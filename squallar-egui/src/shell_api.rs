@@ -99,12 +99,30 @@ pub struct PoolReadout {
     /// names (`act_line - live_bytes`) has no producer yet and is not in the
     /// minimum until it does; `None` only where the pool itself is unknown.
     pub spare_bytes: Option<u64>,
-    /// The percentage of the pool the user asked for. No producer yet
-    /// (the setting lands later); `None` until it does.
+    /// **The percentage of this pool the user asked for** — their own
+    /// setting, `squallar_device_profile::scene::PoolPercents`, verbatim.
+    /// `None` only from a caller that prices no scene (the test harness).
     pub requested_percent: Option<u8>,
-    /// The percentage in force after the hardware cap and the governor.
-    /// `None` until a producer exists.
+    /// **The percentage actually in force**, after the hardware, the user's
+    /// own setting and the governor have each had their say: the figure in
+    /// force over the figure the machine reported, floored. It is what makes
+    /// rung-shedding visible, and the mitigation for a user who set 20 %
+    /// months ago and forgot. `None` where the pool itself is unknown.
     pub effective_percent: Option<u8>,
+    /// **Which of the three terms is the one holding this pool down.** Three
+    /// terms can lower a pool and [`Self::effective_percent`] alone cannot say
+    /// which did.
+    pub binder: squallar_device_profile::scene::PoolBinder,
+    /// **Whether the governor's ceiling is on its way back up**: successive
+    /// qualifying readings are banked toward the next promotion
+    /// (`squallar_app::recovery::HostRecovery::held`).
+    ///
+    /// Read only when [`Self::binder`] is `Governor`, and `false` on the GPU
+    /// pool whatever the pressure — that pool's governor is a session latch
+    /// with no producer that can lift it (`Modulation::gpu_ceiling` is `None`
+    /// for the life of every process today), so a GPU pool that says
+    /// "recovering" would be saying something no code can make true.
+    pub recovering: bool,
 }
 
 impl Default for PoolReadout {
@@ -119,6 +137,8 @@ impl Default for PoolReadout {
             spare_bytes: None,
             requested_percent: None,
             effective_percent: None,
+            binder: squallar_device_profile::scene::PoolBinder::Hardware,
+            recovering: false,
         }
     }
 }

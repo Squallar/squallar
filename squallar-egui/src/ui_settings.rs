@@ -59,6 +59,8 @@ pub(crate) const SETTINGS_ROWS: &[&str] = &[
     "storm.speed",
     "storm.direction",
     "data.auto_poll",
+    "memory.gpu",
+    "memory.system",
     "offline.areas",
     "about.version",
     "about.platform",
@@ -404,6 +406,58 @@ impl super::Gui {
                 }
                 true
             }
+            "memory.gpu" => {
+                section_break(ui);
+                ui.heading("Memory");
+                ui.add_space(SETTINGS_SMALL_SPACING);
+                ui.label(
+                    egui::RichText::new(
+                        // Deliberately not an ordered list of what sheds
+                        // first: `squallar_device_profile::budget::LADDER`
+                        // decides that, it differs per capacity arm, and the
+                        // tile caches move off the economy allowance rather
+                        // than off the ladder at all. A caption naming an
+                        // order would be wrong on some machine.
+                        "The most of each memory this app will take. Lowering \
+                         one leaves it less room to work in: the map tile \
+                         caches shrink, and past that the picture quality, \
+                         the 3D detail and the loop's length step down too.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                let pool = self.budget_readout.as_ref().map(|readout| readout.gpu);
+                let before = self.memory_percents;
+                memory_share_widget(
+                    ui,
+                    "memory_gpu",
+                    "GPU memory",
+                    &mut self.memory_percents.gpu,
+                    pool,
+                );
+                if before != self.memory_percents {
+                    actions.push(GuiAction::SetMemoryPercents(self.memory_percents));
+                }
+                true
+            }
+            "memory.system" => {
+                let pool = self
+                    .budget_readout
+                    .as_ref()
+                    .and_then(|readout| readout.host);
+                let before = self.memory_percents;
+                memory_share_widget(
+                    ui,
+                    "memory_host",
+                    "System memory",
+                    &mut self.memory_percents.host,
+                    pool,
+                );
+                if before != self.memory_percents {
+                    actions.push(GuiAction::SetMemoryPercents(self.memory_percents));
+                }
+                true
+            }
             "offline.areas" => {
                 section_break(ui);
                 // Every area is a SUB-row of this one id: `SETTINGS_ROWS` is
@@ -439,6 +493,12 @@ impl super::Gui {
                     self.heading_source = squallar_location::HeadingSource::default();
                     self.storm_motion_override = crate::StormMotionOverride::default();
                     self.srv_fallback = squallar_radar::srv::SrvFallback::default();
+                    // The App holds its own copy and prices with it, so the
+                    // reset has to be told as well as written down — a reset
+                    // that only moved the slider would leave this session
+                    // running at the old share until the next restart.
+                    self.memory_percents = squallar_device_profile::scene::PoolPercents::default();
+                    actions.push(GuiAction::SetMemoryPercents(self.memory_percents));
                     actions.push(GuiAction::RequestLocation);
                 }
                 true
@@ -549,6 +609,79 @@ fn gps_port_label(ports: &[(Option<String>, String)], selected: Option<&str>) ->
         .unwrap_or_else(|| selected.unwrap_or("Auto-detect").to_owned())
 }
 
+/// **One memory-share control: the slider, and what the machine actually
+/// allowed beside it.**
+///
+/// The caption is the mandatory half. A percentage alone is unreadable now
+/// that three terms can lower a pool — the user's own setting, the hardware,
+/// and the page heap's governor — and it is the whole mitigation for someone
+/// who set 20 % months ago and forgot: the figure in force is stated beside
+/// the figure asked for, with the binding term named.
+///
+/// **The UI paints this; it does not price it.** Every figure in the caption
+/// is read off `crate::shell_api::PoolReadout`, composed in `squallar-app`.
+fn memory_share_widget(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    percent: &mut u8,
+    pool: Option<crate::shell_api::PoolReadout>,
+) {
+    use squallar_device_profile::scene::PoolPercents;
+
+    ui.horizontal(|ui| {
+        ui.label(format!("{label}:"));
+        // A pushed id rather than the label's: two sliders over the same
+        // range in one window would otherwise share a drag state.
+        ui.push_id(id, |ui| {
+            ui.add(
+                egui::Slider::new(percent, PoolPercents::FLOOR..=100)
+                    .step_by(5.0)
+                    .suffix(" %"),
+            );
+        });
+    });
+    ui.label(
+        egui::RichText::new(memory_share_caption(pool, *percent))
+            .small()
+            .weak(),
+    );
+}
+
+/// The line under one memory-share slider: what is actually in force, and
+/// which of the three terms is holding it there.
+///
+/// Absence is stated as absence rather than guessed at — a machine that
+/// reports no figure for a pool is told so, not shown an invented percentage.
+fn memory_share_caption(pool: Option<crate::shell_api::PoolReadout>, requested: u8) -> String {
+    use squallar_device_profile::scene::PoolBinder;
+
+    let Some(pool) = pool else {
+        return "No figure for this memory yet.".to_owned();
+    };
+    if pool.requested_percent != Some(requested) {
+        // The readout is composed on the telemetry tick, not the frame, so a
+        // just-moved slider is genuinely not in force yet. Saying so beats
+        // printing the old figure under the new number.
+        return format!("Applying {requested} %...");
+    }
+    let Some(effective) = pool.effective_percent else {
+        return "This machine reports no size for this memory, so the share \
+                applies to nothing here."
+            .to_owned();
+    };
+    let held = match pool.binder {
+        PoolBinder::Hardware => "all this machine reports",
+        PoolBinder::UserPercent => "your setting",
+        PoolBinder::Governor if pool.recovering => "memory pressure, recovering",
+        PoolBinder::Governor => "memory pressure",
+    };
+    format!(
+        "{requested} % asked for, {effective} % in force ({held}): {} MiB.",
+        pool.capacity_bytes / (1024 * 1024),
+    )
+}
+
 /// Generic combo box for a unit preference enum.
 fn unit_combo<T: Copy + PartialEq + UnitLabel>(
     ui: &mut egui::Ui,
@@ -614,6 +747,162 @@ mod tests {
     fn an_unplugged_port_is_still_named() {
         assert_eq!(gps_port_label(&ports(), Some("/dev/ttyS9")), "/dev/ttyS9");
         assert_eq!(gps_port_label(&[], None), "Auto-detect");
+    }
+}
+
+#[cfg(test)]
+mod memory_share_tests {
+    use super::*;
+    use crate::shell_api::PoolReadout;
+    use squallar_device_profile::scene::{PoolBinder, PoolPercents};
+
+    /// A pool the App has priced, at `requested` %, held by `binder`.
+    fn pool(requested: u8, effective: u8, binder: PoolBinder, recovering: bool) -> PoolReadout {
+        PoolReadout {
+            capacity_bytes: 4 * 1024 * 1024 * 1024,
+            requested_percent: Some(requested),
+            effective_percent: Some(effective),
+            binder,
+            recovering,
+            ..PoolReadout::default()
+        }
+    }
+
+    /// **Every binder is named, and each is named differently.** The whole
+    /// point of the line is that three terms can lower a pool and a bare
+    /// percentage cannot say which did.
+    #[test]
+    fn each_binding_term_is_named_and_no_two_read_alike() {
+        let lines: Vec<String> = [
+            (PoolBinder::Hardware, false),
+            (PoolBinder::UserPercent, false),
+            (PoolBinder::Governor, false),
+            (PoolBinder::Governor, true),
+        ]
+        .into_iter()
+        .map(|(binder, recovering)| {
+            memory_share_caption(Some(pool(60, 60, binder, recovering)), 60)
+        })
+        .collect();
+        for line in &lines {
+            assert!(
+                line.contains("60 % asked for") && line.contains("60 % in force"),
+                "the line states neither the request nor the figure in force: {line}",
+            );
+        }
+        let mut distinct = lines.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            lines.len(),
+            "two binding terms read identically, so the reader cannot tell \
+             them apart: {lines:?}",
+        );
+    }
+
+    /// **A governor that is coming back up says so.** The modulation can rise
+    /// again; a bare "memory pressure" reads like a wall.
+    #[test]
+    fn a_recovering_governor_is_not_reported_as_a_wall() {
+        let stuck = memory_share_caption(Some(pool(80, 40, PoolBinder::Governor, false)), 80);
+        let lifting = memory_share_caption(Some(pool(80, 40, PoolBinder::Governor, true)), 80);
+        assert!(stuck.contains("memory pressure"), "{stuck}");
+        assert!(
+            lifting.contains("recovering"),
+            "a governor with readings banked toward a promotion reads as \
+             terminal: {lifting}",
+        );
+        assert!(
+            !stuck.contains("recovering"),
+            "a governor with nothing banked claims to be recovering: {stuck}",
+        );
+    }
+
+    /// **A slider just moved is not reported as in force.** The readout is
+    /// composed on the telemetry tick, not the frame, so for up to one period
+    /// the App is genuinely still pricing the old figure — printing it under
+    /// the new number would read as a broken control.
+    #[test]
+    fn a_share_the_app_has_not_priced_yet_says_so() {
+        let line = memory_share_caption(Some(pool(100, 100, PoolBinder::Hardware, false)), 45);
+        assert!(
+            line.contains("45"),
+            "the line names no figure at all: {line}"
+        );
+        assert!(
+            !line.contains("in force"),
+            "a share the App has not seen was reported as in force: {line}",
+        );
+    }
+
+    /// Absence is stated as absence. A machine that reports no size for a
+    /// pool is told so, not shown an invented percentage.
+    #[test]
+    fn a_pool_with_no_figure_is_not_given_one() {
+        assert!(memory_share_caption(None, 100).contains("No figure"));
+        let unsized_pool = PoolReadout {
+            requested_percent: Some(100),
+            effective_percent: None,
+            ..PoolReadout::default()
+        };
+        let line = memory_share_caption(Some(unsized_pool), 100);
+        assert!(
+            line.contains("no size"),
+            "a pool with no figure was given one: {line}",
+        );
+    }
+
+    /// **"Reset to defaults" resets this too**, through the button a user
+    /// actually presses.
+    ///
+    /// The `"reset"` arm is a hand-kept list of fields; nothing makes adding a
+    /// setting add a line to it, so a reset that silently forgets one is the
+    /// failure mode, and it is invisible without this.
+    #[test]
+    fn resetting_to_defaults_restores_the_whole_of_both_pools() {
+        let mut h = crate::input_harness::InputHarness::with_screen(egui::vec2(900.0, 1600.0));
+        h.gui_mut().memory_percents = PoolPercents { gpu: 20, host: 30 };
+        h.open_settings();
+
+        let pos = h
+            .inspector_rect()
+            .expect("the settings body is in the inspector")
+            .center();
+        let found = h.scroll_until(pos, egui::vec2(0.0, -160.0), 120, |h| {
+            h.painted_text_rects().iter().any(|(rect, text)| {
+                text == "Reset to defaults" && h.screen_rect().contains(rect.center())
+            })
+        });
+        assert!(found, "the Reset to defaults button never came on screen");
+
+        let button = h
+            .painted_text_rects()
+            .into_iter()
+            .find(|(_, text)| text == "Reset to defaults")
+            .expect("the button was just found on screen")
+            .0;
+        h.clear_actions();
+        h.mouse_click(button.center());
+
+        assert_eq!(
+            h.gui().memory_percents,
+            PoolPercents::FULL,
+            "a reset left the user on a share they had asked to forget",
+        );
+        assert!(
+            h.last_actions().iter().any(|action| matches!(
+                action,
+                GuiAction::SetMemoryPercents(percents) if *percents == PoolPercents::FULL
+            )),
+            "the reset never told the App, so this session keeps pricing at \
+             the old share until a restart; it emitted [{}]",
+            h.last_actions()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
     }
 }
 

@@ -889,6 +889,19 @@ impl Gui {
         self.budget_readout_copies
     }
 
+    /// **The share of each memory pool the user allows this application** —
+    /// the Memory section's two controls, as the config restored them.
+    ///
+    /// Read by the shell once at construction, before the first `fit`, so a
+    /// user who lowered the setting last session never gets one round of
+    /// budgets resolved at the whole pool. Every later change reaches the App
+    /// as [`crate::actions::GuiAction::SetMemoryPercents`] instead: this is a
+    /// value the UI *owns*, not one it prices with, and the App applies it
+    /// (`Capacity::scaled_to`) where every other capacity term is applied.
+    pub fn memory_percents(&self) -> squallar_device_profile::scene::PoolPercents {
+        self.memory_percents
+    }
+
     /// The distinct sites some pane is watching live — the unit the chunk feed
     /// and the archive auto-poll both work in.
     pub fn live_sites(&self) -> Vec<String> {

@@ -268,6 +268,17 @@ pub struct App {
     /// keep a degraded pan margin until the user restarts. Never written
     /// anywhere.
     host_recovery: crate::recovery::HostRecovery,
+    /// **The share of each memory pool the user allows this application** —
+    /// the Memory section's two controls, applied to the capacity by
+    /// [`Self::capacity`] before any allowance is computed.
+    ///
+    /// A copy of a `Gui` value, and the only kind of copy that is right here:
+    /// the setting is the UI's to own and persist, and the *pricing* is this
+    /// layer's. Seeded from the restored config in [`Self::new`] — before the
+    /// first `fit`, so a user who lowered it last session never gets one
+    /// round of budgets resolved at the whole pool — and rewritten by
+    /// `GuiAction::SetMemoryPercents` thereafter.
+    memory_percents: squallar_device_profile::scene::PoolPercents,
     /// **What the page's next picture batch will allocate**, as the last loop
     /// walk priced it — every shown overlay picture at the budget's
     /// oversampling plus one arrival — so the watermark's action line can be
@@ -776,6 +787,13 @@ impl App {
             .is_some_and(|store| gui.load_ui_config(store.as_ref()));
         let site_is_provisional = !restored && apply_location_hint(&mut gui, platform.as_ref());
         // Before `gui` moves into the struct literal below.
+        //
+        // **Read here rather than on the first frame**, because the first
+        // `fit` runs before any frame does: a session restored at 40 % that
+        // learned its share from a `GuiAction` would resolve one round of
+        // budgets against the whole pool first, which is the round most
+        // likely to be the largest one.
+        let memory_percents = gui.memory_percents();
         let parked_fetch_pending = parked_panes(&gui);
         let loop_arm_pending = looping_panes(&gui);
         let site_positions = crate::site_positions::SitePositions::load(platform.kv().as_deref());
@@ -833,6 +851,7 @@ impl App {
             session_capacity: None,
             capacity_modulation: squallar_device_profile::scene::Modulation::NONE,
             host_recovery: crate::recovery::HostRecovery::untouched(),
+            memory_percents,
             host_headroom_bytes: 0,
             budget_readout: squallar_egui::shell_api::BudgetReadout::default(),
             page_heap_reading: None,
@@ -1347,14 +1366,55 @@ impl App {
     /// bracket's whole-application constant otherwise
     /// (`DeviceProfile::capacity`) — or the browser probe's figure where the
     /// profile has only a presumption to offer ([`capacity_with_probe`]),
+    /// **held to the share the user allows** ([`Self::memory_percents`]),
     /// held to whatever pressure has taught this session, and under whatever
     /// modulation is in force ([`Self::capacity_modulation`], which is the
     /// page heap's ceiling and the one term that can lift again).
-    /// Three terms, each of which can only lower the one before it.
+    /// Four terms, each of which can only lower the one before it.
+    ///
+    /// **The user's share is applied first, and the order is load-bearing.**
+    /// `min(hw, latch) × p` is not `min(hw × p, latch)` — at `hw = 100`,
+    /// `latch = 50`, `p = ½` the first answers 25 and the second 50. The
+    /// latch and the modulation are absolute byte ceilings learned under
+    /// pressure; the user asked for `p` % of the **pool**, not for `p` % of a
+    /// latch, so the product is what those two then bound. Leaving all four
+    /// terms as plain `min`s against one another is also what lets the
+    /// readout name the binding one (`scene::pool_binder`) instead of
+    /// guessing.
     pub(super) fn capacity(&self) -> squallar_device_profile::scene::Capacity {
-        capacity_with_probe(&self.device_profile, self.gpu_probe.bytes())
+        self.hardware_capacity()
+            .scaled_to(self.memory_percents)
             .held_to(self.session_capacity)
             .modulated_by(self.capacity_modulation)
+    }
+
+    /// **What the machine reported, before the user's share and before
+    /// pressure** — the first term of [`Self::capacity`]'s chain on its own.
+    ///
+    /// Spelled once and read twice: by the chain, and by the readout, which
+    /// needs the unbound figure to say what fraction of it is actually in
+    /// force and which term took the rest.
+    pub(super) fn hardware_capacity(&self) -> squallar_device_profile::scene::Capacity {
+        capacity_with_probe(&self.device_profile, self.gpu_probe.bytes())
+    }
+
+    /// Adopt the share of each memory pool the user allows. Nothing is
+    /// re-fitted here: [`Self::capacity`] is re-read by the loop walk, so the
+    /// next walk resolves against the new figure the way it would against a
+    /// changed reading.
+    pub(super) fn set_memory_percents(
+        &mut self,
+        percents: squallar_device_profile::scene::PoolPercents,
+    ) {
+        if self.memory_percents == percents {
+            return;
+        }
+        log::info!(
+            "memory shares: {} % of the GPU pool, {} % of the host pool",
+            percents.gpu,
+            percents.host,
+        );
+        self.memory_percents = percents;
     }
 
     /// Make `budgets` the budgets in force, and re-derive what hangs off them.

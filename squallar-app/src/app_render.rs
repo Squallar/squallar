@@ -5117,6 +5117,21 @@ impl super::App {
         use squallar_egui::shell_api::{PaneBudget, PoolReadout};
 
         let cap = self.capacity();
+        // **The unbound figure**, so the readout can say what fraction of it
+        // is in force and which of the three terms took the rest. Read here
+        // rather than reconstructed from `cap`, which has already had all
+        // three applied and cannot be inverted through them.
+        let hardware = self.hardware_capacity();
+        // The share the user allows, with nothing else applied — the middle
+        // term of `App::capacity`'s chain, which is what separates "your
+        // setting" from "the governor" below.
+        let asked = hardware.scaled_to(self.memory_percents);
+        // **`held` is only ever `true` on the host pool.** Nothing produces
+        // `Modulation::gpu_ceiling`, so the GPU pool's only governor is a
+        // session latch with nothing that can lift it, and a GPU pool
+        // reporting recovery would be reporting something no code can make
+        // true.
+        let recovering = self.host_recovery.held() > 0;
         let need = terms.total();
         let readout = &mut self.budget_readout;
         // Bumped here and nowhere else, so the counter and the content cannot
@@ -5156,8 +5171,17 @@ impl super::App {
             allowance_bytes: cap.allowance(),
             need_bytes: need.gpu_bytes,
             spare_bytes: Some(cap.allowance().saturating_sub(need.gpu_bytes)),
-            requested_percent: None,
-            effective_percent: None,
+            requested_percent: Some(self.memory_percents.gpu),
+            effective_percent: squallar_device_profile::scene::effective_percent(
+                hardware.gpu_bytes,
+                cap.gpu_bytes,
+            ),
+            binder: squallar_device_profile::scene::pool_binder(
+                hardware.gpu_bytes,
+                asked.gpu_bytes,
+                cap.gpu_bytes,
+            ),
+            recovering: false,
         };
         // See [`host_spare_bytes`]: the model's spare, bounded by what the
         // heap and this instance's allocator actually say.
@@ -5193,8 +5217,19 @@ impl super::App {
                     allowance_bytes: allowance,
                     need_bytes: need.host_bytes,
                     spare_bytes: Some(host_spare_bytes(model_spare, allowance, heap)),
-                    requested_percent: None,
-                    effective_percent: None,
+                    requested_percent: Some(self.memory_percents.host),
+                    // Against the hardware's own host figure where it has one.
+                    // A capacity that grew a host figure the hardware reading
+                    // had none of is not a fraction of anything, and says so.
+                    effective_percent: hardware.host_bytes.and_then(|hardware_host| {
+                        squallar_device_profile::scene::effective_percent(hardware_host, host)
+                    }),
+                    binder: squallar_device_profile::scene::pool_binder(
+                        hardware.host_bytes.unwrap_or(host),
+                        asked.host_bytes.unwrap_or(host),
+                        host,
+                    ),
+                    recovering,
                 }
             });
         readout.overlay_grids = overlay_grids;
@@ -8119,3 +8154,9 @@ mod host_spare_tests;
 #[path = "app_render/budget_readout_cadence_tests.rs"]
 #[cfg(test)]
 mod budget_readout_cadence_tests;
+
+/// The user's two memory shares end to end: restored before the first fit,
+/// applied ahead of every allowance, and reported beside what was allowed.
+#[path = "app_render/memory_share_tests.rs"]
+#[cfg(test)]
+mod memory_share_tests;

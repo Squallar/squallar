@@ -88,6 +88,14 @@ fn a_current_config_reaches_its_save_fixpoint_in_one_round_trip() {
     assert_eq!(pane1.selected_product(), radar_fields::known::VELOCITY);
     assert!(!pane1.time_link, "pane 1 saved its time link off");
     assert_eq!(gui.presets.len(), 1, "the user preset arrived");
+    // The two memory shares, which are the fixture's only asymmetric pair:
+    // a migration that read one key into both fields would still reach the
+    // fixpoint below while halving somebody's tile caches.
+    assert_eq!(
+        gui.memory_percents(),
+        squallar_device_profile::scene::PoolPercents { gpu: 60, host: 45 },
+        "the file's two memory shares did not arrive as written",
+    );
 
     let save1 = gui.ui_config_json().expect("a loaded Gui serializes");
     let store2 = store_with(&save1);

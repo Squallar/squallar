@@ -261,6 +261,142 @@ impl Modulation {
     };
 }
 
+/// **The share of each pool the user is willing to let this application
+/// take**, as whole percents.
+///
+/// # A ceiling the user LOWERS, never a floor they raise
+///
+/// [`Self::FULL`] — 100 % on both pools — is the default, and that is not a
+/// taste. Every install starts with nothing written down, every config file
+/// produced before this field existed has none, and "Reset to defaults"
+/// clears it: whatever the absent value means is what a very large number of
+/// sessions will do. Shaped as a floor the user raises, a fresh install, a
+/// downgrade and a reset would each silently hold *less* than the user last
+/// asked for. Neutrality is the only default that cannot do that, and it
+/// makes this what every other quality control here is — a ceiling, at the
+/// top until somebody lowers it.
+///
+/// # Two percents, one per pool, and they are independent
+///
+/// A discrete card's VRAM and the host's RAM are two memories
+/// ([`Pools::Split`]), and a user who wants the tile caches out of their RAM
+/// has said nothing about their card. On a unified adapter the two bind one
+/// memory and [`Capacity::scaled_to`] resolves that; the *setting* stays two
+/// numbers so it means the same thing on every machine a config file can be
+/// carried to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PoolPercents {
+    /// The share of [`Capacity::gpu_bytes`] this application may take.
+    pub gpu: u8,
+    /// The share of [`Capacity::host_bytes`] this application may take.
+    pub host: u8,
+}
+
+impl PoolPercents {
+    /// The whole of both pools: the identity on every capacity, and what an
+    /// install with nothing written down gets.
+    pub const FULL: Self = Self {
+        gpu: 100,
+        host: 100,
+    };
+
+    /// **The smallest percent the setting offers, and why that number.**
+    ///
+    /// A decision, not an arbitrary clamp. Below roughly a tenth of any pool
+    /// this application ships against, `crate::fit` has already walked every
+    /// rung to its stop — the offscreen, the oversample, the loop span, the
+    /// grid — so a 9 % and a 1 % resolve to the identical budgets and buy the
+    /// identical picture. A control whose lower half cannot be observed to do
+    /// anything is worse than a shorter control: it invites the user to
+    /// believe they have kept lowering something. **Widening this downward
+    /// needs a measurement showing the rungs still move there**, not a view
+    /// that more range is friendlier.
+    pub const FLOOR: u8 = 10;
+
+    /// A pair read from a config file or a widget, held inside
+    /// [`Self::FLOOR`]`..=100`. A hand-edited `0`, a `250`, and a value from a
+    /// build whose range was wider all cost the user nothing.
+    pub fn clamped(gpu: u8, host: u8) -> Self {
+        Self {
+            gpu: gpu.clamp(Self::FLOOR, 100),
+            host: host.clamp(Self::FLOOR, 100),
+        }
+    }
+}
+
+impl Default for PoolPercents {
+    fn default() -> Self {
+        Self::FULL
+    }
+}
+
+/// **What is actually holding one pool's figure down**, for the readout that
+/// shows a requested percentage beside the one in force.
+///
+/// Three terms can lower a pool and a bare number cannot say which did. A
+/// user who set 20 % months ago and forgot needs to see their own setting
+/// named; a user whose machine is smaller than they think needs to see that
+/// their 100 % is already the whole of it; and a user whose session is under
+/// the page heap's governor needs to see that the figure is *modulated*,
+/// rather than reading it as their setting or as their hardware.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PoolBinder {
+    /// Nothing lowered it: the figure in force is what the machine has.
+    Hardware,
+    /// The user's own percentage is the term in force.
+    UserPercent,
+    /// A session latch ([`Capacity::held_to`]) or the page heap's
+    /// [`Modulation`] sits under the user's percentage. Only the second of
+    /// those can lift again, which is why the readout carries recovery
+    /// separately rather than folding it in here.
+    Governor,
+}
+
+/// **Which of the three terms bound a pool**, given the figure before any of
+/// them, the figure after the user's percentage, and the figure in force.
+///
+/// The governor is asked first because it is the term that can lift: a
+/// session under pressure is a different thing to say than a machine that is
+/// small, and while both are true the recoverable one is the news. Equality
+/// falls through — a percentage at 100 % has bound nothing, and a governor
+/// sitting exactly on the user's line is not the reason the line is there.
+pub fn pool_binder(
+    hardware_bytes: u64,
+    after_percent_bytes: u64,
+    in_force_bytes: u64,
+) -> PoolBinder {
+    if in_force_bytes < after_percent_bytes {
+        PoolBinder::Governor
+    } else if after_percent_bytes < hardware_bytes {
+        PoolBinder::UserPercent
+    } else {
+        PoolBinder::Hardware
+    }
+}
+
+/// **What percent of `hardware_bytes` `in_force_bytes` actually is**, or
+/// `None` where there is no pool to take a percentage of.
+///
+/// **Rounded to nearest, and deliberately not floored.** [`Capacity::scaled_to`]
+/// floors, so the exact reciprocal of a share nothing else has touched is a
+/// hair *under* it — `40 %` of 16 GiB read back as 39.999999994 %. Flooring
+/// here as well would print every user's own untouched setting one point below
+/// what they set it to, on the commonest path there is, which is a
+/// self-inflicted wrongness far worse than the half-point it would buy.
+///
+/// **What says whether anything is binding is [`pool_binder`], which is
+/// exact.** This figure is the magnitude beside it, not the verdict, so it
+/// does not have to carry a conservative bias the verdict already carries
+/// precisely.
+pub fn effective_percent(hardware_bytes: u64, in_force_bytes: u64) -> Option<u8> {
+    if hardware_bytes == 0 {
+        return None;
+    }
+    let hardware = u128::from(hardware_bytes);
+    let percent = (u128::from(in_force_bytes) * 100 + hardware / 2) / hardware;
+    Some(u8::try_from(percent).unwrap_or(u8::MAX))
+}
+
 /// **The host pool a percentage is taken of**: what the OS says is available
 /// plus what this process already holds.
 ///
@@ -295,10 +431,11 @@ impl Modulation {
 ///
 /// **The pool is not RAM this app may take.** It is the figure a percentage
 /// is taken OF, and what may be taken is [`Capacity::host_allowance`] of that
-/// product. **There is no percentage yet** — nothing multiplies this figure
-/// today, and the pool reaches `Capacity::host_bytes` whole, so the only
-/// clamp on it is the three-quarters allowance every host figure has always
-/// had.
+/// product. The percentage is [`PoolPercents::host`], applied by
+/// [`Capacity::scaled_to`] before any allowance is computed; at its default
+/// of 100 % the pool reaches `Capacity::host_bytes` whole and the only clamp
+/// is the three-quarters allowance every host figure has always had, which is
+/// what every session before the setting existed did.
 pub fn host_pool_bytes(available_bytes: u64, own_live_bytes: Option<u64>) -> u64 {
     available_bytes.saturating_add(own_live_bytes.unwrap_or(0))
 }
@@ -456,6 +593,72 @@ impl Capacity {
             .saturating_add(self.host_allowance().unwrap_or(0))
     }
 
+    /// **This capacity with the user's percentages taken of it** — the pool
+    /// figures themselves, before any allowance is computed.
+    ///
+    /// # Why the pool and not the allowance
+    ///
+    /// [`Self::allowance`] does not apply `NEED_FRACTION` on the presumed arm
+    /// (see there), so a percentage applied *after* it would leave every
+    /// browser and every unread native adapter untouched and the control would
+    /// not do what its label says on the arms most users are on. Multiplying
+    /// the pool is also what puts the percentage in front of
+    /// [`Self::economy_allowance`] and everything `crate::fit` derives from a
+    /// capacity — the tile caches included, which are what a RAM slider has to
+    /// move to be worth having.
+    ///
+    /// # Where this sits in the chain, and why it is first
+    ///
+    /// The application's chain is this, then [`Self::held_to`], then
+    /// [`Self::modulated_by`] — the percentage multiplies the **raw** pool and
+    /// the session latch and the governor's ceiling bound the product. The
+    /// order is load-bearing and not a style: `min(hw, latch) × p` is not
+    /// `min(hw × p, latch)`. With `hw = 100`, `latch = 50`, `p = ½` the first
+    /// answers 25 and the second 50. The latch and the modulation are absolute
+    /// byte ceilings learned under pressure; the user asked for `p` % of the
+    /// **pool**, not for `p` % of a latch, so the product is what those two
+    /// then bound. It also leaves all three terms as plain `min`s against one
+    /// another, which is what lets [`pool_binder`] name the binding one
+    /// honestly instead of decoratively.
+    ///
+    /// # The unified arm
+    ///
+    /// On [`Pools::Split`] each figure takes its own percent: two memories,
+    /// two independent settings. On [`Pools::Unified`] the two figures are two
+    /// shares of ONE memory, so both percentages bind the same pool and the
+    /// effective figure is **the lower of the two products** — which is both
+    /// shares scaled by `min(gpu, host)`.
+    ///
+    /// That scaling is also the only one that keeps [`Self::unified`]'s
+    /// partition invariant. Both shares are floored independently, and
+    /// `floor(a) + floor(b) <= floor(a + b)`, so
+    /// `gpu_bytes + host_bytes <= pool × m` for every input — the two
+    /// allowances still cannot sum past the one pool. **A future editor
+    /// "simplifying" this into a re-cut of the scaled pool, or into per-pool
+    /// percents on a unified adapter, breaks that inequality**; it is written
+    /// here because it is not visible from the code.
+    ///
+    /// [`PoolPercents::FULL`] is the identity: `bytes × 100 / 100` is `bytes`
+    /// on every arm, which is the regression that protects every user who
+    /// never opens the setting.
+    pub fn scaled_to(self, percents: PoolPercents) -> Self {
+        let share = |bytes: u64, percent: u8| -> u64 {
+            u64::try_from(u128::from(bytes) * u128::from(percent) / 100).unwrap_or(u64::MAX)
+        };
+        let (gpu_percent, host_percent) = match self.pools {
+            Pools::Split => (percents.gpu, percents.host),
+            Pools::Unified => {
+                let lower = percents.gpu.min(percents.host);
+                (lower, lower)
+            }
+        };
+        Self {
+            gpu_bytes: share(self.gpu_bytes, gpu_percent),
+            host_bytes: self.host_bytes.map(|host| share(host, host_percent)),
+            ..self
+        }
+    }
+
     /// This capacity, held to what the session has learned: pressure lowers a
     /// session's presumption and never raises it, and the lowering is
     /// discarded at exit.
@@ -587,6 +790,10 @@ impl Capacity {
         ceiling.saturating_sub(need.gpu_bytes)
     }
 }
+
+#[path = "scene/percent_tests.rs"]
+#[cfg(test)]
+mod percent_tests;
 
 /// Scenes and stand-ins the crate's tests share.
 #[cfg(test)]

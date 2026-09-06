@@ -9,6 +9,8 @@
   "site": "KTLX",
   "loop_lookback_secs": 3600,
   "loop_speed_fps": 5.0,
+  "gpu_memory_percent": 60,
+  "system_memory_percent": 45,
   "time_step_secs": 600,
   "panes": [
     {

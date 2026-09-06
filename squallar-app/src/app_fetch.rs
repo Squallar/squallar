@@ -696,6 +696,9 @@ impl super::App {
             GuiAction::ReleaseVolume { pane_idx } => {
                 self.handle_release_volume(pane_idx);
             }
+            GuiAction::SetMemoryPercents(percents) => {
+                self.set_memory_percents(percents);
+            }
             GuiAction::PaneClosed { pane_idx } => {
                 // The UI has renumbered. Everything this side keys on a pane
                 // *position* at or above the closed one describes a different

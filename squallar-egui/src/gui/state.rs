@@ -342,6 +342,13 @@ pub struct Gui {
     /// Whether the frame diagnostics overlay is showing — the Interface
     /// section's "Show frame diagnostics" switch. Persisted.
     pub(super) diagnostics_panel: bool,
+    /// **The share of each memory pool the user allows this application** —
+    /// the Memory section's two controls, read by the shell through
+    /// [`super::Gui::memory_percents`] and applied to the capacity before any
+    /// allowance is computed. Persisted; defaults to
+    /// `PoolPercents::FULL`, which is what every session before the setting
+    /// existed did.
+    pub(super) memory_percents: squallar_device_profile::scene::PoolPercents,
     /// The overlay's trailing-window state. Session-only bookkeeping —
     /// emptied whenever the overlay is hidden.
     pub(super) diagnostics: diagnostics::DiagnosticsState,
@@ -660,6 +667,7 @@ impl Gui {
             pills_raise_pending: false,
             pin_pane_controls: false,
             diagnostics_panel: false,
+            memory_percents: squallar_device_profile::scene::PoolPercents::FULL,
             diagnostics: diagnostics::DiagnosticsState::default(),
             ui_faded: false,
             fade_candidate: false,

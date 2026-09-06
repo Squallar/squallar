@@ -972,6 +972,19 @@ fn default_true() -> bool {
     true
 }
 
+/// **A memory-share key that is absent means the whole pool.** The neutral
+/// value, and the one every config written before the Memory section existed
+/// describes — see [`UiConfig::gpu_memory_percent`].
+fn default_full_percent() -> u8 {
+    squallar_device_profile::scene::PoolPercents::FULL.gpu
+}
+
+/// Whether a memory-share field is at its neutral default, for
+/// `skip_serializing_if`.
+fn is_full_percent(value: &u8) -> bool {
+    *value == default_full_percent()
+}
+
 /// A pane whose config names no group is a pane from before groups existed,
 /// and every such pane was in the one group the flags described. See
 /// [`PaneConfig::group`].
@@ -1105,6 +1118,37 @@ struct UiConfig {
     /// forbids.
     #[serde(default, skip_serializing_if = "is_false")]
     diagnostics_panel: bool,
+    /// **The share of this machine's GPU memory the user allows this
+    /// application**, as a whole percent — the Memory section's first control.
+    ///
+    /// Additive on `diagnostics_panel`' terms: `#[serde(default)]`, **no
+    /// `CONFIG_VERSION` bump and no `migrate.rs` step**. The default is 100,
+    /// which is neutrality: absence loads as "the whole pool", which is
+    /// exactly what every session written before this field existed did. A
+    /// default that held anything back would make a fresh install, a
+    /// downgrade and a reset each quietly keep less than the user last asked
+    /// for — see `PoolPercents`.
+    ///
+    /// `skip_serializing_if` at the default for `viewing_live`'s reason:
+    /// writing the key into every file would move the bytes of configs that
+    /// say nothing about it, which
+    /// `a_config_naming_an_unregistered_layer_is_written_back_byte_preserved`
+    /// forbids.
+    #[serde(
+        default = "default_full_percent",
+        skip_serializing_if = "is_full_percent"
+    )]
+    gpu_memory_percent: u8,
+    /// **The share of this machine's system memory the user allows this
+    /// application**, on `gpu_memory_percent`'s terms exactly. A separate key
+    /// and not a pair, because the two pools are two memories on every
+    /// machine but a unified one and a user who wants the tile caches out of
+    /// their RAM has said nothing about their card.
+    #[serde(
+        default = "default_full_percent",
+        skip_serializing_if = "is_full_percent"
+    )]
+    system_memory_percent: u8,
     /// **The user's starred radar sites**, bare ICAO identifiers in the order
     /// they were starred — the same spelling a pick persists, so a favourite
     /// and a current site are the one kind of value.
@@ -1545,6 +1589,8 @@ impl Default for UiConfig {
             srv_fallback: squallar_radar::srv::SrvFallback::default(),
             pin_pane_controls: false,
             diagnostics_panel: false,
+            gpu_memory_percent: default_full_percent(),
+            system_memory_percent: default_full_percent(),
             favorite_sites: Vec::new(),
             downloaded_areas: Vec::new(),
             download_area: DownloadAreaConfig::default(),
@@ -1681,6 +1727,8 @@ impl super::Gui {
             srv_fallback: self.srv_fallback,
             pin_pane_controls: self.pin_pane_controls,
             diagnostics_panel: self.diagnostics_panel,
+            gpu_memory_percent: self.memory_percents.gpu,
+            system_memory_percent: self.memory_percents.host,
             favorite_sites: self.favorite_sites.clone(),
             downloaded_areas: self
                 .downloaded_areas
@@ -1857,6 +1905,13 @@ impl super::Gui {
         self.srv_fallback = config.srv_fallback;
         self.pin_pane_controls = config.pin_pane_controls;
         self.diagnostics_panel = config.diagnostics_panel;
+        // Held inside the offered range on the way in, like every other value
+        // this file reads tolerantly: a hand-edited `0` or `250` costs the
+        // user a sensible setting, not their whole config.
+        self.memory_percents = squallar_device_profile::scene::PoolPercents::clamped(
+            config.gpu_memory_percent,
+            config.system_memory_percent,
+        );
         self.favorite_sites = config.favorite_sites;
         // A block that names no area is dropped, not restored badly — the
         // `VolumeRegionConfig::restore` arrangement, and the reason a hand-
@@ -2368,6 +2423,12 @@ mod notifier_config_tests;
 #[path = "ui_config/storm_motion_config_tests.rs"]
 #[cfg(test)]
 mod storm_motion_config_tests;
+
+/// The two memory-share controls, across a restart — and what an absent pair
+/// means, which is what every install written before them says.
+#[path = "ui_config/memory_shares_config_tests.rs"]
+#[cfg(test)]
+mod memory_shares_config_tests;
 
 #[path = "ui_config/as_of_config_tests.rs"]
 #[cfg(test)]

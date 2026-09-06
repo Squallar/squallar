@@ -119,6 +119,19 @@ pub enum GuiAction {
     PaneClosed {
         pane_idx: usize,
     },
+    /// **The user moved one of the two memory-share controls.**
+    ///
+    /// The value is the UI's — it is a setting, persisted in `ui.json` — and
+    /// the *pricing* is the App's: it applies the pair through
+    /// `Capacity::scaled_to` in the same chain that holds the capacity to the
+    /// session's latch and the page heap's governor. The UI paints the result;
+    /// it does not compute a budget.
+    ///
+    /// Edge-triggered, and the seed is not this action: `App::new` reads the
+    /// restored pair off the `Gui` before its first `fit`, so a user who
+    /// lowered the setting last session never gets one round of budgets
+    /// resolved at the whole pool. This carries every change after that.
+    SetMemoryPercents(squallar_device_profile::scene::PoolPercents),
 }
 
 impl GuiAction {
@@ -138,7 +151,8 @@ impl GuiAction {
             | Self::StopGps
             | Self::RequestLocation
             | Self::StopLocation
-            | Self::OpenLocationSettings => None,
+            | Self::OpenLocationSettings
+            | Self::SetMemoryPercents(_) => None,
             Self::SwitchRadarSite { pane_idx, .. }
             | Self::FetchOverlay { pane_idx, .. }
             | Self::RefreshOverlay { pane_idx, .. }
@@ -279,6 +293,13 @@ impl std::fmt::Display for GuiAction {
                     f,
                     "Pane {} closed; every store keyed on it or above it is stale",
                     pane_idx
+                )
+            }
+            GuiAction::SetMemoryPercents(percents) => {
+                write!(
+                    f,
+                    "Memory shares: {} % of the GPU pool, {} % of the host pool",
+                    percents.gpu, percents.host
                 )
             }
         }
