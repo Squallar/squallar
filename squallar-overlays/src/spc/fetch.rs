@@ -25,7 +25,6 @@ const SPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub fn spc_client(sources: &DataSources) -> Result<reqwest::Client, String> {
     sources
         .spc_client(SPC_TIMEOUT)
-        .build()
         .map_err(|e| format!("could not build the SPC client: {e}"))
 }
 

@@ -146,8 +146,16 @@ impl DataSources {
 
     /// Every METAR fetch goes through here, so the origin's recorded rule is the
     /// rule the request obeys.
-    pub fn metar_client(&self, timeout: std::time::Duration) -> reqwest::ClientBuilder {
-        crate::tls::client_for(self.metar_sends_user_agent, timeout)
+    ///
+    /// **Shared, not fresh** ([`crate::tls::shared_client_for`]): every caller
+    /// that names this rule and this timeout gets the one client, and its
+    /// connection pool with it. Constructing one is measured in milliseconds
+    /// and some of these calls are made on the frame thread.
+    pub fn metar_client(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<reqwest::Client, reqwest::Error> {
+        crate::tls::shared_client_for(self.metar_sends_user_agent, timeout)
     }
 
     /// For every read from the Iowa Environmental Mesonet.
@@ -159,13 +167,24 @@ impl DataSources {
     /// same host and are preflighted out of existence by a `User-Agent` in
     /// exactly the same way, and only in the browser. Reaching for the
     /// application-wide client here is the mistake this name exists to prevent.
-    pub fn iem_client(&self, timeout: std::time::Duration) -> reqwest::ClientBuilder {
-        crate::tls::client_for(self.metar_sends_user_agent, timeout)
+    ///
+    /// Shared on [`Self::metar_client`]'s terms, and with it: the two name the
+    /// same rule, so a matching timeout gets them the same client.
+    pub fn iem_client(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<reqwest::Client, reqwest::Error> {
+        crate::tls::shared_client_for(self.metar_sends_user_agent, timeout)
     }
 
     /// For SPC outlooks, mesoscale discussions and storm reports.
-    pub fn spc_client(&self, timeout: std::time::Duration) -> reqwest::ClientBuilder {
-        crate::tls::client_for(self.spc_sends_user_agent, timeout)
+    ///
+    /// Shared on [`Self::metar_client`]'s terms.
+    pub fn spc_client(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<reqwest::Client, reqwest::Error> {
+        crate::tls::shared_client_for(self.spc_sends_user_agent, timeout)
     }
 
     /// Where one bucket lives, from [`s3_base`](Self::s3_base).
@@ -359,8 +378,13 @@ impl DataSources {
 
     /// For Open-Meteo soundings: no `User-Agent` is required, so the request stays
     /// simple and skips the preflight.
-    pub fn sounding_client(&self, timeout: std::time::Duration) -> reqwest::ClientBuilder {
-        crate::tls::simple_client(timeout)
+    ///
+    /// Shared on [`Self::metar_client`]'s terms.
+    pub fn sounding_client(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<reqwest::Client, reqwest::Error> {
+        crate::tls::shared_client_for(false, timeout)
     }
 }
 
@@ -581,7 +605,7 @@ mod tests {
         let s = DataSources::production();
         let t = std::time::Duration::from_secs(1);
         assert!(
-            !crate::tls::sends_user_agent(&s.sounding_client(t).build().expect("client")),
+            !crate::tls::sends_user_agent(&s.sounding_client(t).expect("client")),
             "the sounding client carries a User-Agent; the fetch was probed \
              and shipped as a simple request",
         );
@@ -609,11 +633,11 @@ mod tests {
         let s = DataSources::production();
         let t = std::time::Duration::from_secs(1);
         assert!(
-            !crate::tls::sends_user_agent(&s.metar_client(t).build().expect("client")),
+            !crate::tls::sends_user_agent(&s.metar_client(t).expect("client")),
             "the METAR client carries a User-Agent; IEM's OPTIONS answers 405",
         );
         assert!(
-            !crate::tls::sends_user_agent(&s.spc_client(t).build().expect("client")),
+            !crate::tls::sends_user_agent(&s.spc_client(t).expect("client")),
             "the SPC client carries a User-Agent; SPC's OPTIONS answers 403",
         );
     }
@@ -631,11 +655,11 @@ mod tests {
             ..DataSources::production()
         };
         assert!(
-            crate::tls::sends_user_agent(&metar.metar_client(t).build().expect("client")),
+            crate::tls::sends_user_agent(&metar.metar_client(t).expect("client")),
             "metar_client does not read metar_sends_user_agent",
         );
         assert!(
-            crate::tls::sends_user_agent(&spc.spc_client(t).build().expect("client")),
+            crate::tls::sends_user_agent(&spc.spc_client(t).expect("client")),
             "spc_client does not read spc_sends_user_agent",
         );
     }

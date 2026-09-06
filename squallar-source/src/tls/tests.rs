@@ -321,3 +321,78 @@ fn probe_client_installs_ring() {
         "tls::client() did not install ring"
     );
 }
+
+/// **One client per distinct (origin rule, timeout), however many rounds ask
+/// for one.**
+///
+/// The count, not a clock. Constructing a `reqwest::Client` is what a fetch
+/// round used to pay for on the frame thread — see `ClientCache` for
+/// the measurement — and scene D's overlay rounds paid it once each.
+///
+/// Driven on a cache of this test's own, so the figure is this test's alone:
+/// the process-wide one is shared with every other test in this binary and
+/// could carry no exact count.
+///
+/// The expectation is the number of DISTINCT keys the ask list names, computed
+/// from that list rather than written down, so a list that grows a key moves
+/// the expectation with it.
+#[test]
+fn one_client_is_built_per_distinct_origin_rule_and_timeout() {
+    let metar = std::time::Duration::from_secs(60);
+    let spc = std::time::Duration::from_secs(30);
+    // A round of asks in the shape scene D produces: the same handful of
+    // origins, asked again on every fetch round.
+    let asks = [
+        (false, metar),
+        (false, spc),
+        (false, spc),
+        (false, metar),
+        (false, spc),
+        (true, metar),
+        (false, metar),
+        (true, spc),
+    ];
+    let mut distinct = asks.to_vec();
+    distinct.sort();
+    distinct.dedup();
+
+    let mut cache = super::ClientCache::new();
+    for ask in asks {
+        cache.get_or_build(ask).expect("a client must build");
+    }
+
+    assert_eq!(
+        cache.builds,
+        distinct.len() as u64,
+        "{} asks over {} distinct (rule, timeout) keys constructed {} clients; \
+         a round that constructs its own pays 3,659-3,973 us for it on the \
+         frame thread",
+        asks.len(),
+        distinct.len(),
+        cache.builds,
+    );
+}
+
+/// **A shared client is still that origin's client.**
+///
+/// The counterweight to the count above, and it is a different question: a
+/// cache that handed every asker the first client it ever built would pass a
+/// count of one and send a `User-Agent` to an origin that answers `OPTIONS`
+/// with `405`. Asked through the process-wide entry point, because that is the
+/// one the call sites use, and with no count asserted, because that entry
+/// point is shared with the rest of this binary.
+#[test]
+fn a_shared_client_carries_the_rule_it_was_asked_for() {
+    let timeout = std::time::Duration::from_secs(7);
+    let with = super::shared_client_for(true, timeout).expect("client");
+    let without = super::shared_client_for(false, timeout).expect("client");
+    assert!(
+        super::sends_user_agent(&with),
+        "a client asked for the User-Agent rule came back without one"
+    );
+    assert!(
+        !super::sends_user_agent(&without),
+        "a client asked for the no-User-Agent rule came back with one, so the \
+         cache is keyed on something other than the rule"
+    );
+}

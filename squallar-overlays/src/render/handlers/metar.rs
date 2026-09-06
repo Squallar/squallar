@@ -40,7 +40,6 @@ fn metar_client(
 ) -> Result<reqwest::Client, String> {
     sources
         .metar_client(METAR_TIMEOUT)
-        .build()
         .map_err(|e| format!("could not build the METAR client: {e}"))
 }
 

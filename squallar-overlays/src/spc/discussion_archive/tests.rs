@@ -208,12 +208,11 @@ fn the_index_url_addresses_the_instant() {
 /// IEM answers `OPTIONS` with `405` and no `Access-Control-Allow-Methods`, so a
 /// `User-Agent` turns this into a preflighted request that the browser never
 /// sends — silently, and on web only. The application-wide client carries one,
-/// which is why this path builds its own.
+/// which is why this path asks for the origin's own.
 #[test]
 fn the_archive_client_sends_no_user_agent() {
     let client = DataSources::production()
         .iem_client(ARCHIVE_TIMEOUT)
-        .build()
         .expect("the IEM client must build");
     assert!(
         !squallar_source::tls::sends_user_agent(&client),
@@ -233,7 +232,6 @@ fn the_archive_client_follows_the_origins_recorded_rule() {
     };
     let client = sources
         .iem_client(ARCHIVE_TIMEOUT)
-        .build()
         .expect("the IEM client must build");
     assert!(
         squallar_source::tls::sends_user_agent(&client),

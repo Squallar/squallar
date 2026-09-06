@@ -59,7 +59,7 @@ impl EnvHeights {
 pub async fn fetch_env_heights(sources: &DataSources, lat: f64, lon: f64) -> Option<EnvHeights> {
     crate::tls::init();
     let url = sources.sounding_url(lat, lon);
-    let client = sources.sounding_client(SOUNDING_TIMEOUT).build().ok()?;
+    let client = sources.sounding_client(SOUNDING_TIMEOUT).ok()?;
     let response = client.get(&url).send().await.ok()?;
     if !response.status().is_success() {
         log::warn!("Sounding fetch: HTTP {} from {url}", response.status());

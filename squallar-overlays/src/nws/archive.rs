@@ -156,7 +156,6 @@ pub async fn fetch_archived_alerts(
     // silently, and on web only. See `DataSources::iem_client`.
     let client = sources
         .iem_client(ARCHIVE_TIMEOUT)
-        .build()
         .map_err(|e| FetchError::permanent(format!("could not build the IEM client: {e}")))?;
 
     let url = sources.nws_alerts_archive_url(at);

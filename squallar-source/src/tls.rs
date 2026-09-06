@@ -95,6 +95,82 @@ pub fn client_for(sends_user_agent: bool, timeout: std::time::Duration) -> reqwe
     }
 }
 
+/// Everything that decides which client a call site wants: the origin's
+/// preflight rule and the timeout. Two call sites that agree on both want the
+/// same client, and get it.
+type ClientKey = (bool, std::time::Duration);
+
+/// The clients [`shared_client_for`] has handed out, and the count of what it
+/// had to construct to do it.
+///
+/// **A `reqwest::Client` is expensive to construct and was being constructed
+/// per fetch round.** Every overlay round that reads IEM or SPC built its own
+/// inside `SourceHandler::create_fetch_tasks`, which runs on the frame thread
+/// in `handle_redraw`'s tail. Measured on scene D, NVIDIA RTX 3090 / Vulkan,
+/// 2026-09-06: 3,659–3,973 µs for a round that built one against 2–11 µs for a
+/// round on the application-wide client, and one METAR round per gesture loop
+/// was the whole p99 of `frame post (handle)` — 4,000 µs at p99 over 112
+/// interact frames, 91% of that family's sum carried by 2 of them.
+///
+/// A client is also a connection pool, so a round that reuses one keeps the
+/// TLS session the round before it opened, rather than handshaking again.
+///
+/// Not a map: the key set is the handful of (rule, timeout) pairs this
+/// application's origins declare, and a linear scan over four entries is
+/// cheaper than hashing one.
+struct ClientCache {
+    entries: Vec<(ClientKey, reqwest::Client)>,
+    builds: u64,
+}
+
+impl ClientCache {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            builds: 0,
+        }
+    }
+
+    fn get_or_build(&mut self, key: ClientKey) -> Result<reqwest::Client, reqwest::Error> {
+        if let Some((_, client)) = self.entries.iter().find(|(held, _)| *held == key) {
+            return Ok(client.clone());
+        }
+        let client = client_for(key.0, key.1).build()?;
+        self.builds += 1;
+        self.entries.push((key, client.clone()));
+        Ok(client)
+    }
+}
+
+static SHARED_CLIENTS: std::sync::Mutex<ClientCache> = std::sync::Mutex::new(ClientCache::new());
+
+/// **The client for this origin rule and timeout**, built on the first ask and
+/// shared with every ask after it. See `ClientCache` for what that is worth.
+///
+/// A poisoned lock is taken anyway: the value behind it is a cache, so the
+/// worst a panicking builder can leave is an entry that was never pushed.
+pub fn shared_client_for(
+    sends_user_agent: bool,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    SHARED_CLIENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_build((sends_user_agent, timeout))
+}
+
+/// **How many `reqwest::Client`s this process has constructed** for
+/// [`shared_client_for`], however many rounds asked for one. Never above the
+/// number of distinct (rule, timeout) pairs asked for; that ceiling is the
+/// whole of what the cache buys and is what
+/// `one_client_is_built_per_distinct_origin_rule_and_timeout` holds.
+pub fn clients_built() -> u64 {
+    SHARED_CLIENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .builds
+}
+
 /// Whether this client attaches a `User-Agent` to every request it issues.
 ///
 /// `reqwest::Client` exposes no getter for its default headers, so this scrapes

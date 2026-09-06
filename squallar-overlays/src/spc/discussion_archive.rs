@@ -71,7 +71,6 @@ pub async fn fetch_archived_discussions(
     // browser, and only in the browser. See `DataSources::iem_client`.
     let client = sources
         .iem_client(ARCHIVE_TIMEOUT)
-        .build()
         .map_err(|e| FetchError::permanent(format!("could not build the IEM client: {e}")))?;
 
     let url = sources.spc_discussions_archive_url(at);
