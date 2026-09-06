@@ -61,27 +61,36 @@ pub struct OverlayGridNeed {
     /// hold, which is the admission question, and a figure that does not
     /// move with the poll.
     ///
-    /// **The grid CACHE's budget, and nothing beside it — a named gap.** Each
-    /// gridded handler holds a second population while a loop of its layer
-    /// runs: a `frame_grids` cache of one `FRAME_STAGING_BYTES` grid plus the
-    /// staging pool's retained buffer of the same size, both summed into the
-    /// handler's own `resident_source_bytes` and neither reachable from this
-    /// figure. **It is not derivable from it**: MRMS's grid is half its cache
-    /// budget and GMGSI's is a quarter of its, so no multiplier over
-    /// `budget_bytes` is the same statement on both layers, and one written
-    /// here would be a budget spelled as arithmetic over another crate's
-    /// private constants — the shape that silently re-derives when one of them
-    /// moves. Measured on the Tier-2 `huge` leg the two populations together
-    /// read up to 444,458,992 B against the 258,663,296 B this field's three
-    /// entries price, so the gap is some 177 MiB.
-    ///
-    /// **What closing it takes**: a second field here — `staging_bytes`, fed
-    /// beside `budget_bytes` by a `source_grid_staging_bytes(id)` next to
-    /// `squallar_overlays`' existing `source_grid_budget_bytes`, summed into
-    /// `crate::fit::NeedTerms::overlay_grids_host`. That is one line in each
-    /// of three files, and one of them is `App::loop_demand`, which builds
-    /// every `Scene` the application prices.
+    /// **The grid CACHE's budget, and nothing beside it.** The second
+    /// population a gridded handler holds is [`Self::staging_bytes`]; the two
+    /// are summed into [`crate::fit::NeedTerms::overlay_grids_host`] and are
+    /// separate fields because neither is derivable from the other.
     pub budget_bytes: u64,
+    /// **What the layer's handler holds beside its cache while a loop of it
+    /// runs** — the handler's own `source_grid_staging_bytes`: its frame-granule
+    /// cache at its `FRAME_STAGING_BYTES` budget, plus the retained decode
+    /// buffer its staging pool parks between granules. Zero for a gridded layer
+    /// that stages nothing (the model layer) and for every layer that is not
+    /// gridded at all.
+    ///
+    /// **A second figure rather than a coefficient over [`Self::budget_bytes`],
+    /// because no coefficient is the same statement on both layers**: MRMS's
+    /// grid is half its cache budget and GMGSI's is a quarter of its, so
+    /// `staging == budget` on one and `staging == budget / 2` on the other. A
+    /// ratio written here would also be a budget spelled as arithmetic over
+    /// another crate's private constants — the shape that re-derives silently
+    /// the day one of them moves. The handler states its own figure, the way it
+    /// already states its cache budget, and this field carries it.
+    ///
+    /// It was a named zero until 2026-09-06, and the gap it left was the
+    /// largest unpriced host family on the census: measured on the Tier-2
+    /// `huge` leg the gridded populations together read up to 444,458,992 B
+    /// against 258,663,296 B priced — some 177 MiB of resident memory the
+    /// admission door could not see. This field is 128,000,000 B of that on
+    /// the arm those figures were taken on (MRMS 98,000,000 + GMGSI
+    /// 30,000,000); what is left over is residency above the budgets, which is
+    /// what a ceiling is for and not a term.
+    pub staging_bytes: u64,
 }
 
 /// One pane, in the terms the cost functions price.

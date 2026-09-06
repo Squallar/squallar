@@ -5254,10 +5254,17 @@ impl super::App {
             })
             .collect();
         counts.shared = self.loop_frames.shared();
+        // **Both populations a gridded handler holds**: its key-space cache,
+        // which the walk above collected, and what it stages beside that while
+        // a loop of the layer runs — asked of the handler crate by id here
+        // rather than derived from the budget, because the two ratios differ
+        // by layer and a coefficient written on this side would re-derive
+        // silently when either constant moved.
         scene.overlay_grids = overlay_grids
             .iter()
-            .map(|(_, budget_bytes)| OverlayGridNeed {
+            .map(|(id, budget_bytes)| OverlayGridNeed {
                 budget_bytes: *budget_bytes,
+                staging_bytes: squallar_overlays::render::handlers::source_grid_staging_bytes(id),
             })
             .collect();
         LoopWalk {

@@ -90,6 +90,129 @@ fn one_more_pane_is_priced_and_is_not_free() {
     );
 }
 
+/// **The door's spare is the ladder floor's, the readout's is the rung the
+/// scene is on, and the door's is never the smaller of the two.**
+///
+/// This test used to assert the two were *equal*, and that premise is false on
+/// plain `main` with none of this land applied: the same fixture reads
+/// 3,892,314,112 B at the door against 3,489,660,928 B at the readout, a 384
+/// MiB gap that is exactly what the ladder sheds. `compose_admission_costs`
+/// says why where it composes the pair — the readout answers *how much room
+/// has the scene on screen left at the rung it is on*, the door answers *is
+/// there a rung at which one more thing fits*, and neither is the other's
+/// approximation. So what is pinned is the **direction**: the door prices a
+/// cheaper scene, so a door coming out with *less* room than the readout would
+/// be refusing acts the ladder could pay for.
+///
+/// **The host pool is asserted absent rather than compared.** On
+/// `TestBridge::desktop()` the capacity is split and carries no host figure at
+/// all, so both halves answer `None` and any equality or ordering written over
+/// them here would be a check that cannot fail. It is pinned as absence
+/// instead, so a fixture that grows a host figure fires this rather than
+/// quietly turning the host half into nothing.
+#[test]
+fn the_table_prices_the_floor_and_the_readout_the_rung_the_scene_is_on() {
+    let mut app = n_pane_app(2, SITE);
+    tick(&mut app);
+    assert!(
+        app.admission_costs.spare.gpu_bytes.is_some()
+            && app.budget_readout.gpu.spare_bytes.is_some(),
+        "the GPU pool always has a spare, and both halves of the composition \
+         have to publish one",
+    );
+    assert_eq!(
+        app.volume_shortfall_bytes, 0,
+        "precondition: this fixture holds no unshed volume bytes, which is the \
+         one term the door subtracts and the readout does not",
+    );
+    assert!(
+        app.admission_costs.spare.gpu_bytes >= app.budget_readout.gpu.spare_bytes,
+        "the door priced the scene at the ladder's floor and came out with LESS \
+         GPU room than the readout found at the rung the scene is on: {:?} < {:?}",
+        app.admission_costs.spare.gpu_bytes,
+        app.budget_readout.gpu.spare_bytes,
+    );
+    assert!(
+        app.admission_costs.spare.host_bytes.is_none()
+            && app
+                .budget_readout
+                .host
+                .as_ref()
+                .and_then(|h| h.spare_bytes)
+                .is_none(),
+        "this fixture's capacity grew a host figure ({:?} at the door, {:?} at \
+         the readout); the host half of this pair is no longer vacuous and now \
+         needs the real assertion the GPU half carries",
+        app.admission_costs.spare.host_bytes,
+        app.budget_readout.host.as_ref().and_then(|h| h.spare_bytes),
+    );
+}
+
+/// **The walk carries BOTH of a shown gridded layer's figures onto the
+/// scene** — the key-space cache budget and what the handler stages beside it.
+///
+/// `fit` sums the two, and every test on the far side of that seam is handed a
+/// scene rather than building one from the application. So a construction site
+/// here that fed the cache budget and left the staging at zero would go on
+/// under-pricing by exactly the family the second field exists to price, with
+/// the whole `squallar-device-profile` suite green. This is the one assertion
+/// that reads the application's own answer.
+#[test]
+fn a_shown_gridded_layer_carries_both_of_its_handlers_figures_onto_the_scene() {
+    use squallar_overlays::render::handlers::{
+        source_grid_budget_bytes, source_grid_staging_bytes,
+    };
+    use squallar_source::id::known;
+
+    // Two gridded layers with different answers, on purpose: MRMS stages two
+    // grids beside its cache, the model layer stages nothing at all. A site
+    // that derived the staging from the budget instead of asking the handler
+    // would charge the model layer for a population it does not hold, which is
+    // the over-firing direction and the worse of the two.
+    let mut app = n_pane_app(1, SITE);
+    {
+        let pane = app.gui.pane_mut(0).expect("the fixture built a pane");
+        for id in [known::MRMS, known::MODEL_DATA] {
+            pane.set_overlay_enabled(id.clone(), true);
+            // The walk reads the pane's drawn texture roster, so the pane has
+            // to have asked for each layer's cache the way a pane pass does.
+            let _ = pane.overlay_cache_mut(&id);
+        }
+    }
+
+    let scene = app.scene_of();
+    let priced: Vec<(u64, u64)> = scene
+        .overlay_grids
+        .iter()
+        .map(|grid| (grid.budget_bytes, grid.staging_bytes))
+        .collect();
+    let expected: Vec<(u64, u64)> = [known::MRMS, known::MODEL_DATA]
+        .iter()
+        .map(|id| (source_grid_budget_bytes(id), source_grid_staging_bytes(id)))
+        .collect();
+    assert_eq!(
+        priced.len(),
+        expected.len(),
+        "precondition: the walk found both gridded layers the pane shows",
+    );
+    // Order-free: the walk's order is the pane's texture roster, a HashMap's.
+    for row in &expected {
+        assert!(
+            priced.contains(row),
+            "the scene is not carrying {row:?}; it carries {priced:?}",
+        );
+    }
+    assert!(
+        expected.contains(&(
+            source_grid_budget_bytes(&known::MRMS),
+            source_grid_staging_bytes(&known::MRMS),
+        )) && source_grid_staging_bytes(&known::MRMS) > 0
+            && source_grid_staging_bytes(&known::MODEL_DATA) == 0,
+        "the premise: one layer here stages and the other does not, or neither \
+         assertion above can fail",
+    );
+}
+
 /// **Every gridded layer has a price, shown or not.** A table that listed only
 /// the layers already on screen would price the very act it exists to gate —
 /// reaching for a layer nothing is holding yet — at nothing.

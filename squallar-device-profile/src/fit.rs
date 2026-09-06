@@ -24,14 +24,16 @@
 //! **sum**, because the renderer's queue holds every band anyone has filed.
 //!
 //! **What is still priced at zero, said here rather than left to be
-//! discovered.** Three census families the `huge` leg measures have no term:
-//! the gridded handlers' per-frame staging grids (their
-//! [`crate::scene::OverlayGridNeed`] carries the grid *cache* budget alone,
-//! and the staging is not derivable from it), `loans out` (9.8 – 14.2 MB) and
-//! `tile bodies` (up to 9.5 MB). The first needs a second figure per layer on
-//! the scene; the other two are bounded by caches in `squallar-egui` and are
-//! together under 25 MB of a browser's 768 MiB host allowance. They are named
-//! zeroes, not silent ones.
+//! discovered.** Two census families the `huge` leg measures have no term:
+//! `loans out` (9.8 – 14.2 MB) and `tile bodies` (up to 9.5 MB). Both are
+//! bounded by caches in `squallar-egui` and are together under 25 MB of a
+//! browser's 768 MiB host allowance. They are named zeroes, not silent ones.
+//!
+//! The third and largest of them — the gridded handlers' per-frame staging
+//! grids — is priced since 2026-09-06:
+//! [`crate::scene::OverlayGridNeed::staging_bytes`] carries the handler's own
+//! `source_grid_staging_bytes` beside its cache budget, and
+//! [`NeedTerms::overlay_grids_host`] sums both.
 //!
 //! [`need_terms_for_pane`] prices one pane; [`need_terms`] is that over the
 //! panes plus the scene-level terms, and the two agree bit for bit by
@@ -181,12 +183,19 @@ pub struct NeedTerms {
     /// the loop-frame replies, which does not exist.
     pub loop_pictures_host: u64,
     /// **Every enabled gridded overlay's decoded source, on the host**, at
-    /// the budget its handler states — counted once however many panes show
+    /// the budgets its handler states — counted once however many panes show
     /// the layer, because the handler is one instance for the whole
     /// application ([`Scene::overlay_grids`]). Nothing until a pane enables a
     /// gridded layer; then MRMS, GMGSI or the model at their key-space grid
     /// budgets, which is what a gridded layer asks the heap to be able to
     /// hold.
+    ///
+    /// **Both of each layer's populations**: the key-space cache
+    /// ([`crate::scene::OverlayGridNeed::budget_bytes`]) *and* what the handler holds beside
+    /// it while a loop of the layer runs
+    /// ([`crate::scene::OverlayGridNeed::staging_bytes`] — the staged granule and
+    /// the retained decode buffer). The second was a named zero until 2026-09-06
+    /// and was the largest unpriced host family the `huge` leg measures.
     pub overlay_grids_host: u64,
     /// **One decoded Level II volume per radar loop frame, on the host** —
     /// resident frames at their measured size, pending frames at the
@@ -457,7 +466,10 @@ pub fn need_terms(scene: &Scene, budgets: &Budgets, grid_bytes: GridBytes) -> Ne
         );
     }
     for layer in &scene.overlay_grids {
-        terms.overlay_grids_host = terms.overlay_grids_host.saturating_add(layer.budget_bytes);
+        terms.overlay_grids_host = terms
+            .overlay_grids_host
+            .saturating_add(layer.budget_bytes)
+            .saturating_add(layer.staging_bytes);
     }
     terms
 }

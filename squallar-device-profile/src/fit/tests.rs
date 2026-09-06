@@ -274,26 +274,180 @@ fn every_term_is_the_cost_function_it_reuses() {
     assert_eq!(tiles.total().gpu_bytes, 0);
     assert_eq!(tiles.total().host_bytes, 193 * 1_030_000);
 
-    // Gridded overlays: each enabled layer's budget as its handler states
-    // it, once, on the host — MRMS's two desktop grids (49 MB apiece; its
-    // cache keys by product and there are two) and GMGSI's four (15 MB
-    // apiece, one byte a point, so 60 MB).
+    // Gridded overlays: each enabled layer's budgets as its handler states
+    // them, once, on the host — MRMS's two desktop cache grids (49 MB apiece;
+    // its cache keys by product and there are two) and GMGSI's four (15 MB
+    // apiece, one byte a point, so 60 MB), plus what each stages beside its
+    // cache while a loop runs (two grids apiece: the staged granule and the
+    // pool's retained buffer).
     // Inputs, not reads of those constants: what is under test is that the
-    // term sums the budgets it is handed, once each.
+    // term sums both figures it is handed, once each.
     let gridded = terms(&Scene {
         overlay_grids: vec![
             OverlayGridNeed {
                 budget_bytes: 98_000_000,
+                staging_bytes: 98_000_000,
             },
             OverlayGridNeed {
                 budget_bytes: 60_000_000,
+                staging_bytes: 30_000_000,
             },
         ],
         ..Scene::empty()
     });
-    assert_eq!(gridded.overlay_grids_host, 158_000_000);
+    assert_eq!(gridded.overlay_grids_host, 286_000_000);
     assert_eq!(gridded.total().gpu_bytes, 0);
-    assert_eq!(gridded.total().host_bytes, 158_000_000);
+    assert_eq!(gridded.total().host_bytes, 286_000_000);
+
+    // **The staging term is summed, not absorbed into the cache budget.** The
+    // same two layers with nothing staged price the cache alone, and the
+    // difference between the two readings is exactly the staging handed in —
+    // so a `staging_bytes` the fold dropped, or one it double-counted, moves
+    // this equality rather than only the total above.
+    let cache_only = terms(&Scene {
+        overlay_grids: vec![
+            OverlayGridNeed {
+                budget_bytes: 98_000_000,
+                staging_bytes: 0,
+            },
+            OverlayGridNeed {
+                budget_bytes: 60_000_000,
+                staging_bytes: 0,
+            },
+        ],
+        ..Scene::empty()
+    });
+    assert_eq!(cache_only.overlay_grids_host, 158_000_000);
+    assert_eq!(
+        gridded.overlay_grids_host - cache_only.overlay_grids_host,
+        128_000_000,
+    );
+}
+
+/// **The staging term moves the ladder, and only where it should — both arms
+/// of the same boundary.**
+///
+/// The figure is a real charge against the host allowance, so the test that
+/// matters is not that the sum rose but that the ladder now answers a scene
+/// differently. That has two failure directions and the second is the worse
+/// one: a term that under-fires leaves a scene resident it cannot hold, a term
+/// that **over**-fires sheds picture quality from a scene that always fitted,
+/// on every start, with nothing to say why.
+///
+/// So the two scenes here differ in exactly one field. The wall is placed by
+/// construction between their two prices — half a staged grid above the one
+/// and half below the other — and both prices are asserted before either
+/// verdict is read, so a term that stopped being summed at all would fail here
+/// as a moved *premise* rather than as a passing control.
+#[test]
+fn the_staging_term_sheds_the_scene_it_pushes_over_and_leaves_the_one_that_fits() {
+    // MRMS on the desktop arm as its handler states the two figures: a
+    // two-grid key-space cache, and two more grids beside it while a loop of
+    // the layer runs (the staged granule and the pool's retained buffer).
+    // Inputs, not reads of that crate's constants — this crate sits under it.
+    const CACHE: u64 = 98_000_000;
+    const STAGING: u64 = 98_000_000;
+
+    // The `huge` leg's canvas and tiles with its loop parked: thirteen overlay
+    // pictures the ladder can actually shed, and no loop, so the two scenes
+    // enter the ladder at identical budgets and the only difference between
+    // their prices is the field under test.
+    let base = {
+        let mut scene = huge(13);
+        scene.panes[0].looping = false;
+        scene.panes[0].loop_scans_needed = false;
+        scene.panes[0].loop_scans_resident_frames = 0;
+        scene.panes[0].loop_scans_resident_bytes = 0;
+        scene
+    };
+    let bare_scene = base.clone();
+    let cache_only = Scene {
+        overlay_grids: vec![OverlayGridNeed {
+            budget_bytes: CACHE,
+            staging_bytes: 0,
+        }],
+        ..base.clone()
+    };
+    let staged = Scene {
+        overlay_grids: vec![OverlayGridNeed {
+            budget_bytes: CACHE,
+            staging_bytes: STAGING,
+        }],
+        ..base
+    };
+
+    let profile = shipped_profile(BudgetLimits::DESKTOP);
+    let class = resolve(&profile);
+    let priced = |scene: &Scene| need(scene, &class, stand_in_grid_bytes).host_bytes;
+
+    // The premises, before any verdict, and both directions of them: the
+    // control is its scene plus one cache budget and NOTHING else, and the
+    // staged scene is the control plus the whole staging figure. The wall
+    // below is placed from the bare scene's own price rather than from either
+    // of these, so a term that over-charges cannot move the wall out of its
+    // own way.
+    let bare = priced(&bare_scene);
+    assert_eq!(
+        priced(&cache_only) - bare,
+        CACHE,
+        "the control is being charged something beside its cache budget",
+    );
+    assert_eq!(
+        priced(&staged) - priced(&cache_only),
+        STAGING,
+        "the staging figure is not reaching the host total the ladder reads",
+    );
+
+    // A host wall half a staged grid above the control's price. The GPU pool
+    // is large enough that nothing on that axis binds, so every verdict below
+    // is the host axis's.
+    let host_wall = {
+        let inverse = Capacity::measured(0, None);
+        inverse.gpu_bytes_for_allowance(bare + CACHE + STAGING / 2)
+    };
+    let cap = Capacity::measured(64 * 1024 * MIB, Some(host_wall));
+    let allowance = cap.host_allowance().expect("a host wall was given");
+    assert!(
+        priced(&cache_only) <= allowance && allowance < priced(&staged),
+        "the wall must sit between the two prices: {} <= {allowance} < {}",
+        priced(&cache_only),
+        priced(&staged),
+    );
+
+    // **Must not fire.** The control's price is unchanged by a staging figure
+    // of zero, it is under the wall, and the ladder leaves it where the class
+    // put it — no rung spent, on either axis.
+    assert_eq!(
+        over(&cache_only, &class, &cap, stand_in_grid_bytes),
+        (false, false),
+        "the control was over before the ladder ran",
+    );
+    let control_fit = fit(&cache_only, &profile, &cap, stand_in_grid_bytes);
+    assert_eq!(control_fit.steps_back, 0, "the control shed a rung");
+    assert_eq!(
+        control_fit,
+        admit(&cache_only, &profile, &cap, stand_in_grid_bytes),
+        "the control came back off the rung admission put it on",
+    );
+
+    // **Must fire.** The same scene with the layer's staging charged is over
+    // the same wall on the host axis alone, and the ladder answers it by
+    // shedding — and by shedding enough, which is the point of charging it.
+    assert_eq!(
+        over(&staged, &class, &cap, stand_in_grid_bytes),
+        (false, true),
+        "the staged scene was not over the host wall at the class rung",
+    );
+    let shed_fit = fit(&staged, &profile, &cap, stand_in_grid_bytes);
+    assert!(
+        shed_fit.steps_back > 0,
+        "the staged scene was priced over the wall and the ladder shed nothing",
+    );
+    assert_eq!(
+        over(&staged, &shed_fit, &cap, stand_in_grid_bytes),
+        (false, false),
+        "the ladder stopped while the staged scene was still over the wall",
+    );
 }
 
 /// **A loop's decoded volumes are priced at what they measured where the

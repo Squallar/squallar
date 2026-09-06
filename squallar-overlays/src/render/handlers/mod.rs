@@ -42,6 +42,11 @@ use squallar_source::id::{LayerId, known};
 /// the UI layer's registry, behind a coupling ceiling). Keyed by id and spelled
 /// here, beside the registrations, so a gridded layer added to [`sources`]
 /// without a row here is a review question in one file.
+///
+/// **The cache alone.** What a gridded handler holds *beside* the cache while a
+/// loop of its layer runs is [`source_grid_staging_bytes`], and the two are
+/// summed by the caller rather than folded together here — see that function
+/// for why one figure cannot carry both.
 pub fn source_grid_budget_bytes(id: &LayerId) -> u64 {
     if *id == known::MRMS {
         crate::mrms::GRID_CACHE_BYTES as u64
@@ -49,6 +54,46 @@ pub fn source_grid_budget_bytes(id: &LayerId) -> u64 {
         gmgsi::GRID_CACHE_BYTES as u64
     } else if *id == known::MODEL_DATA {
         model::MODEL_GRID_BUDGET_BYTES as u64
+    } else {
+        0
+    }
+}
+
+/// **The host bytes a gridded layer's handler keeps BESIDE its cache while a
+/// loop of the layer runs** — the second population
+/// [`source_grid_budget_bytes`] does not reach, and which every gridded
+/// handler's own `resident_source_bytes` already sums.
+///
+/// Two blocks per staging layer, each read off the constant that owns it:
+///
+/// * the handler's **frame-granule cache**, at its `FRAME_STAGING_BYTES`
+///   budget — one granule staged at a time, however many frames the loop
+///   holds, because a loop frame's storage is its texture and the granule is
+///   only what one passes through on the way to being one;
+/// * the **retained decode buffer** [`crate::staging::StagingPool`] parks
+///   between granules, at the nominal shape that pool was declared with. It is
+///   a second live block whatever the frame cache is holding: the slot is full
+///   exactly when the cache is not.
+///
+/// The model layer answers zero. It stages nothing: its `resident_source_bytes`
+/// is its cache plus the pane's carry, with no frame cache and no pool.
+///
+/// **Why this is not a multiplier over [`source_grid_budget_bytes`].** MRMS's
+/// grid is half its cache budget and GMGSI's is a quarter of its, so no
+/// coefficient over `budget_bytes` is the same statement on both layers — and
+/// one written where the budget system reads it would be a figure spelled as
+/// arithmetic over this crate's private constants, which re-derives silently
+/// the day one of them moves. Each term below names its own owner instead, so a
+/// width or a shape that changes carries this figure with it.
+pub fn source_grid_staging_bytes(id: &LayerId) -> u64 {
+    if *id == known::MRMS {
+        (crate::mrms::FRAME_STAGING_BYTES
+            + crate::mrms::staging::STAGING_POINTS
+                * crate::mrms::staging::StagingPool::ELEMENT_BYTES) as u64
+    } else if *id == known::GMGSI {
+        (gmgsi::FRAME_STAGING_BYTES
+            + crate::gmgsi::staging::STAGING_POINTS
+                * crate::gmgsi::staging::StagingPool::ELEMENT_BYTES) as u64
     } else {
         0
     }
@@ -245,6 +290,75 @@ mod grid_budget_tests {
         }
     }
 
+    /// **The staging figure is two whole grids on each staging layer, and it
+    /// is not a multiple of the cache budget.**
+    ///
+    /// The first half is the property: one staged granule plus one retained
+    /// decode buffer, each of the layer's own shape. The second half is the
+    /// reason the figure has to exist separately at all — the same coefficient
+    /// over `budget_bytes` cannot produce both, because MRMS budgets two grids
+    /// and GMGSI four.
+    #[test]
+    fn a_staging_layer_answers_two_of_its_own_grids_and_no_ratio_of_its_budget() {
+        let mrms = source_grid_staging_bytes(&known::MRMS);
+        assert_eq!(mrms, 2 * crate::mrms::CONUS_GRID_BYTES as u64);
+
+        let gmgsi_bytes = source_grid_staging_bytes(&known::GMGSI);
+        assert_eq!(gmgsi_bytes, 2 * gmgsi::GLOBAL_GRID_BYTES as u64);
+
+        // The two ratios differ, which is the whole reason for a second
+        // function: `staging = budget` on MRMS and `staging = budget / 2` on
+        // GMGSI, so neither spelling is the other layer's.
+        assert_eq!(mrms, source_grid_budget_bytes(&known::MRMS));
+        assert_eq!(gmgsi_bytes * 2, source_grid_budget_bytes(&known::GMGSI));
+
+        // The model layer stages nothing: no frame cache, no pool.
+        assert_eq!(source_grid_staging_bytes(&known::MODEL_DATA), 0);
+
+        for id in [
+            known::RADAR,
+            known::METAR,
+            known::NWS_ALERTS,
+            known::LIGHTNING,
+            known::CITY_LABELS,
+            known::SPC_OUTLOOK,
+        ] {
+            assert_eq!(source_grid_staging_bytes(&id), 0, "{}", id.as_str());
+        }
+    }
+
+    /// **Nothing is priced as staging that the layer's own residency does not
+    /// count**, and nothing a staging layer holds is left out of both figures:
+    /// the two functions together are exactly the three blocks
+    /// `resident_source_bytes` sums — the cache, the staged granule, the
+    /// retained slot.
+    #[test]
+    fn the_two_figures_together_cover_every_block_a_handler_sums() {
+        for (id, cache, staged, slot) in [
+            (
+                known::MRMS,
+                crate::mrms::GRID_CACHE_BYTES,
+                crate::mrms::FRAME_STAGING_BYTES,
+                crate::mrms::staging::STAGING_POINTS
+                    * crate::mrms::staging::StagingPool::ELEMENT_BYTES,
+            ),
+            (
+                known::GMGSI,
+                gmgsi::GRID_CACHE_BYTES,
+                gmgsi::FRAME_STAGING_BYTES,
+                crate::gmgsi::staging::STAGING_POINTS
+                    * crate::gmgsi::staging::StagingPool::ELEMENT_BYTES,
+            ),
+        ] {
+            assert_eq!(
+                source_grid_budget_bytes(&id) + source_grid_staging_bytes(&id),
+                (cache + staged + slot) as u64,
+                "{}",
+                id.as_str(),
+            );
+        }
+    }
+
     /// Every registered handler whose source is a grid has a row above: the
     /// handlers that report source bytes are exactly the ones priced here.
     /// A gridded layer registered without a row would be priced at one
@@ -257,5 +371,15 @@ mod grid_budget_tests {
             .filter(|id| source_grid_budget_bytes(id) > 0)
             .collect();
         assert_eq!(priced, vec![known::MODEL_DATA, known::MRMS, known::GMGSI]);
+
+        // A layer that stages is a layer that caches: nothing may answer a
+        // staging figure without a cache budget, or the sum the scene reads
+        // would price a population with no home.
+        let staging: Vec<LayerId> = sources()
+            .iter()
+            .map(|h| h.id().clone())
+            .filter(|id| source_grid_staging_bytes(id) > 0)
+            .collect();
+        assert_eq!(staging, vec![known::MRMS, known::GMGSI]);
     }
 }
