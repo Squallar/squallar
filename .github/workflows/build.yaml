@@ -1306,8 +1306,8 @@ jobs:
   # failing.
   # `needs: [build]` and nothing else -- NOT `macos-universal`, NOT
   # `ios-testflight`. Both of those talk to Apple on Apple's clock: the notary
-  # poll waits up to NOTARY_TIMEOUT (900 s) and the App Store upload polls
-  # App Store Connect. A job in this list gates `deploy-cloudfront` by
+  # stage waits for Apple's verdict unconditionally (only GitHub's own job
+  # timeout bounds it) and the App Store upload polls App Store Connect. A job in this list gates `deploy-cloudfront` by
   # *duration* as well as by result, so an earlier design that made the Apple
   # submissions non-fatal still held the website behind a 15-minute wait -- it
   # fixed failure coupling and left latency coupling untouched. The user's
