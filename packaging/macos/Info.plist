@@ -32,6 +32,19 @@
          visibly soft. Nothing in the code can compensate for it. -->
     <key>NSHighResolutionCapable</key>
     <true/>
+    <!-- Required by App Store Connect's asset validation for a macOS build:
+         an upload with no `LSApplicationCategoryType`, or one whose value is
+         not a category Apple publishes, is rejected. It is written here and
+         not only in the store variant's plist because the key is inert for
+         the direct-download build — Finder reads it to group the app in
+         "Applications by Category" and nothing else consumes it — so one
+         value in one file cannot drift from the other channel's.
+
+         `public.app-category.weather` is Apple's own identifier for the
+         Weather category, and is the one whose App Store section the app
+         would ship in. -->
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.weather</string>
     <!-- Both location keys, deliberately.
 
          `NSLocationWhenInUseUsageDescription` is the iOS key and **does not

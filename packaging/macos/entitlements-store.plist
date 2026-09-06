@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for CHANNEL=store ONLY: the sandboxed build that goes to App
+  Store Connect for TestFlight. The direct-download build (CHANNEL=direct,
+  Developer ID + notarized) signs with NO entitlements file at all and must
+  keep doing so — it is not sandboxed, deliberately, and pointing this file
+  at it would containerise a shipping app behind the user's back.
+
+  `$(TEAM_ID)` and `$(PRODUCT_BUNDLE_IDENTIFIER)` are substituted by
+  packaging/macos/Makefile the same way Info.plist's are, from the values read
+  out of the embedded provisioning profile rather than typed here. Signing an
+  app whose `com.apple.application-identifier` disagrees with the profile is
+  rejected on upload, so the profile is the single source and this file only
+  names the shape.
+
+  Four keys, and each one is here because something in the tree calls it. A
+  capability nothing calls is not an entitlement we ask for — an unused
+  entitlement is a question at review with no answer.
+-->
+<plist version="1.0">
+<dict>
+    <!-- The two keys TestFlight is actually strict about, and the reason a
+         Mac App Store app that never used TestFlight can ship without either.
+         They must agree, exactly, with the embedded provisioning profile:
+         App Store Connect refuses an upload whose application-identifier
+         disagrees with the profile it was signed against. The Makefile
+         substitutes both from the profile rather than from anything typed
+         here, so there is one source and it is the profile. -->
+    <key>com.apple.application-identifier</key>
+    <string>$(TEAM_ID).$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <key>com.apple.developer.team-identifier</key>
+    <string>$(TEAM_ID)</string>
+
+    <!-- The switch itself. Required at upload: App Store Connect's asset
+         validation rejects a macOS build whose executables lack it, with
+         "App sandbox not enabled ... must include the
+         'com.apple.security.app-sandbox' entitlement with a Boolean value of
+         true" (ITMS-90296). That gate sits in front of TestFlight, not after
+         it, so there is no non-sandboxed route to a beta build. -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+
+    <!-- Outbound sockets. Everything the app draws is fetched: the NEXRAD
+         archive and chunk streams, basemap and terrain tiles, HRRR, MRMS,
+         GMGSI, GLM, SPC, METAR and the NWS alert/zone feeds, plus the
+         `ewebsock` chunk notifier (squallar-radar/src/chunk_notify.rs:267,
+         wss://nexrad-aws-notifier.mcswain.dev). Without it every connect
+         fails and the map is empty. -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+
+    <!-- CoreLocation. squallar-location/src/os_location/apple.rs calls
+         CLLocationManager::new() (:378), requestWhenInUseAuthorization()
+         (:419) and startUpdatingLocation() (:199) for real; the app uses the
+         fix to place the user and pick the nearest radar site.
+
+         This one fails SILENTLY without the entitlement, which is why it is
+         worth naming: requestWhenInUseAuthorization returns `void`, so a
+         denied request produces no dialog, no error at the call site and no
+         fix — the same shape the Info.plist comment already documents for a
+         missing usage-description key. NSLocationUsageDescription is present
+         (Info.plist) and is the other half; neither works alone. -->
+    <key>com.apple.security.personal-information.location</key>
+    <true/>
+
+    <!-- Not here, and each for a reason:
+
+         * `com.apple.security.network.server` — every TcpListener::bind in
+           the tree is a loopback stub inside a #[cfg(test)] module. Nothing
+           listens in a shipping build.
+         * `com.apple.security.files.user-selected.*`, `files.bookmarks.*`,
+           `files.downloads.*` — there is no file dialog, no drag-and-drop
+           and no path the user names. Every persistence root is derived from
+           $HOME (squallar/src/platform.rs:85-136: config, zone cache,
+           basemap block cache, basemap downloads), and the sandbox redirects
+           $HOME into ~/Library/Containers/<bundle-id>/Data, so those four
+           roots land inside the container with no entitlement at all.
+         * `com.apple.security.device.serial` — the serial GPS reader is not
+           compiled into this variant. CHANNEL=store builds the `squallar`
+           package with default features disabled, which drops the `gps-serial`
+           feature and with it `serialport`, the port dropdown and the three
+           gps.* settings rows. Shipping the reader without the entitlement
+           would leave a dropdown that can never populate
+           (squallar-nmea-serial/src/serial.rs:30 returns Err -> empty Vec);
+           dropping the feature removes the UI instead of breaking it.
+         * `com.apple.security.device.usb`, `.bluetooth`, `.camera`,
+           `.audio-input`, `personal-information.addressbook`/`.calendars`,
+           `print`, `scripting-targets` — no code, no dependency.
+         * Anything for GPU/Metal — there is no such entitlement. wgpu talks
+           to Metal in-process and the sandbox does not gate it. The capacity
+           reader's mach_host_self()/host_statistics64
+           (squallar/src/capacity/apple.rs:102) is the task's own host port,
+           not a bootstrap lookup of a named service, so it needs no
+           mach-lookup exception either.
+         * `com.apple.security.cs.*` (allow-jit, disable-library-validation,
+           allow-unsigned-executable-memory) — these are hardened-runtime
+           exceptions, not sandbox keys. Nothing in this tree JITs or loads an
+           unsigned library; the direct-download build already runs under the
+           hardened runtime with none of them. -->
+</dict>
+</plist>

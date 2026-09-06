@@ -67,6 +67,13 @@ const IOS_INFO_PLIST: &str = include_str!("../../packaging/ios/Info.plist");
 const MACOS_INFO_PLIST: &str = include_str!("../../packaging/macos/Info.plist");
 #[cfg(test)]
 const PRIVACY_MANIFEST: &str = include_str!("../../packaging/PrivacyInfo.xcprivacy");
+/// The store variant's sandbox entitlements. Not a bundle file — it is handed
+/// to `rcodesign sign --entitlements-xml-path` — but it is XML that ships in
+/// the signature, and it is read by the one tool in the chain that will not
+/// tell you it was unreadable.
+#[cfg(test)]
+const MACOS_STORE_ENTITLEMENTS: &str =
+    include_str!("../../packaging/macos/entitlements-store.plist");
 #[cfg(test)]
 const IOS_MAKEFILE: &str = include_str!("../../packaging/ios/Makefile");
 #[cfg(test)]
@@ -665,6 +672,10 @@ mod tests {
             ("packaging/ios/Info.plist", IOS_INFO_PLIST),
             ("packaging/macos/Info.plist", MACOS_INFO_PLIST),
             ("packaging/PrivacyInfo.xcprivacy", PRIVACY_MANIFEST),
+            (
+                "packaging/macos/entitlements-store.plist",
+                MACOS_STORE_ENTITLEMENTS,
+            ),
         ] {
             let mut rest = xml;
             let mut consumed = 0usize;
@@ -707,6 +718,36 @@ mod tests {
                 consumed += step;
                 rest = &rest[step..];
             }
+        }
+    }
+
+    /// The store variant declares the sandbox, and declares it `true`.
+    ///
+    /// This is the entitlement the App Store Connect *upload validator* checks,
+    /// upstream of TestFlight and of any review a human performs: an upload
+    /// without `com.apple.security.app-sandbox` set to a boolean true is
+    /// refused as ITMS-90296. Internal testers skip Beta App Review; nobody
+    /// skips the validator.
+    ///
+    /// Asserted here rather than trusted to the file because the failure
+    /// arrives late — after a build, a sign and an upload — and reads as a
+    /// distribution problem rather than as a missing key.
+    #[test]
+    fn the_store_entitlements_declare_the_sandbox() {
+        let xml = without_xml_comments(MACOS_STORE_ENTITLEMENTS);
+        for key in [
+            "com.apple.security.app-sandbox",
+            "com.apple.security.network.client",
+        ] {
+            assert_eq!(
+                plist_value(&xml, key),
+                Some("<true/>"),
+                "packaging/macos/entitlements-store.plist must declare {key} as \
+                 <true/>; got {:?}. Without app-sandbox the upload is refused \
+                 as ITMS-90296, and without network.client the app is sandboxed \
+                 into fetching nothing",
+                plist_value(&xml, key)
+            );
         }
     }
 }

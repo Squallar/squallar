@@ -287,6 +287,52 @@ NOTARY_RETRY_SLEEP ?= 30
 # staple attempts before publishing the bundle as PENDING-NOTARIZATION.
 NOTARY_STAPLE_TRIES ?= 10
 
+# ── CHANNEL: which of the two macOS products this run is building ──────
+#
+#   direct  (default)  Developer ID Application, hardened runtime, notarized,
+#                      ticket stapled, NOT sandboxed. This is the build on the
+#                      website. Everything above in this file describes it.
+#   store              Apple Distribution, App Sandbox ON, embedded
+#                      provisioning profile, wrapped in a .pkg signed with a
+#                      Mac Installer Distribution certificate, uploaded to App
+#                      Store Connect for TestFlight. Never notarized: App
+#                      Review is that channel's gate, and the notary is not.
+#
+# The two are different products, not one product with a flag. A store build
+# is sandboxed and a direct build must never be -- sandboxing the download
+# would containerise a shipping app behind the user's back -- so the sandbox
+# entitlement lives in packaging/macos/entitlements-store.plist and is reached
+# only from this variable's `store` value.
+#
+# The `$(error)` is not decoration. The direct path already names its outcomes
+# honestly -- `squallar.app.zip` only with a stapled ticket, and
+# `-NOT-NOTARIZED` / `-PENDING-NOTARIZATION` for every other one -- because a
+# name that can assert a false fact is how a reader works it out wrong. A
+# misspelled or not-yet-configured channel must fail the same way rather than
+# fall through to whichever arm happens to be last: an unrecognised CHANNEL
+# stops make at parse time, before any artifact exists to be mislabelled.
+CHANNEL ?= direct
+ifneq ($(filter-out direct store,$(CHANNEL)),)
+$(error CHANNEL must be `direct` or `store`, got `$(CHANNEL)`)
+endif
+
+# The store variant's App Sandbox entitlements. Read only when CHANNEL=store;
+# the direct build signs with no entitlements file at all and must keep doing
+# so. Every key in it is justified against a call site in the file itself.
+STORE_ENTITLEMENTS ?= $(ROOT)/packaging/macos/entitlements-store.plist
+# The Mac App Store provisioning profile for `app.squallar`, copied into the
+# bundle as Contents/embedded.provisionprofile. TestFlight REQUIRES one even
+# though the Mac App Store does not: a main bundle without it uploads and then
+# reports ITMS-90889, "Cannot be used with TestFlight because the bundle ...
+# is missing a provisioning profile", and the build sits in App Store Connect
+# marked Not Available for Testing. In CI it arrives base64 in the secret
+# MACOS_STORE_PROFILE.
+STORE_PROFILE ?=
+# Builds the flat .pkg. Split out of this file because it is thirty lines of
+# cpio/mkbom/xar that have nothing to do with make, and because it is testable
+# on its own against any .app.
+MKPKG ?= $(ROOT)/packaging/macos/mkpkg.sh
+
 .PHONY: build clean
 build:
 	@cd "$(ROOT)"
@@ -495,7 +541,79 @@ build:
 	  NOTARY_READY=1
 	fi
 	IDENTITY=none
-	if ! command -v $(RCODESIGN) >/dev/null 2>&1; then
+	if [ "$(CHANNEL)" = store ]; then
+	  # ---- the store arm: sandboxed, provisioned, NOT notarized ----
+	  # A different certificate, a different entitlement set and an embedded
+	  # profile. It shares only the bundle layout with the direct arm, which
+	  # is why it branches here and not earlier.
+	  #
+	  # Nothing below is a fallback. A store build that is not signed with an
+	  # Apple Distribution certificate is not a degraded store build, it is an
+	  # artifact that cannot be uploaded, and the packaging stage names it as
+	  # one. The direct arm's ad-hoc fallback exists so a fork's pull request
+	  # still produces a runnable app; there is no equivalent need here,
+	  # because nobody runs a store .pkg locally.
+	  command -v $(RCODESIGN) >/dev/null 2>&1 || { echo "ERROR: CHANNEL=store needs $(RCODESIGN) on PATH."; exit 1; }
+	  # The profile goes in BEFORE signing. It lives inside the bundle, so the
+	  # signature seals it; adding it afterwards breaks the seal exactly the
+	  # way the NOTARIZATION file's comment describes further down.
+	  PROFILE_SRC=
+	  if [ -n "$(STORE_PROFILE)" ]; then
+	    PROFILE_SRC="$(STORE_PROFILE)"
+	  elif [ -n "$${MACOS_STORE_PROFILE:-}" ]; then
+	    PROFILE_SRC="$$SCRATCH/store.provisionprofile"
+	    printf '%s' "$${MACOS_STORE_PROFILE}" | base64 -d > "$$PROFILE_SRC" 2>/dev/null \
+	      || { echo "ERROR: MACOS_STORE_PROFILE is not base64."; exit 1; }
+	  fi
+	  TEAM_ID=
+	  if [ -n "$$PROFILE_SRC" ]; then
+	    cp "$$PROFILE_SRC" "$$APP/Contents/embedded.provisionprofile"
+	    echo "    embedded.provisionprofile: installed"
+	    # The profile is CMS-wrapped XML. `openssl cms -verify -noverify`
+	    # unwraps it without checking Apple's signature -- the check would need
+	    # Apple's CA chain and proves nothing here, since a profile that is not
+	    # Apple's will be rejected on upload anyway. The team id is the one
+	    # value the entitlements have to agree with, and reading it out of the
+	    # profile is what keeps them agreeing.
+	    if command -v openssl >/dev/null 2>&1; then
+	      TEAM_ID="$$(openssl cms -verify -noverify -inform DER -in "$$PROFILE_SRC" 2>/dev/null \
+	        | sed -n '/<key>com.apple.developer.team-identifier<\/key>/{n;s/.*<string>\(.*\)<\/string>.*/\1/p;}' | head -1)"
+	      [ -n "$$TEAM_ID" ] || TEAM_ID="$$(openssl cms -verify -noverify -inform DER -in "$$PROFILE_SRC" 2>/dev/null \
+	        | sed -n '/<key>TeamIdentifier<\/key>/,/<\/array>/{s/.*<string>\(.*\)<\/string>.*/\1/p;}' | head -1)"
+	    fi
+	  else
+	    echo "note: no MACOS_STORE_PROFILE / STORE_PROFILE, so no provisioning profile is embedded."
+	  fi
+	  if [ -n "$${MACOS_STORE_P12:-}" ] && [ -n "$$TEAM_ID" ]; then
+	    SP12="$$SCRATCH/store.p12"
+	    printf '%s' "$${MACOS_STORE_P12}" | base64 -d > "$$SP12" 2>/dev/null \
+	      || { echo "ERROR: MACOS_STORE_P12 is not base64."; exit 1; }
+	    SPWFILE="$$SCRATCH/store.pw"
+	    printf '%s' "$${MACOS_STORE_P12_PASSWORD:-}" > "$$SPWFILE"
+	    # The entitlements are rendered here, from the template, with the team
+	    # id the profile just gave us. Substituting rather than typing the
+	    # value is what stops the two from drifting into an upload rejection.
+	    ENTS="$$SCRATCH/entitlements.plist"
+	    sed -e "s|\$$(TEAM_ID)|$$TEAM_ID|g" \
+	        -e "s|\$$(PRODUCT_BUNDLE_IDENTIFIER)|$$BUNDLE_ID|g" \
+	        "$(STORE_ENTITLEMENTS)" > "$$ENTS"
+	    echo "==> signing for the App Store (sandboxed, team $$TEAM_ID)"
+	    # `--code-signature-flags runtime` for the same reason the direct arm
+	    # sets it, plus one: the guard below counts the flag on every Mach-O
+	    # and does not know which channel produced them. The hardened runtime
+	    # is accepted on Mac App Store builds, so satisfying that guard costs
+	    # this arm nothing.
+	    $(RCODESIGN) sign --p12-file "$$SP12" --p12-password-file "$$SPWFILE" \
+	        --code-signature-flags runtime \
+	        --entitlements-xml-path "$$ENTS" "$$APP" \
+	      && IDENTITY=store \
+	      || { echo "ERROR: signing for the App Store failed."; exit 1; }
+	    echo "    signed with the Apple Distribution certificate and the sandbox entitlements."
+	  else
+	    [ -n "$${MACOS_STORE_P12:-}" ] || echo "note: no MACOS_STORE_P12, so the app is not signed for the store."
+	    [ -n "$$TEAM_ID" ] || echo "note: no team id could be read, so the entitlements cannot be rendered."
+	  fi
+	elif ! command -v $(RCODESIGN) >/dev/null 2>&1; then
 	  echo ""
 	  echo "WARNING: $(RCODESIGN) is not on PATH, so squallar.app is UNSIGNED."
 	  echo "         An arm64 Mac will refuse to execute it at all, and on any Mac"
@@ -1090,7 +1208,61 @@ build:
 	# upload completed (the recovery record); this is the final word.
 	printf '%s\n' "$$SUBMISSION_ID" > "$$OUT/NOTARY_SUBMISSION_ID"
 
-	if [ -n "$(ARCHIVE)" ]; then
+	# ---- package (CHANNEL=store): a .pkg, and never a .zip ----
+	# App Store Connect takes a macOS build as an installer package and has no
+	# .app or .zip spelling, so this channel's artifact is not the direct
+	# channel's artifact under another name. The .pkg is built by mkpkg.sh
+	# (cpio + mkbom + xar; see that file for why none of it needs a Mac) and
+	# then signed as a whole -- `rcodesign sign` signs a XAR pkg installer
+	# directly. A pkg is a container: signing it does NOT sign the app inside
+	# it, which is why the bundle was signed and provisioned above first.
+	#
+	# The name carries the same discipline the zip names do one branch down.
+	# `squallar.pkg` asserts three things at once -- the app is signed with an
+	# Apple Distribution certificate, it carries an embedded provisioning
+	# profile, and the package itself is signed with a Mac Installer
+	# Distribution certificate -- because all three are required and any one
+	# missing is an upload App Store Connect rejects. Every other outcome is
+	# `squallar-NOT-UPLOADABLE.pkg`, which says what is true of it rather than
+	# leaving a reader to find out from Apple twenty minutes later.
+	if [ "$(CHANNEL)" = store ]; then
+	  PKG_OK=1
+	  [ "$$IDENTITY" = store ] || { PKG_OK=; echo "note: app not signed for the store, so the .pkg cannot be uploaded."; }
+	  [ -f "$$APP/Contents/embedded.provisionprofile" ] || { PKG_OK=; echo "note: no embedded.provisionprofile, so TestFlight would reject this (ITMS-90889)."; }
+	  [ -x "$(MKPKG)" ] || { echo "ERROR: $(MKPKG) is missing or not executable."; exit 1; }
+	  PKGNAME=squallar-NOT-UPLOADABLE.pkg
+	  ( cd "$$OUT" && rm -f squallar.pkg squallar-NOT-UPLOADABLE.pkg )
+	  "$(MKPKG)" "$$APP" "$$BUNDLE_ID" "$$MARKETING_VERSION" "$$CURRENT_PROJECT_VERSION" \
+	      "$$OUT/squallar-unsigned.pkg"
+	  # The installer certificate is a SECOND certificate and a different kind
+	  # from the one that signed the app: Apple issues "Mac Installer
+	  # Distribution" (it appears in a keychain as `3rd Party Mac Developer
+	  # Installer:`) only for signing packages, and an app-signing certificate
+	  # cannot stand in for it. Without it the package is still well formed
+	  # and still says so -- it just cannot be uploaded.
+	  if [ -n "$${MACOS_INSTALLER_P12:-}" ] && [ -n "$$PKG_OK" ]; then
+	    IPKG="$$SCRATCH/installer.p12"
+	    printf '%s' "$${MACOS_INSTALLER_P12}" | base64 -d > "$$IPKG" 2>/dev/null \
+	      || { echo "ERROR: MACOS_INSTALLER_P12 is not base64."; exit 1; }
+	    IPWFILE="$$SCRATCH/installer.pw"
+	    printf '%s' "$${MACOS_INSTALLER_P12_PASSWORD:-}" > "$$IPWFILE"
+	    $(RCODESIGN) sign --p12-file "$$IPKG" --p12-password-file "$$IPWFILE" \
+	        "$$OUT/squallar-unsigned.pkg" "$$OUT/squallar.pkg" \
+	      && PKGNAME=squallar.pkg \
+	      || { echo "ERROR: signing the .pkg with the installer certificate failed."; exit 1; }
+	    rm -f "$$OUT/squallar-unsigned.pkg"
+	  else
+	    [ -n "$${MACOS_INSTALLER_P12:-}" ] || echo "note: no MACOS_INSTALLER_P12, so the .pkg is unsigned."
+	    mv "$$OUT/squallar-unsigned.pkg" "$$OUT/$$PKGNAME"
+	  fi
+	  echo "Pkg: $(ROOT)/$$OUT/$$PKGNAME"
+	  if [ "$$PKGNAME" = squallar.pkg ]; then
+	    echo "Upload it with:"
+	    echo "  .github/scripts/appstore-upload.py --platform MAC_OS --pkg $$OUT/squallar.pkg"
+	  else
+	    echo "      This package cannot be uploaded to App Store Connect. See the notes above."
+	  fi
+	elif [ -n "$(ARCHIVE)" ]; then
 	  # actions/upload-artifact drops the executable bit, which turns a .app
 	  # into a directory macOS declines to launch. A zip carries the mode.
 	  #

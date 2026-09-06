@@ -42,6 +42,7 @@ import json
 import os
 import plistlib
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -49,6 +50,8 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+import zlib
+from xml.etree import ElementTree
 
 API = "https://api.appstoreconnect.apple.com"
 # Apple's own name for the audience; a token minted for anything else is
@@ -212,6 +215,73 @@ def ipa_metadata(path: str) -> tuple[str, str, str]:
             pl["CFBundleVersion"])
 
 
+def pkg_metadata(path: str) -> tuple[str, str, str]:
+    """(bundle id, CFBundleShortVersionString, CFBundleVersion) from the .pkg.
+
+    The macOS twin of `ipa_metadata`, and read out of the archive for the same
+    reason: the three values App Store Connect is told about should be the ones
+    inside the thing it is being told about, not a second copy that can drift.
+
+    A flat package is a XAR archive -- a 28-byte header, a zlib-compressed XML
+    table of contents, then a heap. The TOC gives each member's offset into the
+    heap, its stored length and its encoding, so reading one file is a seek and
+    a decompress. No xar(1) is involved, which matters because this script's
+    whole reason for existing is that it runs where Apple's tools do not.
+    """
+    with open(path, "rb") as f:
+        header = f.read(28)
+        if len(header) != 28 or header[:4] != b"xar!":
+            fail(f"{path} is not a XAR archive, so it is not a .pkg.")
+        # magic(4) header_size(2) version(2) toc_compressed(8)
+        # toc_uncompressed(8) checksum_algorithm(4)
+        hdr_size, _version, toc_len_c, _toc_len_u, _cksum = struct.unpack(
+            ">HHQQL", header[4:28])
+        f.seek(hdr_size)
+        toc_xml = zlib.decompress(f.read(toc_len_c))
+        heap_start = hdr_size + toc_len_c
+
+        root = ElementTree.fromstring(toc_xml)
+        entry = None
+        for file_el in root.iter("file"):
+            name_el = file_el.find("name")
+            if name_el is not None and name_el.text == "PackageInfo":
+                entry = file_el
+                break
+        if entry is None:
+            fail(f"{path} has no PackageInfo member, so it is not a component "
+                 "package App Store Connect would accept.")
+        data = entry.find("data")
+        if data is None:
+            fail(f"{path}: the PackageInfo entry carries no <data>.")
+        offset = int(data.find("offset").text)
+        length = int(data.find("length").text)
+        encoding = data.find("encoding")
+        style = encoding.get("style") if encoding is not None else ""
+        f.seek(heap_start + offset)
+        raw = f.read(length)
+    # `application/x-gzip` is what xar calls zlib here. An encoding this does
+    # not know is named rather than guessed at: a wrong guess would produce a
+    # plausible-looking bundle id read out of noise.
+    if style.endswith("gzip"):
+        raw = zlib.decompress(raw)
+    elif style and not style.endswith("octet-stream"):
+        fail(f"{path}: PackageInfo uses encoding {style!r}, which this script "
+             "does not decode.")
+
+    info = ElementTree.fromstring(raw)
+    bundle_id = info.get("identifier")
+    short_version = info.get("version")
+    bundle_el = info.find("./bundle-version/bundle")
+    build_version = (bundle_el.get("CFBundleVersion")
+                     if bundle_el is not None else None)
+    missing = [n for n, v in (("identifier", bundle_id),
+                              ("version", short_version),
+                              ("CFBundleVersion", build_version)) if not v]
+    if missing:
+        fail(f"{path}: PackageInfo is missing {', '.join(missing)}.")
+    return (bundle_id, short_version, build_version)
+
+
 def md5_of(path: str) -> str:
     h = hashlib.md5()
     with open(path, "rb") as f:
@@ -224,7 +294,24 @@ def md5_of(path: str) -> str:
 
 
 def upload(client: Client, ipa: str, platform: str, timeout_s: int) -> int:
-    bundle_id, short_version, build_version = ipa_metadata(ipa)
+    # iOS ships an .ipa, macOS a .pkg -- App Store Connect has no .app or .zip
+    # spelling of a macOS build. The two differ in exactly two places: where
+    # the version fields are read from, and the UTI the reservation declares.
+    #
+    # `com.apple.installer-package-archive` is Apple's published UTI for a
+    # flat installer package and is the value altool sends for `--type osx`.
+    # It is the ONE field in this script that has never been exercised against
+    # Apple: the iOS arm's `com.apple.ipa` has uploaded real builds, this one
+    # has not, and no public document states what /v1/buildUploadFiles expects
+    # for macOS. It is a named constant on one line for that reason -- if the
+    # reservation comes back rejecting the UTI, this is the line to change,
+    # and the error will say so rather than failing somewhere downstream.
+    if ipa.endswith(".pkg"):
+        bundle_id, short_version, build_version = pkg_metadata(ipa)
+        uti = "com.apple.installer-package-archive"
+    else:
+        bundle_id, short_version, build_version = ipa_metadata(ipa)
+        uti = "com.apple.ipa"
     size = os.path.getsize(ipa)
     note(f"==> {os.path.basename(ipa)}: {bundle_id} {short_version} "
          f"({build_version}), {size} bytes")
@@ -263,7 +350,7 @@ def upload(client: Client, ipa: str, platform: str, timeout_s: int) -> int:
                 "fileName": os.path.basename(ipa),
                 "fileSize": size,
                 "assetType": "ASSET",
-                "uti": "com.apple.ipa",
+                "uti": uti,
             },
             "relationships": {
                 "buildUpload": {"data": {"type": "buildUploads", "id": upload_id}}
@@ -432,6 +519,12 @@ def rehearse(ipa: str | None) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ipa")
+    # The macOS spelling. A separate flag rather than letting --ipa take a
+    # .pkg, because the two are not interchangeable and naming the wrong one
+    # should be a usage error here rather than a rejection from Apple twenty
+    # minutes later. Both land in the same variable below: everything after
+    # the metadata read is identical for the two asset kinds.
+    ap.add_argument("--pkg")
     ap.add_argument("--platform", default="IOS")
     ap.add_argument("--timeout", type=int, default=1800,
                     help="seconds to wait for Apple to finish processing")
@@ -440,13 +533,25 @@ def main() -> int:
                          "no network")
     a = ap.parse_args()
 
-    if a.rehearse:
-        return rehearse(a.ipa)
+    if a.ipa and a.pkg:
+        fail("--ipa and --pkg name two different assets; give exactly one.")
+    asset = a.ipa or a.pkg
+    # A macOS asset must be declared as one. The platform decides which app
+    # record the build attaches to, and a .pkg sent as IOS attaches to the iOS
+    # record -- which either fails late or, worse, succeeds against the wrong
+    # platform, so it is checked here rather than left to Apple.
+    if a.pkg and a.platform == "IOS":
+        fail("--pkg is a macOS asset; pass --platform MAC_OS with it.")
+    if a.platform == "MAC_OS" and a.ipa:
+        fail("--platform MAC_OS takes a .pkg (--pkg), not an .ipa.")
 
-    if not a.ipa:
-        fail("--ipa is required unless --rehearse is given.")
-    if not os.path.isfile(a.ipa):
-        fail(f"no such file: {a.ipa}")
+    if a.rehearse:
+        return rehearse(asset)
+
+    if not asset:
+        fail("--ipa or --pkg is required unless --rehearse is given.")
+    if not os.path.isfile(asset):
+        fail(f"no such file: {asset}")
 
     issuer = os.environ.get("APPSTORE_CONNECT_ISSUER_ID", "")
     key_id = os.environ.get("APPSTORE_CONNECT_KEY_ID", "")
@@ -475,7 +580,7 @@ def main() -> int:
             f.write(blob if blob.endswith("\n") else blob + "\n")
         os.chmod(key_path, 0o600)
         try:
-            return upload(Client(issuer, key_id, key_path), a.ipa, a.platform,
+            return upload(Client(issuer, key_id, key_path), asset, a.platform,
                           a.timeout)
         except ApiError as e:
             # Apple's refusal, printed as a refusal. A traceback here would
