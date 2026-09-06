@@ -110,8 +110,12 @@ fn the_polygon_rasterizers_hand_over_premultiplied_pixels() {
 /// every neighbour wrote premultiplied. One global choice of egui constructor is
 /// wrong about one of them whichever way it is made.
 ///
-/// The assertion is that the bytes are the palette's own, unscaled: a colour
-/// channel *above* alpha, which premultiplied RGBA cannot represent.
+/// The assertion used to be a colour channel *above* alpha, which
+/// premultiplied RGBA cannot represent. Every gridded texel is opaque now --
+/// the layer's translucency is its opacity, applied at paint time -- and at
+/// alpha 255 the two conventions agree byte for byte, so what is left to pin
+/// is the declaration itself, and that the bytes are the palette's own:
+/// unscaled and opaque.
 #[test]
 fn model_data_hands_over_straight_alpha() {
     let out = rasterize_gridded(
@@ -126,18 +130,16 @@ fn model_data_hands_over_straight_alpha() {
         "rasterize_gridded has been declared premultiplied. It writes \
          `parameter.color_for_value` bytes into the buffer directly — the \
          palette's own straight RGBA — so declaring it premultiplied darkens \
-         every HRRR pixel by its own alpha.",
+         every translucent HRRR pixel by its own alpha.",
     );
 
     let pixels = drawn(&out.rgba);
     assert!(!pixels.is_empty(), "fixture drew nothing");
-    // CAPE 1000 J/kg is `[255, 255, 0, 160]`: bright, and translucent at an
-    // alpha every colour channel clears.
+    // CAPE 1000 J/kg is `[255, 255, 0, 255]`: the palette's own bytes, opaque.
     assert!(
-        pixels.contains(&[255, 255, 0, 160]),
-        "the CAPE palette entry this fixture was built on has moved, so the \
-         test no longer distinguishes the two conventions. Pick another entry \
-         that is bright and translucent. Found e.g. {:?}",
+        pixels.contains(&[255, 255, 0, 255]),
+        "the CAPE palette entry this fixture was built on has moved, or a \
+         texel carries a translucency of its own again. Found e.g. {:?}",
         &pixels[..pixels.len().min(4)]
     );
 }

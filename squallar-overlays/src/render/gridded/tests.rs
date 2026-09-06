@@ -86,17 +86,17 @@ fn the_generic_ramp_fades_out_below_and_clamps_above() {
     assert_eq!(color_for(&scale, f32::NEG_INFINITY), [0, 0, 0, 0]);
     assert_eq!(color_for(&scale, f32::INFINITY), [0, 0, 0, 0]);
 
-    assert_eq!(color_for(&scale, 10.0), [0, 0, 0, ALPHA]);
-    assert_eq!(color_for(&scale, 20.0), [100, 100, 100, ALPHA]);
-    assert_eq!(color_for(&scale, 40.0), [200, 40, 0, ALPHA]);
+    assert_eq!(color_for(&scale, 10.0), [0, 0, 0, OPAQUE]);
+    assert_eq!(color_for(&scale, 20.0), [100, 100, 100, OPAQUE]);
+    assert_eq!(color_for(&scale, 40.0), [200, 40, 0, OPAQUE]);
     assert_eq!(
         color_for(&scale, 4_000.0),
-        [200, 40, 0, ALPHA],
+        [200, 40, 0, OPAQUE],
         "above the last stop the ramp holds, it does not wrap or fade",
     );
 
     // Half way between the first two stops.
-    assert_eq!(color_for(&scale, 15.0), [50, 50, 50, ALPHA]);
+    assert_eq!(color_for(&scale, 15.0), [50, 50, 50, OPAQUE]);
 }
 
 /// `is_gradient: false` paints the band's own colour across the band rather
@@ -105,9 +105,9 @@ fn the_generic_ramp_fades_out_below_and_clamps_above() {
 fn a_banded_scale_paints_flat_bands() {
     let banded = a_scale(false);
     let ramped = a_scale(true);
-    assert_eq!(color_for(&banded, 15.0), [0, 0, 0, ALPHA]);
-    assert_eq!(color_for(&banded, 19.9), [0, 0, 0, ALPHA]);
-    assert_eq!(color_for(&banded, 20.0), [100, 100, 100, ALPHA]);
+    assert_eq!(color_for(&banded, 15.0), [0, 0, 0, OPAQUE]);
+    assert_eq!(color_for(&banded, 19.9), [0, 0, 0, OPAQUE]);
+    assert_eq!(color_for(&banded, 20.0), [100, 100, 100, OPAQUE]);
     assert_ne!(
         color_for(&banded, 15.0),
         color_for(&ramped, 15.0),

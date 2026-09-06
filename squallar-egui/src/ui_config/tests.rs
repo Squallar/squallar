@@ -2240,3 +2240,142 @@ fn a_removed_layers_opacity_rides_its_tombstone_across_a_reopen() {
         "the re-add after a reopen reset the opacity",
     );
 }
+
+/// **A radar pane with no explicit opacity starts at its product's
+/// yesterday**: `REFLECTIVITY_ALPHA` over 255 on dBZ, 180 over 255 once the
+/// pane switches to velocity -- the number the texels used to carry, now the
+/// slider's default. An explicit value is the user's and survives the switch.
+#[test]
+fn a_radar_pane_with_no_explicit_opacity_starts_at_its_products_default() {
+    let radar = known::RADAR;
+    let mut gui = crate::Gui::new();
+    gui.hydrate_pane_layer_states_for_test(0);
+    let resolved = |gui: &crate::Gui| {
+        let pane = gui.pane(0).expect("pane 0");
+        crate::ui::map::pane_render::resolved_layer_opacity(&gui.overlays, 0, pane, &radar)
+    };
+    {
+        let pane = gui.pane(0).expect("pane 0");
+        assert_eq!(
+            pane.selected_product(),
+            radar_fields::known::REFLECTIVITY,
+            "precondition: a fresh pane shows dBZ",
+        );
+        assert_eq!(
+            pane.layer_opacity(&radar),
+            None,
+            "precondition: nothing explicit"
+        );
+    }
+    let dbz = squallar_source::product::REFLECTIVITY_DEFAULT_OPACITY;
+    assert_eq!(
+        resolved(&gui),
+        dbz,
+        "dBZ starts at its whole-percent default"
+    );
+
+    gui.pane_mut(0)
+        .expect("pane 0")
+        .set_selected_product(radar_fields::known::VELOCITY);
+    gui.hydrate_pane_layer_states_for_test(0);
+    let velocity = radar_fields::product_for(&radar_fields::known::VELOCITY)
+        .expect("the radar crate registers velocity");
+    let on_velocity = resolved(&gui);
+    assert_eq!(
+        on_velocity,
+        squallar_radar::default_plan_opacity(velocity),
+        "the default follows the pane's product",
+    );
+    assert_eq!(on_velocity, 0.71, "the other moments default to 71 %");
+    assert_ne!(on_velocity, dbz, "precondition: the two products differ");
+    assert_eq!(
+        gui.pane(0).expect("pane 0").layer_opacity(&radar),
+        None,
+        "a default is never minted into the slot",
+    );
+
+    gui.pane_mut(0)
+        .expect("pane 0")
+        .set_layer_opacity(&radar, 0.5);
+    assert_eq!(resolved(&gui), 0.5);
+    gui.pane_mut(0)
+        .expect("pane 0")
+        .set_selected_product(radar_fields::known::REFLECTIVITY);
+    gui.hydrate_pane_layer_states_for_test(0);
+    assert_eq!(
+        resolved(&gui),
+        0.5,
+        "an explicit value is the user's and does not follow the product",
+    );
+}
+
+/// **A config written before opacity reopens at every layer's default and
+/// writes no `opacity` key**: the radar slot at its product's default per
+/// pane, a gridded overlay at 160 over 255, a per-element layer at 1.0 --
+/// yesterday's look, with nothing minted into the file.
+#[test]
+fn a_config_written_before_opacity_reopens_at_the_defaults_and_writes_no_key() {
+    let fixture = include_str!("fixtures/current_full.json");
+    assert!(
+        !fixture.contains("opacity"),
+        "precondition: the fixture predates opacity"
+    );
+    let store = MemoryKvStore::default();
+    store
+        .store(UI_CONFIG_KEY, fixture)
+        .expect("the memory store accepts a write");
+    let mut gui = crate::Gui::new();
+    assert!(gui.load_ui_config(&store), "the fixture must load");
+    for idx in 0..2 {
+        gui.hydrate_pane_layer_states_for_test(idx);
+    }
+    let resolved = |gui: &crate::Gui, idx: usize, id: &LayerId| {
+        let pane = gui.pane(idx).expect("both panes");
+        crate::ui::map::pane_render::resolved_layer_opacity(&gui.overlays, idx, pane, id)
+    };
+    let dbz = squallar_source::product::REFLECTIVITY_DEFAULT_OPACITY;
+    for (idx, product, want, what) in [
+        (0usize, radar_fields::known::REFLECTIVITY, dbz, "dBZ"),
+        (1, radar_fields::known::VELOCITY, 0.71, "velocity"),
+    ] {
+        let pane = gui.pane(idx).expect("both panes");
+        assert_eq!(
+            pane.selected_product(),
+            product,
+            "precondition: pane {idx} shows {what}",
+        );
+        assert_eq!(
+            pane.layer_opacity(&known::RADAR),
+            None,
+            "pane {idx}: a pre-feature file minted a value",
+        );
+        assert_eq!(
+            resolved(&gui, idx, &known::RADAR),
+            want,
+            "pane {idx}: radar on {what} reopens at its default",
+        );
+    }
+    assert!(
+        gui.pane(0)
+            .expect("pane 0")
+            .draw_order_vec()
+            .contains(&known::MODEL_DATA),
+        "precondition: pane 0 holds the model layer",
+    );
+    assert_eq!(
+        resolved(&gui, 0, &known::MODEL_DATA),
+        squallar_overlays::render::gridded::DEFAULT_OPACITY,
+        "a gridded overlay reopens at 160 over 255",
+    );
+    assert_eq!(
+        resolved(&gui, 0, &known::CITY_LABELS),
+        1.0,
+        "a per-element layer reopens opaque"
+    );
+
+    let json = gui.ui_config_json().expect("serializable");
+    assert!(
+        !json.contains("opacity"),
+        "reopening a pre-feature file minted an opacity key on the next save",
+    );
+}

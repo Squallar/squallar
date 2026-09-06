@@ -1,5 +1,6 @@
 use super::*;
 use crate::beam;
+use crate::palette::default_plan_alpha;
 use crate::sampler::{Sample, SampleStatus, samplable};
 use nexrad_model::data::{
     ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep,
@@ -2119,7 +2120,15 @@ fn the_table_is_the_palette_function_not_its_stops() {
         for index in 1..=255u8 {
             let value = ramp_value(range, index);
             let (r, g, b, a) = get_color_for_value(product, value);
-            let scaled = (f32::from(a) * volume_alpha_scale(product, value)).round() as u8;
+            // The volume's ceiling is the product's default plan-view opacity,
+            // not the palette byte: the palette paints opaque, and the plan
+            // view's translucency is the layer's, applied at paint time.
+            let ceiling = default_plan_alpha(product);
+            let scaled = if a == 0 {
+                0
+            } else {
+                (f32::from(ceiling) * volume_alpha_scale(product, value)).round() as u8
+            };
             let at = usize::from(index) * 4;
             assert_eq!(
                 &lut[at..at + 4],
@@ -2128,9 +2137,9 @@ fn the_table_is_the_palette_function_not_its_stops() {
                 product.name(),
             );
             assert!(
-                lut[at + 3] <= a,
+                lut[at + 3] <= ceiling,
                 "{} entry {index}: the 3D profile must never exceed the \
-                     palette's own alpha",
+                     product's default plan-view alpha",
                 product.name(),
             );
         }
@@ -2436,9 +2445,18 @@ fn the_default_transparency_profile_is_measured_per_product() {
         let lut = colormap_lut(product, range);
         lut[usize::from(ramp_index(range, value)) * 4 + 3]
     };
+    // "Full plan-view strength" is the product's default opacity where the
+    // palette paints and nothing where it does not. The palette's own byte is
+    // opaque for every painted gate -- a tilt's translucency is the layer's
+    // opacity, applied at paint time -- so the byte no longer says what the
+    // volume's ceiling is; `default_plan_alpha` does.
     let palette_alpha = |product: RadarProduct, value: f32| {
         let range = ramp_of(product);
-        get_color_for_value(product, ramp_value(range, ramp_index(range, value))).3
+        if get_color_for_value(product, ramp_value(range, ramp_index(range, value))).3 == 0 {
+            0
+        } else {
+            default_plan_alpha(product)
+        }
     };
     let solid = |product: RadarProduct, value: f32, what: &str| {
         assert_eq!(
@@ -2536,11 +2554,9 @@ fn the_default_transparency_profile_is_measured_per_product() {
         "pure rain"
     );
     assert_eq!(alpha(RadarProduct::CorrelationCoefficient, 0.99), 0, "rain");
-    let (r, g, b, debris_2d) = get_color_for_value(RadarProduct::CorrelationCoefficient, 0.5);
-    let _ = (r, g, b);
     assert_eq!(
         alpha(RadarProduct::CorrelationCoefficient, 0.5),
-        debris_2d,
+        palette_alpha(RadarProduct::CorrelationCoefficient, 0.5),
         "a debris signature keeps its full plan-view alpha",
     );
     assert!(
@@ -2609,7 +2625,11 @@ fn the_default_transparency_profile_is_measured_per_product() {
         let mut painted_and_drawn = 0usize;
         for index in 1..=255u8 {
             let value = ramp_value(range, index);
-            let plan = get_color_for_value(nrot, value).3;
+            let plan = if get_color_for_value(nrot, value).3 == 0 {
+                0
+            } else {
+                default_plan_alpha(nrot)
+            };
             let volume = lut[usize::from(index) * 4 + 3];
             assert_eq!(
                 volume > 0,
@@ -2651,30 +2671,35 @@ fn the_default_transparency_profile_is_measured_per_product() {
         let range = value_range_for(MomentSlot::Reflectivity);
         let lut = colormap_lut(RadarProduct::Reflectivity, range);
         for index in 1..=255u8 {
-            let (_, _, _, a) =
-                get_color_for_value(RadarProduct::Reflectivity, ramp_value(range, index));
+            let painted =
+                get_color_for_value(RadarProduct::Reflectivity, ramp_value(range, index)).3 > 0;
             assert_eq!(
                 lut[usize::from(index) * 4 + 3],
-                a,
-                "reflectivity entry {index}"
+                if painted {
+                    default_plan_alpha(RadarProduct::Reflectivity)
+                } else {
+                    0
+                },
+                "reflectivity entry {index}: dBZ's volume is its plan-view \
+                 default, unscaled",
             );
         }
     }
 
-    // A volume's maximum alpha is its palette's plan-view alpha, and this is
-    // the column that says so. Eight of the nine read 180, the radar layer's
-    // own translucency convention: ΦDP's 63 is that ceiling times its flat
-    // 0.35, which puts its whole 255-entry ramp under the see-through bar, and
-    // **`ref`'s 160 is `squallar_source::product::REFLECTIVITY_ALPHA`** — dBZ is
-    // drawn by three layers and they paint it at one opacity, which is the
-    // overlays' 160 rather than this crate's 180. It read 180 here until that
-    // unification. Only the ceiling moved: the see-through count is unchanged
-    // for every moment, because reflectivity's own alpha ramp reaches zero well
-    // below the bar and scaling it by 160/180 does not carry another entry
-    // under.
+    // A volume's maximum alpha is its product's default plan-view opacity
+    // (`default_plan_alpha`), and this is the column that says so. Eight of
+    // the nine read 180, the radar layer's own translucency convention: PhiDP's
+    // 63 is that ceiling times its flat 0.35, which puts its whole 255-entry
+    // ramp under the see-through bar, and **`ref`'s 160 is
+    // `squallar_source::product::REFLECTIVITY_ALPHA`** -- dBZ is drawn by three
+    // layers and they default to one opacity, the overlays' 160 rather than
+    // this crate's 180. The palette's own bytes are opaque now (the plan view's
+    // translucency is the layer's opacity, applied at paint time); the volume
+    // has no slider and keeps the ceiling the texels used to carry, which is
+    // why this column did not move when the texels did.
     //
     // A pin over `RadarProduct::all()` rather than over reflectivity alone, so
-    // an alpha change that leaked out of the dBZ field into the other fifteen
+    // a ceiling change that leaked out of the dBZ field into the other fifteen
     // scales reddens here rather than passing as "the constant moved".
     let scan = six_moment_scan();
     let mut measured = Vec::new();

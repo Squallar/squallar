@@ -565,9 +565,34 @@ impl<'a> ValuesRef<'a> {
     }
 }
 
-/// The alpha every gridded overlay paints at. HRRR's eleven ramps all use it,
-/// and a raster drawn under the radar layer wants to be seen through.
-const ALPHA: u8 = 160;
+/// Every painted cell's alpha. Opacity is a property of the layer, not of the
+/// texel: a raster is painted opaque and the pane's opacity slider dims it at
+/// paint time, starting from [`DEFAULT_PLAN_ALPHA`].
+const OPAQUE: u8 = 255;
+
+/// **The plan-view default opacity of every gridded overlay** -- the MRMS
+/// mosaic, the satellite mosaic and every HRRR field -- as the alpha byte
+/// their texels carried before opacity became a layer property. Each of those
+/// handlers answers `SourceHandler::default_opacity` with [`DEFAULT_OPACITY`],
+/// so a fresh slot reproduces yesterday's look and the user's slider moves
+/// from there. `squallar_source::product::REFLECTIVITY_ALPHA` was chosen to
+/// equal it (that constant records why), and
+/// `a_tilt_and_a_mosaic_paint_the_same_dbz_at_the_same_opacity` holds the two
+/// equal.
+pub const DEFAULT_PLAN_ALPHA: u8 = 160;
+
+/// The `0..=1` factor `SourceHandler::default_opacity` answers for every
+/// gridded layer.
+///
+/// **A whole percent, deliberately**, not `DEFAULT_PLAN_ALPHA / 255`
+/// (0.627451). The slider shows an integer percent, so that value would
+/// display 63 % while painting something a user could not return to by hand.
+/// It costs one unit of 255 in painted alpha -- `0.63 * 255` rounds to 161
+/// where these texels used to carry 160 -- which is below perception and
+/// below the ramps' own quantization. Equal to
+/// `squallar_source::product::REFLECTIVITY_DEFAULT_OPACITY` for the same
+/// reason the byte above equals `REFLECTIVITY_ALPHA`.
+pub const DEFAULT_OPACITY: f32 = squallar_source::product::REFLECTIVITY_DEFAULT_OPACITY;
 
 /// How one gridded field is painted.
 ///
@@ -646,7 +671,7 @@ pub fn color_for(scale: &LegendScale, value: f32) -> [u8; 4] {
         return [0, 0, 0, 0];
     }
     if value >= last_value {
-        return [last_color[0], last_color[1], last_color[2], ALPHA];
+        return [last_color[0], last_color[1], last_color[2], OPAQUE];
     }
     // `stops` is ascending (`hrrr::fields::tests` and the radar palettes both
     // pin that), so the bracket is a partition point. `k + 1` is in range
@@ -655,7 +680,7 @@ pub fn color_for(scale: &LegendScale, value: f32) -> [u8; 4] {
     let (lo_value, lo_color) = stops[k];
     let (hi_value, hi_color) = stops[k + 1];
     if !scale.is_gradient {
-        return [lo_color[0], lo_color[1], lo_color[2], ALPHA];
+        return [lo_color[0], lo_color[1], lo_color[2], OPAQUE];
     }
     let t = if hi_value > lo_value {
         (value - lo_value) / (hi_value - lo_value)
@@ -667,7 +692,7 @@ pub fn color_for(scale: &LegendScale, value: f32) -> [u8; 4] {
         mix(lo_color[0], hi_color[0]),
         mix(lo_color[1], hi_color[1]),
         mix(lo_color[2], hi_color[2]),
-        ALPHA,
+        OPAQUE,
     ]
 }
 

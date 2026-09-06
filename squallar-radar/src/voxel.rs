@@ -970,7 +970,15 @@ fn volume_alpha_scale(product: RadarProduct, value: f32) -> f32 {
 
 /// The 256-entry RGBA table for a product over a ramp, entry 0 forced fully
 /// transparent.
+///
+/// The alpha column is the product's **default plan-view opacity**
+/// ([`crate::palette::default_plan_alpha`]) scaled per value, not the
+/// palette's own byte: the palette paints opaque texels and the plan view's
+/// translucency is a painter tint the user can move, while the volume has no
+/// slider and keeps the ceiling that tint starts from. A gate the palette
+/// leaves clear stays clear.
 fn colormap_lut(product: RadarProduct, range: (f32, f32)) -> Vec<u8> {
+    let ceiling = f32::from(crate::palette::default_plan_alpha(product));
     let mut lut = Vec::with_capacity(LUT_LEN);
     // Entry 0 is the no-data entry, forced transparent: most palettes hand
     // back an opaque colour at the ramp's bottom, and an opaque no-data index
@@ -978,8 +986,12 @@ fn colormap_lut(product: RadarProduct, range: (f32, f32)) -> Vec<u8> {
     lut.extend_from_slice(&[0, 0, 0, 0]);
     for index in 1..=255u8 {
         let value = ramp_value(range, index);
-        let (r, g, b, a) = get_color_for_value(product, value);
-        let a = (f32::from(a) * volume_alpha_scale(product, value)).round() as u8;
+        let (r, g, b, palette_a) = get_color_for_value(product, value);
+        let a = if palette_a == 0 {
+            0
+        } else {
+            (ceiling * volume_alpha_scale(product, value)).round() as u8
+        };
         lut.extend_from_slice(&[r, g, b, a]);
     }
     lut

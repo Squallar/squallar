@@ -1263,6 +1263,13 @@ impl OverlayHandler for ModelDataHandler {
         RenderMode::Texture
     }
 
+    /// Yesterday's look: the alpha every HRRR ramp painted into its texels
+    /// before opacity became a layer property. See
+    /// `render::gridded::DEFAULT_PLAN_ALPHA`.
+    fn default_opacity(&self, _pane: &PaneRef<'_>) -> f32 {
+        crate::render::gridded::DEFAULT_OPACITY
+    }
+
     /// HRRR is a run-based forecast: hourly cycles, each carrying grids valid
     /// at the run time plus a forecast hour — discrete stamped frames, and the
     /// stamps run **ahead** of the wall clock.

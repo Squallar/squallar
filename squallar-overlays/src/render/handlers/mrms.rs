@@ -870,6 +870,12 @@ impl OverlayHandler for MrmsHandler {
         RenderMode::Texture
     }
 
+    /// Yesterday's look: the alpha the mosaic's texels carried before opacity
+    /// became a layer property. See `render::gridded::DEFAULT_PLAN_ALPHA`.
+    fn default_opacity(&self, _pane: &PaneRef<'_>) -> f32 {
+        crate::render::gridded::DEFAULT_OPACITY
+    }
+
     /// Nothing here is hatched or theme-coloured: the bar is the product's own
     /// and reads the same on either background.
     fn theme_sensitive(&self) -> bool {

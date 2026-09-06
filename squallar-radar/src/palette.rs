@@ -3,11 +3,66 @@
 use crate::types::{MS_TO_MPH, RadarProduct};
 use std::sync::LazyLock;
 
-const TRANSPARENCY: u8 = 180;
+/// **The alpha every radar scale but dBZ carried in its texels**, kept as the
+/// provenance for the whole-percent default beside it and as the ceiling the
+/// 3D transfer table scales per value.
+///
+/// Not a texel byte any more -- every painted gate is [`OPAQUE`] and the
+/// translucency is the layer's, applied at paint time. What the slider starts
+/// at is [`DEFAULT_PLAN_OPACITY`], which is this number rounded to a whole
+/// percent; this one is what that rounding is measured against, and what the
+/// volume still paints at. dBZ's counterpart is
+/// `squallar_source::product::REFLECTIVITY_ALPHA`; [`default_plan_alpha`]
+/// chooses between the two.
+const DEFAULT_PLAN_ALPHA: u8 = 180;
+
+/// **The opacity every radar scale but dBZ starts at: a whole percent.**
+///
+/// The same trade [`squallar_source::product::REFLECTIVITY_DEFAULT_OPACITY`]
+/// records, for this crate's own scales: the slider shows an integer percent,
+/// so a default of exactly `DEFAULT_PLAN_ALPHA / 255` (0.705882) would display
+/// 71 % while painting something else, and a user returning to 71 % by hand
+/// would not get the default back. It costs one unit of 255 in painted alpha
+/// -- `0.71 * 255` rounds to 181 where these texels used to carry 180 --
+/// which is below perception and below the ramps' own quantization.
+const DEFAULT_PLAN_OPACITY: f32 = 0.71;
+
+/// The alpha of every painted gate. A gate under a scale's floor answers
+/// `(0, 0, 0, 0)` and nothing answers anything between: the NROT walk in
+/// `render.rs` skips a gate on alpha 0, and the cross-section routes through
+/// [`get_color_for_value`] for exactly those floors.
+const OPAQUE: u8 = 255;
+
+/// **The 3D transfer table's ceiling for `product`, and the provenance the
+/// whole-percent slider default is measured against.** dBZ answers
+/// `squallar_source::product::REFLECTIVITY_ALPHA` (160), every other scale
+/// [`DEFAULT_PLAN_ALPHA`] (180); both constants carry their provenance.
+///
+/// The slider's own starting value is [`default_plan_opacity`], a whole
+/// percent within one unit of 255 of this.
+pub fn default_plan_alpha(product: RadarProduct) -> u8 {
+    match product {
+        RadarProduct::Reflectivity => squallar_source::product::REFLECTIVITY_ALPHA,
+        _ => DEFAULT_PLAN_ALPHA,
+    }
+}
+
+/// The opacity `product`'s layer slider starts at, `0..=1` and always a whole
+/// percent -- what the radar handler answers `default_opacity` with.
+///
+/// Distinct from [`default_plan_alpha`], which is the 3D transfer table's
+/// ceiling and stays on the historical byte: the volume has no slider, so
+/// nothing there displays a percent that could disagree with what is painted.
+pub fn default_plan_opacity(product: RadarProduct) -> f32 {
+    match product {
+        RadarProduct::Reflectivity => squallar_source::product::REFLECTIVITY_DEFAULT_OPACITY,
+        _ => DEFAULT_PLAN_OPACITY,
+    }
+}
 
 /// The colour of a **range-folded** gate: one whose true range is ambiguous
 /// past the unambiguous range of its cut's PRF.
-pub const RANGE_FOLDED: (u8, u8, u8, u8) = (178, 102, 204, TRANSPARENCY);
+pub const RANGE_FOLDED: (u8, u8, u8, u8) = (178, 102, 204, OPAQUE);
 
 /// Ascending-threshold color scale: for value `v`, the color of the last entry whose
 /// threshold is <= `v`.
@@ -40,6 +95,10 @@ fn scale_color(scale: ColorScale, value: f32) -> (u8, u8, u8) {
 }
 
 /// RGBA color for a radar value, in the product's own units.
+///
+/// Every painted answer is [`OPAQUE`]; every floor is `(0, 0, 0, 0)`. A
+/// tilt's translucency on the map is its layer's opacity, a painter tint that
+/// starts at [`default_plan_alpha`] -- nothing here carries it.
 pub fn get_color_for_value(product: RadarProduct, value: f32) -> (u8, u8, u8, u8) {
     if !value.is_finite() {
         return (0, 0, 0, 0);
@@ -50,12 +109,7 @@ pub fn get_color_for_value(product: RadarProduct, value: f32) -> (u8, u8, u8, u8
                 return (0, 0, 0, 0);
             }
             let (r, g, b) = scale_color(REFLECTIVITY, value);
-            // Not `TRANSPARENCY`: dBZ is drawn by three layers and they now
-            // paint it at one opacity. See
-            // `squallar_source::product::REFLECTIVITY_ALPHA` for why the number
-            // is the overlays' 160 and not this crate's 180, and for why the
-            // other fifteen scales below keep `TRANSPARENCY`.
-            (r, g, b, squallar_source::product::REFLECTIVITY_ALPHA)
+            (r, g, b, OPAQUE)
         }
         RadarProduct::Velocity | RadarProduct::StormRelativeVelocity => velocity_lookup(value),
         RadarProduct::SpectrumWidth => {
@@ -63,75 +117,75 @@ pub fn get_color_for_value(product: RadarProduct, value: f32) -> (u8, u8, u8, u8
                 return (0, 0, 0, 0);
             }
             let (r, g, b) = scale_color(SPECTRUM_WIDTH, value);
-            (r, g, b, TRANSPARENCY)
+            (r, g, b, OPAQUE)
         }
         RadarProduct::DifferentialReflectivity => {
             let (r, g, b) = scale_color(ZDR, value);
-            (r, g, b, TRANSPARENCY)
+            (r, g, b, OPAQUE)
         }
         RadarProduct::CorrelationCoefficient => {
             if value < 0.0 {
                 return (0, 0, 0, 0);
             }
             let (r, g, b) = scale_color(RHO, value);
-            (r, g, b, TRANSPARENCY)
+            (r, g, b, OPAQUE)
         }
         RadarProduct::DifferentialPhase => {
             let (r, g, b) = scale_color(PHI, value.rem_euclid(360.0));
-            (r, g, b, TRANSPARENCY)
+            (r, g, b, OPAQUE)
         }
         RadarProduct::SpecificDifferentialPhase => {
             let (r, g, b) = scale_color(KDP, value);
-            (r, g, b, TRANSPARENCY)
+            (r, g, b, OPAQUE)
         }
         RadarProduct::EchoTops | RadarProduct::EchoTopsInterpolated => {
             if value < 5.0 {
                 return (0, 0, 0, 0);
             }
             let (r, g, b) = scale_color(ECHO_TOPS, value);
-            (r, g, b, TRANSPARENCY)
+            (r, g, b, OPAQUE)
         }
         RadarProduct::VerticallyIntegratedLiquid => {
             if value < 1.0 {
                 return (0, 0, 0, 0);
             }
             let (r, g, b) = scale_color(VIL, value);
-            (r, g, b, TRANSPARENCY)
+            (r, g, b, OPAQUE)
         }
         RadarProduct::VilDensity => {
             if value < 0.5 {
                 return (0, 0, 0, 0);
             }
             let (r, g, b) = scale_color(VIL_DENSITY, value);
-            (r, g, b, TRANSPARENCY)
+            (r, g, b, OPAQUE)
         }
         RadarProduct::ProbabilityOfSevereHail => {
             if value < 10.0 {
                 return (0, 0, 0, 0);
             }
             let (r, g, b) = scale_color(POSH, value);
-            (r, g, b, TRANSPARENCY)
+            (r, g, b, OPAQUE)
         }
         RadarProduct::MaxExpectedHailSize => {
             if value < 0.25 {
                 return (0, 0, 0, 0);
             }
             let (r, g, b) = scale_color(MEHS, value);
-            (r, g, b, TRANSPARENCY)
+            (r, g, b, OPAQUE)
         }
         RadarProduct::HydrometeorClassification => {
             if value < 10.0 {
                 return (0, 0, 0, 0);
             }
             let (r, g, b) = scale_color(HHC, value);
-            (r, g, b, TRANSPARENCY)
+            (r, g, b, OPAQUE)
         }
         RadarProduct::PrecipitationRate => {
             if value < 0.01 {
                 return (0, 0, 0, 0);
             }
             let (r, g, b) = scale_color(PRECIP_RATE, value);
-            (r, g, b, TRANSPARENCY)
+            (r, g, b, OPAQUE)
         }
         RadarProduct::NormalizedRotation => nrot_lookup(value),
     }
@@ -145,7 +199,7 @@ fn velocity_lookup(velocity_ms: f32) -> (u8, u8, u8, u8) {
     } else {
         scale_color(VELOCITY_INBOUND, mph.abs())
     };
-    (r, g, b, TRANSPARENCY)
+    (r, g, b, OPAQUE)
 }
 
 /// Positive NROT is cyclonic, negative anticyclonic.
@@ -158,7 +212,7 @@ fn nrot_lookup(nrot: f32) -> (u8, u8, u8, u8) {
     } else {
         scale_color(NROT_ANTICYCLONIC, nrot.abs())
     };
-    (r, g, b, TRANSPARENCY)
+    (r, g, b, OPAQUE)
 }
 
 // ————————————————————————————————————————————————————————————————————
@@ -521,10 +575,12 @@ static NROT_ANTICYCLONIC: ColorScale = &(
 /// three layers at once, and while each kept its own table they drifted: radar's
 /// sat roughly one 5 dBZ band off the mosaic's through the green-to-red region.
 /// Its stops now come from `squallar_source::product::REFLECTIVITY_RADAR_STOPS`
-/// (see [`REFLECTIVITY`]), and so does the alpha it paints at,
-/// `REFLECTIVITY_ALPHA` — the only field in this file that does not use
-/// `TRANSPARENCY`. Everything else here is still this crate's: a moment no
-/// other layer publishes has no second table to agree with.
+/// (see [`REFLECTIVITY`]), and so does its default opacity,
+/// `REFLECTIVITY_ALPHA` -- the one product whose [`default_plan_alpha`] is
+/// not this crate's 180. The texels themselves are opaque for every scale;
+/// the translucency is the layer's opacity, applied at paint time.
+/// Everything else here is still this crate's: a moment no other layer
+/// publishes has no second table to agree with.
 ///
 /// **What came down is the agreement, not the whole ladder.** Radar's bar keeps
 /// a tail the two overlay bars do not have — 75 dBZ sky-blue through 95 white,
@@ -694,9 +750,10 @@ mod tests {
             ("pub(in crate::render) static X: ColorScale = &(", Some("X")),
             ("    pub(crate) const X: ColorScale = &(", Some("X")),
             ("static X : ColorScale = &(", Some("X")),
-            ("const TRANSPARENCY: u8 = 180;", None),
+            ("const DEFAULT_PLAN_ALPHA: u8 = 180;", None),
+            ("const OPAQUE: u8 = 255;", None),
             (
-                "pub const RANGE_FOLDED: (u8, u8, u8, u8) = (178, 102, 204, 180);",
+                "pub const RANGE_FOLDED: (u8, u8, u8, u8) = (178, 102, 204, OPAQUE);",
                 None,
             ),
             ("type ColorScale = &'static (ColorThresholds, bool);", None),
@@ -966,12 +1023,7 @@ mod tests {
             let probe = expected + 1.0;
             assert_eq!(
                 get_color_for_value(RadarProduct::SpectrumWidth, probe),
-                (
-                    SW_8_RED[level],
-                    SW_8_GREEN[level],
-                    SW_8_BLUE[level],
-                    TRANSPARENCY
-                ),
+                (SW_8_RED[level], SW_8_GREEN[level], SW_8_BLUE[level], OPAQUE),
                 "{probe} m/s does not paint sw_8.plt level {level}",
             );
         }
@@ -999,7 +1051,7 @@ mod tests {
             (150.0, "RF"),
         ];
         /// `hc_256.plt`, data levels 129–131.
-        const HC_256_MELTING_SNOW: (u8, u8, u8, u8) = (155, 120, 80, TRANSPARENCY);
+        const HC_256_MELTING_SNOW: (u8, u8, u8, u8) = (155, 120, 80, OPAQUE);
 
         let legend = get_legend_scale(RadarProduct::HydrometeorClassification);
 
@@ -1038,7 +1090,7 @@ mod tests {
     #[test]
     fn zdr_below_the_finite_stops_is_dark_gray_not_black() {
         let color = get_color_for_value(RadarProduct::DifferentialReflectivity, -5.0);
-        assert_eq!(color, (66, 66, 66, TRANSPARENCY));
+        assert_eq!(color, (66, 66, 66, OPAQUE));
     }
 
     #[test]
@@ -1176,13 +1228,14 @@ mod tests {
     /// probes: 200 000 steps across a 5 dBZ segment move the fastest channel by
     /// about 0.0013 of a level, which cannot skip a colour.
     ///
-    /// **The comparison is on RGB alone, deliberately.** Reflectivity paints at
-    /// `squallar_source::product::REFLECTIVITY_ALPHA` (160) and `RANGE_FOLDED`
-    /// carries this crate's `TRANSPARENCY` (180), so a whole-tuple `assert_ne!`
-    /// would now pass on the alpha byte no matter what the ramp did — a
-    /// vacuous check that reads exactly like a green one. The question is
-    /// whether a reader can confuse the two colours, and that is an RGB
-    /// question.
+    /// **The comparison is on RGB alone, deliberately.** Every painted colour
+    /// is opaque now, `RANGE_FOLDED` included, so a whole-tuple `assert_ne!`
+    /// is an RGB question in practice -- but while reflectivity painted at 160
+    /// and the fold at 180 that same assertion passed on the alpha byte no
+    /// matter what the ramp did, a vacuous check that read exactly like a
+    /// green one. Stating it on RGB keeps it the question it is, whether a
+    /// reader can confuse the two colours, should a scale ever grow an alpha
+    /// of its own again.
     ///
     /// **Measured margin, so a future stop edit knows how much room it has.**
     /// Restoring the hail tail took the ladder *further* from the target, not
@@ -1247,6 +1300,10 @@ mod tests {
     const CLOSEST_SQ: u32 = 745;
     const CLOSEST_RGB: (u8, u8, u8) = (151, 98, 204);
 
+    /// Whole-tuple on purpose: every painted colour is opaque, so this is an
+    /// RGB check for every product, reflectivity included -- for dBZ it was
+    /// vacuous on the alpha byte while its texels carried 160 against the
+    /// fold's 180.
     #[test]
     fn the_range_folded_colour_is_unreachable_through_any_products_scale() {
         assert_ne!(
@@ -1290,5 +1347,155 @@ mod tests {
         }
         // precondition: the sweep really ran.
         assert_eq!(checked, products.len() * 60_001);
+    }
+
+    /// **`default_plan_alpha` is dBZ's own for reflectivity and 180 for every
+    /// other scale**, over the whole enum rather than the two named products,
+    /// so a product added to the enum lands on a recorded default and a dBZ
+    /// default that drifted from `REFLECTIVITY_ALPHA` reddens here.
+    #[test]
+    fn the_default_plan_alpha_is_dbzs_own_and_180_for_every_other_scale() {
+        use squallar_source::product::REFLECTIVITY_ALPHA;
+        assert_ne!(
+            REFLECTIVITY_ALPHA, DEFAULT_PLAN_ALPHA,
+            "precondition: the two defaults differ, or the arm below is vacuous",
+        );
+        let mut dbz = 0usize;
+        for &product in RadarProduct::all() {
+            let want = if product == RadarProduct::Reflectivity {
+                dbz += 1;
+                REFLECTIVITY_ALPHA
+            } else {
+                180
+            };
+            assert_eq!(default_plan_alpha(product), want, "{product:?}");
+        }
+        assert_eq!(dbz, 1, "precondition: the sweep met reflectivity once");
+        assert_eq!(default_plan_alpha(RadarProduct::Reflectivity), 160);
+    }
+
+    /// **Every default opacity is a whole percent, and within one unit of 255
+    /// of the alpha its texels used to carry.**
+    ///
+    /// Both halves matter and neither implies the other. Whole percent,
+    /// because the slider displays an integer: a default of
+    /// `REFLECTIVITY_ALPHA / 255` would show 63 % and paint 0.627451, so a
+    /// user who dragged away and set 63 % by hand would get a different
+    /// picture than the default at the same displayed number. Within one
+    /// unit, because that is the whole price of the snap -- 0.63 paints 161
+    /// where the texels carried 160, 0.71 paints 181 where they carried 180
+    /// -- and a default that drifted further would be a look change wearing a
+    /// rounding argument.
+    #[test]
+    fn the_defaults_are_whole_percents_within_one_unit_of_their_provenance() {
+        for &product in RadarProduct::all() {
+            let opacity = default_plan_opacity(product);
+            let percent = f64::from(opacity) * 100.0;
+            // **The round trip, not the product.** `0.63f32` is not exactly
+            // 0.63, so `opacity * 100.0` is 62.999999 and comparing it to a
+            // whole number would fail on a value that is a whole percent in
+            // every sense the UI has. What has to hold is what the bug is
+            // about: the number the slider *shows* is the number that, set
+            // back, reproduces this default exactly.
+            let shown = percent.round();
+            assert!(
+                (percent - shown).abs() < 1e-3,
+                "{product:?} defaults to {percent} %, which is not a whole \
+                 percent: the slider would display {shown} % and paint \
+                 something else",
+            );
+            assert_eq!(
+                opacity,
+                shown as f32 / 100.0,
+                "{product:?}: setting the slider to the {shown} % it displays \
+                 does not reproduce the default, so a user who dragged away \
+                 and came back would silently get a different picture",
+            );
+            assert!(
+                (0.0..=100.0).contains(&percent),
+                "{product:?} defaults outside 0..=100 %"
+            );
+            let painted = (f64::from(opacity) * 255.0).round();
+            let provenance = f64::from(default_plan_alpha(product));
+            assert!(
+                (painted - provenance).abs() <= 1.0,
+                "{product:?} now paints {painted} of 255 where its texels \
+                 carried {provenance}: the whole-percent snap costs one unit, \
+                 and this costs {} -- a look change, not a rounding",
+                (painted - provenance).abs(),
+            );
+        }
+        // The two values, named, so the trade is visible where it is asserted.
+        assert_eq!(
+            default_plan_opacity(RadarProduct::Reflectivity),
+            0.63,
+            "dBZ's default is 63 %",
+        );
+        assert_eq!(
+            default_plan_opacity(RadarProduct::Velocity),
+            0.71,
+            "the other moments default to 71 %",
+        );
+        assert_eq!(
+            (f64::from(default_plan_opacity(RadarProduct::Reflectivity)) * 255.0).round(),
+            161.0,
+            "63 % paints 161 of 255, one over the 160 the texels carried",
+        );
+        assert_eq!(
+            (f64::from(default_plan_opacity(RadarProduct::Velocity)) * 255.0).round(),
+            181.0,
+            "71 % paints 181 of 255, one over the 180 the texels carried",
+        );
+    }
+
+    /// **Every painted colour is opaque and every floor is clear**, for every
+    /// product over the sweep the range-folded check walks. This is the
+    /// property that makes a layer's opacity slider mean what it says: 100 %
+    /// is opaque because no texel carries a translucency of its own, and a
+    /// gate under a scale's floor is `(0, 0, 0, 0)` -- what the NROT walk in
+    /// `render.rs` and the cross-section's floor routing key on.
+    #[test]
+    fn every_painted_colour_is_opaque_and_every_floor_is_clear() {
+        let mut painted = 0usize;
+        let mut clear = 0usize;
+        for &product in RadarProduct::all() {
+            let mut painted_here = 0usize;
+            for step in -20_000..=40_000 {
+                let value = step as f32 / 100.0;
+                let color = get_color_for_value(product, value);
+                match color.3 {
+                    OPAQUE => painted_here += 1,
+                    0 => {
+                        assert_eq!(
+                            color,
+                            (0, 0, 0, 0),
+                            "{product:?} at {value}: a clear gate carries a colour",
+                        );
+                        clear += 1;
+                    }
+                    a => panic!(
+                        "{product:?} paints {value} at alpha {a}: a texel carries a \
+                         translucency of its own, so 100 % on the layer's slider is \
+                         no longer opaque"
+                    ),
+                }
+            }
+            assert!(
+                painted_here > 0,
+                "{product:?} painted nothing over the sweep"
+            );
+            painted += painted_here;
+            assert_eq!(
+                get_color_for_value(product, f32::NAN),
+                (0, 0, 0, 0),
+                "{product:?}: NaN is clear",
+            );
+        }
+        assert!(
+            clear > 0,
+            "precondition: no product has a floor, so the clear arm never ran"
+        );
+        assert!(painted > 0);
+        assert_eq!(RANGE_FOLDED.3, OPAQUE, "the fold is a painted colour");
     }
 }

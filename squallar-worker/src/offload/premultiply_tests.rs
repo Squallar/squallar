@@ -44,8 +44,11 @@ fn every_pixel_that_can_exist_reaches_the_same_color32() {
 }
 
 /// The identity holds through a **real plan-view rasterization**. The palette
-/// produces alpha 0 and alpha 180 and nothing else (`palette.rs`'s
-/// `TRANSPARENCY`), which is one fast arm and one table arm.
+/// produces alpha 0 and alpha 255 and nothing else -- every painted gate is
+/// opaque, and a tilt's translucency is its layer's opacity applied at paint
+/// time -- which is the two fast arms, `TRANSPARENT` and the skipped multiply.
+/// The table arm is what the exhaustive pair walk above is for; this one pins
+/// that a real raster reaches `execute` unchanged through the arms it takes.
 #[test]
 fn a_real_plan_view_render_lands_on_the_same_picture() {
     let request = tests::a_job();

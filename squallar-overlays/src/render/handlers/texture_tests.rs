@@ -253,8 +253,10 @@ fn glm_fixture() -> crate::glm::GlmFlash {
 }
 
 /// Uniform −100 J/kg of CIN over [`BOUNDS`] — the handler's own default
-/// parameter. The palette entry that lands on is `[255, 165, 0, 160]`: bright,
-/// and translucent at an alpha two of its channels clear.
+/// parameter. The palette entry that lands on is `[255, 165, 0, 255]`: the
+/// palette's own bytes, opaque -- the model layer's translucency is its
+/// opacity, applied at paint time -- so the straight-alpha walk meets this
+/// fixture on its opaque arm.
 fn cin_grid() -> crate::hrrr::HrrrGridData {
     use crate::hrrr::{GridCoords, HrrrGridData, ModelParameter};
     let parameter = ModelParameter::SurfaceBasedCin;
@@ -340,9 +342,13 @@ fn mrms_grid() -> crate::mrms::MrmsGrid {
 ///
 /// **255 and not a mid-domain count**, which every cell would paint just as
 /// well: `every_texture_handler_declares_the_convention_its_own_bytes_are_in`
-/// separates straight alpha from premultiplied by finding a pixel whose colour
-/// channel exceeds its alpha, and `gridded::ALPHA` is 160 where mid-greyscale
-/// is ~0x8c. A grey fixture would make that walk vacuous for this layer.
+/// separated straight alpha from premultiplied by finding a pixel whose colour
+/// channel exceeds its alpha, and `gridded::ALPHA` (now `OPAQUE`) was 160
+/// where mid-greyscale is ~0x8c. Every gridded texel is opaque now -- the
+/// layer's translucency is its opacity, applied at paint time -- so the walk
+/// meets this fixture on its opaque arm whatever the count; the white fixture
+/// stays because it is the one that would still discriminate if a texel alpha
+/// ever came back.
 fn gmgsi_grid() -> crate::gmgsi::decode::GmgsiGrid {
     use crate::gmgsi::GmgsiChannel;
     let channel = GmgsiChannel::LongwaveIr;
@@ -538,7 +544,10 @@ fn drawn(rgba: &[u8]) -> Vec<[u8; 4]> {
 /// The declared mode against an invariant of the bytes that only that mode can
 /// satisfy: premultiplied RGB is `round(c · a / 255)`, so **no channel can
 /// exceed alpha**, while a bright translucent straight entry has channels far
-/// above it.
+/// above it. A straight buffer whose every drawn pixel is opaque satisfies
+/// both -- that is every gridded raster since opacity became a layer property
+/// -- so the straight arm accepts that shape by name rather than by finding
+/// nothing.
 fn assert_alpha_matches_bytes(what: &str, out: &RasterizeOutput) {
     let pixels = drawn(&out.rgba);
     assert!(
@@ -561,15 +570,22 @@ fn assert_alpha_matches_bytes(what: &str, out: &RasterizeOutput) {
             above.len(),
             &above[..above.len().min(4)],
         ),
-        AlphaMode::Straight => assert!(
-            !above.is_empty(),
-            "{what} declares straight alpha, but not one of its {} drawn \
-             pixels has a colour channel above its alpha — which is exactly \
-             what a premultiplied buffer looks like. `from_rgba_unmultiplied` \
-             will multiply these bytes a second time and darken every \
-             translucent pixel of this layer.",
-            pixels.len(),
-        ),
+        AlphaMode::Straight => {
+            // At alpha 255 the two conventions agree byte for byte, so a
+            // wholly opaque buffer is accepted by that shape, named; a
+            // translucent one must still show a channel above its alpha.
+            let opaque = pixels.iter().all(|p| p[3] == 255);
+            assert!(
+                opaque || !above.is_empty(),
+                "{what} declares straight alpha, but not one of its {} drawn \
+                 pixels has a colour channel above its alpha and not all of \
+                 them are opaque -- which is exactly what a premultiplied \
+                 buffer looks like. `from_rgba_unmultiplied` will multiply \
+                 these bytes a second time and darken every translucent pixel \
+                 of this layer.",
+                pixels.len(),
+            );
+        }
     }
 }
 
@@ -714,12 +730,28 @@ fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
     );
 }
 
-/// The fixture set is only worth what it discriminates: every seeded handler
-/// has to draw pixels the two conventions actually disagree about.
+/// The fixture set is only worth what it discriminates: a handler whose bytes
+/// *can* tell the two conventions apart has to draw pixels they disagree
+/// about.
+///
+/// **Three layers are opaque by design and are named here rather than
+/// tolerated.** The uniform-alpha colour tables paint at 255 since opacity
+/// became a per-layer painter tint -- a texel that carried its own
+/// translucency would put 100 % on the layer's slider somewhere under opaque
+/// -- so for the model, the mosaic and the satellite the two conventions are
+/// byte-identical and no fixture can separate them. Their `AlphaMode` is held
+/// instead by the declaration walk next door plus
+/// `palette::tests::every_painted_colour_is_opaque_and_every_floor_is_clear`
+/// on the radar side.
+///
+/// Naming the set keeps this a gate in **both** directions: a fourth layer
+/// going uniformly opaque reddens here, and so does one of these three
+/// regaining a texel alpha.
 #[test]
 fn every_fixture_draws_pixels_the_two_conventions_disagree_about() {
     let ctx = rctx();
     let mut opaque_only: Vec<LayerId> = Vec::new();
+    let mut discriminating: Vec<LayerId> = Vec::new();
     for handler in sources().iter_mut() {
         if !handler.render_mode().has_texture() || !seed(handler.as_mut()) {
             continue;
@@ -736,13 +768,30 @@ fn every_fixture_draws_pixels_the_two_conventions_disagree_about() {
             .collect();
         if translucent.is_empty() {
             opaque_only.push(id);
+        } else {
+            discriminating.push(id);
         }
     }
+
+    let mut opaque_by_design = [known::MODEL_DATA, known::MRMS, known::GMGSI];
+    opaque_by_design.sort();
+    opaque_only.sort();
+    assert_eq!(
+        opaque_only, opaque_by_design,
+        "the set of texture layers that draw nothing translucent has moved. \
+         For a layer in this set a flipped `AlphaMode` produces byte-identical \
+         pixels, so the walk next door passes either way; the three named are \
+         the uniform-alpha colour tables, opaque since a layer's translucency \
+         became its opacity. A layer that joined the set needs its convention \
+         pinned some other way; one that left it should get its translucent \
+         fixture back.",
+    );
+    // The floor: the walk really ran, and the layers that keep a per-element
+    // alpha still discriminate.
     assert!(
-        opaque_only.is_empty(),
-        "{opaque_only:?} drew nothing translucent, so a flipped `AlphaMode` \
-         would produce byte-identical pixels and the walk next door would \
-         pass either way. Give the fixture a translucent fill.",
+        !discriminating.is_empty(),
+        "no texture handler drew a translucent pixel at all, so this says \
+         nothing about any fixture",
     );
 }
 

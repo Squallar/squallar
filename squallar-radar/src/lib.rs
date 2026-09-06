@@ -56,8 +56,8 @@ pub mod voxel;
 pub mod xsect;
 
 pub use palette::{
-    LegendScale, LegendScaleRef, RANGE_FOLDED, get_color_for_value, get_legend_scale,
-    get_legend_scale_ref,
+    LegendScale, LegendScaleRef, RANGE_FOLDED, default_plan_alpha, default_plan_opacity,
+    get_color_for_value, get_legend_scale, get_legend_scale_ref,
 };
 
 /// Bounds-checked cursor over untrusted payload bytes, from `squallar-source`;

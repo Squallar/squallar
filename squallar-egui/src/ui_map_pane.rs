@@ -4019,34 +4019,32 @@ mod legend_ladder_tests {
         );
     }
 
-    /// **The acceptance for the alpha unification: the two paths hand back the
-    /// same opacity at the same dBZ.**
+    /// **The acceptance for the alpha unification, restated for opacity as a
+    /// layer property: the three painters paint dBZ opaque, and their three
+    /// defaults are one number.**
     ///
-    /// Radar painted dBZ through `squallar-radar`'s `TRANSPARENCY` (180) and the
-    /// gridded overlays through `render::gridded`'s `ALPHA` (160), so a tilt and
-    /// the MRMS mosaic enabled on one pane drew the same quantity at two
-    /// opacities with nothing comparing them. 160 is the survivor —
-    /// `squallar_source::product::REFLECTIVITY_ALPHA` records why that one and
-    /// not a third number.
+    /// Radar painted dBZ through `squallar-radar`'s own 180 and the gridded
+    /// overlays through `render::gridded`'s 160, so a tilt and the MRMS mosaic
+    /// enabled on one pane drew the same quantity at two opacities with
+    /// nothing comparing them. 160 was the survivor --
+    /// `squallar_source::product::REFLECTIVITY_ALPHA` records why that one
+    /// and not a third number -- and it now lives in the layer's default
+    /// opacity rather than in the texel: the texels are opaque, the pane's
+    /// slider dims them at paint time, and a fresh slot starts where
+    /// yesterday's texels were.
     ///
-    /// **This asks the two painters, not the two constants.** A test that
-    /// compared `REFLECTIVITY_ALPHA` against a literal would pass while either
-    /// path stopped reading it; this one walks real dBZ through
-    /// `squallar_radar::get_color_for_value` and through the `FieldPaint` the
-    /// rasterizer actually resolves for the mosaic, and compares the alpha byte
-    /// they return. It is also this crate's job because nothing lower can see
-    /// both: the overlays→radar edge is cut.
-    ///
-    /// HRRR's composite is in it too — it resolves its own ramp rather than the
-    /// generic one over a `LegendScale`, so it is a third painter and not a
-    /// second reader of the same code.
+    /// **This asks the painters and the handlers, not the constants.** It
+    /// walks real dBZ through `squallar_radar::get_color_for_value` and
+    /// through the `FieldPaint` the rasterizer actually resolves for the
+    /// mosaic and the forecast composite (a third painter, not a second
+    /// reader: HRRR resolves its own ramp), and reads each layer's default
+    /// through the registry the way the resolver does. It is this crate's job
+    /// because nothing lower can see all three: the overlays->radar edge is
+    /// cut. The radar product enum is never spelled here -- the
+    /// `arch_ratchets` row holding it out of this crate is at 0 -- only
+    /// carried.
     #[test]
     fn a_tilt_and_a_mosaic_paint_the_same_dbz_at_the_same_opacity() {
-        let expected = squallar_source::product::REFLECTIVITY_ALPHA;
-        // Resolved through the field id, the way `render_radar_color_ramp`
-        // resolves what it bakes a bar from. The `arch_ratchets` row that holds
-        // the radar product enum out of this crate is at 0 and may only fall,
-        // so the enum is never spelled here — only carried.
         let dbz_id = radar_fields::known::REFLECTIVITY;
         let tilt_dbz =
             radar_fields::product_for(&dbz_id).expect("the radar crate registers reflectivity");
@@ -4060,7 +4058,8 @@ mod legend_ladder_tests {
         .expect("the forecast composite's dBZ field is registered for painting");
 
         // Every 0.5 dBZ from the overlays' floor to the top of their bars: the
-        // whole range in which all three layers paint something.
+        // whole range in which all three layers paint something, and every
+        // texel is opaque -- the translucency is the layer's, not the texel's.
         let mut probes = 0usize;
         let mut dbz = 5.0f32;
         while dbz <= 75.0 {
@@ -4069,11 +4068,11 @@ mod legend_ladder_tests {
             let forecast = hrrr_paint.color_for_value(dbz)[3];
             assert_eq!(
                 (tilt, mosaic, forecast),
-                (expected, expected, expected),
-                "at {dbz} dBZ a tilt, the mosaic and the forecast composite \
-                 paint at three different opacities. They are the same \
-                 quantity and can be drawn in the same pane; \
-                 REFLECTIVITY_ALPHA is the one number they all read.",
+                (255, 255, 255),
+                "at {dbz} dBZ a tilt, the mosaic and the forecast composite do \
+                 not all paint opaque texels. A layer's translucency is its \
+                 opacity, applied at paint time; a texel that carries its own \
+                 puts 100 % on the slider somewhere under opaque.",
             );
             probes += 1;
             dbz += 0.5;
@@ -4081,32 +4080,68 @@ mod legend_ladder_tests {
         // precondition: the sweep is a sweep.
         assert_eq!(probes, 141);
 
-        // The floor that stops this passing on three transparent answers: every
-        // layer really paints in this range.
-        assert!(
-            [
-                get_color_for_value(tilt_dbz, 40.0).3,
-                mrms_paint.color_for_value(40.0)[3],
-                hrrr_paint.color_for_value(40.0)[3],
-            ]
-            .iter()
-            .all(|&a| a > 0),
-            "precondition: a 40 dBZ core must be opaque on all three layers, or \
-             the agreement above is an agreement about nothing",
+        // The three defaults, read the way the resolver reads them: through
+        // the registry, for a pane whose radar slot names dBZ.
+        let expected = squallar_source::product::REFLECTIVITY_DEFAULT_OPACITY;
+        let mut gui = crate::Gui::new();
+        gui.hydrate_pane_layer_states_for_test(0);
+        let pane = gui.pane(0).expect("pane 0");
+        assert_eq!(
+            pane.selected_product(),
+            dbz_id,
+            "precondition: a fresh pane shows dBZ"
+        );
+        let default_of = |id: &LayerId| gui.overlays.default_opacity(id, &pane.layer_ref(0, id));
+        assert_eq!(
+            (
+                default_of(&known::RADAR),
+                default_of(&known::MRMS),
+                default_of(&known::MODEL_DATA),
+            ),
+            (expected, expected, expected),
+            "a tilt, the mosaic and the forecast composite start at three \
+             different opacities. They are the same quantity and can be drawn \
+             in the same pane; REFLECTIVITY_DEFAULT_OPACITY is the one number \
+             they all start from.",
+        );
+        // The floor that stops this passing on three 1.0s: the shared default
+        // is a real translucency, and a layer whose alpha is designed per
+        // element starts opaque.
+        assert!(expected > 0.0 && expected < 1.0);
+        assert_eq!(
+            default_of(&known::CITY_LABELS),
+            1.0,
+            "a per-element layer starts at 100 %",
         );
 
-        // And the control: this is not a claim that everything paints at 160.
-        let rho_id = radar_fields::known::CORRELATION_COEFFICIENT;
-        let rho = radar_fields::product_for(&rho_id)
-            .expect("the radar crate registers the correlation coefficient");
-        // The radar crate's other scales keep their own TRANSPARENCY, which is
-        // what makes the reflectivity arm a deliberate exception rather than a
-        // crate-wide edit.
+        // And the control: this is not a claim that every radar product starts
+        // at 160. Radar's default for rhoHV differs from its default for dBZ --
+        // the other fifteen scales keep the radar crate's own 180, which is
+        // what makes the dBZ arm a deliberate exception rather than a
+        // crate-wide edit. The texel, though, is opaque there too.
+        gui.pane_mut(0)
+            .expect("pane 0")
+            .set_selected_product(radar_fields::known::CORRELATION_COEFFICIENT);
+        gui.hydrate_pane_layer_states_for_test(0);
+        let pane = gui.pane(0).expect("pane 0");
+        let rho_default = gui
+            .overlays
+            .default_opacity(&known::RADAR, &pane.layer_ref(0, &known::RADAR));
         assert_ne!(
+            rho_default, expected,
+            "rhoHV now starts at the dBZ default too, so the unification \
+             leaked out of the field it was scoped to",
+        );
+        assert_eq!(
+            rho_default, 0.71,
+            "rhoHV starts at the radar crate's own 71 %",
+        );
+        let rho = radar_fields::product_for(&radar_fields::known::CORRELATION_COEFFICIENT)
+            .expect("the radar crate registers the correlation coefficient");
+        assert_eq!(
             get_color_for_value(rho, 0.95).3,
-            expected,
-            "ρHV now paints at the dBZ alpha too, so the unification leaked out \
-             of the field it was scoped to",
+            255,
+            "rhoHV's texels are opaque like every other scale's",
         );
     }
 }

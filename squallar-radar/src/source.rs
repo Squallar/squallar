@@ -621,6 +621,21 @@ impl SourceHandler for RadarSource {
     fn default_enabled(&self) -> bool {
         true
     }
+    /// **Yesterday's look, per product.** dBZ carried
+    /// `squallar_source::product::REFLECTIVITY_ALPHA` (160) in its texels and
+    /// every other scale 180 before opacity became a layer property; the
+    /// slider starts there for the product this pane shows, and once the user
+    /// sets a value it is fixed across products. Read from the slot config
+    /// `publish_radar_selection` keeps current, through the same door as
+    /// [`Self::current_field`]; a product this build cannot read answers
+    /// dBZ's.
+    fn default_opacity(&self, pane: &PaneRef<'_>) -> f32 {
+        let product = self
+            .current_field(pane)
+            .and_then(|id| crate::fields::product_for(&id))
+            .unwrap_or(crate::types::RadarProduct::Reflectivity);
+        crate::palette::default_plan_opacity(product)
+    }
     fn is_enabled(&self, pane: &PaneRef<'_>) -> bool {
         PaneToggle::is_on(pane, self.enabled)
     }
@@ -873,6 +888,50 @@ mod tests {
             slots: &[],
             loading_site: None,
             peers: &[],
+        }
+    }
+
+    /// **A fresh radar slot starts at its product's own yesterday**: dBZ at
+    /// its whole-percent default, velocity at 71 %, and a product the slot cannot
+    /// name -- an unhydrated pane, or a spelling this build does not register
+    /// -- at dBZ's, which is what a fresh pane shows.
+    #[test]
+    fn a_fresh_radar_slot_starts_at_its_products_default_opacity() {
+        let source = RadarSource::new();
+        let dbz = serde_json::json!({ "product": crate::fields::known::REFLECTIVITY });
+        let velocity = serde_json::json!({ "product": crate::fields::known::VELOCITY });
+        let unknown = serde_json::json!({ "product": "NoSuchMoment" });
+
+        let on_dbz = source.default_opacity(&pane(&dbz));
+        assert_eq!(
+            on_dbz,
+            squallar_source::product::REFLECTIVITY_DEFAULT_OPACITY,
+            "dBZ starts at its whole-percent default",
+        );
+        let on_velocity = source.default_opacity(&pane(&velocity));
+        assert_eq!(on_velocity, 0.71, "the other moments start at 71 %");
+        assert_ne!(
+            on_dbz, on_velocity,
+            "precondition: the two defaults differ, or per-product means nothing",
+        );
+        assert_eq!(
+            source.default_opacity(&pane(&unknown)),
+            on_dbz,
+            "a product this build cannot read answers dBZ's default",
+        );
+        assert_eq!(
+            source.default_opacity(&PaneRef::bare(0)),
+            on_dbz,
+            "an unhydrated pane answers dBZ's default",
+        );
+        for &product in crate::types::RadarProduct::all() {
+            let id = crate::fields::spec(product).id.clone();
+            let config = serde_json::json!({ "product": id });
+            assert_eq!(
+                source.default_opacity(&pane(&config)),
+                crate::palette::default_plan_opacity(product),
+                "{product:?}",
+            );
         }
     }
 

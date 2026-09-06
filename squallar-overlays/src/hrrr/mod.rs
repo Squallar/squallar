@@ -772,6 +772,11 @@ const VIL_STOPS: [(f32, [u8; 3]); 8] = [
     (70.0, [0xff, 0x00, 0xff]),
 ];
 
+/// Every painted cell's alpha, for all thirteen ramps below. Opacity is the
+/// layer's, not the texel's: the model layer's slider starts at
+/// `crate::render::gridded::DEFAULT_PLAN_ALPHA` and dims these at paint time.
+const ALPHA: u8 = 255;
+
 /// The band `value` falls in, flat: the colour of the highest stop at or below
 /// it, transparent below the first, and the last stop's colour above it.
 ///
@@ -779,7 +784,6 @@ const VIL_STOPS: [(f32, [u8; 3]); 8] = [
 /// — so this needs no separate guard, though [`ModelParameter::color_for_value`]
 /// keeps one for the ramps that do.
 fn banded_color(stops: &[(f32, [u8; 3])], value: f32) -> [u8; 4] {
-    const ALPHA: u8 = 160;
     match stops.iter().rev().find(|&&(floor, _)| value >= floor) {
         Some(&(_, [r, g, b])) => [r, g, b, ALPHA],
         None => [0, 0, 0, 0],
@@ -792,7 +796,6 @@ fn banded_color(stops: &[(f32, [u8; 3])], value: f32) -> [u8; 4] {
 /// `stops` ascends and has at least two entries. A NaN fails every `>=` and
 /// falls out transparent.
 fn gradient_color(stops: &[(f32, [u8; 3])], value: f32) -> [u8; 4] {
-    const ALPHA: u8 = 160;
     let Some(k) = stops.iter().rposition(|&(floor, _)| value >= floor) else {
         return [0, 0, 0, 0];
     };
@@ -829,8 +832,6 @@ fn vil_color(kg_per_m2: f32) -> [u8; 4] {
 /// CIN values are ≤ 0 J/kg; more negative = stronger cap. Transparent to −25,
 /// light green to −50, yellow to −100, orange to −200, red/dark purple beyond.
 fn cin_color(value: f32) -> [u8; 4] {
-    const ALPHA: u8 = 160;
-
     let mag = -value;
 
     if mag < 25.0 {
@@ -852,7 +853,6 @@ fn cin_color(value: f32) -> [u8; 4] {
 
 /// CAPE color scale (J/kg, ≥ 0). Higher = more instability.
 fn cape_color(value: f32) -> [u8; 4] {
-    const ALPHA: u8 = 160;
     if value < 250.0 {
         [0, 0, 0, 0]
     } else if value < 500.0 {
@@ -890,7 +890,6 @@ fn cape_color(value: f32) -> [u8; 4] {
 
 /// Lifted Index color scale (°C, more negative = more unstable).
 fn li_color(value: f32) -> [u8; 4] {
-    const ALPHA: u8 = 160;
     if value > 0.0 {
         [0, 0, 0, 0]
     } else if value > -2.0 {
@@ -918,7 +917,6 @@ fn li_color(value: f32) -> [u8; 4] {
 
 /// SRH color scale (m²/s², ≥ 0). Higher = more rotation potential.
 fn srh_color(value: f32) -> [u8; 4] {
-    const ALPHA: u8 = 160;
     if value < 50.0 {
         [0, 0, 0, 0]
     } else if value < 100.0 {
@@ -950,7 +948,6 @@ fn srh_color(value: f32) -> [u8; 4] {
 
 /// Updraft helicity 2–5 km color scale (m²/s²).
 fn uh_color(value: f32) -> [u8; 4] {
-    const ALPHA: u8 = 160;
     if value < 25.0 {
         [0, 0, 0, 0]
     } else if value < 75.0 {
@@ -982,7 +979,6 @@ fn uh_color(value: f32) -> [u8; 4] {
 
 /// Updraft helicity 0–2 km color scale (m²/s², lower thresholds).
 fn uh_low_color(value: f32) -> [u8; 4] {
-    const ALPHA: u8 = 160;
     if value < 10.0 {
         [0, 0, 0, 0]
     } else if value < 30.0 {
@@ -1014,7 +1010,6 @@ fn uh_low_color(value: f32) -> [u8; 4] {
 
 /// Wind speed color scale (kt, display units). Used by gust + shear.
 fn wind_color(kt: f32) -> [u8; 4] {
-    const ALPHA: u8 = 160;
     if kt < 10.0 {
         [0, 0, 0, 0]
     } else if kt < 20.0 {
@@ -1046,7 +1041,6 @@ fn wind_color(kt: f32) -> [u8; 4] {
 
 /// Precipitable water color scale (inches, display units).
 fn pwat_color(inches: f32) -> [u8; 4] {
-    const ALPHA: u8 = 160;
     if inches < 0.75 {
         [0, 0, 0, 0]
     } else if inches < 1.0 {
@@ -1078,7 +1072,6 @@ fn pwat_color(inches: f32) -> [u8; 4] {
 
 /// 2m temperature color scale (°F, display units).
 fn temperature_color(f: f32) -> [u8; 4] {
-    const ALPHA: u8 = 160;
     if f < 0.0 {
         [180, 0, 200, ALPHA]
     } else if f < 32.0 {
@@ -1114,7 +1107,6 @@ fn temperature_color(f: f32) -> [u8; 4] {
 
 /// 2m dewpoint color scale (°F, display units). Higher = more moisture.
 fn dewpoint_color(f: f32) -> [u8; 4] {
-    const ALPHA: u8 = 160;
     if f < 30.0 {
         [0, 0, 0, 0]
     } else if f < 45.0 {
@@ -1148,7 +1140,6 @@ fn dewpoint_color(f: f32) -> [u8; 4] {
 
 /// Visibility color scale (miles, display units). Lower = worse.
 fn visibility_color(mi: f32) -> [u8; 4] {
-    const ALPHA: u8 = 160;
     if mi > 10.0 {
         [0, 0, 0, 0]
     } else if mi > 5.0 {

@@ -187,40 +187,47 @@ pub const REFLECTIVITY_RADAR_STOPS: [(f32, [u8; 3]); 21] = radar_ladder();
 /// this — neither slices it further.
 pub const REFLECTIVITY_OVERLAY_STOPS: [(f32, [u8; 3]); 15] = overlay_ladder();
 
-/// The alpha **every layer that draws dBZ paints at**.
+/// **The plan-view default opacity for dBZ, and the 3D transfer's base
+/// alpha.** Not a texel byte: every layer that draws dBZ paints opaque texels,
+/// and a layer's opacity is a painter tint the user sets per layer. This is
+/// where that slider starts for a radar tilt on reflectivity, the MRMS mosaic
+/// and the model composite (`SourceHandler::default_opacity`), and the
+/// ceiling radar's volume transfer table scales per value
+/// (`squallar_radar::default_plan_alpha`).
 ///
-/// Radar's rasters painted through the radar crate's own `TRANSPARENCY` (180)
-/// and the gridded overlay path through its own `ALPHA` (160), so a tilt and
-/// the MRMS mosaic drawn in the same pane rendered the same quantity at two
-/// opacities. Neither number had a recorded reason; **160 is the one that was
-/// kept, and no third value was invented.**
+/// **160 rather than 180, and the provenance is measured.** Radar's rasters
+/// carried the radar crate's own 180 and the gridded overlay path its own 160,
+/// so a tilt and the MRMS mosaic drawn in the same pane showed the same
+/// quantity at two opacities; neither number had a recorded reason. 160 was
+/// kept and no third value invented: a dBZ raster is a ground layer the reader
+/// places the storm through, two layers at 160 leave about 14 % of the
+/// basemap showing where two at 180 leave about 9 %, and 160 moved exactly one
+/// field's look where 180 would have dragged every gridded field with it.
 ///
-/// 160 rather than 180 for three reasons, in the order that decided it:
-///
-/// * a dBZ raster is a ground layer over the basemap, and the reader places the
-///   storm by what shows through it — county lines, town names, the coast. The
-///   lighter of the two arbitrary numbers is the one that leaves that legible;
-/// * a radar tilt and the MRMS mosaic can be enabled on the **same** pane, and
-///   translucency compounds. Two layers at 160 leave about 14 % of the basemap
-///   showing where two at 180 leave about 9 %;
-/// * moving the overlays up to 180 instead would have dragged non-dBZ fields
-///   with them — `render::gridded::ALPHA` also paints MRMS precipitation rate
-///   and all four GMGSI channels — or forced a per-field alpha nobody asked
-///   for. Choosing 160 changes exactly one field's appearance, radar
-///   reflectivity's, and leaves every other bar in the tree where it was.
-///
-/// **This is not a radar-wide change.** The radar crate's other scales keep
-/// `TRANSPARENCY`; only the dBZ field reads this. What it does reach, because
-/// the palette is one function, is radar's 3D transfer table: reflectivity's
-/// volume alphas are this number scaled per value, so its ceiling came down
-/// with it — 180 to 160 — while the count of see-through entries did not move.
-/// `voxel::tests::the_default_transparency_profile_is_measured_per_product`
-/// records both columns for all nine volume products.
-///
-/// The two paths are held equal **at the same dBZ**, not merely against the same
-/// literal, by `ui::map::pane_render::legend_ladder_tests::
-/// a_tilt_and_a_mosaic_paint_the_same_dbz_at_the_same_opacity`.
+/// Radar's other fifteen scales default to 180; only dBZ reads this. The
+/// three painters are held opaque at the same dBZ, and their three defaults
+/// equal, by `ui::map::pane_render::legend_ladder_tests::
+/// a_tilt_and_a_mosaic_paint_the_same_dbz_at_the_same_opacity`; the 3D column
+/// by `voxel::tests::the_default_transparency_profile_is_measured_per_product`.
 pub const REFLECTIVITY_ALPHA: u8 = 160;
+
+/// **The opacity a dBZ layer's slider starts at: a whole percent.**
+///
+/// Every default in the system is a whole percent, and that is a deliberate
+/// trade. The slider shows an integer percent, so a default of exactly
+/// `REFLECTIVITY_ALPHA / 255` (0.627451) would *display* 63 % while painting
+/// 0.627451; a user who dragged away and came back to 63 % would land on a
+/// different picture than the default at the same displayed number, with
+/// nothing on screen to explain the difference. Snapping every default to a
+/// whole percent removes that whole class of bug.
+///
+/// **What it costs:** one unit of 255 in painted alpha against yesterday.
+/// `0.63 * 255` rounds to 161 where the texels used to carry 160 -- below
+/// perception, and below the quantization the colour ramps already do.
+/// `the_defaults_are_whole_percents_within_one_unit_of_their_provenance`
+/// holds both halves: a whole percent, and within one unit of 255 of the
+/// constant above.
+pub const REFLECTIVITY_DEFAULT_OPACITY: f32 = 0.63;
 
 /// [`REFLECTIVITY_RADAR_STOPS`], concatenated at compile time rather than
 /// transcribed. The `assert!` is what stops a stop added to the core from
