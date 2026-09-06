@@ -2094,7 +2094,23 @@ pub fn rasterize_gridded(
         row.reserve(win_w);
         for i in win.i0..win.i1 {
             match coords.at(j * ni + i) {
-                Some((lat, lon)) => row.push(mb.project(lat, lon, w, h)),
+                // **Into this box's own frame, point by point.** `project` maps
+                // longitude linearly and states no frame, so a point is drawn
+                // where its *stored* number falls — and a grid that closes the
+                // globe stores the two columns either side of its seam a whole
+                // turn apart (GMGSI: `+179.99961` and `-179.92838`, one
+                // 0.0720089-degree cell apart on the ground). `nearest_lon`
+                // carries each to the representation nearest this box, which is
+                // what puts the seam's two columns beside each other and lets a
+                // view centred on the anti-meridian hold columns from both ends
+                // of the axis at once.
+                //
+                // Not gated on `coords.wraps_longitude()`: `GridCoords::Explicit`
+                // answers that `false` by construction rather than by
+                // measurement, so a gate there would make the same geometry
+                // project two different ways depending on which arm holds it —
+                // which is exactly what `wrapping_window_tests` compares.
+                Some((lat, lon)) => row.push(mb.project(lat, mb.nearest_lon(lon), w, h)),
                 None => row.push((f32::NAN, f32::NAN)),
             }
         }
@@ -2114,6 +2130,13 @@ pub fn rasterize_gridded(
     // the three live rows are consecutive, so their residues never collide.
     let mut band: [Vec<(f32, f32)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     let mut projected_to: Option<usize> = None;
+
+    // What a **half-turn** of longitude spans in this texture. Longitude is
+    // mapped linearly, so this is the whole of the conversion; the cell loop
+    // uses it to tell a neighbour from the same meridian a turn away. `inf`
+    // for a degenerate box, which refuses nothing and leaves the sizing as it
+    // was.
+    let half_turn_px = (180.0 / (bounds.max_lon - bounds.min_lon) * f64::from(w)) as f32;
 
     let draw = win.interior(ni, nj);
     for j in draw.j0..draw.j1 {
@@ -2153,21 +2176,34 @@ pub fn rasterize_gridded(
 
             // Half-extents from neighbour spacing. 0.55, not 0.50: a slight
             // overlap hides seams between adjacent cells.
-            let dx_left = if i > 0 {
-                let (nx, _) = at(i - 1);
-                ((cx - nx).abs() * 0.55).max(0.5)
-            } else if i + 1 < ni {
-                let (nx, _) = at(i + 1);
-                ((nx - cx).abs() * 0.55).max(0.5)
-            } else {
-                1.0
+            //
+            // **A neighbour a whole turn away is not a neighbour.** A grid that
+            // closes the globe stores one of the two columns either side of its
+            // seam wrapped: GMGSI's column 0 is `+179.99961` and its column 1
+            // `-179.92838` — one ordinary 0.0720089-degree cell apart on the
+            // ground, 359.928 degrees apart as numbers. `MercatorBounds::project`
+            // maps longitude linearly and applies no shift (each caller states
+            // its own frame), so those two land most of a world apart in the
+            // texture and the spacing below reads that distance as the size of
+            // one cell. Measured at a whole-world viewport (2878 x 1651 pane,
+            // zoom 3.3268, a 605.05-degree box on a 4317 px picture): columns 0
+            // and 1 filled rects **1668 px and 1412 px** wide and held
+            // **4 582 934 pixels, 42.88 % of the picture**, where the cell they
+            // describe is 0.51 px. `refused` is what declines to size a cell
+            // from a spacing no cell can have, and the other side answers
+            // instead — the fallback this arm already had for the grid's own
+            // edge. Gated by `gmgsi_seam_probe_tests`.
+            let spacing = |a: f32, b: f32| {
+                let d = (b - a).abs();
+                (d <= half_turn_px).then(|| (d * 0.55).max(0.5))
             };
-            let dx_right = if i + 1 < ni {
-                let (nx, _) = at(i + 1);
-                ((nx - cx).abs() * 0.55).max(0.5)
-            } else {
-                dx_left
-            };
+            let left = (i > 0).then(|| spacing(at(i - 1).0, cx)).flatten();
+            let right = (i + 1 < ni).then(|| spacing(cx, at(i + 1).0)).flatten();
+            // Unchanged where nothing is refused: `left` for the left half and
+            // `right` for the right, each falling back to the other side and
+            // then to one pixel.
+            let dx_left = left.or(right).unwrap_or(1.0);
+            let dx_right = right.or(left).unwrap_or(1.0);
             let dy_up = if j > 0 {
                 let (_, ny) = above[i - win.i0];
                 ((cy - ny).abs() * 0.55).max(0.5)
@@ -2249,3 +2285,6 @@ mod sites_marker_tests;
 
 #[cfg(test)]
 mod hit_cells_tests;
+
+#[cfg(test)]
+mod gmgsi_seam_probe_tests;
