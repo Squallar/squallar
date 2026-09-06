@@ -34,6 +34,7 @@ fn budget_line(app: &App) -> String {
         None,
         &crate::recovery::HostRecovery::untouched(),
         squallar_egui::admission::Totals::default(),
+        app.admission_costs.spare,
     )
 }
 
@@ -534,6 +535,7 @@ fn a_measured_capacity_reaches_the_fit_and_a_presumed_one_does_not_pretend_to() 
             None,
             &crate::recovery::HostRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
+            app.admission_costs.spare,
         )
     };
     let six = squallar_device_profile::scene::Scene {

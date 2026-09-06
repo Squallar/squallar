@@ -266,6 +266,7 @@ fn the_budget_line_carries_the_admission_counters() {
         None,
         &crate::recovery::HostRecovery::untouched(),
         doors,
+        squallar_device_profile::admit::Spare::default(),
     );
     assert!(
         line.contains("admission asked 7 admitted 5 would refuse 2 refused 0"),
@@ -612,5 +613,36 @@ fn the_doors_spare_is_the_ladders_floor_and_the_readouts_is_the_rung_in_force() 
         "the two halves of one composition must still agree about WHETHER a \
          host figure exists: `None` refuses nothing, and one half seeing a \
          pool the other does not is the divergence, not the arithmetic",
+    );
+}
+
+/// **The App hands the line its own door spare, not a placeholder.**
+///
+/// `budget_telemetry`'s own tests prove the field is written from the argument;
+/// this is the only thing that proves the argument is the figure the doors were
+/// actually compared against. Driven through a real tick, because the wiring is
+/// the whole assertion.
+#[test]
+fn the_budget_line_carries_the_spare_the_doors_were_given() {
+    let mut app = n_pane_app(2, SITE);
+    tick(&mut app);
+    let gpu = app
+        .admission_costs
+        .spare
+        .gpu_bytes
+        .expect("the table carries a GPU spare");
+    let line = app
+        .budget_state_panel_line
+        .clone()
+        .expect("the tick wrote a budget state line");
+    let want = format!("door spare gpu {} MiB", gpu / (1024 * 1024));
+    assert!(
+        line.contains(&want),
+        "the line does not carry the door's own GPU spare ({want}): {line}",
+    );
+    assert!(
+        !line.contains("door spare gpu none"),
+        "a session that has priced a scene must publish a figure, not `none`: \
+         {line}",
     );
 }

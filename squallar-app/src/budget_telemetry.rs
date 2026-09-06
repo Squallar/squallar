@@ -53,8 +53,14 @@
 //! per-pane figures ride the readout the settings screen paints.
 //!
 //! **After everything the rig reads**, in this order: `spare gpu <n> MiB host
-//! <n> MiB`, what each pool has left for one more pane or layer, `none` where
-//! the pool itself is unknown; then `admission asked <n> admitted <n> would
+//! <n> MiB`, what each pool has left AT THE RUNG IN FORCE, `none` where the
+//! pool itself is unknown; then `door spare gpu <n> MiB host <n> MiB joint
+//! <n> MiB`, the same allowances less what the scene would cost with every
+//! rung shed - **the figure an admission door actually compares against**,
+//! and the only one that explains a refusal. The two are never the same
+//! question and are never subtracted from each other; `joint` is `none` on
+//! every split capacity and is the ONLY one a unified capacity's doors read.
+//! Then `admission asked <n> admitted <n> would
 //! refuse <n> refused <n>`, the scene-changing doors' running totals from
 //! boot — `would refuse` is what they priced and would have turned away,
 //! `refused` what they actually did; then `live <page>/<worker> MiB`, what each wasm
@@ -228,6 +234,7 @@ pub(crate) fn budget_state_line(
     page_live_bytes: Option<u64>,
     host_recovery: &crate::recovery::HostRecovery,
     doors: squallar_egui::admission::Totals,
+    door_spare: squallar_device_profile::admit::Spare,
 ) -> String {
     use std::fmt::Write as _;
 
@@ -289,6 +296,32 @@ pub(crate) fn budget_state_line(
         ", spare gpu {} host {}",
         spare(Some(&readout.gpu)),
         spare(readout.host.as_ref()),
+    );
+    // **The DOOR's spare, beside the readout's, because they are two
+    // questions and neither answers the other.** The pair above is the
+    // allowance less what the scene costs at the rung in force - how much
+    // room the picture on screen has left. These three are the allowance less
+    // what it would cost with every rung of the ladder shed, which is the
+    // only figure an act about to be admitted can be compared against
+    // (`App::compose_admission_costs`).
+    //
+    // Without them a refusal's arithmetic was not on the line at all, in two
+    // ways that both bit: the GPU door subtracts `volume_shortfall_bytes` and
+    // the readout does not, so `spare gpu` was never the figure the GPU door
+    // used; and on a `Pools::Unified` capacity - every integrated part, the
+    // Framework 13 this whole campaign started on - `admit::verdict` tests
+    // the summed increment against `joint` ALONE and ignores both axes, so
+    // the line carried two numbers the door had not looked at and none of the
+    // one it had.
+    let door = |bytes: Option<u64>| {
+        bytes.map_or_else(|| "none".to_string(), |bytes| format!("{} MiB", mib(bytes)))
+    };
+    let _ = write!(
+        line,
+        ", door spare gpu {} host {} joint {}",
+        door(door_spare.gpu_bytes),
+        door(door_spare.host_bytes),
+        door(door_spare.joint_bytes),
     );
     // **The admission doors' running totals, handed in.** Read by the caller
     // (`squallar_egui::admission::totals()`) rather than here, for the reason
@@ -646,13 +679,14 @@ mod tests {
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
+                squallar_device_profile::admit::Spare::default(),
             ),
             "budget state: bracket desktop, rung 1, steps 3, pool 3072 MiB, \
              ceiling 3840 MiB, vram 24576 MiB, ram 65536 MiB, declared 8192 MiB, \
              threads 32, form 2, linear 300/700 MiB, cap 5120 3, probe 5, \
              balloon 7 MiB, page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
              host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, \
-             spare gpu none host none, admission asked 0 admitted 0 would refuse 0 refused 0, \
+             spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
              live 250/600 MiB",
         );
         // The figure follows the pool it is handed, not a field of the budgets.
@@ -671,6 +705,7 @@ mod tests {
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
+                squallar_device_profile::admit::Spare::default(),
             )
             .contains(", pool 576 MiB,"),
         );
@@ -691,11 +726,12 @@ mod tests {
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
+                squallar_device_profile::admit::Spare::default(),
             )
             .ends_with(
                 ", probe 5, balloon 0 MiB, page heap acts 0 at 0 MiB, \
                  heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, \
-                 spare gpu none host none, admission asked 0 admitted 0 would refuse 0 refused 0, \
+                 spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 250/600 MiB"
             ),
         );
@@ -717,11 +753,12 @@ mod tests {
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
+                squallar_device_profile::admit::Spare::default(),
             )
             .ends_with(
                 ", cap 24576 2, probe 0, balloon 7 MiB, page heap acts 0 at 0 MiB, \
                  heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, \
-                 spare gpu none host none, admission asked 0 admitted 0 would refuse 0 refused 0, \
+                 spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 250/600 MiB"
             ),
         );
@@ -741,11 +778,12 @@ mod tests {
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
+                squallar_device_profile::admit::Spare::default(),
             )
             .ends_with(
                 ", cap 3456 0, probe 1, balloon 7 MiB, page heap acts 0 at 0 MiB, \
                  heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, \
-                 spare gpu none host none, admission asked 0 admitted 0 would refuse 0 refused 0, \
+                 spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 250/600 MiB"
             ),
         );
@@ -828,6 +866,7 @@ mod tests {
             None,
             &crate::recovery::HostRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
+            squallar_device_profile::admit::Spare::default(),
         );
         let (_, tail) = line
             .split_once(", vram ")
@@ -837,13 +876,13 @@ mod tests {
             "0 MiB, ram 0 MiB, declared 0 MiB, threads 0, form 0, linear 0/0 MiB, \
              cap 3840 0, probe 0, balloon 0 MiB, page heap acts 0 at 0 MiB, \
              heap max 0/0 MiB, host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, \
-             spare gpu none host none, admission asked 0 admitted 0 would refuse 0 refused 0, \
+             spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
              live 0/0 MiB",
         );
         assert_eq!(
             line.matches(", ").count(),
-            21,
-            "twenty-two comma-separated groups with no pane rows, twenty-one \
+            22,
+            "twenty-three comma-separated groups with no pane rows, twenty-two \
              separators: a field was dropped or gained. It was seventeen until \
              the recovery governor's `host steps N promotions N churn N` landed, \
              which is ONE group of three space-separated figures and so moved \
@@ -855,6 +894,86 @@ mod tests {
              lane's figure to another's: the doors and the loop fields landed \
              from two lanes on one day and each was pinned against a line \
              without the other's field on it",
+        );
+    }
+
+    /// **The line carries the DOOR's spare beside the readout's, and they are
+    /// allowed to differ.**
+    ///
+    /// Until 2026-09-06 only the readout's pair was on the line and a reader
+    /// took it for the figure a refusal was measured against. It never was.
+    /// Two ways it was not, and this fixture shows both: the GPU door
+    /// subtracts `volume_shortfall_bytes`, which the readout does not carry;
+    /// and on a `Pools::Unified` capacity `admit::verdict` tests the summed
+    /// increment against `joint` ALONE and ignores both axes, so on every
+    /// integrated part - the machine this campaign started on - the line
+    /// carried two numbers the door had not looked at and none of the one it
+    /// had.
+    #[test]
+    fn the_line_carries_the_doors_own_spare_beside_the_readouts() {
+        let (budgets, profile, linear) = distinct();
+        let line = budget_state_line(
+            &budgets,
+            &profile,
+            linear,
+            POOL,
+            BALLOON,
+            OVER,
+            &CAP,
+            PROBE,
+            WATCH,
+            &two_pane_readout(),
+            LIVE,
+            &crate::recovery::HostRecovery::untouched(),
+            squallar_egui::admission::Totals::default(),
+            squallar_device_profile::admit::Spare {
+                gpu_bytes: Some(100 << 20),
+                host_bytes: Some(200 << 20),
+                joint_bytes: Some(300 << 20),
+            },
+        );
+        assert!(
+            line.contains("spare gpu 3568 MiB host 601 MiB, "),
+            "the readout's own pair must stay exactly where it was - a reader \
+             of `spare gpu` wants the rung in force: {line}",
+        );
+        assert!(
+            line.contains("door spare gpu 100 MiB host 200 MiB joint 300 MiB,"),
+            "the figure a refusal was actually measured against is not on the \
+             line: {line}",
+        );
+    }
+
+    /// A split capacity has no joint pool, and the field says `none` rather
+    /// than a zero a reader would take for "no room". The same spelling the
+    /// readout's own pair already uses for a pool nothing answered for.
+    #[test]
+    fn the_doors_joint_spare_reads_none_on_a_split_capacity() {
+        let (budgets, profile, linear) = distinct();
+        let line = budget_state_line(
+            &budgets,
+            &profile,
+            linear,
+            POOL,
+            BALLOON,
+            OVER,
+            &CAP,
+            PROBE,
+            WATCH,
+            &no_readout(),
+            LIVE,
+            &crate::recovery::HostRecovery::untouched(),
+            squallar_egui::admission::Totals::default(),
+            squallar_device_profile::admit::Spare {
+                gpu_bytes: Some(0),
+                host_bytes: None,
+                joint_bytes: None,
+            },
+        );
+        assert!(
+            line.contains("door spare gpu 0 MiB host none joint none,"),
+            "an empty pool and an absent one must not read alike - `Some(0)` \
+             refuses everything and `None` refuses nothing: {line}",
         );
     }
 
@@ -901,6 +1020,7 @@ mod tests {
             LIVE,
             &crate::recovery::HostRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
+            squallar_device_profile::admit::Spare::default(),
         );
         let read_by_the_rig = rendered(&pattern("budget_state_re"), &DISTINCT_GROUPS);
         assert!(
@@ -911,7 +1031,7 @@ mod tests {
         assert_eq!(
             &line[read_by_the_rig.len()..],
             ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
-             host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, spare gpu none host none, \
+             host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, spare gpu none host none, door spare gpu none host none joint none, \
              admission asked 0 admitted 0 would refuse 0 refused 0, \
              live 250/600 MiB",
             "the tail the rig does not read drifted",
@@ -945,6 +1065,7 @@ mod tests {
             LIVE,
             &crate::recovery::HostRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
+            squallar_device_profile::admit::Spare::default(),
         );
         assert!(
             line.starts_with(&read_by_the_rig),
@@ -954,7 +1075,7 @@ mod tests {
             &line[read_by_the_rig.len()..],
             ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
              host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, \
-             spare gpu 3568 MiB host 601 MiB, admission asked 0 admitted 0 would refuse 0 refused 0, \
+             spare gpu 3568 MiB host 601 MiB, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
              live 250/600 MiB, \
              pane0 gpu 272 MiB host 0 MiB shared 0 MiB own 272 MiB, \
              pane1 gpu 33 MiB host 41 MiB shared 16 MiB own 17 MiB",
@@ -987,6 +1108,7 @@ mod tests {
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
+                squallar_device_profile::admit::Spare::default(),
             );
             let (fixed, _) = line.split_once(", pane0 ").unwrap_or((line.as_str(), ""));
             assert!(
@@ -1024,9 +1146,10 @@ mod tests {
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
+            squallar_device_profile::admit::Spare::default(),
             )
             .ends_with(
-                ", spare gpu 0 MiB host none, admission asked 0 admitted 0 would refuse 0 refused 0, \
+                ", spare gpu 0 MiB host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 250/600 MiB"
             ),
         );
@@ -1052,6 +1175,7 @@ mod tests {
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
+                squallar_device_profile::admit::Spare::default(),
             )
             .starts_with(&good)
         );
@@ -1072,6 +1196,7 @@ mod tests {
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
+                squallar_device_profile::admit::Spare::default(),
             )
             .starts_with(&drifted),
             "a line with one extra space compared equal to the real one, so the \
@@ -1114,11 +1239,12 @@ mod tests {
             None,
             &crate::recovery::HostRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
+            squallar_device_profile::admit::Spare::default(),
         );
         assert!(
             never.ends_with(
                 ", page heap acts 0 at 0 MiB, heap max 0/0 MiB, \
-                 host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, spare gpu none host none, \
+                 host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, spare gpu none host none, door spare gpu none host none joint none, \
                  admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 0/0 MiB"
             ),
@@ -1151,11 +1277,12 @@ mod tests {
             None,
             &crate::recovery::HostRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
+            squallar_device_profile::admit::Spare::default(),
         );
         assert!(
             acted.ends_with(
                 ", page heap acts 2 at 1011 MiB, heap max 0/0 MiB, \
-                 host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, spare gpu none host none, \
+                 host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, spare gpu none host none, door spare gpu none host none joint none, \
                  admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 0/0 MiB"
             ),
@@ -1221,6 +1348,7 @@ mod tests {
             None,
             &recovery,
             squallar_egui::admission::Totals::default(),
+            squallar_device_profile::admit::Spare::default(),
         );
         assert!(
             line.contains(", host steps 2 promotions 1 churn 1,"),

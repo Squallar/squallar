@@ -2432,6 +2432,7 @@ impl super::App {
                     squallar_alloc::live_bytes(),
                     &self.host_recovery,
                     squallar_egui::admission::totals(),
+                    self.admission_costs.spare,
                 )),
         );
         // What this frame's panes' overlay pictures are sized at, so a
