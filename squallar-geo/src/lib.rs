@@ -234,6 +234,73 @@ impl GeoPoint {
     pub fn is_on_earth(self) -> bool {
         (-90.0..=90.0).contains(&self.lat) && (-180.0..=180.0).contains(&self.lon)
     }
+
+    /// This point written the one way [`Self::is_on_earth`] accepts, or `None`
+    /// when it is not a point on Earth at all.
+    ///
+    /// # Two callers, one question, two answers — and why this is a fold rather than a second predicate
+    ///
+    /// [`Self::is_on_earth`] is asked by two kinds of caller that now want
+    /// different answers. A *datum* whose longitude is outside ±180 — a decoded
+    /// message's lat/lon, a volume footprint's corner — is genuinely wrong, and
+    /// `squallar_source::volume::VolumeGrid::footprint` depends on that
+    /// rejection staying loud: it is how a box straddling the antimeridian is
+    /// told from a box spanning the world. A *gesture* comes out of
+    /// `walkers::Projector::unproject` in the map's **continuous** frame, which
+    /// runs past ±180 as the map is panned across the antimeridian, and 190° there
+    /// is an ordinary place to press.
+    ///
+    /// A second predicate would answer one value two ways depending on which
+    /// caller was holding it. This is one predicate and a fold in front of it:
+    /// the caller in the continuous frame carries its value into the frame the
+    /// predicate speaks *first*, and then asks the same question everyone else
+    /// asks. Nothing on the data path folds, so nothing on the data path moved.
+    ///
+    /// # Per value, and deliberately not [`fold_lon_near`]
+    ///
+    /// [`fold_lon_near`] carries a datum *into a pane's* turn, and a rect through
+    /// it takes one shift from its own middle so that it comes back a rect. This
+    /// goes the other way — out of the pane's frame and into the one data is
+    /// written in — where every datum stands alone. A pair-relative shift here
+    /// would make one endpoint's stored value depend on the other, which is
+    /// exactly the thing that must not happen: a drag from 179° to 181° stores
+    /// what the identical drag from 179° to −179° stores, because the same ground
+    /// has to give the same answer however the user got there.
+    ///
+    /// Longitude only. Latitude does not wrap — 95° N is not a place a turn away,
+    /// it is a bug — so it is checked and never folded.
+    ///
+    /// No lap count is refused, because none is wrong: a finite longitude names a
+    /// meridian however many turns out it is written. It is folded with whatever
+    /// precision its own magnitude left it — one ulp at 1e9° is 1.3 cm of ground
+    /// and at 1e15° it is 14 km — and nothing bounds that here, because nothing
+    /// in the workspace produces such a value: the map's centre moves by a pan.
+    ///
+    /// # The early return is the identity, and it is not decoration
+    ///
+    /// [`normalize_lon`] is not bit-exactly the identity on its own range:
+    /// `lon + 180.0` lands on a coarser binary grid than `lon` for half the
+    /// exponent range, so the round trip returns a value one ulp away. Measured
+    /// over every four-decimal longitude, `−180.0000 ..= 180.0000`, **1 744 481
+    /// of 3 600 001 — 48.46 % — move**; `171.4` comes back
+    /// `171.39999999999998`. Folding unconditionally would therefore nudge every
+    /// position that was already accepted, which is every gesture this workspace
+    /// has ever made and every longitude any of them persisted, for a defect
+    /// that is entirely about the values the predicate used to *refuse*.
+    ///
+    /// Returning `self` where the predicate already accepts it is still a
+    /// function of the value alone — the branch reads the value, never the
+    /// caller — and it makes the claim exact: nothing that worked moved.
+    pub fn on_earth(self) -> Option<GeoPoint> {
+        if self.is_on_earth() {
+            return Some(self);
+        }
+        let folded = GeoPoint {
+            lat: self.lat,
+            lon: normalize_lon(self.lon),
+        };
+        folded.is_on_earth().then_some(folded)
+    }
 }
 
 /// Ring of (latitude, longitude) points. First ring is exterior, rest are holes.
@@ -705,5 +772,178 @@ mod wrap_tests {
             assert!(lon_to_tile_x_unbounded(f64::INFINITY, zoom) > 0);
             assert!(lon_to_tile_x_unbounded(f64::NEG_INFINITY, zoom) < 0);
         }
+    }
+}
+
+/// The seam between the map's continuous longitude frame and the ±180 frame
+/// data is written in, as [`GeoPoint::on_earth`] draws it — and the proof that
+/// drawing it there left [`GeoPoint::is_on_earth`] where it was.
+#[cfg(test)]
+mod on_earth_tests {
+    use super::*;
+
+    /// Longitudes a whole turn apart are exact in `f64`, so the fixtures below
+    /// can compare bit for bit rather than within a tolerance nobody derived.
+    /// Anything wanted here has to be checked, not assumed: `-97.2778 + 360`
+    /// comes back one ulp light.
+    const EXACT_LONS: [f64; 7] = [-179.5, -170.0, -45.25, 0.0, 45.25, 170.0, 179.75];
+
+    /// **The fold never moves the ground.** Whatever turn a longitude arrives
+    /// in, the answer names the same meridian — a whole number of turns from
+    /// where it was written — and lies in the range the predicate accepts.
+    #[test]
+    fn the_answer_is_the_same_meridian_written_where_the_predicate_accepts_it() {
+        for base in EXACT_LONS {
+            for turns in [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0] {
+                let raw = base + 360.0 * turns;
+                let point = GeoPoint {
+                    lat: 35.3331,
+                    lon: raw,
+                }
+                .on_earth()
+                .expect("a finite longitude names a meridian, however many turns out");
+
+                assert!(
+                    point.is_on_earth(),
+                    "on_earth({raw}) answered {}, which is_on_earth refuses — the \
+                     fold has to land in the frame the predicate speaks",
+                    point.lon,
+                );
+                let moved = (point.lon - raw) / 360.0;
+                assert_eq!(
+                    moved,
+                    moved.round(),
+                    "on_earth({raw}) answered {}, which is {moved} turns away — a \
+                     fold that is not a whole number of turns named different ground",
+                    point.lon,
+                );
+                assert_eq!(point.lat, 35.3331, "the fold moved a latitude");
+            }
+        }
+    }
+
+    /// **Nothing the predicate already accepted moved.** This is the whole
+    /// blast radius of the change: a position inside the ±180 frame comes back
+    /// bit for bit, so every gesture, every persisted longitude and every
+    /// fixture in the workspace answers exactly what it answered before.
+    ///
+    /// It has to be asserted rather than assumed. An unconditional
+    /// [`normalize_lon`] would move **48.46 %** of these — 1 744 481 of the
+    /// 3 600 001 four-decimal longitudes — by one ulp, because `lon + 180.0`
+    /// rounds onto a coarser grid than `lon` sits on.
+    #[test]
+    fn a_position_already_in_the_frame_comes_back_unchanged() {
+        let mut checked = 0usize;
+        for i in -1_800_000..=1_800_000 {
+            let lon = f64::from(i) / 10_000.0;
+            let here = GeoPoint { lat: -12.5, lon };
+            assert_eq!(
+                here.on_earth(),
+                Some(here),
+                "{lon} was already a place and came back somewhere else",
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 3_600_001, "the sweep did not run");
+    }
+
+    /// **One value has one answer**, whoever asks and however often: folding
+    /// what came back changes nothing, which is what makes "the gesture at `L`
+    /// equals the gesture at `normalize_lon(L)`" an exact claim rather than one
+    /// inside a tolerance.
+    #[test]
+    fn folding_what_is_already_folded_changes_nothing() {
+        let mut checked = 0usize;
+        for i in -20_000..=20_000 {
+            let lon = f64::from(i) * 0.05;
+            let once = GeoPoint { lat: 0.0, lon }.on_earth().expect("finite");
+            let twice = once.on_earth().expect("an accepted point is still a point");
+            assert_eq!(
+                once, twice,
+                "folding {lon} once gave {} and twice gave {} — one meridian with \
+                 two spellings is two answers for one value",
+                once.lon, twice.lon,
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 40_001, "the sweep did not run");
+    }
+
+    /// **A turn out is the same gesture**, bit for bit, over the fixtures whose
+    /// turn shift is exact.
+    #[test]
+    fn a_longitude_a_turn_out_answers_what_the_folded_one_answers() {
+        for base in EXACT_LONS {
+            let here = GeoPoint {
+                lat: -12.5,
+                lon: base,
+            }
+            .on_earth()
+            .expect("finite");
+            for turns in [-2.0, -1.0, 1.0, 2.0] {
+                let there = GeoPoint {
+                    lat: -12.5,
+                    lon: base + 360.0 * turns,
+                }
+                .on_earth()
+                .expect("finite");
+                assert_eq!(
+                    here, there,
+                    "{base} and {base} + {turns} turns are the same ground and \
+                     answered differently",
+                );
+            }
+        }
+    }
+
+    /// **What is not a place is still refused.** Latitude is checked and never
+    /// folded, and a longitude that is not a number folds to one that is not a
+    /// number, which the predicate refuses on its own.
+    #[test]
+    fn a_position_that_is_not_a_place_is_refused() {
+        for lat in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 90.001, -1e9] {
+            assert_eq!(
+                GeoPoint { lat, lon: -97.28 }.on_earth(),
+                None,
+                "latitude {lat} was accepted; latitude does not wrap and a fold \
+                 must not invent one",
+            );
+        }
+        for lon in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                GeoPoint { lat: 35.33, lon }.on_earth(),
+                None,
+                "longitude {lon} was accepted",
+            );
+        }
+    }
+
+    /// **The data path's predicate is untouched.** `squallar-source`'s
+    /// `VolumeGrid::footprint` leaves a box straddling the antimeridian out of
+    /// range on purpose and relies on this refusal being loud; the gesture
+    /// fold stands in front of the predicate, never inside it.
+    #[test]
+    fn the_strict_predicate_still_refuses_a_longitude_off_the_turn() {
+        for lon in [180.001, -180.001, 190.0, -190.0, 550.0, f64::NAN] {
+            assert!(
+                !GeoPoint { lat: 35.33, lon }.is_on_earth(),
+                "is_on_earth accepted {lon}; a straddling footprint would stop \
+                 being rejected and a world-spanning bbox would pass silently",
+            );
+        }
+        assert!(
+            GeoPoint {
+                lat: 35.33,
+                lon: 180.0
+            }
+            .is_on_earth()
+        );
+        assert!(
+            GeoPoint {
+                lat: 35.33,
+                lon: -180.0
+            }
+            .is_on_earth()
+        );
     }
 }

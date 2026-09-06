@@ -94,6 +94,11 @@ mod layer_curation_tests;
 #[cfg(test)]
 mod ui_glyphs;
 
+/// Every map gesture past the antimeridian, and the equivalence that says the
+/// same ground gives the same answer however the user panned to reach it.
+#[cfg(test)]
+mod seam_gesture_tests;
+
 pub use radar_layer::CurrentVolumeStamp;
 pub use ui::config::{UI_CONFIG_BACKUP_KEY, UI_CONFIG_KEY, back_up_pre_slot_config};
 pub use ui::map::pane_render::overlay_cache_token;

@@ -330,13 +330,34 @@ mod tests {
 
     /// The constructor's refusals hold through the edit path: an endpoint
     /// cannot be dragged off the Earth or onto its partner.
+    ///
+    /// **A longitude off the ±180 turn is no longer one of them**, and the
+    /// handle drag is where that shows first: the pointer hands back the pane's
+    /// own continuous frame, so dragging an end west past the antimeridian
+    /// reports 190° and the end has to follow. Latitude is unchanged — it does
+    /// not wrap, so 1e9° north is still nowhere.
     #[test]
     fn an_impossible_endpoint_is_refused_not_laundered() {
-        for bad in [point(f64::NAN, -97.0), point(1e9, -97.0), point(35.0, 1e9)] {
+        for bad in [
+            point(f64::NAN, -97.0),
+            point(1e9, -97.0),
+            point(35.0, f64::NAN),
+            point(35.0, f64::INFINITY),
+        ] {
             assert!(
                 with_endpoint(line(), SectionGrab::A, bad).is_none(),
                 "an endpoint at {bad:?} must be refused"
             );
+        }
+        for far in [190.0, -190.0, 550.0] {
+            let moved = with_endpoint(line(), SectionGrab::A, point(35.0, far))
+                .unwrap_or_else(|| panic!("an end dragged to {far} was refused"));
+            assert_eq!(
+                moved.a(),
+                point(35.0, squallar_geo::normalize_lon(far)),
+                "an end dragged to {far} landed somewhere else",
+            );
+            assert_eq!(moved.b(), line().b(), "grabbing A must not move B");
         }
         assert!(
             with_endpoint(line(), SectionGrab::A, line().b()).is_none(),

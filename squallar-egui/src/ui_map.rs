@@ -1170,7 +1170,11 @@ impl super::Gui {
         let zones: Vec<(SectionGrabZone, crate::pane::SectionLine)> = lines
             .into_iter()
             .map(|(section_pane, line)| {
-                let track = great_circle_track(line, project);
+                let track = great_circle_track(
+                    line,
+                    crate::overlay_cache::pane_turn_lon(projector),
+                    project,
+                );
                 (
                     SectionGrabZone {
                         map_pane: pane_idx,
@@ -1290,7 +1294,11 @@ impl super::Gui {
                 .map(|d| d.preview())
                 .or(dropped)
                 .unwrap_or(committed);
-            let track = great_circle_track(line, project);
+            let track = great_circle_track(
+                line,
+                crate::overlay_cache::pane_turn_lon(projector),
+                project,
+            );
             paint_section_track(painter, &track, pane_rect);
             #[cfg(test)]
             if let (Some(&a), Some(&b)) = (track.first(), track.last()) {
@@ -3304,18 +3312,42 @@ fn paint_armed_hint_chip(
 /// Segments a committed ground track is drawn with.
 const SECTION_TRACK_SAMPLES: usize = 32;
 
-/// The screen polyline of the great circle a section is cut along.
+/// The screen polyline of the great circle a section is cut along, drawn in the
+/// turn `turn_lon` names.
+///
+/// **The turn is a parameter because `Projector::project` folds nothing.** A
+/// line is stored in the ±180 frame — [`crate::pane::SectionLine::new`] carries
+/// it there — while the pane's centre runs on past the antimeridian as it is
+/// panned, so a track projected straight from its stored longitudes lands a
+/// whole world off the glass the moment the map is a turn out. That is now
+/// reachable in one gesture: a section drawn past the seam commits at the ground
+/// it covers and would then draw nowhere.
+///
+/// One shift, taken from the track's own middle, for the reason
+/// [`crate::overlay_cache::geo_corner_rect`] gives — a translation cannot turn
+/// the track inside out, and folding each sample against the pane separately
+/// would break a track longer than half a turn in the middle.
+///
+/// It does **not** straighten a track that crosses the seam itself:
+/// [`squallar_geo::great_circle_point`] answers through `atan2` and its samples
+/// change sign there, which is its own defect and its own change.
 fn great_circle_track(
     line: crate::pane::SectionLine,
+    turn_lon: f64,
     project: impl Fn(squallar_geo::GeoPoint) -> egui::Pos2,
 ) -> Vec<egui::Pos2> {
     let a = (line.a().lat, line.a().lon);
     let b = (line.b().lat, line.b().lon);
+    let (_, mid_lon) = squallar_geo::great_circle_point(a, b, 0.5);
+    let shift = squallar_geo::fold_lon_near(mid_lon, turn_lon) - mid_lon;
     (0..=SECTION_TRACK_SAMPLES)
         .map(|i| {
             let t = i as f64 / SECTION_TRACK_SAMPLES as f64;
             let (lat, lon) = squallar_geo::great_circle_point(a, b, t);
-            project(squallar_geo::GeoPoint { lat, lon })
+            project(squallar_geo::GeoPoint {
+                lat,
+                lon: lon + shift,
+            })
         })
         .collect()
 }

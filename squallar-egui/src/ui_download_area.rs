@@ -104,8 +104,16 @@ pub struct PickedBox {
 
 impl PickedBox {
     /// The box a committed drag describes, or `None` if it describes none.
+    ///
+    /// The centre is folded out of the map's continuous longitude frame by
+    /// [`squallar_geo::GeoPoint::on_earth`], which is what makes a box picked
+    /// past the antimeridian the *same download* as the one picked over the same
+    /// ground a turn back: [`Self::area_id`] quantises the centre into an
+    /// identity a resume matches on, and two spellings of one meridian would be
+    /// two downloads of one place.
     pub fn new(centre: squallar_geo::GeoPoint, half_width_km: f64) -> Option<Self> {
-        (centre.is_on_earth() && half_width_km.is_finite() && half_width_km > 0.0).then_some(Self {
+        let centre = centre.on_earth()?;
+        (half_width_km.is_finite() && half_width_km > 0.0).then_some(Self {
             centre,
             half_width_km,
         })

@@ -152,10 +152,26 @@ fn a_section_line_refuses_endpoints_it_cannot_be_cut_along() {
             "{bad_lat} latitude accepted"
         );
     }
-    for bad_lon in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1e9, 180.001] {
+    for bad_lon in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         assert!(
             SectionLine::new(point(35.3, -97.3), point(35.6, bad_lon)).is_none(),
             "{bad_lon} longitude accepted"
+        );
+    }
+
+    // A longitude off the turn is **not** one of them, and has not been since
+    // the map learned to wrap: the pointer hands back the pane's own continuous
+    // frame, so an end past the antimeridian is an ordinary place to release.
+    // It stores the meridian it names, which is what the equivalent release one
+    // turn back stores. `seam_gesture_tests` is where that equivalence is gated;
+    // this is the refusal list saying it is not on it.
+    for far in [180.5, -180.5, 190.0, -190.0, 550.0, -550.0] {
+        let line = SectionLine::new(point(35.3, -97.3), point(35.6, far))
+            .unwrap_or_else(|| panic!("a release at {far} was refused"));
+        assert_eq!(
+            line.b().lon,
+            squallar_geo::normalize_lon(far),
+            "a release at {far} stored a longitude the ±180 frame does not spell",
         );
     }
 

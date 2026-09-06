@@ -142,10 +142,16 @@ pub struct SectionLine {
 
 impl SectionLine {
     /// A section line from `a` to `b`, or `None` for a line that cannot be cut.
+    ///
+    /// Both ends are carried out of the map's continuous longitude frame by
+    /// [`squallar_geo::GeoPoint::on_earth`], **each on its own**. A shift taken
+    /// from the pair would make one end's stored value depend on the other, and
+    /// then a line drawn 179° → 181° would not be the line drawn 179° → −179°;
+    /// per end, the two are the same two places and store identically. A drag
+    /// spanning a whole turn lands on one meridian at both ends and is refused
+    /// below as the zero-length line it is.
     pub fn new(a: GeoPoint, b: GeoPoint) -> Option<Self> {
-        if !a.is_on_earth() || !b.is_on_earth() {
-            return None;
-        }
+        let (a, b) = (a.on_earth()?, b.on_earth()?);
         if a == b {
             return None;
         }
@@ -335,8 +341,14 @@ impl VolumeRegion {
     /// A region centred on `centre` reaching `half` either side on each axis,
     /// or `None` if the centre is not a point on Earth or the extent is not
     /// finite.
+    ///
+    /// The centre is a *point* and the extent is kilometres, so there is no rect
+    /// in degrees here to fold wrong: [`squallar_geo::GeoPoint::on_earth`]
+    /// carries the centre out of the map's continuous frame and the box is
+    /// rebuilt around it wherever it is drawn.
     pub fn new(centre: GeoPoint, half: squallar_radar::voxel::HalfExtentKm) -> Option<Self> {
-        if !centre.is_on_earth() || !half.is_finite() {
+        let centre = centre.on_earth()?;
+        if !half.is_finite() {
             return None;
         }
         Some(Self {

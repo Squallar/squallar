@@ -30,7 +30,9 @@ fn a_committed_track_bows_the_way_the_cut_does() {
         egui::pos2((p.lon.to_radians() * scale) as f32, (-y * scale) as f32)
     };
 
-    let track = great_circle_track(line, project);
+    // The line is near −97°, so a pane looking at the prime meridian folds it
+    // nowhere: the shift is zero and this measures the bow, not the fold.
+    let track = great_circle_track(line, 0.0, project);
     assert_eq!(track.len(), SECTION_TRACK_SAMPLES + 1);
     assert_eq!(
         (track[0], track[SECTION_TRACK_SAMPLES]),
@@ -74,6 +76,73 @@ fn a_committed_track_bows_the_way_the_cut_does() {
              which is worse than the 258 m the range ring used to sit off this \
              track before the two spheres were unified"
     );
+}
+
+/// **A section's ground track is drawn in the turn the pane is looking at.**
+///
+/// A line is stored in the ±180 frame and the pane's centre is not, so a track
+/// projected straight from its stored longitudes lands a whole world off the
+/// glass once the map is panned across the antimeridian — which is now one
+/// gesture away, because a section can be *drawn* out there.
+///
+/// Two claims, both contradictions rather than thresholds: nothing the pane
+/// draws of its own section may be more than half a turn from where the pane is
+/// looking, since past that the far spelling was taken; and the carry is a whole
+/// number of turns, since anything else names different ground.
+#[test]
+fn a_section_track_is_drawn_in_the_turn_the_pane_is_looking_at() {
+    let line = crate::pane::SectionLine::new(
+        squallar_geo::GeoPoint {
+            lat: 35.0,
+            lon: -179.5,
+        },
+        squallar_geo::GeoPoint {
+            lat: 35.6,
+            lon: -178.0,
+        },
+    )
+    .expect("a line just west of the antimeridian");
+
+    // Longitude alone, recorded in `f64` on the way past: a projected `x` is an
+    // `f32` and the claims below are about degrees, not about pixels.
+    let seen = std::cell::RefCell::new(Vec::<f64>::new());
+    let project = |p: squallar_geo::GeoPoint| {
+        seen.borrow_mut().push(p.lon);
+        egui::pos2(p.lon as f32, p.lat as f32)
+    };
+
+    let mut placed: Vec<(f64, Vec<f64>)> = Vec::new();
+    for turn in [-900.0, -540.5, -180.0, 0.0, 180.0, 190.0, 540.5, 900.0] {
+        seen.borrow_mut().clear();
+        let track = great_circle_track(line, turn, project);
+        assert_eq!(track.len(), SECTION_TRACK_SAMPLES + 1);
+        let lons = seen.borrow().clone();
+        assert_eq!(lons.len(), SECTION_TRACK_SAMPLES + 1);
+
+        for lon in &lons {
+            assert!(
+                (lon - turn).abs() <= 180.0,
+                "a pane looking at {turn} placed part of its own section at {lon}, \
+                 {} degrees away - past half a turn the far spelling was taken and \
+                 the track is drawn a world off the glass",
+                (lon - turn).abs(),
+            );
+        }
+        placed.push((turn, lons));
+    }
+
+    let (_, base) = placed.first().expect("the sweep ran").clone();
+    for (turn, lons) in &placed {
+        for (i, (lon, from)) in lons.iter().zip(base.iter()).enumerate() {
+            let turns = (lon - from) / 360.0;
+            assert_eq!(
+                turns,
+                turns.round(),
+                "sample {i} moved {turns} turns between the pane at {turn} and the \
+                 first - a carry that is not a whole turn names different ground",
+            );
+        }
+    }
 }
 
 #[test]

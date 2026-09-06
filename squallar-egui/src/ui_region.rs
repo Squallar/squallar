@@ -46,14 +46,21 @@ pub(crate) struct RegionDrag {
 
 impl RegionDrag {
     /// Start a drag centred on `centre`, measured against `bounds`.
+    ///
+    /// The press arrives in the map's continuous longitude frame, which runs
+    /// past ±180 once the map is panned across the antimeridian, so it is
+    /// carried into the frame the drag stores in by
+    /// [`squallar_geo::GeoPoint::on_earth`] rather than refused for being out
+    /// there. A press past the seam therefore starts the same drag the identical
+    /// press one turn back starts.
     pub(crate) fn begin(
         pane_idx: crate::pane::PaneId,
         centre: squallar_geo::GeoPoint,
         bounds: DragBoundsKm,
     ) -> Option<Self> {
-        centre.is_on_earth().then_some(Self {
+        Some(Self {
             pane_idx,
-            centre,
+            centre: centre.on_earth()?,
             half_width_km: 0.0,
             bounds,
         })
@@ -75,10 +82,17 @@ impl RegionDrag {
     }
 
     /// Re-measure the half-width against a pointer now over `corner`.
+    ///
+    /// Folded on the way in for the reason [`Self::begin`] gives — dragging
+    /// *across* the seam is as ordinary as pressing past it. The measurement
+    /// itself does not need the fold: `site_bearing_range_km` is periodic in the
+    /// longitude difference, so a corner a turn out already measures correctly.
+    /// It is folded anyway, so that one pointer position has one answer whoever
+    /// asks.
     pub(crate) fn extend_to(&mut self, corner: squallar_geo::GeoPoint) {
-        if !corner.is_on_earth() {
+        let Some(corner) = corner.on_earth() else {
             return;
-        }
+        };
         let (bearing_deg, range_km) = squallar_geo::site_bearing_range_km(
             self.centre.lat,
             self.centre.lon,
