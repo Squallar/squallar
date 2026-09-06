@@ -208,6 +208,31 @@ pub(crate) fn bearing_deg(line: SectionLine) -> f64 {
 
 /// The point `distance_km` from `from` along `bearing_deg`, on the sphere the
 /// rest of the crate's geodesy walks ([`squallar_geo::EARTH_RADIUS_KM`]).
+///
+/// # The single `±360` correction, and why it is neither wrong nor `normalize_lon`
+///
+/// `squallar_geo::great_circle_destination` deliberately does not wrap: it
+/// answers `from.lon` plus an `atan2` displacement, so a step past the
+/// antimeridian comes back as 184.03° rather than −175.97°. Something has to
+/// fold it, because everything downstream of here — the section's own ends, the
+/// sampler, the persisted line — is written on the globe.
+///
+/// **One correction is exact, not lucky.** `atan2` cannot answer more than a
+/// half turn, so an input already on the globe is at most one lap out however
+/// long the step is; a range of five laps of the planet lands in exactly the
+/// same place as a short one. `squallar_geo`'s
+/// `a_destination_moves_a_longitude_by_at_most_a_half_turn` pins that at the
+/// source, and every `from` reaching here is already on the globe: they are
+/// `midpoint`'s `great_circle_point` answer, which comes through `atan2`, or
+/// this function's own output.
+///
+/// **And it is a correction rather than a wrap.** `squallar_geo::normalize_lon`
+/// is the general spelling and is the obvious-looking swap, but it is not
+/// bit-exactly the identity on its own range — 48.46 % of four-decimal
+/// longitudes move by one ulp under it — so adopting it would shift every
+/// section end that never left the globe in the first place. The `if` is what
+/// keeps an unmoved end unmoved, exactly as
+/// [`squallar_geo::GeoPoint::on_earth`]'s early return does.
 fn destination(from: GeoPoint, bearing_deg: f64, distance_km: f64) -> GeoPoint {
     let (lat, lon_raw) =
         squallar_geo::great_circle_destination(from.lat, from.lon, bearing_deg, distance_km);
@@ -311,6 +336,57 @@ mod tests {
 
     fn line() -> SectionLine {
         SectionLine::new(point(35.0, -97.8), point(35.6, -96.9)).expect("a real line")
+    }
+
+    /// **[`destination`]'s single `±360` correction folds every reachable
+    /// answer onto the globe, and folds nothing else.**
+    ///
+    /// Both halves are load-bearing and each is a contradiction rather than a
+    /// threshold. A raw answer is `from.lon` plus an `atan2` displacement, so
+    /// it is at most one lap out however long the step is — including the
+    /// five-lap step below, which is what "a long-range destination needs two
+    /// corrections" would have to mean. And a raw answer already on the globe
+    /// comes back bit for bit: `squallar_geo::normalize_lon` moves 48.46 % of
+    /// four-decimal longitudes by one ulp, so adopting it here would shift
+    /// section ends that nothing asked to move.
+    #[test]
+    fn a_destination_is_folded_by_one_correction_and_never_by_a_wrap() {
+        let mut folded = 0usize;
+        let mut untouched = 0usize;
+        for lon_step in -36..=36 {
+            let from = point(20.0, f64::from(lon_step) * 5.0);
+            for bearing_step in 0..72 {
+                let bearing = f64::from(bearing_step) * 5.0;
+                for km in [1.0, 500.0, 5_000.0, 19_000.0, 40_030.0, 200_150.0] {
+                    let (_, raw) =
+                        squallar_geo::great_circle_destination(from.lat, from.lon, bearing, km);
+                    let got = destination(from, bearing, km);
+                    assert!(
+                        got.is_on_earth(),
+                        "a step of {km} km from {} deg on bearing {bearing} answered \
+                         {} deg, which is not a place: one correction did not reach \
+                         the raw {raw} deg",
+                        from.lon,
+                        got.lon,
+                    );
+                    if (-180.0..=180.0).contains(&raw) {
+                        assert_eq!(
+                            got.lon, raw,
+                            "a raw answer already on the globe was moved: a wrap ran \
+                             where a correction was needed",
+                        );
+                        untouched += 1;
+                    } else {
+                        folded += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            folded > 0 && untouched > 0,
+            "fixture: {folded} answers crossed the seam and {untouched} did not - \
+             both arms have to be reached or one of the claims is vacuous",
+        );
     }
 
     /// Moving one end leaves the other exactly where it was — the property

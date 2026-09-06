@@ -161,12 +161,26 @@ pub fn fold_lon_near(lon: f64, near: f64) -> f64 {
 /// does not do this (see its contract); a caller that wants a wrapped longitude
 /// asks for one here.
 ///
-/// **`rem_euclid`, not a single `±360` correction.** The open-coded form in
-/// `squallar-egui`'s `ui_section_edit::destination` subtracts 360 once, which is
-/// correct for one lap and wrong for two — reachable by a long-range
-/// destination or a caller that already added an offset. That site is the
-/// obvious adoption candidate and is deliberately left alone here, because
-/// changing it is a different crate's gate.
+/// **`rem_euclid`, not a single `±360` correction.** One correction is right for
+/// one lap and wrong for two, and this has to survive both, because callers
+/// hand it whatever they are holding.
+///
+/// The open-coded single correction in `squallar-egui`'s
+/// `ui_section_edit::destination` reads like the obvious adoption candidate and
+/// is **not** one, in both directions.
+///
+/// Two laps are unreachable there. It folds [`great_circle_destination`]'s
+/// answer, which is a longitude already on the globe plus an `atan2`
+/// displacement of at most a half turn — so it is at most one lap out however
+/// long the step is, and a long range cannot make it two
+/// ([`a_destination_moves_a_longitude_by_at_most_a_half_turn`]).
+///
+/// And swapping it for this function would be a regression rather than a
+/// tidy-up. That site leaves a value already on the globe exactly where it is,
+/// while this one is not bit-exactly the identity on its own range: 1,744,481
+/// of the 3,600,001 four-decimal longitudes (48.46 %) move by one ulp under it.
+/// Every section end that nothing had asked to move would shift.
+/// [`GeoPoint::on_earth`]'s early return stands on the same measurement.
 ///
 /// `180.0` wraps to `-180.0`: they are the same meridian, and picking one end
 /// keeps the range half-open so a value cannot be spelled two ways.
@@ -576,6 +590,76 @@ mod tests {
         // function always answering out of range.
         let (_, lon) = great_circle_destination(39.0, -106.0, 90.0, 460.0);
         assert!((-180.0..=180.0).contains(&lon), "control gave {lon}");
+    }
+
+    /// [`great_circle_destination`] moves a longitude by **at most a half
+    /// turn**, however long the range is and however many times round the
+    /// planet it goes.
+    ///
+    /// It adds an `atan2` displacement to the site's own longitude, and
+    /// `atan2` cannot answer more than π. That is what makes the single `±360`
+    /// correction in `squallar-egui`'s `ui_section_edit::destination` exact
+    /// rather than lucky, and it is why a "long-range destination" cannot put
+    /// that site two laps out — see [`normalize_lon`]'s note.
+    ///
+    /// The sweep asserts it reaches the bound it is about, **and that the long
+    /// ranges are what reach it** — a bound nothing approaches is a bound the
+    /// sweep does not test, and the whole sweep reaches 180° on polar geometry
+    /// alone, from a 460 km step over the pole. Without the second guard,
+    /// trimming the multi-lap ranges away would leave this green while it
+    /// stopped saying anything about range at all.
+    #[test]
+    fn a_destination_moves_a_longitude_by_at_most_a_half_turn() {
+        // Five laps of the planet at the far end, so "however long the range
+        // is" is exercised rather than described.
+        let ranges = [
+            0.0,
+            1.0,
+            460.0,
+            std::f64::consts::PI * EARTH_RADIUS_KM * 0.999,
+            2.0 * std::f64::consts::PI * EARTH_RADIUS_KM,
+            10.0 * std::f64::consts::PI * EARTH_RADIUS_KM,
+        ];
+        // A range at or past a half circumference, where a step's own length
+        // is what carries the longitude rather than the latitude it starts at.
+        let long_range = std::f64::consts::PI * EARTH_RADIUS_KM * 0.9;
+        let mut worst = 0.0_f64;
+        let mut worst_long = 0.0_f64;
+        for lat_step in -8..=8 {
+            let site_lat = f64::from(lat_step) * 11.0;
+            for lon_step in -18..=18 {
+                let site_lon = f64::from(lon_step) * 10.0;
+                for bearing_step in 0..72 {
+                    let bearing = f64::from(bearing_step) * 5.0;
+                    for range in ranges {
+                        let (_, lon) = great_circle_destination(site_lat, site_lon, bearing, range);
+                        let moved = (lon - site_lon).abs();
+                        assert!(
+                            moved <= 180.0,
+                            "a destination {range} km from ({site_lat}, {site_lon}) on \
+                             bearing {bearing} moved the longitude {moved} deg, past the \
+                             half turn an atan2 can answer - one correction no longer \
+                             folds it onto the globe",
+                        );
+                        worst = worst.max(moved);
+                        if range >= long_range {
+                            worst_long = worst_long.max(moved);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            worst > 179.0,
+            "the sweep's furthest step moved only {worst} deg, so it never \
+             approaches the half turn it is about",
+        );
+        assert!(
+            worst_long > 179.0,
+            "no range past {long_range} km moved a longitude more than \
+             {worst_long} deg, so the bound is reached by the sweep's polar \
+             geometry alone and nothing here is about a long range",
+        );
     }
 
     /// [`normalize_lon`] is the wrap, and it survives more than one lap.
