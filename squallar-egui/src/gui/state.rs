@@ -353,6 +353,13 @@ pub struct Gui {
     /// `PoolPercents::FULL`, which is what every session before the setting
     /// existed did.
     pub(super) memory_percents: squallar_device_profile::scene::PoolPercents,
+    /// **The largest side the user allows any radar raster** — the
+    /// Memory section's texture-size control, read by the shell through
+    /// [`super::Gui::texture_ceiling`] and applied to every resolved
+    /// `Budgets` before anything is priced with them. Persisted; defaults
+    /// to `TextureCeiling::NONE`, which is what every session before the
+    /// setting existed did.
+    pub(super) texture_ceiling: squallar_device_profile::budget::TextureCeiling,
     /// The overlay's trailing-window state. Session-only bookkeeping —
     /// emptied whenever the overlay is hidden.
     pub(super) diagnostics: diagnostics::DiagnosticsState,
@@ -673,6 +680,7 @@ impl Gui {
             pin_pane_controls: false,
             diagnostics_panel: false,
             memory_percents: squallar_device_profile::scene::PoolPercents::FULL,
+            texture_ceiling: squallar_device_profile::budget::TextureCeiling::NONE,
             diagnostics: diagnostics::DiagnosticsState::default(),
             ui_faded: false,
             fade_candidate: false,

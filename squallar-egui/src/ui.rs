@@ -940,6 +940,17 @@ impl Gui {
         self.memory_percents
     }
 
+    /// **The largest side the user allows any radar raster** — the Memory
+    /// section's texture-size control, as the config restored it.
+    ///
+    /// Read by the shell once at construction, before the first `fit`, on
+    /// [`Self::memory_percents`]' terms exactly; every later change reaches
+    /// the App as [`crate::actions::GuiAction::SetTextureCeiling`]. A value
+    /// the UI owns and does not price with.
+    pub fn texture_ceiling(&self) -> squallar_device_profile::budget::TextureCeiling {
+        self.texture_ceiling
+    }
+
     /// The distinct sites some pane is watching live — the unit the chunk feed
     /// and the archive auto-poll both work in.
     pub fn live_sites(&self) -> Vec<String> {

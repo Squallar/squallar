@@ -5950,7 +5950,12 @@ impl super::App {
                 fitted.steps_back,
             );
         }
-        fitted
+        // Held to the user's own ceiling on the way out, so that every
+        // caller's "did the answer move" comparison against `self.budgets`
+        // — which `adopt_budgets` stores held — compares like with like.
+        // Idempotent, and applied after `fit_holds` so the invariant is
+        // checked on what `fit` actually produced.
+        self.texture_ceiling.hold_all(fitted)
     }
 
     /// **The pool the scene asks for** — what its loops need, capped by the

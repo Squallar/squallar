@@ -280,6 +280,21 @@ pub struct App {
     /// round of budgets resolved at the whole pool — and rewritten by
     /// `GuiAction::SetMemoryPercents` thereafter.
     memory_percents: squallar_device_profile::scene::PoolPercents,
+    /// **The largest side the user allows any radar raster** — the Memory
+    /// section's texture-size control, applied to every resolved `Budgets` by
+    /// [`Self::adopt_budgets`] before anything is priced with them.
+    ///
+    /// A copy of a `Gui` value on `memory_percents`' terms exactly: the
+    /// setting is the UI's to own and persist, the *pricing* is this layer's.
+    /// Seeded from the restored config in [`Self::new`] — before the first
+    /// `fit`, so a user who lowered it last session never gets one round of
+    /// budgets resolved at the full size — and rewritten by
+    /// `GuiAction::SetTextureCeiling` thereafter.
+    ///
+    /// `TextureCeiling::NONE` by default, which is the identity: a session
+    /// that never touches this control resolves the budgets this build
+    /// resolved before the setting existed, field for field.
+    texture_ceiling: squallar_device_profile::budget::TextureCeiling,
     /// **What the page's next picture batch will allocate**, as the last loop
     /// walk priced it — every shown overlay picture at the budget's
     /// oversampling plus one arrival — so the watermark's action line can be
@@ -825,6 +840,7 @@ impl App {
         // budgets against the whole pool first, which is the round most
         // likely to be the largest one.
         let memory_percents = gui.memory_percents();
+        let texture_ceiling = gui.texture_ceiling();
         let parked_fetch_pending = parked_panes(&gui);
         let loop_arm_pending = looping_panes(&gui);
         let site_positions = crate::site_positions::SitePositions::load(platform.kv().as_deref());
@@ -883,6 +899,7 @@ impl App {
             capacity_modulation: squallar_device_profile::scene::Modulation::NONE,
             host_recovery: crate::recovery::HostRecovery::untouched(),
             memory_percents,
+            texture_ceiling,
             host_headroom_bytes: 0,
             budget_readout: squallar_egui::shell_api::BudgetReadout::default(),
             admission_costs: squallar_egui::admission::AdmissionCosts::default(),
@@ -1523,6 +1540,31 @@ impl App {
         self.memory_percents = percents;
     }
 
+    /// **Adopt the user's ceiling on raster sides, and re-fit at once.**
+    ///
+    /// Unlike [`Self::set_memory_percents`], which changes a capacity the
+    /// next loop walk re-reads on its own, this changes a term of `Budgets`
+    /// itself — and `Budgets` is what the dispatcher was handed. Re-fitting
+    /// here is what makes the control take effect on the frame the user
+    /// releases it rather than on whenever the next walk happens to run.
+    pub(super) fn set_texture_ceiling(
+        &mut self,
+        ceiling: squallar_device_profile::budget::TextureCeiling,
+    ) {
+        if self.texture_ceiling == ceiling {
+            return;
+        }
+        match ceiling.side_px() {
+            Some(px) => log::info!("texture ceiling: rasters held to {px} px by your setting"),
+            None => log::info!("texture ceiling: none; rasters take the size this device fits"),
+        }
+        self.texture_ceiling = ceiling;
+        let scene = self.scene_of();
+        let refitted = self.fit_scene(&scene);
+        self.adopt_budgets(refitted);
+        self.loop_pool = self.pool_for_scene(&scene);
+    }
+
     /// Make `budgets` the budgets in force, and re-derive what hangs off them.
     ///
     /// **The raster ceiling is re-derived here, not only in `AppState::new`.**
@@ -1536,6 +1578,13 @@ impl App {
     /// process. And the ladder's last rung walks the same figure *down*, which
     /// has to reach the dispatcher the same way.
     pub(super) fn adopt_budgets(&mut self, budgets: squallar_device_profile::budget::Budgets) {
+        // **The user's ceiling is applied here and nothing downstream repeats
+        // it.** This is the one place `self.budgets` is written, so a caller
+        // that resolves budgets some new way cannot forget the setting;
+        // `hold_all` is `min` on four fields and therefore idempotent, which
+        // is what lets `fit_scene` also hand back a held answer so its
+        // callers' "did anything move" comparisons compare like with like.
+        let budgets = self.texture_ceiling.hold_all(budgets);
         self.budgets = budgets;
         let Some(state) = self.state.as_mut() else {
             return;
@@ -3255,6 +3304,11 @@ mod gui_seam_ratchet_tests;
 
 #[cfg(test)]
 mod gpu_capacity_tests;
+
+/// The user's texture ceiling reaches the budgets in force, and the default
+/// reaches nothing.
+#[cfg(test)]
+mod texture_ceiling_tests;
 
 /// What the OS would give this process reaches the capacity in force, on the
 /// arm that had no host figure at all, and is re-read on every tick.

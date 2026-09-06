@@ -1031,6 +1031,10 @@ fn default_full_percent() -> u8 {
 
 /// Whether a memory-share field is at its neutral default, for
 /// `skip_serializing_if`.
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 fn is_full_percent(value: &u8) -> bool {
     *value == default_full_percent()
 }
@@ -1199,6 +1203,24 @@ struct UiConfig {
         skip_serializing_if = "is_full_percent"
     )]
     system_memory_percent: u8,
+    /// **The largest side, in pixels, the user allows any radar raster** —
+    /// the Memory section's texture-size control. `0` is "no limit".
+    ///
+    /// Additive on `gpu_memory_percent`'s terms exactly: `#[serde(default)]`,
+    /// **no `CONFIG_VERSION` bump and no `migrate.rs` step**. The default is
+    /// `0`, which is neutrality: absence loads as "no ceiling", which is
+    /// exactly what every session written before this field existed did. A
+    /// default that held rasters down would make a fresh install, a downgrade
+    /// and a reset each quietly render smaller pictures than the user last
+    /// asked for.
+    ///
+    /// `skip_serializing_if` at the default for `viewing_live`'s reason:
+    /// writing the key into every file would move the bytes of configs that
+    /// say nothing about it, which
+    /// `a_config_naming_an_unregistered_layer_is_written_back_byte_preserved`
+    /// forbids.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    texture_ceiling_px: u32,
     /// **The user's starred radar sites**, bare ICAO identifiers in the order
     /// they were starred — the same spelling a pick persists, so a favourite
     /// and a current site are the one kind of value.
@@ -1644,6 +1666,7 @@ impl Default for UiConfig {
             diagnostics_panel: false,
             gpu_memory_percent: default_full_percent(),
             system_memory_percent: default_full_percent(),
+            texture_ceiling_px: 0,
             favorite_sites: Vec::new(),
             downloaded_areas: Vec::new(),
             download_area: DownloadAreaConfig::default(),
@@ -1782,6 +1805,7 @@ impl super::Gui {
             diagnostics_panel: self.diagnostics_panel,
             gpu_memory_percent: self.memory_percents.gpu,
             system_memory_percent: self.memory_percents.host,
+            texture_ceiling_px: self.texture_ceiling.as_px(),
             favorite_sites: self.favorite_sites.clone(),
             downloaded_areas: self
                 .downloaded_areas
@@ -1990,6 +2014,11 @@ impl super::Gui {
             config.gpu_memory_percent,
             config.system_memory_percent,
         );
+        // Held inside the offered rungs on the way in, for the reason the
+        // shares above are: a hand-edited `7` or `99999` costs the user a
+        // sensible ceiling, not their whole config.
+        self.texture_ceiling =
+            squallar_device_profile::budget::TextureCeiling::clamped(config.texture_ceiling_px);
         self.favorite_sites = config.favorite_sites;
         // A block that names no area is dropped, not restored badly — the
         // `VolumeRegionConfig::restore` arrangement, and the reason a hand-

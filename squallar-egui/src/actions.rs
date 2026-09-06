@@ -132,6 +132,18 @@ pub enum GuiAction {
     /// lowered the setting last session never gets one round of budgets
     /// resolved at the whole pool. This carries every change after that.
     SetMemoryPercents(squallar_device_profile::scene::PoolPercents),
+    /// **The largest side the user allows any radar raster** changed — the
+    /// Memory section's texture-size control.
+    ///
+    /// On [`Self::SetMemoryPercents`]' terms: the setting is the UI's, the
+    /// pricing is the App's, and the seed is not this action — `App::new`
+    /// reads the restored ceiling off the `Gui` before its first `fit`. This
+    /// carries every change after that.
+    ///
+    /// The App re-fits on it rather than waiting for the next loop walk,
+    /// because unlike a memory share this is a term of `Budgets` itself and
+    /// the dispatcher already holds a copy.
+    SetTextureCeiling(squallar_device_profile::budget::TextureCeiling),
 }
 
 impl GuiAction {
@@ -152,7 +164,8 @@ impl GuiAction {
             | Self::RequestLocation
             | Self::StopLocation
             | Self::OpenLocationSettings
-            | Self::SetMemoryPercents(_) => None,
+            | Self::SetMemoryPercents(_)
+            | Self::SetTextureCeiling(_) => None,
             Self::SwitchRadarSite { pane_idx, .. }
             | Self::FetchOverlay { pane_idx, .. }
             | Self::RefreshOverlay { pane_idx, .. }
@@ -302,6 +315,10 @@ impl std::fmt::Display for GuiAction {
                     percents.gpu, percents.host
                 )
             }
+            GuiAction::SetTextureCeiling(ceiling) => match ceiling.side_px() {
+                Some(px) => write!(f, "Texture ceiling: rasters held to {px} px"),
+                None => write!(f, "Texture ceiling: none"),
+            },
         }
     }
 }

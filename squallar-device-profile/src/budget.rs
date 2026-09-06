@@ -1133,6 +1133,138 @@ impl Budgets {
     }
 }
 
+/// **The largest side, in pixels, the user allows any radar raster.**
+///
+/// A ceiling and only a ceiling. [`Self::NONE`] is the default and the
+/// identity on every field it touches, so a fresh install, a downgrade and a
+/// reset each resolve exactly the budgets this build would have resolved
+/// without the setting — byte for byte, on every bracket. It can never raise
+/// a side: the shape is `squallar_radar::types::RasterSide::held_to` one
+/// layer down, and `squallar_radar::types::SideBound::Setting` is the word a
+/// readout prints when this is what bound the raster.
+///
+/// **Why a ceiling on the side rather than a share of a pool.** The two
+/// memory-share controls hand `crate::fit` a smaller allowance and let the
+/// ladder decide what to shed; this names the one term directly, because a
+/// raster's side is the term whose cost is quadratic and whose effect the
+/// user can see. A machine that renders 4096 px plan views perfectly well
+/// but cannot hold fourteen of them in a loop has nothing to say to a
+/// percentage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TextureCeiling {
+    /// The ceiling in pixels, or `0` for none. Private so the `0` sentinel
+    /// cannot be read as a side by a caller who forgot what it means.
+    side_px: u32,
+}
+
+impl TextureCeiling {
+    /// **No ceiling**: the neutral posture, the identity on every field, and
+    /// what an install with nothing written down gets.
+    pub const NONE: Self = Self { side_px: 0 };
+
+    /// **The smallest ceiling offered, and an unmeasured choice.**
+    ///
+    /// 512 px is the smallest rung the control offers because below it a
+    /// plan view is coarser than the basemap tiles it is composited over, so
+    /// the radar picture stops being the thing the user is looking at. That
+    /// is a structural argument, **not a measurement**: unlike
+    /// [`crate::scene::PoolPercents::FLOOR`], no leg has shown that the rungs
+    /// below here buy nothing. Widening downward needs that leg, and
+    /// widening it on the strength of this comment would be reading a caveat
+    /// as evidence.
+    pub const FLOOR_PX: u32 = 512;
+
+    /// **The largest ceiling offered.** Distinct from [`Self::NONE`] and not
+    /// a synonym for it: the desktop bracket's `raster_side_ceiling_px` is
+    /// 8192, so a raster held to 4096 px is genuinely smaller than one the
+    /// machine would otherwise draw. A first cut of this type collapsed
+    /// anything at or above the largest *long range* side onto `NONE`, which
+    /// made two entries of the list below select the same value and left the
+    /// user picking "4096 px" and being shown "No limit"
+    /// (`every_offered_rung_is_a_distinct_setting` caught it).
+    pub const LARGEST_PX: u32 = 4096;
+
+    /// The rungs the settings control offers, in draw order. `0` is
+    /// [`Self::NONE`] and leads, because the neutral posture is the default
+    /// and a list a user scans top-down should open on it.
+    pub const OFFERED_PX: &'static [u32] = &[0, Self::LARGEST_PX, 2048, 1024, Self::FLOOR_PX];
+
+    /// A ceiling from a config file or a widget, held inside the offered
+    /// range. A hand-edited `1`, a `99999` and a value from a build whose
+    /// rungs were different all cost the user nothing: `0` alone is "no
+    /// ceiling", and every other figure is a real ceiling held into
+    /// [`Self::FLOOR_PX`]`..=`[`Self::LARGEST_PX`].
+    ///
+    /// **Only `0` means none**, so no in-range figure can collapse onto the
+    /// neutral posture and no two offered rungs can coincide.
+    pub fn clamped(side_px: u32) -> Self {
+        match side_px {
+            0 => Self::NONE,
+            n => Self {
+                side_px: n.clamp(Self::FLOOR_PX, Self::LARGEST_PX),
+            },
+        }
+    }
+
+    /// The ceiling in pixels, or `None` when there is none.
+    pub const fn side_px(self) -> Option<usize> {
+        match self.side_px {
+            0 => None,
+            n => Some(n as usize),
+        }
+    }
+
+    /// The raw stored figure, for a config file to write. `0` is
+    /// [`Self::NONE`].
+    pub const fn as_px(self) -> u32 {
+        self.side_px
+    }
+
+    /// Hold one side to this ceiling. The identity under [`Self::NONE`] and
+    /// under any ceiling at or above `side` — this can only lower.
+    pub fn hold(self, side: usize) -> usize {
+        match self.side_px() {
+            None => side,
+            Some(limit) => side.min(limit),
+        }
+    }
+
+    /// Whether this ceiling actually binds anything in `budgets` — what a
+    /// readout asks before telling the user a side is their own doing rather
+    /// than the machine's.
+    pub fn binds(self, budgets: &Budgets) -> bool {
+        self.hold_all(*budgets) != *budgets
+    }
+
+    /// **Every raster side in `budgets`, held to this ceiling.**
+    ///
+    /// The four sides move together and by `min`, which is what keeps the
+    /// ordering the brackets are built with — loop, base, long range, then
+    /// the adapter ceiling — true on the way out: `min(a, c) <= min(b, c)`
+    /// whenever `a <= b`, so no invariant a resolved `Budgets` satisfies can
+    /// be broken by holding it here.
+    ///
+    /// Nothing else is touched. In particular the loop's **frame count** is
+    /// not lowered: the extra frames a smaller raster affords are the point
+    /// of the setting, and `crate::fit` is what spends them.
+    pub fn hold_all(self, mut budgets: Budgets) -> Budgets {
+        if self.side_px().is_none() {
+            return budgets;
+        }
+        budgets.image_side_px = self.hold(budgets.image_side_px);
+        budgets.long_range_image_side_px = self.hold(budgets.long_range_image_side_px);
+        budgets.loop_image_side_px = self.hold(budgets.loop_image_side_px);
+        budgets.raster_side_ceiling_px = self.hold(budgets.raster_side_ceiling_px);
+        budgets
+    }
+}
+
+impl Default for TextureCeiling {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
 /// The budgets this device gets.
 pub fn resolve(profile: &DeviceProfile) -> Budgets {
     let mut budgets = at_class_rung(&profile.limits, profile.promotion());

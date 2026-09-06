@@ -2758,3 +2758,151 @@ fn a_web_profile_keeps_its_instances_wall_because_no_pool_reader_answers_there()
          module was linked with",
     );
 }
+
+/// **The neutral arm, and the one that protects every existing user.**
+///
+/// `TextureCeiling::NONE` is the default, so a session that never touches the
+/// control must resolve the budgets this build resolved before the setting
+/// existed — not "near enough", but the identical struct, on every shipped
+/// bracket and at every promotion. `Budgets` is `PartialEq` over all of its
+/// fields, so this is the byte-for-byte claim and not a spot check of the
+/// four sides.
+#[test]
+fn the_default_texture_ceiling_is_the_identity_on_every_bracket() {
+    for limits in BudgetLimits::SHIPPED {
+        for promotion in [Promotion::Floor, Promotion::Step, Promotion::Ceiling] {
+            let resolved = at_class_rung(&limits, promotion);
+            assert_eq!(
+                TextureCeiling::NONE.hold_all(resolved),
+                resolved,
+                "{} at {promotion:?}: the default ceiling moved a budget",
+                limits.name,
+            );
+            assert!(
+                !TextureCeiling::NONE.binds(&resolved),
+                "{} at {promotion:?}: the default ceiling reports that it binds",
+                limits.name,
+            );
+            assert!(
+                !TextureCeiling::default().binds(&resolved),
+                "{} at {promotion:?}: `default()` is not `NONE`",
+                limits.name,
+            );
+        }
+    }
+}
+
+/// **The arm that binds.** A ceiling under every side lowers all four and
+/// leaves everything else alone — and the ordering the brackets are built
+/// with survives, which is the property `hold_all`'s `min` is chosen for.
+#[test]
+fn a_lowered_texture_ceiling_binds_every_side_and_nothing_else() {
+    let floor_px = TextureCeiling::FLOOR_PX as usize;
+    for limits in BudgetLimits::SHIPPED {
+        let resolved = at_class_rung(&limits, Promotion::Ceiling);
+        let held = TextureCeiling::clamped(TextureCeiling::FLOOR_PX).hold_all(resolved);
+
+        assert_ne!(
+            held, resolved,
+            "{}: the floor ceiling bound nothing",
+            limits.name
+        );
+        assert!(
+            TextureCeiling::clamped(TextureCeiling::FLOOR_PX).binds(&resolved),
+            "{}: a binding ceiling reports that it does not",
+            limits.name,
+        );
+
+        for (name, got) in [
+            ("image_side_px", held.image_side_px),
+            ("long_range_image_side_px", held.long_range_image_side_px),
+            ("loop_image_side_px", held.loop_image_side_px),
+            ("raster_side_ceiling_px", held.raster_side_ceiling_px),
+        ] {
+            assert_eq!(
+                got, floor_px,
+                "{}: {name} is {got} px under a {floor_px} px ceiling",
+                limits.name,
+            );
+        }
+
+        // The ordering the brackets are built with, still true on the way out.
+        assert!(
+            held.loop_image_side_px <= held.image_side_px,
+            "{}",
+            limits.name
+        );
+        assert!(
+            held.image_side_px <= held.long_range_image_side_px,
+            "{}",
+            limits.name,
+        );
+
+        // Everything that is not a raster side is untouched: restore the four
+        // and the struct is the one that went in.
+        let mut restored = held;
+        restored.image_side_px = resolved.image_side_px;
+        restored.long_range_image_side_px = resolved.long_range_image_side_px;
+        restored.loop_image_side_px = resolved.loop_image_side_px;
+        restored.raster_side_ceiling_px = resolved.raster_side_ceiling_px;
+        assert_eq!(
+            restored, resolved,
+            "{}: the ceiling moved a field that is not a raster side",
+            limits.name,
+        );
+    }
+}
+
+/// A ceiling can only ever lower. Above every side it is the identity, which
+/// is what makes "a ceiling the user lowers, never a floor they raise" a
+/// property of the type rather than of the widget that sets it.
+#[test]
+fn a_texture_ceiling_never_raises_a_side() {
+    for limits in BudgetLimits::SHIPPED {
+        let resolved = at_class_rung(&limits, Promotion::Floor);
+        for px in TextureCeiling::OFFERED_PX {
+            let held = TextureCeiling::clamped(*px).hold_all(resolved);
+            assert!(
+                held.image_side_px <= resolved.image_side_px
+                    && held.long_range_image_side_px <= resolved.long_range_image_side_px
+                    && held.loop_image_side_px <= resolved.loop_image_side_px
+                    && held.raster_side_ceiling_px <= resolved.raster_side_ceiling_px,
+                "{} at {px} px: a ceiling raised a side",
+                limits.name,
+            );
+        }
+    }
+}
+
+/// A config file or a widget from another build cannot cost the user their
+/// settings: anything at or above the largest side any bracket resolves is
+/// stored as no ceiling, and anything under the floor is the floor.
+#[test]
+fn a_hand_edited_texture_ceiling_is_held_inside_the_offered_rungs() {
+    assert_eq!(TextureCeiling::clamped(0), TextureCeiling::NONE);
+    assert_eq!(TextureCeiling::clamped(1).side_px(), Some(512));
+    assert_eq!(
+        TextureCeiling::clamped(TextureCeiling::FLOOR_PX - 1).side_px(),
+        Some(TextureCeiling::FLOOR_PX as usize),
+    );
+    // Above the largest rung is the largest rung, NOT "no ceiling": only `0`
+    // means none, so an out-of-range figure cannot silently turn the setting
+    // off.
+    assert_eq!(
+        TextureCeiling::clamped(99_999).side_px(),
+        Some(TextureCeiling::LARGEST_PX as usize),
+    );
+    assert_eq!(TextureCeiling::clamped(1024).side_px(), Some(1024));
+    // The round trip a config file makes.
+    for px in TextureCeiling::OFFERED_PX {
+        let ceiling = TextureCeiling::clamped(*px);
+        assert_eq!(
+            TextureCeiling::clamped(ceiling.as_px()),
+            ceiling,
+            "{px} px did not survive a save and a load",
+        );
+    }
+    // `NONE` writes the neutral figure, which is what keeps the key out of a
+    // config that says nothing about it.
+    assert_eq!(TextureCeiling::NONE.as_px(), 0);
+}

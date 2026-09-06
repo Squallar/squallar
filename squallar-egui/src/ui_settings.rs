@@ -61,6 +61,7 @@ pub(crate) const SETTINGS_ROWS: &[&str] = &[
     "data.auto_poll",
     "memory.gpu",
     "memory.system",
+    "memory.texture_ceiling",
     "offline.areas",
     "about.version",
     "about.platform",
@@ -472,6 +473,14 @@ impl super::Gui {
                 }
                 true
             }
+            "memory.texture_ceiling" => {
+                let before = self.texture_ceiling;
+                texture_ceiling_combo(ui, &mut self.texture_ceiling);
+                if before != self.texture_ceiling {
+                    actions.push(GuiAction::SetTextureCeiling(self.texture_ceiling));
+                }
+                true
+            }
             "offline.areas" => {
                 section_break(ui);
                 // Every area is a SUB-row of this one id: `SETTINGS_ROWS` is
@@ -513,6 +522,13 @@ impl super::Gui {
                     // running at the old share until the next restart.
                     self.memory_percents = squallar_device_profile::scene::PoolPercents::default();
                     actions.push(GuiAction::SetMemoryPercents(self.memory_percents));
+                    // Told as well as written down, for the reason the shares
+                    // above are: the App holds its own copy and re-fits on the
+                    // action, so a reset that only moved the combo would leave
+                    // this session rendering at the old ceiling until restart.
+                    self.texture_ceiling =
+                        squallar_device_profile::budget::TextureCeiling::default();
+                    actions.push(GuiAction::SetTextureCeiling(self.texture_ceiling));
                     actions.push(GuiAction::RequestLocation);
                 }
                 true
@@ -660,6 +676,63 @@ fn memory_share_widget(
             .small()
             .weak(),
     );
+}
+
+/// **The texture-size control: the ceiling the user allows any radar
+/// raster, and what lowering it buys.**
+///
+/// A list of rungs rather than a slider, because the sides a raster can
+/// actually take are powers of two and a continuous control would offer
+/// hundreds of values that resolve to the same picture.
+///
+/// The caption is the mandatory half, on the memory sliders' terms: a bare
+/// "1024 px" says nothing about why anyone would want it. What it must not
+/// do is promise a frame count — how many frames the freed memory buys is a
+/// property of the scene, and the line under the System memory slider above
+/// is where this session's own answer is stated, measured rather than
+/// predicted.
+fn texture_ceiling_combo(
+    ui: &mut egui::Ui,
+    ceiling: &mut squallar_device_profile::budget::TextureCeiling,
+) {
+    use squallar_device_profile::budget::TextureCeiling;
+
+    ui.horizontal(|ui| {
+        ui.label("Texture size:");
+        egui::ComboBox::from_id_salt("memory_texture_ceiling")
+            .selected_text(texture_ceiling_label(*ceiling))
+            .show_ui(ui, |ui| {
+                for &px in TextureCeiling::OFFERED_PX {
+                    let option = TextureCeiling::clamped(px);
+                    let label = texture_ceiling_label(option);
+                    ui.selectable_value(ceiling, option, label);
+                }
+            });
+    });
+    ui.label(
+        egui::RichText::new(match ceiling.side_px() {
+            None => "Rasters take the largest size this device fits. Lower \
+                     this to spend less memory on each radar picture and \
+                     leave more for the rest of the scene."
+                .to_owned(),
+            Some(px) => format!(
+                "Radar pictures are held to {px} px across. This device may \
+                 already draw them smaller; it will not draw them larger."
+            ),
+        })
+        .small()
+        .weak(),
+    );
+}
+
+/// The name one texture-size rung goes by. `None` is the neutral posture and
+/// says so in words rather than as a number, because "4096" would read as a
+/// choice the user made.
+fn texture_ceiling_label(ceiling: squallar_device_profile::budget::TextureCeiling) -> String {
+    match ceiling.side_px() {
+        None => "No limit".to_owned(),
+        Some(px) => format!("{px} px"),
+    }
 }
 
 /// The line under one memory-share slider: what is actually in force, and
@@ -944,6 +1017,66 @@ mod memory_share_tests {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(", "),
+        );
+    }
+}
+
+#[cfg(test)]
+mod texture_ceiling_tests {
+    use super::*;
+    use squallar_device_profile::budget::TextureCeiling;
+
+    /// The neutral posture is named in words. "4096 px" would read as a size
+    /// the user picked, and the whole point of the default is that they have
+    /// not picked one.
+    #[test]
+    fn the_neutral_rung_is_named_rather_than_numbered() {
+        assert_eq!(texture_ceiling_label(TextureCeiling::NONE), "No limit");
+        assert_eq!(texture_ceiling_label(TextureCeiling::default()), "No limit");
+        assert_eq!(
+            texture_ceiling_label(TextureCeiling::clamped(1024)),
+            "1024 px",
+        );
+    }
+
+    /// Every rung the combo offers is distinct once clamped, so the list has
+    /// no two entries that select the same value and leave the user unable to
+    /// tell which one is in force.
+    #[test]
+    fn every_offered_rung_is_a_distinct_setting() {
+        let mut seen: Vec<TextureCeiling> = Vec::new();
+        for px in TextureCeiling::OFFERED_PX {
+            let rung = TextureCeiling::clamped(*px);
+            assert!(
+                !seen.contains(&rung),
+                "{px} px clamps onto a rung already offered",
+            );
+            seen.push(rung);
+        }
+        assert!(
+            seen.contains(&TextureCeiling::NONE),
+            "the offered rungs do not include the neutral posture",
+        );
+    }
+
+    /// The row is in the walked list, and the reset arm names it — a setting
+    /// the reset button leaves alone is the defect this checks for.
+    #[test]
+    fn the_row_is_listed_and_the_reset_arm_names_it() {
+        assert!(
+            SETTINGS_ROWS.contains(&"memory.texture_ceiling"),
+            "the texture ceiling row is not in SETTINGS_ROWS",
+        );
+        let source = include_str!("ui_settings.rs");
+        let reset = source
+            .split_once("\"reset\" => {")
+            .expect("the reset arm")
+            .1;
+        let reset = reset.split_once("\"about.exit\"").expect("the exit arm").0;
+        assert!(
+            reset.contains("SetTextureCeiling"),
+            "the reset arm does not reset the texture ceiling, so `Reset to \
+             defaults` would leave this session at the old one",
         );
     }
 }

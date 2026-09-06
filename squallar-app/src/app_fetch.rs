@@ -4,7 +4,6 @@ use crate::channels::{
 use crate::render_dispatch::RenderGuard;
 use chrono::NaiveDateTime;
 use chrono::TimeZone;
-use squallar_device_profile::constants::LOOP_IMAGE_SIZE;
 use squallar_egui::actions::GuiAction;
 use squallar_egui::pane::TransportCommand;
 use squallar_egui::radar_layer;
@@ -698,6 +697,9 @@ impl super::App {
             }
             GuiAction::SetMemoryPercents(percents) => {
                 self.set_memory_percents(percents);
+            }
+            GuiAction::SetTextureCeiling(ceiling) => {
+                self.set_texture_ceiling(ceiling);
             }
             GuiAction::PaneClosed { pane_idx } => {
                 // The UI has renumbered. Everything this side keys on a pane
@@ -2372,6 +2374,20 @@ impl super::App {
         let rpg_storm_motion = self
             .render
             .rpg_storm_motion_for(product, &target.site, timestamp);
+        // **The side this frame is dispatched at, read once and carried into
+        // the reply**, because the two have to agree and the setting behind
+        // them can move between the dispatch and the arrival.
+        //
+        // It was `constants::LOOP_IMAGE_SIZE` on both halves until 2026-09-06
+        // — a compile-time constant, so they could not disagree and neither
+        // needed to say which side it meant. `Budgets::loop_image_side_px` can
+        // now be lowered by the device fit and by the user's own texture
+        // ceiling, and a reply is validated against `frame_side` rather than
+        // against whatever the budget has since become: a ceiling lowered
+        // while frames are in flight would otherwise fail every one of them
+        // on a length check, and that check's failure arm is a log line and a
+        // dropped picture, not an error anyone sees.
+        let frame_side = self.budgets.loop_image_side_px;
         let ctx = squallar_radar::loop_downloads::LoopRenderContext {
             product,
             elevation: snapped,
@@ -2394,10 +2410,9 @@ impl super::App {
                 squallar_worker::offload::Job::Described(squallar_worker::offload::JobRequest {
                     job: described,
                     // A loop frame, so the loop size — the one envelope both
-                    // radar frame rows take.
-                    geometry: squallar_worker::offload::ceiling_only_geometry(
-                        squallar_device_profile::constants::LOOP_IMAGE_SIZE as u32,
-                    ),
+                    // radar frame rows take, and the same figure the reply is
+                    // measured against.
+                    geometry: squallar_worker::offload::ceiling_only_geometry(frame_side as u32),
                 })
             }
             None => squallar_worker::offload::Job::renders_nothing(),
@@ -2416,12 +2431,12 @@ impl super::App {
                     // decode and moves into the image without a copy here.
                     let picture = match frame.image {
                         squallar_radar::frame::RasterImage::Bytes(bytes) => {
-                            let picture = loop_frame_image(&bytes);
+                            let picture = loop_frame_image(&bytes, frame_side);
                             squallar_radar::render::recycle_image(bytes);
                             picture
                         }
                         squallar_radar::frame::RasterImage::Pixels(pixels) => {
-                            loop_frame_image_owned(pixels)
+                            loop_frame_image_owned(pixels, frame_side)
                         }
                     };
                     let converted = match picture {
@@ -2436,9 +2451,10 @@ impl super::App {
                         ),
                         None => {
                             log::error!(
-                                "Loop render for pane {pane_idx} produced {} bytes, expected {}",
+                                "Loop render for pane {pane_idx} produced {} bytes, expected \
+                                 {} for the {frame_side} px frame it was dispatched at",
                                 image_len,
-                                LOOP_IMAGE_SIZE * LOOP_IMAGE_SIZE * 4
+                                frame_side * frame_side * 4
                             );
                             (None, 0.0, None, FrameProvenance::default())
                         }
@@ -2837,28 +2853,37 @@ impl super::App {
     }
 }
 
-/// Convert a renderer RGBA buffer into egui's pixel layout, or `None` if it is not
-/// the `LOOP_IMAGE_SIZE²` image a loop frame is supposed to be.
-fn loop_frame_image(rgba: &[u8]) -> Option<egui::ColorImage> {
-    if rgba.len() != LOOP_IMAGE_SIZE * LOOP_IMAGE_SIZE * 4 {
+/// Convert a renderer RGBA buffer into egui's pixel layout, or `None` if it is
+/// not the `side²` image the frame was **dispatched** at.
+///
+/// **`side` is an argument and not `constants::LOOP_IMAGE_SIZE`, and that is
+/// the whole of the transition gate.** The refusal arm here is silent by
+/// design — a log line and a dropped picture, because on the worker thread the
+/// assert inside `from_rgba_premultiplied` would kill the thread instead. That
+/// makes it exactly the wrong check to point at a *moving* figure: were this
+/// to read the budget in force at the moment the reply lands, lowering the
+/// texture ceiling would fail every frame already in flight, and the failure
+/// would look like a run of renders that produced nothing. The dispatch site
+/// carries its own side into the closure so a frame is always measured
+/// against what it was asked for.
+fn loop_frame_image(rgba: &[u8], side: usize) -> Option<egui::ColorImage> {
+    if side == 0 || rgba.len() != side * side * 4 {
         return None;
     }
     Some(egui::ColorImage::from_rgba_premultiplied(
-        [LOOP_IMAGE_SIZE, LOOP_IMAGE_SIZE],
+        [side, side],
         rgba,
     ))
 }
 
 /// [`loop_frame_image`] for a raster already in egui's layout: the same size
-/// refusal, and the buffer moves into the image instead of being copied.
-fn loop_frame_image_owned(pixels: Vec<egui::Color32>) -> Option<egui::ColorImage> {
-    if pixels.len() != LOOP_IMAGE_SIZE * LOOP_IMAGE_SIZE {
+/// refusal against the same dispatched `side`, and the buffer moves into the
+/// image instead of being copied.
+fn loop_frame_image_owned(pixels: Vec<egui::Color32>, side: usize) -> Option<egui::ColorImage> {
+    if side == 0 || pixels.len() != side * side {
         return None;
     }
-    Some(egui::ColorImage::new(
-        [LOOP_IMAGE_SIZE, LOOP_IMAGE_SIZE],
-        pixels,
-    ))
+    Some(egui::ColorImage::new([side, side], pixels))
 }
 
 /// [`loop_frame_image`] for a cross-section raster, against the section's own
