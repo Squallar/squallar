@@ -166,3 +166,77 @@ fn two_overlapping_stations_leave_no_hole_between_them() {
          fill draws doubled coverage as a hole"
     );
 }
+
+/// The station model is drawn in points and the picture in texels, so a denser
+/// texture draws the same station at `scale` times the radius and its overcast
+/// disc covers about `scale²` the texels.
+///
+/// Before this the model's shapes were painted one texel per point whatever
+/// the density — only the hit radius and the cull slack were scaled — so on a
+/// phone at three texels per point every circle, barb and weather symbol came
+/// out a third of its size beside numbers the frame thread drew at the right
+/// one. Measured on the solid core of the disc (alpha above half) so the
+/// anti-aliased fringe, which is a fixed one texel wide at either density,
+/// does not blur the ratio.
+#[test]
+fn a_denser_texture_draws_the_station_model_at_the_same_size_on_screen() {
+    use super::{MetarInput, rasterize_metar_stations};
+    use crate::metar::types::{CloudLayer, MetarOb};
+    use std::sync::Arc;
+
+    fn overcast() -> MetarOb {
+        MetarOb {
+            station_id: "KOKC".into(),
+            name: "Will Rogers".into(),
+            lat: 35.0,
+            lon: -98.0,
+            elev_m: None,
+            temp_c: None,
+            dewp_c: None,
+            wind_dir: None,
+            wind_speed_kt: None,
+            wind_gust_kt: None,
+            visibility: None,
+            altimeter_hpa: None,
+            mslp_hpa: None,
+            flight_category: None,
+            raw_ob: "KOKC 041953Z AUTO OVC010".into(),
+            clouds: vec![CloudLayer {
+                cover: "OVC".into(),
+                base_ft: Some(1000),
+            }],
+            wx_string: None,
+            obs_time: String::new(),
+        }
+    }
+    fn core_texels(rgba: &[u8]) -> usize {
+        rgba.chunks_exact(4).filter(|px| px[3] > 128).count()
+    }
+
+    // Zoom 4 is the first tier: the cloud-cover disc alone, and no text — the
+    // one shape whose area the density scales cleanly.
+    let picture = |device_scale: f32| {
+        let input = MetarInput {
+            obs: Arc::new(vec![overcast()]),
+            zoom: 4.0,
+            is_dark: true,
+            device_scale,
+        };
+        rasterize_metar_stations(&input, &BOUNDS, 256, 256)
+    };
+
+    let one = core_texels(&picture(1.0).rgba);
+    let two = core_texels(&picture(2.0).rgba);
+    assert!(
+        one > 30,
+        "non-vacuity: the overcast disc painted {one} solid texels at one \
+         texel per point, which is not a disc",
+    );
+    let ratio = two as f32 / one as f32;
+    assert!(
+        (3.4..=4.6).contains(&ratio),
+        "a station at two texels per point covered {two} solid texels against \
+         {one} at one — {ratio:.2}× where a disc twice the radius is 4×; the \
+         picture is painting the model in texels rather than points",
+    );
+}

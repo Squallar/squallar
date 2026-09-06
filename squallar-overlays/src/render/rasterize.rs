@@ -834,6 +834,7 @@ pub fn rasterize_metar_stations(
             let mut painter = PixmapPointPainter {
                 pixmap: &mut pixmap,
                 center: (px, py),
+                scale,
             };
             // Text is a no-op in this painter, but the draw still asks for
             // it; building it here is per station per PICTURE, in the worker.
@@ -893,13 +894,26 @@ pub fn rasterize_metar_stations(
 /// worker and is a separate question with its own dependency decision.
 struct PixmapPointPainter<'a> {
     pixmap: &'a mut Pixmap,
-    /// The station's own position in pixels; every offset is relative to it.
+    /// The station's own position in texels; every offset is relative to it.
     center: (f32, f32),
+    /// Texels per point — [`sane_device_scale`] of the plan's density.
+    ///
+    /// **The station model speaks points and the picture is texels.** Every
+    /// offset, radius and stroke width the model hands over is a length on
+    /// the display, the same lengths the frame thread draws its text at; a
+    /// picture at three texels per point that painted them as texels drew a
+    /// third-size circle, barb and weather symbol beside full-size numbers.
+    /// The hit radius and the cull slack the caller computes were already
+    /// scaled; the shapes were not.
+    scale: f32,
 }
 
 impl PixmapPointPainter<'_> {
     fn at(&self, offset: [f32; 2]) -> (f32, f32) {
-        (self.center.0 + offset[0], self.center.1 + offset[1])
+        (
+            self.center.0 + offset[0] * self.scale,
+            self.center.1 + offset[1] * self.scale,
+        )
     }
 
     /// `PointPainter` speaks straight (unmultiplied) RGBA, which is what
@@ -919,7 +933,7 @@ impl crate::render::draw::PointPainter for PixmapPointPainter<'_> {
     fn circle_filled(&mut self, offset: [f32; 2], radius: f32, color: [u8; 4]) {
         let (x, y) = self.at(offset);
         let mut pb = PathBuilder::new();
-        pb.push_circle(x, y, radius);
+        pb.push_circle(x, y, radius * self.scale);
         if let Some(path) = pb.finish() {
             self.pixmap.fill_path(
                 &path,
@@ -934,13 +948,13 @@ impl crate::render::draw::PointPainter for PixmapPointPainter<'_> {
     fn circle_stroke(&mut self, offset: [f32; 2], radius: f32, color: [u8; 4], width: f32) {
         let (x, y) = self.at(offset);
         let mut pb = PathBuilder::new();
-        pb.push_circle(x, y, radius);
+        pb.push_circle(x, y, radius * self.scale);
         if let Some(path) = pb.finish() {
             self.pixmap.stroke_path(
                 &path,
                 &Self::paint_of(color),
                 &Stroke {
-                    width,
+                    width: width * self.scale,
                     line_cap: LineCap::Round,
                     ..Default::default()
                 },
@@ -972,7 +986,7 @@ impl crate::render::draw::PointPainter for PixmapPointPainter<'_> {
                 &path,
                 &Self::paint_of(color),
                 &Stroke {
-                    width,
+                    width: width * self.scale,
                     line_cap: LineCap::Round,
                     ..Default::default()
                 },
