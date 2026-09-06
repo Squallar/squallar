@@ -1071,6 +1071,22 @@ pub fn overlay_cache_token(
     base ^ if themed { 0x9E37_79B9_7F4A_7C15 } else { 0 } ^ as_of_term(overlays, pane_idx, pane, id)
 }
 
+/// **The opacity `id` paints at in `pane`**: the value the user set there, or
+/// the layer's default for that pane. One definition for the layer walk, the
+/// floor-strip key and the inspector's slider — the same rule as
+/// [`overlay_cache_token`] and for the same reason: a slider showing one
+/// number while the painter multiplies by another is a disagreement nothing
+/// else can catch.
+pub(crate) fn resolved_layer_opacity(
+    overlays: &OverlayRegistry,
+    pane_idx: usize,
+    pane: &PaneState,
+    id: &LayerId,
+) -> f32 {
+    pane.layer_opacity(id)
+        .unwrap_or_else(|| overlays.default_opacity(id, &pane.layer_ref(pane_idx, id)))
+}
+
 /// **The as-of half of the cache token, and it is `0` on a live pane.**
 ///
 /// An [`TimeAxis::EventLifetime`] layer's picture is *which items are valid at

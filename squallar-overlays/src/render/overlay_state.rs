@@ -604,6 +604,13 @@ impl OverlayRegistry {
         self.handler(id).is_some_and(|h| h.default_enabled())
     }
 
+    /// The opacity `id`'s layer paints at in `pane` until the user sets one
+    /// — [`SourceHandler::default_opacity`]. 1.0 for an id no handler serves:
+    /// nothing draws it, so there is nothing to dim.
+    pub fn default_opacity(&self, id: &LayerId, pane: &PaneRef<'_>) -> f32 {
+        self.handler(id).map_or(1.0, |h| h.default_opacity(pane))
+    }
+
     /// Seeds a new pane's `enabled_overlays`; call after config deserialization.
     pub fn build_enabled_map(
         &self,

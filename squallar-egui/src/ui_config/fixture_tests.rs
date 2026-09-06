@@ -2133,3 +2133,82 @@ fn a_pre_field_id_config_keeps_every_volume_curve_on_its_own_product_and_its_own
         "save-load-save moved the file: reopening the app would not be 1:1",
     );
 }
+
+/// **Two panes hold different opacities for one layer, and both survive the
+/// reopen.** The opacity copy of
+/// [`two_panes_hold_different_answers_for_one_layer_and_both_survive_a_reopen`]:
+/// the same fixture (ungrouped panes, so no link sync can converge them), the
+/// same write-back, the same reopen. The non-triviality floor is the same in
+/// kind: the fixture predates opacity, so both panes start with no value.
+#[test]
+fn two_panes_hold_different_opacities_for_one_layer_and_both_survive_a_reopen() {
+    let kind = known::CITY_LABELS;
+    let store = store_with(include_str!("fixtures/live_chunks_off.json"));
+    let mut gui = Gui::new();
+    assert!(gui.load_ui_config(&store), "the two-pane fixture must load");
+    for idx in 0..2 {
+        let pane = gui.pane(idx).expect("both panes");
+        assert!(
+            pane.draw_order_vec().contains(&kind),
+            "premise: pane {idx} holds {kind:?}",
+        );
+        assert_eq!(
+            pane.layer_opacity(&kind),
+            None,
+            "premise: the fixture predates opacity, so pane {idx} has no value",
+        );
+    }
+
+    gui.pane_mut(0)
+        .expect("pane 0")
+        .set_layer_opacity(&kind, 0.3);
+    gui.pane_mut(1)
+        .expect("pane 1")
+        .set_layer_opacity(&kind, 0.8);
+    // The write-back every toggle and control edit ends with: opacity is not
+    // in `config`, so the handler's rewrite of `config` must leave it alone.
+    gui.readopt_panes_for_test();
+    for (idx, want) in [(0usize, 0.3f32), (1, 0.8)] {
+        let pane = gui.pane(idx).expect("both panes");
+        assert_eq!(pane.layer_opacity(&kind), Some(want), "pane {idx}'s slot");
+        assert_eq!(
+            crate::ui::map::pane_render::resolved_layer_opacity(&gui.overlays, idx, pane, &kind),
+            want,
+            "pane {idx}: the resolver did not answer with the pane's own value",
+        );
+    }
+
+    let json = gui.ui_config_json().expect("serializable");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    for (idx, want) in [(0usize, 0.3f64), (1, 0.8)] {
+        let written = v["panes"][idx]["layer_slots"]
+            .as_array()
+            .expect("a slot list")
+            .iter()
+            .find(|s| s["id"] == kind.as_str())
+            .expect("a slot for the layer")["opacity"]
+            .as_f64()
+            .expect("the pane's opacity did not reach the file");
+        assert!(
+            (written - want).abs() < 1e-6,
+            "pane {idx} wrote {written}, wanted {want}",
+        );
+    }
+
+    let reopened = MemoryKvStore::default();
+    reopened
+        .store(UI_CONFIG_KEY, &json)
+        .expect("the memory store accepts a write");
+    let mut again = Gui::new();
+    assert!(
+        again.load_ui_config(&reopened),
+        "the written file must reload"
+    );
+    for (idx, want) in [(0usize, 0.3f32), (1, 0.8)] {
+        assert_eq!(
+            again.pane(idx).expect("both panes").layer_opacity(&kind),
+            Some(want),
+            "pane {idx} did not come back as it was left",
+        );
+    }
+}

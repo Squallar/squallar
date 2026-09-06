@@ -885,3 +885,41 @@ fn the_eye_and_the_can_are_thumb_sized_and_the_can_ends_the_row() {
         }
     }
 }
+
+/// **The re-add restores the layer's opacity** - the neighbour of
+/// [`re_adding_a_removed_layer_restores_its_saved_settings`]. The slider
+/// position is not in `config`, so it needs its own leg through the trash
+/// can and the catalogue.
+#[test]
+fn re_adding_a_removed_layer_restores_its_opacity() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.open_layers();
+    let subject = REMOVABLE;
+    h.gui_mut()
+        .pane_mut(0)
+        .expect("pane 0")
+        .set_layer_opacity(&subject, 0.35);
+    h.warm_up();
+    assert_eq!(
+        h.gui().pane(0).expect("pane 0").layer_opacity(&subject),
+        Some(0.35),
+        "precondition: the value landed and survived a frame",
+    );
+
+    let row = h.stack_row(&subject).expect("the row is drawn");
+    h.mouse_click(row.remove.center());
+    h.warm_up();
+    assert!(h.stack_row(&subject).is_none(), "precondition: it left");
+    assert_eq!(
+        h.gui().pane(0).expect("pane 0").layer_opacity(&subject),
+        None,
+        "a removed layer has no slot to read",
+    );
+
+    h.add_layer_from_catalog(&subject);
+    assert_eq!(
+        h.gui().pane(0).expect("pane 0").layer_opacity(&subject),
+        Some(0.35),
+        "the re-add reset {subject:?}'s opacity instead of restoring it",
+    );
+}

@@ -2450,11 +2450,17 @@ impl InputHarness {
                 _ => None,
             })
             .unzip();
+        // A galley with no text paints nothing and is not "painted text":
+        // egui's `Slider` hands its prefix and suffix to `DragValue` even when
+        // they are empty, and each becomes an atom laid out as a galley of
+        // its own, so every slider that shows its value would otherwise log
+        // an empty run - which a test asking "was this raw id painted?" for
+        // an option whose id is the empty string reads as yes.
         self.last_texts = full_output
             .shapes
             .iter()
             .filter_map(|clipped| match &clipped.shape {
-                egui::Shape::Text(text) => Some((
+                egui::Shape::Text(text) if !text.galley.text().is_empty() => Some((
                     egui::Rect::from_min_size(text.pos, text.galley.size()),
                     text.galley.text().to_owned(),
                 )),

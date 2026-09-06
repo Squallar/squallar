@@ -10,6 +10,9 @@ use super::{InspectorSelection, PaneState, map};
 /// The heading over the Color Scale layer's per-bar switches.
 pub(crate) const COLOR_BARS_HEADING: &str = "Bars";
 
+/// The label on the opacity slider at the top of every layer's body.
+pub(crate) const OPACITY_LABEL: &str = "Opacity";
+
 /// Width of the inspector, in both its floating and slide-over forms — one value
 /// for the same one-id reason as [`super::ui_stack::STACK_WIDTH`].
 pub(super) const INSPECTOR_WIDTH: f32 = 300.0;
@@ -300,7 +303,8 @@ impl super::Gui {
         });
     }
 
-    /// The layer body: the handler's own controls, through the one host they have.
+    /// The layer body: the layer's opacity, then the handler's own controls
+    /// through the one host they have.
     fn render_layer_body(
         &mut self,
         ui: &mut egui::Ui,
@@ -308,6 +312,8 @@ impl super::Gui {
         kind: &LayerId,
         actions: &mut Vec<GuiAction>,
     ) {
+        self.render_layer_opacity(ui, pane, kind);
+
         if *kind == known::RADAR {
             if let Some(status) = super::shell::radar_row_status(pane) {
                 ui.label(status);
@@ -333,6 +339,55 @@ impl super::Gui {
         }
 
         self.render_overlay_controls_one(ui, pane, kind, actions);
+    }
+
+    /// **The layer's opacity, first in every body** — radar, the colour
+    /// scale, the basemap and an id no handler serves included — where GIMP
+    /// and Photoshop put it. Shows the resolved value, the user's or the
+    /// layer's default, as a whole percent; a drag writes this pane's own
+    /// value through [`PaneState::set_layer_opacity`]. A painter tint at draw
+    /// time and nothing else: no raster, upload or cache token moves with it,
+    /// so a drag costs a repaint.
+    ///
+    /// Deliberately not in the `click_registry`: the gesture sweep drags the
+    /// first registered slider in id order, and that pin names a handler's.
+    fn render_layer_opacity(&mut self, ui: &mut egui::Ui, pane: &mut PaneState, kind: &LayerId) {
+        let resolved =
+            map::pane_render::resolved_layer_opacity(&self.overlays, self.active_pane, pane, kind);
+        let mut percent = (resolved * 100.0).round();
+        let shown = percent;
+        let name = self.overlays.display_name(kind).to_owned();
+        let row = ui.horizontal(|ui| {
+            ui.label(OPACITY_LABEL);
+            ui.add(
+                egui::Slider::new(&mut percent, 0.0..=100.0)
+                    .integer()
+                    .suffix("%")
+                    .clamping(egui::SliderClamping::Always),
+            )
+            .on_hover_text(format!(
+                "How strongly {name} paints over the layers beneath it in this pane. \
+                 Linked panes share it."
+            ))
+        });
+        if (percent - shown).abs() > f32::EPSILON {
+            pane.set_layer_opacity(kind, percent / 100.0);
+        }
+        // Keyed by the layer it is drawn for, so a test can tell one layer's
+        // slider from another's. The rect is the slider's own — rail and
+        // value box — which is what a drag lands on and what has to fit.
+        #[cfg(test)]
+        self.probes
+            .last_control_items
+            .push(super::DrawnControlItem {
+                handler: Some(kind.clone()),
+                label: OPACITY_LABEL.to_owned(),
+                kind: super::DrawnControlKind::Slider,
+                rect: row.inner.rect,
+            });
+        #[cfg(not(test))]
+        let _ = row;
+        ui.add_space(6.0);
     }
 
     /// The Color Scale layer's body: one switch per bar the pane can show —

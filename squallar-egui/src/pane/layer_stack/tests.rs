@@ -144,3 +144,72 @@ fn adopting_another_panes_stack_carries_its_removals() {
         "the destination would re-grow the layer the group removed",
     );
 }
+
+/// Removal keeps the opacity the layer was at, and a re-add hands it back -
+/// the promise `config` already makes, for the same reason: an accidental
+/// click costs a click, not a slider position.
+#[test]
+fn a_removal_keeps_the_layers_opacity_for_the_re_add() {
+    let mut stack = LayerStack::default();
+    let mut lightning = slot(known::LIGHTNING);
+    lightning.opacity = Some(0.4);
+    stack.push(lightning);
+    stack.push(slot(known::METAR));
+
+    stack.take_out(&known::LIGHTNING).expect("it was held");
+    assert_eq!(stack.saved_opacity_of_removed(&known::LIGHTNING), Some(0.4));
+    assert_eq!(
+        stack.saved_opacity_of_removed(&known::METAR),
+        None,
+        "a layer that was never removed has no saved opacity",
+    );
+    stack.take_out(&known::METAR).expect("it was held");
+    assert_eq!(
+        stack.saved_opacity_of_removed(&known::METAR),
+        None,
+        "a layer removed at its default is re-added at its default, not at a \
+         number the tombstone made up",
+    );
+}
+
+/// A reorder is a permutation of whole slots: each id keeps its own opacity
+/// through it, rather than the opacities staying put while the ids move.
+#[test]
+fn a_reorder_keeps_each_slots_opacity_with_its_id() {
+    let mut stack = LayerStack::default();
+    let mut metar = slot(known::METAR);
+    metar.opacity = Some(0.25);
+    let mut labels = slot(known::CITY_LABELS);
+    labels.opacity = Some(0.75);
+    stack.push(metar);
+    stack.push(labels);
+
+    let mut slots = stack.take_slots();
+    slots.reverse();
+    stack.set_slots(slots);
+
+    assert_eq!(
+        stack.first().map(|s| s.id.clone()),
+        Some(known::CITY_LABELS),
+        "precondition: the order moved",
+    );
+    let opacity_of = |id: &LayerId| stack.iter().find(|s| s.id == *id).map(|s| s.opacity);
+    assert_eq!(opacity_of(&known::METAR), Some(Some(0.25)));
+    assert_eq!(opacity_of(&known::CITY_LABELS), Some(Some(0.75)));
+}
+
+/// Opacity is part of what a slot IS: two slots differing only in it are
+/// unequal, and a clone carries it - the layer-link sync copies whole stacks
+/// between panes every frame, and a copy that dropped it would reset the
+/// slider on the next frame.
+#[test]
+fn two_slots_differing_only_in_opacity_are_unequal_and_a_clone_carries_it() {
+    let a = slot(known::METAR);
+    let mut b = slot(known::METAR);
+    assert_eq!(a, b, "precondition: identical apart from what is set below");
+    b.opacity = Some(0.5);
+    assert_ne!(a, b, "opacity is not part of slot equality");
+    let copy = b.clone();
+    assert_eq!(copy.opacity, Some(0.5), "the clone dropped the opacity");
+    assert_eq!(copy, b);
+}

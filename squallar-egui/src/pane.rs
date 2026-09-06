@@ -825,6 +825,15 @@ pub struct LayerSlot {
     pub id: LayerId,
     /// Whether this pane draws the layer.
     pub enabled: bool,
+    /// **How strongly this pane paints the layer, 0..=1, or `None` for the
+    /// layer's default** — the same "no saved opinion" an absent `enabled`
+    /// on the wire means. The pane's fact and a painter tint only: it never
+    /// reaches the raster or the cache token, and it is deliberately not
+    /// inside [`Self::config`], because [`PaneState::adopt_handler_state`]
+    /// rewrites `config` from the handler on every write-back and
+    /// [`PaneState::layer_ref`] hands `config` to `content_signature`, which
+    /// would move the token on every drag.
+    pub opacity: Option<f32>,
     /// The layer's saved configuration, as JSON. `null` means "nothing saved"
     /// — a handler with a `null` slot keeps whatever state it already has,
     /// which is exactly what an absent map entry meant before.
@@ -854,6 +863,10 @@ impl Clone for LayerSlot {
         Self {
             id: self.id.clone(),
             enabled: self.enabled,
+            // Carried: layer-link sync clones a whole stack into every linked
+            // pane each frame, and a copy that dropped it would reset the
+            // slider on the next frame.
+            opacity: self.opacity,
             config: self.config.clone(),
             state: None,
             // For the same reason `state` is not cloned, and one more: a
@@ -871,6 +884,7 @@ impl std::fmt::Debug for LayerSlot {
         f.debug_struct("LayerSlot")
             .field("id", &self.id)
             .field("enabled", &self.enabled)
+            .field("opacity", &self.opacity)
             .field("config", &self.config)
             .field("state", &self.state.is_some())
             .field("frames", &self.time.frames.len())
@@ -878,8 +892,8 @@ impl std::fmt::Debug for LayerSlot {
     }
 }
 
-/// **Two slots are equal when they carry the same layer, flag and saved
-/// configuration.** The runtime state is deliberately not compared: it is
+/// **Two slots are equal when they carry the same layer, flag, opacity and
+/// saved configuration.** The runtime state is deliberately not compared: it is
 /// derived from `config`, so comparing it would make a hydrated slot unequal
 /// to the identical slot that has not been asked for yet. The timeline is
 /// left out for the same reason and one more: it is a position, and two
@@ -887,7 +901,10 @@ impl std::fmt::Debug for LayerSlot {
 /// mid-playback.
 impl PartialEq for LayerSlot {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.enabled == other.enabled && self.config == other.config
+        self.id == other.id
+            && self.enabled == other.enabled
+            && self.opacity == other.opacity
+            && self.config == other.config
     }
 }
 
@@ -897,6 +914,7 @@ impl LayerSlot {
         Self {
             id,
             enabled,
+            opacity: None,
             config: serde_json::Value::Null,
             state: None,
             time: LayerTimeState::new(),
@@ -2746,6 +2764,7 @@ impl PaneState {
         // nothing, which is the same "ask the handler" an absent slot has
         // always meant.
         slot.config = self.layers.saved_config_of_removed(id);
+        slot.opacity = self.layers.saved_opacity_of_removed(id);
         self.insert_slot_at_weight(slot, weight, &|id| weights.get(id).copied());
         true
     }
@@ -2769,6 +2788,27 @@ impl PaneState {
             self.hidden_color_bars.remove(id);
         } else {
             self.hidden_color_bars.insert(id.clone());
+        }
+    }
+
+    /// The opacity the user set for `id` on this pane, or `None` for the
+    /// layer's default. A reader that needs a number resolves through
+    /// `crate::ui::map::pane_render::resolved_layer_opacity`, the one definition the
+    /// walk and the slider share — never here.
+    pub fn layer_opacity(&self, id: &LayerId) -> Option<f32> {
+        self.slot(id).and_then(|slot| slot.opacity)
+    }
+
+    /// Set `id`'s opacity on this pane, clamped to 0..=1. A non-finite value
+    /// is refused rather than clamped: NaN clamps to NaN, and serde_json
+    /// writes that as `null`, which no build reads back as a number. Never
+    /// mints a slot — a layer this pane does not hold has nothing to dim.
+    pub fn set_layer_opacity(&mut self, id: &LayerId, opacity: f32) {
+        if !opacity.is_finite() {
+            return;
+        }
+        if let Some(slot) = self.slot_mut(id) {
+            slot.opacity = Some(opacity.clamp(0.0, 1.0));
         }
     }
 

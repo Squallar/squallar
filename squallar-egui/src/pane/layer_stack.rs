@@ -48,6 +48,10 @@ pub struct RemovedLayer {
     /// The slot's `config` as it stood when the layer left, `Null` for a layer
     /// that had saved nothing.
     pub config: serde_json::Value,
+    /// The slot's opacity as it stood when the layer left, `None` for a layer
+    /// still at its default. Kept for the same reason `config` is: a removal
+    /// the user undoes should cost them nothing.
+    pub opacity: Option<f32>,
 }
 
 /// **One pane's curated layer stack**: the slots it draws, bottom to top, plus
@@ -193,6 +197,7 @@ impl LayerStack {
         self.removed.push(RemovedLayer {
             id: slot.id.clone(),
             config: slot.config.clone(),
+            opacity: slot.opacity,
         });
         Some(slot)
     }
@@ -205,6 +210,15 @@ impl LayerStack {
             .iter()
             .find(|gone| gone.id == *id)
             .map_or(serde_json::Value::Null, |gone| gone.config.clone())
+    }
+
+    /// The opacity `id` held when it was removed, or `None` for a layer that
+    /// was never removed or was at its default. The add path's other read.
+    pub fn saved_opacity_of_removed(&self, id: &LayerId) -> Option<f32> {
+        self.removed
+            .iter()
+            .find(|gone| gone.id == *id)
+            .and_then(|gone| gone.opacity)
     }
 
     /// Forget a tombstone. Called by every path that puts a slot back, so

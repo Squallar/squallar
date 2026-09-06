@@ -332,6 +332,20 @@ struct SlotConfig {
     /// Whether this pane draws the layer, or absent for "ask the handler".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     enabled: Option<bool>,
+    /// **The opacity the user set for the layer in this pane, 0..=1**, absent
+    /// for "the layer's default" — the reading `enabled`'s absence has.
+    /// Additive on `hidden_color_bars`' terms: `#[serde(default)]`, **no
+    /// `CONFIG_VERSION` bump and no `migrate.rs` step**, and
+    /// `skip_serializing_if` so a slot with no explicit value writes the
+    /// bytes it wrote before. Read through [`opacity_or_none`], which is
+    /// lenient on purpose: a value this build cannot use costs the number,
+    /// never the slot.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "opacity_or_none"
+    )]
+    opacity: Option<f32>,
     /// The layer's saved config, absent when there is none to save.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     config: serde_json::Value,
@@ -968,6 +982,42 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// An opacity as the file carries it: a non-finite value is dropped rather
+/// than written (serde_json would spell it `null`, which no build reads back
+/// as a number), and the rest is clamped to 0..=1. `PaneState::set_layer_opacity`
+/// already refuses and clamps, so this is the writer's own guarantee rather
+/// than a repair.
+fn opacity_on_wire(value: Option<f32>) -> Option<f32> {
+    value.filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 1.0))
+}
+
+/// **The lenient reader for a slot's `opacity`.** `null`, a non-number, a
+/// non-finite number and a number outside 0..=1 all read as `None` with a
+/// warning — never as an error. Lenient is load-bearing: [`SlotList`]'s
+/// reader demotes a whole entry to `unknown` on any field error, and the
+/// ships-on reconcile would then put a fresh slot for the same layer beside
+/// the verbatim one, so a bad number would cost the user a duplicate row
+/// instead of one slider position.
+fn opacity_or_none<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value.as_f64() {
+        // The cast is exact for the file's own values: the writer stores an
+        // `f32`, and serde_json's shortest-round-trip spelling reads back to
+        // the same `f32` whether parsed as one or through `f64`.
+        Some(v) if v.is_finite() && (0.0..=1.0).contains(&v) => Ok(Some(v as f32)),
+        _ => {
+            log::warn!(
+                "a layer slot's opacity {value} is not a number in 0..=1; keeping the \
+                 slot and using the layer's default",
+            );
+            Ok(None)
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1521,6 +1571,7 @@ fn pane_slot_list(pane: &PaneState, global_live_chunks: bool) -> SlotList {
         .map(|slot| SlotConfig {
             id: layer_key(&slot.id),
             enabled: Some(slot.enabled),
+            opacity: opacity_on_wire(slot.opacity),
             config: if slot.id == known::RADAR {
                 radar_slot_config(pane, global_live_chunks)
             } else {
@@ -1536,6 +1587,7 @@ fn pane_slot_list(pane: &PaneState, global_live_chunks: bool) -> SlotList {
         known.push(SlotConfig {
             id: layer_key(&known::RADAR),
             enabled: Some(true),
+            opacity: None,
             config: radar_slot_config(pane, global_live_chunks),
         });
     }
@@ -1561,6 +1613,7 @@ fn pane_removed_list(pane: &PaneState) -> SlotList {
             .map(|gone| SlotConfig {
                 id: layer_key(&gone.id),
                 enabled: None,
+                opacity: opacity_on_wire(gone.opacity),
                 config: gone.config.clone(),
             })
             .collect(),
@@ -2069,6 +2122,7 @@ impl super::Gui {
                 .map(|slot| crate::pane::RemovedLayer {
                     id: LayerId::new(slot.id.clone()),
                     config: slot.config.clone(),
+                    opacity: slot.opacity,
                 })
                 .collect();
             let slots: Vec<crate::pane::LayerSlot> = pc
@@ -2085,6 +2139,10 @@ impl super::Gui {
                         enabled: slot.enabled.unwrap_or_else(|| {
                             handler.is_some_and(|h| h.is_enabled(&PaneRef::bare(i)))
                         }),
+                        // Already `None` for anything the reader could not
+                        // use; absent means the layer's default, resolved
+                        // at paint time rather than baked in here.
+                        opacity: slot.opacity,
                         config: slot.config.clone(),
                         id,
                         // Derived from `config` at the next hydrate, never

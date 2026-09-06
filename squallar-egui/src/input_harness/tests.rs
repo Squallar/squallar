@@ -16427,3 +16427,136 @@ fn a_colour_bar_switched_off_in_the_layer_options_stops_painting_and_persists() 
          changes on its next save",
     );
 }
+
+/// **Every layer's body opens with an opacity slider, a drag on it is this
+/// pane's own value, and the value reopens per pane.** Two unlinked panes:
+/// the slider on pane 0's radar body is pressed the user's way, pane 1's city
+/// labels are set through the seam the slider uses, and the file carries both
+/// back to a fresh build with neither pane holding the other's number. An
+/// untouched harness writes no `opacity` key at all.
+#[test]
+fn a_layers_opacity_dragged_in_the_inspector_persists_per_pane() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(2);
+    h.set_layer_links(false);
+    h.frame();
+
+    h.open_layer_in_inspector(&known::RADAR);
+    h.frames_for(2, 1.0 / 60.0);
+    let slider = h
+        .control_items()
+        .into_iter()
+        .find(|item| {
+            item.label == crate::ui::OPACITY_LABEL
+                && item.kind == crate::ui::DrawnControlKind::Slider
+                && item.handler.as_ref() == Some(&known::RADAR)
+        })
+        .expect("the radar body opens with an opacity slider");
+    assert_eq!(
+        h.gui()
+            .pane(0)
+            .expect("pane 0")
+            .layer_opacity(&known::RADAR),
+        None,
+        "precondition: nothing is set yet, so the press below is what sets it",
+    );
+    // A press near the rail's left end: egui sets a slider from the pointer's
+    // position on the rail, so this lands a value well under the 100% shown.
+    let on_rail = egui::pos2(slider.rect.left() + 10.0, slider.rect.center().y);
+    h.mouse_press(on_rail);
+    h.frames_for(2, 1.0 / 60.0);
+    h.mouse_release(on_rail);
+    h.frames_for(2, 1.0 / 60.0);
+    let dragged = h
+        .gui()
+        .pane(0)
+        .expect("pane 0")
+        .layer_opacity(&known::RADAR)
+        .expect("the press did not write the pane's opacity");
+    assert!(
+        dragged < 0.5,
+        "a press near the rail's left end read {dragged}, so the slider is not \
+         the value it shows",
+    );
+
+    h.gui_mut()
+        .pane_mut(1)
+        .expect("pane 1")
+        .set_layer_opacity(&known::CITY_LABELS, 0.6);
+    h.frames_for(2, 1.0 / 60.0);
+    // [pane][radar, city labels]
+    let per_pane = |gui: &crate::Gui| -> [[Option<f32>; 2]; 2] {
+        [0, 1].map(|idx| {
+            let pane = gui.pane(idx).expect("both panes");
+            [
+                pane.layer_opacity(&known::RADAR),
+                pane.layer_opacity(&known::CITY_LABELS),
+            ]
+        })
+    };
+    let want = [[Some(dragged), None], [None, Some(0.6)]];
+    assert_eq!(
+        per_pane(h.gui()),
+        want,
+        "[pane][radar, city labels]: a value crossed panes or layers",
+    );
+
+    let store = squallar_kv::MemoryKvStore::default();
+    h.gui_mut().save_ui_config(&store);
+    let mut reopened = crate::Gui::new();
+    assert!(reopened.load_ui_config(&store));
+    assert_eq!(
+        per_pane(&reopened),
+        want,
+        "[pane][radar, city labels] after a reopen",
+    );
+
+    let mut untouched = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    untouched.set_pane_count(2);
+    untouched.frame();
+    let json = untouched.gui().ui_config_json().expect("serializable");
+    assert!(
+        !json.contains("opacity"),
+        "a config nobody dragged carries an opacity key, so every existing \
+         file changes on its next save",
+    );
+}
+
+/// **On a phone the opacity slider sits inside the sheet** for the three
+/// layers whose body is not a handler's control tree - radar, the basemap and
+/// the colour scale - so the one control every layer shares is reachable
+/// where the inspector actually is on Compact.
+#[test]
+fn the_opacity_slider_sits_inside_the_phone_sheet_for_every_kind_of_body() {
+    let mut h = InputHarness::with_screen(egui::vec2(412.0, 915.0));
+    assert_eq!(
+        h.width_class(),
+        crate::ui_layout::WidthClass::Compact,
+        "precondition: a phone",
+    );
+    for kind in [known::RADAR, known::BASEMAP_TILES, known::COLOR_SCALE] {
+        h.open_layer_in_inspector(&kind);
+        h.frames_for(2, 1.0 / 60.0);
+        let sheet = h
+            .sheet_rect()
+            .expect("the inspector is the sheet's page on a phone");
+        let slider = h
+            .control_items()
+            .into_iter()
+            .find(|item| {
+                item.label == crate::ui::OPACITY_LABEL
+                    && item.kind == crate::ui::DrawnControlKind::Slider
+                    && item.handler.as_ref() == Some(&kind)
+            })
+            .unwrap_or_else(|| panic!("{kind:?}: no opacity slider was drawn"));
+        assert!(
+            sheet.contains_rect(slider.rect),
+            "{kind:?}: the opacity slider at {:?} is not inside the sheet {sheet:?}",
+            slider.rect,
+        );
+        assert!(
+            h.text_painted_in(sheet, crate::ui::OPACITY_LABEL),
+            "{kind:?}: the slider's label is not painted inside the sheet",
+        );
+    }
+}

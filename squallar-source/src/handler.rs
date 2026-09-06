@@ -721,6 +721,13 @@ pub trait SourceHandler: Send {
         false
     }
 
+    /// The opacity a fresh slot for this layer paints at, 0..=1, until the
+    /// user sets one. Takes the pane so a layer whose look depends on a pane
+    /// choice (radar's product) can answer per pane. 1.0 unless overridden.
+    fn default_opacity(&self, _pane: &PaneRef<'_>) -> f32 {
+        1.0
+    }
+
     /// **Surfaced through another layer's controls instead of a stack row and
     /// catalog tile of its own.**
     ///

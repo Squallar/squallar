@@ -1,7 +1,7 @@
 use crate::UI_CONFIG_KEY;
 use squallar_kv::{KvStore, MemoryKvStore};
 use squallar_radar::fields as radar_fields;
-use squallar_source::id::known;
+use squallar_source::id::{LayerId, known};
 
 /// Settings the user changed must come back after a save/load cycle.
 #[test]
@@ -1997,4 +1997,246 @@ fn the_shipped_alias_table_is_empty_and_every_row_lands_on_a_registered_field() 
         );
         assert_ne!(old, current, "an alias to itself is a no-op row");
     }
+}
+
+/// **A layer with no explicit opacity writes no `opacity` key**, so every
+/// existing config keeps its bytes on its next save; a layer the user did set
+/// writes the number and reads it back, and only that layer does.
+#[test]
+fn a_layer_with_no_explicit_opacity_writes_no_opacity_key() {
+    let mut gui = crate::Gui::new();
+    let json = gui.ui_config_json().expect("serializable");
+    assert!(
+        !json.contains("opacity"),
+        "a fresh config carries an opacity key, so every existing file changes \
+         on its next save",
+    );
+
+    gui.pane_mut(0)
+        .expect("pane 0")
+        .set_layer_opacity(&known::CITY_LABELS, 0.4);
+    let json = gui.ui_config_json().expect("serializable");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    let slots = v["panes"][0]["layer_slots"]
+        .as_array()
+        .expect("a slot list");
+    assert!(
+        slots
+            .iter()
+            .any(|slot| slot["id"] == known::CITY_LABELS.as_str()),
+        "precondition: the pane holds city labels",
+    );
+    for slot in slots {
+        assert_eq!(
+            slot.get("opacity").is_some(),
+            slot["id"] == known::CITY_LABELS.as_str(),
+            "only the layer that was set carries the key: {slot}",
+        );
+    }
+
+    let store = MemoryKvStore::default();
+    gui.save_ui_config(&store);
+    let mut restored = crate::Gui::new();
+    assert!(restored.load_ui_config(&store));
+    let pane = restored.pane(0).expect("pane 0");
+    assert_eq!(pane.layer_opacity(&known::CITY_LABELS), Some(0.4));
+    assert_eq!(
+        pane.layer_opacity(&known::BASEMAP_TILES),
+        None,
+        "an unset layer came back with a number",
+    );
+}
+
+/// **An opacity this build cannot read costs the number, never the slot.**
+/// `1e9`, `-3`, `"half"` and `null` each load as "the layer's default" while
+/// the slot keeps its place, its enabled flag and its identity: each id is in
+/// the draw order exactly once and a re-save writes it once. The alternative,
+/// the whole slot demoted to an unknown entry, would put a fresh default slot
+/// beside the verbatim one, and the user would see the layer twice.
+#[test]
+fn an_unreadable_saved_opacity_costs_the_number_never_the_slot() {
+    let fresh = crate::Gui::new();
+    let json = fresh.ui_config_json().expect("serializable");
+    let mut v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    let bad = [
+        serde_json::json!(1e9),
+        serde_json::json!(-3),
+        serde_json::json!("half"),
+        serde_json::Value::Null,
+    ];
+    let mut doctored: Vec<LayerId> = Vec::new();
+    {
+        let slots = v["panes"][0]["layer_slots"]
+            .as_array_mut()
+            .expect("a slot list");
+        let mut victims = slots
+            .iter_mut()
+            .filter(|slot| slot["id"] != known::RADAR.as_str());
+        for value in &bad {
+            let slot = victims
+                .next()
+                .expect("a fresh pane holds at least four non-radar layers");
+            slot["opacity"] = value.clone();
+            // Off, so a slot that came back as a fresh default (on) is told
+            // apart from the one the file described.
+            slot["enabled"] = serde_json::json!(false);
+            doctored.push(LayerId::new(slot["id"].as_str().expect("an id")));
+        }
+    }
+    let store = MemoryKvStore::default();
+    store
+        .store(UI_CONFIG_KEY, &v.to_string())
+        .expect("the memory store accepts a write");
+
+    let mut gui = crate::Gui::new();
+    assert!(gui.load_ui_config(&store), "the rest of the config loads");
+    let pane = gui.pane(0).expect("pane 0");
+    let order = pane.draw_order_vec();
+    for id in &doctored {
+        assert_eq!(
+            pane.layer_opacity(id),
+            None,
+            "{id:?}: an unreadable opacity was kept as a number",
+        );
+        assert_eq!(
+            order.iter().filter(|got| *got == id).count(),
+            1,
+            "{id:?} is not in the draw order exactly once: {order:?}",
+        );
+        assert!(
+            !pane.is_overlay_enabled(id),
+            "{id:?} came back enabled: its slot was demoted and a fresh one \
+             took its place",
+        );
+    }
+
+    let saved = gui.ui_config_json().expect("serializable");
+    let saved: serde_json::Value = serde_json::from_str(&saved).expect("valid JSON");
+    let slots = saved["panes"][0]["layer_slots"]
+        .as_array()
+        .expect("a slot list");
+    for id in &doctored {
+        let written: Vec<&serde_json::Value> = slots
+            .iter()
+            .filter(|slot| slot["id"] == id.as_str())
+            .collect();
+        assert_eq!(
+            written.len(),
+            1,
+            "{id:?} was written {} times - the slot was demoted and \
+             reconciled back beside its verbatim copy",
+            written.len(),
+        );
+        assert!(
+            written[0].get("opacity").is_none(),
+            "{id:?}: the unreadable value was written back: {}",
+            written[0],
+        );
+    }
+}
+
+/// `set_layer_opacity` refuses a non-finite value and clamps the rest, so
+/// nothing serde_json would spell `null` reaches the file (the reader treats
+/// `null` as "no value", and a number the user set would be silently lost),
+/// and no write mints a slot for a layer the pane does not hold.
+#[test]
+fn a_non_finite_or_out_of_range_opacity_is_refused_or_clamped_never_written() {
+    let mut gui = crate::Gui::new();
+    let pane = gui.pane_mut(0).expect("pane 0");
+    let kind = known::CITY_LABELS;
+    pane.set_layer_opacity(&kind, f32::NAN);
+    assert_eq!(pane.layer_opacity(&kind), None, "NaN was stored");
+    pane.set_layer_opacity(&kind, 0.6);
+    pane.set_layer_opacity(&kind, f32::INFINITY);
+    assert_eq!(
+        pane.layer_opacity(&kind),
+        Some(0.6),
+        "an infinity replaced a value the user set",
+    );
+    pane.set_layer_opacity(&kind, 7.0);
+    assert_eq!(
+        pane.layer_opacity(&kind),
+        Some(1.0),
+        "7.0 is clamped, not refused",
+    );
+    pane.set_layer_opacity(&kind, -2.0);
+    assert_eq!(pane.layer_opacity(&kind), Some(0.0));
+
+    let absent = known::LIGHTNING;
+    assert!(
+        pane.slot(&absent).is_none(),
+        "precondition: lightning ships off, so a fresh pane has no slot for it",
+    );
+    pane.set_layer_opacity(&absent, 0.5);
+    assert!(pane.slot(&absent).is_none(), "a slider write minted a slot");
+    assert_eq!(pane.layer_opacity(&absent), None);
+
+    let json = gui.ui_config_json().expect("serializable");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    for slot in v["panes"][0]["layer_slots"]
+        .as_array()
+        .expect("a slot list")
+    {
+        if let Some(opacity) = slot.get("opacity") {
+            let n = opacity
+                .as_f64()
+                .expect("an opacity on the wire is a number, never null");
+            assert!((0.0..=1.0).contains(&n), "{slot}");
+        }
+    }
+}
+
+/// **A removed layer's opacity rides its tombstone across a reopen.** The
+/// removal keeps it, the file carries it in `removed_layers`, and the re-add
+/// after a reopen restores it - so an accidental removal followed by a
+/// restart still costs nothing.
+#[test]
+fn a_removed_layers_opacity_rides_its_tombstone_across_a_reopen() {
+    let kind = known::CITY_LABELS;
+    let mut gui = crate::Gui::new();
+    let pane = gui.pane_mut(0).expect("pane 0");
+    pane.set_layer_opacity(&kind, 0.25);
+    assert!(
+        pane.remove_layer(&kind),
+        "precondition: city labels can be removed",
+    );
+    assert_eq!(
+        pane.layer_opacity(&kind),
+        None,
+        "a removed layer has no slot to read",
+    );
+
+    let json = gui.ui_config_json().expect("serializable");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    let gone = v["panes"][0]["removed_layers"]
+        .as_array()
+        .expect("a removed list")
+        .iter()
+        .find(|slot| slot["id"] == kind.as_str())
+        .expect("the tombstone is written");
+    assert_eq!(gone["opacity"], serde_json::json!(0.25));
+
+    let store = MemoryKvStore::default();
+    store
+        .store(UI_CONFIG_KEY, &json)
+        .expect("the memory store accepts a write");
+    let mut reopened = crate::Gui::new();
+    assert!(reopened.load_ui_config(&store));
+    assert!(
+        !reopened
+            .pane(0)
+            .expect("pane 0")
+            .draw_order_vec()
+            .contains(&kind),
+        "the removal did not survive the reopen",
+    );
+    assert!(
+        reopened.add_layer_on_pane_for_test(0, &kind),
+        "the re-add lands",
+    );
+    assert_eq!(
+        reopened.pane(0).expect("pane 0").layer_opacity(&kind),
+        Some(0.25),
+        "the re-add after a reopen reset the opacity",
+    );
 }
