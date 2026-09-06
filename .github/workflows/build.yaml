@@ -18,8 +18,19 @@ permissions:
 # them comes to be bumped alone, and the point of pinning a tool we hand our
 # signing key to is that it cannot drift.
 env:
-  RCODESIGN_VERSION: 0.29.0
-  RCODESIGN_SHA256: dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002
+  # NOT named RCODESIGN_*, and that is load-bearing rather than a style choice.
+  # rcodesign merges every environment variable prefixed `RCODESIGN_` into its
+  # own configuration, mapping the suffix to a config key in the `default`
+  # profile (apple-codesign 0.29.0, src/cli/config.rs `with_env_prefix`). So a
+  # workflow-level `RCODESIGN_SHA256` -- set here only to pin the download --
+  # became a config key `sha256`, which is not one rcodesign has, and every
+  # `rcodesign sign` died before signing anything with "configuration file
+  # error / problem key: sha256". Reproduced exactly:
+  #   RCODESIGN_SHA256=x rcodesign sign a b
+  # A tool that reads its own prefix out of the environment cannot share that
+  # prefix with the variables naming its download.
+  SIGNTOOL_VERSION: 0.29.0
+  SIGNTOOL_SHA256: dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002
 
 concurrency:
   group: '${{ github.workflow }} @ ${{ github.ref }}'
@@ -633,14 +644,25 @@ jobs:
         run: |
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends curl zip
-          v="$RCODESIGN_VERSION"
+          v="$SIGNTOOL_VERSION"
           base=apple-codesign-$v-x86_64-unknown-linux-musl
           curl -fsSL -o /tmp/rcodesign.tar.gz \
             "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F$v/$base.tar.gz"
-          echo "$RCODESIGN_SHA256  /tmp/rcodesign.tar.gz" | sha256sum -c -
+          echo "$SIGNTOOL_SHA256  /tmp/rcodesign.tar.gz" | sha256sum -c -
           tar -xzf /tmp/rcodesign.tar.gz -C /tmp
           install -m 0755 "/tmp/$base/rcodesign" /usr/local/bin/rcodesign
           rcodesign --version
+          # rcodesign reads its own config out of RCODESIGN_* environment
+          # variables, so any that leak in here silently become config keys and
+          # the first `sign` dies with "configuration file error". Catch it at
+          # the install step, where the message can say what to do, rather than
+          # 200 lines later where it reads as a signing failure.
+          if env | grep -q '^RCODESIGN_'; then
+            echo "::error::RCODESIGN_-prefixed variables are set and rcodesign will read them as configuration:"
+            env | grep '^RCODESIGN_' | sed 's/=.*/=<redacted>/' >&2
+            echo "Rename them (this workflow uses SIGNTOOL_* for exactly this reason)." >&2
+            exit 1
+          fi
 
       # `BIN=` rather than a second build: the row above has already compiled
       # exactly this binary for exactly this triple. `BIN=` names a path and
@@ -781,11 +803,11 @@ jobs:
       # root and has no reason to become it.
       - name: Install the signer
         run: |
-          v="$RCODESIGN_VERSION"
+          v="$SIGNTOOL_VERSION"
           base=apple-codesign-$v-x86_64-unknown-linux-musl
           curl -fsSL -o "$RUNNER_TEMP/rcodesign.tar.gz" \
             "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F$v/$base.tar.gz"
-          echo "$RCODESIGN_SHA256  $RUNNER_TEMP/rcodesign.tar.gz" | sha256sum -c -
+          echo "$SIGNTOOL_SHA256  $RUNNER_TEMP/rcodesign.tar.gz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/rcodesign.tar.gz" -C "$RUNNER_TEMP"
           mkdir -p "$RUNNER_TEMP/bin"
           install -m 0755 "$RUNNER_TEMP/$base/rcodesign" "$RUNNER_TEMP/bin/rcodesign"
