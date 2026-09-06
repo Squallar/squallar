@@ -1843,9 +1843,9 @@ dependencies = [
 
 [[package]]
 name = "grib"
-version = "0.18.2"
+version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3def1ec9770b70aafbe8b14fe6b39d1b547b412ea92ddb2a79c7d3b50b36c951"
+checksum = "c28f5fd0be7bb4010833126c76c4d32ab394ba71e75d40c677afb42233f48db7"
 dependencies = [
  "chrono",
  "grib-build",
