@@ -290,6 +290,37 @@ def md5_of(path: str) -> str:
     return h.hexdigest()
 
 
+# ----------------------------------------------------------------------- utis
+
+# `uti` on a buildUploadFiles reservation is a CLOSED ENUM in Apple's OpenAPI
+# spec for the App Store Connect API, not a free-form type identifier. These
+# five are the whole of it, transcribed from the spec as two independently
+# generated SDKs render it -- aaronsky/asc-swift and
+# AvdLee/appstoreconnect-swift-sdk, which are code-generated from Apple's
+# published schema and agree value for value.
+#
+# The macOS value is `com.apple.pkg`. It is NOT the system UTI for a flat
+# installer package: that is `com.apple.installer-package-archive`, which is
+# what `UTType` reports for a .pkg on disk and what this script sent until the
+# spec was read. It is not in the enum, so the reservation would have been
+# refused -- a plausible identifier for the right file, rejected for not being
+# the one the API names.
+APPLE_UTIS = frozenset({
+    "com.apple.binary-property-list",
+    "com.apple.ipa",
+    "com.apple.pkg",
+    "com.apple.xml-property-list",
+    "com.pkware.zip-archive",
+})
+
+UTI_IPA = "com.apple.ipa"
+UTI_PKG = "com.apple.pkg"
+
+assert {UTI_IPA, UTI_PKG} <= APPLE_UTIS, (
+    "a UTI this script sends is not one App Store Connect accepts"
+)
+
+
 # ------------------------------------------------------------------- the flow
 
 
@@ -297,21 +328,12 @@ def upload(client: Client, ipa: str, platform: str, timeout_s: int) -> int:
     # iOS ships an .ipa, macOS a .pkg -- App Store Connect has no .app or .zip
     # spelling of a macOS build. The two differ in exactly two places: where
     # the version fields are read from, and the UTI the reservation declares.
-    #
-    # `com.apple.installer-package-archive` is Apple's published UTI for a
-    # flat installer package and is the value altool sends for `--type osx`.
-    # It is the ONE field in this script that has never been exercised against
-    # Apple: the iOS arm's `com.apple.ipa` has uploaded real builds, this one
-    # has not, and no public document states what /v1/buildUploadFiles expects
-    # for macOS. It is a named constant on one line for that reason -- if the
-    # reservation comes back rejecting the UTI, this is the line to change,
-    # and the error will say so rather than failing somewhere downstream.
     if ipa.endswith(".pkg"):
         bundle_id, short_version, build_version = pkg_metadata(ipa)
-        uti = "com.apple.installer-package-archive"
+        uti = UTI_PKG
     else:
         bundle_id, short_version, build_version = ipa_metadata(ipa)
-        uti = "com.apple.ipa"
+        uti = UTI_IPA
     size = os.path.getsize(ipa)
     note(f"==> {os.path.basename(ipa)}: {bundle_id} {short_version} "
          f"({build_version}), {size} bytes")
