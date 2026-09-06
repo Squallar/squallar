@@ -262,6 +262,15 @@ impl Totals {
     /// Whether every dispatch is accounted for by exactly one reason. False
     /// means a `record` reached the ledger without passing through
     /// [`note_dispatched`], which is the only way the two can disagree.
+    ///
+    /// **What this cannot detect: whether the reasons are the right ones.** It
+    /// is a conservation law, so it proves nothing is lost and nothing about
+    /// what anything is called. Measured: a tamper that swapped both
+    /// `PanCoverage` arming sites to `ContentOneShot` made a pan phase spend 45
+    /// rasters charged 45-to-content and 0-to-pan, and this returned `true`
+    /// throughout with zero unattributed. Only an assertion naming the arm it
+    /// expects, in both directions, catches a misattribution. "The balance line
+    /// is green" is not a health check.
     pub fn reasons_balance(&self) -> bool {
         self.reasons.iter().sum::<u64>() == self.dispatched
     }
