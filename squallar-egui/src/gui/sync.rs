@@ -279,6 +279,15 @@ impl Gui {
             // cannot happen.
             return;
         }
+        // The registry's draw-order weights, taken before the pane borrow:
+        // `PaneState::adopt_layers` keeps the slots the adopted stack never
+        // held, and a kept slot has to land at its own weight rather than on
+        // top of the group's arrangement.
+        let weights: std::collections::HashMap<squallar_source::id::LayerId, u32> = self
+            .overlays
+            .handlers()
+            .map(|h| (h.id(), h.draw_order_weight()))
+            .collect();
         let src = &self.panes[self.active_pane];
         let group = src.group;
         let active_site = src.site().to_string();
@@ -298,7 +307,7 @@ impl Gui {
             p.scan_info = active_scan_info.clone();
             // The copy arrives with configs but no state: a slot's
             // state is derived, never shared between panes.
-            p.adopt_layers(&active_layers);
+            p.adopt_layers(&active_layers, &|id| weights.get(id).copied());
             p.set_selected_product(active_selected_product.clone());
             p.set_selected_elevation(active_selected_elevation);
             // This is the second way a pane's enabled map changes, and it is the

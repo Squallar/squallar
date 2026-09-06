@@ -360,3 +360,176 @@ fn a_config_restored_mid_session_releases_what_it_switches_off() {
         "the config restore released the radar raster",
     );
 }
+
+// ── An absence is not a curation ──────────────────────────────────────────
+
+/// Take [`KIND`]'s slot off `pane` **leaving no tombstone** — the shape a pane
+/// is in when a door refused to mint the slot (`PaneState::add_layer`,
+/// `Gui::write_pane_overlay`, `Gui::initialize_pane_enabled` all return
+/// without writing), and the shape a pane opened by `set_pane_count` is in
+/// before it is seeded. `PaneState::remove_layer` is the other thing, and it
+/// does leave one.
+fn strip_without_tombstone(pane: &mut PaneState, kind: &squallar_source::id::LayerId) {
+    let kept: Vec<crate::pane::LayerSlot> = pane
+        .layers
+        .take_slots()
+        .into_iter()
+        .filter(|slot| slot.id != *kind)
+        .collect();
+    pane.layers.set_slots(kept);
+    assert!(
+        !pane.layers.holds(kind) && !pane.layers.is_removed(kind),
+        "the fixture must leave neither a slot nor a tombstone, or it is \
+         testing the curation arm instead",
+    );
+}
+
+/// **The regression: a loaded picture left the glass with nothing said.**
+///
+/// A pane the active one never held a layer on used to take that layer off
+/// every linked sibling. The chain: a refusal leaves the active pane with no
+/// slot; `propagate_layer_state` fans the stack out; its price
+/// (`Gui::adopt_layers_increment`) counts only what a destination **gains**,
+/// so a fan-out that takes layers away is `Increment::ZERO` and
+/// `AdmissionLedger::ask` short-circuits it to an admission **without even
+/// counting an ask**; `PaneState::adopt_layers` then replaces the destination
+/// stack wholesale and `release_disabled_overlay_textures` clears the cache.
+/// One refusal anywhere, and the whole linked group goes blank with no
+/// verdict, no notice and nothing on `budget state:`.
+///
+/// A pane opened by `set_pane_count` reaches the same state without any
+/// refusal at all: `PaneState::with_site` gives it `GroupId::FIRST` and
+/// `layer_link: true` with an empty stack, so it joins the group as a source
+/// of truth before anything has seeded it.
+#[test]
+fn the_fan_out_keeps_a_layer_the_source_pane_never_held() {
+    let ctx = egui::Context::default();
+    let mut gui = skewed_gui(&ctx);
+    strip_without_tombstone(gui.pane_mut(0).expect("pane 0"), &KIND);
+
+    for idx in [1, 2] {
+        assert!(
+            has_texture(gui.pane(idx).expect("fixture pane"), &KIND),
+            "premise: pane {idx} must be drawing {KIND:?} before the fan-out, \
+             or the assertion after it is satisfied by an empty start",
+        );
+    }
+
+    let before = gui.admission().counts();
+    gui.propagate_pane_sync();
+    assert_eq!(
+        gui.admission().counts().asked,
+        before.asked,
+        "premise: the fan-out really is a free act here — it asks nothing, \
+         which is why nothing in the ledger could ever have shown this",
+    );
+
+    for idx in [1, 2] {
+        let target = gui.pane(idx).expect("fixture pane");
+        assert!(
+            target.is_overlay_enabled(&KIND),
+            "pane {idx} lost a layer the source pane never held. An absence is \
+             not a curation: the source has no tombstone for it",
+        );
+        assert!(
+            has_texture(target, &KIND),
+            "pane {idx} kept the slot and lost the loaded texture, which is \
+             the same disappearance one layer down",
+        );
+    }
+}
+
+/// **The control arm, one fact changed: the source pane *removed* the layer.**
+///
+/// A removal is the arrangement a linked group shares, it leaves a tombstone,
+/// and it must still fan out — otherwise the fix above turns "keep what the
+/// source never had" into "linking no longer removes", which is the opposite
+/// defect and the one the tombstones were added for.
+#[test]
+fn the_fan_out_still_takes_away_a_layer_the_source_pane_removed() {
+    let ctx = egui::Context::default();
+    let mut gui = skewed_gui(&ctx);
+    assert!(
+        gui.pane_mut(0).expect("pane 0").remove_layer(&KIND),
+        "premise: the removal must really happen, or this is the absence arm \
+         again under another name",
+    );
+    assert!(
+        gui.pane(0).expect("pane 0").layers.is_removed(&KIND),
+        "premise: and it must have left the tombstone that tells the two \
+         apart",
+    );
+
+    for idx in [1, 2] {
+        assert!(
+            has_texture(gui.pane(idx).expect("fixture pane"), &KIND),
+            "premise: pane {idx} is drawing {KIND:?} before the fan-out",
+        );
+    }
+
+    gui.propagate_pane_sync();
+
+    for idx in [1, 2] {
+        let target = gui.pane(idx).expect("fixture pane");
+        assert!(
+            !target.layers.holds(&KIND),
+            "pane {idx} kept a layer the group curated out",
+        );
+        assert!(
+            !has_texture(target, &KIND),
+            "pane {idx} adopted the removal and kept the texture",
+        );
+        assert!(
+            has_texture(target, &squallar_source::id::known::RADAR),
+            "the fan-out released pane {idx}'s radar raster",
+        );
+    }
+}
+
+/// **The kept slot lands at its draw-order weight**, not on top of the stack
+/// it was merged back into. A layer preserved above every other one would draw
+/// over the group's arrangement, which is a second, quieter way for the fix
+/// above to change what the user sees.
+#[test]
+fn a_kept_slot_lands_in_draw_order() {
+    let ctx = egui::Context::default();
+    let mut gui = skewed_gui(&ctx);
+    strip_without_tombstone(gui.pane_mut(0).expect("pane 0"), &KIND);
+
+    let weights: HashMap<squallar_source::id::LayerId, u32> = gui
+        .overlays
+        .handlers()
+        .map(|h| (h.id(), h.draw_order_weight()))
+        .collect();
+    gui.propagate_pane_sync();
+
+    let order: Vec<squallar_source::id::LayerId> = gui
+        .pane(1)
+        .expect("pane 1")
+        .layers
+        .iter()
+        .map(|slot| slot.id.clone())
+        .collect();
+    let kept = order
+        .iter()
+        .position(|id| *id == KIND)
+        .expect("the fan-out kept the slot — the test above holds that");
+    assert!(
+        order
+            .last()
+            .is_some_and(|last| weights[last] > weights[&KIND]),
+        "premise: something in the group's arrangement must sort ABOVE {KIND:?}, \
+         or appending and placing produce the same list and this test cannot \
+         fail: {order:?}",
+    );
+    assert!(
+        kept + 1 < order.len(),
+        "the kept slot was appended to the top of the stack: {order:?}",
+    );
+    let sequence: Vec<u32> = order.iter().map(|id| weights[id]).collect();
+    assert!(
+        sequence.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the kept slot landed out of draw order, so it would paint over the \
+         arrangement the group shares: {sequence:?} for {order:?}",
+    );
+}

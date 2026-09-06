@@ -3068,13 +3068,31 @@ impl PaneState {
     /// configs and leaves every pane where it was on the clock. Before the
     /// timeline lived on the slot it was a separate field this call could not
     /// reach, and that behaviour is what is preserved here.
-    pub fn adopt_layers(&mut self, layers: &LayerStack) {
-        let mut mine: Vec<(LayerId, LayerTimeState)> = self
-            .layers
-            .take_slots()
-            .into_iter()
-            .map(|slot| (slot.id, slot.time))
-            .collect();
+    ///
+    /// **An absence is not a curation, and this is the one place that
+    /// distinction has teeth.** A layer the source stack neither
+    /// [`LayerStack::holds`] nor [`LayerStack::is_removed`] is one the source
+    /// pane never got — a slot some door refused to mint, or a pane opened
+    /// bare and never seeded — and it is kept. A layer the source *removed*
+    /// carries a tombstone and does go, because that removal is the
+    /// arrangement the group shares.
+    ///
+    /// Without the distinction this call is the way a loaded picture leaves
+    /// the glass with nothing said. The fan-out that drives it prices only
+    /// what a destination **gains** (`Gui::adopt_layers_increment`), so a
+    /// fan-out that takes layers away is `Increment::ZERO` and the ledger
+    /// short-circuits it to an admission without even counting an ask; the
+    /// `release_disabled_overlay_textures` behind it then finds no slot and
+    /// clears the cache. One refusal on the active pane — or one pane opened
+    /// into the group with an empty stack, which
+    /// `PaneState::with_site` makes a member of `GroupId::FIRST` with
+    /// `layer_link` on — used to take every overlay in the group with it.
+    pub fn adopt_layers(
+        &mut self,
+        layers: &LayerStack,
+        weight_of: &dyn Fn(&LayerId) -> Option<u32>,
+    ) {
+        let mut mine: Vec<LayerSlot> = self.layers.take_slots();
         // **The whole stack, tombstones included.** A linked group shares one
         // layer arrangement, and a curation is part of the arrangement: a copy
         // that brought the slots but not the removals would let the
@@ -3082,9 +3100,21 @@ impl PaneState {
         // just removed from the group.
         self.layers.adopt(layers);
         for slot in self.layers.iter_mut() {
-            if let Some(pos) = mine.iter().position(|(id, _)| *id == slot.id) {
-                slot.time = mine.remove(pos).1;
+            if let Some(pos) = mine.iter().position(|held| held.id == slot.id) {
+                slot.time = mine.remove(pos).time;
             }
+        }
+        // What is left in `mine` is what the adopted stack does not hold. Of
+        // that, only the tombstoned ids were curated out; the rest the source
+        // simply never had, and they stay — at their draw-order weight, the
+        // same walk `Self::add_layer` makes, so a kept slot lands among the
+        // adopted ones rather than on top of them.
+        for slot in mine {
+            if layers.is_removed(&slot.id) {
+                continue;
+            }
+            let weight = weight_of(&slot.id).unwrap_or(u32::MAX);
+            self.insert_slot_at_weight(slot, weight, weight_of);
         }
     }
 
