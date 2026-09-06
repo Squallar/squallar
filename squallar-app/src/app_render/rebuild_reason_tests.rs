@@ -24,14 +24,15 @@
 //! is stuck on, and a counter wired to the wrong flag fails the phase it
 //! misreads.
 //!
-//! Every door below is a production door, and the fixture is
+//! Every door below is a production door, and the frame is
 //! `idle_raster_tests`': `Gui::ui` decides, `App::process_gui_actions`
 //! dispatches, a refusing sink makes the funnel run the real rasterizer on
 //! this box, `App::poll_overlay_render_results` is the arrival and
-//! `App::deliver_held_rasters` the promote. The view is moved by a **real
-//! drag** — pointer events on the frame's own `RawInput`, through the map's
-//! own drag handler — and never by writing the pane's centre, so what the pan
-//! phase exercises is the door a user's finger goes through.
+//! `App::deliver_held_rasters` the promote. The layers are not that file's —
+//! see `seeded_layers` for the one it drops and why. The view is moved by a
+//! **real drag** — pointer events on the frame's own `RawInput`, through the
+//! map's own drag handler — and never by writing the pane's centre, so what
+//! the pan phase exercises is the door a user's finger goes through.
 //!
 //! In a test build the ledger is one set of counters per thread, so each
 //! phase below reads this test's own dispatches and no sibling's — see
@@ -39,10 +40,11 @@
 //! premise it rests on, and
 //! `the_isolation_these_readings_depend_on_is_on_in_this_binary` for the
 //! proof that the switch reached this binary. What that replaced was a
-//! crate-wide lock only readers took, and it is how one of this file's fifteen
-//! data-phase dispatches came back charged to the coverage arm across a phase
-//! that never moved the map: a sibling holding no lock dispatched inside the
-//! bracket.
+//! crate-wide lock only readers took. The coverage raster this file's data
+//! phase kept reading was **not** a sibling's, though: with the test alone in
+//! its process the charge still landed, on this thread, and the reasons were
+//! the scene's own — see `quiesce` for the coast and `reaches_the_network`
+//! for the download.
 
 use squallar_egui::overlay_cache::{RerenderReason, ledger};
 use squallar_overlays::render::overlay_state::{OverlayFetchResult, SourceEvent};
@@ -189,11 +191,56 @@ fn enable(app: &mut crate::app::App, idx: usize, id: &LayerId) {
     app.gui.overlays = registry;
 }
 
+fn a_discussion_round(n: usize) -> squallar_overlays::render::overlay_state::FetchPayload {
+    use squallar_overlays::spc::discussion::{MdType, SpcDiscussion};
+    let discussions = (0..n)
+        .map(|i| {
+            let (lat, lon) = (34.5 + i as f64 * 0.3, -98.0);
+            SpcDiscussion {
+                number: i as u32 + 1,
+                title: format!("Mesoscale Discussion #{:04}", i + 1),
+                text: String::new(),
+                link: String::new(),
+                md_type: MdType::Convective,
+                polygon: vec![vec![
+                    (lat - 0.25, lon - 0.25),
+                    (lat - 0.25, lon + 0.25),
+                    (lat + 0.25, lon + 0.25),
+                    (lat + 0.25, lon - 0.25),
+                    (lat - 0.25, lon - 0.25),
+                ]],
+                feature: a_polygon(lat, lon),
+                concerning: None,
+                valid_from: None,
+                valid_until: None,
+            }
+        })
+        .collect();
+    squallar_overlays::render::overlay_state::OverlayRegistry::spc_discussions_payload(discussions)
+}
+
+/// Three texture layers whose data **this test alone delivers**.
+///
+/// Not `idle_raster_tests`' three: that scene seeds `RadarCoverage`, whose
+/// content is the radar site table — a process-global `static`
+/// (`squallar_radar::sites::table_generation`) that every other test in this
+/// binary resolving a site moves, and which `Gui::republish_radar_sites_if_the_table_moved`
+/// re-delivers into the pane on the next frame. `idle_raster_tests` reads the
+/// generation on both sides of its window and excuses that layer's rasters
+/// when it moved; a reason bracket cannot, because the ledger does not say
+/// which layer a raster was for. Measured 2026-09-06 under the whole suite at
+/// eight threads: the pan phase, which delivers no data, read `1 content, 2
+/// sweep` beside its `27 pan`, all on this test's own thread, and direction 1
+/// failed on the content raster. Which token moved was not read directly —
+/// the site table is one candidate, the pane clock moving under a scan-info
+/// arrival (see `reaches_the_network`) the other — and both are out of this
+/// scene now: every layer here has a token only this file's `arrive` can
+/// move, and the frame opens no socket.
 fn seeded_layers() -> [LayerId; 3] {
     [
         known::NWS_ALERTS,
         known::STORM_REPORTS,
-        known::RADAR_COVERAGE,
+        known::SPC_DISCUSSIONS,
     ]
 }
 
@@ -205,7 +252,7 @@ fn a_pane_with_three_texture_layers() -> crate::app::App {
     }
     arrive(&mut app, &known::NWS_ALERTS, an_alert_round(3));
     arrive(&mut app, &known::STORM_REPORTS, a_reports_round(4));
-    app.gui.publish_radar_sites();
+    arrive(&mut app, &known::SPC_DISCUSSIONS, a_discussion_round(2));
     app
 }
 
@@ -231,10 +278,42 @@ fn one_frame(app: &mut crate::app::App, ctx: &egui::Context, time: f64, events: 
     });
     let actions = app.gui.ui(ctx);
     let _ = ctx.end_pass();
+    let actions = actions
+        .into_iter()
+        .filter(|action| !reaches_the_network(action))
+        .collect();
     app.process_gui_actions(actions);
     // The refused job runs on a thread of its own; give it the wall clock it
     // needs to land on the channel the next frame drains.
     std::thread::sleep(std::time::Duration::from_millis(2));
+}
+
+/// The actions a frame emits that would leave this process: the radar round
+/// and the overlay auto-fetch.
+///
+/// **The scene declines them, because their answers arrive on the network's
+/// clock.** `Gui::go_offline_for_tests` keeps the tiles from opening a socket
+/// and nothing keeps the radar round from opening one: the first frame asks
+/// for the pane's site and `App::spawn_fetch` downloads the latest KTLX volume
+/// from the NEXRAD archive — measured under `strace -e connect` on
+/// 2026-09-06: five S3 addresses, in a unit test. When that download lands,
+/// `Gui::apply(ScanInfoForSite)` claims the session's initial zoom and the
+/// pane goes from 4 to 7 — and it lands wherever the network puts it. Traced
+/// over ten isolated runs the claim fell **inside the data phase six times**
+/// (reading `2 zoom-settled` there each time, 0 otherwise) and after the test
+/// ended four times; under load the same download can fall in the pan phase,
+/// or land on the frame where it costs `pan` instead. The direction-2 note
+/// used to read that zoom move as "the data phase's own arrivals moving the
+/// zoom, which is the instrument working" — it was a NEXRAD download.
+fn reaches_the_network(action: &squallar_egui::actions::GuiAction) -> bool {
+    use squallar_egui::actions::GuiAction;
+    matches!(
+        action,
+        GuiAction::FetchRadarScan(_)
+            | GuiAction::CheckForNewScans(_)
+            | GuiAction::FetchOverlay { .. }
+            | GuiAction::RefreshOverlay { .. }
+    )
 }
 
 /// `n` quiet frames — no input at all, which is what makes the settle
@@ -246,35 +325,73 @@ fn frames(app: &mut crate::app::App, ctx: &egui::Context, clock: &mut f64, n: us
     }
 }
 
-/// Run quiet frames until the pipeline stops moving, then a few more.
+/// Whether pane 0 is still doing anything a raster could be owed to: a
+/// raster dispatched and not yet retired, a picture held short of the glass,
+/// a settle countdown still running — or **the view still moving**. Read from
+/// the pane itself: the [`RendersInFlight`] mark is set at the dispatch and
+/// cleared at the arrival, so it is true for exactly the span a raster is in
+/// the air, wherever the thread rasterizing it is scheduled; and walkers'
+/// `MapMemory::animating` is true for exactly the span a released drag is
+/// still coasting.
 ///
-/// **The phase boundary, and it has to be a real one.** A raster dispatched by
-/// the pan phase is still rasterizing, arriving and promoting for several
-/// frames after the last drag, and a phase boundary drawn while that is in
-/// flight charges the tail of one stimulus to the next one. Measured before
-/// this existed: a data phase that never moved the map read 2 `zoom-settled`
-/// and 1 `pan` out of 18 — the pan phase's own tail, landing after the
-/// counters were zeroed.
+/// [`RendersInFlight`]: squallar_egui::overlay_cache::RendersInFlight
+fn scene_in_motion(app: &crate::app::App) -> bool {
+    let pane = app.gui.pane(0).expect("the fixture's pane");
+    let pipeline_busy = pane.overlay_textures.values().any(|cache| {
+        !cache.renders.is_empty() || cache.is_holding() || cache.settle_is_counting_down()
+    });
+    pipeline_busy || pane.map_memory.animating() || pane.map_memory.dragging()
+}
+
+/// Run quiet frames until the scene is at rest and the ledger has stopped
+/// moving, then a few more.
 ///
-/// Resting is asserted rather than assumed. A pipeline that never comes to
-/// rest is `idle_raster_tests`' defect, and a phase boundary taken on a moving
-/// ledger would measure it as this file's.
+/// **The phase boundary, and it has to be a real one.** Whatever the pan
+/// phase set in motion and had not finished by the boundary is charged to the
+/// data phase, and the data phase's premise — the map does not move — is then
+/// false by the test's own doing.
+///
+/// **Rest is the scene's own state, not a still ledger.** This used to return
+/// after the ledger had read the same for `QUIET_FRAMES` frames, and that is
+/// a wall-clock proxy wearing a counter's clothes. What it missed, read off a
+/// per-frame trace of the draw pass on 2026-09-06: **a released drag coasts.**
+/// walkers' `Center::Inertia` carries the release velocity forward with a 0.2 s
+/// time constant — about 0.92 per frame at this file's 60 Hz clock — and a
+/// quarter-viewport stroke over eight frames coasts for tens of frames after
+/// the release. Across the ten "quiet" frames the viewport's longitude read
+/// 232.65, 233.12, 233.56, 233.96, 234.33, 234.68, 234.99, 235.28, 235.54,
+/// 235.79 … still creeping, with nothing in flight and the ledger still. The
+/// coverage margin gives out wherever that creep crosses it, which is set by
+/// where the last picture happened to be placed — arrival timing — so 1 run
+/// in 10 crossed it *after* the reset and read `1 pan` or `2 pan` in a data
+/// phase that had moved nothing itself. The pan phase's own count wandered
+/// (39, 41, 43 …) for the same reason.
+///
+/// So the boundary is now drawn on [`scene_in_motion`]: nothing in flight,
+/// nothing held, no settle owed, and the map neither dragging nor coasting.
+/// The quiet frames are the settle on top of that, not the criterion.
+///
+/// A scene that never comes to rest still fails here rather than hanging: the
+/// frame bound is a hang guard well past the coast (tens of frames) plus the
+/// settle, not a budget.
 fn quiesce(app: &mut crate::app::App, ctx: &egui::Context, clock: &mut f64) {
     const QUIET_FRAMES: usize = 10;
-    const MAX_FRAMES: usize = 400;
+    const MAX_FRAMES: usize = 2000;
     let mut last = ledger::totals();
     let mut still = 0usize;
     for _ in 0..MAX_FRAMES {
         frames(app, ctx, clock, 1);
         let now = ledger::totals();
-        still = if now == last { still + 1 } else { 0 };
+        let at_rest = now == last && !scene_in_motion(app);
+        still = if at_rest { still + 1 } else { 0 };
         last = now;
         if still >= QUIET_FRAMES {
             return;
         }
     }
     panic!(
-        "the overlay pipeline never came to rest across {MAX_FRAMES} quiet          frames, so no phase boundary here is clean: {}",
+        "the scene never came to rest across {MAX_FRAMES} quiet frames, so no \
+         phase boundary here is clean: {}",
         breakdown(&last)
     );
 }
@@ -334,7 +451,7 @@ fn data_driven(t: &ledger::Totals) -> u64 {
 /// passes one direction and fails the other.
 #[test]
 fn the_dispatch_reason_separates_a_pan_from_a_data_arrival() {
-    squallar_worker::offload::install_test_worker(Box::new(RefusingPort));
+    let _worker = squallar_worker::offload::install_test_worker(Box::new(RefusingPort));
 
     let ctx = egui::Context::default();
     let mut app = a_pane_with_three_texture_layers();
@@ -439,13 +556,12 @@ fn the_dispatch_reason_separates_a_pan_from_a_data_arrival() {
     // neither passes both.
     //
     // The pinned quantity is `PanCoverage` on each side rather than the wider
-    // `view_driven`, because `view_driven` also carries `ZoomSettled` and this
-    // scene does not control the zoom. Measured here: the data phase's own
-    // arrivals move the pane's zoom (4 -> 7 over the instrument's data block),
-    // and the counter charges that one raster to `ZoomSettled` rather than
-    // folding it into a content arm — which is the instrument working, not a
-    // leak. `PanCoverage` is also the exact quantity the oversampling margin
-    // buys off, so it is the one worth a contract.
+    // `view_driven`, because `PanCoverage` is the exact quantity the
+    // oversampling margin buys off, so it is the one worth a contract. (This
+    // note used to excuse a `ZoomSettled` in the data phase as "the data
+    // phase's own arrivals moving the zoom 4 -> 7". Nothing in this scene
+    // moves the zoom; that was the pane's NEXRAD download landing mid-scene
+    // — see `reaches_the_network`.)
     assert!(
         data_driven(&data_phase) > 0,
         "delivering data charged no raster to a data reason: {}",
@@ -479,7 +595,7 @@ fn the_dispatch_reason_separates_a_pan_from_a_data_arrival() {
 #[test]
 #[ignore = "instrument: prints the reason breakdown, asserts nothing about it"]
 fn the_reason_breakdown_over_a_pan_and_load_scene() {
-    squallar_worker::offload::install_test_worker(Box::new(RefusingPort));
+    let _worker = squallar_worker::offload::install_test_worker(Box::new(RefusingPort));
 
     let ctx = egui::Context::default();
     let mut app = a_pane_with_three_texture_layers();
@@ -570,7 +686,7 @@ fn the_reason_breakdown_over_a_pan_and_load_scene() {
 #[test]
 #[ignore = "instrument: prices the oversampling margin at each rung"]
 fn what_the_oversample_margin_buys_at_each_rung() {
-    squallar_worker::offload::install_test_worker(Box::new(RefusingPort));
+    let _worker = squallar_worker::offload::install_test_worker(Box::new(RefusingPort));
 
     println!(
         "{:>5}  {:>9}  {:>6}  {:>4}  {:>12}  {:>10}  {:>12}",
