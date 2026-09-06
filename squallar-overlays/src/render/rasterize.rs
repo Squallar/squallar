@@ -2048,6 +2048,35 @@ impl GriddedInput {
     }
 }
 
+/// What a **half-turn** of longitude spans in a texture `width` px wide over
+/// `bounds`. Longitude is mapped linearly, so this is the whole of the
+/// conversion; [`rasterize_gridded`]'s cell loop uses it to tell a neighbour
+/// from the same meridian a turn away. `inf` for a degenerate box, which
+/// refuses nothing and leaves the sizing as it was.
+///
+/// **Computed in the app's one continuous longitude frame, and it has to be.**
+/// `walkers::Projector::unproject` is linear in pixel x and folds nothing, so
+/// a viewport straddling the seam arrives as e.g. `179.25..180.75`,
+/// `squallar_egui::overlay_cache::viewport_geo_bounds` takes its two corners as
+/// they come, and `OverlayTexturePlan::coverage` grows the result without
+/// folding: the denominator here is the box's true width. Fold the box into
+/// ±180 anywhere upstream and that 1.5-degree view (2.25 with its overdraw)
+/// measures 357.75: a half-turn shrinks from 80 textures to half of one —
+/// 345 901 px to 2 172 px on a 4317 px picture — and the box now claims the
+/// ground it does not show. The refusal keeps refusing (the seam pair is 4334
+/// px apart against that 2172), so the smear does not come back; what comes
+/// instead is the whole world drawn into a pane a degree and a half wide —
+/// 4978 of GMGSI's 5000 columns, 100 % of the picture, the seam columns
+/// themselves off both ends of the texture (measured once on the seam probe's
+/// fixture, 2026-09-06; not gated). `gmgsi_seam_probe_tests` cannot see any
+/// of it: it pins one viewport's output, and the frame is decided upstream of
+/// this crate. `seam_frame_tests` builds the box the way the app does, asserts
+/// it is continuous, and refuses the folded spelling with both denominators
+/// named.
+pub(crate) fn half_turn_px(bounds: &GeoBounds, width: u32) -> f32 {
+    (180.0 / (bounds.max_lon - bounds.min_lon) * f64::from(width as f32)) as f32
+}
+
 /// Writes pixels directly rather than through tiny-skia: one filled rectangle
 /// per grid point, sized from its neighbour spacing.
 pub fn rasterize_gridded(
@@ -2145,12 +2174,7 @@ pub fn rasterize_gridded(
     let mut band: [Vec<(f32, f32)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     let mut projected_to: Option<usize> = None;
 
-    // What a **half-turn** of longitude spans in this texture. Longitude is
-    // mapped linearly, so this is the whole of the conversion; the cell loop
-    // uses it to tell a neighbour from the same meridian a turn away. `inf`
-    // for a degenerate box, which refuses nothing and leaves the sizing as it
-    // was.
-    let half_turn_px = (180.0 / (bounds.max_lon - bounds.min_lon) * f64::from(w)) as f32;
+    let half_turn_px = half_turn_px(bounds, width);
 
     let draw = win.interior(ni, nj);
     for j in draw.j0..draw.j1 {
@@ -2206,7 +2230,9 @@ pub fn rasterize_gridded(
             // describe is 0.51 px. `refused` is what declines to size a cell
             // from a spacing no cell can have, and the other side answers
             // instead — the fallback this arm already had for the grid's own
-            // edge. Gated by `gmgsi_seam_probe_tests`.
+            // edge. Gated by `gmgsi_seam_probe_tests`. The half-turn it is
+            // measured against is `half_turn_px`, which is only right in the
+            // frame the box arrives in — see there, and `seam_frame_tests`.
             let spacing = |a: f32, b: f32| {
                 let d = (b - a).abs();
                 (d <= half_turn_px).then(|| (d * 0.55).max(0.5))
@@ -2302,3 +2328,6 @@ mod hit_cells_tests;
 
 #[cfg(test)]
 mod gmgsi_seam_probe_tests;
+
+#[cfg(test)]
+mod seam_frame_tests;

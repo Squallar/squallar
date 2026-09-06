@@ -1248,6 +1248,11 @@ impl OverlayHandler for GmgsiHandler {
     fn hover_value_at(&self, lat: f64, lon: f64, pane: &PaneRef<'_>) -> Option<String> {
         let view = self.view(pane);
         let granule = self.cached_grids.get(view.selected_channel)?;
+        // The pointer arrives in the pane's continuous frame — 190 past the
+        // seam, where this granule is written at -170 — and is carried into
+        // the granule's frame before the cull, the lookup and the reach read
+        // it. See `render::geo::lon_into_bounds`.
+        let lon = crate::render::geo::lon_into_bounds(lon, &granule.bounds);
         if !granule.bounds.contains_point(lat, lon) {
             return None;
         }
@@ -1262,7 +1267,11 @@ impl OverlayHandler for GmgsiHandler {
             .coords
             .cell_span_degrees(lat)
             .map(|span| 2.0 * span)?;
-        let (dlat, dlon) = (glat - lat, glon - lon);
+        // `Separable`'s `nearest` compares longitude the short way round, so
+        // the column it answers can be written a turn from the pointer:
+        // column 0 at `+179.99961` for a pointer at `-179.98`. The reach is a
+        // ground distance and reads the column in the pointer's own turn.
+        let (dlat, dlon) = (glat - lat, squallar_geo::fold_lon_near(glon, lon) - lon);
         if dlat * dlat + dlon * dlon > reach * reach {
             return None;
         }

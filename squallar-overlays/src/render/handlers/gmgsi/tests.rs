@@ -2192,3 +2192,107 @@ fn the_parked_staging_mosaic_is_in_this_layers_resident_bytes() {
          slot rather than being a constant added once",
     );
 }
+
+// -- The pointer past the seam ----------------------------------------------
+
+fn seam_handler_over(lon_axis: Vec<f64>, values: Vec<f32>, bounds: GeoBounds) -> GmgsiHandler {
+    let channel = GmgsiChannel::LongwaveIr;
+    let spec = crate::gmgsi::fields::spec(channel);
+    let ni = lon_axis.len();
+    let grid = GmgsiGrid {
+        channel,
+        grid: ResidentGrid {
+            field: spec.id.clone(),
+            ni,
+            nj: 1,
+            coords: GridCoords::Separable {
+                lat_axis: vec![35.0],
+                lon_axis,
+            },
+            values: crate::render::gridded::GridValues::F32(values),
+        },
+        bounds,
+        valid_time: chrono::NaiveDate::from_ymd_opt(2025, 6, 1)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap(),
+    };
+    let mut h = GmgsiHandler::new();
+    h.defaults.enabled = true;
+    h.defaults.selected_channel = channel;
+    h.apply_fetch_result(Box::new(GmgsiFetchResult(Ok(grid))), &PaneRef::across(&[]));
+    h
+}
+
+/// **The pointer past the seam, in both spellings.** `Projector::unproject`
+/// folds nothing, so over a mosaic written at `185..195` the pointer reads 190
+/// when the map was panned there and -170 when it was not; both are the same
+/// ground. The unfolded cull refused the second and the readout went blank.
+#[test]
+fn hover_hits_past_the_seam_whichever_way_the_pointer_is_written() {
+    let h = seam_handler_over(
+        vec![185.0, 190.0, 195.0],
+        vec![10.0, 82.0, 200.0],
+        GeoBounds {
+            min_lat: 35.0,
+            max_lat: 35.0,
+            min_lon: 185.0,
+            max_lon: 195.0,
+        },
+    );
+    let pane = PaneRef::across(&[]);
+    let at = |lon: f64| h.hover_value_at(35.0, lon, &pane);
+    assert_eq!(at(190.0).as_deref(), Some("Longwave IR: 82 count"));
+    assert_eq!(
+        at(-170.0).as_deref(),
+        Some("Longwave IR: 82 count"),
+        "the same ground, written in +/-180"
+    );
+    assert_eq!(
+        at(-165.0).as_deref(),
+        Some("Longwave IR: 200 count"),
+        "the eastern edge, written in +/-180"
+    );
+    assert_eq!(at(0.0), None, "half a world away in either spelling");
+}
+
+/// **The seam column itself.** The real mosaic's column 0 is `+179.99961` and
+/// its column 1 `-179.92838`, so the seam falls 0.036 degrees east of column
+/// 0's midpoint with its neighbour. `Separable`'s `nearest` compares the short
+/// way round and answers column 0 for a pointer at `-179.98` — a column written
+/// a turn from the pointer. The reach test read that as 359.98 degrees and
+/// refused the column the pointer was on, in either spelling of the pointer.
+#[test]
+fn a_pointer_beside_the_seam_column_reads_the_seam_column() {
+    const NI: usize = 5000;
+    let lon_axis: Vec<f64> = (0..NI)
+        .map(|i| {
+            let raw = 179.999_61 + i as f64 * 0.072_008_9;
+            (raw + 180.0).rem_euclid(360.0) - 180.0
+        })
+        .collect();
+    let mut values = vec![50.0f32; NI];
+    values[0] = 200.0;
+    values[1] = 82.0;
+    let h = seam_handler_over(
+        lon_axis,
+        values,
+        GeoBounds {
+            min_lat: 35.0,
+            max_lat: 35.0,
+            min_lon: -180.0,
+            max_lon: 180.0,
+        },
+    );
+    let pane = PaneRef::across(&[]);
+    let at = |lon: f64| h.hover_value_at(35.0, lon, &pane);
+    // 0.020 deg from column 0, 0.052 from column 1: column 0.
+    assert_eq!(at(-179.98).as_deref(), Some("Longwave IR: 200 count"));
+    assert_eq!(
+        at(180.02).as_deref(),
+        Some("Longwave IR: 200 count"),
+        "the same ground, past the seam in the continuous frame"
+    );
+    // 0.028 from column 1, 0.100 from column 0: column 1, the other side.
+    assert_eq!(at(-179.9).as_deref(), Some("Longwave IR: 82 count"));
+}

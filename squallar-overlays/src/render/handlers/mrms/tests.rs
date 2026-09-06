@@ -1816,3 +1816,71 @@ fn the_parked_staging_mosaic_is_in_this_layers_resident_bytes() {
          slot rather than being a constant added once",
     );
 }
+
+// ── The pointer past the seam ───────────────────────────────────────────────
+
+/// A mosaic written past the seam, `185..195`, three columns of one row.
+fn seam_handler() -> MrmsHandler {
+    let product = MrmsProduct::ReflectivityComposite;
+    let values = crate::render::gridded::GridValues::F32(vec![10.0, 45.0, 60.0]);
+    let spec = crate::mrms::fields::spec(product);
+    let paint = crate::render::gridded::field_paint(&spec.id).expect("registered");
+    let (visible_points, value_range) = values.summarize(|v| paint.paints(v));
+    let grid = MrmsGrid {
+        product,
+        grid: Arc::new(ResidentGrid {
+            field: spec.id.clone(),
+            ni: 3,
+            nj: 1,
+            coords: crate::hrrr::GridCoords::Regular {
+                lat0: 35.0,
+                lon0: 185.0,
+                dlat: -0.01,
+                dlon: 5.0,
+                ni: 3,
+                nj: 1,
+                scan_mode: 0,
+            },
+            values,
+        }),
+        bounds: GeoBounds {
+            min_lat: 35.0,
+            max_lat: 35.0,
+            min_lon: 185.0,
+            max_lon: 195.0,
+        },
+        valid: chrono::NaiveDate::from_ymd_opt(2026, 8, 21)
+            .unwrap()
+            .and_hms_opt(0, 0, 39)
+            .unwrap(),
+        visible_points,
+        value_range,
+    };
+    let mut h = MrmsHandler::new();
+    h.defaults.enabled = true;
+    h.defaults.selected_product = product;
+    h.apply_fetch_result(Box::new(MrmsFetchResult(Ok(grid))), &PaneRef::across(&[]));
+    h
+}
+
+/// **The pointer past the seam, in both spellings.** `Projector::unproject`
+/// folds nothing, so over a mosaic at `185..195` the pointer reads 190 when the
+/// map was panned there and -170 when it was not; both are the same ground.
+/// The unfolded cull refused the second and the readout went blank.
+#[test]
+fn hover_hits_past_the_seam_whichever_way_the_pointer_is_written() {
+    let h = seam_handler();
+    let at = |lon: f64| h.hover_value_at(35.0, lon, &PaneRef::bare(0));
+    assert_eq!(at(190.0).as_deref(), Some("CREF: 45.0 dBZ"));
+    assert_eq!(
+        at(-170.0).as_deref(),
+        Some("CREF: 45.0 dBZ"),
+        "the same ground, written in +/-180"
+    );
+    assert_eq!(
+        at(-165.0).as_deref(),
+        Some("CREF: 60.0 dBZ"),
+        "the eastern edge, written in +/-180"
+    );
+    assert_eq!(at(0.0), None, "half a world away in either spelling");
+}

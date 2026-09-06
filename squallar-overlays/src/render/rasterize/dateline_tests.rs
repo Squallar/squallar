@@ -308,16 +308,86 @@ fn a_datum_already_in_frame_is_not_moved() {
     }
 }
 
-/// A datum wider than a half-turn has no unambiguous nearest representation,
-/// so it is left alone rather than guessed at.
+/// A datum up to a whole turn wide is carried to the copy nearest the box;
+/// wider than a turn it is not a width and is left alone.
+///
+/// The box is `-195..-165`, centre `-180`. A feature whose parts the source
+/// already cut at the seam pools into a turn-wide extent — `PKZ784` measures
+/// `-179.9999..180.0` — and the copy of that extent nearest `-180` is the one
+/// that starts there, which is where its western piece belongs. The half-turn
+/// ceiling this replaced refused both of these and the 180-degree datum too.
 #[test]
-fn a_datum_wider_than_a_half_turn_gets_no_shift() {
+fn a_datum_up_to_a_whole_turn_is_carried_and_wider_is_not() {
     let mb = MercatorBounds::from_geo(&bounds(50.0, 54.0, -195.0, -165.0));
-    // A feature whose parts the source already cut at the seam pools into a
-    // box this wide; `PKZ784` measures -179.9999..180.0.
-    assert_eq!(mb.lon_shift(-179.9999, 180.0), 0.0);
-    assert_eq!(mb.lon_shift(0.0, 180.0), 0.0);
+    assert_eq!(mb.lon_shift(-179.9999, 180.0), -360.0);
+    assert_eq!(mb.lon_shift(0.0, 180.0), -360.0);
     assert_ne!(mb.lon_shift(170.0, 179.0), 0.0);
+    assert_eq!(
+        mb.lon_shift(-180.0, 180.0 + 1e-9),
+        0.0,
+        "wider than a turn is not a width"
+    );
+}
+
+/// A zone the source cut at the seam is **one feature with a piece either
+/// side**: `AKZ791` as written, `178.62..179.46`, and the same ring a turn and
+/// two degrees west, `-179.38..-178.54`. Its pooled extent is 358.84 degrees.
+/// A view panned east past the seam to `180.5..210.5` holds the western piece
+/// — at `180.62..181.46` — and none of the eastern one.
+///
+/// FAILED before `lon_shift`'s ceiling moved: the pooled extent was refused a
+/// shift, `-179.38..179.46` meets nothing in `180.5..210.5`, and the feature
+/// was culled whole, western piece and all — 0 px. The same ground written in
+/// ±180, `-179.5..-149.5`, always drew it, and the two must paint the same
+/// pixels.
+#[test]
+fn a_seam_cut_zone_draws_its_far_piece_in_a_view_entirely_past_the_seam() {
+    let west_piece: Vec<(f64, f64)> = AKZ791
+        .iter()
+        .map(|&(lat, lon)| (lat, lon - 358.0))
+        .collect();
+    let zone = OverlayFeature::new(
+        vec![vec![AKZ791.to_vec()], vec![west_piece]],
+        [255, 0, 0, 255],
+        [255, 255, 255, 255],
+        String::new(),
+        String::new(),
+        HatchPattern::None,
+    );
+    let pooled = zone.geo_bounds.expect("two rings pool to an extent");
+    let pooled_span = pooled.max_lon - pooled.min_lon;
+    assert!(
+        pooled_span > 180.0,
+        "the fixture must pool wider than a half-turn to reach the old ceiling; got {pooled_span}"
+    );
+
+    let past = bounds(50.0, 54.0, 180.5, 210.5);
+    let rgba = draw(std::slice::from_ref(&zone), &past);
+    let n = painted(&rgba);
+    assert!(
+        n > 100,
+        "the western piece belongs at 180.62..181.46, inside a view of 180.5..210.5, \
+         and must paint; got {n} px"
+    );
+    let (_, _, x1, _) = painted_bbox(&rgba, TEX).expect("painted");
+    // 0.12..0.96 deg into a 30 deg view: columns 2..16 of 512.
+    assert!(
+        x1 < TEX / 8,
+        "only the western piece is in view and it sits at the west edge; painting \
+         reached column {x1} of {TEX}"
+    );
+
+    let folded = bounds(50.0, 54.0, -179.5, -149.5);
+    let rgba_folded = draw(&[zone], &folded);
+    assert_eq!(
+        painted(&rgba_folded),
+        n,
+        "the same ground written two ways must paint the same count"
+    );
+    assert!(
+        rgba == rgba_folded,
+        "the same ground written two ways must paint the same pixels"
+    );
 }
 
 #[test]

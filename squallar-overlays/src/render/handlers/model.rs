@@ -1463,6 +1463,11 @@ impl OverlayHandler for ModelDataHandler {
 
     fn hover_value_at(&self, lat: f64, lon: f64, pane: &PaneRef<'_>) -> Option<String> {
         let grid = self.grid_of(pane)?;
+        // The pointer arrives in the pane's continuous frame — 190 past the
+        // seam, where this grid is written at -170 — and is carried into the
+        // grid's frame before the cull, the lookup and the reach read it. See
+        // `render::geo::lon_into_bounds`.
+        let lon = crate::render::geo::lon_into_bounds(lon, &grid.bounds);
         if !grid.bounds.contains_point(lat, lon) {
             return None;
         }
@@ -2269,6 +2274,64 @@ mod tests {
             new_handler().hover_value_at(35.0, -97.0, &PaneRef::bare(0)),
             None
         );
+    }
+
+    /// A grid written past the seam, `185..195`, three points along one row.
+    fn seam_hover_handler() -> ModelDataHandler {
+        let parameter = ModelParameter::SurfaceBasedCape;
+        let values = vec![300.0, 1200.0, 4100.0];
+        let (visible_points, value_range) =
+            crate::hrrr::summarize_values(&values, |v| parameter.paints(v));
+        let g = HrrrGridData {
+            parameter,
+            values,
+            coords: crate::hrrr::GridCoords::Explicit {
+                lats: vec![35.0; 3],
+                lons: vec![185.0, 190.0, 195.0],
+            },
+            ni: 3,
+            nj: 1,
+            bounds: GeoBounds {
+                min_lat: 35.0,
+                max_lat: 35.0,
+                min_lon: 185.0,
+                max_lon: 195.0,
+            },
+            ref_time: chrono::NaiveDate::from_ymd_opt(2026, 7, 25)
+                .unwrap()
+                .and_hms_opt(RUN_HOUR, 0, 0)
+                .unwrap(),
+            forecast_hour: parameter.min_forecast_hour(),
+            visible_points,
+            value_range,
+        };
+        let mut h = new_handler();
+        h.defaults.enabled = true;
+        h.defaults.selected_param = parameter;
+        h.apply_fetch_result(Box::new(HrrrFetchResult(Ok(g))), &PaneRef::across(&[]));
+        h
+    }
+
+    /// **The pointer past the seam, in both spellings.** `Projector::unproject`
+    /// folds nothing, so over a grid at `185..195` the pointer reads 190 when
+    /// the map was panned there and -170 when it was not; both are the same
+    /// ground. The unfolded cull refused the second and the readout went blank.
+    #[test]
+    fn hover_hits_past_the_seam_whichever_way_the_pointer_is_written() {
+        let h = seam_hover_handler();
+        let at = |lon: f64| h.hover_value_at(35.0, lon, &PaneRef::bare(0));
+        assert_eq!(at(190.0).as_deref(), Some("SBCAPE: 1200 J/kg"));
+        assert_eq!(
+            at(-170.0).as_deref(),
+            Some("SBCAPE: 1200 J/kg"),
+            "the same ground, written in +/-180"
+        );
+        assert_eq!(
+            at(-165.0).as_deref(),
+            Some("SBCAPE: 4100 J/kg"),
+            "the eastern edge, written in +/-180"
+        );
+        assert_eq!(at(0.0), None, "half a world away in either spelling");
     }
 
     #[test]

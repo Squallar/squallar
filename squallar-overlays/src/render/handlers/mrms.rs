@@ -1057,6 +1057,11 @@ impl OverlayHandler for MrmsHandler {
     /// That is what stops the tooltip claiming "−999.0 dBZ" over the ocean.
     fn hover_value_at(&self, lat: f64, lon: f64, pane: &PaneRef<'_>) -> Option<String> {
         let grid = self.cached_grids.get(self.view(pane).selected_product)?;
+        // The pointer arrives in the pane's continuous frame — 190 past the
+        // seam, where this mosaic is written at -170 — and is carried into the
+        // mosaic's frame before the cull, the lookup and the reach read it.
+        // See `render::geo::lon_into_bounds`.
+        let lon = crate::render::geo::lon_into_bounds(lon, &grid.bounds);
         if !grid.bounds.contains_point(lat, lon) {
             return None;
         }

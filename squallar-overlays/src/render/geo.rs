@@ -2,22 +2,54 @@
 //! `egui::Pos2` ↔ [`ScreenPoint`].
 
 use crate::types::ScreenPoint;
-use squallar_geo::{GeoPolygon, GeoPolygonRing};
+use squallar_geo::{GeoBounds, GeoPolygon, GeoPolygonRing};
+
+/// How far over a whole turn a datum may measure and still be carried by
+/// [`lon_shift`].
+///
+/// An extent is read off its own coordinates, and one that spans the world can
+/// come back a rounding error over 360: at the zoom floor a pane's two edges
+/// unproject to `-4e-14` and `360.00000000000006`, because `2f64.powf(zoom)` is
+/// not the exact inverse of the `log2` the floor was solved with (walkers,
+/// `bc25271f`), and the same arithmetic one ulp of zoom away lands the other
+/// side of 360. A bare `> 360.0` would carry one arm and refuse the other.
+/// `1e-12` is 17.6 ulps of 360 (`2^-44`, 5.7e-14 each): six times the largest
+/// excess measured, 3 ulps, over two pane widths at the floor and one ulp of
+/// zoom either side of it and three centres — and `1e-10` of the finest column
+/// any source here draws (MRMS, 0.01 deg), so no width that means anything
+/// fits inside it. `lon_shift_tests` is that measurement.
+pub const TURN_SLACK: f64 = 1e-12;
 
 /// The whole multiple of 360° that carries the datum spanning
 /// `[datum_min, datum_max]` to its representation nearest the target spanning
 /// `[target_min, target_max]`.
 ///
-/// One spelling, because the two callers have to agree or the map draws a shape
+/// One spelling, because the callers have to agree or the map draws a shape
 /// where it cannot be clicked: the rasterizer moves a *polygon* toward the
-/// *viewport*, the hit test moves a *click* toward a *ring*.
+/// *viewport*, the hit test moves a *click* toward a *ring*, the hover cull
+/// moves a *pointer* toward a *grid* ([`lon_into_bounds`]).
 ///
-/// A datum wider than a half-turn has no unambiguous nearest representation, so
-/// it gets no shift. A single point always has a span of zero, which is why
-/// moving the point is the safe end to move.
+/// **A datum up to a whole turn wide is carried; wider is left where it is.**
+/// Nearest is decided between centres, which are defined for any finite span,
+/// so the width never makes the choice ambiguous — it decides what the choice
+/// is *for*. A point, or a ring inside a half-turn, has one copy that can be in
+/// frame at all, and this picks it. A pooled extent has no single placement —
+/// a zone the source cut at the seam, one piece at `+179.5..180` and one at
+/// `-180..-179.5`, measures `-180..180` — but the caller reading a pooled
+/// extent is a cull, and a cull wants the copy nearest the box: left in the
+/// ±180 frame, that extent meets no viewport panned past the seam to
+/// `181..200`, and the piece that belongs at `180..180.5` is never drawn
+/// (`dateline_tests`). The half-turn ceiling this replaced refused exactly
+/// those, and a datum spanning 180 degrees with them. Nothing written in ±180
+/// can measure more than a turn, so past `360 + TURN_SLACK` the span is not a
+/// width and no shift is right.
+///
+/// What this does not do: a ring wider than a half-turn can be in frame
+/// through *two* copies at once, and a rigid shift draws one. No source here
+/// carries such a ring.
 pub fn lon_shift(datum_min: f64, datum_max: f64, target_min: f64, target_max: f64) -> f64 {
     let span = datum_max - datum_min;
-    if !span.is_finite() || !(0.0..180.0).contains(&span) {
+    if !span.is_finite() || !(0.0..=360.0 + TURN_SLACK).contains(&span) {
         return 0.0;
     }
     let datum_centre = (datum_min + datum_max) / 2.0;
@@ -26,6 +58,20 @@ pub fn lon_shift(datum_min: f64, datum_max: f64, target_min: f64, target_max: f6
         return 0.0;
     }
     360.0 * ((target_centre - datum_centre) / 360.0).round()
+}
+
+/// A pointer's longitude carried into the frame `bounds` is written in.
+///
+/// The pointer arrives from `walkers::Projector::unproject`, which is linear in
+/// pixel x and folds nothing, so past the antimeridian it reads 190 where the
+/// grid under it is written at -170 and an unfolded
+/// [`GeoBounds::contains_point`] refuses it. The pointer is the end that moves —
+/// a point has no shape to deform — and it moves by the one whole turn that
+/// brings it nearest the box, unconditionally: never behind a "does this grid
+/// wrap" gate, which would have the same geometry answer two ways depending on
+/// which arm holds it. [`lon_shift`] with a datum of zero span.
+pub fn lon_into_bounds(lon: f64, bounds: &GeoBounds) -> f64 {
+    lon + lon_shift(lon, lon, bounds.min_lon, bounds.max_lon)
 }
 
 /// `ring`'s longitude extent, or `None` for a ring with no finite vertex.
@@ -172,3 +218,6 @@ pub fn simplify_polygons(polygons: &mut Vec<GeoPolygon>, epsilon: f64) {
     }
     polygons.retain(|p| !p.is_empty());
 }
+
+#[cfg(test)]
+mod lon_shift_tests;
