@@ -317,7 +317,7 @@ impl DoubleTapDragDetector {
         }
 
         if let GestureState::ZoomDragging { .. } = self.state {
-            self.handle_zoom_drag(pos, down, map_memory);
+            self.handle_zoom_drag(pos, down, map_memory, map_rect);
             return;
         }
         if pressed {
@@ -341,11 +341,22 @@ impl DoubleTapDragDetector {
     }
 
     /// While zoom-dragging, apply vertical drag to map zoom or end the gesture.
+    ///
+    /// `map_rect` is the rect the map is drawn into this frame, and it is here
+    /// because the gesture's own `1.0` is not the widest legal zoom — the rect
+    /// is. `Map::show` raises anything below [`walkers::viewport::min_zoom`]
+    /// for its rect, so a set below the floor is a set the widget refuses; the
+    /// host would keep the refused number until the next frame told it
+    /// otherwise, and everything reading zoom in between — a rebuild's
+    /// attribution among them — would read a zoom nothing was drawn at.
+    /// Asking the same floor here is what makes the two agree on the frame the
+    /// gesture happens rather than the one after it.
     fn handle_zoom_drag(
         &mut self,
         pos: egui::Pos2,
         down: bool,
         map_memory: &mut walkers::MapMemory,
+        map_rect: egui::Rect,
     ) {
         if !down {
             self.state = GestureState::Idle;
@@ -358,7 +369,10 @@ impl DoubleTapDragDetector {
         {
             let dy = pos.y - drag_start_y;
             let zoom_delta = dy as f64 / ZOOM_DRAG_SENSITIVITY as f64;
-            let new_zoom = (initial_zoom + zoom_delta).clamp(1.0, 19.0);
+            let new_zoom = walkers::viewport::clamp_zoom(
+                (initial_zoom + zoom_delta).clamp(1.0, 19.0),
+                map_rect,
+            );
             let _ = map_memory.set_zoom(new_zoom);
         }
     }

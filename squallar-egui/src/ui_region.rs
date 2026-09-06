@@ -202,6 +202,14 @@ const SETTLE_SHORTFALL: f64 = (1.0 + COVERAGE_TARGET) / (1.0 + COVERAGE_MARGIN);
 /// away by it. That is why [`viewport_for_region`]'s finiteness test comes
 /// *before* the clamp and not after.
 ///
+/// **It is not the bottom this framing can reach.** That is
+/// [`walkers::viewport::min_zoom`] for the rect being framed, whenever the rect
+/// is wider than one 256-point tile — which every pane this app lays out is.
+/// Below it the Mercator world is smaller than the strip, `Map::show` raises
+/// the zoom on the frame it is shown at, and a framing solved under it
+/// describes a projection nothing is drawn through. [`solve_viewport`] clamps
+/// against both.
+///
 /// [`a_zoom_walkers_refuses_is_one_this_module_clamps_away`]:
 ///     tests::a_zoom_walkers_refuses_is_one_this_module_clamps_away
 const MIN_ZOOM_LEVEL: f64 = 0.0;
@@ -248,7 +256,17 @@ fn solve_viewport(
         if shortfall <= SETTLE_SHORTFALL {
             return Some((memory, pass));
         }
-        let target = (memory.zoom() - shortfall.log2()).clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL);
+        // Raised to the widget's own floor as well as walkers' range, because
+        // a region wider than the world asks for a zoom at which the Mercator
+        // square is smaller than `rect` — and `Map::show`, which is where this
+        // `MapMemory` is spent, refuses it. Left unraised, the memory handed
+        // back describes a framing the strip is never drawn at, and every
+        // reader of it — the settle test on the pass after this one included —
+        // is one frame behind the glass.
+        let target = walkers::viewport::clamp_zoom(
+            (memory.zoom() - shortfall.log2()).clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL),
+            rect,
+        );
         if target == memory.zoom() {
             return Some((memory, pass));
         }

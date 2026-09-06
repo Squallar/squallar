@@ -277,6 +277,16 @@ const PAN_REBUILD_THRESHOLD: f32 = 0.5;
 /// dispatched full-size rasters continuously. A deadband priced in band is zero
 /// exactly there, which is the case with nothing else protecting it. A texel is
 /// ground per texture pixel, and exists whatever the band is.
+///
+/// **The other deadband in this workspace** is `CENTER_SLACK_POINTS` in
+/// `vendor/walkers/src/viewport.rs`, which stops the map's centre clamp
+/// re-firing on its own projection round trip and repainting forever. Same
+/// reason, different shape, and the difference is worth knowing before
+/// reaching for one as a model for the other: that one is already in the unit
+/// its comparison is made in — projected points — and is a fixed constant, so
+/// it needs no equivalent of [`COVERAGE_DEADBAND_VIEWPORT_CEILING`]. This one
+/// is in texels of a picture whose resolution against its own ground varies,
+/// which is exactly what that ceiling exists to bound.
 const COVERAGE_DEADBAND_TEXELS: f64 = 1.0;
 
 /// Ceiling on [`COVERAGE_DEADBAND_TEXELS`] once it is converted to ground, as a
@@ -288,6 +298,12 @@ const COVERAGE_DEADBAND_TEXELS: f64 = 1.0;
 /// 2048 texels across a viewport at zero overdraw, so one texel there is half
 /// this, and every wider texture is finer still — only on a picture whose
 /// resolution against its own ground is degenerate.
+///
+/// The workspace's other deadband, `CENTER_SLACK_POINTS` in
+/// `vendor/walkers/src/viewport.rs`, has no counterpart to this constant and
+/// needs none: it is a fixed slack already expressed in the projected points
+/// its comparison is made in, so there is no per-picture conversion for a
+/// viewport to bound. See [`COVERAGE_DEADBAND_TEXELS`].
 const COVERAGE_DEADBAND_VIEWPORT_CEILING: f64 = 1.0 / 1024.0;
 
 /// Latitude beyond which Web Mercator stops being finite. Bounds are clamped to it

@@ -33,6 +33,23 @@ use egui::Rect;
 /// A 64th of a point is four orders of magnitude above that round trip and
 /// three below anything a display can resolve, so the void it tolerates is not
 /// a void.
+///
+/// **The other deadband in this workspace** is
+/// `squallar-egui/src/overlay_cache.rs`'s `COVERAGE_DEADBAND_TEXELS`, which
+/// exists for the same reason — a comparison that would otherwise re-fire on
+/// its own rounding forever — and is spelled quite differently, so a reader
+/// who has met one should be able to find the other. That one is a deadband in
+/// *texels*, converted to ground before the comparison it guards, and a texel
+/// is only as fine as the picture it belongs to; it therefore carries a second
+/// constant, `COVERAGE_DEADBAND_VIEWPORT_CEILING`, bounding the converted
+/// figure to a thousandth of a viewport.
+///
+/// **This one needs no such ceiling**, and that is the whole of the
+/// difference: it is already in the unit the comparison is made in — projected
+/// points, the units `center.rs` tests the clamp in — and it is a fixed
+/// constant rather than something derived per picture, so there is no
+/// conversion for a viewport to make coarse. A 64th of a point is a 64th of a
+/// point on every map this widget draws.
 pub(crate) const CENTER_SLACK_POINTS: f64 = 1.0 / 64.0;
 
 /// The shallowest zoom at which the world is no smaller than `rect`.

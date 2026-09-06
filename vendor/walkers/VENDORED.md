@@ -2229,6 +2229,28 @@ far side, the "no duplicate continents" half of the requirement stops being free
 and becomes the wrap's own problem to state — because a wrapped world can show
 the same continent twice without the viewport ever exceeding the world's width.
 
+### Changed — source, twenty-eighth commit: the deadband names its counterpart
+
+**Doc comment only. No code, no behaviour, no test moves.** `src/viewport.rs`'s
+`CENTER_SLACK_POINTS` gains a paragraph naming the other deadband in this
+workspace — `COVERAGE_DEADBAND_TEXELS` in
+`squallar-egui/src/overlay_cache.rs` — and the same paragraph is added there
+pointing back, so a reader who meets one can find the other instead of
+concluding there is one deadband policy here when there are two.
+
+The paragraph exists to record the *difference*, which is the part a reader
+would otherwise have to re-derive: the overlay cache's deadband is in texels of
+a picture whose resolution against its own ground varies, so it converts before
+the comparison it guards and carries a second constant,
+`COVERAGE_DEADBAND_VIEWPORT_CEILING`, bounding the converted figure to a
+thousandth of a viewport. This one is already in the unit its comparison is made
+in — projected points — and is a fixed constant, so there is no per-picture
+conversion for a viewport to bound and it needs no such ceiling.
+
+It is recorded here because this file is the list of everything in this
+directory that is not upstream's, and a doc comment upstream did not write is
+one of those things whether or not it changes a byte of behaviour.
+
 ## What the pin actually selects
 
 "Upstream's 38 inline tests are the behaviour pin" is the reason this crate is

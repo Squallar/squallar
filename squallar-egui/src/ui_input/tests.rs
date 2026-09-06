@@ -755,3 +755,151 @@ fn drive_into_moving(memory: &mut walkers::MapMemory) {
         }
     }
 }
+
+/// The pane the map's zoom floor was reported from, in points.
+///
+/// Kept beside the value it produces rather than only in
+/// `vendor/walkers/src/viewport.rs`, so that a reader of this test can see both
+/// halves of the arithmetic without leaving the file.
+const REAL_VIEWPORT: (f32, f32) = (2878.0, 1651.0);
+
+/// `log2(2878 / 256)`, to the bit: [`walkers::viewport::min_zoom`] for
+/// [`REAL_VIEWPORT`], and the same constant `vendor/walkers/src/viewport.rs`'s
+/// own tests pin under this name.
+///
+/// Written out rather than computed, deliberately and in both places: a change
+/// to the floor's arithmetic has to *break* two pins, not move them together.
+const REAL_FLOOR: f64 = 3.4908508767402977;
+
+fn real_viewport_rect() -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(REAL_VIEWPORT.0, REAL_VIEWPORT.1),
+    )
+}
+
+/// The zoom one tile-less `walkers::Map` frame over `rect` leaves in `memory` —
+/// **what is drawn**, as against what the host believes.
+///
+/// Tile-less because the floor is a property of the widget's rect and of
+/// nothing a tile source does, and one frame because that is the whole
+/// question: the widget raises a below-floor zoom on the first frame it is
+/// shown at, so a host that agrees with this has agreed on the same frame.
+fn zoom_the_widget_draws(rect: egui::Rect, memory: &mut walkers::MapMemory) -> f64 {
+    let ctx = egui::Context::default();
+    ctx.begin_pass(egui::RawInput {
+        screen_rect: Some(rect),
+        ..Default::default()
+    });
+    let mut ui = egui::Ui::new(
+        ctx.clone(),
+        egui::Id::new("zoom floor under test"),
+        egui::UiBuilder::new()
+            .layer_id(egui::LayerId::background())
+            .max_rect(rect),
+    );
+    ui.set_clip_rect(rect);
+    ui.add(walkers::Map::new(
+        None,
+        memory,
+        walkers::lon_lat(-97.28, 35.33),
+    ));
+    let _ = ctx.end_pass();
+    memory.zoom()
+}
+
+/// Put a detector mid-zoom-drag from `initial_zoom`, then drag `dy` points.
+fn zoom_drag(initial_zoom: f64, dy: f32, map_rect: egui::Rect) -> walkers::MapMemory {
+    let ctx = egui::Context::default();
+    let mut memory = walkers::MapMemory::default();
+    memory
+        .set_zoom(initial_zoom)
+        .expect("the fixture's starting zoom is inside walkers' range");
+
+    let mut detector = DoubleTapDragDetector {
+        state: GestureState::ZoomDragging {
+            drag_start_y: 100.0,
+            initial_zoom,
+        },
+        ..Default::default()
+    };
+    detector.update(
+        &ctx,
+        PointerFrame {
+            pressed: false,
+            released: false,
+            down: true,
+            pos: egui::pos2(200.0, 100.0 + dy),
+            time: 1.0,
+            stale_down: false,
+        },
+        &mut memory,
+        map_rect,
+    );
+    memory
+}
+
+/// **The gap this closes**: the gesture's own `1.0` is not the widest legal
+/// zoom — the rect is, and a drag that asks for less comes back at the floor.
+#[test]
+fn a_zoom_drag_below_the_viewports_floor_lands_on_the_floor() {
+    let rect = real_viewport_rect();
+    assert_eq!(
+        walkers::viewport::min_zoom(rect).to_bits(),
+        REAL_FLOOR.to_bits(),
+        "the pinned floor is no longer what the widget computes for {REAL_VIEWPORT:?}",
+    );
+
+    // Two full pane-heights of upward drag: far enough to run the gesture into
+    // its own `1.0` lower bound, which is 2.49 levels under this rect's floor.
+    let memory = zoom_drag(5.0, -2.0 * REAL_VIEWPORT.1, rect);
+    assert_eq!(
+        memory.zoom().to_bits(),
+        REAL_FLOOR.to_bits(),
+        "a zoom drag off the bottom of a {REAL_VIEWPORT:?} pane left the host at \
+         {} - below the floor the widget draws at, so the host is holding a zoom \
+         nothing was ever drawn at",
+        memory.zoom(),
+    );
+}
+
+/// The other half of the same fact: the floor only ever *raises*, so a drag
+/// that stays above it is untouched.
+#[test]
+fn a_zoom_drag_above_the_viewports_floor_is_left_alone() {
+    let rect = real_viewport_rect();
+    // 300 points of downward drag at 150 points per level: two levels in.
+    let memory = zoom_drag(8.0, 300.0, rect);
+    assert_eq!(
+        memory.zoom().to_bits(),
+        10.0f64.to_bits(),
+        "a drag well inside the legal range was moved by the floor",
+    );
+}
+
+/// **Host state and drawn state agree on the same frame.**
+///
+/// Not on the next one: the widget's own raise is what used to close this gap,
+/// and it closes it a frame late, because it happens inside a `Map::show` the
+/// host has already read its zoom out of. Showing the widget over the same rect
+/// the gesture was handed must now move nothing at all.
+#[test]
+fn the_host_zoom_a_drag_leaves_is_the_zoom_the_widget_draws() {
+    let rect = real_viewport_rect();
+    let mut memory = zoom_drag(5.0, -2.0 * REAL_VIEWPORT.1, rect);
+    let host = memory.zoom();
+    let drawn = zoom_the_widget_draws(rect, &mut memory);
+    assert_eq!(
+        host.to_bits(),
+        drawn.to_bits(),
+        "the host left zoom at {host} and the widget drew {drawn} - the two \
+         disagree for the frame in between, and every reader of zoom in that \
+         window, a rebuild's attribution included, sees the number that was \
+         not drawn",
+    );
+    assert_eq!(
+        drawn.to_bits(),
+        REAL_FLOOR.to_bits(),
+        "the agreed value is not the floor either end was supposed to reach",
+    );
+}

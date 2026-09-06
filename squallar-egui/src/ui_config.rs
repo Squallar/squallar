@@ -2267,6 +2267,14 @@ fn restore_content(pane_idx: usize, pc: &PaneConfig, pane_count: usize) -> PaneC
 }
 
 /// Put a pane's map back where it was left: same zoom, same centre.
+///
+/// **Not clamped to the viewport's zoom floor, unlike the gesture in
+/// [`crate::ui_input`] and the framing in [`crate::ui_region`]**, because this
+/// site has no rect to clamp against: a config is read before any pane is laid
+/// out, so the pane this zoom belongs to has no size yet. `Map::show` raises a
+/// restored below-floor zoom on the first frame the pane is drawn — that is the
+/// case it was built for — and this is the one place in the app where host
+/// state is legitimately a frame behind the glass.
 fn restore_viewport(pane: &mut PaneState, pc: &PaneConfig) -> bool {
     let mut zoom_restored = false;
     if let Some(zoom) = pc.zoom {
