@@ -222,18 +222,27 @@ pub enum CapacitySource {
 }
 
 /// **A ceiling a governor may put under the capacity in force, per pool** —
-/// the third clamp term in the application's `capacity()` chain, beside the
-/// two session presumptions (`held_to`, `host_held_to`).
+/// the second clamp term in the application's `capacity()` chain, beside the
+/// session's GPU presumption (`held_to`).
 ///
-/// The seam and not yet its producer: `NONE` (the `Default`) is the identity,
-/// and nothing in the tree writes anything else yet. What will: a dwell-based
-/// step on the GPU axis after an out-of-memory event and a host step on a
-/// platform memory warning, both of which come back UP when their dwell
-/// expires — which is exactly why this is a separate term and not another
-/// `session_capacity`: a presumption is latched down for the session, a
-/// modulation is re-derived and can lift. Whatever produces it, a modulation
-/// can only LOWER — it is `min`'d against the capacity, never substituted for
-/// it — so a producer's bug cannot promise more than the hardware.
+/// **[`Self::host_ceiling`] has a producer**: `squallar_app::recovery`, the
+/// page heap's governor, which steps it down on a watermark event and back up
+/// when a margin has held across successive capacity readings. That is
+/// exactly why it is a separate term and not another `session_capacity` — a
+/// presumption is latched down for the session, a modulation is re-derived
+/// and can lift — and why the host presumption it replaced had to GO rather
+/// than sit beside it: both are a `min` against the capacity, so a latch left
+/// in the chain would clamp everything this lifts.
+///
+/// **[`Self::gpu_ceiling`] has none.** It is `None` for the life of every
+/// process today, and the asymmetry is a fact about instruments rather than
+/// an omission: `squallar_alloc::live_bytes` observes a page heap coming back
+/// and nothing observes a card's, so the GPU side stays a latched
+/// presumption until something can watch it recover.
+///
+/// Whatever produces it, a modulation can only LOWER — it is `min`'d against
+/// the capacity, never substituted for it — so a producer's bug cannot
+/// promise more than the hardware.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Modulation {
     /// The most GPU texture memory the term allows, in bytes; `None` leaves
@@ -458,9 +467,13 @@ impl Capacity {
     }
 
     /// The host side of [`Self::held_to`]: a page heap that reached its
-    /// watermark lowers what this session presumes the host holds, never
-    /// raises it, and the lowering dies with the process. A capacity with no
-    /// host figure stays without one — there is nothing to hold down.
+    /// watermark lowers what the session takes the host to hold. **This
+    /// function only ever lowers, and the figure handed to it is what may
+    /// rise** — it is [`Modulation::host_ceiling`] that reaches here, through
+    /// [`Self::modulated_by`], and that ceiling steps back up when
+    /// `squallar_app::recovery`'s margin has held. Nothing latches a host
+    /// figure for the session any more. A capacity with no host figure stays
+    /// without one — there is nothing to hold down.
     pub fn host_held_to(self, session_host_bytes: Option<u64>) -> Self {
         Self {
             host_bytes: self

@@ -31,6 +31,7 @@ fn budget_line(app: &App) -> String {
         // Not `live_bytes()`: this binary's own allocator figure moves with
         // whatever the harness is holding, and these tests pin the line.
         None,
+        &crate::recovery::HostRecovery::untouched(),
     )
 }
 
@@ -511,6 +512,7 @@ fn a_measured_capacity_reaches_the_fit_and_a_presumed_one_does_not_pretend_to() 
             crate::pressure::LinearMemoryWatch::default(),
             &app.budget_readout,
             None,
+            &crate::recovery::HostRecovery::untouched(),
         )
     };
     let six = squallar_device_profile::scene::Scene {
@@ -620,15 +622,24 @@ fn the_profile_update_folds_the_bridges_reading_through_the_tested_seam() {
     );
 }
 
-/// **The modulation term leaves `capacity()` bit-identical on every source
-/// arm while nothing produces one, and can only lower it when something
-/// does.** Three arms, built the way the tests above build them: the
-/// presumption (a headless desktop app), a measured 24 GiB on a discrete
-/// class, and the browser probe's 4032 MiB. On each, the default term is the
-/// identity against the two-term chain it was appended to; a term that names
-/// a ceiling above the figure changes nothing; one below it lowers both pools
+/// **The modulation term leaves `capacity()` bit-identical on a session
+/// nothing has squeezed, and can only lower it when something does.** Three
+/// arms, built the way the tests above build them: the presumption (a
+/// headless desktop app), a measured 24 GiB on a discrete class, and the
+/// browser probe's 4032 MiB. On each, the default term is the identity
+/// against the presumption chain it was appended to; a term that names a
+/// ceiling above the figure changes nothing; one below it lowers both pools
 /// and keeps the source; and a term on the host pool of a capacity with no
 /// host figure invents none.
+///
+/// **The premise this pin was written under has moved and the assertion has
+/// not.** It used to say "nothing produces one yet", which was a fact about
+/// the tree; `crate::recovery` now writes this term on every page-heap event.
+/// What is asserted is unchanged — `Modulation::NONE` on a session that has
+/// had no pressure — because these three apps are built and never squeezed,
+/// and the identity is still what a fresh session carries. The other half of
+/// the chain is what moved: the host presumption `host_held_to` used to hold
+/// is gone, so the term this is compared against is one shorter.
 #[test]
 fn the_modulation_term_is_the_identity_by_default_and_only_ever_lowers() {
     use squallar_device_profile::scene::Modulation;
@@ -649,16 +660,15 @@ fn the_modulation_term_is_the_identity_by_default_and_only_ever_lowers() {
         assert_eq!(
             app.capacity_modulation,
             Modulation::NONE,
-            "nothing produces one yet"
+            "a session that has had no pressure carries a term"
         );
-        let two_terms = capacity_with_probe(&app.device_profile, app.gpu_probe.bytes())
-            .held_to(app.session_capacity)
-            .host_held_to(app.session_host_capacity);
+        let one_term = capacity_with_probe(&app.device_profile, app.gpu_probe.bytes())
+            .held_to(app.session_capacity);
         let three_terms = app.capacity();
         assert_eq!(
-            three_terms, two_terms,
+            three_terms, one_term,
             "the default term moved the capacity on the {:?} arm",
-            two_terms.source
+            one_term.source
         );
 
         app.capacity_modulation = Modulation {
@@ -667,24 +677,24 @@ fn the_modulation_term_is_the_identity_by_default_and_only_ever_lowers() {
         };
         assert_eq!(
             app.capacity(),
-            two_terms,
+            one_term,
             "a ceiling above the figure raised the {:?} arm",
-            two_terms.source
+            one_term.source
         );
 
         app.capacity_modulation = Modulation {
-            gpu_ceiling: Some(two_terms.gpu_bytes / 2),
+            gpu_ceiling: Some(one_term.gpu_bytes / 2),
             host_ceiling: Some(1 << 20),
         };
         let lowered = app.capacity();
-        assert_eq!(lowered.gpu_bytes, two_terms.gpu_bytes / 2);
+        assert_eq!(lowered.gpu_bytes, one_term.gpu_bytes / 2);
         assert_eq!(
             lowered.host_bytes,
-            two_terms.host_bytes.map(|_| 1 << 20),
+            one_term.host_bytes.map(|_| 1 << 20),
             "a host ceiling holds a host figure down and invents none where there is none"
         );
-        assert_eq!(lowered.source, two_terms.source);
-        assert!(lowered.allowance() < two_terms.allowance());
+        assert_eq!(lowered.source, one_term.source);
+        assert!(lowered.allowance() < one_term.allowance());
     }
 }
 

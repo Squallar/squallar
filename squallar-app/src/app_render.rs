@@ -2182,6 +2182,7 @@ impl super::App {
                     self.linear_memory_watch,
                     &self.budget_readout,
                     squallar_alloc::live_bytes(),
+                    &self.host_recovery,
                 )),
         );
         // What this frame's panes' overlay pictures are sized at, so a
@@ -2224,11 +2225,31 @@ impl super::App {
         // the page's has levers — and the page's is also judged after every
         // picture arrival and every frame's tile puts (`observe_page_heap`),
         // so this tick is the worker's one reading and the page's slowest.
+        let acts_before = self.host_recovery.acts();
         if let Some(heap) = linear {
             self.observe_page_heap(heap.page_bytes, heap.page_max_bytes);
             if let Some(worker) = heap.worker_bytes {
                 self.observe_worker_heap(worker, heap.worker_max_bytes);
             }
+        }
+        // **And the other direction, last**, on the same reading and after
+        // the watermark has had it.
+        //
+        // **A tick that demoted does not also bank toward a promotion**, and
+        // the guard is a count rather than the order alone: the reading that
+        // caused the step is a pressure reading by definition, and the
+        // arithmetic would otherwise bank it the moment the step it just took
+        // made a further promotion free. `squeeze` empties the bank; this is
+        // what stops the same tick refilling it.
+        //
+        // `linear` and not `self.page_heap_reading` — the tick's own answer,
+        // so a bridge that stopped answering does not advance a dwell
+        // ([`Self::observe_host_recovery`]). The scene is the one
+        // `refresh_budget_readout` already walked; what a scene SHOWS is not
+        // a function of the budgets, so the watermark above cannot have moved
+        // it.
+        if self.host_recovery.acts() == acts_before {
+            self.observe_host_recovery(linear, &scene);
         }
     }
 
@@ -4990,7 +5011,7 @@ impl super::App {
         // keep their working set — their own floor — and hold no history.
         // The rung rides along untouched; it is the ladder's, not the
         // economy's.
-        if self.tile_economy_squeezed {
+        if self.host_recovery.is_squeezed() {
             self.tile_cache_budget = squallar_device_profile::budget::TileCacheBudget {
                 styled_bytes: 0,
                 parsed_bytes: 0,
@@ -5313,8 +5334,11 @@ impl super::App {
         // what a shorter history frees on the page is the decoded volumes
         // no live frame names, and that set is known only once the pool has
         // been re-planned.
-        let tile_economy_bytes = if cause.is_page_heap() && !self.tile_economy_squeezed {
-            self.tile_economy_squeezed = true;
+        // Counted on the 0 -> 1 edge of the recovery's level, and the level
+        // is stepped by the re-fit below: a second event finds them already
+        // given, and a level that has stepped back down gives them back to
+        // the next loop walk without an event of any kind.
+        let tile_economy_bytes = if cause.is_page_heap() && !self.host_recovery.is_squeezed() {
             let held = self.tile_cache_budget;
             held.styled_bytes + held.parsed_bytes + held.terrain_bytes
         } else {
@@ -5384,11 +5408,21 @@ impl super::App {
     /// allowing three quarters of *that* would compound the step to 0.675 on
     /// every event.
     ///
-    /// **Two walls, two presumptions.** A page-heap event lowers the host
-    /// figure and nothing else: the page's watermark says nothing about the
-    /// card, and a GPU rung shed for it would cost the loop its history for
-    /// a byte the page never gets back. Every other cause lowers the GPU
-    /// figure, as before, and leaves the host's where it stands.
+    /// **Two walls, two terms, and only one of them latches.** A page-heap
+    /// event lowers the host figure and nothing else: the page's watermark
+    /// says nothing about the card, and a GPU rung shed for it would cost the
+    /// loop its history for a byte the page never gets back. Every other
+    /// cause lowers the GPU figure, as before, and leaves the host's where it
+    /// stands.
+    ///
+    /// The host figure is a **modulation** ([`crate::recovery`]) where the
+    /// GPU's is a session presumption, and that asymmetry is the point rather
+    /// than an inconsistency. Both are a `min` against the capacity, so a
+    /// latch left beside the modulation would clamp everything the recovery
+    /// lifts and the whole of it would be a silent no-op. There is a figure
+    /// that observes a page heap coming back — this instance's own allocator
+    /// — and there is none that observes a card's, so the host side can be
+    /// re-derived and the GPU side cannot.
     ///
     /// **The GPU decay has a floor: what the ladder's floor rung needs for
     /// this scene.** The step is geometric — seven events halve the figure,
@@ -5402,10 +5436,14 @@ impl super::App {
     /// exceeds the capacity holds the presumption rather than raising it.
     ///
     /// **Beside the high-water mark, the figure that can fall.** The host
-    /// arm's `observed` is `byteLength`, which only grows; the same lines
-    /// now print this instance's live bytes (`squallar_alloc::live_bytes`)
-    /// beside it — logged, and not yet acted on. `0` there is an instance
-    /// that never installed the counter.
+    /// arm's `observed` is still `byteLength`, which only grows, and that is
+    /// deliberate: this is the DEMOTION path, where the conservative reading
+    /// is the right one and the arithmetic is pinned. The figure that can
+    /// fall — this instance's live bytes (`squallar_alloc::live_bytes`),
+    /// printed beside it here — is consumed by the promotion path instead
+    /// ([`Self::observe_host_recovery`]), which is what releases the step
+    /// this one takes. `0` there is an instance that never installed the
+    /// counter.
     fn refit_under_pressure(&mut self, cause: crate::pressure::Pressure) -> u32 {
         const MIB: u64 = 1024 * 1024;
         let cap = self.capacity();
@@ -5413,18 +5451,6 @@ impl super::App {
         let live = squallar_alloc::live_bytes().unwrap_or(0) / MIB;
         let mut beside = format!("live {live} MiB");
         let lowered = if cause.is_page_heap() {
-            // A bracket with no host figure has nothing to hold down: the
-            // economy went, the rung stands, and the log says why.
-            let Some(host) = cap.host_bytes else {
-                log::info!(
-                    "Budgets: held at rung {} after {}: no host figure on the {} bracket to \
-                     presume lower",
-                    self.budgets.steps_back,
-                    cause.label(),
-                    self.budgets.name,
-                );
-                return self.budgets.steps_back;
-            };
             // **Lowered from the mark, not from the constant.** The scene's
             // host need is the tile working set and the picture batch, and
             // those are a minority of what a page holds: the module's own
@@ -5443,11 +5469,32 @@ impl super::App {
             // the whole heap rather than the part this crate can name. Each
             // event lowers it again from the newer, higher mark, so the
             // ladder converges instead of stalling.
-            let observed = cause.page_heap_used().unwrap_or(host);
+            //
+            // **The step is taken whether or not there is a ceiling to
+            // write.** The tile economies go on every page-heap event, and
+            // what holds them at nothing is the recovery's LEVEL, not the
+            // ceiling; a bracket with no host figure would otherwise take the
+            // event and squeeze nothing. `is_page_heap()` guarantees the mark
+            // is there, and `u64::MAX` makes the `min` a no-op if ever it were
+            // not.
+            let observed = cause.page_heap_used().unwrap_or(u64::MAX);
             beside = format!("page heap mark {} MiB, {beside}", observed / MIB);
-            let host = host.min(observed) / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0;
-            self.session_host_capacity = Some(host);
-            host
+            let ceiling = self.host_recovery.squeeze(cap.host_bytes, observed);
+            self.capacity_modulation.host_ceiling = ceiling;
+            // A bracket with no host figure has nothing to hold down: the
+            // economy went, the rung stands, and the log says why.
+            let Some(ceiling) = ceiling else {
+                log::info!(
+                    "Budgets: held at rung {} after {}: no host figure on the {} bracket to \
+                     presume lower; economies squeezed at level {}",
+                    self.budgets.steps_back,
+                    cause.label(),
+                    self.budgets.name,
+                    self.host_recovery.level(),
+                );
+                return self.budgets.steps_back;
+            };
+            ceiling
         } else {
             let lowered = cap.gpu_bytes / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0;
             let floor = cap
@@ -5493,6 +5540,126 @@ impl super::App {
         self.pending_fit = None;
         self.loop_pool = self.pool_for_scene(&scene);
         self.budgets.steps_back
+    }
+
+    /// **One capacity reading, judged for whether a shed step may come back.**
+    ///
+    /// The counterpart to [`Self::refit_under_pressure`], and the only thing
+    /// that ever raises a figure in the capacity chain. Demotion is immediate
+    /// and this is not: a step is released only when the margin has held for
+    /// [`crate::recovery::HostRecovery::dwell`] successive readings, because
+    /// a bare "un-shed when it fits" was measured to oscillate — an Android
+    /// emulator leg with the host allowance at about the scene's need toggled
+    /// `steps 0` and `steps 1` on consecutive two-second ticks, re-rasterising
+    /// every picture at 150 % and then 125 % each time.
+    ///
+    /// # What "one reading" means, and how a fresh one is told from a repeat
+    ///
+    /// `reading` is the answer the bridge gave **on this tick**, handed in
+    /// rather than read back off [`Self::page_heap_reading`], which keeps the
+    /// last answer when a reader stops answering. A tick the bridge said
+    /// nothing on returns here without touching the dwell, so a dead
+    /// instrument cannot promote by standing still. The falling figure the
+    /// margin is judged on rides inside that same answer
+    /// (`crate::platform::LinearMemory::page_live_bytes`) instead of being
+    /// fetched from a global at the point of use, for the same reason.
+    ///
+    /// **Identity of value is not the test and could not be.** A page that is
+    /// genuinely idle reports the same figures twice, and a rule that refused
+    /// to count a repeat would refuse to recover exactly where recovery is
+    /// safest. What is required is that the observation was taken now, not
+    /// that it differs from the last one.
+    ///
+    /// # The margin, and why every term is the PROMOTED rung's
+    ///
+    /// `fit` is asked what it would answer against the capacity one step of
+    /// ceiling higher, and the scene is priced at that answer: the question
+    /// is "would this still be comfortable once the step is taken", never "is
+    /// it comfortable now". The room the model's spare is bounded by is the
+    /// watermark's own action line for the promoted batch less this
+    /// instance's live bytes — so the test is literally whether the watermark
+    /// would be in `Act` the instant after promoting, decided by the same
+    /// arithmetic that decides demotion.
+    ///
+    /// **`max - byteLength` is deliberately not among the bounds**, though
+    /// `host_spare_bytes` uses it for the readout. It is the monotone term: a
+    /// page that once touched 1011 of 1024 MiB has thirteen MiB of wall room
+    /// for the rest of its life and could never promote however much it
+    /// freed, which is the very ratchet this path exists to break. The cost
+    /// of leaving it out is stated in [`crate::recovery::walled_room_after`],
+    /// along with the premise it rests on that has not been measured on a
+    /// browser.
+    ///
+    /// Nothing is adopted here. The ceiling lifts and
+    /// [`Self::refit_to_scene`] gives the rung back on a later loop walk, on
+    /// its own dwell — the ladder is computed live from scene and capacity
+    /// and has never needed a counter of its own.
+    pub(super) fn observe_host_recovery(
+        &mut self,
+        reading: Option<crate::platform::LinearMemory>,
+        scene: &Scene,
+    ) {
+        use squallar_device_profile::fit::need_terms;
+
+        if !self.host_recovery.is_squeezed() {
+            return;
+        }
+        // A tick the bridge did not answer on is not a reading: the dwell
+        // neither advances nor resets.
+        let Some(heap) = reading else {
+            return;
+        };
+        let Some(live) = heap.page_live_bytes else {
+            return;
+        };
+        let mut released = self.capacity_modulation;
+        released.host_ceiling = self.host_recovery.ceiling_after_promotion();
+        let cap = crate::app::capacity_with_probe(&self.device_profile, self.gpu_probe.bytes())
+            .held_to(self.session_capacity)
+            .modulated_by(released);
+        let Some(allowance_after) = cap.host_allowance() else {
+            return;
+        };
+        let wanted = fit(scene, &self.device_profile, &cap, GRID_BYTES);
+        let terms = need_terms(scene, &wanted, GRID_BYTES);
+        let headroom_after = terms
+            .pictures_host
+            .saturating_add(terms.picture_arrival_host);
+        let room_after = if heap.page_max_bytes > 0 {
+            crate::recovery::walled_room_after(heap.page_max_bytes, headroom_after, live)
+        } else {
+            allowance_after.saturating_sub(live)
+        };
+        let qualified = crate::recovery::promotion_qualifies(
+            need(scene, &self.budgets, GRID_BYTES).host_bytes,
+            need(scene, &wanted, GRID_BYTES).host_bytes,
+            allowance_after,
+            Some(room_after),
+        );
+        if !self.host_recovery.observe(qualified) {
+            return;
+        }
+        self.capacity_modulation.host_ceiling = self.host_recovery.ceiling();
+        log::info!(
+            "Budgets: host ceiling released to {} MiB after {} readings of margin: live {} MiB \
+             against {} MiB of room for a {} MiB step; {} steps still held, {} promotions, \
+             {} undone within {} readings",
+            self.capacity_modulation
+                .host_ceiling
+                .map_or(cap.host_bytes.unwrap_or(0), |ceiling| ceiling)
+                / (1024 * 1024),
+            self.host_recovery.dwell(),
+            live / (1024 * 1024),
+            room_after / (1024 * 1024),
+            need(scene, &wanted, GRID_BYTES)
+                .host_bytes
+                .saturating_sub(need(scene, &self.budgets, GRID_BYTES).host_bytes)
+                / (1024 * 1024),
+            self.host_recovery.level(),
+            self.host_recovery.promotions(),
+            self.host_recovery.churn(),
+            crate::recovery::HOST_RECOVERY_CHURN_READINGS,
+        );
     }
 
     /// **One raster per loop frame of a non-radar layer that has none** — the

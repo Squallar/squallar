@@ -161,6 +161,19 @@ pub(crate) fn capacity_source_word(source: CapacitySource) -> &'static str {
 /// is what it last said beside its `linear` reading, 0 until it has. 0 on the
 /// page is a binary that never installed the counter, not an empty heap.
 ///
+/// **`host steps/promotions/churn` is the recovery governor's always-on
+/// counter set** ([`crate::recovery`]): steps of host ceiling held now,
+/// promotions ever, and **promotions this session's own margin got wrong** —
+/// a squeeze that landed within `HOST_RECOVERY_CHURN_READINGS` readings of a
+/// promotion. The third is the one that matters and the reason the trio is on
+/// this line rather than in a `log::info!`: if the promotion margin is too
+/// lax in the wild, a counter that rides a sentence re-said every telemetry
+/// period is the only thing that will ever say so — every other trace of a
+/// promotion is one line in a console ring that turns over in seconds. Three
+/// fixed-width fields, so they ride in FRONT of the pane group per the rule
+/// below, and behind `heap max` so the rig's unanchored positional probe
+/// (which ends at `balloon`) cannot see them either way.
+///
 /// **The ordering rule for everything appended here: fixed-width fields
 /// first, the variable-arity group LAST.** Anything positioned *behind* a
 /// group whose length varies is what a positional reader cannot find — with
@@ -196,6 +209,7 @@ pub(crate) fn budget_state_line(
     page_heap: crate::pressure::LinearMemoryWatch,
     readout: &squallar_egui::shell_api::BudgetReadout,
     page_live_bytes: Option<u64>,
+    host_recovery: &crate::recovery::HostRecovery,
 ) -> String {
     use std::fmt::Write as _;
 
@@ -214,7 +228,8 @@ pub(crate) fn budget_state_line(
         "budget state: bracket {}, rung {rung}, steps {}, pool {} MiB, ceiling {} MiB, \
          vram {} MiB, ram {} MiB, declared {} MiB, threads {}, form {form}, \
          linear {}/{} MiB, cap {} {}, probe {}, balloon {} MiB, \
-         page heap acts {} at {} MiB, heap max {}/{} MiB",
+         page heap acts {} at {} MiB, heap max {}/{} MiB, \
+         host steps {} promotions {} churn {}",
         budgets.name,
         budgets.steps_back,
         mib(pool_bytes as u64),
@@ -233,6 +248,9 @@ pub(crate) fn budget_state_line(
         mib(page_heap.last_acted_at().unwrap_or(0)),
         mib(linear.map_or(0, |l| l.page_max_bytes)),
         mib(linear.map_or(0, |l| l.worker_max_bytes)),
+        host_recovery.level(),
+        host_recovery.promotions(),
+        host_recovery.churn(),
     );
     // **Fixed-width fields first, the variable-arity group last.** See the
     // note on this function: everything BEHIND a variable group is what a
@@ -549,6 +567,7 @@ mod tests {
             worker_bytes: Some(700 << 20),
             worker_max_bytes: 1100 << 20,
             worker_live_bytes: Some(600 << 20),
+            page_live_bytes: None,
         });
         (budgets, profile, linear)
     }
@@ -573,11 +592,13 @@ mod tests {
                 WATCH,
                 &no_readout(),
                 LIVE,
+                &crate::recovery::HostRecovery::untouched(),
             ),
             "budget state: bracket desktop, rung 1, steps 3, pool 3072 MiB, \
              ceiling 3840 MiB, vram 24576 MiB, ram 65536 MiB, declared 8192 MiB, \
              threads 32, form 2, linear 300/700 MiB, cap 5120 3, probe 5, \
              balloon 7 MiB, page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
+             host steps 0 promotions 0 churn 0, \
              spare gpu none host none, live 250/600 MiB",
         );
         // The figure follows the pool it is handed, not a field of the budgets.
@@ -593,6 +614,7 @@ mod tests {
                 WATCH,
                 &no_readout(),
                 LIVE,
+                &crate::recovery::HostRecovery::untouched(),
             )
             .contains(", pool 576 MiB,"),
         );
@@ -610,10 +632,12 @@ mod tests {
                 WATCH,
                 &no_readout(),
                 LIVE,
+                &crate::recovery::HostRecovery::untouched(),
             )
             .ends_with(
                 ", probe 5, balloon 0 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB, spare gpu none host none, \
+                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, \
+                 spare gpu none host none, \
                  live 250/600 MiB"
             ),
         );
@@ -632,10 +656,12 @@ mod tests {
                 WATCH,
                 &no_readout(),
                 LIVE,
+                &crate::recovery::HostRecovery::untouched(),
             )
             .ends_with(
                 ", cap 24576 2, probe 0, balloon 7 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB, spare gpu none host none, \
+                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, \
+                 spare gpu none host none, \
                  live 250/600 MiB"
             ),
         );
@@ -652,10 +678,12 @@ mod tests {
                 WATCH,
                 &no_readout(),
                 LIVE,
+                &crate::recovery::HostRecovery::untouched(),
             )
             .ends_with(
                 ", cap 3456 0, probe 1, balloon 7 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB, spare gpu none host none, \
+                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, \
+                 spare gpu none host none, \
                  live 250/600 MiB"
             ),
         );
@@ -735,6 +763,7 @@ mod tests {
             WATCH,
             &no_readout(),
             None,
+            &crate::recovery::HostRecovery::untouched(),
         );
         let (_, tail) = line
             .split_once(", vram ")
@@ -743,13 +772,16 @@ mod tests {
             tail,
             "0 MiB, ram 0 MiB, declared 0 MiB, threads 0, form 0, linear 0/0 MiB, \
              cap 3840 0, probe 0, balloon 0 MiB, page heap acts 0 at 0 MiB, \
-             heap max 0/0 MiB, spare gpu none host none, live 0/0 MiB",
+             heap max 0/0 MiB, host steps 0 promotions 0 churn 0, \
+             spare gpu none host none, live 0/0 MiB",
         );
         assert_eq!(
             line.matches(", ").count(),
-            17,
-            "eighteen comma-separated groups with no pane rows, seventeen separators: a \
-             field was dropped or gained",
+            18,
+            "nineteen comma-separated groups with no pane rows, eighteen separators: a \
+             field was dropped or gained. It was seventeen until the recovery \
+             governor's `host steps N promotions N churn N` landed, which is ONE \
+             group of three space-separated figures and so moves this by one",
         );
     }
 
@@ -793,6 +825,7 @@ mod tests {
             WATCH,
             &no_readout(),
             LIVE,
+            &crate::recovery::HostRecovery::untouched(),
         );
         let read_by_the_rig = rendered(&pattern("budget_state_re"), &DISTINCT_GROUPS);
         assert!(
@@ -802,7 +835,8 @@ mod tests {
         );
         assert_eq!(
             &line[read_by_the_rig.len()..],
-            ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, spare gpu none host none, \
+            ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
+             host steps 0 promotions 0 churn 0, spare gpu none host none, \
              live 250/600 MiB",
             "the tail the rig does not read drifted",
         );
@@ -832,6 +866,7 @@ mod tests {
             WATCH,
             &two_pane_readout(),
             LIVE,
+            &crate::recovery::HostRecovery::untouched(),
         );
         assert!(
             line.starts_with(&read_by_the_rig),
@@ -840,6 +875,7 @@ mod tests {
         assert_eq!(
             &line[read_by_the_rig.len()..],
             ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
+             host steps 0 promotions 0 churn 0, \
              spare gpu 3568 MiB host 601 MiB, live 250/600 MiB, \
              pane0 gpu 272 MiB host 0 MiB shared 0 MiB own 272 MiB, \
              pane1 gpu 33 MiB host 41 MiB shared 16 MiB own 17 MiB",
@@ -859,7 +895,17 @@ mod tests {
                 ..two_pane_readout()
             };
             let line = budget_state_line(
-                &budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH, &readout, LIVE,
+                &budgets,
+                &profile,
+                linear,
+                POOL,
+                BALLOON,
+                &CAP,
+                PROBE,
+                WATCH,
+                &readout,
+                LIVE,
+                &crate::recovery::HostRecovery::untouched(),
             );
             let (fixed, _) = line.split_once(", pane0 ").unwrap_or((line.as_str(), ""));
             assert!(
@@ -884,7 +930,17 @@ mod tests {
         };
         assert!(
             budget_state_line(
-                &budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH, &exhausted, LIVE,
+                &budgets,
+                &profile,
+                linear,
+                POOL,
+                BALLOON,
+                &CAP,
+                PROBE,
+                WATCH,
+                &exhausted,
+                LIVE,
+                &crate::recovery::HostRecovery::untouched(),
             )
             .ends_with(", spare gpu 0 MiB host none, live 250/600 MiB"),
         );
@@ -907,6 +963,7 @@ mod tests {
                 WATCH,
                 &no_readout(),
                 LIVE,
+                &crate::recovery::HostRecovery::untouched(),
             )
             .starts_with(&good)
         );
@@ -924,6 +981,7 @@ mod tests {
                 WATCH,
                 &no_readout(),
                 LIVE,
+                &crate::recovery::HostRecovery::untouched(),
             )
             .starts_with(&drifted),
             "a line with one extra space compared equal to the real one, so the \
@@ -963,10 +1021,12 @@ mod tests {
             WATCH,
             &no_readout(),
             None,
+            &crate::recovery::HostRecovery::untouched(),
         );
         assert!(
             never.ends_with(
-                ", page heap acts 0 at 0 MiB, heap max 0/0 MiB, spare gpu none host none, \
+                ", page heap acts 0 at 0 MiB, heap max 0/0 MiB, \
+                 host steps 0 promotions 0 churn 0, spare gpu none host none, \
                  live 0/0 MiB"
             ),
             "a watch that never acted must still print its zero: {never}",
@@ -995,10 +1055,12 @@ mod tests {
             watch,
             &no_readout(),
             None,
+            &crate::recovery::HostRecovery::untouched(),
         );
         assert!(
             acted.ends_with(
-                ", page heap acts 2 at 1011 MiB, heap max 0/0 MiB, spare gpu none host none, \
+                ", page heap acts 2 at 1011 MiB, heap max 0/0 MiB, \
+                 host steps 0 promotions 0 churn 0, spare gpu none host none, \
                  live 0/0 MiB"
             ),
             "the act count and the mark are not both on the line: {acted}",
@@ -1012,6 +1074,59 @@ mod tests {
         assert!(
             rig.contains(r"probe (\d+), balloon (\d+) MiB/;"),
             "the rig's `budget_state_re` no longer ends unanchored at              `balloon`: a trailing field is only safe while it does",
+        );
+    }
+
+    /// **The recovery governor's three counters are on the line, each in its
+    /// own position, and `churn` is the one that matters.**
+    ///
+    /// `host steps` is what is held now, `promotions` is what has been given
+    /// back ever, and `churn` is **promotions this session's own margin got
+    /// wrong** — a squeeze that landed within `HOST_RECOVERY_CHURN_READINGS`
+    /// readings of a promotion. If `HOST_RECOVERY_MARGIN_DELTAS` is too lax
+    /// in the wild, that third figure is the only thing that will ever say
+    /// so: every other trace of a promotion is one `log::info!` in a console
+    /// ring that turns over in seconds, and the rig reads the last sixty
+    /// entries. This line is re-said every telemetry period, so the last tick
+    /// of any leg answers it.
+    ///
+    /// Three DISTINCT values, because a trio pinned at `0 0 0` cannot tell a
+    /// field that reads the wrong counter from one that reads the right one.
+    #[test]
+    fn the_budget_line_carries_the_recoverys_steps_promotions_and_churn() {
+        let profile = DeviceProfile::for_target();
+        let budgets = resolve(&profile);
+        let mut recovery = crate::recovery::HostRecovery::untouched();
+        // Two squeezes, a promotion the second undoes at once (churn), then a
+        // third squeeze: two steps held, one promotion, one churn.
+        recovery.squeeze(Some(1 << 30), 900 << 20);
+        for _ in 0..recovery.dwell() {
+            recovery.observe(true);
+        }
+        assert_eq!(recovery.level(), 0);
+        recovery.squeeze(Some(1 << 30), 900 << 20);
+        recovery.squeeze(Some(900 << 20), 800 << 20);
+        assert_eq!(
+            (recovery.level(), recovery.promotions(), recovery.churn()),
+            (2, 1, 1),
+            "the fixture no longer carries three distinct figures",
+        );
+        let line = budget_state_line(
+            &budgets,
+            &profile,
+            None,
+            POOL,
+            BALLOON,
+            &CAP,
+            PROBE,
+            WATCH,
+            &no_readout(),
+            None,
+            &recovery,
+        );
+        assert!(
+            line.contains(", host steps 2 promotions 1 churn 1,"),
+            "the recovery counters are not on the line, or not in that order: {line}",
         );
     }
 

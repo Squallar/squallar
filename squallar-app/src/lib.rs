@@ -40,6 +40,8 @@ pub mod platform;
 pub(crate) mod platform_double;
 /// Why memory is being asked back, and the one line that says what was given.
 pub mod pressure;
+/// How a shed rung comes back: the dwell and margin that release it.
+pub mod recovery;
 pub mod render_dispatch;
 pub mod render_key;
 pub mod site_catalogue;

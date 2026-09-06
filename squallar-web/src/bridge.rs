@@ -169,6 +169,12 @@ impl PlatformBridge for WebPlatform {
             page_max_bytes: crate::heap_max::this_instance().unwrap_or(0),
             worker_bytes: crate::worker_port::worker_memory_bytes(),
             worker_live_bytes: crate::worker_port::worker_live_bytes(),
+            // This instance's own counter, read here rather than by the app,
+            // so the one host figure that can FALL arrives inside an answer
+            // the bridge gave on this tick and a governor counting readings
+            // cannot advance on a re-published one
+            // (`squallar_app::platform::LinearMemory::page_live_bytes`).
+            page_live_bytes: squallar_alloc::live_bytes(),
             // What the worker reported on its hello where it has said, else
             // what this page asked for it. A zero is "nobody said", which the
             // watermark spells `Quiet` rather than guessing a wall.

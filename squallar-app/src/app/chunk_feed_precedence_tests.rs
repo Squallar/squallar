@@ -2272,6 +2272,7 @@ fn worker_heap(worker_mib: u64) -> crate::platform::LinearMemory {
         worker_bytes: Some(worker_mib * MIB),
         worker_max_bytes: WEB_HEAP_MAX,
         worker_live_bytes: None,
+        page_live_bytes: None,
     }
 }
 
@@ -2297,7 +2298,7 @@ fn a_heap_watermark_at_the_act_line_evicts_economy_and_lowers_the_presumption_on
     seed_render_cache(&mut app);
     assert_eq!(app.budgets.steps_back, 0);
     assert_eq!(app.session_capacity, None);
-    assert_eq!(app.session_host_capacity, None);
+    assert_eq!(app.capacity_modulation.host_ceiling, None);
 
     tick(&mut app);
 
@@ -2305,14 +2306,19 @@ fn a_heap_watermark_at_the_act_line_evicts_economy_and_lowers_the_presumption_on
         app.session_capacity, None,
         "a worker heap reading lowered the card's presumption",
     );
+    // The page's host figure moved from a session presumption to the
+    // recovery's modulation ceiling (`crate::recovery`), which is the same
+    // clamp on the same chain and the only one that can lift again. What is
+    // asserted about a worker reading is unchanged: it moves neither.
     assert_eq!(
-        app.session_host_capacity, None,
-        "a worker heap reading lowered the page's presumption",
+        app.capacity_modulation.host_ceiling, None,
+        "a worker heap reading lowered the page's host ceiling",
     );
     assert!(
-        !app.tile_economy_squeezed,
+        !app.host_recovery.is_squeezed(),
         "a worker heap reading squeezed the page's tile economy",
     );
+    assert_eq!(app.host_recovery.acts(), 0);
     assert_eq!(app.budgets.steps_back, 0);
     assert_eq!(
         app.render.render_cache.entry_count(),
@@ -2347,7 +2353,7 @@ fn a_heap_watermark_at_the_act_line_evicts_economy_and_lowers_the_presumption_on
 /// the mark. The host presumption does not move, and that is the bracket's
 /// doing rather than the event's: the headless bridge resolves the host's
 /// desktop bracket, which carries no host figure, so there is nothing to
-/// hold down — `a_page_heap_event_lowers_the_host_presumption_on_the_wasm_bracket`
+/// hold down — `a_page_heap_event_lowers_the_host_ceiling_on_the_wasm_bracket`
 /// is the arm where there is. The card's presumption is never touched by
 /// a page-heap event.
 #[test]
@@ -2365,6 +2371,7 @@ fn a_heap_that_grows_past_the_refire_step_acts_again() {
             worker_bytes: Some(50 * MIB),
             worker_max_bytes: WEB_HEAP_MAX,
             worker_live_bytes: None,
+            page_live_bytes: None,
         })
     };
     gauge.set(page(891 * MIB));
@@ -2379,7 +2386,7 @@ fn a_heap_that_grows_past_the_refire_step_acts_again() {
     tick(&mut app);
     assert_eq!(app.linear_memory_watch.last_acted_at(), Some(891 * MIB));
     assert!(
-        app.tile_economy_squeezed,
+        app.host_recovery.is_squeezed(),
         "the first page-heap action did not squeeze"
     );
     assert_eq!(app.render.render_cache.entry_count(), 0);
@@ -2387,7 +2394,10 @@ fn a_heap_that_grows_past_the_refire_step_acts_again() {
         app.session_capacity, None,
         "a page-heap event lowered the card's presumption"
     );
-    assert_eq!(app.session_host_capacity, None);
+    // A bracket with no host figure has nothing to hold down, so the ceiling
+    // stays absent even though the level is up: the economy squeeze is the
+    // whole of what this arm's event bought.
+    assert_eq!(app.capacity_modulation.host_ceiling, None);
     assert_eq!(app.worker_memory_watch.last_acted_at(), None);
 
     seed_render_cache(&mut app);
@@ -2432,8 +2442,17 @@ fn a_heap_that_grows_past_the_refire_step_acts_again() {
 /// The headless scene shows no picture, so its headroom is zero and the
 /// action line is the percentage line — the same 891 MiB the fixed line
 /// pinned. Nothing is written to the store.
+///
+/// **Renamed from `..._lowers_the_host_presumption_...`, and every figure in
+/// it is unchanged.** The host figure moved from a latched session
+/// presumption to the recovery governor's modulation ceiling
+/// (`crate::recovery`) — the same `min` on the same chain, and the only term
+/// that can lift again — so `session_host_capacity` became
+/// `capacity_modulation.host_ceiling` and the word in the name went with it.
+/// 840,853,089 and 756,767,772 are the same two bytes figures this pin
+/// carried before; a latch was replaced, not an arithmetic.
 #[test]
-fn a_page_heap_event_lowers_the_host_presumption_on_the_wasm_bracket() {
+fn a_page_heap_event_lowers_the_host_ceiling_on_the_wasm_bracket() {
     use squallar_device_profile::budget::BudgetLimits;
     use squallar_device_profile::linear_memory::LINEAR_MEMORY_REFIRE_STEP_BYTES;
     use squallar_kv::KvStore;
@@ -2448,6 +2467,7 @@ fn a_page_heap_event_lowers_the_host_presumption_on_the_wasm_bracket() {
             worker_bytes: None,
             worker_max_bytes: 0,
             worker_live_bytes: None,
+            page_live_bytes: None,
         })
     };
     let mut app = headless(platform);
@@ -2476,7 +2496,7 @@ fn a_page_heap_event_lowers_the_host_presumption_on_the_wasm_bracket() {
     // 891 MiB read, not nine tenths of the declared GiB.
     gauge.set(page(891 * MIB));
     tick(&mut app);
-    assert_eq!(app.session_host_capacity, Some(840_853_089));
+    assert_eq!(app.capacity_modulation.host_ceiling, Some(840_853_089));
     assert_eq!(
         app.session_capacity, None,
         "the card's presumption moved for the page's heap"
@@ -2486,7 +2506,8 @@ fn a_page_heap_event_lowers_the_host_presumption_on_the_wasm_bracket() {
         app.capacity().gpu_bytes,
         before.app_texture_ceiling_bytes as u64
     );
-    assert!(app.tile_economy_squeezed);
+    assert!(app.host_recovery.is_squeezed());
+    assert_eq!(app.host_recovery.level(), 1);
     let _ = app.observe_loop_demand();
     assert_eq!(
         app.tile_cache_budget,
@@ -2505,8 +2526,13 @@ fn a_page_heap_event_lowers_the_host_presumption_on_the_wasm_bracket() {
 
     gauge.set(page(891 * MIB + LINEAR_MEMORY_REFIRE_STEP_BYTES));
     tick(&mut app);
-    assert_eq!(app.session_host_capacity, Some(756_767_772));
+    assert_eq!(app.capacity_modulation.host_ceiling, Some(756_767_772));
     assert_eq!(app.session_capacity, None);
+    assert_eq!(
+        app.host_recovery.level(),
+        2,
+        "the second event stacked a step the first one could not release",
+    );
 
     assert_eq!(store.load(crate::budget_memo::BUDGET_MEMO_KEY), None);
     assert_eq!(store.load(crate::loop_pool::LOOP_POOL_KEY), None);
@@ -2615,6 +2641,302 @@ fn the_rung_is_the_same_however_many_pictures_are_resident() {
         scene_with_one.panes[0].overlay_pictures, 13,
         "the priced count is the thirteen layers the pane shows, not the one \
          picture that had reached the heap",
+    );
+}
+
+/// **A scene of eleven whole-picture overlays on a wasm bracket** — the
+/// `huge` leg's own pane and picture size — built so that a page-heap event
+/// has a rung to shed and a recovery has one to give back. Returns the app
+/// with the pictures recorded and one loop walk taken.
+///
+/// **MRMS and GMGSI are deliberately not among them, and the reason is a
+/// measurement.** Those two are the gridded sources, and their source budgets
+/// alone price 694,870,912 B of host need — so the leg's full thirteen cost
+/// 954,512,560 B against the wasm bracket's 805,306,368 B allowance, and that
+/// scene does not hold its whole pan margin at ANY capacity this bracket can
+/// offer. `fit` is right to keep it at the floor rung and a promotion rule is
+/// right to refuse it. Including them here would make these tests assert that
+/// the recovery does nothing, which is true of that scene and says nothing
+/// about the rule.
+fn an_eleven_picture_web_app(platform: TestBridge) -> App {
+    use squallar_device_profile::budget::BudgetLimits;
+
+    let shown = [
+        squallar_source::id::known::NWS_ALERTS,
+        squallar_source::id::known::STORM_REPORTS,
+        squallar_source::id::known::SPC_OUTLOOK,
+        squallar_source::id::known::SPC_FIRE_OUTLOOK,
+        squallar_source::id::known::SPC_DISCUSSIONS,
+        squallar_source::id::known::LIGHTNING,
+        squallar_source::id::known::METAR,
+        squallar_source::id::known::CITY_LABELS,
+        squallar_source::id::known::RADAR_SITES,
+        squallar_source::id::known::RADAR_COVERAGE,
+    ];
+    let plan = crate::app::fetch::OverlayRenderRequest {
+        geo_bounds: squallar_geo::GeoBounds {
+            min_lat: 33.0,
+            max_lat: 37.0,
+            min_lon: -99.0,
+            max_lon: -96.0,
+        },
+        texture: squallar_egui::overlay_cache::OverlayTexturePlan {
+            width: 4317,
+            height: 2416,
+            overdraw: 0.5,
+            pixels_per_point: 1.0,
+            pane_px: [2878, 1611],
+        },
+        data_generation: 1,
+        zoom: 32,
+    };
+
+    let mut app = headless(platform);
+    app.device_profile.limits = BudgetLimits::WASM;
+    app.adopt_budgets(squallar_device_profile::budget::resolve(
+        &app.device_profile,
+    ));
+    let pane = app
+        .gui
+        .pane_mut(0)
+        .expect("the headless app lays out a pane");
+    for id in &shown {
+        pane.set_overlay_enabled(id.clone(), true);
+        let _ = pane.overlay_cache_mut(id);
+    }
+    for id in &shown {
+        app.render.record_overlay_dispatch(0, id, plan.clone());
+    }
+    let _ = app.observe_loop_demand();
+    app
+}
+
+/// A page reading with `page_bytes` of `byteLength` and `live` of live bytes,
+/// on the desktop wall. The two are separate arguments because the whole of
+/// the recovery rule turns on their being different figures: `byteLength`
+/// only grows and live bytes fall.
+fn page_and_live(page_bytes: u64, live: Option<u64>) -> Option<crate::platform::LinearMemory> {
+    Some(crate::platform::LinearMemory {
+        page_bytes,
+        page_max_bytes: WEB_HEAP_MAX,
+        worker_bytes: None,
+        worker_max_bytes: 0,
+        worker_live_bytes: None,
+        page_live_bytes: live,
+    })
+}
+
+/// **The spike, chosen against the scene's own arithmetic.** 620 MiB of
+/// `byteLength` is past the action line the whole rung's batch sets
+/// (1024 MiB less 458,914,368 B, so 586 MiB) and low enough that one economy
+/// fraction of it — 585,105,408 B, allowing 438,829,056 — no longer covers
+/// that batch. So the event acts AND costs exactly one rung: 150 % to 125 %,
+/// 458,914,368 B of pictures down to 318,593,484.
+const SPIKE: u64 = 620 * MIB;
+
+/// A second spike past the action line the SHED rung sets — 1024 MiB less
+/// 318,593,484 B, so 720 MiB — and more than one refire step above the first.
+const DEEPER_SPIKE: u64 = 760 * MIB;
+
+/// Live bytes while the page is really full, and after it has come back. The
+/// promotion threshold on this scene falls at 420 MiB: the released rung's
+/// action line is 614,827,456 B and the margin it must leave is 173,875,316.
+const LIVE_FULL: u64 = 600 * MIB;
+const LIVE_RECOVERED: u64 = 60 * MIB;
+
+/// **THE USER'S COMPLAINT, END TO END: a shed pan margin comes back.**
+///
+/// A page-heap spike sheds the overlay-oversampling rung, which is the margin
+/// a picture is rasterised with beyond the viewport, and before this the rung
+/// stayed shed for the life of the tab — "even the smallest of pans causes
+/// tiles to be re-rendered and nws alerts redrawn", twice, from the user.
+/// Here the spike passes, this instance's live bytes fall, and the rung comes
+/// back: the ceiling lifts on the dwell's reading, the tile economies step up
+/// with it, and the ladder re-fits upward on its own frame dwell with no
+/// counter of its own.
+///
+/// Every figure that decides it is the application's: `byteLength` HOLDS at
+/// its spike for the whole trace, so nothing about this recovery is visible
+/// to the monotone high-water mark, and the promotion is carried entirely by
+/// the falling figure.
+#[test]
+fn a_shed_pan_margin_comes_back_once_live_bytes_fall_and_hold() {
+    let platform = TestBridge::web();
+    let gauge = platform.linear_memory_gauge();
+    let mut app = an_eleven_picture_web_app(platform);
+    let whole = app.budgets.overlay_oversample_percent;
+    assert_eq!(whole, 150, "precondition: the top rung's pan margin");
+    assert!(app.host_headroom_bytes > 0, "precondition: a priced batch");
+
+    // The spike. `byteLength` past the action line the scene's own batch sets.
+    gauge.set(page_and_live(SPIKE, Some(LIVE_FULL)));
+    tick(&mut app);
+    let _ = app.observe_loop_demand();
+    assert_eq!(app.host_recovery.level(), 1, "the spike shed nothing");
+    assert!(
+        app.capacity_modulation.host_ceiling.is_some(),
+        "the ceiling was not written",
+    );
+    let shed = app.budgets.overlay_oversample_percent;
+    assert!(
+        shed < whole,
+        "the spike did not cost the pan margin: {shed} percent",
+    );
+    assert!(
+        app.host_recovery.is_squeezed(),
+        "the tile economies were not squeezed",
+    );
+
+    // The recovery: `byteLength` HOLDS at the spike — the high-water mark
+    // sees nothing at all — and live bytes fall. One reading short of the
+    // dwell gives nothing back.
+    let dwell = app.host_recovery.dwell();
+    gauge.set(page_and_live(SPIKE, Some(LIVE_RECOVERED)));
+    for reading in 1..dwell {
+        tick(&mut app);
+        let _ = app.observe_loop_demand();
+        assert_eq!(
+            app.host_recovery.level(),
+            1,
+            "the ceiling lifted on reading {reading} of a {dwell}-reading dwell",
+        );
+        assert_eq!(app.host_recovery.held(), reading);
+    }
+
+    tick(&mut app);
+    assert_eq!(
+        app.host_recovery.level(),
+        0,
+        "the dwell's reading gave nothing back"
+    );
+    assert_eq!(app.capacity_modulation.host_ceiling, None);
+    assert_eq!(app.host_recovery.promotions(), 1);
+    assert!(
+        !app.host_recovery.is_squeezed(),
+        "the tile economies did not step back up with the ceiling",
+    );
+
+    // And the ladder follows, on `refit_to_scene`'s own frame dwell: the
+    // recovery writes a ceiling and nothing else, and `fit` is asked the same
+    // question against a larger capacity.
+    for _ in 0..squallar_device_profile::constants::LOOP_POOL_DWELL_FRAMES + 1 {
+        let _ = app.observe_loop_demand();
+    }
+    assert_eq!(
+        app.budgets.overlay_oversample_percent, whole,
+        "the pan margin did not come back with the ceiling",
+    );
+    assert!(
+        app.tile_cache_budget.styled_bytes > 0,
+        "the tile economy stayed at nothing"
+    );
+}
+
+/// **DEFENDS AGAINST a frozen instrument promoting by doing nothing.** The
+/// dwell counts capacity READINGS, so a tick the bridge did not answer on
+/// must not count toward one. `App` hands the tick's own answer to the
+/// recovery rather than the remembered `page_heap_reading`, so a reader that
+/// stops answering leaves the bank exactly where it was — neither advanced
+/// nor spent — and a promotion still needs its full count of real
+/// observations.
+///
+/// Value identity is deliberately NOT the test: an idle page reports the same
+/// figures twice, and refusing to count a repeat would refuse to recover
+/// where recovery is safest. What is required is that the observation was
+/// taken now.
+#[test]
+fn a_tick_the_bridge_did_not_answer_on_does_not_advance_the_dwell() {
+    let platform = TestBridge::web();
+    let gauge = platform.linear_memory_gauge();
+    let mut app = an_eleven_picture_web_app(platform);
+
+    gauge.set(page_and_live(SPIKE, Some(LIVE_FULL)));
+    tick(&mut app);
+    let _ = app.observe_loop_demand();
+    assert_eq!(
+        app.host_recovery.level(),
+        1,
+        "precondition: a step to release"
+    );
+
+    // A reading that qualifies, banked.
+    gauge.set(page_and_live(SPIKE, Some(LIVE_RECOVERED)));
+    tick(&mut app);
+    assert_eq!(app.host_recovery.held(), 1);
+
+    // The instrument dies. Fifty ticks with nothing behind them.
+    gauge.set(None);
+    for _ in 0..50 {
+        tick(&mut app);
+    }
+    assert_eq!(
+        app.host_recovery.held(),
+        1,
+        "a tick with no reading behind it advanced the dwell",
+    );
+    assert_eq!(app.host_recovery.level(), 1, "a dead instrument promoted");
+
+    // It comes back. The bank is where it was, and the dwell is still owed
+    // its full count of real observations.
+    gauge.set(page_and_live(SPIKE, Some(LIVE_RECOVERED)));
+    let dwell = app.host_recovery.dwell();
+    for _ in 0..dwell - 2 {
+        tick(&mut app);
+    }
+    assert_eq!(app.host_recovery.level(), 1);
+    tick(&mut app);
+    assert_eq!(app.host_recovery.level(), 0);
+    assert_eq!(app.host_recovery.promotions(), 1);
+}
+
+/// **DEFENDS AGAINST a dwell that slows the response to pressure.** The
+/// recovery is a promotion rule and nothing else: a page-heap event still
+/// takes its step on the tick it lands on, and a session that has banked most
+/// of a dwell loses the bank rather than trading it against the event.
+#[test]
+fn pressure_still_steps_on_the_tick_it_lands_on_however_much_dwell_is_banked() {
+    use squallar_device_profile::linear_memory::LINEAR_MEMORY_REFIRE_STEP_BYTES;
+
+    let platform = TestBridge::web();
+    let gauge = platform.linear_memory_gauge();
+    let mut app = an_eleven_picture_web_app(platform);
+
+    gauge.set(page_and_live(SPIKE, Some(LIVE_FULL)));
+    tick(&mut app);
+    let _ = app.observe_loop_demand();
+    assert_eq!(app.host_recovery.level(), 1);
+    let first = app.capacity_modulation.host_ceiling;
+
+    // Bank one reading short of the dwell.
+    let dwell = app.host_recovery.dwell();
+    gauge.set(page_and_live(SPIKE, Some(LIVE_RECOVERED)));
+    for _ in 0..dwell - 1 {
+        tick(&mut app);
+        let _ = app.observe_loop_demand();
+    }
+    assert_eq!(app.host_recovery.held(), dwell - 1);
+    assert_eq!(app.host_recovery.level(), 1);
+
+    // A second event, on the very next reading: the step is taken at once,
+    // and the bank is gone.
+    const { assert!(DEEPER_SPIKE - SPIKE >= LINEAR_MEMORY_REFIRE_STEP_BYTES) };
+    gauge.set(page_and_live(DEEPER_SPIKE, Some(LIVE_FULL)));
+    tick(&mut app);
+    assert_eq!(app.host_recovery.level(), 2, "the dwell delayed a demotion");
+    assert_eq!(app.host_recovery.acts(), 2);
+    assert_eq!(
+        app.host_recovery.held(),
+        0,
+        "a banked dwell survived an event"
+    );
+    assert!(
+        app.capacity_modulation.host_ceiling < first,
+        "the second event did not lower the ceiling further",
+    );
+    assert_eq!(
+        app.host_recovery.dwell(),
+        dwell * 2,
+        "a repeat squeeze did not lengthen the dwell",
     );
 }
 
@@ -2782,7 +3104,7 @@ fn a_page_at_ninety_percent_with_levers_says_so_and_frees_something() {
          figure the action line is the wall less, and pricing it per pane is \
          what let the `huge` leg trap under a quiet watermark",
     );
-    assert_eq!(app.session_host_capacity, None);
+    assert_eq!(app.capacity_modulation.host_ceiling, None);
     seed_render_cache(&mut app);
     assert_eq!(app.render.render_cache.entry_count(), 1);
     assert!(app.tile_cache_budget.styled_bytes > 0);
@@ -2795,6 +3117,7 @@ fn a_page_at_ninety_percent_with_levers_says_so_and_frees_something() {
         worker_bytes: Some(50 * MIB),
         worker_max_bytes: WEB_HEAP_MAX,
         worker_live_bytes: None,
+        page_live_bytes: None,
     }));
     tick(&mut app);
 
@@ -2815,13 +3138,13 @@ fn a_page_at_ninety_percent_with_levers_says_so_and_frees_something() {
         "the action freed nothing: the render cache still holds its entry",
     );
     assert!(
-        app.tile_economy_squeezed,
+        app.host_recovery.is_squeezed(),
         "the action freed nothing: the tile economies were not squeezed",
     );
     assert_eq!(
-        app.session_host_capacity,
+        app.capacity_modulation.host_ceiling,
         Some(ninety / 10 * 9),
-        "the host presumption was not lowered from the mark the heap reached",
+        "the host ceiling was not lowered from the mark the heap reached",
     );
     assert_eq!(
         app.session_capacity, None,

@@ -71,10 +71,27 @@ pub struct LinearMemory {
     /// as it last reported beside [`Self::worker_bytes`]. The one figure of
     /// the worker's heap that can fall: its memory never shrinks, so the gap
     /// between the two is freed-but-reserved headroom. `None` until a worker
-    /// has said, and on a worker whose build predates the field. The page's
-    /// own live bytes are not here: the bridge reads the instance it runs in,
-    /// and the app reads its own allocator directly.
+    /// has said, and on a worker whose build predates the field.
     pub worker_live_bytes: Option<u64>,
+    /// **The page instance's live bytes**, read off this instance's own
+    /// counter (`squallar_alloc::live_bytes`) by the bridge, at the instant
+    /// it composed this reading. `None` where nothing installed the counting
+    /// allocator.
+    ///
+    /// **It rides on the reading rather than being read at the point of use,
+    /// and that is the whole of how a fresh observation is told from a
+    /// re-published one.** The recovery governor advances its dwell on
+    /// readings, so a figure it could fetch for itself would let a tick where
+    /// the bridge said nothing still count: the app would re-read a global
+    /// that had not moved, and a frozen instrument would promote by doing
+    /// nothing. Carried here, the falling figure exists only inside an answer
+    /// the bridge gave on this tick — `linear_memory()` returning `Some` IS
+    /// the freshness test, and `App::observe_host_recovery` is handed the
+    /// tick's answer rather than the remembered [`Self::page_bytes`].
+    /// Identity of value is not the test and cannot be: a genuinely idle page
+    /// can report the same byte figure twice, and refusing to count that
+    /// would be refusing to recover.
+    pub page_live_bytes: Option<u64>,
 }
 
 /// What the browser's WebGPU probe found: the **per-tab allowance**, as the

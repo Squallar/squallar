@@ -240,27 +240,34 @@ pub struct App {
     /// the event less one economy fraction. Discarded at exit — nothing is
     /// learned across sessions.
     session_capacity: Option<u64>,
-    /// **This session's host capacity presumption** — the page heap's, on a
-    /// browser — lowered by a page-heap watermark event and never raised:
-    /// `None` until one, then the host figure in force less one economy
-    /// fraction. The GPU presumption above is untouched by such an event and
-    /// this one by every other cause: the two heaps are two walls. Discarded
-    /// at exit.
-    session_host_capacity: Option<u64>,
-    /// **The third clamp term** on [`Self::capacity`], beside the two
-    /// presumptions above: a ceiling per pool that can be re-derived and can
-    /// LIFT, where a presumption is latched for the session. Nothing produces
-    /// one yet — it is `Modulation::NONE`, the identity, for the life of the
-    /// process — and when the dwell-based recovery lands it writes here and
-    /// nowhere else, so the chain it feeds is already the one every fit reads.
+    /// **The second clamp term** on [`Self::capacity`], beside the GPU
+    /// presumption above: a ceiling per pool that is re-derived and can LIFT,
+    /// where a presumption is latched for the session.
+    ///
+    /// **The page heap's own figure lives here and no longer in a
+    /// presumption**, and the swap is the fix rather than a tidying. The two
+    /// terms are both a `min` against the capacity, so a latch left beside
+    /// this one would clamp everything this one lifts and the recovery would
+    /// be a silent no-op that passed every test. The GPU side is untouched:
+    /// [`Self::session_capacity`] still latches, because nothing observes a
+    /// card's memory coming back the way `squallar_alloc::live_bytes`
+    /// observes a heap's.
+    ///
+    /// Written by [`Self::host_recovery`] and by nothing else.
     capacity_modulation: squallar_device_profile::scene::Modulation,
-    /// **Whether the tile economies have been squeezed to zero** by a
-    /// page-heap event this session: the styled, parsed and terrain
-    /// allowances the loop walk hands the tile caches are held at nothing
-    /// from then on, so the caches keep their working set — their own floor
-    /// — and no history. The first host lever, and the cheapest: one
-    /// refetch on the next pan, never a frame. Never written anywhere.
-    tile_economy_squeezed: bool,
+    /// **How far the host levers are pulled, and what it would take to
+    /// release a step** — see [`crate::recovery`].
+    ///
+    /// A LEVEL, not the one-way `bool` it replaces. While it stands above
+    /// zero the tile economies are nothing: the styled, parsed and terrain
+    /// allowances the loop walk hands the tile caches are held at nothing, so
+    /// the caches keep their working set — their own floor — and no history.
+    /// The first host lever and the cheapest: one refetch on the next pan,
+    /// never a frame. It steps back down under the same dwell and margin that
+    /// lift the ceiling, so a session that hit one transient spike does not
+    /// keep a degraded pan margin until the user restarts. Never written
+    /// anywhere.
+    host_recovery: crate::recovery::HostRecovery,
     /// **What the page's next picture batch will allocate**, as the last loop
     /// walk priced it — every shown overlay picture at the budget's
     /// oversampling plus one arrival — so the watermark's action line can be
@@ -824,9 +831,8 @@ impl App {
             ),
             fit_invariant_broken: std::cell::Cell::new(false),
             session_capacity: None,
-            session_host_capacity: None,
             capacity_modulation: squallar_device_profile::scene::Modulation::NONE,
-            tile_economy_squeezed: false,
+            host_recovery: crate::recovery::HostRecovery::untouched(),
             host_headroom_bytes: 0,
             budget_readout: squallar_egui::shell_api::BudgetReadout::default(),
             page_heap_reading: None,
@@ -1342,12 +1348,12 @@ impl App {
     /// (`DeviceProfile::capacity`) — or the browser probe's figure where the
     /// profile has only a presumption to offer ([`capacity_with_probe`]),
     /// held to whatever pressure has taught this session, and under whatever
-    /// modulation is in force ([`Self::capacity_modulation`] — none today).
+    /// modulation is in force ([`Self::capacity_modulation`], which is the
+    /// page heap's ceiling and the one term that can lift again).
     /// Three terms, each of which can only lower the one before it.
     pub(super) fn capacity(&self) -> squallar_device_profile::scene::Capacity {
         capacity_with_probe(&self.device_profile, self.gpu_probe.bytes())
             .held_to(self.session_capacity)
-            .host_held_to(self.session_host_capacity)
             .modulated_by(self.capacity_modulation)
     }
 
