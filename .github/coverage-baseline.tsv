@@ -7,7 +7,7 @@ nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
 squallar-alloc/src/lib.rs	63	62
 squallar-app/src/app.rs	1646	1201
-squallar-app/src/app_chunks.rs	220	143
+squallar-app/src/app_chunks.rs	220	133
 squallar-app/src/app_fetch.rs	1958	1651
 squallar-app/src/app_render.rs	4255	3542
 squallar-app/src/app_state.rs	77	0
@@ -92,7 +92,7 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	306	268
 squallar-egui/src/tile_mesh/ledger.rs	77	46
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	1542	1476
+squallar-egui/src/tile_source.rs	1542	1477
 squallar-egui/src/tile_source/byte_lru.rs	272	271
 squallar-egui/src/tile_source/cache_ledger.rs	178	138
 squallar-egui/src/tile_source/snap.rs	157	157
@@ -178,7 +178,7 @@ squallar-netcdf/src/cf.rs	191	187
 squallar-netcdf/src/h5.rs	384	339
 squallar-nmea-serial/src/config.rs	6	3
 squallar-nmea-serial/src/nmea_parser.rs	55	0
-squallar-nmea-serial/src/serial.rs	249	111
+squallar-nmea-serial/src/serial.rs	249	109
 squallar-overlays/src/glm/fetch.rs	767	723
 squallar-overlays/src/glm/mod.rs	27	27
 squallar-overlays/src/gmgsi/decode.rs	330	293
@@ -232,8 +232,8 @@ squallar-overlays/src/render/rasterize.rs	1261	1164
 squallar-overlays/src/render/rasterize/lambert_fixture.rs	116	116
 squallar-overlays/src/render/signature_memo.rs	263	262
 squallar-overlays/src/render/station_model.rs	719	519
-squallar-overlays/src/spc/colors.rs	44	44
-squallar-overlays/src/spc/discussion.rs	386	372
+squallar-overlays/src/spc/colors.rs	44	42
+squallar-overlays/src/spc/discussion.rs	386	371
 squallar-overlays/src/spc/discussion_archive.rs	62	31
 squallar-overlays/src/spc/fetch.rs	167	109
 squallar-overlays/src/spc/firewx.rs	383	368
@@ -245,9 +245,9 @@ squallar-radar/src/archive.rs	249	227
 squallar-radar/src/azimuth.rs	191	191
 squallar-radar/src/beam.rs	33	33
 squallar-radar/src/catalogue.rs	174	163
-squallar-radar/src/chunk_feed.rs	271	262
-squallar-radar/src/chunk_notify.rs	402	373
-squallar-radar/src/chunks.rs	975	801
+squallar-radar/src/chunk_feed.rs	271	257
+squallar-radar/src/chunk_notify.rs	402	370
+squallar-radar/src/chunks.rs	975	797
 squallar-radar/src/current.rs	117	116
 squallar-radar/src/derive.rs	320	307
 squallar-radar/src/dpprep.rs	1022	956
@@ -424,8 +424,8 @@ vendor/nexrad-decode/src/messages/digital_radar_data/data_block_id.rs	42	5
 vendor/nexrad-decode/src/messages/digital_radar_data/elevation_data_block.rs	25	5
 vendor/nexrad-decode/src/messages/digital_radar_data/generic_data_block.rs	63	31
 vendor/nexrad-decode/src/messages/digital_radar_data/generic_data_block_header.rs	71	23
-vendor/nexrad-decode/src/messages/digital_radar_data/header.rs	113	37
-vendor/nexrad-decode/src/messages/digital_radar_data/message.rs	231	143
+vendor/nexrad-decode/src/messages/digital_radar_data/header.rs	113	36
+vendor/nexrad-decode/src/messages/digital_radar_data/message.rs	231	142
 vendor/nexrad-decode/src/messages/digital_radar_data/radial_data_block.rs	74	15
 vendor/nexrad-decode/src/messages/digital_radar_data/snapshot_test.rs	5	5
 vendor/nexrad-decode/src/messages/digital_radar_data/spot_blanking_status.rs	15	0
