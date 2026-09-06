@@ -804,8 +804,9 @@ fn a_terrain_enabled_config_reopens_shading_under_the_new_toggle() {
 /// Both controls were 20 points wide and 18 tall, one gap apart, so a thumb
 /// aimed at the eye could take a layer out of the stack. Sizing the eye up
 /// spends the row's own height and moves nothing: its left edge is still one
-/// spacing after the grip. The can is the last thing on the row, past the
-/// name and, on the drawer, past the `›`.
+/// spacing after the grip. The can is the last control on the row, past the
+/// name; on the drawer the `›` navigation mark keeps the very edge and the
+/// can stands inside it.
 #[test]
 fn the_eye_and_the_can_are_thumb_sized_and_the_can_ends_the_row() {
     for (label, size) in [
@@ -856,18 +857,25 @@ fn the_eye_and_the_can_are_thumb_sized_and_the_can_ends_the_row() {
                 row.remove,
                 row.name,
             );
-            assert!(
-                (row.rect.right() - row.remove.right()).abs() < 0.5,
-                "{label} {name}: the can {:?} does not end the row {:?}",
-                row.remove,
-                row.rect,
-            );
-            if let Some(chevron) = row.chevron {
-                assert!(
-                    chevron.right() <= row.remove.left(),
-                    "{label} {name}: the chevron {chevron:?} sits past the can {:?}",
+            match row.chevron {
+                Some(chevron) => {
+                    assert!(
+                        (row.rect.right() - chevron.right()).abs() < 0.5,
+                        "{label} {name}: the chevron {chevron:?} does not end the row {:?}",
+                        row.rect,
+                    );
+                    assert!(
+                        row.remove.right() <= chevron.left(),
+                        "{label} {name}: the can {:?} is not inside the chevron {chevron:?}",
+                        row.remove,
+                    );
+                }
+                None => assert!(
+                    (row.rect.right() - row.remove.right()).abs() < 0.5,
+                    "{label} {name}: the can {:?} does not end the row {:?}",
                     row.remove,
-                );
+                    row.rect,
+                ),
             }
             assert!(
                 row.remove.left() - row.eye.right() >= 28.0,

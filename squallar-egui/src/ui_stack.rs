@@ -68,7 +68,8 @@ const MIN_ROW_HEIGHT: f32 = 28.0;
 /// Both were 20 points wide and 18 tall — a thumb-sized miss on a phone —
 /// with the row's own height and the spacing around them going spare. The
 /// eye keeps its left edge, so sizing it up moves nothing beside it; the can
-/// stands at the end of the line, where a miss on the eye cannot land on it.
+/// stands at the end of the line — inside the drawer's `›` where there is one
+/// — where a miss on the eye cannot land on it.
 const CONTROL_SIDE: f32 = MIN_ROW_HEIGHT;
 
 /// The eye's glyph size, and the can's — the wastebasket is the heavier
@@ -583,9 +584,9 @@ impl super::Gui {
                     self.set_pane_overlay_with_fetch(pane, idx, kind, !enabled, actions);
                 }
 
-                // The rest of the row lays out from its far end: the 🗑 can
-                // last, then the drawer's `›`, then the name block in what is
-                // left.
+                // The rest of the row lays out from its far end: the drawer's
+                // `›` last where there is one, then the 🗑 can, then the name
+                // block in what is left.
                 let refusal = pane.layer_removal_refusal(kind);
                 #[cfg(test)]
                 let mut chevron_rect = None;
@@ -593,6 +594,26 @@ impl super::Gui {
                 let mut name_rect = egui::Rect::NOTHING;
                 let remove = ui
                     .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // A trailing `›` on the drawer and sheet hosts: there a
+                        // row click *pushes* the inspector over this list, and
+                        // the chevron says so — at the very edge, where a list's
+                        // navigation mark lives, so the can inside it is not the
+                        // first thing a thumb finds at the row's end. The
+                        // desktop sidebar, where the inspector opens beside the
+                        // stack, carries none.
+                        if is_drawer {
+                            let chevron = ui.add(
+                                egui::Label::new(egui::RichText::new("\u{203a}").weak())
+                                    .selectable(false),
+                            );
+                            #[cfg(test)]
+                            {
+                                chevron_rect = Some(chevron.rect);
+                            }
+                            #[cfg(not(test))]
+                            let _ = chevron;
+                        }
+
                         // The 🗑 remove control, at the end of the line. The eye
                         // hides the layer; this takes it out of the pane's stack,
                         // which is a different act — and a destructive one — so it
@@ -620,23 +641,6 @@ impl super::Gui {
                             )
                             .on_hover_text(format!("Remove {name} from this pane"))
                             .on_disabled_hover_text(refusal.unwrap_or_default());
-
-                        // A trailing `›` on the drawer and sheet hosts: there a
-                        // row click *pushes* the inspector over this list, and
-                        // the chevron says so. The desktop sidebar, where the
-                        // inspector opens beside the stack, carries none.
-                        if is_drawer {
-                            let chevron = ui.add(
-                                egui::Label::new(egui::RichText::new("\u{203a}").weak())
-                                    .selectable(false),
-                            );
-                            #[cfg(test)]
-                            {
-                                chevron_rect = Some(chevron.rect);
-                            }
-                            #[cfg(not(test))]
-                            let _ = chevron;
-                        }
 
                         // The name and status block. Hidden layers render
                         // dimmed — weak text is the stock theme's own dimming.
