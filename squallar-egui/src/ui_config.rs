@@ -680,10 +680,19 @@ impl DownloadedAreaConfig {
         // The zoom is checked by asking the tile-id space rather than by
         // repeating its ceiling here.
         crate::pmt_index::zxy_to_tile_id(self.max_zoom, 0, 0)?;
+        // Longitude is cyclic and the bbox is a continuous interval, so what
+        // makes it a rectangle is that it is positively wide and no wider than
+        // a turn — not that its edges are spelled inside ±180. A box picked at
+        // the antimeridian has an edge out there by construction (see
+        // `AreaSpec::west`), and refusing it here forgot such an area on every
+        // relaunch. The one-turn bound on each edge keeps a corrupt file from
+        // naming a column no grid has: the centre is folded onto the globe
+        // before the half-width is added, so nothing reachable is further out.
         let real_rectangle = self.west < self.east
+            && self.east - self.west <= 360.0
             && self.south < self.north
-            && (-180.0..=180.0).contains(&self.west)
-            && (-180.0..=180.0).contains(&self.east)
+            && (-360.0..=360.0).contains(&self.west)
+            && (-360.0..=360.0).contains(&self.east)
             && (-90.0..=90.0).contains(&self.south)
             && (-90.0..=90.0).contains(&self.north);
         if !real_rectangle {

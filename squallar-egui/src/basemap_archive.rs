@@ -1263,20 +1263,24 @@ impl Coverage {
     /// Whether an archive with this header could hold `z/x/y`.
     ///
     /// **Conservative in one direction only**: `false` means it provably does
-    /// not hold the tile, `true` means the directories have to be asked. The
-    /// bbox is turned into a tile range with `squallar_geo::lon_to_tile_x`
-    /// and `lat_to_tile_y` — the same two functions
-    /// `basemap_download::area_tiles` enumerated the segment's contents with,
-    /// so the enumeration and the rejection cannot round to different edges.
+    /// not hold the tile, `true` means the directories have to be asked.
+    ///
+    /// The bbox's longitudes are read through
+    /// [`crate::basemap_download::ColumnRun`] — the same type
+    /// `basemap_download::area_tiles` enumerated the segment's contents
+    /// through, so the enumeration and the rejection cannot round to different
+    /// edges, and a header whose east edge runs past +180 is asked for its far
+    /// side rather than rejected for it. Latitude is not cyclic and keeps its
+    /// plain range.
     fn holds(&self, z: u8, x: u32, y: u32) -> bool {
         if z < self.min_zoom || z > self.max_zoom {
             return false;
         }
-        let west = squallar_geo::lon_to_tile_x(self.west, z);
-        let east = squallar_geo::lon_to_tile_x(self.east, z);
         let north = squallar_geo::lat_to_tile_y(self.north, z);
         let south = squallar_geo::lat_to_tile_y(self.south, z);
-        (west..=east).contains(&x) && (north..=south).contains(&y)
+        crate::basemap_download::ColumnRun::of(self.west, self.east, z)
+            .is_some_and(|columns| columns.holds(x))
+            && (north..=south).contains(&y)
     }
 }
 
@@ -1527,6 +1531,120 @@ mod archives_tests;
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod four_gib_offset_tests;
+
+/// The seam half of [`Coverage::holds`], with no archive behind it: the
+/// rejection reads a bbox through the same [`crate::basemap_download::ColumnRun`]
+/// the enumeration wrote it with, so a downloaded area at the antimeridian is
+/// asked for its far side rather than refused for it.
+#[cfg(test)]
+mod coverage_seam_tests {
+    use super::Coverage;
+    use crate::basemap_download::{AreaSpec, area_tiles};
+
+    /// The area every claim below is about: a one-degree band with the seam
+    /// running through the middle of it, at a zoom whose grid is 64 columns
+    /// wide.
+    fn seam_area() -> AreaSpec {
+        AreaSpec {
+            area_id: "seam".to_owned(),
+            west: 176.0,
+            south: 0.0,
+            east: 184.0,
+            north: 1.0,
+            max_zoom: 6,
+        }
+    }
+
+    /// The coverage a segment cut from `area` declares — the writer puts the
+    /// area's own bbox in the header verbatim (`basemap_download`'s
+    /// `PmTilesWriter::bounds` call), so this is that header.
+    fn coverage_of(area: &AreaSpec) -> Coverage {
+        Coverage {
+            min_zoom: 0,
+            max_zoom: area.max_zoom,
+            west: area.west,
+            south: area.south,
+            east: area.east,
+            north: area.north,
+        }
+    }
+
+    /// **The rejection may not refuse a tile the enumeration wrote.** That is a
+    /// contradiction, not a threshold: a segment that holds a tile and denies
+    /// holding it sends the request to the network the download existed to
+    /// avoid, and no legitimate header can do it.
+    ///
+    /// And the other arm, because over-acceptance is the worse direction: the
+    /// column one step east of the box's own ground is not held. Its identity
+    /// is taken from the box's extent plus one column width rather than
+    /// written down.
+    #[test]
+    fn a_seam_crossing_segment_holds_what_its_own_area_enumerated_and_no_more() {
+        let area = seam_area();
+        let coverage = coverage_of(&area);
+        let tiles = area_tiles(&area);
+        assert!(
+            !tiles.is_empty(),
+            "fixture: the area enumerated nothing, so holding it is vacuous",
+        );
+        for (z, x, y) in &tiles {
+            assert!(
+                coverage.holds(*z, *x, *y),
+                "the segment's own header refuses {z}/{x}/{y}, which its own \
+                 area enumerated into it",
+            );
+        }
+
+        // One column east of the box's east edge, at the deepest zoom: ground
+        // the area does not cover and a segment cut from it cannot hold.
+        let z = area.max_zoom;
+        let column_deg = 360.0 / f64::from(2u32.pow(u32::from(z)));
+        let outside =
+            squallar_geo::lon_to_tile_x(squallar_geo::normalize_lon(area.east + column_deg), z);
+        let row = squallar_geo::lat_to_tile_y(area.north, z);
+        assert!(
+            !tiles.contains(&(z, outside, row)),
+            "fixture: column {outside} is inside the area after all, so \
+             refusing it would be the wrong claim",
+        );
+        assert!(
+            !coverage.holds(z, outside, row),
+            "the segment claims ground a column east of its own east edge",
+        );
+    }
+
+    /// A header written a turn out names the same ground and answers the same
+    /// way — the identity that says the fold is a function of the geometry and
+    /// not of which turn the writer happened to be in.
+    #[test]
+    fn a_header_written_a_turn_out_holds_exactly_what_the_folded_one_holds() {
+        let area = seam_area();
+        let here = coverage_of(&area);
+        let far = coverage_of(&AreaSpec {
+            west: area.west + 360.0,
+            east: area.east + 360.0,
+            ..area.clone()
+        });
+        let side = 2u32.pow(u32::from(area.max_zoom));
+        let row = squallar_geo::lat_to_tile_y(area.north, area.max_zoom);
+        let mut held = 0usize;
+        for x in 0..side {
+            let answer = here.holds(area.max_zoom, x, row);
+            assert_eq!(
+                answer,
+                far.holds(area.max_zoom, x, row),
+                "column {x} is held by one spelling of the same ground and not \
+                 the other",
+            );
+            held += usize::from(answer);
+        }
+        assert!(
+            held > 0 && held < side as usize,
+            "fixture: {held} of {side} columns held - a header that holds all \
+             or none makes the agreement above vacuous",
+        );
+    }
+}
 
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]

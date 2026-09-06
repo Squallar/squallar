@@ -482,3 +482,61 @@ fn a_nonsense_terrain_block_costs_the_hillshade_and_not_the_area() {
         "a cut of zero segments would be a half nothing could ever fail to hold all of"
     );
 }
+
+/// **An offline area picked at the antimeridian survives a restart.** Its
+/// bbox has an edge past ±180 by construction — `PickedBox` folds the box's
+/// centre onto the globe and the half-width is then added to each side — and
+/// the restore's `-180..=180` test refused exactly that, so the record was
+/// dropped on every relaunch while its segments went on serving.
+///
+/// The negatives are the other arm, and each is a bbox that is not a rectangle
+/// on a cyclic axis rather than one written in an unusual turn: an inverted
+/// interval names the rest of the world, an interval wider than a turn names
+/// ground twice, and an edge more than a turn out names a column no grid has.
+#[test]
+fn a_seam_crossing_area_survives_a_restart_and_a_non_rectangle_still_does_not() {
+    let dateline = DownloadedArea {
+        spec: AreaSpec {
+            west: 176.5,
+            east: 184.25,
+            ..oklahoma("dateline").spec
+        },
+        ..oklahoma("dateline")
+    };
+
+    let store = MemoryKvStore::default();
+    let mut gui = Gui::new();
+    gui.record_downloaded_area(dateline.clone());
+    gui.save_ui_config(&store);
+    let mut restored = Gui::new();
+    assert!(restored.load_ui_config(&store));
+    assert_eq!(
+        restored.downloaded_areas(),
+        std::slice::from_ref(&dateline),
+        "an area straddling the antimeridian did not come back from the file",
+    );
+
+    for (why, west, east) in [
+        ("an inverted interval", 184.25, 176.5),
+        ("an interval wider than a turn", -180.0, 190.0),
+        ("an edge more than a turn out", 400.0, 401.0),
+    ] {
+        let store = MemoryKvStore::default();
+        let mut gui = Gui::new();
+        gui.record_downloaded_area(DownloadedArea {
+            spec: AreaSpec {
+                west,
+                east,
+                ..dateline.spec.clone()
+            },
+            ..dateline.clone()
+        });
+        gui.save_ui_config(&store);
+        let mut restored = Gui::new();
+        assert!(restored.load_ui_config(&store));
+        assert!(
+            restored.downloaded_areas().is_empty(),
+            "{why} ({west}..={east}) restored as a real area",
+        );
+    }
+}

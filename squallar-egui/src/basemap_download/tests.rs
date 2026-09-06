@@ -539,6 +539,96 @@ fn the_enumeration_starts_at_the_single_z0_tile() {
     assert_eq!(tiles.len(), 3);
 }
 
+/// How finely the box's own longitude extent is walked when the test computes,
+/// independently of the code under test, which columns that ground touches.
+/// One step is 0.002° against a 5.625° column at the deepest zoom below, so a
+/// column inside the box cannot be stepped over.
+const GROUND_WALK_STEPS: u32 = 4096;
+
+/// A one-degree-tall band `west..=east` at zoom 6, for the seam tests below.
+fn seam_band(area_id: &str, west: f64, east: f64) -> AreaSpec {
+    AreaSpec {
+        area_id: area_id.to_owned(),
+        west,
+        south: 0.0,
+        east,
+        north: 1.0,
+        max_zoom: 6,
+    }
+}
+
+/// A download area straddling the antimeridian enumerates the ground it covers
+/// on **both** sides of the seam, and the same ground written a turn away
+/// enumerates the same tiles.
+///
+/// Both claims are contradictions rather than thresholds. The first compares
+/// the enumerated columns against the columns the box's own extent touches,
+/// walked here in degrees and folded per sample — a box cannot legitimately
+/// enumerate a column its ground does not reach, nor miss one it does. The
+/// second is an identity: 176°..184° and 536°..544° are one place, and one
+/// place has one tile set.
+///
+/// Read through `squallar_geo::lon_to_tile_x`, as this was while the map could
+/// not wrap, the east edge clamps to the grid's last column and every column
+/// past the seam is lost — at zoom 6 the box enumerates column 63 alone and
+/// column 0 is never downloaded.
+#[test]
+fn a_seam_crossing_area_enumerates_both_sides_and_the_same_ground_the_same_way() {
+    let area = seam_band("seam", 176.0, 184.0);
+    let tiles: BTreeSet<(u8, u32, u32)> = area_tiles(&area).into_iter().collect();
+    assert!(
+        !tiles.is_empty(),
+        "a real box over real ground enumerated nothing at all",
+    );
+
+    for z in 0..=area.max_zoom {
+        // The columns this box's ground touches, computed from the box's own
+        // extent rather than named: walk the interval in degrees, fold each
+        // sample onto the globe, and ask for its column.
+        let touched: BTreeSet<u32> = (0..=GROUND_WALK_STEPS)
+            .map(|step| {
+                let t = f64::from(step) / f64::from(GROUND_WALK_STEPS);
+                let lon = area.west + (area.east - area.west) * t;
+                squallar_geo::lon_to_tile_x(squallar_geo::normalize_lon(lon), z)
+            })
+            .collect();
+        let enumerated: BTreeSet<u32> = tiles
+            .iter()
+            .filter(|(tile_z, _, _)| *tile_z == z)
+            .map(|(_, x, _)| *x)
+            .collect();
+        assert_eq!(
+            enumerated, touched,
+            "zoom {z}: the area enumerated columns {enumerated:?} for ground \
+             that touches columns {touched:?}",
+        );
+
+        // The seam runs through the middle of this box, so above zoom 0 - the
+        // only zoom whose grid is one column wide - the box has to reach the
+        // column on each side of it.
+        let side = 2u32.pow(u32::from(z));
+        if side > 1 {
+            for (edge, name) in [(side - 1, "west of the seam"), (0, "east of it")] {
+                assert!(
+                    enumerated.contains(&edge),
+                    "zoom {z}: the box spans 176 deg to 184 deg and did not \
+                     enumerate column {edge}, {name}",
+                );
+            }
+        }
+    }
+
+    for (id, shift) in [("seam-east", 360.0), ("seam-west", -360.0)] {
+        let moved = seam_band(id, area.west + shift, area.east + shift);
+        let moved_tiles: BTreeSet<(u8, u32, u32)> = area_tiles(&moved).into_iter().collect();
+        assert_eq!(
+            moved_tiles, tiles,
+            "the same ground written {shift} deg away enumerated a different \
+             tile set: one place, two downloads",
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The plan
 // ---------------------------------------------------------------------------

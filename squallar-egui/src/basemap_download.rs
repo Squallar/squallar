@@ -74,7 +74,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use egui::Context;
 use pmtiles::{Compression, PmTilesWriter, TileCoord, TileType};
-use squallar_geo::{lat_to_tile_y, lon_to_tile_x};
+use squallar_geo::{lat_to_tile_y, lon_to_tile_x_unbounded, wrap_tile_x};
 use squallar_units::DataSize;
 
 use crate::basemap_archive::{ArchiveRangeSource, RangeError, RangeSource};
@@ -129,8 +129,13 @@ pub struct AreaSpec {
     /// `_`, `.`, not starting with `.` — and the stores refuse anything else
     /// rather than let an id traverse a path.
     pub area_id: String,
-    /// Western edge, degrees longitude. The bbox is not wrapped across the
-    /// antimeridian — `lon_to_tile_x` clamps, matching the map's own behaviour.
+    /// Western edge, degrees longitude.
+    ///
+    /// The bbox is a **continuous** interval `west..=east` with `east` at or
+    /// east of `west`, and it may run past ±180: a box picked at the
+    /// antimeridian is spelled by letting an edge out of the globe's turn, not
+    /// by swapping the two edges — swapped, they name the rest of the world.
+    /// [`ColumnRun`] is what carries such an edge back onto the tile grid.
     pub west: f64,
     /// Southern edge, degrees latitude.
     pub south: f64,
@@ -171,15 +176,89 @@ pub fn area_tiles(area: &AreaSpec) -> Vec<(u8, u32, u32)> {
 pub fn area_tiles_to(area: &AreaSpec, archive_max_zoom: u8) -> Vec<(u8, u32, u32)> {
     let mut tiles = Vec::new();
     for z in 0..=area.max_zoom.min(archive_max_zoom) {
-        let x_range = lon_to_tile_x(area.west, z)..=lon_to_tile_x(area.east, z);
+        let Some(columns) = ColumnRun::of(area.west, area.east, z) else {
+            continue;
+        };
         let y_range = lat_to_tile_y(area.north, z)..=lat_to_tile_y(area.south, z);
-        for x in x_range {
+        for x in columns.columns() {
             for y in y_range.clone() {
                 tiles.push((z, x, y));
             }
         }
     }
     tiles
+}
+
+/// The run of tile columns a bbox's `west..=east` covers at one zoom, held as
+/// a **signed, continuous** first column and a count.
+///
+/// This is the one shape the enumeration ([`area_tiles_to`]) and the rejection
+/// (`basemap_archive`'s `Coverage::holds`) both read a bbox's longitudes
+/// through, so "the two cannot round to different edges" is one type rather
+/// than two call sites naming the same two functions.
+///
+/// # Why the columns are unclamped
+///
+/// `squallar_geo::lon_to_tile_x` clamps to the grid, and reading an edge
+/// through it silently drops whatever of the box lies past ±180. A box picked
+/// at the antimeridian has such an edge by construction:
+/// `ui_download_area::PickedBox` folds the box's *centre* onto the globe and
+/// `ui_region::corners_for` then adds a half-width to each side, so a centre a
+/// few degrees from the seam names an east edge past +180. Clamped, the far
+/// side is never enumerated, never downloaded and never found again — an
+/// offline area at the dateline has a hole in it and says nothing.
+///
+/// So the edges are read with [`squallar_geo::lon_to_tile_x_unbounded`] and a
+/// column is carried onto the grid with [`squallar_geo::wrap_tile_x`] at the
+/// moment it is asked for. That is the shape the wrapping map's own tile walk
+/// uses: two numbers where there was one, the signed column saying *which*
+/// turn and the wrapped column saying *which tile*.
+///
+/// A run wider than the grid is capped at the grid, so a box spanning more
+/// than a turn asks for each column once rather than repeatedly. A zoom with
+/// no grid to carry onto — 32 and above, as [`squallar_geo::wrap_tile_x`]
+/// reads it — is no run at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ColumnRun {
+    /// The westmost column, in the continuous frame the bbox is written in.
+    /// Negative west of the grid, past `2^zoom` east of it.
+    first: i64,
+    /// How many columns the run covers, at least one and never more than the
+    /// grid has.
+    count: i64,
+    /// The grid this run is carried onto.
+    zoom: u8,
+}
+
+impl ColumnRun {
+    /// The run `west..=east` covers at `zoom`, or `None` for a bbox that
+    /// covers none — an inverted or empty interval, or a zoom with no grid.
+    pub(crate) fn of(west: f64, east: f64, zoom: u8) -> Option<Self> {
+        let side = i64::from(2u32.checked_pow(u32::from(zoom))?);
+        let first = lon_to_tile_x_unbounded(west, zoom);
+        let count = lon_to_tile_x_unbounded(east, zoom)
+            .checked_sub(first)?
+            .checked_add(1)?;
+        (count > 0).then_some(Self {
+            first,
+            count: count.min(side),
+            zoom,
+        })
+    }
+
+    /// The run's columns, each carried onto the grid.
+    pub(crate) fn columns(self) -> impl Iterator<Item = u32> {
+        (0..self.count).map(move |step| wrap_tile_x(self.first + step, self.zoom))
+    }
+
+    /// Whether the grid column `x` is one of them.
+    ///
+    /// The same carry as [`Self::columns`], run the other way: `x` is measured
+    /// from the run's own first column and wrapped, so a column and the run
+    /// are compared in the run's frame rather than in the grid's.
+    pub(crate) fn holds(self, x: u32) -> bool {
+        i64::from(wrap_tile_x(i64::from(x) - self.first, self.zoom)) < self.count
+    }
 }
 
 // ---------------------------------------------------------------------------
