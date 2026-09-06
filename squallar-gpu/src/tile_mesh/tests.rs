@@ -15,6 +15,7 @@ fn the_locals_block_lays_its_lanes_out_where_the_shader_reads_them() {
             translation: [-11.5, 7.25],
         },
         true,
+        1.0,
     );
     assert_eq!(bytes.len(), LOCALS_BYTES as usize);
     let lane = |i: usize| f32::from_ne_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
@@ -39,8 +40,35 @@ fn dithering_off_reaches_the_shader_as_zero() {
             translation: [0.0, 0.0],
         },
         false,
+        1.0,
     );
     assert_eq!(u32::from_ne_bytes(bytes[20..24].try_into().unwrap()), 0);
+}
+
+/// The painter's opacity rides in lane 6, the lane the shader reads
+/// `r_locals.opacity` from -- and in no other lane. The layout test above
+/// pins the six lanes that were there before it; this pins that the seventh
+/// is the opacity and that adding it moved nothing else, by comparing the
+/// block against the same placement at full opacity byte for byte.
+#[test]
+fn the_opacity_rides_in_lane_six_and_moves_no_other_lane() {
+    let place = Placement {
+        scale: 0.0625,
+        translation: [-11.5, 7.25],
+    };
+    let dimmed = locals_bytes([3440.0, 1440.0], place, true, 0.37);
+    let full = locals_bytes([3440.0, 1440.0], place, true, 1.0);
+    let lane = |bytes: &[u8; LOCALS_BYTES as usize], i: usize| {
+        f32::from_ne_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
+    };
+    assert_eq!(lane(&dimmed, 6), 0.37, "opacity");
+    assert_eq!(lane(&full, 6), 1.0, "opacity at full");
+    assert_eq!(
+        dimmed[..24],
+        full[..24],
+        "the opacity moved a lane the placement owns"
+    );
+    assert_eq!(dimmed[28..], full[28..], "the opacity moved the pad lane");
 }
 
 /// Ring slots are spaced by the adapter's uniform alignment, never by less:
@@ -123,6 +151,35 @@ fn the_stroke_shader_adds_the_offset_outside_the_scale() {
     );
 }
 
+/// **Both vertex entry points apply the opacity, to every channel, at the
+/// vertex.** A layer's opacity reaches a CPU-placed shape through
+/// `Painter::add` as `Color32::gamma_multiply` on all four premultiplied
+/// channels; the callback path gets it as the uniform instead, and the only
+/// place that is the same operation is the unpacked colour before anything
+/// else touches it. A fill path that applied it and a stroke path that did
+/// not would be a road at full strength over a dimmed ground, so each entry
+/// point's own body is checked rather than the file. A source-text assertion
+/// for the same reason as the offset pin above: it reddens without an
+/// adapter.
+#[test]
+fn both_vertex_entry_points_apply_the_opacity_to_the_unpacked_colour() {
+    let wgsl = include_str!("../tile_mesh.wgsl");
+    for entry in ["vs_main", "vs_stroke"] {
+        let body = wgsl
+            .split_once(&format!("fn {entry}("))
+            .map(|(_, rest)| {
+                rest.split_once("return out;")
+                    .expect("a vertex entry point ends by returning `out`")
+                    .0
+            })
+            .unwrap_or_else(|| panic!("the shader has no `{entry}`"));
+        assert!(
+            body.contains("out.color = unpack_color(a_color) * r_locals.opacity;"),
+            "`{entry}` no longer multiplies the unpacked colour by              `r_locals.opacity`; a layer's opacity would dim every CPU-placed              shape and leave this entry point's geometry at full strength"
+        );
+    }
+}
+
 /// The stroke vertex layout the pipeline declares is the one the flattener
 /// writes: three attributes at 0, 4 and 12, in a stride of
 /// [`stroke::STROKE_VERTEX_BYTES`].
@@ -162,6 +219,7 @@ fn a_pass_of_placements_reaches_the_ring_as_one_write() {
                 translation: [i as f32, -(i as f32)],
             },
             false,
+            1.0,
         )
     };
     let mut writes: Vec<(u64, Vec<u8>)> = Vec::new();
@@ -215,6 +273,7 @@ fn a_wrap_inside_a_pass_splits_it_into_two_contiguous_writes() {
             translation: [0.0, 0.0],
         },
         true,
+        1.0,
     );
     let mut writes: Vec<(u64, usize)> = Vec::new();
     let slots: Vec<u32> = (0..3)

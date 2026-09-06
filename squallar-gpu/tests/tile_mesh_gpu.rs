@@ -54,16 +54,33 @@ fn piece() -> egui::Rect {
 /// blend state is exercised rather than only the shader's arithmetic, and so a
 /// dither difference has gradients to show up in.
 fn fills() -> egui::epaint::Mesh {
-    let mut mesh = egui::epaint::Mesh::default();
-    for (i, colour) in [
+    fills_of([
         egui::Color32::from_rgba_premultiplied(200, 30, 40, 255),
         egui::Color32::from_rgba_premultiplied(20, 120, 60, 160),
         egui::Color32::from_rgba_premultiplied(70, 70, 200, 90),
         egui::Color32::from_rgba_premultiplied(11, 13, 17, 200),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    ])
+}
+
+/// [`fills`] with **every channel even**, for the opacity gate: at one half,
+/// an even byte halves exactly on both arms, where an odd one lands on .5 and
+/// the CPU's `(c * f + 0.5) as u8` rounds it while the GPU carries the float
+/// to the framebuffer. The same quads at the same places; only the bytes are
+/// nudged, so what is compared is the arithmetic and not a rounding rule.
+fn even_fills() -> egui::epaint::Mesh {
+    fills_of([
+        egui::Color32::from_rgba_premultiplied(200, 30, 40, 254),
+        egui::Color32::from_rgba_premultiplied(20, 120, 60, 160),
+        egui::Color32::from_rgba_premultiplied(70, 70, 200, 90),
+        egui::Color32::from_rgba_premultiplied(10, 12, 16, 200),
+    ])
+}
+
+/// Four overlapping quads in the given colours, one fixture for both of the
+/// above.
+fn fills_of(colours: [egui::Color32; 4]) -> egui::epaint::Mesh {
+    let mut mesh = egui::epaint::Mesh::default();
+    for (i, colour) in colours.into_iter().enumerate() {
         let at = i as f32 * 400.0;
         mesh.add_rect_with_uv(
             egui::Rect::from_min_size(
@@ -79,7 +96,12 @@ fn fills() -> egui::epaint::Mesh {
 
 /// The fixture's fills, through the map's own flattener.
 fn flat() -> std::sync::Arc<tile_mesh::TileMeshes> {
-    std::sync::Arc::new(tile_mesh::flatten_meshes(std::iter::once((0, &fills()))))
+    flat_of(&fills())
+}
+
+/// One mesh through the map's own flattener.
+fn flat_of(mesh: &egui::epaint::Mesh) -> std::sync::Arc<tile_mesh::TileMeshes> {
+    std::sync::Arc::new(tile_mesh::flatten_meshes(std::iter::once((0, mesh))))
 }
 
 /// The feathering the stroke fixture is flattened and drawn at.
@@ -311,6 +333,29 @@ fn frame(
     frame_clipped(device, queue, renderer, format, vec![(piece(), shapes)]).0
 }
 
+/// [`frame`] with the painter's opacity set before the shapes are added --
+/// what the layer walk does around a layer's arm. egui tints every shape it
+/// can on the way in; a callback goes through untouched and carries its own
+/// factor in the uniform.
+fn frame_at(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer: &mut egui_wgpu::Renderer,
+    format: wgpu::TextureFormat,
+    opacity: f32,
+    shapes: Vec<egui::Shape>,
+) -> Vec<u8> {
+    frame_groups(
+        device,
+        queue,
+        renderer,
+        format,
+        opacity,
+        vec![(piece(), shapes)],
+    )
+    .0
+}
+
 /// [`frame`] over several groups of shapes, each painted under its own clip
 /// rect in the order given -- the shape of a ground walk over more than one
 /// tile -- returning the readback and what egui's tessellator made of the
@@ -322,6 +367,20 @@ fn frame_clipped(
     format: wgpu::TextureFormat,
     groups: Vec<(egui::Rect, Vec<egui::Shape>)>,
 ) -> (Vec<u8>, Vec<egui::ClippedPrimitive>) {
+    frame_groups(device, queue, renderer, format, 1.0, groups)
+}
+
+/// [`frame_clipped`] at a painter opacity. Every group's painter is set to
+/// `opacity` before its shapes are added, which at 1.0 is what a fresh
+/// painter already carries.
+fn frame_groups(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer: &mut egui_wgpu::Renderer,
+    format: wgpu::TextureFormat,
+    opacity: f32,
+    groups: Vec<(egui::Rect, Vec<egui::Shape>)>,
+) -> (Vec<u8>, Vec<egui::ClippedPrimitive>) {
     let ctx = egui::Context::default();
     let canvas = canvas();
     ctx.begin_pass(egui::RawInput {
@@ -329,9 +388,11 @@ fn frame_clipped(
         ..Default::default()
     });
     for (clip, shapes) in groups {
-        ctx.layer_painter(egui::LayerId::background())
-            .with_clip_rect(clip)
-            .extend(shapes);
+        let mut painter = ctx
+            .layer_painter(egui::LayerId::background())
+            .with_clip_rect(clip);
+        painter.set_opacity(opacity);
+        painter.extend(shapes);
     }
     let output = ctx.end_pass();
     let tris = ctx.tessellate(output.shapes, 1.0);
@@ -412,6 +473,26 @@ fn cpu_shape(meshes: &tile_mesh::TileMeshes) -> Vec<egui::Shape> {
     vec![egui::Shape::Mesh(mesh.into())]
 }
 
+/// [`cpu_shape`] with every vertex colour put through
+/// `Color32::gamma_multiply(opacity)` by hand -- the operation
+/// `Painter::add` applies to a mesh under `set_opacity`, spelled out so the
+/// opacity gate can show that the painter's tint *is* that and nothing more.
+fn cpu_shape_tinted(meshes: &tile_mesh::TileMeshes, opacity: f32) -> Vec<egui::Shape> {
+    cpu_shape(meshes)
+        .into_iter()
+        .map(|shape| match shape {
+            egui::Shape::Mesh(mesh) => {
+                let mut mesh = std::sync::Arc::unwrap_or_clone(mesh);
+                for vertex in &mut mesh.vertices {
+                    vertex.color = vertex.color.gamma_multiply(opacity);
+                }
+                egui::Shape::Mesh(mesh.into())
+            }
+            other => other,
+        })
+        .collect()
+}
+
 /// The callback path's shapes: **one** paint callback covering every run of
 /// the tile, at the one placement they share, exactly as `paint_vector_tile`
 /// emits them when nothing the ground phase draws sits between the runs.
@@ -424,6 +505,16 @@ fn callback_shapes(
     meshes: &std::sync::Arc<tile_mesh::TileMeshes>,
     pass_nr: u64,
 ) -> Vec<egui::Shape> {
+    callback_shapes_at(meshes, pass_nr, 1.0)
+}
+
+/// [`callback_shapes`] carrying a layer opacity in its uniform -- what
+/// `draw_tile_layer` hands across from `ui.painter().opacity()`.
+fn callback_shapes_at(
+    meshes: &std::sync::Arc<tile_mesh::TileMeshes>,
+    pass_nr: u64,
+    opacity: f32,
+) -> Vec<egui::Shape> {
     let bridge = TileMeshBridge;
     vec![egui::Shape::Callback(egui::epaint::PaintCallback {
         rect: piece(),
@@ -433,6 +524,7 @@ fn callback_shapes(
                 first_run: 0,
                 run_count: meshes.runs().len(),
                 place: tile_mesh::Placement::of(piece()),
+                opacity,
                 pass_nr,
             })
             .expect("the bridge always answers for a span it was given"),
@@ -459,6 +551,7 @@ fn callback_shapes_per_run(
                         first_run: run,
                         run_count: 1,
                         place: tile_mesh::Placement::of(piece()),
+                        opacity: 1.0,
                         pass_nr,
                     })
                     .expect("the bridge always answers for a run it was given"),
@@ -677,6 +770,111 @@ fn the_callback_path_puts_the_same_bytes_on_screen_as_cpu_placement() {
         "the sRGB and non-sRGB targets read back identically, so this suite \
          cannot see a gamma convention at all and both passes above are vacuous"
     );
+}
+
+/// **A callback at half opacity puts the same bytes on screen as the painter's
+/// own tint of the mesh it replaces.**
+///
+/// A layer's opacity is a painter tint: `Painter::add` puts every colour of
+/// every shape it can reach through `Color32::gamma_multiply`, and a
+/// `Shape::Callback` is the one shape it cannot reach, so the tile-mesh path
+/// carries the factor in its uniform instead. This is the gate that the two
+/// spellings are one operation. Three readbacks per gamma convention:
+///
+/// * **the reference** -- the flattened fills as a CPU mesh, through a painter
+///   at 0.5, which is egui tinting it;
+/// * **the hand-tinted control** -- the same mesh with every vertex put
+///   through `gamma_multiply(0.5)` by this file, through a painter at 1.0;
+///   equal to the reference, which pins what the painter's tint *is*;
+/// * **the case** -- the callback through the same 0.5 painter, carrying 0.5
+///   in its uniform.
+///
+/// The untinted picture is read too and shown to differ from the reference,
+/// so the compares are known to be able to see a tint; and the tinted
+/// picture covers the same texels, so a dim is not a clip. The fixture is
+/// [`even_fills`], which is why the compare is a byte compare and not a
+/// budget: see its doc.
+#[test]
+#[ignore = "needs a real wgpu adapter"]
+fn a_callback_at_half_opacity_puts_the_same_bytes_on_screen_as_the_painters_tint() {
+    const HALF: f32 = 0.5;
+    let _serialised = gpu_lock();
+    let Some((device, queue)) = device() else {
+        eprintln!("SKIPPED: no wgpu adapter");
+        return;
+    };
+    let meshes = flat_of(&even_fills());
+    assert_eq!(meshes.runs().len(), 1, "the fixture is one coalesced run");
+
+    for format in [
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        wgpu::TextureFormat::Rgba8Unorm,
+    ] {
+        let mut renderer = renderer_for(&device, format);
+        let full = frame(&device, &queue, &mut renderer, format, cpu_shape(&meshes));
+        let reference = frame_at(
+            &device,
+            &queue,
+            &mut renderer,
+            format,
+            HALF,
+            cpu_shape(&meshes),
+        );
+        let by_hand = frame(
+            &device,
+            &queue,
+            &mut renderer,
+            format,
+            cpu_shape_tinted(&meshes, HALF),
+        );
+        let gpu = frame_at(
+            &device,
+            &queue,
+            &mut renderer,
+            format,
+            HALF,
+            callback_shapes_at(&meshes, 1, HALF),
+        );
+
+        let drew = painted(&full);
+        assert!(
+            drew > (SIDE * SIDE / 4) as usize,
+            "{format:?}: the CPU path painted only {drew} texels, so a match              would be two nearly-empty pictures agreeing"
+        );
+        assert_ne!(
+            full, reference,
+            "{format:?}: a painter at 0.5 drew the same bytes as one at 1.0,              so this suite cannot see a tint and every compare below is vacuous"
+        );
+        assert_eq!(
+            painted(&reference),
+            drew,
+            "{format:?}: the tint changed which texels were covered"
+        );
+        assert_eq!(
+            painted(&gpu),
+            drew,
+            "{format:?}: the callback at 0.5 covered a different area"
+        );
+
+        let differing = |a: &[u8], b: &[u8]| {
+            a.chunks_exact(4)
+                .zip(b.chunks_exact(4))
+                .filter(|(a, b)| a != b)
+                .count()
+        };
+        assert_eq!(
+            differing(&reference, &by_hand),
+            0,
+            "{format:?}: the painter's tint of a mesh is not `gamma_multiply`              on every vertex, so the shader is mirroring the wrong operation"
+        );
+        let off = differing(&reference, &gpu);
+        assert_eq!(
+            off,
+            0,
+            "{format:?}: {off} of {} texels differ between the callback at              opacity 0.5 and the painter's own tint of the same mesh -- the              uniform is not reaching both vertex stages, or not every channel",
+            SIDE * SIDE
+        );
+    }
 }
 
 /// **The same gate for strokes**, and the harder half: a stroke's geometry is
@@ -1111,6 +1309,7 @@ fn grid_callback(
                 first_run: 0,
                 run_count: 1,
                 place: tile_mesh::Placement::of(tile.full),
+                opacity: 1.0,
                 pass_nr,
             })
             .expect("the bridge always answers for a run it was given"),

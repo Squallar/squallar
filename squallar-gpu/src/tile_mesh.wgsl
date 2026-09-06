@@ -29,7 +29,12 @@ struct Locals {
     /// 1 if dithering is enabled, 0 otherwise. Must be what
     /// `RendererOptions::dithering` gave egui's renderer.
     dithering: u32,
-    _pad: vec2<f32>,
+    /// Paint-time layer opacity, 0-1, applied to the premultiplied colour
+    /// exactly as `Color32::gamma_multiply` is applied to the CPU-placed
+    /// shapes beside these fills: every channel, in gamma space, at the
+    /// vertex. Reuses the old pad lane so the block stays 32 bytes.
+    opacity: f32,
+    _pad: f32,
 };
 @group(0) @binding(0) var<uniform> r_locals: Locals;
 
@@ -77,7 +82,7 @@ fn vs_main(
     @location(1) a_color: u32,
 ) -> VertexOutput {
     var out: VertexOutput;
-    out.color = unpack_color(a_color);
+    out.color = unpack_color(a_color) * r_locals.opacity;
     // `ShapeOrText::placed` spells this `scaling * p + translation`, and so
     // does this: same operands, same order.
     out.position = position_from_screen(r_locals.scale * a_pos + r_locals.translation);
@@ -105,7 +110,7 @@ fn vs_stroke(
     @location(2) a_color: u32,
 ) -> VertexOutput {
     var out: VertexOutput;
-    out.color = unpack_color(a_color);
+    out.color = unpack_color(a_color) * r_locals.opacity;
     out.position = position_from_screen(
         r_locals.scale * vec2<f32>(a_pos) + r_locals.translation + a_offset
     );

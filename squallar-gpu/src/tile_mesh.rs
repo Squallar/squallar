@@ -99,7 +99,8 @@ const _: () = assert!(
     "a frame's worst case of ground draws no longer fits the uniform ring"
 );
 
-/// Bytes one [`Locals`] block occupies: `vec2 + vec2 + f32 + u32 + vec2`.
+/// Bytes one [`Locals`] block occupies:
+/// `vec2 + vec2 + f32 + u32 + f32 + f32`, the last being a pad.
 const LOCALS_BYTES: u64 = 32;
 
 /// One draw's placement, in the byte layout the WGSL `Locals` block declares.
@@ -111,15 +112,17 @@ fn locals_bytes(
     screen_size: [f32; 2],
     place: Placement,
     dithering: bool,
+    opacity: f32,
 ) -> [u8; LOCALS_BYTES as usize] {
     let mut out = [0u8; LOCALS_BYTES as usize];
-    let lanes: [[u8; 4]; 6] = [
+    let lanes: [[u8; 4]; 7] = [
         screen_size[0].to_ne_bytes(),
         screen_size[1].to_ne_bytes(),
         place.translation[0].to_ne_bytes(),
         place.translation[1].to_ne_bytes(),
         place.scale.to_ne_bytes(),
         u32::from(dithering).to_ne_bytes(),
+        opacity.to_ne_bytes(),
     ];
     for (lane, bytes) in lanes.iter().enumerate() {
         out[lane * 4..lane * 4 + 4].copy_from_slice(bytes);
@@ -446,12 +449,18 @@ impl TileMeshStore {
     /// Lay one draw's placement into the pass's batch and answer which ring
     /// slot it will occupy. The bytes reach the ring at [`Self::flush`], or
     /// here when the ring wraps.
-    fn slot(&mut self, queue: &wgpu::Queue, screen_size: [f32; 2], place: Placement) -> u32 {
+    fn slot(
+        &mut self,
+        queue: &wgpu::Queue,
+        screen_size: [f32; 2],
+        place: Placement,
+        opacity: f32,
+    ) -> u32 {
         self.placements += 1;
         let ring = &self.ring;
         let ring_writes = &mut self.ring_writes;
         self.batch.push(
-            locals_bytes(screen_size, place, self.dithering),
+            locals_bytes(screen_size, place, self.dithering, opacity),
             |offset, bytes| {
                 queue.write_buffer(ring, offset, bytes);
                 *ring_writes += 1;
@@ -636,6 +645,12 @@ struct TileMeshCallback {
     first_run: u32,
     run_count: u32,
     place: Placement,
+    /// The painter's opacity on the frame this span was issued, 0-1. Carried
+    /// in the uniform because a `Shape::Callback` is the one shape
+    /// `Painter::add` cannot tint: the layer walk's `set_opacity` reaches the
+    /// CPU-placed shapes beside these runs on its own and this is how it
+    /// reaches the runs.
+    opacity: f32,
     pass_nr: u64,
     /// Written by `prepare`, read by `paint`. See the module doc: every
     /// prepare of a frame runs before any paint of it. One slot serves the
@@ -672,7 +687,7 @@ impl egui_wgpu::CallbackTrait for TileMeshCallback {
             screen_descriptor.size_in_pixels[0] as f32 / screen_descriptor.pixels_per_point,
             screen_descriptor.size_in_pixels[1] as f32 / screen_descriptor.pixels_per_point,
         ];
-        let slot = store.slot(queue, points, self.place);
+        let slot = store.slot(queue, points, self.place, self.opacity);
         self.slot.store(slot, Ordering::Relaxed);
         Vec::new()
     }
@@ -803,6 +818,7 @@ impl TileMeshPainter for TileMeshBridge {
                     first_run: draw.first_run as u32,
                     run_count: draw.run_count as u32,
                     place: draw.place,
+                    opacity: draw.opacity,
                     pass_nr: draw.pass_nr,
                     slot: AtomicU32::new(0),
                 },

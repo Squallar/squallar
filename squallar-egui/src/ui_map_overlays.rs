@@ -301,6 +301,12 @@ pub(super) fn draw_tile_layer(
     // divide, against a span that holds up to 84 cells.
     let feathering = crate::tile_mesh::feathering_of(ui.ctx());
 
+    // The layer's opacity, as the walk set it on this `Ui` before calling
+    // here. egui applies it to every CPU-placed shape as they are added; the
+    // GPU-drawn runs get it through `GroundMeshes`, because a paint callback
+    // is the one shape the painter cannot tint.
+    let opacity = ui.painter().opacity();
+
     // Accumulated across every cell below, so the collision test the caller
     // makes is one test against the whole pane; see [`paint_labels`].
     let mut labels: Vec<walkers::Text> = Vec::new();
@@ -387,6 +393,7 @@ pub(super) fn draw_tile_layer(
                         painter: ground,
                         pass_nr,
                         feathering,
+                        opacity,
                     },
                     rect,
                     piece.uv,
@@ -599,6 +606,7 @@ fn issue_run_batch(
             scale: placement.scaling,
             translation: [placement.translation.x, placement.translation.y],
         },
+        opacity: ground.opacity,
         pass_nr: ground.pass_nr,
     })?;
     Some(egui::Shape::Callback(egui::epaint::PaintCallback {
@@ -940,6 +948,12 @@ struct GroundMeshes<'a> {
     /// [`crate::tile_mesh::feathering_of`]. A stroke run whose tile was
     /// flattened at another value is declined; see [`RunCursor::take_at`].
     feathering: f32,
+    /// The painter's opacity **this frame**, 0-1, from
+    /// `ui.painter().opacity()`, handed to the renderer with every run. The
+    /// CPU-placed shapes of the same tile get it from egui as they are added;
+    /// a `Shape::Callback` is the one shape `Painter::add` cannot tint, so the
+    /// runs would draw at full strength under a dimmed layer without it.
+    opacity: f32,
 }
 
 impl GroundMeshes<'_> {
@@ -950,6 +964,7 @@ impl GroundMeshes<'_> {
         painter: None,
         pass_nr: 0,
         feathering: 0.0,
+        opacity: 1.0,
     };
 
     /// A cursor over this tile's runs, in shape order.
@@ -1474,6 +1489,32 @@ mod tests {
                 .layer_id(egui::LayerId::background())
                 .max_rect(canvas),
         );
+        draw(&ui);
+        ctx.end_pass().shapes
+    }
+
+    /// [`shapes_of_one_pass`] under a `Ui` whose opacity was set before the
+    /// draw -- what the layer walk does around a layer's arm. A sibling
+    /// rather than a parameter so the helper every test above uses stays the
+    /// untouched harness the full-opacity arm is compared against.
+    fn shapes_of_one_pass_at(
+        ctx: &egui::Context,
+        canvas: egui::Rect,
+        opacity: f32,
+        draw: impl FnOnce(&egui::Ui),
+    ) -> Vec<egui::epaint::ClippedShape> {
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(canvas),
+            ..Default::default()
+        });
+        let mut ui = egui::Ui::new(
+            ctx.clone(),
+            egui::Id::new("vector_seam"),
+            egui::UiBuilder::new()
+                .layer_id(egui::LayerId::background())
+                .max_rect(canvas),
+        );
+        ui.set_opacity(opacity);
         draw(&ui);
         ctx.end_pass().shapes
     }
@@ -2465,15 +2506,15 @@ mod tests {
 
     /// A painter that hands back a payload for every span of runs it is asked
     /// about, and remembers what it was asked: the tile, the span as
-    /// `(first_run, run_count)`, and the placement.
+    /// `(first_run, run_count)`, the placement and the opacity.
     #[derive(Default)]
     struct RecordingPainter {
         asked: std::sync::Mutex<Vec<Asked>>,
     }
 
     /// One thing [`RecordingPainter`] was asked for: the tile's id, the span
-    /// as `(first_run, run_count)`, and the placement.
-    type Asked = (u64, (usize, usize), crate::tile_mesh::Placement);
+    /// as `(first_run, run_count)`, the placement and the opacity.
+    type Asked = (u64, (usize, usize), crate::tile_mesh::Placement, f32);
 
     impl crate::tile_mesh::TileMeshPainter for RecordingPainter {
         fn payload(
@@ -2487,6 +2528,7 @@ mod tests {
                     draw.meshes.id(),
                     (draw.first_run, draw.run_count),
                     draw.place,
+                    draw.opacity,
                 ));
             Some(std::sync::Arc::new(()))
         }
@@ -2648,6 +2690,21 @@ mod tests {
         Vec<egui::epaint::ClippedShape>,
         crate::tile_mesh::ledger::Totals,
     ) {
+        one_ground_pass_dimmed(shapes, painter, flattened_at, drawn_at, 1.0)
+    }
+
+    /// [`one_ground_pass_of`] with the ground told a layer opacity, which is
+    /// what `draw_tile_layer` reads off the painter and hands across.
+    fn one_ground_pass_dimmed(
+        shapes: Vec<ShapeOrText>,
+        painter: Option<&std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>>,
+        flattened_at: f32,
+        drawn_at: f32,
+        opacity: f32,
+    ) -> (
+        Vec<egui::epaint::ClippedShape>,
+        crate::tile_mesh::ledger::Totals,
+    ) {
         let ctx = egui::Context::default();
         let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(256.0, 256.0));
@@ -2664,6 +2721,7 @@ mod tests {
                     painter,
                     pass_nr: 7,
                     feathering: drawn_at,
+                    opacity,
                 },
                 rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
@@ -2797,13 +2855,221 @@ mod tests {
 
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(256.0, 256.0));
         let expected = crate::tile_mesh::Placement::of(rect);
-        for (_, _, place) in &asked {
+        for (_, _, place, _) in &asked {
             assert_eq!(
                 *place, expected,
                 "a ground draw was placed by something other than \
                  `mvt::placement` over the whole tile"
             );
         }
+    }
+
+    /// **Every ground draw carries the ground's opacity, and at full opacity
+    /// it carries exactly 1.0.** The renderer applies the value in its
+    /// uniform, so a ground that read the painter but did not hand the number
+    /// across would draw its runs at full strength under a dimmed layer while
+    /// the CPU-placed shapes beside them dimmed. Both arms: the dimmed one
+    /// pins the hand-over, the full one pins that a layer nobody dimmed asks
+    /// for nothing but 1.0.
+    #[test]
+    fn every_ground_draw_carries_the_grounds_opacity() {
+        let _ledger = ledger_guard();
+
+        for opacity in [1.0_f32, 0.5] {
+            let recorder = std::sync::Arc::new(RecordingPainter::default());
+            let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> = recorder.clone();
+            let (_, totals) = one_ground_pass_dimmed(
+                a_styled_tile(),
+                Some(&painter),
+                FEATHERING,
+                FEATHERING,
+                opacity,
+            );
+            // Non-vacuity: the runs went to the GPU, so the recorder was asked.
+            assert_eq!((totals.mesh_draws, totals.stroke_draws), (2, 1));
+            let asked = recorder.asked.lock().expect("not poisoned").clone();
+            assert!(!asked.is_empty(), "no ground draw was asked for");
+            for (_, span, _, carried) in &asked {
+                assert_eq!(
+                    *carried, opacity,
+                    "the draw of runs {span:?} did not carry the ground's \
+                     opacity {opacity}"
+                );
+            }
+        }
+    }
+
+    /// One layer pass over a tile with runs, with the ground draws recorded:
+    /// the shapes the pass emitted, the tile's rect and what the renderer was
+    /// asked. `Some(opacity)` runs it under a `Ui` set to that opacity;
+    /// `None` runs it through [`shapes_of_one_pass`], the harness that never
+    /// heard of opacity, which is the control the full arm is compared to.
+    fn a_tile_layer_pass_at(
+        opacity: Option<f32>,
+    ) -> (Vec<egui::epaint::ClippedShape>, egui::Rect, Vec<Asked>) {
+        squallar_radar::tls::init();
+
+        let ctx = egui::Context::default();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let zoom = 6.0;
+        let mut memory = walkers::MapMemory::default();
+        memory.set_zoom(zoom).expect("zoom 6 is in walkers' range");
+        let projector = walkers::Projector::new(canvas, &memory, walkers::lat_lon(35.33, -97.28));
+        let mut tiles = crate::tile_source::HttpsTiles::with_client(
+            DeadSource,
+            ctx.clone(),
+            reqwest::Client::builder()
+                .build()
+                .expect("the test client should build"),
+        );
+        let tile_zoom = zoom.round() as u8;
+        let span = crate::tiles::tile_span(&projector, canvas, tile_zoom);
+        let tile_id = TileId {
+            x: squallar_geo::wrap_tile_x(span.west, tile_zoom),
+            y: span.north,
+            zoom: tile_zoom,
+        };
+        tiles.put_for_test(tile_id, Tile::Vector(std::sync::Arc::new(a_styled_tile())));
+        let rect = projector.tile_rect(tile_id);
+
+        let recorder = std::sync::Arc::new(RecordingPainter::default());
+        let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> = recorder.clone();
+        let draw = |ui: &egui::Ui| {
+            let labels =
+                draw_tile_layer(ui, &projector, zoom, &mut tiles, 0, Some(&painter)).labels;
+            paint_labels(ui.painter(), labels, &mut walkers::GalleyCache::default());
+        };
+        let shapes = match opacity {
+            Some(opacity) => shapes_of_one_pass_at(&ctx, canvas, opacity, draw),
+            None => shapes_of_one_pass(&ctx, canvas, draw),
+        };
+        let asked = recorder.asked.lock().expect("not poisoned").clone();
+        (shapes, rect, asked)
+    }
+
+    /// The kind of every shape a pass emitted, in order, with `Noop` named so
+    /// a shape egui dropped for being invisible is a difference and not a gap.
+    fn kinds_of(shapes: &[egui::epaint::ClippedShape]) -> Vec<&'static str> {
+        shapes
+            .iter()
+            .map(|clipped| match &clipped.shape {
+                egui::Shape::Noop => "noop",
+                egui::Shape::Rect(_) => "rect",
+                egui::Shape::Mesh(_) => "mesh",
+                egui::Shape::Callback(_) => "callback",
+                egui::Shape::Path(_) => "path",
+                egui::Shape::Text(_) => "text",
+                other => panic!("unexpected shape {other:?}"),
+            })
+            .collect()
+    }
+
+    /// **`draw_tile_layer` reads the layer's opacity off the painter it was
+    /// handed, and a tile at half opacity is dimmed on both of its paths.**
+    ///
+    /// The walk sets the `Ui`'s opacity around a layer's arm; this is the
+    /// arm. Under a `Ui` at 0.5 every ground draw carries 0.5 -- the read
+    /// this pins is `ui.painter().opacity()`, and a ground filled from a
+    /// literal 1.0 would record 1.0 here -- while the tile's hoisted
+    /// background, which egui places on the CPU, arrives with every vertex at
+    /// `gamma_multiply(0.5)` of its colour: the two paths dim by the same
+    /// operation, which is what makes a vector layer's opacity one number and
+    /// not a fill drawn at one strength under a ground at another. The
+    /// sequence of shapes is the same as at 1.0, so a dim changes colours
+    /// and nothing about what is drawn or where.
+    ///
+    /// The other arm: under a `Ui` at 1.0 every draw carries 1.0 and the
+    /// shapes are the ones the untouched harness emits, so a layer nobody
+    /// dimmed paints exactly what it painted before opacity existed.
+    #[test]
+    fn a_tile_layer_at_half_opacity_dims_its_runs_and_its_ground_alike() {
+        let _ledger = ledger_guard();
+        let fill = egui::Color32::from_rgb(0x10, 0x20, 0x30);
+
+        // The vertex colour of the tile's hoisted background: a mesh of four
+        // vertices whose bounds are the tile's rect rounded to pixels, which
+        // is how `a_vector_tile_reaches_the_painter_placed_on_its_own_rect`
+        // finds it too.
+        let background_colour = |shapes: &[egui::epaint::ClippedShape], rect: egui::Rect| {
+            use egui::emath::GuiRounding as _;
+            let expected = rect.round_to_pixels(1.0);
+            shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Mesh(m)
+                        if m.vertices.len() == 4
+                            && (m.calc_bounds().min - expected.min).length() < 0.01
+                            && (m.calc_bounds().max - expected.max).length() < 0.01 =>
+                    {
+                        Some(m.vertices[0].color)
+                    }
+                    _ => None,
+                })
+                .expect("the tile's hoisted background did not reach the painter")
+        };
+
+        let (full, rect, asked_full) = a_tile_layer_pass_at(Some(1.0));
+        assert!(!asked_full.is_empty(), "no run reached the renderer");
+        for (_, span, _, carried) in &asked_full {
+            assert_eq!(
+                *carried, 1.0,
+                "runs {span:?} at full opacity carried {carried}"
+            );
+        }
+        assert_eq!(background_colour(&full, rect), fill);
+        assert!(
+            full.iter()
+                .any(|c| matches!(c.shape, egui::Shape::Callback(_))),
+            "no callback was emitted, so the runs were placed on the CPU and \
+             the opacity carried above was never going to be applied"
+        );
+        // Shape for shape what the untouched harness emits. Compared as
+        // `Debug` text rather than by `==`: a `PaintCallback` is equal only
+        // to itself by pointer, and each pass mints its own payload.
+        let (untouched, _, asked_untouched) = a_tile_layer_pass_at(None);
+        assert_eq!(
+            format!("{full:?}"),
+            format!("{untouched:?}"),
+            "a Ui at 1.0 painted something other than a Ui that was never \
+             told an opacity"
+        );
+        // Minus the tile id: every `put_for_test` flattens afresh and
+        // `TileMeshes::id` is minted per flatten, so two passes over the
+        // same fixture never share one. What must agree is what was asked
+        // for and at what strength.
+        let sans_id = |asked: &[Asked]| -> Vec<((usize, usize), crate::tile_mesh::Placement, f32)> {
+            asked
+                .iter()
+                .map(|(_, span, place, o)| (*span, *place, *o))
+                .collect()
+        };
+        assert_eq!(sans_id(&asked_untouched), sans_id(&asked_full));
+
+        let (half, half_rect, asked_half) = a_tile_layer_pass_at(Some(0.5));
+        assert_eq!(half_rect, rect);
+        assert_eq!(
+            asked_half.len(),
+            asked_full.len(),
+            "a dim changed what went to the GPU"
+        );
+        for (_, span, _, carried) in &asked_half {
+            assert_eq!(
+                *carried, 0.5,
+                "runs {span:?} under a Ui at 0.5 carried {carried}: \
+                 `draw_tile_layer` is not reading the painter's opacity"
+            );
+        }
+        assert_eq!(
+            background_colour(&half, rect),
+            fill.gamma_multiply(0.5),
+            "the CPU-placed background was not dimmed by the painter, so the \
+             two paths of one tile would draw at different strengths"
+        );
+        assert_eq!(
+            kinds_of(&half),
+            kinds_of(&full),
+            "a dim changed what was drawn, not only how strongly"
+        );
     }
 
     /// **No stroke point is placed on the CPU while a renderer can draw it.**
@@ -3404,6 +3670,7 @@ mod tests {
             painter: None,
             pass_nr: 1,
             feathering: FEATHERING,
+            opacity: 1.0,
         };
         for (name, ground) in [("planned", planned), ("un-planned", GroundMeshes::CPU_ONLY)] {
             assert_eq!(

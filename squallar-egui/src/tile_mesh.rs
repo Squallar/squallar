@@ -813,6 +813,12 @@ pub struct GroundDraw<'a> {
     /// in that order.
     pub run_count: usize,
     pub place: Placement,
+    /// The painter's opacity for this frame, 0-1, which the callback must
+    /// apply itself: a `Shape::Callback` is the one shape `Painter::add`
+    /// cannot tint, so the layer walk's `set_opacity` reaches every
+    /// CPU-placed shape beside these runs on its own and reaches the runs
+    /// only through here.
+    pub opacity: f32,
     /// egui's cumulative pass number, so the renderer can tell one frame's
     /// draws from the next without a clock or a callback of its own.
     pub pass_nr: u64,
