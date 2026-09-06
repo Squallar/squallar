@@ -1907,6 +1907,21 @@ mod budget_agreement {
         // what that costs. The row below it — a browser at the WebGL2
         // guarantee — is unmoved, which is the half that says the software
         // path did not come with it.
+        //
+        // **And it moved back to 2048 when the render peak was priced**, by a
+        // different route and with the promotion intact: `resolve` still hands
+        // this adapter the 4096 it earned, and then `fit` sheds it. The scene
+        // is one two-hour loop with no cadence, so its 14 named frames charge
+        // 1120 MiB of decoded volume against a 768 MiB host allowance — over
+        // before any raster is counted, and over by more than any rung can
+        // pay, since ruling 13 keeps every rung off the loop's history. What
+        // changed is which rungs are allowed to try: the raster rung answers
+        // the host axis now that `NeedTerms::render_peak_host` is sized from
+        // it, and stepping 4096 -> 2048 really does return 4096^2 x 16 -
+        // 2048^2 x 16 = 192 MiB of host. It is not enough and the scene still
+        // does not fit, which is the same answer the margin and tile rungs
+        // already gave here — those two buy *nothing* on a scene with no
+        // pictures and no tiles, and were taken anyway.
         assert_eq!(
             row(w, DeviceClass::Unknown, 16384, 16384, None, None, 1),
             (
@@ -1914,13 +1929,14 @@ mod budget_agreement {
                 3_538_944,
                 5,
                 56,
-                288 - 64,
-                4096,
+                288 - 16,
+                2048,
                 288,
                 Presumed,
                 14
             ),
-            "Firefox 153 on the RTX 3090, at what it will actually allocate",
+            "Firefox 153 on the RTX 3090: the promotion it earned, shed by the \
+             host axis it cannot pay",
         );
         assert_eq!(
             row(
@@ -1937,14 +1953,16 @@ mod budget_agreement {
                 3_538_944,
                 5,
                 56,
-                288 - 64,
-                4096,
+                288 - 16,
+                2048,
                 288,
                 Presumed,
                 14
             ),
             "the same browser handed a 24 GiB reading and 64 GiB of RAM: nothing a page \
-             reports is a measurement, so the presumption stands",
+             reports is a measurement, so the presumption stands — and the same host \
+             overage sheds the same raster rung, which is what says the two readings \
+             changed nothing",
         );
         assert_eq!(
             row(w, DeviceClass::Unknown, 2048, 256, None, None, 1),

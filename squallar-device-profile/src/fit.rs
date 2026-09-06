@@ -1,8 +1,10 @@
 //! The one function: what a scene costs at a given [`Budgets`], and the largest
 //! [`Budgets`] whose cost fits a [`Capacity`].
 //!
-//! [`need`] sums terms the tree already prices — `Budgets::loop_frame_bytes`,
-//! `Budgets::section_frame_bytes`, `Budgets::static_frame_bytes`, the raymarch's
+//! [`need`] sums terms the tree already prices — `Budgets::loop_frame_cost`,
+//! `Budgets::section_frame_cost` and `Budgets::static_frame_cost`, each a
+//! `constants::FrameCost` naming the memory every byte of a radar picture is
+//! held in rather than a multiplier spelled at the use site, the raymarch's
 //! own resident-grid arithmetic handed in as [`GridBytes`],
 //! `quality::VolumeQuality::fit` for the offscreen, `quality::offscreen_bytes`
 //! for the mirror, the tile cache's measured entry cost,
@@ -44,7 +46,7 @@
 use crate::budget::{
     BudgetLimits, Budgets, DeviceProfile, TileCacheBudget, resolve, step_down, step_down_for,
 };
-use crate::constants::LOOP_SCAN_RESERVE_BYTES;
+use crate::constants::{FrameCost, LOOP_SCAN_RESERVE_BYTES};
 use crate::quality::{GroundPass, offscreen_bytes};
 use crate::scene::{Capacity, Need, PaneNeed, Pools, Scene};
 use squallar_radar::types::RenderView;
@@ -125,6 +127,26 @@ pub struct NeedTerms {
     /// ([`PaneNeed::loop_scans_needed`]) and only a pane parked at a still
     /// keeps one.
     pub loop_scans_host: u64,
+    /// **What a radar render costs the host while it is running**: the widest
+    /// 2D pane's [`FrameCost::host_peak`] — its finished raster and value grid
+    /// with the claim buffer that painted them still alive beside them.
+    ///
+    /// Until this term existed the whole radar raster economy was priced at
+    /// zero on the host axis. `static_rasters` and `loops` are **GPU** terms —
+    /// [`PaneTerms::gpu_bytes`] sums them and nothing else does — and four
+    /// bytes a texel is the right price for an `Rgba8` texture, so nothing was
+    /// wrong with them; what was missing was the other side of the same
+    /// render. At the desktop ceiling that is 1.00 GiB of host the scene never
+    /// declared, and on a `Pools::Unified` adapter — every integrated part —
+    /// the GPU and host needs face **one** joint test
+    /// ([`over`]), so a host term priced at zero there is a byte the admission
+    /// decision could not see at all.
+    ///
+    /// **A max across panes, not a sum**, like [`Self::picture_arrival_host`]
+    /// and for a weaker reason, which the doc on
+    /// [`PaneTerms::render_peak_host`] states in full: this prices **one**
+    /// render, and `concurrent_renders` is 6 on desktop.
+    pub render_peak_host: u64,
 }
 
 impl NeedTerms {
@@ -137,7 +159,8 @@ impl NeedTerms {
                 .saturating_add(self.pictures_host)
                 .saturating_add(self.picture_arrival_host)
                 .saturating_add(self.overlay_grids_host)
-                .saturating_add(self.loop_scans_host),
+                .saturating_add(self.loop_scans_host)
+                .saturating_add(self.render_peak_host),
         }
     }
 
@@ -152,6 +175,7 @@ impl NeedTerms {
         self.pictures_host = self.pictures_host.saturating_add(pane.pictures_host);
         self.picture_arrival_host = self.picture_arrival_host.max(pane.picture_host);
         self.loop_scans_host = self.loop_scans_host.saturating_add(pane.loop_scans_host);
+        self.render_peak_host = self.render_peak_host.max(pane.render_peak_host);
     }
 
     /// Every GPU term but the loops — what the loop pool has to fit beside.
@@ -196,6 +220,46 @@ pub struct PaneTerms {
     /// One of its pictures, for the scene's arrival term to take the max of.
     /// Not in [`Self::host_bytes`].
     pub picture_host: u64,
+    /// **The host peak of the widest radar render this pane can dispatch**,
+    /// for the scene's [`NeedTerms::render_peak_host`] to take the max of.
+    /// Not in [`Self::host_bytes`] — the scene charges one render, not one
+    /// per pane — and zero for a 3D pane, which rasterises nothing.
+    ///
+    /// The pane's **static** render is the widest, on both 2D arms and
+    /// without a case split: a plan view's static is priced at
+    /// `raster_side_ceiling_px` and its loop frames at `loop_image_side_px`,
+    /// which is never the larger of the two on any shipped bracket, and a
+    /// cross-section's loop frame *is* its static frame. A loop of a layer
+    /// that is not radar rasterises no radar buffers at all and is priced
+    /// whole by [`Self::pictures_host`].
+    ///
+    /// **This prices ONE render, and that is a policy, not a proof.** The
+    /// three buffer pools behind a plan-view render (`POOLED_CELLS`,
+    /// `POOLED_IMAGE`, `POOLED_VALUES` in `squallar_radar::render`) are one
+    /// slot each, process-wide, so only one set is ever *retained* between
+    /// renders — which is a strictly weaker claim than only one set
+    /// *existing* at an instant. A second concurrent plan-view render takes
+    /// the `None` arm of every checkout and allocates its own buffers, so
+    /// with `N` of them in flight the true instant peak is `N ×` this, and
+    /// [`Budgets::concurrent_renders`] is **6** on desktop, 3 on mobile, 1 on
+    /// the web. The 1× is chosen because `6 × 1.00 GiB` would put every
+    /// desktop scene over its allowance and shed it to the ladder's floor,
+    /// and over-firing costs a scene rungs it did not owe; it is not a claim
+    /// that `N` cannot exceed one.
+    ///
+    /// **How to show the 1× wrong from a leg rather than from arithmetic.**
+    /// Two always-on census families answer it directly:
+    /// `renders in flight` — the dispatcher's own in-flight raster level,
+    /// summed across panes by `render_dispatch`'s `price_in_flight` at the
+    /// moment each reply is priced — reads above one render's raster exactly
+    /// when two renders overlap, and is the figure that settles `N`. Beside
+    /// it, `render pools` reports the parked bytes the three slots are
+    /// holding at the instant of the read, which stays at one set's worth
+    /// however high `N` goes: the two disagreeing is the signature of
+    /// concurrency this term is not pricing. If a leg shows `renders in
+    /// flight` steady above one raster, raise this to
+    /// `concurrent_renders × peak` and shed the rungs that follow.
+    pub render_peak_host: u64,
 }
 
 impl PaneTerms {
@@ -255,8 +319,10 @@ pub fn need_terms_for_pane(pane: &PaneNeed, budgets: &Budgets, grid_bytes: GridB
 /// [`need_terms_for_pane`] with the grid already priced, so the scene walk
 /// prices it once.
 fn pane_terms(pane: &PaneNeed, budgets: &Budgets, grid: u64) -> PaneTerms {
+    let static_raster = static_raster_cost(pane, budgets);
     let mut terms = PaneTerms {
-        static_rasters: static_raster_bytes(pane, budgets),
+        static_rasters: static_raster.gpu as u64,
+        render_peak_host: static_raster.host_peak() as u64,
         grids: (pane.volume_grids as u64).saturating_mul(grid),
         offscreens: offscreen_term(pane, budgets),
         buildings: buildings_term(pane, budgets),
@@ -614,27 +680,43 @@ fn grid_cost(budgets: &Budgets, grid_bytes: GridBytes) -> u64 {
     grid_bytes(budgets.grid_cells).map_or(u64::MAX, |bytes| bytes as u64)
 }
 
-/// The static render a 2D pane holds: the raster ceiling's worst case, since
-/// that is the most a device on this class can be asked to hold; the section
-/// frame for a cross-section. A 3D pane's picture is its offscreen and grids.
-fn static_raster_bytes(pane: &PaneNeed, budgets: &Budgets) -> u64 {
+/// **What the static render a 2D pane holds costs on every memory**: the
+/// raster ceiling's worst case for a plan view, since that is the most a
+/// device on this class can be asked to hold; the section frame for a
+/// cross-section. A 3D pane's picture is its offscreen and grids, and it
+/// rasterises nothing, so every axis is zero.
+///
+/// The two arms read the layer's own [`FrameCost`] rather than computing one.
+/// The GPU term goes to `static_rasters` and the host peak to
+/// [`PaneTerms::render_peak_host`], from this one value, so the two axes of a
+/// single render can never come to describe different renders.
+fn static_raster_cost(pane: &PaneNeed, budgets: &Budgets) -> FrameCost {
     match pane.view {
-        RenderView::PlanView => budgets.static_frame_bytes() as u64,
-        RenderView::CrossSection => budgets.section_frame_bytes() as u64,
-        RenderView::Volume => 0,
+        RenderView::PlanView => budgets.static_frame_cost(),
+        RenderView::CrossSection => budgets.section_frame_cost(),
+        RenderView::Volume => FrameCost::default(),
     }
 }
 
-/// What one frame of this pane's loop costs: the layer's own measured frame
-/// for a loop that is not radar, else radar's three shapes as the loop pool's
-/// frame model prices them.
+/// **What one frame of this pane's loop costs the GPU**: the layer's own
+/// measured frame for a loop that is not radar, else radar's three shapes as
+/// the loop pool's frame model prices them, each read off a [`FrameCost`]
+/// rather than computed here.
+///
+/// A GPU figure — [`PaneTerms::loops`] is summed only by
+/// [`PaneTerms::gpu_bytes`] — so it takes the texture term and no host one.
+/// The host side of a radar loop frame is **not** this multiplied by the frame
+/// count: `From<SweepRender> for RenderedFrame` hands the value grid straight
+/// back to `squallar_radar::render`'s pool, so the host buffers belong to the
+/// render that is running and not to the frames that are held. They are priced
+/// once, at [`PaneTerms::render_peak_host`].
 fn loop_frame_bytes(pane: &PaneNeed, budgets: &Budgets, grid: u64) -> u64 {
     if pane.overlay_frame_bytes > 0 {
         return pane.overlay_frame_bytes as u64;
     }
     match pane.view {
-        RenderView::PlanView => budgets.loop_frame_bytes() as u64,
-        RenderView::CrossSection => budgets.section_frame_bytes() as u64,
+        RenderView::PlanView => budgets.loop_frame_cost().gpu as u64,
+        RenderView::CrossSection => budgets.section_frame_cost().gpu as u64,
         RenderView::Volume => grid,
     }
 }

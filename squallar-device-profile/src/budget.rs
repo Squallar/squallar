@@ -1,6 +1,7 @@
 //! One device profile in, one immutable set of budgets out.
 
 use crate::constants;
+use crate::constants::FrameCost;
 use crate::quality::{DeviceClass, GradientShading, VolumeQuality};
 use crate::scene::Capacity;
 
@@ -963,22 +964,41 @@ impl Budgets {
         self.loop_pool_floor_bytes
     }
 
-    /// Bytes one loop frame's texture occupies: RGBA at the loop side squared.
+    /// **What one loop frame costs on every memory it is held in.** Read from
+    /// [`constants::plan_view_frame_cost`], which states the composition once;
+    /// nothing here multiplies a side by a literal of its own.
+    pub fn loop_frame_cost(&self) -> FrameCost {
+        constants::plan_view_frame_cost(self.loop_image_side_px)
+    }
+
+    /// Bytes one loop frame's **texture** occupies on the GPU: the `gpu` term
+    /// of [`Self::loop_frame_cost`]. The axis is in the name of the field it
+    /// reads, so a caller summing this onto `host_bytes` has to say so.
     pub fn loop_frame_bytes(&self) -> usize {
-        self.loop_image_side_px * self.loop_image_side_px * 4
+        self.loop_frame_cost().gpu
     }
 
     /// The bytes the shared render cache's entries may occupy between them,
     /// which is the bound that actually holds on it.
+    ///
+    /// A **host** figure — the cache holds `egui::Color32` pixels and a
+    /// hover source, not a texture — so it takes the `host_held` term.
     pub fn render_cache_budget_bytes(&self) -> usize {
-        self.render_cache_entries * constants::raster_bytes(self.long_range_image_side_px)
+        self.render_cache_entries
+            * constants::plan_view_frame_cost(self.long_range_image_side_px).host_held
     }
 
-    /// Bytes one **static** pane render's texture occupies, worst case: the
-    /// raster ceiling, since that is the most a device on this class can be
-    /// asked to hold.
+    /// **What one static pane render costs on every memory it is held in**,
+    /// worst case: priced at the raster ceiling, since that is the most a
+    /// device on this class can be asked to hold. See [`Self::loop_frame_cost`].
+    pub fn static_frame_cost(&self) -> FrameCost {
+        constants::plan_view_frame_cost(self.raster_side_ceiling_px)
+    }
+
+    /// Bytes one **static** pane render's texture occupies on the GPU, worst
+    /// case: the `gpu` term of [`Self::static_frame_cost`].
     pub fn static_frame_bytes(&self) -> usize {
-        self.raster_side_ceiling_px * self.raster_side_ceiling_px * 4
+        self.static_frame_cost().gpu
     }
 
     /// The largest static plan-view raster a device reporting
@@ -990,10 +1010,17 @@ impl Budgets {
             .min(reported.max(1))
     }
 
-    /// Bytes one **cross-section** loop frame occupies: RGBA at
-    /// `section_width × section_width / 2`.
+    /// **What one cross-section frame costs on every memory it is held in**:
+    /// `section_width × section_width / 2`, priced by
+    /// [`constants::section_frame_cost`].
+    pub fn section_frame_cost(&self) -> FrameCost {
+        constants::section_frame_cost(self.section_width_px, self.section_width_px / 2)
+    }
+
+    /// Bytes one **cross-section** frame's texture occupies on the GPU: the
+    /// `gpu` term of [`Self::section_frame_cost`].
     pub fn section_frame_bytes(&self) -> usize {
-        self.section_width_px * (self.section_width_px / 2) * 4
+        self.section_frame_cost().gpu
     }
 
     /// Frames that hold a texture at once. `evict_textures_outside_render_set`
@@ -1170,6 +1197,13 @@ pub struct Rung {
 /// 6. **3D grid cells**, and the volume texture budget with them: the first
 ///    rung a user calls "worse".
 /// 7. **Raster side**, to the long-range floor: the most visible, so last.
+///    Lowers **both** axes, and did not always: a plan-view render's texture
+///    is a GPU term (`fit::NeedTerms::static_rasters`) and the raster, its
+///    value grid and the claim buffer that painted them are a host one
+///    (`fit::NeedTerms::render_peak_host`), both sized from this one figure.
+///    While the host half was priced at zero this read `GPU`, which made
+///    `fit::every_host_rung_at_its_stop` answer "nothing left to shed" with
+///    the largest host lever in the table untouched.
 const LADDER: [Rung; 7] = [
     Rung {
         step: |b, _| {
@@ -1244,7 +1278,7 @@ const LADDER: [Rung; 7] = [
             b.raster_side_ceiling_px = floor;
             moved
         },
-        lowers: Lowers::GPU,
+        lowers: Lowers::BOTH,
     },
 ];
 

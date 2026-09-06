@@ -1126,3 +1126,104 @@ fn the_desktop_raster_ceiling_is_the_widest_sweeps_own_need_and_no_panes() {
         );
     }
 }
+
+/// **What a plan-view render costs on each arm, buffer by buffer** — the
+/// denominator table, so a figure quoted anywhere can be checked against the
+/// class it came from and no two arms can be added.
+///
+/// Every row is the class's own `raster_side_ceiling_px`, which is what
+/// `Budgets::static_frame_cost` prices a still pane at. The two columns are
+/// two memories and are never summed across the boundary: the GPU one is the
+/// `Rgba8` texture, the host one is the raster, the value grid and the claim
+/// buffer that painted them, all three alive together inside
+/// `RenderBuffers::into_output`.
+///
+/// | arm | ceiling | GPU | host peak |
+/// |---|---:|---:|---:|
+/// | wasm32 | 2048 | 16.00 MiB | 64.00 MiB |
+/// | mobile | 4096 | 64.00 MiB | 256.00 MiB |
+/// | desktop | 8192 | 256.00 MiB | 1024.00 MiB |
+///
+/// The **promoted** web rung is the mobile row: a browser on a real driver
+/// earns 4096 (`WASM_RASTER_SIDE_CEILING_PROMOTED`), so its render peak is
+/// 256.00 MiB and not 64.00 MiB, and the two web figures are never merged.
+///
+/// A **loop** frame is a different denominator again and is never the static
+/// one: `LOOP_IMAGE_SIZE` is 1024 on the web and `NATIVE_IMAGE_SIZE` = 2048 on
+/// both native arms, so a native loop frame is 16.00 MiB of texture whatever
+/// the class ceiling says.
+#[test]
+fn what_a_plan_view_render_costs_on_each_arm_buffer_by_buffer() {
+    const MIB: usize = 1024 * 1024;
+    let expected = [
+        ("wasm32", 2048, 16 * MIB, 64 * MIB),
+        ("mobile", 4096, 64 * MIB, 256 * MIB),
+        ("desktop", 8192, 256 * MIB, 1024 * MIB),
+    ];
+    for (arm, (name, side, gpu, host_peak)) in arms().into_iter().zip(expected) {
+        assert_eq!(arm.name, name);
+        assert_eq!(arm.raster_side_ceiling_px, side, "{name} ceiling");
+        let cost = arm.static_frame_cost();
+        assert_eq!(
+            cost,
+            plan_view_frame_cost(side),
+            "{name}: the one statement"
+        );
+        assert_eq!(cost.gpu, gpu, "{name} GPU texture");
+        assert_eq!(cost.host_peak(), host_peak, "{name} host peak");
+        // The composition, term by term, against the buffers themselves. Not
+        // one multiplier restated: each term is its own allocation's width,
+        // and the held pair is what survives the render.
+        let px = side * side;
+        assert_eq!(cost.gpu, px * PLAN_VIEW_TEXEL_BYTES);
+        assert_eq!(
+            cost.host_held,
+            px * (PLAN_VIEW_TEXEL_BYTES + PLAN_VIEW_VALUE_BYTES),
+        );
+        assert_eq!(cost.host_scratch, px * PLAN_VIEW_CELL_BYTES);
+        assert_eq!(cost.host_held, raster_bytes(side), "the held half");
+        // The scratch is not a rounding on the held bytes: the claim buffer
+        // is eight bytes a pixel against the finished pair's eight, so the
+        // peak is twice what is kept and four times the texture.
+        assert_eq!(cost.host_peak(), 4 * cost.gpu);
+        assert_eq!(cost.host_peak(), 2 * cost.host_held);
+    }
+
+    // The promoted web rung is the mobile row, and the loop frame is neither.
+    assert_eq!(
+        plan_view_frame_cost(WASM_RASTER_SIDE_CEILING_PROMOTED).host_peak(),
+        256 * MIB,
+    );
+    assert_eq!(plan_view_frame_cost(WASM_LOOP_IMAGE_SIZE).gpu, 4 * MIB);
+    assert_eq!(plan_view_frame_cost(DESKTOP_LOOP_IMAGE_SIZE).gpu, 16 * MIB);
+    assert_eq!(DESKTOP_LOOP_IMAGE_SIZE, MOBILE_LOOP_IMAGE_SIZE);
+}
+
+/// **A cross-section frame is priced from its own buffers, not the plan
+/// view's**, and the difference is real in both directions: it carries a
+/// per-pixel status byte the plan view has no counterpart for, and it
+/// allocates no claim buffer, so its host peak is its held bytes exactly.
+#[test]
+fn a_cross_section_frame_is_priced_from_its_own_three_buffers() {
+    for arm in arms() {
+        let cost = arm.section_frame_cost();
+        let px = arm.section_width_px * (arm.section_width_px / 2);
+        assert_eq!(cost.gpu, px * PLAN_VIEW_TEXEL_BYTES, "{}", arm.name);
+        assert_eq!(
+            cost.host_held,
+            px * (PLAN_VIEW_TEXEL_BYTES + PLAN_VIEW_VALUE_BYTES + SECTION_STATUS_BYTES),
+            "{}: image, values and status",
+            arm.name,
+        );
+        assert_eq!(
+            cost.host_scratch, 0,
+            "{}: the section sampler allocates no claim buffer",
+            arm.name,
+        );
+        assert_eq!(cost.host_peak(), cost.host_held, "{}", arm.name);
+        assert_eq!(cost.gpu, arm.section_frame_bytes(), "{}", arm.name);
+        // Nine bytes a pixel, not eight: a status code the plan view does
+        // not keep. Restating it as a ratio would lose exactly that.
+        assert_eq!(cost.host_held * 4, cost.gpu * 9, "{}", arm.name);
+    }
+}

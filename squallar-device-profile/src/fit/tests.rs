@@ -72,22 +72,36 @@ fn every_term_is_the_cost_function_it_reuses() {
     assert_eq!(
         plan,
         NeedTerms {
-            static_rasters: b.static_frame_bytes() as u64,
+            static_rasters: b.static_frame_cost().gpu as u64,
+            render_peak_host: b.static_frame_cost().host_peak() as u64,
             ..NeedTerms::default()
         },
     );
     assert_eq!(
         plan.static_rasters,
         256 * MIB,
-        "8192^2 x 4 B on the desktop class"
+        "8192^2 x 4 B of Rgba8 texture on the desktop class"
     );
+    // The other side of the same render, on the other memory: the raster and
+    // its value grid with the claim buffer that painted them still alive.
+    // 8192^2 x (4 + 4 + 8) B, and the only term of the two the GPU never sees.
+    assert_eq!(
+        plan.render_peak_host,
+        1024 * MIB,
+        "8192^2 x 16 B of host at the instant the render runs"
+    );
+    assert_eq!(plan.total().host_bytes, plan.render_peak_host);
 
     // A cross-section pane's static render: the section frame.
     let section = terms(&scene_of(vec![PaneNeed {
         view: RenderView::CrossSection,
         ..plan_pane(HD, false, TWO_HOURS, None)
     }]));
-    assert_eq!(section.static_rasters, b.section_frame_bytes() as u64);
+    assert_eq!(section.static_rasters, b.section_frame_cost().gpu as u64);
+    assert_eq!(
+        section.render_peak_host,
+        b.section_frame_cost().host_peak() as u64,
+    );
 
     // A radar loop: the pane's span at its cadence, held to the render budget,
     // at the loop frame's cost.
@@ -97,7 +111,10 @@ fn every_term_is_the_cost_function_it_reuses() {
         frames, 28,
         "1 + 7200 / 259 frames, under the 36 the budget caps at"
     );
-    assert_eq!(looping.loops, frames as u64 * b.loop_frame_bytes() as u64,);
+    assert_eq!(
+        looping.loops,
+        frames as u64 * b.loop_frame_cost().gpu as u64,
+    );
     assert_eq!(looping.static_rasters, plan.static_rasters);
     // And one decoded volume per frame on the host, at the reserve — a bare
     // loop's only host term, since it shows no picture and pans no tiles.
@@ -106,7 +123,13 @@ fn every_term_is_the_cost_function_it_reuses() {
         frames as u64 * LOOP_SCAN_RESERVE_BYTES
     );
     assert_eq!(looping.loop_scans_host, 28 * 80 * MIB);
-    assert_eq!(looping.total().host_bytes, looping.loop_scans_host);
+    // The render peak rides beside it: a looping pane still holds a static
+    // render, and its host peak is the same one the still pane's is.
+    assert_eq!(looping.render_peak_host, plan.render_peak_host);
+    assert_eq!(
+        looping.total().host_bytes,
+        looping.loop_scans_host + looping.render_peak_host,
+    );
     assert_eq!(plan.loop_scans_host, 0, "a still pane plays from no cache");
     // A pane asking for less than the budget's span gets less; one asking for
     // more is held to the budget's; no cadence yet buys the whole render budget.
@@ -426,6 +449,11 @@ fn per_pane_terms_fold_back_to_the_whole_bit_exactly() {
                 assert_eq!(whole.pictures_host, sum(|p| p.pictures_host), "{ctx}");
                 assert_eq!(whole.loop_scans_host, sum(|p| p.loop_scans_host), "{ctx}");
                 assert_eq!(
+                    whole.render_peak_host,
+                    parts.iter().map(|p| p.render_peak_host).max().unwrap_or(0),
+                    "{ctx}: the render peak is a max across panes, never a sum",
+                );
+                assert_eq!(
                     whole.picture_arrival_host,
                     parts.iter().map(|p| p.picture_host).max().unwrap_or(0),
                     "{ctx}: the arrival is a max across panes, never a sum",
@@ -455,8 +483,10 @@ fn per_pane_terms_fold_back_to_the_whole_bit_exactly() {
                     sum(|p| p.host_bytes())
                         + whole.tiles_host
                         + whole.picture_arrival_host
-                        + whole.overlay_grids_host,
-                    "{ctx}: the host whole is the panes plus the tiles, the arrival and the grids",
+                        + whole.overlay_grids_host
+                        + whole.render_peak_host,
+                    "{ctx}: the host whole is the panes plus the tiles, the arrival, the grids \
+                     and the one render's peak",
                 );
                 assert_eq!(need(scene, &b, stand_in_grid_bytes), whole.total(), "{ctx}");
             }
@@ -1677,22 +1707,49 @@ fn a_shown_picture_is_priced_at_the_planners_own_arithmetic() {
 ///
 /// **The still shape** — the leg's pane with its loop stopped — is the
 /// picture arithmetic: thirteen pictures at 1.5x on the leg's own 2878 x 1611
-/// pane plus the 193-tile working set plus one arrival are 866,375,476 B of
-/// host need against three quarters of a 1 GiB page heap (805,306,368 B) —
-/// over, which is the trap of 2026-09-02 priced. At 1.25x the same scene is
-/// 687,785,260 B and fits, so `fit` takes exactly that one step: the 3D
-/// ceiling, grid and raster side stay at the class rung, the tiles do not
-/// snap. The same bytes on the desktop bracket with a measured 1 GiB of RAM
-/// take the same one step. Under the session presumptions the watermark
-/// lowers to — nine tenths, then eighty-one hundredths — the rung stays at
-/// 1.25x and then goes to 1x, where the scene is 541,944,292 B against
-/// 652,298,157 B and fits again.
+/// pane plus the 193-tile working set plus one arrival plus the pane's own
+/// render peak are 933,484,340 B of host need against three quarters of a
+/// 1 GiB page heap (805,306,368 B) — over, which is the trap of 2026-09-02
+/// priced. At 1.25x the same scene is 754,894,124 B and fits, so `fit` takes
+/// exactly that one step: the 3D ceiling, grid and raster side stay at the
+/// class rung, the tiles do not snap. Under the session presumptions the
+/// watermark lowers to — nine tenths, then eighty-one hundredths — the rung
+/// goes to 1x at both, where the scene is 609,053,156 B against 652,298,157 B
+/// and fits again.
+///
+/// **Every host figure here is 67,108,864 B larger than it was**, on both
+/// shapes and at every rung, and one term is the whole of the difference:
+/// `NeedTerms::render_peak_host`, the web bracket's 2048 x 2048 raster with
+/// its value grid and its claim buffer, 2048^2 x 16 B. Before it the radar
+/// raster economy was priced at zero on the host axis. It does not move with
+/// any rung on this bracket, because `WASM_RASTER_SIDE_CEILING` already *is*
+/// the long-range floor the raster rung steps to.
+///
+/// **It costs the nine-tenths presumption a rung, and that is the behaviour
+/// change.** At 1.25x the scene is 754,894,124 B against that watermark's
+/// 724,775,730 B allowance — over by 30,118,394 B — so the margin steps a
+/// second time to 1x. Priced without the render peak it was 687,785,260 B,
+/// under the same allowance with 36,990,470 B to spare, and stopped at one
+/// step. The rung it now sheds is one it always owed.
+///
+/// **The desktop bracket no longer takes the same one step**, and that is
+/// the second behaviour change. Its render peak is 8192^2 x 16 B = 1.00 GiB
+/// against the web's 64.00 MiB, so the same scene on the same 1 GiB of RAM
+/// is over by more than the margin rung can pay: it sheds the margin twice,
+/// snaps the tiles, and then steps the raster side to its 4096 floor — four
+/// rungs — and at 810,379,748 B is *still* 5,073,380 B over the allowance,
+/// with every host rung at its stop. A host need is therefore no longer
+/// equal across brackets at the same scene and the same RAM. It never was
+/// on the GPU axis, where `static_rasters` has always been priced at the
+/// class's `raster_side_ceiling_px`; this is the same class figure reaching
+/// the other memory, and it reaches it because the render is one render.
 ///
 /// **This is the arithmetic that failed to run on the leg**, and the reason
 /// is one figure: the need was priced at ONE picture per pane, not thirteen.
-/// 41,719,488 B plus an arrival plus the tiles is 365,741,620 B, well inside
-/// the 805,306,368 B allowance, so `fit` correctly answered "nothing to
-/// shed" to a question that was 500 MB short of the scene. The leg's last
+/// 41,719,488 B plus an arrival plus the tiles plus the render peak is
+/// 432,850,484 B, well inside the 805,306,368 B allowance, so `fit` correctly
+/// answered "nothing to shed" to a question that was 500 MB short of the
+/// scene. The leg's last
 /// telemetry read `steps 0` and `oversample 150` at 1011 of 1024 MiB of
 /// page heap, which is that answer, printed.
 ///
@@ -1707,13 +1764,13 @@ fn a_shown_picture_is_priced_at_the_planners_own_arithmetic() {
 /// allowance on its admission price alone. (At the superseded 58.3 MiB
 /// measurement the reserve was 64 MiB and this read 738,197,504 B, 91.7 %:
 /// under the allowance, which is the reading the correction removed.) So the
-/// host rungs go to their stops (1.25x, 1x, tiles snapped — three steps) and
-/// the scene still costs 1,464,691,172 B against an 805,306,368 B allowance;
+/// host rungs go to their stops (1.25x, 1x, tiles snapped — three steps, the
+/// raster rung moving nothing on a bracket already at its floor) and the
+/// scene still costs 1,172,851,501 B against an 805,306,368 B allowance;
 /// `fit_holds`, because nothing is left to shed on that axis, and no GPU
-/// rung moves for it. The desktop bracket's 28 frames are 2,348,810,240 B
-/// and the same three steps. Under ruling 13 no host rung shortens the loop;
-/// what makes this scene fit is the user's span or, later, a refusal at the
-/// door — not a rung.
+/// rung moves for it. Under ruling 13 no host rung shortens the loop; what
+/// makes this scene fit is the user's span or, later, a refusal at the door
+/// — not a rung.
 #[test]
 fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_no_host_rung() {
     let leg = huge(13);
@@ -1738,7 +1795,7 @@ fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_n
     // ladder never moves. The difference between these two lines is the
     // whole defect; neither the allowance nor the tile term is in it.
     let undercounted = need(&still(1), &top, stand_in_grid_bytes).host_bytes;
-    assert_eq!(undercounted, 365_741_620);
+    assert_eq!(undercounted, 432_850_484);
     assert_eq!(
         over(&still(1), &top, &presumed, stand_in_grid_bytes),
         (false, false),
@@ -1752,7 +1809,20 @@ fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_n
     assert_eq!(at_top.pictures_host, 13 * 41_719_488);
     assert_eq!(at_top.picture_arrival_host, 41_719_488);
     assert_eq!(at_top.loop_scans_host, 0, "the still shape plays no loop");
-    assert_eq!(at_top.total().host_bytes, 866_375_476);
+    // The one term that was priced at zero before: the web bracket's whole
+    // 2048^2 raster with its value grid and its claim buffer, all three alive
+    // together at the instant the render runs.
+    assert_eq!(
+        at_top.render_peak_host,
+        top.static_frame_cost().host_peak() as u64
+    );
+    assert_eq!(at_top.render_peak_host, 2048 * 2048 * 16);
+    assert_eq!(at_top.total().host_bytes, 933_484_340);
+    assert_eq!(
+        at_top.total().host_bytes - at_top.render_peak_host,
+        866_375_476,
+        "the render peak is the whole of the difference from the pre-term figure",
+    );
     assert_eq!(
         over(&scene, &top, &presumed, stand_in_grid_bytes),
         (false, true)
@@ -1763,7 +1833,7 @@ fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_n
     assert_eq!(fitted.overlay_oversample_percent, 125);
     assert_eq!(
         need(&scene, &fitted, stand_in_grid_bytes).host_bytes,
-        687_785_260
+        754_894_124
     );
     assert_eq!(
         over(&scene, &fitted, &presumed, stand_in_grid_bytes),
@@ -1788,7 +1858,14 @@ fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_n
         stand_in_grid_bytes
     ));
 
-    // The same scene, the same host, the desktop bracket: the same step.
+    // **The same scene, the same host, the desktop bracket: four steps now,
+    // not one.** Its render peak is 8192^2 x 16 B against the web's
+    // 2048^2 x 16 B — a class figure, exactly as `static_rasters` has always
+    // been on the GPU axis — so the margin rung cannot pay for it alone: the
+    // margin steps twice, the tiles snap, and the raster side goes to its
+    // 4096 floor, which is a *host* shed only because pricing this term made
+    // the raster rung lower both axes. At its stops the scene is still over,
+    // and `fit_holds` because there is nothing left on that axis.
     let desktop = DeviceProfile {
         class: DeviceClass::Discrete,
         vram_bytes: Some(24 << 30),
@@ -1798,28 +1875,59 @@ fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_n
     let measured = desktop.capacity();
     assert_eq!(measured.source, CapacitySource::Measured);
     assert_eq!(measured.host_allowance(), Some(805_306_368));
+    assert_eq!(
+        resolve(&desktop).static_frame_cost().host_peak(),
+        8192 * 8192 * 16,
+        "1.00 GiB, sixteen times the web bracket's peak",
+    );
     let on_desktop = fit(&scene, &desktop, &measured, stand_in_grid_bytes);
-    assert_eq!(on_desktop.steps_back, 1);
-    assert_eq!(on_desktop.overlay_oversample_percent, 125);
+    assert_eq!(on_desktop.steps_back, 4);
+    assert_eq!(on_desktop.overlay_oversample_percent, 100);
+    assert!(on_desktop.tile_whole_zoom);
+    assert_eq!(
+        on_desktop.raster_side_ceiling_px,
+        BudgetLimits::DESKTOP.long_range_image_side_px.floor,
+        "the raster rung is reachable from the host axis now that a host term \
+         is sized from it",
+    );
     assert_eq!(
         need(&scene, &on_desktop, stand_in_grid_bytes).host_bytes,
-        need(&scene, &fitted, stand_in_grid_bytes).host_bytes,
-        "the same scene costs different host bytes on two brackets",
+        810_379_748,
     );
+    assert!(
+        need(&scene, &on_desktop, stand_in_grid_bytes).host_bytes
+            > measured.host_allowance().unwrap(),
+        "the desktop bracket cannot pay for this scene at any host rung",
+    );
+    assert!(every_host_rung_at_its_stop(&on_desktop, &desktop.limits));
+    assert!(fit_holds(
+        &scene,
+        &on_desktop,
+        &desktop.limits,
+        &measured,
+        stand_in_grid_bytes
+    ));
 
     // The presumption the watermark lowers to, once and twice.
     let lowered = |tenths: u64| presumed.host_held_to(Some((1u64 << 30) * tenths / 100));
+    // **The rung the render peak costs.** Nine tenths held 1.25x while the
+    // radar raster was priced at zero; with it the scene is 754,894,124 B
+    // against 724,775,730 B, over by 30,118,394 B, and the margin steps
+    // again. Without the term it was 687,785,260 B, under with 36,990,470 B
+    // spare — the whole of the difference is one 67,108,864 B render.
     let once = fit(&scene, &wasm, &lowered(90), stand_in_grid_bytes);
+    assert_eq!(lowered(90).host_allowance(), Some(724_775_730));
     assert_eq!(
-        once.overlay_oversample_percent, 125,
-        "nine tenths still holds 1.25x"
+        once.overlay_oversample_percent, 100,
+        "nine tenths no longer holds 1.25x once the render is priced"
     );
+    assert_eq!(once.steps_back, 2);
     let twice = fit(&scene, &wasm, &lowered(81), stand_in_grid_bytes);
     assert_eq!(twice.steps_back, 2);
     assert_eq!(twice.overlay_oversample_percent, 100);
     assert_eq!(
         need(&scene, &twice, stand_in_grid_bytes).host_bytes,
-        541_944_292
+        609_053_156
     );
     assert_eq!(lowered(81).host_allowance(), Some(652_298_157));
     assert!(
@@ -1858,10 +1966,10 @@ fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_n
     assert_eq!(playing.loop_scans_host, 563_798_345);
     assert_eq!(
         playing.total().host_bytes,
-        866_375_476 + 563_798_345,
+        933_484_340 + 563_798_345,
         "the still shape's bytes plus the volumes"
     );
-    assert_eq!(playing.total().host_bytes, 1_430_173_821);
+    assert_eq!(playing.total().host_bytes, 1_497_282_685);
     assert_eq!(
         playing.total().host_bytes - playing.loop_scans_host,
         at_top.total().host_bytes,
@@ -1898,22 +2006,25 @@ fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_n
         pending.loop_scans_host - playing.loop_scans_host,
         358_948_535
     );
-    assert_eq!(pending.total().host_bytes, 1_789_122_356);
+    assert_eq!(pending.total().host_bytes, 1_856_231_220);
 
     let leg_fitted = fit(&leg, &wasm, &presumed, stand_in_grid_bytes);
     assert_eq!(
         leg_fitted.steps_back, 3,
-        "both oversampling steps and the tile snap: every host rung"
+        "both oversampling steps and the tile snap: every host rung that \
+         moves. The raster rung now answers the host axis too, but the web \
+         bracket's ceiling already is the floor it steps to, so it moves \
+         nothing and is not a fourth step here."
     );
     assert_eq!(leg_fitted.overlay_oversample_percent, 100);
     assert!(leg_fitted.tile_whole_zoom);
     assert_eq!(
         need(&leg, &leg_fitted, stand_in_grid_bytes).host_bytes,
-        541_944_292 + 563_798_345
+        609_053_156 + 563_798_345
     );
     assert_eq!(
         need(&leg, &leg_fitted, stand_in_grid_bytes).host_bytes,
-        1_105_742_637
+        1_172_851_501
     );
     assert_eq!(
         over(&leg, &leg_fitted, &presumed, stand_in_grid_bytes),
@@ -1960,9 +2071,16 @@ fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_n
     );
     assert_eq!(on_desktop.loop_scans_host, 1_989_861_705);
     let leg_on_desktop = fit(&leg, &desktop, &measured, stand_in_grid_bytes);
-    assert_eq!(leg_on_desktop.steps_back, 3);
+    // Four rungs, not three: the desktop bracket's 1.00 GiB render peak puts
+    // the raster rung in reach of the host axis, and it steps to the 4096
+    // floor after the margin and the tiles have paid what they can.
+    assert_eq!(leg_on_desktop.steps_back, 4);
     assert_eq!(leg_on_desktop.overlay_oversample_percent, 100);
     assert!(leg_on_desktop.tile_whole_zoom);
+    assert_eq!(
+        leg_on_desktop.raster_side_ceiling_px,
+        BudgetLimits::DESKTOP.long_range_image_side_px.floor,
+    );
     assert!(every_host_rung_at_its_stop(
         &leg_on_desktop,
         &desktop.limits
@@ -1979,15 +2097,15 @@ fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_n
     // oversampling step**, exactly as the still shape does. Its frames are
     // rendered from paired objects, so its site's decoded volumes are dropped
     // and the scan term is nothing: the scene is the pictures and the tiles
-    // again, 866,375,476 B over at 1.5x and 687,785,260 B fitting at 1.25x.
+    // again, 933,484,340 B over at 1.5x and 754,894,124 B fitting at 1.25x.
     // That is the whole distance between the two loops on this scene — one
-    // rung and a fit, against three rungs and 272,984,548 B still over — and
+    // rung and a fit, against three rungs and 367,545,133 B still over — and
     // it is why the price asks the retention's own predicate rather than
     // charging every loop for volumes.
     let l3 = huge_level3(13);
     let l3_terms = need_terms(&l3, &top, stand_in_grid_bytes);
     assert_eq!(l3_terms.loop_scans_host, 0);
-    assert_eq!(l3_terms.total().host_bytes, 866_375_476);
+    assert_eq!(l3_terms.total().host_bytes, 933_484_340);
     assert_eq!(
         l3_terms.total().gpu_bytes,
         playing.total().gpu_bytes,
@@ -2005,7 +2123,7 @@ fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_n
     assert_eq!(
         need(&leg, &leg_fitted, stand_in_grid_bytes).host_bytes
             - presumed.host_allowance().unwrap(),
-        300_436_269,
+        367_545_133,
         "what the Level II leg is over by at every host rung",
     );
 }
@@ -2398,4 +2516,80 @@ fn a_measured_discrete_card_is_unchanged_in_every_figure() {
         budgets.tile_cache(),
         "the economy split is not in force on the measured arm",
     );
+}
+
+/// **Both arms of the render-peak term**: a scene that owed it and now sheds
+/// for it, and one with room that must not move at all.
+///
+/// The firing arm is the incident's own shape — a `Pools::Unified` part, where
+/// the GPU and host needs face one allowance, so a host term priced at zero is
+/// a byte the admission decision cannot see. One still plan-view pane on a
+/// 1 GiB pool: 256 MiB of texture and, at the desktop ceiling, 1.00 GiB of
+/// host at the instant the render runs. The counterfactual is spelled as
+/// subtraction rather than as a second build — the same need with
+/// `render_peak_host` taken back out — so the claim "this term is what fires"
+/// is arithmetic on one figure and not a comparison of two.
+///
+/// The control arm is the one that matters more. Over-firing costs a scene
+/// rungs it does not owe, and a term that fires on everything is worse than
+/// one that fires on nothing: the same scene against a pool with room stays
+/// at the class rung, every field of it, and `steps_back` is zero.
+#[test]
+fn the_render_peak_sheds_a_scene_that_owed_it_and_leaves_one_with_room_alone() {
+    let profile = shipped_profile(BudgetLimits::DESKTOP);
+    let top = resolve(&profile);
+    let scene = scene_of(vec![plan_pane(HD, false, TWO_HOURS, None)]);
+    let terms = need_terms(&scene, &top, stand_in_grid_bytes);
+    assert_eq!(terms.render_peak_host, 1024 * MIB, "8192^2 x 16 B");
+    assert_eq!(terms.total().gpu_bytes, 256 * MIB, "8192^2 x 4 B");
+    assert_eq!(
+        terms.total().host_bytes,
+        terms.render_peak_host,
+        "a bare still pane's whole host cost is the render it is showing",
+    );
+
+    // The firing arm.
+    let tight = Capacity::unified(1 << 30, None);
+    assert_eq!(tight.pools, Pools::Unified);
+    let joint = terms.total().gpu_bytes + terms.total().host_bytes;
+    assert!(
+        joint > tight.joint_allowance(),
+        "{joint} against {}",
+        tight.joint_allowance(),
+    );
+    assert!(
+        joint - terms.render_peak_host < tight.joint_allowance(),
+        "priced as it was before the term, this scene fit with room to spare, \
+         which is what makes the term the thing that fires",
+    );
+    let fitted = fit(&scene, &profile, &tight, stand_in_grid_bytes);
+    assert!(fitted.steps_back > 0, "the scene sheds for the term");
+    assert_eq!(
+        fitted.raster_side_ceiling_px,
+        BudgetLimits::DESKTOP.long_range_image_side_px.floor,
+        "and the rung it ends on is the raster side, which only answers the \
+         host axis because this term is sized from it",
+    );
+    let after = need(&scene, &fitted, stand_in_grid_bytes);
+    assert!(
+        after.gpu_bytes + after.host_bytes <= tight.joint_allowance(),
+        "and having shed, it fits",
+    );
+    assert!(fit_holds(
+        &scene,
+        &fitted,
+        &profile.limits,
+        &tight,
+        stand_in_grid_bytes
+    ));
+
+    // The control arm: the same scene, a pool with room, nothing moves.
+    let roomy = Capacity::unified(8 << 30, None);
+    assert!(joint < roomy.joint_allowance());
+    let unshed = fit(&scene, &profile, &roomy, stand_in_grid_bytes);
+    assert_eq!(
+        unshed, top,
+        "a scene that fits must not shed a rung for a term it can pay",
+    );
+    assert_eq!(unshed.steps_back, 0);
 }

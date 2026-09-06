@@ -22,7 +22,7 @@ use squallar_device_profile::budget::Budgets;
 use squallar_device_profile::constants::{
     LOOP_IMAGE_SIZE, LOOP_POOL_CEILING_BYTES, LOOP_POOL_DWELL_FRAMES, LOOP_POOL_FLOOR_BYTES,
     LOOP_POOL_HYSTERESIS, MAX_LOOP_FRAMES, MAX_LOOP_RENDER_BUDGET, MIN_LOOP_FRAMES_PER_PANE,
-    RENDER_HEIGHT, RENDER_WIDTH, VOLUME_GRID_CELLS,
+    RENDER_HEIGHT, RENDER_WIDTH, VOLUME_GRID_CELLS, plan_view_frame_cost, section_frame_cost,
 };
 use squallar_device_profile::fit::{GridBytes, loop_pool_bytes};
 use squallar_device_profile::scene::{Capacity, CapacitySource, Scene};
@@ -166,13 +166,25 @@ pub fn nominal_overlay_frame_bytes() -> usize {
     plan.width as usize * plan.height as usize * 4
 }
 
-/// What one loop frame costs on this device class, and how many the dispatcher
-/// will ever texture or list.
+/// What one loop frame costs the **GPU** on this device class, and how many
+/// the dispatcher will ever texture or list.
+///
+/// Every byte figure here is a texture: this model sizes the loop pool, and
+/// the pool holds textures. The host side of a radar frame is not this
+/// multiplied by the frame count and is not in this struct — the renderer
+/// hands its value grid straight back to `squallar_radar::render`'s pool at
+/// `From<SweepRender> for RenderedFrame`, so those bytes belong to the render
+/// that is running rather than to the frames that are held, and
+/// `squallar_device_profile::fit::NeedTerms::render_peak_host` prices them
+/// once for the whole scene.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoopFrameModel {
-    /// A [`LOOP_IMAGE_SIZE`]² RGBA raster.
+    /// The `Rgba8` texture a [`LOOP_IMAGE_SIZE`]² raster uploads as — the
+    /// `gpu` term of `constants::plan_view_frame_cost`, which states the
+    /// composition once for every site that prices a radar frame.
     pub plan_view: usize,
-    /// `SECTION_WIDTH × SECTION_HEIGHT` RGBA — half a plan-view frame.
+    /// The same, for a `SECTION_WIDTH × SECTION_HEIGHT` section — half a
+    /// plan-view frame's texture.
     pub section: usize,
     /// One resident voxel grid with its mips and its colour table.
     pub grid: usize,
@@ -196,12 +208,13 @@ pub struct LoopFrameModel {
 impl LoopFrameModel {
     /// The compiled target's figures.
     pub fn for_target() -> Self {
-        let side = LOOP_IMAGE_SIZE;
         Self {
-            plan_view: side * side * 4,
-            section: squallar_radar::xsect::SECTION_WIDTH
-                * squallar_radar::xsect::SECTION_HEIGHT
-                * 4,
+            plan_view: plan_view_frame_cost(LOOP_IMAGE_SIZE).gpu,
+            section: section_frame_cost(
+                squallar_radar::xsect::SECTION_WIDTH,
+                squallar_radar::xsect::SECTION_HEIGHT,
+            )
+            .gpu,
             grid: squallar_volumetric::raymarch::resident_grid_bytes(VOLUME_GRID_CELLS)
                 .unwrap_or(usize::MAX),
             overlay: nominal_overlay_frame_bytes(),
@@ -213,8 +226,8 @@ impl LoopFrameModel {
     /// The figures a resolved [`Budgets`] carries.
     pub fn from_budgets(budgets: &Budgets) -> Self {
         Self {
-            plan_view: budgets.loop_frame_bytes(),
-            section: budgets.section_frame_bytes(),
+            plan_view: budgets.loop_frame_cost().gpu,
+            section: budgets.section_frame_cost().gpu,
             // Bytes one resident voxel grid costs: every mip level, its
             // colour table's own texture and the jitter tile beside it, read
             // from the upload path's own arithmetic (`None` only on a `usize`

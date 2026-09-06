@@ -73,11 +73,132 @@ pub const WASM_RASTER_SIDE_CEILING: usize = WASM_LONG_RANGE_IMAGE_SIZE;
 /// gates carry the detail reaches past it.
 pub const WASM_RASTER_SIDE_CEILING_PROMOTED: usize = MOBILE_RASTER_SIDE_CEILING;
 
-/// Bytes one raster of `side` costs on the host: its RGBA and its `f32` value
-/// grid, four bytes each per pixel.
-pub const fn raster_bytes(side: usize) -> usize {
-    side * side * 8
+/// **What one radar picture costs, on each memory that pays for it.**
+///
+/// A price the budget system *spends*, never one it computes. Every site that
+/// wanted a frame's cost used to spell its own arithmetic over a side — four
+/// of them spelled `side * side * 4` — and a multiplier written at a use site
+/// keeps passing its assertions after the thing it describes has changed
+/// shape. The three fields below name the three memories a picture is really
+/// held in, so a site reads the axis it is summing onto and cannot silently
+/// sum one axis's bytes into another's total.
+///
+/// The axes are **not** interchangeable and are never added across a boundary:
+/// [`Self::gpu`] is a term of `crate::fit::PaneTerms::gpu_bytes`, the two host
+/// figures of `host_bytes`. A `Pools::Unified` adapter is the one place their
+/// sum is taken, and it is taken by `crate::fit::over`, once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameCost {
+    /// **Texture bytes on the GPU**, for as long as the picture is held: the
+    /// one `Rgba8` texture the renderer's raster uploads as, four bytes a
+    /// texel, no mip chain (egui uploads none).
+    pub gpu: usize,
+    /// **Host bytes held for as long as the picture is held**: the raster as
+    /// the display layer keeps it, plus the numbers a readout reads.
+    pub host_held: usize,
+    /// **Host bytes live only while the render that makes the picture runs**,
+    /// and live *at the same instant* as [`Self::host_held`] — not before it
+    /// and not after it, so the two add rather than alternate.
+    pub host_scratch: usize,
 }
+
+impl FrameCost {
+    /// The host peak: what the heap is holding at the instant the render that
+    /// makes this picture is inside `into_output`, with the scratch buffer and
+    /// the finished buffers all alive. The figure a commitment is made
+    /// against, rather than the mean over the render.
+    pub const fn host_peak(&self) -> usize {
+        self.host_held + self.host_scratch
+    }
+}
+
+/// **Bytes a plan-view radar raster of `side` costs, buffer by buffer.**
+///
+/// The one statement of the composition. Every budget site takes its price
+/// from here rather than multiplying a side by a literal of its own, so a
+/// change to what a render allocates lands in one place instead of surviving
+/// in four.
+///
+/// **Its home is beside the buffers, in `squallar_radar::render`.** It is here
+/// only because that file is being rewritten to a polar representation — where
+/// a frame costs `radials × gates × width × sweeps` and a mip factor, which no
+/// expression over a `side` can state at all. This function is the seam that
+/// rewrite swaps: give it the polar shape's own inputs, and every site below
+/// keeps reading a [`FrameCost`] and needs no edit.
+///
+/// The terms, each against the allocation that makes it in
+/// `squallar_radar::render`:
+///
+/// | buffer | site | bytes/px | axis |
+/// |---|---|---:|---|
+/// | `Vec<AtomicU64>` cells | `RenderBuffers::checkout` | 8 | host, scratch |
+/// | `Vec<f32>` values | `checkout_values` | 4 | host, held |
+/// | `Vec<u8>` RGBA | `checkout_image` | 4 | host, held |
+/// | the uploaded texture | the display layer | 4 | GPU |
+///
+/// All three host buffers are alive together inside `RenderBuffers::into_output`:
+/// the values are filled from the cells, the cells are handed back, and only
+/// then is the image checked out — so the cells' pages are still charged to
+/// the process when the values exist, which is what makes the scratch term add
+/// to the held one rather than replace it.
+pub const fn plan_view_frame_cost(side: usize) -> FrameCost {
+    let pixels = side * side;
+    FrameCost {
+        gpu: pixels * PLAN_VIEW_TEXEL_BYTES,
+        host_held: pixels * (PLAN_VIEW_TEXEL_BYTES + PLAN_VIEW_VALUE_BYTES),
+        host_scratch: pixels * PLAN_VIEW_CELL_BYTES,
+    }
+}
+
+/// One RGBA texel, in the raster the renderer writes (`checkout_image`) and in
+/// the `Rgba8` texture it uploads as.
+pub const PLAN_VIEW_TEXEL_BYTES: usize = 4;
+
+/// One entry of the per-pixel value grid a readout reads (`checkout_values`,
+/// a `Vec<f32>`). Host only: the numbers are never uploaded.
+pub const PLAN_VIEW_VALUE_BYTES: usize = 4;
+
+/// One cell of the claim buffer a render paints into (`RenderBuffers::cells`,
+/// a `Vec<AtomicU64>`: a gate key in the high 32 bits, the value in the low).
+/// Host only, and live only while a render runs.
+pub const PLAN_VIEW_CELL_BYTES: usize = 8;
+
+/// Bytes one raster of `side` costs on the host once it is finished: its RGBA
+/// and its `f32` value grid, four bytes each per pixel — the held half of
+/// [`plan_view_frame_cost`], which states the composition.
+pub const fn raster_bytes(side: usize) -> usize {
+    plan_view_frame_cost(side).host_held
+}
+
+/// **Bytes a cross-section raster of `width × height` costs, buffer by
+/// buffer** — [`plan_view_frame_cost`]'s counterpart for the other 2D view,
+/// and stated here for the same reason.
+///
+/// Its buffers are the three fields `squallar_radar::xsect::CrossSection`
+/// holds, all `width × height` and all kept for the life of the section:
+///
+/// | buffer | bytes/px | axis |
+/// |---|---:|---|
+/// | `image`, RGBA8 | 4 | host, held (and the GPU texture) |
+/// | `values`, `f32` in the product's own unit | 4 | host, held |
+/// | `status`, one `SampleStatus::wire_code` | 1 | host, held |
+///
+/// **No scratch term, and that is a difference from the plan view, not an
+/// omission**: the section sampler writes its three buffers directly and
+/// allocates no claim buffer, so there is nothing here answering to
+/// [`PLAN_VIEW_CELL_BYTES`].
+pub const fn section_frame_cost(width: usize, height: usize) -> FrameCost {
+    let pixels = width * height;
+    FrameCost {
+        gpu: pixels * PLAN_VIEW_TEXEL_BYTES,
+        host_held: pixels * (PLAN_VIEW_TEXEL_BYTES + PLAN_VIEW_VALUE_BYTES + SECTION_STATUS_BYTES),
+        host_scratch: 0,
+    }
+}
+
+/// One pixel's sample-status code in a cross-section
+/// (`squallar_radar::xsect::CrossSection`'s `status`, a `Vec<u8>`). Host only.
+pub const SECTION_STATUS_BYTES: usize = 1;
 
 /// The side a **loop frame** is rendered at — the whole side, not a ceiling on
 /// a long-range one: a loop of a 458 km surveillance cut draws every frame at
