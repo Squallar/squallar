@@ -46,6 +46,11 @@ pub struct BudgetReadout {
     pub generation: u64,
     /// One entry per visible pane, in pane order.
     pub panes: Vec<PaneBudget>,
+    /// **One row per layer of each pane that costs the model anything**, in
+    /// pane order and outer-indexed exactly like [`Self::panes`] — the layers
+    /// menu's own read-out. Empty inner vectors are normal: a pane whose
+    /// layers are all point-drawn charges no term any row could carry.
+    pub pane_layers: Vec<Vec<LayerBudget>>,
     /// The whole scene's terms — the panes folded plus the scene-level
     /// terms: mirror, tiles, the arrival, the overlay grids.
     pub terms: NeedTerms,
@@ -92,12 +97,134 @@ pub struct PaneBudget {
     /// admission, visibly"*. The admission door itself is not built here; a
     /// readout that names the two figures is what stands in for it.
     pub loop_frames_effective: usize,
+    /// **What this pane costs the pool that binds it, and the room it has
+    /// there** — the frame overlay's whole line. See [`Charge`].
+    pub charge: Charge,
 }
 
 impl PaneBudget {
     /// Whether this pane's loop was held below what its span asked for.
     pub fn loop_span_clamped(&self) -> bool {
         self.loop_frames_effective < self.loop_frames_requested
+    }
+}
+
+/// **One layer of one pane, as the model prices it** — the layers menu's row
+/// figure.
+///
+/// The pair is the *priced* family, split by **who is charged for it**, which
+/// is the split ruling 8 asks to be displayed rather than attributed:
+/// [`Self::shared_bytes`] is what the application pays once however many panes
+/// show the layer, [`Self::own_bytes`] what this pane pays on top. It is not
+/// the held family [`PaneBudget::shared_bytes`] carries — that one is bytes
+/// resident in the two refcounted stores at the instant of the read — and the
+/// two are never added.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayerBudget {
+    /// Which layer's row this is.
+    pub layer: LayerId,
+    /// **Bytes the application pays once for this layer, whatever pane shows
+    /// it**: a gridded overlay's decoded source grid (one handler instance
+    /// app-wide, so shared by construction), a tile role's working set, and a
+    /// loop the plan aliased onto another pane's.
+    pub shared_bytes: u64,
+    /// **Bytes this pane pays on top**: its own whole-picture raster and the
+    /// copy of it the upload queue holds, its own loop's frames where the plan
+    /// did not alias them, and radar's own rasters and decoded volumes.
+    ///
+    /// **Never zero for a shown texture overlay**: the picture is per pane by
+    /// construction.
+    pub own_bytes: u64,
+    /// The pool [`Self::shared_bytes`] and [`Self::own_bytes`] are in, and the
+    /// room this layer has in it. The pool is the one binding the layer's own
+    /// **pane**, so one menu carries one denominator — and the pane's frame
+    /// overlay is where that denominator is named.
+    pub charge: Charge,
+}
+
+/// **What one pane or one layer is charged, in one named pool, against the
+/// room it has there.**
+///
+/// # Why the allowance is a difference and not a share
+///
+/// The user's ruling is that *"a 1 pane window should have the same overall
+/// pane budget as a 6 pane window … more panes open just slice that whole pane
+/// budget slimmer. and honestly, no reason for it to be equal slices either.
+/// let panes have as much ram as they need"*
+/// (`docs/cross-platform-resource-limits.md` §9.7). So there is no per-pane
+/// allowance to divide out, and an equal share would be a figure the model
+/// does not hold. What a pane or a layer *is* allowed is what the rest of the
+/// scene leaves it: the pool's allowance less every other thing's cost. That
+/// falls as siblings arrive, exactly as the ruling says, and it is a
+/// difference of figures `fit` already produces rather than a second rule.
+///
+/// A corollary worth stating rather than leaving to be discovered: because the
+/// allowance is the pool's less everything else, `cost > allowed` holds for
+/// one thing exactly when the scene's whole need is over that pool's
+/// allowance. The readout is per pane; the condition it reports is the
+/// scene's, and the binder beside it is what says who to ask about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Charge {
+    /// **Which memory this is.** `Joint` on a unified adapter, where the two
+    /// shares are one memory and `fit::over` asks one question of it; on a
+    /// split capacity, whichever of the two pools this thing fills the larger
+    /// fraction of — the one that binds. Naming it is what gives the two
+    /// figures below a denominator.
+    pub pool: squallar_device_profile::admit::Pool,
+    /// What the thing costs that pool at the budgets in force.
+    pub cost_bytes: u64,
+    /// **The room it has**: the pool's allowance less what the rest of the
+    /// scene costs of it. `None` where the pool itself is unknown — a native
+    /// arm no host reader has answered for — where nothing is ever over.
+    pub allowed_bytes: Option<u64>,
+}
+
+impl Default for Charge {
+    /// What a fresh application carries before its first composition: nothing
+    /// charged, and no pool known well enough for anything to be over.
+    fn default() -> Self {
+        Self {
+            pool: squallar_device_profile::admit::Pool::Gpu,
+            cost_bytes: 0,
+            allowed_bytes: None,
+        }
+    }
+}
+
+impl Charge {
+    /// Whether this thing costs more than the room it has. `false` wherever
+    /// the pool is unknown: a readout with no figure refuses nothing, the way
+    /// the admission doors do.
+    pub fn over(&self) -> bool {
+        self.allowed_bytes
+            .is_some_and(|allowed| self.cost_bytes > allowed)
+    }
+
+    /// **The pool's name for a reader** — the label the Settings screen shows
+    /// for the share that moves it (`ui_settings`'s `"GPU memory"` and
+    /// `"System memory"`), so a figure and the control that moves it cannot
+    /// drift into two names for one memory. `memory` for a unified adapter,
+    /// where one of the two shares is not a thing the reader has.
+    pub fn pool_word(&self) -> &'static str {
+        use squallar_device_profile::admit::Pool;
+        match self.pool {
+            Pool::Gpu => "GPU memory",
+            Pool::Host => "system memory",
+            Pool::Joint => "memory",
+        }
+    }
+
+    /// [`Self::pool_word`] with the word `memory` dropped, for a line that
+    /// already has a byte figure on it and no room to say so twice — the
+    /// layers menu's rows, where the panel leaves about 178 pt and the pair
+    /// plus the allowance takes 148 of it.
+    pub fn pool_tag(&self) -> &'static str {
+        use squallar_device_profile::admit::Pool;
+        match self.pool {
+            Pool::Gpu => "GPU",
+            Pool::Host => "system",
+            Pool::Joint => "memory",
+        }
     }
 }
 
@@ -144,6 +271,25 @@ pub struct PoolReadout {
     /// for the life of every process today), so a GPU pool that says
     /// "recovering" would be saying something no code can make true.
     pub recovering: bool,
+}
+
+impl PoolReadout {
+    /// **Which of the three terms is holding this pool down, in words** — the
+    /// four the settings caption already uses, so the pane's own line and the
+    /// screen that carries the control cannot come to say different things
+    /// about one pool.
+    ///
+    /// `ui_settings`'s `memory_share_caption` spells the same four; that copy
+    /// is not yet routed through here because another lane holds the file.
+    pub fn binder_words(&self) -> &'static str {
+        use squallar_device_profile::scene::PoolBinder;
+        match self.binder {
+            PoolBinder::Hardware => "all this machine reports",
+            PoolBinder::UserPercent => "your setting",
+            PoolBinder::Governor if self.recovering => "memory pressure, recovering",
+            PoolBinder::Governor => "memory pressure",
+        }
+    }
 }
 
 impl Default for PoolReadout {

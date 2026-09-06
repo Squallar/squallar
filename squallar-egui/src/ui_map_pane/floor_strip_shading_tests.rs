@@ -104,6 +104,7 @@ fn dispatched(surfaces: PaneSurfaces, ground: GroundIsMesh) -> Vec<LayerId> {
 
     let mut ctx = PaneRenderCtx {
         admission_notice: None,
+        cost: None,
         pane_idx: 0,
         pane: &mut pane,
         overlays: &mut overlays,

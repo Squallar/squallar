@@ -130,6 +130,7 @@ fn walk_at(run: Walk<'_>) -> Walked {
 
     let mut ctx = PaneRenderCtx {
         admission_notice: None,
+        cost: None,
         pane_idx: 0,
         pane: &mut pane,
         overlays: &mut overlays,

@@ -2,7 +2,7 @@
 //! full-bleed map.
 
 use crate::actions::GuiAction;
-use squallar_source::id::{LayerId, known};
+use squallar_source::id::known;
 
 use super::{InspectorSelection, PaneState};
 
@@ -233,7 +233,7 @@ impl super::Gui {
         // state.
         pane.hydrate_layer_states(&self.overlays, self.active_pane);
 
-        let statuses: Vec<(LayerId, Option<String>)> = if stack_slide > 0.0 {
+        let statuses: Vec<super::ui_stack::StackRowLines> = if stack_slide > 0.0 {
             self.stack_row_statuses(self.active_pane, &pane)
         } else {
             Vec::new()
@@ -302,19 +302,35 @@ impl super::Gui {
         &self,
         pane_idx: usize,
         pane: &PaneState,
-    ) -> Vec<(LayerId, Option<String>)> {
+    ) -> Vec<super::ui_stack::StackRowLines> {
         if !pane.draws_map_layers() {
             return Vec::new();
         }
+        // **This pane's own priced rows**, as the App's last telemetry tick
+        // composed them. An empty list is the ordinary state of a session that
+        // has not priced a scene yet, and every row then carries no memory
+        // line rather than a row of zeroes.
+        let priced = self
+            .budget_readout
+            .as_ref()
+            .and_then(|readout| readout.pane_layers.get(pane_idx))
+            .map_or(&[][..], Vec::as_slice);
         let view = pane.view(pane_idx);
         pane.draw_order()
             .map(|kind| {
-                let line = if *kind == known::RADAR {
+                let status = if *kind == known::RADAR {
                     radar_row_status(pane)
                 } else {
                     self.overlays.status_line(kind, &view.layer(kind))
                 };
-                (kind.clone(), line)
+                super::ui_stack::StackRowLines {
+                    layer: kind.clone(),
+                    status,
+                    memory: priced
+                        .iter()
+                        .find(|budget| budget.layer == *kind)
+                        .map(super::ui_stack::layer_memory_line),
+                }
             })
             .collect()
     }

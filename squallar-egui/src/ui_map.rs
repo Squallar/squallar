@@ -81,6 +81,40 @@ impl super::Gui {
             .notice(web_time::Instant::now())
             .map(|notice| notice.text.clone());
 
+        // **Each pane's own cost line inputs**, taken once for the frame for
+        // the reason the notice above is: the pane loop holds `&mut self`
+        // throughout, and the readout is the `Gui`'s. Two integers and an enum
+        // a pane, picked out of a vector the App rebuilds every 2 s — nothing
+        // here is computed, and a session that has priced no scene yet has no
+        // entries and draws no line.
+        let pane_costs: Vec<Option<pane_render::PaneCost>> = self
+            .budget_readout
+            .as_ref()
+            .map(|readout| {
+                readout
+                    .panes
+                    .iter()
+                    .map(|pane| {
+                        let pool = match pane.charge.pool {
+                            // A unified capacity is one memory under two
+                            // shares; the GPU share is the one whose governor
+                            // can latch, so its binder is the one that can be
+                            // holding the joint pool down.
+                            squallar_device_profile::admit::Pool::Gpu
+                            | squallar_device_profile::admit::Pool::Joint => Some(readout.gpu),
+                            squallar_device_profile::admit::Pool::Host => readout.host,
+                        }?;
+                        Some(pane_render::PaneCost {
+                            charge: pane.charge,
+                            binder: pool.binder,
+                            recovering: pool.recovering,
+                            requested_percent: pool.requested_percent,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let pane_count = self.visible_pane_count();
         // The base slot follows the BasemapTiles layer exactly as the terrain
         // slot follows Terrain: built only while a visible pane draws it,
@@ -324,6 +358,7 @@ impl super::Gui {
 
                                         let mut render_ctx = pane_render::PaneRenderCtx {
                                             admission_notice: admission_notice.as_deref(),
+                                            cost: pane_costs.get(pane_idx).copied().flatten(),
                                             pane_idx,
                                             pane: &mut pane,
                                             overlays: &mut self.overlays,
@@ -1831,6 +1866,10 @@ impl super::Gui {
                     // this is the strip's own draw and the glass above it
                     // carries the notice.
                     admission_notice: None,
+                    // Ground only, for the same reason: the cost line is the
+                    // glass's, and the strip is what a 3D floor is draped
+                    // with.
+                    cost: None,
                     pane_idx,
                     pane,
                     overlays: &mut self.overlays,

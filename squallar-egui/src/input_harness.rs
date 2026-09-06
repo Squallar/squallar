@@ -160,6 +160,11 @@ struct FrameFactsForTest {
     /// about admission carries — and a `None` table means the doors ask
     /// nothing, so the whole existing suite runs through them untouched.
     admission: Option<crate::admission::AdmissionCosts>,
+    /// **The budget readout**, as the App's telemetry tick would have composed
+    /// it. `None` until a fixture publishes one — which is what every test
+    /// that is not about the budget readout carries, and a `None` readout
+    /// draws no cost line on a pane and no memory line on a stack row.
+    budget_readout: Option<crate::shell_api::BudgetReadout>,
 }
 
 impl Default for FrameFactsForTest {
@@ -182,6 +187,7 @@ impl Default for FrameFactsForTest {
             floor_tile_zoom_bias: 0,
             mirror_plan_stamp: 0,
             admission: None,
+            budget_readout: None,
         }
     }
 }
@@ -498,10 +504,19 @@ impl InputHarness {
             floor_tile_zoom_bias: self.facts.floor_tile_zoom_bias,
             mirror_plan_stamp: self.facts.mirror_plan_stamp,
             frame_diagnostics: None,
-            budget_readout: None,
+            budget_readout: self.facts.budget_readout.as_ref(),
             admission: self.facts.admission.as_ref(),
             admission_notice: None,
         });
+    }
+
+    /// **Publish a budget readout**, as the App's telemetry tick does. The one
+    /// door a test takes to put a priced scene in front of the pane's cost
+    /// line and the layers menu's rows.
+    pub(crate) fn set_budget_readout(&mut self, readout: crate::shell_api::BudgetReadout) {
+        self.facts.budget_readout = Some(readout);
+        self.apply_facts();
+        self.warm_up();
     }
 
     /// **Publish an admission cost table**, as the App's telemetry tick does.

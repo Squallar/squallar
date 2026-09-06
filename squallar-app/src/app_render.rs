@@ -4920,6 +4920,20 @@ impl super::App {
     /// ceiling is permanent and already at its measured value. Both are a
     /// handful of integer reads over the layers this walk is touching anyway.
     fn loop_demand(&self) -> LoopWalk {
+        self.walk_panes(false)
+    }
+
+    /// [`Self::loop_demand`] with the layers menu's rows collected as well.
+    ///
+    /// **One walk, one reach for the pane vector, and the extra work behind a
+    /// flag** — the frame path takes this at `false` and allocates nothing for
+    /// it, the telemetry tick at `true`. A second function with a second pane
+    /// walk would have cost one more reach into the `Gui` in a file whose
+    /// coupling ceiling is permanent and sits on its measured value (and the
+    /// walker counts a needle spelled in a comment, so this paragraph does not
+    /// spell it); a per-frame `Vec<Vec<_>>` would have cost every frame to
+    /// publish a level nothing reads more than every 2 s.
+    fn walk_panes(&self, layer_rows: bool) -> LoopWalk {
         use squallar_device_profile::quality::GroundPass;
         use squallar_device_profile::scene::PaneNeed;
 
@@ -4967,6 +4981,13 @@ impl super::App {
         // per-layer read-out. Once across panes, because the handler is one
         // instance for the whole application.
         let mut overlay_grids: Vec<(squallar_source::id::LayerId, u64)> = Vec::new();
+        // **The layers menu's rows, one list per pane**, empty on the frame
+        // path — see [`Self::walk_panes`]. What is collected here is the
+        // *identity* half only: which layers this pane shows and which of them
+        // its loop belongs to. Every byte figure is put on them later, in
+        // `compose_budget_readout`, off the `PaneTerms` and the allocation
+        // that already exist there — so no term is spelled twice.
+        let mut pane_layers: Vec<PaneLayerRows> = Vec::new();
         // **Every loop running right now and what it renders**, and **what
         // each pane is parked at** — the two the decoded-volume price is
         // resolved from once the walk has seen every pane, exactly as
@@ -5058,6 +5079,28 @@ impl super::App {
                     overlay_grids.push((id.clone(), bytes));
                 }
             }
+            // **The layers menu's row identities**, off the same filter the
+            // picture count above is taken with, so the rows and the term
+            // they divide cannot list different layers. One entry per pane,
+            // pushed before every early return below for the same reason
+            // `scene.panes` is: a pane's index has to be its index.
+            if layer_rows {
+                pane_layers.push(PaneLayerRows {
+                    overlays: pane
+                        .overlay_textures
+                        .keys()
+                        .filter(|id| **id != known::RADAR && pane.is_overlay_enabled(id))
+                        .map(|id| {
+                            (
+                                id.clone(),
+                                squallar_overlays::render::handlers::source_grid_budget_bytes(id),
+                            )
+                        })
+                        .collect(),
+                    tiles: tile_layer_working_sets(pane),
+                    loop_layer: None,
+                });
+            }
             let picture_px = match self.render.overlay_pane_px(pane_idx) {
                 [0, 0] => window_px,
                 planned => planned,
@@ -5118,9 +5161,18 @@ impl super::App {
                     pane_need.cadence_secs = cadence;
                     pane_need.loop_span_secs = span;
                     pane_need.overlay_frame_bytes = frame_bytes;
+                    // The pane's grant is this layer's frames, so the row that
+                    // carries it is this layer's row and not radar's.
+                    if let Some(rows) = pane_layers.last_mut() {
+                        rows.loop_layer = Some(slot.id.clone());
+                    }
                 }
                 scene.panes.push(pane_need);
                 continue;
+            }
+            // Radar's own timeline is running, so the grant is radar's.
+            if let Some(rows) = pane_layers.last_mut() {
+                rows.loop_layer = Some(known::RADAR);
             }
             live_loops.push(live_loop_row(ls));
             let identity = loop_product(ls).map(|product| LoopIdentity::of(pane, ls, product));
@@ -5273,6 +5325,7 @@ impl super::App {
             scene,
             overlay_grids,
             prospective,
+            pane_layers,
         }
     }
 
@@ -5305,6 +5358,9 @@ impl super::App {
             // The readout's cadence composes the admission table too, and
             // this is the frame path - see `Self::compose_admission_costs`.
             prospective: _,
+            // Empty here by construction: the frame path asks the walk for no
+            // layer rows - see `Self::walk_panes`.
+            pane_layers: _,
         } = self.loop_demand();
         self.loop_counts = counts;
         self.refit_to_scene(&scene);
@@ -5365,11 +5421,18 @@ impl super::App {
             scene,
             overlay_grids,
             prospective,
+            pane_layers,
             ..
-        } = self.loop_demand();
+        } = self.walk_panes(true);
         let terms = squallar_device_profile::fit::need_terms(&scene, &self.budgets, GRID_BYTES);
         let allocation = self.loop_allocation();
-        self.compose_budget_readout(&scene, &terms, overlay_grids.clone(), &allocation);
+        self.compose_budget_readout(
+            &scene,
+            &terms,
+            overlay_grids.clone(),
+            &allocation,
+            &pane_layers,
+        );
         // The other half of the same composition, off the same walk. Not off
         // the same `terms`: those price the scene at the rung it is on, and a
         // door prices at the ladder's floor - see
@@ -5693,6 +5756,7 @@ impl super::App {
         terms: &squallar_device_profile::fit::NeedTerms,
         overlay_grids: Vec<(squallar_source::id::LayerId, u64)>,
         allocation: &LoopAllocation,
+        pane_layers: &[PaneLayerRows],
     ) {
         use squallar_device_profile::scene::CapacitySource;
         use squallar_egui::shell_api::{PaneBudget, PoolReadout};
@@ -5719,6 +5783,7 @@ impl super::App {
         // disagree: every consumer that caches a copy keys off this.
         readout.generation = readout.generation.wrapping_add(1);
         readout.panes.clear();
+        readout.pane_layers.clear();
         for (pane_idx, pane) in scene.panes.iter().enumerate() {
             let pane_terms =
                 squallar_device_profile::fit::need_terms_for_pane(pane, &self.budgets, GRID_BYTES);
@@ -5751,13 +5816,33 @@ impl super::App {
             } else {
                 (0, 0)
             };
+            // **What the pane costs the pool that binds it, and the room the
+            // rest of the scene leaves it** — the frame overlay's whole line.
+            let charge = charge_for(&cap, need, pane_terms.gpu_bytes(), pane_terms.host_bytes());
             readout.panes.push(PaneBudget {
                 terms: pane_terms,
                 shared_bytes,
                 own_bytes,
                 loop_frames_requested,
                 loop_frames_effective,
+                charge,
             });
+            // The layers menu's rows for this pane, priced off the terms just
+            // taken. Absent on any composition the walk was not asked for the
+            // identities on — which is every one but the tick's.
+            readout.pane_layers.push(
+                pane_layers
+                    .get(pane_idx)
+                    .map(|rows| {
+                        layer_budgets(rows, &pane_terms, &cap, need, || {
+                            let held = allocation
+                                .grant_for_pane(pane_idx)
+                                .map_or(0, |grant| grant.bytes() as u64);
+                            (held, allocation.pane_shares_loop(pane_idx))
+                        })
+                    })
+                    .unwrap_or_default(),
+            );
         }
         readout.terms = *terms;
         readout.gpu = PoolReadout {
@@ -7325,6 +7410,32 @@ pub(super) struct LoopWalk {
     /// price turns on — one entry per pane, in `scene.panes` order. Read only
     /// by [`App::compose_admission_costs`]; see [`ProspectiveLoop`].
     prospective: Vec<ProspectiveLoop>,
+    /// **The layers menu's rows, one list per pane**, in `scene.panes` order.
+    /// **Empty on the frame path**: only [`App::walk_panes`] at `true`
+    /// collects it, and the telemetry tick is its one caller.
+    pane_layers: Vec<PaneLayerRows>,
+}
+
+/// **Which layers one pane shows, and which of them its loop belongs to** —
+/// the identity half of a layers-menu row set, collected on the pane walk.
+///
+/// The byte figures are deliberately *not* here. Every one of them is either a
+/// term of the pane's own `PaneTerms` or a figure the loop allocation holds,
+/// and both are already in hand where the readout is composed; taking them on
+/// the walk instead would be a second spelling of arithmetic `fit` owns.
+pub(super) struct PaneLayerRows {
+    /// Every whole-picture overlay this pane shows, each with the app-wide
+    /// source-grid budget its handler states — `0` for a layer that keeps no
+    /// decoded grid, which is most of them.
+    overlays: Vec<(squallar_source::id::LayerId, u64)>,
+    /// Each tile layer this pane draws, with the working set the cache ledger
+    /// measured for its role. App-wide by construction — one cache serves
+    /// every pane — so the whole figure is `shared`.
+    tiles: Vec<(squallar_source::id::LayerId, u64)>,
+    /// The layer whose loop this pane runs — radar, an overlay, or `None` for
+    /// a pane running none. It is what says whose row the pool's grant lands
+    /// on.
+    loop_layer: Option<squallar_source::id::LayerId>,
 }
 
 /// **Whether a loop a pane does not run yet would be a share.**
@@ -8029,20 +8140,252 @@ pub(crate) fn test_loop_allocation() -> LoopAllocation {
 /// pass asked for, drawn level and ancestor net; the per-tile cost is the
 /// mean charge of the role's resident entries, floored at the marker's node.
 fn tile_needs() -> Vec<squallar_device_profile::scene::TileNeed> {
-    use squallar_egui::tile_source::cache_ledger::{ROLES, totals};
+    use squallar_egui::tile_source::cache_ledger::ROLES;
 
     ROLES
         .iter()
-        .map(|role| totals(*role))
-        .filter(|t| t.wanted_on_glass + t.wanted_net > 0)
-        .map(|t| squallar_device_profile::scene::TileNeed {
-            tiles_on_glass: t.wanted_on_glass as usize,
-            ancestor_net: t.wanted_net as usize,
-            bytes_per_tile: (t.resident_bytes / t.resident_entries.max(1))
-                .max(squallar_egui::tile_source::byte_lru::MARKER_BYTES)
-                as usize,
-        })
+        .map(|role| tile_need_for(*role))
+        .filter(|t| t.tiles_on_glass + t.ancestor_net > 0)
         .collect()
+}
+
+/// **What one thing of the scene is charged, in the pool that binds it,
+/// against the room the rest of the scene leaves it.**
+///
+/// Both halves are differences of figures the model already produced, and
+/// neither is a new rule:
+///
+/// * **The room** is `allowance - (need - cost)`. There is no per-pane or
+///   per-layer allowance to divide out — the user's ruling is that panes get
+///   as much as they need and siblings slice the whole thinner
+///   (`docs/cross-platform-resource-limits.md` §9.7) — so what one thing is
+///   allowed is exactly what everything else has not taken.
+/// * **The pool** is `Joint` wherever the capacity is unified, because there
+///   the two shares are one memory and `fit::over` asks one question of it;
+///   otherwise the pool this thing fills the larger fraction of, which is the
+///   one that will refuse it first. Cross-multiplied in `u128` rather than
+///   divided, so a fraction is never rounded before it is compared, and a
+///   pool with no room left and something in it binds outright.
+///
+/// A host figure is `None` on a native arm no reader has answered for. Nothing
+/// is ever over there, which is the same answer the admission doors give an
+/// unknown pool.
+fn charge_for(
+    cap: &squallar_device_profile::scene::Capacity,
+    need: squallar_device_profile::scene::Need,
+    gpu_cost: u64,
+    host_cost: u64,
+) -> squallar_egui::shell_api::Charge {
+    use squallar_device_profile::admit::Pool;
+    use squallar_device_profile::scene::Pools;
+    use squallar_egui::shell_api::Charge;
+
+    // The room a pool has for one thing: its allowance less what everything
+    // else in the scene costs of it.
+    let room = |allowance: u64, pool_need: u64, cost: u64| {
+        allowance.saturating_sub(pool_need.saturating_sub(cost))
+    };
+    if cap.pools == Pools::Unified {
+        let cost = gpu_cost.saturating_add(host_cost);
+        let joint_need = need.gpu_bytes.saturating_add(need.host_bytes);
+        return Charge {
+            pool: Pool::Joint,
+            cost_bytes: cost,
+            allowed_bytes: Some(room(cap.joint_allowance(), joint_need, cost)),
+        };
+    }
+    let gpu_room = room(cap.allowance(), need.gpu_bytes, gpu_cost);
+    let Some(host_allowance) = cap.host_allowance() else {
+        return Charge {
+            pool: Pool::Gpu,
+            cost_bytes: gpu_cost,
+            allowed_bytes: Some(gpu_room),
+        };
+    };
+    let host_room = room(host_allowance, need.host_bytes, host_cost);
+    let gpu = Charge {
+        pool: Pool::Gpu,
+        cost_bytes: gpu_cost,
+        allowed_bytes: Some(gpu_room),
+    };
+    let host = Charge {
+        pool: Pool::Host,
+        cost_bytes: host_cost,
+        allowed_bytes: Some(host_room),
+    };
+    // `cost / room` compared without dividing. A pool with no room left and
+    // something charged to it is past any fraction the other can reach, and a
+    // tie falls to the GPU — the pool every scene has.
+    match (gpu_room, host_room) {
+        (0, _) if gpu_cost > 0 => gpu,
+        (_, 0) if host_cost > 0 => host,
+        _ => {
+            let gpu_fraction = u128::from(gpu_cost) * u128::from(host_room);
+            let host_fraction = u128::from(host_cost) * u128::from(gpu_room);
+            if host_fraction > gpu_fraction {
+                host
+            } else {
+                gpu
+            }
+        }
+    }
+}
+
+/// **One pane's layers-menu rows**, priced off the terms that pane was already
+/// given.
+///
+/// Each row's pair is the *priced* family split by who pays it: `shared` what
+/// the application pays once however many panes show the layer, `own` what
+/// this pane pays on top. Nothing here re-derives a term — every figure is one
+/// of `pane_terms`' own, divided by the count `fit` multiplied it by, or the
+/// grant the pool handed this pane.
+///
+/// `grant` answers the pool's grant for this pane and whether the plan aliased
+/// it onto another pane's loop; it is a closure because a pane with no loop
+/// never asks.
+fn layer_budgets(
+    rows: &PaneLayerRows,
+    pane_terms: &squallar_device_profile::fit::PaneTerms,
+    cap: &squallar_device_profile::scene::Capacity,
+    need: squallar_device_profile::scene::Need,
+    grant: impl Fn() -> (u64, bool),
+) -> Vec<squallar_egui::shell_api::LayerBudget> {
+    use squallar_device_profile::admit::Pool;
+    use squallar_egui::shell_api::LayerBudget;
+
+    // The loop's grant, taken once and only where a loop exists to own it.
+    let (grant_bytes, grant_shared) = match rows.loop_layer {
+        Some(_) => grant(),
+        None => (0, false),
+    };
+    let loop_pair = |id: &squallar_source::id::LayerId| -> (u64, u64) {
+        if rows.loop_layer.as_ref() != Some(id) {
+            return (0, 0);
+        }
+        if grant_shared {
+            (grant_bytes, 0)
+        } else {
+            (0, grant_bytes)
+        }
+    };
+    let mut out = Vec::with_capacity(rows.overlays.len() + rows.tiles.len() + 1);
+    let mut push = |layer: squallar_source::id::LayerId, gpu: (u64, u64), host: (u64, u64)| {
+        // **Each row names the pool that binds it, and it may not be the
+        // pane's.** A pane's cost is nearly all GPU (its rasters, its loop) and
+        // an overlay's is nearly all host (its grid, its picture), so reporting
+        // every row in the pane's pool would empty the tile row and most of the
+        // overlay rows on the arm the GPU binds — the layers whose figures the
+        // menu exists to show. So the pool is asked per row, and the line
+        // carries its name.
+        let charge = charge_for(
+            cap,
+            need,
+            gpu.0.saturating_add(gpu.1),
+            host.0.saturating_add(host.1),
+        );
+        // **The pair follows the pool the row is reported in**, so a joint
+        // capacity adds two figures of one memory and a split one never adds
+        // two figures of two.
+        let (shared_bytes, own_bytes) = match charge.pool {
+            Pool::Gpu => gpu,
+            Pool::Host => host,
+            Pool::Joint => (gpu.0.saturating_add(host.0), gpu.1.saturating_add(host.1)),
+        };
+        if shared_bytes == 0 && own_bytes == 0 {
+            return;
+        }
+        out.push(LayerBudget {
+            layer,
+            shared_bytes,
+            own_bytes,
+            charge,
+        });
+    };
+    // **Radar**, first because it is the only row whose cost a pane carries
+    // whether or not its eye is on: `fit` charges every 2D pane a static
+    // raster, and a 3D pane its grids and its offscreen, off the pane's view
+    // alone.
+    let (radar_loop_shared, radar_loop_own) = loop_pair(&known::RADAR);
+    push(
+        known::RADAR,
+        (
+            radar_loop_shared,
+            radar_loop_own
+                .saturating_add(pane_terms.static_rasters)
+                .saturating_add(pane_terms.grids)
+                .saturating_add(pane_terms.offscreens),
+        ),
+        (
+            0,
+            pane_terms
+                .loop_scans_host
+                .saturating_add(pane_terms.still_scans_host),
+        ),
+    );
+    // **One picture per shown overlay, plus the copy of it the upload queue
+    // holds** — `pictures_host` and `upload_pending_host` are the same batch
+    // twice and `picture_host` is one of them, so the per-layer figure is that
+    // one doubled rather than a division of either total.
+    let picture_pair = pane_terms.picture_host.saturating_mul(2);
+    for (id, grid_bytes) in &rows.overlays {
+        let (loop_shared, loop_own) = loop_pair(id);
+        push(
+            id.clone(),
+            (loop_shared, loop_own),
+            (*grid_bytes, picture_pair),
+        );
+    }
+    for (id, working_set) in &rows.tiles {
+        push(id.clone(), (0, 0), (*working_set, 0));
+    }
+    out
+}
+
+/// One role's `TileNeed`, whether or not its last pass wanted anything —
+/// [`tile_needs`]'s row, split out so the per-layer readout asks the same
+/// question of one role that the scene asks of every role.
+fn tile_need_for(
+    role: squallar_egui::tile_source::cache_ledger::CacheRole,
+) -> squallar_device_profile::scene::TileNeed {
+    let t = squallar_egui::tile_source::cache_ledger::totals(role);
+    squallar_device_profile::scene::TileNeed {
+        tiles_on_glass: t.wanted_on_glass as usize,
+        ancestor_net: t.wanted_net as usize,
+        bytes_per_tile: (t.resident_bytes / t.resident_entries.max(1))
+            .max(squallar_egui::tile_source::byte_lru::MARKER_BYTES)
+            as usize,
+    }
+}
+
+/// **What one tile role's working set costs the host** — the product
+/// `squallar_device_profile::fit::need_terms` folds into `NeedTerms::tiles_host`
+/// for that role, restated here for the one row that reports a role on its
+/// own. If the two ever disagree the fold is the authority.
+fn tile_working_set_bytes(need: &squallar_device_profile::scene::TileNeed) -> u64 {
+    ((need.tiles_on_glass + need.ancestor_net) as u64).saturating_mul(need.bytes_per_tile as u64)
+}
+
+/// **The tile layers one pane draws, with the working set behind each** —
+/// `BasemapTiles` over the base role, `Terrain` over the hillshade's, both
+/// app-wide caches serving every pane at once.
+///
+/// A layer the pane has switched off is absent rather than zero: the cache
+/// behind it is released the frame no visible pane draws it
+/// (`Gui::render_map`), so a row would be reporting another pane's memory
+/// against this pane's switch.
+fn tile_layer_working_sets(
+    pane: &squallar_egui::pane::PaneState,
+) -> Vec<(squallar_source::id::LayerId, u64)> {
+    use squallar_egui::tile_source::cache_ledger::CacheRole;
+
+    [
+        (known::BASEMAP_TILES, CacheRole::Base),
+        (known::TERRAIN, CacheRole::Terrain),
+    ]
+    .into_iter()
+    .filter(|(id, _)| pane.is_overlay_enabled(id))
+    .map(|(id, role)| (id, tile_working_set_bytes(&tile_need_for(role))))
+    .collect()
 }
 
 /// This build's own budgets, for the tests that take them as an argument.

@@ -80,6 +80,11 @@ const REMOVE_GLYPH_SIZE: f32 = 18.0;
 /// The drag grip's hit width. Full row height; the painted dots are smaller.
 const GRIP_WIDTH: f32 = 18.0;
 
+/// What the memory band sits above the row's own bottom edge — the row's
+/// 6 pt of vertical padding, halved, so the band is inset from the bottom by
+/// the same amount the name block is from the top.
+const MEMORY_BAND_LIFT: f32 = 3.0;
+
 /// The painted grip: two columns of three dots, this radius each.
 const GRIP_DOT_RADIUS: f32 = 1.2;
 /// Spacing between grip dot centres, both axes.
@@ -92,6 +97,53 @@ const GRIP_DOT_SPACING: f32 = 5.0;
 const SHEET_HELPER_CAPTION: &str = "The same layer stack as on a desktop: \
     rows select a layer, \u{1f441} hides it, \u{1f5d1} takes it out of this \
     pane, dragging the grip sets what draws over what.";
+
+/// **The dim lines one stack row draws under the layer's name.**
+///
+/// Two, and they are different in kind. [`Self::status`] is what the layer's
+/// own handler says it is *doing* — a count, a product and a tilt, a fault
+/// mark. [`Self::memory`] is what it *costs*, as the App last priced it, and
+/// it is the layers menu's half of the user's ruling that per-layer budgets
+/// live here.
+pub(super) struct StackRowLines {
+    /// The layer this row is for.
+    pub layer: LayerId,
+    /// What the handler offers under the name, where it offers anything.
+    pub status: Option<String>,
+    /// `shared N + own M of A`, where the App has priced this layer for this
+    /// pane. `None` for a layer the model charges nothing for — a point layer,
+    /// a colour scale — and for every row before the first composition, which
+    /// is honest absence rather than a row of zeroes.
+    pub memory: Option<String>,
+}
+
+/// **What one layer costs this pane, and the room it has** — the row's second
+/// dim line.
+///
+/// `shared` is what the application pays once however many panes show the
+/// layer (a gridded overlay's decoded source grid, a tile role's working set,
+/// a loop the plan aliased onto another pane's); `own` is what this pane pays
+/// on top. Ruling 8: displayed, never attributed.
+///
+/// The allowance is the room the rest of the scene leaves this layer, and the
+/// **pool it is in leads the line**: a pane's cost is nearly all GPU and an
+/// overlay's is nearly all host, so the rows of one menu genuinely sit in
+/// different memories and a line that did not say which would be three figures
+/// with no denominator.
+pub(super) fn layer_memory_line(budget: &crate::shell_api::LayerBudget) -> String {
+    use squallar_units::DataSize;
+
+    let pool = budget.charge.pool_tag();
+    let shared = DataSize::from_bytes(budget.shared_bytes).label();
+    let own = DataSize::from_bytes(budget.own_bytes).label();
+    match budget.charge.allowed_bytes {
+        Some(allowed) => format!(
+            "{pool}: shared {shared} + own {own} of {}",
+            DataSize::from_bytes(allowed).label()
+        ),
+        None => format!("{pool}: shared {shared} + own {own}"),
+    }
+}
 
 /// One row the stack actually drew, as it was drawn. Reported by the
 /// renderer, never rebuilt by a test — see `ui_menu::DrawnMenuLeaf` for the
@@ -124,6 +176,8 @@ pub(crate) struct StackRowProbe {
     pub name: egui::Rect,
     /// The status line under the name, when the handler offered one.
     pub status_line: Option<String>,
+    /// The memory line under the status, when the App had priced the layer.
+    pub memory_line: Option<String>,
     /// Whether the row was drawn as the inspector's current selection.
     pub selected: bool,
     /// The trailing `›` chevron — drawn on the drawer and sheet hosts only
@@ -183,7 +237,7 @@ impl super::Gui {
         ctx: &egui::Context,
         slot: SurfaceSlot,
         pane: &mut PaneState,
-        statuses: &[(LayerId, Option<String>)],
+        rows: &[StackRowLines],
         actions: &mut Vec<GuiAction>,
     ) {
         let is_drawer = !self.layout.width.has_persistent_sidebar();
@@ -311,7 +365,7 @@ impl super::Gui {
                                 is_drawer,
                                 slot.sheet,
                                 pane,
-                                statuses,
+                                rows,
                                 actions,
                                 #[cfg(test)]
                                 &mut probe,
@@ -350,7 +404,7 @@ impl super::Gui {
         is_drawer: bool,
         sheet: bool,
         pane: &mut PaneState,
-        statuses: &[(LayerId, Option<String>)],
+        rows: &[StackRowLines],
         actions: &mut Vec<GuiAction>,
         #[cfg(test)] probe: &mut StackProbe,
     ) {
@@ -434,10 +488,9 @@ impl super::Gui {
                 let selected =
                     self.insp_open && self.inspector_sel == InspectorSelection::Layer(kind.clone());
                 let name = self.overlays.display_name(kind).to_owned();
-                let status = statuses
-                    .iter()
-                    .find(|(k, _)| k == kind)
-                    .and_then(|(_, line)| line.clone());
+                let lines = rows.iter().find(|row| row.layer == *kind);
+                let status = lines.and_then(|row| row.status.clone());
+                let memory = lines.and_then(|row| row.memory.clone());
 
                 // The whole row is the click target (the M8 full-row fix):
                 // the full panel width at a comfortable height, allocated
@@ -445,11 +498,24 @@ impl super::Gui {
                 // egui resolves an overlap to the later registration, so the
                 // reorder pair and the eye, drawn after inside this rect,
                 // keep their own clicks by sitting on top. Sized from the
-                // real text styles so a themed font cannot clip the block.
+                // real text styles so a themed font cannot clip the block —
+                // the memory line is measured the same way the status is, so
+                // a row that has both grows by exactly one small line rather
+                // than pushing its own text out of its box.
+                let small = ui.text_style_height(&egui::TextStyle::Small);
+                // **The memory line is a band of its own under the row**, not
+                // a third line inside the name block, and the reason is
+                // measured. The block sits between the eye and the can, which
+                // leaves it 130 pt on the drawer host and 137 on the sidebar;
+                // `shared 49 MB + own 18 MB of 3.1 GB` lays out at 147.8, so
+                // in the block it would lose its allowance to the truncation
+                // on both. Under the controls it has the whole row -- the
+                // same figure, legible, and the controls keep the height they
+                // had because the band is taken off the rect they centre in.
+                let memory_band = memory.as_ref().map_or(0.0, |_| small);
                 let row_height = (ui.text_style_height(&egui::TextStyle::Body)
-                    + status
-                        .as_ref()
-                        .map_or(0.0, |_| ui.text_style_height(&egui::TextStyle::Small))
+                    + status.as_ref().map_or(0.0, |_| small)
+                    + memory_band
                     + 6.0)
                     .max(MIN_ROW_HEIGHT);
                 let (row_rect, row) = ui.allocate_exact_size(
@@ -497,9 +563,18 @@ impl super::Gui {
                     );
                 }
 
+                // The controls' band: the row less whatever the memory line
+                // takes off its bottom. Everything that centres itself in the
+                // row centres in this instead, so a priced row's eye, can and
+                // grip sit exactly where an unpriced row's do.
+                let content_rect = egui::Rect::from_min_max(
+                    row_rect.min,
+                    egui::pos2(row_rect.max.x, row_rect.max.y - memory_band),
+                );
+                let content_height = content_rect.height();
                 let mut row_ui = ui.new_child(
                     egui::UiBuilder::new()
-                        .max_rect(row_rect)
+                        .max_rect(content_rect)
                         .layout(egui::Layout::left_to_right(egui::Align::Center)),
                 );
                 let ui = &mut row_ui;
@@ -513,8 +588,10 @@ impl super::Gui {
                 // drag, so a swipe anywhere else on the row still scrolls
                 // the list on touch. The dots are painted: no glyph egui's
                 // bundled fonts carry draws a grip (`ui_glyphs.rs`).
-                let (handle_rect, handle) =
-                    ui.allocate_exact_size(egui::vec2(GRIP_WIDTH, row_height), egui::Sense::drag());
+                let (handle_rect, handle) = ui.allocate_exact_size(
+                    egui::vec2(GRIP_WIDTH, content_height),
+                    egui::Sense::drag(),
+                );
                 let grip_color = if handle.hovered() || lifting {
                     ui.visuals().strong_text_color()
                 } else {
@@ -644,14 +721,15 @@ impl super::Gui {
 
                         // The name and status block. Hidden layers render
                         // dimmed — weak text is the stock theme's own dimming.
+                        // The memory line is not in here: it is the band under
+                        // this whole row, for the width reason on `row_height`.
                         let block =
                             ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                                 ui.spacing_mut().item_spacing.y = 0.0;
+                                let small = ui.text_style_height(&egui::TextStyle::Small);
                                 let text_height = ui.text_style_height(&egui::TextStyle::Body)
-                                    + status.as_ref().map_or(0.0, |_| {
-                                        ui.text_style_height(&egui::TextStyle::Small)
-                                    });
-                                ui.add_space(((row_height - text_height) / 2.0).max(0.0));
+                                    + status.as_ref().map_or(0.0, |_| small);
+                                ui.add_space(((content_height - text_height) / 2.0).max(0.0));
                                 let name_text = if enabled {
                                     egui::RichText::new(name.as_str())
                                 } else {
@@ -680,12 +758,54 @@ impl super::Gui {
                                 }
                                 text_rect
                             });
+                        let mut text_rect = block.inner;
+                        if let Some(line) = &memory {
+                            // **A quantity, never a warning.** What this layer
+                            // costs is a fact about the scene the user built,
+                            // not a fault, and it is drawn in the same dim
+                            // grey the handler's own detail line sits in
+                            // whatever the figure says. The one place the
+                            // budget system raises its voice is a refusal, and
+                            // that is a plate on the map with a control named
+                            // on it.
+                            //
+                            // Painted rather than added, because this line is
+                            // the *row's* and not the block's: it starts under
+                            // the name and runs to the row's own right edge,
+                            // past the can that bounds every widget above it.
+                            // Clipped to the row, so a font that laid it out
+                            // wider than the panel cannot reach the row below.
+                            let galley = ui.painter().layout_no_wrap(
+                                line.clone(),
+                                egui::TextStyle::Small.resolve(ui.style()),
+                                ui.visuals().weak_text_color(),
+                            );
+                            // **Aligned with the eye, not with the name**, and
+                            // measured: from the name's left the drawer host
+                            // leaves 178 pt and the widest line this format
+                            // prints — `system: shared 999 MB + own 999 MB of
+                            // 999 GB` — lays out at 193. From the eye there
+                            // are 218, and the grip is the only thing to the
+                            // left of it, which is the row's drag affordance
+                            // rather than any of its content.
+                            let at = egui::pos2(
+                                eye.rect.left(),
+                                row_rect.max.y - memory_band - MEMORY_BAND_LIFT,
+                            );
+                            text_rect =
+                                text_rect.union(egui::Rect::from_min_size(at, galley.size()));
+                            ui.painter().with_clip_rect(row_rect).galley(
+                                at,
+                                galley,
+                                egui::Color32::PLACEHOLDER,
+                            );
+                        }
                         #[cfg(test)]
                         {
-                            name_rect = block.inner;
+                            name_rect = text_rect;
                         }
                         #[cfg(not(test))]
-                        let _ = block;
+                        let _ = text_rect;
                         remove
                     })
                     .inner;
@@ -704,6 +824,7 @@ impl super::Gui {
                     handle: handle.rect,
                     name: name_rect,
                     status_line: status.clone(),
+                    memory_line: memory.clone(),
                     selected,
                     chevron: chevron_rect,
                 });
@@ -881,3 +1002,7 @@ impl super::Gui {
         painter.galley(plate.min + pad, galley, egui::Color32::PLACEHOLDER);
     }
 }
+
+#[path = "ui_stack/layer_memory_tests.rs"]
+#[cfg(test)]
+mod layer_memory_tests;

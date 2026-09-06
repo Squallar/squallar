@@ -374,6 +374,10 @@ pub(super) struct PaneRenderCtx<'a> {
     /// answers a thing the user just did and got nothing for. **A silent
     /// refusal is a worse defect than the allocation it prevents.**
     pub admission_notice: Option<&'a str>,
+    /// **What this pane costs and the room it has**, as the App's last
+    /// telemetry tick priced it — the pane's own cost line. `None` from a
+    /// caller that prices no scene, and on every pass but the glass one.
+    pub cost: Option<PaneCost>,
     pub pane_idx: usize,
     pub pane: &'a mut PaneState,
     pub overlays: &'a mut OverlayRegistry,
@@ -815,6 +819,19 @@ pub(super) fn render_pane_map_content(
             ui.set_opacity(base_opacity);
             #[cfg(test)]
             ctx.paint_order.push((id.clone(), painted_layer));
+        }
+
+        // **The pane's own cost**, in the corner the plates below do not
+        // use. It is not one of them and does not compete for their slot:
+        // every one of the four is a thing the application is doing or has
+        // refused, and this is a standing quantity that is true whether or
+        // not anything is happening. Glass only, like the plates — a floor
+        // strip is a texture the 3D ground wears, not a place for chrome.
+        if let Some(cost) = ctx.cost
+            && ctx.surfaces.paints(Surface::Glass)
+        {
+            let cost_painter = ui.painter().with_clip_rect(ctx.pane_rect);
+            draw_pane_cost(&cost_painter, ctx.pane_rect, cost);
         }
 
         // **A refusal, first of the four plates.** The three below say what
@@ -1518,6 +1535,7 @@ fn handle_radar_site_interactions(
     // mutable while `excluded_rects` is read.
     let PaneRenderCtx {
         admission_notice: _,
+        cost: _,
         pane,
         actions,
         pane_idx,
@@ -2257,6 +2275,118 @@ fn draw_top_notice(painter: &egui::Painter, pane_rect: egui::Rect, top_margin: f
     );
     painter.rect_filled(plate, 4.0, egui::Color32::from_black_alpha(200));
     painter.galley(plate.min + PENDING_PADDING, galley, egui::Color32::WHITE);
+}
+
+/// **What this pane costs, the room it has, and what is holding that pool
+/// down** — the inputs of the pane's own cost line, taken off the App's
+/// readout for this pane. `Copy`, so the pane loop carries one per pane and
+/// allocates nothing to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PaneCost {
+    /// The pane's cost in the pool that binds it, and the room the rest of
+    /// the scene leaves it there.
+    pub charge: crate::shell_api::Charge,
+    /// Which of the three terms is holding that pool down, in the words the
+    /// Settings screen uses — [`crate::shell_api::PoolReadout::binder_words`].
+    pub binder: squallar_device_profile::scene::PoolBinder,
+    /// Whether the governor's ceiling is on its way back up.
+    pub recovering: bool,
+    /// The share of that pool the user asked for, where the pool has one.
+    pub requested_percent: Option<u8>,
+}
+
+/// The pane's own top-right inset for the cost lines.
+///
+/// It matches the pill row's inset on purpose: the two sit at the same height
+/// at opposite ends of the pane, above the band the three notice plates share
+/// (which starts at `pills::pill_row_clearance`, 40 pt at the least) and above
+/// the vertical colour bar, whose top is `SCALE_MARGIN + SCALE_TITLE_MARGIN`
+/// down. So the one line of glass this reads on is the one piece of the pane
+/// nothing else claims.
+const COST_INSET: f32 = 8.0;
+
+/// **What the pane costs and what it is allowed, as one line** — the
+/// quantity, with its denominator named.
+///
+/// A pool the session has no figure for states the absence by having no
+/// denominator, rather than by printing an invented one.
+fn pane_cost_line(cost: PaneCost) -> String {
+    use squallar_units::DataSize;
+
+    let spent = DataSize::from_bytes(cost.charge.cost_bytes).label();
+    let pool = cost.charge.pool_word();
+    match cost.charge.allowed_bytes {
+        Some(allowed) => format!(
+            "{pool}: {spent} of {}",
+            DataSize::from_bytes(allowed).label()
+        ),
+        None => format!("{pool}: {spent}"),
+    }
+}
+
+/// **The second line, and only where the pane is over the room it has**: which
+/// of the three terms is holding the pool down, and the control that moves it
+/// where the reader has one.
+///
+/// The user's own share is the only term with a control, so it is the only
+/// arm that names one; a warning the reader cannot act on would be a defect in
+/// the code, not a caption to word better. The other two arms say what is
+/// happening instead — a machine that is small, or a session under pressure
+/// that may be climbing back — and both are things a reader can act on by
+/// closing a pane or waiting, which is why they are stated rather than
+/// swallowed.
+///
+/// A pane comfortably under its room gets no line at all: the figure above is
+/// the whole of what it has to say.
+fn pane_cost_binder_line(cost: PaneCost) -> Option<String> {
+    use squallar_device_profile::scene::PoolBinder;
+
+    if !cost.charge.over() {
+        return None;
+    }
+    Some(match (cost.binder, cost.requested_percent) {
+        (PoolBinder::UserPercent, Some(percent)) => {
+            format!("over - raise it in Settings > Memory (now {percent} %)")
+        }
+        (PoolBinder::UserPercent, None) => "over - raise it in Settings > Memory".to_owned(),
+        (PoolBinder::Hardware, _) => {
+            "over - all this machine reports; close a pane to fit".to_owned()
+        }
+        (PoolBinder::Governor, _) if cost.recovering => {
+            "over - memory pressure, recovering".to_owned()
+        }
+        (PoolBinder::Governor, _) => "over - memory pressure".to_owned(),
+    })
+}
+
+/// **The pane's cost, in the pane's own top-right corner.**
+///
+/// Deliberately not a plate. Three notices and the colour scales already
+/// compete for this pane's chrome, and a fourth box would take the slot from
+/// whichever of them the pane needed more; a shadowed line at the opposite end
+/// of the pill row's band reads beside all of them instead of over them.
+pub(super) fn draw_pane_cost(painter: &egui::Painter, pane_rect: egui::Rect, cost: PaneCost) {
+    let font = egui::FontId::proportional(SCALE_FONT_SIZE);
+    let anchor = egui::pos2(
+        pane_rect.right() - SCALE_MARGIN,
+        pane_rect.top() + COST_INSET,
+    );
+    draw_shadowed_text(
+        painter,
+        anchor,
+        egui::Align2::RIGHT_TOP,
+        &pane_cost_line(cost),
+        font.clone(),
+    );
+    if let Some(line) = pane_cost_binder_line(cost) {
+        draw_shadowed_text(
+            painter,
+            anchor + egui::vec2(0.0, SCALE_FONT_SIZE + 2.0),
+            egui::Align2::RIGHT_TOP,
+            &line,
+            font,
+        );
+    }
 }
 
 /// Draw text with a dark shadow for readability on the map.
@@ -4195,6 +4325,10 @@ mod floor_strip_shading_tests;
 #[path = "ui_map_pane/layer_opacity_walk_tests.rs"]
 #[cfg(test)]
 mod layer_opacity_walk_tests;
+
+#[path = "ui_map_pane/pane_cost_tests.rs"]
+#[cfg(test)]
+mod pane_cost_tests;
 
 #[path = "ui_map_pane/resolved_opacity_tests.rs"]
 #[cfg(test)]
