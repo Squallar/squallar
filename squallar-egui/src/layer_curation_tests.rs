@@ -797,3 +797,83 @@ fn a_terrain_enabled_config_reopens_shading_under_the_new_toggle() {
         "the toggle's off did not stop the dispatch — two sources of truth",
     );
 }
+
+/// **The eye and the can are a row's height square, the eye stays in its
+/// slot, and the can stands at the end of the line — on both hosts.**
+///
+/// Both controls were 20 points wide and 18 tall, one gap apart, so a thumb
+/// aimed at the eye could take a layer out of the stack. Sizing the eye up
+/// spends the row's own height and moves nothing: its left edge is still one
+/// spacing after the grip. The can is the last thing on the row, past the
+/// name and, on the drawer, past the `›`.
+#[test]
+fn the_eye_and_the_can_are_thumb_sized_and_the_can_ends_the_row() {
+    for (label, size) in [
+        ("desktop", egui::vec2(1400.0, 900.0)),
+        ("phone", egui::vec2(420.0, 1400.0)),
+    ] {
+        let mut h = InputHarness::with_screen(size);
+        h.open_layers();
+        h.warm_up();
+        let rows: Vec<_> = [known::RADAR, known::COLOR_SCALE, known::CITY_LABELS]
+            .into_iter()
+            .filter_map(|kind| h.stack_row(&kind))
+            .collect();
+        assert!(
+            rows.len() >= 2,
+            "{label}: non-vacuity — the stack drew {} of the three rows",
+            rows.len()
+        );
+        for row in rows {
+            let name = row.kind.as_str();
+            for (what, rect) in [("eye", row.eye), ("can", row.remove)] {
+                assert!(
+                    rect.width() >= 28.0 - 0.5 && rect.height() >= 28.0 - 0.5,
+                    "{label} {name}: the {what} is {:.0}x{:.0}, under a 28-point square",
+                    rect.width(),
+                    rect.height(),
+                );
+                assert!(
+                    row.rect.contains_rect(rect.shrink(0.5)),
+                    "{label} {name}: the {what} {rect:?} spills out of its row {:?}",
+                    row.rect,
+                );
+            }
+            assert!(
+                (row.eye.left() - row.handle.right() - 8.0).abs() < 0.5,
+                "{label} {name}: the eye moved — it starts {:.1} after the grip, not one spacing",
+                row.eye.left() - row.handle.right(),
+            );
+            assert!(
+                row.eye.right() <= row.name.left(),
+                "{label} {name}: the eye {:?} overlaps the name {:?}",
+                row.eye,
+                row.name,
+            );
+            assert!(
+                row.remove.left() >= row.name.right(),
+                "{label} {name}: the can {:?} is not past the name {:?}",
+                row.remove,
+                row.name,
+            );
+            assert!(
+                (row.rect.right() - row.remove.right()).abs() < 0.5,
+                "{label} {name}: the can {:?} does not end the row {:?}",
+                row.remove,
+                row.rect,
+            );
+            if let Some(chevron) = row.chevron {
+                assert!(
+                    chevron.right() <= row.remove.left(),
+                    "{label} {name}: the chevron {chevron:?} sits past the can {:?}",
+                    row.remove,
+                );
+            }
+            assert!(
+                row.remove.left() - row.eye.right() >= 28.0,
+                "{label} {name}: the can is only {:.0} points from the eye",
+                row.remove.left() - row.eye.right(),
+            );
+        }
+    }
+}

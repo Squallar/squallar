@@ -63,6 +63,19 @@ const PANE_PROPS_BUTTON_LABEL: &str = "Pane properties...";
 /// handler offers no status line under the name.
 const MIN_ROW_HEIGHT: f32 = 28.0;
 
+/// The eye's and the can's hit box: a square of the row's minimum height.
+///
+/// Both were 20 points wide and 18 tall — a thumb-sized miss on a phone —
+/// with the row's own height and the spacing around them going spare. The
+/// eye keeps its left edge, so sizing it up moves nothing beside it; the can
+/// stands at the end of the line, where a miss on the eye cannot land on it.
+const CONTROL_SIDE: f32 = MIN_ROW_HEIGHT;
+
+/// The eye's glyph size, and the can's — the wastebasket is the heavier
+/// drawing of the two and reads level with the eye two points smaller.
+const EYE_GLYPH_SIZE: f32 = 20.0;
+const REMOVE_GLYPH_SIZE: f32 = 18.0;
+
 /// The drag grip's hit width. Full row height; the painted dots are smaller.
 const GRIP_WIDTH: f32 = 18.0;
 
@@ -536,15 +549,15 @@ impl super::Gui {
                 // on the *taken* pane — `set_active_pane_overlay` would
                 // write the placeholder in the vector.
                 let eye_text = if enabled {
-                    egui::RichText::new("\u{1f441}")
+                    egui::RichText::new("\u{1f441}").size(EYE_GLYPH_SIZE)
                 } else {
-                    egui::RichText::new("-").weak()
+                    egui::RichText::new("-").size(EYE_GLYPH_SIZE).weak()
                 };
                 let eye = ui
                     .add(
                         egui::Button::new(eye_text)
                             .frame(false)
-                            .min_size(egui::vec2(20.0, 0.0)),
+                            .min_size(egui::Vec2::splat(CONTROL_SIDE)),
                     )
                     .on_hover_text(if enabled {
                         format!("Hide {name}")
@@ -570,100 +583,111 @@ impl super::Gui {
                     self.set_pane_overlay_with_fetch(pane, idx, kind, !enabled, actions);
                 }
 
-                // The 🗑 remove control. The eye beside it hides the layer;
-                // this takes it out of the pane's stack, which is a different
-                // act and is why the two are not one control with a long
-                // press. **Drawn on every row, live or not**: a layer the pane
-                // cannot give up gets a greyed can whose hover says why, rather
-                // than no control at all — an absent affordance reads as an
-                // oversight, and one that silently does nothing is worse than
-                // both.
+                // The rest of the row lays out from its far end: the 🗑 can
+                // last, then the drawer's `›`, then the name block in what is
+                // left.
                 let refusal = pane.layer_removal_refusal(kind);
-                let remove = ui
-                    .add_enabled(
-                        refusal.is_none(),
-                        egui::Button::new(egui::RichText::new(REMOVE_LABEL).small().color(
-                            if refusal.is_none() {
-                                ui.visuals().weak_text_color()
-                            } else {
-                                ui.visuals().widgets.noninteractive.fg_stroke.color
-                            },
-                        ))
-                        .frame(false)
-                        .min_size(egui::vec2(20.0, 0.0)),
-                    )
-                    .on_hover_text(format!("Remove {name} from this pane"))
-                    .on_disabled_hover_text(refusal.unwrap_or_default());
-                if remove.clicked() {
-                    removing = Some(kind.clone());
-                }
-
-                // A trailing `›` on the drawer and sheet hosts:
-                // there a row click *pushes* the inspector over this list,
-                // and the chevron says so. The desktop sidebar, where the
-                // inspector opens beside the stack, carries none.
                 #[cfg(test)]
                 let mut chevron_rect = None;
                 #[cfg(test)]
                 let mut name_rect = egui::Rect::NOTHING;
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if is_drawer {
-                        let chevron = ui.add(
-                            egui::Label::new(egui::RichText::new("\u{203a}").weak())
-                                .selectable(false),
-                        );
+                let remove = ui
+                    .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // The 🗑 remove control, at the end of the line. The eye
+                        // hides the layer; this takes it out of the pane's stack,
+                        // which is a different act — and a destructive one — so it
+                        // stands a row's width from the eye rather than one gap
+                        // beside it, where a miss on one landed on the other.
+                        // **Drawn on every row, live or not**: a layer the pane
+                        // cannot give up gets a greyed can whose hover says why,
+                        // rather than no control at all — an absent affordance
+                        // reads as an oversight, and one that silently does
+                        // nothing is worse than both.
+                        let remove = ui
+                            .add_enabled(
+                                refusal.is_none(),
+                                egui::Button::new(
+                                    egui::RichText::new(REMOVE_LABEL)
+                                        .size(REMOVE_GLYPH_SIZE)
+                                        .color(if refusal.is_none() {
+                                            ui.visuals().weak_text_color()
+                                        } else {
+                                            ui.visuals().widgets.noninteractive.fg_stroke.color
+                                        }),
+                                )
+                                .frame(false)
+                                .min_size(egui::Vec2::splat(CONTROL_SIDE)),
+                            )
+                            .on_hover_text(format!("Remove {name} from this pane"))
+                            .on_disabled_hover_text(refusal.unwrap_or_default());
+
+                        // A trailing `›` on the drawer and sheet hosts: there a
+                        // row click *pushes* the inspector over this list, and
+                        // the chevron says so. The desktop sidebar, where the
+                        // inspector opens beside the stack, carries none.
+                        if is_drawer {
+                            let chevron = ui.add(
+                                egui::Label::new(egui::RichText::new("\u{203a}").weak())
+                                    .selectable(false),
+                            );
+                            #[cfg(test)]
+                            {
+                                chevron_rect = Some(chevron.rect);
+                            }
+                            #[cfg(not(test))]
+                            let _ = chevron;
+                        }
+
+                        // The name and status block. Hidden layers render
+                        // dimmed — weak text is the stock theme's own dimming.
+                        let block =
+                            ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                let text_height = ui.text_style_height(&egui::TextStyle::Body)
+                                    + status.as_ref().map_or(0.0, |_| {
+                                        ui.text_style_height(&egui::TextStyle::Small)
+                                    });
+                                ui.add_space(((row_height - text_height) / 2.0).max(0.0));
+                                let name_text = if enabled {
+                                    egui::RichText::new(name.as_str())
+                                } else {
+                                    egui::RichText::new(name.as_str()).weak()
+                                };
+                                let name_label = ui
+                                    .add(egui::Label::new(name_text).selectable(false).truncate());
+                                let mut text_rect = name_label.rect;
+                                if let Some(line) = &status {
+                                    // A line that opens with the fault mark is not a
+                                    // count, and `.weak()` is the theme's own way of
+                                    // saying "this is a detail" — the same dim grey
+                                    // `3 shown - W/Wa` sits in. A layer that stopped
+                                    // updating, or is drawing 85 of 297 warnings, gets
+                                    // the warning colour instead: same size, same
+                                    // place, same rect, legible as a fault.
+                                    let text = egui::RichText::new(line.as_str()).small();
+                                    let text = if line.starts_with(STATUS_MARK) {
+                                        text.color(ui.visuals().warn_fg_color)
+                                    } else {
+                                        text.weak()
+                                    };
+                                    let status_label =
+                                        ui.add(egui::Label::new(text).selectable(false).truncate());
+                                    text_rect = text_rect.union(status_label.rect);
+                                }
+                                text_rect
+                            });
                         #[cfg(test)]
                         {
-                            chevron_rect = Some(chevron.rect);
+                            name_rect = block.inner;
                         }
                         #[cfg(not(test))]
-                        let _ = chevron;
-                    }
-
-                    // The name and status block. Hidden layers render
-                    // dimmed — weak text is the stock theme's own dimming.
-                    let block = ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        let text_height = ui.text_style_height(&egui::TextStyle::Body)
-                            + status
-                                .as_ref()
-                                .map_or(0.0, |_| ui.text_style_height(&egui::TextStyle::Small));
-                        ui.add_space(((row_height - text_height) / 2.0).max(0.0));
-                        let name_text = if enabled {
-                            egui::RichText::new(name.as_str())
-                        } else {
-                            egui::RichText::new(name.as_str()).weak()
-                        };
-                        let name_label =
-                            ui.add(egui::Label::new(name_text).selectable(false).truncate());
-                        let mut text_rect = name_label.rect;
-                        if let Some(line) = &status {
-                            // A line that opens with the fault mark is not a
-                            // count, and `.weak()` is the theme's own way of
-                            // saying "this is a detail" — the same dim grey
-                            // `3 shown - W/Wa` sits in. A layer that stopped
-                            // updating, or is drawing 85 of 297 warnings, gets
-                            // the warning colour instead: same size, same
-                            // place, same rect, legible as a fault.
-                            let text = egui::RichText::new(line.as_str()).small();
-                            let text = if line.starts_with(STATUS_MARK) {
-                                text.color(ui.visuals().warn_fg_color)
-                            } else {
-                                text.weak()
-                            };
-                            let status_label =
-                                ui.add(egui::Label::new(text).selectable(false).truncate());
-                            text_rect = text_rect.union(status_label.rect);
-                        }
-                        text_rect
-                    });
-                    #[cfg(test)]
-                    {
-                        name_rect = block.inner;
-                    }
-                    #[cfg(not(test))]
-                    let _ = block;
-                });
+                        let _ = block;
+                        remove
+                    })
+                    .inner;
+                if remove.clicked() {
+                    removing = Some(kind.clone());
+                }
 
                 #[cfg(test)]
                 probe.rows.push(StackRowProbe {
