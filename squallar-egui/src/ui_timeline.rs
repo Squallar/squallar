@@ -1359,6 +1359,124 @@ impl super::Gui {
         )
     }
 
+    /// Whether row 2's two tuning sliders fit on one row of `ui`: both labels,
+    /// both rails and the value box egui draws beside each, measured from the
+    /// real galleys at the real style — `timeline_row1_fits`' device, and
+    /// generous the same way: the tie goes to the two-row form.
+    fn timeline_row2_tuning_fits(&self, ui: &egui::Ui) -> bool {
+        let body = egui::TextStyle::Body.resolve(ui.style());
+        let text = |s: &str| -> f32 {
+            ui.painter()
+                .layout_no_wrap(s.to_owned(), body.clone(), egui::Color32::PLACEHOLDER)
+                .size()
+                .x
+        };
+        let pad = 2.0 * ui.spacing().button_padding.x;
+        // A slider is its rail, a gap, and the value box beside it — at
+        // least `interact_size` wide, wider when its widest reading is.
+        let value_box = |widest: &str| (text(widest) + pad).max(ui.spacing().interact_size.x);
+        let rail = TUNING_SLIDER_WIDTH + ui.spacing().item_spacing.x;
+        let widths = [
+            text("Lookback:"),
+            rail + value_box("1440 min"),
+            text("Speed:"),
+            rail + value_box("30.0 fps"),
+        ];
+        let needed =
+            widths.iter().sum::<f32>() + ui.spacing().item_spacing.x * (widths.len() + 1) as f32;
+        ui.available_width() >= needed
+    }
+
+    /// The Lookback slider, and what releasing it does to every synced pane.
+    fn render_lookback_slider(
+        &mut self,
+        ui: &mut egui::Ui,
+        actions: &mut Vec<GuiAction>,
+        loop_active: bool,
+        #[cfg(test)] row2: &mut TimelineRow2Probe,
+    ) {
+        ui.spacing_mut().slider_width = TUNING_SLIDER_WIDTH;
+        let mut lookback_mins = (self.loop_lookback_secs as f32 / 60.0).round();
+        ui.label("Lookback:");
+        let lookback = ui.add(
+            egui::Slider::new(&mut lookback_mins, 5.0..=1440.0)
+                .logarithmic(true)
+                .suffix(" min")
+                .clamping(egui::SliderClamping::Always),
+        );
+        #[cfg(test)]
+        {
+            row2.lookback = lookback.rect;
+        }
+        if lookback.drag_stopped() {
+            let new_secs = (lookback_mins * 60.0) as u64;
+            if new_secs != self.loop_lookback_secs {
+                self.set_loop_span_secs(new_secs);
+                if loop_active {
+                    for pane_idx in self.loop_sync_targets() {
+                        actions.push(GuiAction::EnableLoop {
+                            pane_idx,
+                            lookback_secs: self.loop_span_secs_for(pane_idx),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// The Speed slider.
+    fn render_speed_slider(
+        &mut self,
+        ui: &mut egui::Ui,
+        #[cfg(test)] row2: &mut TimelineRow2Probe,
+    ) {
+        ui.spacing_mut().slider_width = TUNING_SLIDER_WIDTH;
+        ui.label("Speed:");
+        let mut fps = self.loop_speed_fps;
+        let speed = ui.add(
+            egui::Slider::new(&mut fps, 1.0..=30.0)
+                .suffix(" fps")
+                .clamping(egui::SliderClamping::Always),
+        );
+        if fps != self.loop_speed_fps {
+            self.set_loop_speed_fps(fps);
+        }
+        #[cfg(test)]
+        {
+            row2.speed = speed.rect;
+        }
+        #[cfg(not(test))]
+        let _ = speed;
+    }
+
+    /// Row 2's seek: the same frame-index rail as row 1's, `width` wide. The
+    /// two are on screen together whenever the expander is open, so it
+    /// carries the same past/future break.
+    fn render_loop_seek_rail(
+        &self,
+        ui: &mut egui::Ui,
+        actions: &mut Vec<GuiAction>,
+        current_frame: usize,
+        total: usize,
+        frame_split: Option<f32>,
+        width: f32,
+    ) -> egui::Response {
+        ui.spacing_mut().slider_width = width;
+        let mut frame_idx = current_frame;
+        let seek = paint_split_rail(ui, frame_split, |ui| {
+            ui.add(egui::Slider::new(&mut frame_idx, 0..=(total - 1)).show_value(false))
+        });
+        if seek.changed() {
+            for pane_idx in self.loop_sync_targets() {
+                actions.push(GuiAction::SeekLoopFrame {
+                    pane_idx,
+                    frame_index: frame_idx,
+                });
+            }
+        }
+        seek
+    }
+
     /// Row 2: the loop tuning, shown behind `⋯`.
     fn render_timeline_row2(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
         let pane_idx = self.active_pane;
@@ -1367,53 +1485,36 @@ impl super::Gui {
         let mut row2 = TimelineRow2Probe::default();
 
         ui.separator();
+        // One row when both sliders fit beside their labels, a row each when
+        // they do not. The phone's transport is the map's full width and the
+        // pair did not fit in it, so the frame grew past the screen — and,
+        // centred on the map, lost both its edges equally.
+        let one_row = self.timeline_row2_tuning_fits(ui);
         ui.horizontal(|ui| {
-            ui.spacing_mut().slider_width = TUNING_SLIDER_WIDTH;
-
-            let mut lookback_mins = (self.loop_lookback_secs as f32 / 60.0).round();
-            ui.label("Lookback:");
-            let lookback = ui.add(
-                egui::Slider::new(&mut lookback_mins, 5.0..=1440.0)
-                    .logarithmic(true)
-                    .suffix(" min")
-                    .clamping(egui::SliderClamping::Always),
+            self.render_lookback_slider(
+                ui,
+                actions,
+                loop_active,
+                #[cfg(test)]
+                &mut row2,
             );
-            #[cfg(test)]
-            {
-                row2.lookback = lookback.rect;
+            if one_row {
+                self.render_speed_slider(
+                    ui,
+                    #[cfg(test)]
+                    &mut row2,
+                );
             }
-            if lookback.drag_stopped() {
-                let new_secs = (lookback_mins * 60.0) as u64;
-                if new_secs != self.loop_lookback_secs {
-                    self.set_loop_span_secs(new_secs);
-                    if loop_active {
-                        for pane_idx in self.loop_sync_targets() {
-                            actions.push(GuiAction::EnableLoop {
-                                pane_idx,
-                                lookback_secs: self.loop_span_secs_for(pane_idx),
-                            });
-                        }
-                    }
-                }
-            }
-
-            ui.label("Speed:");
-            let mut fps = self.loop_speed_fps;
-            let speed = ui.add(
-                egui::Slider::new(&mut fps, 1.0..=30.0)
-                    .suffix(" fps")
-                    .clamping(egui::SliderClamping::Always),
-            );
-            if fps != self.loop_speed_fps {
-                self.set_loop_speed_fps(fps);
-            }
-            #[cfg(test)]
-            {
-                row2.speed = speed.rect;
-            }
-            #[cfg(not(test))]
-            let _ = speed;
         });
+        if !one_row {
+            ui.horizontal(|ui| {
+                self.render_speed_slider(
+                    ui,
+                    #[cfg(test)]
+                    &mut row2,
+                );
+            });
+        }
         let scope_caption = self.tuning_scope_caption(pane_idx);
         ui.label(egui::RichText::new(&scope_caption).small().weak());
         #[cfg(test)]
@@ -1452,6 +1553,9 @@ impl super::Gui {
             } else if total == 0 {
                 ui.label("No frames found");
             } else {
+                // The seek rail rides the button row where it fits and takes
+                // a row of its own where the tuning pair did not — the same
+                // width class, decided once.
                 ui.horizontal(|ui| {
                     let prev = ui.button("\u{23ee}").on_hover_text("Previous frame");
                     #[cfg(test)]
@@ -1502,25 +1606,22 @@ impl super::Gui {
                         }
                     }
 
-                    ui.spacing_mut().slider_width = (ui.available_width() * 0.5).clamp(60.0, 240.0);
-                    let mut frame_idx = current_frame;
-                    // Row 2's seek is the same frame-index rail as row 1's,
-                    // and the two are on screen together whenever the
-                    // expander is open, so it carries the same break.
-                    let seek = paint_split_rail(ui, frame_split, |ui| {
-                        ui.add(egui::Slider::new(&mut frame_idx, 0..=(total - 1)).show_value(false))
-                    });
-                    #[cfg(test)]
-                    {
-                        row2.seek = seek.rect;
-                    }
-                    if seek.changed() {
-                        for pane_idx in self.loop_sync_targets() {
-                            actions.push(GuiAction::SeekLoopFrame {
-                                pane_idx,
-                                frame_index: frame_idx,
-                            });
+                    if one_row {
+                        let width = (ui.available_width() * 0.5).clamp(60.0, 240.0);
+                        let seek = self.render_loop_seek_rail(
+                            ui,
+                            actions,
+                            current_frame,
+                            total,
+                            frame_split,
+                            width,
+                        );
+                        #[cfg(test)]
+                        {
+                            row2.seek = seek.rect;
                         }
+                        #[cfg(not(test))]
+                        let _ = seek;
                     }
 
                     if let Some(timestamp) = frame_time {
@@ -1537,6 +1638,26 @@ impl super::Gui {
                         let _ = text;
                     }
                 });
+                if !one_row {
+                    ui.horizontal(|ui| {
+                        // The whole row, less the spacing egui puts after it.
+                        let width = (ui.available_width() - ui.spacing().item_spacing.x).max(60.0);
+                        let seek = self.render_loop_seek_rail(
+                            ui,
+                            actions,
+                            current_frame,
+                            total,
+                            frame_split,
+                            width,
+                        );
+                        #[cfg(test)]
+                        {
+                            row2.seek = seek.rect;
+                        }
+                        #[cfg(not(test))]
+                        let _ = seek;
+                    });
+                }
 
                 if rendering {
                     let text = format!("Rendering {rendered}/{total}...");

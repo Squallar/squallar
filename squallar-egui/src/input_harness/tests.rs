@@ -16297,3 +16297,52 @@ fn the_colour_scale_drops_into_the_space_the_faded_chrome_leaves() {
         panel.bottom(),
     );
 }
+
+/// **The expanded transport fits the phone.** Row 2's two tuning sliders did
+/// not fit the map's width beside each other, so the frame grew past the
+/// screen and, pivoted on the map's centre, was cut off at both edges. Now
+/// they take a row each where they do not fit, and the whole surface stays on
+/// the glass — while on a desktop width they still share one row.
+#[test]
+fn the_expanded_transport_stays_inside_a_phone_screen() {
+    for (label, size, one_row) in [
+        ("portrait phone", egui::vec2(402.0, 874.0), false),
+        ("desktop", egui::vec2(1400.0, 900.0), true),
+    ] {
+        let mut h = InputHarness::with_screen(size);
+        h.set_pane_count(1);
+        h.frame();
+        let expander = h.timeline().expander;
+        assert!(
+            expander.is_finite(),
+            "{label}: precondition — the transport drew its row-2 expander",
+        );
+        h.mouse_click(expander.center());
+        h.frames_for(3, 1.0 / 60.0);
+
+        let transport = h.timeline();
+        let row2 = transport.row2.expect("the expander must open row 2");
+        let screen = h.screen_rect();
+        assert!(
+            screen.contains_rect(transport.rect),
+            "{label}: the expanded transport {:?} runs past the screen {screen:?}",
+            transport.rect,
+        );
+        for (what, rect) in [("Lookback", row2.lookback), ("Speed", row2.speed)] {
+            assert!(
+                rect.is_finite() && transport.rect.contains_rect(rect),
+                "{label}: the {what} slider {rect:?} is not inside the transport {:?}",
+                transport.rect,
+            );
+        }
+        let same_row = (row2.lookback.top() - row2.speed.top()).abs() < 1.0;
+        assert_eq!(
+            same_row,
+            one_row,
+            "{label}: the two tuning sliders {} on one row (lookback {:?}, speed {:?})",
+            if one_row { "must sit" } else { "must not sit" },
+            row2.lookback,
+            row2.speed,
+        );
+    }
+}
