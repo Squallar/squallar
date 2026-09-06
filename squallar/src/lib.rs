@@ -15,6 +15,9 @@
 // caller of looks dead.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub mod android;
+/// Test-only. The Apple bundle metadata App Store review rejects a build for:
+/// the privacy manifest, the export declaration and the purpose strings.
+pub mod apple_bundle_metadata;
 /// The RAM and thread readers behind `PlatformBridge::host_signals`, one
 /// module per OS.
 pub mod capacity;

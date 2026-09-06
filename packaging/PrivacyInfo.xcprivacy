@@ -1,0 +1,210 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Apple privacy manifest. Required since 2024 for App Store submission, and
+  this is the file whose absence is rejection ITMS-91053 ("Missing API
+  declaration"). No Xcode template ever ran over this project, so nothing
+  created it: it is written by hand, from the code, and gated by
+  `squallar/src/apple_bundle_metadata.rs`.
+
+  ONE file, both bundles. The iOS and macOS bundles wrap the same Rust
+  staticlib/binary, so the required-reason answer cannot legitimately differ
+  between them; two copies could only drift. It is copied verbatim (`cp`, no
+  `sed` — there are no build settings to expand here) to the two places Apple
+  looks, which are NOT the same place:
+
+      iOS    squallar.app/PrivacyInfo.xcprivacy                 (bundle root)
+      macOS  squallar.app/Contents/Resources/PrivacyInfo.xcprivacy
+
+  See packaging/ios/Makefile and packaging/macos/Makefile.
+
+  ── Why each entry below is here ─────────────────────────────────────────
+
+  These are Apple's "required reason APIs": ordinary system calls that an app
+  must declare a reason for using. A Rust app trips them the way a .NET app
+  does — through the standard library, not through anything the author wrote —
+  which is exactly why nobody notices until the upload is rejected.
+
+  NSPrivacyAccessedAPICategorySystemBootTime / 35F9.1
+      The symbol that reaches this is `mach_absolute_time`, and it comes from
+      **wgpu-hal's Metal backend**: `wgpu-hal/src/metal/time.rs` declares
+      `extern "C" { fn mach_absolute_time() -> u64; }` and calls it in
+      `PresentationTimer::get_timestamp_ns`, which is the timer Metal's
+      presentation callbacks use. Both Apple targets render through Metal.
+      35F9.1 is the reason for measuring elapsed time between in-app events,
+      which is what a presentation timer does.
+
+      **The obvious answer is subtly the wrong one, so it is written down.**
+      `std::time::Instant` looks like the reacher — there are 238
+      `Instant::now()` call sites in this workspace — but on Apple std calls
+      `clock_gettime(CLOCK_UPTIME_RAW)`, not `mach_absolute_time`
+      (library/std/src/sys/time/unix.rs, the `#[cfg(target_vendor = "apple")]`
+      arm of `Instant::CLOCK_ID`). Apple's boot-time list names two symbols,
+      `systemUptime` and `mach_absolute_time()`, and `clock_gettime` is
+      neither. Std's comment that the value "is identical to the result of
+      mach_absolute_time()" is a statement about the number, not about the
+      symbol a binary scanner sees. So `Instant` alone would probably not trip
+      ITMS-91053; wgpu-hal certainly does. The declaration is right either way,
+      and it is right for a reason that survives a change to either one.
+
+  NSPrivacyAccessedAPICategoryFileTimestamp / C617.1
+      Four first-party reachers, all in `squallar-egui`, all inside
+      `#[cfg(not(target_arch = "wasm32"))]` code, so all live on both Apple
+      targets:
+
+        basemap_archive/block_cache.rs  `mtime_nanos` — `Metadata::modified()`
+                                        on the app's cached archive blocks, to
+                                        pick an eviction order
+        basemap_archive/block_cache.rs  `recover_totals` — `DirEntry::metadata()`
+                                        to size and age the same cache at open
+        basemap_download.rs             `DirEntry::metadata()` sizing the
+                                        offline segments the app itself wrote
+        basemap_archive.rs              `File::metadata()` for the length of the
+                                        app's own archive file
+
+      C617.1 is the reason for metadata of files inside the app's own
+      container, which is what every one of those is: files this app wrote,
+      under its own cache directory, read back by this app alone.
+
+      One caveat, recorded rather than smoothed over: `chrono`'s Unix
+      `Local::now()` path calls `fs::symlink_metadata("/etc/localtime")` and
+      then `.modified()` on it, and the app calls `chrono::Local::now()` in
+      three places. `/etc/localtime` is a *system* file, outside the app
+      container, so C617.1's wording does not literally cover it — and no
+      other code on Apple's list does either (DDA9.1 is display-to-user,
+      3B52.1 is document-picker files, 0A2A.1 is for an SDK author's own
+      manifest). The category is declared and the app has a genuine C617.1 use,
+      so the manifest is truthful as it stands; this is here so the chrono
+      reacher is not later found and mistaken for an undeclared one.
+
+  NSPrivacyAccessedAPICategoryUserDefaults / CA92.1
+      **macOS only, and reached through a dependency rather than through any
+      line in this workspace** — which is exactly why it is easy to miss and
+      why `apple_bundle_metadata.rs` couples it to the dependency instead of to
+      a source marker.
+
+      `dark-light` 2.0.0 (`src/platforms/macos.rs`, `#[cfg(target_os =
+      "macos")]`) reads the system theme with
+      `NSUserDefaults::standardUserDefaults()`, `persistentDomainForName("Apple
+      Global Domain")`, `objectForKey("AppleInterfaceStyle")`. Those selectors
+      land in the macOS binary's Objective-C metadata, which is what Apple's
+      scanner reads. `PlatformBridge::detect_dark_theme`
+      (`squallar/src/platform.rs`) calls it at startup, up to three times,
+      before the first frame.
+
+      iOS does **not** link it: the dependency is declared under
+      `[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]`
+      in `squallar/Cargo.toml`, and a `cargo tree` inverse query for
+      `dark-light` against `aarch64-apple-ios` prints nothing. (Spelled without
+      the flag on purpose: a double hyphen is illegal inside an XML comment and
+      makes this whole manifest unparseable.) The declaration is therefore an
+      over-declaration on iOS, which Apple does not reject; the alternative is
+      two manifests that can drift, and under-declaring is the direction that
+      gets a build refused. If that trade stops being worth it, the way out is
+      to retire `dark-light` on macOS in favour of winit's `ThemeChanged` /
+      `NSApplication.effectiveAppearance`, which reach no required-reason API
+      at all — and the gate will then tell you to drop this entry.
+
+      **CA92.1 is the best available code, not an exact one.** It reads
+      "information that is accessible only to the app itself", and
+      `AppleInterfaceStyle` in the global domain is a system preference rather
+      than this app's own data. Nothing on Apple's list fits better: 1C8F.1 is
+      app groups, AC6B.1 is managed-app configuration, C56D.1 is for an SDK
+      author declaring in the SDK's own manifest. The read is local, is used
+      only to pick a theme, and nothing derived from it leaves the device.
+      Whether a reviewer agrees is not knowable without submitting.
+
+  ── Categories deliberately NOT declared, each checked ────────────────────
+
+  Declaring a category the app does not touch is not free: it is a claim in a
+  submission, and the next person to read this file would believe it. Both
+  remaining categories were checked — across the workspace, `vendor/`, and
+  every crate in `cargo tree` for both Apple targets — and are absent.
+
+  NSPrivacyAccessedAPICategoryDiskSpace
+      Nothing calls `statfs`, `statvfs`, `f_bavail`/`f_bfree`,
+      `volumeAvailableCapacity` or any `NSURLVolume*` key — not in this
+      workspace, not in `vendor/`, and not in any registry crate on either
+      Apple target. No `sysinfo`, `fs2`, `fs4`, `dirs` or `directories` in
+      either tree.
+
+      The function that looks like it does is a red herring worth naming so it
+      is not "rediscovered": `free_space` in
+      `squallar-egui/src/ui_download_area.rs` is `quota?.free()`, arithmetic
+      over an `OfflineQuota` whose two figures come from an HTTP GET to the
+      service worker's `__quota__` route carrying
+      `navigator.storage.estimate()`. A browser figure on the wasm target, no
+      syscall, nothing on Apple. Stronger still: the field is never populated
+      in production on any target — the only caller of `set_download_quota` is
+      the test harness, and the state initialises it `None`.
+
+  NSPrivacyAccessedAPICategoryActiveKeyboards
+      Not used. `UITextInputMode::activeInputModes` exists in the tree only as
+      an unused generated binding in `objc2-ui-kit`, with no caller in the
+      workspace, `vendor/`, winit, or any crate in either Apple tree. An
+      uncalled objc2 binding is dead-code-eliminated and its selector literal
+      never reaches the binary's Objective-C metadata.
+
+  NSPrivacyAccessedAPICategoryUserDefaults *is* declared above — read that
+  entry rather than assuming this app stores preferences in it. It does not:
+  persistence on iOS and macOS is the filesystem-backed `KvStore` in
+  `squallar/src/kv.rs` (`create_dir_all` + `write` on a dedicated writer
+  thread), and the web build uses `localStorage`, which is not this category
+  either. The declaration is there for a dependency's theme probe.
+
+  ── Tracking and collection ──────────────────────────────────────────────
+
+  Both empty, and both are checked claims rather than the convenient answer.
+
+  The app has no analytics, no advertising, no accounts and no telemetry. The
+  one piece of personal data it handles at all is the device's location, and
+  it never leaves the device: it draws a marker and a heading wedge on the
+  map, and it chooses the nearest radar site from a static table compiled into
+  the binary (`squallar_radar::sites::nearest_wsr88d_site`). The only request
+  that carries coordinates is the Open-Meteo sounding fetch, and the
+  coordinates it sends are the *radar site's*, read from that same static
+  table — `squallar-app/src/app_fetch.rs`, `let (lat, lon) = (radar.lat,
+  radar.lon)`. Apple's definition of "collect" is transmission off device, so
+  there is nothing to declare.
+
+  If an analytics SDK, a crash reporter, or any request carrying the user's
+  own coordinates is ever added, NSPrivacyCollectedDataTypes stops being
+  empty and the App Store Connect privacy label has to change with it.
+-->
+<plist version="1.0">
+<dict>
+    <key>NSPrivacyTracking</key>
+    <false/>
+    <key>NSPrivacyTrackingDomains</key>
+    <array/>
+    <key>NSPrivacyCollectedDataTypes</key>
+    <array/>
+    <key>NSPrivacyAccessedAPITypes</key>
+    <array>
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategorySystemBootTime</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>35F9.1</string>
+            </array>
+        </dict>
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>C617.1</string>
+            </array>
+        </dict>
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>CA92.1</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>

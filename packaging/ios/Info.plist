@@ -81,8 +81,40 @@
          stops delivering while the app is backgrounded and the map keeps its
          last dot until the app returns; with it, the app would be asking for a
          capability it has no use for and would have to justify. See the module
-         note in squallar/src/os_location/apple.rs. -->
+         note in squallar-location/src/os_location/apple.rs. -->
     <key>NSLocationWhenInUseUsageDescription</key>
-    <string>Squallar shows your position and heading on the radar map.</string>
+    <string>Squallar marks where you are and which way you are moving on the weather radar map, and opens the nearest radar site instead of asking you to pick one. Location is read only while the app is open, and every part of the map works without it.</string>
+    <!-- Export compliance, and `false` here is a checked claim rather than an
+         assumed one.
+
+         Everything this app sends leaves over HTTPS or WSS. The transport is
+         `rustls` speaking published TLS 1.2/1.3, and the trust decision — the
+         part that would otherwise be cryptography of our own — is handed to
+         Apple's Security.framework through `rustls-platform-verifier`; see
+         `squallar-source/src/tls.rs`, which installs the provider once and
+         sets `https_only(true)`. The only other algorithms in the Apple
+         dependency graph are the RFC 6455 `Sec-WebSocket-Accept` SHA-1
+         handshake digest and non-cryptographic hashes (crc32, adler, xxh3,
+         ahash) used for checksums and hash maps. This app implements no
+         cryptography of its own, signs no requests — the NEXRAD S3 buckets are
+         read anonymously, with no SigV4 and no credential chain — stores
+         nothing encrypted, and offers the user no encryption feature.
+
+         Declaring the key at all is what stops App Store Connect asking the
+         export question on every upload.
+
+         **What would re-open this:** shipping a cipher for anything but TLS;
+         adding an encryption feature a user can point at (encrypted archives,
+         an account with client-side key material, end-to-end sharing); or
+         moving the App Store Connect ES256 token signer into the app, which is
+         CI Python (`.github/scripts/appstore-upload.py`) today and never
+         enters the bundle. Adding SigV4 to the S3 reads would stay exempt, but
+         it changes the reasoning above from "nothing beyond TLS" to "TLS plus
+         standard authentication", so it should be rewritten, not left.
+
+         This is the self-classification only. The separate French declaration
+         App Store Connect asks about is a human's call, not this file's. -->
+    <key>ITSAppUsesNonExemptEncryption</key>
+    <false/>
 </dict>
 </plist>

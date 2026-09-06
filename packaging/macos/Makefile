@@ -441,6 +441,15 @@ build:
 	    packaging/macos/Info.plist > "$$APP/Contents/Info.plist"
 	# An unexpanded $(...) here means a key silently ships as a literal.
 	! grep -q '\$$(' "$$APP/Contents/Info.plist" || { echo "ERROR: unexpanded build setting left in Info.plist"; exit 1; }
+	# Apple's privacy manifest, under Contents/Resources for macOS -- iOS puts
+	# the same file at the bundle root instead, and that difference is why the
+	# placement is worth reading off Apple's rule rather than assuming the two
+	# bundles agree. Copied verbatim: no build settings to expand. It lands
+	# before the signing stage below, which seals the bundle's resources --
+	# anything added after that breaks the seal. One source for both bundles;
+	# see the file's own header.
+	cp packaging/PrivacyInfo.xcprivacy "$$APP/Contents/Resources/PrivacyInfo.xcprivacy"
+	test -s "$$APP/Contents/Resources/PrivacyInfo.xcprivacy" || { echo "ERROR: PrivacyInfo.xcprivacy did not reach Contents/Resources"; exit 1; }
 
 	# ---- the guard the deployment floor exists for ----
 	# Reads the floor out of the Mach-O rather than out of any of the three

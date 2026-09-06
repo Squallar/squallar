@@ -31,6 +31,12 @@ targets:
     deploymentTarget: "14.0"
     sources:
       - path: Sources
+      # Apple's privacy manifest. `make -C packaging/ios` copies this to the
+      # bundle root itself; the entry here is so an Xcode build produces the
+      # same bundle instead of one App Store Connect rejects with ITMS-91053.
+      # One file serves both bundles, hence the `..`.
+      - path: ../PrivacyInfo.xcprivacy
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.squallar

@@ -47,9 +47,22 @@
          "the dialog never appears". Shipping both costs one string and is
          correct on every OS version either key has ever been read by. -->
     <key>NSLocationUsageDescription</key>
-    <string>Squallar shows your position on the radar map and picks the radar site nearest you.</string>
+    <string>Squallar marks where you are and which way you are moving on the weather radar map, and opens the nearest radar site instead of asking you to pick one. Location is read only while the app is open, and every part of the map works without it.</string>
     <key>NSLocationWhenInUseUsageDescription</key>
-    <string>Squallar shows your position on the radar map and picks the radar site nearest you.</string>
+    <string>Squallar marks where you are and which way you are moving on the weather radar map, and opens the nearest radar site instead of asking you to pick one. Location is read only while the app is open, and every part of the map works without it.</string>
+    <!-- Export compliance. The reasoning behind `false`, and the list of
+         changes that would re-open it, is written out once beside the same key
+         in packaging/ios/Info.plist — the two bundles wrap the same Rust
+         binary, so the answer cannot differ between them. In short: HTTPS and
+         WSS only, `rustls` for the transport with the trust decision handed to
+         Apple's Security.framework, no cryptography of this app's own, nothing
+         signed, nothing stored encrypted, no encryption feature for the user.
+
+         Carried on the macOS bundle because the macOS App Store asks the same
+         question. The notarized Developer ID download does not ask it, and the
+         key costs nothing there. -->
+    <key>ITSAppUsesNonExemptEncryption</key>
+    <false/>
     <!-- Deliberately absent, and each for a reason:
 
          * `LSRequiresIPhoneOS`, `UIDeviceFamily`, `UILaunchScreen`,

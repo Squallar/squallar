@@ -37,6 +37,13 @@ targets:
     type: application
     platform: macOS
     deploymentTarget: "11.0"
+    sources:
+      # Apple's privacy manifest. `make -C packaging/macos` copies this into
+      # Contents/Resources itself; the entry here is so an Xcode build produces
+      # the same bundle. Xcode puts a resource there on macOS by itself, which
+      # is the placement Apple wants. One file serves both bundles, hence `..`.
+      - path: ../PrivacyInfo.xcprivacy
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.squallar
