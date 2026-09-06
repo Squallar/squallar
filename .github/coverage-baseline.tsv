@@ -8,7 +8,7 @@ nexrad-level3/src/model/symbology.rs	5	5
 squallar-alloc/src/lib.rs	63	62
 squallar-app/src/app.rs	1597	1175
 squallar-app/src/app_chunks.rs	220	133
-squallar-app/src/app_fetch.rs	1947	1616
+squallar-app/src/app_fetch.rs	1947	1609
 squallar-app/src/app_render.rs	4025	3330
 squallar-app/src/app_state.rs	77	0
 squallar-app/src/budget_arms.rs	17	17
@@ -102,7 +102,7 @@ squallar-egui/src/ui_diagnostics.rs	293	15
 squallar-egui/src/ui_download_area.rs	303	40
 squallar-egui/src/ui_fade.rs	96	39
 squallar-egui/src/ui_glyphs.rs	218	0
-squallar-egui/src/ui_input.rs	352	101
+squallar-egui/src/ui_input.rs	356	101
 squallar-egui/src/ui_inspector.rs	314	0
 squallar-egui/src/ui_layout.rs	257	60
 squallar-egui/src/ui_map.rs	2188	534
@@ -112,7 +112,7 @@ squallar-egui/src/ui_menu.rs	406	92
 squallar-egui/src/ui_offline_areas.rs	198	4
 squallar-egui/src/ui_pills.rs	999	199
 squallar-egui/src/ui_popups.rs	299	4
-squallar-egui/src/ui_region.rs	150	0
+squallar-egui/src/ui_region.rs	152	0
 squallar-egui/src/ui_section_edit.rs	342	0
 squallar-egui/src/ui_section_pane.rs	735	0
 squallar-egui/src/ui_settings.rs	393	0
@@ -223,10 +223,10 @@ squallar-overlays/src/render/handlers/sites.rs	98	34
 squallar-overlays/src/render/hatch.rs	279	0
 squallar-overlays/src/render/jobs.rs	2067	575
 squallar-overlays/src/render/overlay_state.rs	790	304
-squallar-overlays/src/render/rasterize.rs	1268	786
+squallar-overlays/src/render/rasterize.rs	1268	787
 squallar-overlays/src/render/rasterize/lambert_fixture.rs	116	0
 squallar-overlays/src/render/signature_memo.rs	263	91
-squallar-overlays/src/render/station_model.rs	690	0
+squallar-overlays/src/render/station_model.rs	719	0
 squallar-overlays/src/spc/colors.rs	44	9
 squallar-overlays/src/spc/discussion.rs	386	136
 squallar-overlays/src/spc/discussion_archive.rs	63	0
@@ -256,7 +256,7 @@ squallar-radar/src/hover.rs	65	53
 squallar-radar/src/jobs.rs	594	99
 squallar-radar/src/kdp.rs	247	21
 squallar-radar/src/l3_values.rs	282	0
-squallar-radar/src/level3.rs	188	90
+squallar-radar/src/level3.rs	188	61
 squallar-radar/src/loop_downloads.rs	898	401
 squallar-radar/src/loop_geometry.rs	7	7
 squallar-radar/src/nrot.rs	3232	43
