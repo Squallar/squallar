@@ -60,6 +60,27 @@ pub struct OverlayGridNeed {
     /// resident now: what a pane on the layer asks the heap to be able to
     /// hold, which is the admission question, and a figure that does not
     /// move with the poll.
+    ///
+    /// **The grid CACHE's budget, and nothing beside it — a named gap.** Each
+    /// gridded handler holds a second population while a loop of its layer
+    /// runs: a `frame_grids` cache of one `FRAME_STAGING_BYTES` grid plus the
+    /// staging pool's retained buffer of the same size, both summed into the
+    /// handler's own `resident_source_bytes` and neither reachable from this
+    /// figure. **It is not derivable from it**: MRMS's grid is half its cache
+    /// budget and GMGSI's is a quarter of its, so no multiplier over
+    /// `budget_bytes` is the same statement on both layers, and one written
+    /// here would be a budget spelled as arithmetic over another crate's
+    /// private constants — the shape that silently re-derives when one of them
+    /// moves. Measured on the Tier-2 `huge` leg the two populations together
+    /// read up to 444,458,992 B against the 258,663,296 B this field's three
+    /// entries price, so the gap is some 177 MiB.
+    ///
+    /// **What closing it takes**: a second field here — `staging_bytes`, fed
+    /// beside `budget_bytes` by a `source_grid_staging_bytes(id)` next to
+    /// `squallar_overlays`' existing `source_grid_budget_bytes`, summed into
+    /// `crate::fit::NeedTerms::overlay_grids_host`. That is one line in each
+    /// of three files, and one of them is `App::loop_demand`, which builds
+    /// every `Scene` the application prices.
     pub budget_bytes: u64,
 }
 
@@ -180,11 +201,19 @@ pub struct TileNeed {
 pub struct Need {
     /// Textures: loop frames, grids, offscreens, static rasters, the mirror.
     pub gpu_bytes: u64,
-    /// Host memory: the tile working set, every shown overlay picture at the
-    /// budget's oversampling, one more picture for the arrival in flight,
-    /// every enabled gridded overlay's source budget, and one decoded volume
-    /// per radar loop frame — resident frames at their measured size, pending
-    /// frames at the reserve.
+    /// Host memory: the tile working set; every shown overlay picture at the
+    /// budget's oversampling, **twice** — once for the batch the dispatch
+    /// holds and once for the same batch in the renderer's upload queue; one
+    /// more picture for the arrival in flight; one dispatch pass of overlay
+    /// loop-frame rasters; every enabled gridded overlay's source budget; one
+    /// decoded volume per radar loop frame (resident frames at their measured
+    /// size, pending frames at the reserve) and one more for each 2D pane
+    /// parked at a still; and one radar render's peak.
+    ///
+    /// **Three families measured on the `huge` leg are still priced at
+    /// zero**, and `crate::fit`'s module header carries the reason for each:
+    /// the gridded handlers' per-frame staging grids, `loans out` and `tile
+    /// bodies`.
     pub host_bytes: u64,
 }
 

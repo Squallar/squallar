@@ -529,10 +529,11 @@ fn check_budgets(b: &Budgets, profile: &DeviceProfile, from: &str) {
         b.overlay_oversample_percent,
     );
     // The ladder's order, as far as a set of budgets alone can show it. The
-    // history rung lowers the GPU need only, where the margin and the tiles
-    // lower both, so a walk driven by the host axis thins the margin and
-    // snaps the tiles with the loop's history untouched — by design, and
-    // pinned as such by `the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_no_host_rung`.
+    // history rung lowers the GPU need only — see its entry in `LADDER`, which
+    // records both why it may not be widened and that it is a standing
+    // ruling-15 violation WO-I owns — where the margin and the tiles lower
+    // both, so a walk driven by the host axis thins the margin and snaps the
+    // tiles with the loop's history untouched.
     // "History before margin, margin before tiles" therefore holds on the
     // GPU walk and the counted walk (`fit_sheds_down_the_ladder_only_as_far_as_the_scene_needs`,
     // `the_ladder_surrenders_lighting_before_resolution_and_the_picture_last`),

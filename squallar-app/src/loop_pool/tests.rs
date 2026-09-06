@@ -1914,8 +1914,12 @@ mod budget_agreement {
         // is one two-hour loop with no cadence, so its 14 named frames charge
         // 1120 MiB of decoded volume against a 768 MiB host allowance — over
         // before any raster is counted, and over by more than any rung can
-        // pay, since ruling 13 keeps every rung off the loop's history. What
-        // changed is which rungs are allowed to try: the raster rung answers
+        // pay. **Ruling 15 is what keeps every rung off the frame count**: a
+        // loop plays at its listing's cadence or is refused at admission, so
+        // the loop-history rung lowers the GPU axis alone and a host-over walk
+        // cannot take it (`squallar_device_profile::budget`'s `LADDER`, which
+        // records the widening that was measured and declined). What changed
+        // is which rungs are allowed to try: the raster rung answers
         // the host axis now that `NeedTerms::render_peak_host` is sized from
         // it, and stepping 4096 -> 2048 really does return 4096^2 x 16 -
         // 2048^2 x 16 = 192 MiB of host. It is not enough and the scene still

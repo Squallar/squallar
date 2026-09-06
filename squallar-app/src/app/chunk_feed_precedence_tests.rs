@@ -2644,21 +2644,51 @@ fn the_rung_is_the_same_however_many_pictures_are_resident() {
     );
 }
 
-/// **A scene of eleven whole-picture overlays on a wasm bracket** — the
-/// `huge` leg's own pane and picture size — built so that a page-heap event
-/// has a rung to shed and a recovery has one to give back. Returns the app
-/// with the pictures recorded and one loop walk taken.
+/// **A scene of six whole-picture overlays on a wasm bracket** — five shown
+/// plus the arrival in flight, on the `huge` leg's own pane and picture size
+/// — built so that a page-heap event has a rung to shed and a recovery has
+/// one to give back. Returns the app with the pictures recorded and one loop
+/// walk taken.
 ///
-/// **MRMS and GMGSI are deliberately not among them, and the reason is a
-/// measurement.** Those two are the gridded sources, and their source budgets
-/// alone price 694,870,912 B of host need — so the leg's full thirteen cost
-/// 954,512,560 B against the wasm bracket's 805,306,368 B allowance, and that
-/// scene does not hold its whole pan margin at ANY capacity this bracket can
-/// offer. `fit` is right to keep it at the floor rung and a promotion rule is
-/// right to refuse it. Including them here would make these tests assert that
-/// the recovery does nothing, which is true of that scene and says nothing
-/// about the rule.
-fn an_eleven_picture_web_app(platform: TestBridge) -> App {
+/// **The count is chosen against the promotion rule's own arithmetic, and it
+/// fell from ten shown to five on 2026-09-06** when the renderer's upload
+/// queue was priced (`fit::NeedTerms::upload_pending_host`): a shown batch is
+/// charged twice now, once where the dispatch holds it and once where the
+/// renderer is banding it to the GPU. `promotion_qualifies` asks for
+/// `allowance - need_after >= (need_after - need_now) + one refire step`,
+/// which with `k` pictures of `P` bytes at each rung and `F` of fixed host
+/// terms is `805,306,368 - F - 33,554,432 >= k x (2 x P150 - P125)`. On this
+/// pane that is `620,756,992 >= k x 54,475,932`, so `k <= 11`: five shown
+/// pictures and the arrival. At ten the scene costs 1,027,104,192 B at the
+/// whole rung, over the allowance before any event, and the rule is right to
+/// refuse a promotion into it — which would make these tests assert that the
+/// recovery does nothing.
+///
+/// **THE PRODUCT CONSEQUENCE, which is a finding and not a fixture detail:
+/// there is a shown-picture count above which the margin recovery can never
+/// fire at all, it is derivable, and on this pane it just fell from eleven to
+/// five.** A web user showing more than that on a 2878 x 1611 canvas sheds
+/// the pan margin on the first page-heap event and never gets it back,
+/// however much the page frees — because the promotion rule asks whether the
+/// *promoted* rung would still be comfortable, and above that count it never
+/// would. Nothing warns them and nothing in the readout names the count.
+///
+/// The arithmetic, both sides of the change. Before the upload queue was
+/// priced the inequality was `805,306,368 - 67,108,864 - 33,554,432 >=
+/// (N + 1) x 54,475,932`, so `N <= 11` and this fixture's ten shown pictures
+/// sat one under the wall. With the batch charged twice and the parked
+/// still's volume charged at all, it is `805,306,368 - 150,994,944 -
+/// 33,554,432 >= (2N + 1) x 54,475,932`, so `N <= 5`. **The wall did not
+/// appear; it was always there and the fixture was always just under it.**
+/// What moved is the price, and with it the count at which a user meets it.
+///
+/// **MRMS and GMGSI are deliberately not among them, and the reason is the
+/// same shape.** Those two are the gridded sources, and their source budgets
+/// alone price 694,870,912 B of host need, so a scene holding them does not
+/// hold its whole pan margin at ANY capacity this bracket can offer. `fit` is
+/// right to keep it at the floor rung and a promotion rule is right to refuse
+/// it; neither says anything about the rule these tests are for.
+fn a_six_picture_web_app(platform: TestBridge) -> App {
     use squallar_device_profile::budget::BudgetLimits;
 
     let shown = [
@@ -2667,11 +2697,6 @@ fn an_eleven_picture_web_app(platform: TestBridge) -> App {
         squallar_source::id::known::SPC_OUTLOOK,
         squallar_source::id::known::SPC_FIRE_OUTLOOK,
         squallar_source::id::known::SPC_DISCUSSIONS,
-        squallar_source::id::known::LIGHTNING,
-        squallar_source::id::known::METAR,
-        squallar_source::id::known::CITY_LABELS,
-        squallar_source::id::known::RADAR_SITES,
-        squallar_source::id::known::RADAR_COVERAGE,
     ];
     let plan = crate::app::fetch::OverlayRenderRequest {
         geo_bounds: squallar_geo::GeoBounds {
@@ -2726,22 +2751,28 @@ fn page_and_live(page_bytes: u64, live: Option<u64>) -> Option<crate::platform::
     })
 }
 
-/// **The spike, chosen against the scene's own arithmetic.** 620 MiB of
-/// `byteLength` is past the action line the whole rung's batch sets
-/// (1024 MiB less 458,914,368 B, so 586 MiB) and low enough that one economy
-/// fraction of it — 585,105,408 B, allowing 438,829,056 — no longer covers
-/// that batch. So the event acts AND costs exactly one rung: 150 % to 125 %,
-/// 458,914,368 B of pictures down to 318,593,484.
-const SPIKE: u64 = 620 * MIB;
+/// **The spike, chosen against the scene's own arithmetic.** 800 MiB of
+/// `byteLength` is past the action line the whole rung's batch sets — 1024
+/// MiB less the six pictures' 250,316,928 B, so 785.3 MiB — and low enough
+/// that one economy fraction of it (754,974,720 B, allowing 566,231,040) no
+/// longer covers the scene at the whole rung. So the event acts AND costs
+/// exactly one rung: 150 % to 125 %, the scene's 609,909,312 B of host need
+/// down to 469,588,428.
+///
+/// **Every figure here rose with the upload-queue term**, because the action
+/// line is set by the batch and the ceiling has to fall below a need that now
+/// charges that batch twice. The shape of the choice is unchanged.
+const SPIKE: u64 = 800 * MIB;
 
-/// A second spike past the action line the SHED rung sets — 1024 MiB less
-/// 318,593,484 B, so 720 MiB — and more than one refire step above the first.
-const DEEPER_SPIKE: u64 = 760 * MIB;
+/// A second spike past the action line the SHED rung sets — 1024 MiB less the
+/// 125 % batch's 173,778,264 B, so 858.3 MiB — and more than one refire step
+/// above the first.
+const DEEPER_SPIKE: u64 = 880 * MIB;
 
 /// Live bytes while the page is really full, and after it has come back. The
-/// promotion threshold on this scene falls at 420 MiB: the released rung's
-/// action line is 614,827,456 B and the margin it must leave is 173,875,316.
-const LIVE_FULL: u64 = 600 * MIB;
+/// promotion threshold on this scene falls at 619.5 MiB: the released rung's
+/// action line is 823,424,896 B and the margin it must leave is 173,875,316.
+const LIVE_FULL: u64 = 700 * MIB;
 const LIVE_RECOVERED: u64 = 60 * MIB;
 
 /// **THE USER'S COMPLAINT, END TO END: a shed pan margin comes back.**
@@ -2763,7 +2794,7 @@ const LIVE_RECOVERED: u64 = 60 * MIB;
 fn a_shed_pan_margin_comes_back_once_live_bytes_fall_and_hold() {
     let platform = TestBridge::web();
     let gauge = platform.linear_memory_gauge();
-    let mut app = an_eleven_picture_web_app(platform);
+    let mut app = a_six_picture_web_app(platform);
     let whole = app.budgets.overlay_oversample_percent;
     assert_eq!(whole, 150, "precondition: the top rung's pan margin");
     assert!(app.host_headroom_bytes > 0, "precondition: a priced batch");
@@ -2848,7 +2879,7 @@ fn a_shed_pan_margin_comes_back_once_live_bytes_fall_and_hold() {
 fn a_tick_the_bridge_did_not_answer_on_does_not_advance_the_dwell() {
     let platform = TestBridge::web();
     let gauge = platform.linear_memory_gauge();
-    let mut app = an_eleven_picture_web_app(platform);
+    let mut app = a_six_picture_web_app(platform);
 
     gauge.set(page_and_live(SPIKE, Some(LIVE_FULL)));
     tick(&mut app);
@@ -2899,7 +2930,7 @@ fn pressure_still_steps_on_the_tick_it_lands_on_however_much_dwell_is_banked() {
 
     let platform = TestBridge::web();
     let gauge = platform.linear_memory_gauge();
-    let mut app = an_eleven_picture_web_app(platform);
+    let mut app = a_six_picture_web_app(platform);
 
     gauge.set(page_and_live(SPIKE, Some(LIVE_FULL)));
     tick(&mut app);
@@ -3018,7 +3049,7 @@ fn a_heap_at_the_warn_line_is_noted_and_steps_nothing() {
 /// figure both legs reported and Firefox's allocation failures named. Which
 /// rung a scene of that size then takes is the fit's arithmetic and is pinned
 /// where the fit lives
-/// (`squallar_device_profile::fit::tests::the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_no_host_rung`);
+/// (`squallar_device_profile::fit::tests::the_huge_leg_fits_at_no_host_rung_and_the_one_picture_undercount_fitted`);
 /// what is pinned here is that the page path reaches it.
 #[test]
 fn a_page_at_ninety_percent_with_levers_says_so_and_frees_something() {

@@ -1176,6 +1176,35 @@ pub struct Rung {
 ///    little over sheds a little history rather than a rung of detail. A
 ///    shorter loop is the least destructive thing in the application — nothing
 ///    on screen gets worse, there is just less of it.
+///
+///    **THIS RUNG IS A STANDING VIOLATION OF RULING 15, and the ruling is why
+///    it stays `GPU` rather than being widened.** Ruling 15 — *"frame DENSITY
+///    is tier 1 too: refuse, never decimate. A loop plays at the listing's
+///    cadence or it is refused at admission with text"* — states the negative
+///    property as **"no governor path lowers a granted loop's frame count or
+///    span"**, and halving `loop_render_budget` is exactly a governor path
+///    lowering a granted frame count. WO-I owns removing it. It is recorded
+///    here rather than in a commit message because the next reader to find a
+///    host term sized from the frame count will make the same proposal:
+///
+///    On 2026-09-06 this rung was widened to `Lowers::BOTH` and measured,
+///    because the decoded Level II volume behind a loop frame
+///    (`fit::NeedTerms::loop_scans_host`) is a **host** term sized from the
+///    same frame count, and with no cadence yet
+///    [`Budgets::frames_for_span_of`] answers `loop_render_budget` outright —
+///    so on the web bracket a loop that has fetched nothing charges
+///    `14 x LOOP_SCAN_RESERVE_BYTES` = 1,174,405,120 B, **1.46x the whole host
+///    allowance**, and no host rung could touch it. Widening it made
+///    `scene_table`'s "one looping pane" go from 184,549,376 B over at the
+///    stops to fitting with 150,994,944 B to spare, and `huge_pending(13)`
+///    from 726,493,668 B over to 212,614,764 B over. **It was declined**: the
+///    scene is meant to be *refused at admission*, with text naming the span
+///    and the pool, not quietly given fewer frames. `every_host_rung_at_its_stop`
+///    reporting "nothing left to shed" on such a scene is therefore the
+///    **correct** answer, not the gap it looks like — there is nothing left to
+///    shed because shedding frames is forbidden — and what makes the refusal
+///    possible is that `need` prices the term correctly and `over` already
+///    answers "host over" with the rung untouched.
 /// 4. **Overlay oversampling**, one entry of
 ///    [`constants::OVERLAY_OVERSAMPLE_PERCENTS`] a step (1.5x, 1.25x, 1x per
 ///    side). After the history because a shorter loop is *less of the same

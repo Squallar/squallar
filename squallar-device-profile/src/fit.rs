@@ -15,6 +15,24 @@
 //! invents a byte figure: the one constant of this module's own is a measured
 //! maximum rounded up, charged only for what has not arrived, and says so.
 //!
+//! **Four host families are transients rather than residencies**, and each
+//! says on its own doc whether it is a max or a sum and why:
+//! [`NeedTerms::picture_arrival_host`] and [`NeedTerms::render_peak_host`] are
+//! scene-level **maxima** (one reply is converted at a time; one render is
+//! charged), [`NeedTerms::loop_pictures_host`] is a scene-level max times the
+//! application-wide per-pass cap, and [`NeedTerms::upload_pending_host`] is a
+//! **sum**, because the renderer's queue holds every band anyone has filed.
+//!
+//! **What is still priced at zero, said here rather than left to be
+//! discovered.** Three census families the `huge` leg measures have no term:
+//! the gridded handlers' per-frame staging grids (their
+//! [`crate::scene::OverlayGridNeed`] carries the grid *cache* budget alone,
+//! and the staging is not derivable from it), `loans out` (9.8 – 14.2 MB) and
+//! `tile bodies` (up to 9.5 MB). The first needs a second figure per layer on
+//! the scene; the other two are bounded by caches in `squallar-egui` and are
+//! together under 25 MB of a browser's 768 MiB host allowance. They are named
+//! zeroes, not silent ones.
+//!
 //! [`need_terms_for_pane`] prices one pane; [`need_terms`] is that over the
 //! panes plus the scene-level terms, and the two agree bit for bit by
 //! construction (`fit/tests.rs` folds them back).
@@ -46,7 +64,7 @@
 use crate::budget::{
     BudgetLimits, Budgets, DeviceProfile, TileCacheBudget, resolve, step_down, step_down_for,
 };
-use crate::constants::{FrameCost, LOOP_SCAN_RESERVE_BYTES};
+use crate::constants::{FrameCost, LOOP_SCAN_RESERVE_BYTES, MAX_OVERLAY_LOOP_RENDERS_PER_PASS};
 use crate::quality::{GroundPass, offscreen_bytes};
 use crate::scene::{Capacity, Need, PaneNeed, Pools, Scene};
 use squallar_radar::types::RenderView;
@@ -84,12 +102,46 @@ pub struct NeedTerms {
     pub tiles_host: u64,
     /// **Every shown overlay picture, on the host**: each pane's
     /// `overlay_pictures` at [`picture_bytes`] for that pane at the budget's
-    /// oversampling. A picture is a page buffer from the moment the
+    /// oversampling — one page buffer per shown texture layer, at the size
+    /// the planner was handed.
+    ///
+    /// **This is the batch the dispatch holds, and nothing else.** Until
+    /// 2026-09-06 this doc claimed the charge ran "from the moment the
     /// worker's reply is copied in until its last upload band has crossed to
-    /// the GPU — on a ringless device four MiB a frame, so a 43 MB picture
-    /// is eleven frames of residency and thirteen shown layers that
-    /// re-rasterise together are all resident at once.
+    /// the GPU", which the arithmetic never had: a picture the frame thread
+    /// has handed to the renderer sits in
+    /// `squallar_gpu`'s `TextureUpload::pending`, holding egui's own `Arc`
+    /// alive for as many frames as it has bands, and no term here counted it.
+    /// [`Self::upload_pending_host`] is that second residency, and it is a
+    /// term rather than a wider reading of this one because the two are
+    /// **different generations of the batch** — the census families
+    /// `overlay pictures` and `upload pending` are read separately and were
+    /// both non-zero on the same tick.
     pub pictures_host: u64,
+    /// **One more batch, on the host, in the renderer's upload queue**: every
+    /// shown overlay picture again, at the same size — a **sum** across
+    /// panes, because each pane's batch queues on its own.
+    ///
+    /// **Priced at zero until 2026-09-06, and it is the largest single miss
+    /// the model had.** The census family that measures it directly
+    /// (`squallar_egui::heap_census`'s `upload pending`, summed over the
+    /// `pending` queue's distinct `Arc`s by `TextureUpload`'s own
+    /// `publish_pending_level`) read **424,260,388 – 527,142,364 B** on the
+    /// Tier-2 `huge` leg while this model charged nothing for it.
+    ///
+    /// **Why a whole batch and not a fraction of one.** The queue drains one
+    /// [`crate::constants::BLOCKING_BAND_BYTES`] band a frame for the whole
+    /// queue on every device without a staging ring — which is every browser
+    /// — and the shown layers re-rasterise **together** on every move, so a
+    /// thirteen-picture batch of 542,353,344 B is some 135 frames of draining
+    /// against a user who moves the map again inside that. A whole batch
+    /// queued is the steady state under interaction, not a transient: the
+    /// measured range above is 78 – 97 % of that batch.
+    ///
+    /// **A sum, not a max**, unlike [`Self::picture_arrival_host`]: the
+    /// arrival is one buffer for the whole application because one reply is
+    /// converted at a time, and this queue holds every band anyone has filed.
+    pub upload_pending_host: u64,
     /// **One more picture, on the host, for the arrival in flight**: the
     /// largest picture any pane shows, once. The reply is decoded into a
     /// second buffer while the first is alive and then converted into the
@@ -100,6 +152,34 @@ pub struct NeedTerms {
     /// is why [`PaneTerms`] carries its candidate apart from the pane's own
     /// totals.
     pub picture_arrival_host: u64,
+    /// **The overlay loop-frame rasters in transit, on the host**: one
+    /// dispatch pass's whole burst, at the largest looping overlay pane's
+    /// frame.
+    ///
+    /// A loop frame of a layer that is not radar is rasterised through the
+    /// same off-thread funnel the live picture goes through
+    /// (`App::spawn_overlay_render` with `frame: Some(stamp)`), and its reply
+    /// crosses the page heap exactly as a live picture's does. **It is not
+    /// [`Self::pictures_host`]** — that term counts a pane's *shown* layers,
+    /// and a loop-frame dispatch is deliberately kept out of the record that
+    /// answers them (`RenderDispatcher::overlay_picture_sizes` says so) — and
+    /// it is not [`Self::loops`], which is the finished frame's **texture**
+    /// on the GPU.
+    ///
+    /// **A max across panes times a constant, and the constant is the bound.**
+    /// `App::dispatch_overlay_loop_renders` collects its asks into one list
+    /// declared **outside** the pane walk and stops at
+    /// [`crate::constants::MAX_OVERLAY_LOOP_RENDERS_PER_PASS`], so the cap is
+    /// application-wide per pass rather than per pane: at most that many
+    /// rasters are started in one pass, each at most the widest looping
+    /// pane's `overlay_frame_bytes`. **A bound, not a proof** — the cap is on
+    /// asks *started* in a pass and not on asks outstanding, so a pass that
+    /// dispatches its four while four earlier ones are still running exceeds
+    /// this. What holds it in practice is that the funnel is the same one the
+    /// live rasters queue on and a frame already out is skipped
+    /// (`frame.render_in_flight`); what would settle it is a census family on
+    /// the loop-frame replies, which does not exist.
+    pub loop_pictures_host: u64,
     /// **Every enabled gridded overlay's decoded source, on the host**, at
     /// the budget its handler states — counted once however many panes show
     /// the layer, because the handler is one instance for the whole
@@ -127,6 +207,32 @@ pub struct NeedTerms {
     /// ([`PaneNeed::loop_scans_needed`]) and only a pane parked at a still
     /// keeps one.
     pub loop_scans_host: u64,
+    /// **One decoded Level II volume per 2D pane parked at a still, on the
+    /// host**, at [`LOOP_SCAN_RESERVE_BYTES`] — a sum, since two panes on two
+    /// sites hold two volumes.
+    ///
+    /// **Exactly complementary to [`Self::loop_scans_host`]**, which is what
+    /// makes this add rather than double-charge: that term charges a pane
+    /// running a **radar** loop and nothing else, and the application's own
+    /// scene walk reaches its resident measurement only for such a pane
+    /// (`App::loop_demand` pushes a pane onto `scan_owners` under
+    /// `pane_need.looping`, having already `continue`d past every pane whose
+    /// radar timeline is not active). So a pane showing a still — or looping
+    /// a satellite or a forecast while radar sits at one — held a decoded
+    /// volume that no term of this model priced, measured at **94 – 99 MB**
+    /// by the census family `still scans`.
+    ///
+    /// **Charged at the reserve rather than at a measurement, and both
+    /// directions are stated.** The scene says whether a pane is 2D, whether
+    /// it is running a radar loop and whether its site is another pane's; it
+    /// does **not** say whether the pane has radar enabled at all, so this
+    /// over-prices a radar-off pane by one reserve. And the census figure is
+    /// above one reserve (83,886,080 B) because it also holds the per-site
+    /// latest cache, which no scene field names — so this under-prices the
+    /// pair. A measured figure would need the same reconciliation
+    /// [`PaneNeed::loop_scans_resident_bytes`] gives the loop, which needs a
+    /// scene field the application has to fill in.
+    pub still_scans_host: u64,
     /// **What a radar render costs the host while it is running**: the widest
     /// 2D pane's [`FrameCost::host_peak`] — its finished raster and value grid
     /// with the claim buffer that painted them still alive beside them.
@@ -157,15 +263,18 @@ impl NeedTerms {
             host_bytes: self
                 .tiles_host
                 .saturating_add(self.pictures_host)
+                .saturating_add(self.upload_pending_host)
                 .saturating_add(self.picture_arrival_host)
+                .saturating_add(self.loop_pictures_host)
                 .saturating_add(self.overlay_grids_host)
                 .saturating_add(self.loop_scans_host)
+                .saturating_add(self.still_scans_host)
                 .saturating_add(self.render_peak_host),
         }
     }
 
     /// Fold one pane's terms in: every additive term saturating-added, the
-    /// arrival candidate taken as a max.
+    /// three scene-level candidates taken as a max.
     fn fold_pane(&mut self, pane: &PaneTerms) {
         self.static_rasters = self.static_rasters.saturating_add(pane.static_rasters);
         self.loops = self.loops.saturating_add(pane.loops);
@@ -173,8 +282,13 @@ impl NeedTerms {
         self.offscreens = self.offscreens.saturating_add(pane.offscreens);
         self.buildings = self.buildings.saturating_add(pane.buildings);
         self.pictures_host = self.pictures_host.saturating_add(pane.pictures_host);
+        self.upload_pending_host = self
+            .upload_pending_host
+            .saturating_add(pane.upload_pending_host);
         self.picture_arrival_host = self.picture_arrival_host.max(pane.picture_host);
+        self.loop_pictures_host = self.loop_pictures_host.max(pane.loop_picture_host);
         self.loop_scans_host = self.loop_scans_host.saturating_add(pane.loop_scans_host);
+        self.still_scans_host = self.still_scans_host.saturating_add(pane.still_scans_host);
         self.render_peak_host = self.render_peak_host.max(pane.render_peak_host);
     }
 
@@ -212,6 +326,16 @@ pub struct PaneTerms {
     pub buildings: u64,
     /// Every whole-picture overlay it shows, on the host.
     pub pictures_host: u64,
+    /// The same batch again, in the renderer's upload queue — see
+    /// [`NeedTerms::upload_pending_host`]. Additive across panes and in
+    /// [`Self::host_bytes`].
+    pub upload_pending_host: u64,
+    /// One decoded volume for the still this 2D pane is parked at, at
+    /// [`LOOP_SCAN_RESERVE_BYTES`] — see [`NeedTerms::still_scans_host`].
+    /// Zero for a pane running a radar loop, which pays through
+    /// [`Self::loop_scans_host`] instead, and for one whose site another pane
+    /// counts.
+    pub still_scans_host: u64,
     /// One decoded volume per frame of its radar loop, on the host — the
     /// resident ones at their measured size, the pending ones at the
     /// reserve; zero for a pane whose site another pane already counts, and
@@ -220,6 +344,12 @@ pub struct PaneTerms {
     /// One of its pictures, for the scene's arrival term to take the max of.
     /// Not in [`Self::host_bytes`].
     pub picture_host: u64,
+    /// **A whole dispatch pass of this pane's overlay loop frames**, for the
+    /// scene's [`NeedTerms::loop_pictures_host`] to take the max of. Not in
+    /// [`Self::host_bytes`] — the pass cap is application-wide, so the scene
+    /// charges one burst and not one per pane — and zero for a pane that is
+    /// not looping a layer with a frame of its own.
+    pub loop_picture_host: u64,
     /// **The host peak of the widest radar render this pane can dispatch**,
     /// for the scene's [`NeedTerms::render_peak_host`] to take the max of.
     /// Not in [`Self::host_bytes`] — the scene charges one render, not one
@@ -272,9 +402,14 @@ impl PaneTerms {
             .saturating_add(self.buildings)
     }
 
-    /// What this pane costs the host, the arrival excluded.
+    /// What this pane costs the host, the three scene-level candidates
+    /// excluded — the arrival, the loop-frame burst and the render peak are
+    /// each one charge for the whole scene, not one per pane.
     pub fn host_bytes(&self) -> u64 {
-        self.pictures_host.saturating_add(self.loop_scans_host)
+        self.pictures_host
+            .saturating_add(self.upload_pending_host)
+            .saturating_add(self.loop_scans_host)
+            .saturating_add(self.still_scans_host)
     }
 
     /// The two totals.
@@ -355,9 +490,32 @@ fn pane_terms(pane: &PaneNeed, budgets: &Budgets, grid: u64) -> PaneTerms {
                 .saturating_add(pending.saturating_mul(LOOP_SCAN_RESERVE_BYTES));
         }
     }
+    // **A 2D pane that is not running a radar loop is parked at a still**,
+    // and the still is a decoded volume nothing above prices. The predicate
+    // is the complement of the arm just taken, term for term, so no pane can
+    // fall into both: a radar loop is `looping` with no overlay frame of its
+    // own, and a pane whose site is another pane's charges nothing on either
+    // arm.
+    let radar_looping = pane.looping && pane.overlay_frame_bytes == 0;
+    if !radar_looping
+        && !pane.loop_scans_shared
+        && matches!(pane.view, RenderView::PlanView | RenderView::CrossSection)
+    {
+        terms.still_scans_host = LOOP_SCAN_RESERVE_BYTES;
+    }
+    if pane.looping && pane.overlay_frame_bytes > 0 {
+        // One dispatch pass's whole burst of this pane's loop-frame rasters,
+        // for the scene to take the max of — the cap is application-wide.
+        terms.loop_picture_host = (pane.overlay_frame_bytes as u64)
+            .saturating_mul(MAX_OVERLAY_LOOP_RENDERS_PER_PASS as u64);
+    }
     if pane.overlay_pictures > 0 {
         let picture = picture_bytes(pane.picture_px, budgets.overlay_oversample_percent);
         terms.pictures_host = (pane.overlay_pictures as u64).saturating_mul(picture);
+        // The batch the dispatch holds, and the same batch again in the
+        // renderer's upload queue: two generations of one set of layers, both
+        // resident, measured as two census families on one tick.
+        terms.upload_pending_host = terms.pictures_host;
         terms.picture_host = picture;
     }
     terms
