@@ -439,6 +439,50 @@ pub(crate) struct FinishHists {
 /// included — and therefore has more samples in it than this has frames.
 /// The two measure overlapping work over different frame sets; only this one
 /// shares a denominator with `prepare`.
+///
+/// # What each cut scales with, and why the shares are not a constant
+///
+/// **The share of a cut is a property of the SCENE, not of this segment.**
+/// Every campaign frame figure through 2026-09-07 was read on a ONE-PANE
+/// scene, and the shape the campaign carried from them — "`tessellate` is
+/// `prepare`'s biggest named cut" — does not survive a second pane. Measured
+/// on two 420 s gesture legs that differ in `pane_count` and in nothing else
+/// (same eighteen layers, same sites, same binary, same display; interact
+/// frames, `sum=` over `n`):
+///
+/// ```text
+///                 1 pane            6 panes
+///   n              4267               4126
+///   prepare      847 us/fr        3201 us/fr     (x3.78)
+///   plan           0.1%   1.09      0.0%    1.30 (x1.19)  per frame
+///   end-pass       6.7%  56.33      1.7%   54.17 (x0.96)  per shape + frame
+///   tessellate    25.8% 218.64     10.0%  318.90 (x1.46)  per shape/vertex
+///   upload        56.6% 479.00     85.2% 2728.83 (x5.70)  per byte
+///   mirror         0.0%   0.02      0.0%    0.14          per 3D pane
+///   buffers       10.5%  89.10      3.0%   95.10 (x1.07)  per vertex/index
+///   residual      0.29%   2.41     0.08%    2.62 (x1.09)  per frame
+/// ```
+///
+/// Two things in that table are load-bearing for anyone reading a share here.
+///
+/// **The residual is a fixed number of MICROSECONDS, not a fixed share.** It
+/// is six truncating [`micros`] calls against one truncating parent and
+/// nothing else, so its expectation is `6(0.5) - 0.5 = 2.5` us per frame
+/// whatever the scene costs — measured 2.41 and 2.62 across a 3.78x change in
+/// the parent. A residual that ever GREW with pane count would mean real work
+/// no cut names; this one does not.
+///
+/// **Panes are not a multiplier.** Six panes share one window, so each pane is
+/// smaller and draws less: the shape population went 873 to 1925 per pass
+/// (x2.2), not x6, and `tessellate` followed it sub-linearly. What did not
+/// follow is `upload`, which grew x5.70 on only 5% more bytes — a routing
+/// change, not a volume change. See
+/// [`squallar_gpu::egui_renderer::texture_upload`]: a delta crosses whole on
+/// the frame thread when it is *small enough*
+/// (`goes_whole` is `bytes <= band_cap`), so six smaller panes push their
+/// rasters under the threshold and onto the blocking route that one large pane
+/// stayed above. Measured over the same two legs: 2.5 MB of 59.2 GB blocking
+/// on one pane, 35.8 GB of 62.3 GB on six.
 #[derive(Default)]
 pub(crate) struct PrepareHists {
     /// `Gui::ui` return to the egui pass's close: the app's own prologue —
@@ -455,7 +499,14 @@ pub(crate) struct PrepareHists {
     /// staging slots and any blocking `write_texture`.
     pub(crate) upload: Hist,
     /// The pane-mirror pass, and on a frame with no mirror request the
-    /// sub-microsecond cost of finding that out.
+    /// sub-microsecond cost of finding that out — **plus the
+    /// `staged_geometry` walk**, which is inside this span and not the next
+    /// one. That placement is deliberate and stated where it is made
+    /// (`EguiRenderer::end_pass_and_upload`): the walk is the instrument for
+    /// the `buffers` phase, so counting it there would inflate the very
+    /// microseconds its byte total is divided by. It is named here so a
+    /// reader who finds this cut non-zero on a scene with no 3D pane looks
+    /// for a per-primitive walk rather than for a mirror that is not there.
     pub(crate) mirror: Hist,
     /// egui's `update_buffers` — which also dispatches every paint callback's
     /// `prepare`, the 3D raymarch's CPU-side encode included — plus the return
