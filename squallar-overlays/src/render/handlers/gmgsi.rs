@@ -1513,6 +1513,35 @@ impl OverlayHandler for GmgsiHandler {
     /// read beside prices values only. Not counted at all: the rasters made
     /// from these grids, which are the overlay picture family's, and the
     /// textures those became, which are the GPU's.
+    /// **No pane draws this layer, so the staging pool's parked mosaic goes.**
+    ///
+    /// [`StagingPool::release_retained`] was written for two callers and had
+    /// neither: "an idle policy in the layer that owns the source, and a memory
+    /// governor's tier-2 pressure step". This is the first. The pool holds one
+    /// grid-sized buffer **whether or not anything is decoding** — 15,000,000 B on GMGSI — and
+    /// while no pane has this layer enabled nothing decodes, so the block is
+    /// pure carry.
+    ///
+    /// It costs the next decode one allocation, which is the allocation this
+    /// pool exists to remove — and that is why the trigger is this and not a
+    /// clock. The pool's own doc rules a short idle threshold out for exactly
+    /// that reason: it would re-introduce one mosaic-sized allocate-and-free per
+    /// poll on a heap that cannot coalesce, for a layer that is still on. "No
+    /// pane draws it" cannot: the next decode can only follow the layer being
+    /// switched back on.
+    ///
+    /// Safe to call every frame, which is what this hook does: `release_retained`
+    /// takes a `try_lock`, answers `false` on an empty slot and allocates
+    /// nothing to say so.
+    ///
+    /// **What this does NOT release**, deliberately: the granule the state
+    /// carries and the two grid caches. Those are the layer's fetched data, and
+    /// giving them up here is the larger change the contract above describes —
+    /// it trades a refetch on the way back, which the staging buffer does not.
+    fn release_data(&mut self) -> bool {
+        self.frame_grids.staging.release_retained()
+    }
+
     fn resident_source_bytes(&self) -> u64 {
         let carried = match &self.state.data {
             Some(grid) if !self.cached_grids.holds(grid) => grid.values.resident_bytes(),
