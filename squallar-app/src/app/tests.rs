@@ -1729,7 +1729,6 @@ fn the_frame_re_arm_holds_only_work_that_finishes() {
     for kept in [
         "any_render_in_flight",
         "any_loop_active",
-        "chunk_feeds.any_in_flight",
         // The handshake, which times out; not the backoff, which does not.
         "chunk_notify.handshake_pending",
         // Memory the app has already decided it does not want, waiting for a frame to free
@@ -1742,6 +1741,18 @@ fn the_frame_re_arm_holds_only_work_that_finishes() {
                  something unrelated waking the loop: {arm}"
         );
     }
+    // **The one term that left, and why it is not in the list above.** Every
+    // entry there is work whose ending has no producer but a frame. A chunk
+    // round has one: the worker that runs it posts a redraw itself when it
+    // sends, so polling for it as well drew a frame per frame of the round's
+    // latency with nothing to show — 85% of every frame an idle live feed drew.
+    // The two halves are pinned together in
+    // `frame_need::tests::a_chunk_round_is_woken_by_the_worker_that_answers_it_not_by_a_poll`,
+    // which is what keeps the absence safe.
+    assert!(
+        !arm.contains("chunk_feeds.any_in_flight"),
+        "the feed's in-flight poll is back in the re-arm: {arm}"
+    );
     assert!(
         body.contains("self.auto_poll_at ="),
         "the frame no longer records when auto-poll next needs one, so the \
@@ -1863,8 +1874,9 @@ fn a_chunk_feed_between_rounds_still_gets_its_frame() {
     assert_eq!(
         app.auto_poll_delay(),
         None,
-        "a round in flight is already holding the loop awake through \
-             `any_in_flight`; scheduling for it as well would wake it twice"
+        "a round in flight is answered by the worker running it, which posts \
+             a redraw when it sends; a timer for it as well would wake the \
+             loop for a result that already brings its own frame"
     );
 
     app.chunk_feeds.finish_round(

@@ -376,6 +376,18 @@ impl TextureUploads {
         self.capable
     }
 
+    /// **Whether bands are still queued**, and so whether the next frame has
+    /// already been bought before anything else asks for one.
+    ///
+    /// A banded upload spends several frames on purpose: the queue exists so a
+    /// raster reaches the GPU without one frame paying for all of it. Those
+    /// frames are the queue's, and until this was readable from outside they
+    /// were charged to whichever unrelated claim happened to be standing when
+    /// they landed — see `squallar_app::frame_need::WakeClaim::Upload`.
+    pub fn uploads_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     /// Bands this may move in one frame.
     fn bands_per_frame(&self) -> usize {
         bands_per_frame(self.capable)
@@ -398,7 +410,7 @@ impl TextureUploads {
         self.drain(device, queue, renderer);
         self.publish_pending_level();
         self.publish_resident_level();
-        !self.pending.is_empty()
+        self.uploads_pending()
     }
 
     /// Route one delta: egui's own path, or a queue of bands.

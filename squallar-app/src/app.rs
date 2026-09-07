@@ -1150,7 +1150,21 @@ impl App {
         self.push_back_claim();
         let post_back = web_time::Instant::now();
 
-        // **The same eight questions in the same order, with the same
+        // **Asked first and posting nothing.** A frame with bands left in the
+        // upload queue is already bought: `end_pass_and_upload` zeroed this
+        // frame's repaint delay for exactly that reason, and the
+        // `RepaintAction::Now` arm below is what posts it. So this is a claim
+        // and not a question about whether to ask for a frame — it is here to
+        // stop the claims underneath being credited with frames the upload
+        // queue had already paid for, which is the only way removing one of
+        // them can be told from renaming it (`crate::frame_need::WakeClaim`).
+        let upload_claim = self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.egui_renderer.uploads_pending())
+            .then_some(WakeClaim::Upload);
+
+        // **The same questions in the same order, with the same
         // short-circuit** — `or_else` is lazy exactly as `||` was, so a frame
         // with a render in flight still stops at the first one and this tail
         // costs what it did. What is new is that the answer is NAMED rather
@@ -1167,7 +1181,19 @@ impl App {
         // something; nothing else in this list speaks for it.
         } else if self.restore_pending {
             Some(WakeClaim::Restore)
-        } else if self.chunk_feeds.any_in_flight() || self.chunk_notify.handshake_pending() {
+        // **The socket, and not the feed's round.** A round out on a worker is
+        // answered by that worker, which posts a redraw of its own the moment
+        // it sends (`app_chunks::drive_chunk_feeds`,
+        // `app_chunks::fetch_notified_chunk`); re-arming for it here as well
+        // bought a frame with nothing to show for every frame of the round's
+        // latency. Measured on an idle KTLX live feed over two 129 s windows
+        // with no input at all, that was 765 of 930 and 685 of 743 frames
+        // drawn.
+        // The handshake has no such producer — `drive_chunk_notifications`
+        // reconnects it from a frame — so nothing but a frame brings a
+        // dropped socket back, and it stays. See
+        // `crate::frame_need::WakeClaim::Chunk`.
+        } else if self.chunk_notify.handshake_pending() {
             Some(WakeClaim::Chunk)
         } else if squallar_worker::offload::has_deferred_drops() {
             Some(WakeClaim::Drops)
@@ -1212,7 +1238,8 @@ impl App {
         // up is folded into `Timed` rather than given a slot: both are a frame
         // arriving on a clock.
         self.frame_ledger.record_wake_claim(
-            wake_claim
+            upload_claim
+                .or(wake_claim)
                 .or(repaint_claim)
                 .or_else(|| self.auto_poll_at.map(|_| WakeClaim::Timed))
                 .unwrap_or(WakeClaim::External),

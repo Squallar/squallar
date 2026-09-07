@@ -510,3 +510,179 @@ fn the_animation_cause_has_no_bypass_in_the_ui_layer() {
         sites[0].0,
     );
 }
+
+/// The body of a free function or method named `head` in `source`, brace
+/// balanced from its first `{`.
+fn balanced_body(source: &str, head: &str) -> String {
+    let start = source
+        .find(head)
+        .unwrap_or_else(|| panic!("`{head}` is gone"));
+    let rest = &source[start..];
+    let open = rest.find('{').expect("a body");
+    let mut depth = 0usize;
+    for (i, c) in rest[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return rest[open..open + i].to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced braces in {head}");
+}
+
+/// **The texture upload queue has a claim of its own, and it is asked before
+/// every other one.**
+///
+/// A banded upload buys its own frames: `end_pass_and_upload` zeroes the
+/// frame's repaint delay while bands remain, so those frames happen whatever
+/// the re-arm says. Asked last, [`WakeClaim::Upload`] would take only the
+/// frames nothing else was standing for, and every claim above it would be
+/// credited with frames the upload queue had already paid for — which is
+/// precisely how deleting one of those claims reads as a saving while being a
+/// relabelling. **This is the pin that keeps a later before/after honest**,
+/// and it is a position, which is why it is held on the source text.
+///
+/// It also pins the other half: the upload claim posts nothing. It is folded
+/// into the charge and left out of the `if … { notify_redraw }` guard, because
+/// the renderer's own zero delay is what asks for that frame and a second ask
+/// would be a wake nobody needed.
+#[test]
+fn the_upload_queue_names_its_own_claim_and_is_asked_before_the_rest() {
+    const APP: &str = include_str!("../app.rs");
+    // Presence control: the renderer still publishes the fact this reads. A
+    // pin over a predicate that no longer exists would pass over nothing.
+    const RENDERER: &str = include_str!("../../../squallar-gpu/src/egui_renderer.rs");
+    assert!(
+        RENDERER.contains("pub fn uploads_pending(&self) -> bool"),
+        "the renderer no longer publishes whether upload bands are pending, \
+         so the upload claim below is reading something else",
+    );
+
+    let body = balanced_body(APP, "fn handle_redraw(");
+    let at = |needle: &str| {
+        body.find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` is gone from handle_redraw"))
+    };
+    let upload = at("let upload_claim = ");
+    let rearm = at("let wake_claim = ");
+    assert!(
+        upload < rearm,
+        "the upload claim is asked after the re-arm chain, so every claim in \
+         that chain is credited with frames the upload queue had already \
+         bought and a removal there cannot be told from a rename",
+    );
+    assert!(
+        body[upload..rearm].contains("uploads_pending()"),
+        "the upload claim is no longer read from the renderer's pending \
+         bands, so it is standing for something else",
+    );
+    // The fold itself, read between its own parentheses rather than by first
+    // occurrence: `let upload_claim = …` is earlier in the body whatever the
+    // fold does, so a search over the whole body would pass on the binding
+    // alone and say nothing about the order the charge is decided in.
+    let fold_at = at("self.frame_ledger.record_wake_claim(");
+    let fold = &body[fold_at..];
+    let fold = &fold[..fold
+        .find(");")
+        .expect("the record_wake_claim call has no end")];
+    let first = fold
+        .find("upload_claim")
+        .expect("the charge fold no longer names the upload claim");
+    let then = fold
+        .find(".or(wake_claim)")
+        .expect("the charge fold no longer names the re-arm's claim");
+    assert!(
+        first < then,
+        "the charge fold asks the re-arm before the upload queue, so a frame          the upload queue had already bought is charged to whatever the          re-arm was standing for: {fold}",
+    );
+    // The guard on the redraw post names `wake_claim` alone: the upload claim
+    // is an attribution, not a second ask for a frame that is already coming.
+    assert!(
+        body.contains("if wake_claim.is_some() {"),
+        "the re-arm's redraw guard changed shape; if the upload claim has \
+         been folded into it, every banded frame now posts a redraw twice",
+    );
+}
+
+/// **A chunk round in flight is not a reason to draw a frame.**
+///
+/// The round is answered by the worker running it, which posts a redraw of its
+/// own the moment it sends — so re-arming for it as well spent one frame per
+/// frame of the round's latency with nothing to show. Measured on an idle
+/// KTLX live feed over two 129 s windows with no input at all: 901 and 714
+/// unnecessary frames of 930 and 743 drawn, of which 765 and 685 were charged
+/// to that re-arm.
+///
+/// **The two halves have to be pinned together.** Dropping the poll is only
+/// safe while the wake that replaced it exists, so this asserts the absence of
+/// the poll *and* that both dispatch sites still post a redraw on a path that
+/// cannot skip it. If a future edit makes one of those wakes conditional, this
+/// fails here rather than as a feed that stops updating on an idle desktop.
+#[test]
+fn a_chunk_round_is_woken_by_the_worker_that_answers_it_not_by_a_poll() {
+    const APP: &str = include_str!("../app.rs");
+    const CHUNKS: &str = include_str!("../app_chunks.rs");
+
+    let redraw = balanced_body(APP, "fn handle_redraw(");
+    let arm_start = redraw
+        .find("let wake_claim = ")
+        .expect("the end-of-frame re-arm is gone from handle_redraw");
+    let arm = &redraw[arm_start
+        ..arm_start
+            + redraw[arm_start..]
+                .find("notify_redraw(")
+                .expect("the re-arm no longer ends in a redraw request")];
+    assert!(
+        arm.contains("self.chunk_notify.handshake_pending()"),
+        "the re-arm dropped the handshake, which has no producer of its own: \
+         a socket that goes down is then retried only if something unrelated \
+         draws a frame",
+    );
+    assert!(
+        !arm.contains("chunk_feeds.any_in_flight"),
+        "the feed's in-flight poll is back in the re-arm. It asks for a frame \
+         for every frame a round is out, and the worker running that round \
+         already posts one when it answers: {arm}",
+    );
+
+    for site in ["fn drive_chunk_feeds(", "fn fetch_notified_chunk("] {
+        let body = balanced_body(CHUNKS, site);
+        let send = body
+            .find("sender.send(ChunkResponse {")
+            .unwrap_or_else(|| panic!("{site} no longer replies with a ChunkResponse"));
+        let wake = body
+            .find("crate::app::notify_redraw(&window);")
+            .unwrap_or_else(|| {
+                panic!(
+                    "{site} no longer asks for a frame when its round \
+                     answers, and nothing else does: the round's result now \
+                     waits for an unrelated wake"
+                )
+            });
+        assert_eq!(
+            body.matches("crate::app::notify_redraw(&window);").count(),
+            1,
+            "{site} asks for a frame in more than one place; this pin cannot \
+             tell which of them is on the answering path",
+        );
+        assert!(
+            send < wake,
+            "{site} asks for its frame before it sends the result, so the \
+             frame it buys can run before the message is on the channel",
+        );
+        let between = &body[send..wake];
+        for branch in ["if ", "return", "match "] {
+            assert!(
+                !between.contains(branch),
+                "{site} put a `{branch}` between the send and the wake, so \
+                 there is now a path that sends a round's result and never \
+                 asks for the frame that would draw it",
+            );
+        }
+    }
+}

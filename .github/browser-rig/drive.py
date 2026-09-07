@@ -3148,6 +3148,10 @@ var cadence_re = /frame cadence: n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|
 //   * `charged …`: `unnecessary` split by the claim that kept the app awake,
 //     exactly one per frame, so these sum to `unnecessary`. A sum that stops
 //     matching is a frame reaching the verdict with no claim chosen.
+//     `upload` is FIRST and is a cost rather than waste: bands left in the
+//     texture upload queue zero the frame's repaint delay, so those frames
+//     were bought before any other claim was asked, and reading it last would
+//     credit whichever claim came next with frames it never bought.
 //
 // WHY THE DENOMINATOR IS NOT THE REPAINT REQUEST: a map that nudges itself
 // genuinely requests every frame it wastes, so "egui asked" scores the defect
@@ -3155,7 +3159,7 @@ var cadence_re = /frame cadence: n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|
 // event on the raw input, a message taken off a channel, a tile body handled,
 // an animation factor between its endpoints, a surface rebuilt -- and none is
 // reachable from a repaint ask. The ask is used only for `charged`.
-var frame_need_re = /frame need: (\d+) drawn, (\d+) needed, (\d+) unnecessary; caused input=(\d+) arrival=(\d+) animation=(\d+) surface=(\d+); charged render=(\d+) loop=(\d+) hold=(\d+) restore=(\d+) chunk=(\d+) drops=(\d+) gesture=(\d+) egui=(\d+) timed=(\d+) external=(\d+)/;
+var frame_need_re = /frame need: (\d+) drawn, (\d+) needed, (\d+) unnecessary; caused input=(\d+) arrival=(\d+) animation=(\d+) surface=(\d+); charged upload=(\d+) render=(\d+) loop=(\d+) hold=(\d+) restore=(\d+) chunk=(\d+) drops=(\d+) gesture=(\d+) egui=(\d+) timed=(\d+) external=(\d+)/;
 // Scene E's denominators. `listed` is frame SLOTS across every animating
 // layer of every pane; `resident`, `in flight` and `failed` are DISJOINT
 // SUBSETS of it and are never added to it -- a slot may be none of the three.
@@ -3419,16 +3423,17 @@ for (var i = 0; i < C.length; i++) {
                              arrival: parseInt(x[5], 10),
                              animation: parseInt(x[6], 10),
                              surface: parseInt(x[7], 10) },
-                   charged: { render: parseInt(x[8], 10),
-                              loop: parseInt(x[9], 10),
-                              hold: parseInt(x[10], 10),
-                              restore: parseInt(x[11], 10),
-                              chunk: parseInt(x[12], 10),
-                              drops: parseInt(x[13], 10),
-                              gesture: parseInt(x[14], 10),
-                              egui: parseInt(x[15], 10),
-                              timed: parseInt(x[16], 10),
-                              external: parseInt(x[17], 10) } };
+                   charged: { upload: parseInt(x[8], 10),
+                              render: parseInt(x[9], 10),
+                              loop: parseInt(x[10], 10),
+                              hold: parseInt(x[11], 10),
+                              restore: parseInt(x[12], 10),
+                              chunk: parseInt(x[13], 10),
+                              drops: parseInt(x[14], 10),
+                              gesture: parseInt(x[15], 10),
+                              egui: parseInt(x[16], 10),
+                              timed: parseInt(x[17], 10),
+                              external: parseInt(x[18], 10) } };
     frame_need_all.push(frame_need);
   }
   x = loop_state_re.exec(m);
@@ -8097,13 +8102,15 @@ def run_smoke(args):
               % (tag, caused.get("input"), caused.get("arrival"),
                  caused.get("animation"), caused.get("surface")))
         print("[%s] SUMMARY frame need charged (one per unnecessary frame, "
-              "sums to `unnecessary`): render=%s loop=%s hold=%s restore=%s "
-              "chunk=%s drops=%s gesture=%s egui=%s timed=%s external=%s"
-              % (tag, charged.get("render"), charged.get("loop"),
-                 charged.get("hold"), charged.get("restore"),
-                 charged.get("chunk"), charged.get("drops"),
-                 charged.get("gesture"), charged.get("egui"),
-                 charged.get("timed"), charged.get("external")))
+              "sums to `unnecessary`): upload=%s render=%s loop=%s hold=%s "
+              "restore=%s chunk=%s drops=%s gesture=%s egui=%s timed=%s "
+              "external=%s"
+              % (tag, charged.get("upload"), charged.get("render"),
+                 charged.get("loop"), charged.get("hold"),
+                 charged.get("restore"), charged.get("chunk"),
+                 charged.get("drops"), charged.get("gesture"),
+                 charged.get("egui"), charged.get("timed"),
+                 charged.get("external")))
     else:
         print("[%s] SUMMARY frame need: n/a (no `frame need:` line in this "
               "log -- a bundle older than the line, or frame telemetry not "

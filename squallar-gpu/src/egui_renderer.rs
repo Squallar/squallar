@@ -805,6 +805,18 @@ impl EguiRenderer {
         self.uploads.is_delivered(id)
     }
 
+    /// **Whether the texture upload queue still holds bands.**
+    ///
+    /// The same fact [`Self::end_pass_and_upload`] already acts on when it
+    /// overrides the frame's repaint delay to zero, exposed so the caller can
+    /// say *who* that zero came from. Without it the frames a banded upload
+    /// spends are indistinguishable from a widget nudging itself, and are
+    /// charged to whatever unrelated claim was standing — see
+    /// `squallar_app::frame_need::WakeClaim::Upload`.
+    pub fn uploads_pending(&self) -> bool {
+        self.uploads.uploads_pending()
+    }
+
     /// Free textures that are no longer needed.  Call after `queue.submit()`.
     pub fn free_textures(&mut self, ids: &[egui::TextureId]) {
         for id in ids {

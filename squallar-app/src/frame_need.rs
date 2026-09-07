@@ -68,10 +68,13 @@
 //! one happens: one relaxed `fetch_or`. **No clock read and no bin search** —
 //! the counts [`crate::frame_ledger`]'s module doc pins are untouched.
 //!
-//! The wake claim costs nothing beyond what the tail already spent: it is the
-//! same eight predicates `handle_redraw` already asks to decide whether to
-//! post a redraw, asked in the same order and with the same short-circuit, so
-//! a frame with a render in flight still stops at the first one.
+//! The wake claim is all but free: the predicates are the ones
+//! `handle_redraw` already asks to decide whether to post a redraw, asked in
+//! the same order and with the same short-circuit, so a frame stops at the
+//! first one that stands. The one addition is [`WakeClaim::Upload`], a
+//! `VecDeque::is_empty` behind an `Option`, asked first — the renderer had
+//! already acted on that fact when it zeroed the frame's repaint delay, and
+//! this only reads it back.
 
 use squallar_egui::frame_need::NeedCause;
 
@@ -84,16 +87,24 @@ use squallar_egui::frame_need::NeedCause;
 /// `handle_redraw`'s tail asks them, which is the order that already decides
 /// whether it posts a redraw. That makes [`Reading::charges_balance`] an
 /// identity rather than a hope, and it makes the choice a documented
-/// convention rather than an inference: a frame charged to [`Self::Render`]
-/// may also have had a raster held.
+/// convention rather than an inference: a frame charged to [`Self::Upload`]
+/// may also have had a render in flight and a raster held.
 ///
 /// # How to read a charge
 ///
-/// The first seven are the app's own standing claims — "there is work in
+/// [`Self::Upload`] is a frame the application owes itself and cannot avoid:
+/// the bands have to move and only a frame moves them. Read it as a cost, not
+/// as waste to remove; it is first so that the claims below it are not
+/// credited with frames it had already bought.
+///
+/// The next seven are the app's own standing claims — "there is work in
 /// flight, wake me". An unnecessary frame charged to one of them is a **poll
 /// that found nothing**: the answer had not arrived, and the frame that
 /// finally receives it is necessary and counted so. A steady rate there is
-/// the app spinning on a worker instead of being woken by one.
+/// the app spinning on a worker instead of being woken by one — and where the
+/// worker already posts a redraw when it answers, that is a poll with no
+/// reason to exist at all, which is what took `chunk_feeds.any_in_flight()`
+/// out of [`Self::Chunk`].
 ///
 /// [`Self::EguiNow`] is different in kind and is the self-nudge shape: a
 /// widget asked egui for an immediate repaint during the pass, and the frame
@@ -106,6 +117,20 @@ use squallar_egui::frame_need::NeedCause;
 /// that reason.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum WakeClaim {
+    /// `state.egui_renderer.uploads_pending()` — the texture upload queue
+    /// still holds bands.
+    ///
+    /// **First in the order, and that placement is the point.** A banded
+    /// upload spends several frames by design, and it buys them itself: the
+    /// renderer overrides the frame's repaint delay to zero while bands
+    /// remain (`squallar_gpu::egui_renderer::EguiRenderer::end_pass_and_upload`),
+    /// so the frame happens whatever every claim below says. Asked last, it
+    /// would take only the frames nothing else was standing for, and every
+    /// claim above it would read as buying frames that were already bought —
+    /// which is exactly how removing one of them would look like a saving and
+    /// be a relabelling. Asked first, what the claims below it hold is what
+    /// removing them can actually recover.
+    Upload,
     /// `render.any_render_in_flight()`.
     Render,
     /// `gui.any_loop_active()`.
@@ -114,9 +139,17 @@ pub(crate) enum WakeClaim {
     Hold,
     /// `restore_pending` — a deferred restore nothing else speaks for.
     Restore,
-    /// `chunk_feeds.any_in_flight()` or `chunk_notify.handshake_pending()`.
-    /// One slot for the two: they are the same feed seen at two points, and
-    /// splitting them would name a distinction no reader acts on differently.
+    /// `chunk_notify.handshake_pending()` — a push socket that is connecting
+    /// or reconnecting.
+    ///
+    /// **The socket alone.** This used to be `chunk_feeds.any_in_flight() ||
+    /// chunk_notify.handshake_pending()`, on the ground that they are the same
+    /// feed seen at two points. They are not the same *wake*: a round in
+    /// flight is answered by a worker that posts a redraw of its own when it
+    /// sends, and re-arming for it as well made every frame of a round's
+    /// latency a frame with nothing to show. The handshake has no such
+    /// producer — it is driven by `drive_chunk_notifications`, from a frame —
+    /// so it is a claim and the round was a poll.
     Chunk,
     /// `squallar_worker::offload::has_deferred_drops()`.
     Drops,
@@ -140,6 +173,7 @@ impl WakeClaim {
     /// Every variant, in the order [`Self::index`] assigns — which is the
     /// order `handle_redraw`'s tail asks them in.
     pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::Upload,
         Self::Render,
         Self::Loop,
         Self::Hold,
@@ -153,27 +187,29 @@ impl WakeClaim {
     ];
 
     /// How many claims there are — the width of the charge array.
-    pub(crate) const COUNT: usize = 10;
+    pub(crate) const COUNT: usize = 11;
 
     /// This claim's slot in [`Self::ALL`] and in [`Reading::charged`].
     pub(crate) const fn index(self) -> usize {
         match self {
-            Self::Render => 0,
-            Self::Loop => 1,
-            Self::Hold => 2,
-            Self::Restore => 3,
-            Self::Chunk => 4,
-            Self::Drops => 5,
-            Self::Gesture => 6,
-            Self::EguiNow => 7,
-            Self::Timed => 8,
-            Self::External => 9,
+            Self::Upload => 0,
+            Self::Render => 1,
+            Self::Loop => 2,
+            Self::Hold => 3,
+            Self::Restore => 4,
+            Self::Chunk => 5,
+            Self::Drops => 6,
+            Self::Gesture => 7,
+            Self::EguiNow => 8,
+            Self::Timed => 9,
+            Self::External => 10,
         }
     }
 
     /// A short name for a log line. Stable — the browser rig reads these.
     pub(crate) const fn name(self) -> &'static str {
         match self {
+            Self::Upload => "upload",
             Self::Render => "render",
             Self::Loop => "loop",
             Self::Hold => "hold",

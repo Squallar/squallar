@@ -22,6 +22,19 @@ use squallar_gpu::egui_renderer::pass_costs::{PassCosts, StagedGeometry};
 /// build failure rather than a skipped test.
 const DRIVE_PY: &str = include_str!("../../../.github/browser-rig/drive.py");
 
+/// The **second** reader of the `frame need:` sentence, read at compile time
+/// for `DRIVE_PY`'s reason.
+///
+/// `drive.py` scrapes that line in the browser; this scrapes it natively, and
+/// for as long as the pin below asked only about `drive.py` the two could
+/// drift. They did: the claim added in September 2026 grew `drive.py` a field
+/// and left this file expecting ten, and the pin stayed green while the native
+/// rig's probe no longer matched the line at all. A positional regex that
+/// stops matching prints `frame need: n/a`, which reads as "a binary older
+/// than the line" -- a plausible, boring story ready-made to explain away an
+/// instrument that has simply broken.
+const NATIVE_ROW_PY: &str = include_str!("../../../.github/browser-rig/native_row.py");
+
 /// The module whose telemetry sentences these tests pin, read at compile time
 /// for `DRIVE_PY`'s reason — the two source-reading gates below ask what the
 /// app writes, not what a fixture says it writes.
@@ -1773,6 +1786,54 @@ fn the_tile_bodies_line_reads_exactly_as_pinned() {
     );
 }
 
+/// The sentence `native_row.py`'s own `LINE` fixture describes, given one
+/// value per `%d` in order — the native half of "no reader may drift".
+///
+/// Read out of that file rather than restated here, on `pattern`'s terms: a
+/// copy in this module would agree with itself forever while the rig read
+/// something else.
+fn native_row_line(values: &[&str]) -> String {
+    const HEAD: &str = "    LINE = (";
+    let at = NATIVE_ROW_PY.find(HEAD).unwrap_or_else(|| {
+        panic!(
+            "native_row.py no longer declares `{HEAD}…`; the native rig's \
+             fixture for this line moved and this test can no longer read it"
+        )
+    });
+    let rest = &NATIVE_ROW_PY[at + HEAD.len()..];
+    let end = rest
+        .find(')')
+        .expect("native_row.py's LINE tuple is not closed");
+    // Python's implicit concatenation of adjacent string literals: the
+    // template is every quoted run inside the parentheses, in order.
+    let template: String = rest[..end]
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .collect::<Vec<_>>()
+        .concat();
+    let template = template
+        .strip_prefix("[..] INFO ")
+        .expect("native_row.py's fixture no longer carries a log prefix this test can strip");
+    assert_eq!(
+        template.matches("%d").count(),
+        values.len(),
+        "native_row.py's fixture has {} fields and {} values were offered: {template}",
+        template.matches("%d").count(),
+        values.len(),
+    );
+    let mut out = String::new();
+    let mut rest = template;
+    for value in values {
+        let at = rest.find("%d").expect("counted above");
+        out.push_str(&rest[..at]);
+        out.push_str(value);
+        rest = &rest[at + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The `frame need:` sentence, pinned at both ends — **the one line here that
 /// is not about what a frame cost**.
 ///
@@ -1792,7 +1853,7 @@ fn the_frame_need_line_reads_exactly_as_pinned() {
         drawn: 12_345,
         needed: 12_000,
         causes: [900, 11_000, 400, 3],
-        charged: [10, 0, 2, 0, 1, 0, 0, 300, 30, 2],
+        charged: [5, 10, 0, 2, 0, 1, 0, 0, 295, 30, 2],
     };
     // The verdict is arithmetic on the two counts, never a third counter that
     // could drift from them.
@@ -1802,26 +1863,67 @@ fn the_frame_need_line_reads_exactly_as_pinned() {
 
     let expected = "frame need: 12345 drawn, 12000 needed, 345 unnecessary; \
                     caused input=900 arrival=11000 animation=400 surface=3; \
-                    charged render=10 loop=0 hold=2 restore=0 chunk=1 drops=0 \
-                    gesture=0 egui=300 timed=30 external=2";
+                    charged upload=5 render=10 loop=0 hold=2 restore=0 chunk=1 \
+                    drops=0 gesture=0 egui=295 timed=30 external=2";
     assert_eq!(super::frame_need_line(&r), expected);
+    const FIELDS: [&str; 18] = [
+        "12345", "12000", "345", "900", "11000", "400", "3", "5", "10", "0", "2", "0", "1", "0",
+        "0", "295", "30", "2",
+    ];
     assert_eq!(
         super::frame_need_line(&r),
-        rendered(
-            &pattern("frame_need_re"),
-            &[
-                "12345", "12000", "345", "900", "11000", "400", "3", "10", "0", "2", "0", "1", "0",
-                "0", "300", "30", "2",
-            ],
-        ),
-        "the `frame need:` line and the rig's probe have drifted",
+        rendered(&pattern("frame_need_re"), &FIELDS),
+        "the `frame need:` line and the browser rig's probe have drifted",
+    );
+    // **The second reader, and the reason this assertion exists.** Holding the
+    // line against `drive.py` alone let `native_row.py` fall a field behind
+    // and stay silent about it; the same fields against both readers is what
+    // makes "no reader may drift" true rather than true of one of them.
+    assert_eq!(
+        super::frame_need_line(&r),
+        native_row_line(&FIELDS),
+        "the `frame need:` line and the NATIVE rig's fixture have drifted",
+    );
+    // The fixture matching is not enough on its own: `native_row.py` also
+    // names the claims, in order, to key the charge map it prints, and a
+    // template can still be right while those names are reordered or one is
+    // missing. Read from the file, checked against the enum.
+    let keys = {
+        const HEAD: &str = "\"charged\": dict(zip((";
+        let at = NATIVE_ROW_PY
+            .find(HEAD)
+            .expect("native_row.py no longer keys its charge map by name");
+        let rest = &NATIVE_ROW_PY[at + HEAD.len()..];
+        let end = rest
+            .find("), fnd[")
+            .expect("native_row.py's charge key tuple is not closed as this test expects");
+        rest[..end]
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let claims: Vec<String> = crate::frame_need::WakeClaim::ALL
+        .iter()
+        .map(|c| c.name().to_owned())
+        .collect();
+    assert_eq!(
+        keys, claims,
+        "native_row.py names the charges differently from `WakeClaim::ALL`, \
+         so its rows label one claim's count with another claim's name",
+    );
+    assert!(
+        NATIVE_ROW_PY.contains(&format!("), fnd[7:{}])),", 7 + claims.len())),
+        "native_row.py slices a different number of charges than there are \
+         claims, so the charge map it builds is short or over-long",
     );
     // The all-zero reading is a SENTENCE, for the reason `tile bodies:`' is.
     assert_eq!(
         super::frame_need_line(&Reading::default()),
         "frame need: 0 drawn, 0 needed, 0 unnecessary; caused input=0 \
-         arrival=0 animation=0 surface=0; charged render=0 loop=0 hold=0 \
-         restore=0 chunk=0 drops=0 gesture=0 egui=0 timed=0 external=0",
+         arrival=0 animation=0 surface=0; charged upload=0 render=0 loop=0 \
+         hold=0 restore=0 chunk=0 drops=0 gesture=0 egui=0 timed=0 external=0",
     );
 }
 
