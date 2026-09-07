@@ -5018,10 +5018,26 @@ pub(crate) fn default_tile_budget() -> squallar_device_profile::budget::TileCach
 /// this crate must not name `squallar-worker`, whose `offload::discard` is
 /// the frame thread's route for a large drop (the pool's free lane on native,
 /// the frame-paced deferred queue on wasm32), so the application installs the
-/// function once at startup and every source on every thread reaches it here.
-/// A `fn` pointer and a `OnceLock`: nothing to lock per eviction, nothing to
+/// function once at startup and every source reaches it here through one
+/// `fn` pointer in a `OnceLock`: nothing to lock per eviction, nothing to
 /// clear, and a build that installs none — every test, the harness — drops
 /// inline, which is what the code did before the sink existed.
+///
+/// **Call it from the frame thread.** This doc said "every source on every
+/// thread" until 2026-09-07, and under that sentence the wasm route leaks:
+/// `offload::discard` files into a **thread-local** queue and
+/// `offload::drain_deferred_drops` drains the *calling* thread's, so a
+/// payload filed anywhere else is never freed at all — not mis-counted,
+/// never freed. Every call site today is frame-paced ([`HttpsTiles::pump`]
+/// via `trim_economy` and `drain_completed_fetches`), and the page instance
+/// has only the one thread in any case; the sentence was a licence to break
+/// that, not a description of it.
+///
+/// **The one genuinely off-thread eviction does not come through here, on
+/// purpose.** `remember_parsed` runs on native's IO blocking pool and frees
+/// what the byte bound let go of inline, "on the thread that just paid for a
+/// parse of the same order" — its own comment. A payload dropped where it was
+/// made needs no sink.
 static TILE_DISCARD: OnceLock<TileDiscard> = OnceLock::new();
 
 /// The shape of the discard sink: a name for the ledger the payload is filed

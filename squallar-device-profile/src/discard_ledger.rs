@@ -57,8 +57,25 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 thread_local! {
     /// The deferred queue's entries at the prices they were filed at. Kept
-    /// beside the queue's own thread because that queue is thread-local:
-    /// every producer of an entry is the thread that consumes it.
+    /// beside the queue's own thread because that queue is thread-local.
+    ///
+    /// **Every producer of an entry is the thread that consumes it — and that
+    /// is a property of the TARGET, not of this queue.** The queue's route is
+    /// wasm's, and the page instance has exactly one thread: `squallar_web`'s
+    /// `rayon_pool` gives the page `install_serial_pool`, "a real rayon global
+    /// pool of exactly one thread — the calling thread", which spawns nothing,
+    /// and `std::thread::spawn` on `wasm32-unknown-unknown` returns
+    /// `Unsupported`. The rasterization worker is a **second instance with its
+    /// own linear memory**, so its queue, its counter and its census line are
+    /// a different module's and are never summed with these. Natively the
+    /// queue takes a payload only when the free lane has no worker left, and
+    /// that hand-off is the frame thread's.
+    ///
+    /// **What would break if that stopped being true is not this counter.**
+    /// `offload::drain_deferred_drops` drains the *calling* thread's queue, so
+    /// an entry filed from some other thread would never be freed at all — a
+    /// leak, not a mis-count. `squallar_egui::tile_source`'s discard sink is
+    /// the seam where that could happen, and its doc says so.
     static QUEUED: Cell<u64> = const { Cell::new(0) };
 }
 
