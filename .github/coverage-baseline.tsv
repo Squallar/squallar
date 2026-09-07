@@ -26,7 +26,7 @@ squallar-app/src/loop_frame_store.rs	157	139
 squallar-app/src/loop_pool.rs	382	378
 squallar-app/src/loop_refill.rs	97	90
 squallar-app/src/loop_telemetry.rs	50	50
-squallar-app/src/platform.rs	473	383
+squallar-app/src/platform.rs	473	380
 squallar-app/src/platform_double.rs	349	329
 squallar-app/src/pressure.rs	200	192
 squallar-app/src/recovery.rs	105	104
@@ -37,7 +37,7 @@ squallar-app/src/site_positions.rs	56	52
 squallar-app/src/test_keys.rs	3	3
 squallar-app/src/test_sites.rs	16	16
 squallar-app/src/volume_fixture.rs	57	57
-squallar-app/src/volume_inventory.rs	393	385
+squallar-app/src/volume_inventory.rs	499	490
 squallar-app/src/window_gate.rs	31	21
 squallar-basemap/src/jobs.rs	160	150
 squallar-basemap/src/style.rs	83	79
@@ -62,7 +62,7 @@ squallar-device-profile/src/scene.rs	313	313
 squallar-egui/src/actions.rs	91	43
 squallar-egui/src/admission.rs	244	224
 squallar-egui/src/basemap_archive.rs	525	485
-squallar-egui/src/basemap_archive/block_cache.rs	297	261
+squallar-egui/src/basemap_archive/block_cache.rs	297	260
 squallar-egui/src/basemap_areas.rs	239	204
 squallar-egui/src/basemap_download.rs	994	846
 squallar-egui/src/basemap_layer.rs	196	182
@@ -98,7 +98,7 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	306	268
 squallar-egui/src/tile_mesh/ledger.rs	77	46
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	1542	1477
+squallar-egui/src/tile_source.rs	1542	1475
 squallar-egui/src/tile_source/byte_lru.rs	272	271
 squallar-egui/src/tile_source/cache_ledger.rs	178	138
 squallar-egui/src/tile_source/snap.rs	157	157
@@ -228,7 +228,7 @@ squallar-overlays/src/render/handlers/labels.rs	76	58
 squallar-overlays/src/render/handlers/location.rs	76	58
 squallar-overlays/src/render/handlers/metar.rs	637	522
 squallar-overlays/src/render/handlers/mod.rs	160	158
-squallar-overlays/src/render/handlers/model.rs	2611	2469
+squallar-overlays/src/render/handlers/model.rs	2611	2467
 squallar-overlays/src/render/handlers/mrms.rs	674	604
 squallar-overlays/src/render/handlers/outlook.rs	1516	1439
 squallar-overlays/src/render/handlers/reports.rs	751	683
@@ -257,7 +257,7 @@ squallar-radar/src/beam.rs	33	33
 squallar-radar/src/catalogue.rs	174	111
 squallar-radar/src/chunk_feed.rs	271	257
 squallar-radar/src/chunk_notify.rs	402	359
-squallar-radar/src/chunks.rs	1048	742
+squallar-radar/src/chunks.rs	1052	746
 squallar-radar/src/current.rs	117	116
 squallar-radar/src/derive.rs	320	307
 squallar-radar/src/dpprep.rs	1022	956
