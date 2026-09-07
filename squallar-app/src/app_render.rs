@@ -9007,6 +9007,12 @@ mod overlay_upload_tests;
 #[cfg(test)]
 mod radar_texture_sharing_tests;
 
+/// One arriving raster's hit map is one allocation, however many panes draw
+/// it — and every one of them answers a click the same way.
+#[path = "app_render/overlay_hit_map_sharing_tests.rs"]
+#[cfg(test)]
+mod overlay_hit_map_sharing_tests;
+
 #[path = "app_render/frame_order_tests.rs"]
 #[cfg(test)]
 mod frame_order_tests;

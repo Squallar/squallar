@@ -1070,11 +1070,11 @@ impl super::App {
                             .max_id()
                             .is_none_or(|max| (max as usize) < items.len());
                         if grid_agrees && ids_fit {
-                            Ok(Some(
+                            Ok(Some(std::sync::Arc::new(
                                 squallar_overlays::render::rasterize::HitMap::from_cells(
                                     cells, items,
                                 ),
-                            ))
+                            )))
                         } else {
                             Err("cells that do not fit this dispatch's grid or its items")
                         }

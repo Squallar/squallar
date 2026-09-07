@@ -246,7 +246,7 @@ pub struct OverlayRenderResponse {
     pub generation: u64,
     pub pane_indices: Vec<usize>,
     pub zoom: i32,
-    pub hit_map: Option<HitMap>,
+    pub hit_map: Option<Arc<HitMap>>,
     /// **Which loop frame asked for this raster**, or `None` for the pane's
     /// live picture.
     ///

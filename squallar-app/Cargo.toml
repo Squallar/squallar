@@ -159,3 +159,7 @@ squallar-radar = { workspace = true, features = ["test-support"] }
 # dev-dependency edge alone so `cargo build` keeps the process-global counters
 # the shipped telemetry line reports.
 squallar-egui = { workspace = true, features = ["test-support"] }
+# `UserPreferences`, named only to satisfy `OverlayItem::popup_content` in the
+# one-line stub item `overlay_hit_map_sharing_tests` records in its hit map.
+# A dev edge and not a normal one: nothing this crate ships mentions the type.
+squallar-units = { workspace = true }

@@ -914,8 +914,34 @@ pub struct RadarTextureMeta {
 /// A rendered overlay texture and the geo bounds it covers.
 ///
 /// `Clone` because a loop frame holds one: [`crate::pane::LoopFrameImage::Overlay`]
-/// is a whole placed raster, and cloning it is a refcount on the texture handle
-/// plus the small placement record beside it.
+/// is a whole placed raster, and cloning it is a refcount on the texture handle,
+/// a refcount on the hit map, and the small placement record beside them.
+///
+/// **The hit map is behind an `Arc` for exactly that sentence.** It used to be
+/// an owned [`HitMap`], so every clone of this struct — and every one of the
+/// destination panes a single arriving raster names — deep-copied an
+/// `FxHashMap<u32, Vec<u32>>` of one entry per touched quarter-cell, on the
+/// frame thread.
+///
+/// Measured on scene E2 (KTLX, every layer, a playing 1 h loop, one pane,
+/// RTX 3090 / Vulkan on Xvfb), two legs an arm, counterbalanced ABBA: **215
+/// and 205 deep copies a leg, moving 8.4 M and 16.0 M ids**, against none at
+/// all once the handle is shared. The denominator is arrivals that CARRY a hit
+/// map — the four vector layers, about 17% of the 1224 and 1187 rasters that
+/// arrived — and one pane is the FLOOR of the saving, because the copy was per
+/// destination pane. An earlier reading of this same cut put it at ~1233 a
+/// leg; 1233 is the DISPATCHED raster count, and that reading had conflated
+/// arrivals with copies.
+///
+/// What made it worth finding was a share rather than a count: a campaign
+/// instrument timing the frame pump charged this copy **49% of the whole
+/// `Apply` walk**, with a worst single copy of 3489 us against a p99
+/// interact-frame service bar of 4 ms. That instrument never landed, so the
+/// share is not reproducible from this tree; the counts above are.
+///
+/// `squallar_source::hit` had already made this argument for the *items* half
+/// of a hit map and left the cells half owned; this is the same fix, one field
+/// over.
 #[derive(Clone)]
 pub struct OverlayTextureData {
     pub texture: egui::TextureHandle,
@@ -926,7 +952,7 @@ pub struct OverlayTextureData {
     pub width: u32,
     pub height: u32,
     pub radar_meta: Option<RadarTextureMeta>,
-    pub hit_map: Option<HitMap>,
+    pub hit_map: Option<Arc<HitMap>>,
 }
 
 impl OverlayTextureData {

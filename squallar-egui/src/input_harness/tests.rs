@@ -12934,7 +12934,9 @@ fn settle_metar_cache(
                         })
                         .collect()
                 });
-            squallar_overlays::render::rasterize::HitMap::from_cells(cells, &items)
+            std::sync::Arc::new(squallar_overlays::render::rasterize::HitMap::from_cells(
+                cells, &items,
+            ))
         });
         let texture = h.ctx.load_texture(
             format!("settled-metar-{pane_idx}"),

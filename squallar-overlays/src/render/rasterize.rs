@@ -96,7 +96,14 @@ impl HitCells {
     }
 }
 
-#[derive(Clone)]
+/// **Deliberately not `Clone`.** A hit map is one `FxHashMap<u32, Vec<u32>>`
+/// entry per quarter-cell the layer touched, and it used to be cloned once per
+/// destination pane per arriving raster, on the frame thread: measured at 49%
+/// of the whole `Apply` frame-pump walk on scene E2. It is delivered behind an
+/// `Arc` now ([`crate::render::rasterize::HitMap`] rides
+/// `OverlayRenderResponse::hit_map`), every pane shares the one allocation,
+/// and the absent `Clone` is what stops a deep copy coming back: there is no
+/// `&mut self` method on this type, so nothing needs a private copy.
 pub struct HitMap {
     cells: HitCells,
     /// The items a cell's recorded indices name, **positionally**.

@@ -4866,6 +4866,7 @@ dependencies = [
  "squallar-overlays",
  "squallar-radar",
  "squallar-source",
+ "squallar-units",
  "squallar-volumetric",
  "squallar-worker",
  "tokio",
