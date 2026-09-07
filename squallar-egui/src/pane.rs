@@ -2829,6 +2829,38 @@ impl PaneState {
         self.slot(id).is_some_and(|slot| slot.enabled)
     }
 
+    /// **Whether this pane needs its site's radar volumes at all** — the
+    /// question every *fetch* asks, where the draw path asks
+    /// [`Self::is_overlay_enabled`] with [`known::RADAR`].
+    ///
+    /// The same accessor, composed once here rather than re-spelled at each
+    /// door: a second spelling of "is radar wanted" is exactly how a pane with
+    /// its radar layer switched off came to fetch a volume, decode it and
+    /// rasterize 7362² px of picture nobody could see.
+    ///
+    /// **There is a second composition of that accessor and it is not this
+    /// one.** `Gui::plan_view_demand_for_pane` asks whether a pane should have
+    /// a plan-view raster *rendered*; this asks whether it needs the volume
+    /// *fetched*. Both bottom out in [`Self::is_overlay_enabled`] with
+    /// [`known::RADAR`], which is the single definition of "the radar layer is
+    /// switched on" and the only thing either of them would have to change if
+    /// that ever stopped being one flag. They are not two spellings of one
+    /// question that happen to agree: they agree on every map pane and differ
+    /// on purpose everywhere else, for the reason below.
+    ///
+    /// **Wider than the draw question by one case, deliberately.** A
+    /// cross-section or a 3D pane reads the volume without the map ever
+    /// drawing a radar image, and the toggle does not speak for it —
+    /// `Gui::render_radar_controls` says so in as many words where it hides
+    /// the product and tilt pickers: *"The Radar overlay toggle governs
+    /// whether the map draws the radar image over its tiles, which is not a
+    /// question a pane with no map has."* So a pane that draws no map needs
+    /// its data whatever the flag says, and only a **map** pane can turn its
+    /// radar data off by turning the layer off.
+    pub fn needs_radar_data(&self) -> bool {
+        !self.is_map() || self.is_overlay_enabled(&known::RADAR)
+    }
+
     /// Whether the colour bar belonging to `id`'s layer draws on this pane —
     /// radar's asked as [`known::RADAR`]. Only meaningful with the Color Scale
     /// layer on; the painter and the gutter both gate on that first, and on

@@ -15453,17 +15453,22 @@ fn the_chip_names_a_forecast_loops_own_valid_time_and_says_forecast() {
 }
 
 /// **A pane parked on a forecast frame keeps its forward step, rests its
-/// handle on the instant it depicts, and keeps its site in the chunk feed**
-/// (WI-10).
+/// handle on the instant it depicts, and keeps its live posture** (WI-10).
 ///
 /// `viewing_live` means the *selection* follows live data, and it stays true
 /// here — which is exactly why the two widget reads must ask
-/// `depicts_future` instead. The `live_sites` assertion is the control: a
-/// "fix" that cleared `viewing_live` on a future-depicting pane would green
-/// the two widget reads and drop the pane's site from the chunk feed, and
-/// this test is built to red on that.
+/// `depicts_future` instead. The last assertion is the control: a "fix" that
+/// cleared `viewing_live` on a future-depicting pane would green the two
+/// widget reads, and this test is built to red on that.
+///
+/// **It used to read the control off `Gui::live_sites`**, and that stopped
+/// being a reading of `viewing_live` when `live_sites` gained its second term.
+/// This fixture is a map pane with `MODEL_DATA` on and `RADAR` **off**, so its
+/// site is now correctly absent from the chunk feed — a pane showing only a
+/// forecast model needs no live radar volumes assembled for it. The control
+/// asks the posture directly instead, which is what it always meant.
 #[test]
-fn a_pane_parked_on_a_forecast_frame_keeps_forward_step_and_its_chunk_feed() {
+fn a_pane_parked_on_a_forecast_frame_keeps_forward_step_and_its_live_posture() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     on_a_forecast_pane(&mut h);
 
@@ -15506,8 +15511,8 @@ fn a_pane_parked_on_a_forecast_frame_keeps_forward_step_and_its_chunk_feed() {
     );
 
     assert!(
-        h.gui_mut().live_sites().iter().any(|s| s == "KTLX"),
-        "the pane's site left the chunk feed: the fix cleared `viewing_live` \
+        h.gui_mut().pane(0).expect("pane 0").viewing_live,
+        "the pane stopped following live data: the fix cleared `viewing_live` \
          instead of asking the right question"
     );
 }

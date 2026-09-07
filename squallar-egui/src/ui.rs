@@ -1007,12 +1007,27 @@ impl Gui {
         self.texture_ceiling
     }
 
-    /// The distinct sites some pane is watching live — the unit the chunk feed
-    /// and the archive auto-poll both work in.
+    /// The distinct sites some pane is watching live **and needs radar data
+    /// for** — the unit the chunk feed, the chunk/archive notification
+    /// subscriptions and the archive auto-poll all work in.
+    ///
+    /// `needs_radar_data` is the second term and it was missing: a pane
+    /// watching live with its radar layer switched off opened both
+    /// notification sockets for its site, kept a chunk feed assembling
+    /// volumes into it, and pulled the archive on the cadence — measured at
+    /// 17.3 MB of `chunk feed` two seconds after boot and climbing past 95 MB,
+    /// with 103.3 MB of `still scans` behind it, on a scene with every layer
+    /// off (`FLOOR.f1`/`.f2`, 2026-09-07). It asks
+    /// [`PaneState::needs_radar_data`] rather than the enabled flag directly
+    /// so that a cross-section or 3D pane — which reads the volume without the
+    /// map drawing radar — is still served.
     pub fn live_sites(&self) -> Vec<String> {
         let mut sites: Vec<String> = Vec::new();
         for pane in self.panes.iter().take(self.pane_layout.pane_count) {
-            if pane.viewing_live && !sites.iter().any(|s| s.as_str() == pane.site()) {
+            if pane.viewing_live
+                && pane.needs_radar_data()
+                && !sites.iter().any(|s| s.as_str() == pane.site())
+            {
                 sites.push(pane.site().to_string());
             }
         }
@@ -2698,6 +2713,11 @@ impl Gui {
 
 #[cfg(test)]
 mod chunk_scan_info_tests;
+
+/// What decides a site's radar data is wanted at all — the fetch-side half of
+/// the layer-visibility question, and the first-run boundary under it.
+#[cfg(test)]
+mod radar_data_gate_tests;
 
 #[cfg(test)]
 mod link_group_tests;

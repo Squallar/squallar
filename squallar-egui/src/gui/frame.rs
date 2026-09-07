@@ -320,7 +320,16 @@ impl Gui {
         // that declares no interval — would quietly make it the second thing.
         let never_asked = !crate::radar_layer::archive_poll_started(&self.overlays);
 
-        if never_asked && !self.fetching() {
+        // **And only for a pane that needs the data.** The first fetch takes
+        // the *active* pane's config, so the active pane is the one asked:
+        // with its radar layer off, this arm holds, `never_asked` stays true,
+        // and the very next frame after the layer comes on — or after the user
+        // moves to a pane that draws radar — it fires. Nothing is lost by
+        // waiting, and what it saves is a 6.9 MB volume download and its 103.3
+        // MB decode on a scene showing no radar (`FLOOR.f1`, 2026-09-07).
+        let active_wants_radar = self.active_pane().needs_radar_data();
+
+        if never_asked && active_wants_radar && !self.fetching() {
             // The tracked round: the shell drains its answer, so the flag
             // comes back down on delivery or on error.
             self.set_radar_round_in_flight(true);
@@ -332,16 +341,19 @@ impl Gui {
                 .and_then(|t| t.with_nanosecond(0))
                 .unwrap_or(now);
 
-            let mut seen_sites: Vec<&str> = Vec::with_capacity(self.pane_layout.pane_count);
-            for pane in self.panes.iter().take(self.pane_layout.pane_count) {
-                if pane.viewing_live && !seen_sites.contains(&pane.site()) {
-                    seen_sites.push(pane.site());
-                    let config = RadarConfig {
-                        site: pane.site().to_string(),
-                        timestamp: current_scan_time,
-                    };
-                    actions.push(GuiAction::CheckForNewScans(config));
-                }
+            // **`live_sites` rather than a walk of its own.** This loop used
+            // to re-spell that function — same `viewing_live` filter, same
+            // first-seen dedupe, same pane order — and the copy is what let
+            // the cadence keep pulling the archive for a site whose radar
+            // layer had been switched off after `live_sites` learned to ask.
+            // One spelling, so the chunk feed, the notification sockets and
+            // this cadence cannot disagree about which sites are wanted.
+            for site in self.live_sites() {
+                let config = RadarConfig {
+                    site,
+                    timestamp: current_scan_time,
+                };
+                actions.push(GuiAction::CheckForNewScans(config));
             }
 
             // **The clock is stamped by the ask, and the round ends in the
