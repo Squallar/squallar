@@ -281,7 +281,7 @@ reqwest = { version = "=0.13.4", default-features = false, features = [
     "system-proxy",
 ] }
 
-rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
+rustls = { version = "=0.23.44", default-features = false, features = ["ring", "std"] }
 
 # The published nexrad-decode cannot read a TDWR volume, so this workspace
 # builds against a copy it owns.
