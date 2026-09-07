@@ -31,6 +31,33 @@
     <string>$(PLATFORM_NAME)</string>
     <key>DTSDKName</key>
     <string>$(SDK_NAME)</string>
+    <!-- The rest of the DT family. Absent, App Store Connect concludes the app
+         was built with a beta toolchain and refuses the upload with error
+         90534, "Unsupported SDK or Xcode version" — which is what happened to
+         every iOS build before these keys existed, while the Mach-O itself
+         carried a perfectly current sdk 26.4. The bundle, not the binary, is
+         what that check reads.
+
+         DTSDKBuild, DTPlatformBuild and DTPlatformVersion are filled from the
+         SDK the link actually used, so they cannot drift from the image.
+         DTXcode and DTXcodeBuild cannot be: an SDK does not record which Xcode
+         shipped it. The Makefile keeps a table keyed on the SDK build and
+         refuses to build against an SDK it has no row for, rather than
+         inventing an Xcode that never shipped it. -->
+    <key>DTSDKBuild</key>
+    <string>$(SDK_BUILD)</string>
+    <key>DTPlatformBuild</key>
+    <string>$(SDK_BUILD)</string>
+    <key>DTPlatformVersion</key>
+    <string>$(SDK_PRODUCT_VERSION)</string>
+    <key>DTXcode</key>
+    <string>$(DTXCODE)</string>
+    <key>DTXcodeBuild</key>
+    <string>$(XCODE_BUILD)</string>
+    <key>BuildMachineOSBuild</key>
+    <string>$(MACHINE_OS_BUILD)</string>
+    <key>DTCompiler</key>
+    <string>com.apple.compilers.llvm.clang.1_0</string>
     <key>LSRequiresIPhoneOS</key>
     <true/>
     <!-- iPhone presentation clamps to 60 Hz on ProMotion panels without this

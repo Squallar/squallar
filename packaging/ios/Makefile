@@ -260,6 +260,15 @@ build:
 	        | sed -n 's/^CanonicalName://p' | head -1 > $$LIBDIR/sdk-name
 	    tr -d '\"' < $$SDKROOT_REF/SDKSettings.json | tr ',' '\n' \
 	        | sed -n 's/^Version://p' | head -1 > $$LIBDIR/sdk-version
+	    # The SDK's OWN build, which is what DTSDKBuild and DTPlatformBuild
+	    # have to carry. It is not in SDKSettings.json; it is the
+	    # ProductBuildVersion of the SystemVersion.plist the SDK ships.
+	    sed -n '/<key>ProductBuildVersion<\/key>/{n;s|.*<string>\(.*\)</string>.*|\1|p;}' \
+	        $$SDKROOT_REF/System/Library/CoreServices/SystemVersion.plist \
+	        > $$LIBDIR/sdk-build
+	    sed -n '/<key>ProductVersion<\/key>/{n;s|.*<string>\(.*\)</string>.*|\1|p;}' \
+	        $$SDKROOT_REF/System/Library/CoreServices/SystemVersion.plist \
+	        > $$LIBDIR/sdk-product-version
 	    $$IOS_CC $$LIBDIR/squallar_main.o $$LIBDIR/libsquallar_native.a \
 	        -lobjc \
 	        -framework UIKit -framework QuartzCore -framework Metal \
@@ -352,6 +361,47 @@ build:
 	fi
 	echo "    SDK: DTSDKName=$$SDK_NAME, LC_BUILD_VERSION sdk=$$MACHO_SDK minos=$$MACHO_MINOS"
 
+	# ---- which Xcode shipped this SDK ----
+	# App Store Connect refuses a build whose Info.plist has no DTXcode /
+	# DTXcodeBuild / DTSDKBuild: with them missing it concludes the app was
+	# built with a beta toolchain and rejects the upload as error 90534,
+	# "Unsupported SDK or Xcode version". Nothing here is Xcode, so nothing
+	# writes them, and every iOS upload was refused for it.
+	#
+	# DTSDKBuild and DTPlatformBuild come off the SDK, so they cannot drift.
+	# The Xcode identity cannot: an SDK does not record the Xcode it shipped
+	# inside, and this image carries no Xcode at all. So it is a table, keyed
+	# on the SDK build -- and an SDK build with no row is a hard error rather
+	# than a default, because the failure mode of guessing is a bundle that
+	# claims an Xcode which never shipped this SDK, which is a worse lie than
+	# the silence it replaces and is checkable by Apple.
+	SDK_BUILD="$$(cat "$$LIBDIR/sdk-build")"
+	SDK_PRODUCT_VERSION="$$(cat "$$LIBDIR/sdk-product-version")"
+	# No apostrophe in this message, and that is not style. Inside
+	# $${VAR:?word} bash parses `word` with quote handling, so a lone `'"'"'` opens
+	# a single-quoted string that never closes -- the recipe then dies far
+	# below with "syntax error near unexpected token }" pointing at an
+	# unrelated function three hundred lines away.
+	: "$${SDK_BUILD:?the linked SDK has no ProductBuildVersion in its SystemVersion.plist}"
+	case "$$SDK_BUILD" in
+	  # iOS 26.4 SDK, shipped by Xcode 26.4 (17E192) on 2026-03-24, whose
+	  # host macOS build is 25E236. DTXcode is Xcode's version with the dot
+	  # removed and a trailing zero, which is Apple's own spelling: 26.4 ->
+	  # 2640.
+	  23E237) XCODE_BUILD=17E192; DTXCODE=2640; MACHINE_OS_BUILD=25E236 ;;
+	  *)
+	    echo "ERROR: the image's iPhoneOS SDK has build $$SDK_BUILD, and this"
+	    echo "       Makefile has no row for it, so it cannot say which Xcode"
+	    echo "       shipped it. DTXcode/DTXcodeBuild would have to be invented,"
+	    echo "       and App Store Connect checks them against the SDK."
+	    echo ""
+	    echo "       Add a row above with the Xcode release that ships SDK build"
+	    echo "       $$SDK_BUILD (xcodereleases.com lists the pairing), or pin the"
+	    echo "       container image back to one whose SDK is already listed."
+	    exit 1 ;;
+	esac
+	echo "    toolchain: DTSDKBuild=$$SDK_BUILD DTXcode=$$DTXCODE DTXcodeBuild=$$XCODE_BUILD"
+
 	OUT="packaging/ios/build/linux/$$SDK"; APP="$$OUT/squallar.app"
 	rm -rf "$$OUT"; mkdir -p "$$APP"
 	cp "$$LIBDIR/squallar" "$$APP/squallar"; chmod +x "$$APP/squallar"
@@ -363,6 +413,11 @@ build:
 	    -e "s|\$$(SUPPORTED_PLATFORM)|$$SUPPORTED_PLATFORM|g" \
 	    -e "s|\$$(PLATFORM_NAME)|$$SDK|g" \
 	    -e "s|\$$(SDK_NAME)|$$SDK_NAME|g" \
+	    -e "s|\$$(SDK_BUILD)|$$SDK_BUILD|g" \
+	    -e "s|\$$(SDK_PRODUCT_VERSION)|$$SDK_PRODUCT_VERSION|g" \
+	    -e "s|\$$(DTXCODE)|$$DTXCODE|g" \
+	    -e "s|\$$(XCODE_BUILD)|$$XCODE_BUILD|g" \
+	    -e "s|\$$(MACHINE_OS_BUILD)|$$MACHINE_OS_BUILD|g" \
 	    packaging/ios/Info.plist > "$$APP/Info.plist"
 	# An unexpanded $(...) here means a key silently ships as a literal.
 	! grep -q '\$$(' "$$APP/Info.plist" || { echo "ERROR: unexpanded build setting left in Info.plist"; exit 1; }
