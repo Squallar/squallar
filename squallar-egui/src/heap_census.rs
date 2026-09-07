@@ -341,6 +341,11 @@ impl Census {
     /// on shared ownership. Saturating, because a sum of levels read at
     /// adjacent instants has no reason to be trusted to fit if one of them is
     /// a wild reading.
+    ///
+    /// **An UPPER bound, and not a partition** — see [`Self::radar_total`].
+    /// [`Self::resident_floor`] is the other end of the same reading, and a
+    /// caller saying how much of the heap this census accounts for needs
+    /// both: the truth is between them and this instrument cannot say where.
     pub fn resident_total(&self) -> u64 {
         [
             self.radar_total(),
@@ -392,6 +397,71 @@ impl Census {
     /// mistake this module exists to stop.
     pub fn residual(&self, linear_bytes: u64) -> Option<u64> {
         linear_bytes.checked_sub(self.resident_total())
+    }
+
+    /// **The decoded-volume families as a de-duplicated LOWER bound**: the
+    /// largest single one.
+    ///
+    /// The five holders share `Arc`s, so their sum ([`Self::radar_total`]) is
+    /// an upper bound. The floor of a union of overlapping sets is the
+    /// largest member — every byte the biggest holder names is resident
+    /// whatever the others share with it — and that needs no graph walk and
+    /// no frame-thread cost, which is why this is the de-duplicated figure
+    /// the census can actually publish.
+    ///
+    /// It is a **bound and not an estimate**. Where the families are
+    /// disjoint the truth is [`Self::radar_total`]; where they all name one
+    /// volume the truth is this. Nothing here says which, and a reader that
+    /// quotes one end without the other has picked a number rather than read
+    /// one.
+    pub fn radar_floor(&self) -> u64 {
+        [
+            self.loop_scan_bytes,
+            self.loop_l3_bytes,
+            self.still_scan_bytes,
+            self.derive_memo_bytes,
+            self.loop_frame_scan_bytes,
+        ]
+        .into_iter()
+        .fold(0u64, u64::max)
+    }
+
+    /// **The families summed with the radar overlap taken out**: the
+    /// de-duplicated lower bound on what this census accounts for.
+    ///
+    /// The same set as [`Self::resident_total`] with [`Self::radar_floor`]
+    /// in place of [`Self::radar_total`]. Every non-radar family is already
+    /// documented disjoint from its neighbours, so this end moves only
+    /// where the sharing actually is.
+    pub fn resident_floor(&self) -> u64 {
+        self.resident_total()
+            .saturating_sub(self.radar_total())
+            .saturating_add(self.radar_floor())
+    }
+
+    /// **Bytes the allocator says are live that no family here names**, as a
+    /// range.
+    ///
+    /// This is the figure the census exists to produce on a native arm,
+    /// where there is no `byteLength` to take a residual against and
+    /// [`Self::residual`] therefore has no denominator at all. `live` is
+    /// `squallar_alloc::live_bytes()` — bytes granted and not handed back.
+    ///
+    /// Two ends because the families have two ends: `.0` is
+    /// `live − resident_total` (the least that can be unaccounted, since the
+    /// families are an upper bound) and `.1` is `live − resident_floor` (the
+    /// most). Each is `None` where the families price above `live` rather
+    /// than wrapping — a real state when the radar families double-count, and
+    /// exactly the reading that says the upper bound is doing so.
+    ///
+    /// **It is not an error term.** It is every family nobody has thought to
+    /// count yet, plus whatever the census prices at zero. A caller printing
+    /// it must print `live` beside it.
+    pub fn unaccounted(&self, live: u64) -> (Option<u64>, Option<u64>) {
+        (
+            live.checked_sub(self.resident_total()),
+            live.checked_sub(self.resident_floor()),
+        )
     }
 }
 
@@ -475,6 +545,327 @@ pub fn line(census: &Census, linear: Option<u64>, instance: &str) -> String {
     // Writing to a `String` is infallible; the `Result` is `fmt::Write`'s
     // shape, not a case.
     let _ = write_line(&mut out, census, linear, instance);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// The process's own denominator.
+// ---------------------------------------------------------------------------
+
+/// **What the OS gave this process**, published as levels beside the families.
+///
+/// # Why this is here and not on the census line
+///
+/// The families above answer "who is holding the heap". These answer "how big
+/// is the heap, and how much of the process is not it" — a different
+/// denominator, so a different line, the same way `budget state:` and the
+/// census are already kept apart. Adding them to [`write_line`] would also
+/// grow the allocation-error hook's fixed buffer for figures that are `None`
+/// on the one target that hook runs on.
+///
+/// # Why the census needed them at all
+///
+/// [`Census::residual`] is taken against a wasm `byteLength`. **On native
+/// there is no such reading**, so `linear` is `None`, the line prints
+/// `unread linear, residual unknown`, and the census has no denominator of
+/// any kind. That is how a measured native scene came to sit at 3,108.6 MiB
+/// resident with 2,234.6 MiB live and an in-app census whose own *upper*
+/// bound was 1,667.0 MiB — 568 MiB below what the allocator said was live,
+/// and 1,441 MiB below the resident set — with no line anywhere saying so.
+///
+/// # Levels, and the sample count that says how stale they are
+///
+/// Like every family here these are set, never added, and read as atomics so
+/// the allocation-error hook can have them without allocating. Unlike a
+/// family, **an RSS reading has no seam to publish at**: no code in this
+/// process moves those bytes — the kernel does, on a page fault and on a
+/// `MADV_DONTNEED` — so there is nothing to hook and a sample is the only
+/// thing there is. [`ProcessCensus::samples`] and
+/// [`ProcessCensus::walks`] say how many of each have ever been taken, so a
+/// reader can tell a fresh reading from a stale one and a never-read one
+/// from a zero.
+mod process_levels {
+    use super::AtomicU64;
+
+    macro_rules! levels {
+        ($($name:ident;)*) => {
+            $(pub(super) static $name: AtomicU64 = AtomicU64::new(0);)*
+
+            /// Put every process level back to zero. Tests only, like the
+            /// families' own `reset`.
+            #[cfg(test)]
+            pub(super) fn reset() {
+                $($name.store(0, super::Relaxed);)*
+            }
+        };
+    }
+    levels! {
+        LIVE; RSS; ANON; FILE; SHMEM; THREADS; SAMPLES;
+        MAIN_HEAP; ARENA; ARENAS; STACK; ANON_OTHER; NON_HEAP; THP; WALKS;
+    }
+}
+
+use process_levels as lv;
+
+/// The process denominator, read together. Bytes throughout except the three
+/// counts, which say so in their names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProcessCensus {
+    /// `squallar_alloc::live_bytes()` — granted and not handed back.
+    pub live: u64,
+    /// `VmRSS`. Zero *and* `samples == 0` means unread, not empty.
+    pub rss: u64,
+    /// `RssAnon` — the half the allocator lives on.
+    pub anon: u64,
+    /// `RssFile` — code, libraries, mapped data, **and the driver's device
+    /// maps**.
+    pub file: u64,
+    /// `RssShmem`.
+    pub shmem: u64,
+    /// Threads, because glibc's arena count follows it.
+    pub threads: u64,
+    /// How many cheap samples have ever been taken. **Zero means unread.**
+    pub samples: u64,
+    /// `[heap]`, the main arena.
+    pub main_heap: u64,
+    /// glibc secondary arenas: **the arena-retention term**.
+    pub arena: u64,
+    /// How many of them.
+    pub arenas: u64,
+    /// `[stack]` and thread stacks.
+    pub stack: u64,
+    /// Anonymous mappings that are neither: the allocator's own `mmap`ed
+    /// blocks, which is where a large buffer lands.
+    pub anon_other: u64,
+    /// Code, file maps, device maps and kernel pages — **the floor no
+    /// amount of freeing weather data moves**.
+    pub non_heap: u64,
+    /// `AnonHugePages`. **Overlaps the anonymous terms and is not in any
+    /// sum here**; see [`Self::rss_over_live`].
+    pub thp: u64,
+    /// How many expensive walks have ever been taken. **Zero means the
+    /// breakdown terms are unwalked, not zero.**
+    pub walks: u64,
+}
+
+impl ProcessCensus {
+    /// Whether a cheap sample has ever landed. A `false` here means every
+    /// byte figure below is unread rather than measured at zero.
+    pub fn sampled(&self) -> bool {
+        self.samples > 0
+    }
+
+    /// Whether an expensive walk has ever landed — the breakdown terms
+    /// ([`Self::main_heap`] through [`Self::thp`]) are meaningless without it.
+    pub fn walked(&self) -> bool {
+        self.walks > 0
+    }
+
+    /// **What the process holds that the allocator never handed out**:
+    /// `RSS − live`.
+    ///
+    /// `None` where `live` prices above the resident set, which is a real
+    /// state and not an error — a heap whose pages have gone back to the
+    /// kernel is exactly that, and a `0` would hide it.
+    ///
+    /// **This is not one thing.** It is the non-heap floor
+    /// ([`Self::non_heap`]) plus the allocator's chunk headers, its arena
+    /// retention ([`Self::arena`]) and the kernel's huge-page rounding
+    /// ([`Self::thp`]) — and the last two **overlap each other**, because a
+    /// huge page inside an arena is both. This instrument sizes all of them
+    /// and attributes between the overlapping pair for none of them; see the
+    /// module note on [`squallar_alloc::process`].
+    pub fn rss_over_live(&self) -> Option<u64> {
+        self.rss.checked_sub(self.live)
+    }
+}
+
+/// **Publish the cheap reading.** ~11 µs and flat in RSS
+/// (`squallar_alloc::process::resident`), so this may ride a frame.
+///
+/// `live` is passed rather than read here so a caller that already has it
+/// does not take a second reading a few microseconds off the first.
+pub fn publish_resident(live: u64, resident: Option<squallar_alloc::process::Resident>) {
+    lv::LIVE.store(live, Relaxed);
+    if let Some(r) = resident {
+        lv::RSS.store(r.rss_bytes, Relaxed);
+        lv::ANON.store(r.anon_bytes, Relaxed);
+        lv::FILE.store(r.file_bytes, Relaxed);
+        lv::SHMEM.store(r.shmem_bytes, Relaxed);
+        lv::THREADS.store(u64::from(r.threads), Relaxed);
+        lv::SAMPLES.fetch_add(1, Relaxed);
+    }
+}
+
+/// **Publish the expensive walk.** `squallar_alloc::process::breakdown` is
+/// **3.3 ms p50 and 5.8 ms p99 on a 7.2 GB process and grows with the
+/// resident set** — a frame and a half at 250 Hz. Whoever calls this owes the
+/// reader a thread that is not the frame thread; [`spawn_process_sampler`] is
+/// the one this crate ships.
+pub fn publish_breakdown(b: &squallar_alloc::process::Breakdown) {
+    lv::MAIN_HEAP.store(b.main_heap_bytes, Relaxed);
+    lv::ARENA.store(b.arena_bytes, Relaxed);
+    lv::ARENAS.store(u64::from(b.arenas), Relaxed);
+    lv::STACK.store(b.stack_bytes, Relaxed);
+    lv::ANON_OTHER.store(b.anon_other_bytes, Relaxed);
+    lv::NON_HEAP.store(b.non_heap_bytes(), Relaxed);
+    lv::THP.store(b.thp_bytes, Relaxed);
+    lv::WALKS.fetch_add(1, Relaxed);
+}
+
+/// Read the process denominator. Atomic loads only — hook-safe, like
+/// [`census`].
+pub fn process_census() -> ProcessCensus {
+    ProcessCensus {
+        live: lv::LIVE.load(Relaxed),
+        rss: lv::RSS.load(Relaxed),
+        anon: lv::ANON.load(Relaxed),
+        file: lv::FILE.load(Relaxed),
+        shmem: lv::SHMEM.load(Relaxed),
+        threads: lv::THREADS.load(Relaxed),
+        samples: lv::SAMPLES.load(Relaxed),
+        main_heap: lv::MAIN_HEAP.load(Relaxed),
+        arena: lv::ARENA.load(Relaxed),
+        arenas: lv::ARENAS.load(Relaxed),
+        stack: lv::STACK.load(Relaxed),
+        anon_other: lv::ANON_OTHER.load(Relaxed),
+        non_heap: lv::NON_HEAP.load(Relaxed),
+        thp: lv::THP.load(Relaxed),
+        walks: lv::WALKS.load(Relaxed),
+    }
+}
+
+/// **Take the cheap reading now and publish it.** One `/proc` read and a
+/// handful of stores; see [`publish_resident`] for the cost.
+pub fn sample_process() {
+    publish_resident(
+        squallar_alloc::live_bytes().unwrap_or(0),
+        squallar_alloc::process::resident(),
+    );
+}
+
+/// **Start the one thread that takes the expensive walk.**
+///
+/// Idempotent — a second call does nothing, so every frame may call it and
+/// only the first starts anything. The thread sleeps `period` between walks
+/// and costs a few milliseconds of a core when it wakes; it exists because
+/// the walk **must not** be on the frame thread and this crate has no other
+/// off-thread seam it can reach.
+///
+/// Native only: there is no `/proc` on wasm and no thread to spawn there
+/// either, so this is a no-op that keeps the call site free of a `cfg`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn spawn_process_sampler(period: std::time::Duration) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        // A named thread: 141 of them were counted on the measured arm, and
+        // an unnamed one more is a thread nobody can attribute.
+        let spawned = std::thread::Builder::new()
+            .name("squallar.mem.census".into())
+            .spawn(move || {
+                loop {
+                    if let Some(b) = squallar_alloc::process::breakdown() {
+                        publish_breakdown(&b);
+                    }
+                    std::thread::sleep(period);
+                }
+            });
+        // A refusal to spawn leaves `walks` at zero, which the line prints as
+        // `unwalked`. That is the honest outcome and not worth a panic in an
+        // instrument.
+        drop(spawned);
+    });
+}
+
+/// No `/proc` and no threads on wasm — the breakdown stays unwalked and the
+/// line says so.
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_process_sampler(_period: core::time::Duration) {}
+
+/// Bytes [`write_process_line`] can take, for a caller writing it into a
+/// fixed buffer.
+///
+/// Sized the way [`CENSUS_LINE_CAPACITY`] is — against every figure at
+/// `u64::MAX` and the longest instance name, and **exactly**, with no
+/// headroom, so a field added without re-deriving it is a cut line and
+/// `the_widest_process_line_fits_its_buffer` says so rather than letting it
+/// land.
+///
+/// The widest arm is the one where **both** the unaccounted range and the
+/// `rss over live` term print their figures rather than their `none` prose:
+/// the range's `unaccounted <20> B to <20> B` is wider than
+/// `unaccounted none (families price above live)`, so the widest line is a
+/// census whose families price *below* `live`. Seventeen `u64::MAX` figures
+/// at 20 digits, the three counts among them, plus the prose.
+pub const PROCESS_LINE_CAPACITY: usize = 645;
+
+/// **The process denominator as one line.**
+///
+/// Three groups, in the order a reader needs them: what the allocator was
+/// asked for and what this census could name of it; what the OS actually
+/// gave; and the split of the difference — with the **overlapping** pair
+/// marked, because arena retention and huge-page rounding are the same bytes
+/// twice and a reader who adds them has double-counted.
+pub fn write_process_line<W: core::fmt::Write>(
+    out: &mut W,
+    census: &Census,
+    process: &ProcessCensus,
+    instance: &str,
+) -> core::fmt::Result {
+    let (least, most) = census.unaccounted(process.live);
+    write!(out, "process memory ({instance}): live {} B", process.live)?;
+    // The census's two ends against the allocator, which is the whole point
+    // of the line on a native arm.
+    match (least, most) {
+        (Some(least), Some(most)) => write!(
+            out,
+            ", families {} B floor {} B, unaccounted {least} B to {most} B",
+            census.resident_total(),
+            census.resident_floor(),
+        ),
+        _ => write!(
+            out,
+            ", families {} B floor {} B, unaccounted none (families price above live)",
+            census.resident_total(),
+            census.resident_floor(),
+        ),
+    }?;
+    if !process.sampled() {
+        return write!(out, "; rss unread");
+    }
+    write!(
+        out,
+        "; rss {} B, anon {} B, file {} B, shmem {} B, threads {}",
+        process.rss, process.anon, process.file, process.shmem, process.threads
+    )?;
+    match process.rss_over_live() {
+        Some(over) => write!(out, ", rss over live {over} B"),
+        None => write!(out, ", rss over live none (live prices above rss)"),
+    }?;
+    if !process.walked() {
+        return write!(out, "; breakdown unwalked");
+    }
+    write!(
+        out,
+        "; main heap {} B, arenas {} at {} B, stacks {} B, anon other {} B, \
+         non-heap {} B, thp {} B (overlaps the anon terms, not in the sum), \
+         samples {}, walks {}",
+        process.main_heap,
+        process.arenas,
+        process.arena,
+        process.stack,
+        process.anon_other,
+        process.non_heap,
+        process.thp,
+        process.samples,
+        process.walks,
+    )
+}
+
+/// [`write_process_line`] into a `String`, for the telemetry tick.
+pub fn process_line(census: &Census, process: &ProcessCensus, instance: &str) -> String {
+    let mut out = String::new();
+    let _ = write_process_line(&mut out, census, process, instance);
     out
 }
 

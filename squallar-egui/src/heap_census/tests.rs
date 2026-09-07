@@ -192,3 +192,286 @@ fn the_widest_line_fits_the_hooks_buffer() {
         said.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// The de-duplicated bounds, and the process denominator.
+// ---------------------------------------------------------------------------
+
+/// **Serialises every test below that touches the process-global levels.**
+///
+/// The process denominator is a set of statics and the harness runs this
+/// binary's tests on several threads, so two of these would each read the
+/// other's writes — and a `reset()` between them would race the assertions
+/// rather than isolate them. A poisoned lock is read as a live one: a
+/// panicking test has already failed and must not cascade into its siblings.
+static PROCESS_STATIC: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn process_guard() -> std::sync::MutexGuard<'static, ()> {
+    PROCESS_STATIC
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// **The radar floor is the largest single holder, not the sum.**
+///
+/// The five holders share `Arc`s, so the union they cover is at least the
+/// biggest of them and at most their total. A floor that returned the sum
+/// would be the upper bound wearing the other name, which is the one mistake
+/// that would make the "de-duplicated" claim false.
+#[test]
+fn the_radar_floor_is_the_largest_holder_and_the_total_is_the_sum() {
+    let c = distinct();
+    assert_eq!(c.radar_total(), 1 + 2 + 4 + 8 + 16, "the upper bound");
+    assert_eq!(c.radar_floor(), 16, "the floor is the largest holder");
+    assert!(c.radar_floor() < c.radar_total());
+
+    // One holder and nothing else: the two ends meet, because there is no
+    // overlap to be uncertain about.
+    let lone = Census {
+        loop_scan_bytes: 900,
+        ..Census::default()
+    };
+    assert_eq!(lone.radar_floor(), 900);
+    assert_eq!(lone.radar_total(), 900);
+}
+
+/// **The floor differs from the total by exactly the radar overlap**, and by
+/// nothing else — every other family is documented disjoint, so swapping the
+/// radar end must not move any of them.
+#[test]
+fn the_resident_floor_moves_only_the_radar_families() {
+    let c = distinct();
+    assert_eq!(
+        c.resident_total() - c.resident_floor(),
+        c.radar_total() - c.radar_floor(),
+        "the floor moved a family that is not shared"
+    );
+    assert!(c.resident_floor() < c.resident_total());
+
+    // With no radar families at all the two ends are identical.
+    let no_radar = Census {
+        render_cache_bytes: 5_000,
+        ..Census::default()
+    };
+    assert_eq!(no_radar.resident_floor(), no_radar.resident_total());
+}
+
+/// **`unaccounted` is a range, and its ends come from the right ends of the
+/// census.** The least that can be unaccounted is measured against the
+/// families' upper bound; the most, against their floor. Getting these the
+/// wrong way round would report a narrower gap than the evidence supports,
+/// which is the direction that hides bytes.
+#[test]
+fn the_unaccounted_range_runs_from_the_upper_bound_to_the_floor() {
+    let c = distinct();
+    let live = c.resident_total() + 1_000;
+    let (least, most) = c.unaccounted(live);
+    assert_eq!(least, Some(1_000), "least = live - upper bound");
+    assert_eq!(
+        most,
+        Some(1_000 + (c.resident_total() - c.resident_floor())),
+        "most = live - floor"
+    );
+    assert!(most > least, "the range is the wrong way round");
+}
+
+/// **It refuses to wrap at both ends.** Families pricing above `live` is a
+/// real state — the radar upper bound double-counts by design — and a
+/// wrapped `u64` there would print as an enormous unaccounted figure at
+/// exactly the moment the census is over-counting.
+#[test]
+fn the_unaccounted_range_refuses_to_wrap() {
+    let c = distinct();
+    // Above the floor but below the upper bound: one end is real, one is not.
+    let between = c.resident_floor() + 1;
+    let (least, most) = c.unaccounted(between);
+    assert_eq!(least, None, "the upper-bound end wrapped");
+    assert_eq!(most, Some(1));
+
+    // Below both.
+    let (least, most) = c.unaccounted(0);
+    assert_eq!((least, most), (None, None));
+}
+
+/// A never-published process census is **unread, not zero** — the same
+/// distinction `live_bytes` makes. A reader shown `rss 0 B` beside a running
+/// process would believe it.
+#[test]
+fn an_unpublished_process_census_reads_as_unread() {
+    let _serialised = process_guard();
+    process_levels::reset();
+    let p = process_census();
+    assert!(
+        !p.sampled(),
+        "nothing was published, so nothing was sampled"
+    );
+    assert!(!p.walked());
+    let said = process_line(&Census::default(), &p, "page");
+    assert!(said.contains("rss unread"), "{said}");
+    assert!(
+        !said.contains("rss 0 B"),
+        "an unread rss printed as a zero: {said}"
+    );
+    process_levels::reset();
+}
+
+/// A cheap sample lands and the line reports it — and the breakdown is still
+/// **unwalked**, because the two readings are taken by different callers at
+/// different costs and one arriving must never imply the other.
+#[test]
+fn a_cheap_sample_lands_without_implying_a_walk() {
+    let _serialised = process_guard();
+    process_levels::reset();
+    publish_resident(
+        1_000,
+        Some(squallar_alloc::process::Resident {
+            rss_bytes: 3_000,
+            anon_bytes: 2_000,
+            file_bytes: 1_000,
+            shmem_bytes: 0,
+            threads: 141,
+        }),
+    );
+    let p = process_census();
+    assert!(p.sampled());
+    assert!(!p.walked(), "a cheap sample claimed a walk");
+    assert_eq!(p.samples, 1);
+    assert_eq!(p.rss_over_live(), Some(2_000), "rss - live");
+
+    let said = process_line(&Census::default(), &p, "page");
+    assert!(said.contains("live 1000 B"), "{said}");
+    assert!(said.contains("rss 3000 B"), "{said}");
+    assert!(said.contains("threads 141"), "{said}");
+    assert!(said.contains("rss over live 2000 B"), "{said}");
+    assert!(said.contains("breakdown unwalked"), "{said}");
+    process_levels::reset();
+}
+
+/// The walk lands and the line names every class — **with the huge-page term
+/// marked as overlapping**, because a reader who adds it to the arena term
+/// has counted the same bytes twice and that is the exact confusion this
+/// figure exists to prevent.
+#[test]
+fn a_walk_names_every_class_and_marks_the_overlapping_one() {
+    let _serialised = process_guard();
+    process_levels::reset();
+    publish_resident(
+        1_000,
+        Some(squallar_alloc::process::Resident {
+            rss_bytes: 3_000,
+            anon_bytes: 2_000,
+            file_bytes: 1_000,
+            shmem_bytes: 0,
+            threads: 9,
+        }),
+    );
+    publish_breakdown(&squallar_alloc::process::Breakdown {
+        rss_bytes: 3_000,
+        main_heap_bytes: 100,
+        arena_bytes: 700,
+        arenas: 31,
+        stack_bytes: 50,
+        anon_other_bytes: 1_150,
+        code_bytes: 400,
+        file_other_bytes: 300,
+        device_bytes: 280,
+        kernel_bytes: 20,
+        thp_bytes: 1_800,
+        mappings: 42,
+    });
+    let p = process_census();
+    assert!(p.walked());
+    assert_eq!(p.non_heap, 400 + 300 + 280 + 20, "code+file+device+kernel");
+    assert_eq!(p.arenas, 31);
+
+    let said = process_line(&Census::default(), &p, "page");
+    for field in [
+        "main heap 100 B",
+        "arenas 31 at 700 B",
+        "stacks 50 B",
+        "anon other 1150 B",
+        "non-heap 1000 B",
+        "thp 1800 B (overlaps the anon terms, not in the sum)",
+        "walks 1",
+    ] {
+        assert!(said.contains(field), "{field} missing from {said}");
+    }
+    process_levels::reset();
+}
+
+/// **A level is set, not added** — for the process figures too. The sample
+/// and walk COUNTS are the deliberate exception, and they must go up, because
+/// they are what tells a reader the reading is fresh.
+#[test]
+fn process_levels_are_set_while_the_sample_counts_accumulate() {
+    let _serialised = process_guard();
+    process_levels::reset();
+    let reading = squallar_alloc::process::Resident {
+        rss_bytes: 500,
+        anon_bytes: 500,
+        file_bytes: 0,
+        shmem_bytes: 0,
+        threads: 1,
+    };
+    publish_resident(10, Some(reading));
+    publish_resident(10, Some(reading));
+    let p = process_census();
+    assert_eq!(p.rss, 500, "a level accumulated instead of being set");
+    assert_eq!(p.samples, 2, "the sample count did not advance");
+    process_levels::reset();
+}
+
+/// A resident reading that could not be taken publishes `live` and **does
+/// not advance the sample count** — so a native arm whose `/proc` read failed
+/// is `unread` rather than showing the last reading as if it were current.
+#[test]
+fn a_failed_resident_reading_does_not_count_as_a_sample() {
+    let _serialised = process_guard();
+    process_levels::reset();
+    publish_resident(77, None);
+    let p = process_census();
+    assert_eq!(p.live, 77, "live is known even when /proc is not");
+    assert!(!p.sampled(), "a failed read was counted as a sample");
+    process_levels::reset();
+}
+
+/// The process line fits a fixed buffer at the widest figures a `u64` can
+/// hold, the way the census line does — and the constant is that width
+/// EXACTLY, so a field added without re-deriving it fails here.
+#[test]
+fn the_widest_process_line_fits_its_buffer() {
+    let widest = ProcessCensus {
+        live: u64::MAX,
+        rss: u64::MAX,
+        anon: u64::MAX,
+        file: u64::MAX,
+        shmem: u64::MAX,
+        threads: u64::MAX,
+        samples: u64::MAX,
+        main_heap: u64::MAX,
+        arena: u64::MAX,
+        arenas: u64::MAX,
+        stack: u64::MAX,
+        anon_other: u64::MAX,
+        non_heap: u64::MAX,
+        thp: u64::MAX,
+        walks: u64::MAX,
+    };
+    // Both unaccounted arms, because the `none` one is the wider prose.
+    let arms = [
+        process_line(&Census::default(), &widest, "rasterization worker"),
+        process_line(&distinct(), &widest, "rasterization worker"),
+    ];
+    let said = arms.iter().max_by_key(|s| s.len()).expect("two arms");
+    assert!(
+        said.len() <= PROCESS_LINE_CAPACITY,
+        "the widest process line is {} bytes, past {PROCESS_LINE_CAPACITY}",
+        said.len()
+    );
+    assert_eq!(
+        said.len(),
+        PROCESS_LINE_CAPACITY,
+        "the widest process line is {} bytes; re-derive PROCESS_LINE_CAPACITY",
+        said.len()
+    );
+}

@@ -39,6 +39,11 @@ gps-serial = ["squallar-nmea-serial/serial"]
 web-time = { workspace = true }
 # The basemap row: the committed style (moved here so the ~222 KB of JSON is
 # compiled in ONCE) and the styled-tile wire the frame pump offloads through.
+# The counting allocator's own crate: `live_bytes` is the denominator
+# `heap_census` takes its `unaccounted` against, and `process` is the resident-set
+# reader that gives the census a denominator on native at all. A zero-dependency
+# leaf, so this adds one node and no transitive weight.
+squallar-alloc = { workspace = true }
 squallar-basemap = { workspace = true }
 squallar-geo = { workspace = true }
 squallar-kv = { workspace = true }

@@ -54,6 +54,12 @@
 //! allocation has passed through the counter, which is the honest answer and
 //! not a heap of zero bytes.
 
+/// **What the operating system has given this process**, against what the
+/// allocator above was asked for. `live_bytes` is a request; a resident set
+/// is a fact, and on one native reading of the heavy scene the two were
+/// 874 MiB apart with nothing able to name a byte of the gap.
+pub mod process;
+
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::alloc::System;
