@@ -1736,6 +1736,12 @@ impl super::App {
                 // re-stated every frame; the ledger copies it only when its
                 // generation moved - see `Self::compose_admission_costs`.
                 admission: Some(&self.admission_costs),
+                // **The one debited total**, so the UI's ledger and this one
+                // spend the same tick's spare rather than a copy each. Both
+                // already hold the table above; only this makes them agree
+                // about what is left of it. See
+                // `squallar_egui::admission::SharedDebit`.
+                admission_debit: Some(self.admission.debit()),
                 // The loop door's refusals, which are raised on this side of
                 // the seam and have no other way to the glass.
                 admission_notice: self

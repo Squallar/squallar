@@ -4584,6 +4584,7 @@ fn publish_tilt_age(h: &mut InputHarness, secs: u64) {
             frame_diagnostics: None,
             budget_readout: None,
             admission: None,
+            admission_debit: None,
             admission_notice: None,
         });
 }

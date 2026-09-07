@@ -50,6 +50,15 @@
 //! The layer-link fan-out and the span slider are batches for the same
 //! reason — the slider writes every pane at once.
 //!
+//! **Opening a pane is one too**, and it did not used to be. `set_pane_count`
+//! charged for the pane bare and let the `initialize_pane_enabled` two lines
+//! below it ask separately for the layers that pane ships with — two asks,
+//! either of which can be refused alone. Admitted then refused leaves a pane
+//! that opened without its own default layers, which is neither the split the
+//! user clicked nor the layout they had, and the notice on the glass names
+//! layers rather than the pane. It is now summed and asked as one act; see
+//! `Gui::set_pane_count`.
+//!
 //! # The spare is spent as it is admitted
 //!
 //! The table is composed on the App's telemetry tick, not per frame: every
@@ -151,8 +160,10 @@ pub struct AdmissionCosts {
     /// off, and with its site's decoded volumes already counted — which is
     /// what a pane `Gui::set_pane_count` seeds really is, since it is born
     /// from the active pane's site and scan info. The layers
-    /// `initialize_pane_enabled` then default-enables on it are that door's
-    /// charge, not this one's.
+    /// `initialize_pane_enabled` then default-enables on it are **not in this
+    /// figure** — it is one pane, bare. They are summed beside it by the same
+    /// door, from [`Self::panes`] and [`Self::layer_grids`], so the pane and
+    /// its layers are asked for as one act.
     pub new_pane: Increment,
     /// **Per gridded overlay layer: what its decoded source costs the host,
     /// and whether some pane already shows it.** A layer's grid cache is one
@@ -411,16 +422,94 @@ pub struct AdmissionNotice {
 /// How long a refusal notice stays on the glass.
 pub const NOTICE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(6);
 
+/// **One tick's spare, spent once** — the debited total two ledgers holding
+/// the same table share.
+///
+/// There are two [`AdmissionLedger`]s in a running application and there has
+/// to be: the App-side door (`App::handle_enable_loop`, `accept_scan_listing`)
+/// asks the same question the UI doors ask, and it runs *inside* the App's own
+/// `self.gui.panes_and_overlays_mut()` borrow, so it cannot reach the UI's
+/// ledger even if the App-pokes-Gui coupling ceiling had room for it.
+///
+/// **What they must not have two of is the debit.** [`AdmissionLedger::spare`]
+/// is the published spare less what has been admitted against it, and a copy
+/// each means a burst mixing UI acts with loop arms inside one telemetry tick
+/// is compared against one tick's spare **twice** — the scene admitted is up
+/// to double what the device was priced as having. That direction costs the
+/// user their process rather than a rung, which is the direction this whole
+/// admission system exists for.
+///
+/// So the total lives here, behind a handle both ledgers hold, and the App
+/// hands the UI its copy over the frame seam
+/// ([`crate::shell_api::FrameInputs::admission_debit`]) — a field on the
+/// inputs, computed in `squallar-app`, which is the seam's own rule and adds
+/// no reach into the UI at all.
+///
+/// **The generation is in the cell, not beside it.** Both ledgers adopt the
+/// same table and each would otherwise zero the total on adopting it, so the
+/// second to arrive would wipe what the first had already spent. Keyed on the
+/// generation the cell itself last saw, the first adopter resets and the
+/// second finds nothing to do.
+///
+/// Atomics rather than a `Cell` so the ledger stays `Send`; the two ledgers
+/// are on one thread and nothing here is a synchronisation point.
+#[derive(Debug, Default)]
+struct Debit {
+    generation: std::sync::atomic::AtomicU64,
+    gpu_bytes: std::sync::atomic::AtomicU64,
+    host_bytes: std::sync::atomic::AtomicU64,
+}
+
+/// A handle on the shared debited total. See [`Debit`].
+#[derive(Clone, Debug, Default)]
+pub struct SharedDebit(std::sync::Arc<Debit>);
+
+impl SharedDebit {
+    /// What has been admitted against the table in force.
+    fn spent(&self) -> Increment {
+        Increment {
+            gpu_bytes: self.0.gpu_bytes.load(Relaxed),
+            host_bytes: self.0.host_bytes.load(Relaxed),
+        }
+    }
+
+    /// Debit an admitted act, so the next door in the same tick — through
+    /// **either** ledger — sees the smaller spare.
+    fn spend(&self, want: Increment) {
+        self.0.gpu_bytes.fetch_add(want.gpu_bytes, Relaxed);
+        self.0.host_bytes.fetch_add(want.host_bytes, Relaxed);
+    }
+
+    /// Start `generation` if this cell has not already been started on it.
+    /// The second ledger to adopt one table must not re-zero what the first
+    /// has spent against it.
+    fn start(&self, generation: u64) {
+        if self.0.generation.swap(generation, Relaxed) == generation {
+            return;
+        }
+        self.0.gpu_bytes.store(0, Relaxed);
+        self.0.host_bytes.store(0, Relaxed);
+    }
+
+    /// Whether these two handles name the same total.
+    pub fn is_shared_with(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 /// **The per-application ledger**: the table the App published, what has been
 /// admitted against it since, and the notice a refusal left.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct AdmissionLedger {
     costs: AdmissionCosts,
     /// **Increments admitted since [`AdmissionCosts::generation`] last moved.**
     /// Debited from the published spare, so six acts inside one telemetry tick
     /// are compared against six shrinking spares rather than one standing
     /// figure.
-    spent: Increment,
+    ///
+    /// **Shared with the App's ledger, not copied to it** — see
+    /// [`SharedDebit`], which is the whole reason this is behind a handle.
+    spent: SharedDebit,
     /// Depth of an open batch. While non-zero the inner doors charge nothing:
     /// the batch asked for the whole and the transitions it priced are the
     /// ones they will make.
@@ -445,6 +534,18 @@ pub struct AdmissionLedger {
     /// only ever shrink it, so a refusal stays a refusal until the App
     /// publishes a new table. Cleared by [`Self::adopt`] when it does.
     ///
+    /// **The `want` behind a key is not quite as fixed as the spare**, and
+    /// saying so is cheaper than the reader finding out. Since the pane door
+    /// became a batch, `Act::Panes`' increment includes what
+    /// `Gui::default_layers_increment` sums over the panes in hand, so
+    /// curating a default layer back onto a pane shrinks it *within* one
+    /// generation — and a refusal held here goes on answering the smaller
+    /// question with the bigger one's verdict. Bounded by the composition
+    /// cadence (a couple of seconds), and it errs by refusing something that
+    /// has just started fitting rather than by admitting something that does
+    /// not. **Only refusals are held**, so a `want` that grows is re-asked in
+    /// full and cannot be waved through by this.
+    ///
     /// Bounded by the distinct `(act, pane)` pairs a scene can produce — at
     /// most one per act per visible pane — so it needs no eviction.
     refused: Vec<(Act, Option<usize>, Refusal)>,
@@ -456,6 +557,26 @@ pub struct AdmissionLedger {
     counts: Totals,
 }
 
+/// **A cloned ledger is a second application, not a second holder of one
+/// debit.** Derived, the [`SharedDebit`] handle would come along and the copy
+/// would spend the original's total — which is the defect this type exists to
+/// close, running backwards. The clone gets its own cell at the same reading.
+impl Clone for AdmissionLedger {
+    fn clone(&self) -> Self {
+        let spent = SharedDebit::default();
+        spent.start(self.costs.generation);
+        spent.spend(self.spent.spent());
+        Self {
+            costs: self.costs.clone(),
+            spent,
+            batch: self.batch,
+            notice: self.notice.clone(),
+            refused: self.refused.clone(),
+            counts: self.counts,
+        }
+    }
+}
+
 impl AdmissionLedger {
     /// Take a freshly published table. Clears what has been spent when the
     /// generation moved, since the new spare already accounts for it.
@@ -464,7 +585,10 @@ impl AdmissionLedger {
             return;
         }
         self.costs = costs.clone();
-        self.spent = Increment::ZERO;
+        // Keyed on the generation the shared cell last saw, so the second
+        // ledger to adopt one table does not wipe what the first spent
+        // against it. See `SharedDebit`.
+        self.spent.start(costs.generation);
         // A fresh table is a fresh answer: whatever was refused against the
         // old spare gets asked again, which is what makes a refusal something
         // the user can act on and retry rather than a dead end for the
@@ -496,15 +620,45 @@ impl AdmissionLedger {
     }
 
     /// **The spare a door is compared against**: what the App published, less
-    /// everything admitted since it published it.
+    /// everything admitted since it published it — **through either ledger**,
+    /// which is what [`SharedDebit`] is for.
     pub fn spare(&self) -> Spare {
+        let spent = self.spent.spent();
         let debit =
             |published: Option<u64>, spent: u64| published.map(|bytes| bytes.saturating_sub(spent));
         Spare {
-            gpu_bytes: debit(self.costs.spare.gpu_bytes, self.spent.gpu_bytes),
-            host_bytes: debit(self.costs.spare.host_bytes, self.spent.host_bytes),
-            joint_bytes: debit(self.costs.spare.joint_bytes, self.spent.joint_bytes()),
+            gpu_bytes: debit(self.costs.spare.gpu_bytes, spent.gpu_bytes),
+            host_bytes: debit(self.costs.spare.host_bytes, spent.host_bytes),
+            joint_bytes: debit(self.costs.spare.joint_bytes, spent.joint_bytes()),
         }
+    }
+
+    /// **The handle on this ledger's debited total**, for the App to publish
+    /// to the UI's ledger over the frame seam. See [`SharedDebit`].
+    pub fn debit(&self) -> &SharedDebit {
+        &self.spent
+    }
+
+    /// **Spend against `debit` from here on**, rather than against a total of
+    /// this ledger's own.
+    ///
+    /// Idempotent and re-stated every frame: the App publishes its handle on
+    /// [`crate::shell_api::FrameInputs::admission_debit`] and this adopts it
+    /// once. Adopting carries what this ledger has already spent across, so
+    /// the frame in which the two ledgers meet does not forget it — without
+    /// that the handshake would itself be a one-off over-admission of exactly
+    /// the kind it exists to prevent.
+    ///
+    /// **It never resets the total it is joining**, whatever generation this
+    /// ledger is on. The cell's generation is [`Self::adopt`]'s to move, and
+    /// a ledger joining one tick behind the App would otherwise zero a total
+    /// the App had already spent against.
+    pub fn share_debit(&mut self, debit: &SharedDebit) {
+        if self.spent.is_shared_with(debit) {
+            return;
+        }
+        debit.spend(self.spent.spent());
+        self.spent = debit.clone();
     }
 
     /// Whether a batch is open, so an inner door knows to charge nothing.
@@ -555,7 +709,7 @@ impl AdmissionLedger {
         }
         let v = verdict(self.spare(), want);
         if v.is_admit() {
-            self.spent = self.spent.plus(want);
+            self.spent.spend(want);
         }
         (self.record(act, pane, v), true)
     }

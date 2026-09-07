@@ -922,6 +922,14 @@ impl Gui {
         if let Some(costs) = inputs.admission {
             self.admission.adopt(costs);
         }
+        // **After the adopt, never before.** Joining the App's total is a
+        // carry-over of what this ledger has spent, and the adopt above is
+        // what zeroes that for a fresh table; the other order would carry a
+        // stale generation's spend into the new one. Idempotent after the
+        // first frame - see `AdmissionLedger::share_debit`.
+        if let Some(debit) = inputs.admission_debit {
+            self.admission.share_debit(debit);
+        }
         // A refusal the App's own door raised, so the pane paints one notice
         // whichever side of the seam turned the act away.
         self.admission
@@ -1585,14 +1593,44 @@ impl Gui {
     ///
     /// **An admission door** (WO-G), and the only one for a pane: `grown_pane`
     /// comes through here, so gating it as well would refuse the same pane
-    /// twice. It charges for the panes the layout actually **gains** — a
-    /// count that shrinks or stands still asks for nothing — and for those
-    /// panes bare. The layers `initialize_pane_enabled` then default-enables
-    /// on them are that door's charge, two lines down.
+    /// twice.
+    ///
+    /// **And a batch**, for the same reason a preset is one
+    /// (`Gui::apply_preset`): a pane arrives with its default layers already
+    /// on, so the pane and those layers are one act with one name. Priced as
+    /// two asks the first could be admitted and the second refused, and what
+    /// the user would be left holding is a pane that opened without the
+    /// layers it ships with — a scene they did not ask for, under a refusal
+    /// notice naming layers rather than the split they clicked. So the whole
+    /// is summed here — the panes the layout **gains**, bare, plus exactly
+    /// what [`Gui::default_layers_increment`] says `initialize_pane_enabled`
+    /// is about to mint on them — asked once, and the inner door charges
+    /// nothing while the batch is open.
+    ///
+    /// A count that shrinks or stands still asks for nothing, and opens no
+    /// batch: it mints no pane, so there is nothing for this door to have
+    /// priced on the layer door's behalf.
     fn set_pane_count(&mut self, count: usize) -> bool {
         let added = count.saturating_sub(self.pane_layout.pane_count);
+        let active_site = self.panes[self.active_pane].site().to_string();
+        let active_scan_info = self.panes[self.active_pane].scan_info.clone();
+        // Built before they are priced, and pushed only once the whole is
+        // admitted. `self.panes` only ever grows, so a count coming back up
+        // to panes the user closed mints nothing here and the layers those
+        // panes kept are already theirs.
+        let mut opening: Vec<PaneState> = Vec::new();
+        while self.panes.len() + opening.len() < count {
+            let mut new_pane = PaneState::with_site(active_site.clone());
+            new_pane.scan_info = active_scan_info.clone();
+            opening.push(new_pane);
+        }
         if added > 0 {
-            let want = self.admission.costs().new_pane.times(added as u64);
+            let want = self
+                .admission
+                .costs()
+                .new_pane
+                .times(added as u64)
+                .plus(self.default_layers_increment(&opening));
             if !self
                 .admission
                 .enforce(crate::admission::Act::Panes { added }, None, want)
@@ -1604,17 +1642,22 @@ impl Gui {
                 return false;
             }
         }
-        let active_site = self.panes[self.active_pane].site().to_string();
-        let active_scan_info = self.panes[self.active_pane].scan_info.clone();
-        while self.panes.len() < count {
-            let mut new_pane = PaneState::with_site(active_site.clone());
-            new_pane.scan_info = active_scan_info.clone();
-            self.panes.push(new_pane);
-        }
+        let priced_whole = added > 0;
+        self.panes.append(&mut opening);
         // A pane born here has empty overlay maps, and `is_overlay_enabled` reads
         // a missing entry as *off*. Seed it from the handlers, which hold the
         // active pane's state, the same way startup does.
+        //
+        // Inside the batch the ask above paid for, where there was one. A
+        // call that grew nothing did not price this walk and must leave it
+        // to ask for itself.
+        if priced_whole {
+            self.admission.begin_batch();
+        }
         self.initialize_pane_enabled();
+        if priced_whole {
+            self.admission.end_batch();
+        }
         self.pane_layout = PaneLayout::for_count(count, self.layout.width, self.split_orientation);
         // **The count is a ceiling the user sets, never a floor, and lowering
         // it has to release.** `self.panes` only ever grows above — a closed

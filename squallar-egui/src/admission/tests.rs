@@ -135,6 +135,155 @@ fn restating_one_generation_neither_clears_the_debit_nor_re_adopts() {
     assert_eq!(ledger.spare().host_bytes, Some(15 * MIB));
 }
 
+// ── One debit, two ledgers ────────────────────────────────────────────────
+
+/// **A tick's spare is spent once across both ledgers, not once each.**
+///
+/// A running application has two: the UI's, and the App's, for the doors that
+/// run inside the App's own borrow of the Gui. Holding the same table is not
+/// enough — with a debited total each, an act admitted through one leaves the
+/// other still reading the *published* spare, and a burst that mixes UI acts
+/// with loop arms inside one telemetry tick is admitted against one tick's
+/// spare twice. That is an over-admission: the direction that costs the user
+/// their process rather than a rung.
+#[test]
+fn two_ledgers_on_one_table_spend_one_debit() {
+    let table = costs(30 * MIB, 10 * MIB, 1);
+    let mut ui = AdmissionLedger::default();
+    let mut app = AdmissionLedger::default();
+    app.adopt(&table);
+    ui.adopt(&table);
+    ui.share_debit(app.debit());
+
+    // The App's door goes first, for 20 of the 30 MiB.
+    assert!(
+        app.ask(Act::ArmLoop, Some(0), Increment::host(20 * MIB))
+            .is_admit(),
+    );
+    assert_eq!(
+        ui.spare().host_bytes,
+        Some(10 * MIB),
+        "the UI's ledger must see the App's admission; a spare it reads whole \
+         after the App has spent it is one tick's spare counted twice",
+    );
+
+    // And the same act the other way: what the UI spends, the App sees.
+    assert!(
+        ui.ask(Act::ShowLayer, Some(0), Increment::host(10 * MIB))
+            .is_admit(),
+    );
+    assert_eq!(app.spare().host_bytes, Some(0));
+    assert!(
+        !app.ask(Act::ArmLoop, Some(0), Increment::host(1))
+            .is_admit(),
+        "with the tick's whole spare spent, the next door on either ledger \
+         must be refused",
+    );
+}
+
+/// **Both ledgers adopting one table zeroes the total once.**
+///
+/// Each would otherwise clear what has been spent on taking a fresh table,
+/// and the second to arrive would wipe the first's admissions against it —
+/// the same over-admission the shared total exists to close, arriving through
+/// the handshake instead. The reset is keyed on the generation the cell
+/// itself last saw.
+#[test]
+fn the_second_ledger_to_adopt_a_table_does_not_wipe_the_first() {
+    let first = costs(30 * MIB, 10 * MIB, 1);
+    let mut ui = AdmissionLedger::default();
+    let mut app = AdmissionLedger::default();
+    app.adopt(&first);
+    ui.adopt(&first);
+    ui.share_debit(app.debit());
+
+    let second = AdmissionCosts {
+        generation: 2,
+        ..costs(30 * MIB, 10 * MIB, 1)
+    };
+    // The App composes and adopts on the tick; the UI's ledger takes the same
+    // table on the frame that follows, and the App spends in between.
+    app.adopt(&second);
+    assert!(
+        app.ask(Act::ArmLoop, Some(0), Increment::host(25 * MIB))
+            .is_admit(),
+    );
+    ui.adopt(&second);
+
+    assert_eq!(
+        ui.spare().host_bytes,
+        Some(5 * MIB),
+        "the UI's adopt must not re-zero a total the App has already spent \
+         against this very table",
+    );
+}
+
+/// **A ledger joining a total carries what it has already spent into it.** The
+/// handshake is re-stated every frame and must be free after the first, but
+/// the first must not forget an admission either side made before it.
+#[test]
+fn joining_a_shared_total_carries_what_was_already_spent() {
+    let table = costs(30 * MIB, 10 * MIB, 1);
+    let mut ui = AdmissionLedger::default();
+    let mut app = AdmissionLedger::default();
+    app.adopt(&table);
+    ui.adopt(&table);
+    // Both spend before they have ever met.
+    assert!(
+        app.ask(Act::ArmLoop, Some(0), Increment::host(10 * MIB))
+            .is_admit(),
+    );
+    assert!(
+        ui.ask(Act::ShowLayer, Some(0), Increment::host(10 * MIB))
+            .is_admit(),
+    );
+
+    ui.share_debit(app.debit());
+    assert_eq!(
+        ui.spare().host_bytes,
+        Some(10 * MIB),
+        "joining must add this ledger's spend to the total rather than \
+         replace it",
+    );
+
+    // Re-stating it every frame is a no-op, not a second carry-over.
+    for _ in 0..5 {
+        ui.share_debit(app.debit());
+    }
+    assert_eq!(ui.spare().host_bytes, Some(10 * MIB));
+}
+
+/// **A cloned ledger is a second application, not a second holder of one
+/// debit.** Sharing the handle through a clone would be this mechanism
+/// running backwards: two unrelated applications spending each other's spare.
+#[test]
+fn a_cloned_ledger_gets_its_own_total_at_the_same_reading() {
+    let table = costs(30 * MIB, 10 * MIB, 1);
+    let mut ledger = AdmissionLedger::default();
+    ledger.adopt(&table);
+    assert!(
+        ledger
+            .ask(Act::ShowLayer, Some(0), Increment::host(10 * MIB))
+            .is_admit(),
+    );
+
+    let mut copy = ledger.clone();
+    assert_eq!(
+        copy.spare().host_bytes,
+        Some(20 * MIB),
+        "the clone starts from what the original had spent",
+    );
+    assert!(
+        copy.ask(Act::ShowLayer, Some(0), Increment::host(20 * MIB))
+            .is_admit(),
+    );
+    assert_eq!(
+        ledger.spare().host_bytes,
+        Some(20 * MIB),
+        "and spending on the clone must not move the original",
+    );
+}
+
 /// **A batch charges nothing inside it.** The whole act is priced once by the
 /// batch door; the inner doors would otherwise charge the same transitions a
 /// second time and refuse a preset the machine can hold.

@@ -194,9 +194,18 @@ fn a_resident_grid_is_not_charged_at_the_door() {
 
 /// **`set_pane_count`, both arms**, and the one door for a pane: `grown_pane`
 /// comes through it, so nothing is charged twice.
+///
+/// The admit arm's spare is unbounded rather than a figure, and it has to be
+/// now the door prices the pane **and** the layers it ships with as one act:
+/// at `1024 * MIB` this fixture's ask came to 1024 MiB exactly — 128 bare
+/// plus seven default-on layers at 128 — so the arm admitted by equality, and
+/// one more default-on layer landing in the build would have turned it into a
+/// refusal. A test that fails for something it does not assert has stopped
+/// binding. What this measures is the two arms, and the spare only has to be
+/// on the right side of each.
 #[test]
 fn the_pane_door_reads_both_arms() {
-    for (spare, want_refusal) in [(1024 * MIB, false), (0, true)] {
+    for (spare, want_refusal) in [(u64::MAX, false), (0, true)] {
         let mut h = InputHarness::new();
         h.set_admission(costs(spare, 128 * MIB, 4));
         let before = h.gui().admission().counts();
@@ -247,6 +256,121 @@ fn the_pane_door_charges_only_for_growth() {
         moved.asked, 0,
         "re-stating a count and shrinking one must ask for nothing; the door \
          moved {moved:?}",
+    );
+}
+
+/// **Opening a pane is ONE ask, for the pane and the layers it ships with.**
+///
+/// A pane arrives with its default layers already on —
+/// `Gui::initialize_pane_enabled` runs two lines below the count — so the
+/// split and those layers are one act with one name. Two asks is the shape
+/// that lets the first be admitted and the second refused, and the count is
+/// the property that forbids it.
+#[test]
+fn opening_a_pane_is_one_ask_for_the_pane_and_its_layers() {
+    let mut h = InputHarness::new();
+    h.set_admission(costs(u64::MAX, 8 * MIB, 6));
+    let before = h.gui().admission().counts();
+    assert!(h.gui_mut().set_pane_count(2));
+    let moved = h.gui().admission().counts().since(before);
+    assert_eq!(
+        moved.asked, 1,
+        "the pane and its default layers are one act and must reach the \
+         ledger once; the door moved {moved:?}",
+    );
+}
+
+/// **A pane whose layers do not fit does not open at all**, and the notice
+/// names the pane rather than the layers.
+///
+/// The half-applied state this forbids: the bare pane is affordable, so a
+/// door charging for it alone admits the split — and then the layer door two
+/// lines below refuses, leaving a pane the user opened standing empty under a
+/// notice about layers they never touched. Whole or not at all.
+#[test]
+fn a_pane_is_refused_whole_when_only_its_bare_half_would_fit() {
+    let mut h = InputHarness::new();
+    // Room for one bare pane (64 MiB) and nothing like enough for even one
+    // of the layers it ships with. The split is affordable; the pane it
+    // would actually produce is not.
+    h.set_admission({
+        let mut table = costs(100 * MIB, 64 * MIB, 6);
+        // A share still short of its stop, so the refusal can name the
+        // control that produced it rather than a scene lever.
+        table.requested_percent = (70, 70);
+        table
+    });
+
+    let before = h.gui().admission().counts();
+    let grew = h.gui_mut().set_pane_count(2);
+    let moved = h.gui().admission().counts().since(before);
+
+    assert!(
+        !grew,
+        "the bare pane fits and the pane with its layers does not, so the \
+         door must answer no; it moved {moved:?}",
+    );
+    assert_eq!(
+        h.gui().pane_count(),
+        1,
+        "a refused split must leave the layout exactly where it was — a pane \
+         that opened and then had its own default layers refused is a scene \
+         the user never asked for",
+    );
+    assert!(
+        moved.refused > 0,
+        "the refusal must be counted where it happened; the door moved \
+         {moved:?}",
+    );
+    let notice = h
+        .gui()
+        .admission()
+        .notice(web_time::Instant::now())
+        .map(|notice| notice.text.clone())
+        .expect("a refusal the user cannot see is worse than the allocation it prevents");
+    assert!(
+        notice.contains("another pane"),
+        "the user clicked a split, so the notice must name the pane; it said: \
+         {notice}",
+    );
+    assert!(
+        notice.contains("System memory"),
+        "a notice that does not name a control the reader can move is a \
+         warning about nothing; it said: {notice}",
+    );
+}
+
+/// **The admit fixture that resembles it**: the same door, the same act, one
+/// fact changed — enough spare for the pane *and* its layers. Over-firing is
+/// the worse direction here, because a split the machine can hold that the
+/// door turns away is a door the user switches off.
+#[test]
+fn a_pane_opens_whole_when_its_layers_fit_too() {
+    let mut h = InputHarness::new();
+    h.set_admission(costs(u64::MAX, 64 * MIB, 6));
+    let before = h.gui().admission().counts();
+
+    assert!(h.gui_mut().set_pane_count(2));
+    let moved = h.gui().admission().counts().since(before);
+
+    assert_eq!(h.gui().pane_count(), 2, "the door moved {moved:?}");
+    assert_eq!(
+        moved.refused, 0,
+        "nothing may be turned away with room for the whole act; the door \
+         moved {moved:?}",
+    );
+    // And the pane that opened holds the layers it ships with, which is what
+    // the door just paid for.
+    let seeded = h
+        .gui()
+        .pane(1)
+        .expect("the pane opened")
+        .draw_order_vec()
+        .len();
+    assert!(
+        seeded > 0,
+        "the increment covered this pane's default layers, so the pane must \
+         actually hold them",
     );
 }
 

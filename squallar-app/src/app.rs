@@ -334,17 +334,34 @@ pub struct App {
     admission_costs: squallar_egui::admission::AdmissionCosts,
     /// **This layer's own admission ledger**, holding the same table.
     ///
-    /// A second ledger rather than a reach into the Gui's: the App-side door
-    /// (`App::handle_enable_loop`) has to ask the same question the UI doors
-    /// ask, and the App-pokes-Gui coupling ceiling is permanent and sits on
-    /// its measured value - a read through `self.gui` to borrow the UI's
-    /// ledger would raise it.
+    /// A second ledger rather than a reach into the Gui's, and **two things
+    /// forbid the reach, not one**:
     ///
-    /// **What the two ledgers do not share is the debit.** Each spends its
-    /// own copy of one tick's spare, so a burst that mixes UI acts with loop
-    /// arms inside a single telemetry tick can admit up to one tick's spare
-    /// twice. Named rather than discovered: the bound is one tick, and
-    /// closing it means one owner for the table, which is a seam change.
+    /// * The App-pokes-Gui coupling ceiling is permanent and sits on its
+    ///   measured value, so the four reaches one owner would need (the adopt,
+    ///   the loop door's two, the listing door's one) do not fit under it.
+    /// * `accept_scan_listing` is called from inside
+    ///   `self.``gui.panes_and_overlays_mut()`'s own mutable borrow, so it
+    ///   could not borrow a ledger through the Gui at that point whatever the
+    ///   ceiling read. One owner needs a wider disjoint accessor, which is a
+    ///   change to the UI crate's seam and not this field's to make.
+    ///
+    /// (The reach above is spelled in two code spans on purpose. The ratchet
+    /// walk in `squallar-app/tests/arch_ratchets.rs` is a raw grep, and a
+    /// **doc comment** naming the construct counts against the ceiling
+    /// exactly as a real reach would — this paragraph cost the row its last
+    /// unit of headroom before it was re-spelled.)
+    ///
+    /// **What the two ledgers now DO share is the debit.**
+    /// [`squallar_egui::admission::AdmissionLedger::spare`] is the published
+    /// spare less what has been admitted since, and a copy of that figure
+    /// each meant a burst mixing UI acts with loop arms inside one telemetry
+    /// tick was compared against one tick's spare **twice** — an
+    /// over-admission, the direction that costs a process rather than a rung.
+    /// The total is one cell behind a handle
+    /// ([`squallar_egui::admission::SharedDebit`]) that this ledger owns and
+    /// publishes on every frame's inputs; the Gui's ledger joins it and both
+    /// spend from it. Two ledgers, one table, one debit.
     admission: squallar_egui::admission::AdmissionLedger,
     /// **Bytes the volume store is over its budget by with every grid left
     /// held by a visible pane** - `VolumeStore::enforce_budget_sparing`'s

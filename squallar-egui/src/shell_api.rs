@@ -482,6 +482,20 @@ pub struct FrameInputs<'a> {
     /// priced a scene has nothing to refuse against, and refusing on an
     /// absent figure is how an admission system turns into a wall.
     pub admission: Option<&'a crate::admission::AdmissionCosts>,
+    /// **The one debited total both ledgers spend from**
+    /// ([`crate::admission::SharedDebit`]).
+    ///
+    /// The table above says what the App published; this says what has been
+    /// admitted against it *since*, and there is exactly one of it. There are
+    /// two ledgers — the App keeps its own because its doors run inside its
+    /// own borrow of the Gui and could not reach the UI's — and a copy of the
+    /// debit each is how a burst mixing UI acts with loop arms inside one
+    /// telemetry tick admits one tick's spare **twice**.
+    ///
+    /// A handle, not a figure, and re-stated every frame: the ledger joins it
+    /// once and both then spend from it. `None` from a caller with no App
+    /// behind it (the test harness), which keeps the total it already had.
+    pub admission_debit: Option<&'a crate::admission::SharedDebit>,
     /// **A refusal raised on the App's side of the seam**, for the pane to
     /// paint.
     ///

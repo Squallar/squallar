@@ -249,6 +249,12 @@ impl Gui {
     ///
     /// The charge is the transition, so a pane that already holds every layer
     /// asks for nothing, which is what every frame after the first does.
+    ///
+    /// **The charge is not always this door's to ask for.** A caller opening
+    /// panes prices this walk into its own increment and asks once, for the
+    /// pane and its layers together (`Gui::set_pane_count`); the batch it
+    /// holds open over this call is what stops the same bytes being asked
+    /// for twice.
     pub fn initialize_pane_enabled(&mut self) {
         let mut wanted: Vec<(LayerId, u32, bool)> = self
             .overlays
@@ -256,24 +262,8 @@ impl Gui {
             .map(|h| (h.id(), h.draw_order_weight(), h.default_enabled()))
             .collect();
         // Priced before the insert, over exactly the (pane, layer) pairs
-        // `insert_missing_slots` will mint enabled below — `LayerStack::admits`
-        // is the same predicate it uses, so the two cannot disagree about
-        // what is about to be added. A layer's grid is scene-level and
-        // counted once however many panes gain it.
-        let mut want = squallar_device_profile::admit::Increment::ZERO;
-        let mut grids_counted: Vec<LayerId> = Vec::new();
-        for (pane_idx, pane) in self.panes.iter().enumerate() {
-            for (id, _, default_on) in &wanted {
-                if !*default_on || !pane.admits_layer(id, *default_on) {
-                    continue;
-                }
-                want = want.plus(self.admission.pane(pane_idx).show_layer);
-                if !grids_counted.contains(id) {
-                    grids_counted.push(id.clone());
-                    want = want.plus(self.admission.layer_grid(id));
-                }
-            }
-        }
+        // `insert_missing_slots` will mint enabled below.
+        let want = self.default_layers_increment(&[]);
         if !self
             .admission
             .enforce(crate::admission::Act::DefaultLayers, None, want)
@@ -308,6 +298,52 @@ impl Gui {
         for (idx, pane) in panes.iter_mut().enumerate() {
             pane.hydrate_layer_states(overlays, idx);
         }
+    }
+
+    /// **What [`Self::initialize_pane_enabled`] will charge**, over exactly
+    /// the (pane, layer) pairs `insert_missing_slots` is about to mint
+    /// enabled: this Gui's panes, and `opening` — the panes a caller has
+    /// built and is about to push, which do not exist on `self` yet and so
+    /// cannot be walked from it.
+    ///
+    /// Shared with that door rather than re-spelled beside it, so the pane
+    /// door and the layer door cannot disagree about what is being added.
+    /// `PaneState::admits_layer` is the same predicate `insert_missing_slots`
+    /// uses, and the panes in `opening` are the objects that will be pushed
+    /// rather than a model of them — a caller that priced a *description* of
+    /// a new pane would be asserting an equivalence nothing checks.
+    ///
+    /// A layer's decoded grid is scene-level and counted once however many
+    /// panes gain it. A pane index the App's table has no row for prices its
+    /// pictures at zero, which is [`AdmissionLedger::pane`]'s own rule and
+    /// not this walk's: refusing on a figure that does not exist is how an
+    /// admission system turns into a wall.
+    ///
+    /// [`AdmissionLedger::pane`]: crate::admission::AdmissionLedger::pane
+    pub(crate) fn default_layers_increment(
+        &self,
+        opening: &[PaneState],
+    ) -> squallar_device_profile::admit::Increment {
+        let wanted: Vec<(LayerId, bool)> = self
+            .overlays
+            .handlers()
+            .map(|h| (h.id(), h.default_enabled()))
+            .collect();
+        let mut want = squallar_device_profile::admit::Increment::ZERO;
+        let mut grids_counted: Vec<LayerId> = Vec::new();
+        for (pane_idx, pane) in self.panes.iter().chain(opening.iter()).enumerate() {
+            for (id, default_on) in &wanted {
+                if !*default_on || !pane.admits_layer(id, *default_on) {
+                    continue;
+                }
+                want = want.plus(self.admission.pane(pane_idx).show_layer);
+                if !grids_counted.contains(id) {
+                    grids_counted.push(id.clone());
+                    want = want.plus(self.admission.layer_grid(id));
+                }
+            }
+        }
+        want
     }
 
     /// Run the hydrate every caller runs before asking a handler about a

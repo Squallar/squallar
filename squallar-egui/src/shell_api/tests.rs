@@ -70,6 +70,7 @@ fn every_frame_input_surfaces_and_persists() {
         frame_diagnostics: None,
         budget_readout: None,
         admission: None,
+        admission_debit: None,
         admission_notice: None,
     });
 
@@ -159,6 +160,76 @@ fn every_frame_input_surfaces_and_persists() {
     }
 }
 
+/// **The App's debited total reaches the UI's ledger over this seam**, and
+/// the doors on both sides then spend one figure.
+///
+/// The wiring is the whole mechanism: two ledgers holding the same table but
+/// a debit each are compared against one tick's spare twice, and nothing
+/// about the table itself would show it. What crosses is a handle, computed
+/// in `squallar-app` and re-stated every frame, which is the seam's own rule
+/// — the UI reads verdicts, it does not price.
+#[test]
+fn the_apps_debited_total_crosses_the_frame_seam() {
+    let mut h = InputHarness::new();
+    let table = crate::admission::AdmissionCosts {
+        generation: 1,
+        spare: squallar_device_profile::admit::Spare {
+            gpu_bytes: Some(0),
+            host_bytes: Some(30 * 1024 * 1024),
+            joint_bytes: None,
+        },
+        ..Default::default()
+    };
+    // The App's own ledger, holding the table it just composed.
+    let mut app = crate::admission::AdmissionLedger::default();
+    app.adopt(&table);
+
+    h.gui_mut().apply_frame_inputs(FrameInputs {
+        admission: Some(&table),
+        admission_debit: Some(app.debit()),
+        safe_area_insets: (0.0, 0.0, 0.0, 0.0),
+        supports_exit: true,
+        loop_frame_budget: 60,
+        concurrent_renders: 1,
+        tile_cache: crate::tile_source::default_tile_budget(),
+        overlay_overdraw: crate::overlay_cache::OVERDRAW_FRACTION,
+        location_settings_available: false,
+        location: (squallar_location::LocationPermission::Granted, true),
+        gps: None,
+        user_heading: None,
+        catalogue_pending: false,
+        liveness: &[],
+        floor_tile_zoom_bias: 0,
+        mirror_plan_stamp: 0,
+        frame_diagnostics: None,
+        budget_readout: None,
+        admission_notice: None,
+    });
+
+    assert!(
+        h.gui().admission().debit().is_shared_with(app.debit()),
+        "the handle must reach the ledger, or the two sides go on spending a \
+         copy each",
+    );
+
+    // The App's loop door spends most of the tick's spare...
+    assert!(
+        app.ask(
+            crate::admission::Act::ArmLoop,
+            Some(0),
+            squallar_device_profile::admit::Increment::host(25 * 1024 * 1024),
+        )
+        .is_admit(),
+    );
+    // ...and the UI's ledger, across the seam, sees what is left of it.
+    assert_eq!(
+        h.gui().admission().spare().host_bytes,
+        Some(5 * 1024 * 1024),
+        "a UI door asking after the App's has to be compared against what the \
+         App left, not against the published figure again",
+    );
+}
+
 /// The `gps: None` arm clears **both** halves of the fix — the position and
 /// its arrival instant — subsuming the old `clear_gps_fix`. Leaving either
 /// would be the app holding a position it has just been told it may not know.
@@ -186,6 +257,7 @@ fn a_none_gps_clears_the_fix() {
         frame_diagnostics: None,
         budget_readout: None,
         admission: None,
+        admission_debit: None,
         admission_notice: None,
     };
     h.gui_mut().apply_frame_inputs(base);
@@ -212,6 +284,7 @@ fn a_none_gps_clears_the_fix() {
         frame_diagnostics: None,
         budget_readout: None,
         admission: None,
+        admission_debit: None,
         admission_notice: None,
     });
     h.frame();
@@ -282,6 +355,7 @@ mod readout_cadence {
             frame_diagnostics: None,
             budget_readout,
             admission: None,
+            admission_debit: None,
             admission_notice: None,
         });
     }
