@@ -3463,3 +3463,9 @@ mod volume_arrival_tests;
 /// Archive delivery is addressed to the pane that asked, not broadcast.
 #[cfg(test)]
 mod time_group_delivery_tests;
+
+/// What one arriving volume is owned by, and what the inventory charges for
+/// it — over the real drain, because a store filled by hand cannot show which
+/// allocations a caller shares.
+#[cfg(test)]
+mod scan_ownership_tests;

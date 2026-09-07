@@ -53,6 +53,35 @@ pub(crate) type Still = (Arc<Scan>, Arc<DeclaredNyquist>);
 /// A [`Still`] plus the time the volume's first radial was collected.
 pub(crate) type Base = (Arc<Scan>, Arc<DeclaredNyquist>, NaiveDateTime);
 
+/// Which store an entry came from, as a **total order** — the tie-break
+/// [`VolumeInventory::resident_scan_bytes`] uses to name one of two equal
+/// pointers as the payer.
+///
+/// The variants' order is arbitrary and only has to be stable; what matters
+/// is that a key built from it cannot collide across two stores, which a
+/// `(site, Option<when>)` key alone could not because a base and a latest are
+/// both site-keyed.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Store {
+    Base,
+    Latest,
+    Still,
+}
+
+/// One priced volume as [`VolumeInventory::priced_volumes`] yields it: the
+/// entry's ordering key, the allocation behind it, and what that allocation
+/// was priced at when it arrived.
+type PricedVolume<'a> = ((&'a str, Store, Option<NaiveDateTime>), *const Scan, usize);
+
+/// The per-site latest cache as [`VolumeInventory::resident_scan_bytes_with`]
+/// takes it: a site, the volume it is holding, and what that volume was
+/// priced at where it arrived.
+///
+/// Priced by the caller and not walked here: `scan_bytes` is O(radials) and
+/// this figure rides the telemetry tick — the same rule every other holder
+/// in this file follows.
+pub(crate) type LatestVolume<'a> = (&'a str, &'a Arc<Scan>, usize);
+
 /// The most decoded still volumes held at once, across every site.
 ///
 /// # This number is MEASURED. Do not adjust it by feel.
@@ -383,27 +412,120 @@ impl VolumeInventory {
         crate::app::evicted(&mut self.base, doomed)
     }
 
-    /// **Host bytes both stores are holding**, by
+    /// **Host bytes both of this type's stores are holding**, by
     /// [`squallar_radar::scan_size::scan_bytes`] — a floor, since the
     /// allocator's own overhead is not reachable from a slice.
     ///
+    /// **De-duplicated by allocation, because the two stores routinely hold
+    /// the same one.** Both production arrival paths clone ONE `Arc<Scan>`
+    /// into both: the archive drain in `App::update` calls
+    /// [`install_base`](Self::install_base) and then
+    /// [`install_still`](Self::install_still) off one binding, and
+    /// `App::land_chunk_outcome` does the same for a closed live volume. The
+    /// plain sum this replaced charged that volume twice, so on the ordinary
+    /// one-pane scene this family read about double what the inventory held.
+    ///
     /// The denominator is *these two stores*. It is what emptying them would
     /// free **if nothing else held the same volumes**, and something else
-    /// often does: a loop's download cache and the derivation memo hold
-    /// `Arc`s of the same `Scan`s, so their figures and this one sum to an
-    /// upper bound on the joint footprint, never to a partition of it.
+    /// almost always does: the loop download cache, a stored loop frame's
+    /// hover source and the derivation memo hold `Arc`s of the same `Scan`s.
+    /// So their figures and this one sum to an upper bound on the joint
+    /// footprint, never to a partition of it — and emptying the inventory
+    /// drops two of at least three references per volume, which on its own
+    /// frees nothing.
     ///
-    /// A sum of at most [`MAX_RESIDENT_STILL_VOLUMES`] stills plus one base
-    /// per site holding one — a couple of dozen `usize` adds, no walk.
+    /// # What it costs
+    ///
+    /// At most [`MAX_RESIDENT_STILL_VOLUMES`] stills plus one base per site
+    /// holding one, so a couple of dozen entries: `n` field reads and at most
+    /// `n(n-1)/2` pointer compares, allocating nothing, on the telemetry
+    /// tick. The same shape and the same argument as `squallar_gpu`'s
+    /// `publish_pending_level`, which de-duplicates its own residency figure
+    /// by `Arc` pointer for exactly this reason.
+    ///
+    /// **Which of two equal pointers pays is decided by the entries' own
+    /// keys, never by iteration order.** `HashMap` iteration order is not a
+    /// property this figure may rest on: "charge the first one seen" over two
+    /// walks of one map is a level that could move while the heap did not.
     pub(crate) fn resident_scan_bytes(&self) -> usize {
-        let stills = self
-            .still
-            .values()
-            .flat_map(HashMap::values)
-            .fold(0usize, |sum, entry| sum.saturating_add(entry.bytes));
-        self.base_bytes
-            .values()
-            .fold(stills, |sum, bytes| sum.saturating_add(*bytes))
+        self.resident_scan_bytes_with(std::iter::empty::<LatestVolume<'_>>())
+    }
+
+    /// [`resident_scan_bytes`](Self::resident_scan_bytes) **with the per-site
+    /// latest cache folded in**, de-duplicated against both stores the same
+    /// way they are against each other.
+    ///
+    /// `App::latest_cached_scans` is the third long-lived holder of a whole
+    /// decoded volume on this side of the app and it is not this type's to
+    /// own: `App::handle_jump_to_live` moves an entry out of it and into the
+    /// still store, so the store lives beside the panes. It is a genuine
+    /// third store all the same — evicted with these two by
+    /// `App::evict_unshown_scans`, and sharing allocations with the base,
+    /// because the archive drain's auto-poll arm installs one `Arc<Scan>` as
+    /// the merge base and files the same one here.
+    ///
+    /// Taking it as an argument rather than a field is what lets the census's
+    /// `still scans` family mean what its description says — "the still-pane
+    /// inventory and the per-site latest cache are holding together" — with
+    /// one publisher and one de-duplication.
+    pub(crate) fn resident_scan_bytes_with<'s, 'a: 's>(
+        &'s self,
+        latest: impl Iterator<Item = LatestVolume<'a>> + Clone,
+    ) -> usize {
+        debug_assert_eq!(
+            self.base.len(),
+            self.base_bytes.len(),
+            "a merge base and its price row are out of step",
+        );
+        let priced = || {
+            self.priced_volumes().chain(
+                latest.clone().map(|(site, scan, bytes)| {
+                    ((site, Store::Latest, None), Arc::as_ptr(scan), bytes)
+                }),
+            )
+        };
+        priced()
+            .filter(|(key, ptr, _)| {
+                !priced().any(|(other, other_ptr, _)| other_ptr == *ptr && other < *key)
+            })
+            .fold(0usize, |sum, (_, _, bytes)| sum.saturating_add(bytes))
+    }
+
+    /// Every priced volume in both stores, as `(key, allocation, bytes)`.
+    ///
+    /// `key` is a **total order over the entries**, which is what lets
+    /// [`resident_scan_bytes`](Self::resident_scan_bytes) name one of two
+    /// equal pointers as the payer without depending on how a `HashMap`
+    /// walks. A still is `(site, Still, Some(collected-at))` and a base is
+    /// `(site, Base, None)`; the [`Store`] rank is what keeps two site-keyed
+    /// stores apart, and within a store the rest of the key is the map's own
+    /// and so is already unique.
+    ///
+    /// A base's price is looked up beside its volume rather than folded from
+    /// `base_bytes` directly, so a price row that outlived its `Base` cannot
+    /// put a volume on this figure that the inventory has dropped. The
+    /// `debug_assert_eq!` above is what catches the row itself.
+    ///
+    /// Yielded rather than collected because the caller walks it twice and
+    /// must not allocate to do so.
+    fn priced_volumes(&self) -> impl Iterator<Item = PricedVolume<'_>> {
+        let stills = self.still.iter().flat_map(|(site, times)| {
+            times.iter().map(move |(at, entry)| {
+                (
+                    (site.as_str(), Store::Still, Some(*at)),
+                    Arc::as_ptr(&entry.volume.0),
+                    entry.bytes,
+                )
+            })
+        });
+        let bases = self.base.iter().map(move |(site, (scan, _, _))| {
+            (
+                (site.as_str(), Store::Base, None),
+                Arc::as_ptr(scan),
+                self.base_bytes.get(site).copied().unwrap_or(0),
+            )
+        });
+        stills.chain(bases)
     }
 
     /// Every volume still held here, for the derived-product cache's retain
@@ -520,6 +642,16 @@ mod tests {
 
     /// Two volumes that are distinguishable by pointer — `ready_scan` builds a
     /// fresh one per call, so `Arc::ptr_eq` tells them apart.
+    ///
+    /// **This is the control, not the production case.** Nothing built here
+    /// can show what happens when one allocation reaches both stores, which
+    /// is what every arrival actually does — see
+    /// [`one_volume_in_both_stores_is_charged_once`]. It is kept distinct on
+    /// purpose: a de-duplication that collapsed unrelated volumes would show
+    /// up here and nowhere else.
+    ///
+    /// [`one_volume_in_both_stores_is_charged_once`]:
+    ///     one_volume_in_both_stores_is_charged_once
     fn two_volumes() -> (Arc<Scan>, Arc<Scan>) {
         (
             crate::volume_fixture::ready_scan(),
@@ -598,6 +730,173 @@ mod tests {
             inv.resident_scan_bytes(),
             0,
             "an emptied inventory still priced"
+        );
+    }
+
+    /// **One volume in both stores is one allocation and is charged once.**
+    ///
+    /// This is what production does, on both arrival paths: the archive drain
+    /// clones one `Arc<Scan>` into `install_base` and then into
+    /// `install_still`, and `App::land_chunk_outcome` does the same from one
+    /// binding when a live volume closes whole. Summing the stored prices
+    /// charged that one 48.9 MiB median volume twice, and nothing in this
+    /// module could see it: `the_inventorys_byte_total_tracks_both_stores`
+    /// builds its inputs with `two_volumes`, whose whole point is that they
+    /// are DISTINCT.
+    #[test]
+    fn one_volume_in_both_stores_is_charged_once() {
+        let mut inv = VolumeInventory::default();
+        let scan = crate::volume_fixture::ready_scan();
+        let one = squallar_radar::scan_size::scan_bytes(&scan);
+        assert!(
+            one > 0,
+            "fixture: a volume of no gates cannot price anything"
+        );
+
+        let forced = inv.install_still("KTLX".into(), at(0), (Arc::clone(&scan), Arc::default()));
+        assert!(forced.is_empty(), "fixture: one install cannot hit the cap");
+        inv.install_base("KTLX".into(), (Arc::clone(&scan), Arc::default(), at(0)));
+        assert!(
+            Arc::strong_count(&scan) == 3,
+            "fixture: this test is about ONE allocation in two stores, and \
+             the stores are holding {} references",
+            Arc::strong_count(&scan) - 1,
+        );
+
+        assert_eq!(
+            inv.resident_scan_bytes(),
+            one,
+            "the volume both stores hold was charged twice",
+        );
+
+        // Dropping one of two references to one allocation frees nothing, so
+        // the figure must not move: the bytes are still resident.
+        inv.evict_base(&|_| true);
+        assert_eq!(
+            inv.resident_scan_bytes(),
+            one,
+            "the base went and the still still holds the same allocation",
+        );
+        let dropped = inv.retain_still(&|_, _| false);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(inv.resident_scan_bytes(), 0);
+    }
+
+    /// **The de-duplication is by allocation and not by store.** Two distinct
+    /// stills and a base that is one of them is two volumes, not one and not
+    /// three — the mixed case a dedup that collapsed a whole store, or one
+    /// that collapsed nothing, would both get wrong.
+    #[test]
+    fn distinct_volumes_are_still_summed_beside_a_shared_one() {
+        let mut inv = VolumeInventory::default();
+        let (first, second) = two_volumes();
+        let one = squallar_radar::scan_size::scan_bytes(&first);
+        assert!(one > 0, "fixture: a volume of no gates prices nothing");
+        assert_eq!(
+            one,
+            squallar_radar::scan_size::scan_bytes(&second),
+            "fixture: the two volumes must price the same for the arithmetic \
+             below to name a multiple",
+        );
+
+        drop(inv.install_still("KTLX".into(), at(0), (Arc::clone(&first), Arc::default())));
+        drop(inv.install_still("KOUN".into(), at(0), (Arc::clone(&second), Arc::default())));
+        assert_eq!(
+            inv.resident_scan_bytes(),
+            2 * one,
+            "two unrelated volumes were collapsed into one",
+        );
+
+        // KTLX's base is the volume its still already holds; KOUN's is a
+        // third, unrelated one.
+        inv.install_base("KTLX".into(), (first, Arc::default(), at(0)));
+        assert_eq!(
+            inv.resident_scan_bytes(),
+            2 * one,
+            "a base that is the site's own still added a volume that is not \
+             resident",
+        );
+        inv.install_base(
+            "KOUN".into(),
+            (crate::volume_fixture::ready_scan(), Arc::default(), at(1)),
+        );
+        assert_eq!(
+            inv.resident_scan_bytes(),
+            3 * one,
+            "a base nothing else holds was not charged",
+        );
+    }
+
+    /// **The per-site latest cache is a third store and is priced with the
+    /// other two**, de-duplicated against them.
+    ///
+    /// The overlap is not hypothetical: the archive drain's auto-poll arm
+    /// installs one `Arc<Scan>` as `site`'s merge base and files the SAME one
+    /// in `App::latest_cached_scans`, so a figure that added the two would
+    /// charge one volume twice — the defect this whole family had between its
+    /// own two stores.
+    #[test]
+    fn the_latest_cache_is_priced_and_de_duplicated_against_the_stores() {
+        let mut inv = VolumeInventory::default();
+        let cached = crate::volume_fixture::ready_scan();
+        let one = squallar_radar::scan_size::scan_bytes(&cached);
+        assert!(one > 0, "fixture: a volume of no gates prices nothing");
+
+        // Nothing in the inventory: the cache is the whole figure.
+        let held = [("KTLX", Arc::clone(&cached), one)];
+        let rows = || held.iter().map(|(site, scan, bytes)| (*site, scan, *bytes));
+        assert_eq!(
+            inv.resident_scan_bytes_with(rows()),
+            one,
+            "the per-site latest cache was priced by nothing",
+        );
+
+        // The archive drain's auto-poll arm: the same allocation is also the
+        // site's merge base.
+        inv.install_base("KTLX".into(), (Arc::clone(&cached), Arc::default(), at(0)));
+        assert_eq!(
+            inv.resident_scan_bytes_with(rows()),
+            one,
+            "a volume that is both the merge base and the site's latest was \
+             charged twice",
+        );
+
+        // A still of a DIFFERENT volume is a second resident volume.
+        let other = crate::volume_fixture::ready_scan();
+        drop(inv.install_still("KTLX".into(), at(1), (other, Arc::default())));
+        assert_eq!(
+            inv.resident_scan_bytes_with(rows()),
+            2 * one,
+            "an unrelated still was collapsed into the shared volume",
+        );
+
+        // And the no-cache spelling is the same figure without it.
+        assert_eq!(
+            inv.resident_scan_bytes(),
+            2 * one,
+            "the empty-cache spelling must agree with the stores alone",
+        );
+    }
+
+    /// **The charge does not depend on which store the walk reaches first.**
+    ///
+    /// The figure walks two `HashMap`s and `HashMap` promises no order, so a
+    /// "first one seen wins" rule could pay out of the still on one call and
+    /// out of the base on the next — a level that moves while the heap does
+    /// not. Here the two prices differ, so an order-dependent rule reads two
+    /// different totals and only a key-ordered one reads a stable figure.
+    #[test]
+    fn the_shared_charge_is_stable_across_repeated_reads() {
+        let mut inv = VolumeInventory::default();
+        let scan = crate::volume_fixture::ready_scan();
+        let one = squallar_radar::scan_size::scan_bytes(&scan);
+        drop(inv.install_still("KTLX".into(), at(0), (Arc::clone(&scan), Arc::default())));
+        inv.install_base("KTLX".into(), (Arc::clone(&scan), Arc::default(), at(0)));
+
+        let readings: Vec<usize> = (0..64).map(|_| inv.resident_scan_bytes()).collect();
+        assert!(
+            readings.iter().all(|&r| r == one),
+            "the shared volume's charge moved between reads: {readings:?}",
         );
     }
 
