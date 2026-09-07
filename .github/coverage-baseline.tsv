@@ -7,7 +7,7 @@ nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
 squallar-alloc/src/lib.rs	63	62
 squallar-app/src/app.rs	1646	1201
-squallar-app/src/app_chunks.rs	220	133
+squallar-app/src/app_chunks.rs	220	163
 squallar-app/src/app_fetch.rs	1958	1651
 squallar-app/src/app_render.rs	4255	3542
 squallar-app/src/app_state.rs	77	0
@@ -75,7 +75,7 @@ squallar-egui/src/heap_census.rs	70	68
 squallar-egui/src/input_fidelity.rs	141	141
 squallar-egui/src/input_harness.rs	1479	1469
 squallar-egui/src/legend_ramp.rs	146	146
-squallar-egui/src/overlay_cache.rs	524	505
+squallar-egui/src/overlay_cache.rs	524	506
 squallar-egui/src/overlay_cache/ledger.rs	125	108
 squallar-egui/src/pane.rs	1708	1655
 squallar-egui/src/pane/layer_stack.rs	78	75
@@ -92,7 +92,7 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	306	268
 squallar-egui/src/tile_mesh/ledger.rs	77	46
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	1542	1477
+squallar-egui/src/tile_source.rs	1542	1476
 squallar-egui/src/tile_source/byte_lru.rs	272	271
 squallar-egui/src/tile_source/cache_ledger.rs	178	138
 squallar-egui/src/tile_source/snap.rs	157	157
@@ -223,7 +223,7 @@ squallar-overlays/src/render/handlers/location.rs	76	58
 squallar-overlays/src/render/handlers/metar.rs	637	522
 squallar-overlays/src/render/handlers/mod.rs	103	102
 squallar-overlays/src/render/handlers/model.rs	2562	2419
-squallar-overlays/src/render/handlers/mrms.rs	669	598
+squallar-overlays/src/render/handlers/mrms.rs	669	599
 squallar-overlays/src/render/handlers/outlook.rs	1516	1439
 squallar-overlays/src/render/handlers/reports.rs	725	658
 squallar-overlays/src/render/handlers/sites.rs	98	80
@@ -246,10 +246,10 @@ squallar-overlays/src/types.rs	24	24
 squallar-radar/src/archive.rs	249	227
 squallar-radar/src/azimuth.rs	191	191
 squallar-radar/src/beam.rs	33	33
-squallar-radar/src/catalogue.rs	174	160
+squallar-radar/src/catalogue.rs	174	163
 squallar-radar/src/chunk_feed.rs	271	257
 squallar-radar/src/chunk_notify.rs	402	370
-squallar-radar/src/chunks.rs	975	797
+squallar-radar/src/chunks.rs	975	830
 squallar-radar/src/current.rs	117	116
 squallar-radar/src/derive.rs	320	307
 squallar-radar/src/dpprep.rs	1022	956
@@ -263,7 +263,7 @@ squallar-radar/src/hover.rs	65	65
 squallar-radar/src/jobs.rs	594	561
 squallar-radar/src/kdp.rs	247	203
 squallar-radar/src/l3_values.rs	282	281
-squallar-radar/src/level3.rs	188	116
+squallar-radar/src/level3.rs	188	121
 squallar-radar/src/loop_downloads.rs	898	879
 squallar-radar/src/loop_geometry.rs	7	7
 squallar-radar/src/nrot.rs	3232	3175
@@ -275,12 +275,12 @@ squallar-radar/src/render/polar.rs	264	260
 squallar-radar/src/render_input.rs	663	633
 squallar-radar/src/sampler.rs	573	553
 squallar-radar/src/sampler/seam_fixture.rs	178	167
-squallar-radar/src/scan.rs	374	212
+squallar-radar/src/scan.rs	374	208
 squallar-radar/src/scan_size.rs	46	46
 squallar-radar/src/site_position.rs	81	81
 squallar-radar/src/sites.rs	801	799
 squallar-radar/src/sounding.rs	234	207
-squallar-radar/src/source.rs	631	583
+squallar-radar/src/source.rs	631	573
 squallar-radar/src/srm.rs	107	102
 squallar-radar/src/srv.rs	203	203
 squallar-radar/src/tls_pins.rs	64	62
@@ -463,8 +463,8 @@ vendor/nexrad-decode/src/messages/rda_status_data/snapshot_test.rs	5	5
 vendor/nexrad-decode/src/messages/rda_status_data/volume_coverage_pattern.rs	12	0
 vendor/nexrad-decode/src/messages/request_for_data/message.rs	32	6
 vendor/nexrad-decode/src/messages/request_for_data/snapshot_test.rs	5	5
-vendor/nexrad-decode/src/messages/volume_coverage_pattern/elevation_data_block.rs	164	77
-vendor/nexrad-decode/src/messages/volume_coverage_pattern/header.rs	90	52
+vendor/nexrad-decode/src/messages/volume_coverage_pattern/elevation_data_block.rs	164	76
+vendor/nexrad-decode/src/messages/volume_coverage_pattern/header.rs	90	51
 vendor/nexrad-decode/src/messages/volume_coverage_pattern/message.rs	24	24
 vendor/nexrad-decode/src/messages/volume_coverage_pattern/raw/elevation_data_block.rs	19	18
 vendor/nexrad-decode/src/messages/volume_coverage_pattern/snapshot_test.rs	5	5
