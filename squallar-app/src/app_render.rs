@@ -5951,7 +5951,7 @@ impl super::App {
         pane_layers: &[PaneLayerRows],
     ) {
         use squallar_device_profile::scene::CapacitySource;
-        use squallar_egui::shell_api::{PaneBudget, PoolReadout};
+        use squallar_egui::shell_api::{PaneBudget, PoolReadout, RasterSideReadout};
 
         let cap = self.capacity();
         // **The unbound figure**, so the readout can say what fraction of it
@@ -5975,6 +5975,23 @@ impl super::App {
         // from.
         let recovering = self.host_recovery.held() > 0;
         let gpu_recovering = self.gpu_recovery.is_squeezed();
+        // **The texture setting's effective figure, read before the readout is
+        // borrowed** — the same shape as `hardware` above and for the same
+        // reason: what is in force cannot be reconstructed from the setting,
+        // because the device class, the fit's ladder and the adapter's own
+        // `max_texture_dimension_2d` have each already had their say by the
+        // time `AppState` holds this.
+        //
+        // `None` where no device has answered, which is absence rather than a
+        // zero side: `adopt_budgets` is what keeps this current afterwards,
+        // and it returns early on exactly the same `self.state` being `None`.
+        let raster = RasterSideReadout {
+            requested: self.texture_ceiling,
+            effective_side_px: self
+                .state
+                .as_ref()
+                .map(|state| state.raster_side_ceiling_px),
+        };
         let need = terms.total();
         let readout = &mut self.budget_readout;
         // Bumped here and nowhere else, so the counter and the content cannot
@@ -6043,6 +6060,7 @@ impl super::App {
             );
         }
         readout.terms = *terms;
+        readout.raster = raster;
         readout.gpu = PoolReadout {
             capacity_bytes: cap.gpu_bytes,
             source: cap.source,

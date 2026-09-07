@@ -64,6 +64,42 @@ pub struct BudgetReadout {
     /// budget it is priced at — the per-layer read-out of
     /// `NeedTerms::overlay_grids_host`, keyed for the layers menu.
     pub overlay_grids: Vec<(LayerId, u64)>,
+    /// **The texture-size setting's own effective-beside-requested pair** —
+    /// what the user allows a radar raster's side, and what one may actually
+    /// reach on this device.
+    pub raster: RasterSideReadout,
+}
+
+/// **What the user allows any radar raster's side, and the largest side one
+/// may actually take here** — [`PoolReadout::effective_percent`]'s argument
+/// for a ceiling in pixels rather than a share of a pool.
+///
+/// The pair exists for one reason: the setting is a ceiling the hardware may
+/// clamp below, and a control that shows only what was asked for cannot say
+/// so. A user who lowered this months ago and forgot, and a user whose
+/// adapter will not reach the size they picked, are told the same way — the
+/// figure they asked for, beside the figure in force.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RasterSideReadout {
+    /// **The ceiling the user asked for**, verbatim.
+    /// `TextureCeiling::NONE` — the default — is no restriction at all, and
+    /// is what a session that never touched the control carries.
+    pub requested: squallar_device_profile::budget::TextureCeiling,
+    /// **The largest side a plan-view raster may actually take this
+    /// session**: `Budgets::raster_side_for_adapter` at this device's
+    /// `max_texture_dimension_2d`, which is the figure the render dispatcher
+    /// is held to and therefore the one whose effect the user sees.
+    ///
+    /// It can never exceed [`Self::requested`], because the ceiling is
+    /// applied to every raster side in `Budgets` before that function reads
+    /// them; it is *below* it whenever the device class, the fit's ladder or
+    /// the adapter's own limit reaches lower.
+    ///
+    /// **`None` is absence, not zero and not a guess**: before a device has
+    /// answered there is no adapter figure to hold anything to, and
+    /// `memory_share_caption`'s ruling applies — a session with no figure is
+    /// told so rather than shown an invented one.
+    pub effective_side_px: Option<usize>,
 }
 
 /// One pane's priced cost and held bytes.

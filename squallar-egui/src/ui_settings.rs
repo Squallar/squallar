@@ -499,8 +499,11 @@ impl super::Gui {
                 true
             }
             "memory.texture_ceiling" => {
+                // Read off before the `&mut` borrow of the setting, exactly as
+                // the two share rows above read their pools.
+                let raster = self.budget_readout.as_ref().map(|readout| readout.raster);
                 let before = self.texture_ceiling;
-                texture_ceiling_combo(ui, &mut self.texture_ceiling);
+                texture_ceiling_combo(ui, &mut self.texture_ceiling, raster);
                 if before != self.texture_ceiling {
                     actions.push(GuiAction::SetTextureCeiling(self.texture_ceiling));
                 }
@@ -725,6 +728,7 @@ fn memory_share_widget(
 fn texture_ceiling_combo(
     ui: &mut egui::Ui,
     ceiling: &mut squallar_device_profile::budget::TextureCeiling,
+    raster: Option<crate::shell_api::RasterSideReadout>,
 ) {
     use squallar_device_profile::budget::TextureCeiling;
 
@@ -741,19 +745,86 @@ fn texture_ceiling_combo(
             });
     });
     ui.label(
-        egui::RichText::new(match ceiling.side_px() {
-            None => "Rasters take the largest size this device fits. Lower \
-                     this to spend less memory on each radar picture and \
-                     leave more for the rest of the scene."
-                .to_owned(),
-            Some(px) => format!(
-                "Radar pictures are held to {px} px across. This device may \
-                 already draw them smaller; it will not draw them larger."
-            ),
-        })
-        .small()
-        .weak(),
+        egui::RichText::new(texture_ceiling_caption(raster, *ceiling))
+            .small()
+            .weak(),
     );
+}
+
+/// **The line under the texture-size control: what the user asked of every
+/// radar raster, and the largest side one actually takes here.**
+///
+/// `memory_share_caption`'s shape, for `memory_share_caption`'s reason. A
+/// ceiling is a figure the hardware may clamp below — the device class, the
+/// fit's ladder and the adapter's own `max_texture_dimension_2d` each reach
+/// lower than some rung this control offers — and a control showing only
+/// what was asked for cannot say so. It **never overwrites the setting**:
+/// the combo keeps reading the user's own choice whatever this line says,
+/// which is what lets a user who moves to a bigger machine get the size they
+/// asked for without touching the control again.
+///
+/// A hedge in place of the pair — "this device may already draw them
+/// smaller" — is a sentence rather than a figure: true on every machine,
+/// actionable on none, and silent on the one case the pair exists for.
+fn texture_ceiling_caption(
+    raster: Option<crate::shell_api::RasterSideReadout>,
+    requested: squallar_device_profile::budget::TextureCeiling,
+) -> String {
+    // Absence is stated as absence rather than guessed at: a session whose
+    // device has not answered has no side in force to report, and inventing
+    // one is the defect `memory_share_caption` refuses in the same words.
+    let no_figure = || match requested.side_px() {
+        None => "Rasters take the largest size this device fits. Lower this \
+                 to spend less memory on each radar picture and leave more \
+                 for the rest of the scene."
+            .to_owned(),
+        Some(px) => format!(
+            "Radar pictures are held to {px} px across. No figure yet for \
+             the size this device reaches."
+        ),
+    };
+
+    let Some(raster) = raster else {
+        return no_figure();
+    };
+    if raster.requested != requested {
+        // The readout is composed on the telemetry tick, not the frame, so a
+        // just-changed combo is genuinely not in force yet — printing the old
+        // figure under the new choice reads as a broken control.
+        return match requested.side_px() {
+            None => "Lifting the limit...".to_owned(),
+            Some(px) => format!("Applying {px} px..."),
+        };
+    }
+    let Some(effective) = raster.effective_side_px else {
+        return no_figure();
+    };
+    match requested.side_px() {
+        None => format!(
+            "No limit asked for, at most {effective} px in force (all this \
+             device reaches). Lower this to spend less memory on each radar \
+             picture."
+        ),
+        // "at most", because the figure is a ceiling on every raster and not
+        // the side each one takes: `raster_side` asks the sweep's own extent
+        // and gate spacing first and is held to this only where that need
+        // reaches it, so a near-range picture is smaller than this on every
+        // machine.
+        //
+        // `effective` and not `px` on both arms, so the figure printed is the
+        // one actually in force even if the invariant that puts it at or
+        // below the request were ever broken upstream. The words are what
+        // splits the two cases; the number is read off the readout either
+        // way.
+        Some(px) => {
+            let held = if effective < px {
+                "this device does not reach the size you asked for"
+            } else {
+                "your setting"
+            };
+            format!("{px} px asked for, at most {effective} px in force ({held}).")
+        }
+    }
 }
 
 /// The name one texture-size rung goes by. `None` is the neutral posture and
@@ -1055,6 +1126,7 @@ mod memory_share_tests {
 #[cfg(test)]
 mod texture_ceiling_tests {
     use super::*;
+    use crate::shell_api::RasterSideReadout;
     use squallar_device_profile::budget::TextureCeiling;
 
     /// The neutral posture is named in words. "4096 px" would read as a size
@@ -1108,6 +1180,141 @@ mod texture_ceiling_tests {
             reset.contains("SetTextureCeiling"),
             "the reset arm does not reset the texture ceiling, so `Reset to \
              defaults` would leave this session at the old one",
+        );
+    }
+
+    /// A readout composed under `requested`, on a device whose plan views
+    /// reach `effective` px.
+    fn priced(requested: TextureCeiling, effective: usize) -> RasterSideReadout {
+        RasterSideReadout {
+            requested,
+            effective_side_px: Some(effective),
+        }
+    }
+
+    /// **The mandatory arm: a device that will not reach the setting says so,
+    /// beside the setting.**
+    ///
+    /// And the control that matters more than the arm itself — a device that
+    /// *does* reach it must not be reported as falling short. Over-firing is
+    /// the worse direction here: a line that cried "your machine is too
+    /// small" on every machine would teach the user to stop reading it, and
+    /// the one case it exists for would be the case they skipped.
+    #[test]
+    fn a_device_that_will_not_reach_the_setting_says_so_beside_it() {
+        let asked = TextureCeiling::clamped(4096);
+        let clamped = texture_ceiling_caption(Some(priced(asked, 2048)), asked);
+        let reached = texture_ceiling_caption(Some(priced(asked, 4096)), asked);
+
+        for line in [&clamped, &reached] {
+            assert!(
+                line.contains("4096 px asked for") && line.contains("in force"),
+                "the line states neither the request nor the figure in \
+                 force: {line}",
+            );
+        }
+        assert!(
+            clamped.contains("2048 px in force"),
+            "the device's own figure is not on the line, so the user is \
+             shown only what they asked for: {clamped}",
+        );
+        assert!(
+            clamped.contains("does not reach"),
+            "a device below the setting is not named as what held it: \
+             {clamped}",
+        );
+        assert!(
+            reached.contains("4096 px in force") && !reached.contains("does not reach"),
+            "a device that reaches the setting is reported as clamping it: \
+             {reached}",
+        );
+        assert_ne!(
+            clamped, reached,
+            "the clamped and the unclamped device read identically, so this \
+             line cannot tell the user which they have",
+        );
+    }
+
+    /// The neutral posture names the size in force too. A user who has asked
+    /// for no ceiling still has one — the device's — and the whole argument
+    /// for the pair is that a bare setting cannot say what it is.
+    #[test]
+    fn the_neutral_posture_still_names_the_size_in_force() {
+        let line = texture_ceiling_caption(
+            Some(priced(TextureCeiling::NONE, 8192)),
+            TextureCeiling::NONE,
+        );
+        assert!(
+            line.contains("8192 px in force"),
+            "the device's own figure is not on the line: {line}",
+        );
+        assert!(
+            !line.contains("does not reach"),
+            "a session under no ceiling at all is reported as clamped: \
+             {line}",
+        );
+    }
+
+    /// **A ceiling just picked is not reported as in force.** The readout is
+    /// composed on the telemetry tick, so for up to one period the App is
+    /// genuinely still rendering at the old size — `memory_share_caption`'s
+    /// "Applying 45 %..." for the same reason, and printing the old figure
+    /// under the new choice would read as a control that does nothing.
+    #[test]
+    fn a_ceiling_the_app_has_not_priced_yet_says_so() {
+        let asked = TextureCeiling::clamped(1024);
+        let line = texture_ceiling_caption(Some(priced(TextureCeiling::NONE, 8192)), asked);
+        assert!(
+            line.contains("1024"),
+            "the line names no figure at all: {line}",
+        );
+        assert!(
+            !line.contains("in force"),
+            "a ceiling the App has not seen was reported as in force: {line}",
+        );
+        assert!(
+            !line.contains("8192"),
+            "the figure from before the change was printed under the new \
+             choice: {line}",
+        );
+    }
+
+    /// Absence is stated as absence. A session whose device has not answered
+    /// has no size in force to report, and inventing one is the defect
+    /// `memory_share_caption` refuses in the same words.
+    #[test]
+    fn a_session_with_no_device_figure_is_not_given_one() {
+        let asked = TextureCeiling::clamped(2048);
+        let no_readout = texture_ceiling_caption(None, asked);
+        let no_device = texture_ceiling_caption(
+            Some(RasterSideReadout {
+                requested: asked,
+                effective_side_px: None,
+            }),
+            asked,
+        );
+        for line in [&no_readout, &no_device] {
+            assert!(
+                !line.contains("in force"),
+                "a session with no figure was given one: {line}",
+            );
+            assert!(
+                line.contains("2048 px"),
+                "the line does not even name the setting: {line}",
+            );
+        }
+        // The neutral posture keeps the copy that says what the control
+        // buys — the one line on this control that is guidance rather than a
+        // reading, and the only one a fresh install sees.
+        let neutral = texture_ceiling_caption(None, TextureCeiling::NONE);
+        assert!(
+            neutral.contains("Lower this"),
+            "a fresh install is told nothing about what this control does: \
+             {neutral}",
+        );
+        assert!(
+            !neutral.contains("in force"),
+            "a session with no figure was given one: {neutral}",
         );
     }
 }

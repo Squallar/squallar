@@ -14,7 +14,7 @@
 
 use squallar_device_profile::budget::{BudgetLimits, Promotion, TextureCeiling, at_class_rung};
 
-use super::tests::headless;
+use super::tests::{headless, n_pane_app};
 use crate::platform_double::TestBridge;
 
 /// The desktop class rung, which is the widest set of sides any bracket
@@ -139,4 +139,62 @@ fn raising_the_ceiling_gives_the_sides_back() {
         app.budgets, wanted,
         "clearing the ceiling did not restore the budgets",
     );
+}
+
+/// **The App half of effective-beside-requested**: the readout the settings
+/// screen draws its line from carries the ceiling the budgets were composed
+/// under, and states the device's own figure as *absent* where no device has
+/// answered.
+///
+/// The caption in `squallar_egui::ui_settings` is a pure function of this
+/// pair and is tested there on both arms. What can only be checked here is
+/// that the pair is composed at all, that it follows the setting, and that a
+/// session with no adapter is not handed an invented side — the failure this
+/// one would have is a line that reads confidently and describes nothing.
+#[test]
+fn the_readout_carries_the_ceiling_it_was_composed_under() {
+    let mut app = n_pane_app(1, "KTLX");
+    let asked = TextureCeiling::clamped(1024);
+    assert_ne!(
+        asked,
+        TextureCeiling::NONE,
+        "precondition: the two postures this test tells apart are one value, \
+         so both halves below would pass on any behaviour at all",
+    );
+
+    app.set_texture_ceiling(asked);
+    tick(&mut app);
+    assert!(
+        app.budget_readout.generation > 0,
+        "no readout was composed, so every figure read off it below is the \
+         default rather than an answer",
+    );
+    assert_eq!(
+        app.budget_readout.raster.requested, asked,
+        "the readout does not carry the ceiling in force, so the settings \
+         line would report a figure the user never chose",
+    );
+    assert_eq!(
+        app.budget_readout.raster.effective_side_px, None,
+        "a session with no adapter was given a size in force; absence has to \
+         reach the caption as absence, or it prints a confident invention",
+    );
+
+    // The known-unequal control: clearing the setting moves the readout with
+    // it, so the equality above is following the ceiling rather than sitting
+    // on a value that never changes.
+    app.set_texture_ceiling(TextureCeiling::NONE);
+    tick(&mut app);
+    assert_eq!(
+        app.budget_readout.raster.requested,
+        TextureCeiling::NONE,
+        "the readout kept a ceiling the session no longer has",
+    );
+}
+
+/// One telemetry tick, asked for rather than waited on — the cadence
+/// `app_render/budget_readout_cadence_tests.rs` pins, driven the same way.
+fn tick(app: &mut crate::app::App) {
+    app.frame_telemetry_said = None;
+    app.report_frame_telemetry();
 }
