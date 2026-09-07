@@ -2529,17 +2529,14 @@ impl super::App {
         census::set_derive_memo_bytes(squallar_radar::derive::memo_bytes() as u64);
         census::set_render_cache_bytes(self.render.render_cache.resident_bytes() as u64);
         // `renders in flight` is published at its seams, where the bytes
-        // move; this is the tick's reconciliation of it. `render pools` needs
-        // no publisher here: `census()` reads radar's slot atomics directly.
+        // move; this is the tick's reconciliation of it. `render pools` and
+        // `deferred drops` need no publisher here: `census()` reads radar's
+        // slot atomics and the discard ledger's counters directly.
         self.render.publish_heap_census();
         census::set_overlay_picture_bytes(self.render.resident_overlay_pictures().1);
         census::set_loop_frame_bytes(self.loop_frames.resident_host_bytes());
         census::set_loop_frame_scan_bytes(self.loop_frames.pinned_volume_bytes());
         census::set_volume_store_bytes(self.volume_store.memory_bytes() as u64);
-        // Evicted and not yet freed: what `offload::discard` is holding for
-        // the frame-paced drain. One `Cell` read; the queue prices itself at
-        // enqueue and de-prices at drop.
-        census::set_deferred_drop_bytes(squallar_worker::offload::deferred_drop_bytes());
     }
 
     /// **Judge one reading of the page's linear memory** against the line

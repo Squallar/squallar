@@ -23,16 +23,20 @@ use std::collections::HashMap;
 /// and never dropped, so a `Drop` may never run). [`discard_each`] for a
 /// collection — a batch handed over whole is one payload freed in one turn.
 pub fn discard(name: &'static str, payload: impl Send + 'static) {
-    let payload: Box<dyn std::any::Any + Send> = Box::new(payload);
+    // Priced here, once, ahead of the routing: **both** routes hold the bytes
+    // until something finishes the drop, so both have to count them. Unwrapping
+    // inside the deferred queue instead would leave native's lane — the route
+    // that actually runs there — holding an unpriced payload.
+    let (bytes, payload) = priced_parts(Box::new(payload));
     #[cfg(not(target_arch = "wasm32"))]
     // `Err` is a free lane with no live worker; this is the frame thread, which
     // is where a multi-GiB teardown must not land.
-    if let Err(payload) = pool::run_free(name, payload) {
+    if let Err(payload) = pool::run_free(name, bytes, payload) {
         log::warn!("{name}: the free lane has no worker left; deferring the drop instead");
-        defer_drop(name, payload);
+        file_deferred(name, bytes, payload);
     }
     #[cfg(target_arch = "wasm32")]
-    defer_drop(name, payload);
+    file_deferred(name, bytes, payload);
 }
 
 /// [`discard`] each item of `payloads` separately.
@@ -53,11 +57,11 @@ type DeferredDrop = (&'static str, u64, Box<dyn std::any::Any + Send>);
 /// **A payload that says what freeing it will give back**, for a caller that
 /// knows — an evicted volume's sweep, priced at its gate bytes.
 ///
-/// Hand one to [`discard`] / [`discard_each`] like any other payload: the
-/// queue recognises the type when it files it, takes `bytes` as the entry's
-/// price and queues `payload` itself, so no wrapper waits in the queue and the
-/// callers' spelling does not change. An unwrapped payload is priced at its
-/// own struct size, which is a floor and says so in [`deferred_drop_bytes`].
+/// Hand one to [`discard`] / [`discard_each`] like any other payload:
+/// [`discard`] recognises the type as it routes it, takes `bytes` as the
+/// payload's price and hands on `payload` itself, so no wrapper travels and
+/// the callers' spelling does not change. An unwrapped payload is priced at
+/// its own struct size, which is a floor and says so in [`deferred_drop_bytes`].
 pub struct Priced {
     /// What dropping `payload` frees, as the caller knows it. A refcount
     /// decrement that frees nothing certain is honestly 0.
@@ -80,12 +84,6 @@ thread_local! {
     /// A `VecDeque`, so the longest-waiting entry goes next.
     static DEFERRED_DROPS: RefCell<std::collections::VecDeque<DeferredDrop>> =
         const { RefCell::new(std::collections::VecDeque::new()) };
-
-    /// The prices of every entry in the queue, summed: added at
-    /// [`defer_drop`], subtracted as [`drain_deferred_drops`] frees. Kept
-    /// beside the queue rather than folded over it, so a reader on the
-    /// telemetry tick pays one load and not a walk.
-    static DEFERRED_DROP_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// File `payload` for [`drain_deferred_drops`] to retire. Reached on wasm for
@@ -98,6 +96,18 @@ thread_local! {
 /// "settled" over entries nobody priced. A declared price below the struct's
 /// own size is raised to it for the same reason.
 pub fn defer_drop(name: &'static str, payload: Box<dyn std::any::Any + Send>) {
+    let (bytes, payload) = priced_parts(payload);
+    file_deferred(name, bytes, payload);
+}
+
+/// **What freeing `payload` gives back, and the payload itself.** The one
+/// place a [`Priced`] is unwrapped, shared by both of [`discard`]'s routes so
+/// neither can price a payload differently from the other.
+///
+/// A declared price is taken as given but floored at the payload's own struct
+/// size, and an unpriced payload counts that size alone. The floor is what
+/// makes a total of zero mean "nothing held" rather than "nothing priced".
+fn priced_parts(payload: Box<dyn std::any::Any + Send>) -> (u64, Box<dyn std::any::Any + Send>) {
     let (declared, payload) = match payload.downcast::<Priced>() {
         Ok(priced) => {
             let Priced { bytes, payload } = *priced;
@@ -105,8 +115,15 @@ pub fn defer_drop(name: &'static str, payload: Box<dyn std::any::Any + Send>) {
         }
         Err(payload) => (0, payload),
     };
-    let bytes = declared.max(std::mem::size_of_val(&*payload) as u64);
-    DEFERRED_DROP_BYTES.with(|total| total.set(total.get().saturating_add(bytes)));
+    (
+        declared.max(std::mem::size_of_val(&*payload) as u64),
+        payload,
+    )
+}
+
+/// Push an already-priced payload onto this thread's deferred queue.
+fn file_deferred(name: &'static str, bytes: u64, payload: Box<dyn std::any::Any + Send>) {
+    squallar_device_profile::discard_ledger::queue_filed(bytes);
     DEFERRED_DROPS.with(|q| q.borrow_mut().push_back((name, bytes, payload)));
 }
 
@@ -115,20 +132,26 @@ pub fn has_deferred_drops() -> bool {
     DEFERRED_DROPS.with(|q| !q.borrow().is_empty())
 }
 
-/// **Bytes this thread has been handed to free and has not freed yet**: the
-/// queue's entries at the prices they were filed at (see [`defer_drop`]).
+/// **Bytes this thread's DEFERRED QUEUE has been handed and has not freed
+/// yet**: its entries at the prices they were filed at (see [`defer_drop`]).
 ///
-/// Zero exactly when the queue is empty. Otherwise a floor on what the drain
+/// Zero exactly when that queue is empty. Otherwise a floor on what the drain
 /// will give back: a caller that knows what its payload holds says so with a
 /// [`Priced`] — an evicted volume's sweeps arrive priced at their gate bytes —
 /// and everything filed without a price (a render-cache entry, an extract, a
 /// tile body, a shared `Arc`) counts its own struct size and nothing behind
-/// it. Published as the heap
-/// census's `deferred drops` family, which is what a reader of live bytes
-/// waits on before calling a fall "settled": an eviction's bytes leave this
-/// figure over as many frames as the drain's budget takes to reach them.
+/// it.
+///
+/// **One of [`discard`]'s two routes, and on native not the one that runs.**
+/// A native discard rides the pool's `rd-free` lane and is counted there, so
+/// this figure is a structural zero on that target and says nothing about what
+/// is in flight. The question "what has been discarded and not yet freed" is
+/// answered for both routes by
+/// `squallar_device_profile::discard_ledger::in_flight_bytes`, which is what
+/// the heap census's `deferred drops` family reads and what a reader of live
+/// bytes waits on before calling a fall "settled".
 pub fn deferred_drop_bytes() -> u64 {
-    DEFERRED_DROP_BYTES.with(std::cell::Cell::get)
+    squallar_device_profile::discard_ledger::queued_bytes()
 }
 
 /// Free deferred payloads until `budget` is spent, and answer how many went.
@@ -162,7 +185,7 @@ pub fn drain_deferred_drops(budget: std::time::Duration) -> usize {
         // After the drop, so the total reads "queued and not yet freed" to
         // the byte; a `Drop` that files something of its own adds to the
         // total in between, which is the truth of that moment.
-        DEFERRED_DROP_BYTES.with(|total| total.set(total.get().saturating_sub(bytes)));
+        squallar_device_profile::discard_ledger::queue_freed(bytes);
         freed += 1;
         let elapsed = started.elapsed();
         #[cfg(not(target_arch = "wasm32"))]

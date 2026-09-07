@@ -49,8 +49,10 @@ struct Pool {
     free: mpsc::Sender<Doomed>,
 }
 
-/// A payload on its way to the free lane, and the name it was discarded under.
-type Doomed = (&'static str, Box<dyn std::any::Any + Send>);
+/// A payload on its way to the free lane, the name it was discarded under, and
+/// what freeing it gives back — carried so the lane can take the bytes off
+/// `discard_ledger`'s total at the drop, wherever the price was decided.
+type Doomed = (&'static str, u64, Box<dyn std::any::Any + Send>);
 
 /// Started on first use rather than at launch, so a build that never offloads
 /// anything never pays for the threads.
@@ -80,11 +82,16 @@ fn start() -> Pool {
 
     // One thread, deliberately: frees serialise on the allocator.
     let (free, free_rx) = mpsc::channel();
-    lane("rd-free", 1, free_rx, |(name, payload): Doomed| {
+    lane("rd-free", 1, free_rx, |(name, bytes, payload): Doomed| {
         let started = web_time::Instant::now();
         // A `Drop` that panics must not take the lane's only thread with it, or
         // every later discard queues behind a receiver nobody is draining.
-        if guarded(name, move || drop(payload)).is_none() {
+        let panicked = guarded(name, move || drop(payload)).is_none();
+        // After the drop, and on the panicking arm too: a payload that panicked
+        // part-way through its teardown is not coming back, and leaving its
+        // bytes on the total would make the lane read permanently loaded.
+        squallar_device_profile::discard_ledger::lane_freed(bytes);
+        if panicked {
             log::error!("{name}: a payload panicked while being freed");
         }
         log::debug!(
@@ -196,17 +203,32 @@ fn guarded<T>(kind: &'static str, f: impl FnOnce() -> T) -> Option<T> {
     }
 }
 
-/// Hand `payload` to the free lane. [`super::discard`]'s native arm.
+/// Hand `payload`, priced at `bytes`, to the free lane. [`super::discard`]'s
+/// native arm.
 ///
 /// `Err` carries the payload back: the queue is unbounded, so a refusal is a
 /// lane with no live worker and never back-pressure. The caller's answer is not
 /// to free it where it stands — [`super::discard`] files it in the deferred
 /// queue instead.
+///
+/// **This is the seam the native half of the census is published at.** The
+/// depth here is bounded in effect by what could be resident to discard, not
+/// by anything this function does; what it owes a reader is the bytes, at the
+/// instant they stop being any other family's and start being the lane's.
 pub(super) fn run_free(
     name: &'static str,
+    bytes: u64,
     payload: Box<dyn std::any::Any + Send>,
 ) -> Result<(), Box<dyn std::any::Any + Send>> {
-    pool().free.send((name, payload)).map_err(|back| back.0.1)
+    // Priced BEFORE the send, and given back if the send fails. The lane can
+    // free and de-price a payload the instant it is visible on the channel, so
+    // an increment posted afterwards could arrive behind its own decrement —
+    // which saturates at zero and leaves the total permanently `bytes` high.
+    squallar_device_profile::discard_ledger::lane_filed(bytes);
+    pool().free.send((name, bytes, payload)).map_err(|back| {
+        squallar_device_profile::discard_ledger::lane_freed(bytes);
+        back.0.2
+    })
 }
 
 /// This thread's handle to the pool: a cloned `mpsc::Sender`, `Send` but not

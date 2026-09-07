@@ -18,6 +18,12 @@
 //!   loop would cost, priced as a difference of [`fit`]'s own model over two
 //!   scenes, and whether the pools have room for it. [`fit`] answers after
 //!   the bytes are committed; this answers before.
+//! * the discard ledger in [`discard_ledger`] — two byte counters over the
+//!   payloads `squallar_worker::offload::discard` has handed away and nothing
+//!   has finished freeing. It sits here for [`hist`]'s reason: the filler
+//!   (`squallar-worker`) and the reader (`squallar-egui`'s heap census) are on
+//!   opposite sides of a crate boundary, and this is the one crate both stand
+//!   on without a cycle;
 //! * the fixed-shape latency histogram in [`hist`] — pure integer arithmetic
 //!   over a compile-time bin layout. It sits here, under both the UI and the
 //!   wgpu boundary, because both sides read one: the recorder fills on the
@@ -30,6 +36,7 @@
 pub mod admit;
 pub mod budget;
 pub mod constants;
+pub mod discard_ledger;
 pub mod fit;
 pub mod hist;
 pub mod linear_memory;

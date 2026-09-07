@@ -290,3 +290,104 @@ fn a_native_discard_stays_out_of_the_lane_a_pan_is_waiting_on() {
          does not queue ahead of the overlay renders in rd-opaque",
     );
 }
+
+/// **The native route is counted, and counted at the seam.** A discard is in
+/// `discard_ledger`'s total from the moment the frame thread lets go of it
+/// until the lane has finished the drop.
+///
+/// That window is exactly what the heap census's `deferred drops` family
+/// exists to show, and exactly what read zero before the ledger: native's
+/// discards never touch [`DEFERRED_DROPS`], so a family reading the queue
+/// alone reported nothing in flight while the lane held the bytes.
+///
+/// The price is MiB-scale on purpose. The lane's total is process-wide and
+/// other tests in this binary file onto it too, but every one of them hands
+/// over a pointer-sized sentinel, so nothing but this payload can put the
+/// total near [`PRICE`] and the assertions can be absolute.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_native_discard_is_counted_in_flight_until_the_lane_has_freed_it() {
+    use squallar_device_profile::discard_ledger;
+
+    const PRICE: u64 = 64 << 20;
+
+    /// Stops inside `Drop` so the test can read the ledger at the one instant
+    /// the payload is genuinely in flight: handed over, not yet freed.
+    struct HeldOpen {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Drop for HeldOpen {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            // `Err` once the test drops its end, which is the release.
+            let _ = self.release.recv();
+        }
+    }
+
+    let (entered, has_entered) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    discard(
+        "test-in-flight",
+        Priced::new(
+            PRICE,
+            HeldOpen {
+                entered,
+                release: released,
+            },
+        ),
+    );
+
+    has_entered
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the free lane must reach the drop");
+    assert!(
+        discard_ledger::in_flight_bytes() >= PRICE,
+        "a payload the lane is still holding must read as in flight, not settled; \
+         the total was {} B",
+        discard_ledger::in_flight_bytes(),
+    );
+
+    // Let the drop finish. The de-price lands after it returns, so wait for it
+    // rather than assuming the handover and the free are one instant.
+    drop(release);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while discard_ledger::lane_bytes() >= PRICE && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(
+        discard_ledger::lane_bytes() < PRICE,
+        "a freed payload must leave the total; it read {} B",
+        discard_ledger::lane_bytes(),
+    );
+}
+
+/// The wasm route reaches the same total, so one family covers both. The
+/// queue's half is thread-local, so this thread's figure is its own and the
+/// lane's concurrent traffic cannot move it.
+#[test]
+fn a_deferred_payload_is_counted_in_the_same_in_flight_total() {
+    use squallar_device_profile::discard_ledger;
+
+    empty_the_queue();
+    assert_eq!(discard_ledger::queued_bytes(), 0);
+    defer_drop(
+        "test-queue-in-flight",
+        Box::new(Priced::new(32 << 20, vec![0u8; 16])),
+    );
+    assert_eq!(
+        discard_ledger::queued_bytes(),
+        32 << 20,
+        "the queue's bytes must reach the total the census reads"
+    );
+    assert!(
+        discard_ledger::in_flight_bytes() >= 32 << 20,
+        "and the sum must carry them"
+    );
+    assert_eq!(drain_deferred_drops(AMPLE), 1);
+    assert_eq!(
+        discard_ledger::queued_bytes(),
+        0,
+        "and leave it once the drain has freed them"
+    );
+}

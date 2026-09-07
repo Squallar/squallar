@@ -241,15 +241,6 @@ families! {
          and rasterizes. Published by the rasterization worker, the only \
          instance that runs a job off the wire; zero on the page, where it is \
          a real zero.";
-    DEFERRED_DROP_BYTES, deferred_drop_bytes, set_deferred_drop_bytes,
-        "Evicted and NOT YET FREED: what `squallar_worker::offload::discard` \
-         is holding for the frame-paced drain, at the prices its entries were \
-         filed at - an evicted volume's sweeps at their gate bytes, anything \
-         filed unpriced at its own struct size. A floor, and zero exactly when \
-         the queue is empty. Bytes an eviction has already taken out of the \
-         families above and that live bytes will not give back until the \
-         drain reaches them, so a reader of live bytes waits on this before \
-         calling a fall settled.";
     TILE_MESH_BYTES, tile_mesh_bytes, set_tile_mesh_bytes,
         "Tile mesh buffers the renderer is holding. **GPU**, kept beside the \
          others for the reader; [`Census::resident_total`] leaves it out.";
@@ -278,6 +269,41 @@ families! {
          index plane, value plane and transfer table. The GPU textures built \
          from them are the device's and are not this figure.";
     @read
+    deferred_drop_bytes = squallar_device_profile::discard_ledger::in_flight_bytes(),
+        "Evicted and NOT YET FREED: what `squallar_worker::offload::discard` \
+         has handed away and nothing has finished freeing, at the prices its \
+         payloads were filed at - an evicted volume's sweeps at their gate \
+         bytes, anything filed unpriced at its own struct size. A floor, and \
+         zero exactly when nothing is in flight. Bytes an eviction has \
+         already taken out of the families above and that live bytes will not \
+         give back until the drop lands, so a reader of live bytes waits on \
+         this before calling a fall settled. \
+         BOTH ROUTES, which is the point: a discard rides the job pool's \
+         one-thread `rd-free` lane on native and the frame-paced deferred \
+         queue on wasm, and each target's other route is structurally zero. \
+         Summed, not picked, because a payload is in exactly one. \
+         This family used to read the deferred queue ALONE, which on native \
+         is the route that never runs, so it reported 0 while the lane held \
+         the real bytes. That is the failure worth naming: a family \
+         structurally zero on a whole target does not read as broken, it \
+         reads as HEALTHY - nothing in flight, nothing to worry about - and \
+         the sentence above telling a reader to wait on it turns that into an \
+         immediate all-clear at exactly the moment, an allocation refusal, \
+         when the reader most needs the truth. 604 MiB reported as 0 is not a \
+         missing measurement but a confident wrong one, which is worse: a \
+         missing family shows up in the residual, a false zero does not. \
+         READ THROUGH, not published, for `render pool`'s reason: `census()` \
+         reads the ledger's counters at the instant of the read, so the 2 s \
+         tick and the allocation-error hook see the same truth. A tick \
+         publish would miss a burst almost every time one happened - the \
+         window is 27.9 ms for 604 MiB natively and about 0.67 s on wasm, \
+         where the drain pays out in 500 us slices. The 604 MiB is the \
+         desktop resident cap's ARITHMETIC - 8 volumes at the 74.63 MiB \
+         documented maximum - exercised by a probe, not an observed peak. \
+         The window scales with ALLOCATION COUNT, not bytes: a volume is \
+         ~43k buffers whether it is median or maximum shape, and freeing \
+         391 MiB took 25.3 ms against 604 MiB's 27.9 ms. Do not size this \
+         against megabytes.";
     render_pool_bytes = squallar_radar::render::parked_bytes() as u64,
         "Render buffers `squallar_radar` is PARKING between renders - the \
          plan-view cell buffer, RGBA texture and value grid, and the section \
