@@ -1227,3 +1227,491 @@ fn a_cross_section_frame_is_priced_from_its_own_three_buffers() {
         assert_eq!(cost.host_held * 4, cost.gpu * 9, "{}", arm.name);
     }
 }
+
+// ---------------------------------------------------------------------------
+// The polar frame price. Nothing in the tree calls `polar_frame_cost` outside
+// this block, and the first test below is what says so.
+// ---------------------------------------------------------------------------
+
+/// The three shapes design §2.1 names for the families phase A migrates, and
+/// the one HHC lands on. Observations of what those families produce — **not**
+/// bounds; the bounds are `MAX_POLAR_RADIALS` and `MAX_POLAR_GATES`.
+const SURVEILLANCE: (usize, usize) = (720, 1832);
+const DOPPLER: (usize, usize) = (720, 1192);
+const HHC: (usize, usize) = (360, 920);
+
+fn shape(dims: (usize, usize), levels: usize, retained: bool) -> PolarFrameShape {
+    PolarFrameShape {
+        radials: dims.0,
+        gates: dims.1,
+        width_bytes: POLAR_CODE_R8_BYTES,
+        sweeps: 1,
+        mip_levels: levels,
+        codes_retained: retained,
+    }
+}
+
+/// **The mip chain the long way, in a second implementation** — a level list
+/// built by repeated ceil-halving, each level's texels multiplied out and
+/// summed. Shares no line with `chain_texels`: it materialises the extents
+/// rather than accumulating, so a defect in the accumulator cannot hide here.
+fn chain_the_long_way(radials: usize, gates: usize, levels: usize) -> usize {
+    if radials == 0 || gates == 0 {
+        return 0;
+    }
+    let mut extents = Vec::new();
+    let (mut r, mut g) = (radials, gates);
+    for _ in 0..levels {
+        extents.push((r, g));
+        r = if r > 1 {
+            (r as f64 / 2.0).ceil() as usize
+        } else {
+            1
+        };
+        g = if g > 1 {
+            (g as f64 / 2.0).ceil() as usize
+        } else {
+            1
+        };
+    }
+    extents.into_iter().map(|(r, g)| r * g).sum()
+}
+
+/// **The mip chain as WebGPU would size it** — `max(1, floor(size / 2^level))`
+/// — for the comparison that shows the ceil form cannot under-price.
+fn chain_floor_halved(radials: usize, gates: usize, levels: usize) -> usize {
+    (0..levels)
+        .map(|l| (radials >> l).max(1) * (gates >> l).max(1))
+        .sum()
+}
+
+/// **`chain_texels` against a second implementation of the same sum**, over
+/// every shape the design names and a sweep of hostile ones, at every level
+/// count from one to past the full chain.
+///
+/// Not against a recorded number: a pinned total proves the sum has not moved,
+/// not that it was ever right. The long way builds the level list explicitly
+/// and multiplies each level out.
+#[test]
+fn the_mip_chain_equals_the_sum_computed_the_long_way() {
+    let mut checked = 0usize;
+    for (r, g) in [
+        SURVEILLANCE,
+        DOPPLER,
+        HHC,
+        (360, 230),
+        (1, 1),
+        (1, 2048),
+        (2048, 1),
+        (3, 5),
+        (721, 1833),
+        (MAX_POLAR_RADIALS, MAX_POLAR_GATES),
+        (0, 1832),
+        (720, 0),
+    ] {
+        for levels in 1..=(full_mip_levels(r.max(1), g.max(1)) + 3) {
+            assert_eq!(
+                chain_texels(r, g, levels),
+                chain_the_long_way(r, g, levels),
+                "chain_texels({r}, {g}, {levels})",
+            );
+            checked += 1;
+        }
+    }
+    // The instrument has to have been pointed at something: a loop that ran
+    // zero times passes every assertion inside it.
+    assert!(checked > 100, "only {checked} shape/level pairs compared");
+}
+
+/// **The closed form, both sides of it.**
+///
+/// A square chain sums to the clean `4/3`; a `radials × gates` one does not,
+/// and the ceilings admit no exact expression. What is exact is the bracket
+///
+/// ```text
+/// (4/3)·R·G·(1 − 4^-L)  ≤  chain  <  (4/3)·R·G + 2(R+G) + L
+/// ```
+///
+/// and the square power-of-two identity `(4^(k+1) − 1)/3` the 4/3 comes from.
+#[test]
+fn the_mip_chain_closed_form_brackets_the_long_sum() {
+    for (r, g) in [SURVEILLANCE, DOPPLER, HHC, (360, 230), (3, 5), (1024, 1024)] {
+        let levels = full_mip_levels(r, g);
+        let exact = chain_texels(r, g, levels) as f64;
+        let rg = (r * g) as f64;
+        let lower = 4.0 / 3.0 * rg * (1.0 - 4f64.powi(-(levels as i32)));
+        let upper = 4.0 / 3.0 * rg + 2.0 * (r + g) as f64 + levels as f64;
+        assert!(
+            lower <= exact && exact < upper,
+            "{r}x{g} at {levels} levels: {lower} <= {exact} < {upper} does not hold",
+        );
+        // The design's own upper bound is the same statement with `2L` in
+        // place of `L` — true, and looser. Both are asserted so a later
+        // tightening cannot silently break the document's version.
+        assert!(exact < 4.0 / 3.0 * rg + 2.0 * (r + g) as f64 + 2.0 * levels as f64);
+    }
+
+    // The exact identity a SQUARE power-of-two chain has, which is where the
+    // clean 4/3 comes from and why a non-square one has no equivalent.
+    for k in 1..=11u32 {
+        let side = 1usize << k;
+        assert_eq!(
+            chain_texels(side, side, full_mip_levels(side, side)),
+            ((4usize.pow(k + 1)) - 1) / 3,
+            "a {side}x{side} full chain is (4^(k+1) - 1)/3",
+        );
+    }
+
+    // And the factor at the two real shapes, off the sum rather than assumed.
+    // Six figures, because the design quotes six and one of them is a slip.
+    let factor =
+        |(r, g): (usize, usize)| chain_texels(r, g, full_mip_levels(r, g)) as f64 / (r * g) as f64;
+    assert!((factor(SURVEILLANCE) - 1.333_418).abs() < 5e-7);
+    assert!((factor(DOPPLER) - 1.333_439).abs() < 5e-7);
+}
+
+/// **The ceil-halved chain never prices below a floor-halved one.**
+///
+/// Design §2.1 halves by `ceil`; WebGPU sizes a mip level `max(1, floor(size /
+/// 2^level))`. Nothing in this tree builds a chain yet, so the code cannot
+/// arbitrate — but the price must be conservative whichever the renderer picks,
+/// and `ceil(x) >= max(1, floor(x))` for every `x > 0` makes it termwise so.
+///
+/// The control is the second assertion: at the real shapes the two forms
+/// **differ**, so this is not a comparison of a function with itself.
+#[test]
+fn ceil_halving_never_underprices_a_floor_halved_chain() {
+    let mut differed = 0usize;
+    for (r, g) in [
+        SURVEILLANCE,
+        DOPPLER,
+        HHC,
+        (360, 230),
+        (3, 5),
+        (721, 1833),
+        (MAX_POLAR_RADIALS, MAX_POLAR_GATES),
+    ] {
+        for levels in 1..=full_mip_levels(r, g) {
+            let ceiled = chain_texels(r, g, levels);
+            let floored = chain_floor_halved(r, g, levels);
+            assert!(
+                ceiled >= floored,
+                "{r}x{g} at {levels}: ceil chain {ceiled} < floor chain {floored}",
+            );
+            if ceiled != floored {
+                differed += 1;
+            }
+        }
+    }
+    assert!(
+        differed > 0,
+        "the two halvings agreed everywhere, so this test compared a function \
+         with itself and would pass on a `chain_floor_halved` that called \
+         `chain_texels`",
+    );
+    // The gap at the surveillance shape, so its size is on the record: 201
+    // texels on 1,758,832 — immaterial to a budget, material to the upload.
+    let levels = full_mip_levels(SURVEILLANCE.0, SURVEILLANCE.1);
+    assert_eq!(
+        chain_texels(SURVEILLANCE.0, SURVEILLANCE.1, levels)
+            - chain_floor_halved(SURVEILLANCE.0, SURVEILLANCE.1, levels),
+        201,
+    );
+}
+
+/// **`FrameCost` keeps its meaning under the polar terms**, term by term
+/// against the buffers, and the host pair adds rather than alternates for the
+/// plan view's own reason: the chain is reduced *from* the level-0 codes, so
+/// the codes are still allocated when the deepest level exists.
+#[test]
+fn a_polar_frame_is_priced_from_its_own_buffers() {
+    let levels = full_mip_levels(SURVEILLANCE.0, SURVEILLANCE.1);
+    let base = SURVEILLANCE.0 * SURVEILLANCE.1 * POLAR_CODE_R8_BYTES;
+    let chain = chain_texels(SURVEILLANCE.0, SURVEILLANCE.1, levels) * POLAR_CODE_R8_BYTES;
+
+    // A still pane: codes retained, because a hover reads them.
+    let still = polar_frame_cost(shape(SURVEILLANCE, levels, true));
+    assert_eq!(still.gpu, chain, "the code texture and its whole chain");
+    assert_eq!(still.host_held, base, "the level-0 codes a readout reads");
+    assert_eq!(still.host_scratch, chain - base, "the mip tail");
+    assert_eq!(
+        still.host_peak(),
+        chain,
+        "held + scratch is the whole chain exactly: the codes are still \
+         allocated at the instant the deepest level exists",
+    );
+    assert_eq!(still.host_peak(), still.host_held + still.host_scratch);
+
+    // A loop frame under the SHIPPED default: codes dropped after upload.
+    // `host_held` falls to zero; `host_scratch` does NOT, because the codes
+    // must exist to be reduced.
+    let looped = polar_frame_cost(shape(SURVEILLANCE, levels, false));
+    assert_eq!(looped.gpu, still.gpu, "the GPU term is unaffected");
+    assert_eq!(looped.host_held, 0);
+    assert_eq!(looped.host_scratch, chain - base);
+    assert_eq!(looped.host_peak(), chain - base);
+    assert!(
+        looped.host_peak() < still.host_peak(),
+        "retention has to be visible in the price or the two arms are one",
+    );
+
+    // `Reduce::None` — HHC and PHI, one level — makes the scratch exactly
+    // zero, and the GPU term exactly the base plane.
+    let flat = polar_frame_cost(shape(HHC, 1, true));
+    assert_eq!(flat.host_scratch, 0, "one level is the base plane exactly");
+    assert_eq!(flat.gpu, HHC.0 * HHC.1 * POLAR_CODE_R8_BYTES);
+    assert_eq!(flat.host_peak(), flat.host_held);
+
+    // Sweeps multiply every per-frame term and nothing else.
+    let three = PolarFrameShape {
+        sweeps: 3,
+        ..shape(SURVEILLANCE, levels, true)
+    };
+    let cost = polar_frame_cost(three);
+    assert_eq!(cost.gpu, 3 * still.gpu);
+    assert_eq!(cost.host_held, 3 * still.host_held);
+    assert_eq!(cost.host_scratch, 3 * still.host_scratch);
+
+    // The R16 widening is a width, not a second function.
+    let wide = PolarFrameShape {
+        width_bytes: POLAR_CODE_R16_BYTES,
+        ..shape(SURVEILLANCE, levels, true)
+    };
+    assert_eq!(polar_frame_cost(wide).host_peak(), 2 * still.host_peak());
+}
+
+/// **The byte comparison this seam exists for**, at the side a desktop arm
+/// really renders a surveillance cut at — not at a nominal 2048.
+///
+/// `data_limited_side_px` puts a 1832-gate cut at ±460.125 km at **7362 px**,
+/// bound by the sweep's own gates and not by `DESKTOP_RASTER_SIDE_CEILING`
+/// (`the_desktop_raster_ceiling_is_the_widest_sweeps_own_need_and_no_panes`
+/// pins that reading). So the raster this replaces is 827.0 MiB of host peak
+/// for a picture that lands in a pane under 1920 px across.
+///
+/// | | raster @ 7362 | polar, one tilt | ratio |
+/// |---|---:|---:|---:|
+/// | GPU | 216,796,176 | 1,758,832 | 123× |
+/// | host held (still) | 433,592,352 | 1,319,040 | 329× |
+/// | host scratch | 433,592,352 | 439,792 | 986× |
+/// | **host peak** | **867,184,704** | **1,758,832** | **493×** |
+///
+/// The design's §6.1 table quotes the ratio against side 2048 (0.105× GPU),
+/// which is the right comparison for a loop frame and the wrong one for the
+/// still this campaign's 827 MiB `render pools` figure came from.
+#[test]
+fn what_a_polar_frame_costs_against_the_raster_it_replaces() {
+    use squallar_radar::types::{data_limited_side_px, plan_view_extent_km};
+
+    // The side, re-derived rather than pinned, so a change to the sizing rule
+    // moves this comparison instead of leaving it quoting a stale number.
+    const SURVEILLANCE_REACH_KM: f64 = 460.125;
+    const SUPER_RES_GATE_KM: f64 = 0.25;
+    let side = data_limited_side_px(
+        plan_view_extent_km(SURVEILLANCE_REACH_KM),
+        SUPER_RES_GATE_KM,
+    );
+    assert_eq!(
+        side, 7362,
+        "the observed data-bound side of a surveillance cut"
+    );
+
+    let raster = plan_view_frame_cost(side);
+    assert_eq!(raster.gpu, 216_796_176);
+    assert_eq!(raster.host_held, 433_592_352);
+    assert_eq!(raster.host_scratch, 433_592_352);
+    assert_eq!(raster.host_peak(), 867_184_704);
+    assert_eq!(raster.host_peak() / (1024 * 1024), 827);
+
+    let levels = full_mip_levels(SURVEILLANCE.0, SURVEILLANCE.1);
+    let polar = polar_frame_cost(shape(SURVEILLANCE, levels, true));
+    assert_eq!(polar.gpu, 1_758_832);
+    assert_eq!(polar.host_held, 1_319_040);
+    assert_eq!(polar.host_scratch, 439_792);
+    assert_eq!(polar.host_peak(), 1_758_832);
+
+    // The ratio, integer-floored so it cannot be read as more precise than it
+    // is. 493x is the number the admission door must never be wrong about.
+    assert_eq!(raster.host_peak() / polar.host_peak(), 493);
+    assert_eq!(raster.gpu / polar.gpu, 123);
+
+    // And against the design's own denominator, so both readings are on the
+    // record and neither can be quoted as the other. §6.1's table is side 2048.
+    let at_2048 = plan_view_frame_cost(2048);
+    assert_eq!(at_2048.gpu, 16_777_216);
+    assert_eq!(at_2048.host_peak(), 67_108_864);
+    assert_eq!(at_2048.host_peak() / polar.host_peak(), 38);
+
+    // The Doppler figure, which shares no denominator with either of the above.
+    let doppler = polar_frame_cost(shape(DOPPLER, full_mip_levels(DOPPLER.0, DOPPLER.1), true));
+    assert_eq!(doppler.host_peak(), 1_144_411);
+}
+
+/// **The per-sweep-key terms are not in the per-frame price**, and charging
+/// them there would over-count a loop by its frame count.
+#[test]
+fn the_lut_and_the_edge_table_are_per_sweep_key_not_per_frame() {
+    assert_eq!(POLAR_LUT_BYTES, 1_024);
+    assert_eq!(polar_drawn_edge_bytes(720), 5_760);
+    // The prose in `squallar_radar::hover` calls that "5.8 KiB". It is 5.625
+    // KiB — 5.76 kB decimal — and the two prefixes are not the same number.
+    assert_ne!(polar_drawn_edge_bytes(720), (5.8 * 1024.0) as usize);
+
+    // Neither is in a frame's price: the whole host peak is the chain, with
+    // no room left over for a 1,024 B table or a 5,760 B one. So a 60-frame
+    // loop is 60 x the frame cost and ONE LUT, not 60 LUTs.
+    let levels = full_mip_levels(SURVEILLANCE.0, SURVEILLANCE.1);
+    let cost = polar_frame_cost(shape(SURVEILLANCE, levels, true));
+    let base = SURVEILLANCE.0 * SURVEILLANCE.1 * POLAR_CODE_R8_BYTES;
+    let chain = chain_texels(SURVEILLANCE.0, SURVEILLANCE.1, levels) * POLAR_CODE_R8_BYTES;
+    assert_eq!(cost.host_held + cost.host_scratch, chain);
+    assert_eq!(cost.host_held, base);
+    assert_eq!(cost.gpu, chain);
+
+    // The control: a price that HAD folded them in would read differently, and
+    // by an amount this assertion can see. Without this line the three above
+    // pass on any function whose terms happen to sum to the chain.
+    let with_tables = chain + POLAR_LUT_BYTES + polar_drawn_edge_bytes(SURVEILLANCE.0);
+    assert_ne!(cost.gpu, with_tables);
+    assert_eq!(with_tables - cost.gpu, 6_784);
+}
+
+/// **The caps are bounds, and the observed shapes are not.**
+///
+/// `MAX_POLAR_RADIALS` is twice what the RDA can declare and
+/// `MAX_POLAR_GATES` is the WebGL2 per-axis guarantee verbatim. A payload past
+/// either is refused by the producing lane rather than priced — but this seam
+/// must still price the widest admissible frame without overflowing, including
+/// on wasm32 where `usize` is 32 bits.
+#[test]
+fn the_caps_bound_the_arithmetic_and_the_observed_shapes_sit_inside_them() {
+    // NOT `assert_eq!(MAX_POLAR_GATES, WEBGL2_MAX_TEXTURE_DIMENSION_2D)` —
+    // the const is DEFINED as that expression, so such an assertion cannot
+    // fail and would be evidence of nothing. The values are pinned in the
+    // const-assert block; what is testable here is the property that makes
+    // these caps BOUNDS rather than observed maxima.
+    assert_eq!(MAX_POLAR_GATES, 2_048);
+    assert_eq!(MAX_POLAR_RADIALS, 1_440);
+
+    // Every shape the design observes is STRICTLY inside both caps. An
+    // observed maximum is not a bound: a cap equal to the widest thing seen
+    // says only that nothing wider has been seen yet.
+    let observed = [SURVEILLANCE, DOPPLER, HHC, (360, 230)];
+    let widest_radials = observed.iter().map(|s| s.0).max().expect("non-empty");
+    let widest_gates = observed.iter().map(|s| s.1).max().expect("non-empty");
+    assert!(
+        widest_radials < MAX_POLAR_RADIALS,
+        "the radial cap {MAX_POLAR_RADIALS} is the widest observed sweep          ({widest_radials}), which makes it an observation and not a bound",
+    );
+    assert!(
+        widest_gates < MAX_POLAR_GATES,
+        "the gate cap {MAX_POLAR_GATES} is the widest observed sweep          ({widest_gates}), which makes it an observation and not a bound",
+    );
+    // But the gate cap is a LIVE bound, not decoration: a real surveillance
+    // cut sits in its upper half, so a sweep half again as long is refused.
+    assert!(widest_gates > MAX_POLAR_GATES / 2);
+    // The radial cap has the opposite shape and the doc says why: it is twice
+    // what the RDA can declare, so it is slack by construction.
+    assert_eq!(MAX_POLAR_RADIALS, 2 * widest_radials);
+
+    // The widest admissible frame, at the widest code, over two sweeps and the
+    // full chain: still inside a 32-bit `usize`.
+    let widest = PolarFrameShape {
+        radials: MAX_POLAR_RADIALS,
+        gates: MAX_POLAR_GATES,
+        width_bytes: POLAR_CODE_R16_BYTES,
+        sweeps: 2,
+        mip_levels: full_mip_levels(MAX_POLAR_RADIALS, MAX_POLAR_GATES),
+        codes_retained: true,
+    };
+    let cost = polar_frame_cost(widest);
+    assert!(cost.host_peak() < u32::MAX as usize, "{}", cost.host_peak());
+    // And it is still an order of magnitude under one raster at 7362.
+    assert!(cost.host_peak() * 10 < plan_view_frame_cost(7362).host_peak());
+}
+
+/// **Nothing in this workspace calls the polar price outside its own tests.**
+///
+/// The safety constraint this seam lands under: `polar_frame_cost` prices
+/// ~493x below what the renderer actually allocates today, so a call site on
+/// any path reaching `crate::fit::NeedTerms` would have the admission door
+/// admit a scene costing ~493x its price. The switch must be keyed on what the
+/// renderer produced for that frame — never a build flag, never a feature gate.
+///
+/// A source scrape, because that is the only instrument that can see a call
+/// site this crate does not compile. It reads the whole workspace tree, and
+/// the second half proves the scrape is sensitive: the same walk finds the
+/// call sites of `plan_view_frame_cost`, which are many.
+#[test]
+fn nothing_selects_the_polar_price_yet() {
+    use std::fs;
+    use std::path::Path;
+
+    fn walk(dir: &Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if !matches!(name.as_ref(), "target" | ".git" | "node_modules" | "pkg") {
+                    walk(&path, out);
+                }
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && let Ok(text) = fs::read_to_string(&path)
+            {
+                out.push((path, text));
+            }
+        }
+    }
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the crate sits one level under the workspace root")
+        .to_path_buf();
+    let mut files = Vec::new();
+    walk(&root, &mut files);
+    assert!(
+        files.len() > 200,
+        "the walk found {} .rs files, which is not this workspace",
+        files.len(),
+    );
+
+    // The one file allowed to name it: this crate's constants module and its
+    // own tests, which are `constants.rs` and `constants/tests.rs`.
+    let permitted = |p: &Path| {
+        p.ends_with("squallar-device-profile/src/constants.rs")
+            || p.ends_with("squallar-device-profile/src/constants/tests.rs")
+    };
+    let offenders: Vec<_> = files
+        .iter()
+        .filter(|(p, text)| !permitted(p) && text.contains("polar_frame_cost"))
+        .map(|(p, _)| p.display().to_string())
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "polar_frame_cost is selected outside its own module: {offenders:?}. It \
+         prices ~493x below what the renderer allocates today; a call site on \
+         any path that reaches NeedTerms makes the admission door admit a \
+         scene at ~1/493 of its real cost. The switch is keyed on what the \
+         renderer PRODUCED for the frame, never on a flag.",
+    );
+
+    // The scrape is sensitive: the same walk over the same corpus finds the
+    // predecessor's call sites, which exist in several crates. A null from an
+    // instrument never shown to fire is not a null.
+    let raster_sites: Vec<_> = files
+        .iter()
+        .filter(|(p, text)| !permitted(p) && text.contains("plan_view_frame_cost"))
+        .map(|(p, _)| p.display().to_string())
+        .collect();
+    assert!(
+        raster_sites.len() >= 2,
+        "the scrape found only {} call sites of plan_view_frame_cost outside \
+         this module, so it is not reading the workspace and its null above \
+         means nothing: {raster_sites:?}",
+        raster_sites.len(),
+    );
+}

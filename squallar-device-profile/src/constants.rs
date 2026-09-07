@@ -126,6 +126,13 @@ impl FrameCost {
 /// rewrite swaps: give it the polar shape's own inputs, and every site below
 /// keeps reading a [`FrameCost`] and needs no edit.
 ///
+/// **The other half of that seam now exists**: [`polar_frame_cost`], over a
+/// [`PolarFrameShape`]. **Nothing selects it, and nothing may** until the
+/// renderer actually produces polar frames — one surveillance tilt prices
+/// ~493× apart under the two, and a budget holding the polar figure while
+/// this function's raster is what gets allocated would admit a scene ~493×
+/// its own price. See [`polar_frame_cost`] for the constraint in full.
+///
 /// The terms, each against the allocation that makes it in
 /// `squallar_radar::render`:
 ///
@@ -193,6 +200,354 @@ pub const fn raster_bytes(side: usize) -> usize {
 pub const fn converted_raster_bytes(side: usize) -> usize {
     side * side * PLAN_VIEW_TEXEL_BYTES
 }
+
+/// **The shape of one polar radar frame** — what
+/// [`polar_frame_cost`] prices, in the representation's own vocabulary.
+///
+/// [`plan_view_frame_cost`]'s single `side` cannot state this shape: a polar
+/// frame is `radials × gates` cells of `width_bytes`, repeated over `sweeps`,
+/// plus a mip chain whose texel count is not `4/3` of the base for a
+/// non-square grid. Every field is a *count*, and the arithmetic over them is
+/// [`polar_frame_cost`]'s alone, so no call site multiplies a dimension by a
+/// literal of its own — the reason `plan_view_frame_cost` exists.
+///
+/// # Nothing selects this price yet, and that is a safety property
+///
+/// **A price and a producer must not be able to disagree about which
+/// representation a frame is.** This shape prices ~1.76 MB for a surveillance
+/// tilt where `plan_view_frame_cost` prices 827 MiB at the side a real arm
+/// actually renders one at (7362 px, bound by the sweep's own 1832 gates). If
+/// anything selected the polar price while the renderer still produced a
+/// 7362 px raster, the admission door would admit a scene that then allocated
+/// ~470× what it was priced at — the mechanism of a hard freeze, with the
+/// door signing it off. See [`polar_frame_cost`].
+///
+/// # Provenance of the dimensions
+///
+/// The dims are read **from the sweep in hand and never from the VCP**
+/// (`docs/radar-polar-design.md` §2.1; radials disagree about reach, gate
+/// count and spacing — `squallar_radar::render`'s `compute_max_range`,
+/// `compute_gate_interval_km`, `compute_gate_span`). The figures below are
+/// **observations of what the families produce, not bounds on them**; the
+/// bounds are [`MAX_POLAR_RADIALS`] and [`MAX_POLAR_GATES`], and a payload
+/// past either is refused rather than priced.
+///
+/// | family | radials × gates | width | source |
+/// |---|---|---|---|
+/// | REF / RHO (surveillance) | 720 × 1832 | R8 | design §2.1, observed |
+/// | VEL / SW (Doppler) | 720 × 1192 | R8 | design §2.1, observed |
+/// | HHC | 360 × 920 | R8 | design §2.1, observed |
+/// | Level III radial | run count × `num_range_bins` | R8 | per object |
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PolarFrameShape {
+    /// Radials in the sweep — rows of the code plane. Bounded by
+    /// [`MAX_POLAR_RADIALS`].
+    pub radials: usize,
+    /// Gates along a radial — columns of the code plane, after the reach and
+    /// [`MAX_POLAR_GATES`] clamps the design's §2.2 `gates_used` applies.
+    pub gates: usize,
+    /// Bytes one gate's code occupies: [`POLAR_CODE_R8_BYTES`] today,
+    /// [`POLAR_CODE_R16_BYTES`] for the deferred 16-bit widening.
+    pub width_bytes: usize,
+    /// Sweeps this frame draws. One for a plan view of a single tilt; the
+    /// per-sweep terms multiply, the per-sweep-key terms (the LUT) do not.
+    pub sweeps: usize,
+    /// Levels in the mip chain, **counting level 0**. `1` means `Reduce::None`
+    /// — HHC and PHI — and makes [`FrameCost::host_scratch`] exactly zero.
+    /// [`full_mip_levels`] answers the full chain for a shape.
+    pub mip_levels: usize,
+    /// Whether the level-0 codes stay on the host after upload, so a readout
+    /// can decode a gate without the pinned `Arc<Scan>`.
+    ///
+    /// **A per-pane policy, not a build constant.** Design §6.1 spells this
+    /// `if CODES_RETAINED`, as if one global const decided it; §6.2 of the
+    /// same document requires it **on for a still pane** (a hover reads it —
+    /// `squallar_app::render_dispatch`'s two `values_wanted: true` sites) and
+    /// **off for a loop frame** (`values_wanted: false`,
+    /// `squallar_radar::loop_downloads`'s `frame_render_job`). One const
+    /// cannot say both, so it is a field and the caller states which pane it
+    /// is pricing.
+    pub codes_retained: bool,
+}
+
+/// **Bytes one polar radar frame costs, buffer by buffer** —
+/// [`plan_view_frame_cost`]'s successor for the representation described in
+/// `docs/radar-polar-design.md`, and the seam that document's §6.1 names.
+///
+/// # NOTHING MAY SELECT THIS PRICE UNTIL THE RENDERER PRODUCES POLAR FRAMES
+///
+/// This function is **dark**: it is called by its own tests and by nothing on
+/// any path that can reach `crate::fit::NeedTerms`. That is a hard safety
+/// constraint, not a staging convenience.
+///
+/// A surveillance tilt prices at **1,758,832 B** here and at **867,184,704 B
+/// (827.0 MiB)** under `plan_view_frame_cost(7362)` — the side a desktop arm
+/// really renders that sweep at, bound by the data's own 1832 gates and not by
+/// [`DESKTOP_RASTER_SIDE_CEILING`]. That is a factor of **493**. A budget that
+/// took the polar figure while the renderer still produced the raster would
+/// admit a scene costing ~493× its price, and `crate::admit`'s door would be
+/// the thing that signed it off. This project has already hard-frozen a user's
+/// laptop with the arithmetic pointing the *other* way.
+///
+/// So when the switch comes it must be keyed on **what the renderer actually
+/// produced for that frame** — not on a build flag, not on a feature gate, not
+/// on anything a person can flip for a demo. A price and a producer must not
+/// be able to disagree about which representation a frame is.
+///
+/// # The terms, and why the host pair adds rather than alternates
+///
+/// [`FrameCost`] keeps its meaning exactly:
+///
+/// | term | polar buffer | axis |
+/// |---|---|---|
+/// | [`FrameCost::gpu`] | the `R8Uint` code texture **and its whole mip chain** | GPU |
+/// | [`FrameCost::host_held`] | the level-0 codes, when `codes_retained` | host, held |
+/// | [`FrameCost::host_scratch`] | the mip tail the CPU builds before upload | host, scratch |
+///
+/// The scratch term **adds** to the held one for the plan view's own reason:
+/// the chain is reduced *from* the level-0 codes, so the codes are still
+/// allocated at the instant the deepest level exists. That is the same
+/// simultaneity `RenderBuffers::into_output` has, stated over different
+/// buffers.
+///
+/// Under `codes_retained` the peak is therefore exactly the chain:
+/// `host_peak() = sweeps × base + sweeps × (chain − base) = sweeps × chain`.
+/// With `codes_retained` false — the shipped loop default — `host_held` is 0
+/// and the peak is the scratch alone, which is still the mip tail and **not**
+/// zero: the codes must exist to be reduced, they are simply freed after the
+/// upload rather than kept.
+///
+/// # Not in this figure, because they are per **sweep-key**
+///
+/// The LUT ([`POLAR_LUT_BYTES`]) and the drawn-edge table
+/// ([`polar_drawn_edge_bytes`]) are shared across every frame of a loop that
+/// names one `(FieldId, scale, offset)`, so charging them per frame would
+/// over-count a loop by its frame count. Design §6.1.
+pub const fn polar_frame_cost(shape: PolarFrameShape) -> FrameCost {
+    let base = shape.radials * shape.gates * shape.width_bytes;
+    let chain = chain_texels(shape.radials, shape.gates, shape.mip_levels) * shape.width_bytes;
+    FrameCost {
+        gpu: shape.sweeps * chain,
+        host_held: if shape.codes_retained {
+            shape.sweeps * base
+        } else {
+            0
+        },
+        // `chain >= base` for every `mip_levels >= 1`, and `chain == base` at
+        // one level, so this never wraps: level 0 is the first term of the sum.
+        host_scratch: shape.sweeps * (chain - base),
+    }
+}
+
+/// **Texels in a `radials × gates` mip chain of `mip_levels` levels**,
+/// counting level 0.
+///
+/// ```text
+/// chain_texels(R, G, L) = Σ_{l=0}^{L-1} ceil(R / 2^l) · ceil(G / 2^l)
+/// ```
+///
+/// # The closed form is a bracket, not an equality, and that is the point
+///
+/// A **square** chain sums to the familiar `4/3`. A `radials × gates` one does
+/// not, and no expression free of the ceilings states it: the residual depends
+/// on the binary expansions of `R` and `G`. Writing `a_l = ceil(R/2^l) =
+/// (R + α_l)/2^l` with `α_l = (−R) mod 2^l ∈ [0, 2^l)`, and likewise `β_l` for
+/// `G`, each term is `[R·G + R·β_l + G·α_l + α_l·β_l] / 4^l`. Summing over
+/// `l < L` and using `Σ 4^-l = (4/3)(1 − 4^-L)`, `Σ α_l/4^l < Σ 2^-l < 2` and
+/// `Σ α_l·β_l/4^l < L`:
+///
+/// ```text
+/// (4/3)·R·G·(1 − 4^-L)  ≤  chain_texels(R, G, L)  <  (4/3)·R·G + 2(R+G) + L
+/// ```
+///
+/// Both sides are pinned by `the_mip_chain_closed_form_brackets_the_long_sum`.
+/// Design §6.1 states the upper bound as `+ 2L`; that is true but loose, and
+/// `+ L` is what the derivation gives.
+///
+/// The **exact** identity that does exist is the square power-of-two one: for
+/// `R = G = 2^k` over the full chain, `chain = (4^(k+1) − 1)/3`, which is
+/// `(4/3)·R·G − 1/3` and shows where the clean factor comes from.
+///
+/// At the two real surveillance shapes the factor is measured off the sum, not
+/// assumed: **1.333418** at 720 × 1832 and **1.333439** at 720 × 1192.
+/// (Design §6.1 prints `1.33338` for the first; the sum it prints in §2.4
+/// gives `1.333418`, so that factor is a slip in its last two digits. The
+/// second, `1.33344`, is right.)
+///
+/// # Ceil-halving, and why it cannot under-price
+///
+/// The extents halve by `ceil`, per design §2.1 (*"each ceil-halved"*), which
+/// is **not** how WebGPU sizes a mip level — the specification's is
+/// `max(1, floor(size / 2^level))`. Nothing in this tree builds a chain today
+/// (`mip_level_count: 1` at every site), so the code cannot arbitrate and the
+/// GPU-store lane must settle it against wgpu.
+///
+/// For the price it does not matter which wins, and it matters in the safe
+/// direction: `ceil(x) ≥ max(1, floor(x))` for every `x > 0`, so at equal
+/// level counts the ceil chain is **termwise ≥** the floor chain and this
+/// function never under-prices a frame the renderer builds the other way.
+/// Pinned by `ceil_halving_never_underprices_a_floor_halved_chain`. At
+/// 720 × 1832 the gap is 201 texels — immaterial to a budget, material to
+/// whoever writes the upload.
+pub const fn chain_texels(radials: usize, gates: usize, mip_levels: usize) -> usize {
+    // An empty sweep costs nothing, matching `PolarGeometry::is_empty`: a
+    // render that painted no gates has no plane to reduce.
+    if radials == 0 || gates == 0 {
+        return 0;
+    }
+    let mut sum = 0;
+    let (mut r, mut g) = (radials, gates);
+    let mut level = 0;
+    while level < mip_levels {
+        sum += r * g;
+        // Clamped at 1 so a chain asked for more levels than the shape has
+        // keeps adding 1×1 rather than collapsing to zero and under-pricing.
+        r = if r > 1 { ceil_half(r) } else { 1 };
+        g = if g > 1 { ceil_half(g) } else { 1 };
+        level += 1;
+    }
+    sum
+}
+
+/// **Levels in the full ceil-halved chain over `radials × gates`**, counting
+/// level 0 — the chain that runs until both extents are 1.
+///
+/// `ceil(log2(max(R, G))) + 1`, computed by halving rather than by a log so
+/// the answer and [`chain_texels`]'s own halving cannot disagree. 12 at
+/// 720 × 1832 and at 720 × 1192.
+///
+/// **Design §2.4 states `L = floor(log2 max(R,G))`, and its own arithmetic
+/// contradicts that line**: the 720 × 1832 sum it prints has twelve terms and
+/// totals 1,758,832, where `floor(log2 1832) = 10` admits eleven and totals
+/// 1,758,831. The twelve-term figure is the one §6.1 prices with, so the
+/// arithmetic is the claim that survives and the formula line is the typo.
+/// (`floor` is the right level index for a **floor**-halved chain, which is
+/// how that line reads as plausible.)
+pub const fn full_mip_levels(radials: usize, gates: usize) -> usize {
+    let (mut r, mut g) = (radials, gates);
+    let mut levels = 1;
+    while r > 1 || g > 1 {
+        r = if r > 1 { ceil_half(r) } else { 1 };
+        g = if g > 1 { ceil_half(g) } else { 1 };
+        levels += 1;
+    }
+    levels
+}
+
+/// `ceil(n / 2)`, spelled as a quotient plus its remainder so it is
+/// const-evaluable on this toolchain and cannot overflow the way `(n + 1) / 2`
+/// can at the top of the range.
+const fn ceil_half(n: usize) -> usize {
+    n / 2 + n % 2
+}
+
+/// One gate's code in the 8-bit plane every family migrated in design §7's
+/// phases A–C carries: REF, VEL, SW, RHO, ZDR-8, HHC and the five Level III
+/// radial products.
+pub const POLAR_CODE_R8_BYTES: usize = 1;
+
+/// One gate's code in the **deferred** 16-bit widening — PHI and 16-bit ZDR,
+/// design §7 phase F. Named here because [`PolarFrameShape::width_bytes`] is
+/// the only place the widening lands, and a price for it should not have to be
+/// invented at the call site when it does.
+pub const POLAR_CODE_R16_BYTES: usize = 2;
+
+/// Entries in the colour lookup an 8-bit code plane is decoded through: every
+/// code an R8 plane can hold, so the table is **exact** rather than sampled.
+pub const POLAR_LUT_ENTRIES: usize = 256;
+
+/// **Bytes one LUT costs**, on the host and on the GPU alike: 256 RGBA8
+/// entries.
+///
+/// **Per sweep-key — `(FieldId, scale, offset)` — and NOT per frame.** Every
+/// frame of a loop rendering one moment shares one table, so a per-frame
+/// charge would over-count a 60-frame loop sixtyfold. It is deliberately
+/// absent from [`polar_frame_cost`]; design §6.1.
+pub const POLAR_LUT_BYTES: usize = POLAR_LUT_ENTRIES * PLAN_VIEW_TEXEL_BYTES;
+
+/// **Bytes the drawn-edge table costs for `radials` radials**, host and GPU:
+/// each radial's trimmed `(lo, hi)` azimuth as two `f32`.
+///
+/// Per sweep-key like [`POLAR_LUT_BYTES`], and absent from
+/// [`polar_frame_cost`] for the same reason. 5,760 B at 720 radials.
+///
+/// **The successor to `PolarGeometry::resident_bytes`**, which is the same
+/// arithmetic over the same count today — `wedges.len() × size_of::<Wedge>()`,
+/// and a `Wedge` is two `f32`. `squallar_radar::hover`'s `HoverSource` calls
+/// that *"5.8 KiB for a full ring"*: 720 × 8 = 5,760 B is **5.625 KiB**, or
+/// 5.76 kB decimal, so that prose has swapped a decimal prefix for a binary
+/// one. Correcting it belongs to the lane that owns `hover.rs`.
+pub const fn polar_drawn_edge_bytes(radials: usize) -> usize {
+    radials * POLAR_DRAWN_EDGE_BYTES
+}
+
+/// One radial's drawn `(lo, hi)` azimuth pair, two `f32`.
+pub const POLAR_DRAWN_EDGE_BYTES: usize = 2 * size_of::<f32>();
+
+/// **The most radials a polar frame may declare**, past which the payload is
+/// refused rather than priced or truncated.
+///
+/// A **bound**, and derived rather than observed: twice the 720 the RDA can
+/// declare, because *"Level II declares 0.5° or 1.0° and nothing else, the RDA
+/// has no third resolution"* (`squallar_radar::render`). Design §2.2. It plays
+/// [`squallar_radar::types::MAX_EXTENT_KM`]'s role for the other axis — a
+/// ceiling on arithmetic, so a mis-framed radial claiming four thousand
+/// radials cannot size an allocation.
+pub const MAX_POLAR_RADIALS: usize = 2 * 720;
+
+/// **The most gates a polar frame may declare**, past which the payload is
+/// refused.
+///
+/// A **bound**, and the WebGL2 per-axis guarantee verbatim: the code plane is
+/// a texture, and `squallar_gpu`'s device setup pins
+/// `downlevel_webgl2_defaults().using_resolution(adapter)` on the web, which
+/// lifts resolution and nothing else. Design §2.2.
+pub const MAX_POLAR_GATES: usize = squallar_radar::types::WEBGL2_MAX_TEXTURE_DIMENSION_2D;
+
+/// Invariants of the polar pricing above, checked at compile time. Each one
+/// would make the arithmetic silently wrong rather than loudly broken.
+const _: () = const {
+    // The LUT is exact only while it has one entry per code an R8 plane can
+    // address. Widening the code without widening the table would silently
+    // sample the palette instead of reproducing it.
+    assert!(POLAR_LUT_ENTRIES == 1 << (8 * POLAR_CODE_R8_BYTES));
+    // The LUT entry is RGBA8, which is the raster texel's own width. This
+    // const is built out of `PLAN_VIEW_TEXEL_BYTES`, so if that ever stops
+    // meaning four bytes of colour the table silently re-sizes.
+    assert!(PLAN_VIEW_TEXEL_BYTES == 4);
+    assert!(POLAR_LUT_BYTES == 1024);
+    // Two `f32`, not a packed pair and not a `f64` one: the drawn-edge table
+    // is uploaded as-is.
+    assert!(POLAR_DRAWN_EDGE_BYTES == 8);
+    assert!(polar_drawn_edge_bytes(720) == 5_760);
+    // Codes 0 and 1 are sentinels (below-threshold and range-folded) and the
+    // reduce operators exclude them, so a width that could not hold both plus
+    // one real code would make every mip level a sentinel.
+    assert!(POLAR_LUT_ENTRIES > 2);
+    assert!(POLAR_CODE_R16_BYTES > POLAR_CODE_R8_BYTES);
+
+    // Level 0 is the first term, so one level is the base plane exactly and
+    // `polar_frame_cost`'s `chain - base` cannot wrap.
+    assert!(chain_texels(720, 1832, 1) == 720 * 1832);
+    assert!(chain_texels(1, 1, 1) == 1);
+    // The two real surveillance shapes, off the sum rather than off a factor.
+    assert!(chain_texels(720, 1832, full_mip_levels(720, 1832)) == 1_758_832);
+    assert!(chain_texels(720, 1192, full_mip_levels(720, 1192)) == 1_144_411);
+    assert!(full_mip_levels(720, 1832) == 12);
+    // A chain asked for more levels than the shape has keeps adding 1x1 rather
+    // than collapsing: an over-long request must never price at less than the
+    // full chain.
+    assert!(chain_texels(720, 1832, 40) == 1_758_832 + (40 - 12));
+
+    // The caps bound arithmetic, and the observed shapes sit inside them --
+    // an observed maximum is not a bound, and these are the bounds.
+    assert!(MAX_POLAR_RADIALS >= 720);
+    assert!(MAX_POLAR_GATES >= 1832);
+    assert!(MAX_POLAR_GATES == 2048);
+    // The widest frame the caps admit must not overflow a 32-bit `usize`,
+    // because these constants compile on wasm32 too. R16, 2 sweeps, full chain.
+    assert!(MAX_POLAR_RADIALS * MAX_POLAR_GATES * POLAR_CODE_R16_BYTES < (u32::MAX as usize) / 8);
+};
 
 /// **Bytes a cross-section raster of `width × height` costs, buffer by
 /// buffer** — [`plan_view_frame_cost`]'s counterpart for the other 2D view,
