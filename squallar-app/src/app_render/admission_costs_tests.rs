@@ -268,8 +268,26 @@ fn the_loop_door_charges_the_arm_and_not_the_relist() {
 /// tab reinstates itself, and this is where it is refusable.
 ///
 /// The refusal must leave the pane's own wish standing, so the config still
-/// round-trips with the loop in it, and must not re-queue: one refusal, not a
-/// spin.
+/// round-trips with the loop in it, and must not spin.
+///
+/// **"Must not spin" was asserted as "must not re-queue" until 2026-09-07,
+/// and that proxy had the defect inside it.** The reason given was that
+/// `hydrate_parked_panes` drains by `mem::take` and a re-parked entry would
+/// be re-driven on every redraw -- true at the time, and the same mechanism
+/// logged one refusal about forty times in seven seconds on the Tier-2 `long`
+/// leg. But forbidding the queue is what made a refusal terminal for the
+/// session: the user could not shorten their lookback and try again without
+/// restarting the app, and because the wish is persisted that was every
+/// session.
+///
+/// The premise is gone. `AdmissionLedger` answers a repeat of the same
+/// `(act, pane)` against the table in force from a memo -- no verdict, no log
+/// line, no re-stamped notice, no counter -- so a re-queued entry costs a
+/// lookup and nothing else. So the entry stays queued and the spin is now
+/// asserted **by measuring it**: hydrate twenty more times and show the
+/// counters did not move. That is the property the old line was reaching for,
+/// and it is checked directly rather than through a proxy that also forbade
+/// the retry.
 #[test]
 fn a_loop_a_restore_asked_for_is_refusable_and_does_not_spin() {
     let mut app = n_pane_app(1, SITE);
@@ -310,9 +328,27 @@ fn a_loop_a_restore_asked_for_is_refusable_and_does_not_spin() {
          whose refusals have no other way to the glass",
     );
     assert!(
-        app.loop_arm_pending.is_empty(),
-        "a refused arm must not re-queue: `hydrate_parked_panes` drains by \
-         `mem::take` and a re-park would spin on every redraw",
+        !app.loop_arm_pending.is_empty(),
+        "a refused arm must stay queued, or the user cannot lower their ask \
+         and try again without restarting the app",
+    );
+
+    // **And it does not spin**, measured rather than assumed: the door is
+    // entered on each of these passes and answers every one from the
+    // ledger's memo.
+    let settled = app.admission.counts();
+    for _ in 0..20 {
+        app.hydrate_parked_panes();
+    }
+    assert_eq!(
+        app.admission.counts(),
+        settled,
+        "twenty redraws against one table must not be twenty verdicts",
+    );
+    assert!(
+        !app.loop_arm_pending.is_empty(),
+        "and the entry is still there to be re-asked when a table with room \
+         arrives",
     );
     assert_eq!(
         app.gui.pane(0).and_then(|pane| pane.loop_arm_pending),
