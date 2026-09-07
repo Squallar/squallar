@@ -355,3 +355,151 @@ fn a_target_without_proc_answers_none_rather_than_zero() {
     assert_eq!(resident(), None);
     assert_eq!(breakdown(), None);
 }
+
+/// **Sensitivity, at the magnitude a null would be claimed at.**
+///
+/// Tampering proves a counter responds to its own subject. It does not prove
+/// the counter is sensitive at the size the instrument is used to rule
+/// something *out*. Every zero this module reports is a null — "no arena
+/// retention", "no driver maps" — and a null from an instrument never shown
+/// to scream is not a null.
+///
+/// So each class is built overwhelmingly present, at the shape measured on
+/// the arm this campaign runs on (30–31 secondary heaps against 141 threads;
+/// nvidia maps at 102.4 MiB, identical across four snapshots), and the
+/// instrument is required to report it.
+///
+/// **Sizes are relations, not pins**: every expectation below is computed
+/// from what the fixture was built to contain, so the test says the same
+/// thing at any magnitude.
+#[test]
+fn every_class_is_shown_sensitive_at_the_magnitude_a_null_is_claimed_at() {
+    const ARENAS: u64 = 31;
+    /// Resident within each 64 MiB arena. Arenas are mostly-untouched
+    /// reservations, so a realistic arena is far from full.
+    const ARENA_RSS_KB: u64 = 48 * 1024;
+    const DEVICE_KB: u64 = 102_400;
+
+    let mut text = String::new();
+    // 31 glibc secondary arenas: each a touched run followed by its
+    // `PROT_NONE` remainder, together spanning exactly 64 MiB from a 64 MiB
+    // boundary — the real shape, captured from a live process.
+    for i in 0..ARENAS {
+        // Scattered, two spans apart: glibc mmaps arenas at unrelated
+        // addresses, and ADJACENT ones are a documented blind spot with its
+        // own pin below rather than something this fixture should hide.
+        let base = 0x7f00_0000_0000u64 + i * GLIBC_ARENA_SPAN * 2;
+        let touched = base + (ARENA_RSS_KB * 1024);
+        let end = base + GLIBC_ARENA_SPAN;
+        text.push_str(&format!(
+            "{base:x}-{touched:x} rw-p 00000000 00:00 0 \n\
+             Rss:  {ARENA_RSS_KB} kB\n\
+             AnonHugePages:  {ARENA_RSS_KB} kB\n\
+             {touched:x}-{end:x} ---p 00000000 00:00 0 \n\
+             Rss:  0 kB\n\
+             AnonHugePages:  0 kB\n"
+        ));
+    }
+    // The graphics driver's maps, at the figure measured on the RTX 3090 arm.
+    text.push_str(&format!(
+        "7fdcfc6f9000-7fdd02af9000 rw-s 00000000 00:07 1686    /dev/nvidiactl\n\
+         Rss:  {DEVICE_KB} kB\n\
+         AnonHugePages:  0 kB\n"
+    ));
+
+    let b = parse_smaps(&text);
+
+    // ---- the arena term screams -----------------------------------------
+    assert_eq!(
+        b.arenas, ARENAS as u32,
+        "the arena detector went blind at scale"
+    );
+    assert_eq!(
+        b.arena_bytes,
+        ARENAS * ARENA_RSS_KB * 1024,
+        "every arena must be counted, not just the first"
+    );
+    assert!(
+        b.arena_bytes > 1 << 30,
+        "the fixture must be big enough that a zero here would be absurd: {} B",
+        b.arena_bytes
+    );
+
+    // ---- so does the driver term ----------------------------------------
+    assert_eq!(b.device_bytes, DEVICE_KB * 1024);
+    assert_eq!(
+        b.non_heap_bytes(),
+        DEVICE_KB * 1024,
+        "the driver's maps are the whole non-heap floor of this fixture, and \
+         a floor that cannot see them is a 250 MiB budget's largest term \
+         reading zero"
+    );
+
+    // ---- and the partition still closes at magnitude ---------------------
+    assert!(
+        b.partitions(),
+        "the classes stopped adding up at scale: {b:?}"
+    );
+    assert_eq!(b.rss_bytes, ARENAS * ARENA_RSS_KB * 1024 + DEVICE_KB * 1024);
+
+    // ---- the healthy input that RESEMBLES the defect ---------------------
+    // The same 31 runs of the same size and the same total residency, moved
+    // 4 KiB off the boundary: not glibc's, so `arenas` must read zero — and
+    // the bytes must stay on the total rather than vanishing with them.
+    let shifted = text.replace("7f00", "7f01").replace("-7f01", "-7f01");
+    let mut off = String::new();
+    for i in 0..ARENAS {
+        let base = 0x7f00_0000_0000u64 + i * GLIBC_ARENA_SPAN + 4096;
+        let end = base + GLIBC_ARENA_SPAN;
+        off.push_str(&format!(
+            "{base:x}-{end:x} rw-p 00000000 00:00 0 \nRss:  {ARENA_RSS_KB} kB\n"
+        ));
+    }
+    let _ = shifted;
+    let o = parse_smaps(&off);
+    assert_eq!(o.arenas, 0, "a misaligned run was read as a glibc arena");
+    assert_eq!(
+        o.anon_other_bytes,
+        ARENAS * ARENA_RSS_KB * 1024,
+        "the bytes left the census when the run failed the arena test"
+    );
+    assert!(o.partitions(), "a misclassification broke the partition");
+}
+
+/// **The adjacency blind spot, pinned at its real size rather than hidden.**
+///
+/// Two arenas allocated back to back are joined into one 128 MiB run that
+/// carries the signature for neither, so both are missed. This is a FLOOR's
+/// worth of under-counting and it is deliberate — the module note at the
+/// run-extension site says why the obvious fix over-detects instead, by
+/// 5,535 MiB on a real capture.
+///
+/// What this pins is the part that must never change: **the missed bytes stay
+/// on the total.** An under-count that also lost the bytes would break the
+/// partition, and the partition is the one property everything else rests on.
+#[test]
+fn adjacent_arenas_are_under_counted_and_their_bytes_stay_on_the_total() {
+    const RSS_KB: u64 = 32 * 1024;
+    let a = 0x7f00_0000_0000u64;
+    let b = a + GLIBC_ARENA_SPAN;
+    let text = format!(
+        "{a:x}-{b:x} rw-p 00000000 00:00 0 \nRss:  {RSS_KB} kB\n\
+         {b:x}-{:x} rw-p 00000000 00:00 0 \nRss:  {RSS_KB} kB\n",
+        b + GLIBC_ARENA_SPAN
+    );
+    let out = parse_smaps(&text);
+    assert_eq!(
+        out.arenas, 0,
+        "two adjacent arenas are joined and match neither; if this ever reads \
+         2 the run rule changed and the module note must change with it"
+    );
+    assert_eq!(
+        out.anon_other_bytes,
+        2 * RSS_KB * 1024,
+        "the under-counted arenas must land in `anon_other`, not vanish"
+    );
+    assert!(
+        out.partitions(),
+        "an under-count took bytes off the total, which the partition forbids"
+    );
+}
