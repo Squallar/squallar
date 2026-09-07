@@ -144,6 +144,18 @@ impl File {
         if self.compressed() {
             return Err(crate::result::Error::CompressedFile);
         }
+        // LOCAL CHANGE (squallar, see VENDORED.md): the slice below was
+        // unguarded, so a file shorter than its own header PANICKED here
+        // instead of erroring — `File::new(Vec::new()).records()` is an
+        // index-out-of-range, and it reaches that from squallar's
+        // `scan::decode_bytes` on any short download. Every other refusal on
+        // this path is an `Err`; this one aborted the thread.
+        if self.0.len() < size_of::<Header>() {
+            return Err(crate::result::Error::TruncatedVolume {
+                expected: size_of::<Header>(),
+                actual: self.0.len(),
+            });
+        }
         split_compressed_records(&self.0[size_of::<Header>()..])
     }
 

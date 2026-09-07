@@ -176,12 +176,19 @@ fn a_decode_takes_no_copy_of_the_archive_and_both_doors_agree() {
     for (bytes, what) in [
         (wrapped, "a gzip-wrapped archive"),
         (vec![0u8; 4096], "a short uncompressed buffer"),
-        // 24 bytes is the Archive II header and nothing after it. Not shorter:
-        // `File::records` indexes `[24..]` unguarded, so an empty buffer panics
-        // inside the vendored crate — the same panic on both doors, and older
-        // than this change.
         (vec![0u8; 24], "a header with no records behind it"),
+        // **Shorter than the Archive II header.** These three used to PANIC
+        // inside the vendored crate rather than error: `File::records` sliced
+        // at `[24..]` without checking the buffer was that wide, and
+        // `decode_bytes` reaches it on any download shorter than 24 bytes — a
+        // truncated object, a zero-length body, an error page. Every other
+        // refusal on this path is an `Err`; this one aborted the thread.
+        (vec![0u8; 23], "one byte short of the header"),
+        (vec![0u8; 1], "a single byte"),
+        (Vec::new(), "nothing at all"),
     ] {
+        // `decode_*` returning at all is half the assertion: before the guard
+        // in `File::records` these three unwound instead.
         let owned = squallar_radar::scan::decode_bytes(bytes.clone());
         let shared = squallar_radar::scan::decode_shared(Arc::new(bytes));
         assert_eq!(

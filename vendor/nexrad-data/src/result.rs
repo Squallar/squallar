@@ -56,6 +56,20 @@ pub enum Error {
     // in this workspace does either -- this file is the only mention of the
     // variant in the entire tree.
     Decompression(#[from] bzip2_rs::decoder::DecoderError),
+    /// The volume file is shorter than the Archive II header it must begin
+    /// with, so there is no record region to split.
+    ///
+    /// LOCAL CHANGE (squallar, see VENDORED.md). Deliberately **not**
+    /// [`Self::TruncatedRecord`], which this could have reused: that says a
+    /// *record* was short, and what is short here is the file's own header.
+    /// A message that names the wrong thing costs more than the variant does.
+    #[error("truncated volume file: expected at least {expected} bytes of Archive II header, got {actual}")]
+    TruncatedVolume {
+        /// Bytes the Archive II header occupies.
+        expected: usize,
+        /// Bytes the file actually has.
+        actual: usize,
+    },
     /// LDM record was truncated and contains fewer bytes than expected.
     #[error("truncated record: expected {expected} bytes, got {actual}")]
     TruncatedRecord {

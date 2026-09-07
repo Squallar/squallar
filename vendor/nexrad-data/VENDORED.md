@@ -507,6 +507,30 @@ The decoded-moment digest and the raw decompressed-bytes digest are unchanged
 over all 14 volumes. Full method and the control in
 [Measured, end to end](#measured-end-to-end).
 
+#### The short-file panic — `src/volume/file.rs`, `src/result.rs`
+
+`File::records` sliced its buffer at the Archive II header's width without
+checking that the buffer was that wide.
+
+```rust
+-        split_compressed_records(&self.0[size_of::<Header>()..])
++        if self.0.len() < size_of::<Header>() {
++            return Err(crate::result::Error::TruncatedVolume { .. });
++        }
++        split_compressed_records(&self.0[size_of::<Header>()..])
+```
+
+`File::new(Vec::new()).records()` was an index-out-of-range panic, and
+squallar reaches it from `scan::decode_bytes` on any download shorter than 24
+bytes — a truncated object, a zero-length S3 body, an error page. Every other
+refusal on this path is an `Err` and this one aborted the thread instead.
+
+`Error::TruncatedVolume` is a new variant rather than a reuse of the existing
+`TruncatedRecord`, which would have fit the shape and named the wrong thing:
+what is short here is the file's own header, not a record inside it.
+
+Offerable upstream as written.
+
 #### The shared archive buffer — `src/volume/file.rs`
 
 `File` held its bytes as a `Vec<u8>`; here it holds them as an
