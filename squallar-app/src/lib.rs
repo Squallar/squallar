@@ -59,3 +59,6 @@ pub(crate) mod test_sites;
 #[cfg(test)]
 pub(crate) mod volume_fixture;
 pub(crate) mod volume_inventory;
+/// The window's minimized flag and inner size, cached against the events that
+/// define them rather than re-asked on every frame.
+pub(crate) mod window_gate;

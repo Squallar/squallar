@@ -170,6 +170,12 @@ fn looping_panes(gui: &Gui) -> Vec<(usize, squallar_egui::pane::LoopArm, u64)> {
 pub struct App {
     state: Option<app_state::AppState>,
     window: Option<WindowRef>,
+    /// The two window queries the frame gate below turns on, held rather than
+    /// re-asked: on X11 both are display-server round trips, and re-asking
+    /// them every frame was a steady 159 us floor under every interact frame.
+    /// Retired by the events that define the answers, never by a clock — see
+    /// [`crate::window_gate`].
+    window_gate: crate::window_gate::WindowGate,
     gui: Gui,
     /// Whether this platform can quit, answered once at startup —
     /// `PlatformBridge::supports_exit` is a property of the build.
@@ -883,6 +889,7 @@ impl App {
         let mut app = Self {
             state: None,
             window: None,
+            window_gate: crate::window_gate::WindowGate::default(),
             gui,
             supports_exit,
             loop_frame_budget,
@@ -1079,28 +1086,33 @@ impl App {
         self.autosave_config(false);
         let pre_saved = web_time::Instant::now();
 
-        if let Some(window) = self.window.as_ref()
-            && let Some(min) = window.is_minimized()
-            && min
-        {
-            log::debug!("Window is minimized");
-            return;
-        }
-
-        if let Some(window) = self.window.as_ref() {
-            let size = window.inner_size();
-            if size.width == 0 || size.height == 0 {
+        // The same two questions the gate has always asked, off the reading
+        // the last window event left standing rather than off the window
+        // itself: on X11 both are synchronous round trips to the display
+        // server, and asking them here cost a steady 159 us on EVERY interact
+        // frame. `crate::window_gate` carries which events retire a reading
+        // and why those are the ones that define it.
+        let gate = self
+            .window
+            .as_ref()
+            .map(|window| self.window_gate.read(window));
+        if let Some(gate) = gate {
+            if gate.minimized {
+                log::debug!("Window is minimized");
+                return;
+            }
+            if gate.zero_area() {
                 log::debug!(
                     "Window has zero area ({}x{}); skipping frame",
-                    size.width,
-                    size.height
+                    gate.size.0,
+                    gate.size.1
                 );
                 return;
             }
         }
-        // After both window queries and before the renderer check: the `gate`
-        // cut is the two platform questions that can abandon the frame, and
-        // `ensure` is everything from here to the `setup` mark.
+        // After both window questions and before the renderer check: the
+        // `gate` cut is the two platform answers that can abandon the frame,
+        // and `ensure` is everything from here to the `setup` mark.
         let pre_gated = web_time::Instant::now();
 
         self.ensure_rendering_state();
@@ -3124,6 +3136,10 @@ impl App {
         let window = Arc::new(window);
         #[cfg(not(target_arch = "wasm32"))]
         let _ = window.request_inner_size(PhysicalSize::new(RENDER_WIDTH, RENDER_HEIGHT));
+        // A new window is a new pair of answers, and the ask above is
+        // satisfied SYNCHRONOUSLY with no event on the backends that can do
+        // it. Nothing else would retire a reading taken before this point.
+        self.window_gate.invalidate();
         self.window = Some(window.clone());
         // The bridge sees the window once it exists: iOS reads the system
         // appearance off the view behind it (`PlatformBridge::attach_window`).
@@ -3282,6 +3298,11 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        // First, before anything in this handler can read a stale answer: the
+        // window's minimized flag and inner size are cached, and this is the
+        // only thing that retires them.
+        self.window_gate.note_event(&event);
+
         if self.input.process_event(&event) {
             self.handle_input_events(event_loop);
         }
