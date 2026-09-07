@@ -1354,28 +1354,70 @@ jobs:
       # then compiles against the header macro and links normally.
       - name: Build the package tools (xar, mkbom)
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
-            libxml2-dev libssl-dev zlib1g-dev libbz2-dev git
+          # Quiet on success, LOUD on failure. An earlier version of this step
+          # sent every command to /dev/null, so when the xar build failed the
+          # job reported "exit code 1" under a wall of apt output and named no
+          # cause at all. Each command's output is kept and printed only if it
+          # fails, which is the same amount of log on a good run and the whole
+          # of it on a bad one.
+          run() {
+            local what="$1"; shift
+            if ! "$@" > "$RUNNER_TEMP/$what.log" 2>&1; then
+              echo "::error::$what failed. Its output follows."
+              sed 's/^/    /' "$RUNNER_TEMP/$what.log" | tail -60
+              exit 1
+            fi
+          }
 
-          git clone -q https://github.com/mackyle/xar "$RUNNER_TEMP/xar"
-          git -C "$RUNNER_TEMP/xar" checkout -q "$XAR_COMMIT"
+          # autoconf ALONE is not enough: mackyle/xar ships configure.ac and no
+          # configure, so `autoreconf -fi` needs automake and libtool too, and
+          # the runner image carries neither by default.
+          run apt-update sudo apt-get update -qq
+          run apt-install sudo apt-get install -y -qq --no-install-recommends \
+            libxml2-dev libssl-dev zlib1g-dev libbz2-dev git ca-certificates \
+            autoconf automake libtool pkg-config make g++
+
+          run xar-clone git clone -q https://github.com/mackyle/xar "$RUNNER_TEMP/xar"
+          run xar-checkout git -C "$RUNNER_TEMP/xar" checkout -q "$XAR_COMMIT"
           cd "$RUNNER_TEMP/xar/xar"
-          autoreconf -fi >/dev/null 2>&1
-          ./configure --prefix="$RUNNER_TEMP/pkgtools" \
-            ac_cv_lib_crypto_OpenSSL_add_all_ciphers=yes >/dev/null
-          make -j"$(nproc)" >/dev/null && make install >/dev/null
+          # autoreconf EXITS NON-ZERO here and that is not a failure. xar's
+          # configure.ac has no AH_TEMPLATE for UID_STRING, so autoheader stops
+          # with "missing template: UID_STRING" and autoreconf reports its exit
+          # status — after autoconf has already written a working `configure`.
+          # Measured on ubuntu:24.04: autoreconf exits 1, configure and make
+          # then succeed, and the result is xar 1.6.1.
+          #
+          # This is exactly what killed the step before: `bash -e` took the
+          # non-zero exit, and the output was going to /dev/null so nothing said
+          # why. So the exit code is ignored and the POSTCONDITION is asserted
+          # instead — a `configure` that exists and is executable, which is the
+          # thing the next command actually needs.
+          autoreconf -fi > "$RUNNER_TEMP/xar-autoreconf.log" 2>&1 || true
+          if [ ! -x ./configure ]; then
+            echo "::error::autoreconf produced no executable ./configure for xar. Its output follows."
+            sed 's/^/    /' "$RUNNER_TEMP/xar-autoreconf.log" | tail -40
+            exit 1
+          fi
+          run xar-configure ./configure --prefix="$RUNNER_TEMP/pkgtools" \
+            ac_cv_lib_crypto_OpenSSL_add_all_ciphers=yes
+          run xar-make make -j"$(nproc)"
+          run xar-install make install
+          cd "$GITHUB_WORKSPACE"
 
-          git clone -q https://github.com/hogliux/bomutils "$RUNNER_TEMP/bomutils"
-          git -C "$RUNNER_TEMP/bomutils" checkout -q "$BOMUTILS_COMMIT"
-          make -C "$RUNNER_TEMP/bomutils" -j"$(nproc)" >/dev/null
+          run bomutils-clone git clone -q https://github.com/hogliux/bomutils "$RUNNER_TEMP/bomutils"
+          run bomutils-checkout git -C "$RUNNER_TEMP/bomutils" checkout -q "$BOMUTILS_COMMIT"
+          run bomutils-make make -C "$RUNNER_TEMP/bomutils" -j"$(nproc)"
+          mkdir -p "$RUNNER_TEMP/bin"
           install -m 0755 "$RUNNER_TEMP/bomutils/build/bin/mkbom" "$RUNNER_TEMP/bin/mkbom"
           echo "$RUNNER_TEMP/pkgtools/bin" >> "$GITHUB_PATH"
 
           # Asserted here, where the cause is one step away, rather than inside
-          # mkpkg.sh where it would read as a packaging failure.
+          # mkpkg.sh where it would read as a packaging failure. Both are run
+          # for real: a tool that built but cannot execute is the failure this
+          # catches, and it is invisible until something else tries to use it.
           "$RUNNER_TEMP/pkgtools/bin/xar" --version
-          "$RUNNER_TEMP/bin/mkbom" -h >/dev/null 2>&1 || true
+          "$RUNNER_TEMP/bin/mkbom" -h 2>&1 | head -1 || true
+          echo "  xar and mkbom are built and runnable."
 
       - name: Download the arm64 half
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
