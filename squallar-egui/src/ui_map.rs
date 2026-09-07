@@ -87,9 +87,18 @@ impl super::Gui {
         // a pane, picked out of a vector the App rebuilds every 2 s — nothing
         // here is computed, and a session that has priced no scene yet has no
         // entries and draws no line.
+        //
+        // Behind the same switch the layers menu's rows are, and the whole
+        // vector is what it gates: a pane with no `PaneCost` draws no cost
+        // line, which is already the state of every session that has priced
+        // nothing. Both of the corner's lines go together deliberately — the
+        // binder line is a qualifier on the figure above it ("over - raise it
+        // in Settings > Memory"), and printed alone it would be a warning with
+        // no quantity to be over, which this workspace forbids.
         let pane_costs: Vec<Option<pane_render::PaneCost>> = self
             .budget_readout
             .as_ref()
+            .filter(|_| self.memory_figures)
             .map(|readout| {
                 readout
                     .panes

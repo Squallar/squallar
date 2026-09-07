@@ -38,6 +38,22 @@ pub(crate) const LOCATION_DENIED_NOTE: &str = "Your desktop's location switch \
 pub(crate) const LOCATION_DENIED_NOTE: &str = "Location for this app is turned \
     off. It can be turned back on in your system settings.";
 
+/// **The switch that puts the budget system's figures on the glass.**
+///
+/// "figures" and not "diagnostics": these are quantities about the user's own
+/// scene — what the layers they chose cost — and the row above is already the
+/// developer instrument. Naming both "diagnostics" would have made one switch
+/// read as a mode of the other.
+pub(crate) const MEMORY_FIGURES_LABEL: &str = "Show memory figures";
+
+/// The caption under [`MEMORY_FIGURES_LABEL`]. It names **where** the figures
+/// appear rather than what they mean, because a reader meeting this row cold
+/// has not seen them: the two places are the layers menu and the pane corner,
+/// and a caption that only said "memory use" would leave them hunting.
+pub(crate) const MEMORY_FIGURES_NOTE: &str = "Each layer's memory use under \
+    its name in the Layers panel, and each pane's own total in its top-right \
+    corner.";
+
 /// Every row the settings window draws, in draw order, each under a stable id.
 pub(crate) const SETTINGS_ROWS: &[&str] = &[
     "units.timezone",
@@ -49,6 +65,7 @@ pub(crate) const SETTINGS_ROWS: &[&str] = &[
     "units.hail_size",
     "interface.pin_controls",
     "interface.diagnostics",
+    "interface.memory_figures",
     "location",
     "gps.port",
     "gps.baud",
@@ -208,6 +225,14 @@ impl super::Gui {
                     .small()
                     .weak(),
                 );
+                true
+            }
+            // Both surfaces of the budget readout under one switch, because
+            // they are one thing to the reader: what the scene on screen costs
+            // in memory. Off unless it is asked for.
+            "interface.memory_figures" => {
+                ui.checkbox(&mut self.memory_figures, MEMORY_FIGURES_LABEL);
+                ui.label(egui::RichText::new(MEMORY_FIGURES_NOTE).small().weak());
                 true
             }
             "location" => {
@@ -516,6 +541,12 @@ impl super::Gui {
                     self.heading_source = squallar_location::HeadingSource::default();
                     self.storm_motion_override = crate::StormMotionOverride::default();
                     self.srv_fallback = squallar_radar::srv::SrvFallback::default();
+                    // Written down only, unlike the two below: nothing outside
+                    // the `Gui` reads this switch, so there is no App-side copy
+                    // to tell. Off is its default, and a reset that left the
+                    // figures on the glass would be a reset that did not
+                    // restore one.
+                    self.memory_figures = false;
                     // The App holds its own copy and prices with it, so the
                     // reset has to be told as well as written down — a reset
                     // that only moved the slider would leave this session
@@ -1098,6 +1129,121 @@ mod label_tests {
             label.contains("storm motion"),
             "the switch reads {STORM_MOTION_OVERRIDE_LABEL:?}, which does not \
              say what it overrides",
+        );
+    }
+}
+
+/// **The switch that hides the budget system's figures**, as a settings row.
+///
+/// The figures themselves are covered where they are drawn
+/// (`ui_stack::layer_memory_tests`, `ui_map_pane::pane_cost_tests`); what is
+/// here is the control: that it exists, that it sits where the user asked for
+/// it, that pressing it really moves the switch, and that a reset restores it.
+#[cfg(test)]
+mod memory_figures_tests {
+    use super::*;
+
+    /// **Directly under "Show frame diagnostics"**, which is where the user
+    /// asked for it — a row that drifted to the end of the list would still
+    /// draw, still persist and still be wrong.
+    #[test]
+    fn the_row_sits_immediately_below_the_diagnostics_switch() {
+        let diagnostics = SETTINGS_ROWS
+            .iter()
+            .position(|id| *id == "interface.diagnostics")
+            .expect("the diagnostics row is listed");
+        assert_eq!(
+            SETTINGS_ROWS.get(diagnostics + 1),
+            Some(&"interface.memory_figures"),
+            "the memory figures row is not the one under the diagnostics \
+             switch; the list reads {SETTINGS_ROWS:?}",
+        );
+    }
+
+    /// The reset arm names it, on the pattern
+    /// `texture_ceiling_tests::the_row_is_listed_and_the_reset_arm_names_it`
+    /// established: the arm is a hand-kept list of fields and nothing makes
+    /// adding a setting add a line to it.
+    ///
+    /// It is written down and not also announced, unlike the shares and the
+    /// ceiling in the same arm: those have a copy in the App that prices with
+    /// them, and this is read only by the `Gui` that owns it.
+    #[test]
+    fn the_reset_arm_names_the_switch() {
+        let source = include_str!("ui_settings.rs");
+        let reset = source
+            .split_once("\"reset\" => {")
+            .expect("the reset arm")
+            .1;
+        let reset = reset.split_once("\"about.exit\"").expect("the exit arm").0;
+        assert!(
+            reset.contains("self.memory_figures = false;"),
+            "the reset arm does not turn the memory figures off, so `Reset to \
+             defaults` would leave them on the glass",
+        );
+    }
+
+    /// **The switch is reachable and it works** — through the checkbox a user
+    /// actually presses, found on screen by the words they actually read.
+    ///
+    /// Without this the setting could be listed, drawn, persisted and wired to
+    /// nothing: `SETTINGS_ROWS` membership is a parity-walk property, not a
+    /// proof that the widget moves the field.
+    #[test]
+    fn the_checkbox_turns_the_figures_on_and_off_again() {
+        let mut h = crate::input_harness::InputHarness::with_screen(egui::vec2(900.0, 1600.0));
+        h.open_settings();
+        assert!(
+            !h.gui().memory_figures,
+            "premise: the switch starts off, which is what the user asked for",
+        );
+
+        let pos = h
+            .inspector_rect()
+            .expect("the settings body is in the inspector")
+            .center();
+        let found = h.scroll_until(pos, egui::vec2(0.0, -160.0), 120, |h| {
+            h.painted_text_rects().iter().any(|(rect, text)| {
+                text == MEMORY_FIGURES_LABEL && h.screen_rect().contains(rect.center())
+            })
+        });
+        assert!(
+            found,
+            "{MEMORY_FIGURES_LABEL:?} never came on screen, so a user who \
+             wants the figures back has no way to ask for them",
+        );
+
+        let label = h
+            .painted_text_rects()
+            .into_iter()
+            .find(|(_, text)| text == MEMORY_FIGURES_LABEL)
+            .expect("the label was just found on screen")
+            .0;
+        h.mouse_click(label.center());
+        assert!(
+            h.gui().memory_figures,
+            "pressing the switch did not turn the figures on",
+        );
+
+        h.mouse_click(label.center());
+        assert!(
+            !h.gui().memory_figures,
+            "the switch does not turn back off, so the user cannot undo it",
+        );
+    }
+
+    /// The caption names both places the figures appear. A reader meeting the
+    /// row cold has not seen them, and one that named only the layers menu
+    /// would leave the pane corner unexplained.
+    #[test]
+    fn the_caption_names_both_surfaces() {
+        assert!(
+            MEMORY_FIGURES_NOTE.contains("Layers panel"),
+            "the caption does not name the layers menu: {MEMORY_FIGURES_NOTE:?}",
+        );
+        assert!(
+            MEMORY_FIGURES_NOTE.contains("pane"),
+            "the caption does not name the pane's own line: {MEMORY_FIGURES_NOTE:?}",
         );
     }
 }

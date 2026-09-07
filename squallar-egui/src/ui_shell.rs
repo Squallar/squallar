@@ -310,9 +310,19 @@ impl super::Gui {
         // composed them. An empty list is the ordinary state of a session that
         // has not priced a scene yet, and every row then carries no memory
         // line rather than a row of zeroes.
+        //
+        // The switch is read here rather than at the row's paint because
+        // "no line" is already a state every row handles — a layer the model
+        // charges nothing for has none — so a session with the figures off
+        // takes the same path as a session that has priced nothing, and the
+        // rows lay out at their one-line height with no second branch anywhere
+        // in `ui_stack`. The readout itself is still composed and still
+        // reaches the telemetry line: this hides the figures, it does not stop
+        // producing them.
         let priced = self
             .budget_readout
             .as_ref()
+            .filter(|_| self.memory_figures)
             .and_then(|readout| readout.pane_layers.get(pane_idx))
             .map_or(&[][..], Vec::as_slice);
         let view = pane.view(pane_idx);

@@ -522,6 +522,84 @@ fn a_config_written_before_the_diagnostics_panel_loads_it_hidden() {
     );
 }
 
+/// The memory-figures switch survives a save and load — reopen is exactly
+/// 1:1, and a switch the user had to go and find is state they must not have
+/// to find twice.
+#[test]
+fn the_memory_figures_switch_survives_a_save_and_load() {
+    let store = MemoryKvStore::default();
+    let mut gui = crate::Gui::new();
+    assert!(
+        !gui.memory_figures,
+        "precondition: a fresh session ships with the figures hidden",
+    );
+    gui.memory_figures = true;
+    gui.save_ui_config(&store);
+
+    let mut restored = crate::Gui::new();
+    assert!(restored.load_ui_config(&store));
+    assert!(
+        restored.memory_figures,
+        "a session that showed the figures must reopen showing them",
+    );
+
+    restored.memory_figures = false;
+    restored.save_ui_config(&store);
+    let mut again = crate::Gui::new();
+    assert!(again.load_ui_config(&store));
+    assert!(
+        !again.memory_figures,
+        "and hiding them persists the same way",
+    );
+}
+
+/// **The install that already exists loads clean.**
+///
+/// The figures shipped switched on with no key to say so, so every config in
+/// the wild is silent about them — and this is the whole of the migration:
+/// absence loads as off. A default of `true` would have needed a
+/// `CONFIG_VERSION` bump and a `migrate.rs` step to reach these files, and
+/// there is neither.
+#[test]
+fn a_config_written_before_the_memory_figures_switch_loads_them_hidden() {
+    let store = MemoryKvStore::default();
+    store
+        .store(UI_CONFIG_KEY, r#"{"site": "KDMX"}"#)
+        .expect("the memory store accepts a write");
+
+    let mut gui = crate::Gui::new();
+    assert!(gui.load_ui_config(&store));
+    assert!(
+        !gui.memory_figures,
+        "an absent key must mean hidden - a user who never touched this \
+         setting must not be shown the figures",
+    );
+}
+
+/// While off, the key is not written at all, on `diagnostics_panel`' terms:
+/// a save must not move the bytes of a config that says nothing about it.
+#[test]
+fn the_memory_figures_key_is_absent_from_a_config_that_never_turned_them_on() {
+    let store = MemoryKvStore::default();
+    let gui = crate::Gui::new();
+    gui.save_ui_config(&store);
+    let written = store.load(UI_CONFIG_KEY).expect("the config was written");
+    assert!(
+        !written.contains("memory_figures"),
+        "the default wrote its own key into every config: {written}",
+    );
+
+    let mut showing = crate::Gui::new();
+    showing.memory_figures = true;
+    showing.save_ui_config(&store);
+    let written = store.load(UI_CONFIG_KEY).expect("the config was written");
+    assert!(
+        written.contains("memory_figures"),
+        "premise: the key is written once it is true, or the test above \
+         would pass over a field that is never serialised at all: {written}",
+    );
+}
+
 /// The derived-rung choice survives a save and load, both directions.
 #[test]
 fn the_storm_motion_fallback_survives_a_save_and_load() {

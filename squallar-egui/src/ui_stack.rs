@@ -114,6 +114,11 @@ pub(super) struct StackRowLines {
     /// pane. `None` for a layer the model charges nothing for — a point layer,
     /// a colour scale — and for every row before the first composition, which
     /// is honest absence rather than a row of zeroes.
+    ///
+    /// `None` for **every** row while `Gui::memory_figures` is off, which is
+    /// the default and is what the switch does: the composer
+    /// (`ui_shell::stack_row_statuses`) withholds the line rather than the row
+    /// suppressing it, so there is no second spelling of "no line" here.
     pub memory: Option<String>,
 }
 

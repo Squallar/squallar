@@ -42,6 +42,17 @@ fn readout(generation: u64, rows: Vec<LayerBudget>) -> BudgetReadout {
     }
 }
 
+/// **A harness with the memory figures switched on**, which is what every
+/// test below that expects a line on the glass needs: the switch is off in a
+/// fresh `Gui` and off for every install that never touched it, so the
+/// unadorned harness is the *hidden* arm. See
+/// `the_rows_are_bare_until_the_switch_is_on` for that arm driven directly.
+fn showing_figures(size: egui::Vec2) -> InputHarness {
+    let mut h = InputHarness::with_screen(size);
+    h.gui_mut().memory_figures = true;
+    h
+}
+
 /// **The line the ruling asks for, verbatim**, with the layer's own allowance
 /// beside it.
 #[test]
@@ -83,7 +94,7 @@ fn a_wholly_shared_layer_still_names_the_share() {
 /// zeroes on every layer in the stack: absence is absence.
 #[test]
 fn the_priced_row_carries_the_line_and_an_unpriced_row_carries_none() {
-    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    let mut h = showing_figures(egui::vec2(1400.0, 900.0));
     h.set_budget_readout(readout(
         1,
         vec![budget(known::RADAR, 49 * MB, 18 * MB, 3_100 * MB)],
@@ -143,7 +154,7 @@ fn the_memory_line_fits_inside_the_row_at_every_width() {
             crate::ui_layout::WidthClass::Expanded,
         ),
     ] {
-        let mut h = InputHarness::with_screen(size);
+        let mut h = showing_figures(size);
         assert_eq!(
             h.width_class(),
             class,
@@ -201,7 +212,7 @@ fn the_memory_line_fits_inside_the_row_at_every_width() {
 /// right.
 #[test]
 fn a_priced_row_grows_by_exactly_the_line_it_gained() {
-    let mut bare = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    let mut bare = showing_figures(egui::vec2(1400.0, 900.0));
     bare.open_layers();
     let without = bare
         .stack_row(&known::RADAR)
@@ -209,7 +220,7 @@ fn a_priced_row_grows_by_exactly_the_line_it_gained() {
         .rect
         .height();
 
-    let mut priced = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    let mut priced = showing_figures(egui::vec2(1400.0, 900.0));
     priced.set_budget_readout(readout(
         1,
         vec![budget(known::RADAR, 49 * MB, 18 * MB, 3_100 * MB)],
@@ -232,5 +243,56 @@ fn a_priced_row_grows_by_exactly_the_line_it_gained() {
         with - without < 20.0,
         "the priced row grew by {}pt for one small line",
         with - without,
+    );
+}
+
+/// **Both arms of the switch, on the surface the user pointed at.**
+///
+/// The same priced scene is in front of the same menu in both halves, so this
+/// is not `a session that priced nothing shows nothing` wearing a new name:
+/// the readout is published either way and the only difference is the switch.
+///
+/// The off arm asserts the probe **and** the glass. They can disagree — the
+/// probe reports the line the row was given, the painter reports what was
+/// drawn — and a figure that reached the painter without the probe would be
+/// exactly as visible to the user and exactly as wrong.
+#[test]
+fn the_rows_are_bare_until_the_switch_is_on() {
+    const LINE: &str = "GPU: shared 49 MB + own 18 MB of 3.1 GB";
+    let priced = || readout(1, vec![budget(known::RADAR, 49 * MB, 18 * MB, 3_100 * MB)]);
+
+    let mut off = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    assert!(
+        !off.gui().memory_figures,
+        "premise: a fresh session has the figures off, which is what every \
+         install that never touched the switch is",
+    );
+    off.set_budget_readout(priced());
+    off.open_layers();
+    let row = off
+        .stack_row(&known::RADAR)
+        .expect("the Radar row is drawn whether or not it carries a figure");
+    assert_eq!(
+        row.memory_line, None,
+        "the row was handed a figure the user never asked to see",
+    );
+    assert!(
+        !off.text_painted_in(off.screen_rect(), LINE),
+        "the figure was painted with the switch off",
+    );
+
+    let mut on = showing_figures(egui::vec2(1400.0, 900.0));
+    on.set_budget_readout(priced());
+    on.open_layers();
+    let shown = on.stack_row(&known::RADAR).expect("the Radar row is drawn");
+    assert_eq!(
+        shown.memory_line.as_deref(),
+        Some(LINE),
+        "with the switch on the same scene must show the same figure it \
+         always did - this is a visibility change, not a removal",
+    );
+    assert!(
+        on.text_painted_in(on.screen_rect(), LINE),
+        "and it must reach the glass, not only the probe",
     );
 }

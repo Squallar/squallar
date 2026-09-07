@@ -366,6 +366,19 @@ pub struct Gui {
     /// Whether the frame diagnostics overlay is showing — the Interface
     /// section's "Show frame diagnostics" switch. Persisted.
     pub(super) diagnostics_panel: bool,
+    /// **Whether the budget system's figures are drawn on the glass** — the
+    /// Interface section's "Show memory figures" switch, and the one gate over
+    /// both surfaces that show them: the per-layer band under each stack row
+    /// (`ui_shell::stack_row_statuses`) and the per-pane cost line in a pane's
+    /// top-right corner (`ui_map`'s `pane_costs`).
+    ///
+    /// **Off, and off is what an absent config key means.** The figures
+    /// shipped on with no way to turn them off; the user's ruling is that
+    /// every memory readout is off until it is asked for, so the default here
+    /// is the whole of the migration — see the `UiConfig` field. One switch
+    /// and not two because the two surfaces are one readout to the reader:
+    /// what memory this costs, per layer and per pane. Persisted.
+    pub(super) memory_figures: bool,
     /// **The share of each memory pool the user allows this application** —
     /// the Memory section's two controls, read by the shell through
     /// [`super::Gui::memory_percents`] and applied to the capacity before any
@@ -702,6 +715,7 @@ impl Gui {
             pills_raise_pending: false,
             pin_pane_controls: false,
             diagnostics_panel: false,
+            memory_figures: false,
             memory_percents: squallar_device_profile::scene::PoolPercents::FULL,
             texture_ceiling: squallar_device_profile::budget::TextureCeiling::NONE,
             diagnostics: diagnostics::DiagnosticsState::default(),

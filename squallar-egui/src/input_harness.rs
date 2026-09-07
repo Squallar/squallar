@@ -513,6 +513,11 @@ impl InputHarness {
     /// **Publish a budget readout**, as the App's telemetry tick does. The one
     /// door a test takes to put a priced scene in front of the pane's cost
     /// line and the layers menu's rows.
+    ///
+    /// **Publishing it is not enough to see it.** Both surfaces are behind
+    /// `Gui::memory_figures`, which is off in a fresh harness exactly as it is
+    /// in a fresh install, so a test that expects a figure on the glass has to
+    /// turn the switch on as well — see `layer_memory_tests::showing_figures`.
     pub(crate) fn set_budget_readout(&mut self, readout: crate::shell_api::BudgetReadout) {
         self.facts.budget_readout = Some(readout);
         self.apply_facts();

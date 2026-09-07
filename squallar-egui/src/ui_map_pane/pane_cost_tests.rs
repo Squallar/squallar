@@ -186,6 +186,7 @@ fn readout(generation: u64, cost_bytes: u64, allowed: u64) -> BudgetReadout {
 #[test]
 fn the_cost_line_is_painted_on_the_pane_and_the_nag_only_when_it_is_over() {
     let mut h = crate::input_harness::InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.gui_mut().memory_figures = true;
 
     h.set_budget_readout(readout(1, 412 * MB, 2_700 * MB));
     assert!(
@@ -221,5 +222,49 @@ fn a_pane_with_no_readout_paints_no_cost_line() {
     assert!(
         !h.text_painted_in(h.screen_rect(), "GPU memory:"),
         "an application that has priced nothing must invent no figure",
+    );
+}
+
+/// **Both arms of the switch, on the pane's own corner.**
+///
+/// The readout is published in both halves, so the off arm is the switch and
+/// not the empty state `a_pane_with_no_readout_paints_no_cost_line` covers.
+///
+/// **Both lines go together.** The over arm is the one that could plausibly
+/// have been kept — it names a control the reader can reach — but printed
+/// without the figure above it, "over - raise it in Settings > Memory" is a
+/// warning with no quantity to be over, which is the shape this workspace
+/// forbids. So the switch takes the pair, and a reader who wants the warning
+/// turns the figures on and gets the number it is about.
+#[test]
+fn the_corner_is_bare_until_the_switch_is_on() {
+    let mut off = crate::input_harness::InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    assert!(
+        !off.gui().memory_figures,
+        "premise: a fresh session has the figures off",
+    );
+    off.set_budget_readout(readout(1, 2_900 * MB, 2_700 * MB));
+    assert!(
+        !off.text_painted_in(off.screen_rect(), "GPU memory: 2.9 GB of 2.7 GB"),
+        "the pane cost figure was painted with the switch off",
+    );
+    assert!(
+        !off.text_painted_in(off.screen_rect(), "over - raise it in Settings > Memory"),
+        "the binder line outlived the figure it qualifies",
+    );
+
+    let mut on = crate::input_harness::InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    on.gui_mut().memory_figures = true;
+    on.set_budget_readout(readout(1, 2_900 * MB, 2_700 * MB));
+    assert!(
+        on.text_painted_in(on.screen_rect(), "GPU memory: 2.9 GB of 2.7 GB"),
+        "with the switch on the figure must be exactly what it always was",
+    );
+    assert!(
+        on.text_painted_in(
+            on.screen_rect(),
+            "over - raise it in Settings > Memory (now 50 %)"
+        ),
+        "and the binder line comes back with it",
     );
 }

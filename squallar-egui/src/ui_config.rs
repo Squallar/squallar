@@ -1183,6 +1183,27 @@ struct UiConfig {
     /// forbids.
     #[serde(default, skip_serializing_if = "is_false")]
     diagnostics_panel: bool,
+    /// **Whether the budget system's figures are drawn on the glass** — the
+    /// Interface section's "Show memory figures" switch, over both the
+    /// per-layer band in the layers menu and the per-pane cost line in a
+    /// pane's top-right corner.
+    ///
+    /// Additive on `diagnostics_panel`' terms: `#[serde(default)]`, **no
+    /// `CONFIG_VERSION` bump and no `migrate.rs` step**. The default is
+    /// `false`, and that default is the whole of the migration: these figures
+    /// shipped switched on, so an absent key has to load as *off* for the
+    /// installs that already have one to come back clean. A default of `true`
+    /// would have needed a migration step to say so, which is the trade the
+    /// user's ruling — every memory readout off until asked for — settles the
+    /// other way.
+    ///
+    /// `skip_serializing_if` while off for `viewing_live`'s reason: writing
+    /// the key into every file would move the bytes of configs that say
+    /// nothing about it, which
+    /// `a_config_naming_an_unregistered_layer_is_written_back_byte_preserved`
+    /// forbids.
+    #[serde(default, skip_serializing_if = "is_false")]
+    memory_figures: bool,
     /// **The share of this machine's GPU memory the user allows this
     /// application**, as a whole percent — the Memory section's first control.
     ///
@@ -1675,6 +1696,7 @@ impl Default for UiConfig {
             srv_fallback: squallar_radar::srv::SrvFallback::default(),
             pin_pane_controls: false,
             diagnostics_panel: false,
+            memory_figures: false,
             gpu_memory_percent: default_full_percent(),
             system_memory_percent: default_full_percent(),
             texture_ceiling_px: 0,
@@ -1814,6 +1836,7 @@ impl super::Gui {
             srv_fallback: self.srv_fallback,
             pin_pane_controls: self.pin_pane_controls,
             diagnostics_panel: self.diagnostics_panel,
+            memory_figures: self.memory_figures,
             gpu_memory_percent: self.memory_percents.gpu,
             system_memory_percent: self.memory_percents.host,
             texture_ceiling_px: self.texture_ceiling.as_px(),
@@ -2018,6 +2041,7 @@ impl super::Gui {
         self.srv_fallback = config.srv_fallback;
         self.pin_pane_controls = config.pin_pane_controls;
         self.diagnostics_panel = config.diagnostics_panel;
+        self.memory_figures = config.memory_figures;
         // Held inside the offered range on the way in, like every other value
         // this file reads tolerantly: a hand-edited `0` or `250` costs the
         // user a sensible setting, not their whole config.
