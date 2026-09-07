@@ -151,8 +151,16 @@ pub struct RenderCache {
     capacity: usize,
     /// Bytes the resident entries occupy, kept in step with `entries` by
     /// [`Self::insert`], [`Self::retain`], [`Self::clear`] and
-    /// [`Self::take_all`].
+    /// [`Self::take_all`]. **The census figure**, pixels and hover both —
+    /// see [`Self::entry_bytes`].
     resident_bytes: usize,
+    /// The same entries priced in the **budget's** denominator: pixels only,
+    /// and nothing else. Kept in step at the same four sites.
+    ///
+    /// It exists because [`Self::resident_bytes`] is not that denominator and
+    /// was being compared against `byte_capacity` anyway. See
+    /// [`Self::entry_budget_bytes`] for what that cost.
+    budgeted_bytes: usize,
     byte_capacity: usize,
 }
 
@@ -165,15 +173,44 @@ impl RenderCache {
             recency: VecDeque::new(),
             capacity: capacity.max(1),
             resident_bytes: 0,
+            budgeted_bytes: 0,
             byte_capacity,
         }
     }
 
     /// What one entry costs: the texture egui holds and the value grid a hover
     /// reads, both `side² × 4`.
+    /// **What one entry costs on this heap**: its `Color32` pixels and the
+    /// hover field beside them. The `render cache` census family's
+    /// denominator, and not the budget's — see [`Self::entry_budget_bytes`].
     fn entry_bytes(value: &CachedRenderOutput) -> usize {
-        value.image.pixels.len() * std::mem::size_of::<egui::Color32>()
-            + value.hover.resident_bytes()
+        Self::entry_budget_bytes(value) + value.hover.resident_bytes()
+    }
+
+    /// **What one entry costs against `byte_capacity`**: its pixels, which is
+    /// what `Budgets::render_cache_budget_bytes` counts entries of.
+    ///
+    /// A separate function from [`Self::entry_bytes`] because the two answer
+    /// different questions and were the same expression until 2026-09-07,
+    /// when they were found to be **different denominators compared against
+    /// each other**. `render_cache_budget_bytes` is
+    /// `entries * converted_raster_bytes(side)` — `side * side *
+    /// PLAN_VIEW_TEXEL_BYTES`, pixels and nothing else — while the level it
+    /// was compared to also carried each entry's hover field. So a cache
+    /// whose budget said "two rasters" could not hold two rasters: two
+    /// entries of a 7362 px raster priced 444,156,192 B against a capacity of
+    /// 433,592,352 B, over by exactly 10,563,840 B, which is 2 x 5,281,920 B
+    /// — the two hover charges and nothing else.
+    ///
+    /// Measured, empty steady scene, 2026-09-07: the cache duly evicted its
+    /// least-recently-used entry, and `live_bytes` did not move. **The two
+    /// entries shared one `Arc<ColorImage>`**, so the eviction shed a pane's
+    /// share of a raster nobody held a second copy of and freed nothing at
+    /// all — it bought back 211.8 MiB of a census figure and 0 B of heap.
+    /// `the_budget_and_the_price_are_one_expression` is what stops the two
+    /// drifting apart again.
+    fn entry_budget_bytes(value: &CachedRenderOutput) -> usize {
+        value.image.pixels.len() * squallar_device_profile::constants::PLAN_VIEW_TEXEL_BYTES
     }
 
     /// Move `key` to the most-recently-used end. No-op if absent.
@@ -200,35 +237,51 @@ impl RenderCache {
     /// capacities.
     pub fn insert(&mut self, key: RenderKey, value: CachedRenderOutput) {
         let bytes = Self::entry_bytes(&value);
+        let budgeted = Self::entry_budget_bytes(&value);
         if let Some(old) = self.entries.insert(key.clone(), value) {
             // Replacing an existing entry: it is already in `recency`, just refresh it.
             self.resident_bytes = self.resident_bytes.saturating_sub(Self::entry_bytes(&old));
+            self.budgeted_bytes = self
+                .budgeted_bytes
+                .saturating_sub(Self::entry_budget_bytes(&old));
             self.touch(&key);
         } else {
             self.recency.push_back(key);
         }
         self.resident_bytes += bytes;
+        self.budgeted_bytes += budgeted;
+        // `budgeted_bytes`, never `resident_bytes`: the capacity is a count of
+        // rasters priced at their pixels, and comparing a figure that also
+        // carries hover fields against it evicts entries the budget had room
+        // for. See [`Self::entry_budget_bytes`].
         while self.entries.len() > self.capacity
-            || (self.resident_bytes > self.byte_capacity && self.entries.len() > 1)
+            || (self.budgeted_bytes > self.byte_capacity && self.entries.len() > 1)
         {
             let Some(oldest) = self.recency.pop_front() else {
                 break;
             };
             if let Some(gone) = self.entries.remove(&oldest) {
                 self.resident_bytes = self.resident_bytes.saturating_sub(Self::entry_bytes(&gone));
+                self.budgeted_bytes = self
+                    .budgeted_bytes
+                    .saturating_sub(Self::entry_budget_bytes(&gone));
             }
         }
     }
 
     /// Drop every entry whose key fails `keep`.
     pub fn retain(&mut self, keep: impl Fn(&RenderKey) -> bool) {
-        let freed: usize = self
-            .entries
-            .iter()
-            .filter(|(k, _)| !keep(k))
-            .map(|(_, v)| Self::entry_bytes(v))
-            .sum();
+        let (freed, freed_budgeted) = self.entries.iter().filter(|(k, _)| !keep(k)).fold(
+            (0usize, 0usize),
+            |(bytes, budgeted), (_, v)| {
+                (
+                    bytes + Self::entry_bytes(v),
+                    budgeted + Self::entry_budget_bytes(v),
+                )
+            },
+        );
         self.resident_bytes = self.resident_bytes.saturating_sub(freed);
+        self.budgeted_bytes = self.budgeted_bytes.saturating_sub(freed_budgeted);
         self.entries.retain(|k, _| keep(k));
         self.recency.retain(|k| keep(k));
     }
@@ -237,6 +290,7 @@ impl RenderCache {
         self.entries.clear();
         self.recency.clear();
         self.resident_bytes = 0;
+        self.budgeted_bytes = 0;
     }
 
     /// Empty the cache and hand every entry back, owned, with the bytes they
@@ -245,6 +299,7 @@ impl RenderCache {
         let bytes = self.resident_bytes;
         self.recency.clear();
         self.resident_bytes = 0;
+        self.budgeted_bytes = 0;
         (
             self.entries.drain().map(|(_, value)| value).collect(),
             bytes,

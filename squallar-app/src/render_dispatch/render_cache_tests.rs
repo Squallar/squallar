@@ -562,3 +562,96 @@ fn the_resident_total_survives_replacement_retention_and_clearing() {
     cache.clear();
     assert_eq!(cache.resident_bytes(), 0, "clear did not release bytes");
 }
+
+/// **The budget and the price are one expression.**
+///
+/// `Budgets::render_cache_budget_bytes` is `entries *
+/// converted_raster_bytes(side)`; the level compared against it must be
+/// entries priced by that same function and nothing else. The two were the
+/// same expression plus a hover field until 2026-09-07, and the extra term
+/// made a cache whose budget said "two rasters" hold one.
+///
+/// Tied to the expression rather than to a recorded number on purpose: a
+/// pinned constant goes stale the moment `PLAN_VIEW_TEXEL_BYTES` or the raster
+/// sides move, and would then pin the wrong thing quietly.
+#[test]
+fn the_budget_and_the_price_are_one_expression() {
+    for side in [16, 32, 64, 100] {
+        let entry = output_of_side(230.0, side);
+        assert_eq!(
+            RenderCache::entry_budget_bytes(&entry),
+            squallar_device_profile::constants::converted_raster_bytes(side),
+            "the cache prices a {side} px raster in a denominator the budget \
+             does not use"
+        );
+    }
+}
+
+/// **A budget of N rasters holds N rasters.**
+///
+/// The regression this exists for: with the hover field charged against a
+/// budget that counts pixels only, two entries of one side priced above a
+/// two-raster capacity and the cache evicted one. On the measured scene that
+/// eviction freed **0 B** — the two entries shared one `Arc<ColorImage>` — so
+/// it bought nothing and cost a pane its shared raster. Both consumers of the
+/// cache (`dispatch_pane_renders`, which reuses a hit outright, and
+/// `maybe_spawn_speculative_render`, which returns early on one) then miss and
+/// dispatch a full plan-view render.
+///
+/// **Red before this commit, green after, and it needs no board to say so** —
+/// which matters because `1bda4d48d` landed the same afternoon and a green
+/// board alone cannot distinguish this fix working from that one.
+#[test]
+fn a_byte_budget_of_n_rasters_holds_n_rasters() {
+    const SIDE: usize = 64;
+    let budget = 2 * squallar_device_profile::constants::converted_raster_bytes(SIDE);
+    let mut cache = RenderCache::new(MAX_RENDER_CACHE_ENTRIES, budget);
+    cache.insert(key("KTLX", 5), output_of_side(230.0, SIDE));
+    cache.insert(key("KTLX", 9), output_of_side(240.0, SIDE));
+    assert_eq!(
+        cache.entry_count(),
+        2,
+        "a budget of two rasters could not hold two rasters; the hover field \
+         is being charged against a capacity that counts pixels"
+    );
+}
+
+/// **The case where the budget must still bite.** Without this the fix above
+/// is satisfied by a cache that never evicts on bytes at all, which would turn
+/// a corrected denominator into an unbounded cache — the opposite defect and a
+/// far worse one on a 250 MiB target.
+#[test]
+fn a_byte_budget_of_one_raster_holds_one_raster() {
+    const SIDE: usize = 64;
+    let budget = squallar_device_profile::constants::converted_raster_bytes(SIDE);
+    let mut cache = RenderCache::new(MAX_RENDER_CACHE_ENTRIES, budget);
+    cache.insert(key("KTLX", 5), output_of_side(230.0, SIDE));
+    cache.insert(key("KTLX", 9), output_of_side(240.0, SIDE));
+    assert_eq!(
+        cache.entry_count(),
+        1,
+        "the byte budget stopped evicting; a corrected denominator must not \
+         become an unbounded cache"
+    );
+}
+
+/// **The census figure still carries the hover field.** Splitting the budget
+/// denominator out must not quietly shrink what `render cache` reports: the
+/// hover is resident host memory whether or not the budget counts it.
+#[test]
+fn the_census_figure_still_carries_the_hover_field() {
+    const SIDE: usize = 64;
+    let entry = output_of_side(230.0, SIDE);
+    let hover = entry.hover.resident_bytes();
+    assert!(
+        hover > 0,
+        "the fixture's hover is empty; this proves nothing"
+    );
+    let mut cache = RenderCache::new(MAX_RENDER_CACHE_ENTRIES, usize::MAX);
+    cache.insert(key("KTLX", 5), entry);
+    assert_eq!(
+        cache.resident_bytes(),
+        squallar_device_profile::constants::converted_raster_bytes(SIDE) + hover,
+        "the census family lost the hover field when the budget gave it up"
+    );
+}
