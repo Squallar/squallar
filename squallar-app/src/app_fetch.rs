@@ -1687,16 +1687,34 @@ impl super::App {
         // trapped the rig's tab reinstates itself, and it is refusable.
         //
         // A refusal returns before the pane's parked wish is consumed, so the
-        // wish survives: the config still round-trips with the loop in it and
-        // the loop arms on a session with room for it. It does not retry in
-        // this one - `hydrate_parked_panes` took the App's queue by
-        // `mem::take` and nothing here puts the entry back - so a refusal is
-        // one refusal, not a spin.
+        // wish survives on the pane: the config still round-trips with the
+        // loop in it.
+        //
+        // **And it goes back on the App's retry queue, which it did not until
+        // 2026-09-07.** `hydrate_parked_panes` takes that queue by
+        // `mem::take`, and nothing here put the entry back, so one refusal was
+        // one refusal *for the whole session*: the user could not shorten
+        // their lookback, close a pane or turn off a layer and try again --
+        // only restarting the app would ask a second time. The wish being
+        // persisted made it every session, not one. A transient shortage
+        // became a lasting loss of function, and that is a worse outcome than
+        // the allocation the door prevented.
+        //
+        // Re-queued, this is the same park the `TransportNotReady` arm below
+        // makes and it drains the same way. What keeps it from spinning is
+        // `hydrate_parked_panes`, which holds a refused pane until the App
+        // publishes a fresher table -- the only thing that can change the
+        // answer.
         let want = self.admission.pane(pane_idx).arm_loop;
         if !self
             .admission
             .enforce(squallar_egui::admission::Act::ArmLoop, Some(pane_idx), want)
         {
+            self.loop_arm_pending.push((
+                pane_idx,
+                squallar_egui::pane::LoopArm { playing: autoplay },
+                lookback_secs,
+            ));
             return;
         }
         // One clock reading for both halves of the range, so a forward-reaching
@@ -1954,6 +1972,16 @@ impl super::App {
         // scan's own arrival notifies one -- so the checks per pass stay a
         // few field reads, never a poll of anything remote.
         for (pane_idx, arm, lookback) in std::mem::take(&mut self.loop_arm_pending) {
+            // **A loop the door already refused re-parks itself below and
+            // costs one memo lookup to do it.** There is deliberately no
+            // "skip a refused pane" test here: the ledger answers a repeat
+            // from `(act, pane)` without logging, re-stamping the notice or
+            // moving a counter, so a guard here would save a `Vec` index and
+            // a short linear scan -- and, having no observable of its own,
+            // would be a branch no test could redden. What holds the entry
+            // until a fresher table is the memo, and `AdmissionLedger::adopt`
+            // clearing it is what releases the loop the moment the App
+            // publishes room.
             self.handle_enable_loop(pane_idx, lookback, arm.playing);
         }
     }

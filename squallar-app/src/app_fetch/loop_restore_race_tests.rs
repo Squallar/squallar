@@ -379,3 +379,132 @@ fn a_transport_that_cannot_list_still_leaves_loop_mode() {
          infinite retry",
     );
 }
+
+/// A cost table with `spare` on both pools and `arm_loop` priced for pane 0.
+fn admission_table(generation: u64, spare_bytes: u64) -> squallar_egui::admission::AdmissionCosts {
+    squallar_egui::admission::AdmissionCosts {
+        generation,
+        spare: squallar_device_profile::admit::Spare {
+            gpu_bytes: Some(spare_bytes),
+            host_bytes: Some(spare_bytes),
+            joint_bytes: None,
+        },
+        panes: vec![squallar_egui::admission::PaneAdmission {
+            arm_loop: squallar_device_profile::admit::Increment::host(512 * 1024 * 1024),
+            cadence_secs: Some(230),
+            ..Default::default()
+        }],
+        new_pane: squallar_device_profile::admit::Increment::ZERO,
+        layer_grids: Vec::new(),
+        frames: squallar_device_profile::admit::LoopFrames {
+            render_budget: 14,
+            reachable: 14,
+        },
+        requested_percent: (50, 50),
+    }
+}
+
+/// **A refused loop is not lost for the session — the user lowers their ask
+/// and gets it on the next table.**
+///
+/// This is the behaviour a refusal took away, and it is one layer above the
+/// queue: asserting only that the entry was re-parked would pass on a build
+/// where nothing ever drained it again. So the whole gesture is driven — the
+/// refusal, the user freeing room, the App's next telemetry tick — and what
+/// is asserted at the end is that the loop is **armed**.
+///
+/// Until 2026-09-07 the refusal returned without re-queueing and
+/// `hydrate_parked_panes` had already taken the queue by `mem::take`, so the
+/// only way to ask a second time was to restart the app. The wish is
+/// persisted, so that was not one session: it was every session.
+#[test]
+fn a_refused_loop_arms_once_the_user_makes_room_for_it() {
+    let end = scan_stamp();
+    let listed: Vec<_> = [8i64, 4, 0]
+        .iter()
+        .map(|m| end - chrono::Duration::minutes(*m))
+        .collect();
+    let mut app = app_restored_wanting_a_loop(listed, true);
+    // The scan the loop anchors on has landed, so nothing but the door can
+    // stop the arm: this test must not pass on `TransportNotReady`.
+    {
+        let pane = app.gui.pane_mut(0).expect("the fixture built one pane");
+        pane.scan_info = Some(scan_info_for("KTLX"));
+        // What `Gui::load_ui_config` writes on the pane itself, which the
+        // shared fixture above does not: the restore parks the wish in BOTH
+        // of its homes, and half of the property under test is that a
+        // refusal spends neither.
+        pane.loop_arm_pending = Some(LoopArm { playing: true });
+    }
+
+    // A table with no room, and an arm priced well past it.
+    app.admission.adopt(&admission_table(1, 8 * 1024 * 1024));
+    app.hydrate_parked_panes();
+
+    assert_eq!(
+        app.gui
+            .pane(0)
+            .expect("the fixture built one pane")
+            .time_state(&known::RADAR)
+            .phase,
+        LoopPhase::Inactive,
+        "precondition: the door must actually have refused this arm",
+    );
+    assert!(
+        !app.loop_arm_pending.is_empty(),
+        "a refused loop that leaves the retry queue is a loop the user \
+         cannot ask for again without restarting the app",
+    );
+    assert_eq!(
+        app.gui
+            .pane(0)
+            .expect("the fixture built one pane")
+            .loop_arm_pending,
+        Some(LoopArm { playing: true }),
+        "and the pane keeps the wish, so a save during the wait still writes \
+         the loop back",
+    );
+    assert!(
+        app.admission
+            .notice(web_time::Instant::now())
+            .is_some_and(|notice| notice.text.contains("MB")),
+        "a refusal the user cannot see is worse than the allocation it \
+         prevented",
+    );
+
+    // **Redraws are not verdicts.** Twenty more hydrate passes against the
+    // same table must not re-take the decision - nothing that could change
+    // it has happened. This is the ledger's `(act, pane)` memo doing the
+    // work: the door is still entered every pass, and answers from the memo
+    // without logging, re-stamping the notice or counting a second time.
+    let after_first = app.admission.counts();
+    for _ in 0..20 {
+        app.hydrate_parked_panes();
+    }
+    assert_eq!(
+        app.admission.counts(),
+        after_first,
+        "the door was re-asked by the redraw rate rather than by the scene",
+    );
+    assert!(!app.loop_arm_pending.is_empty(), "and it is still queued");
+
+    // The user turns off a layer; the next telemetry tick publishes the room.
+    app.admission.adopt(&admission_table(2, 1024 * 1024 * 1024));
+    app.hydrate_parked_panes();
+
+    let pane = app.gui.pane(0).expect("the fixture built one pane");
+    assert_eq!(
+        pane.time_state(&known::RADAR).phase,
+        LoopPhase::FetchingScanList,
+        "the loop the user re-asked for must arm - this is the function a \
+         refusal used to take for the rest of the session",
+    );
+    assert!(
+        pane.time_state(&known::RADAR).autoplay_on_ready,
+        "and a loop persisted PLAYING must still be asking to play",
+    );
+    assert!(
+        app.loop_arm_pending.is_empty(),
+        "an armed loop leaves the retry queue",
+    );
+}
