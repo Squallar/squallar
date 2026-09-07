@@ -29,6 +29,83 @@ pub use squallar_source::hit::{HitItems, HitResolve};
 /// count — see [`OverlayRegistry::status_line`].
 pub const STATUS_MARK: &str = "!";
 
+/// **Every registry identity lookup, and what it costs to resolve one** — the
+/// `overlay lookups` family, always on and thread-local.
+///
+/// Three quantities with three different denominators, never added:
+///
+/// - a **lookup** is one `&LayerId -> &dyn OverlayHandler` resolution asked of
+///   [`OverlayRegistry`]. The layer walk asks for one every time it needs any
+///   property of any layer, so this counts the walk's *questions*.
+/// - a **probe** is one registered id compared while answering a lookup. A
+///   linear resolver makes this the registry's size on a miss and half of it on
+///   an average hit, so `probes / lookups` is the resolver's shape rather than
+///   the walk's.
+/// - a **vcall** is one [`OverlayHandler::id`] call made while answering a
+///   lookup. It is a virtual call through `dyn`, so it cannot inline and it
+///   builds and drops a `LayerId` per probe. **A resolver that keeps the ids it
+///   was built with makes zero of these**, which is what
+///   `registry_lookups_ask_no_handler_its_own_id` pins.
+///
+/// Thread-local rather than atomic: the walk runs on the frame thread, and a
+/// `lock xadd` per probe would cost more than the probe it is counting. A
+/// reader therefore sees **its own thread's** figures.
+///
+/// **What the counting itself costs, since this lane is about frame time and
+/// an instrument with no figure for its own cost is the defect it is meant to
+/// find.** One thread-local access per lookup, not one per counter: the three
+/// numbers live in ONE `Cell` so [`note`] is a single const-initialised TLS
+/// read-modify-write however many quantities it carries. On the six-pane scene
+/// that is 522 of them per frame — against the 4,584 virtual calls the
+/// resolver they measure no longer makes.
+pub mod lookup_ledger {
+    use std::cell::Cell;
+
+    /// The three counters, in one cell so one TLS access reaches all of them.
+    #[derive(Clone, Copy, Default)]
+    struct Counts {
+        lookups: u64,
+        probes: u64,
+        vcalls: u64,
+    }
+
+    thread_local! {
+        static COUNTS: Cell<Counts> = const {
+            Cell::new(Counts {
+                lookups: 0,
+                probes: 0,
+                vcalls: 0,
+            })
+        };
+    }
+
+    /// One resolution, having compared `probes` ids and made `vcalls` calls to
+    /// [`OverlayHandler::id`](super::OverlayHandler::id) doing it.
+    pub(super) fn note(probes: u64, vcalls: u64) {
+        COUNTS.with(|c| {
+            let mut counts = c.get();
+            counts.lookups = counts.lookups.wrapping_add(1);
+            counts.probes = counts.probes.wrapping_add(probes);
+            counts.vcalls = counts.vcalls.wrapping_add(vcalls);
+            c.set(counts);
+        });
+    }
+
+    /// `(lookups, probes, vcalls)` on **this thread** since the last
+    /// [`reset`].
+    pub fn read() -> (u64, u64, u64) {
+        COUNTS.with(|c| {
+            let counts = c.get();
+            (counts.lookups, counts.probes, counts.vcalls)
+        })
+    }
+
+    /// Zero this thread's three counters.
+    pub fn reset() {
+        COUNTS.with(|c| c.set(Counts::default()));
+    }
+}
+
 /// **Bytes of overlay ITEM data installed across every layer on this
 /// instance** — the `overlay items` heap-census family.
 ///
@@ -72,6 +149,23 @@ pub fn parked_item_bytes() -> u64 {
 
 pub struct OverlayRegistry {
     handlers: Vec<Box<dyn OverlayHandler>>,
+    /// **Every handler's id, in `handlers`' own order**, taken once when the
+    /// registry was built.
+    ///
+    /// Not a cache of something that could go stale: the handler vector is
+    /// **fixed by construction**. [`Self::with_handlers`] is the only place it
+    /// is ever filled, and nothing pushes to it, removes from it or reorders it
+    /// afterwards -- every other site indexes or iterates. So `ids[i]` is
+    /// `handlers[i].id()` for the life of the registry, and
+    /// `registry_ids_match_their_handlers` holds it to that.
+    ///
+    /// It exists because [`OverlayHandler::id`] is a **virtual call that
+    /// returns an owned `LayerId`**, and resolving an id by asking each
+    /// candidate for its own made every lookup cost one indirect call per
+    /// registered layer -- on a walk that asks a lookup per layer per question
+    /// per pane per frame. Reading the ids out of a flat vector is the same
+    /// comparison with none of the calls.
+    ids: Vec<LayerId>,
     /// Populated by map clicks; paged through in the popup.
     pub selected_overlays: Vec<Arc<dyn OverlayItem>>,
     pub selected_overlay_page: usize,
@@ -86,24 +180,42 @@ impl Default for OverlayRegistry {
 
 impl OverlayRegistry {
     pub fn with_handlers(handlers: Vec<Box<dyn OverlayHandler>>) -> Self {
+        // The one place `ids` is filled, and the one place `handlers` is.
+        let ids = handlers.iter().map(|h| h.id()).collect();
         Self {
             handlers,
+            ids,
             selected_overlays: Vec::new(),
             selected_overlay_page: 0,
         }
     }
 
+    /// **Where `id` sits in the handler vector**, or `None` for an id this
+    /// build does not register.
+    ///
+    /// The one resolver: [`Self::handler`] and [`Self::handler_mut`] are both
+    /// this plus an index, so a shared and a mutable lookup cannot disagree
+    /// about which handler an id names, and the ledger counts each of them
+    /// exactly once.
+    fn index_of(&self, id: &LayerId) -> Option<usize> {
+        let mut probes = 0u64;
+        let found = self.ids.iter().position(|held| {
+            probes += 1;
+            held == id
+        });
+        // Zero vcalls: the ids came off the handlers once, at construction.
+        lookup_ledger::note(probes, 0);
+        found
+    }
+
     fn handler(&self, id: &LayerId) -> Option<&dyn OverlayHandler> {
-        self.handlers.iter().find(|h| &h.id() == id).map(|h| &**h)
+        let idx = self.index_of(id)?;
+        Some(&*self.handlers[idx])
     }
 
     fn handler_mut(&mut self, id: &LayerId) -> Option<&mut dyn OverlayHandler> {
-        for handler in &mut self.handlers {
-            if &handler.id() == id {
-                return Some(&mut **handler);
-            }
-        }
-        None
+        let idx = self.index_of(id)?;
+        Some(&mut *self.handlers[idx])
     }
 
     pub fn handlers(&self) -> impl Iterator<Item = &dyn OverlayHandler> {
@@ -1293,6 +1405,81 @@ mod overlay_kind_stays_deleted_tests {
             "overlay_state.rs names `{KIND_NAME}` again — the deleted layer \
              enum. Nothing should reference it, including prose: it no longer \
              exists to be read.",
+        );
+    }
+}
+
+/// **The id vector and the handler vector, held to each other.**
+///
+/// [`OverlayRegistry::ids`] exists so a lookup never has to ask a handler its
+/// own identity. That is only sound while the two vectors agree, and the thing
+/// that would break the agreement — a push, a removal or a reorder after
+/// construction — is not something the type prevents. So these pin it against
+/// the registry the app actually runs.
+#[cfg(test)]
+mod id_cache_tests {
+    use super::*;
+    use crate::render::handlers::sources;
+
+    /// Position for position, the cached id is the handler's own answer.
+    #[test]
+    fn registry_ids_match_their_handlers() {
+        let registry = OverlayRegistry::with_handlers(sources());
+        assert_eq!(
+            registry.ids.len(),
+            registry.handlers.len(),
+            "the registry holds {} ids for {} handlers",
+            registry.ids.len(),
+            registry.handlers.len(),
+        );
+        for (idx, handler) in registry.handlers.iter().enumerate() {
+            assert_eq!(
+                registry.ids[idx],
+                handler.id(),
+                "handler {idx} answers {:?} and the registry filed it under \
+                 {:?}: a lookup for either id reaches the wrong handler.",
+                handler.id(),
+                registry.ids[idx],
+            );
+        }
+    }
+
+    /// **The resolver answers what a scan would**, for every id this build
+    /// registers and for one it does not.
+    ///
+    /// The scan spelled here on purpose: it is the resolver the cached ids
+    /// replaced, and a parity test against the thing being replaced is the
+    /// only one that can catch a cache that is internally consistent and
+    /// wrong.
+    #[test]
+    fn resolution_matches_a_scan_over_the_handlers() {
+        let registry = OverlayRegistry::with_handlers(sources());
+        let every: Vec<LayerId> = registry.handlers.iter().map(|h| h.id()).collect();
+        for id in &every {
+            let scanned = registry
+                .handlers
+                .iter()
+                .position(|h| &h.id() == id)
+                .expect("every id in `every` came off a handler");
+            assert_eq!(
+                registry.index_of(id),
+                Some(scanned),
+                "the resolver puts {id:?} at {:?} and a scan finds it at \
+                 {scanned}",
+                registry.index_of(id),
+            );
+        }
+        // An id no handler answers to. `FakeSource` is a retired reservation
+        // that nothing registers, which is exactly the shape of a config file
+        // naming a layer this build dropped.
+        assert_eq!(
+            registry.index_of(&known::FAKE_SOURCE),
+            None,
+            "an unregistered id resolved to a handler",
+        );
+        assert!(
+            registry.handler(&known::FAKE_SOURCE).is_none(),
+            "an unregistered id resolved to a handler",
         );
     }
 }
