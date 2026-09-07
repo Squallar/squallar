@@ -3402,7 +3402,11 @@ impl ApplicationHandler for App {
         // The shared loop frames' handles are the dying device's too; every
         // pane's copies go in `clear_graphics_state`, and the store's here.
         drop(self.loop_frames.clear());
-        self.gui.clear_graphics_state(); // Keep cached_render intact so we can re-upload the texture
+        // Every pane's live handles go with the device. The pixels behind them
+        // stay in the shared render cache, so the first frame after the resume
+        // repairs each pane with an upload rather than a render -- see
+        // `App::restore_cached_render`.
+        self.gui.clear_graphics_state();
         self.window = None;
         self.state = None;
         // The third holder of that window, and the only one this thread does not own
