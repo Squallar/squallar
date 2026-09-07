@@ -8,7 +8,7 @@ nexrad-level3/src/model/symbology.rs	5	5
 squallar-alloc/src/lib.rs	63	62
 squallar-app/src/app.rs	1646	1201
 squallar-app/src/app_chunks.rs	220	133
-squallar-app/src/app_fetch.rs	1958	1651
+squallar-app/src/app_fetch.rs	1958	1627
 squallar-app/src/app_render.rs	4255	3542
 squallar-app/src/app_state.rs	77	0
 squallar-app/src/budget_arms.rs	17	17
@@ -44,6 +44,7 @@ squallar-buildings/src/footprint.rs	179	164
 squallar-buildings/src/jobs.rs	173	171
 squallar-buildings/src/prism.rs	152	148
 squallar-buildings/src/tile.rs	40	40
+squallar-car/src/lib.rs	824	797
 squallar-device-profile/src/admit.rs	99	98
 squallar-device-profile/src/budget.rs	352	306
 squallar-device-profile/src/constants.rs	47	44
@@ -92,7 +93,7 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	306	268
 squallar-egui/src/tile_mesh/ledger.rs	77	46
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	1542	1477
+squallar-egui/src/tile_source.rs	1542	1476
 squallar-egui/src/tile_source/byte_lru.rs	272	271
 squallar-egui/src/tile_source/cache_ledger.rs	178	138
 squallar-egui/src/tile_source/snap.rs	157	157
@@ -152,8 +153,8 @@ squallar-gpu/src/lib.rs	1	0
 squallar-gpu/src/pressure.rs	18	18
 squallar-gpu/src/staging_ring.rs	105	39
 squallar-gpu/src/tile_mesh.rs	450	55
-squallar-icon/src/lib.rs	203	198
-squallar-icon/src/main.rs	114	0
+squallar-icon/src/lib.rs	213	198
+squallar-icon/src/main.rs	146	0
 squallar-kv/src/lib.rs	14	14
 squallar-location/src/android/location.rs	222	24
 squallar-location/src/android/mod.rs	104	10
@@ -223,7 +224,7 @@ squallar-overlays/src/render/handlers/location.rs	76	58
 squallar-overlays/src/render/handlers/metar.rs	637	522
 squallar-overlays/src/render/handlers/mod.rs	103	102
 squallar-overlays/src/render/handlers/model.rs	2562	2419
-squallar-overlays/src/render/handlers/mrms.rs	669	598
+squallar-overlays/src/render/handlers/mrms.rs	669	599
 squallar-overlays/src/render/handlers/outlook.rs	1516	1439
 squallar-overlays/src/render/handlers/reports.rs	725	658
 squallar-overlays/src/render/handlers/sites.rs	98	80
