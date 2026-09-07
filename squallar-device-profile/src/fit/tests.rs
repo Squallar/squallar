@@ -639,6 +639,11 @@ fn per_pane_terms_fold_back_to_the_whole_bit_exactly() {
                 assert_eq!(whole.pictures_host, sum(|p| p.pictures_host), "{ctx}");
                 assert_eq!(whole.loop_scans_host, sum(|p| p.loop_scans_host), "{ctx}");
                 assert_eq!(
+                    whole.volume_grids_host,
+                    sum(|p| p.volume_grids_host),
+                    "{ctx}: a grid's host half adds across panes exactly as its texture does",
+                );
+                assert_eq!(
                     whole.render_peak_host,
                     parts.iter().map(|p| p.render_peak_host).max().unwrap_or(0),
                     "{ctx}: the render peak is a max across panes, never a sum",
@@ -3400,4 +3405,316 @@ fn a_panes_own_scan_reserve_prices_the_frames_it_has_not_fetched() {
         at_tiny.loop_scans_host, at_sentinel.loop_scans_host,
         "a small per-site figure priced below the class bootstrap",
     );
+}
+
+/// **A resident voxel grid is charged on BOTH memories, and the host half is
+/// the index plane and its table.**
+///
+/// The device holds the widened texture (`stand_in_grid_bytes`, four bytes a
+/// cell here as the raymarch's own arithmetic is four bytes a cell plus its
+/// layout); the host holds `VolumeGrid::indices` at one byte a cell and the
+/// transfer table beside it. Every figure below is spelled from the cell
+/// budget rather than as a literal, so a bracket that re-spends its cells
+/// costs this test nothing.
+#[test]
+fn a_voxel_grid_is_priced_on_the_host_as_well_as_the_device() {
+    for limits in BudgetLimits::SHIPPED {
+        let b = resolve(&shipped_profile(limits));
+        let cells =
+            u64::from(b.grid_cells[0]) * u64::from(b.grid_cells[1]) * u64::from(b.grid_cells[2]);
+        let host = crate::constants::volume_grid_host_bytes(b.grid_cells);
+        assert_eq!(
+            host,
+            cells * crate::constants::HOST_GRID_BYTES_PER_CELL as u64
+                + crate::constants::VOLUME_LUT_BYTES as u64,
+            "{}: the index plane and the table, and nothing else",
+            limits.name,
+        );
+
+        let still = need_terms_for_pane(
+            &volume_pane([2560, 1440], GroundPass::On),
+            &b,
+            stand_in_grid_bytes,
+        );
+        assert_eq!(still.grids, cells * 4, "{}: the texture", limits.name);
+        assert_eq!(
+            still.volume_grids_host, host,
+            "{}: one live grid, one index plane",
+            limits.name,
+        );
+        assert!(
+            still.host_bytes() >= host,
+            "{}: and it reaches the pane's own host total",
+            limits.name,
+        );
+
+        // A 2D pane builds no grid on either memory.
+        let plan = need_terms_for_pane(
+            &plan_pane(HD, true, TWO_HOURS, PRECIP),
+            &b,
+            stand_in_grid_bytes,
+        );
+        assert_eq!(plan.grids, 0, "{}", limits.name);
+        assert_eq!(
+            plan.volume_grids_host, 0,
+            "{}: a plan view rasterises, it does not resample",
+            limits.name,
+        );
+    }
+}
+
+/// **A 3D loop holds one grid per frame on the host, exactly as it does on the
+/// device** — `VolumeStore` keeps an `Arc<VolumeGrid>` for every frame the
+/// pass attaches under `Hold::Set`, so the host term is the frame count times
+/// one grid's index plane, the same frame count the `loops` term buys textures
+/// for. And the two 2D loop arms stay at zero, because their host buffers
+/// belong to the render that is running (`render_peak_host`) and not to the
+/// frames that are held.
+#[test]
+fn a_three_d_loop_charges_one_index_plane_per_frame() {
+    for limits in BudgetLimits::SHIPPED {
+        let b = resolve(&shipped_profile(limits));
+        let host = crate::constants::volume_grid_host_bytes(b.grid_cells);
+        let cells = host - crate::constants::VOLUME_LUT_BYTES as u64;
+
+        let looping = PaneNeed {
+            looping: true,
+            loop_span_secs: TWO_HOURS,
+            cadence_secs: PRECIP,
+            ..volume_pane([2560, 1440], GroundPass::On)
+        };
+        let terms = need_terms_for_pane(&looping, &b, stand_in_grid_bytes);
+        let frames = loop_frames(&looping, &b) as u64;
+        assert!(frames > 0, "{}: the fixture has to loop", limits.name);
+        // The live grid plus one per frame — the same shape as `grids` plus
+        // `loops`, spelled off the frame count rather than pinned.
+        assert_eq!(
+            terms.volume_grids_host,
+            host * (frames + 1),
+            "{}: one grid per frame, and the live one beside them",
+            limits.name,
+        );
+        assert_eq!(
+            terms.loops,
+            cells * 4 * frames,
+            "{}: their textures",
+            limits.name
+        );
+
+        // A plan-view loop and a cross-section loop hold no grid at all.
+        for pane in [
+            plan_pane(HD, true, TWO_HOURS, PRECIP),
+            PaneNeed {
+                view: RenderView::CrossSection,
+                ..plan_pane(HD, true, TWO_HOURS, PRECIP)
+            },
+        ] {
+            assert_eq!(
+                need_terms_for_pane(&pane, &b, stand_in_grid_bytes).volume_grids_host,
+                0,
+                "{}: a 2D loop's host buffers are the render's, priced at render_peak_host",
+                limits.name,
+            );
+        }
+
+        // An overlay loop rasterises a picture and resamples nothing.
+        let overlay = PaneNeed {
+            overlay_frame_bytes: 4 << 20,
+            ..plan_pane(HD, true, TWO_HOURS, PRECIP)
+        };
+        assert_eq!(
+            need_terms_for_pane(&overlay, &b, stand_in_grid_bytes).volume_grids_host,
+            0,
+            "{}: an overlay loop builds no grid",
+            limits.name,
+        );
+    }
+}
+
+/// **On one pool the grid's host half is inside the only sum there is.**
+///
+/// The freeze's shape, as a test rather than as a sentence: a `Pools::Unified`
+/// capacity tests `gpu + host` against one allowance, so a term that reaches
+/// no total escapes the test entirely. Take a joint allowance sized to admit
+/// the scene *without* the new term and show the scene is over it *with* one —
+/// which can only be true if the term is in the sum.
+#[test]
+fn on_one_pool_a_grids_host_half_is_inside_the_joint_test() {
+    let b = desktop();
+    let scene = scene_of(vec![volume_pane([2560, 1440], GroundPass::On)]);
+    let terms = need_terms(&scene, &b, stand_in_grid_bytes);
+    assert!(
+        terms.volume_grids_host > 0,
+        "the fixture has to hold a grid",
+    );
+
+    let joint = terms.total().gpu_bytes + terms.total().host_bytes;
+
+    // A pool whose allowance lands between the need with the term and the
+    // need without it. Sized from the need rather than pinned, so a bracket
+    // that re-spends its cells costs this test nothing; the interval it has
+    // to land in is asserted rather than assumed, so a rounding that moved it
+    // would fail here instead of making the test vacuous.
+    // `Capacity::unified` splits the pool in two and `NEED_FRACTION` takes
+    // three quarters of each, so the joint allowance is three quarters of the
+    // pool: aim it at the need less HALF the new term, which lands strictly
+    // inside the interval from either end.
+    let aim = joint - terms.volume_grids_host / 2;
+    let tight = Capacity::unified(aim * 4 / 3, None);
+    assert_eq!(tight.pools, Pools::Unified);
+    let allowance = tight.joint_allowance();
+    assert!(
+        joint > allowance && joint - terms.volume_grids_host < allowance,
+        "the fixture must be over WITH the term and under WITHOUT it: \
+         {joint} B of need, {allowance} B of allowance, {} B of index plane",
+        terms.volume_grids_host,
+    );
+
+    assert_eq!(
+        over(&scene, &b, &tight, stand_in_grid_bytes),
+        (true, true),
+        "one pool, one need, one allowance — and the index plane is in it",
+    );
+    // The counterfactual as subtraction on one figure, not as a second build:
+    // priced as it was before this term, the same scene fitted.
+    assert!(
+        joint - terms.volume_grids_host < allowance,
+        "{} B of index plane is the whole of the difference",
+        terms.volume_grids_host,
+    );
+}
+
+/// **The render cache's cap prices what `RenderCache::entry_bytes` measures**:
+/// entries times one converted `Color32` raster, four bytes a pixel.
+///
+/// It is a **cap**, not a need term, and that is the model's own distinction
+/// rather than an omission. `crate::scene`'s charter puts what the scene costs
+/// in *need* — "a function of what is shown and at what resolution, never of
+/// the machine" — and what is held beyond it, evictable first under pressure,
+/// in *economy*. A cache of finished rasters is the second kind, which is why
+/// the tile caches are sized by [`tile_cache_budget`] from the economy
+/// allowance and are absent from [`NeedTerms`] too; `tiles_host` prices only
+/// the working set on the glass.
+#[test]
+fn the_render_cache_cap_prices_a_converted_raster_and_not_a_render() {
+    for limits in BudgetLimits::SHIPPED {
+        let b = resolve(&shipped_profile(limits));
+        assert_eq!(
+            b.render_cache_budget_bytes(),
+            b.render_cache_entries
+                * crate::constants::converted_raster_bytes(b.long_range_image_side_px),
+            "{}: entries times one converted raster",
+            limits.name,
+        );
+        // Four bytes a pixel, not the eight of `host_held`: the render's value
+        // grid went back to `squallar_radar::render`'s slot before the entry
+        // existed, so an entry is half what the render allocated.
+        assert_eq!(
+            crate::constants::converted_raster_bytes(b.long_range_image_side_px) * 2,
+            crate::constants::plan_view_frame_cost(b.long_range_image_side_px).host_held,
+            "{}",
+            limits.name,
+        );
+    }
+}
+
+/// **The re-priced render cache cap is exactly half the one it replaces, on
+/// every bracket, and its byte bound is reachable wherever the bracket leaves
+/// room for one.**
+///
+/// The re-pricing is exactly a halving — the same side at four bytes a pixel
+/// instead of eight — so it is spelled as that relation rather than as a
+/// table of literals. The second half is the guard against re-introducing the
+/// defect this fix removes: a cap at or above `entries x` the largest entry
+/// an arm can build is an entry count wearing a byte cap's name.
+#[test]
+fn the_render_cache_cap_is_half_what_it_was_and_stays_reachable() {
+    for limits in BudgetLimits::SHIPPED {
+        let b = resolve(&shipped_profile(limits));
+        let was = b.render_cache_entries
+            * crate::constants::plan_view_frame_cost(b.long_range_image_side_px).host_held;
+        assert_eq!(
+            b.render_cache_budget_bytes() * 2,
+            was,
+            "{}: the same side, the object's true four bytes a pixel",
+            limits.name,
+        );
+
+        // **Reachable — where the bracket leaves room for it to be.** The
+        // largest entry an arm can build is a raster at its raster ceiling.
+        // Where that ceiling is above the long-range side the cap is
+        // genuinely below `entries x` the largest entry and the byte bound
+        // fires before the count does; where the two sides are EQUAL the cap
+        // is exactly `entries x` the largest entry, and no pricing of this
+        // side can make it bind — only the hover residual can push a scene
+        // over it. That is a property of the bracket, not of this function,
+        // and it is asserted in both directions rather than assumed in one.
+        let biggest = crate::constants::converted_raster_bytes(b.raster_side_ceiling_px);
+        let reach = b.render_cache_entries * biggest;
+        if b.raster_side_ceiling_px > b.long_range_image_side_px {
+            assert!(
+                reach > b.render_cache_budget_bytes(),
+                "{}: {} entries of {biggest} B must be able to exceed the {} B cap",
+                limits.name,
+                b.render_cache_entries,
+                b.render_cache_budget_bytes(),
+            );
+        } else {
+            assert_eq!(
+                b.raster_side_ceiling_px, b.long_range_image_side_px,
+                "{}: a ceiling BELOW the long-range side would invert the bracket",
+                limits.name,
+            );
+            assert_eq!(
+                reach,
+                b.render_cache_budget_bytes(),
+                "{}: with one side the cap IS the entry count, and the byte \
+                 bound is reachable only by the hover residual",
+                limits.name,
+            );
+        }
+    }
+}
+
+/// **The cap falls with the user's own texture ceiling** — the one control
+/// that reaches it today, and the reason it is a budget rather than a
+/// constant. `TextureCeiling::hold_all` lowers every raster side including
+/// the long-range side too, so a user who caps their rasters caps the
+/// cache with them.
+///
+/// **The ladder does NOT lower it, and that is stated rather than asserted
+/// away**: the rung that lowers a raster side lowers `raster_side_ceiling_px`
+/// and leaves the long-range side alone. So this asserts monotonicity
+/// down the ladder — a rung may never *raise* it — and the real fall against
+/// the setting.
+#[test]
+fn the_render_cache_cap_falls_with_the_setting_and_never_rises_on_a_rung() {
+    for limits in BudgetLimits::SHIPPED {
+        let top = resolve(&shipped_profile(limits)).render_cache_budget_bytes();
+
+        let mut b = resolve(&shipped_profile(limits));
+        for step in 0..=9u32 {
+            demote(&mut b, &limits, step);
+            assert!(
+                b.render_cache_budget_bytes() <= top,
+                "{}: rung {step} raised the cap",
+                limits.name,
+            );
+        }
+
+        let floor_px = crate::budget::TextureCeiling::FLOOR_PX as usize;
+        let held = crate::budget::TextureCeiling::clamped(crate::budget::TextureCeiling::FLOOR_PX)
+            .hold_all(resolve(&shipped_profile(limits)));
+        assert_eq!(
+            held.render_cache_budget_bytes(),
+            held.render_cache_entries * crate::constants::converted_raster_bytes(floor_px),
+            "{}: the user's floor is what the cache is priced at",
+            limits.name,
+        );
+        assert!(
+            held.render_cache_budget_bytes() < top,
+            "{}: and it is a real fall, not the identity",
+            limits.name,
+        );
+    }
 }

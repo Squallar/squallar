@@ -1007,11 +1007,83 @@ impl Budgets {
     /// The bytes the shared render cache's entries may occupy between them,
     /// which is the bound that actually holds on it.
     ///
-    /// A **host** figure — the cache holds `egui::Color32` pixels and a
-    /// hover source, not a texture — so it takes the `host_held` term.
+    /// A **host** figure — the cache holds `egui::Color32` pixels and a hover
+    /// source, not a texture — priced at
+    /// [`constants::converted_raster_bytes`], which is what
+    /// `RenderCache::entry_bytes` measures.
+    ///
+    /// # What was wrong with this before 2026-09-07
+    ///
+    /// **It priced the wrong object.** It read `plan_view_frame_cost(..).host_held`,
+    /// eight bytes a pixel — the RGBA buffer *and* the `f32` value grid the
+    /// render allocates. A cache entry is neither: it is the converted
+    /// `Color32` image, four bytes a pixel, and the value grid went back to
+    /// `squallar_radar::render`'s slot before the entry existed.
+    ///
+    /// The bound was **not** vacuous — at 4096 px it evicted a desktop
+    /// long-range scene down to four retained entries rather than eight — but
+    /// its implied per-entry price of 134,217,728 B matched no real entry on
+    /// any arm: it over-priced a 4096 px entry by 2.0x and under-priced the
+    /// 7362 px one that has actually been measured by 1.62x. Halving it to
+    /// the object's true four bytes a pixel keeps a binding bound and makes
+    /// it bind on the right quantity.
+    ///
+    /// # Which side, and why NOT the raster ceiling
+    ///
+    /// The long-range image side, not [`Self::raster_side_ceiling_px`]. The ceiling is the side an entry can
+    /// genuinely *reach*, and a first cut of this fix used it on that
+    /// argument — a worst case is the honest price, and the ceiling is the
+    /// only one of the two the ladder's last rung lowers. **Both halves of
+    /// that were wrong, and the arithmetic says so:**
+    ///
+    /// * `entries x converted_raster_bytes(8192)` is 2048 MiB on desktop
+    ///   against the 1024 MiB this used to be. That is not a tighter budget
+    ///   priced correctly; it is **twice the room**, letting the cache hold
+    ///   eight desktop long-range entries where it held four — some 888 MB
+    ///   more resident host on the target this campaign exists for.
+    /// * And it is **effectively vacuous**, which is the defect this fix was
+    ///   opened to remove. No entry can exceed
+    ///   `converted_raster_bytes(raster_side_ceiling_px)` by more than its
+    ///   hover field, so `entries x` that figure is only ever exceeded by the
+    ///   hover: at the ceiling, eight worst entries are 2,189,692,928 B
+    ///   against a 2,147,483,648 B cap — 42 MB over, one entry's worth of
+    ///   shave, and only when every entry sits at the exact ceiling. The
+    ///   entry count would be the whole of the bound.
+    ///
+    /// The long-range side gives 512 MiB on desktop: **exactly half
+    /// what this was**, on every arm, since it is the same side at four bytes
+    /// a pixel instead of eight. It binds at two retained entries against a
+    /// measured 222,072,336 B entry, where the old figure bound at four. A
+    /// correctly-priced bound that is strictly tighter on every bracket, and
+    /// tighter is the direction to err on a byte cap.
+    ///
+    /// **It is still not fitted against a measured capacity, and that is now
+    /// the whole of what is left.** [`TextureCeiling::hold_all`] lowers this
+    /// side from the user's own control, so the cap does move with something;
+    /// the ladder does not move it, because the rung that lowers a raster side
+    /// lowers `raster_side_ceiling_px` and leaves this one alone. Making it a
+    /// function of the capacity needs a `Capacity` at the dispatcher's
+    /// construction, which is `squallar-app`'s to thread.
+    ///
+    /// # The residual, stated rather than rounded away
+    ///
+    /// `RenderCache::entry_bytes` is these pixels **plus**
+    /// `HoverSource::resident_bytes`, and that half is not here. A plan-view
+    /// entry's hover is `HoverSource::resident` — the render's own numbers, so
+    /// its pinned volume is zero — leaving `PolarField::resident_bytes`: the
+    /// wedge geometry and `radials x gates` `f32`s, **5,276,160 B for a
+    /// 720 x 1832 surveillance cut against a 216,796,176 B pixel term, 2.4 %**.
+    /// So this **under-prices an entry by about 2.4 %**, in that direction and
+    /// no other.
+    ///
+    /// It is carried as a residual rather than as a constant because it is a
+    /// property of the *data* — how many radials the cut had and how far its
+    /// gates reached — and no bracket constant can state it without going
+    /// stale the first time a VCP changes. The census family `render cache`
+    /// measures the sum of both halves directly, which is what makes this a
+    /// residual with a magnitude and a direction rather than a shrug.
     pub fn render_cache_budget_bytes(&self) -> usize {
-        self.render_cache_entries
-            * constants::plan_view_frame_cost(self.long_range_image_side_px).host_held
+        self.render_cache_entries * constants::converted_raster_bytes(self.long_range_image_side_px)
     }
 
     /// **What one static pane render costs on every memory it is held in**,
@@ -1467,7 +1539,19 @@ const LADDER: [Rung; 6] = [
             b.volume_texture_bytes = limits.volume_texture_bytes.floor;
             moved
         },
-        lowers: Lowers::GPU,
+        // **`BOTH`, and it was `GPU` until 2026-09-07.** A cell budget prices
+        // two allocations in two memories: the widened texture the raymarch
+        // uploads (`fit::NeedTerms::grids`) and the index plane the
+        // `VolumeStore` keeps (`fit::NeedTerms::volume_grids_host`). While the
+        // second was priced at zero, `GPU` was true of everything the model
+        // charged; now that it is priced, a rung that lowers the cell budget
+        // demonstrably lowers a host term too, and leaving this `GPU` would
+        // hide the rung from every host-over scene — the same class of untrue
+        // statement as the term it was hiding. **Not caught by rulings 13 or
+        // 15**: those forbid a governor lowering a granted loop's *span* or
+        // its *frame density*, and a grid's cell budget is neither — it is the
+        // resolution of one frame, which is exactly what the ladder is for.
+        lowers: Lowers::BOTH,
     },
     Rung {
         step: |b, limits| {

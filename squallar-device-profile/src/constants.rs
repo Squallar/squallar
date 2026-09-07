@@ -170,6 +170,30 @@ pub const fn raster_bytes(side: usize) -> usize {
     plan_view_frame_cost(side).host_held
 }
 
+/// **Bytes one finished plan-view raster costs the host once it has been
+/// CONVERTED for the renderer**: its `egui::Color32` pixels, four a pixel.
+///
+/// **A second buffer, not a second reading of
+/// [`plan_view_frame_cost`]'s `host_held`.** That term prices what the render
+/// itself allocates — the `Vec<u8>` RGBA out of `checkout_image` and the
+/// `Vec<f32>` value grid — and both of those go back to
+/// `squallar_radar::render`'s process-wide slots when the render is done
+/// (`recycle_image`, `recycle_values`), where `render pools` counts them.
+/// `RenderDispatcher`'s `plan_view_image` then builds an
+/// `egui::ColorImage` **from** those bytes, which is a fresh allocation with
+/// a life of its own: it is what the render cache holds, what a pane's cached
+/// render holds, what egui is handed and what the upload queue bands — one
+/// buffer, four owners, all sharing one `Arc`.
+///
+/// Four bytes a pixel because `egui::Color32` is four bytes, which is also
+/// [`PLAN_VIEW_TEXEL_BYTES`]: the same number as the GPU texture's, and a
+/// *different memory*. Spelled through this function rather than as
+/// `plan_view_frame_cost(side).gpu` so that no host total is ever summed out
+/// of a field whose name says GPU.
+pub const fn converted_raster_bytes(side: usize) -> usize {
+    side * side * PLAN_VIEW_TEXEL_BYTES
+}
+
 /// **Bytes a cross-section raster of `width × height` costs, buffer by
 /// buffer** — [`plan_view_frame_cost`]'s counterpart for the other 2D view,
 /// and stated here for the same reason.
@@ -827,6 +851,44 @@ pub const VOLUME_GRID_FLOOR_SHAPE: squallar_radar::voxel::VoxelShape =
 /// Bytes in the colour lookup table that travels with a voxel grid.
 pub const VOLUME_LUT_BYTES: usize = 256 * 4;
 
+/// One cell of a resident [`squallar_radar::voxel::VolumeGrid`]'s **index
+/// plane**, on the host: one palette index a cell, `VolumeGrid::indices`'s
+/// `Vec<u8>`.
+///
+/// The host counterpart of `squallar_volumetric::raymarch::GRID_BYTES_PER_CELL`,
+/// which is four: the plane is widened into the texture format on its way to
+/// the device (`coverage_premultiplied_into`), so the same grid is one byte a
+/// cell here and four there. Two memories, two prices.
+pub const HOST_GRID_BYTES_PER_CELL: usize = 1;
+
+/// **Bytes one resident voxel grid costs the HOST**, for a cell budget of
+/// `cells` — the counterpart of
+/// `squallar_volumetric::raymarch::resident_grid_bytes`, which prices the same
+/// grid's three *textures*.
+///
+/// The figure is `VolumeGrid::memory_bytes`'s, term for term, for the grids
+/// this application actually builds: the index plane at
+/// [`HOST_GRID_BYTES_PER_CELL`] and the transfer table at
+/// [`VOLUME_LUT_BYTES`]. **The value plane is not in it, and that is a
+/// property of the request rather than an omission**: every 3D volume this
+/// tree builds asks `values_wanted: false` (`squallar_radar::voxel`'s
+/// `volume_request_for` — "the values in their own units are a second buffer
+/// nothing up there reads"), so `VolumeGrid::values` is `None` and its
+/// `Vec<f32>` is never allocated. A build that asked for one would hold four
+/// more bytes a cell than this says.
+///
+/// **Priced from the cell BUDGET, not from the resolved shape, and the
+/// direction is stated.** The shape a device builds is
+/// [`volume_grid_shape_of`], whose `spend_budget` rounds each axis *down* to
+/// its alignment and so never yields more cells than the budget it was
+/// handed. So this over-prices a grid whose alignment lost cells and can
+/// never under-price one — the direction a budget term has to err in, and the
+/// reason no `max_axis` has to reach this function.
+pub const fn volume_grid_host_bytes(cells: [u32; 3]) -> u64 {
+    let cells = (cells[0] as u64) * (cells[1] as u64) * (cells[2] as u64);
+    cells * HOST_GRID_BYTES_PER_CELL as u64 + VOLUME_LUT_BYTES as u64
+}
+
 /// The largest 3D texture WebGL2 is *guaranteed* to accept, per axis.
 pub const WEBGL2_MAX_TEXTURE_DIMENSION_3D: u32 = 256;
 
@@ -949,6 +1011,13 @@ const _: () = const {
     // A divisor under one would make the guard a raise.
     assert!(UNIFIED_MEMORY_GPU_DIVISOR >= 1);
     assert!(MAX_RENDER_CACHE_ENTRIES > 0);
+    // The host index plane costs a whole byte a cell — a zero here would price
+    // a resident grid's host half at its transfer table alone.
+    assert!(HOST_GRID_BYTES_PER_CELL > 0);
+    // One spelling of the table that travels with a grid: `VOLUME_LUT_BYTES`
+    // is this crate's name for it, `LUT_LEN` the substrate's. A grid priced
+    // against one and built against the other is a silent gap.
+    assert!(VOLUME_LUT_BYTES == squallar_radar::voxel::LUT_LEN);
     assert!(MAX_CONCURRENT_RENDERS > 0);
     assert!(MAX_CONCURRENT_LOOP_DOWNLOADS > 0);
     // The loop timer divides by this; a reversed pair is a `clamp` that panics.

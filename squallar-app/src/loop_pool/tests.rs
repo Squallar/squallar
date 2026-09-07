@@ -2111,11 +2111,29 @@ mod budget_agreement {
         // does not fit, which is the same answer the margin and tile rungs
         // already gave here — those two buy *nothing* on a scene with no
         // pictures and no tiles, and were taken anyway.
+        //
+        // **And the grid column moved 3,538,944 -> 1,048,576 when a voxel
+        // grid's host half was priced (2026-09-07)**, by the same route as the
+        // raster column above it. The grid-cells rung was declared
+        // `Lowers::GPU` while the only thing a cell budget bought was a
+        // texture; it now also prices `NeedTerms::volume_grids_host` — the
+        // index plane `VolumeStore` keeps on the host — so it lowers both axes
+        // and a host-over walk may take it.
+        //
+        // **On THIS scene it buys nothing, and is taken anyway.** There is no
+        // 3D pane here, so `volume_grids_host` is zero and coarsening the grid
+        // frees no byte of it. That is not new behaviour: `step_down_for`
+        // takes the first rung whose declared axis is over and that moves, not
+        // the first that measurably helps, which is exactly what the margin
+        // and tile rungs are already recorded as doing two paragraphs up. What
+        // changed is the size of that set, and the direction is the honest
+        // one — the rung's `GPU` was a true statement about a model that could
+        // not see half of what a cell budget costs.
         assert_eq!(
             row(w, DeviceClass::Unknown, 16384, 16384, None, None, 1),
             (
                 Promotion::Ceiling,
-                3_538_944,
+                1_048_576,
                 5,
                 56,
                 288 - 16,
@@ -2138,8 +2156,13 @@ mod budget_agreement {
                 1
             ),
             (
+                // Moved with the row above it and for the same reason: the
+                // grid-cells rung answers the host axis now that a cell budget
+                // prices an index plane as well as a texture. The pair moving
+                // together is the point of this row — two readings that change
+                // nothing still change nothing.
                 Promotion::Ceiling,
-                3_538_944,
+                1_048_576,
                 5,
                 56,
                 288 - 16,

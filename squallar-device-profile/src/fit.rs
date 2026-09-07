@@ -7,7 +7,8 @@
 //! held in rather than a multiplier spelled at the use site, the raymarch's
 //! own resident-grid arithmetic handed in as [`GridBytes`],
 //! `quality::VolumeQuality::fit` for the offscreen, `quality::offscreen_bytes`
-//! for the mirror, the tile cache's measured entry cost,
+//! for the mirror, `constants::volume_grid_host_bytes` for the host half of
+//! the same grid, the tile cache's measured entry cost,
 //! `Budgets::prism_vram_bytes` for a pane that draws buildings, each gridded
 //! overlay's own source budget handed in on the scene, and for the decoded
 //! volume behind each radar loop frame its measured size where the cache
@@ -28,6 +29,17 @@
 //! `loans out` (9.8 – 14.2 MB) and `tile bodies` (up to 9.5 MB). Both are
 //! bounded by caches in `squallar-egui` and are together under 25 MB of a
 //! browser's 768 MiB host allowance. They are named zeroes, not silent ones.
+//!
+//! Four more census families have no term here, named on 2026-09-07 by a walk
+//! of every family against every term rather than found one at a time:
+//! `loop l3` (a Level III loop's product buffers — its frames read no volume,
+//! so [`NeedTerms::loop_scans_host`] charges it nothing and nothing else
+//! charges it either), `derive memo` (at most `DERIVE_MEMO_CAPACITY` whole
+//! derived volumes, shared by the section and 3D jobs), and `overlay items` /
+//! `overlay parked` (the feature layers' installed and retired item data,
+//! which [`NeedTerms::overlay_grids_host`] is explicitly disjoint from). Each
+//! is a measured, always-on family that no term reads; none is priced here
+//! yet, and saying so is the point.
 //!
 //! The third and largest of them — the gridded handlers' per-frame staging
 //! grids — is priced since 2026-09-06:
@@ -142,7 +154,28 @@ pub struct NeedTerms {
     ///
     /// **A sum, not a max**, unlike [`Self::picture_arrival_host`]: the
     /// arrival is one buffer for the whole application because one reply is
-    /// converted at a time, and this queue holds every band anyone has filed.
+    /// converted at a time, and each pane's batch queues on its own.
+    ///
+    /// **What this term does NOT price, corrected 2026-09-07.** Until then
+    /// the line above read "and this queue holds every band anyone has
+    /// filed", which is true of the *queue* and false of this *term*: the
+    /// arithmetic is set inside `pane_terms`'s `overlay_pictures > 0` arm and
+    /// mirrors [`Self::pictures_host`] exactly, so it prices the overlay
+    /// batch and nothing else. The queue also carries every radar raster, and
+    /// no byte of that is here.
+    ///
+    /// **And a radar band must not be added to it**, which is why this is a
+    /// correction rather than a widening. A radar raster is **one** host
+    /// buffer with four owners, not two generations: `App::apply_render_to_pane`
+    /// hands `Arc::clone(&render.image)` to `Context::load_texture`, and
+    /// `squallar_gpu`'s `Band::image` is documented as "an `Arc` egui is
+    /// already holding, so carrying it across frames costs a refcount rather
+    /// than a copy" — its `publish_pending_level` dedups by `Arc::ptr_eq` for
+    /// exactly that reason. The render cache entry, the pane's cached render,
+    /// egui's delta and the pending band are one allocation. It is priced
+    /// nowhere in this model at all — see [`Budgets::render_cache_budget_bytes`],
+    /// which bounds it at run time; putting that bound in a need term is what
+    /// the economy is for, and the tile caches are the precedent.
     pub upload_pending_host: u64,
     /// **One more picture, on the host, for the arrival in flight**: the
     /// largest picture any pane shows, once. The reply is decoded into a
@@ -262,6 +295,55 @@ pub struct NeedTerms {
     /// [`PaneTerms::render_peak_host`] states in full: this prices **one**
     /// render, and `concurrent_renders` is 6 on desktop.
     pub render_peak_host: u64,
+    /// **Every resident voxel grid's index plane, on the host**: the host
+    /// counterpart of [`Self::grids`] and of the `RenderView::Volume` arm of
+    /// [`Self::loops`], at [`crate::constants::volume_grid_host_bytes`] a grid.
+    ///
+    /// A `VolumeGrid` is two allocations in two memories. The device holds the
+    /// widened texture, its colour table and the jitter tile
+    /// (`squallar_volumetric::raymarch::resident_grid_bytes`, which
+    /// [`GridBytes`] hands in) — and those are the whole of `grids` and of a
+    /// 3D loop's frames. The host holds the grid the store built and keeps:
+    /// `VolumeGrid::indices`, one palette index a cell, and its transfer
+    /// table. `VolumeStore` keeps them as `Arc<VolumeGrid>` for as long as a
+    /// pane holds them — one per 3D pane, and **one per 3D loop frame**
+    /// (`App::make_volume_frames_resident` attaches with `Hold::Set` and
+    /// restates the whole set every pass).
+    ///
+    /// **Priced at zero until 2026-09-07, and it is the freeze's own shape.**
+    /// [`Self::grids`] is summed by [`Self::gpu_without_loops`] and by
+    /// [`PaneTerms::gpu_bytes`] and by nothing else, so the host half of a
+    /// resident grid reached no total at all. On a `Pools::Split` capacity
+    /// that under-counts the host pool; on a `Pools::Unified` one — every
+    /// integrated part — the two needs face a **single** joint test
+    /// ([`over`]), and a term absent from one axis there is not mis-split but
+    /// **absent from the only sum there is**. Out of one physical pool the
+    /// grid's texture was counted once and its index plane not at all.
+    ///
+    /// **What it is worth, with its denominators.** At the desktop cell budget
+    /// (`DESKTOP_VOLUME_GRID_CELLS`, respent by `volume_grid_shape_of` to
+    /// 512x512x32 — the same 8,388,608 cells) one grid is 38,374,400 B of
+    /// texture against **8,389,632 B of host**, so the host half is 21.9 % of
+    /// what was already charged. A 3D loop is bounded by the store's own
+    /// eviction door (`VolumeStore::enforce_budget_sparing`, which sums
+    /// **texture** bytes against `Budgets::volume_loop_bytes` — 576 MiB on
+    /// desktop), so the store holds at most fifteen grids there:
+    /// **125,844,480 B = 120.0 MiB** of host no term of this model priced.
+    ///
+    /// **The bytes were already measured, which is why this is worth saying
+    /// twice.** `squallar_egui::heap_census`'s `volume store` family is
+    /// published unconditionally on every telemetry tick
+    /// (`App::publish_heap_census`, off `VolumeStore::memory_bytes`) and reads
+    /// exactly this. An always-on host census family with no need term beside
+    /// it is this campaign's signature defect; it is named here so the next
+    /// reader does not have to re-find it.
+    ///
+    /// **A sum, not a max.** Two 3D panes on two targets hold two grids; a
+    /// pane whose target another pane already holds contributes none, because
+    /// the application zeroes its `volume_grids` and prices no loop for it
+    /// (`App::loop_demand`'s alias arm) — exactly as for the GPU terms this
+    /// mirrors.
+    pub volume_grids_host: u64,
 }
 
 impl NeedTerms {
@@ -278,7 +360,8 @@ impl NeedTerms {
                 .saturating_add(self.overlay_grids_host)
                 .saturating_add(self.loop_scans_host)
                 .saturating_add(self.still_scans_host)
-                .saturating_add(self.render_peak_host),
+                .saturating_add(self.render_peak_host)
+                .saturating_add(self.volume_grids_host),
         }
     }
 
@@ -299,6 +382,9 @@ impl NeedTerms {
         self.loop_scans_host = self.loop_scans_host.saturating_add(pane.loop_scans_host);
         self.still_scans_host = self.still_scans_host.saturating_add(pane.still_scans_host);
         self.render_peak_host = self.render_peak_host.max(pane.render_peak_host);
+        self.volume_grids_host = self
+            .volume_grids_host
+            .saturating_add(pane.volume_grids_host);
     }
 
     /// Every GPU term but the loops — what the loop pool has to fit beside.
@@ -327,6 +413,7 @@ impl NeedTerms {
             .saturating_add(self.overlay_grids_host)
             .saturating_add(self.still_scans_host)
             .saturating_add(self.render_peak_host)
+            .saturating_add(self.volume_grids_host)
     }
 }
 
@@ -418,6 +505,15 @@ pub struct PaneTerms {
     /// flight` steady above one raster, raise this to
     /// `concurrent_renders × peak` and shed the rungs that follow.
     pub render_peak_host: u64,
+    /// **This pane's resident voxel grids, on the host** — its live grid and,
+    /// where it loops in 3D, one per loop frame, each at
+    /// [`crate::constants::volume_grid_host_bytes`]. The host counterpart of
+    /// [`Self::grids`] plus the `RenderView::Volume` arm of [`Self::loops`],
+    /// and in [`Self::host_bytes`] because it adds across panes exactly as
+    /// those two do. Zero for a 2D pane, which builds no grid, and zero for a
+    /// pane whose target another pane already holds. See
+    /// [`NeedTerms::volume_grids_host`].
+    pub volume_grids_host: u64,
 }
 
 impl PaneTerms {
@@ -438,6 +534,7 @@ impl PaneTerms {
             .saturating_add(self.upload_pending_host)
             .saturating_add(self.loop_scans_host)
             .saturating_add(self.still_scans_host)
+            .saturating_add(self.volume_grids_host)
     }
 
     /// The two totals.
@@ -454,9 +551,10 @@ impl PaneTerms {
 /// mirror, the tile working set, the enabled gridded overlays' budgets.
 pub fn need_terms(scene: &Scene, budgets: &Budgets, grid_bytes: GridBytes) -> NeedTerms {
     let grid = grid_cost(budgets, grid_bytes);
+    let host_grid = host_grid_cost(budgets);
     let mut terms = NeedTerms::default();
     for pane in &scene.panes {
-        terms.fold_pane(&pane_terms(pane, budgets, grid));
+        terms.fold_pane(&pane_terms(pane, budgets, grid, host_grid));
     }
     terms.mirror = mirror_term(scene.mirror_px, budgets);
     for source in &scene.tile_sources {
@@ -479,17 +577,24 @@ pub fn need_terms(scene: &Scene, budgets: &Budgets, grid_bytes: GridBytes) -> Ne
 /// where a per-pane figure is wanted — a readout, or the increment a pane
 /// being opened would add.
 pub fn need_terms_for_pane(pane: &PaneNeed, budgets: &Budgets, grid_bytes: GridBytes) -> PaneTerms {
-    pane_terms(pane, budgets, grid_cost(budgets, grid_bytes))
+    pane_terms(
+        pane,
+        budgets,
+        grid_cost(budgets, grid_bytes),
+        host_grid_cost(budgets),
+    )
 }
 
-/// [`need_terms_for_pane`] with the grid already priced, so the scene walk
-/// prices it once.
-fn pane_terms(pane: &PaneNeed, budgets: &Budgets, grid: u64) -> PaneTerms {
+/// [`need_terms_for_pane`] with both halves of one grid already priced, so the
+/// scene walk prices each once. `grid` is what one resident grid costs the
+/// device, `host_grid` what the same grid costs the host.
+fn pane_terms(pane: &PaneNeed, budgets: &Budgets, grid: u64, host_grid: u64) -> PaneTerms {
     let static_raster = static_raster_cost(pane, budgets);
     let mut terms = PaneTerms {
         static_rasters: static_raster.gpu as u64,
         render_peak_host: static_raster.host_peak() as u64,
         grids: (pane.volume_grids as u64).saturating_mul(grid),
+        volume_grids_host: (pane.volume_grids as u64).saturating_mul(host_grid),
         offscreens: offscreen_term(pane, budgets),
         buildings: buildings_term(pane, budgets),
         ..PaneTerms::default()
@@ -497,6 +602,11 @@ fn pane_terms(pane: &PaneNeed, budgets: &Budgets, grid: u64) -> PaneTerms {
     if pane.looping {
         let frames = loop_frames(pane, budgets) as u64;
         terms.loops = frames.saturating_mul(loop_frame_bytes(pane, budgets, grid));
+        // The host half of the same frames, on the one arm that has one. See
+        // `loop_frame_host_bytes` for the two arms that are zero and why.
+        terms.volume_grids_host = terms
+            .volume_grids_host
+            .saturating_add(frames.saturating_mul(loop_frame_host_bytes(pane, host_grid)));
         // A radar loop whose frames are rendered from decoded volumes holds
         // one per frame: the ones already there at what they were measured
         // at, the ones still to come at the reserve. Monotone down the ladder
@@ -1052,6 +1162,20 @@ fn grid_cost(budgets: &Budgets, grid_bytes: GridBytes) -> u64 {
     grid_bytes(budgets.grid_cells).map_or(u64::MAX, |bytes| bytes as u64)
 }
 
+/// **One resident grid's cost on the HOST**, the counterpart of
+/// [`grid_cost`]: the index plane the store keeps and the transfer table
+/// beside it, at the cell budget this rung resolved.
+///
+/// No [`GridBytes`] hand-in, and the asymmetry with [`grid_cost`] is the
+/// point. The device figure is the raymarch's own texture-layout arithmetic —
+/// mip levels, tile rounding, a slack allowance — which lives in a crate above
+/// this one and so has to be handed in. The host figure is
+/// `VolumeGrid::memory_bytes`, a length times one byte plus a table, which
+/// this crate can state without knowing anything about a backend.
+fn host_grid_cost(budgets: &Budgets) -> u64 {
+    crate::constants::volume_grid_host_bytes(budgets.grid_cells)
+}
+
 /// **What the static render a 2D pane holds costs on every memory**: the
 /// raster ceiling's worst case for a plan view, since that is the most a
 /// device on this class can be asked to hold; the section frame for a
@@ -1090,6 +1214,34 @@ fn loop_frame_bytes(pane: &PaneNeed, budgets: &Budgets, grid: u64) -> u64 {
         RenderView::PlanView => budgets.loop_frame_cost().gpu as u64,
         RenderView::CrossSection => budgets.section_frame_cost().gpu as u64,
         RenderView::Volume => grid,
+    }
+}
+
+/// **What one frame of this pane's loop costs the HOST in resident voxel
+/// grids** — [`loop_frame_bytes`]'s counterpart, and zero on every arm but
+/// one. Each zero is a statement, not an omission:
+///
+/// * **A loop of a layer that is not radar** (`overlay_frame_bytes > 0`)
+///   rasterises a picture and builds no grid; its host side is
+///   [`PaneTerms::loop_picture_host`] and [`PaneTerms::pictures_host`].
+/// * **A plan-view or cross-section radar loop** builds no grid either, and
+///   its host buffers belong to the render that is running rather than to the
+///   frames that are held — `From<SweepRender> for RenderedFrame` hands the
+///   value grid straight back to `squallar_radar::render`'s pool. They are
+///   priced once, at [`PaneTerms::render_peak_host`], and charging them per
+///   frame here would be the denominator error that doc warns of.
+/// * **A 3D loop** is the one arm that holds a grid per frame:
+///   `App::make_volume_frames_resident` attaches every planned frame's target
+///   to the `VolumeStore` under `Hold::Set`, so the store holds one
+///   `Arc<VolumeGrid>` for each — the same frames [`loop_frame_bytes`] charges
+///   a texture for.
+fn loop_frame_host_bytes(pane: &PaneNeed, host_grid: u64) -> u64 {
+    if pane.overlay_frame_bytes > 0 {
+        return 0;
+    }
+    match pane.view {
+        RenderView::Volume => host_grid,
+        RenderView::PlanView | RenderView::CrossSection => 0,
     }
 }
 
