@@ -674,8 +674,8 @@ fn ci_staged_paths() -> BTreeSet<String> {
     // instead of a `cp`. Read as staging the whole `icons/` directory, exactly
     // as the `cp -R` it replaced was.
     for line in yaml.lines().map(str::trim) {
-        if let Some(rest) = line.split("squallar-icon -- --web ").nth(1) {
-            if let Some(under_dist) = rest
+        if let Some(rest) = line.split("squallar-icon -- --web ").nth(1)
+            && let Some(under_dist) = rest
                 .split_whitespace()
                 .next()
                 .and_then(|d| d.strip_prefix("dist/"))
@@ -683,7 +683,6 @@ fn ci_staged_paths() -> BTreeSet<String> {
                 staged.insert(under_dist.to_string());
                 cp_lines += 1;
             }
-        }
     }
     for line in yaml.lines().map(str::trim) {
         let Some(args) = line.strip_prefix("cp ") else {
