@@ -487,6 +487,17 @@ build:
 	    packaging/macos/Info.plist > "$$APP/Contents/Info.plist"
 	# An unexpanded $(...) here means a key silently ships as a literal.
 	! grep -q '\$$(' "$$APP/Contents/Info.plist" || { echo "ERROR: unexpanded build setting left in Info.plist"; exit 1; }
+	# Xcode ships every plist it bundles as a binary plist (bplist00). App
+	# Store Connect's iOS validator turned out to read one key from that form
+	# only -- 90065 with the key present in XML, cleared by this same
+	# conversion (packaging/ios/Makefile) -- so the Mac bundle takes the shape
+	# every Apple reader has actually been shown. Both channels: one bundle
+	# shape, and the direct channel's readers (Gatekeeper, LaunchServices) read
+	# binary plists from every Xcode-built app on the machine. After the
+	# expansion guard above, which greps the XML.
+	cargo run -q -p squallar-car --bin plist-binary -- "$$APP/Contents/Info.plist"
+	[ "$$(head -c 8 "$$APP/Contents/Info.plist")" = "bplist00" ] \
+	    || { echo "ERROR: Info.plist was not converted to a binary plist."; exit 1; }
 	# Apple's privacy manifest, under Contents/Resources for macOS -- iOS puts
 	# the same file at the bundle root instead, and that difference is why the
 	# placement is worth reading off Apple's rule rather than assuming the two
@@ -1239,8 +1250,11 @@ build:
 	  [ -x "$(MKPKG)" ] || { echo "ERROR: $(MKPKG) is missing or not executable."; exit 1; }
 	  PKGNAME=squallar-NOT-UPLOADABLE.pkg
 	  ( cd "$$OUT" && rm -f squallar.pkg squallar-NOT-UPLOADABLE.pkg )
+	  # MACOS_MIN goes in as the product definition's OS floor: App Store
+	  # Connect requires it to EQUAL the LSMinimumSystemVersion above (90264),
+	  # and this is the same variable that was written there.
 	  "$(MKPKG)" "$$APP" "$$BUNDLE_ID" "$$MARKETING_VERSION" "$$CURRENT_PROJECT_VERSION" \
-	      "$$OUT/squallar-unsigned.pkg"
+	      "$$MACOS_MIN" "$$OUT/squallar-unsigned.pkg"
 	  # The installer certificate is a SECOND certificate and a different kind
 	  # from the one that signed the app: Apple issues "Mac Installer
 	  # Distribution" (it appears in a keychain as `3rd Party Mac Developer
