@@ -15,6 +15,12 @@
 //! whole point. The figure here is `squallar_alloc::live_bytes()` — bytes
 //! granted less bytes returned — across a window that contains the release and
 //! the drop of what it handed over, and nothing else.
+//!
+//! **One `#[test]`, for the reason `squallar-overlays`' sibling suites give**:
+//! the counter is process-global and libtest runs a binary's tests on several
+//! threads, so a second test here would be allocating inside this one's window.
+//! Split, the control below failed under a full `cargo test --workspace` and
+//! passed when run alone — which is a race, and a race is the defect.
 
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -191,13 +197,17 @@ fn live() -> u64 {
     squallar_alloc::live_bytes().expect("this binary installed the counter")
 }
 
-/// **The pressure step hands the section payload back to the allocator.**
+/// **Every release path this change adds, and the control that says the
+/// instrument can see one.**
 ///
-/// Floor — revert `clear_extract_cache` to `self.extract_cache.drain()...`
-/// alone: `released` reads 0 instead of 1 and the fall below reads a few KiB
-/// instead of megabytes.
+/// Floors, in order:
+/// * revert `clear_extract_cache` to `self.extract_cache.drain()...` alone —
+///   `released` reads 0 instead of 1 and the fall reads a few KiB;
+/// * delete the `section_input` arm from `reset_panes_for_site` — that fall
+///   reads a few KiB too (measured: 24 B).
 #[test]
-fn the_pressure_step_gives_the_section_payload_back_to_the_allocator() {
+fn the_section_payload_is_released_and_the_counter_can_see_it() {
+    // ── The pressure step hands the payload back to the allocator ─────────
     let mut d = RenderDispatcher::new();
     cache_a_payload(&mut d);
 
@@ -232,15 +242,8 @@ fn the_pressure_step_gives_the_section_payload_back_to_the_allocator() {
         live() <= quiet + (1 << 20),
         "and it must not take anything to report that",
     );
-}
 
-/// **A new volume for the site takes the site's payload with it**, on the same
-/// terms it already takes every cached raster for that site.
-///
-/// Floor — delete the `section_input` arm from `reset_panes_for_site`: the fall
-/// below reads a few KiB.
-#[test]
-fn a_new_volume_for_the_site_releases_that_sites_section_payload() {
+    // ── A new volume for the site takes that site's payload with it ───────
     let mut d = RenderDispatcher::new();
     cache_a_payload(&mut d);
     let gui = squallar_egui::Gui::new();
@@ -265,14 +268,8 @@ fn a_new_volume_for_the_site_releases_that_sites_section_payload() {
          {after})",
         untouched.saturating_sub(after),
     );
-}
 
-/// **Non-triviality: the instrument can see a free of the class being measured.**
-///
-/// Without this the two figures above could both be reporting an allocator that
-/// never moves.
-#[test]
-fn the_counter_can_see_a_payload_sized_block_go() {
+    // ── Non-triviality: the counter can see a block of this class go ──────
     let before = live();
     let block: Vec<u8> = vec![0; PAYLOAD_FLOOR as usize];
     let held = live();

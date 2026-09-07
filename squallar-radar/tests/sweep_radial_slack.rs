@@ -14,6 +14,10 @@
 //! the fix changes and could be satisfied by a vector that reports a smaller
 //! capacity while holding the same block; `squallar_alloc::live_bytes` is bytes
 //! granted less bytes returned, and cannot be.
+//!
+//! **One `#[test]`**: the counter is process-global and libtest runs a binary's
+//! tests on several threads, so a second test here would be allocating inside
+//! this one's window.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -67,13 +71,14 @@ fn live() -> u64 {
     squallar_alloc::live_bytes().expect("this binary installed the counter")
 }
 
-/// **A sweep off the decoder holds exactly its radials.**
+/// **A sweep off the decoder holds exactly its radials, and the split it
+/// performs is unchanged.**
 ///
 /// Floor — delete the two `sweep_radials.shrink_to_fit()` calls from
 /// `Sweep::from_radials`: the capacity below reads 1024 against a length of 720,
 /// and the byte figure rises by `304 * size_of::<Radial>()`.
 #[test]
-fn a_sweep_off_the_decoder_parks_no_doubling_slack() {
+fn a_sweep_off_the_decoder_parks_no_doubling_slack_and_still_splits_the_same() {
     // The premise this suite is about: a `Vec` grown by `push` to 720 really
     // does land on 1024, so there is 304 slots' worth of slack to give back.
     let mut grown: Vec<Radial> = Vec::new();
@@ -125,11 +130,8 @@ fn a_sweep_off_the_decoder_parks_no_doubling_slack() {
         "the counter did not see a {slack_bytes} B grant",
     );
     drop(block);
-}
 
-/// The split itself is unchanged: same sweeps, same order, same radials.
-#[test]
-fn shrinking_did_not_change_how_the_radials_split() {
+    // ── The split itself is unchanged: same sweeps, order and radials ─────
     let mut radials = Vec::new();
     radials.extend((0..10).map(|a| radial(1, a)));
     radials.extend((0..10).map(|a| radial(2, a)));

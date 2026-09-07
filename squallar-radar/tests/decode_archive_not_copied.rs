@@ -16,6 +16,10 @@
 //! binary installs a `#[global_allocator]` that counts grants at or above the
 //! archive's own size within an explicit window — the shape
 //! `squallar-overlays/tests/gmgsi_staging_release.rs` uses, for the same reason.
+//!
+//! **One `#[test]`**, for the reason that suite gives too: the counter and its
+//! window are process-global, and libtest runs a binary's tests on several
+//! threads, so a second test here would be allocating inside this one's window.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -114,13 +118,13 @@ fn uncompressed_archive() -> Arc<Vec<u8>> {
     Arc::new(bytes)
 }
 
-/// **The decode does not copy the archive.**
+/// **The decode does not copy the archive, and the two doors decode the same.**
 ///
 /// Floor — put `decode_bytes(input.archive.as_ref().clone())` back in
 /// `DecodeJob::run`: the count below reads 1 and the size recorded is
 /// `ARCHIVE_BYTES` exactly.
 #[test]
-fn running_a_decode_job_takes_no_copy_of_the_archive() {
+fn a_decode_takes_no_copy_of_the_archive_and_both_doors_agree() {
     let job = DecodeJob {
         archive: uncompressed_archive(),
     };
@@ -149,14 +153,13 @@ fn running_a_decode_job_takes_no_copy_of_the_archive() {
         "an explicit archive-sized allocation went unseen, so the figure above \
          says nothing: {control_sizes:?}",
     );
-}
 
-/// **The two doors decode the same.** `decode_shared` is `decode_bytes` over a
-/// pointer, and the only thing between them is which `nexrad_data::volume::File`
-/// constructor runs — so anything one refuses the other must refuse, and the
-/// gzip arm has to still inflate.
-#[test]
-fn the_shared_door_and_the_owned_door_agree() {
+    // ── The two doors decode the same ─────────────────────────────────────
+    //
+    // `decode_shared` is `decode_bytes` over a pointer, and the only thing
+    // between them is which `nexrad_data::volume::File` constructor runs — so
+    // anything one refuses the other must refuse, and the gzip arm has to still
+    // inflate.
     use std::io::Write;
 
     // A gzip-wrapped payload, which is the arm that still has to allocate: the
