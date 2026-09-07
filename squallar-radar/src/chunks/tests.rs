@@ -1567,6 +1567,85 @@ fn a_sealing_round_leaves_the_snapshot_cache_warm() {
     );
 }
 
+/// **A round that learned the coverage pattern and sealed nothing still
+/// leaves the build warm.**
+///
+/// A seal is not the only thing that invalidates. The round the start chunk
+/// lands on learns the coverage pattern, and the first chunk carrying a Volume
+/// Data Block learns the site; both mark the build stale and neither seals a
+/// cut. Until 2026-09-07 `warm_snapshot` returned on `sealed_elevations`
+/// alone, so those rounds left a whole-volume rebuild to whoever asked next —
+/// the frame thread, through `ChunkFeedManager::snapshot`. One round in every
+/// volume carries the start chunk.
+#[test]
+fn a_round_that_only_learned_the_coverage_pattern_still_warms_the_snapshot() {
+    let mut p = ChunkPoller::resume("KTLX", vol(42));
+    let chunks = golden_chunks();
+    let seal_at = *sealing_positions(&chunks)
+        .first()
+        .expect("some chunk seals a cut");
+
+    // The round the start chunk 404'd in: radials only, through the first seal.
+    let mut sealing = PollOutcome::default();
+    for chunk in chunks.iter().skip(1).take(seal_at).cloned() {
+        round_ingest(&mut p, &mut sealing, chunk);
+    }
+    assert!(
+        !sealing.sealed_elevations.is_empty(),
+        "precondition: the fixture round must seal a cut so there is a build \
+         to keep warm"
+    );
+    p.warm_snapshot(&sealing);
+    let before = p.snapshot().expect("a volume is assembling");
+    assert!(
+        before.coverage_pattern().elevation_cuts().is_empty(),
+        "precondition: with the start chunk still missing the build carries \
+         the placeholder pattern"
+    );
+    drop(before);
+
+    // The next round brings the start chunk, and seals nothing. Built rather
+    // than taken from the fixture for the same reason
+    // `a_late_start_chunk_reaches_the_snapshot_rather_than_the_next_seal`
+    // builds one: the golden volume's own start chunk carries a pattern whose
+    // cut table is empty, so it cannot tell a rebuilt volume from a
+    // placeholder one.
+    let start = (
+        chunks[0].0,
+        ChunkKind::Start,
+        ChunkContents {
+            radials: Vec::new(),
+            coverage_pattern: Some(vcp_with(&[(0.5, true), (0.9, true), (1.3, false)])),
+            ..Default::default()
+        },
+    );
+    let mut learning = PollOutcome::default();
+    round_ingest(&mut p, &mut learning, start);
+    assert!(
+        learning.learned_coverage_pattern,
+        "the start chunk carries the coverage pattern"
+    );
+    assert!(
+        learning.sealed_elevations.is_empty(),
+        "and it seals nothing, which is the whole case this test is about"
+    );
+
+    p.warm_snapshot(&learning);
+    assert!(
+        p.current.as_ref().expect("a volume").snapshot_is_warm(),
+        "the round that learned the coverage pattern returned with the build \
+         stale, so a whole-volume rebuild lands on the frame thread"
+    );
+    assert!(
+        !p.snapshot()
+            .expect("a volume is assembling")
+            .coverage_pattern()
+            .elevation_cuts()
+            .is_empty(),
+        "the warmed build still carries the placeholder pattern"
+    );
+}
+
 /// A round that seals nothing leaves the cache exactly as it found it: cold
 /// stays cold — no volume is built for a round nothing will render — and warm
 /// keeps the very `Arc` a pane may be holding.

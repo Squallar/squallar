@@ -1201,6 +1201,16 @@ impl VolumeAssembler {
         self.cached.is_some() && !self.stale
     }
 
+    /// Whether a snapshot has been built and is missing something learned
+    /// since — a sealed cut, the coverage pattern, the site.
+    ///
+    /// **Not the negation of [`Self::snapshot_is_warm`]**: a volume nothing
+    /// has ever asked for is neither warm nor stale. It is cold, and
+    /// [`ChunkPoller::warm_snapshot`] leaves it that way.
+    fn snapshot_is_stale(&self) -> bool {
+        self.cached.is_some() && self.stale
+    }
+
     /// Every cut's declared Nyquist velocity — the number [`Self::snapshot`]'s
     /// `Scan` cannot carry, `Radial` having no field for it.
     pub fn declared_nyquist(&self) -> &crate::nyquist::DeclaredNyquist {
@@ -1607,15 +1617,29 @@ impl ChunkPoller {
         outcome.progress = progress;
     }
 
-    /// Rebuild [`VolumeAssembler::snapshot`]'s cache inside the round that
-    /// sealed, so the frame thread does not pay the copy.
+    /// Rebuild [`VolumeAssembler::snapshot`]'s build inside the round that
+    /// invalidated it, so the frame thread never pays for one.
+    ///
+    /// **A seal is not the only thing that invalidates**, and until 2026-09-07
+    /// this returned on `sealed_elevations` alone. The round the start chunk
+    /// lands on learns the coverage pattern and the first chunk carrying a
+    /// Volume Data Block learns the site; both mark the build stale and
+    /// neither seals a cut, so both left a whole-volume rebuild to whoever
+    /// asked next — the frame thread, through `ChunkFeedManager::snapshot`.
+    /// The start chunk is not a rare case: it is one round in every volume,
+    /// and the late-arrival path it also covers is the one where a pane is
+    /// already drawing the volume being rebuilt.
+    ///
+    /// **Cold still stays cold.** A volume nothing has ever asked for is not
+    /// built here, which is what keeps a seal-less round free.
     fn warm_snapshot(&mut self, outcome: &PollOutcome) {
-        if outcome.sealed_elevations.is_empty() {
+        let Some(current) = self.current.as_mut() else {
+            return;
+        };
+        if outcome.sealed_elevations.is_empty() && !current.snapshot_is_stale() {
             return;
         }
-        if let Some(current) = self.current.as_mut() {
-            let _ = current.snapshot();
-        }
+        let _ = current.snapshot();
     }
 
     /// Hold a closed volume back when the round it closed in ends in an error,
