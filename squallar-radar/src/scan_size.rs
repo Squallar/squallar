@@ -3,14 +3,52 @@
 //!
 //! # Why this exists
 //!
-//! Four caches in this application hold whole `Arc<Scan>`s — the loop
-//! download cache, the still-pane inventory, the derivation memo, and
-//! whatever a pane is drawing from — and until this function existed not one
-//! of them could say how many bytes that was. They are bounded by **frame
-//! count**, never by bytes: a loop of thirty frames holds thirty decoded
-//! volumes whatever a volume weighs. On a 1 GiB wasm page heap that is the
-//! difference between a scene that fits and one that traps, and the trap gave
-//! no clue which family it was because no family had a figure.
+//! Caches in this application hold whole `Arc<Scan>`s, and until this
+//! function existed not one of them could say how many bytes that was. They
+//! are bounded by **frame count**, never by bytes: a loop of thirty frames
+//! holds thirty decoded volumes whatever a volume weighs. On a 1 GiB wasm
+//! page heap that is the difference between a scene that fits and one that
+//! traps, and the trap gave no clue which family it was because no family
+//! had a figure.
+//!
+//! # How many holders there are
+//!
+//! **Ten fields, nine allocations, eight owners of a decoded source volume**
+//! — and the three numbers answer three different questions, so a count with
+//! no definition beside it is not a fact. This header said "four" and
+//! `squallar_egui::heap_census::Census::radar_floor` said "five"; both were
+//! counting publishers rather than holders, and both undercounted.
+//!
+//! **Ten fields** that can hold an `Arc<Scan>` past the frame that made it:
+//!
+//! 1. `VolumeInventory::still` — a pane's static render source.
+//! 2. `VolumeInventory::base` — the site's merge base.
+//! 3. `App::latest_cached_scans` — the per-site latest, for `JumpToLive`.
+//! 4. `LoopDownloadManager::scan_cache` — the loop's downloaded volumes.
+//! 5. `DeriveMemo::entries` — a process-global `static`, not an `App` field.
+//! 6. `SweepGates::scan` inside a stored loop frame's `Arc<HoverSource>`
+//!    (`LoopFrameStore::entries`).
+//! 7. the same `Arc<HoverSource>` inside the pane's own frame list
+//!    (`LayerTimeState`) — a second field, the same allocation.
+//! 8. `VolumeAssembler::cached` — the chunk feed's built snapshot.
+//! 9. `ChunkPoller::pending_closed` — closed volumes parked for an outcome,
+//!    an unbounded queue.
+//! 10. `SiteFeed::last_snapshot` — the bridge copy served while the poller is
+//!    away on a round.
+//!
+//! **Nine allocations**, because 6 and 7 are one: a placed loop frame's
+//! `RadarImageData` is cloned by `Arc`, so the store and every pane showing
+//! it share one `HoverSource` and therefore one reference to one `Scan`.
+//!
+//! **Eight owners of a decoded source volume**, because 5 is not one:
+//! `DeriveMemo` holds *synthetic* `Scan`s built by the derivation, which are
+//! their own allocations and share nothing with the volume they were derived
+//! from.
+//!
+//! Checked and **not** on the list: `RenderCache`'s `CachedRenderOutput`
+//! carries an `Arc<HoverSource>`, but every one production builds comes from
+//! `HoverSource::resident`, whose `sweep` is `None` — it pins no volume, and
+//! `RenderCache::entry_bytes` would price one if it ever did.
 //!
 //! # What is counted
 //!

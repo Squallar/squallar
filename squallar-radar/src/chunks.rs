@@ -624,6 +624,21 @@ fn move_feed_level(was: u64, now: u64) {
 /// per assembler is open at a time — a sixteenth of a volume on a VCP 212.
 /// Nothing here ever prices bytes that have gone.
 ///
+/// **The other under-count is a whole volume, and it is the bridge copy.**
+/// `chunk_feed::SiteFeed::last_snapshot` holds an `Arc` of whatever
+/// [`VolumeAssembler::snapshot`] last handed out, to serve the frame thread
+/// while the poller is away on a round. While the assembler's own `cached`
+/// is that same allocation the bridge costs nothing extra and `cached_bytes`
+/// prices it. But a round that seals a cut invalidates that cache and
+/// rebuilds it inside the same round (`ChunkPoller::warm_snapshot`), so it
+/// ends holding a *different* allocation from the one the bridge is still
+/// serving: two whole volumes are resident and this figure names one. The
+/// gap closes when the frame thread next asks `ChunkFeedManager::snapshot`
+/// for that site,
+/// which refreshes the bridge and frees the old volume — one frame while
+/// panes are drawing, and **unbounded for any live site the frame thread
+/// stops asking**.
+///
 /// **An UPPER bound against the other radar families**, like every figure in
 /// `radar_total`: once a round delivers, the same `Arc<Scan>` is installed in
 /// the still inventory, and `still scans` prices it too. This says what
