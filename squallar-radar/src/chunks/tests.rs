@@ -2317,14 +2317,34 @@ async fn live_a_start_chunk_decodes_and_carries_the_coverage_pattern() {
 /// gate on the family that names them.
 ///
 /// **Per-instance figures where exactness is claimed, and the process-global
-/// level only in the two directions that cannot lie.** `CHUNK_FEED_BYTES` is
-/// process-wide and this binary's other tests build assemblers on other
-/// harness threads, so an exact delta against it would be some other arm's
-/// arithmetic as often as not. What is asserted globally is what no
-/// concurrent offset can forge: the level is at least what this assembler
-/// holds, and it strictly falls when this assembler is dropped.
+/// level under a lock.** `CHUNK_FEED_BYTES` is process-wide and this binary's
+/// other tests build assemblers on other harness threads.
+///
+/// **The lock replaces a claim that was not true.** This test used to argue
+/// that its two global assertions were what "no concurrent offset can forge":
+/// that the level is at least what this assembler holds, and that it strictly
+/// falls when this assembler is dropped. The first is sound — a concurrent
+/// mover cannot take *this* assembler's bytes out of the level. The second is
+/// not, and neither is the warm-path reading above it. Both bracket an
+/// operation with two reads, and a concurrent *seal* landing between them adds
+/// to the level, so the observed fall is smaller than the drop that caused it.
+/// Measured 2026-09-07 under a loaded whole-workspace board: "dropping an
+/// assembler holding 4086832 B moved the level only 0 B", from a test that
+/// passes alone and passes 3/3 package-scoped. It was a race, not a flake, and
+/// a race is a regression here.
+///
+/// [`feed_level_serial::exclusive`] is held for the whole body rather than around each
+/// window: every global read here wants the same exclusivity, the body does no
+/// blocking work, and one guard cannot be half-applied. Nothing is weakened —
+/// the assertions are the ones that were always intended, now made against a
+/// level no other thread is moving.
+///
+/// [`feed_level_serial::exclusive`]: crate::chunks::feed_level_serial::exclusive
 #[test]
 fn the_chunk_feed_prices_its_volumes_and_gives_them_back() {
+    // Before the first assembler exists: the guard must cover every read AND
+    // every move this test makes, including its own `drop` below.
+    let _exclusive = crate::chunks::feed_level_serial::exclusive();
     let mut a = assemble(golden_chunks());
 
     // ---- the sealed cuts, priced at each seal ---------------------------

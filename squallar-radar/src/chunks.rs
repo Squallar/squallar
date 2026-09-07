@@ -511,11 +511,95 @@ impl ElevationChunkMap {
 /// the retirement rather than the drop would fall before the bytes did.
 static CHUNK_FEED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// **Serialising the level against the harness's other threads.**
+///
+/// `CHUNK_FEED_BYTES` is process-wide and this crate's lib-test binary runs its
+/// tests on several threads, so a test that brackets an operation with two
+/// reads of the level is measuring *every* thread's assemblers, not its own. A
+/// concurrent seal landing between the two reads ADDS to the level, so an
+/// observed fall comes out smaller than the drop that caused it — which is how
+/// `the_chunk_feed_prices_its_volumes_and_gives_them_back` reported "dropping
+/// an assembler holding 4086832 B moved the level only 0 B" under a loaded
+/// board, while passing alone and passing 3/3 package-scoped. A level sampled
+/// across a window while other threads are live is a false zero for anything
+/// living less than the sample.
+///
+/// **The lock is at the writer, not on the fixtures**, because
+/// [`move_feed_level`] is the single writer of the counter — every seal, the
+/// snapshot, the invalidation and both `Drop`s funnel through it — so no mover
+/// can be added later that forgets to take it. A lock hung on the test
+/// fixtures would be silently escaped by the next test that builds a
+/// `VolumeAssembler` directly, and 46 sites in this crate's tests already do.
+///
+/// **Re-entrant for the exclusive holder, and that is load-bearing**: the
+/// observing test holds exclusivity across its own `drop(assembler)`, and that
+/// drop re-enters [`move_feed_level`] on the same thread. A plain `Mutex` taken
+/// unconditionally would deadlock the test this exists to fix, and
+/// `std::sync::ReentrantLock` is still unstable on this tree's pinned 1.97.1
+/// (`E0658`, tracking issue 121440) — so the re-entrancy is a thread-local flag
+/// the holder sets, checked before the lock is taken.
+#[cfg(test)]
+pub(crate) mod feed_level_serial {
+    use std::cell::Cell;
+    use std::sync::{Mutex, MutexGuard};
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    thread_local! {
+        /// Set only on the thread currently holding [`exclusive`].
+        static HOLDING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Exclusive access for the calling thread until this is dropped. Other
+    /// threads' level moves block; this thread's re-enter freely.
+    pub(crate) struct Exclusive(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+    impl Drop for Exclusive {
+        fn drop(&mut self) {
+            // Cleared BEFORE the guard field drops (a `Drop` body runs ahead of
+            // the fields), so no other thread can be admitted while this one
+            // still reads itself as the holder.
+            HOLDING.with(|h| h.set(false));
+        }
+    }
+
+    /// Take the level for this thread. Poison is recovered rather than
+    /// propagated: one panicking test must not cascade into every other.
+    pub(crate) fn exclusive() -> Exclusive {
+        let guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        HOLDING.with(|h| h.set(true));
+        Exclusive(guard)
+    }
+
+    /// Apply one level move, serialised — unless this thread is the exclusive
+    /// holder, in which case it is already serialised and must not re-lock.
+    pub(crate) fn with_move(apply: impl FnOnce()) {
+        if HOLDING.with(Cell::get) {
+            apply();
+            return;
+        }
+        let _serial = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        apply();
+    }
+}
+
+/// The shipped arm: no lock, no thread-local, no cost. The `cfg` selects a
+/// module, never a fork inside [`move_feed_level`]'s body.
+#[cfg(not(test))]
+pub(crate) mod feed_level_serial {
+    #[inline]
+    pub(crate) fn with_move(apply: impl FnOnce()) {
+        apply();
+    }
+}
+
 /// Move the level from `was` to `now`. One `Relaxed` read-modify-write of a
 /// difference the caller already has, so an add here and a subtract elsewhere
 /// cannot drift the way two separate stores could.
 fn move_feed_level(was: u64, now: u64) {
-    CHUNK_FEED_BYTES.fetch_add(now.wrapping_sub(was), std::sync::atomic::Ordering::Relaxed);
+    feed_level_serial::with_move(|| {
+        CHUNK_FEED_BYTES.fetch_add(now.wrapping_sub(was), std::sync::atomic::Ordering::Relaxed);
+    });
 }
 
 /// **Host bytes the chunk feed's decoded volumes are holding**, this instant.
