@@ -47,8 +47,19 @@ fn arriving_volume() -> nexrad_model::data::Scan {
         .unwrap_or_else(|_| unreachable!("ready_scan hands out a fresh Arc"))
 }
 
-/// Push one archive volume down the real channel and drain it.
+/// Push one archive volume down the real channel and drain it — a Refresh or
+/// scrub fetch, which the drain puts on screen.
 fn land_one_archive_volume(app: &mut App, site: &str, timestamp: chrono::NaiveDateTime) {
+    land_archive(app, site, timestamp, false);
+}
+
+/// The same volume arriving from the auto-poll, which the drain files in
+/// `latest_cached_scans` for a site no pane is watching live.
+fn land_one_auto_poll_volume(app: &mut App, site: &str, timestamp: chrono::NaiveDateTime) {
+    land_archive(app, site, timestamp, true);
+}
+
+fn land_archive(app: &mut App, site: &str, timestamp: chrono::NaiveDateTime, is_auto_poll: bool) {
     let generation = app.render.fetch_generation_for(site);
     app.channels
         .scan_sender
@@ -62,7 +73,7 @@ fn land_one_archive_volume(app: &mut App, site: &str, timestamp: chrono::NaiveDa
                 site: site.to_string(),
                 timestamp,
             }),
-            is_auto_poll: false,
+            is_auto_poll,
         })
         .expect("the app holds the receiver");
     app.poll_data_channels();
@@ -192,5 +203,47 @@ fn two_sites_arrivals_are_two_volumes_on_the_figure() {
         app.volumes.resident_scan_bytes(),
         2 * one,
         "two distinct arrivals were collapsed into one charge",
+    );
+}
+
+/// **An auto-poll's latest that is also the site's merge base adds nothing
+/// to `still scans`**: the drain files one `Arc<Scan>` in both, and the level
+/// de-duplicates by allocation, so the third holder is free.
+#[test]
+fn a_latest_that_is_the_merge_base_adds_nothing_to_the_still_level() {
+    let mut app = app_on_site();
+    app.gui.pane_mut(0).expect("a pane").viewing_live = false;
+    land_one_auto_poll_volume(&mut app, SITE, at(0));
+
+    let (latest, _, _, _) = app
+        .latest_cached_scans
+        .get(SITE)
+        .expect("an auto-poll for a site no pane watches live is filed as its latest");
+    let (base, _) = app
+        .volumes
+        .base_for(SITE)
+        .expect("the drain installed the base");
+    assert!(
+        Arc::ptr_eq(latest, &base),
+        "fixture: the latest and the base are different allocations, so this \
+         is not the shared case",
+    );
+    let one = squallar_radar::scan_size::scan_bytes(latest) as u64;
+    assert!(one > 0, "fixture: a volume priced at nothing");
+
+    assert_eq!(
+        app.volumes.latest_price(SITE) as u64,
+        one,
+        "the drain filed the latest without pricing it",
+    );
+    assert_eq!(
+        app.still_scan_level(),
+        one,
+        "a volume held as both base and latest was charged twice",
+    );
+    assert_eq!(
+        app.still_scan_level(),
+        app.volumes.resident_scan_bytes() as u64,
+        "the shared latest moved the level the stores alone already read",
     );
 }

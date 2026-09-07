@@ -837,7 +837,12 @@ fn set_loop_product(app: &mut crate::app::App, field: &squallar_source::product:
 /// family. This is the other side of that sum, and the assertions below pin it
 /// at zero on both sides of the sweep.
 fn other_decoded_volume_holders(app: &crate::app::App) -> u64 {
-    app.volumes.resident_scan_bytes() as u64 + app.loop_frames.pinned_volume_bytes()
+    app.volumes.resident_scan_bytes_with(
+        app.latest_cached_scans
+            .iter()
+            .map(|(site, (scan, _, _, _))| (site.as_str(), scan, app.volumes.latest_price(site))),
+    ) as u64
+        + app.loop_frames.pinned_volume_bytes()
 }
 
 /// File `MINUTES`' volumes into the loop cache and hand back a clone of each

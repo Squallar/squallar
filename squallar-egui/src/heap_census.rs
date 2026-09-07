@@ -541,8 +541,10 @@ impl Census {
     /// **The decoded-volume families as a de-duplicated LOWER bound**: the
     /// largest single one.
     ///
-    /// The five holders share `Arc`s, so their sum ([`Self::radar_total`]) is
-    /// an upper bound. The floor of a union of overlapping sets is the
+    /// The holders share `Arc`s — ten fields, nine allocations, eight owners
+    /// of a decoded source volume (`squallar_radar::scan_size` lists them),
+    /// published as the six families below — so their sum
+    /// ([`Self::radar_total`]) is an upper bound. The floor of a union of overlapping sets is the
     /// largest member — every byte the biggest holder names is resident
     /// whatever the others share with it — and that needs no graph walk and
     /// no frame-thread cost, which is why this is the de-duplicated figure

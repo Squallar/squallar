@@ -2285,6 +2285,10 @@ impl super::App {
         if let Some((scan_arc, declared, scan_info, timestamp)) =
             self.latest_cached_scans.remove(&pane_site)
         {
+            // The price row goes with the entry: the volume is about to be
+            // priced again as a still, and a row left here would be read
+            // against the next latest this site files before it is re-priced.
+            self.volumes.forget_latest_site(&pane_site);
             log::info!(
                 "JumpToLive: using cached scan for {} @ {}",
                 pane_site,

@@ -2418,6 +2418,10 @@ impl App {
                                 Arc::clone(&scan_arc),
                                 Arc::clone(&declared_nyquist),
                             );
+                            // Priced where it is filed, so `still scans` can
+                            // name it: the inventory carries the price, the
+                            // volume stays here (see `VolumeInventory::latest_bytes`).
+                            self.volumes.price_latest(&site, &scan_arc);
                             self.latest_cached_scans
                                 .insert(site, (scan_arc, declared_nyquist, scan_info, timestamp));
                         } else if feed_is_ahead {
@@ -2741,6 +2745,7 @@ impl App {
             ),
         );
         let evicted_cached = evicted(&mut self.latest_cached_scans, &unshown);
+        self.volumes.forget_latest(&unshown);
         squallar_worker::offload::discard_each(
             "evicted-cached-volume",
             crate::volume_inventory::volume_drop_parts(
@@ -2845,6 +2850,7 @@ impl App {
         //
         // `settling` still exempts a site whose listing is in flight, for the
         // reason it exempts it from `keep`.
+        //
         let keep_scan = |site: &str, ts: &chrono::NaiveDateTime| {
             if settling.contains(site)
                 || squallar_radar::loop_downloads::site_needs_decoded_source(site, &live_loops)

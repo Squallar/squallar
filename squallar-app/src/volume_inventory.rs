@@ -231,6 +231,20 @@ pub(crate) struct VolumeInventory {
     /// mutation of `base` in this file is a mutation of this map, and the two
     /// are pinned together by `the_inventorys_byte_total_tracks_both_stores`.
     base_bytes: HashMap<String, usize>,
+    /// **The per-site latest cache's prices**, keyed as `App::latest_cached_scans`
+    /// is — the volumes themselves live on `App`, because
+    /// `App::handle_jump_to_live` moves one out of that cache and into the
+    /// still store, and the store lives beside the panes.
+    ///
+    /// A row follows the cache at all four of its seams: written where an
+    /// entry is filed (`price_latest`, the archive drain and the chunk
+    /// landing), pruned where entries are evicted (`forget_latest`) and where
+    /// one is moved out into the still store (`forget_latest_site`). The
+    /// reader, `resident_scan_bytes_with`, walks the live cache and looks each
+    /// entry's price up here, so a row alone can never put a volume on the
+    /// figure; keeping the rows exact is what keeps the price it reads the
+    /// price of the volume in hand.
+    latest_bytes: HashMap<String, usize>,
 }
 
 impl VolumeInventory {
@@ -380,6 +394,38 @@ impl VolumeInventory {
         self.base.keys().map(String::as_str)
     }
 
+    // ---- the per-site latest cache's prices --------------------------
+
+    /// Price the volume `App::latest_cached_scans` is about to file for
+    /// `site`: one walk of its radials here, at arrival, and a field read
+    /// every tick thereafter — the rule every holder in this file follows.
+    pub(crate) fn price_latest(&mut self, site: &str, volume: &Scan) {
+        self.latest_bytes.insert(
+            site.to_owned(),
+            squallar_radar::scan_size::scan_bytes(volume),
+        );
+    }
+
+    /// Drop the price rows of the sites `doomed` names — the twin of the
+    /// eviction that empties `App::latest_cached_scans` of them.
+    pub(crate) fn forget_latest(&mut self, doomed: &impl Fn(&String) -> bool) {
+        self.latest_bytes.retain(|site, _| !doomed(site));
+    }
+
+    /// Drop one site's price row — the twin of `App::handle_jump_to_live`
+    /// moving that site's latest out of the cache and into the still store.
+    pub(crate) fn forget_latest_site(&mut self, site: &str) {
+        self.latest_bytes.remove(site);
+    }
+
+    /// What `site`'s latest was priced at, for the caller building
+    /// [`resident_scan_bytes_with`](Self::resident_scan_bytes_with)'s rows.
+    /// Zero for a site never priced, which is the under-count direction and
+    /// is never reached by production: both writers of the cache price first.
+    pub(crate) fn latest_price(&self, site: &str) -> usize {
+        self.latest_bytes.get(site).copied().unwrap_or(0)
+    }
+
     // ---- eviction and residency ---------------------------------------
 
     /// Keep only the stills `wanted` names, and hand the rest back **owned**
@@ -447,6 +493,13 @@ impl VolumeInventory {
     /// keys, never by iteration order.** `HashMap` iteration order is not a
     /// property this figure may rest on: "charge the first one seen" over two
     /// walks of one map is a level that could move while the heap did not.
+    ///
+    /// **The two stores alone, so tests only.** The census family `still
+    /// scans` is a third store wider than this: production publishes it
+    /// through `App::still_scan_level`, which folds in the per-site latest
+    /// cache. Shipping this spelling as well would be two answers to one
+    /// question, and the smaller one has no publisher.
+    #[cfg(test)]
     pub(crate) fn resident_scan_bytes(&self) -> usize {
         self.resident_scan_bytes_with(std::iter::empty::<LatestVolume<'_>>())
     }
@@ -876,6 +929,40 @@ mod tests {
             2 * one,
             "the empty-cache spelling must agree with the stores alone",
         );
+    }
+
+    /// **A latest-cache price row is written once, read by site, and pruned
+    /// with the sites the cache is emptied of.** The volumes live on `App`;
+    /// only their prices live here, so the two are kept in step by their
+    /// callers and this is what the callers can rely on.
+    #[test]
+    fn latest_price_rows_follow_price_and_forget() {
+        let mut inv = VolumeInventory::default();
+        let scan = crate::volume_fixture::ready_scan();
+        let one = squallar_radar::scan_size::scan_bytes(&scan);
+        assert!(one > 0, "fixture: a volume of no gates prices nothing");
+
+        assert_eq!(inv.latest_price("KTLX"), 0, "an unpriced site reads zero");
+        inv.price_latest("KTLX", &scan);
+        inv.price_latest("KOUN", &scan);
+        inv.price_latest("KDMX", &scan);
+        assert_eq!(inv.latest_price("KTLX"), one);
+        assert_eq!(inv.latest_price("KOUN"), one);
+
+        inv.forget_latest(&|site| site == "KTLX");
+        assert_eq!(inv.latest_price("KTLX"), 0, "a forgotten site still priced");
+        assert_eq!(
+            inv.latest_price("KOUN"),
+            one,
+            "the other site was pruned too"
+        );
+
+        inv.forget_latest_site("KDMX");
+        assert_eq!(inv.latest_price("KDMX"), 0, "a moved-out site still priced");
+
+        // Re-pricing a site is a replacement, not an accumulation.
+        inv.price_latest("KOUN", &scan);
+        assert_eq!(inv.latest_price("KOUN"), one);
     }
 
     /// **The charge does not depend on which store the walk reaches first.**

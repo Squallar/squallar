@@ -2518,17 +2518,21 @@ impl super::App {
     /// own ledger, the pending uploads from the renderer's sweep), and the
     /// web layer publishes the loan book.
     ///
-    /// **The radar families overlap and the census says so.** The loop
-    /// cache, the still inventory, the derivation memo and the stored loop
-    /// frames' hover sources hold `Arc`s of the same `Scan`s, so each reports
-    /// what emptying it alone would free and their sum is an upper bound, not
-    /// a partition.
+    /// **The radar families overlap and the census says so.** The holders
+    /// of whole `Arc<Scan>`s are **ten fields, nine allocations, eight owners
+    /// of a decoded source volume** — `squallar_radar::scan_size` lists them
+    /// and what collapses them — and the families published here are fewer
+    /// than that because several holders share one figure (both inventory
+    /// stores and the latest cache under `still scans`; the stored frame and
+    /// the pane's copy under `loop frame scans`). Each family reports what
+    /// emptying it alone would free, so their sum is an upper bound, not a
+    /// partition.
     fn publish_heap_census(&mut self) {
         use squallar_egui::heap_census as census;
 
         census::set_loop_scan_bytes(self.loop_mgr.cached_scan_bytes() as u64);
         census::set_loop_l3_bytes(self.loop_mgr.cached_l3_bytes() as u64);
-        census::set_still_scan_bytes(self.volumes.resident_scan_bytes() as u64);
+        census::set_still_scan_bytes(self.still_scan_level());
         census::set_derive_memo_bytes(squallar_radar::derive::memo_bytes() as u64);
         census::set_render_cache_bytes(self.render.render_cache.resident_bytes() as u64);
         // `renders in flight` is published at its seams, where the bytes
@@ -2542,6 +2546,33 @@ impl super::App {
         census::set_loop_frame_bytes(self.loop_frames.resident_host_bytes());
         census::set_loop_frame_scan_bytes(self.loop_frames.pinned_volume_bytes());
         census::set_volume_store_bytes(self.volume_store.memory_bytes() as u64);
+    }
+
+    /// **The `still scans` level as this tick publishes it**: both of the
+    /// still inventory's stores and the per-site latest cache, de-duplicated
+    /// by allocation ([`VolumeInventory::resident_scan_bytes_with`]).
+    ///
+    /// The latest cache is the family's third store and the description on
+    /// `squallar_egui::heap_census` already names it; it lives on `App`
+    /// because `handle_jump_to_live` moves an entry out of it and into the
+    /// still store, and it is priced where it is filed
+    /// (`VolumeInventory::price_latest`), so this is field reads and pointer
+    /// compares over a couple of dozen entries and no walk. Two consequences
+    /// the pin beside the publisher holds to: a latest that is the site's
+    /// merge base adds **nothing** — the archive drain's auto-poll arm files
+    /// one `Arc<Scan>` in both — and a latest nothing else holds adds
+    /// **exactly its own bytes**, which the plain `resident_scan_bytes` could
+    /// never show.
+    ///
+    /// [`VolumeInventory::resident_scan_bytes_with`]: crate::volume_inventory::VolumeInventory::resident_scan_bytes_with
+    pub(crate) fn still_scan_level(&self) -> u64 {
+        self.volumes.resident_scan_bytes_with(
+            self.latest_cached_scans
+                .iter()
+                .map(|(site, (scan, _, _, _))| {
+                    (site.as_str(), scan, self.volumes.latest_price(site))
+                }),
+        ) as u64
     }
 
     /// **Judge one reading of the page's linear memory** against the line

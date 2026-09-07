@@ -273,6 +273,8 @@ impl super::App {
         // Mirrors the archive drain: a site no pane is watching live keeps its
         // data for `JumpToLive` and its loops.
         if !self.any_pane_live_for_site(site) {
+            // Priced where it is filed — see the archive drain's twin.
+            self.volumes.price_latest(site, &scan);
             self.latest_cached_scans
                 .insert(site.to_string(), (scan, declared, info, timestamp));
             return;
@@ -391,6 +393,12 @@ mod tests;
 #[path = "app_chunks/volume_close_tests.rs"]
 #[cfg(test)]
 mod volume_close_tests;
+
+/// The latest the landing files for a parked site is priced, and the level
+/// names it — the one arm the inventory's stores alone could never show.
+#[path = "app_chunks/latest_cache_price_tests.rs"]
+#[cfg(test)]
+mod latest_cache_price_tests;
 
 /// Who the live feed's volumes are for: every pane on the site that is
 /// following live, and no one else.
