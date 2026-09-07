@@ -1224,7 +1224,7 @@ impl Gui {
                 .pane(pane_idx)
                 .show_layer
                 .plus(admission.layer_grid(kind));
-            if !admission.enforce(crate::admission::Act::ShowLayer, want) {
+            if !admission.enforce(crate::admission::Act::ShowLayer, Some(pane_idx), want) {
                 // Nothing is written: the pane keeps the enabled set it had,
                 // so the eye stays where the user found it and the notice
                 // says what would have to move.
@@ -1524,7 +1524,7 @@ impl Gui {
             let want = self.admission.costs().new_pane.times(added as u64);
             if !self
                 .admission
-                .enforce(crate::admission::Act::Panes { added }, want)
+                .enforce(crate::admission::Act::Panes { added }, None, want)
             {
                 // The layout is left exactly where it was, and the caller
                 // reads `false` the way it already reads a width class that

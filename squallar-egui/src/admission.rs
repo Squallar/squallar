@@ -374,6 +374,27 @@ pub struct AdmissionLedger {
     batch: u32,
     /// The last refusal, for the glass.
     notice: Option<AdmissionNotice>,
+    /// **Every act already refused against the table in force**, with the
+    /// refusal it drew.
+    ///
+    /// A door can be re-driven by something that is not a fresh table. The
+    /// loop door is: `App::hydrate_parked_panes` runs on every
+    /// `RedrawRequested` and a loop waiting on its transport comes straight
+    /// back onto that queue, which on the web build logged the same refusal
+    /// about **forty times in the first seven seconds** (Tier-2 `long` leg,
+    /// Chromium, 2026-09-07). Forty identical lines are not forty verdicts,
+    /// and a notice re-stamped every redraw never ages off the glass.
+    ///
+    /// So a question already answered against this table is answered from
+    /// here: same verdict, no second log line, no re-stamped notice, and no
+    /// second count. **The answer cannot have changed** — [`Self::spare`] is
+    /// the published spare less what has been admitted since, and admissions
+    /// only ever shrink it, so a refusal stays a refusal until the App
+    /// publishes a new table. Cleared by [`Self::adopt`] when it does.
+    ///
+    /// Bounded by the distinct `(act, pane)` pairs a scene can produce — at
+    /// most one per act per visible pane — so it needs no eviction.
+    refused: Vec<(Act, Option<usize>, Refusal)>,
     /// **This ledger's own verdict counts.** The `static`s above are the
     /// process-wide figures the App prints; these are per-application, which
     /// is what a test can assert on without racing every other test in the
@@ -391,6 +412,11 @@ impl AdmissionLedger {
         }
         self.costs = costs.clone();
         self.spent = Increment::ZERO;
+        // A fresh table is a fresh answer: whatever was refused against the
+        // old spare gets asked again, which is what makes a refusal something
+        // the user can act on and retry rather than a dead end for the
+        // session.
+        self.refused.clear();
     }
 
     /// The table in force.
@@ -455,9 +481,28 @@ impl AdmissionLedger {
     /// **The measurement, on every arm.** A refusing verdict counted here is
     /// counted whether or not [`ENFORCING`] then turns the act away, so the
     /// advisory arm reports exactly what the enforcing one would have done.
-    pub fn ask(&mut self, act: Act, want: Increment) -> Verdict {
+    pub fn ask(&mut self, act: Act, pane: Option<usize>, want: Increment) -> Verdict {
+        self.ask_tracked(act, pane, want).0
+    }
+
+    /// [`Self::ask`]'s body, also saying whether this was a **fresh** answer
+    /// or one repeated from [`Self::refused`].
+    ///
+    /// The distinction is the caller's, not the verdict's: a repeat is the
+    /// same answer to the same question and must act the same way, but it
+    /// must not log a second line, re-stamp the notice or move a counter.
+    /// Every figure this ledger publishes is therefore a count of **verdicts
+    /// taken**, never of how often a door happened to be re-driven.
+    fn ask_tracked(&mut self, act: Act, pane: Option<usize>, want: Increment) -> (Verdict, bool) {
         if want.is_zero() || self.in_batch() || self.costs.generation == 0 {
-            return Verdict::Admit;
+            return (Verdict::Admit, true);
+        }
+        if let Some((_, _, held)) = self
+            .refused
+            .iter()
+            .find(|(held_act, held_pane, _)| *held_act == act && *held_pane == pane)
+        {
+            return (Verdict::Refuse(*held), false);
         }
         ASKED.fetch_add(1, Relaxed);
         self.counts.asked = self.counts.asked.saturating_add(1);
@@ -471,6 +516,7 @@ impl AdmissionLedger {
             Verdict::Refuse(refusal) => {
                 WOULD_REFUSE.fetch_add(1, Relaxed);
                 self.counts.would_refuse = self.counts.would_refuse.saturating_add(1);
+                self.refused.push((act, pane, refusal));
                 log::warn!(
                     "admission: would refuse {} - {} asks {} MiB of the {:?} pool, \
                      {} MiB spare, short {} MiB",
@@ -483,7 +529,37 @@ impl AdmissionLedger {
                 );
             }
         }
-        v
+        (v, true)
+    }
+
+    /// **Whether `act` was already refused against the table in force.**
+    ///
+    /// For a caller whose own re-drive is cheaper to skip than to re-ask:
+    /// `App::hydrate_parked_panes` runs every redraw and would otherwise put
+    /// a refused loop back through the whole door on each one. The answer
+    /// cannot change until the App publishes a new table, so a caller that
+    /// sees `true` should hold its request and re-drive on the next
+    /// generation.
+    pub fn already_refused(&self, act: Act, pane: Option<usize>) -> bool {
+        self.refused
+            .iter()
+            .any(|(held_act, held_pane, _)| *held_act == act && *held_pane == pane)
+    }
+
+    /// **What arming `pane_idx`'s loop costs, where that is knowable at all**
+    /// — `None` before a listing has said the site's cadence.
+    ///
+    /// The App prices [`PaneAdmission::arm_loop`] off the pane's prospective
+    /// scene, and with no cadence the model's frame count is the render
+    /// budget's ceiling rather than the span's own answer
+    /// (`squallar_device_profile::admit::LoopFrames::priceable`, which
+    /// carries the measurement). A door spending that figure refuses loops
+    /// that would have fitted, so it does not get to: `None` means **admit
+    /// and ask again where the number lands**, which is the listing, still
+    /// before a frame is downloaded.
+    pub fn arm_loop(&self, pane_idx: usize) -> Option<Increment> {
+        let pane = self.pane(pane_idx);
+        squallar_device_profile::admit::prices_a_loop(pane.cadence_secs).then_some(pane.arm_loop)
     }
 
     /// **This ledger's own verdict counts**, from its first ask. The figure
@@ -508,8 +584,8 @@ impl AdmissionLedger {
     /// putting the user's panes back.
     /// **On an arm where [`ENFORCING`] is false the refusal is counted and
     /// the act proceeds** - see that constant for which arm and why.
-    pub fn enforce(&mut self, act: Act, want: Increment) -> bool {
-        self.decide(act, want, ENFORCING)
+    pub fn enforce(&mut self, act: Act, pane: Option<usize>, want: Increment) -> bool {
+        self.decide(act, pane, want, ENFORCING)
     }
 
     /// [`Self::enforce`]'s body, with the arm's policy passed in rather than
@@ -519,18 +595,36 @@ impl AdmissionLedger {
     /// would leave whichever arm this build did not compile with no test at
     /// all, and the advisory arm is the wasm one — the arm no test in this
     /// workspace executes.
-    fn decide(&mut self, act: Act, want: Increment, enforcing: bool) -> bool {
-        match self.ask(act, want) {
-            Verdict::Admit => true,
-            Verdict::Refuse(refusal) => {
-                if !enforcing {
-                    return true;
+    fn decide(&mut self, act: Act, pane: Option<usize>, want: Increment, enforcing: bool) -> bool {
+        match self.ask_tracked(act, pane, want) {
+            (Verdict::Admit, _) => true,
+            (Verdict::Refuse(refusal), fresh) => {
+                if fresh {
+                    if enforcing {
+                        REFUSED.fetch_add(1, Relaxed);
+                        self.counts.refused = self.counts.refused.saturating_add(1);
+                    }
+                    // **The notice goes up on BOTH arms**, and the two say
+                    // different things because different things happened.
+                    //
+                    // On the advisory arm the act proceeds, so the enforcing
+                    // sentence would be a false statement on the glass -- it
+                    // names a refusal that did not occur. What is true there
+                    // is that the scene went past what the device will give
+                    // it and may fail, and that is worth saying: on the web
+                    // build this is the only warning between a loop the page
+                    // cannot hold and the trap that ends the tab. The reader
+                    // can act on it -- the same share, the same scene levers
+                    // -- which is what separates a warning from a defect.
+                    //
+                    // Until this landed the wasm refusal was invisible by
+                    // construction: computed, logged to a console nobody has
+                    // open, and never once put in front of the person whose
+                    // page was about to die.
+                    let text = refusal_text(act, refusal, self.costs.requested_percent, enforcing);
+                    self.raise_notice(text, web_time::Instant::now());
                 }
-                REFUSED.fetch_add(1, Relaxed);
-                self.counts.refused = self.counts.refused.saturating_add(1);
-                let text = refusal_text(act, refusal, self.costs.requested_percent);
-                self.raise_notice(text, web_time::Instant::now());
-                false
+                !enforcing
             }
         }
     }
@@ -617,7 +711,11 @@ const SHARE_MAX_PERCENT: u8 = 100;
 ///
 /// A unified pool names both shares where both are movable, because on one
 /// memory either share moves the same wall.
-fn refusal_text(act: Act, refusal: Refusal, percents: (u8, u8)) -> String {
+///
+/// `enforced` selects the opening clause. Both arms raise a notice - see
+/// [`AdmissionLedger::decide`] - and only the enforcing one may say the act
+/// was refused, because only there was it.
+fn refusal_text(act: Act, refusal: Refusal, percents: (u8, u8), enforced: bool) -> String {
     let short = refusal.short_bytes().div_ceil(1000 * 1000);
     let (gpu, host) = percents;
     let movable = |percent: u8| percent < SHARE_MAX_PERCENT;
@@ -626,46 +724,62 @@ fn refusal_text(act: Act, refusal: Refusal, percents: (u8, u8)) -> String {
         Pool::Host => (false, movable(host)),
         Pool::Joint => (movable(gpu), movable(host)),
     };
+    // **The opening clause is the only part that differs by arm**, and the
+    // tail - what the reader can move - is the same either way, because the
+    // levers do not depend on whether the door turned the act away.
+    //
+    // The enforcing sentence states a refusal. On the advisory arm no refusal
+    // happened, so saying one did would be a false statement on the glass;
+    // what is true there is that the scene went past what the device will
+    // give it and was let through regardless.
+    let head = |pool: &str| {
+        if enforced {
+            format!(
+                "Not enough {pool}memory for {} - {short} MB short.",
+                act.noun(),
+            )
+        } else {
+            format!(
+                "Over the {pool}memory budget for {} by {short} MB - allowed \
+                 anyway, and the page may fail.",
+                act.noun(),
+            )
+        }
+    };
     if !gpu_movable && !host_movable {
         return format!(
-            "Not enough memory for {} - {short} MB short. This device has no \
-             more to give it: {}.",
-            act.noun(),
+            "{} This device has no more to give it: {}.",
+            head(""),
             scene_lever(act),
         );
     }
     match refusal.pool {
         Pool::Gpu => format!(
-            "Not enough GPU memory for {} - {short} MB short. Raise \"GPU \
-             memory\" in Settings > Memory (now {gpu} %).",
-            act.noun(),
+            "{} Raise \"GPU memory\" in Settings > Memory (now {gpu} %).",
+            head("GPU "),
         ),
         Pool::Host => format!(
-            "Not enough system memory for {} - {short} MB short. Raise \
-             \"System memory\" in Settings > Memory (now {host} %).",
-            act.noun(),
+            "{} Raise \"System memory\" in Settings > Memory (now {host} %).",
+            head("system "),
         ),
         // One memory, and whichever share is still short of its stop is the
         // one that moves the wall. Naming a share already at 100 % beside a
         // movable one would send the reader to the dead control half the time.
         Pool::Joint if gpu_movable && host_movable => format!(
-            "Not enough memory for {} - {short} MB short. This machine shares \
-             one pool between the display and the system: raise \"GPU \
-             memory\" (now {gpu} %) or \"System memory\" (now {host} %) in \
-             Settings > Memory.",
-            act.noun(),
+            "{} This machine shares one pool between the display and the \
+             system: raise \"GPU memory\" (now {gpu} %) or \"System memory\" \
+             (now {host} %) in Settings > Memory.",
+            head(""),
         ),
         Pool::Joint if gpu_movable => format!(
-            "Not enough memory for {} - {short} MB short. This machine shares \
-             one pool between the display and the system: raise \"GPU \
-             memory\" in Settings > Memory (now {gpu} %).",
-            act.noun(),
+            "{} This machine shares one pool between the display and the \
+             system: raise \"GPU memory\" in Settings > Memory (now {gpu} %).",
+            head(""),
         ),
         Pool::Joint => format!(
-            "Not enough memory for {} - {short} MB short. This machine shares \
-             one pool between the display and the system: raise \"System \
-             memory\" in Settings > Memory (now {host} %).",
-            act.noun(),
+            "{} This machine shares one pool between the display and the \
+             system: raise \"System memory\" in Settings > Memory (now {host} %).",
+            head(""),
         ),
     }
 }

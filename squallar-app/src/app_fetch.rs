@@ -1695,7 +1695,7 @@ impl super::App {
         let want = self.admission.pane(pane_idx).arm_loop;
         if !self
             .admission
-            .enforce(squallar_egui::admission::Act::ArmLoop, want)
+            .enforce(squallar_egui::admission::Act::ArmLoop, Some(pane_idx), want)
         {
             return;
         }

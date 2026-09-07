@@ -150,7 +150,7 @@ impl Gui {
         let want = self.loop_span_increment(secs);
         if !self
             .admission
-            .enforce(crate::admission::Act::LoopSpan, want)
+            .enforce(crate::admission::Act::LoopSpan, None, want)
         {
             // The window stays where it was on every pane and on the setting,
             // so the slider reads the number that is actually in force. A
@@ -271,7 +271,7 @@ impl Gui {
         let want = self.adopt_layers_increment();
         if !self
             .admission
-            .enforce(crate::admission::Act::AdoptLayers, want)
+            .enforce(crate::admission::Act::AdoptLayers, None, want)
         {
             // The group keeps the arrangement it had. Whole or not at all: a
             // fan-out stopped halfway would leave a linked group holding two

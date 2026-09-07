@@ -773,6 +773,7 @@ impl super::Gui {
         let count = preset.pane_count.clamp(1, self.layout.width.max_panes());
         if !self.admission.enforce(
             crate::admission::Act::Preset,
+            None,
             self.preset_increment(preset, count),
         ) {
             // Whole or not at all. A preset applied halfway is a scene the

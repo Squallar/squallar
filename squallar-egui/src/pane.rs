@@ -2777,7 +2777,7 @@ impl PaneState {
             // Refused, the slot is not minted and the caller reads `false` the
             // way it already reads a layer the pane holds - the stack is left
             // exactly as the user curated it.
-            if !admission.enforce(crate::admission::Act::ShowLayer, want) {
+            if !admission.enforce(crate::admission::Act::ShowLayer, Some(pane_idx), want) {
                 return false;
             }
         }

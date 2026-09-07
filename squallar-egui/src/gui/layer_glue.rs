@@ -276,7 +276,7 @@ impl Gui {
         }
         if !self
             .admission
-            .enforce(crate::admission::Act::DefaultLayers, want)
+            .enforce(crate::admission::Act::DefaultLayers, None, want)
         {
             // Whole or not at all: a pane holding some of the layers it ships
             // with and not others is a curation the user never made. The
