@@ -7,6 +7,7 @@ use squallar_elevation::HeightField;
 use squallar_elevation::TileCover;
 use squallar_elevation::jobs::{HeightTile, TerrainHeightJob};
 use squallar_overlays::render::jobs::{decode_overlay_out, encode_overlay_out};
+use squallar_overlays::render::raster_buf::RasterBuf;
 use squallar_overlays::render::rasterize::RasterizeOutput;
 use squallar_radar::frame::RenderedFrame;
 use squallar_radar::jobs::{
@@ -3580,14 +3581,14 @@ fn the_overlay_reply_round_trips_and_is_canonical() {
     for cells in [None, Some(a_hit_cells_fixture())] {
         assert_eq!(
             decode_overlay_out(&encode(None, cells.as_ref())),
-            Some((rgba.clone(), None, cells.clone())),
+            Some((rgba.clone().into(), None, cells.clone())),
             "the overlay reply did not survive its own codec",
         );
         // The blank form: no pixels on the wire, and the length the picture
         // would have had comes back instead of them.
         assert_eq!(
             decode_overlay_out(&encode(Some(rgba.len() as u32), cells.as_ref())),
-            Some((Vec::new(), Some(rgba.len() as u32), cells.clone())),
+            Some((RasterBuf::empty(), Some(rgba.len() as u32), cells.clone())),
             "the blank overlay reply did not survive its own codec",
         );
     }
@@ -3803,7 +3804,7 @@ fn a_blank_overlay_reply_carries_no_picture_sized_payload() {
     let (via_wire, blank, _) =
         decode_overlay_out(&painted_head).expect("the painted reply decodes");
     assert_eq!(
-        (via_wire, blank),
+        (via_wire.into_bytes(), blank),
         (direct.rgba.into_bytes(), None),
         "the inked raster did not arrive byte-identical through its own wire \
          form",
@@ -3826,7 +3827,7 @@ fn a_blank_overlay_reply_carries_no_picture_sized_payload() {
     );
     assert_eq!(
         decode_overlay_out(&blank_head),
-        Some((Vec::new(), Some(picture_bytes as u32), None)),
+        Some((RasterBuf::empty(), Some(picture_bytes as u32), None)),
         "a blank reply must arrive AS a blank of the picture's own size. \
          Arriving as nothing is a failed render, which the pane ignores — so \
          the ink of a layer whose data has gone away stays on the glass while \

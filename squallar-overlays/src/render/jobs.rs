@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use squallar_source::job::{EncodeCtx, JobCodec, JobCost, JobGeometry, JobOutCodec, JobSpec};
 use squallar_source::wire::Reader;
 
+use crate::render::raster_buf::RasterBuf;
 use crate::render::rasterize::{
     AlertsInput, AlphaMode, CoverageInput, DiscussionsInput, GlmStrikesInput, GriddedInput,
     HitCells, OutlooksInput, RasterizeOutput, ReportsInput, rasterize_glm_strikes,
@@ -1256,7 +1257,7 @@ fn decode_raster_reply(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutp
     }
     let (rgba, blank, hit_cells) = decode_overlay_out(head)?;
     Some(RasterizeOutput {
-        rgba: rgba.into(),
+        rgba,
         hit_cells,
         alpha: AlphaMode::Premultiplied,
         blank,
@@ -1333,7 +1334,16 @@ pub fn encode_overlay_out(
 /// tail there is a corrupt or foreign message rather than pixels this build
 /// should read. The RGBA tail is handed back **unjudged**: only the dispatch
 /// knows the dimensions it must match.
-pub fn decode_overlay_out(bytes: &[u8]) -> Option<(Vec<u8>, Option<u32>, Option<HitCells>)> {
+///
+/// **The tail is materialized as pixels, not bytes.** The one allocation this
+/// decode makes is a `Vec<Color32>`
+/// ([`RasterBuf::from_premultiplied_wire`]), so the consumer's `ColorImage`
+/// takes the picture by move; a `Vec<u8>` here would have to be copied into a
+/// second buffer the picture's own size, because a `Vec` cannot change the
+/// alignment it is freed with. Every row that replies with a raster shares
+/// this decode, so every overlay kind gets the move — on the web target,
+/// where this codec is the whole of how a reply arrives.
+pub fn decode_overlay_out(bytes: &[u8]) -> Option<(RasterBuf, Option<u32>, Option<HitCells>)> {
     let mut r = Reader::new(bytes);
     let hit_cells = match r.u8()? {
         0 => None,
@@ -1369,12 +1379,16 @@ pub fn decode_overlay_out(bytes: &[u8]) -> Option<(Vec<u8>, Option<u32>, Option<
         _ => return None,
     };
     match r.u8()? {
-        1 => Some((r.rest().to_vec(), None, hit_cells)),
+        1 => Some((
+            RasterBuf::from_premultiplied_wire(r.rest()),
+            None,
+            hit_cells,
+        )),
         0 => {
             let len = r.u32()?;
             r.rest()
                 .is_empty()
-                .then_some((Vec::new(), Some(len), hit_cells))
+                .then_some((RasterBuf::empty(), Some(len), hit_cells))
         }
         _ => None,
     }

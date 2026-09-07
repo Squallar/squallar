@@ -41,6 +41,40 @@ impl RasterBuf {
         Self::Bytes(Vec::new())
     }
 
+    /// **The wire's picture, born as pixels.** The reply's premultiplied RGBA
+    /// becomes the element type the consumer's `ColorImage` holds, in the one
+    /// allocation the decode was always going to make — so the picture reaches
+    /// the texture upload by move rather than through a second buffer its own
+    /// size.
+    ///
+    /// It has to happen *here*, at the birth of the buffer, and cannot be a
+    /// cast afterwards: a `Vec` is freed with the `Layout` it was allocated
+    /// with, so `Vec<u8>` (align 1) and `Vec<Color32>` (`#[repr(align(4))]`)
+    /// are not interconvertible in either direction, and
+    /// `bytemuck::allocation::try_cast_vec` refuses on exactly that ground.
+    ///
+    /// **Premultiplied is the wire's contract, not an assumption**: the funnel
+    /// premultiplies in its output stage before `encode_out`, and
+    /// `Color32::from_rgba_premultiplied` computes nothing — the four bytes
+    /// are stored as they arrived, which is what keeps the picture identical
+    /// to the `Bytes` arm this replaced.
+    ///
+    /// A length that is not whole pixels stays [`Bytes`](Self::Bytes). The
+    /// reply codec hands its tail back **unjudged** — only the dispatch knows
+    /// the dimensions it must match — and materializing whole pixels out of a
+    /// buffer that has none would silently drop the remainder that is the
+    /// evidence of the mismatch.
+    pub fn from_premultiplied_wire(rgba: &[u8]) -> Self {
+        if !rgba.len().is_multiple_of(4) {
+            return Self::Bytes(rgba.to_vec());
+        }
+        Self::Pixels(
+            rgba.chunks_exact(4)
+                .map(|px| Color32::from_rgba_premultiplied(px[0], px[1], px[2], px[3]))
+                .collect(),
+        )
+    }
+
     /// The bytes, borrowed — the read every consumer but the texture upload
     /// makes.
     pub fn as_bytes(&self) -> &[u8] {
