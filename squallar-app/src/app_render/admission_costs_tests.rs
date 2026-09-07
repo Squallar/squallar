@@ -805,3 +805,54 @@ fn the_budget_line_carries_the_spare_the_doors_were_given() {
          {line}",
     );
 }
+
+/// **`loop_frames_allowed` is a real reading of this session's room, not a
+/// constant.**
+///
+/// The listing door decides in this one figure, and every end-to-end test of
+/// that door hands it a table by hand — so without this, the whole mechanism
+/// could be wired to a field the App always fills with zero (refusing every
+/// loop) or always with the render budget (refusing none) and nothing would
+/// notice.
+///
+/// Three properties, none of which a constant has: it is positive on a
+/// session with room, it never exceeds the class figure no rung moves, and it
+/// **falls when the scene grows**. The last is the one that says the derived
+/// scene is the pane's own loop taken out of the real one rather than a
+/// stand-in.
+#[test]
+fn the_listing_doors_frame_count_reads_the_session_rather_than_a_constant() {
+    let mut app = n_pane_app(1, SITE);
+    tick(&mut app);
+    let budget = app.budgets.loop_render_budget;
+
+    let one_pane = app.admission_costs.panes[0].loop_frames_allowed;
+    assert!(
+        one_pane > 0,
+        "a session with room must allow frames, or the door refuses every \
+         loop there is",
+    );
+    assert!(
+        one_pane <= budget,
+        "and never more than the class figure no rung moves: {one_pane} > \
+         {budget}",
+    );
+    assert_eq!(
+        app.admission_costs.panes[0].loop_frame_reserve_bytes,
+        squallar_device_profile::fit::scan_reserve(&app.scene_of().panes[0]),
+        "the reserve a refusal states itself in must be the one the model \
+         charges the pane at",
+    );
+
+    // **The scene grows.** Six panes on the glass leave less for any one
+    // pane's loop than one pane does, so the figure has to move down. A
+    // constant, a class figure or a stand-in scene would all sit still here.
+    let mut crowded = n_pane_app(6, SITE);
+    tick(&mut crowded);
+    let six_panes = crowded.admission_costs.panes[0].loop_frames_allowed;
+    assert!(
+        six_panes <= one_pane,
+        "six panes must not leave one pane's loop MORE room than one pane \
+         does: {six_panes} > {one_pane}",
+    );
+}

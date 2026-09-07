@@ -4272,6 +4272,7 @@ impl super::App {
                         &allocation,
                         pane_idx,
                         &budgets,
+                        &mut self.admission,
                         pane.time_state_mut(&known::RADAR),
                         site,
                         listing,
@@ -5593,6 +5594,19 @@ impl super::App {
             }
         };
 
+        // Hoisted above the pane walk because the listing door's per-pane
+        // frame count is bounded by the same heap reading the scene-wide
+        // spare is: one reading, one instant, so a door and the readout
+        // cannot disagree about what the page is holding.
+        let heap = HostSpareInputs {
+            wall: self
+                .page_heap_reading
+                .filter(|heap| heap.page_max_bytes > 0)
+                .map(|heap| (heap.page_max_bytes, heap.page_bytes)),
+            live_bytes: squallar_alloc::live_bytes(),
+            headroom_bytes: self.host_headroom_bytes,
+        };
+
         let mut panes = Vec::with_capacity(scene.panes.len());
         for (idx, pane) in scene.panes.iter().enumerate() {
             // One more whole-picture overlay layer on this pane: its raster,
@@ -5647,6 +5661,74 @@ impl super::App {
                 Increment::ZERO
             };
 
+            // **How many frames this pane's loop may hold** - the listing
+            // door's figure, and the one admission question about a loop that
+            // can be asked honestly once it is armed.
+            //
+            // Taken over the scene with THIS PANE'S OWN LOOP EXCLUDED, which
+            // is what makes it usable where a byte increment is not. A pane
+            // between its arm and its listing is `is_active()`, so it prices
+            // as `looping` with no cadence, so the model charges it the whole
+            // render budget - 1120 MiB on the web bracket - and `spare` below
+            // is the allowance less a need already carrying that. Floored at
+            // zero by `saturating_sub`, it refuses every frame count there is.
+            // Excluding the pane's own loop is immunity by construction
+            // rather than a correction applied afterwards.
+            //
+            // **The still is credited back**, and it is worth exactly one
+            // frame. A plan-view pane that is not looping is parked at a
+            // still and charged `scan_reserve` for it; arming the loop
+            // displaces that still (`still_scans_host` and `loop_scans_host`
+            // are exact complements). Left out, this would under-count every
+            // plan-view pane by one frame, which is the over-firing
+            // direction. Credited into the MODEL term rather than after the
+            // heap bound, so a page with no room left is still held to what
+            // it is really holding.
+            //
+            // **Host axis only.** It is the axis `loop_scans_host` prices and
+            // the axis the wasm trap lives on; a GPU-bound loop stays the
+            // ladder's question, so this door cannot refuse on GPU grounds
+            // and cannot over-fire on them.
+            //
+            // Not `fit::reachable_loop_frames`, deliberately. That function
+            // short-circuits to the class figure on the presumed and derived
+            // arms because a bracket constant argued with its own headroom is
+            // not a reading of anything - sound for the presumed GPU figure,
+            // and not a description of the web host ceiling, which is the
+            // wasm wall: an exact declared property of the instance. Two
+            // consumers, two questions. The ladder's is unchanged.
+            let loop_frames_allowed = match cap.host_allowance() {
+                Some(allowance) => {
+                    let mut without = scene.clone();
+                    let bare = &mut without.panes[idx];
+                    bare.looping = false;
+                    bare.loop_scans_shared = false;
+                    bare.loop_scans_resident_bytes = 0;
+                    bare.loop_scans_resident_frames = 0;
+                    let bare = *bare;
+                    let need = floor_need(&without);
+                    let still = squallar_device_profile::fit::need_terms_for_pane(
+                        &bare, &budgets, GRID_BYTES,
+                    )
+                    .still_scans_host;
+                    let room = host_spare_bytes(
+                        allowance
+                            .saturating_sub(need.host_bytes)
+                            .saturating_add(still),
+                        allowance,
+                        heap,
+                    );
+                    let reserve = squallar_device_profile::fit::scan_reserve(pane).max(1);
+                    usize::try_from(room / reserve)
+                        .unwrap_or(usize::MAX)
+                        .min(budgets.loop_render_budget)
+                }
+                // No host figure, no host question - every native profile
+                // whose available-memory reader failed lands here, and a door
+                // refusing on an absent figure is refusing on nothing.
+                None => budgets.loop_render_budget,
+            };
+
             panes.push(PaneAdmission {
                 show_layer,
                 arm_loop,
@@ -5654,6 +5736,8 @@ impl super::App {
                 loop_frames_now: now_frames,
                 cadence_secs: pane.cadence_secs.or(would.cadence_secs),
                 looping: pane.looping,
+                loop_frames_allowed,
+                loop_frame_reserve_bytes: squallar_device_profile::fit::scan_reserve(pane),
             });
         }
 
@@ -5722,14 +5806,6 @@ impl super::App {
         // `joint_allowance` and the whole need rather than as the two spares
         // summed, because both of those are floored at zero and would
         // over-state the pool the moment one axis went over its share.
-        let heap = HostSpareInputs {
-            wall: self
-                .page_heap_reading
-                .filter(|heap| heap.page_max_bytes > 0)
-                .map(|heap| (heap.page_max_bytes, heap.page_bytes)),
-            live_bytes: squallar_alloc::live_bytes(),
-            headroom_bytes: self.host_headroom_bytes,
-        };
         let spare = Spare {
             // Less what the volume store could not shed: those bytes are held
             // by grids visible panes are drawing from, so they are resident
@@ -7729,10 +7805,16 @@ fn frames_are_resident(
 
 /// Take a scan listing for `site` into `ls`'s frame list, returning the downloads
 /// it now owes.
+// Eight, and the eighth is the admission ledger. The seven before it are the
+// listing's own inputs; splitting them into a struct to satisfy the count
+// would put a type between this function and its one caller for no reader's
+// benefit.
+#[allow(clippy::too_many_arguments)]
 fn accept_scan_listing(
     allocation: &LoopAllocation,
     pane_idx: usize,
     budgets: &squallar_device_profile::budget::Budgets,
+    admission: &mut squallar_egui::admission::AdmissionLedger,
     ls: &mut squallar_egui::pane::LayerTimeState,
     site: &str,
     listing: squallar_source::time::FrameListing,
@@ -7765,6 +7847,36 @@ fn accept_scan_listing(
             "Loop: sampled {total} down to {} frames for {site}",
             scans.len()
         );
+    }
+
+    // **The listing door** - the loop's one admission verdict, taken here
+    // because here is where its price stops being a guess.
+    //
+    // `build_loop_frames` has just recorded the site's cadence off this very
+    // listing, and `scans` is the frame list that cadence produced at the
+    // pane's own span. Before this point nobody knew either: an arm door
+    // asking then is asking about a frame count nothing has said, and the
+    // model answers such a question with the render budget's ceiling - which
+    // refused a clear-air loop at 1.56x its cost and would refuse a loop that
+    // fits on any site slower than the cap. After this point the first volume
+    // is on the wire. This is the last instant at which the whole loop can be
+    // priced and none of it has been committed.
+    //
+    // One verdict for the whole loop, all or nothing: **rulings 13 and 15**
+    // leave a granted loop's length alone, so a loop that cannot be held is
+    // refused before it is granted rather than quietly thinned afterwards.
+    //
+    // Refused, the pane leaves loop mode the same way it does when a listing
+    // named no scans at all, and no `FramePlan` is returned - so nothing is
+    // ever handed to the download manager and not one volume is fetched.
+    if !admission.admit_loop_frames(pane_idx, scans.len()) {
+        log::warn!(
+            "Loop: pane {pane_idx}'s {site} loop asked for {} frames, which \
+             this session cannot hold; leaving loop mode",
+            scans.len(),
+        );
+        *ls = squallar_egui::pane::LayerTimeState::new();
+        return None;
     }
 
     Some(FramePlan::new(
@@ -8676,6 +8788,17 @@ pub(super) fn layer_share(
 /// the function itself is private to this module and stays that way. Takes
 /// the bare instants the suites list with and wraps them as the listing radar
 /// would have answered (no runs, the window read off its ends), for pane 0.
+///
+/// **The listing door is inert here, and by its own rule rather than by a
+/// flag.** A fresh [`squallar_egui::admission::AdmissionLedger`] carries
+/// generation `0` — an application that has priced nothing refuses nothing —
+/// so every suite reaching this shim builds its frame list exactly as it did
+/// before the door existed. That is right for what they test: fifteen call
+/// sites across five modules asking what a listing becomes, none of them
+/// asking whether it was admitted. The door's own suites drive it through
+/// `accept_loop_scan_listings` with a priced table
+/// (`app_fetch::loop_restore_race_tests`), which is the path production
+/// takes.
 #[cfg(test)]
 pub(crate) fn accept_scan_listing_for_test(
     allocation: &LoopAllocation,
@@ -8685,10 +8808,12 @@ pub(crate) fn accept_scan_listing_for_test(
     scans: Vec<chrono::NaiveDateTime>,
     animating: usize,
 ) -> Option<FramePlan> {
+    let mut unpriced = squallar_egui::admission::AdmissionLedger::default();
     accept_scan_listing(
         allocation,
         0,
         budgets,
+        &mut unpriced,
         ls,
         site,
         listing_of_for_test(scans),

@@ -923,6 +923,31 @@ fn inside_the_band_the_cadence_decides_the_verdict_and_the_phantom_refused_both(
          refusal was not itself a phantom",
     );
 
+    // **The null, at the magnitude it is claimed at.** The admit above sits
+    // 160 MiB clear of the clear-air price - two whole frames - so a door
+    // biased by one frame still passes it, and an admission with that much
+    // slack has not been shown to scream. The maximal case is the spare that
+    // exactly buys the loop: correct pricing admits, and ONE frame of
+    // over-price refuses at the same spare.
+    let exact = split(u64::MAX, clear_air_cost.host_bytes);
+    assert_eq!(
+        verdict(exact, clear_air_cost),
+        Verdict::Admit,
+        "a spare that exactly buys the loop must admit it",
+    );
+    let one_frame_over = Increment::host(clear_air_cost.host_bytes + RESERVE);
+    assert!(
+        !verdict(exact, one_frame_over).is_admit(),
+        "and one frame more must not fit, or this instrument cannot see a \
+         one-frame bias and the admit above proves nothing",
+    );
+    // The same sensitivity one byte in, which is the boundary the primitive
+    // promises and the finest this door can resolve.
+    assert!(
+        !verdict(exact, Increment::host(clear_air_cost.host_bytes + 1)).is_admit(),
+        "one byte past the spare must refuse",
+    );
+
     // Above the band nothing is refused, which is what keeps the door from
     // being a wall: the desktop brackets are not this tight.
     let roomy = split(u64::MAX, 2048 * MIB);

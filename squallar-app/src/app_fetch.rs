@@ -1705,10 +1705,20 @@ impl super::App {
         // `hydrate_parked_panes`, which holds a refused pane until the App
         // publishes a fresher table -- the only thing that can change the
         // answer.
-        let want = self.admission.pane(pane_idx).arm_loop;
-        if !self
-            .admission
-            .enforce(squallar_egui::admission::Act::ArmLoop, Some(pane_idx), want)
+        //
+        // **And it only asks where the loop can be priced at all.**
+        // `AdmissionLedger::arm_loop` answers `None` until a listing has said
+        // the site's cadence, which on a cold hydrate is always: the model's
+        // frame count is then the render budget's ceiling rather than the
+        // span's own answer, and refusing on that turned away loops that
+        // would have fitted. The verdict moves to `accept_scan_listing`,
+        // where the cadence lands and no volume has been fetched yet, and
+        // this door keeps only the case it can answer honestly - a re-arm
+        // inside a session that already knows the site's cadence.
+        if let Some(want) = self.admission.arm_loop(pane_idx)
+            && !self
+                .admission
+                .enforce(squallar_egui::admission::Act::ArmLoop, Some(pane_idx), want)
         {
             self.loop_arm_pending.push((
                 pane_idx,

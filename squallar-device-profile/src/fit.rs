@@ -695,7 +695,12 @@ pub fn reachable_loop_frames(
 /// and the bootstrap is a 208-volume maximum rather than a guess. Letting
 /// evidence lower this would turn one quiet afternoon at a site into a
 /// reserve the next storm's volumes walk straight through.
-fn scan_reserve(pane: &PaneNeed) -> u64 {
+///
+/// **Public for the admission door**, which has to price a loop's pending
+/// frames in the same units the need model does. A door with its own spelling
+/// of this would refuse or admit against a reserve the scene is not being
+/// charged at.
+pub fn scan_reserve(pane: &PaneNeed) -> u64 {
     pane.loop_scan_reserve_bytes.max(LOOP_SCAN_RESERVE_BYTES)
 }
 

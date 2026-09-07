@@ -210,6 +210,46 @@ pub struct PaneAdmission {
     /// Whether it is looping now. A pane already looping pays a span delta,
     /// never [`Self::arm_loop`] again.
     pub looping: bool,
+    /// **The most frames this pane's loop may hold**, once everything in the
+    /// scene that is *not this loop's frames* is paid for.
+    ///
+    /// The figure the **listing door** compares a frame list against
+    /// ([`AdmissionLedger::admit_loop_frames`]), and the one admission
+    /// question about a loop that can be asked honestly: not "does one more
+    /// increment fit" but "how many frames may this hold".
+    ///
+    /// **Derived over the scene with this pane's own loop excluded**, and
+    /// that is what makes it usable where a byte increment is not. Between an
+    /// arm and its listing a pane is `is_active()` and therefore prices as
+    /// `looping` with no cadence, so the model charges it the whole render
+    /// budget — 1120 MiB on the web bracket — and
+    /// [`AdmissionCosts::spare`] is that scene's allowance less that need,
+    /// floored at zero by `saturating_sub`. A door comparing against that
+    /// spare refuses every frame count including the two-frame floor, on
+    /// every arm. Excluding the pane's own loop makes this immune to that by
+    /// construction rather than by correction.
+    ///
+    /// **Host axis only, and deliberately.** It is the axis
+    /// `NeedTerms::loop_scans_host` prices and the axis the wasm trap lives
+    /// on. A GPU-bound loop is still the ladder's to answer through
+    /// `fit`, exactly as before; this door cannot refuse on GPU grounds and
+    /// so cannot over-fire on them.
+    ///
+    /// **Not floored at `MIN_LOOP_FRAMES_PER_PANE`.** `fit::
+    /// reachable_loop_frames` floors there because a count is all it can
+    /// return, and its own comment says the sub-two case "is a refusal to
+    /// make at admission, not a count to round down to one". This is that
+    /// admission, so it takes the raw figure and refuses.
+    pub loop_frames_allowed: usize,
+    /// **What one of this pane's not-yet-arrived loop frames is reserved
+    /// at** — `fit`'s own `scan_reserve` for this pane, the bootstrap or the
+    /// site's calibrated floor above it.
+    ///
+    /// Carried so a refusal can state itself in bytes. The door decides in
+    /// frames, but "three frames short" means nothing on the glass and
+    /// "240 MB short" is the same fact in the units the memory settings are
+    /// in.
+    pub loop_frame_reserve_bytes: u64,
 }
 
 /// **What a door is asking for**, for the log line and the notice.
@@ -231,6 +271,19 @@ pub enum Act {
     Preset,
     /// Arming a loop on one pane.
     ArmLoop,
+    /// **Committing to the frames a loop's listing named** — the loop's one
+    /// whole-loop verdict, taken when its cadence lands and before any of it
+    /// is downloaded.
+    ///
+    /// Spelled apart from [`Self::ArmLoop`] because the two are different
+    /// questions with different answers *and different consequences*. An arm
+    /// refusal costs nothing to re-ask and is re-asked for the user on the
+    /// next table; a listing refusal has already paid for a frame listing
+    /// over the network and is **not**, so its notice has to tell the reader
+    /// to turn the loop back on and an arm's must not. Keeping them apart
+    /// also keeps their refusals apart in the ledger's memo, where they are
+    /// genuinely two answers.
+    LoopFrames,
     /// The lookback slider, which writes every pane.
     LoopSpan,
 }
@@ -244,7 +297,7 @@ impl Act {
             Self::DefaultLayers => "this pane's layers",
             Self::AdoptLayers => "the linked panes' layers",
             Self::Preset => "this preset",
-            Self::ArmLoop => "this loop",
+            Self::ArmLoop | Self::LoopFrames => "this loop",
             Self::LoopSpan => "a longer lookback",
         }
     }
@@ -497,21 +550,40 @@ impl AdmissionLedger {
         if want.is_zero() || self.in_batch() || self.costs.generation == 0 {
             return (Verdict::Admit, true);
         }
-        if let Some((_, _, held)) = self
-            .refused
+        if let Some(held) = self.held_answer(act, pane) {
+            return (held, false);
+        }
+        let v = verdict(self.spare(), want);
+        if v.is_admit() {
+            self.spent = self.spent.plus(want);
+        }
+        (self.record(act, pane, v), true)
+    }
+
+    /// The answer this table already gave to `(act, pane)`, if it gave one.
+    fn held_answer(&self, act: Act, pane: Option<usize>) -> Option<Verdict> {
+        self.refused
             .iter()
             .find(|(held_act, held_pane, _)| *held_act == act && *held_pane == pane)
-        {
-            return (Verdict::Refuse(*held), false);
-        }
+            .map(|(_, _, refusal)| Verdict::Refuse(*refusal))
+    }
+
+    /// **Count a verdict, log a refusal, and remember it** — the half of an
+    /// ask that is the same whether the verdict came from comparing bytes
+    /// against [`Self::spare`] or frames against
+    /// [`PaneAdmission::loop_frames_allowed`].
+    ///
+    /// Spelled once so the two doors cannot come to count, log or memoise
+    /// differently. It does not debit [`Self::spent`]: what an admission
+    /// spends is the byte door's business, and the listing door adds no bytes
+    /// to a scene that is already carrying its loop.
+    fn record(&mut self, act: Act, pane: Option<usize>, v: Verdict) -> Verdict {
         ASKED.fetch_add(1, Relaxed);
         self.counts.asked = self.counts.asked.saturating_add(1);
-        let v = verdict(self.spare(), want);
         match v {
             Verdict::Admit => {
                 ADMITTED.fetch_add(1, Relaxed);
                 self.counts.admitted = self.counts.admitted.saturating_add(1);
-                self.spent = self.spent.plus(want);
             }
             Verdict::Refuse(refusal) => {
                 WOULD_REFUSE.fetch_add(1, Relaxed);
@@ -529,7 +601,74 @@ impl AdmissionLedger {
                 );
             }
         }
-        (v, true)
+        v
+    }
+
+    /// **The listing door: may this pane's loop hold the frames its listing
+    /// named?**
+    ///
+    /// Asked once, when a listing lands and says the site's cadence, and
+    /// **before the first frame is downloaded** — the moment the frame count
+    /// stops being a guess and the moment before any of it is committed.
+    /// `wanted` is the frame list the listing produced, already held to
+    /// `LoopFrames::frames` at the pane's own span.
+    ///
+    /// **A count, not an increment, and that is the whole design.** The
+    /// question at a listing was never "does one more thing fit" — the loop
+    /// is already in the scene by then — it is "how many frames may this
+    /// hold", which is what [`PaneAdmission::loop_frames_allowed`] answers
+    /// over a scene with this pane's own loop taken out. Asking it as a byte
+    /// increment against [`Self::spare`] cannot work: that spare is the
+    /// allowance less a need that already carries this loop at the render
+    /// budget's ceiling, floored at zero, so it refuses every frame count
+    /// there is.
+    ///
+    /// One verdict for the whole loop, taken before a grant exists, so
+    /// **rulings 13 and 15 hold**: nothing here shortens a granted loop or
+    /// decimates one pane's frames on another's behalf. It admits or it
+    /// refuses.
+    ///
+    /// A refusal is counted, logged, memoised and **shown** exactly as a byte
+    /// door's is, and the caller is expected to leave loop mode and download
+    /// nothing.
+    pub fn admit_loop_frames(&mut self, pane_idx: usize, wanted: usize) -> bool {
+        self.decide_loop_frames(pane_idx, wanted, ENFORCING)
+    }
+
+    /// [`Self::admit_loop_frames`]'s body with the arm's policy passed in, so
+    /// both arms are reachable from one test binary — [`Self::decide`]'s
+    /// reason, and the wasm arm is again the one no test here executes.
+    fn decide_loop_frames(&mut self, pane_idx: usize, wanted: usize, enforcing: bool) -> bool {
+        let act = Act::LoopFrames;
+        let pane_key = Some(pane_idx);
+        if self.in_batch() || self.costs.generation == 0 {
+            return true;
+        }
+        let pane = self.pane(pane_idx);
+        // A pane the table has not seen asks for nothing, the same way every
+        // other door reads an absent row: refusing on a figure that does not
+        // exist is how an admission system becomes a wall at startup.
+        if self.costs.panes.get(pane_idx).is_none() || wanted <= pane.loop_frames_allowed {
+            return true;
+        }
+        let (v, fresh) = match self.held_answer(act, pane_key) {
+            Some(held) => (held, false),
+            None => {
+                // The same shortfall in bytes, because that is the unit the
+                // memory settings and the notice are in. `spare_bytes` is
+                // what the allowed frames are worth, not a pool reading:
+                // the door compared counts and the sentence says so in the
+                // units a reader can act on.
+                let reserve = pane.loop_frame_reserve_bytes;
+                let refusal = Refusal {
+                    pool: Pool::Host,
+                    wanted_bytes: (wanted as u64).saturating_mul(reserve),
+                    spare_bytes: (pane.loop_frames_allowed as u64).saturating_mul(reserve),
+                };
+                (self.record(act, pane_key, Verdict::Refuse(refusal)), true)
+            }
+        };
+        self.act_on(act, v, fresh, enforcing)
     }
 
     /// **Whether `act` was already refused against the table in force.**
@@ -596,37 +735,45 @@ impl AdmissionLedger {
     /// all, and the advisory arm is the wasm one — the arm no test in this
     /// workspace executes.
     fn decide(&mut self, act: Act, pane: Option<usize>, want: Increment, enforcing: bool) -> bool {
-        match self.ask_tracked(act, pane, want) {
-            (Verdict::Admit, _) => true,
-            (Verdict::Refuse(refusal), fresh) => {
-                if fresh {
-                    if enforcing {
-                        REFUSED.fetch_add(1, Relaxed);
-                        self.counts.refused = self.counts.refused.saturating_add(1);
-                    }
-                    // **The notice goes up on BOTH arms**, and the two say
-                    // different things because different things happened.
-                    //
-                    // On the advisory arm the act proceeds, so the enforcing
-                    // sentence would be a false statement on the glass -- it
-                    // names a refusal that did not occur. What is true there
-                    // is that the scene went past what the device will give
-                    // it and may fail, and that is worth saying: on the web
-                    // build this is the only warning between a loop the page
-                    // cannot hold and the trap that ends the tab. The reader
-                    // can act on it -- the same share, the same scene levers
-                    // -- which is what separates a warning from a defect.
-                    //
-                    // Until this landed the wasm refusal was invisible by
-                    // construction: computed, logged to a console nobody has
-                    // open, and never once put in front of the person whose
-                    // page was about to die.
-                    let text = refusal_text(act, refusal, self.costs.requested_percent, enforcing);
-                    self.raise_notice(text, web_time::Instant::now());
-                }
-                !enforcing
+        let (v, fresh) = self.ask_tracked(act, pane, want);
+        self.act_on(act, v, fresh, enforcing)
+    }
+
+    /// **Act on a verdict**: the arm's policy, the refused count and the
+    /// notice.
+    ///
+    /// Shared by the byte doors and the listing door so a refusal reaches the
+    /// glass by one path however it was decided. Returns whether the caller
+    /// may proceed.
+    fn act_on(&mut self, act: Act, v: Verdict, fresh: bool, enforcing: bool) -> bool {
+        let Verdict::Refuse(refusal) = v else {
+            return true;
+        };
+        if fresh {
+            if enforcing {
+                REFUSED.fetch_add(1, Relaxed);
+                self.counts.refused = self.counts.refused.saturating_add(1);
             }
+            // **The notice goes up on BOTH arms**, and the two say different
+            // things because different things happened.
+            //
+            // On the advisory arm the act proceeds, so the enforcing sentence
+            // would be a false statement on the glass -- it names a refusal
+            // that did not occur. What is true there is that the scene went
+            // past what the device will give it and may fail, and that is
+            // worth saying: on the web build this is the only warning between
+            // a loop the page cannot hold and the trap that ends the tab. The
+            // reader can act on it -- the same share, the same scene levers --
+            // which is what separates a warning from a defect.
+            //
+            // Until this landed the wasm refusal was invisible by
+            // construction: computed, logged to a console nobody has open,
+            // and never once put in front of the person whose page was about
+            // to die.
+            let text = refusal_text(act, refusal, self.costs.requested_percent, enforcing);
+            self.raise_notice(text, web_time::Instant::now());
         }
+        !enforcing
     }
 
     /// **Open an exemption**: every door reached until [`Self::end_exempt`]
@@ -746,20 +893,21 @@ fn refusal_text(act: Act, refusal: Refusal, percents: (u8, u8), enforced: bool) 
             )
         }
     };
+    let after = follow_up(act, enforced);
     if !gpu_movable && !host_movable {
         return format!(
-            "{} This device has no more to give it: {}.",
+            "{} This device has no more to give it: {}.{after}",
             head(""),
             scene_lever(act),
         );
     }
     match refusal.pool {
         Pool::Gpu => format!(
-            "{} Raise \"GPU memory\" in Settings > Memory (now {gpu} %).",
+            "{} Raise \"GPU memory\" in Settings > Memory (now {gpu} %).{after}",
             head("GPU "),
         ),
         Pool::Host => format!(
-            "{} Raise \"System memory\" in Settings > Memory (now {host} %).",
+            "{} Raise \"System memory\" in Settings > Memory (now {host} %).{after}",
             head("system "),
         ),
         // One memory, and whichever share is still short of its stop is the
@@ -768,17 +916,17 @@ fn refusal_text(act: Act, refusal: Refusal, percents: (u8, u8), enforced: bool) 
         Pool::Joint if gpu_movable && host_movable => format!(
             "{} This machine shares one pool between the display and the \
              system: raise \"GPU memory\" (now {gpu} %) or \"System memory\" \
-             (now {host} %) in Settings > Memory.",
+             (now {host} %) in Settings > Memory.{after}",
             head(""),
         ),
         Pool::Joint if gpu_movable => format!(
             "{} This machine shares one pool between the display and the \
-             system: raise \"GPU memory\" in Settings > Memory (now {gpu} %).",
+             system: raise \"GPU memory\" in Settings > Memory (now {gpu} %).{after}",
             head(""),
         ),
         Pool::Joint => format!(
             "{} This machine shares one pool between the display and the \
-             system: raise \"System memory\" in Settings > Memory (now {host} %).",
+             system: raise \"System memory\" in Settings > Memory (now {host} %).{after}",
             head(""),
         ),
     }
@@ -793,11 +941,35 @@ fn refusal_text(act: Act, refusal: Refusal, percents: (u8, u8), enforced: bool) 
 /// front of one act, not in front of the whole scene.
 const fn scene_lever(act: Act) -> &'static str {
     match act {
-        Act::ArmLoop | Act::LoopSpan => "shorten the lookback, or turn off a layer",
+        Act::ArmLoop | Act::LoopFrames | Act::LoopSpan => {
+            "shorten the lookback, or turn off a layer"
+        }
         Act::Panes { .. } | Act::Preset => "close a pane, or turn off a layer",
         Act::ShowLayer | Act::DefaultLayers | Act::AdoptLayers => {
             "turn off another layer, shorten a lookback, or close a pane"
         }
+    }
+}
+
+/// **What the reader must do after the lever, where the act is not re-asked
+/// for them.**
+///
+/// Every other door here is re-asked from the ledger's memo the moment the
+/// App publishes a table with room, so "lower the lookback" is the whole
+/// instruction: the user changes it and the loop arrives. The listing door is
+/// not, deliberately — re-driving it would put a fresh frame listing on the
+/// network on every redraw — so lowering the lookback alone does **nothing**
+/// visible, and a notice stopping there would leave the reader having done
+/// exactly what they were told with no result. That is a worse experience
+/// than the refusal it followed.
+///
+/// **Empty on the advisory arm**, where the loop was let through and is
+/// already running: telling someone to turn back on a thing that is playing
+/// is the same false statement in the other direction.
+const fn follow_up(act: Act, enforced: bool) -> &'static str {
+    match act {
+        Act::LoopFrames if enforced => " Then turn the loop back on.",
+        _ => "",
     }
 }
 
@@ -810,6 +982,7 @@ fn act_word(act: Act) -> &'static str {
         Act::AdoptLayers => "syncing linked layers",
         Act::Preset => "applying a preset",
         Act::ArmLoop => "arming a loop",
+        Act::LoopFrames => "listing a loop",
         Act::LoopSpan => "widening the lookback",
     }
 }

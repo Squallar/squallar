@@ -771,3 +771,262 @@ fn a_pane_with_no_cadence_yet_has_no_arm_loop_price() {
     ledger.adopt(&table);
     assert_eq!(ledger.arm_loop(0), None);
 }
+
+// ── The listing door ──────────────────────────────────────────────────────
+
+/// A table whose pane 0 may hold `allowed` loop frames, each reserved at
+/// 80 MiB — the web bracket's own figure.
+fn loop_costs(allowed: usize) -> AdmissionCosts {
+    let mut table = costs(u64::MAX, 0, 1);
+    table.panes[0].loop_frames_allowed = allowed;
+    table.panes[0].loop_frame_reserve_bytes = 80 * MIB;
+    table
+}
+
+/// **The listing door resolves one frame, at the spare that exactly buys the
+/// loop.**
+///
+/// This is the assertion that earns every other one here. An admit with
+/// frames to spare passes on a door biased by one, by two, or by a door that
+/// never refuses at all; only the boundary says the instrument can see what
+/// it claims to measure. So: the exact count admits, one more refuses, and
+/// nothing in between is left unstated.
+#[test]
+fn the_listing_door_resolves_a_single_frame_at_the_boundary() {
+    let mut ledger = AdmissionLedger::default();
+    ledger.adopt(&loop_costs(9));
+
+    assert!(
+        ledger.admit_loop_frames(0, 9),
+        "the count the session can hold must be admitted",
+    );
+    assert_eq!(
+        ledger.counts().would_refuse,
+        0,
+        "an admitted loop leaves no refusal behind",
+    );
+    assert!(
+        ledger.notice(web_time::Instant::now()).is_none(),
+        "and nothing on the glass",
+    );
+
+    // One frame more, same table.
+    let mut tight = AdmissionLedger::default();
+    tight.adopt(&loop_costs(9));
+    assert!(
+        !tight.admit_loop_frames(0, 10),
+        "one frame past what the session can hold must be refused, or this \
+         door cannot see a one-frame difference and its admits mean nothing",
+    );
+    assert_eq!(tight.counts().refused, 1);
+}
+
+/// **A loop that fits overwhelmingly is admitted and costs nothing to ask.**
+///
+/// The other half of the pair: over-firing is the worse direction, so a door
+/// that refuses a two-frame loop on a session with room for fourteen would be
+/// worse than no door. Asserted across the whole range, not at one point.
+#[test]
+fn the_listing_door_admits_every_count_the_session_can_hold() {
+    let mut ledger = AdmissionLedger::default();
+    ledger.adopt(&loop_costs(14));
+    for wanted in 0..=14 {
+        assert!(
+            ledger.admit_loop_frames(0, wanted),
+            "{wanted} frames of a possible 14 must be admitted",
+        );
+    }
+    assert_eq!(
+        ledger.counts().would_refuse,
+        0,
+        "not one of those may have taken a refusing verdict",
+    );
+    assert!(ledger.notice(web_time::Instant::now()).is_none());
+}
+
+/// **A refused listing is seen, says what to do, and states itself in bytes.**
+///
+/// The door decides in frames because that is the honest unit at a listing,
+/// but "three frames short" is not something a reader can act on. The
+/// sentence names the shortfall in the units the memory settings are in, and
+/// the lever for a loop is the lookback.
+#[test]
+fn a_refused_listing_names_the_shortfall_in_bytes_and_the_lever() {
+    let mut ledger = AdmissionLedger::default();
+    let mut table = loop_costs(3);
+    // A share still short of its stop, so the notice names the slider rather
+    // than the scene.
+    table.requested_percent = (50, 50);
+    ledger.adopt(&table);
+
+    assert!(!ledger.admit_loop_frames(0, 14));
+    let text = ledger
+        .notice(web_time::Instant::now())
+        .expect(
+            "a refused loop the reader cannot see is worse than the \
+                 allocation it prevented",
+        )
+        .text
+        .clone();
+    // 14 frames wanted, 3 allowed, 80 MiB apiece: 11 x 83_886_080 B, stated
+    // in the decimal MB the notice uses.
+    assert!(
+        text.contains("923 MB"),
+        "the shortfall must be the frames the loop could not have, priced at \
+         the reserve the scene charges them: {text}",
+    );
+    assert!(
+        text.contains("this loop") && text.contains("System memory"),
+        "and it must name the act and the control: {text}",
+    );
+    // **The second action, and it is not decoration.** This door is not
+    // re-asked for the user - re-driving it would put a fresh frame listing
+    // on the network every redraw - so lowering the lookback alone does
+    // nothing they can see. A notice stopping at the lever would leave them
+    // having done exactly what they were told with no result.
+    assert!(
+        text.contains("Then turn the loop back on."),
+        "a refusal nobody retries must say what to do after the lever, or \
+         the instruction is a trap: {text}",
+    );
+
+    // **An ARM refusal must NOT say it**, because that one IS re-asked from
+    // the memo on the next table. The day this door gains an automatic
+    // re-drive, this pair is what says to drop the clause.
+    let mut armed = AdmissionLedger::default();
+    // Its own table: `loop_costs` leaves `u64::MAX` on both pools so that only
+    // the COUNT door bites, and a byte door compared against that admits
+    // everything.
+    let mut tight = costs(8 * MIB, 0, 1);
+    tight.requested_percent = (50, 50);
+    armed.adopt(&tight);
+    assert!(!armed.enforce(Act::ArmLoop, Some(0), Increment::host(600 * MIB)));
+    let arm_text = armed
+        .notice(web_time::Instant::now())
+        .expect("a notice")
+        .text
+        .clone();
+    assert!(
+        !arm_text.contains("turn the loop back on"),
+        "an arm refusal is retried for the user and must not tell them to do \
+         it themselves: {arm_text}",
+    );
+
+    // The scene lever, where no share is left to move.
+    let mut stopped = AdmissionLedger::default();
+    let mut at_stop = loop_costs(3);
+    at_stop.requested_percent = (100, 100);
+    stopped.adopt(&at_stop);
+    assert!(!stopped.admit_loop_frames(0, 14));
+    let text = stopped
+        .notice(web_time::Instant::now())
+        .expect("a notice")
+        .text
+        .clone();
+    assert!(
+        text.contains("shorten the lookback"),
+        "on a device with no more to give, the lever is the user's own \
+         setting: {text}",
+    );
+}
+
+/// **The listing door obeys the ledger's own rules**: exemptions, an unpriced
+/// table, a pane the table has never seen, one answer per table, and a fresh
+/// answer on the next one.
+///
+/// It decides in a different unit from every other door here, so each of
+/// those rules is a place it could have drifted into its own policy.
+#[test]
+fn the_listing_door_shares_the_ledgers_rules() {
+    // An application that has priced nothing refuses nothing.
+    let mut unpriced = AdmissionLedger::default();
+    assert!(unpriced.admit_loop_frames(0, 999));
+
+    // Restore is never a refusal.
+    let mut exempt = AdmissionLedger::default();
+    exempt.adopt(&loop_costs(2));
+    exempt.begin_exempt();
+    assert!(exempt.admit_loop_frames(0, 999));
+    exempt.end_exempt();
+    assert!(exempt.notice(web_time::Instant::now()).is_none());
+    assert!(
+        !exempt.admit_loop_frames(0, 999),
+        "control: outside, it refuses"
+    );
+
+    // A pane the table has not seen asks for nothing - the loop door is
+    // reached by index from a queue drained a frame later.
+    let mut ledger = AdmissionLedger::default();
+    ledger.adopt(&loop_costs(2));
+    assert!(ledger.admit_loop_frames(9, 999));
+
+    // One answer per table, then a fresh one.
+    let mut repeat = AdmissionLedger::default();
+    repeat.adopt(&loop_costs(2));
+    assert!(!repeat.admit_loop_frames(0, 14));
+    let after_one = repeat.counts();
+    for _ in 0..20 {
+        assert!(!repeat.admit_loop_frames(0, 14));
+    }
+    assert_eq!(
+        repeat.counts(),
+        after_one,
+        "20 listings are not 20 verdicts"
+    );
+
+    let mut roomier = loop_costs(14);
+    roomier.generation = 2;
+    repeat.adopt(&roomier);
+    assert!(
+        repeat.admit_loop_frames(0, 14),
+        "a fresher table is a fresh answer",
+    );
+}
+
+/// **Both arms, and only the enforcing one turns the listing away.**
+///
+/// `ENFORCING` is false on wasm32 and no test here runs a wasm build, so the
+/// policy is a parameter and both arms are driven from native — the same
+/// reason `decide` takes one.
+#[test]
+fn the_listing_door_is_advisory_on_the_arm_that_does_not_enforce() {
+    for enforcing in [false, true] {
+        let mut ledger = AdmissionLedger::default();
+        ledger.adopt(&loop_costs(3));
+        let proceeded = ledger.decide_loop_frames(0, 14, enforcing);
+        assert_eq!(
+            proceeded, !enforcing,
+            "the arm decides whether the loop goes ahead: enforcing = \
+             {enforcing}",
+        );
+        let counts = ledger.counts();
+        assert_eq!(counts.would_refuse, 1, "the verdict is taken on both arms");
+        assert_eq!(counts.refused, u32::from(enforcing));
+
+        let text = ledger
+            .notice(web_time::Instant::now())
+            .expect("the reader is told on both arms")
+            .text
+            .clone();
+        assert_eq!(
+            text.contains("Not enough"),
+            enforcing,
+            "only the arm that turned the loop away may say it did: \
+             {text}",
+        );
+        assert_eq!(
+            text.contains("allowed anyway"),
+            !enforcing,
+            "and only the arm that let it through may say that: {text}",
+        );
+        // The advisory arm let the loop through, so it is playing: telling
+        // the reader to turn it back on is the same false statement in the
+        // other direction.
+        assert_eq!(
+            text.contains("turn the loop back on"),
+            enforcing,
+            "the second action belongs only where the loop was actually \
+             turned away: {text}",
+        );
+    }
+}
