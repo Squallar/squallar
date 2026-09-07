@@ -9,9 +9,11 @@ use std::sync::Arc;
 
 use crate::nws::alert::AlertCategory;
 use crate::render::overlay_state::{HitItems, OverlayItem};
+pub use crate::render::raster_buf::RasterBuf;
 use crate::spc::colors::{md_fill_color, md_stroke_color};
 use crate::spc::reports::StormReportKind;
 use crate::types::OverlayFeature;
+use ecolor::Color32;
 use squallar_geo::{GeoBounds, GeoPolygonRing};
 
 /// Occupied cell index to the item indices drawn into it.
@@ -188,7 +190,14 @@ pub fn has_ink(rgba: &[u8]) -> bool {
 
 pub struct RasterizeOutput {
     /// The picture's premultiplied bytes — **empty when `blank` is `Some`**.
-    pub rgba: Vec<u8>,
+    ///
+    /// A [`RasterBuf`] rather than a `Vec<u8>` because which of the two
+    /// layouts the bytes are in is the producer's to decide and no consumer's
+    /// to care about: it derefs to `[u8]`, so every reader below and every
+    /// reader downstream is unchanged, and the one consumer that wants pixels
+    /// takes them by move. See [`RasterBuf`] for why the layout cannot be
+    /// changed after the fact.
+    pub rgba: RasterBuf,
     pub hit_cells: Option<HitCells>,
     pub alpha: AlphaMode,
     /// `Some(len)` when this raster has been judged and had no ink in it:
@@ -237,7 +246,7 @@ impl RasterizeOutput {
         }
         if let Ok(len) = u32::try_from(self.rgba.len()) {
             self.blank = Some(len);
-            self.rgba = Vec::new();
+            self.rgba = RasterBuf::empty();
         }
     }
 }
@@ -256,7 +265,7 @@ impl squallar_source::job::JobOut for RasterizeOutput {
             AlphaMode::Premultiplied => Vec::new(),
             AlphaMode::Straight => {
                 self.alpha = AlphaMode::Premultiplied;
-                vec![&mut self.rgba]
+                vec![self.rgba.as_mut_bytes()]
             }
         }
     }
@@ -350,7 +359,7 @@ pub fn rasterize_spc_outlooks(
             height
         );
         return RasterizeOutput {
-            rgba: vec![0u8; (width * height * 4) as usize],
+            rgba: vec![0u8; (width * height * 4) as usize].into(),
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
@@ -367,7 +376,7 @@ pub fn rasterize_spc_outlooks(
     crate::render::hatch::draw_hatch_pass(&mut pixmap, features, &mb, w, h, *hatch_color);
 
     RasterizeOutput {
-        rgba: pixmap.take(),
+        rgba: pixmap.take().into(),
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
         blank: None,
@@ -406,7 +415,7 @@ pub fn rasterize_spc_discussions(
             height
         );
         return RasterizeOutput {
-            rgba: vec![0u8; (width * height * 4) as usize],
+            rgba: vec![0u8; (width * height * 4) as usize].into(),
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
@@ -439,7 +448,7 @@ pub fn rasterize_spc_discussions(
     }
 
     RasterizeOutput {
-        rgba: pixmap.take(),
+        rgba: pixmap.take().into(),
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
         blank: None,
@@ -483,7 +492,7 @@ pub fn rasterize_nws_alerts(
             height
         );
         return RasterizeOutput {
-            rgba: vec![0u8; (width * height * 4) as usize],
+            rgba: vec![0u8; (width * height * 4) as usize].into(),
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
@@ -503,7 +512,7 @@ pub fn rasterize_nws_alerts(
     }
 
     RasterizeOutput {
-        rgba: pixmap.take(),
+        rgba: pixmap.take().into(),
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
         blank: None,
@@ -580,7 +589,7 @@ pub fn rasterize_radar_coverage(
             height
         );
         return RasterizeOutput {
-            rgba: vec![0u8; (width * height * 4) as usize],
+            rgba: vec![0u8; (width * height * 4) as usize].into(),
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
@@ -652,7 +661,7 @@ pub fn rasterize_radar_coverage(
     }
 
     RasterizeOutput {
-        rgba: pixmap.take(),
+        rgba: pixmap.take().into(),
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
         blank: None,
@@ -836,7 +845,7 @@ pub fn rasterize_metar_stations(
             height
         );
         return RasterizeOutput {
-            rgba: vec![0u8; (width * height * 4) as usize],
+            rgba: vec![0u8; (width * height * 4) as usize].into(),
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
@@ -874,7 +883,7 @@ pub fn rasterize_metar_stations(
     }
 
     RasterizeOutput {
-        rgba: pixmap.take(),
+        rgba: pixmap.take().into(),
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
         blank: None,
@@ -1052,7 +1061,7 @@ pub fn rasterize_storm_reports(
             height
         );
         return RasterizeOutput {
-            rgba: vec![0u8; (width * height * 4) as usize],
+            rgba: vec![0u8; (width * height * 4) as usize].into(),
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
@@ -1169,7 +1178,7 @@ pub fn rasterize_storm_reports(
     }
 
     RasterizeOutput {
-        rgba: pixmap.take(),
+        rgba: pixmap.take().into(),
         hit_cells: Some(hit_cells),
         alpha: AlphaMode::Premultiplied,
         blank: None,
@@ -1289,7 +1298,7 @@ pub fn rasterize_glm_strikes(
             height
         );
         return RasterizeOutput {
-            rgba: vec![0u8; (width * height * 4) as usize],
+            rgba: vec![0u8; (width * height * 4) as usize].into(),
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
@@ -1372,7 +1381,7 @@ pub fn rasterize_glm_strikes(
     }
 
     RasterizeOutput {
-        rgba: pixmap.take(),
+        rgba: pixmap.take().into(),
         hit_cells: Some(hit_cells),
         alpha: AlphaMode::Premultiplied,
         blank: None,
@@ -2122,8 +2131,13 @@ struct CellRect {
     y0: i32,
     x1: i32,
     y1: i32,
-    /// Straight (unmultiplied) RGBA, as this rasterizer writes.
-    color: [u8; 4],
+    /// Straight (unmultiplied) RGBA, as this rasterizer writes — in the
+    /// picture's own element type, so a cell's colour reaches a pixel as one
+    /// word store rather than four byte stores. `Color32` is a 4-byte
+    /// container here and states nothing about alpha; the convention is
+    /// [`RasterizeOutput::alpha`], which this rasterizer answers
+    /// [`AlphaMode::Straight`] until the funnel's premultiply.
+    color: Color32,
 }
 
 impl CellRect {
@@ -2201,20 +2215,16 @@ impl CellRect {
     }
 
     /// Store this cell's colour into every pixel it owns, and count the stores.
-    fn fill(&self, rgba: &mut [u8], width: u32, written_px: &mut u64) {
+    fn fill(&self, px: &mut [Color32], width: u32, written_px: &mut u64) {
         if self.is_empty() {
             return;
         }
         *written_px += (self.x1 - self.x0 + 1) as u64 * (self.y1 - self.y0 + 1) as u64;
         for y in self.y0..=self.y1 {
-            let row_offset = (y as u32 * width * 4) as usize;
+            let row_start = (y as u32 * width) as usize;
             for x in self.x0..=self.x1 {
-                let offset = row_offset + (x as u32 * 4) as usize;
                 // Overwrite — no blending between adjacent grid cells.
-                rgba[offset] = self.color[0];
-                rgba[offset + 1] = self.color[1];
-                rgba[offset + 2] = self.color[2];
-                rgba[offset + 3] = self.color[3];
+                px[row_start + x as usize] = self.color;
             }
         }
     }
@@ -2229,7 +2239,7 @@ impl CellRect {
 /// the cell's real size is, and its right column and bottom row are then the
 /// left column and top row of cells that overwrite them a moment later.
 fn emit_cell_row(
-    rgba: &mut [u8],
+    px: &mut [Color32],
     width: u32,
     row: &mut [Option<CellRect>],
     next: Option<&[Option<CellRect>]>,
@@ -2253,7 +2263,7 @@ fn emit_cell_row(
         ahead = Some(sized);
     }
     for cell in row.iter().flatten() {
-        cell.fill(rgba, width, written_px);
+        cell.fill(px, width, written_px);
     }
 }
 
@@ -2265,15 +2275,26 @@ pub fn rasterize_gridded(
     width: u32,
     height: u32,
 ) -> RasterizeOutput {
+    // **Pixels, not bytes, and that is the whole of the allocation saving.**
+    // A `Vec<u8>` can never be handed to a consumer that wants `Vec<Color32>`
+    // — the alignment a block is freed with is the one it was taken with — so
+    // a byte picture is copied into a second buffer its own size at the
+    // arrival, 40.79 MiB at the 4317 x 2477 case. Written as pixels here, the
+    // one buffer is the one the texture upload takes.
+    //
+    // `zeroed_vec`, not `vec![Color32::TRANSPARENT; n]`: the latter has no
+    // `IsZero` specialisation for a foreign element type, so it would take an
+    // uninitialised block and write the zeros the kernel hands over already
+    // zeroed. This is `alloc_zeroed`, which is what `vec![0u8; size]` was.
     let size = (width * height * 4) as usize;
-    let mut rgba = vec![0u8; size];
+    let mut px: Vec<Color32> = bytemuck::zeroed_vec(size / 4);
     let (ni, nj) = input.shape();
     let coords = input.coords();
 
     let empty = input.whole_values().is_some_and(|(v, _)| v.is_empty());
     if empty || width == 0 || height == 0 || ni == 0 || nj == 0 {
         return RasterizeOutput {
-            rgba,
+            rgba: px.into(),
             hit_cells: None,
             alpha: AlphaMode::Straight,
             blank: None,
@@ -2285,7 +2306,7 @@ pub fn rasterize_gridded(
     // painting it through some other field's colours would be a silent misread.
     let Some(paint) = crate::render::gridded::field_paint(input.field()) else {
         return RasterizeOutput {
-            rgba,
+            rgba: px.into(),
             hit_cells: None,
             alpha: AlphaMode::Straight,
             blank: None,
@@ -2301,7 +2322,7 @@ pub fn rasterize_gridded(
     let win = input.window_for(bounds, width, height);
     if win.is_empty() {
         return RasterizeOutput {
-            rgba,
+            rgba: px.into(),
             hit_cells: None,
             alpha: AlphaMode::Straight,
             blank: None,
@@ -2406,6 +2427,12 @@ pub fn rasterize_gridded(
             if color[3] == 0 {
                 continue;
             }
+            // The four bytes verbatim: `from_rgba_premultiplied` is
+            // `ecolor`'s raw constructor and does no arithmetic, so this
+            // packs the straight channels the paint answered into the
+            // picture's element type and changes no byte. The premultiply is
+            // still the funnel's, and still runs over these same bytes.
+            let color = Color32::from_rgba_premultiplied(color[0], color[1], color[2], color[3]);
 
             let (cx, cy) = at(i);
             if cx.is_nan() || cy.is_nan() {
@@ -2480,7 +2507,7 @@ pub fn rasterize_gridded(
         // written in is unchanged: rows still ascend and, inside a row,
         // columns still ascend.
         if have_prev {
-            emit_cell_row(&mut rgba, width, &mut prev, Some(&cur), &mut written_px);
+            emit_cell_row(&mut px, width, &mut prev, Some(&cur), &mut written_px);
         }
         std::mem::swap(&mut prev, &mut cur);
         have_prev = true;
@@ -2488,7 +2515,7 @@ pub fn rasterize_gridded(
 
     // The last row has no row after it, so it gives up nothing downward.
     if have_prev {
-        emit_cell_row(&mut rgba, width, &mut prev, None, &mut written_px);
+        emit_cell_row(&mut px, width, &mut prev, None, &mut written_px);
     }
 
     gridded_ledger::record(
@@ -2498,7 +2525,7 @@ pub fn rasterize_gridded(
     );
 
     RasterizeOutput {
-        rgba,
+        rgba: px.into(),
         hit_cells: None,
         alpha: AlphaMode::Straight,
         blank: None,

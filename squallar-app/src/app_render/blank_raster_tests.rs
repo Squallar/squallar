@@ -88,7 +88,7 @@ fn arrive(app: &mut crate::app::App, ctx: &egui::Context, generation: u64, rgba:
     let out = rgba.map(|rgba| {
         use squallar_source::job::JobOut;
         let mut raster = squallar_overlays::render::rasterize::RasterizeOutput {
-            rgba,
+            rgba: rgba.into(),
             hit_cells: None,
             alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
             // Unjudged going in, exactly as a rasterizer hands it over: the

@@ -8,7 +8,23 @@ web-time = { workspace = true }
 # One copy per grid row instead of one call per value in `encode_f32s`, safely:
 # `f32` and `u8` are both `Pod`, so `cast_slice` needs no `unsafe`. Already in
 # this package's graph (wgpu pulls it), so the line adds no compiled package.
-bytemuck = "=1.25.2"
+# `extern_crate_alloc` for `zeroed_vec`, which is what keeps the gridded
+# raster's picture on `alloc_zeroed`: `vec![Color32::TRANSPARENT; n]` has no
+# `IsZero` specialisation for a foreign type, so it would allocate uninit and
+# then write forty megabytes of zeros the OS was going to hand over already
+# zeroed. A feature, not a package, and it changes nothing about how the
+# workspace resolves: `wgpu`, `image` and `harfrust` already turn it on
+# (`cargo tree -e features -i bytemuck`, verified on the unmodified tree). It
+# is named here because a PACKAGE-SCOPED build of this crate has none of those
+# three in its graph and would not otherwise have `zeroed_vec`.
+bytemuck = { version = "=1.25.2", features = ["extern_crate_alloc"] }
+# **egui's pixel type in a data crate, on `squallar-radar`'s terms** (see its
+# `RasterImage`): the gridded rasterizer writes its picture in the layout the
+# consumer's `ColorImage` holds, so the buffer crosses by move instead of being
+# copied into a second one the size of the texture. `bytemuck` for the byte view
+# the premultiply and the wire encoder take of it. Adds no package: egui already
+# resolves this exact version, with this feature, through epaint.
+ecolor = { workspace = true, features = ["bytemuck"] }
 
 chrono = { workspace = true }
 flate2 = { workspace = true }

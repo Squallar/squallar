@@ -1117,10 +1117,20 @@ impl super::App {
                         // sent and the wire still carries none of it. Loop
                         // frames are outside the ledger's denominator; see
                         // `file_overlay_loop_frame`.
+                        //
+                        // **By move where the producer wrote pixels.** A
+                        // `ColorImage` holds `Vec<Color32>`, and a raster that
+                        // arrives as bytes cannot become one without a second
+                        // allocation the size of the picture — 40.79 MiB at the
+                        // 4317 x 2477 case, on the thread the reply lands on.
+                        // `RasterBuf::into_pixels` hands the gridded
+                        // rasterizer's own buffer straight over; every other
+                        // producer still pays the copy it always paid, and the
+                        // picture is the same either way.
                         let size = [width as usize, height as usize];
                         response.picture = Some(match blank {
                             None => crate::channels::OverlayPicture::Painted(std::sync::Arc::new(
-                                egui::ColorImage::from_rgba_premultiplied(size, &rgba),
+                                egui::ColorImage::new(size, rgba.into_pixels()),
                             )),
                             Some(_) if response.frame.is_some() => {
                                 crate::channels::OverlayPicture::Painted(std::sync::Arc::new(

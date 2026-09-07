@@ -113,6 +113,7 @@ fn draw(features: &[OverlayFeature], b: &GeoBounds) -> Vec<u8> {
         TEX,
     )
     .rgba
+    .into_bytes()
 }
 
 /// The defect, on the two real zones either side of the seam. A view of

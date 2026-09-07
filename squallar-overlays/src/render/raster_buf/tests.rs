@@ -1,0 +1,108 @@
+//! What the two arms are allowed to differ in (where the bytes live) and what
+//! they are not (the bytes).
+
+use super::RasterBuf;
+use ecolor::Color32;
+
+fn sample_bytes() -> Vec<u8> {
+    (0..64u16).map(|b| (b * 3 % 251) as u8).collect()
+}
+
+fn sample_pixels() -> Vec<Color32> {
+    sample_bytes()
+        .chunks_exact(4)
+        .map(|px| Color32::from_rgba_premultiplied(px[0], px[1], px[2], px[3]))
+        .collect()
+}
+
+/// **The ownership transfer is real.** A `Pixels` buffer handed to
+/// [`RasterBuf::into_pixels`] comes back as the *same allocation* — same
+/// pointer, same capacity — which is the whole claim: the consumer's
+/// `ColorImage` takes the picture the rasterizer wrote rather than a copy of
+/// it. Pointer identity, not length or content, because those two are equal
+/// across a copy as well.
+#[test]
+fn a_pixels_buffer_moves_into_the_consumer_rather_than_being_copied() {
+    let pixels = sample_pixels();
+    let addr = pixels.as_ptr() as usize;
+    let cap = pixels.capacity();
+
+    let moved = RasterBuf::Pixels(pixels).into_pixels();
+
+    assert_eq!(
+        moved.as_ptr() as usize,
+        addr,
+        "into_pixels reallocated a Pixels buffer; the arm exists precisely so \
+         the picture reaches the texture upload without a second allocation",
+    );
+    assert_eq!(
+        moved.capacity(),
+        cap,
+        "the same allocation keeps its capacity"
+    );
+}
+
+/// The `Bytes` arm still answers, and answers the same picture: nothing about
+/// the byte producers changed, and a consumer cannot tell which arm it was
+/// handed except by where the memory is.
+#[test]
+fn the_two_arms_carry_the_same_picture() {
+    let bytes = RasterBuf::Bytes(sample_bytes());
+    let pixels = RasterBuf::Pixels(sample_pixels());
+
+    assert_eq!(
+        bytes, pixels,
+        "the same picture in two layouts is one picture"
+    );
+    assert_eq!(
+        bytes.as_bytes(),
+        pixels.as_bytes(),
+        "the byte view does not depend on the arm",
+    );
+    assert_eq!(
+        bytes.clone().into_pixels(),
+        pixels.clone().into_pixels(),
+        "and neither does the pixel view",
+    );
+    assert_eq!(
+        bytes.clone().into_bytes(),
+        pixels.into_bytes(),
+        "nor the owned bytes",
+    );
+    assert_eq!(bytes, sample_bytes(), "and it compares against a bare Vec");
+}
+
+/// **The premultiply's seam.** The funnel rewrites the picture through
+/// [`RasterBuf::as_mut_bytes`], and a `Pixels` buffer must take that write in
+/// its own memory — not in a temporary that is dropped.
+#[test]
+fn a_write_through_the_byte_view_lands_in_the_pixels_themselves() {
+    let mut buf = RasterBuf::Pixels(sample_pixels());
+    let addr = buf.as_bytes().as_ptr() as usize;
+
+    buf.as_mut_bytes()[5] = 0xAB;
+
+    assert_eq!(
+        buf.as_bytes().as_ptr() as usize,
+        addr,
+        "the mutable byte view is a view, not a copy",
+    );
+    assert_eq!(
+        buf.as_bytes()[5],
+        0xAB,
+        "the write is visible through the buffer",
+    );
+    assert_eq!(
+        buf.into_pixels()[1].g(),
+        0xAB,
+        "and through the pixels: byte 5 is pixel 1's green channel",
+    );
+}
+
+/// An empty picture is empty in both directions — what a settled blank holds.
+#[test]
+fn an_empty_buffer_has_no_bytes_and_no_pixels() {
+    let empty = RasterBuf::empty();
+    assert!(empty.as_bytes().is_empty());
+    assert!(empty.into_pixels().is_empty());
+}

@@ -1256,7 +1256,7 @@ fn decode_raster_reply(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutp
     }
     let (rgba, blank, hit_cells) = decode_overlay_out(head)?;
     Some(RasterizeOutput {
-        rgba,
+        rgba: rgba.into(),
         hit_cells,
         alpha: AlphaMode::Premultiplied,
         blank,
@@ -3226,7 +3226,7 @@ mod tests {
 
     fn assert_reply_round_trips(row: &JobCodec, rgba: Vec<u8>, hit_cells: Option<HitCells>) {
         let reply = DescribedOut(Box::new(RasterizeOutput {
-            rgba: rgba.clone(),
+            rgba: rgba.clone().into(),
             hit_cells: hit_cells.clone(),
             alpha: AlphaMode::Premultiplied,
             // Unjudged, which is what every producer but the output stage

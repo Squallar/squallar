@@ -32,6 +32,23 @@ const UNMULTIPLY: &str = "from_rgba_unmultiplied";
 /// The deleted overlay converter, by the name it had.
 const OVERLAY_CONVERT: &str = "overlay_color_image";
 
+/// **The described reply's compute-nothing read**, by the only name the
+/// deliver calls it by.
+///
+/// It was `ColorImage::from_rgba_premultiplied` until the gridded rasterizer
+/// began writing its picture in the element type the consumer holds.
+/// `RasterBuf::into_pixels` is the same read for a reply that arrived as bytes
+/// and a move for one that did not — and the deliver is still the one place
+/// either happens. The count below is what is pinned, not the spelling: the
+/// question it asks ("is the described reply read exactly once, here") did not
+/// change with the name.
+const DESCRIBED_READ: &str = "into_pixels(";
+
+/// The read `into_pixels` replaced. It may not come back beside it: a second
+/// spelling in the deliver is a second guess at a convention the kind's
+/// rasterizer did not declare.
+const OLD_DESCRIBED_READ: &str = "from_rgba_premultiplied";
+
 /// Every function `setup_egui_frame` reaches that used to walk a full-size
 /// buffer, and no longer may.
 #[test]
@@ -98,23 +115,29 @@ fn every_overlay_dispatch_is_described_and_converts_nothing() {
          again, which is what the `RadarSites` migration removed.",
     );
     assert!(
-        !body.contains("from_rgba_premultiplied"),
-        "`spawn_overlay_render` reads a reply through \
-         `from_rgba_premultiplied` inline. That read lives in \
+        !body.contains(DESCRIBED_READ) && !body.contains(OLD_DESCRIBED_READ),
+        "`spawn_overlay_render` reads a reply inline. That read lives in \
          `overlay_job_deliver` — the one shared deliver — so an inline copy \
          is an arm that has stopped going through it.",
     );
 
     let deliver = body_of(APP_FETCH, "fn overlay_job_deliver(");
     assert_eq!(
-        deliver.matches("from_rgba_premultiplied").count(),
+        deliver.matches(DESCRIBED_READ).count(),
         1,
         "`overlay_job_deliver` must read the described reply through exactly \
-         one `from_rgba_premultiplied` — the compute-nothing read of the \
-         wire's premultiplied-always contract. More is a second guess at a \
+         one `{DESCRIBED_READ}` — the compute-nothing read of the wire's \
+         premultiplied-always contract, and a move for a reply whose producer \
+         wrote it in the consumer's own layout. More is a second guess at a \
          convention the kind's rasterizer did not declare; fewer means the \
          described reply is being converted somewhere else, which can only be \
          the frame thread.",
+    );
+    assert!(
+        !deliver.contains(OLD_DESCRIBED_READ),
+        "`overlay_job_deliver` reads the reply through \
+         `{OLD_DESCRIBED_READ}` as well. `{DESCRIBED_READ}` already answers \
+         both layouts; a second spelling beside it walks the picture twice.",
     );
     assert!(
         !deliver.contains(UNMULTIPLY) && !deliver.contains(OVERLAY_CONVERT),

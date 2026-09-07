@@ -27,6 +27,7 @@ fn raster(grid: &HrrrGridData, bounds: &GeoBounds, width: u32, height: u32) -> V
         height,
     )
     .rgba
+    .into_bytes()
 }
 
 fn box_of(min_lat: f64, max_lat: f64, min_lon: f64, max_lon: f64) -> GeoBounds {

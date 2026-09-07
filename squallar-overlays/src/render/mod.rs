@@ -9,6 +9,7 @@ pub mod handlers;
 mod hatch;
 pub mod jobs;
 pub mod overlay_state;
+pub mod raster_buf;
 pub mod rasterize;
 mod signature_memo;
 pub mod station_model;

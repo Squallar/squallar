@@ -2872,7 +2872,7 @@ fn overlay_reply_via_wire(
     } = execute_bytes(&job.to_bytes())
         .and_then(|out| out.take::<RasterizeOutput>())
         .expect("the described overlay job rasterizes");
-    (rgba, hit_cells)
+    (rgba.into_bytes(), hit_cells)
 }
 
 /// **The parity gate for the alert render**, the sites gate's shape on the
@@ -3804,7 +3804,7 @@ fn a_blank_overlay_reply_carries_no_picture_sized_payload() {
         decode_overlay_out(&painted_head).expect("the painted reply decodes");
     assert_eq!(
         (via_wire, blank),
-        (direct.rgba, None),
+        (direct.rgba.into_bytes(), None),
         "the inked raster did not arrive byte-identical through its own wire \
          form",
     );

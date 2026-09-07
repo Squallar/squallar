@@ -130,7 +130,7 @@ fn read(label: &str, input: &GriddedInput, cov: &GeoBounds, w: u32, h: u32) -> (
         written: delta.written_px,
         painted: painted(&out.rgba),
     };
-    (reading, out.rgba)
+    (reading, out.rgba.into_bytes())
 }
 
 // ── The grids, at their real shapes ───────────────────────────────────────
@@ -376,7 +376,7 @@ fn a_clip_gives_up_only_pixels_the_later_cell_covers() {
                             y0,
                             x1,
                             y1,
-                            color: [1, 2, 3, 4],
+                            color: ecolor::Color32::from_rgba_premultiplied(1, 2, 3, 4),
                         });
                     }
                 }
