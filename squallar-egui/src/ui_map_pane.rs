@@ -792,7 +792,9 @@ pub(super) fn render_pane_map_content(
                         selected.extend(overlay_ctx.draw_overlay(
                             ui.painter(),
                             ctx.pane.overlay_texture_on_screen(id),
-                            overlays.map_labels(id),
+                            // The handler this arm already resolved, not a
+                            // second resolution of the same id.
+                            handler.map_labels(),
                             || overlays.clickable_items(id, &ctx.pane.layer_ref(ctx.pane_idx, id)),
                         ));
                     }
@@ -3122,7 +3124,17 @@ fn render_per_frame_overlay(
     projector: &walkers::Projector,
     pf: &PerFrameOverlayCtx<'_>,
 ) -> Vec<Arc<dyn OverlayItem>> {
-    let points = pf.overlays.per_frame_points(pf.id);
+    // **The layer, resolved once for the whole table.** Every question below
+    // used to be asked of the registry by id, and the registry answers by
+    // scanning -- including `draw_point`, which is asked *inside the point
+    // loop*. At a few hundred stations under a gesture that was a few hundred
+    // identity resolutions per pane per frame to reach one handler whose
+    // identity had not moved since the registry was built. The comment two
+    // lines down already said the rule; this is it applied to the rest.
+    let Some(handler) = pf.overlays.handler_by_id(pf.id) else {
+        return Vec::new();
+    };
+    let points = handler.per_frame_points();
     if points.is_empty() {
         return Vec::new();
     }
@@ -3133,7 +3145,7 @@ fn render_per_frame_overlay(
     // the moment it does, with nothing here to remember. Asked once for the
     // layer, not once per point: the registry answers by scanning its
     // handlers, and the answer does not change between points.
-    let text_only = pf.overlays.job_codec(pf.id).is_some();
+    let text_only = handler.job_codec().is_some();
 
     let zoom_f32 = pf.zoom as f32;
     let is_dark = ui.ctx().global_style().visuals.dark_mode;
@@ -3141,7 +3153,7 @@ fn render_per_frame_overlay(
         zoom: zoom_f32,
         is_dark,
     };
-    let hit_radius = pf.overlays.point_hit_radius(pf.id, zoom_f32);
+    let hit_radius = handler.point_hit_radius(zoom_f32);
     let hover_ctx = HoverContext { prefs: pf.prefs };
 
     let screen_rect = ui.max_rect();
@@ -3178,7 +3190,7 @@ fn render_per_frame_overlay(
             ui.ctx(),
             projector,
             expanded,
-            pf.overlays.data_generation(pf.id),
+            handler.data_generation(),
             zoom_f32,
             is_dark,
         )
@@ -3216,7 +3228,7 @@ fn render_per_frame_overlay(
                 text_only,
                 sink: collecting.then_some(&mut sink),
             };
-            pf.overlays.draw_point(pf.id, pt.id, &mut ep, &draw_ctx);
+            handler.draw_point(pt.id, &mut ep, &draw_ctx);
         }
 
         // Click detection — layer blocking already applied by pre-filter in ui_map.rs.
@@ -3261,7 +3273,7 @@ fn render_per_frame_overlay(
 
     if let Some((_, id)) = closest_hover
         && let Some(hp) = hover_pos
-        && let Some(text) = pf.overlays.hover_text(pf.id, id, &hover_ctx)
+        && let Some(text) = handler.hover_text(id, &hover_ctx)
     {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         map_hover_tooltip(
@@ -4369,6 +4381,10 @@ mod floor_strip_shading_tests;
 #[path = "ui_map_pane/layer_opacity_walk_tests.rs"]
 #[cfg(test)]
 mod layer_opacity_walk_tests;
+
+#[path = "ui_map_pane/lookup_tax_tests.rs"]
+#[cfg(test)]
+mod lookup_tax_tests;
 
 #[path = "ui_map_pane/pane_cost_tests.rs"]
 #[cfg(test)]

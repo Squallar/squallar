@@ -461,7 +461,7 @@ mod tests {
     ///
     /// The rule is "a layer that rasterizes a picture has already drawn its
     /// shapes in the worker, so do not draw them again here". Spelling it as
-    /// `job_codec(id).is_some()` means the next layer to gain a picture stops
+    /// `job_codec().is_some()` means the next layer to gain a picture stops
     /// double-drawing the moment it does. Spelling it as "is this METAR" would
     /// be a line that silently rots into a double-draw — geometry painted
     /// twice, once invisibly, with the tessellator billed for both.
@@ -469,12 +469,26 @@ mod tests {
     /// Source-scanned rather than driven, because what is being pinned is the
     /// SHAPE of the condition; a behavioural test would pass just as happily
     /// on the hardcoded spelling this exists to forbid.
+    ///
+    /// **Two halves, because the question moved without the rule moving.** The
+    /// codec used to be fetched by id per question — `overlays.job_codec(id)` —
+    /// and the point pass now resolves the layer's handler ONCE at the top and
+    /// asks that. So the rule is pinned in two pieces: the decision is still
+    /// `job_codec`, and the thing it is asked of is still the registry's answer
+    /// for this pane's layer id. Together those are strictly what one
+    /// `overlays.job_codec(pf.id)` used to say, and neither half alone is.
     const PANE: &str = include_str!("ui_map_pane.rs");
 
     #[test]
     fn the_frame_thread_asks_the_registry_whether_a_layer_has_a_picture() {
         assert!(
-            PANE.contains("let text_only = pf.overlays.job_codec(pf.id).is_some();"),
+            PANE.contains("let Some(handler) = pf.overlays.handler_by_id(pf.id) else {"),
+            "the point pass no longer resolves its layer through the registry \
+             by id, so whatever `text_only` reads below is not the registry's \
+             answer about this layer",
+        );
+        assert!(
+            PANE.contains("let text_only = handler.job_codec().is_some();"),
             "the point painter's `text_only` is no longer set from the \
              registry, so either the geometry suppression is gone or it is \
              hardcoded to one layer",
