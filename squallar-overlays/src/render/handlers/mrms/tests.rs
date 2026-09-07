@@ -691,6 +691,113 @@ fn an_arrival_pins_every_panes_product_not_just_its_own() {
     assert_eq!(pinned.len(), 2, "deduplicated, and both panes counted");
 }
 
+/// A pane holding `product` with the layer **switched off** — the state a pane
+/// keeps across the toggle, which is the whole reason the pin set could count
+/// it.
+fn disabled_pane_state(product: MrmsProduct) -> Box<MrmsPaneState> {
+    Box::new(MrmsPaneState {
+        enabled: false,
+        selected_product: product,
+    })
+}
+
+/// **A pane with the layer switched off is not showing a product**, so it must
+/// not pin one. Same field [`MrmsHandler::is_enabled`] answers from, so the
+/// pin set and the layer's own answer about a pane cannot disagree.
+#[test]
+fn a_disabled_panes_product_is_not_pinned() {
+    let h = handler_with(MrmsProduct::ReflectivityComposite, vec![45.0; 4]);
+    let on = pane_state(MrmsProduct::ReflectivityComposite);
+    let off = disabled_pane_state(MrmsProduct::PrecipRate);
+    let states: Vec<&dyn std::any::Any> = vec![&*on, &*off];
+    assert_eq!(
+        h.pinned_products(&PaneRef::across(&states)),
+        vec![MrmsProduct::ReflectivityComposite],
+        "only the pane that is drawing may pin",
+    );
+}
+
+/// **Every pane switched off pins nothing at all** — an answer that was
+/// unreachable before, and the whole of what lets the cache let go.
+#[test]
+fn every_pane_disabled_pins_no_product() {
+    let h = handler_with(MrmsProduct::ReflectivityComposite, vec![45.0; 4]);
+    let a = disabled_pane_state(MrmsProduct::ReflectivityComposite);
+    let b = disabled_pane_state(MrmsProduct::PrecipRate);
+    let states: Vec<&dyn std::any::Any> = vec![&*a, &*b];
+    assert!(
+        h.pinned_products(&PaneRef::across(&states)).is_empty(),
+        "a layer nobody is showing must pin nothing",
+    );
+}
+
+/// **A caller that supplied no pane at all still pins**, which is the case the
+/// fallback is for: a pre-hydration read, not a switched-off layer. Stated so
+/// the two empty-looking inputs — no panes, and panes that are all off — are
+/// held apart, because they were the same input before.
+#[test]
+fn no_pane_at_all_still_falls_back_to_the_registry_copy() {
+    let h = handler_with(MrmsProduct::ReflectivityComposite, vec![45.0; 4]);
+    assert_eq!(
+        h.pinned_products(&PaneRef::across(&[])),
+        vec![MrmsProduct::ReflectivityComposite],
+    );
+}
+
+/// **And the bytes actually go.** On the wasm arm's history (`0`) the pin set
+/// alone decides what stays, so this is where a switched-off pane's mosaic is
+/// visible as memory rather than only as a pin.
+///
+/// Denominator: two 100-value fixture mosaics, 400 B each on the wide fixture
+/// arm, in a cache with room for both. Nothing here is over budget — the
+/// history is the whole of the lever, which is what the desktop arm's
+/// `all().len() - 1` switches off while a pane is showing.
+#[test]
+fn a_switched_off_panes_mosaic_is_evicted_where_the_history_binds() {
+    let mut h = MrmsHandler::new();
+    h.defaults.enabled = true;
+    h.cached_grids = MrmsGridCache::new(2 * 400, WASM_GRID_HISTORY_ENTRIES, staging::global());
+    for p in [MrmsProduct::ReflectivityComposite, MrmsProduct::PrecipRate] {
+        h.cached_grids.insert(
+            p,
+            Arc::new(sized(p, 100)),
+            &[
+                MrmsProduct::ReflectivityComposite,
+                MrmsProduct::PrecipRate,
+            ],
+        );
+    }
+    assert_eq!(h.cached_grids.len(), 2, "premise: both mosaics are resident");
+    assert_eq!(h.cached_grids.resident_bytes(), 800, "premise: 400 B each");
+
+    // Pane 0 shows Reflectivity; pane 1 still selects PrecipRate but its layer
+    // is switched off.
+    let on = pane_state(MrmsProduct::ReflectivityComposite);
+    let off = disabled_pane_state(MrmsProduct::PrecipRate);
+    let states: Vec<&dyn std::any::Any> = vec![&*on, &*off];
+    h.apply_fetch_result(
+        Box::new(MrmsFetchResult(Ok(sized(
+            MrmsProduct::ReflectivityComposite,
+            100,
+        )))),
+        &PaneRef::across(&states),
+    );
+
+    assert!(
+        h.cached_grids.contains(MrmsProduct::ReflectivityComposite),
+        "the pane that IS showing must keep its mosaic",
+    );
+    assert!(
+        !h.cached_grids.contains(MrmsProduct::PrecipRate),
+        "a switched-off pane's mosaic was held resident",
+    );
+    assert_eq!(
+        h.cached_grids.resident_bytes(),
+        400,
+        "400 of the 800 B went back",
+    );
+}
+
 // -- The frame contract (WB-10) ---------------------------------------------
 
 /// Stamp `k` of the fixture timeline: **not clock-aligned and not evenly

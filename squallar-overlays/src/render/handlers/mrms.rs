@@ -307,7 +307,7 @@ impl MrmsGridCache {
 
     /// Neither the entry going in nor anything in `pinned` is ever evicted.
     ///
-    /// `pinned` is the **union** of every pane's selected product, not one
+    /// `pinned` is the **union** of every ENABLED pane's selected product, not one
     /// pane's: this cache is shared, and evicting what another pane is showing
     /// to make room is the cross-pane collision the pane state exists to
     /// prevent. The pin decides *which* entry goes, never whether the union
@@ -536,14 +536,32 @@ impl MrmsHandler {
 
     /// **Every product some pane is showing**, deduplicated — what the shared
     /// cache must not evict.
+    ///
+    /// **Showing, which is what `enabled` means.** A pane keeps its slot, its
+    /// state and its selected product when the user switches the layer off,
+    /// so the union walked here answered for panes that are drawing nothing —
+    /// and a pinned entry is never an eviction victim. The layer that is off
+    /// held the same bytes as the layer that is on. The flag is read from the
+    /// same field [`Self::is_enabled`] answers from, so the pin set and the
+    /// layer's own answer about a pane cannot disagree.
+    ///
+    /// **The empty answer is now reachable**, where it was not before: every
+    /// pane disabled pins nothing, which is the whole of what this fixes. The
+    /// fallback below is for a caller that supplied *no pane at all* — a
+    /// pre-hydration read, or a test's [`PaneRef::across`] over an empty
+    /// slice — and is deliberately not gated on the registry copy's own flag,
+    /// which is `false` on a fresh handler and would silently take that
+    /// caller's pin away too.
     fn pinned_products(&self, pane: &PaneRef<'_>) -> Vec<MrmsProduct> {
         let mut pinned: Vec<MrmsProduct> = Vec::new();
+        let mut answered = false;
         for state in pane.all_as::<MrmsPaneState>() {
-            if !pinned.contains(&state.selected_product) {
+            answered = true;
+            if state.enabled && !pinned.contains(&state.selected_product) {
                 pinned.push(state.selected_product);
             }
         }
-        if pinned.is_empty() {
+        if !answered {
             pinned.push(self.defaults.selected_product);
         }
         pinned

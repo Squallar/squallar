@@ -106,8 +106,8 @@ pub const GLOBAL_GRID_BYTES: usize =
 /// [`crate::mrms::GRID_CACHE_BYTES`] states — and **never below the key
 /// space**, for the reason its `const _` states. The cache is keyed by channel
 /// and holds one grid per *distinct* channel some pane has selected; the pin
-/// set `GmgsiGridCache::insert` is handed is the union of every pane's
-/// selection, and every arm allows at least four panes
+/// set `GmgsiGridCache::insert` is handed is the union of every enabled
+/// pane's selection, and every arm allows at least four panes
 /// (`super::model::MAX_PANES_MOBILE` is 4, `MAX_PANES_DESKTOP` 6, and wasm
 /// takes the desktop cap), so all four channels can be pinned at once and none
 /// of them is ever a victim. The arms that sat below that — one channel on
@@ -144,7 +144,7 @@ pub const GRID_CACHE_BYTES: usize = 4 * GLOBAL_GRID_BYTES;
 //
 // **The key space.** One grid per channel any pane can select, because that is
 // what the cache holds when every channel is on some pane and the pin set — the
-// union of every pane's selection — covers every entry. Below this figure
+// union of every enabled pane's selection — covers every entry. Below this figure
 // `GmgsiGridCache::insert` does not evict; it runs out of unpinned victims and
 // takes its `break` arm, so the cache overruns the budget silently and the
 // constant under-reports what the heap is carrying. Two arms sat below it —
@@ -191,8 +191,12 @@ pub const WASM_GRID_HISTORY_ENTRIES: usize = 0;
 /// See [`WASM_GRID_HISTORY_ENTRIES`].
 pub const MOBILE_GRID_HISTORY_ENTRIES: usize = 1;
 /// See [`WASM_GRID_HISTORY_ENTRIES`]. `all().len() - 1` is the value at which
-/// the history never binds: at least one channel is always pinned, so that is
-/// the most unpinned grids the cache can ever hold.
+/// the history stops binding **while some pane is showing this layer**: one
+/// channel is pinned then, so that is the most unpinned grids the cache can
+/// hold. With every pane's layer switched off the pin set is empty
+/// (`GmgsiHandler::pinned_channels` reads each pane's flag) and this arm
+/// binds, which is the point — the grids left behind are ones nothing is
+/// drawing.
 pub const DESKTOP_GRID_HISTORY_ENTRIES: usize = GmgsiChannel::all().len() - 1;
 
 /// The arm this build selects — see [`WASM_GRID_HISTORY_ENTRIES`]. The same
@@ -212,12 +216,18 @@ pub const GRID_HISTORY_ENTRIES: usize = MOBILE_GRID_HISTORY_ENTRIES;
 ))]
 pub const GRID_HISTORY_ENTRIES: usize = DESKTOP_GRID_HISTORY_ENTRIES;
 
-// **Below the key space, on every arm.** `pinned_channels` never answers an
-// empty set (it falls back to the default channel), so the most unpinned grids
-// the cache can hold is `all().len() - 1`; a history at or above the key space
-// is a lever connected to nothing, and it would also price the pinned set plus
-// the history above the byte ceiling. Over the named arms rather than the
-// selected one, so every build checks all three.
+// **Below the key space, on every arm.** With at least one channel pinned the
+// most unpinned grids the cache can hold is `all().len() - 1`, so a history at
+// or above the key space is a lever connected to nothing there, and it would
+// also price the pinned set plus the history above the byte ceiling. Over the
+// named arms rather than the selected one, so every build checks all three.
+//
+// **The pin set CAN be empty**, since `pinned_channels` began reading each
+// pane's `enabled` flag: every pane with the layer switched off pins nothing.
+// That does not weaken this bound — it only means the desktop arm's
+// `all().len() - 1` can now actually bind instead of never binding, which
+// evicts a grid nobody is looking at. The assertion is `<`, so it holds either
+// way; what changed is that the arm above it stopped being decorative.
 const _: () = {
     assert!(WASM_GRID_HISTORY_ENTRIES < GmgsiChannel::all().len());
     assert!(MOBILE_GRID_HISTORY_ENTRIES < GmgsiChannel::all().len());
@@ -491,7 +501,7 @@ impl GmgsiGridCache {
 
     /// Neither the entry going in nor anything in `pinned` is ever evicted.
     ///
-    /// `pinned` is the **union** of every pane's selected channel, not one
+    /// `pinned` is the **union** of every ENABLED pane's selected channel, not one
     /// pane's: this cache is shared, and evicting what another pane is showing
     /// to make room is the cross-pane collision the pane state exists to
     /// prevent. The pin decides *which* entry goes, never whether the union
@@ -701,14 +711,31 @@ impl GmgsiHandler {
 
     /// **Every channel some pane is showing**, deduplicated — what the shared
     /// cache must not evict.
+    ///
+    /// **Showing, which is what `enabled` means.** A pane keeps its slot, its
+    /// state and its selected channel when the user switches the layer off, so
+    /// the union walked here answered for panes that are drawing nothing — and
+    /// a pinned entry is never an eviction victim. The flag is read from the
+    /// same field [`Self::is_enabled`] answers from, so the pin set and the
+    /// layer's own answer about a pane cannot disagree.
+    ///
+    /// **The empty answer is now reachable**, where it was not before: every
+    /// pane disabled pins nothing, which is the whole of what this fixes. The
+    /// fallback below is for a caller that supplied *no pane at all* — a
+    /// pre-hydration read, or a test's [`PaneRef::across`] over an empty
+    /// slice — and is deliberately not gated on the registry copy's own flag,
+    /// which is `false` on a fresh handler and would silently take that
+    /// caller's pin away too.
     fn pinned_channels(&self, pane: &PaneRef<'_>) -> Vec<GmgsiChannel> {
         let mut pinned: Vec<GmgsiChannel> = Vec::new();
+        let mut answered = false;
         for state in pane.all_as::<GmgsiPaneState>() {
-            if !pinned.contains(&state.selected_channel) {
+            answered = true;
+            if state.enabled && !pinned.contains(&state.selected_channel) {
                 pinned.push(state.selected_channel);
             }
         }
-        if pinned.is_empty() {
+        if !answered {
             pinned.push(self.defaults.selected_channel);
         }
         pinned

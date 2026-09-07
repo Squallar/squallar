@@ -300,7 +300,7 @@ pub const CONUS_GRID_BYTES: usize = 7000 * 3500 * crate::render::gridded::Scaled
 ///
 /// **Never below the key space.** The cache is keyed by product and holds one
 /// grid per *distinct* product some pane has selected; the pin set
-/// `MrmsGridCache::insert` is handed is the union of every pane's selection,
+/// `MrmsGridCache::insert` is handed is the union of every enabled pane's selection,
 /// so with the budget at the key space every entry can be pinned and no pinned
 /// entry is ever a victim. A budget below the key space does not make the
 /// cache hold less: `insert` runs out of unpinned victims and takes its
@@ -335,7 +335,7 @@ pub const GRID_CACHE_BYTES: usize = 2 * CONUS_GRID_BYTES;
 //
 // **The key space.** One grid per product any pane can select, because that is
 // what the cache holds when every product is on some pane and the pin set —
-// the union of every pane's selection — covers every entry. Below this figure
+// the union of every enabled pane's selection — covers every entry. Below this figure
 // `MrmsGridCache::insert` does not evict; it runs out of unpinned victims and
 // takes its `break` arm, so the cache overruns the budget silently and the
 // constant under-reports what the heap is carrying. The wasm arm sat one grid
@@ -389,8 +389,11 @@ pub const WASM_GRID_HISTORY_ENTRIES: usize = 0;
 /// See [`WASM_GRID_HISTORY_ENTRIES`].
 pub const MOBILE_GRID_HISTORY_ENTRIES: usize = 1;
 /// See [`WASM_GRID_HISTORY_ENTRIES`]. `all().len() - 1` is the value at which
-/// the history never binds: at least one product is always pinned, so that is
-/// the most unpinned grids the cache can ever hold.
+/// the history stops binding **while some pane is showing this layer**: one
+/// product is pinned then, so that is the most unpinned grids the cache can
+/// hold. With every pane's layer switched off the pin set is empty
+/// (`MrmsHandler::pinned_products` reads each pane's flag) and this arm binds,
+/// which is the point — the grids left behind are ones nothing is drawing.
 pub const DESKTOP_GRID_HISTORY_ENTRIES: usize = MrmsProduct::all().len() - 1;
 
 /// The arm this build selects — see [`WASM_GRID_HISTORY_ENTRIES`]. The same
@@ -410,12 +413,18 @@ pub const GRID_HISTORY_ENTRIES: usize = MOBILE_GRID_HISTORY_ENTRIES;
 ))]
 pub const GRID_HISTORY_ENTRIES: usize = DESKTOP_GRID_HISTORY_ENTRIES;
 
-// **Below the key space, on every arm.** `pinned_products` never answers an
-// empty set (it falls back to the default product), so the most unpinned grids
-// the cache can hold is `all().len() - 1`; a history at or above the key space
-// is a lever connected to nothing, and it would also price the pinned set plus
-// the history above the byte ceiling. Over the named arms rather than the
-// selected one, so every build checks all three.
+// **Below the key space, on every arm.** With at least one product pinned the
+// most unpinned grids the cache can hold is `all().len() - 1`, so a history at
+// or above the key space is a lever connected to nothing there, and it would
+// also price the pinned set plus the history above the byte ceiling. Over the
+// named arms rather than the selected one, so every build checks all three.
+//
+// **The pin set CAN be empty**, since `pinned_products` began reading each
+// pane's `enabled` flag: every pane with the layer switched off pins nothing.
+// That does not weaken this bound — it only means the desktop arm's
+// `all().len() - 1` can now actually bind instead of never binding, which
+// evicts a grid nobody is looking at. The assertion is `<`, so it holds either
+// way; what changed is that the arm above it stopped being decorative.
 const _: () = {
     assert!(WASM_GRID_HISTORY_ENTRIES < MrmsProduct::all().len());
     assert!(MOBILE_GRID_HISTORY_ENTRIES < MrmsProduct::all().len());

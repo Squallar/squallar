@@ -353,7 +353,7 @@ impl ModelGridCache {
 
     /// Neither the entry going in nor anything in `pinned` is ever evicted.
     ///
-    /// `pinned` is the **union** of every pane's current key, not one pane's:
+    /// `pinned` is the **union** of every ENABLED pane's current key, not one pane's:
     /// this cache is shared by every pane, and evicting what another pane is
     /// showing to make room is the cross-pane collision the pane state exists
     /// to prevent. The budget being at least one grid per pane is what makes
@@ -801,12 +801,34 @@ impl ModelDataHandler {
     /// **Every grid some pane is showing**, deduplicated — what the shared
     /// cache must not evict. The union, per [`PaneRef::all_as`]; the registry's
     /// own copy stands in when no pane answered at all.
+    ///
+    /// **Showing, which is what `enabled` means.** A pane keeps its slot, its
+    /// state, its parameter and its parked frame when the user switches the
+    /// layer off, so this union answered for panes drawing nothing — and a
+    /// pinned key is never an eviction victim, so a switched-off pane held a
+    /// grid against a budget that is already the largest host-byte family
+    /// this layer has. The flag is the same field [`Self::is_enabled`] answers
+    /// from, so the pin set cannot disagree with the layer's own answer.
+    ///
+    /// **This makes the empty answer reachable**, and that is the fix rather
+    /// than a hazard: `insert` never evicts the arrival itself, so a cache
+    /// with nothing pinned still installs what lands and merely stops carrying
+    /// what no pane is looking at. The `const _` floor beside
+    /// [`MODEL_GRID_BUDGET_BYTES`] — one grid per pane — is unaffected in the
+    /// safe direction: fewer panes pin, so the budget it holds is now an
+    /// over-statement of what the pin set can force resident, never an
+    /// under-statement.
     fn pinned_keys(&self, pane: &PaneRef<'_>) -> Vec<GridKey> {
         let mut pinned: Vec<GridKey> = Vec::new();
         let mut any_pane = false;
         for state in pane.all_as::<ModelPaneState>() {
+            // A pane still ANSWERS when its layer is switched off — it keeps
+            // its slot and its state — so `any_pane` is set outside the flag.
+            // What it does not do is show a grid, and only a shown grid may
+            // be pinned past the byte budget.
             any_pane = true;
-            if let Some(key) = self.key_of(state)
+            if state.enabled
+                && let Some(key) = self.key_of(state)
                 && !pinned.contains(&key)
             {
                 pinned.push(key);
@@ -3471,6 +3493,104 @@ mod tests {
             "premise: the arriving grid is resident",
         );
         assert_eq!(h.cached_grids.len(), CACHE_ENTRIES, "the cap still holds",);
+    }
+
+    /// A pane holding `param` with the layer **switched off** — the state a
+    /// pane keeps across the toggle, which is the whole reason the pin set
+    /// could count it.
+    fn disabled_pane_state(param: ModelParameter) -> FetchPayload {
+        Box::new(ModelPaneState {
+            enabled: false,
+            selected_param: param,
+            ..ModelPaneState::new(false)
+        })
+    }
+
+    /// **A pane with the layer switched off is not showing a grid**, so its
+    /// key is not in the pin set.
+    ///
+    /// The state survives the toggle — slot, parameter and parked frame are
+    /// all kept so that reopening is 1:1 — so the union this walks answered
+    /// for it either way. Reading the same `enabled` field `is_enabled` reads
+    /// is what makes the two answers agree.
+    #[test]
+    fn a_disabled_panes_key_is_not_pinned() {
+        let h = full_cache();
+        let on = pane_state(oldest());
+        let off = disabled_pane_state(next_oldest());
+        let peers: [&dyn std::any::Any; 2] = [&*on, &*off];
+        let pinned = h.pinned_keys(&PaneRef::across(&peers));
+        assert_eq!(
+            pinned,
+            vec![key(oldest())],
+            "only the pane that is drawing may pin",
+        );
+    }
+
+    /// **Every pane switched off pins nothing at all** — the answer that was
+    /// unreachable before, and the whole of what lets the cache let go.
+    ///
+    /// Not a hazard: `insert` never evicts the arrival itself, so an empty pin
+    /// set still installs what lands. It only stops the cache carrying grids
+    /// no pane is looking at.
+    #[test]
+    fn every_pane_disabled_pins_nothing() {
+        let h = full_cache();
+        let a = disabled_pane_state(oldest());
+        let b = disabled_pane_state(next_oldest());
+        let peers: [&dyn std::any::Any; 2] = [&*a, &*b];
+        assert!(
+            h.pinned_keys(&PaneRef::across(&peers)).is_empty(),
+            "a layer nobody is showing must pin nothing",
+        );
+    }
+
+    /// **And the bytes actually go**: the mirror of
+    /// `an_arrival_evicts_no_parameter_that_any_pane_is_showing`, with pane 1
+    /// switched off.
+    ///
+    /// Same fixture, same arrival, one flag different — so what this measures
+    /// is the flag and not the eviction order. Before the pin set read
+    /// `enabled`, the switched-off pane's grid was pinned and the victim was
+    /// the *third* parameter instead: a grid a pane might still want, given up
+    /// for one no pane could draw.
+    #[test]
+    fn an_arrival_evicts_the_grid_of_a_pane_whose_layer_is_switched_off() {
+        let mut h = full_cache();
+        let showing = oldest();
+        let switched_off = next_oldest();
+        let bystander = fill_order()[2];
+        assert_eq!(
+            h.cached_grids.recency_params()[..3],
+            [showing, switched_off, bystander],
+            "premise: the switched-off pane's grid is the next victim after              the one that is showing",
+        );
+
+        let on = pane_state(showing);
+        let off = disabled_pane_state(switched_off);
+        let peers: [&dyn std::any::Any; 2] = [&*on, &*off];
+        h.apply_fetch_result(
+            Box::new(HrrrFetchResult(Ok(grid(overflow(), vec![300.0])))),
+            &PaneRef::across(&peers),
+        );
+
+        assert!(
+            h.cached_grids.is_resident(key(showing)),
+            "the pane that IS showing must still be pinned",
+        );
+        assert!(
+            !h.cached_grids.is_resident(key(switched_off)),
+            "a switched-off pane's grid was held against the budget",
+        );
+        assert!(
+            h.cached_grids.is_resident(key(bystander)),
+            "the victim must be the switched-off pane's grid, not the next              unpinned one along",
+        );
+        assert!(
+            h.cached_grids.is_resident(key(overflow())),
+            "premise: the arriving grid is resident",
+        );
+        assert_eq!(h.cached_grids.len(), CACHE_ENTRIES, "the cap still holds");
     }
 
     // ── The frame axis (WO-M11) ───────────────────────────────────────────
