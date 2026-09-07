@@ -289,12 +289,20 @@ pub(crate) struct HostSpareInputs {
 
 /// **Host spare: the model's figure, bounded by what the heap actually says.**
 ///
-/// `need()` has no term for loop scans, the extract cache, egui's own buffers
-/// or the deferred-drop queue, so `allowance - need` can read hundreds of MiB
-/// of model spare on a heap that is nearly full — which is exactly the reading
+/// `need()` has no term for the extract cache, egui's own buffers or the
+/// deferred-drop queue, so `allowance - need` can read hundreds of MiB of
+/// model spare on a heap that is nearly full — which is exactly the reading
 /// that would admit one more layer into a trap. **The heap measurement bounds
 /// the model, never the other way round**, and the one figure that bounds it
 /// and can also FALL is what this instance's allocator is holding.
+///
+/// **Loop scans were on that list and are not any more**, so the gap is
+/// narrower than it was: `NeedTerms::loop_scans_host` prices a radar-looping
+/// pane's resident scans and `NeedTerms::still_scans_host` the complementary
+/// volume a pane parked at a still holds. The three named above were each
+/// re-checked against the term list when that sentence was corrected and no
+/// term prices any of them, so the argument stands on a shorter list rather
+/// than on the same one.
 ///
 /// Two arms, by whether the instance has a declared wall:
 ///

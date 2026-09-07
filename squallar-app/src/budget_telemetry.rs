@@ -208,6 +208,35 @@ pub(crate) fn capacity_source_word(source: CapacitySource) -> &'static str {
 /// dwell of a restoration, and is the only thing that can ever say from the
 /// field that `GPU_RECOVERY_DWELL` was argued too short.
 ///
+/// **`ceiling` is the resolved rung value and is NOT always the figure that
+/// binds** — read `cap` for that. `ceiling` prints
+/// `Budgets::app_texture_ceiling_bytes`, which is the bracket resolved at the
+/// rung the scene is on now. What `fit::over` tests a GPU need against is
+/// `Capacity::gpu_bytes`, and on the presumed arm `Capacity::presumed` sets
+/// that from `app_texture_ceiling_bytes.at(Promotion::Floor)` — the bracket's
+/// FLOOR, whatever rung is in force.
+///
+/// The two coincide almost everywhere and the exception is narrow, so it is
+/// spelled rather than left to be rediscovered. It needs all three of: the
+/// **desktop** bracket, which is the only stepped one
+/// (`Bracket::new(DESKTOP_APP_TEXTURE_BUDGET_BYTES,
+/// DESKTOP_APP_TEXTURE_CEILING_BYTES)` — 3840 and 4032 MiB); the **Ceiling**
+/// rung, since `Bracket::new` sets `step` equal to `floor` and only the top
+/// rung departs from it; and a **presumed** capacity, since a measured or
+/// probed one takes `gpu_bytes` from the driver and never from the bracket at
+/// all. On a promoted desktop arm with no GPU reading, `ceiling` therefore
+/// reads 4032 MiB while the figure feeding `fit::over` is 3840 — 192 MiB
+/// apart, one number a reader takes for the other.
+///
+/// **wasm and mobile are `Bracket::pinned`**, so floor, step and ceiling are
+/// one value and the two figures coincide on every rung. A reader who meets
+/// "printed is not binding" and goes looking for it on the browser arm will
+/// find nothing, which is why the scope is named here.
+///
+/// Neither figure is wrong for what it is, and the arithmetic is not touched:
+/// `ceiling` is the rung's resolved budget and `cap` is the capacity in force.
+/// They answer different questions, and the line carries both.
+///
 /// **`host allowance`, `rss` and `pool residual` are the host axis's three
 /// diagnostics**, and each spells its own absence rather than printing a zero.
 /// `host allowance` is `Capacity::host_allowance`, free because `cap` was
