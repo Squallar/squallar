@@ -1238,9 +1238,33 @@ def _in_band(observed, lo, hi, tol):
     return (lo - tol) <= observed <= (hi + tol)
 
 
-def surface_check(asked, achieved, pictures, picture_bytes, reported, panes=None):
+def surface_check(asked, achieved, inked, picture_bytes, reported, panes=None,
+                  pictures=None):
     """Are the pictures the app uploaded the pictures it says it draws, at the
     window it was given?
+
+    **The denominator is INKED pictures, not pictures.** `overlay rasters:`
+    carries both, and its `N pictures of M B` sums only the inked ones: a
+    blank arrival is recorded as `note_picture(0, false)`
+    (`squallar_egui::overlay_cache::ledger`, pinned by `blank_raster_tests`
+    as `dpicture_bytes == 0`), and it still counts as a picture. Dividing the
+    inked sum by every picture is two denominators in one ratio, and it
+    understates by exactly `inked / pictures`. Measured on two native lanes
+    on 2026-09-07: 417/528 = 0.790 and 439/544 = 0.807, the two ratios the
+    refusals printed, and on five brackets of a third lane
+    `inked * 17,971,200 B == bytes` exactly, 5 of 5. The consequence was
+    worse than the refused rows: the check could only pass where
+    `inked == pictures`, which is the condition the browser rig manufactures
+    on purpose by seeding an always-painting layer, so it was green exactly
+    on the least interesting scene and refused every leg carrying real
+    weather (blanks were 19.3-21.0 % of pictures there).
+
+    `pictures` is the whole count, and defaults to `inked` for a caller that
+    has only one number -- a scene with no blanks, which is what every
+    fixture below is. It is not the denominator; it decides one branch, the
+    bracket where pictures were drawn and every one was blank, which is
+    UNCHECKED rather than a refusal: there are no inked bytes to hold
+    against the line, and there is nothing to divide by.
 
     The expected picture size is READ from the app, not modelled. The model
     was `(W * 1.5) * ((H - 40) * 1.5) * 4` with 40 as "the top bar in points",
@@ -1292,6 +1316,10 @@ def surface_check(asked, achieved, pictures, picture_bytes, reported, panes=None
     reported to hold one, which is two of the app's own lines contradicting
     each other. INVALID stays for those and for a real mismatch.
     """
+    # One number is a scene with no blanks, which is what every fixture and
+    # every all-inked leg is; the caller that has both passes both.
+    if pictures is None:
+        pictures = inked
     out = {
         "asked": "%dx%d" % asked if asked else None,
         "achieved": "%dx%d" % achieved if achieved else None,
@@ -1363,6 +1391,13 @@ def surface_check(asked, achieved, pictures, picture_bytes, reported, panes=None
     out["expected_picture_bytes_hi"] = hi
     out["expected_label"] = ("%d" % lo) if lo == hi else "%d..%d" % (lo, hi)
     out["tolerance_bytes"] = tol
+    # Both counts, never added and never swapped: `inked` is the denominator
+    # of `observed_picture_bytes`, `pictures` is what was drawn, and their
+    # difference is the blanks. A row that carries one of them cannot be
+    # checked by a reader who wants the other.
+    out["inked"] = inked
+    out["pictures"] = pictures
+    out["blank"] = pictures - inked
     if not pictures:
         out["unchecked"] = True
         out["unchecked_kind"] = "no_pictures"
@@ -1373,7 +1408,17 @@ def surface_check(asked, achieved, pictures, picture_bytes, reported, panes=None
             "and they were checked against nothing" % out["reported_px"]
         )
         return out
-    observed = picture_bytes / float(pictures)
+    if not inked:
+        out["unchecked"] = True
+        out["unchecked_kind"] = "no_inked_pictures"
+        out["why"] = (
+            "%d picture(s) were drawn in the window and every one was blank: "
+            "a blank arrival is charged 0 B, so there are no bytes to hold "
+            "against the app's %s and nothing to divide by"
+            % (pictures, out["reported_px"])
+        )
+        return out
+    observed = picture_bytes / float(inked)
     out["observed_picture_bytes"] = observed
     out["bytes_met"] = _in_band(observed, lo, hi, tol)
     if not out["bytes_met"]:
@@ -1382,10 +1427,12 @@ def surface_check(asked, achieved, pictures, picture_bytes, reported, panes=None
         # a bar a few rows taller than something believed.
         nearest = lo if abs(observed - lo) <= abs(observed - hi) else hi
         out["why"] = (
-            "picture bytes are not the pictures the app reports: %d B/picture "
-            "observed against %s B expected (+-%d) for %d pane(s) at %s -- "
+            "picture bytes are not the pictures the app reports: %d "
+            "B/INKED picture observed (%d inked of %d drawn, %d blank) "
+            "against %s B expected (+-%d) for %d pane(s) at %s -- "
             "%.3fx the reported figure"
-            % (observed, out["expected_label"], tol, reported["n"],
+            % (observed, inked, pictures, pictures - inked,
+               out["expected_label"], tol, reported["n"],
                out["reported_px"], observed / float(nearest))
         )
     elif not out["geometry_met"]:
@@ -2200,7 +2247,13 @@ def build_row(args, scraped, probes):
     rasters = diff_totals(scraped["rasters"], start_idx, end_idx)
     pictures = rasters[2] if rasters else 0
     picture_bytes = rasters[3] if rasters else 0
-    mbpp = ("%.2f" % (picture_bytes / pictures / 1e6)) if pictures else "-"
+    # `N pictures of M B` sums the INKED pictures only -- a blank arrival is
+    # charged 0 B and still counts as a picture -- so the bytes-per-picture
+    # figure is per inked picture. Dividing by `pictures` mixes two
+    # denominators and reads low by exactly `inked / pictures`; see
+    # `surface_check`.
+    inked = rasters[4] if rasters else 0
+    mbpp = ("%.2f" % (picture_bytes / inked / 1e6)) if inked else "-"
 
     live = liveness(scraped["interact"], end_idx)
     if not live["ok"]:
@@ -2234,7 +2287,8 @@ def build_row(args, scraped, probes):
     if panes is None:
         notes.append("the seeded pane count was not held against the app's: %s"
                      % panes_source)
-    surf = surface_check(args.asked_geom, achieved, pictures, picture_bytes, reported, panes)
+    surf = surface_check(args.asked_geom, achieved, inked, picture_bytes,
+                         reported, panes, pictures=pictures)
     # Native legs open a real window on whatever DISPLAY they were given.
     panel_backed = panel_backed_leg("native")
     # The unit every pixel figure above was measured in, read from winit's own
@@ -2435,6 +2489,10 @@ def build_row(args, scraped, probes):
         "script": args.script,
         "basemap": basemap,
         "pictures": pictures,
+        "inked_pictures": inked,
+        "blank_pictures": pictures - inked,
+        # PER INKED PICTURE. The column keeps its name because readers parse
+        # it; the two counts beside it say what the denominator was.
         "mb_per_picture": mbpp,
         "commit": args.commit,
         "position": args.position,
@@ -2586,12 +2644,14 @@ def print_row(row):
     reported_panes = s.get("reported_panes", s.get("panes"))
     print(
         "ROW   surface asked=%s achieved=%s (from the %s) scale=%s panes=%s "
-        "app_pictures=%s expected=%s B/picture (+-%s) observed=%s B/picture -> %s"
+        "app_pictures=%s inked=%s/%s (%s blank) expected=%s B/picture (+-%s) "
+        "observed=%s B/inked picture -> %s"
         % (
             s.get("asked"), s.get("achieved"), s.get("source") or "?",
             s["scale"] if s.get("scale") is not None else "absent",
             reported_panes if reported_panes is not None else "?",
             s.get("reported_px") or "absent",
+            s.get("inked", "-"), s.get("pictures", "-"), s.get("blank", "-"),
             s.get("expected_label", "-"),
             s.get("tolerance_bytes", "-"),
             ("%.0f" % s["observed_picture_bytes"])
@@ -3206,6 +3266,67 @@ class SurfaceTests(unittest.TestCase):
         self.assertEqual(s["pane_picture_bytes"], [hi, lo], "the 0x0 pane is not priced")
         self.assertEqual(s["expected_label"], "%d..%d" % (lo, hi))
 
+    def test_blank_pictures_do_not_shrink_the_bytes_per_picture(self):
+        """`N pictures of M B` sums the INKED pictures; the count includes
+        the blanks. The fixtures are the two native lanes that were refused
+        on 2026-09-07 (417 inked of 528, 439 of 544) and one bracket of a
+        third (1049 of 1217, where `inked * 17,971,200 == bytes` exactly).
+        Each is CONFIRMED here and each was REFUSED before, at exactly
+        `inked / pictures` of the expected figure -- which is what the old
+        refusals printed, so this test would have caught them."""
+        one = _reported([(2880, 1560)])
+        per = 2880 * 1560 * 4
+        self.assertEqual(per, 17_971_200)
+        for inked, pictures in ((417, 528), (439, 544), (1049, 1217)):
+            s = surface_check((1920, 1080), (1920, 1080), inked, per * inked,
+                              one, panes=1, pictures=pictures)
+            self.assertTrue(s["met"], s.get("why"))
+            self.assertEqual(s["observed_picture_bytes"], per)
+            self.assertEqual(s["inked"], inked)
+            self.assertEqual(s["blank"], pictures - inked)
+            # The defect, stated as arithmetic: the old denominator read low
+            # by exactly the inked share, which is what the row printed.
+            old_observed = per * inked / float(pictures)
+            self.assertAlmostEqual(old_observed / per, inked / float(pictures),
+                                   places=9)
+            self.assertFalse(_in_band(old_observed, per, per,
+                                      s["tolerance_bytes"]),
+                             "the old denominator would not have refused this "
+                             "row, so the fixture proves nothing")
+
+    def test_a_bracket_of_nothing_but_blank_pictures_is_unchecked(self):
+        """Pictures drawn, none inked: a blank is charged 0 B, so there are
+        no bytes to hold against the line and nothing to divide by. UNCHECKED
+        -- neither a confirmation nor a refusal, and never a ZeroDivisionError
+        the runner reads as a crashed analyser."""
+        one = _reported([(2880, 1560)])
+        s = surface_check((1920, 1080), (1920, 1080), 0, 0, one, panes=1,
+                          pictures=42)
+        self.assertFalse(s["met"])
+        self.assertTrue(s["unchecked"])
+        self.assertEqual(s["unchecked_kind"], "no_inked_pictures")
+        self.assertIn("every one was blank", s["why"])
+        self.assertNotIn("observed_picture_bytes", s)
+        # And nothing drawn at all keeps its own kind: the two are different
+        # readings and a reader must be able to tell them apart.
+        s = surface_check((1920, 1080), (1920, 1080), 0, 0, one, panes=1,
+                          pictures=0)
+        self.assertEqual(s["unchecked_kind"], "no_pictures")
+
+    def test_a_real_mismatch_still_refuses_and_names_its_denominator(self):
+        """The check must still be able to fail. Half-sized pictures with
+        every one inked are refused, and the sentence says the denominator
+        was inked pictures -- the figure that misled two lanes was a
+        B/picture reading whose denominator nobody could see."""
+        one = _reported([(2880, 1560)])
+        half = 2880 * 1560 * 4 // 2
+        s = surface_check((1920, 1080), (1920, 1080), 100, half * 100, one,
+                          panes=1, pictures=100)
+        self.assertFalse(s["met"])
+        self.assertFalse(s["unchecked"])
+        self.assertIn("B/INKED picture", s["why"])
+        self.assertIn("100 inked of 100 drawn, 0 blank", s["why"])
+
     def test_a_scene_with_no_panes_is_a_reading_not_an_absent_line(self):
         """The app prints `n=0, px=, bytes=0` for an empty scene rather than
         nothing -- its own pin says why: a line that vanished is
@@ -3433,7 +3554,7 @@ def _hist_first_bin(n):
     return ",".join(str(c) for c in counts)
 
 
-def _leg_log(per_picture, pictures_line, per_loop=10):
+def _leg_log(per_picture, pictures_line, per_loop=10, blank_per_loop=0):
     """A whole leg's log, four loops, `per_loop` pictures a loop at
     `per_picture` B.
 
@@ -3455,10 +3576,17 @@ def _leg_log(per_picture, pictures_line, per_loop=10):
             t + "frame service (interact): n=%d, p50=63 us, p90=63 us, p99=63 us, "
             "hist=%s" % (n, _hist_first_bin(n)))
         pics = per_loop * k
+        # `pictures of N B` sums the INKED pictures only: a blank arrival is
+        # charged 0 B and still counts as a picture. Until 2026-09-07 this
+        # fixture only ever produced `inked == pictures`, which is the one
+        # case the byte check could pass in -- so the defect it was supposed
+        # to catch could not appear here. `blank_per_loop` is what makes a
+        # leg with weather in it representable.
+        inked = (per_loop - blank_per_loop) * k
         lines.append(
             t + "overlay rasters: %d dispatched, %d arrived, %d pictures of %d B, "
             "%d inked, %d shown, 0 promoted, 0 dropped, 0 superseded, 0 cancelled"
-            % (pics, pics, pics, pics * per_picture, pics, pics))
+            % (pics, pics, pics, inked * per_picture, inked, inked))
         if k == 4 and pictures_line:
             lines.append(pictures_line)
         lines.append(t + "gesture script pan-zoom-2d loop complete: 50 frames")
@@ -3499,8 +3627,9 @@ class RowVerdictTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _row(self, per_picture, pictures_line, panes):
-        lines = _leg_log(per_picture, pictures_line)
+    def _row(self, per_picture, pictures_line, panes, blank_per_loop=0):
+        lines = _leg_log(per_picture, pictures_line,
+                         blank_per_loop=blank_per_loop)
         row = build_row(_leg_args(self.load, panes), scrape(lines, self.probes), self.probes)
         head = _capture(lambda: print_row(row)).splitlines()
         return row, head[0], "\n".join(head)
@@ -3620,8 +3749,32 @@ class RowVerdictTests(unittest.TestCase):
         self.assertEqual(row["unchecked"], [])
         self.assertEqual(row["cross"], "yes")
         self.assertNotIn("**", first, first)
-        self.assertIn("app_pictures=2880x1555 expected=17913600 B/picture (+-8870) "
-                      "observed=17913600 B/picture -> CONFIRMED", text)
+        self.assertIn("app_pictures=2880x1555 inked=20/20 (0 blank) "
+                      "expected=17913600 B/picture (+-8870) "
+                      "observed=17913600 B/inked picture -> CONFIRMED", text)
+
+    def test_a_leg_with_blank_rasters_is_confirmed_not_refused(self):
+        """The same leg with a fifth of its pictures blank -- the share a
+        native scene-A leg with live weather actually carries (19.3-21.0 %
+        measured on 2026-09-07). The bytes are the inked ones, so the
+        row is CONFIRMED and the line says what the denominator was. Before
+        the denominator was fixed this row read 0.800x and INVALID, and no
+        fixture here could produce it: `_leg_log` only ever wrote
+        `inked == pictures`."""
+        row, first, text = self._row(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE,
+                                     1, blank_per_loop=2)
+        self.assertEqual(row["invalid"], [], row["invalid"])
+        self.assertEqual(row["cross"], "yes")
+        self.assertNotIn("**", first, first)
+        self.assertEqual(row["pictures"], 20)
+        self.assertEqual(row["inked_pictures"], 16)
+        self.assertEqual(row["blank_pictures"], 4)
+        self.assertIn("app_pictures=2880x1555 inked=16/20 (4 blank) "
+                      "expected=17913600 B/picture (+-8870) "
+                      "observed=17913600 B/inked picture -> CONFIRMED", text)
+        # And the column readers parse keeps its name and its meaning: MB per
+        # inked picture, the same figure an all-inked leg prints.
+        self.assertEqual(row["mb_per_picture"], "17.91")
 
     def test_uploads_off_the_reported_pictures_stamp_invalid_and_not_unchecked(self):
         row, first, text = self._row(MODEL_ONE_PANE_BYTES, OVERLAY_PICTURES_ONE, 1)
@@ -3643,7 +3796,8 @@ class RowVerdictTests(unittest.TestCase):
         self.assertEqual(row["cross"], "yes")
         self.assertNotIn("**", first, first)
         self.assertIn("panes=6 app_pictures=960x777;960x777;960x777;960x777;960x777;"
-                      "960x777 expected=2983680 B/picture (+-3474)", text)
+                      "960x777 inked=20/20 (0 blank) "
+                      "expected=2983680 B/picture (+-3474)", text)
         self.assertIn("-> CONFIRMED", text)
 
     def test_a_six_pane_leg_priced_as_one_picture_is_what_was_refused(self):
