@@ -493,8 +493,21 @@ jobs:
           sdkmanager --licenses < <(yes) >/dev/null
           sdkmanager "platforms;android-$sdk" "build-tools;36.0.0"
 
-      - name: Mint a throwaway signing key
+      - name: Sign with the project key, or mint a throwaway one
         if: matrix.package == 'android'
+        env:
+          # The project's release keystore, when the repository has one. The
+          # three secrets are empty on a fork pull request, which is the
+          # throwaway path below, and the artifact says which key signed it.
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          # The alias is NOT a secret, and must never become one: GitHub masks
+          # every occurrence of a secret's VALUE in every log, so a secret whose
+          # value is `squallar` would redact the product's name across all of
+          # CI. A repository variable is not masked. Defaults to the alias
+          # keystore.properties.example generates.
+          ANDROID_KEY_ALIAS: ${{ vars.ANDROID_KEY_ALIAS || 'squallar' }}
         # Android will not install an unsigned APK, so a release artifact has to
         # be signed with something, and that something must not be a real key:
         # a signing key wired into CI is reachable by any change to the workflow
@@ -558,14 +571,73 @@ jobs:
         # day the image gains a second one.
         run: |
           cd packaging/android
-          # Idempotent by deletion. keytool refuses a second `-genkeypair` into
-          # a keystore that already holds the alias ("Key pair not generated,
-          # alias <ci> already exists"), which a GitHub-hosted runner never
-          # reaches -- its workspace is new every time -- and which a
-          # self-hosted one would hit on its second run. The keystore is
-          # throwaway by construction, so throwing the old one away is the
-          # entire fix.
-          rm -f ci-signing.jks keystore.properties
+          rm -f ci-signing.jks keystore.properties SIGNING
+
+          # ── The project key ──
+          #
+          # Present as three secrets -- the PKCS12 keystore base64'd, its
+          # password, and the key password (the same value as the store
+          # password unless keytool was told otherwise) -- plus the alias, which
+          # is a plain variable (see the step's env). Everything checkable
+          # is checked HERE, by name, before Gradle sees any of it: a bad base64
+          # is not a "signing failed" from AGP forty lines later, and a wrong
+          # password is reported as a wrong password rather than as a keystore
+          # that "could not be loaded".
+          #
+          # One consequence worth stating: with a real key in a repository
+          # secret, every run's APK installs over the last one, which is the
+          # point -- and the key is reachable by any change to this workflow
+          # that a maintainer merges. Fine for a key whose only job is CI
+          # builds and Play upload; the Play *app signing* key should be the
+          # one Google holds (Play App Signing), so this one can be rotated.
+          if [ -n "${ANDROID_KEYSTORE:-}" ]; then
+            facts=""
+            for n in ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_PASSWORD; do
+              [ -n "${!n:-}" ] || facts="$facts $n"
+            done
+            if [ -n "$facts" ]; then
+              echo "::error::ANDROID_KEYSTORE is set but these are missing:$facts. All three secrets are needed; packaging/android/keystore.properties.example says what each is."
+              exit 1
+            fi
+            printf '%s' "$ANDROID_KEYSTORE" | base64 -d > ci-signing.jks 2>/dev/null \
+              || { echo "::error::ANDROID_KEYSTORE is not valid base64. Set it to 'base64 -w0 squallar-release.jks'."; exit 1; }
+            # Wrong password, wrong alias and not-a-keystore separate here, and
+            # the message names which. The password goes through an env var
+            # (keytool's :env spelling), never the command line.
+            if ! KS_PASS="$ANDROID_KEYSTORE_PASSWORD" "$JAVA_HOME/bin/keytool" -list \
+                   -keystore ci-signing.jks -storetype PKCS12 -storepass:env KS_PASS \
+                   -alias "$ANDROID_KEY_ALIAS" > /tmp/keytool-list.log 2>&1; then
+              if grep -qi "password was incorrect\|keystore password" /tmp/keytool-list.log; then
+                echo "::error::ANDROID_KEYSTORE_PASSWORD does not open the keystore in ANDROID_KEYSTORE."
+              elif grep -qi "does not exist" /tmp/keytool-list.log; then
+                echo "::error::ANDROID_KEY_ALIAS '$ANDROID_KEY_ALIAS' is not in the keystore. keytool -list -keystore squallar-release.jks shows the aliases it holds."
+              else
+                echo "::error::ANDROID_KEYSTORE decoded but is not a readable PKCS12 keystore. keytool said:"
+                sed 's/^/    /' /tmp/keytool-list.log
+              fi
+              exit 1
+            fi
+            {
+              echo "storeFile=ci-signing.jks"
+              echo "storePassword=$ANDROID_KEYSTORE_PASSWORD"
+              echo "keyAlias=$ANDROID_KEY_ALIAS"
+              echo "keyPassword=$ANDROID_KEY_PASSWORD"
+            } > keystore.properties
+            echo static > SIGNING
+            echo "signing with the project key (alias $ANDROID_KEY_ALIAS)"
+            exit 0
+          fi
+
+          # ── No project key: a throwaway one ──
+          #
+          # Android will not install an unsigned APK, so a release artifact has
+          # to be signed with something. The identity changes per run, and the
+          # consequence is named in the run's own log rather than hidden:
+          # installing one run's APK over another's fails with
+          # INSTALL_FAILED_UPDATE_INCOMPATIBLE. The password is in the clear on
+          # purpose and is not a secret: it guards a keypair generated one line
+          # above it and destroyed with the container. Both files land on paths
+          # packaging/android/.gitignore already covers.
           "$JAVA_HOME/bin/keytool" -genkeypair -v \
             -keystore ci-signing.jks -storetype PKCS12 \
             -alias ci -keyalg RSA -keysize 2048 -validity 10950 \
@@ -577,6 +649,8 @@ jobs:
             echo "keyAlias=ci"
             echo "keyPassword=squallar-ci-throwaway"
           } > keystore.properties
+          echo throwaway > SIGNING
+          echo "no ANDROID_KEYSTORE secret: signing with a throwaway key"
 
       # `rcodesign` and `zip` before the row runs, not after: unlike the macOS
       # rows -- which build a bare binary and package it in a later step --
@@ -712,8 +786,17 @@ jobs:
             echo "::error::expected exactly [$want] in $apk, got [$got]"
             exit 1
           fi
-          echo "ok: signed by the throwaway key, not debuggable, $got"
-          echo "::notice::${{ matrix.name }} is signed with a throwaway key that differs every run. Installing it over an earlier CI build fails with INSTALL_FAILED_UPDATE_INCOMPATIBLE; run 'adb uninstall app.squallar' first."
+          # Which key, read off the disk (the signing step wrote it), and the
+          # signer's fingerprint printed so a person can check the APK on their
+          # phone is the project key and not a stray throwaway one.
+          signing=$(cat packaging/android/SIGNING 2>/dev/null || echo unknown)
+          fp=$(printf '%s\n' "$certs" | grep -m1 'SHA-256' | sed 's/.*: *//')
+          echo "ok: signed ($signing key, SHA-256 $fp), not debuggable, $got"
+          if [ "$signing" = static ]; then
+            echo "::notice::${{ matrix.name }} is signed with the project key (SHA-256 $fp). It installs over any earlier build signed with the same key."
+          else
+            echo "::notice::${{ matrix.name }} is signed with a throwaway key that differs every run. Installing it over an earlier CI build fails with INSTALL_FAILED_UPDATE_INCOMPATIBLE; run 'adb uninstall app.squallar' first. Set the three ANDROID_KEYSTORE* secrets for a stable key."
+          fi
 
       # Neither `curl` nor `zip` is in the image — every layer that installed
       # curl purged it in the same `RUN` — and `rcodesign` never was. The

@@ -15,3 +15,5 @@ keystore.properties
 app/keystore.properties
 *.jks
 *.keystore
+# Written by CI beside keystore.properties: which key signed this run.
+SIGNING
