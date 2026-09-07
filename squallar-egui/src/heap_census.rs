@@ -793,7 +793,7 @@ pub fn spawn_process_sampler(sample_period: std::time::Duration, walk_every: u32
                     // The walk on the first iteration too, so a reader has a
                     // breakdown within one period rather than `walk_every` of
                     // them.
-                    if walk_every > 0 && n % walk_every == 0 {
+                    if walk_every > 0 && n.is_multiple_of(walk_every) {
                         if let Some(b) = squallar_alloc::process::breakdown() {
                             publish_breakdown(&b);
                         }

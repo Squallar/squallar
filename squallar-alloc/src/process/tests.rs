@@ -155,9 +155,12 @@ fn smaps_sorts_every_class_and_the_partition_closes() {
         "the eight classes did not add to the walk's own total"
     );
     assert!(b.partitions());
+    // main_heap + arena (the 22 528 kB mapping and its 0 kB PROT_NONE
+    // remainder, which the arena term already carries) + anon_other + device
+    // + code + file_other + stack + kernel.
     assert_eq!(
         b.rss_bytes,
-        (100 + 22_528 + 0 + 512 + 2048 + 400 + 64 + 36 + 4) * 1024
+        (100 + 22_528 + 512 + 2048 + 400 + 64 + 36 + 4) * 1024
     );
 }
 
@@ -446,7 +449,6 @@ fn every_class_is_shown_sensitive_at_the_magnitude_a_null_is_claimed_at() {
     // The same 31 runs of the same size and the same total residency, moved
     // 4 KiB off the boundary: not glibc's, so `arenas` must read zero — and
     // the bytes must stay on the total rather than vanishing with them.
-    let shifted = text.replace("7f00", "7f01").replace("-7f01", "-7f01");
     let mut off = String::new();
     for i in 0..ARENAS {
         let base = 0x7f00_0000_0000u64 + i * GLIBC_ARENA_SPAN + 4096;
@@ -455,7 +457,6 @@ fn every_class_is_shown_sensitive_at_the_magnitude_a_null_is_claimed_at() {
             "{base:x}-{end:x} rw-p 00000000 00:00 0 \nRss:  {ARENA_RSS_KB} kB\n"
         ));
     }
-    let _ = shifted;
     let o = parse_smaps(&off);
     assert_eq!(o.arenas, 0, "a misaligned run was read as a glibc arena");
     assert_eq!(

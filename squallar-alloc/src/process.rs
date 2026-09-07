@@ -372,7 +372,7 @@ impl AnonRun {
     /// constant for why a miss is safe.
     fn is_arena(&self) -> bool {
         self.open
-            && self.start % GLIBC_ARENA_SPAN == 0
+            && self.start.is_multiple_of(GLIBC_ARENA_SPAN)
             && self.end.saturating_sub(self.start) == GLIBC_ARENA_SPAN
     }
 }
