@@ -7,8 +7,8 @@ nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
 squallar-alloc/src/lib.rs	63	62
 squallar-app/src/app.rs	1646	1201
-squallar-app/src/app_chunks.rs	220	145
-squallar-app/src/app_fetch.rs	1958	1630
+squallar-app/src/app_chunks.rs	220	143
+squallar-app/src/app_fetch.rs	1958	1651
 squallar-app/src/app_render.rs	4255	3542
 squallar-app/src/app_state.rs	77	0
 squallar-app/src/budget_arms.rs	17	17
@@ -92,7 +92,7 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	306	268
 squallar-egui/src/tile_mesh/ledger.rs	77	46
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	1542	1477
+squallar-egui/src/tile_source.rs	1542	1478
 squallar-egui/src/tile_source/byte_lru.rs	272	271
 squallar-egui/src/tile_source/cache_ledger.rs	178	138
 squallar-egui/src/tile_source/snap.rs	157	157
@@ -237,7 +237,7 @@ squallar-overlays/src/render/station_model.rs	719	519
 squallar-overlays/src/spc/colors.rs	44	42
 squallar-overlays/src/spc/discussion.rs	386	371
 squallar-overlays/src/spc/discussion_archive.rs	62	31
-squallar-overlays/src/spc/fetch.rs	167	104
+squallar-overlays/src/spc/fetch.rs	167	109
 squallar-overlays/src/spc/firewx.rs	383	368
 squallar-overlays/src/spc/outlook.rs	382	345
 squallar-overlays/src/spc/reports.rs	212	202
@@ -247,9 +247,9 @@ squallar-radar/src/archive.rs	249	227
 squallar-radar/src/azimuth.rs	191	191
 squallar-radar/src/beam.rs	33	33
 squallar-radar/src/catalogue.rs	174	160
-squallar-radar/src/chunk_feed.rs	271	257
-squallar-radar/src/chunk_notify.rs	402	370
-squallar-radar/src/chunks.rs	975	801
+squallar-radar/src/chunk_feed.rs	271	262
+squallar-radar/src/chunk_notify.rs	402	373
+squallar-radar/src/chunks.rs	975	797
 squallar-radar/src/current.rs	117	116
 squallar-radar/src/derive.rs	320	307
 squallar-radar/src/dpprep.rs	1022	956
@@ -279,7 +279,7 @@ squallar-radar/src/scan.rs	374	212
 squallar-radar/src/scan_size.rs	46	46
 squallar-radar/src/site_position.rs	81	81
 squallar-radar/src/sites.rs	801	799
-squallar-radar/src/sounding.rs	234	206
+squallar-radar/src/sounding.rs	234	207
 squallar-radar/src/source.rs	631	583
 squallar-radar/src/srm.rs	107	102
 squallar-radar/src/srv.rs	203	203
