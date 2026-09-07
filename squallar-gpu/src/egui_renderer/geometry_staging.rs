@@ -25,17 +25,20 @@
 //! rather than two.
 //!
 //! A slot is sized to [`GEOMETRY_SLOT_GRANULARITY`] rather than to the frame's
-//! exact total, because the ring is grow-only and rebuilds **both** slots when
-//! it grows — two host allocations on the frame thread, which is the thing
-//! being optimised. A per-frame total sized exactly would rebuild on every new
-//! peak, and on native scene A the per-staging total climbs 36 KB to 32.6 MB
-//! over the load, setting a new peak on most frames of it.
+//! exact total, because the ring rebuilds **both** slots when it resizes — two
+//! host allocations on the frame thread, which is the thing being optimised. A
+//! per-frame total sized exactly would rebuild on every new peak, and on native
+//! scene A the per-staging total climbs 36 KB to 32.6 MB over the load, setting
+//! a new peak on most frames of it.
 //!
-//! Above [`MAX_STAGED_GEOMETRY_BYTES`] the ring is refused rather than grown:
-//! it is grow-only and holds [`crate::staging_ring::STAGING_RING_DEPTH`]
-//! slots, so a single outsized frame would pin twice its own size for the rest
-//! of the session. A refused frame takes the route it takes today and costs
-//! what it costs today; [`GeometryStagingTotals::declined`] is where that shows.
+//! Above [`MAX_STAGED_GEOMETRY_BYTES`] the ring is refused rather than grown.
+//! It holds [`crate::staging_ring::STAGING_RING_DEPTH`] slots, so a single
+//! outsized frame would pin twice its own size — until 2026-09-07 for the rest
+//! of the session, because the ring was grow-only, and now until
+//! [`crate::staging_ring::STAGING_RING_SHRINK_DWELL`] stagings have passed
+//! inside the dead band. Neither is a reason to grow to it. A refused frame
+//! takes the route it takes today and costs what it costs today;
+//! [`GeometryStagingTotals::declined`] is where that shows.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -174,7 +177,7 @@ impl egui_wgpu::GeometryStager for GeometryStaging {
         let ring = self
             .ring
             .get_or_insert_with(|| Ring::new(device, slot_bytes, "squallar.geometry.staging"));
-        ring.grow(device, slot_bytes);
+        ring.fit(device, slot_bytes);
         let Some(slot) = ring.claim(device) else {
             self.counters.declined.fetch_add(1, Ordering::Relaxed);
             return false;
@@ -224,7 +227,9 @@ mod tests {
 
     /// Per-frame staged totals shaped like native scene A's load: 36 KB to
     /// 32.6 MB, rising on **every** frame. That monotonic shape is the worst
-    /// case for a grow-only ring and is what the control below checks is real.
+    /// case for the growth half of the ring's sizing — no shrink can fire
+    /// inside it, because every staging asks for more than the last — and is
+    /// what the control below checks is real.
     fn a_rising_scene() -> Vec<u64> {
         let first = 35_976.0f64;
         let last = 32_642_086.0f64;
@@ -237,8 +242,9 @@ mod tests {
     }
 
     /// Ring rebuilds a run of frames costs, given how a slot is sized.
-    /// [`Ring::grow`] rebuilds when the wanted size exceeds what is held, so
-    /// this is the same monotone comparison it makes.
+    /// [`Ring::fit`] rebuilds when the wanted size exceeds what is held, so on
+    /// a strictly rising run this is the same comparison it makes; its shrink
+    /// half cannot fire on one, and is exercised where it lives.
     fn rebuilds(frames: &[u64], slot_size: fn(u64) -> u64) -> usize {
         let mut held = 0;
         let mut count = 0;

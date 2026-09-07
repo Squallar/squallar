@@ -92,7 +92,7 @@ impl VolumeStaging {
         let ring = self
             .ring
             .get_or_insert_with(|| Ring::new(device, layout.bytes, &label("grid.staging")));
-        ring.grow(device, layout.bytes);
+        ring.fit(device, layout.bytes);
         let Some(slot) = ring.claim(device) else {
             return false;
         };
@@ -424,17 +424,18 @@ mod tests {
                     continue;
                 }
 
-                // The ring only ever grows, and it grew exactly when this shape
-                // was the widest yet.
+                // Within this walk the ring only grows, and it grows exactly
+                // when the shape is the widest yet: a shrink needs
+                // `STAGING_RING_SHRINK_DWELL` consecutive stagings inside the
+                // dead band and this walk is twelve.
                 let held = staging.host_bytes();
                 if held > high_water {
                     grows += 1;
                     assert_eq!(
                         turn, 0,
                         "turn {turn}, {cells:?}: the ring resized on a replay of \
-                         a walk it has already been through, so it is not \
-                         grow-only after all and the pages this module says are \
-                         bought once are being bought again",
+                         a walk it has already been through, so the pages this \
+                         module says are bought once are being bought again",
                     );
                     high_water = held;
                 }
@@ -471,7 +472,7 @@ mod tests {
                 grows, 2,
                 "the walk above resized the ring {grows} times, not the two the \
                  shape order was built to force (build at [1,1,1], then the \
-                 first shape whose band is a whole one) — so `Ring::grow`'s \
+                 first shape whose band is a whole one) — so `Ring::fit`'s \
                  body is going unchecked and a session that widens its region \
                  box is relying on code no test runs",
             );

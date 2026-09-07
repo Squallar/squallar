@@ -647,7 +647,7 @@ impl TextureUploads {
         });
         // Only an image with a row wider than a whole band can ask for this; see
         // [`Self::new`].
-        ring.grow(device, plan.staged_bytes());
+        ring.fit(device, plan.staged_bytes());
         let Some(slot) = ring.claim(device) else {
             return false;
         };
