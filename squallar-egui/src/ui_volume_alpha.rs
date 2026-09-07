@@ -152,10 +152,11 @@ fn editor_contents(
             .add_enabled(curves.is_edited(&facts.id), egui::Button::new(RESET_LABEL))
             .on_hover_text(
                 "Forget the drawn curve and render through the default volume opacity \
-                 again - a straight line from transparent at the bottom of the scale to \
-                 solid at the top. That is not the plan view's opacity: a value the map \
-                 paints solid is see-through here unless it is near the top, which is \
-                 what makes a storm's interior visible.",
+                 again - a straight line from transparent to solid at the top of the \
+                 scale, and for reflectivity clear through 10 dBZ first. That is not the \
+                 plan view's opacity: a value the map paints solid is see-through here \
+                 unless it is near the top, which is what makes a storm's interior \
+                 visible.",
             )
             .clicked()
         {

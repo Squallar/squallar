@@ -68,11 +68,11 @@ impl AlphaCurve {
         }
     }
 
-    /// The default curve: a straight line from transparent at the bottom of
-    /// the value axis to opaque at its top — GR2Analyst's untouched Volume
-    /// Alpha, and what an untouched product here renders through and its
-    /// editor shows. Entry `i` is alpha `i`, so entry 0 is the no-data clamp
-    /// for free and entry 255 is solid.
+    /// A straight line from transparent at the bottom of the value axis to
+    /// opaque at its top — GR2Analyst's untouched Volume Alpha. Entry `i` is
+    /// alpha `i`, so entry 0 is the no-data clamp for free and entry 255 is
+    /// solid. The default for every product but reflectivity; see
+    /// [`Self::default_for`].
     ///
     /// One shared table rather than a fresh one per call:
     /// [`AlphaCurves::effective`] hands it out on every frame of every
@@ -80,16 +80,46 @@ impl AlphaCurve {
     /// identity before content, so a fresh allocation per frame would read
     /// as a fresh curve per frame.
     pub fn linear() -> Self {
-        static LINEAR: LazyLock<AlphaCurve> = LazyLock::new(|| {
-            let mut alphas = [0u8; CURVE_LEN];
-            for (i, alpha) in alphas.iter_mut().enumerate() {
-                *alpha = i as u8;
-            }
-            AlphaCurve::from_alphas(alphas)
-        });
+        static LINEAR: LazyLock<AlphaCurve> = LazyLock::new(|| AlphaCurve::ramp_from(0));
         LINEAR.clone()
     }
+
+    /// Transparent through `floor` and a straight line from there to opaque
+    /// at entry 255.
+    fn ramp_from(floor: u8) -> Self {
+        let mut alphas = [0u8; CURVE_LEN];
+        let run = f32::from(u8::MAX - floor);
+        for (i, alpha) in alphas.iter_mut().enumerate().skip(usize::from(floor) + 1) {
+            *alpha = ((i as f32 - f32::from(floor)) / run * 255.0).round() as u8;
+        }
+        AlphaCurve::from_alphas(alphas)
+    }
+
+    /// The curve an untouched `field` renders through, and its editor shows.
+    ///
+    /// Reflectivity is transparent through 10 dBZ and a straight line from
+    /// there to solid at the top: the weak returns under 10 dBZ are clear-air
+    /// and biota that would otherwise wrap every storm in a haze, and the
+    /// floor is asked of the voxel table itself
+    /// ([`squallar_radar::voxel::reflectivity_index_for_dbz`]) so it sits on
+    /// the index the voxels carry. Every other product is [`Self::linear`].
+    /// Shared tables, for the reason `linear` gives.
+    pub fn default_for(field: &FieldId) -> Self {
+        static REFLECTIVITY: LazyLock<AlphaCurve> = LazyLock::new(|| {
+            AlphaCurve::ramp_from(squallar_radar::voxel::reflectivity_index_for_dbz(
+                REFLECTIVITY_FLOOR_DBZ,
+            ))
+        });
+        if *field == squallar_radar::fields::known::REFLECTIVITY {
+            REFLECTIVITY.clone()
+        } else {
+            Self::linear()
+        }
+    }
 }
+
+/// Where the default reflectivity curve starts to show anything, dBZ.
+pub const REFLECTIVITY_FLOOR_DBZ: f32 = 10.0;
 
 /// One freehand stroke segment: rewrite the curve between two pointer samples.
 pub fn apply_stroke(alphas: &mut [u8; CURVE_LEN], from: (f32, f32), to: (f32, f32)) {
@@ -156,14 +186,15 @@ impl AlphaCurves {
         self.curves.remove(field);
     }
 
-    /// The curve `field` renders through: the user's, or [`AlphaCurve::linear`]
-    /// for a product nobody has drawn on. **The one place the default is
-    /// chosen** — the volume painter and the editor both read it, so the
-    /// curve drawn over the palette is the curve the volume is marched
-    /// through. Never stored: [`Self::is_edited`] and the save stay about what
-    /// the user drew.
+    /// The curve `field` renders through: the user's, or
+    /// [`AlphaCurve::default_for`] for a product nobody has drawn on. **The
+    /// one place the default is chosen** — the volume painter and the editor
+    /// both read it, so the curve drawn over the palette is the curve the
+    /// volume is marched through. Never stored: [`Self::is_edited`] and the
+    /// save stay about what the user drew.
     pub fn effective(&self, field: &FieldId) -> AlphaCurve {
-        self.get(field).unwrap_or_else(AlphaCurve::linear)
+        self.get(field)
+            .unwrap_or_else(|| AlphaCurve::default_for(field))
     }
 
     /// Whether `field` has a user curve at all.
@@ -208,7 +239,7 @@ mod tests {
             "a straight line keeps nothing but the no-data entry transparent",
         );
         let curves = AlphaCurves::default();
-        let field = FieldId::new("Reflectivity");
+        let field = FieldId::new("Velocity");
         assert_eq!(
             curves.effective(&field),
             linear,
@@ -222,6 +253,45 @@ mod tests {
             curves.entries().count(),
             0,
             "the default must never reach the save",
+        );
+    }
+
+    /// Reflectivity's default is transparent through 10 dBZ and a straight
+    /// line from there: zero up to and including the 10 dBZ index, a
+    /// non-decreasing ramp above it that ends solid, and a fade band the
+    /// march can skip that is exactly the transparent run.
+    #[test]
+    fn reflectivitys_default_is_clear_through_ten_dbz_then_a_straight_line() {
+        let floor = squallar_radar::voxel::reflectivity_index_for_dbz(REFLECTIVITY_FLOOR_DBZ);
+        let curve = AlphaCurve::default_for(&squallar_radar::fields::known::REFLECTIVITY);
+        let alphas = curve.alphas();
+        for (i, alpha) in alphas.iter().enumerate().take(usize::from(floor) + 1) {
+            assert_eq!(*alpha, 0, "entry {i} is under the floor and must be clear");
+        }
+        assert!(
+            alphas[usize::from(floor) + 1] > 0,
+            "the ramp starts one step above the floor"
+        );
+        assert_eq!(alphas[255], 255, "the top of the scale is solid");
+        for i in usize::from(floor) + 1..CURVE_LEN {
+            assert!(alphas[i] >= alphas[i - 1], "entry {i} falls");
+            // A straight line: the alpha is the fraction of the run, to
+            // rounding.
+            let expected = (i as f32 - f32::from(floor)) / f32::from(255 - floor) * 255.0;
+            assert!(
+                (f32::from(alphas[i]) - expected).abs() <= 0.5,
+                "entry {i} is off the line"
+            );
+        }
+        assert_eq!(
+            curve.fade_band(),
+            floor,
+            "the march must skip exactly the clear run"
+        );
+        assert_eq!(
+            AlphaCurves::default().effective(&squallar_radar::fields::known::REFLECTIVITY),
+            curve,
+            "an untouched reflectivity renders through this curve",
         );
     }
 

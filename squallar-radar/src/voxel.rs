@@ -762,6 +762,50 @@ fn data_levels(slot: MomentSlot) -> (f32, f32) {
     }
 }
 
+/// The LUT index a reflectivity of `dbz` lands on: the inverse of
+/// [`data_levels`] for the reflectivity slot, so a caller naming a floor in
+/// dBZ — the default Volume Alpha's "transparent through 10 dBZ" — gets the
+/// index the voxels actually carry rather than a number derived beside it.
+/// Index 1 is the bottom data level and 255 the top; a value past either end
+/// clamps to it, and index 0 stays the no-data index no value maps to.
+pub fn reflectivity_index_for_dbz(dbz: f32) -> u8 {
+    let (lo, hi) = data_levels(MomentSlot::Reflectivity);
+    let t = ((f64::from(dbz) - f64::from(lo)) / (f64::from(hi) - f64::from(lo))).clamp(0.0, 1.0);
+    1 + (t * 254.0).round() as u8
+}
+
+#[cfg(test)]
+mod reflectivity_index_tests {
+    use super::*;
+
+    /// The index is the inverse of the level table: the two ends land on 1
+    /// and 255, and 10 dBZ — the default Volume Alpha floor — on the index
+    /// whose level is exactly 10.0 at the table's half-dBZ step.
+    #[test]
+    fn the_reflectivity_index_is_the_inverse_of_the_level_table() {
+        let (lo, hi) = data_levels(MomentSlot::Reflectivity);
+        assert_eq!(reflectivity_index_for_dbz(lo), 1);
+        assert_eq!(reflectivity_index_for_dbz(hi), 255);
+        assert_eq!(
+            reflectivity_index_for_dbz(lo - 100.0),
+            1,
+            "below the floor clamps"
+        );
+        assert_eq!(
+            reflectivity_index_for_dbz(hi + 100.0),
+            255,
+            "above the top clamps"
+        );
+        let ten = reflectivity_index_for_dbz(10.0);
+        let step = (hi - lo) / 254.0;
+        let level_of_ten = lo + f32::from(ten - 1) * step;
+        assert!(
+            (level_of_ten - 10.0).abs() < 1e-4,
+            "index {ten} stands for {level_of_ten} dBZ, not 10",
+        );
+    }
+}
+
 /// [`data_levels`], with the derived products' own ranges layered over the
 /// slot's.
 fn data_levels_for(product: RadarProduct, slot: MomentSlot) -> (f32, f32) {

@@ -278,22 +278,22 @@ fn a_pane_taken_off_live_names_the_volume_it_is_showing() {
 }
 
 /// **The Volume Alpha curve rides the frame: the user's when one is stored,
-/// the straight-line default otherwise.**
+/// the product's default otherwise.**
 #[test]
-fn the_alpha_curve_rides_the_frame_and_the_default_is_the_straight_line() {
+fn the_alpha_curve_rides_the_frame_and_the_default_is_the_products_own() {
     use crate::volume_alpha::{AlphaCurve, CURVE_LEN};
 
     let (mut h, painter) = volume_harness(StubVolumePainter::painting());
+    let product = h.gui_mut().pane(1).expect("pane 1").selected_product();
     assert_eq!(
         last_seen(&painter).alpha,
-        Some(AlphaCurve::linear()),
-        "an untouched editor must hand the painter the straight-line default",
+        Some(AlphaCurve::default_for(&product)),
+        "an untouched editor must hand the painter the product's default curve",
     );
 
     let mut alphas = [0u8; CURVE_LEN];
     alphas[128..].fill(255);
     let curve = AlphaCurve::from_alphas(alphas);
-    let product = h.gui_mut().pane(1).expect("pane 1").selected_product();
     h.gui_mut().volume_alpha.set(&product, curve.clone());
     h.frames_for(1, FRAME_DT);
     assert_eq!(
@@ -306,8 +306,8 @@ fn the_alpha_curve_rides_the_frame_and_the_default_is_the_straight_line() {
     h.frames_for(1, FRAME_DT);
     assert_eq!(
         last_seen(&painter).alpha,
-        Some(AlphaCurve::linear()),
-        "a reset must go back to the straight-line default, not to the palette's alpha",
+        Some(AlphaCurve::default_for(&product)),
+        "a reset must go back to the product's default, not to the palette's alpha",
     );
 }
 
