@@ -1505,9 +1505,15 @@ impl super::App {
             let state = self.state.as_mut().unwrap();
             let window = self.window.as_ref().unwrap();
 
-            let window_size = window.inner_size();
+            // Off the gate's reading, not the window: on X11 `inner_size` is a
+            // `GetGeometry` round trip to the display server, and this is the
+            // frame path. The reading is warm here without exception —
+            // `handle_redraw` reads the gate before it decides this frame is
+            // worth building, and it is the only caller of this fn — so this
+            // costs no query at all. See `crate::window_gate`.
+            let (window_w, window_h) = self.window_gate.read(window).size;
             // The CSS-size-to-backing-store ratio, and nothing else.
-            let zoom_factor = state.surface_config.width as f32 / window_size.width.max(1) as f32;
+            let zoom_factor = state.surface_config.width as f32 / window_w.max(1) as f32;
 
             // The gesture player's frame, empty on every unarmed install.
             // Computed against the window in egui points, since that is the
@@ -1521,10 +1527,7 @@ impl super::App {
                         .max(f32::EPSILON);
                     let screen = egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
-                        egui::vec2(
-                            window_size.width as f32 / ppp,
-                            window_size.height as f32 / ppp,
-                        ),
+                        egui::vec2(window_w as f32 / ppp, window_h as f32 / ppp),
                     );
                     let now_secs = player.elapsed_secs();
                     player.events_for_frame(now_secs, screen)
