@@ -93,34 +93,6 @@ jobs:
             cmd: cargo check --workspace --all-targets --features squallar/jni-typecheck --target x86_64-apple-darwin && cargo build --release -p squallar --features squallar/jni-typecheck --target x86_64-apple-darwin
             artifact: packaging/macos/build/x86_64-apple-darwin/squallar-NOT-NOTARIZED.app.zip
             macos_bin: target/x86_64-apple-darwin/release/squallar
-          # The store variant is a SECOND macOS binary, not a re-signature of
-          # the one above. It is built `--no-default-features`, which turns off
-          # `gps-serial`, and that is the whole difference: under the App
-          # Sandbox the serial port enumerator returns Err, so with the feature
-          # on the settings pane draws a device picker that can never populate,
-          # and with it off it draws no rows at all. See
-          # packaging/macos/entitlements-store.plist.
-          #
-          # No `cargo check --workspace --all-targets` on these two rows, and
-          # that is deliberate rather than an omission: the two rows above
-          # already run it for these exact targets, so a second full check
-          # would buy no coverage for several minutes of runner time each. What
-          # is left is the build alone, which is the only thing these rows
-          # exist to produce.
-          #
-          # No `package: macos` either, so the per-arch `.app.zip` steps skip:
-          # a store build is only ever consumed as a universal .pkg, and a
-          # single-arch store .app is a file nobody can do anything with.
-          - name: macos-aarch64-store
-            target: aarch64-apple-darwin
-            macos_arch: aarch64-store
-            cmd: cargo build --release -p squallar --no-default-features --target aarch64-apple-darwin
-            macos_bin: target/aarch64-apple-darwin/release/squallar
-          - name: macos-x86_64-store
-            target: x86_64-apple-darwin
-            macos_arch: x86_64-store
-            cmd: cargo build --release -p squallar --no-default-features --target x86_64-apple-darwin
-            macos_bin: target/x86_64-apple-darwin/release/squallar
           # gnullvm, not MSVC: MSVC is the one family the image does not carry.
           - name: windows-x86_64
             target: x86_64-pc-windows-gnullvm
@@ -1318,9 +1290,18 @@ jobs:
 
   # The second macOS product. `macos-universal` builds the notarized download;
   # this builds the sandboxed .pkg that App Store Connect takes for TestFlight.
-  # They share a Makefile and nothing else: different binaries (this one is
-  # --no-default-features), different certificates, different entitlements,
-  # different wrapper.
+  # They are built from the SAME two halves and differ in how they are signed
+  # and wrapped: different certificates, different entitlements, a provisioning
+  # profile, and a .pkg instead of a .zip.
+  #
+  # An earlier version built its own halves `--no-default-features` to drop the
+  # serial GPS reader, on the grounds that a sandboxed build without
+  # `com.apple.security.device.serial` shows a port picker that can never
+  # populate. That cost two extra cross-compiles and, worse, the feature it
+  # needed could not be expressed without turning serialport on for iOS too --
+  # it is a link error there, which no test catches. The entitlement is
+  # documented and unrestricted, so the store build now asks for it and keeps
+  # the reader, and both products come out of one pair of binaries.
   #
   # NOT in `build-success`, for the reason `macos-universal` and
   # `ios-testflight` are not: this job talks to Apple on Apple's clock, a job
@@ -1397,12 +1378,12 @@ jobs:
       - name: Download the arm64 half
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: macos-bin-aarch64-store
+          name: macos-bin-aarch64
           path: halves/aarch64
       - name: Download the x86_64 half
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: macos-bin-x86_64-store
+          name: macos-bin-x86_64
           path: halves/x86_64
 
       - name: Package and sign the store .pkg

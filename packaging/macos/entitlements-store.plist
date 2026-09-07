@@ -49,6 +49,21 @@
          fails and the map is empty. -->
     <key>com.apple.security.network.client</key>
     <true/>
+    <!-- The serial GPS reader. This variant is built from the same binaries as
+         the direct download, so `serialport` is compiled in and the port
+         picker is drawn; without this entitlement `available_ports()` returns
+         Err and the dropdown renders empty forever
+         (squallar-nmea-serial/src/serial.rs:30).
+
+         Asked for rather than designed around. It is a documented, unrestricted
+         App Sandbox entitlement ("Interaction with serial devices" in Apple's
+         Entitlement Key Reference), not one of the temporary exceptions that
+         invite a review question. The alternative was a second pair of
+         cross-compiles with the reader compiled out, and the feature that
+         would have taken could not be spelled without also turning serialport
+         on for iOS, where it is a link error no test catches. -->
+    <key>com.apple.security.device.serial</key>
+    <true/>
 
     <!-- CoreLocation. squallar-location/src/os_location/apple.rs calls
          CLLocationManager::new() (:378), requestWhenInUseAuthorization()
@@ -76,14 +91,6 @@
            basemap block cache, basemap downloads), and the sandbox redirects
            $HOME into ~/Library/Containers/<bundle-id>/Data, so those four
            roots land inside the container with no entitlement at all.
-         * `com.apple.security.device.serial` — the serial GPS reader is not
-           compiled into this variant. CHANNEL=store builds the `squallar`
-           package with default features disabled, which drops the `gps-serial`
-           feature and with it `serialport`, the port dropdown and the three
-           gps.* settings rows. Shipping the reader without the entitlement
-           would leave a dropdown that can never populate
-           (squallar-nmea-serial/src/serial.rs:30 returns Err -> empty Vec);
-           dropping the feature removes the UI instead of breaking it.
          * `com.apple.security.device.usb`, `.bluetooth`, `.camera`,
            `.audio-input`, `personal-information.addressbook`/`.calendars`,
            `print`, `scripting-targets` — no code, no dependency.

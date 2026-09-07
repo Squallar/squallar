@@ -321,6 +321,34 @@ assert {UTI_IPA, UTI_PKG} <= APPLE_UTIS, (
 )
 
 
+def upload_state(attrs: dict) -> tuple[str, dict]:
+    """The phase of a buildUpload, and whatever diagnostics came with it.
+
+    `state` on this resource is an OBJECT, not a string:
+
+        {"errors": [...], "warnings": [...], "infos": [...], "state": "FAILED"}
+
+    Reading it as a string is not a cosmetic error, it is total. `state in
+    ("FAILED", ...)` compares a dict against strings, which is false forever,
+    so BOTH terminal branches -- accepted and rejected -- become unreachable
+    and every upload runs the full timeout and then takes the "still
+    processing" exit, which returns 0. Measured on run 34063607622: Apple
+    rejected the build 50 seconds in with error 90534, this script polled for
+    another 29 minutes, and the job annotated "accepted by App Store Connect".
+    A rejection reported as a success is the worst direction this can fail in,
+    and it had been failing that way for every iOS upload.
+
+    Both shapes are accepted here because the object form is what the API
+    sends today and the bare string is what the code assumed; if Apple ever
+    flattens it, this keeps working rather than silently reverting to the
+    defect.
+    """
+    state = attrs.get("state", "UNKNOWN")
+    if isinstance(state, dict):
+        return str(state.get("state", "UNKNOWN")), state
+    return str(state), {}
+
+
 # ------------------------------------------------------------------- the flow
 
 
@@ -428,17 +456,20 @@ def upload(client: Client, ipa: str, platform: str, timeout_s: int) -> int:
     deadline = time.time() + timeout_s
     last = None
     while time.time() < deadline:
-        state = client.get(f"/v1/buildUploads/{upload_id}")["data"]["attributes"].get(
-            "state", "UNKNOWN")
-        if state != last:
-            note(f"    state: {state}")
-            last = state
-        if state in ("COMPLETE", "SUCCEEDED"):
+        attrs = client.get(f"/v1/buildUploads/{upload_id}")["data"]["attributes"]
+        phase, diags = upload_state(attrs)
+        if phase != last:
+            note(f"    state: {phase}")
+            for kind in ("errors", "warnings"):
+                for d in diags.get(kind) or []:
+                    note(f"      {kind[:-1]} {d.get('code')}: {d.get('description')}")
+            last = phase
+        if phase in ("COMPLETE", "SUCCEEDED"):
             note(f"==> accepted. buildUpload {upload_id}")
             return 0
-        if state in ("FAILED", "INVALID", "CANCELLED"):
+        if phase in ("FAILED", "INVALID", "CANCELLED"):
             detail = client.get(f"/v1/buildUploads/{upload_id}")
-            fail(f"App Store Connect ended the upload in state {state}:\n"
+            fail(f"App Store Connect ended the upload in state {phase}:\n"
                  f"{json.dumps(detail, indent=2)}")
         time.sleep(15)
 
