@@ -2532,9 +2532,12 @@ impl super::App {
         census::set_derive_memo_bytes(squallar_radar::derive::memo_bytes() as u64);
         census::set_render_cache_bytes(self.render.render_cache.resident_bytes() as u64);
         // `renders in flight` is published at its seams, where the bytes
-        // move; this is the tick's reconciliation of it. `render pools` and
-        // `deferred drops` need no publisher here: `census()` reads radar's
-        // slot atomics and the discard ledger's counters directly.
+        // move; this is the tick's reconciliation of it. `cached renders` —
+        // the rasters the panes hold for restore — rides the same call,
+        // because `pane_render` is the dispatcher's and the walk is a handful
+        // of pointer comparisons. `render pools` and `deferred drops` need no
+        // publisher here: `census()` reads radar's slot atomics and the
+        // discard ledger's counters directly.
         self.render.publish_heap_census();
         census::set_loop_frame_bytes(self.loop_frames.resident_host_bytes());
         census::set_loop_frame_scan_bytes(self.loop_frames.pinned_volume_bytes());

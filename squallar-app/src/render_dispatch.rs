@@ -2347,6 +2347,54 @@ impl RenderDispatcher {
     ///
     /// `render pools` needs nothing here: `heap_census::census()` reads
     /// radar's slot atomics directly.
+    /// **What the panes' [`CachedPaneRender`]s are holding**, de-duplicated by
+    /// buffer: the `Color32` pixels and the hover field of every distinct
+    /// raster some pane has kept for restore.
+    ///
+    /// **De-duplicated across panes, and NOT across families.** Two panes
+    /// showing one raster hold one `Arc` — `apply_render_to_pane` clones the
+    /// reply's, and `PlanViewUploads::handle` is built on the same identity —
+    /// so counting per pane would price one buffer twice. The `Arc`s are
+    /// compared by address because that is the question, *is this the same
+    /// allocation*, and `ColorImage` has no cheap value identity anyway.
+    ///
+    /// The overlap this figure does **not** resolve is the one with `render
+    /// cache`: a pane's cached raster is usually also a cache entry, and the
+    /// two families then name the same bytes twice. Stated on the family's own
+    /// doc rather than corrected here.
+    ///
+    /// Two small `Vec`s rather than a `HashSet`: `pane_render` is a handful of
+    /// entries, and this runs on the 2 s telemetry tick, never on a frame and
+    /// never in the allocation-error hook — that reads the published level.
+    pub fn cached_render_bytes(&self) -> u64 {
+        let mut images: Vec<*const egui::ColorImage> = Vec::with_capacity(self.pane_render.len());
+        let mut hovers: Vec<*const squallar_radar::hover::HoverSource> =
+            Vec::with_capacity(self.pane_render.len());
+        let mut bytes = 0u64;
+        for cached in self
+            .pane_render
+            .iter()
+            .filter_map(|prs| prs.cached_render.as_ref())
+        {
+            let image = Arc::as_ptr(&cached.image);
+            if !images.contains(&image) {
+                images.push(image);
+                bytes = bytes.saturating_add(
+                    (cached.image.pixels.len() * std::mem::size_of::<egui::Color32>()) as u64,
+                );
+            }
+            // The two `Arc`s travel together out of one reply, but they are
+            // two allocations and a future path could share one without the
+            // other; each is asked its own question.
+            let hover = Arc::as_ptr(&cached.hover);
+            if !hovers.contains(&hover) {
+                hovers.push(hover);
+                bytes = bytes.saturating_add(cached.hover.resident_bytes() as u64);
+            }
+        }
+        bytes
+    }
+
     pub fn publish_heap_census(&self) {
         let fold = self.in_flight_image_bytes();
         self.in_flight_total.store(
@@ -2354,6 +2402,7 @@ impl RenderDispatcher {
             Ordering::Relaxed,
         );
         squallar_egui::heap_census::set_render_in_flight_bytes(fold);
+        squallar_egui::heap_census::set_cached_render_bytes(self.cached_render_bytes());
     }
 
     /// Whether some pane already has **this exact plan view** in flight.
@@ -2387,6 +2436,9 @@ mod raster_size_tests;
 
 #[cfg(test)]
 mod budget_order_tests;
+
+#[cfg(test)]
+mod cached_render_census_tests;
 
 // Native-only, like the gated renders it is built on: `Job::Opaque` and the
 // offload pool's threads have no wasm arm.

@@ -104,7 +104,12 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// And `overlay pictures` was DELETED — the family priced a 64-byte plan
 /// record as pixels — so by the same rule it takes its 16 characters and
 /// `16 + 25 = 41` back out: 1062 - 41 = 1021.
-pub const CENSUS_LINE_CAPACITY: usize = 1021;
+/// `cached renders` is 14 characters, so it adds `14 + 25 = 39`: 1021 + 39 =
+/// 1060. This chain is a DERIVATION and not a record: every term in it moves
+/// when a family is added or removed, so re-derive it rather than nudging the
+/// constant, and let `the_widest_line_fits_the_hooks_buffer` be the check.
+/// That test asserts `<=`, so a constant that is too LARGE passes quietly.
+pub const CENSUS_LINE_CAPACITY: usize = 1060;
 
 /// One family's level. A `u64` of bytes, `Relaxed` throughout: every reader
 /// wants a recent figure, none wants a synchronised one, and a census torn
@@ -180,6 +185,25 @@ families! {
     RENDER_CACHE_BYTES, render_cache_bytes, set_render_cache_bytes,
         "Finished radar rasters the render cache is holding, CPU-side: the \
          `Color32` pixel buffers and their resident hover fields.";
+    PANE_CACHED_RENDER_BYTES, cached_render_bytes, set_cached_render_bytes,
+        "Finished plan-view rasters the PANES are holding for restore - each \
+         `RenderDispatcher::pane_render[i].cached_render`, at its `Color32` \
+         pixels and its hover field, the same two terms `render cache` prices. \
+         Kept so a lost graphics context is an upload rather than a re-render \
+         (`App::restore_cached_render`), which on mobile is a context that \
+         goes without a suspend callback to warn of it. \
+         DE-DUPLICATED ACROSS PANES and NOT across families: two panes showing \
+         one raster hold one `Arc` and are counted once here, but the same \
+         `Arc` is usually ALSO a `render cache` entry, and this figure and that \
+         one then name the same bytes twice. \
+         Until 2026-09-07 nothing named these bytes at all: at the empty \
+         steady scene, with every overlay off, one pane held 216,796,176 B of \
+         `Color32` and 5,281,920 B of hover - 211.8 MiB, 87 % of the whole \
+         unaccounted heap - and `publish_heap_census` did not mention it. It \
+         was found in the mapping walk rather than the census: one anonymous \
+         VMA read 1,083,985,920 B against `render pools` 867,184,704 B, and \
+         the 216,796,176 B difference is exactly `side * side * 4` at the \
+         7362 px raster the pools were sized for.";
     RENDER_IN_FLIGHT_BYTES, render_in_flight_bytes, set_render_in_flight_bytes,
         "Finished plan-view rasters between the render thread and the frame \
          thread: the `ColorImage` a render's reply built, priced at its \
@@ -364,6 +388,7 @@ impl Census {
         [
             self.radar_total(),
             self.render_cache_bytes,
+            self.cached_render_bytes,
             self.render_pool_bytes,
             self.render_in_flight_bytes,
             self.overlay_grid_bytes,
@@ -507,7 +532,7 @@ pub fn write_line<W: core::fmt::Write>(
         out,
         "heap census ({instance}): loop scans {} B, loop l3 {} B, still scans {} B, \
          derive memo {} B, loop frame scans {} B, chunk feed {} B, \
-         render cache {} B, render pools {} B, \
+         render cache {} B, cached renders {} B, render pools {} B, \
          renders in flight {} B, \
          overlay grids {} B, overlay items {} B, overlay parked {} B, loop frames {} B, \
          upload pending {} B, tile bodies {} B, tile parsed {} B, \
@@ -520,6 +545,7 @@ pub fn write_line<W: core::fmt::Write>(
         census.loop_frame_scan_bytes,
         census.chunk_feed_bytes,
         census.render_cache_bytes,
+        census.cached_render_bytes,
         census.render_pool_bytes,
         census.render_in_flight_bytes,
         census.overlay_grid_bytes,
