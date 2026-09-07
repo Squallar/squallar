@@ -686,7 +686,10 @@ pub(crate) fn free_space(quota: Option<OfflineQuota>) -> Option<DataSize> {
 /// **The plan is cut before a byte moves** and that cut runs for minutes over
 /// a large area. A bar pinned at 0% through it is indistinguishable from a
 /// hang, and a fabricated percentage would be worse; this says which of the
-/// two states the run is in, and the spinner beside it says it is alive.
+/// two states the run is in. The wait mark beside it says only that — a
+/// spinner used to turn there, and it turned whether or not the plan was
+/// progressing, at a frame per display refresh for the whole cut. What says
+/// the run is alive is the plan landing, and the engine wakes a frame for that.
 pub(crate) const PREPARING_LABEL: &str = "Preparing download...";
 
 /// The exact byte counter that sits beside the bar.
@@ -709,19 +712,36 @@ pub(crate) fn progress_bytes_line(progress: DownloadProgress) -> String {
 /// One function rather than two call sites, so the two views of the *same*
 /// download cannot come to two answers about where it stands — and so the
 /// no-part-counts rule has one place to hold.
-pub(crate) fn render_download_progress(ui: &mut egui::Ui, progress: DownloadProgress) {
-    match progress.byte_fraction() {
+///
+/// `last_drawn` is the line this block drew the last time it drew one, on
+/// whichever surface. The engine wakes a frame on its own events — a plan
+/// landing, a tile landing — through `Context::request_repaint` rather than
+/// through a channel the app drains, so nothing on that path raises the
+/// arrival cause, and every frame it bought read as waste while showing new
+/// figures. The line moving is that arrival made visible: it is credited
+/// here, once per change and never on a redraw of the same figures
+/// ([`crate::frame_need::note_if_changed`]).
+pub(crate) fn render_download_progress(
+    ui: &mut egui::Ui,
+    progress: DownloadProgress,
+    last_drawn: &mut Option<String>,
+) {
+    let line: std::borrow::Cow<'static, str> = match progress.byte_fraction() {
         Some(fraction) => {
             ui.add(egui::ProgressBar::new(fraction).show_percentage());
-            ui.label(egui::RichText::new(progress_bytes_line(progress)).small());
+            let line = progress_bytes_line(progress);
+            ui.label(egui::RichText::new(line.as_str()).small());
+            line.into()
         }
         None => {
             ui.horizontal(|ui| {
-                ui.spinner();
+                crate::ui::wait::mark(ui);
                 ui.label(egui::RichText::new(PREPARING_LABEL).small());
             });
+            PREPARING_LABEL.into()
         }
-    }
+    };
+    crate::frame_need::note_if_changed(last_drawn, &line, crate::frame_need::NeedCause::Arrival);
 }
 
 #[cfg(test)]

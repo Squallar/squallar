@@ -1542,15 +1542,26 @@ impl super::Gui {
             if fetching {
                 // With how long the listing has been out (WI-7) — the one
                 // quantity this phase owns, so a deep-scrub refill reads as
-                // in progress rather than stuck. The spinner keeps the
-                // repaint alive, so the count ticks.
+                // in progress rather than stuck. The count restates the
+                // clock: it asks for the frame that lands where its number
+                // changes and raises the clock cause only when the words it
+                // draws differ from the words it drew last. A spinner used to
+                // keep this alive instead — a frame at the display's rate for
+                // the whole wait, none of them named.
                 let waited = ls
                     .listing_wait(web_time::Instant::now())
-                    .unwrap_or_default()
-                    .as_secs();
+                    .unwrap_or_default();
+                let text = format!("Loading scan list... {}s", waited.as_secs());
+                ui.ctx()
+                    .request_repaint_after(super::wait::seconds_tick(waited));
+                crate::frame_need::note_if_changed(
+                    &mut self.timeline_wait_text,
+                    &text,
+                    crate::frame_need::NeedCause::Clock,
+                );
                 ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(format!("Loading scan list... {waited}s"));
+                    super::wait::mark(ui);
+                    ui.label(text.as_str());
                 });
             } else if total == 0 {
                 ui.label("No frames found");
@@ -1663,8 +1674,11 @@ impl super::Gui {
 
                 if rendering {
                     let text = format!("Rendering {rendered}/{total}...");
+                    // The count and the bar under it move when a render
+                    // lands, and a landing buys its own frame; nothing here
+                    // asks for one.
                     ui.horizontal(|ui| {
-                        ui.spinner();
+                        super::wait::mark(ui);
                         ui.label(text.as_str());
                     });
                     ui.add(

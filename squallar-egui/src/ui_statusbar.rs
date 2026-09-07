@@ -239,22 +239,12 @@ fn describe_age(secs: u64) -> String {
 /// words are the picture; a tick that repaints the same words is still waste
 /// and this leaves it counted as waste.
 ///
-/// # What `last` holds
-///
-/// What this chip last **drew**, not what is on the glass. A bar that is off —
-/// Compact, or faded out — draws no chip and leaves the slot standing, so a
-/// bar returning to the same words raises nothing. The chip appearing at all
-/// with words in it is a change and does raise, once.
-///
-/// One `String` allocation per **change**; an idle frame costs the comparison
-/// and nothing else.
+/// The comparison itself is [`crate::frame_need::note_if_changed`]'s — this
+/// chip was its first site, and the transport's listing counter, the map's
+/// loading plate and the offline download's byte line now share it. What
+/// `last` holds and what a change costs are documented there.
 fn note_clock_change(last: &mut Option<String>, text: &str) -> bool {
-    if last.as_deref() == Some(text) {
-        return false;
-    }
-    *last = Some(text.to_owned());
-    crate::frame_need::note(crate::frame_need::NeedCause::Clock);
-    true
+    crate::frame_need::note_if_changed(last, text, crate::frame_need::NeedCause::Clock)
 }
 
 /// How often [`describe_age`] would print something new at this age.
@@ -354,7 +344,11 @@ fn render_auto_poll_status(
     if fetching {
         ui.label("\u{21bb}");
         ui.label("Downloading");
-        ui.spinner();
+        // A wait mark, not a spinner: the fetch's answer comes back through a
+        // channel the app drains, from a worker that posts its own wake, and
+        // the spinner that turned here bought a frame at the display's rate
+        // for the whole download with nothing new on any of them.
+        super::wait::mark(ui);
         return None;
     }
 

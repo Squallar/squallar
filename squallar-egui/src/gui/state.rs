@@ -272,6 +272,18 @@ pub struct Gui {
     /// not a preference, and a restored copy would claim a chip had drawn
     /// words this process has never drawn.
     pub(super) status_bar_chip_text: Option<String>,
+    /// The words the transport's listing counter ("Loading scan list... Ns")
+    /// drew the last time it drew any — `ui_timeline` compares against it so a
+    /// frame the counter's tick bought is called necessary only when the
+    /// number moved. Session-only, as `status_bar_chip_text` is and for the
+    /// same reason.
+    pub(super) timeline_wait_text: Option<String>,
+    /// The words the offline download's in-flight block drew the last time it
+    /// drew any, on either surface — the planning line or the byte count.
+    /// `ui_download_area::render_download_progress` compares against it so
+    /// the frame a landed plan or a landed tile buys is credited to the
+    /// arrival it shows. Session-only.
+    pub(super) download_progress_text: Option<String>,
     /// Whether the layer catalog is open. Session-only, like every other
     /// open-surface flag; opened by the stack's two `+ Show a layer` buttons
     /// and closed by applying a tile, the `✕`, the backdrop, or
@@ -671,6 +683,8 @@ impl Gui {
             statusbar_rect: None,
             status_bar_tick: None,
             status_bar_chip_text: None,
+            timeline_wait_text: None,
+            download_progress_text: None,
             catalog_open: false,
             catalog_query: String::new(),
             catalog_save_name: String::new(),
@@ -782,6 +796,19 @@ impl Gui {
     pub(crate) fn set_basemap_dir_for_test(&mut self, dir: std::path::PathBuf) {
         self.map_tiles.set_basemap_dir(Some(dir.clone()));
         self.basemap_dir = Some(dir);
+    }
+
+    /// Forget what the transport's listing counter last drew — **for the test
+    /// harness only**.
+    ///
+    /// The map's loading plate and this counter print the same wait and both
+    /// raise [`crate::frame_need::NeedCause::Clock`] on the frames its second
+    /// moves, so a screen showing both cannot say which of them raised. This
+    /// leaves the counter with words it has not drawn before on a frame where
+    /// the plate's number has not moved, which is what separates them.
+    #[cfg(test)]
+    pub(crate) fn forget_timeline_wait_text_for_test(&mut self) {
+        self.timeline_wait_text = None;
     }
 
     /// Never build a live tile source under this `Gui`.

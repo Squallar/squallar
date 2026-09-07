@@ -83,6 +83,9 @@ pub(crate) use pills::{PillKind, PillPopoverProbe, PillRowProbe};
 mod fade;
 #[path = "ui_sheet.rs"]
 mod sheet;
+/// What a wait draws, and the tick its seconds counter asks for.
+#[path = "ui_wait.rs"]
+pub(crate) mod wait;
 pub(crate) use sheet::SheetExtent;
 #[cfg(test)]
 pub(crate) use sheet::SheetPage;

@@ -896,18 +896,34 @@ pub(super) fn render_pane_map_content(
             && ctx.surfaces.paints(Surface::Glass)
             && let Some(loading) = ctx.pane.loop_loading(web_time::Instant::now())
         {
+            let text = loop_loading_notice(loading);
+            // Two arms, two wakes. The listing arm restates the clock — its
+            // number moves once a second for as long as the listing is out —
+            // so it asks for the frame that lands exactly where the number
+            // changes and raises the clock cause only when the words it is
+            // about to draw differ from the words it drew last; a frame that
+            // lands the same number is waste and stays counted as waste. The
+            // frame arm moves on an arrival or on the playhead, each of which
+            // buys its own frame and raises its own cause, so it asks for
+            // nothing: a pane parked on an owed frame lets the application
+            // sleep. Before this the plate re-armed a flat one-second repaint
+            // in both arms and raised nothing in either.
+            if let LoopLoading::Listing { waited } = loading {
+                ui.ctx()
+                    .request_repaint_after(crate::ui::wait::seconds_tick(waited));
+                crate::frame_need::note_if_changed(
+                    &mut ctx.pane.loading_notice_text,
+                    &text,
+                    crate::frame_need::NeedCause::Clock,
+                );
+            }
             let notice_painter = ui.painter().with_clip_rect(ctx.pane_rect);
             draw_top_notice(
                 &notice_painter,
                 ctx.pane_rect,
                 crate::ui::pills::pill_row_clearance(ui.ctx(), ctx.pane_idx),
-                loop_loading_notice(loading),
+                text,
             );
-            // The wait count ticks and the frames land without any input;
-            // keep a slow heartbeat while the plate is up so both reach the
-            // glass. It dies with the plate.
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_secs(1));
         }
 
         if !selected.is_empty() {

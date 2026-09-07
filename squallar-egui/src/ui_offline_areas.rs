@@ -163,12 +163,16 @@ impl super::Gui {
     /// The in-flight run, if there is one: a bar over the bytes, the exact
     /// byte figures beside it, and — until the plan has answered with a
     /// denominator — a preparing state rather than a bar at zero.
-    fn render_active_download(&self, ui: &mut egui::Ui) {
+    fn render_active_download(&mut self, ui: &mut egui::Ui) {
         let Some(active) = self.active_download.as_ref() else {
             return;
         };
         ui.label(format!("Downloading {}", active.spec.area_id));
-        crate::ui_download_area::render_download_progress(ui, active.progress());
+        crate::ui_download_area::render_download_progress(
+            ui,
+            active.progress(),
+            &mut self.download_progress_text,
+        );
         ui.add_space(AREA_ROW_SPACING);
     }
 

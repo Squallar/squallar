@@ -1050,6 +1050,12 @@ pub struct PaneState {
     pub hover_value: Option<String>,
     /// Hover tooltip text from overlay handlers (e.g. model data CIN value).
     pub overlay_hover_value: Option<String>,
+    /// The words the loading plate's listing counter drew the **last time it
+    /// drew any** — what `ui_map_pane` compares against, so a frame the
+    /// counter's tick bought is called necessary only when the number moved
+    /// (`frame_need::note_if_changed`). Session-only and never persisted: it
+    /// describes the glass, not a preference.
+    pub loading_notice_text: Option<String>,
     /// **The colour bars this pane keeps off the glass**, by the layer whose
     /// bar it is — radar's under [`known::RADAR`]. The Color Scale layer's own
     /// options: that layer's toggle is the whole HUD, and these are its bars
@@ -1786,6 +1792,7 @@ impl PaneState {
             layer_link: false,
             hover_value: None,
             overlay_hover_value: None,
+            loading_notice_text: None,
             hidden_color_bars: BTreeSet::new(),
             last_hover_pos: None,
             map_memory,

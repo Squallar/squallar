@@ -86,6 +86,15 @@
 //! moves the picture, never a threshold here — and the site reads the **words
 //! back**, so the ten seconds `describe_age` spends printing "just now" while
 //! the same tick fires are still waste and are still counted as waste.
+//!
+//! The same comparison then turned out to be the fix for the other pictures
+//! that were keeping the app awake. Three data waits drew egui's spinner,
+//! which asks for a frame on every frame it is painted and names nothing, and
+//! the map's loading plate re-armed a one-second tick whose frames showed new
+//! words only in its listing arm; the offline download's byte line was woken
+//! by its engine through `Context::request_repaint` and credited to nobody.
+//! [`note_if_changed`] is the chip's method with the cause left to the caller,
+//! and `crate::ui::wait` is what the waits draw instead of the spinner.
 
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -251,9 +260,45 @@ pub fn animate_bool(ctx: &egui::Context, id: egui::Id, target: bool, seconds: f3
     factor
 }
 
+/// Raise `cause` when `text` is not what `last` holds — the words the caller
+/// drew the **last time it drew any** — and remember `text`. Reports whether it
+/// raised.
+///
+/// **The one spelling of "the words moved"**, and the method every picture
+/// that restates something from off the frame is held to. A timed repaint is an
+/// ask, and an ask is the denominator this instrument refuses, so a widget that
+/// re-arms a tick compares the string it is about to draw with the one it drew
+/// last and raises only on a difference. First written as `ui_statusbar`'s
+/// `note_clock_change` for the auto-poll chip, then wanted by the transport's
+/// listing counter, the map's loading plate and the offline download's byte
+/// line — four sites, one comparison.
+///
+/// `cause` is the caller's to name, because words move for different reasons:
+/// an elapsed-seconds counter restates the clock ([`NeedCause::Clock`]); a byte
+/// count that moved shows something that arrived off the frame thread
+/// ([`NeedCause::Arrival`]).
+///
+/// # What `last` holds
+///
+/// What the caller last **drew**, not what is on the glass. A surface that is
+/// off draws nothing and leaves the slot standing, so a surface returning to
+/// the same words raises nothing; the words appearing at all where there had
+/// been none is a change and raises, once.
+///
+/// One `String` allocation per **change**; an unchanged frame costs the
+/// comparison and nothing else.
+pub fn note_if_changed(last: &mut Option<String>, text: &str, cause: NeedCause) -> bool {
+    if last.as_deref() == Some(text) {
+        return false;
+    }
+    *last = Some(text.to_owned());
+    note(cause);
+    true
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{NeedCause, note, peek, take};
+    use super::{NeedCause, note, note_if_changed, peek, take};
 
     /// **Every cause has its own bit**, which is what lets the reader charge
     /// one frame to several causes without any of them shadowing another.
@@ -311,5 +356,42 @@ mod tests {
         // A `handle_redraw` that early-returned: no `take`.
         note(NeedCause::Input);
         assert_eq!(take(), NeedCause::Arrival.bit() | NeedCause::Input.bit());
+    }
+
+    /// **Different words raise the named cause once; the same words raise
+    /// nothing** — and the bit raised is the one the caller named, not a
+    /// fixed one, since the same comparison serves a clock counter and a
+    /// byte count.
+    #[test]
+    fn the_words_moving_raises_the_named_cause_and_the_same_words_raise_nothing() {
+        let _ = take();
+        let mut last = None;
+        assert!(
+            note_if_changed(&mut last, "3s", NeedCause::Clock),
+            "the first words drew where there had been none and raised nothing",
+        );
+        assert_eq!(take(), NeedCause::Clock.bit());
+        for _ in 0..10 {
+            assert!(
+                !note_if_changed(&mut last, "3s", NeedCause::Clock),
+                "redrawing the same words raised a cause",
+            );
+        }
+        assert_eq!(
+            take(),
+            0,
+            "ten redraws of the same words left a cause standing"
+        );
+        assert!(note_if_changed(&mut last, "4s", NeedCause::Arrival));
+        assert_eq!(
+            take(),
+            NeedCause::Arrival.bit(),
+            "the bit raised is not the one the caller named",
+        );
+        assert_eq!(
+            last.as_deref(),
+            Some("4s"),
+            "the new words were not remembered"
+        );
     }
 }

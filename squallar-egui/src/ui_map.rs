@@ -1650,7 +1650,11 @@ impl super::Gui {
                             // The same block the Downloaded areas screen
                             // draws: one in-flight run, one shape, so the two
                             // views cannot come to two answers about it.
-                            crate::ui_download_area::render_download_progress(ui, progress);
+                            crate::ui_download_area::render_download_progress(
+                                ui,
+                                progress,
+                                &mut self.download_progress_text,
+                            );
                             if ui.button(DOWNLOAD_CANCEL_LABEL).clicked() {
                                 cancel = true;
                             }

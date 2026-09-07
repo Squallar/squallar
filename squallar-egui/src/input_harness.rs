@@ -2565,6 +2565,13 @@ mod loop_overlay_draw_tests;
 #[cfg(test)]
 mod loop_loading_tests;
 
+/// **What a wait asks of the frame loop**: the loading plate, the transport's
+/// two wait lines, the status bar's fetch and the offline download's block,
+/// driven over frames with the wait pending — what each raised, what each
+/// asked for.
+#[cfg(test)]
+mod wait_indicator_tests;
+
 /// **A layer's own loop window** (WB-6): the one Lookback number, raised to the
 /// floor the addressed layer declares, read off the action the ∞ button emits.
 #[cfg(test)]
