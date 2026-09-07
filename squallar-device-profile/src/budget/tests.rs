@@ -2669,7 +2669,7 @@ fn a_percentage_of_available_alone_converges_to_a_smaller_share_than_it_names() 
 /// as zero, under-stating the pool by what the process holds and never
 /// over-stating it.
 #[test]
-fn the_pool_never_recedes_as_this_process_grows() {
+fn the_pool_never_recedes_as_its_own_live_argument_grows() {
     use crate::scene::host_pool_bytes;
 
     const AVAILABLE: u64 = 4 << 30;

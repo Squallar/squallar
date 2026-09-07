@@ -525,10 +525,12 @@ pub fn effective_percent(hardware_bytes: u64, in_force_bytes: u64) -> Option<u8>
 ///
 /// Monotonicity holds in the argument and not in the process. The sum can only
 /// rise as `own_live_bytes` rises
-/// (`the_pool_never_recedes_as_this_process_grows`), but a process that grows
-/// its *non-heap* footprint — one more thread, one more driver mapping — is
-/// charged for it in `available` and credited nothing, so the pool recedes by
-/// exactly that growth. The 3.2 % range above is the measured bound on how far.
+/// (`the_pool_never_recedes_as_its_own_live_argument_grows`, named for the
+/// argument because that is the whole of what it can observe), but a process
+/// that grows its *non-heap* footprint — one more thread, one more driver
+/// mapping — is charged for it in `available` and credited nothing, so the
+/// pool recedes by exactly that growth. The 3.2 % range above is the measured
+/// bound on how far.
 ///
 /// `own_live_bytes` is `squallar_alloc::live_bytes()` where the counting
 /// allocator is installed and `None` where it is not; `None` is read as zero
