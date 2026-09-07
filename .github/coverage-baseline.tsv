@@ -24,7 +24,7 @@ squallar-app/src/loop_frame_store.rs	157	139
 squallar-app/src/loop_pool.rs	382	378
 squallar-app/src/loop_refill.rs	97	90
 squallar-app/src/loop_telemetry.rs	50	50
-squallar-app/src/platform.rs	441	352
+squallar-app/src/platform.rs	441	355
 squallar-app/src/platform_double.rs	342	322
 squallar-app/src/pressure.rs	200	192
 squallar-app/src/recovery.rs	105	104
@@ -247,7 +247,7 @@ squallar-overlays/src/types.rs	24	24
 squallar-radar/src/archive.rs	249	227
 squallar-radar/src/azimuth.rs	191	191
 squallar-radar/src/beam.rs	33	33
-squallar-radar/src/catalogue.rs	174	163
+squallar-radar/src/catalogue.rs	174	160
 squallar-radar/src/chunk_feed.rs	271	257
 squallar-radar/src/chunk_notify.rs	402	370
 squallar-radar/src/chunks.rs	975	805
@@ -428,8 +428,8 @@ vendor/nexrad-decode/src/messages/digital_radar_data/data_block_id.rs	42	5
 vendor/nexrad-decode/src/messages/digital_radar_data/elevation_data_block.rs	25	5
 vendor/nexrad-decode/src/messages/digital_radar_data/generic_data_block.rs	63	31
 vendor/nexrad-decode/src/messages/digital_radar_data/generic_data_block_header.rs	71	23
-vendor/nexrad-decode/src/messages/digital_radar_data/header.rs	113	36
-vendor/nexrad-decode/src/messages/digital_radar_data/message.rs	231	142
+vendor/nexrad-decode/src/messages/digital_radar_data/header.rs	113	37
+vendor/nexrad-decode/src/messages/digital_radar_data/message.rs	231	143
 vendor/nexrad-decode/src/messages/digital_radar_data/radial_data_block.rs	74	15
 vendor/nexrad-decode/src/messages/digital_radar_data/snapshot_test.rs	5	5
 vendor/nexrad-decode/src/messages/digital_radar_data/spot_blanking_status.rs	15	0
