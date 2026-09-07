@@ -128,13 +128,13 @@ jobs:
             target: aarch64-linux-android
             package: android
             abi: arm64-v8a
-            cmd: cd packaging/android && ./gradlew assembleRelease -PabiFilter=arm64-v8a
+            cmd: cargo run -q -p squallar-icon -- --android packaging/android/app/src/main/res && cd packaging/android && ./gradlew assembleRelease -PabiFilter=arm64-v8a
             artifact: packaging/android/app/build/outputs/apk/release/app-arm64-v8a-release.apk
           - name: android-x86_64
             target: x86_64-linux-android
             package: android
             abi: x86_64
-            cmd: cd packaging/android && ./gradlew assembleRelease -PabiFilter=x86_64
+            cmd: cargo run -q -p squallar-icon -- --android packaging/android/app/src/main/res && cd packaging/android && ./gradlew assembleRelease -PabiFilter=x86_64
             artifact: packaging/android/app/build/outputs/apk/release/app-x86_64-release.apk
 
           # The only wasm build, and deliberately so. The deleted `wasm32
@@ -170,7 +170,9 @@ jobs:
               # and carried `*.json` -- what a leaked service-account key wears.
               rm -rf dist && mkdir -p dist/pkg
               cp squallar-web/index.html squallar-web/manifest.webmanifest squallar-web/sw.js squallar-web/heap.js squallar-web/worker.js squallar-web/tile-lane.js dist/
-              cp -R squallar-web/icons dist/icons
+              # Rendered from packaging/icon/squallar.svg rather than copied:
+              # the repository holds one drawing of the icon and no raster of it.
+              cargo run -q -p squallar-icon -- --web dist/icons
               cp squallar-web/pkg/squallar_web.js squallar-web/pkg/squallar_web_bg.wasm dist/pkg/
               # wasm-bindgen emits this only for crates using JS snippets.
               if [ -d squallar-web/pkg/snippets ]; then cp -R squallar-web/pkg/snippets dist/pkg/snippets; fi

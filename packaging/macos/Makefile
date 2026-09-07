@@ -494,6 +494,13 @@ build:
 	# before the signing stage below, which seals the bundle's resources --
 	# anything added after that breaks the seal. One source for both bundles;
 	# see the file's own header.
+	# The app icon, rendered from packaging/icon/squallar.svg straight into
+	# the bundle. Nothing derived from the drawing is committed, so this is
+	# where the .icns comes into existence; CFBundleIconFile in Info.plist
+	# names it without the extension, which is what Finder and the Dock read.
+	cargo run -q -p squallar-icon -- --icns "$$APP/Contents/Resources/squallar.icns"
+	test -s "$$APP/Contents/Resources/squallar.icns" \
+	    || { echo "ERROR: the icon renderer wrote no squallar.icns."; exit 1; }
 	cp packaging/PrivacyInfo.xcprivacy "$$APP/Contents/Resources/PrivacyInfo.xcprivacy"
 	test -s "$$APP/Contents/Resources/PrivacyInfo.xcprivacy" || { echo "ERROR: PrivacyInfo.xcprivacy did not reach Contents/Resources"; exit 1; }
 

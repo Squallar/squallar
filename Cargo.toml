@@ -13,6 +13,7 @@ members = [
     "squallar-volumetric",
     "squallar-web",
     "squallar-egui",
+    "squallar-icon",
     "squallar-radar",
     "squallar-netcdf",
     "squallar-overlays",

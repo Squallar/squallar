@@ -138,6 +138,22 @@ impl DesktopPlatform {
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl PlatformBridge for DesktopPlatform {
+    fn window_attributes(
+        &self,
+        attributes: winit::window::WindowAttributes,
+    ) -> winit::window::WindowAttributes {
+        const ICON_PX: u32 = 256;
+        const ICON_RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/window_icon.rgba"));
+
+        match winit::window::Icon::from_rgba(ICON_RGBA.to_vec(), ICON_PX, ICON_PX) {
+            Ok(icon) => attributes.with_window_icon(Some(icon)),
+            Err(e) => {
+                log::warn!("the built-in window icon did not load, so the window has none: {e}");
+                attributes
+            }
+        }
+    }
+
     fn poll_theme(&mut self) -> Option<bool> {
         // Desktop uses WindowEvent::ThemeChanged; no polling needed.
         None

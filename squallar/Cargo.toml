@@ -35,6 +35,9 @@ name = "squallar_native"
 crate-type = ["rlib", "cdylib"]
 path = "src/lib.rs"
 
+[build-dependencies]
+squallar-icon = { path = "../squallar-icon" }
+
 [dependencies]
 # The counting global allocator, DECLARED in `src/lib.rs` for every artifact
 # this package builds (the desktop bin links the lib; the Android cdylib and

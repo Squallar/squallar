@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512"
+     role="img" aria-label="Squallar: a radar scope with a weather echo">
+  <!--
+    The definitive Squallar icon. Every app icon on every platform is rendered
+    from THIS file: iOS, macOS, Android, and the web. Nothing downstream is
+    hand-drawn and nothing downstream is edited; see packaging/icon/render.py,
+    which writes all of them, and packaging/icon/README.md for the list.
+
+    Authored to match the hand-made web icons that preceded it, whose palette
+    and geometry were measured out of squallar-web/icons/icon-maskable-512.png
+    rather than guessed: background #0d1117, range rings at 25%, 47% and 70% of
+    the scope radius, and an echo running the reflectivity ramp from blue
+    through green and yellow to red.
+
+    Two rules this drawing has to keep, because the platforms enforce them:
+
+      * It is FULL BLEED and OPAQUE, corner to corner. iOS rejects an app icon
+        with an alpha channel outright, and every platform applies its own mask
+        — a circle on Android, a superellipse on iOS, a rounded square on
+        macOS. Drawing our own rounded corners would show through as a second,
+        wrong-radius corner inside theirs.
+      * The subject sits inside the middle 66%, which is Android's adaptive
+        safe zone and the tightest mask any target applies. Everything outside
+        it is background that can be cropped away without losing the icon.
+  -->
+  <defs>
+    <!-- The scope face: barely lighter than the ground, so the rings read as
+         drawn ON something rather than floating. -->
+    <radialGradient id="face" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"   stop-color="#16262c"/>
+      <stop offset="70%"  stop-color="#132025"/>
+      <stop offset="100%" stop-color="#101a20"/>
+    </radialGradient>
+
+    <!-- The echo, on the reflectivity ramp every weather radar product uses.
+         Blue at the edge for light returns through to red at the core, which
+         is why the icon reads as weather rather than as a target blip. -->
+    <radialGradient id="echo" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"   stop-color="#f05a3e" stop-opacity="1"/>
+      <stop offset="28%"  stop-color="#ee6040" stop-opacity="1"/>
+      <stop offset="48%"  stop-color="#d57c4a" stop-opacity="0.96"/>
+      <stop offset="62%"  stop-color="#a8895c" stop-opacity="0.95"/>
+      <stop offset="74%"  stop-color="#5f7a72" stop-opacity="0.92"/>
+      <stop offset="84%"  stop-color="#356a86" stop-opacity="0.85"/>
+      <stop offset="93%"  stop-color="#25507a" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#204563" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- The sweep's decaying tail: bright at the beam, gone a quarter turn
+         behind it. -->
+    <linearGradient id="tail" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%"   stop-color="#3bd17f" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#3bd17f" stop-opacity="0.42"/>
+    </linearGradient>
+
+    <clipPath id="scope">
+      <circle cx="256" cy="256" r="184"/>
+    </clipPath>
+  </defs>
+
+  <!-- Full-bleed ground. No rounded corners: the platform supplies the mask. -->
+  <rect width="512" height="512" fill="#0d1117"/>
+
+  <circle cx="256" cy="256" r="184" fill="url(#face)"/>
+
+  <!-- Crosshair and range rings, clipped to the scope so nothing runs into the
+       corners the platform masks are about to cut. -->
+  <g clip-path="url(#scope)" stroke="#2a6555" fill="none" stroke-width="3">
+    <line x1="72" y1="256" x2="440" y2="256"/>
+    <line x1="256" y1="72" x2="256" y2="440"/>
+    <circle cx="256" cy="256" r="64"/>
+    <circle cx="256" cy="256" r="121"/>
+  </g>
+
+  <!-- The echo sits up and left of centre, off the sweep, so the two read as
+       separate objects rather than one smear. -->
+  <ellipse cx="204" cy="212" rx="58" ry="52" fill="url(#echo)"/>
+
+  <!-- Sweep: a decaying tail behind a bright leading beam, drawn last so the
+       beam stays crisp over the echo.
+
+       The beam stops at r=172, not at the rim. Its stroke is 7 wide with a
+       round cap, so the cap reaches 3.5 past wherever the line ends; drawn to
+       the rim it poked through the outside of the scope. The clip circle is
+       wider than the rim, so nothing else was going to catch that. -->
+  <g clip-path="url(#scope)">
+    <path d="M 256 256 L 256 84 A 172 172 0 0 1 377.6 134.4 Z" fill="url(#tail)"/>
+    <line x1="256" y1="256" x2="377.6" y2="134.4"
+          stroke="#3bd17f" stroke-width="7" stroke-linecap="round"/>
+  </g>
+
+  <!-- The rim, brighter than the inner rings, drawn over everything so the
+       sweep and echo terminate cleanly against it. -->
+  <circle cx="256" cy="256" r="179" fill="none" stroke="#2b725b" stroke-width="5"/>
+</svg>

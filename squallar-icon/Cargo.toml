@@ -1,0 +1,27 @@
+# Every app icon on every platform, rendered from packaging/icon/squallar.svg.
+#
+# A workspace member rather than a `tools/` crate, and that is the whole reason
+# it exists as a crate at all. The two callers need the same code:
+#
+#   * `squallar/build.rs` needs the window icon and the Windows .ico at COMPILE
+#     time, because winit takes the pixels at runtime and the usual spelling is
+#     `include_bytes!` of a file that has to already exist.
+#   * The packaging steps need the web, iOS, macOS, Android and Linux sets at
+#     PACKAGE time.
+#
+# A `tools/` crate stands outside the workspace by design (see
+# tools/squallar-terrain/Cargo.toml), so `cargo run -p …` cannot reach it and a
+# path build-dependency on it would drag a second workspace into this one.
+#
+# Pure Rust on purpose. The earlier shape of this shelled out to `rsvg-convert`
+# and ImageMagick, which meant every packaging job had to install them, a plain
+# `cargo run` produced an iconless window without them, and ImageMagick stamped
+# a `tIME` chunk that made two renders of one drawing differ in bytes.
+[package]
+name = "squallar-icon"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+resvg = "=0.48.1"
+png = "=0.18.1"

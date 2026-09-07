@@ -26,6 +26,9 @@
 # The Tier-2 browser gate's run artifacts (screenshots, per-leg JSON, driver
 # logs). CI uploads them on failure; they must never land in the tree.
 /.github/browser-rig/out/
+# Marketing captures: PNG masters and animation frames. The WebP the site
+# actually ships is written to www/screenshots/ and is tracked.
+/.github/marketing/out/
 # The hardware arm's, same rule. Its default is out-gpu/, and RIG_OUT_DIR
 # names variants (out-gpu-webgpu/ and so on), so the whole family is ignored.
 /.github/browser-rig/out-gpu*/
@@ -34,3 +37,14 @@
 # per-leg JSON, screenshots and driver logs staged as untracked files.
 /.github/browser-rig/out-measure*/
 /.github/browser-rig/__pycache__/
+
+# Every app icon is rendered from packaging/icon/squallar.svg by the
+# `squallar-icon` crate: `squallar/build.rs`
+/squallar-web/icons/
+/www/icons/
+/packaging/ios/AppIcon.appiconset/
+/packaging/macos/squallar.icns
+/packaging/windows/squallar.ico
+/packaging/linux/hicolor/
+/packaging/android/app/src/main/res/mipmap-*/
+/packaging/android/app/src/main/res/values/ic_launcher_background.xml

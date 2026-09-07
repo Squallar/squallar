@@ -284,19 +284,28 @@ fn every_manifest_icon_is_relative_and_the_file_matches_its_declared_size() {
              manifest so the subpath deploy finds it"
         );
 
-        let path = web_dir().join(src);
-        assert!(
-            path.is_file(),
-            "icon {src} does not exist at {}",
-            path.display()
-        );
+        // Checked against what the renderer WRITES, not against a file on
+        // disk. No raster of the icon is committed any more: every one is
+        // rendered from packaging/icon/squallar.svg during the build, so the
+        // question "does this file exist" has no answer in a clean checkout
+        // and the real question is whether the manifest and the renderer agree.
+        let name = src.rsplit('/').next().unwrap_or(src);
+        let (_, px) = rendered_web_icons()
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the manifest declares icon {src:?}, which squallar-icon \
+                     does not render. The deploy stages exactly what that \
+                     binary writes, so this icon would 404."
+                )
+            });
 
         let declared = icon["sizes"].as_str().expect("icon has no sizes");
-        let (w, h) = png_dimensions(&path);
         assert_eq!(
             declared,
-            format!("{w}x{h}"),
-            "{src} declares sizes {declared:?} but the PNG is {w}x{h}"
+            format!("{px}x{px}"),
+            "{src} declares sizes {declared:?} but squallar-icon renders it at {px}x{px}"
         );
     }
 }
@@ -625,8 +634,12 @@ fn every_shell_asset_that_is_not_build_output_exists() {
     assert!(paths.len() > 1, "SHELL_PATHS in sw.js parsed as near-empty");
 
     for path in paths {
-        // "" is the directory index; pkg/ is build output, not in the repo.
-        if path.is_empty() || path.starts_with("pkg/") {
+        // "" is the directory index; pkg/ and icons/ are build output, not in
+        // the repo. The icons are rendered from packaging/icon/squallar.svg at
+        // package time and `every_precached_icon_is_one_the_renderer_writes`
+        // below is what holds them to the same claim this loop makes about
+        // everything else.
+        if path.is_empty() || path.starts_with("pkg/") || path.starts_with("icons/") {
             continue;
         }
         let full = web_dir().join(&path);
@@ -655,6 +668,23 @@ fn ci_staged_paths() -> BTreeSet<String> {
 
     let mut staged = BTreeSet::new();
     let mut cp_lines = 0;
+
+    // The icons are not copied, they are rendered: no raster of the app icon is
+    // committed, so the staging step runs `squallar-icon --web dist/icons`
+    // instead of a `cp`. Read as staging the whole `icons/` directory, exactly
+    // as the `cp -R` it replaced was.
+    for line in yaml.lines().map(str::trim) {
+        if let Some(rest) = line.split("squallar-icon -- --web ").nth(1) {
+            if let Some(under_dist) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|d| d.strip_prefix("dist/"))
+            {
+                staged.insert(under_dist.to_string());
+                cp_lines += 1;
+            }
+        }
+    }
     for line in yaml.lines().map(str::trim) {
         let Some(args) = line.strip_prefix("cp ") else {
             continue;
@@ -1257,4 +1287,95 @@ fn no_arm_of_the_worker_reply_writes_a_field_the_defaults_do_not() {
             );
         }
     }
+}
+
+/// The web icon names and sizes `squallar-icon` writes, read out of its source.
+///
+/// A deliberately small reader rather than a dependency on the crate: this test
+/// is about whether two independently maintained lists agree, and importing one
+/// of them would make the comparison trivially true.
+fn rendered_web_icons() -> Vec<(&'static str, u32)> {
+    const RENDERER: &str = include_str!("../../squallar-icon/src/main.rs");
+    let start = RENDERER
+        .find("const WEB: ")
+        .expect("squallar-icon no longer declares a WEB icon list");
+    // From `= [` rather than the first `[`: the declaration is
+    // `const WEB: [(&str, u32); 5] = [ … ]` and the type's own brackets and
+    // tuple come first. Anchoring on `[` alone parsed the TYPE and then found
+    // no quoted name in it.
+    let body = &RENDERER[start..];
+    let eq = body.find("= [").expect("the WEB list has no `= [`");
+    let body = &body[eq + 2..body.find("];").expect("WEB list is unterminated")];
+
+    let mut out = Vec::new();
+    for entry in body.split('(').skip(1) {
+        let name = entry
+            .split('"')
+            .nth(1)
+            .expect("a WEB entry with no quoted file name");
+        let px: u32 = entry
+            .split(',')
+            .nth(1)
+            .and_then(|s| s.trim().trim_end_matches(')').parse().ok())
+            .expect("a WEB entry with no pixel size");
+        // `include_str!` gives a &'static str, so these slices are 'static too.
+        let name: &'static str = Box::leak(name.to_string().into_boxed_str());
+        out.push((name, px));
+    }
+    assert!(out.len() > 1, "the WEB list parsed as near-empty");
+    out
+}
+
+/// Everything `sw.js` precaches under `icons/` is something the renderer writes.
+///
+/// `every_shell_asset_that_is_not_build_output_exists` skips these, because
+/// they are not in the repository. Skipping them without replacing the claim
+/// would mean a renamed icon precaches a 404, and `cache.addAll` is
+/// all-or-nothing: one missing entry and the shell never caches at all, so
+/// offline support silently does nothing.
+#[test]
+fn every_precached_icon_is_one_the_renderer_writes() {
+    let rendered = rendered_web_icons();
+    let paths = js_string_list(SERVICE_WORKER, "const SHELL_PATHS = [");
+    let icons: Vec<&String> = paths.iter().filter(|p| p.starts_with("icons/")).collect();
+    assert!(
+        !icons.is_empty(),
+        "sw.js precaches no icons at all, so the parse above is reading the \
+         wrong list"
+    );
+
+    for path in icons {
+        let name = path.trim_start_matches("icons/");
+        assert!(
+            rendered.iter().any(|(n, _)| *n == name),
+            "sw.js precaches {path:?}, which squallar-icon does not write. The \
+             deploy stages exactly what that binary renders, so this entry \
+             would 404 and take the whole shell cache down with it. Rendered: \
+             {:?}",
+            rendered.iter().map(|(n, _)| *n).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// The page's `<link>` icons are rendered too. Same failure as above with a
+/// quieter symptom: a broken favicon rather than a dead cache.
+#[test]
+fn every_linked_icon_is_one_the_renderer_writes() {
+    let rendered = rendered_web_icons();
+    let mut found = 0;
+    for chunk in INDEX_HTML.split("icons/").skip(1) {
+        let name = chunk
+            .split('"')
+            .next()
+            .expect("an icons/ reference with no closing quote");
+        found += 1;
+        assert!(
+            rendered.iter().any(|(n, _)| *n == name),
+            "index.html links icons/{name}, which squallar-icon does not write"
+        );
+    }
+    assert!(
+        found > 0,
+        "index.html links no icons, so this test read nothing"
+    );
 }

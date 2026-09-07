@@ -426,6 +426,18 @@ build:
 	# Info.plist it carries no build settings to expand. Absent, App Store
 	# Connect rejects the upload with ITMS-91053 (Missing API declaration).
 	# One source for both bundles; see the file's own header.
+	# The app icon, rendered from packaging/icon/squallar.svg into an asset
+	# catalog. No raster of the icon is committed; see squallar-icon.
+	#
+	# App Store Connect refuses a bundle with no icon three ways at once --
+	# 90022 (no 120x120), 90023 (no 152x152) and 90713 (no CFBundleIconName) --
+	# and the third of those is why a catalog rather than loose PNGs: an app
+	# built against the iOS 11 or later SDK has to name one.
+	cargo run -q -p squallar-icon -- --ios "$$APP"
+	test -s "$$APP/AppIcon60x60@2x.png" \
+	    || { echo "ERROR: the icon renderer wrote no AppIcon60x60@2x.png, which is the 120x120 error 90022 asks for."; exit 1; }
+	test -s "$$APP/AppIcon76x76@2x~ipad.png" \
+	    || { echo "ERROR: the icon renderer wrote no AppIcon76x76@2x~ipad.png, which is the 152x152 error 90023 asks for."; exit 1; }
 	cp packaging/PrivacyInfo.xcprivacy "$$APP/PrivacyInfo.xcprivacy"
 	test -s "$$APP/PrivacyInfo.xcprivacy" || { echo "ERROR: PrivacyInfo.xcprivacy did not reach the bundle root"; exit 1; }
 	# iPhone presentation clamps to 60 Hz on ProMotion panels without this key;
