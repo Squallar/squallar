@@ -16,3 +16,11 @@ edition.workspace = true
 # The rendition pixel compression. Pure Rust; the reference encoder is Apple's
 # C library, and this one produces streams Apple's reader decodes byte-exactly.
 lzfse_rust = "=0.2.1"
+# Property lists, for the one conversion Apple's own tools do that ours did not:
+# Xcode writes every plist it ships as BINARY (`bplist00`), and the bundle this
+# repository built shipped XML. Pure Rust.
+plist = "=1.10.1"
+
+[[bin]]
+name = "plist-binary"
+path = "src/bin/plist_binary.rs"

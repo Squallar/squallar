@@ -456,6 +456,16 @@ build:
 	# iPads are exempt.
 	grep -A1 '<key>CADisableMinimumFrameDurationOnPhone</key>' "$$APP/Info.plist" | grep -q '<true/>' \
 	    || { echo "ERROR: CADisableMinimumFrameDurationOnPhone is not true in the bundled Info.plist"; exit 1; }
+	# Binary, the way Xcode writes every plist it ships. Read off a real Xcode
+	# build of a stub app: its Info.plist begins `bplist00`, ours began
+	# `<?xml`. Every Apple reader takes both; App Store Connect's validators
+	# are only ever shown Xcode's. Converted LAST, after every guard that
+	# greps the plist as XML text, and before signing, which seals it -- the
+	# first placement sat above the CADisableMinimumFrameDurationOnPhone grep,
+	# which then read a binary file and reported the key as not true.
+	cargo run -q -p squallar-car --bin plist-binary -- "$$APP/Info.plist"
+	head -c 8 "$$APP/Info.plist" | grep -q '^bplist00' \
+	    || { echo "ERROR: Info.plist is not a binary plist after conversion."; exit 1; }
 	# ---- sign for App Store distribution ----
 	# An .ipa App Store Connect will accept needs three things this stage adds:
 	# a signature from an Apple Distribution certificate, the App Store
