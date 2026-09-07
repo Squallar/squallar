@@ -2186,6 +2186,8 @@ pub fn rasterize_gridded(
     // `band[j % 3]` holds grid row `j`: the loop advances one row at a time and
     // the three live rows are consecutive, so their residues never collide.
     let mut band: [Vec<(f32, f32)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut drawn_cells: u64 = 0;
+    let mut written_px: u64 = 0;
     let mut projected_to: Option<usize> = None;
 
     let half_turn_px = half_turn_px(bounds, width);
@@ -2279,6 +2281,9 @@ pub fn rasterize_gridded(
             let x1 = ((cx + dx_right) as i32).min(width as i32 - 1);
             let y1 = ((cy + dy_down) as i32).min(height as i32 - 1);
 
+            drawn_cells += 1;
+            written_px += (x1 - x0 + 1).max(0) as u64 * (y1 - y0 + 1).max(0) as u64;
+
             for y in y0..=y1 {
                 let row_offset = (y as u32 * width * 4) as usize;
                 for x in x0..=x1 {
@@ -2293,6 +2298,12 @@ pub fn rasterize_gridded(
         }
     }
 
+    gridded_ledger::record(
+        drawn_cells,
+        written_px,
+        u64::from(width) * u64::from(height),
+    );
+
     RasterizeOutput {
         rgba,
         hit_cells: None,
@@ -2300,6 +2311,8 @@ pub fn rasterize_gridded(
         blank: None,
     }
 }
+
+pub mod gridded_ledger;
 
 #[cfg(test)]
 mod alpha_tests;
