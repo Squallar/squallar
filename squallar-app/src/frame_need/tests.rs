@@ -152,9 +152,10 @@ fn a_map_that_nudges_itself_reads_wholly_unnecessary() {
 fn a_frame_that_raised_any_cause_is_never_counted_unnecessary() {
     for cause in NeedCause::ALL {
         let mut ledger = fresh();
-        // A claim stands, exactly as it would in a live app with a render
-        // out: if the verdict ever consulted it, this frame would be charged.
-        ledger.record_wake_claim(WakeClaim::Render);
+        // A claim stands, exactly as it would in a live app with a loop
+        // playing: if the verdict ever consulted it, this frame would be
+        // charged.
+        ledger.record_wake_claim(WakeClaim::Loop);
         ledger.record(take());
         // ^ the first frame, before any tail — charged to `External`.
         note(cause);
@@ -182,7 +183,7 @@ fn a_frame_that_raised_any_cause_is_never_counted_unnecessary() {
             cause.name(),
         );
         assert_eq!(r.charge(WakeClaim::External), 1);
-        assert_eq!(r.charge(WakeClaim::Render), 0);
+        assert_eq!(r.charge(WakeClaim::Loop), 0);
     }
 }
 
@@ -225,9 +226,9 @@ fn a_frame_is_charged_to_the_claim_that_bought_it() {
     let mut ledger = fresh();
 
     // Frame 1: nobody had claimed anything yet.
-    ledger.record_wake_claim(WakeClaim::Render);
+    ledger.record_wake_claim(WakeClaim::Loop);
     ledger.record(take());
-    // Frame 2: bought by frame 1's render-in-flight claim; its own tail now
+    // Frame 2: bought by frame 1's loop-active claim; its own tail now
     // claims something else entirely.
     ledger.record_wake_claim(WakeClaim::Gesture);
     ledger.record(take());
@@ -241,7 +242,7 @@ fn a_frame_is_charged_to_the_claim_that_bought_it() {
     assert_eq!(
         (
             r.charge(WakeClaim::External),
-            r.charge(WakeClaim::Render),
+            r.charge(WakeClaim::Loop),
             r.charge(WakeClaim::Gesture),
             r.charge(WakeClaim::EguiNow),
         ),
@@ -336,7 +337,7 @@ fn the_line_s_three_groups_keep_their_own_identities() {
     ];
     for (frame, cause) in script.iter().enumerate() {
         ledger.record_wake_claim(if frame % 2 == 0 {
-            WakeClaim::Render
+            WakeClaim::Loop
         } else {
             WakeClaim::EguiNow
         });
@@ -754,4 +755,168 @@ fn the_clock_cause_moves_frames_between_the_verdicts_and_never_the_denominator()
     );
     assert!(moving.charges_balance() && frozen.charges_balance());
     assert!(moving.causes_cover_the_needed() && frozen.causes_cover_the_needed());
+}
+
+/// **A render in flight is not a reason to draw a frame.**
+///
+/// `chunk_feeds.any_in_flight()` left the re-arm for this argument and
+/// `render.any_render_in_flight()` is the same shape one claim over: a render
+/// out on a worker is answered by that worker, which posts a redraw of its own
+/// the moment it sends, so re-arming for it as well spent one frame per frame
+/// of the render's latency with nothing to show. It was the largest charge
+/// left after the chunk round went.
+///
+/// **The two halves have to be pinned together.** Dropping the poll is only
+/// safe while the wake that replaced it exists, so this asserts the absence of
+/// the poll *and* that every dispatch site still posts a redraw on a path that
+/// cannot skip it. All four are held, not only the two the removed poll
+/// tracked: the voxel build and the speculative render never set a pane's
+/// in-flight flag, so they have relied on that wake alone all along, and the
+/// argument for dropping the poll is that they are the rule rather than the
+/// exception.
+///
+/// The **abandon** paths are the other precondition, and they need no wake at
+/// all: they run on the frame thread and clear the flag there, beside the
+/// `abandon_results` that stops the reply. That pairing is what keeps the
+/// predicate falling for a render nobody will hear from again — with the poll
+/// gone it no longer costs frames, but it still gates speculation
+/// (`app_render::maybe_spawn_speculative_render`), so a leaked flag would
+/// silently stop pre-rendering rather than spin.
+#[test]
+fn a_render_in_flight_is_woken_by_the_worker_that_answers_it_not_by_a_poll() {
+    const APP: &str = include_str!("../app.rs");
+    const DISPATCH: &str = include_str!("../render_dispatch.rs");
+    const APP_RENDER: &str = include_str!("../app_render.rs");
+
+    let redraw = balanced_body(APP, "fn handle_redraw(");
+    let arm_start = redraw
+        .find("let wake_claim = ")
+        .expect("the end-of-frame re-arm is gone from handle_redraw");
+    let arm = &redraw[arm_start
+        ..arm_start
+            + redraw[arm_start..]
+                .find("notify_redraw(")
+                .expect("the re-arm no longer ends in a redraw request")];
+    assert!(
+        !arm.contains("any_render_in_flight"),
+        "the render in-flight poll is back in the re-arm. It asks for a frame \
+         for every frame a render is out, and the worker running that render \
+         already posts one when it answers: {arm}",
+    );
+
+    // Presence control, in two parts. The predicate has to still exist and
+    // still be read somewhere, or this test would pass over a function that
+    // had simply been deleted — and the reading that survives is the one that
+    // never cost a frame: the gate that refuses to speculate while an
+    // interactive render is out.
+    assert!(
+        DISPATCH.contains("pub fn any_render_in_flight(&self) -> bool"),
+        "the dispatcher no longer publishes whether a render is in flight, so \
+         the absence asserted above is a deletion and not a removal from the \
+         re-arm",
+    );
+    assert!(
+        balanced_body(APP_RENDER, "fn maybe_spawn_speculative_render(")
+            .contains("self.render.any_render_in_flight()"),
+        "the speculative gate no longer reads the in-flight flag, so nothing \
+         but the re-arm ever did and the flag itself is now dead",
+    );
+
+    // Every dispatch site, and the wake each one's answer brings with it.
+    for (site, response) in [
+        ("fn spawn_render(", "sender.send(RenderResponse {"),
+        (
+            "fn spawn_section_render(",
+            "sender.send(crate::channels::SectionResponse {",
+        ),
+        (
+            "fn spawn_voxel_build(",
+            "sender.send(crate::channels::VoxelResponse {",
+        ),
+        (
+            "fn spawn_speculative_render(",
+            "sender.send(RenderResponse {",
+        ),
+    ] {
+        let body = balanced_body(DISPATCH, site);
+        let send = body
+            .find(response)
+            .unwrap_or_else(|| panic!("{site} no longer replies with `{response}`"));
+        const WAKE: &str = "crate::app::notify_redraw(&window);";
+        let wake = body.find(WAKE).unwrap_or_else(|| {
+            panic!(
+                "{site} no longer asks for a frame when its render \
+                     answers, and nothing else does: the raster it produced \
+                     now waits for an unrelated wake"
+            )
+        });
+        assert_eq!(
+            body.matches(WAKE).count(),
+            1,
+            "{site} asks for a frame in more than one place; this pin cannot \
+             tell which of them is on the answering path",
+        );
+        assert!(
+            send < wake,
+            "{site} asks for its frame before it sends the result, so the \
+             frame it buys can run before the message is on the channel",
+        );
+        let between = &body[send..wake];
+        for branch in ["if ", "return", "match "] {
+            assert!(
+                !between.contains(branch),
+                "{site} put a `{branch}` between the send and the wake, so \
+                 there is now a path that sends a render's result and never \
+                 asks for the frame that would draw it",
+            );
+        }
+        // **And the wake is the closure's last statement.** Both plan-view
+        // sites send only while the result is still wanted, and a
+        // `notify_redraw` moved inside that guard is still after the send
+        // with no branch between the two — every check above passes while an
+        // abandoned render quietly stops asking for its frame. Nothing may
+        // stand between the wake and the closing of the closure, which is
+        // what says no block encloses it and nothing runs after it.
+        let tail = &body[wake + WAKE.len()..];
+        assert!(
+            tail.trim_start().starts_with("});"),
+            "{site}'s wake is not the last statement of its reply closure, so \
+             it sits inside some block that can decline to run it: {}",
+            &tail[..tail.len().min(120)],
+        );
+    }
+
+    // The abandon paths: the flag falls on the frame thread, beside the call
+    // that stops the reply. Checked per site rather than against a count, so
+    // a fifth abandon site added later owes the same pairing without anyone
+    // re-pointing a number — the only thing a count is needed for here is
+    // that the loop below is not vacuous. Four when this was written.
+    let abandons: Vec<usize> = DISPATCH
+        .match_indices(".abandon_results();")
+        .map(|(at, _)| at)
+        .collect();
+    assert!(
+        !abandons.is_empty(),
+        "`render_dispatch` abandons no render results anywhere, so the pairing \
+         checked below is checked over nothing",
+    );
+    for at in abandons {
+        let before = &DISPATCH[..at];
+        let cleared = before.rfind("render_finished();").unwrap_or_else(|| {
+            panic!(
+                "an `abandon_results()` at byte {at} has no `render_finished()` \
+                 before it at all: that pane is marked in flight for a render \
+                 whose reply has just been made unwanted, and nothing will \
+                 ever clear it"
+            )
+        });
+        let between = &before[cleared + "render_finished();".len()..];
+        assert!(
+            !between.contains('{') && !between.contains('}'),
+            "an `abandon_results()` at byte {at} is separated from the \
+             `render_finished()` before it by a block boundary, so they are \
+             no longer the same straight-line path and one can run without \
+             the other: {between}",
+        );
+    }
 }

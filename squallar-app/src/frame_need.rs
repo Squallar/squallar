@@ -89,7 +89,7 @@ use squallar_egui::frame_need::NeedCause;
 /// whether it posts a redraw. That makes [`Reading::charges_balance`] an
 /// identity rather than a hope, and it makes the choice a documented
 /// convention rather than an inference: a frame charged to [`Self::Upload`]
-/// may also have had a render in flight and a raster held.
+/// may also have had a loop running and a raster held.
 ///
 /// # How to read a charge
 ///
@@ -98,14 +98,16 @@ use squallar_egui::frame_need::NeedCause;
 /// as waste to remove; it is first so that the claims below it are not
 /// credited with frames it had already bought.
 ///
-/// The next seven are the app's own standing claims — "there is work in
+/// The next six are the app's own standing claims — "there is work in
 /// flight, wake me". An unnecessary frame charged to one of them is a **poll
 /// that found nothing**: the answer had not arrived, and the frame that
 /// finally receives it is necessary and counted so. A steady rate there is
 /// the app spinning on a worker instead of being woken by one — and where the
 /// worker already posts a redraw when it answers, that is a poll with no
-/// reason to exist at all, which is what took `chunk_feeds.any_in_flight()`
-/// out of [`Self::Chunk`].
+/// reason to exist at all. That is what took `chunk_feeds.any_in_flight()`
+/// out of [`Self::Chunk`], and then what took `Render` out of this list
+/// altogether: it had no second half to keep, so the whole claim went rather
+/// than stay as a column that can never be charged.
 ///
 /// [`Self::EguiNow`] is different in kind and is the self-nudge shape: a
 /// widget asked egui for an immediate repaint during the pass, and the frame
@@ -132,8 +134,6 @@ pub(crate) enum WakeClaim {
     /// be a relabelling. Asked first, what the claims below it hold is what
     /// removing them can actually recover.
     Upload,
-    /// `render.any_render_in_flight()`.
-    Render,
     /// `gui.any_loop_active()`.
     Loop,
     /// `gui.any_raster_held()`.
@@ -182,7 +182,6 @@ impl WakeClaim {
     /// order `handle_redraw`'s tail asks them in.
     pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::Upload,
-        Self::Render,
         Self::Loop,
         Self::Hold,
         Self::Restore,
@@ -195,22 +194,21 @@ impl WakeClaim {
     ];
 
     /// How many claims there are — the width of the charge array.
-    pub(crate) const COUNT: usize = 11;
+    pub(crate) const COUNT: usize = 10;
 
     /// This claim's slot in [`Self::ALL`] and in [`Reading::charged`].
     pub(crate) const fn index(self) -> usize {
         match self {
             Self::Upload => 0,
-            Self::Render => 1,
-            Self::Loop => 2,
-            Self::Hold => 3,
-            Self::Restore => 4,
-            Self::Chunk => 5,
-            Self::Drops => 6,
-            Self::Gesture => 7,
-            Self::EguiNow => 8,
-            Self::Timed => 9,
-            Self::External => 10,
+            Self::Loop => 1,
+            Self::Hold => 2,
+            Self::Restore => 3,
+            Self::Chunk => 4,
+            Self::Drops => 5,
+            Self::Gesture => 6,
+            Self::EguiNow => 7,
+            Self::Timed => 8,
+            Self::External => 9,
         }
     }
 
@@ -218,7 +216,6 @@ impl WakeClaim {
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Upload => "upload",
-            Self::Render => "render",
             Self::Loop => "loop",
             Self::Hold => "hold",
             Self::Restore => "restore",

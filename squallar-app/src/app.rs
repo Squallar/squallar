@@ -1217,14 +1217,21 @@ impl App {
 
         // **The same questions in the same order, with the same
         // short-circuit** — `or_else` is lazy exactly as `||` was, so a frame
-        // with a render in flight still stops at the first one and this tail
+        // with a loop playing still stops at the first one and this tail
         // costs what it did. What is new is that the answer is NAMED rather
         // than collapsed into a bool: the claim standing here is what buys the
         // NEXT frame, and it is the only thing that can say who bought a frame
         // that turned out to need nothing (`crate::frame_need::WakeClaim`).
-        let wake_claim = if self.render.any_render_in_flight() {
-            Some(WakeClaim::Render)
-        } else if self.gui.any_loop_active() {
+        // **Not the render in flight.** A render out on a worker is answered
+        // by that worker, which posts a redraw of its own the moment it sends
+        // (`render_dispatch::spawn_render`,
+        // `render_dispatch::spawn_section_render`); re-arming for it here as
+        // well bought a frame with nothing to show for every frame of the
+        // render's latency. The abandon paths need no wake at all — they
+        // clear the flag on the frame thread, beside the `abandon_results`
+        // they are paired with. See
+        // `crate::frame_need::tests::a_render_in_flight_is_woken_by_the_worker_that_answers_it_not_by_a_poll`.
+        let wake_claim = if self.gui.any_loop_active() {
             Some(WakeClaim::Loop)
         } else if self.gui.any_raster_held() {
             Some(WakeClaim::Hold)

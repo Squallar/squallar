@@ -3164,7 +3164,7 @@ var cadence_re = /frame cadence: n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|
 // that armed the repaint: a widget re-arming a tick forever requests every
 // frame it wastes, so a cause taken from the tick would score that defect
 // necessary exactly as the repaint ask would.
-var frame_need_re = /frame need: (\d+) drawn, (\d+) needed, (\d+) unnecessary; caused input=(\d+) arrival=(\d+) animation=(\d+) surface=(\d+) clock=(\d+); charged upload=(\d+) render=(\d+) loop=(\d+) hold=(\d+) restore=(\d+) chunk=(\d+) drops=(\d+) gesture=(\d+) egui=(\d+) timed=(\d+) external=(\d+)/;
+var frame_need_re = /frame need: (\d+) drawn, (\d+) needed, (\d+) unnecessary; caused input=(\d+) arrival=(\d+) animation=(\d+) surface=(\d+) clock=(\d+); charged upload=(\d+) loop=(\d+) hold=(\d+) restore=(\d+) chunk=(\d+) drops=(\d+) gesture=(\d+) egui=(\d+) timed=(\d+) external=(\d+)/;
 // Scene E's denominators. `listed` is frame SLOTS across every animating
 // layer of every pane; `resident`, `in flight` and `failed` are DISJOINT
 // SUBSETS of it and are never added to it -- a slot may be none of the three.
@@ -3430,16 +3430,15 @@ for (var i = 0; i < C.length; i++) {
                              surface: parseInt(x[7], 10),
                              clock: parseInt(x[8], 10) },
                    charged: { upload: parseInt(x[9], 10),
-                              render: parseInt(x[10], 10),
-                              loop: parseInt(x[11], 10),
-                              hold: parseInt(x[12], 10),
-                              restore: parseInt(x[13], 10),
-                              chunk: parseInt(x[14], 10),
-                              drops: parseInt(x[15], 10),
-                              gesture: parseInt(x[16], 10),
-                              egui: parseInt(x[17], 10),
-                              timed: parseInt(x[18], 10),
-                              external: parseInt(x[19], 10) } };
+                              loop: parseInt(x[10], 10),
+                              hold: parseInt(x[11], 10),
+                              restore: parseInt(x[12], 10),
+                              chunk: parseInt(x[13], 10),
+                              drops: parseInt(x[14], 10),
+                              gesture: parseInt(x[15], 10),
+                              egui: parseInt(x[16], 10),
+                              timed: parseInt(x[17], 10),
+                              external: parseInt(x[18], 10) } };
     frame_need_all.push(frame_need);
   }
   x = loop_state_re.exec(m);
@@ -8109,10 +8108,10 @@ def run_smoke(args):
                  caused.get("animation"), caused.get("surface"),
                  caused.get("clock")))
         print("[%s] SUMMARY frame need charged (one per unnecessary frame, "
-              "sums to `unnecessary`): upload=%s render=%s loop=%s hold=%s "
+              "sums to `unnecessary`): upload=%s loop=%s hold=%s "
               "restore=%s chunk=%s drops=%s gesture=%s egui=%s timed=%s "
               "external=%s"
-              % (tag, charged.get("upload"), charged.get("render"),
+              % (tag, charged.get("upload"),
                  charged.get("loop"), charged.get("hold"),
                  charged.get("restore"), charged.get("chunk"),
                  charged.get("drops"), charged.get("gesture"),

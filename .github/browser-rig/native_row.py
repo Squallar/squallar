@@ -2412,7 +2412,7 @@ def build_row(args, scraped, probes):
     #
     # Three groups, three denominators, never added across: `needed +
     # unnecessary == drawn`; the five `caused` counts OVERLAP and sum to at
-    # least `needed`; the eleven `charged` counts are one per unnecessary
+    # least `needed`; the ten `charged` counts are one per unnecessary
     # frame and sum to `unnecessary`. Both identities are asserted below rather than
     # assumed -- a windowed difference of two running totals is where a
     # miscount would first show, and a row that printed it silently would be
@@ -2429,14 +2429,14 @@ def build_row(args, scraped, probes):
             "drawn": fnd[0], "needed": fnd[1], "unnecessary": fnd[2],
             "caused": dict(zip(("input", "arrival", "animation",
                                 "surface", "clock"), fnd[3:8])),
-            "charged": dict(zip(("upload", "render", "loop", "hold",
+            "charged": dict(zip(("upload", "loop", "hold",
                                  "restore", "chunk", "drops", "gesture",
-                                 "egui", "timed", "external"), fnd[8:19])),
+                                 "egui", "timed", "external"), fnd[8:18])),
             # The two conservation laws, computed over the WINDOW. False is a
             # reader or an app defect, never a property of the scene, so the
             # row prints the flag beside the figures instead of hiding it.
             "partitions": fnd[1] + fnd[2] == fnd[0],
-            "charges_balance": sum(fnd[8:19]) == fnd[2],
+            "charges_balance": sum(fnd[8:18]) == fnd[2],
         }
 
     # Basemap state, on `run_measure.sh`'s own two-counter terms.
@@ -2794,9 +2794,9 @@ def print_row(row):
         g = fn_["charged"]
         print(
             "ROW   frame need charged (one per unnecessary frame): "
-            "upload=%s render=%s loop=%s hold=%s restore=%s chunk=%s "
+            "upload=%s loop=%s hold=%s restore=%s chunk=%s "
             "drops=%s gesture=%s egui=%s timed=%s external=%s"
-            % (g["upload"], g["render"], g["loop"], g["hold"], g["restore"],
+            % (g["upload"], g["loop"], g["hold"], g["restore"],
                g["chunk"], g["drops"], g["gesture"], g["egui"], g["timed"],
                g["external"])
         )
@@ -5508,7 +5508,7 @@ class FrameNeedTests(unittest.TestCase):
 
     LINE = ("[..] INFO frame need: %d drawn, %d needed, %d unnecessary; "
             "caused input=%d arrival=%d animation=%d surface=%d clock=%d; "
-            "charged upload=%d render=%d loop=%d hold=%d restore=%d "
+            "charged upload=%d loop=%d hold=%d restore=%d "
             "chunk=%d drops=%d gesture=%d egui=%d timed=%d external=%d")
 
     def setUp(self):
@@ -5527,7 +5527,7 @@ class FrameNeedTests(unittest.TestCase):
         """A reading at `n` frames, all of them unnecessary and charged to the
         immediate-repaint arm -- the self-nudging map's shape."""
         return self.LINE % (n, 0, n, 0, 0, 0, 0, 0,
-                            0, 0, 0, 0, 0, 0, 0, 0, n, 0, 0)
+                            0, 0, 0, 0, 0, 0, 0, n, 0, 0)
 
     def test_the_probe_is_drive_pys_own(self):
         """Read out of drive.py at run time, never restated here, so the two
@@ -5554,14 +5554,14 @@ class FrameNeedTests(unittest.TestCase):
             ("drawn", 12345), ("needed", 12000), ("unnecessary", 345),
             ("input", 900), ("arrival", 11000), ("animation", 400),
             ("surface", 3), ("clock", 120),
-            ("upload", 5), ("render", 10), ("loop", 11), ("hold", 2),
+            ("upload", 5), ("loop", 11), ("hold", 2),
             ("restore", 12), ("chunk", 1), ("drops", 13), ("gesture", 14),
             ("egui", 295), ("timed", 30), ("external", 2),
         ]
         line = (
             "frame need: %d drawn, %d needed, %d unnecessary; caused "
             "input=%d arrival=%d animation=%d surface=%d clock=%d; charged "
-            "upload=%d render=%d loop=%d hold=%d restore=%d chunk=%d "
+            "upload=%d loop=%d hold=%d restore=%d chunk=%d "
             "drops=%d gesture=%d egui=%d timed=%d external=%d"
             % tuple(v for _, v in fields)
         )
@@ -5589,7 +5589,7 @@ class FrameNeedTests(unittest.TestCase):
         m = self.probes["frame_need_re"].search(self._at(240))
         self.assertIsNotNone(m)
         g = [int(x) for x in m.groups()]
-        self.assertEqual(len(g), 19)
+        self.assertEqual(len(g), 18)
         self.assertEqual(g[0], 240)
         # A field dropped anywhere stops the match dead, which is what keeps a
         # partial reading from arriving as a full one.
@@ -5643,7 +5643,7 @@ class FrameNeedTests(unittest.TestCase):
                 seen += 1
                 # `needed + unnecessary != drawn`, and nothing charged.
                 out.append(self.LINE % (100 * seen, 0, 0, 0, 0, 0, 0, 0,
-                                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+                                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
         _row, text = self._row(out)
         self.assertIn("BROKEN over this window", text)
         self.assertIn("not a reading of the scene", text)

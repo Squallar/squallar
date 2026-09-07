@@ -1700,7 +1700,7 @@ fn an_untouched_app_is_left_free_to_sleep() {
 fn the_frame_re_arm_holds_only_work_that_finishes() {
     let body = fn_body("fn handle_redraw(");
     let start = body
-        .find("if self.render.any_render_in_flight()")
+        .find("let wake_claim = ")
         .expect("the end-of-frame re-arm is gone from handle_redraw");
     let arm = &body[start
         ..start
@@ -1720,7 +1720,6 @@ fn the_frame_re_arm_holds_only_work_that_finishes() {
     // The terms that do belong: each one ends, and its ending asks for the frame that
     // notices.
     for kept in [
-        "any_render_in_flight",
         "any_loop_active",
         // The handshake, which times out; not the backoff, which does not.
         "chunk_notify.handshake_pending",
@@ -1734,17 +1733,23 @@ fn the_frame_re_arm_holds_only_work_that_finishes() {
                  something unrelated waking the loop: {arm}"
         );
     }
-    // **The one term that left, and why it is not in the list above.** Every
-    // entry there is work whose ending has no producer but a frame. A chunk
-    // round has one: the worker that runs it posts a redraw itself when it
-    // sends, so polling for it as well drew a frame per frame of the round's
-    // latency with nothing to show — 85% of every frame an idle live feed drew.
-    // The two halves are pinned together in
-    // `frame_need::tests::a_chunk_round_is_woken_by_the_worker_that_answers_it_not_by_a_poll`,
-    // which is what keeps the absence safe.
+    // **The two terms that left, and why they are not in the list above.**
+    // Every entry there is work whose ending has no producer but a frame.
+    // These two have one: the worker that runs the round, and the worker that
+    // runs the render, each post a redraw themselves when they send — so
+    // polling for them as well drew a frame per frame of their latency with
+    // nothing to show. Each is pinned together with the wake that replaced it,
+    // in `frame_need::tests`:
+    // `a_chunk_round_is_woken_by_the_worker_that_answers_it_not_by_a_poll` and
+    // `a_render_in_flight_is_woken_by_the_worker_that_answers_it_not_by_a_poll`.
+    // Those pairings are what keep these absences safe.
     assert!(
         !arm.contains("chunk_feeds.any_in_flight"),
         "the feed's in-flight poll is back in the re-arm: {arm}"
+    );
+    assert!(
+        !arm.contains("any_render_in_flight"),
+        "the render in-flight poll is back in the re-arm: {arm}"
     );
     assert!(
         body.contains("self.auto_poll_at ="),
