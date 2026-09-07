@@ -54,7 +54,7 @@ fn project(lat: f64, lon: f64, total_pixels: f64) -> (f64, f64) {
 
 /// `squallar_egui::overlay_cache::viewport_geo_bounds` over
 /// `walkers::Projector`: unproject the pane's NW and SE corners.
-fn viewport_bounds(zoom: f64) -> GeoBounds {
+pub(super) fn viewport_bounds(zoom: f64) -> GeoBounds {
     let total = 2f64.powf(zoom) * 256.0;
     let (cx, cy) = project(CENTRE.0, CENTRE.1, total);
     let (nw_lat, nw_lon) = unproject(cx - PANE_W / 2.0, cy - PANE_H / 2.0, total);
@@ -69,7 +69,7 @@ fn viewport_bounds(zoom: f64) -> GeoBounds {
 
 /// `squallar_egui::overlay_cache::OverlayTexturePlan::coverage`, verbatim —
 /// latitude clamped to the Mercator limit, longitude not clamped.
-fn coverage(view: &GeoBounds, overdraw: f64) -> GeoBounds {
+pub(super) fn coverage(view: &GeoBounds, overdraw: f64) -> GeoBounds {
     const LIMIT: f64 = squallar_geo::MERCATOR_LAT_LIMIT_DEG;
     let lat_range = view.max_lat - view.min_lat;
     let lon_range = view.max_lon - view.min_lon;
@@ -81,21 +81,21 @@ fn coverage(view: &GeoBounds, overdraw: f64) -> GeoBounds {
     }
 }
 
-const PANE_W: f64 = 2878.0;
-const PANE_H: f64 = 1651.0;
+pub(super) const PANE_W: f64 = 2878.0;
+pub(super) const PANE_H: f64 = 1651.0;
 const CENTRE: (f64, f64) = (41.498_847_583_948_724, -86.783_624_466_817_76);
-const FROZEN_ZOOM: f64 = 3.326_757_482_253_017;
+pub(super) const FROZEN_ZOOM: f64 = 3.326_757_482_253_017;
 const CONTROL_ZOOM: f64 = 5.0;
 /// `OVERDRAW_FRACTION` — the shipped 150 % oversample, one quarter a side.
-const OVERDRAW: f64 = 0.25;
+pub(super) const OVERDRAW: f64 = 0.25;
 
 // ── The GMGSI grid, at its real shape ─────────────────────────────────────
 
-const NI: usize = 5000;
-const NJ: usize = 3000;
+pub(super) const NI: usize = 5000;
+pub(super) const NJ: usize = 3000;
 /// The measured column step: `geospatial_lon_resolution` says 0.0722, the array
 /// steps this (`GridCoords::Separable`'s own doc).
-const LON_STEP: f64 = 0.072_008_9;
+pub(super) const LON_STEP: f64 = 0.072_008_9;
 /// The measured column 0 (`GridCoords::Separable`'s own doc).
 const LON_0: f64 = 179.999_61;
 /// `geospatial_lat_max` / `geospatial_lat_min` from the reference granule
@@ -107,7 +107,7 @@ const LAT_MIN: f64 = -72.736_80;
 /// `+179.99961`, so the wrap into `[-180, 180)` falls between **column 0 and
 /// column 1**. Column 1 is `-179.92838`, which is what the `Separable` doc
 /// records off the file.
-fn wrapping_lon_axis() -> Vec<f64> {
+pub(super) fn wrapping_lon_axis() -> Vec<f64> {
     (0..NI)
         .map(|i| {
             let raw = LON_0 + i as f64 * LON_STEP;
@@ -129,7 +129,7 @@ fn ascending_lon_axis() -> Vec<f64> {
 /// Uniform in **Mercator y**, not in latitude — the property `Separable`'s doc
 /// measures off the file (a constant -0.628397 of `y` per 500 rows; this
 /// construction gives -0.6284 over the same interval).
-fn lat_axis() -> Vec<f64> {
+pub(super) fn lat_axis() -> Vec<f64> {
     let y_max = squallar_geo::lat_rad_to_mercator_y(LAT_MAX.to_radians());
     let y_min = squallar_geo::lat_rad_to_mercator_y(LAT_MIN.to_radians());
     (0..NJ)
@@ -156,7 +156,7 @@ fn tagged_values() -> GridValues {
     GridValues::F32(v)
 }
 
-fn grid(lon_axis: Vec<f64>, values: GridValues) -> GriddedInput {
+pub(super) fn grid(lon_axis: Vec<f64>, values: GridValues) -> GriddedInput {
     GriddedInput::Resident(Arc::new(ResidentGrid {
         field: FieldId::from_static("GmgsiLongwaveIr"),
         ni: NI,

@@ -2091,6 +2091,152 @@ pub(crate) fn half_turn_px(bounds: &GeoBounds, width: u32) -> f32 {
     (180.0 / (bounds.max_lon - bounds.min_lon) * f64::from(width as f32)) as f32
 }
 
+/// One grid cell's filled rect, as [`rasterize_gridded`] sized it.
+///
+/// Cells are held a row at a time rather than filled where they are computed,
+/// because a cell cannot know what it is allowed to skip until the cells drawn
+/// **after** it are known — see [`Self::clip_x`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CellRect {
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    /// Straight (unmultiplied) RGBA, as this rasterizer writes.
+    color: [u8; 4],
+}
+
+impl CellRect {
+    /// Nothing left to write. Reachable two ways: a cell clamped entirely off
+    /// the texture, and a cell every pixel of which a later cell covers.
+    fn is_empty(&self) -> bool {
+        self.x1 < self.x0 || self.y1 < self.y0
+    }
+
+    /// Give up the columns a **strictly later** cell's rect `l` covers.
+    ///
+    /// **The output cannot move, and that is the whole construction.** The fill
+    /// below overwrites — "no blending between adjacent grid cells" — so a
+    /// pixel's colour is the colour of the *last* cell to cover it. Removing
+    /// from this cell only pixels that `l` covers therefore changes neither
+    /// which pixels end up painted (`l` paints every one of them) nor what
+    /// colour any of them ends up (`l` is later, so it already won them). What
+    /// it removes is the store this cell was making into a pixel it was about
+    /// to lose.
+    ///
+    /// `l` is the later cell's rect **before** `l`'s own clipping, which is what
+    /// makes the argument close over a whole row: whatever `l` gives up, it
+    /// gives up only to a cell later still, so the union of everything from `l`
+    /// onward still covers `l`'s full rect.
+    ///
+    /// **Two conditions, both load-bearing.** `l` must span every row this cell
+    /// writes, or the part given up is only covered on some of them; and `l`
+    /// must reach one of this cell's own ends, or what it covers is an interior
+    /// band and giving it up would split one rect into two. Where either fails
+    /// nothing is given up, which costs a store and cannot cost a pixel — the
+    /// posture a Lambert grid lands in, where a row is not a parallel and two
+    /// cells beside each other can sit a pixel apart in `y`.
+    fn clip_x(&mut self, l: &CellRect) {
+        if self.is_empty() || l.is_empty() {
+            return;
+        }
+        if l.y0 > self.y0 || l.y1 < self.y1 {
+            return;
+        }
+        if l.x1 < self.x0 || l.x0 > self.x1 {
+            return;
+        }
+        if l.x0 <= self.x0 && l.x1 >= self.x1 {
+            self.x1 = self.x0 - 1;
+        } else if l.x1 >= self.x1 {
+            self.x1 = l.x0 - 1;
+        } else if l.x0 <= self.x0 {
+            self.x0 = l.x1 + 1;
+        }
+    }
+
+    /// [`Self::clip_x`] on the other axis: the rows a later cell covers.
+    ///
+    /// Applied **after** `clip_x`, so the columns it tests against are the ones
+    /// this cell will really write. That is not merely an optimisation: a cell
+    /// narrowed in `x` is one a later row's cell is more likely to span, so the
+    /// two clips compose into the full partition rather than half of it.
+    fn clip_y(&mut self, l: &CellRect) {
+        if self.is_empty() || l.is_empty() {
+            return;
+        }
+        if l.x0 > self.x0 || l.x1 < self.x1 {
+            return;
+        }
+        if l.y1 < self.y0 || l.y0 > self.y1 {
+            return;
+        }
+        if l.y0 <= self.y0 && l.y1 >= self.y1 {
+            self.y1 = self.y0 - 1;
+        } else if l.y1 >= self.y1 {
+            self.y1 = l.y0 - 1;
+        } else if l.y0 <= self.y0 {
+            self.y0 = l.y1 + 1;
+        }
+    }
+
+    /// Store this cell's colour into every pixel it owns, and count the stores.
+    fn fill(&self, rgba: &mut [u8], width: u32, written_px: &mut u64) {
+        if self.is_empty() {
+            return;
+        }
+        *written_px += (self.x1 - self.x0 + 1) as u64 * (self.y1 - self.y0 + 1) as u64;
+        for y in self.y0..=self.y1 {
+            let row_offset = (y as u32 * width * 4) as usize;
+            for x in self.x0..=self.x1 {
+                let offset = row_offset + (x as u32 * 4) as usize;
+                // Overwrite — no blending between adjacent grid cells.
+                rgba[offset] = self.color[0];
+                rgba[offset + 1] = self.color[1];
+                rgba[offset + 2] = self.color[2];
+                rgba[offset + 3] = self.color[3];
+            }
+        }
+    }
+}
+
+/// Emit one row of cells, each shrunk to the pixels no later cell takes from it.
+///
+/// `row` is clipped in place and then filled **left to right**, and `next` — the
+/// row drawn after it, unclipped — is what its cells give their bottom rows up
+/// to. The two together are the whole of the saving: at sub-pixel spacing a
+/// cell's `0.5` px half-extent floor makes its rect two pixels by two whatever
+/// the cell's real size is, and its right column and bottom row are then the
+/// left column and top row of cells that overwrite them a moment later.
+fn emit_cell_row(
+    rgba: &mut [u8],
+    width: u32,
+    row: &mut [Option<CellRect>],
+    next: Option<&[Option<CellRect>]>,
+    written_px: &mut u64,
+) {
+    // Right to left, so `ahead` is the next drawn cell in the row — and it is
+    // the rect that cell was *sized* to, never the one it was clipped to.
+    let mut ahead: Option<CellRect> = None;
+    for idx in (0..row.len()).rev() {
+        let Some(mut cell) = row[idx] else {
+            continue;
+        };
+        let sized = cell;
+        if let Some(l) = ahead {
+            cell.clip_x(&l);
+        }
+        if let Some(l) = next.and_then(|n| n[idx]) {
+            cell.clip_y(&l);
+        }
+        row[idx] = Some(cell);
+        ahead = Some(sized);
+    }
+    for cell in row.iter().flatten() {
+        cell.fill(rgba, width, written_px);
+    }
+}
+
 /// Writes pixels directly rather than through tiny-skia: one filled rectangle
 /// per grid point, sized from its neighbour spacing.
 pub fn rasterize_gridded(
@@ -2186,9 +2332,23 @@ pub fn rasterize_gridded(
     // `band[j % 3]` holds grid row `j`: the loop advances one row at a time and
     // the three live rows are consecutive, so their residues never collide.
     let mut band: [Vec<(f32, f32)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    // Cost, in the two terms `gridded_ledger` reads it in. Kept in registers
+    // across the cell loop and posted once, below.
     let mut drawn_cells: u64 = 0;
     let mut written_px: u64 = 0;
     let mut projected_to: Option<usize> = None;
+
+    // **Two rows of rects, never the window** — the same bound the projection
+    // band is held to, and for the same reason. `prev` is the row about to be
+    // filled and `cur` the row after it, which is what `prev`'s cells give
+    // their bottom rows up to. One `Option<CellRect>` per column of the window
+    // is 24 bytes: 336 KB at MRMS's 7000, against the 588 MB a rect per grid
+    // point would be at the zoomed-out window that holds all 24 500 000 of
+    // them. Columns outside the drawn range are `None` for the life of the
+    // raster and are never assigned, so no row pays to clear them.
+    let mut prev: Vec<Option<CellRect>> = vec![None; win_w];
+    let mut cur: Vec<Option<CellRect>> = vec![None; win_w];
+    let mut have_prev = false;
 
     let half_turn_px = half_turn_px(bounds, width);
 
@@ -2215,6 +2375,10 @@ pub fn rasterize_gridded(
         let at = |i: usize| here[i - win.i0];
 
         for i in draw.i0..draw.i1 {
+            // Assigned before any guard below can skip the cell: the buffer is
+            // reused row after row, and a `Some` surviving from the row before
+            // would be filled a second time at the wrong `y`.
+            cur[i - win.i0] = None;
             let Some(value) = input.value_at(i, j) else {
                 continue;
             };
@@ -2282,20 +2446,29 @@ pub fn rasterize_gridded(
             let y1 = ((cy + dy_down) as i32).min(height as i32 - 1);
 
             drawn_cells += 1;
-            written_px += (x1 - x0 + 1).max(0) as u64 * (y1 - y0 + 1).max(0) as u64;
-
-            for y in y0..=y1 {
-                let row_offset = (y as u32 * width * 4) as usize;
-                for x in x0..=x1 {
-                    let offset = row_offset + (x as u32 * 4) as usize;
-                    // Overwrite — no blending between adjacent grid cells.
-                    rgba[offset] = color[0];
-                    rgba[offset + 1] = color[1];
-                    rgba[offset + 2] = color[2];
-                    rgba[offset + 3] = color[3];
-                }
-            }
+            cur[i - win.i0] = Some(CellRect {
+                x0,
+                y0,
+                x1,
+                y1,
+                color,
+            });
         }
+
+        // Row `j - 1` is filled here rather than where it was sized, because
+        // what it may skip is decided by row `j`. The order the picture is
+        // written in is unchanged: rows still ascend and, inside a row,
+        // columns still ascend.
+        if have_prev {
+            emit_cell_row(&mut rgba, width, &mut prev, Some(&cur), &mut written_px);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+        have_prev = true;
+    }
+
+    // The last row has no row after it, so it gives up nothing downward.
+    if have_prev {
+        emit_cell_row(&mut rgba, width, &mut prev, None, &mut written_px);
     }
 
     gridded_ledger::record(
@@ -2355,6 +2528,9 @@ mod hit_cells_tests;
 
 #[cfg(test)]
 mod gmgsi_seam_probe_tests;
+
+#[cfg(test)]
+mod gridded_overdraw_tests;
 
 #[cfg(test)]
 mod seam_frame_tests;
