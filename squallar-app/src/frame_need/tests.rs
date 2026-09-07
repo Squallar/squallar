@@ -686,3 +686,72 @@ fn a_chunk_round_is_woken_by_the_worker_that_answers_it_not_by_a_poll() {
         }
     }
 }
+
+/// **The clock reclassification, with `drawn` as the control.**
+///
+/// A lane that improves a waste ratio by re-attributing frames has improved
+/// the ratio and nothing else, and the only thing separating an honest
+/// re-attribution from a flattering one is that the population is untouched.
+/// So the two arms here are the same sixty frames on the same schedule under
+/// the same claim, differing in one fact: whether the words on the glass
+/// moved. `drawn` is identical across both by assertion, not by inspection.
+///
+/// Arm B is also the shape the residual actually had. Those frames were
+/// charged to [`WakeClaim::Timed`] — a frame arriving on a clock with nothing
+/// to show — which is exactly what a frozen string on a live tick is, and
+/// exactly what a moving one is not.
+#[test]
+fn the_clock_cause_moves_frames_between_the_verdicts_and_never_the_denominator() {
+    const FRAMES: u32 = 60;
+
+    let mut moving = fresh();
+    for _ in 0..FRAMES {
+        moving.record_wake_claim(WakeClaim::Timed);
+        note(NeedCause::Clock);
+        moving.record(take());
+    }
+    // The tamper arm: identical frame count, identical claim, identical tick.
+    // The one difference is that nothing new was printed.
+    let mut frozen = fresh();
+    for _ in 0..FRAMES {
+        frozen.record_wake_claim(WakeClaim::Timed);
+        frozen.record(take());
+    }
+
+    let (moving, frozen) = (moving.reading(), frozen.reading());
+    assert_eq!(
+        (moving.drawn, frozen.drawn),
+        (u64::from(FRAMES), u64::from(FRAMES)),
+        "the two arms did not draw the same number of frames, so anything \
+         below is a comparison of two different runs",
+    );
+    assert_eq!(
+        (moving.needed, moving.unnecessary()),
+        (u64::from(FRAMES), 0),
+        "a frame that printed words nobody had seen was scored waste",
+    );
+    assert_eq!(
+        moving.cause(NeedCause::Clock),
+        u64::from(FRAMES),
+        "the clock cause was raised on every frame and the reading does not \
+         show it",
+    );
+    assert_eq!(
+        (frozen.needed, frozen.unnecessary()),
+        (0, u64::from(FRAMES)),
+        "with the words held still the frames must go back to waste; a \
+         reclassification that survives its own input being frozen is a \
+         threshold wearing a cause's name",
+    );
+    // And the waste lands where the real residual landed: on the timer.
+    assert_eq!(
+        (
+            frozen.charge(WakeClaim::Timed),
+            frozen.charge(WakeClaim::External),
+        ),
+        (u64::from(FRAMES) - 1, 1),
+        "the frozen arm's waste is not charged to the tick that bought it",
+    );
+    assert!(moving.charges_balance() && frozen.charges_balance());
+    assert!(moving.causes_cover_the_needed() && frozen.causes_cover_the_needed());
+}

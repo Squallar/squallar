@@ -3157,9 +3157,14 @@ var cadence_re = /frame cadence: n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|
 // genuinely requests every frame it wastes, so "egui asked" scores the defect
 // 100% NECESSARY. The causes are raised where a change actually happens -- an
 // event on the raw input, a message taken off a channel, a tile body handled,
-// an animation factor between its endpoints, a surface rebuilt -- and none is
-// reachable from a repaint ask. The ask is used only for `charged`.
-var frame_need_re = /frame need: (\d+) drawn, (\d+) needed, (\d+) unnecessary; caused input=(\d+) arrival=(\d+) animation=(\d+) surface=(\d+); charged upload=(\d+) render=(\d+) loop=(\d+) hold=(\d+) restore=(\d+) chunk=(\d+) drops=(\d+) gesture=(\d+) egui=(\d+) timed=(\d+) external=(\d+)/;
+// an animation factor between its endpoints, a surface rebuilt, a
+// clock-restated string printing DIFFERENT WORDS from the ones it last drew
+// -- and none is reachable from a repaint ask. The ask is used only for
+// `charged`. `clock` in particular is read off the WORDS and not off the tick
+// that armed the repaint: a widget re-arming a tick forever requests every
+// frame it wastes, so a cause taken from the tick would score that defect
+// necessary exactly as the repaint ask would.
+var frame_need_re = /frame need: (\d+) drawn, (\d+) needed, (\d+) unnecessary; caused input=(\d+) arrival=(\d+) animation=(\d+) surface=(\d+) clock=(\d+); charged upload=(\d+) render=(\d+) loop=(\d+) hold=(\d+) restore=(\d+) chunk=(\d+) drops=(\d+) gesture=(\d+) egui=(\d+) timed=(\d+) external=(\d+)/;
 // Scene E's denominators. `listed` is frame SLOTS across every animating
 // layer of every pane; `resident`, `in flight` and `failed` are DISJOINT
 // SUBSETS of it and are never added to it -- a slot may be none of the three.
@@ -3422,18 +3427,19 @@ for (var i = 0; i < C.length; i++) {
                    caused: { input: parseInt(x[4], 10),
                              arrival: parseInt(x[5], 10),
                              animation: parseInt(x[6], 10),
-                             surface: parseInt(x[7], 10) },
-                   charged: { upload: parseInt(x[8], 10),
-                              render: parseInt(x[9], 10),
-                              loop: parseInt(x[10], 10),
-                              hold: parseInt(x[11], 10),
-                              restore: parseInt(x[12], 10),
-                              chunk: parseInt(x[13], 10),
-                              drops: parseInt(x[14], 10),
-                              gesture: parseInt(x[15], 10),
-                              egui: parseInt(x[16], 10),
-                              timed: parseInt(x[17], 10),
-                              external: parseInt(x[18], 10) } };
+                             surface: parseInt(x[7], 10),
+                             clock: parseInt(x[8], 10) },
+                   charged: { upload: parseInt(x[9], 10),
+                              render: parseInt(x[10], 10),
+                              loop: parseInt(x[11], 10),
+                              hold: parseInt(x[12], 10),
+                              restore: parseInt(x[13], 10),
+                              chunk: parseInt(x[14], 10),
+                              drops: parseInt(x[15], 10),
+                              gesture: parseInt(x[16], 10),
+                              egui: parseInt(x[17], 10),
+                              timed: parseInt(x[18], 10),
+                              external: parseInt(x[19], 10) } };
     frame_need_all.push(frame_need);
   }
   x = loop_state_re.exec(m);
@@ -8098,9 +8104,10 @@ def run_smoke(args):
                  "n/a" if not drawn
                  else round(100.0 * (fn_.get("unnecessary") or 0) / drawn, 1)))
         print("[%s] SUMMARY frame need caused (OVERLAPPING, never added): "
-              "input=%s arrival=%s animation=%s surface=%s"
+              "input=%s arrival=%s animation=%s surface=%s clock=%s"
               % (tag, caused.get("input"), caused.get("arrival"),
-                 caused.get("animation"), caused.get("surface")))
+                 caused.get("animation"), caused.get("surface"),
+                 caused.get("clock")))
         print("[%s] SUMMARY frame need charged (one per unnecessary frame, "
               "sums to `unnecessary`): upload=%s render=%s loop=%s hold=%s "
               "restore=%s chunk=%s drops=%s gesture=%s egui=%s timed=%s "

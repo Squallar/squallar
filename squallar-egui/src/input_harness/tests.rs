@@ -4534,6 +4534,157 @@ fn the_status_bar_countdown_pays_for_its_own_frames_and_nothing_else_does() {
     );
 }
 
+/// One frame's worth of published radar liveness with the live tilt `secs`
+/// seconds old — everything else at a value that changes nothing the status
+/// bar's auto-poll chip prints.
+fn publish_tilt_age(h: &mut InputHarness, secs: u64) {
+    let liveness = vec![crate::radar_layer::liveness_entry(
+        crate::radar_layer::RadarLiveness {
+            chunk_status: squallar_radar::chunk_feed::ChunkFeedStatus {
+                feeding: true,
+                retired: false,
+                interval_secs: 5,
+                pushed: true,
+                tilt: Some(squallar_radar::chunk_feed::TiltFreshness {
+                    elevation: 0.5,
+                    data_age_secs: secs,
+                }),
+            },
+            current_volumes: std::collections::HashMap::new(),
+        },
+    )];
+    h.gui_mut()
+        .apply_frame_inputs(crate::shell_api::FrameInputs {
+            safe_area_insets: (0.0, 0.0, 0.0, 0.0),
+            supports_exit: true,
+            loop_frame_budget: 8,
+            concurrent_renders: 2,
+            tile_cache: squallar_device_profile::budget::TileCacheBudget {
+                styled_bytes: 1 << 20,
+                parsed_bytes: 1 << 20,
+                terrain_bytes: 1 << 20,
+                whole_zoom: false,
+            },
+            overlay_overdraw: 0.0,
+            location_settings_available: false,
+            location: (squallar_location::LocationPermission::Denied, false),
+            gps: None,
+            user_heading: None,
+            catalogue_pending: false,
+            liveness: &liveness,
+            floor_tile_zoom_bias: 0,
+            mirror_plan_stamp: 0,
+            frame_diagnostics: None,
+            budget_readout: None,
+            admission: None,
+            admission_notice: None,
+        });
+}
+
+/// **The real status bar, driven: the clock cause fires on the frames the age
+/// string changes on and on no others.**
+///
+/// `ui_statusbar::age_tick` arms a repaint every second and the age string
+/// genuinely moves every second, so those frames needed drawing. Measured on
+/// an idle app after the chunk-poll fix ("a chunk round in flight re-armed the
+/// loop on every frame…"), they were 495 of the 720 unnecessary frames left.
+/// The unit tests beside `note_clock_change` hold the helper; this holds the
+/// **widget**, because the claim is about what the status bar does and a
+/// helper wired to nothing would leave every one of those green.
+///
+/// The second half is the tamper. With the published age held still the tick
+/// is still armed and the chip is still drawn, and not one of those frames may
+/// be called necessary — a reclassification that survived its own input being
+/// frozen would be a threshold wearing a cause's name.
+#[test]
+fn the_live_age_string_raises_the_clock_cause_only_when_its_words_move() {
+    use crate::frame_need::{NeedCause, take};
+
+    /// One frame, with the register read for that frame alone.
+    fn judged(h: &mut InputHarness) -> bool {
+        let _ = take();
+        h.frame();
+        take() & NeedCause::Clock.bit() != 0
+    }
+    fn chip_text(h: &InputHarness) -> String {
+        h.status_bar()
+            .poll_chip
+            .expect("the wide status bar lost its auto-poll chip")
+            .1
+    }
+
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+    publish_tilt_age(&mut h, 10);
+    h.warm_up();
+    assert!(
+        chip_text(&h).contains("10s old"),
+        "precondition: the chip is printing the published live age, got {:?}",
+        chip_text(&h),
+    );
+    assert_eq!(
+        h.gui_mut().status_tick_delay(),
+        Some(std::time::Duration::from_secs(1)),
+        "precondition: an age on screen is owed a frame a second, and it is \
+         those frames this cause is about",
+    );
+
+    // Thirty seconds of the beam coming back round, one frame each. Every one
+    // shows a number nobody has seen.
+    for secs in 11..=40u64 {
+        publish_tilt_age(&mut h, secs);
+        assert!(
+            judged(&mut h),
+            "the chip went to {secs}s old and raised no clock cause, so a \
+             frame that showed new words is scored waste",
+        );
+        assert!(
+            chip_text(&h).contains(&format!("{secs}s old")),
+            "the chip did not print the age this frame was judged on, got {:?}",
+            chip_text(&h),
+        );
+    }
+
+    // **The tamper.** Same published age, same armed tick, same drawn chip.
+    let frozen = chip_text(&h);
+    for _ in 0..30 {
+        publish_tilt_age(&mut h, 40);
+        assert!(
+            !judged(&mut h),
+            "a frame that redrew {frozen:?} unchanged was called necessary",
+        );
+    }
+    assert_eq!(
+        chip_text(&h),
+        frozen,
+        "the tamper did not hold the words still, so the zero above is about \
+         a chip that stopped drawing rather than about a chip repeating itself",
+    );
+    assert_eq!(
+        h.gui_mut().status_tick_delay(),
+        Some(std::time::Duration::from_secs(1)),
+        "the tick stopped being armed under the tamper, so those thirty \
+         frames were never bought and the tamper proved nothing",
+    );
+
+    // And the first ten seconds of a tilt, where the tick fires and
+    // `describe_age` prints "just now" throughout: still waste, still counted.
+    publish_tilt_age(&mut h, 0);
+    assert!(
+        judged(&mut h),
+        "precondition: the words moved to \"just now\""
+    );
+    for secs in 1..=9u64 {
+        publish_tilt_age(&mut h, secs);
+        assert!(
+            !judged(&mut h),
+            "{secs}s still reads \"just now\" and the frame was called \
+             necessary anyway",
+        );
+    }
+    assert!(chip_text(&h).contains("just now"));
+}
+
 /// The phone shell draws no status bar at all (plan §1.6), so it owes no frames to
 /// a chip it never drew — the same claim as above, reached by the other route into
 /// the absence.

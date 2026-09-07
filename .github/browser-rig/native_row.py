@@ -2357,7 +2357,7 @@ def build_row(args, scraped, probes):
     # against a segment family's `n`.
     #
     # Three groups, three denominators, never added across: `needed +
-    # unnecessary == drawn`; the four `caused` counts OVERLAP and sum to at
+    # unnecessary == drawn`; the five `caused` counts OVERLAP and sum to at
     # least `needed`; the eleven `charged` counts are one per unnecessary
     # frame and sum to `unnecessary`. Both identities are asserted below rather than
     # assumed -- a windowed difference of two running totals is where a
@@ -2373,16 +2373,16 @@ def build_row(args, scraped, probes):
     else:
         frame_need = {
             "drawn": fnd[0], "needed": fnd[1], "unnecessary": fnd[2],
-            "caused": dict(zip(("input", "arrival", "animation", "surface"),
-                               fnd[3:7])),
+            "caused": dict(zip(("input", "arrival", "animation",
+                                "surface", "clock"), fnd[3:8])),
             "charged": dict(zip(("upload", "render", "loop", "hold",
                                  "restore", "chunk", "drops", "gesture",
-                                 "egui", "timed", "external"), fnd[7:18])),
+                                 "egui", "timed", "external"), fnd[8:19])),
             # The two conservation laws, computed over the WINDOW. False is a
             # reader or an app defect, never a property of the scene, so the
             # row prints the flag beside the figures instead of hiding it.
             "partitions": fnd[1] + fnd[2] == fnd[0],
-            "charges_balance": sum(fnd[7:18]) == fnd[2],
+            "charges_balance": sum(fnd[8:19]) == fnd[2],
         }
 
     # Basemap state, on `run_measure.sh`'s own two-counter terms.
@@ -2727,8 +2727,9 @@ def print_row(row):
         c = fn_["caused"]
         print(
             "ROW   frame need caused (OVERLAPPING, never added to each "
-            "other): input=%s arrival=%s animation=%s surface=%s"
-            % (c["input"], c["arrival"], c["animation"], c["surface"])
+            "other): input=%s arrival=%s animation=%s surface=%s clock=%s"
+            % (c["input"], c["arrival"], c["animation"], c["surface"],
+               c["clock"])
         )
         g = fn_["charged"]
         print(
@@ -5352,7 +5353,7 @@ class FrameNeedTests(unittest.TestCase):
     """
 
     LINE = ("[..] INFO frame need: %d drawn, %d needed, %d unnecessary; "
-            "caused input=%d arrival=%d animation=%d surface=%d; "
+            "caused input=%d arrival=%d animation=%d surface=%d clock=%d; "
             "charged upload=%d render=%d loop=%d hold=%d restore=%d "
             "chunk=%d drops=%d gesture=%d egui=%d timed=%d external=%d")
 
@@ -5371,7 +5372,7 @@ class FrameNeedTests(unittest.TestCase):
     def _at(self, n):
         """A reading at `n` frames, all of them unnecessary and charged to the
         immediate-repaint arm -- the self-nudging map's shape."""
-        return self.LINE % (n, 0, n, 0, 0, 0, 0,
+        return self.LINE % (n, 0, n, 0, 0, 0, 0, 0,
                             0, 0, 0, 0, 0, 0, 0, 0, n, 0, 0)
 
     def test_the_probe_is_drive_pys_own(self):
@@ -5380,11 +5381,61 @@ class FrameNeedTests(unittest.TestCase):
         self.assertIn("frame need: (", drive_pattern("frame_need_re"))
         self.assertIn("charged upload=", drive_pattern("frame_need_re"))
 
+    def test_drive_py_reads_each_group_into_the_field_it_belongs_to(self):
+        """The POSITIONAL half, which no other check covers.
+
+        The test above proves the two halves of the rig read one pattern, and
+        the Rust pin proves that pattern still matches the sentence. Neither
+        says a word about which capture group drive.py assigns to which field
+        name -- and a cause or a claim inserted mid-line shifts every group
+        after it while leaving both of those green. The artifact would then
+        carry one figure under another figure's name, silently, which is the
+        same shape as the drift that left the native reader a field behind and
+        printing `n/a`.
+        """
+        text = _read(DRIVE_PY)
+        pattern = drive_pattern("frame_need_re", text)
+        # A distinct value per field, so a swapped pair cannot read as a match.
+        fields = [
+            ("drawn", 12345), ("needed", 12000), ("unnecessary", 345),
+            ("input", 900), ("arrival", 11000), ("animation", 400),
+            ("surface", 3), ("clock", 120),
+            ("upload", 5), ("render", 10), ("loop", 11), ("hold", 2),
+            ("restore", 12), ("chunk", 1), ("drops", 13), ("gesture", 14),
+            ("egui", 295), ("timed", 30), ("external", 2),
+        ]
+        line = (
+            "frame need: %d drawn, %d needed, %d unnecessary; caused "
+            "input=%d arrival=%d animation=%d surface=%d clock=%d; charged "
+            "upload=%d render=%d loop=%d hold=%d restore=%d chunk=%d "
+            "drops=%d gesture=%d egui=%d timed=%d external=%d"
+            % tuple(v for _, v in fields)
+        )
+        m = re.search(pattern, line)
+        self.assertIsNotNone(m, "drive.py's probe no longer matches the line")
+        groups = m.groups()
+        self.assertEqual(len(groups), len(fields))
+        # The `<field>: parseInt(x[N], 10)` assignments in the block that runs
+        # on a match, read out of drive.py itself.
+        body = text[text.index("x = frame_need_re.exec(m);"):]
+        body = body[:body.index("frame_need_all.push")]
+        assigned = re.findall(r"(\w+): parseInt\(x\[(\d+)\], 10\)", body)
+        self.assertEqual(
+            [name for name, _ in assigned], [name for name, _ in fields],
+            "drive.py reads a different set of fields, or reads them in a "
+            "different order, from the ones the line carries")
+        for (name, expected), (_, at) in zip(fields, assigned):
+            self.assertEqual(
+                int(groups[int(at) - 1]), expected,
+                "drive.py reads group %s into `%s`, which carries %s and not "
+                "%s -- the artifact labels one figure with another's name"
+                % (at, name, groups[int(at) - 1], expected))
+
     def test_the_line_scrapes_with_every_group_mandatory(self):
         m = self.probes["frame_need_re"].search(self._at(240))
         self.assertIsNotNone(m)
         g = [int(x) for x in m.groups()]
-        self.assertEqual(len(g), 18)
+        self.assertEqual(len(g), 19)
         self.assertEqual(g[0], 240)
         # A field dropped anywhere stops the match dead, which is what keeps a
         # partial reading from arriving as a full one.
@@ -5419,6 +5470,11 @@ class FrameNeedTests(unittest.TestCase):
         self.assertIn("ROW   frame need: ", text)
         self.assertIn("100.0%", text)
         self.assertIn("ROW   frame need charged", text)
+        # Every field the pattern reads is printed: a figure parsed into the
+        # row and left out of its own line is invisible to whoever runs the
+        # leg. Asserted as an adjacent PAIR so a field appended to the line and
+        # forgotten in this print cannot pass on the older field alone.
+        self.assertIn("surface=0 clock=0", text)
         self.assertNotIn("BROKEN over this window", text)
 
     def test_a_window_whose_identities_fail_is_printed_as_an_instrument_failure(self):
@@ -5432,7 +5488,7 @@ class FrameNeedTests(unittest.TestCase):
             if "gesture script pan-zoom-2d loop complete" in line:
                 seen += 1
                 # `needed + unnecessary != drawn`, and nothing charged.
-                out.append(self.LINE % (100 * seen, 0, 0, 0, 0, 0, 0,
+                out.append(self.LINE % (100 * seen, 0, 0, 0, 0, 0, 0, 0,
                                         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
         _row, text = self._row(out)
         self.assertIn("BROKEN over this window", text)

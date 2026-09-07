@@ -1848,11 +1848,12 @@ fn native_row_line(values: &[&str]) -> String {
 #[test]
 fn the_frame_need_line_reads_exactly_as_pinned() {
     use crate::frame_need::Reading;
+    use squallar_egui::frame_need::NeedCause;
 
     let r = Reading {
         drawn: 12_345,
         needed: 12_000,
-        causes: [900, 11_000, 400, 3],
+        causes: [900, 11_000, 400, 3, 120],
         charged: [5, 10, 0, 2, 0, 1, 0, 0, 295, 30, 2],
     };
     // The verdict is arithmetic on the two counts, never a third counter that
@@ -1862,13 +1863,14 @@ fn the_frame_need_line_reads_exactly_as_pinned() {
     assert!(r.causes_cover_the_needed());
 
     let expected = "frame need: 12345 drawn, 12000 needed, 345 unnecessary; \
-                    caused input=900 arrival=11000 animation=400 surface=3; \
-                    charged upload=5 render=10 loop=0 hold=2 restore=0 chunk=1 \
-                    drops=0 gesture=0 egui=295 timed=30 external=2";
+                    caused input=900 arrival=11000 animation=400 surface=3 \
+                    clock=120; charged upload=5 render=10 loop=0 hold=2 \
+                    restore=0 chunk=1 drops=0 gesture=0 egui=295 timed=30 \
+                    external=2";
     assert_eq!(super::frame_need_line(&r), expected);
-    const FIELDS: [&str; 18] = [
-        "12345", "12000", "345", "900", "11000", "400", "3", "5", "10", "0", "2", "0", "1", "0",
-        "0", "295", "30", "2",
+    const FIELDS: [&str; 19] = [
+        "12345", "12000", "345", "900", "11000", "400", "3", "120", "5", "10", "0", "2", "0", "1",
+        "0", "0", "295", "30", "2",
     ];
     assert_eq!(
         super::frame_need_line(&r),
@@ -1888,15 +1890,14 @@ fn the_frame_need_line_reads_exactly_as_pinned() {
     // names the claims, in order, to key the charge map it prints, and a
     // template can still be right while those names are reordered or one is
     // missing. Read from the file, checked against the enum.
-    let keys = {
-        const HEAD: &str = "\"charged\": dict(zip((";
+    let names_after = |head: &str, what: &str| -> Vec<String> {
         let at = NATIVE_ROW_PY
-            .find(HEAD)
-            .expect("native_row.py no longer keys its charge map by name");
-        let rest = &NATIVE_ROW_PY[at + HEAD.len()..];
-        let end = rest
-            .find("), fnd[")
-            .expect("native_row.py's charge key tuple is not closed as this test expects");
+            .find(head)
+            .unwrap_or_else(|| panic!("native_row.py no longer keys its {what} map by name"));
+        let rest = &NATIVE_ROW_PY[at + head.len()..];
+        let end = rest.find("), fnd[").unwrap_or_else(|| {
+            panic!("native_row.py's {what} key tuple is not closed as this test expects")
+        });
         rest[..end]
             .split('"')
             .skip(1)
@@ -1904,6 +1905,21 @@ fn the_frame_need_line_reads_exactly_as_pinned() {
             .map(str::to_owned)
             .collect::<Vec<_>>()
     };
+    let keys = names_after("\"charged\": dict(zip((", "charge");
+    // The same hold on the CAUSE names, and it is not symmetry for its own
+    // sake: the charge names were held and the cause names were not, so a
+    // cause added to the enum and forgotten in this tuple would have gone on
+    // labelling one cause's count with the next cause's name — silently, since
+    // `zip` stops at the shorter side and drops the tail without a word.
+    assert_eq!(
+        names_after("\"caused\": dict(zip((", "cause"),
+        NeedCause::ALL
+            .iter()
+            .map(|c| c.name().to_owned())
+            .collect::<Vec<_>>(),
+        "native_row.py names the causes differently from `NeedCause::ALL`, so \
+         its rows label one cause's count with another cause's name",
+    );
     let claims: Vec<String> = crate::frame_need::WakeClaim::ALL
         .iter()
         .map(|c| c.name().to_owned())
@@ -1913,8 +1929,14 @@ fn the_frame_need_line_reads_exactly_as_pinned() {
         "native_row.py names the charges differently from `WakeClaim::ALL`, \
          so its rows label one claim's count with another claim's name",
     );
+    // The charge slice starts past every cause, so a cause added without
+    // moving this slice hands the charge map a cause count and drops a claim.
+    let charges_at = NeedCause::COUNT + 3;
     assert!(
-        NATIVE_ROW_PY.contains(&format!("), fnd[7:{}])),", 7 + claims.len())),
+        NATIVE_ROW_PY.contains(&format!(
+            "), fnd[{charges_at}:{}])),",
+            charges_at + claims.len()
+        )),
         "native_row.py slices a different number of charges than there are \
          claims, so the charge map it builds is short or over-long",
     );
@@ -1922,8 +1944,9 @@ fn the_frame_need_line_reads_exactly_as_pinned() {
     assert_eq!(
         super::frame_need_line(&Reading::default()),
         "frame need: 0 drawn, 0 needed, 0 unnecessary; caused input=0 \
-         arrival=0 animation=0 surface=0; charged upload=0 render=0 loop=0 \
-         hold=0 restore=0 chunk=0 drops=0 gesture=0 egui=0 timed=0 external=0",
+         arrival=0 animation=0 surface=0 clock=0; charged upload=0 render=0 \
+         loop=0 hold=0 restore=0 chunk=0 drops=0 gesture=0 egui=0 timed=0 \
+         external=0",
     );
 }
 

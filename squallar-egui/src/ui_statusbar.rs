@@ -128,6 +128,15 @@ impl super::Gui {
                             &crate::radar_layer::chunk_status(self.liveness()),
                         );
                         self.status_bar_tick = drawn.as_ref().and_then(|&(_, _, tick)| tick);
+                        // **The chip is the one thing on this bar that
+                        // restates the clock**, and the tick set on the line
+                        // above is what buys the frames that restate it. Those
+                        // frames needed drawing exactly when the words moved,
+                        // which is a fact about the words — see
+                        // `note_clock_change`.
+                        if let Some((_, label, _)) = drawn.as_ref() {
+                            note_clock_change(&mut self.status_bar_chip_text, label);
+                        }
                         #[cfg(test)]
                         {
                             probe.poll_chip = drawn.map(|(rect, label, _)| (rect, label));
@@ -216,7 +225,46 @@ fn describe_age(secs: u64) -> String {
     }
 }
 
+/// Raise [`crate::frame_need::NeedCause::Clock`] when the auto-poll chip is
+/// about to draw **different words** from the ones it last drew, and remember
+/// the new ones. Reports whether it raised.
+///
+/// # Why this reads the string and not the tick
+///
+/// [`age_tick`] arms a repaint every second and [`describe_age`] prints "just
+/// now" throughout a tilt's first ten seconds, so a cause taken off the tick
+/// would call the nine frames inside that window necessary while they showed
+/// nothing new — a reclassification by timing, which is the one thing
+/// `crate::frame_need`'s design refuses. The
+/// words are the picture; a tick that repaints the same words is still waste
+/// and this leaves it counted as waste.
+///
+/// # What `last` holds
+///
+/// What this chip last **drew**, not what is on the glass. A bar that is off —
+/// Compact, or faded out — draws no chip and leaves the slot standing, so a
+/// bar returning to the same words raises nothing. The chip appearing at all
+/// with words in it is a change and does raise, once.
+///
+/// One `String` allocation per **change**; an idle frame costs the comparison
+/// and nothing else.
+fn note_clock_change(last: &mut Option<String>, text: &str) -> bool {
+    if last.as_deref() == Some(text) {
+        return false;
+    }
+    *last = Some(text.to_owned());
+    crate::frame_need::note(crate::frame_need::NeedCause::Clock);
+    true
+}
+
 /// How often [`describe_age`] would print something new at this age.
+///
+/// **A ceiling on the words moving, not a promise that they will.** Below ten
+/// seconds [`describe_age`] prints "just now" throughout and this still asks
+/// for a frame a second; that is why [`note_clock_change`] reads the string
+/// rather than trusting this. Above ninety the string moves once a minute but
+/// on `(s + 30) % 60`'s phase, which this sixty-second period does not know,
+/// so a minute reading can sit up to a period stale.
 fn age_tick(secs: u64) -> std::time::Duration {
     if secs < 90 {
         std::time::Duration::from_secs(1)
@@ -513,5 +561,138 @@ mod age_wording_tests {
         assert_eq!(describe_age(90), "2m old");
         assert_eq!(describe_age(120), "2m old");
         assert_eq!(describe_age(330), "6m old");
+    }
+}
+
+/// **The clock cause, held to the words rather than to the tick.**
+///
+/// The status bar's age string is a picture that moves on a clock and, until
+/// this cause existed, told nobody: `age_tick` armed a repaint a second and
+/// every one of the frames it bought was scored waste. The reclassification is
+/// only honest if it is exact in both directions, so both are held here — the
+/// frames where the words move, and the frames where the same tick fires and
+/// they do not.
+#[cfg(test)]
+mod clock_cause_tests {
+    use super::{age_tick, describe_age, note_clock_change};
+    use crate::frame_need::{NeedCause, take};
+
+    /// One frame of the chip, answered **through the register** rather than
+    /// through the helper's return value: the register is what the verdict
+    /// reads, and a helper that returned `true` and raised nothing would be
+    /// exactly the failure this is here to exclude.
+    fn frame(last: &mut Option<String>, text: &str) -> bool {
+        let _ = take();
+        let said = note_clock_change(last, text);
+        let raised = take() & NeedCause::Clock.bit() != 0;
+        assert_eq!(
+            said, raised,
+            "`note_clock_change` reported {said} and raised {raised}: what it \
+             says and what the verdict reads have come apart",
+        );
+        raised
+    }
+
+    /// **The same words raise nothing; different words raise once.**
+    #[test]
+    fn the_cause_follows_the_words_and_not_the_call() {
+        let mut last = None;
+        assert!(
+            frame(&mut last, "10s old"),
+            "the chip drew words where there had been none and raised nothing",
+        );
+        for _ in 0..10 {
+            assert!(
+                !frame(&mut last, "10s old"),
+                "redrawing the same words raised a cause, so a tick that shows \
+                 nothing new is being called a necessary frame",
+            );
+        }
+        assert!(frame(&mut last, "11s old"));
+        assert!(!frame(&mut last, "11s old"));
+    }
+
+    /// **The seconds the tick buys and the words do not move.**
+    ///
+    /// `age_tick` asks for a frame a second across the whole sub-ninety range,
+    /// but `describe_age` prints "just now" throughout a tilt's first ten
+    /// seconds — so nine of the frames that window buys are waste and must
+    /// stay counted as waste. This is the half of the reclassification that
+    /// does not flatter the app, and a cause taken off the tick instead of off
+    /// the string would lose it.
+    #[test]
+    fn the_just_now_window_of_a_tilt_is_still_waste() {
+        for secs in 0..90 {
+            assert_eq!(
+                age_tick(secs),
+                std::time::Duration::from_secs(1),
+                "precondition: this range is where the chip asks for a frame a \
+                 second, and {secs}s does not",
+            );
+        }
+        let mut last = Some(describe_age(0));
+        let mut raised = 0;
+        for secs in 1..=9 {
+            raised += u32::from(frame(&mut last, &describe_age(secs)));
+        }
+        assert_eq!(
+            raised, 0,
+            "the chip printed \"just now\" throughout and {raised} of those \
+             nine tick-bought frames were called necessary",
+        );
+    }
+
+    /// **And the seconds where the words really do move are paid for.**
+    ///
+    /// The other direction, over the range `describe_age` prints seconds in:
+    /// every one of these frames shows a number nobody had seen, so every one
+    /// of them raises.
+    #[test]
+    fn every_second_of_the_seconds_range_shows_new_words() {
+        let mut last = Some(describe_age(10));
+        for secs in 11..=89 {
+            assert!(
+                frame(&mut last, &describe_age(secs)),
+                "the chip went from {:?} to {:?} and raised nothing",
+                describe_age(secs - 1),
+                describe_age(secs),
+            );
+        }
+        // Past ninety it is minutes, and the words stop moving every second
+        // even though the age keeps climbing.
+        assert!(frame(&mut last, &describe_age(90)));
+        for secs in 91..=120 {
+            assert!(
+                !frame(&mut last, &describe_age(secs)),
+                "{secs}s reads the same as {}s and raised a cause",
+                secs - 1,
+            );
+        }
+    }
+
+    /// **The tamper: freeze the string and the frames go back to waste.**
+    ///
+    /// A reclassification that survives its own input being frozen is not a
+    /// reclassification, it is a threshold wearing a cause's name. Here the
+    /// tick still fires sixty times, the chip is still drawn sixty times, and
+    /// with the words held still not one of those frames is called necessary.
+    #[test]
+    fn a_frozen_string_buys_no_frames_at_all() {
+        const FROZEN_AGE: u64 = 42;
+        let mut last = Some(describe_age(FROZEN_AGE));
+        let mut raised = 0;
+        for _ in 0..60 {
+            assert_eq!(
+                age_tick(FROZEN_AGE),
+                std::time::Duration::from_secs(1),
+                "precondition: the tick is still armed while the words are held",
+            );
+            raised += u32::from(frame(&mut last, &describe_age(FROZEN_AGE)));
+        }
+        assert_eq!(
+            raised, 0,
+            "{raised} of sixty frames were called necessary while the words on \
+             screen never changed",
+        );
     }
 }

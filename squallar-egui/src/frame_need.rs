@@ -40,8 +40,11 @@
 //!   playing, or an egui widget animation still between its endpoints.
 //! * [`NeedCause::Surface`] — the surface the frame draws into changed: a
 //!   resize, a scale-factor or theme change, a renderer built.
+//! * [`NeedCause::Clock`] — a value the picture restates from the clock
+//!   printed **different words** this frame. Read off the words, never off the
+//!   tick that armed the repaint; see the variant.
 //!
-//! None of the four is reachable from a repaint request. A frame that raises
+//! None of the five is reachable from a repaint request. A frame that raises
 //! none of them is one the application drew for its own reasons with nothing
 //! to show, and `squallar-app` charges it to the claim that kept the app
 //! awake — which **is** the repaint ask, used for attribution and never for
@@ -68,13 +71,21 @@
 //! # What this cannot see, stated rather than discovered
 //!
 //! The cause list is a **declared** set, and an animating picture whose driver
-//! raises none of the four is scored unnecessary — an over-report, which is
-//! the worse direction here because it is what makes an instrument
-//! unbelievable. Two are known and covered by construction: egui's own widget
-//! animations (through [`animate_bool`], the one spelling this crate
-//! uses) and loop playback. A future picture that moves on a clock and tells
-//! nobody would read as waste; the reading is then a hole in this list, and
-//! the fix is a `note` at the site that moves it, never a threshold here.
+//! raises none of them is scored unnecessary — an over-report, which is the
+//! worse direction here because it is what makes an instrument unbelievable.
+//! Two are covered by construction: egui's own widget animations (through
+//! [`animate_bool`], the one spelling this crate uses) and loop playback.
+//!
+//! A third was the hole this doc predicted and [`NeedCause::Clock`] closed. A
+//! picture that moves on a clock and tells nobody read as waste, and one such
+//! picture was already on screen: `ui_statusbar`'s auto-poll chip arms a one
+//! second repaint and its age string genuinely changes every second. Measured
+//! on an idle app after the chunk-poll fix ("a chunk round in flight re-armed
+//! the loop on every frame…"), 495 of the 720 unnecessary frames left were
+//! frames that showed new words. The fix was the one this paragraph named — a `note` at the site that
+//! moves the picture, never a threshold here — and the site reads the **words
+//! back**, so the ten seconds `describe_age` spends printing "just now" while
+//! the same tick fires are still waste and are still counted as waste.
 
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -105,15 +116,36 @@ pub enum NeedCause {
     /// The surface changed under the frame: a resize, a scale-factor or theme
     /// change, or the renderer being built.
     Surface,
+    /// A value the picture restates from the clock printed **different words**
+    /// this frame.
+    ///
+    /// **The words, never the schedule.** A timed repaint is an ask, and an
+    /// ask is precisely the denominator this instrument refuses: a widget that
+    /// re-arms a tick forever genuinely requests every frame it wastes. So the
+    /// raiser compares the string it is about to draw with the one it drew
+    /// last, and a tick that repaints the same words raises nothing and stays
+    /// waste. That keeps this a cause — something changed — rather than a
+    /// threshold that reclassifies by timing.
+    ///
+    /// Distinct from [`Self::Animation`] on purpose. Folding clock-restated
+    /// text into the animation bucket would hide how many frames a product
+    /// decision to print a moving number costs, which is the question a reader
+    /// of this figure most wants to ask.
+    Clock,
 }
 
 impl NeedCause {
     /// Every variant, in the order [`Self::index`] assigns.
-    pub const ALL: [Self; Self::COUNT] =
-        [Self::Input, Self::Arrival, Self::Animation, Self::Surface];
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Input,
+        Self::Arrival,
+        Self::Animation,
+        Self::Surface,
+        Self::Clock,
+    ];
 
     /// How many causes there are — the width of the reader's counter array.
-    pub const COUNT: usize = 4;
+    pub const COUNT: usize = 5;
 
     /// This cause's slot in [`Self::ALL`] and in the reader's array.
     pub const fn index(self) -> usize {
@@ -122,6 +154,7 @@ impl NeedCause {
             Self::Arrival => 1,
             Self::Animation => 2,
             Self::Surface => 3,
+            Self::Clock => 4,
         }
     }
 
@@ -137,6 +170,7 @@ impl NeedCause {
             Self::Arrival => "arrival",
             Self::Animation => "animation",
             Self::Surface => "surface",
+            Self::Clock => "clock",
         }
     }
 }
@@ -195,10 +229,11 @@ pub fn peek() -> u32 {
 /// `Context::animate_bool_with_time`, and **the one spelling this workspace
 /// uses** — held by `the_animation_cause_has_no_bypass_in_the_ui_layer`.
 ///
-/// egui's animation is the one picture-mover in the tree that neither the
-/// input register nor an arrival can see: a drawer sliding, a status bar
-/// expanding, a toast fading. Those frames genuinely need drawing, so without
-/// this the verdict would call every one of them unnecessary — an over-report,
+/// egui's animation is one of the two picture-movers in the tree that neither
+/// the input register nor an arrival can see: a drawer sliding, a status bar
+/// expanding, a toast fading. (The other is clock-restated text —
+/// [`NeedCause::Clock`].) Those frames genuinely need drawing, so without this
+/// the verdict would call every one of them unnecessary — an over-report,
 /// which is the failure that makes an instrument ignored.
 ///
 /// **The test is the factor, not the ask.** A factor strictly between the two
@@ -227,7 +262,7 @@ mod tests {
     /// with a duplicated `index` would collide silently, and a frame raising
     /// both would report one.
     #[test]
-    fn the_four_causes_occupy_four_distinct_bits() {
+    fn every_cause_occupies_a_bit_of_its_own() {
         let mut seen = 0u32;
         for cause in NeedCause::ALL {
             assert_eq!(

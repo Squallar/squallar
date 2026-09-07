@@ -40,9 +40,10 @@
 //! actually happens and none of them reachable from a repaint request — an
 //! input event read off the raw input egui is about to be handed, a message
 //! taken off a channel, a tile body handled, an animation factor strictly
-//! between its endpoints, a surface rebuilt. A frame that raises one of those
-//! needed drawing. A frame that raises none is one the application drew for
-//! its own reasons with nothing to show.
+//! between its endpoints, a surface rebuilt, a clock-restated string printing
+//! different words from the ones it last printed. A frame that raises one of
+//! those needed drawing. A frame that raises none is one the application drew
+//! for its own reasons with nothing to show.
 //!
 //! The repaint ask is used, and only here: to say **who**. [`WakeClaim`] is
 //! the attribution, on `RerenderReason`'s terms — a bare percentage nobody can
@@ -163,6 +164,13 @@ pub(crate) enum WakeClaim {
     /// auto-poll deadline was what the loop was waiting on. A frame arriving
     /// on a timer with nothing to show is a timer set too fast, which is a
     /// different fix from a widget nudging itself.
+    ///
+    /// **"With nothing to show" is the load-bearing half**, and it used not to
+    /// be true of this bucket. A timed repaint whose text genuinely moves
+    /// raises [`NeedCause::Clock`] at the site that moves it and is never
+    /// judged here at all; what is left is the timer that fires and changes
+    /// nothing. Before that cause existed this bucket held both, and it was
+    /// two frames in three on an idle app.
     Timed,
     /// **Nobody asked.** No claim stood and egui was idle; the frame came from
     /// the platform. See the type note.

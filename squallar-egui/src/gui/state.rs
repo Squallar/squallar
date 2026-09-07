@@ -264,6 +264,14 @@ pub struct Gui {
     /// would read differently, or `None` when nothing it drew restates the
     /// clock.
     pub(super) status_bar_tick: Option<std::time::Duration>,
+    /// The words the auto-poll chip drew the **last time it drew any** — what
+    /// `ui_statusbar::note_clock_change` compares against, so a frame the tick
+    /// above bought is called necessary only when the words actually moved.
+    ///
+    /// Session-only and deliberately never persisted: it describes the glass,
+    /// not a preference, and a restored copy would claim a chip had drawn
+    /// words this process has never drawn.
+    pub(super) status_bar_chip_text: Option<String>,
     /// Whether the layer catalog is open. Session-only, like every other
     /// open-surface flag; opened by the stack's two `+ Show a layer` buttons
     /// and closed by applying a tile, the `✕`, the backdrop, or
@@ -662,6 +670,7 @@ impl Gui {
             statusbar_collapsed: false,
             statusbar_rect: None,
             status_bar_tick: None,
+            status_bar_chip_text: None,
             catalog_open: false,
             catalog_query: String::new(),
             catalog_save_name: String::new(),
