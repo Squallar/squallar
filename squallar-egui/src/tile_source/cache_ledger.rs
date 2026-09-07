@@ -329,14 +329,57 @@ impl RoleLedger {
     }
 }
 
-/// `static` rather than owned by a source because the report wants every
+/// One set rather than a set owned by a source, because the report wants every
 /// source of a role in one reading, and because a role can outlive any one
 /// source (the base map is rebuilt on a theme change).
-static LEDGER: [RoleLedger; ROLES.len()] = [RoleLedger::new(), RoleLedger::new()];
+///
+/// # A test build: one set per thread, and why
+///
+/// `cfg(test)`, and the `test-support` feature `squallar-app` turns on through
+/// its dev-dependency, replace that one shared set with a **per-thread** one.
+/// [`crate::overlay_cache::ledger`] carries the full account of the
+/// arrangement; the reason to repeat it here is that these counters are not
+/// only reported.
+///
+/// **`squallar-app` reads them as an absolute LEVEL and prices the scene with
+/// it.** `app_render::tile_need_for` turns `wanted_on_glass`, `wanted_net` and
+/// the `resident_bytes / resident_entries` ratio into a `scene::TileNeed`,
+/// `app_render::tile_needs` makes those the scene's `tile_sources`, and every
+/// budget decision is taken against that scene — the ladder's `fit`, and the
+/// promotion margin in `app_render::observe_host_recovery`, whose
+/// `model_spare` clears its bar by about 20 MiB of 195 on the six-picture web
+/// fixture. So a sibling test merely putting a tile moved another test's
+/// budget arithmetic: a governor deciding on a figure that was never its own.
+///
+/// The note beside `totals_if_moved` still holds for readers that take
+/// **differences** of two readings. A reader that takes a level cannot be made
+/// correct that way, so the object the tests shared is removed instead of
+/// being locked — the same conclusion, and for the same reason, as the
+/// crate-wide lock that arrangement deleted.
+#[cfg(not(any(test, feature = "test-support")))]
+fn sink() -> &'static [RoleLedger; ROLES.len()] {
+    static SHARED: [RoleLedger; ROLES.len()] = [RoleLedger::new(), RoleLedger::new()];
+    &SHARED
+}
+
+/// One set of counters per thread — the production arm above carries the whole
+/// account of why.
+#[cfg(any(test, feature = "test-support"))]
+fn sink() -> &'static [RoleLedger; ROLES.len()] {
+    thread_local! {
+        /// Leaked rather than borrowed, so this arm hands back the same
+        /// `&'static` the production arm does and every body below stays one
+        /// spelling. One set per thread that touches this ledger at all; the
+        /// process exit frees them.
+        static OWN: &'static [RoleLedger; ROLES.len()] =
+            Box::leak(Box::new([RoleLedger::new(), RoleLedger::new()]));
+    }
+    OWN.with(|ledger| *ledger)
+}
 
 /// Record one event against `role`. The whole hot-path API, one `fetch_add`.
 pub fn note(role: CacheRole, event: CacheEvent) {
-    let ledger = &LEDGER[role.index()];
+    let ledger = &sink()[role.index()];
     match event {
         CacheEvent::Request => ledger.requests.fetch_add(1, Relaxed),
         CacheEvent::RestyleAsk => ledger.restyle_asks.fetch_add(1, Relaxed),
@@ -361,7 +404,7 @@ pub fn note(role: CacheRole, event: CacheEvent) {
 
 /// What one source of `role` holds right now. Levels, so stored not added.
 pub fn set_resident(role: CacheRole, levels: Levels) {
-    let ledger = &LEDGER[role.index()];
+    let ledger = &sink()[role.index()];
     ledger
         .resident_entries
         .store(levels.resident_entries, Relaxed);
@@ -388,7 +431,7 @@ pub fn set_resident(role: CacheRole, levels: Levels) {
 /// Two `Relaxed` loads and one store, on a path that has just done four
 /// stores to the same cache lines.
 fn publish_styled_census() {
-    let bytes = LEDGER
+    let bytes = sink()
         .iter()
         .map(|ledger| ledger.resident_bytes.load(Relaxed))
         .fold(0u64, u64::saturating_add);
@@ -400,7 +443,7 @@ fn publish_styled_census() {
 /// the denominator is `walkers::mvt::ParsedTile::heap_bytes`, which is what
 /// the parsed `ByteLru`s charge.
 fn publish_parsed_census() {
-    let bytes = LEDGER
+    let bytes = sink()
         .iter()
         .map(|ledger| ledger.parsed_bytes.load(Relaxed))
         .fold(0u64, u64::saturating_add);
@@ -410,7 +453,7 @@ fn publish_parsed_census() {
 /// What the last whole pass drawing one source of `role` wanted: cells at the
 /// drawn level and in the ancestor net. Levels, stored at the pass boundary.
 pub fn set_wanted(role: CacheRole, on_glass: u64, net: u64) {
-    let ledger = &LEDGER[role.index()];
+    let ledger = &sink()[role.index()];
     ledger.wanted_on_glass.store(on_glass, Relaxed);
     ledger.wanted_net.store(net, Relaxed);
 }
@@ -418,7 +461,7 @@ pub fn set_wanted(role: CacheRole, on_glass: u64, net: u64) {
 /// How many parses one source of `role`'s parsed-geometry cache holds, and
 /// what they are charged. Levels, stored where the parse lands or leaves.
 pub fn set_parsed(role: CacheRole, entries: u64, bytes: u64) {
-    let ledger = &LEDGER[role.index()];
+    let ledger = &sink()[role.index()];
     ledger.parsed_entries.store(entries, Relaxed);
     ledger.parsed_bytes.store(bytes, Relaxed);
     publish_parsed_census();
@@ -427,14 +470,14 @@ pub fn set_parsed(role: CacheRole, entries: u64, bytes: u64) {
 /// Whether the tile-sharpness rung holds one source of `role` at the whole
 /// zoom. A level, stored where the source's [`super::snap::SnapState`] flips.
 pub fn set_snapped(role: CacheRole, snapped: bool) {
-    LEDGER[role.index()]
+    sink()[role.index()]
         .snapped
         .store(u64::from(snapped), Relaxed);
 }
 
 /// Read one role.
 pub fn totals(role: CacheRole) -> Totals {
-    let ledger = &LEDGER[role.index()];
+    let ledger = &sink()[role.index()];
     Totals {
         requests: ledger.requests.load(Relaxed),
         restyle_asks: ledger.restyle_asks.load(Relaxed),
@@ -464,16 +507,18 @@ pub fn totals(role: CacheRole) -> Totals {
 pub fn totals_if_moved(role: CacheRole) -> Option<Totals> {
     let totals = totals(role);
     let progress = totals.progress();
-    if LEDGER[role.index()].reported.swap(progress, Relaxed) == progress {
+    if sink()[role.index()].reported.swap(progress, Relaxed) == progress {
         return None;
     }
     Some(totals)
 }
 
-// No `reset` here, deliberately, on `super::take_ledger`'s terms: the
-// statics are process-global and a test binary runs its cases in parallel
-// over them, so the tests assert differences of two readings, or read a
-// source's own `Totals`, which nothing else moves.
+// No `reset` here, deliberately, on `super::take_ledger`'s terms. In a
+// production build the counters are process-global, so a reset would be one
+// source clearing every other source's account of a role it shares. In a test
+// build `sink` gives each thread its own set, so there is nothing left to
+// reset across: a test's own writes are the only writes it can see. Readers
+// still prefer a difference of two readings, or a source's own `Totals`.
 
 #[cfg(test)]
 mod tests;

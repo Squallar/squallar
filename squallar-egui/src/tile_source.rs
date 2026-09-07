@@ -3597,9 +3597,11 @@ impl HttpsTiles {
     }
 
     /// This source's own cache counters — every event its cache recorded,
-    /// and no other source's. The statics [`cache_ledger::totals`] reads
-    /// are shared by every source of a role in the process, which in a test
-    /// binary is every test's; a pin on one source reads this instead.
+    /// and no other source's. The counters [`cache_ledger::totals`] reads are
+    /// shared by every source of a role: in a production build that is the
+    /// whole process, and in a test build `cache_ledger::sink` narrows it to
+    /// the calling thread, which is one test's but still every source that
+    /// test builds. A pin on ONE source reads this instead.
     #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) fn cache_stats(&self) -> cache_ledger::Totals {
         self.cache.stats()

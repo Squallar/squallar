@@ -1,11 +1,14 @@
 //! What a reading of the cache ledger is allowed to mean.
 //!
-//! About the arithmetic and the classification, not about the statics, on
-//! [`super::super::take_ledger`]'s terms: the counters are process-global and
-//! this binary runs its tests in parallel over them, so an assertion on an
-//! absolute value would be an assertion about harness scheduling. The one
-//! test that touches a static ([`the_statics_move_by_at_least_what_one_source_applied`])
-//! asserts a difference of two readings and asks only `>=`.
+//! About the arithmetic and the classification, not about the counters
+//! themselves, on [`super::super::take_ledger`]'s terms. In a production build
+//! the counters are process-global; in a test build [`super::sink`] gives each
+//! thread its own set, so a parallel sibling can no longer reach them. These
+//! tests predate that and do not lean on it: they were written when an
+//! assertion on an absolute value would have been an assertion about harness
+//! scheduling, and the one test that touches the shared set
+//! ([`the_statics_move_by_at_least_what_one_source_applied`]) still asserts a
+//! difference of two readings and asks only `>=`, which is true either way.
 
 use super::{CacheEvent, EvictedKind, PutKind, ROLES, Totals, note, totals};
 

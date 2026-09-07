@@ -4975,3 +4975,73 @@ mod sliced_styling {
         );
     }
 }
+
+/// **A sibling thread's tile counters cannot reach this thread's figures**,
+/// which is a property of the build rather than of anyone remembering to
+/// bracket a reading.
+///
+/// What it pins is not a telemetry line. `squallar-app` reads these counters
+/// as an absolute LEVEL and prices the scene with it:
+/// `app_render::tile_need_for` turns `wanted_on_glass`, `wanted_net` and the
+/// `resident_bytes / resident_entries` ratio into a `scene::TileNeed`,
+/// `app_render::tile_needs` makes those the scene's `tile_sources`, and every
+/// budget decision is taken against that scene — the ladder's `fit`, and the
+/// promotion margin in `app_render::observe_host_recovery`. So a sibling test
+/// merely drawing a map moved another test's budget arithmetic. Observed as
+/// three recovery tests in `squallar-app` reading `held() == 0` where a
+/// qualifying reading was banked, under `cargo test --workspace` and never
+/// under a filtered run. See `cache_ledger::sink`.
+///
+/// **Both directions, because only one of them is about isolation.** The
+/// sibling reads its own level back, so a build in which its writes went
+/// nowhere at all cannot pass this by storing nothing; and the same call made
+/// on this thread still has to move this thread's own level.
+///
+/// The level this thread sets is put back before returning. Per-thread
+/// counters isolate a test from its parallel siblings, and `--test-threads=1`
+/// is the one arrangement that can hand the same thread to two tests in turn —
+/// so a test that left a level behind would be the very defect it pins,
+/// arriving by the serial door.
+#[test]
+fn a_sibling_threads_tile_counters_stay_out_of_this_threads_figures() {
+    use cache_ledger::{CacheRole, set_wanted, totals};
+
+    const SIBLING_ON_GLASS: u64 = 4096;
+    const SIBLING_NET: u64 = 2048;
+
+    let role = CacheRole::Base;
+    let before = totals(role);
+
+    let sibling = std::thread::spawn(move || {
+        set_wanted(role, SIBLING_ON_GLASS, SIBLING_NET);
+        totals(role)
+    })
+    .join()
+    .expect("the sibling thread ran to completion");
+
+    assert_eq!(
+        (sibling.wanted_on_glass, sibling.wanted_net),
+        (SIBLING_ON_GLASS, SIBLING_NET),
+        "the sibling's own levels did not reach the sibling's own figures, so \
+         what is asserted below is isolation from a thread that stored nothing",
+    );
+    let after = totals(role);
+    assert_eq!(
+        (after.wanted_on_glass, after.wanted_net),
+        (before.wanted_on_glass, before.wanted_net),
+        "a sibling thread's tile levels moved this thread's figures, so \
+         `tile_need_for` prices a scene out of its neighbours' map and every \
+         budget decided against that scene is theirs as much as its own",
+    );
+
+    set_wanted(role, before.wanted_on_glass + 1, before.wanted_net + 1);
+    let mine = totals(role);
+    set_wanted(role, before.wanted_on_glass, before.wanted_net);
+    assert_eq!(
+        (mine.wanted_on_glass, mine.wanted_net),
+        (before.wanted_on_glass + 1, before.wanted_net + 1),
+        "a store on this thread did not move this thread's own level, so the \
+         equality above says 'nothing counts anywhere' rather than 'a sibling \
+         cannot reach me'",
+    );
+}
