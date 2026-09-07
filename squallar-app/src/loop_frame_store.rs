@@ -258,11 +258,26 @@ impl LoopFrameStore {
     /// the volume store's, priced there.
     ///
     /// An `Overlay` frame used to be named here as carrying an unpriced hit
-    /// map. It does not: `App::place_overlay_loop_frame` sets `hit_map: None`
-    /// on every overlay loop frame (`app_render.rs`), because a frame is a
-    /// picture and hovers are answered from the live layer state. The
-    /// unpriced hit maps are real but they are the **live pane textures'** and
-    /// the in-flight dispatch closures', neither of which this store holds.
+    /// map. It does not — but the reason is a **literal, not a type**, which
+    /// is why the arm below asserts rather than simply answering zero.
+    ///
+    /// `OverlayTextureData` is a `TextureHandle` (a GPU id and a retain
+    /// count, no pixels), a `PlacedRaster`, five scalars, and two `Option`s;
+    /// `hit_map: Option<Arc<HitMap>>` is the only term that can be host bytes.
+    /// At the sole site that builds a `LoopFrameImage::Overlay` — the overlay
+    /// loop-result drain in `app_render.rs`, which a workspace grep finds
+    /// exactly one of — `hit_map` and `radar_meta` are written `None`
+    /// verbatim, because a frame is a picture and hovers are answered from
+    /// the live layer state.
+    ///
+    /// **That citation was wrong until 2026-09-07**: this paragraph named
+    /// `App::place_overlay_loop_frame`, which does not exist and never has.
+    /// The claim held; its named witness did not, and a reader checking the
+    /// sentence would have found nothing and had no way to tell which.
+    ///
+    /// The unpriced hit maps are real but they are the **live pane
+    /// textures'** and the in-flight dispatch closures', neither of which
+    /// this store holds.
     ///
     /// O(entries), O(1) apiece.
     pub fn resident_host_bytes(&self) -> u64 {
@@ -276,8 +291,37 @@ impl LoopFrameStore {
                         + image.tilt_collected_ms.len() * size_of::<i64>())
                         as u64
                 }
-                squallar_egui::pane::LoopFrameImage::Volume(_)
-                | squallar_egui::pane::LoopFrameImage::Overlay(_) => 0,
+                // A named grid, never a held one: `VolumeFrameGrid` is a
+                // `u64` id and a target, so this zero is the type's and not
+                // an unmeasured term. The grid itself is the volume store's
+                // and is priced as `volume store`.
+                squallar_egui::pane::LoopFrameImage::Volume(_) => 0,
+                squallar_egui::pane::LoopFrameImage::Overlay(data) => {
+                    // **The zero this arm answers is load-bearing on a
+                    // literal.** Everything else `OverlayTextureData` holds
+                    // is a GPU handle or a scalar; `hit_map` is the one field
+                    // that can be host bytes, and it is `None` only because
+                    // the one construction site writes it that way. Whoever
+                    // first writes `Some(..)` there would otherwise get a
+                    // silent zero on the largest thing a frame can hold.
+                    //
+                    // It asserts rather than pricing because `HitMap` has no
+                    // public size: it lives in
+                    // `squallar_overlays::render::rasterize`, its `cells` and
+                    // `items` are private, and the one-line
+                    // `pub fn resident_bytes(&self) -> usize` it needs has to
+                    // be added there. Until it is, this is the honest arm —
+                    // a zero that fails loudly the moment it stops being
+                    // true, rather than one that keeps reading healthy.
+                    debug_assert!(
+                        data.hit_map.is_none(),
+                        "an overlay loop frame carried a hit map; `resident_host_bytes` \
+                         still prices it at zero and now under-counts the store. Give \
+                         `squallar_overlays::render::rasterize::HitMap` a `resident_bytes` \
+                         and price it here."
+                    );
+                    0
+                }
             };
             sum.saturating_add(bytes)
         })

@@ -320,3 +320,83 @@ fn hold_frames_files_a_picture_a_pane_already_holds() {
         "a stamp with no picture files nothing",
     );
 }
+
+/// An overlay loop frame with `hit_map: None` — the shape the one
+/// construction site builds — holds no host bytes. A `TextureHandle` is a GPU
+/// id and a retain count, and every other field is a scalar.
+#[test]
+fn an_overlay_frame_with_no_hit_map_holds_nothing() {
+    let ctx = egui::Context::default();
+    let mut store = LoopFrameStore::default();
+    store.insert(
+        LoopFrameKey::plan_view(reflectivity(SITE, TILT), ts(0)),
+        overlay_frame(&ctx, None),
+        0,
+    );
+    assert_eq!(store.resident_host_bytes(), 0);
+}
+
+/// **The case where the zero must stop being believable.**
+///
+/// `resident_host_bytes` prices an overlay frame at nothing because its one
+/// host term, `hit_map`, is `None` at the only place such a frame is built.
+/// That is a literal, not a type — so the arm asserts, and this is the proof
+/// the assert fires rather than the figure quietly staying at zero.
+///
+/// It does not pin a byte figure: `HitMap` has no public size to assert
+/// against, which is the missing one-liner the arm's comment names. What is
+/// pinned is that the store refuses to answer zero for a frame it cannot
+/// price.
+/// `debug_assertions` only: the arm is a `debug_assert!`, so a release test
+/// run has nothing to catch and this would fail for the wrong reason.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "an overlay loop frame carried a hit map")]
+fn an_overlay_frame_carrying_a_hit_map_is_refused() {
+    use squallar_overlays::render::overlay_state::HitItems;
+    use squallar_overlays::render::rasterize::{HitCells, HitMap};
+
+    let ctx = egui::Context::default();
+    let hit_map = Arc::new(HitMap::from_cells(
+        HitCells::new(4, 4),
+        &HitItems::Rows(Vec::new()),
+    ));
+    let mut store = LoopFrameStore::default();
+    store.insert(
+        LoopFrameKey::plan_view(reflectivity(SITE, TILT), ts(0)),
+        overlay_frame(&ctx, Some(hit_map)),
+        0,
+    );
+    let _ = store.resident_host_bytes();
+}
+
+/// An overlay frame pins no decoded volume — structural, since nothing in
+/// `OverlayTextureData` can hold an `Arc<Scan>`.
+#[test]
+fn an_overlay_frame_pins_no_volume() {
+    let ctx = egui::Context::default();
+    let mut store = LoopFrameStore::default();
+    store.insert(
+        LoopFrameKey::plan_view(reflectivity(SITE, TILT), ts(0)),
+        overlay_frame(&ctx, None),
+        0,
+    );
+    assert_eq!(store.pinned_volume_bytes(), 0);
+}
+
+fn overlay_frame(
+    ctx: &egui::Context,
+    hit_map: Option<Arc<squallar_overlays::render::rasterize::HitMap>>,
+) -> LoopFrameImage {
+    let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 0]);
+    LoopFrameImage::Overlay(squallar_egui::overlay_cache::OverlayTextureData {
+        texture: ctx.load_texture("overlay", image, egui::TextureOptions::NEAREST),
+        placed: squallar_radar::types::ImageBounds::from_radar_site(35.33, -97.27, 230.0).into(),
+        data_generation: 0,
+        render_zoom: 0,
+        width: 1,
+        height: 1,
+        radar_meta: None,
+        hit_map,
+    })
+}

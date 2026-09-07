@@ -2408,6 +2408,32 @@ impl RenderDispatcher {
     ///
     /// `render pools` needs nothing here: `heap_census::census()` reads
     /// radar's slot atomics directly.
+    /// **What the still path's Level III products are holding** — every
+    /// `level3_data` entry at its envelope and its decode.
+    ///
+    /// De-duplicated by `Arc`, because two AWIPS codes can be answered by one
+    /// fetched object and pricing per key would then count it twice — the
+    /// same mistake `render cache` was making with its images.
+    ///
+    /// A walk, not a maintained level: the map is a handful of entries (four
+    /// codes a site), the per-product cost is O(packets) over structures the
+    /// decoder already built, and this runs on the 2 s telemetry tick. A
+    /// maintained field would have to be kept in step at every insert, retain
+    /// and clear for a figure nothing reads more often than that.
+    pub fn level3_resident_bytes(&self) -> u64 {
+        let mut seen: Vec<*const Level3Product> = Vec::with_capacity(self.level3_data.len());
+        let mut bytes = 0u64;
+        for product in self.level3_data.values() {
+            let ptr = Arc::as_ptr(product);
+            if seen.contains(&ptr) {
+                continue;
+            }
+            seen.push(ptr);
+            bytes = bytes.saturating_add(product.resident_bytes() as u64);
+        }
+        bytes
+    }
+
     /// **Bytes `render cache` and `cached renders` both name**, measured
     /// rather than bounded: what the two families publish, less what the
     /// allocator actually granted for the rasters behind them.
@@ -2520,6 +2546,7 @@ impl RenderDispatcher {
         squallar_egui::heap_census::set_render_in_flight_bytes(fold);
         squallar_egui::heap_census::set_cached_render_bytes(self.cached_render_bytes());
         squallar_egui::heap_census::set_raster_shared_bytes(self.raster_shared_bytes());
+        squallar_egui::heap_census::set_still_l3_bytes(self.level3_resident_bytes());
     }
 
     /// Whether some pane already has **this exact plan view** in flight.

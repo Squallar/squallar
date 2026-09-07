@@ -105,11 +105,12 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// record as pixels — so by the same rule it takes its 16 characters and
 /// `16 + 25 = 41` back out: 1062 - 41 = 1021.
 /// `cached renders` is 14 characters, so it adds `14 + 25 = 39`: 1021 + 39 =
-/// 1060, and `rasters shared` is 14 too: 1060 + 39 = 1099. This chain is a DERIVATION and not a record: every term in it moves
+/// 1060, and `rasters shared` is 14 too: 1060 + 39 = 1099.
+/// `still l3` is 8 characters: `8 + 25 = 33`, so 1099 + 33 = 1132. This chain is a DERIVATION and not a record: every term in it moves
 /// when a family is added or removed, so re-derive it rather than nudging the
 /// constant, and let `the_widest_line_fits_the_hooks_buffer` be the check.
 /// That test asserts `<=`, so a constant that is too LARGE passes quietly.
-pub const CENSUS_LINE_CAPACITY: usize = 1099;
+pub const CENSUS_LINE_CAPACITY: usize = 1132;
 
 /// One family's level. A `u64` of bytes, `Relaxed` throughout: every reader
 /// wants a recent figure, none wants a synchronised one, and a census torn
@@ -171,6 +172,30 @@ families! {
     LOOP_L3_BYTES, loop_l3_bytes, set_loop_l3_bytes,
         "Level III product bytes the loop cache is holding, paired one per \
          frame with the volumes above.";
+    STILL_L3_BYTES, still_l3_bytes, set_still_l3_bytes,
+        "**Level III products the STILL path is holding** - the latest \
+         fetched object per `(AWIPS code, site)` in \
+         `RenderDispatcher::level3_data`, at its envelope AND its decode. \
+         Four codes per site on this build (`N0K`, `EET`, `DVL`, `DPR`), one \
+         entry apiece, held until the site changes or the panes reset. \
+         Until 2026-09-07 no family named a byte of this holder - not even \
+         the envelope, which is the one term `loop l3` at least counts for \
+         its own. \
+         BOTH HALVES, because both are held: `Level3Product` keeps `bytes` \
+         and `message` for its whole life, so the envelope is not freed when \
+         the decode lands. That is also why this and `loop l3` disagree about \
+         the same object - `loop l3` prices `bytes.len()` alone - and why \
+         they OVERLAP where the loop cache and the dispatcher hold the same \
+         `Arc`: at most `loop l3`'s whole figure is counted twice across the \
+         two, and the sum is an upper bound like every other pair here. \
+         WALKED, not maintained, and the walk is over the product's OWN \
+         decoded structure, so it needs no geometry table and assumes no \
+         radial or gate count. That is deliberate: the ICD estimate that \
+         motivated this family (N0K 720x1200, DPR 360x920, DVL and EET \
+         360x460, about 3.0 MiB for one site's four products) is an \
+         ASSUMPTION, no fixture in this tree carries a real product's shape, \
+         and a constant derived from it would have been a guess wearing a \
+         number. It runs on the 2 s tick, never on a frame.";
     STILL_SCAN_BYTES, still_scan_bytes, set_still_scan_bytes,
         "Decoded volumes the still-pane inventory and the per-site latest \
          cache are holding together.";
@@ -441,6 +466,7 @@ impl Census {
     pub fn resident_total(&self) -> u64 {
         [
             self.radar_total(),
+            self.still_l3_bytes,
             self.render_cache_bytes,
             self.cached_render_bytes,
             self.render_pool_bytes,
@@ -613,7 +639,8 @@ pub fn write_line<W: core::fmt::Write>(
 ) -> core::fmt::Result {
     write!(
         out,
-        "heap census ({instance}): loop scans {} B, loop l3 {} B, still scans {} B, \
+        "heap census ({instance}): loop scans {} B, loop l3 {} B, still l3 {} B, \
+         still scans {} B, \
          derive memo {} B, loop frame scans {} B, chunk feed {} B, \
          render cache {} B, cached renders {} B, rasters shared {} B, \
          render pools {} B, \
@@ -624,6 +651,7 @@ pub fn write_line<W: core::fmt::Write>(
          deferred drops {} B; resident total {} B of ",
         census.loop_scan_bytes,
         census.loop_l3_bytes,
+        census.still_l3_bytes,
         census.still_scan_bytes,
         census.derive_memo_bytes,
         census.loop_frame_scan_bytes,

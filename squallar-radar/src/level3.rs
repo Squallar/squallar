@@ -95,6 +95,29 @@ impl Level3Product {
     pub fn age(&self, now: NaiveDateTime) -> Option<Duration> {
         self.stamp.age(now)
     }
+
+    /// **What holding this product costs on the host heap**: its own struct,
+    /// the WMO/AWIPS envelope it kept, and the decode hanging off its
+    /// message.
+    ///
+    /// **Both halves, because both are held.** The envelope is not freed once
+    /// the message is decoded — `bytes` and `message` live as long as the
+    /// product does — so a figure naming one of them under-reports by the
+    /// other. `LoopDownloads::cache_l3_product` prices `bytes.len()` alone,
+    /// which is the loop cache's own convention and is why `loop l3` and the
+    /// `still l3` census family do not agree about the same product.
+    ///
+    /// `capacity`, not `len`: `squallar_alloc::live_bytes` counts what the
+    /// allocator granted.
+    ///
+    /// O(packets), and the walk is over a decoded product's own structure —
+    /// no geometry table and no assumed radial or gate count. It is called
+    /// once per product on the 2 s telemetry tick, never on a frame.
+    pub fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.bytes.capacity())
+            .saturating_add(self.message.resident_bytes())
+    }
 }
 
 /// Timestamp encoded in a Level III key: `TLX_N0S_2026_07_25_17_30_24` →
