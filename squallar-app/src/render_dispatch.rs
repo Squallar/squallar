@@ -2508,16 +2508,6 @@ impl RenderDispatcher {
             .fold(0u64, u64::saturating_add)
     }
 
-    /// **The tick's reconciliation of the `renders in flight` level.** The
-    /// level itself is published at the seams, where the bytes move; this
-    /// re-derives the running total from the cells ([`Self::in_flight_image_bytes`])
-    /// and republishes it, which corrects the two things a seam cannot: a
-    /// store that lost a race to another thread's later-but-staler store, and
-    /// a cell orphaned by a forgotten pane whose bytes the total still
-    /// carries. Called once a telemetry tick by the app's census publisher.
-    ///
-    /// `render pools` needs nothing here: `heap_census::census()` reads
-    /// radar's slot atomics directly.
     /// **What the still path's Level III products are holding** — every
     /// `level3_data` entry at its envelope and its decode.
     ///
@@ -2647,6 +2637,16 @@ impl RenderDispatcher {
         bytes
     }
 
+    /// **The tick's reconciliation of the `renders in flight` level.** The
+    /// level itself is published at the seams, where the bytes move; this
+    /// re-derives the running total from the cells ([`Self::in_flight_image_bytes`])
+    /// and republishes it, which corrects the two things a seam cannot: a
+    /// store that lost a race to another thread's later-but-staler store, and
+    /// a cell orphaned by a forgotten pane whose bytes the total still
+    /// carries. Called once a telemetry tick by the app's census publisher.
+    ///
+    /// `render pools` needs nothing here: `heap_census::census()` reads
+    /// radar's slot atomics directly.
     pub fn publish_heap_census(&self) {
         let fold = self.in_flight_image_bytes();
         self.in_flight_total.store(
