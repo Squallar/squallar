@@ -303,3 +303,47 @@ fn a_wrap_inside_a_pass_splits_it_into_two_contiguous_writes() {
         "the first write does not end at the ring's end"
     );
 }
+
+/// **The decline and the set that replaces it are one fact, and this holds
+/// them together.**
+///
+/// `TileMeshCallback` tells egui not to set a courtesy viewport
+/// (`courtesy_viewport() -> false`) *because* its own `paint` sets the
+/// full-frame one before it draws anything. Drop the second and the first
+/// becomes a tile squeezed into its own rect a second time — a silent
+/// mis-render, not a failure — so neither half may move without the other.
+///
+/// Source text, and deliberately: the callback is private, carries an
+/// `Arc<TileMeshes>` and an `AtomicU32`, and takes a `RenderPass` to paint
+/// into, so the pairing is not reachable from a host test. What *is* covered
+/// by a real walk is the counting rule this enables —
+/// `command_stream::tests::declining_the_courtesy_viewport_removes_one_call_per_painted_callback`
+/// — and the walk's own arm, pinned in that module's rule 5.
+#[test]
+fn the_tile_callback_declines_egui_s_viewport_because_it_sets_its_own() {
+    const SOURCE: &str = include_str!("../tile_mesh.rs");
+
+    let impl_block = SOURCE
+        .split_once("impl egui_wgpu::CallbackTrait for TileMeshCallback {")
+        .map(|(_, rest)| rest)
+        .expect("`TileMeshCallback`'s `CallbackTrait` impl moved");
+    assert!(
+        impl_block.contains("fn courtesy_viewport(&self) -> bool {\n        false\n    }"),
+        "the tile callback takes egui's courtesy viewport again; it is \
+         overwritten unread by the set in `paint`, one recorded and replayed \
+         `set_viewport` per tile-mesh run per frame"
+    );
+
+    let paint = impl_block
+        .split_once("    fn paint(")
+        .map(|(_, rest)| rest)
+        .expect("`TileMeshCallback::paint` moved");
+    let (before_draws, _) = paint
+        .split_once("render_pass.set_bind_group(")
+        .expect("`paint` no longer binds its uniform group before it draws");
+    assert!(
+        before_draws.contains("render_pass.set_viewport("),
+        "`paint` no longer sets the full-frame viewport before it draws, and \
+         `courtesy_viewport() -> false` means nothing else sets one either"
+    );
+}

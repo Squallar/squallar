@@ -38,6 +38,15 @@ impl Callback {
             callback: std::sync::Arc::new(Self(Box::new(callback))),
         }
     }
+
+    /// **Local change** (see `VENDORED.md`): whether this callback wants the
+    /// courtesy viewport. Exposed because the wrapped `dyn CallbackTrait` is
+    /// private to this crate, and a caller that predicts what
+    /// [`Renderer::render`] will record has to be able to ask the same
+    /// question the walk asks.
+    pub fn wants_courtesy_viewport(&self) -> bool {
+        self.0.courtesy_viewport()
+    }
 }
 
 /// A callback trait that can be used to compose an [`epaint::PaintCallback`] via [`Callback`]
@@ -117,6 +126,28 @@ pub trait CallbackTrait: Send + Sync {
         render_pass: &mut wgpu::RenderPass<'static>,
         callback_resources: &CallbackResources,
     );
+
+    /// **Local change** (see `VENDORED.md`): whether [`Renderer::render`]
+    /// should set a viewport from this callback's own rect before calling
+    /// [`CallbackTrait::paint`].
+    ///
+    /// `true`, the default, is upstream's unconditional behaviour and is what
+    /// a callback that wants to draw in its own rect's coordinates needs.
+    ///
+    /// Return `false` when `paint` sets a viewport of its own before it draws
+    /// anything. Then the courtesy set is a recorded, replayed
+    /// `set_viewport` that is overwritten unread — one per painted callback,
+    /// per frame — and this is how a callback declines it. Declining changes
+    /// nothing else: the callback still owns the pass while it paints, so the
+    /// walk still forgets its scissor and still re-establishes egui's state
+    /// for the next mesh.
+    ///
+    /// Nothing checks a viewport for redundancy at either `wgpu` layer, so
+    /// every one of these reaches the HAL encoder — see `VENDORED.md` for the
+    /// measurement.
+    fn courtesy_viewport(&self) -> bool {
+        true
+    }
 }
 
 /// Information about the screen used for rendering.
@@ -776,14 +807,21 @@ impl Renderer {
                         // The user still has the possibility of setting their own custom
                         // viewport during the paint callback, effectively overriding this
                         // one.
-                        render_pass.set_viewport(
-                            viewport_px.left_px as f32,
-                            viewport_px.top_px as f32,
-                            viewport_px.width_px as f32,
-                            viewport_px.height_px as f32,
-                            0.0,
-                            1.0,
-                        );
+                        //
+                        // **Local change** (see `VENDORED.md`): a callback
+                        // that always does exactly that can say so, and then
+                        // does not pay for a set the next line overwrites
+                        // unread. Upstream is the `true` default.
+                        if cbfn.0.courtesy_viewport() {
+                            render_pass.set_viewport(
+                                viewport_px.left_px as f32,
+                                viewport_px.top_px as f32,
+                                viewport_px.width_px as f32,
+                                viewport_px.height_px as f32,
+                                0.0,
+                                1.0,
+                            );
+                        }
 
                         cbfn.0.paint(info, render_pass, &self.callback_resources);
                     }

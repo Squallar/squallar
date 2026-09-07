@@ -118,7 +118,12 @@ pub struct CommandStream {
     /// stream is a few large draws or many tiny ones.
     pub draw_indices: u64,
     /// `set_viewport` calls egui makes on a callback's behalf, one per painted
-    /// callback, immediately before handing the pass over.
+    /// callback that wants one, immediately before handing the pass over. A
+    /// callback that sets its own viewport before it draws declines the
+    /// courtesy set (`egui_wgpu::CallbackTrait::courtesy_viewport`) and
+    /// records none: `squallar_gpu::tile_mesh::TileMeshCallback` is one, and
+    /// the ground path paints one callback per tile-mesh run, so on a frame
+    /// carrying the basemap this is far below [`Self::callbacks`].
     pub callback_viewports: u64,
 
     /// Every call above, as egui issues it — the walk's own length. See the
@@ -226,7 +231,21 @@ pub fn census(
                 // takes the scissor out of the walk's knowledge.
                 let viewport = scissor(callback.rect, pixels_per_point, size_in_pixels);
                 if viewport[2] > 0 && viewport[3] > 0 {
-                    c.callback_viewports += 1;
+                    // Asked, not assumed: a callback that sets a viewport of
+                    // its own before it draws declines egui's courtesy set,
+                    // and then the walk records none. The same question
+                    // `Renderer::render` asks, through the same accessor, so
+                    // this count cannot disagree with the stream it predicts.
+                    // A callback of some other shape — nothing in this
+                    // workspace builds one — never reaches egui's downcast
+                    // either, and is counted as it was before.
+                    if callback
+                        .callback
+                        .downcast_ref::<egui_wgpu::Callback>()
+                        .is_none_or(egui_wgpu::Callback::wants_courtesy_viewport)
+                    {
+                        c.callback_viewports += 1;
+                    }
                     needs_reset = true;
                     bound_scissor = None;
                 }

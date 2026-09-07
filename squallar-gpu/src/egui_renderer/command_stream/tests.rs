@@ -557,4 +557,126 @@ fn the_vendored_walks_three_rules_are_the_ones_the_census_models() {
          buffers the reset bound; whatever it does instead, the census does \
          not model it"
     );
+
+    // 5. The courtesy viewport is recorded only where the callback wants it.
+    assert!(
+        callback_arm.contains("if cbfn.0.courtesy_viewport() {"),
+        "`render` sets a courtesy viewport for every painted callback again; \
+         `census` charges one only where the callback wants one and would now \
+         under-count by one per declining callback — one per tile-mesh run on \
+         every frame carrying the basemap"
+    );
+}
+
+/// A paint callback over `rect` that sets a viewport of its own and therefore
+/// declines egui's courtesy one — the shape `tile_mesh::TileMeshCallback` has.
+fn callback_declining_courtesy_viewport(at: Rect) -> Primitive {
+    struct OwnViewport;
+    impl egui_wgpu::CallbackTrait for OwnViewport {
+        fn courtesy_viewport(&self) -> bool {
+            false
+        }
+        fn paint(
+            &self,
+            _: egui::PaintCallbackInfo,
+            _: &mut egui_wgpu::wgpu::RenderPass<'static>,
+            _: &egui_wgpu::CallbackResources,
+        ) {
+        }
+    }
+    Primitive::Callback(egui::epaint::PaintCallback {
+        rect: at,
+        callback: egui_wgpu::Callback::new_paint_callback(at, OwnViewport).callback,
+    })
+}
+
+/// **A declining callback records no viewport, and the difference is the
+/// whole point.**
+///
+/// Two identical four-callback frames, one taking egui's courtesy viewport and
+/// one declining it. Held as a *difference* rather than as two magic numbers:
+/// what matters is that declining removes exactly one recorded call per
+/// painted callback and changes nothing else on the walk — the callbacks still
+/// force their resets and still take the scissor out of the walk's knowledge,
+/// so every other figure has to come out equal.
+///
+/// The ground path paints one callback per tile-mesh run, so on a frame
+/// carrying the basemap this difference is the largest single reduction
+/// available in the recorded stream.
+#[test]
+fn declining_the_courtesy_viewport_removes_one_call_per_painted_callback() {
+    let at = |i: f32| rect(i * 100.0, 0.0, i * 100.0 + 90.0, 90.0);
+    let takes: Vec<_> = (0..4)
+        .map(|i| clipped(at(i as f32), callback(at(i as f32))))
+        .collect();
+    let declines: Vec<_> = (0..4)
+        .map(|i| {
+            clipped(
+                at(i as f32),
+                callback_declining_courtesy_viewport(at(i as f32)),
+            )
+        })
+        .collect();
+
+    let taking = census(&takes, PPP, SURFACE);
+    let declining = census(&declines, PPP, SURFACE);
+
+    assert_eq!(
+        (taking.callbacks, taking.callback_viewports),
+        (4, 4),
+        "the default callback must still take egui's courtesy viewport"
+    );
+    assert_eq!(
+        (declining.callbacks, declining.callback_viewports),
+        (4, 0),
+        "a callback that sets its own viewport must record none of egui's"
+    );
+    assert_eq!(
+        taking.calls - declining.calls,
+        4,
+        "declining must remove exactly one recorded call per painted callback"
+    );
+    assert_eq!(
+        (
+            declining.scissor_sets,
+            declining.scissor_repeats,
+            declining.resets,
+            declining.draws,
+            declining.buffer_binds,
+            declining.bind_group_sets,
+        ),
+        (
+            taking.scissor_sets,
+            taking.scissor_repeats,
+            taking.resets,
+            taking.draws,
+            taking.buffer_binds,
+            taking.bind_group_sets,
+        ),
+        "declining the courtesy viewport must change nothing but the viewport"
+    );
+}
+
+/// **A degenerate callback still records nothing, declining or not.**
+///
+/// egui skips a callback whose rect is empty in pixels before it would set any
+/// viewport, so the two arms agree there — and a census that read the decline
+/// off the callback without first taking egui's skip decision would report a
+/// difference here.
+#[test]
+fn a_degenerate_declining_callback_records_no_viewport_either() {
+    let empty = rect(10.0, 10.0, 10.0, 10.0);
+    for primitive in [callback(empty), callback_declining_courtesy_viewport(empty)] {
+        let c = census(
+            &[clipped(rect(0.0, 0.0, 100.0, 100.0), primitive)],
+            PPP,
+            SURFACE,
+        );
+        assert_eq!(
+            (c.callbacks, c.callback_viewports, c.calls),
+            (1, 0, 2),
+            "a callback egui skips must record no viewport — leaving the \
+             primitive's own scissor and the walk's closing one"
+        );
+    }
 }

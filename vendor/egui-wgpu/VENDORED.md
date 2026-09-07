@@ -433,6 +433,47 @@ a frame against the 750 the apitrace leg counted for the whole of such a frame
 under a different layout. The apitrace re-capture that would turn that
 arithmetic into an observation was not taken.
 
+### Changed — `src/renderer.rs`, a callback may decline the courtesy viewport
+
+Upstream's callback arm sets a viewport from the callback's own rect before
+every `paint`, unconditionally, as a courtesy to a callback that wants to draw
+in its rect's coordinates. `squallar_gpu::tile_mesh::TileMeshCallback` does
+not: its geometry is already in screen points, so the first thing its `paint`
+does is overwrite that viewport with the full-frame one. The ground path
+paints **one callback per tile-mesh run**, so on a frame carrying the basemap
+the courtesy set was recorded, replayed and never read, once per run.
+
+Nothing checks a viewport for redundancy at either `wgpu` layer — `wgpu-core`'s
+`StateChange::set_and_check_redundant` covers `set_pipeline` and
+`set_bind_group` and nothing else — so unlike a repeated bind group these all
+reach the HAL encoder and are replayed there at `queue.submit`.
+
+Two edits:
+
+* **`CallbackTrait` gains `courtesy_viewport(&self) -> bool`**, defaulting to
+  `true`, which is upstream's behaviour exactly. A callback returning `false`
+  is stating that its `paint` sets a viewport before it draws.
+* **`render`'s callback arm sets the courtesy viewport only when the callback
+  wants one.** Nothing else about the arm changes: a painted callback still
+  raises `needs_reset` and still drops the walk's remembered scissor, whether
+  it took the viewport or not, because it still owns the pass while it paints.
+
+`Callback::wants_courtesy_viewport` is exposed for the same reason
+`scissor_rect_in_pixels` is: `squallar_gpu::egui_renderer::command_stream`
+predicts what this walk records, the wrapped `dyn CallbackTrait` is private,
+and a census that assumed a viewport per painted callback would over-count by
+exactly the number of runs. Pinned by that module's rule 5
+(`the_vendored_walks_three_rules_are_the_ones_the_census_models`), by
+`declining_the_courtesy_viewport_removes_one_call_per_painted_callback`, and
+on the caller's side by
+`tile_mesh::tests::the_tile_callback_declines_egui_s_viewport_because_it_sets_its_own`,
+which holds the decline and the set that replaces it together.
+
+**Not a timing claim.** The saving is one recorded call per painted callback,
+which `CommandStream` counts exactly and deterministically; the microseconds
+it is worth are below the spread of any leg this workspace can run, and are
+not asserted anywhere.
+
 ## Removing this directory
 
 

@@ -2029,3 +2029,46 @@ fn a_pane_picture_is_held_until_the_pane_is_forgotten() {
         "a released pane is not priced"
     );
 }
+
+/// **The decline and the set that replaces it are one fact.**
+///
+/// `VolumeCallback` tells egui not to set a courtesy viewport because its own
+/// `paint` sets one from `info.viewport_in_pixels()` — the identical rect
+/// egui's courtesy set is computed from — before it blits. So declining is a
+/// pure removal: the pass is left in exactly the state it was left in before,
+/// one recorded `set_viewport` per volume pane per frame lighter. Delete the
+/// set in `paint` while the decline stands and the blit lands on whatever
+/// viewport the previous primitive left, which is a quad over the wrong part
+/// of the screen and not a failure anything else would catch.
+///
+/// Source text, and deliberately: `paint` needs a `RenderPass`, a device and a
+/// populated `VolumeResources` to reach, so the pairing is not observable from
+/// a host test. The counting rule it enables is covered by a real walk in
+/// `squallar_gpu::egui_renderer::command_stream::tests`.
+#[test]
+fn the_volume_callback_declines_egui_s_viewport_because_it_sets_its_own() {
+    const SOURCE: &str = include_str!("../volume_bridge.rs");
+
+    let impl_block = SOURCE
+        .split_once("impl egui_wgpu::CallbackTrait for VolumeCallback {")
+        .map(|(_, rest)| rest)
+        .expect("`VolumeCallback`'s `CallbackTrait` impl moved");
+    assert!(
+        impl_block.contains("fn courtesy_viewport(&self) -> bool {\n        false\n    }"),
+        "the volume callback takes egui's courtesy viewport again; `paint` \
+         overwrites it with an identical rect, so it was never read"
+    );
+
+    let paint = impl_block
+        .split_once("    fn paint(")
+        .map(|(_, rest)| rest)
+        .expect("`VolumeCallback::paint` moved");
+    let (before_blit, _) = paint
+        .split_once("paint_blit(")
+        .expect("`paint` no longer blits its offscreen");
+    assert!(
+        before_blit.contains("render_pass.set_viewport("),
+        "`paint` no longer places its quad with a viewport of its own, and \
+         `courtesy_viewport() -> false` means nothing else sets one either"
+    );
+}

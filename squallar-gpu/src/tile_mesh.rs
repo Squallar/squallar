@@ -708,6 +708,21 @@ impl egui_wgpu::CallbackTrait for TileMeshCallback {
         Vec::new()
     }
 
+    /// **Declined**, and [`Self::paint`] is why: every path of it that draws
+    /// anything sets the full-frame viewport itself, first, because the tile
+    /// geometry is already in screen points. So egui's courtesy set — one
+    /// recorded, replayed `set_viewport` per painted callback, and the ground
+    /// path paints one callback per tile-mesh run — was overwritten unread on
+    /// every frame that carried the basemap.
+    ///
+    /// The paths that decline to draw (no store, no resident mesh, no runs)
+    /// return before they touch the pass at all, so nothing observes the
+    /// viewport they leave standing: the next mesh re-establishes egui's own
+    /// full-frame one through the reset this callback has already forced.
+    fn courtesy_viewport(&self) -> bool {
+        false
+    }
+
     fn paint(
         &self,
         info: egui::PaintCallbackInfo,
@@ -729,12 +744,16 @@ impl egui_wgpu::CallbackTrait for TileMeshCallback {
             return;
         };
 
-        // egui set a viewport from the callback's rect as a courtesy. The
-        // geometry here is already in screen points — the uniform placed it —
-        // so the viewport has to be the whole frame or the tile would be
+        // The geometry here is already in screen points — the uniform placed
+        // it — so the viewport has to be the whole frame or the tile would be
         // squeezed into its own rect a second time. The scissor egui set from
         // the clip rect is what keeps a stretched ancestor inside its piece,
         // and is deliberately left alone.
+        //
+        // egui used to set a viewport from the callback's rect as a courtesy
+        // and this line overwrote it, unread, on every painted callback of
+        // every frame. `courtesy_viewport` below is how this callback declines
+        // it; this set is the one that was always doing the work.
         //
         // Once for the span, not once per run: the runs of a tile share this
         // viewport and this placement slot, and both pipelines below are built

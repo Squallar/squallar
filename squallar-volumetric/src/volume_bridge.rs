@@ -2086,6 +2086,20 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         Vec::new()
     }
 
+    /// **Declined.** [`Self::paint`] sets the viewport itself, from
+    /// `info.viewport_in_pixels()` — the very rect egui's courtesy set is
+    /// computed from — so the courtesy set was overwritten by an identical
+    /// value on every painted frame. Declining leaves the pass in exactly the
+    /// state it was left in before and removes one recorded, replayed
+    /// `set_viewport` per volume pane per frame.
+    ///
+    /// The paths of `paint` that return before that set draw nothing, and the
+    /// next mesh re-establishes egui's own full-frame viewport through the
+    /// reset this callback has already forced.
+    fn courtesy_viewport(&self) -> bool {
+        false
+    }
+
     fn paint(
         &self,
         info: egui::PaintCallbackInfo,
@@ -2117,8 +2131,10 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
             return;
         }
         // The quad covers all of clip space, so the viewport is what places it
-        // over the pane. egui re-binds pipeline, scissor and viewport after
-        // every callback, so nothing here has to be put back.
+        // over the pane — and this is the only set, since `courtesy_viewport`
+        // above declines egui's identical one. The next mesh re-establishes
+        // egui's own pipeline, scissor and full-frame viewport through the
+        // reset this callback forces, so nothing here has to be put back.
         render_pass.set_viewport(
             viewport.left_px as f32,
             viewport.top_px as f32,
