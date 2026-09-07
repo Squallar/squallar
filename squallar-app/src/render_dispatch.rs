@@ -1040,6 +1040,19 @@ impl RenderDispatcher {
         }
         self.level3_data.retain(|(_code, s), _| s != site);
         self.render_cache.retain(|k| k.select.site != site);
+        // The third store keyed on this site, and the largest single entry in
+        // any of them: one whole-volume section payload. It goes on exactly the
+        // terms the render cache above goes on — this site's rasters are all
+        // being given up — and without this line it was given up nowhere, so a
+        // pane that showed one cross-section held a volume for the life of the
+        // process.
+        if self
+            .section_input
+            .as_ref()
+            .is_some_and(|cached| cached.key.site == site)
+        {
+            drop(self.take_section_input());
+        }
     }
 
     /// The narrow counterpart to [`reset_panes_for_site`], for the real-time
@@ -1115,6 +1128,7 @@ impl RenderDispatcher {
         self.render_generation += 1;
         self.level3_data.clear();
         self.render_cache.clear();
+        drop(self.take_section_input());
     }
 
     /// Clear render state for suspend/resume or surface loss.
@@ -1886,11 +1900,28 @@ impl RenderDispatcher {
 
     /// Drop every cached extraction under memory pressure, handing the payloads
     /// back owned for the same reason [`Self::clear_render_cache`] does.
-    pub(crate) fn clear_extract_cache(
-        &mut self,
-    ) -> Vec<Arc<squallar_radar::render_input::RenderInput>> {
+    ///
+    /// **The section payload leaves with them.** It is one whole-volume
+    /// `RenderInput` of exactly the kind this cache holds — the same extraction,
+    /// held in a field instead of a map because there is one of it — and it had
+    /// no release path at all: it survived the pressure step, so a governor that
+    /// gave back every extraction still left a volume resident.
+    pub fn clear_extract_cache(&mut self) -> Vec<Arc<squallar_radar::render_input::RenderInput>> {
         self.extract_recency.clear();
-        self.extract_cache.drain().map(|(_, input)| input).collect()
+        let mut released: Vec<Arc<squallar_radar::render_input::RenderInput>> =
+            self.extract_cache.drain().map(|(_, input)| input).collect();
+        released.extend(self.take_section_input());
+        released
+    }
+
+    /// **Give up the cached whole-volume section payload**, if one is held.
+    ///
+    /// Handed back owned rather than dropped here, so every caller can route it
+    /// to the deferred-drop path instead of freeing a volume on the frame
+    /// thread. `None` when nothing was cached, which is what a caller that runs
+    /// on a schedule needs to be able to say cheaply.
+    fn take_section_input(&mut self) -> Option<Arc<squallar_radar::render_input::RenderInput>> {
+        self.section_input.take().map(|cached| cached.input)
     }
 
     /// How many extractions are resident — the populate tests' observable.
