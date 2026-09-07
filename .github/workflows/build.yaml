@@ -50,6 +50,16 @@ env:
   # abandoned; the format it writes has not changed either.
   XAR_COMMIT: 66d451dab1ef859dd0c83995f2379335d35e53c9
   BOMUTILS_COMMIT: c247002e2f49878bab32dd0fcf805810ae0992cb
+  # CFBundleVersion for every Apple bundle this run builds. App Store Connect
+  # refuses a build whose CFBundleVersion it has already seen for that
+  # CFBundleShortVersionString, and a number kept in a file is one that has to
+  # be bumped by hand before every upload: build 1 of 0.1.0 was accepted on
+  # 2026-09-07 and can never be uploaded again. The run number is monotonic
+  # and never reused; a re-run keeps its run number, so the attempt is
+  # appended when it is not the first (`1234.2`), which is still the
+  # dotted-integer form Apple accepts. The iOS and macOS Makefiles read this
+  # and fall back to project.yml's CURRENT_PROJECT_VERSION for a local build.
+  BUILD_NUMBER: ${{ github.run_attempt != '1' && format('{0}.{1}', github.run_number, github.run_attempt) || github.run_number }}
 
 concurrency:
   group: '${{ github.workflow }} @ ${{ github.ref }}'

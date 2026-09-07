@@ -146,9 +146,11 @@
 #      APPSTORE_* or MACOS_NOTARY_* secrets still in the repository are read by
 #      nothing and should be deleted.
 #
-#   7. Bump `CURRENT_PROJECT_VERSION` in packaging/ios/project.yml for every
-#      upload. App Store Connect rejects a build whose CFBundleVersion it has
-#      already seen for that CFBundleShortVersionString.
+#   7. Nothing to bump. App Store Connect rejects a build whose CFBundleVersion
+#      it has already seen for that CFBundleShortVersionString, so CI passes
+#      BUILD_NUMBER=<run number> and that is what CFBundleVersion becomes;
+#      packaging/ios/project.yml's CURRENT_PROJECT_VERSION is only what a
+#      local build gets. Raise MARKETING_VERSION there for a new version.
 #
 # Until all of that exists the build still runs: it assembles, it says in the
 # log that it is not signing and why, and it uploads an artifact NAMED
@@ -309,7 +311,17 @@ build:
 	yaml_val() { sed -n "s/.*$$1: *\"\{0,1\}\([^\"]*\)\"\{0,1\}.*/\1/p" packaging/ios/project.yml | head -1; }
 	BUNDLE_ID="$$(yaml_val PRODUCT_BUNDLE_IDENTIFIER)"
 	MARKETING_VERSION="$$(yaml_val MARKETING_VERSION)"
-	CURRENT_PROJECT_VERSION="$$(yaml_val CURRENT_PROJECT_VERSION)"
+	# The build number. App Store Connect refuses a build whose CFBundleVersion
+	# it has already seen for that CFBundleShortVersionString (build 1 of
+	# 0.1.0 was accepted on 2026-09-07 and is spent). CI hands in BUILD_NUMBER
+	# from the run number (build.yaml); project.yml's CURRENT_PROJECT_VERSION
+	# is what a local build gets.
+	CURRENT_PROJECT_VERSION="$${BUILD_NUMBER:-$$(yaml_val CURRENT_PROJECT_VERSION)}"
+	case "$$CURRENT_PROJECT_VERSION" in
+	  *[!0-9.]*|"") echo "ERROR: build number '$$CURRENT_PROJECT_VERSION' is not dotted integers (BUILD_NUMBER, else project.yml CURRENT_PROJECT_VERSION)"; exit 1 ;;
+	esac
+	BUILD_NUMBER_SOURCE="packaging/ios/project.yml"; [ -z "$${BUILD_NUMBER:-}" ] || BUILD_NUMBER_SOURCE="BUILD_NUMBER"
+	echo "    build number: $$CURRENT_PROJECT_VERSION (from $$BUILD_NUMBER_SOURCE)"
 	: "$${BUNDLE_ID:?could not read PRODUCT_BUNDLE_IDENTIFIER from packaging/ios/project.yml}"
 	# DTSDKName is read off the SDK the link just used rather than written down
 	# here, so it cannot drift from the image.
