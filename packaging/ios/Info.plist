@@ -97,8 +97,16 @@
          key; iPads are exempt. -->
     <key>CADisableMinimumFrameDurationOnPhone</key>
     <true/>
+    <!-- Must match IOS_MIN in packaging/ios/Makefile, which the build asserts
+         against the Mach-O's own LC_BUILD_VERSION minos rather than trusting
+         both to say the same thing.
+
+         15.0 because App Store Connect warns on anything lower (90068) and
+         makes it a hard refusal in Spring 2027. Raised ahead of the deadline
+         rather than on it: the warning arrives on every upload, and a floor
+         that becomes an error is a worse thing to discover during a release. -->
     <key>MinimumOSVersion</key>
-    <string>14.0</string>
+    <string>15.0</string>
     <!-- 1 = iPhone/iPod, 2 = iPad. Absent, this defaults to iPhone-only, which
          is what left `UISupportedInterfaceOrientations~ipad` below inert. -->
     <key>UIDeviceFamily</key>

@@ -194,7 +194,7 @@ CARGO_VOL ?= squallar-xcross-cargo
 # platform_version spelling collides with the -mios-version-min the wrapper
 # already passes and ld warns "passed two min versions (14.0, 14.0)". Same
 # result, one spelling has no warning to explain to the next reader.
-IOS_MIN ?= 14.0
+IOS_MIN ?= 15.0
 # Reads LC_BUILD_VERSION back out of the linked binary. cctools' own `otool`
 # and `vtool` are not in this image; llvm-objdump is, and its --macho reader
 # prints the same fields. Pinned by absolute path because it is not on PATH.
