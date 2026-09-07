@@ -367,8 +367,14 @@ impl JobSpec for DecodeJob {
         ))
     }
 
+    /// **The archive is not copied to decode it.** This read
+    /// `decode_bytes(input.archive.as_ref().clone())`, which duplicated the
+    /// whole volume — 0.34–17.96 MB, median 5.56 MB — for the length of the
+    /// decode, on up to `Budgets::concurrent_renders` decodes at once, purely
+    /// because `decode_bytes` needs an owned buffer and `run` only ever sees a
+    /// `&DecodeJob`. `decode_shared` takes the pointer the funnel already moved.
     fn run(input: &DecodeJob, _geo: &JobGeometry) -> Option<DecodedScan> {
-        match crate::scan::decode_bytes(input.archive.as_ref().clone()) {
+        match crate::scan::decode_shared(Arc::clone(&input.archive)) {
             Ok(volume) => Some(volume),
             Err(e) => {
                 log::error!("could not decode a Level II volume: {e}");

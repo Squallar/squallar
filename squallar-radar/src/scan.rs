@@ -268,6 +268,27 @@ fn fold_contributions(
 /// left open rather than answered with a log-capture harness built for one
 /// `debug!` line.
 pub fn decode_bytes(bytes: Vec<u8>) -> Result<DecodedScan> {
+    decode_file(nexrad_data::volume::File::new(bytes))
+}
+
+/// [`decode_bytes`] over archive bytes the caller is already sharing.
+///
+/// **The decode does not copy the archive.** `decode_bytes` takes the buffer by
+/// value, so the one production caller — `jobs::DecodeJob::run`, which holds the
+/// archive as the `Arc<Vec<u8>>` the job funnel moves by pointer — had to clone
+/// the whole volume to call it: 0.34–17.96 MB (median 5.56 MB over the archive
+/// sizes this reads), live for the length of the decode, on up to six concurrent
+/// decodes. `File::from_shared` is the vendored door that takes the pointer
+/// instead.
+///
+/// The gzip arm is unchanged and still allocates: `decompress` builds the
+/// inflated buffer and the shared one is released as it does, which is the
+/// behaviour the comment inside [`decode_file`] describes.
+pub fn decode_shared(bytes: std::sync::Arc<Vec<u8>>) -> Result<DecodedScan> {
+    decode_file(nexrad_data::volume::File::from_shared(bytes))
+}
+
+fn decode_file(file: nexrad_data::volume::File) -> Result<DecodedScan> {
     // GUNZIP FIRST, AND BEFORE THE HEADER READ RATHER THAN AFTER.
     //
     // Archives before ~2016 store volumes gzip-wrapped, and every step below
@@ -281,7 +302,7 @@ pub fn decode_bytes(bytes: Vec<u8>) -> Result<DecodedScan> {
     // a modern `_V06` volume pays one two-byte comparison. It takes `self` by
     // value, so the compressed buffer is freed as the decompressed one is
     // built rather than both being held.
-    let file = nexrad_data::volume::File::new(bytes).decompress()?;
+    let file = file.decompress()?;
     let icao = file.header().and_then(|h| h.icao_of_radar());
     match RadarNetwork::of_id(icao.as_deref().unwrap_or("")) {
         RadarNetwork::Wsr88d => decoded(&file),

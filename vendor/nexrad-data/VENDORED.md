@@ -507,6 +507,48 @@ The decoded-moment digest and the raw decompressed-bytes digest are unchanged
 over all 14 volumes. Full method and the control in
 [Measured, end to end](#measured-end-to-end).
 
+#### The shared archive buffer — `src/volume/file.rs`
+
+`File` held its bytes as a `Vec<u8>`; here it holds them as an
+`Arc<Vec<u8>>`, and there is one new constructor.
+
+```rust
+-pub struct File(Vec<u8>);
++pub struct File(std::sync::Arc<Vec<u8>>);
+
++pub fn from_shared(data: std::sync::Arc<Vec<u8>>) -> Self {
++    Self(data)
++}
+```
+
+**Nothing else moves.** `File::new` still takes the buffer by value and is
+still the constructor every existing caller uses; `data`, `header`, `records`,
+`compressed`, `decompress` and `scan` read the same bytes through the same
+expressions. Every derived trait keeps its meaning, because `Arc`'s
+`PartialEq`, `Eq` and `Hash` all forward to the value it holds — two `File`s
+compare and hash exactly as they did. `Clone` gets cheaper rather than
+different: nothing in the crate mutates the buffer, so sharing it is
+unobservable. The one new cost is the `Arc` control block, sixteen bytes per
+`File`.
+
+**Why.** `File::new` is the only door, and it needs to *own* a `Vec<u8>`.
+squallar moves a downloaded archive through its job funnel as an
+`Arc<Vec<u8>>` — a pointer, not a copy, deliberately — and the decode job then
+had to clone the whole volume to open it:
+
+```rust
+crate::scan::decode_bytes(input.archive.as_ref().clone())
+```
+
+Over the 208-volume corpus that workspace measures its decode budget against,
+a compressed archive is **0.34–17.96 MB, median 5.56 MB**, and up to six
+decode concurrently. `from_shared` is the door that takes the pointer. The
+gzip arm is unaffected — `decompress` still inflates into a fresh buffer, and
+the shared one is released as it does.
+
+Offerable upstream as written: it is additive at the API surface, and the
+storage change is invisible to every existing caller.
+
 #### The lint scoping — `src/lib.rs`
 
 Upstream writes

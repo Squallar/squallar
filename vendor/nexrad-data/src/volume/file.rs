@@ -9,8 +9,15 @@ const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 ///
 /// Older NEXRAD archives (pre-~2016) may be gzip-compressed. Call
 /// [`decompress`](Self::decompress) to inflate before accessing records.
+///
+/// LOCAL CHANGE (squallar, see VENDORED.md): the bytes are held behind an
+/// `Arc` so a caller that already has the archive shared can build a `File`
+/// over it instead of copying it ([`File::from_shared`]). Every derived trait
+/// keeps its meaning — `Arc`'s `PartialEq`, `Eq` and `Hash` all forward to the
+/// value — and `Clone` gets cheaper rather than different, because nothing here
+/// mutates the buffer.
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub struct File(Vec<u8>);
+pub struct File(std::sync::Arc<Vec<u8>>);
 
 /// The ceiling a gzip-wrapped volume may decompress to, in bytes.
 ///
@@ -35,6 +42,24 @@ impl File {
     /// The data is stored as-is. Call [`decompress`](Self::decompress) before
     /// accessing records if the file may be gzip-compressed.
     pub fn new(data: Vec<u8>) -> Self {
+        Self(std::sync::Arc::new(data))
+    }
+
+    /// Creates a volume file over archive bytes somebody else already holds.
+    ///
+    /// LOCAL CHANGE (squallar, see VENDORED.md). [`new`](Self::new) takes the
+    /// buffer by value, so a caller holding an `Arc<Vec<u8>>` — which is how a
+    /// downloaded archive travels through squallar's job funnel, one pointer
+    /// rather than a copy — had to clone the whole volume to get one. A
+    /// WSR-88D archive is 0.34–17.96 MB, and up to six decode this way at once.
+    ///
+    /// The data is stored as-is, exactly as `new` stores it. Call
+    /// [`decompress`](Self::decompress) before accessing records if the file may
+    /// be gzip-compressed; on a gzip-wrapped file that allocates the
+    /// decompressed buffer as it always did and the shared one is released
+    /// then, and on an uncompressed file — every `_V06` volume since ~2016 —
+    /// nothing is copied at all.
+    pub fn from_shared(data: std::sync::Arc<Vec<u8>>) -> Self {
         Self(data)
     }
 
@@ -90,7 +115,7 @@ impl File {
             });
         }
 
-        Ok(File(decompressed))
+        Ok(File::new(decompressed))
     }
 
     /// The file's raw data.
