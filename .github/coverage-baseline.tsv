@@ -6,8 +6,8 @@ nexrad-level3/src/model/header.rs	219	217
 nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
 squallar-alloc/src/lib.rs	63	62
-squallar-app/src/app.rs	1646	1201
-squallar-app/src/app_chunks.rs	220	133
+squallar-app/src/app.rs	1647	1201
+squallar-app/src/app_chunks.rs	220	143
 squallar-app/src/app_fetch.rs	1958	1651
 squallar-app/src/app_render.rs	4255	3542
 squallar-app/src/app_state.rs	77	0
@@ -24,7 +24,7 @@ squallar-app/src/loop_frame_store.rs	157	139
 squallar-app/src/loop_pool.rs	382	378
 squallar-app/src/loop_refill.rs	97	90
 squallar-app/src/loop_telemetry.rs	50	50
-squallar-app/src/platform.rs	441	352
+squallar-app/src/platform.rs	470	380
 squallar-app/src/platform_double.rs	342	322
 squallar-app/src/pressure.rs	200	192
 squallar-app/src/recovery.rs	105	104
@@ -225,7 +225,7 @@ squallar-overlays/src/render/handlers/location.rs	76	58
 squallar-overlays/src/render/handlers/metar.rs	637	522
 squallar-overlays/src/render/handlers/mod.rs	103	102
 squallar-overlays/src/render/handlers/model.rs	2562	2419
-squallar-overlays/src/render/handlers/mrms.rs	669	598
+squallar-overlays/src/render/handlers/mrms.rs	669	599
 squallar-overlays/src/render/handlers/outlook.rs	1516	1439
 squallar-overlays/src/render/handlers/reports.rs	725	658
 squallar-overlays/src/render/handlers/sites.rs	98	80
@@ -249,8 +249,8 @@ squallar-radar/src/archive.rs	249	227
 squallar-radar/src/azimuth.rs	191	191
 squallar-radar/src/beam.rs	33	33
 squallar-radar/src/catalogue.rs	174	160
-squallar-radar/src/chunk_feed.rs	271	257
-squallar-radar/src/chunk_notify.rs	402	370
+squallar-radar/src/chunk_feed.rs	271	262
+squallar-radar/src/chunk_notify.rs	402	373
 squallar-radar/src/chunks.rs	975	805
 squallar-radar/src/current.rs	117	116
 squallar-radar/src/derive.rs	320	307
@@ -355,7 +355,7 @@ squallar/src/capacity/vulkan.rs	22	0
 squallar/src/kv.rs	252	236
 squallar/src/main.rs	6	0
 squallar/src/network_security_config.rs	135	132
-squallar/src/platform.rs	158	0
+squallar/src/platform.rs	183	25
 squallar/src/release_artifact_features.rs	167	158
 squallar/src/run.rs	34	0
 vendor/bzip2-rs/src/bitreader.rs	91	88
