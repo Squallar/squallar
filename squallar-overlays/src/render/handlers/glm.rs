@@ -1038,11 +1038,15 @@ impl OverlayHandler for GlmHandler {
     /// travelled at row `i` — the invariant
     /// [`rasterize::HitMap::from_cells`] zips on.
     ///
-    /// **A handle, not a list.** The other two hit-map layers materialise one
-    /// item per row; this one hands over the slab and lets a click build its
-    /// own, so a dispatch costs one refcount bump instead of 125,000 pointers
-    /// copied out of a list that was itself 125,000 allocations to build. See
-    /// [`GlmSlab`].
+    /// **A handle, not a list.** This hands over the slab and lets a click
+    /// build its own item, so a dispatch costs one refcount bump instead of
+    /// 125,000 pointers copied out of a list that was itself 125,000
+    /// allocations to build. See [`GlmSlab`].
+    ///
+    /// The storm-report layer — the only other hit-map layer — reaches the
+    /// same shape by a different route: its items already exist, so its slab
+    /// holds them and `get` clones one pointer, where this one rebuilds a
+    /// flash's item from the packed row.
     fn hit_items(&self) -> Option<HitItems> {
         if self.state.data.is_empty() {
             return None;

@@ -6,18 +6,25 @@
 //! positions name, which stay on the page. This module is the second half, and
 //! it exists in two shapes because two layers pay very different prices for it.
 //!
-//! A layer of a few thousand rows makes one `Arc<dyn OverlayItem>` per row when
-//! its poll lands and hands the list over: the items are already there, and a
-//! dispatch clones a vector of pointers. A layer of six figures of rows cannot.
-//! GLM lightning delivers around 125,000 flashes per 20 s poll, and one `Arc`
-//! per flash is 125,000 allocations at every poll and 125,000 frees on the
-//! frame thread when the next poll replaces them — for a list of which, on any
-//! given click, exactly one element is read.
+//! [`HitItems::Rows`] is the obvious shape — one `Arc<dyn OverlayItem>` per
+//! row, handed over as a vector — and **no layer takes it today**, because
+//! cloning that vector is an item-list walk and an allocation on the frame
+//! thread once per dispatch, for a list of which, on any given click, exactly
+//! one element is read. It is kept as the shape a new layer will reach for
+//! first, and as the one place that walk is counted
+//! ([`crate::walks::note_hit_walk`]).
 //!
-//! So [`HitItems::Slab`] carries a handle to the rows themselves and builds the
-//! one item a click names. The handle owns its rows outright and has no
-//! lifetime: it is a value a handler can park and hand back to be dropped
-//! somewhere other than the frame thread.
+//! So both hit-map layers carry [`HitItems::Slab`]: a handle to the rows, from
+//! which a click builds the one item it names. The handle owns its rows
+//! outright and has no lifetime — a value a handler can park and hand back to
+//! be dropped somewhere other than the frame thread.
+//!
+//! The two arrive at it from opposite ends. GLM lightning delivers around
+//! 125,000 flashes per 20 s poll, so it never materialises items at all and
+//! builds one on demand. Storm reports are a few thousand rows that already
+//! exist as items when their poll lands, so their slab holds those items and
+//! `get` clones a single pointer — the same allocation the layer's own data
+//! holds, not a rebuilt one.
 
 use std::fmt::Debug;
 use std::sync::Arc;

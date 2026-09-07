@@ -149,10 +149,11 @@ impl OverlayItem for Numbered {
     }
 }
 
-/// The materialised arm, [`HitItems::Rows`] — the shape every hit-map layer but
-/// GLM lightning answers, and the one the byte figure below is about. The slab
-/// arm holds one handle and builds nothing until a click asks, so it is not
-/// measured here and could not be: there is no per-item cost to count.
+/// The materialised arm, [`HitItems::Rows`] — **no shipped layer answers it
+/// today**, both hit-map layers having moved to the slab, but it is the shape
+/// a new one reaches for first and it is what the byte figure below is about.
+/// The slab arm holds one handle and builds nothing until a click asks, so it
+/// is not measured here and could not be: there is no per-item cost to count.
 fn numbered(n: u32) -> HitItems {
     (0..n)
         .map(|i| Arc::new(Numbered(i)) as Arc<dyn OverlayItem>)
