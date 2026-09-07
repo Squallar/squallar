@@ -749,12 +749,24 @@ pub(super) fn capacity_with_probe(
 ///
 /// Two readings, summed, and the sum is the point: the OS's available figure
 /// already excludes this process, so a percentage of it alone recedes as the
-/// app grows, and the app's own live bytes are the term that restores the
-/// invariant (`squallar_device_profile::scene::host_pool_bytes` carries the
-/// arithmetic). `squallar_alloc::live_bytes` answers `None` in a process that
-/// never installed the counting allocator — every test binary here — which
-/// the sum reads as zero, under-stating the pool by what this process holds
-/// and never over-stating it.
+/// app grows, and the app's own live bytes are the term that pushes back
+/// (`squallar_device_profile::scene::host_pool_bytes` carries the arithmetic).
+///
+/// **It pushes back on the heap and only on the heap.** What the OS subtracted
+/// is this process's *resident set*; what is added back is the allocator's
+/// *request total*. The pool stays under-stated by everything between them —
+/// the executable, the shared libraries, thread stacks and the graphics
+/// driver's device maps — none of which any allocator hook could ever have
+/// seen. Measured at 256.7-265.0 MiB on this workspace's discrete-GPU Linux
+/// arm, against an irreducible heap floor of 4.23-4.37 MiB. The direction is
+/// the safe one and the residual is deliberate, for reasons the
+/// `host_pool_bytes` doc carries; the `budget state:` line prints `rss` and
+/// `pool residual` so it is a reading rather than a constant.
+///
+/// `squallar_alloc::live_bytes` answers `None` in a process that never
+/// installed the counting allocator — every test binary here — which the sum
+/// reads as zero, dropping that term too and under-stating the pool by the
+/// whole resident set. The same direction at a larger magnitude.
 ///
 /// A free function rather than a method so both callers spell it once: the
 /// seed in [`App::new`], before the first `fit`, and the re-read on the

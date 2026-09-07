@@ -464,26 +464,77 @@ pub fn effective_percent(hardware_bytes: u64, in_force_bytes: u64) -> Option<u8>
 /// `own = pct × available` reads its own consumption back as a smaller
 /// machine, and the ceiling recedes as the app approaches it.
 ///
-/// Write `S` for the figure available when the app held nothing, `L` for its
-/// own live bytes and `A = S − L` for what is available with `L` held. The
-/// naive rule settles where `L = pct × (S − L)`, i.e.
-/// `L = S · pct/(1 + pct)` — at 40 % that is **28.6 % of `S`**, not 40 %, and
+/// Write `S` for the figure available when the app held nothing, `R` for what
+/// the OS has charged this process and `A = S − R` for what is available with
+/// `R` held. The naive rule settles where `R = pct × (S − R)`, i.e.
+/// `R = S · pct/(1 + pct)` — at 40 % that is **28.6 % of `S`**, not 40 %, and
 /// at 100 % it is 50 %. Worse than the wrong number: the ceiling *moves* while
 /// the app allocates, so a governor watching it can never reach it and never
 /// tell that it has not.
 ///
-/// The pool restores the invariant. `available + own live = (S − L) + L = S`
-/// whatever `L` is, so `pct × pool` is a fixed line the app can walk up to and
-/// sit on, and `pct` means what its label says. It is also monotone in the own
-/// figure — a process that holds more never sees its pool shrink for holding
-/// it — which is the property that makes it safe to feed a governor
-/// (`the_pool_never_recedes_as_this_process_grows`).
+/// The sum is the term that pushes back: `available + own live = S − (R − L)`,
+/// where `L` is what the allocator handed out. For every byte the two figures
+/// share, the line is fixed, `pct × pool` is something the app can walk up to
+/// and sit on, and `pct` means what its label says.
+///
+/// # What the sum does not close, and by how much
+///
+/// **`R` is not `L`, and the difference is not added back.** What the OS
+/// subtracted from its available figure is this process's *resident set*; what
+/// this function adds back is the *heap request* total
+/// (`squallar_alloc::live_bytes`). Between them sit the allocator's chunk
+/// headers, its arena retention, huge-page rounding, and — the larger half —
+/// every mapping that never went through `malloc`: the executable, the shared
+/// libraries, thread stacks, mapped fonts, and the graphics driver's device
+/// maps. All of it was subtracted and none of it is credited, so **the pool is
+/// under-stated by `R − L`**.
+///
+/// Measured on this workspace's discrete-GPU Linux arm, 2026-09-06: the
+/// non-heap resident set held **256.7–265.0 MiB, a 3.2 % range across every
+/// condition tested** — empty app, empty steady scene, four quiet legs and one
+/// contaminated at loadavg 21. About 102.4 MiB of it is `/dev/nvidia*`
+/// mappings, constant to 0.1 % over a day and not this app's to release. A
+/// ~152 MiB GPU staging ring (`squallar_gpu::staging_ring`) is driver-owned in
+/// ordinary system RAM and **does not appear as a separable increment**: at the
+/// empty instant the anonymous remainder is only 22.5 MiB, and at scene it
+/// cannot be told from the app's own buffers. It is a possible further term,
+/// not a confirmed one, and it is not to be added to the 265.
+///
+/// **Why the counter cannot see it, rather than only that it cannot**: on the
+/// same arm the app's irreducible heap floor — empty app, every layer off,
+/// device and surface up — is **4.23–4.37 MiB against a ~300 MiB resident
+/// set**. Essentially none of what this process costs the machine at rest is
+/// heap, so there is no allocator hook anywhere that could have counted it.
+/// The gap is not a counter that under-reports; it is a term outside the
+/// counter's domain.
+///
+/// That denominator is one arm on one OS and is not a constant for any other.
+/// What makes the residual readable rather than re-derivable is
+/// `squallar_alloc::process::resident`, which reads `R` in ~11 µs flat in RSS,
+/// and the `budget state:` line, which prints `rss` and `pool residual` beside
+/// `live` on every telemetry tick.
+///
+/// **The direction is the safe one, and it is left uncorrected deliberately.**
+/// An under-stated pool is an under-stated allowance is rungs shed that did not
+/// need to be — the over-firing direction, which refuses rather than
+/// over-promises. Closing it is not a doc change: the only reader of `R` is
+/// Linux-only, so a correction would fix one target and leave the rest, and it
+/// would *raise* every Linux pool by about a quarter of a gigabyte — the
+/// over-promising direction, on the one box whose hard freeze began this
+/// campaign.
+///
+/// Monotonicity holds in the argument and not in the process. The sum can only
+/// rise as `own_live_bytes` rises
+/// (`the_pool_never_recedes_as_this_process_grows`), but a process that grows
+/// its *non-heap* footprint — one more thread, one more driver mapping — is
+/// charged for it in `available` and credited nothing, so the pool recedes by
+/// exactly that growth. The 3.2 % range above is the measured bound on how far.
 ///
 /// `own_live_bytes` is `squallar_alloc::live_bytes()` where the counting
 /// allocator is installed and `None` where it is not; `None` is read as zero
-/// here, which under-states the pool by whatever this process holds. That is
-/// the safe direction — an under-stated pool refuses, it never over-promises
-/// — and it is the arm every process without the allocator takes.
+/// here, which drops the `L` term as well and under-states the pool by the
+/// whole resident set. The same direction at a larger magnitude, and it is the
+/// arm every process without the allocator takes.
 ///
 /// **The pool is not RAM this app may take.** It is the figure a percentage
 /// is taken OF, and what may be taken is [`Capacity::host_allowance`] of that

@@ -2590,8 +2590,21 @@ fn a_page_that_said_what_its_heap_was_built_with_outranks_the_bracket() {
 /// and the ceiling recedes on every step of the way there, so a governor
 /// aiming at it can never arrive and can never tell that it has not.
 ///
-/// The pool `available + own live` is `S` at every `L`, which is the fixed
-/// line the percentage is meant to name.
+/// The pool `available + own live` is `S` at every `L` **in the substitution
+/// below**, which is the fixed line the percentage is meant to name.
+///
+/// # What this cannot check, and what no test at this seam can
+///
+/// The walk hands `host_pool_bytes(START - live, Some(live))`. That
+/// *assumes* the OS's available figure fell by exactly the allocator's
+/// request total — which is the premise that is false: the OS subtracts the
+/// process's **resident set**, so the real identity is `S - (R - L)` and the
+/// pool is under-stated by the difference. `available_bytes` is a parameter,
+/// so how it relates to the other argument is chosen by the caller and is
+/// invisible from in here. **This proves the algebra, not the invariant**,
+/// and it reads like coverage of the invariant. The residual, its measured
+/// magnitude and its direction are on `crate::scene::host_pool_bytes`; the
+/// live figure is `pool residual` on the app's `budget state:` line.
 #[test]
 fn a_percentage_of_available_alone_converges_to_a_smaller_share_than_it_names() {
     use crate::scene::host_pool_bytes;
@@ -2637,9 +2650,18 @@ fn a_percentage_of_available_alone_converges_to_a_smaller_share_than_it_names() 
     }
 }
 
-/// **The pool never recedes as this process grows**, which is the property
-/// that makes it safe to hand a governor: feeding a larger own-live figure
-/// can only raise it.
+/// **The pool never recedes as its own-live ARGUMENT grows**, which is the
+/// property that makes it safe to hand a governor: feeding a larger own-live
+/// figure can only raise it.
+///
+/// **Monotone in the argument is not monotone in the process, and the test
+/// name is the older and wider claim.** A process that grows its *non-heap*
+/// footprint — one more thread, one more driver mapping — is charged for it in
+/// the OS's available figure and credited nothing here, so the pool does
+/// recede by exactly that growth. Bounded rather than absent: the non-heap
+/// resident set held a 3.2 % range across every condition measured on this
+/// workspace's discrete-GPU arm. See `crate::scene::host_pool_bytes` for the
+/// magnitude and why the arithmetic is left as it is.
 ///
 /// Both arms, because over-firing is the worse direction: the sum is monotone
 /// in the own figure, and an absent own figure — a process that never
