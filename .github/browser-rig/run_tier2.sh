@@ -341,6 +341,20 @@ LONG_SEED_LS='{"squallar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\
 # the abort landed 121.8 s (Firefox) and 122.1 s (Chromium) after boot on this
 # scene, so a 90 s leg stops before the thing it is looking for happens. The
 # spread over other scenes ran from 7.3 s upward; 150 s clears the top of it.
+# The `long` (and `huge`) leg's clock. A loop seeded on a live site lists
+# whatever that site is doing today, and what KTLX is doing decides the leg:
+# on 2026-09-07 the leg passed at 05:01Z on VCP 35 (clear air, one volume
+# every 7 min 02 s) and failed on every push from 05:22Z, when KTLX switched
+# to VCP 212 (precipitation, one every 3 min 50 s) at 05:38Z -- 1.84x the
+# volumes in the same one-hour lookback at flat bytes per volume (48.3 vs
+# 50.0 MB raw, decoded off the Level-2 files), and the page's 1 GiB
+# linear-memory wall went with it. A gate whose outcome the atmosphere sets
+# is not a gate, so the leg pins its clock (serve.py --pin-clock) to the end
+# of that VCP 212 run: the seeded one-hour loop lists the same sixteen
+# volumes, 06:24:07Z to 07:21:26Z, every time, from an archive bucket that
+# still listed 2025-09-07 when this was written. Real time is one env var
+# away for a live smoke run; the pinned window is the regression test.
+LONG_PIN_CLOCK="${RIG_LONG_PIN_CLOCK:-2026-09-07T07:22:00Z}"
 LONG_SETTLE="${RIG_LONG_SETTLE:-10}"
 LONG_WINDOW="${RIG_LONG_WINDOW:-140}"
 LONG_PROGRESS_WINDOW="${RIG_LONG_PROGRESS_WINDOW:-20}"
@@ -837,6 +851,8 @@ run_pass() {
     # test. --expect-canvas rides along so a leg that could not be made this
     # big fails instead of quietly reporting a small one.
     SEED="$LONG_SEED_LS"
+    server_args+=(--pin-clock "$LONG_PIN_CLOCK")
+    drive_args+=(--expect-loop-or-refusal)
     drive_args+=(--canvas "$HUGE_CANVAS" --expect-canvas
                  --window "$HUGE_WINDOW"
                  --settle "$HUGE_SETTLE" --data-window "$HUGE_WINDOW_S"
@@ -864,6 +880,12 @@ run_pass() {
     # frame loop is ALIVE after a minute and a half, and stacking the boot-time
     # assertions onto it would only make a slow leg slower.
     SEED="$LONG_SEED_LS"
+    server_args+=(--pin-clock "$LONG_PIN_CLOCK")
+    # Played, or refused and said so. Once the web's admission doors enforce,
+    # this seeded loop is refused by design; without this the leg goes green
+    # for a scene that did nothing, and a green nobody can interpret is
+    # worth less than a red anybody can.
+    drive_args+=(--expect-loop-or-refusal)
     drive_args+=(--settle "$LONG_SETTLE" --data-window "$LONG_WINDOW"
                  --expect-frame-progress "$LONG_PROGRESS_WINDOW")
   elif [ "$leg" = wide ]; then
@@ -1137,8 +1159,17 @@ for leg in legs:
     ifr = r.get("interaction_frames")
     bmg = r.get("basemap_tiles")
     fp = r.get("frame_progress")
+    lor = r.get("loop_or_refusal")
     def tri(x):
         return "-" if x is None else ("ok" if x.get("ok") else "FAIL")
+    # `playing` / `refused` / `NEITHER` -- the third is the failure, and it
+    # is spelled out because "-" would read as "not asserted".
+    def loop_col(x):
+        if x is None:
+            return "-"
+        if x.get("playing"):
+            return "playing"
+        return "refused" if x.get("refused") else "NEITHER"
     # THE SIZE, on the headline row and in DEVICE pixels. Every other figure on
     # this row -- raster bytes, texture uploads, frame times, and the liveness
     # verdict itself -- is a figure PER THIS SIZE. A leg that passed at
@@ -1157,14 +1188,16 @@ for leg in legs:
         size += " [asked %s, met=%s]" % (ct.get("asked"), ct.get("met"))
     print("%-18s %s  boot=%s canvas=%s raf[%s] canvas_blank=%s "
           "errors=%s panics=%s traps=%s round_trip=%s respawn=%s interact=%s "
-          "basemap=%s frames_live=%s"
+          "basemap=%s frames_live=%s loop=%s"
           % (tag, "PASS" if r.get("pass") else "FAIL",
              v.get("booted"), size,
              raf(rw),
              (sh.get("canvas") or {}).get("blank"),
              v.get("rig_error_count"), v.get("panic_count"),
              v.get("wasm_trap_count"),
-             tri(wrt), tri(dr), tri(ifr), tri(bmg), tri(fp)))
+             tri(wrt), tri(dr), tri(ifr), tri(bmg), tri(fp), loop_col(lor)))
+    if lor is not None and not lor.get("ok"):
+        print("%-18s   loop EXPECT FAILED: %s" % ("", lor.get("error")))
     cve = r.get("canvas_expect")
     if cve is not None and not cve.get("ok"):
         print("%-18s   canvas EXPECT FAILED: %s" % ("", cve.get("error")))

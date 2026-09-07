@@ -47,6 +47,13 @@ Rig endpoints (byte transforms of repo files, applied per-response):
                     can never be cache-served the stub -- without that the
                     backoff ladder would deadlock on the stub forever.
 
+  --pin-clock 2026-09-07T07:22:00Z pins both preludes' wall clock: the page
+                    and the worker read that instant plus real elapsed time
+                    from Date.now() / new Date(), so a loop seeded on a site
+                    lists one fixed archive window every run. The Tier-2
+                    `long` leg pins the KTLX VCP 212 window that first hit
+                    the page's 1 GiB linear-memory wall (run_tier2.sh).
+
   /index.html, /sw.js and everything else are served byte-identical to disk.
 
 Programmatic use:
@@ -171,6 +178,31 @@ MIME = {
 PAGE_PRELUDE = b"""<script>/* squallar rig prelude (injected by serve.py, repo untouched) */
 (function () {
   "use strict";
+  // __RIG_PIN_CLOCK_MS__ (see --pin-clock): when not null, this page's wall
+  // clock is pinned. Every `Date.now()` and argument-less `new Date()` --
+  // which is what the app's chrono `Utc::now()` compiles to on wasm, and so
+  // what a radar loop's listing window hangs off -- reads the pinned instant
+  // plus the real time elapsed since this ran. Installed BEFORE this
+  // prelude's own first `Date.now()`, so the rig's timestamps and the app's
+  // clock are one clock: every page-side comparison (frame-progress, stale
+  // readings, t0) stays valid and only the epoch moves. `new Date(x)` and
+  // `Date.parse`/`Date.UTC` are untouched, so a stamp the app READS is
+  // interpreted as before; only what it asks for as "now" moves.
+  var PIN = __RIG_PIN_CLOCK_MS__;
+  if (PIN !== null) {
+    var RealDate = Date;
+    var off = PIN - RealDate.now();
+    var PinnedDate = function Date(...args) {
+      if (!new.target) return String(new PinnedDate());
+      return args.length ? new RealDate(...args) : new RealDate(RealDate.now() + off);
+    };
+    PinnedDate.prototype = RealDate.prototype;
+    PinnedDate.now = function () { return RealDate.now() + off; };
+    PinnedDate.parse = RealDate.parse;
+    PinnedDate.UTC = RealDate.UTC;
+    window.Date = PinnedDate;
+    window.__rig_pin_clock = { pin_ms: PIN, offset_ms: off };
+  }
   var E = (window.__rig_errors = []);
   // 1200 entries, and it STAYS 1200. The cap is a page-memory bound, not a
   // display window: `msg` is truncated at 2000 chars, so the ring's worst
@@ -300,6 +332,31 @@ WORKER_PRELUDE = b"""/* squallar rig worker prelude (injected by serve.py, repo 
 try {
   (function () {
     "use strict";
+    // __RIG_PIN_CLOCK_MS__ (see --pin-clock): when not null, this page's wall
+    // clock is pinned. Every `Date.now()` and argument-less `new Date()` --
+    // which is what the app's chrono `Utc::now()` compiles to on wasm, and so
+    // what a radar loop's listing window hangs off -- reads the pinned instant
+    // plus the real time elapsed since this ran. Installed BEFORE this
+    // prelude's own first `Date.now()`, so the rig's timestamps and the app's
+    // clock are one clock: every page-side comparison (frame-progress, stale
+    // readings, t0) stays valid and only the epoch moves. `new Date(x)` and
+    // `Date.parse`/`Date.UTC` are untouched, so a stamp the app READS is
+    // interpreted as before; only what it asks for as "now" moves.
+    var PIN = __RIG_PIN_CLOCK_MS__;
+    if (PIN !== null) {
+      var RealDate = Date;
+      var off = PIN - RealDate.now();
+      var PinnedDate = function Date(...args) {
+        if (!new.target) return String(new PinnedDate());
+        return args.length ? new RealDate(...args) : new RealDate(RealDate.now() + off);
+      };
+      PinnedDate.prototype = RealDate.prototype;
+      PinnedDate.now = function () { return RealDate.now() + off; };
+      PinnedDate.parse = RealDate.parse;
+      PinnedDate.UTC = RealDate.UTC;
+      self.Date = PinnedDate;
+      self.__rig_pin_clock = { pin_ms: PIN, offset_ms: off };
+    }
     var bc = null;
     try { bc = new BroadcastChannel("__rig"); } catch (_) {}
     function send(o) { try { if (bc) bc.postMessage(o); } catch (_) {} }
@@ -328,13 +385,37 @@ try {
 """
 
 
-def transform_index(raw, block_sw=True, seed_local_storage=None):
+def parse_pin_clock(text):
+    """`2026-09-07T07:22:00Z` -> milliseconds since the epoch. UTC only and
+    the `Z` is required: a pin without a zone would mean a different instant
+    on every runner, which is the one thing a pin exists to prevent."""
+    import datetime
+    if not text.endswith("Z"):
+        raise ValueError("%r must be UTC and end in Z" % text)
+    try:
+        when = datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        raise ValueError("%r is not YYYY-MM-DDTHH:MM:SSZ" % text)
+    when = when.replace(tzinfo=datetime.timezone.utc)
+    return int(when.timestamp() * 1000)
+
+
+def pin_clock_literal(pin_clock_ms):
+    """The JS literal the preludes get for __RIG_PIN_CLOCK_MS__: an integer
+    number of milliseconds since the epoch, or `null` for real time."""
+    return (b"null" if pin_clock_ms is None
+            else str(int(pin_clock_ms)).encode("ascii"))
+
+
+def transform_index(raw, block_sw=True, seed_local_storage=None,
+                    pin_clock_ms=None):
     """index.html bytes -> instrumented page bytes."""
     seed = (json.dumps(seed_local_storage).encode("utf-8")
             if seed_local_storage else b"null")
     prelude = PAGE_PRELUDE.replace(
         b"__RIG_BLOCK_SW__", b"true" if block_sw else b"false").replace(
-        b"__RIG_SEED_LS__", seed)
+        b"__RIG_SEED_LS__", seed).replace(
+        b"__RIG_PIN_CLOCK_MS__", pin_clock_literal(pin_clock_ms))
     marker = b"<head>"
     idx = raw.find(marker)
     if idx >= 0:
@@ -343,9 +424,11 @@ def transform_index(raw, block_sw=True, seed_local_storage=None):
     return prelude + raw  # no <head>: prepend (still first script)
 
 
-def transform_worker(raw):
+def transform_worker(raw, pin_clock_ms=None):
     """worker.js bytes -> instrumented worker bytes."""
-    return WORKER_PRELUDE + b"\n" + raw
+    prelude = WORKER_PRELUDE.replace(
+        b"__RIG_PIN_CLOCK_MS__", pin_clock_literal(pin_clock_ms))
+    return prelude + b"\n" + raw
 
 
 # Served for the FIRST /worker.js request under --doctor-first-worker. A
@@ -398,7 +481,8 @@ class RigHandler(http.server.SimpleHTTPRequestHandler):
             return self._send_transformed(
                 "index.html",
                 lambda raw: transform_index(raw, self.server.rig_block_sw,
-                                            self.server.rig_seed_ls),
+                                            self.server.rig_seed_ls,
+                                            self.server.rig_pin_clock_ms),
                 "text/html; charset=utf-8")
         if path == "/worker.js" and self.server.rig_doctor_first_worker:
             # Exactly the FIRST request gets the stub (threaded server: the
@@ -414,7 +498,9 @@ class RigHandler(http.server.SimpleHTTPRequestHandler):
                                         "text/javascript; charset=utf-8")
         if path == "/worker.js" and self.server.rig_instrument_worker:
             return self._send_transformed(
-                "worker.js", transform_worker, "text/javascript; charset=utf-8")
+                "worker.js",
+                lambda raw: transform_worker(raw, self.server.rig_pin_clock_ms),
+                "text/javascript; charset=utf-8")
         return super().do_GET()
 
     def _send_transformed(self, relname, transform, ctype):
@@ -443,7 +529,7 @@ class RigServer(http.server.ThreadingHTTPServer):
 def start_server(directory=DEFAULT_DIR, port=0, host="127.0.0.1",
                  log=None, block_sw=True, instrument_worker=True, coep=False,
                  seed_local_storage=None, doctor_first_worker=False,
-                 tls_cert=None, tls_key=None):
+                 tls_cert=None, tls_key=None, pin_clock_ms=None):
     """Start serving in a daemon thread. Returns (httpd, thread).
     Stop with stop_server(httpd, thread). Port 0 picks a free port;
     read it from httpd.server_address[1]. With tls_cert+tls_key the
@@ -463,6 +549,7 @@ def start_server(directory=DEFAULT_DIR, port=0, host="127.0.0.1",
     httpd.rig_coep = coep
     httpd.rig_seed_ls = seed_local_storage
     httpd.rig_doctor_first_worker = doctor_first_worker
+    httpd.rig_pin_clock_ms = pin_clock_ms
     httpd.rig_doctor_served = False
     httpd.rig_doctor_lock = threading.Lock()
     thread = threading.Thread(target=httpd.serve_forever,
@@ -503,6 +590,13 @@ def main(argv=None):
                     help="answer the FIRST /worker.js request with a stub that "
                          "posts a doctored build token; later requests get the "
                          "real file (the Tier-2 respawn leg)")
+    ap.add_argument("--pin-clock", default=None, metavar="ISO8601-UTC",
+                    help="pin the page's (and worker's) wall clock: Date.now() "
+                         "and `new Date()` read this instant plus the real "
+                         "time elapsed since the page loaded, e.g. "
+                         "2026-09-07T07:22:00Z. A radar loop seeded on a "
+                         "site then lists the same archive window every run "
+                         "instead of whatever the site is doing today")
     ap.add_argument("--tls-cert", default=None, metavar="PEM",
                     help="serve https with this certificate (pair with "
                          "--tls-key; mkcert output is the intended input -- "
@@ -548,6 +642,14 @@ def main(argv=None):
                   file=sys.stderr)
             return 1
 
+    pin_clock_ms = None
+    if args.pin_clock:
+        try:
+            pin_clock_ms = parse_pin_clock(args.pin_clock)
+        except ValueError as e:
+            print("FATAL: --pin-clock: %s" % e, file=sys.stderr)
+            return 1
+
     log = sys.stderr if args.log == "-" else open(args.log, "a", buffering=1)
     httpd, thread = start_server(
         directory=args.dir, port=args.port, host=args.host, log=log,
@@ -555,7 +657,7 @@ def main(argv=None):
         instrument_worker=not args.no_instrument_worker, coep=args.coep,
         seed_local_storage=seed,
         doctor_first_worker=args.doctor_first_worker,
-        tls_cert=tls_cert, tls_key=tls_key)
+        tls_cert=tls_cert, tls_key=tls_key, pin_clock_ms=pin_clock_ms)
     port = httpd.server_address[1]
     scheme = "https" if httpd.rig_tls else "http"
     # Exactly one machine-parseable stdout line.

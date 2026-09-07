@@ -3330,6 +3330,14 @@ var prep_geometry = null;
 var cadence = null, gpu_unavailable = false, loop_state = null;
 var loop_state_all = [];
 var budget_state = null, budget_state_all = [];
+// The admission doors' running totals, on the TAIL of the same `budget
+// state:` line, after the positional groups above stop at `balloon`:
+// `asked` verdicts, `admitted`, `would refuse` (the advisory figure: what a
+// door WOULD have turned away; on the wasm arm the act proceeds) and
+// `refused` (what a door actually turned away, with the notice raised).
+// Its own regex so the positional one is untouched; null on a bundle from
+// before the counters, never 0.
+var admission_re = /admission asked (\d+) admitted (\d+) would refuse (\d+) refused (\d+)/;
 var interact_all = [], idle_all = [], cadence_all = [];
 var frame_need = null, frame_need_all = [];
 var frame_segment_all = [], tile_take_all = [], tile_phase_all = [];
@@ -3468,7 +3476,16 @@ for (var i = 0; i < C.length; i++) {
                      cap_mib: parseInt(x[13], 10),
                      cap_source: parseInt(x[14], 10),
                      probe: parseInt(x[15], 10),
-                     balloon_mib: parseInt(x[16], 10) };
+                     balloon_mib: parseInt(x[16], 10),
+                     asked: null, admitted: null, would_refuse: null,
+                     refused: null };
+    var ad = admission_re.exec(m);
+    if (ad) {
+      budget_state.asked = parseInt(ad[1], 10);
+      budget_state.admitted = parseInt(ad[2], 10);
+      budget_state.would_refuse = parseInt(ad[3], 10);
+      budget_state.refused = parseInt(ad[4], 10);
+    }
     budget_state_all.push(budget_state);
   }
   x = frame_segment_re.exec(m);
@@ -3682,6 +3699,50 @@ def hist_stats(counts):
             "p90_us": hist_percentile_upper_us(counts, 0.90),
             "p99_us": hist_percentile_upper_us(counts, 0.99),
             "max_us": hist_window_max_us(counts)}
+
+
+def loop_or_refusal(loop_state, budget_state):
+    """A seeded loop either PLAYED or was REFUSED BY A DOOR THAT SAID SO --
+    never neither. The verdict behind `--expect-loop-or-refusal`.
+
+    `playing` reads the last `loop state:` level: at least one layer
+    animating and at least two frames resident (one resident frame is a
+    still wearing a loop's name). `refused` reads the `refused` counter off
+    the last `budget state:` line -- what a door actually turned away, with
+    the notice raised on the glass -- and NOT `would refuse`, which on the
+    advisory arm counts a verdict the act then ignored. The silent case is
+    the one this exists to catch: after admission becomes enforcing on the
+    web, the Tier-2 `long` leg's loop is refused by design, and a leg with
+    only a liveness assertion would go green for a scene that did nothing.
+    A green nobody can interpret is worth less than a red anybody can.
+
+    Pure: two dicts (either may be None) in, one dict out."""
+    ls = loop_state or {}
+    bs = budget_state or {}
+    layers = ls.get("layers")
+    resident = ls.get("resident")
+    refused = bs.get("refused")
+    playing = bool(layers is not None and resident is not None
+                   and layers >= 1 and resident >= 2)
+    refused_seen = bool(refused is not None and refused >= 1)
+    out = {"ok": playing or refused_seen, "playing": playing,
+           "refused": refused_seen,
+           "layers": layers, "resident": resident,
+           "refused_count": refused, "would_refuse": bs.get("would_refuse")}
+    if not out["ok"]:
+        if loop_state is None and budget_state is None:
+            out["error"] = ("neither a `loop state:` nor a `budget state:` "
+                            "line was scraped: the bundle is older than both "
+                            "counters, or the leg did not seed "
+                            "squallar.frame_telemetry")
+        else:
+            out["error"] = (
+                "the seeded loop neither played nor was refused by a door: "
+                "loop state %s layers animating, %s frames resident; "
+                "admission refused %s (would refuse %s). It silently did "
+                "nothing, which is the one outcome a scene may not have"
+                % (layers, resident, refused, bs.get("would_refuse")))
+    return out
 
 
 class FrameLineWatcher:
@@ -6526,8 +6587,49 @@ def selftest_export_window():
     return fails
 
 
+def selftest_loop_or_refusal():
+    """Executable pins on `loop_or_refusal`, the verdict behind
+    --expect-loop-or-refusal. Four fixtures, both arms and both silent
+    shapes: a one-armed pin here would pass for a predicate that returned
+    True whenever a loop line existed. Returns the number of failed pins."""
+    failed = 0
+
+    def pin(name, ok):
+        nonlocal failed
+        print("[self-test] %s %s" % ("ok  " if ok else "FAIL", name))
+        if not ok:
+            failed += 1
+
+    playing = {"layers": 1, "resident": 11}
+    idle = {"layers": 0, "resident": 0}
+    still = {"layers": 1, "resident": 1}
+    quiet = {"refused": 0, "would_refuse": 40}
+    turned_away = {"refused": 1, "would_refuse": 1}
+    v = loop_or_refusal(playing, quiet)
+    pin("a playing loop with no refusal passes", v["ok"] and v["playing"]
+        and not v["refused"])
+    v = loop_or_refusal(idle, turned_away)
+    pin("an idle loop the door refused passes", v["ok"] and v["refused"]
+        and not v["playing"])
+    v = loop_or_refusal(idle, quiet)
+    pin("an idle loop with forty would-refuse and zero refused FAILS and "
+        "names the silent case", not v["ok"]
+        and "neither played nor was refused" in v.get("error", "")
+        and "would refuse 40" in v.get("error", ""))
+    v = loop_or_refusal(still, quiet)
+    pin("one resident frame is a still, not a playing loop", not v["ok"])
+    v = loop_or_refusal(None, None)
+    pin("no lines at all fails as an ABSENCE, not as a refusal",
+        not v["ok"] and "older than both" in v.get("error", ""))
+    v = loop_or_refusal(playing, turned_away)
+    pin("played and refused both true still passes", v["ok"])
+    return failed
+
+
 def selftest():
     failures = []
+    if selftest_loop_or_refusal():
+        failures.append("loop-or-refusal verdict (see [self-test] lines)")
     failures += selftest_android()
     failures += selftest_adapters()
     failures += selftest_tile_cache_settles()
@@ -7305,6 +7407,15 @@ def run_smoke(args):
         # Recorded beside `loop_state`, and None -- never 0 -- when no
         # `budget state:` line matched: an older bundle, not a zero reading.
         result["frame_lines"]["budget_state"] = fl_last.get("budget_state")
+        # Played, or refused and said so -- never neither. Off the same two
+        # LEVEL lines the artifact just recorded, so the verdict and the
+        # figures a reader checks it against are one reading.
+        if args.expect_loop_or_refusal:
+            result["loop_or_refusal"] = loop_or_refusal(
+                fl_last.get("loop_state"), fl_last.get("budget_state"))
+            stage("loop-or-refusal", **{k: v for k, v in
+                                        result["loop_or_refusal"].items()
+                                        if k != "error"})
         # From the WATCHER, deduped by tick, and taken HERE rather than at the
         # worker-signal hand-back: that runs before the last polls, so the
         # artifact carried a list five ticks short of what the window was
@@ -7538,6 +7649,8 @@ def run_smoke(args):
                     % (adapter_label(adapter),
                        webgpu_adapter_label(webgpu_adapter)))
 
+        lor_ok = (result.get("loop_or_refusal") is None
+                  or bool(result["loop_or_refusal"]["ok"]))
         fp_ok = (result.get("frame_progress") is None
                  or bool((result.get("frame_progress") or {}).get("ok")))
         tcs_ok = (result.get("tile_cache_settles") is None
@@ -7570,7 +7683,7 @@ def run_smoke(args):
                               % (ct.get("got"), ct.get("asked")))}
         result["pass"] = (booted and canvas_ok and raf_ok
                           and canvas_blank is not True and not panics
-                          and not traps and fp_ok and tcs_ok
+                          and not traps and fp_ok and tcs_ok and lor_ok
                           and worker_ok and ifr_ok and cwaits_ok
                           and sw_ok is not False and coi_ok is not False
                           and cv_ok is not False
@@ -7596,6 +7709,8 @@ def run_smoke(args):
                                 if traps else None),
             "frame_progress_ok": (None if result.get("frame_progress") is None
                                   else bool(result["frame_progress"]["ok"])),
+            "loop_or_refusal_ok": (None if result.get("loop_or_refusal") is None
+                                   else bool(result["loop_or_refusal"]["ok"])),
             "tile_cache_settles_ok": (None if result.get("tile_cache_settles") is None
                                       else bool(result["tile_cache_settles"]["ok"])),
             # The SIZE this row's every other number is a figure for. A leg
@@ -8799,6 +8914,18 @@ def main(argv=None):
                          "every screenshot and rAF check still passes. Needs "
                          "the squallar.frame_telemetry seed; a leg that never "
                          "wrote the line fails with that stated")
+    ap.add_argument("--expect-loop-or-refusal", action="store_true",
+                    help="PLAYED, OR REFUSED AND SAID SO. Fail unless the last "
+                         "`loop state:` line shows a playing loop (>= 1 layer "
+                         "animating, >= 2 frames resident) OR the last `budget "
+                         "state:` line's `refused` counter is >= 1 -- a door "
+                         "turned the loop away and raised the notice. The "
+                         "silent third outcome, a seeded loop that neither "
+                         "played nor was refused, is the one a green with "
+                         "only --expect-frame-progress would hide once the "
+                         "web's admission doors enforce. `would refuse` does "
+                         "not count: on the advisory arm it is a verdict the "
+                         "act then ignored")
     ap.add_argument("--expect-tile-cache-settles", type=float, default=None,
                     metavar="SECONDS",
                     help="fail unless, over the last SECONDS of the leg, the "
