@@ -162,8 +162,21 @@ pub enum AlphaMode {
 /// rather than keeping a second spelling of it. Two predicates that can
 /// disagree about "is this blank" would be a picture uploaded against a pane
 /// told to clear.
+///
+/// **A word at a time.** "Any non-zero byte" and "any non-zero 64-bit word" are
+/// the same question asked of the same bytes, and the wide spelling is the one
+/// the autovectorizer can widen further; the byte loop this replaced could not
+/// be. No figure is quoted here: the readings taken so far were on a loaded
+/// box, where load biases attribution directionally, so they are leads and not
+/// results. `pod_align_to` splits off the
+/// leading and trailing bytes no aligned word covers, so the answer does not
+/// depend on where the buffer landed or on its length being whole words, and
+/// scanning the head first keeps the short-circuit on ink in the first pixel.
+/// `has_ink_tests` pins this spelling equal to the byte scan element for
+/// element across sizes, alignments, and ink in the first, last and no byte.
 pub fn has_ink(rgba: &[u8]) -> bool {
-    rgba.iter().any(|&b| b != 0)
+    let (head, words, tail) = bytemuck::pod_align_to::<u8, u64>(rgba);
+    head.iter().any(|&b| b != 0) || words.iter().any(|&w| w != 0) || tail.iter().any(|&b| b != 0)
 }
 
 pub struct RasterizeOutput {
@@ -2498,6 +2511,9 @@ mod glm_energy_tests;
 
 #[cfg(test)]
 mod glm_time_tests;
+
+#[cfg(test)]
+mod has_ink_tests;
 
 #[cfg(test)]
 mod hole_tests;
