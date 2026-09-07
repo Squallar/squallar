@@ -208,6 +208,26 @@ pub(crate) fn capacity_source_word(source: CapacitySource) -> &'static str {
 /// dwell of a restoration, and is the only thing that can ever say from the
 /// field that `GPU_RECOVERY_DWELL` was argued too short.
 ///
+/// **`host allowance`, `rss` and `pool residual` are the host axis's three
+/// diagnostics**, and each spells its own absence rather than printing a zero.
+/// `host allowance` is `Capacity::host_allowance`, free because `cap` was
+/// already a parameter — and **`none` there is the UNBOUND regime, not a small
+/// allowance**: with no host figure `fit::over`'s `Pools::Split` host arm is
+/// an `is_some_and` that never fires, so a leg showing `none` has byte figures
+/// that are real readings rather than redistributions against a wall.
+///
+/// `rss` is this process's resident set (`squallar_alloc::process::resident`,
+/// ~11 us and flat in RSS, `none` off Linux) and `pool residual` is
+/// `rss - live` — **the term `pool` above does not have.**
+/// `squallar_device_profile::scene::host_pool_bytes` adds back what the
+/// allocator was asked for, where the OS had already subtracted the whole
+/// resident set; the pool is under-stated by everything between them, which is
+/// every mapping that never went through `malloc` — the executable, the shared
+/// libraries, thread stacks, the driver's device maps. That function's doc
+/// carries the magnitude, the direction, and why closing it would be the wrong
+/// trade. The figure rides here rather than staying a documented constant
+/// because it is one arm's number on one OS.
+///
 /// **The ordering rule for everything appended here: fixed-width fields
 /// first, the variable-arity group LAST.** Anything positioned *behind* a
 /// group whose length varies is what a positional reader cannot find — with
@@ -248,6 +268,7 @@ pub(crate) fn budget_state_line(
     gpu_recovery: &crate::recovery::GpuRecovery,
     doors: squallar_egui::admission::Totals,
     door_spare: squallar_device_profile::admit::Spare,
+    resident: Option<squallar_alloc::process::Resident>,
 ) -> String {
     use std::fmt::Write as _;
 
@@ -303,6 +324,50 @@ pub(crate) fn budget_state_line(
             .filter(|pane| pane.loop_span_clamped())
             .count(),
     );
+    let or_none = |bytes: Option<u64>| {
+        bytes.map_or_else(|| "none".to_string(), |b| format!("{} MiB", mib(b)))
+    };
+    // **Which regime the reading was taken in, and what `pool` above is
+    // missing.** Three fixed-width fields, so they ride in FRONT of `spare`
+    // and `live` per the placement rule on this function.
+    //
+    // `host allowance` is [`Capacity::host_allowance`], and it costs no
+    // plumbing because `cap` was already a parameter. **`none` is not a small
+    // allowance, it is the UNBOUND regime**: a presumed native profile carries
+    // no host figure at all, and `fit::over`'s `Pools::Split` host arm is an
+    // `is_some_and`, so the host axis never fires and every byte figure beside
+    // it is a real reading rather than a redistribution. Two sessions tried to
+    // establish bound-versus-unbound off this line and could not, because the
+    // field did not exist to grep.
+    //
+    // `rss` and `pool residual` are **the term `pool` does not have**.
+    // `scene::host_pool_bytes` adds back `live` — what the allocator was asked
+    // for — where the OS had subtracted the whole resident set, so the pool is
+    // under-stated by `rss - live`: chunk headers, arena retention, and every
+    // mapping that never went through `malloc` (the executable, the shared
+    // libraries, thread stacks, the driver's device maps). That function's doc
+    // carries the magnitude, the direction, and why closing it would be the
+    // wrong trade. It is printed rather than left as a documented constant
+    // because it is one arm's figure on one OS: `rss` is `none` off Linux,
+    // where there is no `/proc` to read it from, and the residual is `none`
+    // in a binary that never installed the counting allocator — an absence,
+    // not a residual of zero.
+    //
+    // The residual is `checked_sub`, so a heap priced above its own residency
+    // — `MADV_DONTNEED` leaves a block live and its page gone — reads `none`
+    // rather than saturating to a zero that would look like perfect coverage.
+    let _ = write!(
+        line,
+        ", host allowance {}, rss {}, pool residual {}",
+        or_none(cap.host_allowance()),
+        or_none(resident.map(|r| r.rss_bytes)),
+        or_none(
+            resident
+                .map(|r| r.rss_bytes)
+                .zip(page_live_bytes)
+                .and_then(|(rss, live)| rss.checked_sub(live)),
+        ),
+    );
     // **Fixed-width fields first, the variable-arity group last.** See the
     // note on this function: everything BEHIND a variable group is what a
     // positional reader cannot find.
@@ -333,15 +398,12 @@ pub(crate) fn budget_state_line(
     // the summed increment against `joint` ALONE and ignores both axes, so
     // the line carried two numbers the door had not looked at and none of the
     // one it had.
-    let door = |bytes: Option<u64>| {
-        bytes.map_or_else(|| "none".to_string(), |bytes| format!("{} MiB", mib(bytes)))
-    };
     let _ = write!(
         line,
         ", door spare gpu {} host {} joint {}",
-        door(door_spare.gpu_bytes),
-        door(door_spare.host_bytes),
-        door(door_spare.joint_bytes),
+        or_none(door_spare.gpu_bytes),
+        or_none(door_spare.host_bytes),
+        or_none(door_spare.joint_bytes),
     );
     // **The admission doors' running totals, handed in.** Read by the caller
     // (`squallar_egui::admission::totals()`) rather than here, for the reason
@@ -572,6 +634,24 @@ mod tests {
     /// other position carries, beside the worker's 600 in [`distinct`].
     const LIVE: Option<u64> = Some(250 << 20);
 
+    /// The resident reading for the distinct line: 900 MiB resident against
+    /// [`LIVE`]'s 250, so `rss` prints 900 and `pool residual` their
+    /// difference, 650 — three figures no other position carries and none of
+    /// them derivable from a neighbour by accident.
+    ///
+    /// Handed in like every other moving figure on this line rather than read
+    /// here: a test binary never installs the counting allocator, and a
+    /// composer that read `/proc` itself would write a different sentence on
+    /// every run.
+    const RESIDENT: Option<squallar_alloc::process::Resident> =
+        Some(squallar_alloc::process::Resident {
+            rss_bytes: 900 << 20,
+            anon_bytes: 700 << 20,
+            file_bytes: 180 << 20,
+            shmem_bytes: 20 << 20,
+            threads: 44,
+        });
+
     const WATCH: crate::pressure::LinearMemoryWatch =
         crate::pressure::LinearMemoryWatch::never_acted();
 
@@ -701,12 +781,14 @@ mod tests {
                 &crate::recovery::GpuRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
                 squallar_device_profile::admit::Spare::default(),
+                RESIDENT,
             ),
             "budget state: bracket desktop, rung 1, steps 3, pool 3072 MiB, \
              ceiling 3840 MiB, vram 24576 MiB, ram 65536 MiB, declared 8192 MiB, \
              threads 32, form 2, linear 300/700 MiB, cap 5120 3, probe 5, \
              balloon 7 MiB, page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
              host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, \
+             host allowance none, rss 900 MiB, pool residual 650 MiB, \
              spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
              live 250/600 MiB",
         );
@@ -728,6 +810,7 @@ mod tests {
                 &crate::recovery::GpuRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
                 squallar_device_profile::admit::Spare::default(),
+                None,
             )
             .contains(", pool 576 MiB,"),
         );
@@ -750,10 +833,11 @@ mod tests {
                 &crate::recovery::GpuRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
                 squallar_device_profile::admit::Spare::default(),
+                None,
             )
             .ends_with(
                 ", probe 5, balloon 0 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, \
+                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, \
                  spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 250/600 MiB"
             ),
@@ -778,10 +862,11 @@ mod tests {
                 &crate::recovery::GpuRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
                 squallar_device_profile::admit::Spare::default(),
+                None,
             )
             .ends_with(
                 ", cap 24576 2, probe 0, balloon 7 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, \
+                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance 30720 MiB, rss none, pool residual none, \
                  spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 250/600 MiB"
             ),
@@ -804,10 +889,11 @@ mod tests {
                 &crate::recovery::GpuRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
                 squallar_device_profile::admit::Spare::default(),
+                None,
             )
             .ends_with(
                 ", cap 3456 0, probe 1, balloon 7 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, \
+                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, \
                  spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 250/600 MiB"
             ),
@@ -893,6 +979,7 @@ mod tests {
             &crate::recovery::GpuRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
             squallar_device_profile::admit::Spare::default(),
+            None,
         );
         let (_, tail) = line
             .split_once(", vram ")
@@ -901,29 +988,149 @@ mod tests {
             tail,
             "0 MiB, ram 0 MiB, declared 0 MiB, threads 0, form 0, linear 0/0 MiB, \
              cap 3840 0, probe 0, balloon 0 MiB, page heap acts 0 at 0 MiB, \
-             heap max 0/0 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, \
+             heap max 0/0 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, \
              spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
              live 0/0 MiB",
         );
         assert_eq!(
             line.matches(", ").count(),
-            23,
-            "twenty-four comma-separated groups with no pane rows, twenty-three \
+            26,
+            "twenty-seven comma-separated groups with no pane rows, twenty-six \
              separators: a field was dropped or gained. It was seventeen until \
              the recovery governor's `host steps N promotions N churn N` landed, \
              which is ONE group of three space-separated figures and so moved \
              this by one; eighteen until the admission doors' \
              `admission asked N admitted N would refuse N refused N`, one group \
              of four; twenty until ruling 15's `loop over N MiB` and \
-             ruling 13's `loop clamped N` landed as two more; and twenty-two \
+             ruling 13's `loop clamped N` landed as two more; twenty-two \
              until the GPU governor's \
              `gpu steps N restored N dwell Nx N s churn N` landed beside the \
              host trio, one group of five space-separated figures and so one \
-             more separator again. **Re-derived by \
+             more separator again; and twenty-three until `host allowance`, \
+             `rss` and `pool residual` landed as three single-figure groups. \
+             **Re-derived by \
              counting the line this build actually writes**, not by adding one \
              lane's figure to another's: the doors and the loop fields landed \
              from two lanes on one day and each was pinned against a line \
              without the other's field on it",
+        );
+    }
+
+    /// **`host allowance` says which regime the reading was taken in**, and
+    /// `none` there is the UNBOUND one rather than a small allowance.
+    ///
+    /// A native profile with no host figure carries `host_bytes: None`, so
+    /// `Capacity::host_allowance` is `None` and `fit::over`'s `Pools::Split`
+    /// host arm — an `is_some_and` — never fires. The host axis is not binding
+    /// at all there, and every byte figure beside it on this line is a real
+    /// reading rather than a redistribution against a wall. Two sessions tried
+    /// to establish bound-from-unbound off this line and could not, because
+    /// the field was not on it.
+    ///
+    /// Both arms, because a field that only ever printed `none` would satisfy
+    /// a literal pin without ever having been computed.
+    #[test]
+    fn the_line_says_whether_the_host_axis_is_bound() {
+        let (budgets, profile, linear) = distinct();
+        let line_for = |cap: &Capacity| {
+            budget_state_line(
+                &budgets,
+                &profile,
+                linear,
+                POOL,
+                BALLOON,
+                OVER,
+                cap,
+                PROBE,
+                WATCH,
+                &no_readout(),
+                LIVE,
+                &crate::recovery::HostRecovery::untouched(),
+                &crate::recovery::GpuRecovery::untouched(),
+                squallar_egui::admission::Totals::default(),
+                squallar_device_profile::admit::Spare::default(),
+                RESIDENT,
+            )
+        };
+        assert!(
+            CAP.host_bytes.is_none(),
+            "the distinct capacity is the unbound arm; this case has no other",
+        );
+        assert!(
+            line_for(&CAP).contains(", host allowance none, "),
+            "an unbound host axis must spell itself: {}",
+            line_for(&CAP),
+        );
+        // The bound arm prints `host_allowance`'s own three quarters, which is
+        // that method's arithmetic and not this line's.
+        let bound = Capacity {
+            host_bytes: Some(4 << 30),
+            ..CAP
+        };
+        assert_eq!(bound.host_allowance(), Some(3 << 30));
+        assert!(
+            line_for(&bound).contains(", host allowance 3072 MiB, "),
+            "a bound host axis must print the allowance in force: {}",
+            line_for(&bound),
+        );
+    }
+
+    /// **`pool residual` is the term the host pool does not have**, printed on
+    /// the line rather than left as a constant in a doc comment.
+    ///
+    /// `scene::host_pool_bytes` adds back `live` — what the allocator was
+    /// asked for — where the OS had already subtracted the whole resident set,
+    /// so the pool it returns is under-stated by `rss - live`. That difference
+    /// is not a rounding error: on this workspace's discrete-GPU arm the
+    /// non-heap resident set held 256.7-265.0 MiB across every condition
+    /// tested. It is one arm's figure on one OS, which is why it is read here
+    /// rather than written down.
+    ///
+    /// Every arm, because three of the four are absences and an absence that
+    /// printed `0` would read as perfect coverage.
+    #[test]
+    fn the_line_carries_the_pool_residual_the_host_pool_omits() {
+        let (budgets, profile, linear) = distinct();
+        let line_for = |resident, live| {
+            budget_state_line(
+                &budgets,
+                &profile,
+                linear,
+                POOL,
+                BALLOON,
+                OVER,
+                &CAP,
+                PROBE,
+                WATCH,
+                &no_readout(),
+                live,
+                &crate::recovery::HostRecovery::untouched(),
+                &crate::recovery::GpuRecovery::untouched(),
+                squallar_egui::admission::Totals::default(),
+                squallar_device_profile::admit::Spare::default(),
+                resident,
+            )
+        };
+        assert!(
+            line_for(RESIDENT, LIVE).contains(", rss 900 MiB, pool residual 650 MiB, "),
+            "the residual is the resident set less the allocator's request total",
+        );
+        assert!(
+            line_for(None, LIVE).contains(", rss none, pool residual none, "),
+            "no `/proc` to read is an absence, not a process of zero bytes",
+        );
+        assert!(
+            line_for(RESIDENT, None).contains(", rss 900 MiB, pool residual none, "),
+            "a binary that never installed the counting allocator has no residual \
+             to state, and every test binary here is one",
+        );
+        // A heap priced above its own residency is a REAL state, not an error:
+        // `MADV_DONTNEED` leaves a block live and its page gone. It reads
+        // `none` rather than saturating to a zero that would look like a pool
+        // with nothing missing from it.
+        assert!(
+            line_for(RESIDENT, Some(2000 << 20)).contains(", rss 900 MiB, pool residual none, "),
+            "a live figure above the resident set must not saturate to zero",
         );
     }
 
@@ -962,6 +1169,7 @@ mod tests {
                 host_bytes: Some(200 << 20),
                 joint_bytes: Some(300 << 20),
             },
+            None,
         );
         assert!(
             line.contains("spare gpu 3568 MiB host 601 MiB, "),
@@ -1001,6 +1209,7 @@ mod tests {
                 host_bytes: None,
                 joint_bytes: None,
             },
+            None,
         );
         assert!(
             line.contains("door spare gpu 0 MiB host none joint none,"),
@@ -1054,6 +1263,7 @@ mod tests {
             &crate::recovery::GpuRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
             squallar_device_profile::admit::Spare::default(),
+            None,
         );
         let read_by_the_rig = rendered(&pattern("budget_state_re"), &DISTINCT_GROUPS);
         assert!(
@@ -1064,7 +1274,7 @@ mod tests {
         assert_eq!(
             &line[read_by_the_rig.len()..],
             ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
-             host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, spare gpu none host none, door spare gpu none host none joint none, \
+             host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, spare gpu none host none, door spare gpu none host none joint none, \
              admission asked 0 admitted 0 would refuse 0 refused 0, \
              live 250/600 MiB",
             "the tail the rig does not read drifted",
@@ -1100,6 +1310,7 @@ mod tests {
             &crate::recovery::GpuRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
             squallar_device_profile::admit::Spare::default(),
+            None,
         );
         assert!(
             line.starts_with(&read_by_the_rig),
@@ -1108,7 +1319,7 @@ mod tests {
         assert_eq!(
             &line[read_by_the_rig.len()..],
             ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
-             host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, \
+             host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, \
              spare gpu 3568 MiB host 601 MiB, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
              live 250/600 MiB, \
              pane0 gpu 272 MiB host 0 MiB shared 0 MiB own 272 MiB, \
@@ -1144,6 +1355,7 @@ mod tests {
                 &crate::recovery::GpuRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
                 squallar_device_profile::admit::Spare::default(),
+                None,
             );
             let (fixed, _) = line.split_once(", pane0 ").unwrap_or((line.as_str(), ""));
             assert!(
@@ -1183,7 +1395,8 @@ mod tests {
             &crate::recovery::GpuRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
             squallar_device_profile::admit::Spare::default(),
-            )
+            None,
+        )
             .ends_with(
                 ", spare gpu 0 MiB host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 250/600 MiB"
@@ -1213,6 +1426,7 @@ mod tests {
                 &crate::recovery::GpuRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
                 squallar_device_profile::admit::Spare::default(),
+                None,
             )
             .starts_with(&good)
         );
@@ -1235,6 +1449,7 @@ mod tests {
                 &crate::recovery::GpuRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
                 squallar_device_profile::admit::Spare::default(),
+                None,
             )
             .starts_with(&drifted),
             "a line with one extra space compared equal to the real one, so the \
@@ -1279,11 +1494,12 @@ mod tests {
             &crate::recovery::GpuRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
             squallar_device_profile::admit::Spare::default(),
+            None,
         );
         assert!(
             never.ends_with(
                 ", page heap acts 0 at 0 MiB, heap max 0/0 MiB, \
-                 host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, spare gpu none host none, door spare gpu none host none joint none, \
+                 host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, spare gpu none host none, door spare gpu none host none joint none, \
                  admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 0/0 MiB"
             ),
@@ -1318,11 +1534,12 @@ mod tests {
             &crate::recovery::GpuRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
             squallar_device_profile::admit::Spare::default(),
+            None,
         );
         assert!(
             acted.ends_with(
                 ", page heap acts 2 at 1011 MiB, heap max 0/0 MiB, \
-                 host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, spare gpu none host none, door spare gpu none host none joint none, \
+                 host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, spare gpu none host none, door spare gpu none host none joint none, \
                  admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 0/0 MiB"
             ),
@@ -1390,6 +1607,7 @@ mod tests {
             &crate::recovery::GpuRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
             squallar_device_profile::admit::Spare::default(),
+            None,
         );
         assert!(
             line.contains(", host steps 2 promotions 1 churn 1,"),
@@ -1445,6 +1663,7 @@ mod tests {
             &gpu,
             squallar_egui::admission::Totals::default(),
             squallar_device_profile::admit::Spare::default(),
+            None,
         );
         assert!(
             line.contains(", gpu steps 2 restored 1 dwell 4x 120 s churn 1,"),

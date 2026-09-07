@@ -2449,6 +2449,7 @@ impl super::App {
                     &self.gpu_recovery,
                     squallar_egui::admission::totals(),
                     self.admission_costs.spare,
+                    squallar_alloc::process::resident(),
                 )),
         );
         // What this frame's panes' overlay pictures are sized at, so a

@@ -427,6 +427,7 @@ fn the_budget_line_carries_the_admission_counters() {
         &crate::recovery::GpuRecovery::untouched(),
         doors,
         squallar_device_profile::admit::Spare::default(),
+        None,
     );
     assert!(
         line.contains("admission asked 7 admitted 5 would refuse 2 refused 0"),

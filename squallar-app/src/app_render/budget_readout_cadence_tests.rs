@@ -122,6 +122,7 @@ fn a_tick_inside_the_period_composes_nothing_and_the_line_reads_what_it_composed
         &app.gpu_recovery,
         squallar_egui::admission::Totals::default(),
         app.admission_costs.spare,
+        None,
     );
     assert!(
         line.contains("pane0 gpu ") && line.contains("pane1 gpu "),
