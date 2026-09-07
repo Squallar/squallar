@@ -15,5 +15,6 @@ keystore.properties
 app/keystore.properties
 *.jks
 *.keystore
-# Written by CI beside keystore.properties: which key signed this run.
+# Written by CI beside keystore.properties: which key signed this run, and
+# that certificate's SHA-256, for the proof step to check the APK against.
 SIGNING

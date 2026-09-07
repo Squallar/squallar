@@ -623,8 +623,16 @@ jobs:
               echo "keyAlias=$ANDROID_KEY_ALIAS"
               echo "keyPassword=$ANDROID_KEY_PASSWORD"
             } > keystore.properties
-            echo static > SIGNING
-            echo "signing with the project key (alias $ANDROID_KEY_ALIAS)"
+            # The keystore certificate's SHA-256, written beside the kind so
+            # the proof step can check the APK's signer against it without
+            # needing the password. Normalised to what apksigner prints:
+            # lowercase hex, no colons.
+            sha=$(KS_PASS="$ANDROID_KEYSTORE_PASSWORD" "$JAVA_HOME/bin/keytool" -list -v \
+                    -keystore ci-signing.jks -storetype PKCS12 -storepass:env KS_PASS \
+                    -alias "$ANDROID_KEY_ALIAS" | grep -m1 'SHA256:' | sed 's/.*SHA256: *//; s/://g' | tr 'A-F' 'a-f')
+            [ ${#sha} -eq 64 ] || { echo "::error::could not read the certificate SHA-256 out of the keystore (got '$sha')."; exit 1; }
+            printf 'static\n%s\n' "$sha" > SIGNING
+            echo "signing with the project key (alias $ANDROID_KEY_ALIAS, SHA-256 $sha)"
             exit 0
           fi
 
@@ -649,8 +657,12 @@ jobs:
             echo "keyAlias=ci"
             echo "keyPassword=squallar-ci-throwaway"
           } > keystore.properties
-          echo throwaway > SIGNING
-          echo "no ANDROID_KEYSTORE secret: signing with a throwaway key"
+          sha=$(KS_PASS=squallar-ci-throwaway "$JAVA_HOME/bin/keytool" -list -v \
+                  -keystore ci-signing.jks -storetype PKCS12 -storepass:env KS_PASS -alias ci \
+                  | grep -m1 'SHA256:' | sed 's/.*SHA256: *//; s/://g' | tr 'A-F' 'a-f')
+          [ ${#sha} -eq 64 ] || { echo "::error::could not read the certificate SHA-256 out of the throwaway keystore (got '$sha')."; exit 1; }
+          printf 'throwaway\n%s\n' "$sha" > SIGNING
+          echo "no ANDROID_KEYSTORE secret: signing with a throwaway key (SHA-256 $sha)"
 
       # `rcodesign` and `zip` before the row runs, not after: unlike the macOS
       # rows -- which build a bare binary and package it in a later step --
@@ -766,8 +778,22 @@ jobs:
 
           certs=$("$bt/apksigner" verify --verbose --print-certs "$apk")
           printf '%s\n' "$certs"
-          if ! printf '%s\n' "$certs" | grep -q 'OU=throwaway signing key'; then
-            echo "::error::$apk carries a valid signature, but not from the throwaway key this workflow mints."
+
+          # The signer must be the key the signing step used, whichever that
+          # was. Compared by certificate SHA-256 rather than by subject: the
+          # earlier check looked for the throwaway key's DN, which meant the
+          # first build signed with the project key failed here as "not from
+          # the throwaway key" -- a correct signature rejected for not being
+          # the wrong one.
+          signing=$(sed -n 1p packaging/android/SIGNING 2>/dev/null || echo unknown)
+          want=$(sed -n 2p packaging/android/SIGNING 2>/dev/null || true)
+          fp=$(printf '%s\n' "$certs" | grep -m1 'certificate SHA-256 digest:' | sed 's/.*: *//' | tr 'A-F' 'a-f')
+          if [ -z "$want" ] || [ -z "$fp" ]; then
+            echo "::error::cannot compare signers: keystore SHA-256 '$want', APK signer SHA-256 '$fp'. The signing step writes packaging/android/SIGNING; if it is missing that step did not run."
+            exit 1
+          fi
+          if [ "$fp" != "$want" ]; then
+            echo "::error::$apk is signed by SHA-256 $fp, but the $signing keystore this run wrote has SHA-256 $want. Gradle signed with something other than keystore.properties."
             exit 1
           fi
 
@@ -789,8 +815,6 @@ jobs:
           # Which key, read off the disk (the signing step wrote it), and the
           # signer's fingerprint printed so a person can check the APK on their
           # phone is the project key and not a stray throwaway one.
-          signing=$(cat packaging/android/SIGNING 2>/dev/null || echo unknown)
-          fp=$(printf '%s\n' "$certs" | grep -m1 'SHA-256' | sed 's/.*: *//')
           echo "ok: signed ($signing key, SHA-256 $fp), not debuggable, $got"
           if [ "$signing" = static ]; then
             echo "::notice::${{ matrix.name }} is signed with the project key (SHA-256 $fp). It installs over any earlier build signed with the same key."
