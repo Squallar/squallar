@@ -2581,6 +2581,41 @@ directory has ever had over label collision: upstream ships no `mod tests` in
 `text.rs` at all. That absence is why replacing its predicate had to be checked
 by *running* the old one, rather than by watching a suite stay green.
 
+### Changed — source, thirty-second commit: a parsed layer stops holding twice the feature slots it filled
+
+`src/mvt.rs`, `parse`. One `.collect()` becomes a `Vec::with_capacity` and a
+loop, and the reason is a std specialisation nothing in the file named.
+
+`reader.get_features(..).into_iter().map(..).collect::<Vec<ParsedFeature>>()`
+meets std's **in-place collect** conditions — the source item is wider than the
+destination one and no less aligned — so the destination does not allocate at
+all: it reuses the decode's own buffer and takes a capacity of
+`src_capacity * size_of::<Src>() / size_of::<Dst>()`. Measured on the pinned
+toolchain (rustc 1.97.1): `mvt_reader::feature::Feature<f32>` is **112** bytes
+and `ParsedFeature` is **56**, so the ratio is exactly **2** and every parsed
+layer held two feature slots for every feature it had.
+
+A `ParsedTile` is cached rather than transient, so that slack was resident for
+the tile's whole life. On the committed Monaco z14 8529/5974 fixture (2,913
+features across 14 source layers) it is **163,128 B of the 2,092,002 the tile
+was priced at — 7.8%**, for nothing. Same trade `shrink_geometry` and
+`tessellate_polygon` already make in this file, taken the same way.
+
+`Vec::with_capacity` and a loop rather than `.collect()` followed by
+`shrink_to_fit`, because the shrink would allocate the right-sized buffer and
+memcpy into it *after* the wrong-sized one already existed; this way the right
+size is the only one asked for. Both are correct whether or not the
+specialisation fires, which is the point — the fix does not depend on a std
+implementation detail, only the *defect* did.
+
+`squallar_egui::tile_source::MEASURED_PARSED_TILE_BYTES` falls **2,092,002 ->
+1,928,874**, re-derived by forcing its band test to fail, not by subtraction.
+
+**Pin**: `mvt::tests::a_parsed_layer_holds_no_feature_slots_it_did_not_fill` —
+capacity against length for every layer of the fixture, with the fixture's
+seven features counted beside it so that a parse which decoded nothing cannot
+satisfy the equalities. Shown red against the tree before this commit.
+
 ## rustfmt
 
 `cargo fmt -p walkers -- --check` is clean over this directory as vendored,

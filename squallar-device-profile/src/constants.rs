@@ -1009,7 +1009,9 @@ pub const fn mib(n: usize) -> usize {
 /// (the plan's ~1.03 MB had the fills and not the strokes; the band test
 /// re-derived it at 1,462,708), and a typical dense-city entry is ~30 KB. A
 /// **parsed** entry is the style-independent decode a restyle re-tessellates
-/// from, ~2.09 MB at the same tail (`MEASURED_PARSED_TILE_BYTES`). A
+/// from, ~1.93 MB at the same tail (`MEASURED_PARSED_TILE_BYTES`, re-derived
+/// at 1,928,874 on 2026-09-07 when the features `Vec` stopped holding two
+/// slots per feature). A
 /// **terrain** entry is one 256x256 RGBA texture, 256 KiB, no tail.
 ///
 /// **Need and economy.** The tile cache is a byte-bounded LRU with a floor in
@@ -1051,7 +1053,7 @@ pub const fn mib(n: usize) -> usize {
 /// (`the_mobile_bracket_promotes_nothing_until_somebody_measures_aarch64`).
 /// Desktop starts at 160/192/64 — 114 tail entries, the user's own window at
 /// the tail (106) with eight to spare, and a parsed cache that restyles the
-/// common 1920x1200 canvas (96 x 2.09 MB = 201 MB, held to 192) wholly from
+/// common 1920x1200 canvas (96 x 1.93 MB = 185 MB, inside 192) wholly from
 /// cache; a 2560x1440 window between zooms (144 entries, 211 MB at the tail)
 /// is the floor's overrun and the step's fit (256 MiB, 183 entries) — and
 /// rises to 512/384/128 on a discrete adapter with a desktop shape, where a

@@ -1729,9 +1729,9 @@ fn the_tile_allowances_are_the_written_figures_on_every_bracket() {
         desktop_step / TAIL,
     );
     // Desktop's parsed floor restyles the common 1920x1200 canvas — 96 tiles
-    // between zooms — from cache at the parsed tail (2.09 MB), to within the
-    // rounding its doc states.
-    const PARSED_TAIL: usize = 2_092_002;
+    // between zooms — from cache at the parsed tail (1.93 MB, re-derived
+    // 2026-09-07), to within the rounding its doc states.
+    const PARSED_TAIL: usize = 1_928_874;
     let desktop_parsed = BudgetLimits::DESKTOP.tile_parsed_bytes.floor;
     assert!(
         desktop_parsed / PARSED_TAIL >= 96,

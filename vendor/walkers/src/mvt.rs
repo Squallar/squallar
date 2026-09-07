@@ -347,17 +347,32 @@ pub fn parse(data: &[u8]) -> Result<ParsedTile, Error> {
     for layer in metadata {
         let extent_supported = layer.extent == ONLY_SUPPORTED_EXTENT;
         let features = if extent_supported {
-            reader
-                .get_features(layer.layer_index)?
-                .into_iter()
-                .map(|mut feature| {
-                    shrink_geometry(&mut feature.geometry);
-                    ParsedFeature {
-                        geometry: feature.geometry,
-                        properties: Arc::new(feature.properties.unwrap_or_default()),
-                    }
-                })
-                .collect()
+            let decoded = reader.get_features(layer.layer_index)?;
+            // **Built at its own length, because `.collect()` here is not.**
+            // `Vec<Feature<f32>>::into_iter().map(..).collect::<Vec<ParsedFeature>>()`
+            // meets std's in-place-collect conditions -- the source item is
+            // wider than the destination one and no less aligned -- so the
+            // destination reuses the decode's allocation and takes a capacity
+            // of `src_capacity * size_of::<Feature>() / size_of::<ParsedFeature>()`.
+            // Measured on the pinned toolchain (rustc 1.97.1):
+            // `mvt_reader::feature::Feature<f32>` is 112 bytes and
+            // `ParsedFeature` is 56, so that ratio is exactly 2 and every
+            // parsed layer held twice the feature slots it had features.
+            //
+            // A parsed tile is cached, not transient, so the slack was
+            // resident for the tile's whole life: on the committed Monaco z14
+            // city-core fixture (2,913 features) **163,128 B of the 2,092,002
+            // a tile was priced at, 7.8%**. Same trade [`shrink_geometry`] and
+            // [`tessellate_polygon`] already make, and taken the same way.
+            let mut features = Vec::with_capacity(decoded.len());
+            for mut feature in decoded {
+                shrink_geometry(&mut feature.geometry);
+                features.push(ParsedFeature {
+                    geometry: feature.geometry,
+                    properties: Arc::new(feature.properties.unwrap_or_default()),
+                });
+            }
+            features
         } else {
             Vec::new()
         };
@@ -1914,6 +1929,40 @@ mod tests {
             from_parse_full, from_parse_lines,
             "non-vacuity: the two styles must render differently, or the \
              equalities above would hold for a styling that ignored the style"
+        );
+    }
+
+    /// **A parsed layer holds exactly the feature slots it has features.**
+    ///
+    /// `.collect()` in [`parse`] used to take the decode's own allocation and
+    /// hand back twice the capacity, because std collects in place when the
+    /// source item is wider than the destination one — see the note there.
+    /// The slack was resident for the cached tile's whole life.
+    ///
+    /// The count beside the loop is the non-vacuity control: capacity equals
+    /// length for a layer that decoded nothing, so a parse that dropped every
+    /// feature would satisfy the equalities on its own.
+    #[test]
+    fn a_parsed_layer_holds_no_feature_slots_it_did_not_fill() {
+        let parsed = parse(&fixture()).expect("the fixture parses");
+
+        let mut features = 0;
+        for layer in &parsed.layers {
+            assert_eq!(
+                layer.features.capacity(),
+                layer.features.len(),
+                "source layer '{}' holds {} feature slots for {} features",
+                layer.name,
+                layer.features.capacity(),
+                layer.features.len()
+            );
+            features += layer.features.len();
+        }
+
+        assert_eq!(
+            features, 7,
+            "the fixture's seven features must all be decoded, or the \
+             equalities above hold over nothing"
         );
     }
 
