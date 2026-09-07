@@ -761,13 +761,14 @@ fn a_switched_off_panes_mosaic_is_evicted_where_the_history_binds() {
         h.cached_grids.insert(
             p,
             Arc::new(sized(p, 100)),
-            &[
-                MrmsProduct::ReflectivityComposite,
-                MrmsProduct::PrecipRate,
-            ],
+            &[MrmsProduct::ReflectivityComposite, MrmsProduct::PrecipRate],
         );
     }
-    assert_eq!(h.cached_grids.len(), 2, "premise: both mosaics are resident");
+    assert_eq!(
+        h.cached_grids.len(),
+        2,
+        "premise: both mosaics are resident"
+    );
     assert_eq!(h.cached_grids.resident_bytes(), 800, "premise: 400 B each");
 
     // Pane 0 shows Reflectivity; pane 1 still selects PrecipRate but its layer

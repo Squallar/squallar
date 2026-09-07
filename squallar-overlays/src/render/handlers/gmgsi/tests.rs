@@ -796,7 +796,11 @@ fn a_switched_off_panes_granule_is_evicted_where_the_history_binds() {
             &[GmgsiChannel::LongwaveIr, GmgsiChannel::Visible],
         );
     }
-    assert_eq!(h.cached_grids.len(), 2, "premise: both granules are resident");
+    assert_eq!(
+        h.cached_grids.len(),
+        2,
+        "premise: both granules are resident"
+    );
 
     let on = pane_state(GmgsiChannel::LongwaveIr);
     let off = disabled_pane_state(GmgsiChannel::Visible);

@@ -566,7 +566,9 @@ pub(crate) mod feed_level_serial {
     /// Take the level for this thread. Poison is recovered rather than
     /// propagated: one panicking test must not cascade into every other.
     pub(crate) fn exclusive() -> Exclusive {
-        let guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         HOLDING.with(|h| h.set(true));
         Exclusive(guard)
     }
@@ -578,7 +580,9 @@ pub(crate) mod feed_level_serial {
             apply();
             return;
         }
-        let _serial = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _serial = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         apply();
     }
 }
