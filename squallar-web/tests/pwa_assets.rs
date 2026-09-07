@@ -679,10 +679,10 @@ fn ci_staged_paths() -> BTreeSet<String> {
                 .split_whitespace()
                 .next()
                 .and_then(|d| d.strip_prefix("dist/"))
-            {
-                staged.insert(under_dist.to_string());
-                cp_lines += 1;
-            }
+        {
+            staged.insert(under_dist.to_string());
+            cp_lines += 1;
+        }
     }
     for line in yaml.lines().map(str::trim) {
         let Some(args) = line.strip_prefix("cp ") else {
