@@ -1993,11 +1993,27 @@ impl Gui {
         self.pane_layout.pane_count
     }
 
+    /// Grow the layout to `count` panes without the admission door — the
+    /// bare skeleton of [`Self::set_pane_count`], for the tests whose subject
+    /// is not whether a pane may be admitted.
+    ///
+    /// **It seeds the new panes, because production does.** A pane pushed
+    /// here holds no layer slots at all, and for as long as new panes were
+    /// born layer-LINKED that never showed: the sync fan-out copied the
+    /// active pane's whole stack onto them within a frame or two, so every
+    /// fixture built this way was standing on the link rather than on the
+    /// seeding. Unlinking new panes by default took the fan-out away and left
+    /// forty-eight tests looking at panes that draw nothing — a state the
+    /// real `set_pane_count` cannot produce, because it calls
+    /// `initialize_pane_enabled` two lines after it pushes.
     #[cfg(test)]
     pub(crate) fn set_pane_count_for_test(&mut self, count: usize) {
         while self.panes.len() < count {
             self.panes.push(PaneState::new());
         }
+        // The same call, in the same place in the sequence, as the real door
+        // makes — the panes it just pushed hold nothing until it runs.
+        self.initialize_pane_enabled();
         self.pane_layout = PaneLayout::for_count(count, self.layout.width, self.split_orientation);
         if self.active_pane >= count {
             self.active_pane = 0;

@@ -146,6 +146,17 @@ struct PaneConfig {
     #[serde(default = "default_true")]
     viewport_link: bool,
     /// Whether this pane's layer state belongs to the linked group.
+    ///
+    /// **`true`, deliberately not the fresh pane's `false`.** The two answer
+    /// different questions: `PaneState::with_site` says what a pane born
+    /// today wants, and this says what a file that never named the field
+    /// meant — it was written by a build whose panes were all linked, so
+    /// defaulting it off here would silently unlink every pane of every user
+    /// who saved before the field existed. That is a fact about history and
+    /// does not move when the fresh default does;
+    /// `absent_legacy_globals_mean_linked_and_are_never_rewritten` holds the
+    /// line. A file this build writes always names the field, so this
+    /// default is reached only by those older files.
     #[serde(default = "default_true")]
     layer_link: bool,
     /// **Which layer this pane's loop transport addresses** — the timeline

@@ -130,6 +130,15 @@ fn skewed_gui(ctx: &egui::Context) -> Gui {
         "premise: the fixture must really be skewed, or pane 2 is an ordinary \
          visible pane and proves nothing this file is about",
     );
+    // Arranged, not assumed: a pane born today starts layer-unlinked, and
+    // every claim in this file is about what the fan-out writes to LINKED
+    // targets. Pane 0 too — the fan-out reads the SOURCE pane's link first
+    // and an unlinked source writes nothing at all.
+    for idx in 0..3 {
+        gui.pane_mut(idx)
+            .expect("the pane count was grown")
+            .layer_link = true;
+    }
     for idx in [1, 2] {
         park_three(ctx, gui.pane_mut(idx).expect("the pane count was grown"));
     }

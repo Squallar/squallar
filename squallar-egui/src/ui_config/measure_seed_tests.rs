@@ -274,8 +274,9 @@ fn every_measure_scene_seeds_the_layout_it_claims() {
             scene.sites,
             "scene {name} displays {} distinct sites ({sites:?}) where its \
              header claims {}. A seed that names more sites than this reports \
-             has been collapsed by `layer_link`, which defaults to true and \
-             converges every linked pane onto the active pane's site",
+             has been collapsed by `layer_link` - true for every pane of a \
+             config that does not name it - which converges every linked pane \
+             onto the active pane's site",
             sites.len(),
             scene.sites,
         );

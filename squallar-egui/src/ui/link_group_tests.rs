@@ -21,6 +21,10 @@ fn b() -> GroupId {
 fn grid(count: usize) -> Gui {
     let mut gui = Gui::new();
     gui.set_pane_count_for_test(count);
+    // Arranged, not assumed: a pane born today starts layer-unlinked, and
+    // every claim in this file is that the GROUP is the only thing narrowing
+    // a fan-out — which needs the flags out of the way, on.
+    gui.set_layer_links_for_test(true);
     for idx in 0..count {
         assert_eq!(
             gui.pane(idx).expect("a fresh pane").group,
@@ -35,6 +39,8 @@ fn grid(count: usize) -> Gui {
 fn pill_grid() -> InputHarness {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.set_pane_count(2);
+    // As in `grid`: the flags are on so that the group is the only variable.
+    h.set_layer_links(true);
     h.close_layers();
     h
 }

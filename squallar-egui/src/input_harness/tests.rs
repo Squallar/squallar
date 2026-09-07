@@ -2519,9 +2519,13 @@ fn a_menu_toggle_propagates_to_the_other_panes_when_sync_is_on() {
     h.warm_up();
     assert_eq!(h.active_pane_index(), 1, "precondition: pane 1 is active");
 
+    // Arranged, not assumed: a pane born today starts layer-unlinked, and
+    // this test is about what a toggle does when the link is ON.
+    h.set_layer_links(true);
     assert!(
         h.all_layer_linked(),
-        "precondition: every pane's layer link is on by default"
+        "precondition: every pane's layer link is on, which is what this \
+         test's propagation is about"
     );
     assert!(
         !h.layers_panel_on_screen(),
@@ -3418,9 +3422,12 @@ fn an_eye_toggle_loads_the_active_panes_config_before_saving_it() {
 #[test]
 fn an_eye_toggle_propagates_over_the_layer_link_mask() {
     let mut h = expanded_with_pane_1_active();
+    // Arranged, not assumed: a pane born today starts layer-unlinked, and
+    // the first arm below needs both ends of the link on.
+    h.set_layer_links(true);
     assert!(
         h.all_layer_linked(),
-        "precondition: every pane's layer link defaults on"
+        "precondition: both ends of the link are on for the first arm"
     );
     // The layer ships disabled, so neither curated stack holds it: both panes
     // are given it, then both are hidden - the "in the stack, eye off" state
@@ -9575,9 +9582,12 @@ fn popover_row(popover: &crate::ui::PillPopoverProbe, label: &str) -> egui::Rect
 #[test]
 fn the_sync_pill_popover_flips_all_three_per_pane_links() {
     let mut h = pill_harness();
+    // Arranged, not assumed: a pane born today starts layer-unlinked, and
+    // every click below is asserted to be a flip from on to off.
+    h.set_layer_links(true);
     assert!(
         h.all_layer_linked(),
-        "precondition: every pane's links default on"
+        "precondition: every link is on, so each click below is a flip off"
     );
 
     let (label, pill) = h.pill(0, PillKind::Link).expect("a Sync pill");
@@ -9706,6 +9716,11 @@ fn a_3d_pane_is_offered_no_viewport_link_at_either_route() {
         crate::ui::SYNC_SECTION_LABELS.map(ToOwned::to_owned);
 
     let mut h = pill_harness();
+    // Arranged, not assumed: this test is about the pill excusing a 3D pane
+    // its VIEWPORT link, so the other two are put on and kept out of it — a
+    // new pane's layer link starts off and would mark the pill for a reason
+    // this test is not about.
+    h.set_layer_links(true);
 
     assert!(
         popover_rows(&mut h).contains(&viewport),
@@ -16966,4 +16981,71 @@ fn the_opacity_slider_sits_inside_the_phone_sheet_for_every_kind_of_body() {
             "{kind:?}: the slider's label is not painted inside the sheet",
         );
     }
+}
+
+/// **A new pane keeps its own layers: `Sync layers` starts off, while the
+/// viewport and time links start on.**
+///
+/// Usability testing turned up no case for two panes mirroring each other's
+/// stacks — a second pane is opened to see what the first one is not showing
+/// — so the layer link is the one dimension a user turns *on* for the rare
+/// want rather than off for the common one. The other two are untouched:
+/// panning both maps together and holding one clock is most of what a split
+/// is for.
+///
+/// **The field and the behaviour**, because the flag alone would pass on a
+/// build whose fan-out ignored it: the eye is clicked through the real stack
+/// row and the other pane must not follow.
+///
+/// A pane restored from a config keeps whatever it saved, and a config that
+/// never named the field still loads linked — `ui_config::tests` holds that
+/// line. This is about a pane born without a saved opinion.
+#[test]
+fn a_new_panes_layers_start_unlinked_while_its_viewport_and_clock_do_not() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(2);
+    h.warm_up();
+
+    for idx in 0..2 {
+        let pane = h.gui().pane(idx).expect("both panes");
+        assert!(
+            !pane.layer_link,
+            "pane {idx} was born layer-linked, so its stack mirrors its \
+             neighbour's until the user breaks the link",
+        );
+        assert!(
+            pane.viewport_link && pane.time_link,
+            "pane {idx}: only the LAYER link changed - a split still pans \
+             together and holds one clock",
+        );
+    }
+
+    // The behaviour, through the user's own route. The layer ships disabled,
+    // so it is given to both panes first: the eye can only be clicked on a
+    // row that exists, and "in the stack, eye off" is the state the toggle
+    // below moves off.
+    h.add_layer_to_pane(0, &known::RADAR_SITES);
+    h.add_layer_to_pane(1, &known::RADAR_SITES);
+    h.set_overlay_on_pane(0, &known::RADAR_SITES, false);
+    h.set_overlay_on_pane(1, &known::RADAR_SITES, false);
+    h.warm_up();
+    assert_eq!(
+        h.active_pane_index(),
+        0,
+        "precondition: pane 0 is active, so the stack row below is its own",
+    );
+
+    let row = h.stack_row(&known::RADAR_SITES).expect("row drawn");
+    h.mouse_click(row.eye.center());
+    h.frames_for(5, FRAME_DT);
+    assert!(
+        h.overlay_enabled_on(0, &known::RADAR_SITES),
+        "precondition: the active pane must have taken its own toggle, or \
+         the negative below passes on a click that did nothing",
+    );
+    assert!(
+        !h.overlay_enabled_on(1, &known::RADAR_SITES),
+        "the toggle reached the other pane: a new pane's layers are still \
+         linked somewhere the flag does not say",
+    );
 }

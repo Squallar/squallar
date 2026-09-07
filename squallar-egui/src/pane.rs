@@ -1032,8 +1032,20 @@ pub struct PaneState {
     /// Whether this pane's viewport belongs to the linked group. Persisted;
     /// default **true**.
     pub viewport_link: bool,
-    /// Whether this pane's layer state belongs to the linked group. Persisted;
-    /// default **true**.
+    /// Whether this pane's layer state belongs to the linked group.
+    ///
+    /// **Persisted, and a pane born here starts it OFF — alone among the
+    /// three.** A second pane is opened to look at something the first one is
+    /// not showing, so a stack that mirrors its neighbour's is the rare want;
+    /// starting linked made every new pane an exact duplicate that the user
+    /// had to break before it was worth having. Panning the maps together and
+    /// holding one clock are the common wants, so [`Self::viewport_link`] and
+    /// [`Self::time_link`] still start on.
+    ///
+    /// **A config file's default is the other way and must stay there**: a
+    /// file that never named the field was written by a build whose panes
+    /// were all linked, and that is what it still means. The two defaults
+    /// answer different questions — see `ui_config`'s own field.
     pub layer_link: bool,
     pub hover_value: Option<String>,
     /// Hover tooltip text from overlay handlers (e.g. model data CIN value).
@@ -1770,7 +1782,8 @@ impl PaneState {
             group: Some(GroupId::FIRST),
             time_link: true,
             viewport_link: true,
-            layer_link: true,
+            // Off, alone among the three — see the field's own note.
+            layer_link: false,
             hover_value: None,
             overlay_hover_value: None,
             hidden_color_bars: BTreeSet::new(),

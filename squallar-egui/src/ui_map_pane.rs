@@ -1984,6 +1984,34 @@ pub(super) fn color_scale_free_rect(
     free
 }
 
+/// How far in from a pane's **left** edge the horizontal bar's own annotations
+/// reach inside [`color_scale_under_rect`]'s strip: the unit title, and the
+/// fold line written after it.
+///
+/// **Read from the same expressions `render_color_scale` draws from**, for the
+/// reason [`color_scale_gutter`] exists: the basemap credit hangs in that same
+/// strip, and a second copy of the title's arithmetic at the call site would
+/// be free to drift from the painter's. `0.0` when this pane paints no
+/// horizontal bar, so a caller that asks anyway reserves nothing.
+pub(super) fn color_scale_under_title_reach(
+    measure: &egui::Painter,
+    pane: &PaneState,
+    prefs: &UserPreferences,
+) -> f32 {
+    if !pane.is_overlay_enabled(&known::COLOR_SCALE) || !radar_bar_drawn(pane) {
+        return 0.0;
+    }
+    let product = pane.selected_product();
+    let unit = crate::field_facts::unit_label(&product, prefs);
+    // `title_pos` is `pane_rect.left() + 2.0`, and the fold line follows the
+    // unit at `unit_width + 6.0` — the horizontal arm of the title block.
+    let mut reach = 2.0 + laid_out_width(measure, unit, SCALE_TITLE_FONT_SIZE);
+    if let Some(line) = legend_second_line(pane, prefs) {
+        reach += 6.0 + laid_out_width(measure, &line, SCALE_FONT_SIZE);
+    }
+    reach
+}
+
 /// The strip **under** a horizontal colour scale: between the bar's bottom
 /// edge and the pane's own, which is the [`SCALE_MARGIN`] the bar is inset by.
 ///

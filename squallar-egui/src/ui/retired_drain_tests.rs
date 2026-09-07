@@ -307,6 +307,9 @@ fn a_layer_another_pane_still_draws_keeps_its_data() {
 fn the_drop_lands_after_the_layer_link_fan_out_reaches_the_sibling() {
     let mut h = InputHarness::new();
     h.set_pane_count(2);
+    // Arranged, not assumed: a pane born today starts layer-unlinked, and
+    // this test's whole subject is what the layer-link FAN-OUT reaches.
+    h.set_layer_links(true);
     h.gui_mut().enable_overlay_for_test(&ALERTS);
     h.warm_up();
     ingest(&mut h, &["urn:one", "urn:two"]);

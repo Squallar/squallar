@@ -14,8 +14,10 @@ fn changed_settings_survive_a_save_and_load() {
     assert_ne!(baseline.loop_lookback_secs, 7200);
     assert_ne!(baseline.loop_speed_fps, 12.5);
     assert!(
-        baseline.pane(0).unwrap().viewport_link && baseline.pane(0).unwrap().layer_link,
-        "default is linked; test flips both off"
+        baseline.pane(0).unwrap().viewport_link && !baseline.pane(0).unwrap().layer_link,
+        "the viewport link defaults on and the layer link defaults off; the \
+         test moves each away from its OWN default, so a restore that quietly \
+         fell back to a default fails below rather than matching by luck"
     );
     assert_eq!(
         baseline.pane(0).unwrap().kind(),
@@ -27,7 +29,7 @@ fn changed_settings_survive_a_save_and_load() {
     gui.loop_lookback_secs = 7200;
     gui.loop_speed_fps = 12.5;
     gui.pane_mut(0).unwrap().viewport_link = false;
-    gui.pane_mut(0).unwrap().layer_link = false;
+    gui.pane_mut(0).unwrap().layer_link = true;
     gui.pane_mut(0)
         .unwrap()
         .set_view(squallar_radar::types::RenderView::Volume);
@@ -55,8 +57,9 @@ fn changed_settings_survive_a_save_and_load() {
     assert_eq!(restored.loop_lookback_secs, 7200);
     assert_eq!(restored.loop_speed_fps, 12.5);
     assert!(
-        !restored.pane(0).unwrap().viewport_link && !restored.pane(0).unwrap().layer_link,
-        "the per-pane links must survive the round trip"
+        !restored.pane(0).unwrap().viewport_link && restored.pane(0).unwrap().layer_link,
+        "the per-pane links must survive the round trip - each was moved off \
+         its own default, so neither can pass by being defaulted"
     );
     assert_eq!(
         restored.pane(0).unwrap().render_view(),

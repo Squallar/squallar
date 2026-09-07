@@ -875,7 +875,26 @@ impl super::Gui {
 
         let right = free.right() - ATTRIBUTION_INSET;
         let left = right - attribution_span(ui.painter(), credit_text);
-        let (pivot, y) = match pane_render::color_scale_under_rect(chrome, horizontal_color_scale) {
+        // The strip under a horizontal bar is shared: the unit title stands at
+        // its left end and the notice hangs from its right, so the arm below
+        // is taken only while the two actually clear each other. On a phone
+        // holding four panes each pane is about 180pt wide, the notice lays
+        // out at 227, and it was drawn straight through its own `dBZ` — one
+        // string printed over another, measured at 360x560. That is not a
+        // reason to give up the placement everywhere: the notice keeps its
+        // place under the bar wherever it fits, and only a strip too narrow to
+        // hold both falls through to the lifting arm, which puts it over the
+        // map instead of over a label.
+        let under =
+            pane_render::color_scale_under_rect(chrome, horizontal_color_scale).filter(|under| {
+                let title = pane_render::color_scale_under_title_reach(
+                    ui.painter(),
+                    &self.panes[corner_idx],
+                    &self.preferences,
+                );
+                left >= under.left() + title + ATTRIBUTION_INSET
+            });
+        let (pivot, y) = match under {
             // Portrait: under the bar, hung off the top of the bar's own
             // margin so the notice's laid-out height cannot push it back over
             // the bar.
