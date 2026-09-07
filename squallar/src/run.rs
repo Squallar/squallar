@@ -7,6 +7,15 @@ fn create_event_loop() -> EventLoop<()> {
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // **First statement, and that is the whole contract.** `M_ARENA_MAX` bounds
+    // the arenas glibc may open from the moment it is set; ones already created
+    // stay created. `main` reaches here through `pollster::block_on`, so no
+    // runtime and no worker thread exists yet — after the tokio and async-std
+    // pools are up this call would be capping a count already reached.
+    // Reported rather than assumed: on a non-glibc target it answers `NotGlibc`
+    // and changes nothing.
+    let arenas = crate::arenas::cap_malloc_arenas();
+
     // Pin the rustls provider at a predictable point rather than letting
     // whichever background task fetches first choose it. Redundant.
     squallar_app::tls::init();
@@ -33,7 +42,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }));
 
-    log::info!("Starting squallar (native)");
+    log::info!("Starting squallar (native); malloc arenas: {arenas:?}");
 
     // Before the app, because the first alerts round is what consumes it.
     // Only names the URL; nothing is fetched here.

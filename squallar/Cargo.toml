@@ -232,6 +232,24 @@ objc2-metal = { version = "=0.3.2", default-features = false, features = [
 # no stake in the moment anything else asks for a newer 0.2.
 libc = "=0.2.189"
 
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+# `mallopt(M_ARENA_MAX, ..)`, for `src/arenas.rs`. glibc opens an arena per
+# allocating thread and each retains its own free lists, which on this
+# process's 130-159 threads is a residency gap `squallar_alloc::live_bytes`
+# cannot see by construction -- a free into an arena bin decrements it and
+# moves no page.
+#
+# **This cfg is the whole justification's scope.** `mallopt` is glibc's; musl
+# has no arenas of this kind, Android is bionic, macOS is libmalloc, and wasm
+# has neither. `target_env = "gnu"` is what separates glibc-on-Linux from the
+# musl and Android targets that also read `target_os = "linux"`.
+#
+# Zero new compiled packages, the same test the Apple block above records:
+# `libc 0.2.189` is already in the Linux graph off Cargo.lock -- tokio, mio and
+# getrandom each reach it. Spelled to match the Apple entry so the two cannot
+# resolve differently.
+libc = "=0.2.189"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 # `GlobalMemoryStatusEx`, for `src/capacity/windows.rs`, and
 # `IDXGIAdapter3::QueryVideoMemoryInfo`, for `src/capacity/dx12.rs`. No

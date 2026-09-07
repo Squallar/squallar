@@ -18,6 +18,9 @@ pub mod android;
 /// Test-only. The Apple bundle metadata App Store review rejects a build for:
 /// the privacy manifest, the export declaration and the purpose strings.
 pub mod apple_bundle_metadata;
+/// The glibc malloc-arena cap. Called first thing in [`run`], before any
+/// thread exists to be given an arena of its own.
+pub mod arenas;
 /// The RAM and thread readers behind `PlatformBridge::host_signals`, one
 /// module per OS.
 pub mod capacity;
