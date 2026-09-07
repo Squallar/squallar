@@ -3,7 +3,6 @@
 use crate::render::polar::{GateAt, PolarField, PolarGeometry};
 use crate::types::RadarProduct;
 use nexrad_model::data::Scan;
-use std::sync::Arc;
 
 /// What the readout can be told about a point.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -18,62 +17,90 @@ pub enum Reading {
     NotResident,
 }
 
-/// The volume behind a picture, and the sweep of it that was drawn.
+/// The gates of the one sweep a picture was drawn from.
+///
+/// **This holds the drawn sweep's moments and no reference to the volume they
+/// came out of.** That is the invariant, and it is what makes a decoded
+/// volume freeable by whoever else holds it: a stored loop frame owning an
+/// `Arc<Scan>` would keep the whole volume resident for as long as the
+/// picture was on the glass, however the loop download cache evicted, and one
+/// of these exists per textured frame — so the volume term would be
+/// multiplied by the render budget (36 frames desktop, 18 mobile, 14 wasm)
+/// rather than bounded by the cache.
+///
+/// `at` reaches one moment of one radial of one sweep and nothing else, so
+/// that is what is kept. The readout is therefore unchanged **by
+/// construction**: the moments are cloned out and read by the same
+/// [`crate::render::moment_value_at`] over the same bytes.
 #[derive(Clone)]
 pub struct SweepGates {
-    scan: Arc<Scan>,
-    /// Index into `scan.sweeps()`, resolved once by
-    /// [`crate::render::sweep_index_for`] — the render's own sweep selection,
-    /// not a second one.
-    sweep: usize,
-    product: RadarProduct,
-    /// **Host bytes the pinned `scan` is holding**, by
-    /// [`crate::scan_size::scan_bytes`] — carried rather than computed on
-    /// demand, because that function is a walk of every radial and the
-    /// readers of this figure are a telemetry tick and a cache's byte
-    /// budget, both of which ride the frame thread.
+    /// One entry per radial of the drawn sweep, in radial order, holding what
+    /// [`RadarProduct::get_moment`] answered for that radial — `None` where it
+    /// answered `None`, so a radial that never carried this moment still reads
+    /// as unpainted rather than as the next radial's gates.
+    radials: Vec<Option<nexrad_model::data::MomentData>>,
+    /// **Host bytes the moments above are holding**, by the same convention
+    /// [`crate::scan_size`] prices a volume with — the gate buffers, the
+    /// vector's own slots, and one allocator block apiece.
     ///
-    /// Supplied by the caller because the caller already has it for free:
-    /// the loop download cache priced the volume once at arrival
-    /// (`LoopDownloadManager::cached_scan_price`), so pinning it here is a
-    /// map lookup rather than a second walk.
-    scan_bytes: usize,
+    /// Carried rather than computed on demand, because the readers of this
+    /// figure are a telemetry tick and a cache's byte budget and both ride
+    /// the frame thread.
+    bytes: usize,
 }
 
 impl SweepGates {
     /// The gates of the sweep `product` at `elevation_deg` was drawn from, or
     /// `None` where this volume cannot answer for that picture.
-    pub fn new(
-        scan: Arc<Scan>,
-        product: RadarProduct,
-        elevation_deg: f32,
-        scan_bytes: usize,
-    ) -> Option<Self> {
+    ///
+    /// **Takes the volume and does not keep it.** The sweep's moments are
+    /// cloned out and `scan` is released at the end of this call, which is
+    /// what lets the loop download cache's eviction actually free a volume.
+    /// One walk of one sweep's radials, once per landed loop frame.
+    pub fn new(scan: &Scan, product: RadarProduct, elevation_deg: f32) -> Option<Self> {
         if !product.is_wire_moment() {
             return None;
         }
-        let sweep = crate::render::sweep_index_for(&scan, product, elevation_deg)?;
-        Some(Self {
-            scan,
-            sweep,
-            product,
-            scan_bytes,
-        })
+        // The render's own sweep selection, not a second one.
+        let index = crate::render::sweep_index_for(scan, product, elevation_deg)?;
+        let sweep = scan.sweeps().get(index)?;
+        let radials: Vec<Option<nexrad_model::data::MomentData>> = sweep
+            .radials()
+            .iter()
+            .map(|radial| product.get_moment(radial).cloned())
+            .collect();
+        let bytes = radials
+            .iter()
+            .flatten()
+            .fold(container_bytes(radials.len()), |sum, moment| {
+                sum.saturating_add(crate::scan_size::gate_bytes(moment))
+            });
+        Some(Self { radials, bytes })
     }
 
-    /// What the volume this pins is holding, bytes. O(1) — see the field.
+    /// What this is holding, bytes. O(1) — see the field.
     pub fn scan_bytes(&self) -> usize {
-        self.scan_bytes
+        self.bytes
     }
 
     /// The value at a gate, decoded on demand.
     fn at(&self, at: GateAt) -> Option<f32> {
-        let sweep = self.scan.sweeps().get(self.sweep)?;
-        let radial = sweep.radials().get(at.radial)?;
-        let moment = self.product.get_moment(radial)?;
+        let moment = self.radials.get(at.radial)?.as_ref()?;
         let raw = crate::render::moment_value_at(moment, at.gate)?;
         crate::render::painted_moment_value(raw).filter(|v| !v.is_nan())
     }
+}
+
+/// The `Vec` of moments' own slots and the one block holding them.
+///
+/// `collect` into a `Vec` from a sized iterator asks for exactly `len` slots,
+/// so capacity is length here and is not read back off the vector.
+fn container_bytes(len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    len.saturating_mul(size_of::<Option<nexrad_model::data::MomentData>>())
+        .saturating_add(crate::scan_size::ALLOCATOR_BLOCK_OVERHEAD)
 }
 
 /// Where a pane's readout gets its number: the geometry of the picture on the
@@ -132,39 +159,39 @@ impl HoverSource {
     }
 
     /// **The polar field alone** — the geometry and, where the render kept
-    /// them, the values. Not the volume a loop frame's source pins; that is
-    /// [`Self::pinned_volume_bytes`], and [`Self::resident_bytes`] is the
-    /// two together.
+    /// them, the values. Not the sweep a loop frame's source holds beside it;
+    /// that is [`Self::pinned_volume_bytes`], and [`Self::resident_bytes`] is
+    /// the two together.
     ///
     /// Spelled separately because the two land in different census families:
-    /// a field is this source's own allocation, a pinned volume is a
-    /// decoded `Scan` three other caches may hold `Arc`s of, and summing
-    /// them into one family would smuggle radar bytes into a family whose
-    /// name says they are not there.
+    /// a field is the picture's own grid and a sweep's moments are radar
+    /// data, and summing them into one family would smuggle radar bytes into
+    /// a family whose name says they are not there.
     pub fn field_bytes(&self) -> usize {
         self.field.resident_bytes()
     }
 
-    /// **Host bytes the decoded volume this source keeps alive is holding**,
-    /// zero for a source over a render that kept its own numbers.
+    /// **Host bytes the drawn sweep's moments this source holds**, zero for a
+    /// source over a render that kept its own numbers.
     ///
-    /// A loop frame's source is built by [`Self::from_volume`] and holds an
-    /// `Arc<Scan>` so the readout can decode a gate on demand. That volume
-    /// is tens of MB and this source is one of its owners: while the loop
-    /// download cache still holds the same `Arc` the bytes are priced there
-    /// too, and **once that cache evicts the entry this is the only figure
-    /// that names them.** Reporting it is not a claim to sole ownership —
-    /// see the shared-ownership note on `squallar_egui::heap_census`.
+    /// A loop frame's source is built by [`Self::from_volume`] and holds the
+    /// gates of the one sweep its picture was drawn from, so the readout can
+    /// decode a gate on demand. Those gates are this source's own allocation
+    /// and are shared with nothing — see [`SweepGates`] — so this figure is
+    /// what dropping the source frees, exactly, and no other holder names
+    /// these bytes.
     ///
-    /// O(1): the figure was priced once where the volume arrived.
+    /// **The name says "volume" and the thing is a sweep** because the name
+    /// is the census family's, and a family renamed is a row a reader cannot
+    /// follow across the campaign's own measurements.
+    ///
+    /// O(1): the figure was priced once where the sweep was extracted.
     pub fn pinned_volume_bytes(&self) -> usize {
         self.sweep.as_ref().map_or(0, SweepGates::scan_bytes)
     }
 
-    /// What holding this costs, bytes — the field **and** the volume it pins.
+    /// What holding this costs, bytes — the field **and** the sweep beside it.
     ///
-    /// The volume used to be missing from this figure, which priced a loop
-    /// frame pinning a whole decoded scan at the 5.8 KiB of its geometry.
     /// O(1).
     pub fn resident_bytes(&self) -> usize {
         self.field_bytes()

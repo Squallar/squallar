@@ -2553,8 +2553,8 @@ impl super::App {
     /// web layer publishes the loan book.
     ///
     /// **The radar families overlap and the census says so.** The holders
-    /// of whole `Arc<Scan>`s are **ten fields, nine allocations, eight owners
-    /// of a decoded source volume** — `squallar_radar::scan_size` lists them
+    /// of whole `Arc<Scan>`s are **eight fields, eight allocations, seven
+    /// owners of a decoded source volume** — `squallar_radar::scan_size` lists them
     /// and what collapses them — and the families published here are fewer
     /// than that because several holders share one figure (both inventory
     /// stores and the latest cache under `still scans`; the stored frame and
@@ -8146,25 +8146,12 @@ fn frame_gates(
 ) -> Option<squallar_radar::hover::SweepGates> {
     let (scan, _) = loop_mgr.get_cached(&rr.target.site, &rr.timestamp)?;
     let product = crate::render_key::radar_field(&rr.target.product)?;
-    // The volume's price comes from the cache that already computed it at
-    // arrival, not from a second walk of the radials: this runs on the frame
-    // thread, once per landed loop frame, and `scan_bytes` is O(radials).
-    //
-    // `get_cached` just answered for this key, and `cache_scan` files the
-    // volume and its price together while `retain_scans` removes both by one
-    // predicate — so the price is present whenever the volume is. The assert
-    // is there because the fallback is a ZERO: if that invariant ever breaks,
-    // this frame would price its pinned volume at nothing, which is the exact
-    // silent undercount this whole change exists to remove.
-    let priced = loop_mgr.cached_scan_price(&rr.target.site, &rr.timestamp);
-    debug_assert!(
-        priced.is_some(),
-        "a cached volume with no price: {} at {}",
-        rr.target.site,
-        rr.timestamp
-    );
-    let scan_bytes = priced.unwrap_or(0);
-    squallar_radar::hover::SweepGates::new(Arc::clone(scan), product, rr.snapped, scan_bytes)
+    // One walk of one sweep's radials, on the frame thread, once per landed
+    // loop frame. `SweepGates` copies out the moments its readout reads and
+    // keeps no reference to `scan`, so it prices what it kept and needs no
+    // price handed to it: the volume's own figure would describe bytes this
+    // frame does not hold.
+    squallar_radar::hover::SweepGates::new(scan, product, rr.snapped)
 }
 
 /// Place a finished loop render on the frame of `ls` that asked for it, returning

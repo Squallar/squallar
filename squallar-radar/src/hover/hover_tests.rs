@@ -84,12 +84,7 @@ fn render(scan: &Scan, product: RadarProduct) -> crate::render::SweepRender {
 fn a_loop_frame_reads_the_same_number_the_render_painted() {
     let scan = std::sync::Arc::new(volume(360, false));
     let out = render(&scan, RadarProduct::Reflectivity);
-    let gates = SweepGates::new(
-        std::sync::Arc::clone(&scan),
-        RadarProduct::Reflectivity,
-        ELEVATION,
-        crate::scan_size::scan_bytes(&scan),
-    )
+    let gates = SweepGates::new(&scan, RadarProduct::Reflectivity, ELEVATION)
     .expect("reflectivity is a wire moment and the fixture carries it");
 
     let geom = out.polar.geometry();
@@ -123,12 +118,7 @@ fn a_loop_frame_reads_the_same_number_the_render_painted() {
 fn a_looping_pane_and_a_still_pane_read_one_point_alike() {
     let scan = std::sync::Arc::new(volume(360, false));
     let out = render(&scan, RadarProduct::Reflectivity);
-    let gates = SweepGates::new(
-        std::sync::Arc::clone(&scan),
-        RadarProduct::Reflectivity,
-        ELEVATION,
-        crate::scan_size::scan_bytes(&scan),
-    )
+    let gates = SweepGates::new(&scan, RadarProduct::Reflectivity, ELEVATION)
     .unwrap();
 
     let still = HoverSource::resident(out.polar.clone());
@@ -166,12 +156,7 @@ fn a_looping_pane_and_a_still_pane_read_one_point_alike() {
 fn a_loop_frame_of_a_derived_product_says_its_numbers_are_not_resident() {
     let scan = std::sync::Arc::new(volume(360, true));
     assert!(
-        SweepGates::new(
-            std::sync::Arc::clone(&scan),
-            RadarProduct::NormalizedRotation,
-            ELEVATION,
-            crate::scan_size::scan_bytes(&scan),
-        )
+        SweepGates::new(&scan, RadarProduct::NormalizedRotation, ELEVATION)
         .is_none(),
         "shear is computed, not measured"
     );
@@ -288,12 +273,7 @@ fn the_hover_lookup_does_not_walk_the_gates() {
         field.strip_values();
         HoverSource::from_volume(
             field,
-            SweepGates::new(
-                std::sync::Arc::clone(&scan),
-                RadarProduct::Reflectivity,
-                ELEVATION,
-                crate::scan_size::scan_bytes(&scan),
-            ),
+            SweepGates::new(&scan, RadarProduct::Reflectivity, ELEVATION),
         )
     };
 
@@ -419,22 +399,24 @@ fn sized_volume(n_sweeps: usize, n_radials: usize, n_gates: usize) -> Scan {
     )
 }
 
-/// **A loop frame prices the decoded volume it pins, not just its geometry.**
+/// **A loop frame prices the sweep it holds, not just its geometry.**
 ///
-/// `HoverSource::from_volume` keeps the `Arc<Scan>` the frame was drawn from
-/// alive so the readout can decode a gate on demand, and `resident_bytes`
-/// once reported the polar field alone — so a frame holding megabytes of
-/// decoded radar priced at the few KB of its wedge table, invisible to the
-/// census and to every budget that evicts on bytes.
+/// `HoverSource::from_volume` keeps what the readout decodes a gate out of,
+/// and `resident_bytes` once reported the polar field alone — so a frame
+/// holding megabytes of decoded radar priced at the few KB of its wedge
+/// table, invisible to the census and to every budget that evicts on bytes.
 ///
-/// **This asserts against the volume's own measured size, not `> 0`.** A
-/// `> 0` assertion passed the broken code, because the geometry was never
-/// zero; what makes this a gate is the multiple. The figures are compared to
-/// `scan_size::scan_bytes` — the same function the loop cache prices with —
-/// rather than to a recorded constant, so a change to what a `Scan` holds
-/// moves both sides together and this test stays about the accounting.
+/// **The value this asserts moved on 2026-09-07 and the property did not.**
+/// What is held used to be the whole `Arc<Scan>`; it is now the moments of
+/// the one sweep the picture was drawn from, which is all `SweepGates::at`
+/// ever reached. So the figure this compares against fell by the ratio of a
+/// sweep's one moment to a whole volume. The pin is on the **accounting** —
+/// that the reported cost names what is actually held and cannot be
+/// satisfied by a token addend — and that is what is re-asserted here,
+/// against the fixture's own described extent rather than against a magic
+/// number.
 #[test]
-fn a_loop_frame_prices_the_volume_it_pins() {
+fn a_loop_frame_prices_the_sweep_it_holds() {
     // 4 cuts × 720 radials × 1000 gates × 2 moments ≈ 5.8 MB of gate bytes.
     let scan = std::sync::Arc::new(sized_volume(4, 720, 1000));
     let volume_bytes = crate::scan_size::scan_bytes(&scan);
@@ -443,45 +425,99 @@ fn a_loop_frame_prices_the_volume_it_pins() {
         "the fixture must be volume-shaped to be worth pricing; it is {volume_bytes} B"
     );
 
+    // **The described extent**: the reflectivity moment of every radial of
+    // the one sweep this picture draws, priced by the function the volume
+    // itself is priced with, plus the vector holding them. Computed from the
+    // fixture rather than recorded, so a change to what a moment holds moves
+    // both sides together.
+    let index = crate::render::sweep_index_for(&scan, RadarProduct::Reflectivity, ELEVATION)
+        .expect("the fixture carries reflectivity at this cut");
+    let sweep = &scan.sweeps()[index];
+    let expected: usize = sweep
+        .radials()
+        .iter()
+        .filter_map(|r| RadarProduct::Reflectivity.get_moment(r))
+        .map(crate::scan_size::gate_bytes)
+        .sum::<usize>()
+        + sweep.radials().len()
+            * size_of::<Option<nexrad_model::data::MomentData>>()
+        + crate::scan_size::ALLOCATOR_BLOCK_OVERHEAD;
+
     let out = render(&scan, RadarProduct::Reflectivity);
     let mut field = out.polar;
     // A loop frame's field carries no values: the numbers come back out of
-    // the volume. This is the exact shape the undercount hid in.
+    // the sweep. This is the exact shape the undercount hid in.
     field.strip_values();
     let field_bytes = crate::render::polar::PolarField::resident_bytes(&field);
 
     let looping = HoverSource::from_volume(
         field,
-        SweepGates::new(
-            std::sync::Arc::clone(&scan),
-            RadarProduct::Reflectivity,
-            ELEVATION,
-            volume_bytes,
-        ),
+        SweepGates::new(&scan, RadarProduct::Reflectivity, ELEVATION),
     );
 
     assert_eq!(
         looping.pinned_volume_bytes(),
-        volume_bytes,
-        "the pinned volume must price at what the volume holds"
+        expected,
+        "the held sweep must price at what its moments hold"
     );
     assert_eq!(
         looping.resident_bytes(),
-        field_bytes + volume_bytes,
-        "the reported cost must be the field AND the volume it pins"
+        field_bytes + expected,
+        "the reported cost must be the field AND the sweep beside it"
     );
     // The defect, stated as a ratio so it cannot be satisfied by a token
-    // addend: the volume is three orders of magnitude past the geometry.
+    // addend: the gate bytes are orders past the geometry.
     assert!(
         looping.resident_bytes() > 100 * field_bytes,
-        "a frame pinning {volume_bytes} B priced at {} B, barely past its \
-         {field_bytes} B of geometry — the volume is not in the figure",
+        "a frame holding {expected} B priced at {} B, barely past its \
+         {field_bytes} B of geometry — the gates are not in the figure",
         looping.resident_bytes()
     );
+    // And the direction of the whole change: what is held is a fraction of
+    // the volume it came out of, not the volume.
     assert!(
-        looping.resident_bytes() >= 5_000_000,
-        "a frame pinning a multi-megabyte volume priced at {} B",
-        looping.resident_bytes()
+        expected * 4 < volume_bytes,
+        "the held sweep is {expected} B of a {volume_bytes} B volume, which is \
+         not the reduction this exists for"
+    );
+}
+
+/// **The volume is released by the time the frame is built** — the property
+/// the whole change turns on.
+///
+/// A stored loop frame used to own the `Arc<Scan>` it was drawn from, so the
+/// loop download cache's own eviction freed nothing while the frame was on
+/// the glass: `loop_render_budget × 48.88 MiB` stayed resident whatever the
+/// cache did. `Arc::strong_count` is the direct question, and it is asked
+/// here because no byte figure can distinguish "priced small" from "not
+/// held".
+#[test]
+fn a_loop_frame_holds_no_reference_to_its_volume() {
+    let scan = std::sync::Arc::new(sized_volume(4, 720, 1000));
+    assert_eq!(
+        std::sync::Arc::strong_count(&scan),
+        1,
+        "precondition: the fixture is the only owner"
+    );
+
+    let out = render(&scan, RadarProduct::Reflectivity);
+    let mut field = out.polar;
+    field.strip_values();
+    let looping = HoverSource::from_volume(
+        field,
+        SweepGates::new(&scan, RadarProduct::Reflectivity, ELEVATION),
+    );
+
+    assert_eq!(
+        std::sync::Arc::strong_count(&scan),
+        1,
+        "the hover source took a reference to the volume and the cache can no \
+         longer free it by evicting"
+    );
+    // It is not holding nothing, either: the readout still answers.
+    assert!(
+        looping.pinned_volume_bytes() > 0,
+        "the source released the volume and kept nothing to read"
     );
 }
 
@@ -532,4 +568,113 @@ fn a_source_holding_no_volume_prices_only_its_field() {
         "a volume-less loop source must not be charged for a volume"
     );
     assert_eq!(volume_less.resident_bytes(), stripped_bytes);
+}
+
+/// [`volume`] with every `gap_every`-th radial carrying **no reflectivity at
+/// all**, which is what a split cut or a partial moment looks like.
+fn volume_with_gaps(n_radials: usize, gap_every: usize) -> Scan {
+    let radials = (0..n_radials)
+        .map(|i| {
+            let refl = (i % gap_every != 0).then(|| {
+                let bytes = (0..GATES)
+                    .map(|g| ((i * 7 + g * 3) % 254) as u8)
+                    .collect::<Vec<u8>>();
+                MomentData::from_fixed_point(
+                    GATES as u16,
+                    0,
+                    (GATE_KM * 1000.0) as u16,
+                    8,
+                    SCALE,
+                    OFFSET,
+                    bytes,
+                )
+            });
+            Radial::new(
+                0,
+                i as u16,
+                i as f32,
+                1.0,
+                RadialStatus::IntermediateRadialData,
+                1,
+                ELEVATION,
+                refl,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        })
+        .collect();
+    Scan::new(
+        VolumeCoveragePattern::new(
+            212,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            Vec::new(),
+        ),
+        vec![Sweep::new(1, radials)],
+    )
+}
+
+/// **A radial carrying no moment holds its place in the extracted sweep.**
+///
+/// The extraction keeps one entry per radial of the drawn sweep and stores
+/// `None` where the radial carried nothing. Collecting only the radials that
+/// answered would shorten the vector and shift every radial after a gap down
+/// by one, so the readout would return a real number taken from the wrong
+/// azimuth — worse than returning nothing, because nothing about it looks
+/// wrong.
+///
+/// Every fixture in the rest of this file gives every radial its moment, so
+/// `filter_map` in place of `map` is invisible to all of them. This is the
+/// one that sees it.
+#[test]
+fn a_gap_radial_does_not_shift_the_radials_after_it() {
+    const GAP_EVERY: usize = 7;
+    const RADIALS: usize = 360;
+    let scan = volume_with_gaps(RADIALS, GAP_EVERY);
+    let gates = SweepGates::new(&scan, RadarProduct::Reflectivity, ELEVATION)
+        .expect("reflectivity is a wire moment and the gapped fixture carries it");
+
+    let sweep = &scan.sweeps()[0];
+    let mut gapped = 0u32;
+    let mut valued = 0u32;
+    for radial in 0..RADIALS {
+        for gate in [0usize, 5, 100, GATES - 1] {
+            let read = gates.at(GateAt { radial, gate });
+            // The same question asked of the volume itself, radial by radial:
+            // if the extraction shifted, these disagree.
+            let expected = RadarProduct::Reflectivity
+                .get_moment(&sweep.radials()[radial])
+                .and_then(|m| crate::render::moment_value_at(m, gate))
+                .and_then(crate::render::painted_moment_value)
+                .filter(|v| !v.is_nan());
+            assert_eq!(
+                read.map(f32::to_bits),
+                expected.map(f32::to_bits),
+                "radial {radial} gate {gate}: the extracted sweep answered for \
+                 a different radial than the volume did"
+            );
+            if radial % GAP_EVERY == 0 {
+                assert_eq!(read, None, "radial {radial} carries no moment");
+                gapped += 1;
+            } else if read.is_some() {
+                valued += 1;
+            }
+        }
+    }
+    assert!(gapped > 150, "only {gapped} gap reads — the fixture has no gaps");
+    assert!(valued > 800, "only {valued} valued reads — the fixture is empty");
 }

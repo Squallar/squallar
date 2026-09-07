@@ -13,34 +13,36 @@
 //!
 //! # How many holders there are
 //!
-//! **Ten fields, nine allocations, eight owners of a decoded source volume**
-//! — and the three numbers answer three different questions, so a count with
-//! no definition beside it is not a fact. This header said "four" and
-//! `squallar_egui::heap_census::Census::radar_floor` said "five"; both were
-//! counting publishers rather than holders, and both undercounted.
+//! **Eight fields, eight allocations, seven owners of a decoded source
+//! volume** — and the three numbers answer three different questions, so a
+//! count with no definition beside it is not a fact. This header said "four"
+//! and `squallar_egui::heap_census::Census::radar_floor` said "five"; both
+//! were counting publishers rather than holders, and both undercounted.
 //!
-//! **Ten fields** that can hold an `Arc<Scan>` past the frame that made it:
+//! **Eight fields** that can hold an `Arc<Scan>` past the frame that made it:
 //!
 //! 1. `VolumeInventory::still` — a pane's static render source.
 //! 2. `VolumeInventory::base` — the site's merge base.
 //! 3. `App::latest_cached_scans` — the per-site latest, for `JumpToLive`.
 //! 4. `LoopDownloadManager::scan_cache` — the loop's downloaded volumes.
 //! 5. `DeriveMemo::entries` — a process-global `static`, not an `App` field.
-//! 6. `SweepGates::scan` inside a stored loop frame's `Arc<HoverSource>`
-//!    (`LoopFrameStore::entries`).
-//! 7. the same `Arc<HoverSource>` inside the pane's own frame list
-//!    (`LayerTimeState`) — a second field, the same allocation.
-//! 8. `VolumeAssembler::cached` — the chunk feed's built snapshot.
-//! 9. `ChunkPoller::pending_closed` — closed volumes parked for an outcome,
+//! 6. `VolumeAssembler::cached` — the chunk feed's built snapshot.
+//! 7. `ChunkPoller::pending_closed` — closed volumes parked for an outcome,
 //!    an unbounded queue.
-//! 10. `SiteFeed::last_snapshot` — the bridge copy served while the poller is
+//! 8. `SiteFeed::last_snapshot` — the bridge copy served while the poller is
 //!    away on a round.
 //!
-//! **Nine allocations**, because 6 and 7 are one: a placed loop frame's
-//! `RadarImageData` is cloned by `Arc`, so the store and every pane showing
-//! it share one `HoverSource` and therefore one reference to one `Scan`.
+//! **Eight allocations**, one apiece: no two of the eight share.
 //!
-//! **Eight owners of a decoded source volume**, because 5 is not one:
+//! Checked and **not** on the list, because it is the one a reader expects to
+//! find there: a stored loop frame's `Arc<HoverSource>`, and the same `Arc`
+//! in the pane's own frame list. Their [`crate::hover::SweepGates`] holds the
+//! moments of the one sweep its picture was drawn from — all `SweepGates::at`
+//! reaches — and clones them out of the volume, so it keeps no `Arc<Scan>`
+//! and a decoded volume stays freeable by whoever else holds it while the
+//! picture is on the glass.
+//!
+//! **Seven owners of a decoded source volume**, because 5 is not one:
 //! `DeriveMemo` holds *synthetic* `Scan`s built by the derivation, which are
 //! their own allocations and share nothing with the volume they were derived
 //! from.
@@ -227,7 +229,12 @@ fn radial_bytes(radial: &Radial) -> usize {
 ///
 /// An empty buffer is charged nothing at all, block included — a `Vec` of
 /// zero length never asked the allocator for anything.
-fn gate_bytes(moment: &impl DataMoment) -> usize {
+///
+/// Public for [`crate::hover::SweepGates`], which holds the moments of one
+/// sweep rather than the volume they came out of and must price them by this
+/// same convention — a sweep priced one way inside a volume and another way
+/// beside it would make the census's families disagree about one allocation.
+pub fn gate_bytes(moment: &impl DataMoment) -> usize {
     let len = moment.raw_values().len();
     if len == 0 {
         0

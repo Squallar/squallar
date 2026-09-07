@@ -247,12 +247,11 @@ impl LoopFrameStore {
     /// on this heap and countable here is each plan-view frame's resident
     /// hover field and each section's tilt vectors.
     ///
-    /// **The decoded volumes a plan-view frame pins are NOT in this figure**,
-    /// deliberately: they are `Arc<Scan>`s the loop download cache may hold
-    /// too, and folding them in here would put radar bytes inside a family
-    /// whose name says they are elsewhere. [`Self::pinned_volume_bytes`] is
-    /// that figure, and it is published into the census beside the other
-    /// decoded-volume families, where shared ownership is already declared.
+    /// **The sweep gates a plan-view frame holds are NOT in this figure**,
+    /// deliberately: they are radar moments, and folding them in here would
+    /// put radar bytes inside a family whose name says they are elsewhere.
+    /// [`Self::pinned_volume_bytes`] is that figure, and it is published into
+    /// the census beside the other decoded-volume families.
     ///
     /// **One thing this still does not count**: a `Volume` frame's grid is
     /// the volume store's, priced there.
@@ -327,31 +326,30 @@ impl LoopFrameStore {
         })
     }
 
-    /// **Decoded Level II volumes the stored plan-view frames are keeping
-    /// alive**, summed.
+    /// **Sweep gates the stored plan-view frames are holding**, summed.
     ///
     /// A loop frame's `HoverSource` is built by `HoverSource::from_volume`
-    /// and holds the `Arc<Scan>` the frame was drawn from, so the readout
-    /// can decode a gate on demand. Until this figure existed nothing
-    /// reported it: `HoverSource::resident_bytes` returned the polar field
-    /// alone, so a frame pinning tens of MB of decoded radar priced at the
-    /// 5.8 KiB of its geometry, invisible to the census that gates this
+    /// and keeps the moments of the ONE sweep its picture was drawn from, so
+    /// the readout can decode a gate on demand. Until this figure existed
+    /// nothing reported it: `HoverSource::resident_bytes` returned the polar
+    /// field alone, so a frame holding megabytes of decoded radar priced at
+    /// the 5.8 KiB of its geometry, invisible to the census that gates this
     /// campaign's decisions.
     ///
-    /// **This overlaps the loop download cache on purpose.** The `Arc` is
-    /// cloned out of that cache, so while the entry lives both figures name
-    /// the same bytes — the census's stated convention for the decoded-volume
-    /// families, each reporting what it would free if it alone let go. The
-    /// case that makes this figure load-bearing rather than redundant is the
-    /// other one: `App::retain_loop_volumes` evicts by the timestamps panes
-    /// currently list, while a stored frame is kept by whether a pane still
-    /// holds it, so **a frame can outlive its cache entry** — and those bytes
-    /// were priced by nothing at all.
+    /// **It overlaps no other family.** The moments are cloned out of the
+    /// volume at extraction, so a stored frame shares no allocation with the
+    /// loop download cache, and dropping the frame is the only thing that
+    /// frees them. Two frames drawn from one volume hold two sweeps and are
+    /// counted twice because there are two: this is a partition of real
+    /// bytes, not a bound.
     ///
-    /// Two frames drawn from the same volume count it twice; the census's
-    /// radar families are an upper bound, not a partition.
+    /// Which is why it has to exist separately from the cache's own figure:
+    /// `App::retain_loop_volumes` evicts by the timestamps panes currently
+    /// list, while a stored frame is kept by whether a pane still holds it,
+    /// so **a frame can outlive its cache entry** and these bytes would then
+    /// be named by nothing.
     ///
-    /// O(entries), O(1) apiece — every volume was priced once at arrival.
+    /// O(entries), O(1) apiece — every sweep was priced once at extraction.
     pub fn pinned_volume_bytes(&self) -> u64 {
         self.entries.iter().fold(0u64, |sum, entry| {
             let bytes = match &entry.image {

@@ -202,11 +202,15 @@ families! {
     DERIVE_MEMO_BYTES, derive_memo_bytes, set_derive_memo_bytes,
         "Derived volumes the derivation memo is holding.";
     LOOP_FRAME_SCAN_BYTES, loop_frame_scan_bytes, set_loop_frame_scan_bytes,
-        "Decoded volumes the stored 2D loop frames are PINNING - each \
-         plan-view frame's hover source holds the `Arc<Scan>` it was drawn \
-         from so the readout can decode a gate on demand. Overlaps the loop \
-         download cache while the entry lives, and is the only figure naming \
-         these bytes once it is evicted.";
+        "Sweep gates the stored 2D loop frames are holding: each plan-view \
+         frame's hover source retains the moments of the ONE sweep its \
+         picture was drawn from, so the readout can decode a gate on demand. \
+         Those moments are cloned out of the volume at extraction and are the \
+         frame's own allocation, sharing nothing with the `Scan` they came \
+         from - so this family names bytes NO other family names, and \
+         dropping a stored frame is the only thing that frees them. It is a \
+         partition and not a bound: two frames drawn from one volume hold two \
+         sweeps and are counted twice because there are two.";
     RENDER_CACHE_BYTES, render_cache_bytes, set_render_cache_bytes,
         "Finished radar rasters the render cache is holding, CPU-side: the \
          `Color32` pixel buffers and their resident hover fields.";
@@ -504,10 +508,12 @@ impl Census {
 
     /// **The decoded-volume families, summed as an upper bound.**
     ///
-    /// Five holders keep `Arc`s of the same volumes — the loop download
-    /// cache, the still inventory, the derivation memo, and the stored loop
-    /// frames' hover sources — so a volume two of them name is counted twice
-    /// here. Stated rather than corrected: the figure that matters for "what
+    /// Holders keep `Arc`s of the same volumes — the loop download cache, the
+    /// still inventory, the derivation memo — so a volume two of them name is
+    /// counted twice here. `loop frame scans` is **not** one of them: a
+    /// stored frame holds a sweep's moments, its own allocation, so its
+    /// bytes are named once in this sum.
+    /// Stated rather than corrected: the figure that matters for "what
     /// would emptying these free" is this one, and the partition it is not
     /// would take a graph walk on the frame thread.
     pub fn radar_total(&self) -> u64 {
@@ -558,9 +564,9 @@ impl Census {
     /// **The decoded-volume families as a de-duplicated LOWER bound**: the
     /// largest single one.
     ///
-    /// The holders share `Arc`s — ten fields, nine allocations, eight owners
-    /// of a decoded source volume (`squallar_radar::scan_size` lists them),
-    /// published as the six families below — so their sum
+    /// The holders share `Arc`s — eight fields, eight allocations, seven
+    /// owners of a decoded source volume (`squallar_radar::scan_size` lists
+    /// them), published as the six families below — so their sum
     /// ([`Self::radar_total`]) is an upper bound. The floor of a union of overlapping sets is the
     /// largest member — every byte the biggest holder names is resident
     /// whatever the others share with it — and that needs no graph walk and
