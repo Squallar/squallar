@@ -744,43 +744,80 @@ pub fn sample_process() {
     );
 }
 
-/// **Start the one thread that takes the expensive walk.**
+/// **Start the one thread that takes both readings**, so that neither is on
+/// the frame thread.
 ///
 /// Idempotent — a second call does nothing, so every frame may call it and
-/// only the first starts anything. The thread sleeps `period` between walks
-/// and costs a few milliseconds of a core when it wakes; it exists because
-/// the walk **must not** be on the frame thread and this crate has no other
-/// off-thread seam it can reach.
+/// only the first starts anything. After the first the whole cost at the call
+/// site is one atomic load.
 ///
-/// Native only: there is no `/proc` on wasm and no thread to spawn there
-/// either, so this is a no-op that keeps the call site free of a `cfg`.
+/// **Two cadences, because the two readings cost three orders of magnitude
+/// apart.** The cheap resident reading (~11 µs, flat in RSS) is taken every
+/// `sample_period`; the mapping walk (3.3 ms p50, 5.8 ms p99, growing with
+/// RSS) every `walk_every`th sample. At the shipped 250 ms and 8 that is
+/// 11 µs four times a second and 3.3 ms every two seconds, none of it on a
+/// frame.
+///
+/// The thread sleeps between readings and holds no lock. It is native-only:
+/// there is no `/proc` on wasm and no thread to spawn there either.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn spawn_process_sampler(period: std::time::Duration) {
+pub fn spawn_process_sampler(sample_period: std::time::Duration, walk_every: u32) {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         // A named thread: 141 of them were counted on the measured arm, and
-        // an unnamed one more is a thread nobody can attribute.
+        // one more that nobody can attribute is how that number got there.
         let spawned = std::thread::Builder::new()
             .name("squallar.mem.census".into())
             .spawn(move || {
+                let mut n: u32 = 0;
                 loop {
-                    if let Some(b) = squallar_alloc::process::breakdown() {
-                        publish_breakdown(&b);
+                    sample_process();
+                    // The walk on the first iteration too, so a reader has a
+                    // breakdown within one period rather than `walk_every` of
+                    // them.
+                    if walk_every > 0 && n % walk_every == 0 {
+                        if let Some(b) = squallar_alloc::process::breakdown() {
+                            publish_breakdown(&b);
+                        }
+                        // **And say it**, on the walk's own cadence rather
+                        // than the frame thread's telemetry tick - this
+                        // thread is the only place that knows a fresh
+                        // reading just landed, and it is not a frame.
+                        //
+                        // `debug!`, matching the quiet arm of the shell's
+                        // `say_telemetry`: the figures are always collected,
+                        // and a reader turns them up rather than the
+                        // instrument shouting by default.
+                        log::debug!("{}", process_line(&census(), &process_census(), "process"));
                     }
-                    std::thread::sleep(period);
+                    n = n.wrapping_add(1);
+                    std::thread::sleep(sample_period);
                 }
             });
-        // A refusal to spawn leaves `walks` at zero, which the line prints as
-        // `unwalked`. That is the honest outcome and not worth a panic in an
-        // instrument.
+        // A refusal to spawn leaves `samples` and `walks` at zero, which the
+        // line prints as `rss unread` and `breakdown unwalked`. That is the
+        // honest outcome, and an instrument is the last thing that should
+        // panic.
         drop(spawned);
     });
 }
 
-/// No `/proc` and no threads on wasm — the breakdown stays unwalked and the
-/// line says so.
+/// **No `/proc` and no threads on wasm**, so the resident reading does not
+/// exist there — but `live_bytes` does, and it is two atomic loads. This
+/// publishes that much and leaves the rest reading `rss unread`, which is
+/// what it is.
 #[cfg(target_arch = "wasm32")]
-pub fn spawn_process_sampler(_period: core::time::Duration) {}
+pub fn spawn_process_sampler(_sample_period: core::time::Duration, _walk_every: u32) {
+    publish_resident(squallar_alloc::live_bytes().unwrap_or(0), None);
+}
+
+/// The cadence the application runs the sampler at: a resident reading four
+/// times a second and a mapping walk every two seconds. Named here, beside
+/// the costs they are chosen against, rather than at the call site.
+pub const PROCESS_SAMPLE_PERIOD: core::time::Duration = core::time::Duration::from_millis(250);
+
+/// See [`PROCESS_SAMPLE_PERIOD`]: every eighth sample takes the walk.
+pub const PROCESS_WALK_EVERY: u32 = 8;
 
 /// Bytes [`write_process_line`] can take, for a caller writing it into a
 /// fixed buffer.

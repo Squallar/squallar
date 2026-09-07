@@ -85,6 +85,21 @@ impl Gui {
             crate::tile_mesh::ledger::totals().mesh_resident_bytes,
         );
 
+        // **The denominator the census never had.** Every family above says
+        // who is holding the heap; none of them says how big the heap is, and
+        // on native there is no `byteLength` to take a residual against - so
+        // the line printed `residual unknown` and a measured scene sat
+        // 1,441 MiB above what the census could name with nothing saying so.
+        //
+        // Idempotent, and NOT a reading: after the first frame this is one
+        // atomic load. Both `/proc` readings are taken on the sampler's own
+        // thread precisely because the cheap one is 11 us and the expensive
+        // one is 3.3 ms, and neither belongs on a frame.
+        crate::heap_census::spawn_process_sampler(
+            crate::heap_census::PROCESS_SAMPLE_PERIOD,
+            crate::heap_census::PROCESS_WALK_EVERY,
+        );
+
         // A download finishes whether or not its screen is open, and the
         // record it publishes is what makes the area exist to the rest of the
         // app - so the publish rides the frame, not the screen.
