@@ -5,7 +5,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use squallar_source::origins::DataSources;
 
@@ -159,26 +159,6 @@ fn requested_worker_url() -> String {
 /// The wasm-bindgen glue `index.html`'s module script imports.
 fn page_module_specifier() -> String {
     literal_after(INDEX_HTML, "index.html", "import init, { start } from \"")
-}
-
-/// Width and height from a PNG's IHDR: an 8-byte signature, then IHDR's length
-/// and type, then width and height as big-endian u32.
-fn png_dimensions(path: &Path) -> (u32, u32) {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-    assert!(
-        bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
-        "{} is not a PNG",
-        path.display()
-    );
-    assert_eq!(
-        &bytes[12..16],
-        b"IHDR",
-        "{} does not start with an IHDR chunk",
-        path.display()
-    );
-    let w = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
-    let h = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
-    (w, h)
 }
 
 /// Every value of an HTML attribute that carries a URL.
