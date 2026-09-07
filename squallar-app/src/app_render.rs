@@ -2446,6 +2446,7 @@ impl super::App {
                     &self.budget_readout,
                     squallar_alloc::live_bytes(),
                     &self.host_recovery,
+                    &self.gpu_recovery,
                     squallar_egui::admission::totals(),
                     self.admission_costs.spare,
                 )),
@@ -2523,6 +2524,11 @@ impl super::App {
         if self.host_recovery.acts() == acts_before {
             self.observe_host_recovery(linear, &scene);
         }
+        // **The card's own axis, on the same tick and on a clock.** It shares
+        // nothing with the block above and needs no guard of its own: the
+        // dwell restarts from the instant of the squeeze, so a tick that
+        // demoted cannot also restore however the two are ordered.
+        self.observe_gpu_recovery(now);
     }
 
     /// **Publish every heap-census family this layer owns.**
@@ -5948,12 +5954,18 @@ impl super::App {
         // term of `App::capacity`'s chain, which is what separates "your
         // setting" from "the governor" below.
         let asked = hardware.scaled_to(self.memory_percents);
-        // **`held` is only ever `true` on the host pool.** Nothing produces
-        // `Modulation::gpu_ceiling`, so the GPU pool's only governor is a
-        // session latch with nothing that can lift it, and a GPU pool
-        // reporting recovery would be reporting something no code can make
-        // true.
+        // **Two governors, two spellings of the same word.** The host's
+        // ceiling lifts on an OBSERVED margin, so "recovering" there means
+        // readings are banked toward the next promotion and a squeezed pool
+        // with nothing banked is not recovering. The GPU's lifts on a
+        // wall-clock dwell with no observation at all
+        // (`crate::recovery::GpuRecovery`), so every squeezed GPU pool is on
+        // its way back unless a new event lands — there is no bank that can
+        // be empty. The `budget state:` line carries the dwell and its
+        // multiplier so a reader can tell which of the two this word came
+        // from.
         let recovering = self.host_recovery.held() > 0;
+        let gpu_recovering = self.gpu_recovery.is_squeezed();
         let need = terms.total();
         let readout = &mut self.budget_readout;
         // Bumped here and nowhere else, so the counter and the content cannot
@@ -6038,7 +6050,7 @@ impl super::App {
                 asked.gpu_bytes,
                 cap.gpu_bytes,
             ),
-            recovering: false,
+            recovering: gpu_recovering,
         };
         // See [`host_spare_bytes`]: the model's spare, bounded by what the
         // heap and this instance's allocator actually say.
@@ -6305,32 +6317,38 @@ impl super::App {
     /// allowing three quarters of *that* would compound the step to 0.675 on
     /// every event.
     ///
-    /// **Two walls, two terms, and only one of them latches.** A page-heap
+    /// **Two walls, two terms, and one cause chooses between them.** A page-heap
     /// event lowers the host figure and nothing else: the page's watermark
     /// says nothing about the card, and a GPU rung shed for it would cost the
     /// loop its history for a byte the page never gets back. Every other
     /// cause lowers the GPU figure, as before, and leaves the host's where it
     /// stands.
     ///
-    /// The host figure is a **modulation** ([`crate::recovery`]) where the
-    /// GPU's is a session presumption, and that asymmetry is the point rather
-    /// than an inconsistency. Both are a `min` against the capacity, so a
-    /// latch left beside the modulation would clamp everything the recovery
-    /// lifts and the whole of it would be a silent no-op. There is a figure
-    /// that observes a page heap coming back — this instance's own allocator
-    /// — and there is none that observes a card's, so the host side can be
-    /// re-derived and the GPU side cannot.
+    /// **Both figures are now a modulation** ([`crate::recovery`]) and
+    /// neither is a session presumption: a latch and a modulation are both a
+    /// `min` against the capacity, so a latch left beside the term would
+    /// clamp everything the recovery lifts and the whole of it would be a
+    /// silent no-op. What still differs is the RULE that lifts each, and that
+    /// asymmetry is a fact about instruments. There is a figure that observes
+    /// a page heap coming back — this instance's own allocator — so the host
+    /// side promotes on an observed margin; there is none that observes a
+    /// card's, so the GPU side restores on a wall-clock dwell it labels as
+    /// one ([`Self::observe_gpu_recovery`]).
     ///
     /// **The GPU decay has a floor: what the ladder's floor rung needs for
     /// this scene.** The step is geometric — seven events halve the figure,
     /// thirty leave four percent of it — and below the floor rung's need the
-    /// ladder has nothing left to shed, so a presumption lowered past it
-    /// buys no rung and only makes the readout lie about a wall this scene
-    /// was never going to fit under. The floor is `fit::floor_need`, priced
-    /// for the scene at every rung's stop and turned back into a capacity
-    /// figure on this arm (`Capacity::gpu_bytes_for_allowance`), and it is
-    /// never above the capacity in force: a scene whose floor need already
-    /// exceeds the capacity holds the presumption rather than raising it.
+    /// ladder has nothing left to shed, so a ceiling lowered past it buys no
+    /// rung and only makes the readout lie about a wall this scene was never
+    /// going to fit under. The floor is `fit::floor_need`, priced for the
+    /// scene at every rung's stop and turned back into a capacity figure on
+    /// this arm (`Capacity::gpu_bytes_for_allowance`), and it is never above
+    /// the capacity in force: a scene whose floor need already exceeds the
+    /// capacity holds the ceiling rather than raising it.
+    ///
+    /// The floored figure is what the governor's stack is pushed with, so a
+    /// restoration pops back to the step under it and the floor holds through
+    /// as many rounds of squeeze and restore as a session has.
     ///
     /// **Beside the high-water mark, the figure that can fall.** The host
     /// arm's `observed` is still `byteLength`, which only grows, and that is
@@ -6399,8 +6417,10 @@ impl super::App {
                     floor_need(&scene, &self.device_profile, GRID_BYTES).gpu_bytes,
                 )
                 .min(cap.gpu_bytes);
-            let gpu = lowered.max(floor);
-            self.session_capacity = Some(gpu);
+            let gpu = self
+                .gpu_recovery
+                .squeeze(lowered.max(floor), web_time::Instant::now());
+            self.capacity_modulation.gpu_ceiling = Some(gpu);
             gpu
         };
         let refitted = self.fit_scene(&scene);
@@ -6512,7 +6532,6 @@ impl super::App {
         let mut released = self.capacity_modulation;
         released.host_ceiling = self.host_recovery.ceiling_after_promotion();
         let cap = crate::app::capacity_with_probe(&self.device_profile, self.gpu_probe.bytes())
-            .held_to(self.session_capacity)
             .modulated_by(released);
         let Some(allowance_after) = cap.host_allowance() else {
             return;
@@ -6556,6 +6575,64 @@ impl super::App {
             self.host_recovery.promotions(),
             self.host_recovery.churn(),
             crate::recovery::HOST_RECOVERY_CHURN_READINGS,
+        );
+    }
+
+    /// **One look at the clock, judged for whether a shed GPU step may come
+    /// back** — the counterpart to the GPU arm of
+    /// [`Self::refit_under_pressure`], and the only thing that ever raises
+    /// the card's figure in the capacity chain.
+    ///
+    /// # Why this one looks at a clock where the host's looks at a reading
+    ///
+    /// [`Self::observe_host_recovery`] is handed a page-heap reading and
+    /// asks whether the margin a promotion needs is really there, because
+    /// `squallar_alloc::live_bytes` is a figure that falls. **There is no
+    /// falling GPU signal in this tree and this must not invent one.** `wgpu`
+    /// reports allocation failures and reports nothing when they stop;
+    /// `crate::pressure::is_the_gpu_probes_own` says whose an event was, not
+    /// whether pressure has gone; capacity is a constant and the upload
+    /// ledgers are running totals of what this application asked for. So the
+    /// rule here is a dwell: a stretch of quiet with no new event, and one
+    /// step back. A repeat event says the inference was wrong and doubles the
+    /// next dwell, capped, so thrash is bounded by construction
+    /// ([`crate::recovery::GpuRecovery`]).
+    ///
+    /// **Wall-clock, not ticks.** This runs on the telemetry tick, which is
+    /// due at most once per [`RASTER_TELEMETRY_PERIOD`] but only on a frame
+    /// (`App::handle_redraw`); under event-driven redraw a dwell counted in
+    /// calls would be a few hundred milliseconds during a gesture and several
+    /// minutes on a map nobody is touching. The tick is therefore only the
+    /// sampling rate and the dwell itself is `web_time::Instant`, so a busy
+    /// session's restoration lands up to one tick late. **A session that
+    /// draws nothing at all restores nothing**, which is stated rather than
+    /// fixed: the quiet is still accruing on the clock, so the first frame
+    /// after it takes the step back at once, and nothing between those two
+    /// moments asked the capacity for anything.
+    ///
+    /// Nothing is adopted here. The ceiling lifts and [`Self::refit_to_scene`]
+    /// gives the rung back on a later loop walk, exactly as on the host side.
+    pub(super) fn observe_gpu_recovery(&mut self, now: web_time::Instant) {
+        if !self.gpu_recovery.observe(now) {
+            return;
+        }
+        self.capacity_modulation.gpu_ceiling = self.gpu_recovery.ceiling();
+        // The last step popped leaves no ceiling at all: the figure now in
+        // force is the one the device profile and the user's share decide,
+        // which is what the chain already answers.
+        let restored = self
+            .capacity_modulation
+            .gpu_ceiling
+            .unwrap_or_else(|| self.capacity().gpu_bytes);
+        log::info!(
+            "Budgets: gpu ceiling restored to {} MiB after {} s of quiet (dwell {}x): \
+             {} steps still held, {} restorations, {} undone inside a dwell",
+            restored / (1024 * 1024),
+            self.gpu_recovery.dwell().as_secs(),
+            self.gpu_recovery.dwell_multiplier(),
+            self.gpu_recovery.level(),
+            self.gpu_recovery.restorations(),
+            self.gpu_recovery.churn(),
         );
     }
 

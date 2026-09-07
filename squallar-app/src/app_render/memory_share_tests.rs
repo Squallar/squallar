@@ -171,8 +171,7 @@ fn the_readout_names_the_request_the_figure_in_force_and_the_binding_term() {
     );
     assert!(
         !gpu.recovering,
-        "the GPU pool has no governor that can lift, so it must never claim \
-         to be recovering",
+        "a pool that has never been squeezed claims to be recovering",
     );
 
     let host = app
@@ -203,10 +202,10 @@ fn a_share_that_takes_nothing_leaves_the_hardware_named() {
 }
 
 /// **A governor under the user's share is named as the governor**, and named
-/// as recoverable on the one pool whose ceiling can actually lift.
+/// as recoverable when its ceiling is actually on its way back.
 ///
-/// The GPU side is the control: its ceiling is a session latch with no
-/// producer that can raise it, so it must not borrow the host side's word.
+/// The GPU side is the control here: this test squeezes only the host, so the
+/// card's governor holds no step and must not borrow the host side's word.
 #[test]
 fn a_governor_under_the_users_share_is_named_and_its_recovery_is_reported() {
     let mut app = app_with_shares(PoolPercents { gpu: 80, host: 80 });
@@ -247,16 +246,21 @@ fn a_governor_under_the_users_share_is_named_and_its_recovery_is_reported() {
         PoolBinder::UserPercent,
         "the host pool's governor reached the GPU pool's verdict",
     );
+    assert!(
+        !app.budget_readout.gpu.recovering,
+        "the card's governor holds no step, so nothing of its ceiling is on \
+         its way back",
+    );
 }
 
 /// **A ceiling on its way back up says so**, through the real recovery state
-/// rather than a flag set for the test: a governor that can lift reads
-/// differently from one that cannot, and "memory pressure" alone reads like a
-/// wall.
+/// rather than a flag set for the test: a ceiling that is climbing reads
+/// differently from one that is stuck, and "memory pressure" alone reads like
+/// a wall.
 ///
-/// The GPU pool is the control. Nothing produces `Modulation::gpu_ceiling`,
-/// so its only governor is a session latch with nothing that can raise it,
-/// and it must never borrow this word.
+/// The GPU pool is the control. Its governor is squeezed by GPU pressure and
+/// nothing else, and this test squeezes only the page heap, so it must not
+/// borrow this word.
 #[test]
 fn a_ceiling_with_readings_banked_toward_a_promotion_reads_as_recovering() {
     let mut app = app_with_shares(PoolPercents { gpu: 80, host: 80 });
@@ -290,7 +294,7 @@ fn a_ceiling_with_readings_banked_toward_a_promotion_reads_as_recovering() {
     );
     assert!(
         !app.budget_readout.gpu.recovering,
-        "the GPU pool borrowed the host pool's recovery, which no producer \
-         can make true there",
+        "the GPU pool borrowed the host pool's recovery, though its own \
+         governor was never squeezed",
     );
 }

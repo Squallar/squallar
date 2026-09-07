@@ -249,25 +249,38 @@ pub struct App {
     /// release build ever sets it. This instance's defect, not the process's:
     /// a second `App` beside it starts clear.
     fit_invariant_broken: std::cell::Cell<bool>,
-    /// **This session's GPU capacity presumption**, lowered by pressure and
-    /// never raised: `None` until an event, then the allowance in force at
-    /// the event less one economy fraction. Discarded at exit — nothing is
-    /// learned across sessions.
-    session_capacity: Option<u64>,
-    /// **The second clamp term** on [`Self::capacity`], beside the GPU
-    /// presumption above: a ceiling per pool that is re-derived and can LIFT,
-    /// where a presumption is latched for the session.
+    /// **How far the GPU ceiling is stepped down, and the quiet it would take
+    /// to release a step** — see [`crate::recovery::GpuRecovery`].
     ///
-    /// **The page heap's own figure lives here and no longer in a
-    /// presumption**, and the swap is the fix rather than a tidying. The two
-    /// terms are both a `min` against the capacity, so a latch left beside
-    /// this one would clamp everything this one lifts and the recovery would
-    /// be a silent no-op that passed every test. The GPU side is untouched:
-    /// [`Self::session_capacity`] still latches, because nothing observes a
-    /// card's memory coming back the way `squallar_alloc::live_bytes`
-    /// observes a heap's.
+    /// A LEVEL that steps back up, not the latched `session_capacity:
+    /// Option<u64>` it replaces. That latch was lowered by every GPU pressure
+    /// event and never raised for the life of the process, and the step is
+    /// geometric, so seven events halved a session's card with nothing that
+    /// could give any of it back. It had to GO rather than sit beside the
+    /// modulation: both are a `min` on this chain, so a latch left beside the
+    /// term would clamp everything the term lifts and the whole recovery
+    /// would be a silent no-op.
     ///
-    /// Written by [`Self::host_recovery`] and by nothing else.
+    /// **There is no falling GPU signal**, so a restoration is a wall-clock
+    /// inference rather than an observed margin, and the readout says which.
+    /// Written into [`Self::capacity_modulation`]'s `gpu_ceiling` and read
+    /// nowhere else. Discarded at exit — nothing is learned across sessions.
+    gpu_recovery: crate::recovery::GpuRecovery,
+    /// **The last clamp term** on [`Self::capacity`]: a ceiling per pool that
+    /// is re-derived and can LIFT, where the presumptions it replaced were
+    /// latched for the session.
+    ///
+    /// **Both pools' figures live here now and neither is a presumption any
+    /// more**, and the swap is the fix rather than a tidying. A latch and
+    /// this term are both a `min` against the capacity, so a latch left
+    /// beside this one would clamp everything this one lifts and the recovery
+    /// would be a silent no-op that passed every test that did not read
+    /// [`Self::capacity`] itself. The page heap's ceiling came here first;
+    /// the card's followed, on a dwell rather than an observed margin,
+    /// because there is no falling GPU signal to judge one on.
+    ///
+    /// Written by [`Self::host_recovery`] and [`Self::gpu_recovery`], and by
+    /// nothing else.
     capacity_modulation: squallar_device_profile::scene::Modulation,
     /// **How far the host levers are pulled, and what it would take to
     /// release a step** — see [`crate::recovery`].
@@ -944,7 +957,7 @@ impl App {
                 crate::loop_pool::LoopFrameModel::from_budgets(&budgets),
             ),
             fit_invariant_broken: std::cell::Cell::new(false),
-            session_capacity: None,
+            gpu_recovery: crate::recovery::GpuRecovery::untouched(),
             capacity_modulation: squallar_device_profile::scene::Modulation::NONE,
             host_recovery: crate::recovery::HostRecovery::untouched(),
             memory_percents,
@@ -1635,25 +1648,23 @@ impl App {
     /// bracket's whole-application constant otherwise
     /// (`DeviceProfile::capacity`) — or the browser probe's figure where the
     /// profile has only a presumption to offer ([`capacity_with_probe`]),
-    /// **held to the share the user allows** ([`Self::memory_percents`]),
-    /// held to whatever pressure has taught this session, and under whatever
-    /// modulation is in force ([`Self::capacity_modulation`], which is the
-    /// page heap's ceiling and the one term that can lift again).
-    /// Four terms, each of which can only lower the one before it.
+    /// **held to the share the user allows** ([`Self::memory_percents`]), and
+    /// under whatever modulation is in force ([`Self::capacity_modulation`],
+    /// which carries both governors' ceilings and is the one term that can
+    /// lift again). Three terms, each of which can only lower the one before
+    /// it.
     ///
     /// **The user's share is applied first, and the order is load-bearing.**
-    /// `min(hw, latch) × p` is not `min(hw × p, latch)` — at `hw = 100`,
-    /// `latch = 50`, `p = ½` the first answers 25 and the second 50. The
-    /// latch and the modulation are absolute byte ceilings learned under
-    /// pressure; the user asked for `p` % of the **pool**, not for `p` % of a
-    /// latch, so the product is what those two then bound. Leaving all four
-    /// terms as plain `min`s against one another is also what lets the
-    /// readout name the binding one (`scene::pool_binder`) instead of
-    /// guessing.
+    /// `min(hw, ceiling) × p` is not `min(hw × p, ceiling)` — at `hw = 100`,
+    /// `ceiling = 50`, `p = ½` the first answers 25 and the second 50. A
+    /// governor's ceilings are absolute byte figures learned under pressure;
+    /// the user asked for `p` % of the **pool**, not for `p` % of a ceiling,
+    /// so the product is what the modulation then bounds. Leaving every term
+    /// a plain `min` against the one before it is also what lets the readout
+    /// name the binding one (`scene::pool_binder`) instead of guessing.
     pub(super) fn capacity(&self) -> squallar_device_profile::scene::Capacity {
         self.hardware_capacity()
             .scaled_to(self.memory_percents)
-            .held_to(self.session_capacity)
             .modulated_by(self.capacity_modulation)
     }
 

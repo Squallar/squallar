@@ -13,6 +13,19 @@
 //! the smallest of pans causes tiles to be re-rendered and nws alerts
 //! redrawn".
 //!
+//! # Two axes, and the instrument that separates them
+//!
+//! [`HostRecovery`] governs the page heap, where `squallar_alloc::live_bytes`
+//! is a figure that can FALL: a promotion is judged on a margin this process
+//! has actually seen ([`promotion_qualifies`]).
+//!
+//! [`GpuRecovery`] governs the card, where **nothing observes memory coming
+//! back**. It is the same stack of steps under a different rule — a
+//! wall-clock dwell with doubling backoff, capped, so a restoration is an
+//! inference the readout labels as one rather than a measurement it does not
+//! have. What follows is the host's rule; the GPU's is on [`GpuRecovery`]
+//! itself.
+//!
 //! # The rule, in one sentence each
 //!
 //! * **Demotion is immediate and unchanged.** [`HostRecovery::squeeze`] takes
@@ -393,6 +406,251 @@ pub fn promotion_qualifies(
 /// before the measurement defensible; the claim is not that it was measured.
 pub fn walled_room_after(max: u64, headroom_after: u64, live_bytes: u64) -> u64 {
     squallar_device_profile::linear_memory::act_line(max, headroom_after).saturating_sub(live_bytes)
+}
+
+/// **The wall-clock quiet a GPU ceiling step needs before it comes back**, at
+/// the first squeeze, before the doubling below lengthens it.
+///
+/// **Seconds, not readings**, and that is the whole difference from
+/// [`HOST_RECOVERY_DWELL_READINGS`]. The host's dwell counts telemetry ticks
+/// because each tick carries a fresh *observation* it is judged on; this one
+/// carries nothing, so a count of ticks would be 250 ms of quiet on a
+/// gesture and several minutes on an idle map — under event-driven redraw a
+/// frame-counted dwell measures nothing at all.
+///
+/// **Why longer than the host's eight seconds.** The host promotes on a
+/// margin it has *seen*; here there is no falling figure to see, so the only
+/// protection against restoring a step into a wall that never went away is
+/// that the wall re-fires inside the dwell and doubles it. Thirty seconds is
+/// long enough to contain the bursts a card actually produces — a resize
+/// storm, a compositor's low-memory sweep, another application taking the
+/// pool — and short enough that a session which hit one transient spike gets
+/// its rung back while the user is still in it rather than at the next
+/// restart, which is the ratchet this exists to break.
+pub const GPU_RECOVERY_DWELL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How many times the GPU dwell may double for a session that keeps being
+/// squeezed: 8x the base at the cap, so a fourth and every later event asks
+/// for four minutes of quiet rather than thirty seconds.
+///
+/// **The cap is what makes restoration observable at all.** Without it a
+/// periodic out-of-memory source — a software rasterizer, a resize storm, a
+/// second application that takes the pool every few minutes — doubles the
+/// dwell past any session's length, and the axis is a one-way latch again
+/// wearing a dwell's name. With it the worst case is bounded: a session that
+/// is squeezed forever still tries a step back every four minutes, and the
+/// counters say how often that was wrong ([`GpuRecovery::churn`]).
+///
+/// Keyed on squeezes **ever**, like the host's, for the same reason: a
+/// session that squeezed, recovered and squeezed again has demonstrated the
+/// pattern the cap is for.
+pub const GPU_RECOVERY_DWELL_MAX_DOUBLINGS: u32 = 3;
+
+/// The most GPU ceiling steps the ladder holds at once. Past it a further
+/// squeeze replaces the step in force rather than stacking a new one, so a
+/// long session cannot grow this without bound.
+pub const GPU_RECOVERY_MAX_STEPS: usize = 16;
+
+/// **The GPU capacity ceiling this session is holding, and the quiet it would
+/// take to release a step of it.**
+///
+/// The same stack as [`HostRecovery`] — [`Self::squeeze`] pushes a step,
+/// [`Self::observe`] pops one — over a different rule, and **the difference
+/// is the point rather than an inconsistency**.
+///
+/// # There is no promotion predicate here, and there cannot be one
+///
+/// [`promotion_qualifies`] reads live bytes: `squallar_alloc::live_bytes`
+/// observes a page heap coming back, so the host axis can ask "is the margin
+/// really there" and answer from a measurement. **Nothing observes a card's
+/// memory coming back.** `wgpu` reports allocation failures and reports
+/// nothing when they stop; `crate::pressure::is_the_gpu_probes_own` says
+/// *whose* an event was, never whether pressure has gone. Copying the host's
+/// predicate here would mean inventing a falling GPU signal, and every
+/// candidate for one — capacity, the upload ledgers, the scene's own need —
+/// is either a constant or this crate's own arithmetic about what it asked
+/// for, which is not an observation of what the driver has.
+///
+/// So this axis **infers**: after a stretch of wall-clock quiet with no new
+/// event, one step is restored on the presumption that whatever refused the
+/// allocation has gone. A repeat event says the presumption was wrong, and
+/// pays for it by doubling the quiet the next attempt needs
+/// ([`GPU_RECOVERY_DWELL_MAX_DOUBLINGS`] caps that doubling so a periodic
+/// source cannot latch the axis by another name). **The readout says so**:
+/// `budget state:` carries `gpu ... dwell 4x 120 s`, a multiplier and a
+/// clock, so a reader can tell this axis apart from one that measured
+/// something.
+///
+/// # What this replaced
+///
+/// `App::session_capacity`: a latched `Option<u64>` lowered on every GPU
+/// pressure event and never raised for the life of the process. The step is
+/// geometric — each event takes nine tenths of a figure that already folds
+/// in the last one — so seven events halved a session's card and thirty left
+/// four percent of it, with nothing that could give any of it back.
+///
+/// It had to GO rather than sit beside this, for the reason the host's
+/// presumption did: both are a `min` on the same capacity chain, so a latch
+/// left beside the modulation would clamp everything the modulation lifts and
+/// the whole of this would be a silent no-op that passed every test that did
+/// not look at `App::capacity()` itself.
+///
+/// Nothing here is written to the store. A reopen presumes the bracket again.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GpuRecovery {
+    /// The steps taken, oldest first; each is the ceiling in force after it,
+    /// and the last is the ceiling in force now. A GPU capacity is always a
+    /// figure — there is no bracket without one — so unlike the host's these
+    /// are not `Option`.
+    steps: Vec<u64>,
+    /// Squeezes ever, this session — the dwell's multiplier and an always-on
+    /// counter for the telemetry line.
+    acts: u32,
+    /// Restorations ever, this session.
+    restorations: u32,
+    /// **Restorations this session's dwell got wrong**: a squeeze that landed
+    /// within one dwell of a restoration.
+    churn: u32,
+    /// When the current stretch of quiet began — the last squeeze or the last
+    /// restoration, whichever is later. `None` before the first squeeze.
+    quiet_since: Option<web_time::Instant>,
+    /// When the last restoration happened, while it is still recent enough
+    /// for a squeeze to count as churn.
+    restored_at: Option<web_time::Instant>,
+}
+
+impl GpuRecovery {
+    /// A session that has never been squeezed — `Default::default()` in a
+    /// `const` context, which the derive cannot give.
+    pub const fn untouched() -> Self {
+        Self {
+            steps: Vec::new(),
+            acts: 0,
+            restorations: 0,
+            churn: 0,
+            quiet_since: None,
+            restored_at: None,
+        }
+    }
+
+    /// The GPU ceiling in force, or `None` where nothing is shed.
+    pub fn ceiling(&self) -> Option<u64> {
+        self.steps.last().copied()
+    }
+
+    /// Whether any step is held.
+    pub fn is_squeezed(&self) -> bool {
+        !self.steps.is_empty()
+    }
+
+    /// How many steps are held.
+    pub fn level(&self) -> u32 {
+        self.steps.len() as u32
+    }
+
+    /// Squeezes ever, this session.
+    pub fn acts(&self) -> u32 {
+        self.acts
+    }
+
+    /// Restorations ever, this session.
+    pub fn restorations(&self) -> u32 {
+        self.restorations
+    }
+
+    /// **Restorations this session's dwell got wrong** — squeezes that landed
+    /// within one dwell of a restoration.
+    ///
+    /// The counterpart to [`HostRecovery::churn`] and there for the same
+    /// reason: [`GPU_RECOVERY_DWELL`] is argued, not measured, and this is
+    /// the only thing that can ever say from the field that the argument was
+    /// too short. It rides the `budget state:` line, which is re-said every
+    /// telemetry period, so the answer is in the last tick of any leg however
+    /// short the capture window.
+    pub fn churn(&self) -> u32 {
+        self.churn
+    }
+
+    /// **What this session's dwell has been multiplied by**: one at the first
+    /// squeeze, doubling per squeeze after it to
+    /// [`GPU_RECOVERY_DWELL_MAX_DOUBLINGS`] doublings. Printed rather than
+    /// derived by a reader, so the line says which regime it is in.
+    pub fn dwell_multiplier(&self) -> u32 {
+        1 << self
+            .acts
+            .saturating_sub(1)
+            .min(GPU_RECOVERY_DWELL_MAX_DOUBLINGS)
+    }
+
+    /// **The quiet this session's next restoration needs.** Zero squeezes
+    /// answers the base too — there is nothing to restore then, and answering
+    /// the base is what makes the figure printable before an event.
+    pub fn dwell(&self) -> std::time::Duration {
+        GPU_RECOVERY_DWELL * self.dwell_multiplier()
+    }
+
+    /// **Take one step down, now.** `stepped` is the ceiling the caller's
+    /// arithmetic arrived at — one economy fraction under the capacity in
+    /// force, floored at what the ladder's floor rung needs for this scene —
+    /// and `now` is the event's clock.
+    ///
+    /// The step is never above the one already in force: `stepped` is derived
+    /// from a capacity this ceiling already clamps, so it cannot rise on its
+    /// own, and the `min` is what makes that true of a caller that passes a
+    /// figure from somewhere else. **Pressure never buys capacity.**
+    ///
+    /// The dwell restarts from here, and it is longer than the last one: a
+    /// squeeze is this axis saying its last inference was wrong.
+    ///
+    /// Returns the ceiling now in force.
+    pub fn squeeze(&mut self, stepped: u64, now: web_time::Instant) -> u64 {
+        let ceiling = self.ceiling().map_or(stepped, |held| held.min(stepped));
+        if self.steps.len() >= GPU_RECOVERY_MAX_STEPS {
+            // The cap: replace the step in force rather than stack another.
+            if let Some(top) = self.steps.last_mut() {
+                *top = ceiling;
+            }
+        } else {
+            self.steps.push(ceiling);
+        }
+        // The window a squeeze counts as churn inside is the dwell that was
+        // in force when the restoration was made, so it is read before the
+        // act below lengthens it.
+        if let Some(restored_at) = self.restored_at
+            && now.duration_since(restored_at) < self.dwell()
+        {
+            self.churn = self.churn.saturating_add(1);
+        }
+        self.restored_at = None;
+        self.quiet_since = Some(now);
+        self.acts = self.acts.saturating_add(1);
+        ceiling
+    }
+
+    /// **One look at the clock.** Restores exactly one step when the quiet
+    /// since the last event or restoration has reached [`Self::dwell`], and
+    /// restarts the quiet from `now` — so a session ten steps down climbs
+    /// back one dwell at a time rather than in a jump, and each climb costs
+    /// the full dwell again.
+    ///
+    /// Returns whether a step was released. Cheap enough to call on every
+    /// telemetry tick; it reads two fields and compares two instants.
+    pub fn observe(&mut self, now: web_time::Instant) -> bool {
+        if !self.is_squeezed() {
+            return false;
+        }
+        let Some(quiet_since) = self.quiet_since else {
+            return false;
+        };
+        if now.duration_since(quiet_since) < self.dwell() {
+            return false;
+        }
+        self.steps.pop();
+        self.quiet_since = Some(now);
+        self.restorations = self.restorations.saturating_add(1);
+        self.restored_at = Some(now);
+        true
+    }
 }
 
 #[cfg(test)]

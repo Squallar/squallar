@@ -196,6 +196,18 @@ pub(crate) fn capacity_source_word(source: CapacitySource) -> &'static str {
 /// below, and behind `heap max` so the rig's unanchored positional probe
 /// (which ends at `balloon`) cannot see them either way.
 ///
+/// **`gpu steps/restored/dwell/churn` is the card's governor**
+/// ([`crate::recovery::GpuRecovery`]), and the field that matters is
+/// `dwell`. The host trio above reports a governor that lifts on an OBSERVED
+/// margin; this one has no falling signal to observe, so it restores a step
+/// after a stretch of wall-clock quiet and doubles that quiet, to a cap,
+/// every time the inference turns out wrong. `dwell 4x 120 s` is therefore
+/// the mechanism stated on the line — a multiplier and a clock, not a
+/// measurement of anything a driver said — and a reader can tell this axis
+/// apart from the host's by it. `churn` is a squeeze that landed inside a
+/// dwell of a restoration, and is the only thing that can ever say from the
+/// field that `GPU_RECOVERY_DWELL` was argued too short.
+///
 /// **The ordering rule for everything appended here: fixed-width fields
 /// first, the variable-arity group LAST.** Anything positioned *behind* a
 /// group whose length varies is what a positional reader cannot find — with
@@ -233,6 +245,7 @@ pub(crate) fn budget_state_line(
     readout: &squallar_egui::shell_api::BudgetReadout,
     page_live_bytes: Option<u64>,
     host_recovery: &crate::recovery::HostRecovery,
+    gpu_recovery: &crate::recovery::GpuRecovery,
     doors: squallar_egui::admission::Totals,
     door_spare: squallar_device_profile::admit::Spare,
 ) -> String {
@@ -254,7 +267,9 @@ pub(crate) fn budget_state_line(
          vram {} MiB, ram {} MiB, declared {} MiB, threads {}, form {form}, \
          linear {}/{} MiB, cap {} {}, probe {}, balloon {} MiB, \
          page heap acts {} at {} MiB, heap max {}/{} MiB, \
-         host steps {} promotions {} churn {}, loop over {} MiB, loop clamped {}",
+         host steps {} promotions {} churn {}, \
+         gpu steps {} restored {} dwell {}x {} s churn {}, \
+         loop over {} MiB, loop clamped {}",
         budgets.name,
         budgets.steps_back,
         mib(pool_bytes as u64),
@@ -276,6 +291,11 @@ pub(crate) fn budget_state_line(
         host_recovery.level(),
         host_recovery.promotions(),
         host_recovery.churn(),
+        gpu_recovery.level(),
+        gpu_recovery.restorations(),
+        gpu_recovery.dwell_multiplier(),
+        gpu_recovery.dwell().as_secs(),
+        gpu_recovery.churn(),
         mib(over_pool_bytes as u64),
         readout
             .panes
@@ -678,6 +698,7 @@ mod tests {
                 &no_readout(),
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
+                &crate::recovery::GpuRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
                 squallar_device_profile::admit::Spare::default(),
             ),
@@ -685,7 +706,7 @@ mod tests {
              ceiling 3840 MiB, vram 24576 MiB, ram 65536 MiB, declared 8192 MiB, \
              threads 32, form 2, linear 300/700 MiB, cap 5120 3, probe 5, \
              balloon 7 MiB, page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
-             host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, \
+             host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, \
              spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
              live 250/600 MiB",
         );
@@ -704,6 +725,7 @@ mod tests {
                 &no_readout(),
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
+                &crate::recovery::GpuRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
                 squallar_device_profile::admit::Spare::default(),
             )
@@ -725,12 +747,13 @@ mod tests {
                 &no_readout(),
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
+                &crate::recovery::GpuRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
                 squallar_device_profile::admit::Spare::default(),
             )
             .ends_with(
                 ", probe 5, balloon 0 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, \
+                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, \
                  spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 250/600 MiB"
             ),
@@ -752,12 +775,13 @@ mod tests {
                 &no_readout(),
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
+                &crate::recovery::GpuRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
                 squallar_device_profile::admit::Spare::default(),
             )
             .ends_with(
                 ", cap 24576 2, probe 0, balloon 7 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, \
+                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, \
                  spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 250/600 MiB"
             ),
@@ -777,12 +801,13 @@ mod tests {
                 &no_readout(),
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
+                &crate::recovery::GpuRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
                 squallar_device_profile::admit::Spare::default(),
             )
             .ends_with(
                 ", cap 3456 0, probe 1, balloon 7 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, \
+                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, \
                  spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 250/600 MiB"
             ),
@@ -865,6 +890,7 @@ mod tests {
             &no_readout(),
             None,
             &crate::recovery::HostRecovery::untouched(),
+            &crate::recovery::GpuRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
             squallar_device_profile::admit::Spare::default(),
         );
@@ -875,21 +901,25 @@ mod tests {
             tail,
             "0 MiB, ram 0 MiB, declared 0 MiB, threads 0, form 0, linear 0/0 MiB, \
              cap 3840 0, probe 0, balloon 0 MiB, page heap acts 0 at 0 MiB, \
-             heap max 0/0 MiB, host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, \
+             heap max 0/0 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, \
              spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
              live 0/0 MiB",
         );
         assert_eq!(
             line.matches(", ").count(),
-            22,
-            "twenty-three comma-separated groups with no pane rows, twenty-two \
+            23,
+            "twenty-four comma-separated groups with no pane rows, twenty-three \
              separators: a field was dropped or gained. It was seventeen until \
              the recovery governor's `host steps N promotions N churn N` landed, \
              which is ONE group of three space-separated figures and so moved \
              this by one; eighteen until the admission doors' \
              `admission asked N admitted N would refuse N refused N`, one group \
-             of four; and twenty until ruling 15's `loop over N MiB` and \
-             ruling 13's `loop clamped N` landed as two more. **Re-derived by \
+             of four; twenty until ruling 15's `loop over N MiB` and \
+             ruling 13's `loop clamped N` landed as two more; and twenty-two \
+             until the GPU governor's \
+             `gpu steps N restored N dwell Nx N s churn N` landed beside the \
+             host trio, one group of five space-separated figures and so one \
+             more separator again. **Re-derived by \
              counting the line this build actually writes**, not by adding one \
              lane's figure to another's: the doors and the loop fields landed \
              from two lanes on one day and each was pinned against a line \
@@ -925,6 +955,7 @@ mod tests {
             &two_pane_readout(),
             LIVE,
             &crate::recovery::HostRecovery::untouched(),
+            &crate::recovery::GpuRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
             squallar_device_profile::admit::Spare {
                 gpu_bytes: Some(100 << 20),
@@ -963,6 +994,7 @@ mod tests {
             &no_readout(),
             LIVE,
             &crate::recovery::HostRecovery::untouched(),
+            &crate::recovery::GpuRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
             squallar_device_profile::admit::Spare {
                 gpu_bytes: Some(0),
@@ -1019,6 +1051,7 @@ mod tests {
             &no_readout(),
             LIVE,
             &crate::recovery::HostRecovery::untouched(),
+            &crate::recovery::GpuRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
             squallar_device_profile::admit::Spare::default(),
         );
@@ -1031,7 +1064,7 @@ mod tests {
         assert_eq!(
             &line[read_by_the_rig.len()..],
             ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
-             host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, spare gpu none host none, door spare gpu none host none joint none, \
+             host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, spare gpu none host none, door spare gpu none host none joint none, \
              admission asked 0 admitted 0 would refuse 0 refused 0, \
              live 250/600 MiB",
             "the tail the rig does not read drifted",
@@ -1064,6 +1097,7 @@ mod tests {
             &two_pane_readout(),
             LIVE,
             &crate::recovery::HostRecovery::untouched(),
+            &crate::recovery::GpuRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
             squallar_device_profile::admit::Spare::default(),
         );
@@ -1074,7 +1108,7 @@ mod tests {
         assert_eq!(
             &line[read_by_the_rig.len()..],
             ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
-             host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, \
+             host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, \
              spare gpu 3568 MiB host 601 MiB, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
              live 250/600 MiB, \
              pane0 gpu 272 MiB host 0 MiB shared 0 MiB own 272 MiB, \
@@ -1107,6 +1141,7 @@ mod tests {
                 &readout,
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
+                &crate::recovery::GpuRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
                 squallar_device_profile::admit::Spare::default(),
             );
@@ -1145,6 +1180,7 @@ mod tests {
                 &exhausted,
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
+            &crate::recovery::GpuRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
             squallar_device_profile::admit::Spare::default(),
             )
@@ -1174,6 +1210,7 @@ mod tests {
                 &no_readout(),
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
+                &crate::recovery::GpuRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
                 squallar_device_profile::admit::Spare::default(),
             )
@@ -1195,6 +1232,7 @@ mod tests {
                 &no_readout(),
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
+                &crate::recovery::GpuRecovery::untouched(),
                 squallar_egui::admission::Totals::default(),
                 squallar_device_profile::admit::Spare::default(),
             )
@@ -1238,13 +1276,14 @@ mod tests {
             &no_readout(),
             None,
             &crate::recovery::HostRecovery::untouched(),
+            &crate::recovery::GpuRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
             squallar_device_profile::admit::Spare::default(),
         );
         assert!(
             never.ends_with(
                 ", page heap acts 0 at 0 MiB, heap max 0/0 MiB, \
-                 host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, spare gpu none host none, door spare gpu none host none joint none, \
+                 host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, spare gpu none host none, door spare gpu none host none joint none, \
                  admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 0/0 MiB"
             ),
@@ -1276,13 +1315,14 @@ mod tests {
             &no_readout(),
             None,
             &crate::recovery::HostRecovery::untouched(),
+            &crate::recovery::GpuRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
             squallar_device_profile::admit::Spare::default(),
         );
         assert!(
             acted.ends_with(
                 ", page heap acts 2 at 1011 MiB, heap max 0/0 MiB, \
-                 host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, spare gpu none host none, door spare gpu none host none joint none, \
+                 host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, spare gpu none host none, door spare gpu none host none joint none, \
                  admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 0/0 MiB"
             ),
@@ -1347,12 +1387,69 @@ mod tests {
             &no_readout(),
             None,
             &recovery,
+            &crate::recovery::GpuRecovery::untouched(),
             squallar_egui::admission::Totals::default(),
             squallar_device_profile::admit::Spare::default(),
         );
         assert!(
             line.contains(", host steps 2 promotions 1 churn 1,"),
             "the recovery counters are not on the line, or not in that order: {line}",
+        );
+    }
+
+    /// **The GPU governor's line says it is INFERRING, not measuring.**
+    ///
+    /// The host trio beside it reports a ceiling that lifts on an observed
+    /// margin; this one has no falling signal at all and lifts on a clock.
+    /// A reader who cannot tell the two apart reads `gpu steps 2` as a
+    /// measurement of a card, so what is pinned here is that the multiplier
+    /// and the seconds are BOTH on the line: `dwell 4x 120 s` is a mechanism,
+    /// where `steps 2` alone would be a claim about hardware.
+    #[test]
+    fn the_budget_line_states_the_gpu_governors_dwell_rather_than_a_measurement() {
+        let profile = DeviceProfile::for_target();
+        let budgets = resolve(&profile);
+        let mut gpu = crate::recovery::GpuRecovery::untouched();
+        let t0 = web_time::Instant::now();
+        // One squeeze, a restoration the next event undoes at once (churn),
+        // then a third squeeze: two steps held, one restoration, one churn,
+        // and a dwell doubled twice.
+        gpu.squeeze(900 << 20, t0);
+        let dwelt = t0 + crate::recovery::GPU_RECOVERY_DWELL;
+        assert!(gpu.observe(dwelt), "the fixture never restored a step");
+        gpu.squeeze(900 << 20, dwelt);
+        gpu.squeeze(800 << 20, dwelt);
+        assert_eq!(
+            (
+                gpu.level(),
+                gpu.restorations(),
+                gpu.churn(),
+                gpu.dwell_multiplier()
+            ),
+            (2, 1, 1, 4),
+            "the fixture no longer carries four distinct figures",
+        );
+        let line = budget_state_line(
+            &budgets,
+            &profile,
+            None,
+            POOL,
+            BALLOON,
+            OVER,
+            &CAP,
+            PROBE,
+            WATCH,
+            &no_readout(),
+            None,
+            &crate::recovery::HostRecovery::untouched(),
+            &gpu,
+            squallar_egui::admission::Totals::default(),
+            squallar_device_profile::admit::Spare::default(),
+        );
+        assert!(
+            line.contains(", gpu steps 2 restored 1 dwell 4x 120 s churn 1,"),
+            "the gpu governor's counters are not on the line, or not in that \
+             order: {line}",
         );
     }
 

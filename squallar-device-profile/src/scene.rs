@@ -278,23 +278,23 @@ pub enum CapacitySource {
 }
 
 /// **A ceiling a governor may put under the capacity in force, per pool** —
-/// the second clamp term in the application's `capacity()` chain, beside the
-/// session's GPU presumption (`held_to`).
+/// the last clamp term in the application's `capacity()` chain.
 ///
-/// **[`Self::host_ceiling`] has a producer**: `squallar_app::recovery`, the
-/// page heap's governor, which steps it down on a watermark event and back up
-/// when a margin has held across successive capacity readings. That is
-/// exactly why it is a separate term and not another `session_capacity` — a
-/// presumption is latched down for the session, a modulation is re-derived
-/// and can lift — and why the host presumption it replaced had to GO rather
-/// than sit beside it: both are a `min` against the capacity, so a latch left
-/// in the chain would clamp everything this lifts.
+/// **Both fields have a producer**, and both are `squallar_app::recovery`.
+/// Each replaced a session presumption that latched down and never came back
+/// up, and each had to REPLACE it rather than sit beside it: a presumption
+/// and a modulation are both a `min` against the capacity, so a latch left in
+/// the chain would clamp everything this term lifts and the governor would be
+/// a silent no-op.
 ///
-/// **[`Self::gpu_ceiling`] has none.** It is `None` for the life of every
-/// process today, and the asymmetry is a fact about instruments rather than
-/// an omission: `squallar_alloc::live_bytes` observes a page heap coming back
-/// and nothing observes a card's, so the GPU side stays a latched
-/// presumption until something can watch it recover.
+/// **What still differs is the rule that lifts each, and that is a fact about
+/// instruments.** [`Self::host_ceiling`] comes back when a margin has held
+/// across successive capacity readings, because `squallar_alloc::live_bytes`
+/// observes a page heap coming back. Nothing observes a card's, so
+/// [`Self::gpu_ceiling`] comes back on a wall-clock dwell with doubling
+/// backoff instead — an inference the application's readout labels as one
+/// (`budget state:`'s `gpu ... dwell 4x 120 s`) rather than a measurement it
+/// does not have.
 ///
 /// Whatever produces it, a modulation can only LOWER — it is `min`'d against
 /// the capacity, never substituted for it — so a producer's bug cannot
@@ -715,8 +715,12 @@ impl Capacity {
         }
     }
 
-    /// This capacity, held to what the session has learned: pressure lowers a
-    /// session's presumption and never raises it, and the lowering is
+    /// This capacity, held to the GPU ceiling a governor has learned. **This
+    /// function only ever lowers, and the figure handed to it is what may
+    /// rise** — it is [`Modulation::gpu_ceiling`] that reaches here, through
+    /// [`Self::modulated_by`], and that ceiling steps back up when
+    /// `squallar_app::recovery`'s dwell has run without a new event. Nothing
+    /// latches a GPU figure for the session any more, and the lowering is
     /// discarded at exit.
     pub fn held_to(self, session_gpu_bytes: Option<u64>) -> Self {
         Self {

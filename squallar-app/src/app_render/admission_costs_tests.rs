@@ -424,6 +424,7 @@ fn the_budget_line_carries_the_admission_counters() {
         &squallar_egui::shell_api::BudgetReadout::default(),
         None,
         &crate::recovery::HostRecovery::untouched(),
+        &crate::recovery::GpuRecovery::untouched(),
         doors,
         squallar_device_profile::admit::Spare::default(),
     );

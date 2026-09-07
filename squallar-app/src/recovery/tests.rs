@@ -638,3 +638,246 @@ fn an_unsqueezed_session_banks_no_dwell_against_a_future_squeeze() {
     assert!(!recovery.observe(true), "a banked dwell promoted at once");
     assert_eq!(recovery.held(), 1);
 }
+
+/// **The card's axis, whose whole rule is a clock.**
+///
+/// [`GpuRecovery`] has no promotion predicate and cannot have one: nothing in
+/// this tree observes a card's memory coming back, so there is no "margin
+/// held" to assert against. What is asserted instead is the shape that stands
+/// in for one — a dwell, a doubling that a repeat event pays for, a cap on
+/// that doubling, and one step per dwell and no more.
+///
+/// **The defending half.** As on the host side, over-firing is the worse
+/// direction: a ceiling that lifts while the wall is still there re-fits the
+/// scene up a rung and is squeezed straight back down, and the user sees the
+/// pumping. So the tests that must produce ZERO restorations — quiet short of
+/// the dwell, and a session squeezed inside every dwell it is given — sit
+/// beside the one that must produce exactly one.
+mod gpu {
+    use crate::recovery::{
+        GPU_RECOVERY_DWELL, GPU_RECOVERY_DWELL_MAX_DOUBLINGS, GPU_RECOVERY_MAX_STEPS, GpuRecovery,
+    };
+
+    const MIB: u64 = 1 << 20;
+
+    /// A squeeze that steps a 1 GiB ceiling down by an economy fraction each
+    /// time, the way `App::refit_under_pressure` does, with no floor in the
+    /// way.
+    fn step(recovery: &mut GpuRecovery, at: web_time::Instant, from: u64) -> u64 {
+        recovery.squeeze(from / 10 * 9, at)
+    }
+
+    /// **A repeat event doubles the dwell, and the doubling stops at 8x.**
+    ///
+    /// The doubling is what bounds thrash: a session whose wall has not gone
+    /// away pays for each wrong inference with a longer wait before the next
+    /// one. The CAP is what keeps restoration reachable at all — without it a
+    /// periodic out-of-memory source (a software rasterizer, a resize storm,
+    /// another application taking the pool) doubles the dwell past any
+    /// session's length and the axis is a one-way latch wearing a dwell's
+    /// name, which is the defect this module exists to remove.
+    #[test]
+    fn a_repeat_event_doubles_the_dwell_and_the_doubling_stops_at_the_cap() {
+        let t0 = web_time::Instant::now();
+        let mut recovery = GpuRecovery::untouched();
+        assert_eq!(
+            recovery.dwell(),
+            GPU_RECOVERY_DWELL,
+            "a session with no event does not print the base dwell",
+        );
+
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            recovery.squeeze(512 * MIB, t0);
+            seen.push(recovery.dwell_multiplier());
+        }
+        assert_eq!(
+            seen,
+            vec![1, 2, 4, 8, 8, 8, 8, 8],
+            "the dwell did not double once per event, or did not stop at the cap",
+        );
+        assert_eq!(
+            recovery.dwell(),
+            GPU_RECOVERY_DWELL * (1 << GPU_RECOVERY_DWELL_MAX_DOUBLINGS),
+            "the capped dwell is not the constant it is documented as",
+        );
+    }
+
+    /// **A dwell with no new event restores exactly one step, and the next
+    /// step costs a whole dwell again.**
+    ///
+    /// One at a time is what keeps a restoration cheap to be wrong about: a
+    /// session ten steps down that jumped back to the top would re-fit the
+    /// whole ladder on one inference, and the re-squeeze would be ten steps
+    /// of scene churn rather than one.
+    #[test]
+    fn a_dwell_with_no_new_event_restores_exactly_one_step() {
+        let t0 = web_time::Instant::now();
+        let mut recovery = GpuRecovery::untouched();
+        let first = step(&mut recovery, t0, 1024 * MIB);
+        let second = step(&mut recovery, t0, first);
+        let third = step(&mut recovery, t0, second);
+        assert_eq!(recovery.ceiling(), Some(third));
+        assert_eq!(recovery.level(), 3);
+
+        // Three events, so the dwell is 4x the base by now.
+        let dwell = recovery.dwell();
+        assert_eq!(dwell, GPU_RECOVERY_DWELL * 4);
+
+        assert!(recovery.observe(t0 + dwell), "the dwell restored nothing");
+        assert_eq!(
+            recovery.ceiling(),
+            Some(second),
+            "the restoration did not step back to the ceiling under the top",
+        );
+        assert_eq!(recovery.level(), 2);
+        assert_eq!(recovery.restorations(), 1);
+
+        // And no second step comes back on the same clock: the quiet restarts
+        // from the restoration.
+        assert!(
+            !recovery.observe(t0 + dwell),
+            "one dwell released two steps",
+        );
+        assert!(
+            !recovery.observe(t0 + dwell + dwell - std::time::Duration::from_millis(1)),
+            "a step came back a millisecond short of the second dwell",
+        );
+        assert!(
+            recovery.observe(t0 + dwell + dwell),
+            "the second dwell restored nothing",
+        );
+        assert_eq!(recovery.ceiling(), Some(first));
+        assert_eq!(recovery.level(), 1);
+        assert_eq!(recovery.restorations(), 2);
+
+        // The last step leaves no ceiling at all, which is the whole point:
+        // the session is back to what the device profile and the user's share
+        // decide, with nothing learned held against it.
+        assert!(recovery.observe(t0 + dwell * 3));
+        assert_eq!(recovery.ceiling(), None);
+        assert!(!recovery.is_squeezed());
+        assert!(
+            !recovery.observe(t0 + dwell * 9),
+            "an unsqueezed session restored a step it never took",
+        );
+    }
+
+    /// **Quiet short of the dwell restores nothing** — the input that
+    /// resembles a recovery without being one.
+    #[test]
+    fn quiet_short_of_the_dwell_restores_nothing() {
+        let t0 = web_time::Instant::now();
+        let mut recovery = GpuRecovery::untouched();
+        recovery.squeeze(512 * MIB, t0);
+        let dwell = recovery.dwell();
+        for cut in [1u32, 2, 4, 10, 100] {
+            let at = t0 + dwell - dwell / cut;
+            assert!(
+                !recovery.observe(at),
+                "a step came back after {:?} of a {dwell:?} dwell",
+                at.duration_since(t0),
+            );
+        }
+        assert_eq!(recovery.level(), 1);
+        assert_eq!(recovery.restorations(), 0);
+    }
+
+    /// **A session squeezed inside every dwell it is given never restores**,
+    /// and the counters say the ceiling is still going one way.
+    ///
+    /// This is the periodic-source case with the doubling working as
+    /// intended: each event lands before the quiet it would have taken to
+    /// restore, so nothing is inferred and nothing is given back. What the
+    /// cap guarantees is only that the wait stops growing, not that a session
+    /// under continuous pressure gets anything back — pressure still wins,
+    /// which is the correct direction.
+    #[test]
+    fn a_session_squeezed_inside_every_dwell_never_restores() {
+        let t0 = web_time::Instant::now();
+        let mut recovery = GpuRecovery::untouched();
+        let mut at = t0;
+        let mut ceiling = 1024 * MIB;
+        for _ in 0..20 {
+            ceiling = step(&mut recovery, at, ceiling);
+            // Half a dwell later, another event — and a look at the clock in
+            // between, which must find nothing.
+            at += recovery.dwell() / 2;
+            assert!(
+                !recovery.observe(at),
+                "a step came back half a dwell after the event that took it",
+            );
+        }
+        assert_eq!(recovery.restorations(), 0);
+        assert_eq!(
+            recovery.churn(),
+            0,
+            "nothing was restored, so nothing churned"
+        );
+        assert_eq!(
+            recovery.level() as usize,
+            GPU_RECOVERY_MAX_STEPS,
+            "twenty events did not stop stacking at the cap",
+        );
+    }
+
+    /// **A squeeze that lands inside a dwell of a restoration is counted as
+    /// churn.**
+    ///
+    /// [`GPU_RECOVERY_DWELL`] is argued from what a card's bursts look like,
+    /// not measured, and this counter is the only thing that can ever say
+    /// from the field that the argument was too short. It rides the `budget
+    /// state:` line for exactly that reason.
+    #[test]
+    fn a_squeeze_inside_a_dwell_of_a_restoration_is_counted_as_churn() {
+        let t0 = web_time::Instant::now();
+        let mut recovery = GpuRecovery::untouched();
+        recovery.squeeze(512 * MIB, t0);
+        let dwell = recovery.dwell();
+        assert!(recovery.observe(t0 + dwell));
+
+        recovery.squeeze(512 * MIB, t0 + dwell);
+        assert_eq!(
+            recovery.churn(),
+            1,
+            "an event on the heels of a restoration was not counted as churn",
+        );
+
+        // A restoration that stands for longer than the dwell before the next
+        // event is not churn: the inference was right for as long as it was
+        // asked to be.
+        let mut settled = GpuRecovery::untouched();
+        settled.squeeze(512 * MIB, t0);
+        let dwell = settled.dwell();
+        assert!(settled.observe(t0 + dwell));
+        settled.squeeze(512 * MIB, t0 + dwell + dwell + dwell);
+        assert_eq!(
+            settled.churn(),
+            0,
+            "a restoration that outlived its own dwell was counted as wrong",
+        );
+    }
+
+    /// **Pressure never buys capacity.** A step is never above the one in
+    /// force, whatever figure the caller's arithmetic arrived at, and a
+    /// restoration only ever gives back a ceiling this session actually held.
+    #[test]
+    fn a_squeeze_never_raises_the_ceiling_and_a_restoration_only_gives_back_what_was_held() {
+        let t0 = web_time::Instant::now();
+        let mut recovery = GpuRecovery::untouched();
+        recovery.squeeze(512 * MIB, t0);
+        recovery.squeeze(4096 * MIB, t0);
+        assert_eq!(
+            recovery.ceiling(),
+            Some(512 * MIB),
+            "an event raised the ceiling above the step already in force",
+        );
+        let dwell = recovery.dwell();
+        assert!(recovery.observe(t0 + dwell));
+        assert_eq!(
+            recovery.ceiling(),
+            Some(512 * MIB),
+            "a restoration invented a ceiling this session never held",
+        );
+    }
+}

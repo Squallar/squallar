@@ -33,6 +33,7 @@ fn budget_line(app: &App) -> String {
         // whatever the harness is holding, and these tests pin the line.
         None,
         &crate::recovery::HostRecovery::untouched(),
+        &app.gpu_recovery,
         squallar_egui::admission::Totals::default(),
         app.admission_costs.spare,
     )
@@ -260,7 +261,7 @@ fn a_capped_probe_prints_five_beside_its_figure() {
 fn a_probed_capacity_is_still_held_to_what_pressure_taught() {
     let mut app = web_app(TestBridge::web());
     app.adopt_probed_capacity(a_probe_of(4032 << 20), wgpu::Backend::BrowserWebGpu);
-    app.session_capacity = Some(1024 << 20);
+    app.capacity_modulation.gpu_ceiling = Some(1024 << 20);
     assert_eq!(app.capacity().gpu_bytes, 1024 << 20);
     assert_eq!(app.capacity().source, CapacitySource::Probed);
 }
@@ -435,8 +436,8 @@ fn an_out_of_memory_during_the_probe_window_holds_the_presumption() {
     app.gpu_probe = GpuProbeReport::Pending;
     app.on_pressure(Pressure::OutOfMemory);
     assert_eq!(
-        app.session_capacity, None,
-        "an OOM in the probe window lowered the presumption"
+        app.capacity_modulation.gpu_ceiling, None,
+        "an OOM in the probe window lowered the ceiling"
     );
     app.adopt_probed_capacity(a_probe_of(4032 << 20), wgpu::Backend::BrowserWebGpu);
     assert_eq!(
@@ -452,14 +453,17 @@ fn an_out_of_memory_during_the_probe_window_holds_the_presumption() {
     let mut app = web_app(TestBridge::web());
     app.gpu_probe = GpuProbeReport::Pending;
     app.on_pressure(Pressure::SurfaceLost);
-    assert_eq!(app.session_capacity, Some(lowered(presumed)));
+    assert_eq!(app.capacity_modulation.gpu_ceiling, Some(lowered(presumed)));
 
     // And an OOM once the probe has reported lowers the probed figure, as
     // pressure lowers any capacity in force.
     let mut app = web_app(TestBridge::web());
     app.adopt_probed_capacity(a_probe_of(4032 << 20), wgpu::Backend::BrowserWebGpu);
     app.on_pressure(Pressure::OutOfMemory);
-    assert_eq!(app.session_capacity, Some(lowered(4032 << 20)));
+    assert_eq!(
+        app.capacity_modulation.gpu_ceiling,
+        Some(lowered(4032 << 20))
+    );
     assert_eq!(app.capacity().gpu_bytes, lowered(4032 << 20));
     assert_eq!(app.capacity().source, CapacitySource::Probed);
 }
@@ -535,6 +539,7 @@ fn a_measured_capacity_reaches_the_fit_and_a_presumed_one_does_not_pretend_to() 
             &app.budget_readout,
             None,
             &crate::recovery::HostRecovery::untouched(),
+            &app.gpu_recovery,
             squallar_egui::admission::Totals::default(),
             app.admission_costs.spare,
         )
@@ -675,8 +680,10 @@ fn the_profile_update_folds_the_bridges_reading_through_the_tested_seam() {
 /// What is asserted is unchanged — `Modulation::NONE` on a session that has
 /// had no pressure — because these three apps are built and never squeezed,
 /// and the identity is still what a fresh session carries. The other half of
-/// the chain is what moved: the host presumption `host_held_to` used to hold
-/// is gone, so the term this is compared against is one shorter.
+/// the chain is what moved: BOTH presumptions `held_to` and `host_held_to`
+/// used to hold are gone — the card's followed the page's into this term
+/// (`crate::recovery::GpuRecovery`) — so what is compared against is the bare
+/// capacity.
 #[test]
 fn the_modulation_term_is_the_identity_by_default_and_only_ever_lowers() {
     use squallar_device_profile::scene::Modulation;
@@ -699,8 +706,7 @@ fn the_modulation_term_is_the_identity_by_default_and_only_ever_lowers() {
             Modulation::NONE,
             "a session that has had no pressure carries a term"
         );
-        let one_term = capacity_with_probe(&app.device_profile, app.gpu_probe.bytes())
-            .held_to(app.session_capacity);
+        let one_term = capacity_with_probe(&app.device_profile, app.gpu_probe.bytes());
         let three_terms = app.capacity();
         assert_eq!(
             three_terms, one_term,

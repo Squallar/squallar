@@ -261,15 +261,25 @@ pub struct PoolReadout {
     /// terms can lower a pool and [`Self::effective_percent`] alone cannot say
     /// which did.
     pub binder: squallar_device_profile::scene::PoolBinder,
-    /// **Whether the governor's ceiling is on its way back up**: successive
-    /// qualifying readings are banked toward the next promotion
-    /// (`squallar_app::recovery::HostRecovery::held`).
+    /// **Whether the governor's ceiling is on its way back up.** Read only
+    /// when [`Self::binder`] is `Governor`, and true on either pool — both
+    /// have a governor that can lift now (`Modulation`'s two ceilings) —
+    /// though the two pools mean it by different evidence.
     ///
-    /// Read only when [`Self::binder`] is `Governor`, and `false` on the GPU
-    /// pool whatever the pressure — that pool's governor is a session latch
-    /// with no producer that can lift it (`Modulation::gpu_ceiling` is `None`
-    /// for the life of every process today), so a GPU pool that says
-    /// "recovering" would be saying something no code can make true.
+    /// On the **host** pool it means successive qualifying readings are
+    /// banked toward the next promotion
+    /// (`squallar_app::recovery::HostRecovery::held`): a squeezed host pool
+    /// with nothing banked is not recovering, because the margin is
+    /// *observed*.
+    ///
+    /// On the **GPU** pool it means a step is held at all
+    /// (`squallar_app::recovery::GpuRecovery::is_squeezed`). Nothing observes
+    /// a card's memory coming back, so that governor restores a step after a
+    /// stretch of wall-clock quiet rather than on a margin — there is no bank
+    /// that could be empty, and every squeezed GPU pool is on its way back
+    /// unless a new event lands. The mechanism is stated on the application's
+    /// `budget state:` line (`gpu ... dwell 4x 120 s`) so that this one bool
+    /// is not asked to carry the difference.
     pub recovering: bool,
 }
 

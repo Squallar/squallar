@@ -1340,8 +1340,8 @@ fn a_lost_surface_evicts_economy_and_refits_and_writes_nothing() {
         "precondition: this build's desktop bracket starts at the cloud rung",
     );
     assert_eq!(
-        app.session_capacity, None,
-        "precondition: a fresh session presumes the bracket"
+        app.capacity_modulation.gpu_ceiling, None,
+        "precondition: a fresh session holds no ceiling over the bracket"
     );
     let scene = app.scene_of();
     assert_eq!(scene.panes.len(), 1);
@@ -1356,9 +1356,9 @@ fn a_lost_surface_evicts_economy_and_refits_and_writes_nothing() {
     );
     assert_eq!(app.render.extract_cache_len(), 0);
     assert_eq!(
-        app.session_capacity,
+        app.capacity_modulation.gpu_ceiling,
         Some(presumed / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0),
-        "the session's presumption did not come down by one economy fraction",
+        "the session's gpu ceiling did not come down by one economy fraction",
     );
     assert_eq!(
         app.budgets, before,
@@ -1499,8 +1499,8 @@ fn a_reopen_fits_the_same_scene_to_the_same_budgets() {
         GradientShading::On,
     );
     assert_eq!(
-        reopened.session_capacity, None,
-        "a capacity presumption outlived the session that learned it",
+        reopened.capacity_modulation.gpu_ceiling, None,
+        "a capacity ceiling outlived the session that learned it",
     );
     assert_eq!(
         reopened.loop_pool, fresh.loop_pool,
@@ -1621,7 +1621,7 @@ fn a_session_that_keeps_failing_settles_at_the_floor_and_never_writes() {
     for _ in 0..12 {
         expected = expected / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0;
     }
-    assert_eq!(app.session_capacity, Some(expected));
+    assert_eq!(app.capacity_modulation.gpu_ceiling, Some(expected));
 }
 
 /// **The GPU decay has a floor: what the ladder's floor rung needs for this
@@ -1660,14 +1660,18 @@ fn thirty_events_leave_the_presumption_at_the_floor_rungs_need_and_not_below() {
     let mut readings = Vec::new();
     for _ in 0..30 {
         app.on_pressure(crate::pressure::Pressure::SurfaceLost);
-        readings.push(app.session_capacity.expect("an event sets the presumption"));
+        readings.push(
+            app.capacity_modulation
+                .gpu_ceiling
+                .expect("an event sets the ceiling"),
+        );
     }
 
     assert_eq!(
-        app.session_capacity,
+        app.capacity_modulation.gpu_ceiling,
         Some(floor),
         "thirty events settled at {:?}, not at the floor rung's need {floor}: {readings:?}",
-        app.session_capacity,
+        app.capacity_modulation.gpu_ceiling,
     );
     assert!(
         readings.windows(2).all(|pair| pair[0] >= pair[1]),
@@ -1688,6 +1692,137 @@ fn thirty_events_leave_the_presumption_at_the_floor_rungs_need_and_not_below() {
         unfloored < floor,
         "the unfloored decay ({unfloored}) did not go below the floor ({floor}), \
          so this test cannot tell a floor from its absence",
+    );
+}
+
+/// **The lift reaches `App::capacity()`, which is the whole point and the
+/// trap.**
+///
+/// The figure the GPU governor writes is one `min` term on a chain of them
+/// (`App::capacity`). Before this work the same figure was ALSO held by a
+/// latched `session_capacity` beside it, and a governor that lifted its own
+/// term while a latch held the other would have been a silent no-op: every
+/// test of the governor in isolation would pass, the counters would report
+/// restorations, and the capacity the scene is actually fitted against would
+/// never move. So what is asserted here is not the governor's state but
+/// `capacity().gpu_bytes` itself, before and after.
+#[test]
+fn a_dwell_with_no_new_event_gives_back_the_capacity_the_pressure_took() {
+    let mut app = app_with_looping_panes(TestBridge::desktop(), 6, 1);
+    let before = app.capacity().gpu_bytes;
+
+    app.on_pressure(crate::pressure::Pressure::SurfaceLost);
+    let squeezed = app.capacity().gpu_bytes;
+    assert!(
+        squeezed < before,
+        "the event did not lower the capacity the scene is fitted against: \
+         {squeezed} of {before}",
+    );
+
+    // A look at the clock with no time passed restores nothing: the dwell is
+    // the rule, and a tick is only how often it is read.
+    let now = web_time::Instant::now();
+    app.observe_gpu_recovery(now);
+    assert_eq!(
+        app.capacity().gpu_bytes,
+        squeezed,
+        "a step came back with no quiet behind it",
+    );
+
+    app.observe_gpu_recovery(now + crate::recovery::GPU_RECOVERY_DWELL);
+    assert_eq!(
+        app.capacity().gpu_bytes,
+        before,
+        "the dwell did not give the capacity back: either the governor \
+         released nothing, or a term beside it is still holding the figure \
+         down",
+    );
+    assert_eq!(
+        app.capacity_modulation.gpu_ceiling, None,
+        "the last step popped left a ceiling behind",
+    );
+}
+
+/// **The floor holds through as many rounds of squeeze and restore as a
+/// session has, and the whole ladder comes back.**
+///
+/// Two properties in one walk, because they are the two halves of the same
+/// claim. Going down: thirty events settle at the floor rung's need and
+/// nothing takes the ceiling below it — pinned on its own by
+/// `thirty_events_leave_the_presumption_at_the_floor_rungs_need_and_not_below`,
+/// re-checked here after the stack has been popped and pushed again, since a
+/// floor that only holds on the way down is a floor that a restoration can
+/// step off.
+///
+/// Coming back: one step per dwell until the stack is empty, at which point
+/// the session holds nothing at all against the device profile. **That is the
+/// ratchet being broken**, stated as the property a reader cares about rather
+/// than as a count of steps.
+#[test]
+fn the_floor_holds_across_rounds_of_squeeze_and_restore_and_the_ladder_comes_all_the_way_back() {
+    use crate::loop_pool::GRID_BYTES;
+    use crate::recovery::GPU_RECOVERY_MAX_STEPS;
+    use squallar_device_profile::fit::floor_need;
+
+    let mut app = app_with_looping_panes(TestBridge::desktop(), 6, 1);
+    let scene = app.scene_of();
+    let presumed = app.capacity().gpu_bytes;
+    let floor = app
+        .capacity()
+        .gpu_bytes_for_allowance(floor_need(&scene, &app.device_profile, GRID_BYTES).gpu_bytes);
+    assert!(
+        floor > 0 && floor < presumed,
+        "fixture: the floor need ({floor}) must sit under the capacity ({presumed})",
+    );
+
+    for _ in 0..30 {
+        app.on_pressure(crate::pressure::Pressure::SurfaceLost);
+    }
+    assert_eq!(app.capacity_modulation.gpu_ceiling, Some(floor));
+    assert_eq!(
+        app.gpu_recovery.level() as usize,
+        GPU_RECOVERY_MAX_STEPS,
+        "thirty events did not stop stacking at the cap",
+    );
+
+    // One step per dwell, and the dwell is the capped one by now. Every
+    // ceiling on the way back is at or above the floor and never below the
+    // one before it.
+    let mut at = web_time::Instant::now();
+    let mut climb = Vec::new();
+    for _ in 0..GPU_RECOVERY_MAX_STEPS {
+        at += app.gpu_recovery.dwell();
+        app.observe_gpu_recovery(at);
+        climb.push(app.capacity().gpu_bytes);
+    }
+    assert!(
+        climb.iter().all(|figure| *figure >= floor),
+        "a restoration stepped the capacity below the floor: {climb:?}",
+    );
+    assert!(
+        climb.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the capacity fell while nothing was pressing it: {climb:?}",
+    );
+    assert_eq!(
+        app.capacity_modulation.gpu_ceiling, None,
+        "sixteen dwells did not empty a sixteen-step stack",
+    );
+    assert_eq!(
+        app.capacity().gpu_bytes,
+        presumed,
+        "the session still holds a figure against the device profile after \
+         every step was restored",
+    );
+
+    // And the floor is still the floor: a further event steps down to it and
+    // no further, from a capacity that has been all the way back up.
+    for _ in 0..30 {
+        app.on_pressure(crate::pressure::Pressure::SurfaceLost);
+    }
+    assert_eq!(
+        app.capacity_modulation.gpu_ceiling,
+        Some(floor),
+        "the floor did not hold through a second round of events",
     );
 }
 
@@ -1732,16 +1867,16 @@ fn an_out_of_memory_error_refits_once_per_frame_and_writes_nothing() {
         "a pressure re-fit lowered a granted loop's frame count",
     );
     assert_eq!(
-        app.session_capacity,
+        app.capacity_modulation.gpu_ceiling,
         Some(3456 * MIB),
-        "two errors on one frame lowered the presumption twice",
+        "two errors on one frame lowered the gpu ceiling twice",
     );
 
     // The next frame, with nothing new noted: the presumption and the budgets
     // hold.
     app.absorb_gpu_pressure();
     assert_eq!(app.budgets.steps_back, 7);
-    assert_eq!(app.session_capacity, Some(3456 * MIB));
+    assert_eq!(app.capacity_modulation.gpu_ceiling, Some(3456 * MIB));
 
     assert_eq!(store.load(crate::budget_memo::BUDGET_MEMO_KEY), None);
     assert_eq!(store.load(crate::loop_pool::LOOP_POOL_KEY), None);
@@ -1772,7 +1907,7 @@ fn a_memory_warning_evicts_economy_and_refits() {
         "the render cache survived a memory warning",
     );
     assert_eq!(
-        app.session_capacity,
+        app.capacity_modulation.gpu_ceiling,
         Some(presumed / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0),
     );
     assert_eq!(
@@ -2270,7 +2405,7 @@ fn a_pressure_event_on_the_measured_arm_lowers_the_capacity_by_one_economy_fract
         before.gpu_bytes / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0,
         "the capacity figure came down by one economy fraction",
     );
-    assert_eq!(app.session_capacity, Some(after.gpu_bytes));
+    assert_eq!(app.capacity_modulation.gpu_ceiling, Some(after.gpu_bytes));
     assert_eq!(
         after.allowance(),
         after.gpu_bytes / NEED_FRACTION.1 * NEED_FRACTION.0,
@@ -2333,14 +2468,14 @@ fn a_heap_watermark_at_the_act_line_evicts_economy_and_lowers_the_presumption_on
     let mut app = headless(platform);
     seed_render_cache(&mut app);
     assert_eq!(app.budgets.steps_back, 0);
-    assert_eq!(app.session_capacity, None);
+    assert_eq!(app.capacity_modulation.gpu_ceiling, None);
     assert_eq!(app.capacity_modulation.host_ceiling, None);
 
     tick(&mut app);
 
     assert_eq!(
-        app.session_capacity, None,
-        "a worker heap reading lowered the card's presumption",
+        app.capacity_modulation.gpu_ceiling, None,
+        "a worker heap reading lowered the card's ceiling",
     );
     // The page's host figure moved from a session presumption to the
     // recovery's modulation ceiling (`crate::recovery`), which is the same
@@ -2427,8 +2562,8 @@ fn a_heap_that_grows_past_the_refire_step_acts_again() {
     );
     assert_eq!(app.render.render_cache.entry_count(), 0);
     assert_eq!(
-        app.session_capacity, None,
-        "a page-heap event lowered the card's presumption"
+        app.capacity_modulation.gpu_ceiling, None,
+        "a page-heap event lowered the card's ceiling"
     );
     // A bracket with no host figure has nothing to hold down, so the ceiling
     // stays absent even though the level is up: the economy squeeze is the
@@ -2534,8 +2669,8 @@ fn a_page_heap_event_lowers_the_host_ceiling_on_the_wasm_bracket() {
     tick(&mut app);
     assert_eq!(app.capacity_modulation.host_ceiling, Some(840_853_089));
     assert_eq!(
-        app.session_capacity, None,
-        "the card's presumption moved for the page's heap"
+        app.capacity_modulation.gpu_ceiling, None,
+        "the card's ceiling moved for the page's heap"
     );
     assert_eq!(app.capacity().host_bytes, Some(840_853_089));
     assert_eq!(
@@ -2563,7 +2698,7 @@ fn a_page_heap_event_lowers_the_host_ceiling_on_the_wasm_bracket() {
     gauge.set(page(891 * MIB + LINEAR_MEMORY_REFIRE_STEP_BYTES));
     tick(&mut app);
     assert_eq!(app.capacity_modulation.host_ceiling, Some(756_767_772));
-    assert_eq!(app.session_capacity, None);
+    assert_eq!(app.capacity_modulation.gpu_ceiling, None);
     assert_eq!(
         app.host_recovery.level(),
         2,
@@ -3214,8 +3349,8 @@ fn a_page_at_ninety_percent_with_levers_says_so_and_frees_something() {
         "the host ceiling was not lowered from the mark the heap reached",
     );
     assert_eq!(
-        app.session_capacity, None,
-        "a page-heap event lowered the card's presumption",
+        app.capacity_modulation.gpu_ceiling, None,
+        "a page-heap event lowered the card's ceiling",
     );
 
     // The sentence the reader gets. A `budget pressure:` line with a page
