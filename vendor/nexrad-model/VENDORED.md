@@ -89,3 +89,47 @@ the added method must leave untouched.
 | `src/data/sweep.rs` | One method, `Sweep::radials_capacity(&self) -> usize` — `Vec::capacity` on the radial vector, for the same reason and marked the same way. Reading it is what lets `squallar_radar::scan_size::scan_bytes` charge what the allocator holds rather than what the slice's length implies; the spare is ~42 % of the length in real decoded volumes. |
 | `Cargo.toml` | The `[lints]` tables every vendored crate here carries, so the clippy fix-bot cannot rewrite upstream source — see the comment above them and vendor/nexrad-decode/Cargo.toml for the mechanism. Also the two `[[test]]` blocks and five dev-dependencies of the deleted tests, removed. |
 | `LICENSE`, `VENDORED.md` | This file and the license notice. |
+
+### Changed — source
+
+#### The doubling slack — `src/data/sweep.rs`
+
+`Sweep::from_radials` shrinks each sweep's radial vector, and the sweep vector
+itself, before handing them over.
+
+```rust
++                    sweep_radials.shrink_to_fit();
+                     sweeps.push(Sweep::new(elevation_number, sweep_radials));
+...
++        sweeps.shrink_to_fit();
+         sweeps
+```
+
+Both vectors are grown by `push` with no capacity known in advance, so both end
+on a power-of-two rung. A real 0.5° surveillance cut is **720 radials** and
+lands in a vector of capacity **1024**: 304 unused slots of
+`size_of::<Radial>()` — **94,848 B on this target** — that the allocator holds
+for as long as the volume is resident, and a decoded volume lives in up to four
+of squallar's caches at once (loop downloads, still inventory, derivation memo,
+and whatever a pane is drawing). Measured over 208 real archive volumes the
+spare runs **~42 % of the length**, which is why
+`squallar_radar::scan_size::sweep_bytes` charges `radials_capacity()` and not
+`len()` — the accessor listed above exists for exactly this quantity, and until
+now nothing gave it back.
+
+Measured, `squallar-radar/tests/sweep_radial_slack.rs` (its own binary with the
+counting `#[global_allocator]`; the figure is `squallar_alloc::live_bytes`,
+granted less returned): one 720-radial sweep off `from_radials` costs
+**225,392 B** with the shrink and **320,240 B** without it — a difference of
+exactly 94,848 B, the 304 slots.
+
+The cost is one reallocation per sweep, at decode time, on a buffer about to be
+handed to a cache and then not touched again — paid once, off the frame thread,
+against bytes held for the volume's whole life. **`Sweep::merge` deliberately
+does not shrink**: a live volume merges repeatedly as cuts arrive, and shrinking
+between merges would pay that copy on every one of them and re-grow
+immediately. `Sweep::new` is likewise untouched — a caller that sized its vector
+deliberately keeps what it asked for.
+
+Offerable upstream as written; `tests/model_types.rs` is the pin it leaves
+intact.

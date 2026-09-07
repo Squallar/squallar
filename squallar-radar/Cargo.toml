@@ -96,3 +96,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # The hail sanity harness re-runs `nexrad-level3`'s whole-file zlib strip on
 # raw NHI objects to reach their Tabular Alphanumeric Block.
 flate2 = { workspace = true }
+# The counting global allocator, for the suites that have to watch a level fall
+# rather than trust a capacity accessor. Tests only -- the `#[global_allocator]`
+# is declared by the test binary that wants it, never by this crate.
+squallar-alloc = { workspace = true }

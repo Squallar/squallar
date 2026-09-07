@@ -33,6 +33,24 @@ impl Sweep {
     }
 
     /// Create a new radar sweep from a list of radials by splitting them by elevation.
+    ///
+    /// LOCAL CHANGE (squallar, see VENDORED.md): each sweep's radial vector, and
+    /// the sweep vector itself, are shrunk to their length before they are
+    /// handed over. Both are grown by `push` with no capacity known in advance,
+    /// so both end on a power-of-two rung: 720 radials — a real 0.5° surveillance
+    /// cut — land in a vector of capacity 1024, and the allocator holds all 1024
+    /// slots of `size_of::<Radial>()` for as long as the volume is resident.
+    /// Measured across 208 real archive volumes the spare is **~42 % of the
+    /// length**, and a decoded volume lives in up to four caches at once (the
+    /// loop download cache, the still inventory, the derivation memo and
+    /// whatever a pane is drawing).
+    ///
+    /// The cost is one reallocation per sweep at decode time, on the buffer that
+    /// is about to be handed to a cache and then not touched again — paid once,
+    /// off the frame thread, against bytes held for the volume's whole life.
+    /// [`merge`](Self::merge) deliberately does **not** shrink: a live volume
+    /// merges repeatedly as cuts arrive, and shrinking between merges would pay
+    /// that copy on every one of them and re-grow immediately.
     pub fn from_radials(radials: Vec<Radial>) -> Vec<Self> {
         let mut sweeps = Vec::new();
 
@@ -42,6 +60,7 @@ impl Sweep {
         for radial in radials {
             if let Some(elevation_number) = sweep_elevation_number {
                 if elevation_number != radial.elevation_number() {
+                    sweep_radials.shrink_to_fit();
                     sweeps.push(Sweep::new(elevation_number, sweep_radials));
                     sweep_radials = Vec::new();
                 }
@@ -54,10 +73,12 @@ impl Sweep {
         // Push the final sweep if there are remaining radials
         if let Some(elevation_number) = sweep_elevation_number {
             if !sweep_radials.is_empty() {
+                sweep_radials.shrink_to_fit();
                 sweeps.push(Sweep::new(elevation_number, sweep_radials));
             }
         }
 
+        sweeps.shrink_to_fit();
         sweeps
     }
 

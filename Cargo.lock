@@ -5099,6 +5099,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "squallar-alloc",
  "squallar-geo",
  "squallar-source",
  "squallar-units",
