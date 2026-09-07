@@ -2536,7 +2536,6 @@ impl super::App {
         // `deferred drops` need no publisher here: `census()` reads radar's
         // slot atomics and the discard ledger's counters directly.
         self.render.publish_heap_census();
-        census::set_overlay_picture_bytes(self.render.resident_overlay_pictures().1);
         census::set_loop_frame_bytes(self.loop_frames.resident_host_bytes());
         census::set_loop_frame_scan_bytes(self.loop_frames.pinned_volume_bytes());
         census::set_volume_store_bytes(self.volume_store.memory_bytes() as u64);

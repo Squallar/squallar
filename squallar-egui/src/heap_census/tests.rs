@@ -13,7 +13,6 @@ fn distinct() -> Census {
         derive_memo_bytes: 8,
         loop_frame_scan_bytes: 16,
         render_cache_bytes: 32,
-        overlay_picture_bytes: 64,
         overlay_grid_bytes: 128,
         overlay_item_bytes: 256,
         overlay_parked_bytes: 512,
@@ -41,7 +40,11 @@ fn distinct() -> Census {
 #[test]
 fn the_resident_total_leaves_the_gpu_families_out() {
     let c = distinct();
-    let every_family = (1 << 24) - 1;
+    // One distinct power of two per family, so the sum of them all is
+    // `2^24 - 1`. `overlay pictures` was deleted, so its 64 is no longer among
+    // them — subtracted as the gap it is rather than replaced by a new
+    // literal, so this stays a derivation and names which family left.
+    let every_family = (1 << 24) - 1 - 64;
     assert_eq!(
         c.resident_total(),
         every_family - 524_288 - 4_194_304,
@@ -97,7 +100,6 @@ fn the_line_names_every_family_and_its_denominator() {
         "loop frame scans 16 B",
         "chunk feed 8388608 B",
         "render cache 32 B",
-        "overlay pictures 64 B",
         "overlay grids 128 B",
         "overlay items 256 B",
         "overlay parked 512 B",
@@ -148,7 +150,6 @@ fn the_widest_line_fits_the_hooks_buffer() {
         derive_memo_bytes: u64::MAX,
         loop_frame_scan_bytes: u64::MAX,
         render_cache_bytes: u64::MAX,
-        overlay_picture_bytes: u64::MAX,
         overlay_grid_bytes: u64::MAX,
         overlay_item_bytes: u64::MAX,
         overlay_parked_bytes: u64::MAX,

@@ -101,7 +101,10 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// the same 37 is spelled `", gpu textures "` (15) + twenty digits + `" B"`
 /// (2) — so 963 + 37 = 1000 on that arm; the `none` arm's 27 make 1027.
 /// `chunk feed` is 10 characters, so it adds `10 + 25 = 35`: 1027 + 35 = 1062.
-pub const CENSUS_LINE_CAPACITY: usize = 1062;
+/// And `overlay pictures` was DELETED — the family priced a 64-byte plan
+/// record as pixels — so by the same rule it takes its 16 characters and
+/// `16 + 25 = 41` back out: 1062 - 41 = 1021.
+pub const CENSUS_LINE_CAPACITY: usize = 1021;
 
 /// One family's level. A `u64` of bytes, `Relaxed` throughout: every reader
 /// wants a recent figure, none wants a synchronised one, and a census torn
@@ -194,9 +197,6 @@ families! {
          pane forgotten while a reply is still in the channel, stops being \
          priced while its raster is still resident. It never prices an image \
          that has gone.";
-    OVERLAY_PICTURE_BYTES, overlay_picture_bytes, set_overlay_picture_bytes,
-        "Overlay pictures this frame's dispatch has resident - the batch \
-         WO-36 capped, at `width * height * 4`.";
     OVERLAY_GRID_BYTES, overlay_grid_bytes, set_overlay_grid_bytes,
         "Decoded overlay SOURCE data the layer handlers are holding BESIDE \
          their state - MRMS mosaics, GMGSI granules, HRRR model grids, their \
@@ -366,7 +366,6 @@ impl Census {
             self.render_cache_bytes,
             self.render_pool_bytes,
             self.render_in_flight_bytes,
-            self.overlay_picture_bytes,
             self.overlay_grid_bytes,
             self.overlay_item_bytes,
             self.overlay_parked_bytes,
@@ -509,7 +508,7 @@ pub fn write_line<W: core::fmt::Write>(
         "heap census ({instance}): loop scans {} B, loop l3 {} B, still scans {} B, \
          derive memo {} B, loop frame scans {} B, chunk feed {} B, \
          render cache {} B, render pools {} B, \
-         renders in flight {} B, overlay pictures {} B, \
+         renders in flight {} B, \
          overlay grids {} B, overlay items {} B, overlay parked {} B, loop frames {} B, \
          upload pending {} B, tile bodies {} B, tile parsed {} B, \
          tile cache {} B, loans out {} B, volume store {} B, jobs in flight {} B, \
@@ -523,7 +522,6 @@ pub fn write_line<W: core::fmt::Write>(
         census.render_cache_bytes,
         census.render_pool_bytes,
         census.render_in_flight_bytes,
-        census.overlay_picture_bytes,
         census.overlay_grid_bytes,
         census.overlay_item_bytes,
         census.overlay_parked_bytes,
