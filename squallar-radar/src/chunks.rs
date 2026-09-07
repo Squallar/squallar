@@ -493,6 +493,58 @@ impl ElevationChunkMap {
     }
 }
 
+/// **Decoded volumes the real-time chunk feed is holding.**
+///
+/// A process-global level, read through by
+/// `squallar_egui::heap_census`'s `chunk feed` family the way
+/// `crate::render::parked_bytes` is: this crate cannot see that one, and a
+/// publish from the frame thread's telemetry tick would have to walk a volume
+/// to produce a figure.
+///
+/// **Maintained off the frame thread, where the bytes actually move.** A
+/// round runs on a tokio worker (native) or outside the frame callback
+/// (wasm), so this is an atomic rather than a field the frame thread reads —
+/// and every seam that moves it is inside a round, except the two `Drop`s,
+/// which run wherever the owner is finally released. That includes the
+/// frame-paced discard queue: `squallar_worker::offload::discard_each` frees a
+/// retired `SiteFeed` on a free lane at some later frame, so a level tied to
+/// the retirement rather than the drop would fall before the bytes did.
+static CHUNK_FEED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Move the level from `was` to `now`. One `Relaxed` read-modify-write of a
+/// difference the caller already has, so an add here and a subtract elsewhere
+/// cannot drift the way two separate stores could.
+fn move_feed_level(was: u64, now: u64) {
+    CHUNK_FEED_BYTES.fetch_add(now.wrapping_sub(was), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// **Host bytes the chunk feed's decoded volumes are holding**, this instant.
+///
+/// Two terms per assembler and one per poller:
+///
+/// * the **sealed cuts** — every `Cut::Sealed` sweep, priced at the seal, and
+///   the volume the feed is building;
+/// * the **snapshot** — `VolumeAssembler::cached`, which
+///   [`VolumeAssembler::snapshot`] builds by DEEP-CLONING every sealed sweep,
+///   so it is a genuine second copy and not an `Arc` of the first;
+/// * the poller's **parked closed volumes**, each a whole `Scan`.
+///
+/// **A FLOOR, and it under-counts in one direction only.** The radials of a
+/// cut still being received (`Cut::Open`) are not priced: they move into a
+/// sealed sweep untouched when the cut completes, so pricing them would need
+/// a subtraction at the seal to avoid double counting, and at most one cut
+/// per assembler is open at a time — a sixteenth of a volume on a VCP 212.
+/// Nothing here ever prices bytes that have gone.
+///
+/// **An UPPER bound against the other radar families**, like every figure in
+/// `radar_total`: once a round delivers, the same `Arc<Scan>` is installed in
+/// the still inventory, and `still scans` prices it too. This says what
+/// emptying the feed alone would free.
+pub fn feed_bytes() -> usize {
+    usize::try_from(CHUNK_FEED_BYTES.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(usize::MAX)
+}
+
 /// One elevation cut being accumulated.
 enum Cut {
     /// Still receiving.
@@ -580,6 +632,13 @@ pub struct VolumeAssembler {
     closed: bool,
     /// Invalidated whenever a cut seals. See [`Self::snapshot`].
     cached: Option<std::sync::Arc<nexrad_model::data::Scan>>,
+    /// Host bytes this assembler's SEALED cuts hold, summed at each seal.
+    /// Sealed cuts are never reopened, so this only rises until the whole
+    /// assembler drops. See [`feed_bytes`] for what is deliberately not in it.
+    sealed_bytes: u64,
+    /// Host bytes [`Self::cached`] holds — a whole deep-copied volume, not an
+    /// `Arc` of the sealed sweeps. Zero exactly when the snapshot is cold.
+    cached_bytes: u64,
     /// Every cut's declared Nyquist velocity, accumulated across the chunks as
     /// they arrive. See [`Self::declared_nyquist`].
     declared_nyquist: crate::nyquist::DeclaredNyquist,
@@ -596,6 +655,8 @@ impl VolumeAssembler {
             volume_time: None,
             ingested: Default::default(),
             cuts: Default::default(),
+            sealed_bytes: 0,
+            cached_bytes: 0,
             coverage_pattern: None,
             saw_start_chunk: false,
             saw_scan_end: false,
@@ -665,7 +726,7 @@ impl VolumeAssembler {
             // `placeholder_coverage_pattern`, whose cut table is empty; a `Scan`
             // that cannot key its own sweeps must not go on being served once
             // the real pattern is known.
-            self.cached = None;
+            self.drop_cached();
         }
 
         // The first chunk to mention a cut is the one that names it; the rest
@@ -679,7 +740,7 @@ impl VolumeAssembler {
             && let Some(site) = contents.site
         {
             self.reported_site = Some(site);
-            self.cached = None;
+            self.drop_cached();
         }
 
         let mut touched: Vec<u8> = Vec::new();
@@ -732,7 +793,7 @@ impl VolumeAssembler {
             }
         }
         if !outcome.sealed.is_empty() {
-            self.cached = None;
+            self.drop_cached();
         }
         outcome.volume_complete = self.is_volume_complete();
         outcome
@@ -755,13 +816,16 @@ impl VolumeAssembler {
             return false;
         }
         let radials = std::mem::take(radials);
-        self.cuts.insert(
-            elevation,
-            Cut::Sealed(nexrad_model::data::Sweep::new(
-                elevation,
-                radials.into_values().collect(),
-            )),
-        );
+        let sweep = nexrad_model::data::Sweep::new(elevation, radials.into_values().collect());
+        // **Priced here, once, off the frame thread.** The radials moved out
+        // of the open cut rather than being copied, so this is bytes crossing
+        // from unpriced to priced and there is nothing to subtract. One walk
+        // of this sweep's ~720 radials, ~16 times a volume, inside the round
+        // that sealed it — never on a frame.
+        let bytes = crate::scan_size::sweep_bytes(&sweep) as u64;
+        move_feed_level(self.sealed_bytes, self.sealed_bytes + bytes);
+        self.sealed_bytes += bytes;
+        self.cuts.insert(elevation, Cut::Sealed(sweep));
         true
     }
 
@@ -861,7 +925,7 @@ impl VolumeAssembler {
             );
         }
         if !short.is_empty() {
-            self.cached = None;
+            self.drop_cached();
         }
         self.closed = true;
         self.progress()
@@ -921,8 +985,28 @@ impl VolumeAssembler {
             Some(site) => nexrad_model::data::Scan::with_site(site, vcp, sweeps),
             None => nexrad_model::data::Scan::new(vcp, sweeps),
         });
+        // **A second whole volume, and priced as one.** The sweeps above were
+        // `sweep.clone()`d out of the sealed cuts, so this `Scan` owns its own
+        // gate buffers rather than sharing theirs. The walk is strictly
+        // smaller than the deep copy that just happened, and it is on the cold
+        // path only — the warm return above does no work, which is what keeps
+        // the frame thread's several calls a frame free.
+        self.cached_bytes = crate::scan_size::scan_bytes(&scan) as u64;
+        move_feed_level(0, self.cached_bytes);
         self.cached = Some(std::sync::Arc::clone(&scan));
         scan
+    }
+
+    /// Drop the built snapshot and give its bytes back to [`feed_bytes`].
+    ///
+    /// Spelled once rather than at each of the four invalidation sites: a
+    /// `self.cached = None` that forgot the level would leave the census
+    /// naming a volume that had gone, which is the one direction this
+    /// instrument must never fail in.
+    fn drop_cached(&mut self) {
+        move_feed_level(self.cached_bytes, 0);
+        self.cached_bytes = 0;
+        self.cached = None;
     }
 
     /// Whether [`Self::snapshot`] would return without building.
@@ -1037,6 +1121,44 @@ pub struct ChunkPoller {
     /// Volumes that closed in rounds that then failed, oldest first, waiting for
     /// outcomes that reach the caller. See [`Self::park_for_next_round`].
     pending_closed: std::collections::VecDeque<ClosedVolume>,
+    /// Host bytes [`Self::pending_closed`] holds. Maintained at the four
+    /// push/pop seams rather than walked: the queue is unbounded, and a fold
+    /// over it would be a walk of every parked volume's radials.
+    pending_bytes: u64,
+}
+
+/// **Give every byte back, wherever this assembler is finally released.**
+///
+/// There is no single choke point to hang this on and there are six paths to
+/// it: `roll` replacing `current`, `poll`'s rediscovery, a poller dropped
+/// because its site went away mid-round, a cancelled round task, the whole
+/// `App` tearing down, and — the one that makes a `Drop` mandatory rather
+/// than tidy — `retain_live`'s retired feeds, which
+/// `squallar_worker::offload::discard_each` frees on a free lane at some
+/// later frame. A level retracted at the retirement instead would fall while
+/// the bytes were still resident, which is the one direction an instrument
+/// must never fail in.
+impl Drop for VolumeAssembler {
+    fn drop(&mut self) {
+        move_feed_level(self.sealed_bytes.saturating_add(self.cached_bytes), 0);
+    }
+}
+
+/// As [`VolumeAssembler`]'s: the parked queue is freed with the poller, on
+/// whichever thread finally holds it.
+impl Drop for ChunkPoller {
+    fn drop(&mut self) {
+        move_feed_level(self.pending_bytes, 0);
+    }
+}
+
+/// Host bytes a parked closed volume holds. `None` — a volume that closed
+/// with no sealed cut at all — costs nothing.
+fn closed_volume_bytes(closed: &ClosedVolume) -> u64 {
+    closed
+        .scan
+        .as_deref()
+        .map_or(0, |scan| crate::scan_size::scan_bytes(scan) as u64)
 }
 
 impl ChunkPoller {
@@ -1048,6 +1170,7 @@ impl ChunkPoller {
             last_round_was_quiet: false,
             selection: CutSelection::All,
             pending_closed: std::collections::VecDeque::new(),
+            pending_bytes: 0,
         }
     }
 
@@ -1061,6 +1184,7 @@ impl ChunkPoller {
             last_round_was_quiet: false,
             selection: CutSelection::All,
             pending_closed: std::collections::VecDeque::new(),
+            pending_bytes: 0,
         }
     }
 
@@ -1194,7 +1318,7 @@ impl ChunkPoller {
         // As in `poll`: a volume closed by a round that then failed leaves on a
         // later outcome, whichever way that one leaves. Oldest first.
         let mut outcome = PollOutcome {
-            closed: self.pending_closed.pop_front(),
+            closed: self.take_pending(),
             ..Default::default()
         };
         if id.site() != self.site {
@@ -1321,8 +1445,39 @@ impl ChunkPoller {
             );
             // Front, not back: this one was drained before the ones already
             // queued were added, so it is the oldest of them.
-            self.pending_closed.push_front(closed);
+            self.park_pending_front(closed);
         }
+    }
+
+    /// Take the oldest parked volume, giving its bytes back to
+    /// [`feed_bytes`]. It leaves on an outcome, crosses to the frame thread
+    /// and is either installed — where `still scans` prices it — or dropped.
+    fn take_pending(&mut self) -> Option<ClosedVolume> {
+        let closed = self.pending_closed.pop_front()?;
+        let bytes = closed_volume_bytes(&closed);
+        move_feed_level(self.pending_bytes, self.pending_bytes.saturating_sub(bytes));
+        self.pending_bytes = self.pending_bytes.saturating_sub(bytes);
+        Some(closed)
+    }
+
+    /// Park a volume at the front — it is older than everything queued.
+    fn park_pending_front(&mut self, closed: ClosedVolume) {
+        self.charge_pending(&closed);
+        self.pending_closed.push_front(closed);
+    }
+
+    /// Park a volume behind the others.
+    fn park_pending_back(&mut self, closed: ClosedVolume) {
+        self.charge_pending(&closed);
+        self.pending_closed.push_back(closed);
+    }
+
+    /// One walk per parked volume, at the park. The queue is drained one an
+    /// outcome, so this runs about as often as a volume rolls.
+    fn charge_pending(&mut self, closed: &ClosedVolume) {
+        let bytes = closed_volume_bytes(closed);
+        move_feed_level(self.pending_bytes, self.pending_bytes + bytes);
+        self.pending_bytes += bytes;
     }
 
     /// Give a freshly closed volume to this round if it is not already carrying
@@ -1334,7 +1489,7 @@ impl ChunkPoller {
         if outcome.closed.is_none() {
             outcome.closed = Some(closed);
         } else {
-            self.pending_closed.push_back(closed);
+            self.park_pending_back(closed);
         }
     }
 
@@ -1348,7 +1503,7 @@ impl ChunkPoller {
         // A volume closed by an earlier round that then failed rides out on this
         // one, whichever way it leaves. Oldest first. See `park_for_next_round`.
         let mut outcome = PollOutcome {
-            closed: self.pending_closed.pop_front(),
+            closed: self.take_pending(),
             ..Default::default()
         };
 

@@ -30,6 +30,7 @@ fn distinct() -> Census {
         render_pool_bytes: 1_048_576,
         render_in_flight_bytes: 2_097_152,
         gpu_texture_bytes: 4_194_304,
+        chunk_feed_bytes: 8_388_608,
     }
 }
 
@@ -40,14 +41,14 @@ fn distinct() -> Census {
 #[test]
 fn the_resident_total_leaves_the_gpu_families_out() {
     let c = distinct();
-    let every_family = (1 << 23) - 1;
+    let every_family = (1 << 24) - 1;
     assert_eq!(
         c.resident_total(),
         every_family - 524_288 - 4_194_304,
         "the resident total swept a GPU family in; it is a residual against a \
          linear-memory `byteLength`, which no device byte is on",
     );
-    assert_eq!(c.radar_total(), 1 + 2 + 4 + 8 + 16);
+    assert_eq!(c.radar_total(), 1 + 2 + 4 + 8 + 16 + 8_388_608);
 }
 
 /// The residual is the reading less the families, and `None` — not zero, and
@@ -94,6 +95,7 @@ fn the_line_names_every_family_and_its_denominator() {
         "still scans 4 B",
         "derive memo 8 B",
         "loop frame scans 16 B",
+        "chunk feed 8388608 B",
         "render cache 32 B",
         "overlay pictures 64 B",
         "overlay grids 128 B",
@@ -157,6 +159,7 @@ fn the_widest_line_fits_the_hooks_buffer() {
         tile_cache_bytes: u64::MAX,
         tile_mesh_bytes: u64::MAX,
         gpu_texture_bytes: u64::MAX,
+        chunk_feed_bytes: u64::MAX,
         volume_store_bytes: u64::MAX,
         loan_outstanding_bytes: u64::MAX,
         job_in_flight_bytes: u64::MAX,
@@ -221,8 +224,16 @@ fn process_guard() -> std::sync::MutexGuard<'static, ()> {
 #[test]
 fn the_radar_floor_is_the_largest_holder_and_the_total_is_the_sum() {
     let c = distinct();
-    assert_eq!(c.radar_total(), 1 + 2 + 4 + 8 + 16, "the upper bound");
-    assert_eq!(c.radar_floor(), 16, "the floor is the largest holder");
+    assert_eq!(
+        c.radar_total(),
+        1 + 2 + 4 + 8 + 16 + 8_388_608,
+        "the upper bound"
+    );
+    assert_eq!(
+        c.radar_floor(),
+        8_388_608,
+        "the floor is the largest holder"
+    );
     assert!(c.radar_floor() < c.radar_total());
 
     // One holder and nothing else: the two ends meet, because there is no

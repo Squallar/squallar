@@ -100,7 +100,8 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// characters, so it adds `12 + 25 = 37`, and it lands in the GPU tail where
 /// the same 37 is spelled `", gpu textures "` (15) + twenty digits + `" B"`
 /// (2) — so 963 + 37 = 1000 on that arm; the `none` arm's 27 make 1027.
-pub const CENSUS_LINE_CAPACITY: usize = 1027;
+/// `chunk feed` is 10 characters, so it adds `10 + 25 = 35`: 1027 + 35 = 1062.
+pub const CENSUS_LINE_CAPACITY: usize = 1062;
 
 /// One family's level. A `u64` of bytes, `Relaxed` throughout: every reader
 /// wants a recent figure, none wants a synchronised one, and a census torn
@@ -304,6 +305,19 @@ families! {
          ~43k buffers whether it is median or maximum shape, and freeing \
          391 MiB took 25.3 ms against 604 MiB's 27.9 ms. Do not size this \
          against megabytes.";
+    chunk_feed_bytes = squallar_radar::chunks::feed_bytes() as u64,
+        "Decoded volumes the REAL-TIME CHUNK FEED is holding - the sealed \
+         cuts of the volume each live site is assembling, the deep-copied \
+         snapshot built from them, and the closed volumes a poller has \
+         parked. Two whole volumes a live site at the peak, and until \
+         2026-09-07 no family named a byte of it: the feed's stores are \
+         three levels below `App` and nothing in the tree could price them. \
+         READ THROUGH, like `render pools`: radar cannot see this module, \
+         and the levels are maintained inside the polling round, off the \
+         frame thread, where the bytes actually move. A FLOOR - the radials \
+         of a cut still arriving are not priced, at most a sixteenth of a \
+         volume - and an UPPER bound against `still scans`, which prices the \
+         same `Arc` once a round delivers it.";
     render_pool_bytes = squallar_radar::render::parked_bytes() as u64,
         "Render buffers `squallar_radar` is PARKING between renders - the \
          plan-view cell buffer, RGBA texture and value grid, and the section \
@@ -384,6 +398,7 @@ impl Census {
             .saturating_add(self.still_scan_bytes)
             .saturating_add(self.derive_memo_bytes)
             .saturating_add(self.loop_frame_scan_bytes)
+            .saturating_add(self.chunk_feed_bytes)
     }
 
     /// **What this census does not account for**, against a real reading of
@@ -421,6 +436,7 @@ impl Census {
             self.still_scan_bytes,
             self.derive_memo_bytes,
             self.loop_frame_scan_bytes,
+            self.chunk_feed_bytes,
         ]
         .into_iter()
         .fold(0u64, u64::max)
@@ -491,7 +507,8 @@ pub fn write_line<W: core::fmt::Write>(
     write!(
         out,
         "heap census ({instance}): loop scans {} B, loop l3 {} B, still scans {} B, \
-         derive memo {} B, loop frame scans {} B, render cache {} B, render pools {} B, \
+         derive memo {} B, loop frame scans {} B, chunk feed {} B, \
+         render cache {} B, render pools {} B, \
          renders in flight {} B, overlay pictures {} B, \
          overlay grids {} B, overlay items {} B, overlay parked {} B, loop frames {} B, \
          upload pending {} B, tile bodies {} B, tile parsed {} B, \
@@ -502,6 +519,7 @@ pub fn write_line<W: core::fmt::Write>(
         census.still_scan_bytes,
         census.derive_memo_bytes,
         census.loop_frame_scan_bytes,
+        census.chunk_feed_bytes,
         census.render_cache_bytes,
         census.render_pool_bytes,
         census.render_in_flight_bytes,
@@ -833,8 +851,10 @@ pub const PROCESS_WALK_EVERY: u32 = 8;
 /// the range's `unaccounted <20> B to <20> B` is wider than
 /// `unaccounted none (families price above live)`, so the widest line is a
 /// census whose families price *below* `live`. Seventeen `u64::MAX` figures
-/// at 20 digits, the three counts among them, plus the prose.
-pub const PROCESS_LINE_CAPACITY: usize = 645;
+/// at 20 digits, the three counts among them, plus the prose — and the two
+/// census ends it prints (`families` and `floor`) grow with the census, so a
+/// family added there moves this too: `chunk feed` took it from 645 to 647.
+pub const PROCESS_LINE_CAPACITY: usize = 647;
 
 /// **The process denominator as one line.**
 ///

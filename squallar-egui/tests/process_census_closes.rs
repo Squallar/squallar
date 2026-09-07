@@ -63,7 +63,8 @@ fn the_process_census_partitions_names_a_floor_and_follows_a_real_allocation() {
     );
 
     // ---- 2. The mapping walk is a partition too, by construction. --------
-    let walk = squallar_alloc::process::breakdown().expect("/proc/self/smaps reads where status does");
+    let walk =
+        squallar_alloc::process::breakdown().expect("/proc/self/smaps reads where status does");
     assert!(
         walk.partitions(),
         "the eight classes summed to {} B against the walk's own {} B: {walk:?}",
@@ -145,7 +146,10 @@ fn the_process_census_partitions_names_a_floor_and_follows_a_real_allocation() {
     // of each reading has landed, but they cannot make two instants into one
     // - so the line is composed from readings taken together.
     let walk = squallar_alloc::process::breakdown().expect("still readable");
-    publish_resident(after, Some(squallar_alloc::process::resident().expect("still readable")));
+    publish_resident(
+        after,
+        Some(squallar_alloc::process::resident().expect("still readable")),
+    );
     squallar_egui::heap_census::publish_breakdown(&walk);
     let p = process_census();
     assert!(p.sampled() && p.walked(), "the publish did not land");

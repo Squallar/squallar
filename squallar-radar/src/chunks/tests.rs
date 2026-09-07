@@ -1643,7 +1643,13 @@ fn the_aborting_round_warms_the_snapshot_before_it_returns_the_error() {
 #[test]
 fn every_failing_round_parks_the_closed_volume_and_every_round_collects_it() {
     const PARK: &str = "self.park_for_next_round(&mut outcome);";
-    const DRAIN: &str = "closed: self.pending_closed.pop_front(),";
+    // Re-pointed 2026-09-07 from `self.pending_closed.pop_front()`: the queue
+    // gained a byte level, so both rounds now drain through `take_pending`,
+    // which is that `pop_front` plus the retraction. **A mechanical re-point,
+    // not a moved assertion** — what this test pins is that each round drains
+    // a parked volume BEFORE any early return, and both the position and the
+    // ordering assertion below are unchanged.
+    const DRAIN: &str = "closed: self.take_pending(),";
     for signature in ["pub async fn poll(", "pub async fn fetch_notified("] {
         let body = poller_method(signature);
         let drain = body.find(DRAIN).unwrap_or_else(|| {
@@ -2300,4 +2306,103 @@ async fn live_a_start_chunk_decodes_and_carries_the_coverage_pattern() {
             "the position the feed states is not a place a radar is: {site}",
         );
     }
+}
+
+/// **The chunk feed's volumes are priced, and the level gives them back.**
+///
+/// Until 2026-09-07 nothing in the tree named a byte of this: the feed's
+/// stores sit three levels below `App` — manager, site feed, poller,
+/// assembler — and no accessor anywhere could price them, so a live site's
+/// two whole decoded volumes were invisible to every instrument. This is the
+/// gate on the family that names them.
+///
+/// **Per-instance figures where exactness is claimed, and the process-global
+/// level only in the two directions that cannot lie.** `CHUNK_FEED_BYTES` is
+/// process-wide and this binary's other tests build assemblers on other
+/// harness threads, so an exact delta against it would be some other arm's
+/// arithmetic as often as not. What is asserted globally is what no
+/// concurrent offset can forge: the level is at least what this assembler
+/// holds, and it strictly falls when this assembler is dropped.
+#[test]
+fn the_chunk_feed_prices_its_volumes_and_gives_them_back() {
+    let mut a = assemble(golden_chunks());
+
+    // ---- the sealed cuts, priced at each seal ---------------------------
+    // Recomputed here from the cuts themselves rather than compared against a
+    // recorded constant: the expectation is a relation to what is actually
+    // held, so it stays true at any volume size.
+    let sealed_now: u64 = a
+        .cuts
+        .values()
+        .filter_map(|cut| match cut {
+            Cut::Sealed(sweep) => Some(crate::scan_size::sweep_bytes(sweep) as u64),
+            _ => None,
+        })
+        .sum();
+    assert!(sealed_now > 0, "the fixture sealed no cuts");
+    assert_eq!(
+        a.sealed_bytes, sealed_now,
+        "the level the seals accumulated is not what the sealed cuts hold"
+    );
+
+    // ---- the snapshot is a SECOND whole volume, not an Arc of the first --
+    assert_eq!(
+        a.cached_bytes, 0,
+        "nothing is cached before the first build"
+    );
+    let snap = a.snapshot();
+    assert_eq!(
+        a.cached_bytes,
+        crate::scan_size::scan_bytes(&snap) as u64,
+        "the built snapshot was not priced at what it holds"
+    );
+    assert!(
+        a.cached_bytes > 0,
+        "a snapshot of a volume with sealed cuts priced at nothing"
+    );
+
+    // The warm return does no work and must not re-charge: a second call
+    // that added again would double the family every time a pane asked.
+    let charged = a.cached_bytes;
+    let again = a.snapshot();
+    assert!(
+        std::sync::Arc::ptr_eq(&snap, &again),
+        "the fixture went cold"
+    );
+    assert_eq!(
+        a.cached_bytes, charged,
+        "the warm snapshot path charged the level a second time"
+    );
+
+    // ---- the global level carries at least what this assembler holds -----
+    let held = a.sealed_bytes + a.cached_bytes;
+    assert!(
+        feed_bytes() as u64 >= held,
+        "the process level {} B is below this assembler's own {held} B",
+        feed_bytes()
+    );
+
+    // ---- an invalidation gives the snapshot's bytes back -----------------
+    drop(snap);
+    drop(again);
+    a.drop_cached();
+    assert_eq!(a.cached_bytes, 0, "the invalidation kept the level up");
+    assert_eq!(
+        a.sealed_bytes, sealed_now,
+        "dropping the snapshot moved the sealed cuts' level"
+    );
+
+    // ---- and the drop gives back everything ------------------------------
+    // The direction that matters: a retired feed is freed on a free lane at
+    // some later frame, so a level that fell at the retirement instead of at
+    // the drop would name bytes that were still resident.
+    let before_drop = feed_bytes() as u64;
+    let owed = a.sealed_bytes + a.cached_bytes;
+    drop(a);
+    let after_drop = feed_bytes() as u64;
+    assert!(
+        before_drop.saturating_sub(after_drop) >= owed,
+        "dropping an assembler holding {owed} B moved the level only {} B",
+        before_drop.saturating_sub(after_drop)
+    );
 }
