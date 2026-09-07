@@ -445,6 +445,11 @@ build:
 	    || { echo "ERROR: the icon renderer wrote no AppIcon60x60@2x.png, which is the 120x120 error 90022 asks for."; exit 1; }
 	test -s "$$APP/AppIcon76x76@2x~ipad.png" \
 	    || { echo "ERROR: the icon renderer wrote no AppIcon76x76@2x~ipad.png, which is the 152x152 error 90023 asks for."; exit 1; }
+	# PkgInfo: eight bytes, the bundle's type and creator ("APPL????"), and
+	# Xcode has written it into every app bundle since the beginning. Read off
+	# a real Xcode build of a stub app rather than assumed; it was the ONE file
+	# that build shipped and this one did not.
+	printf 'APPL????' > "$$APP/PkgInfo"
 	cp packaging/PrivacyInfo.xcprivacy "$$APP/PrivacyInfo.xcprivacy"
 	test -s "$$APP/PrivacyInfo.xcprivacy" || { echo "ERROR: PrivacyInfo.xcprivacy did not reach the bundle root"; exit 1; }
 	# iPhone presentation clamps to 60 Hz on ProMotion panels without this key;
