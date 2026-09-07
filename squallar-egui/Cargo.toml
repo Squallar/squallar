@@ -183,6 +183,11 @@ pmtiles = { workspace = true, features = ["http-async"] }
 wasm-bindgen-futures = "=0.4.78"
 
 [dev-dependencies]
+# `test-support` so the census gate can MOVE radar's chunk-feed level and show
+# the `chunk feed` family really reads it. Without this the read-through is
+# ungated: a tamper replacing the expression with `0u64` passed every test.
+squallar-radar = { workspace = true, features = ["test-support"] }
+
 # `image` moved to `[dependencies]` when the terrain hillshade landed: the
 # WebP decode is now a shipped code path, not only the test fixtures' PNG
 # encoder. The tests keep using it from there.

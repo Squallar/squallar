@@ -486,3 +486,32 @@ fn the_widest_process_line_fits_its_buffer() {
         said.len()
     );
 }
+
+/// **The `chunk feed` family reads radar's own level**, and is not wired to a
+/// constant.
+///
+/// A read-through family has no setter, so nothing in this crate's tests
+/// touches its publisher — and every assertion elsewhere in this file is
+/// against a HAND-BUILT `Census`, which never runs `census()` at all. A
+/// tamper replacing the expression with `0u64` passed all sixteen of them.
+/// This moves the level radar actually maintains and reads the family back.
+#[test]
+fn the_chunk_feed_family_reads_radars_own_level() {
+    let _serialised = process_guard();
+    let before = census().chunk_feed_bytes;
+    // A figure no real assembler would produce, so a stale reading cannot be
+    // mistaken for this one.
+    const MARK: u64 = 0x5EED_1234;
+    squallar_radar::chunks::force_feed_level(0, MARK);
+    assert_eq!(
+        census().chunk_feed_bytes,
+        before + MARK,
+        "the census did not see radar's level move"
+    );
+    squallar_radar::chunks::force_feed_level(MARK, 0);
+    assert_eq!(
+        census().chunk_feed_bytes,
+        before,
+        "the level did not come back"
+    );
+}

@@ -545,6 +545,18 @@ pub fn feed_bytes() -> usize {
         .unwrap_or(usize::MAX)
 }
 
+/// **Move the feed level from a dependent crate's test.**
+///
+/// Behind `test-support` for the reason the feature exists: `#[cfg(test)]` is
+/// crate-local, and `squallar_egui`'s census gate needs to move this level to
+/// show that its `chunk feed` family really reads THIS function and has not
+/// been quietly wired to a constant. A tamper replacing that read with `0u64`
+/// survived every test in the tree until this existed.
+#[cfg(feature = "test-support")]
+pub fn force_feed_level(was: u64, now: u64) {
+    move_feed_level(was, now);
+}
+
 /// One elevation cut being accumulated.
 enum Cut {
     /// Still receiving.

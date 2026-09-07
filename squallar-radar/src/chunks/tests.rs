@@ -2364,6 +2364,11 @@ fn the_chunk_feed_prices_its_volumes_and_gives_them_back() {
     // The warm return does no work and must not re-charge: a second call
     // that added again would double the family every time a pane asked.
     let charged = a.cached_bytes;
+    // The GLOBAL level, not just the field: a re-charge that bumped the
+    // process level without touching `cached_bytes` survived this test until
+    // the reading below was added, and it is the exact shape of the bug -
+    // several panes ask for a snapshot every frame.
+    let level_before_warm = feed_bytes() as u64;
     let again = a.snapshot();
     assert!(
         std::sync::Arc::ptr_eq(&snap, &again),
@@ -2372,6 +2377,12 @@ fn the_chunk_feed_prices_its_volumes_and_gives_them_back() {
     assert_eq!(
         a.cached_bytes, charged,
         "the warm snapshot path charged the level a second time"
+    );
+    assert_eq!(
+        feed_bytes() as u64,
+        level_before_warm,
+        "the warm snapshot path moved the process level; a pane asking for a \
+         snapshot it already has must cost nothing"
     );
 
     // ---- the global level carries at least what this assembler holds -----
