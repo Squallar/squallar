@@ -226,9 +226,24 @@ fn two_sites_in_one_drain_do_not_share_a_texture() {
     let _ = drain_uploads(&ctx);
 
     // Same dimensions, different pixels: a key that compared shape rather than identity
-    // would call these one raster.
-    post(&mut app, 0, RadarProduct::Reflectivity, TILT, raster(1));
-    post(&mut app, 1, RadarProduct::Reflectivity, TILT, raster(2));
+    // would call these one raster. Kept, so the identity assertions below have
+    // something to compare against.
+    let first_raster = raster(1);
+    let second_raster = raster(2);
+    post(
+        &mut app,
+        0,
+        RadarProduct::Reflectivity,
+        TILT,
+        Arc::clone(&first_raster),
+    );
+    post(
+        &mut app,
+        1,
+        RadarProduct::Reflectivity,
+        TILT,
+        Arc::clone(&second_raster),
+    );
     app.poll_render_results(&ctx);
 
     assert_eq!(
@@ -241,25 +256,35 @@ fn two_sites_in_one_drain_do_not_share_a_texture() {
         placed(&mut app, 1),
         "a pane on {OTHER_SITE} is drawing {SITE}'s texture"
     );
-    // And the pixels, not merely the handles: a shared handle is only wrong because of what
-    // it paints.
-    let on_pane = |idx: usize, seed: u8| {
-        let want = raster(seed);
-        let got = app
-            .render
-            .pane_render
-            .get(idx)
-            .and_then(|prs| prs.cached_render.as_ref())
-            .expect("this pane was served")
-            .image
-            .clone();
-        assert_eq!(got.pixels, want.pixels, "pane {idx} holds the wrong raster");
-    };
-    on_pane(0, 1);
-    on_pane(1, 2);
+    // And *which buffer* each pane was shown, not merely that the handles
+    // differ: a shared handle is only wrong because of what it paints. Buffer
+    // identity is the stronger half of the old pixel comparison — two rasters
+    // could compare equal by accident, but only one allocation is the one this
+    // pane's texture was uploaded from.
+    assert!(
+        app.render.pane_render[0].shows_buffer(&first_raster),
+        "pane 0 was shown a raster other than the one delivered for it",
+    );
+    assert!(
+        app.render.pane_render[1].shows_buffer(&second_raster),
+        "pane 1 was shown a raster other than the one delivered for it",
+    );
+    assert!(
+        !app.render.pane_render[0].shows_buffer(&second_raster),
+        "pane 0 claims the other site's buffer",
+    );
 }
 
-/// A resume puts every pane back with one upload.
+/// **A resume puts every pane back with one upload** — off the render cache,
+/// through the ordinary dispatch, since 2026-09-07.
+///
+/// The panes used to hold a CPU copy of the raster apiece for exactly this
+/// moment, and `restore_cached_render` re-uploaded from it. They hold no
+/// pixels now: the teardown clears every `last_rendered`, and the `Dispatch`
+/// row finds each pane wanting a picture and answers it from the shared
+/// render cache. The observable is unchanged and that is the point — one
+/// upload for four panes, one texture handle between them, and the pixels that
+/// were on the glass.
 #[test]
 fn a_resume_puts_four_panes_back_with_one_upload() {
     let ctx = egui::Context::default();
@@ -277,18 +302,37 @@ fn a_resume_puts_four_panes_back_with_one_upload() {
     );
     for pane_idx in 0..4 {
         assert!(
-            app.render.pane_render[pane_idx].cached_render.is_some(),
-            "precondition: pane {pane_idx} must have a cached render to restore"
+            app.render.pane_render[pane_idx].shows_buffer(&expected),
+            "precondition: pane {pane_idx} must be showing the delivered raster"
         );
     }
+    assert!(
+        app.render
+            .get_cached_render(
+                SITE,
+                RadarProduct::Reflectivity,
+                squallar_radar::types::RenderView::PlanView,
+                TILT,
+            )
+            .is_some(),
+        "precondition: the render cache must be holding the raster the resume \
+         is expected to come back from",
+    );
 
-    // What a suspend, a display change or a surface loss does: every handle released, every
-    // `cached_render` deliberately kept.
+    // What a suspend, a display change or a surface loss does: every handle
+    // released, every pane's dedupe cleared, the shared render cache kept.
     app.gui.clear_graphics_state();
     app.render.clear_last_rendered();
     let _ = drain_uploads(&ctx);
 
     app.restore_cached_render(&ctx);
+    assert!(
+        drain_uploads(&ctx).is_empty(),
+        "the restore uploaded a plan view itself. It is the section panes' \
+         path now; a plan view comes back through the dispatch below, which is \
+         what lets the pane stop holding one",
+    );
+    app.dispatch_pane_renders(&ctx);
 
     let uploads = drain_uploads(&ctx);
     assert_eq!(
@@ -434,4 +478,192 @@ fn a_pane_handed_a_different_raster_uploads_it() {
         "the replaced texture is still allocated after the pane stopped drawing \
          it, so two generations of the same overlay are resident at once"
     );
+}
+
+/// **The pane keeps the buffer's identity and not the buffer.**
+///
+/// This is the falsifiable half of the `cached renders` census family, which
+/// can only read zero and so cannot fail on its own. Until 2026-09-07 a pane
+/// held `Arc::clone` of every raster it was shown, for restore: at the 7362 px
+/// side a desktop plan view reaches that is 216,796,176 B a pane, held for the
+/// life of the process, and the *sole* holder of those bytes the moment the
+/// render cache dropped its own entry — which the FLOOR legs measured
+/// happening at t=339 s and t=327 s with `live_bytes` not moving.
+///
+/// So: hand the app a raster, then let go of every other holder there is — the
+/// texture manager's delta, the render cache entry, and this test's own clone
+/// — and require the allocation to be gone. A pane that still holds pixels
+/// fails here.
+#[test]
+fn a_pane_does_not_keep_the_pixels_it_was_shown() {
+    // Deliberately not `SIDE`, and the reason is the whole point of the
+    // precondition below: a 4 px raster is 64 B, which is also what an `Arc`
+    // header costs, so a holder that had shrunk from a picture to a handle
+    // would price the same as the picture and slide through. At 64 px the two
+    // figures cannot be confused.
+    const RELEASED_SIDE: usize = 64;
+    const RELEASED_BYTES: usize =
+        RELEASED_SIDE * RELEASED_SIDE * std::mem::size_of::<egui::Color32>();
+
+    let ctx = egui::Context::default();
+    let mut app = n_pane_app(1, SITE);
+    point_at(&mut app, 0, SITE, RadarProduct::Reflectivity);
+    let _ = drain_uploads(&ctx);
+
+    let shown = Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+        [RELEASED_SIDE, RELEASED_SIDE],
+        &vec![7u8; RELEASED_SIDE * RELEASED_SIDE * 4],
+    ));
+    let pixels = Arc::downgrade(&shown);
+    deliver(
+        &mut app,
+        &ctx,
+        0,
+        RadarProduct::Reflectivity,
+        Arc::clone(&shown),
+    );
+
+    // **Preconditions, named in bytes rather than in "not empty".** A release
+    // assertion is only as good as the proof that there was something of a
+    // known size to release: if the delivery upstream of this ever stops
+    // producing a raster -- a render that is no longer dispatched at all, say
+    // -- the allocation below would be dead because nothing ever held it, and
+    // this test would pass while proving nothing. So: the pane took THIS
+    // buffer, the shared cache is holding a raster of exactly the expected
+    // byte size, and the allocation is alive at this instant.
+    assert!(
+        app.render.pane_render[0].shows_buffer(&shown),
+        "precondition: the pane must have taken this raster",
+    );
+    let held = app
+        .render
+        .get_cached_render(
+            SITE,
+            RadarProduct::Reflectivity,
+            squallar_radar::types::RenderView::PlanView,
+            TILT,
+        )
+        .expect("precondition: the render cache must be holding the delivered raster");
+    assert_eq!(
+        held.image.pixels.len() * std::mem::size_of::<egui::Color32>(),
+        RELEASED_BYTES,
+        "precondition: the holder is not holding {RELEASED_BYTES} B of pixels, \
+         so the release below is a release of something else -- or of nothing",
+    );
+    assert!(
+        pixels.upgrade().is_some(),
+        "precondition: the allocation must be ALIVE here, or `is_none()` below \
+         is satisfied by a raster that was never built",
+    );
+
+    // Every other holder, let go of one at a time so a survivor is nameable.
+    drop(drain_uploads(&ctx)); // egui's texture delta
+    let (evicted, _) = app.render.clear_render_cache();
+    drop(evicted); // the shared render cache entry
+
+    // **Counted before it is dropped**, which is the sharper half of the two
+    // assertions: with every named holder released, the only strong reference
+    // left must be this test's own. `strong_count` says that directly, and it
+    // says it about the app rather than about the `Weak` -- a survivor here is
+    // a holder this test can then hunt by name, where a live `Weak` after the
+    // final drop only says that somebody, somewhere, still has it. Adopted
+    // from the holder-counting pattern the disabled-render lane is using.
+    assert_eq!(
+        Arc::strong_count(&shown),
+        1,
+        "with egui's delta and the render cache released, {} strong \
+         reference(s) remain instead of this test's one -- something in the \
+         app is still holding the raster",
+        Arc::strong_count(&shown),
+    );
+
+    drop(shown); // this test's own
+
+    assert!(
+        pixels.upgrade().is_none(),
+        "the pane is still holding the {RELEASED_BYTES} B it was shown. At the \
+         shipped raster side that is 216,796,176 B a pane, held against a \
+         graphics loss that may never come, and with the render cache emptied \
+         above the pane is the only holder there is",
+    );
+    assert!(
+        app.render.pane_render[0].uploaded_from.is_some(),
+        "the pane forgot which buffer its texture came from. That identity is \
+         what stops a tilt click on a tilt-independent product re-uploading a \
+         raster already on the GPU; dropping it trades resident bytes for an \
+         upload of the same size",
+    );
+}
+
+/// **A resume the render cache cannot answer puts no picture back**, and does
+/// not pretend to.
+///
+/// The control for `a_resume_puts_four_panes_back_with_one_upload`: with the
+/// cache emptied there is nowhere left for the pixels to come from, so the
+/// pane waits for a render rather than being served out of a copy of its own.
+/// Without this, that test passes against a build where the pane still holds
+/// the raster and the cache lookup is decoration.
+#[test]
+fn a_resume_the_render_cache_cannot_answer_puts_no_picture_back() {
+    let ctx = egui::Context::default();
+    let mut app = n_pane_app(1, SITE);
+    point_at(&mut app, 0, SITE, RadarProduct::Reflectivity);
+    let served = raster(4);
+    let served_bytes = served.pixels.len() * std::mem::size_of::<egui::Color32>();
+    deliver(
+        &mut app,
+        &ctx,
+        0,
+        RadarProduct::Reflectivity,
+        Arc::clone(&served),
+    );
+    assert!(
+        holds_texture(&mut app, 0),
+        "precondition: the pane must be showing a picture before it loses one",
+    );
+    // Named in bytes, not in "is_some": what makes the emptied cache below
+    // meaningful is that it was holding a raster of a known size first.
+    assert_eq!(
+        app.render
+            .get_cached_render(
+                SITE,
+                RadarProduct::Reflectivity,
+                squallar_radar::types::RenderView::PlanView,
+                TILT,
+            )
+            .map(|e| e.image.pixels.len() * std::mem::size_of::<egui::Color32>()),
+        Some(served_bytes),
+        "precondition: the render cache must be holding {served_bytes} B of \
+         pixels, or emptying it below empties nothing",
+    );
+
+    app.gui.clear_graphics_state();
+    app.render.clear_last_rendered();
+    let (evicted, _) = app.render.clear_render_cache();
+    drop(evicted);
+    let _ = drain_uploads(&ctx);
+
+    app.restore_cached_render(&ctx);
+    app.dispatch_pane_renders(&ctx);
+
+    assert!(
+        drain_uploads(&ctx).is_empty(),
+        "a picture came back from somewhere with the render cache empty — the \
+         pane is holding pixels of its own again",
+    );
+    assert!(
+        !holds_texture(&mut app, 0),
+        "the pane is drawing a radar texture the render cache could not have \
+         given it",
+    );
+}
+
+/// Whether pane `pane_idx` is drawing a radar texture at all.
+fn holds_texture(app: &mut crate::app::App, pane_idx: usize) -> bool {
+    app.gui
+        .pane_mut(pane_idx)
+        .expect("pane exists")
+        .overlay_cache_mut(&known::RADAR)
+        .current()
+        .is_some()
 }

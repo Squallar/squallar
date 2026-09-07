@@ -161,6 +161,22 @@ fn no_production_file_pushes_through_a_gui_setter() {
 /// the door spends one. The crate-wide walk moved by the same three, since
 /// every site is a production file.
 ///
+/// # The cached-render twin -- `app_render.rs` 88 -> 84
+///
+/// `restore_cached_render` no longer puts plan views back: the panes stopped
+/// holding a CPU copy of their raster, and the picture comes back through
+/// `App::dispatch_pane_renders` off the shared render cache. The loop that
+/// read those copies took four reaches with it (`pane_count`,
+/// `pane_has_no_plan_view`, `get_scan_info_for_pane`, `pane_mut`) and nothing
+/// came in through the seam to replace them. The crate-wide rows fell by the
+/// same four, plus one unit of standing arrears -- see `SELF_GUI_MAX`.
+///
+/// The figures moved once more while this land was in flight, and the shed is
+/// still four: the file read 89 when the shed was measured and 88 by the time
+/// it landed, because another land shed one of its own and did not lower this
+/// pin. So 84 absorbs that unit too -- it is the same arrears the paragraph
+/// above describes, arriving a second time from a different land.
+///
 /// # Arrears, re-measured 2026-09-02 on base `3d5e1559`
 ///
 /// `app.rs` read 35 by this scrape against a pin of 36; the other three files
@@ -181,7 +197,7 @@ fn the_gui_coupling_only_ever_shrinks() {
     for (name, source, ceiling) in [
         ("app.rs", APP, 35),
         ("app_fetch.rs", APP_FETCH, 35),
-        ("app_render.rs", APP_RENDER, 89),
+        ("app_render.rs", APP_RENDER, 84),
         ("app_chunks.rs", APP_CHUNKS, 13),
     ] {
         let n = collapsed(source).matches(SELF_GUI).count();

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 
 use crate::channels::ArrivalRecv as _;
 use squallar_radar::level3::Level3Product;
@@ -22,11 +22,18 @@ impl Drop for RenderGuard {
     }
 }
 
-/// The last successful render's pixels + metadata, so the texture can be
-/// re-uploaded instantly after suspend/resume without re-rendering.
+/// **A finished plan view on its way to a pane**: the pixels, and everything
+/// the picture has to be able to say about itself once it is on the glass.
+///
+/// **Nothing holds one of these at rest.** It is built where a raster arrives
+/// ([`crate::app::App::poll_render_results`]) or where the render cache
+/// answers a pane ([`crate::app::App::dispatch_pane_renders`]), spent by
+/// [`crate::app::App::apply_render_to_pane`], and dropped. The name is older
+/// than that: until 2026-09-07 every pane kept a clone of one for restore, and
+/// [`PaneRenderState::uploaded_from`] is what replaced it.
 pub struct CachedPaneRender {
-    /// See [`crate::channels::RenderedImage::image`] — held converted, so a
-    /// resume is an upload and not a second walk of 64 MiB.
+    /// See [`crate::channels::RenderedImage::image`] — held converted, so an
+    /// apply is an upload and not a second walk of 64 MiB.
     pub image: Arc<egui::ColorImage>,
     /// The half-width the cached pixels were projected at, km.
     pub max_range_km: f64,
@@ -53,8 +60,42 @@ pub struct PaneRenderState {
     in_flight_plan_view: Option<RenderKey>,
     /// Last rendered radar parameters to detect changes.
     pub last_rendered: Option<(RadarProduct, f32)>,
-    /// Cached render for instant texture restore after suspend/resume.
-    pub cached_render: Option<CachedPaneRender>,
+    /// **The buffer behind the texture this pane is showing** — an identity,
+    /// held weakly, and not a picture.
+    ///
+    /// [`crate::app::App::apply_render_to_pane`] compares the raster it is
+    /// handed against this one: the same allocation means the pixels already
+    /// on the GPU *are* these pixels, so the pane is re-described rather than
+    /// re-uploaded — a tilt click on a tilt-independent product is that case,
+    /// and at the shipped side it is a 206.75 MiB upload either way. That
+    /// comparison is the whole of what this field is for, and a [`Weak`] is
+    /// exactly enough for it: the question is *is this the same allocation*,
+    /// never *what does it contain*.
+    ///
+    /// **It used to be the pixels.** Until 2026-09-07 this was a
+    /// [`CachedPaneRender`] holding `Arc::clone` of the raster, kept so a lost
+    /// graphics context could be repaired by an upload rather than a render.
+    /// At the 7362 px side a desktop plan view reaches that is 216,796,176 B
+    /// of `Color32` per pane, held for the life of the process, and once the
+    /// render cache evicted its own entry the pane was the **sole** holder of
+    /// it. The repair now comes off the render cache like any other dispatch —
+    /// see [`crate::app::App::restore_cached_render`].
+    ///
+    /// A `Weak` keeps the `Arc`'s header allocation alive after the pixels are
+    /// freed, which is what makes the comparison exact rather than merely
+    /// likely: no later `Arc` can be handed an address this one still names.
+    /// The cost is that header, 64 B on this target, per pane whose raster has
+    /// been freed under it.
+    ///
+    /// **It is still cleared at every site that used to drop the pixels**, and
+    /// that is deliberate rather than left over: a release path exists for
+    /// what a holder CLAIMS as well as for what it holds, and this field
+    /// claims that a particular texture is on this pane's glass. Left set
+    /// across a teardown or an invalidation it would answer yes to
+    /// [`crate::app::App::apply_render_to_pane`] for a texture the device no
+    /// longer has, and the upload that pane needs would be skipped. So the
+    /// clears stayed when the bytes went.
+    pub uploaded_from: Option<Weak<egui::ColorImage>>,
     /// One flag per render dispatched for this pane and not yet finished, held
     /// alongside the copy the render thread carries.
     results_wanted: Vec<Arc<AtomicBool>>,
@@ -79,7 +120,7 @@ impl PaneRenderState {
             render_in_flight: false,
             in_flight_plan_view: None,
             last_rendered: None,
-            cached_render: None,
+            uploaded_from: None,
             results_wanted: Vec::new(),
             reply_bytes: Arc::new(AtomicUsize::new(0)),
             in_flight_total,
@@ -89,6 +130,24 @@ impl PaneRenderState {
     /// Whether a background render is running for this pane.
     pub fn render_in_flight(&self) -> bool {
         self.render_in_flight
+    }
+
+    /// Record that this pane's texture was uploaded from `image`. See
+    /// [`Self::uploaded_from`].
+    pub fn note_uploaded(&mut self, image: &Arc<egui::ColorImage>) {
+        self.uploaded_from = Some(Arc::downgrade(image));
+    }
+
+    /// Whether `image` is the buffer this pane's texture was uploaded from —
+    /// **the same allocation**, not a buffer that compares equal.
+    ///
+    /// Compared by address, which is the question being asked; `Weak::as_ptr`
+    /// answers it without upgrading, and the allocation cannot be reused while
+    /// the `Weak` names it.
+    pub fn shows_buffer(&self, image: &Arc<egui::ColorImage>) -> bool {
+        self.uploaded_from
+            .as_ref()
+            .is_some_and(|seen| std::ptr::eq(seen.as_ptr(), Arc::as_ptr(image)))
     }
 
     /// Mark a render dispatched for this pane, `key` naming the plan view it draws —
@@ -1111,7 +1170,7 @@ impl RenderDispatcher {
     pub fn forget_panes_from(&mut self, from: usize) {
         for prs in self.pane_render.iter_mut().skip(from) {
             prs.last_rendered = None;
-            prs.cached_render = None;
+            prs.uploaded_from = None;
             prs.render_finished();
             // Paired with the line above: see `results_wanted`.
             prs.abandon_results();
@@ -1141,7 +1200,7 @@ impl RenderDispatcher {
         for (idx, prs) in self.pane_render.iter_mut().enumerate() {
             if gui.pane(idx).is_some_and(|p| p.site() == site) {
                 prs.last_rendered = None;
-                prs.cached_render = None;
+                prs.uploaded_from = None;
                 prs.render_finished();
                 // Paired with the line above: see `results_wanted`.
                 prs.abandon_results();
@@ -1269,7 +1328,7 @@ impl RenderDispatcher {
                     .is_some_and(|(product, elevation)| want(product, elevation));
             if matches {
                 prs.last_rendered = None;
-                prs.cached_render = None;
+                prs.uploaded_from = None;
                 prs.render_finished();
                 // Paired with the line above: see `results_wanted`.
                 prs.abandon_results();
@@ -1284,7 +1343,7 @@ impl RenderDispatcher {
     pub fn reset_panes(&mut self) {
         for prs in &mut self.pane_render {
             prs.last_rendered = None;
-            prs.cached_render = None;
+            prs.uploaded_from = None;
             prs.render_finished();
             prs.abandon_results();
         }
@@ -1295,9 +1354,20 @@ impl RenderDispatcher {
     }
 
     /// Clear render state for suspend/resume or surface loss.
+    ///
+    /// **Both fields, because both describe a picture that is gone.**
+    /// `last_rendered` is the dedupe, and clearing it is what makes the next
+    /// frame's dispatch rebuild rather than skip; `uploaded_from` names the
+    /// buffer behind a texture the dead device owned, and every one of those
+    /// handles is released by `Gui::clear_graphics_state` in the same
+    /// teardown. Leaving it set was harmless — the retain in
+    /// [`crate::app::App::apply_render_to_pane`] finds no handle to keep and
+    /// uploads anyway — but it would be a field claiming a texture that does
+    /// not exist.
     pub fn clear_last_rendered(&mut self) {
         for prs in &mut self.pane_render {
             prs.last_rendered = None;
+            prs.uploaded_from = None;
         }
     }
 
@@ -2538,13 +2608,20 @@ impl RenderDispatcher {
     /// rather than bounded: what the two families publish, less what the
     /// allocator actually granted for the rasters behind them.
     ///
-    /// Two sources of double-counting, and this catches both. Across the two
-    /// families: a pane's `cached_render` is an `Arc` clone of the reply the
-    /// cache also filed. Inside `render cache`: several keys can name one
-    /// `Arc`, which is what `PlanViewUploads::handle` exists to arrange, so
-    /// it is the ordinary case. On the empty steady scene the second alone
-    /// was 211.8 MiB — two cache entries, one buffer, and evicting the first
-    /// freed nothing.
+    /// **One source of double-counting is left, and it is `render cache`'s
+    /// own**: several keys can name one `Arc`, which is what
+    /// `PlanViewUploads::handle` exists to arrange, so it is the ordinary case
+    /// rather than an edge. On the empty steady scene that alone was
+    /// 211.8 MiB — two cache entries, one buffer, and evicting the first freed
+    /// nothing.
+    ///
+    /// The other source was the panes: each held an `Arc` clone of the reply
+    /// the cache had also filed, so the two families named one buffer twice.
+    /// That holder went on 2026-09-07 and [`Self::cached_render_bytes`] now
+    /// reads zero, which leaves this term measuring the cache against itself.
+    /// It stays written as the difference of the two published figures rather
+    /// than narrowed to the cache, so the day a second holder appears it is
+    /// priced without anyone having to remember to widen it.
     ///
     /// The subtraction is saturating and the union is built from the same two
     /// prices the families publish, so this can never exceed them and a floor
@@ -2554,25 +2631,25 @@ impl RenderDispatcher {
         published.saturating_sub(self.raster_union_bytes())
     }
 
-    /// **What the allocator granted for every distinct raster the cache and
-    /// the panes hold between them** — each `Arc` counted once, whichever
-    /// holders name it.
+    /// **What the allocator granted for every distinct raster the two raster
+    /// families hold between them** — each `Arc` counted once, whichever
+    /// holder names it.
     ///
-    /// `Vec::contains` over a handful of pointers rather than a `HashSet`:
-    /// the cache is a few entries and `pane_render` a few panes, this runs on
-    /// the 2 s telemetry tick and never on a frame, and the allocation-error
-    /// hook reads the published level rather than this walk.
+    /// Today that is the render cache alone: the panes hold no rasters, so
+    /// there is no second holder to chain on here. See
+    /// [`Self::cached_render_bytes`] for what they used to hold and why the
+    /// family naming it is still published.
+    ///
+    /// `Vec::contains` over a handful of pointers rather than a `HashSet`: the
+    /// cache is a few entries, this runs on the 2 s telemetry tick and never
+    /// on a frame, and the allocation-error hook reads the published level
+    /// rather than this walk.
     fn raster_union_bytes(&self) -> u64 {
         let entries = self.render_cache.entries().map(|e| (&e.image, &e.hover));
-        let panes = self
-            .pane_render
-            .iter()
-            .filter_map(|prs| prs.cached_render.as_ref())
-            .map(|c| (&c.image, &c.hover));
         let mut images: Vec<*const egui::ColorImage> = Vec::new();
         let mut hovers: Vec<*const squallar_radar::hover::HoverSource> = Vec::new();
         let mut union = 0u64;
-        for (image, hover) in entries.chain(panes) {
+        for (image, hover) in entries {
             let image_ptr = Arc::as_ptr(image);
             if !images.contains(&image_ptr) {
                 images.push(image_ptr);
@@ -2589,52 +2666,31 @@ impl RenderDispatcher {
         union
     }
 
-    /// **What the panes' [`CachedPaneRender`]s are holding**, de-duplicated by
-    /// buffer: the `Color32` pixels and the hover field of every distinct
-    /// raster some pane has kept for restore.
+    /// **What the panes are holding of the rasters they show: nothing**, and
+    /// the zero is the point.
     ///
-    /// **De-duplicated across panes, and NOT across families.** Two panes
-    /// showing one raster hold one `Arc` — `apply_render_to_pane` clones the
-    /// reply's, and `PlanViewUploads::handle` is built on the same identity —
-    /// so counting per pane would price one buffer twice. The `Arc`s are
-    /// compared by address because that is the question, *is this the same
-    /// allocation*, and `ColorImage` has no cheap value identity anyway.
+    /// Until 2026-09-07 every pane kept an `Arc` clone of its plan view for
+    /// restore, and this family is what first named those bytes: on the empty
+    /// steady scene one pane held 216,796,176 B of `Color32` and 5,281,920 B
+    /// of hover — 211.8 MiB, 87 % of the whole unaccounted heap. The holder is
+    /// gone. A pane now keeps [`PaneRenderState::uploaded_from`], a [`Weak`]
+    /// that owns no pixels, so there is nothing left to walk and this reads
+    /// zero by construction.
     ///
-    /// The overlap this figure does **not** resolve is the one with `render
-    /// cache`: a pane's cached raster is usually also a cache entry, and the
-    /// two families then name the same bytes twice. Stated on the family's own
-    /// doc rather than corrected here.
+    /// **It is still published, because it is the witness.** A family row that
+    /// can only ever read zero is a retirement candidate, and this one is; but
+    /// the zero has to be **read on a leg** before the row is deleted, or the
+    /// fix and the removal of the instrument that would have caught it failing
+    /// become one unfalsifiable claim. Retire it once a steady-state leg has
+    /// printed `cached renders 0 B` — not in the land that made it zero.
     ///
-    /// Two small `Vec`s rather than a `HashSet`: `pane_render` is a handful of
-    /// entries, and this runs on the 2 s telemetry tick, never on a frame and
-    /// never in the allocation-error hook — that reads the published level.
+    /// The falsifiable half lives where the behaviour does:
+    /// `a_pane_does_not_keep_the_pixels_it_was_shown` upgrades the `Weak`
+    /// after every other holder has let go and requires it to be dead. That
+    /// test fails if a pane starts holding pixels again; this function cannot,
+    /// and saying so is the point of the paragraph above.
     pub fn cached_render_bytes(&self) -> u64 {
-        let mut images: Vec<*const egui::ColorImage> = Vec::with_capacity(self.pane_render.len());
-        let mut hovers: Vec<*const squallar_radar::hover::HoverSource> =
-            Vec::with_capacity(self.pane_render.len());
-        let mut bytes = 0u64;
-        for cached in self
-            .pane_render
-            .iter()
-            .filter_map(|prs| prs.cached_render.as_ref())
-        {
-            let image = Arc::as_ptr(&cached.image);
-            if !images.contains(&image) {
-                images.push(image);
-                bytes = bytes.saturating_add(
-                    (cached.image.pixels.len() * std::mem::size_of::<egui::Color32>()) as u64,
-                );
-            }
-            // The two `Arc`s travel together out of one reply, but they are
-            // two allocations and a future path could share one without the
-            // other; each is asked its own question.
-            let hover = Arc::as_ptr(&cached.hover);
-            if !hovers.contains(&hover) {
-                hovers.push(hover);
-                bytes = bytes.saturating_add(cached.hover.resident_bytes() as u64);
-            }
-        }
-        bytes
+        0
     }
 
     /// **The tick's reconciliation of the `renders in flight` level.** The

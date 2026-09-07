@@ -289,17 +289,23 @@ fn a_long_range_render_is_placed_at_the_size_it_was_rendered_at() {
          without it a velocity pane can say nothing about where its own \
          picture wraps",
     );
-    assert_eq!(
-        app.render.pane_render[0]
-            .cached_render
-            .as_ref()
-            .map(|c| c.image.size),
-        Some([side, side]),
+    assert!(
+        app.render.pane_render[0].shows_buffer(&render.image),
+        "the pane did not record the buffer its texture was uploaded from",
     );
 }
 
+/// **A pane whose picture is put back describes the same cut it took down.**
+///
+/// The repair is an apply: since 2026-09-07 a lost graphics context is
+/// answered by `App::dispatch_pane_renders` handing the pane its raster back
+/// off the render cache, through this very function, rather than by
+/// `App::restore_cached_render` re-uploading a copy the pane had kept. So the
+/// second apply below *is* the resume, at the layer the metadata is written.
+/// `a_resume_puts_four_panes_back_with_one_upload` is the same statement one
+/// layer up, driving the teardown and the dispatch.
 #[test]
-fn a_resume_puts_back_the_fold_limit_it_took_down() {
+fn a_repaired_pane_puts_back_the_fold_limit_it_lost() {
     let ctx = egui::Context::default();
     let mut app = app_showing_site();
     let render = CachedPaneRender {
@@ -315,13 +321,13 @@ fn a_resume_puts_back_the_fold_limit_it_took_down() {
         let cache = pane.overlay_cache_mut(&squallar_source::id::known::RADAR);
         cache.clear();
     }
-    app.restore_cached_render(&ctx);
+    app.apply_render_to_pane(&ctx, 0, &render, &mut PlanViewUploads::default());
 
     let pane = app.gui.pane_mut(0).unwrap();
     let cache = pane.overlay_cache_mut(&squallar_source::id::known::RADAR);
     let placed = cache
         .current()
-        .expect("the kept copy must have been re-uploaded");
+        .expect("the raster the cache handed back must have been uploaded");
     assert_eq!(
         placed.radar_meta.as_ref().and_then(|m| m.nyquist_ms),
         Some(26.42),
@@ -330,7 +336,7 @@ fn a_resume_puts_back_the_fold_limit_it_took_down() {
 }
 
 #[test]
-fn a_resumed_velocity_pane_annotates_the_fold_again() {
+fn a_repaired_velocity_pane_annotates_the_fold_again() {
     let ctx = egui::Context::default();
     let mut app = app_showing_site();
     app.gui
@@ -363,7 +369,7 @@ fn a_resumed_velocity_pane_annotates_the_fold_again() {
         "a pane whose picture is gone still claimed to know where it folded",
     );
 
-    app.restore_cached_render(&ctx);
+    app.apply_render_to_pane(&ctx, 0, &render, &mut PlanViewUploads::default());
     assert_eq!(
         app.gui.pane(0).unwrap().displayed_nyquist_ms(),
         Some(26.42),

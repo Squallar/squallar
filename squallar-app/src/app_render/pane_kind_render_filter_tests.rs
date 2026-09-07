@@ -536,8 +536,17 @@ fn the_loop_frame_broadcast_skips_a_pane_with_no_plan_view() {
     }
 }
 
+/// **A resume uploads no plan view to a pane that draws none** — and the
+/// shared raster survives the pane's change of kind, so converting back is an
+/// upload rather than a fresh render.
+///
+/// The second half used to be a statement about the pane's own copy of the
+/// pixels ("the cached pixels must survive"). The pane holds no pixels since
+/// 2026-09-07; what has to survive is the **render cache** entry, which is
+/// where the picture now comes back from — a stronger property, since one
+/// entry serves every pane on that plan view rather than one pane.
 #[test]
-fn the_cached_render_restore_skips_a_pane_with_no_plan_view() {
+fn a_resume_uploads_no_plan_view_to_a_pane_that_draws_none() {
     for kind in [
         squallar_radar::types::RenderView::CrossSection,
         squallar_radar::types::RenderView::Volume,
@@ -552,8 +561,9 @@ fn the_cached_render_restore_skips_a_pane_with_no_plan_view() {
         );
         app.dispatch_pane_renders(&egui::Context::default());
         assert!(
-            app.render.pane_render[0].cached_render.is_some(),
-            "precondition: the pane must be holding a cached render to restore"
+            holds_radar_texture(&mut app, 0),
+            "precondition: the pane must have been served a plan view before \
+                 it stops drawing one"
         );
 
         app.gui.pane_mut(0).unwrap().set_view(kind);
@@ -563,7 +573,9 @@ fn the_cached_render_restore_skips_a_pane_with_no_plan_view() {
             .overlay_cache_mut(&known::RADAR)
             .clear();
 
-        app.restore_cached_render(&egui::Context::default());
+        let ctx = egui::Context::default();
+        app.restore_cached_render(&ctx);
+        app.dispatch_pane_renders(&ctx);
 
         assert!(
             !holds_radar_texture(&mut app, 0),
@@ -571,8 +583,15 @@ fn the_cached_render_restore_skips_a_pane_with_no_plan_view() {
                  pane that draws none"
         );
         assert!(
-            app.render.pane_render[0].cached_render.is_some(),
-            "{kind:?}: the cached pixels must survive, or converting back to a \
+            app.render
+                .get_cached_render(
+                    SITE,
+                    PRODUCT,
+                    squallar_radar::types::RenderView::PlanView,
+                    TILT,
+                )
+                .is_some(),
+            "{kind:?}: the shared raster must survive, or converting back to a \
                  map costs a fresh render rather than an upload"
         );
     }

@@ -307,7 +307,21 @@ const INVENTORY_FIELD: &str = concat!("volumes: ", "crate::volume_inventory::");
 /// identity through an App-owned store now — and nothing came in through the
 /// seam to replace them. See `gui_seam_ratchet_tests.rs`, which fell 101 -> 89
 /// on the same land.
-const SELF_GUI_MAX: usize = 152;
+/// # 152 -> 147 at the cached-render twin
+///
+/// The restore's plan-view loop is gone with the CPU copy it read from
+/// (`App::restore_cached_render`), and its four reaches went with it:
+/// `pane_count`, `pane_has_no_plan_view`, `get_scan_info_for_pane` and
+/// `pane_mut`, all inside the loop that put each pane's raster back. Nothing
+/// replaced them -- the picture comes back through
+/// `App::dispatch_pane_renders`, which was already reaching the panes it
+/// serves.
+///
+/// **The fifth is arrears, absorbed here rather than left standing.** This
+/// walk read 151 against a pin of 152 on the base this land started from, and
+/// on `main` at the same hour, so an earlier land had shed without lowering.
+/// Sitting the constant back on its measurement is what a ratchet is for.
+const SELF_GUI_MAX: usize = 147;
 /// Row 1b — the same needle outside test-named paths.
 ///
 /// Everything on [`SELF_GUI_MAX`] applies here: permanent, falls only, sits on
@@ -329,7 +343,10 @@ const SELF_GUI_MAX: usize = 152;
 ///
 /// 159 -> 147 with the loop frame store, by exactly what [`SELF_GUI_MAX`]
 /// moved: all twelve gates were in `app_render.rs`.
-const SELF_GUI_NON_TEST_MAX: usize = 147;
+/// 147 -> 142 with the cached-render twin, by exactly what [`SELF_GUI_MAX`]
+/// moved and for the same reason: the four reaches are all in production code,
+/// and the fifth unit is the same standing arrears.
+const SELF_GUI_NON_TEST_MAX: usize = 142;
 /// Row 2a — **`ui.rs`'s own `impl Gui` block, and only that file**.
 ///
 /// **0 since WO-E8b**, which is where the plan said it would land. The last

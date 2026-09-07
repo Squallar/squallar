@@ -211,36 +211,46 @@ families! {
         "Finished radar rasters the render cache is holding, CPU-side: the \
          `Color32` pixel buffers and their resident hover fields.";
     PANE_CACHED_RENDER_BYTES, cached_render_bytes, set_cached_render_bytes,
-        "Finished plan-view rasters the PANES are holding for restore - each \
-         `RenderDispatcher::pane_render[i].cached_render`, at its `Color32` \
-         pixels and its hover field, the same two terms `render cache` prices. \
-         Kept so a lost graphics context is an upload rather than a re-render \
-         (`App::restore_cached_render`), which on mobile is a context that \
-         goes without a suspend callback to warn of it. \
-         DE-DUPLICATED ACROSS PANES and NOT across families: two panes showing \
-         one raster hold one `Arc` and are counted once here, but the same \
-         `Arc` is usually ALSO a `render cache` entry, and this figure and that \
-         one then name the same bytes twice. \
-         Until 2026-09-07 nothing named these bytes at all: at the empty \
-         steady scene, with every overlay off, one pane held 216,796,176 B of \
-         `Color32` and 5,281,920 B of hover - 211.8 MiB, 87 % of the whole \
-         unaccounted heap - and `publish_heap_census` did not mention it. It \
-         was found in the mapping walk rather than the census: one anonymous \
-         VMA read 1,083,985,920 B against `render pools` 867,184,704 B, and \
-         the 216,796,176 B difference is exactly `side * side * 4` at the \
-         7362 px raster the pools were sized for.";
+        "Finished plan-view rasters the PANES are holding: NONE, since \
+         2026-09-07, and the zero is what this row is for. \
+         Each pane used to keep an `Arc` clone of its raster so a lost \
+         graphics context could be repaired by an upload rather than a \
+         re-render. At the empty steady scene, with every overlay off, that \
+         was 216,796,176 B of `Color32` and 5,281,920 B of hover on ONE pane - \
+         211.8 MiB, 87 % of the whole unaccounted heap - held for the life of \
+         the process, and the sole holder of those bytes once the render cache \
+         evicted its own entry. It was found in the mapping walk rather than \
+         the census: one anonymous VMA read 1,083,985,920 B against \
+         `render pools` 867,184,704 B, and the 216,796,176 B difference is \
+         exactly `side * side * 4` at the 7362 px raster the pools were sized \
+         for. \
+         The pane now keeps `PaneRenderState::uploaded_from`, a `Weak` that \
+         owns no pixels and answers one question - is this the raster my \
+         texture was uploaded from - so a cache hit handing back the picture \
+         already on the GPU is restamped rather than re-uploaded. \
+         A REPORTED ZERO, NOT A DELETED ROW. It is the witness that the copy \
+         is gone, and a row that can only read zero may be retired only after \
+         a steady-state leg has PRINTED that zero. Deleting it in the land \
+         that made it zero would leave the claim unfalsifiable. What can fail \
+         is the behaviour test beside it, \
+         `a_pane_does_not_keep_the_pixels_it_was_shown`, which lets go of \
+         every other holder and requires the allocation to be gone.";
     RASTER_SHARED_BYTES, raster_shared_bytes, set_raster_shared_bytes,
         "**Bytes `render cache` and `cached renders` BOTH name** - the \
          correction term that turns their sum into a range, and NOT a holder \
          of anything. Left out of [`Census::resident_total`] for that reason, \
          the way the two GPU families are: nothing on this heap is these \
          bytes a second time, they are one allocation two families counted. \
-         Two sources of sharing, and it measures both rather than bounding \
-         them: a pane's `cached_render` is usually an `Arc` clone of a live \
-         `render cache` entry's image, and `RenderCache` prices its entries \
-         one at a time while several keys can hold ONE `Arc` - which is what \
-         `PlanViewUploads::handle` exists to arrange, so it is the ordinary \
-         case and not an edge. \
+         ONE SOURCE OF SHARING IS LEFT, and it is the cache's own: \
+         `RenderCache` prices its entries one at a time while several keys can \
+         hold ONE `Arc` - which is what `PlanViewUploads::handle` exists to \
+         arrange, so it is the ordinary case and not an edge. The other source \
+         was the panes, each holding an `Arc` clone of a live `render cache` \
+         entry's image; that holder went on 2026-09-07 and `cached renders` \
+         now reads zero, so this term measures the cache against itself. It is \
+         still written as the difference of the two published figures rather \
+         than narrowed to the cache, so a second holder would be priced \
+         without anyone remembering to widen it. \
          A MEASURED UNION, not a `max`: the app walks both holders and adds \
          each distinct `Arc` once, which the radar families cannot do because \
          their holders are spread across three crates. So \
@@ -511,9 +521,12 @@ impl Census {
 
     /// **The two plan-view raster families, summed as an upper bound.**
     ///
-    /// `render cache` and `cached renders` hold `Arc`s of the same images, so
-    /// a raster both name is counted twice here. [`Self::raster_floor`] is
-    /// the other end, and unlike [`Self::radar_floor`] it is exact.
+    /// The two could hold `Arc`s of the same images, and did until 2026-09-07:
+    /// a raster both name is counted twice here. [`Self::raster_floor`] is the
+    /// other end, and unlike [`Self::radar_floor`] it is exact. With
+    /// `cached renders` reading zero the two ends meet, and the pair is kept
+    /// because the correction is measured rather than assumed -- it would
+    /// price a second holder the day one appears.
     pub fn raster_total(&self) -> u64 {
         self.render_cache_bytes
             .saturating_add(self.cached_render_bytes)

@@ -964,8 +964,11 @@ fn the_index_finds_functions_and_modules() {
         // This file's own tests, which are `fn`s behind a `#[test]`.
         "the_walk_stops_at_nested_checkouts",
         "every_test_a_comment_names_is_a_test_that_exists",
-        // A `mod`, and one declared with `#[path]` at that.
-        "restore_describes_its_image_tests",
+        // A `mod`, and one declared with `#[path]` at that. Any such module
+        // will do and this one is not special -- re-point it at another
+        // `#[path]`-declared `mod` if this one is ever deleted, rather than
+        // dropping the row, which is what proves the index reads that shape.
+        "restore_texture_limit_tests",
         // A vendored crate's definition, proving the index reads past the
         // files `scanned` declines to scan.
         "decompress",

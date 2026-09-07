@@ -634,8 +634,8 @@ different instruments and one's number is never the other's).
 
 | Test | Constant | Ceiling | What it counts |
 |---|---|---|---|
-| `the_app_pokes_gui_coupling_never_grows` | `SELF_GUI_MAX` | 164 | `self.gui.` anywhere in `squallar-app` |
-| | `SELF_GUI_NON_TEST_MAX` | 159 | the same, outside test-named paths |
+| `the_app_pokes_gui_coupling_never_grows` | `SELF_GUI_MAX` | 147 | `self.gui.` anywhere in `squallar-app` |
+| | `SELF_GUI_NON_TEST_MAX` | 142 | the same, outside test-named paths |
 | | — | 0 | `self.gui.set_` anywhere in `squallar-app` — the target zero, held as a test rather than as a grep |
 | `the_config_swap_stays_deleted` | — | 0 | `load_pane_configs` / `save_pane_configs` / `loaded_configs`, with `serialize_pane_state` as the presence control |
 | `the_gui_setter_surface_never_grows` | `UI_SETTER_MAX` | 0 | `pub fn set_` in `squallar-egui/src/ui.rs` |
@@ -664,7 +664,7 @@ cargo test -p squallar-app --test arch_ratchets   # 11/11
 | `no_production_file_pushes_through_a_gui_setter` | `app.rs`, `app_fetch.rs`, `app_render.rs`, `app_chunks.rs` | 0 `self.gui.set_` each |
 | `the_gui_coupling_only_ever_shrinks` | `app.rs` | 35 |
 | | `app_fetch.rs` | 35 |
-| | `app_render.rs` | 101 |
+| | `app_render.rs` | 84 |
 | | `app_chunks.rs` | 13 |
 
 Both scrapes are **whitespace-collapsed**, so a call wrapped across lines counts
@@ -695,6 +695,17 @@ So the honest form of the claim is dated: **as re-measured at WO-ARREARS
 (2026-08-21, base `178ab361`) every ceiling in §6.1 and §6.2 sits on its
 measured value.** Checking that is a `git diff` of the constants against a
 fresh measurement, not a sentence to trust.
+
+**The four values above were re-measured on 2026-09-07** (base `03cfcb8b8`),
+by their own instruments, in the land that removed the panes' CPU copy of the
+radar raster: the crate-wide walk read 151 / 146 against pins of 152 / 147 --
+one unit of standing arrears, absorbed -- and the restore's plan-view loop shed
+four more reaches with the copy it read from, giving 147 / 142 and
+`app_render.rs` 85. The other three per-file values were on their pins and did
+not move. **The table below this line was stale before that land** and is
+corrected here for the rows it touches; the rest of it is a copy of the
+constants, as the paragraph above says, and worth re-deriving rather than
+trusting.
 
 Re-measured again on **2026-09-02, base `3d5e1559`**, by both instruments:
 `app.rs`'s per-file ceiling sat one above its scrape (36 against 35) and was

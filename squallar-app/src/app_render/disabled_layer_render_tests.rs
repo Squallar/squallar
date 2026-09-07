@@ -156,6 +156,24 @@ fn small_raster() -> Arc<egui::ColorImage> {
 /// standing on a non-emptiness premise would then pass because there was
 /// nothing left to release rather than because anything was released. Naming
 /// the byte figure makes that change trip the precondition loudly instead.
+///
+/// # That change arrived on 2026-09-07, and this is what it caught
+///
+/// The paragraph above is kept as written because it came true, almost to the
+/// word: `PaneRenderState::cached_render` — the pane's `Arc` clone of the
+/// raster, held for restore — was replaced by
+/// `PaneRenderState::uploaded_from`, a `Weak` kept only for upload identity,
+/// and `RenderDispatcher::cached_render_bytes` now reads **zero by
+/// construction**. Spelled "not zero" these preconditions would have gone
+/// quiet; spelled in bytes they went red and sent the change's author here.
+///
+/// So the controls below now read `(raster_bytes(), 0)`, and the second term
+/// is a **structural zero**: not a measurement, and no longer able to say
+/// "the scene with the layer ON reaches the pane". What says that instead is
+/// [`radar_texture_px`] — the pane-side holder that survived, asserted at its
+/// pixel size beside every one of them. The zero is kept rather than dropped
+/// because it is still a tripwire: a pane that starts holding pixels again
+/// makes these lines red.
 fn raster_bytes() -> u64 {
     (small_raster().pixels.len() * std::mem::size_of::<egui::Color32>()) as u64
 }
@@ -333,12 +351,21 @@ fn a_pane_with_radar_switched_off_dispatches_nothing() {
     control.poll_render_results(&ctx);
     assert_eq!(
         census_raster_bytes(&control),
-        (raster_bytes(), raster_bytes()),
-        "control: the same scene with radar DRAWN must put {} B into both the \
-         shared `render cache` and the pane's `cached renders` copy. If it no \
-         longer does, the holder set has moved and every zero asserted above \
-         has become vacuous - re-derive it",
+        (raster_bytes(), 0),
+        "control: the same scene with radar DRAWN must put {} B into the \
+         shared `render cache`. If it no longer does, the holder set has moved \
+         and every zero asserted above has become vacuous - re-derive it. The \
+         second term is a structural zero since 2026-09-07; see \
+         [`raster_bytes`]",
         raster_bytes(),
+    );
+    assert_eq!(
+        radar_texture_px(&mut control),
+        Some((SIDE as u32, SIDE as u32)),
+        "control: the same scene with radar DRAWN must reach the PANE too. \
+         This is what the pane's byte figure used to say before that holder \
+         became an identity; without it the zeros above are only about the \
+         shared cache",
     );
 }
 
@@ -395,12 +422,14 @@ fn switching_radar_off_gives_back_the_resident_render() {
     let (cache_before, panes_before) = census_raster_bytes(&app);
     assert_eq!(
         (cache_before, panes_before),
-        (raster_bytes(), raster_bytes()),
-        "precondition: the shared `render cache` and the pane's `cached \
-         renders` restore copy must BOTH be holding this raster's {} B. A \
-         figure that is neither that nor zero means a holder now keeps \
-         something other than the pixels — re-derive the holder set and the \
-         release below with it, do not relax this line",
+        (raster_bytes(), 0),
+        "precondition: the shared `render cache` must be holding this \
+         raster's {} B, and the pane's `cached renders` figure must be the \
+         structural zero it became on 2026-09-07. A first term that is \
+         neither that nor zero, or a second term that is not zero, means a \
+         holder now keeps something other than what this file believes — \
+         re-derive the holder set and the release below with it, do not relax \
+         this line",
         raster_bytes(),
     );
     assert_eq!(
@@ -455,11 +484,19 @@ fn a_raster_arriving_after_the_layer_went_off_is_not_taken() {
         control.poll_render_results(&ctx);
         assert_eq!(
             census_raster_bytes(&control),
-            (raster_bytes(), raster_bytes()),
-            "control: a delivered raster on a drawn layer must land in both \
-             holders at {} B, or the zeros asserted below are what an empty \
-             run looks like rather than what a refusal looks like",
+            (raster_bytes(), 0),
+            "control: a delivered raster on a drawn layer must land in the \
+             shared cache at {} B, or the zeros asserted below are what an \
+             empty run looks like rather than what a refusal looks like. The \
+             second term is a structural zero; see [`raster_bytes`]",
             raster_bytes(),
+        );
+        assert_eq!(
+            radar_texture_px(&mut control),
+            Some((SIDE as u32, SIDE as u32)),
+            "control: the delivered raster must reach the pane when the layer \
+             is drawn, or the refusal below is indistinguishable from a \
+             delivery that never worked",
         );
     }
 

@@ -1553,9 +1553,10 @@ impl super::App {
         let ctx = self.state.as_ref().unwrap().egui_renderer.context().clone();
         let pump_began = web_time::Instant::now();
 
-        // First use of the context this frame, and it has to be: `begin_frame`
-        // above is the moment egui is told this device's real texture limit,
-        // and the restore is an upload. See `App::restore_cached_render`.
+        // First use of the context this frame, and before the paint list is
+        // built: the restore is an upload, and a picture put back after the
+        // layout is a pane that flashes empty for a frame. See
+        // `App::restore_cached_render`.
         if self.restore_pending {
             self.restore_cached_render(&ctx);
         }
@@ -1807,7 +1808,7 @@ impl super::App {
 
             // Extract fields to avoid borrow issues
             let origin_pane = rr.pane_idx;
-            let render_result = crate::render_dispatch::CachedPaneRender {
+            let render_result = CachedPaneRender {
                 image: rendered.image,
                 max_range_km: rendered.max_range_km,
                 hover: rendered.hover,
@@ -1995,7 +1996,7 @@ impl super::App {
         &mut self,
         ctx: &egui::Context,
         pane_idx: usize,
-        render: &crate::render_dispatch::CachedPaneRender,
+        render: &CachedPaneRender,
         uploads: &mut PlanViewUploads,
     ) {
         use squallar_egui::overlay_cache::{OverlayTextureData, RadarTextureMeta};
@@ -2011,13 +2012,13 @@ impl super::App {
         };
 
         // Whether the picture being applied is the picture already on this
-        // pane — the *same buffer*, not a buffer that compares equal.
+        // pane — the *same buffer*, not a buffer that compares equal. The pane
+        // remembers that buffer weakly; see `PaneRenderState::uploaded_from`.
         let already_on_screen = self
             .render
             .pane_render
             .get(pane_idx)
-            .and_then(|prs| prs.cached_render.as_ref())
-            .is_some_and(|cached| Arc::ptr_eq(&cached.image, &render.image));
+            .is_some_and(|prs| prs.shows_buffer(&render.image));
 
         // Let go of the old radar overlay texture — unless it is the one about
         // to go back, in which case it is kept rather than retired and
@@ -2058,18 +2059,11 @@ impl super::App {
             }
         };
 
-        // Cache the pixels for fast restore after suspend/resume
+        // Remember which buffer these pixels came from — the identity above,
+        // and not the pixels. Recorded whichever branch ran: the retained
+        // handle was uploaded from this same buffer.
         if pane_idx < self.render.pane_render.len() {
-            self.render.pane_render[pane_idx].cached_render = Some(CachedPaneRender {
-                image: Arc::clone(&render.image),
-                max_range_km: render.max_range_km,
-                hover: Arc::clone(&render.hover),
-                product: render.product,
-                elevation: render.elevation,
-                nyquist_ms: render.nyquist_ms,
-                melting_layer_source: render.melting_layer_source,
-                storm_motion: render.storm_motion,
-            });
+            self.render.pane_render[pane_idx].note_uploaded(&render.image);
         }
 
         let bounds = ImageBounds::from_radar_site(lat, lon, render.max_range_km);
@@ -3369,7 +3363,7 @@ impl super::App {
                         squallar_radar::types::RenderView::PlanView,
                         elevation,
                     ) {
-                        let render_result = crate::render_dispatch::CachedPaneRender {
+                        let render_result = CachedPaneRender {
                             image: Arc::clone(&cached.image),
                             max_range_km: cached.max_range_km,
                             hover: Arc::clone(&cached.hover),
@@ -3446,8 +3440,15 @@ impl super::App {
                 // pixels.
                 //
                 // **The holders released here are the ones this layer can
-                // enumerate**: the pane's GPU texture, the pane's
-                // `cached_render` restore copy, and the `last_rendered` mark.
+                // enumerate**: the pane's GPU texture, the pane's record of
+                // which buffer that texture came from, and the `last_rendered`
+                // mark. The middle one was a full CPU copy of the raster until
+                // 2026-09-07 and is now `uploaded_from`, a `Weak` holding no
+                // pixels — so releasing it frees nothing, and it is released
+                // anyway, because it is a CLAIM that a particular texture is on
+                // this pane's glass and that claim is what has just stopped
+                // being true. Left set, it would answer yes to
+                // `apply_render_to_pane` for a texture this pane no longer has.
                 // The mark going back is also what makes re-enabling prompt —
                 // `needs_render` reads `None` as "never rendered", so the next
                 // frame after the layer comes back dispatches, or takes the
@@ -3475,7 +3476,7 @@ impl super::App {
                         self.render
                             .release_plan_view_render(&self.gui, &site, product, elevation);
                     }
-                    self.render.pane_render[pane_idx].cached_render = None;
+                    self.render.pane_render[pane_idx].uploaded_from = None;
                 }
                 self.render.pane_render[pane_idx].last_rendered = None;
             }
@@ -3775,145 +3776,71 @@ impl super::App {
         }
     }
 
-    /// The largest side this restore would hand egui.
+    /// **Put back what a dead graphics context took and this app still
+    /// has**, and dispatch for the rest.
     ///
-    /// Plan views only, and that is the whole set rather than a shortcut: a
-    /// cross-section is `SECTION_WIDTH` by half of it — 2048 native, 1024 on
-    /// wasm — and 2048 is the *smallest* limit any `egui::Context` reports,
-    /// the `InputState::default` one. A section can therefore never be the
-    /// raster that does not fit. Pinned by
-    /// `a_cross_section_can_never_be_the_raster_that_does_not_fit`, which goes
-    /// red if a section ever grows past that floor and this has to widen.
-    fn widest_raster_to_restore(&self) -> usize {
-        self.render
-            .pane_render
-            .iter()
-            .filter_map(|prs| prs.cached_render.as_ref())
-            .map(|cached| cached.image.width().max(cached.image.height()))
-            .max()
-            .unwrap_or(0)
-    }
-
-    /// Restore the radar image from cached raw RGBA data.
+    /// Two things, and radar's plan view is deliberately not one of them:
+    /// every raster still crossing to the GPU is let go of, on every pane;
+    /// and every section pane's picture is re-uploaded from the
+    /// [`CrossSection`](squallar_radar::xsect::CrossSection) the pane still
+    /// holds.
     ///
-    /// **The context must already have run a pass.** `egui::Context::load_texture`
-    /// checks the picture it is handed against `InputState::max_texture_side`,
-    /// and a context that has not begun a pass carries the 2048 that
-    /// `InputState::default` carries — not what the adapter reports, which on
-    /// the API-34 x86_64 emulator is 32768 and on any mobile device is at least
-    /// twice the 4096 a long-range plan view reaches. Handing it a 4096 px
-    /// raster there trips a `debug_assert!` that takes the winit loop, and with
-    /// it the Activity, down; measured 3 of 3 on `main@178ab361` and again 3 of
-    /// 3 on `main@5dbe9339`, 2026-08-21, API-34 x86_64 emulator.
-    /// egui learns the real number from the `RawInput` `begin_frame` hands it,
-    /// so the restore runs from inside the frame. The guard below is that
-    /// sentence checked rather than assumed: it defers rather than clamping,
-    /// because a halved raster is a visible change to the picture the user had.
+    /// # The plan view comes back through the ordinary dispatch
+    ///
+    /// Until 2026-09-07 this function also re-uploaded each pane's plan view
+    /// from a `CachedPaneRender` the pane had kept since its last render —
+    /// 216,796,176 B of `Color32` per pane at the 7362 px side a desktop arm
+    /// reaches, held for the life of the process against a graphics loss that
+    /// may never come, and the sole holder of those bytes as soon as the
+    /// render cache evicted its own entry. That copy is gone.
+    ///
+    /// What replaces it is the path the app already had. Both teardowns clear
+    /// every pane's `last_rendered` (`RenderDispatcher::clear_last_rendered`),
+    /// so the `Dispatch` row three phases below this one finds each pane
+    /// wanting a picture and answers it exactly as it answers any other ask:
+    /// the render cache if it still holds the raster — one upload, shared by
+    /// every pane showing it, through the same `PlanViewUploads` a first
+    /// render uses — and a background render if it does not. **Nothing here
+    /// renders and nothing here waits**; a pane whose raster the cache has
+    /// dropped shows what it was showing, or its rendering state, until the
+    /// render lands. That is a cache miss, and it is what a cache miss already
+    /// looks like on this pane after a tilt reset.
+    ///
+    /// # Why there is no texture-limit guard here any more
+    ///
+    /// There was one, and it deferred the whole restore to a later frame when
+    /// the widest raster exceeded `InputState::max_texture_side` — because a
+    /// context that has not run a pass reports the 2048 `InputState::default`
+    /// carries, and a 4096 px plan view handed to it trips a `debug_assert!`
+    /// that takes the winit loop, and with it the Activity, down (measured
+    /// 3 of 3 on the API-34 x86_64 emulator, 2026-08-21). Only the plan view
+    /// was ever that raster: a cross-section is `SECTION_WIDTH` by half of it,
+    /// 2048 native and 1024 on wasm, and 2048 is the *smallest* limit any
+    /// `egui::Context` reports. With the plan views gone from this path
+    /// nothing it uploads can exceed that floor, which is what
+    /// `a_cross_section_can_never_be_the_raster_that_does_not_fit` now holds
+    /// down: if a section ever grows past 2048 that test goes red and the
+    /// guard has to come back.
+    ///
+    /// It still runs from **inside** the frame rather than from the moment the
+    /// rendering state is built, and
+    /// `the_restore_runs_from_inside_the_frame_and_not_from_the_state_that_built_it`
+    /// still pins that: the section upload wants the real limit too, and a
+    /// picture put back after the paint list is built is a pane that flashes
+    /// empty for a frame.
     pub(super) fn restore_cached_render(&mut self, ctx: &egui::Context) {
-        use squallar_egui::overlay_cache::{OverlayTextureData, RadarTextureMeta};
-        use squallar_geo::PlacedRaster;
-        use squallar_radar::types::ImageBounds;
-
-        // Ahead of every mutation below, so a deferral is a whole one. The
-        // flag is this function's own: it clears it by doing the work and
-        // raises it by declining to, so no caller has to know the rule.
-        let widest = self.widest_raster_to_restore();
-        let admitted = ctx.input(|i| i.max_texture_side);
-        if widest > admitted {
-            // Said rather than passed over in silence: this frame put nothing
-            // back, and the two numbers are what tells a frame that ran too
-            // early from an adapter that really is this small.
-            log::info!(
-                "restore deferred: a {widest} px raster against a context \
-                 admitting {admitted} px"
-            );
-            self.restore_pending = true;
-            return;
-        }
+        // This function's own flag: it clears it by doing the work. Nothing
+        // defers any more, but the flag is still what carries a restore across
+        // the frame boundary from `ensure_rendering_state`, and what
+        // `frame_need::WakeClaim::Restore` speaks for.
         self.restore_pending = false;
 
-        // Every raster still arriving is let go of first, on **every** pane and
-        // whether or not this goes on to restore one.
+        // Every raster still arriving is let go of first, on **every** pane:
+        // it was crossing to a device that is gone, and nothing else will ever
+        // end the hold.
         self.gui.release_held_rasters();
 
-        // Section panes first, and through their own loop: the one below is
-        // bounded by `pane_render.len()` and skips every pane with no plan
-        // view, which is every section pane there is.
         self.restore_section_textures(ctx);
-
-        // Panes sharing a raster shared it before the context died too:
-        let mut uploads = PlanViewUploads::default();
-
-        for pane_idx in 0..self.render.pane_render.len().min(self.gui.pane_count()) {
-            if self.gui.pane_has_no_plan_view(pane_idx) {
-                continue;
-            }
-            let Some(ref cached) = self.render.pane_render[pane_idx].cached_render else {
-                continue;
-            };
-            let max_range_km = cached.max_range_km;
-            let product = cached.product;
-            let elevation = cached.elevation;
-            let nyquist_ms = cached.nyquist_ms;
-            let melting_layer_source = cached.melting_layer_source;
-            let storm_motion = cached.storm_motion;
-
-            let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
-                continue;
-            };
-            let lat = scan_info.site.lat;
-            let lon = scan_info.site.lon;
-
-            log::info!(
-                "Restoring cached radar image for pane {} ({:?} at {:.1}°) from memory",
-                pane_idx,
-                product,
-                elevation
-            );
-
-            let side = cached.image.width();
-            let image = Arc::clone(&cached.image);
-            let texture = {
-                let counter = &mut self.texture_counter;
-                uploads.handle(&image, || {
-                    *counter += 1;
-                    ctx.load_texture(
-                        format!("radar_image_{counter}"),
-                        Arc::clone(&image),
-                        egui::TextureOptions::NEAREST,
-                    )
-                })
-            };
-
-            let bounds = ImageBounds::from_radar_site(lat, lon, max_range_km);
-            let placed: PlacedRaster = bounds.into();
-            if let Some(pane) = self.gui.pane_mut(pane_idx) {
-                let cache = pane.overlay_cache_mut(&squallar_source::id::known::RADAR);
-                // Showing retires whatever the pane was showing; see the note
-                // in `App::apply_render_to_pane`.
-                cache.show(OverlayTextureData {
-                    texture,
-                    placed,
-                    data_generation: 0,
-                    render_zoom: 0,
-                    width: side as u32,
-                    height: side as u32,
-                    radar_meta: Some(RadarTextureMeta {
-                        hover: Arc::clone(&cached.hover),
-                        lat,
-                        lon,
-                        max_range_km,
-                        nyquist_ms,
-                        melting_layer_source,
-                        storm_motion,
-                        product: crate::render_key::field_id_of(product),
-                        elevation,
-                    }),
-                    hit_map: None,
-                });
-            }
-            self.render.pane_render[pane_idx].last_rendered = Some((product, elevation));
-        }
     }
 
     /// Try to acquire the next surface texture for rendering.
@@ -9244,11 +9171,6 @@ mod pane_kind_render_filter_tests;
 #[path = "app_render/restore_texture_limit_tests.rs"]
 #[cfg(test)]
 mod restore_texture_limit_tests;
-
-/// A restored image describes itself too.
-#[path = "app_render/restore_describes_its_image_tests.rs"]
-#[cfg(test)]
-mod restore_describes_its_image_tests;
 
 /// What a section pane is told when it cannot be cut, and when the picture on
 /// screen has stopped being the truth.
