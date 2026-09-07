@@ -18,6 +18,59 @@ use squallar_source::product::FieldId;
 use squallar_units::UserPreferences;
 use std::collections::HashMap;
 
+/// **What the plan-view render dispatch owes one pane** — the answer
+/// [`Gui::plan_view_demand_for_pane`] gives, in the states the dispatch
+/// actually has.
+///
+/// "Nothing to draw yet" and "nothing will ever be drawn" are separate
+/// variants because they want **opposite** treatment of what the pane is
+/// already holding: the first keeps its picture, the second gives it back.
+/// Collapsing them into one `None` is what makes a switched-off layer
+/// indistinguishable from a layer waiting for its cut.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PlanViewDemand {
+    /// The pane paints radar and wants this field at this tilt.
+    Wanted(FieldId, f32),
+    /// The pane paints radar, and its scan offers nothing to render for the
+    /// selection. Whatever is on the glass stands.
+    Nothing,
+    /// The pane paints no radar at all, so a render would never be seen and
+    /// what it holds for radar can go back.
+    NotDrawn,
+    /// The pane has no plan view to put a raster on, whatever its layers say —
+    /// a cross-section or a volume. Nothing is dispatched and nothing is
+    /// released: this pane's rasters are not plan-view rasters and are not
+    /// this question's to give back.
+    NoPlanView,
+}
+
+impl PlanViewDemand {
+    /// The field and tilt a render would be for, or `None` for the three
+    /// states that ask for none.
+    pub fn wanted(&self) -> Option<(FieldId, f32)> {
+        match self {
+            Self::Wanted(product, elevation) => Some((product.clone(), *elevation)),
+            Self::Nothing | Self::NotDrawn | Self::NoPlanView => None,
+        }
+    }
+
+    /// Whether this pane is one the plan-view dispatch walks at all. The pane's
+    /// *kind* question, folded in here so the dispatch asks the seam once per
+    /// pane instead of twice.
+    pub fn no_plan_view(&self) -> bool {
+        matches!(self, Self::NoPlanView)
+    }
+
+    /// Whether a finished plan-view raster addressed to this pane has anywhere
+    /// to go. `NoPlanView` answers **false**: a result can arrive for a pane
+    /// that changed kind mid-flight, and it is still filed for the siblings
+    /// that are showing the same picture — `origin_draws_plan` is what stops it
+    /// being painted on the pane itself.
+    pub fn serves_no_render(&self) -> bool {
+        matches!(self, Self::Nothing | Self::NotDrawn)
+    }
+}
+
 #[path = "ui_shell.rs"]
 mod shell;
 #[path = "ui_stack.rs"]
@@ -1990,6 +2043,47 @@ impl Gui {
         self.panes
             .get(pane_idx)
             .and_then(|p| p.get_rendering_params())
+    }
+
+    /// **What the plan-view render dispatch owes pane `pane_idx`, answered the
+    /// way the DRAW path answers it.**
+    ///
+    /// [`Self::get_rendering_params_for_pane`] says what the pane has
+    /// *selected*; this says what it would *paint*. The difference is one
+    /// question — whether the radar layer is on at all — and a render must be
+    /// gated on this one, because a selection stands while the eye is shut.
+    /// It is asked here with [`PaneState::is_overlay_enabled`] and
+    /// [`known::RADAR`], which is **the same accessor and the same id the draw
+    /// walk's own per-layer skip uses** (`ui::map::pane_render`'s
+    /// `for id in &draw_order { if !pane.is_overlay_enabled(id) { continue } }`).
+    /// Not a second spelling of "is radar visible": two predicates that agree
+    /// today and drift tomorrow are exactly the defect this closes, since a
+    /// dispatch answering "yes" to a walk answering "no" is a 216,796,176 B
+    /// raster nobody can see.
+    ///
+    /// **The pane's kind is folded in too** ([`PlanViewDemand::NoPlanView`]),
+    /// so the dispatch asks this seam once per pane rather than asking the
+    /// kind and the params as two separate crossings.
+    ///
+    /// **[`PlanViewDemand::NotDrawn`] is not [`PlanViewDemand::Nothing`].** A
+    /// pane with no cut to show keeps what is on its glass, because the stale
+    /// picture is still being painted under a notice saying what it is
+    /// ([`PaneState::stale_image_on_screen`]); a pane that paints no radar at
+    /// all is painting no notice either, so what it holds is releasable.
+    pub fn plan_view_demand_for_pane(&self, pane_idx: PaneId) -> PlanViewDemand {
+        let Some(pane) = self.panes.get(pane_idx) else {
+            return PlanViewDemand::NoPlanView;
+        };
+        if !pane.is_map() {
+            return PlanViewDemand::NoPlanView;
+        }
+        if !pane.is_overlay_enabled(&known::RADAR) {
+            return PlanViewDemand::NotDrawn;
+        }
+        match pane.get_rendering_params() {
+            Some((product, elevation)) => PlanViewDemand::Wanted(product, elevation),
+            None => PlanViewDemand::Nothing,
+        }
     }
 
     pub fn pane_count(&self) -> usize {

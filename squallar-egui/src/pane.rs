@@ -2708,12 +2708,12 @@ impl PaneState {
     /// The radar slot is not just another layer here: its `config` is where
     /// this pane keeps its own site, product, elevation and live-chunk switch
     /// ([`RADAR_SLOT_PANE_KEYS`], which exist precisely because that slot has
-    /// two owners), its [`LayerTimeState`] is the one the render dispatcher
-    /// and the scan cache address by name, and
-    /// [`Self::overlay_texture_releasable`] exempts its texture by
-    /// name. Removing it would not hide a picture, it would delete the pane's
-    /// whole selection. So a radar pane keeps its radar layer, and the control
-    /// says so rather than being absent or silently doing nothing.
+    /// two owners), and its [`LayerTimeState`] is the one the render dispatcher
+    /// and the scan cache address by name. Removing it would not hide a
+    /// picture, it would delete the pane's whole selection. So a radar pane
+    /// keeps its radar layer, and the control says so rather than being absent
+    /// or silently doing nothing. Its *texture* is not special:
+    /// [`Self::overlay_texture_releasable`] judges it like any other layer's.
     ///
     /// Everything else is removable, the colour scale included: it is a legend
     /// drawn over the map with no pane state hanging off it, the eye already
@@ -3417,10 +3417,24 @@ impl PaneState {
 
     /// Whether `kind`'s texture may be let go, judged against the slot list
     /// that decides it — the single definition of that question.
+    ///
+    /// **Radar is judged like every other layer here, and that rests on one
+    /// property**: the way back is open. `App::dispatch_pane_renders` puts a
+    /// pane that paints no radar back to `last_rendered: None` — the mark that
+    /// reads "never rendered" — so the frame after the layer comes back on
+    /// renders it, or takes the shared cache's hit outright. The dispatch
+    /// re-renders on a product/tilt/scan key and not on an empty cache, so
+    /// **without** that reset a released raster would stay released and a
+    /// parked pane would show empty map. Anyone exempting radar here again
+    /// must either keep that reset or accept that, and a 216,796,176 B raster
+    /// held for a layer the user switched off is waste like any other
+    /// layer's.
+    ///
+    /// The fallback [`Self::is_overlay_enabled`] applies to radar as to
+    /// everything else: an id with no slot is not drawn, so its texture is
+    /// releasable.
     pub fn overlay_texture_releasable(layers: &[LayerSlot], id: &LayerId) -> bool {
-        // The same fallback [`Self::is_overlay_enabled`] applies: an id with no
-        // slot is not drawn, so its texture is releasable.
-        *id != known::RADAR && !layers.iter().any(|slot| slot.id == *id && slot.enabled)
+        !layers.iter().any(|slot| slot.id == *id && slot.enabled)
     }
 
     pub fn overlay_texture_is_releasable(&self, id: &LayerId) -> bool {

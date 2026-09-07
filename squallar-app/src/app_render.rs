@@ -1784,11 +1784,17 @@ impl super::App {
                 continue;
             }
 
+            // **The same door the dispatch asks, and it has to be.** A raster
+            // is asked for on one frame and arrives on another, so the layer
+            // can be switched off in between; asking a narrower question here
+            // than the dispatch asked there is what lets that raster be filed
+            // in the shared cache and uploaded to a pane that has stopped
+            // painting it.
             if rr.pane_idx >= self.gui.pane_count()
                 || self
                     .gui
-                    .get_rendering_params_for_pane(rr.pane_idx)
-                    .is_none()
+                    .plan_view_demand_for_pane(rr.pane_idx)
+                    .serves_no_render()
             {
                 continue;
             }
@@ -1859,7 +1865,13 @@ impl super::App {
                 let Some(other) = self.gui.pane(other_idx) else {
                     continue;
                 };
-                if !other.is_map() || other.site() != origin_site {
+                // The draw walk's own gate, on the binding this loop already
+                // holds: a sibling that paints no radar is handed no raster,
+                // for the same reason the origin pane above is not.
+                if !other.is_map()
+                    || other.site() != origin_site
+                    || !other.is_overlay_enabled(&squallar_source::id::known::RADAR)
+                {
                     continue;
                 }
                 let Some((other_product, other_elevation)) = other
@@ -3323,12 +3335,18 @@ impl super::App {
         self.apply_storm_motion_override();
         let mut uploads = PlanViewUploads::default();
         for pane_idx in 0..self.gui.pane_count() {
-            if self.gui.pane_has_no_plan_view(pane_idx) {
+            // **The draw path's own question, asked here** — see
+            // `Gui::plan_view_demand_for_pane`. What a pane has SELECTED and
+            // what it PAINTS are different questions and a render is gated on
+            // the second: a raster made for a layer the draw walk skips is
+            // 216,796,176 B of `Color32` nobody can see. The pane's kind rides
+            // the same answer, so this loop asks the seam once per pane.
+            let demand = self.gui.plan_view_demand_for_pane(pane_idx);
+            if demand.no_plan_view() {
                 continue;
             }
-            if let Some((product, elevation)) = self
-                .gui
-                .get_rendering_params_for_pane(pane_idx)
+            if let Some((product, elevation)) = demand
+                .wanted()
                 .and_then(|(id, e)| Some((squallar_radar::fields::product_for(&id)?, e)))
             {
                 let prs = &self.render.pane_render[pane_idx];
@@ -3417,14 +3435,47 @@ impl super::App {
                     }
                 }
             } else if pane_idx < self.render.pane_render.len() {
-                // Only clear the radar texture if no scan data is loaded for this pane.
-                let has_scan = self
+                // **A pane that paints no radar gives its raster back**, and a
+                // pane that merely has no cut to show does not. The second
+                // still has the last picture on its glass under a
+                // "showing X instead" notice (`PaneState::stale_image_on_screen`),
+                // so its texture is kept whenever a scan is loaded; the first
+                // is painting neither, so everything it holds for radar is
+                // waste — 216,796,176 B of `Color32` per pane at the
+                // production raster, plus the pane's restore copy of the same
+                // pixels.
+                //
+                // **The holders released here are the ones this layer can
+                // enumerate**: the pane's GPU texture, the pane's
+                // `cached_render` restore copy, and the `last_rendered` mark.
+                // The mark going back is also what makes re-enabling prompt —
+                // `needs_render` reads `None` as "never rendered", so the next
+                // frame after the layer comes back dispatches, or takes the
+                // shared cache's hit outright. The shared `RenderCache` is NOT
+                // evicted here: it is keyed by site/product/tilt rather than by
+                // pane, a sibling pane may still be showing the same picture,
+                // and on this scene it never gains an entry in the first place
+                // because nothing is ever dispatched.
+                let not_drawn = demand == squallar_egui::PlanViewDemand::NotDrawn;
+                let (has_scan, site) = self
                     .gui
                     .pane(pane_idx)
-                    .is_some_and(|p| p.scan_info.is_some());
-                if !has_scan && let Some(pane) = self.gui.pane_mut(pane_idx) {
+                    .map(|p| (p.scan_info.is_some(), p.site().to_string()))
+                    .unwrap_or_default();
+                if (not_drawn || !has_scan)
+                    && let Some(pane) = self.gui.pane_mut(pane_idx)
+                {
                     let cache = pane.overlay_cache_mut(&squallar_source::id::known::RADAR);
                     cache.clear();
+                }
+                if not_drawn {
+                    if let Some((product, elevation)) =
+                        self.render.pane_render[pane_idx].last_rendered
+                    {
+                        self.render
+                            .release_plan_view_render(&self.gui, &site, product, elevation);
+                    }
+                    self.render.pane_render[pane_idx].cached_render = None;
                 }
                 self.render.pane_render[pane_idx].last_rendered = None;
             }
@@ -9069,6 +9120,12 @@ mod level3_poll_tests;
 #[path = "app_render/first_launch_tests.rs"]
 #[cfg(test)]
 mod first_launch_tests;
+
+/// A layer that is not drawn is not rendered: the dispatch gate, and the
+/// fresh-install case it must not swallow.
+#[path = "app_render/disabled_layer_render_tests.rs"]
+#[cfg(test)]
+mod disabled_layer_render_tests;
 
 #[path = "app_render/loop_dispatch_tests.rs"]
 #[cfg(test)]

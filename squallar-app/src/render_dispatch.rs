@@ -1164,6 +1164,60 @@ impl RenderDispatcher {
         }
     }
 
+    /// **Give back the shared raster a pane has stopped painting.**
+    ///
+    /// Called by `App::dispatch_pane_renders` on the frame a pane's radar
+    /// layer goes off, with the picture that pane's `last_rendered` named. The
+    /// pane's own two holders — its GPU texture and its `cached_render`
+    /// restore copy — are released there; this is the third, and the largest:
+    /// a plan-view entry is `side^2 * 4` bytes, 216,796,176 B at the
+    /// production raster, and the cache's byte cap is reached by two of them.
+    ///
+    /// **One key, not a sweep.** A blanket "retain what the panes want" would
+    /// also throw away the adjacent-tilt rasters
+    /// `maybe_spawn_speculative_render` files *ahead* of a tilt change: no
+    /// pane wants those yet, and their whole purpose is that the change is
+    /// instant when one does. So this drops exactly the picture the pane was
+    /// showing, and only when no other pane is still showing it — a sibling on
+    /// the same site, product and tilt holds the same `Arc` and is why the
+    /// check is against every pane's demand rather than against this one's
+    /// absence.
+    ///
+    /// `gui` is a parameter, as it is for [`Self::reset_panes_for_site`] and
+    /// [`Self::invalidate_panes_where`]: the store is the dispatcher's and the
+    /// panes are the question.
+    pub fn release_plan_view_render(
+        &mut self,
+        gui: &squallar_egui::Gui,
+        site: &str,
+        product: RadarProduct,
+        elevation: f32,
+    ) {
+        let key = render_cache_key(
+            site,
+            &squallar_radar::fields::spec(product).id,
+            RenderView::PlanView,
+            elevation,
+        );
+        let wanted_elsewhere = (0..gui.pane_count()).any(|idx| {
+            gui.plan_view_demand_for_pane(idx)
+                .wanted()
+                .and_then(|(id, elevation)| {
+                    let site = gui.pane(idx)?.site().to_string();
+                    Some(render_cache_key(
+                        &site,
+                        &id,
+                        RenderView::PlanView,
+                        elevation,
+                    ))
+                })
+                .is_some_and(|wanted| wanted == key)
+        });
+        if !wanted_elsewhere {
+            self.render_cache.retain(|held| *held != key);
+        }
+    }
+
     /// The narrow counterpart to [`reset_panes_for_site`], for the real-time
     /// chunk feed: one elevation cut completed, not a whole volume.
     pub fn reset_panes_for_tilts(

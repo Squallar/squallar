@@ -148,16 +148,58 @@ fn skewed_gui(ctx: &egui::Context) -> Gui {
 /// Switch [`KIND`] on or off for pane 0 through the real toggle path — the one
 /// every eye, Show switch, catalog tile and preset routes through.
 fn toggle(gui: &mut Gui, on: bool) {
+    toggle_kind(gui, &KIND, on);
+}
+
+/// [`toggle`] for a layer the caller names.
+fn toggle_kind(gui: &mut Gui, kind: &squallar_source::id::LayerId, on: bool) {
     let mut pane = std::mem::take(&mut gui.panes[0]);
     Gui::write_pane_overlay(
         &mut gui.overlays,
         &mut gui.admission,
         0,
         &mut pane,
-        &KIND,
+        kind,
         on,
     );
     gui.panes[0] = pane;
+}
+
+/// **Radar's own switch releases radar's raster**, like every other layer's.
+///
+/// Releasing it is safe because the way back is open:
+/// `dispatch_pane_renders` puts a pane that paints no radar back to
+/// `last_rendered: None`, the mark that reads "never rendered", and the
+/// dispatch re-renders on a product/tilt/scan key rather than on an empty
+/// cache. That pairing is the whole of it — a release without that reset
+/// would leave a parked pane showing empty map, which is why
+/// [`PaneState::overlay_texture_releasable`] may only judge radar like the
+/// rest for as long as the reset stands.
+///
+/// The sibling case is [`switching_a_layer_off_releases_its_texture_and_not_the_others`],
+/// which still requires radar's raster to SURVIVE another layer's toggle: what
+/// releases it is its own switch, not any switch.
+#[test]
+fn switching_radar_off_releases_the_radar_raster() {
+    let ctx = egui::Context::default();
+    let mut gui = gui_with_parked_textures(&ctx);
+    let radar = squallar_source::id::known::RADAR;
+    assert!(
+        has_texture(gui.pane(0).expect("pane 0"), &radar),
+        "premise: the fixture must really have parked a radar texture",
+    );
+
+    toggle_kind(&mut gui, &radar, false);
+
+    let pane = gui.pane(0).expect("pane 0");
+    assert!(
+        !has_texture(pane, &radar),
+        "the radar layer switched off is still holding its full-size raster -          216,796,176 B at the production side, for a picture the draw walk          skips",
+    );
+    assert!(
+        has_texture(pane, &KIND),
+        "switching radar off released a texture belonging to a layer that is          still on: the release has become `clear on every write`",
+    );
 }
 
 /// **The leak test.** A layer switched off lets its texture go, and takes
