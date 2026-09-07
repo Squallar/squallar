@@ -705,3 +705,251 @@ fn a_new_pane_is_charged_for_the_tiles_it_puts_on_the_glass() {
         bare.host_bytes,
     );
 }
+
+// ── Pricing a loop at the listing, not at the arm ──────────────────────────
+
+/// The lookback the app ships as its default (`Gui`'s `loop_lookback_secs`),
+/// which is what the Tier-2 `long` leg's seed inherits by naming none.
+const DEFAULT_LOOKBACK_SECS: usize = 3600;
+
+/// **KTLX at VCP 212, precipitation**, measured 2026-09-07: 16 volumes from
+/// 06:24:07Z to 07:21:26Z, median gap 230 s.
+const PRECIP_CADENCE: Option<u32> = Some(230);
+
+/// **KTLX at VCP 35, clear air**, measured the same day: 8-9 volumes inside
+/// 03:02Z-05:31Z, median gap 422 s.
+const CLEAR_AIR_CADENCE: Option<u32> = Some(422);
+
+/// The reserve one frame of a radar loop is priced at until its volume lands.
+const RESERVE: u64 = crate::constants::LOOP_SCAN_RESERVE_BYTES;
+
+fn wasm() -> crate::budget::Budgets {
+    resolve(&shipped_profile(BudgetLimits::WASM))
+}
+
+/// **What arming one plan-view radar loop costs**, through [`increment`] —
+/// this module's only pricing primitive, so the test cannot come to price a
+/// loop differently from the door.
+fn arm_cost(span_secs: usize, cadence: Option<u32>) -> Increment {
+    let budgets = wasm();
+    let before = scene_of(vec![plan_pane(HD, false, span_secs, cadence)]);
+    let after = scene_of(vec![plan_pane(HD, true, span_secs, cadence)]);
+    increment(&before, &after, &budgets, stand_in_grid_bytes)
+}
+
+/// **A door with no cadence has no price, and says so.**
+///
+/// The defect this closes, in one row. [`LoopFrames::requested`] answers
+/// [`LoopFrames::ceiling`] for `cadence_secs: None` — right for a frame list,
+/// wrong for a door — and the arm-loop door consumed that answer, so on the
+/// web bracket every loop was priced at fourteen frames before any listing
+/// existed. [`LoopFrames::priceable`] refuses to answer instead.
+#[test]
+fn a_loop_with_no_cadence_yet_is_not_priceable_and_is_not_guessed_at() {
+    for limits in BudgetLimits::SHIPPED {
+        let budgets = resolve(&shipped_profile(limits));
+        let frames = LoopFrames::of(&budgets);
+        assert_eq!(
+            frames.priceable(DEFAULT_LOOKBACK_SECS, None),
+            None,
+            "{}: a door was handed a frame count for a site nobody has listed",
+            limits.name,
+        );
+        assert_eq!(
+            frames.priceable(DEFAULT_LOOKBACK_SECS, Some(0)),
+            None,
+            "{}: a zero cadence converts no span and is not a cadence",
+            limits.name,
+        );
+        assert!(
+            !prices_a_loop(None) && !prices_a_loop(Some(0)) && prices_a_loop(Some(230)),
+            "{}: the predicate and the converter disagree about what is \
+             priceable",
+            limits.name,
+        );
+
+        // **Non-vacuity**: the old spelling really does answer on this row,
+        // and really does answer the ceiling rather than the span. If it ever
+        // stops, `priceable`'s `None` witnesses nothing.
+        assert_eq!(
+            frames.requested(DEFAULT_LOOKBACK_SECS, None),
+            frames.frames(DEFAULT_LOOKBACK_SECS, None),
+            "{}: the branch this guards is gone",
+            limits.name,
+        );
+        assert!(
+            frames.frames(DEFAULT_LOOKBACK_SECS, None) >= MIN_LOOP_FRAMES_PER_PANE,
+            "{}",
+            limits.name,
+        );
+
+        // And where a cadence IS known, `priceable` is the model's own answer
+        // and nothing else - it adds no clamp of its own.
+        for cadence in [PRECIP_CADENCE, CLEAR_AIR_CADENCE, Some(60), Some(600)] {
+            assert_eq!(
+                frames.priceable(DEFAULT_LOOKBACK_SECS, cadence),
+                Some(budgets.frames_for_span_of(DEFAULT_LOOKBACK_SECS, cadence)),
+                "{}: at {cadence:?}",
+                limits.name,
+            );
+        }
+    }
+}
+
+/// **The two arms, on the bracket and the scene that trapped the tab.**
+///
+/// One hour of lookback on the web bracket, at the two cadences KTLX was
+/// measured at hours apart on 2026-09-07. The cadence is the only input that
+/// differs, and it moves the price by 400 MiB.
+///
+/// * **Precipitation, 230 s.** `1 + 3600/230 = 16` frames *available* in the
+///   listing, which the bracket's render budget then caps to **14** — two
+///   different numbers, and the one the door consumes is the cap.
+/// * **Clear air, 422 s.** `1 + 3600/422 = 9` frames, **under** the cap, so
+///   nothing clamps and the loop costs what the span asks for.
+///
+/// Today's door prices both at 14. That is right by coincidence on the first
+/// and **1.56x over** on the second, and the band between the two prices is
+/// the range of spares where the door refuses a loop that would have fitted.
+#[test]
+fn the_web_bracket_prices_a_precipitation_loop_above_a_clear_air_one() {
+    let frames = LoopFrames::of(&wasm());
+
+    let precip = frames
+        .priceable(DEFAULT_LOOKBACK_SECS, PRECIP_CADENCE)
+        .expect("a listed cadence is priceable");
+    let clear_air = frames
+        .priceable(DEFAULT_LOOKBACK_SECS, CLEAR_AIR_CADENCE)
+        .expect("a listed cadence is priceable");
+
+    // The listing's own count, before the budget's cap: the two are different
+    // things and a report naming one for the other is ambiguous.
+    assert_eq!(
+        frames.requested(DEFAULT_LOOKBACK_SECS, PRECIP_CADENCE),
+        16,
+        "the precipitation window lists 16 volumes",
+    );
+    assert_eq!(precip, 14, "the render budget caps the listing's 16 to 14");
+    assert_eq!(
+        frames.requested(DEFAULT_LOOKBACK_SECS, CLEAR_AIR_CADENCE),
+        9,
+        "clear air asks for 9",
+    );
+    assert_eq!(clear_air, 9, "9 is under the cap, so nothing clamps it");
+    assert!(
+        clear_air < precip,
+        "the slower site must price lower, or the cadence is not being read",
+    );
+
+    // The prices, through the model. A loop displaces the still its pane was
+    // parked at, so the increment is one frame's reserve short of the whole.
+    let precip_cost = arm_cost(DEFAULT_LOOKBACK_SECS, PRECIP_CADENCE);
+    let clear_air_cost = arm_cost(DEFAULT_LOOKBACK_SECS, CLEAR_AIR_CADENCE);
+    assert_eq!(
+        precip_cost.host_bytes,
+        precip as u64 * RESERVE - RESERVE,
+        "14 frames less the still they displace",
+    );
+    assert_eq!(
+        precip_cost.host_bytes / MIB,
+        1040,
+        "the figure the Tier-2 `long` leg logged, to the MiB",
+    );
+    assert_eq!(clear_air_cost.host_bytes / MIB, 640);
+
+    // **The phantom, priced.** What the door charged before it read a cadence.
+    let unpriced = arm_cost(DEFAULT_LOOKBACK_SECS, None);
+    assert_eq!(
+        unpriced.host_bytes, precip_cost.host_bytes,
+        "the no-cadence branch prices at the cap, which is the precipitation \
+         price - right by coincidence, on one of the two arms",
+    );
+    assert!(
+        unpriced.host_bytes > clear_air_cost.host_bytes,
+        "the phantom must over-price the slow site, or there was no defect",
+    );
+    assert_eq!(
+        unpriced.host_bytes - clear_air_cost.host_bytes,
+        400 * MIB,
+        "the clear-air over-price, which is what a door would have refused on",
+    );
+}
+
+/// **The verdict, on both arms, across the band the phantom created.**
+///
+/// The band is `640 MiB < spare < 1040 MiB`: a session with that much host
+/// spare can hold a clear-air loop and cannot hold a precipitation one, and
+/// the whole value of reading the cadence is that the two now answer
+/// differently there.
+///
+/// **Over-firing is the worse direction**, so the clear-air row is the one
+/// that matters: a door that refuses a scene which would have fitted is a
+/// worse product than one that refuses nothing.
+#[test]
+fn inside_the_band_the_cadence_decides_the_verdict_and_the_phantom_refused_both() {
+    let frames = LoopFrames::of(&wasm());
+    let precip_cost = arm_cost(DEFAULT_LOOKBACK_SECS, PRECIP_CADENCE);
+    let clear_air_cost = arm_cost(DEFAULT_LOOKBACK_SECS, CLEAR_AIR_CADENCE);
+    let unpriced = arm_cost(DEFAULT_LOOKBACK_SECS, None);
+
+    // A spare inside the band, with the GPU pool wide open so the host is
+    // unambiguously what answers.
+    let inside = split(u64::MAX, 800 * MIB);
+    assert!(
+        !verdict(inside, precip_cost).is_admit(),
+        "a precipitation loop does not fit 800 MiB and must be refused",
+    );
+    assert_eq!(
+        verdict(inside, clear_air_cost),
+        Verdict::Admit,
+        "a clear-air loop DOES fit 800 MiB - refusing it is the over-fire \
+         this whole change exists to stop",
+    );
+    assert!(
+        !verdict(inside, unpriced).is_admit(),
+        "the phantom refused the clear-air loop too, which is the defect",
+    );
+
+    // **The leg's own spare, and its refusal was correct.** 292 MiB was
+    // measured on the failing Tier-2 `long` leg (Chromium, page instance,
+    // 2026-09-07). Only four frames fit there, so BOTH cadences are over and
+    // the refusal that run logged was right - the number behind it was the
+    // thing that was wrong, not the answer.
+    let leg = split(u64::MAX, 292 * MIB);
+    assert!(!verdict(leg, precip_cost).is_admit());
+    assert!(
+        !verdict(leg, clear_air_cost).is_admit(),
+        "at the leg's spare even the slow site is over, so this run's \
+         refusal was not itself a phantom",
+    );
+
+    // Above the band nothing is refused, which is what keeps the door from
+    // being a wall: the desktop brackets are not this tight.
+    let roomy = split(u64::MAX, 2048 * MIB);
+    assert_eq!(verdict(roomy, precip_cost), Verdict::Admit);
+    assert_eq!(verdict(roomy, clear_air_cost), Verdict::Admit);
+
+    // **What span WOULD fit the leg's 292 MiB**, at the precipitation
+    // cadence: the frames its spare buys, and the lookback they cover. The
+    // door is only as useful as the setting it points the reader at.
+    let fits = 1 + (292 * MIB / RESERVE) as usize;
+    assert_eq!(
+        fits, 4,
+        "292 MiB of spare buys three frames beside the still"
+    );
+    let span_that_fits = (fits - 1) * PRECIP_CADENCE.unwrap() as usize;
+    assert_eq!(span_that_fits, 690, "11.5 minutes, not the default hour");
+    assert!(
+        frames.priceable(span_that_fits, PRECIP_CADENCE) == Some(fits),
+        "the span and the frame count must round-trip through the converter",
+    );
+    assert_eq!(
+        arm_cost(span_that_fits, PRECIP_CADENCE).host_bytes,
+        3 * RESERVE,
+        "and it fits inside 292 MiB",
+    );
+    assert_eq!(
+        verdict(leg, arm_cost(span_that_fits, PRECIP_CADENCE)),
+        Verdict::Admit,
+    );
+}

@@ -357,6 +357,52 @@ impl LoopFrames {
     pub fn frames(&self, span_secs: usize, cadence_secs: Option<u32>) -> usize {
         self.requested(span_secs, cadence_secs).min(self.ceiling())
     }
+
+    /// **What an admission door may price a loop at**, or `None` where no
+    /// listing has said the site's cadence yet.
+    ///
+    /// [`Self::requested`] answers [`Self::ceiling`] for a loop with no
+    /// cadence, and that is right for *its* consumer: a frame list has to be
+    /// capped by something and nothing has said what more exists. It is wrong
+    /// for a door, which is asking **what will this cost**. The ceiling is a
+    /// compiled frame count; it reads neither the user's span nor the site's
+    /// cadence, so it prices every loop the same and prices most of them high.
+    ///
+    /// Measured on the Tier-2 `long` leg, 2026-09-07, Chromium, page instance:
+    /// the arm-loop door refused at **1040 MiB** — `14 x LOOP_SCAN_RESERVE_BYTES`
+    /// less the still the loop displaces — before any listing existed. At
+    /// KTLX's precipitation cadence (230 s) a 3600 s lookback really does reach
+    /// the cap, so 14 was right by coincidence; at its clear-air cadence
+    /// (422 s) the same loop holds **9** frames and the door priced 1.56x what
+    /// it costs. A door that refuses scenes which would have fit is a worse
+    /// product than one that refuses nothing, so the over-price is the
+    /// direction that matters.
+    ///
+    /// **`None` rather than a guess, and that is the whole point.** Nothing
+    /// here substitutes a cadence — not a constant, not a class default, not a
+    /// figure carried over from a previous session (ruling 6: nothing learned
+    /// across sessions). A synthesised cadence is a guess wearing a
+    /// measurement's authority, which is the shape that took a user's laptop
+    /// down. A door holding `None` does not refuse; it admits, and the verdict
+    /// is taken where the number lands — the listing, which is still before
+    /// the first frame is downloaded and before a byte of it is committed.
+    pub fn priceable(&self, span_secs: usize, cadence_secs: Option<u32>) -> Option<usize> {
+        prices_a_loop(cadence_secs).then(|| self.frames(span_secs, cadence_secs))
+    }
+}
+
+/// **Whether a loop can be priced at all**: a listing has landed and said the
+/// site's cadence.
+///
+/// The one predicate behind [`LoopFrames::priceable`], spelled apart so a
+/// door that holds no [`LoopFrames`] — `squallar_egui`'s ledger, which carries
+/// finished byte figures and a cadence per pane — asks the same question the
+/// model does rather than open its own `is_some()` and drift from it.
+///
+/// A zero cadence is not a cadence: it converts no span and would divide by
+/// nothing. [`LoopFrames::requested`] already filters it, and this agrees.
+pub const fn prices_a_loop(cadence_secs: Option<u32>) -> bool {
+    matches!(cadence_secs, Some(secs) if secs > 0)
 }
 
 #[path = "admit/tests.rs"]
