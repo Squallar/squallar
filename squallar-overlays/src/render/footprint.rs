@@ -337,6 +337,20 @@ pub(crate) fn reports_rows(rows: &std::sync::Arc<Vec<ReportPaint>>) -> u64 {
     reports_rows_bytes(rows)
 }
 
+/// **The storm-report hit slab: the pointers only.**
+///
+/// The slab holds one `Arc<StormReportItem>` per report, and every one of
+/// those bodies is the layer's own item data, priced in the `overlay items`
+/// family already. So what freeing this slab gives back is the vector of
+/// pointers and nothing else — the same rule the alert rows follow, and for
+/// the same reason: pricing the bodies here would put one report into two
+/// figures a reader is invited to add.
+pub(crate) fn reports_hit_slab(
+    slab: &std::sync::Arc<crate::render::handlers::reports::StormReportHitSlab>,
+) -> u64 {
+    slab.pointer_bytes()
+}
+
 /// **The lightning layer's built paint rows** — the memo's whole row set,
 /// which at the ~125 000 flashes a busy 20 s poll delivers is the largest
 /// single figure in the parked family.

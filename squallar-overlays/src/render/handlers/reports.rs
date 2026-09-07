@@ -133,6 +133,43 @@ impl OverlayItem for StormReportItem {
     }
 }
 
+/// **The hit list as a handle rather than a list.**
+///
+/// The items are already `Arc<StormReportItem>` in `state.data` — the poll
+/// built them — so what a dispatch used to pay was not building them but
+/// copying the vector of pointers, once per dispatch, on the frame thread.
+/// This holds that vector for the generation and lets a click clone the one
+/// pointer it names, which is [`HitItems::Slab`]'s whole purpose and the shape
+/// the lightning layer already takes.
+///
+/// `get` hands back **the same allocation** `state.data` holds, not a rebuilt
+/// item: reports arrive whole and are never reconstructed from a denser
+/// representation the way a GLM flash is.
+#[derive(Debug)]
+pub(crate) struct StormReportHitSlab {
+    items: Vec<Arc<StormReportItem>>,
+}
+
+impl StormReportHitSlab {
+    /// What freeing this slab gives back: the pointer vector alone. The item
+    /// bodies it points at are the layer's own data and are priced there.
+    pub(crate) fn pointer_bytes(&self) -> u64 {
+        (self.items.capacity() * size_of::<Arc<StormReportItem>>()) as u64
+    }
+}
+
+impl squallar_source::hit::HitResolve for StormReportHitSlab {
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn get(&self, index: usize) -> Option<Arc<dyn OverlayItem>> {
+        self.items
+            .get(index)
+            .map(|item| Arc::clone(item) as Arc<dyn OverlayItem>)
+    }
+}
+
 pub(crate) struct StormReportsHandler {
     pub state: OverlayState<Vec<Arc<StormReportItem>>, Assembled>,
     pub enabled: bool,
@@ -140,6 +177,9 @@ pub(crate) struct StormReportsHandler {
     /// shared by every dispatch since — see [`Self::paint_input`].
     pub(crate) rows_memo:
         crate::render::signature_memo::BuiltMemo<Arc<Vec<rasterize::ReportPaint>>>,
+    /// The hit-list handle of the current generation, built once per poll and
+    /// shared by every dispatch since — see [`Self::hit_items`].
+    pub(crate) hit_memo: crate::render::signature_memo::BuiltMemo<Arc<StormReportHitSlab>>,
 }
 
 impl StormReportsHandler {
@@ -151,6 +191,9 @@ impl StormReportsHandler {
             enabled: false,
             rows_memo: crate::render::signature_memo::BuiltMemo::new(
                 crate::render::footprint::reports_rows,
+            ),
+            hit_memo: crate::render::signature_memo::BuiltMemo::for_hit_list(
+                crate::render::footprint::reports_hit_slab,
             ),
         }
     }
@@ -337,14 +380,22 @@ impl OverlayHandler for StormReportsHandler {
         // nothing dispatches this layer any more, so no later `get_or_build`
         // would retire them.
         self.rows_memo.retire_live_rows();
+        self.hit_memo.retire_live_rows();
         true
     }
 
     fn take_retired(&self) -> Vec<Box<dyn std::any::Any + Send>> {
-        crate::render::overlay_state::retired_batch(
+        let mut batch = crate::render::overlay_state::retired_batch(
             self.state.take_retired(),
             self.rows_memo.take_retired(),
-        )
+        );
+        batch.extend(
+            self.hit_memo
+                .take_retired()
+                .into_iter()
+                .map(|slab| Box::new(slab) as Box<dyn std::any::Any + Send>),
+        );
+        batch
     }
 
     fn apply_fetch_result(&mut self, result: FetchPayload, _pane: &PaneRef<'_>) {
@@ -402,18 +453,29 @@ impl OverlayHandler for StormReportsHandler {
 
     /// Index-aligned with [`Self::paint_input`]'s rows: `hit_items()[i]` **is**
     /// the item whose report travelled at row `i` — the invariant
-    /// [`rasterize::HitMap::from_cells`] zips on.
+    /// [`rasterize::HitMap::from_cells`] zips on. Both halves index
+    /// `state.data` in its own order and neither filters, which is what makes
+    /// the alignment hold without either walking the other.
+    ///
+    /// **A handle, not a list**, on the same terms as the lightning layer's:
+    /// the vector of pointers is copied once per poll rather than once per
+    /// dispatch, and a dispatch costs one refcount bump. The order is
+    /// `state.data`'s either way, so this is the same list arriving by a
+    /// cheaper route — not a different one.
     fn hit_items(&self) -> Option<crate::render::overlay_state::HitItems> {
         if self.state.data.is_empty() {
             return None;
         }
-        Some(
-            self.state
-                .data
-                .iter()
-                .map(|i| i.clone() as Arc<dyn OverlayItem>)
-                .collect(),
-        )
+        let slab = self
+            .hit_memo
+            .get_or_build(self.state.data_generation, 0, || {
+                Some(Arc::new(StormReportHitSlab {
+                    items: self.state.data.clone(),
+                }))
+            })?;
+        Some(crate::render::overlay_state::HitItems::Slab(
+            slab as Arc<dyn squallar_source::hit::HitResolve>,
+        ))
     }
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig, _pane: &PaneRef<'_>) -> Vec<FetchTask> {

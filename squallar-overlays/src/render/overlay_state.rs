@@ -430,12 +430,17 @@ impl OverlayRegistry {
         }
     }
 
+    /// **One dispatch.** The dispatch tail calls this exactly once per layer
+    /// it dispatches, before it asks the same layer for [`Self::hit_items`],
+    /// so this is the denominator every figure in
+    /// [`squallar_source::walks`] is quoted against.
     pub fn prepare_job(
         &self,
         id: &LayerId,
         ctx: &RasterizeContext,
         pane: &PaneRef<'_>,
     ) -> Option<DescribedJob> {
+        squallar_source::walks::note_dispatch();
         self.handler(id).and_then(|h| h.prepare_job(ctx, pane))
     }
 

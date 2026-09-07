@@ -87,8 +87,15 @@ impl HitItems {
 
 /// So a handler that already builds one item per row keeps writing
 /// `Some(rows.map(..).collect())` and nothing else changes at its end.
+///
+/// **This is the hit-side item-list walk, and the only shape of it**: a
+/// [`HitItems::Slab`] is built from a handle and walks nothing. So the count
+/// [`crate::walks::note_hit_walk`] keeps is exactly the number of dispatches
+/// that materialised one row per item, which is what the `hitmap` cut is
+/// timing whenever it reads anything at all.
 impl FromIterator<Arc<dyn OverlayItem>> for HitItems {
     fn from_iter<T: IntoIterator<Item = Arc<dyn OverlayItem>>>(iter: T) -> Self {
+        crate::walks::note_hit_walk();
         HitItems::Rows(iter.into_iter().collect())
     }
 }

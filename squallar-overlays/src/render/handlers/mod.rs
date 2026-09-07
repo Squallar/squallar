@@ -25,6 +25,9 @@ pub mod sites;
 #[cfg(test)]
 mod texture_tests;
 
+#[cfg(test)]
+mod dispatch_walk_tests;
+
 use super::overlay_state::OverlayHandler;
 use squallar_source::id::{LayerId, known};
 

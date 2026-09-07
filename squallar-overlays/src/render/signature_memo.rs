@@ -118,6 +118,11 @@ pub(crate) struct BuiltMemo<T> {
     /// every memo's price is a plain function of the row, and refusing
     /// captures keeps the memo the same size it was.
     price: fn(&T) -> u64,
+    /// Which half of the dispatch this memo's builds are walks of. A memo
+    /// cannot infer this from its own row type — the hit-list slab and the
+    /// paint rows are both `Arc`s of a vector — so it is stated at
+    /// construction and reported from the miss path.
+    walk: squallar_source::walks::WalkKind,
     /// How many times the build closure ran — the mechanism's count, for the
     /// gate that an unchanged key builds nothing.
     #[cfg(test)]
@@ -134,12 +139,23 @@ impl<T: Clone> BuiltMemo<T> {
     /// publish a silent zero into a census family whose whole purpose is to
     /// find what nobody is counting.
     pub fn new(price: fn(&T) -> u64) -> Self {
+        Self::of_kind(price, squallar_source::walks::WalkKind::Paint)
+    }
+
+    /// A memo over a layer's **hit list** rather than its paint rows, so its
+    /// builds are counted as the half they belong to.
+    pub fn for_hit_list(price: fn(&T) -> u64) -> Self {
+        Self::of_kind(price, squallar_source::walks::WalkKind::Hit)
+    }
+
+    fn of_kind(price: fn(&T) -> u64, walk: squallar_source::walks::WalkKind) -> Self {
         Self {
             generation: Cell::new(0),
             rows: RefCell::new(Vec::new()),
             retired: RefCell::new(Vec::new()),
             parked_bytes: Cell::new(0),
             price,
+            walk,
             #[cfg(test)]
             builds: Cell::new(0),
         }
@@ -185,6 +201,11 @@ impl<T: Clone> BuiltMemo<T> {
         }
         #[cfg(test)]
         self.builds.set(self.builds.get() + 1);
+        // **The miss path, and only the miss path.** A hit hands back a
+        // refcount clone and walks nothing, so counting it here would report
+        // the memo's whole traffic as walks and hide the saving it exists to
+        // make.
+        squallar_source::walks::note_walk(self.walk);
         let value = build()?;
         let mut rows = self.rows.borrow_mut();
         if rows.len() >= JOB_MEMO_ROWS {

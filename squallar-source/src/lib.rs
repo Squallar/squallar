@@ -22,4 +22,5 @@ pub mod reserve;
 pub mod time;
 pub mod tls;
 pub mod volume;
+pub mod walks;
 pub mod wire;
