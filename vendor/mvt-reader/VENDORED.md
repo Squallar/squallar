@@ -93,7 +93,7 @@ help with the **peak**, which is what the module dies on.
 
 ## Local changes
 
-Six, and nothing else. Two of them (5 and 6) are this workspace's CI applying
+Seven, and nothing else. Two of them (5 and 6) are this workspace's CI applying
 itself to a new member rather than decisions — they are listed because a reader
 diffing against the registry copy will hit them first and should be able to
 stop reading.
@@ -145,6 +145,37 @@ stop reading.
    same workflow gates on `cargo clippy --all-targets --all-features -D
    warnings`, and a warning here is a red board rather than a warning.
 
+7. **`src/interned.rs` is new, and `Reader::get_interned_layer_as` beside
+   `get_features_as` reads through it.** The same decode with the layer's key
+   and value tables **kept** instead of expanded into a `HashMap` per feature.
+   `intern_tags` is `parse_tags`'s twin: the same wire validation — pairs, and
+   both indices inside their tables, the same `InvalidTags` — appending the
+   `(key index, value index)` pair to a per-layer arena instead of cloning a
+   key `String` and a value into a map.
+
+   **This is additive and nothing was rerouted.** `get_features_as` is
+   untouched, so `squallar-buildings`' footprint parse and this crate's own
+   `peak_allocation_tests` still run through exactly the code they did.
+   `parse_geometry` is not touched either — change 1 is still the whole of the
+   behaviour delta in it.
+
+   **Why the caller could not do this itself.** A `Layer` message's `keys` and
+   `values` are behind `Reader`'s private `tile` field and the private
+   `vector_tile` module, so the tables were unreachable from outside this
+   crate: a dependent could only take the expanded bags and re-intern them,
+   which pays the whole cost first and then throws it away. `vendor/walkers`'
+   `mvt::parse` is the caller, and its `VENDORED.md` carries the measurement —
+   on the committed Monaco z14 fixture the expanded bags were **1,447,103 B of
+   a parsed tile's 2,092,002**, against **166 keys and 1,848 values** in the
+   tables they came from.
+
+   One thing this deliberately does **not** do: drop a repeated tag key. A tag
+   list naming one key twice is malformed, and `get_features_as` resolves it
+   through `HashMap::insert`, so the last write wins. Choosing that here would
+   decide the question for every caller off a wire detail; the arena keeps both
+   pairs in order and the caller that wants the map's answer reads its window
+   backwards. `vendor/walkers`' `LayerProperties::pair` does, and says so.
+
 The `include`, `keywords` and `repository` keys are left as upstream wrote them
 even though this copy is never published, so the manifest still reads as a diff
 against the registry version.
@@ -153,7 +184,9 @@ against the registry version.
 
 Change 1 is the one that matters and it is three lines in one function; find
 `parse_geometry` and check whether the per-ring `coordinates = ...` assignments
-still reserve `geometry_data.len()`. If upstream has fixed it, this directory
+still reserve `geometry_data.len()`. Change 7 is the largest by line count and
+the easiest to re-apply: one new file plus one method and one free function,
+none of which upstream has anything at the same place. If upstream has fixed it, this directory
 can go: delete the member entry, the `[patch.crates-io]` line and the
 `[profile.dev.package.mvt-reader]` override in the root `Cargo.toml`, and move
 `src/peak_allocation_tests.rs` somewhere it can still run against the registry

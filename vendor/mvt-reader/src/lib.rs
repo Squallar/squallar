@@ -67,6 +67,8 @@
 
 pub mod error;
 pub mod feature;
+/// LOCAL CHANGE: the interned decode. See `VENDORED.md`, change 7.
+pub mod interned;
 pub mod layer;
 
 mod vector_tile;
@@ -81,6 +83,7 @@ use geo_types::{
     Coord, CoordNum, Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon, Point,
     Polygon,
 };
+use interned::{InternedFeature, InternedLayer};
 use layer::Layer;
 use num_traits::NumCast;
 use prost::{Message, bytes::Bytes};
@@ -274,6 +277,80 @@ impl Reader {
             None => Ok(vec![]),
         }
     }
+
+    /// LOCAL CHANGE: the same decode as [`Self::get_features_as`] with the
+    /// layer's key and value tables **kept** instead of expanded into a
+    /// `HashMap` per feature. See [`crate::interned`] and `VENDORED.md`.
+    ///
+    /// Identical to `get_features_as` in what it accepts and what it refuses:
+    /// the same geometries, the same skip of a feature carrying no `type`, and
+    /// the same [`error::ParserError::InvalidTags`] for an odd tag list or an
+    /// index outside its table. What differs is only where the properties end
+    /// up.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mvt_reader::Reader;
+    ///
+    /// let data = vec![/* Vector tile data */];
+    /// let reader = Reader::new(data).unwrap();
+    ///
+    /// if let Ok(layer) = reader.get_interned_layer_as::<f32>(0) {
+    ///   for feature in &layer.features {
+    ///     for (key, value) in feature.tags(&layer) {
+    ///       let _ = (&layer.keys[*key as usize], &layer.values[*value as usize]);
+    ///     }
+    ///   }
+    /// }
+    /// ```
+    pub fn get_interned_layer_as<T: CoordNum>(
+        &self,
+        layer_index: usize,
+    ) -> Result<InternedLayer<T>, error::ParserError> {
+        let Some(layer) = self.tile.layers.get(layer_index) else {
+            return Ok(InternedLayer {
+                keys: Vec::new(),
+                values: Vec::new(),
+                tags: Vec::new(),
+                features: Vec::new(),
+            });
+        };
+
+        let mut features = Vec::with_capacity(layer.features.len());
+        // The whole layer's pairs in one allocation. `tags` is a flat
+        // `Vec<u32>` of alternating indices on the wire, so the layer's total
+        // is exactly half the sum of their lengths.
+        let mut tags: Vec<(u32, u32)> =
+            Vec::with_capacity(layer.features.iter().map(|f| f.tags.len()).sum::<usize>() / 2);
+
+        for feature in layer.features.iter() {
+            let Some(geom_type) = feature.r#type else {
+                continue;
+            };
+            let geom_type =
+                GeomType::try_from(geom_type).map_err(|_| error::ParserError::InvalidGeometry)?;
+            let parsed_geometry = parse_geometry::<T>(&feature.geometry, geom_type)?;
+
+            let tags_start = tags.len() as u32;
+            intern_tags(&feature.tags, &layer.keys, &layer.values, &mut tags)?;
+            let tags_len = tags.len() as u32 - tags_start;
+
+            features.push(InternedFeature {
+                geometry: parsed_geometry,
+                id: feature.id,
+                tags_start,
+                tags_len,
+            });
+        }
+
+        Ok(InternedLayer {
+            keys: layer.keys.clone(),
+            values: layer.values.iter().cloned().map(map_value).collect(),
+            tags,
+            features,
+        })
+    }
 }
 
 fn process_layers<T, F>(
@@ -314,6 +391,26 @@ fn parse_tags(
         );
     }
     Ok(result)
+}
+
+/// LOCAL CHANGE: [`parse_tags`]'s twin for the interned decode.
+///
+/// The same wire validation — pairs, and both indices inside their tables —
+/// with the pair appended to `out` rather than resolved into a map. It never
+/// clones a key or a value.
+fn intern_tags(
+    tags: &[u32],
+    keys: &[String],
+    values: &[vector_tile::tile::Value],
+    out: &mut Vec<(u32, u32)>,
+) -> Result<(), error::ParserError> {
+    for item in tags.chunks(2) {
+        if item.len() != 2 || item[0] as usize >= keys.len() || item[1] as usize >= values.len() {
+            return Err(error::ParserError::InvalidTags);
+        }
+        out.push((item[0], item[1]));
+    }
+    Ok(())
 }
 
 fn map_value(value: vector_tile::tile::Value) -> Value {

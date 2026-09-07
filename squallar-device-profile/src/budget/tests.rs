@@ -1729,9 +1729,14 @@ fn the_tile_allowances_are_the_written_figures_on_every_bracket() {
         desktop_step / TAIL,
     );
     // Desktop's parsed floor restyles the common 1920x1200 canvas — 96 tiles
-    // between zooms — from cache at the parsed tail (1.93 MB, re-derived
-    // 2026-09-07), to within the rounding its doc states.
-    const PARSED_TAIL: usize = 1_928_874;
+    // between zooms — from cache at the parsed tail. The tail is
+    // `squallar_egui::tile_source::MEASURED_PARSED_TILE_BYTES`, restated here
+    // because this crate sits under that one; it fell 2,092,002 -> 670,110 on
+    // 2026-09-07 when the parse stopped expanding the wire's interned property
+    // tables per feature, so the floor now holds ~300 of these rather than 96.
+    // The assertion is unchanged and deliberately still reads 96: it is the
+    // canvas the floor must cover, not the count it happens to reach.
+    const PARSED_TAIL: usize = 670_110;
     let desktop_parsed = BudgetLimits::DESKTOP.tile_parsed_bytes.floor;
     assert!(
         desktop_parsed / PARSED_TAIL >= 96,

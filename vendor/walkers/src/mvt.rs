@@ -167,26 +167,159 @@ struct ParsedLayer {
     /// what the reader-backed path did: `find_layer` refused it and the
     /// caller's `if let Ok` fell through to the same trace as a missing layer.
     extent_supported: bool,
+    /// Shared, not owned, and **one set of tables for the whole layer**: they
+    /// are read by every feature of it, by every style layer that visits it,
+    /// across every styling of this tile.
+    properties: Arc<LayerProperties>,
     features: Vec<ParsedFeature>,
 }
 
 struct ParsedFeature {
     geometry: Geometry<f32>,
-    /// Shared, not owned: one bag is read by every style layer that visits the
-    /// source layer, across every styling of this tile.
-    properties: Arc<HashMap<String, Value>>,
+    /// This feature's window into its layer's tag arena — see
+    /// [`LayerProperties`]. Eight bytes, inline: a feature owns no property
+    /// heap of its own.
+    tags: TagSpan,
+}
+
+/// Where one feature's `(key index, value index)` pairs sit in its layer's
+/// arena.
+#[derive(Clone, Copy)]
+pub(crate) struct TagSpan {
+    start: u32,
+    len: u32,
+}
+
+/// One source layer's property tables, kept the way the wire carries them.
+///
+/// **A Mapbox Vector Tile already interns its properties.** A `Layer` message
+/// holds a `keys` table and a `values` table, and each feature's `tags` is a
+/// flat list of indices into them; a key that a thousand features carry is one
+/// string on the wire. Until 2026-09-07 the parse expanded that into one
+/// `HashMap<String, mvt_reader::feature::Value>` per feature, with an owned
+/// key `String` per property — it threw the interning away and then paid to
+/// hold the result for as long as the tile was cached.
+///
+/// Measured on the committed Monaco z14 8529/5974 fixture (185,182 MVT bytes,
+/// 14 source layers, 2,913 features, 14,303 properties), by re-deriving
+/// `squallar_egui::tile_source::MEASURED_PARSED_TILE_BYTES` from its band:
+/// the expanded bags were **1,447,103 B — 69.2% of the 2,092,002 a parsed
+/// tile was resident for** — and the tables they were expanded from hold
+/// **166 keys and 1,848 values**. Interned, the same properties are 188,227 B:
+/// 73,803 of tables and 114,424 of index pairs.
+///
+/// A lookup is what pays for it, and it is not the hash it replaced: see
+/// [`Self::pair`].
+pub(crate) struct LayerProperties {
+    /// The layer's key table, in wire order.
+    keys: Box<[String]>,
+    /// The layer's value table, in wire order.
+    values: Box<[Value]>,
+    /// Every feature's `(key index, value index)` pairs, back to back — one
+    /// allocation for the layer rather than one per feature.
+    tags: Box<[(u32, u32)]>,
+}
+
+impl LayerProperties {
+    /// The tables a layer at an unsupported extent gets. Empty boxed slices
+    /// allocate nothing.
+    fn empty() -> Self {
+        Self {
+            keys: Vec::new().into_boxed_slice(),
+            values: Vec::new().into_boxed_slice(),
+            tags: Vec::new().into_boxed_slice(),
+        }
+    }
+
+    /// The value behind `key` for the feature at `span`, converted on the way
+    /// out, or `None` if the feature does not carry it.
+    ///
+    /// **`None` and `Some(Null)` are different answers** and the caller reads
+    /// them differently: `["get", k]` maps both to JSON `null`, but a bare
+    /// property token in a comparison falls back to the *literal string* when
+    /// the feature does not carry the key, and to the value when it does. A
+    /// tile may legitimately carry an MVT `Value::Null`.
+    pub(crate) fn get(&self, span: TagSpan, key: &str) -> Option<JsonValue> {
+        self.pair(span, key)
+            .map(|(_, value)| mvt_value_to_json_value(&self.values[value as usize]))
+    }
+
+    /// Whether the feature at `span` carries `key` at all.
+    pub(crate) fn contains_key(&self, span: TagSpan, key: &str) -> bool {
+        self.pair(span, key).is_some()
+    }
+
+    /// The feature's pair for `key`, or none.
+    ///
+    /// **A scan over the feature's own pairs, not a hash of the key.** The
+    /// bags are small — measured over the Monaco z14 fixture's 2,913 features,
+    /// the median is 3 pairs and the mean 4.9, and the longest single feature
+    /// carries 42 — so this is a handful of `String == &str` comparisons,
+    /// almost all of which fail on length before a byte is read. What it
+    /// replaced was a SipHash-1-3 of the key plus a probe plus one comparison
+    /// on a hit. **Measured against each other, release, 2026-09-07** (the
+    /// table is in `VENDORED.md`): at the median bag the scan is faster at
+    /// every probe position; it crosses over around a bag of five to eight for
+    /// a key written early or a deep miss; and a 42-property feature probed
+    /// adversarially costs about +65 ns on that one visit. Over the whole
+    /// fixture under the committed dark style that nets **-13.7 ns per
+    /// style-layer visit, -6.8%** — the lookup is cheaper, not dearer.
+    ///
+    /// **Backwards, and that is not a detail.** `mvt-reader`'s
+    /// `parse_tags` resolved a tag list through `HashMap::insert`, so a
+    /// malformed feature naming one key twice kept the **last** value. The
+    /// arena keeps wire order with repeats intact, so reading it backwards is
+    /// what preserves that exactly. `a_repeated_tag_key_reads_as_the_last_one`
+    /// pins it.
+    fn pair(&self, span: TagSpan, key: &str) -> Option<(u32, u32)> {
+        let start = span.start as usize;
+        self.tags[start..start + span.len as usize]
+            .iter()
+            .rev()
+            .find(|(k, _)| self.keys[*k as usize] == key)
+            .copied()
+    }
+
+    /// The heap these tables hold — and unlike the `HashMap` they replaced,
+    /// **exactly**, not from below.
+    ///
+    /// A `Box<[T]>` has no capacity beyond its length, so there is no bucket
+    /// count to estimate around: every term here is a length times a size plus
+    /// the strings' own capacities.
+    fn heap_bytes(&self) -> usize {
+        self.keys.len() * std::mem::size_of::<String>()
+            + self.keys.iter().map(String::capacity).sum::<usize>()
+            + self.values.len() * std::mem::size_of::<Value>()
+            + self
+                .values
+                .iter()
+                .map(|value| match value {
+                    Value::String(string) => string.capacity(),
+                    _ => 0,
+                })
+                .sum::<usize>()
+            + self.tags.len() * std::mem::size_of::<(u32, u32)>()
+    }
 }
 
 impl ParsedTile {
     /// The heap this tile holds, counted at **capacity**, because capacity is
     /// what is resident while the tile is cached.
     ///
-    /// Exact on the `Vec`, `String` and geometry terms. The `HashMap` term is
-    /// an estimate from below: hashbrown keeps one `(K, V)` slot and one
-    /// control byte per bucket, and this counts `capacity()` of each — the
-    /// usable seven-eighths of the buckets — because the bucket count itself
-    /// is not observable. Consumers sizing a cache against this should treat
-    /// it the way squallar-egui's `MEASURED_STYLED_ENTRY_BYTES` treats its figure:
+    /// **Exact in every term, since 2026-09-07.** It used to carry one
+    /// estimate-from-below — hashbrown keeps a `(K, V)` slot and a control
+    /// byte per *bucket* while only `capacity()`, the usable seven-eighths, is
+    /// observable — and that term is gone with the per-feature `HashMap` it
+    /// priced. What replaced it is [`LayerProperties`], three boxed slices
+    /// whose length *is* their capacity.
+    ///
+    /// The property tables are charged **once per source layer**, not once per
+    /// feature: every feature of a layer reads the same tables through the
+    /// same `Arc`, and pricing them per feature would report a tile at roughly
+    /// its old cost while holding a fraction of it.
+    ///
+    /// Consumers sizing a cache against this should still treat it the way
+    /// squallar-egui's `MEASURED_STYLED_ENTRY_BYTES` treats its figure:
     /// re-measure by forcing the deriving test to fail, never infer.
     pub fn heap_bytes(&self) -> usize {
         self.layers.capacity() * std::mem::size_of::<ParsedLayer>()
@@ -195,38 +328,20 @@ impl ParsedTile {
                 .iter()
                 .map(|layer| {
                     layer.name.capacity()
+                        // The Arc allocation: two refcounts and the tables'
+                        // own three fat pointers. Once for the layer.
+                        + 2 * std::mem::size_of::<usize>()
+                        + std::mem::size_of::<LayerProperties>()
+                        + layer.properties.heap_bytes()
                         + layer.features.capacity() * std::mem::size_of::<ParsedFeature>()
                         + layer
                             .features
                             .iter()
-                            .map(|feature| {
-                                geometry_heap_bytes(&feature.geometry)
-                                    // The Arc allocation: two refcounts and the
-                                    // map header itself.
-                                    + 2 * std::mem::size_of::<usize>()
-                                    + std::mem::size_of::<HashMap<String, Value>>()
-                                    + properties_heap_bytes(&feature.properties)
-                            })
+                            .map(|feature| geometry_heap_bytes(&feature.geometry))
                             .sum::<usize>()
                 })
                 .sum::<usize>()
     }
-}
-
-/// The heap behind one property bag: the table, the key strings, and the
-/// string values — the only `mvt_reader::feature::Value` arm that owns heap.
-fn properties_heap_bytes(properties: &HashMap<String, Value>) -> usize {
-    properties.capacity() * (std::mem::size_of::<(String, Value)>() + 1)
-        + properties
-            .iter()
-            .map(|(key, value)| {
-                key.capacity()
-                    + match value {
-                        Value::String(string) => string.capacity(),
-                        _ => 0,
-                    }
-            })
-            .sum::<usize>()
 }
 
 /// The heap behind one geometry, at capacity. A `Coord<f32>` is inline; every
@@ -346,39 +461,53 @@ pub fn parse(data: &[u8]) -> Result<ParsedTile, Error> {
     let mut layers = Vec::with_capacity(metadata.len());
     for layer in metadata {
         let extent_supported = layer.extent == ONLY_SUPPORTED_EXTENT;
-        let features = if extent_supported {
-            let decoded = reader.get_features(layer.layer_index)?;
-            // **Built at its own length, because `.collect()` here is not.**
-            // `Vec<Feature<f32>>::into_iter().map(..).collect::<Vec<ParsedFeature>>()`
-            // meets std's in-place-collect conditions -- the source item is
-            // wider than the destination one and no less aligned -- so the
-            // destination reuses the decode's allocation and takes a capacity
-            // of `src_capacity * size_of::<Feature>() / size_of::<ParsedFeature>()`.
-            // Measured on the pinned toolchain (rustc 1.97.1):
+        let (properties, features) = if extent_supported {
+            // **The interned decode, not the expanded one.** `get_features`
+            // would hand back a `HashMap<String, Value>` per feature, built by
+            // cloning a key `String` and a value out of the layer's own tables
+            // for every tag -- see [`LayerProperties`] for what that cost and
+            // what it is now.
+            let decoded = reader.get_interned_layer_as::<f32>(layer.layer_index)?;
+
+            // **Built at its own length, because `.collect()` here would not
+            // be.** `Vec<_>::into_iter().map(..).collect::<Vec<ParsedFeature>>()`
+            // meets std's in-place-collect conditions when the source item is
+            // wider than the destination one and no less aligned, and then the
+            // destination reuses the decode's allocation with a capacity of
+            // `src_capacity * size_of::<Src>() / size_of::<ParsedFeature>()`.
+            // Measured on rustc 1.97.1 against the expanded decode it replaced:
             // `mvt_reader::feature::Feature<f32>` is 112 bytes and
-            // `ParsedFeature` is 56, so that ratio is exactly 2 and every
-            // parsed layer held twice the feature slots it had features.
-            //
-            // A parsed tile is cached, not transient, so the slack was
-            // resident for the tile's whole life: on the committed Monaco z14
-            // city-core fixture (2,913 features) **163,128 B of the 2,092,002
-            // a tile was priced at, 7.8%**. Same trade [`shrink_geometry`] and
-            // [`tessellate_polygon`] already make, and taken the same way.
-            let mut features = Vec::with_capacity(decoded.len());
-            for mut feature in decoded {
+            // `ParsedFeature` is 56, so that ratio was exactly 2 and every
+            // parsed layer held twice the feature slots it had features --
+            // 163,128 B of the 2,092,002 the Monaco z14 fixture was priced at,
+            // resident for the cached tile's whole life.
+            let mut features = Vec::with_capacity(decoded.features.len());
+            for mut feature in decoded.features {
                 shrink_geometry(&mut feature.geometry);
                 features.push(ParsedFeature {
                     geometry: feature.geometry,
-                    properties: Arc::new(feature.properties.unwrap_or_default()),
+                    tags: TagSpan {
+                        start: feature.tags_start,
+                        len: feature.tags_len,
+                    },
                 });
             }
-            features
+
+            (
+                LayerProperties {
+                    keys: decoded.keys.into_boxed_slice(),
+                    values: decoded.values.into_boxed_slice(),
+                    tags: decoded.tags.into_boxed_slice(),
+                },
+                features,
+            )
         } else {
-            Vec::new()
+            (LayerProperties::empty(), Vec::new())
         };
         layers.push(ParsedLayer {
             name: layer.name,
             extent_supported,
+            properties: Arc::new(properties),
             features,
         });
     }
@@ -547,10 +676,14 @@ where
                     paint,
                     ..
                 } => {
-                    let features = source_features(&self.tile, source_layer);
+                    let Some(source) = find_source_layer(&self.tile, source_layer) else {
+                        self.next_layer();
+                        continue;
+                    };
+                    let features = &source.features;
                     let end = self.feature.saturating_add(left).min(features.len());
                     for feature in &features[self.feature..end] {
-                        if let Some(context) = scan(feature, self.zoom, filter.as_ref())
+                        if let Some(context) = scan(source, feature, self.zoom, filter.as_ref())
                             && let Err(err) = render_polygon(
                                 &feature.geometry,
                                 &context,
@@ -570,10 +703,14 @@ where
                     paint,
                     ..
                 } => {
-                    let features = source_features(&self.tile, source_layer);
+                    let Some(source) = find_source_layer(&self.tile, source_layer) else {
+                        self.next_layer();
+                        continue;
+                    };
+                    let features = &source.features;
                     let end = self.feature.saturating_add(left).min(features.len());
                     for feature in &features[self.feature..end] {
-                        if let Some(context) = scan(feature, self.zoom, filter.as_ref())
+                        if let Some(context) = scan(source, feature, self.zoom, filter.as_ref())
                             && let Err(err) =
                                 render_line(&feature.geometry, &context, &mut self.shapes, paint)
                         {
@@ -589,10 +726,14 @@ where
                     paint,
                     ..
                 } => {
-                    let features = source_features(&self.tile, source_layer);
+                    let Some(source) = find_source_layer(&self.tile, source_layer) else {
+                        self.next_layer();
+                        continue;
+                    };
+                    let features = &source.features;
                     let end = self.feature.saturating_add(left).min(features.len());
                     for feature in &features[self.feature..end] {
-                        if let Some(context) = scan(feature, self.zoom, filter.as_ref())
+                        if let Some(context) = scan(source, feature, self.zoom, filter.as_ref())
                             && let Err(err) = render_symbol(
                                 &feature.geometry,
                                 &context,
@@ -731,10 +872,15 @@ pub(crate) mod scans {
     }
 }
 
-/// The features of the tile's source layer called `name`, or none.
-fn source_features<'a>(tile: &'a ParsedTile, name: &str) -> &'a [ParsedFeature] {
+/// The tile's source layer called `name` — its features and the property
+/// tables they index into — or none.
+///
+/// It hands back the layer rather than just its features because a feature's
+/// properties live on the layer now: its `tags` is a window into the layer's
+/// [`LayerProperties`], and a caller reading one needs both.
+fn find_source_layer<'a>(tile: &'a ParsedTile, name: &str) -> Option<&'a ParsedLayer> {
     match tile.layers.iter().find(|layer| layer.name == name) {
-        Some(layer) if layer.extent_supported => layer.features.as_slice(),
+        Some(layer) if layer.extent_supported => Some(layer),
         _ => {
             // **`trace!`, not `warn!`, because a tile without a source layer is
             // ordinary data.** A style names 94 source layers and no tile carries
@@ -759,27 +905,40 @@ fn source_features<'a>(tile: &'a ParsedTile, name: &str) -> &'a [ParsedFeature] 
             // An unsupported extent lands here too, exactly as it did when
             // `find_layer` refused it into the same fallback.
             trace!("Source layer '{name}' not found. Skipping.");
-            &[]
+            None
         }
     }
 }
 
 /// Consider one feature for one style layer: build its [`Context`] and, if
 /// the layer has a filter, evaluate it. `Some` is a feature the layer draws.
-fn scan(feature: &ParsedFeature, zoom: u8, filter: Option<&Filter>) -> Option<Context> {
+fn scan(
+    layer: &ParsedLayer,
+    feature: &ParsedFeature,
+    zoom: u8,
+    filter: Option<&Filter>,
+) -> Option<Context> {
     #[cfg(test)]
     scans::bump();
 
-    // The property bag is *shared* into the context, not rebuilt in it.
-    // Converting it to JSON up front cost a `HashMap` allocation and a
-    // `String` clone per string-valued property for every feature the
-    // source layer holds -- including the ones the filter is about to
-    // reject, which read no property at all. `Properties::Mvt` converts a
-    // value when a lookup asks for it instead, and the `Arc` is what lets
-    // one parse serve every styling without copying a bag.
+    // The properties are *shared* into the context, not rebuilt in it, and
+    // since 2026-09-07 what is shared is the layer's interned tables rather
+    // than a bag of this feature's own. Converting to JSON up front cost a
+    // `HashMap` allocation and a `String` clone per string-valued property for
+    // every feature the source layer holds -- including the ones the filter is
+    // about to reject, which read no property at all. `Properties::Mvt`
+    // converts a value when a lookup asks for it instead.
+    //
+    // **One `Arc::clone` per scan, exactly as before.** The tables are one
+    // allocation for the whole layer, so the refcount traffic of a styling is
+    // unchanged by the interning: it is still one bump per feature per style
+    // layer, not one per table.
     let context = Context::with_properties(
         geometry_type_to_str(&feature.geometry),
-        Properties::Mvt(Arc::clone(&feature.properties)),
+        Properties::Mvt {
+            properties: Arc::clone(&layer.properties),
+            tags: feature.tags,
+        },
         zoom,
     );
 
@@ -788,7 +947,7 @@ fn scan(feature: &ParsedFeature, zoom: u8, filter: Option<&Filter>) -> Option<Co
         .then_some(context)
 }
 
-pub(crate) fn mvt_value_to_json_value(value: &Value) -> JsonValue {
+fn mvt_value_to_json_value(value: &Value) -> JsonValue {
     match value {
         Value::String(s) => JsonValue::String(s.clone()),
         Value::Int(x) | Value::SInt(x) => JsonValue::Number((*x).into()),
@@ -1929,6 +2088,200 @@ mod tests {
             from_parse_full, from_parse_lines,
             "non-vacuity: the two styles must render differently, or the \
              equalities above would hold for a styling that ignored the style"
+        );
+    }
+
+    /// One line of geometry, for a feature whose properties are the point of
+    /// the test.
+    fn one_line() -> Vec<u32> {
+        vec![
+            command(1, 1),
+            param(10),
+            param(10),
+            command(2, 1),
+            param(50),
+            param(0),
+        ]
+    }
+
+    /// **The wire's interning survives the parse.** A key two features share
+    /// is one `String` in the layer's table, not one per feature — which is
+    /// the whole of what this representation buys.
+    ///
+    /// Read off the tables directly rather than through a heap figure,
+    /// because a byte count can fall for reasons that have nothing to do with
+    /// sharing. The `assert_ne` beside it is the non-vacuity control: the two
+    /// features must really carry different *values* under that shared key,
+    /// or a parse that collapsed them into one feature would pass.
+    #[test]
+    fn a_key_two_features_share_is_one_string_in_the_layers_table() {
+        let tile = encode_tile(&[(
+            "roads",
+            vec![
+                FeatureSpec {
+                    geom_type: GEOM_LINESTRING,
+                    properties: vec![("kind", Prop::Str("primary"))],
+                    geometry: one_line(),
+                },
+                FeatureSpec {
+                    geom_type: GEOM_LINESTRING,
+                    properties: vec![("kind", Prop::Str("service"))],
+                    geometry: one_line(),
+                },
+            ],
+        )]);
+        let parsed = parse(&tile).expect("the tile parses");
+        let layer = &parsed.layers[0];
+
+        assert_eq!(layer.features.len(), 2, "both features must be decoded");
+        assert_eq!(
+            layer.properties.keys.len(),
+            1,
+            "two features carrying `kind` must share one key string, not hold \
+             {} of them",
+            layer.properties.keys.len()
+        );
+        assert_eq!(
+            layer.properties.tags.len(),
+            2,
+            "one index pair per property, arena-wide"
+        );
+
+        let first = layer
+            .properties
+            .get(layer.features[0].tags, "kind")
+            .expect("the first feature carries `kind`");
+        let second = layer
+            .properties
+            .get(layer.features[1].tags, "kind")
+            .expect("the second feature carries `kind`");
+        assert_ne!(
+            first, second,
+            "non-vacuity: the two features must read different values through \
+             the shared key, or the sharing was never exercised"
+        );
+    }
+
+    /// **A repeated tag key reads as the last one, exactly as the `HashMap`
+    /// did.**
+    ///
+    /// `mvt-reader`'s `parse_tags` resolved a tag list through
+    /// `HashMap::insert`, so a malformed feature naming one key twice kept the
+    /// last value and dropped the first. The arena keeps both pairs in wire
+    /// order, so [`LayerProperties::pair`] reads the window backwards to
+    /// answer the same way. Read it forwards and this test says `"primary"`.
+    ///
+    /// The pair count beside the answer is the control: both writes must be in
+    /// the arena, or "the last one" is the only one and the choice was never
+    /// made.
+    #[test]
+    fn a_repeated_tag_key_reads_as_the_last_one() {
+        let tile = encode_tile(&[(
+            "roads",
+            vec![FeatureSpec {
+                geom_type: GEOM_LINESTRING,
+                properties: vec![
+                    ("kind", Prop::Str("primary")),
+                    ("kind", Prop::Str("service")),
+                ],
+                geometry: one_line(),
+            }],
+        )]);
+        let parsed = parse(&tile).expect("the tile parses");
+        let layer = &parsed.layers[0];
+        let feature = &layer.features[0];
+
+        assert_eq!(
+            feature.tags.len, 2,
+            "both writes must reach the arena, or there is nothing to choose \
+             between"
+        );
+        assert_eq!(
+            layer.properties.get(feature.tags, "kind"),
+            Some(JsonValue::String("service".to_owned())),
+            "a repeated key must read as the last write, as `HashMap::insert` \
+             left it"
+        );
+        assert!(
+            layer.properties.contains_key(feature.tags, "kind"),
+            "and the key is present either way"
+        );
+        assert_eq!(
+            layer.properties.get(feature.tags, "missing"),
+            None,
+            "a key the feature does not carry is absent, not null"
+        );
+    }
+
+    /// **A `Null` a tile really carries is not the same answer as a key it
+    /// does not.** `["get", k]` maps both to JSON `null`, but a bare property
+    /// token in a comparison falls back to the literal string when the key is
+    /// absent — so the two must stay distinguishable at this layer.
+    #[test]
+    fn a_carried_null_is_not_the_same_answer_as_an_absent_key() {
+        let tile = encode_tile(&[(
+            "roads",
+            vec![FeatureSpec {
+                geom_type: GEOM_LINESTRING,
+                properties: vec![("kind", Prop::Null)],
+                geometry: one_line(),
+            }],
+        )]);
+        let parsed = parse(&tile).expect("the tile parses");
+        let layer = &parsed.layers[0];
+        let feature = &layer.features[0];
+
+        assert_eq!(
+            layer.properties.get(feature.tags, "kind"),
+            Some(JsonValue::Null),
+            "a carried MVT null must read as `Some(Null)`"
+        );
+        assert_eq!(
+            layer.properties.get(feature.tags, "absent"),
+            None,
+            "a key the feature does not carry must read as `None`"
+        );
+        assert!(layer.properties.contains_key(feature.tags, "kind"));
+        assert!(!layer.properties.contains_key(feature.tags, "absent"));
+    }
+
+    /// **`heap_bytes` prices the shared tables once for the layer, not once
+    /// per feature.**
+    ///
+    /// The sizer this replaced charged every feature for its own bag, which
+    /// was true of the old shape and would be a fiction of this one: a sizer
+    /// that kept doing it would report a tile at roughly its old cost while
+    /// holding a fraction of it.
+    ///
+    /// The property: adding a feature that carries the *same* key and value as
+    /// one already there must grow the heap by its own geometry, its
+    /// `ParsedFeature` slot and its one index pair — and by no string at all.
+    #[test]
+    fn a_second_feature_sharing_a_property_adds_no_string_to_the_heap() {
+        let spec = || FeatureSpec {
+            geom_type: GEOM_LINESTRING,
+            properties: vec![("kind", Prop::Str("a rather long value string"))],
+            geometry: one_line(),
+        };
+        let one = parse(&encode_tile(&[("roads", vec![spec()])])).expect("parses");
+        let two = parse(&encode_tile(&[("roads", vec![spec(), spec()])])).expect("parses");
+
+        let grew = two.heap_bytes() - one.heap_bytes();
+        let feature_slot = std::mem::size_of::<ParsedFeature>();
+        let pair = std::mem::size_of::<(u32, u32)>();
+        let geometry = geometry_heap_bytes(&one.layers[0].features[0].geometry);
+        assert_eq!(
+            grew,
+            feature_slot + pair + geometry,
+            "a second feature sharing a key and a value grew the heap by \
+             {grew} B, where its slot ({feature_slot}), its index pair \
+             ({pair}) and its geometry ({geometry}) are all it can honestly \
+             cost"
+        );
+        assert!(
+            geometry > 0,
+            "non-vacuity: the shared-nothing part of a feature must be \
+             non-zero, or the sum above is satisfied by counting nothing"
         );
     }
 

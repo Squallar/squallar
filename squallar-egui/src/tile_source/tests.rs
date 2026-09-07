@@ -1486,14 +1486,22 @@ fn the_parsed_entry_cost_is_what_the_fixture_actually_parses() {
 
     let parsed = walkers::mvt::parse(&bytes).expect("the tile parses");
 
-    // A non-triviality floor, against the same fixture facts the styled test
-    // uses: a city-core tile is thousands of features, and a parse whose heap
-    // sits below the styled entry is not holding them.
+    // A non-triviality floor **derived from the input in hand**, not from a
+    // magic number and no longer from the styled entry: a decode holds
+    // coordinates as `f32` pairs and property strings beside their tables, so
+    // it outweighs the varint-packed bytes it came from. A parse that decoded
+    // nothing sits at its layer names and fails this.
+    //
+    // It used to read `> MEASURED_STYLED_ENTRY_BYTES / 2`, which was a fact
+    // about the old parse rather than a floor: the parse was twice the styled
+    // entry and is now under half of it, so that spelling would fail on a
+    // healthy tile.
     let heap = parsed.heap_bytes();
     assert!(
-        heap > super::MEASURED_STYLED_ENTRY_BYTES / 2,
-        "the parse of the fixture's densest tile measures {heap} bytes, which \
-         is too small to be the decode of a city core"
+        heap > bytes.len(),
+        "the parse of the fixture's densest tile measures {heap} bytes against \
+         {} bytes of MVT input, so the count is not reaching the decode",
+        bytes.len()
     );
 
     assert!(

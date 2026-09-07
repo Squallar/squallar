@@ -1009,10 +1009,11 @@ pub const fn mib(n: usize) -> usize {
 /// (the plan's ~1.03 MB had the fills and not the strokes; the band test
 /// re-derived it at 1,462,708), and a typical dense-city entry is ~30 KB. A
 /// **parsed** entry is the style-independent decode a restyle re-tessellates
-/// from, ~1.93 MB at the same tail (`MEASURED_PARSED_TILE_BYTES`, re-derived
-/// at 1,928,874 on 2026-09-07 when the features `Vec` stopped holding two
-/// slots per feature). A
-/// **terrain** entry is one 256x256 RGBA texture, 256 KiB, no tail.
+/// from, **~0.67 MB** at the same tail (`MEASURED_PARSED_TILE_BYTES`, re-derived
+/// at 670,110 on 2026-09-07 — it was ~2.09 MB until the parse stopped expanding
+/// the wire's own interned property tables into a `HashMap` per feature, and
+/// stopped holding two feature slots per feature). A **terrain** entry is one
+/// 256x256 RGBA texture, 256 KiB, no tail.
 ///
 /// **Need and economy.** The tile cache is a byte-bounded LRU with a floor in
 /// entries: the working set the last pass measured (tiles on the glass plus
@@ -1053,12 +1054,27 @@ pub const fn mib(n: usize) -> usize {
 /// (`the_mobile_bracket_promotes_nothing_until_somebody_measures_aarch64`).
 /// Desktop starts at 160/192/64 — 114 tail entries, the user's own window at
 /// the tail (106) with eight to spare, and a parsed cache that restyles the
-/// common 1920x1200 canvas (96 x 1.93 MB = 185 MB, inside 192) wholly from
-/// cache; a 2560x1440 window between zooms (144 entries, 211 MB at the tail)
-/// is the floor's overrun and the step's fit (256 MiB, 183 entries) — and
-/// rises to 512/384/128 on a discrete adapter with a desktop shape, where a
-/// 3840x2160 window between zooms (299 tiles, 437 MB at the tail) fits
-/// without the floor's help.
+/// common 1920x1200 canvas (96 tiles) wholly from cache; a 2560x1440 window
+/// between zooms (144 entries, 211 MB at the styled tail) is the floor's
+/// overrun and the step's fit (256 MiB, 183 entries) — and rises to
+/// 512/384/128 on a discrete adapter with a desktop shape, where a 3840x2160
+/// window between zooms (299 tiles, 437 MB at the tail) fits without the
+/// floor's help.
+///
+/// **The parsed floor has surplus, and the surplus is AVAILABLE, not taken.**
+/// 192 MiB was argued as 96 x 2.09 MB = 201 MB held to 192; at 0.67 MB those
+/// same 96 tiles are **64 MB**, and the floor holds **300** of them. Every
+/// byte figure in this table is deliberately unchanged by that: the parse
+/// getting cheaper is strictly less memory for the same behaviour, and reading
+/// it as licence to keep three times the history would turn a measured saving
+/// into a wash.
+///
+/// Spending it is a product decision and nobody has taken it. What it would
+/// buy is a choice, not an obvious win — the surplus is either kept as history
+/// (more zoom levels restyle from cache, fewer refetches) or left as resident
+/// bytes the process no longer needs. The figures above are the measurement;
+/// the budgets stay where they are until somebody decides, and this comment is
+/// where the decision would be recorded.
 ///
 /// **The host ceilings** (`*_TILE_HOST_CEILING_BYTES`) bound the three at each
 /// rung the way `APP_TEXTURE_BUDGET_BYTES` bounds the GPU sum, and

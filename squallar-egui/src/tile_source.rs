@@ -222,12 +222,10 @@ pub const RASTER_TILE_BYTES: usize = 256 * 256 * 4;
 /// Same tile, same method as [`MEASURED_STYLED_ENTRY_BYTES`]: the committed
 /// Monaco fixture's z14 city-core tile (185,182 MVT bytes), counted at
 /// **capacity** by `walkers::mvt::ParsedTile::heap_bytes` — decoded geometry,
-/// per-feature property bags, key and value strings. Re-derived 2026-09-07 by
+/// the source layers' property tables, and the spine. Re-derived 2026-09-07 by
 /// forcing
 /// `tile_source::tests::the_parsed_entry_cost_is_what_the_fixture_actually_parses`
 /// to fail; the band there is the derivation, this line is only its record.
-/// **Larger than the styled entry**, which is why the parsed cache has its own
-/// byte allowance beside the styled one's rather than sharing it.
 ///
 /// **It has been measured three times and fallen twice, and the composition is
 /// why**, because each fall is a fixed defect rather than a re-count:
@@ -236,17 +234,21 @@ pub const RASTER_TILE_BYTES: usize = 256 * 256 * 4;
 /// |---|---:|---|
 /// | 2026-08-29, first | 29,903,162 | — |
 /// | 2026-08-29, after shrinking | 2,092,002 | `mvt-reader` grew every ring at `Vec::with_capacity(<whole feature's command count>)`, so geometry capacity was 28.1 MB for 318 KB of shrunk content; `walkers::mvt::parse` shrinks per feature |
-/// | 2026-09-07 | 1,928,874 | the features `Vec` was collected **in place** out of the decode's own buffer, so every layer held two `ParsedFeature` slots per feature — 163,128 B of slack, 7.8% of the tile |
+/// | 2026-09-07 | 1,928,874 | the features `Vec` was collected **in place** out of the decode's own buffer, so it held two `ParsedFeature` slots per feature: 163,128 B of slack, 7.8% |
+/// | 2026-09-07 | 670,110 | the per-feature `HashMap<String, Value>` property bags — **1,447,103 B, 69.2% of the tile** — became per-layer interned tables plus an eight-byte index span per feature, which is how the wire carries them in the first place |
 ///
-/// What that leaves, on that tile: 1,260,671 B of per-feature property bags —
-/// 2,913 features, 14,303 properties, a `HashMap` apiece — 186,432 of the
-/// `Arc` and `HashMap` headers over them, 317,736 of geometry, 163,128 of
-/// feature spine and 907 of layers and names.
+/// What is left, on that tile: **317,736 B of geometry** (47.4%), **188,227 of
+/// properties** (28.1% — 73,803 of shared key and value tables over 14 source
+/// layers, 114,424 of index pairs over 14,303 properties), **163,128 of
+/// feature spine** (24.3%), and 1,019 of layers and names. It is now **under
+/// half the styled entry** rather than twice it; the parsed cache keeps its
+/// own byte allowance because it is a separate population, not because it is
+/// the larger one.
 ///
 /// Like its styled sibling: re-derive it by forcing the test's band to fail,
 /// never by inference from a type's field list — the band cannot catch this
 /// constant drifting upward into a safe over-estimate.
-pub const MEASURED_PARSED_TILE_BYTES: usize = 1_928_874;
+pub const MEASURED_PARSED_TILE_BYTES: usize = 670_110;
 
 /// A basemap styling: the built style, and the key that built it.
 ///

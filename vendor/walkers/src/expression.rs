@@ -40,7 +40,7 @@ pub enum Error {
     UnmatchedCaseOrMatch(Value),
 }
 
-/// The property bag a feature's expressions resolve against.
+/// The properties a feature's expressions resolve against.
 ///
 /// A vector tile hands its properties over in `mvt_reader`'s own value type,
 /// and the whole bag used to be converted to JSON before a single expression
@@ -49,18 +49,27 @@ pub enum Error {
 /// style reads one or two keys out of that bag, or none at all -- filters
 /// reject most features before any paint expression looks at them.
 ///
-/// So `Mvt` keeps mvt-reader's map exactly as it arrives, moved rather than
-/// rebuilt, and converts a value only when a lookup asks for it. `Json` is the
-/// bag a caller supplies directly, which is what [`Context::new`] still takes.
+/// So `Mvt` names the properties where the tile already put them and converts
+/// a value only when a lookup asks for it. `Json` is the bag a caller supplies
+/// directly, which is what [`Context::new`] still takes.
 ///
-/// `Mvt` is behind an `Arc` because one parsed tile ([`crate::mvt::ParsedTile`])
-/// is styled many times — every style layer visiting the source layer builds a
-/// `Context` per feature, and a consumer re-styling a cached parse does it all
-/// again — so the bag is shared rather than cloned per `Context`. The lookups
-/// read through the `Arc` unchanged.
+/// **What `Mvt` names is the layer's tables, not this feature's bag.** The
+/// wire interns properties per source layer — a `keys` table, a `values`
+/// table, and per-feature indices into both — and since 2026-09-07 the parse
+/// keeps them that way; see [`crate::mvt::LayerProperties`] for the
+/// measurement. `tags` is this feature's window into the layer's arena.
+///
+/// The tables are behind an `Arc` for the same reason the bag was: one parsed
+/// tile ([`crate::mvt::ParsedTile`]) is styled many times — every style layer
+/// visiting the source layer builds a `Context` per feature, and a consumer
+/// re-styling a cached parse does it all again. It is still **one**
+/// `Arc::clone` per `Context`, because it is one allocation for the layer.
 pub(crate) enum Properties {
     Json(HashMap<String, Value>),
-    Mvt(Arc<HashMap<String, mvt_reader::feature::Value>>),
+    Mvt {
+        properties: Arc<crate::mvt::LayerProperties>,
+        tags: crate::mvt::TagSpan,
+    },
 }
 
 impl Properties {
@@ -69,16 +78,14 @@ impl Properties {
     fn get(&self, key: &str) -> Option<Value> {
         match self {
             Properties::Json(properties) => properties.get(key).cloned(),
-            Properties::Mvt(properties) => {
-                properties.get(key).map(crate::mvt::mvt_value_to_json_value)
-            }
+            Properties::Mvt { properties, tags } => properties.get(*tags, key),
         }
     }
 
     fn contains_key(&self, key: &str) -> bool {
         match self {
             Properties::Json(properties) => properties.contains_key(key),
-            Properties::Mvt(properties) => properties.contains_key(key),
+            Properties::Mvt { properties, tags } => properties.contains_key(*tags, key),
         }
     }
 }

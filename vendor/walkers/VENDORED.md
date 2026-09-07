@@ -2616,6 +2616,182 @@ capacity against length for every layer of the fixture, with the fixture's
 seven features counted beside it so that a parse which decoded nothing cannot
 satisfy the equalities. Shown red against the tree before this commit.
 
+### Changed — source, thirty-third commit: the property bag stops being expanded per feature
+
+`src/mvt.rs` and `src/expression.rs`, plus one additive method in
+`vendor/mvt-reader` (its `VENDORED.md`, change 7).
+
+**A Mapbox Vector Tile already interns its properties.** A `Layer` message
+carries `keys: Vec<String>` and `values: Vec<Value>` and each feature's `tags`
+is a flat list of indices into them, so a key a thousand features share is one
+string on the wire. `mvt-reader`'s `parse_tags` expanded that into one
+`HashMap<String, Value>` per feature with an owned key `String` per property —
+it threw the interning away — and since the twenty-first commit the parse
+*kept* the result, behind an `Arc`, for as long as the tile was cached.
+
+#### What it cost, measured
+
+Re-derived from the wire by decoding the committed Monaco z14 8529/5974
+fixture (185,182 MVT bytes) and reproducing `ParsedTile::heap_bytes()` term by
+term. It reproduces the recorded 2,092,002 **to the byte**, which is what makes
+the split below a measurement rather than an apportionment:
+
+| term | bytes | share |
+| --- | ---: | ---: |
+| property bags (`properties_heap_bytes`) | 1,260,671 | 60.3% |
+| per-feature `Arc` header + `HashMap` header (2,913 x 64) | 186,432 | 8.9% |
+| **properties, total** | **1,447,103** | **69.2%** |
+| geometry (215,016 of coordinates, 102,720 of ring spine) | 317,736 | 15.2% |
+| features `Vec` spine (at 2x length — the previous commit) | 326,256 | 15.6% |
+| layers `Vec` and layer names | 907 | 0.0% |
+| **total** | **2,092,002** | |
+
+14 source layers, 2,913 features, 14,303 properties — a `HashMap` apiece,
+20,876 `(String, Value)` slots between them, and 237,747 B of key and value
+strings, against the **166 keys and 1,848 values** the layers' own tables hold.
+
+A note on the figure this table corrects: the doc on
+`MEASURED_PARSED_TILE_BYTES` read "1,400,495 B of per-feature property bags",
+and the bags are **1,260,671**. The difference, 139,824, is exactly
+`2,913 x 48` — the features `Vec`'s in-place-collect slack, which that
+apportionment charged to the bags. The gated total was right; the split was
+not.
+
+#### What replaced it
+
+`ParsedLayer` holds an `Arc<LayerProperties>` — three boxed slices, the
+layer's `keys`, its `values`, and one arena of every feature's
+`(key index, value index)` pairs back to back — and `ParsedFeature` holds an
+eight-byte `TagSpan` into that arena and no property heap of its own.
+
+| term | bytes |
+| --- | ---: |
+| shared key and value tables, 14 layers | 73,803 |
+| tag arena, 14,303 pairs x 8 B | 114,424 |
+| **properties, total** | **188,227** |
+
+**1,447,103 -> 188,227, an 87.0% cut**, and the parsed tile goes
+**2,092,002 -> 670,110, a 68.0% cut** with the previous commit's 163,128
+included. `MEASURED_PARSED_TILE_BYTES` follows, re-derived from its band.
+
+It also removes allocations rather than only bytes: the properties of one tile
+were **2,913 `HashMap`s plus 14,303 key `String`s plus a `String` per
+string-valued property**; they are now **14 x (3 boxed slices + one `Arc`)
+plus 166 key `String`s**. That is peak as well as resident, which is the half
+that matters on wasm32 — see `vendor/mvt-reader/VENDORED.md` on what an
+infallible allocation against a 1 GiB module ceiling does to a browser tab.
+
+`(u32, u32)` and not `(u16, u16)`, deliberately. The wire type for a tag is
+`uint32`; a `u16` pair would be 4 bytes instead of 8 and would save a further
+57,212 B on this tile (2.7%), and it would need a refusal or a fallback for a
+layer with more than 65,535 keys or values. A truncating index does not draw
+nothing, it draws the **wrong** label, and this directory has paid for a
+lenient guard downstream of an upstream disagreement before. The saving is not
+worth buying that with.
+
+#### The lookup, which is the cost
+
+`Properties::get` and `contains_key` were a hash of the key and a probe. They
+are now a scan of the feature's own pairs, comparing `keys[pair.0]` against the
+query string. Measured over the fixture's 2,913 features the bags are small —
+median **3** pairs, mean **4.9**, longest **42** — and most comparisons fail on
+length before a byte is read.
+
+**It is faster, and the measurement is the gate rather than a footnote.**
+Release profile, rustc 1.97.1, the Monaco z14 8529/5974 city core under the
+committed `dark` style at zoom 14, min of 61 per round, three rounds per pass
+and **two independent passes** so the spread is build-to-build and not
+round-to-round. `StyledCursor::visited` reports **23,836** style-layer visits
+on both trees, which is the control that says the walk did not change:
+
+| | `styled`, six samples (ms) | per style-layer visit |
+| --- | --- | ---: |
+| before (`HashMap`) | 4.7679 4.8129 4.7821 / 4.7275 4.7707 4.7576 | 198.3-201.9 ns |
+| after (interned) | 4.4499 4.4805 4.4801 / 4.3933 4.4441 4.4024 | 184.3-188.0 ns |
+
+**The two ranges do not overlap** — the slowest `after` sample (4.4805) is
+below the fastest `before` one (4.7275) — so the −6.8%, −13.7 ns per visit, is
+outside the noise rather than inside it. `parse` moves the same way and further:
+**1.7221-1.7756 ms to 1.0521-1.1111, −39%**.
+
+Said plainly, because it is the answer somebody needs and not a table to read:
+**the indexed lookup does not cost anything at paint time. It is cheaper.**
+
+#### Where the scan does lose, measured rather than reasoned
+
+The end-to-end figure already contains every feature of the real tile, so
+nothing below is extrapolated from it — this is the mechanism, not the claim.
+One release binary, both representations, same content, ns per lookup:
+
+| bag | probe | interned | `HashMap` |
+| ---: | --- | ---: | ---: |
+| 1 | first / last / miss (length) / miss (deep) | 8.34 / 8.42 / 1.89 / 2.69 | 12.77 / 12.82 / 7.66 / 7.33 |
+| **3** (median) | | 11.56 / 7.97 / 2.72 / 5.88 | 13.16 / 12.95 / 7.58 / 7.36 |
+| 5 (mean 4.9) | | 14.86 / 7.96 / 3.36 / 9.29 | 13.17 / 12.95 / 7.58 / 7.58 |
+| 8 | | 19.91 / 7.96 / 4.37 / 14.41 | 13.03 / 12.76 / 7.56 / 9.52 |
+| **42** (longest) | | 78.60 / 8.00 / 17.14 / 73.47 | 13.09 / 12.90 / 7.62 / 7.62 |
+
+Two probes for a miss because one of them flatters the scan and saying so is
+the point: `miss (length)` differs in length from every key and fails on the
+length check without reading a byte; `miss (deep)` is the same length as every
+key and differs only in its last byte, which is the worst input a scan can be
+handed. The honest miss figure is the second.
+
+* **At the median bag of 3 the interned form is faster at every probe
+  position**, miss included, which is why the tile-wide figure moves the way it
+  does. The scan reads the window backwards, so `last` is O(1) and flat at ~8 ns
+  whatever the bag holds.
+* **The crossover is a bag of about 5 to 8**, and only for a key written early
+  in the bag or a deep miss.
+* **The tail is real and bounded**: a 42-property feature probed adversarially
+  costs about **+65 ns** on that one visit. The fixture's 2,913 features are
+  median 3 and mean 4.9; **78 of them (2.7%) carry more than 8 properties and
+  exactly one carries 42**. That is why a 6x worst case leaves the tile 6.8%
+  faster, and it is the reason the tile-wide number is the one to quote.
+
+The refcount traffic does not move: it was one `Arc::clone` per `Context`
+before and it is one now, because the tables are one allocation for the whole
+layer rather than one per feature.
+
+#### Behaviour held, not assumed
+
+* **The golden did not move and no recording was touched.**
+  `rendering_the_fixture_reproduces_the_recorded_shapes_exactly` and
+  `one_parse_styled_under_two_styles_matches_the_fused_path_for_both` pass
+  unedited. Property *iteration order* never reached output — the only readers
+  were `get` and `contains_key` — which is why a `HashMap` with a random
+  iteration order could be replaced by an ordered arena without the output
+  moving.
+* **A repeated tag key still reads as the last one.** `parse_tags` resolved a
+  malformed feature naming one key twice through `HashMap::insert`, so the last
+  write won. The arena keeps both pairs in wire order and `LayerProperties::pair`
+  reads its window **backwards**, which is what preserves that.
+  `a_repeated_tag_key_reads_as_the_last_one` pins it and reads `"primary"` if
+  the scan is turned around.
+* **`None` and `Some(Null)` stay different answers.** `["get", k]` maps both to
+  JSON `null`, but a bare property token in a comparison falls back to the
+  literal string only when the key is *absent*.
+  `a_carried_null_is_not_the_same_answer_as_an_absent_key` pins both.
+* **`Context::new` keeps its exact signature** — `(&'static str,
+  HashMap<String, serde_json::Value>, u8)` — so `Properties::Json` and every
+  caller outside this directory (`squallar-egui/src/ui_map_overlays.rs`,
+  `squallar-egui/tests/committed_styles_parse.rs`, and the 22 inline
+  expression tests) are untouched.
+* **`heap_bytes` prices the tables once per layer**, and
+  `a_second_feature_sharing_a_property_adds_no_string_to_the_heap` is the
+  assertion that it does: a second feature carrying the same key and value
+  grows the tile by its `ParsedFeature` slot, its one index pair and its own
+  geometry, and by no string. A sizer that kept charging per feature would
+  report a tile at roughly its old cost while holding a fraction of it.
+* **`heap_bytes` is now exact.** It carried one estimate-from-below — hashbrown
+  keeps a slot and a control byte per *bucket* while only `capacity()`, the
+  usable seven-eighths, is observable — and that term is gone with the map it
+  priced. A `Box<[T]>` has no capacity beyond its length.
+
+**Test count: `cargo test -p walkers --features mvt --lib -- --list` reports
+137**, from **133** before the previous commit — one test new there and four
+here. (102 at the twenty-third commit; the rest landed between.)
+
 ## rustfmt
 
 `cargo fmt -p walkers -- --check` is clean over this directory as vendored,
