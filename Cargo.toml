@@ -14,6 +14,7 @@ members = [
     "squallar-web",
     "squallar-egui",
     "squallar-icon",
+    "squallar-car",
     "squallar-radar",
     "squallar-netcdf",
     "squallar-overlays",
@@ -164,6 +165,7 @@ squallar-overlays = { path = "squallar-overlays" }
 squallar-radar = { path = "squallar-radar" }
 squallar-source = { path = "squallar-source" }
 squallar-units = { path = "squallar-units" }
+squallar-car = { path = "squallar-car" }
 squallar-volumetric = { path = "squallar-volumetric" }
 squallar-web = { path = "squallar-web" }
 squallar-worker = { path = "squallar-worker" }

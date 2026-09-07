@@ -1,0 +1,18 @@
+# Apple compiled asset catalogs (`Assets.car`), written on Linux.
+#
+# Its own crate because it is a file format, not an icon concern: nothing in
+# here knows what an SVG is. `squallar-icon` renders the pixels and calls this
+# to wrap them; anything else that ever needs a catalog -- a launch image, a
+# colour set -- would call it the same way. The format was recovered from
+# catalogs compiled by Apple's own actool and checked against Apple's own
+# reader; every literal in src/lib.rs names the reference catalog and byte
+# offset it was read from.
+[package]
+name = "squallar-car"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# The rendition pixel compression. Pure Rust; the reference encoder is Apple's
+# C library, and this one produces streams Apple's reader decodes byte-exactly.
+lzfse_rust = "=0.2.1"

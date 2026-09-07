@@ -16,7 +16,7 @@ name: squallar
 options:
   bundleIdPrefix: dev.mcswain
   deploymentTarget:
-    iOS: "14.0"
+    iOS: "15.0"
   createIntermediateGroups: true
 settings:
   base:
@@ -28,7 +28,7 @@ targets:
   squallar:
     type: application
     platform: iOS
-    deploymentTarget: "14.0"
+    deploymentTarget: "15.0"
     sources:
       - path: Sources
       # Apple's privacy manifest. `make -C packaging/ios` copies this to the

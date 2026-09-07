@@ -2790,6 +2790,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lzfse_rust"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5edeac3ec657925dececc672bdd58fa2212291886ddcb3e08aa46924c78340c6"
+
+[[package]]
 name = "mach2"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4872,6 +4878,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "squallar-car"
+version = "0.1.0"
+dependencies = [
+ "lzfse_rust",
+]
+
+[[package]]
 name = "squallar-device-profile"
 version = "0.1.0"
 dependencies = [
@@ -4960,6 +4973,7 @@ version = "0.1.0"
 dependencies = [
  "png",
  "resvg",
+ "squallar-car",
 ]
 
 [[package]]

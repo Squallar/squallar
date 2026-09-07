@@ -4,14 +4,15 @@
 //! `squallar/build.rs` calls this for the window icon and the Windows `.ico`,
 //! and the packaging steps call the binary for the rest.
 //!
-//! The two container formats here — ICO and ICNS — are written directly rather
-//! than handed to a converter. That is not enthusiasm for byte-twiddling: the
-//! converter this replaced silently wrote a **one-image** `.icns` out of ten
-//! inputs, which would have left Finder a single size to scale everything from.
-//! Both formats are a header and a directory in front of PNG payloads, so
-//! owning them costs less than checking whether a tool got them right, and the
-//! two rules that actually bite are pinned by the tests at the bottom of this
-//! file.
+//! The container formats here — ICO and ICNS in this file, Apple's compiled
+//! asset catalog in `squallar-car` — are written directly rather than handed to a
+//! converter. That is not enthusiasm for byte-twiddling: the converter this
+//! replaced silently wrote a **one-image** `.icns` out of ten inputs, which
+//! would have left Finder a single size to scale everything from, and the
+//! catalog's compiler ships only inside Xcode. ICO and ICNS are a header and a
+//! directory in front of PNG payloads, so owning them costs less than checking
+//! whether a tool got them right, and the two rules that actually bite are
+//! pinned by the tests at the bottom of this file.
 
 use resvg::tiny_skia::{Pixmap, Transform};
 use resvg::usvg::{Options, Tree};
@@ -86,6 +87,19 @@ impl Icon {
     /// takes. Raw rather than PNG so the runtime needs no decoder.
     pub fn rgba(&self, px: u32) -> Vec<u8> {
         self.render(px).data().to_vec()
+    }
+
+    /// Render at `px` as raw BGRA8, straight colour, rows top-down: the pixel
+    /// layout an asset catalog's `ARGB` rendition holds (see `squallar_car`).
+    pub fn bgra(&self, px: u32) -> Vec<u8> {
+        self.render(px)
+            .pixels()
+            .iter()
+            .flat_map(|p| {
+                let c = p.demultiply();
+                [c.blue(), c.green(), c.red(), c.alpha()]
+            })
+            .collect()
     }
 
     /// Render into a `px`-square canvas with the drawing inset to `fraction` of

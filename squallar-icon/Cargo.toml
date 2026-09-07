@@ -25,3 +25,4 @@ edition.workspace = true
 [dependencies]
 resvg = "=0.48.1"
 png = "=0.18.1"
+squallar-car = { workspace = true }

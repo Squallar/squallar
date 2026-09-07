@@ -3,7 +3,7 @@
 //! Called by the packaging steps, one flag per target:
 //!
 //!     cargo run -p squallar-icon -- --web       squallar-web/icons
-//!     cargo run -p squallar-icon -- --ios       packaging/ios/AppIcon.appiconset
+//!     cargo run -p squallar-icon -- --ios       packaging/ios/build/linux/iphoneos/squallar.app
 //!     cargo run -p squallar-icon -- --icns      packaging/macos/build/squallar.icns
 //!     cargo run -p squallar-icon -- --ico       packaging/windows/squallar.ico
 //!     cargo run -p squallar-icon -- --android   packaging/android/app/src/main/res
@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
+use squallar_car::{APP_ICON, Xcode, assets_car};
 use squallar_icon::{ICNS_MEMBERS, ICO_SIZES, Icon, icns, ico};
 
 /// The web set. Names match what `squallar-web/index.html` links and what
@@ -59,8 +60,8 @@ const HICOLOR: [u32; 7] = [16, 22, 24, 32, 48, 128, 256];
 /// Exactly two, and exactly these two, because that is what Apple's own
 /// `actool` emits next to the catalog it compiles: `AppIcon60x60@2x.png` at 120
 /// and `AppIcon76x76@2x~ipad.png` at 152. Read off a real compile rather than
-/// guessed -- `actool` was run over this project's own AppIcon.appiconset and
-/// these are the files it produced.
+/// guessed -- `actool` was run over a one-image `AppIcon.appiconset` of this
+/// icon and these are the files it produced.
 ///
 /// A larger loose set does NOT help. Thirteen of them shipped in the bundle
 /// root and App Store Connect still returned 90022 and 90023, because the
@@ -70,21 +71,8 @@ const HICOLOR: [u32; 7] = [16, 22, 24, 32, 48, 128, 256];
 /// `(file name without .png, pixels)`.
 const IOS_LOOSE: [(&str, u32); 2] = [("AppIcon60x60@2x", 120), ("AppIcon76x76@2x~ipad", 152)];
 
-const IOS_CONTENTS: &str = r#"{
-  "images" : [
-    {
-      "filename" : "AppIcon.png",
-      "idiom" : "universal",
-      "platform" : "ios",
-      "size" : "1024x1024"
-    }
-  ],
-  "info" : {
-    "author" : "squallar",
-    "version" : 1
-  }
-}
-"#;
+/// The edge of the one image an iOS icon catalog is compiled from.
+const IOS_CATALOG_EDGE: u32 = 1024;
 
 const ANDROID_ADAPTIVE_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
@@ -105,6 +93,28 @@ fn main() -> Result<(), String> {
         std::fs::read(&svg_path).map_err(|e| format!("reading {}: {e}", svg_path.display()))?;
     let icon = Icon::parse(&svg)?;
 
+    // `--xcode VERSION:BUILD` is read first, wherever it appears, because it
+    // is not a target: it is the identity the iOS catalog claims, and it has
+    // to be the same Xcode the Makefile stamps into Info.plist. Required for
+    // `--ios` rather than defaulted, so there is exactly one place that
+    // knows which Xcode shipped the SDK -- the Makefile's SDK-keyed table --
+    // and this binary cannot quietly disagree with it.
+    let xcode: Option<(String, String)> = match args.iter().position(|a| a == "--xcode") {
+        None => None,
+        Some(at) => {
+            let spec = args.get(at + 1).ok_or_else(|| {
+                "--xcode takes VERSION:BUILD, e.g. --xcode 26.4:17E192".to_string()
+            })?;
+            let (v, b) = spec
+                .split_once(':')
+                .filter(|(v, b)| !v.is_empty() && !b.is_empty())
+                .ok_or_else(|| {
+                    format!("--xcode takes VERSION:BUILD, e.g. --xcode 26.4:17E192; got {spec:?}")
+                })?;
+            Some((v.to_string(), b.to_string()))
+        }
+    };
+
     let mut i = 0;
     while i < args.len() {
         let (flag, dest) = match (args.get(i), args.get(i + 1)) {
@@ -112,8 +122,24 @@ fn main() -> Result<(), String> {
             _ => return Err(usage()),
         };
         match flag {
+            "--xcode" => {}
             "--web" => web(&icon, &dest)?,
-            "--ios" => ios(&icon, &dest)?,
+            "--ios" => {
+                let (version, build) = xcode.as_ref().ok_or_else(|| {
+                    "--ios needs --xcode VERSION:BUILD: the catalog names the Xcode that \
+                     compiled it, and it must match the DTXcode/DTXcodeBuild the Makefile \
+                     writes into Info.plist (packaging/ios/Makefile, the SDK-keyed table)."
+                        .to_string()
+                })?;
+                ios(
+                    &icon,
+                    &dest,
+                    &Xcode {
+                        version: version.as_str(),
+                        build: build.as_str(),
+                    },
+                )?
+            }
             "--icns" => macos(&icon, &dest)?,
             "--ico" => windows(&icon, &dest)?,
             "--android" => android(&icon, &dest)?,
@@ -126,7 +152,7 @@ fn main() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: squallar-icon (--web|--ios|--icns|--ico|--android|--hicolor) PATH ...\n\
+    "usage: squallar-icon [--xcode VERSION:BUILD] (--web|--ios|--icns|--ico|--android|--hicolor) PATH ...\n\
      \n\
      Writes one platform's icons from packaging/icon/squallar.svg. Several\n\
      targets may be given in one run. Nothing written here is committed."
@@ -159,20 +185,22 @@ fn web(icon: &Icon, dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn ios(icon: &Icon, bundle: &Path) -> Result<(), String> {
-    // Loose PNGs at the bundle root, plus the source catalog beside them.
-    //
-    // The catalog is written but NOT compiled: `actool` is Xcode-only, so
-    // there is no `Assets.car` here and the loose files are what the bundle
-    // actually ships. The `.appiconset` is kept because it is the input any
-    // future compile would take, and because it is where the 1024 marketing
-    // icon belongs.
+fn ios(icon: &Icon, bundle: &Path, xcode: &Xcode) -> Result<(), String> {
+    // The compiled catalog at the bundle root, and the two loose PNGs actool
+    // writes beside it. The catalog is what App Store Connect reads the icon
+    // out of; `squallar_car` says how it is put together without Xcode.
     for (name, px) in IOS_LOOSE {
         write(&bundle.join(format!("{name}.png")), &icon.png(px))?;
     }
-    let catalog = bundle.join("AppIcon.appiconset");
-    write(&catalog.join("AppIcon.png"), &icon.png(1024))?;
-    write(&catalog.join("Contents.json"), IOS_CONTENTS.as_bytes())
+    let (name, identifier) = APP_ICON;
+    let catalog = assets_car(
+        name,
+        identifier,
+        IOS_CATALOG_EDGE,
+        &icon.bgra(IOS_CATALOG_EDGE),
+        xcode,
+    );
+    write(&bundle.join("Assets.car"), &catalog)
 }
 
 fn macos(icon: &Icon, path: &Path) -> Result<(), String> {

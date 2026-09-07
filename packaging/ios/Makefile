@@ -388,7 +388,7 @@ build:
 	  # host macOS build is 25E236. DTXcode is Xcode's version with the dot
 	  # removed and a trailing zero, which is Apple's own spelling: 26.4 ->
 	  # 2640.
-	  23E237) XCODE_BUILD=17E192; DTXCODE=2640; MACHINE_OS_BUILD=25E236 ;;
+	  23E237) XCODE_VERSION=26.4; XCODE_BUILD=17E192; DTXCODE=2640; MACHINE_OS_BUILD=25E236 ;;
 	  *)
 	    echo "ERROR: the image's iPhoneOS SDK has build $$SDK_BUILD, and this"
 	    echo "       Makefile has no row for it, so it cannot say which Xcode"
@@ -426,14 +426,21 @@ build:
 	# Info.plist it carries no build settings to expand. Absent, App Store
 	# Connect rejects the upload with ITMS-91053 (Missing API declaration).
 	# One source for both bundles; see the file's own header.
-	# The app icon, rendered from packaging/icon/squallar.svg into an asset
-	# catalog. No raster of the icon is committed; see squallar-icon.
+	# The app icon, rendered from packaging/icon/squallar.svg into a compiled
+	# asset catalog (Assets.car) plus the two loose PNGs actool writes beside
+	# one. No raster of the icon is committed, and no Xcode is involved:
+	# squallar-icon writes the catalog itself (see squallar-icon/src/car.rs).
 	#
 	# App Store Connect refuses a bundle with no icon three ways at once --
 	# 90022 (no 120x120), 90023 (no 152x152) and 90713 (no CFBundleIconName) --
-	# and the third of those is why a catalog rather than loose PNGs: an app
-	# built against the iOS 11 or later SDK has to name one.
-	cargo run -q -p squallar-icon -- --ios "$$APP"
+	# and it reads the sizes out of the COMPILED catalog, which is why the loose
+	# pair alone was not enough: an app built against the iOS 11 or later SDK
+	# has to name a catalog icon, and the catalog has to hold it.
+	# --xcode carries the SAME row that wrote DTXcode/DTXcodeBuild above into
+	# the catalog's own Xcode claim, so the bundle makes one claim, not two.
+	cargo run -q -p squallar-icon -- --xcode "$$XCODE_VERSION:$$XCODE_BUILD" --ios "$$APP"
+	test -s "$$APP/Assets.car" \
+	    || { echo "ERROR: the icon renderer wrote no Assets.car, the compiled catalog App Store Connect reads the icon sizes from (errors 90022, 90023, 90713)."; exit 1; }
 	test -s "$$APP/AppIcon60x60@2x.png" \
 	    || { echo "ERROR: the icon renderer wrote no AppIcon60x60@2x.png, which is the 120x120 error 90022 asks for."; exit 1; }
 	test -s "$$APP/AppIcon76x76@2x~ipad.png" \
