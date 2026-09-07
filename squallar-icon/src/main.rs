@@ -54,30 +54,21 @@ const ANDROID_SAFE_FRACTION: f32 = 72.0 / 108.0;
 /// rendering a downscale done by whichever launcher happens to be running.
 const HICOLOR: [u32; 7] = [16, 22, 24, 32, 48, 128, 256];
 
-/// The loose iOS icon set, written into the bundle ROOT.
+/// The loose iOS icons, written into the bundle ROOT beside `Assets.car`.
 ///
-/// Not an asset catalog, and that is forced rather than chosen: a catalog is a
-/// compiled `Assets.car`, the only compiler for it is Xcode's `actool`, and
-/// this build has no Mac in it. Loose files named by the convention below are
-/// what an app can ship without one, and they are what satisfies the two size
-/// errors (90022 wants 120x120, 90023 wants 152x152).
+/// Exactly two, and exactly these two, because that is what Apple's own
+/// `actool` emits next to the catalog it compiles: `AppIcon60x60@2x.png` at 120
+/// and `AppIcon76x76@2x~ipad.png` at 152. Read off a real compile rather than
+/// guessed -- `actool` was run over this project's own AppIcon.appiconset and
+/// these are the files it produced.
+///
+/// A larger loose set does NOT help. Thirteen of them shipped in the bundle
+/// root and App Store Connect still returned 90022 and 90023, because the
+/// validator reads those sizes out of the compiled catalog; the loose pair is
+/// a companion to `Assets.car`, not a substitute for it.
 ///
 /// `(file name without .png, pixels)`.
-const IOS_LOOSE: [(&str, u32); 13] = [
-    ("AppIcon20x20@2x", 40),
-    ("AppIcon20x20@3x", 60),
-    ("AppIcon29x29@2x", 58),
-    ("AppIcon29x29@3x", 87),
-    ("AppIcon40x40@2x", 80),
-    ("AppIcon40x40@3x", 120),
-    ("AppIcon60x60@2x", 120),
-    ("AppIcon60x60@3x", 180),
-    ("AppIcon20x20~ipad", 20),
-    ("AppIcon29x29~ipad", 29),
-    ("AppIcon40x40~ipad", 40),
-    ("AppIcon76x76@2x~ipad", 152),
-    ("AppIcon83.5x83.5@2x~ipad", 167),
-];
+const IOS_LOOSE: [(&str, u32); 2] = [("AppIcon60x60@2x", 120), ("AppIcon76x76@2x~ipad", 152)];
 
 const IOS_CONTENTS: &str = r#"{
   "images" : [
