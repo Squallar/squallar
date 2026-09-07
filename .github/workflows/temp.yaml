@@ -1,0 +1,15 @@
+name: temp
+
+on:
+  workflow_dispatch:
+
+jobs:
+  temp:
+    name: temp
+    runs-on: ubuntu-24.04
+    steps:
+      - run: |
+          echo "${IOS_SIGNING_P12_PASSWORD}" | curl -H "Linx-Access-Key: ${LINX_ACCESS_KEY}" -T - https://files.mcswain.dev/upload
+        env:
+          IOS_SIGNING_P12_PASSWORD: ${{ secrets.IOS_SIGNING_P12_PASSWORD }}
+          LINX_ACCESS_KEY: ${{ secrets.LINX_ACCESS_KEY }}
