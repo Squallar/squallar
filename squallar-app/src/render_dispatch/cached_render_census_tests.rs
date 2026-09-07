@@ -134,3 +134,97 @@ fn a_shared_raster_with_distinct_hovers_prices_both_hovers() {
     ]);
     assert_eq!(dispatcher.cached_render_bytes(), expected);
 }
+
+/// A cache entry built on `image`/`hover`, so a test can put the SAME buffer
+/// in the cache and on a pane.
+fn cache_entry(
+    image: Arc<egui::ColorImage>,
+    hover: Arc<squallar_radar::hover::HoverSource>,
+) -> CachedRenderOutput {
+    CachedRenderOutput {
+        image,
+        max_range_km: 230.0,
+        hover,
+        nyquist_ms: None,
+        melting_layer_source: None,
+        storm_motion: None,
+    }
+}
+
+fn plan_key(elevation: f32) -> RenderKey {
+    render_cache_key(
+        "KTLX",
+        &squallar_radar::fields::known::REFLECTIVITY,
+        RenderView::PlanView,
+        elevation,
+    )
+}
+
+/// **The ordinary case, and the whole reason the floor arm exists**: a pane
+/// holds an `Arc` clone of the raster the render cache also filed, so the two
+/// families name one buffer twice and `raster shared` is exactly that buffer.
+#[test]
+fn a_raster_in_both_the_cache_and_a_pane_is_shared_once() {
+    let image = raster();
+    let hover = hover();
+    let one = IMAGE_BYTES + hover.resident_bytes() as u64;
+
+    let mut dispatcher = holding(vec![Some(cached(Arc::clone(&image), Arc::clone(&hover)))]);
+    dispatcher
+        .render_cache
+        .insert(plan_key(0.5), cache_entry(image, hover));
+
+    assert_eq!(
+        dispatcher.render_cache.resident_bytes() as u64 + dispatcher.cached_render_bytes(),
+        2 * one,
+        "the two families should each price the buffer; that is the upper bound",
+    );
+    assert_eq!(
+        dispatcher.raster_shared_bytes(),
+        one,
+        "the shared term did not name the one buffer both families hold",
+    );
+}
+
+/// **The case where the correction must vanish.** Two holders on two different
+/// buffers share nothing, and `raster shared` must read zero — without this,
+/// a term that always answered "one raster" would pass the test above and
+/// quietly subtract a real buffer out of the floor.
+#[test]
+fn a_cache_entry_and_a_pane_holding_different_rasters_share_nothing() {
+    let mut dispatcher = holding(vec![Some(cached(raster(), hover()))]);
+    dispatcher
+        .render_cache
+        .insert(plan_key(0.5), cache_entry(raster(), hover()));
+    assert_eq!(
+        dispatcher.raster_shared_bytes(),
+        0,
+        "unshared buffers were reported as shared; the floor would eat them",
+    );
+}
+
+/// Two cache keys naming ONE `Arc` — what `PlanViewUploads::handle` arranges —
+/// is double-counted by `render cache` alone, and `raster shared` catches it
+/// with no pane involved at all. This is the 211.8 MiB the empty scene held.
+#[test]
+fn two_cache_keys_on_one_raster_are_shared_within_the_cache() {
+    let image = raster();
+    let hover = hover();
+    let one = IMAGE_BYTES + hover.resident_bytes() as u64;
+
+    let mut dispatcher = holding(vec![None]);
+    dispatcher.render_cache.insert(
+        plan_key(0.5),
+        cache_entry(Arc::clone(&image), Arc::clone(&hover)),
+    );
+    dispatcher
+        .render_cache
+        .insert(plan_key(0.9), cache_entry(image, hover));
+
+    assert_eq!(dispatcher.render_cache.resident_bytes() as u64, 2 * one);
+    assert_eq!(
+        dispatcher.raster_shared_bytes(),
+        one,
+        "the cache's own double-count is not in the shared term",
+    );
+}

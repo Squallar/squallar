@@ -105,11 +105,11 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// record as pixels — so by the same rule it takes its 16 characters and
 /// `16 + 25 = 41` back out: 1062 - 41 = 1021.
 /// `cached renders` is 14 characters, so it adds `14 + 25 = 39`: 1021 + 39 =
-/// 1060. This chain is a DERIVATION and not a record: every term in it moves
+/// 1060, and `rasters shared` is 14 too: 1060 + 39 = 1099. This chain is a DERIVATION and not a record: every term in it moves
 /// when a family is added or removed, so re-derive it rather than nudging the
 /// constant, and let `the_widest_line_fits_the_hooks_buffer` be the check.
 /// That test asserts `<=`, so a constant that is too LARGE passes quietly.
-pub const CENSUS_LINE_CAPACITY: usize = 1060;
+pub const CENSUS_LINE_CAPACITY: usize = 1099;
 
 /// One family's level. A `u64` of bytes, `Relaxed` throughout: every reader
 /// wants a recent figure, none wants a synchronised one, and a census torn
@@ -204,6 +204,41 @@ families! {
          VMA read 1,083,985,920 B against `render pools` 867,184,704 B, and \
          the 216,796,176 B difference is exactly `side * side * 4` at the \
          7362 px raster the pools were sized for.";
+    RASTER_SHARED_BYTES, raster_shared_bytes, set_raster_shared_bytes,
+        "**Bytes `render cache` and `cached renders` BOTH name** - the \
+         correction term that turns their sum into a range, and NOT a holder \
+         of anything. Left out of [`Census::resident_total`] for that reason, \
+         the way the two GPU families are: nothing on this heap is these \
+         bytes a second time, they are one allocation two families counted. \
+         Two sources of sharing, and it measures both rather than bounding \
+         them: a pane's `cached_render` is usually an `Arc` clone of a live \
+         `render cache` entry's image, and `RenderCache` prices its entries \
+         one at a time while several keys can hold ONE `Arc` - which is what \
+         `PlanViewUploads::handle` exists to arrange, so it is the ordinary \
+         case and not an edge. \
+         A MEASURED UNION, not a `max`: the app walks both holders and adds \
+         each distinct `Arc` once, which the radar families cannot do because \
+         their holders are spread across three crates. So \
+         [`Census::raster_floor`] is exact where [`Census::radar_floor`] is a \
+         bound. \
+         **THE QUESTION IT ANSWERS**, said exactly, because a wider one is \
+         easy to read into it: *how much do `render cache` and `cached \
+         renders` name twice between them*. It is NOT the wider question of \
+         how much of this heap's raster bytes are double-counted. A THIRD \
+         family holds the same `Arc`s while a raster is banding - `upload \
+         pending`, which is handed `Arc::clone(&render.image)` by \
+         `apply_render_to_pane` and keeps it until the last band lands - and \
+         this walk cannot see it: `TextureUploads` lives in `squallar_gpu` \
+         and the dispatcher that does the walk cannot reach it. So while an \
+         upload is in flight the pair's floor is right and the CENSUS's floor \
+         is still an over-estimate; see [`Census::resident_floor`]. \
+         Measured, empty steady scene, 2026-09-07: `render cache` read \
+         444,156,192 B for 39 ticks - exactly two entries at 222,078,096 B - \
+         while the allocator held one buffer. Evicting the first freed 0 B \
+         and the second freed 204.0 MiB, which is how the sharing was found. \
+         The census over-reported by 211.8 MiB for 80 s and `unaccounted` \
+         under-reported by the same, on the one scene precise enough \
+         (~1.5 MiB) for that to be the whole story.";
     RENDER_IN_FLIGHT_BYTES, render_in_flight_bytes, set_render_in_flight_bytes,
         "Finished plan-view rasters between the render thread and the frame \
          thread: the `ColorImage` a render's reply built, priced at its \
@@ -248,7 +283,26 @@ families! {
     UPLOAD_PENDING_BYTES, upload_pending_bytes, set_upload_pending_bytes,
         "Images the renderer is still banding to the GPU. A band crosses \
          ~4 MiB a frame where no staging ring exists - which is every browser \
-         - so a picture is held whole for as many frames as it has bands.";
+         - so a picture is held whole for as many frames as it has bands. \
+         Already DE-DUPLICATED WITHIN ITSELF: `publish_pending_level` sweeps \
+         the queue distinct by `Arc::ptr_eq`, so two bands of one image are \
+         one charge. It was the only family here that did that, and `render \
+         cache` is the one that did not - the pattern was in the tree and \
+         unadopted, which is how 211.8 MiB of phantom survived. \
+         It OVERLAPS the two raster families while a radar raster is in \
+         flight: the `Arc` it holds is the one `apply_render_to_pane` handed \
+         `ctx.load_texture`, which is the same `Arc` `render cache` and \
+         `cached renders` hold. `raster shared` does NOT span it, so a reader \
+         adding all three has counted one buffer three times. \
+         **A LEVEL, SAMPLED.** It is maintained per frame off `apply` and \
+         `free`, so it is right at every instant - but the census line is \
+         written every 2 s, and on both FLOOR legs a 206.75 MiB raster \
+         crossed this queue between two samples and it read 0 B at all 100 \
+         ticks. `gpu textures` went 2,097,152 -> 218,893,332 B in one tick \
+         and never moved again. The instrument is not blind - it reads 44 \
+         distinct non-zero values up to 569,465,072 B at the E2 scene - so \
+         its zero answers *what is pending right now* and must never be \
+         quoted against *does this scene ever hold upload bytes*.";
     TILE_BODY_BYTES, tile_body_bytes, set_tile_body_bytes,
         "Undecoded vector-tile bodies the wasm-only body cache is holding. \
          Zero on every native target, where the cache does not exist.";
@@ -425,6 +479,26 @@ impl Census {
             .saturating_add(self.chunk_feed_bytes)
     }
 
+    /// **The two plan-view raster families, summed as an upper bound.**
+    ///
+    /// `render cache` and `cached renders` hold `Arc`s of the same images, so
+    /// a raster both name is counted twice here. [`Self::raster_floor`] is
+    /// the other end, and unlike [`Self::radar_floor`] it is exact.
+    pub fn raster_total(&self) -> u64 {
+        self.render_cache_bytes
+            .saturating_add(self.cached_render_bytes)
+    }
+
+    /// **The same two families with the sharing taken out**: the bytes the
+    /// allocator actually granted for the rasters those two hold.
+    ///
+    /// Exact, not a bound. `raster shared` is a measured union rather than
+    /// the largest-member floor [`Self::radar_floor`] has to settle for, so
+    /// where the radar families give a range this gives the figure.
+    pub fn raster_floor(&self) -> u64 {
+        self.raster_total().saturating_sub(self.raster_shared_bytes)
+    }
+
     /// **What this census does not account for**, against a real reading of
     /// the instance's linear memory.
     ///
@@ -473,10 +547,19 @@ impl Census {
     /// in place of [`Self::radar_total`]. Every non-radar family is already
     /// documented disjoint from its neighbours, so this end moves only
     /// where the sharing actually is.
+    ///
+    /// **A third overlap is known and NOT corrected**, so this is a floor of
+    /// what the census can see and not of the heap. `upload pending` holds
+    /// the same `Arc<ColorImage>` as the two raster families for as long as a
+    /// raster is banding, and no walk can span all three: `TextureUploads` is
+    /// `squallar_gpu`'s and the raster walk is the app dispatcher's. It was
+    /// 0 B on every FLOOR leg measured and 72.8 MiB at the E2 scene, which is
+    /// the size of the caveat, not a correction to it.
     pub fn resident_floor(&self) -> u64 {
         self.resident_total()
             .saturating_sub(self.radar_total())
             .saturating_add(self.radar_floor())
+            .saturating_sub(self.raster_shared_bytes)
     }
 
     /// **Bytes the allocator says are live that no family here names**, as a
@@ -532,7 +615,8 @@ pub fn write_line<W: core::fmt::Write>(
         out,
         "heap census ({instance}): loop scans {} B, loop l3 {} B, still scans {} B, \
          derive memo {} B, loop frame scans {} B, chunk feed {} B, \
-         render cache {} B, cached renders {} B, render pools {} B, \
+         render cache {} B, cached renders {} B, rasters shared {} B, \
+         render pools {} B, \
          renders in flight {} B, \
          overlay grids {} B, overlay items {} B, overlay parked {} B, loop frames {} B, \
          upload pending {} B, tile bodies {} B, tile parsed {} B, \
@@ -546,6 +630,7 @@ pub fn write_line<W: core::fmt::Write>(
         census.chunk_feed_bytes,
         census.render_cache_bytes,
         census.cached_render_bytes,
+        census.raster_shared_bytes,
         census.render_pool_bytes,
         census.render_in_flight_bytes,
         census.overlay_grid_bytes,

@@ -262,6 +262,12 @@ impl RenderCache {
         self.resident_bytes
     }
 
+    /// The resident entries, for a caller pricing the `Arc`s they share with
+    /// somewhere else. Order is the map's and means nothing.
+    pub fn entries(&self) -> impl Iterator<Item = &CachedRenderOutput> {
+        self.entries.values()
+    }
+
     #[cfg(test)]
     pub fn entry_count(&self) -> usize {
         debug_assert_eq!(
@@ -2347,6 +2353,61 @@ impl RenderDispatcher {
     ///
     /// `render pools` needs nothing here: `heap_census::census()` reads
     /// radar's slot atomics directly.
+    /// **Bytes `render cache` and `cached renders` both name**, measured
+    /// rather than bounded: what the two families publish, less what the
+    /// allocator actually granted for the rasters behind them.
+    ///
+    /// Two sources of double-counting, and this catches both. Across the two
+    /// families: a pane's `cached_render` is an `Arc` clone of the reply the
+    /// cache also filed. Inside `render cache`: several keys can name one
+    /// `Arc`, which is what `PlanViewUploads::handle` exists to arrange, so
+    /// it is the ordinary case. On the empty steady scene the second alone
+    /// was 211.8 MiB — two cache entries, one buffer, and evicting the first
+    /// freed nothing.
+    ///
+    /// The subtraction is saturating and the union is built from the same two
+    /// prices the families publish, so this can never exceed them and a floor
+    /// derived from it can never go below zero.
+    pub fn raster_shared_bytes(&self) -> u64 {
+        let published = self.render_cache.resident_bytes() as u64 + self.cached_render_bytes();
+        published.saturating_sub(self.raster_union_bytes())
+    }
+
+    /// **What the allocator granted for every distinct raster the cache and
+    /// the panes hold between them** — each `Arc` counted once, whichever
+    /// holders name it.
+    ///
+    /// `Vec::contains` over a handful of pointers rather than a `HashSet`:
+    /// the cache is a few entries and `pane_render` a few panes, this runs on
+    /// the 2 s telemetry tick and never on a frame, and the allocation-error
+    /// hook reads the published level rather than this walk.
+    fn raster_union_bytes(&self) -> u64 {
+        let entries = self.render_cache.entries().map(|e| (&e.image, &e.hover));
+        let panes = self
+            .pane_render
+            .iter()
+            .filter_map(|prs| prs.cached_render.as_ref())
+            .map(|c| (&c.image, &c.hover));
+        let mut images: Vec<*const egui::ColorImage> = Vec::new();
+        let mut hovers: Vec<*const squallar_radar::hover::HoverSource> = Vec::new();
+        let mut union = 0u64;
+        for (image, hover) in entries.chain(panes) {
+            let image_ptr = Arc::as_ptr(image);
+            if !images.contains(&image_ptr) {
+                images.push(image_ptr);
+                union = union.saturating_add(
+                    (image.pixels.len() * std::mem::size_of::<egui::Color32>()) as u64,
+                );
+            }
+            let hover_ptr = Arc::as_ptr(hover);
+            if !hovers.contains(&hover_ptr) {
+                hovers.push(hover_ptr);
+                union = union.saturating_add(hover.resident_bytes() as u64);
+            }
+        }
+        union
+    }
+
     /// **What the panes' [`CachedPaneRender`]s are holding**, de-duplicated by
     /// buffer: the `Color32` pixels and the hover field of every distinct
     /// raster some pane has kept for restore.
@@ -2403,6 +2464,7 @@ impl RenderDispatcher {
         );
         squallar_egui::heap_census::set_render_in_flight_bytes(fold);
         squallar_egui::heap_census::set_cached_render_bytes(self.cached_render_bytes());
+        squallar_egui::heap_census::set_raster_shared_bytes(self.raster_shared_bytes());
     }
 
     /// Whether some pane already has **this exact plan view** in flight.

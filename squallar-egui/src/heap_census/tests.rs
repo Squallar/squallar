@@ -14,6 +14,7 @@ fn distinct() -> Census {
         loop_frame_scan_bytes: 16,
         render_cache_bytes: 32,
         cached_render_bytes: 16_777_216,
+        raster_shared_bytes: 33_554_432,
         overlay_grid_bytes: 128,
         overlay_item_bytes: 256,
         overlay_parked_bytes: 512,
@@ -42,15 +43,21 @@ fn distinct() -> Census {
 fn the_resident_total_leaves_the_gpu_families_out() {
     let c = distinct();
     // One distinct power of two per family, so the sum of them all is
-    // `2^24 - 1`. `overlay pictures` was deleted, so its 64 is no longer among
+    // `2^26 - 1`. `overlay pictures` was deleted, so its 64 is no longer among
     // them — subtracted as the gap it is rather than replaced by a new
     // literal, so this stays a derivation and names which family left.
-    let every_family = (1 << 25) - 1 - 64;
+    //
+    // The exclusions are NAMED rather than spelled as their powers: a literal
+    // here goes on passing while pointing at the wrong family after any
+    // renumber, which is exactly what a fixture like this exists to catch.
+    let every_family = (1 << 26) - 1 - 64;
     assert_eq!(
         c.resident_total(),
-        every_family - 524_288 - 4_194_304,
-        "the resident total swept a GPU family in; it is a residual against a \
-         linear-memory `byteLength`, which no device byte is on",
+        every_family - c.tile_mesh_bytes - c.gpu_texture_bytes - c.raster_shared_bytes,
+        "the resident total swept in a family that holds nothing: the two GPU \
+         ones (it is a residual against a linear-memory `byteLength`, which no \
+         device byte is on) or `raster shared`, which is one allocation two \
+         families counted and not a third copy of it",
     );
     assert_eq!(c.radar_total(), 1 + 2 + 4 + 8 + 16 + 8_388_608);
 }
@@ -152,6 +159,7 @@ fn the_widest_line_fits_the_hooks_buffer() {
         loop_frame_scan_bytes: u64::MAX,
         render_cache_bytes: u64::MAX,
         cached_render_bytes: u64::MAX,
+        raster_shared_bytes: u64::MAX,
         overlay_grid_bytes: u64::MAX,
         overlay_item_bytes: u64::MAX,
         overlay_parked_bytes: u64::MAX,
@@ -253,21 +261,81 @@ fn the_radar_floor_is_the_largest_holder_and_the_total_is_the_sum() {
 /// nothing else — every other family is documented disjoint, so swapping the
 /// radar end must not move any of them.
 #[test]
-fn the_resident_floor_moves_only_the_radar_families() {
+fn the_resident_floor_moves_only_the_shared_families() {
     let c = distinct();
     assert_eq!(
         c.resident_total() - c.resident_floor(),
-        c.radar_total() - c.radar_floor(),
+        (c.radar_total() - c.radar_floor()) + c.raster_shared_bytes,
         "the floor moved a family that is not shared"
     );
     assert!(c.resident_floor() < c.resident_total());
 
-    // With no radar families at all the two ends are identical.
-    let no_radar = Census {
+    // With nothing shared at either overlap the two ends are identical: one
+    // raster family holding bytes no other family names moves neither end.
+    let unshared = Census {
         render_cache_bytes: 5_000,
         ..Census::default()
     };
-    assert_eq!(no_radar.resident_floor(), no_radar.resident_total());
+    assert_eq!(unshared.resident_floor(), unshared.resident_total());
+}
+
+/// **The raster pair's two ends.** `render cache` and `cached renders` hold
+/// `Arc`s of the same images, so their sum is an upper bound and the floor is
+/// that sum less what they share — measured, not bounded, which is what
+/// separates this pair from the radar families.
+#[test]
+fn the_raster_floor_takes_the_shared_arcs_out() {
+    let both = Census {
+        render_cache_bytes: 5_000,
+        cached_render_bytes: 5_000,
+        raster_shared_bytes: 5_000,
+        ..Census::default()
+    };
+    assert_eq!(both.raster_total(), 10_000, "the upper bound is the sum");
+    assert_eq!(
+        both.raster_floor(),
+        5_000,
+        "the floor kept the buffer twice"
+    );
+    assert_eq!(
+        both.resident_total() - both.resident_floor(),
+        5_000,
+        "the resident range did not carry the raster sharing"
+    );
+}
+
+/// **The case where the correction must dominate**: nothing shared, and the
+/// two ends must not move at all. Without this the subtraction above is
+/// satisfied by a floor that always halves the pair.
+#[test]
+fn two_raster_families_sharing_nothing_move_neither_end() {
+    let disjoint = Census {
+        render_cache_bytes: 5_000,
+        cached_render_bytes: 7_000,
+        raster_shared_bytes: 0,
+        ..Census::default()
+    };
+    assert_eq!(disjoint.raster_total(), 12_000);
+    assert_eq!(
+        disjoint.raster_floor(),
+        12_000,
+        "a floor ate unshared bytes"
+    );
+    assert_eq!(disjoint.resident_floor(), disjoint.resident_total());
+}
+
+/// It refuses to wrap: a `raster shared` larger than the pair it corrects is a
+/// torn read across two adjacent instants, not a negative heap.
+#[test]
+fn the_raster_floor_refuses_to_wrap() {
+    let torn = Census {
+        render_cache_bytes: 1_000,
+        cached_render_bytes: 0,
+        raster_shared_bytes: u64::MAX,
+        ..Census::default()
+    };
+    assert_eq!(torn.raster_floor(), 0);
+    assert_eq!(torn.resident_floor(), 0);
 }
 
 /// **`unaccounted` is a range, and its ends come from the right ends of the
