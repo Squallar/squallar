@@ -547,7 +547,9 @@ impl PlatformBridge for AndroidPlatform {
 
 // ── iOS implementation ──
 //
-// Compass and theme are still the next unit of work and are `None` here.
+// Theme comes off the UIView behind the winit window (`attach_window`), because
+// winit 0.30.13's iOS backend answers `Window::theme` with `None` and never
+// sends `ThemeChanged`. Compass is still the next unit of work and is `None`.
 //
 // There is no insets querier and must not be one: egui-winit already fills
 // `RawInput::safe_area_insets` on iOS. Android's side channel works around a
@@ -561,6 +563,13 @@ pub struct IosPlatform {
     basemap_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
     redraw_waker: RedrawWaker,
+    /// The UIView winit draws into, from the raw window handle, once
+    /// `attach_window` has run. The system appearance is its trait
+    /// collection's `userInterfaceStyle`; see `read_dark_theme`. The app holds
+    /// an `Arc` to the window for its whole life, so the view outlives this.
+    ui_view: Option<std::ptr::NonNull<objc2::runtime::AnyObject>>,
+    /// What the last poll read, so `poll_theme` reports flips and not every tick.
+    theme_edge: squallar_app::platform::ThemeEdge,
 }
 
 #[cfg(target_os = "ios")]
@@ -587,6 +596,8 @@ impl IosPlatform {
             basemap_dir: Self::sandbox_subdir("Library/Caches/squallar/basemap-downloads"),
             config_dir: Self::sandbox_subdir("Library/Application Support/squallar"),
             redraw_waker: RedrawWaker::new(),
+            ui_view: None,
+            theme_edge: squallar_app::platform::ThemeEdge::default(),
         }
     }
 
@@ -594,12 +605,61 @@ impl IosPlatform {
     fn sandbox_subdir(rel: &str) -> Option<std::path::PathBuf> {
         std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(rel))
     }
+
+    /// `UITraitCollection.userInterfaceStyle` of the view winit draws into.
+    /// Two message sends. `None` before `attach_window`, and for a style that
+    /// is neither light nor dark (`UIUserInterfaceStyleUnspecified`).
+    ///
+    /// The view's own trait collection rather than
+    /// `UITraitCollection.currentTraitCollection` (only meaningful inside a
+    /// trait-environment callback) or `UIScreen.mainScreen` (deprecated): the
+    /// view is what UIKit re-traits on a system switch, and it honours any
+    /// `overrideUserInterfaceStyle` set on an ancestor. Called on the loop
+    /// thread, which is UIKit's main thread; both callers are.
+    #[allow(
+        unsafe_code,
+        reason = "two Objective-C message sends on the UIView winit owns"
+    )]
+    fn read_dark_theme(&self) -> Option<bool> {
+        let view = self.ui_view?;
+        // SAFETY: `view` is the UIView behind the winit window the app keeps
+        // alive for its whole run; UIView responds to `traitCollection` with
+        // a UITraitCollection, which responds to `userInterfaceStyle` with an
+        // NSInteger. A nil trait collection messages to 0, which reads as
+        // unspecified below rather than as either appearance.
+        let style: isize = unsafe {
+            let traits: *mut objc2::runtime::AnyObject =
+                objc2::msg_send![view.as_ptr(), traitCollection];
+            objc2::msg_send![traits, userInterfaceStyle]
+        };
+        squallar_app::platform::dark_from_user_interface_style(style)
+    }
 }
 
 #[cfg(target_os = "ios")]
 impl PlatformBridge for IosPlatform {
+    /// Re-read on every tick and report the flips. There is no event to wait
+    /// on: winit's iOS backend never sends `ThemeChanged`, and a
+    /// `traitCollectionDidChange` hook would need a view-controller subclass
+    /// winit owns. One message send per tick on the main thread is cheaper
+    /// than the receiver drain Android does in the same slot.
     fn poll_theme(&mut self) -> Option<bool> {
-        None
+        let now = self.read_dark_theme()?;
+        self.theme_edge.observe(now)
+    }
+
+    fn attach_window(&mut self, window: &winit::window::Window) {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        self.ui_view = match window.window_handle().map(|h| h.as_raw()) {
+            Ok(RawWindowHandle::UiKit(h)) => Some(h.ui_view.cast()),
+            other => {
+                log::error!(
+                    "the iOS window handle is not UiKit ({other:?}); the system \
+                     appearance cannot be read and the theme falls back to light"
+                );
+                None
+            }
+        };
     }
 
     fn poll_heading(&mut self) -> Option<f32> {
@@ -620,10 +680,25 @@ impl PlatformBridge for IosPlatform {
         }
     }
 
-    /// `dark-light` 2.0's iOS arm returns `Mode::Light` unconditionally, so the
-    /// replacement is a `UITraitCollection.userInterfaceStyle` read.
+    /// The synchronous read `App::resolve_theme` falls through to. Light when
+    /// there is nothing to read yet (before `attach_window`) or UIKit says
+    /// unspecified; the first `poll_theme` after the window exists corrects
+    /// a fallback. Loud on the first case, because that failure is invisible:
+    /// this was a literal `false` until 2026-09-07 and every iOS build
+    /// resolved the System theme to Light.
     fn detect_dark_theme(&self) -> bool {
-        false
+        match self.read_dark_theme() {
+            Some(dark) => dark,
+            None => {
+                if self.ui_view.is_none() {
+                    log::warn!(
+                        "no window attached yet, so the iOS appearance cannot be read; \
+                         assuming light until the first poll"
+                    );
+                }
+                false
+            }
+        }
     }
 
     fn set_back_handler(&mut self, handler: fn()) {
@@ -734,4 +809,45 @@ pub fn create_platform() -> AndroidPlatform {
 #[cfg(target_os = "ios")]
 pub fn create_platform() -> IosPlatform {
     IosPlatform::new()
+}
+
+#[cfg(test)]
+mod ios_theme_source_tests {
+    /// The iOS bridge only compiles on iOS, and no host test can hand it a
+    /// UIView. What a host CAN pin is that its two theme entry points are
+    /// reads and not assumptions: until 2026-09-07 `detect_dark_theme` was a
+    /// literal `false` and `poll_theme` a literal `None`, and every iOS build
+    /// resolved the System theme to Light with nothing to fail.
+    #[test]
+    fn the_ios_theme_is_read_off_the_view_not_assumed() {
+        let src = include_str!("platform.rs");
+        let (_, ios) = src
+            .split_once("impl PlatformBridge for IosPlatform")
+            .expect("the iOS bridge impl is no longer in platform.rs");
+        let body = |name: &str| -> &str {
+            let (_, rest) = ios
+                .split_once(name)
+                .unwrap_or_else(|| panic!("{name} is no longer on the iOS bridge"));
+            rest.split_once("\n    }")
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{name} has no recognisable body"))
+        };
+        let detect = body("fn detect_dark_theme(&self) -> bool {");
+        assert!(
+            detect.contains("self.read_dark_theme()"),
+            "iOS detect_dark_theme no longer reads the view's trait collection: {detect}"
+        );
+        let poll = body("fn poll_theme(&mut self) -> Option<bool> {");
+        assert!(
+            poll.contains("self.read_dark_theme()") && poll.contains("theme_edge.observe"),
+            "iOS poll_theme no longer reads the view and reports flips: {poll}"
+        );
+        let (_, reader) = src
+            .split_once("fn read_dark_theme(&self) -> Option<bool> {")
+            .expect("the iOS trait-collection reader is gone");
+        assert!(
+            reader.contains("userInterfaceStyle") && reader.contains("traitCollection"),
+            "read_dark_theme no longer asks UIKit for userInterfaceStyle"
+        );
+    }
 }

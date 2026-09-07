@@ -480,6 +480,16 @@ pub trait PlatformBridge {
     /// Poll for theme changes from the OS. `Some(is_dark)` on a change.
     fn poll_theme(&mut self) -> Option<bool>;
 
+    /// Hand the bridge the window once it exists; `App::create_window` calls
+    /// this right after it stores the window. Nothing by default. iOS keeps
+    /// the UIView behind the window, because that is where the system
+    /// appearance lives (`UITraitCollection.userInterfaceStyle` of a view)
+    /// and winit's iOS backend gives the app nothing else: 0.30.13 answers
+    /// `Window::theme` with `None` ("`Window::theme` is ignored on iOS") and
+    /// never sends `WindowEvent::ThemeChanged`. Until this existed every iOS
+    /// build resolved the System theme to Light.
+    fn attach_window(&mut self, _window: &winit::window::Window) {}
+
     /// Poll for compass heading updates. Returns degrees (0–360) if available.
     fn poll_heading(&mut self) -> Option<f32>;
 
@@ -731,12 +741,69 @@ pub trait PlatformBridge {
     }
 }
 
+/// `UIUserInterfaceStyle` as UIKit numbers it: 0 unspecified, 1 light,
+/// 2 dark. `None` for unspecified and for any value UIKit has not defined,
+/// so a caller falls back rather than reading a future style as one of the
+/// two it knows.
+pub fn dark_from_user_interface_style(style: isize) -> Option<bool> {
+    match style {
+        1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
+}
+
+/// Turns a value read on every tick into the change events
+/// [`PlatformBridge::poll_theme`] reports. The first observation is reported
+/// too: before it the app had no reading from this source and may have
+/// resolved the theme from a fallback, and `adopt_theme` is a no-op when the
+/// value it is handed is the one it already holds.
+#[derive(Debug, Default)]
+pub struct ThemeEdge {
+    last: Option<bool>,
+}
+
+impl ThemeEdge {
+    /// `Some(now)` when `now` differs from the last observation (or there was
+    /// none), `None` when nothing changed.
+    pub fn observe(&mut self, now: bool) -> Option<bool> {
+        if self.last == Some(now) {
+            None
+        } else {
+            self.last = Some(now);
+            Some(now)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // No test here can build a `winit::Window`; what `App` puts in the slot is
     // pinned by a source probe in `app.rs`.
+
+    /// UIKit's three defined values and two it has not defined.
+    #[test]
+    fn user_interface_style_maps_only_the_two_defined_appearances() {
+        assert_eq!(dark_from_user_interface_style(0), None, "unspecified");
+        assert_eq!(dark_from_user_interface_style(1), Some(false), "light");
+        assert_eq!(dark_from_user_interface_style(2), Some(true), "dark");
+        assert_eq!(dark_from_user_interface_style(3), None, "undefined, above");
+        assert_eq!(dark_from_user_interface_style(-1), None, "undefined, below");
+    }
+
+    /// A poll reports the first reading, then only flips, in both directions.
+    #[test]
+    fn theme_edge_reports_the_first_reading_and_every_flip() {
+        let mut edge = ThemeEdge::default();
+        assert_eq!(edge.observe(true), Some(true), "first reading is reported");
+        assert_eq!(edge.observe(true), None, "same reading is silent");
+        assert_eq!(edge.observe(true), None, "still silent");
+        assert_eq!(edge.observe(false), Some(false), "dark to light");
+        assert_eq!(edge.observe(false), None);
+        assert_eq!(edge.observe(true), Some(true), "light to dark");
+    }
 
     /// `Arc<AtomicUsize>` because the slot's contents must be `Send + Sync`.
     fn counting_wake(waker: &RedrawWaker) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {

@@ -3048,6 +3048,9 @@ impl App {
         #[cfg(not(target_arch = "wasm32"))]
         let _ = window.request_inner_size(PhysicalSize::new(RENDER_WIDTH, RENDER_HEIGHT));
         self.window = Some(window.clone());
+        // The bridge sees the window once it exists: iOS reads the system
+        // appearance off the view behind it (`PlatformBridge::attach_window`).
+        self.platform.attach_window(&window);
 
         let held = Some(window.clone());
         self.redraw_waker.install(move || notify_redraw(&held));
