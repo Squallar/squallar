@@ -3,11 +3,12 @@ nexrad-level3/src/decode/mod.rs	97	57
 nexrad-level3/src/decode/radial.rs	488	327
 nexrad-level3/src/decode/symbology.rs	195	172
 nexrad-level3/src/model/header.rs	219	217
+nexrad-level3/src/model/mod.rs	70	48
 nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
 squallar-alloc/src/lib.rs	63	62
 squallar-alloc/src/process.rs	167	165
-squallar-app/src/app.rs	1709	1237
+squallar-app/src/app.rs	1707	1237
 squallar-app/src/app_chunks.rs	227	109
 squallar-app/src/app_fetch.rs	1999	1467
 squallar-app/src/app_offline.rs	31	30
@@ -18,11 +19,11 @@ squallar-app/src/budget_memo.rs	52	52
 squallar-app/src/budget_telemetry.rs	668	664
 squallar-app/src/channels.rs	68	62
 squallar-app/src/frame_ledger.rs	1262	1156
-squallar-app/src/frame_need.rs	68	68
+squallar-app/src/frame_need.rs	66	66
 squallar-app/src/frame_pump.rs	27	27
 squallar-app/src/input.rs	138	127
 squallar-app/src/location_hint.rs	82	51
-squallar-app/src/loop_frame_store.rs	157	139
+squallar-app/src/loop_frame_store.rs	161	150
 squallar-app/src/loop_pool.rs	382	378
 squallar-app/src/loop_refill.rs	97	90
 squallar-app/src/loop_telemetry.rs	50	50
@@ -30,7 +31,7 @@ squallar-app/src/platform.rs	473	380
 squallar-app/src/platform_double.rs	349	329
 squallar-app/src/pressure.rs	200	192
 squallar-app/src/recovery.rs	105	104
-squallar-app/src/render_dispatch.rs	1327	1226
+squallar-app/src/render_dispatch.rs	1413	1306
 squallar-app/src/render_key.rs	27	27
 squallar-app/src/site_catalogue.rs	36	29
 squallar-app/src/site_positions.rs	56	52
@@ -62,7 +63,7 @@ squallar-device-profile/src/scene.rs	313	313
 squallar-egui/src/actions.rs	91	43
 squallar-egui/src/admission.rs	244	224
 squallar-egui/src/basemap_archive.rs	525	485
-squallar-egui/src/basemap_archive/block_cache.rs	297	260
+squallar-egui/src/basemap_archive/block_cache.rs	297	261
 squallar-egui/src/basemap_areas.rs	239	204
 squallar-egui/src/basemap_download.rs	994	846
 squallar-egui/src/basemap_layer.rs	196	182
@@ -77,7 +78,7 @@ squallar-egui/src/gui/layer_glue.rs	425	414
 squallar-egui/src/gui/probes.rs	97	97
 squallar-egui/src/gui/state.rs	185	182
 squallar-egui/src/gui/sync.rs	290	284
-squallar-egui/src/heap_census.rs	207	197
+squallar-egui/src/heap_census.rs	217	207
 squallar-egui/src/input_fidelity.rs	141	141
 squallar-egui/src/input_harness.rs	1485	1475
 squallar-egui/src/legend_ramp.rs	146	146
@@ -98,7 +99,7 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	306	268
 squallar-egui/src/tile_mesh/ledger.rs	77	46
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	1542	1475
+squallar-egui/src/tile_source.rs	1542	1476
 squallar-egui/src/tile_source/byte_lru.rs	272	271
 squallar-egui/src/tile_source/cache_ledger.rs	178	138
 squallar-egui/src/tile_source/snap.rs	157	157
@@ -132,8 +133,8 @@ squallar-egui/src/ui_stack.rs	510	486
 squallar-egui/src/ui_statusbar.rs	382	369
 squallar-egui/src/ui_timeline.rs	1026	937
 squallar-egui/src/ui_topbar.rs	408	396
-squallar-egui/src/ui_volume_alpha.rs	251	117
-squallar-egui/src/volume_alpha.rs	210	208
+squallar-egui/src/ui_volume_alpha.rs	252	117
+squallar-egui/src/volume_alpha.rs	240	238
 squallar-egui/src/volume_iso.rs	94	94
 squallar-egui/src/volume_view.rs	356	344
 squallar-elevation/src/height.rs	87	87
@@ -271,7 +272,7 @@ squallar-radar/src/hover.rs	65	65
 squallar-radar/src/jobs.rs	594	557
 squallar-radar/src/kdp.rs	247	203
 squallar-radar/src/l3_values.rs	282	281
-squallar-radar/src/level3.rs	188	58
+squallar-radar/src/level3.rs	193	58
 squallar-radar/src/loop_downloads.rs	982	961
 squallar-radar/src/loop_geometry.rs	7	7
 squallar-radar/src/nrot.rs	3232	3175
@@ -299,7 +300,7 @@ squallar-radar/src/vil.rs	364	354
 squallar-radar/src/vild.rs	96	94
 squallar-radar/src/volume_wire.rs	353	324
 squallar-radar/src/volumetric.rs	287	283
-squallar-radar/src/voxel.rs	666	652
+squallar-radar/src/voxel.rs	685	671
 squallar-radar/src/xsect.rs	459	458
 squallar-source/src/feature.rs	19	19
 squallar-source/src/fetch_policy.rs	558	555
