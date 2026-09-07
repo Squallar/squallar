@@ -1710,7 +1710,36 @@ impl App {
         // is what lets `fit_scene` also hand back a held answer so its
         // callers' "did anything move" comparisons compare like with like.
         let budgets = self.texture_ceiling.hold_all(budgets);
+        let render_cache_bytes_before = self.budgets.render_cache_budget_bytes();
         self.budgets = budgets;
+
+        // **The render cache's byte capacity follows the rung.** A cache of
+        // finished rasters is economy, not need: need is what the scene costs
+        // and is never a function of the machine, economy is what is resident
+        // beyond it and the first thing given back under pressure. So the
+        // lever is this — re-applying the capacity the ladder now affords —
+        // and not a rung of its own. Before this line the capacity was written
+        // once, at `RenderDispatcher::new`, and a shed rung left the cache
+        // refilling to the startup figure. Not gated on `self.state`: the
+        // cache is host memory and the device has no say in it. What no
+        // longer fits leaves through the deferred-drop path, never freed here.
+        let render_cache_bytes = budgets.render_cache_budget_bytes();
+        let evicted = self
+            .render
+            .set_render_cache_budget_bytes(render_cache_bytes);
+        if render_cache_bytes != render_cache_bytes_before {
+            log::info!(
+                "the render cache may now hold {} MiB of shared renders, from {}: {} evicted \
+                 at {:?} rung {}",
+                render_cache_bytes / (1024 * 1024),
+                render_cache_bytes_before / (1024 * 1024),
+                evicted.len(),
+                budgets.promotion,
+                budgets.steps_back,
+            );
+        }
+        squallar_worker::offload::discard_each("rebudget-render-cache", evicted);
+
         let Some(state) = self.state.as_mut() else {
             return;
         };
@@ -3443,6 +3472,10 @@ mod gpu_capacity_tests;
 /// reaches nothing.
 #[cfg(test)]
 mod texture_ceiling_tests;
+
+/// A shed rung reaches the render cache's byte capacity.
+#[cfg(test)]
+mod render_cache_rebudget_wiring_tests;
 
 /// What the OS would give this process reaches the capacity in force, on the
 /// arm that had no host figure at all, and is re-read on every tick.

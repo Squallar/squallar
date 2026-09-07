@@ -250,21 +250,9 @@ impl RenderCache {
         }
         self.resident_bytes += bytes;
         self.budgeted_bytes += budgeted;
-        // `budgeted_bytes`, never `resident_bytes`: the capacity is a count of
-        // rasters priced at their pixels, and comparing a figure that also
-        // carries hover fields against it evicts entries the budget had room
-        // for. See [`Self::entry_budget_bytes`].
-        while self.entries.len() > self.capacity
-            || (self.budgeted_bytes > self.byte_capacity && self.entries.len() > 1)
-        {
-            let Some(oldest) = self.recency.pop_front() else {
+        while self.over_capacity() {
+            if self.evict_lru().is_none() {
                 break;
-            };
-            if let Some(gone) = self.entries.remove(&oldest) {
-                self.resident_bytes = self.resident_bytes.saturating_sub(Self::entry_bytes(&gone));
-                self.budgeted_bytes = self
-                    .budgeted_bytes
-                    .saturating_sub(Self::entry_budget_bytes(&gone));
             }
         }
     }
@@ -337,6 +325,66 @@ impl RenderCache {
     #[cfg(test)]
     pub fn recency_order(&self) -> Vec<RenderKey> {
         self.recency.iter().cloned().collect()
+    }
+
+    /// Whether the cache holds more than either capacity allows — **the one
+    /// condition every eviction here answers to**, [`Self::insert`]'s and
+    /// [`Self::set_byte_capacity`]'s alike, so the two cannot disagree about
+    /// what fits.
+    ///
+    /// `budgeted_bytes`, never `resident_bytes`: the capacity is a count of
+    /// rasters priced at their pixels, and comparing a figure that also
+    /// carries hover fields against it evicts entries the budget had room
+    /// for. See [`Self::entry_budget_bytes`]. The `len() > 1` floor keeps an
+    /// entry larger than the whole byte budget resident alone rather than
+    /// evicting everything: a cache that is always empty is a silent way to
+    /// disable pane sharing.
+    fn over_capacity(&self) -> bool {
+        self.entries.len() > self.capacity
+            || (self.budgeted_bytes > self.byte_capacity && self.entries.len() > 1)
+    }
+
+    /// Evict the least-recently-used entry, debit both ledgers for it and
+    /// hand it back owned. `None` once nothing is left to evict.
+    fn evict_lru(&mut self) -> Option<CachedRenderOutput> {
+        loop {
+            let oldest = self.recency.pop_front()?;
+            if let Some(gone) = self.entries.remove(&oldest) {
+                self.resident_bytes = self.resident_bytes.saturating_sub(Self::entry_bytes(&gone));
+                self.budgeted_bytes = self
+                    .budgeted_bytes
+                    .saturating_sub(Self::entry_budget_bytes(&gone));
+                return Some(gone);
+            }
+        }
+    }
+
+    /// **Re-apply the byte budget** — the ladder's lever on this cache when a
+    /// rung is shed. Until this existed the capacity was written once, at
+    /// construction, and a shed rung left the cache refilling to the startup
+    /// figure: memory the ladder had just decided the scene could not afford.
+    ///
+    /// Shrinking evicts least-recently-used first until within the new budget,
+    /// through the same [`Self::over_capacity`] / [`Self::evict_lru`] pair
+    /// [`Self::insert`] evicts through — one accounting path, so this and an
+    /// insert can never keep different sets — and hands the evicted entries
+    /// back owned, for a caller that will free them off the frame thread.
+    /// Raising the budget evicts nothing. The entry-count capacity is not
+    /// touched: it is pinned per class, and only the bytes move with the rung.
+    ///
+    /// The returned entries carry their census bytes ([`Self::entry_bytes`],
+    /// pixels and hover) for whoever prices the discard; what decided they had
+    /// to go is the budgeted figure, as it is for an insert.
+    pub fn set_byte_capacity(&mut self, bytes: usize) -> Vec<CachedRenderOutput> {
+        self.byte_capacity = bytes;
+        let mut evicted = Vec::new();
+        while self.over_capacity() {
+            match self.evict_lru() {
+                Some(gone) => evicted.push(gone),
+                None => break,
+            }
+        }
+        evicted
     }
 }
 
@@ -1204,6 +1252,14 @@ impl RenderDispatcher {
     /// the deferred-drop path rather than free them on the frame thread.
     pub fn clear_render_cache(&mut self) -> (Vec<CachedRenderOutput>, usize) {
         self.render_cache.take_all()
+    }
+
+    /// Re-apply the shared render cache's byte budget after the budget ladder
+    /// moved. Whatever no longer fits comes back owned, least-recently-used
+    /// first, for the same deferred-drop path [`Self::clear_render_cache`]'s
+    /// entries take.
+    pub fn set_render_cache_budget_bytes(&mut self, bytes: usize) -> Vec<CachedRenderOutput> {
+        self.render_cache.set_byte_capacity(bytes)
     }
 
     /// Check if any pane has a render in flight.
@@ -2568,6 +2624,9 @@ mod level3_dispatch_tests;
 
 #[cfg(test)]
 mod render_cache_tests;
+
+#[cfg(test)]
+mod render_cache_rebudget_tests;
 
 #[cfg(test)]
 mod render_invalidation_tests;
