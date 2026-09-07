@@ -512,28 +512,41 @@ impl LoopDownloadManager {
         self.l3_bytes_cached
     }
 
-    /// Take out every cached volume whose `(site, timestamp)` fails `keep`, and
-    /// hand the removed values back **owned**.
+    /// Take out every cached volume that fails `keep`, and hand the removed
+    /// values back **owned**.
+    ///
+    /// `keep` is asked with the entry's **address** — the `(site, timestamp)`
+    /// it was filed under — **and the volume itself**, because the two do not
+    /// name one clock. A volume a loop downloaded is filed under its S3 key's
+    /// second; one the archive drain filed is under the second it was fetched
+    /// by; one the chunk feed filed is under its own first radial. A caller
+    /// asking an IDENTITY question — "is this the volume a pane is parked on"
+    /// — must answer it off the volume (`crate::types::volume_collected_at`),
+    /// never off the address, or an archive-fetched volume a pane is parked on
+    /// reads as unwanted and is evicted from under it.
     pub fn retain_scans(
         &mut self,
-        keep: impl Fn(&str, &chrono::NaiveDateTime) -> bool,
+        keep: impl Fn(&str, &chrono::NaiveDateTime, &nexrad_model::data::Scan) -> bool,
     ) -> Vec<CachedVolume> {
         let mut removed = Vec::new();
+        let mut gone: Vec<(String, chrono::NaiveDateTime)> = Vec::new();
         self.scan_cache.retain(|site, scans| {
             removed.extend(
                 scans
-                    .extract_if(|ts, _| !keep(site.as_str(), ts))
-                    .map(|(_, volume)| volume),
+                    .extract_if(|ts, (scan, _)| !keep(site.as_str(), ts, scan))
+                    .map(|(ts, volume)| {
+                        gone.push((site.clone(), ts));
+                        volume
+                    }),
             );
             !scans.is_empty()
         });
-        // The prices go by the same predicate, so the total falls by exactly
+        // The prices go by exactly the keys that left, so the total falls by
         // what left rather than by a second walk of the volumes now removed.
-        for (_, price) in self
-            .scan_prices
-            .extract_if(|(site, ts), _| !keep(site.as_str(), ts))
-        {
-            self.scan_bytes_cached = self.scan_bytes_cached.saturating_sub(price);
+        for key in gone {
+            if let Some(price) = self.scan_prices.remove(&key) {
+                self.scan_bytes_cached = self.scan_bytes_cached.saturating_sub(price);
+            }
         }
         removed
     }
@@ -1168,9 +1181,9 @@ mod tests {
             "a gap paired to nothing was charged for bytes it has not got"
         );
 
-        mgr.retain_scans(|_, at| *at == ts(0));
+        mgr.retain_scans(|_, at, _| *at == ts(0));
         assert_eq!(mgr.cached_scan_bytes(), one, "eviction did not subtract");
-        mgr.retain_scans(|_, _| false);
+        mgr.retain_scans(|_, _, _| false);
         assert_eq!(mgr.cached_scan_bytes(), 0, "an emptied cache still priced");
         mgr.retain_l3(|_, _| false);
         assert_eq!(mgr.cached_l3_bytes(), 0);
@@ -1299,7 +1312,7 @@ mod tests {
         mgr.cache_scan("KTLX", ts(0), doomed.clone());
         mgr.cache_scan("KTLX", ts(1), kept.clone());
 
-        let removed = mgr.retain_scans(|_, stamp| *stamp == ts(1));
+        let removed = mgr.retain_scans(|_, stamp, _| *stamp == ts(1));
 
         assert_eq!(removed.len(), 1, "one entry failed the predicate");
         assert!(
@@ -1320,7 +1333,7 @@ mod tests {
         mgr.cache_scan("KTLX", ts(0), volume());
         mgr.cache_scan("KOUN", ts(0), volume());
 
-        let removed = mgr.retain_scans(|site, _| site == "KTLX");
+        let removed = mgr.retain_scans(|site, _, _| site == "KTLX");
 
         assert_eq!(removed.len(), 1);
         assert!(mgr.is_cached("KTLX", &ts(0)));
@@ -1338,7 +1351,7 @@ mod tests {
         mgr.cache_scan("KOUN", ts(0), volume());
         mgr.cache_scan("KOUN", ts(1), volume());
 
-        let removed = mgr.retain_scans(|site, stamp| site == "KOUN" && *stamp == ts(1));
+        let removed = mgr.retain_scans(|site, stamp, _| site == "KOUN" && *stamp == ts(1));
 
         assert_eq!(removed.len(), 2);
         assert!(
@@ -1361,7 +1374,7 @@ mod tests {
         mgr.mark_in_flight("KOUN", ts(5));
         mgr.add_spawned(2);
 
-        let removed = mgr.retain_scans(|_, _| false);
+        let removed = mgr.retain_scans(|_, _, _| false);
 
         assert_eq!(removed.len(), 1, "precondition: the sweep did evict");
         assert!(
@@ -1872,7 +1885,7 @@ mod tests {
         let learned = mgr.site_scan_reserve_bytes("KTLX");
         assert!(learned > 1);
 
-        let dropped = mgr.retain_scans(|_, _| false);
+        let dropped = mgr.retain_scans(|_, _, _| false);
         assert_eq!(dropped.len(), 1, "the fixture was not evicted");
         assert_eq!(
             mgr.cached_scan_bytes(),

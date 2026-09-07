@@ -297,6 +297,29 @@ impl From<ImageBounds> for squallar_geo::PlacedRaster {
     }
 }
 
+/// **When this volume was collected: its first sweep's first radial, to the
+/// millisecond.** `None` for a volume with no radial.
+///
+/// This is the volume's IDENTITY and the one key every store that answers
+/// "is this the volume the pane is parked on" must use — it is what
+/// [`ScanInfo::from_scan`] makes `ScanInfo::timestamp`, what the still
+/// inventory is keyed by, and what the pane's render reads back with.
+///
+/// It is **not** the S3 key's time. An archive key (`KTLX20260907_181234_V06`)
+/// carries the volume header's clock truncated to the second, and the
+/// archive fetches hand that second on as the arrival's `timestamp`; the two
+/// clocks differ on essentially every real volume (measured over the local
+/// corpus, see `App::evict_unneeded_loop_scans`). The key second is an
+/// ADDRESS in the listing — right for planning a download, wrong for asking
+/// whether two holders hold one volume.
+pub fn volume_collected_at(data: &Scan) -> Option<NaiveDateTime> {
+    data.sweeps()
+        .first()
+        .and_then(|s| s.radials().first())
+        .and_then(|r| chrono::DateTime::from_timestamp_millis(r.collection_timestamp()))
+        .map(|dt| dt.naive_utc())
+}
+
 #[derive(Debug, Clone)]
 pub struct ScanInfo {
     /// Where this volume's radar is, and how high.
@@ -464,15 +487,7 @@ impl ScanInfo {
             product_elevations.keys().copied().collect();
         available_products.sort_by_key(|p| p.sort_order());
 
-        let actual_timestamp = data
-            .sweeps()
-            .first()
-            .and_then(|s| s.radials().first())
-            .and_then(|r| {
-                chrono::DateTime::from_timestamp_millis(r.collection_timestamp())
-                    .map(|dt| dt.naive_utc())
-            })
-            .unwrap_or(requested_timestamp);
+        let actual_timestamp = volume_collected_at(data).unwrap_or(requested_timestamp);
 
         let status = format!(
             "Loaded {} products: {}",

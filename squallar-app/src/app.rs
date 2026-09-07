@@ -2851,17 +2851,44 @@ impl App {
         // `settling` still exempts a site whose listing is in flight, for the
         // reason it exempts it from `keep`.
         //
-        let keep_scan = |site: &str, ts: &chrono::NaiveDateTime| {
-            if settling.contains(site)
-                || squallar_radar::loop_downloads::site_needs_decoded_source(site, &live_loops)
-            {
-                keep(site, ts)
-            } else {
-                parked
-                    .iter()
-                    .any(|&(at_site, at)| at_site == site && at == *ts)
-            }
-        };
+        // **`parked` is asked against BOTH of a volume's clocks, because a
+        // pane's own clock may be either one.**
+        //
+        // A volume has an *address* — the `(site, timestamp)` the loop cache
+        // filed it under — and an *identity*, its first radial to the
+        // millisecond (`volume_collected_at`). They are not the same instant:
+        // an archive arrival is filed under the second it was fetched by (the
+        // S3 key's `%H%M%S`), and over the 171 local Archive II volumes the
+        // two are equal on **0 of 171**, a median 437 ms apart.
+        //
+        // Which one a pane parks at depends on where its `scan_info` came
+        // from. The archive drain publishes the volume's own radial time, so
+        // an archive-fetched parked volume matched nothing here and was swept
+        // out from under its pane — re-downloaded and re-decoded by the next
+        // loop into a second whole allocation of a volume the still inventory
+        // was still holding. A pane navigated onto a loop frame carries the
+        // listing key instead, which is the address; and a volume with no
+        // clocked radial has `scan_info.timestamp` fall back to the fetch's
+        // own instant, which is also the address.
+        //
+        // So this is a union and not a replacement: matching either clock
+        // keeps everything the address alone kept and adds the archive case
+        // it missed. A false keep costs one volume that is already resident;
+        // a false drop costs a download, a decode, and a duplicate of a
+        // volume this process is still holding.
+        let keep_scan =
+            |site: &str, ts: &chrono::NaiveDateTime, scan: &nexrad_model::data::Scan| {
+                if settling.contains(site)
+                    || squallar_radar::loop_downloads::site_needs_decoded_source(site, &live_loops)
+                {
+                    keep(site, ts)
+                } else {
+                    let collected = squallar_radar::types::volume_collected_at(scan);
+                    parked.iter().any(|&(at_site, at)| {
+                        at_site == site && (at == *ts || Some(at) == collected)
+                    })
+                }
+            };
         self.loop_mgr.retain_plan_frames(keep);
         squallar_worker::offload::discard_each(
             "evicted-loop-volume",

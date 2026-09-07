@@ -206,6 +206,49 @@ fn two_sites_arrivals_are_two_volumes_on_the_figure() {
     );
 }
 
+/// **The two clocks, and the volume the sweep evicted from under its pane.**
+///
+/// The archive drain files an arrival in the loop cache under the second it
+/// was fetched by (the S3 key's clock), and puts the volume's own first radial
+/// — to the millisecond — on the pane as `scan_info.timestamp`. Those differ
+/// on essentially every real volume. `evict_unneeded_loop_scans` kept "what a
+/// pane is parked at" by comparing the pane's clock against the cache key, so
+/// the parked volume read as unwanted, left the loop cache, and the still
+/// inventory became its sole owner — until the next loop downloaded it again.
+///
+/// Red on the tree before the identity fix; the precondition below is what
+/// makes it about the two clocks rather than about eviction in general.
+#[test]
+fn a_parked_volume_survives_the_loop_sweep_however_the_archive_keyed_it() {
+    let mut app = app_on_site();
+    land_one_archive_volume(&mut app, SITE, at(0));
+
+    let parked_at = app
+        .gui
+        .pane(0)
+        .and_then(|p| p.scan_info.as_ref().map(|i| i.timestamp))
+        .expect("the drain put scan info on the pane");
+    assert_ne!(
+        parked_at,
+        at(0),
+        "fixture: the pane's clock and the fetch's clock coincide, so this \
+         scene cannot show the two-clock defect",
+    );
+    assert!(
+        app.loop_mgr.get_cached(SITE, &at(0)).is_some(),
+        "precondition: the arrival was filed in the loop cache under the fetch clock",
+    );
+
+    app.evict_unneeded_loop_scans();
+
+    assert!(
+        app.loop_mgr.get_cached(SITE, &at(0)).is_some(),
+        "the volume the pane is parked on was evicted from the loop cache \
+         because its key ({}) was compared against the pane's clock ({parked_at})",
+        at(0),
+    );
+}
+
 /// **An auto-poll's latest that is also the site's merge base adds nothing
 /// to `still scans`**: the drain files one `Arc<Scan>` in both, and the level
 /// de-duplicates by allocation, so the third holder is free.

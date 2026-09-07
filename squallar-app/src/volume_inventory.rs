@@ -6,8 +6,17 @@
 //! * **The still** — what a pane's static (non-loop) render draws. Keyed
 //!   `(site, collected-at)`, because two panes on one site are allowed to be
 //!   parked at two different moments and each must draw its own. The moment is
-//!   the pane's own `scan_info.timestamp` — the volume's first radial — so the
-//!   key a reader asks with is the key the writer installed under.
+//!   the pane's own `scan_info.timestamp` — the volume's first radial, by
+//!   [`squallar_radar::types::volume_collected_at`] — so the key a reader asks
+//!   with is the key the writer installed under. **That clock is the volume's
+//!   identity, and it is not the loop download cache's key.** That cache is
+//!   keyed by an *address* — the S3 key's second, which the archive fetches
+//!   hand on as an arrival's `timestamp` — and the two are equal on 0 of the
+//!   171 local Archive II volumes. A pane's own clock may be either one
+//!   depending on where its `scan_info` came from, so
+//!   `App::evict_unneeded_loop_scans` matches a parked volume against both;
+//!   it once compared identity to address alone and swept every
+//!   archive-fetched parked volume out from under its pane.
 //! * **The base** — the most recent *complete* volume for a site, with the
 //!   time its first radial was collected. It is the base of the current merged
 //!   volume ([`squallar_radar::current::resolve`]) that sections, the 3D view
