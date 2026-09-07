@@ -56,9 +56,11 @@ fn the_first_read_asks_the_window() {
     assert_eq!(server.asks.get(), 1, "the first read must reach the window");
 }
 
-/// **The defect this exists for.** Two X11 round trips per frame — measured at
-/// a steady 159 µs on every interact frame — to re-ask a question no event has
-/// answered differently.
+/// **The defect this exists for.** Two X11 round trips per frame — 72.61 µs
+/// per interact frame at 640×480, 462–474 µs at 1920×1080 — to re-ask a
+/// question no event has answered differently. The cost has no single figure
+/// and the saving is not the same number as the removal; [`crate::window_gate`]
+/// carries both.
 #[test]
 fn a_warm_reading_is_served_without_asking_again() {
     let server = Server::new(false, (1920, 1080));
@@ -305,8 +307,9 @@ fn the_scale_factor_change_is_on_the_retiring_side() {
 }
 
 /// **The regression gate on the frame path.** The two queries this cache
-/// replaced were a steady 159 µs on every interact frame; the cheapest way for
-/// them to come back is for somebody to spell one in `handle_redraw` again.
+/// replaced cost 72.61 µs per interact frame at 640×480 and 462–474 µs at
+/// 1920×1080; the cheapest way for them to come back is for somebody to spell
+/// one in `handle_redraw` again.
 ///
 /// Held on the source text because the property is "this call is not made
 /// here", and an absence cannot be observed from inside a call that has
@@ -327,9 +330,10 @@ fn handle_redraw_asks_the_window_nothing() {
         assert!(
             !body.contains(query),
             "`handle_redraw` spells `{query}` again. On X11 that is a \
-             synchronous round trip to the display server on every frame — \
-             the 159 µs floor `WindowGate` exists to remove. Read it off the \
-             gate instead.",
+             synchronous round trip to the display server on every frame, and \
+             it is the cost `WindowGate` exists to remove: 72.61 µs per \
+             interact frame at 640×480, 462–474 µs at 1920×1080. Read it off \
+             the gate instead.",
         );
     }
     assert!(

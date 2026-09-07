@@ -176,10 +176,12 @@ pub struct App {
     state: Option<app_state::AppState>,
     window: Option<WindowRef>,
     /// The two window queries the frame gate below turns on, held rather than
-    /// re-asked: on X11 both are display-server round trips, and re-asking
-    /// them every frame was a steady 159 us floor under every interact frame.
+    /// re-asked: on X11 both are display-server round trips whose cost scales
+    /// with the server's queue depth, not with the frame — 72.61 us per
+    /// interact frame at 640x480, 462-474 us at 1920x1080. Holding them nets
+    /// 49.94 us of that back, which is less than it removes.
     /// Retired by the events that define the answers, never by a clock — see
-    /// [`crate::window_gate`].
+    /// [`crate::window_gate`] for the arm and for why removed and saved differ.
     window_gate: crate::window_gate::WindowGate,
     gui: Gui,
     /// Whether this platform can quit, answered once at startup —
@@ -1140,9 +1142,11 @@ impl App {
         // The same two questions the gate has always asked, off the reading
         // the last window event left standing rather than off the window
         // itself: on X11 both are synchronous round trips to the display
-        // server, and asking them here cost a steady 159 us on EVERY interact
-        // frame. `crate::window_gate` carries which events retire a reading
-        // and why those are the ones that define it.
+        // server, costing 72.61 us per interact frame at 640x480 and
+        // 462-474 us at 1920x1080 — a function of the server's queue depth,
+        // not a per-frame constant. `crate::window_gate` carries which events
+        // retire a reading, why those are the ones that define it, and what
+        // the removal nets once the pump segment is counted.
         let gate = self
             .window
             .as_ref()

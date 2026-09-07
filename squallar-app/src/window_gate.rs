@@ -7,10 +7,48 @@
 //! `is_minimized` is a `GetProperty` of `_NET_WM_STATE` looked up for
 //! `_NET_WM_STATE_HIDDEN`, `inner_size` is a `GetGeometry`
 //! (winit 0.30.13, `platform_impl/linux/x11/window.rs`, `is_minimized` and
-//! `inner_size_physical`). Measured on this box that pair was a **steady
-//! 159 µs on every interact frame** — a floor, not a tail, and about 4 % of a
-//! 4 ms frame spent asking two questions whose answers change only when the
-//! user resizes, hides or restores the window.
+//! `inner_size_physical`). The answers change only when the user resizes,
+//! hides or restores the window, so asking per frame buys nothing at any
+//! resolution — but what the pair costs, and what holding it saves, are two
+//! different numbers and neither is a constant.
+//!
+//! # What the pair costs
+//!
+//! **Not one figure.** An earlier reading of a **steady 159 µs on every
+//! interact frame — a floor, not a tail** is withdrawn: it was one unstated
+//! condition quoted as if it were the property. The same two queries, same
+//! box, same display, same binary, measure
+//!
+//! * **72.61 µs** per interact frame at 640×480, and
+//! * **462–474 µs** at 1920×1080.
+//!
+//! A synchronous round trip is charged for whatever the server already has
+//! queued ahead of the reply, so the cost tracks X connection and server
+//! queue depth rather than sitting under each frame as a per-frame constant.
+//! Quote it with the resolution it was read at, or do not quote it.
+//!
+//! # What removing it saves
+//!
+//! **Also not the same number.** On the 640×480 arm the two round trips took
+//! 72.61 µs out of the gate segment — that segment goes to zero — but
+//! 40.86 µs of it came back in the **pump** segment, 200× that column's floor
+//! in the null control. The net is **49.94 µs per presented interact frame,
+//! 68.8 % of what was removed**, and it holds outside the ledger: cadence
+//! improved 49.4 µs once the null's −9.48 µs bias was subtracted, which
+//! agrees with the service figure.
+//!
+//! The general form is what keeps this from rotting again: **a segment
+//! falling to zero proves the work left that segment, not that its cost left
+//! the frame.** Only a paired whole-frame figure settles that, and any future
+//! reading of this cache owes both halves.
+//!
+//! Two thirds of a real per-frame cost is worth taking and none of this
+//! argues for putting the queries back. The claim was overstated; the cache
+//! is not.
+//!
+//! Arm: Xvfb, 640×480, RTX 3090 via Vulkan, scene A, paired adjacent frames,
+//! medians, n = 5466 presented interact frames against a null control at
+//! n = 5542; the 1920×1080 figure is the same rig at that geometry.
 //!
 //! It is a round trip only on X11. `is_minimized` is `isMiniaturized` on
 //! macOS, `IsIconic` on Windows, and a flat `None` on Wayland, Android and
