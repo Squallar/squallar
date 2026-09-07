@@ -271,7 +271,14 @@ def pkg_metadata(path: str) -> tuple[str, str, str]:
     info = ElementTree.fromstring(raw)
     bundle_id = info.get("identifier")
     short_version = info.get("version")
-    bundle_el = info.find("./bundle-version/bundle")
+    # productbuild writes the bundle's versions on a top-level <bundle> element
+    # and leaves <bundle-version><bundle id=.../> with the id alone (measured
+    # on `productbuild --component`, macOS 25E253, 2026-09-07; mkpkg.sh writes
+    # the same shape). The earlier hand-shaped PackageInfo had the version on
+    # the nested element instead, so both are read, top-level first.
+    bundle_el = info.find("./bundle")
+    if bundle_el is None or not bundle_el.get("CFBundleVersion"):
+        bundle_el = info.find("./bundle-version/bundle")
     build_version = (bundle_el.get("CFBundleVersion")
                      if bundle_el is not None else None)
     missing = [n for n, v in (("identifier", bundle_id),
