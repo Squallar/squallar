@@ -255,7 +255,7 @@ static POOLED_CELLS: std::sync::Mutex<Option<Vec<AtomicU64>>> = std::sync::Mutex
 /// Maintained beside the slot and never derived from it. It is written only
 /// with the slot's own lock in hand — [`park_slot`] stores the capacity where
 /// [`RenderBuffers::recycle`] parks, [`take_slot`] stores zero where
-/// [`RenderBuffers::checkout`] and [`trim_pools`] take — so the level and the
+/// [`RenderBuffers::checkout`] and [`take_pools`] take — so the level and the
 /// slot are never seen to disagree, and [`pooled_bytes`] is a relaxed load
 /// that takes no lock at all. That matters because of how it is read:
 /// `squallar_egui::heap_census::census()` reads [`pooled_bytes`] directly,
@@ -357,7 +357,7 @@ mod demand {
         }
     }
 
-    /// Forget every generation. What [`super::trim_pools`] does to the history
+    /// Forget every generation. What [`super::take_pools`] does to the history
     /// behind the buffers it drops — a caller shedding memory is not asking to
     /// have the same sizes handed straight back.
     pub(super) fn forget() {
@@ -366,6 +366,30 @@ mod demand {
         SEEN.store(0, Relaxed);
         CARRY.store(0, Relaxed);
     }
+}
+
+/// Plan-view renders this process has begun, ever.
+///
+/// **Monotonic and never reset**, which is the whole of its contract: a
+/// reader compares two readings and learns whether a render started between
+/// them. A level that could fall — outstanding renders, say — would have to
+/// be decremented by whatever finishes one, and a render abandoned by a panic
+/// finishes nothing; this cannot get stuck, because the only write is the
+/// increment [`RenderBuffers::new`] makes at the head of every render.
+///
+/// It answers "has a render been dispatched since I last looked". It does not
+/// answer "is one running now": a reader that needs that asks the layer that
+/// dispatched it.
+static RENDERS_BEGUN: AtomicUsize = AtomicUsize::new(0);
+
+/// [`RENDERS_BEGUN`] — one relaxed load, so an idle check can be made on the
+/// frame thread without taking a slot lock, exactly as [`pooled_bytes`] can.
+///
+/// **This instance's own**, like every other figure this module publishes: on
+/// the web the page and the rasterization worker each have their own, and the
+/// worker's is the one that counts renders.
+pub fn renders_begun() -> usize {
+    RENDERS_BEGUN.load(Ordering::Relaxed)
 }
 
 /// The one RGBA texture this process keeps between plan-view renders, and the
@@ -558,29 +582,78 @@ pub fn parked_bytes() -> usize {
     pooled_bytes() + crate::xsect::pooled_bytes()
 }
 
-/// Drop every pooled buffer and forget the demand behind them, so the next
-/// render allocates for exactly what it asks for.
+/// Whatever [`take_pools`] found in the three plan-view slots, on its way to
+/// being freed.
 ///
-/// Three frees and three stores — no work proportional to the buffers' size,
-/// and each slot's lock is held only long enough to move the buffer out, with
-/// the buffers themselves dropped after the guards are released. So it is cheap
-/// enough for a caller that is shedding memory under pressure.
+/// **A carrier and nothing else**: it has no `Drop` of its own, so freeing it
+/// is freeing the three `Vec`s, and the caller decides on which thread that
+/// happens. Every field is `Send`, which is what lets a caller hand the whole
+/// thing to an offload lane.
+pub struct ParkedBuffers {
+    cells: Option<Vec<AtomicU64>>,
+    image: Option<Vec<u8>>,
+    values: Option<Vec<f32>>,
+}
+
+impl ParkedBuffers {
+    /// What freeing this gives back: the same capacities [`pooled_bytes`] was
+    /// reporting for these buffers an instant before they were taken, and zero
+    /// for a slot that was empty.
+    ///
+    /// The figure a caller prices a deferred free at, so the bytes are on some
+    /// family's books for the whole of the hand-off rather than vanishing
+    /// between the slot and the lane.
+    pub fn bytes(&self) -> usize {
+        self.cells
+            .as_ref()
+            .map_or(0, |c| c.capacity() * std::mem::size_of::<AtomicU64>())
+            + self.image.as_ref().map_or(0, Vec::capacity)
+            + self
+                .values
+                .as_ref()
+                .map_or(0, |v| v.capacity() * std::mem::size_of::<f32>())
+    }
+}
+
+/// Empty every pooled slot and forget the demand behind them, **handing the
+/// buffers back to the caller** so the next render allocates for exactly what
+/// it asks for.
 ///
-/// **It has no production caller.** What it covers is the one case the
-/// retention rule cannot see on its own: a session whose last render was a
-/// large one and that then goes quiet, where no later checkout ever arrives to
-/// weigh the buffer against the demand that has since decayed. Reaching it
-/// needs an idle or memory-pressure signal, and this tree has none — the
-/// browser's rasterization worker is message-driven with the job queue held by
-/// the event loop, so "no job pending" is not a fact it can observe.
-pub fn trim_pools() {
+/// Three takes and three stores, and each slot's lock is held only long enough
+/// to move the buffer out — so *this* call is cheap enough for the frame
+/// thread. **Freeing what it answers is not.** Measured on the campaign's
+/// scene, one thread, `std::alloc::System`: the three buffers a 7362 px render
+/// leaves are 867,184,704 B, and dropping them took 18.4–31.7 ms over twelve
+/// samples on an idle box. That is several times a frame at any cadence this
+/// application aims at, which is why this function hands them over rather than
+/// dropping them where it stands — a caller on the frame thread owes them to
+/// an offload lane.
+///
+/// What it covers is the one case the retention rule cannot see on its own: a
+/// session whose last render was a large one and that then goes quiet, where
+/// no later checkout ever arrives to weigh the buffer against the demand that
+/// has since decayed. Reaching it needs an idle signal, and the fact this
+/// module can offer towards one is [`renders_begun`]; the layer that
+/// dispatches renders owns the rest of it.
+pub fn take_pools() -> ParkedBuffers {
     let cells = take_slot(&mut RenderBuffers::pool(), &POOLED_CELL_BYTES);
     let image = take_slot(&mut image_pool(), &POOLED_IMAGE_BYTES);
     let values = take_slot(&mut values_pool(), &POOLED_VALUE_BYTES);
     demand::forget();
-    drop(cells);
-    drop(image);
-    drop(values);
+    ParkedBuffers {
+        cells,
+        image,
+        values,
+    }
+}
+
+/// [`take_pools`], freeing what it answers on the calling thread.
+///
+/// **Never call it from the frame thread**: see the measured cost on
+/// [`take_pools`]. This is for a caller that is already off-frame, and for
+/// tests, which is what every call in this tree is.
+pub fn trim_pools() {
+    drop(take_pools());
 }
 
 impl RenderBuffers {
@@ -590,6 +663,9 @@ impl RenderBuffers {
         // renders *before* this one. See [`Self::carry_ceiling_px`].
         let carry_ceiling_px = demand::high();
         demand::observe(pixels);
+        // The head of every plan-view render, which is what makes
+        // [`RENDERS_BEGUN`] the count it claims to be.
+        RENDERS_BEGUN.fetch_add(1, Ordering::Relaxed);
         Self {
             cells: Self::checkout(pixels, carry_ceiling_px),
             carry_ceiling_px,
@@ -664,7 +740,7 @@ impl RenderBuffers {
     ///
     /// **What the lock covers is one `Option::take` in [`Self::checkout`],
     /// one `is_none` plus a move-assign in [`Self::recycle`], and one
-    /// `Option::take` in [`trim_pools`] — each with the one relaxed store that
+    /// `Option::take` in [`take_pools`] — each with the one relaxed store that
     /// keeps [`POOLED_CELL_BYTES`] in step — and nothing else.**
     fn pool() -> std::sync::MutexGuard<'static, Option<Vec<AtomicU64>>> {
         POOLED_CELLS

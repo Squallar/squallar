@@ -2469,6 +2469,13 @@ impl super::App {
         // climbs hundreds of MB between two ticks the hook's is the one to
         // believe.
         self.publish_heap_census();
+        // **One reading of the idle policy, off the level the call above just
+        // folded.** `render pools` is the largest family on a quiet scene and
+        // the retention rule behind it only runs on a checkout, so a session
+        // that has stopped rendering holds its buffers forever; this is the
+        // tick that notices. See [`crate::render_pool_trim`] — the trim itself
+        // is a `take` and a hand-off to the free lane, never a free here.
+        crate::render_pool_trim::observe_reading(self.render.in_flight_image_bytes() == 0);
         say_telemetry(
             loud,
             &squallar_egui::heap_census::line(

@@ -48,6 +48,8 @@ pub mod pressure;
 pub mod recovery;
 pub mod render_dispatch;
 pub mod render_key;
+/// When a session that has stopped rendering gives its render buffers back.
+pub mod render_pool_trim;
 pub mod site_catalogue;
 pub mod site_positions;
 #[cfg(test)]

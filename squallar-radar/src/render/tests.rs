@@ -3158,7 +3158,7 @@ fn consecutive_gates_tile_with_no_seam() {
 /// the frame thread's telemetry tick and the allocation-error hook, neither
 /// of which may block behind a render's `take`.
 ///
-/// The three guards are taken in the order `trim_pools` takes them; no path in
+/// The three guards are taken in the order `take_pools` takes them; no path in
 /// this module holds two slot locks at once, so nothing can deadlock against
 /// this thread while it holds all three. Other tests in this binary that
 /// render will wait on the locks for the length of the test, which is one
