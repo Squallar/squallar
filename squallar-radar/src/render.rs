@@ -447,6 +447,12 @@ fn checkout_image(pixels: usize) -> Vec<u8> {
     match taken {
         Some(mut image) => {
             image.clear();
+            // `resize` reserves through `Vec::reserve`, which is the AMORTISED
+            // path: an undersized pooled buffer would be doubled rather than
+            // grown to `len`. The same defect `checkout_values` carries, in the
+            // spelling that hides it — there is no arithmetic here to read as
+            // wrong. Exact first, so `resize` finds the room already there.
+            image.reserve_exact(len);
             image.resize(len, 0u8);
             image
         }
@@ -463,7 +469,20 @@ fn checkout_values(pixels: usize) -> Vec<f32> {
         .filter(|values| within_slack(values.capacity(), pixels.max(demand::high())));
     let mut values = taken.unwrap_or_default();
     values.clear();
-    values.reserve_exact(pixels.saturating_sub(values.capacity()));
+    // **`reserve_exact` counts from `len`, and `len` is zero here.** This read
+    // `reserve_exact(pixels.saturating_sub(values.capacity()))`, which on a
+    // just-cleared buffer asks for capacity `0 + (pixels - capacity)` — a
+    // figure the buffer it was measured against already exceeds, so it
+    // no-opped, and the `extend` in `RenderBuffers::into_output` then grew the
+    // buffer through `Vec`'s AMORTISED path, which takes `max(2 * capacity,
+    // need)`. `within_slack` bounds capacity only from above, so an undersized
+    // pooled buffer always passed the filter and always took that path.
+    //
+    // Measured by heaptrack on a real arm: one live 400,040,000 B allocation
+    // here where the exact need was 216,800,000 B — a pooled 50,005,000-value
+    // buffer at 92.3 % of need, doubled to 100,010,000. 84.5 % over, parked,
+    // and held for the rest of the session.
+    values.reserve_exact(pixels);
     values
 }
 
@@ -607,6 +626,14 @@ impl RenderBuffers {
         match pooled {
             Some(cells) => {
                 let mut cells = cells;
+                // As `checkout_image`: `resize_with` grows through the
+                // amortised path and would double an undersized pooled buffer.
+                // **`len`, not `capacity`, is the base** — this buffer is not
+                // cleared, so `reserve_exact(additional)` targets
+                // `len + additional`, and that is what makes `n` the result.
+                // Reading `capacity` here would reintroduce the defect
+                // `checkout_values` had.
+                cells.reserve_exact(n.saturating_sub(cells.len()));
                 cells.resize_with(n, || AtomicU64::new(Self::EMPTY));
                 cells
             }
