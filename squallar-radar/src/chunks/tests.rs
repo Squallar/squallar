@@ -456,6 +456,180 @@ fn digest(a: &mut VolumeAssembler) -> u64 {
     crate::volumetric::tests::fnv1a64(&crate::volumetric::compute_echo_tops(&scan))
 }
 
+/// The address of one cut's radial buffer inside `scan`.
+///
+/// The `Vec<Radial>` behind `Sweep::radials` is one heap allocation, and a
+/// sweep that MOVES carries it unchanged while a sweep that is CLONED gets a
+/// fresh one. Comparing the address is therefore the direct observation of
+/// which of the two happened — and it cannot false-pass in the move
+/// direction, because both paths that copy allocate the new buffer while the
+/// old one is still alive, so the allocator cannot hand back the same
+/// address.
+fn radial_buffer_address(scan: &nexrad_model::data::Scan, elevation: u8) -> usize {
+    scan.sweeps()
+        .iter()
+        .find(|sweep| sweep.elevation_number() == elevation)
+        .unwrap_or_else(|| panic!("the volume carries no cut {elevation}"))
+        .radials()
+        .as_ptr() as usize
+}
+
+/// Feed chunks up to and including the `n`th sealing chunk of the fixture.
+fn assembled_through_seal(n: usize) -> VolumeAssembler {
+    let chunks = golden_chunks();
+    let seal_at = *sealing_positions(&chunks)
+        .get(n)
+        .unwrap_or_else(|| panic!("the golden volume has no seal {n}"));
+    let mut a = VolumeAssembler::new("KTLX", vol(42));
+    for (sequence, kind, contents) in chunks.into_iter().take(seal_at + 1) {
+        a.ingest_contents(sequence, kind, volume_time(), contents);
+    }
+    a
+}
+
+/// **A live site holds ONE volume, and the family prices one.**
+///
+/// The gate on the change of 2026-09-07. Before it, [`VolumeAssembler::snapshot`]
+/// built its `Scan` by deep-cloning every sealed sweep while the assembler went
+/// on owning the originals, so a live site held its volume twice and the level
+/// carried both copies — this delta read about 2x `scan_bytes` and now reads
+/// exactly it.
+///
+/// **Exactly, not approximately**: the sweeps are the same allocations, so
+/// the volume's price after the build is `scan_bytes` of the volume and
+/// nothing else. A test that allowed a tolerance here would pass on a tree
+/// that still copied.
+///
+/// Under [`feed_level_serial::exclusive`] because the level is process-wide
+/// and this binary's other tests move it from other threads.
+///
+/// [`feed_level_serial::exclusive`]: crate::chunks::feed_level_serial::exclusive
+#[test]
+fn a_live_sites_volume_is_priced_once_because_it_exists_once() {
+    let _exclusive = crate::chunks::feed_level_serial::exclusive();
+    let before = feed_bytes() as u64;
+    let mut a = assemble(golden_chunks());
+    let snap = a.snapshot();
+    let one_volume = crate::scan_size::scan_bytes(&snap) as u64;
+    assert!(one_volume > 0, "the fixture assembled nothing to price");
+    assert_eq!(
+        a.staged_bytes + a.cached_bytes,
+        one_volume,
+        "the assembler's own terms price {} B against the one volume it holds \
+         ({one_volume} B)",
+        a.staged_bytes + a.cached_bytes
+    );
+    assert_eq!(
+        feed_bytes() as u64 - before,
+        one_volume,
+        "sealing a volume and handing out its snapshot moved the feed level by \
+         {} B, against one volume of {one_volume} B",
+        feed_bytes() as u64 - before
+    );
+}
+
+/// **A rebuild moves the sweeps it already had.**
+///
+/// The allocation-level statement of the same change: after a later seal, the
+/// cuts already in the built `Scan` are the SAME buffers in the new one. On a
+/// tree that clones them this fails on the address, whatever the level says.
+#[test]
+fn a_rebuild_moves_the_sweeps_it_already_had_rather_than_copying_them() {
+    let mut a = assembled_through_seal(0);
+    let first = a.snapshot();
+    let elevation = first
+        .sweeps()
+        .first()
+        .expect("the first seal put a cut in the volume")
+        .elevation_number();
+    let was = radial_buffer_address(&first, elevation);
+    // The assembler is the only owner now, which is the condition for the move.
+    drop(first);
+
+    let chunks = golden_chunks();
+    let seals = sealing_positions(&chunks);
+    let (first_seal, second_seal) = (seals[0], seals[1]);
+    for (sequence, kind, contents) in chunks
+        .into_iter()
+        .skip(first_seal + 1)
+        .take(second_seal - first_seal)
+    {
+        a.ingest_contents(sequence, kind, volume_time(), contents);
+    }
+    assert!(
+        !a.snapshot_is_warm(),
+        "the second seal did not invalidate, so this proves nothing"
+    );
+    let second = a.snapshot();
+    assert!(
+        second.sweeps().len() > 1,
+        "the rebuild must carry both cuts for the address below to be the \
+         moved one rather than the only one"
+    );
+    assert_eq!(
+        radial_buffer_address(&second, elevation),
+        was,
+        "the cut already in the volume was COPIED into the rebuilt one: its \
+         radial buffer moved, so the site is holding that cut twice"
+    );
+}
+
+/// **The one case that copies is a consumer holding the old volume**, and it
+/// still prices exactly one.
+///
+/// The transient this change trades for: while the bridge, the still
+/// inventory or a pane holds the last snapshot, a rebuild cannot move out of
+/// it and copies for that rebuild alone. What must stay true is that the
+/// assembler prices the volume it now holds — once — and that the volume the
+/// consumer is holding is untouched.
+#[test]
+fn a_rebuild_a_consumer_forced_copies_once_and_still_prices_one_volume() {
+    let _exclusive = crate::chunks::feed_level_serial::exclusive();
+    let mut a = assembled_through_seal(0);
+    let held = a.snapshot();
+    let elevation = held
+        .sweeps()
+        .first()
+        .expect("the first seal put a cut in the volume")
+        .elevation_number();
+    let consumer_address = radial_buffer_address(&held, elevation);
+    let consumer_radials = held.sweeps()[0].radials().len();
+
+    let chunks = golden_chunks();
+    let seals = sealing_positions(&chunks);
+    let (first_seal, second_seal) = (seals[0], seals[1]);
+    for (sequence, kind, contents) in chunks
+        .into_iter()
+        .skip(first_seal + 1)
+        .take(second_seal - first_seal)
+    {
+        a.ingest_contents(sequence, kind, volume_time(), contents);
+    }
+    let rebuilt = a.snapshot();
+
+    assert!(
+        !std::sync::Arc::ptr_eq(&held, &rebuilt),
+        "the rebuild handed back the very `Arc` a consumer is holding"
+    );
+    assert_ne!(
+        radial_buffer_address(&rebuilt, elevation),
+        consumer_address,
+        "the rebuild moved a buffer out of a volume somebody else is still \
+         holding, which would leave that consumer reading freed memory"
+    );
+    assert_eq!(
+        held.sweeps()[0].radials().len(),
+        consumer_radials,
+        "the volume the consumer holds changed under it"
+    );
+    assert_eq!(
+        a.staged_bytes + a.cached_bytes,
+        crate::scan_size::scan_bytes(&rebuilt) as u64,
+        "the copying rebuild left the assembler pricing something other than \
+         the one volume it holds"
+    );
+}
+
 /// **The claim this module rests on**: assembling a volume from chunks
 /// produces the same `Scan` that decoding the whole volume does.
 #[test]
@@ -706,9 +880,8 @@ fn a_roll_leaves_an_abandoned_cut_out_of_the_scan_it_hands_back() {
     );
     assert!(
         closed.scan.is_none(),
-        "a volume that closed short built a snapshot anyway — a deep copy of \
-             every sealed sweep, on the one path where `close` had just cleared \
-             the cache, for a volume every consumer discards"
+        "a volume that closed short built a snapshot anyway — a whole-volume \
+             build for a volume every consumer discards"
     );
 }
 
@@ -974,9 +1147,9 @@ fn late_radials_for_a_sealed_cut_are_dropped() {
     assert!(a.progress().late_radials_dropped > 0);
 }
 
-/// The cache is what keeps a poll cheap: `Sweep: Clone` deep-copies every
-/// gate byte, so rebuilding per poll would be hundreds of megabytes of
-/// memcpy across a volume.
+/// The cache is what keeps a poll cheap: a rebuild a consumer forces copies
+/// every gate byte of the volume (`Sweep: Clone`), so rebuilding per poll
+/// would be hundreds of megabytes of memcpy.
 #[test]
 fn the_snapshot_is_shared_until_a_cut_seals() {
     let mut a = VolumeAssembler::new("KTLX", vol(42));
@@ -1383,7 +1556,7 @@ fn a_sealing_round_leaves_the_snapshot_cache_warm() {
 
     assert!(
         p.current.as_ref().expect("a volume").snapshot_is_warm(),
-        "a sealing round returned with the cache cold, so the deep copy lands \
+        "a sealing round returned with the build stale, so the rebuild lands \
              on whoever asks next — the frame thread"
     );
     let first = p.snapshot().expect("a volume is assembling");
@@ -2351,21 +2524,24 @@ fn the_chunk_feed_prices_its_volumes_and_gives_them_back() {
     // Recomputed here from the cuts themselves rather than compared against a
     // recorded constant: the expectation is a relation to what is actually
     // held, so it stays true at any volume size.
-    let sealed_now: u64 = a
-        .cuts
+    let staged_now: u64 = a
+        .staged
         .values()
-        .filter_map(|cut| match cut {
-            Cut::Sealed(sweep) => Some(crate::scan_size::sweep_bytes(sweep) as u64),
-            _ => None,
-        })
+        .map(|sweep| crate::scan_size::sweep_bytes(sweep) as u64)
         .sum();
-    assert!(sealed_now > 0, "the fixture sealed no cuts");
+    assert!(staged_now > 0, "the fixture sealed no cuts");
     assert_eq!(
-        a.sealed_bytes, sealed_now,
-        "the level the seals accumulated is not what the sealed cuts hold"
+        a.staged_bytes, staged_now,
+        "the level the seals accumulated is not what the staged sweeps hold"
+    );
+    assert_eq!(
+        a.cuts.values().filter(|cut| cut.is_sealed()).count(),
+        a.staged.len(),
+        "a sealed cut's sweep is not staged and no build has happened, so the \
+         volume is somewhere neither byte term can see"
     );
 
-    // ---- the snapshot is a SECOND whole volume, not an Arc of the first --
+    // ---- the build MOVES the staged sweeps in; it does not copy them -----
     assert_eq!(
         a.cached_bytes, 0,
         "nothing is cached before the first build"
@@ -2379,6 +2555,16 @@ fn the_chunk_feed_prices_its_volumes_and_gives_them_back() {
     assert!(
         a.cached_bytes > 0,
         "a snapshot of a volume with sealed cuts priced at nothing"
+    );
+    assert!(
+        a.staged.is_empty(),
+        "a sweep stayed staged after the build folded it in, so the volume is \
+         either in two places or short a cut"
+    );
+    assert_eq!(
+        a.staged_bytes, 0,
+        "the staged sweeps kept their charge after the build took them, so \
+         this assembler's one volume is priced twice"
     );
 
     // The warm return does no work and must not re-charge: a second call
@@ -2406,21 +2592,38 @@ fn the_chunk_feed_prices_its_volumes_and_gives_them_back() {
     );
 
     // ---- the global level carries at least what this assembler holds -----
-    let held = a.sealed_bytes + a.cached_bytes;
+    let held = a.staged_bytes + a.cached_bytes;
     assert!(
         feed_bytes() as u64 >= held,
         "the process level {} B is below this assembler's own {held} B",
         feed_bytes()
     );
 
-    // ---- an invalidation gives the snapshot's bytes back -----------------
+    // ---- an invalidation must NOT lower the level ------------------------
+    // **The reversal, and it is the whole point of the change.** This section
+    // used to assert that invalidating gave the snapshot's bytes back, which
+    // was an assertion about the old MECHANISM — the build was a copy, and
+    // dropping it really did free a volume. The build owns the volume now, so
+    // an invalidation frees nothing, and a level that fell here would price
+    // bytes that are still resident: the one direction this instrument may
+    // never fail in. The property both versions assert is the same one, bytes
+    // priced == bytes held.
+    let held_before = a.staged_bytes + a.cached_bytes;
+    let level_before_invalidate = feed_bytes() as u64;
     drop(snap);
     drop(again);
-    a.drop_cached();
-    assert_eq!(a.cached_bytes, 0, "the invalidation kept the level up");
+    a.invalidate();
     assert_eq!(
-        a.sealed_bytes, sealed_now,
-        "dropping the snapshot moved the sealed cuts' level"
+        a.staged_bytes + a.cached_bytes,
+        held_before,
+        "the invalidation moved this assembler's own level, and it freed \
+         nothing: the volume is still inside the built `Scan`"
+    );
+    assert_eq!(
+        feed_bytes() as u64,
+        level_before_invalidate,
+        "the invalidation retracted bytes from the process level while every \
+         one of them was still resident"
     );
 
     // ---- and the drop gives back everything ------------------------------
@@ -2428,7 +2631,7 @@ fn the_chunk_feed_prices_its_volumes_and_gives_them_back() {
     // some later frame, so a level that fell at the retirement instead of at
     // the drop would name bytes that were still resident.
     let before_drop = feed_bytes() as u64;
-    let owed = a.sealed_bytes + a.cached_bytes;
+    let owed = a.staged_bytes + a.cached_bytes;
     drop(a);
     let after_drop = feed_bytes() as u64;
     assert!(

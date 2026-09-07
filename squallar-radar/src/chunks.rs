@@ -610,12 +610,18 @@ fn move_feed_level(was: u64, now: u64) {
 ///
 /// Two terms per assembler and one per poller:
 ///
-/// * the **sealed cuts** — every `Cut::Sealed` sweep, priced at the seal, and
-///   the volume the feed is building;
-/// * the **snapshot** — `VolumeAssembler::cached`, which
-///   [`VolumeAssembler::snapshot`] builds by DEEP-CLONING every sealed sweep,
-///   so it is a genuine second copy and not an `Arc` of the first;
+/// * the **staged sweeps** — cuts that have sealed since the last snapshot
+///   was built, priced at the seal and waiting to be moved into the next one;
+/// * the **built snapshot** — `VolumeAssembler::cached`, the `Scan` the feed
+///   serves, which OWNS every sweep folded into it rather than copying one;
 /// * the poller's **parked closed volumes**, each a whole `Scan`.
+///
+/// **The two assembler terms are disjoint, and together they are ONE
+/// volume.** A sealed cut's sweep is in exactly one of them: staged until a
+/// build moves it in, inside the built `Scan` afterwards. Until 2026-09-07
+/// they were not disjoint — the build deep-cloned every sealed sweep and the
+/// assembler went on owning the originals — so a live site held its volume
+/// twice and this figure named both copies.
 ///
 /// **A FLOOR, and it under-counts in one direction only.** The radials of a
 /// cut still being received (`Cut::Open`) are not priced: they move into a
@@ -624,20 +630,20 @@ fn move_feed_level(was: u64, now: u64) {
 /// per assembler is open at a time — a sixteenth of a volume on a VCP 212.
 /// Nothing here ever prices bytes that have gone.
 ///
-/// **The other under-count is a whole volume, and it is the bridge copy.**
+/// **The one whole-volume under-count left is a rebuild a consumer forced.**
 /// `chunk_feed::SiteFeed::last_snapshot` holds an `Arc` of whatever
 /// [`VolumeAssembler::snapshot`] last handed out, to serve the frame thread
-/// while the poller is away on a round. While the assembler's own `cached`
-/// is that same allocation the bridge costs nothing extra and `cached_bytes`
-/// prices it. But a round that seals a cut invalidates that cache and
-/// rebuilds it inside the same round (`ChunkPoller::warm_snapshot`), so it
-/// ends holding a *different* allocation from the one the bridge is still
-/// serving: two whole volumes are resident and this figure names one. The
-/// gap closes when the frame thread next asks `ChunkFeedManager::snapshot`
-/// for that site,
-/// which refreshes the bridge and frees the old volume — one frame while
-/// panes are drawing, and **unbounded for any live site the frame thread
-/// stops asking**.
+/// while the poller is away on a round. At rest that is the same allocation
+/// the assembler holds, so it costs nothing extra and `cached_bytes` prices
+/// it. A round that seals while the bridge is holding it is the case
+/// [`VolumeAssembler::snapshot`] cannot move out of: it copies for that
+/// rebuild, and the old allocation — the bridge's, and the still inventory's
+/// where a round has delivered — is resident and not in this figure. It goes
+/// when they let go of it: the frame thread's next `ChunkFeedManager::snapshot`
+/// refreshes the bridge, and `still scans` prices the inventory's meanwhile.
+/// **Unbounded for a live site the frame thread stops asking about**, as
+/// before — but one volume rather than two, because the assembler no longer
+/// keeps a copy of its own besides.
 ///
 /// **An UPPER bound against the other radar families**, like every figure in
 /// `radar_total`: once a round delivers, the same `Arc<Scan>` is installed in
@@ -671,15 +677,24 @@ enum Cut {
         /// spacing: 720 at 0.5°, 360 at 1.0°.
         expected: Option<usize>,
     },
-    /// A full rotation, frozen. Radials are moved out of the map, not copied.
-    Sealed(nexrad_model::data::Sweep),
+    /// A full rotation, frozen. The sweep itself is moved on — into
+    /// [`VolumeAssembler::staged`], and from there into the built snapshot —
+    /// so what stays here is only what the assembler answers about the cut
+    /// without reading its radials.
+    Sealed {
+        /// The median elevation angle over the sweep's radials, taken once at
+        /// the seal because the sweep is about to move out of reach.
+        /// `None` only for a sweep with no radials, which [`VolumeAssembler`]
+        /// does not seal.
+        angle: Option<f32>,
+    },
     /// Terminated, or closed with the volume, short of its radial count.
     Abandoned { have: usize, expected: usize },
 }
 
 impl Cut {
     fn is_sealed(&self) -> bool {
-        matches!(self, Self::Sealed(_))
+        matches!(self, Self::Sealed { .. })
     }
 }
 
@@ -745,14 +760,24 @@ pub struct VolumeAssembler {
     selection: CutSelection,
     late_radials_dropped: usize,
     closed: bool,
-    /// Invalidated whenever a cut seals. See [`Self::snapshot`].
+    /// The `Scan` the feed serves, and the **owner** of every sweep folded
+    /// into it. Marked stale rather than dropped when a cut seals: dropping
+    /// it would throw the volume away, not release a copy of it. See
+    /// [`Self::snapshot`].
     cached: Option<std::sync::Arc<nexrad_model::data::Scan>>,
-    /// Host bytes this assembler's SEALED cuts hold, summed at each seal.
-    /// Sealed cuts are never reopened, so this only rises until the whole
-    /// assembler drops. See [`feed_bytes`] for what is deliberately not in it.
-    sealed_bytes: u64,
-    /// Host bytes [`Self::cached`] holds — a whole deep-copied volume, not an
-    /// `Arc` of the sealed sweeps. Zero exactly when the snapshot is cold.
+    /// Whether [`Self::cached`] is missing something learned since it was
+    /// built — a sealed cut, the coverage pattern, the site.
+    stale: bool,
+    /// Sealed sweeps not yet folded into [`Self::cached`], by elevation
+    /// number. A sealed cut's sweep is in exactly one of the two places, which
+    /// is what makes the two byte terms below disjoint.
+    staged: std::collections::BTreeMap<u8, nexrad_model::data::Sweep>,
+    /// Host bytes [`Self::staged`] holds, summed at each seal and handed to
+    /// [`Self::cached_bytes`] when a build folds the sweeps in. See
+    /// [`feed_bytes`] for what is deliberately not in it.
+    staged_bytes: u64,
+    /// Host bytes [`Self::cached`] holds — the volume itself, once, not a copy
+    /// of it. Zero exactly when no snapshot has been built.
     cached_bytes: u64,
     /// Every cut's declared Nyquist velocity, accumulated across the chunks as
     /// they arrive. See [`Self::declared_nyquist`].
@@ -770,7 +795,8 @@ impl VolumeAssembler {
             volume_time: None,
             ingested: Default::default(),
             cuts: Default::default(),
-            sealed_bytes: 0,
+            staged: Default::default(),
+            staged_bytes: 0,
             cached_bytes: 0,
             coverage_pattern: None,
             saw_start_chunk: false,
@@ -780,6 +806,7 @@ impl VolumeAssembler {
             late_radials_dropped: 0,
             closed: false,
             cached: None,
+            stale: false,
             declared_nyquist: crate::nyquist::DeclaredNyquist::empty(),
             reported_site: None,
         }
@@ -841,7 +868,7 @@ impl VolumeAssembler {
             // `placeholder_coverage_pattern`, whose cut table is empty; a `Scan`
             // that cannot key its own sweeps must not go on being served once
             // the real pattern is known.
-            self.drop_cached();
+            self.invalidate();
         }
 
         // The first chunk to mention a cut is the one that names it; the rest
@@ -855,7 +882,7 @@ impl VolumeAssembler {
             && let Some(site) = contents.site
         {
             self.reported_site = Some(site);
-            self.drop_cached();
+            self.invalidate();
         }
 
         let mut touched: Vec<u8> = Vec::new();
@@ -897,7 +924,7 @@ impl VolumeAssembler {
                 }
                 // Never reopened: a sealed cut may already be inside a `Scan`
                 // some render is holding.
-                Cut::Sealed(_) | Cut::Abandoned { .. } => self.late_radials_dropped += 1,
+                Cut::Sealed { .. } | Cut::Abandoned { .. } => self.late_radials_dropped += 1,
             }
         }
 
@@ -908,7 +935,7 @@ impl VolumeAssembler {
             }
         }
         if !outcome.sealed.is_empty() {
-            self.drop_cached();
+            self.invalidate();
         }
         outcome.volume_complete = self.is_volume_complete();
         outcome
@@ -938,9 +965,14 @@ impl VolumeAssembler {
         // of this sweep's ~720 radials, ~16 times a volume, inside the round
         // that sealed it — never on a frame.
         let bytes = crate::scan_size::sweep_bytes(&sweep) as u64;
-        move_feed_level(self.sealed_bytes, self.sealed_bytes + bytes);
-        self.sealed_bytes += bytes;
-        self.cuts.insert(elevation, Cut::Sealed(sweep));
+        move_feed_level(self.staged_bytes, self.staged_bytes + bytes);
+        self.staged_bytes += bytes;
+        // Taken before the sweep moves out of reach. `progress` used to
+        // recompute this median over the cut's ~720 radials on every call, and
+        // every round makes several.
+        let angle = sweep.elevation_angle_degrees();
+        self.staged.insert(elevation, sweep);
+        self.cuts.insert(elevation, Cut::Sealed { angle });
         true
     }
 
@@ -1039,9 +1071,15 @@ impl VolumeAssembler {
                 },
             );
         }
-        if !short.is_empty() {
-            self.drop_cached();
-        }
+        // **Nothing is invalidated here, and that is a change of 2026-09-07.**
+        // A cut going from `Open` to `Abandoned` changes nothing the snapshot
+        // carries — only `Cut::Sealed` ever reaches it — so a build made
+        // before this call is still exactly right. It used to be dropped
+        // anyway, which cost nothing back when the build was a copy. Under a
+        // build that OWNS the volume it would cost a whole one: a volume whose
+        // only open cut was never wanted still completes, so `roll` asks for
+        // its snapshot, and that rebuild would run with the bridge still
+        // holding the volume being rebuilt — the one branch that copies.
         self.closed = true;
         self.progress()
     }
@@ -1052,9 +1090,9 @@ impl VolumeAssembler {
         let mut abandoned = Vec::new();
         for (elevation, cut) in &self.cuts {
             match cut {
-                Cut::Sealed(sweep) => {
+                Cut::Sealed { angle } => {
                     sealed_elevations.push(*elevation);
-                    sealed_angles.push(sweep.elevation_angle_degrees().unwrap_or(f32::NAN));
+                    sealed_angles.push(angle.unwrap_or(f32::NAN));
                 }
                 Cut::Abandoned { have, expected } => abandoned.push(AbandonedCut {
                     elevation: *elevation,
@@ -1080,18 +1118,43 @@ impl VolumeAssembler {
 
     /// The volume so far, as a `Scan` carrying **only complete sweeps**, in
     /// ascending elevation-number order.
+    ///
+    /// **The sweeps MOVE into the `Scan`.** A sealed cut's sweep waits in
+    /// [`Self::staged`] and is folded in here; a rebuild after a later seal
+    /// takes the previous `Scan` apart with `Arc::try_unwrap` and moves its
+    /// sweeps into the new one. One volume per live site, in one place —
+    /// which place it is depends only on how much of it has been built.
+    ///
+    /// **One case copies, and `try_unwrap` is what identifies it**: another
+    /// owner still holds the volume being rebuilt — the bridge
+    /// (`chunk_feed::SiteFeed::last_snapshot`), the still inventory, a pane.
+    /// Then this rebuild, and only this one, clones the sweeps out of the
+    /// shared `Scan`, so the second copy exists exactly while somebody else
+    /// legitimately holds the old volume and dies when they let go. It is the
+    /// same memcpy every rebuild used to pay unconditionally.
+    ///
+    /// **The warm path stays free**, which is what the frame thread's several
+    /// calls a frame depend on; a build happens on the poller's thread, inside
+    /// the round that invalidated (`ChunkPoller::warm_snapshot`).
     pub fn snapshot(&mut self) -> std::sync::Arc<nexrad_model::data::Scan> {
-        if let Some(cached) = &self.cached {
+        if let Some(cached) = &self.cached
+            && !self.stale
+        {
             return std::sync::Arc::clone(cached);
         }
-        let sweeps: Vec<nexrad_model::data::Sweep> = self
-            .cuts
-            .values()
-            .filter_map(|cut| match cut {
-                Cut::Sealed(sweep) => Some(sweep.clone()),
-                _ => None,
-            })
-            .collect();
+        // Taken out of the field first: the assembler must not still be an
+        // owner when `try_unwrap` asks whether anybody else is one.
+        let mut sweeps: Vec<nexrad_model::data::Sweep> = match self.cached.take() {
+            None => Vec::new(),
+            Some(previous) => match std::sync::Arc::try_unwrap(previous) {
+                Ok(scan) => scan.into_sweeps(),
+                Err(shared) => shared.sweeps().to_vec(),
+            },
+        };
+        sweeps.extend(std::mem::take(&mut self.staged).into_values());
+        // Both sources are already ascending and a cut seals once, so this
+        // sorts a dozen-odd already-ordered runs and cannot see a duplicate.
+        sweeps.sort_by_key(nexrad_model::data::Sweep::elevation_number);
         let vcp = self
             .coverage_pattern
             .clone()
@@ -1100,34 +1163,42 @@ impl VolumeAssembler {
             Some(site) => nexrad_model::data::Scan::with_site(site, vcp, sweeps),
             None => nexrad_model::data::Scan::new(vcp, sweeps),
         });
-        // **A second whole volume, and priced as one.** The sweeps above were
-        // `sweep.clone()`d out of the sealed cuts, so this `Scan` owns its own
-        // gate buffers rather than sharing theirs. The walk is strictly
-        // smaller than the deep copy that just happened, and it is on the cold
-        // path only — the warm return above does no work, which is what keeps
-        // the frame thread's several calls a frame free.
-        self.cached_bytes = crate::scan_size::scan_bytes(&scan) as u64;
-        move_feed_level(0, self.cached_bytes);
+        // **One volume, priced once.** Going in this assembler held
+        // `staged_bytes + cached_bytes`; coming out it holds this `Scan` — the
+        // same sweeps, in one container, plus its own vector and metadata
+        // blocks. The walk is one pass over the volume on the poller's thread,
+        // about as often as a cut seals; the warm return above does no work at
+        // all, which is what keeps the frame thread's calls free.
+        let now = crate::scan_size::scan_bytes(&scan) as u64;
+        move_feed_level(self.staged_bytes + self.cached_bytes, now);
+        self.staged_bytes = 0;
+        self.cached_bytes = now;
+        self.stale = false;
         self.cached = Some(std::sync::Arc::clone(&scan));
         scan
     }
 
-    /// Drop the built snapshot and give its bytes back to [`feed_bytes`].
+    /// Mark the built snapshot stale, so the next [`Self::snapshot`] rebuilds.
     ///
-    /// Spelled once rather than at each of the four invalidation sites: a
-    /// `self.cached = None` that forgot the level would leave the census
-    /// naming a volume that had gone, which is the one direction this
-    /// instrument must never fail in.
-    fn drop_cached(&mut self) {
-        move_feed_level(self.cached_bytes, 0);
-        self.cached_bytes = 0;
-        self.cached = None;
+    /// **It frees nothing and the level does not move**, which is the whole
+    /// difference from the `drop_cached` it replaced on 2026-09-07. The built
+    /// `Scan` owns the volume's sweeps now, so dropping it here would throw
+    /// the volume away rather than release a copy of it — and retracting the
+    /// level here would be worse than merely wrong: it would price bytes that
+    /// are still resident, the one direction this instrument may never fail
+    /// in.
+    ///
+    /// Still spelled once rather than at each of the four sites, for the
+    /// reason it always was: an invalidation that forgot its accounting is
+    /// invisible.
+    fn invalidate(&mut self) {
+        self.stale = true;
     }
 
     /// Whether [`Self::snapshot`] would return without building.
     #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) fn snapshot_is_warm(&self) -> bool {
-        self.cached.is_some()
+        self.cached.is_some() && !self.stale
     }
 
     /// Every cut's declared Nyquist velocity — the number [`Self::snapshot`]'s
@@ -1255,7 +1326,7 @@ pub struct ChunkPoller {
 /// must never fail in.
 impl Drop for VolumeAssembler {
     fn drop(&mut self) {
-        move_feed_level(self.sealed_bytes.saturating_add(self.cached_bytes), 0);
+        move_feed_level(self.staged_bytes.saturating_add(self.cached_bytes), 0);
     }
 }
 

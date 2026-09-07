@@ -409,12 +409,16 @@ families! {
          391 MiB took 25.3 ms against 604 MiB's 27.9 ms. Do not size this \
          against megabytes.";
     chunk_feed_bytes = squallar_radar::chunks::feed_bytes() as u64,
-        "Decoded volumes the REAL-TIME CHUNK FEED is holding - the sealed \
-         cuts of the volume each live site is assembling, the deep-copied \
-         snapshot built from them, and the closed volumes a poller has \
-         parked. Two whole volumes a live site at the peak, and until \
-         2026-09-07 no family named a byte of it: the feed's stores are \
-         three levels below `App` and nothing in the tree could price them. \
+        "Decoded volumes the REAL-TIME CHUNK FEED is holding - the cuts each \
+         live site has sealed but not yet folded into a snapshot, the built \
+         snapshot they fold into, and the closed volumes a poller has parked. \
+         ONE whole volume a live site, and the first two terms are why: a \
+         sealed cut's sweep is either staged or inside the built `Scan`, \
+         never both, because the build MOVES it rather than copying it. \
+         Falsifiable where it is decided, in `VolumeAssembler::snapshot`: the \
+         previous volume's sweeps leave it by `Arc::try_unwrap` and the \
+         staged ones by `mem::take`, so no sweep is in two places for two \
+         terms to price. \
          READ THROUGH, like `render pools`: radar cannot see this module, \
          and the levels are maintained inside the polling round, off the \
          frame thread, where the bytes actually move. A FLOOR - the radials \
