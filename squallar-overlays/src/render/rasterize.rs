@@ -96,6 +96,19 @@ impl HitCells {
     pub fn max_id(&self) -> Option<u32> {
         self.cells.values().flatten().copied().max()
     }
+
+    /// Bytes this grid holds on the heap: the table's buffer — one
+    /// `(u32, Vec<u32>)` and a control byte per slot of its `capacity()` —
+    /// plus every occupied cell's id vector at **its** `capacity()`. The
+    /// allocator's figures, not `len()`s: [`Self::record`] grows a cell's
+    /// vector by doubling, so a cell holding three ids is holding four. Priced
+    /// through [`ItemFootprint`](squallar_source::footprint::ItemFootprint)'s
+    /// table impl so a hit grid and every other table in the census are
+    /// measured with one rule.
+    pub fn resident_bytes(&self) -> usize {
+        let bytes = squallar_source::footprint::ItemFootprint::owned_bytes(&self.cells);
+        usize::try_from(bytes).unwrap_or(usize::MAX)
+    }
 }
 
 /// **Deliberately not `Clone`.** A hit map is one `FxHashMap<u32, Vec<u32>>`
@@ -138,6 +151,29 @@ impl HitMap {
             .iter()
             .filter_map(|id| self.items.get(*id as usize))
             .collect()
+    }
+
+    /// Bytes this map holds on the heap: [`HitCells::resident_bytes`] for the
+    /// index, plus the items half **only when it is a list**.
+    ///
+    /// A [`HitItems::Rows`] is a vector of `Arc` pointers this map owns — the
+    /// clone [`Self::from_cells`] took — priced at its `capacity()` times the
+    /// pointer size. The bodies those pointers reach are the layer's own
+    /// items, priced in the `overlay items` family, and are not added here.
+    ///
+    /// A [`HitItems::Slab`] adds **nothing**: the handle sits inline in this
+    /// struct, [`HitResolve`](squallar_source::hit::HitResolve) exposes no
+    /// byte figure, and the block it reaches is the layer's own — GLM's flash
+    /// slab under `overlay items`, the storm-report pointer vector under the
+    /// parked family — so a figure here would put one block into two families
+    /// a reader is invited to add. Both shipped hit-map layers answer a slab,
+    /// so for them this is the cells alone.
+    pub fn resident_bytes(&self) -> usize {
+        let items = match &self.items {
+            HitItems::Rows(rows) => rows.capacity() * size_of::<Arc<dyn OverlayItem>>(),
+            HitItems::Slab(_) => 0,
+        };
+        self.cells.resident_bytes().saturating_add(items)
     }
 }
 
@@ -2575,6 +2611,9 @@ mod sites_marker_tests;
 
 #[cfg(test)]
 mod hit_cells_tests;
+
+#[cfg(test)]
+mod hit_map_bytes_tests;
 
 #[cfg(test)]
 mod gmgsi_seam_probe_tests;
