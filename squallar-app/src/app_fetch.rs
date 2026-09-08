@@ -1229,9 +1229,26 @@ impl super::App {
                             None => crate::channels::OverlayPicture::Painted(std::sync::Arc::new(
                                 egui::ColorImage::new(size, rgba.into_pixels()),
                             )),
+                            // **`ColorImage::filled` is the one spelling this
+                            // may not use.** It is `vec![color; w * h]`, which
+                            // for a foreign element type has no `IsZero`
+                            // specialisation and so writes a whole picture of
+                            // zeros — 41,719,488 B at the user's 150 % rung —
+                            // over memory the allocator hands over zeroed
+                            // anyway. This closure is the browser's
+                            // `deliver_ns`, on the page's MAIN THREAD, so that
+                            // write is frame-thread time for a picture nothing
+                            // has drawn into. `RasterBuf::transparent_pixels`
+                            // is the same picture from `alloc_zeroed` and
+                            // carries the measurement.
                             Some(_) if response.frame.is_some() => {
                                 crate::channels::OverlayPicture::Painted(std::sync::Arc::new(
-                                    egui::ColorImage::filled(size, egui::Color32::TRANSPARENT),
+                                    egui::ColorImage::new(
+                                        size,
+                                        squallar_overlays::render::raster_buf::RasterBuf::transparent_pixels(
+                                            size[0].saturating_mul(size[1]),
+                                        ),
+                                    ),
                                 ))
                             }
                             Some(_) => crate::channels::OverlayPicture::Blank { width, height },

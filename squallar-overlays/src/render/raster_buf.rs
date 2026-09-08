@@ -42,8 +42,8 @@ impl RasterBuf {
         Self::Bytes(Vec::new())
     }
 
-    /// A picture of `pixels` transparent pixels, for a caller that is about to
-    /// overwrite every one of them through [`Self::as_mut_bytes`].
+    /// A picture of `pixels` transparent pixels — a transport's copy
+    /// destination, and the picture a blank loop frame is given.
     ///
     /// **The one way a transport can allocate this arm without naming
     /// [`Color32`].** The browser port copies a reply's picture straight into
@@ -51,7 +51,39 @@ impl RasterBuf {
     /// the element type stays this type's own business — which is the whole
     /// reason the arm can exist above a crate that does not draw.
     pub fn transparent(pixels: usize) -> Self {
-        Self::Pixels(vec![Color32::TRANSPARENT; pixels])
+        Self::Pixels(Self::transparent_pixels(pixels))
+    }
+
+    /// [`Self::transparent`] as the element type an `egui::ColorImage` holds,
+    /// for the caller that hands one straight over and never wants the enum.
+    ///
+    /// **`zeroed_vec`, never `vec![Color32::TRANSPARENT; n]`** — the same rule
+    /// [`rasterize_gridded`](crate::render::rasterize::rasterize_gridded)
+    /// already writes its picture under, and this is the other allocation it
+    /// governs. A foreign element type has no `IsZero` specialisation, so the
+    /// macro spelling takes an uninitialised block and then writes forty
+    /// megabytes of zeros over memory the allocator was going to hand over
+    /// zeroed; `zeroed_vec` is `alloc_zeroed` and writes none of them.
+    /// [`Color32::TRANSPARENT`] is four zero bytes, so the two spell the same
+    /// picture — `transparent_is_four_zero_bytes` fails if that ever stops
+    /// being true, which is the whole precondition.
+    ///
+    /// Measured natively at the user's own 150 % rung (41,719,488 B,
+    /// 10,429,872 px), medians of 30 iterations over three runs: the macro
+    /// spelling 14.076 / 14.597 / 15.127 ms, this one 0.007 / 0.008 /
+    /// 0.008 ms. **The cost is removed, not relocated** — a later full read of
+    /// the picture is 4.043-4.142 ms against 4.288-4.403 ms, so ~0.25 ms of
+    /// the ~14 ms comes back when something touches the pages. At the 125 %
+    /// and 100 % rungs the two are indistinguishable (medians within
+    /// 0.02 ms): glibc mmaps the top rung fresh and reuses a resident block
+    /// for the other two, where `alloc_zeroed` must memset like anyone else.
+    ///
+    /// **That figure is native glibc and is not the browser's.** wasm has no
+    /// mmap and no demand paging, and no arm of this change has been measured
+    /// on the Tier-2 rig; what carries here is that the write is dead on every
+    /// target and the spelling is never the slower of the two.
+    pub fn transparent_pixels(pixels: usize) -> Vec<Color32> {
+        bytemuck::zeroed_vec(pixels)
     }
 
     /// **The wire's picture, born as pixels.** The reply's premultiplied RGBA

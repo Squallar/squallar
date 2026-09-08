@@ -148,3 +148,37 @@ fn a_wire_round_trip_keeps_the_same_allocation() {
     );
     assert_eq!(back, RasterBuf::Pixels(sample_pixels()), "the bytes moved");
 }
+
+/// **The precondition [`RasterBuf::transparent_pixels`] rests on.** That
+/// constructor answers `alloc_zeroed` where it used to write
+/// `Color32::TRANSPARENT` into every pixel, and the two are the same picture
+/// only while `TRANSPARENT` is four zero bytes. `ecolor` deciding otherwise —
+/// an opaque-black transparent, a different channel order with a sentinel —
+/// would turn a blank loop frame and every transport copy destination into
+/// zeros silently, with no other test in the tree noticing.
+#[test]
+fn transparent_is_four_zero_bytes() {
+    assert_eq!(
+        bytemuck::bytes_of(&Color32::TRANSPARENT),
+        &[0, 0, 0, 0],
+        "Color32::TRANSPARENT is no longer four zero bytes, so a zeroed \
+         allocation is no longer the picture `transparent_pixels` promises",
+    );
+}
+
+/// And the constructor itself answers that picture, at a length that is not a
+/// round number of anything.
+#[test]
+fn a_transparent_buffer_is_transparent_in_both_arms() {
+    let buf = RasterBuf::transparent(7);
+    assert_eq!(
+        buf.as_bytes(),
+        [0u8; 28],
+        "28 bytes, every one of them zero"
+    );
+    assert_eq!(
+        RasterBuf::transparent_pixels(7),
+        vec![Color32::TRANSPARENT; 7],
+        "the pixels spelling agrees with the macro it replaced",
+    );
+}
