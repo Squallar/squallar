@@ -33,7 +33,15 @@
 //!
 //! A duration sample is `end - start` in whole microseconds through
 //! [`Hist::record`], so every quoted percentile is a conservative bin upper
-//! edge. **No figure from this module ever gates CI.**
+//! edge. A pair whose end stamp *precedes* its begin is not a duration at
+//! all — it is a broken clock — so it is **discarded and counted** rather
+//! than folded in: recording it as a saturated outlier would put a
+//! four-thousand-second sample in the tail and poison the family's exact
+//! mean for the rest of the process. `non_monotone` is the fourth figure
+//! this module publishes and it is a *defect* count, not a cost: any value
+//! but zero means the adapter's timestamps cannot be believed, and the
+//! histogram beside it is short by exactly that many samples.
+//! **No figure from this module ever gates CI.**
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -162,6 +170,9 @@ pub struct GpuPassReport {
     pub passes: [u64; FAMILIES],
     /// Resolves collected — frames represented in the histograms.
     pub frames: u64,
+    /// Stamp pairs discarded per family because the end stamp preceded the
+    /// begin stamp. Zero on a device whose clock works; see the module doc.
+    pub non_monotone: [u64; FAMILIES],
 }
 
 impl GpuPassReport {
@@ -173,6 +184,12 @@ impl GpuPassReport {
     /// The family's cumulative encoded-pass count.
     pub fn passes(&self, pass: ProbedPass) -> u64 {
         self.passes[pass as usize]
+    }
+
+    /// The family's discarded non-monotone stamp pairs — a broken-clock
+    /// count, never a cost. See the module doc.
+    pub fn non_monotone(&self, pass: ProbedPass) -> u64 {
+        self.non_monotone[pass as usize]
     }
 }
 
@@ -187,6 +204,7 @@ pub struct GpuPassProbe {
     hists: [Hist; FAMILIES],
     passes: [u64; FAMILIES],
     frames: u64,
+    non_monotone: [u64; FAMILIES],
 }
 
 impl GpuPassProbe {
@@ -229,6 +247,7 @@ impl GpuPassProbe {
             hists: [Hist::new(); FAMILIES],
             passes: [0; FAMILIES],
             frames: 0,
+            non_monotone: [0; FAMILIES],
         })
     }
 
@@ -336,11 +355,22 @@ impl GpuPassProbe {
                             let end = u64::from_le_bytes(
                                 view[at + 8..at + 16].try_into().expect("8 bytes"),
                             );
-                            let ticks = end.wrapping_sub(begin);
-                            // Ticks → whole microseconds, saturating into the
-                            // histogram's over-ceiling clamp rather than
-                            // wrapping: a non-monotone pair reads as an
-                            // outlier, never as a small number.
+                            // A pair the device answered out of order is not
+                            // a slow pass, it is a clock that cannot be
+                            // believed: count it and drop it. Folding it in
+                            // would need `wrapping_sub`, and the ~2^64 ticks
+                            // that produces saturate into the histogram's
+                            // over-ceiling clamp — where an honestly slow
+                            // pass also lands, so the two would be
+                            // indistinguishable — and add `u32::MAX` to the
+                            // family's exact sum, permanently.
+                            let Some(ticks) = end.checked_sub(begin) else {
+                                self.non_monotone[family] += 1;
+                                continue;
+                            };
+                            // Ticks → whole microseconds. The clamp is the
+                            // histogram's own ceiling bin now; nothing here
+                            // manufactures an outlier.
                             let us = (ticks as f64 * f64::from(self.period_ns) / 1_000.0)
                                 .min(f64::from(u32::MAX))
                                 as u32;
@@ -364,6 +394,7 @@ impl GpuPassProbe {
             hists: self.hists,
             passes: self.passes,
             frames: self.frames,
+            non_monotone: self.non_monotone,
         }
     }
 }

@@ -12,7 +12,23 @@
 //! `timestampComputeAndGraphics` is true): the probe's counts equal the passes
 //! actually encoded, a family's bracket is handed out exactly once per frame
 //! however many passes ask, every collected sample comes from monotone stamps,
-//! and a family that never ran holds zero everything.
+//! no sample claims more time than the loop that produced it spent, and a
+//! family that never ran holds zero everything.
+//!
+//! **Nothing here asserts how long a pass took**, and that is deliberate. Until
+//! 2026-09-08 the monotonicity obligation was spelled as "the histogram's
+//! over-64 ms clamp bin is empty", which is a wall clock: a non-monotone pair
+//! saturates that bin, but so does an honestly slow march, and on a contended
+//! runner the two are indistinguishable. Measured on this box (llvmpipe LLVM
+//! 22.1.8 / Mesa 26.2.1, Ryzen 9 7950X): with a cold Mesa shader cache the
+//! first raymarch of the process costs **295-478 ms** — llvmpipe JITs the
+//! shader inside the bracketed pass — against 0.6-0.8 ms for every frame
+//! after it. Fifteen cold runs put 180 of 180 samples on monotone stamps and
+//! 15 of 180 over the ceiling, all of them frame 0. The clamp assertion was
+//! red on the honest cause 100% of the time it fired and on the cause its
+//! message named 0% of the time. `volume_march_cost` owns the cost sweep;
+//! this suite owns the instrument, and it warms the pipeline before it
+//! measures so the JIT is not in the figures it prints.
 //!
 //! **Absence** (the same adapter, device requested with `Features::empty()` —
 //! the shape of every WebGL2 leg and every install that never asked): the
@@ -22,6 +38,8 @@
 //! zero-query-submissions count — a probe that ignored the feature gate, or a
 //! call site that stopped honouring the `Option`, reddens it.
 #![cfg(not(target_arch = "wasm32"))]
+
+use std::time::Instant;
 
 use egui_wgpu::wgpu;
 use squallar_egui::pane::OrbitCamera;
@@ -85,10 +103,25 @@ fn the_probe_counts_what_it_brackets_and_brackets_once_per_frame() {
     pipelines.upload_quad(&queue);
     let (target, volume) = stand_in_scene(&device, &queue, &pipelines);
 
+    // One unbracketed raymarch before anything is measured. A software
+    // rasteriser compiles the pipeline's shader on its first draw and does it
+    // *inside* the pass, so without this the frame-0 sample is the JIT and not
+    // the march — 295-478 ms against 0.6-0.8 ms, measured. No probe call is
+    // made here, so the counters below are untouched by it.
+    let mut warm = device.create_command_encoder(&Default::default());
+    pipelines.encode_raymarch_with_timestamps(&mut warm, &target, &volume, None, None);
+    queue.submit(Some(warm.finish()));
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("polling the device failed");
+
     let mut probe = GpuPassProbe::new(&device, &queue)
         .expect("this device was created with TIMESTAMP_QUERY and the probe refused it");
     let handle = probe.handle();
 
+    // Every pass the loop brackets is submitted and polled to completion
+    // inside this span, so the span is an upper bound on their total.
+    let loop_began = Instant::now();
     for frame in 0..FRAMES {
         let mut encoder = device.create_command_encoder(&Default::default());
 
@@ -121,11 +154,37 @@ fn the_probe_counts_what_it_brackets_and_brackets_once_per_frame() {
         probe.collect();
     }
 
+    let loop_span_micros = loop_began.elapsed().as_micros();
+
     let report = probe.report();
     assert_eq!(
         report.passes(ProbedPass::Raymarch),
         2 * FRAMES,
         "every encoded pass must be counted, bracketed or not",
+    );
+    // The monotonicity obligation, asserted as itself. It stands FIRST among
+    // the sample assertions on purpose: a device answering pairs out of order
+    // also shortens the histogram, and the next assertion would then fail with
+    // a message about sample counts on a defect that is about the clock.
+    assert_eq!(
+        report.non_monotone(ProbedPass::Raymarch),
+        0,
+        "the adapter answered raymarch stamp pairs whose end preceded their \
+         begin; the probe discarded them, and no sample it keeps may come \
+         from a clock that does that",
+    );
+    // The other half of "this is a duration": a bracketed pass cannot have
+    // taken longer than the wall clock the test itself spent submitting and
+    // waiting for it. Self-scaling, so a loaded box moves both sides — unlike
+    // a fixed millisecond bar, which is what this suite used to hold. It is
+    // the total, not a percentile, so one inflated sample cannot hide behind
+    // eleven honest ones.
+    assert!(
+        u128::from(report.hist(ProbedPass::Raymarch).sum_micros()) <= loop_span_micros,
+        "the probe reports {} us of raymarch across {FRAMES} frames that took \
+         {loop_span_micros} us of wall clock to submit and drain; a pass \
+         cannot outlast the span it ran in, so the stamps are not durations",
+        report.hist(ProbedPass::Raymarch).sum_micros(),
     );
     assert_eq!(
         report.hist(ProbedPass::Raymarch).total(),
@@ -135,12 +194,6 @@ fn the_probe_counts_what_it_brackets_and_brackets_once_per_frame() {
     assert_eq!(
         report.frames, FRAMES,
         "every frame's resolve must have landed"
-    );
-    assert_eq!(
-        report.hist(ProbedPass::Raymarch).counts()[squallar_device_profile::hist::SLOTS - 1],
-        0,
-        "a sample in the over-64ms clamp from an 8-cubed march means a \
-         non-monotone stamp pair wrapped into a huge duration",
     );
     for family in [ProbedPass::Ground, ProbedPass::Mirror, ProbedPass::Main] {
         assert_eq!(
@@ -155,15 +208,19 @@ fn the_probe_counts_what_it_brackets_and_brackets_once_per_frame() {
         );
     }
     let period = queue.get_timestamp_period();
+    let hist = report.hist(ProbedPass::Raymarch);
+    // The over-ceiling count is REPORTED, never asserted: on a cold software
+    // rasteriser it counts honestly slow marches, which is not this suite's
+    // subject. A reader chasing a slow adapter wants to see it; CI must not
+    // go red on it.
     println!(
         "probe presence path on this adapter (timestamp period {period} ns): \
-         {FRAMES} frames, raymarch p50 {:?} us, p99 {:?} us",
-        report
-            .hist(ProbedPass::Raymarch)
-            .percentile_upper_micros(0.50),
-        report
-            .hist(ProbedPass::Raymarch)
-            .percentile_upper_micros(0.99),
+         {FRAMES} frames in {loop_span_micros} us, raymarch p50 {:?} us, \
+         p99 {:?} us, mean {:?} us, {} sample(s) at or over the 64 ms ceiling",
+        hist.percentile_upper_micros(0.50),
+        hist.percentile_upper_micros(0.99),
+        hist.mean_micros(),
+        hist.counts()[squallar_device_profile::hist::SLOTS - 1],
     );
 }
 

@@ -266,6 +266,7 @@ fn the_gpu_passes_line_reads_exactly_as_pinned() {
         hists: [Hist::new(); 4],
         passes: [6, 0, 1, 2],
         frames: 3,
+        non_monotone: [0; 4],
     };
     report.hists[ProbedPass::Raymarch as usize].record(1_000);
     report.hists[ProbedPass::Mirror as usize].record(100);
@@ -386,6 +387,7 @@ fn the_rig_reads_the_frame_lines_the_app_actually_writes() {
         hists: [Hist::new(); 4],
         passes: [6, 0, 1, 2],
         frames: 3,
+        non_monotone: [0; 4],
     };
     report.hists[ProbedPass::Raymarch as usize].record(1_000);
     report.hists[ProbedPass::Mirror as usize].record(100);
