@@ -135,7 +135,7 @@ impl JobSpec for RadarPlanJob {
         // byte that was in this framing before keeps the offset it had and the
         // input still ends the payload.
         out.push(input.surface.wire_code());
-        out.extend_from_slice(&input.input.to_bytes());
+        input.input.write_bytes(out);
     }
 
     fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(RadarPlanJob, JobGeometry)> {
@@ -320,7 +320,7 @@ impl JobSpec for SectionJob {
 
     fn encode(input: &SectionJob, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
         encode_section_request(out, &input.request);
-        out.extend_from_slice(&input.input.to_bytes());
+        input.input.write_bytes(out);
     }
 
     fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(SectionJob, JobGeometry)> {
@@ -393,7 +393,7 @@ impl JobSpec for VoxelJob {
 
     fn encode(input: &VoxelJob, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
         encode_voxel_request(out, &input.request);
-        out.extend_from_slice(&input.input.to_bytes());
+        input.input.write_bytes(out);
     }
 
     fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(VoxelJob, JobGeometry)> {

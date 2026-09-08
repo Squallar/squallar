@@ -921,6 +921,24 @@ impl RenderInput {
     /// verbatim, which is where nearly all the bytes are.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.encoded_len());
+        self.write_bytes(&mut out);
+        out
+    }
+
+    /// [`Self::to_bytes`] into a buffer the caller already owns.
+    ///
+    /// **The door every job row uses**, because the rows that carry a
+    /// `RenderInput` — `radar`, `section`, `voxels` — are framed into a
+    /// message of their own. `out.extend_from_slice(&input.to_bytes())` wrote
+    /// the gate blobs twice and allocated a whole second copy of them to do
+    /// it, at the dispatch site, on the FRAME THREAD: a `RenderInput` is "the
+    /// largest thing in the request by three orders of magnitude" and its own
+    /// struct doc says so.
+    ///
+    /// `out` is reserved for what this will add, so a caller with a
+    /// part-written message pays one growth rather than the doubling walk.
+    pub fn write_bytes(&self, out: &mut Vec<u8>) {
+        out.reserve(self.encoded_len());
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         out.extend_from_slice(&self.product.wire_code().to_le_bytes());
@@ -1003,17 +1021,16 @@ impl RenderInput {
                     None => out.push(0),
                     Some(moment) => {
                         out.push(1);
-                        encode_moment(&mut out, moment);
+                        encode_moment(out, moment);
                     }
                 }
                 out.push(radial.extras.len() as u8);
                 for (code, payload) in &radial.extras {
                     out.push(*code);
-                    encode_moment(&mut out, payload);
+                    encode_moment(out, payload);
                 }
             }
         }
-        out
     }
 
     /// Decode a payload [`to_bytes`](Self::to_bytes) produced.
