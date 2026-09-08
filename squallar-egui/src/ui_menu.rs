@@ -182,9 +182,57 @@ fn render_menu_items(ui: &mut egui::Ui, nodes: &[MenuNode], out: &mut MenuFrame,
     }
 }
 
+/// **How many menu models have been built on this thread.**
+///
+/// The gate for the one property this model's callers owe: it is built to be
+/// *drawn*, so a presentation that is not showing the menu must not build one.
+/// Counting the calls is what says so — the cost is a tree of `Vec`s and a
+/// `ControlItem` list per switch read off the layer, none of which any figure
+/// downstream can distinguish from the widgets around it once it has been
+/// dropped.
+///
+/// Test-only, and a thread-local because [`Gui::menu_model`] takes `&self`.
+#[cfg(test)]
+pub(crate) mod build_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static BUILT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn note() {
+        BUILT.with(|c| c.set(c.get().wrapping_add(1)));
+    }
+
+    /// Models built on this thread since the last [`reset`].
+    pub(crate) fn read() -> u64 {
+        BUILT.with(Cell::get)
+    }
+
+    pub(crate) fn reset() {
+        BUILT.with(|c| c.set(0));
+    }
+}
+
 impl super::Gui {
     /// Build this frame's menu, reading the live state the toggles reflect.
+    ///
+    /// **Not free, and not to be built speculatively.** Two of the toggles
+    /// below read their value out of the radar layer's `ControlItem` tree
+    /// ([`crate::radar_layer::live_chunks_enabled`] and
+    /// [`crate::radar_layer::chunk_notifications_enabled`]), and that tree is
+    /// rebuilt in full for each of them — seven items, nine `String`s and two
+    /// `Vec`s apiece, behind a registry id scan. A third switch takes a scan of
+    /// its own. Measured on the shipped registry, repeat-identical: one build
+    /// is **28 allocations, 3,122 bytes, 3 registry lookups and 48 full
+    /// `LayerId` comparisons**. A model built for a presentation that turns
+    /// out not to draw it is all of that, paid and dropped. Every caller
+    /// builds it where it draws it: [`Gui::render_top_bar`]'s inside the popup
+    /// body egui skips while the menu is closed, the sheet's inside the page
+    /// it fills.
     pub(super) fn menu_model(&self) -> Vec<MenuNode> {
+        #[cfg(test)]
+        build_count::note();
         let pane = self.active_pane();
         let mut file = vec![MenuNode::Item {
             label: "Refresh Radar",

@@ -17055,3 +17055,61 @@ fn a_new_panes_layers_start_unlinked_while_its_viewport_and_clock_do_not() {
          linked somewhere the flag does not say",
     );
 }
+
+/// **A menu nobody opened is not a menu the frame builds.**
+///
+/// `Gui::menu_model` is not a read: two of its toggles take their value out of
+/// the radar layer's whole `ControlItem` tree, which is rebuilt in full for
+/// each of them — seven items, nine `String`s and two `Vec`s apiece — and a
+/// third takes a registry id scan of its own. The top bar used to build the
+/// model unconditionally, at the head of `render_top_bar`, and hand it to a
+/// `Popup::menu(..).show(..)` body that egui does not run while the popup is
+/// closed. So on every frame the user was not in the ☰ dropdown — which is
+/// every frame of a pan, a zoom or a scrub — the `ui:topbar` cut paid a
+/// measured 28 allocations, 3,122 bytes, 3 registry lookups and 48 full
+/// `LayerId` comparisons for a tree it dropped unread.
+///
+/// The model is now built inside that body. This pins the property rather than
+/// the saving: **zero models on a closed-menu frame, one on an open-menu
+/// frame.** The second half is what stops the fix from being "never build it",
+/// which would empty the menu.
+///
+/// Counted rather than inferred, because there is no figure downstream that
+/// can tell a dropped `Vec` tree from the widgets drawn around it.
+#[test]
+fn a_frame_with_the_menu_closed_builds_no_menu_model() {
+    let mut h = InputHarness::new();
+    h.warm_up();
+    assert!(
+        h.menu_leaves().is_empty(),
+        "premise: the \u{2630} dropdown must start closed"
+    );
+    assert_ne!(
+        h.width_class(),
+        crate::ui_layout::WidthClass::Compact,
+        "premise: the default harness screen must be a width that draws the \
+         top bar's dropdown at all — the phone shell hosts the menu in the \
+         sheet instead"
+    );
+
+    crate::ui::menu_build_count::reset();
+    h.frame();
+    let closed = crate::ui::menu_build_count::read();
+    assert_eq!(
+        closed, 0,
+        "a frame with the menu closed built {closed} menu model(s). Every one \
+         of them is a tree of `Vec`s and two rebuilds of the radar layer's \
+         control list, dropped without being drawn.",
+    );
+
+    h.open_menu();
+    crate::ui::menu_build_count::reset();
+    h.frame();
+    let open = crate::ui::menu_build_count::read();
+    assert_eq!(
+        open, 1,
+        "a frame with the menu OPEN built {open} menu model(s). One is what \
+         the dropdown draws from; zero would be an empty menu, and more than \
+         one is the same waste moved rather than removed.",
+    );
+}

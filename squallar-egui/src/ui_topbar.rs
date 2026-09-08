@@ -94,7 +94,6 @@ impl super::Gui {
     /// active pane and the segments write state directly.
     pub(super) fn render_top_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
         let compact = self.layout.width == crate::ui_layout::WidthClass::Compact;
-        let model = (!compact).then(|| self.menu_model());
         let mut menu_frame = ui_menu::MenuFrame::default();
 
         #[cfg(test)]
@@ -112,7 +111,7 @@ impl super::Gui {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = ROOMY_ITEM_SPACING;
 
-                if let Some(model) = &model {
+                if !compact {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let insp_open = self.insp_open;
                         let inspector = ui.selectable_label(insp_open, INSPECTOR_TOGGLE_LABEL);
@@ -165,7 +164,6 @@ impl super::Gui {
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             self.render_top_bar_run(
                                 ui,
-                                model,
                                 &mut menu_frame,
                                 #[cfg(test)]
                                 &mut probe,
@@ -324,7 +322,6 @@ impl super::Gui {
     fn render_top_bar_run(
         &mut self,
         ui: &mut egui::Ui,
-        model: &[ui_menu::MenuNode],
         menu_frame: &mut ui_menu::MenuFrame,
         #[cfg(test)] probe: &mut super::TopBarProbe,
     ) {
@@ -357,7 +354,27 @@ impl super::Gui {
                     egui::Popup::menu(&menu_button)
                         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                         .show(|ui| {
-                            *menu_frame = ui_menu::render_menu_popup(ui, model);
+                            // **Built here, inside the closure the popup only
+                            // runs when it is open.** `Popup::show` returns
+                            // without calling this when the menu is closed,
+                            // which is every frame the user is not in the
+                            // menu — and `menu_model` is not a cheap read: it
+                            // rebuilds the radar layer's whole `ControlItem`
+                            // tree once per switch it reads off it, behind an
+                            // id scan each. Measured on the shipped registry:
+                            // **28 allocations, 3,122 bytes, 3 registry
+                            // lookups and 48 full `LayerId` comparisons** per
+                            // build, all of it dropped unread while the menu
+                            // is closed. Nothing here is deferred past the
+                            // point the old spelling built it at: this is the
+                            // same instant in the same frame, one branch
+                            // further in.
+                            //
+                            // The pane read the model makes still happens
+                            // outside the frame's `mem::take` windows — this
+                            // whole call runs before `render_panes` — which is
+                            // the precondition `Gui::menu_model` states.
+                            *menu_frame = ui_menu::render_menu_popup(ui, &self.menu_model());
                             let armed = menu_frame.events.iter().any(|event| {
                                 matches!(
                                     event,

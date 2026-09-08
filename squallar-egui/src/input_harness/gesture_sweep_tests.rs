@@ -210,10 +210,9 @@ fn one_sweep_loop_clicks_every_registered_target_exactly_as_scheduled() {
 /// the mobile view."* It is not the rigging. It is the layout, and the rig was
 /// unable to see it.
 ///
-/// **MEASURED MECHANISM.** `render_top_bar` computes
-/// `let model = (!compact).then(|| self.menu_model())` and registers
+/// **MEASURED MECHANISM.** `render_top_bar` registers
 /// [`ui_sweep::LAYERS_TOGGLE`] and [`ui_sweep::INSPECTOR_TOGGLE`] **inside**
-/// `if let Some(model) = &model`. On `WidthClass::Compact` that branch never
+/// its `if !compact` branch. On `WidthClass::Compact` that branch never
 /// runs, so neither control registers a rect. The sweep therefore never opens
 /// the layers panel and never opens the inspector — and because
 /// [`ui_sweep::INSPECTOR_CLOSE`] and the slider are drawn *by* the inspector,

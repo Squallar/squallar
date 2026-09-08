@@ -94,6 +94,10 @@ pub(crate) use ui_menu::DrawnMenuLeaf;
 #[cfg(test)]
 #[cfg(test)]
 pub(crate) use ui_menu::VOLUME_PANE_LABEL;
+/// How many menu models have been built on this thread — see
+/// [`ui_menu::build_count`].
+#[cfg(test)]
+pub(crate) use ui_menu::build_count as menu_build_count;
 #[cfg(test)]
 pub(crate) use ui_menu::{DRAW_CROSS_SECTION_LABEL, PICK_REGION_LABEL};
 #[path = "ui_map.rs"]
