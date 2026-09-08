@@ -4,25 +4,36 @@
 //! instants per frame; `finalize` folds them into fixed-shape histograms
 //! ([`squallar_device_profile::hist::Hist`]) once the frame's outcome is
 //! known. **Product telemetry, not a campaign instrument**: always on, no
-//! feature gate, and the per-frame cost is **fifty-three clock reads,
-//! sixty-three integer bin searches** and two `u32` comparisons.
+//! feature gate, and the per-frame cost is **sixty-three clock reads on a
+//! one-pane plan-view frame, seventy-one integer bin searches** and two
+//! `u32` comparisons.
 //!
 //! The clock reads, counted where they are taken: the ledger's own **eight**
 //! stamps (its six `mark_*`/`finalize` reads plus the pair the acquire
 //! closure hands back), the **six** `handle_redraw` takes across its head,
-//! the **seven** `setup_egui_frame` takes across `pump`, the **fourteen**
-//! `Gui::ui` takes on its way through (six in `ui_phased`, two inside
-//! `render_shell_phased`, six more inside `render_stack_and_inspector`), the
+//! the **seven** `setup_egui_frame` takes across `pump`, the
+//! **twenty-four** `Gui::ui` takes on its way through (six in `ui_phased`,
+//! two inside `render_shell_phased`, six more inside
+//! `render_stack_and_inspector`, ten inside `render_panes`), the
 //! **five** the egui pass takes, the **six** `handle_redraw`'s tail takes
 //! (five in the tail, one inside `process_gui_actions`) and the **seven**
 //! `present_frame` takes after the acquire returns.
 //!
-//! **Fifty-three is the frame that reaches the layer panel; a frame that does
-//! not costs forty-nine.** `render_stack_and_inspector` has three early
+//! **Sixty-three is the frame that reaches the layer panel; a frame that does
+//! not costs fifty-nine.** `render_stack_and_inspector` has three early
 //! returns — a compact width, a faded chrome, both slide factors at zero —
 //! and every one of them fills its remaining five stamps from ONE clock read
 //! (`shell_api::StackStamps::skipped_after`). So the [`StackHists`] split is
 //! six reads at most and two at least, and never a read per skipped region.
+//!
+//! **Ten of the twenty-four are `render_panes`', and they are the one count
+//! in this block that moves with the SCENE.** [`PanesHists`]' seven cuts are
+//! nanosecond sums across a pane loop, so that call takes three reads before
+//! the loop, one after it, and **six per plan-view pane** — a pane that is
+//! not a plan view runs no `walkers::Map` widget of its own and takes three.
+//! Sixty-three is therefore the ONE-pane plan-view frame: a second plan-view
+//! pane makes it sixty-nine, and a one-pane volume frame costs sixty. Count
+//! the panes before quoting the figure.
 //!
 //! **Two neighbouring instruments are NOT in the fifty-three, and naming them
 //! is what stops the next recount oscillating.** `EguiRenderer` takes a sixth
@@ -34,10 +45,12 @@
 //!
 //! The bin searches, on a presented interact frame: ten outside the splits
 //! (one service, one service-less-present, six segments, one acquire, one
-//! cadence) and fifty-three in them — **seven** the `pre` split ([`PreHists`]), **eight** the `pump`
+//! cadence) and sixty-one in them — **seven** the `pre` split ([`PreHists`]), **eight** the `pump`
 //! split ([`PumpHists`]), **nine** the `ui` split ([`UiHists`]), **seven**
 //! the `stack` split ([`StackHists`], one level below the `ui` nine and never
-//! added to them), **six** the
+//! added to them), **eight** the `panes` split ([`PanesHists`], the `stack`
+//! split's sibling one level below a different `ui` cut, and never added to
+//! those nine either), **six** the
 //! `prepare` split ([`PrepareHists`]), **seven** the `post` split
 //! ([`PostHists`]) and **nine** the `finish` split ([`FinishHists`]). All but
 //! the last record only on the frames their own segment does; the `finish`
@@ -588,8 +601,16 @@ pub(crate) struct UiHists {
     /// The time dialog, between the shell and the panes. Its own cut because
     /// a dialog that is not open should not be charged to the map surfaces.
     pub(crate) dialog: Hist,
-    /// The time dialog and `render_panes` — every map surface, and on a
-    /// toggle frame the pane that acts on the click `shell` just read.
+    /// `render_panes` — every map surface, and on a toggle frame the pane
+    /// that acts on the click `shell` just read.
+    ///
+    /// **The time dialog is NOT in this cut.** It was, until `dialog` was cut
+    /// out above; this doc went on saying otherwise for two landings, which
+    /// is what `ui_phase_micros`' sixth and seventh entries settle —
+    /// `dialog` closes on `phases.dialog` and this one opens on it.
+    ///
+    /// Opened up one level further by [`PanesHists`], whose seven named cuts
+    /// and residual telescope to exactly this one.
     pub(crate) panes: Hist,
     /// The four pending appliers (pane view, section line, region, section
     /// edit) and the fade toggle: state the surfaces above deferred out of
@@ -716,6 +737,102 @@ pub(crate) struct StackHists {
     /// and it is this family's residual, closing on the parent's own right
     /// boundary so that nothing can hide behind it.
     pub(crate) settle: Hist,
+}
+
+/// Where the `ui` split's `panes` cut went, one level below [`UiHists`].
+///
+/// # Denominator
+///
+/// **Exactly [`UiHists::panes`]'s** — presented interact frames that left
+/// `ui_phases` — and that equality is the design, not a coincidence: the
+/// eight `record` calls sit in the very block the seventh `ui` cut's does, so
+/// `panes.residual.total()` and `ui.panes.total()` cannot differ
+/// (`the_panes_family_records_on_exactly_the_frames_its_parent_does`).
+/// [`StackHists`]' denominator note applies here word for word: a family with
+/// a NARROWER `n` than its parent would still telescope on the frames it
+/// holds, and every share read off it would be arithmetic over the wrong
+/// denominator.
+///
+/// **Never added to `frame ui (panes)`.** These are not a tenth `ui` cut
+/// beside it; they *are* it, opened up. The reporting prefix is deliberately
+/// `frame panes` — a third spelling, so that no reader pattern-matching
+/// `frame ui` can add two levels of the same span together. [`StackHists`]'
+/// choice exactly.
+///
+/// # Nanoseconds in, microseconds out — and why that forces a residual
+///
+/// [`StackHists`] has no `residual` because its seven cuts are bracketed by
+/// instants and the last closes on the parent's own right boundary. This one
+/// cannot do that: `render_panes` runs a **pane loop**, and four of the seven
+/// named cuts are sums across it. So [`squallar_egui::shell_api::PanesCuts`]
+/// accumulates in nanoseconds and converts once, here —
+/// [`DispatchCuts`]' pattern for [`DispatchCuts`]' reason. Truncating per
+/// pane instead would round every sub-microsecond piece to zero and hand the
+/// difference to the residual, which is the one figure that must not absorb
+/// an artifact.
+///
+/// The residual is then `panes` minus the seven — **arithmetic, not
+/// inference**. It holds three things and nothing else: up to seven
+/// microseconds of truncation dust per frame (one per named cut), the return
+/// out of `render_panes` after its last charge, and any span this
+/// decomposition genuinely failed to name. A residual of a few microseconds
+/// per frame is the first of those; a large one is the third, and is a bug in
+/// this split rather than a finding about the frame.
+///
+/// # What this split was cut to answer
+///
+/// `panes` is the largest cut of the largest segment. Measured on the Tier-2
+/// browser rig against main `7dad44888`, scene `pan-zoom-2d`, 1 pane KTLX, 18
+/// layers, 2878x1566 canvas, on two **software** arms that are never merged —
+/// Firefox on Mesa llvmpipe and Chromium on SwiftShader — `ui` was the
+/// largest segment mean and the largest segment p99 on all six legs, and
+/// `ui_panes` held **81.6 %** of `ui` on Firefox (leading 76 of 80 latched
+/// worst frames) and **40.1 %** on Chromium (55 of 62). One undivided cut
+/// cannot say which of seven things that is.
+///
+/// **Those figures are from software rasterisers on a contended box** (1-min
+/// loadavg 14.4–25.5), so the absolutes are inflated; the shares and the
+/// leader-counts are what they support. On hardware `finish` shrinks — it is
+/// 95.6 % `finish:submit` on llvmpipe — so `ui`'s share would RISE. That is a
+/// mechanism and not a measurement, and no number is quoted for it here.
+///
+/// # `widget` is structurally absent, not small, on two of the three arms
+///
+/// Only a plan-view pane runs a `walkers::Map` widget. A cross-section or
+/// volume pane leaves `widget` at exactly zero and files its whole arm under
+/// `content`, so `widget / content` is a ratio about the SCENE before it is
+/// one about the code. Read `n` and the scene's pane kinds before reading
+/// that pair — [`StackHists`]' "check the leg produces the frames" note, one
+/// level down.
+#[derive(Default)]
+pub(crate) struct PanesHists {
+    /// See [`squallar_egui::shell_api::PanesCuts::setup_ns`] — the prologue
+    /// before the central panel opens, tile-slot decisions included.
+    pub(crate) setup: Hist,
+    /// See [`squallar_egui::shell_api::PanesCuts::panel_ns`] — the panel's
+    /// head, before the first pane.
+    pub(crate) panel: Hist,
+    /// See [`squallar_egui::shell_api::PanesCuts::resolve_ns`] — per pane,
+    /// everything before its render-view arm. Scales with pane count.
+    pub(crate) resolve: Hist,
+    /// See [`squallar_egui::shell_api::PanesCuts::widget_ns`] — per pane, the
+    /// `walkers::Map` widget's own frame around this crate's draw closure.
+    /// **Zero on a pane that is not a plan view.**
+    pub(crate) widget: Hist,
+    /// See [`squallar_egui::shell_api::PanesCuts::content_ns`] — per pane,
+    /// the draw context this crate builds and the enabled-layer walk it hands
+    /// over to. The only cut here that scales with layer data.
+    pub(crate) content: Hist,
+    /// See [`squallar_egui::shell_api::PanesCuts::tools_ns`] — per pane, the
+    /// furniture around the content. Inert unless a draw tool is armed.
+    pub(crate) tools: Hist,
+    /// See [`squallar_egui::shell_api::PanesCuts::credit_ns`] — the
+    /// epilogue: dividers, credit, viewport sync and the tile restores.
+    pub(crate) credit: Hist,
+    /// `panes` minus the seven above — arithmetic, not inference. See this
+    /// type's "Nanoseconds in, microseconds out" note for the three things it
+    /// can hold.
+    pub(crate) residual: Hist,
 }
 
 /// Where the `post` segment's time went, cut at the seams `handle_redraw`'s
@@ -1082,6 +1199,8 @@ pub(crate) struct FrameLedger {
     ui: UiHists,
     /// See [`StackHists`] — `ui.stack`, opened up, same frames.
     stack: StackHists,
+    /// See [`PanesHists`] — `ui.panes`, opened up, same frames.
+    panes: PanesHists,
     /// See [`PumpHists`] — `segments.pump`, opened up, same frames.
     pump: PumpHists,
     /// See [`PostHists`] — `segments.post`, opened up, same frames.
@@ -1267,6 +1386,47 @@ fn dispatch_cut_micros(cuts: DispatchCuts, dispatch: u32) -> [u32; 7] {
         hitmap,
         offload,
         dispatch.saturating_sub(claimed),
+    ]
+}
+
+/// The eight cuts of the `ui` split's `panes` cut, in call order:
+/// `[setup, panel, resolve, widget, content, tools, credit, residual]` — see
+/// [`PanesHists`], whose fields these are.
+///
+/// `panes` is the parent cut in whole microseconds, as [`ui_phase_micros`]
+/// computed it; `cuts` is the nanosecond accumulation `render_panes` itself
+/// made across its pane loop. The residual is the parent minus the seven,
+/// saturating at zero — [`dispatch_cut_micros`]' shape and its reasoning
+/// verbatim, and a free function so the telescoping is testable without a
+/// frame.
+///
+/// **Saturating and not asserting**, for [`dispatch_cut_micros`]' reason: the
+/// seven are measured inside the span the parent brackets and cannot
+/// legitimately exceed it, but the parent is two clock reads and the seven
+/// are ten on a one-pane plan-view frame, and a clock that steps backwards
+/// between them would otherwise panic on the frame thread.
+fn panes_cut_micros(cuts: squallar_egui::shell_api::PanesCuts, panes: u32) -> [u32; 8] {
+    let us = |ns: u64| -> u32 { (ns / 1_000).min(u64::from(u32::MAX)) as u32 };
+    let named = [
+        us(cuts.setup_ns),
+        us(cuts.panel_ns),
+        us(cuts.resolve_ns),
+        us(cuts.widget_ns),
+        us(cuts.content_ns),
+        us(cuts.tools_ns),
+        us(cuts.credit_ns),
+    ];
+    let claimed = named.iter().fold(0u32, |sum, &cut| sum.saturating_add(cut));
+    let [setup, panel, resolve, widget, content, tools, credit] = named;
+    [
+        setup,
+        panel,
+        resolve,
+        widget,
+        content,
+        tools,
+        credit,
+        panes.saturating_sub(claimed),
     ]
 }
 
@@ -1837,6 +1997,36 @@ impl FrameLedger {
                 self.stack.render.record(render);
                 self.stack.inspector.record(inspector);
                 self.stack.settle.record(settle);
+                // And the seventh cut, opened up on the same terms: inside
+                // the very guard `ui.panes` records under, so the two
+                // families' `n` are equal BY CONSTRUCTION. Unlike the seven
+                // above these arrive as nanosecond sums over a pane loop, so
+                // the parent value -- `panes`, destructured five lines up --
+                // is what the residual is taken from. Zero new clock reads
+                // here: `render_panes` took them where the loop is.
+                let [
+                    panes_setup,
+                    panes_panel,
+                    panes_resolve,
+                    panes_widget,
+                    panes_content,
+                    panes_tools,
+                    panes_credit,
+                    panes_residual,
+                ] = panes_cut_micros(
+                    m.ui_phases
+                        .as_ref()
+                        .map_or_else(Default::default, |phases| phases.panes_cuts),
+                    panes,
+                );
+                self.panes.setup.record(panes_setup);
+                self.panes.panel.record(panes_panel);
+                self.panes.resolve.record(panes_resolve);
+                self.panes.widget.record(panes_widget);
+                self.panes.content.record(panes_content);
+                self.panes.tools.record(panes_tools);
+                self.panes.credit.record(panes_credit);
+                self.panes.residual.record(panes_residual);
             }
             // And the same for `post`, whose right-hand boundary is `now` —
             // the very instant this function opened with, so the sixth cut
@@ -1968,6 +2158,12 @@ impl FrameLedger {
         &self.stack
     }
 
+    /// See [`PanesHists`] — `ui_phases().panes`, opened up, and never added
+    /// to it.
+    pub(crate) fn panes_phases(&self) -> &PanesHists {
+        &self.panes
+    }
+
     pub(crate) fn ui_phases(&self) -> &UiHists {
         &self.ui
     }
@@ -2059,8 +2255,9 @@ mod tests {
     use super::{
         DispatchCuts, FinishPhaseStamps, Instant, PRESENT_CUT, PostPhaseStamps, PrePhaseStamps,
         PumpPhaseStamps, WorstFrame, dispatch_cut_micros, finish_phase_micros, latch_worst, micros,
-        post_phase_micros, pre_phase_micros, prepare_phase_micros, pump_phase_micros,
-        service_less_present_micros, service_micros, stack_phase_micros, ui_phase_micros,
+        panes_cut_micros, post_phase_micros, pre_phase_micros, prepare_phase_micros,
+        pump_phase_micros, service_less_present_micros, service_micros, stack_phase_micros,
+        ui_phase_micros,
     };
     use squallar_egui::shell_api::UiPhaseStamps;
     use squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps;
@@ -2170,6 +2367,13 @@ mod tests {
             panes: at(offsets[6]),
             applied: at(offsets[7]),
             stack: stack_stamps_flat(at(offsets[3])),
+            // The `panes` split's own seven are nanosecond sums this helper
+            // has no frame to take, and every cut of the level ABOVE them
+            // telescopes whatever they hold: an all-zero accumulation files
+            // the whole parent cut under `residual`, which is a coherent
+            // reading and not a claim about where pane time goes. The panes
+            // split has its own fixture -- see `panes_cuts`.
+            panes_cuts: squallar_egui::shell_api::PanesCuts::default(),
         }
     }
 
@@ -2344,6 +2548,7 @@ mod tests {
                 panes: shell + std::time::Duration::from_micros(5_000),
                 applied: shell + std::time::Duration::from_micros(5_500),
                 stack,
+                panes_cuts: squallar_egui::shell_api::PanesCuts::default(),
             },
             ui_end,
         );
@@ -2735,6 +2940,7 @@ mod tests {
                 panes: shell,
                 applied: shell,
                 stack,
+                panes_cuts: squallar_egui::shell_api::PanesCuts::default(),
             });
             ledger.finalize(true);
             let parent = agree(
@@ -2776,6 +2982,126 @@ mod tests {
         // `frame service (interact)` at n=0 because it takes no input at all,
         // so every interact-only family on it telescopes perfectly over an
         // empty sample and looks correct while measuring nothing.
+        assert_eq!(
+            parent, 2,
+            "the parent cut does not hold the two samples this test drove \
+             through it, so the per-step equality above proved nothing",
+        );
+    }
+
+    /// **`frame panes (*)`'s `n` is `frame ui (panes)`'s `n`, on every frame
+    /// and not only in the total** —
+    /// `the_stack_family_records_on_exactly_the_frames_its_parent_does`, one
+    /// cut across.
+    ///
+    /// Every figure this split supports is its own `sum` over the parent
+    /// cut's `sum`. A family with a narrower denominator would still
+    /// telescope on the frames it held and every share read off it would be
+    /// arithmetic over the wrong frame set, so the claim is about the frame
+    /// SET and the object has to be the trajectory — the pair after each
+    /// frame — not the pair at the end.
+    ///
+    /// **And a frame that accumulated nothing still contributes a sample.**
+    /// That is the difference from `DispatchHists`, which files no sample on
+    /// a frame that dispatched nothing: `render_panes` runs on every frame
+    /// that leaves `ui_phases`, so an all-zero accumulation is a frame whose
+    /// whole `panes` cut is `residual` — a reading, and never an absence.
+    #[test]
+    fn the_panes_family_records_on_exactly_the_frames_its_parent_does() {
+        let mut ledger = super::FrameLedger::default();
+
+        let agree = |ledger: &super::FrameLedger, after: &str| {
+            let parent = ledger.ui.panes.total();
+            for (name, family) in [
+                ("setup", &ledger.panes.setup),
+                ("panel", &ledger.panes.panel),
+                ("resolve", &ledger.panes.resolve),
+                ("widget", &ledger.panes.widget),
+                ("content", &ledger.panes.content),
+                ("tools", &ledger.panes.tools),
+                ("credit", &ledger.panes.credit),
+                ("residual", &ledger.panes.residual),
+            ] {
+                assert_eq!(
+                    family.total(),
+                    parent,
+                    "after {after}: `frame panes ({name})` stands at {} \
+                     samples against its parent `frame ui (panes)`'s {}. \
+                     Every share this family supports is its own sum over \
+                     that one, so a step where the two disagree is a share \
+                     computed between two different frame sets -- even if \
+                     they end level",
+                    family.total(),
+                    parent,
+                );
+            }
+            parent
+        };
+        agree(&ledger, "no frames at all");
+
+        // **One frame that accumulated and one that did not.** The second is
+        // the step a family guarded on "did this frame charge anything"
+        // would fail, and it is the common frame: a pane loop can run
+        // entirely inside the clock's grain on a cheap scene.
+        for (nth, charged) in [true, false].into_iter().enumerate() {
+            let start = Instant::now();
+            let statusbar = Instant::now();
+            let shell = Instant::now();
+            let ui_end = Instant::now();
+            ledger.cur.start = Some(start);
+            ledger.cur.setup = Some(start);
+            ledger.cur.ui_start = Some(start);
+            ledger.cur.ui_end = Some(ui_end);
+            ledger.cur.acquire = Some((ui_end, ui_end));
+            ledger.cur.present_return = Some(ui_end);
+            ledger.cur.ui_phases = Some(UiPhaseStamps {
+                polled: start,
+                laid_out: start,
+                topbar: start,
+                statusbar,
+                shell,
+                dialog: shell,
+                panes: shell,
+                applied: shell,
+                stack: stack_stamps_flat(statusbar),
+                panes_cuts: if charged {
+                    panes_cuts([1_000, 0, 0, 0, 2_000, 0, 0])
+                } else {
+                    squallar_egui::shell_api::PanesCuts::default()
+                },
+            });
+            ledger.finalize(true);
+            let parent = agree(
+                &ledger,
+                if charged {
+                    "a frame whose pane loop charged something"
+                } else {
+                    "a frame whose pane loop charged nothing"
+                },
+            );
+            assert_eq!(
+                parent,
+                nth as u64 + 1,
+                "the parent cut did not take a sample from a frame that left \
+                 ui_phases, so the equality above is holding two families \
+                 level at a standstill rather than through a frame",
+            );
+        }
+
+        // **A frame with no `ui_phases` at all.** The parent cut takes no
+        // sample and neither may this family: eight zeros would be eight
+        // false readings, not an absence.
+        let start = Instant::now();
+        let end = Instant::now();
+        ledger.cur.start = Some(start);
+        ledger.cur.setup = Some(start);
+        ledger.cur.ui_start = Some(start);
+        ledger.cur.ui_end = Some(end);
+        ledger.cur.acquire = Some((end, end));
+        ledger.cur.present_return = Some(end);
+        ledger.finalize(true);
+        let parent = agree(&ledger, "a frame that left no ui_phases");
+
         assert_eq!(
             parent, 2,
             "the parent cut does not hold the two samples this test drove \
@@ -4198,6 +4524,7 @@ mod tests {
             panes: dusty_start + std::time::Duration::from_nanos(ns[6]),
             applied: dusty_start + std::time::Duration::from_nanos(ns[7]),
             stack: stack_stamps_flat(dusty_start + std::time::Duration::from_nanos(ns[3])),
+            panes_cuts: squallar_egui::shell_api::PanesCuts::default(),
         };
         let dusty_end = dusty_start + std::time::Duration::from_nanos(at + 1_549_500);
         let dusty_cuts = ui_phase_micros(dusty_start, &dusty, dusty_end);
@@ -4249,6 +4576,7 @@ mod tests {
                 panes: Instant::now(),
                 applied: Instant::now(),
                 stack: stack_stamps_flat(live_statusbar),
+                panes_cuts: squallar_egui::shell_api::PanesCuts::default(),
             };
             let live_end = Instant::now();
             assert_telescopes_within_truncation(
@@ -4576,6 +4904,125 @@ mod tests {
         assert_eq!(seven[3], 8_000);
         assert_eq!(
             seven[6], 0,
+            "the residual went negative rather than to zero"
+        );
+    }
+
+    /// A `render_panes` accumulation stated in nanoseconds, one field at a
+    /// time — [`cuts`]' twin one family across.
+    fn panes_cuts(seven: [u64; 7]) -> squallar_egui::shell_api::PanesCuts {
+        squallar_egui::shell_api::PanesCuts {
+            setup_ns: seven[0],
+            panel_ns: seven[1],
+            resolve_ns: seven[2],
+            widget_ns: seven[3],
+            content_ns: seven[4],
+            tools_ns: seven[5],
+            credit_ns: seven[6],
+        }
+    }
+
+    /// **The eight telescope to `panes`.** The residual is defined as the
+    /// parent minus the seven named, so this cannot be an approximate
+    /// equality and no reading of the split may need one: any `render_panes`
+    /// time the seven do not name is *in* the eighth figure, not missing
+    /// from the report. `the_post_phases_telescope_to_post`'s property, and
+    /// `the_dispatch_cuts_telescope_to_dispatch`'s shape, since this family
+    /// accumulates across a loop rather than bracketing instants.
+    #[test]
+    fn the_panes_cuts_telescope_to_panes() {
+        let panes = 9_000;
+        // **Not 6_400 for `content`**: `geodesy_one_definition` reads a bare
+        // 6_400 in this tree as an earth radius in kilometres, and it read
+        // this fixture's assertion as exactly that. The precedent is
+        // `the_worst_frame_latch_keeps_the_largest_service` five hundred
+        // lines up; the figure below is arbitrary and carries no geodesy.
+        let eight = panes_cut_micros(
+            panes_cuts([
+                120_000, 40_000, 310_000, 900_000, 5_400_000, 30_000, 200_000,
+            ]),
+            panes,
+        );
+        assert_eq!(
+            eight.iter().copied().fold(0u32, u32::wrapping_add),
+            panes,
+            "the eight cuts of `panes` do not sum to it: {eight:?}",
+        );
+        // And the residual is the one absorbing the difference, not a cut.
+        assert_eq!(eight[..7], [120, 40, 310, 900, 5_400, 30, 200]);
+        assert_eq!(eight[7], 2_000);
+    }
+
+    /// **Every one of the seven can move the answer, and moves exactly two
+    /// figures.** Telescoping alone is satisfied by a degenerate split — one
+    /// cut holding everything and six spelled as the same accumulator
+    /// telescopes perfectly and decomposes nothing.
+    /// `every_ui_stamp_is_load_bearing_in_two_cuts`' shape for an
+    /// accumulator family: charge one field and its own cut rises by the
+    /// charge while the residual falls by exactly that, and nothing else
+    /// moves.
+    #[test]
+    fn every_panes_cut_is_load_bearing_against_the_residual() {
+        let panes = 20_000;
+        let flat = panes_cut_micros(panes_cuts([0; 7]), panes);
+        assert_eq!(
+            flat,
+            [0, 0, 0, 0, 0, 0, 0, panes],
+            "an unaccumulated frame does not file its whole parent under the \
+             residual, so the residual is not the parent minus the named",
+        );
+        for slot in 0..7 {
+            let mut ns = [0u64; 7];
+            ns[slot] = 3_000_000;
+            let moved = panes_cut_micros(panes_cuts(ns), panes);
+            for other in 0..7 {
+                let expect = if other == slot { 3_000 } else { 0 };
+                assert_eq!(
+                    moved[other], expect,
+                    "charging cut {slot} moved cut {other}: {moved:?}. Two \
+                     cuts reading one accumulator would telescope and \
+                     decompose nothing",
+                );
+            }
+            assert_eq!(
+                moved[7],
+                panes - 3_000,
+                "cut {slot}'s charge did not come out of the residual, so \
+                 the eight do not partition the parent",
+            );
+        }
+    }
+
+    /// **Sub-microsecond work is not rounded away**, and here that is a
+    /// per-PANE claim rather than a per-request one:
+    /// `many_sub_microsecond_visits_survive_into_the_cut_that_earned_them`
+    /// one family across. Six panes each spending 700 ns resolving is 4.2 µs
+    /// of a frame; converting per pane would have reported six zeros and
+    /// handed the whole of it to the residual, which is read as "time the
+    /// seven do not name".
+    #[test]
+    fn many_sub_microsecond_panes_survive_into_the_cut_that_earned_them() {
+        let mut accumulated = squallar_egui::shell_api::PanesCuts::default();
+        for _ in 0..6 {
+            squallar_egui::shell_api::PanesCuts::charge_ns(&mut accumulated.resolve_ns, 700);
+        }
+        let eight = panes_cut_micros(accumulated, 20);
+        assert_eq!(eight[2], 4, "resolve lost its sub-microsecond panes");
+        assert_eq!(eight[7], 16, "the residual absorbed them instead");
+    }
+
+    /// **A span the cuts overrun reports no residual, and does not panic** —
+    /// `cuts_that_overrun_their_span_report_a_zero_residual`, one family
+    /// across. The parent is two clock reads and the seven are ten on a
+    /// one-pane plan-view frame; a coarse or backward-stepping web clock can
+    /// order them wrongly, and a frame-thread panic in an always-on
+    /// instrument is a worse outcome than a zero.
+    #[test]
+    fn panes_cuts_that_overrun_their_span_report_a_zero_residual() {
+        let eight = panes_cut_micros(panes_cuts([0, 0, 0, 0, 8_000_000, 0, 0]), 3_000);
+        assert_eq!(eight[4], 8_000);
+        assert_eq!(
+            eight[7], 0,
             "the residual went negative rather than to zero"
         );
     }

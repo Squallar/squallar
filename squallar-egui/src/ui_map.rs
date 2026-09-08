@@ -1,4 +1,5 @@
 use crate::actions::GuiAction;
+use crate::shell_api::PanesCuts;
 use squallar_overlays::render::overlay_state::PaneRef;
 use squallar_radar::hover::{HoverSource, Reading};
 use squallar_radar::types::RenderView;
@@ -55,12 +56,26 @@ fn reason_headline(reason: &str) -> &str {
 
 impl super::Gui {
     /// Draw every visible pane, whatever kind each one is.
+    ///
+    /// Returns the frame's actions and [`PanesCuts`] — where this call's time
+    /// went, in nanoseconds, for `frame_ledger::PanesHists` to file against
+    /// the `ui` split's seventh cut. The cuts are contiguous over the whole
+    /// body, so the ledger's residual is that cut minus these seven and is
+    /// arithmetic rather than inference.
     pub(super) fn render_panes(
         &mut self,
         ui: &mut egui::Ui,
         excluded_rects: &[egui::Rect],
-    ) -> Vec<GuiAction> {
+    ) -> (Vec<GuiAction>, PanesCuts) {
         use walkers::{Map, Position};
+
+        // **This split's cursor, and it is never re-read at a seam.** Every
+        // `charge` closes the cut behind it and opens the one in front from
+        // ONE clock read; taking a second would leave the gap between the two
+        // in no cut at all and inflate the ledger's residual by the clock's
+        // own dust rather than by anything the frame did.
+        let mut cuts = PanesCuts::default();
+        let mut at = web_time::Instant::now();
 
         let mut actions = Vec::new();
         let ctx = ui.ctx().clone();
@@ -172,6 +187,8 @@ impl super::Gui {
             .map(|idx| self.tile_zoom_bias_for_pane(idx))
             .collect();
 
+        at = PanesCuts::charge(&mut cuts.setup_ns, at);
+
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
@@ -218,6 +235,7 @@ impl super::Gui {
                         .collect::<Vec<_>>(),
                 );
                 self.mirror_size_points = mirror_size_points;
+                at = PanesCuts::charge(&mut cuts.panel_ns, at);
 
                 for pane_idx in 0..pane_count {
                     let pane_rect = self.pane_layout.pane_rect(pane_idx, panel_rect);
@@ -317,6 +335,7 @@ impl super::Gui {
                             .id_salt(("pane_map", pane_idx)),
                     );
                     child_ui.set_clip_rect(pane_rect);
+                    at = PanesCuts::charge(&mut cuts.resolve_ns, at);
 
                     match pane.render_view() {
                         RenderView::PlanView => {
@@ -347,6 +366,15 @@ impl super::Gui {
                                         egui::DragPanButtons::PRIMARY
                                     })
                                     .show(&mut child_ui, |ui, _response, projector, memory| {
+                                        // Closes the widget's own way IN: the
+                                        // gesture handling and the projector
+                                        // walkers does before it hands the
+                                        // closure a `Ui`, plus this arm's own
+                                        // entry above (the pane-content
+                                        // record, which compiles to nothing
+                                        // outside tests, and the `Map`
+                                        // builder).
+                                        at = PanesCuts::charge(&mut cuts.widget_ns, at);
                                         let zoom = memory.zoom();
 
                                         if let Some(gesture) = gesture {
@@ -417,6 +445,7 @@ impl super::Gui {
                                             pane_idx,
                                             std::mem::take(&mut render_ctx.paint_order),
                                         ));
+                                        at = PanesCuts::charge(&mut cuts.content_ns, at);
 
                                         self.track_section_edit(
                                             ui,
@@ -431,8 +460,12 @@ impl super::Gui {
                                         );
 
                                         self.draw_region_boxes(ui, projector, pane_idx);
+                                        at = PanesCuts::charge(&mut cuts.tools_ns, at);
                                     });
                             }
+                            // And the widget's way OUT: the response walkers
+                            // finishes after the closure returns.
+                            at = PanesCuts::charge(&mut cuts.widget_ns, at);
                         }
                         RenderView::CrossSection => {
                             self.record_pane_content(pane_idx, RenderView::CrossSection, pane_rect);
@@ -453,6 +486,9 @@ impl super::Gui {
                                 &pane,
                                 &self.preferences,
                             );
+                            // No `walkers::Map` on this arm, so `widget` stays
+                            // at zero and the whole arm is `content`.
+                            at = PanesCuts::charge(&mut cuts.content_ns, at);
                         }
                         RenderView::Volume => {
                             self.record_pane_content(pane_idx, RenderView::Volume, pane_rect);
@@ -552,6 +588,9 @@ impl super::Gui {
                                 horizontal_color_scale,
                                 &pane,
                             );
+                            // As on the cross-section arm: no widget of its
+                            // own, so the whole arm is `content`.
+                            at = PanesCuts::charge(&mut cuts.content_ns, at);
                         }
                     }
 
@@ -590,6 +629,7 @@ impl super::Gui {
                         #[cfg(not(test))]
                         let _ = painted;
                     }
+                    at = PanesCuts::charge(&mut cuts.tools_ns, at);
                 } // end pane loop
 
                 self.click_consumed_frame = click_consumed;
@@ -696,8 +736,12 @@ impl super::Gui {
         self.floor_strips.end_pass();
         self.map_tiles.restore_base_tiles(tiles_owned);
         self.map_tiles.restore_terrain_tiles(terrain_owned);
+        // This split's right boundary. What is left between here and the
+        // ledger's own `UiPhaseStamps::panes` stamp is this function's return
+        // and nothing else, and that is what the ledger's residual holds.
+        PanesCuts::close(&mut cuts.credit_ns, at);
 
-        actions
+        (actions, cuts)
     }
 
     /// The lowest `y` this pane's colour scale may draw to.

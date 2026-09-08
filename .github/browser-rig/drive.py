@@ -3438,6 +3438,11 @@ var frame_pre_re = /frame pre \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|
 var frame_ui_re = /frame ui \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var frame_stack_re = /frame stack \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var frame_post_re = /frame post \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+// `frame ui (panes)`, opened up -- `frame_stack_re`'s sibling one cut across.
+// Seven mandatory groups and no optional one: `native_row.py` int()s every
+// group it is handed, so a field that can be absent has to reach the row as
+// None rather than be coerced to 0.
+var frame_panes_re = /frame panes \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 // `frame finish (*)` decomposes the frame tail. **Its denominator is not
 // the others': it is recorded for EVERY presented frame, idle included,
 // outside `finalize`'s interacted arm. So its `n` is LARGER than
@@ -3513,6 +3518,7 @@ var frame_service_less_present_all = [];
 var frame_pump_all = [];
 var frame_ui_all = [];
 var frame_stack_all = [];
+var frame_panes_all = [];
 var frame_finish_all = [];
 var frame_worst_all = [];
 var begins = [], loops = [];
@@ -3678,6 +3684,12 @@ for (var i = 0; i < C.length; i++) {
   if (x) frame_stack_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                                 sum: parseInt(x[3], 10), p50: x[4],
                                 p90: x[5], p99: x[6], hist: x[7] });
+  // `frame ui (panes)`, opened up. Same denominator by construction, never
+  // added to `frame ui (*)` and never to `frame segment (ui)`.
+  x = frame_panes_re.exec(m);
+  if (x) frame_panes_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
+                                sum: parseInt(x[3], 10), p50: x[4],
+                                p90: x[5], p99: x[6], hist: x[7] });
   x = frame_pump_re.exec(m);
   if (x) frame_pump_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                                sum: parseInt(x[3], 10), p50: x[4],
@@ -3818,6 +3830,7 @@ return { interact: interact, idle: idle, segments: segments, prep: prep,
          frame_service_less_present_all: frame_service_less_present_all,
          frame_ui_all: frame_ui_all,
          frame_stack_all: frame_stack_all,
+         frame_panes_all: frame_panes_all,
          frame_pump_all: frame_pump_all,
          frame_post_all: frame_post_all,
          frame_finish_all: frame_finish_all,
@@ -4383,6 +4396,7 @@ class FrameLineWatcher:
                             ("frame_pre_all", "pre"),
                             ("frame_ui_all", "ui"),
                             ("frame_stack_all", "stack"),
+                            ("frame_panes_all", "panes"),
                             ("frame_pump_all", "pump"),
                             ("frame_post_all", "post"),
                             ("frame_finish_all", "finish"),
@@ -4805,8 +4819,8 @@ def _window_stats(watcher, t0, t1, out):
 # arm never produced still has no key, so an absent arm stays an ABSENCE and
 # not a zero -- that property is the dict's, not this list's.
 WINDOW_FAMILY_PREFIXES = ("segment:", "prepare:", "post:", "dispatch:",
-                          "pre:", "ui:", "stack:", "pump:", "finish:",
-                          "take:", "phase:", "lesspresent:")
+                          "pre:", "ui:", "stack:", "panes:", "pump:",
+                          "finish:", "take:", "phase:", "lesspresent:")
 
 
 def watcher_named_in(gw):

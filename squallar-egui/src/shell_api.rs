@@ -410,7 +410,9 @@ pub struct FrameDiagnostics<'a> {
 /// against the wrong shape, so the count is restated here whenever a stamp is
 /// added — [`StackStamps`] below is the ninth through the fourteenth, and it
 /// deliberately does NOT change the nine: those six bound cuts of `stack`,
-/// which is one cut of this family, not a tenth beside them.
+/// which is one cut of this family, not a tenth beside them. [`PanesCuts`] is
+/// not a stamp at all — it is nanosecond sums over `render_panes`' pane loop
+/// — and for the same reason does not change the nine either.
 #[derive(Clone, Copy, Debug)]
 pub struct UiPhaseStamps {
     /// After the frame's polls: the site-table republish, the auto-poll
@@ -449,6 +451,16 @@ pub struct UiPhaseStamps {
     /// App's call site keeps its tuple arity and the App layer gains no new
     /// reach into the Gui: the six ride the stamps the ledger already takes.
     pub stack: StackStamps,
+    /// Where `render_panes` spent the seventh cut — [`UiPhaseStamps::dialog`]
+    /// to [`UiPhaseStamps::panes`], opened up. See [`PanesCuts`].
+    ///
+    /// **Nanosecond sums, not instants**, because that cut runs a pane loop
+    /// and four of its seven pieces are sums across it; [`StackStamps`]'
+    /// six bound one straight-line span and can be instants. Carried inside
+    /// this struct for [`UiPhaseStamps::stack`]'s reason exactly: the App's
+    /// call site keeps its arity and the App layer gains no new reach into
+    /// the Gui.
+    pub panes_cuts: PanesCuts,
 }
 
 /// Where `Gui::render_stack_and_inspector` crossed its own boundaries — the
@@ -526,6 +538,118 @@ impl StackStamps {
             rendered: now,
             inspected: now,
         }
+    }
+}
+
+/// What one `Gui::render_panes` call spent, by sub-cut, accumulated in
+/// **nanoseconds**.
+///
+/// # Why nanoseconds, and why this is not a `Stamps` type
+///
+/// [`StackStamps`]' six siblings each bracket a single span between two
+/// instants, so instants telescope for them. `render_panes` runs a **loop**,
+/// and four of the seven cuts below are sums across it. Truncating each to
+/// whole microseconds once per pane would round every sub-microsecond piece
+/// to zero and hand the difference to the residual — the one figure that must
+/// not absorb an artifact, because it is read as "time these seven do not
+/// name". `frame_ledger::DispatchCuts` is the same shape for the same reason.
+///
+/// # The seven partition the call, and nothing overlaps
+///
+/// `setup` and `panel` are the frame's two prologues, `resolve`/`widget`/
+/// `content`/`tools` are per-pane sums over the pane loop, and `credit` is
+/// the epilogue that closes on the function's own return. Together they are
+/// contiguous over the whole call, so `frame_ledger::PanesHists`' residual is
+/// the parent cut minus these — arithmetic, never inference.
+///
+/// **A pane that is not a plan view leaves `widget` at zero and files its
+/// whole arm under `content`.** Only the plan-view arm runs a `walkers::Map`
+/// widget, so `widget` is structurally absent on a cross-section or volume
+/// pane rather than small — read it beside `content`, never alone.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct PanesCuts {
+    /// The prologue before the central panel opens: the refusal-plate text,
+    /// the per-pane cost vector, the visible-pane count, and the basemap and
+    /// terrain slot decisions (`ensure_base_tiles` / `release_base_tiles` and
+    /// their terrain twins) with the two takes that follow them. Scales with
+    /// what the tile slots have to do, which on a steady frame is nothing.
+    pub setup_ns: u64,
+    /// The panel's own head, before the first pane: the colour-scale
+    /// orientation, `detect_active_pane_click`, the multi-pane viewport
+    /// snapshot, `dismiss_overlay_popups`, the floor set and
+    /// `floor_strip_plan`. Scales with pane count and with nothing else.
+    pub panel_ns: u64,
+    /// Per pane, everything before its render-view arm: the pane rect, the
+    /// colour-scale floor (which measures through the painter), the pane's
+    /// take out of the slice, the centre, the pointer and gesture resolve and
+    /// the child `Ui`. Scales with pane count.
+    pub resolve_ns: u64,
+    /// Per pane, the `walkers::Map` widget's own frame **around** this
+    /// crate's draw closure — the gesture handling and the projector on the
+    /// way in, the response on the way out. Zero on a pane that is not a plan
+    /// view. Scales with pane count, not with layer data.
+    pub widget_ns: u64,
+    /// Per pane, what the pane actually draws.
+    ///
+    /// On a plan view: the zoom read, the armed gesture's tracking, the
+    /// `PaneRenderCtx` this crate builds to hand over (the excluded-rect and
+    /// user-fix clones are in here, not in `resolve`), and
+    /// `render_pane_map_content` — the whole enabled-layer walk. On a
+    /// cross-section or volume pane: the entire arm.
+    ///
+    /// Scales with **layer data**, and is the only cut here that does.
+    pub content_ns: u64,
+    /// Per pane, the furniture around the content: the section-edit tracker,
+    /// the section tracks and the region boxes inside the map closure, and
+    /// after the arm the armed-hint chip, the pane's restore into the slice
+    /// and its border. Scales with pane count; all three draw tools are inert
+    /// unless one is armed.
+    pub tools_ns: u64,
+    /// The epilogue, and this split's right boundary: the pane dividers, the
+    /// basemap and terrain credit, `sync_viewports`, and after the panel
+    /// closes the floor-strip pass end and the two tile restores. Drawn once
+    /// per panel however many panes there are.
+    pub credit_ns: u64,
+}
+
+impl PanesCuts {
+    /// Charge `ns` to `slot`, saturating.
+    ///
+    /// **The accumulation is nanoseconds and converts once**, in
+    /// `frame_ledger::panes_cut_micros`. Truncating to whole microseconds
+    /// here — once per pane — would round every sub-microsecond piece to zero
+    /// and hand the difference to the residual, which is the one figure that
+    /// must not absorb an artifact. `frame_ledger::DispatchCuts` carries the
+    /// same rule for the same reason.
+    pub fn charge_ns(slot: &mut u64, ns: u64) {
+        *slot = slot.saturating_add(ns);
+    }
+
+    /// Charge the span from `from` to now against `slot`, and return the
+    /// instant that closed it so the caller can carry it as its cursor.
+    ///
+    /// **One clock read.** The cuts are contiguous, so a seam's instant both
+    /// closes the cut behind it and opens the one in front; taking two would
+    /// leave the gap between them in no cut at all and quietly inflate the
+    /// residual.
+    #[must_use]
+    pub(crate) fn charge(slot: &mut u64, from: web_time::Instant) -> web_time::Instant {
+        let now = web_time::Instant::now();
+        Self::charge_ns(
+            slot,
+            now.duration_since(from)
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64,
+        );
+        now
+    }
+
+    /// The last charge of a call, where no cut opens after it. Spelled apart
+    /// from [`PanesCuts::charge`] so that one can stay `#[must_use]`: a
+    /// dropped cursor mid-call would leave the next cut measuring from the
+    /// wrong instant, and that is a mistake worth a compile error.
+    pub(crate) fn close(slot: &mut u64, from: web_time::Instant) {
+        let _ = Self::charge(slot, from);
     }
 }
 

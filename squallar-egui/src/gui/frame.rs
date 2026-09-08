@@ -198,7 +198,11 @@ impl Gui {
         }
         let dialog_done = web_time::Instant::now();
 
-        actions.extend(self.render_panes(&mut root_ui, &shell.out.excluded_rects));
+        // The seventh `ui` cut, and its own seven sub-cuts beside it: the
+        // call runs a pane loop, so those are nanosecond sums it accumulates
+        // rather than instants this function could stamp.
+        let (pane_actions, panes_cuts) = self.render_panes(&mut root_ui, &shell.out.excluded_rects);
+        actions.extend(pane_actions);
         let panes = web_time::Instant::now();
 
         self.apply_pending_pane_view(&mut actions);
@@ -261,6 +265,10 @@ impl Gui {
                 // carried here rather than returned beside the tuple: the
                 // App's call site keeps its arity and gains no new reach.
                 stack: shell.stack,
+                // And the panes' own seven, on the same terms and for the
+                // same reason — nanosecond sums, not stamps, because the cut
+                // they open is a loop.
+                panes_cuts,
             },
             retired,
         )

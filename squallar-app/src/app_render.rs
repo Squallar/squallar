@@ -1016,6 +1016,57 @@ fn frame_stack_lines(s: &crate::frame_ledger::StackHists) -> [String; 7] {
     ]
 }
 
+/// The eight `frame panes (<name>):` lines — `frame ui (panes)`, opened up.
+///
+/// Denominator: **exactly `frame ui (panes)`'s**, and by construction rather
+/// than by inspection — the eight `record` calls sit inside the very guard
+/// the seventh `ui` cut's does, so the two families' `n` cannot differ. Seven
+/// named cuts plus a residual, so they telescope to that cut's `sum` exactly
+/// rather than to within a truncation bound: the residual is defined as the
+/// parent minus the seven and absorbs the truncation itself.
+///
+/// **Never added to `frame ui (*)` and never to `frame segment (ui)`.** Each
+/// is the one below it, opened up, and adding any pair double-counts the same
+/// microseconds under two headings. The prefix is a third spelling —
+/// `frame panes`, not `frame ui` — precisely so that a reader pattern-matching
+/// on `frame ui` cannot sum two levels of one span. `frame stack (…)`'s
+/// choice, for its reason, one cut across.
+///
+/// # Read this family off `sum`, and read `n` first
+///
+/// `Hist` is four bins per octave and carries no maximum, so every percentile
+/// on these lines is a bin EDGE and therefore a lower bound, and percentiles
+/// never add. The share that answers "which of the seven is `panes`" is this
+/// line's `sum` over `frame ui (panes)`'s `sum`, both carried exactly.
+///
+/// And `n` first, because every cut here is interact-only: a leg that takes
+/// no input records `n=0` and the eight telescope perfectly over nothing —
+/// indistinguishable, on the artifact, from a correct instrument. The rig's
+/// `wide` leg reads `frame service (interact)` at `n=0` for exactly that
+/// reason.
+///
+/// # `frame panes (widget)` is an absence on two of the three pane kinds
+///
+/// Only a plan-view pane runs a `walkers::Map` widget; a cross-section or
+/// volume pane files its whole arm under `content` and leaves `widget` at
+/// exactly zero. So a zero `widget` is a fact about the scene's pane kinds
+/// before it is one about the code, and `widget` against `content` is not a
+/// ratio to quote without saying which kinds the panes were.
+///
+/// Emitted every tick, `n=0` included, on [`frame_segment_lines`]' terms.
+fn frame_panes_lines(p: &crate::frame_ledger::PanesHists) -> [String; 8] {
+    [
+        named_hist_line("frame panes", "setup", &p.setup),
+        named_hist_line("frame panes", "panel", &p.panel),
+        named_hist_line("frame panes", "resolve", &p.resolve),
+        named_hist_line("frame panes", "widget", &p.widget),
+        named_hist_line("frame panes", "content", &p.content),
+        named_hist_line("frame panes", "tools", &p.tools),
+        named_hist_line("frame panes", "credit", &p.credit),
+        named_hist_line("frame panes", "residual", &p.residual),
+    ]
+}
+
 /// The eight `frame pump (<name>):` lines — the `pump` segment, opened up.
 ///
 /// Same denominator as `frame segment (pump)` — presented interact frames —
@@ -2495,6 +2546,14 @@ impl super::App {
         // construction, seven contiguous cuts of that one cut — never added
         // to it and never to `frame segment (ui)`. See `frame_stack_lines`.
         for line in frame_stack_lines(ledger.stack_phases()) {
+            say_telemetry(loud, &line);
+        }
+        // `frame stack`'s sibling one cut across: which part of `render_panes`
+        // owns the largest cut of the largest segment. Same denominator as
+        // `frame ui (panes)` by construction, seven named cuts and a residual
+        // — never added to it and never to `frame segment (ui)`. See
+        // `frame_panes_lines`.
+        for line in frame_panes_lines(ledger.panes_phases()) {
             say_telemetry(loud, &line);
         }
         // The `pump` segment above, opened up at the seams `setup_egui_frame`

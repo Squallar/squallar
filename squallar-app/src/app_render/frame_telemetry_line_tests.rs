@@ -876,6 +876,8 @@ fn every_frame_cut_family_the_app_writes_is_scraped_and_windowed_by_the_rig() {
         // rest and is subject to both halves of this gate: a probe that reads
         // it, and a window prefix that keeps it once read.
         ("frame stack", "stack"),
+        // The same, one cut across: the split below `frame ui (panes)`.
+        ("frame panes", "panes"),
         ("frame post", "post"),
         ("frame pump", "pump"),
         ("frame dispatch", "dispatch"),
@@ -1210,6 +1212,12 @@ fn every_frame_line_family_the_app_writes_has_a_named_rig_probe() {
         // pattern-matching `frame ui` must not be able to sum two levels of
         // the same span, so this family is neither `ui` nor a `ui` cut name.
         ("stack", &["frame_stack_re"]),
+        // `frame ui (panes)`, opened up — `stack`'s sibling one cut across,
+        // and a fourth prefix for the third one's reason: `panes` is also a
+        // `ui` CUT NAME, so a probe anchored on anything looser than the
+        // literal `frame panes (` would scrape `frame ui (panes)` as one of
+        // its own eight.
+        ("panes", &["frame_panes_re"]),
         // Three probes, one family word. `frame service less present (…)`
         // is the SAME `service` family word — the enumeration below reads to
         // the first non-lowercase character — and it is deliberately the
@@ -1780,6 +1788,164 @@ fn the_rig_reads_the_stack_lines_the_app_actually_writes() {
         pattern("frame_stack_re").starts_with("frame stack \\("),
         "the rig's stack probe is no longer anchored on the literal the check \
          above tests for, so that check has stopped covering the collision",
+    );
+}
+
+/// The `frame panes (…)` sentence, pinned as a literal.
+///
+/// Same formatter as `frame ui (…)` and `frame stack (…)`, and deliberately a
+/// **fourth prefix**: the eight are cuts of `frame ui (panes)`, which is
+/// itself a cut of `frame segment (ui)`. The `sum=` is the load-bearing field
+/// — 3 x 100 = 300, where every percentile of that histogram answers the
+/// bin's 106 us upper edge, which is why no share may be read off a
+/// percentile.
+#[test]
+fn the_frame_panes_line_reads_exactly_as_pinned() {
+    let mut h = Hist::new();
+    for _ in 0..3 {
+        h.record(100);
+    }
+    let mut slots = [0u32; 42];
+    slots[3] = 3;
+    let expected_hist = slots.map(|c| c.to_string()).join(",");
+    assert_eq!(
+        super::named_hist_line("frame panes", "content", &h),
+        format!(
+            "frame panes (content): n=3, sum=300 us, p50=106 us, p90=106 us, \
+             p99=106 us, hist={expected_hist}"
+        ),
+    );
+}
+
+/// All eight `panes` cuts are emitted, under their own names, every tick —
+/// and each carries its own histogram.
+///
+/// The `n` conjunct is what stops a mis-wired call from reading green:
+/// `content` carrying `widget`'s histogram would keep every name right and
+/// every figure wrong, and those two are the pair this split exists to tell
+/// apart — the layer walk against the map widget around it — so a swap there
+/// would answer the question backwards.
+#[test]
+fn every_panes_phase_is_reported_under_its_own_name() {
+    let mut phases = crate::frame_ledger::PanesHists::default();
+    // A different sample count per cut, so a swapped pair cannot pass.
+    for (slot, hist) in [
+        &mut phases.setup,
+        &mut phases.panel,
+        &mut phases.resolve,
+        &mut phases.widget,
+        &mut phases.content,
+        &mut phases.tools,
+        &mut phases.credit,
+        &mut phases.residual,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for _ in 0..=slot {
+            hist.record(1_000);
+        }
+    }
+    let lines = super::frame_panes_lines(&phases);
+    let names = [
+        "setup", "panel", "resolve", "widget", "content", "tools", "credit", "residual",
+    ];
+    assert_eq!(lines.len(), names.len());
+    for (slot, (line, name)) in lines.iter().zip(names).enumerate() {
+        assert!(
+            line.starts_with(&format!("frame panes ({name}): n={}, ", slot + 1)),
+            "panes cut {slot} reported as {line:?}, which is not {name}'s \
+             line carrying {name}'s histogram",
+        );
+    }
+}
+
+/// **The `panes` cuts do not collide with the two levels above them.**
+///
+/// `the_stack_cut_lines_are_not_mistakable_for_their_parents`, one cut
+/// across, and the collision is one word closer here: `panes` is a `ui` CUT
+/// NAME as well as this family's prefix, so `frame ui (panes)` and
+/// `frame panes (…)` share both words in the other order. A rig regex
+/// anchored loosely enough to match two of them would read a cut as its own
+/// parent — and because the eight sum to `frame ui (panes)`, which sums into
+/// `frame segment (ui)`, the mistake is *plausible arithmetic* rather than an
+/// obvious null.
+#[test]
+fn the_panes_cut_lines_are_not_mistakable_for_their_parents() {
+    let mut h = Hist::new();
+    h.record(1_000);
+    let parent_cut = super::named_hist_line("frame ui", "panes", &h);
+    assert!(
+        !parent_cut.starts_with("frame panes ("),
+        "the `frame ui (panes)` line {parent_cut:?} reads as one of its own \
+         cuts, so a reader would add the eight to the one they decompose",
+    );
+    assert!(
+        !parent_cut.contains("frame panes ("),
+        "the rig's panes anchor appears inside the `frame ui (panes)` line it \
+         decomposes: {parent_cut:?}",
+    );
+    let segment_line = super::named_hist_line("frame segment", "ui", &h);
+    assert!(
+        !segment_line.starts_with("frame panes ("),
+        "the ui segment line {segment_line:?} reads as a panes cut",
+    );
+    // And the other neighbour one level down: `frame stack (…)` is the same
+    // shape under a different parent cut, and the two are never added.
+    for line in super::frame_stack_lines(&crate::frame_ledger::StackHists::default()) {
+        assert!(
+            !line.starts_with("frame panes ("),
+            "the stack cut {line:?} reads as a panes cut, and the two \
+             decompose DIFFERENT cuts of `ui`",
+        );
+    }
+    for line in super::frame_panes_lines(&crate::frame_ledger::PanesHists::default()) {
+        assert!(
+            line.starts_with("frame panes ("),
+            "a panes cut is not under the cut prefix: {line:?}",
+        );
+        assert!(
+            !line.starts_with("frame ui ("),
+            "the panes cut {line:?} reads as a tenth `ui` cut, which a reader \
+             would add to the `ui` nine it is already inside",
+        );
+        assert!(
+            !line.starts_with("frame segment"),
+            "the panes cut {line:?} reads as a seventh frame segment",
+        );
+        assert!(
+            !line.starts_with("frame stack ("),
+            "the panes cut {line:?} reads as a `stack` cut, which decomposes \
+             a different cut of the same segment",
+        );
+    }
+}
+
+/// The rig's `frame panes` probe reads what the app writes.
+///
+/// `the_rig_reads_the_stack_lines_the_app_actually_writes`, one cut across: a
+/// family the app writes and the rig has no regex for is ABSENT from the
+/// artifact rather than empty. This family decomposes the largest cut of the
+/// largest segment, so the same absence here would leave 81.6 % of `ui`
+/// undecomposed on the arm that measured it.
+#[test]
+fn the_rig_reads_the_panes_lines_the_app_actually_writes() {
+    let mut h = Hist::new();
+    h.record(100);
+    h.record(4_000);
+    let hist = counts_string(&h);
+    assert_eq!(
+        super::named_hist_line("frame panes", "widget", &h),
+        rendered(
+            &pattern("frame_panes_re"),
+            &["widget", "2", "4100", "106", "4757", "4757", &hist],
+        ),
+        "the `frame panes (…)` line and the rig's probe have drifted",
+    );
+    assert!(
+        pattern("frame_panes_re").starts_with("frame panes \\("),
+        "the rig's panes probe is no longer anchored on the literal the \
+         collision check tests for, so that check has stopped covering it",
     );
 }
 
