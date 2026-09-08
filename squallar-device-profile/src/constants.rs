@@ -1076,29 +1076,80 @@ pub const fn mib(n: usize) -> usize {
 /// what a desktop-shaped one does. Mobile is **pinned** at the wasm floor:
 /// aarch64 is unmeasured and every mobile bracket is pinned until it is
 /// (`the_mobile_bracket_promotes_nothing_until_somebody_measures_aarch64`).
-/// Desktop starts at 160/192/64 — 114 tail entries, the user's own window at
-/// the tail (106) with eight to spare, and a parsed cache that restyles the
-/// common 1920x1200 canvas (96 tiles) wholly from cache; a 2560x1440 window
-/// between zooms (144 entries, 211 MB at the styled tail) is the floor's
-/// overrun and the step's fit (256 MiB, 183 entries) — and rises to
-/// 512/384/128 on a discrete adapter with a desktop shape, where a 3840x2160
-/// window between zooms (299 tiles, 437 MB at the tail) fits without the
-/// floor's help.
 ///
-/// **The parsed floor has surplus, and the surplus is AVAILABLE, not taken.**
-/// 192 MiB was argued as 96 x 2.09 MB = 201 MB held to 192; at 0.67 MB those
-/// same 96 tiles are **64 MB**, and the floor holds **300** of them. Every
-/// byte figure in this table is deliberately unchanged by that: the parse
-/// getting cheaper is strictly less memory for the same behaviour, and reading
-/// it as licence to keep three times the history would turn a measured saving
-/// into a wash.
+/// **The wasm parsed arm does not move when the parse gets cheaper, because
+/// its surplus is owed and not available.** 48 MiB held ~24.1 parses at the
+/// old tail and holds ~75.1 at this one; 64 MiB held ~32.1 and holds ~100.1.
+/// Against the half-step set this block argues the styled floor from — 106
+/// here, and **174** where the tree measures it today
+/// (`squallar_egui::tiles::measured::HALF_STEP_TILES`; the paragraphs above
+/// still carry the earlier ~106, which `docs/cross-platform-resource-limits.md`
+/// records as a count cap's ceiling rather than a working set) — the arm is
+/// short either way, before the parse got cheaper and after. So the whole
+/// 3.1x is spent on overrun the working-set floor was already carrying:
+/// nothing here is banked, and mobile stays pinned to it.
 ///
-/// Spending it is a product decision and nobody has taken it. What it would
-/// buy is a choice, not an obvious win — the surplus is either kept as history
-/// (more zoom levels restyle from cache, fewer refetches) or left as resident
-/// bytes the process no longer needs. The figures above are the measurement;
-/// the budgets stay where they are until somebody decides, and this comment is
-/// where the decision would be recorded.
+/// Desktop starts at 160/62/64 — 114 styled tail entries, the user's own
+/// window at the styled tail (106) with eight to spare, and a parsed cache
+/// that restyles the common 1920x1200 canvas (96 tiles) wholly from cache; a
+/// 2560x1440 window between zooms (144 styled entries, 211 MB at the styled
+/// tail) is the styled floor's overrun and the styled step's fit (256 MiB,
+/// 183 entries) — and rises to 512/192/128 on a discrete adapter with a
+/// desktop shape, where a 3840x2160 window between zooms (299 tiles, 437 MB
+/// at the styled tail) fits without the floor's help.
+///
+/// **Every parsed rung is now a canvas tile count times the parsed tail. At
+/// the step and the ceiling that is a DECISION taken here, and it is not the
+/// preservation of anything.** Read the paragraph above for what it actually
+/// derived: **96 is the only parsed count in it.** 144, 183 and 299 are styled
+/// counts — 144 x 1.46 MB = 211, 256 MiB / 1.46 MB = 183, 299 x 1.46 MB = 437.
+/// The parsed step and ceiling never had a canvas count at all. 256 and 384
+/// MiB are simply what somebody wrote, and 128.3 and 192.5 parses are what
+/// those bytes happened to buy at a cost that has since changed by 3.1x.
+///
+/// So **neither** reading preserves a decision, and the question is not which
+/// figure to keep but which quantity is worth deciding. Both were computed:
+///
+/// | rung | canvas | keep what the bytes BOUGHT | cover the CANVAS |
+/// |---|---|---:|---:|
+/// | floor | 1920x1200 | 96.2 -> 61.50 -> **62 MiB** | 96 -> 61.35 -> **62 MiB** |
+/// | step | 2560x1440 | 128.3 -> 82.00 -> **83 MiB** | 144 -> 92.03 -> **93 MiB** |
+/// | ceiling | 3840x2160 | 192.5 -> 123.00 -> **124 MiB** | 299 -> 191.08 -> **192 MiB** |
+///
+/// (parses -> exact MiB -> rounded up to the whole MiB, as the floor already was)
+///
+/// **Where the 78 MiB between them falls is the argument.** 87 % of it is the
+/// ceiling rung and 0 % is the floor: as landed the two readings give the
+/// floor the *same* 62 MiB, and unrounded the canvas reading is 0.15 MiB
+/// *smaller* there. The ceiling rung is the discrete-adapter desktop with a
+/// 3840x2160 canvas — the machine least constrained by resident footprint —
+/// and the floor is where a footprint target actually binds. The choice
+/// therefore never trades bytes against coverage where the bytes matter; it
+/// spends 68 MiB on a large-GPU desktop to cover that same desktop's canvas.
+///
+/// **The fact that argues against it, because it is real and was weighed.**
+/// The same change cut a parsed miss from **1.7756 ms to 1.0521 ms** on this
+/// fixture — a 40.7 % cut — so tolerating under-coverage is materially
+/// cheaper than it was when 256 and 384 MiB were written. That genuinely
+/// weakens the case for buying coverage and does not overturn it: 1.0521 ms
+/// is still **26 % of the 4 ms frame bar**, a miss is still the cost the
+/// cache exists to avoid, and the rung paying for it is the one with the
+/// memory to spare. Coverage of a named canvas is also a quantity a later
+/// reader can check against a window, where "128.3 parses" is only an
+/// artefact of arithmetic nobody performed on purpose.
+///
+/// Stated in both directions, because one alone misreads it: **parsed
+/// coverage RISES at two rungs while parsed bytes fall at all three.**
+/// 96/128/192 parses become 96/144/299; 192/256/384 MiB become 62/93/192.
+///
+/// The arithmetic, rounded up to the whole MiB the way the floor already was
+/// (96 x 2,092,002 = 191.53 -> mib(192)): 96 x 670,110 = 61.35 -> 62 MiB,
+/// 144 x 670,110 = 92.03 -> 93 MiB, 299 x 670,110 = 191.08 -> 192 MiB.
+/// `the_tile_allowances_are_the_written_figures_on_every_bracket` holds each
+/// rung against `count x tail` in **both** directions rather than against a
+/// byte literal, so the next tail measurement moves these for free — and
+/// cannot silently multiply a count the way fixed bytes under a 3.1x cheaper
+/// parse would have (300, 400 and 600 parses, chosen by nobody).
 ///
 /// **The host ceilings** (`*_TILE_HOST_CEILING_BYTES`) bound the three at each
 /// rung the way `APP_TEXTURE_BUDGET_BYTES` bounds the GPU sum, and
@@ -1123,11 +1174,16 @@ pub const MOBILE_TILE_HOST_CEILING_BYTES: usize = WASM_TILE_HOST_CEILING_BYTES[0
 
 /// The desktop arm. See [`WASM_TILE_STYLED_BYTES`].
 pub const DESKTOP_TILE_STYLED_BYTES: [usize; 3] = [mib(160), mib(256), mib(512)];
-pub const DESKTOP_TILE_PARSED_BYTES: [usize; 3] = [mib(192), mib(256), mib(384)];
+pub const DESKTOP_TILE_PARSED_BYTES: [usize; 3] = [mib(62), mib(93), mib(192)];
 pub const DESKTOP_TILE_TERRAIN_BYTES: [usize; 3] = [mib(64), mib(80), mib(128)];
-/// 416 / 592 / 1024 MiB of allowances at the three rungs. The ceiling rung is
-/// exactly its sum: nothing is slack there.
-pub const DESKTOP_TILE_HOST_CEILING_BYTES: [usize; 3] = [mib(448), mib(640), mib(1024)];
+/// 286 / 429 / 832 MiB of allowances at the three rungs, each rounded up to
+/// the next 64 MiB — which is what every host ceiling in this block already
+/// was, checked in `the_host_ceilings_are_their_sums_rounded_up_to_64_mib`.
+/// The ceiling rung is still exactly its sum, 832 being a multiple of 64:
+/// nothing is slack there. These fell with the parsed allowances; leaving
+/// them where they were would have failed `check_budgets`'s 1.25x snugness
+/// at the floor (448 over 286) and at the step (640 over 429).
+pub const DESKTOP_TILE_HOST_CEILING_BYTES: [usize; 3] = [mib(320), mib(448), mib(832)];
 
 /// The share of a **measured, probed or derived** GPU capacity the scene's
 /// need may occupy, as `(numerator, denominator)`: three quarters. Metal's own
@@ -1385,9 +1441,11 @@ const _: () = const {
             + WASM_TILE_PARSED_BYTES[rung]
             + WASM_TILE_TERRAIN_BYTES[rung];
         assert!(wasm <= WASM_TILE_HOST_CEILING_BYTES[rung]);
-        // `ceiling <= 1.25 x sum`, spelled without the product: the desktop
-        // ceiling rung is 1 GiB and `x 4` overflows a 32-bit `usize` on wasm32,
-        // where these constants compile too.
+        // `ceiling <= 1.25 x sum`, spelled without the product: these
+        // constants compile for wasm32 too, where `usize` is 32 bits and a
+        // `sum x 4` on a gibibyte-scale desktop rung overflows it. The rung
+        // that motivated the spelling was 1 GiB; it is 832 MiB today and the
+        // spelling stays, because the hazard is the scale and not one value.
         assert!(WASM_TILE_HOST_CEILING_BYTES[rung] <= wasm + wasm / 4);
         let desktop = DESKTOP_TILE_STYLED_BYTES[rung]
             + DESKTOP_TILE_PARSED_BYTES[rung]

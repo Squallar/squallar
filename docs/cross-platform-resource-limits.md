@@ -188,7 +188,7 @@ All `constants.rs` paths below are `squallar-device-profile/src/constants.rs`.
 | `LOOP_POOL_HYSTERESIS` / `LOOP_POOL_DWELL_FRAMES` | `constants.rs:345,349` | 1.25 / 15 | — | **runtime** — `LoopPoolState::observe` (`loop_pool.rs:421`) |
 | `MAX_LOOP_VOLUME_BUILDS_PER_FRAME` / `MAX_LOOP_SECTION_CUTS_PER_FRAME` | `constants.rs:369,223` | 1 / 1 | — | **runtime** (frame-time pacing, not memory) |
 | `VOLUME_OFFSCREEN_REFERENCE_PANE_PX` | `constants.rs:454` | [2560, 1440] | — | **runtime** |
-| ~~`TILE_CACHE_ENTRIES` / `PARSED_TILE_CACHE_ENTRIES`~~ → `BudgetLimits::{tile_styled_bytes, tile_parsed_bytes, tile_terrain_bytes}` | `squallar-device-profile/src/constants.rs`, `WASM_TILE_STYLED_BYTES` and neighbours | 48/64/64 · 48/64/64 · 25/32/32 MiB (wasm; the ceiling is the step until U1); mobile pinned at the wasm floor; 160/256/512 · 192/256/384 · 64/80/128 MiB (desktop) | — | **runtime**, inside `Budgets` since WO-6 — §11.2 |
+| ~~`TILE_CACHE_ENTRIES` / `PARSED_TILE_CACHE_ENTRIES`~~ → `BudgetLimits::{tile_styled_bytes, tile_parsed_bytes, tile_terrain_bytes}` | `squallar-device-profile/src/constants.rs`, `WASM_TILE_STYLED_BYTES` and neighbours | 48/64/64 · 48/64/64 · 25/32/32 MiB (wasm; the ceiling is the step until U1); mobile pinned at the wasm floor; 160/256/512 · 62/93/192 · 64/80/128 MiB (desktop; the parsed rungs are 96/144/299 tiles × the 670,110 B parsed tail — one canvas per rung. Only the floor's 96 was ever a parsed count; applying the step's and ceiling's canvases to this population is a decision, recorded with its rejected alternative on `WASM_TILE_STYLED_BYTES`) | — | **runtime**, inside `Budgets` since WO-6 — §11.2 |
 
 ### 1.3 Non-GPU pressure with no budget at all
 

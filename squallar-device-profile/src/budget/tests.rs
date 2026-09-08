@@ -1629,9 +1629,14 @@ fn the_mobile_bracket_promotes_nothing_until_somebody_measures_aarch64() {
 /// and at every rung.** The argument for each is on
 /// `constants::WASM_TILE_STYLED_BYTES`; this holds the arithmetic it was
 /// made from — styled / parsed / terrain at floor, step and ceiling — and the
-/// two relations the argument rests on: the styled floor holds 2,400 typical
-/// entries and not the 106-tile worst case, and desktop's parsed floor is
-/// what a 1920x1200 restyle needs.
+/// relations the argument rests on: the styled floor holds 2,400 typical
+/// entries and not the 106-tile worst case, and each of desktop's three
+/// parsed rungs is what one of the doc's three canvases restyles from cache.
+///
+/// The parsed rungs are pinned as `count x tail` **in both directions**, not
+/// as byte literals. The lower arm is the old claim; the upper arm is the one
+/// that would have caught this area's last defect, where a parse getting 3.1x
+/// cheaper at fixed bytes silently tripled every rung's count.
 #[test]
 fn the_tile_allowances_are_the_written_figures_on_every_bracket() {
     let mib = |n: usize| n * 1024 * 1024;
@@ -1654,9 +1659,9 @@ fn the_tile_allowances_are_the_written_figures_on_every_bracket() {
         (
             BudgetLimits::DESKTOP,
             [160, 256, 512],
-            [192, 256, 384],
+            [62, 93, 192],
             [64, 80, 128],
-            [448, 640, 1024],
+            [320, 448, 832],
         ),
     ] {
         let name = limits.name;
@@ -1728,21 +1733,48 @@ fn the_tile_allowances_are_the_written_figures_on_every_bracket() {
          between zooms",
         desktop_step / TAIL,
     );
-    // Desktop's parsed floor restyles the common 1920x1200 canvas — 96 tiles
-    // between zooms — from cache at the parsed tail. The tail is
-    // `squallar_egui::tile_source::MEASURED_PARSED_TILE_BYTES`, restated here
-    // because this crate sits under that one; it fell 2,092,002 -> 670,110 on
-    // 2026-09-07 when the parse stopped expanding the wire's interned property
-    // tables per feature, so the floor now holds ~300 of these rather than 96.
-    // The assertion is unchanged and deliberately still reads 96: it is the
-    // canvas the floor must cover, not the count it happens to reach.
+    // **Every desktop parsed rung is a canvas tile count times the parsed
+    // tail**, not a byte figure: 1920x1200 (96) at the floor, 2560x1440 (144)
+    // at the step, 3840x2160 (299) at the ceiling. The counts deliberately do
+    // not follow the tail: they are the canvases these rungs must cover, not
+    // the counts the bytes happen to reach. Spelled as a product so a
+    // re-measured tail moves the bytes rather than opening a negotiation.
+    //
+    // Only the floor's 96 was ever written down as a parsed count; the step
+    // and the ceiling took theirs from the canvases named beside them, which
+    // the constants' doc records as a decision with its rejected alternative.
+    //
+    // `PARSED_TAIL` restates `squallar_egui::tile_source::MEASURED_PARSED_TILE_BYTES`
+    // because this crate sits under that one and `tests/charter.rs` pins the
+    // dependency ceiling that keeps it there. The restatement is bound to the
+    // real constant one crate up, in squallar-egui's
+    // `the_two_slots_price_against_the_brackets_they_are_handed`, which reads
+    // both — so a tail that moves without this line moving reddens there.
     const PARSED_TAIL: usize = 670_110;
-    let desktop_parsed = BudgetLimits::DESKTOP.tile_parsed_bytes.floor;
-    assert!(
-        desktop_parsed / PARSED_TAIL >= 96,
-        "desktop's parsed floor holds {} worst-case parses, under the 96 a 1920x1200          canvas keeps between zooms",
-        desktop_parsed / PARSED_TAIL,
-    );
+    let desktop_parsed = BudgetLimits::DESKTOP.tile_parsed_bytes;
+    for (rung, bytes, canvas, want) in [
+        ("floor", desktop_parsed.floor, "1920x1200", 96_usize),
+        ("step", desktop_parsed.step, "2560x1440", 144),
+        ("ceiling", desktop_parsed.ceiling, "3840x2160", 299),
+    ] {
+        assert!(
+            bytes >= want * PARSED_TAIL,
+            "desktop's parsed {rung} is {bytes} B and holds {} worst-case parses, under the \
+             {want} a {canvas} canvas keeps between zooms ({want} x {PARSED_TAIL} = {} B)",
+            bytes / PARSED_TAIL,
+            want * PARSED_TAIL,
+        );
+        // The upper arm, and it is the one with teeth: a rung that reaches a
+        // whole extra canvas of parses is buying coverage nobody decided on,
+        // which is exactly what fixed bytes under a cheaper parse produce.
+        // One MiB of rounding is the whole allowance.
+        assert!(
+            bytes < want * PARSED_TAIL + 1024 * 1024,
+            "desktop's parsed {rung} is {bytes} B, over a MiB above the {want} parses a \
+             {canvas} canvas keeps: the derivation is `count x tail` rounded up to the whole \
+             MiB, and this is not that",
+        );
+    }
     // The ceiling rung holds a 3840x2160 window between zooms — 299 tiles —
     // at the tail without the floor's help.
     let desktop_ceiling = BudgetLimits::DESKTOP.tile_styled_bytes.ceiling;
@@ -1751,6 +1783,51 @@ fn the_tile_allowances_are_the_written_figures_on_every_bracket() {
         "desktop's styled ceiling holds {} worst-case entries, under the 299 a 4K window          keeps between zooms",
         desktop_ceiling / TAIL,
     );
+}
+
+/// **Every tile host ceiling is the sum of the three allowances it bounds,
+/// rounded up to the next 64 MiB.** `check_budgets` already holds the two
+/// loose ends — the sum fits under the ceiling, and the ceiling is inside
+/// 1.25x of the sum — but 1.25x is a wide band, and the band is what let the
+/// desktop floor and step sit at 448 and 640 MiB over sums of 286 and 429
+/// while the parsed allowances came down. This is the rule the seven figures
+/// were actually written to; it was unstated until a change moved them.
+///
+/// Not a restatement of `check_budgets`: that one cannot fail while a ceiling
+/// drifts anywhere inside the band, and this one cannot pass unless the
+/// ceiling is the one figure the rule names.
+#[test]
+fn the_host_ceilings_are_their_sums_rounded_up_to_64_mib() {
+    const STEP: usize = 64 * 1024 * 1024;
+    let up = |sum: usize| sum.div_ceil(STEP) * STEP;
+    for limits in [
+        BudgetLimits::WASM,
+        BudgetLimits::MOBILE,
+        BudgetLimits::DESKTOP,
+    ] {
+        let name = limits.name;
+        for (rung, pick) in [("floor", 0_usize), ("step", 1), ("ceiling", 2)] {
+            let at = |b: Bracket| [b.floor, b.step, b.ceiling][pick];
+            let sum = at(limits.tile_styled_bytes)
+                + at(limits.tile_parsed_bytes)
+                + at(limits.tile_terrain_bytes);
+            // Non-vacuity: a bracket that summed to nothing would make the
+            // rule trivially true at a zero ceiling.
+            assert!(
+                sum > 0,
+                "{name} {rung}: the three allowances summed to zero"
+            );
+            assert_eq!(
+                at(limits.tile_host_ceiling_bytes),
+                up(sum),
+                "{name} {rung}: the host ceiling is {} MiB; the three allowances sum to {} MiB, \
+                 whose round up to the next 64 MiB is {} MiB",
+                at(limits.tile_host_ceiling_bytes) >> 20,
+                sum >> 20,
+                up(sum) >> 20,
+            );
+        }
+    }
 }
 
 /// **Terrain rasters are GPU textures, and they are left out of

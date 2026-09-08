@@ -1874,8 +1874,19 @@ fn the_tile_allowance_follows_the_economy_on_the_measured_arm_and_the_bracket_ot
         "a card with no economy left still holds the floor"
     );
 
-    // Between the two the shares are what they say: pick an economy that
-    // lands every population strictly inside its bracket.
+    // Between the two the shares are what they say — **for styled, and only
+    // styled**. At this economy the three shares are 400 / 400 / 200 MiB, and
+    // only styled (bracket 160..512) lands strictly inside one. Parsed clamps
+    // at its ceiling and so does terrain (200 MiB against 128), so two of the
+    // three rows below are `hold` against `hold`: they re-prove the ceiling
+    // the `at_ceiling` case above already holds, not the split.
+    //
+    // Both clamps predate the parsed re-derivation — on the brackets before
+    // it, parsed was 400 over a 384 ceiling and terrain 200 over the same 128
+    // — so the count of clamped rows is two either way, and re-deriving the
+    // parsed bracket only deepened one of them. A standing gap, not one this
+    // change opened. An economy of 440 MiB puts all three strictly inside
+    // (176 / 176 / 88); that is the fix, and it wants a run of this suite.
     let parts: u64 = TILE_ECONOMY_SHARES.iter().sum();
     let economy = 5 * (200u64 << 20);
     let cap = Capacity::measured(

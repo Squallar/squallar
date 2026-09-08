@@ -1297,6 +1297,16 @@ fn the_users_canvas_snaps_at_the_wasm_floor_and_never_on_the_desktop_floor() {
 /// styled floor cannot hold the user's 174-tile half-step set at the measured
 /// tail and holds 1,600 typical entries; and the measured tail is the whole
 /// slot — shapes and flattened buffers — and not the shapes alone.
+///
+/// **It also carries the parsed arm, and that half is load-bearing across a
+/// crate boundary.** `squallar-device-profile` sits under this crate by
+/// charter and so cannot import [`super::MEASURED_PARSED_TILE_BYTES`]; its own
+/// suite restates the tail as a literal. Here both are visible at once, so
+/// this is the only place that can catch the restatement going stale. Each
+/// desktop parsed rung is checked as `count x tail` in **both** directions —
+/// under it and the rung no longer restyles its canvas from cache, a MiB over
+/// it and the rung has quietly bought parses nobody chose, which is exactly
+/// what a cheaper parse at unchanged bytes produces.
 #[test]
 fn the_two_slots_price_against_the_brackets_they_are_handed() {
     use squallar_device_profile::budget::BudgetLimits;
@@ -1325,6 +1335,58 @@ fn the_two_slots_price_against_the_brackets_they_are_handed() {
     );
     // The tail is the whole slot and not the shapes alone — held at compile
     // time by `STYLED_TAIL_CARRIES_THE_FLATTENED_HALF` below.
+
+    // **The parsed arm, against the real constant.** `squallar-device-profile`
+    // cannot import `MEASURED_PARSED_TILE_BYTES` — its `tests/charter.rs` pins
+    // a dependency ceiling that keeps `squallar-egui` above it — so its own
+    // suite restates the tail as a literal. This is the line that binds the
+    // restatement: the brackets over there are read here against the constant
+    // itself, so a tail that moves without those brackets moving reddens, in
+    // either direction.
+    let desktop_parsed = BudgetLimits::DESKTOP.tile_parsed_bytes;
+    let tail = super::MEASURED_PARSED_TILE_BYTES;
+    // Non-vacuity: a zero tail would make every product below zero and every
+    // comparison trivially true.
+    assert!(tail > 0, "the parsed tail is zero; nothing below can fail");
+    for (rung, bytes, canvas, want) in [
+        ("floor", desktop_parsed.floor, "1920x1200", 96_usize),
+        ("step", desktop_parsed.step, "2560x1440", 144),
+        ("ceiling", desktop_parsed.ceiling, "3840x2160", 299),
+    ] {
+        assert!(
+            bytes >= want * tail,
+            "device-profile's desktop parsed {rung} is {bytes} B, under the {want} parses a \
+             {canvas} canvas keeps between zooms at the measured tail ({want} x {tail} = {} B). \
+             Re-derive that bracket from this constant; its suite restates the tail and has \
+             gone stale",
+            want * tail,
+        );
+        assert!(
+            bytes < want * tail + 1024 * 1024,
+            "device-profile's desktop parsed {rung} is {bytes} B, over a MiB above the {want} \
+             parses a {canvas} canvas keeps at the measured tail: the rung buys {} parses, and \
+             a count nobody chose is what a cheaper parse at fixed bytes looks like",
+            bytes / tail,
+        );
+    }
+    // **The wasm arm is short of its working set and that is the reason it
+    // does not move**: its surplus is owed to the overrun the working-set
+    // floor already carries, not available to spend. Asserted against the
+    // measured half-step set rather than a literal.
+    for (rung, bytes) in [
+        ("floor", wasm.tile_parsed_bytes.floor),
+        ("step", wasm.tile_parsed_bytes.step),
+    ] {
+        assert!(
+            bytes / tail < crate::tiles::measured::HALF_STEP_TILES,
+            "the wasm parsed {rung} now holds {} parses, at or over the {}-tile half-step set: \
+             the arm is no longer short of its working set, so the surplus stopped being owed \
+             and `WASM_TILE_PARSED_BYTES` is due a re-argument rather than a pin",
+            bytes / tail,
+            crate::tiles::measured::HALF_STEP_TILES,
+        );
+    }
+
     // The terrain population is priced at the raster, no tail: one 256x256
     // RGBA texture, and the marker beside it.
     assert_eq!(super::RASTER_TILE_BYTES, 256 * 256 * 4);

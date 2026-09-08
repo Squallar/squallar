@@ -245,6 +245,13 @@ pub const RASTER_TILE_BYTES: usize = 256 * 256 * 4;
 /// own byte allowance because it is a separate population, not because it is
 /// the larger one.
 ///
+/// The desktop parsed brackets are a canvas tile count times this figure:
+/// `squallar_device_profile::constants::WASM_TILE_STYLED_BYTES` carries the
+/// derivation, and
+/// `tests::the_two_slots_price_against_the_brackets_they_are_handed` holds
+/// them to it in both directions — this constant is read there, so a re-measure
+/// that leaves those brackets behind reddens.
+///
 /// Like its styled sibling: re-derive it by forcing the test's band to fail,
 /// never by inference from a type's field list — the band cannot catch this
 /// constant drifting upward into a safe over-estimate.
