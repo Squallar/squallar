@@ -365,3 +365,181 @@ fn a_product_the_plane_refuses_can_never_reach_a_fan() {
     // The control: the same call shape on a product the encoder admits.
     assert!(CodePlane::build(RADIALS, GATES, vec![7; RADIALS * GATES], key(), 8,).is_ok());
 }
+
+// ── The join: what the renderer produces is what this accepts ───────────────
+
+/// [`a_scan`] with every radial carrying its moment.
+fn a_scan() -> nexrad_model::data::Scan {
+    a_scan_missing(&[])
+}
+
+/// A one-tilt volume of 36 radials, each carrying an eight-bit reflectivity
+/// moment whose codes vary along the radial and die out past gate 80 — except
+/// the radials named in `missing`, which carry none at all.
+fn a_scan_missing(missing: &[u16]) -> nexrad_model::data::Scan {
+    use nexrad_model::data::{
+        ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan,
+        Sweep, VolumeCoveragePattern, WaveformType,
+    };
+    let radials = (0..36u16)
+        .map(|i| {
+            let bytes: Vec<u8> = (0..120usize)
+                .map(|g| if g < 80 { ((g % 200) + 2) as u8 } else { 0 })
+                .collect();
+            Radial::new(
+                0,
+                i,
+                f32::from(i) * 10.0,
+                10.0,
+                RadialStatus::IntermediateRadialData,
+                1,
+                0.5,
+                (!missing.contains(&i))
+                    .then(|| MomentData::from_fixed_point(120, 2125, 250, 8, 2.0, 66.0, bytes)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        })
+        .collect();
+    let cut = ElevationCut::new(
+        0.5,
+        ChannelConfiguration::ConstantPhase,
+        WaveformType::CS,
+        20.0,
+        true,
+        true,
+        false,
+        false,
+        1,
+        20,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        false,
+        0,
+        false,
+        0,
+        false,
+        false,
+    );
+    Scan::new(
+        VolumeCoveragePattern::new(
+            212,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            vec![cut],
+        ),
+        vec![Sweep::new(1, radials)],
+    )
+}
+
+/// **What the renderer emits is what this function accepts** — the join
+/// between the two crates, and the one seam whose failure is a pane with
+/// nothing on it.
+///
+/// `fan_sweep` refuses a plane and a geometry that are not one sweep, and
+/// every one of its refusals is silent at the call site: the delivery gets
+/// `None`, the reply carries no raster either, and the frame retires as
+/// failed. Nothing above this asserts that the producer's own two halves
+/// satisfy those guards, and they arrive as separate objects built by separate
+/// code, so they are free to drift.
+///
+/// The reach is the conjunct that would go first. `render_sweep_plane`
+/// measures it off the painted codes; `is_well_formed` requires
+/// `1 <= reach_gates <= gates`; the fixture dies out at gate 80 of 120, so a
+/// producer that reported the stride instead would still pass the bound and a
+/// producer that reported zero would not. The exact figure is asserted, not
+/// just the bound.
+#[test]
+fn a_rendered_plane_is_a_payload_this_function_accepts() {
+    let render = squallar_radar::render::render_sweep_plane(
+        &a_scan(),
+        0.5,
+        RadarProduct::Reflectivity,
+        &squallar_radar::nyquist::DeclaredNyquist::empty(),
+    )
+    .expect("an eight-bit reflectivity sweep renders as a plane");
+    assert!(
+        render.image.is_empty(),
+        "the polar path built a raster as well, which is the allocation it exists to skip",
+    );
+    let plane = render.codes.as_ref().expect("the render carries a plane");
+    assert_eq!(
+        render.polar.geometry().reach_gates(),
+        80,
+        "the reach is the furthest painted gate, not the stride and not zero",
+    );
+
+    let sweep = fan_sweep(plane, render.polar.geometry(), SITE_LAT, SITE_LON)
+        .expect("the renderer's own two halves describe one sweep");
+    assert!(
+        sweep.is_well_formed(),
+        "the payload the renderer produced does not describe itself consistently",
+    );
+    assert_eq!((sweep.radials, sweep.gates), (36, 120));
+    // Every level of the chain reached the payload, so a zoomed-out fragment
+    // has a level to read rather than clamping to the closest.
+    assert_eq!(sweep.levels(), plane.levels());
+    assert!(sweep.levels() > 1, "a max-reducing product has a chain");
+}
+
+/// **A radial the sweep carried no moment for claims no sky.**
+///
+/// The raster's own semantics: `PolarBuffers` leaves a radial it never painted
+/// with a NaN wedge, and `fan_sweep` turns that into a degenerate sector. The
+/// polar path writes its wedges out rather than recording them as it paints,
+/// so this is the branch where the two could have come to disagree — and the
+/// disagreement would not be a missing picture, since an unpainted code is
+/// transparent either way. It would be a *readout*: `draw_edges` gives the
+/// azimuth to whichever radial claims it, and a radial with no data claiming a
+/// sector takes hovers from the neighbours that do.
+///
+/// The populated radials are the control: their edges must be their own
+/// wedge's bounds, so "every edge collapsed" cannot pass this.
+#[test]
+fn a_radial_with_no_moment_claims_no_sector() {
+    let missing = [3u16, 17];
+    let render = squallar_radar::render::render_sweep_plane(
+        &a_scan_missing(&missing),
+        0.5,
+        RadarProduct::Reflectivity,
+        &squallar_radar::nyquist::DeclaredNyquist::empty(),
+    )
+    .expect("the remaining radials still make a plane");
+    let plane = render.codes.as_ref().expect("a plane");
+    let sweep = fan_sweep(plane, render.polar.geometry(), SITE_LAT, SITE_LON)
+        .expect("the pair describes one sweep");
+
+    assert_eq!(sweep.edges.len(), 36);
+    for (i, edge) in sweep.edges.iter().enumerate() {
+        if missing.contains(&(i as u16)) {
+            assert_eq!(
+                *edge,
+                [0.0, 0.0],
+                "radial {i} carried no moment and still claimed a sector",
+            );
+        } else {
+            assert!(
+                edge[1] > edge[0],
+                "radial {i} carried a moment and claimed nothing",
+            );
+        }
+    }
+}

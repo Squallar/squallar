@@ -514,6 +514,7 @@ fn the_loop_frame_broadcast_skips_a_pane_with_no_plan_view() {
                 melting_layer_source: None,
                 storm_motion: None,
                 polar: Default::default(),
+                codes: None,
             })
             .expect("the receiver lives on the App");
         app.poll_loop_render_results(&egui::Context::default());

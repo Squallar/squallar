@@ -309,14 +309,20 @@ fn a_loop_reply_is_priced_by_its_ticket_and_settled_per_response() {
 
     // Two frames of different sizes, so a settle that takes the wrong one is
     // visible rather than symmetric.
-    let first = loop_image_bytes(Some(&egui::ColorImage::new(
-        [SIDE, SIDE],
-        vec![egui::Color32::BLACK; SIDE * SIDE],
-    )));
-    let second = loop_image_bytes(Some(&egui::ColorImage::new(
-        [SIDE / 2, SIDE / 2],
-        vec![egui::Color32::BLACK; (SIDE / 2) * (SIDE / 2)],
-    )));
+    let first = loop_reply_bytes(
+        Some(&egui::ColorImage::new(
+            [SIDE, SIDE],
+            vec![egui::Color32::BLACK; SIDE * SIDE],
+        )),
+        None,
+    );
+    let second = loop_reply_bytes(
+        Some(&egui::ColorImage::new(
+            [SIDE / 2, SIDE / 2],
+            vec![egui::Color32::BLACK; (SIDE / 2) * (SIDE / 2)],
+        )),
+        None,
+    );
     assert!(
         first > second && second > 0,
         "the two frames must differ for this test to distinguish them"
@@ -372,17 +378,76 @@ fn a_loop_reply_is_priced_by_its_ticket_and_settled_per_response() {
 #[test]
 fn a_loop_reply_that_drew_nothing_prices_nothing() {
     let _census = census_guard();
-    assert_eq!(loop_image_bytes(None), 0);
+    assert_eq!(loop_reply_bytes(None, None), 0);
 
     let d = RenderDispatcher::new();
     squallar_egui::heap_census::set_render_in_flight_bytes(0);
-    d.loop_reply_ticket().price(loop_image_bytes(None));
+    d.loop_reply_ticket().price(loop_reply_bytes(None, None));
     assert_eq!(
         squallar_egui::heap_census::census().render_in_flight_bytes,
         0,
         "a loop reply with no image put bytes on the level"
     );
     assert_eq!(d.in_flight_image_bytes(), 0);
+}
+
+/// **A polar reply is priced too, by the bytes its payload actually holds.**
+///
+/// The gap this closes is a specific one: a polar reply carries no picture, so
+/// the raster term of the price is zero for it, and a function that only knew
+/// about pictures would report a plane in flight as nothing at all. It is
+/// 1,758,832 B for a surveillance sweep — small beside the raster it replaces
+/// and not small enough to be nowhere.
+///
+/// The picture arm is the control: it must still price its own pixels and
+/// nothing more, or "the plane is counted" would also be satisfied by a
+/// function that had started counting everything twice.
+///
+/// TAMPER: drop the `codes` term and the first assertion goes red; drop the
+/// `image` term and the second does.
+#[test]
+fn a_polar_reply_is_priced_by_the_payload_it_holds() {
+    let sweep = squallar_egui::radar_fan::FanSweep {
+        field: squallar_radar::fields::known::REFLECTIVITY,
+        radials: 8,
+        gates: 4,
+        codes: vec![0; 8 * 4 + 4 * 2 + 2 + 1],
+        level_offsets: vec![0, 32, 40, 42],
+        lut_rgba: vec![0; squallar_egui::radar_fan::LUT_BYTES],
+        edges: vec![[0.0, 45.0]; 8],
+        geometry: squallar_egui::radar_fan::FanGeometry {
+            site_lat: 35.33,
+            site_lon: -97.28,
+            first_gate_slant_km: 2.125,
+            gate_interval_slant_km: 0.25,
+            elevation_deg: Some(0.5),
+            reach_gates: 4,
+            reach_km: 3.0,
+            earth_radius_km: squallar_geo::EARTH_RADIUS_KM,
+            effective_radius_km: squallar_radar::beam::RE_EFF_KM,
+        },
+    };
+    assert!(
+        sweep.is_well_formed(),
+        "premise: the fixture is a payload the renderer would accept",
+    );
+    assert_eq!(
+        loop_reply_bytes(None, Some(&sweep)),
+        sweep.resident_bytes(),
+        "a reply carrying a plane and no picture priced its plane at nothing",
+    );
+
+    // The control: a picture with no plane still prices its own pixels alone.
+    let image = egui::ColorImage::new([4, 4], vec![egui::Color32::BLACK; 16]);
+    assert_eq!(
+        loop_reply_bytes(Some(&image), None),
+        16 * std::mem::size_of::<egui::Color32>(),
+    );
+    // And the sum is total: a frame that carried both would price both.
+    assert_eq!(
+        loop_reply_bytes(Some(&image), Some(&sweep)),
+        16 * std::mem::size_of::<egui::Color32>() + sweep.resident_bytes(),
+    );
 }
 
 /// **Both ends of the loop seam are actually called.**

@@ -8,6 +8,7 @@ use std::f64::consts::PI;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub mod codes;
+pub mod plane;
 pub mod polar;
 
 /// Pre-computed Web Mercator projection constants, derived from
@@ -770,6 +771,9 @@ impl RenderBuffers {
             nyquist_ms: None,
             melting_layer_source: None,
             storm_motion: None,
+            // The raster is this render's surface. A plane arrives from
+            // `render_sweep_plane`, which does not come through here.
+            codes: None,
         }
     }
 }
@@ -855,6 +859,14 @@ pub struct SweepRender {
     /// The storm motion vector the storm-relative velocity was computed
     /// against, or `None` for every other product — nothing else applies one.
     pub storm_motion: Option<crate::srv::SrvMotion>,
+    /// **The same sweep's gates as codes**, for a render asked for the polar
+    /// surface and able to give it — [`render_sweep_plane`].
+    ///
+    /// `None` on every raster render, and mutually exclusive with
+    /// [`Self::image`] for the reason `RenderedFrame::into_surface_tails`
+    /// gives: a frame has one surface. The polar arm builds no raster at all,
+    /// which is the whole of the saving rather than a detail of it.
+    pub codes: Option<codes::CodePlane>,
 }
 
 impl SweepRender {
@@ -1297,6 +1309,185 @@ fn sweep_ground_factor(slant_reach_km: f64, elevation_deg: f64) -> f64 {
     (crate::beam::ground_range_km(slant_reach_km, elevation_deg) / slant_reach_km).clamp(0.0, 1.0)
 }
 
+/// **Everything a plan view of one Level II sweep is laid out by**, derived
+/// once from the sweep itself.
+///
+/// It exists because there are now two surfaces drawn from these numbers — the
+/// raster and the code plane — and a second derivation of them would be a
+/// second opinion about where a sweep's gates are. The two paths would then be
+/// free to drift, and a fan drawn at one layout over a readout picked at
+/// another is a plausible picture of nothing.
+struct SweepLayout {
+    /// The sweep's median elevation, degrees, or flat where it will not say.
+    sweep_elevation: f64,
+    /// How far the data reaches, **ground** km.
+    ground_reach_km: f64,
+    /// How far apart two samples are along a radial, ground km.
+    ground_sample_km: f64,
+    /// Gate 0's centre along the beam, km.
+    first_gate_slant_km: f64,
+    /// One gate's depth along the beam, km.
+    gate_interval_slant_km: f64,
+    /// The stride: the most gates any radial carrying the product declares.
+    gate_count: usize,
+    /// Each radial's own azimuth, degrees.
+    azimuths_deg: Vec<f64>,
+    /// Each radial's half-width, degrees, from its neighbours in azimuth.
+    half_widths: Vec<f64>,
+}
+
+impl SweepLayout {
+    fn of(radials: &[Radial], product: types::RadarProduct) -> Self {
+        // The stand-in for an unmeasurable sweep is 1.0° because that is the
+        // coarser of the two resolutions the RDA has, so a sweep too degenerate
+        // to measure is painted as if it were the wider one rather than as a
+        // spoke.
+        let median_step = crate::azimuth::median_azimuth_step_deg(
+            radials.iter().map(|r| f64::from(r.azimuth_angle_degrees())),
+        )
+        .unwrap_or(1.0);
+        // Slant out of `compute_max_range`, ground into the projection: how far
+        // the *data* goes is a property of the sweep, how wide the *picture* is
+        // has to be the ground it covers.
+        let sweep_elevation = sweep_elevation_deg_or_flat(radials);
+        let slant_reach_km = compute_max_range(radials, product);
+        let cos_e = sweep_ground_factor(slant_reach_km, sweep_elevation);
+        let gate_interval_slant_km = compute_gate_interval_km(radials, product);
+        let (first_gate_slant_km, gate_count) = compute_gate_span(radials, product);
+        // Half-widths for the whole sweep at once, because each one depends on
+        // where its neighbours in azimuth landed; see `l2_wedge_half_widths_deg`.
+        let azimuths_deg: Vec<f64> = radials
+            .iter()
+            .map(|r| f64::from(r.azimuth_angle_degrees()))
+            .collect();
+        let declared_deg: Vec<f64> = radials
+            .iter()
+            .map(|r| f64::from(r.azimuth_spacing_degrees()))
+            .collect();
+        let half_widths = l2_wedge_half_widths_deg(&azimuths_deg, &declared_deg, median_step);
+        Self {
+            sweep_elevation,
+            ground_reach_km: slant_reach_km * cos_e,
+            ground_sample_km: gate_interval_slant_km * cos_e,
+            first_gate_slant_km,
+            gate_interval_slant_km,
+            gate_count,
+            azimuths_deg,
+            half_widths,
+        }
+    }
+
+    /// The shape the raster's polar buffer is sized by.
+    fn polar_shape(&self) -> polar::PolarShape {
+        polar::PolarShape {
+            radials: self.azimuths_deg.len(),
+            gates: self.gate_count,
+            first_gate_slant_km: self.first_gate_slant_km,
+            gate_interval_slant_km: self.gate_interval_slant_km,
+            elevation_deg: Some(self.sweep_elevation),
+        }
+    }
+
+    /// The geometry a **plane** sits in: the same layout, with the wedges
+    /// written out rather than recorded as the fill paints them.
+    ///
+    /// A radial carrying no moment gets a NaN wedge, which is exactly what
+    /// `PolarBuffers::into_field` leaves for a radial the raster never
+    /// reached, and which `fan_sweep` turns into a degenerate sector that
+    /// draws nothing. A radial that carries the moment gets its real angles
+    /// even where every gate of it is below threshold: the codes are what say
+    /// nothing is there, and code 0 resolves to a fully transparent table
+    /// entry.
+    fn plane_geometry(
+        &self,
+        radials: &[Radial],
+        product: types::RadarProduct,
+    ) -> polar::PolarGeometry {
+        let wedges = radials
+            .iter()
+            .enumerate()
+            .map(|(i, radial)| {
+                if product.get_moment(radial).is_some() {
+                    polar::Wedge {
+                        azimuth_deg: self.azimuths_deg[i] as f32,
+                        half_width_deg: self.half_widths[i] as f32,
+                    }
+                } else {
+                    polar::Wedge {
+                        azimuth_deg: f32::NAN,
+                        half_width_deg: f32::NAN,
+                    }
+                }
+            })
+            .collect();
+        polar::PolarGeometry::from_parts(
+            wedges,
+            self.first_gate_slant_km,
+            self.gate_interval_slant_km,
+            Some(self.sweep_elevation),
+            self.gate_count,
+        )
+    }
+}
+
+/// **One Level II sweep as a code plane and the geometry it sits in, with no
+/// raster built at all** — the polar surface's whole render path.
+///
+/// The saving is the absence: `render_with_projection` holds one atomic cell
+/// per output pixel (8 B) and the RGBA texture (4 B) live at once, and at the
+/// desktop side a 1832-gate cut needs, that pair is 650,388,528 B. This builds
+/// neither. What it produces instead is a plane whose chain sums to 1,758,832 B
+/// for a surveillance sweep — the figure `codes::tests` computes off the shape.
+///
+/// **`None` is not a failure, it is the raster.** Every reason a sweep cannot
+/// become a plane is a [`plane::PlaneUnavailable`] arm, and the caller's answer
+/// to all of them is to render the way it renders today. Fidelity is therefore
+/// never traded here: a sweep whose codes an eight-bit plane cannot carry is
+/// not carried by one.
+///
+/// The polar field travels with **geometry and no numbers**, which is what a
+/// loop frame's does anyway (`PolarField::strip_values`). A caller that wants
+/// the numbers behind the gates is given the raster instead — see
+/// `jobs::RadarPlanJob::run` — because a plane answers them through its codes
+/// and this field would have to hold a second copy of them to answer at all.
+pub fn render_sweep_plane(
+    data: &Scan,
+    elevation_angle: f32,
+    product: types::RadarProduct,
+    declared_nyquist: &crate::nyquist::DeclaredNyquist,
+) -> Option<SweepRender> {
+    // The same owner the raster path finds, so a plane and a raster of one
+    // request are never two different cuts.
+    let owner = find_sweep_owner(data, product, elevation_angle)?;
+    let radials = owner.radials();
+    let nyquist_ms = declared_nyquist.get(owner.elevation_number());
+
+    let layout = SweepLayout::of(radials, product);
+    let built = match plane::sweep_code_plane(radials, product, layout.gate_count) {
+        Ok(built) => built,
+        Err(why) => {
+            log::info!("{product:?} renders as a raster rather than a plane: {why:?}");
+            return None;
+        }
+    };
+    let geometry = layout
+        .plane_geometry(radials, product)
+        .reaching(built.reach_gates);
+    Some(SweepRender {
+        // The surface is the plane. Nothing here checks out a pooled image or
+        // a cell buffer, which is the point of the path.
+        image: Vec::new(),
+        // The extent the raster would have been projected at, so a pane placing
+        // this frame puts it exactly where the raster went.
+        max_range_km: types::plan_view_extent_km(layout.ground_reach_km),
+        polar: polar::PolarField::from_parts(geometry, Vec::new()),
+        nyquist_ms,
+        melting_layer_source: None,
+        storm_motion: None,
+        codes: Some(built.plane),
+    })
+}
+
 /// How far a field's samples go along a radial and how far apart they are, both
 /// in the ground coordinate the caller paints in.
 #[derive(Clone, Copy)]
@@ -1548,47 +1739,21 @@ pub fn render_radar_to_image_full_sized(
         );
     }
 
-    // The stand-in for an unmeasurable sweep is 1.0° because that is the
-    // coarser of the two resolutions the RDA has, so a sweep too degenerate to
-    // measure is painted as if it were the wider one rather than as a spoke.
-    let median_step = crate::azimuth::median_azimuth_step_deg(
-        radials.iter().map(|r| f64::from(r.azimuth_angle_degrees())),
-    )
-    .unwrap_or(1.0);
-    // Slant out of `compute_max_range`, ground into the projection: how far
-    // the *data* goes is a property of the sweep, how wide the *picture* is
-    // has to be the ground it covers.
-    let sweep_elevation = sweep_elevation_deg_or_flat(radials);
-    let slant_reach_km = compute_max_range(radials, product);
-    let cos_e = sweep_ground_factor(slant_reach_km, sweep_elevation);
-    let ground_reach_km = slant_reach_km * cos_e;
-    let ground_sample_km = compute_gate_interval_km(radials, product) * cos_e;
-    let (first_gate_slant_km, gate_count) = compute_gate_span(radials, product);
-
-    // Half-widths for the whole sweep at once, because each one depends on
-    // where its neighbours in azimuth landed; see `l2_wedge_half_widths_deg`.
-    let azimuths_deg: Vec<f64> = radials
-        .iter()
-        .map(|r| f64::from(r.azimuth_angle_degrees()))
-        .collect();
-    let declared_deg: Vec<f64> = radials
-        .iter()
-        .map(|r| f64::from(r.azimuth_spacing_degrees()))
-        .collect();
-    let half_widths = l2_wedge_half_widths_deg(&azimuths_deg, &declared_deg, median_step);
+    let layout = SweepLayout::of(radials, product);
+    let SweepLayout {
+        sweep_elevation,
+        ground_reach_km,
+        ground_sample_km,
+        ref half_widths,
+        ..
+    } = layout;
     let output = render_with_projection(
         radar_lat,
         radar_lon,
         FieldRadial {
             reach_km: ground_reach_km,
             sample_km: ground_sample_km,
-            shape: polar::PolarShape {
-                radials: radials.len(),
-                gates: gate_count,
-                first_gate_slant_km,
-                gate_interval_slant_km: compute_gate_interval_km(radials, product),
-                elevation_deg: Some(sweep_elevation),
-            },
+            shape: layout.polar_shape(),
         },
         product,
         side_ceiling_px,

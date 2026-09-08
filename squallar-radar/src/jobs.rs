@@ -62,6 +62,52 @@ fn holding_its_numbers_narrow(mut frame: RenderedFrame) -> RenderedFrame {
     frame
 }
 
+/// **Which surface a plan-view render is asked for**, as the byte the request
+/// carries.
+///
+/// A request states this rather than the renderer deciding, because the answer
+/// is a property of the *caller*: a polar surface has no fallback — the raster
+/// it would fall back to is exactly the allocation the representation exists
+/// not to make — so a machine with no `RadarFanPainter` installed asking for
+/// one would be a pane with no radar on it. The caller is the only half that
+/// knows.
+///
+/// The pattern is `render::polar::PolarWireForm`'s, deliberately and to the
+/// letter: a byte with an explicit code each way, `from_wire_code` answering
+/// `None` for anything this build does not write, and the byte written in the
+/// same statement as the field it describes. An unknown form is declined and
+/// never assumed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanSurface {
+    /// The raster this build has always produced.
+    Raster,
+    /// A code plane where the sweep can carry one, and the raster where it
+    /// cannot — see [`crate::render::render_sweep_plane`]. Asking for a fan is
+    /// never a promise of one; every reason a sweep is refused is a fidelity
+    /// reason and the answer to all of them is today's raster.
+    Fan,
+}
+
+impl PlanSurface {
+    /// This surface as the byte the request carries.
+    pub fn wire_code(self) -> u8 {
+        match self {
+            Self::Raster => 0,
+            Self::Fan => 1,
+        }
+    }
+
+    /// The inverse of [`wire_code`](Self::wire_code), or `None` for a surface
+    /// this build does not write.
+    pub fn from_wire_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Raster),
+            1 => Some(Self::Fan),
+            _ => None,
+        }
+    }
+}
+
 /// Rasterize a Level II frame.
 #[derive(Debug, PartialEq)]
 pub struct RadarPlanJob {
@@ -71,6 +117,8 @@ pub struct RadarPlanJob {
     /// Whether the caller wants the numbers behind the gates, or only the
     /// geometry of where they are.
     pub values_wanted: bool,
+    /// Which surface the caller can draw. See [`PlanSurface`].
+    pub surface: PlanSurface,
 }
 
 squallar_source::impl_job_input!(RadarPlanJob);
@@ -83,22 +131,57 @@ impl JobSpec for RadarPlanJob {
 
     fn encode(input: &RadarPlanJob, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
         out.push(u8::from(input.values_wanted));
+        // Behind `values_wanted` and in front of the nested input, so every
+        // byte that was in this framing before keeps the offset it had and the
+        // input still ends the payload.
+        out.push(input.surface.wire_code());
         out.extend_from_slice(&input.input.to_bytes());
     }
 
     fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(RadarPlanJob, JobGeometry)> {
         let values_wanted = flag(r.u8()?)?;
+        // Declined, never assumed: a byte this build does not write is a
+        // request from a peer it cannot serve, and defaulting it to the raster
+        // would answer a question that was not asked.
+        let surface = PlanSurface::from_wire_code(r.u8()?)?;
         let input = RenderInput::from_bytes(r.rest())?;
         Some((
             RadarPlanJob {
                 input: Box::new(input),
                 values_wanted,
+                surface,
             },
             geo,
         ))
     }
 
+    /// **The polar surface is tried first and falls back**, which is the whole
+    /// of the arm: `render_sweep_plane` answers `None` for every sweep an
+    /// eight-bit plane cannot carry without dropping a distinction, and the
+    /// answer to all of them is the raster this row has always produced.
+    ///
+    /// It is asked only where the caller wants the picture and not the numbers.
+    /// A plane's numbers **are** its codes, and the polar field it travels with
+    /// carries geometry alone; a caller that asked for the values would
+    /// otherwise be handed a frame that cannot answer a hover, silently. The
+    /// two flags are read in one place so that trade is stated rather than
+    /// discovered.
     fn run(input: &RadarPlanJob, geo: &JobGeometry) -> Option<RenderedFrame> {
+        if input.surface == PlanSurface::Fan && !input.values_wanted {
+            let scan = input.input.to_scan();
+            let plane = crate::render::render_sweep_plane(
+                &scan,
+                input.input.elevation(),
+                input.input.product(),
+                &input.input.declared_nyquist(),
+            );
+            if let Some(render) = plane {
+                // The polar field is already numberless — the renderer never
+                // wrote values into it — so neither `strip_values` nor
+                // `compact_values` has anything to do here.
+                return Some(RenderedFrame::from(render));
+            }
+        }
         crate::render::render_from_sized(&input.input, geo.side_ceiling_px as usize).map(|render| {
             let mut frame = RenderedFrame::from(render);
             if input.values_wanted {
@@ -660,6 +743,50 @@ mod tests {
         )
     }
 
+    /// [`sample_scan`]'s one tilt, with a **sixteen-bit** differential phase
+    /// moment beside the eight-bit reflectivity one — one volume holding both
+    /// sides of the R8 admission.
+    fn a_two_moment_scan() -> nexrad_model::data::Scan {
+        use nexrad_model::data::{MomentData, Radial, RadialStatus, Sweep};
+        let radials = (0..36)
+            .map(|i| {
+                let phi: Vec<u8> = (0..120u16).flat_map(|g| (g + 2).to_be_bytes()).collect();
+                Radial::new(
+                    0,
+                    i,
+                    f32::from(i) * 10.0,
+                    10.0,
+                    RadialStatus::IntermediateRadialData,
+                    1,
+                    0.5,
+                    Some(MomentData::from_fixed_point(
+                        120,
+                        0,
+                        250,
+                        8,
+                        2.0,
+                        66.0,
+                        vec![200; 120],
+                    )),
+                    None,
+                    None,
+                    None,
+                    Some(MomentData::from_fixed_point(
+                        120, 0, 250, 16, 2.8361, 2.0, phi,
+                    )),
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        let mut scan = sample_scan();
+        scan = nexrad_model::data::Scan::new(
+            scan.coverage_pattern().clone(),
+            vec![Sweep::new(1, radials)],
+        );
+        scan
+    }
+
     /// The single-tilt payload the `radar` row carries.
     fn a_plan_input() -> RenderInput {
         RenderInput::extract(
@@ -818,14 +945,18 @@ mod tests {
 
     #[test]
     fn the_radar_row_round_trips() {
-        // Both flag values: the wire byte differs, and the loop-frame case
-        // (`false`) is the one the frontend fixture set does not frame.
+        // Both flag values and both surfaces: each is a wire byte of its
+        // own, and the loop-frame case (`false` / `Fan`) is the one the
+        // frontend fixture set does not frame.
         for values_wanted in [true, false] {
-            let job = DescribedJob::new(RadarPlanJob {
-                input: Box::new(a_plan_input()),
-                values_wanted,
-            });
-            assert_round_trips_passing_geo_through(&JOB_CODECS[0], &job);
+            for surface in [PlanSurface::Raster, PlanSurface::Fan] {
+                let job = DescribedJob::new(RadarPlanJob {
+                    input: Box::new(a_plan_input()),
+                    values_wanted,
+                    surface,
+                });
+                assert_round_trips_passing_geo_through(&JOB_CODECS[0], &job);
+            }
         }
     }
 
@@ -1014,6 +1145,7 @@ mod tests {
             let job = DescribedJob::new(RadarPlanJob {
                 input: Box::new(a_plan_input()),
                 values_wanted,
+                surface: PlanSurface::Raster,
             });
             let out = (JOB_CODECS[0].run)(&job, &geometry_with_ceiling(4096))
                 .expect("the fixture renders");
@@ -1028,6 +1160,153 @@ mod tests {
                 frame.polar.has_values(),
                 wants,
                 "values_wanted: {values_wanted} must leave has_values() = {wants}",
+            );
+        }
+    }
+
+    /// **A fan request answers a plane, and the plane is the frame's only
+    /// surface.**
+    ///
+    /// Three conjuncts and none is optional. The plane is present — which is
+    /// the whole of what this lane added, and was `None` on every frame this
+    /// build produced before it. The raster is *absent*, which is the saving
+    /// rather than a detail of it: a frame that carried both would hold the
+    /// 650 MB cells-and-image pair the representation exists not to allocate,
+    /// and `into_surface_tails` would refuse it. And the polar field carries
+    /// its geometry, because a pane still has to know where the gates are.
+    ///
+    /// TAMPER: make `run`'s fan arm fall through to the raster and the first
+    /// two go red; make `render_sweep_plane` keep the projected image and the
+    /// second goes red alone.
+    #[test]
+    fn a_fan_request_answers_a_plane_and_no_raster() {
+        let job = DescribedJob::new(RadarPlanJob {
+            input: Box::new(a_plan_input()),
+            values_wanted: false,
+            surface: PlanSurface::Fan,
+        });
+        let out =
+            (JOB_CODECS[0].run)(&job, &geometry_with_ceiling(4096)).expect("the fixture renders");
+        let frame = out
+            .take::<RenderedFrame>()
+            .expect("the radar row answers a frame");
+        let plane = frame
+            .codes
+            .as_ref()
+            .expect("the fan request produced a plane");
+        assert!(
+            frame.image.is_empty(),
+            "a frame with a plane also carried a raster; that is both surfaces at once",
+        );
+        assert!(
+            !frame.polar.geometry().is_empty(),
+            "the plane arrived with no geometry to place it by",
+        );
+        // The two halves describe the same sweep, which is what
+        // `render_dispatch::fan_sweep` refuses a mismatch of.
+        assert_eq!(
+            plane.shape(),
+            (
+                frame.polar.geometry().radials(),
+                frame.polar.geometry().gates()
+            ),
+        );
+    }
+
+    /// **A caller that asked for the numbers is given the form that has
+    /// them.**
+    ///
+    /// A plane's numbers are its codes and the polar field beside one carries
+    /// geometry alone, so a fan request with `values_wanted` set falls back to
+    /// the raster rather than answering a frame no hover can read. Stated
+    /// here rather than discovered by a pane whose readout went blank.
+    ///
+    /// TAMPER: drop the `!input.values_wanted` conjunct in `run` and this goes
+    /// red on both assertions.
+    #[test]
+    fn a_fan_request_that_wants_the_numbers_gets_the_raster() {
+        let job = DescribedJob::new(RadarPlanJob {
+            input: Box::new(a_plan_input()),
+            values_wanted: true,
+            surface: PlanSurface::Fan,
+        });
+        let out =
+            (JOB_CODECS[0].run)(&job, &geometry_with_ceiling(4096)).expect("the fixture renders");
+        let frame = out
+            .take::<RenderedFrame>()
+            .expect("the radar row answers a frame");
+        assert!(frame.codes.is_none(), "a plane cannot answer a hover");
+        assert!(
+            frame.polar.has_values(),
+            "and the raster's numbers are gone"
+        );
+    }
+
+    /// **A product an eight-bit plane cannot carry renders the way it renders
+    /// today**, even under a fan request.
+    ///
+    /// Differential phase is refused by domain (`WireWordTooWide`: sixteen-bit
+    /// wire codes, 65,534 reachable values against 254 a plane can index), and
+    /// the answer is a raster with a texture in it — not a blank pane, and not
+    /// a quantised plane.
+    ///
+    /// **The control is the first half**, and it is what stops this reading
+    /// green through an arm it never reached: the same scan's reflectivity,
+    /// under the same request, must come back WITH a plane. Without it a
+    /// fixture that simply failed to extract would satisfy every assertion
+    /// below.
+    #[test]
+    fn a_refused_product_under_a_fan_request_still_renders_its_raster() {
+        let _ledger = crate::render::codes::hold_refusal_ledger();
+        let scan = a_two_moment_scan();
+        let fan_frame = |product| {
+            let input = RenderInput::extract(&scan, 0.5, product, 35.0, -97.0, None, None)
+                .unwrap_or_else(|| panic!("the fixture carries {product:?}"));
+            let job = DescribedJob::new(RadarPlanJob {
+                input: Box::new(input),
+                values_wanted: false,
+                surface: PlanSurface::Fan,
+            });
+            (JOB_CODECS[0].run)(&job, &geometry_with_ceiling(4096))
+                .expect("the fixture renders")
+                .take::<RenderedFrame>()
+                .expect("a frame")
+        };
+
+        let admitted = fan_frame(RadarProduct::Reflectivity);
+        assert!(
+            admitted.codes.is_some(),
+            "the control: an eight-bit reflectivity sweep of this scan must \
+             reach the fan arm, or the refusal below proves nothing",
+        );
+
+        let refused = fan_frame(RadarProduct::DifferentialPhase);
+        assert!(
+            refused.codes.is_none(),
+            "a sixteen-bit moment was given an R8 plane",
+        );
+        assert!(
+            !refused.image.is_empty(),
+            "a refused product lost its raster instead of keeping it",
+        );
+    }
+
+    /// The surface byte is declined, never assumed — the pattern
+    /// `PolarWireForm` set.
+    #[test]
+    fn an_unknown_surface_byte_is_declined() {
+        assert_eq!(PlanSurface::from_wire_code(0), Some(PlanSurface::Raster));
+        assert_eq!(PlanSurface::from_wire_code(1), Some(PlanSurface::Fan));
+        assert_ne!(
+            PlanSurface::Raster.wire_code(),
+            PlanSurface::Fan.wire_code(),
+            "two surfaces sharing a code is a request that cannot say what it wants",
+        );
+        for code in 2..=u8::MAX {
+            assert_eq!(
+                PlanSurface::from_wire_code(code),
+                None,
+                "surface byte {code} was read as a form this build writes",
             );
         }
     }

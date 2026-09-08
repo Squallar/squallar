@@ -67,6 +67,11 @@ pub struct CachedPaneRender {
 ///
 /// **Not for the frame thread.** It concatenates the chain, which is the whole
 /// plane again, and bakes a table. Both belong where the plane was built.
+///
+/// The one caller is `app_fetch`'s `loop_reply_surface`, which runs where the
+/// job reply is delivered — a pool lane natively, and never the frame thread.
+/// `app_render`'s `loop_frame_fan`, which *is* on the frame thread, reads the
+/// payload that produced rather than calling this.
 pub fn fan_sweep(
     plane: &squallar_radar::render::codes::CodePlane,
     geometry: &squallar_radar::render::polar::PolarGeometry,
@@ -938,14 +943,31 @@ fn in_flight_bytes(rendered: Option<&crate::channels::RenderedImage>) -> usize {
     })
 }
 
-/// **What a loop reply's raster costs on this heap**, priced the same way a
-/// plan-view reply is: its `Color32` pixels, and zero for a reply that drew
-/// nothing. Public because both ends of that seam live outside this module —
-/// the send in `app_fetch`'s `spawn_loop_frame_render`, the receipt in
-/// `app_render`'s `poll_loop_render_results` — and pricing them through one
-/// function is what stops the two ends from disagreeing.
-pub fn loop_image_bytes(image: Option<&egui::ColorImage>) -> usize {
+/// **What a loop reply costs on this heap while it is in flight**, whichever
+/// of the two surfaces it carried: a raster's `Color32` pixels, or a polar
+/// payload's own `resident_bytes`. Zero for a reply that drew nothing.
+///
+/// Public because both ends of that seam live outside this module — the send
+/// in `app_fetch`'s `loop_reply_surface`, the receipt in `app_render`'s
+/// `poll_loop_render_results` — and pricing them through one function is what
+/// stops the two ends from disagreeing.
+///
+/// The two arms **add** rather than alternate, and the sum is not a hedge: a
+/// reply carries one surface, so one term is zero on every reply this build
+/// sends. Writing it as a sum is what makes the function total — a frame that
+/// somehow carried both would be priced for both rather than for whichever
+/// arm was checked first.
+///
+/// **`resident_bytes` and not a budget constant.** It is read off the buffers
+/// the payload allocated, so it measures the object in flight; the crate that
+/// *budgets* a polar frame has a price of its own that nothing may select yet,
+/// and this is deliberately not it.
+pub fn loop_reply_bytes(
+    image: Option<&egui::ColorImage>,
+    codes: Option<&squallar_egui::radar_fan::FanSweep>,
+) -> usize {
     image.map_or(0, |i| i.pixels.len() * std::mem::size_of::<egui::Color32>())
+        + codes.map_or(0, squallar_egui::radar_fan::FanSweep::resident_bytes)
 }
 
 /// A loop reply closure's handle on the in-flight level — see
@@ -2144,6 +2166,10 @@ impl RenderDispatcher {
                             ),
                             // A static pane keeps the grid: it is what a hover reads.
                             values_wanted: true,
+                            // And therefore the raster: a plane's numbers are
+                            // its codes, and the polar field beside one carries
+                            // geometry alone. See `RadarPlanJob::run`.
+                            surface: squallar_radar::jobs::PlanSurface::Raster,
                         },
                         // And it is the one render kind that may take the
                         // long-range raster, if this device can hold one.
@@ -2578,6 +2604,9 @@ impl RenderDispatcher {
                     // The body's trap, held: this raster becomes the pane's
                     // static render on tilt-step, and a hover reads the grid.
                     values_wanted: true,
+                    // And the raster with it, for the reason the interactive
+                    // dispatch above gives.
+                    surface: squallar_radar::jobs::PlanSurface::Raster,
                 },
                 squallar_worker::offload::ceiling_only_geometry(
                     self.static_side_ceiling_px() as u32

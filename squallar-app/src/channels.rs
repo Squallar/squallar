@@ -467,6 +467,20 @@ pub struct LoopRenderResponse {
     /// wedges and a gate spacing against 5.03 MiB of values — see
     /// [`squallar_radar::hover::SweepGates`]. Set on the failure path too, empty.
     pub polar: squallar_radar::render::polar::PolarField,
+    /// **This frame's code plane, already turned into the payload the renderer
+    /// draws**, or `None` for a reply whose surface was a raster.
+    ///
+    /// The plane itself does not travel this far: turning one into a
+    /// [`FanSweep`](squallar_egui::radar_fan::FanSweep) walks the whole mip
+    /// chain into a single buffer and bakes the 256-entry colour table, and
+    /// `render_dispatch::fan_sweep` says in as many words that neither belongs
+    /// on the frame thread. So the turn happens where the reply is delivered —
+    /// a pool lane natively — and what reaches the frame is a finished payload
+    /// to file, not a plane to build.
+    ///
+    /// `Some` here and [`Self::image`] `Some` are mutually exclusive: the
+    /// frame carried one surface and this is which.
+    pub codes: Option<std::sync::Arc<squallar_egui::radar_fan::FanSweep>>,
 }
 
 /// Result from cutting a single cross-section loop frame.

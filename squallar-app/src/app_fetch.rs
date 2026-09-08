@@ -2733,6 +2733,15 @@ impl super::App {
             srv_fallback: self.render.srv_fallback(),
             melting_layer,
             rpg_storm_motion,
+            // **The producer asks the same question the draw asks**, off the
+            // one field that holds the answer. A frame built in the polar
+            // shape on a machine with no renderer for it is a pane with no
+            // radar on it, because the raster it would fall back to is the
+            // allocation the representation exists not to make.
+            surface: match self.radar_fan_painter {
+                Some(_) => squallar_radar::jobs::PlanSurface::Fan,
+                None => squallar_radar::jobs::PlanSurface::Raster,
+            },
         };
         // Which job input this frame's data makes is radar's answer, not this
         // crate's: the described job crosses back with its input type erased and
@@ -2758,57 +2767,20 @@ impl super::App {
             // draw" a failed render has always been.
             let frame = output.and_then(|out| out.take::<squallar_radar::frame::RenderedFrame>());
             // A failed render still has to be sent, so render_in_flight gets cleared.
-            let (image, max_range_km, nyquist_ms, describes, polar) = match frame {
-                Some(mut frame) => {
-                    let image_len = frame.image.len_bytes();
-                    // A `Bytes` frame is the pooled native path and keeps
-                    // copying; a `Pixels` frame was materialized at wire
-                    // decode and moves into the image without a copy here.
-                    let picture = match frame.image {
-                        squallar_radar::frame::RasterImage::Bytes(bytes) => {
-                            let picture = loop_frame_image(&bytes, frame_side);
-                            squallar_radar::render::recycle_image(bytes);
-                            picture
-                        }
-                        squallar_radar::frame::RasterImage::Pixels(pixels) => {
-                            loop_frame_image_owned(pixels, frame_side)
-                        }
-                    };
-                    let converted = match picture {
-                        Some(image) => (
-                            Some(image),
-                            frame.max_range_km,
-                            frame.nyquist_ms,
-                            FrameProvenance {
-                                melting_layer_source: frame.melting_layer_source,
-                                storm_motion: frame.storm_motion,
-                            },
-                        ),
-                        None => {
-                            log::error!(
-                                "Loop render for pane {pane_idx} produced {} bytes, expected \
-                                 {} for the {frame_side} px frame it was dispatched at",
-                                image_len,
-                                frame_side * frame_side * 4
-                            );
-                            (None, 0.0, None, FrameProvenance::default())
-                        }
-                    };
-                    frame.polar.strip_values();
-                    let (image, max_range_km, nyquist_ms, describes) = converted;
-                    (image, max_range_km, nyquist_ms, describes, frame.polar)
-                }
-                None => (
-                    None,
-                    0.0,
-                    None,
-                    FrameProvenance::default(),
-                    Default::default(),
-                ),
-            };
+            let LoopReplySurface {
+                image,
+                codes,
+                max_range_km,
+                nyquist_ms,
+                describes,
+                polar,
+            } = loop_reply_surface(frame, frame_side, lat, lon, pane_idx);
             // Priced BEFORE the send, so `poll_loop_render_results` can never
             // settle bytes that were not added. Zero on the failure arm.
-            loop_reply.price(crate::render_dispatch::loop_image_bytes(image.as_ref()));
+            loop_reply.price(crate::render_dispatch::loop_reply_bytes(
+                image.as_ref(),
+                codes.as_deref(),
+            ));
             // One send site for both outcomes, so `snapped` cannot come to differ
             // between them.
             let _ = sender.send(crate::channels::LoopRenderResponse {
@@ -2824,6 +2796,7 @@ impl super::App {
                 melting_layer_source: describes.melting_layer_source,
                 storm_motion: describes.storm_motion,
                 polar,
+                codes,
             });
             super::notify_redraw(&window);
         });
@@ -3227,6 +3200,124 @@ impl super::App {
 /// would look like a run of renders that produced nothing. The dispatch site
 /// carries its own side into the closure so a frame is always measured
 /// against what it was asked for.
+/// **What a finished loop render becomes**, shaped where the reply is
+/// delivered rather than where it lands.
+struct LoopReplySurface {
+    image: Option<egui::ColorImage>,
+    codes: Option<std::sync::Arc<squallar_egui::radar_fan::FanSweep>>,
+    max_range_km: f64,
+    nyquist_ms: Option<f64>,
+    describes: FrameProvenance,
+    polar: squallar_radar::render::polar::PolarField,
+}
+
+/// **The surface half of a loop reply, built off the frame thread.**
+///
+/// A free function and not a closure body, because it is where the two
+/// surfaces fork and a fork with no name is a fork with no test. It runs on
+/// the thread `offload::deliver_job_reply` delivers on — natively a pool lane,
+/// never the frame thread.
+///
+/// **The plane becomes the payload here.**
+/// [`fan_sweep`](crate::render_dispatch::fan_sweep) walks the whole mip chain
+/// into one buffer and bakes the 256-entry table, and its own doc says neither
+/// belongs on the frame thread; `app_render`'s arrival path reads what this
+/// produced rather than producing it. On the web this thread is the page's
+/// main thread, and there the work does not *add* to it: it replaces the
+/// `loop_frame_image` materialization on the other arm, which is larger by the
+/// whole difference between a raster and a plane.
+///
+/// The raster conversion is skipped whole where a plane arrived, because a
+/// frame has one surface: such a reply's image is empty by construction and
+/// running the conversion would report a zero-length picture as a failed
+/// render.
+fn loop_reply_surface(
+    frame: Option<squallar_radar::frame::RenderedFrame>,
+    frame_side: usize,
+    lat: f64,
+    lon: f64,
+    pane_idx: usize,
+) -> LoopReplySurface {
+    let Some(mut frame) = frame else {
+        return LoopReplySurface {
+            image: None,
+            codes: None,
+            max_range_km: 0.0,
+            nyquist_ms: None,
+            describes: FrameProvenance::default(),
+            polar: Default::default(),
+        };
+    };
+    let describes = FrameProvenance {
+        melting_layer_source: frame.melting_layer_source,
+        storm_motion: frame.storm_motion,
+    };
+    let codes = frame
+        .codes
+        .take()
+        .and_then(|plane| {
+            crate::render_dispatch::fan_sweep(&plane, frame.polar.geometry(), lat, lon)
+        })
+        .map(std::sync::Arc::new);
+    let image_len = frame.image.len_bytes();
+    // A `Bytes` frame is the pooled native path and keeps copying; a `Pixels`
+    // frame was materialized at wire decode and moves into the image without a
+    // copy here.
+    //
+    // **The plane wins where a frame carried both.** A well-formed polar reply
+    // has an empty raster, so on it this branch only saves the walk; what it
+    // is *for* is the producer bug `RenderedFrame::into_surface_tails`
+    // `debug_assert`s about, where running the conversion would materialize a
+    // whole `ColorImage` beside the plane and send a reply with two surfaces
+    // in it — the pane holding both representations of one picture, which is
+    // strictly worse than the raster this replaces.
+    let image = if codes.is_some() {
+        None
+    } else {
+        match std::mem::replace(
+            &mut frame.image,
+            squallar_radar::frame::RasterImage::Bytes(Vec::new()),
+        ) {
+            squallar_radar::frame::RasterImage::Bytes(bytes) => {
+                let picture = loop_frame_image(&bytes, frame_side);
+                squallar_radar::render::recycle_image(bytes);
+                picture
+            }
+            squallar_radar::frame::RasterImage::Pixels(pixels) => {
+                loop_frame_image_owned(pixels, frame_side)
+            }
+        }
+    };
+    // **A reply with neither surface is the failure arm**, and it is the only
+    // one that discards the frame's own numbers: a picture of the wrong length
+    // says nothing trustworthy about the range it was projected at either.
+    if image.is_none() && codes.is_none() {
+        log::error!(
+            "Loop render for pane {pane_idx} produced {image_len} bytes, expected \
+             {} for the {frame_side} px frame it was dispatched at",
+            frame_side * frame_side * 4
+        );
+        frame.polar.strip_values();
+        return LoopReplySurface {
+            image: None,
+            codes: None,
+            max_range_km: 0.0,
+            nyquist_ms: None,
+            describes: FrameProvenance::default(),
+            polar: frame.polar,
+        };
+    }
+    frame.polar.strip_values();
+    LoopReplySurface {
+        image,
+        codes,
+        max_range_km: frame.max_range_km,
+        nyquist_ms: frame.nyquist_ms,
+        describes,
+        polar: frame.polar,
+    }
+}
+
 fn loop_frame_image(rgba: &[u8], side: usize) -> Option<egui::ColorImage> {
     if side == 0 || rgba.len() != side * side * 4 {
         return None;
@@ -4338,3 +4429,8 @@ pub fn install_tile_discard() {
         squallar_worker::offload::discard(name, payload);
     });
 }
+
+/// The delivery-side fork between the two loop surfaces.
+#[cfg(test)]
+#[path = "app_fetch/loop_reply_surface_tests.rs"]
+mod loop_reply_surface_tests;

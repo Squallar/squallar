@@ -6,13 +6,17 @@
 //! [`crate::palette::get_color_for_value`] per gate. The plane is the data; this
 //! table is the palette, baked.
 //!
-//! **This module produces a table and nothing draws through it yet.** No
-//! renderer emits a code plane, so nothing here is on a paint path — it is the
-//! first landable piece of the polar representation and it is deliberately
-//! inert. Building it early is what makes the *fidelity* question answerable
-//! before any pixel moves: a 256-entry table is exact for some products and
-//! cannot be for others, and `codes/tests.rs` settles which is which by
-//! measurement rather than by assumption.
+//! **A renderer emits planes now** — [`crate::render::render_sweep_plane`],
+//! through [`crate::render::plane`], for a Level II plan view whose caller
+//! asked for the polar surface. What is still dark is the *draw*: no build
+//! installs a `RadarFanPainter`, so nothing paints through this table on a
+//! shipped scene, and `squallar_device_profile`'s polar price stays unselected
+//! with it — that crate scrapes for its own function's name as a literal, so
+//! this sentence names it only by description. The fidelity question was
+//! answerable before any pixel
+//! moved for the same reason it still is: a 256-entry table is exact for some
+//! products and cannot be for others, and `codes/tests.rs` settles which is
+//! which by measurement rather than by assumption.
 //!
 //! # Why a bake loses nothing where it is exact
 //!
@@ -421,8 +425,10 @@ pub fn full_mip_levels(radials: usize, gates: usize) -> usize {
 /// is a deliberate change from the raster, whose `RenderBuffers::claim` orders
 /// by `write_key` and is therefore last-radial-wins.
 ///
-/// **Nothing draws this yet.** No renderer emits a plane, and the budget seam
-/// that would price one stays dark until the renderer produces polar frames —
+/// **A renderer emits these now** and nothing draws them yet, which are two
+/// different statements: [`crate::render::render_sweep_plane`] builds a plane
+/// where a caller asks for one, and no build installs a painter for it. The
+/// budget seam that would price one stays dark until both are true —
 /// `squallar_device_profile`'s own darkness gate is what holds that, and it
 /// matches the price function's name as a literal, so this sentence names it
 /// only by description.

@@ -336,6 +336,7 @@ fn frames_holding_a_picture_after_a_render(park_on_the_satellite: bool) -> (bool
             melting_layer_source: None,
             storm_motion: None,
             polar: Default::default(),
+            codes: None,
         })
         .expect("the receiver lives on the App");
     app.poll_loop_render_results(&egui::Context::default());

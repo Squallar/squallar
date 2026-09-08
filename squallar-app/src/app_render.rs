@@ -5080,7 +5080,10 @@ impl super::App {
             // move the image out of `rr`, and per response rather than per
             // pane — a loop pane has many frames in flight at once.
             self.render
-                .settle_loop_reply(crate::render_dispatch::loop_image_bytes(rr.image.as_ref()));
+                .settle_loop_reply(crate::render_dispatch::loop_reply_bytes(
+                    rr.image.as_ref(),
+                    rr.codes.as_deref(),
+                ));
             let origin_pane = rr.pane_idx;
             // Resolved before the pane is borrowed, and off the *response*
             // rather than off the pane — see `frame_gates`.
@@ -8891,33 +8894,31 @@ fn rendered_image(
 /// with no radar on it, not a slower pane. Unlike a tile fill, which falls
 /// back to CPU placement and loses only speed.
 ///
-/// *The reply must carry a code plane.* **No reply does today, and the reason
-/// moved on 2026-09-08.** `ce3bf6fbe` landed the third wire tail, so
-/// `RenderedFrame::codes` now exists — but it is `None` on every frame this
-/// build produces, because no renderer emits a plane; and
-/// [`LoopRenderResponse`](crate::channels::LoopRenderResponse), which is what
-/// *this* function is handed, carries no `codes` field at all. Two separate
-/// gaps, and either alone is enough for this to return `None` on every reply,
-/// so no pane has ever held a polar surface in a shipped build.
+/// *The reply must carry a payload.*
+/// [`LoopRenderResponse::codes`](crate::channels::LoopRenderResponse::codes) is
+/// `Some` exactly where the render produced a code plane, which is where the
+/// dispatch asked for one and the sweep could carry it. Every other reply is a
+/// raster and this answers `None` for it.
 ///
-/// That is the one dark row of this seam. Everything either side of it — the
-/// arm on `RadarSurface`, the draw fork, the painter install, the floor-strip
-/// refusal, the picture key, the ordered position the callback takes — is
-/// finished and exercised.
+/// **This function reads and does not build**, which is the whole of why the
+/// reply carries a finished payload rather than a plane.
+/// [`fan_sweep`](crate::render_dispatch::fan_sweep) walks the chain, which is
+/// the plane again, and bakes a table; it says in as many words that neither
+/// belongs on the frame thread, and this runs on the frame thread. The turn
+/// happens where the reply is delivered — `App::spawn_loop_render`'s
+/// delivery, a pool lane natively — and what lands here is already the
+/// renderer's payload.
 ///
-/// **What is left is not this function's to do.** `fan_sweep` walks the whole
-/// chain, which is the plane again, and bakes a table; this runs on the frame
-/// thread, where neither belongs. The producer that writes the tail is the one
-/// that should call
-/// [`fan_sweep`](crate::render_dispatch::fan_sweep) — so the remaining work is
-/// a plane emitted at render time and carried through to the reply, and this
-/// function then reads what arrived rather than building it.
+/// One sweep a frame, so the slice is one long. A pane's fan is a slice
+/// because the surface admits several sweeps; a plan-view loop frame is one
+/// cut of one volume and has exactly one.
 fn loop_frame_fan(
-    _reply: &crate::channels::LoopRenderResponse,
+    reply: &crate::channels::LoopRenderResponse,
     renderer: Option<&std::sync::Arc<dyn squallar_egui::radar_fan::RadarFanPainter>>,
 ) -> Option<std::sync::Arc<[std::sync::Arc<squallar_egui::radar_fan::FanSweep>]>> {
     renderer?;
-    None
+    let sweep = reply.codes.clone()?;
+    Some(std::sync::Arc::from(vec![sweep]))
 }
 
 /// The sweep a finished loop render was drawn from, for reading its numbers

@@ -242,6 +242,7 @@ fn deliver_every_frame(app: &mut crate::app::App, ctx: &egui::Context, pane: usi
                 melting_layer_source: None,
                 storm_motion: None,
                 polar: Default::default(),
+                codes: None,
             })
             .expect("the receiver lives on the App");
     }

@@ -355,6 +355,22 @@ impl PolarGeometry {
             reach_gates: gates,
         }
     }
+
+    /// [`Self::from_parts`]'s reach, **measured** rather than assumed whole.
+    ///
+    /// `from_parts` answers `reach_gates == gates` because a caller holding a
+    /// layout and no data has nothing else to say. A caller that walked the
+    /// gates has: `render_sweep_plane` counts the painted ones, the same
+    /// quantity `PolarBuffers::into_field` reads off the raster it just wrote,
+    /// and the two must mean the same thing or a fan and a raster of one sweep
+    /// draw to two different radii.
+    ///
+    /// Clamped to the stride, because a reach past it is a caller that
+    /// miscounted and `gate_at` would answer gates no row holds.
+    pub fn reaching(mut self, reach_gates: usize) -> Self {
+        self.reach_gates = reach_gates.min(self.gates);
+        self
+    }
 }
 
 /// The numbers behind a picture, in either of the two forms that answer

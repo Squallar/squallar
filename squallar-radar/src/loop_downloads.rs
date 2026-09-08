@@ -45,6 +45,12 @@ pub struct LoopRenderContext {
     pub melting_layer: Option<Arc<Vec<u8>>>,
     /// The RPG's storm motion vector for **this frame's own volume**.
     pub rpg_storm_motion: Option<(f32, f32)>,
+    /// **Which surface this pane's loop frames can be drawn on.**
+    ///
+    /// Carried from the dispatcher rather than decided here, for the reason
+    /// [`crate::jobs::PlanSurface`] gives: whether a fan can be drawn at all is
+    /// a property of the machine the pane is on, and this crate cannot see it.
+    pub surface: crate::jobs::PlanSurface,
 }
 
 /// **Whether `site`'s decoded Level II volumes are still needed by anything
@@ -1329,6 +1335,7 @@ impl LoopDownloadManager {
                         ),
                         // Loop frames store an empty value grid.
                         values_wanted: false,
+                        surface: ctx.surface,
                     },
                 ))
             }
@@ -2978,6 +2985,7 @@ mod archive_tests {
             srv_fallback: crate::srv::SrvFallback::default(),
             melting_layer: None,
             rpg_storm_motion: None,
+            surface: crate::jobs::PlanSurface::Raster,
         };
 
         assert!(

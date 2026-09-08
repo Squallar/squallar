@@ -147,6 +147,7 @@ fn response(
         melting_layer_source: None,
         storm_motion: None,
         polar: Default::default(),
+        codes: None,
     }
 }
 
@@ -771,6 +772,62 @@ fn fan_sweeps() -> std::sync::Arc<[std::sync::Arc<squallar_egui::radar_fan::FanS
             },
         },
     )])
+}
+
+/// A painter that draws nothing — enough to be installed, which is all
+/// [`loop_frame_fan`] asks of one.
+struct NoOpFanPainter;
+
+impl squallar_egui::radar_fan::RadarFanPainter for NoOpFanPainter {
+    fn payload(
+        &self,
+        _draw: squallar_egui::radar_fan::FanDraw<'_>,
+    ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
+}
+
+/// **The arrival path reads the payload the reply carried and builds none.**
+///
+/// Four arms, and the pairing is what makes each one say something. With a
+/// painter installed, a reply carrying a payload yields it *by identity* —
+/// `Arc::ptr_eq`, so a seam that rebuilt an equal payload on the frame thread
+/// fails here even though the picture would be identical. A reply carrying
+/// none yields none, which is the raster arm. And with no painter installed
+/// neither reply yields anything, because a fan has no fallback and a frame
+/// built in the polar shape on a machine that cannot draw one is a pane with
+/// no radar on it.
+///
+/// TAMPER: return `Some` unconditionally and the two `None` arms go red;
+/// rebuild the payload from the plane here and the identity arm goes red; drop
+/// the `renderer?` and the no-painter arms go red.
+#[test]
+fn the_fan_a_loop_frame_draws_is_the_payload_its_reply_carried() {
+    let painter: std::sync::Arc<dyn squallar_egui::radar_fan::RadarFanPainter> =
+        std::sync::Arc::new(NoOpFanPainter);
+    let carried = std::sync::Arc::clone(&fan_sweeps()[0]);
+
+    let mut with_payload = response(ts(1), target("KTLX", 0.5));
+    with_payload.codes = Some(std::sync::Arc::clone(&carried));
+    let bare = response(ts(1), target("KTLX", 0.5));
+
+    let drawn = loop_frame_fan(&with_payload, Some(&painter))
+        .expect("a reply carrying a payload draws a fan");
+    assert_eq!(drawn.len(), 1, "one cut of one volume is one sweep");
+    assert!(
+        std::sync::Arc::ptr_eq(&drawn[0], &carried),
+        "the payload was rebuilt on the frame thread rather than carried",
+    );
+
+    assert!(
+        loop_frame_fan(&bare, Some(&painter)).is_none(),
+        "a raster reply produced a fan out of nothing",
+    );
+    assert!(
+        loop_frame_fan(&with_payload, None).is_none(),
+        "a fan was built on a machine with no renderer to draw it",
+    );
+    assert!(loop_frame_fan(&bare, None).is_none());
 }
 
 /// **A polar frame mints no texture, and that is the whole saving.**

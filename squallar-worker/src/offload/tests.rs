@@ -69,6 +69,7 @@ pub(super) fn a_job() -> JobRequest {
                 RenderInput::from_bytes(&sample_input_bytes()).expect("fixture payload decodes"),
             ),
             values_wanted: true,
+            surface: squallar_radar::jobs::PlanSurface::Raster,
         },
         ceiling_only_geometry(4096),
     )

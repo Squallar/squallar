@@ -102,10 +102,10 @@ pub struct RenderedFrame {
     /// own, so the head would need one anyway, at which point the third tail
     /// costs its framing and nothing else.
     ///
-    /// **`None` on every frame this build produces.** No renderer emits a
-    /// plane yet; the wire is landed ahead of the producer so the two halves
-    /// arrive in one reviewable piece rather than as a payload nothing can
-    /// carry.
+    /// `Some` exactly on the frames `crate::render::render_sweep_plane`
+    /// produced — a Level II plan view whose caller asked for the polar
+    /// surface and whose sweep could carry one. Every other renderer answers a
+    /// raster and leaves this `None`.
     pub codes: Option<crate::render::codes::CodePlane>,
 }
 
@@ -121,9 +121,11 @@ impl From<crate::render::SweepRender> for RenderedFrame {
             nyquist_ms: render.nyquist_ms,
             melting_layer_source: render.melting_layer_source,
             storm_motion: render.storm_motion,
-            // The renderer produces a raster. `SweepRender` has no plane to
-            // hand over, and this arm is where one would arrive when it does.
-            codes: None,
+            // Whichever surface the renderer built. `render_sweep_plane` is
+            // the one path that fills this, and it leaves `image` empty, so
+            // the exclusivity `into_surface_tails` asserts holds by
+            // construction of the renderer rather than by a check here.
+            codes: render.codes,
         }
     }
 }

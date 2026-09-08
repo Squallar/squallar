@@ -3765,14 +3765,26 @@ mod tests;
 ///
 /// `None` today, on every target, and that is where the polar path stops: the
 /// renderer half lives in `squallar_gpu::radar_fan` and is not in this tree
-/// yet. One function, so the answer cannot be given twice — the install above
-/// publishes what this returns and the arrival path in `app_render` asks the
-/// installed value before it will build a polar surface at all.
+/// yet. One function, so the answer cannot be given twice — it is what
+/// `spawn_loop_render` asks before it will *request* a polar frame, and what
+/// the arrival path in `app_render` asks before it will build a polar surface.
 ///
 /// When the store and the bridge land, this becomes the two lines the tile
 /// mesh already has beside it: insert the store into the renderer's callback
 /// resources, then return the bridge. It takes no arguments today for the same
 /// reason it returns `None` — there is nothing yet to give it.
+///
+/// **And one more line, elsewhere, in the same change.**
+/// `squallar_device_profile`'s polar frame price is deliberately dark —
+/// nothing on a path to `fit::NeedTerms` may select it — because a polar frame
+/// and a raster of the same sweep differ by a factor of 369, and a budget
+/// taking the polar figure while the renderer still produced rasters would
+/// sign off a scene costing 369× its price. The producer emits planes now, so
+/// the day this function returns a bridge is the day that price has to be
+/// keyed on **what the renderer actually produced for that frame** — never on
+/// this function alone, and never on a build flag. That crate's own doc states
+/// the constraint and scrapes the workspace for its function's name as a
+/// literal, which is why this names it only by description.
 fn radar_fan_bridge() -> Option<Arc<dyn squallar_egui::radar_fan::RadarFanPainter>> {
     None
 }

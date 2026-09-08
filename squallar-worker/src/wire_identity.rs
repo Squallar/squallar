@@ -21,7 +21,17 @@
 /// points at it. Re-pinning a row changes [`wire_digest`] and so the local
 /// build token.
 pub const WIRE_FRAMING_ROWS: &[&str] = &[
-    "radar | 46 | 0x813f26d9407ac047",
+    // Re-pinned when the plan-view request learned to state which surface the
+    // caller can draw (`jobs::PlanSurface`). The row grew by that one byte and
+    // by nothing else, and the arithmetic is checkable without the encoder:
+    // the surface byte is written LAST in the framed prefix — behind
+    // `values_wanted`, in front of the nested `RenderInput` that `framing_of`
+    // strips — so the new digest is the old one folded with a single `0x00`,
+    // which is `PlanSurface::Raster`'s code and what the fixture carries.
+    // `0x813f26d9407ac047 * 0x100000001b3 mod 2^64 == 0x190f4a289094b8a5`,
+    // exactly what the encoder now posts. Every other row was byte-identical
+    // in this change; a move in one of those would have been a bug in it.
+    "radar | 47 | 0x190f4a289094b8a5",
     "level3 | 68 | 0xae8be80f6b6cf96e",
     "level3/vild | 74 | 0xad0639c99f05f4e7",
     "section | 88 | 0xe8e95369569f391f",
