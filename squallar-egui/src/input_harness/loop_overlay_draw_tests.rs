@@ -288,11 +288,11 @@ fn an_overlay_frame_is_not_a_radar_render_view() {
 
     // The converse: radar's own shapes must not answer the overlay accessor.
     let plan = LoopFrameImage::PlanView(crate::pane::RadarImageData {
-        texture: ctx.load_texture(
+        surface: crate::pane::RadarSurface::Raster(ctx.load_texture(
             "p",
             egui::ColorImage::filled([1, 1], egui::Color32::BLUE),
             egui::TextureOptions::default(),
-        ),
+        )),
         lat: 35.0,
         lon: -97.0,
         placed: squallar_geo::PlacedRaster::of(squallar_geo::GeoBounds {

@@ -74,7 +74,7 @@ fn loop_in(view: RenderView, count: u32) -> LayerTimeState {
 fn plan_view_picture(ctx: &egui::Context) -> LoopFrameImage {
     let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
     LoopFrameImage::PlanView(RadarImageData {
-        texture: ctx.load_texture("plan", image, egui::TextureOptions::NEAREST),
+        surface: RadarSurface::Raster(ctx.load_texture("plan", image, egui::TextureOptions::NEAREST)),
         lat: 35.33,
         lon: -97.28,
         max_range_km: 230.0,

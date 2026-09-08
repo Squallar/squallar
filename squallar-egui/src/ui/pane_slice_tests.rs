@@ -1050,11 +1050,11 @@ fn device_raster(ctx: &egui::Context, name: &str) -> crate::overlay_cache::Overl
 /// reached before WO-T3.5, and the floor it must not trade away.
 fn device_plan_view(ctx: &egui::Context) -> crate::pane::RadarImageData {
     crate::pane::RadarImageData {
-        texture: ctx.load_texture(
+        surface: crate::pane::RadarSurface::Raster(ctx.load_texture(
             "radar".to_owned(),
             egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
             egui::TextureOptions::NEAREST,
-        ),
+        )),
         lat: 35.0,
         lon: -97.0,
         max_range_km: 100.0,

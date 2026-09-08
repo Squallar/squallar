@@ -116,6 +116,7 @@ fn dispatched(surfaces: PaneSurfaces, ground: GroundIsMesh) -> Vec<LayerId> {
         point_text_meshes: &mut crate::point_painter::PointTextMeshes::default(),
         label_cache: &mut crate::label_cache::LabelCache::default(),
         ground_meshes: None,
+            radar_fan: None,
         // No tile source either way: what is being measured is which arms the
         // walk dispatches, which is what the paint-order record carries, and
         // an arm that runs with nothing to draw still records itself.

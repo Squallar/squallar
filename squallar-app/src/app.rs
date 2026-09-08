@@ -216,6 +216,15 @@ pub struct App {
     /// The same painter [`Gui`] was handed, kept so the frame path can take its floor-
     /// magnification demand.
     volume_painter: Option<Arc<squallar_volumetric::bridge::BridgeVolumePainter>>,
+    /// The same fan painter [`Gui`] was handed, kept because the **producer**
+    /// has to ask the same question the draw does.
+    ///
+    /// A polar radar surface has no fallback: the raster it would fall back to
+    /// is the allocation the representation exists not to make, so a frame
+    /// built in the polar shape on a machine with no renderer for it is a pane
+    /// with no radar on it. One field, read by the install and by the arrival
+    /// path, is what stops those two answering differently.
+    radar_fan_painter: Option<Arc<dyn squallar_egui::radar_fan::RadarFanPainter>>,
     /// The rung the pane mirror is drawn at, and the hysteresis that governs when it may
     /// move.
     mirror_rungs: squallar_gpu::egui_renderer::MirrorRungs,
@@ -968,6 +977,7 @@ impl App {
             radar_liveness: squallar_egui::radar_layer::RadarLiveness::default(),
             liveness: Vec::new(),
             volume_painter: None,
+            radar_fan_painter: None,
             mirror_rungs: squallar_gpu::egui_renderer::MirrorRungs::default(),
             mirror_plan_applied: None,
             mirror_plan_stamp: 0,
@@ -1907,12 +1917,21 @@ impl App {
         );
         state.egui_renderer.callback_resources_mut().insert(ground);
 
-        // Both of the renderer's painters, published at one seam.
+        // The radar fan, when this build has one. Its store goes into
+        // `callback_resources_mut()` first and the painter is published after,
+        // for the reason the ground store above is: a frame that dispatched a
+        // fan callback into an empty slot would draw nothing and report
+        // nothing.
+        let fan = radar_fan_bridge();
+        self.radar_fan_painter = fan.clone();
+
+        // Every one of the renderer's painters, published at one seam.
         for installed in [
             GuiEvent::VolumePainter(Some(painter)),
             GuiEvent::TileMeshPainter(Some(std::sync::Arc::new(
                 squallar_gpu::tile_mesh::TileMeshBridge,
             ))),
+            GuiEvent::RadarFanPainter(fan),
         ] {
             self.gui.apply(installed);
         }
@@ -3741,6 +3760,22 @@ mod offline_tests;
 
 #[cfg(test)]
 mod tests;
+
+/// **What draws a radar sweep's code plane on this build, or nothing.**
+///
+/// `None` today, on every target, and that is where the polar path stops: the
+/// renderer half lives in `squallar_gpu::radar_fan` and is not in this tree
+/// yet. One function, so the answer cannot be given twice — the install above
+/// publishes what this returns and the arrival path in `app_render` asks the
+/// installed value before it will build a polar surface at all.
+///
+/// When the store and the bridge land, this becomes the two lines the tile
+/// mesh already has beside it: insert the store into the renderer's callback
+/// resources, then return the bridge. It takes no arguments today for the same
+/// reason it returns `None` — there is nothing yet to give it.
+fn radar_fan_bridge() -> Option<Arc<dyn squallar_egui::radar_fan::RadarFanPainter>> {
+    None
+}
 
 #[cfg(test)]
 mod theme_flip_tests;

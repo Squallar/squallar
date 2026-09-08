@@ -5040,6 +5040,11 @@ impl super::App {
             // Resolved before the pane is borrowed, and off the *response*
             // rather than off the pane — see `frame_gates`.
             let gates = frame_gates(&self.loop_mgr, &rr);
+            // Asked here, beside the gates and for the same reason: off the
+            // *response*, before anything borrows a pane, and with the
+            // installed renderer in hand — a polar surface is only ever built
+            // where there is something that can draw one.
+            let fan = loop_frame_fan(&rr, self.radar_fan_painter.as_ref());
 
             let Some(pane) = self.gui.pane_mut(origin_pane) else {
                 continue;
@@ -5049,6 +5054,7 @@ impl super::App {
             let Some(image) = accept_render_result(
                 pane.time_state_mut(&known::RADAR),
                 &mut rr,
+                fan,
                 gates,
                 |color_image| {
                     *counter += 1;
@@ -8737,11 +8743,11 @@ fn settle_radar_loop_phase(
 /// The frame image a finished loop render describes.
 fn rendered_image(
     rr: &crate::channels::LoopRenderResponse,
-    texture: &egui::TextureHandle,
+    surface: squallar_egui::pane::RadarSurface,
     gates: Option<squallar_radar::hover::SweepGates>,
 ) -> squallar_egui::pane::RadarImageData {
     squallar_egui::pane::RadarImageData {
-        texture: texture.clone(),
+        surface,
         lat: rr.site_lat,
         lon: rr.site_lon,
         max_range_km: rr.max_range_km,
@@ -8759,6 +8765,40 @@ fn rendered_image(
             gates,
         )),
     }
+}
+
+/// **The polar sweeps a finished loop render carried**, or `None` for a reply
+/// that carried a raster.
+///
+/// Two conjuncts, and neither is optional.
+///
+/// *A renderer must be installed.* A polar surface has no fallback — the
+/// raster it would fall back to is the allocation this representation exists
+/// not to make — so a fan built on a machine that cannot draw one is a pane
+/// with no radar on it, not a slower pane. Unlike a tile fill, which falls
+/// back to CPU placement and loses only speed.
+///
+/// *The reply must carry a code plane.* **No reply does today.**
+/// `RenderedFrame` puts two tails on the wire, the polar field and the image;
+/// the code plane is a third that no producer writes, so this returns `None`
+/// on every reply and no pane has ever held a polar surface in a shipped
+/// build. That is the one dark row of this seam and it is one function wide:
+/// when the third tail lands, this reads it, hands it and the reply's own
+/// `polar` geometry to [`crate::render_dispatch::fan_sweep`], and collects the
+/// result. Everything either side of it — the arm on `RadarSurface`, the draw
+/// fork, the painter install, the floor-strip refusal, the picture key — is
+/// finished and exercised.
+///
+/// **The concatenation goes with the tail, not with this call.** `fan_sweep`
+/// walks the whole chain, which is the plane again; this function runs on the
+/// frame thread, where that does not belong. The producer that writes the tail
+/// is the one that should call it.
+fn loop_frame_fan(
+    _reply: &crate::channels::LoopRenderResponse,
+    renderer: Option<&std::sync::Arc<dyn squallar_egui::radar_fan::RadarFanPainter>>,
+) -> Option<std::sync::Arc<[std::sync::Arc<squallar_egui::radar_fan::FanSweep>]>> {
+    renderer?;
+    None
 }
 
 /// The sweep a finished loop render was drawn from, for reading its numbers
@@ -8783,19 +8823,28 @@ fn frame_gates(
 fn accept_render_result(
     ls: &mut squallar_egui::pane::LayerTimeState,
     rr: &mut crate::channels::LoopRenderResponse,
+    fan: Option<std::sync::Arc<[std::sync::Arc<squallar_egui::radar_fan::FanSweep>]>>,
     gates: Option<squallar_radar::hover::SweepGates>,
     upload: impl FnOnce(egui::ColorImage) -> egui::TextureHandle,
 ) -> Option<squallar_egui::pane::RadarImageData> {
     let frame = ls.frame_awaiting_render_result_mut(rr.timestamp, &rr.target)?;
     frame.render_in_flight = false;
 
-    let Some(color_image) = rr.image.take() else {
-        frame.render_failed = true;
-        return None;
+    // **The upload happens on the raster arm only**, and that is the whole
+    // saving rather than a detail of it: a polar frame that also minted a
+    // texture would hold both representations and cost more than the raster
+    // did. So the closure is called inside the arm and not before the match.
+    let surface = match fan {
+        Some(sweeps) => squallar_egui::pane::RadarSurface::Fan(sweeps),
+        None => {
+            let Some(color_image) = rr.image.take() else {
+                frame.render_failed = true;
+                return None;
+            };
+            squallar_egui::pane::RadarSurface::Raster(upload(color_image))
+        }
     };
-
-    let texture = upload(color_image);
-    let image = rendered_image(rr, &texture, gates);
+    let image = rendered_image(rr, surface, gates);
     frame.image = Some(squallar_egui::pane::LoopFrameImage::PlanView(image.clone()));
     Some(image)
 }

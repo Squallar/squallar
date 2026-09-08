@@ -58,6 +58,9 @@ pub mod pane;
 /// its API declines to.
 pub mod pmt_index;
 pub(crate) mod point_painter;
+/// A plan-view sweep as the codes the radar measured, drawn from the GPU
+/// through a baked colour table instead of rasterized on the CPU.
+pub mod radar_fan;
 /// The radar layer's own glue: what the presentation holds for radar that no
 /// other layer has.
 pub mod radar_layer;

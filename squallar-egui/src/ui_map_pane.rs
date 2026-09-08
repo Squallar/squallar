@@ -310,7 +310,7 @@ pub(super) fn ground_content_key(input: &GroundKeyInputs<'_>, ground: GroundIsMe
                     input
                         .pane
                         .active_image()
-                        .map(|img| img.texture.id())
+                        .map(|img| img.surface.picture_key())
                         .hash(h);
                 } else {
                     input
@@ -446,6 +446,11 @@ pub(super) struct PaneRenderCtx<'a> {
     /// [`Self::ground_mesh_painter`], which is where the floor strip is cut
     /// out of it.
     pub ground_meshes: Option<&'a std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>>,
+    /// What can draw a radar sweep's code plane from the GPU, or `None` where
+    /// nothing can. Read through [`Self::radar_fan_painter`], which is where
+    /// the floor strip is cut out of it for the same reason
+    /// [`Self::ground_mesh_painter`] cuts the tile meshes.
+    pub radar_fan: Option<&'a std::sync::Arc<dyn crate::radar_fan::RadarFanPainter>>,
     /// Whether the pane this pass belongs to draws its ground as a 3D mesh
     /// rather than as flat map pixels. See [`GroundIsMesh`], which is a
     /// newtype rather than a `bool` for a reason this field is the whole
@@ -529,6 +534,26 @@ impl PaneRenderCtx<'_> {
     ) -> Option<&std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>> {
         match self.surfaces {
             PaneSurfaces::GroundAndGlass => self.ground_meshes,
+            PaneSurfaces::GroundOnly => None,
+        }
+    }
+
+    /// What may draw this pass's radar sweeps from the GPU — **never a floor
+    /// strip**, and the reason is the one directly above: the strip's
+    /// primitives are copied into the mirror with every `Primitive::Callback`
+    /// swapped for an empty mesh, so a fan issued here would reach the 3D
+    /// floor as nothing at all.
+    ///
+    /// The difference from the ground's cut is what happens next. A tile fill
+    /// refused here falls back to CPU placement and the strip is complete; a
+    /// fan has no fallback, so the strip would simply have no radar on it.
+    /// That is why the refusal is *counted* — `radar_fan::ledger`'s
+    /// `floor_strip` arm — rather than quietly taken.
+    fn radar_fan_painter(
+        &self,
+    ) -> Option<&std::sync::Arc<dyn crate::radar_fan::RadarFanPainter>> {
+        match self.surfaces {
+            PaneSurfaces::GroundAndGlass => self.radar_fan,
             PaneSurfaces::GroundOnly => None,
         }
     }
@@ -637,6 +662,8 @@ pub(super) fn render_pane_map_content(
                     // one.
                     if ctx.pane.time_state(&known::RADAR).is_active() {
                         if let Some(img) = ctx.pane.active_image().cloned() {
+                            let fan = ctx.radar_fan_painter().cloned();
+                            let on_floor_strip = ctx.surfaces == PaneSurfaces::GroundOnly;
                             render_radar_overlay(
                                 ui,
                                 projector,
@@ -644,6 +671,8 @@ pub(super) fn render_pane_map_content(
                                 ctx.pane,
                                 ctx.pane_rect,
                                 ctx.preferences,
+                                fan.as_ref(),
+                                on_floor_strip,
                             );
                         }
                     } else {
@@ -1302,6 +1331,7 @@ fn as_of_term(overlays: &OverlayRegistry, pane_idx: usize, pane: &PaneState, id:
 
 /// Render the radar image overlay, range ring, and hover tooltip (loop playback
 /// path).
+#[allow(clippy::too_many_arguments)]
 fn render_radar_overlay(
     ui: &egui::Ui,
     projector: &walkers::Projector,
@@ -1309,13 +1339,22 @@ fn render_radar_overlay(
     pane: &mut PaneState,
     pane_rect: egui::Rect,
     prefs: &UserPreferences,
+    fan: Option<&std::sync::Arc<dyn crate::radar_fan::RadarFanPainter>>,
+    on_floor_strip: bool,
 ) {
-    ui.painter().image(
-        img.texture.id(),
-        crate::overlay_cache::placed_rect(projector, &img.placed),
-        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-        egui::Color32::WHITE,
-    );
+    match &img.surface {
+        crate::pane::RadarSurface::Raster(texture) => {
+            ui.painter().image(
+                texture.id(),
+                crate::overlay_cache::placed_rect(projector, &img.placed),
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+        crate::pane::RadarSurface::Fan(sweeps) => {
+            draw_radar_fan(ui, projector, img, sweeps, fan, on_floor_strip);
+        }
+    }
 
     render_radar_range_ring(ui, projector, img.lat, img.lon, img.max_range_km);
     update_pane_hover_value_from_meta(
@@ -1330,6 +1369,129 @@ fn render_radar_overlay(
         pane_rect,
         prefs,
     );
+}
+
+/// **Issue one pane's polar sweeps as one paint callback**, or say why not.
+///
+/// # Where this sits in the draw order, and why it sits there
+///
+/// At the radar layer's own position in the pane's layer walk — the same
+/// `ui.painter()`, at the same point in it, that `Painter::image` was called
+/// from a moment ago. So the fan composites exactly where the raster
+/// composited: over the basemap, over the four weather layers whose
+/// `draw_order_weight` is below radar's 30 (satellite, the model composite, the
+/// MRMS mosaic, the fire-weather outlooks), under everything above it, and
+/// under the user's own reordering of that list.
+///
+/// The design (§4.1) sites this at the tail of the *ground* callback run
+/// instead, so the fan rides inside a state reset the basemap already paid for.
+/// That is a real saving and it is not taken here, because the ground run
+/// happens before the layer walk starts: a fan issued there draws beneath every
+/// weather layer including the four that are beneath radar today, and stops
+/// answering to a draw order the user is allowed to rearrange. The design names
+/// only "basemap strokes and labels" as the consequence and leaves the question
+/// open for a ruling (§10.6); the wider consequence is what makes it worth
+/// keeping open. Moving the issue point later is one call site, and the reset
+/// it would save is one per pane per frame.
+///
+/// A `Shape::Callback` forces a primitive boundary, so this does cost that
+/// boundary where a textured rectangle cost none.
+fn draw_radar_fan(
+    ui: &egui::Ui,
+    projector: &walkers::Projector,
+    img: &RadarImageData,
+    sweeps: &Arc<[Arc<crate::radar_fan::FanSweep>]>,
+    painter: Option<&Arc<dyn crate::radar_fan::RadarFanPainter>>,
+    on_floor_strip: bool,
+) -> crate::radar_fan::FanOutcome {
+    let outcome = issue_radar_fan(ui, projector, img, sweeps, painter, on_floor_strip);
+    crate::radar_fan::ledger::note(outcome);
+    outcome
+}
+
+/// [`draw_radar_fan`] without the ledger write, so the decision is a pure
+/// function of its inputs and can be asserted as one.
+fn issue_radar_fan(
+    ui: &egui::Ui,
+    projector: &walkers::Projector,
+    img: &RadarImageData,
+    sweeps: &Arc<[Arc<crate::radar_fan::FanSweep>]>,
+    painter: Option<&Arc<dyn crate::radar_fan::RadarFanPainter>>,
+    on_floor_strip: bool,
+) -> crate::radar_fan::FanOutcome {
+    use crate::radar_fan::{FanOutcome, FanRefusal};
+
+    if on_floor_strip {
+        return FanOutcome::Refused(FanRefusal::FloorStrip);
+    }
+    let Some(painter) = painter else {
+        return FanOutcome::Refused(FanRefusal::NoPainter);
+    };
+    // Every payload, not the first: a malformed sweep anywhere in the set is a
+    // texture upload sized by a number that did not survive the trip, and the
+    // renderer indexes all of them.
+    if sweeps.is_empty() || !sweeps.iter().all(|s| s.is_well_formed()) {
+        return FanOutcome::Refused(FanRefusal::Malformed);
+    }
+
+    let view = fan_view(ui, projector, img.lat, img.lon);
+    let Some(payload) = painter.payload(crate::radar_fan::FanDraw {
+        sweeps,
+        view,
+        // The layer walk's `set_opacity` reaches every shape it adds through
+        // `ui.painter()` except this one; a callback is the shape a painter
+        // cannot tint, so the factor travels in the payload and the callback
+        // applies it.
+        opacity: ui.painter().opacity(),
+        pass_nr: ui.ctx().cumulative_pass_nr(),
+    }) else {
+        return FanOutcome::Refused(FanRefusal::PainterDeclined);
+    };
+
+    ui.painter()
+        .add(egui::Shape::Callback(egui::epaint::PaintCallback {
+            // The pane's map rect, which is what egui turns into the viewport.
+            // The vertex stage emits clip space inside it, so unlike the
+            // tile-mesh path this needs no `set_viewport` override — and that
+            // is what keeps the recorded call count at six.
+            rect: ui.max_rect(),
+            callback: payload,
+        }));
+    FanOutcome::Painted
+}
+
+/// This frame's view of a fan, read off the projector the pane is drawing
+/// through.
+///
+/// The site is projected here, in the projector's own `f64`, and enters the
+/// payload as a screen position. That is deliberate: the shader forms
+/// differences *from* this point and never forms a Mercator ordinate of its
+/// own, which is what keeps deep zoom exact (design §4.3).
+fn fan_view(
+    ui: &egui::Ui,
+    projector: &walkers::Projector,
+    site_lat: f64,
+    site_lon: f64,
+) -> crate::radar_fan::FanView {
+    let site = walkers::lat_lon(site_lat, site_lon);
+    // Pixels per metre at the site's own latitude — Mercator's stretch is in
+    // it, which is what makes this the right selector for a level rather than
+    // an equator figure that would pick too coarse a level in the north.
+    let px_per_m = f64::from(projector.scale_pixel_per_meter(site));
+    crate::radar_fan::FanView {
+        rect: ui.max_rect(),
+        site_px: projector.project(site).to_pos2(),
+        world_px: projector.world_pixels(),
+        // A non-finite or zero scale is a projector that cannot place
+        // anything; `0.0` selects level 0, which is the finest and never the
+        // wrong picture, only the slowest one.
+        km_per_px: if px_per_m.is_finite() && px_per_m > 0.0 {
+            1.0 / (px_per_m * 1000.0)
+        } else {
+            0.0
+        },
+        pixels_per_point: ui.ctx().pixels_per_point(),
+    }
 }
 
 /// Draw only the range ring for a radar site (used with overlay-cache rendering).
@@ -4469,6 +4631,12 @@ mod lookup_tax_tests;
 #[path = "ui_map_pane/pane_cost_tests.rs"]
 #[cfg(test)]
 mod pane_cost_tests;
+
+/// The plan view's two surfaces, and the claim that they composite in the
+/// same place.
+#[path = "ui_map_pane/radar_fan_draw_tests.rs"]
+#[cfg(test)]
+mod radar_fan_draw_tests;
 
 #[path = "ui_map_pane/resolved_opacity_tests.rs"]
 #[cfg(test)]

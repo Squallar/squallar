@@ -60,7 +60,7 @@ fn frame_texture(app: &crate::app::App, pane: usize, frame: usize) -> Option<egu
         .image
         .as_ref()?
         .plan_view()
-        .map(|picture| picture.texture.id())
+        .and_then(|picture| picture.surface.raster().map(egui::TextureHandle::id))
 }
 
 fn frame_hover(

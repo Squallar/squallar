@@ -859,6 +859,9 @@ impl Gui {
             GuiEvent::TileMeshPainter(painter) => {
                 self.tile_mesh_painter = painter;
             }
+            GuiEvent::RadarFanPainter(painter) => {
+                self.radar_fan_painter = painter;
+            }
         }
     }
 
@@ -2759,6 +2762,13 @@ impl Gui {
         // bind groups all belong to the device that is going away, and the
         // ground falls back to CPU placement until a fresh painter arrives.
         self.tile_mesh_painter = None;
+        // And again for the fan: its code textures, LUTs and static disk mesh
+        // are the dead device's. Unlike the ground, a plan view in the polar
+        // shape has nothing to fall back to — the raster it would draw is the
+        // allocation it exists to avoid — so a pane whose radar is a fan shows
+        // no radar until a fresh painter arrives, and the ledger counts every
+        // frame of that rather than leaving it silent.
+        self.radar_fan_painter = None;
     }
 
     pub(crate) fn volume_painter(

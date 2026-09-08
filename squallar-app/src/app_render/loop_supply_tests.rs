@@ -320,7 +320,7 @@ fn deliver(
 fn textured(ctx: &egui::Context) -> squallar_egui::pane::LoopFrameImage {
     let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
     squallar_egui::pane::LoopFrameImage::PlanView(squallar_egui::pane::RadarImageData {
-        texture: ctx.load_texture("test", image, egui::TextureOptions::NEAREST),
+        surface: squallar_egui::pane::RadarSurface::Raster(ctx.load_texture("test", image, egui::TextureOptions::NEAREST)),
         lat: 35.0,
         lon: -97.0,
         max_range_km: 100.0,

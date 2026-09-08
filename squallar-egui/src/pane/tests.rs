@@ -192,7 +192,7 @@ fn dummy_texture(ctx: &egui::Context) -> LoopFrameImage {
 fn dummy_plan_view(ctx: &egui::Context) -> RadarImageData {
     let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
     RadarImageData {
-        texture: ctx.load_texture("test", image, egui::TextureOptions::NEAREST),
+        surface: RadarSurface::Raster(ctx.load_texture("test", image, egui::TextureOptions::NEAREST)),
         lat: 0.0,
         lon: 0.0,
         max_range_km: 100.0,

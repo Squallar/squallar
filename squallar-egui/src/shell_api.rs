@@ -873,6 +873,11 @@ pub enum GuiEvent {
     /// away. Absent, every fill takes the CPU placement path — see
     /// [`crate::tile_mesh`].
     TileMeshPainter(Option<std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>>),
+    /// Install what can draw a radar sweep's code plane from the GPU, or take
+    /// it away. Absent, a pane holding a polar surface draws no radar at all —
+    /// there is no raster to fall back to — so the shell installs this before
+    /// it lets anything produce one. See [`crate::radar_fan`].
+    RadarFanPainter(Option<std::sync::Arc<dyn crate::radar_fan::RadarFanPainter>>),
 }
 
 #[cfg(test)]

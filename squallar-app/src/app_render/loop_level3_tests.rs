@@ -654,11 +654,11 @@ fn volume() -> Arc<nexrad_model::data::Scan> {
 fn image() -> squallar_egui::pane::RadarImageData {
     let ctx = egui::Context::default();
     squallar_egui::pane::RadarImageData {
-        texture: ctx.load_texture(
+        surface: squallar_egui::pane::RadarSurface::Raster(ctx.load_texture(
             "test",
             egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
             egui::TextureOptions::NEAREST,
-        ),
+        )),
         lat: 35.33,
         lon: -97.27,
         max_range_km: 100.0,

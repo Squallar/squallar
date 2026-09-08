@@ -361,11 +361,11 @@ fn a_loop_tick_repaints_the_floor_exactly_once() {
     };
     let radar_frame = |name: &str| {
         LoopFrameImage::PlanView(crate::pane::RadarImageData {
-            texture: ctx.load_texture(
+            surface: crate::pane::RadarSurface::Raster(ctx.load_texture(
                 name.to_owned(),
                 egui::ColorImage::filled([1, 1], egui::Color32::BLUE),
                 egui::TextureOptions::default(),
-            ),
+            )),
             lat: 35.33,
             lon: -97.28,
             placed: squallar_geo::PlacedRaster::of(squallar_geo::GeoBounds {

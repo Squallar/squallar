@@ -532,6 +532,9 @@ pub struct Gui {
     /// Whatever can draw a vector tile's fills from the GPU, or `None` on a
     /// build or a frame where nothing can — see [`crate::tile_mesh`].
     pub(super) tile_mesh_painter: Option<std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>>,
+    /// Whatever can draw a radar sweep's code plane from the GPU, or `None` on
+    /// a build or a frame where nothing can — see [`crate::radar_fan`].
+    pub(super) radar_fan_painter: Option<std::sync::Arc<dyn crate::radar_fan::RadarFanPainter>>,
     /// The user's Volume Alpha curves, one per edited product. See
     /// [`crate::volume_alpha`]: absence means "render through the palette's
     /// own alpha, bit-exactly", which is why this is a store of exceptions
@@ -764,6 +767,7 @@ impl Gui {
             storm_motion_editing: false,
             volume_painter: None,
             tile_mesh_painter: None,
+            radar_fan_painter: None,
             volume_alpha: crate::volume_alpha::AlphaCurves::default(),
             volume_iso: crate::volume_iso::IsoThresholds::default(),
             config_unknown_fields: serde_json::Map::new(),

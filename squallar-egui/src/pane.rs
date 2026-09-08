@@ -138,9 +138,97 @@ impl GroupId {
     }
 }
 
+/// **What a plan-view radar frame puts on the map.**
+///
+/// Two representations of one picture, and the discriminant sits here — one
+/// level below `LoopFrameImage`, whose four arms are untouched — because a
+/// plan view is a plan view whichever shape its gates are in. Everything else
+/// about the frame (where it is placed, its range ring, its readout, its
+/// nyquist and melting-layer provenance) is identical across the two and is
+/// held once, beside this.
+///
+/// * [`Raster`](Self::Raster) is what shipped: the rasterizer resolved a
+///   colour per gate into a square RGBA image, and the pane draws it as one
+///   textured rectangle. Cheap to draw, quadratic in a side chosen for the
+///   screen.
+/// * [`Fan`](Self::Fan) is the sweep itself — one byte per gate in the polar
+///   frame the radar measured in, coloured by a baked 256-entry table in the
+///   fragment stage. Linear in the numbers the radar chose. It draws through a
+///   paint callback, which means it needs a renderer installed
+///   ([`crate::radar_fan::RadarFanPainter`]) and has **no fallback** without
+///   one: the raster it would fall back to is the object it exists not to
+///   allocate.
+///
+/// A frame is one or the other and never both, which is what makes the size
+/// win real rather than a second copy.
+#[derive(Clone)]
+pub enum RadarSurface {
+    Raster(egui::TextureHandle),
+    /// The sweeps behind one plan view, in submission order. A still and a
+    /// loop frame both carry exactly one today; the slice is what lets a
+    /// multi-tilt pane draw its cuts in one callback later without the type
+    /// changing under it.
+    Fan(Arc<[Arc<crate::radar_fan::FanSweep>]>),
+}
+
+impl RadarSurface {
+    /// The texture, for the raster arm only.
+    ///
+    /// **Deliberately not a "get me something to draw" accessor.** A caller
+    /// that needs a texture handle needs the raster arm specifically — the
+    /// upload bookkeeping, the retained-handle comparison, a test asserting
+    /// which picture a pane is showing — and a fan has no texture to give it.
+    /// Returning `None` here is that fact, not a failure.
+    pub fn raster(&self) -> Option<&egui::TextureHandle> {
+        match self {
+            Self::Raster(texture) => Some(texture),
+            Self::Fan(_) => None,
+        }
+    }
+
+    /// Whether this is the polar arm.
+    pub fn is_fan(&self) -> bool {
+        matches!(self, Self::Fan(_))
+    }
+
+    /// **What identifies the picture this surface is**, for the caches keyed
+    /// on "has the picture changed".
+    ///
+    /// The raster arm answers with its texture id, hashed — the same quantity
+    /// the floor-strip key hashed when there was only one arm. The fan answers
+    /// with its payload's own address, which is exactly as stable and for the
+    /// same reason a `TextureHandle` is: a sweep set is built once and shared
+    /// by reference, so a new picture is a new allocation and the same picture
+    /// is the same one.
+    ///
+    /// The tag is not decoration. Two arms hashing into one `u64` space could
+    /// agree by accident, and a floor strip that skipped a repaint because a
+    /// pointer collided with a texture id would be a stale picture on the 3D
+    /// floor with every gate green.
+    pub fn picture_key(&self) -> (u8, u64) {
+        match self {
+            Self::Raster(texture) => {
+                let mut hasher = std::hash::DefaultHasher::new();
+                std::hash::Hash::hash(&texture.id(), &mut hasher);
+                (0, std::hash::Hasher::finish(&hasher))
+            }
+            Self::Fan(sweeps) => (1, Arc::as_ptr(sweeps).cast::<u8>() as u64),
+        }
+    }
+
+    /// **Host bytes this surface holds**, or `0` for a raster — whose pixels
+    /// live in egui's texture manager and are counted there, not here.
+    pub fn resident_bytes(&self) -> usize {
+        match self {
+            Self::Raster(_) => 0,
+            Self::Fan(sweeps) => sweeps.iter().map(|s| s.resident_bytes()).sum(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RadarImageData {
-    pub texture: egui::TextureHandle,
+    pub surface: RadarSurface,
     pub lat: f64,
     pub lon: f64,
     /// The half-width this frame was projected at, km — what the renderer

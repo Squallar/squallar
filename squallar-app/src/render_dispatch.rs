@@ -51,6 +51,108 @@ pub struct CachedPaneRender {
     pub storm_motion: Option<squallar_radar::srv::SrvMotion>,
 }
 
+/// **Turn one sweep's code plane into the payload the renderer draws.**
+///
+/// The whole of the polar surface's construction, and deliberately a free
+/// function over two borrowed halves rather than a method on either: the plane
+/// is the radar crate's (`CodePlane`, which knows about products and reduce
+/// operators), the payload is the UI crate's (`FanSweep`, which knows about
+/// neither), and this is the one place the two are put together. Nothing above
+/// or below it names both.
+///
+/// **`None` when the plane and the geometry are not the same sweep.** They
+/// arrive as two objects and a mismatch is not a rounding error — it is one
+/// sweep's codes drawn at another sweep's angles, which paints a plausible
+/// picture of nothing. Cheaper to refuse than to detect afterwards.
+///
+/// **Not for the frame thread.** It concatenates the chain, which is the whole
+/// plane again, and bakes a table. Both belong where the plane was built.
+pub fn fan_sweep(
+    plane: &squallar_radar::render::codes::CodePlane,
+    geometry: &squallar_radar::render::polar::PolarGeometry,
+    site_lat: f64,
+    site_lon: f64,
+) -> Option<squallar_egui::radar_fan::FanSweep> {
+    let (radials, gates) = plane.shape();
+    if radials != geometry.radials() || gates != geometry.gates() {
+        return None;
+    }
+    let reach_gates = geometry.reach_gates();
+    if reach_gates == 0 || reach_gates > gates {
+        return None;
+    }
+
+    // Level 0 then the chain, in level order, with an offset per level. The
+    // renderer sizes each texture level from `radials`/`gates` by the same
+    // ceil-halving the producer used, so the offsets are the only thing that
+    // has to travel.
+    let levels = plane.levels();
+    let mut codes = Vec::with_capacity(plane.resident_bytes());
+    let mut level_offsets = Vec::with_capacity(levels);
+    for level in 0..levels {
+        let (bytes, _, _) = plane.level(level)?;
+        level_offsets.push(u32::try_from(codes.len()).ok()?);
+        codes.extend_from_slice(bytes);
+    }
+
+    // **The sky each radial was drawn over, from the wedges the render itself
+    // wrote.** `Wedge::contains` is `delta >= -half && delta < half` about the
+    // radial's own azimuth, so these two numbers are that predicate's bounds
+    // and not a second opinion about where a radial starts. A radial the
+    // render never reached carries a NaN wedge; it becomes a degenerate sector
+    // that draws nothing, which is what it painted.
+    let edges: Vec<[f32; 2]> = geometry
+        .wedges()
+        .iter()
+        .map(|w| {
+            if w.azimuth_deg.is_finite() && w.half_width_deg.is_finite() {
+                [
+                    w.azimuth_deg - w.half_width_deg,
+                    w.azimuth_deg + w.half_width_deg,
+                ]
+            } else {
+                [0.0, 0.0]
+            }
+        })
+        .collect();
+
+    let first = geometry.first_gate_slant_km();
+    let interval = geometry.gate_interval_slant_km();
+    // The **outer edge** of the last gate the render reached, not its centre:
+    // `gate_at` floors `(along - first) / interval + 0.5`, so gate `g` owns
+    // `[first + (g - 0.5)·interval, first + (g + 0.5)·interval)` and the disc
+    // ends at the far end of the last one.
+    let reach_slant_km = first + (reach_gates as f64 - 0.5) * interval;
+    let reach_km = match geometry.elevation_deg() {
+        Some(e) => squallar_radar::beam::ground_range_km(reach_slant_km, e),
+        None => reach_slant_km,
+    };
+
+    Some(squallar_egui::radar_fan::FanSweep {
+        field: crate::render_key::field_id_of(plane.key().product),
+        radials: u32::try_from(radials).ok()?,
+        gates: u32::try_from(gates).ok()?,
+        codes,
+        level_offsets,
+        lut_rgba: squallar_radar::render::codes::Lut::build(plane.key()).to_rgba_bytes(),
+        edges,
+        geometry: squallar_egui::radar_fan::FanGeometry {
+            site_lat,
+            site_lon,
+            first_gate_slant_km: first,
+            gate_interval_slant_km: interval,
+            elevation_deg: geometry.elevation_deg(),
+            reach_gates: u32::try_from(reach_gates).ok()?,
+            reach_km,
+            // Carried rather than looked up in the renderer, so the shader
+            // names no radius of its own and the fragment's ground range is
+            // the one the readout's pick took. See `squallar_egui::radar_fan`.
+            earth_radius_km: squallar_geo::EARTH_RADIUS_KM,
+            effective_radius_km: squallar_radar::beam::RE_EFF_KM,
+        },
+    })
+}
+
 /// Per-pane render tracking state.
 pub struct PaneRenderState {
     /// True while a background render is in progress for this pane.
@@ -2760,6 +2862,11 @@ mod budget_order_tests;
 
 #[cfg(test)]
 mod cached_render_census_tests;
+
+/// The plane-to-payload conversion: what it refuses, and what it carries
+/// across unreinterpreted.
+#[cfg(test)]
+mod fan_sweep_tests;
 
 // Native-only, like the gated renders it is built on: `Job::Opaque` and the
 // offload pool's threads have no wasm arm.

@@ -415,6 +415,7 @@ impl super::Gui {
                                             pane_rect,
                                             surfaces: pane_render::PaneSurfaces::GroundAndGlass,
                                             ground_meshes: self.tile_mesh_painter.as_ref(),
+                                            radar_fan: self.radar_fan_painter.as_ref(),
                                             // Not a lookup: the 3D ground is
                                             // drawn by the volume arm, which
                                             // this arm is not, and the type
@@ -1970,6 +1971,10 @@ impl super::Gui {
                     // with the reason written beside it, rather than a `None`
                     // here that reads as an omission.
                     ground_meshes: self.tile_mesh_painter.as_ref(),
+                    // Carried for the same reason and cut in the same place:
+                    // `PaneRenderCtx::radar_fan_painter` refuses a floor
+                    // strip, where a `None` here would read as an omission.
+                    radar_fan: self.radar_fan_painter.as_ref(),
                     draws_3d_ground,
                     horizontal_color_scale,
                     color_scale_floor,

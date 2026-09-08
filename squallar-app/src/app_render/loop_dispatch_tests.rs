@@ -110,7 +110,7 @@ fn loop_on(ctx: &egui::Context, site: &'static str, textured: &[usize]) -> Layer
         let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
         ls.frames[i].image = Some(squallar_egui::pane::LoopFrameImage::PlanView(
             squallar_egui::pane::RadarImageData {
-                texture: ctx.load_texture("test", image, egui::TextureOptions::NEAREST),
+                surface: squallar_egui::pane::RadarSurface::Raster(ctx.load_texture("test", image, egui::TextureOptions::NEAREST)),
                 lat: 35.0,
                 lon: -97.0,
                 max_range_km: 100.0,
@@ -666,7 +666,7 @@ fn a_rendered_frame_is_placed_where_the_render_actually_drew_it() {
     );
     assert_ne!(rr.site_lon, squallar_egui::radar_layer::coords(&ls).1);
 
-    let placed = accept_render_result(&mut ls, &mut rr, None, |_| dummy_texture(&ctx))
+    let placed = accept_render_result(&mut ls, &mut rr, None, None, |_| dummy_texture(&ctx))
         .expect("the loop is awaiting this result");
 
     let image = ls.frames[1]
@@ -688,7 +688,10 @@ fn a_rendered_frame_is_placed_where_the_render_actually_drew_it() {
     // The picture handed back for filing and broadcast is the one placed on
     // the frame — same placement, same texture.
     assert_eq!((placed.lat, placed.lon), (image.lat, image.lon));
-    assert_eq!(placed.texture.id(), image.texture.id());
+    assert_eq!(
+        placed.surface.raster().map(egui::TextureHandle::id),
+        image.surface.raster().map(egui::TextureHandle::id)
+    );
 }
 
 #[test]
@@ -699,7 +702,7 @@ fn a_refused_result_is_never_uploaded() {
     let mut stale = response(ts(1), target("KTLX", 2.4));
 
     let mut uploads = 0;
-    let placed = accept_render_result(&mut ls, &mut stale, None, |_| {
+    let placed = accept_render_result(&mut ls, &mut stale, None, None, |_| {
         uploads += 1;
         dummy_texture(&ctx)
     });
@@ -727,7 +730,7 @@ fn a_failed_render_retires_its_frame_without_a_texture() {
     };
 
     let mut uploads = 0;
-    let placed = accept_render_result(&mut ls, &mut failed, None, |_| {
+    let placed = accept_render_result(&mut ls, &mut failed, None, None, |_| {
         uploads += 1;
         dummy_texture(&ctx)
     });
@@ -1128,7 +1131,7 @@ fn hovering_a_looping_pane_reads_a_value_out_of_the_frames_own_volume() {
 
     let ctx = egui::Context::default();
     let texture = dummy_texture(&ctx);
-    let img = rendered_image(&rr, &texture, gates);
+    let img = rendered_image(&rr, squallar_egui::pane::RadarSurface::Raster(texture.clone()), gates);
 
     let mut read = 0u32;
     let mut az = 0.5f64;
@@ -1159,7 +1162,7 @@ fn hovering_a_looping_pane_reads_a_value_out_of_the_frames_own_volume() {
         "only {read} points on the loop frame had a value"
     );
 
-    let orphan = rendered_image(&rr, &texture, None);
+    let orphan = rendered_image(&rr, squallar_egui::pane::RadarSurface::Raster(texture.clone()), None);
     assert_eq!(
         orphan.hover.read(90.0, 20.0),
         squallar_radar::hover::Reading::NotResident,
