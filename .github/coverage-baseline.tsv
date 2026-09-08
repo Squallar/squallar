@@ -100,7 +100,7 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	306	268
 squallar-egui/src/tile_mesh/ledger.rs	77	46
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	1542	1474
+squallar-egui/src/tile_source.rs	1542	1475
 squallar-egui/src/tile_source/byte_lru.rs	272	271
 squallar-egui/src/tile_source/cache_ledger.rs	181	165
 squallar-egui/src/tile_source/snap.rs	157	157
@@ -408,7 +408,7 @@ vendor/nexrad-data/src/aws/archive/list_files.rs	6	0
 vendor/nexrad-data/src/aws/client.rs	12	0
 vendor/nexrad-data/src/aws/realtime/assemble.rs	137	0
 vendor/nexrad-data/src/aws/realtime/chunk.rs	16	11
-vendor/nexrad-data/src/aws/realtime/chunk_identifier.rs	94	76
+vendor/nexrad-data/src/aws/realtime/chunk_identifier.rs	94	79
 vendor/nexrad-data/src/aws/realtime/chunk_iterator.rs	317	0
 vendor/nexrad-data/src/aws/realtime/chunk_timing_model.rs	38	0
 vendor/nexrad-data/src/aws/realtime/chunk_timing_stats.rs	62	0
