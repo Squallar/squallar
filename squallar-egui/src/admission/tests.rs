@@ -1179,3 +1179,489 @@ fn the_listing_door_is_advisory_on_the_arm_that_does_not_enforce() {
         );
     }
 }
+
+// ── The wish a refusal leaves behind ──────────────────────────────────────
+//
+// Every fixture here is a pair: the refusal that retains a wish, and beside
+// it the same act one fact apart that does not. The direction that matters is
+// over-firing — a wish re-offered or re-driven when the room never came back
+// is a scene change with nothing behind it — so the "still refused" arm is the
+// one each of these leads with.
+
+/// The two tables one recovery scene needs: the tight one that refuses, and
+/// the fresher one the App publishes after the user frees room. Generation 2
+/// on the second, because a table that does not move is not adopted at all.
+fn roomier(spare_bytes: u64, per_layer: u64, panes: usize) -> AdmissionCosts {
+    let mut table = costs(spare_bytes, per_layer, panes);
+    table.generation = 2;
+    table
+}
+
+/// **The sentence on the glass, for the arms that assert a tick announced
+/// nothing.**
+///
+/// "Nothing was announced" is *not* "there is no notice": the refusal that
+/// opened each of these scenes is still up at these readings — it lives
+/// [`NOTICE_LIFETIME`], and the ticks below land well inside that. So the
+/// assertion is that the sentence did not **change**, which is the property,
+/// and asserting `None` instead would be a check that could only pass by
+/// accident of timing.
+fn notice_text(ledger: &AdmissionLedger, now: web_time::Instant) -> Option<String> {
+    ledger.notice(now).map(|notice| notice.text.clone())
+}
+
+/// **A refused act is retained past the generation that refused it**, and the
+/// reader is told when it starts fitting.
+///
+/// The defect: a refusal wrote nothing but a six-second notice, so a user who
+/// did exactly what the notice told them — closed a pane, raised a share —
+/// got no sign that it had worked and no way to know their layer was
+/// affordable now. The wish is what carries the question across the tick.
+#[test]
+fn a_refused_layer_is_retained_and_re_offered_when_the_room_comes_back() {
+    let mut ledger = AdmissionLedger::default();
+    ledger.adopt(&costs(0, 10 * MIB, 1));
+    let want = Increment::host(10 * MIB);
+
+    assert!(!ledger.decide(Act::ShowLayer, Some(0), want, true));
+    assert_eq!(
+        ledger.pending().len(),
+        1,
+        "the user still wants the layer they clicked",
+    );
+    assert_eq!(ledger.pending()[0].act, Act::ShowLayer);
+    assert_eq!(ledger.pending()[0].pane, Some(0));
+
+    // The tick that republishes the spare, with the room the user freed.
+    let at = web_time::Instant::now();
+    ledger.adopt_at(&roomier(64 * MIB, 10 * MIB, 1), at);
+    assert!(
+        ledger.pending().is_empty(),
+        "a wish that fits is resolved, not carried forever",
+    );
+    assert_eq!(
+        ledger.notice(at).map(|notice| notice.text.as_str()),
+        Some(reoffer_text(Act::ShowLayer)),
+        "and the reader is told the gesture will work now",
+    );
+    assert!(
+        ledger.take_granted().is_empty(),
+        "a re-offered act is the user's to make; nothing may perform it",
+    );
+
+    // **The healthy input that resembles it**: the same act, the same door,
+    // the same table — admitted the first time. Nothing is retained and
+    // nothing is announced, because nothing was ever refused.
+    let mut roomy = AdmissionLedger::default();
+    roomy.adopt(&costs(64 * MIB, 10 * MIB, 1));
+    assert!(roomy.decide(Act::ShowLayer, Some(0), want, true));
+    assert!(roomy.pending().is_empty());
+    let at = web_time::Instant::now();
+    roomy.adopt_at(&roomier(64 * MIB, 10 * MIB, 1), at);
+    assert!(
+        roomy.notice(at).is_none(),
+        "a table with room must not announce a wish nobody made",
+    );
+}
+
+/// **A wish that still does not fit stays a wish.** The over-firing arm of the
+/// test above: the tick came, the room did not, and announcing it anyway would
+/// send the reader back to a wall.
+#[test]
+fn a_wish_the_fresher_table_still_cannot_hold_stays_pending() {
+    let mut ledger = AdmissionLedger::default();
+    ledger.adopt(&costs(0, 10 * MIB, 1));
+    assert!(!ledger.decide(Act::ShowLayer, Some(0), Increment::host(10 * MIB), true));
+
+    let at = web_time::Instant::now();
+    let refusal = notice_text(&ledger, at);
+    assert!(
+        refusal.as_deref().is_some_and(|t| t.contains("Not enough")),
+        "the fixture must start with the refusal on the glass: {refusal:?}",
+    );
+    // A fresher table, and the shortage is exactly as it was.
+    ledger.adopt_at(&roomier(0, 10 * MIB, 1), at);
+    assert_eq!(
+        ledger.pending().len(),
+        1,
+        "the wish outlives a table that could not hold it",
+    );
+    assert_eq!(
+        notice_text(&ledger, at),
+        refusal,
+        "and nothing new is announced, because nothing changed",
+    );
+
+    // One more tick, and this one has the room: the same wish resolves.
+    let mut third = roomier(64 * MIB, 10 * MIB, 1);
+    third.generation = 3;
+    ledger.adopt_at(&third, at);
+    assert!(ledger.pending().is_empty());
+    assert_eq!(
+        ledger.notice(at).map(|notice| notice.text.as_str()),
+        Some(reoffer_text(Act::ShowLayer)),
+    );
+}
+
+/// **The invariant acts are re-driven; the gestures are re-offered.** The
+/// per-act split is the whole product answer, and this is the pair that shows
+/// the two halves are actually different code paths and not one policy with
+/// two names.
+#[test]
+fn a_pane_s_default_layers_are_re_driven_where_a_click_is_only_re_offered() {
+    let want = Increment::host(10 * MIB);
+
+    // The invariant: nothing was clicked to ask for a pane's default layers
+    // and nothing will be clicked to ask again, so the application puts them
+    // back itself.
+    let mut invariant = AdmissionLedger::default();
+    invariant.adopt(&costs(0, 10 * MIB, 1));
+    assert!(!invariant.decide(Act::DefaultLayers, None, want, true));
+    let at = web_time::Instant::now();
+    let refusal = notice_text(&invariant, at);
+    assert!(
+        refusal.as_deref().is_some_and(|t| t.contains("Not enough")),
+        "the fixture must start with the refusal on the glass: {refusal:?}",
+    );
+    invariant.adopt_at(&roomier(64 * MIB, 10 * MIB, 1), at);
+    let granted = invariant.take_granted();
+    assert_eq!(
+        granted.iter().map(|wish| wish.act).collect::<Vec<_>>(),
+        [Act::DefaultLayers],
+        "the seeding walk is the application's to re-run",
+    );
+    assert!(invariant.pending().is_empty());
+    assert_eq!(
+        notice_text(&invariant, at),
+        refusal,
+        "and it announces nothing: there is no gesture to ask the reader for",
+    );
+
+    // **One fact changed — the act.** A click on one pane's eye is the user's
+    // curation, and the door may not make it for them.
+    let mut gesture = AdmissionLedger::default();
+    gesture.adopt(&costs(0, 10 * MIB, 1));
+    assert!(!gesture.decide(Act::ShowLayer, Some(0), want, true));
+    let at = web_time::Instant::now();
+    gesture.adopt_at(&roomier(64 * MIB, 10 * MIB, 1), at);
+    assert!(
+        gesture.take_granted().is_empty(),
+        "nothing may paint a layer the user has not asked for twice",
+    );
+    assert!(gesture.notice(at).is_some(), "they are told instead");
+}
+
+/// **The acts a standing loop already re-asks retain nothing.**
+///
+/// `App::hydrate_parked_panes` re-drives a refused loop arm off its own parked
+/// queue on every redraw, and `Gui::propagate_pane_sync` re-drives the
+/// layer-link fan-out at the end of every shell frame. A wish for either would
+/// be a second copy of one that already exists, and the copy is the thing that
+/// drifts — so the ledger holds none.
+#[test]
+fn the_self_driven_acts_are_retained_by_their_own_loops_and_not_here() {
+    for act in [Act::ArmLoop, Act::AdoptLayers] {
+        let mut ledger = AdmissionLedger::default();
+        ledger.adopt(&costs(0, 10 * MIB, 1));
+        assert!(!ledger.decide(act, Some(0), Increment::host(10 * MIB), true));
+        assert_eq!(
+            ledger.counts().refused,
+            1,
+            "{act:?} was still refused and still counted",
+        );
+        assert!(
+            ledger.pending().is_empty(),
+            "{act:?} is re-asked by its own loop; a wish here would be a \
+             second copy of it",
+        );
+    }
+
+    // The control, one fact changed: an act with no loop behind it is
+    // retained by the same door on the same table.
+    let mut ledger = AdmissionLedger::default();
+    ledger.adopt(&costs(0, 10 * MIB, 1));
+    assert!(!ledger.decide(Act::ShowLayer, Some(0), Increment::host(10 * MIB), true));
+    assert_eq!(ledger.pending().len(), 1);
+}
+
+/// **A wish the user made a minute ago is not a wish now.**
+///
+/// Wall clock, not frames: what is being bounded is how long ago the person
+/// asked, and a frame count measures how busy the machine has been instead.
+#[test]
+fn a_wish_ages_out_and_is_not_offered() {
+    let mut ledger = AdmissionLedger::default();
+    ledger.adopt(&costs(0, 10 * MIB, 1));
+    let asked_at = web_time::Instant::now();
+    assert!(!ledger.decide(Act::ShowLayer, Some(0), Increment::host(10 * MIB), true));
+    assert_eq!(ledger.pending().len(), 1);
+
+    // The room arrives, too late to be what they wanted. Twice the life
+    // rather than exactly it: the verdict's own clock reading is taken a few
+    // nanoseconds after `asked_at`, so an `at + WISH_LIFETIME` reading is
+    // fractionally INSIDE the window and would test the other arm.
+    let late = asked_at + WISH_LIFETIME * 2;
+    ledger.adopt_at(&roomier(64 * MIB, 10 * MIB, 1), late);
+    assert!(
+        ledger.pending().is_empty(),
+        "an expired wish is dropped, not carried",
+    );
+    assert_eq!(
+        ledger.notice(late),
+        None,
+        "and a layer nobody wants any more is not offered back",
+    );
+
+    // **The same scene one fact apart**: the room arrives while the gesture
+    // is still theirs.
+    let mut in_time = AdmissionLedger::default();
+    in_time.adopt(&costs(0, 10 * MIB, 1));
+    let asked_at = web_time::Instant::now();
+    assert!(!in_time.decide(Act::ShowLayer, Some(0), Increment::host(10 * MIB), true));
+    let soon = asked_at + WISH_LIFETIME / 2;
+    in_time.adopt_at(&roomier(64 * MIB, 10 * MIB, 1), soon);
+    assert_eq!(
+        in_time.notice(soon).map(|notice| notice.text.as_str()),
+        Some(reoffer_text(Act::ShowLayer)),
+    );
+}
+
+/// **A repeat inside one generation is not a new wish**, and does not restart
+/// the clock.
+///
+/// `App::hydrate_parked_panes` re-drives its door on every redraw, and the
+/// within-generation memo is what stops that being forty verdicts. If a
+/// re-drive also refreshed `wished_at`, a door driven at frame rate would hold
+/// a wish forever and [`WISH_LIFETIME`] would bound nothing at all.
+#[test]
+fn re_driving_a_refused_door_neither_adds_a_wish_nor_moves_its_clock() {
+    let mut ledger = AdmissionLedger::default();
+    ledger.adopt(&costs(0, 10 * MIB, 1));
+    let want = Increment::host(10 * MIB);
+    assert!(!ledger.decide(Act::ShowLayer, Some(0), want, true));
+    let first = ledger.pending()[0].wished_at;
+
+    for _ in 0..40 {
+        assert!(!ledger.decide(Act::ShowLayer, Some(0), want, true));
+    }
+    assert_eq!(
+        ledger.pending().len(),
+        1,
+        "forty redraws are not forty wishes"
+    );
+    assert_eq!(
+        ledger.pending()[0].wished_at,
+        first,
+        "and not one of them may push the expiry out",
+    );
+    assert_eq!(ledger.counts().would_refuse, 1, "nor take a second verdict");
+}
+
+/// **A wish whose pane is gone is not a wish.** Closing the pane is one of the
+/// ways the room comes back, and offering the reader a layer for a pane that
+/// is no longer on the glass names something they cannot look at.
+#[test]
+fn a_wish_dies_with_the_pane_it_named() {
+    let mut ledger = AdmissionLedger::default();
+    ledger.adopt(&costs(0, 10 * MIB, 2));
+    assert!(!ledger.decide(Act::ShowLayer, Some(1), Increment::host(10 * MIB), true));
+    assert_eq!(ledger.pending().len(), 1);
+
+    // The user closed pane 1, which is what made the room.
+    let at = web_time::Instant::now();
+    let refusal = notice_text(&ledger, at);
+    ledger.adopt_at(&roomier(64 * MIB, 10 * MIB, 1), at);
+    assert!(ledger.pending().is_empty());
+    assert_eq!(
+        notice_text(&ledger, at),
+        refusal,
+        "a pane that is gone is offered nothing",
+    );
+
+    // **One fact changed**: the same room, and the pane still there.
+    let mut kept = AdmissionLedger::default();
+    kept.adopt(&costs(0, 10 * MIB, 2));
+    assert!(!kept.decide(Act::ShowLayer, Some(1), Increment::host(10 * MIB), true));
+    let at = web_time::Instant::now();
+    kept.adopt_at(&roomier(64 * MIB, 10 * MIB, 2), at);
+    assert_eq!(
+        kept.notice(at).map(|notice| notice.text.as_str()),
+        Some(reoffer_text(Act::ShowLayer)),
+    );
+}
+
+/// **The retained set is bounded by the questions a scene can ask**, not by
+/// how often it asks them. An unbounded pending set is a leak, and this
+/// campaign has spent itself on that class.
+#[test]
+fn the_wish_set_holds_one_entry_per_question_however_often_it_is_asked() {
+    let mut ledger = AdmissionLedger::default();
+    ledger.adopt(&costs(0, 10 * MIB, 4));
+    let want = Increment::host(10 * MIB);
+
+    // Twenty **distinct** questions to the memo — the payload differs, so each
+    // takes its own verdict — and one wish, because a user who asked for
+    // twenty splits wants the last one.
+    for added in 1..=20 {
+        assert!(!ledger.decide(Act::Panes { added }, None, want, true));
+    }
+    assert_eq!(
+        ledger.counts().would_refuse,
+        20,
+        "each payload is its own question to the memo",
+    );
+    assert_eq!(
+        ledger.pending().len(),
+        1,
+        "and one wish, the last one asked",
+    );
+    assert_eq!(ledger.pending()[0].act, Act::Panes { added: 20 });
+
+    // A different pane is a different question and keeps its own entry.
+    for pane in 0..4 {
+        assert!(!ledger.decide(Act::ShowLayer, Some(pane), want, true));
+    }
+    assert_eq!(ledger.pending().len(), 5);
+    assert!(
+        ledger.pending().len() <= PENDING_CAP,
+        "the ceiling exists to be unreachable, not to be approached",
+    );
+}
+
+/// **Every act kind is its own retention key**, which is what makes the
+/// ceiling above arithmetic rather than a guess.
+#[test]
+fn every_act_kind_has_its_own_retention_key() {
+    let mut keys: Vec<u8> = ACT_KINDS.iter().map(|act| act.retention_key()).collect();
+    let total = keys.len();
+    keys.sort_unstable();
+    keys.dedup();
+    assert_eq!(
+        keys.len(),
+        total,
+        "two acts sharing a key would silently replace each other's wishes",
+    );
+
+    // The ceiling, re-derived here against the layout's own maximum: every
+    // retaining kind against every addressable pane plus the `None` key.
+    let retaining = ACT_KINDS
+        .iter()
+        .filter(|act| !matches!(act.recovery(), Recovery::SelfDriven))
+        .count();
+    let reachable = retaining * (squallar_device_profile::budget::MAX_PANES_DESKTOP + 1);
+    let cap = PENDING_CAP;
+    assert!(
+        reachable <= cap,
+        "the backstop must sit above what the key space can actually reach: \
+         {reachable} > {cap}",
+    );
+}
+
+/// **Exactly one act is re-driven without asking**, and the walk that re-drives
+/// it (`Gui::replay_granted_admissions`) has an arm for exactly that one. A
+/// second `Silent` act added without an arm there would do nothing at all —
+/// a silent partial success — so the roster is pinned here instead of being
+/// left to the match's empty arms.
+#[test]
+fn default_layers_is_the_only_silently_replayed_act() {
+    let silent: Vec<Act> = ACT_KINDS
+        .iter()
+        .copied()
+        .filter(|act| act.recovery() == Recovery::Silent)
+        .collect();
+    assert_eq!(
+        silent,
+        [Act::DefaultLayers],
+        "add an arm to Gui::replay_granted_admissions before adding a \
+         Recovery::Silent act",
+    );
+}
+
+/// **The advisory arm retains nothing**, because nothing was turned away.
+/// Retaining a wish for an act that already happened would re-drive it, which
+/// is a worse defect than the refusal that did not occur.
+#[test]
+fn the_advisory_arm_counts_a_refusal_and_keeps_no_wish() {
+    let mut advisory = AdmissionLedger::default();
+    advisory.adopt(&costs(0, 10 * MIB, 1));
+    assert!(advisory.decide(Act::ShowLayer, Some(0), Increment::host(10 * MIB), false));
+    assert_eq!(
+        advisory.counts().would_refuse,
+        1,
+        "the measurement runs on every arm",
+    );
+    assert!(
+        advisory.pending().is_empty(),
+        "and the act it let through leaves nothing to re-ask",
+    );
+
+    // One fact changed: the arm.
+    let mut enforcing = AdmissionLedger::default();
+    enforcing.adopt(&costs(0, 10 * MIB, 1));
+    assert!(!enforcing.decide(Act::ShowLayer, Some(0), Increment::host(10 * MIB), true));
+    assert_eq!(enforcing.pending().len(), 1);
+}
+
+/// **Resolving a wish commits nothing.** The re-ask is a filter, not a grant:
+/// a re-offered act has not happened and a re-driven one goes back through its
+/// real door, which is what debits. Spending here would hold bytes against a
+/// scene nobody has asked for yet.
+#[test]
+fn resolving_a_wish_spends_none_of_the_spare() {
+    let mut ledger = AdmissionLedger::default();
+    ledger.adopt(&costs(0, 10 * MIB, 1));
+    assert!(!ledger.decide(Act::ShowLayer, Some(0), Increment::host(10 * MIB), true));
+
+    let fresher = roomier(64 * MIB, 10 * MIB, 1);
+    ledger.adopt_at(&fresher, web_time::Instant::now());
+    assert_eq!(
+        ledger.spare(),
+        fresher.spare,
+        "the published spare, untouched: no act has happened",
+    );
+}
+
+/// **The listing door's wish is held in frames**, because that is the unit its
+/// question is asked in. Re-asking a frame count as a byte increment against
+/// the spare is the mis-comparison `AdmissionLedger::admit_loop_frames`
+/// exists to avoid, and it would refuse every count there is.
+#[test]
+fn a_refused_listing_is_retained_in_frames_and_re_offered_when_the_loop_fits() {
+    let mut ledger = AdmissionLedger::default();
+    ledger.adopt(&loop_costs(2));
+    assert!(
+        !ledger.decide_loop_frames(0, 8, true),
+        "eight frames against a two-frame allowance",
+    );
+    assert_eq!(ledger.pending().len(), 1);
+    assert_eq!(ledger.pending()[0].act, Act::LoopFrames);
+
+    // A fresher table whose allowance still cannot hold the listing.
+    let at = web_time::Instant::now();
+    let refusal = notice_text(&ledger, at);
+    assert!(
+        refusal.as_deref().is_some_and(|t| t.contains("Not enough")),
+        "the fixture must start with the refusal on the glass: {refusal:?}",
+    );
+    let mut tight = loop_costs(4);
+    tight.generation = 2;
+    ledger.adopt_at(&tight, at);
+    assert_eq!(
+        ledger.pending().len(),
+        1,
+        "four frames is more room and still not enough",
+    );
+    assert_eq!(notice_text(&ledger, at), refusal);
+
+    // **One fact changed**: the allowance now covers the listing.
+    let mut roomy = loop_costs(8);
+    roomy.generation = 3;
+    ledger.adopt_at(&roomy, at);
+    assert!(ledger.pending().is_empty());
+    assert_eq!(
+        ledger.notice(at).map(|notice| notice.text.as_str()),
+        Some(reoffer_text(Act::LoopFrames)),
+        "and the reader is told to turn the loop back on, which is the \
+         gesture the refusal's own follow-up named",
+    );
+}

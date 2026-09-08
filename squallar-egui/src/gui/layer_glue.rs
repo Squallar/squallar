@@ -300,6 +300,58 @@ impl Gui {
         }
     }
 
+    /// **Re-drive the acts a refusal retained, now that they fit again** —
+    /// the [`Recovery::Silent`] half of admission's wish set.
+    ///
+    /// Driven from [`Gui::apply_frame_inputs`] and nowhere else, on the one
+    /// frame that adopts a fresher admission table: the ledger fills that
+    /// queue only inside `AdmissionLedger::adopt`, and only with the wishes
+    /// that fit the table it has just taken. Every other frame this is a
+    /// `mem::take` of an empty vector, which allocates nothing and walks
+    /// nothing. It is not the frame thread doing heavy work on a schedule —
+    /// it is the frame thread doing, once, exactly the work the user's own
+    /// click would have done on it.
+    ///
+    /// **A replay is a real ask, not a grant.** The wish carries the price the
+    /// table in force at the refusal put on it, and that price can have moved;
+    /// the door below re-prices against the table now in force and refuses
+    /// again if it must, putting the wish straight back. The direction that
+    /// cannot happen is over-admitting, which is the direction that costs the
+    /// user their process.
+    ///
+    /// The match is wildcard-free so that an act made [`Recovery::Silent`]
+    /// later cannot arrive here and silently do nothing;
+    /// `default_layers_is_the_only_silently_replayed_act` is the gate that
+    /// says the empty arms really are empty.
+    ///
+    /// [`Recovery::Silent`]: crate::admission::Recovery::Silent
+    pub(crate) fn replay_granted_admissions(&mut self) {
+        use crate::admission::Act;
+        let granted = self.admission.take_granted();
+        for wish in granted {
+            match wish.act {
+                // "A pane holds the layers it ships with" is an invariant the
+                // application owes, not a gesture the user made - so it is
+                // put back without asking. The call charges only the
+                // transitions it will actually make, so a pane that has since
+                // gained its slots asks for nothing and this is a walk over
+                // the handler list.
+                Act::DefaultLayers => self.initialize_pane_enabled(),
+                // Every one of these is `Reoffer` or `SelfDriven`, and the
+                // ledger never queues one here. Listed rather than
+                // wildcarded: a variant that changes its recovery has to be
+                // read against this arm before it compiles.
+                Act::Panes { .. }
+                | Act::ShowLayer
+                | Act::AdoptLayers
+                | Act::Preset
+                | Act::ArmLoop
+                | Act::LoopFrames
+                | Act::LoopSpan => {}
+            }
+        }
+    }
+
     /// **What [`Self::initialize_pane_enabled`] will charge**, over exactly
     /// the (pane, layer) pairs `insert_missing_slots` is about to mint
     /// enabled: this Gui's panes, and `opening` — the panes a caller has

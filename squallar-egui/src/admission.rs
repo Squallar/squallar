@@ -84,22 +84,54 @@
 //! prevented
 //!
 //! The twin of the rule above, and it is a **requirement of a door**, not a
-//! nicety. Every door here refuses by returning, and nothing anywhere retains
-//! the wish or asks again: `App::handle_enable_loop` returns before the pane's
-//! parked wish is consumed but `looping_panes` is drained once in `App::new`
-//! and only `TransportNotReady` re-queues, so one refused loop at startup is a
-//! session with no loop at all — and the wish is persisted, so it is *every*
-//! session. `PaneState::add_layer` and `Gui::write_pane_overlay` have the same
-//! shape on a layer. The only state a refusal writes is a six-second notice.
+//! nicety. A door that refuses by returning and writes nothing but a
+//! six-second notice turns a transient shortage into a lasting loss of
+//! function: the scene that was tight when the user clicked is not the scene a
+//! minute later, and even a *correct* refusal has to be re-asked when the
+//! thing that made the scene tight goes away — a layer hidden, a pane closed,
+//! a loop stopped, a rung shed, the host governor recovering.
 //!
-//! So a refusal here is **permanent for the session**, and that turns a
-//! transient shortage into a lasting loss of function. Even a *correct*
-//! refusal has to be re-asked when the thing that made the scene tight goes
-//! away — a layer hidden, a pane closed, a loop stopped, a rung shed, the host
-//! governor recovering. Until a door retains what it refused and asks again on
-//! the telemetry tick that republishes the spare, refusing costs more than it
-//! saves, which is the other half of why [`ENFORCING`] is off on the arm every
-//! user is on.
+//! So a refused act is retained as a [`PendingWish`], which **outlives the
+//! generation it was refused in**, and every wish is re-asked against the
+//! table [`AdmissionLedger::adopt`] takes — the same telemetry tick that
+//! republishes the spare. A wish that fits is resolved and dropped; a wish
+//! that does not stays pending and is asked again on the next table.
+//!
+//! **What resolving means is per act, not one global answer**, because the
+//! acts differ in what re-asking costs and in what the user would attribute
+//! the result to. [`Recovery`] is the answer and [`Act::recovery`] is the
+//! table: a layer's eye-click is re-*offered* on the glass, because painting a
+//! layer minutes after the gesture is a scene change with no gesture behind
+//! it; a pane's default layer set is re-*driven*, because "a pane holds the
+//! layers it ships with" is a standing invariant the app owes the user rather
+//! than a gesture they made. **The re-driven arm has no live customer today**
+//! and that is stated rather than implied: every caller of that one door is
+//! batched or exempt, so it is a policy waiting for a caller, and
+//! [`Act::recovery`] names the three callers and what covers each.
+//!
+//! Two things are deliberately kept out of this, and both read like it:
+//!
+//! - [`AdmissionLedger::refused`] is a **within-generation memo**, not
+//!   retention. It stops one question being answered forty times against one
+//!   table, and it is cleared on every new table because a fresh table is a
+//!   fresh answer. The wish set is the opposite of that clear: it *survives*
+//!   it, and it is what asks the question again.
+//! - **Two acts need no wish at all**, because a standing loop already
+//!   re-asks them the moment that memo clears. `App::hydrate_parked_panes`
+//!   re-drives a refused loop arm off its own parked queue on every redraw,
+//!   and `Gui::propagate_pane_sync` re-drives the layer-link fan-out at the
+//!   end of every shell frame. Retaining those here would be a second copy of
+//!   a wish that already exists, and a second copy is a thing that drifts.
+//!   They are [`Recovery::SelfDriven`], and the constant says so where a
+//!   reader looking for them will be.
+//!
+//! **Nothing is retained on an arm that did not turn the act away.** Where
+//! [`ENFORCING`] is `false` the act proceeded, so there is no wish: retaining
+//! one would re-drive something that already happened. The whole of this
+//! section is therefore inert on wasm32 today, and that is the point of it —
+//! it removes the *reason* [`ENFORCING`] is off there. It does **not** flip
+//! it. That needs field evidence off [`Totals::would_refuse`] on the arm every
+//! user is on, and it is the user's call.
 //!
 //! # Refusing is per-arm, measuring is not
 //!
@@ -312,7 +344,236 @@ impl Act {
             Self::LoopSpan => "a longer lookback",
         }
     }
+
+    /// **What becomes of this act's wish when the spare that refused it
+    /// grows.** See [`Recovery`], which is where the reasoning per act is.
+    ///
+    /// Wildcard-free on purpose: an act added to this enum does not get an
+    /// answer by default, it gets a build failure until somebody decides
+    /// which of the three it is.
+    pub const fn recovery(self) -> Recovery {
+        match self {
+            // A standing loop already re-asks it. `App::hydrate_parked_panes`
+            // takes `App::loop_arm_pending` on every redraw and a refused arm
+            // re-parks itself onto that queue, so what holds the loop is the
+            // within-generation memo and what releases it is that memo being
+            // cleared by a fresher table. This act's own doc has said so since
+            // the queue landed.
+            Self::ArmLoop => Recovery::SelfDriven,
+            // The same shape one level up: `Gui::propagate_pane_sync` runs at
+            // the end of every shell frame, so the fan-out asks for itself
+            // again the moment the memo clears. A linked group's arrangement
+            // is a standing invariant rather than a gesture, which is also why
+            // re-driving it needs no permission.
+            Self::AdoptLayers => Recovery::SelfDriven,
+            // **The one silently re-driven act.** "A pane holds the layers it
+            // ships with" is an invariant the application owes the user, not a
+            // gesture the user made: nothing was clicked to produce these
+            // layers and nothing will be clicked to ask for them again, so a
+            // refusal here leaves a pane in a state the user never curated and
+            // has no name for. `Gui::initialize_pane_enabled` charges only the
+            // transitions it will actually make, so a replay onto a pane that
+            // has since gained its slots asks for nothing.
+            //
+            // **And it cannot be refused on main today**, which is worth
+            // knowing before reading this as live behaviour: all three of that
+            // door's callers are covered. `Gui::set_pane_count` holds a batch
+            // over it (the pane and its layers are one act), `load_ui_config`
+            // holds an exemption over it (restore is never a refusal), and
+            // `Gui::new` reaches it before any table exists. So this arm is
+            // the answer to "what should happen if it ever is", exercised by
+            // `crate::admission::tests` and by nothing on the live path. It
+            // becomes reachable the moment the door gains a caller that is
+            // neither batched nor exempt.
+            Self::DefaultLayers => Recovery::Silent,
+            // A gesture on one pane's eye. Painting a layer minutes after the
+            // click is a scene change with no gesture behind it, and a pane's
+            // stack is user-curated state - the one thing a door may not write
+            // on the user's behalf. Re-offered.
+            Self::ShowLayer => Recovery::Reoffer,
+            // The layout is the most visible thing on the glass and the
+            // hardest change to attribute: a split that appears on its own
+            // reads as a bug, not as a wish granted. Re-offered. The preset is
+            // the same act with more of the scene in it.
+            Self::Panes { .. } | Self::Preset => Recovery::Reoffer,
+            // The slider shows the number in force. Widening the window
+            // silently would move a control the reader may be looking at, and
+            // the lookback is the user's to spend by rulings 13 and 15.
+            Self::LoopSpan => Recovery::Reoffer,
+            // **It has already paid for a frame listing over the network**, so
+            // re-driving it costs a listing per table rather than nothing -
+            // which is the distinction this variant was spelled apart from
+            // `ArmLoop` to keep. Its refusal notice already tells the reader
+            // to turn the loop back on ([`follow_up`]); this tells them when
+            // that will work.
+            Self::LoopFrames => Recovery::Reoffer,
+        }
+    }
+
+    /// **The key a wish is retained under**: the variant, with any payload
+    /// excluded.
+    ///
+    /// Deliberately coarser than the `PartialEq` [`AdmissionLedger::refused`]
+    /// keys on. That memo answers "what did this table say to *this exact*
+    /// question", so `Panes { added: 2 }` and `Panes { added: 3 }` are two
+    /// questions there and must be. A wish is "what did the user last want",
+    /// and a user who asked for three panes and then for two wants two - so
+    /// the later ask replaces the earlier one rather than sitting beside it.
+    /// It is also what makes the retained set's ceiling a fixed number instead
+    /// of one that scales with a payload's range.
+    ///
+    /// Wildcard-free for the same reason [`Self::recovery`] is.
+    const fn retention_key(self) -> u8 {
+        match self {
+            Self::Panes { .. } => 0,
+            Self::ShowLayer => 1,
+            Self::DefaultLayers => 2,
+            Self::AdoptLayers => 3,
+            Self::Preset => 4,
+            Self::ArmLoop => 5,
+            Self::LoopFrames => 6,
+            Self::LoopSpan => 7,
+        }
+    }
 }
+
+/// **Every kind of act, for the retained set's ceiling to be derived over
+/// rather than typed.**
+///
+/// **The premise the compiler does not check**: that this lists every variant.
+/// A variant added to [`Act`] is forced to get a [`Act::retention_key`] arm -
+/// that match is wildcard-free and will not compile without one - but nothing
+/// forces it into this roster, so a new act would leave [`PENDING_CAP`] one
+/// short. `every_act_kind_has_its_own_retention_key` is the check, and it is a
+/// test rather than a `const _` because the distinctness it asserts needs a
+/// walk. The consequence of being one short is a dropped wish, never an
+/// unbounded set: what bounds the set is the key replacement in [`place`], and
+/// this ceiling is the backstop behind it.
+const ACT_KINDS: &[Act] = &[
+    Act::Panes { added: 1 },
+    Act::ShowLayer,
+    Act::DefaultLayers,
+    Act::AdoptLayers,
+    Act::Preset,
+    Act::ArmLoop,
+    Act::LoopFrames,
+    Act::LoopSpan,
+];
+
+/// **What happens to a refused act when the spare that refused it grows.**
+///
+/// The three answers exist because the acts are genuinely three different
+/// things, and picking one answer for all of them gets two of the three wrong:
+/// re-driving everything paints layers and opens panes nobody just asked for,
+/// and re-offering everything puts a notice on the glass for work the
+/// application should simply have done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Recovery {
+    /// **Re-drive the act for the user.** Nothing external was paid for it and
+    /// the application would have done it unasked, so there is no gesture to
+    /// attribute the result to and none is needed.
+    Silent,
+    /// **Say there is room now, and let the reader ask again.** The act was a
+    /// gesture, and performing a gesture the user made a minute ago is a scene
+    /// change they cannot attribute; or it has already paid for something
+    /// external and re-driving it would pay again on every table.
+    Reoffer,
+    /// **Retain nothing**: a standing loop in the application already re-asks
+    /// this act, and the within-generation memo clearing on a fresh table is
+    /// what releases it. A wish here would be a second copy of one that
+    /// already exists.
+    SelfDriven,
+}
+
+/// **What a wish asked for, in the unit its own door decides in.**
+///
+/// The byte doors compare an [`Increment`] against [`AdmissionLedger::spare`];
+/// the listing door compares a frame count against
+/// [`PaneAdmission::loop_frames_allowed`], for the reasons written on
+/// [`AdmissionLedger::admit_loop_frames`]. Re-asking has to use the same unit
+/// the refusal used or it is answering a different question.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Want {
+    /// A byte door's increment.
+    Bytes(Increment),
+    /// The listing door's frame count.
+    Frames(usize),
+}
+
+/// **A refused act, retained so the door can ask again when the scene
+/// changes.**
+///
+/// Held past the generation it was refused in - which is the whole difference
+/// between this and [`AdmissionLedger::refused`] - and re-asked on every table
+/// [`AdmissionLedger::adopt`] takes until one of four things happens: it fits,
+/// the pane it named is gone, it ages out ([`WISH_LIFETIME`]), or the same
+/// question is asked again and replaces it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingWish {
+    /// What was asked for.
+    pub act: Act,
+    /// The pane it was asked on, where the act names one.
+    pub pane: Option<usize>,
+    /// The price the table in force at the refusal put on it. An estimate by
+    /// the time it is re-asked - see [`AdmissionLedger::revisit`].
+    want: Want,
+    /// When the verdict that refused it was taken. Wall clock, because the
+    /// quantity being bounded is how long ago the user asked; a frame count
+    /// measures how busy the machine has been instead.
+    wished_at: web_time::Instant,
+}
+
+/// **How long a refused act stays a wish.**
+///
+/// A wish is the user's intent, and intent goes stale: nobody wants the layer
+/// they gave up on two minutes ago to appear while they are doing something
+/// else. So the retained set is bounded in time as well as in size, and this
+/// is the time.
+///
+/// **Sixty seconds, and the reason is the errand the refusal notice sends the
+/// reader on.** That notice names a control - `Raise "System memory" in
+/// Settings > Memory` - and lives [`NOTICE_LIFETIME`], six seconds. Opening
+/// the settings screen, finding the Memory heading, moving a share and coming
+/// back is a ten-second job for someone who knows the screen and most of a
+/// minute for someone meeting it for the first time. A wish that expired
+/// before the second reader finished would make the instruction a lie, which
+/// is the defect the notice exists to avoid. Sixty seconds covers them and is
+/// still comfortably inside the span over which a person attributes an
+/// outcome to their own gesture.
+///
+/// It is also about thirty tables at the composition cadence
+/// (`App::compose_admission_costs`, ~2 s), so a wish gets on the order of
+/// thirty re-asks - far more than a governor recovery or a closed pane needs
+/// to show up.
+///
+/// **Measured from the last verdict that refused this question, not the
+/// first.** A repeat inside one generation is answered from the memo without
+/// a verdict, so a door re-driven sixty times a second refreshes nothing; only
+/// a fresh refusal - a new gesture, or a replay that was refused again - moves
+/// the clock, and a new gesture *should* start the clock again.
+pub const WISH_LIFETIME: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// **The most wishes either set may hold**, derived rather than typed.
+///
+/// The real bound is [`place`]: one entry per `(act kind, pane)`, the later
+/// ask replacing the earlier. That gives a ceiling of every act kind against
+/// every pane a layout can show, plus the `None` key the acts that name no
+/// pane share - so it is derived from [`ACT_KINDS`] and the layout's own
+/// maximum rather than written as a number that would go stale beside them.
+///
+/// This is the **backstop** behind that bound, not the bound (see the plan's
+/// rule: an unreachable budget is a backstop, not a redundancy). Its
+/// unreachability rests on three premises and the compiler checks none of
+/// them: that [`place`] really is keyed, that [`ACT_KINDS`] is exhaustive, and
+/// that no pane index reaches this ledger above the layout's maximum. The
+/// first two have tests; the third is a runtime property of `Gui::panes`.
+const PENDING_CAP: usize =
+    ACT_KINDS.len() * (squallar_device_profile::budget::MAX_PANES_DESKTOP + 1);
+
+/// The ceiling prices one wish per act kind per addressable pane, plus the
+/// one key every pane-less act shares. Named here so a change to either term
+/// fails with the arithmetic in front of the reader.
+const _: () = assert!(PENDING_CAP == 8 * 7);
 
 /// **Whether a refusal turns the act away, or is only counted** — the one
 /// per-arm value in this module, and a selected value rather than a fork in
@@ -333,6 +594,23 @@ impl Act {
 /// instrument that made all three visible goes on running; only the turning
 /// away is off, and it comes back when the door and the readout are shown to
 /// be describing the same scene.
+///
+/// **One of the two reasons is now gone, and this is deliberately still
+/// `false`.** The other half of why enforcing here was untenable was that a
+/// refusal was permanent for the session: a *correct* refusal cost the user a
+/// function until they restarted the application. Refusals are retained and
+/// re-asked on every table now ([`PendingWish`], [`Recovery`]), so being wrong
+/// costs a table rather than a session. That removes a reason. It is not
+/// evidence, and removing a reason is not a flip: what a flip needs is
+/// [`Totals::would_refuse`] read on the arm every user is on, beside a
+/// `budget state:` line that agrees with it about the same scene — and it is
+/// the user's call, not this module's.
+///
+/// Note what that means for everything in this file about wishes: on the arm
+/// where this is `false` **no wish is ever retained**, because nothing is ever
+/// turned away. The machinery is exercised on native and by
+/// [`AdmissionLedger::decide`]'s injected arm in tests, and it is waiting here
+/// for the day the constant moves.
 #[cfg(target_arch = "wasm32")]
 const ENFORCING: bool = false;
 #[cfg(not(target_arch = "wasm32"))]
@@ -548,7 +826,39 @@ pub struct AdmissionLedger {
     ///
     /// Bounded by the distinct `(act, pane)` pairs a scene can produce — at
     /// most one per act per visible pane — so it needs no eviction.
+    ///
+    /// **This is a memo, not retention**, and the difference is the point of
+    /// [`Self::pending`] beside it: what is held here is one table's answer to
+    /// one question, and it is *correct* that it dies with the table. What
+    /// must not die with the table is the user's wish.
     refused: Vec<(Act, Option<usize>, Refusal)>,
+    /// **What was refused and is still wanted** — the wishes that outlive the
+    /// generation, re-asked on every table [`Self::adopt`] takes. See
+    /// [`PendingWish`], and [`Recovery`] for what happens to one that starts
+    /// fitting.
+    ///
+    /// **Held per ledger, unlike the debit.** [`SharedDebit`] is shared
+    /// because two ledgers spending one tick's spare twice over-admits the
+    /// scene; a wish is the opposite shape - it is the record of a door's own
+    /// refusal, and the door that refused it is the door that can re-drive or
+    /// re-offer it. The App's ledger holds the loop wishes and the UI's holds
+    /// the layer and layout ones, which is exactly where each is answerable.
+    ///
+    /// Bounded twice over: by the `(act kind, pane)` key [`place`] replaces on
+    /// — the ceiling is [`PENDING_CAP`] — and in time by [`WISH_LIFETIME`].
+    pending: Vec<PendingWish>,
+    /// **Wishes that fit again and whose act the application re-drives
+    /// itself** — [`Recovery::Silent`], filled by [`Self::revisit`] and
+    /// drained by [`Self::take_granted`].
+    ///
+    /// A queue rather than a callback because the ledger cannot perform an
+    /// act: it holds no panes, no registry and no layer stack, and giving it
+    /// any of those would put pricing and doing in one object. The caller that
+    /// owns the doors drains it — `Gui::replay_granted_admissions`.
+    ///
+    /// Keyed the same way [`Self::pending`] is, so a caller that never drains
+    /// holds at most the same key space rather than one entry per table.
+    granted: Vec<PendingWish>,
     /// **This ledger's own verdict counts.** The `static`s above are the
     /// process-wide figures the App prints; these are per-application, which
     /// is what a test can assert on without racing every other test in the
@@ -572,6 +882,11 @@ impl Clone for AdmissionLedger {
             batch: self.batch,
             notice: self.notice.clone(),
             refused: self.refused.clone(),
+            // A second application wants the same things: a wish is the
+            // user's, not the cell's, and the reason the debit may not be
+            // copied does not reach it.
+            pending: self.pending.clone(),
+            granted: self.granted.clone(),
             counts: self.counts,
         }
     }
@@ -579,8 +894,22 @@ impl Clone for AdmissionLedger {
 
 impl AdmissionLedger {
     /// Take a freshly published table. Clears what has been spent when the
-    /// generation moved, since the new spare already accounts for it.
+    /// generation moved, since the new spare already accounts for it, and
+    /// re-asks every wish a refusal left behind.
+    ///
+    /// **This is the tick that republishes the spare**, on both sides of the
+    /// seam: `App::compose_admission_costs` calls it from the telemetry
+    /// cadence, and `Gui::apply_frame_inputs` calls it on the one frame that
+    /// first sees the new generation. Everything below the generation compare
+    /// therefore runs at most once per table, never per frame.
     pub fn adopt(&mut self, costs: &AdmissionCosts) {
+        self.adopt_at(costs, web_time::Instant::now());
+    }
+
+    /// [`Self::adopt`] with the clock passed in, so a test can age a wish
+    /// without sleeping - the shape [`Self::notice`] and
+    /// [`Self::raise_notice`] already have, and for the same reason.
+    pub fn adopt_at(&mut self, costs: &AdmissionCosts, now: web_time::Instant) {
         if costs.generation == self.costs.generation {
             return;
         }
@@ -594,6 +923,111 @@ impl AdmissionLedger {
         // the user can act on and retry rather than a dead end for the
         // session.
         self.refused.clear();
+        // **After the table is in force, never before**: `revisit` compares
+        // every wish against `Self::spare`, and that reads `self.costs`.
+        self.revisit(now);
+    }
+
+    /// **Ask every retained wish again, against the table just adopted.**
+    ///
+    /// The other half of the memo clear above: clearing `refused` lets a door
+    /// that is re-driven ask again, and this asks for the doors that are
+    /// **not** re-driven — a click nobody will make twice, a preset applied
+    /// once, a slider already back where it was.
+    ///
+    /// Four things end a wish, and only one of them is "it fits":
+    ///
+    /// - **The pane it named is gone.** A wish addressed to pane 3 in a
+    ///   two-pane layout is not a wish any more, and re-offering it would name
+    ///   a pane that is not on the glass. Dropped before the fit test, so a
+    ///   closed pane never resolves a wish it took the room from.
+    /// - **It aged out** ([`WISH_LIFETIME`]).
+    /// - **It fits**, and then [`Recovery`] says what that means.
+    /// - Or the same question is asked again, which replaces it in
+    ///   [`place`] rather than here.
+    ///
+    /// **The fit test is against the wish's own recorded price, which is an
+    /// estimate by now.** `AdmissionLedger::refused`'s own doc records why: a
+    /// door's increment can move inside a generation. So this is a filter and
+    /// not a grant — a `Silent` wish goes back through its real door, which
+    /// re-prices against the table in force and refuses again if it has to,
+    /// and a `Reoffer` wish commits nothing at all. Nothing here debits
+    /// [`Self::spent`]: no act has happened yet, and spending for one that
+    /// may never be asked for would hold bytes against a scene nobody has.
+    fn revisit(&mut self, now: web_time::Instant) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let held = std::mem::take(&mut self.pending);
+        // **One notice for the whole tick, and it is the newest wish's.**
+        // `place` pushes at the back, so this set reads oldest-first and the
+        // last wish to resolve is the one the reader asked for most recently
+        // - the one they can still attribute a sentence to. Collected and
+        // raised once after the walk rather than inside it, so a tick that
+        // resolves three wishes stamps the notice once instead of three
+        // times; a door that refuses later in the same frame overwrites it,
+        // which is the newer fact and the right one to show.
+        let mut reoffer: Option<Act> = None;
+        for wish in held {
+            if wish
+                .pane
+                .is_some_and(|idx| self.costs.panes.get(idx).is_none())
+            {
+                continue;
+            }
+            if now.duration_since(wish.wished_at) >= WISH_LIFETIME {
+                continue;
+            }
+            if !self.wish_fits(&wish) {
+                self.pending.push(wish);
+                continue;
+            }
+            match wish.act.recovery() {
+                Recovery::Silent => place(&mut self.granted, wish),
+                Recovery::Reoffer => reoffer = Some(wish.act),
+                // Never retained, so never seen here. Spelled rather than
+                // wildcarded so a `recovery` that changes has to be read
+                // against this walk too.
+                Recovery::SelfDriven => {}
+            }
+        }
+        if let Some(act) = reoffer {
+            self.raise_notice(reoffer_text(act).to_string(), now);
+        }
+    }
+
+    /// **Would the table in force take this wish now** — in the unit the door
+    /// that refused it decides in, which is the only unit the answer means
+    /// anything in.
+    fn wish_fits(&self, wish: &PendingWish) -> bool {
+        match wish.want {
+            Want::Bytes(want) => verdict(self.spare(), want).is_admit(),
+            // The listing door's question, re-asked exactly as
+            // `Self::decide_loop_frames` asks it: a count against the frames
+            // this pane's loop may hold over a scene with its own loop taken
+            // out. A wish with no pane cannot be one of these and does not
+            // fit by default rather than by accident.
+            Want::Frames(frames) => wish
+                .pane
+                .is_some_and(|idx| frames <= self.pane(idx).loop_frames_allowed),
+        }
+    }
+
+    /// **The wishes still waiting on room.** The figure a test asserts the
+    /// bound on, and what a diagnostics row would read.
+    pub fn pending(&self) -> &[PendingWish] {
+        &self.pending
+    }
+
+    /// **Take the wishes that fit again and are the application's to
+    /// re-drive.** Empty on every tick but the one that resolved one, and
+    /// empty for the whole session on an arm where [`ENFORCING`] is `false` —
+    /// nothing was turned away there, so nothing was retained.
+    ///
+    /// The caller re-drives each act through its **real door**, which asks
+    /// again against the table in force. See `Gui::replay_granted_admissions`.
+    pub fn take_granted(&mut self) -> Vec<PendingWish> {
+        std::mem::take(&mut self.granted)
     }
 
     /// The table in force.
@@ -688,6 +1122,12 @@ impl AdmissionLedger {
     /// **The measurement, on every arm.** A refusing verdict counted here is
     /// counted whether or not [`ENFORCING`] then turns the act away, so the
     /// advisory arm reports exactly what the enforcing one would have done.
+    ///
+    /// **It raises no notice and retains no wish.** Both are
+    /// [`Self::act_on`]'s, and a caller that only asks has not turned anything
+    /// away - so there is nothing to announce and nothing to ask again for.
+    /// Every production door goes through [`Self::enforce`] or
+    /// [`Self::admit_loop_frames`], which do.
     pub fn ask(&mut self, act: Act, pane: Option<usize>, want: Increment) -> Verdict {
         self.ask_tracked(act, pane, want).0
     }
@@ -822,7 +1262,7 @@ impl AdmissionLedger {
                 (self.record(act, pane_key, Verdict::Refuse(refusal)), true)
             }
         };
-        self.act_on(act, v, fresh, enforcing)
+        self.act_on(act, pane_key, Want::Frames(wanted), v, fresh, enforcing)
     }
 
     /// **Whether `act` was already refused against the table in force.**
@@ -890,7 +1330,7 @@ impl AdmissionLedger {
     /// workspace executes.
     fn decide(&mut self, act: Act, pane: Option<usize>, want: Increment, enforcing: bool) -> bool {
         let (v, fresh) = self.ask_tracked(act, pane, want);
-        self.act_on(act, v, fresh, enforcing)
+        self.act_on(act, pane, Want::Bytes(want), v, fresh, enforcing)
     }
 
     /// **Act on a verdict**: the arm's policy, the refused count and the
@@ -899,14 +1339,37 @@ impl AdmissionLedger {
     /// Shared by the byte doors and the listing door so a refusal reaches the
     /// glass by one path however it was decided. Returns whether the caller
     /// may proceed.
-    fn act_on(&mut self, act: Act, v: Verdict, fresh: bool, enforcing: bool) -> bool {
+    ///
+    /// **Seven arguments counting `self`, which is exactly clippy's ceiling.**
+    /// `too_many_arguments` fires at *more* than seven, so this passes - but
+    /// the next parameter added here is a lint failure and not a style
+    /// question. Bundle `act`/`pane`/`want` into a struct at that point rather
+    /// than raising a threshold: they are one thing (the question that was
+    /// asked) already spelled as three.
+    fn act_on(
+        &mut self,
+        act: Act,
+        pane: Option<usize>,
+        want: Want,
+        v: Verdict,
+        fresh: bool,
+        enforcing: bool,
+    ) -> bool {
         let Verdict::Refuse(refusal) = v else {
             return true;
         };
         if fresh {
+            // One reading for the wish and the notice, so a wish cannot be
+            // stamped a tick apart from the sentence that announced it.
+            let now = web_time::Instant::now();
             if enforcing {
                 REFUSED.fetch_add(1, Relaxed);
                 self.counts.refused = self.counts.refused.saturating_add(1);
+                // **Only where the act was actually turned away.** On the
+                // advisory arm it proceeded, and retaining a wish for
+                // something that already happened would re-drive it - which
+                // is a worse defect than the refusal that did not occur.
+                self.retain(act, pane, want, now);
             }
             // **The notice goes up on BOTH arms**, and the two say different
             // things because different things happened.
@@ -925,9 +1388,33 @@ impl AdmissionLedger {
             // and never once put in front of the person whose page was about
             // to die.
             let text = refusal_text(act, refusal, self.costs.requested_percent, enforcing);
-            self.raise_notice(text, web_time::Instant::now());
+            self.raise_notice(text, now);
         }
         !enforcing
+    }
+
+    /// **Keep what was refused, so the next table can ask again.**
+    ///
+    /// Only a *fresh* verdict reaches this: a repeat inside one generation is
+    /// answered from [`Self::refused`] without a verdict, so a door
+    /// `App::hydrate_parked_panes` re-drives sixty times a second registers
+    /// nothing and refreshes no clock. See [`WISH_LIFETIME`] on why the clock
+    /// is the last refusal's rather than the first's.
+    fn retain(&mut self, act: Act, pane: Option<usize>, want: Want, now: web_time::Instant) {
+        if matches!(act.recovery(), Recovery::SelfDriven) {
+            // A standing loop already holds this wish; a copy here would be a
+            // second one. See `Recovery::SelfDriven`.
+            return;
+        }
+        place(
+            &mut self.pending,
+            PendingWish {
+                act,
+                pane,
+                want,
+                wished_at: now,
+            },
+        );
     }
 
     /// **Open an exemption**: every door reached until [`Self::end_exempt`]
@@ -977,6 +1464,62 @@ impl AdmissionLedger {
             text,
             raised_at: now,
         });
+    }
+}
+
+/// **Put `wish` in `set` under its own key**, replacing whatever question it
+/// repeats.
+///
+/// The key is `(Act::retention_key, pane)`: one entry per question, the later
+/// ask winning, because a user who asked for three panes and then for two
+/// wants two. That is what bounds both sets - see [`PENDING_CAP`], which is
+/// the backstop behind this rather than the bound itself.
+///
+/// Pushed at the back, so the set reads oldest-first and
+/// [`AdmissionLedger::revisit`] can take the newest resolved wish as the one
+/// to name on the glass.
+///
+/// The cap drops the **oldest** wish, which is the one whose gesture is
+/// furthest away. It is unreachable while the key holds, and a wish dropped
+/// under it is a wish the user is not told about - so it is a backstop against
+/// an unbounded `Vec`, and never a policy.
+fn place(set: &mut Vec<PendingWish>, wish: PendingWish) {
+    set.retain(|held| {
+        held.act.retention_key() != wish.act.retention_key() || held.pane != wish.pane
+    });
+    if set.len() >= PENDING_CAP {
+        set.remove(0);
+    }
+    set.push(wish);
+}
+
+/// **What a wish that started fitting says**, for the acts the application
+/// will not perform on the user's behalf ([`Recovery::Reoffer`]).
+///
+/// Three things, in the order a reader needs them: that the wall is gone, what
+/// it was about, and the gesture that gets it. The last is what separates this
+/// from a status line — a sentence saying only "there is room now" is a
+/// notification about something the reader has no move to make on.
+///
+/// **It never claims the act happened.** The whole reason these acts are
+/// re-offered rather than re-driven is that the application did not do them,
+/// and a sentence in the past tense here would be the same false statement on
+/// the glass the advisory arm's opening clause exists to avoid.
+///
+/// Every variant has an arm, including the ones [`Act::recovery`] never sends
+/// here, so a change of policy on any act finds a sentence already written
+/// rather than a wildcard.
+const fn reoffer_text(act: Act) -> &'static str {
+    match act {
+        Act::ShowLayer => "There is room for this layer now - turn it on again.",
+        Act::DefaultLayers => "There is room for this pane's layers now.",
+        Act::AdoptLayers => "There is room for the linked panes' layers now.",
+        Act::Panes { .. } => "There is room for another pane now - try the split again.",
+        Act::Preset => "There is room for this preset now - apply it again.",
+        Act::ArmLoop | Act::LoopFrames => {
+            "There is room for this loop now - turn the loop back on."
+        }
+        Act::LoopSpan => "There is room for a longer lookback now - move the slider again.",
     }
 }
 
@@ -1108,14 +1651,19 @@ const fn scene_lever(act: Act) -> &'static str {
 /// **What the reader must do after the lever, where the act is not re-asked
 /// for them.**
 ///
-/// Every other door here is re-asked from the ledger's memo the moment the
-/// App publishes a table with room, so "lower the lookback" is the whole
-/// instruction: the user changes it and the loop arrives. The listing door is
-/// not, deliberately — re-driving it would put a fresh frame listing on the
-/// network on every redraw — so lowering the lookback alone does **nothing**
-/// visible, and a notice stopping there would leave the reader having done
-/// exactly what they were told with no result. That is a worse experience
-/// than the refusal it followed.
+/// The loop *arm* is re-asked for the user the moment the App publishes a
+/// table with room — `App::hydrate_parked_panes` re-drives it off its own
+/// parked queue and the memo clearing is what releases it — so for that act
+/// "lower the lookback" is the whole instruction: the user changes it and the
+/// loop arrives. The listing door is not re-driven, deliberately — that would
+/// put a fresh frame listing on the network on every table — so lowering the
+/// lookback alone does **nothing** visible, and a notice stopping there would
+/// leave the reader having done exactly what they were told with no result.
+/// That is a worse experience than the refusal it followed.
+///
+/// What the listing door gets instead is the other end of the same sentence:
+/// its wish is retained, and [`reoffer_text`] tells the reader when the room
+/// they freed is enough. See [`Recovery::Reoffer`].
 ///
 /// **Empty on the advisory arm**, where the loop was let through and is
 /// already running: telling someone to turn back on a thing that is playing

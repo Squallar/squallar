@@ -930,6 +930,20 @@ impl Gui {
         if let Some(debit) = inputs.admission_debit {
             self.admission.share_debit(debit);
         }
+        // **After the adopt that filled the queue, and after the debit it
+        // will spend against.** Empty on every frame but the one that first
+        // sees a fresher table, and empty for the whole session unless a door
+        // refused an act the application re-drives on the user's behalf - see
+        // `crate::admission::Recovery`.
+        self.replay_granted_admissions();
+        // **A refusal outranks a re-offer, which is why this stays last.** The
+        // adopt above may have raised "there is room for this now" on this
+        // ledger; if the App's door refused something inside the last six
+        // seconds, its sentence overwrites that one here. That order is the
+        // right one: something that just failed is more urgent than something
+        // that could now succeed, and the re-offered wish is gone either way -
+        // the reader can still make the gesture.
+        //
         // A refusal the App's own door raised, so the pane paints one notice
         // whichever side of the seam turned the act away.
         self.admission
