@@ -120,11 +120,11 @@ fn a_pane_that_stops_drawing_radar_lets_go_of_its_volume() {
         "premise: every arrival is filed in the loop download cache too, and \
          that is the holder a still-inventory figure cannot see",
     );
-    // **The DROP in the count, not the count.** Some of this workspace's
-    // process-global state outlives a test — the derive memo among it — so a
-    // whole-suite run can carry an owner this scene never created, and an
-    // absolute `== 1` reads red in a full run and green when filtered. What
-    // this change is answerable for is the three owners it removes.
+    // **The DROP in the count, not the count.** The eviction's three frees
+    // complete off-thread on the pool's single `rd-free` lane, so an absolute
+    // `== 1` would be asserting on that lane's drain rather than on retention
+    // — see [`owners_once_freed`]. What this change is answerable for is the
+    // three owners it removes.
     let owners_before = Arc::strong_count(&volume);
 
     draw_radar(&mut app, 0, false);
