@@ -858,3 +858,90 @@ fn the_listing_doors_frame_count_reads_the_session_rather_than_a_constant() {
          does: {six_panes} > {one_pane}",
     );
 }
+
+/// **"Host unbounded" and "host not applicable" must not look alike.**
+///
+/// Where no host reader has answered, [`super::charge_for`] used to return a
+/// GPU-only `Charge` whatever the thing cost the host. So a thing charged
+/// entirely to the host came back naming the GPU, with the GPU's denominator,
+/// and no caller could tell the host axis had been *skipped* rather than
+/// *cleared* — the figure printed was true about a pool the thing was not
+/// being charged to. That is why this door stood open unnoticed: it did not
+/// report an absent bound, it reported a different pool's present one.
+///
+/// `Charge::allowed_bytes` already spells the honest answer. Its own doc says
+/// `None` is "where the pool itself is unknown — a native arm no host reader
+/// has answered for — where nothing is ever over", and both readers render it
+/// as a spend with no denominator (`ui_map_pane::pane_cost_line`,
+/// `ui_stack::layer_memory_line`).
+///
+/// **Both directions**, because only one of them is about the fix: a host cost
+/// with no host figure must name the host and admit it has no bound, and a
+/// thing that costs the host nothing must still name the GPU with the GPU's
+/// real room — otherwise this passes by reporting `Host` for everything.
+#[test]
+fn a_host_cost_with_no_host_figure_names_the_host_and_admits_it_has_no_bound() {
+    use squallar_device_profile::admit::Pool;
+    use squallar_device_profile::scene::{Capacity, CapacitySource, Need, Pools};
+
+    const GPU_POOL: u64 = 4 << 30;
+    const HOST_COST: u64 = 512 << 20;
+    const GPU_COST: u64 = 64 << 20;
+
+    // A native arm no host reader answered for: split pools, no host figure.
+    let cap = Capacity {
+        gpu_bytes: GPU_POOL,
+        host_bytes: None,
+        source: CapacitySource::Presumed,
+        pools: Pools::Split,
+    };
+    assert_eq!(
+        cap.host_allowance(),
+        None,
+        "precondition: this fixture must be the arm with no host figure",
+    );
+    let need = Need {
+        gpu_bytes: GPU_COST,
+        host_bytes: HOST_COST,
+    };
+
+    let charged = super::charge_for(&cap, need, GPU_COST, HOST_COST);
+    assert_eq!(
+        charged.pool,
+        Pool::Host,
+        "a cost borne by the host was reported against the GPU, so the reader \
+         was handed a true figure about the wrong pool",
+    );
+    assert_eq!(
+        charged.cost_bytes, HOST_COST,
+        "the host cost was replaced by the GPU's",
+    );
+    assert_eq!(
+        charged.allowed_bytes, None,
+        "an unknown host bound was reported as a known GPU one, which is the \
+         conflation this test exists for",
+    );
+
+    // The other direction: nothing charged to the host is still the GPU's, and
+    // it keeps a real denominator.
+    let gpu_only = super::charge_for(
+        &cap,
+        Need {
+            gpu_bytes: GPU_COST,
+            host_bytes: 0,
+        },
+        GPU_COST,
+        0,
+    );
+    assert_eq!(
+        gpu_only.pool,
+        Pool::Gpu,
+        "a thing costing the host nothing was moved to the host pool, so the \
+         assertion above says 'Host for everything' rather than 'Host when \
+         the host pays'",
+    );
+    assert!(
+        gpu_only.allowed_bytes.is_some(),
+        "the GPU arm lost its denominator, which it has and should report",
+    );
+}

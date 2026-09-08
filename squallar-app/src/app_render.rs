@@ -8486,11 +8486,34 @@ fn charge_for(
         };
     }
     let gpu_room = room(cap.allowance(), need.gpu_bytes, gpu_cost);
+    // **"Host unbounded" and "host not applicable" must not look alike.**
+    // This arm used to answer a GPU-only `Charge` whenever no host reader had
+    // answered, so a thing charged entirely to the host came back naming the
+    // GPU, with a GPU denominator, and nothing downstream could tell that the
+    // host axis had been skipped rather than cleared. That is why this door
+    // stood open unnoticed: the figure it printed was true about a pool the
+    // thing was not being charged to.
+    //
+    // `Charge::allowed_bytes` already spells the honest answer -- `None` is
+    // documented as "the pool itself is unknown ... where nothing is ever
+    // over" -- and both readers render it as a spend with no denominator
+    // (`ui_map_pane::pane_cost_line`, `ui_stack::layer_memory_line`). So a
+    // host cost with no host figure is reported as the HOST pool with an
+    // unknown bound, which is what it is. A thing that costs the host nothing
+    // still belongs to the GPU, and that arm is unchanged.
     let Some(host_allowance) = cap.host_allowance() else {
-        return Charge {
-            pool: Pool::Gpu,
-            cost_bytes: gpu_cost,
-            allowed_bytes: Some(gpu_room),
+        return if host_cost > 0 {
+            Charge {
+                pool: Pool::Host,
+                cost_bytes: host_cost,
+                allowed_bytes: None,
+            }
+        } else {
+            Charge {
+                pool: Pool::Gpu,
+                cost_bytes: gpu_cost,
+                allowed_bytes: Some(gpu_room),
+            }
         };
     };
     let host_room = room(host_allowance, need.host_bytes, host_cost);
