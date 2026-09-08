@@ -100,9 +100,24 @@ impl Pressure {
     /// **No desktop target raises either arm.** `page_max_bytes` is supplied
     /// only by `squallar-web` (`squallar_web::bridge`), so `LinearMemory` is a
     /// browser cause, and the memory warning is Android's and iOS's. On
-    /// desktop the only causes are the two GPU ones, and every host lever in
-    /// `App::on_pressure` is therefore dark there. That is a gap in the
+    /// desktop the only causes are the two GPU ones, so **nothing there sheds
+    /// host memory BECAUSE host memory is high**. That is a gap in the
     /// *causes*, not in the levers, and it is not this predicate's to close.
+    ///
+    /// **What that does NOT mean is that every host lever is dark on desktop,
+    /// and the difference is worth spelling because the shorter claim is the
+    /// tempting one.** Three of `App::on_pressure`'s reclaims are
+    /// unconditional and run on whatever cause arrives, desktop included:
+    /// `clear_render_cache`, `clear_extract_cache` and
+    /// `evict_unneeded_loop_scans`. What is gated is the tile economy (on
+    /// [`Self::is_page_heap`]) and the grid-staging release (on this
+    /// predicate), and those two genuinely are dark on a desktop.
+    ///
+    /// So the accurate reading is that a desktop's host reclaims only ever run
+    /// as a **side effect of a GPU failure** — a lost surface or a refused
+    /// allocation — and never because anything read the host heap. In a
+    /// healthy desktop session neither fires, which is why the gap is real;
+    /// it is just a gap in what can raise a cause, not in what a cause does.
     pub fn is_host_heap(self) -> bool {
         matches!(self, Self::LinearMemory { .. } | Self::MemoryWarning)
     }

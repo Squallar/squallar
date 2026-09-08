@@ -649,6 +649,16 @@ pub(crate) struct HostHeapWatch {
     /// `linear_memory_verdict` takes its own that way: saturating in `u64`
     /// would make a nearly-full reading near the top of the range read as
     /// under.
+    ///
+    /// **Not `squallar_alloc::live_peak_bytes()`, and neither replaces the
+    /// other.** That is a high-water mark of the NUMERATOR — the most this
+    /// allocator ever held. This is a high-water mark of the RATIO, and the
+    /// denominator moves too: `host_allowance()` recedes as the rest of the
+    /// machine fills, and the act line falls further as the scene's next
+    /// picture batch grows. A session whose live bytes plateau while the box
+    /// fills around it shows a rising figure here and a flat one there, and
+    /// only this one is a statement about how close the application came to
+    /// the line it would have acted on.
     peak_percent: u32,
 }
 
@@ -697,9 +707,17 @@ fn act_line_for(allowance: Option<u64>, headroom: u64) -> Option<u64> {
 }
 
 /// `host heap watch: live 3266 MiB, allowance 46080 MiB, act line 40089 MiB,
-/// headroom 512 MiB, over 0 of 42 readings` — the two figures a host-heap
-/// pressure signal would compare and how often it would have fired, said
-/// every telemetry period on every target.
+/// headroom 512 MiB, over 0 of 42 readings, peak 8 percent` — the two figures
+/// a host-heap pressure signal would compare and how often it would have
+/// fired, said every telemetry period on every target.
+///
+/// **Those numbers are a shape, not a reading**, and the label is here because
+/// the omission of it already cost something: the example was quoted back as
+/// a measured session result within the hour. Only `live` is even the right
+/// order of magnitude for this workspace's Linux arm; the rest were chosen to
+/// show the field widths. What this line has actually read on a running
+/// application is, at the time of writing, nothing at all — the instrument
+/// landed before any leg was run through it.
 ///
 /// **Nothing here gates anything and nothing here sheds a byte**; see
 /// [`HostHeapWatch`]. Its own line and never appended to `budget state:`,
