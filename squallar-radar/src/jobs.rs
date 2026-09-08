@@ -45,6 +45,18 @@ frame_reply_codec!(RadarPlanJob);
 frame_reply_codec!(Level3Job);
 frame_reply_codec!(Level3PairJob);
 
+/// A finished frame whose numbers are wanted, holding them the narrow way.
+///
+/// Every rasterizing row but the Level II one keeps its numbers unconditionally
+/// — only [`RadarPlanJob`] has a caller that says it will not read them — so
+/// this is where the other rows say the same thing the Level II row's
+/// `values_wanted` arm says. See [`crate::render::polar::PolarField::compact_values`]
+/// for why it cannot cost fidelity.
+fn holding_its_numbers_narrow(mut frame: RenderedFrame) -> RenderedFrame {
+    frame.polar.compact_values();
+    frame
+}
+
 /// Rasterize a Level II frame.
 #[derive(Debug, PartialEq)]
 pub struct RadarPlanJob {
@@ -84,7 +96,9 @@ impl JobSpec for RadarPlanJob {
     fn run(input: &RadarPlanJob, geo: &JobGeometry) -> Option<RenderedFrame> {
         crate::render::render_from_sized(&input.input, geo.side_ceiling_px as usize).map(|render| {
             let mut frame = RenderedFrame::from(render);
-            if !input.values_wanted {
+            if input.values_wanted {
+                frame.polar.compact_values();
+            } else {
                 frame.polar.strip_values();
             }
             frame
@@ -138,6 +152,7 @@ impl JobSpec for Level3Job {
                 geo.side_ceiling_px as usize,
             )
             .map(RenderedFrame::from)
+            .map(holding_its_numbers_narrow)
         })
     }
 }
@@ -193,7 +208,8 @@ impl JobSpec for Level3PairJob {
                 input.radar_lon,
                 geo.side_ceiling_px as usize,
             )
-            .map(RenderedFrame::from),
+            .map(RenderedFrame::from)
+            .map(holding_its_numbers_narrow),
             _ => None,
         }
     }

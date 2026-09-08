@@ -261,6 +261,14 @@ impl RenderCache {
     /// 433,592,352 B, over by exactly 10,563,840 B, which is 2 x 5,281,920 B
     /// — the two hover charges and nothing else.
     ///
+    /// **That 5,281,920 B is what a hover charge was on that day and not what
+    /// one is now.** A still pane's numbers are held a byte a gate since
+    /// `PolarField::compact_values`, so the charge on the same sweep is
+    /// 1,320,064 B and the gap between these two functions is a quarter of
+    /// what the paragraph above measures. The figure is left as it was read
+    /// because it is what named the defect; the reason the two functions
+    /// differ is the part that does not depend on it.
+    ///
     /// Measured, empty steady scene, 2026-09-07: the cache duly evicted its
     /// least-recently-used entry, and `live_bytes` did not move. **The two
     /// entries shared one `Arc<ColorImage>`**, so the eviction shed a pane's

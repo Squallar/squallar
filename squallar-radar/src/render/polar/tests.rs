@@ -276,7 +276,7 @@ fn layout_fixture() -> PolarField {
         // both of the two states the renderer puts on this wire beside ordinary
         // numbers: `NaN` for a gate it painted nothing at, and the range-folded
         // sentinel for one it painted the folded colour at.
-        values: vec![
+        values: Values::Wide(vec![
             0.0,
             -1.5,
             2.25,
@@ -289,7 +289,7 @@ fn layout_fixture() -> PolarField {
             32.5,
             64.75,
             -128.25,
-        ],
+        ]),
     }
 }
 
@@ -551,4 +551,169 @@ fn a_sweep_across_north_has_no_seam() {
             .collect();
         assert_eq!(claims, vec![0], "azimuth {az} across the north seam");
     }
+}
+
+/// A field of `radials × gates` whose gate `(r, g)` carries
+/// `values[(r * gates + g) % values.len()]`, so a caller states exactly how
+/// many distinct numbers the plane holds.
+fn field_of(radials: usize, gates: usize, values: &[f32]) -> PolarField {
+    let wedges = uniform_wedges(radials);
+    let cells = (0..radials * gates)
+        .map(|i| values[i % values.len()])
+        .collect();
+    PolarField::from_parts(
+        PolarGeometry::from_parts(wedges, 0.5, 1.0, None, gates),
+        cells,
+    )
+}
+
+/// Every gate of a field, read straight out of the plane rather than through a
+/// pick, so a comparison covers gates no azimuth resolves to.
+fn every_gate(f: &PolarField) -> Vec<Option<f32>> {
+    let g = f.geometry();
+    (0..g.radials())
+        .flat_map(|radial| (0..g.gates()).map(move |gate| GateAt { radial, gate }))
+        .map(|at| f.at(at))
+        .collect()
+}
+
+/// The numbers a render can paint, including the two it paints that are NaNs
+/// meaning different things and the two zeroes that compare equal.
+fn every_kind_of_painted_number() -> Vec<f32> {
+    vec![
+        0.0,
+        -0.0,
+        -1.5,
+        2.25,
+        f32::NAN,
+        super::super::RANGE_FOLDED_SENTINEL,
+        f32::MIN,
+        f32::MAX,
+        -128.25,
+    ]
+}
+
+#[test]
+fn compacting_returns_every_number_unchanged() {
+    let wide = field_of(9, 7, &every_kind_of_painted_number());
+    let mut narrow = wide.clone();
+    narrow.compact_values();
+
+    assert!(
+        narrow.resident_bytes() < wide.resident_bytes(),
+        "nothing was compacted: {} B against {} B",
+        narrow.resident_bytes(),
+        wide.resident_bytes(),
+    );
+    assert_eq!(
+        every_gate(&narrow),
+        every_gate(&wide),
+        "a compacted plane answered a gate differently from the plane it was \
+         built from. The table holds the painted numbers themselves, so this \
+         is an indexing and can only differ if a code was assigned to the \
+         wrong pattern.",
+    );
+    assert!(narrow.has_values(), "compacting is not stripping");
+}
+
+#[test]
+fn compacting_keeps_the_two_nans_apart() {
+    // `f32` equality says these are neither equal nor unequal, and both are
+    // painted: one means "no gate here", the other means "range folded". A
+    // table keyed on the number rather than on its bits merges them, and the
+    // wire then comes back with one where the other was.
+    let unpainted = f32::NAN;
+    let folded = super::super::RANGE_FOLDED_SENTINEL;
+    assert_ne!(
+        unpainted.to_bits(),
+        folded.to_bits(),
+        "this test is vacuous unless the two sentinels differ",
+    );
+
+    let wide = field_of(4, 2, &[unpainted, folded, 3.0, -0.0, 0.0, 7.5, -2.0, 9.0]);
+    let mut narrow = wide.clone();
+    narrow.compact_values();
+    assert_eq!(
+        narrow.to_bytes(),
+        wide.to_bytes(),
+        "two distinct bit patterns were folded into one code",
+    );
+}
+
+#[test]
+fn the_wire_is_the_same_bytes_from_either_form() {
+    let mut narrow = layout_fixture();
+    narrow.compact_values();
+    assert_eq!(
+        narrow.to_bytes(),
+        layout_fixture().to_bytes(),
+        "compacting moved the bytes this protocol ships. The coded form is a \
+         way of holding the numbers and never a way of writing them, so \
+         `to_bytes` widens whichever form it is handed and the pin in \
+         `the_polar_wire_layout_is_the_one_this_protocol_ships` covers both.",
+    );
+}
+
+#[test]
+fn a_compacted_field_survives_the_round_trip_the_worker_port_makes() {
+    let mut sent = ring(8, 45.0, 4);
+    sent.compact_values();
+    let back = PolarField::from_bytes(&sent.to_bytes()).expect("its own bytes");
+    assert_eq!(every_gate(&back), every_gate(&sent));
+    assert_eq!(back, sent, "the two forms compare by their numbers");
+}
+
+#[test]
+fn compacting_falls_the_price_to_a_byte_a_gate_and_the_table() {
+    let numbers = every_kind_of_painted_number();
+    let (radials, gates) = (720, 1832);
+    let wide = field_of(radials, gates, &numbers);
+    let mut narrow = wide.clone();
+    narrow.compact_values();
+
+    let geometry = wide.geometry().resident_bytes();
+    assert_eq!(
+        wide.resident_bytes() - geometry,
+        radials * gates * size_of::<f32>(),
+        "radials × gates × f32",
+    );
+    assert_eq!(
+        narrow.resident_bytes() - geometry,
+        radials * gates + numbers.len() * size_of::<f32>(),
+        "a byte a gate, plus one f32 per distinct number this field holds",
+    );
+}
+
+#[test]
+fn a_plane_with_more_numbers_than_a_byte_can_name_stays_wide() {
+    // 256 distinct numbers is what a byte addresses and 257 is one past it,
+    // which is the boundary and not a magic number: the wire byte a radar
+    // moment carries has 256 reachable values, and a computed field has as
+    // many as it has gates.
+    for (distinct, compacts) in [(255, true), (256, true), (257, false)] {
+        let numbers: Vec<f32> = (0..distinct).map(|i| i as f32 * 0.25).collect();
+        let wide = field_of(distinct, distinct, &numbers);
+        let mut narrow = wide.clone();
+        narrow.compact_values();
+
+        assert_eq!(
+            every_gate(&narrow),
+            every_gate(&wide),
+            "{distinct} distinct: a refused plane must still read its numbers",
+        );
+        assert_eq!(
+            narrow.resident_bytes() < wide.resident_bytes(),
+            compacts,
+            "{distinct} distinct numbers: expected compacted = {compacts}",
+        );
+    }
+}
+
+#[test]
+fn compacting_a_stripped_field_holds_nothing() {
+    let mut f = ring(8, 45.0, 4);
+    f.strip_values();
+    f.compact_values();
+    assert!(!f.has_values());
+    assert_eq!(f.resident_bytes(), f.geometry().resident_bytes());
 }

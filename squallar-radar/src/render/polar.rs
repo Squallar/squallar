@@ -357,12 +357,183 @@ impl PolarGeometry {
     }
 }
 
+/// The numbers behind a picture, in either of the two forms that answer
+/// [`PolarField::at`] with the identical bits.
+///
+/// `docs/radar-polar-design.md` §6.3 — *"the resident term becomes codes
+/// rather than f32"* — for the one place the numbers are actually held. The
+/// design states it of the polar representation as a whole; this is the half
+/// that needs no renderer and no wire, because the codes are derived from the
+/// values the render already painted and are widened again before they are
+/// written.
+#[derive(Clone, Debug)]
+enum Values {
+    /// One `f32` a gate, as the render painted it.
+    Wide(Vec<f32>),
+    /// One byte a gate, indexing the distinct numbers the render actually
+    /// painted.
+    ///
+    /// **Exact, and not a quantisation.** `table` holds the painted numbers
+    /// themselves rather than the ends of a range, so a code names one of them
+    /// and reading it back is an indexing rather than a rounding. What bounds
+    /// this form is the *count* of distinct numbers, and a plane with more of
+    /// them than a byte can address stays [`Values::Wide`] instead of losing
+    /// some.
+    Coded { codes: Vec<u8>, table: Vec<f32> },
+}
+
+impl Default for Values {
+    fn default() -> Self {
+        Self::Wide(Vec::new())
+    }
+}
+
+/// Elementwise over the numbers, on `f32`'s own comparison, so the two forms
+/// answer this the way one `Vec<f32>` did before either existed: a coded plane
+/// equals the wide plane it was built from, and a plane holding a NaN still
+/// equals nothing, itself included.
+impl PartialEq for Values {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().zip(other.iter()).all(|(a, b)| a == b)
+    }
+}
+
+impl Values {
+    /// The most distinct numbers a coded plane can name — one byte's worth.
+    const MAX_CODES: usize = u8::MAX as usize + 1;
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Wide(values) => values.len(),
+            Self::Coded { codes, .. } => codes.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The number at `index`, or `None` past the end.
+    fn get(&self, index: usize) -> Option<f32> {
+        match self {
+            Self::Wide(values) => values.get(index).copied(),
+            Self::Coded { codes, table } => table.get(usize::from(*codes.get(index)?)).copied(),
+        }
+    }
+
+    /// Every number in order, widened.
+    ///
+    /// Indexed rather than filtered so the count it yields is exactly
+    /// [`Values::len`]: [`PolarField::to_bytes`] writes that count into the
+    /// header and then writes this, and an iterator that could quietly yield
+    /// fewer would write a header describing bytes it did not write.
+    fn iter(&self) -> impl Iterator<Item = f32> + '_ {
+        (0..self.len()).map(|i| match self {
+            Self::Wide(values) => values[i],
+            Self::Coded { codes, table } => table[usize::from(codes[i])],
+        })
+    }
+
+    /// What holding this costs, bytes.
+    fn resident_bytes(&self) -> usize {
+        match self {
+            Self::Wide(values) => values.len() * size_of::<f32>(),
+            Self::Coded { codes, table } => codes.len() + table.len() * size_of::<f32>(),
+        }
+    }
+
+    /// Re-hold the numbers as codes, or leave them wide where there are more
+    /// distinct ones than a byte can name.
+    ///
+    /// One walk, and it stops at the first number past the ceiling: a plane
+    /// whose gates are a computed gradient rather than a wire byte disagrees
+    /// within its first few radials, so the walk it does not finish is the
+    /// small one.
+    fn compact(&mut self) {
+        let Self::Wide(values) = self else {
+            return;
+        };
+        if values.is_empty() {
+            return;
+        }
+        let mut assigned = CodeTable::new();
+        let mut codes = Vec::with_capacity(values.len());
+        for value in values.iter() {
+            let Some(code) = assigned.code_for(value.to_bits()) else {
+                return;
+            };
+            codes.push(code);
+        }
+        *self = Self::Coded {
+            codes,
+            table: assigned.table,
+        };
+    }
+}
+
+/// A code per distinct bit pattern, assigned in the order the patterns are
+/// first seen.
+///
+/// **Keyed on the bits and not on the number**, because two of the things a
+/// render paints are NaNs that mean different things — the unpainted marker
+/// and [`super::RANGE_FOLDED_SENTINEL`] — and `f32` equality neither
+/// distinguishes those nor separates `-0.0` from `0.0`. The wire has to come
+/// back byte for byte, so what is deduplicated is the byte pattern.
+///
+/// Open-addressed over twice [`Values::MAX_CODES`] slots, so the table is at
+/// most half full and a probe always reaches an empty one. Sized to fit a
+/// cache: the alternative, a hash map, is a walk over every gate of every
+/// still render and this is the same walk without the per-gate hashing cost.
+struct CodeTable {
+    keys: [u32; Self::SLOTS],
+    codes: [u8; Self::SLOTS],
+    used: [bool; Self::SLOTS],
+    /// The distinct numbers, indexed by the code assigned to each.
+    table: Vec<f32>,
+}
+
+impl CodeTable {
+    const SLOTS: usize = 2 * Values::MAX_CODES;
+
+    fn new() -> Self {
+        Self {
+            keys: [0; Self::SLOTS],
+            codes: [0; Self::SLOTS],
+            used: [false; Self::SLOTS],
+            table: Vec::new(),
+        }
+    }
+
+    /// The code for `bits`, assigning a fresh one where this pattern is new,
+    /// or `None` at the pattern one past what a byte can address.
+    fn code_for(&mut self, bits: u32) -> Option<u8> {
+        // Fibonacci hashing: the bits of a float differ in their low end
+        // across adjacent gates and in their high end across products, and a
+        // multiply mixes both ends into the slot index.
+        let mut slot = (bits.wrapping_mul(0x9E37_79B9) >> 23) as usize & (Self::SLOTS - 1);
+        loop {
+            if !self.used[slot] {
+                let code = u8::try_from(self.table.len()).ok()?;
+                self.used[slot] = true;
+                self.keys[slot] = bits;
+                self.codes[slot] = code;
+                self.table.push(f32::from_bits(bits));
+                return Some(code);
+            }
+            if self.keys[slot] == bits {
+                return Some(self.codes[slot]);
+            }
+            slot = (slot + 1) & (Self::SLOTS - 1);
+        }
+    }
+}
+
 /// A render's geometry with the numbers it painted, row-major `radials ×
 /// gates`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PolarField {
     geometry: PolarGeometry,
-    values: Vec<f32>,
+    values: Values,
 }
 
 impl PolarField {
@@ -374,7 +545,39 @@ impl PolarField {
     /// Give up the numbers and keep the geometry, for a render whose caller
     /// asked for the picture and not the values.
     pub fn strip_values(&mut self) {
-        self.values = Vec::new();
+        self.values = Values::default();
+    }
+
+    /// **Re-hold the numbers as one byte a gate plus a table of the distinct
+    /// ones**, for a render whose caller *did* ask for them.
+    ///
+    /// [`Self::strip_values`]'s counterpart: that one is what a loop frame
+    /// does with numbers nobody will read, this is what a still pane does with
+    /// numbers a hover will. A surveillance cut's plane is 720 × 1832 gates,
+    /// so the fall is `radials × gates × 4` to `radials × gates + table` —
+    /// 5,276,160 B to 1,320,064 B at the widest table this form admits, which
+    /// is `compacting_falls_the_price_to_a_byte_a_gate_and_the_table` computed
+    /// off the shape rather than a figure recorded here.
+    ///
+    /// **It cannot cost fidelity, by construction.** The table holds the
+    /// painted numbers themselves, so [`Self::at`] returns the bit pattern it
+    /// was given, and a plane carrying more distinct patterns than a byte can
+    /// address is left wide rather than rounded — which is what a computed
+    /// field (rotation, storm-relative velocity, a rate) does, and what a wire
+    /// byte's 256 reachable values never do. The refusal is measured off the
+    /// plane in hand and not read out of a table of products, so a product
+    /// that stops being exact stops being compacted on the same day.
+    ///
+    /// **And it cannot move the wire.** [`Self::to_bytes`] writes the same
+    /// `f32`s from either form, which
+    /// `the_wire_is_the_same_bytes_from_either_form` asserts against the
+    /// pinned layout rather than against a second opinion.
+    ///
+    /// One walk of the plane, on whichever thread the render finished on;
+    /// never on the frame thread, and never on a plane that is about to be
+    /// stripped.
+    pub fn compact_values(&mut self) {
+        self.values.compact();
     }
 
     /// Whether the numbers are resident.
@@ -389,16 +592,15 @@ impl PolarField {
             return None;
         }
         let index = at.radial * self.geometry.gates + at.gate;
-        let taken = self.values.get(index..=index)?;
+        let v = self.values.get(index)?;
         #[cfg(test)]
-        note_gate_reads(taken.len() as u64);
-        let v = *taken.last()?;
+        note_gate_reads(1);
         (!v.is_nan()).then_some(v)
     }
 
     /// What holding this costs, bytes — what the render cache bounds itself by.
     pub fn resident_bytes(&self) -> usize {
-        self.geometry.resident_bytes() + self.values.len() * std::mem::size_of::<f32>()
+        self.geometry.resident_bytes() + self.values.resident_bytes()
     }
 
     /// Build one directly, for tests and for callers holding a polar grid.
@@ -407,7 +609,10 @@ impl PolarField {
             values.is_empty() || values.len() == geometry.radials() * geometry.gates(),
             "a polar field is exactly radials × gates, or nothing"
         );
-        Self { geometry, values }
+        Self {
+            geometry,
+            values: Values::Wide(values),
+        }
     }
 }
 
@@ -433,7 +638,10 @@ impl PolarField {
             out.extend_from_slice(&w.azimuth_deg.to_le_bytes());
             out.extend_from_slice(&w.half_width_deg.to_le_bytes());
         }
-        for v in &self.values {
+        // Widened here and not held wide: the coded form is a way of *holding*
+        // the numbers and never a way of writing them, so this encoding is the
+        // one it has always been whichever form the field is in.
+        for v in self.values.iter() {
             out.extend_from_slice(&v.to_le_bytes());
         }
         out
@@ -500,7 +708,7 @@ impl PolarField {
                 gates,
                 reach_gates,
             },
-            values,
+            values: Values::Wide(values),
         })
     }
 }
@@ -624,7 +832,7 @@ impl PolarBuffers {
                 gates,
                 reach_gates,
             },
-            values,
+            values: Values::Wide(values),
         }
     }
 }
