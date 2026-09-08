@@ -18,7 +18,7 @@ mod content;
 
 /// The pane's own layer list, split from the build's catalogue.
 mod layer_stack;
-pub use layer_stack::{LayerStack, RemovedLayer};
+pub use layer_stack::{LayerStack, RemovedLayer, slot_ledger};
 
 pub use content::{
     BASE_HALF_WIDTH_KM, CrossSectionPane, DEFAULT_SUN_LIGHTING, DEFAULT_VERTICAL_EXAGGERATION,
@@ -2256,8 +2256,13 @@ impl PaneState {
     }
 
     /// This pane's slot for `id`, or `None` for a layer it has no slot for.
+    ///
+    /// Through [`LayerStack::position_of`], which is the stack's own index and
+    /// not a scan of it — this is reached three or four times per layer per
+    /// pane per frame by the layer walk alone.
     pub fn slot(&self, id: &LayerId) -> Option<&LayerSlot> {
-        self.layers.iter().find(|slot| slot.id == *id)
+        let pos = self.layers.position_of(id)?;
+        self.layers.get(pos)
     }
 
     /// This pane's slot for `id`, mutably.
@@ -2271,15 +2276,14 @@ impl PaneState {
     /// top of the stack — the same answer [`Self::set_overlay_enabled`] gives
     /// a layer it is asked about and this pane has never heard of.
     pub fn time_state_mut(&mut self, id: &LayerId) -> &mut LayerTimeState {
-        if self.slot(id).is_none() {
+        if self.layers.position_of(id).is_none() {
             self.layers.push(LayerSlot::new(id.clone(), false));
         }
-        &mut self
+        let pos = self
             .layers
-            .iter_mut()
-            .find(|slot| slot.id == *id)
-            .expect("the slot was just inserted")
-            .time
+            .position_of(id)
+            .expect("the slot was just inserted");
+        &mut self.layers[pos].time
     }
 
     /// **The layer whose stamps this pane's clock walks** — its *time-primary*
@@ -2622,7 +2626,8 @@ impl PaneState {
     }
 
     pub fn slot_mut(&mut self, id: &LayerId) -> Option<&mut LayerSlot> {
-        self.layers.iter_mut().find(|slot| slot.id == *id)
+        let pos = self.layers.position_of(id)?;
+        self.layers.get_mut(pos)
     }
 
     /// The draw order, bottom to top — the slot list's own order.
@@ -3258,7 +3263,7 @@ impl PaneState {
             }
         };
         let site = self.site.clone();
-        let Some(slot) = self.layers.iter_mut().find(|slot| slot.id == known::RADAR) else {
+        let Some(slot) = self.slot_mut(&known::RADAR) else {
             return;
         };
         let held = slot.config.as_object();
@@ -3324,7 +3329,7 @@ impl PaneState {
                 return;
             }
         }
-        let Some(slot) = self.layers.iter_mut().find(|slot| slot.id == *id) else {
+        let Some(slot) = self.slot_mut(id) else {
             // Unreachable through `add_layer` above, which only declines an id
             // no handler serves — and this pane holds no slot for one of those
             // either.

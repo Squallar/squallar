@@ -189,3 +189,217 @@ fn two_slots_differing_only_in_opacity_are_unequal_and_a_clone_carries_it() {
     assert_eq!(copy.opacity, Some(0.5), "the clone dropped the opacity");
     assert_eq!(copy, b);
 }
+
+// ── The position index, door by door ──────────────────────────────────────
+//
+// The index answers `position_of`, and a STALE one is a wrong answer rather
+// than a slow one: it names a slot that has moved, or misses a slot that has
+// arrived. The type's defence is structural — `slots` and its index live
+// behind `guarded::Slots`, whose only mutable door drops the index on the way
+// in — but "structural" is a claim, and these are what hold it to the claim.
+//
+// One test per door that can move a slot, each asking the question the index
+// answers rather than the one the `Vec` answers. The tamper they were all
+// shown red under is `guarded::Slots::as_mut` not clearing `fresh`: that one
+// edit is the whole of the invalidation, so every door below reads red
+// together under it, which is the point — no door has its own remembering to
+// do.
+
+/// The whole index in one property: after any door, `position_of` and a plain
+/// scan of the same stack agree about every id, present or absent.
+fn index_agrees_with_a_scan(stack: &LayerStack, ids: &[LayerId]) {
+    for id in ids {
+        let scanned = stack.iter().position(|held| held.id == *id);
+        assert_eq!(
+            stack.position_of(id),
+            scanned,
+            "the index puts {id:?} at {:?} and a scan of the same stack puts \
+             it at {scanned:?}",
+            stack.position_of(id),
+        );
+    }
+}
+
+/// Every id these tests ask about — the three they place plus one they never
+/// do, so a miss is exercised as well as a hit.
+fn probed_ids() -> Vec<LayerId> {
+    vec![
+        known::METAR,
+        known::NWS_ALERTS,
+        known::LIGHTNING,
+        known::GMGSI,
+    ]
+}
+
+/// **`push`** — a slot arriving on top after the index has been built.
+#[test]
+fn the_index_survives_a_push() {
+    let mut stack = LayerStack::default();
+    stack.push(slot(known::METAR));
+    // Build the index BEFORE the mutation: a door that invalidates nothing is
+    // indistinguishable from one that does unless something was there to lose.
+    assert_eq!(stack.position_of(&known::METAR), Some(0));
+    stack.push(slot(known::NWS_ALERTS));
+    index_agrees_with_a_scan(&stack, &probed_ids());
+    assert_eq!(stack.position_of(&known::NWS_ALERTS), Some(1));
+}
+
+/// **`insert`** — the door that moves every slot above it down one.
+#[test]
+fn the_index_survives_an_insert_below_a_held_slot() {
+    let mut stack = LayerStack::default();
+    stack.push(slot(known::METAR));
+    stack.push(slot(known::LIGHTNING));
+    assert_eq!(stack.position_of(&known::LIGHTNING), Some(1));
+    stack.insert(0, slot(known::NWS_ALERTS));
+    index_agrees_with_a_scan(&stack, &probed_ids());
+    assert_eq!(
+        stack.position_of(&known::LIGHTNING),
+        Some(2),
+        "an insert underneath pushed the held slot up and the index did not \
+         follow it",
+    );
+}
+
+/// **`take_out`** — the door that removes, and therefore the one where a stale
+/// index can name a position the list no longer has.
+#[test]
+fn the_index_survives_a_take_out() {
+    let mut stack = LayerStack::default();
+    stack.push(slot(known::METAR));
+    stack.push(slot(known::NWS_ALERTS));
+    stack.push(slot(known::LIGHTNING));
+    assert_eq!(stack.position_of(&known::LIGHTNING), Some(2));
+    assert!(stack.take_out(&known::METAR).is_some());
+    index_agrees_with_a_scan(&stack, &probed_ids());
+    assert_eq!(stack.position_of(&known::METAR), None);
+    assert_eq!(stack.position_of(&known::LIGHTNING), Some(1));
+}
+
+/// **`take_slots` + `set_slots`** — the whole-list rewrite `set_draw_order`
+/// runs, which is a permutation and therefore invisible to any check that
+/// only watches the list's length.
+#[test]
+fn the_index_survives_a_whole_list_rewrite_that_only_permutes() {
+    let mut stack = LayerStack::default();
+    stack.push(slot(known::METAR));
+    stack.push(slot(known::NWS_ALERTS));
+    assert_eq!(stack.position_of(&known::METAR), Some(0));
+    let mut taken = stack.take_slots();
+    taken.reverse();
+    stack.set_slots(taken);
+    index_agrees_with_a_scan(&stack, &probed_ids());
+    assert_eq!(
+        stack.position_of(&known::METAR),
+        Some(1),
+        "the list was reversed and the index still points where the slot used \
+         to be — the length never changed, so only the ids can catch this",
+    );
+}
+
+/// **`clear`** — every position the index holds becomes out of bounds at once.
+#[test]
+fn the_index_survives_a_clear() {
+    let mut stack = LayerStack::default();
+    stack.push(slot(known::METAR));
+    assert_eq!(stack.position_of(&known::METAR), Some(0));
+    stack.clear();
+    index_agrees_with_a_scan(&stack, &probed_ids());
+    assert_eq!(stack.position_of(&known::METAR), None);
+}
+
+/// **`adopt`** — the layer-link sync's whole-stack copy, which replaces the
+/// slots wholesale from another pane.
+#[test]
+fn the_index_survives_an_adopt() {
+    let mut source = LayerStack::default();
+    source.push(slot(known::LIGHTNING));
+    source.push(slot(known::GMGSI));
+
+    let mut stack = LayerStack::default();
+    stack.push(slot(known::METAR));
+    assert_eq!(stack.position_of(&known::METAR), Some(0));
+    stack.adopt(&source);
+    index_agrees_with_a_scan(&stack, &probed_ids());
+    assert_eq!(stack.position_of(&known::METAR), None);
+    assert_eq!(stack.position_of(&known::GMGSI), Some(1));
+}
+
+/// **`DerefMut`** — the escape hatch, and the reason the invalidation is a
+/// property of the door rather than a list of call sites.
+///
+/// `&mut [LayerSlot]` cannot insert or remove, so a reviewer reading the
+/// mutation methods alone would conclude the index is safe. It can *reorder*,
+/// and it can rewrite a slot's `id` in place, and either one moves the mapping
+/// this index holds. Nothing in the crate does so today; the point is that
+/// nothing has to remember not to.
+#[test]
+fn the_index_survives_a_reorder_through_the_mutable_slice() {
+    let mut stack = LayerStack::default();
+    stack.push(slot(known::METAR));
+    stack.push(slot(known::NWS_ALERTS));
+    assert_eq!(stack.position_of(&known::METAR), Some(0));
+    stack.swap(0, 1);
+    index_agrees_with_a_scan(&stack, &probed_ids());
+    assert_eq!(stack.position_of(&known::METAR), Some(1));
+}
+
+/// The other half of the same escape hatch: an id rewritten in place, so the
+/// stack holds a layer the index has never heard of and no longer holds one it
+/// has.
+#[test]
+fn the_index_survives_an_id_rewritten_through_the_mutable_slice() {
+    let mut stack = LayerStack::default();
+    stack.push(slot(known::METAR));
+    stack.push(slot(known::NWS_ALERTS));
+    // Builds the index and leaves position 0 remembered. The slot rewritten
+    // below is the OTHER one, so the memo cannot answer for it and the
+    // fingerprint list is the only thing standing between the question and a
+    // wrong answer.
+    assert_eq!(stack.position_of(&known::METAR), Some(0));
+    stack[1].id = known::GMGSI;
+    index_agrees_with_a_scan(&stack, &probed_ids());
+    assert_eq!(stack.position_of(&known::NWS_ALERTS), None);
+    assert_eq!(
+        stack.position_of(&known::GMGSI),
+        Some(1),
+        "a layer arrived by having its id written in place, and the index has \
+         never heard of it",
+    );
+}
+
+/// **A fingerprint rejects but never accepts.** Two ids sharing a length and
+/// their first, middle and last byte are the same fingerprint and different
+/// layers, and the index must still tell them apart — which it does by
+/// confirming every candidate with a full comparison before returning it.
+#[test]
+fn two_ids_with_the_same_fingerprint_are_still_told_apart() {
+    // Same length (5), same first byte, same middle byte, same last byte.
+    let a = LayerId::new("axbxc");
+    let b = LayerId::new("aybxc");
+    let mut stack = LayerStack::default();
+    stack.push(slot(a.clone()));
+    stack.push(slot(b.clone()));
+    assert_eq!(stack.position_of(&a), Some(0));
+    assert_eq!(stack.position_of(&b), Some(1));
+    assert_eq!(stack.position_of(&LayerId::new("azbxc")), None);
+}
+
+/// **The memo is a shortcut, never an answer.** The walk asks the pane three
+/// or four questions about the same layer in a row, so the resolver remembers
+/// the last position it returned — and a remembered position that has stopped
+/// being right must fall through to the scan rather than be believed.
+#[test]
+fn the_remembered_position_is_confirmed_before_it_is_believed() {
+    let mut stack = LayerStack::default();
+    stack.push(slot(known::METAR));
+    stack.push(slot(known::NWS_ALERTS));
+    // Leaves METAR remembered at 0.
+    assert_eq!(stack.position_of(&known::METAR), Some(0));
+    stack.swap(0, 1);
+    assert_eq!(
+        stack.position_of(&known::METAR),
+        Some(1),
+        "the memo answered from the position METAR held before the swap",
+    );
+}

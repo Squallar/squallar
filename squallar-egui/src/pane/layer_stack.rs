@@ -28,6 +28,86 @@ use squallar_source::id::LayerId;
 
 use super::LayerSlot;
 
+/// **What this pane pays to find out *where* a layer sits in its own stack** —
+/// the `slot lookups` family, always on and thread-local.
+///
+/// The sibling of
+/// [`lookup_ledger`](squallar_overlays::render::overlay_state::lookup_ledger),
+/// which prices the same question asked of the *registry*. Three quantities
+/// with three different denominators, never added:
+///
+/// - a **lookup** is one `&LayerId -> Option<usize>` resolution asked of
+///   [`LayerStack::position_of`]. Every `PaneState::slot`, `slot_mut`,
+///   `layer_ref`, `is_overlay_enabled`, `layer_opacity`, `time_state` and
+///   `PaneView::layer` is one, so this counts the walk's *questions of the
+///   pane*.
+/// - a **mark** is one 8-byte fingerprint compared while answering one. The
+///   fingerprints are a dense `Vec<u64>` beside the slot list, so a mark is a
+///   register compare over a contiguous array rather than a stride over a
+///   `LayerSlot`.
+/// - a **compare** is one full `LayerId == LayerId`, which is the string
+///   compare the scan used to do per slot. A fingerprint can reject but never
+///   accept, so every answer this returns has been confirmed by one of these,
+///   and **`compares / lookups` is 1.00 on a hit and 0 on a miss** — never the
+///   list's length.
+///
+/// Thread-local rather than atomic, for the reason the registry's is: the walk
+/// runs on the frame thread and a `lock xadd` per mark would cost more than the
+/// mark. A reader sees **its own thread's** figures.
+///
+/// **What the counting costs**, since a ledger with no figure for itself is the
+/// defect it exists to find: one thread-local read-modify-write per *lookup* —
+/// not per mark and not per counter, because the three numbers share one
+/// `Cell`. The marks and compares of a whole scan are summed in registers and
+/// handed over once.
+pub mod slot_ledger {
+    use std::cell::Cell;
+
+    /// The three counters, in one cell so one TLS access reaches all of them.
+    #[derive(Clone, Copy, Default)]
+    struct Counts {
+        lookups: u64,
+        marks: u64,
+        compares: u64,
+    }
+
+    thread_local! {
+        static COUNTS: Cell<Counts> = const {
+            Cell::new(Counts {
+                lookups: 0,
+                marks: 0,
+                compares: 0,
+            })
+        };
+    }
+
+    /// One resolution, having compared `marks` fingerprints and made
+    /// `compares` full id comparisons doing it.
+    pub(super) fn note(marks: u64, compares: u64) {
+        COUNTS.with(|c| {
+            let mut counts = c.get();
+            counts.lookups = counts.lookups.wrapping_add(1);
+            counts.marks = counts.marks.wrapping_add(marks);
+            counts.compares = counts.compares.wrapping_add(compares);
+            c.set(counts);
+        });
+    }
+
+    /// `(lookups, marks, compares)` on **this thread** since the last
+    /// [`reset`].
+    pub fn read() -> (u64, u64, u64) {
+        COUNTS.with(|c| {
+            let counts = c.get();
+            (counts.lookups, counts.marks, counts.compares)
+        })
+    }
+
+    /// Zero this thread's three counters.
+    pub fn reset() {
+        COUNTS.with(|c| c.set(Counts::default()));
+    }
+}
+
 /// **A layer this pane used to hold and no longer does**, with what it held.
 ///
 /// Two facts, and both are load-bearing:
@@ -64,25 +144,187 @@ pub struct RemovedLayer {
 /// reading the stack was never the problem.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct LayerStack {
-    slots: Vec<LayerSlot>,
+    slots: guarded::Slots,
     /// Ids this pane has excluded, in removal order. Not a `HashSet`: it
     /// persists, and a set would write a different file on every save.
     removed: Vec<RemovedLayer>,
 }
 
+/// **The slot list and its position index, behind a wall the rest of this file
+/// cannot reach over.**
+///
+/// The index answers "where does `id` sit" without striding the slot list, and
+/// a *stale* one is a wrong answer rather than a slow one — so the thing that
+/// must be true is not "every mutation site remembers to invalidate" but "no
+/// mutation site can fail to". Both fields are private **to this module**, so
+/// the only way any code outside it — including the rest of `LayerStack` —
+/// can touch a slot mutably is [`Slots::as_mut`], and that invalidates on the
+/// way through. A door that has not been written yet invalidates too.
+///
+/// The index is a `Vec<u64>` of **fingerprints**, one per slot, rebuilt lazily
+/// on the first read after an invalidation. A fingerprint packs the id's
+/// length and its first, middle and last byte, so it can *reject* a candidate
+/// without touching the string but can never *accept* one: every position this
+/// returns has been confirmed by a full `LayerId` comparison. That is the
+/// whole saving — the scan that used to make N string comparisons over a
+/// `LayerSlot`-strided list now makes N register comparisons over 8-byte
+/// elements and exactly one string comparison.
+///
+/// **What a rebuild costs**, because an index whose maintenance is unpriced is
+/// the optimisation this campaign keeps finding: one pass over the slots, four
+/// byte loads each, into a `Vec` whose allocation is reused. At the eighteen
+/// slots the shipped registry fills that is one of the scans it replaces, and
+/// the walk makes scores of them between mutations.
+mod guarded {
+    use std::cell::{Cell, RefCell};
+
+    use squallar_source::id::LayerId;
+
+    use super::LayerSlot;
+    use super::slot_ledger;
+
+    /// No slot remembered — [`Slots::last`]'s empty value.
+    const NO_SLOT: usize = usize::MAX;
+
+    pub(super) struct Slots {
+        slots: Vec<LayerSlot>,
+        /// One fingerprint per slot, in `slots`' own order. Meaningful only
+        /// while `fresh`.
+        marks: RefCell<Vec<u64>>,
+        /// Whether `marks` describes `slots` as it stands.
+        fresh: Cell<bool>,
+        /// **The position the last lookup resolved to**, or [`NO_SLOT`].
+        ///
+        /// The walk asks the pane three or four questions about the *same*
+        /// layer in a row — enabled, then opacity, then its `PaneRef`, then
+        /// its texture — so a one-entry memo answers most lookups with a
+        /// single comparison and no scan at all. Self-verifying: the id at
+        /// the remembered position is compared before it is believed, so the
+        /// memo can only ever be a shortcut, never an answer.
+        last: Cell<usize>,
+    }
+
+    /// A dense stand-in for one id: its length and its first, middle and last
+    /// byte. Rejects on any of the four differing; accepts nothing on its own.
+    fn mark(id: &LayerId) -> u64 {
+        let bytes = id.as_str().as_bytes();
+        let len = bytes.len();
+        ((len as u64) << 32)
+            | (u64::from(bytes.first().copied().unwrap_or(0)) << 16)
+            | (u64::from(bytes.get(len / 2).copied().unwrap_or(0)) << 8)
+            | u64::from(bytes.last().copied().unwrap_or(0))
+    }
+
+    impl Slots {
+        pub(super) fn from_vec(slots: Vec<LayerSlot>) -> Self {
+            Self {
+                slots,
+                marks: RefCell::new(Vec::new()),
+                fresh: Cell::new(false),
+                last: Cell::new(NO_SLOT),
+            }
+        }
+
+        pub(super) fn as_slice(&self) -> &[LayerSlot] {
+            &self.slots
+        }
+
+        /// **The one mutable door.** Every structural change and every element
+        /// rewrite in this crate reaches the slots through here, and the index
+        /// is dropped on the way in — before the caller has had a chance to
+        /// move anything.
+        pub(super) fn as_mut(&mut self) -> &mut Vec<LayerSlot> {
+            self.fresh.set(false);
+            self.last.set(NO_SLOT);
+            &mut self.slots
+        }
+
+        /// Where `id` sits, or `None` for an id this stack does not hold —
+        /// [`Iterator::position`]'s answer, by construction: the first
+        /// confirmed match wins.
+        pub(super) fn position_of(&self, id: &LayerId) -> Option<usize> {
+            // The memo, checked before anything is built. One comparison, and
+            // it is the same comparison the scan would have ended on.
+            let remembered = self.last.get();
+            if let Some(slot) = self.slots.get(remembered)
+                && slot.id == *id
+            {
+                slot_ledger::note(0, 1);
+                return Some(remembered);
+            }
+            let wanted = mark(id);
+            let mut marks = self.marks.borrow_mut();
+            if !self.fresh.get() {
+                marks.clear();
+                marks.extend(self.slots.iter().map(|slot| mark(&slot.id)));
+                self.fresh.set(true);
+            }
+            let mut scanned = 0u64;
+            let mut compares = 0u64;
+            let mut found = None;
+            for (idx, held) in marks.iter().enumerate() {
+                scanned += 1;
+                if *held == wanted {
+                    compares += 1;
+                    if self.slots[idx].id == *id {
+                        found = Some(idx);
+                        break;
+                    }
+                }
+            }
+            slot_ledger::note(scanned, compares);
+            if let Some(idx) = found {
+                self.last.set(idx);
+            }
+            found
+        }
+    }
+
+    /// **The index is derived state and never travels.** A clone comes up with
+    /// nothing built, because a clone's `marks` would describe the original's
+    /// slots and the first read rebuilds them anyway.
+    impl Clone for Slots {
+        fn clone(&self) -> Self {
+            Self::from_vec(self.slots.clone())
+        }
+    }
+
+    /// Derived state again: two stacks holding the same slots are the same
+    /// stack, whether or not either has built its index.
+    impl PartialEq for Slots {
+        fn eq(&self, other: &Self) -> bool {
+            self.slots == other.slots
+        }
+    }
+
+    impl std::fmt::Debug for Slots {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.slots.fmt(f)
+        }
+    }
+
+    impl Default for Slots {
+        fn default() -> Self {
+            Self::from_vec(Vec::new())
+        }
+    }
+}
+
 impl Deref for LayerStack {
     type Target = [LayerSlot];
     fn deref(&self) -> &[LayerSlot] {
-        &self.slots
+        self.slots.as_slice()
     }
 }
 
 /// Mutable **element** access, not mutable *structure* access: `&mut [T]` can
 /// reorder and rewrite slots but cannot insert or remove one, so the curation
-/// invariant stays behind the methods below.
+/// invariant stays behind the methods below. It **can** move an id, which is
+/// why it goes through [`guarded::Slots::as_mut`] like everything else and
+/// drops the position index on the way.
 impl DerefMut for LayerStack {
     fn deref_mut(&mut self) -> &mut [LayerSlot] {
-        &mut self.slots
+        self.slots.as_mut()
     }
 }
 
@@ -90,7 +332,7 @@ impl<'a> IntoIterator for &'a LayerStack {
     type Item = &'a LayerSlot;
     type IntoIter = std::slice::Iter<'a, LayerSlot>;
     fn into_iter(self) -> Self::IntoIter {
-        self.slots.iter()
+        self.slots.as_slice().iter()
     }
 }
 
@@ -98,7 +340,7 @@ impl<'a> IntoIterator for &'a mut LayerStack {
     type Item = &'a mut LayerSlot;
     type IntoIter = std::slice::IterMut<'a, LayerSlot>;
     fn into_iter(self) -> Self::IntoIter {
-        self.slots.iter_mut()
+        self.slots.as_mut().iter_mut()
     }
 }
 
@@ -107,14 +349,17 @@ impl LayerStack {
     /// has excluded nothing either; keeping the tombstones would make the next
     /// reconcile refuse to fill an empty pane.
     pub fn clear(&mut self) {
-        self.slots.clear();
+        self.slots.as_mut().clear();
         self.removed.clear();
     }
 
     /// A stack from a config file: the slots it named, and the removals it
     /// recorded.
     pub fn from_parts(slots: Vec<LayerSlot>, removed: Vec<RemovedLayer>) -> Self {
-        Self { slots, removed }
+        Self {
+            slots: guarded::Slots::from_vec(slots),
+            removed,
+        }
     }
 
     /// The tombstones, for the save path.
@@ -129,7 +374,19 @@ impl LayerStack {
 
     /// Whether this pane holds a slot for `id` at all.
     pub fn holds(&self, id: &LayerId) -> bool {
-        self.slots.iter().any(|slot| slot.id == *id)
+        self.position_of(id).is_some()
+    }
+
+    /// **Where `id` sits in this stack**, or `None` for an id it does not
+    /// hold — the one resolver. [`PaneState::slot`] and [`PaneState::slot_mut`]
+    /// are both this plus an index, so a shared and a mutable lookup cannot
+    /// disagree about which slot an id names and
+    /// [`slot_ledger`] counts each of them exactly once.
+    ///
+    /// [`PaneState::slot`]: super::PaneState::slot
+    /// [`PaneState::slot_mut`]: super::PaneState::slot_mut
+    pub fn position_of(&self, id: &LayerId) -> Option<usize> {
+        self.slots.position_of(id)
     }
 
     /// **The reconcile rule, in one place: may a registered handler join this
@@ -154,13 +411,15 @@ impl LayerStack {
     /// Push a slot onto the top of the stack.
     pub fn push(&mut self, slot: LayerSlot) {
         self.clear_tombstone(&slot.id);
-        self.slots.push(slot);
+        self.slots.as_mut().push(slot);
     }
 
     /// Insert a slot at `pos`, bottom-relative.
     pub fn insert(&mut self, pos: usize, slot: LayerSlot) {
         self.clear_tombstone(&slot.id);
-        self.slots.insert(pos.min(self.slots.len()), slot);
+        let slots = self.slots.as_mut();
+        let at = pos.min(slots.len());
+        slots.insert(at, slot);
     }
 
     /// Take the slots out for a whole-list rewrite, leaving the tombstones
@@ -169,7 +428,7 @@ impl LayerStack {
     ///
     /// [`PaneState::set_draw_order`]: super::PaneState::set_draw_order
     pub fn take_slots(&mut self) -> Vec<LayerSlot> {
-        std::mem::take(&mut self.slots)
+        std::mem::take(self.slots.as_mut())
     }
 
     /// Put a rewritten slot list back. Any id in it that carried a tombstone
@@ -179,7 +438,7 @@ impl LayerStack {
         for slot in &slots {
             self.clear_tombstone(&slot.id);
         }
-        self.slots = slots;
+        *self.slots.as_mut() = slots;
     }
 
     /// **Curate `id` out of this pane**, keeping what it held.
@@ -191,8 +450,8 @@ impl LayerStack {
     ///
     /// [`PaneState::remove_layer`]: super::PaneState::remove_layer
     pub fn take_out(&mut self, id: &LayerId) -> Option<LayerSlot> {
-        let pos = self.slots.iter().position(|slot| slot.id == *id)?;
-        let slot = self.slots.remove(pos);
+        let pos = self.position_of(id)?;
+        let slot = self.slots.as_mut().remove(pos);
         self.clear_tombstone(&slot.id);
         self.removed.push(RemovedLayer {
             id: slot.id.clone(),
@@ -233,7 +492,7 @@ impl LayerStack {
     /// removals would hand the destination pane every removed layer back on
     /// its next reconcile.
     pub fn adopt(&mut self, other: &LayerStack) {
-        self.slots = other.slots.clone();
+        *self.slots.as_mut() = other.slots.as_slice().to_vec();
         self.removed = other.removed.clone();
     }
 }

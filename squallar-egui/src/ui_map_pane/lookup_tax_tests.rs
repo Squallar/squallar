@@ -21,7 +21,7 @@
 //! nothing here is a frame figure.
 
 use super::*;
-use crate::pane::PaneState;
+use crate::pane::{PaneState, slot_ledger};
 use squallar_overlays::render::overlay_state::{OverlayRegistry, lookup_ledger};
 
 /// **The measured number of registry lookups one walk over an all-layers pane
@@ -32,13 +32,29 @@ use squallar_overlays::render::overlay_state::{OverlayRegistry, lookup_ledger};
 /// for, not one that lands quietly.
 const LOOKUPS_PER_WALK_CEILING: u64 = 87;
 
-/// The three ledger figures one walk over a pane with `panes` panes' worth of
-/// walks costs: `(lookups, probes, vcalls)`.
+/// **The measured number of full `LayerId` comparisons one walk over an
+/// all-layers pane makes asking its own pane where a layer sits** — the other
+/// half of the same tax, and until the index below it was the larger half.
+///
+/// A ceiling in the same shape as [`LOOKUPS_PER_WALK_CEILING`], and it is set
+/// at the number of *lookups* rather than at a scan's length on purpose: a
+/// resolver that confirms exactly one candidate per question makes one of
+/// these per hit and none per miss, so anything above the lookup count is a
+/// scan that has come back.
+const SLOT_COMPARES_PER_LOOKUP_CEILING: f64 = 1.0;
+
+/// The two ledgers' figures for one walk over a pane with `panes` panes' worth
+/// of walks: `((lookups, probes, vcalls), (slot lookups, marks, compares))`.
+///
+/// The two halves have **different denominators and are never added**: the
+/// first is what the walk asks the *registry* (which handler is this id), the
+/// second what it asks the *pane* (where in my stack is this id). A frame pays
+/// both, per layer, per pane.
 ///
 /// One registry and one pane list for the whole run, built once and walked
 /// `panes` times, because that is what a frame does: `render_panes` loops the
 /// panes over one registry.
-fn walk_ledger(panes: usize) -> (u64, u64, u64) {
+fn walk_ledger(panes: usize) -> ((u64, u64, u64), (u64, u64, u64)) {
     let canvas = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
     let egui_ctx = egui::Context::default();
     let mut overlays = OverlayRegistry::with_handlers(crate::sources::all());
@@ -84,6 +100,7 @@ fn walk_ledger(panes: usize) -> (u64, u64, u64) {
     // `set_overlay_enabled` both ask the registry, and those are a config
     // load's cost, not a frame's.
     lookup_ledger::reset();
+    slot_ledger::reset();
     for (pane_idx, pane) in states.iter_mut().enumerate() {
         let mut ctx = PaneRenderCtx {
             admission_notice: None,
@@ -119,7 +136,7 @@ fn walk_ledger(panes: usize) -> (u64, u64, u64) {
         };
         render_pane_map_content(&mut ui, &projector, memory.zoom(), &mut ctx);
     }
-    let read = lookup_ledger::read();
+    let read = (lookup_ledger::read(), slot_ledger::read());
     let _ = egui_ctx.end_pass();
     read
 }
@@ -132,7 +149,7 @@ fn walk_ledger(panes: usize) -> (u64, u64, u64) {
 /// regression lands inside a pin.
 #[test]
 fn one_walk_over_every_layer_asks_the_registry_a_bounded_number_of_times() {
-    let (lookups, probes, vcalls) = walk_ledger(1);
+    let ((lookups, probes, vcalls), _) = walk_ledger(1);
     // Printed whether or not the assertion fires: the figure is the finding.
     eprintln!("one pane, every layer on: {lookups} lookups, {probes} probes, {vcalls} vcalls");
     assert!(
@@ -151,8 +168,8 @@ fn one_walk_over_every_layer_asks_the_registry_a_bounded_number_of_times() {
 /// nothing across panes.
 #[test]
 fn registry_lookups_scale_one_for_one_with_panes() {
-    let (one, one_probes, _) = walk_ledger(1);
-    let (six, six_probes, _) = walk_ledger(6);
+    let ((one, one_probes, _), _) = walk_ledger(1);
+    let ((six, six_probes, _), _) = walk_ledger(6);
     eprintln!("one pane {one} lookups / {one_probes} probes; six panes {six} / {six_probes}");
     assert_eq!(
         six,
@@ -176,12 +193,83 @@ fn registry_lookups_scale_one_for_one_with_panes() {
 /// scans by asking.
 #[test]
 fn registry_lookups_ask_no_handler_its_own_id() {
-    let (lookups, _, vcalls) = walk_ledger(1);
+    let ((lookups, _, vcalls), _) = walk_ledger(1);
     assert_eq!(
         vcalls, 0,
         "{lookups} lookups made {vcalls} `OverlayHandler::id` calls between \
          them. The resolver is asking each candidate handler its own identity \
          to answer a question the registry already knows the answer to."
+    );
+}
+
+/// **The other half of the same question, and the one nothing was counting.**
+///
+/// The registry answers "which handler is this id"; the pane answers "where in
+/// my stack is this id", and until the index landed it answered by the same
+/// linear scan — over `LayerSlot`s rather than over a flat id list, so each
+/// probe strode a whole slot struct to reach the `LayerId` at its front.
+///
+/// Printed whether or not it asserts, because the figure is the finding.
+#[test]
+fn one_walk_asks_its_own_pane_where_a_layer_is_more_often_than_it_asks_the_registry() {
+    let ((registry_lookups, registry_probes, _), (slot_lookups, marks, compares)) = walk_ledger(1);
+    eprintln!(
+        "one pane, every layer on: registry {registry_lookups} lookups / \
+         {registry_probes} probes; pane {slot_lookups} lookups / {marks} marks / \
+         {compares} compares"
+    );
+    assert!(
+        slot_lookups > 0,
+        "the walk asked its pane where a layer sits zero times, which means \
+         this instrument is not wired to the walk it claims to measure"
+    );
+}
+
+/// **A confirmed candidate per question, and no scan behind it.**
+///
+/// This is the gate on the index. A resolver that scans makes one full
+/// `LayerId` comparison per slot it strides past; one that indexes makes
+/// exactly one, on the candidate it is about to return, and none at all on a
+/// miss. So `compares <= lookups` is the property, and it reads red on any
+/// tree whose `PaneState::slot` is `self.layers.iter().find(..)`.
+#[test]
+fn the_pane_confirms_one_candidate_per_question_rather_than_scanning() {
+    let (_, (lookups, marks, compares)) = walk_ledger(1);
+    let per_lookup = compares as f64 / lookups as f64;
+    eprintln!(
+        "pane lookups {lookups}, marks {marks}, full id compares {compares} \
+         ({per_lookup:.2} per lookup)"
+    );
+    assert!(
+        per_lookup <= SLOT_COMPARES_PER_LOOKUP_CEILING,
+        "the walk made {compares} full `LayerId` comparisons over {lookups} \
+         questions ({per_lookup:.2} each, over the \
+         {SLOT_COMPARES_PER_LOOKUP_CEILING} an index makes). The pane is \
+         answering `where is this layer` by walking its slot list."
+    );
+}
+
+/// **The pane's half scales with panes exactly as the registry's does.**
+///
+/// Six panes is six times one, because a pane's stack is its own and nothing
+/// is shared across them — the same property
+/// `registry_lookups_scale_one_for_one_with_panes` pins on the other ledger,
+/// and it is pinned here too so that a future term shared between panes cannot
+/// appear on one side without the other noticing.
+#[test]
+fn pane_lookups_scale_one_for_one_with_panes() {
+    let (_, (one, one_marks, one_compares)) = walk_ledger(1);
+    let (_, (six, six_marks, six_compares)) = walk_ledger(6);
+    eprintln!(
+        "one pane {one} lookups / {one_marks} marks / {one_compares} compares; \
+         six panes {six} / {six_marks} / {six_compares}"
+    );
+    assert_eq!(
+        six,
+        one * 6,
+        "six panes asked their panes {six} times against one pane's {one}: the \
+         walk either gained a term six panes share or shed one, and either way \
+         the one-pane figures this campaign steers by no longer scale."
     );
 }
 
