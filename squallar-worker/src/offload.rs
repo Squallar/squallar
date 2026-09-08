@@ -1229,6 +1229,68 @@ pub fn deliver_encoded_reply(id: u64, reply: Option<(u8, Vec<u8>, Vec<Vec<u8>>)>
     deliver_job_reply(id, result);
 }
 
+/// Whether job `id`'s reply is a whole picture whose pixels a transport may
+/// materialise before they cross into this instance's memory.
+///
+/// Asked by the browser port BEFORE it copies anything, because the answer
+/// decides whether the picture is copied once into the buffer its consumer
+/// keeps or twice through a `Vec<u8>` of its own size. **The ROW answers, not
+/// this module**: which kinds carry a picture is a property of the pipeline
+/// that produces one, and a funnel that knew the list would be naming job
+/// kinds it has no business naming. `false` for an id with no pending job — an
+/// unknown reply is decoded the ordinary way and refused at the registry like
+/// any other late one.
+pub fn reply_is_raster(id: u64) -> bool {
+    pending().get(&id).is_some_and(|job| job.row.splits_pixels)
+}
+
+/// [`deliver_encoded_reply`] for a reply whose picture the transport LIFTED OUT
+/// of the head and materialised as pixels, rather than handing the head over
+/// whole.
+///
+/// `head` is the head with the picture's span removed; `picture` is what those
+/// bytes became, carried as [`squallar_source::job::PixelBuf`] so this crate
+/// moves a picture without naming a colour type or a pipeline's own buffer.
+/// The two are checked against each other by the row's decoder — the prefix
+/// states the span's length, and a transport that lifted the wrong one is
+/// refused there rather than putting a torn picture on a pane.
+///
+/// The same guard as [`deliver_encoded_reply`] and one more: the reply's tag
+/// must match the row recorded at dispatch, AND that row must declare it
+/// carries a liftable picture. A caller that took this path for any other row
+/// is a bug in the caller, so it is refused rather than decoded some other way.
+pub fn deliver_encoded_reply_split(
+    id: u64,
+    kind: u8,
+    head: Vec<u8>,
+    picture: squallar_source::job::PixelBuf,
+    tails: Vec<Vec<u8>>,
+) {
+    let row = pending().get(&id).map(|job| job.row);
+    let result = match row {
+        Some(row) if kind == wire_code(row) && row.splits_pixels => {
+            (row.decode_out_pixels)(&head, tails, picture)
+        }
+        Some(row) => {
+            log::error!(
+                "a worker answered job {id} with out-kind {kind} as a split \
+                 picture where the dispatched `{}` row's code is {} and it \
+                 {} a liftable picture; treating it as a failed job",
+                row.label,
+                wire_code(row),
+                if row.splits_pixels {
+                    "declares"
+                } else {
+                    "does not declare"
+                },
+            );
+            None
+        }
+        None => None,
+    };
+    deliver_job_reply(id, result);
+}
+
 /// How many jobs this thread's sink owes an answer for. For diagnostics and
 /// tests. Scoped to the sink rather than the process-wide registry, whose count
 /// would depend on what test runs beside it.

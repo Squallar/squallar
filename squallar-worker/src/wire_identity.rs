@@ -80,19 +80,30 @@ pub const WIRE_FRAMING_ROWS: &[&str] = &[
 /// asserts them, folded into the token beside the request rows.
 ///
 /// Re-pinned 2026-09-04 when a raster with no ink in it stopped putting its
-/// pixels on the wire. The reply gained a **pixels tag** — one byte, written
-/// after the cells block and immediately before the pixels — so the two
-/// painted rows each moved by one byte and both digests with them. The third
-/// row is the new form and the reason for the change: `blank` is a whole
-/// picture's answer in 6 bytes (cells tag, pixels tag, and the `u32` length
-/// the picture would have had), against the 17 the same 16-byte fixture costs
-/// painted. At the sizes measured on the Tier-2 legs that is 8.26 MB (Chromium)
-/// and 8.92 MB (Firefox) of pixels not sent, per blank reply — two targets,
-/// never added.
+/// pixels on the wire. The reply gained a **pixels tag** — one byte — so the
+/// two painted rows each moved by one byte and both digests with them. The
+/// third row is the form that change added: `blank` is a whole picture's
+/// answer in 6 bytes, against the 17 the same 16-byte fixture costs painted.
+/// At the sizes measured on the Tier-2 legs that is 8.26 MB (Chromium) and
+/// 8.92 MB (Firefox) of pixels not sent, per blank reply — two targets, never
+/// added.
+///
+/// **Re-pinned again 2026-09-08, and this one MOVED BYTES ON PURPOSE.** The
+/// pixels block was hoisted in front of the cells block and given an explicit
+/// `u32` length, so the picture now starts at a constant offset of five and the
+/// browser transport can copy it straight into the `Vec<Color32>` its consumer
+/// keeps instead of through a `Vec<u8>` of its own size — two full-size buffers
+/// live at once, measured at 75.4 MiB for one picture, of which this removes
+/// one. Both painted rows grew by exactly the four bytes of that length; the
+/// blank row is unchanged at 6, because a blank already wrote a tag and a `u32`
+/// and only their order moved. **Re-pinning here is the sanctioned response to
+/// a deliberate framing change and nothing else**: the row feeds the local
+/// build token, so two builds with different framings refuse each other and
+/// respawn rather than exchanging a reply either would misread.
 pub const WIRE_REPLY_ROWS: &[&str] = &[
-    "bare | 18 | 0x93c5c4df6ea1a99a",
-    "cells | 70 | 0xc4b06c5559789a91",
-    "blank | 6 | 0xd78fbd7f8cf93a4d",
+    "bare | 22 | 0x2a894fce9e16cbd4",
+    "cells | 74 | 0xed8f0851ce2dd001",
+    "blank | 6 | 0x0cf6ca5254a6cb0d",
 ];
 
 /// The 6 frame-reply framing rows, exactly as

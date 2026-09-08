@@ -105,6 +105,49 @@ pub trait JobOut: std::fmt::Debug + Send + 'static {
     fn discard_blank_rasters(&mut self) {}
 }
 
+/// One rasterized picture, owned, in a form this crate can name without naming
+/// a colour type.
+///
+/// **Four-byte texels, 4-aligned by construction, and deliberately `u32`.** The
+/// element type is not a colour and nothing on this floor interprets it: the
+/// funnel only carries the buffer from the transport that filled it to the
+/// codec row that decodes it. What matters is that it is the SAME size and
+/// alignment as the consumer's pixel type, so the picture reaches that consumer
+/// **by move** — a `Vec` is freed with the `Layout` it was taken with, so a
+/// buffer of the wrong alignment could never become one at any price, and that
+/// is the whole reason this type exists rather than a `Vec<u8>`.
+///
+/// `u32` and not a newtype, because a newtype would have to be `bytemuck::Pod`
+/// for the cast at the far end to be provably allocation-preserving, and
+/// `bytemuck` is a dependency this crate does not have. `u32` is already `Pod`,
+/// already 4/4, and costs nothing. `squallar_overlays::render::raster_buf`
+/// proves the round trip keeps the pointer and the capacity.
+/// [`JobCodec::decode_out_pixels`]'s shape: the head with the picture's span
+/// removed, the row's tails, and the picture the transport already lifted out.
+///
+/// Named for the same reason [`DecodeResident`] is — a bare function pointer
+/// with three arguments and an erased return reads as noise in the row.
+pub type DecodeOutPixels = fn(&[u8], Vec<Vec<u8>>, PixelBuf) -> Option<DescribedOut>;
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PixelBuf(Vec<u32>);
+
+impl PixelBuf {
+    pub fn from_words(words: Vec<u32>) -> Self {
+        Self(words)
+    }
+
+    pub fn into_words(self) -> Vec<u32> {
+        self.0
+    }
+
+    /// How many bytes the picture is — four per texel, which is the figure the
+    /// wire states and the decoder checks against.
+    pub fn bytes(&self) -> usize {
+        self.0.len() * 4
+    }
+}
+
 #[derive(Debug)]
 pub struct DescribedOut(pub Box<dyn JobOut>);
 
@@ -303,6 +346,12 @@ pub struct JobCodec {
     /// Reply-direction decoder; the `Option` is the decode failing, never
     /// absence. Takes the tails **by value** so a decoder can ADOPT a buffer.
     pub decode_out: fn(&[u8], Vec<Vec<u8>>) -> Option<DescribedOut>,
+    /// [`JobOutCodec::SPLITS_PIXELS`], so a transport can ask the row rather
+    /// than knowing which crate the row came from.
+    pub splits_pixels: bool,
+    /// [`JobOutCodec::decode_out_pixels`], erased. Reached only when
+    /// [`Self::splits_pixels`] is true.
+    pub decode_out_pixels: DecodeOutPixels,
     pub cost: JobCost,
 }
 
@@ -361,6 +410,31 @@ pub trait JobSpec: 'static {
 pub trait JobOutCodec: JobSpec {
     fn encode_out(v: Self::Out, head: &mut Vec<u8>, tails: &mut Vec<Vec<u8>>);
     fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<Self::Out>;
+
+    /// Whether this row's reply carries a whole picture at a constant offset in
+    /// its head, which a transport may lift out and materialise **before** it
+    /// copies anything.
+    ///
+    /// Defaulted `false`, so a row says nothing about pixels unless it has
+    /// some. The transport asks this through the funnel and takes the ordinary
+    /// whole-head route when it is false.
+    const SPLITS_PIXELS: bool = false;
+
+    /// [`Self::decode_out`] for a reply whose picture the transport already
+    /// lifted out: `head` is the head with the picture's span removed, and
+    /// `pixels` is what those bytes became.
+    ///
+    /// Defaulted to refusing, because a row that declares no picture cannot be
+    /// handed one — a caller that routed here for such a row is a bug in the
+    /// caller, and answering `None` fails that job rather than decoding it some
+    /// other way.
+    fn decode_out_pixels(
+        _head: &[u8],
+        _tails: Vec<Vec<u8>>,
+        _pixels: PixelBuf,
+    ) -> Option<Self::Out> {
+        None
+    }
 }
 
 impl JobCodec {
@@ -378,6 +452,8 @@ impl JobCodec {
             decode_resident: decode_resident_shim::<S>,
             encode_out: encode_out_shim::<S>,
             decode_out: decode_out_shim::<S>,
+            splits_pixels: S::SPLITS_PIXELS,
+            decode_out_pixels: decode_out_pixels_shim::<S>,
             cost: S::COST,
         }
     }
@@ -459,6 +535,15 @@ fn encode_out_shim<S: JobOutCodec>(v: DescribedOut, head: &mut Vec<u8>, tails: &
 
 fn decode_out_shim<S: JobOutCodec>(head: &[u8], tails: Vec<Vec<u8>>) -> Option<DescribedOut> {
     let v = S::decode_out(head, tails)?;
+    Some(DescribedOut(Box::new(v)))
+}
+
+fn decode_out_pixels_shim<S: JobOutCodec>(
+    head: &[u8],
+    tails: Vec<Vec<u8>>,
+    pixels: PixelBuf,
+) -> Option<DescribedOut> {
+    let v = S::decode_out_pixels(head, tails, pixels)?;
     Some(DescribedOut(Box::new(v)))
 }
 

@@ -2,6 +2,7 @@
 //! producer wrote it in.
 
 use ecolor::Color32;
+use squallar_source::job::PixelBuf;
 
 /// One rasterized picture's buffer: RGBA bytes, or the same bytes already in
 /// the element type an `egui::ColorImage` holds.
@@ -39,6 +40,18 @@ impl RasterBuf {
     /// The picture with no bytes in it, which is what a settled blank holds.
     pub const fn empty() -> Self {
         Self::Bytes(Vec::new())
+    }
+
+    /// A picture of `pixels` transparent pixels, for a caller that is about to
+    /// overwrite every one of them through [`Self::as_mut_bytes`].
+    ///
+    /// **The one way a transport can allocate this arm without naming
+    /// [`Color32`].** The browser port copies a reply's picture straight into
+    /// the byte view of one of these and never depends on `ecolor` to do it, so
+    /// the element type stays this type's own business — which is the whole
+    /// reason the arm can exist above a crate that does not draw.
+    pub fn transparent(pixels: usize) -> Self {
+        Self::Pixels(vec![Color32::TRANSPARENT; pixels])
     }
 
     /// **The wire's picture, born as pixels.** The reply's premultiplied RGBA
@@ -93,6 +106,32 @@ impl RasterBuf {
             Self::Bytes(bytes) => bytes,
             Self::Pixels(pixels) => bytemuck::cast_slice_mut(pixels),
         }
+    }
+
+    /// **The wire's carrier, and back, both by move.** `squallar_source`'s
+    /// [`PixelBuf`] is a `Vec<u32>`: the same size and the same alignment as
+    /// `Color32`, so `bytemuck` re-labels the allocation instead of copying it.
+    /// That is what lets the funnel carry a picture without naming a colour
+    /// type, and it is proved rather than asserted — see
+    /// `a_wire_round_trip_keeps_the_same_allocation` in this module's tests.
+    ///
+    /// The `expect` cannot fire: it needs `Color32` to stop being four bytes at
+    /// four-byte alignment, which that test fails on first. A fallback copy
+    /// here would be worse than a panic — it would silently reintroduce the
+    /// second full-size buffer this whole path exists to remove.
+    pub fn into_wire(self) -> PixelBuf {
+        PixelBuf::from_words(
+            bytemuck::allocation::try_cast_vec(self.into_pixels())
+                .expect("Color32 and u32 are both 4 bytes at 4-byte alignment"),
+        )
+    }
+
+    /// [`Self::into_wire`] reversed, on the same terms.
+    pub fn from_wire(wire: PixelBuf) -> Self {
+        Self::Pixels(
+            bytemuck::allocation::try_cast_vec(wire.into_words())
+                .expect("Color32 and u32 are both 4 bytes at 4-byte alignment"),
+        )
     }
 
     /// **The move this type exists for.** A `Pixels` buffer becomes the

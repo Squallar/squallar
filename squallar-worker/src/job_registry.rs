@@ -2,8 +2,9 @@
 //! the source crates' registries.
 
 /// Every codec row this build composes, in order: the six radar rows
-/// (radar, level3, level3/vild, section, voxels, decode), then the seven
-/// overlay rows (sites, alerts, outlooks, discussions, reports, glm, model),
+/// (radar, level3, level3/vild, section, voxels, decode), then the eight
+/// overlay rows (sites, alerts, outlooks, discussions, reports, glm, model,
+/// metar),
 /// then the one elevation row (terrain/heights), then the one buildings row
 /// (buildings/prisms), then the one basemap row (basemap/tiles). Wire codes
 /// are indices into this composition plus one (1..=16, 0 unallocated so a

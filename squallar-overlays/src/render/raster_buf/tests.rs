@@ -106,3 +106,45 @@ fn an_empty_buffer_has_no_bytes_and_no_pixels() {
     assert!(empty.as_bytes().is_empty());
     assert!(empty.into_pixels().is_empty());
 }
+
+/// **The proof `into_wire`/`from_wire` rest on.** The funnel carries a picture
+/// as `squallar_source::job::PixelBuf` so it never names a colour type; that is
+/// only free if the round trip is a re-label of one allocation rather than two
+/// copies. Pointer and capacity, in BOTH directions, plus the size/alignment
+/// equality the cast needs — because if that equality ever stops holding, the
+/// `expect`s in those two methods are what fires, and this is the test that
+/// says so first.
+#[test]
+fn a_wire_round_trip_keeps_the_same_allocation() {
+    assert_eq!(
+        (
+            std::mem::size_of::<Color32>(),
+            std::mem::align_of::<Color32>()
+        ),
+        (std::mem::size_of::<u32>(), std::mem::align_of::<u32>()),
+        "Color32 and u32 have stopped agreeing on size or alignment, so the \
+         wire carrier can no longer re-label the picture and must copy it",
+    );
+
+    let pixels = sample_pixels();
+    let addr = pixels.as_ptr() as usize;
+    let cap = pixels.capacity();
+
+    let wire = RasterBuf::Pixels(pixels).into_wire();
+    let back = RasterBuf::from_wire(wire);
+    let RasterBuf::Pixels(round_tripped) = &back else {
+        panic!("from_wire did not produce a Pixels arm");
+    };
+    assert_eq!(
+        round_tripped.as_ptr() as usize,
+        addr,
+        "the wire round trip reallocated the picture; the funnel would be \
+         copying every raster it carries",
+    );
+    assert_eq!(
+        round_tripped.capacity(),
+        cap,
+        "the same allocation keeps its capacity"
+    );
+    assert_eq!(back, RasterBuf::Pixels(sample_pixels()), "the bytes moved");
+}

@@ -360,29 +360,10 @@ fn deliver(worker: &web_sys::Worker, data: &JsValue) {
     };
     let loan = proto::loan_field(data);
 
-    let mut moved = 0usize;
-    let mut copied_at_worker = 0usize;
-    // **Nanoseconds, not the microseconds the send direction accumulates in.**
-    // A reply is one head and zero or more tails, and a tail can be a few
-    // hundred bytes; a per-call truncation to whole microseconds would report
-    // zero for a hundred of those and understate the total by the whole of the
-    // small end.
-    let mut copy_ns = 0u64;
-    // Counting and copying are ONE step, so a buffer cannot be counted into
-    // `moved` and copied outside the clock — which is what a separate `count`
-    // made easy.
-    let mut take = |array: &js_sys::Uint8Array| {
-        let len = array.length() as usize;
-        moved += len;
-        if !crate::shared_loan::is_foreign_shared(array) {
-            copied_at_worker += len;
-        }
-        note_block(len);
-        let start = web_time::Instant::now();
-        let bytes = array.to_vec();
-        copy_ns += ns(start, web_time::Instant::now());
-        bytes
-    };
+    // Whether this job's reply is a whole picture, asked BEFORE anything is
+    // copied because the answer decides how it is copied. See [`Pull::split`].
+    let raster = offload::reply_is_raster(id as u64);
+    let mut pull = Pull::default();
 
     let reply = (|| {
         // Undefined as well as null: `post_result` writes an explicit null on
@@ -393,7 +374,17 @@ fn deliver(worker: &web_sys::Worker, data: &JsValue) {
             .and_then(|v| v.as_f64())
             .map(|v| v as u8)?;
         let out = out.dyn_into::<js_sys::Uint8Array>().ok()?;
-        let head = take(&out);
+        // A raster row's picture is lifted straight into the element type its
+        // consumer keeps; every other row's head is copied whole, exactly as
+        // before. `None` from `split` is "this head has no liftable span" — a
+        // blank, or a prefix that does not describe one — and falls back rather
+        // than failing, because a head the transport cannot split is still a
+        // head the row's own decoder reads.
+        let split = if raster { pull.split(&out) } else { None };
+        let (head, picture) = match split {
+            Some((head, picture)) => (head, Some(picture)),
+            None => (pull.whole(&out), None),
+        };
         // TAILS null or absent reads as no tails.
         let tails = match proto::field(data, proto::TAILS).filter(|v| !v.is_null()) {
             None => Vec::new(),
@@ -403,12 +394,15 @@ fn deliver(worker: &web_sys::Worker, data: &JsValue) {
                 for tail in array.iter() {
                     // The same checked cast per tail — one copy each.
                     let tail = tail.dyn_into::<js_sys::Uint8Array>().ok()?;
-                    tails.push(take(&tail));
+                    tails.push(pull.whole(&tail));
                 }
                 tails
             }
         };
-        Some((kind, head, tails))
+        Some(match picture {
+            Some(picture) => Reply::Split(kind, head, picture, tails),
+            None => Reply::Whole(kind, head, tails),
+        })
     })();
 
     // **Before** `deliver_encoded_reply`, which runs the caller's delivery and
@@ -424,13 +418,135 @@ fn deliver(worker: &web_sys::Worker, data: &JsValue) {
     // runs the row's decode and the caller's delivery inline, so on this
     // target the whole of it is page-main-thread time between two frames.
     let deliver_start = web_time::Instant::now();
-    offload::deliver_encoded_reply(id as u64, reply);
+    match reply {
+        // `into_wire` is the move that lets the funnel carry a picture without
+        // naming a colour type: same size, same alignment, so `bytemuck`
+        // re-labels the allocation rather than copying it.
+        Some(Reply::Split(kind, head, picture, tails)) => {
+            offload::deliver_encoded_reply_split(id as u64, kind, head, picture.into_wire(), tails)
+        }
+        Some(Reply::Whole(kind, head, tails)) => {
+            offload::deliver_encoded_reply(id as u64, Some((kind, head, tails)))
+        }
+        None => offload::deliver_encoded_reply(id as u64, None),
+    }
     account_reply(
-        moved,
-        copied_at_worker,
-        copy_ns,
+        pull.moved,
+        pull.copied_at_worker,
+        pull.copy_ns,
         ns(deliver_start, web_time::Instant::now()),
     );
+}
+
+/// What [`deliver`] pulled out of one `DONE` message.
+enum Reply {
+    /// The head whole — every row whose reply is not a picture, and a picture
+    /// reply whose head carries no liftable span.
+    Whole(u8, Vec<u8>, Vec<Vec<u8>>),
+    /// The head with the picture's span removed, and the picture already in the
+    /// element type an `egui::ColorImage` holds.
+    Split(
+        u8,
+        Vec<u8>,
+        squallar_overlays::render::raster_buf::RasterBuf,
+        Vec<Vec<u8>>,
+    ),
+}
+
+/// The counters [`deliver`] fills while it pulls a reply out of the worker's
+/// memory, and the two ways it can pull one.
+///
+/// A struct rather than closures over three locals, because both spellings need
+/// the same three counters and only one closure may borrow them at a time.
+/// Counting and copying stay ONE step either way, so a buffer cannot be counted
+/// into `moved` and copied outside the clock.
+#[derive(Default)]
+struct Pull {
+    moved: usize,
+    copied_at_worker: usize,
+    /// **Nanoseconds, not the microseconds the send direction accumulates in.**
+    /// A reply is one head and zero or more tails, and a tail can be a few
+    /// hundred bytes; a per-call truncation to whole microseconds would report
+    /// zero for a hundred of those and understate the total by the whole of the
+    /// small end.
+    copy_ns: u64,
+}
+
+impl Pull {
+    fn count(&mut self, array: &js_sys::Uint8Array) {
+        let len = array.length() as usize;
+        self.moved += len;
+        if !crate::shared_loan::is_foreign_shared(array) {
+            self.copied_at_worker += len;
+        }
+    }
+
+    /// One buffer, copied out whole into this instance's memory.
+    fn whole(&mut self, array: &js_sys::Uint8Array) -> Vec<u8> {
+        self.count(array);
+        note_block(array.length() as usize);
+        let start = web_time::Instant::now();
+        let bytes = array.to_vec();
+        self.copy_ns += ns(start, web_time::Instant::now());
+        bytes
+    }
+
+    /// **One picture, copied out ONCE, into the element type it will be drawn
+    /// from.**
+    ///
+    /// The head of a raster reply states its picture's span in a fixed prefix
+    /// (`squallar_overlays::render::jobs::overlay_pixel_span`), so those bytes
+    /// can be copied straight into a `Vec<Color32>` instead of into a `Vec<u8>`
+    /// that the decode would then have to walk into a second buffer the
+    /// picture's own size. Both buffers were live at once — measured at 75.4 MiB
+    /// for one picture on a 2878x1566 canvas — and this is the half that goes.
+    ///
+    /// A copy into a 4-aligned destination is sound; it is the VIEW that
+    /// alignment forbids, which is why the picture has to be born as pixels
+    /// here rather than cast afterwards. `RasterBuf::as_mut_bytes` is that
+    /// destination and needs no `unsafe`, which this crate forbids outright.
+    ///
+    /// `None` where the prefix describes no span — a blank, a short head, or a
+    /// length that is not whole pixels — and the caller copies the head whole.
+    fn split(
+        &mut self,
+        array: &js_sys::Uint8Array,
+    ) -> Option<(Vec<u8>, squallar_overlays::render::raster_buf::RasterBuf)> {
+        use squallar_overlays::render::jobs::{OVERLAY_PIXEL_PREFIX_BYTES, overlay_pixel_span};
+        use squallar_overlays::render::raster_buf::RasterBuf;
+
+        let total = array.length() as usize;
+        let mut prefix = [0u8; OVERLAY_PIXEL_PREFIX_BYTES];
+        let read = OVERLAY_PIXEL_PREFIX_BYTES.min(total);
+        array.subarray(0, read as u32).copy_to(&mut prefix[..read]);
+        let (offset, len) = overlay_pixel_span(&prefix[..read])?;
+        // A span the head cannot contain is a corrupt or foreign message, not a
+        // picture to copy the tail of.
+        if offset.checked_add(len)? > total {
+            return None;
+        }
+
+        self.count(array);
+        note_block(len);
+        let start = web_time::Instant::now();
+        let mut picture = RasterBuf::transparent(len / 4);
+        array
+            .subarray(offset as u32, (offset + len) as u32)
+            .copy_to(picture.as_mut_bytes());
+        // The head with the span taken out: its prefix, then whatever followed
+        // the picture. One allocation, and small — the cells block and five
+        // bytes.
+        let mut head = vec![0u8; total - len];
+        array
+            .subarray(0, offset as u32)
+            .copy_to(&mut head[..offset]);
+        array
+            .subarray((offset + len) as u32, total as u32)
+            .copy_to(&mut head[offset..]);
+        self.copy_ns += ns(start, web_time::Instant::now());
+        note_block(head.len());
+        Some((head, picture))
+    }
 }
 
 // ── The tile lane ────────────────────────────────────────────────────────────

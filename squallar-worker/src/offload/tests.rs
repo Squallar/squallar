@@ -3601,6 +3601,146 @@ fn the_overlay_reply_round_trips_and_is_canonical() {
 
 /// The framing the overlay reply ships is **this** framing.
 #[test]
+fn the_picture_starts_at_a_constant_offset_whatever_the_cells_say() {
+    // **The property the whole split path rests on.** The browser transport
+    // decides where to copy from BEFORE it copies anything, so the picture's
+    // offset may not be a function of the data in front of it. It was: the
+    // cells block used to come first and states no byte length of its own, so
+    // the offset could only be learned by walking it.
+    let rgba: Vec<u8> = (0..16).collect();
+    let mut seen = Vec::new();
+    for cells in [None, Some(a_hit_cells_fixture())] {
+        let mut encoded = Vec::new();
+        encode_overlay_out(&rgba, None, cells.as_ref(), &mut encoded);
+        let prefix = &encoded[..squallar_overlays::render::jobs::OVERLAY_PIXEL_PREFIX_BYTES];
+        let span = squallar_overlays::render::jobs::overlay_pixel_span(prefix)
+            .expect("a painted reply states a pixel span in its prefix");
+        assert_eq!(
+            span,
+            (
+                squallar_overlays::render::jobs::OVERLAY_PIXEL_PREFIX_BYTES,
+                rgba.len()
+            ),
+            "the span a painted reply states is not the constant offset and \
+             the fixture's own length",
+        );
+        assert_eq!(
+            &encoded[span.0..span.0 + span.1],
+            &rgba[..],
+            "the stated span does not contain the picture that was encoded",
+        );
+        seen.push(span.0);
+    }
+    assert_eq!(
+        seen[0], seen[1],
+        "the picture moved when hit cells were added, so the transport would \
+         have to walk the cells block to find it — which is the whole of what \
+         this ordering exists to prevent",
+    );
+
+    // A blank states no span, so the transport does not take the split path
+    // for one and the whole-head decode still owns that case.
+    let mut blank = Vec::new();
+    encode_overlay_out(&[], Some(64), None, &mut blank);
+    assert_eq!(
+        squallar_overlays::render::jobs::overlay_pixel_span(
+            &blank[..squallar_overlays::render::jobs::OVERLAY_PIXEL_PREFIX_BYTES]
+        ),
+        None,
+        "a blank reply offered a pixel span; there are no pixels to lift",
+    );
+}
+
+#[test]
+fn the_split_decode_and_the_whole_decode_agree() {
+    // **The equivalence that makes the fast path safe to take.** The page
+    // lifts the picture out and decodes what is left; the funnel decodes the
+    // head whole. They must produce the same reply, or a browser draws
+    // something a native build would not.
+    let rgba: Vec<u8> = (0..64).collect();
+    for cells in [None, Some(a_hit_cells_fixture())] {
+        let mut encoded = Vec::new();
+        encode_overlay_out(&rgba, None, cells.as_ref(), &mut encoded);
+        let (offset, len) = squallar_overlays::render::jobs::overlay_pixel_span(
+            &encoded[..squallar_overlays::render::jobs::OVERLAY_PIXEL_PREFIX_BYTES],
+        )
+        .expect("a painted reply states a pixel span");
+
+        // Exactly what `squallar_web::worker_port::Pull::split` builds: the
+        // head with the span removed, and the span as pixels.
+        let mut head = encoded[..offset].to_vec();
+        head.extend_from_slice(&encoded[offset + len..]);
+        let picture =
+            RasterBuf::from_premultiplied_wire(&encoded[offset..offset + len]).into_wire();
+
+        let split =
+            squallar_overlays::render::jobs::decode_raster_reply_split(&head, picture, Vec::new())
+                .expect("the split decode reads what the encoder wrote");
+        let whole = decode_overlay_out(&encoded).expect("the whole decode reads it too");
+        assert_eq!(
+            split.rgba, whole.0,
+            "the two decodes disagree on the picture"
+        );
+        assert_eq!(
+            split.blank, whole.1,
+            "the two decodes disagree on blankness"
+        );
+        assert_eq!(
+            split.hit_cells.map(|c| c.cells),
+            whole.2.map(|c| c.cells),
+            "the two decodes disagree on the hit cells",
+        );
+    }
+}
+
+#[test]
+fn a_split_reply_whose_stated_length_does_not_match_its_picture_is_refused() {
+    // A transport that lifted the wrong span would otherwise put a torn
+    // picture on a pane, and nothing downstream would notice: the length the
+    // prefix states is the only thing that can catch it.
+    let rgba: Vec<u8> = (0..64).collect();
+    let mut encoded = Vec::new();
+    encode_overlay_out(&rgba, None, None, &mut encoded);
+    let (offset, len) = squallar_overlays::render::jobs::overlay_pixel_span(
+        &encoded[..squallar_overlays::render::jobs::OVERLAY_PIXEL_PREFIX_BYTES],
+    )
+    .expect("a painted reply states a pixel span");
+    let mut head = encoded[..offset].to_vec();
+    head.extend_from_slice(&encoded[offset + len..]);
+
+    // One pixel short of what the prefix claims.
+    let short = RasterBuf::from_premultiplied_wire(&encoded[offset..offset + len - 4]).into_wire();
+    assert!(
+        squallar_overlays::render::jobs::decode_raster_reply_split(&head, short, Vec::new())
+            .is_none(),
+        "a picture shorter than its stated span was accepted",
+    );
+}
+
+#[test]
+fn only_the_rows_that_carry_a_picture_declare_a_liftable_one() {
+    // `splits_pixels` is what makes the page take the fast path at all, and the
+    // funnel asks the ROW rather than knowing which crate it came from. So the
+    // claim to hold is that every overlay row declares a liftable picture and
+    // nothing else does — checked against the composed registry rather than a
+    // remembered index, because a registry chained in front of the overlays
+    // renumbers every row after it.
+    for row in crate::job_registry::job_codecs() {
+        let is_overlay = squallar_overlays::render::jobs::JOB_CODECS
+            .iter()
+            .any(|candidate| std::ptr::eq(candidate, row));
+        assert_eq!(
+            row.splits_pixels, is_overlay,
+            "`{}` declares splits_pixels = {} where being an overlay row is \
+             {}: a row declaring a picture it has not got would be handed one, \
+             and a row with a picture declaring none pays the two-buffer path \
+             with nothing in the tree to say so",
+            row.label, row.splits_pixels, is_overlay,
+        );
+    }
+}
+
+#[test]
 fn the_overlay_reply_framing_is_the_one_this_protocol_ships() {
     let rgba: Vec<u8> = (0..16).collect();
     // Sink-shaped construction since WO-M7d; the byte VALUES these rows pin
@@ -3842,22 +3982,28 @@ fn a_malformed_overlay_reply_is_refused_rather_than_misread() {
     let rgba: Vec<u8> = (0..16).collect();
     let mut encoded = Vec::new();
     encode_overlay_out(&rgba, None, Some(&a_hit_cells_fixture()), &mut encoded);
-    let prefix = encoded.len() - rgba.len();
 
     // Control first: untouched bytes decode, so every refusal below is the
     // mutation's doing.
     assert!(decode_overlay_out(&encoded).is_some());
 
-    // Layout, stated once: cells tag(1) + width(4) + height(4) + count(4) = 13,
-    // then the sorted entries, then the pixels tag(1) — the last byte before
-    // the RGBA, and the byte that says whether there is any.
+    // Layout, stated once: pixels tag(1) + pixel length(4) = 5, then the RGBA,
+    // then the cells block — tag(1) + width(4) + height(4) + count(4) = 13 and
+    // then the sorted entries. Every offset below is relative to `cells_at`
+    // rather than to the head, so the fixture's own size is not baked in twice.
+    let cells_at = squallar_overlays::render::jobs::OVERLAY_PIXEL_PREFIX_BYTES + rgba.len();
     assert_eq!(
-        prefix, 54,
-        "the fixture's framed prefix moved; re-derive the offsets"
+        encoded.len() - rgba.len(),
+        58,
+        "the fixture's framing moved; re-derive the offsets"
     );
 
-    // Truncation anywhere inside the framed prefix is a refusal.
-    for cut in 1..prefix {
+    // **Truncation ANYWHERE is a refusal**, not merely inside a prefix: the
+    // pixel length makes a short RGBA span readable as short, which the old
+    // "the picture is the rest" form could not distinguish from a small
+    // picture. So this walks the whole message rather than stopping where the
+    // pixels began.
+    for cut in 1..encoded.len() {
         assert_eq!(
             decode_overlay_out(&encoded[..cut]),
             None,
@@ -3867,20 +4013,20 @@ fn a_malformed_overlay_reply_is_refused_rather_than_misread() {
 
     // A hit-cells tag this build does not have.
     let mut bad_tag = encoded.clone();
-    bad_tag[0] = 2;
+    bad_tag[cells_at] = 2;
     assert_eq!(decode_overlay_out(&bad_tag), None, "tag 2 was accepted");
 
     // The last entry's index: 8 is one past the 4×2 grid.
     let mut moved = encoded.clone();
-    moved[41..45].copy_from_slice(&6u32.to_le_bytes());
+    moved[cells_at + 41..cells_at + 45].copy_from_slice(&6u32.to_le_bytes());
     let (_, _, cells) = decode_overlay_out(&moved).expect("index 6 is a legal cell");
     assert!(
         cells.expect("cells").cells.contains_key(&6),
-        "bytes 41..45 are not the last entry's index; the refusal below \
+        "the bytes at cells_at+41 are not the last entry's index; the refusal below \
          would be about some other field",
     );
     let mut out_of_range = encoded.clone();
-    out_of_range[41..45].copy_from_slice(&8u32.to_le_bytes());
+    out_of_range[cells_at + 41..cells_at + 45].copy_from_slice(&8u32.to_le_bytes());
     assert_eq!(
         decode_overlay_out(&out_of_range),
         None,
@@ -3891,7 +4037,7 @@ fn a_malformed_overlay_reply_is_refused_rather_than_misread() {
     // 7.
     for (rewritten, what) in [(6u32, "an unsorted"), (5u32, "a duplicated")] {
         let mut disordered = encoded.clone();
-        disordered[13..17].copy_from_slice(&rewritten.to_le_bytes());
+        disordered[cells_at + 13..cells_at + 17].copy_from_slice(&rewritten.to_le_bytes());
         assert_eq!(
             decode_overlay_out(&disordered),
             None,
@@ -3902,13 +4048,13 @@ fn a_malformed_overlay_reply_is_refused_rather_than_misread() {
 
     // An empty id list, which the rasterizer never records.
     assert_eq!(
-        u32::from_le_bytes(encoded[17..21].try_into().unwrap()),
+        u32::from_le_bytes(encoded[cells_at + 17..cells_at + 21].try_into().unwrap()),
         1,
-        "bytes 17..21 are not the first entry's id count; the refusal below \
+        "the bytes at cells_at+17 are not the first entry's id count; the refusal below \
          would be about some other field",
     );
     let mut emptied = encoded.clone();
-    emptied[17..21].copy_from_slice(&0u32.to_le_bytes());
+    emptied[cells_at + 17..cells_at + 21].copy_from_slice(&0u32.to_le_bytes());
     assert_eq!(
         decode_overlay_out(&emptied),
         None,

@@ -89,12 +89,22 @@ impl JobSpec for CoverageJob {
 }
 
 impl JobOutCodec for CoverageJob {
+    const SPLITS_PIXELS: bool = true;
+
     fn encode_out(v: RasterizeOutput, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
         encode_raster_reply(v, head);
     }
 
     fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutput> {
         decode_raster_reply(head, tails)
+    }
+
+    fn decode_out_pixels(
+        head: &[u8],
+        tails: Vec<Vec<u8>>,
+        pixels: squallar_source::job::PixelBuf,
+    ) -> Option<RasterizeOutput> {
+        decode_raster_reply_split(head, pixels, tails)
     }
 }
 
@@ -184,12 +194,22 @@ impl JobSpec for AlertsJob {
 }
 
 impl JobOutCodec for AlertsJob {
+    const SPLITS_PIXELS: bool = true;
+
     fn encode_out(v: RasterizeOutput, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
         encode_raster_reply(v, head);
     }
 
     fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutput> {
         decode_raster_reply(head, tails)
+    }
+
+    fn decode_out_pixels(
+        head: &[u8],
+        tails: Vec<Vec<u8>>,
+        pixels: squallar_source::job::PixelBuf,
+    ) -> Option<RasterizeOutput> {
+        decode_raster_reply_split(head, pixels, tails)
     }
 }
 
@@ -240,12 +260,22 @@ impl JobSpec for OutlooksJob {
 }
 
 impl JobOutCodec for OutlooksJob {
+    const SPLITS_PIXELS: bool = true;
+
     fn encode_out(v: RasterizeOutput, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
         encode_raster_reply(v, head);
     }
 
     fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutput> {
         decode_raster_reply(head, tails)
+    }
+
+    fn decode_out_pixels(
+        head: &[u8],
+        tails: Vec<Vec<u8>>,
+        pixels: squallar_source::job::PixelBuf,
+    ) -> Option<RasterizeOutput> {
+        decode_raster_reply_split(head, pixels, tails)
     }
 }
 
@@ -296,12 +326,22 @@ impl JobSpec for DiscussionsJob {
 }
 
 impl JobOutCodec for DiscussionsJob {
+    const SPLITS_PIXELS: bool = true;
+
     fn encode_out(v: RasterizeOutput, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
         encode_raster_reply(v, head);
     }
 
     fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutput> {
         decode_raster_reply(head, tails)
+    }
+
+    fn decode_out_pixels(
+        head: &[u8],
+        tails: Vec<Vec<u8>>,
+        pixels: squallar_source::job::PixelBuf,
+    ) -> Option<RasterizeOutput> {
+        decode_raster_reply_split(head, pixels, tails)
     }
 }
 
@@ -382,12 +422,22 @@ impl JobSpec for ReportsJob {
 }
 
 impl JobOutCodec for ReportsJob {
+    const SPLITS_PIXELS: bool = true;
+
     fn encode_out(v: RasterizeOutput, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
         encode_raster_reply(v, head);
     }
 
     fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutput> {
         decode_raster_reply(head, tails)
+    }
+
+    fn decode_out_pixels(
+        head: &[u8],
+        tails: Vec<Vec<u8>>,
+        pixels: squallar_source::job::PixelBuf,
+    ) -> Option<RasterizeOutput> {
+        decode_raster_reply_split(head, pixels, tails)
     }
 }
 
@@ -627,12 +677,22 @@ impl JobSpec for MetarJob {
 }
 
 impl JobOutCodec for MetarJob {
+    const SPLITS_PIXELS: bool = true;
+
     fn encode_out(v: RasterizeOutput, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
         encode_raster_reply(v, head);
     }
 
     fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutput> {
         decode_raster_reply(head, tails)
+    }
+
+    fn decode_out_pixels(
+        head: &[u8],
+        tails: Vec<Vec<u8>>,
+        pixels: squallar_source::job::PixelBuf,
+    ) -> Option<RasterizeOutput> {
+        decode_raster_reply_split(head, pixels, tails)
     }
 }
 
@@ -720,12 +780,22 @@ impl JobSpec for GlmJob {
 }
 
 impl JobOutCodec for GlmJob {
+    const SPLITS_PIXELS: bool = true;
+
     fn encode_out(v: RasterizeOutput, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
         encode_raster_reply(v, head);
     }
 
     fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutput> {
         decode_raster_reply(head, tails)
+    }
+
+    fn decode_out_pixels(
+        head: &[u8],
+        tails: Vec<Vec<u8>>,
+        pixels: squallar_source::job::PixelBuf,
+    ) -> Option<RasterizeOutput> {
+        decode_raster_reply_split(head, pixels, tails)
     }
 }
 
@@ -1231,12 +1301,22 @@ fn decode_gridded_head(
 }
 
 impl JobOutCodec for GriddedJob {
+    const SPLITS_PIXELS: bool = true;
+
     fn encode_out(v: RasterizeOutput, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
         encode_raster_reply(v, head);
     }
 
     fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutput> {
         decode_raster_reply(head, tails)
+    }
+
+    fn decode_out_pixels(
+        head: &[u8],
+        tails: Vec<Vec<u8>>,
+        pixels: squallar_source::job::PixelBuf,
+    ) -> Option<RasterizeOutput> {
+        decode_raster_reply_split(head, pixels, tails)
     }
 }
 
@@ -1256,6 +1336,29 @@ fn decode_raster_reply(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutp
         return None;
     }
     let (rgba, blank, hit_cells) = decode_overlay_out(head)?;
+    Some(RasterizeOutput {
+        rgba,
+        hit_cells,
+        alpha: AlphaMode::Premultiplied,
+        blank,
+    })
+}
+
+/// [`decode_raster_reply`] for a picture the transport already materialised as
+/// pixels — the browser's path, where taking it as bytes first would cost a
+/// second buffer the size of the picture, live at the same instant as this one.
+///
+/// Every other term is [`decode_raster_reply`]'s, including the refusal of a
+/// tail this adapter never writes.
+pub fn decode_raster_reply_split(
+    head: &[u8],
+    picture: squallar_source::job::PixelBuf,
+    tails: Vec<Vec<u8>>,
+) -> Option<RasterizeOutput> {
+    if !tails.is_empty() {
+        return None;
+    }
+    let (rgba, blank, hit_cells) = decode_overlay_out_split(head, RasterBuf::from_wire(picture))?;
     Some(RasterizeOutput {
         rgba,
         hit_cells,
@@ -1304,41 +1407,38 @@ fn decode_raster_reply(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutp
 /// and the `Vec<Color32>` are still both live — while making a picture-sized
 /// buffer permanently resident, which is worse than the transient it replaces.
 ///
-/// # What would remove the second buffer, and what it costs
+/// # Why the pixels block comes first
 ///
-/// **The picture has to be born as pixels on the page**, in one buffer the
-/// consumer keeps, with the bytes never landing in a `Vec<u8>` of their own.
-/// A copy into a 4-aligned destination is fine — it is the *view* that
-/// alignment forbids — so the page can allocate the destination and copy the
-/// worker's own `Uint8Array` range straight into it:
-/// `RasterBuf::Pixels(vec![Color32::TRANSPARENT; n])` gives an aligned
-/// `&mut [u8]` through [`RasterBuf::as_mut_bytes`], and
-/// `Uint8Array::subarray(a, b).copy_to(..)` fills it. No `unsafe`, which
-/// `squallar-web` forbids, and no dependency it does not already declare.
+/// **So the browser transport never makes a `Vec<u8>` of the picture at all.**
+/// The page allocates `RasterBuf::Pixels` and copies the worker's own
+/// `Uint8Array` range straight into the aligned `&mut [u8]` that arm exposes,
+/// so the picture is born in the element type its consumer keeps. Before this
+/// ordering it could not: the pixels sat behind the hit-cells block, which is
+/// variable, data-dependent and states no byte length of its own, so the
+/// offset could only be learned by walking it. Now it is
+/// [`OVERLAY_PIXEL_PREFIX_BYTES`] and the length is in the prefix.
 ///
-/// **Reorder this encoding to make the offset a constant.** The page cannot
-/// find the picture in what is written above: the pixels sit behind the
-/// hit-cells block, which is variable, data-dependent and carries no byte
-/// length of its own — only a cell count, each cell stating its own id count
-/// — so the offset can be learned only by walking it. Writing the pixels tag
-/// and a `u32` length FIRST, the RGBA next and the cells block LAST makes the
-/// offset 5 and the length readable from bytes 1..5. `squallar-source`'s job
-/// wire is same-build-only by construction, so that reordering is free to
-/// happen here; it moves this codec's own round-trip assertions and no other
-/// row's, and no digest suite.
+/// A copy into a 4-aligned destination is fine; it is the *view* that
+/// alignment forbids. `Vec<u8>` is align-1 and `Vec<Color32>` is align-4, a
+/// `Vec` is freed with the `Layout` it was taken with, and so no cast can turn
+/// one into the other in either direction — which is why this had to be fixed
+/// where the layout is decided rather than at the call site that suffered it.
 ///
-/// The pixels then have to reach a decode. They do not go through
-/// [`JobOutCodec::decode_out`], which takes `&[u8]` and is declared in
-/// `squallar-source` — putting `Color32` there would move a UI type into the
-/// vocabulary crate every source crate sits on, past a charter test that pins
-/// that ceiling in writing, and that is an `ARCHITECTURE.md` decision rather
-/// than a perf change. **It is not needed.** `squallar-worker` already
-/// declares both `egui` and this crate, under the exception its own manifest
-/// records, so the raster reply's pixel path lives there — one layer above the
-/// vocabulary crate, which is never touched. Three crates, no amendment.
+/// Measured before the change, rig software arm at 2878x1566: the page's copy
+/// of the head was 39,526,454 B and the `Vec<Color32>` built out of it
+/// 39,526,452 B, both live at once because `deliver_encoded_reply` binds the
+/// head and passes it by borrow across the decode — 75.4 MiB for one picture,
+/// against a measured page peak of 828-830 MiB.
 ///
-/// [`JobOutCodec`]: squallar_source::job::JobOutCodec
-/// [`RasterBuf::as_mut_bytes`]: crate::render::raster_buf::RasterBuf::as_mut_bytes
+/// Three other routes are recorded as refused rather than left to be
+/// re-derived. Freeing the head before the pixels are allocated is impossible,
+/// because the pixels are read out of it. A reusable staging buffer on the page
+/// removes the per-reply allocation but not the peak — the staging buffer and
+/// the pixels are still both live — and makes a picture-sized buffer
+/// permanently resident, which is worse than the transient it replaces. And
+/// padding the header to four so the prefix can be dropped afterwards is a
+/// `Vec::drain`, which is a memmove of the whole picture: it fixes the peak and
+/// buys nothing on time.
 ///
 /// **`blank` is transported, never re-decided.** `Some(len)` writes the pixels
 /// tag `0` and that length and no pixels at all — the whole of what a raster
@@ -1349,13 +1449,33 @@ fn decode_raster_reply(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutp
 /// by [`RasterizeOutput::settle_blank`](crate::render::rasterize::RasterizeOutput::settle_blank)
 /// in the run funnel's output stage; asking again here could answer
 /// differently and put a picture on a pane that was told to clear.
-pub fn encode_overlay_out(
-    rgba: &[u8],
-    blank: Option<u32>,
-    hit_cells: Option<&HitCells>,
-    out: &mut Vec<u8>,
-) {
-    out.reserve(rgba.len() + 64);
+/// How many bytes of an overlay reply's head come before its pixels.
+///
+/// A CONSTANT, and that is the point of the ordering below. The transport has
+/// to know where the picture starts before it copies anything, and it must not
+/// learn that by walking a structure whose length is a function of the data.
+pub const OVERLAY_PIXEL_PREFIX_BYTES: usize = 5;
+
+/// Where the whole-picture RGBA lies in a head whose first
+/// [`OVERLAY_PIXEL_PREFIX_BYTES`] bytes are `prefix`: `(offset, len)`.
+///
+/// `None` for a blank reply, for a prefix shorter than the constant, and for a
+/// pixels tag outside `{0, 1}` — in every one of those cases there is no
+/// picture to lift out and the caller decodes the head whole. **A length that
+/// is not a whole number of pixels answers `None` too**, because a caller that
+/// allocated `len / 4` pixels for it would silently drop the remainder that is
+/// the evidence of the mismatch.
+pub fn overlay_pixel_span(prefix: &[u8]) -> Option<(usize, usize)> {
+    let mut r = Reader::new(prefix);
+    let len = match r.u8()? {
+        1 => r.u32()? as usize,
+        _ => return None,
+    };
+    len.is_multiple_of(4)
+        .then_some((OVERLAY_PIXEL_PREFIX_BYTES, len))
+}
+
+fn encode_hit_cells(hit_cells: Option<&HitCells>, out: &mut Vec<u8>) {
     match hit_cells {
         None => out.push(0),
         Some(cells) => {
@@ -1374,9 +1494,64 @@ pub fn encode_overlay_out(
             }
         }
     }
+}
+
+fn decode_hit_cells(r: &mut Reader<'_>) -> Option<Option<HitCells>> {
+    match r.u8()? {
+        0 => Some(None),
+        1 => {
+            let width = r.u32()?;
+            let height = r.u32()?;
+            let grid = u64::from(width) * u64::from(height);
+            let occupied = r.u32()? as usize;
+            let mut cells = crate::render::rasterize::HitCellMap::default();
+            let mut previous: Option<u32> = None;
+            for _ in 0..occupied {
+                let idx = r.u32()?;
+                if u64::from(idx) >= grid || previous.is_some_and(|p| p >= idx) {
+                    return None;
+                }
+                previous = Some(idx);
+                let id_count = r.u32()? as usize;
+                if id_count == 0 {
+                    return None;
+                }
+                let mut ids = Vec::new();
+                for _ in 0..id_count {
+                    ids.push(r.u32()?);
+                }
+                cells.insert(idx, ids);
+            }
+            Some(Some(crate::render::rasterize::HitCells {
+                width,
+                height,
+                cells,
+            }))
+        }
+        _ => None,
+    }
+}
+
+pub fn encode_overlay_out(
+    rgba: &[u8],
+    blank: Option<u32>,
+    hit_cells: Option<&HitCells>,
+    out: &mut Vec<u8>,
+) {
+    out.reserve(rgba.len() + 64);
+    // **The pixels block first, and its length written even though the picture
+    // used to be "the rest".** The browser transport copies this head out of the
+    // worker's memory and must decide, BEFORE it copies anything, whether to
+    // materialise the picture straight into the `Vec<Color32>` its consumer
+    // keeps. It can only do that if the picture's offset is a constant, and
+    // with the cells block first it was not one: that block's length is a
+    // function of how many items the raster caught, so the offset could only be
+    // learned by walking it. See `overlay_pixel_span`, which is the whole of
+    // what a reader needs and reads five bytes.
     match blank {
         None => {
             out.push(1);
+            out.extend_from_slice(&(rgba.len() as u32).to_le_bytes());
             out.extend_from_slice(rgba);
         }
         Some(len) => {
@@ -1384,6 +1559,7 @@ pub fn encode_overlay_out(
             out.extend_from_slice(&len.to_le_bytes());
         }
     }
+    encode_hit_cells(hit_cells, out);
 }
 
 /// The inverse of [`encode_overlay_out`], answering `(rgba, blank, cells)` on
@@ -1409,53 +1585,43 @@ pub fn encode_overlay_out(
 /// where this codec is the whole of how a reply arrives.
 pub fn decode_overlay_out(bytes: &[u8]) -> Option<(RasterBuf, Option<u32>, Option<HitCells>)> {
     let mut r = Reader::new(bytes);
-    let hit_cells = match r.u8()? {
-        0 => None,
+    let (rgba, blank) = match r.u8()? {
         1 => {
-            let width = r.u32()?;
-            let height = r.u32()?;
-            let grid = u64::from(width) * u64::from(height);
-            let occupied = r.u32()? as usize;
-            let mut cells = crate::render::rasterize::HitCellMap::default();
-            let mut previous: Option<u32> = None;
-            for _ in 0..occupied {
-                let idx = r.u32()?;
-                if u64::from(idx) >= grid || previous.is_some_and(|p| p >= idx) {
-                    return None;
-                }
-                previous = Some(idx);
-                let id_count = r.u32()? as usize;
-                if id_count == 0 {
-                    return None;
-                }
-                let mut ids = Vec::new();
-                for _ in 0..id_count {
-                    ids.push(r.u32()?);
-                }
-                cells.insert(idx, ids);
-            }
-            Some(crate::render::rasterize::HitCells {
-                width,
-                height,
-                cells,
-            })
+            let len = r.u32()? as usize;
+            (RasterBuf::from_premultiplied_wire(r.take(len)?), None)
         }
+        0 => (RasterBuf::empty(), Some(r.u32()?)),
         _ => return None,
     };
-    match r.u8()? {
-        1 => Some((
-            RasterBuf::from_premultiplied_wire(r.rest()),
-            None,
-            hit_cells,
-        )),
-        0 => {
-            let len = r.u32()?;
-            r.rest()
-                .is_empty()
-                .then_some((RasterBuf::empty(), Some(len), hit_cells))
-        }
-        _ => None,
+    let hit_cells = decode_hit_cells(&mut r)?;
+    r.at_end().then_some((rgba, blank, hit_cells))
+}
+
+/// [`decode_overlay_out`] for a reply whose picture the transport has ALREADY
+/// lifted out and materialised as pixels.
+///
+/// `head` is the reply's head with the RGBA span removed — its
+/// [`OVERLAY_PIXEL_PREFIX_BYTES`]-byte prefix followed directly by the cells
+/// block — and `picture` is what those removed bytes became. **The prefix's
+/// length is checked against the picture that arrived** rather than trusted:
+/// it is the one place a transport that lifted the wrong span would otherwise
+/// go unnoticed, and a wrong span is a torn picture on a pane.
+///
+/// Refuses a blank, because a blank has no span to lift and the caller should
+/// not have taken this path for one.
+pub fn decode_overlay_out_split(
+    head: &[u8],
+    picture: RasterBuf,
+) -> Option<(RasterBuf, Option<u32>, Option<HitCells>)> {
+    let mut r = Reader::new(head);
+    if r.u8()? != 1 {
+        return None;
     }
+    if r.u32()? as usize != picture.as_bytes().len() {
+        return None;
+    }
+    let hit_cells = decode_hit_cells(&mut r)?;
+    r.at_end().then_some((picture, None, hit_cells))
 }
 
 // ── The field codecs the rows share ──────────────────────────────────────
