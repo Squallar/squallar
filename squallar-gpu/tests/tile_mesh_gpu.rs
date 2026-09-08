@@ -111,6 +111,62 @@ fn flat_of(mesh: &egui::epaint::Mesh) -> std::sync::Arc<tile_mesh::TileMeshes> {
 /// texels.
 const FEATHERING: f32 = 1.0;
 
+/// **The most a texel may differ between two arms that agree geometrically.**
+///
+/// Zero texels is what the two comparisons in this file expect and what they
+/// got for months. It is not, however, what either of them can *guarantee*,
+/// and the difference cost `main` five red runs.
+///
+/// Both comparisons put two differently-built pictures side by side. The
+/// stroke pair agrees to one ulp of the placed coordinate rather than exactly
+/// — measured, not argued, by
+/// `tile_mesh::fixture_tests::the_offsets_reproduce_epaints_own_tessellation`
+/// over 400+ paths on both of epaint's branches. The background pair agrees to
+/// a pixel rounding: a feathered `Shape::Rect` under a scissor on one side, a
+/// hard `add_colored_rect` mesh on the other. Neither difference is visible at
+/// the rasteriser's sub-pixel step — until a texel's coverage lands *exactly*
+/// on a rounding boundary, where the two sides are free to round opposite ways
+/// and the readback comes back one least-significant bit apart.
+///
+/// That is not a hypothetical either. Between 2026-09-07 and 2026-09-08 both
+/// comparisons reddened `main` on five commits whose `squallar-gpu` tree,
+/// `Cargo.lock` and workflow were byte-identical to the greens on either side
+/// of them, always with the same reading: `1 of 65536 texels differ, worst
+/// channel delta 1` on `Rgba8UnormSrgb`, at `(128, 222)` — a texel on the
+/// grid's vertical seam, which [`GRID_ORIGIN`] deliberately places on an exact
+/// half-pixel. Bit-identical every time, so not a race; over an unchanged tree,
+/// so not a regression. A property of the host the software rasteriser was
+/// JIT-compiled for.
+///
+/// So the bound is one bit, and one bit is the whole of the slack. **A
+/// misplacement does not move a colour by one.** It hands a *whole edge* to
+/// the wrong side of a pixel: [`GRID_ORIGIN`]'s own doc records that dropping
+/// the pixel rounding `background_within` performs reads 600 texels off, three
+/// whole columns, in the saturated per-tile colours this fixture is painted in.
+/// The delta conjunct below is what separates a rounding boundary from a
+/// geometry error, and it is tight: it admits the last bit and nothing else.
+const LAST_BIT: u8 = 1;
+
+/// **How many texels of the stroke picture may sit on a coverage tie.**
+///
+/// The observed figure on CI is one, of 65,536, over ~11,000 painted. This is
+/// sixteen: enough headroom that a second tie on another host is not a red,
+/// and far too little to hide a moved edge. The fixture's shortest stroke
+/// spans most of the canvas, so a stroke placed one pixel out redisplays its
+/// whole outline — hundreds of texels, and in saturated colours, so the
+/// [`LAST_BIT`] conjunct above catches it before this one is consulted.
+const STROKE_TIE_BUDGET: usize = SIDE as usize / 16;
+
+/// **How many texels of the grid picture may sit on a coverage tie.**
+///
+/// One eighth of a tile's edge. The defect this comparison exists to catch is
+/// recorded in [`GRID_ORIGIN`]'s own doc: an edge handed to the wrong side of
+/// a half-pixel reads *three whole columns*, 600 texels, off. One column is
+/// [`GRID_SIDE`] = 100. Twelve is an order of magnitude under a single
+/// column, so no edge can move without this reddening, and an order of
+/// magnitude over the one tie CI actually shows.
+const SEAM_TIE_BUDGET: usize = GRID_SIDE as usize / 8;
+
 /// The tile's strokes: five polylines with corners of every kind — a gentle
 /// bend, a right angle, and one sharper than a right angle, which is the
 /// branch that splits a path point in two — in translucent colours so the
@@ -987,13 +1043,34 @@ fn the_stroke_callback_path_puts_the_same_bytes_on_screen_as_cpu_placement() {
              delta {worst}, over {drew} painted",
             SIDE * SIDE
         );
-        assert_eq!(
-            differing,
-            0,
-            "{format:?}: {differing} of {} texels differ between egui's own \
-             tessellation of the placed path and the pre-computed offsets \
-             (worst channel delta {worst})",
+        // **The two budgets this test's own doc comment promises.** They were
+        // prose over an `assert_eq!(differing, 0)` until 2026-09-08; see
+        // [`LAST_BIT`] for what that cost and why zero was never the thing
+        // this pair can guarantee.
+        assert!(
+            worst <= LAST_BIT,
+            "{format:?}: a channel differs by {worst} between egui's own \
+             tessellation of the placed path and the pre-computed offsets, \
+             over {differing} of {} texels. One bit is a coverage tie; \
+             {worst} is geometry. The offsets are supposed to reproduce \
+             epaint's tessellation to one ulp of the placed coordinate — if \
+             `tile_mesh::fixture_tests::the_offsets_reproduce_epaints_own_\
+             tessellation` is still green then the vertices agree and the \
+             difference entered after them, in the shader, the blend or the \
+             gamma",
             SIDE * SIDE
+        );
+        assert!(
+            differing <= STROKE_TIE_BUDGET,
+            "{format:?}: {differing} of {} texels differ (worst channel delta \
+             {worst}) between egui's own tessellation of the placed path and \
+             the pre-computed offsets, over {drew} painted. Every one of them \
+             is within a bit, so this is not a misplacement — but {} texels \
+             is past the {STROKE_TIE_BUDGET} a coverage tie can reach on this \
+             fixture, and a whole edge's worth of last-bit disagreement is a \
+             rounding rule that has changed, not a tie",
+            SIDE * SIDE,
+            differing
         );
         readings.push(cpu);
     }
@@ -1485,12 +1562,51 @@ fn the_hoisted_background_rectangles_put_the_same_bytes_on_screen_as_per_tile_cl
             )
         })
         .collect();
+    let worst = clipped
+        .iter()
+        .zip(hoisted.iter())
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    // Reported whether or not it gates, so a run that passes still says how
+    // close to the budget it came.
+    println!(
+        "{format:?}: {} of {} texels differ between the clipped and hoisted backgrounds, worst channel delta {worst}, over {drew} painted",
+        differing.len(),
+        SIDE * SIDE
+    );
+    // **A coverage tie is allowed here; an edge is not.** See [`LAST_BIT`].
+    // [`GRID_ORIGIN`] puts every x edge on an exact half-pixel deliberately,
+    // which is the position at which the feathered-and-rounded rectangle's
+    // inner feather boundary lands exactly on a pixel centre — so whether that
+    // centre reads the fill or a hair under it is a float tie the rasteriser
+    // is free to break either way, and lavapipe breaks it differently
+    // depending on the host it JITs for.
     assert!(
-        differing.is_empty(),
-        "{} of {} texels differ between the per-tile clipped backgrounds and the \
-         hoisted cut ones -- the cut is not the clip. The first of them:\n{}",
+        worst <= LAST_BIT,
+        "a channel differs by {worst} between the per-tile clipped \
+         backgrounds and the hoisted cut ones, over {} texels -- the cut is \
+         not the clip. One bit is a coverage tie at a half-pixel seam; \
+         {worst} is an edge on the wrong side of a pixel, which is what \
+         dropping `background_within`'s rounding does. The first of them:\n{}",
+        differing.len(),
+        differing
+            .iter()
+            .take(12)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        differing.len() <= SEAM_TIE_BUDGET,
+        "{} of {} texels differ between the per-tile clipped backgrounds and \
+         the hoisted cut ones. Every one is within a bit, so no edge has \
+         moved -- but {SEAM_TIE_BUDGET} is the budget, and a whole column of \
+         this grid is {} texels. A disagreement that reaches a column is a \
+         rounding rule that has changed, not a tie. The first of them:\n{}",
         differing.len(),
         SIDE * SIDE,
+        GRID_SIDE as usize,
         differing
             .iter()
             .take(12)
