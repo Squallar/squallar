@@ -8,11 +8,11 @@ nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
 squallar-alloc/src/lib.rs	170	162
 squallar-alloc/src/process.rs	167	165
-squallar-app/src/app.rs	1773	1294
+squallar-app/src/app.rs	1779	1300
 squallar-app/src/app_chunks.rs	228	113
 squallar-app/src/app_fetch.rs	2089	1491
 squallar-app/src/app_offline.rs	31	30
-squallar-app/src/app_render.rs	4560	3840
+squallar-app/src/app_render.rs	4565	3845
 squallar-app/src/app_state.rs	77	0
 squallar-app/src/budget_arms.rs	17	17
 squallar-app/src/budget_memo.rs	52	52
@@ -27,7 +27,7 @@ squallar-app/src/loop_frame_store.rs	161	150
 squallar-app/src/loop_pool.rs	382	378
 squallar-app/src/loop_refill.rs	97	90
 squallar-app/src/loop_telemetry.rs	50	50
-squallar-app/src/platform.rs	473	383
+squallar-app/src/platform.rs	473	380
 squallar-app/src/platform_double.rs	349	329
 squallar-app/src/pressure.rs	218	210
 squallar-app/src/recovery.rs	176	171
@@ -100,7 +100,7 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	306	268
 squallar-egui/src/tile_mesh/ledger.rs	77	46
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	1542	1476
+squallar-egui/src/tile_source.rs	1542	1474
 squallar-egui/src/tile_source/byte_lru.rs	272	271
 squallar-egui/src/tile_source/cache_ledger.rs	181	165
 squallar-egui/src/tile_source/snap.rs	157	157
@@ -272,7 +272,7 @@ squallar-radar/src/hail.rs	140	139
 squallar-radar/src/hca.rs	1195	1068
 squallar-radar/src/hhc.rs	411	380
 squallar-radar/src/hover.rs	72	71
-squallar-radar/src/jobs.rs	594	557
+squallar-radar/src/jobs.rs	602	559
 squallar-radar/src/kdp.rs	247	203
 squallar-radar/src/l3_values.rs	282	281
 squallar-radar/src/level3.rs	193	58
@@ -284,7 +284,7 @@ squallar-radar/src/palette.rs	562	540
 squallar-radar/src/product_spec.rs	444	443
 squallar-radar/src/render.rs	1316	1152
 squallar-radar/src/render/codes.rs	223	222
-squallar-radar/src/render/polar.rs	339	327
+squallar-radar/src/render/polar.rs	414	401
 squallar-radar/src/render_input.rs	663	633
 squallar-radar/src/sampler.rs	573	553
 squallar-radar/src/sampler/seam_fixture.rs	178	167
