@@ -14,10 +14,14 @@
 //! room for `len + additional`, and `len` was **zero** after its `clear`, so it
 //! no-opped against a buffer already holding that capacity. Measured by
 //! heaptrack on a real arm: one live **400,040,000 B** allocation where the
-//! exact need was **216,800,000 B**. That grid went on 2026-09-08 — nothing
-//! downstream ever read it — and the defect it demonstrated is still live in
-//! the two slots that remain, which call `resize`/`resize_with` and so carry it
-//! in the spelling that hides it.
+//! exact need was **216,800,000 B**. That grid went on 2026-09-08, for a
+//! different reason — nothing downstream ever read it.
+//!
+//! The two slots that remain are each repaired by one `reserve_exact`, placed
+//! ahead of the `resize`/`resize_with` that would otherwise take the amortised
+//! path. Neither has any arithmetic left to read as wrong, so in both the
+//! repair now looks like a line worth tidying away; the floors below are what
+//! say it is not.
 //!
 //! Two instruments, because the defect has two halves and each hides the other:
 //! the **allocation sizes** taken during the growing render (the transient),
@@ -70,9 +74,15 @@ const GROWN_PX: usize = GROWN * GROWN;
 const SLOT_BYTES_PER_PX: usize = 8 + 4;
 
 /// The largest single buffer a `GROWN` render legitimately needs: its cells, at
-/// eight bytes a pixel. **The described extent** — nothing this render takes
-/// has any business being larger, and a doubled buffer necessarily is.
+/// eight bytes a pixel.
 const LARGEST_LEGITIMATE: usize = GROWN_PX * 8;
+
+/// **Every** block of this class a `GROWN` render legitimately takes, largest
+/// first: its cells at eight bytes a pixel, then its texture at four. **The
+/// described extent**, and it is a *list* rather than a ceiling because a
+/// ceiling cannot see the smaller of the two slots double — 2 × `WARM_PX` × 4
+/// is 8,000,000 B, which is under the 8,652,800 B the cells legitimately take.
+const NEEDED: [usize; 2] = [LARGEST_LEGITIMATE, GROWN_PX * 4];
 
 /// What counts as a block worth watching. Under the smaller of the two buffers
 /// (`GROWN_PX * 4` = 4,326,400 B) so both are seen.
@@ -194,13 +204,17 @@ fn render_at(p: &RadialPacket, side: usize) {
 
 /// **A pooled buffer is grown to what the render needs, not to twice itself.**
 ///
-/// Floors, in order:
+/// Floors, in order, each measured by deleting the call it names:
 /// * `checkout_image`: delete its `reserve_exact(len)` — an 8,000,000 B block
-///   appears where 4,326,400 B is needed;
+///   appears where 4,326,400 B is needed, and the pool then holds 16,652,800 B
+///   where the pair costs 12,979,200 B;
 /// * `RenderBuffers::checkout`: delete its `reserve_exact` — a 16,000,000 B
 ///   block appears where 8,652,800 B is needed.
 ///
-/// Any one of the three moves `pooled_bytes` off the exact figure below.
+/// Either floor moves both readings — but only because the transient one is an
+/// **equality**. Stated as a ceiling on the largest legitimate buffer it saw
+/// the second floor and not the first, since a doubled texture is 8,000,000 B
+/// and the cells legitimately take 8,652,800.
 #[test]
 fn a_pooled_buffer_too_small_is_grown_to_the_need_and_not_to_twice_itself() {
     let sweep = packet();
@@ -218,17 +232,15 @@ fn a_pooled_buffer_too_small_is_grown_to_the_need_and_not_to_twice_itself() {
 
     // ── The reading: what the growing render takes ─────────────────────────
     let ((), sizes) = counting(|| render_at(&sweep, GROWN));
-    let oversized: Vec<usize> = sizes
-        .iter()
-        .copied()
-        .filter(|&b| b > LARGEST_LEGITIMATE)
-        .collect();
-    assert!(
-        oversized.is_empty(),
-        "the growing render took {oversized:?}, each larger than the biggest \
-         buffer a {GROWN}² render needs ({LARGEST_LEGITIMATE} B of cells). \
-         That is `Vec`'s amortised `max(2 * capacity, need)` doubling a pooled \
-         buffer that was merely undersized. All blocks seen: {sizes:?}",
+    let mut taken = sizes.clone();
+    taken.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(
+        taken, NEEDED,
+        "the growing render took {sizes:?}; a {GROWN}² render's two slots are \
+         exactly {NEEDED:?}. A block over one of those is `Vec`'s amortised \
+         `max(2 * capacity, need)` doubling a pooled buffer that was merely \
+         undersized; a block that is neither is a third buffer of this class \
+         on a path that is supposed to hold two.",
     );
 
     // ── The half the transient hides: what is then HELD ────────────────────
