@@ -1079,6 +1079,132 @@ fn a_pane_animating_two_layers_divides_its_bytes_and_not_its_frame_count() {
     );
 }
 
+/// **A layer the pane stops drawing stops dividing the pane's share.**
+///
+/// The sibling of the test above, and the direction that had to move with it.
+/// The pane's need is priced at the dearest frame times the layers it is
+/// sized for (`pane_loop_need`), and `layer_share` divides what the pane was
+/// granted by the layers animating on it. Those two counts have to be one set:
+/// sized over one layer and divided by two, a pane's only drawn layer comes out
+/// holding *fewer* frames than it did while its neighbour was on — the
+/// misallocation turned inside out, paid by the layer the user is looking at.
+///
+/// Driven through `App::dispatch_loop_renders`, which computes the divisor
+/// itself, and walked past `LOOP_POOL_DWELL_FRAMES` on both arms so what each
+/// reading reports is the plan in force and not one still settling.
+///
+/// **Floor — `divide_by_animating`: put
+/// `animating_layers().count()` back at the dispatch's divisor.** Radar's list
+/// comes back to the two-layer figure with only radar drawn, and the assertion
+/// reds. Applied and observed.
+#[test]
+fn a_layer_the_pane_stops_drawing_stops_dividing_the_panes_share() {
+    let ctx = egui::Context::default();
+    let taken = Arc::new(Mutex::new(0usize));
+    let _guard = squallar_worker::offload::install_test_worker(Box::new(TakeAll {
+        taken: Arc::clone(&taken),
+    }));
+
+    let listed: Vec<chrono::NaiveDateTime> = (0..120).map(ts).collect();
+    let (mut app, _asked) = app_with_frames(listed.clone());
+
+    {
+        let pane = app.gui.pane_mut(0).expect("the fixture built a pane");
+        // Radar is drawn: this fixture's pane is a map pane, and a map pane
+        // that has never heard of the radar layer draws no radar image, so
+        // without this the walk under test declines to price radar at all and
+        // the reading below would be about an empty pane.
+        pane.set_overlay_enabled(known::RADAR, true);
+        *pane.time_state_mut(&known::RADAR) = squallar_egui::radar_layer::begin_loop(
+            24 * 3600,
+            &radar_site(),
+            squallar_radar::types::RenderView::PlanView,
+        );
+        assert!(
+            pane.needs_radar_data(),
+            "premise: the pane must draw radar, or the divisor below is \
+             dividing nothing",
+        );
+    }
+
+    // The model layer, drawn, with the pane's own live raster in its cache so
+    // `overlay_frame_bytes` measures a frame rather than presuming one.
+    app.gui
+        .pane_mut(0)
+        .expect("pane 0")
+        .set_overlay_enabled(known::MODEL_DATA, true);
+    app.spawn_overlay_render(vec![0], known::MODEL_DATA, a_render_request(), None);
+    deliver_live_raster(&mut app, &ctx, 1024);
+    build_loop(&mut app, (listed[0], listed[listed.len() - 1]));
+
+    // Radar's own frame list, seeded through the production listing function
+    // so the timeline carries the listing `resample_frames` chooses from.
+    let allocation = app.loop_allocation();
+    let budgets = app.budgets;
+    let scans: Vec<chrono::NaiveDateTime> = (0..200)
+        .map(|i| ts(0) + chrono::Duration::minutes(i * 4))
+        .collect();
+    let animating = app
+        .gui
+        .pane(0)
+        .expect("pane 0")
+        .animating_drawn_layers()
+        .count();
+    assert_eq!(
+        animating, 2,
+        "premise: two drawn animating layers, or there is no division to take \
+         away",
+    );
+    crate::app::render::accept_scan_listing_for_test(
+        &allocation,
+        &budgets,
+        app.gui
+            .pane_mut(0)
+            .expect("pane 0")
+            .time_state_mut(&known::RADAR),
+        "KTLX",
+        scans.clone(),
+        animating,
+    );
+
+    let radar_frames = |app: &crate::app::App| {
+        app.gui
+            .pane(0)
+            .expect("pane 0")
+            .time_state(&known::RADAR)
+            .frames
+            .len()
+    };
+    let walk = |app: &mut crate::app::App| {
+        for _ in 0..=squallar_device_profile::constants::LOOP_POOL_DWELL_FRAMES {
+            app.dispatch_loop_renders();
+        }
+    };
+
+    walk(&mut app);
+    let with_both = radar_frames(&app);
+    assert!(
+        with_both < scans.len(),
+        "premise: the listing must be longer than the divided share buys \
+         ({with_both} of {}), or the list is not reporting the divisor",
+        scans.len(),
+    );
+
+    app.gui
+        .pane_mut(0)
+        .expect("pane 0")
+        .set_overlay_enabled(known::MODEL_DATA, false);
+    walk(&mut app);
+    let radar_alone = radar_frames(&app);
+
+    assert!(
+        radar_alone > with_both,
+        "a layer the pane no longer draws went on taking its half of the \
+         pane's bytes: radar holds {radar_alone} frames beside a switched-off \
+         model layer where it held {with_both} beside a drawn one",
+    );
+}
+
 /// **WB-7: a pane looping a layer that is not radar is a share of the pool.**
 ///
 /// `loop_demand` reads each pane's *radar* timeline, so before WB-7 a radar-off

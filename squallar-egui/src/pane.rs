@@ -2398,6 +2398,46 @@ impl PaneState {
         self.layers.iter().filter(|slot| slot.time.is_active())
     }
 
+    /// **Whether this pane turns `id`'s data into something a viewer sees** —
+    /// the question every supply door asks before it spends, composed once
+    /// from the two accessors that already answer it rather than spelled a
+    /// third time.
+    ///
+    /// The two halves are not interchangeable and the fork is the whole reason
+    /// this exists. Radar's is [`Self::needs_radar_data`], which is wider than
+    /// the layer flag by exactly the panes that read a volume without a map
+    /// drawing a radar image; every other layer's is
+    /// [`Self::is_overlay_enabled`], the flag itself. Asking either about the
+    /// other's layers is wrong in a specific direction: the flag alone stops
+    /// supplying a cross-section, and `needs_radar_data` alone answers *true*
+    /// for a switched-off satellite on every pane that is not a map.
+    ///
+    /// [`Self::animating_drawn_layers`] is where a divisor asks this; the two
+    /// dispatch walks ask their own half directly, each for the one layer in
+    /// its hand.
+    pub fn draws_layer(&self, id: &LayerId) -> bool {
+        if *id == known::RADAR {
+            self.needs_radar_data()
+        } else {
+            self.is_overlay_enabled(id)
+        }
+    }
+
+    /// [`Self::animating_layers`] narrowed to the ones this pane draws — the
+    /// set a **byte** share is asked for, and divided across.
+    ///
+    /// A loop survives its layer being switched off ([`Self::refresh_transport`]
+    /// keeps a running timeline on purpose), so the two sets differ for as long
+    /// as the layer is off and the difference is bytes: a slot in
+    /// `animating_layers` and not in this one holds no pictures — the dispatch
+    /// released them — while still reading as a claimant. Counted, it takes a
+    /// base grant and balloon frames from the panes that do draw, and halves
+    /// the share of a drawing layer beside it on its own pane.
+    pub fn animating_drawn_layers(&self) -> impl Iterator<Item = &LayerSlot> {
+        self.animating_layers()
+            .filter(|slot| self.draws_layer(&slot.id))
+    }
+
     /// [`Self::animating_layers`], to write — the set the readiness pass walks
     /// so that settling a loop is asked of every layer that is running one,
     /// not of the radar slot by name (WI-2).

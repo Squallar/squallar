@@ -269,6 +269,17 @@ fn awaiting_listing(
         .pane_mut(pane_idx)
         .expect("the fixture built a pane");
     pane.set_transport_layer(supply_id());
+    // **The layer is switched on, which is what arming a loop means.**
+    // `PaneState::frame_series_layers` — the roster `begin_loop_for_pane` arms
+    // from — takes only enabled slots, so no production loop is ever armed on a
+    // layer its pane does not draw; that state is reached only by the user
+    // switching the layer off afterwards, which is
+    // `super::disabled_layer_loop_tests`' subject. `time_state_mut` mints a
+    // slot with `enabled: false` (the same answer `set_overlay_enabled` gives
+    // for a layer this pane has never heard of), so without this the fixture
+    // arms a loop in a state production cannot reach, and the supply gates read
+    // the switch-off's answer for a loop nobody switched off.
+    pane.set_overlay_enabled(supply_id(), true);
     *pane.time_state_mut(&supply_id()) = squallar_egui::pane::LayerTimeState::begin(
         (range.1 - range.0).num_seconds() as u64,
         squallar_radar::types::RenderView::PlanView,
@@ -595,6 +606,245 @@ fn two_animating_layers_each_get_half_the_bytes() {
         two * 2 * bytes <= allocation.share_bytes,
         "and the two of them together must still fit the one share",
     );
+}
+
+/// A sink that takes every job — nothing here rasterizes.
+struct TakeEveryJob;
+
+impl squallar_worker::offload::JobSink for TakeEveryJob {
+    fn send(
+        &self,
+        _id: u64,
+        _request: squallar_worker::offload::JobRequest,
+    ) -> Result<(), squallar_worker::offload::JobRequest> {
+        Ok(())
+    }
+}
+
+/// The pane's live dispatch request — what writes the geometry record the loop
+/// supply walk reuses.
+fn a_render_request() -> crate::app::fetch::OverlayRenderRequest {
+    crate::app::fetch::OverlayRenderRequest {
+        geo_bounds: squallar_geo::GeoBounds {
+            min_lat: 34.0,
+            max_lat: 36.0,
+            min_lon: -99.0,
+            max_lon: -97.0,
+        },
+        texture: squallar_egui::overlay_cache::OverlayTexturePlan {
+            width: 8,
+            height: 5,
+            overdraw: 0.0,
+            pixels_per_point: 1.0,
+            pane_px: [0, 0],
+        },
+        data_generation: 0,
+        zoom: 32,
+    }
+}
+
+/// **A listing that lands after the layer is switched off becomes the frame
+/// list and fetches not one granule.**
+///
+/// The listing has to land: nothing re-asks for a listing a pane stopped
+/// waiting for, and a timeline left in `FetchingScanList` waits there for the
+/// life of the session — so refusing it here would trade a bounded batch of
+/// fetches for a loop that never comes back. What is held back is the
+/// dispatch, one `fetch_frame` per frame of the render set.
+///
+/// **The way back is the supply walk itself.** A frame whose granule the layer
+/// is not holding is what `dispatch_overlay_loop_renders` calls *owed its
+/// data*, and `refetch_owed_loop_frames` asks for every one of them — so the
+/// pass after the layer returns puts back exactly what this held.
+#[test]
+fn a_listing_that_lands_after_the_switch_off_fetches_nothing_and_still_becomes_the_frame_list() {
+    let listed: Vec<_> = (0..6).map(|i| ts(i * 60)).collect();
+    let range = (ts(-60), ts(6 * 60));
+    let (mut app, asked) = app_with_supply(listed.clone(), Vec::new());
+    awaiting_listing(&mut app, 0, range);
+    app.gui
+        .pane_mut(0)
+        .expect("the fixture built a pane")
+        .set_overlay_enabled(supply_id(), false);
+
+    deliver(&mut app, range, listed.clone());
+
+    let ls = app
+        .gui
+        .pane(0)
+        .expect("the fixture built a pane")
+        .time_state(&supply_id());
+    assert_eq!(
+        ls.frames.iter().map(|f| f.timestamp).collect::<Vec<_>>(),
+        listed,
+        "the listing must still become the frame list: nothing re-asks for a \
+         listing a pane stopped waiting for, so a loop refused here is stuck \
+         in FetchingScanList for the life of the session",
+    );
+    assert!(
+        asked.lock().expect("no poisoned lock").fetched.is_empty(),
+        "a listing landing after the switch-off went on putting one granule \
+         per frame on the wire for a layer nobody is looking at: {:?}",
+        asked.lock().expect("no poisoned lock").fetched,
+    );
+
+    // The way back, through the walk that fills every other frame. The pane's
+    // own geometry record first: `refetch_owed_loop_frames` declines to ask
+    // for a granule a pane could not rasterize, so without one this pass would
+    // read green on any tree.
+    let _guard = squallar_worker::offload::install_test_worker(Box::new(TakeEveryJob));
+    app.spawn_overlay_render(vec![0], supply_id(), a_render_request(), None);
+    assert!(
+        app.render.overlay_record(0, &supply_id()).is_some(),
+        "premise: the pane must carry a geometry record, or the supply walk \
+         declines every ask below and the way back reads green on any tree",
+    );
+    app.gui
+        .pane_mut(0)
+        .expect("the fixture built a pane")
+        .set_overlay_enabled(supply_id(), true);
+    app.dispatch_overlay_loop_renders();
+
+    let mut fetched = asked.lock().expect("no poisoned lock").fetched.clone();
+    fetched.sort_unstable();
+    fetched.dedup();
+    assert_eq!(
+        fetched, listed,
+        "and every frame the held-back listing left owed must be asked for on \
+         the pass after the layer returns",
+    );
+}
+
+/// **A layer the pane stops drawing stops halving the share of the layer
+/// beside it.**
+///
+/// The divisor at the listing, where the frame list is cut. It has to be the
+/// same set `pane_loop_need` sized the pane's share for: sized over one layer
+/// and divided by two, the drawn layer comes out of a switch-off holding
+/// *fewer* frames than it did before its neighbour went away.
+///
+/// The second animating layer here is radar, because that is the pairing a
+/// pane reaches without a second registered double — and the pane is made to
+/// draw it first, since a map pane that has never heard of the radar layer
+/// draws no radar image and would be one drawn layer either way.
+#[test]
+fn a_layer_the_pane_stops_drawing_stops_halving_the_listing_share() {
+    let listed: Vec<_> = (0..400).map(|i| ts(i * 60)).collect();
+    let range = (ts(-60), ts(400 * 60));
+
+    let held_with = frames_after_a_listing_beside_radar(&listed, range, true);
+    let held_alone = frames_after_a_listing_beside_radar(&listed, range, false);
+
+    assert!(
+        held_with < listed.len(),
+        "premise: the listing must be longer than the divided share buys \
+         ({held_with} of {}), or the list is not reporting the divisor",
+        listed.len(),
+    );
+    assert!(
+        held_alone > held_with,
+        "a layer the pane no longer draws went on taking its half of the \
+         pane's bytes at the listing: the drawn layer holds {held_alone} \
+         frames beside a switched-off radar where it held {held_with} beside \
+         a drawn one",
+    );
+}
+
+/// **And the supply dispatch's own divisor moves with it.**
+///
+/// The sibling of the test above at the other seam: `accept_loop_scan_listings`
+/// cuts the list when the listing lands, and `dispatch_overlay_loop_renders`
+/// re-samples it on every pass from the allocation in force. Both divide the
+/// pane's bytes, so both have to divide by the same set — a list cut for one
+/// drawn layer and then re-sampled as though two were drawn is the switch-off
+/// taking frames away from the layer still on screen, one pass later.
+///
+/// The listing lands with radar drawn, so the list starts at the halved
+/// figure; the switch-off is what the dispatch has to answer.
+#[test]
+fn the_supply_dispatch_stops_halving_a_list_when_the_layer_beside_it_goes_off() {
+    let listed: Vec<_> = (0..400).map(|i| ts(i * 60)).collect();
+    let range = (ts(-60), ts(400 * 60));
+
+    let (mut app, _asked) = app_with_supply(listed.clone(), Vec::new());
+    awaiting_listing(&mut app, 0, range);
+    {
+        let pane = app.gui.pane_mut(0).expect("the fixture built a pane");
+        pane.set_overlay_enabled(squallar_source::id::known::RADAR, true);
+        *pane.time_state_mut(&squallar_source::id::known::RADAR) =
+            squallar_egui::pane::LayerTimeState::begin(
+                3600,
+                squallar_radar::types::RenderView::PlanView,
+                Box::new(()),
+            );
+    }
+    deliver(&mut app, range, listed.clone());
+
+    let held = |app: &crate::app::App| {
+        app.gui
+            .pane(0)
+            .expect("the fixture built a pane")
+            .time_state(&supply_id())
+            .frames
+            .len()
+    };
+    let halved = held(&app);
+    assert!(
+        halved < listed.len(),
+        "premise: the listing must be longer than the divided share buys \
+         ({halved} of {}), or the list is not reporting a divisor at all",
+        listed.len(),
+    );
+
+    app.gui
+        .pane_mut(0)
+        .expect("the fixture built a pane")
+        .set_overlay_enabled(squallar_source::id::known::RADAR, false);
+    app.dispatch_overlay_loop_renders();
+
+    assert!(
+        held(&app) > halved,
+        "the supply walk went on dividing this layer's bytes by a layer the \
+         pane stopped drawing: {} frames where the switch-off should have \
+         given the whole share back",
+        held(&app),
+    );
+}
+
+/// Deliver one listing to a pane animating the test layer **and** radar, with
+/// radar drawn or not, and answer how many frames the test layer ended up
+/// holding.
+fn frames_after_a_listing_beside_radar(
+    listed: &[chrono::NaiveDateTime],
+    range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+    radar_drawn: bool,
+) -> usize {
+    let (mut app, _asked) = app_with_supply(listed.to_vec(), Vec::new());
+    awaiting_listing(&mut app, 0, range);
+    {
+        let pane = app.gui.pane_mut(0).expect("the fixture built a pane");
+        pane.set_overlay_enabled(squallar_source::id::known::RADAR, true);
+        *pane.time_state_mut(&squallar_source::id::known::RADAR) =
+            squallar_egui::pane::LayerTimeState::begin(
+                3600,
+                squallar_radar::types::RenderView::PlanView,
+                Box::new(()),
+            );
+        assert_eq!(
+            pane.animating_drawn_layers().count(),
+            2,
+            "premise: two drawn animating layers, or there is no division to \
+             take away",
+        );
+        pane.set_overlay_enabled(squallar_source::id::known::RADAR, radar_drawn);
+    }
+    deliver(&mut app, range, listed.to_vec());
+    app.gui
+        .pane(0)
+        .expect("the fixture built a pane")
+        .time_state(&supply_id())
+        .frames
+        .len()
 }
 
 // ── 3. The residency oracle ───────────────────────────────────────────────

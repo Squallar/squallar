@@ -4564,10 +4564,36 @@ impl super::App {
                         continue;
                     }
                     pane.hydrate_layer_states(overlays, pane_idx);
-                    // The whole-pane cap divides across the layers this pane is
-                    // animating, and it is counted HERE - where the budget is
-                    // consumed - not pushed down with it.
-                    let animating = pane.animating_layers().count();
+                    // The whole-pane cap divides across the layers this pane
+                    // **draws**, and it is counted HERE - where the budget is
+                    // consumed - not pushed down with it. The drawn set and not
+                    // the animating one because that is the set `pane_loop_need`
+                    // sized the pane's share for; the two must be one set or a
+                    // layer switched off on this pane silently halves the share
+                    // of the layer beside it that is still on screen.
+                    let animating = pane.animating_drawn_layers().count();
+                    // **Whether the listing this pane is waiting for is one it
+                    // will draw anything from.** A layer switched off *after*
+                    // its listing went out still keeps a running timeline, so
+                    // the answer still has to land - the frame list is made of
+                    // it, and nothing re-asks for a listing a pane stopped
+                    // waiting for, so refusing it here would strand the loop in
+                    // `FetchingScanList` for the life of the session. What does
+                    // not have to happen is the spending: the frame list is
+                    // built and settled below exactly as always, and the
+                    // dispatch that follows it - one batch of volumes, bounded
+                    // by `concurrent_loop_downloads`, or one granule fetch per
+                    // frame - is held back for a pane that can paint none of
+                    // them.
+                    //
+                    // **The way back is the pass after the layer returns**, and
+                    // it is already built. Radar's plan is simply never set, so
+                    // `LoopDownloadManager::plan_describes` reads false and
+                    // `dispatch_loop_renders` re-derives the queue from this
+                    // same frame list; an overlay frame with no granule is what
+                    // `dispatch_overlay_loop_renders` calls *owed its data* and
+                    // hands to `refetch_owed_loop_frames`.
+                    let drawn = pane.draws_layer(&layer);
                     // **The listing whole, not just its instants.**
                     // `FrameStamp::run` is what tells two runs' grids for the
                     // same valid time apart, and the model layer's
@@ -4638,25 +4664,34 @@ impl super::App {
                         // already capped to what the pane's byte share buys,
                         // so every frame it holds is a frame it means to make
                         // resident, and the order is the playhead outward.
+                        //
+                        // For a layer this pane draws. The list above is
+                        // stamps and it stands either way; what is held back
+                        // is the granule per frame this would put on the wire
+                        // for a layer nobody is looking at. Every one of them
+                        // is asked for again the pass after the layer returns,
+                        // as a frame *owed its data* — see `drawn` above.
                         let budget = ls.frames.len();
-                        owed.push((
-                            pane_idx,
-                            ls.render_set_indices(budget)
-                                .into_iter()
-                                .map(|idx| {
-                                    let valid = ls.frames[idx].timestamp;
-                                    // The stamp the LAYER named, carried back
-                                    // whole — see `listing` above. The
-                                    // reconstruction is the fallback for a
-                                    // layer whose sampling dropped the row,
-                                    // which cannot happen while the frames come
-                                    // from `stamps` itself.
-                                    stamps.iter().copied().find(|f| f.valid == valid).unwrap_or(
-                                        squallar_source::time::FrameStamp { valid, run: None },
-                                    )
-                                })
-                                .collect(),
-                        ));
+                        if drawn {
+                            owed.push((
+                                pane_idx,
+                                ls.render_set_indices(budget)
+                                    .into_iter()
+                                    .map(|idx| {
+                                        let valid = ls.frames[idx].timestamp;
+                                        // The stamp the LAYER named, carried
+                                        // back whole — see `listing` above. The
+                                        // reconstruction is the fallback for a
+                                        // layer whose sampling dropped the row,
+                                        // which cannot happen while the frames
+                                        // come from `stamps` itself.
+                                        stamps.iter().copied().find(|f| f.valid == valid).unwrap_or(
+                                            squallar_source::time::FrameStamp { valid, run: None },
+                                        )
+                                    })
+                                    .collect(),
+                            ));
+                        }
                         continue;
                     };
                     // -- Radar ------------------------------------------------
@@ -4680,7 +4715,17 @@ impl super::App {
                     ) else {
                         continue;
                     };
-                    built.push((pane_idx, plan, product));
+                    // For a pane that draws radar. The frame list, the cadence
+                    // and the playhead are already on the timeline above and
+                    // stand either way; what is held back is the plan and the
+                    // batch of volumes derived from it. Leaving the plan unset
+                    // is itself the way back — `plan_describes` reads false for
+                    // a pane it has never seen, so the first
+                    // `dispatch_loop_renders` after the layer returns re-derives
+                    // the queue from this very list.
+                    if drawn {
+                        built.push((pane_idx, plan, product));
+                    }
                 }
             }
             for (pane_idx, plan, product) in built {
@@ -5691,22 +5736,43 @@ impl super::App {
                     let span = pane_need.loop_span_secs.max(slot.time.span_secs as usize);
                     let cadence = slot.time.cadence_secs;
                     let frame_bytes = overlay_frame_bytes(pane, &slot.id, &self.budgets);
-                    demand.push(pane_loop_need(
-                        pane,
-                        pane_idx,
-                        LoopKind::Overlay,
-                        &slot.time,
-                        &self.budgets,
-                        &model,
-                    ));
+                    // **The pool is asked for the layers this pane DRAWS; the
+                    // scene is priced for the ones it is holding.** The two
+                    // part while a layer is switched off, and they answer
+                    // different questions — `fit` is told what this pane
+                    // costs, which is why the row below is left alone, and the
+                    // pool is told who is dividing it.
+                    //
+                    // A loop outlives its layer's switch — the transport keeps
+                    // a running timeline (`PaneState::refresh_transport`) —
+                    // and `dispatch_overlay_loop_renders` released its
+                    // pictures on the pass the layer went off, so a need
+                    // pushed for it buys nothing anybody can see. That is not
+                    // merely waste: every base is paid before any balloon and
+                    // each balloon frame goes to the coarsest *claimant*, so a
+                    // claimant holding no pictures takes both from the panes
+                    // that do draw.
+                    let drawn = pane.animating_drawn_layers().next();
+                    if let Some(drawn) = drawn {
+                        demand.push(pane_loop_need(
+                            pane,
+                            pane_idx,
+                            LoopKind::Overlay,
+                            &drawn.time,
+                            &self.budgets,
+                            &model,
+                        ));
+                    }
                     pane_need.looping = true;
                     pane_need.cadence_secs = cadence;
                     pane_need.loop_span_secs = span;
                     pane_need.overlay_frame_bytes = frame_bytes;
                     // The pane's grant is this layer's frames, so the row that
-                    // carries it is this layer's row and not radar's.
+                    // carries it is this layer's row and not radar's — the
+                    // layer the grant was *asked for*, which is the drawn one
+                    // wherever the two differ.
                     if let Some(rows) = pane_layers.last_mut() {
-                        rows.loop_layer = Some(slot.id.clone());
+                        rows.loop_layer = Some(drawn.unwrap_or(slot).id.clone());
                     }
                 }
                 scene.panes.push(pane_need);
@@ -5717,7 +5783,25 @@ impl super::App {
                 rows.loop_layer = Some(known::RADAR);
             }
             live_loops.push(live_loop_row(ls));
-            let identity = loop_product(ls).map(|product| LoopIdentity::of(pane, ls, product));
+            // **Whether radar's loop is one this pane draws** — the verdict
+            // `App::dispatch_loop_renders` acts on, asked here through the same
+            // accessor so the walk that divides the pool and the walk that
+            // spends it cannot come to different answers about one pane.
+            let radar_drawn = pane.needs_radar_data();
+            // **An owner that holds nothing must not own an identity.** `seen`
+            // makes a later pane on the same loop an *alias*, and an alias asks
+            // for nothing of its own because it reads the owner's grant. A pane
+            // whose radar is switched off holds no frames —
+            // `dispatch_loop_renders` released them and retired its queue — so
+            // owning the identity would leave a sibling that really is drawing
+            // reading a grant nobody asked for. Registered only where the pane
+            // draws, which also makes the admission door's ruling-8 answer
+            // true: a prospective loop matching a switched-off pane's identity
+            // would find no resident set to share.
+            let identity = radar_drawn
+                .then(|| loop_product(ls))
+                .flatten()
+                .map(|product| LoopIdentity::of(pane, ls, product));
             let owner = match identity {
                 // A 3D pane with no product yet asks for nothing.
                 None if ls.view == squallar_radar::types::RenderView::Volume => {
@@ -5746,14 +5830,33 @@ impl super::App {
                     pane_need.volume_grids = 0;
                 }
                 None => {
-                    demand.push(pane_loop_need(
-                        pane,
-                        pane_idx,
-                        LoopKind::of(ls.view),
-                        ls,
-                        &self.budgets,
-                        &model,
-                    ));
+                    // **Radar's timeline is running, which is not the same as
+                    // radar being drawn.** Where it is, the need is radar's and
+                    // priced at its view's frame. Where it is not, this pane
+                    // may still be animating something the user can see — the
+                    // switch is per layer — so the need falls to the first
+                    // layer it draws, and to none at all when it draws none.
+                    // The scene row is untouched on every arm: `fit` is still
+                    // being told what this pane is holding.
+                    if radar_drawn {
+                        demand.push(pane_loop_need(
+                            pane,
+                            pane_idx,
+                            LoopKind::of(ls.view),
+                            ls,
+                            &self.budgets,
+                            &model,
+                        ));
+                    } else if let Some(drawn) = pane.animating_drawn_layers().next() {
+                        demand.push(pane_loop_need(
+                            pane,
+                            pane_idx,
+                            LoopKind::Overlay,
+                            &drawn.time,
+                            &self.budgets,
+                            &model,
+                        ));
+                    }
                     pane_need.looping = true;
                 }
             }
@@ -7211,9 +7314,13 @@ impl super::App {
             let (panes, overlays) = self.gui.visible_panes_and_overlays_mut();
             for (pane_idx, pane) in panes.iter_mut().enumerate() {
                 // The whole-pane share divides across every layer that is
-                // animating, radar included — the same denominator WI-5 built
-                // the frame list under.
-                let animating = pane.animating_layers().count();
+                // animating **and drawn**, radar included — the same
+                // denominator WI-5 built the frame list under, and the same
+                // set `pane_loop_need` sized the share for. A layer switched
+                // off holds no pictures and is passed over below; leaving it
+                // in the divisor would take half of what the pane was granted
+                // for one drawn layer and give it to nobody.
+                let animating = pane.animating_drawn_layers().count();
                 let ids: Vec<squallar_source::id::LayerId> = pane
                     .animating_layers()
                     .filter(|slot| slot.id != squallar_source::id::known::RADAR)
@@ -7593,7 +7700,13 @@ impl super::App {
             });
             // Read before the timeline is borrowed mutably: the divisor the
             // pane's layers share, and the clock a re-sampled list settles to.
-            let animating = pane.animating_layers().count();
+            // The **drawn** animating layers, which is the set the pane's share
+            // was asked for — see `pane_loop_need`. This walk is only reached
+            // for a pane that needs its radar data, so radar itself is always
+            // one of them; what the filter takes out is a satellite or a model
+            // layer the user switched off beside it, which would otherwise go
+            // on halving radar's own frame list.
+            let animating = pane.animating_drawn_layers().count();
             let clock = pane.time.mode;
             let ls = pane.time_state_mut(&known::RADAR);
             if !ls.is_active() {
@@ -9457,6 +9570,15 @@ pub(super) fn loop_ready_budget(
 /// own list. One layer alone is exactly its own need. `primary` is the layer
 /// the pane's clock walks — radar's timeline where radar loops, the first
 /// animating layer otherwise — and its cadence is the one the grant records.
+///
+/// **The layers walked are the ones the pane DRAWS**
+/// ([`squallar_egui::pane::PaneState::animating_drawn_layers`]), and they are
+/// the same set [`layer_share`]'s divisor counts. They have to be one set:
+/// sized over two layers and divided by three, the drawn layer gets less than
+/// it did before its neighbour was switched off, which is the defect turned
+/// inside out. A switched-off layer is holding no pictures, so pricing the
+/// need at its frame charges the pool for bytes nobody holds and buys the
+/// drawn layer nothing.
 fn pane_loop_need(
     pane: &squallar_egui::pane::PaneState,
     pane_idx: usize,
@@ -9470,7 +9592,7 @@ fn pane_loop_need(
     let mut span_secs = pane.time.span_secs;
     let mut base_frames = 0usize;
     let mut max_frames = 0usize;
-    for slot in pane.animating_layers() {
+    for slot in pane.animating_drawn_layers() {
         layers += 1;
         let ls = &slot.time;
         let layer_price = if slot.id == squallar_source::id::known::RADAR {
@@ -9966,6 +10088,13 @@ mod layer_share_tests;
 #[path = "app_render/loop_balloon_tests.rs"]
 #[cfg(test)]
 mod loop_balloon_tests;
+
+/// **Who divides the loop pool**: a loop on a pane that draws nothing takes
+/// base bytes and balloon frames from the panes that do, and a listing that
+/// lands after the switch-off used to drag a batch of volumes behind it.
+#[path = "app_render/loop_pool_demand_tests.rs"]
+#[cfg(test)]
+mod loop_pool_demand_tests;
 
 /// The Level III half of the loop: pairing a bucket object to each frame's volume,
 /// what a gap does, and what happens when a pane retargets across the datasource
