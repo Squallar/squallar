@@ -18,7 +18,7 @@ squallar-app/src/budget_arms.rs	17	17
 squallar-app/src/budget_memo.rs	52	52
 squallar-app/src/budget_telemetry.rs	895	889
 squallar-app/src/channels.rs	100	93
-squallar-app/src/frame_ledger.rs	1648	1563
+squallar-app/src/frame_ledger.rs	1674	1589
 squallar-app/src/frame_need.rs	66	66
 squallar-app/src/frame_pump.rs	27	27
 squallar-app/src/input.rs	138	127
@@ -27,7 +27,7 @@ squallar-app/src/loop_frame_store.rs	161	150
 squallar-app/src/loop_pool.rs	382	378
 squallar-app/src/loop_refill.rs	97	90
 squallar-app/src/loop_telemetry.rs	50	50
-squallar-app/src/platform.rs	473	380
+squallar-app/src/platform.rs	473	383
 squallar-app/src/platform_double.rs	349	329
 squallar-app/src/pressure.rs	218	210
 squallar-app/src/recovery.rs	176	171
@@ -100,7 +100,7 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	306	268
 squallar-egui/src/tile_mesh/ledger.rs	77	46
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	1542	1477
+squallar-egui/src/tile_source.rs	1542	1476
 squallar-egui/src/tile_source/byte_lru.rs	272	271
 squallar-egui/src/tile_source/cache_ledger.rs	181	165
 squallar-egui/src/tile_source/snap.rs	157	157
@@ -159,6 +159,7 @@ squallar-gpu/src/egui_renderer/texture_upload/resident.rs	47	47
 squallar-gpu/src/gpu_probe.rs	148	6
 squallar-gpu/src/lib.rs	1	0
 squallar-gpu/src/pressure.rs	18	18
+squallar-gpu/src/radar_fan.rs	634	77
 squallar-gpu/src/staging_ring.rs	232	128
 squallar-gpu/src/tile_mesh.rs	453	55
 squallar-icon/src/lib.rs	213	198
@@ -232,14 +233,14 @@ squallar-overlays/src/render/handlers/location.rs	76	58
 squallar-overlays/src/render/handlers/metar.rs	637	522
 squallar-overlays/src/render/handlers/mod.rs	164	162
 squallar-overlays/src/render/handlers/model.rs	2751	2582
-squallar-overlays/src/render/handlers/mrms.rs	674	603
+squallar-overlays/src/render/handlers/mrms.rs	674	604
 squallar-overlays/src/render/handlers/outlook.rs	1676	1620
 squallar-overlays/src/render/handlers/reports.rs	751	683
 squallar-overlays/src/render/handlers/sites.rs	98	80
 squallar-overlays/src/render/hatch.rs	279	275
-squallar-overlays/src/render/jobs.rs	2126	2081
+squallar-overlays/src/render/jobs.rs	2222	2119
 squallar-overlays/src/render/overlay_state.rs	892	821
-squallar-overlays/src/render/raster_buf.rs	61	53
+squallar-overlays/src/render/raster_buf.rs	75	64
 squallar-overlays/src/render/rasterize.rs	1376	1279
 squallar-overlays/src/render/rasterize/gridded_ledger.rs	39	39
 squallar-overlays/src/render/rasterize/lambert_fixture.rs	116	116
@@ -282,8 +283,8 @@ squallar-radar/src/nyquist.rs	126	107
 squallar-radar/src/palette.rs	562	540
 squallar-radar/src/product_spec.rs	444	443
 squallar-radar/src/render.rs	1316	1152
-squallar-radar/src/render/codes.rs	46	46
-squallar-radar/src/render/polar.rs	264	260
+squallar-radar/src/render/codes.rs	223	222
+squallar-radar/src/render/polar.rs	339	327
 squallar-radar/src/render_input.rs	663	633
 squallar-radar/src/sampler.rs	573	553
 squallar-radar/src/sampler/seam_fixture.rs	178	167
@@ -311,7 +312,7 @@ squallar-source/src/footprint.rs	68	62
 squallar-source/src/handler.rs	378	315
 squallar-source/src/hit.rs	26	19
 squallar-source/src/id.rs	52	52
-squallar-source/src/job.rs	275	205
+squallar-source/src/job.rs	301	211
 squallar-source/src/liveness.rs	39	39
 squallar-source/src/origins.rs	288	282
 squallar-source/src/product.rs	91	61
@@ -350,7 +351,7 @@ squallar-web/src/shared_loan.rs	77	73
 squallar-web/src/worker_heap.rs	92	86
 squallar-web/src/worker_retry.rs	51	51
 squallar-worker/src/job_registry.rs	8	8
-squallar-worker/src/offload.rs	543	516
+squallar-worker/src/offload.rs	567	516
 squallar-worker/src/offload/pool.rs	96	90
 squallar-worker/src/wire_identity.rs	139	138
 squallar/src/android/back.rs	26	0
