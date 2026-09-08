@@ -966,6 +966,35 @@ fn frame_ui_lines(u: &crate::frame_ledger::UiHists) -> [String; 9] {
 /// frames these histograms never see — and half the measured `ui` spikes are
 /// on idle frames. Read the share here; read the spike there.
 ///
+/// # …and neither does `frame worst:`. NOTHING reports the maximum of `stack`
+///
+/// The sentence above is the one every reader of this family follows, and it
+/// promises more than the columns deliver. `frame worst:` does not latch on
+/// `ui.stack`, or on any cut: it latches on **`service`**
+/// (`frame_ledger.rs`, `FrameLedger::finalize` —
+/// `if self.worst_since_boot.is_none_or(|w| service > w.service)`), and its
+/// `stack_*` columns are then simply whatever that frame's cuts happened to
+/// be. A frame with a large `stack` that was not its period's **service**
+/// maximum is never latched and never printed, so **every `stack_*` figure on
+/// that line is a LOWER BOUND on the maximum of the cut, not the maximum.**
+///
+/// The `boot:` half is worse, because it reads like a session maximum and is
+/// not one. It is monotone in `service` ALONE, so its `ui_stack` moves in
+/// either direction as the session goes on: measured on the native scene-D
+/// leg of 2026-09-08, run 3 printed `ui_stack=1353 us` on its FIRST tick and
+/// `ui_stack=132 us` on its LAST, because a later frame with a bigger present
+/// stall and a tiny `ui` displaced the record. A reader who takes the last
+/// `boot:` line as "the worst `stack` this session" is off by 10x, in the
+/// direction that hides the spike. **That misreading has already happened
+/// once**, in the lane that first pointed this family at a leg.
+///
+/// So the honest position for this whole family: `Hist` carries no maximum,
+/// the percentiles are bin-edge lower bounds, and `frame worst:` bounds the
+/// cut from below on the wrong key. **The maximum of `ui.stack` is not a
+/// figure this tree can currently produce.** Anyone who needs it has to add
+/// a latch keyed on the cut itself; until then, say "at least", and never
+/// quote a `stack_*` column as a maximum.
+///
 /// Emitted every tick, `n=0` included, on [`frame_segment_lines`]' terms.
 fn frame_stack_lines(s: &crate::frame_ledger::StackHists) -> [String; 7] {
     [

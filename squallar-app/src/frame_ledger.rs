@@ -1009,6 +1009,29 @@ pub(crate) struct WorstFrame {
     /// **Zero new clock reads**: the six stamps are already taken on every
     /// presented frame that reaches the pass; only seven `u32` subtractions
     /// moved out of the arm.
+    ///
+    /// # These seven are a LOWER BOUND on the cut, never its maximum
+    ///
+    /// **The latch key is `service`, not any cut.** [`FrameLedger::finalize`]
+    /// replaces this record only when a frame's `service` exceeds the stored
+    /// one, so these seven describe whichever frame was slowest OVERALL — and
+    /// a frame whose `stack` was large while its `service` was not is never
+    /// latched and never printed. Read "at least this much", never "at most".
+    ///
+    /// And the `boot:` copy is **not** a session maximum of anything but
+    /// `service`. It is monotone in that one field, so its `stack_cuts` move
+    /// in BOTH directions across a session: on the native scene-D leg of
+    /// 2026-09-08 run 3 printed `ui_stack=1353 us` on its first tick and
+    /// `132 us` on its last, a later present stall having displaced the
+    /// record with a frame that barely touched the UI. It reads like a
+    /// high-water mark and is not one; the first lane to point this family at
+    /// a leg misread it exactly that way before checking the key.
+    ///
+    /// Combined with [`Hist`] carrying no maximum, that leaves the maximum of
+    /// `ui.stack` **unreported by this tree**. Closing it means a latch keyed
+    /// on the cut, which is a new comparison per frame and was not worth it
+    /// on the evidence available when this landed — recorded here so the next
+    /// reader meets the gap rather than inferring a figure from these seven.
     pub(crate) stack_cuts: [u32; 7],
     /// The seven `pre` cuts of THIS frame, in [`PreHists`]' order:
     /// `[platform, ingest, evict, drops, autosave, gate, ensure]`. They
@@ -2463,11 +2486,36 @@ mod tests {
              than one clock read and four cuts carry the clock's dust: \
              {cuts:?}",
         );
-        assert_eq!(
-            cuts.iter().sum::<u32>(),
+        // **Telescoping here is a BOUND, not an equality, and the arm's own
+        // premise is why.** This arm's stamps come off the real clock, and
+        // the comment at the top of it says the reads are tens of nanoseconds
+        // apart -- so every one of the seven cuts truncates to 0 us while the
+        // parent `micros(statusbar, shell)` truncates to whatever the whole
+        // span happens to land on. On a quiet box that parent is 0 and the
+        // equality held by luck; under a loaded one the six reads cross a
+        // microsecond boundary, the parent rounds up to 1, and the assertion
+        // failed with `left: 0, right: 1` -- on a peer's `--workspace` board,
+        // for a lane that had not touched this file.
+        //
+        // That was a WALL-CLOCK assertion carrying a structural message: the
+        // property this gate exists for is that the seven cuts decompose the
+        // span and nothing hides between them, and that property is
+        // `sum <= parent` with a gap under the cut count. Seven truncating
+        // `micros` calls can lose at most `7 - 1 = 6` us between them (see
+        // `micros`), so the bound is exactly 6 and NOT ONE MICROSECOND MORE:
+        // a wider tolerance would swallow a genuinely missing, zeroed or
+        // mis-paired cut, which is the only thing this assertion is here to
+        // catch. `assert_telescopes_within_truncation` states both halves.
+        //
+        // Arm 2 below keeps the exact equality, and should: its stamps are
+        // synthetic offsets from one base, no clock runs between them, and
+        // equality is a real property of that arithmetic rather than a
+        // property of how fast the machine was.
+        assert_telescopes_within_truncation(
+            &cuts,
             micros(statusbar, shell),
-            "the seven cuts of an early-returning frame do not telescope to \
-             its own stack span",
+            "the seven cuts of an early-returning frame, off real back-to-back \
+             clock reads",
         );
 
         // ---- Arm 2: synthetic stamps, where the MAGNITUDES are checkable ----
@@ -2504,6 +2552,78 @@ mod tests {
              the time spent deciding not to draw is attributed to nothing",
         );
         assert_eq!(syn_cuts.iter().sum::<u32>(), micros(base, syn_shell));
+    }
+
+    /// **The load-sensitive shape that red-gated a peer's board, constructed
+    /// rather than waited for.**
+    ///
+    /// `an_early_return_zeroes_the_cuts_it_skipped_and_still_telescopes`'s
+    /// first arm takes its stamps off the real clock. Six back-to-back reads
+    /// are tens of nanoseconds on a quiet box, so historically every cut
+    /// truncated to 0 and so did the parent, and an exact-equality assertion
+    /// passed. Under a loaded box the same six reads straddle a microsecond
+    /// boundary: the cuts still truncate to 0 individually, the PARENT rounds
+    /// up to 1, and the assertion failed `left: 0, right: 1`.
+    ///
+    /// Reproducing that by loading the machine is not a test. This builds the
+    /// arithmetic directly: a span of 1,200 ns whose seven sub-spans are each
+    /// under 1,000 ns. `sum` is 0, `parent` is 1, and the ONLY thing that
+    /// separates a passing gate from a failing one is whether the assertion
+    /// is an equality or the truncation bound.
+    ///
+    /// **This test is red against the equality it replaced** — that is what
+    /// makes it a regression test rather than a restatement.
+    #[test]
+    fn a_sub_microsecond_stack_span_whose_parent_rounds_up_still_telescopes() {
+        let base = Instant::now();
+        // The early-return shape: one filler instant for the five stamps
+        // `skipped_after` fills, placed 600 ns in -- inside the same
+        // microsecond as `base`.
+        let filler = base + std::time::Duration::from_nanos(600);
+        let stack = squallar_egui::shell_api::StackStamps {
+            snapped: filler,
+            gated: filler,
+            hydrated: filler,
+            statused: filler,
+            rendered: filler,
+            inspected: filler,
+        };
+        // The parent closes at 1,200 ns, which is a DIFFERENT microsecond
+        // from `base`. This is the whole defect in three instants.
+        let shell = base + std::time::Duration::from_nanos(1_200);
+
+        let cuts = stack_phase_micros(base, &stack, shell);
+        let parent = micros(base, shell);
+        assert_eq!(
+            cuts, [0; 7],
+            "every sub-span is under a microsecond, so every cut must \
+             truncate to zero; if one did not, this fixture no longer builds \
+             the shape it exists to build: {cuts:?}",
+        );
+        assert_eq!(
+            parent, 1,
+            "the parent span must round UP to 1 us while its parts round \
+             DOWN to 0 -- that mismatch IS the defect under test, and a \
+             parent of {parent} means the fixture has stopped reproducing it",
+        );
+        assert_eq!(
+            cuts.iter().sum::<u32>(),
+            0,
+            "the sum of the truncated parts must be 0 against a parent of 1",
+        );
+
+        // The property, which holds: the cuts claim no time the parent did
+        // not have, and fall short by less than the cut count.
+        let gap = assert_telescopes_within_truncation(
+            &cuts,
+            parent,
+            "a sub-microsecond early-return span",
+        );
+        assert_eq!(
+            gap, 1,
+            "the whole gap here is one microsecond of truncation dust, well \
+             inside the 6 us seven truncating micros() calls can lose",
+        );
     }
 
     /// **The family records on exactly the frames its parent cut does.**
