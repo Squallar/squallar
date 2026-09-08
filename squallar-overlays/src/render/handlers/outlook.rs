@@ -415,12 +415,12 @@ impl SpcOutlookHandler {
     /// Every enabled product's features, concatenated in the order they will be
     /// painted — for the products whose issuance is **in force at `as_of`**.
     ///
-    /// The as-of filter (WB-5, [`TimeAxis::EventLifetime`]): two `Option`
-    /// comparisons against `valid`/`expire`, parsed once at fetch. A side
-    /// that did not parse passes on that side — an issuance is never dropped
-    /// for want of a readable time (the `NwsAlert` rule). The `expire` half
-    /// is what keeps a later instant from wearing an outlook that has lapsed;
-    /// a `valid`-only filter would draw every held issuance forever forward.
+    /// The as-of filter (WB-5, [`TimeAxis::EventLifetime`]) is
+    /// [`SpcOutlook::in_force_at`], which both this walk and
+    /// [`Self::clickable_items`] go through so the painted set and the
+    /// clickable set cannot drift apart. Its bounds are `issue` and `expire`,
+    /// **not** `valid`: see that method for why a `valid` lower bound draws
+    /// nothing at all.
     fn features_in_paint_order(
         &self,
         view: &OutlookPaneState,
@@ -449,9 +449,7 @@ impl SpcOutlookHandler {
             .filter(move |product| enabled.contains(product))
             .filter_map(move |&product| {
                 let outlook = self.state.data.get(&(day, product))?;
-                let in_force = outlook.valid.is_none_or(|valid| valid <= as_of)
-                    && outlook.expire.is_none_or(|expire| as_of < expire);
-                in_force.then_some((product, outlook))
+                outlook.in_force_at(as_of).then_some((product, outlook))
             })
     }
 
@@ -697,14 +695,25 @@ impl OverlayHandler for SpcOutlookHandler {
         self.state.data.len()
     }
 
+    /// **The same walk the picture is painted from**, so a polygon can offer a
+    /// popup only while it is also on the glass. This half used to iterate
+    /// `enabled_products` with no as-of filter at all while
+    /// [`Self::paint_input`] filtered, and the gap between them is what the
+    /// user saw: nothing drawn, and a tap on the empty map still opening an
+    /// outlook's details.
+    ///
+    /// **The instant is the wall clock, and on a scrubbed pane that is not the
+    /// pane's.** A hit test has no [`RasterizeContext`] — [`PaneRef`] carries
+    /// no clock — so the two halves coincide exactly on a live pane and the
+    /// scrubbed pane's hit set is the live one. That residual is narrower than
+    /// the unfiltered walk it replaces, and closing it means putting `as_of`
+    /// on `PaneRef`.
     fn clickable_items<'a>(&'a self, pane: &PaneRef<'_>) -> Vec<ClickableItem<'a>> {
         let view = self.view(pane);
         let day = view.selected_day;
+        let now = chrono::Utc::now().naive_utc();
         let mut items = Vec::new();
-        for &product in &view.enabled_products {
-            let Some(outlook) = self.state.data.get(&(day, product)) else {
-                continue;
-            };
+        for (product, outlook) in self.in_force_in_paint_order(view, now) {
             for feature in &outlook.features {
                 items.push(ClickableItem {
                     features: std::slice::from_ref(feature),
@@ -1092,6 +1101,7 @@ mod tests {
         SpcOutlook {
             day: OutlookDay::Day3,
             product,
+            issue: None,
             valid: None,
             expire: None,
             features: Vec::new(),
@@ -1454,6 +1464,7 @@ mod tests {
         SpcOutlook {
             day: OutlookDay::Day1,
             product,
+            issue: None,
             valid: None,
             expire: None,
             features: Vec::new(),
@@ -2114,8 +2125,10 @@ mod tests {
         }
     }
 
-    /// A Day-1 categorical handler holding one issuance with the given window.
+    /// A Day-1 categorical handler holding one issuance published at `issue`
+    /// and describing `valid`..`expire`.
     fn day1_with_window(
+        issue: Option<chrono::NaiveDateTime>,
         valid: Option<chrono::NaiveDateTime>,
         expire: Option<chrono::NaiveDateTime>,
     ) -> SpcOutlookHandler {
@@ -2135,6 +2148,7 @@ mod tests {
             SpcOutlook {
                 day: OutlookDay::Day1,
                 product: OutlookProduct::Categorical,
+                issue,
                 valid,
                 expire,
                 features: vec![feature],
@@ -2157,12 +2171,18 @@ mod tests {
     /// comparison keeps 18Z green and turns both day-2 readings red.
     #[test]
     fn an_outlook_draws_only_while_its_issuance_is_in_force() {
-        let handler = day1_with_window(Some(at(22, 13)), Some(at(23, 12)));
+        let handler = day1_with_window(Some(at(22, 6)), Some(at(22, 13)), Some(at(23, 12)));
 
         assert_eq!(
-            labels_at(&handler, at(22, 11)),
+            labels_at(&handler, at(22, 5)),
             Vec::<String>::new(),
-            "before `valid` the issuance is not yet in force",
+            "before `issue` the outlook did not exist yet",
+        );
+        assert_eq!(
+            labels_at(&handler, at(22, 11)),
+            vec!["SLGT".to_owned()],
+            "published at 06Z and describing 13Z onward: the six hours between \
+             them are the product's own lead time, not a gap in it",
         );
         assert_eq!(
             labels_at(&handler, at(22, 18)),
@@ -2182,6 +2202,144 @@ mod tests {
         );
     }
 
+    /// SPC's own Day-2 categorical bytes, captured from the live endpoint at
+    /// 2026-09-08T07:44Z and saved unmodified. Its window is the ordinary
+    /// shape of every outlook SPC publishes: `ISSUE` 2026-09-08 05:13Z,
+    /// `VALID` 2026-09-09 12:00Z, `EXPIRE` 2026-09-10 12:00Z — published
+    /// thirty-one hours before the day it describes begins.
+    const DAY2_CATEGORICAL: &str =
+        include_str!("../../../testdata/day2otlk_20260908_0513_cat.lyr.geojson");
+
+    fn utc(y: i32, m: u32, d: u32, h: u32, min: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, min, 0)
+            .unwrap()
+    }
+
+    /// A handler holding `outlook` as the pane's selected day and product.
+    fn holding(outlook: SpcOutlook) -> SpcOutlookHandler {
+        let mut handler = SpcOutlookHandler::new();
+        handler.defaults = OutlookPaneState {
+            selected_day: outlook.day,
+            enabled_products: HashSet::from([outlook.product]),
+        };
+        handler
+            .state
+            .data
+            .insert((outlook.day, outlook.product), outlook);
+        handler
+    }
+
+    /// **The user's report, on SPC's own bytes: nothing painted, popup fine.**
+    ///
+    /// A forecast's window is in the future *by construction* — that is what
+    /// makes it a forecast. `VALID` is the period the outlook **describes**;
+    /// the filter was using it as the period the outlook **applies**, so
+    /// `valid <= as_of` was false for every product SPC publishes and
+    /// [`SpcOutlookHandler::paint_input`] answered `None` at every instant.
+    /// `prepare_job` then described no job and `App::spawn_overlay_render`
+    /// returned before offloading anything, so no picture was ever made —
+    /// while `clickable_items` walked the held data unfiltered and kept
+    /// handing out popups for polygons that were never drawn.
+    ///
+    /// Days 2 through 8 could never satisfy it at any instant. Day 1 could
+    /// not either between its 06Z issuance and the 12Z its window opens.
+    #[test]
+    fn a_day2_outlook_paints_on_the_afternoon_it_was_issued() {
+        let outlook = crate::spc::outlook::parse_geojson(
+            &serde_json::from_str(DAY2_CATEGORICAL).expect("the fixture is JSON"),
+            OutlookDay::Day2,
+            OutlookProduct::Categorical,
+        )
+        .expect("SPC's own bytes parse");
+
+        // The fixture is a real forecast shape and the constructor is what
+        // reads it: issued before the instant below, describing a day that
+        // starts well after it. A hand-built fixture would prove neither.
+        assert_eq!(
+            outlook.issue,
+            Some(utc(2026, 9, 8, 5, 13)),
+            "the parser reads ISSUE - the field the in-force test is bounded by",
+        );
+        assert_eq!(outlook.valid, Some(utc(2026, 9, 9, 12, 0)));
+        assert!(
+            outlook.issue < outlook.valid,
+            "precondition: this is a FORECAST, published before the day it describes",
+        );
+        assert_eq!(outlook.features.len(), 2, "TSTM and MRGL");
+
+        let handler = holding(outlook);
+        // Mid-afternoon on the day it was issued: after ISSUE, and thirty-one
+        // hours before VALID. This is a live pane on an ordinary day.
+        let as_of = utc(2026, 9, 8, 19, 0);
+        let input = handler
+            .paint_input(&paint_ctx(as_of), &handler.defaults)
+            .expect("a published Day-2 outlook describes a job on the day it is issued");
+        assert_eq!(input.features.len(), 2, "both risk areas travel");
+    }
+
+    /// **The two halves cannot disagree.** Whatever is on the glass is what
+    /// offers a popup, because [`SpcOutlookHandler::clickable_items`] and
+    /// [`SpcOutlookHandler::paint_input`] now walk the same
+    /// [`SpcOutlook::in_force_at`]. The hit half used to filter on nothing at
+    /// all, which is the half of the defect the user could see working.
+    ///
+    /// Both windows are anchored to the wall clock rather than to a fixed
+    /// date, because `clickable_items` has no context to take an instant from
+    /// and reads that clock itself — a fixed-date fixture here would pass
+    /// today and rot on a date.
+    #[test]
+    fn the_clickable_set_is_the_painted_set() {
+        let base = crate::spc::outlook::parse_geojson(
+            &serde_json::from_str(DAY2_CATEGORICAL).expect("the fixture is JSON"),
+            OutlookDay::Day2,
+            OutlookProduct::Categorical,
+        )
+        .expect("SPC's own bytes parse");
+        let now = chrono::Utc::now().naive_utc();
+        let hours = chrono::Duration::hours;
+
+        // The live reading: SPC's real geometry under this morning's issuance,
+        // describing tomorrow — the Day-2 shape, re-dated so the test cannot
+        // rot. Painted, and therefore clickable.
+        let live = holding(SpcOutlook {
+            issue: Some(now - hours(2)),
+            valid: Some(now + hours(22)),
+            expire: Some(now + hours(46)),
+            ..base.clone()
+        });
+        assert!(
+            live.paint_input(&paint_ctx(now), &live.defaults).is_some(),
+            "a Day-2 issuance published two hours ago is on the glass",
+        );
+        assert_eq!(
+            live.clickable_items(&PaneRef::bare(0)).len(),
+            2,
+            "and both of its areas answer a tap",
+        );
+
+        // The lapsed reading: a hold that was never replaced. Not painted,
+        // and therefore not clickable either - which is the direction the
+        // unfiltered hit walk got wrong.
+        let lapsed = holding(SpcOutlook {
+            issue: Some(now - hours(72)),
+            valid: Some(now - hours(48)),
+            expire: Some(now - hours(24)),
+            ..base
+        });
+        assert!(
+            lapsed
+                .paint_input(&paint_ctx(now), &lapsed.defaults)
+                .is_none(),
+            "a lapsed issuance is off the glass",
+        );
+        assert!(
+            lapsed.clickable_items(&PaneRef::bare(0)).is_empty(),
+            "nothing off the glass may open a popup",
+        );
+    }
+
     /// **The cross-cutting non-triviality: a LIVE pane is byte-identical.**
     /// At the live instant, an issuance whose window contains now paints the
     /// same input as one with no parsed window at all — which is the
@@ -2190,10 +2348,11 @@ mod tests {
     fn a_live_pane_paints_the_unwindowed_picture() {
         let now = chrono::Utc::now().naive_utc();
         let windowed = day1_with_window(
+            Some(now - chrono::Duration::hours(12)),
             Some(now - chrono::Duration::hours(6)),
             Some(now + chrono::Duration::hours(6)),
         );
-        let unwindowed = day1_with_window(None, None);
+        let unwindowed = day1_with_window(None, None, None);
         let live = windowed.paint_input(&paint_ctx(now), &windowed.defaults);
         assert!(
             live.as_ref()
@@ -2215,7 +2374,7 @@ mod tests {
     /// back inside it is a hit on the held row, not a rebuild.
     #[test]
     fn the_built_input_is_reused_until_a_term_of_the_picture_moves() {
-        let mut handler = day1_with_window(Some(at(22, 13)), Some(at(23, 12)));
+        let mut handler = day1_with_window(Some(at(22, 6)), Some(at(22, 13)), Some(at(23, 12)));
         let pane = PaneRef::bare(0);
         let first = handler.prepare_job(&paint_ctx(at(22, 14)), &pane).unwrap();
         let second = handler.prepare_job(&paint_ctx(at(22, 20)), &pane).unwrap();
@@ -2275,6 +2434,7 @@ mod tests {
             Ok(SpcOutlook {
                 day: OutlookDay::Day1,
                 product: OutlookProduct::Categorical,
+                issue: None,
                 valid: None,
                 expire: None,
                 features: Vec::new(),

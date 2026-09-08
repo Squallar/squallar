@@ -150,9 +150,43 @@ impl std::fmt::Display for OutlookProduct {
 pub struct SpcOutlook {
     pub day: OutlookDay,
     pub product: OutlookProduct,
+    /// When SPC published this issuance — `ISSUE` in the GeoJSON.
+    ///
+    /// **Not `valid`.** An outlook is a forecast, so `valid`/`expire` delimit
+    /// the period it *describes*, which is ahead of publication by up to a
+    /// week; `issue` is the instant from which it is the product to show.
+    pub issue: Option<NaiveDateTime>,
     pub valid: Option<NaiveDateTime>,
     pub expire: Option<NaiveDateTime>,
     pub features: Vec<OverlayFeature>,
+}
+
+impl SpcOutlook {
+    /// Whether this issuance is the one a pane depicting `as_of` should be
+    /// wearing.
+    ///
+    /// **The lower bound is `issue`, not `valid`, and that distinction is the
+    /// whole point.** An outlook is a *forecast*: `valid`/`expire` delimit the
+    /// convective day it describes, which is ahead of publication by twelve
+    /// hours for Day 1 and by up to a week for Day 8. Comparing a live pane's
+    /// clock against `valid` therefore asks "has the forecast period started
+    /// yet", answers no for every product SPC publishes, and draws nothing —
+    /// measured against the live endpoints at 2026-09-08T07:44Z, where the
+    /// current Day 1 issuance was `ISSUE` 0538Z but `VALID` 1200Z. `issue` is
+    /// the instant from which this is the product to show, so a pane scrubbed
+    /// to before it still draws nothing rather than wearing a forecast that
+    /// did not exist yet.
+    ///
+    /// `expire` stays exclusive and stays load-bearing: it is what keeps a
+    /// hold that was never replaced — the app slept, a fetch round failed —
+    /// off the glass once the day it describes has passed.
+    ///
+    /// A side that did not parse passes on that side: an issuance is never
+    /// dropped for want of a readable time.
+    pub fn in_force_at(&self, as_of: NaiveDateTime) -> bool {
+        self.issue.is_none_or(|issue| issue <= as_of)
+            && self.expire.is_none_or(|expire| as_of < expire)
+    }
 }
 
 /// Origin must come from
@@ -234,6 +268,7 @@ pub fn parse_geojson(
     // (`rasterize::rasterize_spc_outlooks`), so this is the paint order.
     let mut risk = Vec::new();
     let mut overlays = Vec::new();
+    let mut issue: Option<NaiveDateTime> = None;
     let mut valid: Option<NaiveDateTime> = None;
     let mut expire: Option<NaiveDateTime> = None;
 
@@ -244,6 +279,7 @@ pub fn parse_geojson(
         let ParsedOutlookFeature {
             feature,
             layer,
+            issue: feat_issue,
             valid: feat_valid,
             expire: feat_expire,
         } = match parse_outlook_feature(feature_val) {
@@ -254,6 +290,9 @@ pub fn parse_geojson(
                 continue;
             }
         };
+        if issue.is_none() {
+            issue = feat_issue;
+        }
         if valid.is_none() {
             valid = feat_valid;
         }
@@ -274,6 +313,7 @@ pub fn parse_geojson(
     Ok(SpcOutlook {
         day,
         product,
+        issue,
         valid,
         expire,
         features: risk,
@@ -283,6 +323,7 @@ pub fn parse_geojson(
 struct ParsedOutlookFeature {
     feature: OverlayFeature,
     layer: OutlookLayer,
+    issue: Option<NaiveDateTime>,
     valid: Option<NaiveDateTime>,
     expire: Option<NaiveDateTime>,
 }
@@ -407,6 +448,10 @@ fn parse_outlook_feature(
     let fill_rgba = super::colors::parse_hex_color(fill_hex, layer.fill_alpha());
     let stroke_rgba = super::colors::parse_hex_color(stroke_hex, 255);
 
+    let issue = properties
+        .get("ISSUE")
+        .and_then(|v| v.as_str())
+        .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y%m%d%H%M").ok());
     let valid = properties
         .get("VALID")
         .and_then(|v| v.as_str())
@@ -452,6 +497,7 @@ fn parse_outlook_feature(
     Ok(Some(ParsedOutlookFeature {
         feature,
         layer,
+        issue,
         valid,
         expire,
     }))

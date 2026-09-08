@@ -131,6 +131,7 @@ fn seed(app: &mut crate::app::App, id: &LayerId) {
                 result: Ok(SpcOutlook {
                     day: OutlookDay::Day1,
                     product: OutlookProduct::Categorical,
+                    issue: None,
                     valid: None,
                     expire: None,
                     features: vec![a_feature()],

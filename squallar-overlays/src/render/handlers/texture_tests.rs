@@ -197,6 +197,7 @@ fn outlook_fixture() -> crate::spc::outlook::SpcOutlook {
     SpcOutlook {
         day: OutlookDay::Day1,
         product: OutlookProduct::Categorical,
+        issue: None,
         valid: None,
         expire: None,
         features: vec![feature()],

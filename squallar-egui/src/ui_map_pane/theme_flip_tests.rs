@@ -41,6 +41,7 @@ fn gui_with_an_outlook() -> Gui {
                 result: Ok(SpcOutlook {
                     day: OutlookDay::Day1,
                     product: OutlookProduct::Categorical,
+                    issue: None,
                     valid: None,
                     expire: None,
                     features: vec![feature],
