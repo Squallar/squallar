@@ -608,9 +608,12 @@ const _: () = assert!(PENDING_CAP == 9 * 7);
 /// per-arm value in this module, and a selected value rather than a fork in
 /// [`AdmissionLedger::decide`]'s body.
 ///
-/// `true` on native, where the doors exist for a real measured failure: an
-/// integrated adapter placing its pictures in memory shared with the
-/// compositor, on a machine that hard-froze rather than reported a wall.
+/// `true` on native, where a refusal has something to protect that the
+/// platform will not report: an integrated adapter places its pictures in
+/// memory shared with the compositor, so there is no distinct device wall to
+/// be hit and an over-commitment is simply taken out of the pool the rest of
+/// the machine is running in. Nothing announces that, which is why the door
+/// rather than an error is what has to hold the line.
 ///
 /// `false` on wasm32, from 2026-09-06. Enforcing there took three user-visible
 /// functions with it inside hours of landing — a loaded whole-picture layer
