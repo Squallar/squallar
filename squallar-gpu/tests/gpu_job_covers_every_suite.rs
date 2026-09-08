@@ -371,3 +371,47 @@ fn the_column_zero_rule_really_discriminates() {
          that the classifier has not simply stopped reading the files.",
     );
 }
+
+/// **The job runs every derived suite even after one of them fails.**
+///
+/// `cargo test` stops at the first failing *target* unless told otherwise, and
+/// this job hands it fourteen. Without `--no-fail-fast` a red in an early suite
+/// means the later ones never run, and nothing in the log says so — a suite
+/// that was never started prints nothing at all, so the row reads as "one
+/// failure" when what it actually established is "one failure and thirteen
+/// unknowns".
+///
+/// That is not hypothetical. Over the nine red runs on `main` between
+/// 2026-09-07 and 2026-09-08, four stopped in `gpu_probe` having reached 3 of
+/// the 14 derived suites and five stopped in `tile_mesh_gpu` having reached 5.
+/// `volume_shader_mutants` — the mutation battery that is the guard on every
+/// other volume suite in this directory — ran in none of the nine.
+///
+/// The derivation above exists so that a suite cannot be forgotten by a stale
+/// list. This is the same defect one layer down: a suite that is named, and
+/// then not run, because an earlier one broke.
+#[test]
+fn the_gpu_job_runs_every_derived_suite_even_after_one_fails() {
+    let shell = gpu_job_shell();
+    let invocation = shell
+        .lines()
+        .find(|l| l.contains("cargo test -p squallar-gpu") && l.contains("${args[@]}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the gpu job no longer runs `cargo test -p squallar-gpu` over \
+                 the derived `${{args[@]}}`; this assertion has lost its \
+                 subject and every claim below it would be vacuous",
+            )
+        });
+    assert!(
+        invocation.contains("--no-fail-fast"),
+        "the gpu job's integration step runs `{}` without `--no-fail-fast`. \
+         cargo will stop at the first failing target of the fourteen, and the \
+         suites after it will not run *and will not be reported as skipped*. \
+         The flag costs nothing — the step's exit status is identical, since \
+         cargo still fails when any target failed — and it is the difference \
+         between a red that names every broken suite and one that has to be \
+         bisected by re-running CI.",
+        invocation.trim(),
+    );
+}

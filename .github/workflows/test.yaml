@@ -182,7 +182,27 @@ jobs:
             echo "::error::derived only ${#ran[@]} suites; the glob or the marker has broken"
             exit 1
           fi
-          cargo test -p squallar-gpu "${args[@]}" -- --ignored --nocapture
+          # `--no-fail-fast` because without it this row hides its own scope.
+          # cargo stops at the first *target* that fails, and the targets run in
+          # the derived (alphabetical) order above, so a red in an early suite
+          # means every later one simply never ran -- and the log gives no hint
+          # of it, because a suite that was never started prints nothing.
+          #
+          # Measured over the nine red runs on `main` between 2026-09-07 and
+          # 2026-09-08: four failed in `gpu_probe` and reached 3 of the 14
+          # derived suites, five failed in `tile_mesh_gpu` and reached 5 of 14.
+          # `volume_shader_mutants` -- the mutation battery that is the guard on
+          # every other volume suite -- ran in none of them. So on every red
+          # commit in that window the shader nobody had proved was being read
+          # was, again, not proved, and the row reported one failure while
+          # concealing that it had not looked for nine or eleven others.
+          #
+          # The exit status is unchanged: cargo still fails the step if any
+          # target failed. All this buys is that the log names every suite that
+          # broke instead of only the first, which is the difference between a
+          # red that is legible and one that has to be bisected by re-running.
+          # Held by `the_gpu_job_runs_every_derived_suite_even_after_one_fails`.
+          cargo test -p squallar-gpu "${args[@]}" --no-fail-fast -- --ignored --nocapture
       - name: Run the adapter-only unit tests
         # The `#[ignore]`d tests that live in a lib rather than in
         # squallar-gpu/tests. Two crates have them: the renderer's sentinel
