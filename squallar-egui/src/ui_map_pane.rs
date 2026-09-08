@@ -1818,6 +1818,7 @@ fn handle_radar_site_interactions(
         pane_rect,
         excluded_rects,
         click_consumed,
+        galley_cache,
         ..
     } = ctx;
     let pane_idx = *pane_idx;
@@ -1830,11 +1831,6 @@ fn handle_radar_site_interactions(
     let click_pos = *overlay_click_pos;
 
     let is_dark = ui.ctx().global_style().visuals.dark_mode;
-    let text_color = if is_dark {
-        egui::Color32::WHITE
-    } else {
-        egui::Color32::BLACK
-    };
 
     // Read once, before the click arm below borrows `pane` mutably. Which
     // station is current and which is loading is what the three marker fills
@@ -1860,7 +1856,12 @@ fn handle_radar_site_interactions(
     // `label_order`'s order is what makes the result stable: the first name to
     // ask finds nothing claimed and therefore always draws, so a viewport with
     // any station in it can never come back with every name suppressed.
-    if zoom >= SITE_LABEL_MIN_ZOOM {
+    if zoom >= SITE_LABEL_MIN_ZOOM && !sites.is_empty() {
+        // The galley memo's own frame check, and it is inside this gate rather
+        // than at the top: it costs a `Context::fonts` read, which is a write
+        // lock on the whole context, and below the label zoom there is nothing
+        // for it to protect.
+        galley_cache.begin_frame(ui.ctx());
         let mut occupied = walkers::OccupiedAreas::new();
         let ranks = site_label_ranks(sites, pane);
         for idx in crate::site_marker::label_order(&ranks) {
@@ -1868,11 +1869,11 @@ fn handle_radar_site_interactions(
             let text_pos = egui::pos2(site.screen.x, site.screen.y + icon_size / 2.0 + 3.0);
             crate::site_marker::try_draw_site_label(
                 ui.painter(),
+                galley_cache,
                 &mut occupied,
                 text_pos,
                 site.site.name,
                 egui::FontId::monospace(font_size),
-                text_color,
                 is_dark,
             );
         }

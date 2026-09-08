@@ -373,31 +373,159 @@ fn the_label_order_is_selected_first_then_the_tables_own_order() {
     );
 }
 
-/// Lay a set of names out and report which ones drew.
-fn placed_names(anchors: &[(egui::Pos2, &str)]) -> Vec<String> {
-    let ctx = egui::Context::default();
+/// What one pass of the label phase did.
+struct PassOutcome {
+    /// The names that drew, in the order they drew.
+    drew: Vec<String>,
+    /// Galleys **epaint** had to lay out and keep over this pass — read from
+    /// its own cache across the pass, so it counts the layouts whatever route
+    /// asked for them.
+    epaint_galleys: usize,
+}
+
+/// One pass of the label phase over `anchors`, against the caller's own memo
+/// and context.
+fn label_pass(
+    ctx: &egui::Context,
+    galleys: &mut walkers::GalleyCache,
+    anchors: &[(egui::Pos2, &str)],
+    is_dark: bool,
+) -> PassOutcome {
     ctx.begin_pass(egui::RawInput {
         screen_rect: Some(canvas()),
         ..Default::default()
     });
     let painter = egui::Painter::new(ctx.clone(), egui::LayerId::background(), canvas());
+    galleys.begin_frame(ctx);
+    let before = ctx.fonts(|f| f.num_galleys_in_cache());
     let mut occupied = walkers::OccupiedAreas::new();
     let mut drew = Vec::new();
     for (at, name) in anchors {
         if try_draw_site_label(
             &painter,
+            galleys,
             &mut occupied,
             *at,
             name,
             egui::FontId::monospace(10.0),
-            egui::Color32::WHITE,
-            true,
+            is_dark,
         ) {
             drew.push((*name).to_owned());
         }
     }
+    let epaint_galleys = ctx
+        .fonts(|f| f.num_galleys_in_cache())
+        .saturating_sub(before);
     let _ = ctx.end_pass();
-    drew
+    PassOutcome {
+        drew,
+        epaint_galleys,
+    }
+}
+
+/// Lay a set of names out and report which ones drew.
+fn placed_names(anchors: &[(egui::Pos2, &str)]) -> Vec<String> {
+    let ctx = egui::Context::default();
+    let mut galleys = walkers::GalleyCache::default();
+    label_pass(&ctx, &mut galleys, anchors, true).drew
+}
+
+/// Three station names far enough apart that all three draw, so the count
+/// below is over labels that took both halves of the old path.
+const SEPARATED: [(egui::Pos2, &str); 3] = [
+    (egui::pos2(200.0, 200.0), "KTLX"),
+    (egui::pos2(700.0, 300.0), "KINX"),
+    (egui::pos2(1200.0, 800.0), "KVNX"),
+];
+
+/// **One name, one layout — not one to measure the plate and another to draw
+/// it.**
+///
+/// `try_draw_site_label` has to know how wide a name came out before it can
+/// claim the screen for it, and the only thing that knows is a laid-out
+/// galley. It used to lay the name out twice for that: once in a hard-coded
+/// `Color32::WHITE` to measure, then again in the ink to draw. epaint keys its
+/// galley cache by the whole layout job, **colour included**, so those were
+/// two distinct entries and two full layouts — a `String` allocated from the
+/// name and a write lock on the context, each — for one string of glyphs whose
+/// metrics do not depend on its colour.
+///
+/// **Counted off epaint's own cache, not off ours.** `num_galleys_in_cache` is
+/// egui's figure and knows nothing about which route asked, so it counts the
+/// two-layout shape and the one-layout shape alike; a gate reading
+/// `walkers::GalleyCache`'s counters would only be able to see the route that
+/// replaced the defect.
+///
+/// **Light theme on purpose.** The ink is `BLACK` there and the measure pass
+/// used `WHITE`, so the two entries are distinct. In dark theme the ink is
+/// `WHITE` too, the two layout jobs collide in epaint's cache, and the defect
+/// is invisible to any count — which is exactly the reason this fixture names
+/// its theme.
+#[test]
+fn a_station_name_is_laid_out_once_and_not_once_per_colour() {
+    let ctx = egui::Context::default();
+    let mut galleys = walkers::GalleyCache::default();
+    let pass = label_pass(&ctx, &mut galleys, &SEPARATED, false);
+
+    assert_eq!(
+        pass.drew.len(),
+        SEPARATED.len(),
+        "the fixture's premise: all three names must draw, or the count \
+         below is over labels that never reached the drawing half",
+    );
+    assert_eq!(
+        pass.epaint_galleys,
+        SEPARATED.len(),
+        "one galley per name. Twice that is the measure-then-draw shape \
+         back: the plate measured from a WHITE layout the drawing throws \
+         away",
+    );
+}
+
+/// **A frame that re-draws the same names lays nothing out at all.**
+///
+/// The station vocabulary is fixed — 208 four-letter names — and
+/// `site_label_font_size` clamps to exactly 12.0 at every zoom that draws one,
+/// so what a pan changes is where each name is anchored and nothing the memo
+/// is keyed on. Before the memo, every visible station paid a fresh layout on
+/// every frame of every gesture; a viewport at the label zoom on a wide canvas
+/// holds most of the table.
+///
+/// The first two passes are warm-up: egui rasterises the glyphs on the first
+/// and the memo drops itself whenever the font atlas moves under it, which it
+/// does while the atlas is still filling. What is asserted is the *settled*
+/// frame — the one a gesture spends all but its first frames in.
+#[test]
+fn a_repeat_frame_of_the_same_names_lays_out_nothing() {
+    let ctx = egui::Context::default();
+    let mut galleys = walkers::GalleyCache::default();
+    for _ in 0..2 {
+        let _ = label_pass(&ctx, &mut galleys, &SEPARATED, false);
+    }
+
+    let layouts = galleys.layouts();
+    let hits = galleys.hits();
+    let pass = label_pass(&ctx, &mut galleys, &SEPARATED, false);
+
+    assert_eq!(
+        pass.drew.len(),
+        SEPARATED.len(),
+        "the same three names must still all draw on the settled frame",
+    );
+    assert_eq!(
+        galleys.layouts() - layouts,
+        0,
+        "a settled frame re-drawing names it has already seen must lay out \
+         none of them",
+    );
+    assert_eq!(
+        galleys.hits() - hits,
+        SEPARATED.len() as u64,
+        "and every one of them must have been answered by the memo -- a \
+         zero here with zero layouts would mean the labels stopped being \
+         asked for",
+    );
+    assert_eq!(pass.epaint_galleys, 0, "and nothing reached epaint either");
 }
 
 /// **The user's report, as an assertion: `KMPX` and `KMSP` stop drawing on top

@@ -383,23 +383,18 @@ pub(crate) fn label_order(ranks: &[LabelRank]) -> Vec<usize> {
 /// between touching and not.
 const LABEL_GUTTER_POINTS: f32 = 1.0;
 
-/// The screen a station's name would take at `anchor`, plate and gutter
-/// included.
+/// The ink a station's name is set in, and the plate behind it, from the one
+/// thing that decides both.
 ///
-/// Measured from the laid-out galley rather than from a character count: the
-/// name is set by egui at a point size, so only egui knows how wide it came
-/// out.
-pub(crate) fn label_area(
-    painter: &egui::Painter,
-    anchor: egui::Pos2,
-    name: &str,
-    font: egui::FontId,
-) -> egui::Rect {
-    let galley = painter.layout_no_wrap(name.to_owned(), font, egui::Color32::WHITE);
-    egui::Align2::CENTER_TOP
-        .anchor_size(anchor, galley.size())
-        .expand2(egui::vec2(2.0, 1.0))
-        .expand(LABEL_GUTTER_POINTS)
+/// A parameter until 2026-09-08, and it was never anything but this expression
+/// evaluated at the call site: two arguments for one bit, with nothing holding
+/// the ink and the plate to the same theme.
+fn label_colors(is_dark: bool) -> (egui::Color32, egui::Color32) {
+    if is_dark {
+        (egui::Color32::WHITE, egui::Color32::from_black_alpha(140))
+    } else {
+        (egui::Color32::BLACK, egui::Color32::from_white_alpha(140))
+    }
 }
 
 /// Claim the screen a name needs, and draw it there if it was free.
@@ -411,30 +406,60 @@ pub(crate) fn label_area(
 /// lives: this function has no opinion about who deserves the spot, only about
 /// whether it is taken.
 ///
+/// # The name is laid out once, and not once per frame
+///
+/// The screen a name needs can only be measured off the laid-out galley — the
+/// name is set by egui at a point size, so only egui knows how wide it came
+/// out — and this used to lay it out **twice**: once in `Color32::WHITE` to
+/// measure the plate, and again in the ink to draw it. epaint's galley cache
+/// is keyed by the whole `LayoutJob`, colour included, so those were two
+/// distinct entries and two full layouts, each allocating a `String` from
+/// `name` and taking `Context::fonts` — for one string of glyphs whose metrics
+/// do not depend on its colour. The measurement is now taken off the galley
+/// that is about to be drawn.
+///
+/// And it is answered from [`walkers::GalleyCache`], the memo the station
+/// models already draw their text through, rather than from epaint's per-pass
+/// cache: the vocabulary is the site table's own station names, set at a size
+/// [`site_label_font_size`] clamps to exactly 12.0 at every zoom that draws
+/// one, so after the first frame every name is a hit costing a hash of bytes
+/// the caller already holds — no `String`, no lock, no layout. What a gesture
+/// moves is where each name is anchored, and nothing in the memo's key is a
+/// position.
+///
+/// **Its cost is one entry per station name**, against a table this pane
+/// shares with the point layers' station-model text and a
+/// [`walkers::GalleyCache::MAX_ENTRIES`] ceiling the table is dropped whole
+/// at. One name per row of the site table is a bounded set and a small
+/// fraction of that ceiling; a layer that ever interned unbounded text through
+/// the same memo is what would make the two compete.
+///
+/// The caller owns the memo and must have run
+/// [`walkers::GalleyCache::begin_frame`] on this frame: a galley points into
+/// the font atlas by pixel position and egui rebuilds that atlas.
+///
 /// Returns whether the label drew.
 pub(crate) fn try_draw_site_label(
     painter: &egui::Painter,
+    galleys: &mut walkers::GalleyCache,
     occupied: &mut walkers::OccupiedAreas,
     anchor: egui::Pos2,
     name: &str,
     font: egui::FontId,
-    text_color: egui::Color32,
     is_dark: bool,
 ) -> bool {
-    let area = label_area(painter, anchor, name, font.clone());
+    let (text_color, plate) = label_colors(is_dark);
+    let galley = galleys.galley_for_point(painter.ctx(), name, font, text_color);
+    let text_rect = egui::Align2::CENTER_TOP.anchor_size(anchor, galley.size());
+    let plate_rect = text_rect.expand2(egui::vec2(2.0, 1.0));
+
+    let area = plate_rect.expand(LABEL_GUTTER_POINTS);
     let claim = walkers::text::OrientedRect::new(area.center(), 0.0, area.size());
     if !occupied.try_occupy(claim) {
         return false;
     }
 
-    let plate = if is_dark {
-        egui::Color32::from_black_alpha(140)
-    } else {
-        egui::Color32::from_white_alpha(140)
-    };
-    let galley = painter.layout_no_wrap(name.to_owned(), font, text_color);
-    let rect = egui::Align2::CENTER_TOP.anchor_size(anchor, galley.size());
-    painter.rect_filled(rect.expand2(egui::vec2(2.0, 1.0)), 2.0, plate);
-    painter.galley(rect.min, galley, text_color);
+    painter.rect_filled(plate_rect, 2.0, plate);
+    painter.galley(text_rect.min, galley, text_color);
     true
 }
