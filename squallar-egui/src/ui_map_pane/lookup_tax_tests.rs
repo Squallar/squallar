@@ -79,7 +79,7 @@ impl LayersOn {
     fn takes(self, idx: usize) -> bool {
         match self {
             Self::Every => true,
-            Self::EverySecond => idx % 2 == 0,
+            Self::EverySecond => idx.is_multiple_of(2),
         }
     }
 }
