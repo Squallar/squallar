@@ -8270,6 +8270,21 @@ def run_smoke(args):
                 else:
                     fp["ok"] = True
                     fp["gained"] = inside[-1]["n"] - inside[0]["n"]
+                    # THE RATE, RECORDED AND NOT GATED. This verdict is `ok`
+                    # on ANY strict increase, which is the right rule for the
+                    # thing it exists to catch -- a frame loop that STOPPED --
+                    # and no ms figure gates anywhere in this rig. But three
+                    # `huge` arms have been recorded as passes at 1.00, 1.33
+                    # and 3.25 fps, and each of those had to be recomputed by
+                    # hand from `gained` and `in_window` on the assumption of a
+                    # 2 s tick, because the reading timestamps were dropped
+                    # here. They are in `inside`; keeping the span makes the
+                    # rate an artifact fact rather than a reconstruction, so a
+                    # reader can see a 1 fps pass instead of deriving it.
+                    span = inside[-1]["t"] - inside[0]["t"]
+                    fp["observed_span_ms"] = span
+                    fp["fps"] = (round(fp["gained"] / (span / 1000.0), 2)
+                                 if span > 0 else None)
             result["frame_progress"] = fp
             stage("frame-progress", **fp)
 
@@ -8664,6 +8679,10 @@ def run_smoke(args):
                                 if traps else None),
             "frame_progress_ok": (None if result.get("frame_progress") is None
                                   else bool(result["frame_progress"]["ok"])),
+            # Beside the boolean, never instead of it: `ok` is the verdict and
+            # this is the rate it was reached at. A pass at 1 fps and a pass at
+            # 60 read identically without it.
+            "frame_progress_fps": (result.get("frame_progress") or {}).get("fps"),
             "loop_or_refusal_ok": (None if result.get("loop_or_refusal") is None
                                    else bool(result["loop_or_refusal"]["ok"])),
             # The two readings of the same wall, never added: how close the
