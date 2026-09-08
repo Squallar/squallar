@@ -1943,3 +1943,8 @@ mod ledger_tests;
 /// planner keeps at every rung of the ladder.
 #[cfg(test)]
 mod gesture_dispatch_tests;
+
+/// The resize arm: what a picture of the wrong size owes, and why that arm
+/// needs no brake of its own while a raster is already in flight.
+#[cfg(test)]
+mod resize_arm_tests;

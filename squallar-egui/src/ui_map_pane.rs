@@ -1075,10 +1075,40 @@ pub(super) fn render_pane_map_content(
             // what always should have: a raster the pane genuinely wants and
             // could not ask for.
             //
-            // A dispatch that was REFUSED has no arrival to wait for and
-            // nothing else would ever re-ask, so that one still latches --
-            // this is the `request_once` retry, kept.
-            resolution.overlay_work_owed |= stale && !dispatched;
+            // A dispatch REFUSED **by the device budget** has no arrival to
+            // wait for and nothing else would ever re-ask, so that one still
+            // latches -- this is the `request_once` retry, kept.
+            //
+            // **A dispatch refused because this destination already has a
+            // raster out is the other refusal, and it is the one this field's
+            // own doc rules out.** `RendersInFlight::admits` is
+            // `!holds(slot) && out.len() < limit`; a whole-picture layer has
+            // exactly one destination, so `out.len()` is 0 or 1, and every
+            // shipped `concurrent_renders` is at least 1 (1 on the web
+            // bracket, 3 on mobile, 6 on desktop). The second conjunct can
+            // therefore only fail when the first already has, and a refusal
+            // **is** `holds(WHOLE)` on every bracket this tree ships. Only a
+            // limit of zero parts them, which is why the fixture pinning the
+            // retry has to spell one.
+            //
+            // So `stale && !dispatched` was the whole flight of every raster,
+            // per pane and per layer, on every arm of `needs_rerender` alike:
+            // the first picture of a pane that has just opened, a settled
+            // zoom, a plan resize. That is the state
+            // [`StripResolution::overlay_work_owed`] says in as many words it
+            // must not be set for. The content arm alone escaped it, and only
+            // because its own brake makes `stale` itself false.
+            //
+            // **Nothing is delayed by dropping it.** The arrival retires the
+            // ticket in `PumpPhase::Apply`, which `App::setup_egui_frame` runs
+            // *before* `Gui::ui` builds the paint list -- so the frame an
+            // arrival wakes is the same frame whose draw pass finds `admits`
+            // true and dispatches. The landing raster is also a new texture
+            // identity, and that is a [`ground_content_key`] input, so the
+            // strip repaints on that frame off the key rather than off this
+            // latch. That is the wake-up the doc means by "carries its own".
+            resolution.overlay_work_owed |=
+                stale && !dispatched && !cache.renders.holds(RenderSlot::WHOLE);
             // `has_data` and not just reaching here enabled. A repaint asked
             // for on a frame that cannot dispatch anything is a wakeup nothing
             // can satisfy.

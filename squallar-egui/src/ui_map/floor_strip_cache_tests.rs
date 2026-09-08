@@ -840,6 +840,84 @@ fn a_refused_overlay_dispatch_keeps_the_strip_repainting() {
     );
 }
 
+/// **The refusal that is NOT the retry: a raster already in flight.**
+///
+/// `RendersInFlight::admits` is `!holds(slot) && out.len() < limit`, and a
+/// whole-picture texture layer has exactly one destination — so wherever the
+/// device budget is not the binding term, a refused dispatch means precisely
+/// that this pane already has a raster of this layer on its way. That raster
+/// carries its own wake-up: its arrival is a new texture identity, and that is
+/// a [`ground_content_key`](super::ground_content_key) input. So the strip has
+/// nothing to gain by repainting until it lands, and
+/// [`StripResolution::overlay_work_owed`](super::StripResolution) says so in
+/// as many words — *"Not 'a raster is in flight'."*
+///
+/// The fixture above is the other conjunct and must stay green beside this
+/// one: together they say the latch distinguishes the two refusals rather
+/// than answering a constant to both.
+///
+/// **Driven from the `FirstPicture` arm and not the resize one, deliberately.**
+/// The pane has no picture yet, so a raster is owed on every frame whatever
+/// the plan says — which is also the boot condition, where every enabled
+/// texture layer has one out at once. The line under test cannot see which arm
+/// made `stale` true, so the cheapest arm that reaches it is the honest
+/// fixture; the resize arm's own reading is pinned in
+/// `crate::overlay_cache::resize_arm_tests`.
+///
+/// **The mark goes on BEFORE the first frame that draws the layer, and that
+/// ordering is the whole fixture.** The strip cache only paints a strip whose
+/// key moved *or* whose last paint committed incomplete, so the latch can only
+/// ever be observed on a strip that is already dirty. Recording the mark after
+/// a clean settle produced a fixture that passed with the brake **and without
+/// it** — the strip had gone clean while the dispatch was still being admitted
+/// and simply never painted again. It was caught by tampering the brake out
+/// and getting green, which is the only reason this note exists.
+#[test]
+fn an_overlay_raster_in_flight_does_not_hold_the_strip_open() {
+    use crate::overlay_cache::{RenderSlot, RenderTicket};
+
+    let mut h = resolved_floor_harness();
+    h.set_overlay_on_pane(1, &known::NWS_ALERTS, true);
+    ingest_one_alert(&mut h);
+
+    // The mark the app's dispatch sets, set here directly: this crate has no
+    // rasteriser behind it, so a ticket recorded and never retired is exactly
+    // a raster still in the air.
+    let cache = h
+        .gui_mut()
+        .pane_mut(1)
+        .expect("pane 1")
+        .overlay_cache_mut(&known::NWS_ALERTS);
+    cache.renders.record(RenderTicket::whole(
+        0,
+        squallar_geo::GeoBounds {
+            min_lat: 30.0,
+            max_lat: 40.0,
+            min_lon: -100.0,
+            max_lon: -90.0,
+        },
+    ));
+    assert!(
+        cache.renders.holds(RenderSlot::WHOLE),
+        "the fixture put no raster in flight, so the refusal below would be \
+         the device budget's and this would be the retry fixture again",
+    );
+
+    // Enabling the layer moved the key, so one paint here is the content's
+    // own ask. What must not survive it is the completeness latch.
+    h.frames_for(4, FRAME_DT);
+    let before = paints(&h);
+    h.frames_for(10, FRAME_DT);
+    assert_eq!(
+        paints(&h) - before,
+        0,
+        "the strip repainted across the flight of a raster it had already \
+         asked for — a second whole map render plus the mirror pass, per pane \
+         and per layer, on every frame the raster is in the air. It buys \
+         nothing: the arrival is what moves the content key",
+    );
+}
+
 /// The graphics-state reset repaints: the mirror texture died with the
 /// device, and a clean key must not keep sampling a texture that is gone.
 #[test]
