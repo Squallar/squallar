@@ -7,6 +7,7 @@ use nexrad_model::data::{DataMoment, Radial, Scan};
 use std::f64::consts::PI;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+pub mod codes;
 pub mod polar;
 
 /// Pre-computed Web Mercator projection constants, derived from
