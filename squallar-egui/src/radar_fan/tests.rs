@@ -4,10 +4,15 @@
 //! on fidelity: the producer already refuses a plane it cannot build, and what
 //! these hold is that what *arrived* describes itself consistently. Every arm
 //! is a real indexing hazard — a level whose bytes are not there, a table that
-//! is not a table, an edge list that does not cover the radials — and each is
-//! asserted against a payload that is healthy in every other respect, so a
-//! check that started passing for the wrong reason shows up as the healthy
-//! control going red.
+//! is not a table, an edge list that does not cover the radials.
+//!
+//! [`every_malformation_is_refused_one_at_a_time`] asserts only that each
+//! payload is refused, which is the property that matters and is **not** the
+//! same as saying which guard refused it. Some of these defects trip more than
+//! one, and a fixture that trips two proves nothing about either.
+//! [`each_guard_is_the_sole_reason_some_payload_is_refused`] is the one that
+//! pins that down: one payload per guard, healthy in every other respect, so a
+//! guard deleted from `is_well_formed` cannot go unnoticed.
 
 use super::*;
 
@@ -20,8 +25,12 @@ fn geometry() -> FanGeometry {
         elevation_deg: Some(0.5),
         reach_gates: 4,
         reach_km: 3.0,
-        earth_radius_km: 6371.0,
-        effective_radius_km: 6371.0 * 4.0 / 3.0,
+        // The tree's own two, not a second spelling of them: a fixture that
+        // wrote the numbers out would be exactly the second definition
+        // `geodesy_one_definition.rs` exists to refuse, and carrying them as
+        // data is the whole reason `FanGeometry` has these fields at all.
+        earth_radius_km: squallar_geo::EARTH_RADIUS_KM,
+        effective_radius_km: squallar_radar::beam::RE_EFF_KM,
     }
 }
 
@@ -113,27 +122,17 @@ fn a_ragged_chain_is_well_formed_at_the_lengths_ceil_halving_gives() {
 #[test]
 fn every_malformation_is_refused_one_at_a_time() {
     let cases: Vec<(&str, FanSweep)> = vec![
+        ("no radials", no_radials()),
         (
-            "no radials",
-            FanSweep {
-                radials: 0,
-                ..one_level()
-            },
-        ),
-        (
+            // Refused by the reach guard rather than by a stride check of its
+            // own — `is_well_formed` says why there is no such check to write.
             "no gates",
             FanSweep {
                 gates: 0,
                 ..one_level()
             },
         ),
-        (
-            "no levels at all",
-            FanSweep {
-                level_offsets: Vec::new(),
-                ..one_level()
-            },
-        ),
+        ("no levels at all", no_levels()),
         (
             "level 0 not starting at 0",
             FanSweep {
@@ -143,9 +142,20 @@ fn every_malformation_is_refused_one_at_a_time() {
             },
         ),
         (
-            "a table that is not 256 entries",
+            "a table one entry short of 256",
             FanSweep {
-                lut_rgba: vec![0; LUT_BYTES - 4],
+                lut_rgba: vec![0; LUT_BYTES - LUT_ENTRY_BYTES],
+                ..one_level()
+            },
+        ),
+        (
+            // The long side too, because the check is an equality and a
+            // producer that baked a *bigger* table is the two constants
+            // disagreeing about how many colours a code can address — which
+            // the short side alone would not catch.
+            "a table one entry past 256",
+            FanSweep {
+                lut_rgba: vec![0; LUT_BYTES + LUT_ENTRY_BYTES],
                 ..one_level()
             },
         ),
@@ -198,9 +208,13 @@ fn every_malformation_is_refused_one_at_a_time() {
             },
         ),
         (
+            // The codes are the length the *levels* add up to, so the total
+            // still balances and only the in-order walk can see the gap. A
+            // payload one byte longer would be refused by the length check
+            // instead, and would say nothing about this one.
             "a chain with a gap between two levels",
             FanSweep {
-                codes: vec![0; 44],
+                codes: vec![0; 43],
                 level_offsets: vec![0, 33, 41, 43],
                 ..chained()
             },
@@ -259,4 +273,171 @@ fn the_ledger_totals_name_their_own_denominator() {
         declined: 1,
     };
     assert_eq!(totals.painted + totals.refused(), totals.draws);
+}
+
+/// A payload with **no radials** and nothing else wrong: no edges to cover
+/// them, and no codes, because every level of a zero-radial plane is zero
+/// cells. Every other guard passes on it, so `radials == 0` is the only thing
+/// left to refuse it.
+fn no_radials() -> FanSweep {
+    FanSweep {
+        radials: 0,
+        edges: Vec::new(),
+        codes: Vec::new(),
+        ..one_level()
+    }
+}
+
+/// A payload declaring **no levels** and nothing else wrong. `want` never
+/// accumulates, so its codes must be empty for the length check to pass — and
+/// with that done, `level_offsets.is_empty()` is the only guard left.
+fn no_levels() -> FanSweep {
+    FanSweep {
+        level_offsets: Vec::new(),
+        codes: Vec::new(),
+        ..one_level()
+    }
+}
+
+/// **Every guard is load-bearing on its own.**
+///
+/// For each, a payload healthy in every other respect: refused, and refused
+/// *because of that guard*, since nothing else about it is wrong. The second
+/// half of each row is the proof of the first — repair the one field and the
+/// payload is well-formed, so the refusal was the guard's and not the
+/// fixture's.
+///
+/// `gates == 0` has no row because it can have none: a zero stride forces the
+/// reach guard to fire, and `is_well_formed` records that rather than carrying
+/// a check no input can uniquely trip.
+#[test]
+fn each_guard_is_the_sole_reason_some_payload_is_refused() {
+    let rows: Vec<(&str, FanSweep, FanSweep)> = vec![
+        (
+            "radials == 0",
+            no_radials(),
+            FanSweep {
+                radials: 1,
+                edges: vec![[0.0, 45.0]],
+                codes: vec![0; 4],
+                ..one_level()
+            },
+        ),
+        (
+            // Its repair is `one_level()` itself: giving the payload a level
+            // back also gives it that level's bytes back, and those two
+            // together are the only difference between the pair.
+            "level_offsets.is_empty()",
+            no_levels(),
+            one_level(),
+        ),
+        (
+            "edges cover the radials",
+            FanSweep {
+                edges: vec![[0.0, 45.0]; 7],
+                ..one_level()
+            },
+            one_level(),
+        ),
+        (
+            "the table is 256 entries",
+            FanSweep {
+                lut_rgba: vec![0; LUT_BYTES - LUT_ENTRY_BYTES],
+                ..one_level()
+            },
+            one_level(),
+        ),
+        (
+            "reach_gates != 0",
+            FanSweep {
+                geometry: FanGeometry {
+                    reach_gates: 0,
+                    ..geometry()
+                },
+                ..one_level()
+            },
+            one_level(),
+        ),
+        (
+            "reach_gates <= gates",
+            FanSweep {
+                geometry: FanGeometry {
+                    reach_gates: 5,
+                    ..geometry()
+                },
+                ..one_level()
+            },
+            one_level(),
+        ),
+        (
+            "the levels are laid out in order (overlap)",
+            FanSweep {
+                level_offsets: vec![0, 31, 40, 42],
+                ..chained()
+            },
+            chained(),
+        ),
+        (
+            "the levels are laid out in order (gap)",
+            FanSweep {
+                level_offsets: vec![0, 33, 41, 43],
+                ..chained()
+            },
+            chained(),
+        ),
+        (
+            "codes are exactly the levels' length",
+            FanSweep {
+                codes: vec![0; 33],
+                ..one_level()
+            },
+            one_level(),
+        ),
+    ];
+    for (guard, bad, good) in rows {
+        assert!(
+            !bad.is_well_formed(),
+            "{guard}: accepted the payload it guards against"
+        );
+        assert!(
+            good.is_well_formed(),
+            "{guard}: the repaired payload is still refused, so the fixture is \
+             wrong about which guard fired"
+        );
+    }
+}
+
+/// **No two outcomes share a counter.**
+///
+/// The ledger is the only report a running app makes of a hole in its radar
+/// picture, and a hole reported under another hole's name is worse than one
+/// reported under none: the figures still add up, so nothing looks wrong. The
+/// arms are wired once, in `ledger::slot`, and this is the property that
+/// wiring has to have — every outcome distinct, and every one inside the array
+/// it indexes.
+#[test]
+fn every_outcome_has_a_counter_of_its_own() {
+    let slots: Vec<usize> = ledger::EVERY_OUTCOME
+        .iter()
+        .map(|o| ledger::slot_for_test(*o))
+        .collect();
+    let distinct: std::collections::BTreeSet<usize> = slots.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        ledger::EVERY_OUTCOME.len(),
+        "two outcomes share a counter: {slots:?}"
+    );
+    assert!(
+        slots.iter().all(|s| *s < ledger::EVERY_OUTCOME.len()),
+        "a slot indexes past the array it indexes: {slots:?}"
+    );
+    // And the list is the whole enum rather than a subset that happens to be
+    // distinct: one arm per refusal, plus the painted arm.
+    assert_eq!(
+        ledger::EVERY_OUTCOME
+            .iter()
+            .filter(|o| matches!(o, FanOutcome::Refused(_)))
+            .count(),
+        ledger::EVERY_OUTCOME.len() - 1
+    );
 }

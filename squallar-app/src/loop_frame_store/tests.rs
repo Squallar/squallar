@@ -27,7 +27,11 @@ fn reflectivity(site: &str, elevation: f32) -> RenderTarget {
 fn picture(ctx: &egui::Context) -> LoopFrameImage {
     let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
     LoopFrameImage::PlanView(squallar_egui::pane::RadarImageData {
-        surface: squallar_egui::pane::RadarSurface::Raster(ctx.load_texture("shared", image, egui::TextureOptions::NEAREST)),
+        surface: squallar_egui::pane::RadarSurface::Raster(ctx.load_texture(
+            "shared",
+            image,
+            egui::TextureOptions::NEAREST,
+        )),
         lat: 35.33,
         lon: -97.27,
         max_range_km: 230.0,

@@ -110,7 +110,11 @@ fn loop_on(ctx: &egui::Context, site: &'static str, textured: &[usize]) -> Layer
         let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
         ls.frames[i].image = Some(squallar_egui::pane::LoopFrameImage::PlanView(
             squallar_egui::pane::RadarImageData {
-                surface: squallar_egui::pane::RadarSurface::Raster(ctx.load_texture("test", image, egui::TextureOptions::NEAREST)),
+                surface: squallar_egui::pane::RadarSurface::Raster(ctx.load_texture(
+                    "test",
+                    image,
+                    egui::TextureOptions::NEAREST,
+                )),
                 lat: 35.0,
                 lon: -97.0,
                 max_range_km: 100.0,
@@ -742,6 +746,140 @@ fn a_failed_render_retires_its_frame_without_a_texture() {
     assert!(ls.frames[1].image.is_none());
 }
 
+/// One well-formed sweep, small on purpose: nothing here reads a code, only
+/// the shape the payload declares about itself.
+fn fan_sweeps() -> std::sync::Arc<[std::sync::Arc<squallar_egui::radar_fan::FanSweep>]> {
+    std::sync::Arc::from(vec![std::sync::Arc::new(
+        squallar_egui::radar_fan::FanSweep {
+            field: squallar_radar::fields::known::REFLECTIVITY,
+            radials: 4,
+            gates: 2,
+            codes: vec![0; 8],
+            level_offsets: vec![0],
+            lut_rgba: vec![0; squallar_egui::radar_fan::LUT_BYTES],
+            edges: vec![[0.0, 90.0], [90.0, 180.0], [180.0, 270.0], [270.0, 360.0]],
+            geometry: squallar_egui::radar_fan::FanGeometry {
+                site_lat: 35.33,
+                site_lon: -97.28,
+                first_gate_slant_km: 2.125,
+                gate_interval_slant_km: 0.25,
+                elevation_deg: Some(0.5),
+                reach_gates: 2,
+                reach_km: 2.5,
+                earth_radius_km: squallar_geo::EARTH_RADIUS_KM,
+                effective_radius_km: squallar_radar::beam::RE_EFF_KM,
+            },
+        },
+    )])
+}
+
+/// **A polar frame mints no texture, and that is the whole saving.**
+///
+/// A frame that took the fan arm *and* uploaded would be holding both
+/// representations of one picture and would cost strictly more than the raster
+/// it replaced — the increment would be a regression wearing its own name. So
+/// what is asserted is not that the fan arrives, but that the upload closure is
+/// never entered and the reply's pixels are left where they were.
+///
+/// The raster arm of the same fixture is the control immediately below: same
+/// response, same loop, one upload. Without it "zero uploads" would also be
+/// true of a seam that had stopped accepting results at all.
+#[test]
+fn a_polar_frame_uploads_nothing_and_the_raster_arm_still_does() {
+    let ctx = egui::Context::default();
+    let sweeps = fan_sweeps();
+
+    let mut ls = loop_on(&ctx, "KTLX", &[]);
+    ls.frames[1].render_in_flight = true;
+    let mut rr = response(ts(1), ls.rendered_for.clone().expect("target adopted"));
+
+    let mut uploads = 0;
+    let placed = accept_render_result(&mut ls, &mut rr, Some(sweeps.clone()), None, |_| {
+        uploads += 1;
+        dummy_texture(&ctx)
+    })
+    .expect("the loop is awaiting this result");
+
+    assert_eq!(
+        uploads, 0,
+        "a polar frame minted a texture as well as a plane"
+    );
+    assert!(
+        rr.image.is_some(),
+        "and the reply's pixels were never taken, so nothing consumed them silently"
+    );
+    assert!(
+        placed.surface.is_fan(),
+        "the accepted surface is the polar arm"
+    );
+    assert!(
+        placed.surface.raster().is_none(),
+        "a fan has no texture to give"
+    );
+    let squallar_egui::pane::RadarSurface::Fan(placed_sweeps) = &placed.surface else {
+        unreachable!("asserted a fan directly above")
+    };
+    assert!(
+        std::sync::Arc::ptr_eq(placed_sweeps, &sweeps),
+        "the payload was rebuilt rather than carried, so residency-by-identity is broken"
+    );
+
+    // The frame itself holds the same surface the caller was handed.
+    let filed = ls.frames[1]
+        .image
+        .as_ref()
+        .and_then(squallar_egui::pane::LoopFrameImage::plan_view)
+        .expect("the frame was filled with a plan view");
+    assert_eq!(filed.surface.picture_key(), placed.surface.picture_key());
+    assert!(!ls.frames[1].render_in_flight);
+
+    // The control: the identical response with no plane behind it takes the
+    // raster arm and does upload, exactly once.
+    let mut ls = loop_on(&ctx, "KTLX", &[]);
+    ls.frames[1].render_in_flight = true;
+    let mut rr = response(ts(1), ls.rendered_for.clone().expect("target adopted"));
+    let mut uploads = 0;
+    let placed = accept_render_result(&mut ls, &mut rr, None, None, |_| {
+        uploads += 1;
+        dummy_texture(&ctx)
+    })
+    .expect("the loop is awaiting this result");
+    assert_eq!(uploads, 1);
+    assert!(!placed.surface.is_fan());
+    assert!(rr.image.is_none(), "the raster arm does take the pixels");
+}
+
+/// **`resident_bytes` counts the two arms in the two places they live.** The
+/// fan's plane is host memory this frame is holding; a raster's pixels belong
+/// to egui's texture manager and are counted there, so the frame reports zero
+/// for them rather than double-counting.
+#[test]
+fn a_polar_frame_reports_the_bytes_it_holds_and_a_raster_reports_none() {
+    let ctx = egui::Context::default();
+    let sweeps = fan_sweeps();
+    let want: usize = sweeps.iter().map(|s| s.resident_bytes()).sum();
+    assert!(
+        want > squallar_egui::radar_fan::LUT_BYTES,
+        "fixture holds a plane"
+    );
+
+    let mut ls = loop_on(&ctx, "KTLX", &[]);
+    ls.frames[1].render_in_flight = true;
+    let mut rr = response(ts(1), ls.rendered_for.clone().expect("target adopted"));
+    let fan = accept_render_result(&mut ls, &mut rr, Some(sweeps), None, |_| {
+        dummy_texture(&ctx)
+    })
+    .expect("awaited");
+    assert_eq!(fan.surface.resident_bytes(), want);
+
+    let mut ls = loop_on(&ctx, "KTLX", &[]);
+    ls.frames[1].render_in_flight = true;
+    let mut rr = response(ts(1), ls.rendered_for.clone().expect("target adopted"));
+    let raster = accept_render_result(&mut ls, &mut rr, None, None, |_| dummy_texture(&ctx))
+        .expect("awaited");
+    assert_eq!(raster.surface.resident_bytes(), 0);
+}
+
 #[test]
 fn a_download_is_cached_under_the_site_it_came_from() {
     let mut mgr = LoopDownloadManager::new();
@@ -1131,7 +1269,11 @@ fn hovering_a_looping_pane_reads_a_value_out_of_the_frames_own_volume() {
 
     let ctx = egui::Context::default();
     let texture = dummy_texture(&ctx);
-    let img = rendered_image(&rr, squallar_egui::pane::RadarSurface::Raster(texture.clone()), gates);
+    let img = rendered_image(
+        &rr,
+        squallar_egui::pane::RadarSurface::Raster(texture.clone()),
+        gates,
+    );
 
     let mut read = 0u32;
     let mut az = 0.5f64;
@@ -1162,7 +1304,11 @@ fn hovering_a_looping_pane_reads_a_value_out_of_the_frames_own_volume() {
         "only {read} points on the loop frame had a value"
     );
 
-    let orphan = rendered_image(&rr, squallar_egui::pane::RadarSurface::Raster(texture.clone()), None);
+    let orphan = rendered_image(
+        &rr,
+        squallar_egui::pane::RadarSurface::Raster(texture.clone()),
+        None,
+    );
     assert_eq!(
         orphan.hover.read(90.0, 20.0),
         squallar_radar::hover::Reading::NotResident,

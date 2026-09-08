@@ -142,7 +142,7 @@ fn walk_at(run: Walk<'_>) -> Walked {
         point_text_meshes: &mut crate::point_painter::PointTextMeshes::default(),
         label_cache: &mut crate::label_cache::LabelCache::default(),
         ground_meshes: None,
-            radar_fan: None,
+        radar_fan: None,
         basemap_tiles: None,
         terrain_tiles: None,
         tile_zoom_bias: 0,

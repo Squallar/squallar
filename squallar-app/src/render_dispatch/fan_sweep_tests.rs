@@ -43,7 +43,9 @@ fn plane() -> CodePlane {
     CodePlane::build(
         RADIALS,
         GATES,
-        (0..(RADIALS * GATES) as u32).map(|i| (i + 2) as u8).collect(),
+        (0..(RADIALS * GATES) as u32)
+            .map(|i| (i + 2) as u8)
+            .collect(),
         key(),
         8,
     )
@@ -72,8 +74,8 @@ fn geometry() -> PolarGeometry {
 #[test]
 fn a_matched_plane_and_geometry_make_a_well_formed_payload() {
     let (plane, geometry) = (plane(), geometry());
-    let sweep = fan_sweep(&plane, &geometry, SITE_LAT, SITE_LON)
-        .expect("the pair describes one sweep");
+    let sweep =
+        fan_sweep(&plane, &geometry, SITE_LAT, SITE_LON).expect("the pair describes one sweep");
 
     assert!(
         sweep.is_well_formed(),
@@ -95,7 +97,10 @@ fn a_matched_plane_and_geometry_make_a_well_formed_payload() {
     // the tree's own two — the sphere a ground range is taken on, and the
     // bent radius a slant range converts through. They are not equal, and a
     // payload that made them equal would be a straight beam.
-    assert_eq!(sweep.geometry.earth_radius_km, squallar_geo::EARTH_RADIUS_KM);
+    assert_eq!(
+        sweep.geometry.earth_radius_km,
+        squallar_geo::EARTH_RADIUS_KM
+    );
     assert_eq!(
         sweep.geometry.effective_radius_km,
         squallar_radar::beam::RE_EFF_KM
@@ -165,12 +170,19 @@ fn the_edges_are_the_drawn_wedges_and_an_unpainted_radial_collapses() {
     assert_eq!(sweep.edges.len(), RADIALS);
     for (i, w) in ws.iter().enumerate() {
         if i == 3 {
-            assert_eq!(sweep.edges[i], [0.0, 0.0], "the unpainted radial did not collapse");
+            assert_eq!(
+                sweep.edges[i],
+                [0.0, 0.0],
+                "the unpainted radial did not collapse"
+            );
             continue;
         }
         assert_eq!(
             sweep.edges[i],
-            [w.azimuth_deg - w.half_width_deg, w.azimuth_deg + w.half_width_deg]
+            [
+                w.azimuth_deg - w.half_width_deg,
+                w.azimuth_deg + w.half_width_deg
+            ]
         );
         // The sector is the width the render painted, not the width the sweep
         // declared: those are the same only when nothing was trimmed, and this
@@ -246,16 +258,26 @@ fn a_plane_and_a_geometry_that_are_not_one_sweep_are_refused() {
         "accepted a geometry with one more radial than the plane"
     );
 
-    let deep = PolarGeometry::from_parts(
+    // **Narrower, not wider**, and the direction is the whole point. A
+    // geometry one gate *wider* also has a reach one gate wider, so the reach
+    // guard refuses it and the shape check is never reached — a fixture that
+    // trips two guards says nothing about either. One gate narrower carries a
+    // reach that is comfortably inside the plane, so the stride disagreement
+    // is the only thing left to refuse it.
+    let shallow = PolarGeometry::from_parts(
         wedges(),
         FIRST_GATE_SLANT_KM,
         GATE_INTERVAL_SLANT_KM,
         Some(ELEVATION_DEG),
-        GATES + 1,
+        GATES - 1,
     );
     assert!(
-        fan_sweep(&plane(), &deep, SITE_LAT, SITE_LON).is_none(),
-        "accepted a geometry one gate wider than the plane"
+        shallow.reach_gates() <= GATES,
+        "fixture: the reach guard would fire"
+    );
+    assert!(
+        fan_sweep(&plane(), &shallow, SITE_LAT, SITE_LON).is_none(),
+        "accepted a geometry one gate narrower than the plane"
     );
 
     // The healthy control, so the two refusals above are the mismatch's and
@@ -265,19 +287,52 @@ fn a_plane_and_a_geometry_that_are_not_one_sweep_are_refused() {
 
 /// A geometry that reached no gates has no disc to draw, and one whose reach
 /// runs past its own stride is describing a row it does not have.
+///
+/// **Both arrive over the wire, and that is where this reaches them.**
+/// `from_parts` ties `reach_gates` to `gates`, so nothing built through it can
+/// state either defect — but `PolarField::from_bytes` reads the reach off the
+/// buffer as a bare `u32` and validates it against nothing, and
+/// `PolarRenderTarget::into_field` derives it from what was actually painted,
+/// which is `0` for a sweep that painted nothing. A worker reply is exactly
+/// that buffer. Doctoring the four bytes is the shortest statement of the
+/// hazard the guard exists for.
 #[test]
 fn a_reach_of_nothing_and_a_reach_past_the_stride_are_both_refused() {
-    // `from_parts` sets `reach_gates == gates`, so a zero-gate geometry is the
-    // only way to state "the render reached nothing" through the public door.
-    let empty = PolarGeometry::from_parts(
-        wedges(),
-        FIRST_GATE_SLANT_KM,
-        GATE_INTERVAL_SLANT_KM,
-        Some(ELEVATION_DEG),
-        0,
+    // The reach is the third `u32` of the header — `PolarField::to_bytes`.
+    const REACH_AT: usize = 8;
+
+    let doctored = |reach: u32| {
+        let field = squallar_radar::render::polar::PolarField::from_parts(geometry(), Vec::new());
+        let mut bytes = field.to_bytes();
+        bytes[REACH_AT..REACH_AT + 4].copy_from_slice(&reach.to_le_bytes());
+        squallar_radar::render::polar::PolarField::from_bytes(&bytes)
+            .expect("only the reach was changed, and the length did not move")
+    };
+
+    // The control first: the same round trip, untouched, still builds — so the
+    // two refusals below are the reach's and not the wire's.
+    let intact = doctored(GATES as u32);
+    assert_eq!(intact.geometry().reach_gates(), GATES);
+    assert!(fan_sweep(&plane(), intact.geometry(), SITE_LAT, SITE_LON).is_some());
+
+    let reached_nothing = doctored(0);
+    assert_eq!(reached_nothing.geometry().reach_gates(), 0);
+    assert!(
+        fan_sweep(&plane(), reached_nothing.geometry(), SITE_LAT, SITE_LON).is_none(),
+        "built a disc out of a sweep that painted no gate"
     );
-    assert!(fan_sweep(&plane(), &empty, SITE_LAT, SITE_LON).is_none());
-    assert!(empty.is_empty());
+
+    let past_the_stride = doctored(GATES as u32 + 1);
+    assert_eq!(past_the_stride.geometry().reach_gates(), GATES + 1);
+    assert_eq!(
+        past_the_stride.geometry().gates(),
+        GATES,
+        "fixture: the stride must still match the plane, or the shape check fires first"
+    );
+    assert!(
+        fan_sweep(&plane(), past_the_stride.geometry(), SITE_LAT, SITE_LON).is_none(),
+        "accepted a reach past the row the plane actually has"
+    );
 }
 
 /// **The fidelity refusal is consumed, not re-litigated.** Six products the
@@ -308,14 +363,5 @@ fn a_product_the_plane_refuses_can_never_reach_a_fan() {
         );
     }
     // The control: the same call shape on a product the encoder admits.
-    assert!(
-        CodePlane::build(
-            RADIALS,
-            GATES,
-            vec![7; RADIALS * GATES],
-            key(),
-            8,
-        )
-        .is_ok()
-    );
+    assert!(CodePlane::build(RADIALS, GATES, vec![7; RADIALS * GATES], key(), 8,).is_ok());
 }

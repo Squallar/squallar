@@ -233,7 +233,11 @@ fn an_untouched_config_round_trips_to_radar() {
 fn plan_view_folding_at(ctx: &egui::Context, nyquist_ms: f64) -> LoopFrameImage {
     let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
     LoopFrameImage::PlanView(RadarImageData {
-        surface: RadarSurface::Raster(ctx.load_texture("plan", image, egui::TextureOptions::NEAREST)),
+        surface: RadarSurface::Raster(ctx.load_texture(
+            "plan",
+            image,
+            egui::TextureOptions::NEAREST,
+        )),
         lat: 35.33,
         lon: -97.28,
         max_range_km: 230.0,

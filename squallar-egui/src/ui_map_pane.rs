@@ -447,9 +447,19 @@ pub(super) struct PaneRenderCtx<'a> {
     /// out of it.
     pub ground_meshes: Option<&'a std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>>,
     /// What can draw a radar sweep's code plane from the GPU, or `None` where
-    /// nothing can. Read through [`Self::radar_fan_painter`], which is where
-    /// the floor strip is cut out of it for the same reason
-    /// [`Self::ground_mesh_painter`] cuts the tile meshes.
+    /// nothing can. Passed through **uncut**, unlike
+    /// [`Self::ground_mesh_painter`]: a floor strip must refuse a fan for the
+    /// same reason it refuses a tile mesh — its primitives are copied into the
+    /// mirror with every `Primitive::Callback` swapped for an empty mesh — but
+    /// where a refused tile fill falls back to CPU placement and the strip is
+    /// complete, a refused fan leaves the strip with no radar on it at all.
+    ///
+    /// That difference is why the strip is not cut out here. Cutting it here
+    /// would make the fan arrive as `None`, indistinguishable from a build
+    /// with no renderer, and the hole would be counted under the wrong name.
+    /// The strip is named once, at the call site, and reaches the draw as its
+    /// own refusal — `radar_fan::ledger`'s `floor_strip` arm — rather than
+    /// disguised as an absent painter.
     pub radar_fan: Option<&'a std::sync::Arc<dyn crate::radar_fan::RadarFanPainter>>,
     /// Whether the pane this pass belongs to draws its ground as a 3D mesh
     /// rather than as flat map pixels. See [`GroundIsMesh`], which is a
@@ -534,26 +544,6 @@ impl PaneRenderCtx<'_> {
     ) -> Option<&std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>> {
         match self.surfaces {
             PaneSurfaces::GroundAndGlass => self.ground_meshes,
-            PaneSurfaces::GroundOnly => None,
-        }
-    }
-
-    /// What may draw this pass's radar sweeps from the GPU — **never a floor
-    /// strip**, and the reason is the one directly above: the strip's
-    /// primitives are copied into the mirror with every `Primitive::Callback`
-    /// swapped for an empty mesh, so a fan issued here would reach the 3D
-    /// floor as nothing at all.
-    ///
-    /// The difference from the ground's cut is what happens next. A tile fill
-    /// refused here falls back to CPU placement and the strip is complete; a
-    /// fan has no fallback, so the strip would simply have no radar on it.
-    /// That is why the refusal is *counted* — `radar_fan::ledger`'s
-    /// `floor_strip` arm — rather than quietly taken.
-    fn radar_fan_painter(
-        &self,
-    ) -> Option<&std::sync::Arc<dyn crate::radar_fan::RadarFanPainter>> {
-        match self.surfaces {
-            PaneSurfaces::GroundAndGlass => self.radar_fan,
             PaneSurfaces::GroundOnly => None,
         }
     }
@@ -662,8 +652,8 @@ pub(super) fn render_pane_map_content(
                     // one.
                     if ctx.pane.time_state(&known::RADAR).is_active() {
                         if let Some(img) = ctx.pane.active_image().cloned() {
-                            let fan = ctx.radar_fan_painter().cloned();
-                            let on_floor_strip = ctx.surfaces == PaneSurfaces::GroundOnly;
+                            let surfaces = ctx.surfaces;
+                            let fan = ctx.radar_fan.cloned();
                             render_radar_overlay(
                                 ui,
                                 projector,
@@ -672,7 +662,7 @@ pub(super) fn render_pane_map_content(
                                 ctx.pane_rect,
                                 ctx.preferences,
                                 fan.as_ref(),
-                                on_floor_strip,
+                                surfaces,
                             );
                         }
                     } else {
@@ -1340,7 +1330,7 @@ fn render_radar_overlay(
     pane_rect: egui::Rect,
     prefs: &UserPreferences,
     fan: Option<&std::sync::Arc<dyn crate::radar_fan::RadarFanPainter>>,
-    on_floor_strip: bool,
+    surfaces: PaneSurfaces,
 ) {
     match &img.surface {
         crate::pane::RadarSurface::Raster(texture) => {
@@ -1352,7 +1342,7 @@ fn render_radar_overlay(
             );
         }
         crate::pane::RadarSurface::Fan(sweeps) => {
-            draw_radar_fan(ui, projector, img, sweeps, fan, on_floor_strip);
+            draw_radar_fan(ui, projector, img, sweeps, fan, surfaces);
         }
     }
 
@@ -1402,9 +1392,9 @@ fn draw_radar_fan(
     img: &RadarImageData,
     sweeps: &Arc<[Arc<crate::radar_fan::FanSweep>]>,
     painter: Option<&Arc<dyn crate::radar_fan::RadarFanPainter>>,
-    on_floor_strip: bool,
+    surfaces: PaneSurfaces,
 ) -> crate::radar_fan::FanOutcome {
-    let outcome = issue_radar_fan(ui, projector, img, sweeps, painter, on_floor_strip);
+    let outcome = issue_radar_fan(ui, projector, img, sweeps, painter, surfaces);
     crate::radar_fan::ledger::note(outcome);
     outcome
 }
@@ -1417,11 +1407,15 @@ fn issue_radar_fan(
     img: &RadarImageData,
     sweeps: &Arc<[Arc<crate::radar_fan::FanSweep>]>,
     painter: Option<&Arc<dyn crate::radar_fan::RadarFanPainter>>,
-    on_floor_strip: bool,
+    surfaces: PaneSurfaces,
 ) -> crate::radar_fan::FanOutcome {
     use crate::radar_fan::{FanOutcome, FanRefusal};
 
-    if on_floor_strip {
+    // **The strip is recognised here and nowhere else.** The caller forwards
+    // its own `surfaces` field and states nothing about it, so there is no
+    // second spelling of this comparison to drift from — and this one is under
+    // test, where a comparison living at the call site would not have been.
+    if surfaces == PaneSurfaces::GroundOnly {
         return FanOutcome::Refused(FanRefusal::FloorStrip);
     }
     let Some(painter) = painter else {

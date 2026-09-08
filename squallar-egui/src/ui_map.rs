@@ -1971,9 +1971,10 @@ impl super::Gui {
                     // with the reason written beside it, rather than a `None`
                     // here that reads as an omission.
                     ground_meshes: self.tile_mesh_painter.as_ref(),
-                    // Carried for the same reason and cut in the same place:
-                    // `PaneRenderCtx::radar_fan_painter` refuses a floor
-                    // strip, where a `None` here would read as an omission.
+                    // Carried, and deliberately **not** cut here. The strip
+                    // does refuse a fan, but it refuses it by name at the draw
+                    // — a `None` here would be indistinguishable from a build
+                    // with no renderer and would count the hole as one.
                     radar_fan: self.radar_fan_painter.as_ref(),
                     draws_3d_ground,
                     horizontal_color_scale,

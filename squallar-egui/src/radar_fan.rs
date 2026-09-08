@@ -27,10 +27,13 @@
 //! It is **not** the producer and not the renderer. The plane is built off the
 //! frame thread from the codes the wire carried
 //! (`squallar_radar::render::codes::CodePlane`), and the codes are baked into a
-//! table by `codes::Lut` — neither is named here, because both name
-//! `RadarProduct` and this crate names no radar product at all
+//! table by `codes::Lut` — neither is named here, because both name the radar
+//! crate's product enum and this crate names it nowhere at all
 //! (`arch_ratchets.rs`, `PRODUCT_IN_EGUI_MAX = 0`, asserted with `assert_eq!`).
-//! What arrives here is bytes, scalars and a [`FieldId`].
+//! That ratchet is a **text scan**, so spelling the enum even in a sentence
+//! saying this crate does not spell it is itself the thing it counts — which
+//! is how this file first landed the board's only occurrence of it. What
+//! arrives here is bytes, scalars and a [`FieldId`].
 //!
 //! # Why the radii travel in the payload
 //!
@@ -203,21 +206,34 @@ impl FanSweep {
     /// *transport* check — that what arrived is what was built — and it is the
     /// one the renderer needs before it indexes anything.
     pub fn is_well_formed(&self) -> bool {
-        if self.radials == 0 || self.gates == 0 || self.level_offsets.is_empty() {
+        // `gates == 0` is deliberately **not** a conjunct here. It cannot be
+        // the sole reason a payload is refused: a zero stride forces
+        // `reach_gates` either to 0 or past it, and the reach guard below
+        // catches both. A check no input can uniquely trip reads as protection
+        // and is not any, so the guard that does the work is the one that is
+        // written.
+        if self.radials == 0 || self.level_offsets.is_empty() {
             return false;
         }
         if self.edges.len() != self.radials as usize {
             return false;
         }
-        if self.geometry.reach_gates == 0 || self.geometry.reach_gates > self.gates {
+        // The table is indexed by a whole byte, so anything short of
+        // [`LUT_BYTES`] is a code that resolves past the end of the upload —
+        // and anything longer is a producer and a consumer that disagree about
+        // how many colours a code plane can address. Equality, both ways.
+        if self.lut_rgba.len() != LUT_BYTES {
             return false;
         }
-        if self.level_offsets[0] != 0 {
+        if self.geometry.reach_gates == 0 || self.geometry.reach_gates > self.gates {
             return false;
         }
         // Every level must lie inside `codes`, and the levels must be laid out
         // in order with no gap and no overlap: the offset of level `l + 1` is
-        // the end of level `l`.
+        // the end of level `l`. Level 0 is not a separate case — `want` starts
+        // at 0, so the first turn of this loop *is* "level 0 begins at byte
+        // 0", and spelling it again above would be a second authority on one
+        // question rather than a second question.
         let mut want = 0usize;
         for level in 0..self.levels() {
             let Some((r, g)) = self.level_shape(level) else {
@@ -335,12 +351,45 @@ pub enum FanOutcome {
 pub mod ledger {
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use super::{FanOutcome, FanRefusal};
+
+    /// One counter per outcome, indexed by [`slot`].
+    const SLOTS: usize = 5;
+
     static DRAWS: AtomicU64 = AtomicU64::new(0);
-    static PAINTED: AtomicU64 = AtomicU64::new(0);
-    static NO_PAINTER: AtomicU64 = AtomicU64::new(0);
-    static MALFORMED: AtomicU64 = AtomicU64::new(0);
-    static FLOOR_STRIP: AtomicU64 = AtomicU64::new(0);
-    static DECLINED: AtomicU64 = AtomicU64::new(0);
+    static COUNTS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+
+    /// **Which counter an outcome belongs in — decided once.**
+    ///
+    /// [`note`] writes through this and [`totals`] reads through it, so a
+    /// miswired arm cannot show up as one figure that is wrong and another
+    /// that is right: it can only show up as two outcomes sharing a counter.
+    /// That is a property of this function alone, and
+    /// `every_outcome_has_a_counter_of_its_own` is what holds it.
+    ///
+    /// Two `match`es over the same enum — one to increment, one to read — is
+    /// the shape this replaced, and it had no such property: the pair could
+    /// disagree and every figure would still add up.
+    const fn slot(outcome: FanOutcome) -> usize {
+        match outcome {
+            FanOutcome::Painted => 0,
+            FanOutcome::Refused(FanRefusal::NoPainter) => 1,
+            FanOutcome::Refused(FanRefusal::Malformed) => 2,
+            FanOutcome::Refused(FanRefusal::FloorStrip) => 3,
+            FanOutcome::Refused(FanRefusal::PainterDeclined) => 4,
+        }
+    }
+
+    /// Every outcome the draw fork can reach, which is what a test asserting
+    /// "all of them" has to range over.
+    #[cfg(test)]
+    pub(super) const EVERY_OUTCOME: [FanOutcome; SLOTS] = [
+        FanOutcome::Painted,
+        FanOutcome::Refused(FanRefusal::NoPainter),
+        FanOutcome::Refused(FanRefusal::Malformed),
+        FanOutcome::Refused(FanRefusal::FloorStrip),
+        FanOutcome::Refused(FanRefusal::PainterDeclined),
+    ];
 
     /// The counters, read together.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -364,28 +413,27 @@ pub mod ledger {
     }
 
     /// Record one fan surface's outcome.
-    pub(crate) fn note(outcome: super::FanOutcome) {
+    pub(crate) fn note(outcome: FanOutcome) {
         DRAWS.fetch_add(1, Ordering::Relaxed);
-        let counter = match outcome {
-            super::FanOutcome::Painted => &PAINTED,
-            super::FanOutcome::Refused(super::FanRefusal::NoPainter) => &NO_PAINTER,
-            super::FanOutcome::Refused(super::FanRefusal::Malformed) => &MALFORMED,
-            super::FanOutcome::Refused(super::FanRefusal::FloorStrip) => &FLOOR_STRIP,
-            super::FanOutcome::Refused(super::FanRefusal::PainterDeclined) => &DECLINED,
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
+        COUNTS[slot(outcome)].fetch_add(1, Ordering::Relaxed);
     }
 
     /// The running totals.
     pub fn totals() -> Totals {
+        let at = |outcome| COUNTS[slot(outcome)].load(Ordering::Relaxed);
         Totals {
             draws: DRAWS.load(Ordering::Relaxed),
-            painted: PAINTED.load(Ordering::Relaxed),
-            no_painter: NO_PAINTER.load(Ordering::Relaxed),
-            malformed: MALFORMED.load(Ordering::Relaxed),
-            floor_strip: FLOOR_STRIP.load(Ordering::Relaxed),
-            declined: DECLINED.load(Ordering::Relaxed),
+            painted: at(FanOutcome::Painted),
+            no_painter: at(FanOutcome::Refused(FanRefusal::NoPainter)),
+            malformed: at(FanOutcome::Refused(FanRefusal::Malformed)),
+            floor_strip: at(FanOutcome::Refused(FanRefusal::FloorStrip)),
+            declined: at(FanOutcome::Refused(FanRefusal::PainterDeclined)),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn slot_for_test(outcome: FanOutcome) -> usize {
+        slot(outcome)
     }
 }
 
