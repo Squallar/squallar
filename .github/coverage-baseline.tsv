@@ -64,7 +64,7 @@ squallar-device-profile/src/scene.rs	313	313
 squallar-egui/src/actions.rs	91	43
 squallar-egui/src/admission.rs	600	540
 squallar-egui/src/basemap_archive.rs	525	485
-squallar-egui/src/basemap_archive/block_cache.rs	297	260
+squallar-egui/src/basemap_archive/block_cache.rs	297	261
 squallar-egui/src/basemap_areas.rs	239	204
 squallar-egui/src/basemap_download.rs	994	846
 squallar-egui/src/basemap_layer.rs	196	182
@@ -100,7 +100,7 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	306	268
 squallar-egui/src/tile_mesh/ledger.rs	77	46
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	1542	1477
+squallar-egui/src/tile_source.rs	1542	1474
 squallar-egui/src/tile_source/byte_lru.rs	272	271
 squallar-egui/src/tile_source/cache_ledger.rs	181	165
 squallar-egui/src/tile_source/snap.rs	157	157
