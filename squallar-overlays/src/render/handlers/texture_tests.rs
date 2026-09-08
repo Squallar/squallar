@@ -210,6 +210,7 @@ fn fire_outlook_fixture() -> crate::spc::firewx::SpcFireOutlook {
         day: FireDay::Day1,
         hazard: FireHazard::DryThunderstorm,
         product: FireProduct::Categorical,
+        issue: None,
         valid: None,
         expire: None,
         features: vec![feature()],

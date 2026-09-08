@@ -211,9 +211,27 @@ pub struct SpcFireOutlook {
     pub day: FireDay,
     pub hazard: FireHazard,
     pub product: FireProduct,
+    /// When SPC published this issuance — `ISSUE` in the GeoJSON. **Not
+    /// `valid`**; see [`SpcFireOutlook::in_force_at`].
+    pub issue: Option<NaiveDateTime>,
     pub valid: Option<NaiveDateTime>,
     pub expire: Option<NaiveDateTime>,
     pub features: Vec<OverlayFeature>,
+}
+
+impl SpcFireOutlook {
+    /// Whether this issuance is the one a pane depicting `as_of` should wear —
+    /// the convective layer's [`crate::spc::outlook::SpcOutlook::in_force_at`]
+    /// rule, on the same fields, for the same reason.
+    ///
+    /// The lower bound is `issue`, not `valid`: the day-1 fire weather
+    /// issuance published at 0555Z is `VALID` from 1200Z, so a live pane
+    /// compared against `valid` draws nothing for the six hours between them,
+    /// and a day-2 issuance — `VALID` tomorrow — never draws at all.
+    pub fn in_force_at(&self, as_of: NaiveDateTime) -> bool {
+        self.issue.is_none_or(|issue| issue <= as_of)
+            && self.expire.is_none_or(|expire| as_of < expire)
+    }
 }
 
 /// Origin must come from
@@ -280,6 +298,7 @@ pub fn parse_geojson(
     // (`rasterize::rasterize_spc_outlooks`), so SPC's own ascending
     // publication order is the paint order and nothing is re-sorted.
     let mut features = Vec::new();
+    let mut issue: Option<NaiveDateTime> = None;
     let mut valid: Option<NaiveDateTime> = None;
     let mut expire: Option<NaiveDateTime> = None;
 
@@ -290,6 +309,7 @@ pub fn parse_geojson(
         // outlook. Same feed generator, same posture.
         let ParsedFireFeature {
             feature,
+            issue: feat_issue,
             valid: feat_valid,
             expire: feat_expire,
         } = match parse_fire_feature(feature_val) {
@@ -302,6 +322,9 @@ pub fn parse_geojson(
         // The window before the geometry, deliberately: a feature that draws
         // nothing still dates the product, and out of season it is the ONLY
         // feature there is.
+        if issue.is_none() {
+            issue = feat_issue;
+        }
         if valid.is_none() {
             valid = feat_valid;
         }
@@ -317,6 +340,7 @@ pub fn parse_geojson(
         day,
         hazard,
         product,
+        issue,
         valid,
         expire,
         features,
@@ -328,6 +352,7 @@ struct ParsedFireFeature {
     /// unsupported geometry type. **The window beside it is still good** —
     /// see the note on [`parse_fire_feature`].
     feature: Option<OverlayFeature>,
+    issue: Option<NaiveDateTime>,
     valid: Option<NaiveDateTime>,
     expire: Option<NaiveDateTime>,
 }
@@ -372,6 +397,10 @@ fn parse_fire_feature(feature_val: &serde_json::Value) -> Result<ParsedFireFeatu
     let fill_rgba = super::colors::parse_hex_color(fill_hex, REGULAR_FILL_ALPHA);
     let stroke_rgba = super::colors::parse_hex_color(stroke_hex, 255);
 
+    let issue = properties
+        .get("ISSUE")
+        .and_then(|v| v.as_str())
+        .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y%m%d%H%M").ok());
     let valid = properties
         .get("VALID")
         .and_then(|v| v.as_str())
@@ -402,6 +431,7 @@ fn parse_fire_feature(feature_val: &serde_json::Value) -> Result<ParsedFireFeatu
             }
             return Ok(ParsedFireFeature {
                 feature: None,
+                issue,
                 valid,
                 expire,
             });
@@ -410,6 +440,7 @@ fn parse_fire_feature(feature_val: &serde_json::Value) -> Result<ParsedFireFeatu
             log::warn!("Skipping unsupported geometry type: {other}");
             return Ok(ParsedFireFeature {
                 feature: None,
+                issue,
                 valid,
                 expire,
             });
@@ -429,6 +460,7 @@ fn parse_fire_feature(feature_val: &serde_json::Value) -> Result<ParsedFireFeatu
     });
     Ok(ParsedFireFeature {
         feature,
+        issue,
         valid,
         expire,
     })

@@ -436,7 +436,9 @@ impl SpcFireOutlookHandler {
     /// Every enabled file's features, concatenated in the order they will be
     /// painted.
     /// Every selected file's features, in paint order — for the files whose
-    /// issuance is **in force at `as_of`** (WB-5, [`TimeAxis::EventLifetime`]):
+    /// issuance is **in force at `as_of`** ([`SpcFireOutlook::in_force_at`],
+    /// which [`Self::clickable_items`] goes through too so the painted set and
+    /// the clickable set cannot drift apart) (WB-5, [`TimeAxis::EventLifetime`]):
     /// the same two-`Option` window filter as the convective handler, against
     /// `valid`/`expire` parsed once at fetch, a missing side passing.
     fn features_in_paint_order(
@@ -464,9 +466,7 @@ impl SpcFireOutlookHandler {
         view.extend_scope(&mut scope);
         scope.into_iter().filter_map(move |key| {
             let outlook = self.state.data.get(&key)?;
-            let in_force = outlook.valid.is_none_or(|valid| valid <= as_of)
-                && outlook.expire.is_none_or(|expire| as_of < expire);
-            in_force.then_some((key, outlook))
+            outlook.in_force_at(as_of).then_some((key, outlook))
         })
     }
 
@@ -753,15 +753,15 @@ impl OverlayHandler for SpcFireOutlookHandler {
         self.state.data.len()
     }
 
+    /// **The same walk the picture is painted from**, so a polygon can offer a
+    /// popup only while it is also on the glass — see the convective layer's
+    /// note for the gap this closes and for why the instant here is the wall
+    /// clock rather than a scrubbed pane's own.
     fn clickable_items<'a>(&'a self, pane: &PaneRef<'_>) -> Vec<ClickableItem<'a>> {
         let view = self.view(pane);
-        let mut scope = Vec::new();
-        view.extend_scope(&mut scope);
+        let now = chrono::Utc::now().naive_utc();
         let mut items = Vec::new();
-        for key in scope {
-            let Some(outlook) = self.state.data.get(&key) else {
-                continue;
-            };
+        for (key, outlook) in self.in_force_in_paint_order(view, now) {
             let (day, hazard, product) = key;
             for feature in &outlook.features {
                 items.push(ClickableItem {
@@ -1053,6 +1053,7 @@ mod tests {
             day,
             hazard,
             product,
+            issue: None,
             valid: None,
             expire: None,
             features: Vec::new(),
@@ -2004,9 +2005,10 @@ mod tests {
         }
     }
 
-    /// A Day-1 handler holding one issuance of the day's first file, with the
-    /// given window.
+    /// A Day-1 handler holding one issuance of the day's first file,
+    /// published at `issue` and describing `valid`..`expire`.
     fn day1_with_window(
+        issue: Option<chrono::NaiveDateTime>,
         valid: Option<chrono::NaiveDateTime>,
         expire: Option<chrono::NaiveDateTime>,
     ) -> SpcFireOutlookHandler {
@@ -2030,6 +2032,7 @@ mod tests {
                 day: FireDay::Day1,
                 hazard,
                 product,
+                issue,
                 valid,
                 expire,
                 features: vec![feature],
@@ -2052,12 +2055,18 @@ mod tests {
     /// scrubbed pane there, not a gap an archive fetch will later fill.
     #[test]
     fn a_fire_outlook_draws_only_while_its_issuance_is_in_force() {
-        let handler = day1_with_window(Some(at(22, 12)), Some(at(23, 12)));
+        let handler = day1_with_window(Some(at(22, 6)), Some(at(22, 12)), Some(at(23, 12)));
 
         assert_eq!(
-            labels_at(&handler, at(22, 11)),
+            labels_at(&handler, at(22, 5)),
             Vec::<String>::new(),
-            "before `valid` the issuance is not yet in force",
+            "before `issue` the outlook did not exist yet",
+        );
+        assert_eq!(
+            labels_at(&handler, at(22, 11)),
+            vec!["ELEV".to_owned()],
+            "published at 06Z and describing 12Z onward: the lead time between \
+             them is the product working as designed, not a gap in it",
         );
         assert_eq!(
             labels_at(&handler, at(22, 20)),
@@ -2079,10 +2088,11 @@ mod tests {
     fn a_live_pane_paints_the_unwindowed_picture() {
         let now = chrono::Utc::now().naive_utc();
         let windowed = day1_with_window(
+            Some(now - chrono::Duration::hours(12)),
             Some(now - chrono::Duration::hours(6)),
             Some(now + chrono::Duration::hours(6)),
         );
-        let unwindowed = day1_with_window(None, None);
+        let unwindowed = day1_with_window(None, None, None);
         let live = windowed.paint_input(&paint_ctx(now), &windowed.defaults);
         assert!(
             live.as_ref()
@@ -2101,7 +2111,7 @@ mod tests {
     /// after a light one is a hit on the same allocation.
     #[test]
     fn the_built_input_is_reused_across_the_theme_and_the_clock() {
-        let mut handler = day1_with_window(Some(at(22, 13)), Some(at(23, 12)));
+        let mut handler = day1_with_window(Some(at(22, 6)), Some(at(22, 13)), Some(at(23, 12)));
         let pane = PaneRef::bare(0);
         let light = handler.prepare_job(&paint_ctx(at(22, 14)), &pane).unwrap();
         let dark = handler
