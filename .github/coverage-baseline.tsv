@@ -16,7 +16,7 @@ squallar-app/src/app_render.rs	4456	3745
 squallar-app/src/app_state.rs	77	0
 squallar-app/src/budget_arms.rs	17	17
 squallar-app/src/budget_memo.rs	52	52
-squallar-app/src/budget_telemetry.rs	802	796
+squallar-app/src/budget_telemetry.rs	810	804
 squallar-app/src/channels.rs	68	62
 squallar-app/src/frame_ledger.rs	1262	1156
 squallar-app/src/frame_need.rs	66	66
@@ -27,7 +27,7 @@ squallar-app/src/loop_frame_store.rs	161	150
 squallar-app/src/loop_pool.rs	382	378
 squallar-app/src/loop_refill.rs	97	90
 squallar-app/src/loop_telemetry.rs	50	50
-squallar-app/src/platform.rs	473	383
+squallar-app/src/platform.rs	473	380
 squallar-app/src/platform_double.rs	349	329
 squallar-app/src/pressure.rs	200	192
 squallar-app/src/recovery.rs	176	171
@@ -62,7 +62,7 @@ squallar-device-profile/src/mobile_cfg.rs	19	19
 squallar-device-profile/src/quality.rs	103	102
 squallar-device-profile/src/scene.rs	313	313
 squallar-egui/src/actions.rs	91	43
-squallar-egui/src/admission.rs	288	268
+squallar-egui/src/admission.rs	422	397
 squallar-egui/src/basemap_archive.rs	525	485
 squallar-egui/src/basemap_archive/block_cache.rs	297	261
 squallar-egui/src/basemap_areas.rs	239	204
@@ -75,7 +75,7 @@ squallar-egui/src/floor_ledger.rs	51	12
 squallar-egui/src/frame_need.rs	94	93
 squallar-egui/src/gesture_player.rs	416	395
 squallar-egui/src/gui/frame.rs	516	493
-squallar-egui/src/gui/layer_glue.rs	437	426
+squallar-egui/src/gui/layer_glue.rs	444	430
 squallar-egui/src/gui/probes.rs	97	97
 squallar-egui/src/gui/state.rs	191	188
 squallar-egui/src/gui/sync.rs	290	284
@@ -100,13 +100,13 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	306	268
 squallar-egui/src/tile_mesh/ledger.rs	77	46
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	1542	1477
+squallar-egui/src/tile_source.rs	1542	1475
 squallar-egui/src/tile_source/byte_lru.rs	272	271
 squallar-egui/src/tile_source/cache_ledger.rs	181	165
 squallar-egui/src/tile_source/snap.rs	157	157
 squallar-egui/src/tile_source/take_ledger.rs	109	95
 squallar-egui/src/tiles.rs	406	370
-squallar-egui/src/ui.rs	1418	1314
+squallar-egui/src/ui.rs	1419	1315
 squallar-egui/src/ui_catalog.rs	552	547
 squallar-egui/src/ui_config.rs	1097	1040
 squallar-egui/src/ui_config/migrate.rs	190	176
