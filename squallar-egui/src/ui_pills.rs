@@ -1015,6 +1015,8 @@ fn sync_pill_hover(
     layer_link: bool,
     time_link: bool,
 ) -> String {
+    #[cfg(test)]
+    super::hover_text_count::note();
     let mut text = match group {
         None => "In no group - this pane syncs with nobody".to_owned(),
         Some(group) if with.is_empty() => {
@@ -1291,11 +1293,6 @@ impl super::Gui {
         actions: &mut Vec<GuiAction>,
     ) {
         let group = self.panes[idx].group;
-        // Who else is in it, for the hover. Read here rather than inside the
-        // closure below, which already holds `self.panes[idx]` borrowed.
-        let group_company: Vec<PaneId> = (0..self.visible_pane_count())
-            .filter(|&other| other != idx && self.panes_share_group(idx, other))
-            .collect();
         let (site, kind, product, shares_viewport, links, line_absent, tilt) = {
             let pane = &self.panes[idx];
             let (_, tilt) = pane
@@ -1420,14 +1417,22 @@ impl super::Gui {
                         let all_linked =
                             (!shares_viewport || viewport_link) && layer_link && time_link;
                         let label = sync_pill_label(group, all_linked);
-                        let pill = ui.button(label.as_str()).on_hover_text(sync_pill_hover(
-                            group,
-                            &group_company,
-                            shares_viewport,
-                            viewport_link,
-                            layer_link,
-                            time_link,
-                        ));
+                        // `on_hover_ui`, not `on_hover_text`: the latter is
+                        // this closure with its text already built, and the
+                        // text is a `format!` over a joined `Vec<String>` —
+                        // per pane, per frame, for a tooltip nobody was on.
+                        // The company walk moved in with it.
+                        let pill = ui.button(label.as_str()).on_hover_ui(|ui| {
+                            ui.set_max_width(ui.spacing().tooltip_width);
+                            ui.add(egui::Label::new(sync_pill_hover(
+                                group,
+                                &self.group_company(idx),
+                                shares_viewport,
+                                viewport_link,
+                                layer_link,
+                                time_link,
+                            )));
+                        });
                         #[cfg(test)]
                         probe.pills.push((PillKind::Link, label, pill.rect));
                         if pill.clicked() && swallow {
@@ -1508,6 +1513,15 @@ impl super::Gui {
             })
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The other visible panes in pane `idx`'s link group — the Sync pill's
+    /// hover, and nothing else. Walked inside that hover for the reason
+    /// [`sync_pill_hover`] is built there.
+    fn group_company(&self, idx: PaneId) -> Vec<PaneId> {
+        (0..self.visible_pane_count())
+            .filter(|&other| other != idx && self.panes_share_group(idx, other))
+            .collect()
     }
 
     /// The site popover: search field over the one site list.

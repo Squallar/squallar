@@ -9762,6 +9762,70 @@ fn a_frame_hovering_nothing_builds_no_live_feed_tooltip_string() {
     );
 }
 
+/// **The Sync pill's hover is not built for a frame nobody is hovering — and
+/// neither is the pane walk that only ever fed it.**
+///
+/// `Response::on_hover_text` is `on_hover_ui` with its text **already built**
+/// (`egui/src/response.rs`), so `sync_pill_hover` — a `format!` over a joined
+/// `Vec<String>` — ran once per visible pane per frame, above a walk of the
+/// pane list assembling the group's company for it. Both now happen inside
+/// the `on_hover_ui` body.
+///
+/// The cost scales with panes *and* with group size, so it is measured on the
+/// scene it is worst on rather than the one-pane scene it is absent from. Off
+/// a temporary counting `#[global_allocator]`, repeat-identical across three
+/// runs of 100 still frames: **18 allocations per frame at two panes** (9 per
+/// pane) and **84 at six** (14 per pane, the company list being longer), now
+/// zero on both.
+///
+/// Pinned **in both directions**: zero strings on a frame hovering no pill,
+/// exactly one on the frame whose tooltip is up. Zero on the open frame is
+/// what "never build it at all" would score.
+#[test]
+fn a_frame_hovering_no_pill_builds_no_sync_tooltip_string() {
+    let mut h = pill_harness();
+    assert_eq!(
+        h.pill_rows().len(),
+        2,
+        "premise: the Sync pill is only offered above one pane, and a \
+         per-pane build is only visible as more than one"
+    );
+    let (label, pill) = h.pill(0, PillKind::Link).expect("pane 0 draws a sync pill");
+
+    h.mouse_move(h.map_center());
+    h.frames_for(4, 0.1);
+    crate::ui::hover_text_count::reset();
+    h.frame();
+    let closed = crate::ui::hover_text_count::read();
+    assert_eq!(
+        closed,
+        0,
+        "a frame hovering no pill built {closed} sync-pill hover string(s) \
+         across {} pane(s), each a joined `Vec<String>` nobody read.",
+        h.pill_rows().len()
+    );
+
+    h.mouse_move(pill.center());
+    h.frames_for(12, 0.1);
+    assert!(
+        h.painted_text_strings()
+            .iter()
+            .any(|t| t.contains("with pane 2")),
+        "premise: hovering the {label:?} pill must raise its tooltip, naming \
+         the other pane in the group; painted: {:?}",
+        h.painted_text_strings()
+    );
+    crate::ui::hover_text_count::reset();
+    h.frame();
+    let open = crate::ui::hover_text_count::read();
+    assert_eq!(
+        open, 1,
+        "a frame with the sync tooltip OPEN built {open} string(s). One is \
+         the hovered pane's; zero is an empty tooltip, and two would mean the \
+         unhovered pane built one as well."
+    );
+}
+
 /// 73e. **The product and tilt popovers offer the combos' own lists, and a pick
 /// writes the pane — with the product pick resetting the tilt.**
 #[test]

@@ -2944,7 +2944,7 @@ pub(crate) mod frame_series_query_count {
 }
 
 /// How many frame-path tooltip strings have been built on this thread — the
-/// counter behind `a_frame_hovering_nothing_builds_no_live_feed_tooltip_string`.
+/// counter behind the two `..._builds_no_..._tooltip_string` gates.
 ///
 /// `Response::on_hover_text` is `on_hover_ui` with its text **already built**
 /// (`egui/src/response.rs`), so a paragraph nobody was hovering was formatted
