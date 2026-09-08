@@ -41,8 +41,8 @@
 //! accounts for 400 MB of 1024 must be reported as accounting for 400 MB of
 //! 1024 — never as if the families it does name were the whole heap.
 //!
-//! # **MEASURED 2026-09-08: the residual is mostly ALLOCATOR RETENTION, and
-//! no family can ever reach it**
+//! # **MEASURED 2026-09-08: the residual is not a holder — it is the gap
+//! between the PEAK and the resting level**
 //!
 //! Read this before hunting a holder for the residual. Two sessions have now
 //! spent a night doing exactly that, and the second was told to.
@@ -56,43 +56,70 @@
 //! `byteLength − live_bytes` is exactly the freed-but-reserved headroom the
 //! high-water mark hides."*
 //!
-//! The figures are from the Tier-2 `long` leg's own console ring, where the
-//! `budget state:` line's `live <page>/<worker> MiB` and this line are
-//! written on one tick and land in the ring at the same millisecond, so they
-//! are a pairing and not an alignment:
+//! The figures are from Tier-2 `long` and `huge` legs' own console rings,
+//! where the `budget state:` line's `live <page>/<worker> MiB` and this line
+//! are written on one tick and land in the ring at the same millisecond, so
+//! they are a pairing and not an alignment:
 //!
-//! | arm | `byteLength` | `live_bytes` | RETENTION | this census's floor | unaccounted LIVE |
+//! | arm | `byteLength` | `live` at rest | difference | this census's floor | unaccounted LIVE |
 //! |---|---|---|---|---|---|
-//! | firefox, 4 settled ticks | 889.1 | 490 | **399** | 454.6 | **35.4** (7.2 % of live) |
-//! | chromium, 5 settled ticks | 877.9 | 510–518 | **359–367** | 480.4 | **29.6–37.6** |
+//! | firefox `long`, 4 settled ticks | 889.1 | 490 | **399** | 454.6 | **35.4** (7.2 % of live) |
+//! | chromium `long`, 5 settled ticks | 877.9 | 510–518 | **359–367** | 480.4 | **29.6–37.6** |
 //!
 //! So the 373.0 MiB that `byteLength − resident_total` reported on the
-//! firefox arm decomposes as 399.1 of retention **less** 26.1 of this census
-//! pricing *above* the live heap — and the ~35 MiB that is genuinely unnamed
-//! is a residual of a completely different size from the one the subtraction
-//! advertises. **The signature that settles it against every holder theory**:
-//! on chromium `live` FELL 671 → 517 MiB while `byteLength` ROSE 861.9 →
-//! 877.9. The application freed 150 MiB and the page grew anyway. No holder
-//! does that.
+//! firefox arm decomposes as 399.1 of headroom **less** 26.1 of this census
+//! pricing *above* the live heap, and the genuinely unnamed part is ~35 MiB —
+//! a residual of a completely different size from the one the subtraction
+//! advertises. **No family, however carefully written, will ever close it.**
 //!
-//! **Two consequences, and the second is not about this module at all.**
+//! # **And the headroom is TRANSIENTS, not fragmentation — do not give up on it**
+//!
+//! The paragraph above is easy to finish with "so it is fragmentation and no
+//! residency lever reaches it". That conclusion is wrong, and the correction
+//! is the whole reason [`ProcessCensus::live_peak`] exists.
+//!
+//! `byteLength ≈ live_peak + fragmentation`, and a **max over sampled `live`
+//! readings is a strict lower bound on `live_peak`** — a 2 s sampler can miss
+//! a peak, never invent one.
+//!
+//! Taken over 32 `long` and `huge` arms and **conditioned on whether the page
+//! actually refused an allocation**, which is the only split that matters
+//! because the ratio is a statement about the wall:
+//!
+//! | arms | n | min | median | max |
+//! |---|---|---|---|---|
+//! | refused on the page | 21 | **0.81** | **0.92** | 0.98 |
+//! | never refused | 11 | 0.46 | 0.63 | 0.98 |
+//!
+//! **On every arm that died, at least 81 % of the page's linear memory was
+//! live at some sampled instant, and typically 92 %** — against an estimator
+//! that can only under-read. So the fragmentation term at the wall is at most
+//! a fifth and usually under a tenth, the peak is made of live bytes, and the
+//! headroom is the distance between a peak near 1000 MiB and a resting level
+//! near 490. That distance is transients, and every one of them is somebody's
+//! allocation.
+//!
+//! The healthy arms sitting lower is the same fact from the other side: a
+//! page that never approached its ceiling grew once for a transient and then
+//! sat well below it. It is not a counter-example, and a floor could not
+//! produce one.
+//!
+//! **Two consequences.**
 //!
 //! 1. **Take the unnamed term against [`ProcessCensus::live`], never against
 //!    `byteLength`.** [`Census::unaccounted`] is that reading and exists for
-//!    it. A `byteLength` residual is an upper bound on the unnamed holder and
-//!    is dominated by a term no family can be written for.
-//! 2. **A page can die at a `byteLength` ceiling while holding half of it
-//!    live**, which is a defect class this instrument is the wrong shape for.
-//!    Every family here is a LEVEL — what is held now — and retention is
-//!    driven by CHURN, the flow of large short-lived blocks. Nothing in this
-//!    tree counts that flow. The overlay path is the worked example: on wasm
-//!    a picture arrives as a `Vec<u8>` off the worker wire and
-//!    `RasterBuf::into_pixels` *collects* it into a `Vec<Color32>`, so two
-//!    blocks of 42,772,836 B at the 4317x2477 plan are allocated and freed
-//!    per picture, and `squallar_web::worker_port` calls that second copy "a
-//!    property of the types, not of the transport". Both are gone by the next
-//!    tick and neither is on any level here; the linear memory they grew is
-//!    not.
+//!    it. A `byteLength` residual is dominated by a term no family can be
+//!    written for.
+//! 2. **Steer by [`ProcessCensus::live_peak`], not by `live` at rest.** Every
+//!    family here is a LEVEL, and a page is killed by what was held at ONE
+//!    instant. A scene whose resting level is 250 MiB still dies at 1024 if
+//!    its peak touched 1000, and no level on this line would have said so.
+//!    The overlay path is the worked example: on wasm a picture arrives as a
+//!    `Vec<u8>` off the worker wire and `RasterBuf::into_pixels` *collects*
+//!    it into a `Vec<Color32>`, so two blocks of 42,772,836 B at the
+//!    4317x2477 plan are live at the same instant — 75.4 MiB that no tick
+//!    will ever sample, and that `squallar_web::worker_port` calls "a
+//!    property of the types, not of the transport".
 //!
 //! # Shared ownership is double counted, on purpose
 //!
@@ -410,6 +437,13 @@ families! {
          Published at the seam - the deliver as it sends, the drain as it \
          receives - for `renders in flight`'s reason: a reply lives about one \
          frame and a 2 s tick would read it as zero almost always. \
+         KNOWN OMISSION, named rather than left silent: a reply's `hit_map` \
+         is host bytes too - an `FxHashMap<u32, Vec<u32>>` over the touched \
+         quarter-cells, on about 17 % of arrivals (the four vector layers) - \
+         and this family prices the PICTURE alone. `HitMap` has no public \
+         size to ask for; `squallar_app::loop_frame_store` records the same \
+         gap at the same type for the same reason. A named gap lands in the \
+         residual where someone finds it. \
          DISJOINT from every other family here. The picture is not in \
          `overlay grids` or `overlay items`, which price the SOURCE data a \
          handler decodes, never the raster drawn from it; and it is not yet \
@@ -705,13 +739,14 @@ impl Census {
     /// the reading beside it — a residual with no denominator is the exact
     /// mistake this module exists to stop.
     ///
-    /// **This figure is NOT "how much is held by something unnamed", and on
-    /// wasm it is mostly not held by anything at all.** `linear_bytes` is a
-    /// high-water mark and this subtraction carries every byte the allocator
-    /// has freed and cannot give back — 359 to 399 MiB of a ~880 MiB page on
-    /// both browsers, measured. [`Self::unaccounted`] against
-    /// [`ProcessCensus::live`] is the reading that answers the holder
-    /// question; see the module note, which has the table.
+    /// **This figure is NOT "how much is held by something unnamed".**
+    /// `linear_bytes` is a high-water mark, so this subtraction carries every
+    /// byte the allocator has freed and cannot give back — 359 to 399 MiB of
+    /// a ~880 MiB page on both browsers, measured. [`Self::unaccounted`]
+    /// against [`ProcessCensus::live`] answers the holder question, and
+    /// [`ProcessCensus::live_peak`] answers the one this figure is usually
+    /// being asked in place of: whether those bytes were ever live at once,
+    /// and so whether any lever reaches them. See the module note.
     pub fn residual(&self, linear_bytes: u64) -> Option<u64> {
         linear_bytes.checked_sub(self.resident_total())
     }
@@ -940,7 +975,7 @@ mod process_levels {
         };
     }
     levels! {
-        LIVE; RSS; ANON; FILE; SHMEM; THREADS; SAMPLES;
+        LIVE; LIVE_PEAK; LIVE_PEAK_LARGE; RSS; ANON; FILE; SHMEM; THREADS; SAMPLES;
         MAIN_HEAP; ARENA; ARENAS; STACK; ANON_OTHER; NON_HEAP; THP; WALKS;
     }
 }
@@ -953,6 +988,32 @@ use process_levels as lv;
 pub struct ProcessCensus {
     /// `squallar_alloc::live_bytes()` — granted and not handed back.
     pub live: u64,
+    /// **`squallar_alloc::live_peak_bytes()` — the high-water mark of
+    /// [`Self::live`], taken at the grant and never on a tick.**
+    ///
+    /// The term that says whether a residency lever can reach a wasm page's
+    /// death at all. A linear memory never shrinks, so
+    /// `byteLength ≈ live_peak + fragmentation`: the first half is bytes some
+    /// instant of this program really did hold, which every retention lever
+    /// in the tree moves, and the second is allocation SHAPE, which none of
+    /// them touches. Reading `live` at rest against `byteLength` — which is
+    /// what this campaign did until 2026-09-08 — conflates the two and cannot
+    /// say which is which.
+    ///
+    /// Zero means unread, on [`Self::samples`]'s terms: no binary in this
+    /// process declared the counting allocator.
+    pub live_peak: u64,
+    /// **What [`Self::live_peak`] was MADE OF** — blocks over
+    /// `squallar_alloc::LARGE_GRANT_FLOOR` live at the instant the peak was
+    /// set, `squallar_alloc::live_peak_large_blocks()`.
+    ///
+    /// Answers "the peak was 880 MiB and N large blocks were live" directly
+    /// rather than by inference. **Taken at the peak, not sampled**: it is
+    /// stored only when the peak advances, so it describes the instant the
+    /// maximum was reached. A level read on a tick would answer the same
+    /// question about a different moment — usually one where the transients
+    /// that set the peak are long gone — and would look identical.
+    pub live_peak_large: u64,
     /// `VmRSS`. Zero *and* `samples == 0` means unread, not empty.
     pub rss: u64,
     /// `RssAnon` — the half the allocator lives on.
@@ -1027,6 +1088,14 @@ impl ProcessCensus {
 /// does not take a second reading a few microseconds off the first.
 pub fn publish_resident(live: u64, resident: Option<squallar_alloc::process::Resident>) {
     lv::LIVE.store(live, Relaxed);
+    // Read here rather than taken as a parameter, unlike `live`: the peak is
+    // maintained at the allocation site and is already exact at every
+    // instant, so there is no second reading to keep in step with the first.
+    // Nothing here samples it — a sampled peak is a false zero for every
+    // transient shorter than the sample, which is the whole class it exists
+    // to catch. See `squallar_alloc::live_peak_bytes`.
+    lv::LIVE_PEAK.store(squallar_alloc::live_peak_bytes().unwrap_or(0), Relaxed);
+    lv::LIVE_PEAK_LARGE.store(squallar_alloc::live_peak_large_blocks(), Relaxed);
     if let Some(r) = resident {
         lv::RSS.store(r.rss_bytes, Relaxed);
         lv::ANON.store(r.anon_bytes, Relaxed);
@@ -1058,6 +1127,8 @@ pub fn publish_breakdown(b: &squallar_alloc::process::Breakdown) {
 pub fn process_census() -> ProcessCensus {
     ProcessCensus {
         live: lv::LIVE.load(Relaxed),
+        live_peak: lv::LIVE_PEAK.load(Relaxed),
+        live_peak_large: lv::LIVE_PEAK_LARGE.load(Relaxed),
         rss: lv::RSS.load(Relaxed),
         anon: lv::ANON.load(Relaxed),
         file: lv::FILE.load(Relaxed),
@@ -1189,9 +1260,59 @@ pub const PROCESS_WALK_EVERY: u32 = 8;
 /// `floor` totals it widens were already past the power of ten that would
 /// have cost a digit. Re-derive by running the test, which asserts equality
 /// rather than `<=`; never carry a delta across a rebase.
-pub const PROCESS_LINE_CAPACITY: usize = 649;
+///
+/// `live peak` is the first field added to this line rather than to the
+/// census, and it moves the constant by its OWN prose and figure, not by a
+/// digit on somebody else's total: `", live peak "` is 12 characters, plus
+/// twenty digits and `" B"`, so `12 + 20 + 2 = 34` and 649 becomes 683.
+/// `peak large blocks` is a COUNT and carries no `" B"`:
+/// `", peak large blocks "` is 20 characters plus twenty digits, so
+/// `20 + 20 = 40` and 683 becomes 723.
+pub const PROCESS_LINE_CAPACITY: usize = 723;
 
 /// **The process denominator as one line.**
+///
+/// # The exact format, for whoever writes the regex
+///
+/// Written down here rather than left to be read off the `write!` calls,
+/// because the scraper lives in another repository's `drive.py` and the two
+/// drift the moment one of them is the only record.
+///
+/// ```text
+/// process memory (page): live 123 B, live peak 456 B, peak large blocks 7, \
+/// families 8 B floor 9 B, unaccounted 1 B to 2 B; rss unread
+/// ```
+///
+/// * The prefix is `process memory (<instance>): `, and `<instance>` is one
+///   of `page`, `rasterization worker` or `tile lane` — **always match it**,
+///   because the page and the worker are two heaps under two ceilings and a
+///   figure from the wrong one is worse than no figure. A fourth spelling,
+///   `process`, is the native sampler thread's own (it logs this line at
+///   `debug!` on the walk's cadence, where the frame thread's telemetry tick
+///   says `page`); on the web the sampler has no thread and the tick is the
+///   only emitter, so a web scrape sees `page` alone.
+/// * Fields are `<name> <integer>`, a byte figure carrying a trailing ` B`
+///   and a count carrying none. Every integer is a plain decimal `u64` with
+///   no separators and no units other than that ` B`.
+/// * `, ` separates fields; `; ` separates the three groups.
+///
+/// **The first group is unconditional and everything after it is not.** `rss`
+/// collapses to `rss unread` where there is no `/proc` — which is every web
+/// target — and the breakdown collapses to `breakdown unwalked` until a walk
+/// has landed. `unaccounted` has a second arm, `unaccounted none (families
+/// price above live)`, which is a real state and not an error.
+///
+/// So **`live`, `live peak` and `peak large blocks` sit in that first group,
+/// immediately after the prefix**, and that is a deliberate choice against
+/// this workspace's usual "append at the end" rule for scraped lines. The
+/// usual rule exists because `budget state:` is read by an unanchored
+/// positional regex; here the opposite applies, because the *end* of this
+/// line is the conditional part. A field appended after the breakdown would
+/// be present on a native tick and absent on a web one, at two different
+/// offsets. In the first group it is at a fixed offset on every target and
+/// every tick, and
+/// `process memory \((\w[\w ]*)\): live (\d+) B, live peak (\d+) B, peak large blocks (\d+)`
+/// matches all of them.
 ///
 /// Three groups, in the order a reader needs them: what the allocator was
 /// asked for and what this census could name of it; what the OS actually
@@ -1205,7 +1326,12 @@ pub fn write_process_line<W: core::fmt::Write>(
     instance: &str,
 ) -> core::fmt::Result {
     let (least, most) = census.unaccounted(process.live);
-    write!(out, "process memory ({instance}): live {} B", process.live)?;
+    write!(
+        out,
+        "process memory ({instance}): live {} B, live peak {} B, \
+         peak large blocks {}",
+        process.live, process.live_peak, process.live_peak_large
+    )?;
     // The census's two ends against the allocator, which is the whole point
     // of the line on a native arm.
     match (least, most) {
@@ -1252,6 +1378,82 @@ pub fn write_process_line<W: core::fmt::Write>(
         process.samples,
         process.walks,
     )
+}
+
+/// **The large-grant histogram as one line**, for the telemetry tick.
+///
+/// # The exact format, for whoever writes the regex
+///
+/// ```text
+/// large grants (page): 1048576..1179648 B x3 = 3145728 B, largest 1100000 B; \
+/// 33554432..37748736 B x12 = 460000000 B, largest 37000000 B
+/// large grants (page): none
+/// ```
+///
+/// * The prefix is `large grants (<instance>): `, and `<instance>` is the
+///   same three-way choice [`write_process_line`] documents, for the same
+///   reason.
+/// * Then either the literal `none`, or one or more bucket clauses separated
+///   by `; `.
+/// * A clause is `<low>..<high> B x<count> = <bytes> B, largest <max> B`.
+///   `low` and `high` bound the bucket (`low` inclusive, `high` exclusive);
+///   `count` and `bytes` are cumulative over the whole session; **`max` is
+///   the exact largest single grant in that bucket**, which is the figure a
+///   reader wants — it decides whether a free chunk can serve a repeat, and
+///   it is exact where the bucket is not.
+/// * Empty buckets are omitted, so the clause count varies from tick to tick
+///   and a positional regex will not do. Match clauses with
+///   `(\d+)\.\.(\d+) B x(\d+) = (\d+) B, largest (\d+) B` and take every
+///   match on the line.
+///
+/// **Cumulative flow, never a level, and never added to anything on the
+/// census line.**
+///
+/// A `String` and therefore NOT hook-safe, unlike everything else in this
+/// module: the bucket set is unbounded prose and the allocation-error hook
+/// writes into a fixed buffer. That is deliberate — this answers "what shape
+/// are the blocks that grew this heap", which is a question you ask before
+/// the wall, not at it.
+///
+/// **Cumulative flow, not a level**, and it is the only such figure this
+/// module carries. Every other family here says what is held now; a wasm
+/// linear memory is grown by what was ever held *at once* and never shrinks,
+/// so the shape of the large grants is what a level structurally cannot say.
+/// Empty buckets are left out, so a quiet process says
+/// `large grants (page): none`.
+pub fn large_grants_line(instance: &str) -> String {
+    use core::fmt::Write;
+
+    let mut out = String::new();
+    let _ = write!(out, "large grants ({instance}):");
+    let mut said = 0usize;
+    for idx in 0..squallar_alloc::LARGE_GRANT_BUCKETS {
+        let Some(b) = squallar_alloc::large_grant(idx) else {
+            break;
+        };
+        if b.count == 0 {
+            continue;
+        }
+        // The range, then what landed in it, then the largest single one
+        // EXACTLY — that last figure is what decides whether a free chunk can
+        // serve a repeat, and it is readable at finer resolution than the
+        // bucket it sits in.
+        let _ = write!(
+            out,
+            "{} {}..{} B x{} = {} B, largest {} B",
+            if said == 0 { "" } else { ";" },
+            b.low,
+            b.high,
+            b.count,
+            b.bytes,
+            b.max,
+        );
+        said += 1;
+    }
+    if said == 0 {
+        let _ = write!(out, " none");
+    }
+    out
 }
 
 /// [`write_process_line`] into a `String`, for the telemetry tick.

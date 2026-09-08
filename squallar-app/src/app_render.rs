@@ -2656,6 +2656,53 @@ impl super::App {
                 "page",
             ),
         );
+        // **The census against the ALLOCATOR, and the peak beside it.**
+        //
+        // The line above takes its residual against `byteLength`, which only
+        // ever grows: on wasm a linear memory never shrinks, so that
+        // subtraction carries every byte this page has ever freed. Measured
+        // 2026-09-08 on the Tier-2 `long` leg, that term was 359 to 399 MiB
+        // of a ~880 MiB page on both browsers, and three sessions read it as
+        // a holder nobody had counted. `live` is the reading that answers the
+        // holder question and `live peak` is the one that says whether any
+        // residency lever reaches the page's death at all — see
+        // `squallar_alloc::live_peak_bytes`.
+        //
+        // **SAID here, never published here.** The levels are already
+        // current on both targets and neither publisher is this thread:
+        // `squallar_egui::gui::frame` calls `heap_census::spawn_process_sampler`
+        // every frame, whose wasm arm IS a `publish_resident` and whose native
+        // arm starts the `squallar.mem.census` thread that samples every
+        // 250 ms and walks every 2 s. Re-publishing here would put that
+        // thread's `/proc` read — 11 us cheap, 3.3 ms p50 for the walk — on
+        // the frame thread, which is the one thing its own doc says must not
+        // happen.
+        //
+        // **What was actually missing is the SAYING, on the web.** The native
+        // sampler logs `process_line` itself, on the walk's cadence, from its
+        // own thread; the wasm arm has no thread and logs nothing, so on the
+        // one target this campaign measures the process census was published
+        // every frame and printed never. `live peak` would have been born
+        // unobservable exactly where it is needed.
+        //
+        // The resident half is `None` on the web, where there is no `/proc`;
+        // the line says `rss unread` and the two allocator figures — two
+        // atomic loads, on every target — still land.
+        say_telemetry(
+            loud,
+            &squallar_egui::heap_census::process_line(
+                &squallar_egui::heap_census::census(),
+                &squallar_egui::heap_census::process_census(),
+                "page",
+            ),
+        );
+        // **The shape of the blocks that grew the heap**, its own line
+        // because it is cumulative flow where everything above is a level,
+        // and the two must never be added. A level cannot answer this: a
+        // linear memory is grown by what was held at ONE instant and never
+        // gives it back, so the transient pair that raised the peak is gone
+        // from every level by the time any tick reads one.
+        say_telemetry(loud, &squallar_egui::heap_census::large_grants_line("page"));
         // The wasm heap watermarks, on the same tick. The bridge answers the
         // platform question: a native bridge reads no heap and neither arm
         // is entered there. The two instances are judged apart — each has

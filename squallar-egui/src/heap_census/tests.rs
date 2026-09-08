@@ -549,6 +549,8 @@ fn a_failed_resident_reading_does_not_count_as_a_sample() {
 fn the_widest_process_line_fits_its_buffer() {
     let widest = ProcessCensus {
         live: u64::MAX,
+        live_peak: u64::MAX,
+        live_peak_large: u64::MAX,
         rss: u64::MAX,
         anon: u64::MAX,
         file: u64::MAX,
@@ -580,6 +582,42 @@ fn the_widest_process_line_fits_its_buffer() {
         PROCESS_LINE_CAPACITY,
         "the widest process line is {} bytes; re-derive PROCESS_LINE_CAPACITY",
         said.len()
+    );
+}
+
+/// **A process that never installed the counting allocator says so**, rather
+/// than printing an empty histogram as if it had measured one.
+///
+/// This test binary does not declare `squallar_alloc::Counting`, so nothing
+/// has ever reached `note_large_grant` here and `none` is the true answer.
+/// The line's own honesty rule, the same one `rss unread` and
+/// `breakdown unwalked` carry: a zero that means "not counted here" must not
+/// read as a zero that means "nothing happened".
+#[test]
+fn a_process_with_no_counting_allocator_reports_no_large_grants() {
+    let said = large_grants_line("page");
+    assert_eq!(
+        said, "large grants (page): none",
+        "this binary installs no counting allocator, so the histogram has \
+         seen nothing and must say so rather than print buckets",
+    );
+}
+
+/// **`live peak` is on the process line and is its own figure**, not a
+/// restatement of `live`.
+#[test]
+fn the_process_line_carries_the_peak_beside_the_live_figure() {
+    let p = ProcessCensus {
+        live: 111,
+        live_peak: 222,
+        live_peak_large: 3,
+        ..Default::default()
+    };
+    let said = process_line(&Census::default(), &p, "page");
+    assert!(
+        said.contains("live 111 B, live peak 222 B, peak large blocks 3"),
+        "the peak is the term that says whether a residency lever reaches a \
+         wasm page's death, and it is not on the line: {said}",
     );
 }
 
