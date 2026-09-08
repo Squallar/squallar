@@ -1792,3 +1792,110 @@ fn the_wasm_loop_budgets_clear_the_reproduced_freeze() {
     // archive (5.56 MiB), so the common case never re-downloads.
     assert!(WASM_LOOP_ARCHIVE_CEILING_BYTES as u64 >= wf::FRAMES * 5_830_000);
 }
+
+/// **The price and the producer agree about a real object, not just about
+/// arithmetic.**
+///
+/// `polar_frame_cost` is dark and has only ever been checked against closed
+/// forms and hand sums. `squallar_radar` now builds the thing it prices, so
+/// the honest check is to build one and weigh it: the plane's own
+/// `resident_bytes` — read off the vectors it allocated — against
+/// `chain_texels` over the same shape, for every shape in the design's table.
+///
+/// A disagreement here is not a rounding difference. It would mean the budget
+/// prices a buffer of one size while the encoder allocates another, which is
+/// exactly the failure the dark-price constraint exists to prevent, arriving
+/// from the other direction.
+#[test]
+fn the_price_weighs_the_plane_the_producer_actually_builds() {
+    use squallar_radar::render::codes::{CodePlane, LutKey};
+    use squallar_radar::types::RadarProduct;
+
+    // Every shape `PolarFrameShape`'s doc table observes, at the products that
+    // may actually have a plane.
+    let arms = [
+        (RadarProduct::Reflectivity, 720usize, 1832usize),
+        (RadarProduct::Velocity, 720, 1192),
+        (RadarProduct::CorrelationCoefficient, 720, 1832),
+        (RadarProduct::SpectrumWidth, 720, 1192),
+        // A ragged shape, where ceil-halving leaves edges on both axes.
+        (RadarProduct::Reflectivity, 367, 913),
+    ];
+    for (product, radials, gates) in arms {
+        let key = LutKey {
+            product,
+            scale: 2.0,
+            offset: 66.0,
+        };
+        let plane = CodePlane::build(radials, gates, vec![0; radials * gates], key, 8)
+            .expect("a shape inside both caps");
+
+        assert_eq!(
+            plane.levels(),
+            full_mip_levels(radials, gates),
+            "{product:?} {radials}x{gates}: the producer's chain and this crate's level count \
+             disagree, so the price would charge for levels the encoder does not build",
+        );
+        let priced = polar_frame_cost(PolarFrameShape {
+            radials,
+            gates,
+            width_bytes: POLAR_CODE_R8_BYTES,
+            sweeps: 1,
+            mip_levels: full_mip_levels(radials, gates),
+            codes_retained: true,
+        });
+        assert_eq!(
+            priced.host_peak(),
+            plane.resident_bytes(),
+            "{product:?} {radials}x{gates}: priced {} bytes against a plane that weighs {}",
+            priced.host_peak(),
+            plane.resident_bytes(),
+        );
+        assert_eq!(priced.gpu, plane.resident_bytes());
+    }
+
+    // The categorical arm: one level, so the price's `mip_levels = 1` and the
+    // producer's `Reduce::None` have to reach the same figure by two different
+    // routes.
+    let hhc = CodePlane::build(
+        360,
+        920,
+        vec![0; 360 * 920],
+        LutKey::identity(RadarProduct::HydrometeorClassification),
+        8,
+    )
+    .expect("inside both caps");
+    assert_eq!(hhc.levels(), 1);
+    let priced_flat = polar_frame_cost(PolarFrameShape {
+        radials: 360,
+        gates: 920,
+        width_bytes: POLAR_CODE_R8_BYTES,
+        sweeps: 1,
+        mip_levels: 1,
+        codes_retained: true,
+    });
+    assert_eq!(priced_flat.host_peak(), hhc.resident_bytes());
+    assert_eq!(priced_flat.host_scratch, 0);
+
+    // The caps this crate publishes are the producer's own, so a shape one
+    // step past them is refused rather than priced.
+    assert_eq!(
+        MAX_POLAR_RADIALS,
+        squallar_radar::render::codes::MAX_POLAR_RADIALS
+    );
+    assert_eq!(
+        MAX_POLAR_GATES,
+        squallar_radar::render::codes::MAX_POLAR_GATES
+    );
+    assert!(
+        CodePlane::build(
+            MAX_POLAR_RADIALS + 1,
+            8,
+            Vec::new(),
+            LutKey::identity(RadarProduct::Reflectivity),
+            8,
+        )
+        .is_err(),
+        "the price's cap and the producer's refusal have come apart",
+    );
+}

@@ -534,7 +534,13 @@ pub const POLAR_DRAWN_EDGE_BYTES: usize = 2 * size_of::<f32>();
 /// [`squallar_radar::types::MAX_EXTENT_KM`]'s role for the other axis — a
 /// ceiling on arithmetic, so a mis-framed radial claiming four thousand
 /// radials cannot size an allocation.
-pub const MAX_POLAR_RADIALS: usize = 2 * 720;
+///
+/// **Read from the producer, not restated here.** `CodePlane::build` is what
+/// refuses a payload past this bound; a second copy of the number in the
+/// pricing crate could drift from the one the encoder enforces, and a price
+/// that admitted a shape the producer refuses would be pricing a frame that
+/// cannot exist.
+pub const MAX_POLAR_RADIALS: usize = squallar_radar::render::codes::MAX_POLAR_RADIALS;
 
 /// **The most gates a polar frame may declare**, past which the payload is
 /// refused.
@@ -543,7 +549,7 @@ pub const MAX_POLAR_RADIALS: usize = 2 * 720;
 /// a texture, and `squallar_gpu`'s device setup pins
 /// `downlevel_webgl2_defaults().using_resolution(adapter)` on the web, which
 /// lifts resolution and nothing else. Design §2.2.
-pub const MAX_POLAR_GATES: usize = squallar_radar::types::WEBGL2_MAX_TEXTURE_DIMENSION_2D;
+pub const MAX_POLAR_GATES: usize = squallar_radar::render::codes::MAX_POLAR_GATES;
 
 /// Invariants of the polar pricing above, checked at compile time. Each one
 /// would make the arithmetic silently wrong rather than loudly broken.

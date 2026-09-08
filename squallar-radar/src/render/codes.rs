@@ -188,5 +188,448 @@ pub fn distinct_palette_colours(product: RadarProduct, samples: usize) -> usize 
     seen.len()
 }
 
+/// **The most radials a code plane may declare**, past which the payload is
+/// refused rather than truncated.
+///
+/// Twice the 720 the RDA can declare: Level II states 0.5° or 1.0° azimuth
+/// resolution and has no third, so this is slack by construction rather than
+/// an observation of the widest sweep seen. `squallar_device_profile`'s
+/// `MAX_POLAR_RADIALS` is this constant — the bound belongs beside the code
+/// that enforces it, and the pricing crate reads it from here so the refusal
+/// and the price cannot disagree about what is admissible.
+pub const MAX_POLAR_RADIALS: usize = 2 * 720;
+
+/// **The most gates a code plane may declare**, past which the payload is
+/// refused.
+///
+/// The WebGL2 per-axis guarantee verbatim: the plane is a texture, and
+/// `squallar_gpu` pins `downlevel_webgl2_defaults().using_resolution(adapter)`
+/// on the web, which lifts resolution and nothing else. A real surveillance
+/// cut declares 1832 gates, so this bound sits in the upper half of what the
+/// data really produces and is live rather than decorative.
+pub const MAX_POLAR_GATES: usize = crate::types::WEBGL2_MAX_TEXTURE_DIMENSION_2D;
+
+/// Payloads refused by [`CodePlane::build`] since the process started.
+///
+/// Always on, like the rest of this crate's ledgers: a refusal is the only
+/// evidence that a hostile or malformed sweep reached the encoder, and a
+/// counter that exists only under `cfg(test)` cannot report one from a running
+/// app.
+static REFUSALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Why a payload could not become a code plane.
+///
+/// Every arm is a refusal and none is a truncation: a plane that silently
+/// dropped radials or gates would paint a sweep that was never measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaneRefusal {
+    /// Zero radials, zero gates, or past [`MAX_POLAR_RADIALS`] /
+    /// [`MAX_POLAR_GATES`].
+    Shape { radials: usize, gates: usize },
+    /// The code buffer is not exactly `radials * gates` bytes.
+    CodeCount { got: usize, want: usize },
+    /// The product's gates cannot survive eight bits. See [`R8Fidelity`].
+    NotRepresentable {
+        product: RadarProduct,
+        fidelity: R8Fidelity,
+    },
+    /// The product is exact only on the 8-bit wire form and this sweep carried
+    /// the wide one.
+    WideWireWord {
+        product: RadarProduct,
+        word_bits: u8,
+    },
+}
+
+/// Whether an R8 code plane can carry a product's gates without dropping a
+/// distinction the raster paints today.
+///
+/// Measured, not assumed — `an_r8_plane_is_exact_for_wire_bytes_and_lossy_for_computed_gradients`
+/// derives every one of these from two independent quantities (how many values
+/// the encoding can produce, and how many colours the palette resolves over
+/// the extent its own legend declares) and fails if this table disagrees with
+/// the measurement.
+///
+/// **`docs/radar-polar-design.md` §7 and §2.4 put six lossy products on R8
+/// planes** — NROT and SRV in phase D, and KDP, VIL, EchoTops and VIL density
+/// in the reduce table. That is a fidelity regression and this type is where
+/// it stops: [`CodePlane::build`] refuses them, so the design's schedule
+/// cannot be followed into the mistake by a later lane that reads the document
+/// and not this table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum R8Fidelity {
+    /// The wire carries this moment's codes at eight bits, so a gate can hold
+    /// [`PAINTABLE_CODES`] distinct values and no more. An R8 plane stores it
+    /// **as measured**, and the palette's width is irrelevant — reflectivity
+    /// resolves thousands of distinct colours across its extent and a real
+    /// reflectivity sweep still shows at most 254 of them, raster or plane.
+    WireByteExact,
+    /// Eight bits in most volumes and sixteen in some. Exact on the narrow
+    /// form only, so [`CodePlane::build`] requires the caller to state the
+    /// word size the sweep actually carried.
+    ExactOnEightBitWireOnly,
+    /// Sixteen-bit wire codes: 65,534 reachable values against 254 the plane
+    /// can index. Excluded by its domain, whatever the palette does.
+    WireWordTooWide,
+    /// No wire code at all — the field is computed as `f32` per gate, so an R8
+    /// plane is a quantiser rather than a store, and the palette resolves more
+    /// distinct colours over the product's own extent than the plane has
+    /// paintable codes.
+    ComputedPaletteTooWide,
+    /// Computed like the arm above, but over a **banded** palette narrow
+    /// enough that 254 codes hold every colour it can show. Fidelity admits
+    /// it; note that no quantiser is defined for these products anywhere, so
+    /// admitting one is not the same as being ready to build it.
+    ComputedPaletteFits,
+}
+
+impl R8Fidelity {
+    /// Whether an R8 plane is lossless for this verdict on the **narrow** wire
+    /// form — the question the palette measurement answers, with the wide-word
+    /// case held out because that is a domain refusal and not a palette one.
+    pub fn admits_eight_bit_wire(self) -> bool {
+        self.admits(8)
+    }
+
+    /// Whether a plane may be built for this verdict at all, given the wire
+    /// word size the sweep carried.
+    fn admits(self, word_bits: u8) -> bool {
+        match self {
+            R8Fidelity::WireByteExact | R8Fidelity::ComputedPaletteFits => true,
+            R8Fidelity::ExactOnEightBitWireOnly => word_bits == 8,
+            R8Fidelity::WireWordTooWide | R8Fidelity::ComputedPaletteTooWide => false,
+        }
+    }
+}
+
+/// The measured verdict for `product`. See [`R8Fidelity`].
+pub fn r8_fidelity(product: RadarProduct) -> R8Fidelity {
+    match product {
+        RadarProduct::Reflectivity
+        | RadarProduct::Velocity
+        | RadarProduct::SpectrumWidth
+        | RadarProduct::CorrelationCoefficient
+        | RadarProduct::HydrometeorClassification => R8Fidelity::WireByteExact,
+        RadarProduct::DifferentialReflectivity => R8Fidelity::ExactOnEightBitWireOnly,
+        RadarProduct::DifferentialPhase => R8Fidelity::WireWordTooWide,
+        RadarProduct::StormRelativeVelocity
+        | RadarProduct::SpecificDifferentialPhase
+        | RadarProduct::NormalizedRotation
+        | RadarProduct::EchoTops
+        | RadarProduct::EchoTopsInterpolated
+        | RadarProduct::VerticallyIntegratedLiquid
+        | RadarProduct::VilDensity
+        | RadarProduct::PrecipitationRate => R8Fidelity::ComputedPaletteTooWide,
+        // Banded scales of ten and twelve stops: an R8 plane holds them with
+        // room to spare. They are not migrated for size reasons rather than
+        // fidelity ones -- 360 x 230 cells is 82.8 KB and the polar win does
+        // not pay for defining a quantiser -- but nothing here forbids it.
+        RadarProduct::ProbabilityOfSevereHail | RadarProduct::MaxExpectedHailSize => {
+            R8Fidelity::ComputedPaletteFits
+        }
+    }
+}
+
+/// How a mip level reduces the cells beneath it.
+///
+/// **Declared per product, because "strongest" is not one operation.** Design
+/// §2.4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reduce {
+    /// The code ascends with the quantity, so the strongest echo is the
+    /// largest code.
+    MaxCode,
+    /// Codes ascend from −Nyquist to +Nyquist, so the largest code is the
+    /// fastest *away* rather than the strongest. The choice is the magnitude
+    /// of the decoded quantity, which is well defined because the code map is
+    /// affine and monotone.
+    MaxMagnitude,
+    /// No reduction: the plane is one level and the shader clamps to it.
+    /// Hydrometeor class codes are categorical and ordinally meaningless; a
+    /// maximum over them would name a class nobody measured.
+    None,
+}
+
+impl Reduce {
+    /// The operator `product` reduces by.
+    pub fn for_product(product: RadarProduct) -> Self {
+        match product {
+            RadarProduct::HydrometeorClassification | RadarProduct::DifferentialPhase => {
+                Reduce::None
+            }
+            RadarProduct::Velocity
+            | RadarProduct::StormRelativeVelocity
+            | RadarProduct::NormalizedRotation => Reduce::MaxMagnitude,
+            _ => Reduce::MaxCode,
+        }
+    }
+}
+
+/// Levels in a full chain over `radials x gates`, **counting level 0**.
+///
+/// The last level is the one whose both dimensions have reached 1 under
+/// repeated ceil-halving. `squallar_device_profile::constants::full_mip_levels`
+/// answers the same question on the pricing side; this is the producer's own,
+/// and `the_price_weighs_the_plane_the_producer_actually_builds` holds them equal.
+pub fn full_mip_levels(radials: usize, gates: usize) -> usize {
+    let mut levels = 1;
+    let (mut r, mut g) = (radials, gates);
+    while r > 1 || g > 1 {
+        r = r.div_ceil(2);
+        g = g.div_ceil(2);
+        levels += 1;
+    }
+    levels
+}
+
+/// **A sweep's gates as the codes the wire carried, plus a max-reducing mip
+/// chain** — the polar representation's payload.
+///
+/// Radial-major, one byte per gate at level 0. Each further level ceil-halves
+/// both dimensions and reduces the up-to-four cells beneath it by the
+/// product's [`Reduce`], so a zoomed-out fragment reads the strongest echo in
+/// its footprint instead of whichever radial happened to be written last. That
+/// is a deliberate change from the raster, whose `RenderBuffers::claim` orders
+/// by `write_key` and is therefore last-radial-wins.
+///
+/// **Nothing draws this yet.** No renderer emits a plane, and the budget seam
+/// that would price one stays dark until the renderer produces polar frames —
+/// `squallar_device_profile`'s own darkness gate is what holds that, and it
+/// matches the price function's name as a literal, so this sentence names it
+/// only by description.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CodePlane {
+    /// Level 0, radial-major, `radials * gates` bytes.
+    codes: Vec<u8>,
+    /// Levels 1..=L concatenated, each ceil-halved from the one before.
+    mips: Vec<u8>,
+    /// Where each level begins in [`CodePlane::mips`], indexed by
+    /// `level - 1`; one entry per level above zero.
+    mip_offsets: Vec<usize>,
+    radials: usize,
+    gates: usize,
+    key: LutKey,
+    reduce: Reduce,
+}
+
+impl CodePlane {
+    /// Build a plane from a sweep's raw codes.
+    ///
+    /// `word_bits` is the wire word size the moment was carried at — 8 or 16 —
+    /// and it is a parameter rather than an assumption because differential
+    /// reflectivity appears as both and only the narrow form is exact.
+    ///
+    /// Refuses, never truncates and never panics: a shape past the caps, a
+    /// code buffer that does not match the shape, a product whose gates cannot
+    /// survive eight bits, and a wide word for a product that is exact only at
+    /// eight. Every refusal increments [`CodePlane::refusals`].
+    pub fn build(
+        radials: usize,
+        gates: usize,
+        codes: Vec<u8>,
+        key: LutKey,
+        word_bits: u8,
+    ) -> Result<Self, PlaneRefusal> {
+        Self::build_inner(radials, gates, codes, key, word_bits).inspect_err(|_| {
+            REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        })
+    }
+
+    fn build_inner(
+        radials: usize,
+        gates: usize,
+        codes: Vec<u8>,
+        key: LutKey,
+        word_bits: u8,
+    ) -> Result<Self, PlaneRefusal> {
+        let fidelity = r8_fidelity(key.product);
+        if !fidelity.admits(word_bits) {
+            return Err(match fidelity {
+                R8Fidelity::ExactOnEightBitWireOnly => PlaneRefusal::WideWireWord {
+                    product: key.product,
+                    word_bits,
+                },
+                _ => PlaneRefusal::NotRepresentable {
+                    product: key.product,
+                    fidelity,
+                },
+            });
+        }
+        if radials == 0 || gates == 0 || radials > MAX_POLAR_RADIALS || gates > MAX_POLAR_GATES {
+            return Err(PlaneRefusal::Shape { radials, gates });
+        }
+        let want = radials * gates;
+        if codes.len() != want {
+            return Err(PlaneRefusal::CodeCount {
+                got: codes.len(),
+                want,
+            });
+        }
+
+        let reduce = Reduce::for_product(key.product);
+        let mut plane = Self {
+            codes,
+            mips: Vec::new(),
+            mip_offsets: Vec::new(),
+            radials,
+            gates,
+            key,
+            reduce,
+        };
+        plane.build_chain();
+        Ok(plane)
+    }
+
+    /// Reduce level by level, each from the one before.
+    ///
+    /// Hierarchical reduction equals reducing a level-0 footprint whole,
+    /// because every operator here is a maximum over a total order with the
+    /// same sentinel fallback, and a maximum is associative.
+    /// `max_mip_is_max` asserts that against a direct walk of the footprint
+    /// rather than trusting the argument.
+    fn build_chain(&mut self) {
+        if self.reduce == Reduce::None {
+            return;
+        }
+        let levels = full_mip_levels(self.radials, self.gates);
+        let (mut r, mut g) = (self.radials, self.gates);
+        for level in 1..levels {
+            let (pr, pg) = (r, g);
+            r = r.div_ceil(2);
+            g = g.div_ceil(2);
+            self.mip_offsets.push(self.mips.len());
+            for radial in 0..r {
+                for gate in 0..g {
+                    let mut cells = [None; 4];
+                    let mut n = 0;
+                    for dr in 0..2 {
+                        for dg in 0..2 {
+                            let (sr, sg) = (radial * 2 + dr, gate * 2 + dg);
+                            if sr < pr && sg < pg {
+                                cells[n] = Some(self.level_code(level - 1, pg, sr, sg));
+                                n += 1;
+                            }
+                        }
+                    }
+                    let reduced = self.reduce_cells(&cells[..n]);
+                    self.mips.push(reduced);
+                }
+            }
+        }
+    }
+
+    /// One code out of an already-written level. `stride` is that level's gate
+    /// count, passed in because the caller is mid-write and the offsets vector
+    /// does not yet describe the level being produced.
+    fn level_code(&self, level: usize, stride: usize, radial: usize, gate: usize) -> u8 {
+        let index = radial * stride + gate;
+        if level == 0 {
+            self.codes[index]
+        } else {
+            self.mips[self.mip_offsets[level - 1] + index]
+        }
+    }
+
+    /// The declared reduce over up to four cells, with the sentinel rule.
+    ///
+    /// Codes 0 and 1 are status and not measurement, so they are excluded from
+    /// the comparison and only survive when nothing under the cell measured
+    /// anything. Excluding them from [`Reduce::MaxMagnitude`] is load-bearing:
+    /// code 0 sits 129 away from a mid-scale zero and would otherwise beat
+    /// every real velocity.
+    fn reduce_cells(&self, cells: &[Option<u8>]) -> u8 {
+        let zero_code = self.key.offset.round();
+        let mut best: Option<u8> = None;
+        let mut folded = false;
+        for code in cells.iter().flatten().copied() {
+            match code {
+                BELOW_THRESHOLD_CODE => {}
+                RANGE_FOLDED_CODE => folded = true,
+                _ => {
+                    let better = match best {
+                        None => true,
+                        Some(current) => match self.reduce {
+                            Reduce::MaxCode => code > current,
+                            // Ties to the larger code, so the key is a total
+                            // order and the reduction is associative.
+                            Reduce::MaxMagnitude => {
+                                let key = |c: u8| {
+                                    (((f32::from(c) - zero_code).abs() * 1_000.0) as i64, c)
+                                };
+                                key(code) > key(current)
+                            }
+                            Reduce::None => false,
+                        },
+                    };
+                    if better {
+                        best = Some(code);
+                    }
+                }
+            }
+        }
+        best.unwrap_or(if folded {
+            RANGE_FOLDED_CODE
+        } else {
+            BELOW_THRESHOLD_CODE
+        })
+    }
+
+    /// Levels in this plane, counting level 0. `1` for [`Reduce::None`].
+    pub fn levels(&self) -> usize {
+        self.mip_offsets.len() + 1
+    }
+
+    /// A level's bytes and its dimensions, or `None` past the chain.
+    pub fn level(&self, level: usize) -> Option<(&[u8], usize, usize)> {
+        let (mut r, mut g) = (self.radials, self.gates);
+        for _ in 0..level {
+            r = r.div_ceil(2);
+            g = g.div_ceil(2);
+        }
+        if level == 0 {
+            return Some((&self.codes, r, g));
+        }
+        let start = *self.mip_offsets.get(level - 1)?;
+        Some((&self.mips[start..start + r * g], r, g))
+    }
+
+    /// One code, by level and position.
+    pub fn code_at(&self, level: usize, radial: usize, gate: usize) -> Option<u8> {
+        let (bytes, r, g) = self.level(level)?;
+        (radial < r && gate < g)
+            .then(|| bytes[radial * g + gate])?
+            .into()
+    }
+
+    /// What decodes and colours this plane.
+    pub fn key(&self) -> LutKey {
+        self.key
+    }
+
+    /// The operator its chain was reduced by.
+    pub fn reduce(&self) -> Reduce {
+        self.reduce
+    }
+
+    /// Level 0's shape.
+    pub fn shape(&self) -> (usize, usize) {
+        (self.radials, self.gates)
+    }
+
+    /// **Bytes this plane's buffers hold**, level 0 plus the whole chain.
+    ///
+    /// The heap the plane really occupies, read off the vectors rather than
+    /// recomputed from the shape, so it is a measurement of the object and not
+    /// a second spelling of the price.
+    pub fn resident_bytes(&self) -> usize {
+        self.codes.len() + self.mips.len()
+    }
+
+    /// Payloads refused since the process started.
+    pub fn refusals() -> u64 {
+        REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 #[cfg(test)]
 mod tests;
