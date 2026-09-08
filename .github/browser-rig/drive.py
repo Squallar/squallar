@@ -3140,6 +3140,21 @@ var sample_heap_max_re = /heap max (\d+)\/(\d+) MiB/;
 var sample_admission_re = /admission asked (\d+) admitted (\d+) would refuse (\d+) refused (\d+)/;
 var sample_census_loop_re = /heap census \(([a-z0-9-]+)\): loop scans (\d+) B/;
 var sample_census_grids_re = /overlay grids (\d+) B/;
+var sample_census_upload_re = /upload pending (\d+) B/;
+// The allocator's own live figure beside the high-water `linear` above, and
+// the pair is the whole held-vs-churn question in one row: a linear memory
+// never shrinks, so `linear - live` is freed-but-reserved headroom and not
+// holdings. Reconstructing it from console lines after the fact is how a
+// post-wall sample got read as a retention figure. The `/` and ` MiB` are
+// load-bearing -- the same line carries `notices raised N live M reoffered`.
+var sample_live_re = /budget state: .* live (\d+)\/(\d+) MiB/;
+// The drain, so its rate is a subtraction between rows rather than a
+// reconstruction: `bands` against `cadence_n` is bands per frame, and
+// `upload_apply_us` against `bands` is what one band costs the frame thread.
+// Both were reconstructed by hand on 2026-09-08 to refute a 4 ms/band figure
+// divided out of a different route's pricing.
+var sample_uploads_re = /texture uploads: (\d+) deltas, (\d+) B to the GPU, (\d+) B whole, (\d+) bands, (\d+) B staged, (\d+) B blocking/;
+var sample_prep_re = /frame prep costs: (\d+) passes, (\d+) us tessellate, (\d+) us upload apply/;
 var sample_census_resident_re = /resident total (\d+) B of (\d+) B linear/;
 // One instance word, and it is the PAGE's. The census line is written by the
 // page's telemetry tick and by the allocation-error hook on whichever
@@ -3151,8 +3166,12 @@ var row = { now: Date.now(), t0: (window.__rig && window.__rig.t0) || null,
             linear_page_mib: null, linear_worker_mib: null, linear_t: null,
             heap_max_page_mib: null, heap_max_worker_mib: null,
             asked: null, admitted: null, would_refuse: null, refused: null,
+            live_page_mib: null, live_worker_mib: null,
             census_instance: null, loop_scan_b: null, overlay_grid_b: null,
-            resident_total_b: null, census_linear_b: null, census_t: null };
+            upload_pending_b: null,
+            resident_total_b: null, census_linear_b: null, census_t: null,
+            upload_bands: null, upload_blocking_b: null, upload_whole_b: null,
+            prep_passes: null, upload_apply_us: null };
 var allocs = [];
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || ""), t = C[i].t, x;
@@ -3171,6 +3190,11 @@ for (var i = 0; i < C.length; i++) {
       row.heap_max_page_mib = parseInt(hm[1], 10);
       row.heap_max_worker_mib = parseInt(hm[2], 10);
     }
+    var lv = sample_live_re.exec(m);
+    if (lv) {
+      row.live_page_mib = parseInt(lv[1], 10);
+      row.live_worker_mib = parseInt(lv[2], 10);
+    }
     var ad = sample_admission_re.exec(m);
     if (ad) {
       row.asked = parseInt(ad[1], 10);
@@ -3186,11 +3210,24 @@ for (var i = 0; i < C.length; i++) {
     row.census_t = t;
     var g = sample_census_grids_re.exec(m);
     if (g) row.overlay_grid_b = parseInt(g[1], 10);
+    var up = sample_census_upload_re.exec(m);
+    if (up) row.upload_pending_b = parseInt(up[1], 10);
     var rt = sample_census_resident_re.exec(m);
     if (rt) {
       row.resident_total_b = parseInt(rt[1], 10);
       row.census_linear_b = parseInt(rt[2], 10);
     }
+  }
+  x = sample_uploads_re.exec(m);
+  if (x) {
+    row.upload_whole_b = parseInt(x[3], 10);
+    row.upload_bands = parseInt(x[4], 10);
+    row.upload_blocking_b = parseInt(x[6], 10);
+  }
+  x = sample_prep_re.exec(m);
+  if (x) {
+    row.prep_passes = parseInt(x[1], 10);
+    row.upload_apply_us = parseInt(x[3], 10);
   }
   if (m.indexOf("alloc failed:") >= 0) allocs.push({ t: t, msg: m });
 }
@@ -4151,9 +4188,13 @@ class CensusSampler:
     COLUMNS = ("t_host_iso", "leg_s", "t_page_ms", "loadavg1",
                "cadence_n", "cadence_page_t_ms",
                "linear_page_mib", "linear_page_ceiling_mib",
+               "live_page_mib", "live_worker_mib",
                "linear_worker_mib", "linear_worker_ceiling_mib",
-               "overlay_grids_b", "loop_scans_b", "resident_total_b",
+               "overlay_grids_b", "loop_scans_b", "upload_pending_b",
+               "resident_total_b",
                "census_linear_b", "census_instance",
+               "upload_bands", "upload_blocking_b", "upload_whole_b",
+               "prep_passes", "upload_apply_us",
                "asked", "admitted", "would_refuse", "refused",
                "alloc_failed_total")
 
@@ -4197,9 +4238,17 @@ class CensusSampler:
             "linear_page_ceiling_mib": r.get("heap_max_page_mib"),
             "linear_worker_mib": r.get("linear_worker_mib"),
             "linear_worker_ceiling_mib": r.get("heap_max_worker_mib"),
+            "live_page_mib": r.get("live_page_mib"),
+            "live_worker_mib": r.get("live_worker_mib"),
             "overlay_grids_b": r.get("overlay_grid_b"),
             "loop_scans_b": r.get("loop_scan_b"),
+            "upload_pending_b": r.get("upload_pending_b"),
             "resident_total_b": r.get("resident_total_b"),
+            "upload_bands": r.get("upload_bands"),
+            "upload_blocking_b": r.get("upload_blocking_b"),
+            "upload_whole_b": r.get("upload_whole_b"),
+            "prep_passes": r.get("prep_passes"),
+            "upload_apply_us": r.get("upload_apply_us"),
             "census_linear_b": r.get("census_linear_b"),
             "census_instance": r.get("census_instance"),
             "asked": r.get("asked"),
@@ -7128,6 +7177,104 @@ def selftest_loop_or_refusal():
     return failed
 
 
+def selftest_sample_probe_patterns():
+    """Executable pins on the four `SAMPLE_PROBE` patterns added 2026-09-08,
+    against console lines copied verbatim from a real `huge` artefact.
+
+    A regex that never matches writes `-` into its column on every row for the
+    life of the leg and reads exactly like a page that had nothing to report,
+    which is the shape `UploadTotals::deltas` exists to make readable and the
+    shape this file's own `why_empty` was added for. The patterns live in a JS
+    string this process cannot execute, so what is pinned here is the pattern
+    TEXT, lifted out of `SAMPLE_PROBE` itself rather than retyped -- a copy
+    would drift and still pass. Returns the number of failed pins."""
+    failed = 0
+
+    def pin(name, ok):
+        nonlocal failed
+        print("[self-test] %s %s" % ("ok  " if ok else "FAIL", name))
+        if not ok:
+            failed += 1
+
+    def pattern(js_name):
+        m = re.search(r"var %s = /(.*?)/;" % js_name, SAMPLE_PROBE)
+        return re.compile(m.group(1)) if m else None
+
+    BUDGET = ("budget state: bracket wasm32, rung 0, steps 3, pool 56 MiB, "
+              "ceiling 288 MiB, vram 0 MiB, ram 0 MiB, declared 0 MiB, "
+              "threads 32, form 2, linear 1015/692 MiB, cap 288 0, probe 3, "
+              "balloon 0 MiB, page heap acts 4 at 1015 MiB, heap max "
+              "1024/1024 MiB, host steps 4 promotions 0 churn 0, gpu steps 0 "
+              "restored 0 dwell 1x 30 s churn 0, loop over 934 MiB, loop "
+              "clamped 1, host allowance 411 MiB, rss none, pool residual "
+              "none, spare gpu 216 MiB host 0 MiB, door spare gpu 216 MiB "
+              "host 0 MiB joint none, admission asked 1 admitted 0 would "
+              "refuse 1 refused 0, notices raised 2 live 0 reoffered 0, "
+              "live 664/488 MiB, pane0 gpu 72 MiB host 1448 MiB shared 0 MiB "
+              "own 990 MiB")
+    CENSUS = ("heap census (page): loop scans 104196480 B, loop l3 0 B, still "
+              "l3 2169366 B, still scans 52098240 B, derive memo 0 B, loop "
+              "frame scans 2701472 B, chunk feed 9918880 B, render cache 0 B, "
+              "cached renders 0 B, rasters shared 0 B, render pools 0 B, "
+              "renders in flight 0 B, overlay grids 204736760 B, overlay "
+              "items 15746562 B, overlay parked 0 B, loop frames 11520 B, "
+              "upload pending 79774704 B, tile bodies 0 B, tile parsed 0 B, "
+              "tile cache 154836004 B, loans out 0 B, volume store 0 B, jobs "
+              "in flight 0 B, deferred drops 0 B; resident total 626189988 B "
+              "of 1064632320 B linear, residual 438442332 B; tile meshes "
+              "71602324 B, gpu textures 437344336 B (GPU, not in the total)")
+    UPLOADS = ("texture uploads: 260 deltas, 753615168 B to the GPU, "
+               "10685192 B whole, 357 bands, 0 B staged, 753615168 B blocking")
+    PREP = ("frame prep costs: 366 passes, 191629 us tessellate, 82498 us "
+            "upload apply, 0 us mirror, 49059 us buffers and callbacks")
+
+    live = pattern("sample_live_re")
+    m = live.search(BUDGET) if live else None
+    pin("the live pattern reads the page/worker MiB pair",
+        m is not None and m.groups() == ("664", "488"))
+    # The decoy arm needs the decoy AFTER the pair, and this is the second
+    # attempt at it. Asserting only against BUDGET above is VACUOUS: the
+    # `notices raised 2 live 0 reoffered 0` token sits to the LEFT of the real
+    # pair, and a greedy `.*` walks to the rightmost ` live ` on its own, so a
+    # loose `live (\d+)\/?(\d+)?` passes that fixture too -- verified by
+    # tampering to exactly that pattern, which left every pin green. What the
+    # `\/` and the ` MiB` actually buy is a line whose trailing tokens grow,
+    # so the fixture puts an unrelated `live` token to the RIGHT.
+    TRAILING = BUDGET + ", notices live 7"
+    m2 = live.search(TRAILING) if live else None
+    pin("a `live N` token added to the RIGHT of the pair does not displace it",
+        m2 is not None and m2.groups() == ("664", "488"))
+
+    up = pattern("sample_census_upload_re")
+    m = up.search(CENSUS) if up else None
+    pin("upload pending is read off the census line",
+        m is not None and m.group(1) == "79774704")
+    # The negative arm the family needs: `upload pending` must not be confused
+    # with the `overlay parked`/`loans out` zeros around it.
+    pin("and it is that family rather than a neighbouring zero",
+        m is not None and m.group(1) != "0")
+
+    u = pattern("sample_uploads_re")
+    m = u.search(UPLOADS) if u else None
+    pin("texture uploads yields whole, bands and blocking by position",
+        m is not None
+        and m.group(3) == "10685192" and m.group(4) == "357"
+        and m.group(6) == "753615168")
+
+    pr = pattern("sample_prep_re")
+    m = pr.search(PREP) if pr else None
+    pin("frame prep costs yields passes and upload-apply microseconds",
+        m is not None and m.group(1) == "366" and m.group(3) == "82498")
+
+    # And the columns really carry them: a probe field with no column is a
+    # reading taken and thrown away, which is what happened to `upload
+    # pending` for the life of this sampler.
+    for col in ("live_page_mib", "upload_pending_b", "upload_bands",
+                "upload_apply_us"):
+        pin("%s is a sampler column" % col, col in CensusSampler.COLUMNS)
+    return failed
+
+
 def selftest_page_clock():
     """Executable pins on `page_clock_verdict`, the guard between a driver's
     clock and the page's. Both arms of every branch: a one-armed set here
@@ -7314,6 +7461,8 @@ def selftest():
                         "(see [self-test] lines)")
     if selftest_page_clock():
         failures.append("page/driver clock guard (see [self-test] lines)")
+    if selftest_sample_probe_patterns():
+        failures.append("sample-probe patterns (see [self-test] lines)")
     failures += selftest_android()
     failures += selftest_adapters()
     failures += selftest_tile_cache_settles()
