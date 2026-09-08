@@ -1,29 +1,23 @@
 //! **That a pooled render buffer too small for the next render is grown to what
 //! that render needs, and not to twice what it already had.**
 //!
-//! All three plan-view slots hand their buffer to a `Vec` growth call, and all
-//! three reached it through `Vec`'s **amortised** path, which takes
+//! Both plan-view slots hand their buffer to a `Vec` growth call, and both
+//! reached it through `Vec`'s **amortised** path, which takes
 //! `max(2 * capacity, need)`. `within_slack` bounds a pooled buffer's capacity
 //! only from *above*, so an **undersized** buffer always passed the filter and
 //! always took that path — and the doubled buffer then passed `within_slack` on
 //! the way back out, so it parked and stayed parked.
 //!
-//! The value grid reached it through arithmetic that reads as if it prevented
-//! exactly this:
-//!
-//! ```ignore
-//! values.clear();
-//! values.reserve_exact(pixels.saturating_sub(values.capacity()));
-//! ```
-//!
-//! `reserve_exact(additional)` guarantees room for `len + additional`, and
-//! `len` is **zero** after the `clear`. So it asked for `pixels - capacity`
-//! against a buffer already holding `capacity`, no-opped, and left the growth
-//! to the `extend` in `RenderBuffers::into_output`. Measured by heaptrack on a
-//! real arm: one live **400,040,000 B** allocation where the exact need was
-//! **216,800,000 B**. The texture and the cell buffer had no arithmetic to get
-//! wrong — they call `resize`/`resize_with`, which reserve amortised — so the
-//! same defect was there in the spelling that hides it.
+//! There were three slots when this file was written, and the third — a
+//! `Vec<f32>` value grid — reached the amortised path through arithmetic that
+//! read as if it prevented exactly this: `reserve_exact(additional)` guarantees
+//! room for `len + additional`, and `len` was **zero** after its `clear`, so it
+//! no-opped against a buffer already holding that capacity. Measured by
+//! heaptrack on a real arm: one live **400,040,000 B** allocation where the
+//! exact need was **216,800,000 B**. That grid went on 2026-09-08 — nothing
+//! downstream ever read it — and the defect it demonstrated is still live in
+//! the two slots that remain, which call `resize`/`resize_with` and so carry it
+//! in the spelling that hides it.
 //!
 //! Two instruments, because the defect has two halves and each hides the other:
 //! the **allocation sizes** taken during the growing render (the transient),
@@ -66,17 +60,22 @@ const GROWN: usize = 1040;
 const WARM_PX: usize = WARM * WARM;
 const GROWN_PX: usize = GROWN * GROWN;
 
-/// Bytes one pixel costs across the three slots: eight for its cell, four for
-/// its RGBA texel, four for its `f32` value.
-const SLOT_BYTES_PER_PX: usize = 8 + 4 + 4;
+/// Bytes one pixel costs across the two slots: eight for its cell, four for its
+/// RGBA texel.
+///
+/// **Sixteen until 2026-09-08**, when the third slot — a `Vec<f32>` value grid
+/// at four more bytes a pixel — was removed for being written once per pixel
+/// and never read. This number falling is the cut; nothing else in this file
+/// changed meaning.
+const SLOT_BYTES_PER_PX: usize = 8 + 4;
 
 /// The largest single buffer a `GROWN` render legitimately needs: its cells, at
 /// eight bytes a pixel. **The described extent** — nothing this render takes
 /// has any business being larger, and a doubled buffer necessarily is.
 const LARGEST_LEGITIMATE: usize = GROWN_PX * 8;
 
-/// What counts as a block worth watching. Under the smallest of the three
-/// buffers (`GROWN_PX * 4` = 4,326,400 B) so all three are seen.
+/// What counts as a block worth watching. Under the smaller of the two buffers
+/// (`GROWN_PX * 4` = 4,326,400 B) so both are seen.
 const LARGE: usize = 4 * 1024 * 1024;
 
 /// **The premise the whole file rests on, checked where it cannot drift.** The
@@ -179,13 +178,12 @@ fn packet() -> RadialPacket {
     }
 }
 
-/// One render at `side`, taken to all three of its buffers' production death
-/// sites — the walk `render_pool_residency.rs` documents, and for its reason: a
-/// version that skipped them would exercise one slot of three.
+/// One render at `side`, taken to both of its buffers' production death sites —
+/// the walk `render_pool_residency.rs` documents, and for its reason: a version
+/// that skipped them would exercise one slot of two.
 fn render_at(p: &RadialPacket, side: usize) {
     let out = render_level3_radial_to_image(p, PRODUCT, LAT, LON, SCALE, OFFSET, None, side)
         .expect("the packet renders");
-    assert_eq!(out.values.len(), side * side);
     assert_eq!(out.image.len(), side * side * 4);
     let frame = RenderedFrame::from(out);
     match frame.image {
@@ -197,9 +195,8 @@ fn render_at(p: &RadialPacket, side: usize) {
 /// **A pooled buffer is grown to what the render needs, not to twice itself.**
 ///
 /// Floors, in order:
-/// * `checkout_values`: put `reserve_exact(pixels.saturating_sub(capacity))`
-///   back — an 8,000,000 B block appears where 4,326,400 B is needed;
-/// * `checkout_image`: delete its `reserve_exact(len)` — likewise;
+/// * `checkout_image`: delete its `reserve_exact(len)` — an 8,000,000 B block
+///   appears where 4,326,400 B is needed;
 /// * `RenderBuffers::checkout`: delete its `reserve_exact` — a 16,000,000 B
 ///   block appears where 8,652,800 B is needed.
 ///
@@ -216,7 +213,7 @@ fn a_pooled_buffer_too_small_is_grown_to_the_need_and_not_to_twice_itself() {
     assert_eq!(
         pooled_bytes(),
         WARM_PX * SLOT_BYTES_PER_PX,
-        "premise: all three slots are holding a {WARM}² buffer",
+        "premise: both slots are holding a {WARM}² buffer",
     );
 
     // ── The reading: what the growing render takes ─────────────────────────
@@ -238,7 +235,7 @@ fn a_pooled_buffer_too_small_is_grown_to_the_need_and_not_to_twice_itself() {
     assert_eq!(
         pooled_bytes(),
         GROWN_PX * SLOT_BYTES_PER_PX,
-        "after growing to {GROWN}² the pool holds {} B where the three slots \
+        "after growing to {GROWN}² the pool holds {} B where the two slots \
          cost {} B. A doubled buffer passes `within_slack` on the way back out \
          too, so it parks and stays parked for the session. Blocks seen: \
          {sizes:?}",

@@ -5,19 +5,24 @@
 //! asks `TEXELS_PER_SAMPLE` texels per gate for it — 7362 px over ±460 km —
 //! and a caller's ceiling under that paints the same gates on fewer texels.
 //! This suite renders that sweep at the floor and at the sides under it and
-//! counts, per gate, whether the gate still owns at least one texel of the
-//! value grid, which is the grid the picture is coloured from. A gate with no
-//! texel is a gate the user cannot see at any zoom.
+//! counts, per gate, whether the gate still owns at least one texel. A gate
+//! with no texel is a gate the user cannot see at any zoom.
+//!
+//! **Ownership is read off the claim the render actually made** — `write_key`,
+//! the rank `fetch_max` settled each pixel's contest by — which is why this
+//! suite is in the crate rather than in `tests/`: the keys live in the cells,
+//! and the cells are drained and handed back before a render returns. See
+//! [`super::claims`].
 //!
 //! Eight probe radials, one every 45°, carry a value unique to each of their
 //! gates; their two neighbours carry a filler so the azimuthal contest near the
 //! site is real; every other radial is below threshold and paints nothing.
 
+use super::{GateId, claims, render_radar_to_image_full_sized, write_key};
+use crate::types::{self, RadarProduct};
 use nexrad_model::data::{
     MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
 };
-use squallar_radar::render::render_radar_to_image_full_sized;
-use squallar_radar::types::{self, RadarProduct};
 use std::collections::HashSet;
 
 const LAT: f64 = 35.3333;
@@ -118,32 +123,67 @@ impl Rung {
 }
 
 fn render_rung(scan: &Scan, ceiling: usize) -> Rung {
+    claims::arm();
     let out = render_radar_to_image_full_sized(
         scan,
         ELEVATION,
         RadarProduct::Reflectivity,
         LAT,
         LON,
-        squallar_radar::srv::MotionInputs::default(),
+        crate::srv::MotionInputs::default(),
         None,
         None,
-        &squallar_radar::nyquist::DeclaredNyquist::empty(),
+        &crate::nyquist::DeclaredNyquist::empty(),
         ceiling,
     )
     .expect("a filled surveillance cut renders");
-    let side = out.values.len().isqrt();
-    assert_eq!(side * side, out.values.len(), "the value grid is square");
-    let painted: HashSet<u32> = out
-        .values
-        .iter()
-        .filter(|v| !v.is_nan())
-        .map(|v| v.to_bits())
-        .collect();
+    // **The oracle is the claim, not the value.** `write_key` is the rank
+    // `fetch_max` settled each pixel's contest by, so it is literally "which
+    // gate owns this texel" — the question this file asks.
+    //
+    // It replaced a value oracle on 2026-09-08, when the `f32` value grid that
+    // oracle read was removed from the render for being written once per pixel
+    // and never read. The value oracle worked only because `probe_raw` is
+    // injective over the probe gates. **The colour the picture carries is not,
+    // and could not have stood in for it**: this fixture runs 0.125 dBZ to
+    // 916 dBZ against a ladder that saturates at 95, so almost every probe gate
+    // paints the same white, and a colour oracle would have reported nearly
+    // every gate as surviving on every rung. That would not have passed
+    // quietly — the base-side assertion at the end of this file catches an
+    // oracle that reports no losses, and a tamper confirms it does — but it
+    // would have turned a measurement of the rasterizer into a measurement of
+    // how flat the palette is up there. There is no colour-based fixture that
+    // makes this question answerable: 14,656 probe gates need 14,656
+    // distinguishable answers and the reflectivity ladder reaches 3,549.
+    //
+    // **The two oracles were measured against each other before the old one
+    // went, and they agree digit for digit.** The value form was run on
+    // `ec8e7855c` and this form on the change that replaced it; all five rungs
+    // match on every figure the table below prints — total gates owning a
+    // texel, the per-probe array, the loss count, the furthest lost gate and
+    // the count past the crowding gate. That is the expected result rather than
+    // a lucky one: `probe_raw` is injective over the probe gates, so "this
+    // gate's value is somewhere in the raster" and "this gate's key is
+    // somewhere in the raster" select the same gates. Nothing in this file's
+    // expectations was re-pointed for the change.
+    let keys = claims::take().expect("the render was armed");
+    let side = keys.len().isqrt();
+    assert_eq!(side * side, keys.len(), "the claim raster is square");
+    assert_eq!(
+        out.image.len(),
+        keys.len() * 4,
+        "the claim raster and the texture describe different pictures"
+    );
+    let claimed: HashSet<u32> = keys.into_iter().filter(|&k| k != 0).collect();
     let mut survived = [0usize; 8];
     let mut lost: Vec<(usize, usize)> = Vec::new();
     for (p, count) in survived.iter_mut().enumerate() {
         for g in 0..GATES {
-            if painted.contains(&(f32::from(probe_raw(p, g)) / SCALE).to_bits()) {
+            let key = write_key(GateId {
+                radial: PROBES[p],
+                gate: g,
+            });
+            if claimed.contains(&key) {
                 *count += 1;
             } else {
                 lost.push((p, g));

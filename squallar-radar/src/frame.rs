@@ -100,7 +100,6 @@ impl From<crate::render::SweepRender> for RenderedFrame {
     /// rasterizing arms, so a Level III frame and a Level II one cannot come to
     /// describe themselves differently.
     fn from(render: crate::render::SweepRender) -> Self {
-        crate::render::recycle_values(render.values);
         Self {
             image: RasterImage::Bytes(render.image),
             max_range_km: render.max_range_km,

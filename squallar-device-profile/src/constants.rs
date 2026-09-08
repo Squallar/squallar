@@ -153,8 +153,8 @@ impl FrameCost {
 /// **The other half of that seam now exists**: [`polar_frame_cost`], over a
 /// [`PolarFrameShape`]. **Nothing selects it, and nothing may** until the
 /// renderer actually produces polar frames — one surveillance tilt prices
-/// ~493× apart under the two, and a budget holding the polar figure while
-/// this function's raster is what gets allocated would admit a scene ~493×
+/// ~369× apart under the two, and a budget holding the polar figure while
+/// this function's raster is what gets allocated would admit a scene ~369×
 /// its own price. See [`polar_frame_cost`] for the constraint in full.
 ///
 /// The terms, each against the allocation that makes it in
@@ -163,20 +163,24 @@ impl FrameCost {
 /// | buffer | site | bytes/px | axis |
 /// |---|---|---:|---|
 /// | `Vec<AtomicU64>` cells | `RenderBuffers::checkout` | 8 | host, scratch |
-/// | `Vec<f32>` values | `checkout_values` | 4 | host, held |
 /// | `Vec<u8>` RGBA | `checkout_image` | 4 | host, held |
 /// | the uploaded texture | the display layer | 4 | GPU |
 ///
-/// All three host buffers are alive together inside `RenderBuffers::into_output`:
-/// the values are filled from the cells, the cells are handed back, and only
-/// then is the image checked out — so the cells' pages are still charged to
-/// the process when the values exist, which is what makes the scratch term add
-/// to the held one rather than replace it.
+/// Both host buffers are alive together inside `RenderBuffers::into_output`:
+/// the image is checked out, coloured from the cells, and only then are the
+/// cells handed back — so the cells' pages are still charged to the process
+/// while the image exists, which is what makes the scratch term add to the
+/// held one rather than replace it.
+///
+/// **There was a third, and it was never read.** Until 2026-09-08 a `Vec<f32>`
+/// value grid stood between the cells and the texture at four more bytes a
+/// pixel, held. Nothing downstream read it — a hover reads the polar field —
+/// so it and this term went together; see `RenderBuffers::into_output`.
 pub const fn plan_view_frame_cost(side: usize) -> FrameCost {
     let pixels = side * side;
     FrameCost {
         gpu: pixels * PLAN_VIEW_TEXEL_BYTES,
-        host_held: pixels * (PLAN_VIEW_TEXEL_BYTES + PLAN_VIEW_VALUE_BYTES),
+        host_held: pixels * PLAN_VIEW_TEXEL_BYTES,
         host_scratch: pixels * PLAN_VIEW_CELL_BYTES,
     }
 }
@@ -185,18 +189,28 @@ pub const fn plan_view_frame_cost(side: usize) -> FrameCost {
 /// the `Rgba8` texture it uploads as.
 pub const PLAN_VIEW_TEXEL_BYTES: usize = 4;
 
-/// One entry of the per-pixel value grid a readout reads (`checkout_values`,
-/// a `Vec<f32>`). Host only: the numbers are never uploaded.
-pub const PLAN_VIEW_VALUE_BYTES: usize = 4;
+/// One entry of the per-pixel value grid a cross-section readout reads
+/// (`squallar_radar::xsect::CrossSection`'s `values`, a `Vec<f32>`). Host
+/// only: the numbers are never uploaded.
+///
+/// **The section's, and the section's alone.** The plan view carried a grid of
+/// its own under this name until 2026-09-08, when it was found to be written
+/// once and never read; only [`section_frame_cost`] charges this now.
+pub const SECTION_VALUE_BYTES: usize = 4;
 
 /// One cell of the claim buffer a render paints into (`RenderBuffers::cells`,
 /// a `Vec<AtomicU64>`: a gate key in the high 32 bits, the value in the low).
 /// Host only, and live only while a render runs.
 pub const PLAN_VIEW_CELL_BYTES: usize = 8;
 
-/// Bytes one raster of `side` costs on the host once it is finished: its RGBA
-/// and its `f32` value grid, four bytes each per pixel — the held half of
-/// [`plan_view_frame_cost`], which states the composition.
+/// Bytes one raster of `side` costs on the host once it is finished: its RGBA,
+/// four bytes a pixel — the held half of [`plan_view_frame_cost`], which
+/// states the composition.
+///
+/// Equal in value to [`converted_raster_bytes`] and deliberately a separate
+/// function: this is the renderer's own `Vec<u8>`, that one is the
+/// `egui::Color32` buffer built from it, and they are two allocations that
+/// happen to cost the same.
 pub const fn raster_bytes(side: usize) -> usize {
     plan_view_frame_cost(side).host_held
 }
@@ -206,10 +220,9 @@ pub const fn raster_bytes(side: usize) -> usize {
 ///
 /// **A second buffer, not a second reading of
 /// [`plan_view_frame_cost`]'s `host_held`.** That term prices what the render
-/// itself allocates — the `Vec<u8>` RGBA out of `checkout_image` and the
-/// `Vec<f32>` value grid — and both of those go back to
-/// `squallar_radar::render`'s process-wide slots when the render is done
-/// (`recycle_image`, `recycle_values`), where `render pools` counts them.
+/// itself allocates — the `Vec<u8>` RGBA out of `checkout_image` — which goes
+/// back to `squallar_radar::render`'s process-wide slot when the render is done
+/// (`recycle_image`), where `render pools` counts it.
 /// `RenderDispatcher`'s `plan_view_image` then builds an
 /// `egui::ColorImage` **from** those bytes, which is a fresh allocation with
 /// a life of its own: it is what the render cache holds, what a pane's cached
@@ -304,12 +317,14 @@ pub struct PolarFrameShape {
 /// any path that can reach `crate::fit::NeedTerms`. That is a hard safety
 /// constraint, not a staging convenience.
 ///
-/// A surveillance tilt prices at **1,758,832 B** here and at **867,184,704 B
-/// (827.0 MiB)** under `plan_view_frame_cost(7362)` — the side a desktop arm
+/// A surveillance tilt prices at **1,758,832 B** here and at **650,388,528 B
+/// (620.3 MiB)** under `plan_view_frame_cost(7362)` — the side a desktop arm
 /// really renders that sweep at, bound by the data's own 1832 gates and not by
-/// [`DESKTOP_RASTER_SIDE_CEILING`]. That is a factor of **493**. A budget that
-/// took the polar figure while the renderer still produced the raster would
-/// admit a scene costing ~493× its price, and `crate::admit`'s door would be
+/// [`DESKTOP_RASTER_SIDE_CEILING`]. That is a factor of **369**, and it was
+/// 493 against the 867,184,704 B that figure was before the value grid left
+/// the render on 2026-09-08. A budget that took the polar figure while the
+/// renderer still produced the raster would admit a scene costing ~369× its
+/// price, and `crate::admit`'s door would be
 /// the thing that signed it off. This project has already hard-frozen a user's
 /// laptop with the arithmetic pointing the *other* way.
 ///
@@ -594,7 +609,7 @@ pub const fn section_frame_cost(width: usize, height: usize) -> FrameCost {
     let pixels = width * height;
     FrameCost {
         gpu: pixels * PLAN_VIEW_TEXEL_BYTES,
-        host_held: pixels * (PLAN_VIEW_TEXEL_BYTES + PLAN_VIEW_VALUE_BYTES + SECTION_STATUS_BYTES),
+        host_held: pixels * (PLAN_VIEW_TEXEL_BYTES + SECTION_VALUE_BYTES + SECTION_STATUS_BYTES),
         host_scratch: 0,
     }
 }

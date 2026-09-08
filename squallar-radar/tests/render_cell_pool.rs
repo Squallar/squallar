@@ -53,23 +53,20 @@ fn packet(bins: usize, painted_bins: usize) -> RadialPacket {
 /// A side the pool has to serve that is not the base one.
 const SMALL_SIDE: usize = 1024;
 
-fn render_at(p: &RadialPacket, side_ceiling_px: usize) -> (Vec<u8>, Vec<u32>) {
-    let out =
-        render_level3_radial_to_image(p, PRODUCT, LAT, LON, SCALE, OFFSET, None, side_ceiling_px)
-            .expect("the packet renders");
-    (out.image, out.values.iter().map(|v| v.to_bits()).collect())
+fn render_at(p: &RadialPacket, side_ceiling_px: usize) -> Vec<u8> {
+    render_level3_radial_to_image(p, PRODUCT, LAT, LON, SCALE, OFFSET, None, side_ceiling_px)
+        .expect("the packet renders")
+        .image
 }
 
-fn render(p: &RadialPacket) -> (Vec<u8>, Vec<u32>) {
+fn render(p: &RadialPacket) -> Vec<u8> {
     render_at(p, IMAGE_SIZE)
 }
 
-/// How many pixels the render claimed.
-fn painted(values: &[u32]) -> usize {
-    values
-        .iter()
-        .filter(|&&bits| !f32::from_bits(bits).is_nan())
-        .count()
+/// How many pixels the render claimed, off the texture itself: every painted
+/// colour is opaque and every unclaimed texel is left `(0, 0, 0, 0)`.
+fn painted(image: &[u8]) -> usize {
+    image.chunks_exact(4).filter(|px| px[3] != 0).count()
 }
 
 #[test]
@@ -81,11 +78,11 @@ fn a_render_never_inherits_a_pixel_from_the_one_before_it() {
     let wide = packet(BINS, BINS);
     let blank = packet(BINS, 0);
 
-    let (narrow_image, narrow_values) = render(&narrow);
-    let narrow_pixels = painted(&narrow_values);
+    let narrow_image = render(&narrow);
+    let narrow_pixels = painted(&narrow_image);
 
-    let (wide_image, wide_values) = render(&wide);
-    let wide_pixels = painted(&wide_values);
+    let wide_image = render(&wide);
+    let wide_pixels = painted(&wide_image);
 
     assert!(
         narrow_pixels > 10_000,
@@ -101,9 +98,9 @@ fn a_render_never_inherits_a_pixel_from_the_one_before_it() {
         "the two packets have to render differently, or nothing below can fail"
     );
 
-    let (again_image, again_values) = render(&narrow);
+    let again_image = render(&narrow);
     assert_eq!(
-        painted(&again_values),
+        painted(&again_image),
         narrow_pixels,
         "the narrow render claimed a different number of pixels when it followed a wider one"
     );
@@ -111,42 +108,33 @@ fn a_render_never_inherits_a_pixel_from_the_one_before_it() {
         again_image, narrow_image,
         "the narrow render's texture changed when it followed a wider one"
     );
-    assert_eq!(
-        again_values, narrow_values,
-        "the narrow render's value grid changed when it followed a wider one"
-    );
 
-    let (small_image, small_values) = render_at(&wide, SMALL_SIDE);
-    assert_eq!(
-        small_values.len(),
-        SMALL_SIDE * SMALL_SIDE,
-        "a render at a smaller side got a value grid of the pooled buffer's length, not its own"
-    );
+    let small_image = render_at(&wide, SMALL_SIDE);
     assert_eq!(
         small_image.len(),
-        small_values.len() * 4,
-        "the texture and the value grid disagree about how many pixels were rendered"
+        SMALL_SIDE * SMALL_SIDE * 4,
+        "a render at a smaller side got a texture of the pooled buffer's length, not its own"
     );
     assert!(
-        painted(&small_values) > 10_000,
+        painted(&small_image) > 10_000,
         "the smaller raster has to paint for the two assertions below to say anything: {} pixels",
-        painted(&small_values)
+        painted(&small_image)
     );
 
-    let (small_blank_image, small_blank_values) = render_at(&blank, SMALL_SIDE);
+    let small_blank_image = render_at(&blank, SMALL_SIDE);
     assert_eq!(
-        painted(&small_blank_values),
+        painted(&small_blank_image),
         0,
-        "a render that paints no gate must leave every value NaN, at any raster side"
+        "a render that paints no gate must leave every texel clear, at any raster side"
     );
     assert!(
         small_blank_image.iter().all(|&b| b == 0),
         "a render that paints no gate must leave every texel zero, at any raster side"
     );
 
-    let (grown_image, grown_values) = render(&narrow);
+    let grown_image = render(&narrow);
     assert_eq!(
-        painted(&grown_values),
+        painted(&grown_image),
         narrow_pixels,
         "the narrow render claimed a different number of pixels when it followed a smaller raster"
     );
@@ -154,16 +142,12 @@ fn a_render_never_inherits_a_pixel_from_the_one_before_it() {
         grown_image, narrow_image,
         "the narrow render's texture changed when the pooled buffer had to grow for it"
     );
-    assert_eq!(
-        grown_values, narrow_values,
-        "the narrow render's value grid changed when the pooled buffer had to grow for it"
-    );
 
-    let (blank_image, blank_values) = render(&blank);
+    let blank_image = render(&blank);
     assert_eq!(
-        painted(&blank_values),
+        painted(&blank_image),
         0,
-        "a render that paints no gate must leave every value NaN"
+        "a render that paints no gate must leave every texel clear"
     );
     assert!(
         blank_image.iter().all(|&b| b == 0),

@@ -1,19 +1,21 @@
 //! A render never inherits a texel from the render before it.
 //!
-//! `into_output` carries the RGBA texture and the value grid from one plan-view
-//! render to the next, and what makes that safe is that a buffer coming out of
-//! a slot is indistinguishable from a fresh allocation: zeroed everywhere for
-//! the texture, empty for the grid, and as long as the raster asking for it.
+//! `into_output` carries the RGBA texture from one plan-view render to the
+//! next, and what makes that safe is that a buffer coming out of the slot is
+//! indistinguishable from a fresh allocation: zeroed everywhere, and as long as
+//! the raster asking for it.
 //!
-//! **Where the teeth are.** The texture's colouring pass has no `else` arm: a
-//! pixel whose value is `NaN` and whose bits are not the range-folded sentinel
-//! is left exactly as the buffer delivered it, and every real sweep leaves most
-//! of the raster that way. So a pooled texture handed out unreset shows the
-//! previous render, and the `blank` renders below claim no gate, so every one
-//! of their 4 M texels comes straight from whatever the slot held. The value
-//! grid is filled by `extend`, which **appends**, so a checkout that skipped
-//! the `clear` leaves every grid after the first longer than the raster it
-//! describes.
+//! **Where the teeth are.** The colouring pass skips a pixel no gate claimed,
+//! leaving it exactly as the buffer delivered it, and every real sweep leaves
+//! most of the raster that way. So a pooled texture handed out unreset shows
+//! the previous render, and the `blank` renders below claim no gate, so every
+//! one of their 4 M texels comes straight from whatever the slot held.
+//!
+//! Every claim here is made against the **texture**, which is the buffer that
+//! ships. It was made against the `f32` value grid beside it until 2026-09-08,
+//! when that grid was removed for being written once and never read; the
+//! painted-pixel count now comes off the texels' own alpha, which is the same
+//! question asked of the buffer the user actually sees.
 //!
 //! **Why an integration test.** The claim is about process-wide values, and
 //! inside the library's own test binary other tests rasterize on other threads
@@ -22,7 +24,7 @@
 //! the interleaving back.
 
 use nexrad_level3::model::{RadialPacket, RadialRun};
-use squallar_radar::render::{recycle_image, recycle_values, render_level3_radial_to_image};
+use squallar_radar::render::{recycle_image, render_level3_radial_to_image};
 use squallar_radar::types::{IMAGE_SIZE, RadarProduct};
 
 const LAT: f64 = 35.3333;
@@ -82,28 +84,25 @@ fn packet(bins: usize, painted_bins: usize) -> RadialPacket {
 /// Render, then hand both buffers back exactly as the frontend does at their
 /// death sites.
 /// next call to inherit.
-fn render_at(p: &RadialPacket, side_ceiling_px: usize) -> (Vec<u8>, Vec<u32>) {
+fn render_at(p: &RadialPacket, side_ceiling_px: usize) -> Vec<u8> {
     let out =
         render_level3_radial_to_image(p, PRODUCT, LAT, LON, SCALE, OFFSET, None, side_ceiling_px)
             .expect("the packet renders");
     let image = out.image;
-    let bits: Vec<u32> = out.values.iter().map(|v| v.to_bits()).collect();
     recycle_image(image.clone());
-    recycle_values(out.values);
-    (image, bits)
+    image
 }
 
 /// [`render_at`] at the base raster side.
-fn render(p: &RadialPacket) -> (Vec<u8>, Vec<u32>) {
+fn render(p: &RadialPacket) -> Vec<u8> {
     render_at(p, IMAGE_SIZE)
 }
 
-/// How many pixels the render claimed.
-fn painted(values: &[u32]) -> usize {
-    values
-        .iter()
-        .filter(|&&bits| !f32::from_bits(bits).is_nan())
-        .count()
+/// How many pixels the render claimed, off the texture itself: every painted
+/// colour is opaque and every unclaimed texel is left `(0, 0, 0, 0)`, so a
+/// non-zero alpha is exactly a gate having reached that pixel.
+fn painted(image: &[u8]) -> usize {
+    image.chunks_exact(4).filter(|px| px[3] != 0).count()
 }
 
 #[test]
@@ -116,11 +115,11 @@ fn a_render_never_inherits_a_texel_from_the_one_before_it() {
     let wide = packet(BINS, BINS);
     let blank = packet(BINS, 0);
 
-    let (narrow_image, narrow_values) = render(&narrow);
-    let narrow_pixels = painted(&narrow_values);
+    let narrow_image = render(&narrow);
+    let narrow_pixels = painted(&narrow_image);
 
-    let (wide_image, wide_values) = render(&wide);
-    let wide_pixels = painted(&wide_values);
+    let wide_image = render(&wide);
+    let wide_pixels = painted(&wide_image);
 
     assert!(
         narrow_pixels > 10_000,
@@ -139,11 +138,11 @@ fn a_render_never_inherits_a_texel_from_the_one_before_it() {
     // The sharpest case: a render that claims no gate at all, on the buffer the
     // *wide* render has just given back. Every texel here is one the colouring
     // pass does not write.
-    let (blank_image, blank_values) = render(&blank);
+    let blank_image = render(&blank);
     assert_eq!(
-        painted(&blank_values),
+        painted(&blank_image),
         0,
-        "a render that paints no gate must leave every value NaN"
+        "a render that paints no gate must leave every texel clear"
     );
     assert!(
         blank_image.iter().all(|&b| b == 0),
@@ -153,9 +152,9 @@ fn a_render_never_inherits_a_texel_from_the_one_before_it() {
         blank_image.len()
     );
 
-    let (again_image, again_values) = render(&narrow);
+    let again_image = render(&narrow);
     assert_eq!(
-        painted(&again_values),
+        painted(&again_image),
         narrow_pixels,
         "the narrow render claimed a different number of pixels when it followed a wider one"
     );
@@ -163,41 +162,32 @@ fn a_render_never_inherits_a_texel_from_the_one_before_it() {
         again_image, narrow_image,
         "the narrow render's texture changed when it followed a wider one"
     );
-    assert_eq!(
-        again_values, narrow_values,
-        "the narrow render's value grid changed when it followed a wider one"
-    );
 
     // This render needs a quarter of the bytes the last one gave back, so a slot
     // has to be fitted to the render taking it.
-    let (small_image, small_values) = render_at(&wide, SMALL_SIDE);
-    assert_eq!(
-        small_values.len(),
-        SMALL_SIDE * SMALL_SIDE,
-        "a render at a smaller side got a value grid of the pooled buffer's length, not its own"
-    );
+    let small_image = render_at(&wide, SMALL_SIDE);
     assert_eq!(
         small_image.len(),
-        small_values.len() * 4,
-        "the texture and the value grid disagree about how many pixels were rendered"
+        SMALL_SIDE * SMALL_SIDE * 4,
+        "a render at a smaller side got a texture of the pooled buffer's length, not its own"
     );
     assert!(
-        painted(&small_values) > 10_000,
+        painted(&small_image) > 10_000,
         "the smaller raster has to paint for the assertions below to say anything: {} pixels",
-        painted(&small_values)
+        painted(&small_image)
     );
 
     // Truncating a buffer keeps whatever the cut-off bytes held.
-    let (small_blank_image, small_blank_values) = render_at(&blank, SMALL_SIDE);
+    let small_blank_image = render_at(&blank, SMALL_SIDE);
     assert_eq!(
-        small_blank_values.len(),
-        SMALL_SIDE * SMALL_SIDE,
+        small_blank_image.len(),
+        SMALL_SIDE * SMALL_SIDE * 4,
         "a blank render at the smaller side got the pooled buffer's length, not its own"
     );
     assert_eq!(
-        painted(&small_blank_values),
+        painted(&small_blank_image),
         0,
-        "a render that paints no gate must leave every value NaN, at any raster side"
+        "a render that paints no gate must leave every texel clear, at any raster side"
     );
     assert!(
         small_blank_image.iter().all(|&b| b == 0),
@@ -210,10 +200,10 @@ fn a_render_never_inherits_a_texel_from_the_one_before_it() {
     // And back up: the slots hold SMALL_SIDE² pixels against the IMAGE_SIZE²
     // this asks for, so everything past the first quarter is memory the fit has
     // just grown into place.
-    let (grown_blank_image, grown_blank_values) = render(&blank);
+    let grown_blank_image = render(&blank);
     assert_eq!(
-        grown_blank_values.len(),
-        IMAGE_SIZE * IMAGE_SIZE,
+        grown_blank_image.len(),
+        IMAGE_SIZE * IMAGE_SIZE * 4,
         "a render at the base side got the smaller pooled buffer's length, not its own"
     );
     assert!(
@@ -224,18 +214,14 @@ fn a_render_never_inherits_a_texel_from_the_one_before_it() {
         grown_blank_image.len()
     );
 
-    let (grown_image, grown_values) = render(&narrow);
+    let grown_image = render(&narrow);
     assert_eq!(
-        painted(&grown_values),
+        painted(&grown_image),
         narrow_pixels,
         "the narrow render claimed a different number of pixels when it followed a smaller raster"
     );
     assert_eq!(
         grown_image, narrow_image,
-        "the narrow render's texture changed when the pooled buffers had to grow for it"
-    );
-    assert_eq!(
-        grown_values, narrow_values,
-        "the narrow render's value grid changed when the pooled buffers had to grow for it"
+        "the narrow render's texture changed when the pooled buffer had to grow for it"
     );
 }

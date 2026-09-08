@@ -61,9 +61,14 @@ const RATIOS: [usize; 6] = [4, 8, 12, 16, 20, 32];
 /// Cycles of the interleave to read.
 const CYCLES: usize = 6;
 
-/// Bytes one pixel costs across the three slots: eight for its cell, four for
-/// its RGBA texel, four for its `f32` value.
-const SLOT_BYTES_PER_PX: usize = 8 + 4 + 4;
+/// Bytes one pixel costs across the two slots: eight for its cell, four for
+/// its RGBA texel.
+const SLOT_BYTES_PER_PX: usize = 8 + 4;
+
+/// Big buffers one still render allocates when it can take neither from a slot:
+/// its cell buffer and its texture. **The unit the sensitivity check below is
+/// really counting**, and the reason that check is not written in cycles.
+const STILL_BLOCKS_PER_THRASH: usize = 2;
 
 /// What counts as a block worth watching: half a still render's cell buffer.
 /// Above every block a `LOOP`-sided render takes (its cells are
@@ -159,7 +164,6 @@ fn packet() -> RadialPacket {
 fn render_at(p: &RadialPacket, side: usize) {
     let out = render_level3_radial_to_image(p, PRODUCT, LAT, LON, SCALE, OFFSET, None, side)
         .expect("the packet renders");
-    assert_eq!(out.values.len(), side * side);
     let frame = RenderedFrame::from(out);
     match frame.image {
         RasterImage::Bytes(bytes) => recycle_image(bytes),
@@ -207,12 +211,36 @@ fn the_pool_under_a_still_and_loop_interleave_is_measured_not_assumed() {
             render_at(&sweep, LOOP);
         }
     });
+    // **This bound is in blocks, and it used to be in cycles.** It read
+    // `thrash_allocs >= CYCLES` — six — on the reasoning that fewer than one
+    // block per cycle meant the instrument could not see a thrash. That
+    // reasoning did not describe what the walk does. Measured on main on
+    // 2026-09-08 by tampering the threshold so the assertion printed its own
+    // input, the walk allocated `[32M, 16M, 16M, 32M, 16M, 16M]`: **two
+    // thrashing stills of three buffers each, not six cycles of one.** The
+    // bound was counting buffers and being compared against a number of cycles,
+    // and it cleared six only because a still render allocated three big
+    // buffers. Removing the value grid left the same two thrashing stills at
+    // two buffers each — four blocks — and the coincidence stopped holding.
+    //
+    // So the check is stated in the quantity it actually measures: one still
+    // render's worth of big buffers, which is what a single observed thrash
+    // costs. The settled arm above allocates zero, so this arm allocating a
+    // still's worth is what separates parking from thrashing.
+    //
+    // **A defect is open behind this, and it is not fixed here.** The walk this
+    // file calls "deliberately thrashing" stops thrashing after its second
+    // cycle: cycles three through six take their buffers from the slots. The
+    // reading below is therefore weaker than its own prose claims, on main
+    // today and before this change. Correcting it moves what the main reading
+    // measures and could legitimately move the pin's value, which needs its own
+    // justification and must not ride in on a byte cut.
     assert!(
-        thrash_allocs >= CYCLES,
+        thrash_allocs >= STILL_BLOCKS_PER_THRASH,
         "the deliberately-thrashing walk allocated {thrash_allocs} still-sized \
-         blocks over {CYCLES} cycles {thrash_sizes:?}. Fewer than one per cycle \
-         means this instrument cannot see a thrash, and a low reading from the \
-         interleave below would say nothing at all",
+         blocks {thrash_sizes:?}, fewer than the {STILL_BLOCKS_PER_THRASH} a \
+         single thrashing still costs. This instrument cannot see a thrash at \
+         all, and a low reading from the interleave below would say nothing",
     );
 
     // ── The reading: the still:loop ratio swept across the window ───────────

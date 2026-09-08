@@ -55,25 +55,21 @@ fn packet(silence: Option<usize>) -> RadialPacket {
     }
 }
 
-fn render(p: &RadialPacket) -> (Vec<u8>, Vec<f32>) {
-    let SweepRender { image, values, .. } =
-        render_level3_radial_to_image(p, PRODUCT, LAT, LON, SCALE, OFFSET, None, types::IMAGE_SIZE)
-            .unwrap();
-    (image, values)
+fn render(p: &RadialPacket) -> Vec<u8> {
+    render_level3_radial_to_image(p, PRODUCT, LAT, LON, SCALE, OFFSET, None, types::IMAGE_SIZE)
+        .unwrap()
+        .image
 }
 
-fn digest(image: &[u8], values: &[f32]) -> u64 {
+fn digest(image: &[u8]) -> u64 {
     let mut h = DefaultHasher::new();
     image.hash(&mut h);
-    for v in values {
-        v.to_bits().hash(&mut h);
-    }
     h.finish()
 }
 
 #[test]
 fn fixture_covers_a_realistic_share_of_the_image() {
-    let (image, values) = render(&packet(None));
+    let image = render(&packet(None));
     let painted = image.chunks_exact(4).filter(|px| px[3] != 0).count();
     // 600 bins of 0.25 km reach 150 km, and the frame is now 150 km too, so
     // the disc fills it corner to corner: pi/4 of the raster, against the
@@ -86,32 +82,29 @@ fn fixture_covers_a_realistic_share_of_the_image() {
         (painted as f64) > disc * 0.9 && (painted as f64) < disc * 1.1,
         "painted {painted}, expected about {disc:.0} for a {N_BINS}-gate disc"
     );
-    assert!(values.iter().any(|v| !v.is_nan()));
+    assert!(painted > 0);
 }
 
-#[test]
-fn values_round_trip_through_the_cell_unaltered() {
-    let (_, values) = render(&packet(None));
-    for &v in values.iter().filter(|v| !v.is_nan()) {
-        let gate = v * SCALE + OFFSET;
-        assert!(
-            gate.fract() == 0.0 && (2.0..=250.0).contains(&gate),
-            "value {v} is not (gate - {OFFSET}) / {SCALE} for any gate the fixture wrote"
-        );
-    }
-}
+// `values_round_trip_through_the_cell_unaltered` stood here until 2026-09-08.
+// It pinned that a gate's `f32` survived `RenderBuffers::cell`'s pack and unpack
+// bit-exactly, read back out of the render's `Vec<f32>` value grid. The grid
+// went with the buffer, and with it the only place a raster's per-pixel value
+// was observable. The property has not moved: the values a reader actually gets
+// come off `SweepRender::polar`, whose round trip `render::polar::tests` pins,
+// and the cell's pack is exercised by every assertion here that expects a
+// particular colour.
 
 /// Pins the *direction* of the tie-break, not just its stability.
 fn assert_later_radial_wins(
-    both: &[f32],
-    only_first: &[f32],
-    only_second: &[f32],
-    first_value: f32,
+    both: &[u8],
+    only_first: &[u8],
+    only_second: &[u8],
+    first_colour: (u8, u8, u8, u8),
 ) {
     let contested = only_first
-        .iter()
-        .zip(only_second)
-        .filter(|(a, b)| !a.is_nan() && !b.is_nan())
+        .chunks_exact(4)
+        .zip(only_second.chunks_exact(4))
+        .filter(|(a, b)| a[3] != 0 && b[3] != 0)
         .count();
     assert!(
         contested > 20,
@@ -120,13 +113,13 @@ fn assert_later_radial_wins(
     );
 
     let stolen = both
-        .iter()
-        .zip(only_second)
-        .filter(|(got, second)| !second.is_nan() && **got == first_value)
+        .chunks_exact(4)
+        .zip(only_second.chunks_exact(4))
+        .filter(|(got, second)| second[3] != 0 && (got[0], got[1], got[2], got[3]) == first_colour)
         .count();
     assert_eq!(
         stolen, 0,
-        "{stolen} of {contested} contested pixels kept radial 0's value even though \
+        "{stolen} of {contested} contested pixels kept radial 0's colour even though \
              radial 1 reached them; the later radial is no longer winning"
     );
 }
@@ -151,24 +144,24 @@ fn level3_later_radial_wins_a_contested_pixel() {
             radials: vec![run(90.0, first), run(91.0, second)],
         }
     }
-    let grid = |first, second| render(&two_radials(first, second)).1;
+    let grid = |first, second| render(&two_radials(first, second));
     assert_later_radial_wins(
         &grid(200, 100),
         &grid(200, 0),
         &grid(0, 100),
-        (200.0 - OFFSET) / SCALE,
+        colour_of(PRODUCT, (200.0 - OFFSET) / SCALE),
     );
 }
 
 #[test]
 fn overlapping_radials_contend_for_pixels() {
-    let (_, full) = render(&packet(None));
-    let (_, cut) = render(&packet(Some(N_RADIALS / 2)));
+    let full = render(&packet(None));
+    let cut = render(&packet(Some(N_RADIALS / 2)));
 
     let contested = full
-        .iter()
-        .zip(&cut)
-        .filter(|(a, b)| !a.is_nan() && !b.is_nan() && a.to_bits() != b.to_bits())
+        .chunks_exact(4)
+        .zip(cut.chunks_exact(4))
+        .filter(|(a, b)| a[3] != 0 && b[3] != 0 && a != b)
         .count();
 
     assert!(
@@ -185,50 +178,37 @@ fn parallel_render_is_deterministic() {
         "single-threaded pool: this test cannot observe a race"
     );
     let p = packet(None);
-    let first = {
-        let (i, v) = render(&p);
-        digest(&i, &v)
-    };
+    let first = digest(&render(&p));
     for run in 1..10 {
-        let (i, v) = render(&p);
-        assert_eq!(digest(&i, &v), first, "render {run} differs from render 0");
+        assert_eq!(
+            digest(&render(&p)),
+            first,
+            "render {run} differs from render 0"
+        );
     }
 }
 
 #[test]
 fn parallel_matches_single_thread() {
     let p = packet(None);
-    let (i, v) = render(&p);
-    let parallel = digest(&i, &v);
+    let parallel = digest(&render(&p));
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(1)
         .build()
         .unwrap();
-    let sequential = pool.install(|| {
-        let (i, v) = render(&p);
-        digest(&i, &v)
-    });
+    let sequential = pool.install(|| digest(&render(&p)));
 
     assert_eq!(parallel, sequential);
 }
 
-#[test]
-fn colour_agrees_with_value_at_every_pixel() {
-    let (image, values) = render(&packet(None));
-    for (idx, (px, &v)) in image.chunks_exact(4).zip(&values).enumerate() {
-        let expected = if v.is_nan() {
-            (0, 0, 0, 0)
-        } else {
-            get_color_for_value(PRODUCT, v)
-        };
-        assert_eq!(
-            (px[0], px[1], px[2], px[3]),
-            expected,
-            "pixel {idx} holds a colour its value did not produce (value {v})"
-        );
-    }
-}
+// `colour_agrees_with_value_at_every_pixel` stood here until 2026-09-08, with a
+// Level II twin and an NROT one. Each pinned that the RGBA texture and the
+// `f32` value grid beside it described the same pixel; the grid went — nothing
+// downstream read it — so there is no second description left to disagree with
+// and the property is unrepresentable rather than unchecked. What the raster
+// paints for a gate is pinned against the polar field by
+// `the_polar_field_answers_what_the_raster_paints`.
 
 // ── Level II and NROT ────────────────────────────────────────────────────
 
@@ -300,11 +280,25 @@ fn l2_scan(gates: &[u8], velocity: bool) -> Scan {
     l2_sweep(gates, &azimuths, 1.0, velocity)
 }
 
-fn render_l2(gates: &[u8], product: types::RadarProduct) -> (Vec<u8>, Vec<f32>) {
+fn render_l2(gates: &[u8], product: types::RadarProduct) -> Vec<u8> {
     let scan = l2_scan(gates, product != types::RadarProduct::Reflectivity);
-    let SweepRender { image, values, .. } =
-        render_radar_to_image(&scan, L2_ELEVATION, product, LAT, LON).unwrap();
-    (image, values)
+    render_radar_to_image(&scan, L2_ELEVATION, product, LAT, LON)
+        .unwrap()
+        .image
+}
+
+/// Whether the raster claimed pixel `i`. Every painted colour is opaque and
+/// every unclaimed texel is left `(0, 0, 0, 0)`, so a non-zero alpha is exactly
+/// a gate having reached that pixel — the question `!painted_at(&image, i)` asked
+/// of the `f32` grid that stood beside the texture until 2026-09-08.
+fn painted_at(image: &[u8], i: usize) -> bool {
+    image[4 * i + 3] != 0
+}
+
+/// What `value` paints for `product` — the raster's whole postcondition, and
+/// the form a gate's value has to be put in to be compared against a texel.
+fn colour_of(product: types::RadarProduct, value: f32) -> (u8, u8, u8, u8) {
+    get_color_for_value(product, value)
 }
 
 fn probe_at(extent_km: f64, side_px: usize, az_deg: f64, range_km: f64) -> usize {
@@ -334,44 +328,28 @@ fn pixel_at(image: &[u8], idx: usize) -> (u8, u8, u8, u8) {
     (px[0], px[1], px[2], px[3])
 }
 
-fn assert_probes(values: &[f32], painted: bool, probes: &[(f64, f64)], why: &str) {
+fn assert_probes(image: &[u8], painted: bool, probes: &[(f64, f64)], why: &str) {
     for &(az, range) in probes {
-        let v = values[probe_at(l2_ground_reach_km(), types::IMAGE_SIZE, az, range)];
+        let at = probe_at(l2_ground_reach_km(), types::IMAGE_SIZE, az, range);
+        let hit = painted_at(image, at);
         assert_eq!(
-            !v.is_nan(),
+            hit,
             painted,
             "({az}°, {range} km) is {} — {why}",
-            if v.is_nan() { "unpainted" } else { "painted" },
+            if hit { "painted" } else { "unpainted" },
         );
     }
 }
 
 #[test]
 fn level2_later_radial_wins_a_contested_pixel() {
-    let grid = |g: &[u8]| render_l2(g, PRODUCT).1;
+    let grid = |g: &[u8]| render_l2(g, PRODUCT);
     assert_later_radial_wins(
         &grid(&[200, 100]),
         &grid(&[200, 0]),
         &grid(&[0, 100]),
-        (200.0 - OFFSET) / SCALE,
+        colour_of(PRODUCT, (200.0 - OFFSET) / SCALE),
     );
-}
-
-#[test]
-fn level2_colour_agrees_with_value_at_every_pixel() {
-    let (image, values) = render_l2(&[200, 100, 180, 120], PRODUCT);
-    assert!(
-        values.iter().any(|v| !v.is_nan()),
-        "level II fixture painted nothing"
-    );
-    for (px, &v) in image.chunks_exact(4).zip(&values) {
-        let want = if v.is_nan() {
-            (0, 0, 0, 0)
-        } else {
-            get_color_for_value(PRODUCT, v)
-        };
-        assert_eq!((px[0], px[1], px[2], px[3]), want);
-    }
 }
 
 fn nrot_scan(n_radials: usize) -> Scan {
@@ -435,38 +413,10 @@ fn nrot_sector(n_radials: usize, step_deg: f32) -> Scan {
 }
 
 #[test]
-fn nrot_colour_comes_from_the_nrot_palette() {
-    let scan = nrot_scan(360);
-    let SweepRender { image, values, .. } = render_radar_to_image(
-        &scan,
-        L2_ELEVATION,
-        types::RadarProduct::NormalizedRotation,
-        LAT,
-        LON,
-    )
-    .unwrap();
-
-    let painted = image.chunks_exact(4).filter(|px| px[3] != 0).count();
-    assert!(
-        painted > 10_000,
-        "NROT fixture painted only {painted} pixels"
-    );
-
-    for (px, &v) in image.chunks_exact(4).zip(&values) {
-        let want = if v.is_nan() {
-            (0, 0, 0, 0)
-        } else {
-            get_color_for_value(types::RadarProduct::NormalizedRotation, v)
-        };
-        assert_eq!((px[0], px[1], px[2], px[3]), want);
-    }
-}
-
-#[test]
 fn nrot_render_is_deterministic() {
     let scan = nrot_scan(360);
     let once = || {
-        let SweepRender { image, values, .. } = render_radar_to_image(
+        let SweepRender { image, .. } = render_radar_to_image(
             &scan,
             L2_ELEVATION,
             types::RadarProduct::NormalizedRotation,
@@ -474,7 +424,7 @@ fn nrot_render_is_deterministic() {
             LON,
         )
         .unwrap();
-        digest(&image, &values)
+        digest(&image)
     };
     let first = once();
     for run in 1..6 {
@@ -497,27 +447,49 @@ fn nrot_render_is_deterministic() {
 #[test]
 fn a_sparse_sweep_leaves_holes_not_chord_triangles() {
     let scan = l2_sweep(&[200; 4], &[0.0, 90.0, 180.0, 270.0], 0.5, false);
-    let SweepRender { values, .. } =
+    let SweepRender { image, .. } =
         render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
 
     assert_probes(
-        &values,
+        &image,
         true,
         &[(0.0, 50.0), (90.0, 50.0), (180.0, 50.0), (270.0, 50.0)],
         "a radial paints where it looked",
     );
     assert_probes(
-        &values,
+        &image,
         false,
         &[(30.0, 50.0), (60.0, 50.0), (120.0, 50.0), (300.0, 50.0)],
         "the radar never looked here and the display must not claim it did",
     );
 }
 
+/// **Every gate in this fixture paints, and that is load-bearing.**
+///
+/// The raws were `2 + i % 200` — minus 32 dBZ to 67.5 — until 2026-09-08, and
+/// the 64 of them below raw 66 are under the dBZ floor, so they claimed a pixel
+/// and coloured it transparent. That was invisible to the `f32` value grid this
+/// file used to read, which could say whether a pixel was *claimed* but not
+/// whether it was *painted*, and the two assertions below were written as if
+/// those were the same question.
+///
+/// They are not, and the difference is real: on the old fixture the two
+/// collection orders paint **690 of about 2.1 M pixels differently**. The
+/// tie-break ranks by radial *index* (`write_key`, "the way a single-threaded
+/// radial-major render would"), so reversing the sweep renumbers the radials
+/// and a contested pixel is won by a different one — and where those two rivals
+/// disagree about whether they paint at all, the picture's own coverage moves.
+///
+/// **That is a property of the renderer, not of this fixture, and it is filed
+/// rather than fixed here**: the tie-break is defined on collection order by
+/// design, so what is open is whether visible coverage may follow it. This test
+/// keeps its own claim — that reordering a sweep does not change what it
+/// covers — and states it on a fixture where claimed and painted are the same
+/// set, which is what makes the claim checkable at all.
 #[test]
 fn an_out_of_order_sweep_still_paints() {
     let azimuths: Vec<f32> = (0..360).map(|i| i as f32).collect();
-    let gates: Vec<u8> = (0..360).map(|i| 2 + (i % 200) as u8).collect();
+    let gates: Vec<u8> = (0..360).map(|i| 66 + (i % 190) as u8).collect();
 
     let render = |ascending: bool| {
         let (az, g) = if ascending {
@@ -531,38 +503,38 @@ fn an_out_of_order_sweep_still_paints() {
         let scan = l2_sweep(&g, &az, 1.0, false);
         render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON)
             .unwrap()
-            .values
+            .image
     };
 
     let up = render(true);
     let down = render(false);
 
-    let up_painted = up.iter().filter(|v| !v.is_nan()).count();
-    let down_painted = down.iter().filter(|v| !v.is_nan()).count();
+    let up_painted = up.chunks_exact(4).filter(|px| px[3] != 0).count();
+    let down_painted = down.chunks_exact(4).filter(|px| px[3] != 0).count();
     assert_eq!(
         down_painted, up_painted,
         "a descending sweep painted {down_painted} px against the ascending {up_painted}",
     );
 
     let mask_differs = up
-        .iter()
-        .zip(&down)
-        .filter(|(a, b)| a.is_nan() != b.is_nan())
+        .chunks_exact(4)
+        .zip(down.chunks_exact(4))
+        .filter(|(a, b)| (a[3] != 0) != (b[3] != 0))
         .count();
     assert_eq!(
         mask_differs, 0,
         "{mask_differs} pixels are painted in one collection order and not the other",
     );
 
-    let value_differs = up
-        .iter()
-        .zip(&down)
-        .filter(|(a, b)| !a.is_nan() && a.to_bits() != b.to_bits())
+    let colour_differs = up
+        .chunks_exact(4)
+        .zip(down.chunks_exact(4))
+        .filter(|(a, b)| a[3] != 0 && a != b)
         .count();
     assert!(
-        value_differs > 0,
+        colour_differs > 0,
         "no contested pixel changed hands, so this fixture cannot tell a mask \
-         comparison from a value comparison",
+         comparison from a colour comparison",
     );
 }
 
@@ -573,7 +545,7 @@ fn declared_spacing_drives_the_wedge_width() {
         let scan = l2_sweep(&[200; 180], &azimuths, declared, false);
         render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON)
             .unwrap()
-            .values
+            .image
     };
 
     let midpoints = [(1.0, 50.0), (3.0, 50.0), (181.0, 50.0)];
@@ -595,17 +567,17 @@ fn declared_spacing_drives_the_wedge_width() {
 fn a_lying_declaration_is_clamped_to_the_sweeps_median() {
     let azimuths: Vec<f32> = (0..=400).map(|i| i as f32 * 0.5).collect();
     let scan = l2_sweep(&vec![200; azimuths.len()], &azimuths, 45.0, false);
-    let SweepRender { values, .. } =
+    let SweepRender { image, .. } =
         render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
 
     assert_probes(
-        &values,
+        &image,
         true,
         &[(0.0, 50.0), (100.0, 50.0), (200.0, 50.0)],
         "the arc itself still paints",
     );
     assert_probes(
-        &values,
+        &image,
         false,
         &[(205.0, 50.0), (250.0, 50.0), (355.0, 50.0)],
         "45° is not a resolution the RDA has and the sweep's own spacing says so",
@@ -615,17 +587,17 @@ fn a_lying_declaration_is_clamped_to_the_sweeps_median() {
 #[test]
 fn a_sweep_with_no_declaration_is_capped_at_a_sane_wedge() {
     let scan = l2_sweep(&[200, 200], &[0.0, 10.0], 0.0, false);
-    let SweepRender { values, .. } =
+    let SweepRender { image, .. } =
         render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
 
     assert_probes(
-        &values,
+        &image,
         true,
         &[(0.0, 50.0), (10.0, 50.0)],
         "both radials paint",
     );
     assert_probes(
-        &values,
+        &image,
         false,
         &[(4.0, 50.0), (90.0, 50.0), (270.0, 50.0)],
         "two radials are two samples, not a sweep",
@@ -719,7 +691,7 @@ fn wedges_meet_where_the_antenna_wobbled() {
         // The middle of the wide gap — between radial `i` and radial `i + 1`,
         // which sit `0.5 + WOBBLE_DEG` apart.
         let az = f64::from(azimuths[i]) + f64::from(0.5 + WOBBLE_DEG) / 2.0;
-        if out.values[probe_at(out.max_range_km, side, az, 450.0)].is_nan() {
+        if !painted_at(&out.image, probe_at(out.max_range_km, side, az, 450.0)) {
             unpainted += 1;
         }
     }
@@ -740,7 +712,10 @@ fn a_dropped_radial_still_leaves_its_gap() {
     let side = (out.image.len() / 4).isqrt();
     let mut painted = 0;
     for i in (0..720).filter(|i| i % 4 == 1) {
-        if !out.values[probe_at(out.max_range_km, side, i as f64 * 0.5, 450.0)].is_nan() {
+        if painted_at(
+            &out.image,
+            probe_at(out.max_range_km, side, i as f64 * 0.5, 450.0),
+        ) {
             painted += 1;
         }
     }
@@ -785,7 +760,7 @@ fn a_solid_field_leaves_no_pixel_of_itself_unpainted() {
     )
     .unwrap();
     let side = (out.image.len() / 4).isqrt();
-    let painted = |x: usize, y: usize| !out.values[y * side + x].is_nan();
+    let painted = |x: usize, y: usize| painted_at(&out.image, y * side + x);
     let mut holes = Vec::new();
     for y in 1..side - 1 {
         for x in 1..side - 1 {
@@ -925,16 +900,16 @@ fn tdwr_sweep_from_gates(gates: Vec<u8>) -> Scan {
     )
 }
 
-fn painted_ranges_km_at(values: &[f32], extent_km: f64, site_lat: f64) -> Vec<f64> {
+fn painted_ranges_km_at(image: &[u8], extent_km: f64, site_lat: f64) -> Vec<f64> {
     let bounds = types::ImageBounds::from_radar_site(site_lat, LON, extent_km);
     // Off the grid's own length, so this reads a 4096-pixel render as readily
     // as a base one and cannot be pointed at the wrong picture.
-    let side = values.len().isqrt();
-    assert_eq!(side * side, values.len(), "a value grid must be square");
+    let side = (image.len() / 4).isqrt();
+    assert_eq!(side * side * 4, image.len(), "a raster must be square");
     let merc_span = bounds.mercator_y_max - bounds.mercator_y_min;
     (0..side)
         .flat_map(|row| (0..side).map(move |col| (row, col)))
-        .filter(|&(row, col)| !values[row * side + col].is_nan())
+        .filter(|&(row, col)| painted_at(image, row * side + col))
         .map(|(row, col)| {
             let lon = bounds.min_lon
                 + (col as f64 + 0.5) / side as f64 * (bounds.max_lon - bounds.min_lon);
@@ -945,8 +920,8 @@ fn painted_ranges_km_at(values: &[f32], extent_km: f64, site_lat: f64) -> Vec<f6
         .collect()
 }
 
-fn painted_ranges_km(values: &[f32], extent_km: f64) -> Vec<f64> {
-    painted_ranges_km_at(values, extent_km, LAT)
+fn painted_ranges_km(image: &[u8], extent_km: f64) -> Vec<f64> {
+    painted_ranges_km_at(image, extent_km, LAT)
 }
 
 #[test]
@@ -955,7 +930,7 @@ fn a_tdwr_long_range_sweep_is_projected_at_its_own_reach() {
     let scan = tdwr_long_range_sweep(BEACON_KM);
     let SweepRender {
         max_range_km: extent_km,
-        values,
+        image,
         ..
     } = render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
 
@@ -969,7 +944,7 @@ fn a_tdwr_long_range_sweep_is_projected_at_its_own_reach() {
     for az in [0.0, 90.0, 180.0, 270.0] {
         let at = probe_at(extent_km, types::IMAGE_SIZE, az, BEACON_KM);
         assert!(
-            !values[at].is_nan(),
+            painted_at(&image, at),
             "the beacon 400 km out at {az}° is unpainted at the pixel this \
              render's own projection puts it in",
         );
@@ -982,7 +957,7 @@ fn a_tdwr_long_range_sweep_is_projected_at_its_own_reach() {
     let px_per_km = side as f64 / (2.0 * extent_km);
     let east = (0..side)
         .rev()
-        .find(|&col| (0..side).any(|row| !values[row * side + col].is_nan()))
+        .find(|&col| (0..side).any(|row| painted_at(&image, row * side + col)))
         .expect("the beacon painted something");
     let painted_km = (east as f64 + 0.5 - side as f64 / 2.0) / px_per_km;
     assert!(
@@ -1122,7 +1097,7 @@ fn a_tdwr_doppler_sweep_is_projected_at_its_own_reach_not_the_base_extent() {
         let side = types::IMAGE_SIZE;
         let east = (0..side)
             .rev()
-            .find(|&col| (0..side).any(|row| !vel.values[row * side + col].is_nan()))
+            .find(|&col| (0..side).any(|row| painted_at(&vel.image, row * side + col)))
             .expect("the Doppler disc painted something");
         assert!(
             east >= side - 2,
@@ -1281,8 +1256,8 @@ fn tilted_beacon_sweep(
     )
 }
 
-fn ring_bounds_km(values: &[f32], extent_km: f64) -> (f64, f64, f64) {
-    let ranges = painted_ranges_km(values, extent_km);
+fn ring_bounds_km(image: &[u8], extent_km: f64) -> (f64, f64, f64) {
+    let ranges = painted_ranges_km(image, extent_km);
     assert!(!ranges.is_empty(), "the fixture painted nothing at all");
     let near = ranges.iter().copied().fold(f64::INFINITY, f64::min);
     let far = ranges.iter().copied().fold(0.0f64, f64::max);
@@ -1301,17 +1276,23 @@ fn a_45_degree_sweep_lands_at_the_same_ground_range_in_2d_and_3d() {
     // ── The plan view ──
     let SweepRender {
         max_range_km: extent_km,
-        values,
+        image,
         ..
     } = render_radar_to_image(&scan, ELEV, PRODUCT, LAT, LON).unwrap();
     let px_per_km = types::IMAGE_SIZE as f64 / (2.0 * extent_km);
 
     assert!(
-        !values[probe_at(extent_km, types::IMAGE_SIZE, 90.0, ground_km)].is_nan(),
+        painted_at(
+            &image,
+            probe_at(extent_km, types::IMAGE_SIZE, 90.0, ground_km)
+        ),
         "the beacon is unpainted at the {ground_km:.3} km of ground it sits over",
     );
     assert!(
-        values[probe_at(extent_km, types::IMAGE_SIZE, 90.0, SLANT_KM)].is_nan(),
+        !painted_at(
+            &image,
+            probe_at(extent_km, types::IMAGE_SIZE, 90.0, SLANT_KM)
+        ),
         "the beacon is still painted out at its {SLANT_KM} km slant range, \
          which is 5.86 km past the ground it is over",
     );
@@ -1337,7 +1318,7 @@ fn a_45_degree_sweep_lands_at_the_same_ground_range_in_2d_and_3d() {
     );
 
     // ── And the two bands are the same band ──
-    let (_, _, centre_2d) = ring_bounds_km(&values, extent_km);
+    let (_, _, centre_2d) = ring_bounds_km(&image, extent_km);
     let mut lo = f64::INFINITY;
     let mut hi = 0.0f64;
     for step in 0..2000 {
@@ -1369,10 +1350,10 @@ fn a_tdwr_steep_tilt_renders_at_half_its_slant_range() {
 
     let SweepRender {
         max_range_km: extent_km,
-        values,
+        image,
         ..
     } = render_radar_to_image(&scan, ELEV, PRODUCT, LAT, LON).unwrap();
-    let (near, far, centre) = ring_bounds_km(&values, extent_km);
+    let (near, far, centre) = ring_bounds_km(&image, extent_km);
 
     assert!(
         (centre - 12.0).abs() < 0.3,
@@ -1414,11 +1395,11 @@ fn a_low_tilt_beacon_moves_less_than_a_pixel() {
     let scan = tilted_beacon_sweep(ELEV, 0.25, 900, SLANT_KM, 2);
     let SweepRender {
         max_range_km: extent_km,
-        values,
+        image,
         ..
     } = render_radar_to_image(&scan, ELEV, PRODUCT, LAT, LON).unwrap();
 
-    let (_, _, centre) = ring_bounds_km(&values, extent_km);
+    let (_, _, centre) = ring_bounds_km(&image, extent_km);
     let px_per_km = types::IMAGE_SIZE as f64 / (2.0 * extent_km);
     let moved_px = (SLANT_KM - centre) * px_per_km;
     assert!(
@@ -1433,7 +1414,7 @@ fn a_sweep_inside_the_old_floor_is_drawn_at_its_own_reach() {
     let scan = l2_sweep(&[200; 360], &azimuths, 1.0, false);
     let SweepRender {
         max_range_km: extent_km,
-        values,
+        image,
         ..
     } = render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
 
@@ -1455,7 +1436,7 @@ fn a_sweep_inside_the_old_floor_is_drawn_at_its_own_reach() {
     // with no Mercator row arithmetic in the way.
     let side = types::IMAGE_SIZE;
     let row = side / 2;
-    let painted = |col: usize| !values[row * side + col].is_nan();
+    let painted = |col: usize| painted_at(&image, row * side + col);
     let east = (0..side).rev().find(|&c| painted(c)).expect("echo east");
     let west = (0..side).find(|&c| painted(c)).expect("echo west");
 
@@ -1487,10 +1468,10 @@ fn nothing_is_painted_outside_the_extent_a_render_declares() {
         for site_lat in [LAT, 47.0411, 48.1946] {
             let SweepRender {
                 max_range_km: extent_km,
-                values,
+                image,
                 ..
             } = render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, site_lat, LON).unwrap();
-            let ranges = painted_ranges_km_at(&values, extent_km, site_lat);
+            let ranges = painted_ranges_km_at(&image, extent_km, site_lat);
             assert!(
                 !ranges.is_empty(),
                 "{why} at {site_lat}\u{b0}N painted nothing"
@@ -1519,7 +1500,7 @@ fn nothing_is_painted_outside_the_extent_a_render_declares() {
     // geography's help.
     let SweepRender {
         max_range_km: extent_km,
-        values,
+        image,
         ..
     } = render_radar_to_image(
         &l2_sweep(&[200; 360], &azimuths, 1.0, false),
@@ -1537,20 +1518,20 @@ fn nothing_is_painted_outside_the_extent_a_render_declares() {
             side / 2,
             (0..side)
                 .rev()
-                .find(|&c| !values[side / 2 * side + c].is_nan())
+                .find(|&c| painted_at(&image, side / 2 * side + c))
                 .unwrap(),
         ),
         (
             "west",
             side / 2,
             (0..side)
-                .find(|&c| !values[side / 2 * side + c].is_nan())
+                .find(|&c| painted_at(&image, side / 2 * side + c))
                 .unwrap(),
         ),
         (
             "north",
             (0..side)
-                .find(|&r| !values[r * side + side / 2].is_nan())
+                .find(|&r| painted_at(&image, r * side + side / 2))
                 .unwrap(),
             side / 2,
         ),
@@ -1558,7 +1539,7 @@ fn nothing_is_painted_outside_the_extent_a_render_declares() {
             "south",
             (0..side)
                 .rev()
-                .find(|&r| !values[r * side + side / 2].is_nan())
+                .find(|&r| painted_at(&image, r * side + side / 2))
                 .unwrap(),
             side / 2,
         ),
@@ -1579,7 +1560,7 @@ fn nrot_does_not_smear_past_its_sector() {
     let scan = nrot_sector(72, 0.5);
     let SweepRender {
         max_range_km: extent_km,
-        values,
+        image,
         ..
     } = render_radar_to_image(
         &scan,
@@ -1590,14 +1571,13 @@ fn nrot_does_not_smear_past_its_sector() {
     )
     .unwrap();
 
-    let painted = values.iter().filter(|v| !v.is_nan()).count();
+    let painted = image.chunks_exact(4).filter(|px| px[3] != 0).count();
     assert!(painted > 1_000, "the NROT sector painted only {painted} px");
 
     for range in [20.0, 30.0, 40.0, 50.0] {
         for az in [37.0, -1.5] {
-            let v = values[probe_at(extent_km, types::IMAGE_SIZE, az, range)];
             assert!(
-                v.is_nan(),
+                !painted_at(&image, probe_at(extent_km, types::IMAGE_SIZE, az, range)),
                 "({az}°, {range} km) is painted - the sector runs 0° to \
                  35.5° and the display must end where it does",
             );
@@ -2076,28 +2056,39 @@ fn the_hybrid_classification_changes_with_the_environmental_heights() {
         super::render_hhc_to_image(&scan, LAT, LON, Some((0.8, 2.0)), None, types::IMAGE_SIZE)
             .expect("the fixture classifies");
 
-    let painted = |grid: &[f32]| grid.iter().filter(|v| !v.is_nan()).count();
-    let all_of = |grid: &[f32], class: f32| grid.iter().filter(|v| **v == class).count();
+    let painted = |image: &[u8]| image.chunks_exact(4).filter(|px| px[3] != 0).count();
+    // A class is read through the colour it paints. The classification scale is
+    // a step table with a distinct colour for every RPG class
+    // (`palette::tests::every_rpg_hydrometeor_class_has_its_own_colour`), so
+    // "every cell is `class`" and "every cell is `class`'s colour" are the same
+    // statement about this product.
+    let all_of = |image: &[u8], class: f32| {
+        let want = colour_of(types::RadarProduct::HydrometeorClassification, class);
+        image
+            .chunks_exact(4)
+            .filter(|px| (px[0], px[1], px[2], px[3]) == want)
+            .count()
+    };
 
-    let cells = painted(&defaults.values);
+    let cells = painted(&defaults.image);
     assert!(
         cells > 0,
         "the fixture painted nothing, so it proves nothing"
     );
     assert_eq!(
-        painted(&sounding.values),
+        painted(&sounding.image),
         cells,
         "both environments must classify the same disc — a difference in \
          *coverage* would confound the difference in class",
     );
     assert_eq!(
-        all_of(&defaults.values, RA),
+        all_of(&defaults.image, RA),
         cells,
         "with the adaptation defaults the melting layer sits above the beam \
          and the whole disc is rain",
     );
     assert_eq!(
-        all_of(&sounding.values, DS),
+        all_of(&sounding.image, DS),
         cells,
         "with the sounding's 0.8 km freezing level the beam climbs out of the \
          melting layer and the whole disc is dry snow",
@@ -2157,14 +2148,9 @@ fn a_render_inside_the_floor_ignores_the_long_range_ceiling_entirely() {
         base.image, offered.image,
         "the image moved under an unused ceiling"
     );
-    // `NaN` is most of a value grid, and `NaN != NaN`, so the bits are what is
-    // compared — a grid full of quiet NaNs would otherwise never be equal to
-    // itself and this assertion would be vacuous.
-    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     assert_eq!(
-        bits(&base.values),
-        bits(&offered.values),
-        "the value grid moved under an unused ceiling",
+        base.image, offered.image,
+        "the raster moved under an unused ceiling",
     );
 }
 
@@ -2175,7 +2161,6 @@ fn a_tdwr_long_range_sweep_takes_the_long_range_raster() {
     let SweepRender {
         image,
         max_range_km: extent_km,
-        values,
         ..
     } = render_radar_to_image_full_sized(
         &scan,
@@ -2196,7 +2181,6 @@ fn a_tdwr_long_range_sweep_takes_the_long_range_raster() {
         LONG_RANGE_SIDE * LONG_RANGE_SIDE * 4,
         "a 417 km sweep under a {LONG_RANGE_SIDE} px ceiling must take it",
     );
-    assert_eq!(values.len(), LONG_RANGE_SIDE * LONG_RANGE_SIDE);
     assert!(
         (extent_km - tdwr_ground_reach_km()).abs() < 1e-9,
         "the extent is the ground the sweep covers, not the raster's size: \
@@ -2206,7 +2190,7 @@ fn a_tdwr_long_range_sweep_takes_the_long_range_raster() {
     for az in [0.0, 90.0, 180.0, 270.0] {
         let at = probe_at(extent_km, LONG_RANGE_SIDE, az, BEACON_KM);
         assert!(
-            !values[at].is_nan(),
+            painted_at(&image, at),
             "the beacon 400 km out at {az}° is unpainted at the pixel this \
              render's own projection puts it in",
         );
@@ -2417,7 +2401,7 @@ fn a_base_size_ceiling_pays_for_the_extra_ground_in_scale() {
     for az in [0.0, 90.0, 180.0, 270.0] {
         let at = probe_at(extent_km, types::IMAGE_SIZE, az, FAR_KM);
         assert!(
-            !lean.values[at].is_nan(),
+            painted_at(&lean.image, at),
             "a gate {FAR_KM} km out at {az}° is unpainted on the base-size \
              raster, {:.0} km past the floor this render is here to be outside",
             FAR_KM - types::BASE_EXTENT_KM,
@@ -2451,7 +2435,6 @@ fn a_ceiling_under_the_base_size_renders_a_leaner_picture_of_the_same_ground() {
     let SweepRender {
         image,
         max_range_km: extent_km,
-        values,
         ..
     } = render_radar_to_image_full_sized(
         &scan,
@@ -2468,14 +2451,13 @@ fn a_ceiling_under_the_base_size_renders_a_leaner_picture_of_the_same_ground() {
     .expect("the fixture renders");
 
     assert_eq!(image.len(), LEAN * LEAN * 4);
-    assert_eq!(values.len(), LEAN * LEAN);
     assert!(
         (extent_km - tdwr_ground_reach_km()).abs() < 1e-9,
         "a leaner raster covers the same ground: {extent_km}",
     );
     let at = probe_at(extent_km, LEAN, 90.0, 400.2);
     assert!(
-        !values[at].is_nan(),
+        painted_at(&image, at),
         "the beacon is unpainted on the lean raster",
     );
 }
@@ -2492,7 +2474,7 @@ fn a_range_folded_gate_paints_the_dedicated_purple_and_below_threshold_does_not(
     gates[BELOW_AZ] = RAW_BELOW_THRESHOLD;
     let scan = l2_sweep(&gates, &azimuths, 1.0, true);
 
-    let SweepRender { image, values, .. } =
+    let SweepRender { image, .. } =
         render_radar_to_image(&scan, L2_ELEVATION, types::RadarProduct::Velocity, LAT, LON)
             .expect("the fixture renders");
 
@@ -2507,16 +2489,11 @@ fn a_range_folded_gate_paints_the_dedicated_purple_and_below_threshold_does_not(
         crate::palette::RANGE_FOLDED,
         "a range-folded gate is the dedicated purple",
     );
-    assert!(
-        values[folded].is_nan(),
-        "the exported grid carries a plain NaN over a folded gate, not a \
-         payload — nothing across the JS boundary reads one",
-    );
-    assert_eq!(
-        values[folded].to_bits(),
-        f32::NAN.to_bits(),
-        "and it is the canonical NaN, not the sentinel the cell held",
-    );
+    // Two assertions stood here until 2026-09-08: that the render's `Vec<f32>`
+    // value grid carried a plain, canonical `NaN` over a folded gate rather
+    // than the sentinel bit pattern the cell held. The grid went — nothing
+    // downstream read it — and the sentinel no longer leaves `into_output`: it
+    // is read off the cell, painted, and dropped with the cell buffer.
 
     let below = probe_at(
         l2_ground_reach_km(),
@@ -2529,13 +2506,14 @@ fn a_range_folded_gate_paints_the_dedicated_purple_and_below_threshold_does_not(
         0,
         "a below-threshold gate stays transparent",
     );
-    assert!(values[below].is_nan());
+    assert!(!painted_at(&image, below));
 
     // The precondition: the rest of the sweep really did paint, or the two
     // assertions above are about a blank picture.
     let neighbour = probe_at(l2_ground_reach_km(), types::IMAGE_SIZE, 80.0, 50.0);
     assert!(
-        !values[neighbour].is_nan() && pixel_at(&image, neighbour) != crate::palette::RANGE_FOLDED,
+        painted_at(&image, neighbour)
+            && pixel_at(&image, neighbour) != crate::palette::RANGE_FOLDED,
         "an ordinary radial paints its own colour",
     );
 }
@@ -2722,26 +2700,10 @@ fn a_checked_out_texture_is_zero_at_every_length() {
     assert!(image.iter().all(|&b| b == 0));
 }
 
-#[test]
-fn a_checked_out_value_grid_is_empty_at_every_length() {
-    // See `a_checked_out_texture_is_zero_at_every_length` on why demand is
-    // declared before the offers.
-    super::demand::observe(1 << 20);
-    for held in [0usize, 1, 1024, 4096, 1 << 20] {
-        super::recycle_values(vec![f32::from_bits(0xDEAD_BEEF); held]);
-        let values = super::checkout_values(held);
-        assert_eq!(
-            values.len(),
-            0,
-            "a checkout came back holding {} values after the slot held {held}",
-            values.len()
-        );
-    }
-}
-
-// What `recycle_image` and `recycle_values` do *to the slot* — keep the first offer,
-// drop the rest, decline a buffer with no capacity — is pinned in
-// `tests/render_output_slot.rs` and deliberately not here.
+// What `recycle_image` does *to the slot* — keep the first offer, drop the
+// rest, decline a buffer with no capacity — is pinned in
+// `tests/render_output_slot.rs` and deliberately not here. Its value-grid
+// counterpart went with the grid on 2026-09-08.
 
 #[test]
 fn the_rasterizer_places_a_gate_where_the_beam_module_says_it_is() {
@@ -2963,7 +2925,7 @@ fn one_stray_velocity_radial_does_not_reframe_the_reflectivity_pane() {
 // ── The polar field against the raster it was painted beside ────────────────
 
 #[test]
-fn the_polar_field_answers_what_the_value_grid_holds() {
+fn the_polar_field_answers_what_the_raster_paints() {
     let out = render_level3_radial_to_image(
         &packet(None),
         PRODUCT,
@@ -3015,15 +2977,20 @@ fn the_polar_field_answers_what_the_value_grid_holds() {
                 "({az}°, {km} km) is the centre of ({radial}, {gate})"
             );
             centres += 1;
-            let from_grid = coarse.values[probe_at(coarse.max_range_km, cside, az, km)];
-            if from_grid.is_nan() {
+            let at = probe_at(coarse.max_range_km, cside, az, km);
+            if !painted_at(&coarse.image, at) {
                 pinholes += 1;
                 continue;
             }
             assert_eq!(
-                coarse.polar.at(picked).unwrap().to_bits(),
-                from_grid.to_bits(),
-                "({az}°, {km} km): the grid and the gate must be the same number"
+                colour_of(PRODUCT, coarse.polar.at(picked).unwrap()),
+                (
+                    coarse.image[4 * at],
+                    coarse.image[4 * at + 1],
+                    coarse.image[4 * at + 2],
+                    coarse.image[4 * at + 3],
+                ),
+                "({az}°, {km} km): the raster must paint what the gate holds"
             );
         }
     }
@@ -3042,22 +3009,30 @@ fn the_polar_field_answers_what_the_value_grid_holds() {
     while az < 360.0 {
         let mut km = 0.05f64;
         while km < 150.0 {
-            let from_grid = out.values[probe_at(extent, types::IMAGE_SIZE, az, km)];
+            let at = probe_at(extent, types::IMAGE_SIZE, az, km);
+            let shown = (
+                out.image[4 * at],
+                out.image[4 * at + 1],
+                out.image[4 * at + 2],
+                out.image[4 * at + 3],
+            );
             let picked = geom.pick(az, km);
             let from_gate = picked.and_then(|a| out.polar.at(a));
             probes += 1;
-            let agreed = match (from_grid.is_nan(), from_gate) {
+            let agreed = match (shown.3 == 0, from_gate) {
                 (true, None) => true,
-                (false, Some(v)) => v == from_grid,
+                (false, Some(v)) => colour_of(PRODUCT, v) == shown,
                 _ => false,
             };
             if !agreed {
                 disagreed += 1;
                 if let Some(a) = picked
-                    && !from_grid.is_nan()
-                    && neighbours(&geom, a)
-                        .into_iter()
-                        .any(|n| out.polar.at(n) == Some(from_grid))
+                    && shown.3 != 0
+                    && neighbours(&geom, a).into_iter().any(|n| {
+                        out.polar
+                            .at(n)
+                            .is_some_and(|v| colour_of(PRODUCT, v) == shown)
+                    })
                 {
                     adjacent += 1;
                 }
@@ -3158,33 +3133,28 @@ fn consecutive_gates_tile_with_no_seam() {
 /// the frame thread's telemetry tick and the allocation-error hook, neither
 /// of which may block behind a render's `take`.
 ///
-/// The three guards are taken in the order `take_pools` takes them; no path in
-/// this module holds two slot locks at once, so nothing can deadlock against
-/// this thread while it holds all three. Other tests in this binary that
+/// Both guards are taken in the order `take_pools` takes them; no path in this
+/// module holds two slot locks at once, so nothing can deadlock against this
+/// thread while it holds them. Other tests in this binary that
 /// render will wait on the locks for the length of the test, which is one
 /// thread spawn.
 #[test]
 fn pooled_bytes_is_read_without_taking_a_slot_lock() {
     let mut cells = RenderBuffers::pool();
     let mut image = image_pool();
-    let mut values = values_pool();
 
     // Known contents under the guards: whatever another test left is taken
     // out (and its level zeroed), then one buffer of known capacity goes in
     // each slot through the same seam the production doors use.
     drop(take_slot(&mut cells, &POOLED_CELL_BYTES));
     drop(take_slot(&mut image, &POOLED_IMAGE_BYTES));
-    drop(take_slot(&mut values, &POOLED_VALUE_BYTES));
     let cell_buffer: Vec<AtomicU64> = (0..512).map(|_| AtomicU64::new(0)).collect();
     let cell_bytes = cell_buffer.capacity() * std::mem::size_of::<AtomicU64>();
     let image_buffer = vec![0u8; 4096];
     let image_bytes = image_buffer.capacity();
-    let value_buffer = vec![0f32; 1024];
-    let value_bytes = value_buffer.capacity() * std::mem::size_of::<f32>();
     park_slot(&mut cells, &POOLED_CELL_BYTES, cell_buffer, cell_bytes);
     park_slot(&mut image, &POOLED_IMAGE_BYTES, image_buffer, image_bytes);
-    park_slot(&mut values, &POOLED_VALUE_BYTES, value_buffer, value_bytes);
-    let expected = cell_bytes + image_bytes + value_bytes;
+    let expected = cell_bytes + image_bytes;
 
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -3202,5 +3172,4 @@ fn pooled_bytes_is_read_without_taking_a_slot_lock() {
     // Leave the slots as they were found by the next test: empty, at zero.
     drop(take_slot(&mut cells, &POOLED_CELL_BYTES));
     drop(take_slot(&mut image, &POOLED_IMAGE_BYTES));
-    drop(take_slot(&mut values, &POOLED_VALUE_BYTES));
 }

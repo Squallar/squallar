@@ -7,7 +7,7 @@
 //! scene the parked cell buffer was 413.5 MiB and the parked texture 206.8 MiB
 //! — 620 MiB of a 1,805 MiB heap — and neither was in any census family, while
 //! the staging pools a tenth their size were. `pooled_bytes` existed and
-//! nothing shipped read it; it also walked three locks, which the telemetry
+//! nothing shipped read it; it also walked every slot's lock, which the telemetry
 //! tick and the allocation-error hook may not do (`render::tests` pins that
 //! half). This file pins the other half: that the lock-free figure is the
 //! slots' truth at every step of a render's life.
@@ -112,11 +112,11 @@ fn the_pools_report_exactly_what_they_park_and_nothing_they_have_lent_out() {
     );
 
     // (2) **The cell buffer's park, through its only door.** `into_output`
-    // recycles the drained cells before it hands the texture back, and a size
-    // seen twice is carried — so the level is now exactly one cell per pixel
-    // of this render, eight bytes each, and nothing else.
+    // recycles the drained cells once it has coloured the texture from them,
+    // and a size seen twice is carried — so the level is now exactly one cell
+    // per pixel of this render, eight bytes each, and nothing else.
     let second = render(&sweep);
-    let pixels = second.values.len();
+    let pixels = second.image.len() / 4;
     let cells = pixels * CELL_BYTES;
     assert_eq!(
         pooled_bytes(),
@@ -126,31 +126,30 @@ fn the_pools_report_exactly_what_they_park_and_nothing_they_have_lent_out() {
         pooled_bytes()
     );
 
-    // (3) **The value grid's park, through its production door.** The grid
-    // dies in `From<SweepRender> for RenderedFrame`; the level must rise by
-    // exactly the grid's capacity in bytes — capacity, because that is what
-    // the allocator holds whatever the grid's length.
-    let grid_bytes = second.values.capacity() * std::mem::size_of::<f32>();
+    // (3) **The texture's park, through its production door.** A renderer's
+    // own output is always `Bytes`, and the app recycles it after copying.
+    //
+    // A third step stood between these two until 2026-09-08, parking a
+    // `Vec<f32>` value grid through `From<SweepRender> for RenderedFrame`. The
+    // grid was written once per pixel and never read, so it went; the frame
+    // conversion now parks nothing and the level does not move across it.
     let image_bytes = second.image.capacity();
     let frame = RenderedFrame::from(second);
     assert_eq!(
         pooled_bytes(),
-        cells + grid_bytes,
-        "parking the value grid moved the level by {} B, not by its {grid_bytes} B",
+        cells,
+        "the frame conversion moved the level by {} B; it parks nothing",
         pooled_bytes() as isize - cells as isize
     );
-
-    // (4) **The texture's park, through its production door.** A renderer's
-    // own output is always `Bytes`, and the app recycles it after copying.
     let RasterImage::Bytes(texture) = frame.image else {
         panic!("a renderer's own output is `Bytes`; `Pixels` exists only past a wire decode")
     };
     recycle_image(texture);
     assert_eq!(
         pooled_bytes(),
-        cells + grid_bytes + image_bytes,
+        cells + image_bytes,
         "parking the texture moved the level by {} B, not by its {image_bytes} B",
-        pooled_bytes() as isize - (cells + grid_bytes) as isize
+        pooled_bytes() as isize - cells as isize
     );
 
     // (5) **A declined offer leaves the level where it was.** The texture
@@ -166,15 +165,14 @@ fn the_pools_report_exactly_what_they_park_and_nothing_they_have_lent_out() {
     );
 
     // (6) **A take lowers the level by exactly what left.** The third render
-    // takes all three buffers; while it runs they are its, and when it
-    // returns the cells are back in their slot (recycled inside
-    // `into_output`) while the texture and grid are in its output. So the
-    // level fell by exactly the texture and the grid.
+    // takes both buffers; while it runs they are its, and when it returns the
+    // cells are back in their slot (recycled inside `into_output`) while the
+    // texture is in its output. So the level fell by exactly the texture.
     let third = render(&sweep);
     assert_eq!(
         pooled_bytes(),
         cells,
-        "with the texture and grid out with a render the level is {} B, not the {cells} B of \
+        "with the texture out with a render the level is {} B, not the {cells} B of \
          the one buffer (cells) that is parked",
         pooled_bytes()
     );

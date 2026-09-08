@@ -332,11 +332,10 @@ mod demand {
     /// session had already shown, or is it the first of its kind.
     ///
     /// [`RenderBuffers::recycle`](super::RenderBuffers::recycle) does not read
-    /// this; it carries its own render's copy and is exact. This is for the two
-    /// slots whose buffers come back through a public entry point
-    /// ([`super::recycle_image`], [`super::recycle_values`]) — the value grid
-    /// from `frame::RenderedFrame`'s conversion, the texture from the display
-    /// layer — and so arrive with no render to ask. With one raster render in
+    /// this; it carries its own render's copy and is exact. This is for the one
+    /// slot whose buffer comes back through a public entry point
+    /// ([`super::recycle_image`]) — the texture, from the display layer — and
+    /// so arrives with no render to ask. With one raster render in
     /// flight at a time — which is
     /// what `WASM_MAX_CONCURRENT_RENDERS` pins on the web arm — it is that
     /// render's own figure. Where several renders overlap it can be a render or
@@ -396,17 +395,10 @@ pub fn renders_begun() -> usize {
 /// one value grid, in two slots that fill and empty independently.
 static POOLED_IMAGE: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
 
-/// See [`POOLED_IMAGE`], which documents both slots.
-static POOLED_VALUES: std::sync::Mutex<Option<Vec<f32>>> = std::sync::Mutex::new(None);
-
 /// Bytes [`POOLED_IMAGE`] is holding — the parked texture's capacity, zero
 /// while the slot is empty. The same discipline as [`POOLED_CELL_BYTES`]:
 /// stored only under the slot's lock, read without it.
 static POOLED_IMAGE_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-/// Bytes [`POOLED_VALUES`] is holding — the parked grid's capacity at four
-/// bytes a value. See [`POOLED_IMAGE_BYTES`].
-static POOLED_VALUE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// Empty `slot`, recording in `level` that it now holds nothing.
 ///
@@ -433,13 +425,6 @@ fn park_slot<T>(slot: &mut Option<T>, level: &AtomicUsize, buffer: T, bytes: usi
 /// The texture slot, with a poisoned lock read as a live one.
 fn image_pool() -> std::sync::MutexGuard<'static, Option<Vec<u8>>> {
     POOLED_IMAGE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// The value-grid slot. See [`image_pool`].
-fn values_pool() -> std::sync::MutexGuard<'static, Option<Vec<f32>>> {
-    POOLED_VALUES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -473,41 +458,14 @@ fn checkout_image(pixels: usize) -> Vec<u8> {
             image.clear();
             // `resize` reserves through `Vec::reserve`, which is the AMORTISED
             // path: an undersized pooled buffer would be doubled rather than
-            // grown to `len`. The same defect `checkout_values` carries, in the
-            // spelling that hides it — there is no arithmetic here to read as
-            // wrong. Exact first, so `resize` finds the room already there.
+            // grown to `len`. Exact first, so `resize` finds the room already
+            // there.
             image.reserve_exact(len);
             image.resize(len, 0u8);
             image
         }
         None => vec![0u8; len],
     }
-}
-
-/// An empty value grid with room for `pixels` values — the pool's if it has one
-/// the demand behind it accounts for.
-fn checkout_values(pixels: usize) -> Vec<f32> {
-    // See [`checkout_image`] for why this is a `let` and not a receiver, and
-    // for why the misfit is filtered out rather than dropped by a match arm.
-    let taken = take_slot(&mut values_pool(), &POOLED_VALUE_BYTES)
-        .filter(|values| within_slack(values.capacity(), pixels.max(demand::high())));
-    let mut values = taken.unwrap_or_default();
-    values.clear();
-    // **`reserve_exact` counts from `len`, and `len` is zero here.** This read
-    // `reserve_exact(pixels.saturating_sub(values.capacity()))`, which on a
-    // just-cleared buffer asks for capacity `0 + (pixels - capacity)` — a
-    // figure the buffer it was measured against already exceeds, so it
-    // no-opped, and the `extend` in `RenderBuffers::into_output` then grew the
-    // buffer through `Vec`'s AMORTISED path, which takes `max(2 * capacity,
-    // need)`. `within_slack` bounds capacity only from above, so an undersized
-    // pooled buffer always passed the filter and always took that path.
-    //
-    // Measured by heaptrack on a real arm: one live 400,040,000 B allocation
-    // here where the exact need was 216,800,000 B — a pooled 50,005,000-value
-    // buffer at 92.3 % of need, doubled to 100,010,000. 84.5 % over, parked,
-    // and held for the rest of the session.
-    values.reserve_exact(pixels);
-    values
 }
 
 /// Offer a finished RGBA texture back for the next plan-view render to draw
@@ -531,21 +489,11 @@ pub fn recycle_image(image: Vec<u8>) {
     park_slot(&mut image_pool(), &POOLED_IMAGE_BYTES, image, bytes);
 }
 
-/// Offer a finished value grid back. See [`recycle_image`], which this mirrors
-/// exactly.
-pub fn recycle_values(values: Vec<f32>) {
-    if values.capacity() == 0 || !within_slack(values.capacity(), demand::carry()) {
-        return;
-    }
-    let bytes = values.capacity() * std::mem::size_of::<f32>();
-    park_slot(&mut values_pool(), &POOLED_VALUE_BYTES, values, bytes);
-}
-
 /// Bytes the three plan-view slots are holding right now: **capacity**, not
-/// length, and the cells' eight bytes a pixel beside the texture's four and the
-/// value grid's four. Zero for a slot whose buffer is out with a render.
+/// length, and the cells' eight bytes a pixel beside the texture's four. Zero
+/// for a slot whose buffer is out with a render.
 ///
-/// **Three relaxed loads and no lock.** Each slot's figure is maintained
+/// **Two relaxed loads and no lock.** Each slot's figure is maintained
 /// beside it by [`take_slot`] and [`park_slot`] under that slot's own lock
 /// (see [`POOLED_CELL_BYTES`]), so `squallar_egui::heap_census::census()`
 /// reads it — through [`parked_bytes`] — as the `render pools` family
@@ -555,14 +503,12 @@ pub fn recycle_values(values: Vec<f32>) {
 /// equal by construction: no path moves a buffer into or out of a slot
 /// without storing the level in the same critical section.
 pub fn pooled_bytes() -> usize {
-    POOLED_CELL_BYTES.load(Ordering::Relaxed)
-        + POOLED_IMAGE_BYTES.load(Ordering::Relaxed)
-        + POOLED_VALUE_BYTES.load(Ordering::Relaxed)
+    POOLED_CELL_BYTES.load(Ordering::Relaxed) + POOLED_IMAGE_BYTES.load(Ordering::Relaxed)
 }
 
-/// Every render buffer this crate parks between renders, in bytes: the three
+/// Every render buffer this crate parks between renders, in bytes: the two
 /// plan-view slots of [`pooled_bytes`] and the section-plane slot of
-/// [`crate::xsect::pooled_bytes`]. Four relaxed loads; see each for the
+/// [`crate::xsect::pooled_bytes`]. Three relaxed loads; see each for the
 /// discipline that makes them lock-free.
 ///
 /// On the measured scene the plan-view slots alone were 620 MiB — a 7362²
@@ -582,17 +528,16 @@ pub fn parked_bytes() -> usize {
     pooled_bytes() + crate::xsect::pooled_bytes()
 }
 
-/// Whatever [`take_pools`] found in the three plan-view slots, on its way to
+/// Whatever [`take_pools`] found in the two plan-view slots, on its way to
 /// being freed.
 ///
 /// **A carrier and nothing else**: it has no `Drop` of its own, so freeing it
-/// is freeing the three `Vec`s, and the caller decides on which thread that
+/// is freeing the two `Vec`s, and the caller decides on which thread that
 /// happens. Every field is `Send`, which is what lets a caller hand the whole
 /// thing to an offload lane.
 pub struct ParkedBuffers {
     cells: Option<Vec<AtomicU64>>,
     image: Option<Vec<u8>>,
-    values: Option<Vec<f32>>,
 }
 
 impl ParkedBuffers {
@@ -608,10 +553,6 @@ impl ParkedBuffers {
             .as_ref()
             .map_or(0, |c| c.capacity() * std::mem::size_of::<AtomicU64>())
             + self.image.as_ref().map_or(0, Vec::capacity)
-            + self
-                .values
-                .as_ref()
-                .map_or(0, |v| v.capacity() * std::mem::size_of::<f32>())
     }
 }
 
@@ -619,12 +560,13 @@ impl ParkedBuffers {
 /// buffers back to the caller** so the next render allocates for exactly what
 /// it asks for.
 ///
-/// Three takes and three stores, and each slot's lock is held only long enough
+/// Two takes and two stores, and each slot's lock is held only long enough
 /// to move the buffer out — so *this* call is cheap enough for the frame
 /// thread. **Freeing what it answers is not.** Measured on the campaign's
-/// scene, one thread, `std::alloc::System`: the three buffers a 7362 px render
-/// leaves are 867,184,704 B, and dropping them took 18.4–31.7 ms over twelve
-/// samples on an idle box. That is several times a frame at any cadence this
+/// scene, one thread, `std::alloc::System`: the buffers a 7362 px render left
+/// were 867,184,704 B across three slots, and dropping them took 18.4–31.7 ms
+/// over twelve samples on an idle box. The value grid went on 2026-09-08 and
+/// the same two slots are 650,388,528 B. That is several times a frame at any cadence this
 /// application aims at, which is why this function hands them over rather than
 /// dropping them where it stands — a caller on the frame thread owes them to
 /// an offload lane.
@@ -638,13 +580,8 @@ impl ParkedBuffers {
 pub fn take_pools() -> ParkedBuffers {
     let cells = take_slot(&mut RenderBuffers::pool(), &POOLED_CELL_BYTES);
     let image = take_slot(&mut image_pool(), &POOLED_IMAGE_BYTES);
-    let values = take_slot(&mut values_pool(), &POOLED_VALUE_BYTES);
     demand::forget();
-    ParkedBuffers {
-        cells,
-        image,
-        values,
-    }
+    ParkedBuffers { cells, image }
 }
 
 /// [`take_pools`], freeing what it answers on the calling thread.
@@ -707,8 +644,8 @@ impl RenderBuffers {
                 // **`len`, not `capacity`, is the base** — this buffer is not
                 // cleared, so `reserve_exact(additional)` targets
                 // `len + additional`, and that is what makes `n` the result.
-                // Reading `capacity` here would reintroduce the defect
-                // `checkout_values` had.
+                // Reading `capacity` here would ask for room the buffer
+                // already has and leave the amortised path to grow it.
                 cells.reserve_exact(n.saturating_sub(cells.len()));
                 cells.resize_with(n, || AtomicU64::new(Self::EMPTY));
                 cells
@@ -769,14 +706,25 @@ impl RenderBuffers {
     /// vanishes against the palette lookups.
     const COLOR_CHUNK: usize = 16 * 1024;
 
-    /// Split the cells into the RGBA texture and the value grid, give the
-    /// drained buffer back to [`POOLED_CELLS`], and hand back the extent they
-    /// were painted at so that whatever places the picture places it on the
-    /// same ground the gates were projected onto.
+    /// Colour the cells into the RGBA texture, give the drained buffer back to
+    /// [`POOLED_CELLS`], and hand back the extent they were painted at so that
+    /// whatever places the picture places it on the same ground the gates were
+    /// projected onto.
     ///
     /// A carried buffer has to go back to the pool [`Self::EMPTY`] everywhere,
     /// or the next render inherits whatever pixels this one painted that it
-    /// does not.
+    /// does not. The colouring pass drains each cell as it reads it, so the
+    /// drain and the paint are one walk rather than two.
+    ///
+    /// **The cells are coloured in place of a value grid, not through one.**
+    /// Until 2026-09-08 this filled a `Vec<f32>` from the cells, handed the
+    /// cells back, and then coloured the texture from that grid — a third
+    /// full-size buffer at four bytes a pixel, 216,796,176 B at the 7362 px
+    /// desktop side. Nothing downstream ever read it: `RenderedFrame::from`
+    /// recycled it on the spot and a hover reads the [`polar::PolarField`]
+    /// beside it, so the grid existed only to carry values from one loop to
+    /// the next. Reading the cell directly deletes the buffer and the copy
+    /// into it, and drops the pools from sixteen bytes a pixel to twelve.
     fn into_output(self, extent_km: f64) -> SweepRender {
         let Self {
             mut cells,
@@ -785,39 +733,91 @@ impl RenderBuffers {
             product,
         } = self;
         let pixels = cells.len();
-        let mut value_data = checkout_values(pixels);
-        value_data.extend(cells.iter_mut().map(|a| {
-            match std::mem::replace(a.get_mut(), Self::EMPTY) {
-                Self::EMPTY => f32::NAN,
-                cell => f32::from_bits(cell as u32),
-            }
-        }));
-        Self::recycle(cells, carry_ceiling_px);
+        // Before the colouring pass, which drains every cell. See [`claims`];
+        // this changes nothing about what is produced.
+        #[cfg(all(test, not(target_arch = "wasm32")))]
+        claims::note(&cells);
         let mut image = checkout_image(pixels);
         image
             .par_chunks_mut(4 * Self::COLOR_CHUNK)
-            .zip(value_data.par_chunks_mut(Self::COLOR_CHUNK))
-            .for_each(|(px, vals)| {
-                for (px, v) in px.chunks_exact_mut(4).zip(vals) {
+            .zip(cells.par_chunks_mut(Self::COLOR_CHUNK))
+            .for_each(|(px, cells)| {
+                for (px, cell) in px.chunks_exact_mut(4).zip(cells) {
+                    // Drained here, which is what leaves the buffer fit for
+                    // [`Self::recycle`]'s all-`EMPTY` invariant.
+                    let claimed = std::mem::replace(cell.get_mut(), Self::EMPTY);
+                    if claimed == Self::EMPTY {
+                        // Left exactly as `checkout_image` delivered it: zero,
+                        // which is transparent. See that function.
+                        continue;
+                    }
+                    let v = f32::from_bits(claimed as u32);
                     if !v.is_nan() {
-                        let c = get_color_for_value(product, *v);
+                        let c = get_color_for_value(product, v);
                         px.copy_from_slice(&[c.0, c.1, c.2, c.3]);
                     } else if v.to_bits() == RANGE_FOLDED_BITS {
                         let c = crate::palette::RANGE_FOLDED;
                         px.copy_from_slice(&[c.0, c.1, c.2, c.3]);
-                        *v = f32::NAN;
                     }
                 }
             });
+        Self::recycle(cells, carry_ceiling_px);
         SweepRender {
             image,
             max_range_km: extent_km,
-            values: value_data,
             polar: polar.into_field(),
             nyquist_ms: None,
             melting_layer_source: None,
             storm_motion: None,
         }
+    }
+}
+
+/// Which gate claimed each texel, for the one suite that has to ask.
+///
+/// **Pure observation, on the `polar::note_gate_reads` pattern.** Nothing here
+/// is read by [`RenderBuffers::into_output`]; the raster it produces is
+/// identical byte for byte whether or not a test has armed this. It exists
+/// because `write_key` — "which gate owns this pixel" — is the only honest
+/// oracle for gate survival, and it lives in the cells, which are drained and
+/// handed back before the render returns.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) mod claims {
+    use super::{AtomicU64, RenderBuffers};
+
+    thread_local! {
+        /// The keys of the render this thread is watching, or `None` when it
+        /// is watching nothing — which is every render but the armed one.
+        static KEYS: std::cell::RefCell<Option<Vec<u32>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Watch the next render on this thread.
+    pub(crate) fn arm() {
+        KEYS.with(|k| *k.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// The armed render's per-texel keys, and the watch off again.
+    pub(crate) fn take() -> Option<Vec<u32>> {
+        KEYS.with(|k| k.borrow_mut().take())
+    }
+
+    /// Record `cells` if this thread is watching. Called before the colouring
+    /// pass drains them, and a no-op — one thread-local read — otherwise.
+    pub(crate) fn note(cells: &[AtomicU64]) {
+        KEYS.with(|k| {
+            if let Some(keys) = k.borrow_mut().as_mut() {
+                keys.clear();
+                keys.extend(cells.iter().map(|c| {
+                    let held = c.load(std::sync::atomic::Ordering::Relaxed);
+                    if held == RenderBuffers::EMPTY {
+                        0
+                    } else {
+                        (held >> 32) as u32
+                    }
+                }));
+            }
+        });
     }
 }
 
@@ -841,9 +841,6 @@ pub struct SweepRender {
     /// go on the ground, not how far the data reached. See
     /// [`render_with_projection`].
     pub max_range_km: f64,
-    /// Per-pixel values, `f32::NAN` where nothing was painted **and** where a
-    /// range-folded gate was (see [`RANGE_FOLDED_BITS`]).
-    pub values: Vec<f32>,
     /// The gates behind those pixels, at the resolution the radar measured
     /// them, and the geometry to find one under a point.
     pub polar: polar::PolarField,
@@ -2489,3 +2486,6 @@ pub fn render_level3_message_to_image_sized(
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod gate_survival_tests;

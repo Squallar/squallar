@@ -45,6 +45,26 @@ const MIN_SEGMENTS: usize = 5;
 /// Every citation in the workspace that resolves to nothing on purpose, with
 /// the reason it is not a defect.
 const ALLOWED: &[(&str, &str, &str)] = &[
+    // ── Sentences narrating their own deletion ──────────────────────────
+    (
+        "squallar-radar/src/render/tests.rs",
+        "values_round_trip_through_the_cell_unaltered",
+        "Deleted on 2026-09-08 with the `Vec<f32>` value grid it read, which \
+         the plan-view render stopped allocating because nothing downstream \
+         read it. The comment at that line exists to say the test went and \
+         where the property is pinned instead (`render::polar::tests` for the \
+         values a reader actually gets), so the name is the subject of the \
+         sentence rather than a citation of a live guarantee.",
+    ),
+    (
+        "squallar-radar/src/render/tests.rs",
+        "colour_agrees_with_value_at_every_pixel",
+        "Deleted on 2026-09-08, with its Level II and NROT twins. Each pinned \
+         that the RGBA texture and the `f32` value grid described the same \
+         pixel; the grid went, so there is no second description left to \
+         disagree with and the property is unrepresentable rather than \
+         unchecked. The comment naming it is narrating that.",
+    ),
     // ── Instruments that live on `campaign-harness` by policy ───────────
     // ── Names owned by a dependency or an OS ────────────────────────────
     (

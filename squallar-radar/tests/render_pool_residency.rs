@@ -4,10 +4,10 @@
 //! **The defect this pins is retention, not sizing.** A render takes the side
 //! `types::raster_side_px` gives it, and below `BASE_EXTENT_KM` that is
 //! `IMAGE_SIZE` whatever the adapter offers — no render is oversized for its
-//! sweep. What was wrong is what the pools *kept* afterwards. All three slots
-//! are `side²`: eight bytes a pixel of cells, four of texture, four of value
-//! grid. A browser on a real driver resolves the ceiling to 4096 px, so one
-//! long-range sweep reserved 4096² × 16 B = 256 MiB across the three — and kept
+//! sweep. What was wrong is what the pools *kept* afterwards. Both slots
+//! are `side²`: eight bytes a pixel of cells and four of texture. A browser on
+//! a real driver resolves the ceiling to 4096 px, so one long-range sweep
+//! reserved 4096² × 12 B = 192 MiB across the two — and kept
 //! it. The cell guard that was supposed to release it compared `len` against
 //! four times the request, and `4096² = 4 · 2048²` exactly, so on the one
 //! transition it existed for it sat on its own boundary and read "reuse";
@@ -55,11 +55,14 @@ const LARGE: usize = IMAGE_SIZE;
 /// The smaller. What a browser renders its loop frames at.
 const SMALL: usize = 1024;
 
-/// Bytes one pixel of a finished render costs across all three slots: eight for
-/// the cell it was claimed in, four for its RGBA texel, four for its `f32`
-/// value. Every slot has a production death site, and [`render_at`] walks all
-/// of them.
-const SLOT_BYTES_PER_PX: usize = 8 + 4 + 4;
+/// Bytes one pixel of a finished render costs across both slots: eight for the
+/// cell it was claimed in, four for its RGBA texel. Every slot has a production
+/// death site, and [`render_at`] walks both of them.
+///
+/// **Sixteen until 2026-09-08**, when the third slot — a `Vec<f32>` value grid
+/// at four more bytes a pixel — went for being written once per pixel and never
+/// read.
+const SLOT_BYTES_PER_PX: usize = 8 + 4;
 
 /// How much larger than the demand behind it a carried buffer may be. Stated
 /// here rather than imported because the claim is about bytes reserved, not
@@ -108,8 +111,8 @@ fn packet() -> RadialPacket {
 /// `squallar_app`'s `render_dispatch::rendered_image_from` and
 /// `app_fetch::handle_jump_to_live`, both on the `Bytes` arm, which is the arm a
 /// renderer's own output always takes — `Pixels` exists only past a wire decode.
-/// A version of this file that skipped them would exercise one slot of three and
-/// read green while two thirds of the reservation stayed resident.
+/// A version of this file that skipped them would exercise one slot of two and
+/// read green while half of the reservation stayed resident.
 fn render_at(p: &RadialPacket, side: usize) -> usize {
     let out = render_level3_radial_to_image(p, PRODUCT, LAT, LON, SCALE, OFFSET, None, side)
         .expect("the packet renders");
@@ -119,13 +122,7 @@ fn render_at(p: &RadialPacket, side: usize) -> usize {
         "a render asked for {side}² px came back with a texture of {} bytes",
         out.image.len()
     );
-    assert_eq!(
-        out.values.len(),
-        side * side,
-        "a render asked for {side}² px came back with {} values",
-        out.values.len()
-    );
-    let painted = out.values.iter().filter(|v| !v.is_nan()).count();
+    let painted = out.image.chunks_exact(4).filter(|px| px[3] != 0).count();
     let frame = RenderedFrame::from(out);
     match frame.image {
         RasterImage::Bytes(bytes) => recycle_image(bytes),
@@ -152,7 +149,7 @@ fn the_pools_reserve_for_the_demand_the_session_showed_and_not_for_the_ceiling()
     assert_eq!(
         pooled_bytes(),
         0,
-        "the process's first render left {} bytes reserved across the three slots; a \
+        "the process's first render left {} bytes reserved across the two slots; a \
          size this session has seen exactly once has shown no demand to reserve against",
         pooled_bytes()
     );
@@ -163,7 +160,7 @@ fn the_pools_reserve_for_the_demand_the_session_showed_and_not_for_the_ceiling()
     assert_eq!(
         pooled_bytes(),
         LARGE * LARGE * SLOT_BYTES_PER_PX,
-        "a size rendered twice left {} bytes reserved rather than the {} its three slots \
+        "a size rendered twice left {} bytes reserved rather than the {} its two slots \
          cost, so the pools are not carrying what the session keeps asking for",
         pooled_bytes(),
         LARGE * LARGE * SLOT_BYTES_PER_PX

@@ -107,17 +107,13 @@ fn assert_same_frame(left: &SweepRender, right: &SweepRender, what: &str) {
         left.nyquist_ms, right.nyquist_ms,
         "{what}: declared Nyquist differs"
     );
-    assert_eq!(
-        left.values.len(),
-        right.values.len(),
-        "{what}: value grid length differs"
+    // The gate values behind the picture, whole — geometry and samples both.
+    // `assert!` rather than `assert_eq!`: these are megabytes, and the question
+    // is whether they differ, not how.
+    assert!(
+        left.polar.to_bytes() == right.polar.to_bytes(),
+        "{what}: the polar field behind the picture differs"
     );
-    for (i, (a, b)) in left.values.iter().zip(&right.values).enumerate() {
-        assert!(
-            a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()),
-            "{what}: value {i} differs: {a} vs {b}"
-        );
-    }
 }
 
 fn painted(frame: &SweepRender) -> usize {

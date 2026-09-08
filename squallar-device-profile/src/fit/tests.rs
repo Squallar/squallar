@@ -85,13 +85,15 @@ fn every_term_is_the_cost_function_it_reuses() {
         256 * MIB,
         "8192^2 x 4 B of Rgba8 texture on the desktop class"
     );
-    // The other side of the same render, on the other memory: the raster and
-    // its value grid with the claim buffer that painted them still alive.
-    // 8192^2 x (4 + 4 + 8) B, and the only term of the two the GPU never sees.
+    // The other side of the same render, on the other memory: the raster with
+    // the claim buffer that painted it still alive. 8192^2 x (4 + 8) B, and
+    // the only term of the two the GPU never sees. It was 16 B a pixel until
+    // 2026-09-08, when the value grid between them went for being written once
+    // a pixel and never read.
     assert_eq!(
         plan.render_peak_host,
-        1024 * MIB,
-        "8192^2 x 16 B of host at the instant the render runs"
+        768 * MIB,
+        "8192^2 x 12 B of host at the instant the render runs"
     );
     assert_eq!(
         plan.total().host_bytes,
@@ -2087,7 +2089,9 @@ fn the_huge_leg_fits_at_no_host_rung_and_the_one_picture_undercount_fitted() {
     // one below is the whole defect, and neither the allowance nor the tile
     // term is in it.
     let undercounted = need(&still(1), &top, stand_in_grid_bytes).host_bytes;
-    assert_eq!(undercounted, 558_456_052);
+    // 558,456,052 until 2026-09-08; the 16,777,216 B difference is this pane's
+    // 2048^2 value grid, which the render no longer allocates.
+    assert_eq!(undercounted, 541_678_836);
     assert_eq!(
         over(&still(1), &top, &presumed, stand_in_grid_bytes),
         (false, false),
@@ -2107,13 +2111,14 @@ fn the_huge_leg_fits_at_no_host_rung_and_the_one_picture_undercount_fitted() {
     // The volume the still it is showing was decoded from — the term the
     // radar-loop arm does not reach, because this pane runs no radar loop.
     assert_eq!(at_top.still_scans_host, LOOP_SCAN_RESERVE_BYTES);
-    // The web bracket's whole 2048^2 raster with its value grid and its claim
-    // buffer, all three alive together at the instant the render runs.
+    // The web bracket's whole 2048^2 raster with the claim buffer that painted
+    // it, both alive together at the instant the render runs. It was sixteen
+    // bytes a pixel until 2026-09-08, when the value grid between them went.
     assert_eq!(
         at_top.render_peak_host,
         top.static_frame_cost().host_peak() as u64
     );
-    assert_eq!(at_top.render_peak_host, 2048 * 2048 * 16);
+    assert_eq!(at_top.render_peak_host, 2048 * 2048 * 12);
     // Every host term of the shape, summed here rather than re-typed as one
     // literal, so a term that moves names itself.
     assert_eq!(
@@ -2125,7 +2130,10 @@ fn the_huge_leg_fits_at_no_host_rung_and_the_one_picture_undercount_fitted() {
             + at_top.still_scans_host
             + at_top.render_peak_host,
     );
-    assert_eq!(at_top.total().host_bytes, 1_559_723_764);
+    // 1,559,723,764 until 2026-09-08; the 16,777,216 B difference is the
+    // 2048^2 value grid this render no longer allocates, and it arrives here
+    // through `render_peak_host` in the sum above.
+    assert_eq!(at_top.total().host_bytes, 1_542_946_548);
     assert_eq!(
         over(&scene, &top, &presumed, stand_in_grid_bytes),
         (false, true)
@@ -2146,10 +2154,14 @@ fn the_huge_leg_fits_at_no_host_rung_and_the_one_picture_undercount_fitted() {
     let at_floor = need_terms(&scene, &fitted, stand_in_grid_bytes);
     assert_eq!(at_floor.pictures_host, 13 * 18_545_832);
     assert_eq!(at_floor.upload_pending_host, at_floor.pictures_host);
-    assert_eq!(at_floor.total().host_bytes, 934_035_052);
+    // 934,035,052 until 2026-09-08, less the 16,777,216 B of value grid the
+    // render no longer allocates. It is still over — the ladder still runs out
+    // with the shape above the allowance — so the ruling this test records is
+    // unchanged and only the margin moved.
+    assert_eq!(at_floor.total().host_bytes, 917_257_836);
     assert_eq!(
         at_floor.total().host_bytes - presumed.host_allowance().unwrap(),
-        128_728_684,
+        111_951_468,
         "what the still shape is over by once the ladder has nothing left",
     );
     assert_eq!(
@@ -2183,7 +2195,7 @@ fn the_huge_leg_fits_at_no_host_rung_and_the_one_picture_undercount_fitted() {
 
     // **The same scene, the same host, the desktop bracket: further, and
     // still over.** Its render peak is 8192^2 x 16 B against the web's
-    // 2048^2 x 16 B, so the raster rung is a host lever there and is taken.
+    // 2048^2 x 12 B, so the raster rung is a host lever there and is taken.
     let desktop = DeviceProfile {
         class: DeviceClass::Discrete,
         vram_bytes: Some(24 << 30),
@@ -2195,8 +2207,9 @@ fn the_huge_leg_fits_at_no_host_rung_and_the_one_picture_undercount_fitted() {
     assert_eq!(measured.host_allowance(), Some(805_306_368));
     assert_eq!(
         resolve(&desktop).static_frame_cost().host_peak(),
-        8192 * 8192 * 16,
-        "1.00 GiB, sixteen times the web bracket's peak",
+        8192 * 8192 * 12,
+        "0.75 GiB, still sixteen times the web bracket's peak - both fell by \
+         the same quarter when the value grid left the render",
     );
     let on_desktop = fit(&scene, &desktop, &measured, stand_in_grid_bytes);
     assert_eq!(on_desktop.overlay_oversample_percent, 100);
@@ -2258,7 +2271,10 @@ fn the_huge_leg_fits_at_no_host_rung_and_the_one_picture_undercount_fitted() {
         at_top.total().host_bytes - at_top.still_scans_host + playing.loop_scans_host,
         "on the host the loop swaps the parked still for its own volumes",
     );
-    assert_eq!(playing.total().host_bytes, 2_291_294_269);
+    // 2,291,294,269 until 2026-09-08, less this render's 2048^2 value grid.
+    // The relation above it is what checks the figure; this literal only
+    // records where the relation lands.
+    assert_eq!(playing.total().host_bytes, 2_274_517_053);
     assert_eq!(
         playing.total().gpu_bytes,
         at_top.total().gpu_bytes + playing.loops,
@@ -2301,7 +2317,8 @@ fn the_huge_leg_fits_at_no_host_rung_and_the_one_picture_undercount_fitted() {
         pending.loop_scans_host - playing.loop_scans_host,
         358_948_535
     );
-    assert_eq!(pending.total().host_bytes, 2_650_242_804);
+    // 2,650,242,804 until 2026-09-08, less this render's 2048^2 value grid.
+    assert_eq!(pending.total().host_bytes, 2_633_465_588);
 
     let leg_fitted = fit(&leg, &wasm, &presumed, stand_in_grid_bytes);
     assert_eq!(leg_fitted.overlay_oversample_percent, 100);
@@ -2315,9 +2332,11 @@ fn the_huge_leg_fits_at_no_host_rung_and_the_one_picture_undercount_fitted() {
         need(&leg, &leg_fitted, stand_in_grid_bytes).host_bytes,
         at_floor.total().host_bytes - at_floor.still_scans_host + playing.loop_scans_host,
     );
+    // 1,665,605,557 until 2026-09-08, less this render's 2048^2 value grid.
+    // The relation above is the check; this records where it lands.
     assert_eq!(
         need(&leg, &leg_fitted, stand_in_grid_bytes).host_bytes,
-        1_665_605_557
+        1_648_828_341
     );
     assert_eq!(
         over(&leg, &leg_fitted, &presumed, stand_in_grid_bytes),
@@ -2404,7 +2423,8 @@ fn the_huge_leg_fits_at_no_host_rung_and_the_one_picture_undercount_fitted() {
         at_top.total().host_bytes - at_top.still_scans_host,
         "the still shape without the volume it was parked at",
     );
-    assert_eq!(l3_terms.total().host_bytes, 1_475_837_684);
+    // 1,475,837,684 until 2026-09-08, less this render's 2048^2 value grid.
+    assert_eq!(l3_terms.total().host_bytes, 1_459_060_468);
     assert_eq!(
         l3_terms.total().gpu_bytes,
         playing.total().gpu_bytes,
@@ -2414,7 +2434,8 @@ fn the_huge_leg_fits_at_no_host_rung_and_the_one_picture_undercount_fitted() {
     assert_eq!(l3_fitted.overlay_oversample_percent, 100);
     assert!(l3_fitted.tile_whole_zoom);
     let l3_at_floor = need(&l3, &l3_fitted, stand_in_grid_bytes).host_bytes;
-    assert_eq!(l3_at_floor, 850_148_972);
+    // 850,148,972 until 2026-09-08, less this render's 2048^2 value grid.
+    assert_eq!(l3_at_floor, 833_371_756);
     assert_eq!(
         over(&l3, &l3_fitted, &presumed, stand_in_grid_bytes),
         (false, true),
@@ -2423,7 +2444,7 @@ fn the_huge_leg_fits_at_no_host_rung_and_the_one_picture_undercount_fitted() {
     );
     assert_eq!(
         l3_at_floor - presumed.host_allowance().unwrap(),
-        44_842_604,
+        28_065_388,
         "what the Level III leg is over by at every host rung",
     );
     // Priced as it was before the upload term, this shape fitted with room —
@@ -2440,8 +2461,9 @@ fn the_huge_leg_fits_at_no_host_rung_and_the_one_picture_undercount_fitted() {
     assert_eq!(
         need(&leg, &leg_fitted, stand_in_grid_bytes).host_bytes
             - presumed.host_allowance().unwrap(),
-        860_299_189,
-        "what the Level II leg is over by at every host rung — 608,640,949 B \
+        843_521_973,
+        "what the Level II leg is over by at every host rung — 860,299,189 B \
+         until the value grid left the render on 2026-09-08, and 608,640,949 B \
          until ruling 13 stopped cutting the pane's two-hour lookback to the \
          bracket's forty-five minutes, which is three more frames at the \
          reserve",
@@ -2860,7 +2882,7 @@ fn the_render_peak_sheds_a_scene_that_owed_it_and_leaves_one_with_room_alone() {
     let top = resolve(&profile);
     let scene = scene_of(vec![plan_pane(HD, false, TWO_HOURS, None)]);
     let terms = need_terms(&scene, &top, stand_in_grid_bytes);
-    assert_eq!(terms.render_peak_host, 1024 * MIB, "8192^2 x 16 B");
+    assert_eq!(terms.render_peak_host, 768 * MIB, "8192^2 x 12 B");
     assert_eq!(terms.total().gpu_bytes, 256 * MIB, "8192^2 x 4 B");
     assert_eq!(
         terms.still_scans_host, LOOP_SCAN_RESERVE_BYTES,
@@ -3617,11 +3639,20 @@ fn the_render_cache_cap_prices_a_converted_raster_and_not_a_render() {
             "{}: entries times one converted raster",
             limits.name,
         );
-        // Four bytes a pixel, not the eight of `host_held`: the render's value
-        // grid went back to `squallar_radar::render`'s slot before the entry
-        // existed, so an entry is half what the render allocated.
+        // **These were a factor of two apart, and the factor was the value
+        // grid.** `host_held` priced the render's RGBA *and* a `Vec<f32>` of
+        // the same pixel count, so an entry was half what a render allocated.
+        // The grid went on 2026-09-08 — written once a pixel, never read — and
+        // a render now holds its raster and nothing else, so the two agree.
+        //
+        // **This pair therefore no longer tells the two prices apart by
+        // value**, and that is worth stating rather than leaving as a passing
+        // line: a cap wrongly spelled `host_held` would read the same as one
+        // spelled `converted_raster_bytes` today. What still discriminates is
+        // `squallar_app`'s `the_budget_and_the_price_are_one_expression`, and
+        // the reachability half of the test below.
         assert_eq!(
-            crate::constants::converted_raster_bytes(b.long_range_image_side_px) * 2,
+            crate::constants::converted_raster_bytes(b.long_range_image_side_px),
             crate::constants::plan_view_frame_cost(b.long_range_image_side_px).host_held,
             "{}",
             limits.name,
@@ -3629,24 +3660,33 @@ fn the_render_cache_cap_prices_a_converted_raster_and_not_a_render() {
     }
 }
 
-/// **The re-priced render cache cap is exactly half the one it replaces, on
-/// every bracket, and its byte bound is reachable wherever the bracket leaves
-/// room for one.**
+/// **The render cache cap prices the entry and not the render, on every
+/// bracket, and its byte bound is reachable wherever the bracket leaves room
+/// for one.**
 ///
-/// The re-pricing is exactly a halving — the same side at four bytes a pixel
-/// instead of eight — so it is spelled as that relation rather than as a
-/// table of literals. The second half is the guard against re-introducing the
-/// defect this fix removes: a cap at or above `entries x` the largest entry
-/// an arm can build is an entry count wearing a byte cap's name.
+/// This test was `..._is_half_what_it_was_...` and asserted a factor of two:
+/// the cap had been priced at `entries x host_held` and was corrected to the
+/// same side at the entry's own four bytes a pixel, which halved it. **The
+/// factor was the value grid.** `host_held` carried a `Vec<f32>` of the same
+/// pixel count beside the RGBA until 2026-09-08, when it went for being
+/// written once a pixel and never read, and the two prices have been equal
+/// since. The relation is spelled as it now stands rather than as a halving
+/// that no longer happens; the history is here so the change reads as the
+/// grid going rather than as a guard being loosened.
+///
+/// The second half is the guard against re-introducing the defect the
+/// original fix removed, and it is untouched by any of that: a cap at or
+/// above `entries x` the largest entry an arm can build is an entry count
+/// wearing a byte cap's name.
 #[test]
-fn the_render_cache_cap_is_half_what_it_was_and_stays_reachable() {
+fn the_render_cache_cap_prices_the_entry_and_stays_reachable() {
     for limits in BudgetLimits::SHIPPED {
         let b = resolve(&shipped_profile(limits));
-        let was = b.render_cache_entries
+        let a_render_holds = b.render_cache_entries
             * crate::constants::plan_view_frame_cost(b.long_range_image_side_px).host_held;
         assert_eq!(
-            b.render_cache_budget_bytes() * 2,
-            was,
+            b.render_cache_budget_bytes(),
+            a_render_holds,
             "{}: the same side, the object's true four bytes a pixel",
             limits.name,
         );

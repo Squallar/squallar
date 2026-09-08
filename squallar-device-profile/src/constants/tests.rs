@@ -1141,19 +1141,23 @@ fn the_desktop_raster_ceiling_is_the_widest_sweeps_own_need_and_no_panes() {
 /// Every row is the class's own `raster_side_ceiling_px`, which is what
 /// `Budgets::static_frame_cost` prices a still pane at. The two columns are
 /// two memories and are never summed across the boundary: the GPU one is the
-/// `Rgba8` texture, the host one is the raster, the value grid and the claim
-/// buffer that painted them, all three alive together inside
-/// `RenderBuffers::into_output`.
+/// `Rgba8` texture, the host one is the raster and the claim buffer that
+/// painted it, both alive together inside `RenderBuffers::into_output`.
 ///
 /// | arm | ceiling | GPU | host peak |
 /// |---|---:|---:|---:|
-/// | wasm32 | 2048 | 16.00 MiB | 64.00 MiB |
-/// | mobile | 4096 | 64.00 MiB | 256.00 MiB |
-/// | desktop | 8192 | 256.00 MiB | 1024.00 MiB |
+/// | wasm32 | 2048 | 16.00 MiB | 48.00 MiB |
+/// | mobile | 4096 | 64.00 MiB | 192.00 MiB |
+/// | desktop | 8192 | 256.00 MiB | 768.00 MiB |
+///
+/// **The host peaks fell by a quarter on 2026-09-08** — they were 64, 256 and
+/// 1024 MiB — when the `Vec<f32>` value grid was removed from the plan-view
+/// render. It was written once per pixel and never read; the figures moved
+/// because the buffer did.
 ///
 /// The **promoted** web rung is the mobile row: a browser on a real driver
 /// earns 4096 (`WASM_RASTER_SIDE_CEILING_PROMOTED`), so its render peak is
-/// 256.00 MiB and not 64.00 MiB, and the two web figures are never merged.
+/// 192.00 MiB and not 48.00 MiB, and the two web figures are never merged.
 ///
 /// A **loop** frame is a different denominator again and is never the static
 /// one: `LOOP_IMAGE_SIZE` is 1024 on the web and `NATIVE_IMAGE_SIZE` = 2048 on
@@ -1163,9 +1167,9 @@ fn the_desktop_raster_ceiling_is_the_widest_sweeps_own_need_and_no_panes() {
 fn what_a_plan_view_render_costs_on_each_arm_buffer_by_buffer() {
     const MIB: usize = 1024 * 1024;
     let expected = [
-        ("wasm32", 2048, 16 * MIB, 64 * MIB),
-        ("mobile", 4096, 64 * MIB, 256 * MIB),
-        ("desktop", 8192, 256 * MIB, 1024 * MIB),
+        ("wasm32", 2048, 16 * MIB, 48 * MIB),
+        ("mobile", 4096, 64 * MIB, 192 * MIB),
+        ("desktop", 8192, 256 * MIB, 768 * MIB),
     ];
     for (arm, (name, side, gpu, host_peak)) in arms().into_iter().zip(expected) {
         assert_eq!(arm.name, name);
@@ -1180,26 +1184,27 @@ fn what_a_plan_view_render_costs_on_each_arm_buffer_by_buffer() {
         assert_eq!(cost.host_peak(), host_peak, "{name} host peak");
         // The composition, term by term, against the buffers themselves. Not
         // one multiplier restated: each term is its own allocation's width,
-        // and the held pair is what survives the render.
+        // and the held term is what survives the render.
         let px = side * side;
         assert_eq!(cost.gpu, px * PLAN_VIEW_TEXEL_BYTES);
-        assert_eq!(
-            cost.host_held,
-            px * (PLAN_VIEW_TEXEL_BYTES + PLAN_VIEW_VALUE_BYTES),
-        );
+        assert_eq!(cost.host_held, px * PLAN_VIEW_TEXEL_BYTES);
         assert_eq!(cost.host_scratch, px * PLAN_VIEW_CELL_BYTES);
         assert_eq!(cost.host_held, raster_bytes(side), "the held half");
         // The scratch is not a rounding on the held bytes: the claim buffer
-        // is eight bytes a pixel against the finished pair's eight, so the
-        // peak is twice what is kept and four times the texture.
-        assert_eq!(cost.host_peak(), 4 * cost.gpu);
-        assert_eq!(cost.host_peak(), 2 * cost.host_held);
+        // is eight bytes a pixel against the finished raster's four, so the
+        // peak is three times what is kept. **Held and GPU are now the same
+        // number** — the raster is all the render keeps — so the two lines
+        // below say the same thing about two different memories, and both are
+        // written out because that coincidence is a fact about today's
+        // buffers rather than a rule.
+        assert_eq!(cost.host_peak(), 3 * cost.gpu);
+        assert_eq!(cost.host_peak(), 3 * cost.host_held);
     }
 
     // The promoted web rung is the mobile row, and the loop frame is neither.
     assert_eq!(
         plan_view_frame_cost(WASM_RASTER_SIDE_CEILING_PROMOTED).host_peak(),
-        256 * MIB,
+        192 * MIB,
     );
     assert_eq!(plan_view_frame_cost(WASM_LOOP_IMAGE_SIZE).gpu, 4 * MIB);
     assert_eq!(plan_view_frame_cost(DESKTOP_LOOP_IMAGE_SIZE).gpu, 16 * MIB);
@@ -1218,7 +1223,7 @@ fn a_cross_section_frame_is_priced_from_its_own_three_buffers() {
         assert_eq!(cost.gpu, px * PLAN_VIEW_TEXEL_BYTES, "{}", arm.name);
         assert_eq!(
             cost.host_held,
-            px * (PLAN_VIEW_TEXEL_BYTES + PLAN_VIEW_VALUE_BYTES + SECTION_STATUS_BYTES),
+            px * (PLAN_VIEW_TEXEL_BYTES + SECTION_VALUE_BYTES + SECTION_STATUS_BYTES),
             "{}: image, values and status",
             arm.name,
         );
@@ -1499,9 +1504,14 @@ fn a_polar_frame_is_priced_from_its_own_buffers() {
 /// | | raster @ 7362 | polar, one tilt | ratio |
 /// |---|---:|---:|---:|
 /// | GPU | 216,796,176 | 1,758,832 | 123× |
-/// | host held (still) | 433,592,352 | 1,319,040 | 329× |
+/// | host held (still) | 216,796,176 | 1,319,040 | 164× |
 /// | host scratch | 433,592,352 | 439,792 | 986× |
-/// | **host peak** | **867,184,704** | **1,758,832** | **493×** |
+/// | **host peak** | **650,388,528** | **1,758,832** | **369×** |
+///
+/// The held row and the peak fell on 2026-09-08, when the `Vec<f32>` value
+/// grid came out of the plan-view render for being written once a pixel and
+/// never read. The peak ratio was **493×** against a raster peak of
+/// 867,184,704 B; the polar column is untouched.
 ///
 /// The design's §6.1 table quotes the ratio against side 2048 (0.105× GPU),
 /// which is the right comparison for a loop frame and the wrong one for the
@@ -1525,10 +1535,14 @@ fn what_a_polar_frame_costs_against_the_raster_it_replaces() {
 
     let raster = plan_view_frame_cost(side);
     assert_eq!(raster.gpu, 216_796_176);
-    assert_eq!(raster.host_held, 433_592_352);
+    // Held was 433,592,352 and the peak 867,184,704 (827 MiB) until
+    // 2026-09-08, when the `Vec<f32>` value grid came out of the plan-view
+    // render for being written once a pixel and never read. Held is the
+    // raster alone now; the scratch claim buffer is untouched at eight bytes.
+    assert_eq!(raster.host_held, 216_796_176);
     assert_eq!(raster.host_scratch, 433_592_352);
-    assert_eq!(raster.host_peak(), 867_184_704);
-    assert_eq!(raster.host_peak() / (1024 * 1024), 827);
+    assert_eq!(raster.host_peak(), 650_388_528);
+    assert_eq!(raster.host_peak() / (1024 * 1024), 620);
 
     let levels = full_mip_levels(SURVEILLANCE.0, SURVEILLANCE.1);
     let polar = polar_frame_cost(shape(SURVEILLANCE, levels, true));
@@ -1538,16 +1552,18 @@ fn what_a_polar_frame_costs_against_the_raster_it_replaces() {
     assert_eq!(polar.host_peak(), 1_758_832);
 
     // The ratio, integer-floored so it cannot be read as more precise than it
-    // is. 493x is the number the admission door must never be wrong about.
-    assert_eq!(raster.host_peak() / polar.host_peak(), 493);
+    // is. 369x is the number the admission door must never be wrong about; it
+    // was 493x until the value grid left the raster on 2026-09-08.
+    assert_eq!(raster.host_peak() / polar.host_peak(), 369);
     assert_eq!(raster.gpu / polar.gpu, 123);
 
     // And against the design's own denominator, so both readings are on the
     // record and neither can be quoted as the other. §6.1's table is side 2048.
     let at_2048 = plan_view_frame_cost(2048);
     assert_eq!(at_2048.gpu, 16_777_216);
-    assert_eq!(at_2048.host_peak(), 67_108_864);
-    assert_eq!(at_2048.host_peak() / polar.host_peak(), 38);
+    // 67,108,864 and 38x until the value grid left the render on 2026-09-08.
+    assert_eq!(at_2048.host_peak(), 50_331_648);
+    assert_eq!(at_2048.host_peak() / polar.host_peak(), 28);
 
     // The Doppler figure, which shares no denominator with either of the above.
     let doppler = polar_frame_cost(shape(DOPPLER, full_mip_levels(DOPPLER.0, DOPPLER.1), true));
@@ -1640,9 +1656,9 @@ fn the_caps_bound_the_arithmetic_and_the_observed_shapes_sit_inside_them() {
 /// **Nothing in this workspace calls the polar price outside its own tests.**
 ///
 /// The safety constraint this seam lands under: `polar_frame_cost` prices
-/// ~493x below what the renderer actually allocates today, so a call site on
+/// ~369x below what the renderer actually allocates today, so a call site on
 /// any path reaching `crate::fit::NeedTerms` would have the admission door
-/// admit a scene costing ~493x its price. The switch must be keyed on what the
+/// admit a scene costing ~369x its price. The switch must be keyed on what the
 /// renderer produced for that frame — never a build flag, never a feature gate.
 ///
 /// A source scrape, because that is the only instrument that can see a call
@@ -1700,9 +1716,9 @@ fn nothing_selects_the_polar_price_yet() {
     assert!(
         offenders.is_empty(),
         "polar_frame_cost is selected outside its own module: {offenders:?}. It \
-         prices ~493x below what the renderer allocates today; a call site on \
+         prices ~369x below what the renderer allocates today; a call site on \
          any path that reaches NeedTerms makes the admission door admit a \
-         scene at ~1/493 of its real cost. The switch is keyed on what the \
+         scene at ~1/369 of its real cost. The switch is keyed on what the \
          renderer PRODUCED for the frame, never on a flag.",
     );
 

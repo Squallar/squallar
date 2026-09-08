@@ -2,7 +2,7 @@
 //! nothing to lend.
 
 use nexrad_level3::model::{RadialPacket, RadialRun};
-use squallar_radar::render::{recycle_image, recycle_values, render_level3_radial_to_image};
+use squallar_radar::render::{recycle_image, render_level3_radial_to_image};
 use squallar_radar::types::RadarProduct;
 
 const LAT: f64 = 35.3333;
@@ -25,7 +25,7 @@ const BINS: usize = 920;
 /// memory for no more certainty.
 const SIDE: usize = 1024;
 
-/// Elements in the value grid, and pixels in the texture.
+/// Pixels in the texture.
 const PIXELS: usize = SIDE * SIDE;
 
 /// Bytes in the texture: RGBA.
@@ -33,9 +33,6 @@ const TEXTURE_LEN: usize = PIXELS * 4;
 
 /// The slack that makes an offered buffer recognisable when it comes back.
 const MARK: usize = 1 << 20;
-
-/// The same in `f32` elements.
-const MARK_VALUES: usize = MARK / 4;
 
 /// A full sweep that paints, so every render below succeeds and produces a
 /// raster of the full `SIDE`. What it paints does not matter here — this file
@@ -67,8 +64,8 @@ fn packet() -> RadialPacket {
     }
 }
 
-/// One render at [`SIDE`], answering with what its two buffers had room for.
-fn render_capacities(p: &RadialPacket) -> (usize, usize) {
+/// One render at [`SIDE`], answering with what its texture had room for.
+fn render_capacities(p: &RadialPacket) -> usize {
     let out = render_level3_radial_to_image(p, PRODUCT, LAT, LON, SCALE, OFFSET, None, SIDE)
         .expect("the packet renders");
     assert_eq!(
@@ -76,12 +73,7 @@ fn render_capacities(p: &RadialPacket) -> (usize, usize) {
         TEXTURE_LEN,
         "the render did not take the side this file is written for"
     );
-    assert_eq!(
-        out.values.len(),
-        PIXELS,
-        "the render did not take the side this file is written for"
-    );
-    (out.image.capacity(), out.values.capacity())
+    out.image.capacity()
 }
 
 #[test]
@@ -89,7 +81,7 @@ fn a_slot_holds_one_buffer_hands_it_over_and_declines_an_empty_one() {
     let sweep = packet();
 
     // The process's first render.
-    let (fresh_image, fresh_values) = render_capacities(&sweep);
+    let fresh_image = render_capacities(&sweep);
 
     // **A second render before the first offer, and it is load-bearing.** The
     // slots weigh an offer against the demand the session showed *before* the
@@ -101,64 +93,41 @@ fn a_slot_holds_one_buffer_hands_it_over_and_declines_an_empty_one() {
     // takes the process to the point where it may.
     render_capacities(&sweep);
     assert!(
-        fresh_image < TEXTURE_LEN + MARK && fresh_values < PIXELS + MARK_VALUES,
-        "a render that allocated for itself came back with {fresh_image} bytes and \
-         {fresh_values} values of room against a raster of {TEXTURE_LEN} and {PIXELS} — which \
-         is more slack than this file's MARK, so nothing below can tell a pooled buffer from a \
-         fresh one"
+        fresh_image < TEXTURE_LEN + MARK,
+        "a render that allocated for itself came back with {fresh_image} bytes of room against \
+         a raster of {TEXTURE_LEN} — which is more slack than this file's MARK, so nothing \
+         below can tell a pooled buffer from a fresh one"
     );
 
     // (1) An offer to an empty slot is what the next render draws into.
     recycle_image(Vec::with_capacity(TEXTURE_LEN + MARK));
-    recycle_values(Vec::with_capacity(PIXELS + MARK_VALUES));
-    let (image, values) = render_capacities(&sweep);
+    let image = render_capacities(&sweep);
     assert!(
         image >= TEXTURE_LEN + MARK,
         "the texture slot was offered a buffer with {} bytes of room and the next render came \
          back with {image}, so it did not draw into the offered buffer",
         TEXTURE_LEN + MARK
     );
-    assert!(
-        values >= PIXELS + MARK_VALUES,
-        "the grid slot was offered a buffer with {} values of room and the next render came \
-         back with {values}, so it did not fill the offered buffer",
-        PIXELS + MARK_VALUES
-    );
 
     // (2) A second offer is dropped rather than displacing the first.
     recycle_image(Vec::with_capacity(TEXTURE_LEN));
     recycle_image(Vec::with_capacity(TEXTURE_LEN + MARK));
-    recycle_values(Vec::with_capacity(PIXELS));
-    recycle_values(Vec::with_capacity(PIXELS + MARK_VALUES));
-    let (image, values) = render_capacities(&sweep);
+    let image = render_capacities(&sweep);
     assert!(
         image < TEXTURE_LEN + MARK,
         "the second texture offered displaced the first instead of being dropped: the render \
          came back with {image} bytes of room, which is the second buffer's"
     );
-    assert!(
-        values < PIXELS + MARK_VALUES,
-        "the second grid offered displaced the first instead of being dropped: the render came \
-         back with {values} values of room, which is the second buffer's"
-    );
 
     // (3) A buffer with no capacity is declined.
     recycle_image(Vec::new());
-    recycle_values(Vec::new());
     recycle_image(Vec::with_capacity(TEXTURE_LEN + MARK));
-    recycle_values(Vec::with_capacity(PIXELS + MARK_VALUES));
-    let (image, values) = render_capacities(&sweep);
+    let image = render_capacities(&sweep);
     assert!(
         image >= TEXTURE_LEN + MARK,
         "a texture with no capacity took the slot: the render after it came back with {image} \
          bytes of room rather than the {} it was offered, so the empty was holding the slot \
          while the next render had to allocate anyway",
         TEXTURE_LEN + MARK
-    );
-    assert!(
-        values >= PIXELS + MARK_VALUES,
-        "a grid with no capacity took the slot: the render after it came back with {values} \
-         values of room rather than the {} it was offered",
-        PIXELS + MARK_VALUES
     );
 }
