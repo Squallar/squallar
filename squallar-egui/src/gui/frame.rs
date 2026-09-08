@@ -85,6 +85,29 @@ impl Gui {
             crate::tile_mesh::ledger::totals().mesh_resident_bytes,
         );
 
+        // **The glyph atlas, the one host texture no family named.** epaint
+        // holds it for the life of the `Context`, `min(max_texture_side,
+        // 16384)` wide, doubling its height on demand and evicting nothing;
+        // `TextureAtlas::max_height` is the width, so it can reach the width
+        // squared before `Fonts::begin_pass` recycles it. Until this line
+        // every byte of it landed in the census residual, and `gpu textures`
+        // named only the device copy.
+        //
+        // Published from here for the reason the overlay families above are:
+        // the `Context` is the UI layer's, and reaching across for it would
+        // grow the app layer's coupling for a counter.
+        //
+        // One `Context::fonts` per frame. That is a write lock on the
+        // context, and it is the same lock `walkers::AtlasStamp::read`
+        // already takes once per pane per frame from `paint_labels`; this
+        // adds one more of it, before anything paints, where nothing is
+        // contending for it. No walk: `font_image_size` is two `usize`s off
+        // the image header.
+        crate::heap_census::set_font_atlas_bytes(ctx.fonts(|f| {
+            let [w, h] = f.font_image_size();
+            (w as u64) * (h as u64) * 4
+        }));
+
         // **The denominator the census never had.** Every family above says
         // who is holding the heap; none of them says how big the heap is, and
         // on native there is no `byteLength` to take a residual against - so

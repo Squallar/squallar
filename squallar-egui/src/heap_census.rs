@@ -108,12 +108,13 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// 1060, and `rasters shared` is 14 too: 1060 + 39 = 1099.
 /// `still l3` is 8 characters: `8 + 25 = 33`, so 1099 + 33 = 1132.
 /// `loop archives` is 13 characters: `13 + 25 = 38`, so 1132 + 38 = 1170.
+/// `font atlas` is 10 characters: `10 + 25 = 35`, so 1170 + 35 = 1205.
 ///
 /// This chain is a DERIVATION and not a record: every term in it moves
 /// when a family is added or removed, so re-derive it rather than nudging the
 /// constant, and let `the_widest_line_fits_the_hooks_buffer` be the check.
 /// That test asserts `<=`, so a constant that is too LARGE passes quietly.
-pub const CENSUS_LINE_CAPACITY: usize = 1170;
+pub const CENSUS_LINE_CAPACITY: usize = 1205;
 
 /// One family's level. A `u64` of bytes, `Relaxed` throughout: every reader
 /// wants a recent figure, none wants a synchronised one, and a census torn
@@ -374,6 +375,42 @@ families! {
          and rasterizes. Published by the rasterization worker, the only \
          instance that runs a job off the wire; zero on the page, where it is \
          a real zero.";
+    FONT_ATLAS_BYTES, font_atlas_bytes, set_font_atlas_bytes,
+        "epaint's glyph atlas on the HOST heap: the `ColorImage` egui holds \
+         for the life of the `Context`, at four bytes a texel of \
+         `Fonts::font_image_size`. The device copy of the same picture is in \
+         `gpu textures`, which has named it all along; this side had no \
+         family, so an atlas that grew landed in the residual with nothing \
+         saying which family had moved. \
+         It is NOT a cache with a working set. epaint allocates it \
+         `min(max_texture_side, 16384)` wide and DOUBLES its height on \
+         demand, and `TextureAtlas::max_height` is the width - so the ceiling \
+         is the width squared, and `Fonts::begin_pass` recycles only above \
+         `0.8 x width` rows. Nothing evicts a cold glyph. \
+         The width is the adapter's, so a figure here names its target. Read \
+         off this tree's own `plan views may reach` boot line in captured rig \
+         logs, as `max_texture_dimension_2d` -> width: native Linux 32768 -> \
+         16384; native M2 16384 -> 16384; Firefox/WebGL2 on Linux 16384 and \
+         on the M2 32768, both -> 16384; **Chromium/WebGL2 on Linux 8192 -> \
+         8192**. The two web targets do NOT agree and a figure that merged \
+         them would be wrong by 2x on one of them. iOS and Android are \
+         unmeasured here; the boot line prints it on every launch. \
+         **A LEVEL, and the doubling is not in it.** `take_delta` clones the \
+         whole image into an `ImageDelta::full` on every growth, and that \
+         clone lives across the whole of `EguiRenderer::end_frame` - \
+         tessellate, upload, mirror, `update_buffers` - so for a whole \
+         frame's prepare phase, which is the frame's own peak, the heap \
+         holds this figure TWICE. The second copy is the delta's and is \
+         nobody's family either. \
+         **And a THIRD copy can exist that `live_bytes` structurally cannot \
+         see.** The growth is a `Vec::resize`, i.e. a `realloc`, and \
+         `squallar_alloc::Counting::realloc` books it as one block returned \
+         and one granted - a net delta. So an allocator that satisfies it by \
+         allocate-copy-free holds `S + 2S` at once and `live_bytes` reads \
+         only `2S`. That is real on RSS and on a wasm `byteLength`, where it \
+         is up to 1.5x this figure and never given back, and it is invisible \
+         to the metric this whole campaign gates on. Read it against the \
+         process families, never against `live_bytes` alone.";
     TILE_MESH_BYTES, tile_mesh_bytes, set_tile_mesh_bytes,
         "Tile mesh buffers the renderer is holding. **GPU**, kept beside the \
          others for the reader; [`Census::resident_total`] leaves it out.";
@@ -520,6 +557,7 @@ impl Census {
             self.loan_outstanding_bytes,
             self.volume_store_bytes,
             self.job_in_flight_bytes,
+            self.font_atlas_bytes,
             self.deferred_drop_bytes,
         ]
         .into_iter()
@@ -694,7 +732,7 @@ pub fn write_line<W: core::fmt::Write>(
          overlay grids {} B, overlay items {} B, overlay parked {} B, loop frames {} B, \
          upload pending {} B, tile bodies {} B, tile parsed {} B, \
          tile cache {} B, loans out {} B, volume store {} B, jobs in flight {} B, \
-         deferred drops {} B; resident total {} B of ",
+         font atlas {} B, deferred drops {} B; resident total {} B of ",
         census.loop_scan_bytes,
         census.loop_archive_bytes,
         census.loop_l3_bytes,
@@ -719,6 +757,7 @@ pub fn write_line<W: core::fmt::Write>(
         census.loan_outstanding_bytes,
         census.volume_store_bytes,
         census.job_in_flight_bytes,
+        census.font_atlas_bytes,
         census.deferred_drop_bytes,
         census.resident_total(),
     )?;

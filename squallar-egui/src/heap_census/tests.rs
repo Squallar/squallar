@@ -34,6 +34,7 @@ fn distinct() -> Census {
         render_in_flight_bytes: 2_097_152,
         gpu_texture_bytes: 4_194_304,
         chunk_feed_bytes: 8_388_608,
+        font_atlas_bytes: 64,
     }
 }
 
@@ -45,9 +46,11 @@ fn distinct() -> Census {
 fn the_resident_total_leaves_the_gpu_families_out() {
     let c = distinct();
     // One distinct power of two per family, so the sum of them all is
-    // `2^28 - 1`. `overlay pictures` was deleted, so its 64 is no longer among
-    // them — subtracted as the gap it is rather than replaced by a new
-    // literal, so this stays a derivation and names which family left.
+    // `2^28 - 1`. `overlay pictures` was deleted and its `2^6` left a gap,
+    // which stood here as an explicit `- 64` so the derivation named the
+    // family that had left rather than hiding it in a literal. `font atlas`
+    // has now taken that vacant `2^6`, so the gap closes and the subtraction
+    // goes: the run is contiguous again.
     //
     // The exponent moved from 27 to 28 when `loop archives` landed and took
     // `2^27`: a family added without moving it would make this assertion fail
@@ -57,7 +60,7 @@ fn the_resident_total_leaves_the_gpu_families_out() {
     // The exclusions are NAMED rather than spelled as their powers: a literal
     // here goes on passing while pointing at the wrong family after any
     // renumber, which is exactly what a fixture like this exists to catch.
-    let every_family = (1 << 28) - 1 - 64;
+    let every_family = (1 << 28) - 1;
     assert_eq!(
         c.resident_total(),
         every_family - c.tile_mesh_bytes - c.gpu_texture_bytes - c.raster_shared_bytes,
@@ -128,6 +131,7 @@ fn the_line_names_every_family_and_its_denominator() {
         "volume store 65536 B",
         "jobs in flight 131072 B",
         "deferred drops 262144 B",
+        "font atlas 64 B",
         "render pools 1048576 B",
         "renders in flight 2097152 B",
     ] {
@@ -187,6 +191,7 @@ fn the_widest_line_fits_the_hooks_buffer() {
         deferred_drop_bytes: u64::MAX,
         render_pool_bytes: u64::MAX,
         render_in_flight_bytes: u64::MAX,
+        font_atlas_bytes: u64::MAX,
     };
     // All three residual arms, because the widest is not the obvious one: a
     // reading of `u64::MAX` against saturated families prints `residual 0 B`,
@@ -594,5 +599,92 @@ fn the_chunk_feed_family_reads_radars_own_level() {
         census().chunk_feed_bytes,
         before,
         "the level did not come back"
+    );
+}
+
+/// **The glyph atlas family is a real reading of a real atlas, not a zero.**
+///
+/// The census's own rule for a readable zero (see [`super`]'s note on
+/// `deltas`) applies here too: `font atlas` reads 0 B on a process that has
+/// laid out no text and 0 B on a publisher that has silently stopped, and
+/// nothing else in the census can tell those apart. What separates them is
+/// the arithmetic — four bytes a texel of `Fonts::font_image_size` — so it is
+/// pinned against an atlas this test grows itself.
+///
+/// Denominator: an epaint `Fonts` built the way `egui::Context` builds one
+/// (stock `FontDefinitions`, `TextOptions` with the width under test), driven
+/// with printable ASCII. Host bytes; the device copy is `gpu textures`.
+#[test]
+fn the_font_atlas_family_prices_four_bytes_a_texel_of_the_real_atlas() {
+    let text: String = (0x20u8..=0x7eu8).map(|b| b as char).collect();
+    let mut fonts = egui::epaint::text::Fonts::new(
+        egui::epaint::text::TextOptions {
+            max_texture_side: 4096,
+            ..Default::default()
+        },
+        egui::epaint::text::FontDefinitions::default(),
+    );
+
+    // A fresh atlas is 32 rows tall whatever is in it, so read it before and
+    // after: a family that ignored the atlas entirely would match one of the
+    // two by luck and cannot match both.
+    let priced = |f: &egui::epaint::text::Fonts| {
+        let [w, h] = f.font_image_size();
+        (w as u64) * (h as u64) * 4
+    };
+    let fresh = priced(&fonts);
+    assert_eq!(fresh, 4096 * 32 * 4, "epaint opens the atlas at 32 rows");
+
+    // Enough distinct sizes to force it past its opening height.
+    {
+        let mut view = fonts.with_pixels_per_point(2.0);
+        for step in 0..24 {
+            let size = 9.0 + step as f32;
+            let _ = view.layout(
+                text.clone(),
+                egui::FontId::proportional(size),
+                egui::Color32::WHITE,
+                f32::INFINITY,
+            );
+        }
+    }
+    let grown = priced(&fonts);
+    assert!(
+        grown > fresh,
+        "the fixture did not grow the atlas ({fresh} B -> {grown} B), so it \
+         cannot say the family tracks a growth"
+    );
+
+    reset();
+    set_font_atlas_bytes(grown);
+    assert_eq!(census().font_atlas_bytes, grown);
+    assert!(
+        line(&census(), None, "test").contains(&format!("font atlas {grown} B")),
+        "the family is set but does not reach the line the allocation-error \
+         hook prints"
+    );
+
+    // A level, set and never added — the rule every family here is under.
+    set_font_atlas_bytes(fresh);
+    assert_eq!(census().font_atlas_bytes, fresh);
+    reset();
+}
+
+/// The atlas is **in** the page total, unlike the two GPU families beside it.
+///
+/// `gpu textures` and `tile meshes` are carried outside
+/// [`Census::resident_total`] because no device byte is on the reading the
+/// residual is taken against. This one is a `Vec<Color32>` on the same linear
+/// memory as every other family here, so leaving it out would put it straight
+/// back into the residual it was added to take out of.
+#[test]
+fn the_font_atlas_is_inside_the_page_total() {
+    let mut c = Census::default();
+    assert_eq!(c.resident_total(), 0);
+    c.font_atlas_bytes = 4_194_304;
+    assert_eq!(
+        c.resident_total(),
+        4_194_304,
+        "the glyph atlas is host bytes and must be inside the total"
     );
 }
