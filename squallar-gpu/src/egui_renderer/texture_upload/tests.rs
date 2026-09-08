@@ -211,10 +211,17 @@ fn the_font_atlas_crosses_whole_however_large_it_has_grown() {
             "on {device} a picture of {full_square} B crossed whole: the atlas \
              exemption leaked onto the rasters this module exists to band",
         );
+        // Re-pointed 2026-09-07 from `band_cap` to `whole_budget`. The claim
+        // is unchanged — a delta AT the whole-crossing threshold must still
+        // cross on a fresh frame, or the route can be starved by its own
+        // bound. What moved is which symbol IS that threshold: `goes_whole`
+        // read `band_cap` and now reads `whole_budget`, because a ring band is
+        // a memcpy and a whole delta is a blocking write, and only one of the
+        // two is an allowance on the frame thread.
         assert!(
-            crosses_whole_now(picture, capable, band_cap(capable), 0),
-            "on {device} a picture at the cap must still go whole, exactly as \
-             `goes_whole` says",
+            crosses_whole_now(picture, capable, whole_budget(capable), 0),
+            "on {device} a picture at the whole-crossing threshold must still \
+             go whole, exactly as `goes_whole` says",
         );
     }
 }
@@ -222,18 +229,21 @@ fn the_font_atlas_crosses_whole_however_large_it_has_grown() {
 /// One frame's whole-crossing route spends at most [`whole_budget`], however
 /// many deltas egui hands over.
 ///
-/// **The bound is the frame, not the delta.** [`goes_whole`] caps one delta at
-/// [`band_cap`], and that was read as though it capped the frame; `apply` loops
-/// the whole delta set through the route with nothing counting what it spends,
-/// so N deltas at the cap cost N times the cap on one frame thread. On web that
-/// is 4 MiB each with no N — see [`whole_budget`] for the loop frames that
-/// supply them.
+/// **The bound is the frame, not the delta.** [`goes_whole`] caps one delta,
+/// and that was read as though it capped the frame; `apply` loops the whole
+/// delta set through the route with nothing counting what it spends, so N
+/// deltas at the cap cost N times the cap on one frame thread. On web that is
+/// 4 MiB each with no N — see [`whole_budget`] for the loop frames that supply
+/// them.
 #[test]
 fn one_frame_cannot_spend_more_than_its_budget_on_whole_writes() {
-    for capable in [false, true] {
-        // The largest a single delta may be and still take this route, so the
-        // worst case per delta.
-        let each = band_cap(capable);
+    for (capable, each) in [false, true].into_iter().flat_map(|capable| {
+        // The largest a single delta may be and still take this route (the
+        // worst case per delta), and a quarter of it — so the bound is shown
+        // to bite on a frame that admits several deltas and not only on one
+        // that admits exactly one.
+        [whole_budget(capable), whole_budget(capable) / 4].map(move |each| (capable, each))
+    }) {
         let mut spent = 0usize;
         let mut crossed = 0usize;
         for i in 0..64u64 {
@@ -246,8 +256,9 @@ fn one_frame_cannot_spend_more_than_its_budget_on_whole_writes() {
         // satisfy the bound below and move no bytes at all.
         assert!(
             crossed >= 1,
-            "capable={capable}: nothing crossed whole, so the bound below is \
-             vacuous — a delta at the cap must always cross on a fresh frame",
+            "capable={capable}, each={each} B: nothing crossed whole, so the \
+             bound below is vacuous — a delta at the threshold must always \
+             cross on a fresh frame",
         );
         assert!(
             spent <= whole_budget(capable),
@@ -258,6 +269,111 @@ fn one_frame_cannot_spend_more_than_its_budget_on_whole_writes() {
             whole_budget(capable),
         );
     }
+}
+
+/// **The whole-crossing allowance is a share of the frame this application
+/// aims at**, and it is checked as a TIME rather than as a byte count.
+///
+/// The defect this pins is not a value, it is a *shape*: the allowance used to
+/// be `band_cap × bands_per_frame`, a product of one constant sized against a
+/// 16.7 ms frame and one that counts staging buffers. Neither factor is a
+/// blocking allowance, nobody chose their product, and moving either — a third
+/// ring slot, say — moved this route's cost on the frame thread silently. A
+/// gate on the byte figure would have been satisfied by the old value on the
+/// day it was written; this one asks what the bytes COST against what the frame
+/// has, which is the thing that was wrong.
+///
+/// The share and the bandwidth are both named by the module, so this is the
+/// derived quantity checked against what it describes and not against a magic
+/// number.
+#[test]
+fn the_whole_crossing_allowance_is_a_share_of_the_frame_the_app_aims_at() {
+    let frame = squallar_device_profile::constants::TARGET_FRAME_SERVICE;
+    let slice_us = frame.as_micros() as u64 / WHOLE_CROSSING_SHARE;
+
+    // Non-vacuity first: an allowance of zero satisfies every bound below and
+    // sends every delta to the bands.
+    assert!(
+        whole_budget(true) > 0 && whole_budget(false) > 0,
+        "an allowance of zero bytes bounds the frame by starving the route",
+    );
+
+    // The ring arm, which is the one this file derives.
+    let us = whole_budget(true) as u64 * 1_000_000 / BAR_WRITE_BYTES_PER_SEC;
+    assert!(
+        us <= slice_us,
+        "a ring device's whole-crossing route may put {} B on the frame \
+         thread, which is {us} us at the {BAR_WRITE_BYTES_PER_SEC} B/s this \
+         module measured — over the {slice_us} us that is one \
+         {WHOLE_CROSSING_SHARE}th of the {} us frame this application aims at",
+        whole_budget(true),
+        frame.as_micros(),
+    );
+
+    // And the arithmetic that used to produce it is shown to fail the same
+    // test, so the gate is known to fire on the defect rather than only to
+    // pass on the fix. 8 MiB x 2 slots = 16 MiB = 7.6 ms against a 4 ms frame.
+    let old = band_cap(true) * bands_per_frame(true);
+    let old_us = old as u64 * 1_000_000 / BAR_WRITE_BYTES_PER_SEC;
+    assert!(
+        old_us > frame.as_micros() as u64,
+        "the superseded arithmetic `band_cap x bands_per_frame` = {old} B = \
+         {old_us} us now fits inside the whole {} us frame, so this test no \
+         longer demonstrates the defect it was written against and the bound \
+         above is unwitnessed",
+        frame.as_micros(),
+    );
+}
+
+/// **A delta the budget displaces costs one band, not a queue of them.**
+///
+/// This is what keeps the new failure mode small. Past the allowance a delta is
+/// filed as bands and arrives on a later frame; `whole_budget <= band_cap` is
+/// what makes that "a later frame" rather than `ceil(bytes / band_cap)` of
+/// them. Lowering `band_cap` under the allowance — or raising the allowance
+/// over it — would multiply the arrival latency of every displaced raster
+/// without changing a line of the routing, and neither constant's own note
+/// mentions the other.
+#[test]
+fn a_delta_the_budget_displaces_is_at_most_one_band() {
+    for capable in [false, true] {
+        assert!(
+            whole_budget(capable) <= band_cap(capable),
+            "capable={capable}: the whole-crossing allowance is {} B against a \
+             {} B band, so a delta the allowance turns away is filed as {} \
+             bands and waits that many drain slots rather than one",
+            whole_budget(capable),
+            band_cap(capable),
+            whole_budget(capable).div_ceil(band_cap(capable)),
+        );
+        assert!(
+            bands_per_frame(capable) >= 1,
+            "capable={capable}: the drain moves no bands, so a displaced delta \
+             never arrives at all",
+        );
+    }
+}
+
+/// **The class with a cheap alternative is never allowed more blocking than
+/// the class with none.**
+///
+/// A ring device can memcpy a band into a staging slot and let the copy engine
+/// pull it at 24.7 GB/s; a ringless device — all of web — has one route and it
+/// is `write_texture` on the frame thread. So an allowance that is LARGER on
+/// the ring arm is backwards, and it was: 16 MiB against 4 MiB, four times as
+/// much blocking for the class that did not need any of it. Nothing intended
+/// that — `bands_per_frame` is 2 on one arm and 1 on the other, and the
+/// multiplication carried it into the frame's allowance.
+#[test]
+fn a_ring_device_is_not_allowed_more_blocking_than_a_ringless_one() {
+    assert!(
+        whole_budget(true) <= whole_budget(false),
+        "a ring device may block the frame thread with {} B and a ringless one \
+         with {} B: the class that can fall back to the copy engine is allowed \
+         more of the route that cannot",
+        whole_budget(true),
+        whole_budget(false),
+    );
 }
 
 /// The atlas exemption outlives a spent budget, and takes nothing with it.

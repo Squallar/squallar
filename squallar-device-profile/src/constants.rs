@@ -6,6 +6,30 @@ pub const RENDER_WIDTH: u32 = 1920;
 /// Default height for the application window in pixels
 pub const RENDER_HEIGHT: u32 = 1080;
 
+/// **The frame this application is trying to hit**, and the denominator any
+/// frame-thread budget in this workspace is a share of.
+///
+/// 4 ms: p99 interact-frame service, the 250 Hz frame the campaign holds every
+/// arm to. It was prose in five doc comments and a constant in none, so every
+/// budget that wanted to be a share of a frame had to name its own frame — and
+/// four of them named **16.7 ms**, a 60 Hz frame this application has not aimed
+/// at since the campaign opened (`squallar_gpu`'s `UPLOAD_BAND_BYTES`,
+/// [`MAX_LOOP_SECTION_CUTS_PER_FRAME`], `budget`'s desktop offscreen bracket,
+/// and one test-local `FRAME`). A budget sized against the wrong frame reads as
+/// headroom rather than as an overrun, and nothing fires.
+///
+/// # It is DECLARED, not measured, and that is a limitation and not a shorthand
+///
+/// Nothing in this process has ever asked the display what it runs at. There is
+/// no `MonitorHandle::refresh_rate_millihertz`, no `current_monitor` and no
+/// `video_modes` call anywhere in the workspace; winit is a dependency of two
+/// crates and neither touches the monitor API. The one place a refresh rate is
+/// read is `.github/browser-rig/run_measure_native.sh`'s `plat_refresh`, out of
+/// process, and it reaches the runner's own vblank-liveness check and never the
+/// binary. So a budget may follow **this**; a budget that wants to follow the
+/// panel in front of the user needs a monitor read that does not exist yet.
+pub const TARGET_FRAME_SERVICE: Duration = Duration::from_millis(4);
+
 /// The side, in pixels, a **static** plan-view render is allowed to grow to
 /// when its sweep reaches past [`squallar_radar::types::BASE_EXTENT_KM`].
 pub const WASM_LONG_RANGE_IMAGE_SIZE: usize =

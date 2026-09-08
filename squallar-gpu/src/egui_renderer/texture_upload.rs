@@ -47,6 +47,19 @@ use resident::ResidentTextures;
 /// much frame thread whichever route it takes, so the DMA path can fall back to
 /// `write_texture` mid-raster. Two slots of 8 MiB is 16.9 MiB of pinned host
 /// memory against the 437 MB an un-banded ring would need.
+///
+/// **That 16.7 ms is a 60 Hz frame, and this application aims at
+/// [`squallar_device_profile::constants::TARGET_FRAME_SERVICE`] — 4 ms.** What
+/// survives the correction is the *ring slot*: on a device with a ring a band
+/// is a memcpy into cached host memory, so its size prices pinned host memory
+/// and the copy engine, not the frame thread. What does not survive is this
+/// figure as a **blocking** allowance. Two places used it as one:
+/// [`whole_budget`], which no longer does, and [`DECLINE_PATIENCE`]'s
+/// fallback, which still writes a whole 8 MiB band with `write_texture` when
+/// the ring has refused four frames running — 3.8 ms at the 2.1 GB/s below,
+/// which is nearly the whole bar on one frame. That path is bounded by
+/// nothing here and re-sizing it is a re-sweep of the ring slot, not a
+/// re-spelling of this line.
 pub const UPLOAD_BAND_BYTES: usize = 8 << 20;
 
 /// Bands one frame moves when the copy engine is doing it.
@@ -76,8 +89,16 @@ fn band_cap(capable: bool) -> usize {
 
 /// Whether a delta of `bytes` for a texture this module does not own crosses
 /// whole on this frame's queue rather than being filed as bands.
+///
+/// **The threshold is [`whole_budget`], not [`band_cap`]** — the largest
+/// single delta that may block the frame thread is the most a whole frame may
+/// block it with, because one delta is what a fresh frame can be asked for.
+/// The two were the same expression until 2026-09-07 and that conflation is
+/// what put a ring device's blocking allowance at 16 MiB; see [`whole_budget`]
+/// for the arithmetic that produced it. `band_cap` keeps its own job, which is
+/// how much of a raster one queued band carries.
 fn goes_whole(capable: bool, bytes: usize) -> bool {
-    bytes <= band_cap(capable)
+    bytes <= whole_budget(capable)
 }
 
 /// Whether `id` is the font atlas, the one texture that crosses whole at any
@@ -114,37 +135,118 @@ fn is_font_atlas(id: egui::TextureId) -> bool {
     id == egui::TextureId::default()
 }
 
+/// What `queue.write_texture` moves through the card's BAR window, in bytes a
+/// second: this module's own measured figure (13.7 MB in 6.41 ms at 7362²,
+/// see the module note). The staged route's 24.7 GB/s is deliberately absent —
+/// the whole-crossing route never touches the ring, and pricing it at the ring's
+/// bandwidth is the mistake this file already made once.
+const BAR_WRITE_BYTES_PER_SEC: u64 = 2_100_000_000;
+
+/// The share of
+/// [`squallar_device_profile::constants::TARGET_FRAME_SERVICE`] the
+/// whole-crossing route may hold.
+///
+/// A quarter — the share [`UPLOAD_BAND_BYTES`] was always sized at ("a quarter
+/// of a 16.7 ms frame"). **What is corrected here is the frame, not the
+/// share.**
+const WHOLE_CROSSING_SHARE: u64 = 4;
+
+/// [`WHOLE_CROSSING_SHARE`] of the target frame, priced at
+/// [`BAR_WRITE_BYTES_PER_SEC`]: 1 ms of BAR window, 2,100,000 B.
+const WHOLE_CROSSING_BYTES: usize = (BAR_WRITE_BYTES_PER_SEC
+    * squallar_device_profile::constants::TARGET_FRAME_SERVICE.as_micros() as u64
+    / WHOLE_CROSSING_SHARE
+    / 1_000_000) as usize;
+
 /// Whole-crossing bytes one frame may push through `Renderer::update_texture`
 /// before the rest are filed as bands.
 ///
-/// **The same per-frame allowance the banded route already has**, derived
-/// rather than chosen: [`band_cap`] is the largest blocking chunk a frame was
-/// measured to absorb, and [`bands_per_frame`] is how many of them the drain
-/// moves. A route handed an *unbounded* number of chunks that each fit the cap
-/// is not bounded by the cap. The frame is what has to be bounded, and it was
-/// not: [`TextureUploads::apply`] loops the whole delta set through this route
-/// with nothing counting what it spends.
+/// # Why the route has to be bounded at all
 ///
-/// Not a hypothetical arithmetic, and the figures are pinned constants rather
-/// than a fit. On web `squallar_device_profile::constants::WASM_LOOP_IMAGE_SIZE`
-/// is 1024, so one loop frame's texture is 1024·1024·4 = 4 MiB — *exactly*
+/// `Renderer::update_texture` is `write_texture` on the frame's own queue, so
+/// every byte on this route is frame thread. A route handed an *unbounded*
+/// number of chunks that each fit a per-delta cap is not bounded by that cap;
+/// the frame is what has to be bounded, and [`TextureUploads::apply`] used to
+/// loop the whole delta set through this route with nothing counting what it
+/// spent. On web `WASM_LOOP_IMAGE_SIZE` is 1024, so one loop frame's texture is
+/// 4 MiB — *exactly*
 /// [`squallar_device_profile::constants::BLOCKING_BAND_BYTES`], which
-/// [`goes_whole`] compares with `<=`. Every loop frame takes this route. A
-/// dispatch textures `Budgets::textured_frames` of them, which on web is
-/// `min(WASM_MAX_LOOP_RENDER_BUDGET, WASM_MAX_LOOP_FRAMES)` = `min(14, 14)` =
-/// **14**, and 14 × 4 MiB = **56 MiB of blocking `write_texture` on one frame
-/// thread**. Out of wasm linear memory at ~1 GB/s that is ~56 ms, and the panel
-/// that reported this defect put its `prep` p99 in the **[53.8, 64.0) ms** bin.
-/// The font atlas is *not* what fills that bin: measured headless over the
-/// app's own bounded size sets, the 16384-wide web atlas settles at 16384×64
-/// and its largest whole delta is 4 MiB.
+/// [`goes_whole`] compares with `<=`. A dispatch textures
+/// `Budgets::textured_frames` of them, on web `min(14, 14)` = 14, and
+/// 14 × 4 MiB = **56 MiB of blocking `write_texture` on one frame thread**. Out
+/// of wasm linear memory at ~1 GB/s that is ~56 ms, and the panel that reported
+/// that defect put its `prep` p99 in the **[53.8, 64.0) ms** bin. Not a
+/// hypothetical arithmetic: every figure in it is a pinned constant rather than
+/// a fit. And the font atlas is *not* what fills that bin — measured headless
+/// over the app's own bounded size sets, the 16384-wide web atlas settles at
+/// 16384×64 and its largest whole delta is 4 MiB.
 ///
-/// Nothing is starved by this: [`goes_whole`] already caps one whole-crossing
-/// delta at [`band_cap`], which is never above this budget, so the first delta
-/// of a frame always crosses. What overflows falls to the bands, which carry it
-/// from the next frame — the arrival every raster past the cap already has.
+/// # The figure this returns is a TIME, spent at a bandwidth
+///
+/// It was `band_cap × bands_per_frame` until 2026-09-07 — a budget written as
+/// arithmetic over two constants, neither of which is a blocking allowance:
+///
+/// * [`UPLOAD_BAND_BYTES`] is 8 MiB *because* it is "a quarter of a 16.7 ms
+///   frame", i.e. sized against **60 Hz**; and
+/// * [`bands_per_frame`] is [`DMA_BANDS_PER_FRAME`] is
+///   [`crate::staging_ring::STAGING_RING_DEPTH`] — a count of **staging
+///   buffers**, chosen because a slot claimed on a frame cannot be handed back
+///   on that frame.
+///
+/// Their product on a ring device was 16 MiB, which is **7.6 ms** at
+/// [`BAR_WRITE_BYTES_PER_SEC`] — nearly twice
+/// [`squallar_device_profile::constants::TARGET_FRAME_SERVICE`]. Nobody chose
+/// 7.6 ms; it fell out. A third staging buffer, a change with nothing to do
+/// with the frame thread, would silently have made this route 50% more
+/// expensive.
+///
+/// And it was inverted between the two device classes. A ring device was
+/// allowed 16 MiB of blocking while a **ringless** one was allowed 4 MiB —
+/// four times as much for the class that has a copy engine to fall back on,
+/// against the class where every byte is frame thread and there is no
+/// alternative at all. Nothing intended that either; `bands_per_frame` is 2 on
+/// one and 1 on the other, and the multiplication carried it.
+///
+/// # What each arm is now, and why they are derived differently
+///
+/// **Ring device: [`WHOLE_CROSSING_BYTES`]**, a quarter of the target frame at
+/// the measured BAR bandwidth. Here the number is a real cost lever: a byte
+/// displaced onto the bands is memcpy'd into a staging slot and pulled by the
+/// copy engine at 24.7 GB/s against this route's 2.1 GB/s, so displacing it
+/// makes it about twelve times cheaper *on the frame thread* and buys a frame
+/// or two of arrival latency to do it.
+///
+/// **Ringless device: [`band_cap`], unchanged.** On that class both routes are
+/// the same blocking `write_texture`, so this allowance does not change what a
+/// frame costs per byte — only *when* it is paid. That is the dry-frame dial
+/// [`squallar_device_profile::constants::BLOCKING_BAND_BYTES`] already swept
+/// over 56 pan speeds, and this follows the sweep rather than re-deciding it.
+/// The same arithmetic as the ring arm would say ~1 MiB there (a quarter of
+/// 4 ms at the ~1 GB/s out of wasm linear memory the section above prices);
+/// taking it would halve a web frame's worst blocking spend and would delay
+/// basemap tiles after a pan, and **no frame-time instrument exists on either
+/// web target** to say which wins — `run_tier2.sh` gates behaviour, not
+/// milliseconds. So it is stated here and not taken.
+///
+/// # Nothing is starved, and what it costs when the budget bites
+///
+/// [`goes_whole`] reads this same figure, so a delta at the threshold always
+/// crosses on a fresh frame. Past it a delta is filed as bands, and
+/// `whole_budget <= band_cap` on both arms
+/// (`a_delta_the_budget_displaces_is_at_most_one_band`) — so a displaced delta
+/// is **one** band and costs one drain slot, not `ceil(bytes / band)` of them.
+/// The drain moves [`bands_per_frame`] bands a frame and breaks after any frame
+/// on which it allocated a texture, so the arrival it buys is a frame or two,
+/// and a scene that files new rasters faster than that grows
+/// [`TextureUploads::pending`] — which is published every frame as the
+/// `upload pending` census family and is the figure to read if a layer ever
+/// appears late after a pan.
 fn whole_budget(capable: bool) -> usize {
-    band_cap(capable) * bands_per_frame(capable)
+    if capable {
+        WHOLE_CROSSING_BYTES
+    } else {
+        band_cap(capable)
+    }
 }
 
 /// Bands one frame moves, by device capability. See
@@ -207,9 +309,9 @@ pub struct UploadTotals {
     /// what makes a zero byte count readable.
     pub deltas: u64,
     /// Bytes handed whole to `Renderer::update_texture` — every delta at or
-    /// under [`UPLOAD_BAND_BYTES`] for an id this module does not own, and
+    /// under [`whole_budget`] for an id this module does not own, and
     /// the font atlas at any size (see [`is_font_atlas`]), bounded per frame
-    /// by [`whole_budget`]. **A
+    /// by that same figure. **A
     /// routing figure and a subset of [`Self::blocking_bytes`], never added to
     /// it**: `update_texture` is `write_texture` on the frame's own queue, so
     /// these bytes are blocking too, whatever the device.

@@ -478,11 +478,18 @@ pub(crate) struct FinishHists {
 /// follow is `upload`, which grew x5.70 on only 5% more bytes — a routing
 /// change, not a volume change. See
 /// [`squallar_gpu::egui_renderer::texture_upload`]: a delta crosses whole on
-/// the frame thread when it is *small enough*
-/// (`goes_whole` is `bytes <= band_cap`), so six smaller panes push their
+/// the frame thread when it is *small enough*, so six smaller panes push their
 /// rasters under the threshold and onto the blocking route that one large pane
 /// stayed above. Measured over the same two legs: 2.5 MB of 59.2 GB blocking
 /// on one pane, 35.8 GB of 62.3 GB on six.
+///
+/// The threshold those figures were read against was 8 MiB, and the frame's
+/// whole allowance was 16 MiB — `band_cap` times a count of staging buffers,
+/// which is **7.6 ms** of blocking at the 2.1 GB/s that module measures, against
+/// a [`squallar_device_profile::constants::TARGET_FRAME_SERVICE`] of 4 ms. Both
+/// are now one figure derived from that frame and that bandwidth
+/// (`texture_upload::whole_budget`), so the six-pane `upload` reading above is
+/// a reading of the OLD routing and is kept as the before half of the pair.
 #[derive(Default)]
 pub(crate) struct PrepareHists {
     /// `Gui::ui` return to the egui pass's close: the app's own prologue —
