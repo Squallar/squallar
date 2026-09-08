@@ -573,6 +573,13 @@ fn every_cfg_arm_selects_the_constant_named_for_its_device_class() {
         // The building geometry row: one number on every arm, pinned until a
         // second machine is measured.
         "PRISM_GEOMETRY_BYTES",
+        // The loop cache's three: how many decoded bytes may be committed at
+        // once, how many compressed bytes may be held, and how far ahead of a
+        // playhead a decoded volume is kept. Sized per arm against the
+        // reproduced wasm freeze -- see the block above them.
+        "LOOP_DECODED_CEILING_BYTES",
+        "LOOP_ARCHIVE_CEILING_BYTES",
+        "LOOP_DECODED_LOOKAHEAD_FRAMES",
     ];
 
     // Cascades that still spell their arms as literals, and so cannot be
@@ -1714,4 +1721,58 @@ fn nothing_selects_the_polar_price_yet() {
          means nothing: {raster_sites:?}",
         raster_sites.len(),
     );
+}
+
+/// **The wasm loop budgets leave the reproduced freeze short of the page by the
+/// margin their doc claims** — asserted from the recorded figures the doc
+/// quotes, so a change to any one term moves this and not just the prose.
+///
+/// A runtime test and not a `const` assertion: it needs `max` and formatted
+/// failure messages, and neither is const on this toolchain.
+///
+/// **Nothing here reads the admission door.** On that reproduction the door's
+/// `asked` counter moves only on refusals, so a zero is what a door that is
+/// never called and a door that admits every time both print; a grant is not
+/// evidence that anything fits. The claim is resident bytes against the page.
+#[test]
+fn the_wasm_loop_budgets_clear_the_reproduced_freeze() {
+    use super::web_freeze_2026_09_07 as wf;
+    use super::{WASM_LOOP_ARCHIVE_CEILING_BYTES, WASM_LOOP_DECODED_CEILING_BYTES};
+
+    let residue_firefox = wf::RESIDENT_TOTAL_FIREFOX - wf::LOOP_SCANS_FIREFOX;
+    let residue_chromium = wf::RESIDENT_TOTAL_CHROMIUM - wf::LOOP_SCANS_CHROMIUM;
+    assert!(
+        residue_firefox > residue_chromium,
+        "the doc names firefox as the worse leg for non-loop residue; it is not \
+         ({residue_firefox} vs {residue_chromium}) — re-derive the margin"
+    );
+    let residue = residue_firefox;
+
+    let loop_after = WASM_LOOP_DECODED_CEILING_BYTES as u64
+        + WASM_LOOP_ARCHIVE_CEILING_BYTES as u64
+        + wf::FRAMES * wf::SWEEP_BYTES;
+    let short_of_wall = wf::PAGE_BYTES
+        .checked_sub(residue + loop_after)
+        .expect("the wasm loop budgets alone push the reproduced scene past the page");
+    assert!(
+        short_of_wall >= wf::CLAIMED_MARGIN_BYTES,
+        "the budgets leave the death scene {} MiB short of the wall, less than \
+         the {} MiB claimed",
+        short_of_wall >> 20,
+        wf::CLAIMED_MARGIN_BYTES >> 20
+    );
+    // And the claim is stated, not headroom by accident: within one grid
+    // family of the truth, or the doc is under-stating what it has.
+    assert!(
+        short_of_wall - wf::CLAIMED_MARGIN_BYTES < wf::OVERLAY_GRIDS,
+        "the doc claims {} MiB and the arithmetic gives {} MiB; re-state it",
+        wf::CLAIMED_MARGIN_BYTES >> 20,
+        short_of_wall >> 20
+    );
+    // The decoded ceiling admits at least two volumes at the corpus maximum,
+    // or the initial fill cannot pipeline at all.
+    assert!(WASM_LOOP_DECODED_CEILING_BYTES as u64 >= 2 * 78_255_227);
+    // The archive ceiling holds a full loop at the tree's 208-corpus median
+    // archive (5.56 MiB), so the common case never re-downloads.
+    assert!(WASM_LOOP_ARCHIVE_CEILING_BYTES as u64 >= wf::FRAMES * 5_830_000);
 }

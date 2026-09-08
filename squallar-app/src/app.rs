@@ -2825,6 +2825,21 @@ impl App {
         // linear scan for the reason `evict_unshown_scans`' own `parked` is
         // one: it holds at most one entry per pane.
         let mut parked: Vec<(&str, chrono::NaiveDateTime)> = Vec::new();
+        // **The frames whose decoded volume must stay resident**, a subset of
+        // `needed`: every frame the loop still names keeps its compressed
+        // archive, but only these keep their moments.
+        let mut decoded_wanted: std::collections::HashMap<
+            &str,
+            std::collections::HashSet<chrono::NaiveDateTime>,
+        > = std::collections::HashMap::new();
+        // **How far ahead of a playhead each frame sits**, smallest across
+        // every pane that names it, so the archive ceiling evicts the frame
+        // no pane is heading towards. A frame two panes name is as near as
+        // its nearest playhead.
+        let mut frame_distance: std::collections::HashMap<
+            &str,
+            std::collections::HashMap<chrono::NaiveDateTime, u64>,
+        > = std::collections::HashMap::new();
         // **Every loop running right now, and what it renders** — the argument
         // to `site_needs_decoded_source`. `None` is a loop that has not
         // dispatched, which that predicate reads as "keep".
@@ -2868,6 +2883,36 @@ impl App {
             let frames = needed.entry(radar_layer::site(ls)).or_default();
             for frame in &ls.frames {
                 frames.insert(frame.timestamp);
+            }
+            // **Which of those frames need their MOMENTS, as opposed to just
+            // their bytes.** Only two things read a decoded volume: a first
+            // render, and a retarget re-render. Playback reads neither — the
+            // texture already exists, and a landed frame's readout holds its
+            // own sweep rather than the volume. So a frame that is textured
+            // and not about to be drawn does not need its moments resident,
+            // and its volume can be rebuilt from the archive kept above.
+            let total = ls.frames.len();
+            let playhead = ls.current_frame();
+            let decoded = decoded_wanted.entry(radar_layer::site(ls)).or_default();
+            let distances = frame_distance.entry(radar_layer::site(ls)).or_default();
+            for (idx, frame) in ls.frames.iter().enumerate() {
+                // Forward distance from the playhead, wrapping the way
+                // playback does, so the lookahead runs in the direction of
+                // travel and not symmetrically around it.
+                let ahead = total
+                    .checked_sub(playhead)
+                    .map_or(0, |back| (idx + back) % total.max(1));
+                // `None` keeps nothing beyond the untextured: on a 1 GiB wasm
+                // page a spare 42-75 MiB volume is what the reproduced freeze
+                // cost, and a retarget that waits one decode is a wait.
+                let within_lookahead =
+                    squallar_device_profile::constants::LOOP_DECODED_LOOKAHEAD_FRAMES
+                        .is_some_and(|lookahead| ahead <= lookahead);
+                if frame.image.is_none() || within_lookahead {
+                    decoded.insert(frame.timestamp);
+                }
+                let nearest = distances.entry(frame.timestamp).or_insert(u64::MAX);
+                *nearest = (*nearest).min(ahead as u64);
             }
         }
         let keep = |site: &str, ts: &chrono::NaiveDateTime| {
@@ -2934,9 +2979,71 @@ impl App {
                 }
             };
         self.loop_mgr.retain_plan_frames(keep);
+        // **The archives follow the FRAME list, not the narrower decoded
+        // rule.** A site whose loop has retargeted to Level III derives
+        // nothing from Level II and drops its decoded volumes below, but its
+        // frames still stand — so keeping the compressed bytes makes
+        // retargeting back a decode instead of the re-download it is today,
+        // at a median 5.8 % of the decoded cost.
+        //
+        // Asked with the address alone, which is safe here for a reason
+        // `keep_scan` cannot rely on: every archive was filed under the
+        // address the loop downloaded it at, so the two-clock hazard has
+        // nothing to bite.
+        self.loop_mgr.retain_archives(keep);
         squallar_worker::offload::discard_each(
             "evicted-loop-volume",
             crate::volume_inventory::volume_drop_parts(self.loop_mgr.retain_scans(keep_scan)),
+        );
+        // **The residency pass, after the retention pass.** `retain_scans`
+        // has just dropped every volume the loop does not want at all; this
+        // drops the MOMENTS of frames it does want but is not about to draw,
+        // keeping their archives. A frame evicted here comes back through the
+        // pump's decode arm at no network cost, and one with no archive
+        // behind it is not evicted here at all — that rule lives in
+        // `evict_decoded_except`, because it is a property of the policy and
+        // not of this caller.
+        let decoded_keep =
+            |site: &str, ts: &chrono::NaiveDateTime, scan: &nexrad_model::data::Scan| {
+                if settling.contains(site) {
+                    return true;
+                }
+                // A pane parked on this volume is drawing it right now, and
+                // asks with both of the volume's clocks for `keep_scan`'s
+                // reason.
+                let collected = squallar_radar::types::volume_collected_at(scan);
+                if parked
+                    .iter()
+                    .any(|&(at_site, at)| at_site == site && (at == *ts || Some(at) == collected))
+                {
+                    return true;
+                }
+                decoded_wanted
+                    .get(site)
+                    .is_some_and(|frames| frames.contains(ts))
+            };
+        squallar_worker::offload::discard_each(
+            "evicted-loop-decoded",
+            crate::volume_inventory::volume_drop_parts(
+                self.loop_mgr.evict_decoded_except(decoded_keep),
+            ),
+        );
+        // **The compressed cache's own bound**, in bytes rather than frames
+        // because the archive swings 16.5x across the measured corpus while
+        // the frame count does not. Furthest from a playhead goes first; an
+        // evicted archive costs a re-download if its frame is wanted again,
+        // which is what that frame costs today.
+        self.loop_mgr.evict_archives_to_ceiling(
+            squallar_device_profile::constants::LOOP_ARCHIVE_CEILING_BYTES,
+            // Distance from the nearest playhead; an archive no live frame
+            // names at all sorts above every named one and goes first.
+            |site, ts| {
+                frame_distance
+                    .get(site)
+                    .and_then(|frames| frames.get(ts))
+                    .copied()
+                    .unwrap_or(u64::MAX)
+            },
         );
         squallar_worker::offload::discard_each(
             "evicted-loop-object",

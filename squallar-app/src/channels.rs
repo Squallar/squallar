@@ -272,6 +272,15 @@ pub struct LoopScanDownloadResponse {
     /// The decoded volume and its declared Nyquist velocities, or `None` if the
     /// download failed — the pair for the reason [`ScanData::declared_nyquist`] gives.
     pub scan: Option<(Arc<Scan>, Arc<squallar_radar::nyquist::DeclaredNyquist>)>,
+    /// **The compressed bytes the volume was decoded from**, or `None` where
+    /// the download failed and there are none.
+    ///
+    /// The `Arc` the decode job already moved by pointer, not a copy: the loop
+    /// cache keeps it so that evicting the decoded volume costs a decode to
+    /// undo rather than a network round trip. `Some` even when `scan` is
+    /// `None`, because bytes that failed to decode are still bytes worth
+    /// keeping over re-fetching them.
+    pub archive: Option<Arc<Vec<u8>>>,
 }
 
 /// The Level III bucket keys a loop's pairings will be ranked against: one

@@ -83,9 +83,9 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// land. Sized against every figure at `u64::MAX` and the longest instance
 /// name, not against a plausible reading — and sized EXACTLY: the widest line
 /// is this many bytes, with no headroom, so a family added without re-deriving
-/// it is cut and the test says so. The arithmetic: twenty-three families (the
+/// it is cut and the test says so. The arithmetic: twenty-four families (the
 /// two GPU ones included), the resident total and the linear reading are
-/// twenty-five `u64::MAX` figures at 20 digits apiece, the prose between them
+/// twenty-six `u64::MAX` figures at 20 digits apiece, the prose between them
 /// under `rasterization worker` makes up the rest — and the residual is the
 /// **`none` arm**: a reading of `u64::MAX - 1` against families that saturate
 /// prints `residual none (families price above it)`, 27 bytes wider than the
@@ -106,11 +106,14 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// `16 + 25 = 41` back out: 1062 - 41 = 1021.
 /// `cached renders` is 14 characters, so it adds `14 + 25 = 39`: 1021 + 39 =
 /// 1060, and `rasters shared` is 14 too: 1060 + 39 = 1099.
-/// `still l3` is 8 characters: `8 + 25 = 33`, so 1099 + 33 = 1132. This chain is a DERIVATION and not a record: every term in it moves
+/// `still l3` is 8 characters: `8 + 25 = 33`, so 1099 + 33 = 1132.
+/// `loop archives` is 13 characters: `13 + 25 = 38`, so 1132 + 38 = 1170.
+///
+/// This chain is a DERIVATION and not a record: every term in it moves
 /// when a family is added or removed, so re-derive it rather than nudging the
 /// constant, and let `the_widest_line_fits_the_hooks_buffer` be the check.
 /// That test asserts `<=`, so a constant that is too LARGE passes quietly.
-pub const CENSUS_LINE_CAPACITY: usize = 1132;
+pub const CENSUS_LINE_CAPACITY: usize = 1170;
 
 /// One family's level. A `u64` of bytes, `Relaxed` throughout: every reader
 /// wants a recent figure, none wants a synchronised one, and a census torn
@@ -211,6 +214,18 @@ families! {
          dropping a stored frame is the only thing that frees them. It is a \
          partition and not a bound: two frames drawn from one volume hold two \
          sweeps and are counted twice because there are two.";
+    LOOP_ARCHIVE_BYTES, loop_archive_bytes, set_loop_archive_bytes,
+        "Compressed Level II archives the loop download cache is holding, so \
+         a frame whose decoded volume was evicted costs a DECODE to restore \
+         rather than a network round trip. Named apart from `loop scans` and \
+         never added to it: the two are different orders of magnitude - \
+         measured over 39 volumes, an archive is 1.0-16.1 MiB against a \
+         33.7-82.7 MiB decoded volume, a median ratio of 17.1x - and they are \
+         evicted by different policies, so one figure over both could not say \
+         which half a fall came from. Shares nothing with `loop scans`: the \
+         buffer here is the compressed object, the volume there is what was \
+         decoded out of it. It DOES overlap the job funnel for the length of \
+         a decode, which holds the same `Arc` while it reads it.";
     RENDER_CACHE_BYTES, render_cache_bytes, set_render_cache_bytes,
         "Finished radar rasters the render cache is holding, CPU-side: the \
          `Color32` pixel buffers and their resident hover fields.";
@@ -484,6 +499,11 @@ impl Census {
     pub fn resident_total(&self) -> u64 {
         [
             self.radar_total(),
+            // A real allocation that no other family names, so it is summed
+            // flat rather than through `radar_total`'s upper bound: the
+            // decoded-volume families share `Arc`s with each other and this
+            // shares with none of them.
+            self.loop_archive_bytes,
             self.still_l3_bytes,
             self.render_cache_bytes,
             self.cached_render_bytes,
@@ -664,7 +684,8 @@ pub fn write_line<W: core::fmt::Write>(
 ) -> core::fmt::Result {
     write!(
         out,
-        "heap census ({instance}): loop scans {} B, loop l3 {} B, still l3 {} B, \
+        "heap census ({instance}): loop scans {} B, loop archives {} B, \
+         loop l3 {} B, still l3 {} B, \
          still scans {} B, \
          derive memo {} B, loop frame scans {} B, chunk feed {} B, \
          render cache {} B, cached renders {} B, rasters shared {} B, \
@@ -675,6 +696,7 @@ pub fn write_line<W: core::fmt::Write>(
          tile cache {} B, loans out {} B, volume store {} B, jobs in flight {} B, \
          deferred drops {} B; resident total {} B of ",
         census.loop_scan_bytes,
+        census.loop_archive_bytes,
         census.loop_l3_bytes,
         census.still_l3_bytes,
         census.still_scan_bytes,
@@ -1015,8 +1037,11 @@ pub const PROCESS_WALK_EVERY: u32 = 8;
 /// census whose families price *below* `live`. Seventeen `u64::MAX` figures
 /// at 20 digits, the three counts among them, plus the prose — and the two
 /// census ends it prints (`families` and `floor`) grow with the census, so a
-/// family added there moves this too: `chunk feed` took it from 645 to 647.
-pub const PROCESS_LINE_CAPACITY: usize = 647;
+/// family added there moves this too: `chunk feed` took it from 645 to 647,
+/// and `loop archives` from 647 to 649 — a family costs this line two bytes,
+/// not the `name.len() + 25` it costs the census line, because only the
+/// saturated `unaccounted` figures widen here and not a per-family term.
+pub const PROCESS_LINE_CAPACITY: usize = 649;
 
 /// **The process denominator as one line.**
 ///

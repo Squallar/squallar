@@ -751,6 +751,9 @@ fn a_download_is_cached_under_the_site_it_came_from() {
             site: "KTLX".to_string(),
             timestamp: ts(0),
             scan: Some(volume.clone()),
+            // The archive drain's shape: a volume filed with no compressed
+            // bytes behind it. What this test pins is the mark and the cache.
+            archive: None,
         },
     );
 
@@ -773,6 +776,7 @@ fn a_failed_download_clears_its_mark_and_caches_nothing() {
             site: "KTLX".to_string(),
             timestamp: ts(0),
             scan: None,
+            archive: None,
         },
     );
 
@@ -1212,4 +1216,104 @@ fn the_readiness_walk_settles_every_animating_layer_not_only_radar() {
         "and radar's own slot is still settled by the same pass (it goes on to \
          Playing, because the transport addresses it and playback then starts)"
     );
+}
+
+/// **The download pump branches on the decode state before it reaches the
+/// network, and the frame build never decodes.**
+///
+/// # This is a SHAPE gate, not a behaviour gate, and the difference matters
+///
+/// It reads the source of `dispatch_pending_loop_downloads` and asserts the
+/// three-way branch is spelled there. It cannot prove a decode is dispatched;
+/// nothing in this tree drives that function yet, and an `App` harness for it
+/// does not exist. What it *can* catch is the two edits that would silently
+/// undo the design — someone simplifying the branch back to two states, and
+/// someone "fixing" a missing volume by decoding inside the frame build.
+///
+/// The decision the branch makes IS gated behaviourally, radar-side, by
+/// `needs_decode_is_true_only_with_bytes_and_no_moments_and_no_errand` and
+/// `the_frame_build_answers_none_rather_than_decoding`. What is ungated is only
+/// the glue between the two, and a behavioural test for it is owed the moment
+/// a pump harness exists.
+///
+/// **Nothing here reads the admission door.** On the reproduced freeze the
+/// door admitted every time on an over-stated `room`, so a grant is not
+/// evidence that anything fits; the expectations here are about what the pump
+/// does with bytes it can see, and the page-fit claim is asserted from a
+/// resident total elsewhere (`web_freeze_2026_09_07` in the budget crate).
+///
+/// TAMPER: delete the plan walk from the pump, or drop the `decoded_room_for`
+/// check from it, or add a decode to `frame_render_job`.
+#[test]
+fn the_pump_asks_for_a_decode_before_it_asks_for_the_network() {
+    const APP_RENDER: &str = include_str!("../app_render.rs");
+
+    // Bodies are taken up to the closing brace at method indentation — the
+    // same delimiter `frame_thread_conversion_tests::body_of` uses. Splitting
+    // on the next `fn ` silently OVER-READS: the next item is often
+    // `pub(super) fn`, so the "body" runs on into later functions and picks up
+    // their words. That is how the first version of this test reported the
+    // render spawn mentioning `decode` when its own body does not.
+    let (_, rest) = APP_RENDER
+        .split_once("fn dispatch_pending_loop_downloads")
+        .expect("the loop download pump is no longer written here");
+    let body = rest.split_once("\n    }").map_or(rest, |(body, _)| body);
+
+    assert!(
+        body.contains("frames_needing_decode"),
+        "the pump no longer walks the plan for frames whose bytes are held and \
+         whose moments are not, so a frame the residency pass evicted, or one \
+         whose decode was deferred at arrival, is never decoded again"
+    );
+    assert!(
+        body.contains("decoded_room_for"),
+        "the pump dispatches decodes without asking the decoded ceiling: a \
+         retarget then admits every frame's volume at once, which is the \
+         reproduced wasm death rebuilt out of its fix"
+    );
+    assert!(
+        body.contains("mark_decode_in_flight"),
+        "a dispatched decode is not reserved against the ceiling, so the next \
+         pass cannot see it and over-admits by every decode in flight"
+    );
+    assert!(
+        body.contains("spawn_loop_frame_decode"),
+        "the pump asks the decode question and does not act on it"
+    );
+    let decode_at = body.find("frames_needing_decode").expect("checked above");
+    let fetch_at = body
+        .find("spawn_frame_fetch_task")
+        .expect("the pump no longer fetches at all");
+    assert!(
+        decode_at < fetch_at,
+        "the network branch is reached before the decode branch, so a held \
+         archive loses the race to a download of the same bytes"
+    );
+
+    // And the frame thread's own path stays free of decoding: `frame_render_job`
+    // is called synchronously from the render spawn, so a decode reached from
+    // there would be tens of MB of work on the frame thread.
+    const APP_FETCH: &str = include_str!("../app_fetch.rs");
+    let (_, spawn) = APP_FETCH
+        .split_once("fn spawn_loop_frame_render")
+        .expect("`spawn_loop_frame_render` is no longer written here");
+    let spawn_body = spawn.split_once("\n    }").map_or(spawn, |(b, _)| b);
+    // Named symbols, not the substring "decode": that body legitimately carries
+    // the comment "decode and moves into the image without a copy here", which
+    // is about a reply's WIRE decode and has nothing to do with decoding a
+    // volume. A substring check fails on it and says nothing true.
+    for forbidden in [
+        "spawn_loop_frame_decode",
+        "decode_offloaded",
+        "DecodeJob",
+        "decode_shared",
+        "decode_bytes",
+    ] {
+        assert!(
+            !spawn_body.contains(forbidden),
+            "`spawn_loop_frame_render` reaches `{forbidden}`, and it runs \
+             synchronously on the frame thread: a volume decode there is tens \
+             of MB of work where the frame is being built"
+        );
+    }
 }

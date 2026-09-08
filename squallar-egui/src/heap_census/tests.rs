@@ -8,6 +8,7 @@ use super::*;
 fn distinct() -> Census {
     Census {
         loop_scan_bytes: 1,
+        loop_archive_bytes: 134_217_728,
         loop_l3_bytes: 2,
         still_l3_bytes: 67_108_864,
         still_scan_bytes: 4,
@@ -44,14 +45,19 @@ fn distinct() -> Census {
 fn the_resident_total_leaves_the_gpu_families_out() {
     let c = distinct();
     // One distinct power of two per family, so the sum of them all is
-    // `2^27 - 1`. `overlay pictures` was deleted, so its 64 is no longer among
+    // `2^28 - 1`. `overlay pictures` was deleted, so its 64 is no longer among
     // them — subtracted as the gap it is rather than replaced by a new
     // literal, so this stays a derivation and names which family left.
+    //
+    // The exponent moved from 27 to 28 when `loop archives` landed and took
+    // `2^27`: a family added without moving it would make this assertion fail
+    // by exactly its own figure, which is the failure a fixture like this is
+    // for and not a reason to write the sum as a literal.
     //
     // The exclusions are NAMED rather than spelled as their powers: a literal
     // here goes on passing while pointing at the wrong family after any
     // renumber, which is exactly what a fixture like this exists to catch.
-    let every_family = (1 << 27) - 1 - 64;
+    let every_family = (1 << 28) - 1 - 64;
     assert_eq!(
         c.resident_total(),
         every_family - c.tile_mesh_bytes - c.gpu_texture_bytes - c.raster_shared_bytes,
@@ -103,6 +109,7 @@ fn the_line_names_every_family_and_its_denominator() {
     let said = line(&c, Some(c.resident_total() + 900_000_000), "page");
     for field in [
         "loop scans 1 B",
+        "loop archives 134217728 B",
         "loop l3 2 B",
         "still scans 4 B",
         "derive memo 8 B",
@@ -154,6 +161,7 @@ fn an_unread_heap_prints_no_residual() {
 fn the_widest_line_fits_the_hooks_buffer() {
     let widest = Census {
         loop_scan_bytes: u64::MAX,
+        loop_archive_bytes: u64::MAX,
         loop_l3_bytes: u64::MAX,
         still_l3_bytes: u64::MAX,
         still_scan_bytes: u64::MAX,

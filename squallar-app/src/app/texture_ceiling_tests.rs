@@ -90,7 +90,7 @@ fn a_lowered_ceiling_reaches_the_budgets_in_force() {
 /// **The figure the loop dispatch and its validator both read is the one the
 /// ceiling moved.**
 ///
-/// `spawn_loop_render` reads `budgets.loop_image_side_px` once and carries it
+/// `spawn_loop_frame_render` reads `budgets.loop_image_side_px` once and carries it
 /// into the reply's length check; before 2026-09-06 both halves read the
 /// compile-time `LOOP_IMAGE_SIZE` and could not disagree. This pins the
 /// property that made threading it necessary: lowering the ceiling moves the

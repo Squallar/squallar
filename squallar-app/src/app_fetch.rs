@@ -408,16 +408,26 @@ impl super::App {
     fn decode_offloaded<T: Send + 'static>(
         window: Option<crate::WindowRef>,
         sender: Sender<T>,
-        archive: Vec<u8>,
-        respond: impl FnOnce(Option<squallar_radar::scan::DecodedScan>) -> Option<T> + Send + 'static,
+        archive: std::sync::Arc<Vec<u8>>,
+        respond: impl FnOnce(
+            Option<squallar_radar::scan::DecodedScan>,
+            std::sync::Arc<Vec<u8>>,
+        ) -> Option<T>
+        + Send
+        + 'static,
     ) {
+        // **The archive is handed to the responder as well as to the job, and
+        // that is the whole of what makes the loop's compressed cache free.**
+        // The `Arc` the funnel moves by pointer already existed here and was
+        // dropped when the job finished; a caller that wants to keep the
+        // compressed bytes now takes a refcount on the same allocation
+        // instead of copying 1.0-16.1 MiB back out of nowhere.
+        let kept = std::sync::Arc::clone(&archive);
         squallar_worker::offload::offload_job(
             "level2-decode",
             squallar_worker::offload::Job::Described(
                 squallar_worker::offload::JobRequest::describe(
-                    squallar_radar::jobs::DecodeJob {
-                        archive: std::sync::Arc::new(archive),
-                    },
+                    squallar_radar::jobs::DecodeJob { archive },
                     // A decode draws nothing, so its envelope carries no ceiling —
                     // the same effective 0 it has always had.
                     squallar_worker::offload::ceiling_only_geometry(0),
@@ -427,7 +437,7 @@ impl super::App {
                 // `None` here is an archive that did not decode, which `execute`'s arm
                 // has already logged.
                 let volume = result.and_then(|out| out.take::<squallar_radar::scan::DecodedScan>());
-                if let Some(message) = respond(volume) {
+                if let Some(message) = respond(volume, kept) {
                     let _ = sender.send(message);
                 }
                 crate::app::notify_redraw(&window);
@@ -495,33 +505,39 @@ impl super::App {
                     return;
                 }
             };
-            Self::decode_offloaded(window, sender, archive, move |volume| {
-                let result = match volume {
-                    Some(volume) => {
-                        log::info!("Fetched scan: {} @ {}", site, timestamp);
-                        Ok(ScanData {
-                            scan: volume.scan,
-                            declared_nyquist: volume.declared_nyquist,
-                            site: site.clone(),
-                            timestamp,
-                        })
-                    }
-                    // The archive arrived and would not decode. `execute` has
-                    // logged why; this is what the pane is told.
-                    None => {
-                        let err = format!("Could not decode the volume for {site} @ {timestamp}");
-                        log::error!("{err}");
-                        Err(err)
-                    }
-                };
-                Some(ScanResponse {
-                    generation,
-                    site,
-                    requester,
-                    result,
-                    is_auto_poll: false,
-                })
-            });
+            Self::decode_offloaded(
+                window,
+                sender,
+                std::sync::Arc::new(archive),
+                move |volume, _archive| {
+                    let result = match volume {
+                        Some(volume) => {
+                            log::info!("Fetched scan: {} @ {}", site, timestamp);
+                            Ok(ScanData {
+                                scan: volume.scan,
+                                declared_nyquist: volume.declared_nyquist,
+                                site: site.clone(),
+                                timestamp,
+                            })
+                        }
+                        // The archive arrived and would not decode. `execute` has
+                        // logged why; this is what the pane is told.
+                        None => {
+                            let err =
+                                format!("Could not decode the volume for {site} @ {timestamp}");
+                            log::error!("{err}");
+                            Err(err)
+                        }
+                    };
+                    Some(ScanResponse {
+                        generation,
+                        site,
+                        requester,
+                        result,
+                        is_auto_poll: false,
+                    })
+                },
+            );
         });
     }
 
@@ -899,24 +915,29 @@ impl super::App {
                         Ok(Some((archive, timestamp))) => {
                             // The decode goes to the funnel; the answer is
                             // still conditional, which is what the `Option`
-                            Self::decode_offloaded(window, sender, archive, move |volume| {
-                                let volume = volume?;
-                                Some(crate::channels::ScanResponse {
-                                    generation,
-                                    site: site.clone(),
-                                    // The auto-poll is about the site, not a
-                                    // pane, and keeps the site-wide audience
-                                    // and the site-wide supersede rule.
-                                    requester: FetchRequester::Site,
-                                    result: Ok(crate::channels::ScanData {
-                                        scan: volume.scan,
-                                        declared_nyquist: volume.declared_nyquist,
-                                        site,
-                                        timestamp,
-                                    }),
-                                    is_auto_poll: true,
-                                })
-                            });
+                            Self::decode_offloaded(
+                                window,
+                                sender,
+                                std::sync::Arc::new(archive),
+                                move |volume, _archive| {
+                                    let volume = volume?;
+                                    Some(crate::channels::ScanResponse {
+                                        generation,
+                                        site: site.clone(),
+                                        // The auto-poll is about the site, not a
+                                        // pane, and keeps the site-wide audience
+                                        // and the site-wide supersede rule.
+                                        requester: FetchRequester::Site,
+                                        result: Ok(crate::channels::ScanData {
+                                            scan: volume.scan,
+                                            declared_nyquist: volume.declared_nyquist,
+                                            site,
+                                            timestamp,
+                                        }),
+                                        is_auto_poll: true,
+                                    })
+                                },
+                            );
                             // `decode_offloaded` redraws when it answers.
                             return;
                         }
@@ -2220,29 +2241,34 @@ impl super::App {
         self.spawn_detached(async move {
             match scan::fetch_adjacent_scan(&site, current_utc, forward).await {
                 Ok((archive, timestamp)) => {
-                    Self::decode_offloaded(window, sender, archive, move |volume| {
-                        let result = match volume {
-                            Some(volume) => Ok(crate::channels::ScanData {
-                                scan: volume.scan,
-                                declared_nyquist: volume.declared_nyquist,
-                                site: site.clone(),
-                                timestamp,
-                            }),
-                            None => {
-                                let err =
-                                    format!("Could not decode the adjacent volume for {site}");
-                                log::error!("{err}");
-                                Err(err)
-                            }
-                        };
-                        Some(crate::channels::ScanResponse {
-                            generation,
-                            site,
-                            requester,
-                            result,
-                            is_auto_poll: false,
-                        })
-                    });
+                    Self::decode_offloaded(
+                        window,
+                        sender,
+                        std::sync::Arc::new(archive),
+                        move |volume, _archive| {
+                            let result = match volume {
+                                Some(volume) => Ok(crate::channels::ScanData {
+                                    scan: volume.scan,
+                                    declared_nyquist: volume.declared_nyquist,
+                                    site: site.clone(),
+                                    timestamp,
+                                }),
+                                None => {
+                                    let err =
+                                        format!("Could not decode the adjacent volume for {site}");
+                                    log::error!("{err}");
+                                    Err(err)
+                                }
+                            };
+                            Some(crate::channels::ScanResponse {
+                                generation,
+                                site,
+                                requester,
+                                result,
+                                is_auto_poll: false,
+                            })
+                        },
+                    );
                 }
                 Err(e) => {
                     let err = format!("Failed to find adjacent scan: {:?}", e);
@@ -2374,24 +2400,106 @@ impl super::App {
                 site,
                 timestamp,
                 scan: None,
+                archive: None,
             });
             return;
         };
-        Self::decode_offloaded(self.window.clone(), sender, archive, move |volume| {
-            // Both halves, because a loop frame is dealiased on the same terms as
-            // the still frame beside it.
-            let scan = volume.map(|volume| {
-                (
-                    std::sync::Arc::new(volume.scan),
-                    std::sync::Arc::new(volume.declared_nyquist),
-                )
-            });
-            Some(crate::channels::LoopScanDownloadResponse {
+        let archive = std::sync::Arc::new(archive);
+        // **The decode is admitted against the decoded ceiling here too, not
+        // only at the pump.** Downloads are not gated by it — the network
+        // should stay busy — so several can land while the decoded set is
+        // full. One that does is filed compressed and cleared from in-flight,
+        // which puts it exactly where the pump's plan walk looks for frames to
+        // decode when room frees. Nothing is copied: the same `Arc` rides back.
+        if !self.loop_mgr.decoded_room_for(
+            &site,
+            squallar_device_profile::constants::LOOP_DECODED_CEILING_BYTES,
+        ) {
+            let _ = sender.send(crate::channels::LoopScanDownloadResponse {
                 site,
                 timestamp,
-                scan,
-            })
-        });
+                scan: None,
+                archive: Some(archive),
+            });
+            crate::app::notify_redraw(&self.window);
+            return;
+        }
+        Self::decode_offloaded(
+            self.window.clone(),
+            sender,
+            archive,
+            move |volume, archive| {
+                // Both halves, because a loop frame is dealiased on the same terms as
+                // the still frame beside it.
+                let scan = volume.map(|volume| {
+                    (
+                        std::sync::Arc::new(volume.scan),
+                        std::sync::Arc::new(volume.declared_nyquist),
+                    )
+                });
+                // **The compressed bytes ride back beside the decoded volume**,
+                // so the cache can drop the volume later and rebuild it with a
+                // decode instead of a download. This is a refcount on the
+                // buffer the job already held, not a second copy of it.
+                //
+                // Carried even when the decode FAILED: the bytes are what they
+                // are, and a frame whose archive is undecodable is better
+                // retried as a decode of bytes already here than as a fresh
+                // download of the same bytes.
+                Some(crate::channels::LoopScanDownloadResponse {
+                    site,
+                    timestamp,
+                    scan,
+                    archive: Some(archive),
+                })
+            },
+        );
+    }
+
+    /// **Re-decode a loop frame from compressed bytes this process is already
+    /// holding**, for a frame whose decoded half the residency policy evicted.
+    ///
+    /// [`Self::take_loop_frame_archive`] with the network step removed: the
+    /// same job, the same funnel, the same response and the same in-flight
+    /// bookkeeping, so the arrival path cannot tell a re-decode from a first
+    /// decode and no second filing rule exists to drift from the first.
+    ///
+    /// **Never reached from the frame build.**
+    /// `LoopDownloadManager::frame_render_job` runs synchronously inside
+    /// `App::spawn_loop_frame_render` and answers `None` for a frame with no decoded
+    /// volume, exactly as it does for one whose download has not landed. The
+    /// decode is dispatched from the download pump instead, off the frame
+    /// thread, because a volume decode is 30-80 MiB of work and "it runs
+    /// rarely" is not an exception to that.
+    pub(super) fn spawn_loop_frame_decode(
+        &self,
+        site: String,
+        timestamp: chrono::NaiveDateTime,
+        archive: std::sync::Arc<Vec<u8>>,
+    ) {
+        let sender = self.channels.loop_scan_download_sender.clone();
+        Self::decode_offloaded(
+            self.window.clone(),
+            sender,
+            archive,
+            move |volume, archive| {
+                let scan = volume.map(|volume| {
+                    (
+                        std::sync::Arc::new(volume.scan),
+                        std::sync::Arc::new(volume.declared_nyquist),
+                    )
+                });
+                Some(crate::channels::LoopScanDownloadResponse {
+                    site,
+                    timestamp,
+                    scan,
+                    // The same buffer back again: `cache_archive` replaces the
+                    // entry with the pointer it already held, so re-filing is
+                    // an integer's worth of work and not a second retention.
+                    archive: Some(archive),
+                })
+            },
+        );
     }
 
     /// Spawn the key listing a pane's Level III loop pairings will be ranked against:

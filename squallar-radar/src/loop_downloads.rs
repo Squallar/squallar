@@ -109,7 +109,30 @@ pub enum L3FrameState {
 pub struct LoopDownloadManager {
     /// Downloaded scan data cache for loop frames, keyed by site then timestamp
     /// (shared across every pane looping that site).
+    ///
+    /// **Presence here means "renderable now", and that is what
+    /// [`Self::is_cached`] answers.** A frame whose decoded half has been
+    /// evicted keeps its [`archive_cache`](Self::archive_cache) entry and is
+    /// absent from this map, so every existing reader of `is_cached` stays
+    /// correct without knowing the archive half exists.
     scan_cache: HashMap<String, HashMap<chrono::NaiveDateTime, CachedVolume>>,
+    /// **The compressed archive each loop-downloaded frame was decoded
+    /// from**, keyed exactly as [`scan_cache`](Self::scan_cache) is.
+    ///
+    /// Held so that re-obtaining a volume the decoded cache has evicted is a
+    /// DECODE rather than a network round trip. Measured over 39 archive
+    /// volumes: a decoded volume is 33.7-82.7 MiB and the archive it came
+    /// from is 1.0-16.1 MiB, a median ratio of 17.1x, so holding the
+    /// compressed form instead costs a median 5.8 % of the decoded one.
+    ///
+    /// **Only the loop download path files here.** The archive drain and the
+    /// chunk feed hand this manager decoded volumes with no archive behind
+    /// them, so an absent entry means "no archive was ever kept", never "the
+    /// archive was lost". That is also why this map has no two-clock problem:
+    /// every key it holds was filed under the S3 address the loop downloaded
+    /// it at, which is the same address `scan_cache` used for the same
+    /// arrival.
+    archive_cache: HashMap<String, HashMap<chrono::NaiveDateTime, Arc<Vec<u8>>>>,
     /// Scans currently being downloaded, keyed by site then timestamp (to avoid
     /// duplicate downloads across panes looping the same site).
     in_flight_set: HashMap<String, HashSet<chrono::NaiveDateTime>>,
@@ -193,6 +216,28 @@ pub struct LoopDownloadManager {
     /// [`scan_cache`](Self::scan_cache) is addressed, and every mutation of
     /// one is a mutation of the other.
     scan_prices: HashMap<(String, chrono::NaiveDateTime), usize>,
+    /// **What [`archive_cache`](Self::archive_cache) is holding, in host
+    /// bytes**: each buffer's length and one allocator block for it.
+    ///
+    /// A running total for [`Self::cached_scan_bytes`]'s reason, and a
+    /// SEPARATE total from it on purpose. Decoded volumes and compressed
+    /// archives are different orders of magnitude and are evicted by
+    /// different policies; summing them into one figure would let a cache
+    /// holding 25 archives and no volumes read like one holding half a
+    /// volume, and the census family that reports it could not say which.
+    archive_bytes_cached: usize,
+    /// **Decodes dispatched and not yet landed, with the bytes each was
+    /// reserved at** — the site's reserve at dispatch. Keyed as the caches
+    /// are; a key here is also in `in_flight_set`, never the reverse.
+    ///
+    /// This is what makes the decoded ceiling an ADMISSION bound: a volume
+    /// being decoded is not yet in `scan_bytes_cached`, so a pump that read
+    /// only that total would dispatch a decode per pass until the first one
+    /// landed and then find itself over the ceiling by every decode it had
+    /// started. Reserved at dispatch, released at arrival.
+    decodes_in_flight: HashMap<(String, chrono::NaiveDateTime), usize>,
+    /// Running sum of [`decodes_in_flight`](Self::decodes_in_flight)'s values.
+    decode_reserved_bytes: usize,
     /// **What [`l3_cache`](Self::l3_cache) is holding, in host bytes** — each
     /// product's `bytes` buffer, which is nearly all of it. O(1) to price, so
     /// there is no price map beside it.
@@ -256,6 +301,10 @@ impl LoopDownloadManager {
     pub fn new() -> Self {
         Self {
             scan_cache: HashMap::new(),
+            archive_cache: HashMap::new(),
+            archive_bytes_cached: 0,
+            decodes_in_flight: HashMap::new(),
+            decode_reserved_bytes: 0,
             in_flight_set: HashMap::new(),
             pending_downloads: HashMap::new(),
             pending_l3: HashMap::new(),
@@ -420,6 +469,243 @@ impl LoopDownloadManager {
         self.scan_prices.get(&(site.to_string(), *ts)).copied()
     }
 
+    /// **What one archive buffer costs this process**: its bytes and the one
+    /// allocator block holding them.
+    fn archive_price(archive: &Arc<Vec<u8>>) -> usize {
+        archive
+            .len()
+            .saturating_add(crate::scan_size::ALLOCATOR_BLOCK_OVERHEAD)
+    }
+
+    /// **Keep the compressed archive a loop frame was decoded from**, so the
+    /// decoded half can be evicted and rebuilt without the network.
+    ///
+    /// Takes the `Arc` the job funnel already moved by pointer
+    /// (`jobs::DecodeJob::archive`), so retaining it is a refcount and never
+    /// a copy of 1.0-16.1 MiB.
+    ///
+    /// **The buffer is shared with the decode job that is reading it** for as
+    /// long as that job runs, so during a decode these bytes are named twice
+    /// across this figure and the job's. After the reply lands this map is
+    /// the only owner.
+    pub fn cache_archive(&mut self, site: &str, ts: chrono::NaiveDateTime, archive: Arc<Vec<u8>>) {
+        let price = Self::archive_price(&archive);
+        let previous = self
+            .archive_cache
+            .entry(site.to_string())
+            .or_default()
+            .insert(ts, archive);
+        if let Some(was) = previous {
+            self.archive_bytes_cached = self
+                .archive_bytes_cached
+                .saturating_sub(Self::archive_price(&was));
+        }
+        self.archive_bytes_cached = self.archive_bytes_cached.saturating_add(price);
+    }
+
+    /// Whether the compressed archive for this frame is held, whatever the
+    /// decoded half is doing.
+    pub fn has_archive(&self, site: &str, ts: &chrono::NaiveDateTime) -> bool {
+        self.archive_cache
+            .get(site)
+            .is_some_and(|archives| archives.contains_key(ts))
+    }
+
+    /// The archive for this frame, as a pointer to hand the decode job.
+    pub fn archive_for(&self, site: &str, ts: &chrono::NaiveDateTime) -> Option<Arc<Vec<u8>>> {
+        self.archive_cache.get(site)?.get(ts).map(Arc::clone)
+    }
+
+    /// **Host bytes the compressed archives are holding.** O(1).
+    ///
+    /// Deliberately not folded into [`Self::cached_scan_bytes`]; see
+    /// [`archive_bytes_cached`](Self::archive_bytes_cached).
+    pub fn cached_archive_bytes(&self) -> usize {
+        self.archive_bytes_cached
+    }
+
+    /// How many archives this site is holding. A probe, for the reason the
+    /// probes above it are.
+    pub fn cached_archive_count(&self, site: &str) -> usize {
+        self.archive_cache
+            .get(site)
+            .map_or(0, |archives| archives.len())
+    }
+
+    /// **The third state of a loop frame: its bytes are here and its moments
+    /// are not.**
+    ///
+    /// The download pump asks this after [`Self::is_cached`] and
+    /// [`Self::is_in_flight`] have both said no. `true` means dispatch a
+    /// decode of [`Self::archive_for`]; `false` with the other two false
+    /// means dispatch a download.
+    ///
+    /// In-flight is part of the question because one `in_flight_set` covers
+    /// both errands: a frame being decoded is in flight exactly as a frame
+    /// being downloaded is, so the network concurrency cap keeps meaning one
+    /// thing and a second decode cannot be dispatched for a frame already
+    /// being decoded.
+    pub fn needs_decode(&self, site: &str, ts: &chrono::NaiveDateTime) -> bool {
+        self.has_archive(site, ts) && !self.is_cached(site, ts) && !self.is_in_flight(site, ts)
+    }
+
+    /// **Evict the DECODED half of every frame that fails `keep`, holding on
+    /// to the archive.** Hands the removed volumes back owned, for the
+    /// deferred-drop path.
+    ///
+    /// This is the residency policy, and it is a different question from
+    /// [`Self::retain_scans`]'s: that one asks whether the loop still wants
+    /// the frame AT ALL and drops both halves, this one asks whether the
+    /// frame needs its moments RIGHT NOW.
+    ///
+    /// Only two things read a decoded volume: a first render, and a retarget
+    /// re-render. Playback reads neither — the texture already exists, and
+    /// since `hover::SweepGates` stopped pinning the volume the readout holds
+    /// its own sweep. So a frame that is textured and not about to be
+    /// retargeted needs no moments, and the caller's `keep` is expected to be
+    /// "has no texture yet, or is the playhead or within its lookahead".
+    ///
+    /// A frame evicted here comes back through the decode arm of the pump
+    /// ([`Self::needs_decode`]), off the archive, at no network cost.
+    /// **A volume with no archive behind it is never evicted here**, whatever
+    /// `keep` says. This policy's whole premise is that eviction costs a
+    /// decode; for a volume the archive drain or the chunk feed filed there
+    /// is nothing to decode from, so evicting it would silently convert a
+    /// residency policy into a re-download policy. Those volumes leave only
+    /// through [`Self::retain_scans`], which is the caller saying the frame
+    /// is not wanted at all.
+    pub fn evict_decoded_except(
+        &mut self,
+        keep: impl Fn(&str, &chrono::NaiveDateTime, &nexrad_model::data::Scan) -> bool,
+    ) -> Vec<CachedVolume> {
+        // Disjoint field borrows: the archive map is read inside a closure
+        // that is mutating the scan map, which `self.` spelling cannot express.
+        let Self {
+            scan_cache,
+            archive_cache,
+            scan_prices,
+            scan_bytes_cached,
+            ..
+        } = self;
+        let mut removed = Vec::new();
+        let mut gone: Vec<(String, chrono::NaiveDateTime)> = Vec::new();
+        scan_cache.retain(|site, scans| {
+            removed.extend(
+                scans
+                    .extract_if(|ts, (scan, _)| {
+                        let rebuildable = archive_cache
+                            .get(site.as_str())
+                            .is_some_and(|archives| archives.contains_key(ts));
+                        rebuildable && !keep(site.as_str(), ts, scan)
+                    })
+                    .map(|(ts, volume)| {
+                        gone.push((site.clone(), ts));
+                        volume
+                    }),
+            );
+            !scans.is_empty()
+        });
+        for key in gone {
+            if let Some(price) = scan_prices.remove(&key) {
+                *scan_bytes_cached = scan_bytes_cached.saturating_sub(price);
+            }
+        }
+        removed
+    }
+
+    /// **Drop every archive whose `(site, timestamp)` fails `keep`.**
+    ///
+    /// Asked with the address alone and not with the volume, unlike
+    /// [`Self::retain_scans`]: every archive here was filed under the address
+    /// the loop downloaded it at, so the address IS its identity and the
+    /// two-clock hazard that predicate exists for cannot arise.
+    ///
+    /// The caller passes the frame-list predicate — "does a live loop frame
+    /// name this moment" — and not the narrower one that decides decoded
+    /// residency. A site whose loop has retargeted to Level III keeps its
+    /// archives while its frames stand, so retargeting back is a decode
+    /// rather than the re-download it is today.
+    pub fn retain_archives(&mut self, keep: impl Fn(&str, &chrono::NaiveDateTime) -> bool) {
+        let mut freed = 0usize;
+        self.archive_cache.retain(|site, archives| {
+            archives.retain(|ts, archive| {
+                let kept = keep(site.as_str(), ts);
+                if !kept {
+                    freed = freed.saturating_add(Self::archive_price(archive));
+                }
+                kept
+            });
+            !archives.is_empty()
+        });
+        self.archive_bytes_cached = self.archive_bytes_cached.saturating_sub(freed);
+    }
+
+    /// **Hold the archives inside a BYTE ceiling, evicting the ones furthest
+    /// from the playhead first.** Returns the bytes freed.
+    ///
+    /// # Why bytes and not a frame count
+    ///
+    /// Measured over 39 archive volumes: the compressed form is 1,023,254 B
+    /// at the smallest and 16,895,202 B at the largest, a **16.5x swing**,
+    /// while the frame count a loop holds does not move at all. A ceiling
+    /// expressed as frames and sized for the median is 2.9x over budget on
+    /// the largest — `25 * 16,895,202` is 402.8 MiB, which is over the whole
+    /// process target on its own, before a single sweep is held. So the
+    /// bound has to be the quantity that actually varies.
+    ///
+    /// `rank` is asked per held archive and orders eviction: **higher is
+    /// evicted first**, so a caller passes distance from the playhead. Frames
+    /// nobody names should already have gone through
+    /// [`Self::retain_archives`]; this is the second bound, for a loop whose
+    /// every frame is legitimately named and whose archives still do not fit.
+    ///
+    /// An evicted archive costs a re-download if its frame is wanted again,
+    /// which is exactly what a frame costs today — the policy degrades to
+    /// current behaviour rather than to something worse.
+    ///
+    /// O(held) and only when over the ceiling; held is a few dozen.
+    pub fn evict_archives_to_ceiling(
+        &mut self,
+        ceiling: usize,
+        rank: impl Fn(&str, &chrono::NaiveDateTime) -> u64,
+    ) -> usize {
+        if self.archive_bytes_cached <= ceiling {
+            return 0;
+        }
+        let mut held: Vec<(u64, String, chrono::NaiveDateTime, usize)> = Vec::new();
+        // A plain walk and not an iterator chain: `rank` is borrowed by every
+        // entry, and a nested `map` would have to move it.
+        for (site, archives) in &self.archive_cache {
+            for (ts, archive) in archives {
+                held.push((
+                    rank(site.as_str(), ts),
+                    site.clone(),
+                    *ts,
+                    Self::archive_price(archive),
+                ));
+            }
+        }
+        // Furthest first, and the stamp breaks a tie so two archives at equal
+        // distance evict in a fixed order rather than in map order.
+        held.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(&b.2)));
+        let mut freed = 0usize;
+        for (_, site, ts, price) in held {
+            if self.archive_bytes_cached <= ceiling {
+                break;
+            }
+            if let Some(archives) = self.archive_cache.get_mut(&site)
+                && archives.remove(&ts).is_some()
+            {
+                self.archive_bytes_cached = self.archive_bytes_cached.saturating_sub(price);
+                freed = freed.saturating_add(price);
+                if archives.is_empty() {
+                    self.archive_cache.remove(&site);
+                }
+            }
+        }
+        freed
+    }
+
     /// **Tell this cache what a volume is presumed to cost** before anything
     /// has been measured — the budget crate's `LOOP_SCAN_RESERVE_BYTES`.
     ///
@@ -571,7 +857,61 @@ impl LoopDownloadManager {
     }
 
     /// Remove a site's timestamp from the in-flight set (download completed or failed).
+    /// **Bytes the decoded cache is committed to**: what it holds plus what
+    /// every decode in flight was reserved at. The figure the decoded
+    /// ceiling is enforced against, at the pump and at download arrival.
+    pub fn decoded_committed_bytes(&self) -> usize {
+        self.scan_bytes_cached
+            .saturating_add(self.decode_reserved_bytes)
+    }
+
+    /// **Whether one more decode of a `site` volume fits under `ceiling`**,
+    /// pricing the not-yet-decoded volume at the site's reserve — the same
+    /// figure the budget model prices a pending frame at, so admission and
+    /// the model cannot disagree about what a decode will cost.
+    ///
+    /// `true` when nothing is committed yet even if one volume alone exceeds
+    /// the ceiling: a ceiling that admitted nothing would be a loop that never
+    /// renders, which is not the failure it exists to prevent.
+    pub fn decoded_room_for(&self, site: &str, ceiling: usize) -> bool {
+        let committed = self.decoded_committed_bytes();
+        committed == 0 || committed.saturating_add(self.site_scan_reserve_bytes(site)) <= ceiling
+    }
+
+    /// Mark a DECODE in flight: the shared in-flight mark, plus a reservation
+    /// of the site's reserve against the decoded ceiling.
+    pub fn mark_decode_in_flight(&mut self, site: &str, ts: chrono::NaiveDateTime) {
+        let reserve = self.site_scan_reserve_bytes(site);
+        self.mark_in_flight(site, ts);
+        if self
+            .decodes_in_flight
+            .insert((site.to_string(), ts), reserve)
+            .is_none()
+        {
+            self.decode_reserved_bytes = self.decode_reserved_bytes.saturating_add(reserve);
+        }
+    }
+
+    /// **Every frame of `pane`'s plan whose bytes are held and whose moments
+    /// are not**, in plan order — the frames the pump should decode once the
+    /// decoded ceiling has room. Catches both a frame the residency policy
+    /// evicted and one whose decode was deferred at arrival, neither of which
+    /// is in any download queue any more.
+    pub fn frames_needing_decode(&self, pane: usize) -> Vec<(String, chrono::NaiveDateTime)> {
+        let Some(plan) = self.plans.get(&pane) else {
+            return Vec::new();
+        };
+        plan.frames
+            .iter()
+            .filter(|ts| self.needs_decode(&plan.site, ts))
+            .map(|ts| (plan.site.clone(), *ts))
+            .collect()
+    }
+
     pub fn complete_download(&mut self, site: &str, ts: &chrono::NaiveDateTime) {
+        if let Some(reserve) = self.decodes_in_flight.remove(&(site.to_string(), *ts)) {
+            self.decode_reserved_bytes = self.decode_reserved_bytes.saturating_sub(reserve);
+        }
         if let Some(tss) = self.in_flight_set.get_mut(site) {
             tss.remove(ts);
         }
@@ -978,7 +1318,7 @@ mod tests {
     use super::*;
     use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
 
-    fn ts(minute: u32) -> chrono::NaiveDateTime {
+    pub(super) fn ts(minute: u32) -> chrono::NaiveDateTime {
         chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
             .unwrap()
             .and_hms_opt(0, minute, 0)
@@ -988,7 +1328,7 @@ mod tests {
     /// A distinct cached volume. The contents do not matter — every assertion
     /// here is about *which* `Arc` comes back out, compared by pointer — and
     /// nothing here reads the declarations, so the fixture declares nothing.
-    fn volume() -> CachedVolume {
+    pub(super) fn volume() -> CachedVolume {
         (scan(), Arc::default())
     }
 
@@ -1087,7 +1427,7 @@ mod tests {
     /// other test here compares `Arc` pointers and never reads a gate — and a
     /// volume of no sweeps correctly prices at zero, which is exactly the
     /// value the byte assertions below could not tell from a broken total.
-    fn priced_volume() -> CachedVolume {
+    pub(super) fn priced_volume() -> CachedVolume {
         use nexrad_model::data::{MomentData, Radial, RadialStatus, Sweep};
 
         let radials = (0..8)
@@ -1948,5 +2288,495 @@ mod tests {
             80 * 1024 * 1024,
             "evidence smaller than the bootstrap lowered the reserve",
         );
+    }
+}
+
+/// **The compressed-archive half of the loop cache**, and the two eviction
+/// policies over it.
+///
+/// # Every test here names the tamper that must turn it red
+///
+/// Part B shipped a claim in its commit body that no test in its file could
+/// falsify — every fixture happened to make the defect invisible — and it was
+/// caught only by tampering the assertion after writing it. So each test below
+/// records, in its own doc, the one-line change to production code that must
+/// make it fail. **A test whose tamper has not been run is not yet a gate**,
+/// and none of these tampers has been run at the time of writing.
+#[cfg(test)]
+mod archive_tests {
+    use super::tests::{priced_volume, ts, volume};
+    use super::*;
+
+    /// An archive buffer of exactly `bytes` bytes.
+    fn archive(bytes: usize) -> Arc<Vec<u8>> {
+        Arc::new(vec![7u8; bytes])
+    }
+
+    /// The measured extremes of the 39-volume corpus, so a ceiling test is run
+    /// against the size that actually breaks a frame-count bound rather than
+    /// against the median that hides it.
+    const CORPUS_MIN_ARCHIVE: usize = 1_023_254;
+    const CORPUS_MAX_ARCHIVE: usize = 16_895_202;
+
+    /// **`is_cached` keeps meaning "renderable now".**
+    ///
+    /// Every existing caller reads it to decide whether a frame can be drawn or
+    /// has to be fetched, and a compressed-only entry can do neither — its
+    /// moments are gone. If this ever answers `true` for an archive-only frame,
+    /// the render path will ask for a volume that is not there.
+    ///
+    /// TAMPER: make `is_cached` consult `archive_cache` as well as `scan_cache`.
+    #[test]
+    fn an_archive_alone_is_not_a_cached_scan() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.cache_archive("KTLX", ts(0), archive(4096));
+
+        assert!(
+            mgr.has_archive("KTLX", &ts(0)),
+            "precondition: the archive was filed"
+        );
+        assert!(
+            !mgr.is_cached("KTLX", &ts(0)),
+            "an archive-only frame reported itself renderable"
+        );
+        assert!(
+            mgr.get_cached("KTLX", &ts(0)).is_none(),
+            "an archive-only frame handed out a volume"
+        );
+        assert_eq!(
+            mgr.cached_scan_count("KTLX"),
+            0,
+            "an archive was counted as a decoded volume"
+        );
+    }
+
+    /// **The third planner state is exactly "bytes here, moments not, nothing
+    /// in flight".**
+    ///
+    /// This is the predicate the download pump branches on. Each of the three
+    /// conjuncts is asserted separately, because a predicate that ignored one
+    /// of them would still pass a test that only checked the happy case: an
+    /// ignored `is_cached` re-decodes a frame that is already renderable, and
+    /// an ignored `is_in_flight` dispatches a second decode for a frame already
+    /// being decoded.
+    ///
+    /// TAMPER: drop any one of the three conjuncts from `needs_decode`.
+    #[test]
+    fn needs_decode_is_true_only_with_bytes_and_no_moments_and_no_errand() {
+        let mut mgr = LoopDownloadManager::new();
+
+        assert!(
+            !mgr.needs_decode("KTLX", &ts(0)),
+            "a frame with nothing at all wants a download, not a decode"
+        );
+
+        mgr.cache_archive("KTLX", ts(0), archive(4096));
+        assert!(
+            mgr.needs_decode("KTLX", &ts(0)),
+            "bytes held and moments absent is the decode state"
+        );
+
+        mgr.mark_in_flight("KTLX", ts(0));
+        assert!(
+            !mgr.needs_decode("KTLX", &ts(0)),
+            "a frame already on an errand must not be dispatched again"
+        );
+        mgr.complete_download("KTLX", &ts(0));
+
+        mgr.cache_scan("KTLX", ts(0), volume());
+        assert!(
+            !mgr.needs_decode("KTLX", &ts(0)),
+            "a renderable frame does not need decoding"
+        );
+    }
+
+    /// **Evicting the moments keeps the bytes, and the two totals move
+    /// independently.**
+    ///
+    /// The whole design rests on this: the decoded total falls by a volume, the
+    /// archive total does not move, and the frame is left in the state the pump
+    /// will rebuild from.
+    ///
+    /// TAMPER: make `evict_decoded_except` drop the archive entry too.
+    #[test]
+    fn evicting_the_decoded_half_leaves_the_archive_and_its_bytes() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.cache_archive("KTLX", ts(0), archive(CORPUS_MIN_ARCHIVE));
+        mgr.cache_scan("KTLX", ts(0), priced_volume());
+
+        let decoded_before = mgr.cached_scan_bytes();
+        let archives_before = mgr.cached_archive_bytes();
+        assert!(decoded_before > 0, "precondition: the volume was priced");
+        assert!(archives_before > 0, "precondition: the archive was priced");
+
+        let dropped = mgr.evict_decoded_except(|_, _, _| false);
+
+        assert_eq!(dropped.len(), 1, "the volume was not handed back owned");
+        assert_eq!(
+            mgr.cached_scan_bytes(),
+            0,
+            "the decoded total did not fall by the evicted volume"
+        );
+        assert_eq!(
+            mgr.cached_archive_bytes(),
+            archives_before,
+            "evicting moments moved the archive total"
+        );
+        assert!(
+            mgr.has_archive("KTLX", &ts(0)),
+            "the archive went with the volume, so the frame now costs a download"
+        );
+        assert!(
+            mgr.needs_decode("KTLX", &ts(0)),
+            "the evicted frame did not land in the decode state"
+        );
+    }
+
+    /// **A volume with no archive behind it is never evicted by the residency
+    /// policy.**
+    ///
+    /// The archive drain and the chunk feed file decoded volumes with no
+    /// compressed bytes. For those, eviction is not "costs a decode" but "costs
+    /// a re-download", which silently converts a residency policy into a
+    /// bandwidth policy. This is the conjunct most likely to be dropped by
+    /// someone simplifying the closure, and the one whose loss is invisible
+    /// until a user on a slow link scrubs a loop.
+    ///
+    /// TAMPER: remove the `rebuildable &&` guard in `evict_decoded_except`.
+    #[test]
+    fn a_volume_with_no_archive_survives_the_residency_policy() {
+        let mut mgr = LoopDownloadManager::new();
+        // Filed the way the chunk feed and the archive drain file: no archive.
+        mgr.cache_scan("KTLX", ts(0), priced_volume());
+        let priced = mgr.cached_scan_bytes();
+
+        let dropped = mgr.evict_decoded_except(|_, _, _| false);
+
+        assert!(
+            dropped.is_empty(),
+            "a volume with nothing to rebuild it from was evicted"
+        );
+        assert!(
+            mgr.is_cached("KTLX", &ts(0)),
+            "and it is gone from the cache"
+        );
+        assert_eq!(
+            mgr.cached_scan_bytes(),
+            priced,
+            "its bytes left the total while the volume stayed, or the reverse"
+        );
+    }
+
+    /// **`retain_archives` drops by the frame predicate and subtracts exactly
+    /// what left.**
+    ///
+    /// TAMPER: make `retain_archives` return without touching
+    /// `archive_bytes_cached`.
+    #[test]
+    fn dropping_archives_subtracts_their_bytes() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.cache_archive("KTLX", ts(0), archive(CORPUS_MIN_ARCHIVE));
+        mgr.cache_archive("KTLX", ts(1), archive(CORPUS_MAX_ARCHIVE));
+        mgr.cache_archive("KOUN", ts(0), archive(CORPUS_MIN_ARCHIVE));
+        let all = mgr.cached_archive_bytes();
+
+        mgr.retain_archives(|site, at| site == "KTLX" && *at == ts(0));
+
+        assert!(mgr.has_archive("KTLX", &ts(0)), "the kept archive left");
+        assert!(
+            !mgr.has_archive("KTLX", &ts(1)),
+            "an unwanted archive stayed"
+        );
+        assert!(
+            !mgr.has_archive("KOUN", &ts(0)),
+            "another site's archive stayed"
+        );
+        assert_eq!(
+            mgr.cached_archive_bytes(),
+            CORPUS_MIN_ARCHIVE + crate::scan_size::ALLOCATOR_BLOCK_OVERHEAD,
+            "the total is not what the one surviving archive holds"
+        );
+        assert!(
+            mgr.cached_archive_bytes() < all,
+            "the total did not fall at all"
+        );
+
+        mgr.retain_archives(|_, _| false);
+        assert_eq!(
+            mgr.cached_archive_bytes(),
+            0,
+            "an emptied cache still priced"
+        );
+    }
+
+    /// **Re-filing an archive under a key already held does not double count.**
+    ///
+    /// The re-decode path files the same buffer back, so this runs on every
+    /// rebuild rather than being an edge case.
+    ///
+    /// TAMPER: drop the `if let Some(was)` subtraction in `cache_archive`.
+    #[test]
+    fn refiling_one_archive_prices_it_once() {
+        let mut mgr = LoopDownloadManager::new();
+        let bytes = archive(CORPUS_MIN_ARCHIVE);
+        mgr.cache_archive("KTLX", ts(0), Arc::clone(&bytes));
+        let once = mgr.cached_archive_bytes();
+
+        mgr.cache_archive("KTLX", ts(0), bytes);
+
+        assert_eq!(
+            mgr.cached_archive_bytes(),
+            once,
+            "re-filing the same buffer charged for it twice"
+        );
+        assert_eq!(mgr.cached_archive_count("KTLX"), 1);
+    }
+
+    /// **The archive ceiling is held in BYTES, and the test uses the corpus
+    /// MAXIMUM rather than its median.**
+    ///
+    /// This is the test the design exists for. A frame-count bound sized for a
+    /// median archive passes on median inputs and is 2.9x over budget on the
+    /// largest: 25 frames at 16,895,202 B is 402.8 MiB, past the whole process
+    /// target on its own. So the fixture is 25 of the largest, and the
+    /// assertion is against the ceiling, not against a frame count.
+    ///
+    /// TAMPER: change `evict_archives_to_ceiling` to stop after a fixed number
+    /// of evictions rather than when under the ceiling.
+    #[test]
+    fn the_archive_ceiling_binds_on_maximum_sized_archives() {
+        const CEILING: usize = 96 * 1024 * 1024;
+        let mut mgr = LoopDownloadManager::new();
+        for minute in 0..25u32 {
+            mgr.cache_archive("KTLX", ts(minute), archive(CORPUS_MAX_ARCHIVE));
+        }
+        let before = mgr.cached_archive_bytes();
+        assert!(
+            before > CEILING,
+            "precondition: 25 maximum archives ({before} B) must exceed the ceiling"
+        );
+
+        // Furthest from the playhead first: minute 0 is the playhead.
+        let freed = mgr.evict_archives_to_ceiling(CEILING, |_, at| {
+            (at.and_utc().timestamp() - ts(0).and_utc().timestamp()) as u64
+        });
+
+        assert!(freed > 0, "nothing was evicted");
+        assert!(
+            mgr.cached_archive_bytes() <= CEILING,
+            "the cache is still {} B, over the {CEILING} B ceiling",
+            mgr.cached_archive_bytes()
+        );
+        assert!(
+            mgr.has_archive("KTLX", &ts(0)),
+            "the playhead's own archive was evicted before further ones"
+        );
+        assert!(
+            !mgr.has_archive("KTLX", &ts(24)),
+            "the furthest archive survived while the ceiling was exceeded"
+        );
+    }
+
+    /// **Under the ceiling, nothing is evicted and nothing is walked.**
+    ///
+    /// The counterpart the ceiling test cannot give: a policy that always
+    /// evicted something would pass the test above and quietly shrink a cache
+    /// that fits.
+    ///
+    /// TAMPER: remove the `if self.archive_bytes_cached <= ceiling { break; }`
+    /// guard from the eviction loop. Removing the EARLY RETURN alone does not
+    /// turn this red — the in-loop guard still stops it on the first pass —
+    /// which the tamper run showed and which is why the guard is named here
+    /// rather than the return.
+    #[test]
+    fn a_cache_inside_the_ceiling_is_left_alone() {
+        const CEILING: usize = 96 * 1024 * 1024;
+        let mut mgr = LoopDownloadManager::new();
+        for minute in 0..25u32 {
+            mgr.cache_archive("KTLX", ts(minute), archive(CORPUS_MIN_ARCHIVE));
+        }
+        let before = mgr.cached_archive_bytes();
+        assert!(before <= CEILING, "precondition: 25 minimum archives fit");
+
+        let freed = mgr.evict_archives_to_ceiling(CEILING, |_, _| 0);
+
+        assert_eq!(freed, 0, "a cache that fits was trimmed anyway");
+        assert_eq!(mgr.cached_archive_bytes(), before);
+        assert_eq!(mgr.cached_archive_count("KTLX"), 25);
+    }
+
+    /// **The decoded ceiling is enforced against what is COMMITTED — held plus
+    /// reserved in flight — not against what has landed.**
+    ///
+    /// A pump that read only `cached_scan_bytes` would dispatch one decode per
+    /// pass until the first landed, then find itself over the ceiling by every
+    /// decode it had started. On the reproduced wasm freeze that is fourteen
+    /// volumes admitted at once out of a retarget. The reservation is what
+    /// makes the ceiling an admission bound.
+    ///
+    /// Nothing here consults the admission door or a grant: on that
+    /// reproduction the door admitted every time on an over-stated `room`, so
+    /// a grant is not evidence that anything fits.
+    ///
+    /// TAMPER: make `decoded_committed_bytes` return `scan_bytes_cached` alone.
+    #[test]
+    fn the_decoded_ceiling_counts_decodes_in_flight() {
+        let mut mgr = LoopDownloadManager::new();
+        const RESERVE: usize = 50 * 1024 * 1024;
+        mgr.set_scan_reserve_bootstrap(RESERVE);
+        // Room for two reserves and not three.
+        let ceiling = 2 * RESERVE + RESERVE / 2;
+        for minute in 0..4u32 {
+            mgr.cache_archive("KTLX", ts(minute), archive(4096));
+        }
+
+        assert!(
+            mgr.decoded_room_for("KTLX", ceiling),
+            "an empty cache has room"
+        );
+        mgr.mark_decode_in_flight("KTLX", ts(0));
+        assert_eq!(
+            mgr.decoded_committed_bytes(),
+            RESERVE,
+            "one decode reserved"
+        );
+        assert!(mgr.decoded_room_for("KTLX", ceiling), "room for a second");
+        mgr.mark_decode_in_flight("KTLX", ts(1));
+        assert_eq!(mgr.decoded_committed_bytes(), 2 * RESERVE);
+        assert!(
+            !mgr.decoded_room_for("KTLX", ceiling),
+            "a third decode was admitted with two in flight and no room for it"
+        );
+        // Marking the same frame twice reserves once.
+        mgr.mark_decode_in_flight("KTLX", ts(1));
+        assert_eq!(
+            mgr.decoded_committed_bytes(),
+            2 * RESERVE,
+            "a re-mark double-reserved"
+        );
+
+        // Landing releases the reservation and the volume takes its place at
+        // its measured size, which is what the ceiling then sees.
+        mgr.complete_download("KTLX", &ts(0));
+        assert_eq!(
+            mgr.decoded_committed_bytes(),
+            RESERVE,
+            "arrival did not release"
+        );
+        mgr.cache_scan("KTLX", ts(0), priced_volume());
+        assert_eq!(
+            mgr.decoded_committed_bytes(),
+            RESERVE + mgr.cached_scan_bytes(),
+            "the landed volume is not what the ceiling now sees"
+        );
+        assert!(
+            mgr.decoded_room_for("KTLX", ceiling),
+            "with one reserve and one small volume there is room again"
+        );
+    }
+
+    /// **A ceiling smaller than one volume still admits the first one.**
+    ///
+    /// The bound exists to stop a loop killing the page, not to stop it
+    /// rendering. A ceiling that admitted nothing on a site whose reserve
+    /// exceeds it would be a loop that never draws, silently.
+    ///
+    /// TAMPER: drop the `committed == 0 ||` arm from `decoded_room_for`.
+    #[test]
+    fn an_empty_decoded_set_admits_one_volume_whatever_the_ceiling() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.set_scan_reserve_bootstrap(80 * 1024 * 1024);
+        assert!(
+            mgr.decoded_room_for("KTLX", 1),
+            "a 1-byte ceiling refused the first volume, so the loop never renders"
+        );
+        mgr.mark_decode_in_flight("KTLX", ts(0));
+        assert!(
+            !mgr.decoded_room_for("KTLX", 1),
+            "and it admits only the one"
+        );
+    }
+
+    /// **The plan walk finds both kinds of frame that need decoding and are in
+    /// no queue**: one the residency pass evicted, and one whose decode was
+    /// deferred at arrival. Neither is in a download queue any more, so a pump
+    /// that only drained its queue would never decode either.
+    ///
+    /// TAMPER: make `frames_needing_decode` read the pending queue instead of
+    /// the plan.
+    #[test]
+    fn the_plan_walk_finds_evicted_and_deferred_frames() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.set_plan(
+            7,
+            FramePlan::new("KTLX".to_string(), vec![ts(0), ts(1), ts(2), ts(3)]),
+        );
+        // ts(0): decoded and textured -> evicted by the residency pass.
+        mgr.cache_archive("KTLX", ts(0), archive(4096));
+        mgr.cache_scan("KTLX", ts(0), priced_volume());
+        mgr.evict_decoded_except(|_, _, _| false);
+        // ts(1): arrived with the decoded set full -> filed compressed only.
+        mgr.cache_archive("KTLX", ts(1), archive(4096));
+        // ts(2): renderable, nothing to do.
+        mgr.cache_archive("KTLX", ts(2), archive(4096));
+        mgr.cache_scan("KTLX", ts(2), priced_volume());
+        // ts(3): never downloaded; a download's job, not a decode's.
+
+        let found = mgr.frames_needing_decode(7);
+        assert_eq!(
+            found,
+            vec![("KTLX".to_string(), ts(0)), ("KTLX".to_string(), ts(1))],
+            "the plan walk did not name exactly the evicted and the deferred frame, in plan order"
+        );
+        // And a frame already on its errand is not named twice.
+        mgr.mark_decode_in_flight("KTLX", ts(0));
+        assert_eq!(
+            mgr.frames_needing_decode(7),
+            vec![("KTLX".to_string(), ts(1))]
+        );
+        assert!(
+            mgr.frames_needing_decode(8).is_empty(),
+            "an unknown pane has no plan"
+        );
+    }
+
+    /// **The frame build never decodes.**
+    ///
+    /// `frame_render_job` is called synchronously from `App::spawn_loop_frame_render`
+    /// on the frame thread. For a frame whose moments have been evicted it must
+    /// answer `None` — the same "nothing to draw" it gives a frame whose
+    /// download has not landed — and leave the rebuild to the pump. A version
+    /// that decoded here would put 30-80 MiB of work on the frame thread, and
+    /// "it runs rarely" is not an exception to that rule.
+    ///
+    /// TAMPER: make `frame_render_job` fall back to `archive_for` and decode.
+    #[test]
+    fn the_frame_build_answers_none_rather_than_decoding() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.cache_archive("KTLX", ts(0), archive(CORPUS_MIN_ARCHIVE));
+
+        let ctx = LoopRenderContext {
+            product: RadarProduct::Reflectivity,
+            elevation: 0.5,
+            lat: 35.3333,
+            lon: -97.2778,
+            storm_motion: None,
+            env_heights: None,
+            srv_fallback: crate::srv::SrvFallback::default(),
+            melting_layer: None,
+            rpg_storm_motion: None,
+        };
+
+        assert!(
+            mgr.frame_render_job("KTLX", &ts(0), &ctx).is_none(),
+            "the frame build produced a job for a frame whose moments are absent"
+        );
+        assert!(
+            mgr.frame_data("KTLX", RadarProduct::Reflectivity, &ts(0))
+                .is_none(),
+            "an archive-only frame reported its data as arrived"
+        );
+        // And the archive is still there for the pump to rebuild from.
+        assert!(mgr.needs_decode("KTLX", &ts(0)));
     }
 }

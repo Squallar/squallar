@@ -2579,6 +2579,7 @@ impl super::App {
         self.render.publish_heap_census();
         census::set_loop_frame_bytes(self.loop_frames.resident_host_bytes());
         census::set_loop_frame_scan_bytes(self.loop_frames.pinned_volume_bytes());
+        census::set_loop_archive_bytes(self.loop_mgr.cached_archive_bytes() as u64);
         census::set_volume_store_bytes(self.volume_store.memory_bytes() as u64);
     }
 
@@ -4556,12 +4557,54 @@ impl super::App {
             return;
         };
 
-        // Filter out timestamps already cached or in flight for this site
+        // **Three states, not two.** A frame is renderable (`is_cached`), or
+        // busy (`is_in_flight`), or its compressed bytes are here and its
+        // moments are not (`needs_decode`), or nothing of it is here at all.
+        // Only the last wants the network; the third wants a decode of bytes
+        // this process is already holding.
+        //
+        // The decodes are counted against the same `slots` as the downloads
+        // and marked on the same in-flight set, because they go through the
+        // same job funnel and the concurrency cap has to mean one thing.
+        //
+        // **The decodes come first and are bounded by BYTES, not only by
+        // slots.** A retarget blanks every frame at once; a pump that
+        // dispatched a decode for each would rebuild the reproduced wasm
+        // death — 596 MiB of decoded volumes on a 1 GiB page — out of the fix
+        // for it. So each decode is admitted against
+        // `LOOP_DECODED_CEILING_BYTES` at the site's reserve, reserved in
+        // flight and released at arrival, and a frame over the ceiling waits
+        // compressed. It does not allocate and die.
+        //
+        // They are taken from the PLAN rather than from the queue, because
+        // the frames that need them are not in any queue: a volume the
+        // residency pass evicted, or one whose decode was deferred at arrival,
+        // was dispatched long ago and popped then.
+        let ceiling = squallar_device_profile::constants::LOOP_DECODED_CEILING_BYTES;
+        let mut decodes = 0usize;
+        for (decode_site, ts) in self.loop_mgr.frames_needing_decode(pane_idx) {
+            if decodes >= slots || !self.loop_mgr.decoded_room_for(&decode_site, ceiling) {
+                break;
+            }
+            let Some(archive) = self.loop_mgr.archive_for(&decode_site, &ts) else {
+                continue;
+            };
+            self.loop_mgr.mark_decode_in_flight(&decode_site, ts);
+            self.spawn_loop_frame_decode(decode_site, ts, archive);
+            decodes += 1;
+        }
+        let slots = slots.saturating_sub(decodes);
+
+        // **Downloads: the queue, minus anything already held in either form.**
+        // A frame with its archive here needs no network whatever its decoded
+        // half is doing; the plan walk above owns that errand.
         let mut batch = Vec::new();
         while !queue.is_empty() && batch.len() < slots {
             let ts = *queue.front().unwrap();
-            if self.loop_mgr.is_cached(&site, &ts) || self.loop_mgr.is_in_flight(&site, &ts) {
-                // Already have or fetching this scan — remove from pending
+            if self.loop_mgr.is_cached(&site, &ts)
+                || self.loop_mgr.is_in_flight(&site, &ts)
+                || self.loop_mgr.has_archive(&site, &ts)
+            {
                 queue.pop_front();
             } else {
                 batch.push(queue.pop_front().unwrap());
@@ -8229,6 +8272,14 @@ fn apply_completed_download(
     resp: crate::channels::LoopScanDownloadResponse,
 ) {
     loop_mgr.complete_download(&resp.site, &resp.timestamp);
+    // **The archive is filed before the volume and independently of it.** It
+    // is what lets the decoded half be evicted later and rebuilt without the
+    // network, and a decode that failed still leaves bytes worth keeping: the
+    // retry is then a decode of what is already here rather than a second
+    // download of the same object.
+    if let Some(archive) = resp.archive {
+        loop_mgr.cache_archive(&resp.site, resp.timestamp, archive);
+    }
     // Skip failures — the mark is cleared either way so the frame can be retried.
     if let Some(volume) = resp.scan {
         loop_mgr.cache_scan(&resp.site, resp.timestamp, volume);

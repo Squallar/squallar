@@ -763,6 +763,191 @@ pub const MAX_CONCURRENT_LOOP_DOWNLOADS: usize = NON_MOBILE_MAX_CONCURRENT_LOOP_
 pub const MOBILE_MAX_CONCURRENT_LOOP_DOWNLOADS: usize = 4;
 pub const NON_MOBILE_MAX_CONCURRENT_LOOP_DOWNLOADS: usize = 8;
 
+/// **The three loop-cache budgets, per arm, sized against a reproduced death.**
+///
+/// # Provenance: a user's browser froze, and the rig reproduced it byte for byte
+///
+/// Web build, MRMS and GMGSI on, a loop playing. An infallible allocation at
+/// the 1 GiB wasm page ceiling — `alloc failed: 2384 B requested, 1024 of 1024
+/// MiB linear in page` — aborting inside the `requestAnimationFrame` callback
+/// with winit's runner `RefCell` mutably borrowed, so the frame loop stops ten
+/// to thirteen seconds after boot while rAF stays healthy and the canvas holds
+/// its last frame. Identical on the previous night's tip: not a regression.
+///
+/// The census at death, read from the rig's own json — the durable copy at
+/// `/home/reddragon/.cache/rd-perf-webfreeze-repro/wf-rig-out-main-lw/`,
+/// `chromium.long.json`, the last `heap census` line before the trap, with
+/// `frame_lines.budget_state.linear_page_mib` reading 1024 in the same file:
+///
+/// ```text
+/// resident total   952,242,007 B   908.1 MiB   of a 1024 MiB page
+/// loop scans       625,178,880 B   596.2 MiB
+/// overlay grids    219,773,456 B   209.6 MiB
+/// still scans       62,017,120 B    59.1 MiB
+/// everything else                    43.2 MiB
+/// ```
+///
+/// That leg's `loop_or_refusal.resident` reads 18 and the firefox leg's reads
+/// 14 (`WASM_MAX_LOOP_FRAMES`), so the per-frame figure is 33-43 MiB depending
+/// on which count is the denominator; the sizing below uses the TOTAL and
+/// does not depend on the split.
+///
+/// The firefox leg died at 828.6 MiB with 447.2 MiB of loop scans and **122.2
+/// MiB** of everything else, so the non-loop residue is 312-381 MiB across the
+/// two browsers. **The sizing below uses 381, the worse of the two.**
+///
+/// The loop's decoded volumes were 66 % of the page. What the loop needs is
+/// one sweep's moments per textured frame (1,359,376 B, a constant of the
+/// instrument — see `hover::SweepGates`), the compressed archive of each frame
+/// so an evicted volume is a decode away rather than a download, and a bounded
+/// number of volumes decoded at any one moment. Three budgets, one per term.
+///
+/// # Why each is BYTES and not a frame count
+///
+/// Over 39 real archive volumes the compressed form spans 1,023,254 to
+/// 16,895,202 B — a 16.5x swing — and the decoded form spans 33.7 to 82.7 MiB,
+/// while the frame count a loop holds does not move. A frame-count ceiling
+/// sized for the median is 2.9x over budget on the largest archive: fourteen
+/// frames at the maximum is 225.5 MiB of archives alone. Bound the quantity
+/// that varies.
+///
+/// # Why each is an ADMISSION ceiling and not only an eviction one
+///
+/// A retarget blanks every frame's texture at once. A policy that keeps a
+/// volume decoded while its frame has no texture would then admit all fourteen
+/// volumes together — the death scene, rebuilt by the fix. So the decoded
+/// ceiling is enforced where a decode is DISPATCHED (the download pump and the
+/// download arrival), not only where a volume is evicted after its texture
+/// lands. Over the ceiling, a frame waits compressed; it does not allocate and
+/// die.
+///
+/// # The wasm arithmetic, against the worse leg
+///
+/// ```text
+/// page                                   1024 MiB
+/// non-loop residue, firefox leg         - 381
+/// decoded ceiling (2 x 74.6 MiB max V)  - 160
+/// archive ceiling                       - 128
+/// 14 sweeps x 1.30 MiB                  -  18
+///                                       ------
+/// short of the wall by                    337 MiB
+/// ```
+///
+/// 337 MiB is the margin for a second overlay family the size of the grids
+/// (210 MiB) with room left over. It is a stated margin against a measured
+/// scene, and the test beside these constants asserts it from the same
+/// figures, so a change to any one term moves the assertion.
+///
+/// An archive ceiling of 128 MiB holds fourteen archives at both corpus
+/// medians (40 and 78 MiB) and trims fourteen at the corpus maximum (226 MiB)
+/// to the nearest seven, which costs those seven a re-download if wanted —
+/// what every frame costs today.
+///
+/// # The arrival rate does not defeat this, and the reason is admission, not
+/// # eviction
+///
+/// The reproduction's console, at two-second ticks: loop scans 0, 0, 0, 99.4,
+/// 397.5, 596.2 MiB — decoded volumes arriving at ~100 MiB/s (149 over one
+/// tick) onto a page already past 600. Two bounds hold that, and the stronger
+/// is the first:
+///
+/// 1. A download landing with the decoded set full is filed COMPRESSED at
+///    arrival (`App::take_loop_frame_archive` asks `decoded_room_for` before it
+///    decodes). Decoded bytes therefore never exceed the ceiling committed, at
+///    any arrival rate, whether or not a sweep ever ran.
+/// 2. Archives then arrive at ~13 MiB/s at the corpus-median size and ~38 at
+///    the maximum (100 MiB/s ÷ 42.6 MiB per volume × C). The archive ceiling is
+///    enforced by `App::evict_unshown_scans`, called from `handle_redraw` —
+///    the per-frame path — so the overshoot between two sweeps at 60 Hz is
+///    under 0.7 MiB at the worst rate, against a ceiling that takes 3.4 s to
+///    fill. A policy that evicted on the next LISTING would not hold; one on
+///    the frame does.
+///
+/// # What is still PROVISIONAL, and what replaces it
+///
+/// The decoded ceiling's real driver is decode latency against playback
+/// cadence, and that latency is UNMEASURED: the harness exists
+/// (`squallar-radar/tests/mem_loop_decode_cost.rs`) and has never been run.
+/// The archive ceiling's right shape is a per-site observed archive peak that
+/// only rises, the archive twin of `LoopDownloadManager::site_scan_peak`. Both
+/// figures below are the honest bootstrap for that measurement, not its result.
+#[cfg(target_arch = "wasm32")]
+pub const LOOP_DECODED_CEILING_BYTES: usize = WASM_LOOP_DECODED_CEILING_BYTES;
+#[cfg(all(not(target_arch = "wasm32"), mobile))]
+pub const LOOP_DECODED_CEILING_BYTES: usize = MOBILE_LOOP_DECODED_CEILING_BYTES;
+#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
+pub const LOOP_DECODED_CEILING_BYTES: usize = DESKTOP_LOOP_DECODED_CEILING_BYTES;
+
+/// Two volumes at the corpus maximum of 74.63 MiB, or three at the death
+/// scene's 42.6. The pipeline depth of the initial fill and of a retarget.
+pub const WASM_LOOP_DECODED_CEILING_BYTES: usize = 160 * 1024 * 1024;
+pub const MOBILE_LOOP_DECODED_CEILING_BYTES: usize = 320 * 1024 * 1024;
+/// Held to the campaign's 250 MiB process target rather than to the box: a
+/// 25-stamp desktop loop was 1,222 MiB of decoded volumes before this.
+pub const DESKTOP_LOOP_DECODED_CEILING_BYTES: usize = 256 * 1024 * 1024;
+
+#[cfg(target_arch = "wasm32")]
+pub const LOOP_ARCHIVE_CEILING_BYTES: usize = WASM_LOOP_ARCHIVE_CEILING_BYTES;
+#[cfg(all(not(target_arch = "wasm32"), mobile))]
+pub const LOOP_ARCHIVE_CEILING_BYTES: usize = MOBILE_LOOP_ARCHIVE_CEILING_BYTES;
+#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
+pub const LOOP_ARCHIVE_CEILING_BYTES: usize = DESKTOP_LOOP_ARCHIVE_CEILING_BYTES;
+
+pub const WASM_LOOP_ARCHIVE_CEILING_BYTES: usize = 128 * 1024 * 1024;
+pub const MOBILE_LOOP_ARCHIVE_CEILING_BYTES: usize = 192 * 1024 * 1024;
+pub const DESKTOP_LOOP_ARCHIVE_CEILING_BYTES: usize = 256 * 1024 * 1024;
+
+/// **Which frames keep their DECODED volume beyond the ones with no texture
+/// yet**: `None` keeps none — a textured frame's volume goes the moment its
+/// texture lands — and `Some(n)` keeps the playhead's and the `n` ahead of it
+/// in the direction of travel, so a retarget's first frames appear without a
+/// decode.
+///
+/// `None` on wasm, because the death above is what a spare 42-75 MiB volume
+/// costs on a 1 GiB page carrying 381 MiB of other families, and a retarget
+/// that waits one decode is a wait and not a wall. `Some(0)` on mobile keeps
+/// the playhead alone. `Some(2)` on desktop is PROVISIONAL: the right value is
+/// `ceil(decode_latency / frame_interval)` and the latency is unmeasured (see
+/// above). Do not inherit the campaign's 250-300 MiB/s-per-lane figure for it;
+/// that came from an eight-lane arm under contention.
+#[cfg(target_arch = "wasm32")]
+pub const LOOP_DECODED_LOOKAHEAD_FRAMES: Option<usize> = WASM_LOOP_DECODED_LOOKAHEAD_FRAMES;
+#[cfg(all(not(target_arch = "wasm32"), mobile))]
+pub const LOOP_DECODED_LOOKAHEAD_FRAMES: Option<usize> = MOBILE_LOOP_DECODED_LOOKAHEAD_FRAMES;
+#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
+pub const LOOP_DECODED_LOOKAHEAD_FRAMES: Option<usize> = DESKTOP_LOOP_DECODED_LOOKAHEAD_FRAMES;
+
+pub const WASM_LOOP_DECODED_LOOKAHEAD_FRAMES: Option<usize> = None;
+pub const MOBILE_LOOP_DECODED_LOOKAHEAD_FRAMES: Option<usize> = Some(0);
+pub const DESKTOP_LOOP_DECODED_LOOKAHEAD_FRAMES: Option<usize> = Some(2);
+
+/// **The census at death, as this crate's own record of the scene the wasm
+/// budgets above were sized against** — bytes, from the rig json, so the test
+/// below can assert the margin from the same figures the doc quotes.
+pub mod web_freeze_2026_09_07 {
+    /// `resident total`, chromium leg.
+    pub const RESIDENT_TOTAL_CHROMIUM: u64 = 952_242_007;
+    /// `loop scans`, chromium leg.
+    pub const LOOP_SCANS_CHROMIUM: u64 = 625_178_880;
+    /// `resident total`, firefox leg.
+    pub const RESIDENT_TOTAL_FIREFOX: u64 = 868_884_686;
+    /// `loop scans`, firefox leg.
+    pub const LOOP_SCANS_FIREFOX: u64 = 468_884_160;
+    /// `overlay grids`, identical on both legs.
+    pub const OVERLAY_GRIDS: u64 = 219_773_456;
+    /// Frames the wasm loop holds: `WASM_MAX_LOOP_FRAMES`. The firefox leg's
+    /// `loop_or_refusal.resident` read exactly this; chromium's read 18.
+    pub const FRAMES: u64 = 14;
+    /// One frame's extracted sweep, `hover::SweepGates::scan_bytes()`,
+    /// constant across all 39 measured volumes.
+    pub const SWEEP_BYTES: u64 = 1_359_376;
+    /// The page.
+    pub const PAGE_BYTES: u64 = 1024 * 1024 * 1024;
+    /// The margin the sizing claims. A stated figure, not headroom by
+    /// accident.
+    pub const CLAIMED_MARGIN_BYTES: u64 = 320 * 1024 * 1024;
+}
+
 /// Maximum total number of loop frames kept per pane.
 /// Limits combined memory from textures and scan data.
 #[cfg(target_arch = "wasm32")]
