@@ -75,13 +75,13 @@ fn bounds() -> GeoBounds {
 pub(super) struct Asked {
     /// One entry per `prepare_job`, holding that dispatch's `ctx.frame`.
     /// `None` is a live raster — the pane's own picture.
-    prepared: Vec<Option<FrameStamp>>,
+    pub(super) prepared: Vec<Option<FrameStamp>>,
     /// One entry per `fetch_frame`, whole. The `run` half is what WI-5's
     /// dispatch dropped: it built `FrameStamp { valid, run: None }` from the
     /// frame list, and the model layer's `frame_target` — the resolver behind
     /// `fetch_frame` — answers `None` without a run, so every model frame
     /// fetch was declined before it was built.
-    fetched: Vec<FrameStamp>,
+    pub(super) fetched: Vec<FrameStamp>,
 }
 
 /// A `FrameSeries` texture layer that lists frames, holds all of them but
@@ -352,6 +352,14 @@ pub(super) fn build_loop(
 ) {
     let pane = app.gui.pane_mut(0).expect("the fixture built a pane");
     pane.set_transport_layer(known::MODEL_DATA);
+    // **The pane draws the layer it is looping.** `time_state_mut` mints a
+    // slot for a layer the pane has never heard of and mints it *off*, so
+    // every loop this fixture built ran on a layer the pane does not draw —
+    // a state a user can reach only by switching the layer off mid-loop, and
+    // the one the supply walk now declines to spend bytes on. Nothing this
+    // suite asserts moved; what moved is the fixture saying which of the two
+    // states it means.
+    pane.set_overlay_enabled(known::MODEL_DATA, true);
     *pane.time_state_mut(&known::MODEL_DATA) = squallar_egui::pane::LayerTimeState::begin(
         (range.1 - range.0).num_seconds() as u64,
         squallar_radar::types::RenderView::PlanView,
@@ -391,7 +399,7 @@ pub(super) fn frame_stamps(app: &crate::app::App) -> Vec<chrono::NaiveDateTime> 
 /// The texture id on each frame, `None` where a frame has no picture. Identity
 /// and not presence: the defect this suite exists for hands every frame the
 /// *same* handle, which reads green against any `is_some()`.
-fn frame_textures(app: &crate::app::App) -> Vec<Option<egui::TextureId>> {
+pub(super) fn frame_textures(app: &crate::app::App) -> Vec<Option<egui::TextureId>> {
     app.gui
         .pane(0)
         .expect("pane 0")

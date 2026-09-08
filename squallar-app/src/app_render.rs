@@ -7133,6 +7133,36 @@ impl super::App {
                     {
                         continue;
                     }
+                    // **A layer this pane does not draw is supplied nothing
+                    // and holds nothing.**
+                    //
+                    // A loop survives its layer being switched off — the
+                    // transport keeps a running timeline
+                    // (`PaneState::refresh_transport`), so the frame list, the
+                    // listing and the playhead all stand — and every pass of
+                    // this walk went on putting the granules on the wire and
+                    // the rasters on the funnel for frames no pane could
+                    // paint, then holding a texture per frame for the life of
+                    // the session. The fetch and the render gates that landed
+                    // for the still picture never reached the loop's half.
+                    //
+                    // `PaneState::is_overlay_enabled` is the accessor the draw
+                    // walk's own per-layer skip asks, composed here as the
+                    // still picture's two doors compose it — not a second
+                    // reading of "the user switched this off".
+                    //
+                    // **The way back is this same walk.** Only the textures
+                    // go: `evict_textures_outside_render_set(0)` empties
+                    // `frame.image` and leaves the stamps, so the pass after
+                    // the layer comes back on finds every frame owed a picture
+                    // and refills it in place. Nothing else is torn down —
+                    // no queue is retired and no list is re-sampled — so the
+                    // loop that comes back is the loop that left.
+                    if !pane.is_overlay_enabled(&id) {
+                        pane.time_state_mut(&id)
+                            .evict_textures_outside_render_set(0);
+                        continue;
+                    }
                     let held = layer_share(
                         &allocation,
                         pane_idx,
@@ -9607,6 +9637,12 @@ mod first_launch_tests;
 #[path = "app_render/disabled_layer_render_tests.rs"]
 #[cfg(test)]
 mod disabled_layer_render_tests;
+
+/// The loop's half of "a layer that is not drawn is not rendered": the supply
+/// a pane stops spending on a layer it no longer draws, and the way back.
+#[path = "app_render/disabled_layer_loop_tests.rs"]
+#[cfg(test)]
+mod disabled_layer_loop_tests;
 
 #[path = "app_render/loop_dispatch_tests.rs"]
 #[cfg(test)]
