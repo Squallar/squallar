@@ -1154,3 +1154,56 @@ fn a_stored_fingerprint_is_the_stored_bytes_and_moves_with_them() {
     assert_eq!(contiguous.stored_fingerprint("v").expect("read"), None);
     assert_eq!(contiguous.stored_fingerprint("absent").expect("read"), None);
 }
+
+/// **The `Vec<f32>` sink reserves exactly the count it is given**, not the
+/// doubling `try_reserve` would take.
+///
+/// `count` is the whole read stated before the first value arrives — that is
+/// what the trait is for — so an amortised reserve buys no second growth and
+/// costs a block up to twice the array: 120,000,000 B for the 60,000,000 B
+/// mosaic this trait exists to keep out of the heap in the first place.
+///
+/// Nothing shipped calls this impl today, and every caller that might would
+/// hand it a destination already the right length, so a test on a real read is
+/// a test of a no-op. Both arms below are the case that is not: a destination
+/// carrying a block shorter than the read, empty and non-empty, since `reserve`
+/// is `additional` and a non-empty sink must reach `len + count` and no more.
+#[test]
+fn the_vec_sink_reserves_exactly_the_count_and_not_twice_what_it_holds() {
+    const COUNT: usize = 4_096;
+    const PRIOR: usize = 16;
+
+    let mut empty: Vec<f32> = Vec::new();
+    empty.reserve_exact(COUNT - COUNT / 4);
+    let short = empty.capacity();
+    assert!(
+        short < COUNT && short * 2 > COUNT,
+        "the premise is a block short of {COUNT} by an amount the amortised \
+         path would overshoot, and it holds {short}",
+    );
+    UnpackedSink::reserve(&mut empty, COUNT).expect("the reserve fits");
+    assert_eq!(
+        empty.capacity(),
+        COUNT,
+        "an empty sink reserved {} for a read of {COUNT}",
+        empty.capacity(),
+    );
+
+    let mut appended: Vec<f32> = Vec::new();
+    appended.reserve_exact(COUNT - COUNT / 4);
+    appended.resize(PRIOR, 0.0);
+    let held = appended.capacity();
+    assert!(
+        held < PRIOR + COUNT && held * 2 > PRIOR + COUNT,
+        "the premise is a block short of {} by an amount the amortised path \
+         would overshoot, and it holds {held}",
+        PRIOR + COUNT,
+    );
+    UnpackedSink::reserve(&mut appended, COUNT).expect("the reserve fits");
+    assert_eq!(
+        appended.capacity(),
+        PRIOR + COUNT,
+        "a sink holding {PRIOR} values reserved {} for a further {COUNT}",
+        appended.capacity(),
+    );
+}

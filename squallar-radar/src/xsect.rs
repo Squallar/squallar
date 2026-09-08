@@ -545,15 +545,50 @@ impl SectionPlanes {
 
     /// Make these planes exactly what `vec![0u8; pixels * 4]`,
     /// `vec![f32::NAN; pixels]` and `vec![NoCoverage; pixels]` would be.
+    ///
+    /// Every `resize` is preceded by its own `reserve_exact`, as
+    /// `render::checkout_image` is and for the same reason: `resize` reserves
+    /// through `Vec::reserve`, the AMORTISED path, so a plane arriving here
+    /// shorter than a section is grown to `max(2 * capacity, need)` rather
+    /// than to `need`. Each plane is cleared first, so its `len` is zero and
+    /// the exact reserve targets the whole plane.
+    ///
+    /// **Three reserves and not one figure.** The planes are three widths —
+    /// four bytes a pixel, an `f32` a pixel, a byte a pixel — and a reserve
+    /// weighed against anything but the plane's own need would be an upper
+    /// bound that the smaller planes' doubling fits under.
     fn fit(&mut self) {
         let pixels = SECTION_WIDTH * SECTION_HEIGHT;
         self.image.clear();
+        self.image.reserve_exact(pixels * 4);
         self.image.resize(pixels * 4, 0u8);
         self.values.clear();
+        self.values.reserve_exact(pixels);
         self.values.resize(pixels, f32::NAN);
         self.status.clear();
+        self.status.reserve_exact(pixels);
         self.status
             .resize(pixels, SampleStatus::NoCoverage.wire_code());
+    }
+
+    /// Whether these planes are worth parking: no plane holds capacity beyond
+    /// the section the next cut will fit it to.
+    ///
+    /// A plane *smaller* than a section passes — [`fit`](Self::fit) grows it,
+    /// and exactly. What fails is only the other direction, which is what
+    /// [`CrossSection::from_parts`] cannot rule out: it weighs `len`, and a
+    /// plane assembled by growth carries capacity its length does not account
+    /// for. `fit` never shrinks, so without this the slot would hold that
+    /// overhang for the life of the process.
+    ///
+    /// Plane by plane against each plane's own need, not against the set's
+    /// summed bytes: one plane at twice its size is under a sum that the other
+    /// two are at.
+    fn fits_section(&self) -> bool {
+        let pixels = SECTION_WIDTH * SECTION_HEIGHT;
+        self.image.capacity() <= pixels * 4
+            && self.values.capacity() <= pixels
+            && self.status.capacity() <= pixels
     }
 
     /// What the allocator is holding for these planes: every plane's
@@ -584,8 +619,14 @@ fn checkout() -> SectionPlanes {
     planes
 }
 
-/// Offer a set of planes back, keeping them only if the slot is free.
+/// Offer a set of planes back, keeping them only if the slot is free **and**
+/// no plane is larger than a section — see [`SectionPlanes::fits_section`].
 fn recycle(planes: SectionPlanes) {
+    // Before the lock, so an over-large set is freed without the slot's lock
+    // in hand and never counts against [`POOLED_PLANE_BYTES`].
+    if !planes.fits_section() {
+        return;
+    }
     let mut pool = pool();
     if pool.is_none() {
         POOLED_PLANE_BYTES.store(planes.capacity_bytes(), Ordering::Relaxed);

@@ -328,12 +328,20 @@ impl Narrowing {
 
 impl squallar_netcdf::UnpackedSink for Narrowing {
     fn reserve(&mut self, count: usize) -> Result<(), String> {
-        // The buffer is the staging slot's and is already exactly this long;
-        // the reserve is a no-op that stays fallible for the granule whose
-        // shape the slot was not holding.
+        // The buffer is the staging slot's and is normally already exactly
+        // this long; the reserve is then a no-op that stays fallible for the
+        // granule whose shape the slot was not holding.
+        //
+        // **`try_reserve_exact`, as [`Self::widen`] and the whole MRMS path
+        // use.** `try_reserve` is the amortised path: the granule whose count
+        // the slot is *not* holding — the one case where this reserve does
+        // anything at all — would take `max(2 * capacity, count)` and park a
+        // block up to twice the mosaic. On wasm32 that block is permanent,
+        // dlmalloc growing linear memory through `memory.grow` and never
+        // returning it.
         self.count = count;
         self.codes
-            .try_reserve(count)
+            .try_reserve_exact(count)
             .map_err(|_| format!("cannot hold {count} values"))
     }
 

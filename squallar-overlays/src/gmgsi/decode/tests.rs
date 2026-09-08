@@ -1119,3 +1119,50 @@ fn a_granule_whose_values_are_not_byte_exact_is_decoded_wide_and_bit_for_bit() {
         );
     }
 }
+
+/// **The staging buffer grows to exactly the granule's count**, as this
+/// module's own [`Narrowing::widen`] and the whole MRMS path already do.
+///
+/// What masks it is that the two figures agree in every shipped path:
+/// `StagingPool::take` hands back a buffer whose capacity **is** the point
+/// count the decode asked for, or a fresh one reserved exactly, and the count
+/// `read_unpacked_f32_to` then states is that same variable's. So a test on a
+/// real granule cannot tell `try_reserve` from `try_reserve_exact` — both are
+/// no-ops there. The case that is not a no-op is a buffer whose block is
+/// shorter than the count, and there the amortised path takes
+/// `max(2 * capacity, count)`: up to twice a mosaic, which on wasm32 is
+/// permanent, dlmalloc growing linear memory through `memory.grow` and never
+/// returning it.
+///
+/// Asserted against the count itself, not against [`crate::gmgsi::GRID_POINTS`]:
+/// a bound taken from the shape this build was sized for is a bound a doubled
+/// smaller mosaic can sit under.
+#[test]
+fn the_staging_buffer_reserves_exactly_the_count_the_granule_declares() {
+    const COUNT: usize = 40_000;
+
+    let mut held: Vec<u8> = Vec::new();
+    held.reserve_exact(COUNT - COUNT / 4);
+    let short = held.capacity();
+    // Both halves of the premise: shorter than the count, so the reserve is
+    // not a no-op, and over half of it, so the amortised answer overshoots.
+    assert!(
+        short < COUNT && short * 2 > COUNT,
+        "the premise is a block short of {COUNT} by an amount the amortised \
+         path would overshoot, and it holds {short}",
+    );
+
+    let mut values = Narrowing::new(held, 0);
+    squallar_netcdf::UnpackedSink::reserve(&mut values, COUNT).expect("the reserve fits");
+
+    assert_eq!(
+        values.codes.capacity(),
+        COUNT,
+        "the staging buffer holds {} values where the granule declares {COUNT}",
+        values.codes.capacity(),
+    );
+    assert_eq!(
+        values.count, COUNT,
+        "the count the widen path reserves against was not the one stated",
+    );
+}

@@ -248,8 +248,13 @@ pub trait UnpackedSink {
 
 /// The plain destination: the array itself, appended to.
 impl UnpackedSink for Vec<f32> {
+    /// **`try_reserve_exact`, not `try_reserve`.** `count` is the whole read
+    /// stated up front, so there is no second growth for an amortised reserve
+    /// to be paying for; taking `max(2 * capacity, count)` instead would hold
+    /// up to 120,000,000 B for a 60,000,000 B array whenever this destination
+    /// arrives carrying a shorter read's allocation.
     fn reserve(&mut self, count: usize) -> Result<(), String> {
-        self.try_reserve(count)
+        self.try_reserve_exact(count)
             .map_err(|_| format!("cannot hold {count} values"))
     }
 

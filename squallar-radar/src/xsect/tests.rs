@@ -2677,3 +2677,79 @@ fn a_fitted_plane_set_is_what_three_fresh_vecs_would_be() {
         "likewise for the value plane",
     );
 }
+
+/// **A plane shorter than a section is grown to exactly a section**, never to
+/// the doubling `Vec::resize` reaches for on its own.
+///
+/// The dimensions mask this in every shipped path: `SECTION_WIDTH` and
+/// `SECTION_HEIGHT` are compile-time constants, so every set of planes the
+/// slot hands back is already a section's worth and `resize` never grows one.
+/// A test on those constants therefore proves nothing about the growth. This
+/// drives the case a dimension change makes live — planes arriving short of a
+/// section by an amount that makes the amortised and the exact answers differ
+/// — and asserts the capacity **is** the need rather than being enough for it.
+///
+/// Each plane against its own need, never one bound over the set: the three
+/// are three widths, and a bound taken from the widest is a bound a doubled
+/// value or status plane sits comfortably under.
+#[test]
+fn a_short_plane_is_grown_to_exactly_a_section_and_not_to_twice_itself() {
+    let pixels = SECTION_WIDTH * SECTION_HEIGHT;
+
+    /// A plane holding three quarters of `need` and nothing in it.
+    fn short<T>(need: usize) -> Vec<T> {
+        let mut v = Vec::new();
+        v.reserve_exact(need - need / 4);
+        v
+    }
+    let mut planes = SectionPlanes {
+        image: short(pixels * 4),
+        values: short(pixels),
+        status: short(pixels),
+    };
+
+    // The premise, plane by plane: each arrives short of its own need, and
+    // short by an amount that makes `max(2 * capacity, need)` overshoot. Both
+    // halves are required — a plane already long enough would make `fit`'s
+    // reserve a no-op, and a plane under half its need would reach `need`
+    // through the amortised path too.
+    for (label, held, need) in [
+        ("image", planes.image.capacity(), pixels * 4),
+        ("values", planes.values.capacity(), pixels),
+        ("status", planes.status.capacity(), pixels),
+    ] {
+        assert!(
+            held < need && held * 2 > need,
+            "{label}: the premise is a plane short of its {need} by an amount \
+             the amortised path would overshoot, and it holds {held}",
+        );
+    }
+
+    planes.fit();
+
+    assert_eq!(
+        planes.image.capacity(),
+        pixels * 4,
+        "the image plane holds {} B where a section is {} B",
+        planes.image.capacity(),
+        pixels * 4,
+    );
+    assert_eq!(
+        planes.values.capacity(),
+        pixels,
+        "the value plane holds {} values where a section is {pixels}",
+        planes.values.capacity(),
+    );
+    assert_eq!(
+        planes.status.capacity(),
+        pixels,
+        "the status plane holds {} values where a section is {pixels}",
+        planes.status.capacity(),
+    );
+    assert_eq!(
+        planes.capacity_bytes(),
+        pixels * 9,
+        "a fitted set is nine bytes a pixel and this one is {} B",
+        planes.capacity_bytes(),
+    );
+}
