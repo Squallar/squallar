@@ -3448,8 +3448,25 @@ impl PaneState {
         self.overlay_textures.get(id)
     }
 
+    /// **Two hashes rather than one hash and a `String`.** `entry` needs an
+    /// owned key whether or not it uses it, and a config-loaded `LayerId` is a
+    /// `Cow::Owned` — so the old spelling allocated per texture layer per pane
+    /// per frame to look up an entry that was almost always already there.
+    // `clippy::map_entry` says to use `entry` here, and `entry` is the cost
+    // this removed: it takes an OWNED key whether or not it inserts, so the
+    // lint's shape allocates a `String` on every call for a `Cow::Owned` id
+    // that is already in the map. Two hashes of a ten-byte string against one
+    // hash and one malloc, on a path reached per texture layer per pane per
+    // frame.
+    #[allow(clippy::map_entry)]
     pub fn overlay_cache_mut(&mut self, id: &LayerId) -> &mut OverlayTextureCache {
-        self.overlay_textures.entry(id.clone()).or_default()
+        if !self.overlay_textures.contains_key(id) {
+            self.overlay_textures
+                .insert(id.clone(), OverlayTextureCache::default());
+        }
+        self.overlay_textures
+            .get_mut(id)
+            .expect("the entry was just inserted")
     }
 
     /// Whether `kind`'s texture may be let go, judged against the slot list

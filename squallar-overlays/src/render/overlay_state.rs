@@ -166,6 +166,22 @@ pub struct OverlayRegistry {
     /// per pane per frame. Reading the ids out of a flat vector is the same
     /// comparison with none of the calls.
     ids: Vec<LayerId>,
+    /// **The ids of the handlers that render through a texture**, in
+    /// `handlers`' own order, taken once when the registry was built.
+    ///
+    /// The layer walk's cache-token pass is a loop over exactly this list, and
+    /// it rebuilt it PER PANE PER FRAME out of
+    /// `handlers().filter(..).map(|h| h.id())` — one virtual `id()` call per
+    /// registered handler and one owned `LayerId` per texture layer, every
+    /// frame, for a list that cannot change. That cost was invisible to
+    /// [`lookup_ledger`], which counts only the `id()` calls made while
+    /// *answering a lookup*.
+    ///
+    /// Sound for the same reason [`Self::ids`] is, plus one: `handlers` is
+    /// fixed by construction, and [`OverlayHandler::render_mode`] is answered
+    /// by a constant in every implementation this workspace has.
+    /// `registry_texture_ids_match_their_handlers` holds both halves.
+    texture_ids: Vec<LayerId>,
     /// Populated by map clicks; paged through in the popup.
     pub selected_overlays: Vec<Arc<dyn OverlayItem>>,
     pub selected_overlay_page: usize,
@@ -181,10 +197,17 @@ impl Default for OverlayRegistry {
 impl OverlayRegistry {
     pub fn with_handlers(handlers: Vec<Box<dyn OverlayHandler>>) -> Self {
         // The one place `ids` is filled, and the one place `handlers` is.
-        let ids = handlers.iter().map(|h| h.id()).collect();
+        let ids: Vec<LayerId> = handlers.iter().map(|h| h.id()).collect();
+        let texture_ids = handlers
+            .iter()
+            .zip(ids.iter())
+            .filter(|(handler, _)| handler.render_mode().has_texture())
+            .map(|(_, id)| id.clone())
+            .collect();
         Self {
             handlers,
             ids,
+            texture_ids,
             selected_overlays: Vec::new(),
             selected_overlay_page: 0,
         }
@@ -220,6 +243,14 @@ impl OverlayRegistry {
 
     pub fn handlers(&self) -> impl Iterator<Item = &dyn OverlayHandler> {
         self.handlers.iter().map(|h| &**h)
+    }
+
+    /// **Every registered layer that renders through a texture**, in registry
+    /// order — the list the layer walk's cache-token pass iterates.
+    ///
+    /// Held rather than rebuilt: see [`Self::texture_ids`].
+    pub fn texture_ids(&self) -> &[LayerId] {
+        &self.texture_ids
     }
 
     /// The default draw order, bottom to top — every registered handler's id
@@ -1440,6 +1471,37 @@ mod id_cache_tests {
                  {:?}: a lookup for either id reaches the wrong handler.",
                 handler.id(),
                 registry.ids[idx],
+            );
+        }
+    }
+
+    /// **The texture list is the same list a fresh filter would build, and the
+    /// property it rests on is that a handler's render mode does not move.**
+    ///
+    /// Two assertions, because two different things could be wrong: the list
+    /// could have been built from the wrong handlers, or a handler could
+    /// answer `render_mode` differently on a second call. The second is what
+    /// makes holding the list legitimate at all.
+    #[test]
+    fn registry_texture_ids_match_their_handlers() {
+        let registry = OverlayRegistry::with_handlers(sources());
+        let fresh: Vec<LayerId> = registry
+            .handlers()
+            .filter(|h| h.render_mode().has_texture())
+            .map(|h| h.id())
+            .collect();
+        assert_eq!(
+            registry.texture_ids(),
+            fresh.as_slice(),
+            "the held texture list and a freshly filtered one disagree",
+        );
+        for handler in registry.handlers() {
+            assert_eq!(
+                handler.render_mode(),
+                handler.render_mode(),
+                "{} answers `render_mode` differently on two calls, so the \
+                 registry may not hold the answer",
+                handler.display_name(),
             );
         }
     }

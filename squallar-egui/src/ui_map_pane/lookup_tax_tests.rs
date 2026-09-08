@@ -55,6 +55,36 @@ const SLOT_COMPARES_PER_LOOKUP_CEILING: f64 = 1.0;
 /// `panes` times, because that is what a frame does: `render_panes` loops the
 /// panes over one registry.
 fn walk_ledger(panes: usize) -> ((u64, u64, u64), (u64, u64, u64)) {
+    walk_ledger_scene(panes, LayersOn::Every)
+}
+
+/// **Which of the registered layers the scene switches on.**
+///
+/// The six-pane feed seeds — and every rig scene this campaign owns — are
+/// `Every`. A real user's panes are not, and the difference is invisible to any
+/// figure measured on the seeds.
+#[derive(Clone, Copy, Debug)]
+enum LayersOn {
+    /// Every registered layer, which is what `walk_ledger` measures.
+    Every,
+    /// **Every second registered layer, in registry order** — a constructed
+    /// scene, and the construction is stated because nothing we own has one:
+    /// the eighteen handlers `sources::all()` registers are switched on and off
+    /// alternately, so roughly half the texture layers are off and the walk
+    /// still has to decide that about each of them.
+    EverySecond,
+}
+
+impl LayersOn {
+    fn takes(self, idx: usize) -> bool {
+        match self {
+            Self::Every => true,
+            Self::EverySecond => idx % 2 == 0,
+        }
+    }
+}
+
+fn walk_ledger_scene(panes: usize, on: LayersOn) -> ((u64, u64, u64), (u64, u64, u64)) {
     let canvas = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
     let egui_ctx = egui::Context::default();
     let mut overlays = OverlayRegistry::with_handlers(crate::sources::all());
@@ -66,8 +96,8 @@ fn walk_ledger(panes: usize) -> ((u64, u64, u64), (u64, u64, u64)) {
     let mut states: Vec<PaneState> = (0..panes)
         .map(|_| {
             let mut pane = PaneState::new();
-            for id in &ids {
-                pane.set_overlay_enabled(id.clone(), true);
+            for (idx, id) in ids.iter().enumerate() {
+                pane.set_overlay_enabled(id.clone(), on.takes(idx));
             }
             pane.hydrate_layer_states(&overlays, 0);
             pane
@@ -270,6 +300,44 @@ fn pane_lookups_scale_one_for_one_with_panes() {
         "six panes asked their panes {six} times against one pane's {one}: the \
          walk either gained a term six panes share or shed one, and either way \
          the one-pane figures this campaign steers by no longer scale."
+    );
+}
+
+/// **What the walk pays for a layer the pane has switched OFF.**
+///
+/// The cache-token pass asks every texture layer for its content signature, its
+/// theme sensitivity, its as-of term and whether it has data — four registry
+/// resolutions and four slot lookups — and then, for a disabled layer, throws
+/// all four answers away: every consumer of them sits inside an `enabled &&`
+/// conjunction.
+///
+/// **This is worth exactly nothing on any scene this campaign measures**, which
+/// all switch every layer on, and it is paid by every user whose panes are not
+/// all-on. So the figure is quoted against a scene constructed for it —
+/// [`LayersOn::EverySecond`] — and the two are printed side by side so the
+/// denominators cannot be confused.
+///
+/// The property pinned is the one that survives a scene change: switching a
+/// layer OFF must not cost MORE than leaving it on, per layer walked.
+#[test]
+fn a_layer_the_pane_switched_off_is_not_probed_as_if_it_were_on() {
+    let ((all_on_registry, ..), (all_on_pane, ..)) = walk_ledger_scene(1, LayersOn::Every);
+    let ((half_off_registry, ..), (half_off_pane, ..)) =
+        walk_ledger_scene(1, LayersOn::EverySecond);
+    eprintln!(
+        "one pane: every layer on = {all_on_registry} registry / {all_on_pane} pane \
+         lookups; every second layer on = {half_off_registry} / {half_off_pane}"
+    );
+    assert!(
+        half_off_registry < all_on_registry,
+        "a pane with half its layers switched off asked the registry \
+         {half_off_registry} times against an all-on pane's {all_on_registry}. \
+         The walk is pricing a layer the user cannot see as if it drew."
+    );
+    assert!(
+        half_off_pane < all_on_pane,
+        "a pane with half its layers switched off asked its own stack \
+         {half_off_pane} times against an all-on pane's {all_on_pane}."
     );
 }
 

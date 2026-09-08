@@ -991,19 +991,32 @@ pub(super) fn render_pane_map_content(
         // cache token below — a theme flip re-rasterizes on the next frame.
         let is_dark = ui.ctx().global_style().visuals.dark_mode;
 
-        let texture_ids: Vec<LayerId> = ctx
-            .overlays
-            .handlers()
-            .filter(|h| h.render_mode().has_texture())
-            .map(|h| h.id())
-            .collect();
-        for id in &texture_ids {
+        // The registry's own list, not a fresh filter over it: `handlers` is
+        // fixed by construction, so rebuilding this per pane per frame was one
+        // virtual `id()` call per registered handler and one owned `LayerId`
+        // per texture layer, for a list that cannot change.
+        let texture_ids: &[LayerId] = ctx.overlays.texture_ids();
+        for id in texture_ids {
             // Radar rendering is driven by product/elevation changes (not viewport),
             // handled by dispatch_pane_renders() in the platform crate.
             if *id == known::RADAR {
                 continue;
             }
-            let enabled = ctx.pane.is_overlay_enabled(id);
+            // **Asked first, and the whole body is under it.** Every consumer
+            // below is inside an `enabled &&` conjunction; the one statement
+            // that was not is the `clear()` this arm now makes directly. So a
+            // layer the pane has switched OFF used to pay `content_signature`,
+            // `theme_sensitive`, `as_of_term` and `has_data` -- four registry
+            // resolutions and four slot lookups -- for four answers that were
+            // then thrown away.
+            //
+            // This is worth nothing on a scene with every layer on, which is
+            // every scene this campaign measures, and it is paid by every user
+            // whose panes are not all-on.
+            if !ctx.pane.is_overlay_enabled(id) {
+                ctx.pane.overlay_cache_mut(id).clear();
+                continue;
+            }
             let token = overlay_cache_token(ctx.overlays, ctx.pane_idx, ctx.pane, id, is_dark);
             let has_data = ctx
                 .overlays
@@ -1011,8 +1024,7 @@ pub(super) fn render_pane_map_content(
             let cache = ctx.pane.overlay_cache_mut(id);
             // Asked on every frame the overlay is live, and not gated on
             // `render_in_flight`: a skipped frame is missing from the settle clock.
-            let stale = enabled
-                && has_data
+            let stale = has_data
                 && cache.needs_rerender(token, zoom, zoom_drive, &viewport_bounds, &tex_plan);
             let dispatched = stale
                 && cache
@@ -1061,14 +1073,11 @@ pub(super) fn render_pane_map_content(
             // nothing else would ever re-ask, so that one still latches --
             // this is the `request_once` retry, kept.
             resolution.overlay_work_owed |= stale && !dispatched;
-            // `enabled && has_data` and not just `enabled`. A repaint asked for
-            // on a frame that cannot dispatch anything is a wakeup nothing can
-            // satisfy.
-            if enabled && has_data && cache.settle_is_counting_down() {
+            // `has_data` and not just reaching here enabled. A repaint asked
+            // for on a frame that cannot dispatch anything is a wakeup nothing
+            // can satisfy.
+            if has_data && cache.settle_is_counting_down() {
                 settle_counting = true;
-            }
-            if !enabled {
-                cache.clear();
             }
         }
 
