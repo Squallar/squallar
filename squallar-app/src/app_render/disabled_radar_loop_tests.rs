@@ -151,10 +151,16 @@ fn frame_stamps(app: &crate::app::App, pane: usize) -> Vec<chrono::NaiveDateTime
         .collect()
 }
 
-/// The texture id on each of this pane's frames, `None` where the frame holds
-/// no picture — a "did this frame get a picture" assertion about a picture
-/// rather than about a flag.
-fn frame_textures(app: &crate::app::App, pane: usize) -> Vec<Option<egui::TextureId>> {
+/// **Which picture each of this pane's frames holds**, `None` where it holds
+/// none — a "did this frame get a picture" assertion about a picture rather
+/// than about a flag.
+///
+/// A picture key rather than a texture id, because a plan view has two
+/// representations and only one of them has a texture: a fan's pixels never
+/// exist on the host. The key identifies either without the caller knowing
+/// which it got, and its arm tag keeps the two from colliding — see
+/// `RadarSurface::picture_key`.
+fn frame_pictures(app: &crate::app::App, pane: usize) -> Vec<Option<(u8, u64)>> {
     app.gui
         .pane(pane)
         .expect("the fixture built this pane")
@@ -166,7 +172,7 @@ fn frame_textures(app: &crate::app::App, pane: usize) -> Vec<Option<egui::Textur
                 .image
                 .as_ref()
                 .and_then(squallar_egui::pane::LoopFrameImage::plan_view)
-                .map(|picture| picture.texture.id())
+                .map(|picture| picture.surface.picture_key())
         })
         .collect()
 }
@@ -377,7 +383,7 @@ fn a_plan_that_still_describes_its_list_is_left_alone() {
 fn a_loop_on_a_pane_that_needs_no_radar_data_asks_for_nothing() {
     let mut app = app_with_a_loop(&stamps());
     assert!(
-        frame_textures(&app, 0).iter().all(Option::is_none),
+        frame_pictures(&app, 0).iter().all(Option::is_none),
         "premise: every frame is owed its picture, or this claim is vacuous",
     );
 
@@ -442,7 +448,7 @@ fn a_loop_on_a_pane_that_needs_no_radar_data_gives_its_pictures_back() {
     app.dispatch_loop_renders();
 
     assert!(
-        frame_textures(&app, 0).iter().all(Option::is_some),
+        frame_pictures(&app, 0).iter().all(Option::is_some),
         "premise: every frame holds a picture, or there is nothing to release",
     );
     let hover = hover_of(&app, 0, 0);
@@ -462,8 +468,8 @@ fn a_loop_on_a_pane_that_needs_no_radar_data_gives_its_pictures_back() {
     walk(&mut app, PASSES);
 
     assert!(
-        frame_textures(&app, 0).iter().all(Option::is_none),
-        "the frames kept their textures for a layer the pane does not draw",
+        frame_pictures(&app, 0).iter().all(Option::is_none),
+        "the frames kept their pictures for a layer the pane does not draw",
     );
     assert_eq!(
         app.loop_frames.holders(&key),
@@ -510,7 +516,7 @@ fn a_loop_switched_off_and_on_again_comes_back_whole() {
 
     app.dispatch_loop_renders();
     deliver_every_frame(&mut app, &ctx, 0);
-    let before = frame_textures(&app, 0);
+    let before = frame_pictures(&app, 0);
     let playhead_before = app
         .gui
         .pane(0)
@@ -525,7 +531,7 @@ fn a_loop_switched_off_and_on_again_comes_back_whole() {
     set_radar(&mut app, 0, false);
     walk(&mut app, PASSES);
     assert!(
-        frame_textures(&app, 0).iter().all(Option::is_none),
+        frame_pictures(&app, 0).iter().all(Option::is_none),
         "premise: the switch-off really released the pictures, or coming back \
          whole is a claim about a loop that never left",
     );
@@ -562,13 +568,13 @@ fn a_loop_switched_off_and_on_again_comes_back_whole() {
     );
 
     deliver_every_frame(&mut app, &ctx, 0);
-    let after = frame_textures(&app, 0);
+    let after = frame_pictures(&app, 0);
     assert!(
         after.iter().all(Option::is_some),
         "a frame was never re-asked for its picture: {after:?}",
     );
-    let mut distinct: Vec<egui::TextureId> = after.iter().flatten().copied().collect();
-    distinct.sort_by_key(|id| format!("{id:?}"));
+    let mut distinct: Vec<(u8, u64)> = after.iter().flatten().copied().collect();
+    distinct.sort_unstable();
     distinct.dedup();
     assert_eq!(
         distinct.len(),
@@ -606,11 +612,11 @@ fn a_sibling_still_drawing_the_site_keeps_the_shared_picture_and_the_volumes() {
     walk(&mut app, PASSES);
 
     assert!(
-        frame_textures(&app, 0).iter().all(Option::is_some),
+        frame_pictures(&app, 0).iter().all(Option::is_some),
         "the pane still drawing the site lost its pictures",
     );
     assert!(
-        frame_textures(&app, 1).iter().all(Option::is_none),
+        frame_pictures(&app, 1).iter().all(Option::is_none),
         "premise: the disabled pane really let go, or the sibling's pictures \
          survived a release that never happened",
     );

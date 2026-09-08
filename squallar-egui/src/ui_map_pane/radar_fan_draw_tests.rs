@@ -752,6 +752,7 @@ fn ordered_walk(order: impl FnOnce(&mut PaneState)) -> (Vec<LayerId>, Vec<&'stat
         user_fix: None,
         basemap_labels: Vec::new(),
         galley_cache: &mut walkers::GalleyCache::default(),
+        label_cache: &mut crate::label_cache::LabelCache::default(),
         point_text_meshes: &mut crate::point_painter::PointTextMeshes::default(),
         ground_meshes: None,
         radar_fan: Some(&painter),
