@@ -1411,6 +1411,42 @@ struct VisibleSite {
     icon_rect: egui::Rect,
 }
 
+/// The zoom below which a radar site draws its marker but not its name.
+///
+/// Load-bearing beyond legibility: it is what keeps
+/// [`site_label_font_size`] off the sloped part of its own clamp. See there.
+const SITE_LABEL_MIN_ZOOM: f64 = 5.0;
+
+/// The marker glyph's side in points, at `zoom`.
+fn site_icon_size(zoom: f64) -> f32 {
+    (10.0 + zoom as f32 * 2.0).clamp(8.0, 24.0)
+}
+
+/// The site label's text size in points, at `zoom`.
+///
+/// **A text size that is a continuous function of zoom is a font-atlas leak,
+/// and this one is a clamp away from being one.** Every distinct `f32` size
+/// is its own set of glyphs in egui's atlas, epaint evicts none of them, and
+/// the atlas doubles its height to fit — which is how the METAR station model
+/// doubled it twice in five seconds before `station_model::quarter_points`
+/// quantised it, and, by pushing the atlas past the renderer's band cap and
+/// onto the banded upload route, how the place names came out as bars on
+/// Android. That upload route is fixed independently now
+/// (`squallar_gpu::egui_renderer::texture_upload::is_font_atlas`), so what is
+/// left here is the growth alone.
+///
+/// This one is safe by *composition* rather than by construction, and the two
+/// halves live in different functions: the label is only drawn at or above
+/// [`SITE_LABEL_MIN_ZOOM`], and at that zoom [`site_icon_size`] is already
+/// 20.0, whose 0.6 is over the clamp's ceiling. So every zoom that draws gets
+/// exactly 12.0. Widen the clamp, or lower the draw gate, and the sloped
+/// stretch below is reachable and each frame of a pinch asks for a size
+/// nobody has seen. `the_site_label_asks_for_one_size_at_every_zoom_it_draws`
+/// is what says so.
+fn site_label_font_size(zoom: f64) -> f32 {
+    (site_icon_size(zoom) * 0.6).clamp(8.0, 12.0)
+}
+
 /// Project the radar site table once, keeping the sites within a 100 px margin
 /// of this pane. Empty when the layer is off.
 fn visible_radar_sites(
@@ -1425,7 +1461,7 @@ fn visible_radar_sites(
     // The margin is what lets a site just off the edge still draw its label and
     // take a click on the icon straddling the boundary.
     let near = ui.max_rect().expand(100.0);
-    let icon_size = (10.0 + zoom as f32 * 2.0).clamp(8.0, 24.0);
+    let icon_size = site_icon_size(zoom);
     // **The turn this pane is looking at.** `Projector::project` is linear in
     // longitude and folds nothing, so a station written -165.30 seen from a map
     // centred at 170E lands 335 degrees west of centre instead of 25 degrees
@@ -1576,9 +1612,8 @@ fn handle_radar_site_interactions(
     let pane_idx = *pane_idx;
     let pane_rect = *pane_rect;
 
-    let zoom_f32 = zoom as f32;
-    let icon_size = (10.0 + zoom_f32 * 2.0).clamp(8.0, 24.0);
-    let font_size = (icon_size * 0.6).clamp(8.0, 12.0);
+    let icon_size = site_icon_size(zoom);
+    let font_size = site_label_font_size(zoom);
 
     let hover_pos = ui.ctx().pointer_hover_pos();
     let click_pos = *overlay_click_pos;
@@ -1614,7 +1649,7 @@ fn handle_radar_site_interactions(
     // `label_order`'s order is what makes the result stable: the first name to
     // ask finds nothing claimed and therefore always draws, so a viewport with
     // any station in it can never come back with every name suppressed.
-    if zoom >= 5.0 {
+    if zoom >= SITE_LABEL_MIN_ZOOM {
         let mut occupied = walkers::OccupiedAreas::new();
         let ranks = site_label_ranks(sites, pane);
         for idx in crate::site_marker::label_order(&ranks) {
@@ -4402,3 +4437,7 @@ mod pane_cost_tests;
 #[path = "ui_map_pane/resolved_opacity_tests.rs"]
 #[cfg(test)]
 mod resolved_opacity_tests;
+
+#[path = "ui_map_pane/site_label_size_tests.rs"]
+#[cfg(test)]
+mod site_label_size_tests;
