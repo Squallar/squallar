@@ -1368,10 +1368,10 @@ fn render_radar_overlay(
 /// At the radar layer's own position in the pane's layer walk — the same
 /// `ui.painter()`, at the same point in it, that `Painter::image` was called
 /// from a moment ago. So the fan composites exactly where the raster
-/// composited: over the basemap, over the four weather layers whose
-/// `draw_order_weight` is below radar's 30 (satellite, the model composite, the
-/// MRMS mosaic, the fire-weather outlooks), under everything above it, and
-/// under the user's own reordering of that list.
+/// composited: over the basemap, over the five weather layers whose
+/// `draw_order_weight` is below radar's 30 — Global Satellite (5), Model Data
+/// (10), MRMS Mosaic (15), SPC Outlooks (20) and SPC Fire Weather (25) — under
+/// everything above it, and under the user's own reordering of that list.
 ///
 /// The design (§4.1) sites this at the tail of the *ground* callback run
 /// instead, so the fan rides inside a state reset the basemap already paid for.
