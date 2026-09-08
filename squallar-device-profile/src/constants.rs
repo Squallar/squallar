@@ -324,9 +324,11 @@ pub struct PolarFrameShape {
 /// 493 against the 867,184,704 B that figure was before the value grid left
 /// the render on 2026-09-08. A budget that took the polar figure while the
 /// renderer still produced the raster would admit a scene costing ~369× its
-/// price, and `crate::admit`'s door would be
-/// the thing that signed it off. This project has already hard-frozen a user's
-/// laptop with the arithmetic pointing the *other* way.
+/// price, and `crate::admit`'s door would be the thing that signed it off. The
+/// ordering is a safety constraint for that reason alone: the two prices
+/// differ by a factor of 369, so the door cannot tell a scene it can afford
+/// from one it cannot until the producer and the price agree about which
+/// representation a frame is.
 ///
 /// So when the switch comes it must be keyed on **what the renderer actually
 /// produced for that frame** — not on a build flag, not on a feature gate, not
