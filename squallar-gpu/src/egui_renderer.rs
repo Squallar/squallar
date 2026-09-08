@@ -185,6 +185,75 @@ fn staged_geometry(tris: &[egui::ClippedPrimitive]) -> (u64, u64, u64) {
     (vertices, indices, bytes)
 }
 
+/// Empty every mesh the main pass is going to skip anyway, so its bytes are
+/// not staged for a draw that never reads them.
+///
+/// `Renderer::render` skips a primitive whose clip rect scissors to zero width
+/// or height, but `Renderer::update_buffers` copies a mesh's vertices and
+/// indices whatever its clip rect says. Between them, geometry laid out
+/// entirely off the surface is a full trip across the staging window for
+/// nothing.
+///
+/// **What puts geometry off the surface is the 3D panes' floor strips.** They
+/// are drawn below the frame's bottom edge so that
+/// [`EguiRenderer::render_mirror`] can copy them into the mirror texture, and
+/// they are the only thing down there. A strip cannot reach the GPU through
+/// the tile-mesh callback the plan view uses — the mirror swaps callbacks out,
+/// so a callback-drawn strip would mirror as an empty rect — so it places
+/// every vector-tile fill and stroke on the CPU instead. Measured on the
+/// six-pane hardware legs of 2026-09-08, that is the whole of this frame's
+/// geometry: a scene of six 3D-and-plan panes placed 757 M tile vertices over
+/// a leg and staged 1,019,596 per `update_buffers` call, against 22,033 for
+/// the same six panes drawn plan-only, which place none.
+///
+/// The mesh is emptied rather than the primitive removed: `render` walks the
+/// slice lists `update_buffers` filled in lockstep with this slice, so a
+/// shorter slice here would desynchronise them. An empty mesh keeps its place
+/// in both walks and stages nothing.
+///
+/// **Nothing is emptied unless something survives.** `update_buffers` leaves
+/// its slice lists untouched on a call with no indices or no vertices to
+/// stage, which would leave `render` walking whichever call filled them last;
+/// blanking every mesh in the picture is the one way this function could
+/// produce that call, so it declines to.
+///
+/// The walk itself is one scissor computation per primitive, on the slice
+/// [`command_stream::census`] already walks once per frame for the same
+/// reason and with the same rounding.
+fn blank_offsurface_meshes(tris: &mut [egui::ClippedPrimitive], descriptor: &ScreenDescriptor) {
+    use egui::epaint::Primitive;
+
+    let drawn = |clipped: &egui::ClippedPrimitive| {
+        let rect = egui_wgpu::scissor_rect_in_pixels(
+            &clipped.clip_rect,
+            descriptor.pixels_per_point,
+            descriptor.size_in_pixels,
+        );
+        rect[2] != 0 && rect[3] != 0
+    };
+
+    let (kept_vertices, kept_indices) =
+        tris.iter()
+            .fold((0usize, 0usize), |acc, clipped| match &clipped.primitive {
+                Primitive::Mesh(mesh) if drawn(clipped) => {
+                    (acc.0 + mesh.vertices.len(), acc.1 + mesh.indices.len())
+                }
+                _ => acc,
+            });
+    if kept_vertices == 0 || kept_indices == 0 {
+        return;
+    }
+
+    for clipped in tris.iter_mut() {
+        if drawn(clipped) {
+            continue;
+        }
+        if let Primitive::Mesh(mesh) = &mut clipped.primitive {
+            *mesh = egui::epaint::Mesh::default();
+        }
+    }
+}
+
 /// A primitive's clip rect, narrowed to whichever source rect it belongs to;
 /// `Rect::ZERO` for none — a zero-size scissor, which `Renderer::render` skips
 /// while still advancing its buffer iterators. First match, not the union: the
@@ -546,6 +615,10 @@ impl EguiRenderer {
             self.render_mirror(device, queue, &mut tris, &request);
             mirror_us = micros_between(stamp_mirror, web_time::Instant::now());
         }
+        // Off-surface meshes carry no pixel into the pass below, and
+        // `update_buffers` stages them anyway. Emptied here, after the mirror
+        // has taken the copy it needs of them.
+        blank_offsurface_meshes(&mut tris, &screen_descriptor);
         // **Before `stamp_buffers`, and that is the whole point of the
         // placement.** This walk is the instrument for the phase the stamp
         // below opens; counted inside it, the byte total would inflate the

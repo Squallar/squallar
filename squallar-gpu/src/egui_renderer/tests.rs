@@ -691,3 +691,168 @@ fn only_a_hand_on_the_app_makes_the_frame_interact() {
         );
     }
 }
+
+/// A six-pane fixture, the shape the finding needs: three plan panes and
+/// three 3D panes whose floor strips are laid out below the frame's bottom
+/// edge so the mirror can copy them, plus one paint callback on screen.
+///
+/// One pane cannot show this at all — a single pane's own content is on
+/// screen, and it is the strips *beside* it that the main pass stages and
+/// never draws.
+fn six_pane_frame_with_floor_strips() -> Vec<egui::ClippedPrimitive> {
+    fn mesh(vertices: usize, indices: usize) -> egui::epaint::Primitive {
+        egui::epaint::Primitive::Mesh(egui::epaint::Mesh {
+            vertices: vec![egui::epaint::Vertex::default(); vertices],
+            indices: vec![0u32; indices],
+            texture_id: egui::TextureId::default(),
+        })
+    }
+
+    let mut tris = Vec::new();
+    // Six panes, three across and two down, over a 1920x1080 surface.
+    for row in 0..2 {
+        for col in 0..3 {
+            let min = egui::pos2(col as f32 * 640.0, row as f32 * 540.0);
+            tris.push(egui::ClippedPrimitive {
+                clip_rect: egui::Rect::from_min_size(min, egui::vec2(640.0, 540.0)),
+                primitive: mesh(400, 600),
+            });
+        }
+    }
+    // The three 3D panes' floor strips, entirely below the frame. Each one is
+    // the CPU-placed vector-tile geometry the strip cannot send through the
+    // tile-mesh callback.
+    for col in 0..3 {
+        let min = egui::pos2(col as f32 * 640.0, 1080.0);
+        tris.push(egui::ClippedPrimitive {
+            clip_rect: egui::Rect::from_min_size(min, egui::vec2(640.0, 540.0)),
+            primitive: mesh(120_000, 360_000),
+        });
+    }
+    // A raymarch callback on the first 3D pane's glass. `render` draws
+    // callbacks; nothing here may turn one into a mesh.
+    tris.push(egui::ClippedPrimitive {
+        clip_rect: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(640.0, 540.0)),
+        primitive: egui::epaint::Primitive::Callback(egui::epaint::PaintCallback {
+            rect: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(640.0, 540.0)),
+            callback: std::sync::Arc::new(()),
+        }),
+    });
+    tris
+}
+
+/// The main pass stages only the geometry it will draw: a mesh clipped
+/// entirely off the surface is emptied, and one on the surface is not.
+///
+/// Both directions are asserted deliberately. "Nothing off-surface is staged"
+/// passes trivially on a function that empties every mesh in the picture, and
+/// that function would stage an empty frame.
+#[test]
+fn the_main_pass_stages_no_geometry_it_will_not_draw() {
+    // `super::` rather than the module's own import of this type, which is
+    // `cfg(not(target_arch = "wasm32"))` for the sake of the native-only
+    // renderer items beside it. What these two tests guard is not native-only
+    // and is compiled for wasm as well, so they must build there too.
+    let descriptor = super::ScreenDescriptor {
+        size_in_pixels: [1920, 1080],
+        pixels_per_point: 1.0,
+    };
+    let mut tris = six_pane_frame_with_floor_strips();
+    let before = super::staged_geometry(&tris);
+    let primitives_before = tris.len();
+
+    super::blank_offsurface_meshes(&mut tris, &descriptor);
+
+    assert_eq!(
+        tris.len(),
+        primitives_before,
+        "a primitive was added or removed, which desynchronises the slice \
+         lists `update_buffers` fills from the walk `render` makes over them",
+    );
+
+    // The six on-screen panes keep every vertex they had: 6 x (400, 600).
+    // The three strips keep none: they were 3 x (120 000, 360 000).
+    let after = super::staged_geometry(&tris);
+    assert_eq!(
+        before,
+        (6 * 400 + 3 * 120_000, 6 * 600 + 3 * 360_000, {
+            let v: u64 = 6 * 400 + 3 * 120_000;
+            let i: u64 = 6 * 600 + 3 * 360_000;
+            v * size_of::<egui::epaint::Vertex>() as u64 + i * size_of::<u32>() as u64
+        }),
+        "the fixture no longer stages what this test was written against",
+    );
+    assert_eq!(
+        after.0,
+        6 * 400,
+        "the main pass still stages off-surface vertices, or has started \
+         dropping on-surface ones: expected the six panes' 2400 vertices and \
+         none of the floor strips' 360 000, got {}",
+        after.0,
+    );
+    assert_eq!(
+        after.1,
+        6 * 600,
+        "the main pass still stages off-surface indices, or has started \
+         dropping on-surface ones: expected 3600, got {}",
+        after.1,
+    );
+
+    // The positive direction, per primitive rather than in the total: every
+    // on-surface pane mesh is untouched, every strip is empty, and the
+    // callback is still a callback.
+    for (idx, clipped) in tris.iter().enumerate() {
+        match (&clipped.primitive, idx) {
+            (egui::epaint::Primitive::Mesh(mesh), 0..=5) => assert_eq!(
+                (mesh.vertices.len(), mesh.indices.len()),
+                (400, 600),
+                "on-surface pane {idx} lost its geometry",
+            ),
+            (egui::epaint::Primitive::Mesh(mesh), 6..=8) => assert_eq!(
+                (mesh.vertices.len(), mesh.indices.len()),
+                (0, 0),
+                "floor strip {idx} is still staged in full",
+            ),
+            (egui::epaint::Primitive::Callback(_), 9) => {}
+            (primitive, idx) => panic!(
+                "primitive {idx} changed kind: {}",
+                match primitive {
+                    egui::epaint::Primitive::Mesh(_) => "callback became a mesh",
+                    egui::epaint::Primitive::Callback(_) => "mesh became a callback",
+                },
+            ),
+        }
+    }
+}
+
+/// A picture with nothing on the surface is left alone.
+///
+/// `update_buffers` leaves its slice lists as they were when a call has no
+/// indices or no vertices to stage, and `render` then walks lists another
+/// call filled. Emptying every mesh in the picture is the one way this
+/// function could produce that call.
+#[test]
+fn a_picture_that_is_entirely_off_surface_is_left_staged() {
+    // `super::` rather than the module's own import of this type, which is
+    // `cfg(not(target_arch = "wasm32"))` for the sake of the native-only
+    // renderer items beside it. What these two tests guard is not native-only
+    // and is compiled for wasm as well, so they must build there too.
+    let descriptor = super::ScreenDescriptor {
+        size_in_pixels: [1920, 1080],
+        pixels_per_point: 1.0,
+    };
+    let mut tris = six_pane_frame_with_floor_strips();
+    tris.retain(|clipped| clipped.clip_rect.min.y >= 1080.0);
+    assert_eq!(tris.len(), 3, "the fixture's three floor strips");
+    let before = super::staged_geometry(&tris);
+
+    super::blank_offsurface_meshes(&mut tris, &descriptor);
+
+    assert_eq!(
+        super::staged_geometry(&tris),
+        before,
+        "a picture with nothing on the surface was emptied, so the next \
+         `update_buffers` stages nothing and `render` walks whichever slice \
+         lists the previous call left behind",
+    );
+}
