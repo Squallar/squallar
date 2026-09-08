@@ -9499,17 +9499,18 @@ fn the_site_pill_popover_searches_and_switches() {
 ///
 /// `Gui::pane_has_frame_series_layer` is not a read: it walks the pane's
 /// enabled layers from the top and asks each one whether it comes in stamped
-/// frames, and each of those questions scans the whole handler registry,
-/// calling `OverlayHandler::id` on every handler until it matches. The
+/// frames, and each of those questions is a registry resolution. The
 /// timeline's transport row asked it above the step dropdown, on every frame
 /// the timeline was expanded, and its only consumer was the dropdown body —
 /// which `ComboBox::show_ui` runs through `Popup::menu(..).show(..)`, and
 /// egui does not run that while the dropdown is closed
 /// (`containers/combo_box.rs`, `containers/popup.rs`). Counted on the
 /// harness's own one-pane scene, repeat-identical across three runs: one
-/// query a frame, walking 6 of the pane's layers and making **106 handler
-/// probes** — each an `OverlayHandler::id` virtual call returning an owned
-/// `LayerId`, and a full `LayerId` comparison against it — now zero.
+/// query a frame, walking 6 of the pane's layers and — with the question then
+/// spelled as a walk of the handler vector — making **106 handler probes**,
+/// each an `OverlayHandler::id` virtual call returning an owned `LayerId` and
+/// a full `LayerId` comparison against it. Now zero, and the resolution those
+/// six questions became makes no such call either.
 ///
 /// The question is now asked inside the body. The property, both ways:
 /// **zero on a frame with the dropdown closed, one on the frame it is open.**

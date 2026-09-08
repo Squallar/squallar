@@ -2551,9 +2551,8 @@ impl Gui {
     /// [`PaneState::clock_layer`]: crate::pane::PaneState::clock_layer
     /// [`PaneState::topmost_frame_series_layer`]: crate::pane::PaneState::topmost_frame_series_layer
     /// **Not a read**: the walk asks every enabled layer on the pane whether
-    /// it comes in stamped frames, and each of those questions scans the
-    /// registry, calling `OverlayHandler::id` on each handler until it
-    /// matches. Asked where it is drawn — inside the step picker's own
+    /// it comes in stamped frames, and each of those questions is a registry
+    /// resolution. Asked where it is drawn — inside the step picker's own
     /// dropdown body — and nowhere else.
     pub fn pane_has_frame_series_layer(&self, idx: usize) -> bool {
         #[cfg(test)]

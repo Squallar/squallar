@@ -1768,6 +1768,13 @@ impl LayerTimeState {
 /// frames — the one reading of "this layer can loop", asked of the registry
 /// rather than spelled as a match on the id.
 ///
+/// Asked through the registry's own resolver, which reads the id off the list
+/// it was built with. The alternative spelling — walking the handler vector
+/// and calling the virtual `OverlayHandler::id` on each candidate — answers
+/// the same question at one indirect call and one built `LayerId` per handler
+/// ahead of the one it wants, and both callers below ask it once per enabled
+/// layer on the pane.
+///
 /// One function so [`PaneState::topmost_frame_series_layer`] and
 /// [`PaneState::frame_series_layers`] cannot drift: the topmost is the last
 /// member of the set, and two predicates would let it stop being one.
@@ -1775,12 +1782,11 @@ fn comes_in_stamped_frames(
     overlays: &squallar_overlays::render::overlay_state::OverlayRegistry,
     id: &LayerId,
 ) -> bool {
-    overlays.handlers().any(|handler| {
-        handler.id() == *id
-            && matches!(
-                handler.time_axis(),
-                squallar_source::time::TimeAxis::FrameSeries { .. }
-            )
+    overlays.handler_by_id(id).is_some_and(|handler| {
+        matches!(
+            handler.time_axis(),
+            squallar_source::time::TimeAxis::FrameSeries { .. }
+        )
     })
 }
 
@@ -4220,6 +4226,10 @@ mod volume_due_tests;
 /// Which layer the loop transport addresses, and what a config says about it.
 #[cfg(test)]
 mod transport_addressing_tests;
+
+/// What "which of my layers can loop" pays to resolve each layer's handler.
+#[cfg(test)]
+mod frame_series_lookup_tests;
 
 #[cfg(test)]
 mod tests;

@@ -479,13 +479,12 @@ impl Gui {
         // parked at different hours ask the national feed for the very same
         // bytes; splitting them would buy a second identical download for a
         // difference the request never carries.
-        let depicted_matters = overlays.handlers().any(|handler| {
-            handler.id() == *kind
-                && matches!(
-                    handler.time_axis(),
-                    squallar_source::time::TimeAxis::EventLifetime
-                        | squallar_source::time::TimeAxis::FrameSeries { .. }
-                )
+        let depicted_matters = overlays.handler_by_id(kind).is_some_and(|handler| {
+            matches!(
+                handler.time_axis(),
+                squallar_source::time::TimeAxis::EventLifetime
+                    | squallar_source::time::TimeAxis::FrameSeries { .. }
+            )
         });
         let mut asks: Vec<RoundAsk> = Vec::with_capacity(wanting.len());
         let mut owed: Vec<usize> = Vec::with_capacity(wanting.len());
