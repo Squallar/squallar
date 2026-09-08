@@ -101,6 +101,19 @@ pub struct FanGeometry {
     /// The **ground** range of the outer edge of the last reached gate, km:
     /// where the drawn disc ends. The mesh's outermost ring sits here.
     pub reach_km: f64,
+    /// The **ground** range of the inner edge of gate 0, km: where the drawn
+    /// disc begins. The mesh's innermost ring sits here.
+    ///
+    /// **Carried rather than converted downstream**, for the reason the two
+    /// radii below are handed over. It is gate 0's centre less half a gate,
+    /// taken through the same beam bend [`Self::reach_km`] is taken through,
+    /// and the crate that owns that bend fills both in. A renderer deriving it
+    /// from the slant figures would be a second spelling of the beam.
+    ///
+    /// It is also the second of the two numbers one gate's **ground** depth is
+    /// read off — `(reach_km - first_gate_km) / reach_gates` — so nothing
+    /// downstream divides a slant depth by a cosine of its own either.
+    pub first_gate_km: f64,
     /// The sphere a ground range is taken on, km. See the module docs.
     pub earth_radius_km: f64,
     /// The effective (beam-bent) radius a slant range is converted on, km.

@@ -218,6 +218,23 @@ impl RadarSurface {
 
     /// **Host bytes this surface holds**, or `0` for a raster — whose pixels
     /// live in egui's texture manager and are counted there, not here.
+    ///
+    /// Read off the payloads' own vectors and never from a constant: a plane
+    /// is sized by the radials and gates the radar chose, and two sweeps of
+    /// one product disagree about both.
+    ///
+    /// **The same number the card is holding**, which is the representation
+    /// rather than a coincidence: the renderer's residency is a `Weak` handle
+    /// to this very payload, so a fan's plane is on the GPU *and* on this heap
+    /// for as long as the frame lives. That is what lets the scene's per-frame
+    /// GPU price be read from here (`squallar_device_profile`'s
+    /// `PaneNeed::radar_frame_bytes`) without a second measurement that could
+    /// disagree with this one.
+    ///
+    /// So a `0` from this function is **"a raster, priced as one"** and never
+    /// "free". A fan with no sweeps in it cannot reach a caller — the draw
+    /// fork refuses an empty span as malformed — and pricing one as a raster
+    /// would over-price it in any case.
     pub fn resident_bytes(&self) -> usize {
         match self {
             Self::Raster(_) => 0,

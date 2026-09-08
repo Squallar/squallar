@@ -3769,3 +3769,64 @@ fn the_render_cache_cap_falls_with_the_setting_and_never_rises_on_a_rung() {
         );
     }
 }
+
+/// **A pane holding polar frames is charged for polar frames, and the
+/// substitution reaches `NeedTerms::loops` rather than stopping at the
+/// selector.**
+///
+/// The whole of the budget switch on this side. `PaneNeed::radar_frame_bytes`
+/// is what the application measured off the frames the pane is actually
+/// holding, and a plan-view loop is charged that instead of
+/// `Budgets::loop_frame_cost().gpu` — never the other way round, and never on
+/// any signal but the frames themselves.
+///
+/// The scene is held identical between the arms except for the one field, so
+/// the difference in `loops` is that field's and nothing else's; and the frame
+/// count is recovered from the raster arm rather than assumed, so this states
+/// the substitution without restating `frames_for_span`'s arithmetic.
+///
+/// TAMPER: delete the measured arm in `loop_frame_bytes` and the polar arm
+/// reads the raster's total; make it unconditional and the zero arm goes red.
+#[test]
+fn a_pane_holding_polar_frames_is_charged_for_polar_frames() {
+    let budgets = desktop();
+    let raster_frame = budgets.loop_frame_cost().gpu as u64;
+    // A real surveillance plane's whole chain, which is what a pane holding
+    // one measures. Stated here rather than imported: this test is about the
+    // substitution, and it must fail if the substitution stops happening
+    // whatever that figure becomes.
+    const POLAR_FRAME: usize = 1_758_832;
+    assert!(
+        (POLAR_FRAME as u64) < raster_frame,
+        "premise: the polar figure is the smaller of the two ({POLAR_FRAME} vs \
+         {raster_frame}), or the arms below could not tell them apart"
+    );
+
+    let terms = |scene: &Scene| need_terms(scene, &budgets, stand_in_grid_bytes);
+    let as_raster = terms(&scene_of(vec![plan_pane(HD, true, TWO_HOURS, PRECIP)]));
+    let mut polar_pane = plan_pane(HD, true, TWO_HOURS, PRECIP);
+    polar_pane.radar_frame_bytes = POLAR_FRAME;
+    let as_polar = terms(&scene_of(vec![polar_pane]));
+
+    // The frame count is the raster arm's own, recovered rather than assumed.
+    assert!(
+        as_raster.loops > 0,
+        "premise: the raster arm charges a loop"
+    );
+    assert_eq!(as_raster.loops % raster_frame, 0);
+    let frames = as_raster.loops / raster_frame;
+    assert!(
+        frames > 1,
+        "premise: more than one frame, or the two arms could \
+         differ by a rounding"
+    );
+
+    assert_eq!(
+        as_polar.loops,
+        frames * POLAR_FRAME as u64,
+        "the polar pane was charged {} for {frames} frames, which is neither \
+         its own frames' price nor the raster's",
+        as_polar.loops
+    );
+    assert!(as_polar.loops < as_raster.loops);
+}

@@ -128,10 +128,21 @@ pub fn fan_sweep(
     // `[first + (g - 0.5)·interval, first + (g + 0.5)·interval)` and the disc
     // ends at the far end of the last one.
     let reach_slant_km = first + (reach_gates as f64 - 0.5) * interval;
-    let reach_km = match geometry.elevation_deg() {
-        Some(e) => squallar_radar::beam::ground_range_km(reach_slant_km, e),
-        None => reach_slant_km,
+    // And the **inner edge** of gate 0 by the same reading of the same
+    // expression. Held at zero rather than allowed negative: a sweep whose
+    // first gate straddles the site has no disc inside it to draw, and a
+    // negative radius would place the mesh's innermost ring at a bearing half
+    // a turn from the one its sector carries.
+    let near_slant_km = (first - 0.5 * interval).max(0.0);
+    // One conversion spelled once, over both ends. The `None` arm is the sweep
+    // whose two range figures are **already ground ranges** — `PolarGeometry`'s
+    // own distinction — and converting one of those would bend a beam twice.
+    let ground_km = |slant: f64| match geometry.elevation_deg() {
+        Some(e) => squallar_radar::beam::ground_range_km(slant, e),
+        None => slant,
     };
+    let reach_km = ground_km(reach_slant_km);
+    let first_gate_km = ground_km(near_slant_km);
 
     Some(squallar_egui::radar_fan::FanSweep {
         field: crate::render_key::field_id_of(plane.key().product),
@@ -149,6 +160,7 @@ pub fn fan_sweep(
             elevation_deg: geometry.elevation_deg(),
             reach_gates: u32::try_from(reach_gates).ok()?,
             reach_km,
+            first_gate_km,
             // Carried rather than looked up in the renderer, so the shader
             // names no radius of its own and the fragment's ground range is
             // the one the readout's pick took. See `squallar_egui::radar_fan`.

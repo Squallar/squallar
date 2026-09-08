@@ -423,6 +423,7 @@ fn a_polar_reply_is_priced_by_the_payload_it_holds() {
             elevation_deg: Some(0.5),
             reach_gates: 4,
             reach_km: 3.0,
+            first_gate_km: 2.0,
             earth_radius_km: squallar_geo::EARTH_RADIUS_KM,
             effective_radius_km: squallar_radar::beam::RE_EFF_KM,
         },

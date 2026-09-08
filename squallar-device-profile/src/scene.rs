@@ -122,6 +122,31 @@ pub struct PaneNeed {
     /// because an overlay frame is the pane's own raster, planned by a crate
     /// this one sits under.
     pub overlay_frame_bytes: usize,
+    /// **Bytes one frame of this pane's RADAR plan-view loop costs, measured
+    /// off the polar payloads the pane is holding** — or `0` where its frames
+    /// are rasters, or where none has landed yet.
+    ///
+    /// The companion to [`Self::overlay_frame_bytes`] and carried for the same
+    /// reason: a frame's size is the producing crate's answer and this one
+    /// cannot see it. What differs is which of two representations the
+    /// renderer produced, and the two are ~369x apart for one surveillance
+    /// tilt — so this is read from `RadarSurface::resident_bytes` over the frames
+    /// **actually on the pane**, and never from a build flag, a feature gate
+    /// or the presence of a renderer. A price and a producer must not be able
+    /// to disagree about which representation a frame is.
+    ///
+    /// **The zero means "ask the raster's price", not "free".** A pane whose
+    /// loop has not landed a frame yet, and a pane whose sweeps were refused a
+    /// code plane on fidelity grounds, both hold rasters as far as anything
+    /// here can tell, and `crate::fit`'s plan-view arm prices them at
+    /// [`crate::budget::Budgets::loop_frame_cost`] exactly as it always has.
+    /// A polar frame is the cheaper of the two, so the fallback over-prices
+    /// and never under-prices.
+    ///
+    /// **The worst of the pane's frames, not their mean.** A budget is a
+    /// commitment against a peak, and one pane's loop can hold cuts of two
+    /// widths while a product change works through it.
+    pub radar_frame_bytes: usize,
     /// Voxel grids the pane keeps resident beside any loop: one live grid for a
     /// 3D pane, none for a 2D one. A second pane orbiting the same volume adds
     /// none — the grids live in one store keyed by target.
@@ -971,6 +996,7 @@ pub(crate) mod fixtures {
             loop_span_secs: span_secs,
             cadence_secs,
             overlay_frame_bytes: 0,
+            radar_frame_bytes: 0,
             volume_grids: 0,
             ground: GroundPass::Off,
             buildings: false,
@@ -1090,6 +1116,7 @@ pub(crate) mod fixtures {
             loop_span_secs: 0,
             cadence_secs: None,
             overlay_frame_bytes: 0,
+            radar_frame_bytes: 0,
             volume_grids: 1,
             ground,
             buildings: false,

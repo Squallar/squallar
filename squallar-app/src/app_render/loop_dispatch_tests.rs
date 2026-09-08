@@ -767,6 +767,7 @@ fn fan_sweeps() -> std::sync::Arc<[std::sync::Arc<squallar_egui::radar_fan::FanS
                 elevation_deg: Some(0.5),
                 reach_gates: 2,
                 reach_km: 2.5,
+                first_gate_km: 2.0,
                 earth_radius_km: squallar_geo::EARTH_RADIUS_KM,
                 effective_radius_km: squallar_radar::beam::RE_EFF_KM,
             },
@@ -1522,4 +1523,126 @@ fn the_pump_asks_for_a_decode_before_it_asks_for_the_network() {
              of MB of work where the frame is being built"
         );
     }
+}
+
+/// A fan payload of `gates` gates, so two of them differ in size by a number
+/// this file states rather than by a shape it hopes differs.
+fn fan_sweeps_of(
+    gates: u32,
+) -> std::sync::Arc<[std::sync::Arc<squallar_egui::radar_fan::FanSweep>]> {
+    let mut sweep = (*fan_sweeps()[0]).clone();
+    sweep.gates = gates;
+    sweep.codes = vec![0; (sweep.radials * gates) as usize];
+    sweep.geometry.reach_gates = gates;
+    assert!(
+        sweep.is_well_formed(),
+        "the widened fixture still describes itself"
+    );
+    std::sync::Arc::from(vec![std::sync::Arc::new(sweep)])
+}
+
+/// Fill frame `at` of `ls` with the surface a reply carrying `fan` produces.
+fn land(
+    ctx: &egui::Context,
+    ls: &mut LayerTimeState,
+    at: usize,
+    fan: Option<std::sync::Arc<[std::sync::Arc<squallar_egui::radar_fan::FanSweep>]>>,
+) {
+    ls.frames[at].render_in_flight = true;
+    let mut rr = response(
+        ts(at as u32),
+        ls.rendered_for.clone().expect("target adopted"),
+    );
+    accept_render_result(ls, &mut rr, fan, None, |_| dummy_texture(ctx))
+        .expect("the loop is awaiting this result");
+}
+
+/// **The per-frame price a radar loop is budgeted at is read off the frames the
+/// pane is holding, and a raster among them prices the whole set as rasters.**
+///
+/// This is the switch the polar representation lands behind. A polar frame and
+/// a raster of one surveillance tilt are ~369x apart, so the figure the
+/// admission door and the loop pool spend per frame cannot come from a build
+/// flag or from the presence of a renderer — every one of `CodePlane::build`'s
+/// nine product refusals and `sweep_code_plane`'s five per-sweep ones falls
+/// back to the raster, and only the frame itself knows which it became.
+///
+/// Each arm is asserted against what IT needs and never against a shared bound:
+/// the two fan arms against their own payloads' `resident_bytes`, the raster
+/// and empty arms against the literal `0` that means "ask the raster's price".
+///
+/// TAMPER: drop the `is_fan` early return and the mixed arm reads the fan's
+/// bytes (the under-pricing direction, ~369x); swap `max` for `min` and the
+/// two-fan arm reads the narrow payload; return a constant and the two fan
+/// arms disagree with each other.
+#[test]
+fn a_loops_frame_price_is_measured_and_a_raster_anywhere_prices_the_set() {
+    let ctx = egui::Context::default();
+    let narrow = fan_sweeps_of(2);
+    let wide = fan_sweeps_of(64);
+    let narrow_bytes: usize = narrow.iter().map(|s| s.resident_bytes()).sum();
+    let wide_bytes: usize = wide.iter().map(|s| s.resident_bytes()).sum();
+    assert!(
+        wide_bytes > narrow_bytes,
+        "premise: the two fixtures are different sizes, or the max below is \
+         vacuous ({wide_bytes} vs {narrow_bytes})"
+    );
+
+    // Nothing landed: the loop is priced as a raster, because nothing has said
+    // otherwise.
+    let mut ls = loop_on(&ctx, "KTLX", &[]);
+    assert_eq!(radar_loop_frame_bytes(&ls), 0);
+
+    // One fan, and the figure is that payload's own — not the other's.
+    land(&ctx, &mut ls, 0, Some(narrow.clone()));
+    assert_eq!(radar_loop_frame_bytes(&ls), narrow_bytes);
+
+    // Two fans of different widths: the worst frame, which is what one figure
+    // per frame has to be.
+    land(&ctx, &mut ls, 1, Some(wide.clone()));
+    assert_eq!(radar_loop_frame_bytes(&ls), wide_bytes);
+
+    // And a raster beside them — the sweep that was refused a plane. The set
+    // now costs a raster a frame and says so.
+    land(&ctx, &mut ls, 2, None);
+    assert_eq!(
+        radar_loop_frame_bytes(&ls),
+        0,
+        "a raster in the set was priced at the fan's bytes, which under-prices \
+         it by the whole ratio the representation exists for"
+    );
+
+    // The order does not decide it: the raster first, then the fans.
+    let mut ls = loop_on(&ctx, "KTLX", &[]);
+    land(&ctx, &mut ls, 0, None);
+    land(&ctx, &mut ls, 1, Some(wide));
+    assert_eq!(radar_loop_frame_bytes(&ls), 0);
+}
+
+/// **What the switch buys, on the fixtures this file holds** — and the reason
+/// it may not be a constant.
+///
+/// The measured figure is asserted against the *denominator it replaces*:
+/// `Budgets::loop_frame_cost().gpu`, which is what `fit`'s plan-view arm
+/// spends per frame for a raster loop. Not against a magic number, and not
+/// against the ~369x of the design, which is a figure for a 7362 px desktop
+/// raster of a real 1832-gate cut and not for these fixtures.
+#[test]
+fn a_measured_polar_frame_is_cheaper_than_the_raster_it_replaces() {
+    let ctx = egui::Context::default();
+    let budgets = squallar_device_profile::budget::resolve(
+        &squallar_device_profile::budget::DeviceProfile::for_target(),
+    );
+    let raster = budgets.loop_frame_cost().gpu;
+
+    let mut ls = loop_on(&ctx, "KTLX", &[]);
+    land(&ctx, &mut ls, 0, Some(fan_sweeps_of(1832)));
+    let polar = radar_loop_frame_bytes(&ls);
+
+    assert!(polar > 0, "the fixture is a fan and prices as one");
+    assert!(
+        polar < raster,
+        "a polar frame ({polar} B) is not cheaper than the raster loop frame \
+         it replaces ({raster} B), so the switch buys nothing"
+    );
 }

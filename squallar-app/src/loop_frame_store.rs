@@ -242,10 +242,19 @@ impl LoopFrameStore {
     /// **What the stored frames hold on the HOST heap**, which is far less
     /// than what they hold.
     ///
-    /// A frame's pixels are the GPU's: `PlanView` and `Section` carry an
-    /// `egui::TextureHandle`, and `Volume` carries only a store id. What is
-    /// on this heap and countable here is each plan-view frame's resident
-    /// hover field and each section's tilt vectors.
+    /// A frame's pixels are the GPU's wherever they are pixels: a `Section`
+    /// and a **raster** `PlanView` carry an `egui::TextureHandle`, and
+    /// `Volume` carries only a store id. What is on this heap and countable
+    /// here is each plan-view frame's resident hover field, each section's
+    /// tilt vectors — and a **polar** plan-view frame's own code plane.
+    ///
+    /// **That last term is host bytes by construction and not by accident.**
+    /// A fan frame's picture is its plane, and the renderer's residency is a
+    /// `Weak` handle to the very payload this entry holds — so the plane is
+    /// on the card *and* on this heap for as long as the frame lives, and a
+    /// plane nobody holds is one the card gives back. It is counted once:
+    /// the pane's own frame shares this `Arc` rather than owning a second
+    /// copy.
     ///
     /// **The sweep gates a plan-view frame holds are NOT in this figure**,
     /// deliberately: they are radar moments, and folding them in here would
@@ -283,7 +292,12 @@ impl LoopFrameStore {
         self.entries.iter().fold(0u64, |sum, entry| {
             let bytes = match &entry.image {
                 squallar_egui::pane::LoopFrameImage::PlanView(image) => {
-                    image.hover.field_bytes() as u64
+                    // The surface term is `None` on the raster arm — whose
+                    // pixels really are the GPU's — and the payload's own
+                    // measured bytes on the polar one. Never a nominal
+                    // figure: a plane is sized by the radials and gates the
+                    // radar chose.
+                    image.hover.field_bytes() as u64 + image.surface.resident_bytes() as u64
                 }
                 squallar_egui::pane::LoopFrameImage::Section(image) => {
                     (image.tilt_elevations_deg.len() * size_of::<f64>()

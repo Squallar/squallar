@@ -5740,6 +5740,10 @@ impl super::App {
                 loop_span_secs: pane.time.span_secs as usize,
                 cadence_secs: None,
                 overlay_frame_bytes: 0,
+                // Radar's own timeline, whatever this pane is animating: the
+                // frames priced here are the ones the pane is holding, and
+                // the arms below never change which layer that is.
+                radar_frame_bytes: radar_loop_frame_bytes(ls),
                 volume_grids: usize::from(view == squallar_radar::types::RenderView::Volume),
                 ground,
                 // No production caller dispatches a `BuildingMeshJob` yet, so
@@ -8632,6 +8636,49 @@ fn build_loop_frames(
 /// (4 MiB against 9.44 MB on wasm, 16 MiB against 18.66 MB native).
 ///
 /// [`LoopPool`]: crate::loop_pool::LoopPool
+/// **What one frame of a pane's radar plan-view loop costs, measured off the
+/// frames the pane is holding** — `0` where they are rasters or where none has
+/// landed.
+///
+/// The radar companion to [`overlay_frame_bytes`], and the whole of the budget
+/// switch for the polar representation. A polar frame and a raster of one
+/// surveillance tilt are ~369x apart, so which of the two a pane is holding
+/// cannot be inferred from a flag, from the presence of a renderer, or from
+/// what the dispatch asked for: `CodePlane::build` refuses nine products by
+/// domain and `sweep_code_plane` refuses five more conditions, and the answer
+/// to every one of them is today's raster. So this asks the frames.
+///
+/// **The worst frame, not the mean**, because a budget is a commitment against
+/// a peak — and `0` from an empty loop is "price it as a raster", which is the
+/// larger of the two and therefore the safe direction.
+///
+/// **A raster anywhere in the set prices the whole set as rasters**, and that
+/// is the conjunct that keeps this on the safe side rather than a tidiness
+/// choice. A loop's frames really can differ: `CodePlane::build`'s refusals
+/// are per product and so agree across a loop, but `sweep_code_plane`'s are
+/// per sweep — a clear-air volume with nothing above threshold gets a raster
+/// while the volume before it got a plane. The consumers spend ONE figure per
+/// frame, so a set holding both has to be priced at the larger, and the larger
+/// is the raster by ~369x. Taking the fan's bytes there would price a raster
+/// at a fraction of what it allocates, which is the mechanism the polar price
+/// was kept dark to avoid.
+fn radar_loop_frame_bytes(ls: &squallar_egui::pane::LayerTimeState) -> usize {
+    let mut worst = 0usize;
+    for frame in &ls.frames {
+        // Not a plan view, so not this term: a section's frames are rasters
+        // and a volume's are named grids, both priced elsewhere.
+        let Some(squallar_egui::pane::LoopFrameImage::PlanView(image)) = frame.image.as_ref()
+        else {
+            continue;
+        };
+        if !image.surface.is_fan() {
+            return 0;
+        }
+        worst = worst.max(image.surface.resident_bytes());
+    }
+    worst
+}
+
 fn overlay_frame_bytes(
     pane: &squallar_egui::pane::PaneState,
     layer: &squallar_source::id::LayerId,
@@ -9628,7 +9675,16 @@ fn pane_loop_need(
         layers += 1;
         let ls = &slot.time;
         let layer_price = if slot.id == squallar_source::id::known::RADAR {
-            model.bytes_for(ls.view)
+            // The pool divides on the same figure the scene is priced at, and
+            // for the same reason: a polar frame really is ~369x smaller than
+            // the raster this model's `plan_view` states, so a pool grant sized
+            // at the raster would hand a fan loop a fraction of the frames it
+            // can afford. Zero — a raster loop, or one with no frame yet — is
+            // the model's own arm, unchanged.
+            match radar_loop_frame_bytes(ls) {
+                0 => model.bytes_for(ls.view),
+                measured => measured,
+            }
         } else {
             overlay_frame_bytes(pane, &slot.id, budgets)
         };

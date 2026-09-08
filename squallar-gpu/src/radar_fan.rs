@@ -25,16 +25,21 @@
 //! `paint`, and the batch that writes that ring once per pass rather than once
 //! per draw.
 //!
-//! # Nothing installs this
+//! # What installs this
 //!
-//! No painter publishes a [`RadarFanCallback`], no pane issues one, and no
-//! budget selects the polar price. This module and
-//! `tests/radar_fan_gpu.rs` are its only callers. That is deliberate and it is
-//! a safety property rather than staging convenience: the polar price and the
-//! plan-view raster price differ by ~369x for the same tilt, so a scene priced
-//! as polar while the renderer still produces a raster would be admitted at a
-//! fraction of what it then allocates. The switch belongs in the lane that
-//! makes the renderer produce polar frames, keyed on what it produced.
+//! [`RadarFanBridge`], published through `squallar_egui`'s
+//! `GuiEvent::RadarFanPainter` by the shell that also puts a [`RadarFanStore`]
+//! into the renderer's callback resources — the store first, so no frame can
+//! dispatch a fan callback into an empty slot. The same switch is what makes
+//! the *producer* build planes at all (`squallar_radar`'s `PlanSurface::Fan`),
+//! so a build that cannot draw a fan never asks for one: a polar frame has no
+//! fallback, because the raster it would fall back to is the allocation this
+//! representation exists not to make.
+//!
+//! The scene's price follows what the renderer produced and not this module's
+//! presence. A pane's loop frames are priced off the payloads the pane is
+//! actually holding — `squallar_egui::radar_fan::FanSweep::resident_bytes`,
+//! measured — so a frame that fell back to a raster is still priced as one.
 //!
 //! # What this module does NOT decide
 //!
@@ -54,6 +59,15 @@ use egui_wgpu::wgpu;
 use squallar_device_profile::constants::{
     MAX_POLAR_GATES, MAX_POLAR_RADIALS, POLAR_LUT_BYTES, POLAR_LUT_ENTRIES, full_mip_levels,
 };
+
+/// **The payload this module draws** — `squallar_egui`'s, not one of its own.
+///
+/// A type alias and never a second type. The plane is built off the frame
+/// thread into that struct, the pane holds it, and the callback below carries
+/// the same `Arc`: one allocation, one authority on what a sweep's shape is,
+/// and no copy anywhere between the producer and the upload. The name is
+/// shortened here only because it appears in every signature.
+pub type UiSweep = squallar_egui::radar_fan::FanSweep;
 
 /// Wedges in the canonical disk mesh — one per radial a sweep may declare.
 ///
@@ -168,13 +182,19 @@ const _: () = assert!(
 pub const fn pack_vertex(sector: u32, ring: u32, side: u32) -> u32 {
     sector | (ring << SECTOR_BITS) | (side << SIDE_SHIFT)
 }
-
 /// Why a payload could not become a resident sweep.
 ///
 /// Every arm is a refusal and none is a truncation. **None of them is a
 /// fidelity judgement**: whether a product's gates survive eight bits is
 /// `squallar_radar`'s `CodePlane::build`'s question and is settled before a
 /// payload gets here. These are the things this module cannot upload.
+///
+/// **Nor is any of them the payload's own self-description.** Whether a
+/// [`UiSweep`]'s level offsets, code length, table length and edge count agree
+/// with the shape it declares is [`UiSweep::is_well_formed`]'s question, asked
+/// at the draw fork one crate up and counted there as its own refusal. These
+/// are the further things a *texture upload* needs and that question does not
+/// cover: the resolution caps, a usable gate depth, and one site per callback.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FanRefusal {
     /// Zero radials, zero gates, or past [`MAX_POLAR_RADIALS`] /
@@ -189,185 +209,131 @@ pub enum FanRefusal {
     /// A gate depth of zero or less, which would make the gate index a divide
     /// by zero.
     GateInterval(f32),
+    /// Two sweeps of one callback disagree about where the radar is or about
+    /// which sphere a ground range is taken on.
+    ///
+    /// **A callback's `Locals` block holds one site and one radius**, shared by
+    /// every sweep it draws, because a pane's fan is one radar's cuts. A span
+    /// that disagreed would draw the second sweep's gates at the first sweep's
+    /// site — a plausible picture of the wrong place — so it is refused where
+    /// the disagreement can be seen rather than resolved by taking whichever
+    /// sweep happens to be first.
+    Site,
 }
 
-/// The scalars one sweep is drawn and decoded by.
+/// **Whether this module can upload one payload**, and nothing about whether it
+/// should be drawn.
 ///
-/// Every one of them is a number the producing crate already holds; none is
-/// derived here. `elevation_deg` is `None` for a sweep whose two range figures
-/// are **already ground ranges** — `PolarGeometry::gate_at`'s own distinction,
-/// and the reason this is an `Option` and not a NaN.
+/// Refuses, never truncates and never panics. The caller is
+/// [`RadarFanBridge::payload`], which declines the whole draw on the first
+/// refusal — the egui side counts that as
+/// `squallar_egui::radar_fan::FanRefusal::PainterDeclined`, so a refusal here
+/// is a hole in the picture the always-on ledger can report from a running app
+/// rather than a silent empty pane.
+pub fn admit(sweep: &UiSweep) -> Result<(), FanRefusal> {
+    let radials = sweep.radials as usize;
+    let gates = sweep.gates as usize;
+    if radials == 0 || gates == 0 || radials > MAX_POLAR_RADIALS || gates > MAX_POLAR_GATES {
+        return Err(FanRefusal::Shape { radials, gates });
+    }
+    // Clamped the way the upload loop clamps it: a payload declaring more
+    // levels than ceil-halving can produce is uploaded to the depth that
+    // exists, so the length this checks is the length the loop will read.
+    let levels = sweep.levels().clamp(1, full_mip_levels(radials, gates));
+    let want = chain_bytes(radials, gates, levels);
+    if sweep.codes.len() != want {
+        return Err(FanRefusal::CodeBytes {
+            got: sweep.codes.len(),
+            want,
+        });
+    }
+    if sweep.lut_rgba.len() != POLAR_LUT_BYTES {
+        return Err(FanRefusal::LutBytes {
+            got: sweep.lut_rgba.len(),
+            want: POLAR_LUT_BYTES,
+        });
+    }
+    if sweep.edges.len() != radials {
+        return Err(FanRefusal::EdgeCount {
+            got: sweep.edges.len(),
+            want: radials,
+        });
+    }
+    let scalars = sweep_scalars(sweep);
+    let unusable = |v: f32| !v.is_finite() || v <= 0.0;
+    if unusable(scalars.gate_interval_slant_km) {
+        return Err(FanRefusal::GateInterval(scalars.gate_interval_slant_km));
+    }
+    if unusable(scalars.gate_interval_km) {
+        return Err(FanRefusal::GateInterval(scalars.gate_interval_km));
+    }
+    Ok(())
+}
+
+/// **What identifies one payload to the store**, and therefore what residency
+/// is keyed by: the address of the `Arc`'s own allocation.
+///
+/// **Exact rather than merely likely, and a [`Weak`] is what makes it so.** The
+/// store holds a weak handle beside every resident sweep, and a `Weak` keeps
+/// the allocation alive after the payload inside it is dropped — so no later
+/// `Arc<UiSweep>` can be handed an address a resident entry still names, and
+/// the reuse that would draw one sweep's codes under another sweep's key
+/// cannot occur. `squallar_egui::radar_fan::FanSweep`'s own doc states
+/// residency as pointer identity for this reason; `squallar_egui::pane`'s
+/// `RadarSurface::key` identifies the same object the same way.
+fn sweep_key(sweep: &Arc<UiSweep>) -> usize {
+    Arc::as_ptr(sweep) as usize
+}
+
+/// The scalars one sweep is drawn and decoded by, in the lanes the WGSL
+/// `Sweep` block declares.
+///
+/// **Every geodesy figure is read off the payload and none is derived here.**
+/// This crate may not depend on the one that defines the spheres, and the
+/// workspace has exactly one definition of each horizontal geodesy figure —
+/// `squallar-radar/tests/geodesy_one_definition.rs` scans every `.rs` and
+/// `.wgsl` for a second spelling. The two ground radii and the elevation
+/// travel in [`squallar_egui::radar_fan::FanGeometry`]; what happens below is
+/// arithmetic over them and never a conversion of its own.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct FanScalars {
-    /// The GROUND range of the mesh's innermost ring, km.
-    pub first_gate_km: f32,
-    /// The GROUND range of the mesh's outermost ring, km.
-    pub reach_km: f32,
-    /// Gate 0's centre ALONG THE BEAM, km.
-    pub first_gate_slant_km: f32,
-    /// One gate's depth ALONG THE BEAM, km.
-    pub gate_interval_slant_km: f32,
+struct FanScalars {
+    first_gate_km: f32,
+    reach_km: f32,
+    first_gate_slant_km: f32,
+    gate_interval_slant_km: f32,
     /// One gate's GROUND depth, km — the mip selection's denominator, and a
-    /// different number from the one above.
-    pub gate_interval_km: f32,
-    /// The tilt's elevation, degrees, or `None` where the ranges are ground
-    /// ranges already.
-    pub elevation_deg: Option<f32>,
-    /// Gates the sweep reached, which bounds the gate index.
-    pub reach_gates: u32,
-    /// The 4/3 effective earth radius the beam bends over, km.
-    ///
-    /// **Handed in rather than named.** `squallar-gpu` may not depend on the
-    /// crate that defines it, and the workspace has exactly one definition of
-    /// each horizontal geodesy figure —
-    /// `squallar-radar/tests/geodesy_one_definition.rs` scans every `.rs` and
-    /// `.wgsl` for a second spelling.
-    pub re_eff_km: f32,
+    /// different number from the slant one above. The disc's own two ground
+    /// radii over the gates between them, which is the only reading of it that
+    /// cannot disagree with where the mesh's rings were placed.
+    gate_interval_km: f32,
+    elev_rad: f32,
+    has_elevation: u32,
+    reach_gates: u32,
+    re_eff_km: f32,
 }
 
-/// One sweep's CPU side: the code plane and its chain, the baked colour table,
-/// the drawn azimuth of every radial, and the scalars.
-///
-/// # Where this type belongs
-///
-/// The design sites it in `squallar-egui`, so that the UI layer can hold a
-/// sweep without depending on the wgpu boundary. It is here for as long as
-/// nothing outside this crate names it, which is for as long as nothing
-/// installs the painter; the UI-seam lane moves it and this module keeps only
-/// the store.
-///
-/// # Residency
-///
-/// Held behind an `Arc`, and the store keeps a `Weak` to it. **That handle is
-/// the whole eviction rule**: when the owner drops the sweep the weak handle
-/// goes dead and the next pass's sweep gives the GPU textures back. Nothing
-/// here has a budget of its own to disagree with the owner's.
-#[derive(Clone, Debug, PartialEq)]
-pub struct FanSweep {
-    id: u64,
-    radials: usize,
-    gates: usize,
-    codes: Vec<u8>,
-    mip_levels: usize,
-    lut: Vec<u8>,
-    edges: Vec<[f32; 2]>,
-    scalars: FanScalars,
-}
-
-/// A code plane and its chain, as one argument.
-///
-/// The four fields describe one object and are only ever handed over together;
-/// `squallar_radar`'s `CodePlane` is where they come from and it holds them the
-/// same way.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FanPlane {
-    pub radials: usize,
-    pub gates: usize,
-    /// The whole chain concatenated, level 0 first. Level `l` is
-    /// `ceil(radials / 2^l) x ceil(gates / 2^l)` bytes, radial-major.
-    pub codes: Vec<u8>,
-    /// Levels in `codes`, counting level 0. `1` for a plane whose product
-    /// reduces by nothing.
-    pub mip_levels: usize,
-}
-
-impl FanSweep {
-    /// Take a sweep, or refuse it.
-    ///
-    /// Refuses, never truncates and never panics.
-    pub fn new(
-        id: u64,
-        plane: FanPlane,
-        lut: Vec<u8>,
-        edges: Vec<[f32; 2]>,
-        scalars: FanScalars,
-    ) -> Result<Self, FanRefusal> {
-        let FanPlane {
-            radials,
-            gates,
-            codes,
-            mip_levels,
-        } = plane;
-        if radials == 0 || gates == 0 || radials > MAX_POLAR_RADIALS || gates > MAX_POLAR_GATES {
-            return Err(FanRefusal::Shape { radials, gates });
-        }
-        let levels = mip_levels.clamp(1, full_mip_levels(radials, gates));
-        let want = chain_bytes(radials, gates, levels);
-        if codes.len() != want {
-            return Err(FanRefusal::CodeBytes {
-                got: codes.len(),
-                want,
-            });
-        }
-        if lut.len() != POLAR_LUT_BYTES {
-            return Err(FanRefusal::LutBytes {
-                got: lut.len(),
-                want: POLAR_LUT_BYTES,
-            });
-        }
-        if edges.len() != radials {
-            return Err(FanRefusal::EdgeCount {
-                got: edges.len(),
-                want: radials,
-            });
-        }
-        let unusable = |v: f32| !v.is_finite() || v <= 0.0;
-        if unusable(scalars.gate_interval_slant_km) {
-            return Err(FanRefusal::GateInterval(scalars.gate_interval_slant_km));
-        }
-        if unusable(scalars.gate_interval_km) {
-            return Err(FanRefusal::GateInterval(scalars.gate_interval_km));
-        }
-        Ok(Self {
-            id,
-            radials,
-            gates,
-            codes,
-            mip_levels: levels,
-            lut,
-            edges,
-            scalars,
-        })
-    }
-
-    /// What the store keys residency by.
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
-    /// Level 0's shape, as `(radials, gates)`.
-    pub fn shape(&self) -> (usize, usize) {
-        (self.radials, self.gates)
-    }
-
-    /// Levels in the chain, counting level 0.
-    pub fn mip_levels(&self) -> usize {
-        self.mip_levels
-    }
-
-    /// The scalars this sweep is drawn and decoded by.
-    pub fn scalars(&self) -> FanScalars {
-        self.scalars
-    }
-
-    /// Bytes this sweep costs the GPU: the whole chain, plus the table.
-    pub fn bytes(&self) -> u64 {
-        (self.codes.len() + self.lut.len()) as u64
-    }
-
-    /// One level's bytes and its `(radials, gates)`, or `None` past the chain.
-    pub fn level(&self, level: usize) -> Option<(&[u8], usize, usize)> {
-        if level >= self.mip_levels {
-            return None;
-        }
-        let mut at = 0usize;
-        let (mut r, mut g) = (self.radials, self.gates);
-        for _ in 0..level {
-            at += r * g;
-            r = r.div_ceil(2);
-            g = g.div_ceil(2);
-        }
-        Some((&self.codes[at..at + r * g], r, g))
+fn sweep_scalars(sweep: &UiSweep) -> FanScalars {
+    let g = sweep.geometry;
+    // Zero gates would be a divide, and `admit` refuses `reach_gates == 0`
+    // through the well-formedness the draw fork already asked — but this
+    // function is what `admit` reads the answer out of, so it runs first. A
+    // zero here yields a non-finite depth, which is exactly what the
+    // `GateInterval` arm refuses.
+    let gate_interval_km = (g.reach_km - g.first_gate_km) / f64::from(g.reach_gates);
+    FanScalars {
+        first_gate_km: g.first_gate_km as f32,
+        reach_km: g.reach_km as f32,
+        first_gate_slant_km: g.first_gate_slant_km as f32,
+        gate_interval_slant_km: g.gate_interval_slant_km as f32,
+        gate_interval_km: gate_interval_km as f32,
+        // Zero and never a NaN for the sweep whose ranges are ground ranges
+        // already: a uniform lane carrying a NaN is a value every arithmetic
+        // path has to be checked against. `has_elevation` is what the shader
+        // reads to know the lane is meaningless.
+        elev_rad: g.elevation_deg.unwrap_or(0.0).to_radians() as f32,
+        has_elevation: u32::from(g.elevation_deg.is_some()),
+        reach_gates: g.reach_gates,
+        re_eff_km: g.effective_radius_km as f32,
     }
 }
 
@@ -390,54 +356,87 @@ pub fn chain_bytes(radials: usize, gates: usize, levels: usize) -> usize {
 
 /// Where one pane is looking, on the frame a fan is drawn.
 ///
-/// **Every geodesy figure is handed in**, for the reason [`FanScalars`] names.
-/// So is the site's screen position, computed in `f64` on the CPU and arriving
-/// as a small `f32`: the shader never forms a difference of two `O(1)`
-/// projected coordinates.
+/// **In points, and converted to pixels in `prepare`.** egui turns the
+/// callback's rect into the render pass's viewport by a rounding of its own
+/// ([`ViewportInPixels::from_points`], in `epaint`), and clip space maps onto
+/// whatever that rounding produced. A caller narrowing to pixels here would be
+/// a second rounding, off by up to a pixel from the one egui applied; so this
+/// carries the points and [`prepare_locals`] reproduces egui's arithmetic from
+/// the renderer's own [`egui_wgpu::ScreenDescriptor`].
+///
+/// **Every geodesy figure is handed in**, for the reason [`admit`] names: this
+/// crate may not name the sphere.
+///
+/// [`ViewportInPixels::from_points`]: egui::epaint::ViewportInPixels::from_points
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FanView {
-    /// The site's position inside the callback's viewport, in pixels from its
-    /// top-left corner.
-    ///
-    /// **The callback's viewport, not the frame's.** egui sets a viewport from
-    /// the callback's rect before `paint`, so clip space maps onto that rect;
-    /// a caller computing this must mirror `PaintCallbackInfo::viewport_in_pixels`'s
-    /// rounding rather than its own.
-    pub site_px: [f32; 2],
-    /// That viewport's size, in pixels.
-    pub viewport_px: [f32; 2],
-    /// Pixels the whole world spans at this zoom.
-    pub world_px: f32,
+    /// The callback's own rect, in points — the pane's map rect, which is what
+    /// egui turns into the viewport.
+    pub rect: egui::Rect,
+    /// The site's screen position, in points, in the frame [`Self::rect`] is
+    /// in. Projected in `f64` on the CPU and arriving already reduced, so the
+    /// shader never forms a difference of two `O(1)` projected coordinates.
+    pub site_pt: egui::Pos2,
+    /// Points the whole Mercator world spans at this zoom.
+    pub world_pt: f32,
     /// The site's latitude, degrees. Reduced to its sine, cosine and Mercator
-    /// y in `f64` here, so the shader receives three numbers it only ever
+    /// y in `f64` below, so the shader receives three numbers it only ever
     /// differences against.
     pub site_lat_deg: f64,
-    /// Ground kilometres one screen pixel covers, for the mip selection.
-    pub km_per_px: f32,
+    /// Ground kilometres one screen **point** covers. Divided by the frame's
+    /// pixels per point below, because the level selection is a question about
+    /// pixels and a points figure would pick a level too fine by that factor
+    /// on every high-DPI display.
+    pub km_per_pt: f32,
     /// The sphere ground range is measured on, km.
     pub earth_radius_km: f32,
     /// Paint-time layer opacity, 0-1.
     pub opacity: f32,
 }
 
-/// One [`FanView`], in the byte layout the WGSL `Locals` block declares.
+/// One [`FanView`] against one frame's screen, in the byte layout the WGSL
+/// `Locals` block declares.
 ///
 /// Assembled field by field rather than cast from a `repr(C)` struct: this
 /// crate forbids `unsafe`, and forty-eight bytes once per draw is not where a
 /// frame is spent.
-fn locals_bytes(view: &FanView) -> [u8; LOCALS_BYTES as usize] {
+///
+/// The viewport arithmetic is `epaint`'s `ViewportInPixels::from_points`, term
+/// for term: round each edge to whole physical pixels, clamp to the screen,
+/// and take the difference. Not an approximation of it — the same expression,
+/// because the pass's viewport is set from that function and the shader's clip
+/// space maps onto whatever it produced.
+fn prepare_locals(
+    view: &FanView,
+    screen: &egui_wgpu::ScreenDescriptor,
+) -> [u8; LOCALS_BYTES as usize] {
+    let ppp = screen.pixels_per_point;
+    let [screen_w, screen_h] = screen.size_in_pixels;
+    let (screen_w, screen_h) = (screen_w as f32, screen_h as f32);
+    let left = (ppp * view.rect.min.x).round().clamp(0.0, screen_w);
+    let right = (ppp * view.rect.max.x).round().clamp(left, screen_w);
+    let top = (ppp * view.rect.min.y).round().clamp(0.0, screen_h);
+    let bottom = (ppp * view.rect.max.y).round().clamp(top, screen_h);
+
     let (sin_lat0, cos_lat0) = view.site_lat_deg.to_radians().sin_cos();
     // Web Mercator's y is `atanh(sin lat)`. Formed in f64 and handed over,
     // because the fragment stage adds a small offset to it and inverts.
     let merc_y = sin_lat0.clamp(-1.0, 1.0).atanh();
+    // A zero-scale frame is one nothing can be placed on; the LOD it selects
+    // is level 0, which is the finest and never the wrong picture.
+    let km_per_px = if ppp.is_finite() && ppp > 0.0 {
+        view.km_per_pt / ppp
+    } else {
+        0.0
+    };
     let lanes: [[u8; 4]; 12] = [
-        view.site_px[0].to_ne_bytes(),
-        view.site_px[1].to_ne_bytes(),
-        view.viewport_px[0].to_ne_bytes(),
-        view.viewport_px[1].to_ne_bytes(),
-        view.world_px.to_ne_bytes(),
+        (ppp * view.site_pt.x - left).to_ne_bytes(),
+        (ppp * view.site_pt.y - top).to_ne_bytes(),
+        (right - left).to_ne_bytes(),
+        (bottom - top).to_ne_bytes(),
+        (ppp * view.world_pt).to_ne_bytes(),
         view.opacity.to_ne_bytes(),
-        view.km_per_px.to_ne_bytes(),
+        km_per_px.to_ne_bytes(),
         (sin_lat0 as f32).to_ne_bytes(),
         (cos_lat0 as f32).to_ne_bytes(),
         (merc_y as f32).to_ne_bytes(),
@@ -457,28 +456,28 @@ fn locals_bytes(view: &FanView) -> [u8; LOCALS_BYTES as usize] {
 /// Surplus sectors are left at `(0, 0)`, which is `lo == hi` and therefore two
 /// degenerate triangles — the mechanism that lets one canonical mesh serve
 /// every sweep shape.
-fn sweep_bytes(sweep: &FanSweep) -> Vec<u8> {
+fn sweep_bytes(sweep: &UiSweep, levels: usize) -> Vec<u8> {
     let mut out = vec![0u8; SWEEP_UNIFORM_BYTES as usize];
     for (radial, [lo, hi]) in sweep.edges.iter().enumerate() {
         let at = radial * 8;
         out[at..at + 4].copy_from_slice(&lo.to_radians().to_ne_bytes());
         out[at + 4..at + 8].copy_from_slice(&hi.to_radians().to_ne_bytes());
     }
-    let s = sweep.scalars;
+    let s = sweep_scalars(sweep);
     let tail = EDGE_VEC4S * 16;
     let lanes: [[u8; 4]; 12] = [
         s.first_gate_km.to_ne_bytes(),
         s.reach_km.to_ne_bytes(),
         s.first_gate_slant_km.to_ne_bytes(),
         s.gate_interval_slant_km.to_ne_bytes(),
-        s.elevation_deg.unwrap_or(0.0).to_radians().to_ne_bytes(),
+        s.elev_rad.to_ne_bytes(),
         s.re_eff_km.to_ne_bytes(),
         (1.0f32 / s.re_eff_km).to_ne_bytes(),
         s.gate_interval_km.to_ne_bytes(),
-        u32::from(s.elevation_deg.is_some()).to_ne_bytes(),
-        (sweep.radials as u32).to_ne_bytes(),
+        s.has_elevation.to_ne_bytes(),
+        sweep.radials.to_ne_bytes(),
         s.reach_gates.to_ne_bytes(),
-        (sweep.mip_levels as u32).to_ne_bytes(),
+        (levels as u32).to_ne_bytes(),
     ];
     for (lane, bytes) in lanes.iter().enumerate() {
         let at = tail + lane * 4;
@@ -543,8 +542,10 @@ struct Resident {
     _uniform: wgpu::Buffer,
     bytes: u64,
     /// The owner's handle, seen from here. Dead means the sweep is gone and so
-    /// are these textures, next sweep.
-    alive: Weak<FanSweep>,
+    /// are these textures, next sweep — and, while it is held, no later
+    /// payload can be allocated at the address this entry is keyed by. See
+    /// [`sweep_key`].
+    alive: Weak<UiSweep>,
 }
 
 /// What the fan draws need across frames: the pipeline, the canonical mesh, the
@@ -560,7 +561,7 @@ pub struct RadarFanStore {
     batch: ViewBatch,
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
-    resident: HashMap<u64, Resident>,
+    resident: HashMap<usize, Resident>,
     resident_bytes: u64,
     uploads: u64,
     upload_bytes: u64,
@@ -788,11 +789,23 @@ impl RadarFanStore {
 
     /// Make one sweep resident, uploading it if this is the first frame it has
     /// been drawn on.
-    fn ensure(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, sweep: &Arc<FanSweep>) {
-        if self.resident.contains_key(&sweep.id) {
+    ///
+    /// **Nothing is uploaded twice and nothing is copied.** The payload is the
+    /// one `squallar_egui` built off the frame thread, held here through the
+    /// callback's `Arc`; a loop step that returns to a sweep already resident
+    /// finds its key and writes no bytes at all.
+    fn ensure(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, sweep: &Arc<UiSweep>) {
+        let key = sweep_key(sweep);
+        if self.resident.contains_key(&key) {
             return;
         }
-        let (radials, gates) = sweep.shape();
+        let (radials, gates) = (sweep.radials as usize, sweep.gates as usize);
+        // The payload was admitted by the bridge that built this callback, but
+        // the levels are clamped again rather than trusted: this is the number
+        // the texture is created with, and a descriptor that promised more
+        // levels than the loop below writes would leave a level of the chain
+        // undefined for the shader to read.
+        let levels = sweep.levels().clamp(1, full_mip_levels(radials, gates));
         let codes = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("radar fan codes"),
             size: wgpu::Extent3d {
@@ -800,17 +813,22 @@ impl RadarFanStore {
                 height: radials as u32,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: sweep.mip_levels as u32,
+            mip_level_count: levels as u32,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::R8Uint,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        for level in 0..sweep.mip_levels {
-            let (bytes, r, g) = sweep
-                .level(level)
-                .expect("a level inside the chain the sweep declares");
+        for level in 0..levels {
+            let (Some(bytes), Some((r, g))) = (sweep.level(level), sweep.level_shape(level)) else {
+                // Unreachable through the bridge, which admits the chain
+                // length first. Skipped rather than asserted because this
+                // runs inside the renderer's prepare, where a panic takes the
+                // frame and every pane on it.
+                continue;
+            };
+            let (r, g) = (r as usize, g as usize);
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &codes,
@@ -854,7 +872,7 @@ impl RadarFanStore {
         });
         queue.write_texture(
             lut.as_image_copy(),
-            &sweep.lut,
+            &sweep.lut_rgba,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(POLAR_LUT_BYTES as u32),
@@ -873,7 +891,7 @@ impl RadarFanStore {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        queue.write_buffer(&uniform, 0, &sweep_bytes(sweep));
+        queue.write_buffer(&uniform, 0, &sweep_bytes(sweep, levels));
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("radar fan sweep"),
@@ -898,12 +916,16 @@ impl RadarFanStore {
             ],
         });
 
-        let bytes = sweep.bytes();
+        // **What the card is holding for this sweep**, off the payload's own
+        // vectors rather than recomputed from its shape: the whole chain, the
+        // table and the drawn-edge lanes, which is what
+        // `squallar_egui::radar_fan::FanSweep::resident_bytes` measures.
+        let bytes = sweep.resident_bytes() as u64;
         self.resident_bytes += bytes;
         self.uploads += 1;
         self.upload_bytes += bytes;
         self.resident.insert(
-            sweep.id,
+            key,
             Resident {
                 bind_group,
                 _codes: codes,
@@ -916,14 +938,20 @@ impl RadarFanStore {
     }
 
     /// Lay one draw's view into the pass's batch and answer its ring slot.
-    fn slot(&mut self, queue: &wgpu::Queue, view: &FanView) -> u32 {
+    fn slot(
+        &mut self,
+        queue: &wgpu::Queue,
+        view: &FanView,
+        screen: &egui_wgpu::ScreenDescriptor,
+    ) -> u32 {
         self.views += 1;
         let ring = &self.ring;
         let ring_writes = &mut self.ring_writes;
-        self.batch.push(locals_bytes(view), |offset, bytes| {
-            queue.write_buffer(ring, offset, bytes);
-            *ring_writes += 1;
-        })
+        self.batch
+            .push(prepare_locals(view, screen), |offset, bytes| {
+                queue.write_buffer(ring, offset, bytes);
+                *ring_writes += 1;
+            })
     }
 
     /// Write the pass's gathered views into the ring as one `write_buffer`.
@@ -1050,7 +1078,12 @@ fn align_up(value: u32, alignment: u32) -> u32 {
 pub struct RadarFanCallback {
     /// The sweeps to draw, front to back. Keeps them alive until `prepare` has
     /// read them, and is what the store's weak handles are taken from.
-    pub sweeps: Vec<Arc<FanSweep>>,
+    ///
+    /// **The `squallar_egui` payload itself, shared and never copied.** The
+    /// plane was built off the frame thread and the pane is holding it; this
+    /// carries the same allocation, so a fan costs the process one plane and
+    /// not two.
+    pub sweeps: Vec<Arc<UiSweep>>,
     pub view: FanView,
     pub pass_nr: u64,
     /// Written by `prepare`, read by `paint`. Every prepare of a frame runs
@@ -1063,7 +1096,7 @@ impl RadarFanCallback {
     /// One pane's fan. `None` for an empty span, which would be a callback that
     /// records a bind group and draws nothing — the primitive boundary this
     /// path exists to spend only on pixels.
-    pub fn new(sweeps: Vec<Arc<FanSweep>>, view: FanView, pass_nr: u64) -> Option<Self> {
+    pub fn new(sweeps: Vec<Arc<UiSweep>>, view: FanView, pass_nr: u64) -> Option<Self> {
         if sweeps.is_empty() {
             return None;
         }
@@ -1075,9 +1108,10 @@ impl RadarFanCallback {
         })
     }
 
-    /// The payload `egui_wgpu` downcasts, for a caller that has a painter seam
-    /// to publish it through. **Nothing calls this yet**, which is what keeps
-    /// the pass dark.
+    /// The payload `egui_wgpu` downcasts. [`RadarFanBridge`] is the seam that
+    /// publishes it; the rect it is given here is `ZERO` and unread, because
+    /// the rect that matters is the one the pane's `Shape::Callback` carries
+    /// and that is what egui turns into the viewport.
     pub fn payload(self) -> Arc<dyn Any + Send + Sync> {
         egui_wgpu::Callback::new_paint_callback(egui::Rect::ZERO, self).callback
     }
@@ -1088,7 +1122,7 @@ impl egui_wgpu::CallbackTrait for RadarFanCallback {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        screen_descriptor: &egui_wgpu::ScreenDescriptor,
         _egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
@@ -1103,7 +1137,7 @@ impl egui_wgpu::CallbackTrait for RadarFanCallback {
         for sweep in &self.sweeps {
             store.ensure(device, queue, sweep);
         }
-        let slot = store.slot(queue, &self.view);
+        let slot = store.slot(queue, &self.view, screen_descriptor);
         self.slot.store(slot, Ordering::Relaxed);
         Vec::new()
     }
@@ -1150,7 +1184,7 @@ impl egui_wgpu::CallbackTrait for RadarFanCallback {
         for sweep in &self.sweeps {
             // `continue`, not `return`: a pane can be missing one sweep's
             // residency and hold the others, and they still draw.
-            let Some(resident) = store.resident.get(&sweep.id) else {
+            let Some(resident) = store.resident.get(&sweep_key(sweep)) else {
                 continue;
             };
             render_pass.set_bind_group(1, &resident.bind_group, &[]);
@@ -1159,5 +1193,164 @@ impl egui_wgpu::CallbackTrait for RadarFanCallback {
         }
         store.recorded.fetch_add(recorded, Ordering::Relaxed);
         store.paints.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// **The seam's renderer side**: turns one pane's fan draw into the payload
+/// `egui_wgpu` downcasts, or declines it.
+///
+/// Holds nothing, exactly as [`crate::tile_mesh::TileMeshBridge`] holds
+/// nothing: the store is in the callback resources and the textures are in the
+/// store, so this is installed once and never has to be replaced when a sweep
+/// arrives or goes.
+///
+/// **Declining is visible.** `squallar_egui`'s draw fork counts a `None` from
+/// here as `FanRefusal::PainterDeclined` in its always-on ledger, so every
+/// refusal below is a hole in the picture a running app can report rather than
+/// a pane that quietly draws nothing.
+#[derive(Default)]
+pub struct RadarFanBridge;
+
+impl squallar_egui::radar_fan::RadarFanPainter for RadarFanBridge {
+    fn payload(
+        &self,
+        draw: squallar_egui::radar_fan::FanDraw<'_>,
+    ) -> Option<Arc<dyn Any + Send + Sync>> {
+        // An empty span would be a callback that records a bind group and
+        // draws nothing — a primitive boundary bought for no pixels, which is
+        // the cost this whole path exists to remove.
+        let first = draw.sweeps.first()?;
+        for sweep in draw.sweeps.iter() {
+            admit(sweep).ok()?;
+            // One `Locals` block per callback carries one site and one sphere.
+            // See `FanRefusal::Site`.
+            let (a, b) = (sweep.geometry, first.geometry);
+            if a.site_lat != b.site_lat
+                || a.site_lon != b.site_lon
+                || a.earth_radius_km != b.earth_radius_km
+            {
+                return None;
+            }
+        }
+        let view = FanView {
+            rect: draw.view.rect,
+            site_pt: draw.view.site_px,
+            world_pt: draw.view.world_px as f32,
+            site_lat_deg: first.geometry.site_lat,
+            km_per_pt: draw.view.km_per_px as f32,
+            earth_radius_km: first.geometry.earth_radius_km as f32,
+            opacity: draw.opacity,
+        };
+        RadarFanCallback::new(draw.sweeps.to_vec(), view, draw.pass_nr)
+            .map(RadarFanCallback::payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **The viewport this pass places a fan in is egui's own, at every scale
+    /// factor** — not an approximation of it.
+    ///
+    /// The pass's viewport is set by `egui_wgpu` from
+    /// `PaintCallbackInfo::viewport_in_pixels`, and the vertex stage emits clip
+    /// space against the size [`prepare_locals`] wrote into `Locals`. If the
+    /// two roundings differ the whole fan is offset and scaled by the
+    /// difference — a picture that looks like a radar image and is drawn at the
+    /// wrong place, worst at the fractional scale factors a real desktop uses.
+    ///
+    /// Driven at `pixels_per_point` values the hardware suite cannot reach: it
+    /// renders a 256 px canvas at 1.0, where points and pixels are the same
+    /// number and every conversion below is the identity.
+    ///
+    /// The radius comes from `squallar_geo` even though nothing here reads it:
+    /// a fixture spelling one would be the second definition of the sphere
+    /// that `squallar-radar/tests/geodesy_one_definition.rs` scans every `.rs`
+    /// in this workspace for, and it caught this file when it did.
+    ///
+    /// TAMPER: use `rect.size() * ppp` for the viewport, or drop either clamp,
+    /// and the fractional or off-screen rows go red.
+    #[test]
+    fn the_viewport_is_epaints_own_at_every_scale_factor() {
+        let rect = egui::Rect::from_min_max(egui::pos2(10.5, 20.25), egui::pos2(310.5, 220.75));
+        let screen = [1024u32, 768u32];
+        let mut checked = 0;
+        for ppp in [1.0f32, 1.25, 1.5, 2.0, 2.4, 3.0] {
+            let want = egui::epaint::ViewportInPixels::from_points(&rect, ppp, screen);
+            let bytes = prepare_locals(
+                &FanView {
+                    rect,
+                    site_pt: rect.center(),
+                    world_pt: 4096.0,
+                    site_lat_deg: 35.0,
+                    km_per_pt: 2.0,
+                    earth_radius_km: squallar_geo::EARTH_RADIUS_KM as f32,
+                    opacity: 1.0,
+                },
+                &egui_wgpu::ScreenDescriptor {
+                    size_in_pixels: screen,
+                    pixels_per_point: ppp,
+                },
+            );
+            let lane = |i: usize| f32::from_ne_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+
+            assert_eq!(
+                [lane(2), lane(3)],
+                [want.width_px as f32, want.height_px as f32],
+                "the viewport size disagrees with egui's at {ppp}"
+            );
+            // And the site sits at the same offset inside it that egui's own
+            // left/top edges put it at.
+            assert_eq!(
+                [lane(0), lane(1)],
+                [
+                    ppp * rect.center().x - want.left_px as f32,
+                    ppp * rect.center().y - want.top_px as f32
+                ],
+                "the site's position inside the viewport disagrees at {ppp}"
+            );
+            // The level selection is per PIXEL, so it falls as the scale
+            // factor rises. A points figure would select a level too fine by
+            // exactly this factor on every high-DPI display.
+            assert_eq!(lane(6), 2.0 / ppp, "km per pixel at {ppp}");
+            // World span scales with it too, or the fan would be placed at one
+            // zoom and sized at another.
+            assert_eq!(lane(4), 4096.0 * ppp, "world pixels at {ppp}");
+            checked += 1;
+        }
+        assert_eq!(checked, 6, "the loop compared nothing");
+
+        // A rect running off the screen is clamped the way egui clamps it,
+        // rather than emitting a viewport wider than the target.
+        let off = egui::Rect::from_min_max(egui::pos2(-40.0, -10.0), egui::pos2(2000.0, 900.0));
+        let want = egui::epaint::ViewportInPixels::from_points(&off, 2.0, screen);
+        let bytes = prepare_locals(
+            &FanView {
+                rect: off,
+                site_pt: egui::pos2(0.0, 0.0),
+                world_pt: 4096.0,
+                site_lat_deg: 35.0,
+                km_per_pt: 2.0,
+                earth_radius_km: squallar_geo::EARTH_RADIUS_KM as f32,
+                opacity: 1.0,
+            },
+            &egui_wgpu::ScreenDescriptor {
+                size_in_pixels: screen,
+                pixels_per_point: 2.0,
+            },
+        );
+        let lane = |i: usize| f32::from_ne_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!(
+            [lane(2), lane(3)],
+            [want.width_px as f32, want.height_px as f32]
+        );
+        assert!(
+            lane(2) <= screen[0] as f32 && lane(3) <= screen[1] as f32,
+            "an off-screen rect produced a viewport larger than the target"
+        );
+        // The premise the clamp row rests on: this rect really does run off,
+        // so the assertion above is the clamp firing and not an identity.
+        assert!(2.0 * off.width() > screen[0] as f32);
     }
 }

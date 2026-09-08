@@ -52,11 +52,11 @@ use naga::valid::{Capabilities, ValidationFlags, Validator};
 use squallar_device_profile::constants::{
     MAX_POLAR_GATES, MAX_POLAR_RADIALS, POLAR_LUT_BYTES, POLAR_LUT_ENTRIES,
 };
+use squallar_egui::radar_fan::{FanGeometry, FanSweep};
 use squallar_gpu::egui_renderer::AttachmentConfig;
 use squallar_gpu::radar_fan::{
-    EDGE_VEC4S, FanPlane, FanRefusal, FanScalars, FanSweep, FanView, MESH_INDICES, MESH_VERTICES,
-    RADAR_FAN_WGSL, RINGS, RadarFanCallback, RadarFanStore, SECTORS, SWEEP_UNIFORM_BYTES,
-    chain_bytes, pack_vertex,
+    EDGE_VEC4S, FanRefusal, FanView, MESH_INDICES, MESH_VERTICES, RADAR_FAN_WGSL, RINGS,
+    RadarFanCallback, RadarFanStore, SECTORS, SWEEP_UNIFORM_BYTES, admit, chain_bytes, pack_vertex,
 };
 
 /// The canvas, in pixels — which is also the callback's viewport and the whole
@@ -161,61 +161,105 @@ fn one_degree_edges() -> Vec<[f32; 2]> {
         .collect::<Vec<_>>()
 }
 
-/// The scalars for a sweep at `elevation_deg`, or one whose ranges are already
+/// The geometry for a sweep at `elevation_deg`, or one whose ranges are already
 /// ground ranges.
-fn scalars(elevation_deg: Option<f32>) -> FanScalars {
-    // The mesh spans gate 0's near edge to the last gate's far edge, in GROUND
-    // range — the same conversion the fragment inverts.
+///
+/// The two GROUND radii are the ones the producer fills in
+/// (`squallar_app::render_dispatch`'s `fan_sweep`): gate 0's near edge and the
+/// last reached gate's far edge, taken through the same beam bend the fragment
+/// inverts. The store reads one gate's ground depth off their difference, so
+/// nothing here states that number twice.
+fn geometry(elevation_deg: Option<f32>) -> FanGeometry {
     let near_slant = f64::from(FIRST_GATE_KM - 0.5 * GATE_KM);
     let far_slant = f64::from(FIRST_GATE_KM + (GATES as f32 - 0.5) * GATE_KM);
     let ground = |slant: f64| match elevation_deg {
         Some(e) => squallar_radar::beam::ground_range_km(slant, f64::from(e)),
         None => slant,
     };
-    FanScalars {
-        first_gate_km: ground(near_slant.max(0.0)) as f32,
-        reach_km: ground(far_slant) as f32,
-        first_gate_slant_km: FIRST_GATE_KM,
-        gate_interval_slant_km: GATE_KM,
-        // The GROUND depth of a gate, which at these elevations is within a
-        // fraction of a percent of the slant one and is a different lane
-        // regardless.
-        gate_interval_km: ((ground(far_slant) - ground(near_slant.max(0.0)))
-            / f64::from(GATES as f32)) as f32,
-        elevation_deg,
+    FanGeometry {
+        site_lat: SITE_LAT,
+        site_lon: SITE_LON,
+        first_gate_slant_km: f64::from(FIRST_GATE_KM),
+        gate_interval_slant_km: f64::from(GATE_KM),
+        elevation_deg: elevation_deg.map(f64::from),
         reach_gates: GATES as u32,
-        re_eff_km: squallar_radar::beam::RE_EFF_KM as f32,
+        reach_km: ground(far_slant),
+        first_gate_km: ground(near_slant.max(0.0)),
+        earth_radius_km: squallar_geo::EARTH_RADIUS_KM,
+        effective_radius_km: squallar_radar::beam::RE_EFF_KM,
+    }
+}
+
+/// One payload's level offsets, for a chain laid out level 0 first with no gap.
+fn level_offsets(radials: usize, gates: usize, levels: usize) -> Vec<u32> {
+    let (mut r, mut g) = (radials, gates);
+    let mut at = 0u32;
+    let mut out = Vec::with_capacity(levels);
+    for _ in 0..levels {
+        out.push(at);
+        at += (r * g) as u32;
+        r = r.div_ceil(2);
+        g = g.div_ceil(2);
+    }
+    out
+}
+
+/// One payload from its parts, laid out level 0 first with no gap.
+///
+/// The field is [`squallar_radar`]'s reflectivity spelling because a payload
+/// carries one; nothing this file drives reads it — the table is baked before
+/// a sweep reaches the store, so all that is left to name is which legend the
+/// gates belong to.
+fn payload(
+    radials: usize,
+    gates: usize,
+    codes: Vec<u8>,
+    levels: usize,
+    lut: Vec<u8>,
+    edges: Vec<[f32; 2]>,
+    geometry: FanGeometry,
+) -> FanSweep {
+    FanSweep {
+        field: squallar_radar::fields::known::REFLECTIVITY,
+        radials: radials as u32,
+        gates: gates as u32,
+        codes,
+        level_offsets: level_offsets(radials, gates, levels),
+        lut_rgba: lut,
+        edges,
+        geometry,
     }
 }
 
 /// The fixture sweep, at one elevation arm and one table.
-fn fixture(id: u64, elevation_deg: Option<f32>, lut: Vec<u8>) -> Arc<FanSweep> {
-    Arc::new(
-        FanSweep::new(
-            id,
-            FanPlane {
-                radials: RADIALS,
-                gates: GATES,
-                codes: plane_codes(),
-                mip_levels: 1,
-            },
-            lut,
-            one_degree_edges(),
-            scalars(elevation_deg),
-        )
-        .expect("the fixture sweep is inside every cap"),
-    )
+///
+/// **No id.** Residency is the payload's own address, so two fixtures with
+/// identical bytes are two sweeps because they are two allocations — which is
+/// what a `Weak` handle held beside each makes exact.
+fn fixture(elevation_deg: Option<f32>, lut: Vec<u8>) -> Arc<FanSweep> {
+    let sweep = Arc::new(payload(
+        RADIALS,
+        GATES,
+        plane_codes(),
+        1,
+        lut,
+        one_degree_edges(),
+        geometry(elevation_deg),
+    ));
+    assert!(sweep.is_well_formed(), "the fixture describes itself");
+    admit(&sweep).expect("the fixture sweep is inside every cap");
+    sweep
 }
 
 /// The view every fixture is drawn under: the site at the canvas centre, the
 /// whole canvas as the viewport.
 fn view(opacity: f32) -> FanView {
     FanView {
-        site_px: [SIDE as f32 / 2.0, SIDE as f32 / 2.0],
-        viewport_px: [SIDE as f32, SIDE as f32],
-        world_px: WORLD_PX,
+        rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(SIDE as f32, SIDE as f32)),
+        site_pt: egui::pos2(SIDE as f32 / 2.0, SIDE as f32 / 2.0),
+        world_pt: WORLD_PX,
         site_lat_deg: SITE_LAT,
-        km_per_px: KM_PER_PX,
+        km_per_pt: KM_PER_PX,
         earth_radius_km: squallar_geo::EARTH_RADIUS_KM as f32,
         opacity,
     }
@@ -242,8 +286,8 @@ enum Expect {
 fn expect_at(px: u32, py: u32, elevation_deg: Option<f32>) -> Expect {
     let site = view(1.0);
     // The fragment is evaluated at the pixel centre.
-    let rel_x = (f64::from(px) + 0.5 - f64::from(site.site_px[0])) / f64::from(WORLD_PX);
-    let rel_y = (f64::from(py) + 0.5 - f64::from(site.site_px[1])) / f64::from(WORLD_PX);
+    let rel_x = (f64::from(px) + 0.5 - f64::from(site.site_pt.x)) / f64::from(WORLD_PX);
+    let rel_y = (f64::from(py) + 0.5 - f64::from(site.site_pt.y)) / f64::from(WORLD_PX);
 
     let two_pi = std::f64::consts::TAU;
     let merc_y_site = SITE_LAT.to_radians().sin().atanh();
@@ -695,29 +739,33 @@ fn the_chain_arithmetic_is_the_producers() {
              {radials}x{gates}"
         );
         // And level by level, which is what the upload actually slices.
-        let sweep = FanSweep::new(
-            1,
-            FanPlane {
-                radials,
-                gates,
-                codes: {
-                    let mut all = Vec::new();
-                    for level in 0..levels {
-                        all.extend_from_slice(plane.level(level).expect("a declared level").0);
-                    }
-                    all
-                },
-                mip_levels: levels,
+        let mut geom = geometry(Some(0.5));
+        geom.reach_gates = gates as u32;
+        let sweep = payload(
+            radials,
+            gates,
+            {
+                let mut all = Vec::new();
+                for level in 0..levels {
+                    all.extend_from_slice(plane.level(level).expect("a declared level").0);
+                }
+                all
             },
+            levels,
             opaque_lut(),
             vec![[0.0, 1.0]; radials],
-            scalars(Some(0.5)),
-        )
-        .expect("a plane the producer built is one this can upload");
+            geom,
+        );
+        admit(&sweep).expect("a plane the producer built is one this can upload");
         for level in 0..levels {
-            let (mine, r, g) = sweep.level(level).expect("a declared level");
+            let mine = sweep.level(level).expect("a declared level");
+            let (r, g) = sweep.level_shape(level).expect("a declared level");
             let (theirs, pr, pg) = plane.level(level).expect("a declared level");
-            assert_eq!((r, g), (pr, pg), "level {level} at {radials}x{gates}");
+            assert_eq!(
+                (r as usize, g as usize),
+                (pr, pg),
+                "level {level} at {radials}x{gates}"
+            );
             assert_eq!(mine, theirs, "level {level} at {radials}x{gates}");
         }
     }
@@ -728,23 +776,29 @@ fn the_chain_arithmetic_is_the_producers() {
 /// A plane that silently dropped radials or gates would draw a sweep nobody
 /// measured; one whose buffer was short of its shape would read past the end of
 /// a level. Each conjunct is driven on its own.
+///
+/// **These are the upload's questions and not the payload's self-description.**
+/// Whether a payload's own numbers agree with each other is
+/// `FanSweep::is_well_formed`'s, asked at the draw fork in `squallar_egui` and
+/// counted there; what [`admit`] adds is the resolution caps, a usable gate
+/// depth, and the chain length the texture will actually be sliced by.
 #[test]
 fn a_malformed_payload_is_refused_rather_than_truncated() {
-    let ok = scalars(None);
-    let plane = |r: usize, g: usize, bytes: usize| FanPlane {
-        radials: r,
-        gates: g,
-        codes: vec![0; bytes],
-        mip_levels: 1,
+    let geom = |gates: usize| {
+        let mut g = geometry(None);
+        g.reach_gates = gates as u32;
+        g
     };
     let shape = |r: usize, g: usize| {
-        FanSweep::new(
+        admit(&payload(
+            r,
+            g,
+            vec![0; r.saturating_mul(g)],
             1,
-            plane(r, g, r.saturating_mul(g)),
             opaque_lut(),
             vec![[0.0, 1.0]; r],
-            ok,
-        )
+            geom(g.max(1)),
+        ))
     };
     assert_eq!(
         shape(4_000, 60),
@@ -770,37 +824,114 @@ fn a_malformed_payload_is_refused_rather_than_truncated() {
         })
     );
     // The widest admissible shape is admitted, so the refusals above are the
-    // cap firing and not the constructor refusing everything.
+    // cap firing and not the door refusing everything.
     assert!(shape(MAX_POLAR_RADIALS, MAX_POLAR_GATES).is_ok());
+    // And the shape one gate inside each cap, so neither bound is off by one
+    // in the permissive direction.
+    assert!(shape(MAX_POLAR_RADIALS - 1, MAX_POLAR_GATES - 1).is_ok());
 
+    let four_by_five = |codes: usize, lut: Vec<u8>, edges: usize| {
+        admit(&payload(
+            4,
+            5,
+            vec![0; codes],
+            1,
+            lut,
+            vec![[0.0, 1.0]; edges],
+            geom(5),
+        ))
+    };
     assert_eq!(
-        FanSweep::new(1, plane(4, 5, 19), opaque_lut(), vec![[0.0, 1.0]; 4], ok),
+        four_by_five(19, opaque_lut(), 4),
         Err(FanRefusal::CodeBytes { got: 19, want: 20 })
     );
     assert_eq!(
-        FanSweep::new(1, plane(4, 5, 20), vec![0; 12], vec![[0.0, 1.0]; 4], ok),
+        four_by_five(20, vec![0; 12], 4),
         Err(FanRefusal::LutBytes {
             got: 12,
             want: POLAR_LUT_BYTES
         })
     );
     assert_eq!(
-        FanSweep::new(1, plane(4, 5, 20), opaque_lut(), vec![[0.0, 1.0]; 3], ok),
+        four_by_five(20, opaque_lut(), 3),
         Err(FanRefusal::EdgeCount { got: 3, want: 4 })
     );
 
-    let mut zero_gate = ok;
-    zero_gate.gate_interval_slant_km = 0.0;
+    // A zero slant depth, which is the gate index's divisor.
+    let mut zero_slant = geom(5);
+    zero_slant.gate_interval_slant_km = 0.0;
     assert_eq!(
-        FanSweep::new(
+        admit(&payload(
+            4,
+            5,
+            vec![0; 20],
             1,
-            plane(4, 5, 20),
             opaque_lut(),
             vec![[0.0, 1.0]; 4],
-            zero_gate
-        ),
+            zero_slant
+        )),
         Err(FanRefusal::GateInterval(0.0))
     );
+    // And a zero GROUND depth, which is the level selection's — a different
+    // lane, refused on its own terms. The disc's two ground radii are equal
+    // here, so the difference the store reads one gate's depth off is zero.
+    let mut flat_disc = geom(5);
+    flat_disc.first_gate_km = flat_disc.reach_km;
+    assert_eq!(
+        admit(&payload(
+            4,
+            5,
+            vec![0; 20],
+            1,
+            opaque_lut(),
+            vec![[0.0, 1.0]; 4],
+            flat_disc
+        )),
+        Err(FanRefusal::GateInterval(0.0))
+    );
+
+    // Two sweeps of one callback must name one site: `Locals` holds one.
+    let here = fixture(None, opaque_lut());
+    let mut elsewhere_geom = geometry(None);
+    elsewhere_geom.site_lon = SITE_LON + 1.0;
+    let elsewhere = Arc::new(payload(
+        RADIALS,
+        GATES,
+        plane_codes(),
+        1,
+        opaque_lut(),
+        one_degree_edges(),
+        elsewhere_geom,
+    ));
+    let sweeps: Arc<[Arc<FanSweep>]> = Arc::from(vec![Arc::clone(&here), elsewhere]);
+    let painter = squallar_gpu::radar_fan::RadarFanBridge;
+    let draw = |sweeps: &Arc<[Arc<FanSweep>]>| {
+        use squallar_egui::radar_fan::RadarFanPainter as _;
+        let v = view(1.0);
+        painter
+            .payload(squallar_egui::radar_fan::FanDraw {
+                sweeps,
+                view: squallar_egui::radar_fan::FanView {
+                    rect: v.rect,
+                    site_px: v.site_pt,
+                    world_px: f64::from(v.world_pt),
+                    km_per_px: f64::from(v.km_per_pt),
+                    pixels_per_point: 1.0,
+                },
+                opacity: 1.0,
+                pass_nr: 1,
+            })
+            .is_some()
+    };
+    assert!(
+        !draw(&sweeps),
+        "two sweeps at two sites became one callback, which would draw the \
+         second sweep's gates at the first sweep's radar"
+    );
+    // The same span with one site is issued, so the refusal above is the site
+    // comparison firing and not the bridge declining every span.
+    let agreeing: Arc<[Arc<FanSweep>]> = Arc::from(vec![here, fixture(None, opaque_lut())]);
+    assert!(draw(&agreeing));
 }
 
 /// **The canonical mesh names every `(sector, ring, side)` exactly once, and
@@ -811,7 +942,7 @@ fn a_malformed_payload_is_refused_rather_than_truncated() {
 /// forever, in a picture that looks like a radar image.
 #[test]
 fn the_mesh_covers_every_sector_ring_and_side_once() {
-    let sweep = fixture(1, None, opaque_lut());
+    let sweep = fixture(None, opaque_lut());
     let _ = sweep;
     let mut seen = std::collections::HashSet::new();
     for sector in 0..SECTORS as u32 {
@@ -848,7 +979,7 @@ fn assert_every_pixel_reads_its_own_gate(
     // in the readback byte for byte.
     let format = wgpu::TextureFormat::Rgba8Unorm;
     let lut = opaque_lut();
-    let sweep = fixture(1, elevation_deg, lut.clone());
+    let sweep = fixture(elevation_deg, lut.clone());
     let store = RadarFanStore::new(device, attachments(format));
     let (pixels, renderer) = frame(
         device,
@@ -1043,7 +1174,7 @@ fn both_gamma_conventions_draw_and_they_differ() {
         } else {
             CLEAR_GAMMA
         };
-        let sweep = fixture(1, Some(0.5), lut.clone());
+        let sweep = fixture(Some(0.5), lut.clone());
         let store = RadarFanStore::new(&device, attachments(format));
         let (pixels, _) = frame(
             &device,
@@ -1149,7 +1280,7 @@ fn an_alpha_zero_table_paints_nothing() {
 
     // The control first: the same fixture with an opaque table paints, so the
     // null below is a property of the alphas and not of a fan that never drew.
-    let opaque = fixture(1, None, opaque_lut());
+    let opaque = fixture(None, opaque_lut());
     let store = RadarFanStore::new(&device, attachments(format));
     let (visible, _) = frame(
         &device,
@@ -1168,7 +1299,7 @@ fn an_alpha_zero_table_paints_nothing() {
     for (code, entry) in invisible_lut.chunks_exact_mut(4).enumerate() {
         entry.copy_from_slice(&[code as u8, 200, 40, 0]);
     }
-    let hidden = fixture(2, None, invisible_lut);
+    let hidden = fixture(None, invisible_lut);
     let store = RadarFanStore::new(&device, attachments(format));
     let (pixels, _) = frame(
         &device,
@@ -1202,7 +1333,7 @@ fn the_opacity_uniform_scales_the_fan() {
     let lut = opaque_lut();
     let mut readings = Vec::new();
     for opacity in [1.0f32, 0.5] {
-        let sweep = fixture(1, None, lut.clone());
+        let sweep = fixture(None, lut.clone());
         let store = RadarFanStore::new(&device, attachments(format));
         let (pixels, _) = frame(
             &device,
@@ -1270,21 +1401,16 @@ fn sectors_past_the_sweeps_radials_draw_nothing() {
     // is being checked is that the 1,432 unused sectors are silent.
     let mut lut = opaque_lut();
     lut[0..4].copy_from_slice(&[255, 0, 255, 255]);
-    let narrow = Arc::new(
-        FanSweep::new(
-            9,
-            FanPlane {
-                radials: 8,
-                gates: GATES,
-                codes: vec![64u8; 8 * GATES],
-                mip_levels: 1,
-            },
-            lut,
-            (0..8).map(|i| [i as f32, i as f32 + 1.0]).collect(),
-            scalars(None),
-        )
-        .expect("eight radials is inside every cap"),
-    );
+    let narrow = Arc::new(payload(
+        8,
+        GATES,
+        vec![64u8; 8 * GATES],
+        1,
+        lut,
+        (0..8).map(|i| [i as f32, i as f32 + 1.0]).collect(),
+        geometry(None),
+    ));
+    admit(&narrow).expect("eight radials is inside every cap");
     let store = RadarFanStore::new(&device, attachments(format));
     let (pixels, _) = frame(
         &device,
@@ -1326,9 +1452,7 @@ fn the_callback_records_six_calls_and_two_more_per_extra_sweep() {
     };
     let format = wgpu::TextureFormat::Rgba8Unorm;
     for sweeps in 1..=3usize {
-        let carried: Vec<_> = (0..sweeps)
-            .map(|i| fixture(i as u64 + 1, None, opaque_lut()))
-            .collect();
+        let carried: Vec<_> = (0..sweeps).map(|_| fixture(None, opaque_lut())).collect();
         let store = RadarFanStore::new(&device, attachments(format));
         let (_, renderer) = frame(
             &device,
@@ -1369,8 +1493,8 @@ fn a_dropped_sweep_is_given_back_on_the_next_pass() {
         return;
     };
     let format = wgpu::TextureFormat::Rgba8Unorm;
-    let kept = fixture(1, None, opaque_lut());
-    let dropped = fixture(2, None, opaque_lut());
+    let kept = fixture(None, opaque_lut());
+    let dropped = fixture(None, opaque_lut());
     let store = RadarFanStore::new(&device, attachments(format));
     let (_, mut renderer) = frame(
         &device,
@@ -1385,7 +1509,10 @@ fn a_dropped_sweep_is_given_back_on_the_next_pass() {
     );
     let before = store_of(&renderer).resident_bytes();
     assert_eq!(store_of(&renderer).resident_sweeps(), 2);
-    assert_eq!(before, kept.bytes() + dropped.bytes());
+    assert_eq!(
+        before,
+        (kept.resident_bytes() + dropped.resident_bytes()) as u64
+    );
 
     // The owner lets one go, and a later pass sweeps it.
     let store = renderer
@@ -1407,7 +1534,10 @@ fn a_dropped_sweep_is_given_back_on_the_next_pass() {
         "the sweep the owner dropped is still resident, so this store is \
          keeping GPU memory alive past the thing that owns it"
     );
-    assert_eq!(store_of(&renderer).resident_bytes(), kept.bytes());
+    assert_eq!(
+        store_of(&renderer).resident_bytes(),
+        kept.resident_bytes() as u64
+    );
     // And no second upload for the sweep that stayed.
     assert_eq!(store_of(&renderer).uploads().0, 2);
 }
@@ -1428,7 +1558,7 @@ fn a_callback_with_no_store_draws_nothing_and_is_counted() {
     };
     let format = wgpu::TextureFormat::Rgba8Unorm;
     let before = squallar_gpu::radar_fan::storeless_callbacks();
-    let sweep = fixture(1, None, opaque_lut());
+    let sweep = fixture(None, opaque_lut());
     // One callback with no store reaches TWO sites that count it: `prepare`,
     // which finds nothing to upload into, and `paint`, which finds nothing to
     // draw out of. Asserted as an exact delta rather than as "it moved",
@@ -1480,27 +1610,22 @@ fn the_mip_level_is_chosen_by_the_pixel_footprint() {
         r = r.div_ceil(2);
         g = g.div_ceil(2);
     }
-    let sweep = Arc::new(
-        FanSweep::new(
-            1,
-            FanPlane {
-                radials: RADIALS,
-                gates: GATES,
-                codes,
-                mip_levels: LEVELS,
-            },
-            lut.clone(),
-            one_degree_edges(),
-            scalars(None),
-        )
-        .expect("four levels of the fixture shape"),
-    );
+    let sweep = Arc::new(payload(
+        RADIALS,
+        GATES,
+        codes,
+        LEVELS,
+        lut.clone(),
+        one_degree_edges(),
+        geometry(None),
+    ));
+    admit(&sweep).expect("four levels of the fixture shape");
 
     // `gate_interval_km` is 1 km here, so `km_per_px` names the level directly:
     // floor(log2(km_per_px)).
     for (km_per_px, level) in [(1.0f32, 0usize), (2.0, 1), (4.0, 2), (16.0, 3)] {
         let mut at_zoom = view(1.0);
-        at_zoom.km_per_px = km_per_px;
+        at_zoom.km_per_pt = km_per_px;
         let store = RadarFanStore::new(&device, attachments(format));
         let (pixels, _) = frame(
             &device,
@@ -1534,9 +1659,9 @@ fn the_mip_level_is_chosen_by_the_pixel_footprint() {
     // And the clamp: a plane of one level stays on level 0 however far out the
     // view is, with no branch and no cfg. That is what a categorical plane
     // needs.
-    let flat = fixture(2, None, lut.clone());
+    let flat = fixture(None, lut.clone());
     let mut far = view(1.0);
-    far.km_per_px = 512.0;
+    far.km_per_pt = 512.0;
     let store = RadarFanStore::new(&device, attachments(format));
     let (pixels, _) = frame(
         &device,

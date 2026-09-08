@@ -1226,6 +1226,14 @@ fn loop_frame_bytes(pane: &PaneNeed, budgets: &Budgets, grid: u64) -> u64 {
         return pane.overlay_frame_bytes as u64;
     }
     match pane.view {
+        // **Measured where the renderer produced a plane, the raster's price
+        // otherwise** — see [`PaneNeed::radar_frame_bytes`]. The selection is
+        // on what the pane is HOLDING and on nothing else: the two
+        // representations of one surveillance tilt are ~369x apart, so a
+        // budget keyed on a flag could sign off a scene at a fraction of what
+        // it then allocates. A zero is the raster arm, which is the larger of
+        // the two, so the fallback over-prices and never under-prices.
+        RenderView::PlanView if pane.radar_frame_bytes > 0 => pane.radar_frame_bytes as u64,
         RenderView::PlanView => budgets.loop_frame_cost().gpu as u64,
         RenderView::CrossSection => budgets.section_frame_cost().gpu as u64,
         RenderView::Volume => grid,

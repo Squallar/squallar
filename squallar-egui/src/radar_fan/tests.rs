@@ -25,6 +25,12 @@ fn geometry() -> FanGeometry {
         elevation_deg: Some(0.5),
         reach_gates: 4,
         reach_km: 3.0,
+        // Gate 0.s near edge in GROUND range: 2.125 - 0.125 slant, which at
+        // half a degree is 2.0 km to well past the digits a fixture states.
+        // Its distance from `reach_km` over `reach_gates` is 0.25 km, the
+        // same gate the slant figures declare — so the fixture agrees with
+        // itself about how deep a gate is.
+        first_gate_km: 2.0,
         // The tree's own two, not a second spelling of them: a fixture that
         // wrote the numbers out would be exactly the second definition
         // `geodesy_one_definition.rs` exists to refuse, and carrying them as

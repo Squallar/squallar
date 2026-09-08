@@ -406,3 +406,105 @@ fn overlay_frame(
         hit_map,
     })
 }
+
+/// One polar plan-view frame, holding a plane of `gates` gates.
+fn fan_picture(gates: u32) -> (LoopFrameImage, usize) {
+    let sweep = std::sync::Arc::new(squallar_egui::radar_fan::FanSweep {
+        field: squallar_radar::fields::known::REFLECTIVITY,
+        radials: 4,
+        gates,
+        codes: vec![0; (4 * gates) as usize],
+        level_offsets: vec![0],
+        lut_rgba: vec![0; squallar_egui::radar_fan::LUT_BYTES],
+        edges: vec![[0.0, 90.0], [90.0, 180.0], [180.0, 270.0], [270.0, 360.0]],
+        geometry: squallar_egui::radar_fan::FanGeometry {
+            site_lat: 35.33,
+            site_lon: -97.27,
+            first_gate_slant_km: 2.125,
+            gate_interval_slant_km: 0.25,
+            elevation_deg: Some(0.5),
+            reach_gates: gates,
+            reach_km: 2.5,
+            first_gate_km: 2.0,
+            earth_radius_km: squallar_geo::EARTH_RADIUS_KM,
+            effective_radius_km: squallar_radar::beam::RE_EFF_KM,
+        },
+    });
+    assert!(sweep.is_well_formed(), "the fixture describes itself");
+    let bytes = sweep.resident_bytes();
+    let image = LoopFrameImage::PlanView(squallar_egui::pane::RadarImageData {
+        surface: squallar_egui::pane::RadarSurface::Fan(std::sync::Arc::from(vec![sweep])),
+        lat: 35.33,
+        lon: -97.27,
+        max_range_km: 230.0,
+        placed: squallar_radar::types::ImageBounds::from_radar_site(35.33, -97.27, 230.0).into(),
+        nyquist_ms: None,
+        melting_layer_source: None,
+        storm_motion: None,
+        hover: Arc::new(squallar_radar::hover::HoverSource::empty()),
+    });
+    (image, bytes)
+}
+
+/// **A polar frame's plane is host bytes and this store counts them; a
+/// raster's pixels are egui's and it does not.**
+///
+/// The term exists because the polar surface changed what a plan-view frame
+/// holds. A raster frame's picture is a `TextureHandle` — a GPU id and a
+/// retain count — so the store's old zero was right for it and stays right. A
+/// fan frame's picture is the code plane itself, on this heap, for as long as
+/// the frame lives: the renderer's residency is a `Weak` handle to that very
+/// payload. Priced at zero it would be the largest thing a loop holds and
+/// invisible to the census that gates this campaign.
+///
+/// Each arm is asserted against what IT holds — the raster against zero, each
+/// fan against its own payload's `resident_bytes` — and never against a shared
+/// bound, which at two different plane widths would leave the narrower one
+/// unguarded up to the difference.
+///
+/// TAMPER: drop the surface term from the `PlanView` arm and both fan arms go
+/// red while the raster arm stays green.
+#[test]
+fn a_polar_frames_plane_is_counted_on_the_host_and_a_rasters_pixels_are_not() {
+    let ctx = egui::Context::default();
+
+    // The raster arm, alone: the store's standing zero.
+    let mut store = LoopFrameStore::default();
+    store.insert(
+        LoopFrameKey::plan_view(reflectivity(SITE, TILT), ts(0)),
+        picture(&ctx),
+        0,
+    );
+    assert_eq!(
+        store.resident_host_bytes(),
+        0,
+        "a raster frame's pixels are egui's and must not be counted here too"
+    );
+
+    // One fan: its own plane, to the byte.
+    let (narrow, narrow_bytes) = fan_picture(2);
+    let mut store = LoopFrameStore::default();
+    store.insert(
+        LoopFrameKey::plan_view(reflectivity(SITE, TILT), ts(0)),
+        narrow,
+        0,
+    );
+    assert_eq!(store.resident_host_bytes(), narrow_bytes as u64);
+
+    // A second fan of a different width adds its own, so the figure is a sum
+    // over the entries and not one entry's price times a count.
+    let (wide, wide_bytes) = fan_picture(64);
+    assert!(
+        wide_bytes > narrow_bytes,
+        "premise: the two fixtures differ in size ({wide_bytes} vs {narrow_bytes})"
+    );
+    store.insert(
+        LoopFrameKey::plan_view(reflectivity(SITE, TILT), ts(1)),
+        wide,
+        0,
+    );
+    assert_eq!(
+        store.resident_host_bytes(),
+        (narrow_bytes + wide_bytes) as u64
+    );
+}

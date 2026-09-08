@@ -103,6 +103,7 @@ fn sweep() -> FanSweep {
             elevation_deg: Some(0.5),
             reach_gates: 2,
             reach_km: 2.5,
+            first_gate_km: 2.0,
             earth_radius_km: squallar_geo::EARTH_RADIUS_KM,
             effective_radius_km: squallar_radar::beam::RE_EFF_KM,
         },

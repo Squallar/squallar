@@ -1922,7 +1922,11 @@ impl App {
         // for the reason the ground store above is: a frame that dispatched a
         // fan callback into an empty slot would draw nothing and report
         // nothing.
-        let fan = radar_fan_bridge();
+        let fan = radar_fan_bridge(
+            state.egui_renderer.callback_resources_mut(),
+            &state.device,
+            attachments,
+        );
         self.radar_fan_painter = fan.clone();
 
         // Every one of the renderer's painters, published at one seam.
@@ -3763,30 +3767,40 @@ mod tests;
 
 /// **What draws a radar sweep's code plane on this build, or nothing.**
 ///
-/// `None` today, on every target, and that is where the polar path stops: the
-/// renderer half lives in `squallar_gpu::radar_fan` and is not in this tree
-/// yet. One function, so the answer cannot be given twice — it is what
+/// One function, so the answer cannot be given twice — it is what
 /// `spawn_loop_render` asks before it will *request* a polar frame, and what
 /// the arrival path in `app_render` asks before it will build a polar surface.
+/// Those two must agree: a plane built on a machine that cannot draw one is a
+/// pane with no radar on it, because the raster it would fall back to is the
+/// allocation the representation exists not to make.
 ///
-/// When the store and the bridge land, this becomes the two lines the tile
-/// mesh already has beside it: insert the store into the renderer's callback
-/// resources, then return the bridge. It takes no arguments today for the same
-/// reason it returns `None` — there is nothing yet to give it.
+/// It answers off the store the caller has just installed, and takes it as an
+/// argument for that reason: an installed store is the whole of what a fan
+/// draw needs from this build, so a bridge returned beside one cannot be a
+/// promise the renderer has not kept. The order is the ground store's above —
+/// resources first, painter after — so no frame can dispatch a fan callback
+/// into an empty slot.
 ///
-/// **And one more line, elsewhere, in the same change.**
-/// `squallar_device_profile`'s polar frame price is deliberately dark —
-/// nothing on a path to `fit::NeedTerms` may select it — because a polar frame
-/// and a raster of the same sweep differ by a factor of 369, and a budget
-/// taking the polar figure while the renderer still produced rasters would
-/// sign off a scene costing 369× its price. The producer emits planes now, so
-/// the day this function returns a bridge is the day that price has to be
-/// keyed on **what the renderer actually produced for that frame** — never on
-/// this function alone, and never on a build flag. That crate's own doc states
-/// the constraint and scrapes the workspace for its function's name as a
-/// literal, which is why this names it only by description.
-fn radar_fan_bridge() -> Option<Arc<dyn squallar_egui::radar_fan::RadarFanPainter>> {
-    None
+/// **The price follows the payload, not this function.** A polar frame and a
+/// raster of one sweep differ by a factor of ~369, so a budget keyed on a
+/// build flag — this function included — could price a scene at a fraction of
+/// what it then allocates. Every plan-view loop frame is instead priced off
+/// what the pane is actually holding (`app_render`'s `radar_loop_frame_bytes`,
+/// measured through `FanSweep::resident_bytes`), which prices a sweep that
+/// fell back to a raster as the raster it is. `squallar_device_profile`'s own
+/// polar price stays unselected and its doc states that constraint; it scrapes
+/// the workspace for its function's name as a literal, which is why this names
+/// it only by description.
+fn radar_fan_bridge(
+    resources: &mut egui_wgpu::CallbackResources,
+    device: &wgpu::Device,
+    attachments: squallar_gpu::egui_renderer::AttachmentConfig,
+) -> Option<Arc<dyn squallar_egui::radar_fan::RadarFanPainter>> {
+    resources.insert(squallar_gpu::radar_fan::RadarFanStore::new(
+        device,
+        attachments,
+    ));
+    Some(Arc::new(squallar_gpu::radar_fan::RadarFanBridge))
 }
 
 #[cfg(test)]
