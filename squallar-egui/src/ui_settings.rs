@@ -1454,3 +1454,7 @@ mod memory_figures_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ui_settings/texture_ceiling_caption_tests.rs"]
+mod texture_ceiling_caption_tests;
