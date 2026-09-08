@@ -21,6 +21,10 @@ pub mod gpu_probe;
 /// The out-of-memory count the device's error sink raises and the frame loop
 /// drains — one pressure event per frame, whatever the count.
 pub mod pressure;
+/// One radar sweep as a fan of per-radial sectors, its gates carried as the
+/// codes the wire held and coloured through a 256-entry table on the GPU.
+/// **Dark**: nothing installs the painter and nothing draws it.
+pub mod radar_fan;
 pub mod staging_ring;
 /// A vector tile's tessellated fills, uploaded once and placed by a uniform —
 /// the renderer half of [`squallar_egui::tile_mesh`].
