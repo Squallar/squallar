@@ -8778,21 +8778,27 @@ fn rendered_image(
 /// with no radar on it, not a slower pane. Unlike a tile fill, which falls
 /// back to CPU placement and loses only speed.
 ///
-/// *The reply must carry a code plane.* **No reply does today.**
-/// `RenderedFrame` puts two tails on the wire, the polar field and the image;
-/// the code plane is a third that no producer writes, so this returns `None`
-/// on every reply and no pane has ever held a polar surface in a shipped
-/// build. That is the one dark row of this seam and it is one function wide:
-/// when the third tail lands, this reads it, hands it and the reply's own
-/// `polar` geometry to [`crate::render_dispatch::fan_sweep`], and collects the
-/// result. Everything either side of it — the arm on `RadarSurface`, the draw
-/// fork, the painter install, the floor-strip refusal, the picture key — is
+/// *The reply must carry a code plane.* **No reply does today, and the reason
+/// moved on 2026-09-08.** `ce3bf6fbe` landed the third wire tail, so
+/// `RenderedFrame::codes` now exists — but it is `None` on every frame this
+/// build produces, because no renderer emits a plane; and
+/// [`LoopRenderResponse`](crate::channels::LoopRenderResponse), which is what
+/// *this* function is handed, carries no `codes` field at all. Two separate
+/// gaps, and either alone is enough for this to return `None` on every reply,
+/// so no pane has ever held a polar surface in a shipped build.
+///
+/// That is the one dark row of this seam. Everything either side of it — the
+/// arm on `RadarSurface`, the draw fork, the painter install, the floor-strip
+/// refusal, the picture key, the ordered position the callback takes — is
 /// finished and exercised.
 ///
-/// **The concatenation goes with the tail, not with this call.** `fan_sweep`
-/// walks the whole chain, which is the plane again; this function runs on the
-/// frame thread, where that does not belong. The producer that writes the tail
-/// is the one that should call it.
+/// **What is left is not this function's to do.** `fan_sweep` walks the whole
+/// chain, which is the plane again, and bakes a table; this runs on the frame
+/// thread, where neither belongs. The producer that writes the tail is the one
+/// that should call
+/// [`fan_sweep`](crate::render_dispatch::fan_sweep) — so the remaining work is
+/// a plane emitted at render time and carried through to the reply, and this
+/// function then reads what arrived rather than building it.
 fn loop_frame_fan(
     _reply: &crate::channels::LoopRenderResponse,
     renderer: Option<&std::sync::Arc<dyn squallar_egui::radar_fan::RadarFanPainter>>,
