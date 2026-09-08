@@ -8,11 +8,11 @@ nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
 squallar-alloc/src/lib.rs	63	62
 squallar-alloc/src/process.rs	167	165
-squallar-app/src/app.rs	1722	1249
+squallar-app/src/app.rs	1722	1264
 squallar-app/src/app_chunks.rs	228	113
 squallar-app/src/app_fetch.rs	2000	1468
 squallar-app/src/app_offline.rs	31	30
-squallar-app/src/app_render.rs	4449	3738
+squallar-app/src/app_render.rs	4456	3745
 squallar-app/src/app_state.rs	77	0
 squallar-app/src/budget_arms.rs	17	17
 squallar-app/src/budget_memo.rs	52	52
@@ -27,7 +27,7 @@ squallar-app/src/loop_frame_store.rs	161	150
 squallar-app/src/loop_pool.rs	382	378
 squallar-app/src/loop_refill.rs	97	90
 squallar-app/src/loop_telemetry.rs	50	50
-squallar-app/src/platform.rs	473	380
+squallar-app/src/platform.rs	473	383
 squallar-app/src/platform_double.rs	349	329
 squallar-app/src/pressure.rs	200	192
 squallar-app/src/recovery.rs	176	171
@@ -100,7 +100,7 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	306	268
 squallar-egui/src/tile_mesh/ledger.rs	77	46
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	1542	1474
+squallar-egui/src/tile_source.rs	1542	1477
 squallar-egui/src/tile_source/byte_lru.rs	272	271
 squallar-egui/src/tile_source/cache_ledger.rs	181	165
 squallar-egui/src/tile_source/snap.rs	157	157
@@ -127,7 +127,7 @@ squallar-egui/src/ui_popups.rs	299	236
 squallar-egui/src/ui_region.rs	148	146
 squallar-egui/src/ui_section_edit.rs	376	365
 squallar-egui/src/ui_section_pane.rs	735	708
-squallar-egui/src/ui_settings.rs	722	638
+squallar-egui/src/ui_settings.rs	806	722
 squallar-egui/src/ui_sheet.rs	550	524
 squallar-egui/src/ui_shell.rs	275	270
 squallar-egui/src/ui_stack.rs	510	486
