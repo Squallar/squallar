@@ -100,7 +100,7 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	306	268
 squallar-egui/src/tile_mesh/ledger.rs	77	46
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	1542	1475
+squallar-egui/src/tile_source.rs	1542	1478
 squallar-egui/src/tile_source/byte_lru.rs	272	271
 squallar-egui/src/tile_source/cache_ledger.rs	181	165
 squallar-egui/src/tile_source/snap.rs	157	157
@@ -127,7 +127,7 @@ squallar-egui/src/ui_popups.rs	299	236
 squallar-egui/src/ui_region.rs	148	146
 squallar-egui/src/ui_section_edit.rs	376	365
 squallar-egui/src/ui_section_pane.rs	735	708
-squallar-egui/src/ui_settings.rs	806	722
+squallar-egui/src/ui_settings.rs	806	729
 squallar-egui/src/ui_sheet.rs	550	524
 squallar-egui/src/ui_shell.rs	275	270
 squallar-egui/src/ui_stack.rs	510	486
@@ -346,6 +346,7 @@ squallar-web/src/heap_max.rs	43	40
 squallar-web/src/kv.rs	14	14
 squallar-web/src/lib.rs	10	10
 squallar-web/src/shared_loan.rs	77	73
+squallar-web/src/worker_heap.rs	92	86
 squallar-web/src/worker_retry.rs	51	51
 squallar-worker/src/job_registry.rs	8	8
 squallar-worker/src/offload.rs	543	516
