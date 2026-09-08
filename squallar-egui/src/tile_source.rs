@@ -80,11 +80,10 @@ const RECOVERED: &str = "the archive is answering tile reads again, so it draws 
 ///
 /// # How the tile caches are bounded
 ///
-/// One source owns one [`TileCache`]: a [`byte_lru::ByteLru`] whose budget
-/// is the device's allowance for that source's population
-/// (`squallar_device_profile::budget::TileCacheBudget`, pushed in every frame
-/// through `MapTileState::set_budget`) and whose floor in entries is the
-/// working set the last pass measured ([`HttpsTiles::note_wanted`]). There is
+/// One source owns one [`TileCache`]: a [`byte_lru::ByteLru`] whose floor in
+/// entries is the working set the last pass measured
+/// ([`HttpsTiles::note_wanted`]) and whose budget is the **smaller** of two
+/// figures — what the device permits and what the source demands. There is
 /// no count constant and no per-target cascade here any more. An LRU below
 /// the working set is not a slower cache, it is a broken one — it evicts a
 /// tile still on the glass and refetches it next frame, for something the
@@ -94,6 +93,27 @@ const RECOVERED: &str = "the archive is answering tile reads again, so it draws 
 /// against a cap of 100 — the working set the floor later measured there is
 /// 174 — 93 % of asks refetches of tiles just evicted, 414 MB uploaded to
 /// hold 18.8 MB, with nothing moving.
+///
+/// **What the device permits** is
+/// `squallar_device_profile::budget::TileCacheBudget`, pushed in every frame
+/// through `MapTileState::set_budget`. On a measured or probed capacity it is
+/// a share of `Capacity::economy_allowance` — `ECONOMY_FRACTION` of the
+/// **card** less the scene's **device** need — held inside the class bracket.
+/// That figure is about the GPU, and the styled shapes it sizes live on the
+/// **host**: on a discrete-GPU desktop with room to spare the share saturates
+/// `DESKTOP_TILE_STYLED_BYTES`' 512 MiB ceiling whatever is on the glass. The
+/// heap census read 488.4 MiB held in this family on the six-pane arm against
+/// a 250 MiB whole-process target, and the ~165.6 MiB the same arm read
+/// before this cache was bounded in bytes at all was
+/// `DESKTOP_TILE_CACHE_ENTRIES`' 256 entries at their measured mean. An
+/// allowance derived from a memory the population does not occupy cannot
+/// bound it, so it is a ceiling here and not the budget.
+///
+/// **What the source demands** is [`HttpsTiles::demand_cap_bytes`]: the cells
+/// the passes measured, priced at the cache's own mean resident entry, times
+/// [`WORKING_SET_REUSE_MULTIPLE`]. It is the figure that scales with the
+/// scene rather than with the machine, and it is what makes six panes cost
+/// six panes' worth of tiles instead of whatever the card had left over.
 ///
 /// # Two slots, three populations
 ///
@@ -156,6 +176,41 @@ const RECOVERED: &str = "the archive is answering tile reads again, so it draws 
 /// predicted a figure from a struct's fields and was wrong by exactly the
 /// amount it computed; the lesson is kept, the arithmetic is not.
 pub const MEASURED_STYLED_ENTRY_BYTES: usize = 1_462_708;
+
+/// **How many working sets of styled entries a source may hold**, the demand
+/// half of the two figures [`MEASURED_STYLED_ENTRY_BYTES`]' doc names.
+///
+/// One is the working set itself and the rest is reuse: at `2` a source holds
+/// what is on the glass and one whole screen more of what the user panned
+/// away from, and the cells beyond that are refetched. The cost of being
+/// wrong here is a refetch — never a frame, never a coarser tile — because
+/// the cells on the glass are held by the *floor*, in entries, which no
+/// budget can evict below ([`byte_lru::ByteLru::trim_one`]).
+///
+/// **Two lower bounds it may not go under, and both are the reason it is not
+/// `1`.**
+///
+/// The first is the tile-sharpness rung. [`snap`] arms on
+/// [`byte_lru::ByteLru::floor_overrun_bytes`] — the working set alone holding
+/// past the budget — and releases only when the unsnapped set fits with
+/// [`snap::TILE_SNAP_RELEASE_HYSTERESIS`] to spare. A cap at the working
+/// set's own price would read as a permanent overrun and snap the source to
+/// the whole zoom for good, which is a **fidelity** loss and not a cache
+/// miss. [`HttpsTiles::demand_cap_bytes`] prices the larger of the snapped
+/// and unsnapped sets for the same reason, so the cap can never be the thing
+/// that keeps a snapped source snapped; `2` clears the hysteresis' `5/4` by
+/// 1.6x either way.
+///
+/// The second is the ancestor net and the markers of requests in flight: both
+/// are cache entries the floor counts, so a multiple of `1` would leave the
+/// budget exactly at the floor's price and every put would be a put over
+/// budget.
+///
+/// Raising it costs bytes linearly and buys refetches back; lowering it below
+/// `2` is the one direction this constant may not take without re-arguing the
+/// snap above. `tests::the_demand_cap_never_wedges_the_sharpness_rung` is
+/// what holds that.
+pub const WORKING_SET_REUSE_MULTIPLE: u64 = 2;
 
 /// What a typical dense-city styled entry costs — an estimate, carried with
 /// its direction. The committed Monaco fixture's mean over all 246 tiles it
@@ -1595,6 +1650,13 @@ pub struct HttpsTiles {
     /// set the cache's floor follows. See [`Self::note_wanted`].
     wanted: WantedTally,
 
+    /// **What the device permits this source's styled entries**, as
+    /// `MapTileState::set_budget` last delivered it. Held rather than pushed
+    /// straight into the cache because the budget in force is the smaller of
+    /// this and [`Self::demand_cap_bytes`], and the demand half moves every
+    /// pass while this moves on a re-fit. See [`Self::apply_styled_budget`].
+    styled_allowance_bytes: u64,
+
     /// The asks the request channel refused, in the order it refused them, so
     /// the next pass asks for them first. See [`AskQueue`].
     asks: AskQueue,
@@ -2534,6 +2596,7 @@ impl HttpsTiles {
             requests_closed: false,
             // A plain HTTP raster source draws the ground: the base role.
             cache: TileCache::new(styled_bytes, cache_ledger::CacheRole::Base),
+            styled_allowance_bytes: styled_bytes,
             style_epoch: RASTER_STYLE_EPOCH,
             feathering: None,
             // A raster source has no style to swap and no parse to keep.
@@ -2753,8 +2816,15 @@ impl HttpsTiles {
     /// that stand in for it) — the device's allowance, pushed in every frame
     /// by `MapTileState::set_budget`. A rise takes effect at once; a fall is
     /// paid down by [`Self::pump`] one entry at a time.
+    ///
+    /// `styled_bytes` is a **ceiling** on the styled cache rather than its
+    /// budget: what the cache is told is the smaller of it and
+    /// [`Self::demand_cap_bytes`]. The parsed and body caches take the figure
+    /// as handed — neither has a floor or a working set of its own, so its
+    /// allowance already binds it.
     pub(crate) fn set_budget(&mut self, styled_bytes: u64, parsed_bytes: u64) {
-        self.cache.set_budget(styled_bytes);
+        self.styled_allowance_bytes = styled_bytes;
+        self.apply_styled_budget();
         if let Some(parsed) = &self.parsed {
             parsed
                 .lock()
@@ -2791,12 +2861,19 @@ impl HttpsTiles {
     /// working set costs more than the budget the difference is the
     /// cache's overrun, reported as a level and never hidden by evicting a
     /// tile that is on the glass.
+    ///
+    /// **The budget follows too**, and this is the hook that moves it: the
+    /// allowance is a ceiling and the working set is what the cache is
+    /// actually sized for ([`Self::apply_styled_budget`]). Integers over
+    /// fields this call already touched — no allocation and no eviction, both
+    /// of which the byte LRU defers.
     pub(crate) fn note_wanted(&mut self, pass_nr: u64, on_glass: usize, net: usize) {
         if self.wanted.note(pass_nr, on_glass, net) {
             self.asks.new_pass();
         }
         let floor = self.wanted.floor().saturating_add(MAX_PARALLEL_DOWNLOADS);
         self.cache.set_floor_entries(floor);
+        self.apply_styled_budget();
         let (completed_on_glass, completed_net) = self.wanted.completed();
         cache_ledger::set_wanted(
             self.cache.role,
@@ -2806,15 +2883,68 @@ impl HttpsTiles {
         self.retry_refused_asks();
     }
 
+    /// **What this source's working set justifies holding**, in bytes: the
+    /// cells the passes measured plus the [`MAX_PARALLEL_DOWNLOADS`] markers
+    /// the floor also counts, priced at the cache's own mean resident entry,
+    /// times [`WORKING_SET_REUSE_MULTIPLE`].
+    ///
+    /// `None` while no pass has wanted anything — a parked source, or one
+    /// that has not drawn yet. There is no working set to argue from then,
+    /// and a source parked by a layer switch keeps its slots as economy for
+    /// the fetchless restore ([`Self::release_working_set`]); capping a
+    /// parked source at zero would empty it and make the restore a refetch.
+    ///
+    /// The **larger** of the snapped and unsnapped tallies, because the
+    /// snapped one is what a snapped source has on the glass and the
+    /// unsnapped one is what [`snap`]'s release gate prices to come back.
+    /// Pricing only the first would let the cap shrink with the snap and then
+    /// refuse the release that shrinking earned — the source would never draw
+    /// sharp again. See [`WORKING_SET_REUSE_MULTIPLE`].
+    ///
+    /// The mean is the cache's own ([`byte_lru::ByteLru::mean_entry_bytes`]),
+    /// the same projection [`Self::snap_for_pass`] prices its unsnapped set
+    /// with. It reads [`byte_lru::MARKER_BYTES`] on an empty cache, so a
+    /// source that has drawn but holds nothing is capped at its floor's
+    /// marker price and grows out of it as tiles land — the floor is what
+    /// keeps the glass covered in the meantime, and it is in entries.
+    fn demand_cap_bytes(&self) -> Option<u64> {
+        let cells = self.wanted.floor().max(self.unsnapped.floor());
+        if cells == 0 {
+            return None;
+        }
+        Some(
+            (cells.saturating_add(MAX_PARALLEL_DOWNLOADS) as u64)
+                .saturating_mul(self.cache.mean_entry_bytes())
+                .saturating_mul(WORKING_SET_REUSE_MULTIPLE),
+        )
+    }
+
+    /// Tell the styled cache the smaller of what the device permits
+    /// ([`Self::set_budget`]) and what the working set demands
+    /// ([`Self::demand_cap_bytes`]). Called wherever either moves.
+    fn apply_styled_budget(&mut self) {
+        let budget = self
+            .demand_cap_bytes()
+            .map_or(self.styled_allowance_bytes, |demand| {
+                self.styled_allowance_bytes.min(demand)
+            });
+        self.cache.set_budget(budget);
+    }
+
     /// This source stopped drawing — the layer was switched off and the
     /// source parked. Nothing is on the glass, so the floor is zero and every
     /// slot is economy the budget may reclaim; the pass tally and the refused
     /// asks start over when it draws again.
+    ///
+    /// The demand cap goes with the working set that argued it, so the
+    /// allowance stands alone again and the slots the source had stay as
+    /// economy for the restore. See [`Self::demand_cap_bytes`].
     pub(crate) fn release_working_set(&mut self) {
         self.wanted = WantedTally::default();
         self.unsnapped = WantedTally::default();
         self.asks.clear();
         self.cache.set_floor_entries(0);
+        self.apply_styled_budget();
         cache_ledger::set_wanted(self.cache.role, 0, 0);
     }
 
@@ -2863,8 +2993,14 @@ impl HttpsTiles {
     /// net — accumulated across panes in `pass_nr` as [`Self::note_wanted`]
     /// accumulates what was drawn. Priced, never asked for: the release gate
     /// of [`Self::snap_for_pass`] reads the last whole pass's total.
+    ///
+    /// The demand cap prices this tally beside [`Self::wanted`] and is
+    /// re-applied here, so a snapped source's budget is the one the release
+    /// gate will be measured against on the same pass rather than the pass
+    /// after. See [`Self::demand_cap_bytes`].
     pub(crate) fn note_unsnapped(&mut self, pass_nr: u64, on_glass: usize, net: usize) {
         self.unsnapped.note(pass_nr, on_glass, net);
+        self.apply_styled_budget();
     }
 
     /// Whether the tile-sharpness rung holds this source at the whole zoom.
@@ -3603,6 +3739,15 @@ impl HttpsTiles {
         self.cache.in_flight_len()
     }
 
+    /// The byte budget the styled cache is running under — the smaller of the
+    /// device's allowance and [`Self::demand_cap_bytes`]. The ledger publishes
+    /// what is *resident* and what overruns, never the bound itself; gated as
+    /// [`Self::cached_entries`] is.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    fn styled_budget_bytes(&self) -> u64 {
+        self.cache.budget()
+    }
+
     /// This source's own cache counters — every event its cache recorded,
     /// and no other source's. The counters [`cache_ledger::totals`] reads are
     /// shared by every source of a role: in a production build that is the
@@ -4101,6 +4246,7 @@ impl HttpsTiles {
             reads_failing,
             requests_closed: false,
             cache: TileCache::new(budget.styled_bytes, role),
+            styled_allowance_bytes: budget.styled_bytes,
             style_epoch: RASTER_STYLE_EPOCH,
             feathering: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -4178,6 +4324,7 @@ impl HttpsTiles {
                 default_tile_budget().styled_bytes,
                 cache_ledger::CacheRole::Base,
             ),
+            styled_allowance_bytes: default_tile_budget().styled_bytes,
             // An inert source never restyles and never parses -- the same
             // never-restyles spelling as a raster source, which is what the
             // epoch constant's doc names for this case.

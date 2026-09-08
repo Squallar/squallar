@@ -13,8 +13,9 @@ use walkers::{Style, Tile, TileId, TilePiece, Tiles};
 use super::byte_lru::MARKER_BYTES;
 use super::{
     HttpsTiles, MAX_IN_FLIGHT, MAX_PARALLEL_DOWNLOADS, PumpBudget, ReadFailureRun,
-    SUSTAINED_READ_FAILURES, TileCache, WASM_TILE_DECODES_PER_PUMP, cache_ledger, drain_up_to,
-    interpolate_from_lower_zoom, slot_for, tile_client, tile_id_is_valid,
+    SUSTAINED_READ_FAILURES, TileCache, WASM_TILE_DECODES_PER_PUMP, WORKING_SET_REUSE_MULTIPLE,
+    cache_ledger, drain_up_to, interpolate_from_lower_zoom, slot_for, tile_client,
+    tile_id_is_valid,
 };
 
 // ---------------------------------------------------------------------------
@@ -5105,5 +5106,241 @@ fn a_sibling_threads_tile_counters_stay_out_of_this_threads_figures() {
         "a store on this thread did not move this thread's own level, so the \
          equality above says 'nothing counts anywhere' rather than 'a sibling \
          cannot reach me'",
+    );
+}
+
+// ---------------------------------------------------------------------------
+
+/// A `side`x`side` window whose west edge is at `x0`, drawn the way
+/// [`pass_over_grid`] draws one at the origin: the pump, the working set for
+/// `pass_nr`, then the walk. A map that pans is this window stepping east.
+fn pass_over_window(tiles: &mut HttpsTiles, pass_nr: u64, x0: u32, side: u32, zoom: u8) {
+    tiles.pump();
+    tiles.note_wanted(pass_nr, (side * side) as usize, 0);
+    for y in 0..side {
+        for x in x0..x0 + side {
+            tiles.ground_at(TileId { x, y, zoom });
+        }
+    }
+}
+
+/// The panned window's side: 36 cells, small enough that the loopback server
+/// fills it inside the timeout at every stop.
+const PAN_SIDE: u32 = 6;
+const PAN_CELLS: u64 = (PAN_SIDE * PAN_SIDE) as u64;
+/// How many screens east the window walks. Six stops of 36 cells is 216
+/// distinct tiles, against a cap that holds 84.
+const PAN_STOPS: u32 = 6;
+/// What the demand cap comes to for [`PAN_CELLS`] of fixture tiles: the cells
+/// and the in-flight markers the floor also counts, at one landed fixture
+/// tile, times the reuse multiple.
+const PAN_DEMAND_CAP: u64 =
+    (PAN_CELLS + MAX_PARALLEL_DOWNLOADS as u64) * FIXTURE_TILE_BYTES * WORKING_SET_REUSE_MULTIPLE;
+/// An allowance no scene this fixture can draw would ever reach — the stand-in
+/// for what a discrete-GPU desktop's economy share hands the styled cache.
+const ALLOWANCE_FOR_EVERYTHING: u64 = 4_000 * FIXTURE_TILE_BYTES;
+
+/// **A map that pans holds the glass and one screen of history, not the whole
+/// card's economy.**
+///
+/// The allowance handed in holds every tile the walk will ever see, which is
+/// what `fit::tile_cache_budget` does on a measured capacity with room: its
+/// share is a fraction of the *card* less the scene's *device* need, and the
+/// styled shapes it sizes are on the host. So the allowance is the control
+/// arm, not the treatment — this test would pass at any budget below the cap
+/// for reasons that have nothing to do with the cap, and the assertion below
+/// that the walk really outgrew the cap is what stops that from reading as a
+/// pass.
+///
+/// Three properties, and the first is the one the other two are allowed to
+/// cost nothing against:
+///
+/// 1. **Every cell of the window the walk is standing on is resident.** The
+///    floor is in entries and no budget evicts under it, so the demand cap
+///    can never take a tile off the glass.
+///
+///    **This conjunct does not discriminate in this fixture, and saying so is
+///    the point.** Tampered to `let floor = 0` — the floor removed outright —
+///    it still reads green, because the walk touches all 36 cells every pass
+///    and they are therefore the 36 most recently used of the 84 the cap
+///    holds: the LRU's own recency protects the window here, with or without
+///    the floor. It is a regression guard on the composition, not evidence
+///    for the floor. What *did* show the floor working is the tamper on
+///    conjunct 2 below: at a reuse multiple of zero the cache held
+///    `resident_entries == floor_entries == 42` and let 174 tiles go, so the
+///    floor was the whole of what stood between a zero budget and an empty
+///    cache.
+/// 2. **Nothing overruns.** The cap is [`WORKING_SET_REUSE_MULTIPLE`] times
+///    what the floor holds, so the working set never reads as held past the
+///    budget — which is what `snap` arms the tile-sharpness rung on. A cap
+///    that cost sharpness would show here, and a multiple of zero does.
+/// 3. **What is held is the cap and not the allowance.** 216 distinct tiles
+///    were fetched; 84 tiles' worth is resident. Without the cap the same
+///    walk holds all 216 (41,472 B against 16,128), which is the shape of the
+///    488.4 MiB the census read on the six-pane arm.
+#[test]
+fn a_panning_map_holds_the_working_set_and_its_reuse_margin_not_the_allowance() {
+    let server = TileServer::start(Behaviour::Serve(Arc::new(fixture_png())));
+    let ctx = Context::default();
+    let mut tiles = loopback_tiles_with_budget(&server, &ctx, ALLOWANCE_FOR_EVERYTHING);
+
+    let mut pass = 0u64;
+    for stop in 0..PAN_STOPS {
+        let x0 = stop * PAN_SIDE;
+        let landed = pump_until(DEFAULT_TIMEOUT, || {
+            pass += 1;
+            pass_over_window(&mut tiles, pass, x0, PAN_SIDE, GRID_ZOOM);
+            std::thread::sleep(Duration::from_millis(2));
+            (tiles.cache_stats().puts_first >= u64::from(stop + 1) * PAN_CELLS).then_some(())
+        });
+        assert!(
+            landed.is_some(),
+            "stop {stop}: the window's cells never all landed: {:?}",
+            tiles.cache_stats()
+        );
+    }
+
+    let last = (PAN_STOPS - 1) * PAN_SIDE;
+    let stats = tiles.cache_stats();
+    eprintln!(
+        "{PAN_STOPS} stops of a {PAN_SIDE}x{PAN_SIDE} window under an allowance of \
+         {ALLOWANCE_FOR_EVERYTHING} B and a demand cap of {PAN_DEMAND_CAP} B: {stats:?}"
+    );
+
+    // The control on the whole test: the walk has to have outgrown the cap,
+    // or every bound below holds for want of anything to bound.
+    assert!(
+        stats.puts_first > PAN_DEMAND_CAP / FIXTURE_TILE_BYTES,
+        "only {} tiles were ever fetched, against a cap that holds {}: the pan never outgrew \
+         the cap, so nothing below is a bound on anything: {stats:?}",
+        stats.puts_first,
+        PAN_DEMAND_CAP / FIXTURE_TILE_BYTES,
+    );
+
+    for y in 0..PAN_SIDE {
+        for x in last..last + PAN_SIDE {
+            let id = TileId {
+                x,
+                y,
+                zoom: GRID_ZOOM,
+            };
+            assert!(
+                tiles.tile_is_cached(id),
+                "the cap took {id:?} off the glass: the floor did not hold the working set"
+            );
+        }
+    }
+    assert_eq!(
+        stats.overrun_bytes, 0,
+        "the working set reads as held past the budget, which is what arms the tile-sharpness \
+         rung: the cap is under what the floor holds: {stats:?}"
+    );
+    assert_eq!(
+        tiles.styled_budget_bytes(),
+        PAN_DEMAND_CAP,
+        "the budget in force is not the demand cap: {stats:?}"
+    );
+    assert!(
+        stats.resident_bytes <= PAN_DEMAND_CAP,
+        "the cache holds {} B against a cap of {PAN_DEMAND_CAP} B: {stats:?}",
+        stats.resident_bytes,
+    );
+}
+
+/// **A parked source keeps its allowance, so the restore is still fetchless.**
+///
+/// `release_working_set` is the layer being switched off. There is no working
+/// set to argue a cap from then, and the slots the source holds are the
+/// economy `MapTileState` trims one entry a frame — capping a parked source at
+/// zero would empty it and turn re-enabling the layer into a refetch of
+/// everything. The control is the same source before the release, where the
+/// cap is in force.
+#[test]
+fn a_parked_source_is_capped_by_its_allowance_alone() {
+    let server = TileServer::start(Behaviour::Serve(Arc::new(fixture_png())));
+    let ctx = Context::default();
+    let mut tiles = loopback_tiles_with_budget(&server, &ctx, ALLOWANCE_FOR_EVERYTHING);
+
+    pass_over_window(&mut tiles, 1, 0, PAN_SIDE, GRID_ZOOM);
+    pass_over_window(&mut tiles, 2, 0, PAN_SIDE, GRID_ZOOM);
+    assert!(
+        tiles.styled_budget_bytes() < ALLOWANCE_FOR_EVERYTHING,
+        "a drawing source is not capped at all, so the release below cannot be shown to lift \
+         anything"
+    );
+
+    tiles.release_working_set();
+    assert_eq!(
+        tiles.styled_budget_bytes(),
+        ALLOWANCE_FOR_EVERYTHING,
+        "a parked source is still carrying a cap argued from a working set it no longer has"
+    );
+}
+
+/// **The demand cap can never be what keeps a snapped source snapped.**
+///
+/// `snap` releases the tile-sharpness rung when the set the source would draw
+/// unsnapped fits the budget with `snap::TILE_SNAP_RELEASE_HYSTERESIS` to
+/// spare. A cap priced off the *snapped* working set alone would fall with the
+/// snap and then refuse the release the snap earned — the source would draw at
+/// the whole zoom for the rest of the session, which is a **fidelity** loss
+/// and not the refetch this cut is allowed to cost. So
+/// [`HttpsTiles::demand_cap_bytes`] prices the larger of the two tallies.
+///
+/// Driven the way `ui_map_overlays::draw_tile_layer` drives it — the snap
+/// decision at the head of the pass, then the two tallies — over the rig's own
+/// reading of the user's window (`crate::tiles::measured`): 86 cells snapped
+/// at a whole zoom against 174 at the half step. The allowance is far above
+/// either, so the cap is the only thing the release gate can be measured
+/// against.
+///
+/// The control is the first half: the source has to really snap under the
+/// rung, or the release below is a source that was never snapped agreeing it
+/// is not snapped.
+#[test]
+fn the_demand_cap_never_wedges_the_sharpness_rung() {
+    use crate::tiles::measured::{HALF_STEP_TILES, WHOLE_ZOOM_TILES};
+
+    let server = TileServer::start(Behaviour::Serve(Arc::new(fixture_png())));
+    let ctx = Context::default();
+    let mut tiles = loopback_tiles_with_budget(&server, &ctx, ALLOWANCE_FOR_EVERYTHING);
+
+    // One pass as the drawing code makes it: the rung's decision first, then
+    // the set that decision drew and the set it would have drawn sharp.
+    let mut pass = 0u64;
+    let step = |tiles: &mut HttpsTiles, pass: &mut u64| {
+        *pass += 1;
+        let snapped = tiles.snap_for_pass(*pass);
+        let on_glass = if snapped {
+            WHOLE_ZOOM_TILES
+        } else {
+            HALF_STEP_TILES
+        };
+        tiles.note_wanted(*pass, on_glass, 0);
+        tiles.note_unsnapped(*pass, HALF_STEP_TILES, 0);
+    };
+
+    // The rung the ladder delivers snaps the source, dwell and all.
+    tiles.set_whole_zoom_rung(true);
+    for _ in 0..=super::snap::TILE_SNAP_DWELL_PASSES + 1 {
+        step(&mut tiles, &mut pass);
+    }
+    assert!(
+        tiles.snapped(),
+        "the source never snapped, so the release below is not a release"
+    );
+
+    // The rung is gone. Nothing else has changed, so the only thing that can
+    // hold the source at the whole zoom now is its own budget.
+    tiles.set_whole_zoom_rung(false);
+    for _ in 0..=super::snap::TILE_SNAP_DWELL_PASSES + 1 {
+        step(&mut tiles, &mut pass);
+    }
+    assert!(
+        !tiles.snapped(),
+        "the rung is off and the source is still snapped: its demand cap is under what the \
+         unsnapped set needs to release, so the map never draws sharp again — a fidelity loss, \
+         not a refetch. Budget {} B against an unsnapped set of {HALF_STEP_TILES} cells",
+        tiles.styled_budget_bytes(),
     );
 }
