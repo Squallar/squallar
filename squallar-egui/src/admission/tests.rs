@@ -1180,6 +1180,289 @@ fn the_listing_door_is_advisory_on_the_arm_that_does_not_enforce() {
     }
 }
 
+/// **An admitted listing is a verdict, and it moves `asked`.**
+///
+/// The defect this pins: `decide_loop_frames` returned early on every count
+/// the session could hold without touching `record`, so the only figures a
+/// browser rig can read — the process totals on `budget state:` — moved for a
+/// refused loop and stayed at zero for every loop that fitted. A counter that
+/// reads zero on a healthy session cannot tell "no door ran" from "every door
+/// admitted", which is the difference the rig is there to see.
+#[test]
+fn an_admitted_listing_is_counted_like_a_refused_one() {
+    let mut ledger = AdmissionLedger::default();
+    ledger.adopt(&loop_costs(9));
+
+    assert!(ledger.admit_loop_frames(0, 9));
+    let counts = ledger.counts();
+    assert_eq!(
+        (counts.asked, counts.admitted),
+        (1, 1),
+        "a loop that fits took a verdict and it must be countable",
+    );
+    assert_eq!((counts.would_refuse, counts.refused), (0, 0));
+
+    // Control, one fact changed: the same door on a count that does not fit
+    // moves the other pair, and `asked` moves for both.
+    let mut tight = AdmissionLedger::default();
+    tight.adopt(&loop_costs(9));
+    assert!(!tight.admit_loop_frames(0, 10));
+    let counts = tight.counts();
+    assert_eq!((counts.asked, counts.admitted), (1, 0));
+    assert_eq!((counts.would_refuse, counts.refused), (1, 1));
+
+    // A pane the table has never seen is still not counted: there was no
+    // figure to compare against, so no verdict was taken.
+    let mut absent = AdmissionLedger::default();
+    absent.adopt(&loop_costs(9));
+    assert!(absent.admit_loop_frames(9, 999));
+    assert_eq!(absent.counts(), Totals::default());
+}
+
+/// **Every reach of the listing door lands in exactly one exit, and the exits
+/// account for every reach.**
+///
+/// The invariant [`LoopDoorTotals::exits_balance`] states, driven rather than
+/// asserted in prose. Its value is in the future: an exit added to
+/// `decide_loop_frames` without a counter makes this red instead of quietly
+/// under-counting a denominator a rig is reading.
+///
+/// Driven on **one ledger's own copy** and not on the process statics, which
+/// every other test in this binary is moving at the same time.
+#[test]
+fn the_listing_doors_exits_partition_its_reaches() {
+    let mut ledger = AdmissionLedger::default();
+    assert_eq!(ledger.door_exits(), LoopDoorTotals::default());
+
+    // Unpriced: no table has been published.
+    assert!(ledger.admit_loop_frames(0, 999));
+    // Exempt: a restore holds a batch open over the door.
+    ledger.adopt(&loop_costs(9));
+    ledger.begin_exempt();
+    assert!(ledger.admit_loop_frames(0, 999));
+    ledger.end_exempt();
+    // No row: a pane the table has never seen.
+    assert!(ledger.admit_loop_frames(9, 999));
+    // Fit, then over.
+    assert!(ledger.admit_loop_frames(0, 9));
+    assert!(!ledger.admit_loop_frames(0, 10));
+
+    let exits = ledger.door_exits();
+    assert_eq!(
+        (exits.reached, exits.unpriced, exits.batch, exits.no_row),
+        (5, 1, 1, 1),
+    );
+    assert_eq!((exits.fit, exits.over), (1, 1));
+    assert!(
+        exits.exits_balance(),
+        "an exit without a counter is an under-counted denominator: {exits:?}",
+    );
+    assert_eq!(
+        (exits.worst_wanted, exits.worst_allowed),
+        (10, 9),
+        "the widest gap is ONE reach's pair - a count from one loop beside an \
+         allowance from another is a fabricated finding",
+    );
+    // The verdict counters see only the two exits that had a table row to
+    // answer from, which is the gap this family exists to make readable.
+    let counts = ledger.counts();
+    assert_eq!(
+        (counts.asked, counts.admitted, counts.would_refuse),
+        (2, 1, 1)
+    );
+}
+
+// ── The overlay listing door ──────────────────────────────────────────────
+
+/// **The non-radar half of the fork takes a verdict at all**, and it is the
+/// share path's own arithmetic that decides it.
+///
+/// Before this door, `App::accept_loop_scan_listings`'s "every layer but
+/// radar" arm built a frame list and dispatched it with nothing in this
+/// ledger to say it had happened — on every target, native included. The two
+/// figures are the caller's: what one of this layer's frames costs on this
+/// pane, and what the pane's slice of the loop pool gave one animating layer.
+#[test]
+fn the_overlay_listing_door_counts_the_share_it_was_handed() {
+    let mut ledger = AdmissionLedger::default();
+    ledger.adopt(&costs(u64::MAX, 0, 1));
+
+    // Six frames of 11.06 MB inside a 80 MiB share.
+    ledger.advise_overlay_loop_frames(0, 6, FramePrice::Measured(11_059_200), 80 * MIB);
+    let counts = ledger.counts();
+    assert_eq!(
+        (counts.asked, counts.admitted),
+        (1, 1),
+        "a list inside its share is an admitted verdict, not a silence",
+    );
+    assert_eq!(counts.would_refuse, 0);
+    assert!(ledger.notice(web_time::Instant::now()).is_none());
+
+    // One frame past it, same table: 8 x 11.06 MB is 88.5 MB against 83.9 MB.
+    let mut over = AdmissionLedger::default();
+    over.adopt(&costs(u64::MAX, 0, 1));
+    over.advise_overlay_loop_frames(0, 8, FramePrice::Measured(11_059_200), 80 * MIB);
+    let counts = over.counts();
+    assert_eq!(
+        (counts.asked, counts.would_refuse),
+        (1, 1),
+        "and a list past it is a verdict this door can see",
+    );
+    assert_eq!(
+        counts.refused, 0,
+        "but nothing was turned away, on either arm",
+    );
+}
+
+/// **This door never turns a loop away, and the sentence it raises says so.**
+///
+/// The list it is handed has already been held to the same `afforded_bytes`
+/// by the division that built it (`app_render::layer_share`), and the one way
+/// it comes back over is that function's own `MIN_LOOP_FRAMES_PER_PANE`
+/// floor — which it documents itself as exceeding the byte bound to honour.
+/// Refusing there would overturn that constant's decision through a side
+/// door, so what this adds is the count, the log line and the warning rather
+/// than a refusal. The enforcing arm is driven all the same, so the day it is
+/// wanted it is not being written for the first time.
+#[test]
+fn the_overlay_listing_door_is_advisory_on_both_arms() {
+    for enforcing in [false, true] {
+        let mut ledger = AdmissionLedger::default();
+        let mut table = costs(u64::MAX, 0, 1);
+        table.requested_percent = (50, 50);
+        ledger.adopt(&table);
+
+        let proceeded = ledger.decide_overlay_loop_frames(
+            0,
+            8,
+            FramePrice::Measured(11_059_200),
+            80 * MIB,
+            enforcing,
+        );
+        assert_eq!(
+            proceeded, !enforcing,
+            "only the arm that enforces may stop the loop: enforcing = {enforcing}",
+        );
+        let counts = ledger.counts();
+        assert_eq!(counts.would_refuse, 1, "the verdict is taken on both arms");
+        assert_eq!(counts.refused, u32::from(enforcing));
+
+        let text = ledger
+            .notice(web_time::Instant::now())
+            .expect("the reader is told on both arms")
+            .text
+            .clone();
+        assert!(
+            text.contains("GPU memory"),
+            "an overlay loop frame is a texture, and the share the reader can \
+             move is the GPU one: {text}",
+        );
+        assert_eq!(
+            text.contains("allowed anyway"),
+            !enforcing,
+            "the advisory arm must not claim a refusal that did not happen: \
+             {text}",
+        );
+    }
+
+    // The door the application actually calls takes the advisory arm, so a
+    // loop past its share plays and is counted rather than being stopped.
+    let mut live = AdmissionLedger::default();
+    live.adopt(&costs(u64::MAX, 0, 1));
+    live.advise_overlay_loop_frames(0, 8, FramePrice::Measured(11_059_200), 80 * MIB);
+    assert_eq!(live.counts().refused, 0);
+    assert!(
+        live.pending().is_empty(),
+        "nothing turned away retains nothing"
+    );
+}
+
+/// **The overlay door keeps the same partition over its own denominator.**
+///
+/// Four exits rather than five: it reads no table row, so `no_row` is
+/// structurally absent here rather than merely unobserved. The two doors'
+/// reaches are counted apart and never summed — one is per radar listing and
+/// the other per non-radar one.
+#[test]
+fn the_overlay_doors_exits_partition_its_own_reaches() {
+    let mut ledger = AdmissionLedger::default();
+
+    ledger.advise_overlay_loop_frames(0, 4, FramePrice::Measured(11_059_200), 80 * MIB); // unpriced
+    ledger.adopt(&costs(u64::MAX, 0, 1));
+    ledger.begin_exempt();
+    ledger.advise_overlay_loop_frames(0, 4, FramePrice::Measured(11_059_200), 80 * MIB); // batch
+    ledger.end_exempt();
+    ledger.advise_overlay_loop_frames(0, 4, FramePrice::Measured(11_059_200), 80 * MIB); // fit
+    ledger.advise_overlay_loop_frames(0, 9, FramePrice::Nominal(11_059_200), 80 * MIB); // over
+
+    let exits = ledger.overlay_door_exits();
+    assert_eq!(
+        (
+            exits.reached,
+            exits.unpriced,
+            exits.batch,
+            exits.fit,
+            exits.over
+        ),
+        (4, 1, 1, 1, 1),
+    );
+    assert_eq!(exits.no_row, 0, "this door reads no row and never can");
+    assert!(exits.exits_balance(), "{exits:?}");
+    // **The second partition of the same denominator**: which arm priced
+    // each reach. Counted before the exits, so the free ones carry it too -
+    // three measured above and one nominal.
+    assert_eq!((exits.priced_measured, exits.priced_nominal), (3, 1));
+    assert!(
+        exits.price_arms_balance(),
+        "a verdict priced off a measured raster and one priced off the class          nominal are different confidences and must not be one number:          {exits:?}",
+    );
+    assert_eq!(
+        (exits.worst_wanted, exits.worst_allowed),
+        (9, 7),
+        "the pair is in frames on both doors, so one line reads in one unit: \
+         83,886,080 B of share buys 7 frames of 11,059,200 B",
+    );
+    assert_eq!(
+        ledger.door_exits(),
+        LoopDoorTotals::default(),
+        "and not one of those reaches was counted against radar's door",
+    );
+    assert!(
+        !ledger.door_exits().price_arms_balance() || ledger.door_exits().reached == 0,
+        "radar prices from one arm and names none, so this invariant is the          overlay door's alone",
+    );
+}
+
+/// **A pane looping radar beside a model field asks two questions, and one
+/// answer may not stand in for the other.**
+///
+/// The memo in [`AdmissionLedger::refused`] is keyed by `(act, pane)`. With
+/// one variant for both halves of the fork, a radar loop refused on pane 0
+/// would be replayed as the answer to that pane's overlay listing — a loop
+/// priced at a decoded volume's reserve refusing one whose frames are
+/// rasters.
+#[test]
+fn the_two_listing_doors_do_not_answer_for_each_other() {
+    let mut ledger = AdmissionLedger::default();
+    let mut table = loop_costs(3);
+    table.requested_percent = (50, 50);
+    ledger.adopt(&table);
+
+    assert!(!ledger.admit_loop_frames(0, 14), "radar's loop is refused");
+    // The same pane's overlay listing, comfortably inside its own share.
+    ledger.advise_overlay_loop_frames(0, 4, FramePrice::Measured(11_059_200), 80 * MIB);
+    let counts = ledger.counts();
+    assert_eq!(
+        (counts.asked, counts.admitted),
+        (2, 1),
+        "the overlay question was asked and answered on its own figures",
+    );
+    assert_eq!(
+        counts.would_refuse, 1,
+        "radar's refusal must not be replayed as the overlay's",
+    );
+}
+
 // ── The wish a refusal leaves behind ──────────────────────────────────────
 //
 // Every fixture here is a pair: the refusal that retains a wish, and beside

@@ -4259,7 +4259,19 @@ impl super::App {
                         // The cap is a byte division rather than radar's
                         // count, because an overlay frame is not a radar
                         // frame's size.
-                        let frame_bytes = overlay_frame_bytes(pane, &layer, &budgets);
+                        // **With the arm it took**, because a verdict priced
+                        // off a raster the pane is drawing and one priced off
+                        // the class's nominal are different confidences. A
+                        // loop is armed before its frames exist, so the
+                        // nominal is the common answer here.
+                        let price = overlay_frame_price(pane, &layer, &budgets);
+                        let frame_bytes = price.bytes() as usize;
+                        // The two figures the division is made of, taken here
+                        // so the door below compares the **same** pair
+                        // `layer_share` divides. One arithmetic reaching two
+                        // consumers: a door with its own spelling of this
+                        // would be a second bound on one page.
+                        let afforded = layer_share_bytes(&allocation, pane_idx, animating);
                         let ls = pane.time_state_mut(&layer);
                         let Some(stamps) = build_loop_frames(ls, listing, |_| {
                             layer_share(&allocation, pane_idx, None, frame_bytes, animating)
@@ -4272,6 +4284,23 @@ impl super::App {
                             *ls = squallar_egui::pane::LayerTimeState::new();
                             continue;
                         };
+                        // **The listing door for this half of the fork**, and
+                        // until it landed there was none: this arm built a
+                        // frame list and dispatched it without one verdict in
+                        // the admission ledger, on every target including
+                        // native. Advisory on both arms and it never turns the
+                        // loop away - the list is already held to `afforded`
+                        // by the division that built it, and the one way it
+                        // comes back over is the `MIN_LOOP_FRAMES_PER_PANE`
+                        // floor `layer_share` documents itself as exceeding
+                        // the byte bound to honour. What was missing was the
+                        // count, the log line and the sentence, not a refusal.
+                        self.admission.advise_overlay_loop_frames(
+                            pane_idx,
+                            stamps.len(),
+                            price,
+                            afforded as u64,
+                        );
                         log::info!(
                             "Loop: populated {} {} frames for pane {pane_idx}",
                             stamps.len(),
@@ -7948,11 +7977,37 @@ fn overlay_frame_bytes(
     layer: &squallar_source::id::LayerId,
     budgets: &squallar_device_profile::budget::Budgets,
 ) -> usize {
+    overlay_frame_price(pane, layer, budgets).bytes() as usize
+}
+
+/// [`overlay_frame_bytes`] **with the arm it took**, for a caller that has to
+/// record how confident the figure is.
+///
+/// The selection is spelled once, here, and `overlay_frame_bytes` is this
+/// with the label dropped — so a caller that only wants the number and one
+/// that wants both cannot come to disagree about which arm answered.
+///
+/// **The nominal arm is live at a listing far more often than it looks**, and
+/// that is the reading this exists to make countable: a loop is armed before
+/// any of its frames have rastered, so unless the pane is already drawing
+/// this layer live, the figure the listing door is shown is the class's
+/// nominal. See [`squallar_egui::admission::FramePrice`] for what separates
+/// the two and by how much.
+fn overlay_frame_price(
+    pane: &squallar_egui::pane::PaneState,
+    layer: &squallar_source::id::LayerId,
+    budgets: &squallar_device_profile::budget::Budgets,
+) -> squallar_egui::admission::FramePrice {
     pane.overlay_cache(layer)
         .and_then(squallar_egui::overlay_cache::OverlayTextureCache::current)
-        .map(|texture| texture.width as usize * texture.height as usize * 4)
+        .map(|texture| texture.width as u64 * texture.height as u64 * 4)
         .filter(|bytes| *bytes > 0)
-        .unwrap_or_else(|| LoopFrameModel::from_budgets(budgets).overlay)
+        .map(squallar_egui::admission::FramePrice::Measured)
+        .unwrap_or_else(|| {
+            squallar_egui::admission::FramePrice::Nominal(
+                LoopFrameModel::from_budgets(budgets).overlay as u64,
+            )
+        })
 }
 
 /// **A non-radar layer's answer to [`settle_loop_phase`]'s `scan_available`**:
@@ -8954,6 +9009,24 @@ pub(super) fn loop_frames_held(
 /// happen.
 ///
 /// [`MIN_LOOP_FRAMES_PER_PANE`]: squallar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE
+/// **Bytes one animating layer of `pane_idx` may hold its frames in** — the
+/// pane's slice of the loop pool, divided by the layers animating on it.
+///
+/// Spelled once because two consumers read it and they must not drift:
+/// [`layer_share`] divides it by what one of *this layer's* frames costs to
+/// size the frame list, and `AdmissionLedger::advise_overlay_loop_frames`
+/// compares the list that came back against it. A door with its own
+/// arithmetic here would be a second bound on one page — the renderer
+/// proceeding on one number while the door decided on another — which is the
+/// disagreement the whole admission system exists to remove.
+pub(super) fn layer_share_bytes(
+    allocation: &LoopAllocation,
+    pane_idx: usize,
+    animating: usize,
+) -> usize {
+    allocation.share_bytes_for(pane_idx) / animating.max(1)
+}
+
 pub(super) fn layer_share(
     allocation: &LoopAllocation,
     pane_idx: usize,
@@ -8968,7 +9041,7 @@ pub(super) fn layer_share(
     }
     // A frame that costs nothing is a model built wrong; the floor answers
     // rather than a division by zero.
-    let by_bytes = (allocation.share_bytes_for(pane_idx) / animating.max(1))
+    let by_bytes = layer_share_bytes(allocation, pane_idx, animating)
         .checked_div(frame_bytes)
         .unwrap_or(squallar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE);
     by_bytes

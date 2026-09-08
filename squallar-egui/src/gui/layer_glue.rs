@@ -347,6 +347,7 @@ impl Gui {
                 | Act::Preset
                 | Act::ArmLoop
                 | Act::LoopFrames
+                | Act::OverlayLoopFrames
                 | Act::LoopSpan => {}
             }
         }

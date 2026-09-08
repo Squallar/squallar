@@ -458,3 +458,92 @@ fn the_mosaic_takes_the_clock_of_a_radar_off_pane_and_of_nothing_else() {
          model's clock, and the model's own transport is untouched by WB-10",
     );
 }
+
+/// **The mosaic's listing takes an admission verdict, and a verdict is the
+/// thing this half of the fork never had.**
+///
+/// `App::accept_loop_scan_listings` forks on whether the arrival named a
+/// radar site. The radar arm has asked the listing door since it landed; the
+/// "every layer but radar" arm built its frame list and dispatched it with
+/// **nothing** in the ledger to say it had happened — on every target, native
+/// included. So MRMS, GMGSI and every model field were priced (the arm has
+/// divided bytes since WB-7) and never counted.
+///
+/// What is asserted is the pair that separates the two failures a counter
+/// reading zero cannot tell apart: exactly one verdict was taken, and the
+/// loop was **not** turned away by it. This door is advisory on both arms —
+/// the list it prices was already held to the same share by the division that
+/// built it.
+#[test]
+fn the_mosaics_listing_takes_a_verdict_and_is_not_turned_away_by_it() {
+    let mut app = mosaic_app();
+    // A table with a pane row and nothing this door reads: both figures it
+    // compares come from the caller. The generation is what makes the ledger
+    // answer at all — an application that has priced nothing says nothing.
+    app.admission
+        .adopt(&squallar_egui::admission::AdmissionCosts {
+            generation: 1,
+            spare: squallar_device_profile::admit::Spare {
+                gpu_bytes: Some(u64::MAX),
+                host_bytes: Some(u64::MAX),
+                joint_bytes: None,
+            },
+            panes: vec![squallar_egui::admission::PaneAdmission::default()],
+            new_pane: squallar_device_profile::admit::Increment::ZERO,
+            layer_grids: Vec::new(),
+            frames: squallar_device_profile::admit::LoopFrames {
+                render_budget: 14,
+                reachable: 14,
+            },
+            requested_percent: (50, 50),
+        });
+    let before = app.admission.counts();
+    assert_eq!(before.asked, 0, "precondition: no door has run yet");
+
+    build_loop(&mut app);
+
+    let after = app.admission.counts();
+    assert_eq!(
+        after.asked, 1,
+        "the listing of a non-radar loop must reach the ledger exactly once",
+    );
+    assert_eq!(
+        after.admitted + after.would_refuse,
+        1,
+        "and that ask must have produced an answer, not a silence",
+    );
+    assert_eq!(
+        after.refused, 0,
+        "this door never turns a loop away: the frame list it priced was \
+         already held to the same share by the division that built it",
+    );
+    assert_eq!(
+        app.gui
+            .pane(0)
+            .expect("the fixture built a pane")
+            .time_state(&known::MRMS)
+            .frames
+            .len(),
+        FRAMES as usize,
+        "and the loop the verdict was taken on is still whole",
+    );
+
+    // **Which arm priced it, and this is the reading the flip to enforcing
+    // has to meet.** A loop is armed before any of its frames have rastered,
+    // so at the listing there is no current texture and the figure the door
+    // is shown is the class's nominal (18,662,400 B) rather than this pane's
+    // own raster. One number for every non-radar layer and every window: it
+    // over-prices the suite's worked 1280x960-point pane at 1x by 1.69x and
+    // UNDER-prices the same pane at 2x by 0.42x. Advisory, so neither
+    // direction costs anything today.
+    let exits = app.admission.overlay_door_exits();
+    assert_eq!(
+        (exits.priced_measured, exits.priced_nominal),
+        (0, 1),
+        "a cold loop's listing is priced off the nominal, and a verdict that          cannot say so is a confidence nobody can read",
+    );
+    assert!(
+        exits.price_arms_balance() && exits.exits_balance(),
+        "{exits:?}"
+    );
+}

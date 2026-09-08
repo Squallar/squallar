@@ -166,7 +166,7 @@ use squallar_device_profile::admit::{
     Increment, LoopFrames, Pool, Refusal, Spare, Verdict, verdict,
 };
 use squallar_source::id::LayerId;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
 /// **What the App priced, for the doors to sum against.**
 ///
@@ -327,6 +327,20 @@ pub enum Act {
     /// also keeps their refusals apart in the ledger's memo, where they are
     /// genuinely two answers.
     LoopFrames,
+    /// **Committing to the frames a NON-radar loop's listing named** — the
+    /// same instant of the same act, on the arm that renders its frames as
+    /// overlay rasters rather than from decoded volumes.
+    ///
+    /// Spelled apart from [`Self::LoopFrames`] for two reasons and neither is
+    /// cosmetic. The **price** differs: a radar frame is a decoded Level II
+    /// volume held at `fit::scan_reserve` on the page heap, an overlay frame
+    /// is the pane's own raster held as a texture, and `fit::loop_frame_bytes`
+    /// already keeps them apart. And a pane can animate **both at once** —
+    /// `PaneState::animating_layers` counts radar beside a model field — so
+    /// one variant would put two different questions about one pane under one
+    /// key in [`AdmissionLedger::refused`], and the radar answer would be
+    /// replayed as the overlay one.
+    OverlayLoopFrames,
     /// The lookback slider, which writes every pane.
     LoopSpan,
 }
@@ -340,7 +354,7 @@ impl Act {
             Self::DefaultLayers => "this pane's layers",
             Self::AdoptLayers => "the linked panes' layers",
             Self::Preset => "this preset",
-            Self::ArmLoop | Self::LoopFrames => "this loop",
+            Self::ArmLoop | Self::LoopFrames | Self::OverlayLoopFrames => "this loop",
             Self::LoopSpan => "a longer lookback",
         }
     }
@@ -407,6 +421,19 @@ impl Act {
             // to turn the loop back on ([`follow_up`]); this tells them when
             // that will work.
             Self::LoopFrames => Recovery::Reoffer,
+            // **Nothing to retain, because nothing is ever turned away.**
+            // [`AdmissionLedger::advise_overlay_loop_frames`] is an advisory
+            // door on **both** arms — see its own doc for why the frame list
+            // it prices is already bounded by the division that built it — so
+            // it never refuses, and a wish is only ever retained for an act a
+            // door actually stopped ([`AdmissionLedger::act_on`]).
+            //
+            // It is also self-driven in the strong sense the moment that
+            // changes: `App::dispatch_overlay_loop_renders` re-derives the
+            // very share this door compares against on **every dispatch
+            // pass** and re-samples the list to it, so the question is asked
+            // again continuously without a listing and without this ledger.
+            Self::OverlayLoopFrames => Recovery::SelfDriven,
         }
     }
 
@@ -432,7 +459,8 @@ impl Act {
             Self::Preset => 4,
             Self::ArmLoop => 5,
             Self::LoopFrames => 6,
-            Self::LoopSpan => 7,
+            Self::OverlayLoopFrames => 7,
+            Self::LoopSpan => 8,
         }
     }
 }
@@ -457,6 +485,7 @@ const ACT_KINDS: &[Act] = &[
     Act::Preset,
     Act::ArmLoop,
     Act::LoopFrames,
+    Act::OverlayLoopFrames,
     Act::LoopSpan,
 ];
 
@@ -573,7 +602,7 @@ const PENDING_CAP: usize =
 /// The ceiling prices one wish per act kind per addressable pane, plus the
 /// one key every pane-less act shares. Named here so a change to either term
 /// fails with the arithmetic in front of the reader.
-const _: () = assert!(PENDING_CAP == 8 * 7);
+const _: () = assert!(PENDING_CAP == 9 * 7);
 
 /// **Whether a refusal turns the act away, or is only counted** — the one
 /// per-arm value in this module, and a selected value rather than a fork in
@@ -639,6 +668,96 @@ static ADMITTED: AtomicU32 = AtomicU32::new(0);
 static WOULD_REFUSE: AtomicU32 = AtomicU32::new(0);
 static REFUSED: AtomicU32 = AtomicU32::new(0);
 
+/// **Every reach of a listing door, and which of its exits it took.**
+///
+/// A second family beside [`Totals`], because [`Totals`] structurally cannot
+/// answer the question these doors raise. [`AdmissionLedger::record`] is what
+/// moves [`ASKED`], and until 2026-09-08 the radar listing door reached it on
+/// exactly ONE of its five exits — the refusal. The other four were
+/// `return true` above it, so a door that ran a hundred times and admitted a
+/// hundred loops printed
+///
+/// ```text
+/// admission asked 0 admitted 0 would refuse 0 refused 0
+/// ```
+///
+/// which is the identical line to a door that was never reached at all, and
+/// to a caller that returned before the door existed. **Three readings, three
+/// different fixes, one line** — and `asked 0` on the web target was read as
+/// "the door is never asked" when "the door is asked and always fits"
+/// produces the same four zeros.
+///
+/// [`ASKED`] now moves on the fit exit too, which ends that particular
+/// ambiguity for the caller that has a table row. This family ends the rest
+/// of it: [`LoopDoorTotals::reached`] is a denominator no verdict counter can
+/// supply, and the exits partition it exactly, so a door that is inert on a
+/// target is told apart from one that is merely generous.
+///
+/// The design, the packed `worst` pair and the partition invariant are a
+/// peer's (`45ba1ac25`, branch `fix/atlas-upload-bound`), carried here rather
+/// than re-invented.
+///
+/// Product telemetry in the shape the rest of this module uses: always on, no
+/// feature gate, one relaxed `fetch_add` per reach on a path that runs once
+/// per listing arrival.
+static LOOP_DOOR_REACHED: AtomicU32 = AtomicU32::new(0);
+/// Reaches that returned free because a batch was open — a restore, which
+/// [`AdmissionLedger::begin_exempt`] holds open on purpose.
+static LOOP_DOOR_BATCH: AtomicU32 = AtomicU32::new(0);
+/// Reaches that returned free because the App had published no cost table yet
+/// (`generation == 0`).
+static LOOP_DOOR_UNPRICED: AtomicU32 = AtomicU32::new(0);
+/// Reaches that returned free because the table carried no row for the pane.
+static LOOP_DOOR_NO_ROW: AtomicU32 = AtomicU32::new(0);
+/// Reaches whose frame count was within [`PaneAdmission::loop_frames_allowed`].
+/// **The one that matters**: a target where every reach lands here has a door
+/// that runs and never bites.
+static LOOP_DOOR_FIT: AtomicU32 = AtomicU32::new(0);
+/// Reaches that went past the fit test and took a refusing verdict.
+static LOOP_DOOR_OVER: AtomicU32 = AtomicU32::new(0);
+/// The largest `wanted` the radar listing door has been shown, packed with
+/// the allowance it was compared against **on that same reach**:
+/// `wanted << 32 | allowed`.
+///
+/// One atomic rather than two, so the pair cannot be read from two different
+/// calls. Two statics would let a reader take a frame count from one loop and
+/// an allowance from another and call the gap between them a finding.
+static LOOP_DOOR_WORST: AtomicU64 = AtomicU64::new(0);
+
+/// The same family for [`AdmissionLedger::advise_overlay_loop_frames`], kept
+/// **apart** rather than folded in. The two doors have different denominators
+/// — one reach per radar listing against one per non-radar listing — and a
+/// merged total would answer neither. `no_row` is structurally absent here
+/// rather than merely unobserved: that door reads no table row, so its exits
+/// are four.
+static OVERLAY_DOOR_REACHED: AtomicU32 = AtomicU32::new(0);
+/// See [`LOOP_DOOR_BATCH`].
+static OVERLAY_DOOR_BATCH: AtomicU32 = AtomicU32::new(0);
+/// See [`LOOP_DOOR_UNPRICED`].
+static OVERLAY_DOOR_UNPRICED: AtomicU32 = AtomicU32::new(0);
+/// Reaches whose frame list fitted the bytes the pane's share bought.
+static OVERLAY_DOOR_FIT: AtomicU32 = AtomicU32::new(0);
+/// Reaches whose frame list was past that share — counted, logged and said on
+/// the glass, and never turned away.
+static OVERLAY_DOOR_OVER: AtomicU32 = AtomicU32::new(0);
+/// **Which arm of `app_render::overlay_frame_bytes` priced the reach.**
+/// Counted at the top beside [`OVERLAY_DOOR_REACHED`], so these two partition
+/// the same denominator the exits do — every reach prices exactly one way,
+/// including the ones that exit free.
+///
+/// A verdict taken on a **measured** raster and one taken on the class's
+/// nominal are different confidences and must not be one number: that is the
+/// same defect as `asked 0` meaning three things. See [`FramePrice`] for what
+/// separates the two arms and by how much.
+static OVERLAY_DOOR_MEASURED: AtomicU32 = AtomicU32::new(0);
+/// See [`OVERLAY_DOOR_MEASURED`].
+static OVERLAY_DOOR_NOMINAL: AtomicU32 = AtomicU32::new(0);
+/// The overlay door's worst pair, packed as [`LOOP_DOOR_WORST`] is: the
+/// largest frame count it has been shown, beside **the frames that reach's
+/// own share would have bought**. Converted to frames rather than carried as
+/// bytes so the two doors' lines read in one unit.
+static OVERLAY_DOOR_WORST: AtomicU64 = AtomicU64::new(0);
+
 /// **How often a sentence was put on the glass, and how often it landed on
 /// one that was already there.**
 ///
@@ -700,6 +819,186 @@ pub struct Totals {
     /// Subtract it to get the refusal-driven figure — see
     /// [`NOTICES_REOFFERED`].
     pub reoffered: u32,
+}
+
+/// **Where a listing door's reaches went**, exit by exit. See
+/// [`LOOP_DOOR_REACHED`] for why this is a family of its own and not more
+/// fields on [`Totals`].
+///
+/// # Denominator
+///
+/// **Every call to one door**, on both arms and whether or not it enforced.
+/// [`Self::reached`] is the total and the exit counts partition it exactly —
+/// [`Self::exits_balance`] is that property, and it is what makes a missing
+/// increment at a new exit a test failure rather than a silent under-count.
+///
+/// **The two doors are two of these and are never summed.** One counts radar
+/// listings and the other non-radar ones; adding them would describe neither.
+///
+/// It shares no denominator with [`Totals`] either. `Totals::asked` counts
+/// verdicts taken — the `fit` and `over` exits — while `reached` counts every
+/// exit, so the gap between them is exactly the reaches that had no table to
+/// answer from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoopDoorTotals {
+    /// Calls to the door, however they ended. **A zero here is the only
+    /// reading that says the door was never reached**, and it is the reading
+    /// `Totals::asked` was mistaken for.
+    pub reached: u32,
+    /// Freed by an open batch (a restore).
+    pub batch: u32,
+    /// Freed because no cost table had been published yet.
+    pub unpriced: u32,
+    /// Freed because the table had no row for the pane. Structurally zero for
+    /// the overlay door, which reads no row.
+    pub no_row: u32,
+    /// Fitted what the pane could hold, and took an admitting verdict.
+    pub fit: u32,
+    /// Past what the pane could hold, and took a refusing verdict.
+    pub over: u32,
+    /// The largest frame count the door has been shown.
+    pub worst_wanted: u32,
+    /// The frames that same reach could have held. A **pair** with
+    /// [`Self::worst_wanted`], from one reach, so the gap between them is a
+    /// real gap.
+    pub worst_allowed: u32,
+    /// **Reaches priced off a raster the pane is really drawing**
+    /// ([`FramePrice::Measured`]). Overlay door only.
+    pub priced_measured: u32,
+    /// **Reaches priced off the class's nominal frame**
+    /// ([`FramePrice::Nominal`]) — a pane that has not rastered this layer
+    /// yet, which is the common case at a listing because a loop is armed
+    /// before its frames exist. Overlay door only.
+    pub priced_nominal: u32,
+}
+
+impl LoopDoorTotals {
+    /// Whether the exits account for every reach. False can only mean a new
+    /// exit was added to a door without a counter, which is exactly the
+    /// defect this family exists to make impossible to repeat.
+    #[must_use]
+    pub const fn exits_balance(&self) -> bool {
+        self.batch
+            .saturating_add(self.unpriced)
+            .saturating_add(self.no_row)
+            .saturating_add(self.fit)
+            .saturating_add(self.over)
+            == self.reached
+    }
+
+    /// **A second partition of the same denominator**: which arm priced each
+    /// reach. Counted before the exits, so it holds over every reach and not
+    /// only the ones that took a verdict.
+    ///
+    /// **The overlay door's invariant, and only its.** The radar door prices
+    /// from one arm (`fit::scan_reserve`), so both fields are structurally
+    /// zero there and this is false for it by construction rather than by
+    /// under-counting. Asserted where it means something.
+    #[must_use]
+    pub const fn price_arms_balance(&self) -> bool {
+        self.priced_measured.saturating_add(self.priced_nominal) == self.reached
+    }
+}
+
+/// **Which arm of `app_render::overlay_frame_bytes` answered**, carried with
+/// the figure so a verdict cannot be recorded without saying how confident it
+/// is.
+///
+/// The two arms are the same planner
+/// (`crate::overlay_cache::plan_overlay_texture`) run on two different
+/// inputs, and they are **not** a whole picture against a grid cell — every
+/// texture layer on a pane rasterizes into that pane's one whole-picture
+/// plan, built once per pane per frame in `ui_map_pane`, so a gridded layer's
+/// real frame is a pane-sized raster like any other.
+///
+/// * [`Self::Measured`] is that plan, read off the raster the pane is drawing
+///   this layer with right now.
+/// * [`Self::Nominal`] is `app_render::LoopFrameModel`'s `overlay` arm: the
+///   same planner on the default window at density 1.0, the full overdraw
+///   margin and no adapter clamp — **18,662,400 B**, pinned by
+///   `an_overlay_frame_is_priced_by_the_planner_and_is_not_a_radar_frame`.
+///
+/// **It is not uniformly the larger of the two.** Against that suite's own
+/// worked measurement — a 1280x960-point pane at density 1.0, 1920x1440
+/// texels, 11,059,200 B — the nominal is 1.69x. Against the same pane at
+/// density 2.0 (44.24 MB) it is 0.42x, so on a hi-dpi display the nominal
+/// **under**-prices. What is systematic is only that it is one number for
+/// every non-radar layer and every window.
+///
+/// **This door is advisory, so neither direction costs a user anything
+/// today.** It is counted because the day the arm flips, a cold loop priced
+/// off the nominal is a loop refused on a figure nobody measured, and
+/// `would_refuse` climbing would read as a true positive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FramePrice {
+    /// Read off the raster this pane is drawing this layer with.
+    Measured(u64),
+    /// The class's nominal overlay frame, before this pane has rastered one.
+    Nominal(u64),
+}
+
+impl FramePrice {
+    /// The figure, whichever arm it came from.
+    #[must_use]
+    pub const fn bytes(self) -> u64 {
+        match self {
+            Self::Measured(bytes) | Self::Nominal(bytes) => bytes,
+        }
+    }
+}
+
+/// The radar listing door's exits, as running totals from boot.
+pub fn loop_door_totals() -> LoopDoorTotals {
+    let worst = LOOP_DOOR_WORST.load(Relaxed);
+    LoopDoorTotals {
+        reached: LOOP_DOOR_REACHED.load(Relaxed),
+        batch: LOOP_DOOR_BATCH.load(Relaxed),
+        unpriced: LOOP_DOOR_UNPRICED.load(Relaxed),
+        no_row: LOOP_DOOR_NO_ROW.load(Relaxed),
+        fit: LOOP_DOOR_FIT.load(Relaxed),
+        over: LOOP_DOOR_OVER.load(Relaxed),
+        worst_wanted: (worst >> 32) as u32,
+        worst_allowed: worst as u32,
+        // The radar door prices from one arm (`fit::scan_reserve`), so it has
+        // no arm to name. Structurally zero, not unobserved.
+        priced_measured: 0,
+        priced_nominal: 0,
+    }
+}
+
+/// The overlay listing door's exits, as running totals from boot. Never added
+/// to [`loop_door_totals`] — see [`LoopDoorTotals`] on the two denominators.
+pub fn overlay_loop_door_totals() -> LoopDoorTotals {
+    let worst = OVERLAY_DOOR_WORST.load(Relaxed);
+    LoopDoorTotals {
+        reached: OVERLAY_DOOR_REACHED.load(Relaxed),
+        batch: OVERLAY_DOOR_BATCH.load(Relaxed),
+        unpriced: OVERLAY_DOOR_UNPRICED.load(Relaxed),
+        no_row: 0,
+        fit: OVERLAY_DOOR_FIT.load(Relaxed),
+        over: OVERLAY_DOOR_OVER.load(Relaxed),
+        worst_wanted: (worst >> 32) as u32,
+        worst_allowed: worst as u32,
+        priced_measured: OVERLAY_DOOR_MEASURED.load(Relaxed),
+        priced_nominal: OVERLAY_DOOR_NOMINAL.load(Relaxed),
+    }
+}
+
+/// Note one reach of a door: `wanted` frames against the `allowed` its own
+/// reach was compared with, kept as one word.
+fn note_worst_pair(cell: &AtomicU64, wanted: usize, allowed: usize) {
+    let clamp = |n: usize| n.min(u32::MAX as usize) as u64;
+    let packed = (clamp(wanted) << 32) | clamp(allowed);
+    // A compare-exchange on the WHOLE word rather than a `fetch_max`: the two
+    // halves have to come from one reach, and a max over the packed word would
+    // let a larger allowance carry a smaller count into the cell.
+    let mut held = cell.load(Relaxed);
+    while (packed >> 32) > (held >> 32) {
+        match cell.compare_exchange_weak(held, packed, Relaxed, Relaxed) {
+            Ok(_) => break,
+            Err(now) => held = now,
+        }
+    }
 }
 
 /// The counters, as running totals from boot.
@@ -913,6 +1212,15 @@ pub struct AdmissionLedger {
     /// binary. Both move on the same verdict, so they cannot disagree about
     /// what happened — only about the denominator.
     counts: Totals,
+    /// **This ledger's own copy of the radar listing door's exits**, for the
+    /// same reason [`Self::counts`] exists: the `static`s are shared by every
+    /// test in the binary, and an invariant over them
+    /// ([`LoopDoorTotals::exits_balance`]) could only be asserted on a figure
+    /// another thread is moving underneath the reader.
+    door_exits: LoopDoorTotals,
+    /// The same, for the overlay listing door. Apart, because the two
+    /// denominators are apart.
+    overlay_door_exits: LoopDoorTotals,
 }
 
 /// **A cloned ledger is a second application, not a second holder of one
@@ -936,6 +1244,8 @@ impl Clone for AdmissionLedger {
             pending: self.pending.clone(),
             granted: self.granted.clone(),
             counts: self.counts,
+            door_exits: self.door_exits,
+            overlay_door_exits: self.overlay_door_exits,
         }
     }
 }
@@ -1224,6 +1534,20 @@ impl AdmissionLedger {
     /// differently. It does not debit [`Self::spent`]: what an admission
     /// spends is the byte door's business, and the listing door adds no bytes
     /// to a scene that is already carrying its loop.
+    /// The per-ledger half of [`note_worst_pair`], on whichever door's copy.
+    fn note_worst(&mut self, overlay: bool, wanted: usize, allowed: usize) {
+        let cell = if overlay {
+            &mut self.overlay_door_exits
+        } else {
+            &mut self.door_exits
+        };
+        let wanted = u32::try_from(wanted).unwrap_or(u32::MAX);
+        if wanted > cell.worst_wanted {
+            cell.worst_wanted = wanted;
+            cell.worst_allowed = u32::try_from(allowed).unwrap_or(u32::MAX);
+        }
+    }
+
     fn record(&mut self, act: Act, pane: Option<usize>, v: Verdict) -> Verdict {
         ASKED.fetch_add(1, Relaxed);
         self.counts.asked = self.counts.asked.saturating_add(1);
@@ -1288,16 +1612,55 @@ impl AdmissionLedger {
     fn decide_loop_frames(&mut self, pane_idx: usize, wanted: usize, enforcing: bool) -> bool {
         let act = Act::LoopFrames;
         let pane_key = Some(pane_idx);
-        if self.in_batch() || self.costs.generation == 0 {
+        // **Counted at the top, before any exit.** Three of the five exits
+        // below never reach a verdict at all, so without this the only reach
+        // visible anywhere is one that had a table to answer from — see
+        // [`LOOP_DOOR_REACHED`].
+        LOOP_DOOR_REACHED.fetch_add(1, Relaxed);
+        self.door_exits.reached = self.door_exits.reached.saturating_add(1);
+        if self.in_batch() {
+            LOOP_DOOR_BATCH.fetch_add(1, Relaxed);
+            self.door_exits.batch = self.door_exits.batch.saturating_add(1);
+            return true;
+        }
+        if self.costs.generation == 0 {
+            LOOP_DOOR_UNPRICED.fetch_add(1, Relaxed);
+            self.door_exits.unpriced = self.door_exits.unpriced.saturating_add(1);
+            return true;
+        }
+        // A pane the table has not seen asks for nothing, the same way every
+        // other door reads an absent row: refusing on a figure that does not
+        // exist is how an admission system becomes a wall at startup. No
+        // **verdict** is taken either — there was no figure to compare
+        // against — which is why this exit moves the family above and not
+        // [`Totals`].
+        if self.costs.panes.get(pane_idx).is_none() {
+            LOOP_DOOR_NO_ROW.fetch_add(1, Relaxed);
+            self.door_exits.no_row = self.door_exits.no_row.saturating_add(1);
             return true;
         }
         let pane = self.pane(pane_idx);
-        // A pane the table has not seen asks for nothing, the same way every
-        // other door reads an absent row: refusing on a figure that does not
-        // exist is how an admission system becomes a wall at startup.
-        if self.costs.panes.get(pane_idx).is_none() || wanted <= pane.loop_frames_allowed {
+        // The pair is noted here and not earlier: above this line there is no
+        // row, so there is no allowance to pair the count with, and a zero
+        // allowance filed against a real count would read as the widest gap
+        // this door had ever seen.
+        note_worst_pair(&LOOP_DOOR_WORST, wanted, pane.loop_frames_allowed);
+        self.note_worst(false, wanted, pane.loop_frames_allowed);
+        // **An admit is a verdict, and it is counted like one.** This early
+        // return used to leave without touching `record`, so `asked` moved
+        // only when a loop was refused and the listing door's admits were
+        // invisible in the only figures the browser rig can read. The
+        // comparison here is against a real row of a real table: it is the
+        // same question the refusing arm below answers, with the other
+        // answer.
+        if wanted <= pane.loop_frames_allowed {
+            LOOP_DOOR_FIT.fetch_add(1, Relaxed);
+            self.door_exits.fit = self.door_exits.fit.saturating_add(1);
+            self.record(act, pane_key, Verdict::Admit);
             return true;
         }
+        LOOP_DOOR_OVER.fetch_add(1, Relaxed);
+        self.door_exits.over = self.door_exits.over.saturating_add(1);
         let (v, fresh) = match self.held_answer(act, pane_key) {
             Some(held) => (held, false),
             None => {
@@ -1316,6 +1679,176 @@ impl AdmissionLedger {
             }
         };
         self.act_on(act, pane_key, Want::Frames(wanted), v, fresh, enforcing)
+    }
+
+    /// **The listing door for a loop that is not radar: was the frame list
+    /// this pane just built inside the bytes its share bought?**
+    ///
+    /// Asked at the same instant [`Self::admit_loop_frames`] is — when a
+    /// listing lands and the frame count stops being a guess — on the arm
+    /// that renders its frames as overlay rasters. Until it existed the whole
+    /// non-radar half of `App::accept_loop_scan_listings` took no verdict of
+    /// any kind, on any target: MRMS, GMGSI and every model field built a
+    /// frame list and dispatched it with nothing in this ledger's counters to
+    /// say it had happened.
+    ///
+    /// # It is the share path's own arithmetic, not a second bound
+    ///
+    /// **Both figures come from the caller and neither is priced here.**
+    /// `frame_bytes` is `app_render::overlay_frame_bytes` — the pane's live
+    /// raster for this layer, measured, and the class's nominal overlay frame
+    /// before one exists — and `afforded_bytes` is
+    /// `app_render::layer_share_bytes`, the slice of the loop pool this
+    /// pane's animating layers divide. Those are the *same two numbers*
+    /// `layer_share` divides to size the list, spelled once and reaching two
+    /// consumers. A door that priced these frames its own way would be a
+    /// second bound on one page, with the renderer proceeding on one number
+    /// and the door refusing on the other.
+    ///
+    /// **Neither figure is a ceiling less a running total**, which is the
+    /// shape that bricks a door rather than bounding it: a term spelled
+    /// `max - spent` against a **monotone** reading falls to zero the first
+    /// time the ceiling is touched and stays there for the session, while the
+    /// allocator is still handing out reusable pages. Both of these are live.
+    /// `afforded_bytes` is re-derived from the allocation in force at every
+    /// listing — it grows again when the pool re-plans or a layer stops
+    /// animating — and `frame_bytes` is re-measured off the pane's current
+    /// raster.
+    ///
+    /// **Radar's reserve is not reusable here and the model says so.**
+    /// [`PaneAdmission::loop_frame_reserve_bytes`] is `fit::scan_reserve` — a
+    /// decoded Level II volume on the page heap — and
+    /// `fit::loop_frame_host_bytes` charges an overlay loop **zero** per frame
+    /// on that axis by name. What an overlay frame costs is a texture, which
+    /// is the axis `fit::loop_pool_bytes` sizes the pool on, so the refusal
+    /// names [`Pool::Gpu`].
+    ///
+    /// # Advisory on both arms, deliberately, and this is the one door that is
+    ///
+    /// [`ENFORCING`] is not consulted: this door passes `false`. The list it
+    /// is handed has **already** been held to `afforded_bytes` by the division
+    /// that built it, and the one way it can come back over is the
+    /// `MIN_LOOP_FRAMES_PER_PANE` floor `layer_share` documents itself as
+    /// exceeding the byte bound to honour — "one frame over, by construction,
+    /// which is the alternative to an animation that cannot animate". Turning
+    /// the loop away there would overturn that constant's decision through a
+    /// side door, on a scene the tree deliberately allows.
+    ///
+    /// So what this adds is the thing that was missing rather than a new
+    /// refusal: the over-commit is **counted** in [`Totals::would_refuse`],
+    /// **logged** with its arithmetic, and **said on the glass** in the same
+    /// sentence the advisory arm gives every other door — over the budget,
+    /// allowed anyway, and here is the share to move.
+    pub fn advise_overlay_loop_frames(
+        &mut self,
+        pane_idx: usize,
+        wanted: usize,
+        price: FramePrice,
+        afforded_bytes: u64,
+    ) {
+        self.decide_overlay_loop_frames(pane_idx, wanted, price, afforded_bytes, false);
+    }
+
+    /// [`Self::advise_overlay_loop_frames`]'s body with the policy passed in,
+    /// so the arm this door does not take is still reachable from a test —
+    /// [`Self::decide`]'s reason, and here the unexercised arm is the
+    /// enforcing one rather than the wasm one.
+    fn decide_overlay_loop_frames(
+        &mut self,
+        pane_idx: usize,
+        wanted: usize,
+        price: FramePrice,
+        afforded_bytes: u64,
+        enforcing: bool,
+    ) -> bool {
+        let frame_bytes = price.bytes();
+        let act = Act::OverlayLoopFrames;
+        let pane_key = Some(pane_idx);
+        // The same partition the radar door keeps, over this door's own
+        // denominator: one reach per **non-radar** listing, and the exits
+        // account for every one of them.
+        OVERLAY_DOOR_REACHED.fetch_add(1, Relaxed);
+        self.overlay_door_exits.reached = self.overlay_door_exits.reached.saturating_add(1);
+        // The price arm, counted here rather than beside the verdict, so it
+        // partitions every reach and not only the ones that reach an exit
+        // with a table behind it. See [`LoopDoorTotals::price_arms_balance`].
+        match price {
+            FramePrice::Measured(_) => {
+                OVERLAY_DOOR_MEASURED.fetch_add(1, Relaxed);
+                self.overlay_door_exits.priced_measured =
+                    self.overlay_door_exits.priced_measured.saturating_add(1);
+            }
+            FramePrice::Nominal(_) => {
+                OVERLAY_DOOR_NOMINAL.fetch_add(1, Relaxed);
+                self.overlay_door_exits.priced_nominal =
+                    self.overlay_door_exits.priced_nominal.saturating_add(1);
+            }
+        }
+        if self.in_batch() {
+            OVERLAY_DOOR_BATCH.fetch_add(1, Relaxed);
+            self.overlay_door_exits.batch = self.overlay_door_exits.batch.saturating_add(1);
+            return true;
+        }
+        if self.costs.generation == 0 {
+            OVERLAY_DOOR_UNPRICED.fetch_add(1, Relaxed);
+            self.overlay_door_exits.unpriced = self.overlay_door_exits.unpriced.saturating_add(1);
+            return true;
+        }
+        // **No table row is read, and none is required.** Both figures this
+        // door compares are the caller's, taken live at the listing: the
+        // pane's share moves when the pool re-plans or a second layer starts
+        // animating, and the frame moves when the window is resized, so
+        // neither is a level a telemetry tick could publish. The generation
+        // above is still honoured — an application that has priced nothing
+        // says nothing — because the notice this raises quotes the table's
+        // memory shares.
+        let wanted_bytes = (wanted as u64).saturating_mul(frame_bytes);
+        // **The admit is taken before the memo is consulted**, exactly as
+        // `Self::decide_loop_frames` takes it: the memo answers "what did this
+        // table say to this question", and a list that fits is a different
+        // question from the one that did not. It is counted, which is the
+        // whole reason this door exists on a page where nothing is refused.
+        // The pair in frames, not bytes, so the two doors' lines read in one
+        // unit: what the list holds, beside what this reach's own share would
+        // have bought. A frame that costs nothing is a model built wrong and
+        // buys nothing rather than dividing by zero.
+        let afforded_frames = afforded_bytes.checked_div(frame_bytes).unwrap_or(0);
+        note_worst_pair(&OVERLAY_DOOR_WORST, wanted, afforded_frames as usize);
+        self.note_worst(true, wanted, afforded_frames as usize);
+        if wanted_bytes <= afforded_bytes {
+            OVERLAY_DOOR_FIT.fetch_add(1, Relaxed);
+            self.overlay_door_exits.fit = self.overlay_door_exits.fit.saturating_add(1);
+            self.record(act, pane_key, Verdict::Admit);
+            return true;
+        }
+        OVERLAY_DOOR_OVER.fetch_add(1, Relaxed);
+        self.overlay_door_exits.over = self.overlay_door_exits.over.saturating_add(1);
+        let (v, fresh) = match self.held_answer(act, pane_key) {
+            Some(held) => (held, false),
+            None => (
+                self.record(
+                    act,
+                    pane_key,
+                    Verdict::Refuse(Refusal {
+                        pool: Pool::Gpu,
+                        wanted_bytes,
+                        spare_bytes: afforded_bytes,
+                    }),
+                ),
+                true,
+            ),
+        };
+        self.act_on(
+            act,
+            pane_key,
+            Want::Bytes(Increment {
+                gpu_bytes: wanted_bytes,
+                host_bytes: 0,
+            }),
+            v,
+            fresh,
+            enforcing,
+        )
     }
 
     /// **Whether `act` was already refused against the table in force.**
@@ -1353,6 +1886,20 @@ impl AdmissionLedger {
     /// test in the binary and by every application in the process.
     pub fn counts(&self) -> Totals {
         self.counts
+    }
+
+    /// **This ledger's own record of where the radar listing door's reaches
+    /// went** — the per-application twin of [`loop_door_totals`], and the
+    /// figure [`LoopDoorTotals::exits_balance`] can be asserted on without
+    /// racing every other test in the binary.
+    pub fn door_exits(&self) -> LoopDoorTotals {
+        self.door_exits
+    }
+
+    /// The same, for the overlay listing door. See
+    /// [`overlay_loop_door_totals`].
+    pub fn overlay_door_exits(&self) -> LoopDoorTotals {
+        self.overlay_door_exits
     }
 
     /// **Ask, and act on the answer** - the enforcing door.
@@ -1588,7 +2135,7 @@ const fn reoffer_text(act: Act) -> &'static str {
         Act::AdoptLayers => "There is room for the linked panes' layers now.",
         Act::Panes { .. } => "There is room for another pane now - try the split again.",
         Act::Preset => "There is room for this preset now - apply it again.",
-        Act::ArmLoop | Act::LoopFrames => {
+        Act::ArmLoop | Act::LoopFrames | Act::OverlayLoopFrames => {
             "There is room for this loop now - turn the loop back on."
         }
         Act::LoopSpan => "There is room for a longer lookback now - move the slider again.",
@@ -1710,7 +2257,7 @@ fn refusal_text(act: Act, refusal: Refusal, percents: (u8, u8), enforced: bool) 
 /// front of one act, not in front of the whole scene.
 const fn scene_lever(act: Act) -> &'static str {
     match act {
-        Act::ArmLoop | Act::LoopFrames | Act::LoopSpan => {
+        Act::ArmLoop | Act::LoopFrames | Act::OverlayLoopFrames | Act::LoopSpan => {
             "shorten the lookback, or turn off a layer"
         }
         Act::Panes { .. } | Act::Preset => "close a pane, or turn off a layer",
@@ -1757,6 +2304,7 @@ fn act_word(act: Act) -> &'static str {
         Act::Preset => "applying a preset",
         Act::ArmLoop => "arming a loop",
         Act::LoopFrames => "listing a loop",
+        Act::OverlayLoopFrames => "listing an overlay loop",
         Act::LoopSpan => "widening the lookback",
     }
 }
