@@ -3366,6 +3366,7 @@ fn a_page_at_ninety_percent_with_levers_says_so_and_frees_something() {
             render_bytes: 0,
             extracts: 0,
             tile_economy_bytes: 0,
+            staging_released_bytes: 0,
             oversample_percent: app.budgets.overlay_oversample_percent,
         },
         app.budgets.steps_back,

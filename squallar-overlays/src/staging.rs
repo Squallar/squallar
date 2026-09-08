@@ -391,5 +391,69 @@ impl<T: Copy> StagingPool<T> {
     }
 }
 
+/// **Every shipped staging pool's parked block, handed back at once** — the
+/// second of the two callers [`StagingPool::release_retained`] was written for
+/// and had never had: *"an idle policy in the layer that owns the source, and
+/// a memory governor's tier-2 pressure step"*. `SourceHandler::release_data`
+/// is the first, and it only fires for a layer **no pane draws**; this is the
+/// one for a layer that is still on, on a heap that has run out.
+///
+/// **Answers the bytes it gave back**, so a caller can say what it got
+/// rather than only that it asked — a pressure line that printed a `bool`
+/// could not be compared against the family it is trying to move.
+///
+/// **What this costs, exactly**: the next decode of each source allocates a
+/// grid instead of being handed one — one allocation, which is the allocation
+/// these pools exist to remove. Nothing is refetched, nothing is redrawn and
+/// no picture leaves the glass, because **nothing reads a parked buffer**: it
+/// is a block waiting to be filled, not data. That is what makes it the first
+/// thing a governor should take and the reason the trigger here is pressure
+/// and not a clock — [`StagingPool::release_retained`]'s own doc rules a short
+/// idle threshold out, because on a layer that is still on it would
+/// re-introduce one grid-sized allocate-and-free per poll on a heap that
+/// cannot coalesce. A wall that has already been hit is not that case.
+///
+/// **What it gives back**, at the shapes the two shipped slots retain:
+/// 49,000,000 B on MRMS and 15,000,000 B on GMGSI — 64,000,000 B (61.0 MiB)
+/// when both are parked. For scale, `overlay grids` read 155,776,456 B on the
+/// wasm32 page of the Tier-2 `huge` Firefox leg at tip `651d289d1`, of which
+/// the MRMS block alone is 31.5 %; the page was refusing allocations at 978 of
+/// its 1024 MiB when it died. `tests/overlay_grid_residency_split.rs` prices
+/// the family's three holders and this lever against them.
+///
+/// **Named here rather than walked**, and that is a deliberate cost. There is
+/// no registry of pools to iterate: each source declares its own `global()`,
+/// and a pool added without a row here is released by nothing. The
+/// alternative — an inventory every pool registers itself into — buys a walk
+/// at the price of a `static` mutable table on a path that must not allocate
+/// or block, for a set that has been two for the life of the module. A third
+/// source is a review question in one file, which is the same trade
+/// [`crate::render::handlers::source_grid_budget_bytes`] takes for the same
+/// reason.
+pub fn release_all_retained() -> u64 {
+    let mrms_pool = crate::mrms::staging::global();
+    let gmgsi_pool = crate::gmgsi::staging::global();
+    // **The levels are read BEFORE the release**: `release_retained` answers
+    // whether there was a block, never how big it was, and after it there is
+    // nothing left to price. Gated on that answer so a slot a decode held the
+    // lock on is reported as nothing given rather than as bytes freed.
+    let mrms_held = mrms_pool.retained_bytes() as u64;
+    let gmgsi_held = gmgsi_pool.retained_bytes() as u64;
+    // Two statements and not one `||` expression: both pools must be ASKED,
+    // and a short-circuit would leave GMGSI's block parked on every event
+    // where MRMS happened to have one.
+    let mrms = if mrms_pool.release_retained() {
+        mrms_held
+    } else {
+        0
+    };
+    let gmgsi = if gmgsi_pool.release_retained() {
+        gmgsi_held
+    } else {
+        0
+    };
+    mrms + gmgsi
+}
+
 #[cfg(test)]
 mod tests;

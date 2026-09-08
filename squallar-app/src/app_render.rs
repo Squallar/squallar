@@ -6476,6 +6476,17 @@ impl super::App {
     /// dropped on this thread: a shared render is `side^2 x 4` bytes twice
     /// over, and an extraction is a whole sweep's gates.
     ///
+    /// **The grid-decode pools are released here too**, on a host-heap cause
+    /// ([`crate::pressure::Pressure::is_host_heap`]):
+    /// `squallar_overlays::staging::release_all_retained` is the second of the
+    /// two callers that lever was written for -- *"an idle policy in the layer
+    /// that owns the source, and a memory governor's tier-2 pressure step"* --
+    /// and until this land it had only the first, which fires solely for a
+    /// layer **no pane draws**. It reaches the pools directly rather than
+    /// through the registry: they are process-wide statics of
+    /// `squallar-overlays`, so this costs no reach into the UI layer and no
+    /// pane state at all.
+    ///
     /// Held rasters are not released here. The one call that lets them go is
     /// on the surface-lost path, which drops the whole graphics state behind
     /// this anyway; reaching it from here would grow the app's reach into the
@@ -6509,6 +6520,36 @@ impl super::App {
             0
         };
 
+        // **And the grid-decode pools' parked blocks**, which are the cheapest
+        // host bytes in the application to give back: nothing reads a parked
+        // buffer. It is a block waiting to be filled, not data, so the whole
+        // cost is one allocation on the next decode -- no refetch, no
+        // re-raster, and nothing leaves the glass. 49,000,000 B on MRMS and
+        // 15,000,000 B on GMGSI, and `overlay grids` read 155.8 to 219.0 MB on
+        // the wasm32 page across the Tier-2 legs, so this is a fifth to a
+        // third of that family answered by giving up nothing a pane is using.
+        //
+        // **`is_host_heap()`, which is one arm wider than the tile economy's
+        // `is_page_heap()`**, and the extra arm is the platform's own memory
+        // warning. The economy's gate is narrow because what it does is lower
+        // a session presumption and re-fit a scene, which needs the `used`
+        // figure only the wasm watermark carries; this hands back blocks
+        // nothing reads, which Android's `onLowMemory` and iOS's
+        // `didReceiveMemoryWarning` are a perfectly good reason to do. The two
+        // GPU causes and the worker's heap are excluded: host bytes do not
+        // answer a device wall, and the worker's pools are statics of the
+        // worker's own instance that nothing here can reach.
+        //
+        // Unlike the economy this is NOT gated on the squeeze level: the slots
+        // refill from the next decode, so a second event two minutes later has
+        // a real block to take again, and a level would make the lever
+        // one-shot for the life of the session.
+        let staging_released_bytes = if cause.is_host_heap() {
+            squallar_overlays::staging::release_all_retained()
+        } else {
+            0
+        };
+
         // An allocation the browser refused while the WebGPU probe was holding
         // its doubling textures is the probe's doing, not a wall of this
         // session's: the textures are destroyed the moment the probe reports,
@@ -6530,6 +6571,7 @@ impl super::App {
             render_bytes,
             extracts: extract_entries,
             tile_economy_bytes,
+            staging_released_bytes,
             oversample_percent: self.budgets.overlay_oversample_percent,
         };
         log::warn!("{}", crate::pressure::pressure_line(cause, reclaimed, rung));

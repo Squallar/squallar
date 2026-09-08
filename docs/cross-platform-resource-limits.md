@@ -1917,17 +1917,39 @@ pub enum Pressure { SurfaceLost, OutOfMemory, MemoryWarning, LinearMemory { used
   page's watermark says nothing about the card, and a GPU rung shed for it —
   the loop's history first — would cost the picture for a byte the page never
   gets back; every other cause lowers the GPU figure as before. Its levers,
-  each counted on the `budget pressure:` line, which gained two trailing
-  fields (`tile economy <MiB>, oversample <percent>`): **(1)** the render
+  each counted on the `budget pressure:` line, which gained three trailing
+  fields (`tile economy <MiB>, staging released <MiB>, oversample <percent>`):
+  **(1)** the render
   cache and the extracts, as for any cause; **(2)** the tile economies
   squeezed to nothing — styled, parsed and terrain allowances at zero from
   then on (`App::tile_economy_squeezed`, applied on every loop walk through
   the existing `TileCacheBudget` seam), the working set kept by the caches'
   own floor, paid down one eviction per pump and never a frame; counted
-  once, a second event finds them given; **(3)** the host presumption down by
+  once, a second event finds them given; **(3)** the grid-decode pools'
+  parked blocks, handed back by
+  `squallar_overlays::staging::release_all_retained` — 49,000,000 B on MRMS
+  and 15,000,000 B on GMGSI, and the cheapest host bytes in the application
+  to give up, because **nothing reads a parked buffer**: it is a block
+  waiting to be filled, not data, so the whole cost is one allocation on that
+  layer's next decode and the eviction after it refills the slot. Unlike (2)
+  this is **not** counted once — the slots refill, so a later event has a
+  real block to take again; **(4)** the host presumption down by
   one economy fraction and the re-fit, which takes the oversampling rung
   where the batch no longer fits (§9.2, "what the `huge` scene fits to");
-  **(4)** the loop caches' sweep, last, once the pool has been re-planned.
+  **(5)** the loop caches' sweep, last, once the pool has been re-planned.
+
+  **Every lever above is dark on desktop, and that is a gap in the CAUSES
+  rather than in the levers.** `Pressure::LinearMemory` is raised only from a
+  `page_max_bytes` reading, and that field is supplied by
+  `squallar_web::bridge` and by nothing else; `Pressure::MemoryWarning` is
+  Android's `onLowMemory` and iOS's `didReceiveMemoryWarning`. So the only
+  pressure a desktop session can raise is one of the two GPU causes, neither
+  of which is a host-heap cause, and the whole of this paragraph describes
+  behaviour a desktop build has never performed. `Pressure::is_page_heap`
+  gates (2) and (4); `Pressure::is_host_heap` gates (3) and is wider by the
+  platform warning alone, because handing back blocks nothing reads needs no
+  `used` figure while lowering a presumption does. A host-heap target on
+  desktop needs a desktop cause first.
   **Not a lever, and named so nobody looks for it:** "hidden-layer pictures".
   A layer switched off has its picture released at the toggle
   (`Pane::release_disabled_overlay_textures`) and only visible panes are

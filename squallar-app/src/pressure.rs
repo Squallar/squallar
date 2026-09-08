@@ -78,6 +78,35 @@ impl Pressure {
         matches!(self, Self::WorkerMemory { .. })
     }
 
+    /// **Whether this cause is a wall on the heap THIS instance's own host
+    /// allocations sit on**, and so whether handing host bytes back answers
+    /// it at all.
+    ///
+    /// Wider than [`Self::is_page_heap`] by exactly one arm, and the
+    /// difference is deliberate rather than an oversight to be tidied away.
+    /// `is_page_heap` asks "does this event lower the session's host
+    /// *presumption* and re-fit the scene" — a question only the wasm
+    /// watermark can answer, because only it carries a `used` reading to
+    /// lower a presumption to. This asks the plainer question "is the host
+    /// heap what ran out", and Android's `onLowMemory` and iOS's
+    /// `didReceiveMemoryWarning` say yes to it without carrying a figure.
+    ///
+    /// The two GPU causes say **no**: a lost surface and a wgpu allocation
+    /// failure are walls on the device, and host bytes given back do not move
+    /// them. `WorkerMemory` says no for the reason its own doc gives — the
+    /// heap it names is the rasterization worker's, and every static this
+    /// process can reach is the page's.
+    ///
+    /// **No desktop target raises either arm.** `page_max_bytes` is supplied
+    /// only by `squallar-web` (`squallar_web::bridge`), so `LinearMemory` is a
+    /// browser cause, and the memory warning is Android's and iOS's. On
+    /// desktop the only causes are the two GPU ones, and every host lever in
+    /// `App::on_pressure` is therefore dark there. That is a gap in the
+    /// *causes*, not in the levers, and it is not this predicate's to close.
+    pub fn is_host_heap(self) -> bool {
+        matches!(self, Self::LinearMemory { .. } | Self::MemoryWarning)
+    }
+
     /// **What the page heap was holding when this cause fired**, where the
     /// cause is the page's — the reading the watermark judged, in bytes.
     ///
@@ -123,6 +152,28 @@ pub struct Reclaimed {
     /// stays. Zero on a cause that is not the page heap's, and zero on a
     /// page-heap event after the first: the economy was already given back.
     pub tile_economy_bytes: u64,
+    /// **Host bytes of parked grid-staging buffer handed back**: what
+    /// `squallar_overlays::staging::release_all_retained` found in the two
+    /// shipped decode pools — one MRMS mosaic at 49,000,000 B and one GMGSI
+    /// granule at 15,000,000 B when both are parked.
+    ///
+    /// **`_released_`, and the suffix is load-bearing.** There is already a
+    /// `staging_bytes` in this application and it is the OPPOSITE direction:
+    /// `squallar_device_profile::scene::OverlayGridNeed::staging_bytes` is
+    /// what a pane on a gridded layer asks the heap to be able to hold — a
+    /// budget, 128,000,000 B on the arm it was measured on, and one of the
+    /// terms the admission door adds up. This is bytes given BACK, out of
+    /// that same population. The two describe one set of blocks from opposite
+    /// ends and must never be added.
+    ///
+    /// **Nothing reads a parked buffer**, so this is the one host lever whose
+    /// whole cost is one allocation on the next decode: no refetch, no
+    /// re-raster, nothing off the glass. Zero on a cause that is not a
+    /// host-heap one — the pools are on THIS instance's heap and a GPU wall
+    /// is not answered by giving host bytes back — and zero on a second event
+    /// that finds the slots already empty, which is the ordinary reading
+    /// between two decodes.
+    pub staging_released_bytes: u64,
     /// The overlay-oversampling rung in force once the event is answered,
     /// in percent per side — `Budgets::overlay_oversample_percent`. The
     /// lever the page heap's re-fit pulls; printed so a log says which rung
@@ -135,13 +186,14 @@ pub struct Reclaimed {
 pub fn pressure_line(cause: Pressure, reclaimed: Reclaimed, rung: u32) -> String {
     format!(
         "budget pressure: {} -> evicted render cache {} entries {} MiB, extracts {}, \
-         ladder rung {}, tile economy {} MiB, oversample {}",
+         ladder rung {}, tile economy {} MiB, staging released {} MiB, oversample {}",
         cause.describe(),
         reclaimed.render_entries,
         reclaimed.render_bytes / (1024 * 1024),
         reclaimed.extracts,
         rung,
         mib(reclaimed.tile_economy_bytes),
+        mib(reclaimed.staging_released_bytes),
         reclaimed.oversample_percent,
     )
 }
@@ -305,6 +357,7 @@ mod tests {
                 render_bytes: 48 * 1024 * 1024,
                 extracts: 2,
                 tile_economy_bytes: 0,
+                staging_released_bytes: 0,
                 oversample_percent: 150,
             },
             1,
@@ -312,7 +365,8 @@ mod tests {
         assert_eq!(
             line,
             "budget pressure: out of memory -> evicted render cache 3 entries 48 MiB, \
-             extracts 2, ladder rung 1, tile economy 0 MiB, oversample 150"
+             extracts 2, ladder rung 1, tile economy 0 MiB, staging released 0 MiB, \
+             oversample 150"
         );
         for cause in [
             Pressure::SurfaceLost,
@@ -353,7 +407,8 @@ mod tests {
         assert_eq!(
             line,
             "budget pressure: linear memory 891 of 1024 MiB -> evicted render cache \
-             0 entries 0 MiB, extracts 0, ladder rung 1, tile economy 0 MiB, oversample 0"
+             0 entries 0 MiB, extracts 0, ladder rung 1, tile economy 0 MiB, \
+             staging released 0 MiB, oversample 0"
         );
         let squeezed = pressure_line(
             Pressure::LinearMemory {
@@ -362,13 +417,16 @@ mod tests {
             },
             Reclaimed {
                 tile_economy_bytes: 121 * MIB,
+                staging_released_bytes: 61 * MIB,
                 oversample_percent: 125,
                 ..Reclaimed::default()
             },
             1,
         );
         assert!(
-            squeezed.ends_with(", ladder rung 1, tile economy 121 MiB, oversample 125"),
+            squeezed.ends_with(
+                ", ladder rung 1, tile economy 121 MiB, staging released 61 MiB, oversample 125"
+            ),
             "{squeezed}"
         );
         assert!(Pressure::LinearMemory { used: 1, max: 2 }.is_page_heap());
@@ -381,6 +439,25 @@ mod tests {
         ] {
             assert!(!gpu.is_page_heap() && !gpu.is_beyond_reach(), "{gpu:?}");
         }
+        // `is_host_heap` is `is_page_heap` plus the platform warning, and
+        // NOTHING else: a widening past these two would put the grid-staging
+        // release on a GPU wall it cannot answer, or on a heap it cannot
+        // reach. Written as the whole partition so an arm added to `Pressure`
+        // has to be classified here rather than falling silently one way.
+        for (cause, host) in [
+            (Pressure::LinearMemory { used: 1, max: 2 }, true),
+            (Pressure::MemoryWarning, true),
+            (Pressure::SurfaceLost, false),
+            (Pressure::OutOfMemory, false),
+            (Pressure::WorkerMemory { used: 1, max: 2 }, false),
+        ] {
+            assert_eq!(cause.is_host_heap(), host, "{cause:?}");
+        }
+        assert!(
+            Pressure::MemoryWarning.is_host_heap() && !Pressure::MemoryWarning.is_page_heap(),
+            "the one arm that separates the two predicates; if this ever \
+             agrees, one of them has stopped being needed",
+        );
         assert_eq!(
             pressure_line(
                 Pressure::WorkerMemory {
@@ -391,7 +468,8 @@ mod tests {
                 0,
             ),
             "budget pressure: worker memory 891 of 1024 MiB -> evicted render cache \
-             0 entries 0 MiB, extracts 0, ladder rung 0, tile economy 0 MiB, oversample 0"
+             0 entries 0 MiB, extracts 0, ladder rung 0, tile economy 0 MiB, \
+             staging released 0 MiB, oversample 0"
         );
         assert_eq!(
             linear_memory_line(800 * MIB, GIB),
