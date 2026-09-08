@@ -216,6 +216,26 @@ impl super::Gui {
     }
 }
 
+/// The live-feed chip's tooltip.
+///
+/// A function rather than an argument, so the frame path can leave it unbuilt:
+/// `Response::on_hover_text` takes its text already made, and this paragraph
+/// is a `format!` over a second `format!`.
+fn chunk_feed_hover(chunks: &squallar_radar::chunk_feed::ChunkFeedStatus) -> String {
+    #[cfg(test)]
+    super::hover_text_count::note();
+    format!(
+        "Assembled from the real-time chunk feed{}. The age is how long ago \
+         the radar collected this tilt; it climbs until the beam comes back \
+         round. The archive is polled only if the feed stops.",
+        if chunks.pushed {
+            ", fetched as each chunk is published".to_owned()
+        } else {
+            format!(", checked every {}s", chunks.interval_secs)
+        }
+    )
+}
+
 /// How stale a tilt is, in words a status bar has room for.
 fn describe_age(secs: u64) -> String {
     match secs {
@@ -386,16 +406,14 @@ fn render_auto_poll_status(
 
     let response = ui.label(label.as_str());
     let response = if chunks.feeding {
-        response.on_hover_text(format!(
-            "Assembled from the real-time chunk feed{}. The age is how long ago \
-             the radar collected this tilt; it climbs until the beam comes back \
-             round. The archive is polled only if the feed stops.",
-            if chunks.pushed {
-                ", fetched as each chunk is published".to_owned()
-            } else {
-                format!(", checked every {}s", chunks.interval_secs)
-            }
-        ))
+        // `on_hover_ui`, not `on_hover_text`: the latter is exactly this
+        // closure with its text ALREADY built, so a paragraph nobody was
+        // hovering was formatted on every frame of a live feed. egui runs
+        // this body only while the tooltip is up.
+        response.on_hover_ui(|ui| {
+            ui.set_max_width(ui.spacing().tooltip_width);
+            ui.add(egui::Label::new(chunk_feed_hover(chunks)));
+        })
     } else if chunks.retired {
         response.on_hover_text(
             "The real-time feed stopped responding for this site; falling back \

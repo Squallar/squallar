@@ -1755,6 +1755,21 @@ impl InputHarness {
         self.warm_up();
     }
 
+    /// Publish a live real-time chunk feed, as the radar layer's liveness does
+    /// while the bucket is delivering. This is the state the status bar draws
+    /// its "Live" chip in, and the only one that carries the feed's tooltip.
+    pub(crate) fn feed_chunks(&mut self, interval_secs: u64) {
+        self.facts.radar_liveness.chunk_status = squallar_radar::chunk_feed::ChunkFeedStatus {
+            feeding: true,
+            retired: false,
+            interval_secs,
+            pushed: false,
+            tilt: None,
+        };
+        self.apply_facts();
+        self.warm_up();
+    }
+
     /// Say when the data behind pane `idx`'s radar image was collected, as
     /// `apply_render_to_pane` does when a render lands — whichever datasource the
     /// product came from.

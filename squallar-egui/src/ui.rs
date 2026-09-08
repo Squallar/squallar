@@ -2942,3 +2942,34 @@ pub(crate) mod frame_series_query_count {
         ASKED.with(|c| c.set(0));
     }
 }
+
+/// How many frame-path tooltip strings have been built on this thread — the
+/// counter behind `a_frame_hovering_nothing_builds_no_live_feed_tooltip_string`.
+///
+/// `Response::on_hover_text` is `on_hover_ui` with its text **already built**
+/// (`egui/src/response.rs`), so a paragraph nobody was hovering was formatted
+/// every frame. The builders this counts are free functions called from the
+/// `on_hover_ui` bodies that replaced those arguments.
+///
+/// Test-only, and a thread-local because the builders are free functions.
+#[cfg(test)]
+pub(crate) mod hover_text_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static BUILT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn note() {
+        BUILT.with(|c| c.set(c.get().wrapping_add(1)));
+    }
+
+    /// Strings built on this thread since the last [`reset`].
+    pub(crate) fn read() -> u64 {
+        BUILT.with(Cell::get)
+    }
+
+    pub(crate) fn reset() {
+        BUILT.with(|c| c.set(0));
+    }
+}

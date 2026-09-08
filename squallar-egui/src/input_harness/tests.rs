@@ -9703,6 +9703,65 @@ fn a_frame_with_no_pill_picker_open_assembles_no_popover_payloads() {
     );
 }
 
+/// **The live-feed chip's tooltip is not built for a frame nobody is hovering.**
+///
+/// `Response::on_hover_text` is `on_hover_ui` with its text **already built** —
+/// the closure is lazy, the argument is not (`egui/src/response.rs`). The
+/// status bar's chip took its text that way, so a ~230-character `format!`
+/// wrapping a second `format!` was assembled and dropped on every frame a
+/// real-time chunk feed was running. Measured off a temporary counting
+/// `#[global_allocator]`, repeat-identical across three runs of 100 still
+/// frames: **2 allocations per frame**, now zero.
+///
+/// This pins the property **in both directions**: zero strings on a frame
+/// hovering nothing, exactly one on the frame whose tooltip is up. Zero on
+/// the open frame would be a tooltip with no words in it — which is what
+/// "never build it at all" scores, and is the whole reason the second half
+/// is here.
+#[test]
+fn a_frame_hovering_nothing_builds_no_live_feed_tooltip_string() {
+    let mut h = InputHarness::new();
+    h.feed_chunks(30);
+    let (chip, text) = h
+        .status_bar()
+        .poll_chip
+        .expect("premise: a live feed must draw the chip that carries the hover");
+    assert!(
+        text.starts_with('\u{23fa}'),
+        "premise: the chip must be in its live state, not {text:?}"
+    );
+
+    h.mouse_move(h.map_center());
+    h.frames_for(4, 0.1);
+    crate::ui::hover_text_count::reset();
+    h.frame();
+    let closed = crate::ui::hover_text_count::read();
+    assert_eq!(
+        closed, 0,
+        "a frame hovering nothing built {closed} live-feed tooltip string(s), \
+         each a `format!` over a `format!` dropped without being drawn."
+    );
+
+    h.mouse_move(chip.center());
+    h.frames_for(12, 0.1);
+    assert!(
+        h.painted_text_strings()
+            .iter()
+            .any(|t| t.contains("Assembled from the real-time chunk feed")),
+        "premise: hovering the live chip must actually raise its tooltip — \
+         without that the count below proves nothing; painted: {:?}",
+        h.painted_text_strings()
+    );
+    crate::ui::hover_text_count::reset();
+    h.frame();
+    let open = crate::ui::hover_text_count::read();
+    assert_eq!(
+        open, 1,
+        "a frame with the live-feed tooltip OPEN built {open} string(s). One \
+         is the paragraph it draws; zero is a tooltip with nothing in it."
+    );
+}
+
 /// 73e. **The product and tilt popovers offer the combos' own lists, and a pick
 /// writes the pane — with the product pick resetting the tilt.**
 #[test]
