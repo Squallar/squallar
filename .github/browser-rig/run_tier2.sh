@@ -594,9 +594,59 @@ sample_header_lines() {
 # BOTH instances are given the same 1024 MiB ceiling by squallar-web/heap.js,
 # so those lines establish the WALL and cannot name the heap. The wo30 budget
 # readings can, and do: it is the PAGE that arrives within 24-83 MiB of its
-# ceiling. What the canvas buys the failure is baseline -- more rasters, more
-# tiles, more textures on the page heap -- and the page then dies of the wall
-# the `long` reproduction dies at, a few seconds sooner.
+# ceiling.
+#
+# WHAT THE CANVAS DOES, STATED NO FURTHER THAN THE READINGS GO. It would be
+# convenient to write that it merely amplifies the term `long` dies of, and
+# that is NOT what the census says. Read the two scenes' composition at the
+# wall and they are different failures reaching the same ceiling:
+#
+#   long  at 1280   dies with 596 MiB of LOOP SCANS -- the decoded volumes,
+#                   which is the term that leg was built to catch.
+#   huge  at 2878   dies with loop scans never above 99.4 MiB and overlay
+#                   grids at 210, against a RESIDENT TOTAL of 699 while the
+#                   page is pinned at 1024. 325 MiB that no census family
+#                   names.
+#
+# Measured independently by the `wideloop` leg below, whose sampler reads the
+# census every two seconds at a third geometry: at the last sample of each of
+# its eight attempts the page stands at 965-1024 MiB while the census names
+# 510-781, leaving 205-514 MiB (median ~294) unaccounted. The `huge` figure
+# sits inside that range, from a different lane on a different run.
+#
+# So the canvas does not only make the same term bigger -- it RECRUITS A TERM
+# THE CENSUS DOES NOT NAME, and that term is what a fix has to find.
+#
+# WHERE THAT TERM CANNOT BE, which is worth more than a guess about where it
+# is. The residual is `page linear MINUS the page census families`, and both
+# halves are the PAGE's by construction: `app_render.rs` writes the census with
+# `linear.map(|heap| heap.page_bytes)` and the instance word `"page"`. The
+# rasterization worker's heap is a DIFFERENT `WebAssembly.Memory` in a
+# different instance -- `worker_heap.rs`'s "Two instances, and the third name
+# is a thread", `heap_max.rs`'s "Two instances, two cells", `bridge.rs`'s "two
+# instances under two ceilings", and `alloc_failure.rs` calling the worker's
+# "a second 1 GiB nothing prices". Not one byte of it appears in the page's
+# `byteLength`, so it CANNOT be the unnamed part of a total it was never part
+# of. That is why the line prints `linear <page>/<worker>` as a pair and never
+# a sum, and it is why an earlier draft of this block naming the worker as the
+# strong candidate was wrong.
+#
+# WHAT IS LEFT IS PAGE-SIDE AND THIS FILE DOES NOT PICK AMONG IT. The tree
+# already names several page-side holdings outside every census family --
+# `app_render.rs`: "the module's own statics, egui's tessellation buffers, the
+# decoded volumes behind the loop and every transfer in flight are on the same
+# heap and in no term here". A fifth candidate fits the canvas dependence
+# specifically, because it is the one that scales with the canvas SQUARED:
+# egui's texture population, where each overlay picture is a canvas-scaled
+# `ColorImage`, which `heap_census.rs` mentions only inside other families'
+# prose (lines 283 and 604) and never as a term of its own.
+#
+# NOTHING IN THIS TREE IDENTIFIES WHICH, and this block stops there on purpose.
+# A candidate promoted to a cause here is adopted by the next reader, and this
+# correction is already the second one on this block: canvas-as-cause, then
+# canvas-as-amplifier, then the worker. Each was a reasonable reading of the
+# figures available and each was wrong, so the figures are what this block
+# carries and the mechanism is left open for a measurement to close.
 #
 # WHY THE TWO EVER LOOKED LIKE SEPARATE DEFECTS, and this is the sentence this
 # block most needed: this target is `panic-strategy = "abort"`, so NOTHING
@@ -615,6 +665,31 @@ sample_header_lines() {
 # therefore unanswered. A two-arm run answers it; no projection does. The
 # `wideloop` leg below samples the census every two seconds precisely so that
 # the next reading of this scene does not have this hole in it.
+#
+# ANSWERED 2026-09-08, and the answer is NO. The memory fix's two `huge` arms
+# were run: parent chromium peaked at 1024 with 2,384 B refused AT the
+# ceiling and parent firefox at 1015 with 50,849,246 B refused; the arm with
+# the loop's decoded volumes removed still died, at 985 chromium and 1013
+# firefox. Removing them is not sufficient at this canvas -- which is what the
+# unnamed 325 MiB above predicted, and why the term matters more than the loop.
+#
+# A CAVEAT ON EVERY `linear <page>/<WORKER>` FIGURE TAKEN BEFORE 2026-09-08,
+# this leg's own included. The page held the worker's heap figures in statics
+# that nothing cleared on loss, so a worker that spoke once and died read
+# identically to one still speaking (fixed at `a26a54ff0`, which introduces
+# `Reading::{Unread, Current, Stale}`). Every worker column in the artefacts
+# under ~/.cache/rustdar-fb-rig-out/ is therefore a real reading by some
+# worker at some time, with no way to say whether it was alive. The bias is
+# NOT neutral: a stale figure on a dying page is most likely a last gasp, so
+# it over-reads exactly where these legs read it -- near the wall. The MAXIMUM
+# is the figure most exposed to this and the medians least.
+#
+# It does not reach the canvas finding, whose two scenes are disjoint in page
+# linear and would need a canvas-CORRELATED bias to manufacture. And it does
+# not reach an `alloc failed: ... linear in raster worker` line, which is a
+# different reading altogether: the allocation-error hook runs INSIDE the
+# instance that refused, so that line is the worker's own voice at the instant
+# of refusal rather than the page's cache of it.
 #
 # 45 s of window and not 140: the death is at +14-16 s on a scene that
 # reproduces, so this clears it by ~3x while keeping the leg affordable. If a
