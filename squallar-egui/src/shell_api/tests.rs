@@ -450,3 +450,169 @@ mod readout_cadence {
         );
     }
 }
+
+/// Contract test: **the liveness seam copies on the layers' cadence, not the
+/// frame's.**
+///
+/// `FrameInputs::liveness` is a borrowed slice the App re-states on every
+/// frame and rebuilds an entry of only when that layer's own answer moves
+/// (`App::republish_liveness`, pinned from the producer side by
+/// `chunk_feed_precedence_tests::an_unchanged_liveness_answer_is_restated_and_not_rebuilt`).
+/// What the Gui must not do is pay for the restatement: an unguarded copy is a
+/// heap allocation, an atomic bump per entry and the matching drop, on every
+/// frame of every gesture, to re-state entries that are byte-for-byte the ones
+/// already held.
+///
+/// A test that asserted the *entries arrive* would have passed on the
+/// unguarded copy too; what is asserted here is the copy count.
+mod liveness_cadence {
+    use super::*;
+    use squallar_source::liveness::SourceLiveness;
+
+    /// Two seconds of 120 Hz: the frames one published answer has to survive.
+    const FRAMES: usize = 240;
+
+    fn entries(secs: u64) -> Vec<SourceLiveness> {
+        vec![crate::radar_layer::liveness_entry(RadarLiveness {
+            chunk_status: ChunkFeedStatus {
+                feeding: true,
+                retired: false,
+                interval_secs: secs,
+                pushed: true,
+                tilt: None,
+            },
+            current_volumes: std::collections::HashMap::new(),
+        })]
+    }
+
+    /// One frame's worth of inputs, everything but the liveness held still —
+    /// the App's per-frame restatement.
+    fn apply(h: &mut InputHarness, liveness: &[SourceLiveness]) {
+        h.gui_mut().apply_frame_inputs(FrameInputs {
+            safe_area_insets: (0.0, 0.0, 0.0, 0.0),
+            supports_exit: true,
+            loop_frame_budget: 60,
+            concurrent_renders: 1,
+            tile_cache: crate::tile_source::default_tile_budget(),
+            overlay_overdraw: crate::overlay_cache::OVERDRAW_FRACTION,
+            location_settings_available: false,
+            location: (squallar_location::LocationPermission::Denied, false),
+            gps: None,
+            user_heading: None,
+            catalogue_pending: false,
+            liveness,
+            floor_tile_zoom_bias: 0,
+            mirror_plan_stamp: 0,
+            frame_diagnostics: None,
+            budget_readout: None,
+            admission: None,
+            admission_debit: None,
+            admission_notice: None,
+        });
+    }
+
+    #[test]
+    fn the_seam_copies_once_per_published_answer_and_not_once_per_frame() {
+        let mut h = InputHarness::new();
+        assert_eq!(
+            h.gui().liveness_copies(),
+            0,
+            "precondition: nothing has crossed the seam yet",
+        );
+
+        // The App's steady state: one published answer, re-stated every frame.
+        let published = entries(5);
+        for _ in 0..FRAMES {
+            apply(&mut h, &published);
+        }
+        assert_eq!(
+            h.gui().liveness_copies(),
+            1,
+            "{FRAMES} frames restating one published answer took {} copies; \
+             the seam is cloning the slice again instead of comparing it",
+            h.gui().liveness_copies(),
+        );
+        assert_eq!(
+            crate::radar_layer::chunk_status(h.gui().liveness()).interval_secs,
+            5,
+            "the one copy has to be the real answer, or the count is vacuous",
+        );
+
+        // A layer republished: a new payload allocation, so the copy is taken.
+        let republished = entries(9);
+        apply(&mut h, &republished);
+        assert_eq!(
+            h.gui().liveness_copies(),
+            2,
+            "a republished answer did not cross, so the UI would paint the \
+             last one forever",
+        );
+        assert_eq!(
+            crate::radar_layer::chunk_status(h.gui().liveness()).interval_secs,
+            9,
+            "the copy carried the old answer",
+        );
+
+        // …and it settles again on the new one.
+        for _ in 0..FRAMES {
+            apply(&mut h, &republished);
+        }
+        assert_eq!(
+            h.gui().liveness_copies(),
+            2,
+            "the seam does not settle: it copied on {FRAMES} frames that \
+             restated the answer it had just taken",
+        );
+    }
+
+    /// **A layer that stops publishing, and one that starts, both cross.** The
+    /// compare is over the whole entry set, so the length is part of it — a
+    /// guard that only walked the entries it held in common would serve a
+    /// retired layer's last answer forever.
+    #[test]
+    fn an_entry_appearing_or_vanishing_is_copied() {
+        let mut h = InputHarness::new();
+        let published = entries(5);
+        apply(&mut h, &published);
+        assert_eq!(h.gui().liveness_copies(), 1);
+
+        apply(&mut h, &[]);
+        assert_eq!(
+            h.gui().liveness_copies(),
+            2,
+            "the layer stopped publishing and the seam kept its last answer",
+        );
+        assert!(
+            h.gui().liveness().is_empty(),
+            "the emptied slice did not cross",
+        );
+
+        apply(&mut h, &published);
+        assert_eq!(
+            h.gui().liveness_copies(),
+            3,
+            "the layer published again and the seam stayed empty",
+        );
+    }
+
+    /// **The question is pointer identity, and it is asked of the payloads.**
+    /// Two byte-identical answers built separately are two allocations, and
+    /// the seam copies — it must, because the payload is opaque and nothing on
+    /// this path may look inside one to find out otherwise. Recorded so the
+    /// cheapness claim is read as what it is: the App's restatement is free,
+    /// a rebuild is not, and no frame path rebuilds.
+    #[test]
+    fn a_rebuilt_but_identical_answer_is_copied_because_the_payload_is_opaque() {
+        let mut h = InputHarness::new();
+        apply(&mut h, &entries(5));
+        assert_eq!(h.gui().liveness_copies(), 1);
+
+        apply(&mut h, &entries(5));
+        assert_eq!(
+            h.gui().liveness_copies(),
+            2,
+            "a separately built payload compared equal — the seam is looking \
+             inside an opaque payload, which it may not do",
+        );
+    }
+}

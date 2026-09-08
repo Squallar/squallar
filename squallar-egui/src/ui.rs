@@ -869,6 +869,24 @@ impl Gui {
         }
     }
 
+    /// Whether `fresh` is the entry set `held` already holds: the same layers,
+    /// in the same order, over the same payload allocations.
+    ///
+    /// The ids are compared as well as the payloads, so this holds without a
+    /// promise from the producer — a payload re-filed under a different layer
+    /// would otherwise read as unmoved. Both halves are cheap next to what
+    /// they guard: a pointer and a layer id against an allocation and an
+    /// atomic bump per entry.
+    fn liveness_restated(
+        held: &[squallar_source::liveness::SourceLiveness],
+        fresh: &[squallar_source::liveness::SourceLiveness],
+    ) -> bool {
+        held.len() == fresh.len()
+            && held.iter().zip(fresh).all(|(held, fresh)| {
+                held.id == fresh.id && std::sync::Arc::ptr_eq(&held.payload, &fresh.payload)
+            })
+    }
+
     /// Apply one frame's facts, composed by the App from state it already
     /// owns, once per frame immediately before [`Gui::ui`]. Plain stores —
     /// every compound, event-shaped effect goes through [`Gui::apply`].
@@ -898,9 +916,21 @@ impl Gui {
         }
         self.user_heading = inputs.user_heading;
         self.catalogue_pending = inputs.catalogue_pending;
-        // Cloned, not borrowed: each entry is an id plus an `Arc`, so a frame
-        // that publishes an unchanged status re-states the same allocation.
-        self.liveness = inputs.liveness.to_vec();
+        // **Copied only when it moved, and "moved" is a pointer per entry.**
+        // Each entry is a layer id and an `Arc` the App rebuilds only when
+        // that layer's own answer changes (`App::republish_liveness`), so on
+        // all but one frame per change the slice it lends is the same layers
+        // over the same payload allocations. This compare is that fact spelled
+        // out, and it is what the payload being opaque leaves available:
+        // pointer identity answers "did any layer's answer move" without
+        // looking inside one, which the generic path may not do anyway.
+        //
+        // The clone it guards is a heap allocation, an atomic bump per entry
+        // and the matching per-entry drop on the next frame, on every frame.
+        if !Self::liveness_restated(&self.liveness, inputs.liveness) {
+            self.liveness = inputs.liveness.to_vec();
+            self.liveness_copies += 1;
+        }
         // **Copied only when it moved, and "moved" is one integer.** The App
         // re-states the same borrowed readout every frame and rebuilds it on
         // its consumer's cadence, so on all but one frame per rebuild this is
@@ -1003,6 +1033,13 @@ impl Gui {
     /// App publishes, never once per frame. See the field.
     pub fn budget_readout_copies(&self) -> u64 {
         self.budget_readout_copies
+    }
+
+    /// **How many times this Gui has copied the liveness slice.** The figure
+    /// the per-frame claim rests on: it rises once per answer a layer
+    /// republishes, never once per frame. See the field.
+    pub fn liveness_copies(&self) -> u64 {
+        self.liveness_copies
     }
 
     /// **The admission ledger**: the cost table the App last published, what

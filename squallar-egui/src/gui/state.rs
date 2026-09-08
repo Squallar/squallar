@@ -16,6 +16,13 @@ pub struct Gui {
     /// and the per-site volume stamps — which is why nothing here names
     /// either.
     pub(super) liveness: Vec<squallar_source::liveness::SourceLiveness>,
+    /// **How many times this Gui has copied the liveness slice**, since
+    /// construction. An always-on counter on the same terms as
+    /// [`Self::budget_readout_copies`]: the App re-states the same entries
+    /// every frame and rebuilds one only when that layer's answer moves, so
+    /// this must rise on the layers' cadence and not on the frame's, and a
+    /// counter is the only thing that can say so.
+    pub(super) liveness_copies: u64,
     /// **The budget system's readout**, as the App last composed it and this
     /// Gui last saw it change ([`crate::shell_api::BudgetReadout`]). Held so
     /// the in-frame and per-layer readouts can paint it without pricing
@@ -633,6 +640,7 @@ impl Gui {
 
         let mut gui = Self {
             liveness: Vec::new(),
+            liveness_copies: 0,
             budget_readout: None,
             budget_readout_copies: 0,
             admission: crate::admission::AdmissionLedger::default(),
