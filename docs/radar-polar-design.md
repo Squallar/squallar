@@ -64,9 +64,12 @@ same path closes it.
 
 ### Constraints carried in from the frame-time session (binding)
 
-* ONE paint callback per pane for all sweeps, sited **adjacent to the ground
-  callbacks** so it rides inside a reset already paid. A basemap frame carries
-  two resets; a third is a 50 % regression.
+* ONE paint callback per pane for all sweeps. The "sited **adjacent to the
+  ground callbacks** so it rides inside a reset already paid" half of this
+  constraint is **withdrawn** by the §10.6 ruling — that siting removes radar
+  from the layer order, which is not a cost this design may spend. One callback
+  per pane still binds; where it is issued is the layer walk's business, and the
+  reset it costs is paid rather than dodged — see §4.1's Siting note.
 * STATIC disk mesh; the Mercator projection is done in the **vertex shader**.
   No mesh rebuild on pan or zoom.
 * Per frame: one uniform write and nothing else. No vertex or index writes on
@@ -387,14 +390,44 @@ rounding itself — the same discipline `tile_mesh.rs:682-685` applies to
 `ScreenDescriptor::screen_size_in_points` ("this is its body, and it must stay
 its body"). Pinned by a test against the vendored function.
 
-**Siting.** The callback is issued at the **tail of the ground-callback run**,
-from the `issue_run_batch` neighbourhood in
-`squallar-egui/src/ui_map_overlays.rs:596-628`. A painted callback sets
-`needs_reset` and the next *mesh* pays the reset triple plus two buffer binds
-(`command_stream.rs:204-213`, matching `vendor/egui-wgpu/src/renderer.rs:693-720`).
-Adjacent to the existing callbacks, the fan pays **zero** additional resets.
-**Consequence, stated because it is visible:** basemap strokes and labels then
-draw *over* radar, which they do not today. See §10.6.
+**Siting. SUPERSEDED by the ruling on §10.6 (2026-09-08).** This section
+proposed issuing the callback at the **tail of the ground-callback run**, from
+the `issue_run_batch` neighbourhood in
+`squallar-egui/src/ui_map_overlays.rs:596-628`, where — adjacent to the existing
+callbacks — the fan would pay **zero** additional resets. It named the visible
+consequence as "basemap strokes and labels draw over radar" and sent the
+appearance to §10.6 for a ruling.
+
+The ruling rejected the framing: **a radar is an overlay like any other
+overlay.** The ground run happens before the pane's layer walk starts, so a fan
+issued there occupies no position in the stack at all — it draws beneath every
+other weather layer regardless of what the user wants, and stops answering to
+the draw order the user is entitled to rearrange. Severing radar from the
+ordering was never a cost the design was entitled to price; it was a defect
+inside one arm of a question that should not have been asked.
+
+**What is built instead:** the callback is issued at radar's own position in
+the layer walk, from `draw_radar_fan` in `squallar-egui/src/ui_map_pane.rs`, the
+same `ui.painter()` at the same point the raster's textured rectangle used.
+Radar composites exactly where it always has and keeps responding to reordering.
+`the_fan_draws_at_the_position_the_user_ordered_radar_into` pins it.
+
+**The reset price is real, and it is not avoidable by siting.** A painted
+callback sets `needs_reset` and the next *mesh* pays the reset triple plus two
+buffer binds (`command_stream.rs:204-213`, matching
+`vendor/egui-wgpu/src/renderer.rs:693-720`). "The next mesh" is the next one
+anywhere in the pass, not the next layer above radar — the pane's deferred
+notices, the colour scale, another pane and the app's chrome all qualify — so
+budget **one reset per pane per frame** and treat a configuration that dodges it
+as luck. What is withdrawn is not the cost but the comparison: the only siting
+that avoids the reset is the one that removes radar from the layer order, so
+there is nothing left to price this against, and the "50 %" figure has no second
+arm.
+
+It is also **not measurable today**: no build issues a fan callback (this
+section's renderer does not exist and `radar_fan_bridge` returns `None`), so any
+figure would be inferred. The two terms the cost is a function of are pinned
+instead — one callback per pane, at radar's ordered position.
 
 ### 4.2 The static disk mesh — per-radial sectors, PICKED
 
@@ -888,10 +921,19 @@ crates; `rm` the lane's target dir when it lands or bins.
    Roughly four transcendentals per covered fragment. *Settles it:* a
    measurement on llvmpipe and SwiftShader at a full-pane disc — measured, never
    scaled, and against the unchanged-tree spread first.
-6. **Is it acceptable that basemap strokes and labels draw over radar?** That is
-   the price of callback adjacency (§4.1), and the alternative is a third reset
-   per frame — a 50 % regression on a measured figure. *Settles it:* a user
-   ruling on the appearance.
+6. ~~**Is it acceptable that basemap strokes and labels draw over radar?**~~
+   **SETTLED 2026-09-08, against the premise.** The question offered a choice
+   between pinning radar on top as today and pinning it beneath the stack by
+   drawing it earlier. The ruling: *"there's a misconception here. a radar is an
+   overlay like any other overlay."* It takes its position in the ordinary
+   layer order the user controls and keeps responding to reordering exactly as
+   Global Satellite, Model Data, MRMS Mosaic and the two SPC layers do. There
+   is no special slot at either end, so the ground-callback-tail siting was not
+   a cheaper implementation of radar-as-overlay — it was not one at all, and the
+   "50 % regression" priced the only legal implementation against an illegal
+   one. §4.1's Siting paragraph is superseded. **The reset itself is not
+   withdrawn**: budget one per pane per frame and keep it in the frame-time
+   accounting. What is withdrawn is the idea that it was optional.
 7. **Should `CODES_RETAINED` default on for loop frames?** It buys hover on
    every loop frame — which does not exist today — for 75.5 MiB desktop /
    17.6 MiB wasm (**inferred**), where the f32 equivalent was 301.9 MiB and

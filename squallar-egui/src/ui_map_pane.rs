@@ -1373,19 +1373,38 @@ fn render_radar_overlay(
 /// (10), MRMS Mosaic (15), SPC Outlooks (20) and SPC Fire Weather (25) — under
 /// everything above it, and under the user's own reordering of that list.
 ///
-/// The design (§4.1) sites this at the tail of the *ground* callback run
-/// instead, so the fan rides inside a state reset the basemap already paid for.
-/// That is a real saving and it is not taken here, because the ground run
-/// happens before the layer walk starts: a fan issued there draws beneath every
-/// weather layer including the four that are beneath radar today, and stops
-/// answering to a draw order the user is allowed to rearrange. The design names
-/// only "basemap strokes and labels" as the consequence and leaves the question
-/// open for a ruling (§10.6); the wider consequence is what makes it worth
-/// keeping open. Moving the issue point later is one call site, and the reset
-/// it would save is one per pane per frame.
+/// The design (§4.1) sited this at the tail of the *ground* callback run
+/// instead, so the fan would ride inside a state reset the basemap already
+/// paid for, and left the appearance open for a ruling (§10.6). **The ruling
+/// came back against the premise, not for one of its arms: a radar is an
+/// overlay like any other overlay.** The ground run happens before the layer
+/// walk starts, so a fan issued there has no position in the stack to take —
+/// it draws beneath every other weather layer whatever the user does, and stops
+/// answering to a draw order the user is entitled to rearrange. That is not a
+/// cheaper way to draw radar as an overlay; it is not drawing it as one. The
+/// saving was never available, so there was no trade.
 ///
-/// A `Shape::Callback` forces a primitive boundary, so this does cost that
-/// boundary where a textured rectangle cost none.
+/// # What the callback costs
+///
+/// A painted callback sets `needs_reset`, and **the next *mesh* pays it** —
+/// the reset triple plus two buffer binds
+/// (`squallar_gpu::egui_renderer::command_stream`, matching
+/// `vendor/egui-wgpu/src/renderer.rs`). The next mesh is not "the next layer
+/// above radar": it is the next mesh **anywhere in the pass**, so the pane's
+/// own deferred notices, the colour scale, another pane, and the app's chrome
+/// all qualify. Something almost always draws after a pane's radar layer, so
+/// budget one reset per pane per frame and treat a configuration that avoids
+/// it as luck rather than as a plan.
+///
+/// That price is real and it is **not avoidable by siting**, because the one
+/// siting that avoids it — the ground-callback tail — is the one that takes
+/// radar out of the layer order. The design's "50 %" priced this arm against
+/// that one; with that one unavailable there is nothing to price it against.
+///
+/// Both terms the cost is a function of are pinned rather than described:
+/// `the_fan_draws_at_the_position_the_user_ordered_radar_into` holds that the
+/// callback takes radar's ordered position and that there is exactly one of
+/// them per pane.
 fn draw_radar_fan(
     ui: &egui::Ui,
     projector: &walkers::Projector,

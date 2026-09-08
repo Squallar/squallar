@@ -701,3 +701,159 @@ fn a_new_radar_picture_moves_the_floor_key_and_the_same_one_does_not() {
     // anything else is a new picture to the strip.
     assert_ne!(strip_key(fan), strip_key(raster_surface(&ctx)));
 }
+
+/// One full pane walk with radar showing a fan and a renderer installed, over
+/// a stack the caller has ordered. Returns which layers the walk dispatched,
+/// in order, and the pass's shapes as kind names.
+fn ordered_walk(order: impl FnOnce(&mut PaneState)) -> (Vec<LayerId>, Vec<&'static str>) {
+    let canvas = canvas();
+    let egui_ctx = egui::Context::default();
+    let mut overlays = OverlayRegistry::with_handlers(crate::sources::all());
+    let mut pane = pane_showing(fan_surface(vec![sweep()]));
+    for id in [
+        known::RADAR,
+        known::BASEMAP_TILES,
+        known::CITY_LABELS,
+        known::RADAR_SITES,
+        known::COLOR_SCALE,
+    ] {
+        pane.set_overlay_enabled(id, true);
+    }
+    pane.hydrate_layer_states(&overlays, 0);
+    order(&mut pane);
+
+    let mut memory = walkers::MapMemory::default();
+    memory.set_zoom(7.0).expect("7 is a zoom walkers accepts");
+    let projector = walkers::Projector::new(canvas, &memory, walkers::lat_lon(SITE_LAT, SITE_LON));
+    let painter: Arc<dyn RadarFanPainter> = Recorder::new(true);
+    let preferences = UserPreferences::default();
+    let mut actions = Vec::new();
+    let mut click_consumed = false;
+
+    egui_ctx.begin_pass(egui::RawInput {
+        screen_rect: Some(canvas),
+        ..Default::default()
+    });
+    let mut ui = egui::Ui::new(
+        egui_ctx.clone(),
+        egui::Id::new("radar-fan-order"),
+        egui::UiBuilder::new()
+            .layer_id(egui::LayerId::background())
+            .max_rect(canvas),
+    );
+    let mut ctx = PaneRenderCtx {
+        admission_notice: None,
+        cost: None,
+        pane_idx: 0,
+        pane: &mut pane,
+        overlays: &mut overlays,
+        user_location: None,
+        user_heading: None,
+        user_fix: None,
+        basemap_labels: Vec::new(),
+        galley_cache: &mut walkers::GalleyCache::default(),
+        point_text_meshes: &mut crate::point_painter::PointTextMeshes::default(),
+        ground_meshes: None,
+        radar_fan: Some(&painter),
+        basemap_tiles: None,
+        terrain_tiles: None,
+        tile_zoom_bias: 0,
+        overlay_render_limit: 1,
+        overlay_overdraw: crate::overlay_cache::OVERDRAW_FRACTION,
+        actions: &mut actions,
+        pane_rect: canvas,
+        surfaces: PaneSurfaces::GroundAndGlass,
+        draws_3d_ground: GroundIsMesh::PLAN_VIEW,
+        horizontal_color_scale: true,
+        color_scale_floor: canvas.max.y,
+        pointer_available: false,
+        excluded_rects: Vec::new(),
+        long_press_pos: None,
+        overlay_click_pos: None,
+        click_consumed: &mut click_consumed,
+        preferences: &preferences,
+        paint_order: Vec::new(),
+    };
+    render_pane_map_content(&mut ui, &projector, memory.zoom(), &mut ctx);
+    let dispatched: Vec<LayerId> = ctx.paint_order.iter().map(|(id, _)| id.clone()).collect();
+    let shapes: Vec<&'static str> = egui_ctx
+        .end_pass()
+        .shapes
+        .into_iter()
+        .map(|clipped| match clipped.shape {
+            egui::Shape::Callback(_) => "callback",
+            egui::Shape::Noop => "noop",
+            _ => "shape",
+        })
+        .collect();
+    (dispatched, shapes)
+}
+
+/// **Radar is an overlay like any other, and the fan draws where the user put
+/// it.**
+///
+/// The polar path draws through a paint callback rather than a textured
+/// rectangle, and a callback is the one shape that could plausibly have been
+/// hoisted out of the walk — issued once per pane beside the ground callbacks,
+/// where it would ride inside a GPU state reset the basemap already paid for.
+/// That siting is cheaper and it is not what this does, because it would pin
+/// radar beneath every layer in the stack and stop it answering to the user's
+/// ordering at all. Radar has no special slot at either end.
+///
+/// So the claim is the ordinary one, and it is stated the ordinary way: move
+/// radar in the draw order and the fan's callback moves with it, by the same
+/// rule that moves any other layer's shapes.
+#[test]
+fn the_fan_draws_at_the_position_the_user_ordered_radar_into() {
+    let radar_first = |pane: &mut PaneState| pane.set_draw_order(&[known::RADAR]);
+    let radar_last = |pane: &mut PaneState| {
+        let rest: Vec<LayerId> = pane
+            .draw_order_vec()
+            .into_iter()
+            .filter(|id| *id != known::RADAR)
+            .collect();
+        pane.set_draw_order(&rest);
+    };
+
+    let (first_order, first_shapes) = ordered_walk(radar_first);
+    let (last_order, last_shapes) = ordered_walk(radar_last);
+
+    // The walk dispatched radar where the order put it, and the two orders
+    // really are different — otherwise everything below holds over one scene
+    // walked twice.
+    assert_eq!(
+        first_order.first(),
+        Some(&known::RADAR),
+        "radar was ordered first and the walk dispatched {first_order:?}"
+    );
+    assert_eq!(
+        last_order.last(),
+        Some(&known::RADAR),
+        "radar was ordered last and the walk dispatched {last_order:?}"
+    );
+    assert!(
+        first_order.len() > 1,
+        "fixture: one dispatched layer cannot show a position"
+    );
+
+    // And the fan's callback is where that put it. Counted as the shapes drawn
+    // before it, which is a position in the pass and not a claim about which
+    // layer drew what.
+    let before = |shapes: &[&str]| {
+        shapes
+            .iter()
+            .position(|s| *s == "callback")
+            .expect("the fan was issued as a callback")
+    };
+    let (early, late) = (before(&first_shapes), before(&last_shapes));
+    assert!(
+        early < late,
+        "the fan drew at the same point ({early} vs {late} shapes before it) \
+         whichever end of the stack radar was ordered into, so it is not \
+         taking its position from the order",
+    );
+    // Exactly one callback either way: the fan is one draw per pane, and the
+    // count is what the reset cost is a function of.
+    assert_eq!(first_shapes.iter().filter(|s| **s == "callback").count(), 1);
+    assert_eq!(last_shapes.iter().filter(|s| **s == "callback").count(), 1);
+}
