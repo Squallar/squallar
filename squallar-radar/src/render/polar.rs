@@ -624,6 +624,42 @@ impl PolarField {
         self.geometry.resident_bytes() + self.values.resident_bytes()
     }
 
+    /// **A field whose numbers are one code a gate and a table of what each
+    /// code means** — [`Values::Coded`] built directly, with no wide plane
+    /// ever existing to compact.
+    ///
+    /// [`Self::compact_values`] is this after the fact, for a render that
+    /// painted `f32`s; this is for the producer that never did. The two reach
+    /// the same form and [`Self::at`] cannot tell which one built it, which is
+    /// the point: a hover over a code plane reads the number the raster's own
+    /// grid held.
+    ///
+    /// **`None` where the three parts do not describe one picture**: a table
+    /// no byte can index, a code naming an entry the table does not hold, or a
+    /// code buffer that is not exactly `radials × gates`. Refused rather than
+    /// repaired — each of those is one sweep's codes read against another
+    /// sweep's table, which answers a plausible number for a gate nobody
+    /// measured, and the caller's answer to a refusal is the raster.
+    pub fn from_code_table(
+        geometry: PolarGeometry,
+        codes: Vec<u8>,
+        table: Vec<f32>,
+    ) -> Option<Self> {
+        if table.is_empty() || table.len() > Values::MAX_CODES {
+            return None;
+        }
+        if codes.len() != geometry.radials().checked_mul(geometry.gates())? {
+            return None;
+        }
+        if codes.iter().any(|&code| usize::from(code) >= table.len()) {
+            return None;
+        }
+        Some(Self {
+            geometry,
+            values: Values::Coded { codes, table },
+        })
+    }
+
     /// Build one directly, for tests and for callers holding a polar grid.
     pub fn from_parts(geometry: PolarGeometry, values: Vec<f32>) -> Self {
         debug_assert!(
@@ -949,6 +985,20 @@ pub(super) struct PolarBuffers {
 
 /// The bits [`PolarBuffers`] leaves where nothing was painted — `f32::NAN`.
 const UNPAINTED_BITS: u32 = 0x7FC0_0000;
+
+/// **The number a gate carries where the render painted nothing.**
+///
+/// [`PolarBuffers`] leaves this bit pattern behind and [`PolarField::at`]
+/// answers `None` for it. Public because the polar surface's producer writes
+/// the same marker into a code table without a raster ever existing, and two
+/// spellings of "nothing was painted here" would be two answers to one
+/// question — one of which `to_bytes` would then put on the wire.
+///
+/// Distinct from `super::RANGE_FOLDED_SENTINEL` on the bits, which is the
+/// whole reason it is a named pattern rather than `f32::NAN` written twice:
+/// both are NaNs, `at` answers `None` for both, and only the bits keep a
+/// gate the radar could not range apart from a gate it never measured.
+pub const UNPAINTED: f32 = f32::from_bits(UNPAINTED_BITS);
 
 impl PolarBuffers {
     /// A field of `shape`, every gate unpainted and every wedge unrecorded.

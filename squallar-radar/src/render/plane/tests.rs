@@ -1,7 +1,7 @@
 //! What the polar producer refuses, and what it keeps.
 
 use super::*;
-use crate::render::codes::{Lut, PAINTABLE_CODES, r8_fidelity};
+use crate::render::codes::{Lut, PAINTABLE_CODES, RANGE_FOLDED_CODE, r8_fidelity};
 use crate::render::{moment_value_at, painted_moment_value};
 use crate::types::RadarProduct;
 use nexrad_model::data::{MomentData, Radial, RadialStatus};
@@ -420,5 +420,206 @@ fn the_admitted_products_fit_the_paintable_codes() {
         distinct.len() <= PAINTABLE_CODES,
         "a plane held {} distinct measurements against {PAINTABLE_CODES} paintable codes",
         distinct.len(),
+    );
+}
+
+// ── What a code means as a number ───────────────────────────────────────────
+
+/// `(scale, offset)` pairs a real moment block has carried, plus the shapes
+/// that break naive arithmetic — the same hostile set `codes::tests` measures
+/// the colour table against, because the two tables are one decode.
+const DECODES: &[(f32, f32)] = &[
+    (2.0, 66.0),
+    (2.0, 129.0),
+    (16.0, 128.0),
+    (25.3, 128.5),
+    (1.0, 0.0),
+    (1000.0, 0.0),
+    (-2.0, 66.0),
+    (0.0, 0.0),
+    (f32::NAN, 0.0),
+    (f32::INFINITY, 0.0),
+];
+
+/// **The value table is the fill loop's own decode, code for code, on the
+/// bits.**
+///
+/// The whole claim a readout over a code plane rests on: `Lut::value_of` is
+/// `moment_value_at` followed by `painted_moment_value` — the exact pair the
+/// raster's fill loop runs per gate — evaluated once per code instead of once
+/// per gate. So a hover that indexes this table reads back the number the
+/// raster's own value grid held, and the read-back is an indexing rather than
+/// a rounding.
+///
+/// **On the bits and not on `==`.** Two of the things this decode produces are
+/// NaNs that mean different things, and `f32` equality neither distinguishes
+/// them nor separates `-0.0` from `0.0`. The wire carries the bits, so the
+/// bits are what is compared.
+///
+/// The reference side reads a **real moment block** rather than a second
+/// spelling of the arithmetic: the raw byte goes through `MomentData`'s own
+/// decode, which is the authority both tables exist to mirror.
+///
+/// TAMPER: give `value_of` the plain `f32::NAN` for a below-threshold gate
+/// instead of the unpainted marker, or drop its `scale == 0.0` arm, and this
+/// goes red.
+#[test]
+fn the_value_table_is_the_fill_loops_decode_code_for_code() {
+    let mut checked = 0usize;
+    for &product in RadarProduct::all() {
+        for &(scale, offset) in DECODES {
+            let key = LutKey {
+                product,
+                scale,
+                offset,
+            };
+            let table = Lut::value_table(key);
+            assert_eq!(table.len(), 256, "the table addresses every code a byte holds");
+            for code in 0..=u8::MAX {
+                let block = moment(vec![code], 8, scale, offset);
+                let expected = moment_value_at(&block, 0)
+                    .and_then(painted_moment_value)
+                    .unwrap_or(crate::render::polar::UNPAINTED);
+                assert_eq!(
+                    table[usize::from(code)].to_bits(),
+                    expected.to_bits(),
+                    "code {code} at scale {scale} offset {offset}: the value table and the \
+                     fill loop's decode disagree, so a readout over a plane would answer a \
+                     number the raster never painted",
+                );
+                assert_eq!(
+                    Lut::value_of(key, code).to_bits(),
+                    table[usize::from(code)].to_bits(),
+                    "the table and the per-code answer must be one function",
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(
+        checked,
+        RadarProduct::all().len() * DECODES.len() * 256,
+        "the walk did not cover the product x decode x code space it claims",
+    );
+}
+
+/// **The two NaNs the decode produces stay distinct through the table and out
+/// onto the wire**, which `PolarField::at` cannot show because it answers
+/// `None` for both.
+///
+/// A below-threshold gate is one the radar measured nothing in; a range-folded
+/// one is a gate the radar has a return from and cannot place. `at` collapses
+/// them — that is what it is for — so the separation has to be asserted where
+/// the bits are still visible, which is `to_bytes`.
+///
+/// TAMPER: table a below-threshold code as `painted_moment_value`'s
+/// range-folded answer, or write `f32::NAN` for the fold, and the inequality
+/// below goes red while every `at` in the suite stays green.
+#[test]
+fn the_unpainted_marker_and_the_fold_sentinel_stay_two_patterns_on_the_wire() {
+    let key = LutKey {
+        product: RadarProduct::Reflectivity,
+        scale: REFL_SCALE,
+        offset: REFL_OFFSET,
+    };
+    let table = Lut::value_table(key);
+    let folded = painted_moment_value(nexrad_model::data::MomentValue::RangeFolded)
+        .expect("a range-folded gate is painted");
+    assert_eq!(
+        table[usize::from(BELOW_THRESHOLD_CODE)].to_bits(),
+        crate::render::polar::UNPAINTED.to_bits(),
+    );
+    assert_eq!(
+        table[usize::from(RANGE_FOLDED_CODE)].to_bits(),
+        folded.to_bits(),
+    );
+    assert_ne!(
+        crate::render::polar::UNPAINTED.to_bits(),
+        folded.to_bits(),
+        "the premise: the two markers are two bit patterns, or nothing below can fail",
+    );
+
+    // One radial, two gates: the first below threshold, the second folded.
+    let geometry = crate::render::polar::PolarGeometry::from_parts(
+        vec![crate::render::polar::Wedge {
+            azimuth_deg: 0.0,
+            half_width_deg: 0.5,
+        }],
+        1.0,
+        0.25,
+        Some(0.5),
+        2,
+    );
+    let field = crate::render::polar::PolarField::from_code_table(
+        geometry,
+        vec![BELOW_THRESHOLD_CODE, RANGE_FOLDED_CODE],
+        table,
+    )
+    .expect("two codes of a one-radial sweep");
+
+    // `at` cannot separate them, which is why the wire is asked instead.
+    for gate in 0..2 {
+        assert_eq!(
+            field.at(crate::render::polar::GateAt { radial: 0, gate }),
+            None,
+            "gate {gate}: both markers read as unpainted through `at`",
+        );
+    }
+
+    let bytes = field.to_bytes();
+    let value_at = |gate: usize| {
+        let start = bytes.len() - 8 + gate * 4;
+        u32::from_le_bytes(bytes[start..start + 4].try_into().expect("four bytes"))
+    };
+    assert_eq!(value_at(0), crate::render::polar::UNPAINTED.to_bits());
+    assert_eq!(value_at(1), folded.to_bits());
+    assert_ne!(
+        value_at(0),
+        value_at(1),
+        "the wide wire form collapsed the two markers into one pattern",
+    );
+}
+
+/// **A code the table does not name is refused, not indexed.**
+///
+/// `from_code_table` is handed three parts that arrive separately, and a code
+/// past the table's end is one sweep's codes read against another sweep's
+/// table. Refused at the door rather than answered out of bounds on the thread
+/// that reads a hover.
+#[test]
+fn a_code_the_table_does_not_name_is_refused() {
+    let geometry = crate::render::polar::PolarGeometry::from_parts(
+        vec![crate::render::polar::Wedge {
+            azimuth_deg: 0.0,
+            half_width_deg: 0.5,
+        }],
+        1.0,
+        0.25,
+        Some(0.5),
+        2,
+    );
+    // A two-entry table and a code of 7.
+    assert_eq!(
+        crate::render::polar::PolarField::from_code_table(
+            geometry.clone(),
+            vec![0, 7],
+            vec![1.0, 2.0],
+        ),
+        None,
+    );
+    // The shape has to be exactly radials x gates.
+    assert_eq!(
+        crate::render::polar::PolarField::from_code_table(
+            geometry.clone(),
+            vec![0],
+            vec![1.0, 2.0],
+        ),
+        None,
+    );
+    // And the control: the same parts, in shape, are admitted.
+    assert!(
+        crate::render::polar::PolarField::from_code_table(geometry, vec![0, 1], vec![1.0, 2.0],)
+            .is_some(),
+        "the control: a well-formed triple is admitted, or the refusals above prove nothing",
     );
 }

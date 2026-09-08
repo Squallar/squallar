@@ -160,25 +160,29 @@ impl JobSpec for RadarPlanJob {
     /// eight-bit plane cannot carry without dropping a distinction, and the
     /// answer to all of them is the raster this row has always produced.
     ///
-    /// It is asked only where the caller wants the picture and not the numbers.
-    /// A plane's numbers **are** its codes, and the polar field it travels with
-    /// carries geometry alone; a caller that asked for the values would
-    /// otherwise be handed a frame that cannot answer a hover, silently. The
-    /// two flags are read in one place so that trade is stated rather than
-    /// discovered.
+    /// **`values_wanted` does not decide which surface is built.** It asks for
+    /// the numbers behind the gates, and a plane holds those: its codes are
+    /// the wire's own words and a 256-entry table says what each decodes to,
+    /// so the field beside a plane answers a hover with the bits the raster's
+    /// grid held. What the flag decides is whether that field is built at all
+    /// — one byte a gate on a still pane, nothing on a loop frame. Reading it
+    /// as a request for a *representation* is what tied a still pane to the
+    /// `side²` cells-and-image pair for the want of a number.
     fn run(input: &RadarPlanJob, geo: &JobGeometry) -> Option<RenderedFrame> {
-        if input.surface == PlanSurface::Fan && !input.values_wanted {
+        if input.surface == PlanSurface::Fan {
             let scan = input.input.to_scan();
             let plane = crate::render::render_sweep_plane(
                 &scan,
                 input.input.elevation(),
                 input.input.product(),
                 &input.input.declared_nyquist(),
+                input.values_wanted,
             );
             if let Some(render) = plane {
-                // The polar field is already numberless — the renderer never
-                // wrote values into it — so neither `strip_values` nor
-                // `compact_values` has anything to do here.
+                // The field is already in the form the caller asked for —
+                // coded where the numbers were wanted, empty where they were
+                // not — so neither `strip_values` nor `compact_values` has
+                // anything to do here.
                 return Some(RenderedFrame::from(render));
             }
         }
@@ -1254,32 +1258,94 @@ mod tests {
         );
     }
 
-    /// **A caller that asked for the numbers is given the form that has
-    /// them.**
+    /// **A caller that asked for the numbers is given a plane, and the plane
+    /// answers with the raster's own numbers.**
     ///
-    /// A plane's numbers are its codes and the polar field beside one carries
-    /// geometry alone, so a fan request with `values_wanted` set falls back to
-    /// the raster rather than answering a frame no hover can read. Stated
-    /// here rather than discovered by a pane whose readout went blank.
+    /// The claim this row rests on since a still pane took the polar path: a
+    /// plane's numbers *are* its codes, so `values_wanted` asks for
+    /// information the plane has rather than for the representation the
+    /// raster held it in. Until 2026-09-08 this row read the flag as the
+    /// second thing and fell back to the raster for it, which tied every still
+    /// pane to the `side²` cells-and-image pair for the want of a number.
     ///
-    /// TAMPER: drop the `!input.values_wanted` conjunct in `run` and this goes
-    /// red on both assertions.
+    /// Four conjuncts. The frame is a plane and carries no raster — the
+    /// saving. Its field has numbers — a readout can be answered at all. And
+    /// **every gate the raster answers, the plane answers identically, on the
+    /// bits**: the two renders of one input are walked gate for gate, and the
+    /// count of compared gates is asserted non-trivial so a fixture that
+    /// painted nothing could not pass this vacuously.
+    ///
+    /// The comparison is one-directional by construction and not by
+    /// convenience: the raster's field holds only the gates its projection
+    /// reached, and a fan draws the disc the sweep measured, so the plane may
+    /// answer gates the raster clipped. What must never happen is the two
+    /// disagreeing about a gate the raster painted.
+    ///
+    /// TAMPER: hand `render_sweep_plane` a table built from a different key,
+    /// or drop `values_wanted` from its signature so the field arrives empty,
+    /// and this goes red.
     #[test]
-    fn a_fan_request_that_wants_the_numbers_gets_the_raster() {
-        let job = DescribedJob::new(RadarPlanJob {
-            input: Box::new(a_plan_input()),
-            values_wanted: true,
-            surface: PlanSurface::Fan,
-        });
-        let out =
-            (JOB_CODECS[0].run)(&job, &geometry_with_ceiling(4096)).expect("the fixture renders");
-        let frame = out
-            .take::<RenderedFrame>()
-            .expect("the radar row answers a frame");
-        assert!(frame.codes.is_none(), "a plane cannot answer a hover");
+    fn a_fan_request_that_wants_the_numbers_reads_back_the_rasters_own() {
+        let frame_of = |surface| {
+            let job = DescribedJob::new(RadarPlanJob {
+                input: Box::new(a_plan_input()),
+                values_wanted: true,
+                surface,
+            });
+            (JOB_CODECS[0].run)(&job, &geometry_with_ceiling(4096))
+                .expect("the fixture renders")
+                .take::<RenderedFrame>()
+                .expect("the radar row answers a frame")
+        };
+
+        let raster = frame_of(PlanSurface::Raster);
+        let fan = frame_of(PlanSurface::Fan);
+
         assert!(
-            frame.polar.has_values(),
-            "and the raster's numbers are gone"
+            fan.codes.is_some(),
+            "a fan request that wants the numbers fell back to the raster",
+        );
+        assert!(
+            fan.image.is_empty(),
+            "the frame carried a plane and a raster at once",
+        );
+        assert!(
+            fan.polar.has_values(),
+            "the plane arrived with no numbers behind it, so no hover can read it",
+        );
+
+        let (rg, fg) = (raster.polar.geometry(), fan.polar.geometry());
+        assert_eq!(
+            (rg.radials(), rg.gates()),
+            (fg.radials(), fg.gates()),
+            "the two renders of one sweep describe two different grids",
+        );
+
+        let mut compared = 0usize;
+        for radial in 0..rg.radials() {
+            for gate in 0..rg.gates() {
+                let at = crate::render::polar::GateAt { radial, gate };
+                let Some(painted) = raster.polar.at(at) else {
+                    continue;
+                };
+                let read_back = fan
+                    .polar
+                    .at(at)
+                    .unwrap_or_else(|| panic!("radial {radial} gate {gate}: the raster painted a \
+                         number here and the plane reads nothing"));
+                assert_eq!(
+                    read_back.to_bits(),
+                    painted.to_bits(),
+                    "radial {radial} gate {gate}: the plane reads back a different number \
+                     than the raster painted",
+                );
+                compared += 1;
+            }
+        }
+        assert!(
+            compared > 1_000,
+            "only {compared} gates were compared, which is not a rendered sweep: this would \
+             read green over a fixture that painted nothing",
         );
     }
 

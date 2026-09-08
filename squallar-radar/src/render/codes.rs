@@ -142,6 +142,47 @@ impl Lut {
         self.entries[usize::from(code)]
     }
 
+    /// **What one code decodes to as a number**, or
+    /// [`polar::UNPAINTED`](crate::render::polar::UNPAINTED) where the raster
+    /// paints nothing at that code.
+    ///
+    /// [`Self::colour_of`]'s counterpart, in the same match on the same value
+    /// and for the same reason: a code plane's numbers are its codes, and a
+    /// readout over one has to answer the number the raster's own value grid
+    /// held. The decode is `crate::render`'s `moment_value_at` followed by
+    /// `painted_moment_value` — the exact pair the fill loop runs per gate —
+    /// so a read-back through this is an **indexing** of the same arithmetic
+    /// and never a rounding of it.
+    ///
+    /// The two things the raster paints that are both NaN stay distinct here:
+    /// a below-threshold gate takes the unpainted marker and a range-folded
+    /// one takes `RANGE_FOLDED_SENTINEL`. `PolarField::at` answers `None` for
+    /// both, so nothing that goes through it can tell them apart — which is
+    /// why they are separated on the bits at the one place that holds them.
+    pub fn value_of(key: LutKey, code: u8) -> f32 {
+        use nexrad_model::data::MomentValue;
+        let decoded = if key.scale == 0.0 {
+            MomentValue::Value(f32::from(code))
+        } else {
+            match code {
+                BELOW_THRESHOLD_CODE => MomentValue::BelowThreshold,
+                RANGE_FOLDED_CODE => MomentValue::RangeFolded,
+                _ => MomentValue::Value((f32::from(code) - key.offset) / key.scale),
+            }
+        };
+        crate::render::painted_moment_value(decoded).unwrap_or(crate::render::polar::UNPAINTED)
+    }
+
+    /// [`Self::value_of`] over every code a byte can address — the table a
+    /// coded [`crate::render::polar::PolarField`] indexes.
+    ///
+    /// Whole rather than only the codes a sweep happens to carry, so the
+    /// table is a function of the key alone and two planes decoded under one
+    /// key cannot come to hold different tables.
+    pub fn value_table(key: LutKey) -> Vec<f32> {
+        (0..LUT_ENTRIES).map(|code| Self::value_of(key, code as u8)).collect()
+    }
+
     /// The table as the bytes a `256 x 1` `Rgba8Unorm` texture takes.
     ///
     /// **Straight alpha, not premultiplied.** The fragment stage multiplies by

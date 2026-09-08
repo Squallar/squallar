@@ -26,7 +26,7 @@
 
 use nexrad_model::data::{DataMoment as _, Radial};
 
-use super::codes::{BELOW_THRESHOLD_CODE, CodePlane, LutKey, PlaneRefusal, RANGE_FOLDED_CODE};
+use super::codes::{BELOW_THRESHOLD_CODE, CodePlane, LutKey, PlaneRefusal};
 use crate::types::RadarProduct;
 
 /// **Why a sweep could not become a code plane**, past the refusals
@@ -130,28 +130,26 @@ impl Decode {
 
 /// **Whether a code paints anything**, for each of the 256 a byte can hold.
 ///
-/// The raster's own predicate, precomputed: `moment_value_at` followed by
+/// Read straight off [`super::codes::Lut::value_table`] rather than decoded a
+/// second time: that table is `moment_value_at` followed by
 /// [`super::painted_moment_value`], which is exactly the pair the fill loop
-/// runs per gate. A table rather than a call per gate because the answer
-/// depends only on the code and the sweep's one decode, so a surveillance
-/// sweep's 1.3 million gates ask 256 questions between them.
+/// runs per gate, and "paints nothing" is what that pair answers `None` for.
+/// A second spelling of the decode here is what would let the reach this
+/// computes and the numbers a readout reads come from two different
+/// arithmetics.
+///
+/// **On the bits, not on `is_nan`.** A range-folded gate is painted and its
+/// sentinel is a NaN, so `is_nan` would call it unpainted and shorten the
+/// reach of every sweep that carries one.
 ///
 /// `scale == 0.0` is not a case here: [`PlaneUnavailable::RawWordEncoding`]
 /// has already refused that encoding, so the sentinels are sentinels.
-fn painted_codes(decode: Decode) -> [bool; 256] {
+fn painted_codes(values: &[f32]) -> [bool; 256] {
     let mut painted = [false; 256];
     for (code, slot) in painted.iter_mut().enumerate() {
-        let code = code as u8;
-        *slot = match code {
-            BELOW_THRESHOLD_CODE => false,
-            RANGE_FOLDED_CODE => true,
-            _ => {
-                let value = (f32::from(code) - decode.offset) / decode.scale;
-                // `painted_moment_value`'s own bound on a decoded value,
-                // spelled through it so the two cannot drift.
-                super::painted_moment_value(nexrad_model::data::MomentValue::Value(value)).is_some()
-            }
-        };
+        *slot = values
+            .get(code)
+            .is_some_and(|v| v.to_bits() != crate::render::polar::UNPAINTED.to_bits());
     }
     painted
 }
@@ -209,7 +207,15 @@ pub fn sweep_code_plane(
             radials: radials.len(),
             gates,
         }))?;
-    let painted = painted_codes(decode);
+    // The key the plane will carry, built here rather than at the `build`
+    // call below, because the reach walk and the finished plane must decode a
+    // code the same way and this is the one object that says how.
+    let key = LutKey {
+        product,
+        scale: decode.scale,
+        offset: decode.offset,
+    };
+    let painted = painted_codes(&super::codes::Lut::value_table(key));
     let mut codes = vec![BELOW_THRESHOLD_CODE; cells];
     let mut reach_gates = 0usize;
     for (radial_idx, radial) in radials.iter().enumerate() {
@@ -234,18 +240,8 @@ pub fn sweep_code_plane(
         return Err(PlaneUnavailable::NothingPainted);
     }
 
-    let plane = CodePlane::build(
-        radials.len(),
-        gates,
-        codes,
-        LutKey {
-            product,
-            scale: decode.scale,
-            offset: decode.offset,
-        },
-        decode.word_bits,
-    )
-    .map_err(PlaneUnavailable::Refused)?;
+    let plane = CodePlane::build(radials.len(), gates, codes, key, decode.word_bits)
+        .map_err(PlaneUnavailable::Refused)?;
     Ok(SweepPlane { plane, reach_gates })
 }
 

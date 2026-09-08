@@ -1445,16 +1445,27 @@ impl SweepLayout {
 /// never traded here: a sweep whose codes an eight-bit plane cannot carry is
 /// not carried by one.
 ///
-/// The polar field travels with **geometry and no numbers**, which is what a
-/// loop frame's does anyway (`PolarField::strip_values`). A caller that wants
-/// the numbers behind the gates is given the raster instead — see
-/// `jobs::RadarPlanJob::run` — because a plane answers them through its codes
-/// and this field would have to hold a second copy of them to answer at all.
+/// **`values_wanted` decides whether the polar field beside the plane carries
+/// numbers**, and it costs one byte a gate rather than a raster.
+///
+/// A loop frame reads nothing back and travels with geometry alone, which is
+/// what its field did anyway (`PolarField::strip_values`). A still pane's
+/// readout does read one, and what it needs is the *number* under the pointer
+/// — not a wide grid to hold it in. So the field is built from the plane's own
+/// codes and a 256-entry table of what each decodes to
+/// ([`codes::Lut::value_table`]): the same arithmetic the raster's fill loop
+/// ran per gate, evaluated once per code, so a read-back is an indexing of it
+/// and never a rounding. `radials × gates + 1,024` bytes against the raster
+/// path's `side²` pair.
+///
+/// `None` if the field refuses those three parts, for the same reason every
+/// other `None` here is: the caller's answer to all of them is the raster.
 pub fn render_sweep_plane(
     data: &Scan,
     elevation_angle: f32,
     product: types::RadarProduct,
     declared_nyquist: &crate::nyquist::DeclaredNyquist,
+    values_wanted: bool,
 ) -> Option<SweepRender> {
     // The same owner the raster path finds, so a plane and a raster of one
     // request are never two different cuts.
@@ -1473,6 +1484,19 @@ pub fn render_sweep_plane(
     let geometry = layout
         .plane_geometry(radials, product)
         .reaching(built.reach_gates);
+    let polar = if values_wanted {
+        // Level 0 alone: the mip chain is what the *picture* is drawn from and
+        // a readout never samples it. One copy of the plane's own bytes, on
+        // whichever pool lane the render finished on.
+        let (level0, _, _) = built.plane.level(0)?;
+        polar::PolarField::from_code_table(
+            geometry,
+            level0.to_vec(),
+            codes::Lut::value_table(built.plane.key()),
+        )?
+    } else {
+        polar::PolarField::from_parts(geometry, Vec::new())
+    };
     Some(SweepRender {
         // The surface is the plane. Nothing here checks out a pooled image or
         // a cell buffer, which is the point of the path.
@@ -1480,7 +1504,7 @@ pub fn render_sweep_plane(
         // The extent the raster would have been projected at, so a pane placing
         // this frame puts it exactly where the raster went.
         max_range_km: types::plan_view_extent_km(layout.ground_reach_km),
-        polar: polar::PolarField::from_parts(geometry, Vec::new()),
+        polar,
         nyquist_ms,
         melting_layer_source: None,
         storm_motion: None,
