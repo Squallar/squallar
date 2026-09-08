@@ -54,6 +54,9 @@ pub mod pan_zoom_2d {
     /// [`STROKE_SPEED_STEP`].
     pub(crate) const STROKE_SPEED_BASE: f32 = 200.0;
     pub(crate) const STROKE_SPEED_STEP: f32 = 225.0;
+    /// A stroke reaches at most this fraction of the shorter screen edge,
+    /// whatever its pair's speed would otherwise carry it.
+    pub(crate) const REACH_FRACTION: f32 = 0.4;
 }
 
 /// The 3D volume scenario: a closed Lissajous orbit drag, then a wheel dolly
@@ -264,6 +267,10 @@ pub struct GesturePlayer {
     pointer_at: Option<egui::Pos2>,
     /// Signed wheel notches already emitted this loop.
     notches_emitted: i64,
+    /// The pan-zoom stroke whose press is still down, so a later frame can
+    /// put its release where the schedule says even if no frame landed in
+    /// the stroke's coast window.
+    stroke_open: Option<u32>,
     /// Last two-finger positions emitted, for the pinch release.
     pinch_last: Option<(egui::Pos2, egui::Pos2)>,
     /// The gap the active pinch window ends on; the release lands here.
@@ -293,6 +300,7 @@ impl GesturePlayer {
             down_at: None,
             pointer_at: None,
             notches_emitted: 0,
+            stroke_open: None,
             pinch_last: None,
             pinch_end_gap: pinch_2d::GAP_MIN,
             pending_release: None,
@@ -361,6 +369,7 @@ impl GesturePlayer {
             self.step(&mut events, screen, targets, tail_from, LOOP_SECONDS);
             self.release_all(&mut events);
             self.notches_emitted = 0;
+            self.stroke_open = None;
             self.loops_completed += 1;
             log::info!("{}", loop_complete_line(self.script, self.frames_this_loop));
             self.frames_this_loop = 0;
@@ -501,48 +510,79 @@ impl GesturePlayer {
 
     // ── pan-zoom-2d ──
 
+    /// Where stroke `stroke`'s pointer is `t_in` seconds into it: out from
+    /// the screen centre along the pair's angle, at the pair's speed, capped
+    /// at [`REACH_FRACTION`](pan_zoom_2d::REACH_FRACTION) of the shorter
+    /// screen edge and held there once the hold time is reached. Odd strokes
+    /// take the mirrored angle — same speed, opposite direction, so the
+    /// pair's displacements cancel and the loop re-centres.
+    ///
+    /// A closed form in `(stroke, t_in)` on purpose: it is both the position
+    /// a frame inside the stroke moves to and the position the stroke's
+    /// release lands on, so the two can never disagree.
+    fn stroke_pos(screen: egui::Rect, stroke: u32, t_in: f64) -> egui::Pos2 {
+        use pan_zoom_2d::*;
+        let pair = stroke / 2;
+        let speed = STROKE_SPEED_BASE + STROKE_SPEED_STEP * pair as f32;
+        let mut angle = 0.7 * pair as f32;
+        if stroke % 2 == 1 {
+            angle += std::f32::consts::PI;
+        }
+        let reach_cap = REACH_FRACTION * screen.width().min(screen.height());
+        let reach = (speed * t_in.min(STROKE_HOLD) as f32).min(reach_cap);
+        screen.center() + egui::vec2(angle.cos(), angle.sin()) * reach
+    }
+
     fn pan_zoom_2d(&mut self, events: &mut Vec<egui::Event>, screen: egui::Rect, to: f64) {
         use pan_zoom_2d::*;
         let center = screen.center();
         let t = to;
+        // One spelling of the hold deadline for both the close-out below and
+        // the in-stroke branch, so no rounding can put a frame on both sides
+        // of it and park the pointer back at the centre with the button down.
+        let hold_until = |stroke: u32| f64::from(stroke) * STROKE_PERIOD + STROKE_HOLD;
+        // Close an open stroke on the first frame at or past its hold time,
+        // wherever that frame falls — not only inside the
+        // `STROKE_PERIOD - STROKE_HOLD` coast window, which any frame gap
+        // wider than the coast steps clean over. A stranded release leaves
+        // the button down into the next stroke, and that stroke's first move
+        // drags the pointer back to the centre, so the stranded stroke nets
+        // nothing: its mirrored pair stops cancelling and the loop keeps the
+        // pair's whole displacement as a net pan. Same shape as the zoom
+        // legs' flush below — a half-line in `t`, never a window.
+        let mut closed_now = false;
+        if let Some(open) = self.stroke_open
+            && t >= hold_until(open)
+        {
+            closed_now = self.release_if_down(events, Self::stroke_pos(screen, open, STROKE_HOLD));
+            self.stroke_open = None;
+        }
         if t < DRAG_END {
             let stroke = ((t / STROKE_PERIOD) as u32).min(STROKES - 1);
             let t_in = t - f64::from(stroke) * STROKE_PERIOD;
-            let pair = stroke / 2;
-            let speed = STROKE_SPEED_BASE + STROKE_SPEED_STEP * pair as f32;
-            let mut angle = 0.7 * pair as f32;
-            if stroke % 2 == 1 {
-                // The mirror stroke: same speed, opposite direction, so the
-                // pair's displacements cancel and the loop re-centres.
-                angle += std::f32::consts::PI;
-            }
-            let reach_cap = 0.4 * screen.width().min(screen.height());
-            let reach = |dt: f64| (speed * dt as f32).min(reach_cap);
-            if t_in < STROKE_HOLD {
+            if t < hold_until(stroke) {
                 if self.down_at.is_none() {
                     // Park, press alone, then reach — three frames, never
-                    // one batch (`press_parked`). The reach is a function of
-                    // `t_in`, so the frame after the press catches up to
-                    // where the stroke is by then; nothing is lost.
-                    self.press_parked(events, center);
+                    // one batch (`press_parked`), and never a park in the
+                    // batch that just released: egui reads one pointer
+                    // position per pass, so a move behind a release is the
+                    // released stroke handed back to the map. The reach is a
+                    // function of `t_in`, so the frame after the press
+                    // catches up to where the stroke is by then; nothing is
+                    // lost.
+                    if !closed_now && self.press_parked(events, center) {
+                        self.stroke_open = Some(stroke);
+                    }
                     return;
                 }
-                let pos = center + egui::vec2(angle.cos(), angle.sin()) * reach(t_in);
-                self.move_to(events, pos);
-            } else {
-                // Release exactly at the hold-time reach, whatever the frame
-                // cadence did: the release carries its own move, so the net
-                // stroke displacement is cadence-independent.
-                let pos = center + egui::vec2(angle.cos(), angle.sin()) * reach(STROKE_HOLD);
-                if !self.release_if_down(events, pos) {
-                    // Already released: use the rest of the gap to park at
-                    // the next stroke's press point, so its press can go out
-                    // on that stroke's first frame.
-                    self.park(events, center);
-                }
+                self.move_to(events, Self::stroke_pos(screen, stroke, t_in));
+            } else if !closed_now {
+                // The release is already out. Use the rest of the gap to
+                // park at the next stroke's press point, so its press can go
+                // out on that stroke's first frame.
+                self.park(events, center);
             }
         } else {
-            self.release_if_down(events, center);
             // Evaluated past the legs' ends too, not only inside them: the
             // frame cadence lands the u=1 crossing just after a leg's end
             // time, and a branch closed at exactly that time would strand the

@@ -582,3 +582,258 @@ fn the_registry_collects_only_while_armed() {
     );
     click_registry::set_collecting(false);
 }
+
+/// The camera state the pan-zoom script has handed the map at the end of a
+/// replay, in the script's own vocabulary: the pan is the pointer
+/// displacement delivered while the button was down, the zoom is the signed
+/// wheel delta, and the two counts say the strokes and notches were really
+/// emitted rather than skipped. `dragged` is the path length the pressed
+/// pointer travelled — a "did the work happen" figure a stroke that never
+/// pressed cannot fake, where the net pan can.
+#[derive(Debug, Clone, PartialEq)]
+struct CameraEnd {
+    /// Summed in f64 so the harness contributes no error of its own: an f32
+    /// running total over a few thousand deltas loses ~0.1 pt by itself.
+    pan: (f64, f64),
+    zoom_notches: f32,
+    dragged: f64,
+    presses: usize,
+    wheel_events: usize,
+}
+
+fn camera_end(frames: &[(f64, Vec<egui::Event>)]) -> CameraEnd {
+    let mut down = false;
+    let mut pos: Option<egui::Pos2> = None;
+    let mut end = CameraEnd {
+        pan: (0.0, 0.0),
+        zoom_notches: 0.0,
+        dragged: 0.0,
+        presses: 0,
+        wheel_events: 0,
+    };
+    let apply = |end: &mut CameraEnd, to: egui::Pos2, down: bool, pos: &mut Option<egui::Pos2>| {
+        if down && let Some(prev) = *pos {
+            let (dx, dy) = (f64::from(to.x - prev.x), f64::from(to.y - prev.y));
+            end.pan.0 += dx;
+            end.pan.1 += dy;
+            end.dragged += dx.hypot(dy);
+        }
+        *pos = Some(to);
+    };
+    for (_, events) in frames {
+        for event in events {
+            match event {
+                egui::Event::PointerMoved(p) => apply(&mut end, *p, down, &mut pos),
+                egui::Event::PointerButton {
+                    pos: p, pressed, ..
+                } => {
+                    apply(&mut end, *p, down && !*pressed, &mut pos);
+                    if *pressed {
+                        end.presses += 1;
+                    }
+                    down = *pressed;
+                }
+                egui::Event::MouseWheel { delta, .. } => {
+                    end.zoom_notches += delta.y;
+                    end.wheel_events += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    end
+}
+
+/// Frames every `dt` seconds up to `until`.
+fn steady_times(dt: f64, until: f64) -> Vec<f64> {
+    let mut out = Vec::new();
+    let mut t = 0.0;
+    while t < until {
+        t += dt;
+        out.push(t);
+    }
+    out
+}
+
+/// A cadence that lands a frame just before and just after **every** boundary
+/// the pan-zoom schedule has — each stroke's start and hold time, the drag's
+/// end, and both zoom legs' ends — on top of a 30 fps fill. The half-line
+/// branches are what a boundary frame probes: one that fired on a window
+/// instead strands whatever the two frames straddled.
+fn boundary_straddling_times(until: f64) -> Vec<f64> {
+    use pan_zoom_2d::*;
+    let nudge = 1e-4;
+    let mut out = steady_times(1.0 / 30.0, until);
+    let mut loop_start = 0.0;
+    while loop_start < until {
+        let mut marks = vec![
+            DRAG_END,
+            QUIET_1_END,
+            ZOOM_IN_END,
+            QUIET_2_END,
+            ZOOM_OUT_END,
+            LOOP_SECONDS,
+        ];
+        for stroke in 0..STROKES {
+            marks.push(f64::from(stroke) * STROKE_PERIOD);
+            marks.push(f64::from(stroke) * STROKE_PERIOD + STROKE_HOLD);
+        }
+        for mark in marks {
+            out.push(loop_start + mark - nudge);
+            out.push(loop_start + mark + nudge);
+        }
+        loop_start += LOOP_SECONDS;
+    }
+    out.sort_by(f64::total_cmp);
+    out.retain(|t| *t > 0.0 && *t < until);
+    out.dedup();
+    out
+}
+
+/// A jittered cadence around `mean`, seeded — the shape of a real leg, and at
+/// a 41 ms mean the one that put 1433-1457 frames on the Mac legs whose
+/// six-segment totals spread 38.4 %.
+fn jittered_around(seed: u64, mean: f64, until: f64) -> Vec<f64> {
+    let mut state = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    let mut out = Vec::new();
+    let mut t = 0.0;
+    while t < until {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let u = ((state >> 33) as f64) / ((1u64 << 31) as f64);
+        t += mean * (0.5 + u);
+        out.push(t);
+    }
+    out
+}
+
+/// The script's end camera state is a function of elapsed time and nothing
+/// else — the same pan, the same zoom, and the same per-stroke displacements
+/// under every frame cadence.
+///
+/// The mechanism this pins: a stroke's release used to be emitted only by a
+/// frame that landed inside its coast window, `STROKE_PERIOD - STROKE_HOLD`
+/// = 50 ms wide. Any frame gap wider than that stepped over the window, left
+/// the button down into the next stroke, and that stroke's first move dragged
+/// the pointer back to the centre — so the stranded stroke netted nothing,
+/// its mirrored pair stopped cancelling, and the loop kept the pair's whole
+/// displacement (up to `REACH_FRACTION` of the shorter edge, 432 pt at
+/// 1920x1080) as a net pan. Which strokes were stranded was pure frame-gap
+/// luck: five Mac Firefox legs of the same build, script and seed ended
+/// between 36.41 N / 430 km and 79.89 N / 4,973 km.
+#[test]
+fn the_pan_zoom_camera_lands_in_the_same_place_at_every_frame_cadence() {
+    use pan_zoom_2d::*;
+    // Three loops, cut in the third's quiet tail: past ZOOM_OUT_END, so all
+    // three drag phases and all three zoom cycles are complete.
+    const LOOPS: usize = 3;
+    let until = LOOPS as f64 * LOOP_SECONDS - 0.5;
+
+    // What the schedule alone says the run must deliver.
+    let reach_cap = REACH_FRACTION * NATIVE.width().min(NATIVE.height());
+    let stroke_reach = |stroke: u32| {
+        let speed = STROKE_SPEED_BASE + STROKE_SPEED_STEP * (stroke / 2) as f32;
+        f64::from((speed * STROKE_HOLD as f32).min(reach_cap))
+    };
+    // Each stroke presses at the centre and travels outward only, so its
+    // pressed path length is exactly the reach its hold time buys.
+    let expected_dragged = LOOPS as f64 * (0..STROKES).map(stroke_reach).sum::<f64>();
+    let expected_presses = LOOPS * STROKES as usize;
+    let expected_wheel_events = LOOPS * 2 * NOTCHES_PER_LEG as usize;
+
+    // A tolerance of the f32 direction vector the player scales by: its
+    // length is 1 only to f32 precision, so a stroke's delivered reach is its
+    // scheduled reach times 1 +/- ~1e-7, and the run's 16,173 pt of pressed
+    // travel carries a few thousandths of a point of that. Nothing else is
+    // approximate — the sums above are f64. It is four orders of magnitude
+    // under the smallest thing a stranded stroke could be worth, pair 0's
+    // 90 pt reach, so it cannot swallow one.
+    let tolerance = 1e-2;
+
+    let cadences: Vec<(String, Vec<f64>)> = vec![
+        ("60 fps".to_owned(), steady_times(1.0 / 60.0, until)),
+        // Wider than the 50 ms coast window, so a release that needs a frame
+        // inside it is stranded.
+        ("16.7 fps".to_owned(), steady_times(0.06, until)),
+        ("10 fps".to_owned(), steady_times(0.1, until)),
+        (
+            "60 fps, first frames 40 ms late".to_owned(),
+            late_first_frames(STROKE_PERIOD, until),
+        ),
+        (
+            "30 fps straddling every boundary".to_owned(),
+            boundary_straddling_times(until),
+        ),
+        (
+            "jittered ~41 ms".to_owned(),
+            jittered_around(7, 0.041, until),
+        ),
+        (
+            "jittered ~25 ms".to_owned(),
+            jittered_around(11, 0.025, until),
+        ),
+    ];
+
+    let mut reference: Option<(&str, CameraEnd, Vec<egui::Vec2>)> = None;
+    for (name, times) in &cadences {
+        let frames = replay("pan-zoom-2d", times, NATIVE);
+        let end = camera_end(&frames);
+        let nets: Vec<egui::Vec2> = strokes(&frames).iter().map(|s| s.net).collect();
+
+        // The gesture really did its work: every stroke pressed, every notch
+        // emitted, and the pressed pointer travelled the whole scripted path.
+        assert_eq!(
+            end.presses, expected_presses,
+            "{name}: {} strokes pressed, the schedule has {expected_presses}",
+            end.presses
+        );
+        assert_eq!(
+            end.wheel_events, expected_wheel_events,
+            "{name}: {} wheel notches, the schedule has {expected_wheel_events}",
+            end.wheel_events
+        );
+        assert!(
+            (end.dragged - expected_dragged).abs() < tolerance,
+            "{name}: the pressed pointer travelled {} pt, the schedule's strokes total \
+             {expected_dragged} pt",
+            end.dragged
+        );
+        // And it landed back where it started: mirrored pairs, equal legs.
+        assert!(
+            end.pan.0.hypot(end.pan.1) < tolerance,
+            "{name}: the run left a net pan of {:?} pt",
+            end.pan
+        );
+        assert_eq!(end.zoom_notches, 0.0, "{name}: the run left a net zoom");
+
+        match &reference {
+            None => reference = Some((name, end, nets)),
+            Some((ref_name, ref_end, ref_nets)) => {
+                assert!(
+                    (end.pan.0 - ref_end.pan.0).hypot(end.pan.1 - ref_end.pan.1) < tolerance
+                        && end.zoom_notches == ref_end.zoom_notches
+                        && (end.dragged - ref_end.dragged).abs() < tolerance
+                        && end.presses == ref_end.presses
+                        && end.wheel_events == ref_end.wheel_events,
+                    "the camera ends at {end:?} under {name} but at {ref_end:?} under {ref_name}"
+                );
+                assert_eq!(
+                    nets.len(),
+                    ref_nets.len(),
+                    "{name}: {} stroke displacements against {ref_name}'s {}",
+                    nets.len(),
+                    ref_nets.len()
+                );
+                for (i, (a, b)) in nets.iter().zip(ref_nets).enumerate() {
+                    assert!(
+                        f64::from((*a - *b).length()) < tolerance,
+                        "{name}: stroke {i} displaced {a:?}, {ref_name} displaced {b:?}"
+                    );
+                }
+            }
+        }
+    }
+}
