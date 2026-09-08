@@ -234,6 +234,23 @@ impl Default for StackProbe {
     }
 }
 
+/// [`egui::Response::on_hover_text`], with the text composed only on the frame
+/// the tooltip is actually drawn.
+///
+/// `on_hover_text` takes its text by value, so every caller pays for the
+/// string whether or not the pointer is anywhere near the widget. A layer row
+/// carries three of these and a stack carries a row per layer, which made the
+/// panel compose a tooltip for every control on every row every frame to show
+/// one. The body is `Response::on_hover_text`'s own (egui 0.35) with the
+/// argument moved inside the closure, so what is drawn is the same widget in
+/// the same box.
+fn on_hover_text_lazy(response: egui::Response, text: impl FnOnce() -> String) -> egui::Response {
+    response.on_hover_ui(|ui| {
+        ui.set_max_width(ui.spacing().tooltip_width);
+        ui.add(egui::Label::new(text()));
+    })
+}
+
 impl super::Gui {
     /// The stack, in the slot its host chose — the map's top-left corner
     /// from the shell, the sheet's body from the phone shell.
@@ -494,8 +511,11 @@ impl super::Gui {
                     self.insp_open && self.inspector_sel == InspectorSelection::Layer(kind.clone());
                 let name = self.overlays.display_name(kind).to_owned();
                 let lines = rows.iter().find(|row| row.layer == *kind);
-                let status = lines.and_then(|row| row.status.clone());
-                let memory = lines.and_then(|row| row.memory.clone());
+                // Borrowed, not cloned. The composer already owns both lines
+                // for the whole pass and nothing here outlives it, so the two
+                // `String`s a row used to copy every frame bought nothing.
+                let status: Option<&str> = lines.and_then(|row| row.status.as_deref());
+                let memory: Option<&str> = lines.and_then(|row| row.memory.as_deref());
 
                 // The whole row is the click target (the M8 full-row fix):
                 // the full panel width at a comfortable height, allocated
@@ -517,9 +537,9 @@ impl super::Gui {
                 // on both. Under the controls it has the whole row -- the
                 // same figure, legible, and the controls keep the height they
                 // had because the band is taken off the rect they centre in.
-                let memory_band = memory.as_ref().map_or(0.0, |_| small);
+                let memory_band = memory.map_or(0.0, |_| small);
                 let row_height = (ui.text_style_height(&egui::TextStyle::Body)
-                    + status.as_ref().map_or(0.0, |_| small)
+                    + status.map_or(0.0, |_| small)
                     + memory_band
                     + 6.0)
                     .max(MIN_ROW_HEIGHT);
@@ -615,9 +635,10 @@ impl super::Gui {
                         );
                     }
                 }
-                let handle = handle
-                    .on_hover_cursor(egui::CursorIcon::Grab)
-                    .on_hover_text(format!("Drag to reorder {name}"));
+                let handle =
+                    on_hover_text_lazy(handle.on_hover_cursor(egui::CursorIcon::Grab), || {
+                        format!("Drag to reorder {name}")
+                    });
                 if handle.drag_started() {
                     self.stack_drag = Some(kind.clone());
                 }
@@ -636,17 +657,20 @@ impl super::Gui {
                 } else {
                     egui::RichText::new("-").size(EYE_GLYPH_SIZE).weak()
                 };
-                let eye = ui
-                    .add(
+                let eye = on_hover_text_lazy(
+                    ui.add(
                         egui::Button::new(eye_text)
                             .frame(false)
                             .min_size(egui::Vec2::splat(CONTROL_SIDE)),
-                    )
-                    .on_hover_text(if enabled {
-                        format!("Hide {name}")
-                    } else {
-                        format!("Show {name}")
-                    });
+                    ),
+                    || {
+                        if enabled {
+                            format!("Hide {name}")
+                        } else {
+                            format!("Show {name}")
+                        }
+                    },
+                );
                 // A UiSweep target: the sweep toggles every eye it can see.
                 if crate::gesture_player::click_registry::collecting() {
                     crate::gesture_player::click_registry::register(
@@ -706,23 +730,26 @@ impl super::Gui {
                         // rather than no control at all — an absent affordance
                         // reads as an oversight, and one that silently does
                         // nothing is worse than both.
-                        let remove = ui
-                            .add_enabled(
-                                refusal.is_none(),
-                                egui::Button::new(
-                                    egui::RichText::new(REMOVE_LABEL)
-                                        .size(REMOVE_GLYPH_SIZE)
-                                        .color(if refusal.is_none() {
-                                            ui.visuals().weak_text_color()
-                                        } else {
-                                            ui.visuals().widgets.noninteractive.fg_stroke.color
-                                        }),
-                                )
-                                .frame(false)
-                                .min_size(egui::Vec2::splat(CONTROL_SIDE)),
+                        let remove = ui.add_enabled(
+                            refusal.is_none(),
+                            egui::Button::new(
+                                egui::RichText::new(REMOVE_LABEL)
+                                    .size(REMOVE_GLYPH_SIZE)
+                                    .color(if refusal.is_none() {
+                                        ui.visuals().weak_text_color()
+                                    } else {
+                                        ui.visuals().widgets.noninteractive.fg_stroke.color
+                                    }),
                             )
-                            .on_hover_text(format!("Remove {name} from this pane"))
-                            .on_disabled_hover_text(refusal.unwrap_or_default());
+                            .frame(false)
+                            .min_size(egui::Vec2::splat(CONTROL_SIDE)),
+                        );
+                        let remove =
+                            on_hover_text_lazy(remove, || format!("Remove {name} from this pane"));
+                        let remove = remove.on_disabled_hover_ui(|ui| {
+                            ui.set_max_width(ui.spacing().tooltip_width);
+                            ui.add(egui::Label::new(refusal.unwrap_or_default()));
+                        });
 
                         // The name and status block. Hidden layers render
                         // dimmed — weak text is the stock theme's own dimming.
@@ -733,7 +760,7 @@ impl super::Gui {
                                 ui.spacing_mut().item_spacing.y = 0.0;
                                 let small = ui.text_style_height(&egui::TextStyle::Small);
                                 let text_height = ui.text_style_height(&egui::TextStyle::Body)
-                                    + status.as_ref().map_or(0.0, |_| small);
+                                    + status.map_or(0.0, |_| small);
                                 ui.add_space(((content_height - text_height) / 2.0).max(0.0));
                                 let name_text = if enabled {
                                     egui::RichText::new(name.as_str())
@@ -743,7 +770,7 @@ impl super::Gui {
                                 let name_label = ui
                                     .add(egui::Label::new(name_text).selectable(false).truncate());
                                 let mut text_rect = name_label.rect;
-                                if let Some(line) = &status {
+                                if let Some(line) = status {
                                     // A line that opens with the fault mark is not a
                                     // count, and `.weak()` is the theme's own way of
                                     // saying "this is a detail" — the same dim grey
@@ -751,7 +778,7 @@ impl super::Gui {
                                     // updating, or is drawing 85 of 297 warnings, gets
                                     // the warning colour instead: same size, same
                                     // place, same rect, legible as a fault.
-                                    let text = egui::RichText::new(line.as_str()).small();
+                                    let text = egui::RichText::new(line).small();
                                     let text = if line.starts_with(STATUS_MARK) {
                                         text.color(ui.visuals().warn_fg_color)
                                     } else {
@@ -764,7 +791,7 @@ impl super::Gui {
                                 text_rect
                             });
                         let mut text_rect = block.inner;
-                        if let Some(line) = &memory {
+                        if let Some(line) = memory {
                             // **A quantity, never a warning.** What this layer
                             // costs is a fact about the scene the user built,
                             // not a fault, and it is drawn in the same dim
@@ -781,7 +808,7 @@ impl super::Gui {
                             // Clipped to the row, so a font that laid it out
                             // wider than the panel cannot reach the row below.
                             let galley = ui.painter().layout_no_wrap(
-                                line.clone(),
+                                line.to_owned(),
                                 egui::TextStyle::Small.resolve(ui.style()),
                                 ui.visuals().weak_text_color(),
                             );
@@ -828,8 +855,8 @@ impl super::Gui {
                     remove_enabled: refusal.is_none(),
                     handle: handle.rect,
                     name: name_rect,
-                    status_line: status.clone(),
-                    memory_line: memory.clone(),
+                    status_line: status.map(str::to_owned),
+                    memory_line: memory.map(str::to_owned),
                     selected,
                     chevron: chevron_rect,
                 });
