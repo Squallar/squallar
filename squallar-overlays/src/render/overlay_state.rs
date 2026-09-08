@@ -573,10 +573,36 @@ impl OverlayRegistry {
         }
     }
 
+    /// Whether `id` could put a pixel inside `bounds` — see
+    /// [`OverlayHandler::paints_in`], which carries the whole account of why
+    /// this is a different question from [`Self::has_data`] and which direction
+    /// it is allowed to be wrong in.
+    ///
+    /// **`true` for an id no handler owns**, which is the same answer the
+    /// dispatch already gives such an id: `App::spawn_overlay_render` refuses it
+    /// at the `render_mode` guard, several statements before this is reached.
+    /// Answering `false` here would route an unregistered layer through the
+    /// blank delivery instead, which is a second refusal path for a case that
+    /// already has one.
+    pub fn paints_in(
+        &self,
+        id: &LayerId,
+        bounds: &squallar_geo::GeoBounds,
+        ctx: &RasterizeContext,
+        pane: &PaneRef<'_>,
+    ) -> bool {
+        self.handler(id)
+            .is_none_or(|h| h.paints_in(bounds, ctx, pane))
+    }
+
     /// **One dispatch.** The dispatch tail calls this exactly once per layer
     /// it dispatches, before it asks the same layer for [`Self::hit_items`],
     /// so this is the denominator every figure in
     /// [`squallar_source::walks`] is quoted against.
+    ///
+    /// A dispatch refused by [`Self::paints_in`] never reaches here and is in
+    /// none of those figures, which is honest rather than a gap: the walk it
+    /// counts did not happen.
     pub fn prepare_job(
         &self,
         id: &LayerId,

@@ -1407,21 +1407,46 @@ impl super::App {
                 // locals and the accumulate happens once the block closes.
                 let build_start = web_time::Instant::now();
                 // Declared unassigned: the block below has no early exit, so
-                // all three are definitely written, and a placeholder value
-                // here would be a dead store the compiler is right to flag.
+                // all four — these three and `empty_extent` — are definitely
+                // written, and a placeholder value here would be a dead store
+                // the compiler is right to flag.
                 let hydrated;
                 let prepared;
                 let hit_mapped;
+                // **Whether this layer could put a pixel in the ground this
+                // raster covers** — `SourceHandler::paints_in`, asked before
+                // the paint input is built rather than discovered by building
+                // it, rasterizing it and finding the buffer empty. `false` is
+                // delivered as a blank below; it is never a refusal to answer.
+                //
+                // **Live rasters only.** A loop frame has no blank state to
+                // hold, so `frame.is_some()` keeps the pre-existing path
+                // exactly — see the method's own note.
+                let empty_extent;
                 let built = {
                     let (panes, overlays) = self.gui.panes_and_overlays_mut();
                     panes[first_pane_idx].hydrate_layer_states(overlays, first_pane_idx);
                     hydrated = web_time::Instant::now();
                     let view = panes[first_pane_idx].view(first_pane_idx);
                     let pane = view.layer(id);
-                    let job = overlays.prepare_job(id, &rctx, &pane);
+                    empty_extent =
+                        frame.is_none() && !overlays.paints_in(id, &render_bounds, &rctx, &pane);
+                    // Skipped where the extent is empty, which is the whole of
+                    // the saving: no paint input is built, no hit list is
+                    // materialised, nothing crosses the worker wire and no
+                    // picture-sized pixmap is allocated to be thrown away.
+                    let job = if empty_extent {
+                        None
+                    } else {
+                        overlays.prepare_job(id, &rctx, &pane)
+                    };
                     prepared = web_time::Instant::now();
                     // The page-side half of a hit map.
-                    let id_map = overlays.hit_items(id);
+                    let id_map = if empty_extent {
+                        None
+                    } else {
+                        overlays.hit_items(id)
+                    };
                     hit_mapped = web_time::Instant::now();
                     // The codec row the handler registered — its label is the
                     // job's name in the timing log.
@@ -1439,6 +1464,31 @@ impl super::App {
                         hitmap_ns: crate::frame_ledger::nanos(prepared, hit_mapped),
                         ..Default::default()
                     });
+                if empty_extent {
+                    // **A blank, and never the exit below.** The two look
+                    // interchangeable and are opposites: `None` takes
+                    // `clear_overlay_render_marks` and sends nothing, so the
+                    // pane keeps whatever it was drawing — which is the shipped
+                    // symptom of a layer that renders nothing while its popup
+                    // still answers. A blank is a *clear*: it retires this
+                    // dispatch's ticket, replaces the ink of a layer whose data
+                    // has moved out of view, and is what the rasterizer would
+                    // have answered anyway after spending the picture to say
+                    // so. Pinned by
+                    // `an_empty_extent_delivers_a_blank_rather_than_no_response`.
+                    let _ = sender.send(OverlayRenderResponse {
+                        picture: Some(crate::channels::OverlayPicture::Blank { width, height }),
+                        geo_bounds: render_bounds,
+                        overlay_kind: id.clone(),
+                        generation: data_generation,
+                        pane_indices,
+                        zoom,
+                        hit_map: None,
+                        frame,
+                    });
+                    super::notify_redraw(&window);
+                    return;
+                }
                 let Some((job, id_map, row)) = built else {
                     self.clear_overlay_render_marks(&pane_indices, id, frame, &ticket);
                     return;
@@ -4126,6 +4176,13 @@ mod site_switch_tests;
 #[cfg(test)]
 #[path = "app_fetch/overlay_arrival_tests.rs"]
 mod overlay_arrival_tests;
+
+/// A layer holding data somewhere is not a layer that paints here — the
+/// dispatch doors gate on the extent-blind `has_data` and spent a full-size
+/// raster to discover an empty extent.
+#[cfg(test)]
+#[path = "app_fetch/overlay_extent_tests.rs"]
+mod overlay_extent_tests;
 
 /// A non-radar loop gains a frame when its own source publishes one — the
 /// append walk read radar's slot and rejected every other layer's timeline.

@@ -854,6 +854,57 @@ impl OverlayHandler for NwsAlertHandler {
         });
     }
 
+    /// **The three filters [`rasterize::rasterize_nws_alerts`] applies, asked
+    /// before the raster is spent instead of after.**
+    ///
+    /// [`Self::has_data`] is `!self.state.data.is_empty()` — one active alert
+    /// anywhere in the country — so a pane over Oklahoma with every warning in
+    /// Maine dispatched a full-size raster to be told its extent was empty. The
+    /// filters below are the rasterizer's own, in the rasterizer's own order:
+    /// [`Self::admitted`] is what [`Self::paint_input`] puts on the wire, the
+    /// category and dismissed tests are what `rasterize_nws_alerts` skips on,
+    /// and `any_feature_paints_in` is the geo-AABB cull `draw_feature` runs
+    /// before it projects anything.
+    ///
+    /// **[`Self::is_drawn`] is deliberately not used here**, and the difference
+    /// is a departed alert: that predicate requires `departed.is_none()`, while
+    /// the paint path admits a departed item whose window still covers `as_of`.
+    /// Culling on `is_drawn` would clear a scrubbed pane that should be drawing
+    /// an alert which has since left the feed — a wrong `false`, which is the
+    /// one direction `SourceHandler::paints_in` may not be wrong in.
+    ///
+    /// A zone-based alert whose boundaries never resolved carries no features
+    /// and is culled by having none, which is the same answer the rasterizer
+    /// reaches by drawing none — the distinction [`Self::shown_counts`] returns
+    /// as its two halves.
+    ///
+    /// **Unmemoized, and that is not the walk `4bc434793` removed.** That land
+    /// took a twice-per-frame walk of the whole feed off the status line, where
+    /// the cost was paid on every frame for a pair of numbers that move on a
+    /// poll. This one is paid **per dispatch** — which is what it exists to
+    /// prevent, and it prevents a picture-sized rasterization each time — and
+    /// it short-circuits on the first admitted feature that survives the cull,
+    /// so the scene it walks furthest on is the one where it is about to answer
+    /// `true` and cost nothing.
+    fn paints_in(
+        &self,
+        bounds: &squallar_geo::GeoBounds,
+        ctx: &RasterizeContext,
+        pane: &PaneRef<'_>,
+    ) -> bool {
+        let view = self.view(pane);
+        rasterize::any_feature_paints_in(
+            self.state
+                .data
+                .iter()
+                .filter(|item| Self::admitted(item, ctx.as_of))
+                .filter(|item| view.enabled_categories.contains(&item.alert.category))
+                .filter(|item| !self.hidden_alerts.contains(&item.alert.id))
+                .flat_map(|item| item.alert.features.iter()),
+            bounds,
+        )
+    }
+
     /// **Built once per picture, not once per dispatch.** The input is a
     /// `String` and an `Arc` clone per admitted alert plus the dismissed set,
     /// on the frame thread, and its terms are the data generation, the view
@@ -1171,6 +1222,132 @@ mod tests {
         let mut handler = NwsAlertHandler::new();
         handler.apply_fetch_result(whole(alerts), &PaneRef::across(&[]));
         handler
+    }
+
+    /// **The dispatch door's predicate agrees with what the rasterizer would
+    /// have painted**, on both sides.
+    ///
+    /// `SourceHandler::paints_in` refuses a raster, and the refusal is
+    /// delivered as a blank — which is a *clear*, not a skip. So a `false` it
+    /// gets wrong takes ink off the glass, and the only honest pin is the
+    /// rasterizer's own answer over the same alerts at the same bounds:
+    /// `has_ink` over what `rasterize_nws_alerts` actually produced, which is
+    /// the same predicate `RasterizeOutput::settle_blank` applies in the run
+    /// funnel's output stage.
+    ///
+    /// **Both arms are asserted absolutely as well as against each other.** An
+    /// equality alone is satisfied by a predicate and a rasterizer that are
+    /// both stuck at the same answer — a category filter that admitted nothing
+    /// would make every arm `false == false` and read green while the map drew
+    /// nothing.
+    ///
+    /// The far arm is in Maine rather than a degree outside the near one: the
+    /// cull compares longitudes after a whole-turn shift into the texture's own
+    /// frame, and a fixture sitting on the edge would not separate a correct
+    /// frame from an absent one.
+    #[test]
+    fn the_extent_predicate_agrees_with_what_the_rasterizer_paints() {
+        use squallar_source::handler::SourceHandler;
+
+        let handler = handler_with(vec![alert("a", "Tornado Warning")]);
+        let pane = PaneRef::bare(0);
+        let clock = chrono::NaiveDate::from_ymd_opt(2026, 8, 20)
+            .expect("a real date")
+            .and_hms_opt(19, 0, 0)
+            .expect("a real time");
+        let ctx = RasterizeContext {
+            is_dark: false,
+            zoom: 7.0,
+            device_scale: 1.0,
+            now: clock,
+            as_of: clock,
+            frame: None,
+        };
+
+        // `alert()`'s one polygon is 35.0..35.5 by -97.0..-96.5.
+        let over = squallar_geo::GeoBounds {
+            min_lat: 34.5,
+            max_lat: 36.0,
+            min_lon: -97.5,
+            max_lon: -96.0,
+        };
+        let away = squallar_geo::GeoBounds {
+            min_lat: 44.0,
+            max_lat: 45.0,
+            min_lon: -70.0,
+            max_lon: -69.0,
+        };
+
+        let input = handler
+            .paint_input(&ctx, handler.view(&pane))
+            .expect("the fixture holds one alert in force");
+        let rasterized = |bounds: &squallar_geo::GeoBounds| {
+            let out = crate::render::rasterize::rasterize_nws_alerts(&input, bounds, 96, 48);
+            crate::render::rasterize::has_ink(&out.rgba)
+        };
+
+        for (bounds, what) in [(over, "over the alert"), (away, "far from the alert")] {
+            assert_eq!(
+                handler.paints_in(&bounds, &ctx, &pane),
+                rasterized(&bounds),
+                "the door and the rasterizer disagree {what}: a false refusal \
+                 clears a pane that should have ink, and a false admission \
+                 spends the raster this predicate exists to save",
+            );
+        }
+        assert!(
+            handler.paints_in(&over, &ctx, &pane),
+            "the near arm must admit, or every case here is false == false",
+        );
+        assert!(
+            !handler.paints_in(&away, &ctx, &pane),
+            "the far arm must refuse, or nothing here separates the predicate \
+             from a constant",
+        );
+
+        // **The wrapped viewport, asserted absolutely.** Sharing one cull makes
+        // the door and the rasterizer agree by construction, which is the whole
+        // design — but two spellings that are both wrong agree too, and an
+        // equality cannot see that. A pane panned past the dateline arrives as
+        // 170..200 expressed as -190..-160, and a feature at longitude 172 has
+        // to be carried a whole turn into that frame before the boxes are
+        // compared. Drop the shift from `feature_survives_cull` and this line
+        // is what goes red; the equality above stays green.
+        let wrapped = squallar_geo::GeoBounds {
+            min_lat: 34.0,
+            max_lat: 36.0,
+            min_lon: -195.0,
+            max_lon: -165.0,
+        };
+        let dateline = handler_with(vec![{
+            let mut a = alert("b", "Tornado Warning");
+            let (fill, stroke) = crate::nws::colors::alert_color("Tornado Warning");
+            a.features = Arc::new(vec![OverlayFeature::new(
+                vec![vec![vec![(34.5, 170.0), (35.5, 170.0), (35.5, 175.0)]]],
+                fill,
+                stroke,
+                "Tornado Warning".into(),
+                String::new(),
+                HatchPattern::None,
+            )]);
+            a
+        }]);
+        let wrapped_input = dateline
+            .paint_input(&ctx, dateline.view(&pane))
+            .expect("the dateline fixture holds one alert in force");
+        assert!(
+            crate::render::rasterize::has_ink(
+                &crate::render::rasterize::rasterize_nws_alerts(&wrapped_input, &wrapped, 96, 48)
+                    .rgba
+            ),
+            "precondition: the rasterizer must paint the wrapped fixture, or \
+             the door agreeing with it says nothing",
+        );
+        assert!(
+            dateline.paints_in(&wrapped, &ctx, &pane),
+            "a feature at longitude 172 was refused for a viewport covering it \
+             as -188: the cull compared longitudes in two different frames",
+        );
     }
 
     /// A **zone-based** alert exactly as the parser admits one: `affectedZones`

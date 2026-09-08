@@ -866,9 +866,62 @@ pub trait SourceHandler: Send {
     /// survives.
     fn apply_fetch_result(&mut self, result: FetchPayload, pane: &PaneRef<'_>);
 
+    /// Whether this handler could put a pixel inside `bounds` — the ground one
+    /// raster would cover, which is the viewport plus its oversampling margin.
+    ///
+    /// # Why this is a separate question from [`Self::has_data`]
+    ///
+    /// [`Self::has_data`] takes no bounds and every implementor in the tree
+    /// answers it extent-blind: five of them are literally
+    /// `!self.state.data.is_empty()`, and the rest test that a selected grid is
+    /// resident. It means **"this handler holds a non-empty dataset"**. Both
+    /// overlay dispatch doors — the draw loop's `needs_rerender` pass and
+    /// `App::arrived_overlay_asks` — gate on it as though it meant "this render
+    /// will paint something", so one active alert anywhere in the country makes
+    /// a pane over Oklahoma spend a full-size raster to discover its own extent
+    /// is empty. The extent test then happens in the worker, after the pixmap
+    /// has been allocated and painted, and `RasterizeOutput::settle_blank`
+    /// throws the buffer away. This is that predicate asked one field earlier,
+    /// where it can still refuse the work.
+    ///
+    /// # The direction it is allowed to be wrong in
+    ///
+    /// `true` is the safe answer and the default, so a handler that has not
+    /// been converted dispatches exactly as it did before this method existed.
+    /// A wrong `true` costs one raster that comes back blank, which is today's
+    /// behaviour. A wrong `false` **clears a pane that should have had ink**,
+    /// because the refusal is delivered as a blank and a blank is a clear. An
+    /// override must therefore admit a *superset* of what the layer's
+    /// rasterizer would paint: cull only what that rasterizer's own cull would
+    /// cull, and answer `true` wherever the geometry is unknown.
+    ///
+    /// # It is not asked for a loop frame
+    ///
+    /// `App::spawn_overlay_render` consults this only when
+    /// [`RasterizeContext::frame`] is `None`. A frame of a loop has no blank
+    /// state to hold — `OverlayTextureCache::show_blank` belongs to a pane's
+    /// live cache and a loop frame image has no equivalent — so a refusal there
+    /// would either hold the previous frame's ink or re-ask for the same empty
+    /// raster for ever.
+    fn paints_in(
+        &self,
+        bounds: &squallar_geo::GeoBounds,
+        ctx: &RasterizeContext,
+        pane: &PaneRef<'_>,
+    ) -> bool {
+        let _ = (bounds, ctx, pane);
+        true
+    }
+
     /// This handler's raster as a described job, or `None` when there is nothing
     /// to render. `has_data()` must answer `false` exactly when this answers
     /// `None`, or the settle machinery asks for a render nothing can satisfy.
+    ///
+    /// **`None` is a failed render and is never how an empty extent is
+    /// expressed.** It takes `App::clear_overlay_render_marks` and sends no
+    /// response at all, so the pane keeps whatever it was drawing. A layer with
+    /// nothing in view answers [`Self::paints_in`] `false` instead and is
+    /// delivered an explicit blank, because a blank is a clear.
     fn prepare_job(&self, ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
         let _ = (ctx, pane);
         None

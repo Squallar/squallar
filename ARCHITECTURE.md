@@ -257,9 +257,12 @@ pins it.
 
 ### 3.4 `SourceHandler` — the layer contract
 
-* **Owner**: `squallar-source/src/handler.rs`. Fifty-eight methods; most
-  defaulted. `RadarSource` (`squallar-radar/src/source.rs`) overrides
-  thirty-four of them.
+* **Owner**: `squallar-source/src/handler.rs`. **Sixty-four methods, every one
+  of them defaulted**; `RadarSource` (`squallar-radar/src/source.rs`) overrides
+  thirty-four and leaves thirty at their default. Re-measured 2026-09-08 in the
+  land that added `paints_in`; the line had read "fifty-eight … twenty-four"
+  since before three of the methods above it existed, which is what a copied
+  count does when nothing measures it. Re-derive it rather than trusting it.
 * **The scope line, as ruled**:
 
   > at campaign end `RadarSource` implements every `SourceHandler` surface
@@ -269,7 +272,7 @@ pins it.
   > the per-pane fetch seam is post-campaign.
 
   Measured beside it, so the sentence is not read wider than it is:
-  `create_fetch_tasks` is one of the twenty-four surfaces `RadarSource` leaves
+  `create_fetch_tasks` is one of the thirty surfaces `RadarSource` leaves
   at their trait default. It is the one that *matters*, because it is the
   overlay fetch door; radar arrives instead through `create_frame_list_task`,
   `list_frames`, `fetch_frame`, `apply_frame_listing` and its own bespoke
@@ -295,6 +298,24 @@ appears at `arm_layer_loop`, `rail_regions` (`ui_timeline.rs`),
 `loop_span_secs_for` (`gui/sync.rs`) and `comes_in_stamped_frames` (`pane.rs`).
 `time_axis`, `frame_horizon`, `min_loop_frames`, `latest_at` and `residency_for`
 are all this shape.
+
+**`paints_in` (2026-09-08) is this shape too, and it exists because a neighbour
+of it was read as answering a question it does not.** `has_data` takes no bounds
+and every implementor answers it extent-blind — five of them are literally
+`!self.state.data.is_empty()` — so it means *"this handler holds a non-empty
+dataset"*. Both overlay dispatch doors gated on it as though it meant *"this
+render will paint something"*, and the difference is a full-size raster: one
+active alert anywhere in the country made a pane over Oklahoma allocate, paint
+and scan a picture in the worker to discover its own extent was empty, which
+`RasterizeOutput::settle_blank` then threw away. The extent question is the
+layer's own to answer — where its features are is not something the shell can
+re-spell without a second authority — so it is a method rather than a cull the
+app tries to write. Two rules govern an override, and both are in the method's
+doc: it may be wrong only in the `true` direction, because a refusal is
+delivered as a blank and **a blank is a clear**; and it is built from the
+rasterizer's *own* cull (`any_feature_paints_in` wraps the expression
+`draw_feature` runs) rather than a second spelling that could disagree with it
+about the dateline.
 
 **A `match` on a concrete layer id stays** when the thing it names is one of:
 

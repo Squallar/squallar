@@ -1424,6 +1424,79 @@ pub fn rasterize_glm_strikes(
     }
 }
 
+/// The geo-AABB cull [`draw_feature`] applies before any projection work.
+///
+/// `false` is "this feature cannot put a pixel in this texture", and it is the
+/// whole of what `draw_feature` decides before it starts projecting. A feature
+/// carrying no [`OverlayFeature::geo_bounds`] is not culled at all — the extent
+/// is unknown, so the safe answer is that it paints.
+///
+/// **Shifted into the texture's frame first**, because
+/// `OverlayFeature::geo_bounds` is the raw GeoJSON extent while a dateline
+/// viewport arrives as e.g. -195..-165. That is the whole reason this is not a
+/// bare `intersects`, and the whole reason it is one function rather than two
+/// spellings: the dispatch door asks the same question one field earlier (see
+/// [`any_feature_paints_in`]) and a second spelling that disagreed with this
+/// one would refuse a raster the rasterizer would have painted.
+fn feature_survives_cull(feature: &OverlayFeature, mb: &MercatorBounds) -> bool {
+    let Some(ref fb) = feature.geo_bounds else {
+        return true;
+    };
+    let tb = GeoBounds {
+        min_lat: merc_y_to_lat(mb.merc_y_min),
+        max_lat: merc_y_to_lat(mb.merc_y_max),
+        min_lon: mb.min_lon,
+        max_lon: mb.max_lon,
+    };
+    let shift = mb.lon_shift(fb.min_lon, fb.max_lon);
+    let shifted = GeoBounds {
+        min_lon: fb.min_lon + shift,
+        max_lon: fb.max_lon + shift,
+        ..*fb
+    };
+    shifted.intersects(&tb)
+}
+
+/// Whether **any** of `features` survives [`feature_survives_cull`] against
+/// `bounds` — the predicate a handler's `SourceHandler::paints_in` is built
+/// from.
+///
+/// The Mercator frame is built once for the whole walk rather than once per
+/// feature, which is the only difference between this and calling the cull in a
+/// loop: `MercatorBounds::from_geo` clamps and transforms two latitudes, and a
+/// national alert list would pay that per item.
+///
+/// # What a `false` here is allowed to conclude, per rasterizer
+///
+/// [`rasterize_nws_alerts`] paints through [`draw_feature`] and nothing else,
+/// so "every feature was culled" and "the pixmap stays empty" are the *same
+/// statement* about it, reached through the same code.
+///
+/// **[`rasterize_spc_outlooks`] is NOT that shape**, and the difference is
+/// worth stating rather than assuming, because the safe-looking reading is that
+/// two polygon layers behave alike. It runs a second painter,
+/// `hatch::draw_hatch_pass`, which walks the features again and **does not
+/// apply this cull at all** — it projects every hatched polygon and relies on
+/// tiny-skia clipping to the pixmap for anything off-texture. The predicate is
+/// still sound there, but by an *argument* and not by a shared implementation:
+/// [`OverlayFeature::geo_bounds`] is computed by `OverlayFeature::new` from the
+/// very polygons the hatch pass projects, so a feature this cull rejects cannot
+/// project inside the texture either. **Re-check that if the hatch pass ever
+/// paints something not derived from `feature.polygons`.**
+///
+/// A rasterizer with a painter of any other shape — a marker whose radius
+/// reaches outside its own centre's box, a wash grown from a station by a fixed
+/// ground distance — is not covered by this at all and must not be gated on it.
+pub fn any_feature_paints_in<'a>(
+    features: impl IntoIterator<Item = &'a OverlayFeature>,
+    bounds: &GeoBounds,
+) -> bool {
+    let mb = MercatorBounds::from_geo(bounds);
+    features
+        .into_iter()
+        .any(|feature| feature_survives_cull(feature, &mb))
+}
+
 fn draw_feature(
     pixmap: &mut Pixmap,
     feature: &OverlayFeature,
@@ -1432,25 +1505,8 @@ fn draw_feature(
     h: f32,
     scale: f32,
 ) {
-    // Geo-AABB cull before any projection work, shifted into the texture's
-    // frame first: `OverlayFeature::geo_bounds` is the raw GeoJSON extent while
-    // a dateline viewport arrives as e.g. -195..-165.
-    if let Some(ref fb) = feature.geo_bounds {
-        let tb = GeoBounds {
-            min_lat: merc_y_to_lat(mb.merc_y_min),
-            max_lat: merc_y_to_lat(mb.merc_y_max),
-            min_lon: mb.min_lon,
-            max_lon: mb.max_lon,
-        };
-        let shift = mb.lon_shift(fb.min_lon, fb.max_lon);
-        let shifted = GeoBounds {
-            min_lon: fb.min_lon + shift,
-            max_lon: fb.max_lon + shift,
-            ..*fb
-        };
-        if !shifted.intersects(&tb) {
-            return;
-        }
+    if !feature_survives_cull(feature, mb) {
+        return;
     }
 
     for polygon in &feature.polygons {
