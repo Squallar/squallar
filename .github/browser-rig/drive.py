@@ -4092,6 +4092,47 @@ def loop_or_refusal(loop_state, budget_state):
     return out
 
 
+ALLOC_PAGE_LEVEL_RE = re.compile(
+    r"alloc failed:.*?(\d+) of (\d+) MiB linear in page")
+
+
+def alloc_line_page_levels(allocs):
+    """**The page's linear level as the ALLOCATION HOOK saw it**, off
+    `alloc failed: N B requested, <level> of <ceiling> MiB linear in page`.
+    Returns `(peak_mib, ceiling_mib)`, either `None` if no line carried one.
+
+    # Why this exists beside the sampler's own reading
+
+    The sampler's `linear_page_mib` comes from the `budget state:` line, which
+    the app's telemetry tick writes -- and that tick is part of the frame loop.
+    When the loop dies the line stops, the sampler keeps returning rows
+    because the PAGE still answers JS, and every later row repeats the last
+    published level. The rows look identical to live ones.
+
+    Measured 2026-09-08 on the four `huge-adcdfdcf9-*` arms: two of them read
+    a sampled peak of 940 and 928 MiB and PASSED `--expect-linear-headroom 64`
+    while the allocation hook on those same arms was printing `1023 of 1024
+    MiB linear in page`. The assert went blind at exactly the moment it exists
+    to fire, and was covered both times by `--expect-no-alloc-failure`, which
+    reads this other route. One pin, two routes.
+
+    The allocation-error hook runs INSIDE the instance that refused, at the
+    instant of refusal, so it reports whether or not the frame loop is alive.
+    `in page` is required in the pattern: the worker is a different heap under
+    a different ceiling and the two are never merged.
+
+    Pure: a list of `{"msg": ...}` in, a tuple out."""
+    peak = ceiling = None
+    for a in allocs or []:
+        m = ALLOC_PAGE_LEVEL_RE.search(str((a or {}).get("msg", "")))
+        if not m:
+            continue
+        lvl, ceil = int(m.group(1)), int(m.group(2))
+        peak = lvl if peak is None else max(peak, lvl)
+        ceiling = ceil if ceiling is None else max(ceiling, ceil)
+    return peak, ceiling
+
+
 def linear_headroom_verdict(peak_mib, ceiling_mib, want_mib):
     """**The page never came within `want_mib` of its own linear ceiling.**
     The verdict behind `--expect-linear-headroom`.
@@ -7449,6 +7490,35 @@ def selftest_wall_verdicts():
     pin("two refusals fail, are counted, and name both instances",
         not v["ok"] and v["count"] == 2
         and v["instances"] == ["page", "raster worker"])
+
+    # `alloc_line_page_levels`, the second route into the headroom verdict.
+    # Fixtures are the real lines off huge-adcdfdcf9-*, including the exact
+    # pair that made the assert a coin flip: a sampled peak of 940 passing at
+    # the moment the hook was printing 1023.
+    PAGE_1023 = {"msg": "alloc failed: 50849246 B requested, 1023 of 1024 "
+                        "MiB linear in page"}
+    PAGE_1002 = {"msg": "alloc failed: 80640 B requested, 1002 of 1024 "
+                        "MiB linear in page"}
+    WORKER = {"msg": "alloc failed: 98000000 B requested, 700 of 1024 "
+                     "MiB linear in raster worker"}
+    peak, ceil = alloc_line_page_levels([PAGE_1002, PAGE_1023])
+    pin("the hook's PEAK page level is taken, not the first or the last",
+        peak == 1023 and ceil == 1024)
+    peak, _ = alloc_line_page_levels([WORKER])
+    pin("a worker refusal contributes NOTHING to the page's level",
+        peak is None)
+    peak, _ = alloc_line_page_levels([])
+    pin("no refusal yields no level rather than a zero", peak is None)
+    # The regression itself, end to end: sampled 940 alone passes, and the two
+    # routes together fail. A one-armed pin here would pass for a fix that
+    # ignored the sampler.
+    v_alone = linear_headroom_verdict(940, 1024, 64)
+    hook, _ = alloc_line_page_levels([PAGE_1023])
+    v_both = linear_headroom_verdict(max(940, hook), 1024, 64)
+    pin("the false green is reproduced by the sampled route ALONE",
+        v_alone["ok"])
+    pin("and the two routes together turn it red at the hook's 1023",
+        not v_both["ok"] and v_both["peak_page_mib"] == 1023)
     return failed
 
 
@@ -8608,9 +8678,22 @@ def run_smoke(args):
                              "nothing sampled the page's linear memory, so "
                              "there is no peak to hold against a ceiling"}
             else:
+                # The HIGHER of the two routes, because they go blind at
+                # different moments: the sampled level stops when the frame
+                # loop stops, the allocation hook reports from inside the
+                # refusing instance whether or not it is alive. Taking the max
+                # is what stops the assert passing at 940 while the hook says
+                # 1023. See `alloc_line_page_levels`.
+                a_peak, a_ceiling = alloc_line_page_levels(allocs)
+                s_peak, s_ceiling = (sampler.peak_page_mib(),
+                                     sampler.page_ceiling_mib())
+                peak = max([v for v in (s_peak, a_peak) if v is not None],
+                           default=None)
+                ceiling = s_ceiling if s_ceiling is not None else a_ceiling
                 result["linear_headroom"] = linear_headroom_verdict(
-                    sampler.peak_page_mib(), sampler.page_ceiling_mib(),
-                    args.expect_linear_headroom)
+                    peak, ceiling, args.expect_linear_headroom)
+                result["linear_headroom"]["peak_sampled_mib"] = s_peak
+                result["linear_headroom"]["peak_alloc_hook_mib"] = a_peak
             stage("linear-headroom", **{k: v for k, v
                                         in result["linear_headroom"].items()
                                         if k != "error"})
