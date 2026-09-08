@@ -1008,6 +1008,38 @@ impl LoopDownloadManager {
         self.plans.insert(pane, plan);
     }
 
+    /// **Whether the plan filed for `pane` still describes the loop it serves**
+    /// — the same site, the same stamps, in the same order.
+    ///
+    /// **The way back.** A plan is a derivation of a loop's frame list and of
+    /// nothing else — `the_frame_list_and_the_frame_plan_describe_the_same_scans`
+    /// pins the two as equal frame for frame where the listing lands — but it
+    /// was only ever *re-derived* on an event: `resample_frames` reporting that
+    /// the list had changed. A queue retired by [`Self::remove_pending`]
+    /// therefore had no way back at all. The list it was derived from had not
+    /// changed, so nothing re-asked for it, and a loop whose queue was retired
+    /// sat holding frames it would never refetch — which is why nothing could
+    /// afford to retire one.
+    ///
+    /// Asked as a **state** and not as an event, it composes: false for a plan
+    /// that was retired, false for one the frame list has moved out from
+    /// under, and true on every pass in between. A caller that re-derives on
+    /// `false` re-derives exactly when the derivation is stale and is a no-op
+    /// the rest of the time, whatever the reason the two came apart.
+    ///
+    /// No allocation, and it stops at the first disagreement: a site compare
+    /// and a few dozen `NaiveDateTime` compares.
+    pub fn plan_describes(
+        &self,
+        pane: usize,
+        site: &str,
+        frames: impl IntoIterator<Item = chrono::NaiveDateTime>,
+    ) -> bool {
+        self.plans
+            .get(&pane)
+            .is_some_and(|plan| plan.site == site && plan.frames.iter().copied().eq(frames))
+    }
+
     /// Derive this pane's download queues for `product`, returning whether
     /// anything changed.
     pub fn plan_downloads_for(&mut self, pane: usize, product: RadarProduct) -> bool {

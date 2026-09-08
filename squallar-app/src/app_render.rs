@@ -5097,14 +5097,41 @@ impl super::App {
                         })
                         .collect()
                 };
+            // **Whether radar's verdict may be believed at all**, read before
+            // the mutable walk. See the radar arm below.
+            let supplied = p.needs_radar_data();
             // Asked of every layer that is animating, not of the radar slot by
             // name (WI-2) - pinned by
             // `the_readiness_walk_settles_every_animating_layer_not_only_radar`.
             for slot in p.animating_layers_mut() {
                 let budget = loop_ready_budget(&allocation, pidx, &slot.time, &budgets);
                 let settled = if slot.id == squallar_source::id::known::RADAR {
-                    // Radar answers both questions out of its own bookkeeping.
-                    settle_radar_loop_phase(loop_mgr, pidx, &mut slot.time, budget)
+                    // **A loop nothing is supplying is not a loop that failed.**
+                    //
+                    // `settle_loop_phase`'s last arm answers "no frame of this
+                    // loop could be rendered" with `*ls = new()`, and it gets
+                    // there through three readings that a withdrawn supply
+                    // makes true together: every frame reads *settled* because
+                    // an untextured frame with no volume cached and nothing in
+                    // flight is settled by `render_set_settled`'s own rule; no
+                    // frame holds a picture, because the release above took
+                    // them; and nothing is *still arriving*, because the queue
+                    // was retired. So the walk that stops spending on a pane
+                    // that needs no radar data would, one pass later, destroy
+                    // the very frame list the way back is refilled from — and
+                    // the layer would come back on to an empty timeline.
+                    //
+                    // Not the same as `false` meaning "not ready": the phase
+                    // is left exactly as the switch-off found it, so a loop
+                    // that was `Playing` is still `Playing` when it returns
+                    // and one still filling resumes filling.
+                    //
+                    // Radar's arm alone. Every other layer answers
+                    // *still arriving* with `|_| true`, which is what already
+                    // stands between a loop with nothing to show and
+                    // `*ls = new()`; radar answers it from its own bookkeeping
+                    // and has no such floor.
+                    supplied && settle_radar_loop_phase(loop_mgr, pidx, &mut slot.time, budget)
                 } else {
                     // Every other layer (WI-5 supplies the residency oracle,
                     // WI-7 the loading state):
@@ -7368,11 +7395,20 @@ impl super::App {
         let allocation = self.observe_loop_demand();
         let budgets = self.budgets;
         let model = LoopFrameModel::from_budgets(&budgets);
-        // Radar loops whose frame list was re-sampled to the allocation in
-        // force this pass: the pane, its product, the loop's site and the list
-        // as it now stands, so the download queue can be re-derived from it
-        // once the panes are released.
-        let mut resampled: Vec<(
+        // Radar loops whose download plan no longer describes their frame
+        // list: the pane, its product, the loop's site and the list as it now
+        // stands, so the plan is re-set from it and the queue re-derived once
+        // the panes are released.
+        //
+        // **A state, not an event, and that is the way back.** This collected
+        // the loops `resample_frames` had just *reported changed*, which meant
+        // a queue could only ever be re-derived by the one act that moved the
+        // list — so a queue retired for any other reason had no way back, and
+        // nothing could afford to retire one. `plan_describes` asks instead
+        // whether the derivation still holds, which is false for a retired
+        // plan and for a moved list alike; the re-sample is now one of the
+        // reasons rather than the only one.
+        let mut rederive: Vec<(
             usize,
             squallar_radar::types::RadarProduct,
             String,
@@ -7385,8 +7421,10 @@ impl super::App {
         // Panes whose 3D loop must let go of every grid it holds **before**
         // anything is built for the new key. See `VolumeStore::retain_set`:
         let mut release_volume_sets: Vec<usize> = Vec::new();
-        // Panes whose loop is no longer active and whose download queue is
-        // therefore serving nobody. Collected for the same borrow reason.
+        // Panes whose loop is serving nobody — switched off, or running on a
+        // layer the pane does not draw — and whose download queue is therefore
+        // buying volumes for pictures no pane can paint. Collected for the same
+        // borrow reason.
         let mut retire_queues: Vec<usize> = Vec::new();
         // Panes that cannot loop at all. Separate from `retire_queues` because
         // that one also releases a 3D loop's resident grid set, and a pane
@@ -7409,6 +7447,48 @@ impl super::App {
         for (pane_idx, pane) in panes.iter_mut().enumerate() {
             if !pane.can_loop() {
                 drop_pending.push(pane_idx);
+                continue;
+            }
+            // **A pane that needs no radar data buys none, renders none and
+            // holds none — including for its loop.**
+            //
+            // `PaneState::refresh_transport` keeps a running timeline's
+            // transport on purpose, so switching a looping layer off leaves
+            // the frame list, the listing and the playhead exactly where they
+            // were and this walk went on spending on them: a volume per frame
+            // still queued, a full-size raster per frame still described onto
+            // the funnel, and every texture already landed still held for the
+            // life of the session. `Gui::live_sites` and
+            // `App::evict_unneeded_loop_scans` closed the *still* picture's
+            // half of the same question on 2026-09-07; neither reached the
+            // loop's, which is where the bytes are — one raster and one
+            // texture per frame instead of one per pane.
+            //
+            // `PaneState::needs_radar_data` and **not**
+            // `is_overlay_enabled(&RADAR)`, which the overlay loops' own arm
+            // asks. The two differ on exactly the panes this walk also serves:
+            // a cross-section or a 3D pane reads the volume without the map
+            // ever drawing a radar image, and the toggle does not speak for
+            // it. Composing the accessor the fetch and the eviction pass both
+            // compose is also what keeps the two passes from disagreeing —
+            // the pane whose volumes eviction drops is the pane this declines
+            // to re-ask for.
+            //
+            // **The pictures go and the stamps stay.**
+            // `evict_textures_outside_render_set(0)` empties `frame.image` and
+            // touches nothing else, and the pane says nothing to
+            // `self.loop_frames` below, so a picture no other pane names is
+            // dropped at `end_pass` and one a sibling still shows is not. The
+            // queue is retired, which used to be the thing that could not be
+            // undone; `LoopDownloadManager::plan_describes` is the way back,
+            // and it re-derives the plan from this same frame list on the
+            // first pass after the layer returns.
+            if !pane.needs_radar_data() {
+                if pane.time_state(&known::RADAR).is_active() {
+                    pane.time_state_mut(&known::RADAR)
+                        .evict_textures_outside_render_set(0);
+                }
+                retire_queues.push(pane_idx);
                 continue;
             }
             let Some(product) = squallar_radar::fields::product_for(&pane.selected_product())
@@ -7469,7 +7549,23 @@ impl super::App {
             );
             if ls.resample_frames(held) {
                 ls.settle_playhead(clock);
-                resampled.push((
+            }
+
+            // **The way back.** The plan is a derivation of the list above and
+            // of nothing else, so the question asked here is whether the
+            // derivation still holds — not whether the act that usually
+            // invalidates it has just run. A re-sample makes it false; so does
+            // a queue retired while the list stood, which is the case that had
+            // no way back before and the reason the walk above can now retire
+            // one. On every other pass the plan describes the list and this is
+            // a site compare and a few dozen stamp compares that change
+            // nothing.
+            if !self.loop_mgr.plan_describes(
+                pane_idx,
+                radar_layer::site(ls),
+                ls.frames.iter().map(|f| f.timestamp),
+            ) {
+                rederive.push((
                     pane_idx,
                     product,
                     radar_layer::site(ls).to_string(),
@@ -7535,7 +7631,7 @@ impl super::App {
         for pane_idx in drop_pending {
             self.loop_mgr.remove_pending(pane_idx);
         }
-        for pane_idx in retire_queues {
+        for &pane_idx in &retire_queues {
             self.loop_mgr.remove_pending(pane_idx);
             // A torn-down 3D loop's grids go with its queue. Without this the
             // resident set outlives the loop that asked for it, and 512 MiB
@@ -7557,14 +7653,14 @@ impl super::App {
                  freed)",
             );
         }
-        // A re-sampled list names volumes the plan may not: the plan is
-        // re-set from the list as it stands and the queue re-derived, so the
-        // frames a balloon added are fetched — and nothing already cached is
-        // fetched twice, since the download dispatch skips the cache.
-        for (pane_idx, product, site, frames) in resampled {
+        // The list names volumes the plan does not: the plan is re-set from
+        // the list as it stands and the queue re-derived, so the frames a
+        // balloon added are fetched and so are the frames a retired queue
+        // stopped asking for — and nothing already cached is fetched twice,
+        // since the download dispatch skips the cache.
+        for (pane_idx, product, site, frames) in rederive {
             log::info!(
-                "Loop: pane {pane_idx} re-sampled its {site} list to {} frames for the \
-                 allocation in force",
+                "Loop: pane {pane_idx} re-derived its {site} download queue from a {}-frame list",
                 frames.len(),
             );
             self.loop_mgr
@@ -7609,6 +7705,17 @@ impl super::App {
 
         for pane_idx in 0..pane_count {
             if self.gui.pane_cannot_loop(pane_idx) {
+                continue;
+            }
+            // **The walk above's verdict, carried — not asked again.** A pane
+            // whose loop serves nobody had its queue retired and its pictures
+            // released up there; describing a raster for it here would put
+            // back, every pass, exactly what that release just took. The set
+            // is read rather than re-derived so the two halves of this one
+            // function cannot come to different answers about the same pane:
+            // a loop that is merely `Inactive` is in it too, and the phase
+            // check below would have caught only that half.
+            if retire_queues.contains(&pane_idx) {
                 continue;
             }
             let Some(pane) = self.gui.pane(pane_idx) else {
@@ -9643,6 +9750,12 @@ mod disabled_layer_render_tests;
 #[path = "app_render/disabled_layer_loop_tests.rs"]
 #[cfg(test)]
 mod disabled_layer_loop_tests;
+
+/// Radar's own half of it: the way back a retired queue never had, and the
+/// supply a pane stops spending on a radar loop whose data it does not need.
+#[path = "app_render/disabled_radar_loop_tests.rs"]
+#[cfg(test)]
+mod disabled_radar_loop_tests;
 
 #[path = "app_render/loop_dispatch_tests.rs"]
 #[cfg(test)]
