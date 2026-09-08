@@ -203,6 +203,19 @@ PAGE_PRELUDE = b"""<script>/* squallar rig prelude (injected by serve.py, repo u
     window.Date = PinnedDate;
     window.__rig_pin_clock = { pin_ms: PIN, offset_ms: off };
   }
+  // THE PAGE'S CLOCK, REACHABLE FROM A WEBDRIVER SCRIPT. A driver's
+  // `execute` does not always run where this prelude ran: geckodriver
+  // evaluates in a Marionette sandbox whose `Date` is the untouched
+  // intrinsic, so `Date.now()` there reads the REAL clock while every
+  // timestamp this prelude stamps is on the pinned one. Subtracting the two
+  // is how a live frame loop was reported as stopped for ~23 h on every
+  // pinned firefox leg. An expando IS reachable from that sandbox (measured
+  // on geckodriver 0.37.1 / firefox 154: `window.__rig_now()` pinned,
+  // bare `Date.now()` real, `window.Date === Date` false), so a driver that
+  // wants THIS page's clock calls this and never its own `Date`.
+  // Defined whether or not a pin is installed, so the caller has one route
+  // rather than two and an unpinned leg exercises the same one.
+  window.__rig_now = function () { return Date.now(); };
   var E = (window.__rig_errors = []);
   // 1200 entries, and it STAYS 1200. The cap is a page-memory bound, not a
   // display window: `msg` is truncated at 2000 chars, so the ring's worst

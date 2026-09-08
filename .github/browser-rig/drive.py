@@ -91,6 +91,7 @@ Typical use (see run_smoke.sh for the orchestrated version):
 
 import argparse
 import base64
+import datetime
 import errno
 import inspect
 import json
@@ -3815,6 +3816,152 @@ def hist_stats(counts):
             "max_us": hist_window_max_us(counts)}
 
 
+# The page's own `Date.now()`, fetched by a route that survives a driver
+# whose script context is not the page. `serve.py`'s prelude defines
+# `window.__rig_now` (an EXPANDO -- see the comment there for why a bare
+# `Date` will not do).
+PAGE_CLOCK_PROBE = r"""
+var pin = window.__rig_pin_clock || null;
+return { page: (typeof window.__rig_now === "function") ? window.__rig_now() : null,
+         driver: Date.now(),
+         pin_ms: pin ? pin.pin_ms : null,
+         offset_ms: pin ? pin.offset_ms : null };
+"""
+
+# Two reads in ONE script, so the residual below is a clock difference and
+# never a round trip. Anything past a few seconds means the model is wrong,
+# not that the box was busy.
+PAGE_CLOCK_SKEW_TOLERANCE_MS = 5000.0
+
+
+def parse_pin_clock(text):
+    """`2026-09-07T07:22:00Z` -> ms since the epoch. Deliberately the same
+    shape and the same refusals as `serve.py`'s parser: the two ends of a
+    pinned leg must agree on what the string means or the check below is
+    comparing an instant to a typo."""
+    if not text.endswith("Z"):
+        raise ValueError("%r must be UTC and end in Z" % text)
+    try:
+        when = datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        raise ValueError("%r is not YYYY-MM-DDTHH:MM:SSZ" % text)
+    return int(when.replace(tzinfo=datetime.timezone.utc).timestamp() * 1000)
+
+
+def page_clock_verdict(probe, expect_pin_ms=None):
+    """`PAGE_CLOCK_PROBE`'s return -> {now_ms, problem}: the clock every
+    page-side timestamp is stamped on, and the reason it cannot be trusted
+    when there is one.
+
+    **Why this is not `Date.now()`.** Every `t` this rig diffs is stamped by
+    serve.py's page prelude. A driver's `execute` may run somewhere else:
+    chromedriver evaluates in the page's main world and reads the same clock,
+    geckodriver evaluates in a Marionette sandbox holding the untouched `Date`
+    intrinsic. Under `--pin-clock` those are ~23 h apart, and subtracting one
+    from the other reported a live frame loop as stopped on EVERY pinned
+    firefox leg -- a verdict about frames produced by an instrument that had
+    lost track of which clock it was on.
+
+    **The check is an identity, not a threshold.** A pinned page and an
+    unpinned driver SHOULD disagree, by exactly the offset the prelude
+    published, so "they differ by more than an hour" would fire on every
+    healthy pinned firefox leg. Under a pin there are TWO healthy shapes and
+    the driver picks which: chromium evaluates in the page's world, so
+    `page - driver == 0`; firefox evaluates in a sandbox on the real clock,
+    so `page - driver == offset_ms`. Either is accepted; anything else means
+    a clock nobody declared has moved and no staleness figure is meaningful.
+    With no pin installed the only healthy shape is `page - driver == 0`.
+
+    **What this can and cannot see.** When `__rig_now` answers, it is the
+    prelude's own clock by construction -- the same one that stamps every
+    reading -- so the returned figure is right whether or not the cross-check
+    below could discriminate. The cross-check earns its place on the cases it
+    CAN catch: a driver clock skewed by something neither shape explains, an
+    undeclared shim on an unpinned leg, and the mirror of the original bug --
+    a pin the page published with no `__rig_now` to read the clock it moved,
+    where the rig would otherwise fall back to the driver's clock silently.
+    It cannot cross-check a pinned page against a pinned driver: there is
+    only one clock in that reading and nothing independent to compare."""
+    probe = probe or {}
+    page = probe.get("page")
+    driver = probe.get("driver")
+    pin_ms = probe.get("pin_ms")
+    offset = probe.get("offset_ms")
+    # THE MIRROR FAILURE, AND IT NEVER ANNOUNCES ITSELF. Comparing two clocks
+    # cannot tell a pinned leg from an unpinned one -- both are self-
+    # consistent. A leg launched with `--pin-clock` whose page published no
+    # pin reads plausible from end to end: sane staleness, sane counts, a
+    # scene that renders. What it is doing is listing today's data while the
+    # seeded scene expects a fixed archive window, so the leg silently stops
+    # being the leg anyone thought they ran. Only the variable the pin
+    # actually sets can see it.
+    if expect_pin_ms is not None:
+        fallback = page if page is not None else driver
+        if pin_ms is None:
+            return {"now_ms": fallback, "problem":
+                    "this leg was launched for a clock pinned at %d but the "
+                    "page published NO pin (`window.__rig_pin_clock` is "
+                    "absent), so serve.py's --pin-clock never reached it. "
+                    "Every page-side timestamp is on the REAL clock while the "
+                    "seeded scene expects the pinned archive window -- a leg "
+                    "in that state reads plausible all the way through, which "
+                    "is why this is checked and not inferred"
+                    % expect_pin_ms}
+        if pin_ms != expect_pin_ms:
+            return {"now_ms": fallback, "problem":
+                    "this leg was launched for a clock pinned at %d but the "
+                    "page is pinned at %d, a %d ms difference. The scene was "
+                    "seeded for one archive window and the page's clock is in "
+                    "another"
+                    % (expect_pin_ms, pin_ms, pin_ms - expect_pin_ms)}
+    if page is None:
+        # No `__rig_now`: an un-instrumented page, or a prelude that did not
+        # run. Falling back to the driver's clock is right ONLY when nothing
+        # shifted the page's -- and a published pin proves something did.
+        if offset is not None:
+            return {"now_ms": driver, "problem":
+                    "the page published a clock pin (pin_ms=%s, offset_ms=%s) "
+                    "but exposes no `window.__rig_now`, so the only clock this "
+                    "rig can read is the DRIVER's and every page-side "
+                    "timestamp is on the PINNED one. serve.py's prelude "
+                    "defines `__rig_now`; a page without it is either not "
+                    "served through serve.py or its prelude did not run"
+                    % (pin_ms, offset)}
+        return {"now_ms": driver, "problem": None}
+    if driver is None:
+        return {"now_ms": page, "problem": None}
+    # Candidates: the driver shares the page's clock, or (under a pin) it is
+    # on the real one. Both are healthy; the smallest residual is the shape
+    # the driver is actually in.
+    candidates = [("driver shares the page clock", 0)]
+    if offset is not None:
+        candidates.append(("driver is on the real clock", offset))
+    best = min(candidates, key=lambda c: abs(page - driver - c[1]))
+    residual = page - driver - best[1]
+    if abs(residual) > PAGE_CLOCK_SKEW_TOLERANCE_MS:
+        tried = " or ".join("%s (%+d ms)" % (n, o) for n, o in candidates)
+        return {"now_ms": page, "problem":
+                "the page clock and the driver clock disagree by %d ms that "
+                "no declared shape explains: page `window.__rig_now()` reads "
+                "%d, the driver's own `Date.now()` reads %d, a raw difference "
+                "of %d ms, against %s. The rig cannot say which clock the "
+                "page-side timestamps are on, so no staleness figure is "
+                "meaningful"
+                % (int(residual), page, driver, page - driver, tried)}
+    return {"now_ms": page, "problem": None}
+
+
+def page_now_ms(session, expect_pin_ms=None):
+    """`page_clock_verdict` over a live session."""
+    try:
+        probe = session.execute(PAGE_CLOCK_PROBE)
+    except Exception as e:  # a driver that cannot run a script at all
+        return {"now_ms": None, "problem":
+                "the page clock could not be read: %s: %s"
+                % (type(e).__name__, e)}
+    return page_clock_verdict(probe, expect_pin_ms)
+
+
 def loop_or_refusal(loop_state, budget_state):
     """A seeded loop either PLAYED or was REFUSED BY A DOOR THAT SAID SO --
     never neither. The verdict behind `--expect-loop-or-refusal`.
@@ -6931,6 +7078,139 @@ def selftest_loop_or_refusal():
     return failed
 
 
+def selftest_page_clock():
+    """Executable pins on `page_clock_verdict`, the guard between a driver's
+    clock and the page's. Both arms of every branch: a one-armed set here
+    would pass for a predicate that never reports a problem, which is exactly
+    the shape that shipped -- `frame_progress` subtracted two clocks for
+    months and nothing could fail. Returns the number of failed pins."""
+    failed = 0
+
+    def pin(name, ok):
+        nonlocal failed
+        print("[self-test] %s %s" % ("ok  " if ok else "FAIL", name))
+        if not ok:
+            failed += 1
+
+    PIN_MS = 1788765720000          # 2026-09-07T07:22:00Z, the `long` leg's pin
+    REAL = 1788851885922            # a real clock ~23.9 h later
+    OFF = PIN_MS - REAL
+
+    # Chromium under a pin: the driver evaluates in the page's world, so both
+    # reads are already the pinned clock and the offset is not applied twice.
+    v = page_clock_verdict({"page": PIN_MS + 600, "driver": PIN_MS + 600,
+                            "pin_ms": PIN_MS, "offset_ms": OFF})
+    pin("a pinned page whose driver shares its clock is NOT flagged",
+        v["problem"] is None and v["now_ms"] == PIN_MS + 600)
+
+    # Firefox under a pin: the sandbox holds the real clock. Healthy -- the
+    # published offset accounts for the whole difference -- and the returned
+    # figure is the PAGE's.
+    v = page_clock_verdict({"page": PIN_MS + 600, "driver": REAL + 600,
+                            "pin_ms": PIN_MS, "offset_ms": OFF})
+    pin("a pinned page and an unpinned driver ~23.9 h apart is HEALTHY, and "
+        "the page clock is what comes back",
+        v["problem"] is None and v["now_ms"] == PIN_MS + 600)
+
+    # A driver clock in neither declared shape -- not sharing the page's and
+    # not the real one either. Two healthy shapes exist under a pin, so the
+    # fixture has to miss BOTH to be a fault at all.
+    skewed = REAL + 600 + 7200000
+    v = page_clock_verdict({"page": PIN_MS + 600, "driver": skewed,
+                            "pin_ms": PIN_MS, "offset_ms": OFF})
+    pin("a driver clock matching NEITHER declared shape is flagged, and the "
+        "message names both clocks, the raw difference and what it tried",
+        v["problem"] is not None
+        and "window.__rig_now" in v["problem"]
+        and str(PIN_MS + 600) in v["problem"] and str(skewed) in v["problem"]
+        and "driver shares the page clock" in v["problem"]
+        and "driver is on the real clock" in v["problem"])
+
+    # And the shape that is NOT a fault however far apart the two numbers
+    # look: chromium under a pin reads one clock twice.
+    v = page_clock_verdict({"page": PIN_MS + 600, "driver": PIN_MS + 600,
+                            "pin_ms": PIN_MS, "offset_ms": OFF})
+    pin("a pinned page read by a pinned driver is not flagged for the offset "
+        "it never applied", v["problem"] is None)
+
+    # No pin anywhere: the two clocks must simply agree.
+    v = page_clock_verdict({"page": REAL, "driver": REAL + 3,
+                            "pin_ms": None, "offset_ms": None})
+    pin("an unpinned page and driver within tolerance is NOT flagged",
+        v["problem"] is None and v["now_ms"] == REAL)
+    v = page_clock_verdict({"page": PIN_MS, "driver": REAL,
+                            "pin_ms": None, "offset_ms": None})
+    pin("an unpinned page disagreeing with its driver IS flagged (some other "
+        "shim moved a clock nobody declared), and with no pin the only shape "
+        "it can name is the sharing one",
+        v["problem"] is not None
+        and "driver shares the page clock" in v["problem"]
+        and "driver is on the real clock" not in v["problem"])
+
+    # The mirror of the original bug: a pin the page published but no route
+    # to the clock it moved.
+    v = page_clock_verdict({"page": None, "driver": REAL,
+                            "pin_ms": PIN_MS, "offset_ms": OFF})
+    pin("a published pin with no `__rig_now` is flagged as an instrument "
+        "condition and still returns a usable number",
+        v["problem"] is not None and "no `window.__rig_now`" in v["problem"]
+        and v["now_ms"] == REAL)
+
+    # An un-instrumented page with nothing shifted is not a problem.
+    v = page_clock_verdict({"page": None, "driver": REAL,
+                            "pin_ms": None, "offset_ms": None})
+    pin("no pin and no `__rig_now` falls back to the driver clock silently",
+        v["problem"] is None and v["now_ms"] == REAL)
+
+    # Tolerance is a boundary, so both sides of it are pinned.
+    v = page_clock_verdict({"page": REAL + int(PAGE_CLOCK_SKEW_TOLERANCE_MS) - 1,
+                            "driver": REAL, "pin_ms": None, "offset_ms": None})
+    pin("a skew just inside the tolerance passes", v["problem"] is None)
+    v = page_clock_verdict({"page": REAL + int(PAGE_CLOCK_SKEW_TOLERANCE_MS) + 1,
+                            "driver": REAL, "pin_ms": None, "offset_ms": None})
+    pin("a skew just outside the tolerance fails", v["problem"] is not None)
+
+    v = page_clock_verdict(None)
+    pin("an empty probe does not raise", v["now_ms"] is None)
+
+    # THE MIRROR: a leg that believes it is pinned and is not. Both arms,
+    # because the whole point is that the numbers look fine either way.
+    healthy = {"page": PIN_MS + 600, "driver": REAL + 600,
+               "pin_ms": PIN_MS, "offset_ms": OFF}
+    v = page_clock_verdict(healthy, expect_pin_ms=PIN_MS)
+    pin("a leg expecting a pin, on a page that has it, is not flagged",
+        v["problem"] is None)
+
+    unpinned = {"page": REAL + 600, "driver": REAL + 600,
+                "pin_ms": None, "offset_ms": None}
+    v = page_clock_verdict(unpinned)
+    pin("that same unpinned page is SELF-CONSISTENT and passes when nothing "
+        "expected a pin -- which is why two clocks alone cannot see this",
+        v["problem"] is None)
+    v = page_clock_verdict(unpinned, expect_pin_ms=PIN_MS)
+    pin("and IS flagged the moment the leg says it expected one",
+        v["problem"] is not None
+        and "published NO pin" in v["problem"]
+        and str(PIN_MS) in v["problem"])
+
+    wrong = {"page": PIN_MS + 600, "driver": REAL + 600,
+             "pin_ms": PIN_MS + 3600000, "offset_ms": OFF}
+    v = page_clock_verdict(wrong, expect_pin_ms=PIN_MS)
+    pin("a page pinned to the WRONG instant is flagged and both instants are "
+        "named", v["problem"] is not None
+        and str(PIN_MS) in v["problem"] and str(PIN_MS + 3600000) in v["problem"])
+
+    pin("the drive-side pin parser agrees with serve.py's on the `long` pin",
+        parse_pin_clock("2026-09-07T07:22:00Z") == PIN_MS)
+    for bad in ("2026-09-07T07:22:00", "not-a-time", "2026-09-07 07:22:00Z"):
+        try:
+            parse_pin_clock(bad); ok = False
+        except ValueError:
+            ok = True
+        pin("the pin parser refuses %r rather than guessing a zone" % bad, ok)
+    return failed
+
+
 def selftest_wall_verdicts():
     """Executable pins on `linear_headroom_verdict` and
     `alloc_failure_verdict`. Both arms of each, plus the absent-reading case
@@ -6982,6 +7262,8 @@ def selftest():
     if selftest_wall_verdicts():
         failures.append("linear-headroom / alloc-failure verdicts "
                         "(see [self-test] lines)")
+    if selftest_page_clock():
+        failures.append("page/driver clock guard (see [self-test] lines)")
     failures += selftest_android()
     failures += selftest_adapters()
     failures += selftest_tile_cache_settles()
@@ -7067,6 +7349,10 @@ def run_smoke(args):
     tag = args.tag or args.browser
     tmp_root = args.tmp_dir  # None = system default; see launch() for why
     window = tuple(int(v) for v in args.window.split("x"))
+    # Parsed HERE and not at each use: a malformed pin string must stop the
+    # leg before a browser is launched, not two minutes in beside a verdict.
+    expect_pin_ms = (parse_pin_clock(args.expect_pinned_clock)
+                     if getattr(args, "expect_pinned_clock", None) else None)
 
     result = {
         "tag": tag, "browser": args.browser, "url": args.url,
@@ -7728,15 +8014,16 @@ def run_smoke(args):
             frames_watch.poll()
             span_ms = args.expect_frame_progress * 1000.0
             rs = frames_watch.readings("cadence")
-            now_ms = session.execute("return Date.now();")
+            clock = page_now_ms(session, expect_pin_ms)
+            now_ms = clock["now_ms"]
             fp = {"ok": False, "window_s": args.expect_frame_progress,
                   "readings": len(rs)}
-            if not rs:
-                fp["error"] = (
-                    "no `frame cadence` reading was ever scraped: either the "
-                    "leg did not seed squallar.frame_telemetry, or the frame "
-                    "loop died before the first 2 s emission")
-            else:
+            # The reading facts are recorded whatever the clock did. They
+            # are stamped page-side and the count diff below never touches
+            # `now_ms`, so they stay readable -- and recomputable by hand --
+            # on a leg whose clock the rig could not establish.
+            inside = []
+            if rs:
                 newest = rs[-1]
                 inside = [r for r in rs if newest["t"] - r["t"] <= span_ms]
                 fp.update(newest_t=newest["t"], newest_n=newest["n"],
@@ -7744,6 +8031,21 @@ def run_smoke(args):
                                     else int(now_ms - newest["t"])),
                           in_window=len(inside),
                           first_n=(inside[0]["n"] if inside else None))
+            if clock["problem"]:
+                # An instrument that lost its clock reports THAT. Saying "the
+                # frame loop stopped" here would be a verdict about the app
+                # made by a rig that cannot measure, which is the defect this
+                # whole path exists to have stopped making.
+                fp["instrument_error"] = clock["problem"]
+                fp["error"] = ("frame progress COULD NOT BE MEASURED: %s"
+                               % clock["problem"])
+            elif not rs:
+                fp["error"] = (
+                    "no `frame cadence` reading was ever scraped: either the "
+                    "leg did not seed squallar.frame_telemetry, or the frame "
+                    "loop died before the first 2 s emission")
+            else:
+                newest = rs[-1]
                 stale_bad = (now_ms is not None
                              and now_ms - newest["t"] > span_ms)
                 if stale_bad:
@@ -7785,9 +8087,16 @@ def run_smoke(args):
         # for why silence is a zero and an absent line is an error.
         if args.expect_tile_cache_settles:
             totals_watch.poll()
-            now_ms = session.execute("return Date.now();")
+            # Same clock, same reason. Latent while `tilecache` is unpinned in
+            # run_tier2.sh and live the moment anyone pins it.
+            clock = page_now_ms(session, expect_pin_ms)
             tcs = tile_cache_settles(totals_watch, args.expect_tile_cache_settles,
-                                     now_ms)
+                                     clock["now_ms"])
+            if clock["problem"]:
+                tcs["ok"] = False
+                tcs["instrument_error"] = clock["problem"]
+                tcs["error"] = ("the tile-cache settle COULD NOT BE MEASURED: "
+                                "%s" % clock["problem"])
             result["tile_cache_settles"] = tcs
             stage("tile-cache-settles", ok=tcs["ok"], window_s=tcs["window_s"],
                   snap_flips=tcs["snap_flips"], settled_s=tcs["settled_s"],
@@ -9376,6 +9685,16 @@ def main(argv=None):
                          "every screenshot and rAF check still passes. Needs "
                          "the squallar.frame_telemetry seed; a leg that never "
                          "wrote the line fails with that stated")
+    ap.add_argument("--expect-pinned-clock", default=None,
+                    metavar="ISO8601-UTC",
+                    help="assert the PAGE reports a clock pinned to this "
+                         "instant, i.e. that serve.py's --pin-clock actually "
+                         "reached it. Pass the same string the server got. "
+                         "Nothing else can see this: a leg whose pin silently "
+                         "failed to apply is self-consistent -- sane "
+                         "staleness, sane counts, a scene that renders -- "
+                         "while listing today's data instead of the archive "
+                         "window its scene was seeded for")
     ap.add_argument("--sample-tsv", default=None, metavar="PATH",
                     help="APPEND one census row every --sample-interval "
                          "seconds to PATH, through the settle and the data "

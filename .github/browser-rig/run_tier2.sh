@@ -1164,6 +1164,9 @@ run_pass() {
     # WIDELOOP block above for the seed's composition and for the sampler.
     SEED="$WIDELOOP_SEED_LS"
     server_args+=(--pin-clock "$LONG_PIN_CLOCK")
+    # Both ends of the pin, so a pin that did not reach the page is a named
+    # failure rather than a leg that quietly measured today.
+    drive_args+=(--expect-pinned-clock "$LONG_PIN_CLOCK")
     drive_args+=(--expect-loop-or-refusal)
     drive_args+=(--canvas "$WIDELOOP_CANVAS" --expect-canvas
                  --window "$WIDELOOP_WINDOW"
@@ -1183,6 +1186,9 @@ run_pass() {
     # big fails instead of quietly reporting a small one.
     SEED="$LONG_SEED_LS"
     server_args+=(--pin-clock "$LONG_PIN_CLOCK")
+    # Both ends of the pin, so a pin that did not reach the page is a named
+    # failure rather than a leg that quietly measured today.
+    drive_args+=(--expect-pinned-clock "$LONG_PIN_CLOCK")
     drive_args+=(--expect-loop-or-refusal)
     drive_args+=(--canvas "$HUGE_CANVAS" --expect-canvas
                  --window "$HUGE_WINDOW"
@@ -1212,6 +1218,9 @@ run_pass() {
     # assertions onto it would only make a slow leg slower.
     SEED="$LONG_SEED_LS"
     server_args+=(--pin-clock "$LONG_PIN_CLOCK")
+    # Both ends of the pin, so a pin that did not reach the page is a named
+    # failure rather than a leg that quietly measured today.
+    drive_args+=(--expect-pinned-clock "$LONG_PIN_CLOCK")
     # Played, or refused and said so. Once the web's admission doors enforce,
     # this seeded loop is refused by design; without this the leg goes green
     # for a scene that did nothing, and a green nobody can interpret is
