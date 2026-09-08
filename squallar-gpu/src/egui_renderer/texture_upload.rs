@@ -415,6 +415,16 @@ pub struct TextureUploads {
     /// [`UploadTotals::progress`] at the last line [`Self::report`] logged, so
     /// a frame that moved nothing costs one `u64` compare and says nothing.
     reported: u64,
+    /// Whether this instance publishes into `squallar_egui::heap_census`.
+    ///
+    /// Those families are process-wide slots, each holding one level, so each
+    /// has one owner. The renderer built on a device is it. A device-less
+    /// fixture is not: a process can hold several of those at once, and their
+    /// stores would land in one another's slot between a publisher's store
+    /// and its reader's load. That is not a hypothetical - it is where
+    /// `the_census_carries_the_resident_texture_level` read another test's
+    /// zero, and a level published by whoever stored last is not a level.
+    census_publisher: bool,
 }
 
 /// What is left of one texture's upload.
@@ -454,10 +464,15 @@ impl TextureUploads {
             resident: ResidentTextures::default(),
             reported: 0,
             whole_spent: 0,
+            census_publisher: true,
         }
     }
 
     /// Uploads with no device to ask, for a host test: bands, never DMA.
+    ///
+    /// **Publishes nothing.** See [`Self::census_publisher`]: a binary may
+    /// hold any number of these at once, so none of them owns a census slot.
+    /// The one fixture that does is [`Self::without_device_on_census`].
     #[cfg(test)]
     pub fn without_device() -> Self {
         Self {
@@ -470,6 +485,29 @@ impl TextureUploads {
             resident: ResidentTextures::default(),
             reported: 0,
             whole_spent: 0,
+            census_publisher: false,
+        }
+    }
+
+    /// The device-less fixture that **owns** this process's census slots, for
+    /// the one test that reads one back.
+    ///
+    /// Exactly one may exist per test binary, and that is this constructor's
+    /// job rather than a convention a reader has to keep: a second call
+    /// panics. A rule kept by comment is what failed here before - the
+    /// asserting test said "one test, not several" and got one *asserting*
+    /// test while every sibling went on publishing.
+    #[cfg(test)]
+    pub fn without_device_on_census() -> Self {
+        static CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        assert!(
+            !CLAIMED.swap(true, std::sync::atomic::Ordering::SeqCst),
+            "the census slots already have a publisher in this binary; a \
+             second one stores between the first's publish and its read",
+        );
+        Self {
+            census_publisher: true,
+            ..Self::without_device()
         }
     }
 
@@ -856,7 +894,9 @@ impl TextureUploads {
             })
             .map(|(_, band)| band.image.as_raw().len() as u64)
             .sum();
-        squallar_egui::heap_census::set_upload_pending_bytes(bytes);
+        if self.census_publisher {
+            squallar_egui::heap_census::set_upload_pending_bytes(bytes);
+        }
     }
 
     /// Publish what the DEVICE is holding in egui's texture population, for
@@ -872,12 +912,14 @@ impl TextureUploads {
     ///
     /// # What it costs
     ///
-    /// One field read and one `Relaxed` store. The level is maintained at the
-    /// create, replace and free sites above; nothing walks the population, so
-    /// this may sit on the frame thread's own path the way
+    /// One bool test, one field read and one `Relaxed` store. The level is
+    /// maintained at the create, replace and free sites above; nothing walks
+    /// the population, so this may sit on the frame thread's own path the way
     /// [`Self::publish_pending_level`] does.
     fn publish_resident_level(&self) {
-        squallar_egui::heap_census::set_gpu_texture_bytes(self.resident.bytes());
+        if self.census_publisher {
+            squallar_egui::heap_census::set_gpu_texture_bytes(self.resident.bytes());
+        }
     }
 
     /// Forget everything egui retired this frame.

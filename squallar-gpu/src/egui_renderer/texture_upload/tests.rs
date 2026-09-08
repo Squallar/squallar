@@ -764,11 +764,17 @@ fn an_atlas_page_costs_its_page_and_not_the_sum_of_its_tiles() {
 
 /// **The published census level is the renderer's own resident figure.**
 ///
-/// One test, not several: the census is a set of process-wide statics and two
-/// publishers racing in one test binary would read each other's stores.
+/// The census is a set of process-wide statics, so two publishers in one test
+/// binary would store into each other's slots. The fixture is what keeps that
+/// from happening: [`TextureUploads::without_device_on_census`] is the only
+/// publisher this binary can build and refuses to be built twice, and every
+/// other fixture here publishes nothing. The comment this replaced asked for
+/// "one test, not several" and got one *asserting* test - the siblings' five
+/// `free` sites went on publishing, and this assertion read one of their
+/// zeroes roughly one workspace run in five.
 #[test]
 fn the_census_carries_the_resident_texture_level() {
-    let mut uploads = TextureUploads::without_device();
+    let mut uploads = TextureUploads::without_device_on_census();
     let id = egui::TextureId::User(5);
     uploads.note_resident_for_test(id, [512, 512]);
     // `free` publishes, and it is the only publish this fixture can reach
