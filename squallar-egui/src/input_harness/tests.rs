@@ -9495,6 +9495,70 @@ fn the_site_pill_popover_searches_and_switches() {
     assert!(h.pill_popover().is_none(), "a pick closes the popover");
 }
 
+/// **A site picker nobody opened assembles no site sections.**
+///
+/// `Gui::site_sections` is not a read. It clones the whole favourites list,
+/// walks every visible pane to build the "in other panes" rows, and — the
+/// moment the app has a location fix — ranks the ENTIRE radar table by
+/// distance and sorts it, for five rows. The pill row used to build it at the
+/// head of `site_pill_popover`, once per visible pane, and hand it to an
+/// `egui::Popup::menu(..).show(..)` body that egui does not run while the
+/// popup is closed (`containers/popup.rs`: `show` returns `None` before
+/// invoking its content when the popup is not open). So every frame of a pan,
+/// a zoom or a scrub paid for one dropped `SiteSections` per pane. On this
+/// harness's own two-pane scene, measured off a temporary counting
+/// `#[global_allocator]` and repeat-identical across three runs: **4
+/// allocations and 624 bytes per frame** with a fix and nothing starred, **16
+/// allocations and 1,056 bytes per frame** with a fix, three favourites and
+/// the second pane on another site — plus, in both, two rank-and-sort passes
+/// over the whole site table this process resolved.
+///
+/// The sections are now assembled inside that body. This pins the property
+/// rather than the saving: **zero models on a frame with no picker open, one
+/// on the frame whose picker is open.** The second half is what stops the fix
+/// from being "never build them", which would empty the picker.
+///
+/// Counted rather than inferred: a dropped `Vec` tree leaves no trace in any
+/// figure downstream of it.
+#[test]
+fn a_frame_with_no_site_picker_open_assembles_no_site_sections() {
+    let mut h = pill_harness();
+    h.warm_up();
+    assert!(
+        h.pill_popover().is_none(),
+        "premise: no pill popover may be open on the closed frame"
+    );
+    assert_eq!(
+        h.pill_rows().len(),
+        2,
+        "premise: both panes must draw a pill row, so a per-pane build is          visible as more than one"
+    );
+
+    crate::ui::site_sections_build_count::reset();
+    h.frame();
+    let closed = crate::ui::site_sections_build_count::read();
+    assert_eq!(
+        closed, 0,
+        "a frame with no site picker open assembled {closed} site-section          model(s). Each is a favourites clone, a pane walk and — with a fix          present — a distance ranking of the whole radar table, dropped          without being drawn."
+    );
+
+    let (_, pill) = h.pill(0, PillKind::Site).expect("pane 0 draws a site pill");
+    h.mouse_click(pill.center());
+    h.frame();
+    assert!(
+        h.pill_popover().is_some(),
+        "premise: the click must have opened the site picker"
+    );
+
+    crate::ui::site_sections_build_count::reset();
+    h.frame();
+    let open = crate::ui::site_sections_build_count::read();
+    assert_eq!(
+        open, 1,
+        "a frame with the site picker OPEN assembled {open} site-section          model(s). One is what the picker draws from; zero would be a picker          with no shortcuts in it, and more than one is the same waste moved          rather than removed."
+    );
+}
+
 /// 73e. **The product and tilt popovers offer the combos' own lists, and a pick
 /// writes the pane — with the product pick resetting the tilt.**
 #[test]

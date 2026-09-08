@@ -1046,6 +1046,33 @@ fn sync_pill_hover(
     text
 }
 
+/// How many [`Gui::site_sections`] models have been assembled on this thread
+/// — the counter behind
+/// `a_frame_with_no_site_picker_open_assembles_no_site_sections`.
+///
+/// Test-only, and a thread-local because [`Gui::site_sections`] takes `&self`.
+#[cfg(test)]
+pub(crate) mod build_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static BUILT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn note() {
+        BUILT.with(|c| c.set(c.get().wrapping_add(1)));
+    }
+
+    /// Section models built on this thread since the last [`reset`].
+    pub(crate) fn read() -> u64 {
+        BUILT.with(Cell::get)
+    }
+
+    pub(crate) fn reset() {
+        BUILT.with(|c| c.set(0));
+    }
+}
+
 impl super::Gui {
     /// The shortcut sections pane `idx`'s site picker offers.
     ///
@@ -1056,7 +1083,17 @@ impl super::Gui {
     /// inspector route runs with the active pane `mem::take`n out of the
     /// vector, so the slot holds a placeholder that would answer for the wrong
     /// site.
+    ///
+    /// **Not free, and not to be built speculatively.** It clones the whole
+    /// favourites list, walks every visible pane for the "in other panes"
+    /// rows, and — the moment the app has a location fix — ranks the *entire*
+    /// process radar table by distance and sorts it, for five rows. Every
+    /// caller therefore builds it where it draws it: the pill's inside the
+    /// popup body egui skips while the picker is closed, the inspector's
+    /// inside the panel it fills.
     pub(super) fn site_sections(&self, idx: PaneId, current: &str) -> SiteSections {
+        #[cfg(test)]
+        build_count::note();
         // Deliberately NOT `Gui::live_sites`, which filters to panes watching
         // live — the right predicate for the chunk feed, the wrong one here. A
         // pane parked in the archive is still a pane showing a site.
@@ -1431,11 +1468,14 @@ impl super::Gui {
         current: &str,
         actions: &mut Vec<GuiAction>,
     ) {
-        let sections = self.site_sections(idx, current);
         let shown = egui::Popup::menu(pill)
             .id(pill_popup_id(idx, PillKind::Site))
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
+                // Inside the body, not above the popup: egui runs this closure
+                // only while the picker is open, and the sections are not a
+                // read — see `site_sections`.
+                let sections = self.site_sections(idx, current);
                 ui.set_min_width(SITE_POPOVER_WIDTH);
                 let search = ui.add(
                     egui::TextEdit::singleline(&mut self.site_query)

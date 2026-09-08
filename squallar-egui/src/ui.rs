@@ -134,6 +134,10 @@ pub(crate) use pills::PILL_ROW_CLEARANCE;
 /// The sync section's row labels, for the parity walk.
 #[cfg(test)]
 pub(crate) use pills::SYNC_SECTION_LABELS;
+/// How many site-section models have been built on this thread — see
+/// [`pills::build_count`].
+#[cfg(test)]
+pub(crate) use pills::build_count as site_sections_build_count;
 #[cfg(test)]
 pub(crate) use pills::{PillKind, PillPopoverProbe, PillRowProbe};
 #[path = "ui_fade.rs"]
