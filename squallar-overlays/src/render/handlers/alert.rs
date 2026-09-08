@@ -267,6 +267,11 @@ pub(crate) struct NwsAlertHandler {
     /// answer prefers [`PaneRef::state`] when there is one.
     pub defaults: AlertPaneState,
     signature_memo: crate::render::signature_memo::SignatureMemo,
+    /// The drawn/painted pair per (generation, view) — see
+    /// [`Self::shown_counts`]. Its own table rather than a second value in
+    /// [`Self::signature_memo`] because the two answers are different
+    /// quantities that happen to share a key.
+    counts_memo: crate::render::signature_memo::SignatureMemo,
     /// The last built paint input per (generation, view, admitted set,
     /// device scale) — see [`Self::prepare_job`].
     pub(crate) job_memo: crate::render::signature_memo::JobMemo,
@@ -274,6 +279,9 @@ pub(crate) struct NwsAlertHandler {
     /// memo gate: an unchanged (generation, view) call must add zero.
     #[cfg(test)]
     pub(crate) sig_item_visits: std::cell::Cell<u64>,
+    /// The same gate for [`Self::shown_counts`]'s walk.
+    #[cfg(test)]
+    pub(crate) count_item_visits: std::cell::Cell<u64>,
 }
 
 impl NwsAlertHandler {
@@ -285,11 +293,14 @@ impl NwsAlertHandler {
             hidden_alerts: HashSet::new(),
             defaults: AlertPaneState::new(true),
             signature_memo: crate::render::signature_memo::SignatureMemo::new(),
+            counts_memo: crate::render::signature_memo::SignatureMemo::new(),
             job_memo: crate::render::signature_memo::JobMemo::new(
                 crate::render::footprint::alerts_job,
             ),
             #[cfg(test)]
             sig_item_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            count_item_visits: std::cell::Cell::new(0),
         }
     }
 
@@ -321,26 +332,46 @@ impl NwsAlertHandler {
             && !self.hidden_alerts.contains(&item.alert.id)
     }
 
-    /// How many alerts the user's filters let through. Not the same as
-    /// [`painted_count`](NwsAlertHandler::painted_count): an alert whose zone
-    /// boundaries did not resolve passes every filter and paints nothing.
-    fn drawn_count(&self, view: &AlertPaneState) -> usize {
-        self.state
-            .data
-            .iter()
-            .filter(|item| self.is_drawn(view, item))
-            .count()
-    }
-
-    /// How many alerts actually put ink on the map: let through *and* holding
-    /// geometry. A zone-based alert whose boundaries all failed is `is_drawn`
-    /// and paints nothing.
-    fn painted_count(&self, view: &AlertPaneState) -> usize {
-        self.state
-            .data
-            .iter()
-            .filter(|item| self.is_drawn(view, item) && !item.alert.features.is_empty())
-            .count()
+    /// **How many alerts the user's filters let through, and how many of those
+    /// put ink on the map** — one walk, remembered.
+    ///
+    /// The two are not the same number: an alert whose zone boundaries did not
+    /// resolve passes every filter and paints nothing. They are also never
+    /// wanted apart — the status line and the layer's own control list each
+    /// print the pair — and they share `is_drawn`, so they share a walk. Two
+    /// walks is what this was, and both of its callers run per pane per layer
+    /// per **frame** while the answer moves on a poll or a toggle: on a busy
+    /// feed the status line alone was six hundred hashed set lookups a frame
+    /// to compose a string that changes about once a minute.
+    ///
+    /// Memoised on [`content_signature`](Self::content_signature)'s key, and
+    /// it has to be that key: `data_generation` covers the feed and
+    /// `departed`, `view_key` covers the two filter inputs a caller can move
+    /// without a generation bump, and the fold reads nothing else — the same
+    /// `is_drawn`, and `features` which that fold already keys on.
+    ///
+    /// Packed into the memo's `u64` as `drawn << 32 | painted`. Neither can
+    /// exceed the item count and the feed is a few hundred rows, so 32 bits
+    /// each is not a bound this can meet.
+    fn shown_counts(&self, view: &AlertPaneState) -> (usize, usize) {
+        let packed = self.counts_memo.get_or_compute(
+            self.state.data_generation,
+            self.view_key(view),
+            || {
+                let mut drawn: u64 = 0;
+                let mut painted: u64 = 0;
+                for item in &self.state.data {
+                    #[cfg(test)]
+                    self.count_item_visits.set(self.count_item_visits.get() + 1);
+                    if self.is_drawn(view, item) {
+                        drawn += 1;
+                        painted += u64::from(!item.alert.features.is_empty());
+                    }
+                }
+                (drawn << 32) | painted
+            },
+        );
+        ((packed >> 32) as usize, (packed & 0xffff_ffff) as usize)
     }
 
     /// What the rasterizer reads, captured once. The rows are
@@ -592,19 +623,17 @@ impl OverlayHandler for NwsAlertHandler {
         }
     }
 
-    /// E.g. `"3 shown - W/Wa/Adv/Oth"`. **`"85 of 297 shown"`** when
-    /// [`painted_count`] and [`drawn_count`] disagree, which is the honest
-    /// reading of a poll whose zone boundaries did not all resolve.
+    /// E.g. `"3 shown - W/Wa/Adv/Oth"`. **`"85 of 297 shown"`** when the two
+    /// halves of [`shown_counts`] disagree, which is the honest reading of a
+    /// poll whose zone boundaries did not all resolve.
     ///
-    /// [`drawn_count`]: NwsAlertHandler::drawn_count
-    /// [`painted_count`]: NwsAlertHandler::painted_count
+    /// [`shown_counts`]: NwsAlertHandler::shown_counts
     fn status_line(&self, pane: &PaneRef<'_>) -> Option<String> {
         let view = self.view(pane);
         if view.enabled_categories.is_empty() {
             return None;
         }
-        let allowed = self.drawn_count(view);
-        let painted = self.painted_count(view);
+        let (allowed, painted) = self.shown_counts(view);
         let shown = if painted == allowed {
             format!("{allowed}")
         } else {
@@ -950,8 +979,7 @@ impl OverlayHandler for NwsAlertHandler {
             });
         }
         if self.has_data(pane) {
-            let allowed = self.drawn_count(view);
-            let painted = self.painted_count(view);
+            let (allowed, painted) = self.shown_counts(view);
             items.push(ControlItem::InfoText {
                 text: if painted == allowed {
                     format!("{allowed} alerts shown")
@@ -1183,7 +1211,7 @@ mod tests {
         let mut handler = handler_with(vec![zone_alert("a", "Tornado Warning", 0)]);
         let unresolved = handler.content_signature(&PaneRef::bare(0));
         assert_eq!(
-            handler.drawn_count(&handler.defaults),
+            handler.shown_counts(&handler.defaults).0,
             1,
             "fixture: the alert must count as drawn with no features, or the \
              count would move on its own and this proves nothing",
@@ -1195,7 +1223,7 @@ mod tests {
         );
         let resolved = handler.content_signature(&PaneRef::bare(0));
         assert_eq!(
-            handler.drawn_count(&handler.defaults),
+            handler.shown_counts(&handler.defaults).0,
             1,
             "fixture: still one drawn alert, so only the geometry moved",
         );
@@ -1305,6 +1333,51 @@ mod tests {
             handler.sig_item_visits.get(),
             warmed,
             "an unchanged generation and view walked the items again",
+        );
+    }
+
+    /// The same rule for the drawn/painted pair, which is asked once a frame
+    /// by the status line and again by the layer's control list.
+    #[test]
+    fn a_repeat_ask_for_the_shown_counts_never_revisits_the_items() {
+        let handler = handler_with(vec![
+            alert("a", "Tornado Warning"),
+            alert("b", "Severe Thunderstorm Warning"),
+        ]);
+        let first = handler.shown_counts(&handler.defaults);
+        let warmed = handler.count_item_visits.get();
+        assert_eq!(first, (2, 2), "fixture: both alerts pass and both paint");
+        assert!(
+            warmed > 0,
+            "fixture: the first call really walked the items"
+        );
+
+        assert_eq!(handler.shown_counts(&handler.defaults), first);
+        assert_eq!(
+            handler.count_item_visits.get(),
+            warmed,
+            "an unchanged generation and view walked the items again",
+        );
+    }
+
+    /// And it is a memo, not a freeze: a poll that changes the set moves the
+    /// pair on the very next ask.
+    #[test]
+    fn a_generation_bump_recounts_the_shown_pair() {
+        let mut handler = handler_with(vec![alert("a", "Tornado Warning")]);
+        assert_eq!(handler.shown_counts(&handler.defaults), (1, 1));
+
+        handler.apply_fetch_result(
+            whole(vec![
+                alert("a", "Tornado Warning"),
+                alert("b", "Severe Thunderstorm Warning"),
+            ]),
+            &PaneRef::across(&[]),
+        );
+        assert_eq!(
+            handler.shown_counts(&handler.defaults),
+            (2, 2),
+            "a poll that added a warning must be counted",
         );
     }
 
@@ -1568,7 +1641,7 @@ mod tests {
             &PaneRef::across(&[]),
         );
         assert_eq!(
-            handler.drawn_count(&handler.defaults),
+            handler.shown_counts(&handler.defaults).0,
             3,
             "premise: every filter lets all three through",
         );
@@ -1734,9 +1807,9 @@ mod tests {
             alert("c", "Flood Advisory"),
         ]);
         let agree = |h: &NwsAlertHandler, expected: usize, why: &str| {
-            assert_eq!(h.drawn_count(&h.defaults), expected, "{why}");
+            assert_eq!(h.shown_counts(&h.defaults).0, expected, "{why}");
             assert_eq!(
-                h.drawn_count(&h.defaults),
+                h.shown_counts(&h.defaults).0,
                 h.clickable_items(&PaneRef::bare(0)).len(),
                 "the count and the clickable set disagree: {why}",
             );
@@ -1857,9 +1930,9 @@ mod tests {
         }
     }
 
-    /// **The count that would have revealed the gap excluded it too**:
-    /// `drawn_count` and `painted_count` both filter on `is_drawn`, which was
-    /// permanently false for `Other`.
+    /// **The count that would have revealed the gap excluded it too**: both
+    /// halves of `shown_counts` filter on `is_drawn`, which was permanently
+    /// false for `Other`.
     #[test]
     fn an_air_quality_alert_is_drawn_counted_and_clickable() {
         let mut handler = handler_with(vec![
@@ -1873,7 +1946,7 @@ mod tests {
         );
 
         assert_eq!(
-            handler.drawn_count(&handler.defaults),
+            handler.shown_counts(&handler.defaults).0,
             2,
             "the air quality alert is missing from the count that would have \
              shown it missing from the map",
@@ -1888,7 +1961,7 @@ mod tests {
             .defaults
             .enabled_categories
             .remove(&AlertCategory::Other);
-        assert_eq!(handler.drawn_count(&handler.defaults), 1);
+        assert_eq!(handler.shown_counts(&handler.defaults).0, 1);
         assert_eq!(
             handler.status_line(&PaneRef::bare(0)).as_deref(),
             Some("1 shown - W/Wa/Adv")
@@ -2021,12 +2094,12 @@ mod tests {
         let pane_a = ref_of(&a, 0);
         let pane_b = ref_of(&b, 1);
         assert_eq!(
-            handler.drawn_count(handler.view(&pane_a)),
+            handler.shown_counts(handler.view(&pane_a)).0,
             2,
             "pane 0 still lets both categories through",
         );
         assert_eq!(
-            handler.drawn_count(handler.view(&pane_b)),
+            handler.shown_counts(handler.view(&pane_b)).0,
             1,
             "pane 1 turned advisories off",
         );
@@ -2405,7 +2478,7 @@ mod tests {
             1,
             "every surface but the as-of paint sees only the active feed",
         );
-        assert_eq!(h.drawn_count(&h.defaults), 1);
+        assert_eq!(h.shown_counts(&h.defaults).0, 1);
     }
 
     /// **The control that makes retention bounded**: an alert whose window
