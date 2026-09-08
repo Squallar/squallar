@@ -363,6 +363,9 @@ fn deliver(worker: &web_sys::Worker, data: &JsValue) {
     // Whether this job's reply is a whole picture, asked BEFORE anything is
     // copied because the answer decides how it is copied. See [`Pull::split`].
     let raster = offload::reply_is_raster(id as u64);
+    // Read here for the same reason `raster` is: delivering removes the job
+    // from the registry, so the row cannot be named afterwards.
+    let row = offload::reply_row_label(id as u64).unwrap_or("");
     let mut pull = Pull::default();
 
     let reply = (|| {
@@ -435,6 +438,7 @@ fn deliver(worker: &web_sys::Worker, data: &JsValue) {
         pull.copied_at_worker,
         pull.copy_ns,
         ns(deliver_start, web_time::Instant::now()),
+        row,
     );
 }
 
@@ -752,6 +756,11 @@ struct Traffic {
     /// answers "what share of the thread", this one answers "how long was the
     /// thread gone", and a p99 question needs the second.
     worst_copy_ns: u64,
+    /// **Whose reply that worst copy was** — the job row's label, and the
+    /// bytes it moved. See [`Self::worst_deliver_row`], which exists for the
+    /// same reason.
+    worst_copy_row: &'static str,
+    worst_copy_bytes: u64,
     /// Whole nanoseconds in `offload::deliver_encoded_reply` — the row's
     /// decode and the caller's delivery, both of which run inline on this
     /// thread — cumulative over the same denominator. **Never added to
@@ -761,6 +770,17 @@ struct Traffic {
     deliver_ns: u64,
     /// The single worst reply's [`Self::deliver_ns`].
     worst_deliver_ns: u64,
+    /// **Whose reply that worst delivery was** — the job row's label, and the
+    /// bytes it moved.
+    ///
+    /// Without these the maximum is unattributable, because the denominator
+    /// `replies` counts EVERY row the worker answers: a whole-picture overlay
+    /// raster and a radar volume decode land in the same figure, and reading
+    /// the worst one as a picture is an inference the ledger cannot support.
+    /// The label is read from the registry BEFORE the delivery, since
+    /// delivering removes the job — see `offload::reply_row_label`.
+    worst_deliver_row: &'static str,
+    worst_deliver_bytes: u64,
     /// Reply buffers of at least [`LARGE_BLOCK_BYTES`], counted per BUFFER
     /// rather than per reply: `to_vec` makes one allocation per head and per
     /// tail, and one allocation is what the allocator sees.
@@ -785,8 +805,12 @@ impl Traffic {
         post_us: 0,
         copy_ns: 0,
         worst_copy_ns: 0,
+        worst_copy_row: "",
+        worst_copy_bytes: 0,
         deliver_ns: 0,
         worst_deliver_ns: 0,
+        worst_deliver_row: "",
+        worst_deliver_bytes: 0,
         blocks_large: 0,
         blocks_small: 0,
         blocks_unlisted: 0,
@@ -860,7 +884,13 @@ fn account_sent(in_moved: usize, in_copied: usize, encode_us: u64, post_us: u64)
 /// not the two clocks — so every figure in the reply direction stands over the
 /// one denominator `replies` names. Its delivery is a `None` handed to a
 /// caller's channel and is not what these clocks are asked about.
-fn account_reply(out_moved: usize, out_copied: usize, copy_ns: u64, deliver_ns: u64) {
+fn account_reply(
+    out_moved: usize,
+    out_copied: usize,
+    copy_ns: u64,
+    deliver_ns: u64,
+    row: &'static str,
+) {
     if out_moved == 0 && out_copied == 0 {
         return;
     }
@@ -869,11 +899,50 @@ fn account_reply(out_moved: usize, out_copied: usize, copy_ns: u64, deliver_ns: 
         totals.out_moved += out_moved as u64;
         totals.out_copied += out_copied as u64;
         totals.copy_ns += copy_ns;
-        totals.worst_copy_ns = totals.worst_copy_ns.max(copy_ns);
+        // The label and the bytes move WITH the maximum, in the same branch
+        // that raises it, so a reported row can only ever be the row of the
+        // figure beside it.
+        if copy_ns > totals.worst_copy_ns {
+            totals.worst_copy_ns = copy_ns;
+            totals.worst_copy_row = row;
+            totals.worst_copy_bytes = out_moved as u64;
+        }
         totals.deliver_ns += deliver_ns;
-        totals.worst_deliver_ns = totals.worst_deliver_ns.max(deliver_ns);
+        if deliver_ns > totals.worst_deliver_ns {
+            totals.worst_deliver_ns = deliver_ns;
+            totals.worst_deliver_row = row;
+            totals.worst_deliver_bytes = out_moved as u64;
+        }
     });
-    log_blocks(&TRAFFIC.with(Cell::get));
+    let totals = TRAFFIC.with(Cell::get);
+    log_blocks(&totals);
+    log_worst(&totals);
+}
+
+/// **Who the two maxima on the `transport:` line belong to.**
+///
+/// A separate line for the reason `log_blocks` is one: that sentence is held
+/// field for field against the rig's regex by `transport_line_shape.rs`, and
+/// `native_row.py` `int()`s every group it reads, so a non-numeric field added
+/// there would turn the whole reading null rather than error. This line is read
+/// off the console export the rig already keeps whole.
+///
+/// `-` for a maximum whose row could not be named: the registry had no pending
+/// job for that id, which is a late or withdrawn reply. It is written rather
+/// than skipped so the line's shape never depends on the data.
+fn log_worst(totals: &Traffic) {
+    let name = |row: &'static str| if row.is_empty() { "-" } else { row };
+    log::info!(
+        "worst reply: copy {} us on `{}` moving {} B, \
+         delivery {} us on `{}` moving {} B, over {} replies",
+        totals.worst_copy_ns / 1_000,
+        name(totals.worst_copy_row),
+        totals.worst_copy_bytes,
+        totals.worst_deliver_ns / 1_000,
+        name(totals.worst_deliver_row),
+        totals.worst_deliver_bytes,
+        totals.replies,
+    );
 }
 
 // ── The reply block table ────────────────────────────────────────────────────

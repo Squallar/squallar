@@ -1244,6 +1244,22 @@ pub fn reply_is_raster(id: u64) -> bool {
     pending().get(&id).is_some_and(|job| job.row.splits_pixels)
 }
 
+/// Which row job `id`'s reply will be decoded through, by the label that row
+/// carries — for a transport that wants to say WHOSE reply a figure it just
+/// measured belongs to.
+///
+/// **Asked before the reply is delivered, because delivering removes the job.**
+/// [`deliver_job_reply`] takes the entry out of the registry before it runs
+/// `deliver`, so a caller that clocks a delivery and then asks who it was for
+/// gets `None` every time.
+///
+/// `None` for an id with no pending job — a late reply, or one already
+/// withdrawn — which is the same answer [`reply_is_raster`] gives and means
+/// the same thing.
+pub fn reply_row_label(id: u64) -> Option<&'static str> {
+    pending().get(&id).map(|job| job.row.label)
+}
+
 /// [`deliver_encoded_reply`] for a reply whose picture the transport LIFTED OUT
 /// of the head and materialised as pixels, rather than handing the head over
 /// whole.
