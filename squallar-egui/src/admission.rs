@@ -639,6 +639,37 @@ static ADMITTED: AtomicU32 = AtomicU32::new(0);
 static WOULD_REFUSE: AtomicU32 = AtomicU32::new(0);
 static REFUSED: AtomicU32 = AtomicU32::new(0);
 
+/// **How often a sentence was put on the glass, and how often it landed on
+/// one that was already there.**
+///
+/// Separate from the verdict counters above because they answer a different
+/// question and could not answer this one. A user reported a notice that
+/// "appeared and went away"; nothing in this tree could confirm or refute it,
+/// because **no per-act refusal is logged anywhere** — the only refusal text
+/// the application emits is the cumulative
+/// `admission asked N admitted N would refuse N refused N` group on
+/// `budget state:`, and [`AdmissionLedger::raise_notice`] draws without
+/// logging. A hypothesis about re-stamping was therefore unfalsifiable on
+/// every log this application can produce.
+///
+/// [`NOTICES_RAISED_LIVE`] is the whole instrument: a notice raised while one
+/// is **still showing** replaces it and restarts its six seconds, which is what
+/// a reader sees as flicker. A notice raised after the previous one aged out
+/// is just the next notice. The two are indistinguishable in a total and
+/// opposite in what they mean, so they are counted apart.
+static NOTICES_RAISED: AtomicU32 = AtomicU32::new(0);
+/// See [`NOTICES_RAISED`]: raised while a notice was already on the glass.
+static NOTICES_RAISED_LIVE: AtomicU32 = AtomicU32::new(0);
+/// **Stamps this module's own re-offer path put up** ([`AdmissionLedger::revisit`]).
+///
+/// Counted apart so it can be **subtracted**, not to be admired. A re-offer is
+/// a stamp like any other, so without this field a wish resolving on the
+/// telemetry tick would be indistinguishable from the re-stamped refusal the
+/// counter exists to find — this lane's own new code masquerading as the
+/// phantom it was written to measure. `raised - reoffered` is the
+/// refusal-driven figure.
+static NOTICES_REOFFERED: AtomicU32 = AtomicU32::new(0);
+
 /// What the doors have decided since the process started.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Totals {
@@ -658,6 +689,17 @@ pub struct Totals {
     /// between them is what a refusal costs the user, and collapsing them
     /// into one field is how an advisory arm stops being visible.
     pub refused: u32,
+    /// **Sentences put on the glass** — see [`NOTICES_RAISED`]. Every
+    /// [`AdmissionLedger::raise_notice`], whatever raised it.
+    pub raised: u32,
+    /// **Of those, the ones that landed on a notice still showing**, which is
+    /// what a reader sees as a notice appearing and vanishing. See
+    /// [`NOTICES_RAISED_LIVE`].
+    pub raised_live: u32,
+    /// **Of [`Self::raised`], the ones this module's re-offer path put up.**
+    /// Subtract it to get the refusal-driven figure — see
+    /// [`NOTICES_REOFFERED`].
+    pub reoffered: u32,
 }
 
 /// The counters, as running totals from boot.
@@ -667,6 +709,9 @@ pub fn totals() -> Totals {
         admitted: ADMITTED.load(Relaxed),
         would_refuse: WOULD_REFUSE.load(Relaxed),
         refused: REFUSED.load(Relaxed),
+        raised: NOTICES_RAISED.load(Relaxed),
+        raised_live: NOTICES_RAISED_LIVE.load(Relaxed),
+        reoffered: NOTICES_REOFFERED.load(Relaxed),
     }
 }
 
@@ -679,6 +724,9 @@ impl Totals {
             admitted: self.admitted.saturating_sub(earlier.admitted),
             would_refuse: self.would_refuse.saturating_sub(earlier.would_refuse),
             refused: self.refused.saturating_sub(earlier.refused),
+            raised: self.raised.saturating_sub(earlier.raised),
+            raised_live: self.raised_live.saturating_sub(earlier.raised_live),
+            reoffered: self.reoffered.saturating_sub(earlier.reoffered),
         }
     }
 }
@@ -992,6 +1040,11 @@ impl AdmissionLedger {
             }
         }
         if let Some(act) = reoffer {
+            // **Counted before it is raised, so this lane's own stamp cannot
+            // read as the phantom re-stamp the counter exists to find.** See
+            // `NOTICES_REOFFERED`.
+            NOTICES_REOFFERED.fetch_add(1, Relaxed);
+            self.counts.reoffered = self.counts.reoffered.saturating_add(1);
             self.raise_notice(reoffer_text(act).to_string(), now);
         }
     }
@@ -1458,8 +1511,27 @@ impl AdmissionLedger {
             .filter(|notice| now.duration_since(notice.raised_at) < NOTICE_LIFETIME)
     }
 
-    /// Put a notice up. Test support and the enforcing land's own use.
+    /// **Put a notice up, and count that it went up** — see
+    /// [`NOTICES_RAISED`].
+    ///
+    /// The `raised_live` half is read **before** the write, because after it
+    /// there is always a notice showing: what is being counted is whether this
+    /// stamp replaced a sentence the reader could still see, which is the
+    /// difference between a notice that flickers and one that follows another.
+    ///
+    /// Every stamp goes through here — a refusal on either arm, a re-offer,
+    /// and [`Self::adopt_remote_notice`] carrying the App door's sentence
+    /// across the seam. That last one is already guarded by a text compare, so
+    /// a notice re-stated unchanged every frame does not count and does not
+    /// re-stamp; a *changed* remote sentence does both, which is true.
     pub fn raise_notice(&mut self, text: String, now: web_time::Instant) {
+        let onto_a_live_one = self.notice(now).is_some();
+        NOTICES_RAISED.fetch_add(1, Relaxed);
+        self.counts.raised = self.counts.raised.saturating_add(1);
+        if onto_a_live_one {
+            NOTICES_RAISED_LIVE.fetch_add(1, Relaxed);
+            self.counts.raised_live = self.counts.raised_live.saturating_add(1);
+        }
         self.notice = Some(AdmissionNotice {
             text,
             raised_at: now,

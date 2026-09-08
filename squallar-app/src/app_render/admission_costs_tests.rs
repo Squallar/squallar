@@ -405,6 +405,11 @@ fn the_budget_line_carries_the_admission_counters() {
         admitted: 5,
         would_refuse: 2,
         refused: 0,
+        // Distinct from every figure above, so the assertion below cannot pass
+        // on a formatter that printed the wrong field.
+        raised: 3,
+        raised_live: 1,
+        reoffered: 1,
     };
     let line = crate::budget_telemetry::budget_state_line(
         &squallar_device_profile::budget::resolve(
@@ -433,6 +438,13 @@ fn the_budget_line_carries_the_admission_counters() {
         line.contains("admission asked 7 admitted 5 would refuse 2 refused 0"),
         "the counters are not on the line: {line}",
     );
+    // **What reached the glass, beside what the doors decided.** Three figures
+    // no other field on the line carries, so this cannot pass on a formatter
+    // that printed a neighbour.
+    assert!(
+        line.contains("notices raised 3 live 1 reoffered 1"),
+        "the notice counters are not on the line: {line}",
+    );
     // And they sit BEFORE the variable-arity pane rows, where a positional
     // reader can still find them.
     let admission_at = line
@@ -442,6 +454,13 @@ fn the_budget_line_carries_the_admission_counters() {
         line.find(", pane0 ")
             .is_none_or(|panes| admission_at < panes),
         "the counters must precede the pane rows: {line}",
+    );
+    let notices_at = line
+        .find("notices raised")
+        .expect("the field is on the line");
+    assert!(
+        line.find(", pane0 ").is_none_or(|panes| notices_at < panes),
+        "the notice counters must precede the pane rows too: {line}",
     );
 }
 

@@ -1665,3 +1665,123 @@ fn a_refused_listing_is_retained_in_frames_and_re_offered_when_the_loop_fits() {
          gesture the refusal's own follow-up named",
     );
 }
+
+// ── What reached the glass ────────────────────────────────────────────────
+
+/// **A notice raised onto one that is still showing is a re-stamp; one raised
+/// after the last aged out is just the next notice.**
+///
+/// The two are indistinguishable in a total and opposite in what they mean: a
+/// re-stamp restarts the six seconds under the reader's eyes, which is what a
+/// user described as a notice appearing and going away. Nothing in this tree
+/// could confirm or refute that report before this counter — **no per-act
+/// refusal is logged anywhere**, and `raise_notice` draws without logging, so
+/// the hypothesis was unfalsifiable on every log the application emits.
+///
+/// Three arms, because two of them would let a counter that simply counts
+/// calls pass: the fresh one, the re-stamp, and the one that is neither.
+#[test]
+fn a_notice_raised_over_a_live_one_is_counted_apart_from_one_raised_after_it_aged() {
+    let mut ledger = AdmissionLedger::default();
+    let at = web_time::Instant::now();
+
+    ledger.raise_notice("first".to_string(), at);
+    assert_eq!(ledger.counts().raised, 1, "the sentence went up");
+    assert_eq!(
+        ledger.counts().raised_live,
+        0,
+        "there was nothing on the glass for it to replace",
+    );
+
+    // **The re-stamp**: inside NOTICE_LIFETIME, so the reader can still see
+    // the sentence this one replaces.
+    ledger.raise_notice("second".to_string(), at + NOTICE_LIFETIME / 2);
+    assert_eq!(ledger.counts().raised, 2);
+    assert_eq!(
+        ledger.counts().raised_live,
+        1,
+        "a sentence replaced under the reader's eyes is the whole measurement",
+    );
+
+    // **One fact changed — the clock.** The same call after the notice aged
+    // out is the next notice, not a re-stamp, and must not move `live`.
+    ledger.raise_notice("third".to_string(), at + NOTICE_LIFETIME * 3);
+    assert_eq!(ledger.counts().raised, 3);
+    assert_eq!(
+        ledger.counts().raised_live,
+        1,
+        "a notice raised after the last one expired replaced nothing the \
+         reader could see",
+    );
+}
+
+/// **A refusal's own stamp goes through the same counter**, so the figure is
+/// of the glass and not of one call site. Both arms of the door: the enforcing
+/// one raises, and the advisory one raises too — it says something different,
+/// but it is a sentence on the glass either way.
+#[test]
+fn a_refusal_counts_its_stamp_on_both_arms() {
+    for enforcing in [true, false] {
+        let mut ledger = AdmissionLedger::default();
+        ledger.adopt(&costs(0, 10 * MIB, 1));
+        let before = ledger.counts();
+        ledger.decide(
+            Act::ShowLayer,
+            Some(0),
+            Increment::host(10 * MIB),
+            enforcing,
+        );
+        let moved = ledger.counts().since(before);
+        assert_eq!(moved.raised, 1, "enforcing = {enforcing}");
+        assert_eq!(
+            moved.raised_live, 0,
+            "the first refusal of a session replaces nothing: enforcing = {enforcing}",
+        );
+        assert_eq!(
+            moved.reoffered, 0,
+            "a refusal is not a re-offer: enforcing = {enforcing}",
+        );
+    }
+}
+
+/// **This lane's own re-offer counts itself**, so it cannot masquerade as the
+/// phantom re-stamp the counter was written to find.
+///
+/// A wish resolving on the telemetry tick puts a sentence up like any other,
+/// and without `reoffered` beside `raised` it would be indistinguishable from
+/// a refusal being re-stamped — the new code reading as the defect it was
+/// added to measure. `raised - reoffered` is the refusal-driven figure.
+#[test]
+fn the_re_offer_path_counts_itself_apart_from_a_refusal_re_stamp() {
+    let mut ledger = AdmissionLedger::default();
+    ledger.adopt(&costs(0, 10 * MIB, 1));
+    assert!(!ledger.decide(Act::ShowLayer, Some(0), Increment::host(10 * MIB), true));
+    let after_refusal = ledger.counts();
+    assert_eq!(after_refusal.raised, 1);
+    assert_eq!(after_refusal.reoffered, 0);
+
+    // The tick that publishes the room. The wish resolves and says so — ON
+    // TOP of the refusal notice, which is still inside its six seconds, so
+    // this is a genuine re-stamp AND a re-offer, and the two are counted
+    // separately rather than one standing in for the other.
+    let at = web_time::Instant::now();
+    ledger.adopt_at(&roomier(64 * MIB, 10 * MIB, 1), at);
+    let moved = ledger.counts().since(after_refusal);
+    assert_eq!(moved.raised, 1, "the re-offer is a stamp like any other");
+    assert_eq!(moved.reoffered, 1, "and it is attributable to this path");
+    assert_eq!(
+        ledger.counts().raised - ledger.counts().reoffered,
+        1,
+        "the refusal-driven figure is what is left after subtracting it",
+    );
+
+    // **The control that makes the subtraction mean something**: a tick with
+    // no wish to resolve raises nothing at all.
+    let mut quiet = AdmissionLedger::default();
+    quiet.adopt(&costs(64 * MIB, 10 * MIB, 1));
+    let before = quiet.counts();
+    quiet.adopt_at(&roomier(64 * MIB, 10 * MIB, 1), web_time::Instant::now());
+    let moved = quiet.counts().since(before);
+    assert_eq!(moved.raised, 0);
+    assert_eq!(moved.reoffered, 0);
+}

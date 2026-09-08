@@ -453,6 +453,28 @@ pub(crate) fn budget_state_line(
         ", admission asked {} admitted {} would refuse {} refused {}",
         doors.asked, doors.admitted, doors.would_refuse, doors.refused,
     );
+    // **What reached the GLASS, beside what the doors decided.** One group of
+    // three, fixed width, among the fixed-width fields and ahead of the
+    // variable-arity `pane<i>` rows, per the placement rule on this function.
+    //
+    // The counters above say what the doors did; none of them says whether the
+    // user ever saw it, and the two are not the same event. `notices raised`
+    // is every sentence put on the glass; `live` is the subset that landed on
+    // a notice still showing, which is what a reader experiences as a notice
+    // appearing and vanishing; `reoffered` is the subset this application put
+    // up because a refused act started fitting again, carried so it can be
+    // SUBTRACTED - without it, a wish resolving on the telemetry tick would be
+    // indistinguishable from the re-stamped refusal the pair exists to find.
+    //
+    // It is here because a user reported exactly that flicker and nothing in
+    // this tree could confirm or refute it: no per-act refusal is logged
+    // anywhere, so the hypothesis was unfalsifiable on every log the
+    // application can emit.
+    let _ = write!(
+        line,
+        ", notices raised {} live {} reoffered {}",
+        doors.raised, doors.raised_live, doors.reoffered,
+    );
     let _ = write!(
         line,
         ", live {}/{} MiB",
@@ -819,6 +841,7 @@ mod tests {
              host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, \
              host allowance none, rss 900 MiB, pool residual 650 MiB, \
              spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
+             notices raised 0 live 0 reoffered 0, \
              live 250/600 MiB",
         );
         // The figure follows the pool it is handed, not a field of the budgets.
@@ -868,6 +891,7 @@ mod tests {
                 ", probe 5, balloon 0 MiB, page heap acts 0 at 0 MiB, \
                  heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, \
                  spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
+                 notices raised 0 live 0 reoffered 0, \
                  live 250/600 MiB"
             ),
         );
@@ -897,6 +921,7 @@ mod tests {
                 ", cap 24576 2, probe 0, balloon 7 MiB, page heap acts 0 at 0 MiB, \
                  heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance 30720 MiB, rss none, pool residual none, \
                  spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
+                 notices raised 0 live 0 reoffered 0, \
                  live 250/600 MiB"
             ),
         );
@@ -924,6 +949,7 @@ mod tests {
                 ", cap 3456 0, probe 1, balloon 7 MiB, page heap acts 0 at 0 MiB, \
                  heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, \
                  spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
+                 notices raised 0 live 0 reoffered 0, \
                  live 250/600 MiB"
             ),
         );
@@ -1019,12 +1045,12 @@ mod tests {
              cap 3840 0, probe 0, balloon 0 MiB, page heap acts 0 at 0 MiB, \
              heap max 0/0 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, \
              spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
-             live 0/0 MiB",
+             notices raised 0 live 0 reoffered 0, live 0/0 MiB",
         );
         assert_eq!(
             line.matches(", ").count(),
-            26,
-            "twenty-seven comma-separated groups with no pane rows, twenty-six \
+            27,
+            "twenty-eight comma-separated groups with no pane rows, twenty-seven \
              separators: a field was dropped or gained. It was seventeen until \
              the recovery governor's `host steps N promotions N churn N` landed, \
              which is ONE group of three space-separated figures and so moved \
@@ -1041,7 +1067,11 @@ mod tests {
              counting the line this build actually writes**, not by adding one \
              lane's figure to another's: the doors and the loop fields landed \
              from two lanes on one day and each was pinned against a line \
-             without the other's field on it",
+             without the other's field on it. **26 -> 27 is a stated decision, \
+             not a re-point**: this lane added exactly ONE group, \
+             `notices raised N live N reoffered N` - three space-separated \
+             figures inside one comma-separated group, so one separator, and \
+             the number moved by exactly the number of groups added",
         );
     }
 
@@ -1305,6 +1335,7 @@ mod tests {
             ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
              host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, spare gpu none host none, door spare gpu none host none joint none, \
              admission asked 0 admitted 0 would refuse 0 refused 0, \
+             notices raised 0 live 0 reoffered 0, \
              live 250/600 MiB",
             "the tail the rig does not read drifted",
         );
@@ -1350,6 +1381,7 @@ mod tests {
             ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
              host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, \
              spare gpu 3568 MiB host 601 MiB, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
+             notices raised 0 live 0 reoffered 0, \
              live 250/600 MiB, \
              pane0 gpu 272 MiB host 0 MiB shared 0 MiB own 272 MiB, \
              pane1 gpu 33 MiB host 41 MiB shared 16 MiB own 17 MiB",
@@ -1428,6 +1460,7 @@ mod tests {
         )
             .ends_with(
                 ", spare gpu 0 MiB host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
+                 notices raised 0 live 0 reoffered 0, \
                  live 250/600 MiB"
             ),
         );
@@ -1530,6 +1563,7 @@ mod tests {
                 ", page heap acts 0 at 0 MiB, heap max 0/0 MiB, \
                  host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, spare gpu none host none, door spare gpu none host none joint none, \
                  admission asked 0 admitted 0 would refuse 0 refused 0, \
+                 notices raised 0 live 0 reoffered 0, \
                  live 0/0 MiB"
             ),
             "a watch that never acted must still print its zero: {never}",
@@ -1570,6 +1604,7 @@ mod tests {
                 ", page heap acts 2 at 1011 MiB, heap max 0/0 MiB, \
                  host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, spare gpu none host none, door spare gpu none host none joint none, \
                  admission asked 0 admitted 0 would refuse 0 refused 0, \
+                 notices raised 0 live 0 reoffered 0, \
                  live 0/0 MiB"
             ),
             "the act count and the mark are not both on the line: {acted}",
