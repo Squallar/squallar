@@ -1590,6 +1590,7 @@ fn a_reply_to_an_abandoned_render_is_not_delivered() {
             nyquist_ms: None,
             melting_layer_source: None,
             storm_motion: None,
+            codes: None,
         }))),
     );
 
@@ -1639,6 +1640,7 @@ fn a_cancelled_job_delivers_nothing_once_and_its_late_reply_is_refused() {
             nyquist_ms: None,
             melting_layer_source: None,
             storm_motion: None,
+            codes: None,
         }))),
     );
     assert!(
@@ -3814,6 +3816,7 @@ fn the_frame_reply_framing_is_the_one_this_registry_ships() {
             direction_deg: 245.0,
             source: squallar_radar::srv::StormMotionSource::BunkersRightMover,
         }),
+        codes: None,
     };
     let bare = RenderedFrame {
         image: squallar_radar::frame::RasterImage::Bytes(vec![1, 2, 3, 4]),
@@ -3822,6 +3825,32 @@ fn the_frame_reply_framing_is_the_one_this_registry_ships() {
         nyquist_ms: None,
         melting_layer_source: None,
         storm_motion: None,
+        codes: None,
+    };
+    // The third surface. Neither fixture above reaches the head's code block
+    // -- both are rasters -- so without this one a build could reorder the
+    // plane's shape and key fields and no row here would move.
+    let plane = RenderedFrame {
+        image: squallar_radar::frame::RasterImage::Bytes(Vec::new()),
+        max_range_km: 230.0,
+        polar: Default::default(),
+        nyquist_ms: None,
+        melting_layer_source: None,
+        storm_motion: None,
+        codes: Some(
+            squallar_radar::render::codes::CodePlane::build(
+                3,
+                4,
+                vec![0, 1, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49],
+                squallar_radar::render::codes::LutKey {
+                    product: squallar_radar::types::RadarProduct::Reflectivity,
+                    scale: 2.0,
+                    offset: 66.0,
+                },
+                8,
+            )
+            .expect("the literal plane is inside every cap"),
+        ),
     };
     let radar_row = job_codecs()
         .find(|row| row.label == "radar")
@@ -3832,24 +3861,31 @@ fn the_frame_reply_framing_is_the_one_this_registry_ships() {
         (radar_row.encode_out)(DescribedOut(Box::new(frame.clone())), &mut head, &mut tails);
         assert_eq!(
             tails.len(),
-            2,
-            "the frame reply rides exactly two tails; a third would need \
+            3,
+            "the frame reply rides exactly three tails; a fourth would need \
              its own digest row",
         );
         (head, tails)
     };
     let (full_head, full_tails) = encode(&full);
     let (bare_head, bare_tails) = encode(&bare);
+    let (plane_head, plane_tails) = encode(&plane);
     let row = |name: &str, bytes: &[u8]| {
         format!("{name} | {} | {:#018x}", bytes.len(), layout_digest(bytes))
     };
     let rows = vec![
         row("frame/full/head", &full_head),
         row("frame/full/polar", &full_tails[0]),
-        row("frame/full/image", &full_tails[1]),
+        row("frame/full/codes", &full_tails[1]),
+        row("frame/full/image", &full_tails[2]),
         row("frame/bare/head", &bare_head),
         row("frame/bare/polar", &bare_tails[0]),
-        row("frame/bare/image", &bare_tails[1]),
+        row("frame/bare/codes", &bare_tails[1]),
+        row("frame/bare/image", &bare_tails[2]),
+        row("frame/plane/head", &plane_head),
+        row("frame/plane/polar", &plane_tails[0]),
+        row("frame/plane/codes", &plane_tails[1]),
+        row("frame/plane/image", &plane_tails[2]),
     ];
     assert_eq!(
         rows,

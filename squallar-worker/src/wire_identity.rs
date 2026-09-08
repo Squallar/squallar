@@ -106,25 +106,74 @@ pub const WIRE_REPLY_ROWS: &[&str] = &[
     "blank | 6 | 0x0cf6ca5254a6cb0d",
 ];
 
-/// The 6 frame-reply framing rows, exactly as
+/// The 12 frame-reply framing rows, exactly as
 /// `offload::tests::the_frame_reply_framing_is_the_one_this_registry_ships`
 /// asserts them: the frame's head+tails wire form
 /// (`squallar_radar::frame::RenderedFrame::write_head` + the nominated
-/// `[polar, image]` tails) — head, polar tail and image tail for one fixture
-/// with all three optional trios present and one with none. The per-tail
+/// `[polar, codes, image]` tails) — head and three tails for each of three
+/// fixtures: `full`, with every optional trio present; `bare`, with none; and
+/// `plane`, whose surface is a code plane rather than a raster. The per-tail
 /// rows also pin the tail ORDER.
 ///
+/// # What moved when the code tail arrived, and what did not
+///
+/// A polar frame carries its gates as **codes**, and they travel as their own
+/// tail rather than appended to the head. `8b22ca6f2` is why: the overlay
+/// reply appends its picture to the head and *"the page cannot find the
+/// picture in it, because the pixels sit behind a block with no length of its
+/// own"*. A tail has its own length by construction and starts at offset zero.
+///
+/// Two rows are **re-pinned**, and both for the same one-byte reason — the
+/// head gained a surface discriminant, written last so every field already in
+/// it keeps its offset:
+///
+/// | row | was | is |
+/// |---|---|---|
+/// | `frame/full/head` | `29 \| 0x89dc568e54cf7abb` | `30 \| 0x10e1ceda1c8d8bc1` |
+/// | `frame/bare/head` | `11 \| 0xc813d3185b023723` | `12 \| 0xfbe6d562a4c3b079` |
+///
+/// **Every other pre-existing row is byte-identical**, and that is an
+/// assertion rather than an expectation: `frame/full/polar`,
+/// `frame/bare/polar`, `frame/full/image` and `frame/bare/image` carry the
+/// same lengths and the same digests they carried before, because
+/// `PolarField` and `RasterImage` were not touched. A move in one of those
+/// would be a bug in this change, not a row to re-record.
+///
+/// Six rows are **new**: a code tail for each of the two raster fixtures
+/// (empty, which is the mutual exclusion made visible — exactly one of
+/// `codes` / `image` is ever non-empty), and four for the `plane` fixture.
+///
+/// **The `plane` fixture exists because neither of the other two reaches the
+/// head's code block.** Both are rasters, so their surface byte is followed by
+/// nothing; a build that reordered the plane's shape and key fields would move
+/// no length and no digest anywhere, and the codec's own round-trip could not
+/// see it either — the direct arm and the via-wire arm run the same encoder,
+/// so a symmetric change is invisible to a parity test. That is the hole
+/// [`WIRE_HEIGHT_REPLY_ROWS`] was written to close for the height reply, found
+/// again here before it could ship.
+///
 /// Row-length arithmetic (independent of the encoder): head/full
-/// 8 + (1+8) + (1+1) + (1+1+4+4) = 29; head/bare 8+1+1+1 = 11; polar/full
-/// 80 = 16 header + 3x8 + 2x8 + 6x4; polar/bare 40 = 16 header + 3x8
-/// (the default field); image 8/4 = the fixture Vecs.
+/// 8 + (1+8) + (1+1) + (1+1+4+4) + 1 = 30; head/bare 8+1+1+1+1 = 12;
+/// head/plane 8+1+1+1+1 + 19 = 31, the trailing 19 being
+/// `CodePlane::WIRE_HEAD_BYTES` (4+4+2+4+4+1 — the constructor's own
+/// arguments but the codes); polar/full 80 = 16 header + 3x8 + 2x8 + 6x4;
+/// polar/bare and polar/plane 40 = 16 header + 3x8 (the default field);
+/// codes/plane 12 = 3 radials x 4 gates, **level 0 alone** — the mip chain is
+/// a pure function of it and is rebuilt at decode rather than sent;
+/// image and the empty tails = the fixture Vecs.
 pub const WIRE_FRAME_REPLY_ROWS: &[&str] = &[
-    "frame/full/head | 29 | 0x89dc568e54cf7abb",
+    "frame/full/head | 30 | 0x10e1ceda1c8d8bc1",
     "frame/full/polar | 80 | 0x9f0c3f4e5dce8435",
+    "frame/full/codes | 0 | 0xcbf29ce484222325",
     "frame/full/image | 8 | 0x0363b2a3926bce45",
-    "frame/bare/head | 11 | 0xc813d3185b023723",
+    "frame/bare/head | 12 | 0xfbe6d562a4c3b079",
     "frame/bare/polar | 40 | 0x3f3ecf0cef9be2c0",
+    "frame/bare/codes | 0 | 0xcbf29ce484222325",
     "frame/bare/image | 4 | 0xbe7a5e775165785d",
+    "frame/plane/head | 31 | 0xe21c3f042291c176",
+    "frame/plane/polar | 40 | 0x3f3ecf0cef9be2c0",
+    "frame/plane/codes | 12 | 0x6c2b85b62288e8a5",
+    "frame/plane/image | 0 | 0xcbf29ce484222325",
 ];
 
 /// The 2 height-reply framing rows, exactly as

@@ -217,6 +217,35 @@ pub const MAX_POLAR_GATES: usize = crate::types::WEBGL2_MAX_TEXTURE_DIMENSION_2D
 /// app.
 static REFUSALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Serialises the tests that read [`CodePlane::refusals`] as a **delta**.
+///
+/// The ledger is process-global and always on, and this crate's unit tests are
+/// one binary, so two suites that both refuse payloads run in parallel threads
+/// against one counter and a delta of "exactly six" becomes a race between
+/// whichever tests happen to be in flight.
+///
+/// **Observed, not hypothesised.** With three such tests in the binary the
+/// filtered run `--lib -- --test-threads 16 refused` failed 4 times in 60,
+/// reporting `left: 8, right: 6` — two refusals from a neighbour landing
+/// between one test's `before` and its assertion. With only the two this crate
+/// had before the wire's arrival it still failed 1 time in 60, so the race
+/// predates that test rather than being caused by it. Every test that refuses
+/// a payload, or that reads the counter, takes this lock.
+///
+/// Poisoning is recovered from rather than propagated: a panic in one of these
+/// tests is that test's own failure, and turning it into a second failure in
+/// every other one hides which assertion actually broke.
+#[cfg(test)]
+pub(crate) static REFUSAL_LEDGER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`REFUSAL_LEDGER`] for the rest of the caller's scope.
+#[cfg(test)]
+pub(crate) fn hold_refusal_ledger() -> std::sync::MutexGuard<'static, ()> {
+    REFUSAL_LEDGER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Why a payload could not become a code plane.
 ///
 /// Every arm is a refusal and none is a truncation: a plane that silently
@@ -410,6 +439,10 @@ pub struct CodePlane {
     gates: usize,
     key: LutKey,
     reduce: Reduce,
+    /// The wire word size the codes arrived at, as [`CodePlane::build`] was
+    /// told — provenance, and the one build argument the plane cannot
+    /// re-derive from what it stores. See [`CodePlane::word_bits`].
+    word_bits: u8,
 }
 
 impl CodePlane {
@@ -475,6 +508,7 @@ impl CodePlane {
             gates,
             key,
             reduce,
+            word_bits,
         };
         plane.build_chain();
         Ok(plane)
@@ -625,9 +659,125 @@ impl CodePlane {
         self.codes.len() + self.mips.len()
     }
 
+    /// The wire word size this plane's codes arrived at — 8 or 16, whichever
+    /// [`CodePlane::build`] was told.
+    ///
+    /// **Provenance, and not re-derivable from what the plane stores.**
+    /// [`r8_fidelity`] answers which widths a product *admits*, which for
+    /// differential reflectivity is a strictly wider set than the one width
+    /// this sweep actually carried. So the wire carries the byte rather than
+    /// inferring it: an inference would be a second opinion about
+    /// admissibility on the decode side, and the two halves could then differ
+    /// about which sweeps are representable.
+    pub fn word_bits(&self) -> u8 {
+        self.word_bits
+    }
+
     /// Payloads refused since the process started.
     pub fn refusals() -> u64 {
         REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+// ── The wire form ────────────────────────────────────────────────────────────
+
+/// **A plane crosses the worker wire as a head block plus a flat tail**, and
+/// this is the head block's width.
+///
+/// The split is not a stylistic one. `8b22ca6f2` records what the alternative
+/// costs: the overlay reply appends its picture to the head, behind a
+/// variable-length block that states no byte length of its own, and *"the page
+/// cannot find the picture in it"* — a reader that has not walked the whole
+/// preceding list does not know where the pixels start, and the offset it does
+/// reach is not 4-aligned. A tail has its own length by construction and
+/// starts at offset zero, so the codes are addressable without walking
+/// anything.
+///
+/// The block is **exactly [`CodePlane::build`]'s arguments but the codes**, in
+/// declaration order, so the encoder and the decoder cannot come to disagree
+/// about what a plane is made of: `radials` `u32`, `gates` `u32`, the
+/// product's `u16` wire code, `scale` `f32`, `offset` `f32`, `word_bits` `u8`.
+impl CodePlane {
+    /// Bytes [`CodePlane::write_wire_head`] writes. Fixed — every field is a
+    /// scalar of stated width.
+    pub const WIRE_HEAD_BYTES: usize = 4 + 4 + 2 + 4 + 4 + 1;
+
+    /// The head block, little-endian.
+    ///
+    /// `radials` and `gates` are written as `u32` and cannot truncate:
+    /// [`CodePlane::build`] refuses anything past [`MAX_POLAR_RADIALS`] and
+    /// [`MAX_POLAR_GATES`], both far below `u32::MAX`, so a plane that exists
+    /// fits by construction.
+    pub fn write_wire_head(&self, out: &mut Vec<u8>) {
+        let dim = |n: usize| {
+            u32::try_from(n).expect("the shape caps bound both dimensions well below u32::MAX")
+        };
+        out.extend_from_slice(&dim(self.radials).to_le_bytes());
+        out.extend_from_slice(&dim(self.gates).to_le_bytes());
+        out.extend_from_slice(&self.key.product.wire_code().to_le_bytes());
+        out.extend_from_slice(&self.key.scale.to_le_bytes());
+        out.extend_from_slice(&self.key.offset.to_le_bytes());
+        out.push(self.word_bits);
+    }
+
+    /// **Level 0's codes and nothing else** — the flat tail.
+    ///
+    /// The mip chain does **not** cross. It is a pure function of level 0 and
+    /// the product's [`Reduce`], so sending it would be sending a derivation
+    /// the receiver can make and would hand a hostile payload a chain that
+    /// disagrees with the codes beneath it — a picture nobody measured, at
+    /// every zoom but the closest. `docs/radar-polar-design.md` §2.4 builds
+    /// the chain at upload for the same reason it is not a wire field.
+    ///
+    /// The saving is real and on the campaign's own axis: a surveillance
+    /// sweep's level 0 is 1,319,040 B against the whole chain's 1,758,832 B
+    /// (`a_surveillance_sweeps_plane_costs_what_the_chain_sums_to`), so the
+    /// transient the receiving side allocates is 25% smaller than the object
+    /// it builds.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.codes.clone()
+    }
+
+    /// [`CodePlane::to_bytes`] by move — the encoder's spelling, so a reply
+    /// does not hold two copies of a megabyte-plus buffer at once. It cannot
+    /// disagree with the borrowing form: both hand back the same field.
+    pub fn into_codes(self) -> Vec<u8> {
+        self.codes
+    }
+
+    /// The inverse of [`write_wire_head`](Self::write_wire_head) plus
+    /// [`to_bytes`](Self::to_bytes): read the block off `r` and rebuild.
+    ///
+    /// **Rebuilt through [`CodePlane::build`], not assembled field by field.**
+    /// That is what keeps the wire from acquiring a second opinion about
+    /// admissibility: the caps, the code-count check and the eight lossy
+    /// products' refusal are the producer's own, run again on the decode side
+    /// because they are the *same* function, and every refusal here lands in
+    /// [`CodePlane::refusals`] rather than in a counter of the wire's own.
+    ///
+    /// The one refusal that is **not** counted there is a product wire code
+    /// this build does not know: there is no [`LutKey`] to build with, so no
+    /// plane is ever attempted. It is an ordinary `None`, and the reply is
+    /// treated as a failed job.
+    pub fn from_wire(r: &mut squallar_source::wire::Reader<'_>, codes: Vec<u8>) -> Option<Self> {
+        let radials = r.u32()? as usize;
+        let gates = r.u32()? as usize;
+        let product = RadarProduct::from_wire_code(r.u16()?)?;
+        let scale = r.f32()?;
+        let offset = r.f32()?;
+        let word_bits = r.u8()?;
+        Self::build(
+            radials,
+            gates,
+            codes,
+            LutKey {
+                product,
+                scale,
+                offset,
+            },
+            word_bits,
+        )
+        .ok()
     }
 }
 

@@ -53,6 +53,7 @@ fn gated_render() -> (mpsc::Sender<()>, squallar_worker::offload::Job) {
                     nyquist_ms: None,
                     melting_layer_source: None,
                     storm_motion: None,
+                    codes: None,
                 },
             )))
         })),

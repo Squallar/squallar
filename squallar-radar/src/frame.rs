@@ -93,6 +93,20 @@ pub struct RenderedFrame {
     /// `None` for every raster that shifted nothing — which is every product
     /// but storm-relative velocity.
     pub storm_motion: Option<crate::srv::SrvMotion>,
+    /// **The same sweep's gates as codes, when this frame was produced on the
+    /// polar path** — `docs/radar-polar-design.md` §3.
+    ///
+    /// Mutually exclusive with [`image`](Self::image), which is why the two
+    /// travel as separate tails rather than as one tail that is sometimes
+    /// RGBA: a tail that changed meaning would carry no discriminant of its
+    /// own, so the head would need one anyway, at which point the third tail
+    /// costs its framing and nothing else.
+    ///
+    /// **`None` on every frame this build produces.** No renderer emits a
+    /// plane yet; the wire is landed ahead of the producer so the two halves
+    /// arrive in one reviewable piece rather than as a payload nothing can
+    /// carry.
+    pub codes: Option<crate::render::codes::CodePlane>,
 }
 
 impl From<crate::render::SweepRender> for RenderedFrame {
@@ -107,6 +121,9 @@ impl From<crate::render::SweepRender> for RenderedFrame {
             nyquist_ms: render.nyquist_ms,
             melting_layer_source: render.melting_layer_source,
             storm_motion: render.storm_motion,
+            // The renderer produces a raster. `SweepRender` has no plane to
+            // hand over, and this arm is where one would arrive when it does.
+            codes: None,
         }
     }
 }
@@ -131,6 +148,13 @@ impl squallar_source::job::JobOut for RenderedFrame {
     /// frame exists only past a wire decode, and the wire carries
     /// premultiplied rasters by contract (the premultiply moved to the
     /// producer), so it reports nothing to fix.
+    ///
+    /// **[`RenderedFrame::codes`] is deliberately not reachable from here**,
+    /// and could not be: codes are palette indices, so multiplying one by an
+    /// alpha produces a different gate's measurement rather than a dimmer
+    /// version of this one. The match below returns the raster arm alone, so
+    /// a plane is excluded by construction rather than by a check that could
+    /// be forgotten.
     fn straight_rasters_mut(&mut self) -> Vec<&mut [u8]> {
         match &mut self.image {
             RasterImage::Bytes(bytes) => vec![bytes],
@@ -139,9 +163,60 @@ impl squallar_source::job::JobOut for RenderedFrame {
     }
 }
 
+/// [`RenderedFrame::codes`] absent: the frame's surface is the raster in
+/// [`RenderedFrame::image`], and the code tail is empty.
+pub const SURFACE_RASTER: u8 = 0;
+
+/// [`RenderedFrame::codes`] present: the frame's surface is the code plane,
+/// and the image tail is empty.
+pub const SURFACE_CODES: u8 = 1;
+
 impl RenderedFrame {
+    /// The widest head this codec writes — every optional present *and* a code
+    /// plane's block behind them — so the reply's head is one allocation
+    /// whatever the frame carries.
+    ///
+    /// Arithmetic rather than a literal, and derived from the same terms
+    /// `a_malformed_frame_reply_is_refused_rather_than_misread` re-derives its
+    /// offsets from.
+    pub const WIRE_HEAD_MAX_BYTES: usize = 8
+        + (1 + 8)
+        + (1 + 1)
+        + (1 + 1 + 4 + 4)
+        + 1
+        + crate::render::codes::CodePlane::WIRE_HEAD_BYTES;
+
+    /// **The two mutually exclusive surface tails, in wire order —
+    /// `(codes, image)`.** Exactly one is non-empty.
+    ///
+    /// By move, because both are the largest buffers in the reply and a
+    /// borrowing form would put two copies of one of them in the process at
+    /// once — the shape `8b22ca6f2` measured at 75.4 MiB for a single overlay
+    /// picture.
+    ///
+    /// A frame carrying **both** a plane and a raster is a producer bug, not a
+    /// wire condition: the surface is whichever one the renderer built, and
+    /// nothing can construct a frame where that question has two answers
+    /// except code in this crate. The `debug_assert` is where that bug
+    /// surfaces; the decode's own refusal is where a *hostile* payload
+    /// claiming both is stopped, and the two are deliberately different
+    /// mechanisms because they are different failures.
+    pub fn into_surface_tails(self) -> (Vec<u8>, Vec<u8>) {
+        debug_assert!(
+            self.codes.is_none() || self.image.is_empty(),
+            "a frame has one surface: a code plane or a raster, never both",
+        );
+        match self.codes {
+            Some(plane) => (plane.into_codes(), Vec::new()),
+            None => (Vec::new(), self.image.into_bytes()),
+        }
+    }
+
     /// The frame's wire HEAD — the scalar block the reply direction's `OUT`
     /// payload carries for the three frame rows.
+    ///
+    /// The surface discriminant and the plane's block are written **last**, so
+    /// every field that was in this head before keeps the offset it had.
     pub fn write_head(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.max_range_km.to_le_bytes());
         match self.nyquist_ms {
@@ -167,10 +242,19 @@ impl RenderedFrame {
                 out.extend_from_slice(&motion.direction_deg.to_le_bytes());
             }
         }
+        match &self.codes {
+            None => out.push(SURFACE_RASTER),
+            Some(plane) => {
+                out.push(SURFACE_CODES);
+                plane.write_wire_head(out);
+            }
+        }
     }
 
+    /// The inverse of [`write_head`](Self::write_head) plus the three tails,
+    /// in the order [`crate::jobs`] pushes them: `[polar, codes, image]`.
     pub fn from_parts(head: &[u8], tails: Vec<Vec<u8>>) -> Option<Self> {
-        let Ok([polar_bytes, image]) = <[Vec<u8>; 2]>::try_from(tails) else {
+        let Ok([polar_bytes, code_bytes, image]) = <[Vec<u8>; 3]>::try_from(tails) else {
             return None;
         };
         let mut r = squallar_source::wire::Reader::new(head);
@@ -199,6 +283,28 @@ impl RenderedFrame {
             }
             _ => return None,
         };
+        // The surface, and with it which of the two exclusive tails carries
+        // this frame. Both halves of the exclusion are REFUSED rather than
+        // repaired: a reply that names one surface and fills the other tail is
+        // one this build did not write, and picking a winner would paint a
+        // picture out of whichever buffer happened to be believed.
+        let codes = match r.u8()? {
+            SURFACE_RASTER => {
+                if !code_bytes.is_empty() {
+                    return None;
+                }
+                None
+            }
+            SURFACE_CODES => {
+                if !image.is_empty() {
+                    return None;
+                }
+                Some(crate::render::codes::CodePlane::from_wire(
+                    &mut r, code_bytes,
+                )?)
+            }
+            _ => return None,
+        };
         if !r.at_end() {
             return None;
         }
@@ -213,6 +319,7 @@ impl RenderedFrame {
             nyquist_ms,
             melting_layer_source,
             storm_motion,
+            codes,
         })
     }
 }
@@ -324,6 +431,7 @@ mod tests {
                 direction_deg: 245.0,
                 source: crate::srv::StormMotionSource::BunkersRightMover,
             }),
+            codes: None,
         }
     }
 
@@ -338,22 +446,65 @@ mod tests {
             nyquist_ms: None,
             melting_layer_source: None,
             storm_motion: None,
+            codes: None,
+        }
+    }
+
+    /// A tiny code plane, built through the producer's own constructor so this
+    /// fixture cannot describe a plane [`crate::render::codes::CodePlane`]
+    /// would refuse.
+    fn a_code_plane() -> crate::render::codes::CodePlane {
+        crate::render::codes::CodePlane::build(
+            3,
+            4,
+            // 0 and 1 are the two sentinels; the rest are measurements, so the
+            // mip chain this shape produces is not all-sentinel.
+            vec![0, 1, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49],
+            crate::render::codes::LutKey {
+                product: crate::types::RadarProduct::Reflectivity,
+                scale: 2.0,
+                offset: 66.0,
+            },
+            8,
+        )
+        .expect("the fixture plane is inside every cap and its product is exact on R8")
+    }
+
+    /// **The polar fixture: a frame whose surface is a code plane.**
+    ///
+    /// Its `image` is empty, which is the exclusion the encode side asserts —
+    /// and the reason the fixture exists at all is that neither of the two
+    /// above reaches the head's surface block, so without it a build could
+    /// reorder the plane's shape and key fields and no round-trip and no
+    /// pinned row would see it. That is exactly the hole
+    /// `wire_identity::WIRE_HEIGHT_REPLY_ROWS` was written to close for the
+    /// height reply.
+    fn a_polar_frame() -> RenderedFrame {
+        RenderedFrame {
+            image: RasterImage::Bytes(Vec::new()),
+            max_range_km: 230.0,
+            polar: a_polar_field(),
+            nyquist_ms: Some(26.4),
+            melting_layer_source: None,
+            storm_motion: None,
+            codes: Some(a_code_plane()),
         }
     }
 
     /// Encode `frame` as the frame reply codec does — head via
-    /// [`RenderedFrame::write_head`], tails `[polar, image]` — cloning
+    /// [`RenderedFrame::write_head`], tails `[polar, codes, image]` — cloning
     /// where the codec moves, because these tests still hold the frame
     /// afterward.
     fn encode_parts(frame: &RenderedFrame) -> (Vec<u8>, Vec<Vec<u8>>) {
         let mut head = Vec::new();
         frame.write_head(&mut head);
-        (head, vec![frame.polar.to_bytes(), frame.image.to_bytes()])
+        let (codes, image) = frame.clone().into_surface_tails();
+        (head, vec![frame.polar.to_bytes(), codes, image])
     }
 
     #[test]
     fn the_frame_survives_its_own_codec_with_and_without_the_optionals() {
-        for frame in [a_full_frame(), a_bare_frame()] {
+        for frame in [a_full_frame(), a_bare_frame(), a_polar_frame()] {
             let (head, tails) = encode_parts(&frame);
             assert_eq!(
                 RenderedFrame::from_parts(&head, tails),
@@ -374,8 +525,9 @@ mod tests {
 
         assert_eq!(
             head.len(),
-            8 + (1 + 8) + (1 + 1) + (1 + 1 + 4 + 4),
-            "the fixture's head moved; re-derive the offsets",
+            8 + (1 + 8) + (1 + 1) + (1 + 1 + 4 + 4) + 1,
+            "the fixture's head moved; re-derive the offsets. The trailing 1 \
+             is the surface discriminant, which a raster frame spends alone",
         );
 
         for cut in 1..head.len() {
@@ -444,11 +596,20 @@ mod tests {
             "storm-motion code 4 was accepted",
         );
 
-        // The tail-count refusals: 0, 1 and 3 around the valid 2.
+        // The tail-count refusals: 0, 1, 2 and 4 around the valid 3.
         for (count, wrong) in [
             (0usize, Vec::new()),
             (1, vec![tails[0].clone()]),
-            (3, vec![tails[0].clone(), tails[1].clone(), Vec::new()]),
+            (2, vec![tails[0].clone(), tails[1].clone()]),
+            (
+                4,
+                vec![
+                    tails[0].clone(),
+                    tails[1].clone(),
+                    tails[2].clone(),
+                    Vec::new(),
+                ],
+            ),
         ] {
             assert_eq!(
                 RenderedFrame::from_parts(&head, wrong),
@@ -464,6 +625,176 @@ mod tests {
             None,
             "a doctored polar tail was accepted",
         );
+
+        // The surface discriminant is the head's last byte on a raster frame,
+        // and only the two named values decode.
+        let surface_at = head.len() - 1;
+        assert_eq!(
+            head[surface_at], SURFACE_RASTER,
+            "premise: a frame with no plane names the raster surface",
+        );
+        for tag in [SURFACE_CODES, 2, u8::MAX] {
+            let mut bad = head.clone();
+            bad[surface_at] = tag;
+            assert_eq!(
+                RenderedFrame::from_parts(&bad, tails.clone()),
+                None,
+                "surface tag {tag} on a head with no plane block was accepted",
+            );
+        }
+
+        // A raster frame's code tail is empty, and bytes in it are a reply
+        // this build did not write rather than a plane to believe.
+        let mut smuggled = tails.clone();
+        smuggled[1] = vec![7];
+        assert_eq!(
+            RenderedFrame::from_parts(&head, smuggled),
+            None,
+            "a raster-surfaced reply carrying codes in its code tail was accepted",
+        );
+    }
+
+    /// **The polar surface's own refusals** — the head block a raster frame
+    /// never writes, and the exclusion between the two surface tails.
+    #[test]
+    fn a_malformed_polar_frame_reply_is_refused_rather_than_misread() {
+        use crate::render::codes::CodePlane;
+
+        // The refusals below are counted, and the ledger is process-global.
+        let _ledger = crate::render::codes::hold_refusal_ledger();
+
+        let frame = a_polar_frame();
+        let (head, tails) = encode_parts(&frame);
+
+        // Control first: untouched parts decode, so every refusal below is the
+        // mutation's doing.
+        assert_eq!(
+            RenderedFrame::from_parts(&head, tails.clone()),
+            Some(frame.clone()),
+            "premise: the polar fixture survives its own codec",
+        );
+        assert_eq!(
+            tails[2],
+            Vec::<u8>::new(),
+            "premise: a plane's frame puts nothing in the image tail",
+        );
+        assert_eq!(
+            tails[1].len(),
+            3 * 4,
+            "premise: the code tail is level 0 and nothing else",
+        );
+
+        // The surface byte, then the plane's own block: shape, product, scale,
+        // offset, word size.
+        let surface_at = head.len() - 1 - CodePlane::WIRE_HEAD_BYTES;
+        assert_eq!(
+            head[surface_at], SURFACE_CODES,
+            "premise: a frame with a plane names the code surface",
+        );
+        assert_eq!(
+            head.len(),
+            // A Nyquist and nothing else, so this fixture's absent-optional
+            // tags cost a byte each: the head's length is not the raster
+            // fixture's, and both are re-derived rather than copied.
+            8 + (1 + 8) + 1 + 1 + 1 + CodePlane::WIRE_HEAD_BYTES,
+            "the polar fixture's head moved; re-derive the offsets",
+        );
+
+        // Truncating anywhere inside the plane block leaves a head no reader
+        // can finish.
+        for cut in surface_at + 1..head.len() {
+            assert_eq!(
+                RenderedFrame::from_parts(&head[..cut], tails.clone()),
+                None,
+                "the polar head truncated to {cut} bytes was accepted",
+            );
+        }
+
+        // Naming the raster surface leaves the plane block as trailing bytes,
+        // and leaves a non-empty code tail beside it.
+        let mut as_raster = head.clone();
+        as_raster[surface_at] = SURFACE_RASTER;
+        assert_eq!(
+            RenderedFrame::from_parts(&as_raster, tails.clone()),
+            None,
+            "a plane's head relabelled as a raster was accepted",
+        );
+
+        // A plane's frame with a picture in the image tail claims two
+        // surfaces. Refused, not resolved.
+        let mut both = tails.clone();
+        both[2] = vec![1, 2, 3, 4];
+        assert_eq!(
+            RenderedFrame::from_parts(&head, both),
+            None,
+            "a reply claiming both a code plane and a raster was accepted",
+        );
+
+        // The plane's own refusals reach `CodePlane::build`, so they land in
+        // the producer's counter rather than in one the wire minted. Each
+        // mutation is checked to move it by exactly one.
+        let shape_at = surface_at + 1;
+        let product_at = shape_at + 8;
+        for (what, doctor) in [
+            (
+                "a code tail that is not the declared shape",
+                Box::new(|_h: &mut Vec<u8>, t: &mut Vec<Vec<u8>>| {
+                    t[1].pop().expect("the fixture's code tail is not empty");
+                }) as Box<dyn Fn(&mut Vec<u8>, &mut Vec<Vec<u8>>)>,
+            ),
+            (
+                "a radial count past the cap",
+                Box::new(|h: &mut Vec<u8>, _t: &mut Vec<Vec<u8>>| {
+                    h[shape_at..shape_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+                }),
+            ),
+            (
+                "a gate count of zero",
+                Box::new(|h: &mut Vec<u8>, _t: &mut Vec<Vec<u8>>| {
+                    h[shape_at + 4..shape_at + 8].copy_from_slice(&0u32.to_le_bytes());
+                }),
+            ),
+            (
+                "a product an R8 plane cannot carry",
+                Box::new(|h: &mut Vec<u8>, _t: &mut Vec<Vec<u8>>| {
+                    let lossy = crate::types::RadarProduct::NormalizedRotation.wire_code();
+                    h[product_at..product_at + 2].copy_from_slice(&lossy.to_le_bytes());
+                }),
+            ),
+        ] {
+            let before = CodePlane::refusals();
+            let (mut h, mut t) = (head.clone(), tails.clone());
+            doctor(&mut h, &mut t);
+            assert_eq!(
+                RenderedFrame::from_parts(&h, t),
+                None,
+                "{what} was accepted",
+            );
+            assert_eq!(
+                CodePlane::refusals(),
+                before + 1,
+                "{what} was refused somewhere other than the producer's own \
+                 constructor, so the refusal counter did not see it",
+            );
+        }
+
+        // A product code this build does not know is refused BEFORE a plane is
+        // attempted -- there is no key to build one with -- so it is the one
+        // malformation that is not in that counter. Named rather than left to
+        // be discovered as a hole.
+        let before = CodePlane::refusals();
+        let mut unknown = head.clone();
+        unknown[product_at..product_at + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(
+            RenderedFrame::from_parts(&unknown, tails.clone()),
+            None,
+            "an unknown product wire code was accepted",
+        );
+        assert_eq!(
+            CodePlane::refusals(),
+            before,
+            "an unreadable head reached the plane constructor",
+        );
     }
 
     /// The trio travels atomically: one tag, three fields, so a half-formed
@@ -477,8 +808,9 @@ mod tests {
         assert_eq!(head[19], 0, "the storm tag encodes the absence");
         assert_eq!(
             head.len(),
-            20,
-            "nothing rides between an absent trio's tag and the head's end",
+            21,
+            "nothing rides between an absent trio's tag and the surface \
+             discriminant that closes the head",
         );
         let back = RenderedFrame::from_parts(&head, tails).expect("the absent form decodes");
         assert_eq!(back.storm_motion, None);

@@ -21,13 +21,19 @@ fn a_wire_decoded_frame_gives_its_buffer_to_the_image_without_a_copy() {
         nyquist_ms: None,
         melting_layer_source: None,
         storm_motion: None,
+        codes: None,
     };
 
     // Encoded exactly as the frame reply codec writes it, decoded through the
-    // same `from_parts` the wire path runs.
+    // same `from_parts` the wire path runs. The tails come from
+    // `into_surface_tails` rather than being written out here: the codec
+    // nominates `[polar, codes, image]` and a hand-built pair would stop
+    // being the codec's own answer the moment a tail is added.
     let mut head = Vec::new();
     frame.write_head(&mut head);
-    let tails = vec![frame.polar.to_bytes(), rgba.clone()];
+    let polar_tail = frame.polar.to_bytes();
+    let (codes, image) = frame.into_surface_tails();
+    let tails = vec![polar_tail, codes, image];
     let decoded = RenderedFrame::from_parts(&head, tails).expect("the frame reply decodes");
 
     let RasterImage::Pixels(pixels) = &decoded.image else {

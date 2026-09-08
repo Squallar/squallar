@@ -600,6 +600,7 @@ fn a_categorical_plane_is_one_level() {
 /// panic, and never an allocation sized by the claim.
 #[test]
 fn a_hostile_polar_payload_is_refused() {
+    let _ledger = super::hold_refusal_ledger();
     let key = LutKey::identity(RadarProduct::Reflectivity);
     let before = CodePlane::refusals();
 
@@ -668,6 +669,9 @@ fn a_hostile_polar_payload_is_refused() {
 /// regression.
 #[test]
 fn a_product_an_r8_plane_cannot_carry_is_refused() {
+    // This test refuses payloads too, so it is one of the neighbours whose
+    // bumps a delta-reading test would otherwise attribute to itself.
+    let _ledger = super::hold_refusal_ledger();
     let mut refused = Vec::new();
     let mut admitted = Vec::new();
     for &product in RadarProduct::all() {
@@ -767,4 +771,276 @@ fn a_surveillance_sweeps_plane_costs_what_the_chain_sums_to() {
     assert_eq!(plane.level(0).expect("level 0").0.len(), 1_319_040);
     // And the table that colours it, per sweep key rather than per frame.
     assert_eq!(Lut::build(key).to_rgba_bytes().len(), 1_024);
+}
+
+// ── The wire form ────────────────────────────────────────────────────────────
+
+/// The fixture the wire tests pin: a small plane with both sentinels and real
+/// measurements, at a shape whose chain is more than one level.
+fn a_wire_fixture() -> CodePlane {
+    CodePlane::build(
+        3,
+        4,
+        vec![0, 1, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49],
+        LutKey {
+            product: RadarProduct::Reflectivity,
+            scale: 2.0,
+            offset: 66.0,
+        },
+        8,
+    )
+    .expect("the fixture is inside every cap and its product is exact on R8")
+}
+
+/// **The bytes a plane puts on the wire are these bytes.**
+///
+/// Digest suite in the shape `render_input/tests.rs` and `render/polar/tests.rs`
+/// use — length and layout digest over a literal fixture — because the two
+/// things that can silently break a wire form are a reordered field and a
+/// retyped one, and neither moves a round-trip: the encoder and the decoder
+/// are one codec, so a symmetric change is invisible to a parity test. The
+/// same reasoning `wire_identity::WIRE_HEIGHT_REPLY_ROWS` records.
+///
+/// The head and the tail are pinned **separately** because that is how they
+/// travel: the head is scalars in the reply's `OUT` block, the tail is its own
+/// transferable buffer starting at offset zero.
+#[test]
+fn the_plane_wire_layout_is_the_one_this_protocol_ships() {
+    let plane = a_wire_fixture();
+
+    let mut head = Vec::new();
+    plane.write_wire_head(&mut head);
+    assert_eq!(
+        (head.len(), crate::wire::layout_digest(&head)),
+        (19, 0xe6e4_4710_6e47_1997),
+        "the head block `write_wire_head` writes moved. A field was added, \
+         removed, reordered or retyped -- and because `from_wire` is the same \
+         codec read backwards, nothing else in this crate can see that. The \
+         block is `CodePlane::build`'s own arguments but the codes: radials \
+         u32, gates u32, product u16, scale f32, offset f32, word_bits u8.",
+    );
+    assert_eq!(
+        head.len(),
+        CodePlane::WIRE_HEAD_BYTES,
+        "the constant and the writer disagree about the block's width",
+    );
+
+    let tail = plane.to_bytes();
+    assert_eq!(
+        (tail.len(), crate::wire::layout_digest(&tail)),
+        (12, 0x6c2b_85b6_2288_e8a5),
+        "the code tail moved",
+    );
+}
+
+/// **A plane survives its own wire form, chain and all.**
+///
+/// Over every product an R8 plane admits, at both wire word sizes and at
+/// shapes that exercise the odd-dimension ceil-halving, because the chain is
+/// rebuilt on the far side rather than carried and a rebuild that disagreed
+/// with the original would be a different picture at every zoom but the
+/// closest.
+#[test]
+fn a_plane_survives_its_own_wire_form() {
+    let mut checked = 0usize;
+    for &product in RadarProduct::all() {
+        for &(scale, offset) in KEYS {
+            for &(radials, gates) in &[(1usize, 1usize), (3, 4), (7, 5), (2, 9)] {
+                for word_bits in [8u8, 16] {
+                    let key = LutKey {
+                        product,
+                        scale,
+                        offset,
+                    };
+                    let codes = woven_codes(radials, gates, 3);
+                    let Ok(plane) = CodePlane::build(radials, gates, codes, key, word_bits) else {
+                        continue;
+                    };
+
+                    let mut head = Vec::new();
+                    plane.write_wire_head(&mut head);
+                    let tail = plane.to_bytes();
+                    let mut r = crate::wire::Reader::new(&head);
+                    let back = CodePlane::from_wire(&mut r, tail.clone())
+                        .expect("a plane this build wrote is a plane this build reads");
+                    assert!(r.at_end(), "the head block left bytes unread");
+                    // Compared as BYTES rather than as values, because
+                    // `KEYS` carries a NaN scale on purpose and NaN is not
+                    // equal to itself: a value comparison would report every
+                    // non-finite key as a round-trip failure while the bits
+                    // crossed intact. The struct comparison below covers
+                    // everything that can be compared as a value.
+                    let mut back_head = Vec::new();
+                    back.write_wire_head(&mut back_head);
+                    assert_eq!(
+                        (&back_head, &back.to_bytes()),
+                        (&head, &tail),
+                        "{product:?} at ({scale}, {offset}) {radials}x{gates} \
+                         w{word_bits} did not survive its own wire form",
+                    );
+                    if !scale.is_nan() && !offset.is_nan() {
+                        assert_eq!(
+                            back, plane,
+                            "{product:?} at ({scale}, {offset}) \
+                             {radials}x{gates} w{word_bits}: the rebuilt \
+                             plane is not the one that was sent",
+                        );
+                    }
+                    // The provenance byte is carried, not inferred: nothing in
+                    // the plane could re-derive it, and inferring it would be
+                    // a second opinion about which sweeps are representable.
+                    assert_eq!(back.word_bits(), word_bits);
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        checked >= 100,
+        "the sweep degenerated to {checked} planes; a round-trip that round-trips \
+         nothing is not evidence",
+    );
+}
+
+/// **The mip chain is rebuilt on the far side, not sent.**
+///
+/// The tail is level 0 alone, so what crosses is strictly smaller than the
+/// object built from it — and a hostile payload cannot supply a chain that
+/// disagrees with the codes beneath it, because there is no chain to supply.
+#[test]
+fn the_wire_carries_level_zero_and_the_chain_is_rebuilt() {
+    let plane = a_wire_fixture();
+    let (radials, gates) = plane.shape();
+    assert_eq!(plane.to_bytes().len(), radials * gates);
+    assert!(
+        plane.levels() > 1,
+        "premise: this fixture has a chain to leave behind",
+    );
+    assert!(
+        plane.to_bytes().len() < plane.resident_bytes(),
+        "the tail is the whole object, so nothing is being rebuilt",
+    );
+    // And the two spellings of the tail are the same bytes: one borrows, one
+    // moves, and the encoder uses the moving one so a reply never holds two
+    // copies of a megabyte-plus buffer.
+    assert_eq!(plane.to_bytes(), plane.clone().into_codes());
+}
+
+/// **A doctored plane payload is refused, and counted where the producer
+/// counts.**
+///
+/// The decode goes through `CodePlane::build`, so the caps, the code-count
+/// check and the eight lossy products' refusal are the producer's own rather
+/// than a second opinion the wire grew — and the evidence a hostile sweep
+/// arrived lands in the one always-on ledger.
+#[test]
+fn a_doctored_plane_payload_is_refused_and_counted() {
+    let _ledger = super::hold_refusal_ledger();
+    let plane = a_wire_fixture();
+    let mut head = Vec::new();
+    plane.write_wire_head(&mut head);
+    let tail = plane.to_bytes();
+
+    // Control: the untouched pair decodes and costs no refusal.
+    let before = CodePlane::refusals();
+    assert!(CodePlane::from_wire(&mut crate::wire::Reader::new(&head), tail.clone()).is_some());
+    assert_eq!(CodePlane::refusals(), before, "a good payload was counted");
+
+    let counted = |what: &str, head: &[u8], tail: Vec<u8>| {
+        let before = CodePlane::refusals();
+        assert_eq!(
+            CodePlane::from_wire(&mut crate::wire::Reader::new(head), tail),
+            None,
+            "{what} was accepted",
+        );
+        assert_eq!(
+            CodePlane::refusals(),
+            before + 1,
+            "{what} was refused somewhere other than the producer's own constructor",
+        );
+    };
+
+    counted("a code buffer shorter than its declared shape", &head, {
+        let mut short = tail.clone();
+        short.pop();
+        short
+    });
+    counted("a code buffer longer than its declared shape", &head, {
+        let mut long = tail.clone();
+        long.push(0);
+        long
+    });
+    counted(
+        "a radial count past the cap",
+        &{
+            let mut h = head.clone();
+            h[0..4].copy_from_slice(&(MAX_POLAR_RADIALS as u32 + 1).to_le_bytes());
+            h
+        },
+        tail.clone(),
+    );
+    counted(
+        "a gate count past the cap",
+        &{
+            let mut h = head.clone();
+            h[4..8].copy_from_slice(&(MAX_POLAR_GATES as u32 + 1).to_le_bytes());
+            h
+        },
+        tail.clone(),
+    );
+    counted(
+        "a product an R8 plane cannot carry",
+        &{
+            let mut h = head.clone();
+            h[8..10].copy_from_slice(&RadarProduct::NormalizedRotation.wire_code().to_le_bytes());
+            h
+        },
+        tail.clone(),
+    );
+    counted(
+        "a wide wire word for a product that is exact only at eight bits",
+        &{
+            let mut h = head.clone();
+            h[8..10].copy_from_slice(
+                &RadarProduct::DifferentialReflectivity
+                    .wire_code()
+                    .to_le_bytes(),
+            );
+            h[18] = 16;
+            h
+        },
+        tail.clone(),
+    );
+
+    // A product code this build does not know cannot reach the constructor --
+    // there is no key to build with -- so it is refused WITHOUT reaching the
+    // ledger. Named here rather than left as a hole someone finds later.
+    let before = CodePlane::refusals();
+    let mut unknown = head.clone();
+    unknown[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+    assert_eq!(
+        CodePlane::from_wire(&mut crate::wire::Reader::new(&unknown), tail.clone()),
+        None,
+        "an unknown product wire code was accepted",
+    );
+    assert_eq!(
+        CodePlane::refusals(),
+        before,
+        "an unreadable head reached the plane constructor",
+    );
+
+    // A truncated head is refused at every cut, and none of them is a plane.
+    let before = CodePlane::refusals();
+    for cut in 0..head.len() {
+        assert_eq!(
+            CodePlane::from_wire(&mut crate::wire::Reader::new(&head[..cut]), tail.clone()),
+            None,
+            "the plane head truncated to {cut} bytes was accepted",
+        );
+    }
+    assert_eq!(
+        CodePlane::refusals(),
+        before,
+        "a head that ran out mid-field reached the plane constructor",
+    );
 }

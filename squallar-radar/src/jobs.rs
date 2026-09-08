@@ -28,10 +28,15 @@ macro_rules! frame_reply_codec {
     ($spec:ty) => {
         impl JobOutCodec for $spec {
             fn encode_out(v: RenderedFrame, head: &mut Vec<u8>, tails: &mut Vec<Vec<u8>>) {
-                head.reserve_exact(29);
+                head.reserve_exact(RenderedFrame::WIRE_HEAD_MAX_BYTES);
                 v.write_head(head);
                 tails.push(v.polar.to_bytes());
-                tails.push(v.image.into_bytes());
+                // The two surface tails, in the order `from_parts` reads them.
+                // Exactly one is non-empty, and which one the head's surface
+                // discriminant states.
+                let (codes, image) = v.into_surface_tails();
+                tails.push(codes);
+                tails.push(image);
             }
 
             fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RenderedFrame> {
@@ -769,6 +774,7 @@ mod tests {
                 nyquist_ms: Some(8.5),
                 melting_layer_source: None,
                 storm_motion: None,
+                codes: None,
             };
             let mut head = Vec::new();
             let mut tails = Vec::new();
@@ -786,8 +792,8 @@ mod tests {
             );
             assert_eq!(
                 tails.len(),
-                2,
-                "`{}`: the frame nominates two tails (which two, and in \
+                3,
+                "`{}`: the frame nominates three tails (which three, and in \
                  what order, is the frame-reply digest rows' pin)",
                 row.label,
             );
