@@ -81,6 +81,65 @@
 #             see HUGE_WINDOW below) passes while claiming a size it never
 #             rendered at, which is the same "verdict the rig has not earned"
 #             this file's run-id binding exists to end.
+#   wideloop  NOT IN THE DEFAULT ROSTER -- opt in with RIG_LEGS="wideloop".
+#             THE USER'S OWN CONFIGURATION, which until this leg no row here
+#             expressed: the `long` leg's scene (all seventeen layers, MRMS and
+#             GMGSI among them, and a PLAYING loop) at the `wide` leg's canvas
+#             AND at its world zoom -- 2878x1651 asked, 2878x1566 met, zoom 3.0
+#             centred on the CONUS. Every existing leg has a strict subset of
+#             that:
+#
+#               long       the layers and the loop, at the browser default
+#                          (1280x757 chromium / 1280x815 firefox), default zoom
+#               wide       the canvas and the world zoom, TWO layers, no loop
+#               huge       the layers, the loop and the canvas -- and the
+#                          pane's own zoom over KTLX, not the world view
+#
+#             The union is the configuration a user reported the app freezing
+#             the whole browser in, and the gap it closes is the zoom: a
+#             world-zoom viewport at 2878 points projects far more gridded
+#             points and asks for a tile span neither `long` nor `huge` does,
+#             on top of the loop's granules. Whether that is WORSE than `long`
+#             was unmeasured, and unmeasurable, until this leg existed.
+#
+#             It samples. Every other leg here reads its levels at a handful
+#             of moments, which is enough for a question about a level that
+#             stays readable; this scene DIES, and after the trap nothing moves
+#             again. Measured on the reproducing `long` runs: the overlay grids
+#             saturate near 210 MiB by t+6 s, decoded loop volumes then arrive
+#             at ~100 MB/s onto a page already past 600 MiB, and 1024 MiB is
+#             reached at t+10.3 s -- a fatal window about four seconds wide. So
+#             `--sample-tsv` writes one row every two seconds (the app's own
+#             telemetry tick) through the settle AND the data window, carrying
+#             the app's `frame cadence`, both `linear` figures WITH the two
+#             `heap max` ceilings beside them, the four admission counters, the
+#             census's overlay-grid and loop-scan bytes, and this box's
+#             1-minute load average at that instant. A leg sampling slower
+#             reports the death without the approach, and the approach is the
+#             finding.
+#
+#             THE TSV CARRIES ITS OWN IDENTITY. Commit, wall clock, the sha256
+#             of the seed that produced the scene and the sha256 of the wasm
+#             that ran it are written into the file before the browser starts
+#             (`sample_header_lines`). A name is not an identity: a directory
+#             letter standing in for a commit and an mtime standing in for a
+#             leg start both stood for an hour on 2026-09-07 because nothing
+#             inside either artefact could contradict them.
+#
+#             TWO ASSERTIONS BEYOND THE ROSTER'S USUAL, and they are two
+#             readings of one wall, never added: --expect-linear-headroom 64
+#             (the page instance stayed 64 MiB clear of the ceiling THE APP
+#             REPORTS, not of a number typed here) and
+#             --expect-no-alloc-failure (no `alloc failed:` line reached either
+#             ring). The trap count already gates the corpse; these two name
+#             the cause.
+#
+#             HELD OUT OF THE DEFAULT ROSTER on `huge`'s terms and for `huge`'s
+#             reason: the defect it reproduces is live and owned elsewhere, and
+#             defaulting it now would redden this gate for every session in
+#             this tree over a bug none of them introduced. It goes into the
+#             default the day this scene can go green, and at that point it is
+#             the thing that proves the fix.
 #   tilecache NOT IN THE DEFAULT ROSTER -- opt in with RIG_LEGS="tilecache".
 #             One pane at zoom 14 over a dense city core, the basemap on and
 #             nobody touching the page, and ONE assert beyond liveness: over
@@ -408,6 +467,85 @@ WIDE_WINDOW_S="${RIG_WIDE_WINDOW_S:-50}"
 WIDE_PROGRESS_WINDOW="${RIG_WIDE_PROGRESS_WINDOW:-20}"
 
 # ---------------------------------------------------------------------------
+# THE `wideloop` LEG: the user's own configuration, and the union no leg had
+# ---------------------------------------------------------------------------
+#
+# THE SEED IS COMPOSED, NOT COPIED. It is `LONG_SEED_LS` with the `wide` leg's
+# zoom and centre spliced into the pane, so the layer set and the playing loop
+# are LITERALLY the `long` leg's -- one source of truth for the seventeen
+# layers, and a third hand-maintained copy of that list is exactly how a scene
+# drifts from the scene its comment claims. The splice is checked in
+# `--selftest`, offline: a bash whose substitution semantics moved would
+# otherwise run the `long` scene under this leg's name and report it as a
+# world-zoom finding.
+WIDELOOP_PANE_ANCHOR='{\"site\":\"KTLX\",'
+WIDELOOP_PANE_SPLICE='{\"site\":\"KTLX\",\"zoom\":3.0,\"center\":[39.83,-98.58],'
+WIDELOOP_SEED_LS="${LONG_SEED_LS/"$WIDELOOP_PANE_ANCHOR"/"$WIDELOOP_PANE_SPLICE"}"
+
+# The `wide` leg's geometry, BY REFERENCE and not by value: this leg's whole
+# claim is that it is that canvas carrying the `long` leg's scene, and two
+# numbers that have to be kept equal by hand are two numbers that will not be.
+# `--expect-canvas` rides along, which `wide` does not carry: a leg whose point
+# is the size must fail rather than quietly report a smaller one.
+WIDELOOP_WINDOW="${RIG_WIDELOOP_WINDOW:-$WIDE_WINDOW}"
+WIDELOOP_CANVAS="${RIG_WIDELOOP_CANVAS:-$WIDE_CANVAS}"
+
+# 6 + 54 = 60 s. The deaths this scene is built from land at t+10.3 s (`long`,
+# 1280 wide) and t+14-16 s (`huge`, this canvas), so 60 s is roughly 4x the
+# slowest of them -- `wide`'s length, for `wide`'s reason, and not `long`'s 150
+# because this leg is not waiting for granules to accumulate before the wall is
+# reached. The settle is SIX and not ten: the sampler runs through the settle,
+# but the rAF warm sample between settle and data window does not sample, and a
+# ten-second settle would put that gap on top of the fatal window.
+WIDELOOP_SETTLE="${RIG_WIDELOOP_SETTLE:-6}"
+WIDELOOP_WINDOW_S="${RIG_WIDELOOP_WINDOW_S:-54}"
+WIDELOOP_PROGRESS_WINDOW="${RIG_WIDELOOP_PROGRESS_WINDOW:-20}"
+# Two seconds because that is the app's own telemetry tick: a faster cadence
+# re-reads the same console lines and buys nothing but rows.
+WIDELOOP_SAMPLE_INTERVAL="${RIG_WIDELOOP_SAMPLE_INTERVAL:-2}"
+# MiB of clearance the page must keep from the ceiling IT REPORTS. 64 and not
+# 0: an allocation is refused at the wall, so a leg that only failed AT 1024
+# would be reporting the trap the trap counter already reports. This one is
+# supposed to see the approach.
+WIDELOOP_LINEAR_HEADROOM="${RIG_WIDELOOP_LINEAR_HEADROOM:-64}"
+
+# rAF deltas in the warm sample, and this leg lowers the rig default of 120 for
+# a reason that is not about rAF at all. The warm sample is the one stretch of
+# the leg the census sampler cannot see into, and its LENGTH IS SET BY THE PAGE
+# -- 120 deltas is 2 s at 60 Hz and was 29 s on the chromium arm of this scene,
+# which draws at p50 172 ms under a 2878x1566 canvas at world zoom. Measured
+# 2026-09-08: that hole contained the first allocation refusal on both
+# browsers. 30 deltas keeps the rAF figure (a p50 and a p95 over 30 samples is
+# still a reading) and shortens the blind stretch by 4x, and the two samples
+# drive.py now takes on either side of it bound whatever is left.
+WIDELOOP_FRAMES="${RIG_WIDELOOP_FRAMES:-30}"
+
+# The identity lines written INTO the sample TSV before the browser starts.
+# Every fact here is one only the runner holds -- the commit, the seed, the
+# bundle -- and every one of them is hashed or read rather than named: a
+# directory called `A` is not a commit and an mtime is not a leg start.
+sample_header_lines() {
+  local tsv="$1" seed="$2" tag="$3"
+  local wasm="$WEB_DIR/pkg/squallar_web_bg.wasm"
+  {
+    echo "# tier2 leg=$tag rig=$RIG_DIR"
+    echo "# commit=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "# commit_subject=$(git -C "$REPO_ROOT" log -1 --format=%s 2>/dev/null | cut -c1-120)"
+    echo "# tree_dirty=$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null | wc -l) file(s) modified"
+    echo "# started_host_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ) started_host_epoch=$(date +%s)"
+    echo "# seed_sha256=$(printf '%s' "$seed" | sha256sum | cut -d" " -f1)"
+    echo "# wasm=$wasm"
+    echo "# wasm_sha256=$(sha256sum "$wasm" 2>/dev/null | cut -d" " -f1)"
+    echo "# wasm_bytes=$(stat -c%s "$wasm" 2>/dev/null)"
+    echo "# pin_clock=$LONG_PIN_CLOCK canvas_asked=$WIDELOOP_CANVAS window=$WIDELOOP_WINDOW"
+    echo "# host_uname=$(uname -sr) host_loadavg_at_start=$(cut -d" " -f1-3 /proc/loadavg 2>/dev/null)"
+    echo "# clocks: t_host_iso is THIS BOX'\''s wall clock; t_page_ms is the PAGE'\''s"
+    echo "#   Date.now(), which serve.py --pin-clock moves to $LONG_PIN_CLOCK."
+    echo "#   They are two clocks and differencing across them is meaningless."
+  } >> "$tsv"
+}
+
+# ---------------------------------------------------------------------------
 # THE `huge` LEG: the size the app is actually used at
 # ---------------------------------------------------------------------------
 #
@@ -426,6 +564,57 @@ WIDE_PROGRESS_WINDOW="${RIG_WIDE_PROGRESS_WINDOW:-20}"
 # while the app is dead. The app's own frame counter is again the only witness,
 # which is why this leg carries --expect-frame-progress rather than a
 # screenshot.
+#
+# CORRECTION 2026-09-08: THE SIZE IS THE AMPLIFIER, NOT THE CAUSE, AND THE
+# PANIC TEXT NAMES NEITHER.
+#
+# The two paragraphs above are observations and they hold: this scene dies at
+# 2878x1651 and survives at the browser default. What does NOT follow -- and
+# what this block used to invite a reader to conclude -- is that the canvas is
+# an independent defect from the `long` leg's MRMS abort. It is the same wall.
+# Read off the artefacts under ~/.cache/rustdar-fb-rig-out/ rather than off the
+# symptom, and every recorded `huge` death is an allocation refused against a
+# 1024 MiB linear memory:
+#
+#   wo25b-huge-2026-09-04, the refusals themselves (bytes ASKED FOR, and where
+#   the heap stood when the allocator said no):
+#     chromium.huge           78,389,248 B at  993 of 1024 MiB   (1 panic, 18 traps)
+#     chromium.huge attempt1  73,496,033 B at  978; 49,042,152 B at 999
+#     firefox.huge             7,281,678 B at 1023;  3,967,488 B at 1020
+#     firefox.huge attempt1   49,042,152 B at 1018;     69,098 B at 1024 of 1024
+#
+#   wo30-huge-*, which carries NO refusal line at all -- a DIFFERENT reading,
+#   never added to the one above: the `budget state:` line's PAGE linear level
+#   at the last tick before the end.
+#     chromium.huge attempt1  linear 1000/446 MiB   (page/worker)
+#     firefox.huge             linear  941/580 MiB
+#
+# The two families are what make the attribution: the wo25b lines PREDATE the
+# instance word (`... MiB linear in page` was appended later), and on a desktop
+# BOTH instances are given the same 1024 MiB ceiling by squallar-web/heap.js,
+# so those lines establish the WALL and cannot name the heap. The wo30 budget
+# readings can, and do: it is the PAGE that arrives within 24-83 MiB of its
+# ceiling. What the canvas buys the failure is baseline -- more rasters, more
+# tiles, more textures on the page heap -- and the page then dies of the wall
+# the `long` reproduction dies at, a few seconds sooner.
+#
+# WHY THE TWO EVER LOOKED LIKE SEPARATE DEFECTS, and this is the sentence this
+# block most needed: this target is `panic-strategy = "abort"`, so NOTHING
+# unwinds, and ANY abort inside the requestAnimationFrame callback leaves
+# winit's `Shared::runner` RefCell mutably borrowed for the life of the page.
+# `RefCell already borrowed` is therefore the terminal symptom of EVERY death
+# in that callback and cannot discriminate between them. It is a LOCATION, not
+# a cause. A reader who takes it for one sizes the fix against the canvas
+# rather than against the page.
+#
+# AND WHAT IS STILL OPEN, stated so nobody reads the correction as more than
+# it is: every artefact quoted above predates the heap-census families, so not
+# one of them carries a `heap census (...)` line and there is no residue figure
+# at this canvas -- verified, not assumed (no census line in any of the eight
+# JSONs). Whether removing the loop's decoded volumes is ENOUGH at 2878x1651 is
+# therefore unanswered. A two-arm run answers it; no projection does. The
+# `wideloop` leg below samples the census every two seconds precisely so that
+# the next reading of this scene does not have this hole in it.
 #
 # 45 s of window and not 140: the death is at +14-16 s on a scene that
 # reproduces, so this clears it by ~3x while keeping the leg affordable. If a
@@ -546,7 +735,8 @@ done
 # process group id gets killed on behalf of a process that already exited.
 preserve_attempt() {
   local tag="$1" n=0 sfx src
-  for sfx in json driver.log driver.stderr xvfb.log canvas.png page.png mem.tsv; do
+  for sfx in json driver.log driver.stderr xvfb.log canvas.png page.png \
+             mem.tsv samples.tsv; do
     src="$OUT_DIR/$tag.$sfx"
     [ -e "$src" ] || continue
     mv "$src" "$OUT_DIR/$tag.attempt1.$sfx" && n=$((n + 1))
@@ -600,10 +790,58 @@ if [ "$SELFTEST" = 1 ]; then
       LIVE "$(cat "$st_dir/firefox.attempt1.json" 2>/dev/null)"
 
   rm -rf "$st_dir"
+
+  # THE COMPOSED SCENE IS THE SCENE THIS FILE CLAIMS. `WIDELOOP_SEED_LS` is
+  # `LONG_SEED_LS` with a zoom and a centre spliced in by bash parameter
+  # substitution -- one source of truth for the seventeen layers, and a silent
+  # no-op if that substitution ever stops matching. A leg running the `long`
+  # scene under the `wideloop` name would report the default zoom's numbers as
+  # a world-zoom finding, so the splice is checked here, offline, before any
+  # browser starts. Checked through the JSON rather than by grepping the
+  # string: a seed that no longer parses enables nothing and every downstream
+  # assertion reads as an app defect.
+  wl_check="$("$PY" - "$WIDELOOP_SEED_LS" "$LONG_SEED_LS" <<'EOF'
+import json, sys
+wide, long_ = sys.argv[1], sys.argv[2]
+bad = []
+try:
+    pane = json.loads(json.loads(wide)["squallar.ui"])["panes"][0]
+    lpane = json.loads(json.loads(long_)["squallar.ui"])["panes"][0]
+except Exception as e:
+    print("FAIL the composed seed is not the JSON this script claims: %s" % e)
+    raise SystemExit(0)
+if pane.get("zoom") != 3.0:
+    bad.append("zoom is %r, not the world zoom 3.0" % (pane.get("zoom"),))
+if pane.get("center") != [39.83, -98.58]:
+    bad.append("centre is %r, not the CONUS centre" % (pane.get("center"),))
+if pane.get("loop_playback") != "playing":
+    bad.append("the loop is %r, not playing" % (pane.get("loop_playback"),))
+if pane.get("enabled_overlays") != lpane.get("enabled_overlays"):
+    bad.append("the layer set is NOT the long leg's")
+for layer in ("Mrms", "Gmgsi"):
+    if not (pane.get("enabled_overlays") or {}).get(layer):
+        bad.append("%s is not enabled; it is half the scene" % layer)
+if pane.get("site") != lpane.get("site"):
+    bad.append("the site moved: %r vs %r" % (pane.get("site"), lpane.get("site")))
+if wide == long_:
+    bad.append("the splice was a NO-OP: this leg would run the long scene")
+for b in bad:
+    print("FAIL %s" % b)
+if not bad:
+    print("ok the wideloop seed is the long scene at world zoom")
+EOF
+)"
+  while IFS= read -r line; do
+    case "$line" in
+      ok\ *) echo "  ${line}" ;;
+      *) echo "  $line"; st_fails=$((st_fails + 1)) ;;
+    esac
+  done <<< "$wl_check"
+
   if [ "$st_fails" -eq 0 ]; then
-    echo "run_tier2 SELFTEST PASS (7 checks)"; exit 0
+    echo "run_tier2 SELFTEST PASS (7 preserve checks + the wideloop seed)"; exit 0
   fi
-  echo "run_tier2 SELFTEST FAIL ($st_fails of 7)" >&2; exit 1
+  echo "run_tier2 SELFTEST FAIL ($st_fails)" >&2; exit 1
 fi
 
 if [ -z "${RIG_GECKODRIVER:-}" ]; then
@@ -836,6 +1074,7 @@ run_pass() {
   # before producing anything leaves an EMPTY slot rather than the last run's
   # verdict wearing this run's name.
   rm -f "$OUT_DIR/$tag.json" \
+        "$OUT_DIR/$tag.samples.tsv" \
         "$OUT_DIR/$tag.page.png" "$OUT_DIR/$tag.canvas.png" \
         "$OUT_DIR/$tag.fail.png" "$OUT_DIR/$tag.driver.log" \
         "$OUT_DIR/$tag.driver.stderr" "$OUT_DIR/$tag.xvfb.log"
@@ -844,7 +1083,24 @@ run_pass() {
     firefox)  driver="$GECKODRIVER" ;;
     *) echo "unknown browser: $browser" >&2; return 1 ;;
   esac
-  if [ "$leg" = huge ]; then
+  if [ "$leg" = wideloop ]; then
+    # The `long` leg's scene at the `wide` leg's canvas AND world zoom -- the
+    # union a user was in, which no other leg here expresses. See the
+    # WIDELOOP block above for the seed's composition and for the sampler.
+    SEED="$WIDELOOP_SEED_LS"
+    server_args+=(--pin-clock "$LONG_PIN_CLOCK")
+    drive_args+=(--expect-loop-or-refusal)
+    drive_args+=(--canvas "$WIDELOOP_CANVAS" --expect-canvas
+                 --window "$WIDELOOP_WINDOW"
+                 --settle "$WIDELOOP_SETTLE" --data-window "$WIDELOOP_WINDOW_S"
+                 --expect-frame-progress "$WIDELOOP_PROGRESS_WINDOW"
+                 --expect-no-alloc-failure
+                 --expect-linear-headroom "$WIDELOOP_LINEAR_HEADROOM"
+                 --sample-tsv "$OUT_DIR/$tag.samples.tsv"
+                 --sample-interval "$WIDELOOP_SAMPLE_INTERVAL"
+                 --frames "$WIDELOOP_FRAMES")
+    sample_header_lines "$OUT_DIR/$tag.samples.tsv" "$SEED" "$tag"
+  elif [ "$leg" = huge ]; then
     # The long leg's scene at the user's canvas. Same seventeen layers and the
     # same playing loop -- the freeze reproduces on a scene that is drawing,
     # and this leg differs from `long` in SIZE, which is the variable under
@@ -1231,6 +1487,36 @@ for leg in legs:
                  fp.get("stale_ms"), fp.get("in_window")))
         if fp.get("error"):
             print("%-18s   frame progress: %s" % ("", fp["error"]))
+    # THE WALL AND THE APPROACH TO IT. Two readings, never added: how close the
+    # page's own linear memory came to the ceiling THE APP REPORTS, and what
+    # the allocator refused when it got there. Printed whenever the leg asked
+    # for them, pass or fail, because the headroom is the figure the fix will
+    # be judged by and a green that does not say 424 MiB is not evidence.
+    lh = r.get("linear_headroom")
+    if lh is not None:
+        print("%-18s   linear page peak %s of %s MiB ceiling (headroom %s MiB, "
+              "want >= %s) %s"
+              % ("", lh.get("peak_page_mib"), lh.get("ceiling_page_mib"),
+                 lh.get("headroom_mib"), lh.get("want_headroom_mib"),
+                 "OK" if lh.get("ok") else "FAILED"))
+        if lh.get("error"):
+            print("%-18s   linear headroom: %s" % ("", lh["error"]))
+    afl = r.get("alloc_failures")
+    if afl is not None:
+        print("%-18s   alloc refusals %s%s %s"
+              % ("", afl.get("count"),
+                 (" on " + ", ".join(afl.get("instances") or []))
+                 if afl.get("count") else "",
+                 "OK" if afl.get("ok") else "FAILED"))
+        if afl.get("first"):
+            print("%-18s   first refusal: %s" % ("", afl["first"][:160]))
+    cs = r.get("census_samples")
+    if cs is not None:
+        print("%-18s   census samples %s rows every %ss over leg %s-%s s "
+              "(%s probe errors) -> %s"
+              % ("", cs.get("rows"), cs.get("interval_s"),
+                 cs.get("first_leg_s"), cs.get("last_leg_s"),
+                 cs.get("probe_errors"), cs.get("path")))
     if v.get("first_wasm_trap"):
         print("%-18s   first wasm trap: %s"
               % ("", str(v["first_wasm_trap"]).splitlines()[0][:160]))

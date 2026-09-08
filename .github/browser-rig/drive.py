@@ -3083,6 +3083,110 @@ return { attached: attached, different: different, off_frame: off_frame,
 #
 # NO figure scraped here ever gates CI; the only gate built on these lines is
 # --expect-interaction-frames, a count assert.
+# THE APPROACH, NOT ONLY THE DEATH.
+#
+# Every other scrape in this file is read at a handful of moments -- after
+# settle, mid-window, at the end -- because every other question here is about
+# a level or a total that is still there to be read when the leg stops. The
+# question this one answers is not: the `wideloop` leg's page climbs to its
+# linear-memory ceiling and traps, and after the trap NOTHING moves again, so a
+# reading taken afterwards describes a corpse. Measured on the reproducing
+# `long` runs: the grids saturate near 210 MiB by t+6 s, decoded loop volumes
+# then arrive at roughly 100 MB/s onto a page already past 600 MiB, and the
+# 1024 MiB wall is hit at t+10.3 s. The fatal window is about four seconds
+# wide. A leg sampling slower than that reports the death without the approach,
+# and the approach is the finding.
+#
+# So this probe is deliberately NARROW and cheap enough to run every two
+# seconds: the newest reading of each family, off the same page-side console
+# ring every other scrape reads, plus every `alloc failed:` line the ring and
+# the error ring hold. It duplicates no verdict -- `budget_state_re` next door
+# stays the positional reading the artifact records and `the_rig_reads_the_
+# budget_line_the_app_actually_writes` holds to the app's formatter; these
+# patterns are anchored on their own LABELS instead, so they read the same
+# figures without a second positional parse to keep in step.
+#
+# TWO CLOCKS, NEVER MIXED. `now` and every `t` here are the PAGE's Date.now(),
+# which `serve.py --pin-clock` offsets to the pinned archive instant; the host
+# wall clock and the host load average are stamped by the Python caller. The
+# TSV names each column for the clock it came from.
+#
+# `heap max` is scraped beside `linear` for one reason: a reading that
+# approaches a ceiling is unreadable without the ceiling beside it. 1024 MiB is
+# a property of THIS build (`.github/scripts/wasm-threads.sh --max-memory`, and
+# `squallar-web/heap.js` may hand a handheld less), so the wall travels with
+# the figure that approaches it rather than living in a reader's head.
+SAMPLE_PROBE = r"""
+var C = window.__rig_console || [];
+var E = window.__rig_errors || [];
+var sample_cadence_re = /frame cadence: n=(\d+)/;
+var sample_linear_re = /budget state: .* linear (\d+)\/(\d+) MiB/;
+var sample_heap_max_re = /heap max (\d+)\/(\d+) MiB/;
+var sample_admission_re = /admission asked (\d+) admitted (\d+) would refuse (\d+) refused (\d+)/;
+var sample_census_loop_re = /heap census \(([a-z0-9-]+)\): loop scans (\d+) B/;
+var sample_census_grids_re = /overlay grids (\d+) B/;
+var sample_census_resident_re = /resident total (\d+) B of (\d+) B linear/;
+// One instance word, and it is the PAGE's. The census line is written by the
+// page's telemetry tick and by the allocation-error hook on whichever
+// instance refused; `raster worker` carries a space and is deliberately
+// outside the pattern, so a worker's census can never be filed under a page
+// column. A refusal on any instance still reaches `allocs` below, whole.
+var row = { now: Date.now(), t0: (window.__rig && window.__rig.t0) || null,
+            cadence_n: null, cadence_t: null,
+            linear_page_mib: null, linear_worker_mib: null, linear_t: null,
+            heap_max_page_mib: null, heap_max_worker_mib: null,
+            asked: null, admitted: null, would_refuse: null, refused: null,
+            census_instance: null, loop_scan_b: null, overlay_grid_b: null,
+            resident_total_b: null, census_linear_b: null, census_t: null };
+var allocs = [];
+for (var i = 0; i < C.length; i++) {
+  var m = String(C[i].msg || ""), t = C[i].t, x;
+  x = sample_cadence_re.exec(m);
+  if (x) { row.cadence_n = parseInt(x[1], 10); row.cadence_t = t; }
+  x = sample_linear_re.exec(m);
+  if (x) {
+    row.linear_page_mib = parseInt(x[1], 10);
+    row.linear_worker_mib = parseInt(x[2], 10);
+    row.linear_t = t;
+    // Same line, read by their own labels: the ceiling and the four door
+    // counters ride the `budget state:` tail after the positional groups
+    // stop.
+    var hm = sample_heap_max_re.exec(m);
+    if (hm) {
+      row.heap_max_page_mib = parseInt(hm[1], 10);
+      row.heap_max_worker_mib = parseInt(hm[2], 10);
+    }
+    var ad = sample_admission_re.exec(m);
+    if (ad) {
+      row.asked = parseInt(ad[1], 10);
+      row.admitted = parseInt(ad[2], 10);
+      row.would_refuse = parseInt(ad[3], 10);
+      row.refused = parseInt(ad[4], 10);
+    }
+  }
+  x = sample_census_loop_re.exec(m);
+  if (x) {
+    row.census_instance = x[1];
+    row.loop_scan_b = parseInt(x[2], 10);
+    row.census_t = t;
+    var g = sample_census_grids_re.exec(m);
+    if (g) row.overlay_grid_b = parseInt(g[1], 10);
+    var rt = sample_census_resident_re.exec(m);
+    if (rt) {
+      row.resident_total_b = parseInt(rt[1], 10);
+      row.census_linear_b = parseInt(rt[2], 10);
+    }
+  }
+  if (m.indexOf("alloc failed:") >= 0) allocs.push({ t: t, msg: m });
+}
+for (var j = 0; j < E.length; j++) {
+  var em = String(E[j].msg || "");
+  if (em.indexOf("alloc failed:") >= 0) allocs.push({ t: E[j].t, msg: em });
+}
+return { row: row, allocs: allocs, console_total: C.length };
+"""
+
+
 FRAME_LINE_PROBE = r"""
 var C = window.__rig_console || [];
 var svc_interact_re = /frame service \(interact\): n=(\d+), p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
@@ -3753,6 +3857,197 @@ def loop_or_refusal(loop_state, budget_state):
                 "nothing, which is the one outcome a scene may not have"
                 % (layers, resident, refused, bs.get("would_refuse")))
     return out
+
+
+def linear_headroom_verdict(peak_mib, ceiling_mib, want_mib):
+    """**The page never came within `want_mib` of its own linear ceiling.**
+    The verdict behind `--expect-linear-headroom`.
+
+    Both figures come off the app's own `budget state:` line -- `linear a/b`
+    for the two instances' current bytes, `heap max a/b` for the two ceilings
+    they are held to -- so the assertion is against the wall THIS BUILD linked
+    rather than against a number typed here. A build that hands a handheld
+    512 MiB is judged against 512.
+
+    The PAGE instance only. The worker has its own heap and its own ceiling,
+    the two are never added, and only the page's has levers on it.
+
+    An absent reading FAILS rather than passes: a leg that could not read the
+    ceiling did not measure the thing it claims, which is the same rule
+    `--expect-canvas` carries one level up. Pure: three numbers in, one dict
+    out."""
+    out = {"ok": False, "want_headroom_mib": want_mib,
+           "peak_page_mib": peak_mib, "ceiling_page_mib": ceiling_mib,
+           "headroom_mib": None}
+    if peak_mib is None or ceiling_mib is None:
+        out["error"] = (
+            "no sample carried both a page `linear` figure and its `heap max` "
+            "ceiling: the leg did not seed squallar.frame_telemetry, the "
+            "bundle predates the `heap max` field, or the page died before "
+            "the first `budget state:` line. Nothing was measured against a "
+            "wall, so this is not a pass")
+        return out
+    out["headroom_mib"] = ceiling_mib - peak_mib
+    out["ok"] = out["headroom_mib"] >= want_mib
+    if not out["ok"]:
+        out["error"] = (
+            "the page instance's linear memory reached %d MiB of its own "
+            "%d MiB ceiling -- %d MiB of headroom, under the %d MiB this leg "
+            "demands. On this target an allocation past the ceiling is not an "
+            "error anyone catches: `panic-strategy = abort` traps the module "
+            "with winit's runner RefCell held, and the frame loop is over"
+            % (peak_mib, ceiling_mib, out["headroom_mib"], want_mib))
+    return out
+
+
+def alloc_failure_verdict(allocs):
+    """**No allocation was refused.** The verdict behind
+    `--expect-no-alloc-failure`.
+
+    `squallar-web`'s allocation-error hook writes one `alloc failed: <n> B
+    requested, <linear> of <max> MiB linear in <instance>` line and the module
+    then traps. The trap is already gated (`wasm_trap_count`), and this is a
+    DIFFERENT reading of the same moment: the trap says the module is dead,
+    this says WHAT it died asking for, on WHICH instance, and with the heap
+    where. A trap from any other cause carries no such line, so the two are
+    never the same fact and are never added.
+
+    Pure: a list of {t, msg} in, one dict out."""
+    out = {"ok": not allocs, "count": len(allocs),
+           "first": (str(allocs[0].get("msg"))[:300] if allocs else None),
+           "instances": sorted({_alloc_instance(a.get("msg")) for a in allocs})}
+    if allocs:
+        out["error"] = (
+            "%d allocation refusal(s) reached the console; the first is %r. "
+            "Nothing unwinds through one on this target"
+            % (len(allocs), out["first"]))
+    return out
+
+
+def _alloc_instance(msg):
+    """The instance word off an `alloc failed:` line -- `page`, `raster
+    worker`, `tile lane` -- or `?` where the line does not carry one. The page
+    and the workers run the same module and the same hook, so an unattributed
+    refusal is a refusal on one of three heaps."""
+    m = re.search(r"linear in ([a-z ]+)$", str(msg or "").strip())
+    return m.group(1) if m else "?"
+
+
+class CensusSampler:
+    """**The approach to the wall, sampled on a clock this file owns.**
+
+    One row every `interval` seconds, appended to a TSV as it is taken and
+    flushed, so a leg that is killed still leaves everything it had seen. The
+    row is `SAMPLE_PROBE`'s reading plus the two facts only the host has: the
+    host's wall clock and its 1-minute load average AT THAT INSTANT.
+
+    **The load column is here rather than in a separate timeline on purpose.**
+    A column recorded inside the instrument is the labelling authority for the
+    row it sits on; an external timeline can corroborate a source and can
+    never establish a boundary, because nothing in it is stamped by the thing
+    it describes.
+
+    Two clocks and both are named: `t_host_iso` is this box's real wall clock,
+    `t_page_ms` is the PAGE's `Date.now()`, which `serve.py --pin-clock` moves
+    to the pinned archive instant. Subtracting one from the other is
+    meaningless and the column names are what stop it."""
+
+    COLUMNS = ("t_host_iso", "leg_s", "t_page_ms", "loadavg1",
+               "cadence_n", "cadence_page_t_ms",
+               "linear_page_mib", "linear_page_ceiling_mib",
+               "linear_worker_mib", "linear_worker_ceiling_mib",
+               "overlay_grids_b", "loop_scans_b", "resident_total_b",
+               "census_linear_b", "census_instance",
+               "asked", "admitted", "would_refuse", "refused",
+               "alloc_failed_total")
+
+    def __init__(self, session, path, interval):
+        self.session = session
+        self.path = path
+        self.interval = interval
+        self.rows = []
+        # Keyed by (page stamp, message) so a line still in the ring at the
+        # next sample is not counted twice; a real second refusal of the same
+        # size at a later instant keys differently and is kept.
+        self.allocs = {}
+        self.errors = 0
+        self.fh = open(path, "a", buffering=1)
+        self.fh.write("#columns\t%s\n" % "\t".join(self.COLUMNS))
+
+    def note(self, text):
+        """A `#` line into the TSV -- the identity facts the runner knows and
+        this process does not."""
+        self.fh.write("# %s\n" % text)
+
+    def sample(self, leg_s):
+        try:
+            sig = self.session.execute(SAMPLE_PROBE) or {}
+        except Exception as e:                      # noqa: BLE001 -- a dead
+            # page must not end the leg here: the FAILURE is the finding, and
+            # the row records that the probe could not run.
+            self.errors += 1
+            sig = {"row": {}, "probe_error": str(e)[:200]}
+        r = dict(sig.get("row") or {})
+        for a in sig.get("allocs") or []:
+            self.allocs[(a.get("t"), str(a.get("msg")))] = a
+        row = {
+            "t_host_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "leg_s": leg_s,
+            "t_page_ms": r.get("now"),
+            "loadavg1": _loadavg(),
+            "cadence_n": r.get("cadence_n"),
+            "cadence_page_t_ms": r.get("cadence_t"),
+            "linear_page_mib": r.get("linear_page_mib"),
+            "linear_page_ceiling_mib": r.get("heap_max_page_mib"),
+            "linear_worker_mib": r.get("linear_worker_mib"),
+            "linear_worker_ceiling_mib": r.get("heap_max_worker_mib"),
+            "overlay_grids_b": r.get("overlay_grid_b"),
+            "loop_scans_b": r.get("loop_scan_b"),
+            "resident_total_b": r.get("resident_total_b"),
+            "census_linear_b": r.get("census_linear_b"),
+            "census_instance": r.get("census_instance"),
+            "asked": r.get("asked"),
+            "admitted": r.get("admitted"),
+            "would_refuse": r.get("would_refuse"),
+            "refused": r.get("refused"),
+            "alloc_failed_total": len(self.allocs),
+        }
+        self.rows.append(row)
+        self.fh.write("\t".join(
+            "-" if row[c] is None else str(row[c]) for c in self.COLUMNS) + "\n")
+        return row
+
+    def peak_page_mib(self):
+        vals = [r["linear_page_mib"] for r in self.rows
+                if r["linear_page_mib"] is not None]
+        return max(vals) if vals else None
+
+    def page_ceiling_mib(self):
+        vals = [r["linear_page_ceiling_mib"] for r in self.rows
+                if r["linear_page_ceiling_mib"] is not None]
+        return vals[-1] if vals else None
+
+    def alloc_list(self):
+        return [self.allocs[k] for k in sorted(self.allocs,
+                                               key=lambda k: (k[0] or 0, k[1]))]
+
+    def record(self):
+        """What the artifact carries about the sampling itself: how many rows,
+        over what span, at what asked-for cadence, and how many probes threw.
+        A row count without its interval is not readable."""
+        return {"path": self.path, "interval_s": self.interval,
+                "rows": len(self.rows), "probe_errors": self.errors,
+                "first_leg_s": (self.rows[0]["leg_s"] if self.rows else None),
+                "last_leg_s": (self.rows[-1]["leg_s"] if self.rows else None),
+                "peak_linear_page_mib": self.peak_page_mib(),
+                "linear_page_ceiling_mib": self.page_ceiling_mib(),
+                "alloc_failures": len(self.allocs)}
+
+    def close(self):
+        try:
+            self.fh.close()
+        except Exception:                            # noqa: BLE001
+            pass
 
 
 class FrameLineWatcher:
@@ -6636,10 +6931,57 @@ def selftest_loop_or_refusal():
     return failed
 
 
+def selftest_wall_verdicts():
+    """Executable pins on `linear_headroom_verdict` and
+    `alloc_failure_verdict`. Both arms of each, plus the absent-reading case
+    -- a pin that only ever showed a verdict passing would be satisfied by a
+    predicate that always passes, which is the shape this rig has shipped
+    before. Returns the number of failed pins."""
+    failed = 0
+
+    def pin(name, ok):
+        nonlocal failed
+        print("[self-test] %s %s" % ("ok  " if ok else "FAIL", name))
+        if not ok:
+            failed += 1
+
+    v = linear_headroom_verdict(600, 1024, 64)
+    pin("a page 424 MiB under its ceiling passes",
+        v["ok"] and v["headroom_mib"] == 424)
+    v = linear_headroom_verdict(1024, 1024, 64)
+    pin("a page AT its ceiling fails and says so",
+        not v["ok"] and "1024 MiB of its own 1024 MiB" in v.get("error", ""))
+    v = linear_headroom_verdict(1000, 1024, 64)
+    pin("24 MiB of headroom under a 64 MiB demand fails", not v["ok"])
+    v = linear_headroom_verdict(960, 1024, 64)
+    pin("exactly the demanded headroom passes", v["ok"])
+    v = linear_headroom_verdict(400, 512, 64)
+    pin("the ceiling is the one READ, not 1024",
+        v["ok"] and v["ceiling_page_mib"] == 512)
+    v = linear_headroom_verdict(None, 1024, 64)
+    pin("no reading FAILS rather than passing vacuously",
+        not v["ok"] and "not a pass" in v.get("error", ""))
+
+    v = alloc_failure_verdict([])
+    pin("no refusal passes with a zero count", v["ok"] and v["count"] == 0)
+    v = alloc_failure_verdict([
+        {"t": 1, "msg": "alloc failed: 984 B requested, 1024 of 1024 MiB "
+                        "linear in page"},
+        {"t": 2, "msg": "alloc failed: 98000000 B requested, unread of 1024 "
+                        "MiB linear in raster worker"}])
+    pin("two refusals fail, are counted, and name both instances",
+        not v["ok"] and v["count"] == 2
+        and v["instances"] == ["page", "raster worker"])
+    return failed
+
+
 def selftest():
     failures = []
     if selftest_loop_or_refusal():
         failures.append("loop-or-refusal verdict (see [self-test] lines)")
+    if selftest_wall_verdicts():
+        failures.append("linear-headroom / alloc-failure verdicts "
+                        "(see [self-test] lines)")
     failures += selftest_android()
     failures += selftest_adapters()
     failures += selftest_tile_cache_settles()
@@ -7016,6 +7358,38 @@ def run_smoke(args):
         # so the ring's eviction cannot lose a reading between polls.
         totals_watch = RunningTotalsWatcher(session)
         totals_watch.poll()
+        # THE APPROACH TO THE WALL, on a clock of its own. Constructed here --
+        # before the settle -- because the scene this exists for dies about ten
+        # seconds after boot, which on a leg with a ten-second settle is BEFORE
+        # the data window opens. See `CensusSampler` for the two clocks and for
+        # why the load average is a column here rather than an external
+        # timeline.
+        sampler = None
+        if args.sample_tsv:
+            sampler = CensusSampler(session, args.sample_tsv,
+                                    args.sample_interval)
+            sampler.note("drive.py run_id=%s tag=%s browser=%s started_utc=%s"
+                         % (args.run_id, args.tag, args.browser,
+                            result["started_utc"]))
+            sampler.note("canvas asked=%s window=%s interval_s=%s"
+                         % (args.canvas, args.window, args.sample_interval))
+            stage("sampler", path=args.sample_tsv,
+                  interval=args.sample_interval)
+
+        def sample_sleep(seconds):
+            """`time.sleep`, with a census row taken every interval on the way
+            through. Byte-for-byte the old behaviour when no sampler was asked
+            for -- every other leg's timing is unchanged by this file."""
+            if sampler is None:
+                time.sleep(seconds)
+                return
+            deadline = time.monotonic() + seconds
+            while True:
+                sampler.sample(round(time.monotonic() - t0, 2))
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return
+                time.sleep(min(sampler.interval, left))
         interact_before = frames_watch.interact_n()
         if args.expect_interaction_frames or args.w3c_gesture:
             stage("frame-lines-baseline", interact_n=interact_before)
@@ -7080,7 +7454,7 @@ def run_smoke(args):
             stage("basemap-tiles-done", **result["basemap_tiles"])
 
         stage("settle", seconds=args.settle)
-        time.sleep(args.settle)
+        sample_sleep(args.settle)
 
         if args.w3c_gesture:
             stage("w3c-gesture", kind=args.w3c_gesture,
@@ -7096,7 +7470,16 @@ def run_smoke(args):
             frames_watch.poll()
 
         stage("raf-warm", frames=args.frames)
+        # A row on each side of the warm sample. It is `--frames` rAF deltas
+        # long, which is a duration the PAGE decides: 120 deltas is 2 s at
+        # 60 Hz and 29 s on a page drawing at 172 ms, and the census sampler is
+        # otherwise blind for exactly that long, in the middle of the leg. Both
+        # holes measured on 2026-09-08 contained the death.
+        if sampler is not None:
+            sampler.sample(round(time.monotonic() - t0, 2))
         result["raf_warm"] = raf_sample(session, args.frames)
+        if sampler is not None:
+            sampler.sample(round(time.monotonic() - t0, 2))
         stage("raf-warm-done", **{k: (round(v, 2) if isinstance(v, float) else v)
                                   for k, v in (result["raf_warm"] or {}).items()
                                   if k in ("ok", "n", "p50", "p95", "max")})
@@ -7141,12 +7524,12 @@ def run_smoke(args):
             if not mid_done:
                 result["resources_mid"] = session.execute(RESOURCES_PROBE)
         else:
-            time.sleep(args.data_window / 2)
+            sample_sleep(args.data_window / 2)
             result["resources_mid"] = session.execute(RESOURCES_PROBE)
             frames_watch.poll()
             totals_watch.poll()
             note_load()
-            time.sleep(args.data_window / 2)
+            sample_sleep(args.data_window / 2)
         note_load()
         totals_watch.poll()
         result["resources"] = session.execute(RESOURCES_PROBE)
@@ -7388,6 +7771,15 @@ def run_smoke(args):
                     fp["gained"] = inside[-1]["n"] - inside[0]["n"]
             result["frame_progress"] = fp
             stage("frame-progress", **fp)
+
+        # The last row, taken beside the liveness verdict so the TSV's final
+        # line and the `frame cadence` figure the leg is judged on describe the
+        # same instant.
+        if sampler is not None:
+            sampler.sample(round(time.monotonic() - t0, 2))
+            result["census_samples"] = sampler.record()
+            stage("census-samples", **result["census_samples"])
+            sampler.close()
 
         # The settle assertion. See `tile_cache_settles` for the rule and
         # for why silence is a zero and an absent line is an error.
@@ -7659,6 +8051,50 @@ def run_smoke(args):
                     % (adapter_label(adapter),
                        webgpu_adapter_label(webgpu_adapter)))
 
+        # THE WALL, AND WHAT WAS REFUSED AT IT. Computed here rather than
+        # beside the sampler because `rig_signal` has only just been collected:
+        # the refusal lines are taken from the UNION of what the sampler saw
+        # live and what the end-of-leg export holds, so a line evicted from the
+        # ring between two samples cannot go missing and one seen twice cannot
+        # be counted twice.
+        if args.expect_no_alloc_failure or args.expect_linear_headroom is not None:
+            seen = dict(sampler.allocs) if sampler is not None else {}
+            sig = result.get("rig_signal") or {}
+            for family in ("console", "console_tail", "errors"):
+                for e in (sig.get(family) or []):
+                    msg = str((e or {}).get("msg", ""))
+                    if "alloc failed:" in msg:
+                        seen[(e.get("t"), msg)] = {"t": e.get("t"), "msg": msg}
+            allocs = [seen[k] for k in sorted(seen, key=lambda k: (k[0] or 0, k[1]))]
+        if args.expect_no_alloc_failure:
+            result["alloc_failures"] = alloc_failure_verdict(allocs)
+            stage("alloc-failures", **{k: v for k, v
+                                       in result["alloc_failures"].items()
+                                       if k != "error"})
+        if args.expect_linear_headroom is not None:
+            if sampler is None:
+                # The pairing error, spelled the way --expect-canvas spells
+                # its own: a leg asked to assert against a wall nothing was
+                # reading did not measure a small headroom, it measured
+                # nothing.
+                result["linear_headroom"] = {
+                    "ok": False, "want_headroom_mib": args.expect_linear_headroom,
+                    "peak_page_mib": None, "ceiling_page_mib": None,
+                    "headroom_mib": None,
+                    "error": "--expect-linear-headroom without --sample-tsv: "
+                             "nothing sampled the page's linear memory, so "
+                             "there is no peak to hold against a ceiling"}
+            else:
+                result["linear_headroom"] = linear_headroom_verdict(
+                    sampler.peak_page_mib(), sampler.page_ceiling_mib(),
+                    args.expect_linear_headroom)
+            stage("linear-headroom", **{k: v for k, v
+                                        in result["linear_headroom"].items()
+                                        if k != "error"})
+        af_ok = (result.get("alloc_failures") is None
+                 or bool(result["alloc_failures"]["ok"]))
+        lh_ok = (result.get("linear_headroom") is None
+                 or bool(result["linear_headroom"]["ok"]))
         lor_ok = (result.get("loop_or_refusal") is None
                   or bool(result["loop_or_refusal"]["ok"]))
         fp_ok = (result.get("frame_progress") is None
@@ -7694,6 +8130,7 @@ def run_smoke(args):
         result["pass"] = (booted and canvas_ok and raf_ok
                           and canvas_blank is not True and not panics
                           and not traps and fp_ok and tcs_ok and lor_ok
+                          and af_ok and lh_ok
                           and worker_ok and ifr_ok and cwaits_ok
                           and sw_ok is not False and coi_ok is not False
                           and cv_ok is not False
@@ -7721,6 +8158,18 @@ def run_smoke(args):
                                   else bool(result["frame_progress"]["ok"])),
             "loop_or_refusal_ok": (None if result.get("loop_or_refusal") is None
                                    else bool(result["loop_or_refusal"]["ok"])),
+            # The two readings of the same wall, never added: how close the
+            # page came to its own ceiling, and what the allocator refused
+            # when it got there.
+            "alloc_failures_ok": (None if result.get("alloc_failures") is None
+                                  else bool(result["alloc_failures"]["ok"])),
+            "alloc_failure_count": (result.get("alloc_failures") or {}).get("count"),
+            "linear_headroom_ok": (None if result.get("linear_headroom") is None
+                                   else bool(result["linear_headroom"]["ok"])),
+            "peak_linear_page_mib": (result.get("linear_headroom") or {}).get(
+                "peak_page_mib"),
+            "linear_page_ceiling_mib": (result.get("linear_headroom") or {}).get(
+                "ceiling_page_mib"),
             "tile_cache_settles_ok": (None if result.get("tile_cache_settles") is None
                                       else bool(result["tile_cache_settles"]["ok"])),
             # The SIZE this row's every other number is a figure for. A leg
@@ -8927,6 +9376,44 @@ def main(argv=None):
                          "every screenshot and rAF check still passes. Needs "
                          "the squallar.frame_telemetry seed; a leg that never "
                          "wrote the line fails with that stated")
+    ap.add_argument("--sample-tsv", default=None, metavar="PATH",
+                    help="APPEND one census row every --sample-interval "
+                         "seconds to PATH, through the settle and the data "
+                         "window. The row is the app's own `frame cadence`, "
+                         "`budget state:` (both `linear` figures WITH the two "
+                         "`heap max` ceilings beside them, and the four "
+                         "admission counters) and `heap census (page)` "
+                         "readings, plus this host's wall clock and 1-minute "
+                         "load average at that instant. Written and flushed "
+                         "as it goes, so a leg that is killed still leaves "
+                         "what it saw. For a scene that DIES: a level read "
+                         "after the trap describes a corpse, and the approach "
+                         "is the finding")
+    ap.add_argument("--sample-interval", type=float, default=2.0,
+                    metavar="SECONDS",
+                    help="seconds between --sample-tsv rows (default 2, which "
+                         "is the app's own telemetry tick: a faster cadence "
+                         "re-reads the same lines)")
+    ap.add_argument("--expect-no-alloc-failure", action="store_true",
+                    help="fail the leg if any `alloc failed:` line reached the "
+                         "console or error ring. A DIFFERENT reading from the "
+                         "trap count beside it: the trap says the module is "
+                         "dead, this says what it died asking for and on which "
+                         "instance. Reads the UNION of what --sample-tsv saw "
+                         "live and the end-of-leg console export, so it works "
+                         "without the sampler and sees more with it: the "
+                         "export is byte-budgeted and a refusal can be "
+                         "evicted from the ring before the leg ends")
+    ap.add_argument("--expect-linear-headroom", type=float, default=None,
+                    metavar="MIB",
+                    help="fail the leg unless the PAGE instance's linear "
+                         "memory stayed at least MIB below its own ceiling, "
+                         "both figures off the app's `budget state:` line "
+                         "(`linear a/b` and `heap max a/b`) so the wall is the "
+                         "one this build linked rather than a number typed "
+                         "here. Needs --sample-tsv. An absent reading fails: a "
+                         "leg that never read the ceiling measured nothing "
+                         "against it")
     ap.add_argument("--expect-loop-or-refusal", action="store_true",
                     help="PLAYED, OR REFUSED AND SAID SO. Fail unless the last "
                          "`loop state:` line shows a playing loop (>= 1 layer "
