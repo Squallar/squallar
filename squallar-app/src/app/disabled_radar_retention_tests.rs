@@ -149,7 +149,7 @@ fn a_pane_that_stops_drawing_radar_lets_go_of_its_volume() {
          just gave up. Both hold the same allocation, so this is the \
          difference between a figure falling and a heap falling.",
     );
-    let owners_after = Arc::strong_count(&volume);
+    let owners_after = owners_once_freed(&volume, owners_before - 3);
     assert!(
         owners_before >= owners_after + 3,
         "the app let go of only {} of the three owners one arrival has — the \
@@ -159,6 +159,38 @@ fn a_pane_that_stops_drawing_radar_lets_go_of_its_volume() {
          {owners_after} after; the survivor is this test's own clone).",
         owners_before - owners_after,
     );
+}
+
+/// `volume`'s owner count once the eviction's frees have actually happened, or
+/// the count as it stood at the deadline.
+///
+/// **The eviction does not free anything itself, and a count read on the
+/// instruction after it is racing.** `evict_unshown_scans` hands every evicted
+/// volume to `squallar_worker::offload::discard`, which on native routes to the
+/// pool's free lane — the whole point being that a multi-GiB teardown must not
+/// land on the frame thread (`app::tests` red-gates a return to `retain` for
+/// exactly that reason). So the three owners go away on ANOTHER THREAD, some
+/// time after the call returns.
+///
+/// Read straight through, this test failed on **8 of 25 unmodified-tree runs**
+/// of `cargo test -p squallar-app --lib` (2026-09-08, and the same on the tree
+/// that added this helper: 10 of 25 before, 0 of 25 after). It reported "the
+/// app let go of only 1 of the three owners", which is a true statement about
+/// an instant that had not finished happening.
+///
+/// **Polls for the property, and never asserts on the clock.** The deadline is
+/// only how long it is willing to be wrong before it says so; it returns the
+/// live count either way, so a genuine retention regression still fails on the
+/// caller's own assertion and its own message rather than on a timeout.
+fn owners_once_freed(volume: &Arc<nexrad_model::data::Scan>, target: usize) -> usize {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let owners = Arc::strong_count(volume);
+        if owners <= target || std::time::Instant::now() >= deadline {
+            return owners;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 /// **The control, and the more important half of the pair**: a pane that draws
