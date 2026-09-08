@@ -12,7 +12,7 @@ squallar-app/src/app.rs	1723	1250
 squallar-app/src/app_chunks.rs	228	113
 squallar-app/src/app_fetch.rs	2000	1468
 squallar-app/src/app_offline.rs	31	30
-squallar-app/src/app_render.rs	4505	3799
+squallar-app/src/app_render.rs	4423	3718
 squallar-app/src/app_state.rs	77	0
 squallar-app/src/budget_arms.rs	17	17
 squallar-app/src/budget_memo.rs	52	52
@@ -31,7 +31,7 @@ squallar-app/src/platform.rs	473	380
 squallar-app/src/platform_double.rs	349	329
 squallar-app/src/pressure.rs	200	192
 squallar-app/src/recovery.rs	105	104
-squallar-app/src/render_dispatch.rs	1463	1345
+squallar-app/src/render_dispatch.rs	1447	1329
 squallar-app/src/render_key.rs	27	27
 squallar-app/src/site_catalogue.rs	36	29
 squallar-app/src/site_positions.rs	56	52
@@ -99,7 +99,7 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	306	268
 squallar-egui/src/tile_mesh/ledger.rs	77	46
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	1542	1474
+squallar-egui/src/tile_source.rs	1542	1476
 squallar-egui/src/tile_source/byte_lru.rs	272	271
 squallar-egui/src/tile_source/cache_ledger.rs	178	138
 squallar-egui/src/tile_source/snap.rs	157	157
