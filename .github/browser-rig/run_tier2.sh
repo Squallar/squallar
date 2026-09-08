@@ -248,6 +248,38 @@
 # Without --expect-cross-origin-isolated that run proves nothing: a browser
 # that ignored the headers looks exactly like one that honoured them.
 #
+# AN OPEN GAP IN WHAT THIS GATE CAN DECIDE, and it is not a caveat on one leg.
+#
+# Because this gate is the software arm permanently and by design (see ADAPTER
+# below), it is STRUCTURALLY UNABLE TO SEPARATE A PRODUCT DEFECT IN THE TEXTURE
+# UPLOAD QUEUE FROM llvmpipe BEING SLOW AT A LARGE CANVAS. The mechanism is not
+# subtle. On a ringless device -- all of web -- the drain moves ONE 4 MiB band
+# per frame, so its throughput ceiling is `4 MiB x the frame rate`. The frame
+# rate here is the software rasteriser's: measured on the `huge` firefox arm,
+# prep is 933 us a pass (tessellate 577, upload apply 214, buffers 141) against
+# an rAF p50 of **261 ms**, so prep is 0.36% of the frame and the other 99.6% is
+# llvmpipe filling 2878x1651 = 4.75 Mpx. The chain is therefore
+#
+#   software rasteriser -> ~4.5 fps -> a drain ceiling of ~18 MB/s -> the queue grows
+#
+# and at 60 fps that ceiling is thirteen times higher. **Nothing measured on
+# this rig establishes that `upload pending` builds up on a real driver at
+# all**, and no leg that can be added here would establish it, because the
+# adapter is the thing held fixed.
+#
+# THE ARM THAT CLOSES IT IS `run_gpu_arm.sh`, which is a measurement arm and not
+# a gate, and it has NEVER RUN THIS SCENE. Until it has, every `upload pending`
+# finding in this file is scoped to software and must say so. The two arms are
+# never merged and each prints its own renderer, which is exactly why this gap
+# can be stated precisely rather than argued.
+#
+# What a future reader can do WITHOUT a hardware arm: the sampler writes
+# `upload_pending_b` and `cadence_n` on the same row, so the frame rate is a
+# subtraction and the drain ceiling is derivable per row. A queue that grows
+# while the frame rate is healthy is a product defect; a queue that grows only
+# as the frame rate collapses is the rasteriser. That pairing is the reading to
+# take, and it is why those two columns sit together.
+#
 # ADAPTER: this gate is the rig's SOFTWARE arm, deliberately and permanently.
 # Chromium runs on SwiftShader and Firefox on Xvfb -> Mesa llvmpipe, so it is
 # deterministic and runs on a CI box with no GPU. Every cap it reports
@@ -757,6 +789,16 @@ sample_header_lines() {
 #
 # WHAT THE DRAIN ACTUALLY COSTS, MEASURED, because the obvious inference from
 # the paragraph above is wrong and it was made here first.
+#
+# THIS IS THE THIRD INSTANCE OF ONE MISTAKE AND THE FILE NAMES IT ITSELF.
+# `texture_upload.rs` records the first two -- "the whole-crossing route never
+# touches the ring, and pricing it at the ring's bandwidth is the mistake this
+# file already made once" -- and this is the same move a third time, in the
+# other direction: pricing the BANDED drain at the whole-crossing route's
+# bandwidth. A route's cost is measured on that route. It was derived here,
+# amplified into a campaign-level claim about the web target before anyone
+# asked how it was derived, and forwarded to another lane as settled; the
+# figures below are what it should have been checked against first.
 #
 # `whole_budget`'s note prices 56 MiB of blocking `write_texture` at ~1 GB/s for
 # ~56 ms, which divides to ~4 ms for a 4 MiB band -- the whole of
