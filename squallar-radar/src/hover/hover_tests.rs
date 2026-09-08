@@ -85,7 +85,7 @@ fn a_loop_frame_reads_the_same_number_the_render_painted() {
     let scan = std::sync::Arc::new(volume(360, false));
     let out = render(&scan, RadarProduct::Reflectivity);
     let gates = SweepGates::new(&scan, RadarProduct::Reflectivity, ELEVATION)
-    .expect("reflectivity is a wire moment and the fixture carries it");
+        .expect("reflectivity is a wire moment and the fixture carries it");
 
     let geom = out.polar.geometry();
     let mut painted = 0u32;
@@ -118,8 +118,7 @@ fn a_loop_frame_reads_the_same_number_the_render_painted() {
 fn a_looping_pane_and_a_still_pane_read_one_point_alike() {
     let scan = std::sync::Arc::new(volume(360, false));
     let out = render(&scan, RadarProduct::Reflectivity);
-    let gates = SweepGates::new(&scan, RadarProduct::Reflectivity, ELEVATION)
-    .unwrap();
+    let gates = SweepGates::new(&scan, RadarProduct::Reflectivity, ELEVATION).unwrap();
 
     let still = HoverSource::resident(out.polar.clone());
     let mut looping_field = out.polar;
@@ -156,8 +155,7 @@ fn a_looping_pane_and_a_still_pane_read_one_point_alike() {
 fn a_loop_frame_of_a_derived_product_says_its_numbers_are_not_resident() {
     let scan = std::sync::Arc::new(volume(360, true));
     assert!(
-        SweepGates::new(&scan, RadarProduct::NormalizedRotation, ELEVATION)
-        .is_none(),
+        SweepGates::new(&scan, RadarProduct::NormalizedRotation, ELEVATION).is_none(),
         "shear is computed, not measured"
     );
 
@@ -439,8 +437,7 @@ fn a_loop_frame_prices_the_sweep_it_holds() {
         .filter_map(|r| RadarProduct::Reflectivity.get_moment(r))
         .map(crate::scan_size::gate_bytes)
         .sum::<usize>()
-        + sweep.radials().len()
-            * size_of::<Option<nexrad_model::data::MomentData>>()
+        + sweep.radials().len() * size_of::<Option<nexrad_model::data::MomentData>>()
         + crate::scan_size::ALLOCATOR_BLOCK_OVERHEAD;
 
     let out = render(&scan, RadarProduct::Reflectivity);
@@ -675,6 +672,12 @@ fn a_gap_radial_does_not_shift_the_radials_after_it() {
             }
         }
     }
-    assert!(gapped > 150, "only {gapped} gap reads — the fixture has no gaps");
-    assert!(valued > 800, "only {valued} valued reads — the fixture is empty");
+    assert!(
+        gapped > 150,
+        "only {gapped} gap reads — the fixture has no gaps"
+    );
+    assert!(
+        valued > 800,
+        "only {valued} valued reads — the fixture is empty"
+    );
 }
