@@ -140,6 +140,7 @@ fn walk_at(run: Walk<'_>) -> Walked {
         basemap_labels: Vec::new(),
         galley_cache: &mut walkers::GalleyCache::default(),
         point_text_meshes: &mut crate::point_painter::PointTextMeshes::default(),
+        label_cache: &mut crate::label_cache::LabelCache::default(),
         ground_meshes: None,
         basemap_tiles: None,
         terrain_tiles: None,

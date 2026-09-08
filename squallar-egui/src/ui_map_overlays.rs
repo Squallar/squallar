@@ -1045,7 +1045,8 @@ impl RunCursor {
     }
 }
 
-/// Lay every label this pane collected out against **one** [`OccupiedAreas`].
+/// Lay every label this pane collected out against **one** [`OccupiedAreas`],
+/// and paint the ones that survived.
 ///
 /// walkers constructs its own inside the per-tile draw, so its collision test
 /// cannot see across a tile seam and it draws a name once per tile that carries
@@ -1059,21 +1060,60 @@ impl RunCursor {
 /// The layout is finished before `extend` because laying a label out takes
 /// `Context::fonts_mut` while `Painter::extend` holds the graphics lock;
 /// interleaving them deadlocks.
+///
+/// **The solve is skipped outright on a pane whose labels have not moved.**
+/// [`solve_labels`] reads the list and the fonts and nothing else, so `cache`
+/// answers with the shapes it produced last time whenever this pane hands over
+/// the same list under the same glyph raster — which, on a map nobody is
+/// touching, is every frame after the first. The shapes it hands back are the
+/// shapes a fresh solve would have built, painted through the same `extend`
+/// under the same clip and the same opacity, so nothing about the picture
+/// depends on which of the two answered. See [`crate::label_cache`] for what
+/// is in the key and what is deliberately not.
 pub(super) fn paint_labels(
     painter: &egui::Painter,
     labels: Vec<walkers::Text>,
     galleys: &mut walkers::GalleyCache,
+    cache: &mut crate::label_cache::LabelCache,
+    pane_idx: usize,
 ) {
     if labels.is_empty() {
         return;
     }
-    galleys.begin_frame(painter.ctx());
+    let key = crate::label_cache::LabelKey::new(painter.ctx());
+    if let Some(kept) = cache.lookup(pane_idx, key, &labels) {
+        // Cloned rather than moved: the entry has to outlive this frame, and a
+        // shape clone is a refcount bump on a galley that is already laid out.
+        painter.extend(kept.to_vec());
+        return;
+    }
+    crate::tile_mesh::ledger::note_label_solve();
+    let placed = solve_labels(painter.ctx(), &labels, galleys);
+    painter.extend(placed.clone());
+    cache.store(pane_idx, key, labels, placed);
+}
+
+/// The label phase itself: lay every name out, and hand back the shapes that
+/// survived, in paint order.
+///
+/// Pure in its inputs — the context's fonts, the list, and the memo it lays
+/// out through — which is the property [`paint_labels`]' memo stands on.
+pub(super) fn solve_labels(
+    ctx: &egui::Context,
+    labels: &[walkers::Text],
+    galleys: &mut walkers::GalleyCache,
+) -> Vec<egui::Shape> {
+    galleys.begin_frame(ctx);
 
     let mut occupied = walkers::OccupiedAreas::new();
     // Where each name has already been drawn, so a fragmented river is named
     // once per stretch of screen rather than once per OSM way. See
     // [`MIN_REPEAT_DISTANCE`].
-    let mut placed_names: std::collections::HashMap<std::sync::Arc<str>, Vec<egui::Pos2>> =
+    //
+    // Borrowed from `labels`, never owned: the map is built and dropped inside
+    // this call, so a name that draws costs a hash of its bytes and no
+    // refcount traffic at all.
+    let mut placed_names: std::collections::HashMap<&std::sync::Arc<str>, Vec<egui::Pos2>> =
         std::collections::HashMap::new();
 
     let mut placed: Vec<egui::Shape> = Vec::with_capacity(labels.len());
@@ -1081,8 +1121,6 @@ pub(super) fn paint_labels(
     for text in labels {
         let position = text.position;
 
-        // Borrowed, never cloned: this runs per label per frame, and the name
-        // is only ever moved into the map by a label that actually drew.
         if placed_names.get(&text.text).is_some_and(|anchors| {
             anchors
                 .iter()
@@ -1091,19 +1129,19 @@ pub(super) fn paint_labels(
             continue;
         }
 
-        let shape = lay_out_label(painter.ctx(), &text, &mut occupied, galleys);
+        let shape = lay_out_label(ctx, text, &mut occupied, galleys);
 
         // Only a label that actually drew claims the spot. A name suppressed by
         // the collision test must not stop the same name drawing further along,
         // or one river losing a contest at a crowded confluence would be
         // silenced across the whole viewport.
         if !matches!(shape, egui::Shape::Noop) {
-            placed_names.entry(text.text).or_default().push(position);
+            placed_names.entry(&text.text).or_default().push(position);
             placed.push(shape);
         }
     }
 
-    painter.extend(placed);
+    placed
 }
 
 #[cfg(test)]
@@ -1581,7 +1619,13 @@ mod tests {
             let labels = draw_tile_layer(ui, &projector, zoom, &mut tiles, 0, None).labels;
             // The pane's `CityLabels` arm, which is where the deferred labels
             // are painted; without it this pass draws ground and no names.
-            paint_labels(ui.painter(), labels, &mut walkers::GalleyCache::default());
+            paint_labels(
+                ui.painter(),
+                labels,
+                &mut walkers::GalleyCache::default(),
+                &mut crate::label_cache::LabelCache::default(),
+                0,
+            );
         });
 
         // NON-VACUITY, and the specific thing that would have passed before:
@@ -1739,7 +1783,13 @@ mod tests {
                 Background::Inline,
             );
         }
-        paint_labels(ui.painter(), labels, &mut walkers::GalleyCache::default());
+        paint_labels(
+            ui.painter(),
+            labels,
+            &mut walkers::GalleyCache::default(),
+            &mut crate::label_cache::LabelCache::default(),
+            0,
+        );
     }
 
     fn text_count(shapes: &[egui::epaint::ClippedShape]) -> usize {
@@ -2007,7 +2057,13 @@ mod tests {
                 .map(|(i, n)| label(n, egui::pos2(200.0 + dx, 100.0 + 90.0 * i as f32)))
                 .collect();
             let shapes = shapes_of_one_pass(&ctx_kept, canvas, |ui| {
-                paint_labels(ui.painter(), labels, &mut kept);
+                paint_labels(
+                    ui.painter(),
+                    labels,
+                    &mut kept,
+                    &mut crate::label_cache::LabelCache::default(),
+                    0,
+                );
             });
             kept_frames.push(describe(&shapes));
         }
@@ -2021,7 +2077,13 @@ mod tests {
                 .map(|(i, n)| label(n, egui::pos2(200.0 + dx, 100.0 + 90.0 * i as f32)))
                 .collect();
             let shapes = shapes_of_one_pass(&ctx_fresh, canvas, |ui| {
-                paint_labels(ui.painter(), labels, &mut walkers::GalleyCache::default());
+                paint_labels(
+                    ui.painter(),
+                    labels,
+                    &mut walkers::GalleyCache::default(),
+                    &mut crate::label_cache::LabelCache::default(),
+                    0,
+                );
             });
             fresh_frames.push(describe(&shapes));
         }
@@ -2034,6 +2096,142 @@ mod tests {
         // The memo did its job: three passes over three names, laid out once.
         assert_eq!(kept.layouts(), names.len() as u64);
         assert_eq!(kept.hits(), 2 * names.len() as u64);
+    }
+
+    /// **A kept label solve paints what a fresh solve paints, frame after
+    /// frame.**
+    ///
+    /// The sibling above holds the *galley* memo, which is a memo of glyphs
+    /// and is re-consulted every frame. This holds the memo of the whole
+    /// phase: three passes over an UNMOVED label list against one
+    /// [`crate::label_cache::LabelCache`], and three passes each with its own,
+    /// which is the arm that solves every time. Every `TextShape` must match
+    /// in position, colour and laid-out text.
+    ///
+    /// The labels do not move between passes here, and that is the difference
+    /// from the sibling: this is the case the phase memo exists for, and the
+    /// one a map nobody is touching is in on every frame.
+    #[test]
+    fn a_kept_label_solve_paints_what_a_fresh_solve_paints() {
+        let _ledger = ledger_guard();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN);
+        // Crowded on purpose: the third and fifth sit on top of the first and
+        // fourth, so two of the five lose the collision contest and the
+        // comparison covers the refusals as well as the placements.
+        let names: [(&str, egui::Pos2); 5] = [
+            ("Washita River", egui::pos2(200.0, 100.0)),
+            ("Oklahoma City", egui::pos2(560.0, 100.0)),
+            ("Lake Thunderbird", egui::pos2(204.0, 104.0)),
+            ("Norman", egui::pos2(200.0, 400.0)),
+            ("Moore", egui::pos2(203.0, 403.0)),
+        ];
+        let labels = || -> Vec<Text> { names.iter().map(|(n, at)| label(n, *at)).collect() };
+
+        let describe =
+            |shapes: &[egui::epaint::ClippedShape]| -> Vec<(String, egui::Pos2, egui::Color32)> {
+                text_shapes(shapes)
+                    .iter()
+                    .map(|t| (t.galley.text().to_owned(), t.pos, t.fallback_color))
+                    .collect()
+            };
+
+        const PASSES: u64 = 3;
+
+        let ctx_kept = egui::Context::default();
+        let mut galleys = walkers::GalleyCache::default();
+        let mut cache = crate::label_cache::LabelCache::default();
+        let mut kept_frames = Vec::new();
+        for _ in 0..PASSES {
+            let shapes = shapes_of_one_pass(&ctx_kept, canvas, |ui| {
+                paint_labels(ui.painter(), labels(), &mut galleys, &mut cache, 0);
+            });
+            kept_frames.push(describe(&shapes));
+        }
+
+        let ctx_fresh = egui::Context::default();
+        let mut fresh_frames = Vec::new();
+        for _ in 0..PASSES {
+            let shapes = shapes_of_one_pass(&ctx_fresh, canvas, |ui| {
+                paint_labels(
+                    ui.painter(),
+                    labels(),
+                    &mut walkers::GalleyCache::default(),
+                    &mut crate::label_cache::LabelCache::default(),
+                    0,
+                );
+            });
+            fresh_frames.push(describe(&shapes));
+        }
+
+        assert_eq!(kept_frames, fresh_frames);
+        assert!(
+            !kept_frames[0].is_empty(),
+            "the fixture drew no labels, so the comparison proves nothing",
+        );
+        assert!(
+            kept_frames[0].len() < names.len(),
+            "the fixture placed every label, so the comparison never covers a refusal",
+        );
+
+        // **The cut itself.** One solve for the three passes, and the two
+        // later ones did not reach the galley memo at all: the whole phase --
+        // galley probe, repeat-name table, oriented rectangles and the
+        // bucketed collision search -- did not run.
+        assert_eq!(cache.solves(), 1, "the label set was solved more than once");
+        assert_eq!(cache.hits(), PASSES - 1);
+        let touched = galleys.layouts() + galleys.hits();
+        assert_eq!(
+            touched,
+            names.len() as u64,
+            "a kept frame reached the galley memo, so the phase ran again",
+        );
+    }
+
+    /// The memo is a memo, not a latch: a label set that moved is solved
+    /// again, and a set that came back is solved again after it.
+    #[test]
+    fn a_moved_label_set_is_solved_again() {
+        let _ledger = ledger_guard();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN);
+        let ctx = egui::Context::default();
+        let mut galleys = walkers::GalleyCache::default();
+        let mut cache = crate::label_cache::LabelCache::default();
+
+        let at = |dx: f32| vec![label("Washita River", egui::pos2(200.0 + dx, 300.0))];
+
+        for dx in [0.0_f32, 0.0, 11.0, 11.0, 0.0] {
+            let _ = shapes_of_one_pass(&ctx, canvas, |ui| {
+                paint_labels(ui.painter(), at(dx), &mut galleys, &mut cache, 0);
+            });
+        }
+
+        // Three distinct lists in that run of five: 0, 11, and 0 again.
+        assert_eq!(cache.solves(), 3, "a moved label set was answered stale");
+        assert_eq!(cache.hits(), 2);
+    }
+
+    /// Two panes handing over the same names keep two solves, because the
+    /// entry is per pane. A single-entry memo would thrash between them and
+    /// solve on every frame; a memo that ignored the pane would paint one
+    /// pane's labels into the other.
+    #[test]
+    fn each_pane_keeps_its_own_solve() {
+        let _ledger = ledger_guard();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN);
+        let ctx = egui::Context::default();
+        let mut galleys = walkers::GalleyCache::default();
+        let mut cache = crate::label_cache::LabelCache::default();
+
+        let labels = || vec![label("Washita River", egui::pos2(200.0, 300.0))];
+        for _ in 0..3 {
+            for pane in 0..2 {
+                let _ = shapes_of_one_pass(&ctx, canvas, |ui| {
+                    paint_labels(ui.painter(), labels(), &mut galleys, &mut cache, pane);
+                });
+            }
+        }
+        assert_eq!(cache.solves(), 2, "one solve per pane, not one per frame");
+        assert_eq!(cache.hits(), 4);
     }
 
     /// Every `TextShape` a pass emitted, reaching inside a haloed label's
@@ -2164,7 +2362,13 @@ mod tests {
             .map(|(i, at)| label(&format!("River {i}"), *at))
             .collect();
         let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            paint_labels(ui.painter(), distinct, &mut walkers::GalleyCache::default());
+            paint_labels(
+                ui.painter(),
+                distinct,
+                &mut walkers::GalleyCache::default(),
+                &mut crate::label_cache::LabelCache::default(),
+                0,
+            );
         });
         assert_eq!(
             text_shapes(&shapes).len(),
@@ -2175,7 +2379,13 @@ mod tests {
 
         let crowded: Vec<Text> = anchors.iter().map(|at| label("Rio Grande", *at)).collect();
         let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            paint_labels(ui.painter(), crowded, &mut walkers::GalleyCache::default());
+            paint_labels(
+                ui.painter(),
+                crowded,
+                &mut walkers::GalleyCache::default(),
+                &mut crate::label_cache::LabelCache::default(),
+                0,
+            );
         });
         assert_eq!(
             text_shapes(&shapes).len(),
@@ -2199,7 +2409,13 @@ mod tests {
             label("Rio Salado", egui::pos2(140.0, 400.0)),
         ];
         let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            paint_labels(ui.painter(), spread, &mut walkers::GalleyCache::default());
+            paint_labels(
+                ui.painter(),
+                spread,
+                &mut walkers::GalleyCache::default(),
+                &mut crate::label_cache::LabelCache::default(),
+                0,
+            );
         });
         let drawn: Vec<&str> = text_shapes(&shapes)
             .iter()
@@ -2241,6 +2457,8 @@ mod tests {
                 ui.painter(),
                 vec![label("Washita River", egui::pos2(400.0, 300.0))],
                 &mut walkers::GalleyCache::default(),
+                &mut crate::label_cache::LabelCache::default(),
+                0,
             );
         });
 
@@ -2284,6 +2502,8 @@ mod tests {
                 ui.painter(),
                 vec![long],
                 &mut walkers::GalleyCache::default(),
+                &mut crate::label_cache::LabelCache::default(),
+                0,
             );
         });
         assert!(
@@ -2312,6 +2532,8 @@ mod tests {
                     ui.painter(),
                     vec![text],
                     &mut walkers::GalleyCache::default(),
+                    &mut crate::label_cache::LabelCache::default(),
+                    0,
                 );
             });
             assert_eq!(
@@ -2751,6 +2973,8 @@ mod tests {
                 ui.painter(),
                 labels.clone(),
                 &mut walkers::GalleyCache::default(),
+                &mut crate::label_cache::LabelCache::default(),
+                0,
             );
         });
         (emitted, crate::tile_mesh::ledger::totals())
@@ -3031,7 +3255,13 @@ mod tests {
         let draw = |ui: &egui::Ui| {
             let labels =
                 draw_tile_layer(ui, &projector, zoom, &mut tiles, 0, Some(&painter)).labels;
-            paint_labels(ui.painter(), labels, &mut walkers::GalleyCache::default());
+            paint_labels(
+                ui.painter(),
+                labels,
+                &mut walkers::GalleyCache::default(),
+                &mut crate::label_cache::LabelCache::default(),
+                0,
+            );
         };
         let shapes = match opacity {
             Some(opacity) => shapes_of_one_pass_at(&ctx, canvas, opacity, draw),

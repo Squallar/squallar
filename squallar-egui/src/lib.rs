@@ -48,6 +48,7 @@ pub mod heap_census;
 /// The one copy of the integration-faithful event sequences, emitted by both
 /// the headless input harness and the gesture player.
 pub(crate) mod input_fidelity;
+pub(crate) mod label_cache;
 pub(crate) mod legend_ramp;
 pub mod overlay_cache;
 pub mod pane;

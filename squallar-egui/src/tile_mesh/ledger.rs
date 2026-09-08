@@ -27,6 +27,13 @@
 //!   deferred**. The non-triviality conjunct under the first figure: a zero
 //!   there means the fills went to the GPU only if this is still positive; if
 //!   both are zero the tile pass did not run.
+//! * [`Totals::label_solves`] — **times the label phase actually ran**, one
+//!   per pane per frame whose names or glyph raster had moved since that
+//!   pane last drew them. Its denominator is FRAMES-AND-PANES and the figure
+//!   above it is ANCHORS, so the two are never divided into one another; what
+//!   they say together is how much of the deferred work the memo removed. A
+//!   figure equal to the pane-frames the leg drew is a memo that never
+//!   answers; see `squallar_egui::label_cache`.
 //! * [`Totals::mesh_draws`] — **paint callbacks pushed for fill runs**, one
 //!   per run per tile per frame. The floor under the first figure's zero.
 //! * [`Totals::stroke_draws`] — **paint callbacks pushed for stroke runs**,
@@ -45,6 +52,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 static MESH_VERTICES_PLACED: AtomicU64 = AtomicU64::new(0);
 static PATH_POINTS_PLACED: AtomicU64 = AtomicU64::new(0);
 static LABEL_ANCHORS_PLACED: AtomicU64 = AtomicU64::new(0);
+static LABEL_SOLVES: AtomicU64 = AtomicU64::new(0);
 static MESH_DRAWS: AtomicU64 = AtomicU64::new(0);
 static STROKE_DRAWS: AtomicU64 = AtomicU64::new(0);
 static MESH_UPLOADS: AtomicU64 = AtomicU64::new(0);
@@ -59,6 +67,9 @@ pub struct Totals {
     pub mesh_vertices_placed: u64,
     pub path_points_placed: u64,
     pub label_anchors_placed: u64,
+    /// Label phases run: one per pane per frame that could not be answered
+    /// from the kept solve. A **count of phases**, never of labels.
+    pub label_solves: u64,
     pub mesh_draws: u64,
     pub stroke_draws: u64,
     pub mesh_uploads: u64,
@@ -88,6 +99,12 @@ pub fn note_path_points_placed(n: u64) {
 /// Label anchors this tile deferred to the label phase. One call per tile.
 pub fn note_label_anchors_placed(n: u64) {
     LABEL_ANCHORS_PLACED.fetch_add(n, Relaxed);
+}
+
+/// One pane's label phase ran rather than answering from its kept solve. One
+/// call per pane per frame, and only on a frame that solved.
+pub fn note_label_solve() {
+    LABEL_SOLVES.fetch_add(1, Relaxed);
 }
 
 /// Fill runs this tile handed to the renderer. One call per tile.
@@ -132,6 +149,7 @@ impl Totals {
         self.mesh_vertices_placed
             .wrapping_add(self.path_points_placed)
             .wrapping_add(self.label_anchors_placed)
+            .wrapping_add(self.label_solves)
             .wrapping_add(self.mesh_draws)
             .wrapping_add(self.stroke_draws)
             .wrapping_add(self.mesh_uploads)
@@ -160,6 +178,7 @@ pub fn totals() -> Totals {
         mesh_vertices_placed: MESH_VERTICES_PLACED.load(Relaxed),
         path_points_placed: PATH_POINTS_PLACED.load(Relaxed),
         label_anchors_placed: LABEL_ANCHORS_PLACED.load(Relaxed),
+        label_solves: LABEL_SOLVES.load(Relaxed),
         mesh_draws: MESH_DRAWS.load(Relaxed),
         stroke_draws: STROKE_DRAWS.load(Relaxed),
         mesh_uploads: MESH_UPLOADS.load(Relaxed),
@@ -181,6 +200,7 @@ pub(crate) fn reset() {
         &MESH_VERTICES_PLACED,
         &PATH_POINTS_PLACED,
         &LABEL_ANCHORS_PLACED,
+        &LABEL_SOLVES,
         &MESH_DRAWS,
         &STROKE_DRAWS,
         &MESH_UPLOADS,

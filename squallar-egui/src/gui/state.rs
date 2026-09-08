@@ -101,6 +101,11 @@ pub struct Gui {
     /// frames. Owned here for the same reason the galley memo is: it exists to
     /// outlive the frame. See [`crate::point_painter::PointTextMeshes`].
     pub(super) point_text_meshes: crate::point_painter::PointTextMeshes,
+    /// The basemap's place names, kept solved and tessellated per pane
+    /// between frames. Owned here for the same reason the two above are:
+    /// what it saves only exists across frames. See
+    /// [`crate::label_cache::LabelCache`].
+    pub(super) label_cache: crate::label_cache::LabelCache,
     /// The floor-strip cache: per-pane content keys, the all-or-nothing
     /// frame verdict, and the repaint-force latch. See
     /// [`map::FloorStrips`].
@@ -658,6 +663,7 @@ impl Gui {
             map_pane_geo: HashMap::new(),
             galley_cache: walkers::GalleyCache::default(),
             point_text_meshes: crate::point_painter::PointTextMeshes::default(),
+            label_cache: crate::label_cache::LabelCache::default(),
             floor_strips: map::FloorStrips::default(),
             volume_empty_states: HashMap::new(),
             mirror_size_points: egui::Vec2::ZERO,

@@ -406,6 +406,10 @@ pub(super) struct PaneRenderCtx<'a> {
     /// layer. Lent for the frame for the same reason the galley memo is. See
     /// [`crate::point_painter::PointTextMeshes`].
     pub point_text_meshes: &'a mut crate::point_painter::PointTextMeshes,
+    /// The basemap's place names, kept solved and tessellated per pane
+    /// between frames. Lent for the frame for the same reason the two above
+    /// are. See [`crate::label_cache::LabelCache`].
+    pub label_cache: &'a mut crate::label_cache::LabelCache,
     /// The base tile source, taken out of `tiles::MapTileState` for the
     /// frame. `None` while the BasemapTiles layer is off in every visible
     /// pane (the slot is then released — a disabled layer costs zero
@@ -728,6 +732,8 @@ pub(super) fn render_pane_map_content(
                         ui.painter(),
                         std::mem::take(&mut ctx.basemap_labels),
                         ctx.galley_cache,
+                        ctx.label_cache,
+                        ctx.pane_idx,
                     );
                 }
                 id if *id == known::RADAR_COVERAGE => {

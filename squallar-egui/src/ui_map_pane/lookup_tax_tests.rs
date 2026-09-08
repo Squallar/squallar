@@ -113,6 +113,7 @@ fn walk_ledger_scene(panes: usize, on: LayersOn) -> ((u64, u64, u64), (u64, u64,
     let mut click_consumed = false;
     let mut galley_cache = walkers::GalleyCache::default();
     let mut point_text_meshes = crate::point_painter::PointTextMeshes::default();
+    let mut label_cache = crate::label_cache::LabelCache::default();
 
     egui_ctx.begin_pass(egui::RawInput {
         screen_rect: Some(canvas),
@@ -144,6 +145,7 @@ fn walk_ledger_scene(panes: usize, on: LayersOn) -> ((u64, u64, u64), (u64, u64,
             basemap_labels: Vec::new(),
             galley_cache: &mut galley_cache,
             point_text_meshes: &mut point_text_meshes,
+            label_cache: &mut label_cache,
             ground_meshes: None,
             basemap_tiles: None,
             terrain_tiles: None,
@@ -473,6 +475,7 @@ mod point_pass {
         let mut click_consumed = false;
         let mut galley_cache = walkers::GalleyCache::default();
         let mut point_text_meshes = crate::point_painter::PointTextMeshes::default();
+        let mut label_cache = crate::label_cache::LabelCache::default();
 
         egui_ctx.begin_pass(egui::RawInput {
             screen_rect: Some(canvas),
@@ -498,6 +501,7 @@ mod point_pass {
             basemap_labels: Vec::new(),
             galley_cache: &mut galley_cache,
             point_text_meshes: &mut point_text_meshes,
+            label_cache: &mut label_cache,
             ground_meshes: None,
             basemap_tiles: None,
             terrain_tiles: None,
