@@ -3743,6 +3743,32 @@ impl PaneState {
         }
     }
 
+    /// **Whole-picture overlay rasters this pane has occupying the upload
+    /// pipe**: one per layer that has a whole raster dispatched and not yet
+    /// arrived, or arrived and not yet delivered to the GPU.
+    ///
+    /// The two states are one charge and not two because they are one
+    /// picture's bytes at two points of the same journey — `overlay replies`
+    /// on the way in, `upload pending` on the way out, two census families
+    /// whose own note says they "abut and do not overlap". A layer in neither
+    /// state costs nothing; the picture it is drawing is the GPU's.
+    ///
+    /// **Radar is not counted.** Its rasters come from
+    /// `App::dispatch_pane_renders`, not from the overlay door this figure
+    /// feeds, so charging them would close a door against traffic it cannot
+    /// throttle — the way to make a loop playing on one pane stop every other
+    /// layer from ever re-rendering.
+    pub fn overlay_pictures_outstanding(&self) -> usize {
+        self.overlay_textures
+            .iter()
+            .filter(|(id, cache)| {
+                **id != known::RADAR
+                    && (cache.is_holding()
+                        || cache.renders.holds(crate::overlay_cache::RenderSlot::WHOLE))
+            })
+            .count()
+    }
+
     /// Put a freshly placed raster on this pane — now, or when it is whole.
     pub fn place_radar_raster(
         &mut self,

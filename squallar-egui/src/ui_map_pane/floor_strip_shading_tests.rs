@@ -102,6 +102,7 @@ fn dispatched(surfaces: PaneSurfaces, ground: GroundIsMesh) -> Vec<LayerId> {
             .max_rect(canvas),
     );
 
+    let budget = std::cell::Cell::new(usize::MAX);
     let mut ctx = PaneRenderCtx {
         admission_notice: None,
         cost: None,
@@ -124,6 +125,7 @@ fn dispatched(surfaces: PaneSurfaces, ground: GroundIsMesh) -> Vec<LayerId> {
         terrain_tiles: None,
         tile_zoom_bias: 0,
         overlay_render_limit: 1,
+        overlay_dispatch_budget: &budget,
         overlay_overdraw: crate::overlay_cache::OVERDRAW_FRACTION,
         actions: &mut actions,
         pane_rect: canvas,

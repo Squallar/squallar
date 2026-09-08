@@ -2707,6 +2707,41 @@ impl Gui {
         self.panes.iter().any(PaneState::is_holding_raster)
     }
 
+    /// **How many more whole-picture overlay rasters this frame may ask for**,
+    /// for the whole application: the ceiling less what the visible panes
+    /// already have in the pipe.
+    ///
+    /// # What this bounds that the per-cache door cannot
+    ///
+    /// `crate::overlay_cache::RendersInFlight::admits` bounds one pane and
+    /// layer, and its own note says what that leaves open — "the aggregate is
+    /// `panes x texture layers x budget x plan bytes`, which the budget alone
+    /// does not bound". Every shown layer re-rasterizes on the same move, so
+    /// the aggregate IS the quantity, and each of its terms is a whole
+    /// picture: 41.7 MB at a 2878x1651 pane, thirteen layers, one batch, and
+    /// `squallar_gpu`'s band queue holding each of them whole until its last
+    /// band crosses. See
+    /// `squallar_device_profile::constants::MAX_OVERLAY_PICTURES_OUTSTANDING`.
+    ///
+    /// # The visible panes, and why a hidden one is not counted
+    ///
+    /// The door this feeds is asked only where a pane is drawn, so a hidden
+    /// pane can spend nothing; counting what it still holds would shrink the
+    /// allowance of the panes that can. A hidden pane's own outstanding
+    /// rasters are retired by the arrival path
+    /// (`App::poll_overlay_render_results` drops a picture no visible pane
+    /// wants), not held against the panes on screen.
+    pub fn overlay_dispatch_budget(&self, pane_count: usize) -> usize {
+        let outstanding: usize = self
+            .panes
+            .iter()
+            .take(pane_count)
+            .map(PaneState::overlay_pictures_outstanding)
+            .sum();
+        squallar_device_profile::constants::MAX_OVERLAY_PICTURES_OUTSTANDING
+            .saturating_sub(outstanding)
+    }
+
     /// Show every held raster whose pixels have all landed — the radar raster
     /// and every layer texture alike.
     pub fn promote_held_rasters(&mut self, delivered: impl Fn(egui::TextureId) -> bool) {

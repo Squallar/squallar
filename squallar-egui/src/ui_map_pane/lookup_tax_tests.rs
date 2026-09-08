@@ -133,6 +133,7 @@ fn walk_ledger_scene(panes: usize, on: LayersOn) -> ((u64, u64, u64), (u64, u64,
     lookup_ledger::reset();
     slot_ledger::reset();
     for (pane_idx, pane) in states.iter_mut().enumerate() {
+        let budget = std::cell::Cell::new(usize::MAX);
         let mut ctx = PaneRenderCtx {
             admission_notice: None,
             cost: None,
@@ -152,6 +153,7 @@ fn walk_ledger_scene(panes: usize, on: LayersOn) -> ((u64, u64, u64), (u64, u64,
             terrain_tiles: None,
             tile_zoom_bias: 0,
             overlay_render_limit: 1,
+            overlay_dispatch_budget: &budget,
             overlay_overdraw: crate::overlay_cache::OVERDRAW_FRACTION,
             actions: &mut actions,
             pane_rect: canvas,
@@ -490,6 +492,7 @@ mod point_pass {
                 .max_rect(canvas),
         );
         lookup_ledger::reset();
+        let budget = std::cell::Cell::new(usize::MAX);
         let mut ctx = PaneRenderCtx {
             admission_notice: None,
             cost: None,
@@ -509,6 +512,7 @@ mod point_pass {
             terrain_tiles: None,
             tile_zoom_bias: 0,
             overlay_render_limit: 1,
+            overlay_dispatch_budget: &budget,
             overlay_overdraw: crate::overlay_cache::OVERDRAW_FRACTION,
             actions: &mut actions,
             pane_rect: canvas,

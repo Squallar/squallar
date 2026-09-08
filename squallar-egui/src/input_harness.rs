@@ -2593,3 +2593,6 @@ mod radar_draw_addressing_tests;
 /// opacity change never asks for.
 #[cfg(test)]
 mod layer_opacity_tests;
+
+#[cfg(test)]
+mod overlay_dispatch_budget_tests;

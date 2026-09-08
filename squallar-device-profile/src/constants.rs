@@ -1052,6 +1052,76 @@ pub const MAX_LOOP_SECTION_CUTS_PER_FRAME: usize = 1;
 /// arrives when it arrives.
 pub const MAX_OVERLAY_LOOP_RENDERS_PER_PASS: usize = 4;
 
+/// How many whole-picture overlay rasters the **whole application** may have
+/// outstanding at once — dispatched and not yet arrived, plus arrived and not
+/// yet delivered to the GPU.
+///
+/// # The quantity nothing bounded
+///
+/// `squallar_egui::overlay_cache::RendersInFlight` bounds one pane and layer,
+/// and its own type note says what that leaves open: "the aggregate is `panes
+/// x texture layers x budget x plan bytes` — **which the budget alone does not
+/// bound**". The shown layers re-rasterize *together* on every map move, so the
+/// unbounded quantity is a whole batch, and it is resident twice over on its
+/// way to the card: as an `Arc<egui::ColorImage>` between the rasterizer and
+/// the frame thread (`overlay replies`), and then as one band queue entry per
+/// picture in `squallar_gpu`'s `TextureUploads::pending` (`upload pending`),
+/// which holds each picture **whole** until its last band has crossed.
+///
+/// The band queue drains one [`BLOCKING_BAND_BYTES`] band a frame on every
+/// device without a staging ring — which is every browser — so a picture is
+/// held for `ceil(bytes / 4 MiB)` frames. That figure is a property of the
+/// *canvas*, not of the design: at a 1280-wide pane a picture is ~8 MiB and
+/// takes 2 frames, and the measured `upload pending` peaked at 64.3 MiB and
+/// returned to zero; at 2878x1651 the same picture is 41.7 MB and takes 11
+/// frames, and the same family read **302-579 MiB and never drained**.
+/// `squallar_device_profile::fit::NeedTerms::upload_pending_host` prices that
+/// steady state at a whole batch — 542,353,344 B for thirteen layers — and
+/// calls the measured range 78-97 % of it.
+///
+/// # Four, and what the fifth would buy
+///
+/// The band queue is the bottleneck on every ringless device, so a raster
+/// dispatched past what the queue can absorb does not arrive any sooner: it
+/// waits in a queue instead of waiting to be asked for, and pays a whole
+/// picture of host memory for the difference. Four keeps the rasterizer ahead
+/// of the drain at the *small* canvas, where a picture is two frames of drain
+/// against a ~133 ms rasterize — the case where a tighter bound would idle the
+/// queue — and it is the same figure, for the same funnel reason, as
+/// [`MAX_OVERLAY_LOOP_RENDERS_PER_PASS`].
+///
+/// **It is a count and not a byte budget on purpose.** The thing being bounded
+/// is one picture per outstanding raster whatever its size, and the size is
+/// the pane's own plan; a byte budget would re-derive the plan here, and
+/// `budgets that silently re-derive` is the defect that produced the 7.6 ms
+/// blocking allowance nobody chose in `squallar_gpu`'s `whole_budget`.
+///
+/// # What a refusal costs, and why it cannot lose a raster
+///
+/// The door is the draw pass's, beside the per-cache one, and a refusal there
+/// latches `overlay_work_owed` — the `request_once` retry that exists because
+/// "a dispatch that was REFUSED has no arrival to wait for and nothing else
+/// would ever re-ask". So the layer asks again on the next frame and every
+/// frame after until it is admitted. Nothing is dropped and no affordance
+/// stops working; what changes is that the layers of a batch reach the glass
+/// in sequence rather than all at the end of one, and the total is unchanged
+/// because the drain never moved faster than one band a frame either way.
+///
+/// # The ordering it does not promise, stated rather than left to be found
+///
+/// A pane REPLACING a picture it is already uploading is charged nothing —
+/// the supersede is net zero on the pipe — so under a pan long enough to
+/// outlast a picture's drain the layers already in the pipe can keep taking
+/// their own slots back while a layer with nothing in it waits. Nothing here
+/// rotates the walk, and the brake that ends it is
+/// `OverlayTextureCache::sweep_discarded`, which answers `needs_rerender`
+/// false for a pane that has demonstrated it discards uploads. **What the
+/// waiting layer shows meanwhile is the picture it already had**, which is
+/// what it showed before this door existed too: the batch's last picture was
+/// 135 frames of draining behind the move either way. The door changes which
+/// layers are early, not whether any is served.
+pub const MAX_OVERLAY_PICTURES_OUTSTANDING: usize = 4;
+
 /// The blocking-upload band: on a device with **no staging ring** — all of
 /// web, and any native adapter without `MAPPABLE_PRIMARY_BUFFERS` — this is
 /// both the largest texture delta that crosses whole on the frame's own queue

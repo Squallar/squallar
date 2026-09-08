@@ -182,6 +182,14 @@ impl super::Gui {
         // One read for every pane this frame draws: the figure is the
         // device's, not the pane's.
         let overlay_render_limit = self.concurrent_renders;
+        // **What this frame may still ask the rasterizer for**, for the whole
+        // application rather than for one pane and layer. Opened here, before
+        // any pane is drawn, because the quantity it bounds is the batch —
+        // every shown layer of every pane re-rasterizes together on a move —
+        // and spent by `render_pane_map_content`'s door. See
+        // `Gui::overlay_dispatch_budget`.
+        let overlay_dispatch_budget =
+            std::cell::Cell::new(self.overlay_dispatch_budget(pane_count));
         let overlay_overdraw = self.overlay_overdraw;
         let tile_zoom_biases: Vec<u8> = (0..pane_count)
             .map(|idx| self.tile_zoom_bias_for_pane(idx))
@@ -410,6 +418,7 @@ impl super::Gui {
                                             terrain_tiles: terrain_owned.as_mut(),
                                             tile_zoom_bias,
                                             overlay_render_limit,
+                                            overlay_dispatch_budget: &overlay_dispatch_budget,
                                             overlay_overdraw,
                                             actions: &mut actions,
                                             pane_rect,
@@ -521,6 +530,7 @@ impl super::Gui {
                                 pane_idx,
                                 floor_strips.get(pane_idx).copied().flatten(),
                                 FloorStripCtx {
+                                    overlay_dispatch_budget: &overlay_dispatch_budget,
                                     pane: &mut pane,
                                     map_memory: floor_frame.memory,
                                     center: floor_frame.centre,
@@ -1832,6 +1842,7 @@ impl super::Gui {
         floor: FloorStripCtx<'_>,
     ) -> Option<crate::volume_view::MapPaneGeo> {
         let FloorStripCtx {
+            overlay_dispatch_budget,
             pane,
             map_memory,
             center,
@@ -1962,6 +1973,7 @@ impl super::Gui {
                     terrain_tiles: terrain,
                     tile_zoom_bias,
                     overlay_render_limit,
+                    overlay_dispatch_budget,
                     overlay_overdraw,
                     actions,
                     pane_rect: strip,
@@ -2235,6 +2247,12 @@ impl FloorStrips {
 /// Everything [`Gui::draw_floor_strip`] needs from the pane loop that is not
 /// already on the `Gui`.
 struct FloorStripCtx<'a> {
+    /// The frame's remaining application-wide allowance of new whole-picture
+    /// overlay rasters, shared with the plan-view pass rather than reopened:
+    /// the strip draws the same pane's layers and asks the same door, so a
+    /// second allowance here would let one frame dispatch twice the batch.
+    /// See [`pane_render::PaneRenderCtx::overlay_dispatch_budget`].
+    overlay_dispatch_budget: &'a std::cell::Cell<usize>,
     pane: &'a mut crate::pane::PaneState,
     /// The viewport the strip is drawn through, **owned**.
     map_memory: walkers::MapMemory,

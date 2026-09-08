@@ -149,12 +149,27 @@ pub struct NeedTerms {
     /// — and the shown layers re-rasterise **together** on every move, so a
     /// thirteen-picture batch of 542,353,344 B is some 135 frames of draining
     /// against a user who moves the map again inside that. A whole batch
-    /// queued is the steady state under interaction, not a transient: the
-    /// measured range above is 78 – 97 % of that batch.
+    /// queued **was** the steady state under interaction when this was
+    /// measured — the range above is 78 – 97 % of that batch — and the
+    /// paragraph below says what changed and why the arithmetic did not.
     ///
     /// **A sum, not a max**, unlike [`Self::picture_arrival_host`]: the
     /// arrival is one buffer for the whole application because one reply is
     /// converted at a time, and each pane's batch queues on its own.
+    ///
+    /// **The steady state above is no longer the application's, and this term
+    /// is now an over-price rather than a reading.** The draw pass has an
+    /// application-wide door on it since 2026-09-08 --
+    /// [`crate::constants::MAX_OVERLAY_PICTURES_OUTSTANDING`], asked in
+    /// `squallar_egui`'s `render_pane_map_content` beside the per-cache one --
+    /// so the pictures that can be in the pipe at once are four and not a
+    /// batch, whatever the pane count. **The arithmetic here is deliberately
+    /// left at a whole batch**: over-pricing a term sheds ladder rungs and
+    /// under-pricing one hands out memory the machine does not have, and
+    /// re-pricing this one moves which rungs every shipped device gets. That
+    /// is a ladder change with its own measurement, not a side effect of the
+    /// door. What must not survive is the *claim*: a whole batch queued is
+    /// what this term charges, and it is no longer what the application does.
     ///
     /// **What this term does NOT price, corrected 2026-09-07.** Until then
     /// the line above read "and this queue holds every band anyone has

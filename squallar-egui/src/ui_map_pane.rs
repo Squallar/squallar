@@ -431,6 +431,17 @@ pub(super) struct PaneRenderCtx<'a> {
     /// the device's `Budgets::concurrent_renders`. See
     /// [`crate::overlay_cache::RendersInFlight::admits`].
     pub overlay_render_limit: usize,
+    /// **What is left of this frame's application-wide allowance of new
+    /// whole-picture overlay rasters**, shared by every pane and layer the
+    /// frame draws and decremented as each one is admitted.
+    ///
+    /// A `Cell` and not a `&mut`: the pane loop holds one pane mutably at a
+    /// time and the floor strip builds a second context for the same frame,
+    /// so the allowance cannot be borrowed exclusively by either. See
+    /// `squallar_device_profile::constants::MAX_OVERLAY_PICTURES_OUTSTANDING`
+    /// for what it is, and `crate::ui::Gui::overlay_dispatch_budget` for how
+    /// the frame's opening figure is composed.
+    pub overlay_dispatch_budget: &'a std::cell::Cell<usize>,
     /// The overdraw fraction this pane's whole-picture overlays ask for, per
     /// side — the ladder's oversampling rung, delivered through
     /// `crate::shell_api::FrameInputs::overlay_overdraw` and handed to
@@ -1051,10 +1062,33 @@ pub(super) fn render_pane_map_content(
             // `render_in_flight`: a skipped frame is missing from the settle clock.
             let stale = has_data
                 && cache.needs_rerender(token, zoom, zoom_drive, &viewport_bounds, &tex_plan);
-            let dispatched = stale
-                && cache
-                    .renders
-                    .admits(RenderSlot::WHOLE, ctx.overlay_render_limit);
+            // **The pipe already holds this layer's picture**, so the ask
+            // below replaces it rather than adding to it: the `hold` drops
+            // the handle it was keeping, egui retires that texture, and
+            // `squallar_gpu`'s `TextureUploads::free` takes its bands out of
+            // the queue in the same breath. A supersede is net zero on the
+            // aggregate and is charged nothing.
+            let replaces = cache.is_holding();
+            let admits = cache
+                .renders
+                .admits(RenderSlot::WHOLE, ctx.overlay_render_limit);
+            // **The aggregate door**, beside the per-cache one above. See
+            // `squallar_device_profile::constants::MAX_OVERLAY_PICTURES_OUTSTANDING`
+            // for what it bounds and why the per-cache limit cannot: this is
+            // the only place that can see the whole batch, because the batch
+            // is every shown layer of every pane and the per-cache limit is
+            // asked once per layer.
+            let afforded = replaces || ctx.overlay_dispatch_budget.get() > 0;
+            let dispatched = stale && admits && afforded;
+            if dispatched && !replaces {
+                // `saturating_sub` and not `-`: the two lines are a pair, and
+                // a pair is what a later edit can come apart. Nothing may
+                // reach here at zero today — `afforded` is the same read one
+                // line up — and an allowance that went negative would be a
+                // door that swings open, so it floors instead.
+                ctx.overlay_dispatch_budget
+                    .set(ctx.overlay_dispatch_budget.get().saturating_sub(1));
+            }
             if dispatched {
                 ctx.actions.push(GuiAction::RenderOverlay {
                     pane_idx: ctx.pane_idx,

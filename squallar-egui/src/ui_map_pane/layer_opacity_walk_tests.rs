@@ -128,6 +128,7 @@ fn walk_at(run: Walk<'_>) -> Walked {
     // the only caller there is of the composition the walk does with it.
     ui.set_opacity(run.base);
 
+    let budget = std::cell::Cell::new(usize::MAX);
     let mut ctx = PaneRenderCtx {
         admission_notice: None,
         cost: None,
@@ -147,6 +148,7 @@ fn walk_at(run: Walk<'_>) -> Walked {
         terrain_tiles: None,
         tile_zoom_bias: 0,
         overlay_render_limit: 1,
+        overlay_dispatch_budget: &budget,
         overlay_overdraw: crate::overlay_cache::OVERDRAW_FRACTION,
         actions: &mut actions,
         pane_rect: canvas,
