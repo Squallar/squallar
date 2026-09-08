@@ -183,6 +183,12 @@ pub mod alloc_failure;
 /// two atomics and a truth about them, and the host tests read them.
 pub mod heap_max;
 
+/// **What the rasterization worker last said about its own heap, and whether
+/// the worker that said it is still this page's.** Not wasm32-gated for
+/// [`heap_max`]'s reason: when a figure stops being current is a rule, and a
+/// wasm-gated rule is host-tested by nothing.
+pub mod worker_heap;
+
 /// `initThreadPool`, the JS half of `wasm-bindgen-rayon`'s pool. Re-exported
 /// because wasm-bindgen only emits a binding for an export this crate names:
 /// the symbol is defined in the dependency, and without this line `worker.js`

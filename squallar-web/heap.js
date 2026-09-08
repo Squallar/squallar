@@ -78,12 +78,26 @@ export const HANDHELD_PAGE_BYTES = 512 * 1024 * 1024;
 /**
  * **What a handheld's rasterization WORKER gets**, and it is deliberately not
  * the page's figure. The worker holds no cache: it holds the buffers of the
- * jobs in flight, bounded by `WASM_MAX_CONCURRENT_RENDERS` (3), plus the tile
- * lane's parse and style scratch on the same heap. The largest single
- * allocation ever measured there is the MRMS decoder's 98 MB grid. 256 MiB is
- * two of those plus room, and it keeps the PAIR at 768 MiB on a 2 GiB phone
- * -- two heaps in two address spaces, but one physical RAM, which is the only
- * reason the two figures are ever considered together.
+ * jobs in flight, plus the tile lane's parse and style scratch on the same
+ * heap. The largest single allocation ever measured there is the MRMS
+ * decoder's 98 MB grid. 256 MiB is two of those plus room, and it keeps the
+ * PAIR at 768 MiB on a 2 GiB phone -- two heaps in two address spaces, but
+ * one physical RAM, which is the only reason the two figures are ever
+ * considered together.
+ *
+ * **The figure is a policy against the largest single allocation, not a
+ * derivation from what is in flight, because what is in flight is not
+ * bounded in bytes.** The radar family shares one slot
+ * (`WASM_MAX_CONCURRENT_RENDERS`, which is 1 on this target); the overlay
+ * rasters -- the picture-sized jobs, and the ones this heap is really sized
+ * for -- do not pass through that counter at all. Their cap is per (pane,
+ * layer, slot) and the aggregate is panes x texture layers, which
+ * `squallar_egui::overlay_cache::InFlight` states in its own doc that the
+ * budget does not bound. Nothing prices this heap and no lever of the
+ * application reaches it: both the admission door and the watermark that
+ * grant the work are taken against the PAGE's ceiling
+ * (`squallar_app::app_render::host_spare_bytes`), so a grant made there
+ * commits this instance to rasters no term of it has costed.
  */
 export const HANDHELD_WORKER_BYTES = 256 * 1024 * 1024;
 

@@ -262,8 +262,13 @@ impl PlatformBridge for WebPlatform {
         Some(LinearMemory {
             page_bytes: crate::shared_loan::memory_bytes()?,
             page_max_bytes: crate::heap_max::this_instance().unwrap_or(0),
-            worker_bytes: crate::worker_port::worker_memory_bytes(),
-            worker_live_bytes: crate::worker_port::worker_live_bytes(),
+            // `bytes()` and not `current()`: this pair is the readout's,
+            // and the readout wants the last figure said whoever said it
+            // (`crate::worker_heap::Reading`). A term that BOUNDS something
+            // must ask `current()` instead — a replaced worker's figures
+            // stand here and are not a live instance's.
+            worker_bytes: crate::worker_heap::memory().bytes(),
+            worker_live_bytes: crate::worker_heap::live().bytes(),
             // This instance's own counter, read here rather than by the app,
             // so the one host figure that can FALL arrives inside an answer
             // the bridge gave on this tick and a governor counting readings

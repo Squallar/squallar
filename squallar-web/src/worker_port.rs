@@ -53,7 +53,6 @@ use crate::worker_protocol as proto;
 use crate::worker_retry::Backoff;
 use squallar_worker::offload::{self, JobRequest, JobSink};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering};
 use wasm_bindgen::prelude::*;
 
 /// Where the worker's bootstrap lives, relative to the page.
@@ -88,54 +87,14 @@ thread_local! {
     static RESPAWN_SCHEDULED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// The worker's heap size as it last reported on its hello or a reply — see
-/// `worker_protocol::MEM`. 0 is "no worker has said yet", which
-/// [`worker_memory_bytes`] spells as `None`; a real heap is never 0 bytes.
-static WORKER_MEMORY_BYTES: AtomicU64 = AtomicU64::new(0);
-
-/// The rasterization worker's linear memory, in bytes, as it last reported;
-/// `None` until one has. A replaced worker's last figure stands until its
-/// successor speaks, which is the same rule its jobs follow.
-pub(crate) fn worker_memory_bytes() -> Option<u64> {
-    match WORKER_MEMORY_BYTES.load(Ordering::Relaxed) {
-        0 => None,
-        bytes => Some(bytes),
-    }
-}
-
-/// The worker's live bytes as it last reported beside its heap size — see
-/// `worker_protocol::LIVE`. 0 is "no worker has said yet", which
-/// [`worker_live_bytes`] spells as `None`; a running instance's allocator is
-/// never holding nothing.
-static WORKER_LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
-
-/// The rasterization worker's live bytes — what its allocator has handed out
-/// and not been handed back — as it last reported; `None` until one has. The
-/// figure beside [`worker_memory_bytes`] that can fall, under the same rule
-/// for a replaced worker.
-pub(crate) fn worker_live_bytes() -> Option<u64> {
-    match WORKER_LIVE_BYTES.load(Ordering::Relaxed) {
-        0 => None,
-        bytes => Some(bytes),
-    }
-}
-
 /// Take the worker's heap reading — and its live bytes, where the message
-/// carries them — off a message that carries one. A message without a field
-/// — a worker from a build before it — leaves that last reading alone rather
-/// than writing a zero.
+/// carries them — off a message that carries one, and hand both to
+/// [`crate::worker_heap`], which holds the figures and the rule about when
+/// one stops being current. A field the message does not carry arrives there
+/// as `None` and leaves that figure alone.
 fn note_worker_memory(data: &JsValue) {
-    for (key, cell) in [
-        (proto::MEM, &WORKER_MEMORY_BYTES),
-        (proto::LIVE, &WORKER_LIVE_BYTES),
-    ] {
-        if let Some(bytes) = proto::field(data, key)
-            .and_then(|v| v.as_f64())
-            .filter(|v| v.is_finite() && *v > 0.0)
-        {
-            cell.store(bytes as u64, Ordering::Relaxed);
-        }
-    }
+    let reading = |key| proto::field(data, key).and_then(|v| v.as_f64());
+    crate::worker_heap::note(reading(proto::MEM), reading(proto::LIVE));
 }
 
 /// Start the rasterization worker and, once it identifies itself as this same
@@ -225,6 +184,12 @@ fn lose(generation: u64, reason: &str) {
     // dropped by generation before they reach a handler — so the sweep is the
     // whole of the cleanup.
     crate::shared_loan::release_all(reason);
+    // **And that worker's heap figures stop being current.** They stand —
+    // the readout's rule is that the last figure said is what a reader wants
+    // — but rasterization falls back to the page's own thread here and there
+    // is no second instance behind them until a respawn says hello, so
+    // nothing may take them as a bound (`crate::worker_heap`).
+    crate::worker_heap::lost();
     schedule_respawn();
 }
 
