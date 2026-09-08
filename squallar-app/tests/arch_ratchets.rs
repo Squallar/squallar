@@ -173,6 +173,20 @@ const KEPT_STORE: &str = concat!("latest_cached", "_scans");
 /// The owner the first two moved behind — row 12's second presence control.
 const INVENTORY_FIELD: &str = concat!("volumes: ", "crate::volume_inventory::");
 
+/// Row 14 — **comparing a handler against its own declared id**, which is the
+/// only way a scan over the handler vector can find one. Split, per this
+/// file's needle hygiene.
+const HANDLER_ID_COMPARE: &str = concat!(".id()", " == ");
+/// Row 14's replacement, and its presence control: the registry's indexed
+/// resolver, which reads the id off the list it was built with and asks no
+/// handler anything.
+const HANDLER_RESOLVER: &str = concat!("handler_by", "_id(");
+/// Row 14's second presence control — the ONE occurrence of the needle the
+/// tree keeps on purpose, in `squallar-overlays`: the parity test that checks
+/// the indexed resolver against a scan. If the needle stops matching there it
+/// has rotted, and the zeroes below would be about nothing.
+const RESOLVER_PARITY_TEST: &str = concat!("fn resolution_matches", "_a_scan_over_the_handlers()");
+
 // --------------------------------------------------------------------------- Ceilings
 // — at-land measurements (see the table above).
 
@@ -1193,4 +1207,78 @@ fn the_platform_redraw_call_has_exactly_one_spelling() {
          here is safe; anywhere else, that decision has been left behind.",
         path.display(),
     );
+}
+
+/// Row 14 — **a layer's handler is resolved by the registry, never by asking
+/// every handler who it is.**
+///
+/// `OverlayRegistry` holds the id list it was built from and resolves an id
+/// against that list: no indirect call, no `LayerId` built and dropped per
+/// candidate. The alternative spelling —
+/// `handlers().any(|h| h.id() == *id && ...)`, or the `find`/`position` forms
+/// of the same thing — answers the identical question at one virtual
+/// `OverlayHandler::id` call and one full `LayerId` comparison **per handler
+/// ahead of the one it wants**, which over a whole registry is quadratic in
+/// the registry's size.
+///
+/// It is pinned rather than left to review because the spelling kept being
+/// copied into paths that run often. Three lands removed instances measured at
+/// 106 handler probes a frame (the timeline's step picker), 171 per scrubbed
+/// pane per frame (the overlay cache token's as-of half) and 513 per pass over
+/// the registry (the per-layer fetch context's three narrowings). Each was
+/// found by hand, and each was a copy of the one before it.
+///
+/// **Zero in the non-test source of both consumer crates**, which is where
+/// every one of those instances lived. `squallar-overlays` is deliberately not
+/// in the haystack: it owns the resolver, and it keeps exactly one scan on
+/// purpose — the parity test that checks the resolver against one — which is
+/// this row's own proof that the needle still matches something.
+#[test]
+fn a_handler_is_never_found_by_asking_every_handler_its_own_id() {
+    // The needle is alive: it matches the one scan the tree keeps on purpose.
+    let overlays = load_tree(&Path::new(ROOT).join("squallar-overlays"));
+    assert_anchored(
+        &overlays,
+        "src/render/overlay_state.rs",
+        RESOLVER_PARITY_TEST,
+    );
+    assert!(
+        count(&overlays, HANDLER_ID_COMPARE) > 0,
+        "presence control: the needle {HANDLER_ID_COMPARE:?} matches nothing \
+         in squallar-overlays, which holds the resolver-versus-scan parity \
+         test. The needle has rotted and the zeroes below are about nothing.",
+    );
+
+    for crate_name in ["squallar-app", "squallar-egui"] {
+        let crate_root = Path::new(ROOT).join(crate_name);
+        let files = load_tree(&crate_root);
+        assert!(
+            files.len() > 20,
+            "presence control: the walk reached {} .rs files under \
+             {crate_name}, which is too few to be the real tree — the count \
+             below would be about nothing",
+            files.len(),
+        );
+        assert!(
+            count(&files, HANDLER_RESOLVER) > 0,
+            "presence control: {crate_name} names the registry's resolver \
+             {HANDLER_RESOLVER:?} nowhere at all. Either the resolver was \
+             renamed — in which case this row must be re-anchored — or \
+             the walk is reading the wrong tree.",
+        );
+
+        let non_test: usize = files
+            .iter()
+            .filter(|(p, _)| !in_test_path(p, &crate_root))
+            .map(|(_, t)| t.matches(HANDLER_ID_COMPARE).count())
+            .sum();
+        assert_eq!(
+            non_test, 0,
+            "{crate_name} compares a handler against its own declared id in \
+             {non_test} place(s). That is a scan over the handler vector: an \
+             indirect call and a `LayerId` built and dropped per handler \
+             ahead of the one it wants, to answer a question `handler_by_id` \
+             answers off an index. Ask the registry.",
+        );
+    }
 }
