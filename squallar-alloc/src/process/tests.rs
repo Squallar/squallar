@@ -310,34 +310,49 @@ fn an_empty_or_headerless_walk_is_still_coherent() {
 /// **The reader agrees with the parser on this machine.** A live Linux arm
 /// reads its own `/proc` and the two figures must be the same process: the
 /// cheap reading's RSS and the expensive walk's summed RSS are the same
-/// quantity by two routes, so they agree to within what the process
-/// allocated between the two reads.
+/// quantity by two routes.
+///
+/// **The walk is bracketed by two cheap reads, and the tolerance is what
+/// those two say the process moved.** A single cheap read compared against
+/// the walk is two readings of a quantity that is still moving: the walk is
+/// milliseconds long, the harness allocates on every other thread throughout
+/// it, and a fixed tenth of the reading is a bet that the process grew by
+/// less than that while it ran. It did not always — this failed under load on
+/// a tree nobody had touched. Motion between the two reads is not noise to be
+/// tolerated at a guessed magnitude, it is a quantity this test can measure,
+/// so it measures it: the bracket's own width is the floor of the tolerance,
+/// and the tenth stays on top of it as the term that covers the pages the
+/// measurement itself faults in. On a quiet process the bracket is tight and
+/// this is the assertion it always was; under load it widens by exactly what
+/// moved, and by nothing else. A mis-parse is off by orders of magnitude or
+/// reads zero, and no amount of load reaches that.
 ///
 /// Linux only, because there is no `/proc` to read anywhere else — and the
 /// non-Linux arm has its own test below that the answer is `None`.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_two_readings_describe_the_same_process() {
-    let r = resident().expect("the Linux arm reads /proc/self/status");
+    let before = resident().expect("the Linux arm reads /proc/self/status");
     let b = breakdown().expect("the Linux arm reads /proc/self/smaps");
+    let after = resident().expect("the Linux arm reads /proc/self/status");
 
-    assert!(r.rss_bytes > 0, "a running process holds pages");
-    assert!(r.partitions(), "the kernel's own split did not close");
+    assert!(before.rss_bytes > 0, "a running process holds pages");
+    assert!(before.partitions(), "the kernel's own split did not close");
+    assert!(after.partitions(), "the kernel's own split did not close");
     assert!(
         b.partitions(),
         "the mapping walk's classes did not add to its total: {b:?}"
     );
 
-    // The two reads are microseconds apart and the harness allocates between
-    // them, so this is a bound and not an equality. A tenth is enormous
-    // against that and tiny against a mis-parse, which would be off by
-    // orders of magnitude or read zero.
-    let (lo, hi) = (r.rss_bytes.min(b.rss_bytes), r.rss_bytes.max(b.rss_bytes));
+    let lo = before.rss_bytes.min(after.rss_bytes);
+    let hi = before.rss_bytes.max(after.rss_bytes);
+    let moved = hi - lo;
+    let slack = moved + hi / 10;
     assert!(
-        hi - lo < hi / 10,
-        "status says {} B resident and the smaps walk says {} B; the two \
-         readings are not the same process",
-        r.rss_bytes,
+        b.rss_bytes + slack >= lo && b.rss_bytes <= hi + slack,
+        "status read {lo} B then {hi} B around a walk that summed {} B; the \
+         process moved {moved} B while the walk ran and that is {slack} B of \
+         slack, so the two readings are not the same process",
         b.rss_bytes
     );
 

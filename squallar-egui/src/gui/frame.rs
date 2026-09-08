@@ -111,10 +111,9 @@ impl Gui {
         // adds one more of it, before anything paints, where nothing is
         // contending for it. No walk: `font_image_size` is two `usize`s off
         // the image header.
-        crate::heap_census::set_font_atlas_bytes(ctx.fonts(|f| {
-            let [w, h] = f.font_image_size();
-            (w as u64) * (h as u64) * 4
-        }));
+        crate::heap_census::set_font_atlas_bytes(
+            ctx.fonts(|f| crate::heap_census::atlas_bytes(f.font_image_size())),
+        );
 
         // **The denominator the census never had.** Every family above says
         // who is holding the heap; none of them says how big the heap is, and

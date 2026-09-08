@@ -86,6 +86,14 @@ enum Behaviour {
     ServeOnly { path: String, body: Arc<Vec<u8>> },
 }
 
+impl Behaviour {
+    /// Whether this behaviour leaves a request recorded and unanswered.
+    /// [`Behaviour::ServeOnly`] counts: it hangs every path but its one.
+    fn hangs(&self) -> bool {
+        matches!(self, Behaviour::Hang | Behaviour::ServeOnly { .. })
+    }
+}
+
 /// A real HTTP/1.1 server on loopback, recording every path it is asked for.
 struct TileServer {
     base_url: String,
@@ -94,10 +102,14 @@ struct TileServer {
     accept: Option<std::thread::JoinHandle<()>>,
     /// Connections parked by [`Behaviour::Hang`], held open until shutdown.
     parked: Arc<Mutex<Vec<TcpStream>>>,
+    /// [`Behaviour::hangs`], kept so [`loopback_client_for`] can meet a
+    /// hanging server with a client that will wait it out.
+    hangs: bool,
 }
 
 impl TileServer {
     fn start(behaviour: Behaviour) -> Self {
+        let hangs = behaviour.hangs();
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind a loopback port");
         let addr = listener.local_addr().expect("read back the bound address");
         // Non-blocking accept so the thread can notice `stop` instead of parking
@@ -140,6 +152,7 @@ impl TileServer {
             stop,
             accept: Some(accept),
             parked,
+            hangs,
         }
     }
 
@@ -306,20 +319,54 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long "and it stays that way" observations watch for.
 const SETTLE: Duration = Duration::from_millis(300);
 
-/// A client that can reach the cleartext loopback server.
-fn loopback_client() -> reqwest::Client {
+/// A client that can reach the cleartext loopback server `server`, with the
+/// request timeout that server's behaviour calls for.
+///
+/// **A [`Behaviour::hangs`] server is met with no request timeout at all, and
+/// that is a correctness property of this file rather than a comfort.**
+/// `Hang` promises to record a request and never answer it, and every test
+/// built on it reasons that the request stays out: "asked once and not asked
+/// again", "six out and no more", "the marker is gone but the request is not".
+/// A client that gives up after five seconds silently turns that promise into
+/// "answers with an error every five seconds" partway through the test. A
+/// retired fetch frees a concurrency slot, the loop refills it from the queued
+/// asks, and the server records an arrival nothing asked for — so a count the
+/// test pinned as exact grows on a system that did nothing wrong, whenever the
+/// run took longer than the timeout. On a loaded box it does; that is how a
+/// correct tree red-gated a peer at 7 against 6.
+///
+/// Nothing waits on a hung fetch to end, so there is nothing for the timeout
+/// to rescue: every wait in this file carries its own deadline, and
+/// `runtime::native::Runtime::drop` cancels an in-flight request outright at
+/// teardown rather than waiting it out.
+fn loopback_client_for(server: &TileServer) -> reqwest::Client {
+    loopback_client_with_timeout((!server.hangs).then(|| Duration::from_secs(5)))
+}
+
+/// [`loopback_client_for`] with the request timeout named — `None` for none at
+/// all. Only [`a_refilled_slot_is_a_new_arrival_and_not_a_wider_loop`] names
+/// its own, to construct the overshoot the doc above describes.
+///
+/// The `tls::init` is not optional and is not the caller's to remember:
+/// building a `reqwest::Client` without a crypto provider installed panics
+/// inside `reqwest`, and it panics only in the *first* test in a process to
+/// try — the provider is installed process-wide, so a second test in the same
+/// binary borrows the first's and reads green on its own bug. Every client
+/// this file builds comes through here for that reason.
+fn loopback_client_with_timeout(timeout: Option<Duration>) -> reqwest::Client {
     squallar_radar::tls::init();
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("the loopback client should build")
+    let mut builder = reqwest::Client::builder();
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
+    }
+    builder.build().expect("the loopback client should build")
 }
 
 fn loopback_tiles(server: &TileServer, ctx: &Context) -> HttpsTiles {
     HttpsTiles::with_client(
         LoopbackSource::new(&server.base_url),
         ctx.clone(),
-        loopback_client(),
+        loopback_client_for(server),
     )
 }
 
@@ -330,7 +377,7 @@ fn loopback_tiles_with_budget(server: &TileServer, ctx: &Context, budget_bytes: 
     HttpsTiles::with_client_and_budget(
         LoopbackSource::new(&server.base_url),
         ctx.clone(),
-        loopback_client(),
+        loopback_client_for(server),
         budget_bytes,
     )
 }
@@ -410,7 +457,7 @@ fn attribution_reaches_the_tiles_trait() {
     let tiles = HttpsTiles::with_client(
         LoopbackSource::new(&server.base_url),
         Context::default(),
-        loopback_client(),
+        loopback_client_for(&server),
     );
 
     let attribution = Tiles::attribution(&tiles);
@@ -772,7 +819,7 @@ fn the_ancestor_net_is_never_asked_for_past_what_the_source_serves() {
     let shallow = HttpsTiles::with_client(
         LoopbackSource::new(&server.base_url).with_max_zoom(3),
         ctx.clone(),
-        loopback_client(),
+        loopback_client_for(&server),
     );
     let mut shallow = shallow;
 
@@ -974,7 +1021,7 @@ fn a_tile_deeper_than_the_source_supports_is_fetched_from_its_deepest_ancestor()
     let mut tiles = HttpsTiles::with_client(
         LoopbackSource::new(&server.base_url).with_max_zoom(3),
         ctx.clone(),
-        loopback_client(),
+        loopback_client_for(&server),
     );
 
     // Zoom 5, four levels below max_zoom 3 -> a 4x4 subdivision.
@@ -1052,14 +1099,14 @@ fn tile_size_comes_from_the_source() {
     let unusual = HttpsTiles::with_client(
         LoopbackSource::new(&server.base_url).with_tile_size(512),
         ctx.clone(),
-        loopback_client(),
+        loopback_client_for(&server),
     );
     assert_eq!(Tiles::tile_size(&unusual), 512);
 
     let ordinary = HttpsTiles::with_client(
         LoopbackSource::new(&server.base_url),
         ctx,
-        loopback_client(),
+        loopback_client_for(&server),
     );
     assert_eq!(
         Tiles::tile_size(&ordinary),
@@ -1126,6 +1173,24 @@ fn an_arriving_tile_requests_a_repaint() {
 }
 
 /// No more than [`super::MAX_PARALLEL_DOWNLOADS`] downloads are in flight.
+///
+/// **The gate is the loop's own high-water mark, not the number of requests
+/// the server has counted.** Those are different quantities: the server's is
+/// cumulative and rises every time a fetch ends and its slot is refilled, so a
+/// loop that never held more than six can hand the server twenty-four
+/// arrivals and have obeyed its limit throughout — which is exactly what
+/// [`a_refilled_slot_is_a_new_arrival_and_not_a_wider_loop`] constructs. The
+/// old spelling waited for the count to *reach* six and then demanded it still
+/// *be* six; on a loaded box a `reqwest` request timeout fired inside that
+/// window, a slot refilled, and a correct system read 7. Worse, the level it
+/// sampled was sampled once, after a wait that raced it, so an excursion
+/// shorter than the gap between two samples could not have been seen at all.
+///
+/// [`HttpsTiles::parallel_peak`] is latched by [`super::fetch_continuously`]
+/// at the instant it pushes, so no excursion can hide between observations,
+/// and the assertion is the ceiling the limit actually states. The floor is
+/// asserted too: a peak short of the limit means the ramp never happened and
+/// the ceiling held vacuously.
 #[test]
 fn no_more_than_the_concurrency_limit_is_downloaded_at_once() {
     let server = TileServer::start(Behaviour::Hang);
@@ -1133,29 +1198,113 @@ fn no_more_than_the_concurrency_limit_is_downloaded_at_once() {
     let mut tiles = loopback_tiles(&server, &ctx);
 
     let wanted = (EXPECTED_PARALLEL_DOWNLOADS * 12) as u32;
-    let mut ask = || {
+    let ask = |tiles: &mut HttpsTiles| {
         tiles.pump();
         for x in 0..wanted {
             tiles.at(TileId { x, y: 0, zoom: 8 });
         }
+        assert!(
+            tiles.parallel_peak() <= EXPECTED_PARALLEL_DOWNLOADS,
+            "the fetch loop held {} downloads at once, past the limit of \
+             {EXPECTED_PARALLEL_DOWNLOADS}",
+            tiles.parallel_peak()
+        );
     };
 
+    // The ramp. Every pass through it re-checks the ceiling, so an excursion
+    // on the way up is caught where it happens rather than sampled for later.
+    let ramped = pump_until(DEFAULT_TIMEOUT, || {
+        ask(&mut tiles);
+        (tiles.parallel_peak() >= EXPECTED_PARALLEL_DOWNLOADS).then_some(())
+    });
     assert!(
-        server.wait_for_requests(EXPECTED_PARALLEL_DOWNLOADS, &mut ask),
-        "the downloads never ramped up to the limit"
+        ramped.is_some(),
+        "the downloads never ramped up to the limit: the loop peaked at {}",
+        tiles.parallel_peak()
     );
 
-    // Keep asking for all of them; the count must not climb past the limit.
+    // Keep asking for all of them; the loop must not widen past the limit.
     let deadline = Instant::now() + SETTLE;
     while Instant::now() < deadline {
-        ask();
+        ask(&mut tiles);
         std::thread::sleep(Duration::from_millis(2));
     }
 
     assert_eq!(
-        server.request_count(),
+        tiles.parallel_peak(),
         EXPECTED_PARALLEL_DOWNLOADS,
-        "more downloads were started at once than the limit allows"
+        "the fetch loop's widest moment was not the limit"
+    );
+}
+
+/// **A refilled slot is a new arrival and not a wider loop**, which is why
+/// [`no_more_than_the_concurrency_limit_is_downloaded_at_once`] gates the
+/// loop's own peak rather than the server's request count.
+///
+/// The failure is constructed instead of waited for: an 80 ms request timeout
+/// against a server that never answers retires all six fetches several times
+/// over inside one [`SETTLE`], so the server counts far more arrivals than the
+/// limit while the loop never holds more than six at once. On a loaded box the
+/// live client's 5 s timeout does the same thing, which is how a correct
+/// system red-gated a peer's board at 7 against 6.
+///
+/// Both facts are pinned separately. If the arrivals ever stop overshooting,
+/// this test has stopped constructing the shape it exists to describe and says
+/// so, rather than passing vacuously.
+#[test]
+fn a_refilled_slot_is_a_new_arrival_and_not_a_wider_loop() {
+    let server = TileServer::start(Behaviour::Hang);
+    let ctx = Context::default();
+    let mut tiles = HttpsTiles::with_client(
+        LoopbackSource::new(&server.base_url),
+        ctx.clone(),
+        loopback_client_with_timeout(Some(Duration::from_millis(80))),
+    );
+
+    let wanted = (EXPECTED_PARALLEL_DOWNLOADS * 12) as u32;
+    let ask = |tiles: &mut HttpsTiles| {
+        tiles.pump();
+        for x in 0..wanted {
+            tiles.at(TileId { x, y: 0, zoom: 8 });
+        }
+        assert!(
+            tiles.parallel_peak() <= EXPECTED_PARALLEL_DOWNLOADS,
+            "the fetch loop held {} downloads at once, past the limit of \
+             {EXPECTED_PARALLEL_DOWNLOADS}",
+            tiles.parallel_peak()
+        );
+    };
+
+    // Both halves are waited for rather than timed: a fixed window would be a
+    // bet that a loaded box reaches the ramp, and reaching it is the fixture,
+    // not the finding. Each pass re-checks the ceiling on the way.
+    let ramped = pump_until(DEFAULT_TIMEOUT, || {
+        ask(&mut tiles);
+        (tiles.parallel_peak() >= EXPECTED_PARALLEL_DOWNLOADS).then_some(())
+    });
+    assert!(
+        ramped.is_some(),
+        "the downloads never ramped up to the limit: the loop peaked at {}",
+        tiles.parallel_peak()
+    );
+    let overshot = pump_until(DEFAULT_TIMEOUT, || {
+        ask(&mut tiles);
+        (server.request_count() > EXPECTED_PARALLEL_DOWNLOADS).then_some(())
+    });
+    assert!(
+        overshot.is_some(),
+        "fixture: the 80 ms timeouts never refilled a slot, so this test no \
+         longer constructs an arrival count that outruns the limit — it saw \
+         {} arrivals",
+        server.request_count()
+    );
+
+    assert_eq!(
+        tiles.parallel_peak(),
+        EXPECTED_PARALLEL_DOWNLOADS,
+        "the loop's widest moment was not the limit, though the server counted \
+         {} arrivals",
+        server.request_count()
     );
 }
 

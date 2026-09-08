@@ -675,11 +675,10 @@ fn the_font_atlas_family_prices_four_bytes_a_texel_of_the_real_atlas() {
 
     // A fresh atlas is 32 rows tall whatever is in it, so read it before and
     // after: a family that ignored the atlas entirely would match one of the
-    // two by luck and cannot match both.
-    let priced = |f: &egui::epaint::text::Fonts| {
-        let [w, h] = f.font_image_size();
-        (w as u64) * (h as u64) * 4
-    };
+    // two by luck and cannot match both. Priced through the publisher's own
+    // `atlas_bytes` rather than a copy of its multiplication, so a publisher
+    // that started charging three bytes a texel fails here.
+    let priced = |f: &egui::epaint::text::Fonts| atlas_bytes(f.font_image_size());
     let fresh = priced(&fonts);
     assert_eq!(fresh, 4096 * 32 * 4, "epaint opens the atlas at 32 rows");
 
@@ -703,19 +702,32 @@ fn the_font_atlas_family_prices_four_bytes_a_texel_of_the_real_atlas() {
          cannot say the family tracks a growth"
     );
 
-    reset();
-    set_font_atlas_bytes(grown);
-    assert_eq!(census().font_atlas_bytes, grown);
+    // **Read off a `Census` of this test's own and never off the process
+    // globals.** `font_atlas_bytes` is published by `Gui::frame`, on every
+    // frame, unconditionally — so every frame-driving test in this binary is
+    // a concurrent writer of the very level a `set` here would then read
+    // back, and the harness runs them on 32 threads. No mutex in this file
+    // can reach that writer, so the observation is made immune instead of
+    // isolated: the arithmetic under test is `atlas_bytes`, and the two
+    // transport claims a `census()` round trip would have added are already
+    // gated where nothing global can move them —
+    // [`a_level_is_set_and_not_added`] for set-replaces-not-adds, and
+    // [`the_line_names_every_family_and_its_denominator`] for `font atlas`
+    // reaching the printed line, both against a hand-built `Census`.
+    let c = Census {
+        font_atlas_bytes: grown,
+        ..Default::default()
+    };
     assert!(
-        line(&census(), None, "test").contains(&format!("font atlas {grown} B")),
-        "the family is set but does not reach the line the allocation-error \
-         hook prints"
+        line(&c, None, "test").contains(&format!("font atlas {grown} B")),
+        "the grown atlas does not reach the line the allocation-error hook \
+         prints"
     );
-
-    // A level, set and never added — the rule every family here is under.
-    set_font_atlas_bytes(fresh);
-    assert_eq!(census().font_atlas_bytes, fresh);
-    reset();
+    assert_eq!(
+        c.resident_total(),
+        grown,
+        "a real atlas reading is host bytes and must be inside the page total"
+    );
 }
 
 /// The atlas is **in** the page total, unlike the two GPU families beside it.

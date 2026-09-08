@@ -1245,17 +1245,34 @@ mod tests {
             .unwrap();
 
             assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
-            std::thread::sleep(Duration::from_millis(200));
-            assert!(
-                rx.try_recv().is_ok(),
-                "the poller stopped sending, so this proves nothing about waking"
-            );
+
+            // The poller's own sends are the clock, not `sleep`. A fixed
+            // window is a bet that a loaded box got the thread scheduled --
+            // the wake can still read 0 when the test resumes -- and it is
+            // also a bet on how many intervals fit inside it. Each `recv` is
+            // one interval that demonstrably happened, and the ceiling is
+            // re-checked after every one of them.
+            for interval in 1..=16 {
+                assert_eq!(
+                    rx.recv_timeout(Duration::from_secs(5)),
+                    Ok(true),
+                    "the poller stopped sending after {interval} intervals, so \
+                     this proves nothing about waking"
+                );
+                assert!(
+                    woke.load(Ordering::SeqCst) <= 1,
+                    "a reading that never changed woke the loop anyway, which \
+                     on Android is a frame every interval for the life of the \
+                     process: {} wakes by interval {interval}",
+                    woke.load(Ordering::SeqCst)
+                );
+            }
 
             assert_eq!(
                 woke.load(Ordering::SeqCst),
                 1,
-                "a reading that never changed woke the loop anyway, which on \
-                 Android is a frame every interval for the life of the process"
+                "the first reading owes exactly one wake, and 16 unchanged \
+                 intervals owe none"
             );
         }
 
@@ -1295,15 +1312,31 @@ mod tests {
             );
         }
 
+        /// **Nothing samples after the poller thread is gone.**
+        ///
+        /// The two readings are separated by the thread's *exit*, not by a
+        /// wall-clock window. Exactly one further sample is owed after the
+        /// receiver is dropped -- the poller reads, sends, and breaks on the
+        /// failed send -- so two fixed 200 ms sleeps were a bet on which side
+        /// of the first reading that sample landed: a thread starved through
+        /// the first window and scheduled during the second failed a poller
+        /// that had done nothing wrong. Dropping the closure is what
+        /// disconnects `gone_rx`, and it is an event certain to arrive, so
+        /// waiting for it is bounded and exact; past it the count cannot move
+        /// and a reading that did means something outlived the thread that
+        /// owns the detector.
         #[test]
         fn poller_stops_sampling_after_exit() {
             let calls = Arc::new(AtomicUsize::new(0));
             let probe = Arc::clone(&calls);
+            // Owned by the detector closure, so it drops when the thread does.
+            let (gone_tx, gone_rx) = std::sync::mpsc::channel();
             let rx = spawn_state_poller(
                 "test-quiesce",
                 Duration::from_millis(5),
                 move || {
                     probe.fetch_add(1, Ordering::SeqCst);
+                    let _ = gone_tx.send(());
                     true
                 },
                 RedrawWaker::new(),
@@ -1312,15 +1345,41 @@ mod tests {
 
             assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
             drop(rx);
+            let at_drop = calls.load(Ordering::SeqCst);
 
-            std::thread::sleep(Duration::from_millis(200));
-            let settled = calls.load(Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(200));
+            // The deadline is the `while`, not an arm of the `match`: a
+            // poller that never lets go keeps the probe channel fed, so a
+            // loop that only checked the clock on a `Timeout` would spin on
+            // `Ok` for ever and hang instead of reporting. That is what the
+            // first spelling of this did under its own tamper.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut let_go = false;
+            while std::time::Instant::now() < deadline {
+                match gone_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(()) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        let_go = true;
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                }
+            }
+            assert!(
+                let_go,
+                "the poller never let go of its detector after the receiver \
+                 was dropped"
+            );
 
-            assert_eq!(
-                calls.load(Ordering::SeqCst),
-                settled,
-                "detector was still being called after the receiver was dropped"
+            // One further sample is owed and no more: the loop reads, sends,
+            // and breaks on the failed send, so the sample the drop raced is
+            // the last one. `at_drop` was read after the drop, so it either
+            // already counts that sample or the reading below does.
+            let after = calls.load(Ordering::SeqCst);
+            assert!(
+                after <= at_drop + 1,
+                "the detector was called {} more times after the receiver was \
+                 dropped, against the one sample the loop owes",
+                after - at_drop
             );
         }
     }

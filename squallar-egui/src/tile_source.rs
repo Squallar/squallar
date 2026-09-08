@@ -33,7 +33,7 @@
 //! [`HttpsTiles::pump`] for why, and for the one thing that would break.
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -53,6 +53,34 @@ use walkers::{Style, Tile, TileId, TilePiece, Tiles};
 /// Tile providers throttle or ban clients that exceed their limits, so this is
 /// a term of use rather than a performance dial.
 pub const MAX_PARALLEL_DOWNLOADS: usize = 6;
+
+/// The most fetches an IO loop has ever held at once — the high-water mark of
+/// its `outstanding` set, latched by the loop itself at the instant it pushes.
+///
+/// **A level sampled from outside is a false zero for any excursion shorter
+/// than the sample, and the count of requests a server has *seen* is not this
+/// number at all.** A cumulative arrival count rises every time a fetch ends
+/// and its slot is refilled — a timeout against an unanswering server refills
+/// six slots a timeout-period, so a loop holding exactly six can deliver
+/// twenty-four arrivals and stay inside its limit the whole time. This is the
+/// quantity [`MAX_PARALLEL_DOWNLOADS`] actually bounds, published so a test
+/// can gate the bound rather than a proxy for it: an excursion cannot hide
+/// between two observations, because the loop records its own.
+#[derive(Clone, Default)]
+struct ParallelPeak(Arc<AtomicUsize>);
+
+impl ParallelPeak {
+    /// Record that `live` fetches are outstanding right now.
+    fn observe(&self, live: usize) {
+        self.0.fetch_max(live, Ordering::Relaxed);
+    }
+
+    /// The high-water mark so far. 0 for a source whose loop never ran.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    fn peak(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+}
 
 /// Consecutive tile reads that must fail, with none answering in between,
 /// before an archive source reports that it is not drawing the map.
@@ -1583,6 +1611,20 @@ pub struct HttpsTiles {
     /// whose bytes are not on the glass; a read that answers clears it.
     reads_failing: Arc<AtomicBool>,
 
+    /// The high-water mark of this source's IO loop concurrency — see
+    /// [`ParallelPeak`]. Written by the loop at every push, read by the bound
+    /// test. Stays 0 for a source with no loop ([`Self::inert`]), which is the
+    /// truth about that source rather than a false zero.
+    ///
+    /// Held on every build and not behind `cfg(test)`, so the latch the test
+    /// reads is the one the shipping loop runs: a test-only counter would
+    /// measure a different loop from the one that has to obey the limit.
+    #[allow(
+        dead_code,
+        reason = "written by the IO loop on every build; read by the bound test"
+    )]
+    parallel_peak: ParallelPeak,
+
     /// Set when the request channel has been found disconnected.
     ///
     /// **This is a latch, and it exists to bound a log flood.** A disconnected
@@ -2578,8 +2620,15 @@ impl HttpsTiles {
         #[cfg(target_arch = "wasm32")]
         let frame_ctx = egui_ctx.clone();
 
+        let parallel_peak = ParallelPeak::default();
+
         let runtime = runtime::spawn(fetch_continuously(
-            source, client, request_rx, tile_tx, egui_ctx,
+            source,
+            client,
+            request_rx,
+            tile_tx,
+            egui_ctx,
+            parallel_peak.clone(),
         ));
 
         Self {
@@ -2593,6 +2642,7 @@ impl HttpsTiles {
             // raster source rather than reading half of a rule.
             fault: Arc::new(OnceLock::new()),
             reads_failing: Arc::new(AtomicBool::new(false)),
+            parallel_peak,
             requests_closed: false,
             // A plain HTTP raster source draws the ground: the base role.
             cache: TileCache::new(styled_bytes, cache_ledger::CacheRole::Base),
@@ -3748,6 +3798,15 @@ impl HttpsTiles {
         self.cache.budget()
     }
 
+    /// The most fetches this source's IO loop has ever held at once — see
+    /// [`ParallelPeak`], which says why this and not the number of requests a
+    /// server has counted. Exposed for the bound test, gated as
+    /// [`Self::cached_entries`] is.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn parallel_peak(&self) -> usize {
+        self.parallel_peak.peak()
+    }
+
     /// This source's own cache counters — every event its cache recorded,
     /// and no other source's. The counters [`cache_ledger::totals`] reads are
     /// shared by every source of a role: in a production build that is the
@@ -3918,6 +3977,7 @@ async fn fetch_continuously<S: TileSource>(
     mut request_rx: Receiver<TileId>,
     mut tile_tx: Sender<Fetched>,
     egui_ctx: Context,
+    parallel_peak: ParallelPeak,
 ) {
     let mut outstanding = FuturesUnordered::new();
 
@@ -3926,6 +3986,7 @@ async fn fetch_continuously<S: TileSource>(
             match request_rx.next().await {
                 Some(tile_id) => {
                     outstanding.push(fetch_one(&source, &client, &egui_ctx, tile_id));
+                    parallel_peak.observe(outstanding.len());
                     continue;
                 }
                 None => break,
@@ -3937,6 +3998,7 @@ async fn fetch_continuously<S: TileSource>(
                     // a `Next` does not cancel the futures inside it.
                     drop(pending);
                     outstanding.push(fetch_one(&source, &client, &egui_ctx, tile_id));
+                    parallel_peak.observe(outstanding.len());
                     continue;
                 }
                 Either::Left((None, _)) => break,
@@ -4159,6 +4221,7 @@ impl HttpsTiles {
         let max_zoom = Arc::new(AtomicU8::new(MAX_ZOOM_UNKNOWN));
         let fault: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
         let reads_failing = Arc::new(AtomicBool::new(false));
+        let parallel_peak = ParallelPeak::default();
         // How this archive's bodies decode -- filled in by the IO task from
         // the header, at open, before it serves a tile. See [`ArchiveTileKind`].
         let archive_kind: Arc<OnceLock<ArchiveTileKind>> = Arc::new(OnceLock::new());
@@ -4223,6 +4286,7 @@ impl HttpsTiles {
             ArchiveSlots {
                 max_zoom: Arc::clone(&max_zoom),
                 fault: Arc::clone(&fault),
+                parallel_peak: parallel_peak.clone(),
                 reads_failing: Arc::clone(&reads_failing),
                 kind: archive_kind,
                 declared: declared_kind,
@@ -4244,6 +4308,7 @@ impl HttpsTiles {
             max_zoom,
             fault,
             reads_failing,
+            parallel_peak,
             requests_closed: false,
             cache: TileCache::new(budget.styled_bytes, role),
             styled_allowance_bytes: budget.styled_bytes,
@@ -4319,6 +4384,8 @@ impl HttpsTiles {
             max_zoom: Arc::new(AtomicU8::new(MAX_ZOOM_UNKNOWN)),
             fault: Arc::new(OnceLock::new()),
             reads_failing: Arc::new(AtomicBool::new(false)),
+            // No IO loop, so nothing is ever outstanding.
+            parallel_peak: ParallelPeak::default(),
             requests_closed: false,
             cache: TileCache::new(
                 default_tile_budget().styled_bytes,
@@ -4440,6 +4507,9 @@ struct ArchiveSlots {
     /// loop writes more than once, and the only one that can go back down.
     reads_failing: Arc<AtomicBool>,
     kind: Arc<OnceLock<ArchiveTileKind>>,
+    /// [`HttpsTiles::parallel_peak`]'s far end. Latched by the serve loop at
+    /// every push, for the reason [`ParallelPeak`] gives.
+    parallel_peak: ParallelPeak,
     /// What the *caller* says this archive holds, when the header cannot say
     /// it — the only way [`ArchiveTileKind::TerrainRgb`] is ever reached.
     ///
@@ -4618,6 +4688,7 @@ async fn serve_archive_continuously<S, St>(
             match request_rx.next().await {
                 Some(tile_id) => {
                     outstanding.push(read_one(&archive, &styling, &egui_ctx, kind, tile_id));
+                    slots.parallel_peak.observe(outstanding.len());
                     continue;
                 }
                 None => break,
@@ -4628,6 +4699,7 @@ async fn serve_archive_continuously<S, St>(
                     // Release the borrow of `outstanding` before pushing.
                     drop(pending);
                     outstanding.push(read_one(&archive, &styling, &egui_ctx, kind, tile_id));
+                    slots.parallel_peak.observe(outstanding.len());
                     continue;
                 }
                 Either::Left((None, _)) => break,

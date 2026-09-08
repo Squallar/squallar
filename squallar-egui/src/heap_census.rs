@@ -249,6 +249,19 @@ macro_rules! families {
         /// Put every published level back to zero. Tests only: nothing
         /// shipped resets a level, because a level is not a running total.
         /// The `@read` families are their owners' to empty.
+        ///
+        /// **A process-global stomp, and the harness runs this binary's tests
+        /// on a thread apiece.** Eight published families are written by
+        /// ordinary code paths that unrelated tests drive — `Gui::frame`
+        /// publishes five of them on *every* frame, and the tile source
+        /// publishes three more — so a test that sets a family and then reads
+        /// it back through [`census`] is racing every frame-driving test in
+        /// the binary, and no lock in the test module can reach those writers.
+        /// A test may read a published family from [`census`] only where it
+        /// owns every writer of that family in this binary; otherwise it
+        /// belongs against a hand-built [`Census`], which is what
+        /// `the_font_atlas_family_prices_four_bytes_a_texel_of_the_real_atlas`
+        /// was moved to after it reddened a peer's board on a correct tree.
         #[cfg(test)]
         pub(crate) fn reset() {
             $($name.store(0, Relaxed);)*
@@ -629,6 +642,20 @@ families! {
          alike, so each reports the buffers ITS OWN renders parked and the \
          two are NEVER summed - the worker rasterizes, so its figure is \
          usually the larger, and it appears on the worker's own census line.";
+}
+
+/// What the glyph atlas costs the host heap, from `Fonts::font_image_size`.
+///
+/// **The `font atlas` family's whole arithmetic, named once.** epaint holds
+/// the atlas as a `ColorImage`, four bytes a texel, and until this was a
+/// function the expression lived inline at the publisher while the test that
+/// pins it kept a second copy of the same multiplication — so the two could
+/// disagree and only the copy was ever gated. It is the publisher's
+/// expression that has to be right, so it is the publisher's expression that
+/// is pinned.
+pub fn atlas_bytes(size: [usize; 2]) -> u64 {
+    let [width, height] = size;
+    (width as u64) * (height as u64) * 4
 }
 
 impl Census {

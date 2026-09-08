@@ -55,24 +55,65 @@ fn drive(gui: &mut Gui, frames: usize) -> usize {
     (0..frames).map(|_| failing_frame(gui)).sum()
 }
 
-/// **The storm test.** Thousands of frames inside the first backoff window buy
-/// exactly one attempt.
+/// The attempts the backoff schedule owes over `elapsed`: the one that goes out
+/// on the first frame, plus one for every rung the drive outlived. The rungs
+/// are 2 s doubling to the layer's own poll interval, which
+/// [`the_ladder_is_climbed_one_attempt_per_rung`] pins one rung at a time and
+/// [`the_measured_storm_window_costs_six_attempts`] pins end to end.
+///
+/// A **ceiling**, deliberately: whether the gate has fired at the instant a
+/// rung expires is exactly the boundary this cannot know, so a rung reached is
+/// counted as a rung spent.
+fn attempts_owed_by(elapsed: Duration, interval_secs: u64) -> usize {
+    let mut owed = 1;
+    let mut spent = Duration::ZERO;
+    let mut rung = 2u64;
+    loop {
+        spent += Duration::from_secs(rung);
+        if spent > elapsed {
+            return owed;
+        }
+        owed += 1;
+        rung = (rung * 2).min(interval_secs);
+    }
+}
+
+/// **The storm test.** Thousands of frames buy the attempts the *schedule*
+/// owes and not one per frame.
+///
+/// **The bound is the backoff schedule over the time the drive actually took,
+/// not a wall-clock budget the drive has to come in under.** This used to
+/// assert that 3089 gate evaluations fit inside the first 2 s rung and that
+/// the count was therefore exactly 1 — but the gate reads the same real clock
+/// the premise did, so a loaded box that took 2.1 s over the drive earned a
+/// second attempt honestly and failed *both* assertions on a tree nobody had
+/// touched. Attempts are owed to elapsed time; frames are the thing that must
+/// not multiply them, and that is what is asserted here.
 #[test]
 fn a_failing_layer_is_not_refetched_on_the_next_frame() {
     let mut gui = gui_with_only_discussions();
+    let interval = gui
+        .overlays
+        .auto_poll_interval(&KIND)
+        .expect("SPC discussions auto-poll; this test needs a layer that does");
+
     let start = std::time::Instant::now();
     let attempts = drive(&mut gui, 3089);
     let elapsed = start.elapsed();
 
+    let owed = attempts_owed_by(elapsed, interval);
     assert!(
-        elapsed < Duration::from_secs(2),
-        "premise: 3089 gate evaluations must fit inside the first backoff rung \
-         for the count below to mean what it says, but took {elapsed:?}",
+        owed < 30,
+        "premise: the drive took {elapsed:?}, long enough for the schedule to \
+         owe {owed} attempts, and a bound that loose no longer says anything \
+         about 3089 frames",
     );
-    assert_eq!(
-        attempts, 1,
-        "a failing SPC MD fetch is being retried per frame — this is the 3089 \
-         requests in 105 s that `squallar_overlays::fetch_policy` exists to stop",
+    assert!(
+        (1..=owed).contains(&attempts),
+        "3089 frames bought {attempts} attempts where the schedule owes at \
+         most {owed} over {elapsed:?} — a failing SPC MD fetch is being \
+         retried per frame, which is the 3089 requests in 105 s that \
+         `squallar_overlays::fetch_policy` exists to stop",
     );
 }
 
