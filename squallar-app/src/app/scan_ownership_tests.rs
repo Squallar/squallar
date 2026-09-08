@@ -72,6 +72,10 @@ fn land_archive(app: &mut App, site: &str, timestamp: chrono::NaiveDateTime, is_
                 declared_nyquist: Default::default(),
                 site: site.to_string(),
                 timestamp,
+                // The compressed half of the same arrival. It shares nothing
+                // with the volume, so the allocation identities this module
+                // asserts are untouched by it.
+                archive: Some(std::sync::Arc::new(vec![0u8; 64])),
             }),
             is_auto_poll,
         })

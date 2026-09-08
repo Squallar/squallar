@@ -53,6 +53,27 @@ pub struct ScanData {
     pub declared_nyquist: squallar_radar::nyquist::DeclaredNyquist,
     pub site: String,
     pub timestamp: NaiveDateTime,
+    /// **The compressed bytes this volume was decoded from.**
+    ///
+    /// The `Arc` the decode job already held, not a copy: `decode_offloaded`
+    /// hands the archive to the responder beside the volume it produced, and
+    /// this is a refcount on that same allocation.
+    ///
+    /// Carried because every one of these arrivals is filed in the loop
+    /// download cache by `App::append_scan_to_active_loops`, and a volume with
+    /// no archive behind it is one `LoopDownloadManager::evict_decoded_except`
+    /// refuses to evict — its whole premise is that eviction costs a decode.
+    /// Until this field existed the still and auto-poll arrivals were exactly
+    /// that: decoded volumes the residency policy could never drop, holding a
+    /// median 48.9 MiB apiece for as long as a loop frame named the moment,
+    /// and counting against `LOOP_DECODED_CEILING_BYTES` while they did.
+    ///
+    /// `None` for a path that has no compressed form to keep — the chunk
+    /// feed's assembled volumes, which are built from chunks and were never
+    /// one archive object. `Some` is an offer and not an instruction: the sink
+    /// keeps it only where a loop exists to trade it in, which is what
+    /// `LoopDownloadManager::is_looping` decides.
+    pub archive: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 /// **Who asked for a scan.**

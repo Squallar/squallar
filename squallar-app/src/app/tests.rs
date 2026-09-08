@@ -2636,6 +2636,7 @@ fn a_discarded_scan_result_still_takes_down_the_wait_it_belonged_to() {
                     .unwrap()
                     .and_hms_opt(0, 0, 0)
                     .unwrap(),
+                archive: Some(std::sync::Arc::new(vec![0u8; 64])),
             }),
             is_auto_poll: false,
         })

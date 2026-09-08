@@ -125,13 +125,22 @@ pub struct LoopDownloadManager {
     /// from is 1.0-16.1 MiB, a median ratio of 17.1x, so holding the
     /// compressed form instead costs a median 5.8 % of the decoded one.
     ///
-    /// **Only the loop download path files here.** The archive drain and the
-    /// chunk feed hand this manager decoded volumes with no archive behind
-    /// them, so an absent entry means "no archive was ever kept", never "the
-    /// archive was lost". That is also why this map has no two-clock problem:
-    /// every key it holds was filed under the S3 address the loop downloaded
-    /// it at, which is the same address `scan_cache` used for the same
-    /// arrival.
+    /// **Two paths file here, and the chunk feed is not one of them.** The
+    /// loop's own downloads file the archive they fetched; the archive drain's
+    /// three arrivals — the pane fetch, the auto-poll and the adjacent-volume
+    /// nudge — file the archive their decode came out of **where
+    /// [`Self::is_looping`] answers for the site**, because otherwise the
+    /// volume they hand [`Self::cache_scan`] is one
+    /// [`Self::evict_decoded_except`] can never drop. What has none is the
+    /// chunk feed's assembled volume, which was built from chunks and was
+    /// never one archive object; so an absent entry means "no archive was ever
+    /// kept", never "the archive was lost".
+    ///
+    /// **No two-clock problem, on either path.** Every key here was filed in
+    /// the same call, out of the same timestamp, as the `scan_cache` entry it
+    /// belongs to — the loop's download under the S3 address it fetched at,
+    /// the drain's under the address the arrival carried — so the two halves
+    /// of a frame cannot end up under two addresses.
     archive_cache: HashMap<String, HashMap<chrono::NaiveDateTime, Arc<Vec<u8>>>>,
     /// Scans currently being downloaded, keyed by site then timestamp (to avoid
     /// duplicate downloads across panes looping the same site).
@@ -892,19 +901,49 @@ impl LoopDownloadManager {
         }
     }
 
-    /// **Every frame of `pane`'s plan whose bytes are held and whose moments
-    /// are not**, in plan order — the frames the pump should decode once the
-    /// decoded ceiling has room. Catches both a frame the residency policy
-    /// evicted and one whose decode was deferred at arrival, neither of which
-    /// is in any download queue any more.
+    /// **Every moment of `pane`'s site whose bytes are held and whose moments
+    /// are not** — the frames the pump should decode once the decoded ceiling
+    /// has room. Catches both a frame the residency policy evicted and one
+    /// whose decode was deferred at arrival, neither of which is in any
+    /// download queue any more.
+    ///
+    /// **The plan's own frames first, in plan order, then the site's other
+    /// archived moments oldest-first.** The pump takes these until it runs out
+    /// of slots, so the order is a priority and the listed frames are the ones
+    /// a re-plan would also queue.
+    ///
+    /// **Asked of the archives and not of the plan alone**, because a plan is
+    /// built from a bucket listing and the archive drain files moments from
+    /// outside it: the pane fetch, the auto-poll and the adjacent-volume nudge
+    /// each put a volume and its compressed bytes in this cache without any
+    /// listing having named the moment. Restricting the walk to the plan would
+    /// make those arrivals evictable by
+    /// [`Self::evict_decoded_except`] and restorable by nothing until the next
+    /// listing arrived. The archive half is what bounds this: `retain_archives`
+    /// keeps only moments a live loop frame names, so a moment offered here is
+    /// one something still wants.
     pub fn frames_needing_decode(&self, pane: usize) -> Vec<(String, chrono::NaiveDateTime)> {
         let Some(plan) = self.plans.get(&pane) else {
             return Vec::new();
         };
-        plan.frames
+        let mut wanted: Vec<chrono::NaiveDateTime> = plan
+            .frames
             .iter()
+            .copied()
             .filter(|ts| self.needs_decode(&plan.site, ts))
-            .map(|ts| (plan.site.clone(), *ts))
+            .collect();
+        if let Some(archives) = self.archive_cache.get(plan.site.as_str()) {
+            let mut unlisted: Vec<chrono::NaiveDateTime> = archives
+                .keys()
+                .copied()
+                .filter(|ts| !plan.frames.contains(ts) && self.needs_decode(&plan.site, ts))
+                .collect();
+            unlisted.sort_unstable();
+            wanted.extend(unlisted);
+        }
+        wanted
+            .into_iter()
+            .map(|ts| (plan.site.clone(), ts))
             .collect()
     }
 
@@ -938,6 +977,27 @@ impl LoopDownloadManager {
         self.pending_downloads.remove(&pane);
         self.pending_l3.remove(&pane);
         self.plans.remove(&pane);
+    }
+
+    /// **Whether any pane is looping `site`** — asked of the plans, which are
+    /// what a running loop leaves here and what
+    /// [`Self::remove_pending`] takes away when one stops.
+    ///
+    /// The question a caller filing an arrival's compressed bytes needs
+    /// answered: an archive earns its keep only where
+    /// [`Self::evict_decoded_except`] can trade it for a decoded volume, and
+    /// that pass keeps the volume a pane is parked at whatever else it does.
+    /// So on a site nothing loops the compressed half would be held for a
+    /// swap that cannot happen.
+    ///
+    /// **A proxy, and loose in the safe direction.** A plan outlives the frame
+    /// list it was built from until the pane's queues are removed, so this can
+    /// answer `true` for a loop that has just ended — which costs one archive
+    /// the next `retain_archives` drops, not a decoded volume.
+    ///
+    /// O(panes with a plan), which is at most the pane count.
+    pub fn is_looping(&self, site: &str) -> bool {
+        self.plans.values().any(|plan| plan.site == site)
     }
 
     /// Record what volumes a pane's loop frames name, replacing any previous
@@ -2310,6 +2370,127 @@ mod archive_tests {
     /// An archive buffer of exactly `bytes` bytes.
     fn archive(bytes: usize) -> Arc<Vec<u8>> {
         Arc::new(vec![7u8; bytes])
+    }
+
+    /// **A volume with no archive behind it can starve the decode pump, and
+    /// the archive is what un-starves it.**
+    ///
+    /// `decoded_room_for` is what admits a decode, at the pump and at download
+    /// arrival, and `evict_decoded_except` is the only thing that brings the
+    /// committed figure back down — but it refuses a volume with nothing to
+    /// rebuild from. So a cache filled with archive-less volumes a live loop
+    /// still names is over the ceiling with no way back under, and every frame
+    /// the loop downloads for itself waits compressed and undrawn. That is the
+    /// shape the archive drain's arrivals used to have: they were filed by
+    /// `App::append_scan_to_active_loops` with their compressed half thrown
+    /// away.
+    ///
+    /// The ceiling is a parameter here, so this asks the real predicate at a
+    /// size the fixture can reach rather than pinning a device constant.
+    ///
+    /// TAMPER: make `evict_decoded_except` ignore its `rebuildable` guard —
+    /// the archive-less half of this test goes green, which is the whole
+    /// distinction it draws.
+    #[test]
+    fn archive_less_volumes_hold_the_decoded_ceiling_shut() {
+        let one = crate::scan_size::scan_bytes(&priced_volume().0);
+        let ceiling = one * 2;
+
+        let mut with = LoopDownloadManager::new();
+        let mut without = LoopDownloadManager::new();
+        for minute in [0, 2, 4] {
+            with.cache_scan("KTLX", ts(minute), priced_volume());
+            with.cache_archive("KTLX", ts(minute), archive(1024));
+            without.cache_scan("KTLX", ts(minute), priced_volume());
+        }
+
+        assert!(
+            !with.decoded_room_for("KTLX", ceiling) && !without.decoded_room_for("KTLX", ceiling),
+            "precondition: both caches are over the ceiling, so the pump \
+             admits no decode from either",
+        );
+
+        with.evict_decoded_except(|_, _, _| false);
+        without.evict_decoded_except(|_, _, _| false);
+
+        assert!(
+            with.decoded_room_for("KTLX", ceiling),
+            "the residency pass traded the moments for the archives and the \
+             pump can dispatch again",
+        );
+        assert!(
+            !without.decoded_room_for("KTLX", ceiling),
+            "and with nothing to rebuild from the same pass frees nothing, so \
+             the ceiling stays shut for as long as the loop names the frames",
+        );
+        assert_eq!(
+            without.cached_scan_count("KTLX"),
+            3,
+            "not one of them left: this is a policy refusing to evict, not an \
+             eviction that failed",
+        );
+    }
+
+    /// **A moment no listing named is still offered back to the decode arm**,
+    /// after the plan's own frames and oldest-first.
+    ///
+    /// The archive drain files volumes from outside the loop's download path,
+    /// so their moments are in no plan. Before those arrivals carried their
+    /// compressed bytes this far they could never be evicted and the gap did
+    /// not matter; now that `evict_decoded_except` can drop them, a walk over
+    /// the plan alone would give the moments away with nothing able to hand
+    /// them back until the next listing arrived.
+    ///
+    /// TAMPER: restrict the walk to `plan.frames` again, or drop the
+    /// `!plan.frames.contains(ts)` guard. Both fail every run.
+    ///
+    /// **The ordering conjunct is gated probabilistically and nothing can make
+    /// it otherwise**: the source is a `HashMap`, so dropping `sort_unstable`
+    /// fails only on the runs whose iteration order is not already ascending.
+    /// Measured at two unlisted moments it came back green on 3 of 5 runs —
+    /// a coin flip, which is no gate at all. Six of them put a false green at
+    /// one permutation in 720, and they are filed in scrambled order so the
+    /// insertion sequence is not the answer either.
+    #[test]
+    fn the_decode_walk_offers_an_archived_moment_no_plan_names() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.set_plan(0, FramePlan::new("KTLX".to_string(), vec![ts(4)]));
+        // The plan's own frame, held in both forms and then evicted: the
+        // ordinary loop-download case.
+        mgr.cache_scan("KTLX", ts(4), volume());
+        mgr.cache_archive("KTLX", ts(4), archive(1024));
+        // Six drain arrivals in scrambled order — see the note on the
+        // ordering conjunct above.
+        for minute in [11, 5, 13, 7, 3, 9] {
+            mgr.cache_scan("KTLX", ts(minute), volume());
+            mgr.cache_archive("KTLX", ts(minute), archive(1024));
+        }
+        // A fourth site's arrival, which this pane's plan must not name.
+        mgr.cache_scan("KOUN", ts(7), volume());
+        mgr.cache_archive("KOUN", ts(7), archive(1024));
+
+        assert!(
+            mgr.frames_needing_decode(0).is_empty(),
+            "precondition: nothing needs a decode while every volume's \
+             moments are here",
+        );
+
+        mgr.evict_decoded_except(|_, _, _| false);
+
+        assert_eq!(
+            mgr.frames_needing_decode(0),
+            vec![
+                ("KTLX".to_string(), ts(4)),
+                ("KTLX".to_string(), ts(3)),
+                ("KTLX".to_string(), ts(5)),
+                ("KTLX".to_string(), ts(7)),
+                ("KTLX".to_string(), ts(9)),
+                ("KTLX".to_string(), ts(11)),
+                ("KTLX".to_string(), ts(13)),
+            ],
+            "the plan's frame first because a re-plan would queue it too, \
+             then the unlisted arrivals oldest-first, and no other site's",
+        );
     }
 
     /// The measured extremes of the 39-volume corpus, so a ceiling test is run

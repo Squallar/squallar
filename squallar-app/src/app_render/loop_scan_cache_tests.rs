@@ -82,9 +82,180 @@ fn install_listing(app: &mut crate::app::App, minutes: &[u32]) {
     );
 }
 
+/// One archive drain arrival, as `App::poll_scan_results` files it.
+///
+/// **The archive is part of the arrival**, not an embellishment of the
+/// fixture: all three of the drain's arms come off `decode_offloaded`, which
+/// hands the responder the same `Arc<Vec<u8>>` the decode job held, and the
+/// arm then passes it here. A helper that filed the volume alone would be
+/// mirroring a path this application no longer has, and the eviction gate
+/// below would be asking its question of a fixture rather than of the
+/// production shape.
 fn poll_scan(app: &mut crate::app::App, minute: u32) {
     let (scan, declared) = volume();
-    app.append_scan_to_active_loops(SITE, at(minute), scan, declared);
+    app.append_scan_to_active_loops(SITE, at(minute), scan, declared, Some(polled_archive()));
+}
+
+/// The compressed bytes a drain arrival carries. Content is never read — the
+/// cache prices the buffer and hands it back to a decode — so what matters is
+/// that it is a real allocation with a length.
+fn polled_archive() -> Arc<Vec<u8>> {
+    Arc::new(vec![7u8; 1024])
+}
+
+/// **A volume the archive drain filed can be evicted down to its archive; one
+/// filed without an archive cannot.**
+///
+/// `evict_decoded_except` refuses to drop a volume with no archive behind it,
+/// because its whole premise is that eviction costs a decode — so before the
+/// drain carried its compressed bytes this far, every still fetch, auto-poll
+/// and adjacent-volume nudge that reached the loop cache put a decoded volume
+/// there that the residency pass could never touch. Those volumes are a
+/// measured 48.9 MiB median apiece and they count against
+/// `LOOP_DECODED_CEILING_BYTES` for as long as a loop frame names the moment,
+/// so a session accumulating them starves the decode pump of the room it needs
+/// for the frames the loop downloaded itself.
+///
+/// **Both halves are asserted, and the second is what makes the first mean
+/// anything.** A falling decoded figure alone is consistent with the bytes
+/// having moved rather than gone, and an eviction that succeeded without
+/// keeping the archive would have converted a residency policy into a
+/// re-download policy. So this asks that the decoded half went, that the
+/// compressed half stayed, and that the frame is back in the pump's decode
+/// arm.
+///
+/// TAMPER: pass `None` for the archive in `App::append_scan_to_active_loops`'s
+/// three `poll_scan_results` call sites, or drop the `cache_archive` call
+/// inside it. Either leaves the `WITH_ARCHIVE` half red.
+#[test]
+fn a_drain_arrival_is_evictable_exactly_when_it_brought_its_archive() {
+    const WITH_ARCHIVE: u32 = 4;
+    const WITHOUT_ARCHIVE: u32 = 6;
+
+    let mut app = app_on_site();
+    // A loop on the site, because an arrival keeps its compressed bytes only
+    // where one exists to trade them in.
+    app.loop_mgr
+        .set_plan(0, plan_for(&[WITH_ARCHIVE, WITHOUT_ARCHIVE]));
+    poll_scan(&mut app, WITH_ARCHIVE);
+    let (scan, declared) = volume();
+    app.append_scan_to_active_loops(SITE, at(WITHOUT_ARCHIVE), scan, declared, None);
+
+    assert_eq!(
+        app.loop_mgr.cached_scan_count(SITE),
+        2,
+        "precondition: both arrivals put a decoded volume in the loop cache",
+    );
+    assert_eq!(
+        app.loop_mgr.cached_archive_count(SITE),
+        1,
+        "precondition: exactly one of them brought compressed bytes with it",
+    );
+
+    // The residency pass at its widest: nothing is wanted decoded.
+    let dropped = app.loop_mgr.evict_decoded_except(|_, _, _| false);
+
+    assert_eq!(
+        dropped.len(),
+        1,
+        "only the arrival with an archive behind it is evictable; the one \
+         without has nothing to be rebuilt from",
+    );
+    assert!(
+        !app.loop_mgr.is_cached(SITE, &at(WITH_ARCHIVE)),
+        "the archived arrival's moments are gone",
+    );
+    assert!(
+        app.loop_mgr.is_cached(SITE, &at(WITHOUT_ARCHIVE)),
+        "the arrival with no archive is untouched, whatever the policy says",
+    );
+    assert_eq!(
+        app.loop_mgr.cached_archive_count(SITE),
+        1,
+        "the compressed half stayed: the cost of this eviction is a decode, \
+         not a download",
+    );
+    assert!(
+        app.loop_mgr.needs_decode(SITE, &at(WITH_ARCHIVE)),
+        "and the frame is back in the pump's decode arm, so nothing has to \
+         reach the network to draw it again",
+    );
+}
+
+/// **The pump offers the evicted arrival back without a new listing**, which
+/// `needs_decode` alone does not say.
+///
+/// `frames_needing_decode` is what the pump's decode arm walks, and the pane's
+/// frame plan is built from a bucket listing that never named this moment —
+/// the drain filed it from outside the loop's own download path. So an arrival
+/// that became evictable without also being reachable by that walk would lose
+/// its moments to the residency pass with nothing able to hand them back until
+/// the next listing arrived, and a retarget in that window would leave the
+/// frame undrawn. This is the other half of the pair.
+///
+/// **The plan is not touched, and the assertion says so.** The alternative
+/// spelling — filing the moment into every plan for its site — would move the
+/// numbers in `a_retired_frame_is_not_re_queued_after_the_window_moves`, whose
+/// subject is what the plan holds; this one widens a read and leaves the plan
+/// exactly as the listing built it.
+///
+/// TAMPER: restrict `LoopDownloadManager::frames_needing_decode` to
+/// `plan.frames` again. `needs_decode` still answers `true` and this walk
+/// comes back empty.
+#[test]
+fn the_pump_offers_an_evicted_drain_arrival_back_without_a_new_listing() {
+    const POLLED: u32 = 4;
+
+    let mut app = app_on_site();
+    app.loop_mgr.set_plan(0, plan_for(&[0, 8]));
+    poll_scan(&mut app, POLLED);
+
+    app.loop_mgr.evict_decoded_except(|_, _, _| false);
+
+    assert_eq!(
+        app.loop_mgr.plan_frame_count(0),
+        2,
+        "the plan still names exactly what the listing put in it",
+    );
+    assert_eq!(
+        app.loop_mgr.frames_needing_decode(0),
+        vec![(SITE.to_string(), at(POLLED))],
+        "and the pump has exactly one decode errand: the arrival whose \
+         moments it just gave back. The two listed moments were never held in \
+         either form, so they are downloads and not decodes.",
+    );
+}
+
+/// **An arrival on a site nothing loops keeps no compressed bytes.**
+///
+/// The archive is held so `evict_decoded_except` can trade it for a decoded
+/// volume, and that pass keeps whatever volume a pane is parked at whatever
+/// else it drops. So on a site with no loop the compressed half would be a
+/// buffer waiting for a swap that cannot happen — a pane scrubbed to a past
+/// instant with no loop running is exactly that shape, and it is the one case
+/// where filing the archive is a pure addition.
+///
+/// TAMPER: drop the `self.loop_mgr.is_looping(site)` conjunct in
+/// `App::append_scan_to_active_loops`.
+#[test]
+fn an_arrival_on_a_site_nothing_loops_keeps_no_archive() {
+    const PARKED: u32 = 4;
+
+    let mut app = app_on_site();
+    poll_scan(&mut app, PARKED);
+
+    assert_eq!(
+        app.loop_mgr.cached_scan_count(SITE),
+        1,
+        "precondition: the arrival is in the loop cache either way — this is \
+         about which halves of it are kept, not whether it lands",
+    );
+    assert_eq!(
+        app.loop_mgr.cached_archive_count(SITE),
+        0,
+        "and nothing loops the site, so its compressed bytes are dropped \
+         rather than parked against an eviction that cannot happen",
+    );
 }
 
 fn object() -> Arc<squallar_radar::level3::Level3Product> {

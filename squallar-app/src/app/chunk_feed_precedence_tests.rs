@@ -90,6 +90,9 @@ fn send_archive_scan(app: &App, timestamp: chrono::NaiveDateTime, scan: nexrad_m
                 declared_nyquist: Default::default(),
                 site: "KTLX".to_string(),
                 timestamp,
+                // An archive arrival carries the bytes it was decoded from,
+                // which is what lets the loop cache hold it compressed.
+                archive: Some(std::sync::Arc::new(vec![0u8; 64])),
             }),
             is_auto_poll: false,
         })
@@ -111,6 +114,7 @@ fn send_auto_poll_archive(app: &App, timestamp: chrono::NaiveDateTime) {
                 declared_nyquist: Default::default(),
                 site: "KTLX".to_string(),
                 timestamp,
+                archive: Some(std::sync::Arc::new(vec![0u8; 64])),
             }),
             is_auto_poll: true,
         })

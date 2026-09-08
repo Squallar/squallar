@@ -71,6 +71,7 @@ fn deliver(
                 declared_nyquist: Default::default(),
                 site: SITE.to_string(),
                 timestamp: collected,
+                archive: Some(std::sync::Arc::new(vec![0u8; 64])),
             }),
             is_auto_poll: false,
         })

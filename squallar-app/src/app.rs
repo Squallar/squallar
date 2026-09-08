@@ -2432,6 +2432,12 @@ impl App {
                         );
                         let site = scan_data.site;
                         let timestamp = scan_data.timestamp;
+                        // **The compressed bytes the volume came out of**, so
+                        // that whichever arm below files it in the loop cache
+                        // files something the residency pass can evict. Taken
+                        // out here because all three arms need it and the
+                        // struct is destructured field by field.
+                        let archive = scan_data.archive;
                         let scan_arc = Arc::new(scan_data.scan);
                         // What the archive declared each cut's Nyquist velocity to be, held
                         // beside the volume for as long as it is the merge base.
@@ -2472,6 +2478,7 @@ impl App {
                                 timestamp,
                                 Arc::clone(&scan_arc),
                                 Arc::clone(&declared_nyquist),
+                                archive,
                             );
                             // Priced where it is filed, so `still scans` can
                             // name it: the inventory carries the price, the
@@ -2489,6 +2496,7 @@ impl App {
                                 timestamp,
                                 scan_arc,
                                 declared_nyquist,
+                                archive,
                             );
                             self.gui.finish_loading(&site);
                         } else {
@@ -2521,6 +2529,7 @@ impl App {
                                 timestamp,
                                 Arc::clone(&scan_arc),
                                 Arc::clone(&declared_nyquist),
+                                archive,
                             );
 
                             if self.manual_nav_pending {

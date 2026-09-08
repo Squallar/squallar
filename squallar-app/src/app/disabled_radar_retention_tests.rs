@@ -67,6 +67,7 @@ fn land_one_volume(app: &mut App) {
                 declared_nyquist: Default::default(),
                 site: SITE.to_string(),
                 timestamp: at(0),
+                archive: Some(std::sync::Arc::new(vec![0u8; 64])),
             }),
             is_auto_poll: false,
         })

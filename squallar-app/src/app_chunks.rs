@@ -320,7 +320,12 @@ impl super::App {
             // behind this call is read product-blind and never re-downloaded, so
             // it takes `whole_volume_complete`.
             if closed.progress.whole_volume_complete {
-                self.append_scan_to_active_loops(site, timestamp, scan, declared);
+                // **No archive: this volume was assembled from chunks and was
+                // never one compressed object**, so there is nothing to
+                // rebuild it from and `evict_decoded_except` will refuse to
+                // drop it. The archive of the same volume appears in the S3
+                // bucket minutes later and arrives down the drain's own path.
+                self.append_scan_to_active_loops(site, timestamp, scan, declared, None);
             } else {
                 log::debug!(
                     "{site}: volume complete on the {} cut(s) the feed asked for but \

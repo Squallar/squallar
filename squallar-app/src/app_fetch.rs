@@ -509,7 +509,7 @@ impl super::App {
                 window,
                 sender,
                 std::sync::Arc::new(archive),
-                move |volume, _archive| {
+                move |volume, archive| {
                     let result = match volume {
                         Some(volume) => {
                             log::info!("Fetched scan: {} @ {}", site, timestamp);
@@ -518,6 +518,7 @@ impl super::App {
                                 declared_nyquist: volume.declared_nyquist,
                                 site: site.clone(),
                                 timestamp,
+                                archive: Some(archive),
                             })
                         }
                         // The archive arrived and would not decode. `execute` has
@@ -919,7 +920,7 @@ impl super::App {
                                 window,
                                 sender,
                                 std::sync::Arc::new(archive),
-                                move |volume, _archive| {
+                                move |volume, archive| {
                                     let volume = volume?;
                                     Some(crate::channels::ScanResponse {
                                         generation,
@@ -933,6 +934,7 @@ impl super::App {
                                             declared_nyquist: volume.declared_nyquist,
                                             site,
                                             timestamp,
+                                            archive: Some(archive),
                                         }),
                                         is_auto_poll: true,
                                     })
@@ -2302,13 +2304,14 @@ impl super::App {
                         window,
                         sender,
                         std::sync::Arc::new(archive),
-                        move |volume, _archive| {
+                        move |volume, archive| {
                             let result = match volume {
                                 Some(volume) => Ok(crate::channels::ScanData {
                                     scan: volume.scan,
                                     declared_nyquist: volume.declared_nyquist,
                                     site: site.clone(),
                                     timestamp,
+                                    archive: Some(archive),
                                 }),
                                 None => {
                                     let err =
@@ -2812,16 +2815,42 @@ impl super::App {
 
     /// Append a freshly-polled scan to any active loops, evicting frames past
     /// the lookback window.
+    ///
+    /// **`archive` is what makes the volume evictable**, and a `None` here is
+    /// a volume the residency policy can never drop. `evict_decoded_except`
+    /// refuses to evict a volume with no archive behind it — its premise is
+    /// that eviction costs a decode, and for a volume with nothing to decode
+    /// from it would silently become a re-download policy. So the arrivals
+    /// that reach this function with their compressed bytes (the pane fetch,
+    /// the auto-poll and the adjacent-volume nudge, all three off
+    /// `decode_offloaded`, which hands the responder the same `Arc` the job
+    /// held) file them here, and the ones that have none — the chunk feed's
+    /// assembled volumes — pass `None` and keep the standing behaviour.
+    ///
+    /// The archive is filed under the SAME key as the volume, in this call,
+    /// out of the same arguments, so the two halves of a frame cannot end up
+    /// under two addresses.
     pub(super) fn append_scan_to_active_loops(
         &mut self,
         site: &str,
         timestamp: chrono::NaiveDateTime,
         scan: std::sync::Arc<nexrad_model::data::Scan>,
         declared: std::sync::Arc<squallar_radar::nyquist::DeclaredNyquist>,
+        archive: Option<std::sync::Arc<Vec<u8>>>,
     ) {
         // Store in the shared cache under this scan's own site, for every loop on that
         // site to use.
         self.loop_mgr.cache_scan(site, timestamp, (scan, declared));
+        // **The compressed half, but only where a loop can ever trade it in.**
+        // `evict_decoded_except` keeps the volume a pane is parked at whatever
+        // else it drops, so on a site nothing loops the archive would be a
+        // held buffer waiting for a swap that cannot happen — a pane scrubbed
+        // to a past instant with no loop running is exactly that shape.
+        if let Some(archive) = archive
+            && self.loop_mgr.is_looping(site)
+        {
+            self.loop_mgr.cache_archive(site, timestamp, archive);
+        }
 
         let allocation = self.loop_allocation();
         let budgets = self.budgets;
