@@ -43,6 +43,143 @@ fn wrap_deg(a: f64) -> f64 {
     a
 }
 
+/// The azimuth span one radial is **drawn** over, degrees.
+///
+/// Anchored on the radial's own azimuth and deliberately **not** folded onto
+/// any range: a wedge spanning north is one interval whose `lo` is negative,
+/// not two intervals with a seam at 0. The fan geometry and the pick both read
+/// this, so folding it here would put a seam in the picture.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DrawnEdge {
+    /// The clockwise-most edge, degrees. `lo == hi` means the radial draws
+    /// nothing — an unpainted radial, or one a neighbour trimmed to zero.
+    pub lo_deg: f32,
+    /// The counter-clockwise-most edge, degrees.
+    pub hi_deg: f32,
+}
+
+impl DrawnEdge {
+    /// A radial that draws nothing.
+    pub const EMPTY: Self = Self {
+        lo_deg: 0.0,
+        hi_deg: 0.0,
+    };
+
+    /// Whether this span is empty.
+    ///
+    /// Spelled through `partial_cmp` because the answer for a NaN edge has to
+    /// be "empty" and not "wide": a negated `>` says that correctly and reads
+    /// as a typo, and `<=` would say the opposite for NaN.
+    pub fn is_empty(&self) -> bool {
+        !matches!(
+            self.hi_deg.partial_cmp(&self.lo_deg),
+            Some(std::cmp::Ordering::Greater)
+        )
+    }
+
+    /// Whether `azimuth_deg` falls in this span, on the same half-open
+    /// convention [`Wedge::contains`] uses so abutting spans tile without
+    /// double-claiming their shared edge.
+    ///
+    /// Measured from `lo` rather than from a midpoint, and widened to `f64`
+    /// **before** any arithmetic. A midpoint form computes `lo + hi` and
+    /// `hi - lo`; done in `f32` those round in opposite directions and two
+    /// spans that abut exactly both claim their shared edge, which is the one
+    /// thing this function exists to prevent. Found by
+    /// `the_drawn_sweep_claims_every_azimuth_at_most_once` on a ragged sweep.
+    fn contains(&self, azimuth_deg: f64) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        let lo = f64::from(self.lo_deg);
+        let width = f64::from(self.hi_deg) - lo;
+        (azimuth_deg - lo).rem_euclid(360.0) < width
+    }
+}
+
+/// **Each radial's drawn azimuth span, with every overlap removed.**
+///
+/// `docs/radar-polar-design.md` §2.2. [`super::l2_wedge_half_widths_deg`]
+/// takes the declared azimuth spacing as a *floor* and widens each radial
+/// toward its neighbours, so where the real gap is tighter than the
+/// declaration **wedges overlap**. The raster resolves that by ordering:
+/// [`PolarGeometry::pick`] scans in reverse and the greatest radial index
+/// wins, which is `write_key`'s own ordering.
+///
+/// Geometry cannot express "greatest wins" without a depth buffer, and egui's
+/// pass has none. So this removes the overlap instead of ordering it: where
+/// two radials would both claim a point, each is trimmed to the **midpoint of
+/// their two azimuths** — the boundary that gives every point to the radial
+/// whose beam is nearer it.
+///
+/// **For non-overlapping input this is the identity**, so the answer is
+/// unchanged wherever the raster was unambiguous; it differs only inside the
+/// slivers where two radials both claimed a point. Unpainted radials
+/// ([`Wedge::UNPAINTED`]) yield [`DrawnEdge::EMPTY`] and are excluded from
+/// their neighbours' boundaries entirely, so a sweep with gaps does not have
+/// its live radials stretched across them.
+pub fn draw_edges(wedges: &[Wedge]) -> Vec<DrawnEdge> {
+    let mut edges = vec![DrawnEdge::EMPTY; wedges.len()];
+
+    // Only radials that were actually painted take part. A NaN azimuth has no
+    // position to trim against and no sky to claim.
+    let mut live: Vec<usize> = (0..wedges.len())
+        .filter(|&i| {
+            wedges[i].azimuth_deg.is_finite()
+                && wedges[i].half_width_deg.is_finite()
+                && wedges[i].half_width_deg > 0.0
+        })
+        .collect();
+    if live.is_empty() {
+        return edges;
+    }
+    if live.len() == 1 {
+        let w = wedges[live[0]];
+        // No neighbour to trim against. The only bound is the circle itself:
+        // a half-width past 180 degrees would wrap onto its own far edge.
+        let half = f64::from(w.half_width_deg).min(180.0);
+        let az = f64::from(w.azimuth_deg);
+        edges[live[0]] = DrawnEdge {
+            lo_deg: (az - half) as f32,
+            hi_deg: (az + half) as f32,
+        };
+        return edges;
+    }
+
+    live.sort_by(|&a, &b| {
+        let key = |i: usize| f64::from(wedges[i].azimuth_deg).rem_euclid(360.0);
+        key(a)
+            .partial_cmp(&key(b))
+            .expect("azimuths are finite here")
+    });
+
+    // The forward gap from each live radial to the next one round the circle.
+    // Cyclic, so the last radial's neighbour is the first.
+    for (slot, &i) in live.iter().enumerate() {
+        let next = live[(slot + 1) % live.len()];
+        let prev = live[(slot + live.len() - 1) % live.len()];
+        let az = f64::from(wedges[i].azimuth_deg);
+        let half = f64::from(wedges[i].half_width_deg);
+
+        // Forward and backward gaps, each in [0, 360). With two radials the
+        // two gaps sum to 360 and each side is bisected independently, which
+        // is what keeps the pair from overlapping on the far side too.
+        let gap_fwd = (f64::from(wedges[next].azimuth_deg) - az).rem_euclid(360.0);
+        let gap_back = (az - f64::from(wedges[prev].azimuth_deg)).rem_euclid(360.0);
+
+        // Trim to the nearer of the wedge's own edge and the bisector. A gap
+        // wider than the wedge leaves the wedge untouched, which is the
+        // identity the doc promises for non-overlapping input.
+        let hi = half.min(gap_fwd / 2.0);
+        let lo = half.min(gap_back / 2.0);
+        edges[i] = DrawnEdge {
+            lo_deg: (az - lo) as f32,
+            hi_deg: (az + hi) as f32,
+        };
+    }
+    edges
+}
+
 /// One gate of one radial, in the order the render walked them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GateAt {
@@ -98,6 +235,33 @@ impl PolarGeometry {
         let radial = (0..self.wedges.len())
             .rev()
             .find(|&i| self.wedges[i].contains(azimuth_deg))?;
+        Some(GateAt { radial, gate })
+    }
+
+    /// The gate under a point, resolved against the **drawn** edges rather
+    /// than the painted wedges.
+    ///
+    /// [`Self::pick`]'s answer for the raster; this one for the fan. They
+    /// agree everywhere the wedges do not overlap, and inside an overlap this
+    /// gives the point to the nearer beam where `pick` gives it to the greater
+    /// radial index. `edges` is [`draw_edges`] over this geometry's own
+    /// wedges, passed in rather than recomputed because it is derived once at
+    /// upload and read on every hover — building it per call would put a sort
+    /// and an allocation on the frame thread.
+    ///
+    /// **Nothing calls this yet, and that is deliberate.** The readout must
+    /// agree with the picture, and the picture is still the raster, so hover
+    /// keeps using [`Self::pick`] until the fan is what draws. Switching the
+    /// readout first would make it disagree with every pixel on screen.
+    pub fn pick_drawn(
+        &self,
+        edges: &[DrawnEdge],
+        azimuth_deg: f64,
+        ground_km: f64,
+    ) -> Option<GateAt> {
+        let gate = self.gate_at(ground_km)?;
+        let radial =
+            (0..self.wedges.len().min(edges.len())).find(|&i| edges[i].contains(azimuth_deg))?;
         Some(GateAt { radial, gate })
     }
 

@@ -317,3 +317,238 @@ fn the_polar_wire_layout_is_the_one_this_protocol_ships() {
          full layout identity joins the token.",
     );
 }
+
+/// A geometry over `wedges`, with gate 0 at 0.5 km and a 1 km depth so a
+/// ground range of 40 km lands well inside every radial.
+fn geometry_of(wedges: Vec<Wedge>) -> PolarGeometry {
+    PolarGeometry::from_parts(wedges, 0.5, 1.0, None, 200)
+}
+
+/// A uniform sweep: `n` radials evenly spaced, each painted at exactly half
+/// the spacing, so no two wedges overlap and none leaves a gap.
+fn uniform_wedges(n: usize) -> Vec<Wedge> {
+    let step = 360.0 / n as f32;
+    (0..n)
+        .map(|i| Wedge {
+            azimuth_deg: i as f32 * step,
+            half_width_deg: step / 2.0,
+        })
+        .collect()
+}
+
+/// **`draw_edges` is the identity on wedges that do not overlap.**
+///
+/// The promise the whole substitution rests on: the fan may only change what
+/// the picture shows inside the slivers the raster was already ambiguous
+/// about. If it moved a non-overlapping edge it would be re-drawing gates that
+/// were never in question.
+#[test]
+fn drawn_edges_leave_a_non_overlapping_sweep_alone() {
+    for n in [360usize, 720, 17] {
+        let wedges = uniform_wedges(n);
+        let edges = draw_edges(&wedges);
+        assert_eq!(edges.len(), n);
+        for (i, w) in wedges.iter().enumerate() {
+            let natural_lo = w.azimuth_deg - w.half_width_deg;
+            let natural_hi = w.azimuth_deg + w.half_width_deg;
+            assert!(
+                (edges[i].lo_deg - natural_lo).abs() < 1e-3
+                    && (edges[i].hi_deg - natural_hi).abs() < 1e-3,
+                "{n} radials, radial {i}: drawn {:?} but the wedge was \
+                 [{natural_lo}, {natural_hi}] and nothing overlaps it",
+                edges[i],
+            );
+        }
+    }
+}
+
+/// **Overlapping wedges are trimmed to the bisector, and the sliver is split
+/// rather than given to whoever was written last.**
+#[test]
+fn an_overlap_is_removed_at_the_midpoint() {
+    // Two radials 1 degree apart, each painted 2 degrees wide: they overlap
+    // over most of their span.
+    let wedges = vec![
+        Wedge {
+            azimuth_deg: 10.0,
+            half_width_deg: 1.0,
+        },
+        Wedge {
+            azimuth_deg: 11.0,
+            half_width_deg: 1.0,
+        },
+    ];
+    let edges = draw_edges(&wedges);
+    // The bisector is 10.5 on the near side; on the far side the gap is 359
+    // degrees, so neither is trimmed there.
+    assert!((edges[0].hi_deg - 10.5).abs() < 1e-4, "{:?}", edges[0]);
+    assert!((edges[1].lo_deg - 10.5).abs() < 1e-4, "{:?}", edges[1]);
+    assert!((edges[0].lo_deg - 9.0).abs() < 1e-4, "{:?}", edges[0]);
+    assert!((edges[1].hi_deg - 12.0).abs() < 1e-4, "{:?}", edges[1]);
+    // And they abut exactly: no gap opened where the overlap was.
+    assert!((edges[0].hi_deg - edges[1].lo_deg).abs() < 1e-4);
+}
+
+/// **No point on the circle is claimed by two radials**, for overlapping and
+/// non-overlapping input alike.
+///
+/// The property the fan needs and the raster never had: with no depth buffer,
+/// two triangles claiming one pixel is whichever the rasteriser reached last.
+/// A dense walk of the whole circle, not a pairwise argument.
+#[test]
+fn the_drawn_sweep_claims_every_azimuth_at_most_once() {
+    let arms: Vec<(&str, Vec<Wedge>)> = vec![
+        ("uniform 720", uniform_wedges(720)),
+        ("uniform 360", uniform_wedges(360)),
+        (
+            "widened past the spacing, so every radial overlaps both neighbours",
+            (0..360)
+                .map(|i| Wedge {
+                    azimuth_deg: i as f32,
+                    half_width_deg: 2.0,
+                })
+                .collect(),
+        ),
+        (
+            "ragged: a jittered sweep with uneven gaps",
+            (0..360)
+                .map(|i| Wedge {
+                    azimuth_deg: i as f32 + ((i * 7) % 5) as f32 * 0.1,
+                    half_width_deg: 0.9,
+                })
+                .collect(),
+        ),
+    ];
+    for (name, wedges) in arms {
+        let edges = draw_edges(&wedges);
+        let mut covered = 0usize;
+        for step in 0..36_000 {
+            let az = f64::from(step) / 100.0;
+            let claims = edges.iter().filter(|e| e.contains(az)).count();
+            assert!(
+                claims <= 1,
+                "{name}: azimuth {az} is claimed by {claims} radials; with no depth buffer \
+                 the picture there is whichever triangle the rasteriser reached last",
+            );
+            covered += claims;
+        }
+        // And the sweep still covers the sky it did before: trimming removes
+        // overlap, never coverage. A rule that emptied every wedge would pass
+        // the at-most-once check above on its own.
+        assert!(
+            covered > 35_900,
+            "{name}: only {covered} of 36000 probes are covered, so trimming removed coverage \
+             rather than overlap",
+        );
+    }
+}
+
+/// **The drawn pick agrees with the painted pick wherever the raster was
+/// unambiguous, and differs only inside a contested sliver.**
+///
+/// Hover reads one of these and the picture shows the other, so a disagreement
+/// outside a sliver would be a readout that names a gate no pixel came from.
+#[test]
+fn the_drawn_pick_matches_the_painted_pick_outside_the_slivers() {
+    let geometry = geometry_of(uniform_wedges(720));
+    let edges = draw_edges(geometry.wedges());
+    let ground_km = 40.0;
+    let mut compared = 0usize;
+    for step in 0..36_000 {
+        let az = f64::from(step) / 100.0;
+        assert_eq!(
+            geometry.pick_drawn(&edges, az, ground_km),
+            geometry.pick(az, ground_km),
+            "azimuth {az}: the fan and the raster disagree about a point no two wedges \
+             contest",
+        );
+        compared += 1;
+    }
+    assert_eq!(compared, 36_000);
+
+    // Now the contested case: every radial two degrees wide on a one-degree
+    // spacing. The two picks MUST differ somewhere, or the sliver rule is not
+    // doing anything and the test above proves nothing.
+    let contested = geometry_of(
+        (0..360)
+            .map(|i| Wedge {
+                azimuth_deg: i as f32,
+                half_width_deg: 1.0,
+            })
+            .collect(),
+    );
+    let contested_edges = draw_edges(contested.wedges());
+    let mut differ = 0usize;
+    for step in 0..36_000 {
+        let az = f64::from(step) / 100.0;
+        if contested.pick_drawn(&contested_edges, az, ground_km) != contested.pick(az, ground_km) {
+            differ += 1;
+        }
+    }
+    assert!(
+        differ > 0,
+        "the two picks agree everywhere even where wedges overlap, so the trim is inert",
+    );
+}
+
+/// **An unpainted radial draws nothing and does not stretch its neighbours.**
+#[test]
+fn an_unpainted_radial_draws_nothing() {
+    let mut wedges = uniform_wedges(360);
+    wedges[100] = Wedge::UNPAINTED;
+    wedges[101] = Wedge::UNPAINTED;
+    let edges = draw_edges(&wedges);
+    assert!(edges[100].is_empty(), "{:?}", edges[100]);
+    assert!(edges[101].is_empty(), "{:?}", edges[101]);
+    // The live neighbours either side keep their own width rather than
+    // growing across the hole: a gap in the data is a gap in the picture.
+    for i in [99usize, 102] {
+        let w = wedges[i];
+        assert!(
+            (edges[i].hi_deg - edges[i].lo_deg - 2.0 * w.half_width_deg).abs() < 1e-3,
+            "radial {i} was stretched across the unpainted gap: {:?}",
+            edges[i],
+        );
+    }
+    // Nothing is claimed inside the hole the two dead radials leave. Its
+    // edges are radial 99's own `hi` and radial 102's own `lo`, read off the
+    // table rather than assumed, because assuming them is how this probe
+    // walked out of the hole and past a live neighbour the first time.
+    let (hole_lo, hole_hi) = (edges[99].hi_deg, edges[102].lo_deg);
+    assert!(
+        hole_hi - hole_lo > 1.0,
+        "[{hole_lo}, {hole_hi}] is not a hole"
+    );
+    for step in 0..200 {
+        let az = f64::from(hole_lo) + f64::from(hole_hi - hole_lo) * f64::from(step) / 200.0;
+        assert_eq!(
+            edges.iter().filter(|e| e.contains(az)).count(),
+            0,
+            "azimuth {az} is inside the unpainted hole and something claimed it",
+        );
+    }
+    // A sweep of nothing but unpainted radials draws nothing at all.
+    let none = draw_edges(&[Wedge::UNPAINTED; 16]);
+    assert!(none.iter().all(|e| e.is_empty()));
+}
+
+/// **A wedge spanning north is one interval, not two.**
+///
+/// The seam test. `lo` is allowed to be negative and the pick wraps, because
+/// the fan's vertex shader works in a continuous longitude frame and a table
+/// folded onto `[0, 360)` would put a visible seam at true north.
+#[test]
+fn a_sweep_across_north_has_no_seam() {
+    let wedges = uniform_wedges(360);
+    let edges = draw_edges(&wedges);
+    // Radial 0 sits on north, so its span crosses zero.
+    assert!(edges[0].lo_deg < 0.0, "{:?}", edges[0]);
+    assert!(edges[0].hi_deg > 0.0, "{:?}", edges[0]);
+    // Points either side of north are claimed, and by the same radial.
+    for az in [359.9_f64, 359.99, 0.0, 0.1] {
+        let claims: Vec<usize> = (0..edges.len())
+            .filter(|&i| edges[i].contains(az))
+            .collect();
+        assert_eq!(claims, vec![0], "azimuth {az} across the north seam");
+    }
+}

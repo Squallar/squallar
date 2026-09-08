@@ -3173,3 +3173,100 @@ fn pooled_bytes_is_read_without_taking_a_slot_lock() {
     drop(take_slot(&mut cells, &POOLED_CELL_BYTES));
     drop(take_slot(&mut image, &POOLED_IMAGE_BYTES));
 }
+
+/// **What a plan-view raster and a polar code plane actually weigh, for the
+/// same sweep, in one process.**
+///
+/// The campaign has been comparing a measured polar figure against
+/// `squallar_device_profile`'s arithmetic for the raster, which makes the
+/// ratio half-measured. This weighs both sides of it: the raster's own
+/// `image`, the polar field beside it, and a [`CodePlane`] built at the
+/// geometry that same render produced.
+///
+/// Both figures are read off the buffers the code allocated rather than
+/// recomputed from the shape, and neither depends on gate content — only on
+/// shape — so they are exact for any reflectivity sweep of this cut.
+#[test]
+fn a_raster_and_a_code_plane_are_weighed_against_each_other() {
+    use crate::render::codes::{CodePlane, LutKey};
+
+    // 720 radials at half-degree spacing -- a super-resolution surveillance
+    // cut's radial count. `l2_sweep` takes one gate byte per radial and gives
+    // each radial `L2_GATES` gates, so the shape is 720 x 600 rather than the
+    // 1832 x 600 `l2_scan` would produce by using the byte count as the
+    // radial count.
+    let bytes: Vec<u8> = (0..720).map(|i| (i % 200 + 40) as u8).collect();
+    let azimuths: Vec<f32> = (0..720).map(|i| i as f32 * 0.5).collect();
+    let scan = l2_sweep(&bytes, &azimuths, 0.5, false);
+    let rendered = render_radar_to_image(
+        &scan,
+        L2_ELEVATION,
+        types::RadarProduct::Reflectivity,
+        LAT,
+        LON,
+    )
+    .expect("the fixture renders");
+
+    // The texel width, measured rather than assumed: the image is exactly
+    // four bytes a pixel over a square side. `PLAN_VIEW_VALUE_BYTES` used to
+    // add four more per pixel here and was deleted on 2026-09-08 when it was
+    // found written and never read; this is what says the price now describes
+    // the object.
+    let pixels = rendered.image.len() / 4;
+    let side = (pixels as f64).sqrt().round() as usize;
+    assert_eq!(side * side, pixels, "the raster is not square");
+    assert_eq!(
+        rendered.image.len(),
+        side * side * 4,
+        "the raster is not four bytes a pixel, so the price's texel term no longer \
+         describes what the renderer allocates",
+    );
+
+    // The same sweep as a code plane, at the geometry this render produced.
+    let geometry = rendered.polar.geometry();
+    let (radials, plane_gates) = (geometry.radials(), geometry.gates());
+    let plane = CodePlane::build(
+        radials,
+        plane_gates,
+        vec![0; radials * plane_gates],
+        LutKey {
+            product: types::RadarProduct::Reflectivity,
+            scale: 2.0,
+            offset: 66.0,
+        },
+        8,
+    )
+    .expect("a real sweep's shape is inside both caps");
+
+    // The comparison, both sides weighed, exact rather than bounded. The
+    // raster scales with the square of a projection side chosen from the
+    // extent; the plane scales with the gates the radar actually measured,
+    // which is why the gap widens with range instead of staying fixed.
+    assert_eq!(side, 2048);
+    assert_eq!((radials, plane_gates), (720, 600));
+    assert_eq!(rendered.image.len(), 16_777_216);
+    assert_eq!(plane.levels(), 11);
+    assert_eq!(plane.resident_bytes(), 576_061);
+
+    // The polar field is not an extra the plane adds -- it is what the plane
+    // REPLACES. Today's raster path already carries a `Vec<f32>` of the same
+    // gates beside the picture, and the plane is smaller than that field
+    // alone, before the picture is counted at all.
+    assert_eq!(rendered.polar.resident_bytes(), 1_733_760);
+    assert!(
+        plane.resident_bytes() < rendered.polar.resident_bytes(),
+        "the plane ({}) is not smaller than the f32 field it replaces ({})",
+        plane.resident_bytes(),
+        rendered.polar.resident_bytes(),
+    );
+
+    // So the whole retained host cost of drawing this sweep as a raster,
+    // against drawing it as a plane. Both terms measured; neither inferred.
+    let raster_host = rendered.image.len() + rendered.polar.resident_bytes();
+    assert_eq!(raster_host, 18_510_976);
+    assert!(
+        raster_host / plane.resident_bytes() >= 32,
+        "raster {raster_host} B against plane {} B is under 32x",
+        plane.resident_bytes(),
+    );
+}
