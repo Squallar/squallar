@@ -1276,6 +1276,70 @@ fn decode_raster_reply(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutp
 /// [`HitCellMap`](crate::render::rasterize::HitCellMap) is unseeded: the sort is
 /// what makes the encoding canonical, not the hasher.
 ///
+/// # Why the picture is IN the head, and what moving it out would cost
+///
+/// The picture is appended to the head rather than nominated as a tail, and on
+/// the browser that decides how many full-size buffers a delivery holds at
+/// once. The page's `deliver` copies the head into its own linear memory as a
+/// `Vec<u8>` (`squallar_web::worker_port`), `decode_overlay_out` then builds
+/// the `Vec<Color32>` the consumer takes by move, and the head is BORROWED
+/// across that build — `offload::deliver_encoded_reply` binds it and passes
+/// `&head` — so both are live at the same instant. Measured on the rig's
+/// software arm, 2878x1566: 39,526,454 B and 39,526,452 B, 75.4 MiB for one
+/// picture, against a page whose whole linear high-water was 225-264 MiB.
+///
+/// **The picture cannot be copied straight from the worker's view into the
+/// `Vec<Color32>` while it lives here, and the reason is alignment rather than
+/// effort.** The RGBA starts at a non-4-aligned offset in this buffer — two
+/// bytes with no hit cells, and the cells block's own length with them — so a
+/// `Color32` view of those bytes puts every pixel across two slots. Padding
+/// the header to four and dropping the prefix afterwards is a `Vec::drain`,
+/// which is a memmove of the whole picture: it fixes the two-buffer peak and
+/// buys nothing at all on time.
+///
+/// Two other routes fail for their own reasons, recorded so they are not
+/// re-derived. Freeing the head before the pixels are allocated is impossible,
+/// because the pixels are read out of it. And a reusable staging buffer on the
+/// page removes the per-reply allocation but not the peak — the staging buffer
+/// and the `Vec<Color32>` are still both live — while making a picture-sized
+/// buffer permanently resident, which is worse than the transient it replaces.
+///
+/// # What would remove the second buffer, and what it costs
+///
+/// **The picture has to be born as pixels on the page**, in one buffer the
+/// consumer keeps, with the bytes never landing in a `Vec<u8>` of their own.
+/// A copy into a 4-aligned destination is fine — it is the *view* that
+/// alignment forbids — so the page can allocate the destination and copy the
+/// worker's own `Uint8Array` range straight into it:
+/// `RasterBuf::Pixels(vec![Color32::TRANSPARENT; n])` gives an aligned
+/// `&mut [u8]` through [`RasterBuf::as_mut_bytes`], and
+/// `Uint8Array::subarray(a, b).copy_to(..)` fills it. No `unsafe`, which
+/// `squallar-web` forbids, and no dependency it does not already declare.
+///
+/// **Reorder this encoding to make the offset a constant.** The page cannot
+/// find the picture in what is written above: the pixels sit behind the
+/// hit-cells block, which is variable, data-dependent and carries no byte
+/// length of its own — only a cell count, each cell stating its own id count
+/// — so the offset can be learned only by walking it. Writing the pixels tag
+/// and a `u32` length FIRST, the RGBA next and the cells block LAST makes the
+/// offset 5 and the length readable from bytes 1..5. `squallar-source`'s job
+/// wire is same-build-only by construction, so that reordering is free to
+/// happen here; it moves this codec's own round-trip assertions and no other
+/// row's, and no digest suite.
+///
+/// The pixels then have to reach a decode. They do not go through
+/// [`JobOutCodec::decode_out`], which takes `&[u8]` and is declared in
+/// `squallar-source` — putting `Color32` there would move a UI type into the
+/// vocabulary crate every source crate sits on, past a charter test that pins
+/// that ceiling in writing, and that is an `ARCHITECTURE.md` decision rather
+/// than a perf change. **It is not needed.** `squallar-worker` already
+/// declares both `egui` and this crate, under the exception its own manifest
+/// records, so the raster reply's pixel path lives there — one layer above the
+/// vocabulary crate, which is never touched. Three crates, no amendment.
+///
+/// [`JobOutCodec`]: squallar_source::job::JobOutCodec
+/// [`RasterBuf::as_mut_bytes`]: crate::render::raster_buf::RasterBuf::as_mut_bytes
+///
 /// **`blank` is transported, never re-decided.** `Some(len)` writes the pixels
 /// tag `0` and that length and no pixels at all — the whole of what a raster
 /// with no ink in it costs the wire, against `len` bytes before
