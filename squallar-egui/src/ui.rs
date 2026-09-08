@@ -138,6 +138,10 @@ pub(crate) use pills::SYNC_SECTION_LABELS;
 /// [`pills::build_count`].
 #[cfg(test)]
 pub(crate) use pills::build_count as site_sections_build_count;
+/// How many pill-popover payloads have been built on this thread — see
+/// [`pills::popover_payload_count`].
+#[cfg(test)]
+pub(crate) use pills::popover_payload_count;
 #[cfg(test)]
 pub(crate) use pills::{PillKind, PillPopoverProbe, PillRowProbe};
 #[path = "ui_fade.rs"]

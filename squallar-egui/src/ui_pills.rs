@@ -1046,6 +1046,33 @@ fn sync_pill_hover(
     text
 }
 
+/// How many pill-popover payloads — a product list or a tilt ladder — have
+/// been assembled on this thread. The counter behind
+/// `a_frame_with_no_pill_picker_open_assembles_no_popover_payloads`.
+///
+/// Test-only, and a thread-local because both builders take `&self`.
+#[cfg(test)]
+pub(crate) mod popover_payload_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static BUILT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn note() {
+        BUILT.with(|c| c.set(c.get().wrapping_add(1)));
+    }
+
+    /// Payloads built on this thread since the last [`reset`].
+    pub(crate) fn read() -> u64 {
+        BUILT.with(Cell::get)
+    }
+
+    pub(crate) fn reset() {
+        BUILT.with(|c| c.set(0));
+    }
+}
+
 /// How many [`Gui::site_sections`] models have been assembled on this thread
 /// — the counter behind
 /// `a_frame_with_no_site_picker_open_assembles_no_site_sections`.
@@ -1269,7 +1296,7 @@ impl super::Gui {
         let group_company: Vec<PaneId> = (0..self.visible_pane_count())
             .filter(|&other| other != idx && self.panes_share_group(idx, other))
             .collect();
-        let (site, kind, product, shares_viewport, links, line_absent, tilt, products, elevations) = {
+        let (site, kind, product, shares_viewport, links, line_absent, tilt) = {
             let pane = &self.panes[idx];
             let (_, tilt) = pane
                 .get_rendering_params()
@@ -1282,23 +1309,6 @@ impl super::Gui {
                 (pane.viewport_link, pane.layer_link, pane.time_link),
                 pane.cross_section().and_then(|s| s.line).is_none(),
                 tilt,
-                pane.scan_info.as_ref().map(|info| {
-                    // The scan lists what it offers in the radar layer's own
-                    // terms; the picker names fields by id.
-                    info.available_products
-                        .iter()
-                        .map(|p| squallar_radar::fields::spec(*p).id.clone())
-                        .collect::<Vec<_>>()
-                }),
-                pane.scan_info
-                    .as_ref()
-                    .and_then(|info| {
-                        let product =
-                            squallar_radar::fields::product_for(&pane.selected_product())?;
-                        info.product_elevations.get(&product)
-                    })
-                    .cloned()
-                    .unwrap_or_default(),
             )
         };
         let is_map = kind == RenderView::PlanView;
@@ -1385,7 +1395,7 @@ impl super::Gui {
                         }
                     }
                     if !swallow {
-                        self.product_pill_popover(&pill, idx, products.as_deref(), &product);
+                        self.product_pill_popover(&pill, idx, &product);
                     }
 
                     if is_map {
@@ -1401,7 +1411,7 @@ impl super::Gui {
                             }
                         }
                         if !swallow {
-                            self.tilt_pill_popover(&pill, idx, &elevations);
+                            self.tilt_pill_popover(&pill, idx, &product);
                         }
                     }
 
@@ -1458,6 +1468,46 @@ impl super::Gui {
         }
         #[cfg(not(test))]
         let _ = area;
+    }
+
+    /// The product list pane `idx`'s picker offers — the scan's own products,
+    /// named by field id, or `None` when the pane has no scan.
+    ///
+    /// **Not a read**, and built where it is drawn for that reason: a `Vec`
+    /// per call, one per product the scan carries. The pill row assembled it
+    /// per pane per frame and handed it to a `Popup::menu(..).show(..)` body
+    /// egui does not run while the picker is closed.
+    fn pane_product_options(&self, idx: PaneId) -> Option<Vec<FieldId>> {
+        #[cfg(test)]
+        popover_payload_count::note();
+        self.panes[idx].scan_info.as_ref().map(|info| {
+            // The scan lists what it offers in the radar layer's own terms;
+            // the picker names fields by id.
+            info.available_products
+                .iter()
+                .map(|p| squallar_radar::fields::spec(*p).id.clone())
+                .collect()
+        })
+    }
+
+    /// The tilt ladder pane `idx`'s picker offers for `product` — empty when
+    /// the scan has no angles for it yet, which is the picker's own
+    /// "waiting" state rather than an absent control.
+    ///
+    /// On [`Self::pane_product_options`]' terms: a `Vec<f32>` cloned off the
+    /// scan behind a product lookup, built inside the body that draws it.
+    fn pane_elevation_ladder(&self, idx: PaneId, product: &FieldId) -> Vec<f32> {
+        #[cfg(test)]
+        popover_payload_count::note();
+        self.panes[idx]
+            .scan_info
+            .as_ref()
+            .and_then(|info| {
+                let product = squallar_radar::fields::product_for(product)?;
+                info.product_elevations.get(&product)
+            })
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// The site popover: search field over the one site list.
@@ -1524,18 +1574,15 @@ impl super::Gui {
     }
 
     /// The product popover: the scan's own product list.
-    fn product_pill_popover(
-        &mut self,
-        pill: &egui::Response,
-        idx: PaneId,
-        options: Option<&[FieldId]>,
-        current: &FieldId,
-    ) {
+    fn product_pill_popover(&mut self, pill: &egui::Response, idx: PaneId, current: &FieldId) {
         let shown = egui::Popup::menu(pill)
             .id(pill_popup_id(idx, PillKind::Product))
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
-                let outcome = match options {
+                // Inside the body: egui runs this closure only while the
+                // picker is open, and the list is a `Vec` off the scan.
+                let options = self.pane_product_options(idx);
+                let outcome = match options.as_deref() {
                     Some(options) => product_list_ui(ui, options, current),
                     None => {
                         ui.label("No scan loaded");
@@ -1569,17 +1616,21 @@ impl super::Gui {
 
     /// The tilt popover: the selected product's elevation list, exactly the
     /// combo's.
-    fn tilt_pill_popover(&mut self, pill: &egui::Response, idx: PaneId, elevations: &[f32]) {
+    fn tilt_pill_popover(&mut self, pill: &egui::Response, idx: PaneId, product: &FieldId) {
         let shown = egui::Popup::menu(pill)
             .id(pill_popup_id(idx, PillKind::Tilt))
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
+                // Inside the body, for `product_pill_popover`'s reason: the
+                // ladder is a `Vec<f32>` cloned off the scan behind a product
+                // lookup, and egui skips this closure while the picker is shut.
+                let elevations = self.pane_elevation_ladder(idx, product);
                 let current = self.panes[idx].selected_elevation();
                 let outcome = if elevations.is_empty() {
                     ui.label("Waiting for this product's data");
                     PickOutcome::default()
                 } else {
-                    tilt_list_ui(ui, elevations, current)
+                    tilt_list_ui(ui, &elevations, current)
                 };
                 #[cfg(test)]
                 {

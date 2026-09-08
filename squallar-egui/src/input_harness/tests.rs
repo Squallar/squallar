@@ -9559,6 +9559,92 @@ fn a_frame_with_no_site_picker_open_assembles_no_site_sections() {
     );
 }
 
+/// **A pill picker nobody opened assembles no payload for it.**
+///
+/// The product list is a `Vec<FieldId>` off the scan and the tilt ladder is a
+/// `Vec<f32>` cloned out of it behind a product lookup. Both used to be built
+/// in `render_pill_row`'s per-pane read — once per visible pane per frame, on
+/// a non-map pane too, where the tilt pill is not even drawn — and handed to
+/// `Popup::menu(..).show(..)` bodies egui does not run while the picker is
+/// closed (`containers/popup.rs`). Measured off a temporary counting
+/// `#[global_allocator]`, repeat-identical across three runs, on a two-pane
+/// scene carrying a VCP-212-shaped volume (six moments, fourteen tilts) on
+/// both panes: **4 payload models, 4 allocations and 400 bytes per frame**,
+/// now zero.
+///
+/// Both are now built inside the body that draws them, and this pins the
+/// property in both directions: **zero payloads on a frame with no picker
+/// open, one on the frame whose picker is open.** Zero on the open frame
+/// would be a picker with nothing in it.
+#[test]
+fn a_frame_with_no_pill_picker_open_assembles_no_popover_payloads() {
+    let scan_harness = || {
+        let mut h = pill_harness();
+        h.load_scan("KTLX");
+        h.offer_product(0, &radar_fields::known::REFLECTIVITY, 0.5);
+        h.offer_product(0, &radar_fields::known::REFLECTIVITY, 1.5);
+        h.close_layers();
+        h.warm_up();
+        h
+    };
+
+    let mut h = scan_harness();
+    assert!(
+        h.pill_popover().is_none(),
+        "premise: no pill popover may be open on the closed frame"
+    );
+    assert_eq!(
+        h.pill_rows().len(),
+        2,
+        "premise: both panes must draw a pill row, so a per-pane build is \
+         visible as more than one"
+    );
+
+    crate::ui::popover_payload_count::reset();
+    h.frame();
+    let closed = crate::ui::popover_payload_count::read();
+    assert_eq!(
+        closed, 0,
+        "a frame with no pill picker open assembled {closed} popover \
+         payload(s), each a `Vec` off the scan dropped without being drawn."
+    );
+
+    let (_, pill) = h.pill(0, PillKind::Product).expect("a product pill");
+    h.mouse_click(pill.center());
+    h.frame();
+    assert_eq!(
+        h.pill_popover().map(|p| p.pill),
+        Some(PillKind::Product),
+        "premise: the click must have opened the product picker"
+    );
+    crate::ui::popover_payload_count::reset();
+    h.frame();
+    let open = crate::ui::popover_payload_count::read();
+    assert_eq!(
+        open, 1,
+        "a frame with the product picker OPEN assembled {open} payload(s). \
+         One is the list it draws; zero is an empty picker."
+    );
+
+    let mut h = scan_harness();
+    let (_, pill) = h.pill(0, PillKind::Tilt).expect("a tilt pill");
+    h.mouse_click(pill.center());
+    h.frame();
+    assert_eq!(
+        h.pill_popover().map(|p| p.pill),
+        Some(PillKind::Tilt),
+        "premise: the click must have opened the tilt picker"
+    );
+    crate::ui::popover_payload_count::reset();
+    h.frame();
+    let open = crate::ui::popover_payload_count::read();
+    assert_eq!(
+        open, 1,
+        "a frame with the tilt picker OPEN assembled {open} payload(s). One \
+         is the ladder it draws; zero is a picker stuck on \"waiting\"."
+    );
+}
+
 /// 73e. **The product and tilt popovers offer the combos' own lists, and a pick
 /// writes the pane — with the product pick resetting the tilt.**
 #[test]
