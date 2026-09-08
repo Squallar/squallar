@@ -2219,12 +2219,21 @@ fn radar_bar_drawn(pane: &PaneState) -> bool {
 }
 
 /// How wide `text` lays out at `size`, logical pixels.
+///
+/// **Laid out in [`egui::Color32::PLACEHOLDER`], and the colour is the point.**
+/// The galley is thrown away after its width is read, so any colour would
+/// serve — but epaint keys its cache by the whole `LayoutJob`, colour
+/// included, and this vocabulary is exactly what [`render_color_scales`] is
+/// about to draw. Measuring in an ink colour therefore mints a second entry
+/// per tick, per bar, per pane, per frame for glyphs whose metrics do not
+/// depend on their colour. The painters lay out in the placeholder too, so
+/// the whole block costs one galley per string.
 fn laid_out_width(measure: &egui::Painter, text: &str, size: f32) -> f32 {
     measure
         .layout_no_wrap(
             text.to_owned(),
             egui::FontId::proportional(size),
-            egui::Color32::WHITE,
+            egui::Color32::PLACEHOLDER,
         )
         .rect
         .width()
@@ -2244,7 +2253,9 @@ fn legend_block_reach(
             .layout_no_wrap(
                 "0".to_owned(),
                 egui::FontId::proportional(SCALE_FONT_SIZE),
-                egui::Color32::WHITE,
+                // Discarded after its height is read; see `laid_out_width` for
+                // why the colour is the placeholder and not an ink.
+                egui::Color32::PLACEHOLDER,
             )
             .rect
             .height();
@@ -2726,6 +2737,22 @@ pub(super) fn draw_pane_cost(painter: &egui::Painter, pane_rect: egui::Rect, cos
 }
 
 /// Draw text with a dark shadow for readability on the map.
+///
+/// # The string is laid out once, and not once per colour
+///
+/// The shadow and the ink are the same glyphs at two positions in two
+/// colours, and this used to draw each through [`egui::Painter::text`] —
+/// which lays out from scratch every call. epaint keys its galley cache by
+/// the whole `LayoutJob`, **colour included**, so the two were distinct
+/// entries: two full layouts, two `String`s allocated from a `&str` the
+/// caller already holds, and two `Context::fonts` write locks, for one string
+/// of glyphs whose metrics do not depend on its colour.
+///
+/// It is laid out in [`egui::Color32::PLACEHOLDER`] instead and coloured at
+/// paint, which is the same vertices: the tessellator substitutes each
+/// shape's own fallback colour for the placeholder, and a `layout_no_wrap`
+/// job has no vertex that is not a glyph — no underline, no strike-through,
+/// no background — so there is nothing else for a colour to reach.
 fn draw_shadowed_text(
     painter: &egui::Painter,
     pos: egui::Pos2,
@@ -2733,14 +2760,23 @@ fn draw_shadowed_text(
     text: &str,
     font: egui::FontId,
 ) {
-    painter.text(
-        pos + egui::vec2(SHADOW_OFFSET, SHADOW_OFFSET),
-        anchor,
-        text,
-        font.clone(),
+    let galley = painter.layout_no_wrap(text.to_owned(), font, egui::Color32::PLACEHOLDER);
+    // Anchored from the one galley's size, which is what makes the two draws
+    // register: they were already the same size, because a colour does not
+    // move a glyph.
+    let size = galley.size();
+    painter.galley(
+        anchor
+            .anchor_size(pos + egui::vec2(SHADOW_OFFSET, SHADOW_OFFSET), size)
+            .min,
+        galley.clone(),
         egui::Color32::from_black_alpha(200),
     );
-    painter.text(pos, anchor, text, font, egui::Color32::WHITE);
+    painter.galley(
+        anchor.anchor_size(pos, size).min,
+        galley,
+        egui::Color32::WHITE,
+    );
 }
 
 /// Every colour-scale legend a pane shows: the radar product's own bar, and
@@ -2987,7 +3023,7 @@ pub(super) fn render_color_scale(
             // Measured rather than reserved, because the gap between the two
             // has to look the same after `m/s` as after `km/h`.
             let unit_width = painter
-                .layout_no_wrap(unit.to_owned(), title_font, egui::Color32::WHITE)
+                .layout_no_wrap(unit.to_owned(), title_font, egui::Color32::PLACEHOLDER)
                 .rect
                 .width();
             draw_shadowed_text(
@@ -4693,3 +4729,7 @@ mod resolved_opacity_tests;
 #[path = "ui_map_pane/site_label_size_tests.rs"]
 #[cfg(test)]
 mod site_label_size_tests;
+
+#[path = "ui_map_pane/shadowed_text_tests.rs"]
+#[cfg(test)]
+mod shadowed_text_tests;
