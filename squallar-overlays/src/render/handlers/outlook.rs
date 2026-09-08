@@ -815,6 +815,49 @@ impl OverlayHandler for SpcOutlookHandler {
         // not on a data ID.
     }
 
+    /// **The in-force filter and the geo cull, asked before the raster is spent
+    /// instead of after.**
+    ///
+    /// [`Self::has_data`] is true when any enabled product holds a non-empty
+    /// issuance, which is a statement about the country and not about this
+    /// pane: a Day 1 outlook over the Plains made a pane on the Cascades
+    /// rasterize a whole picture to be told its extent was empty.
+    ///
+    /// **Through [`Self::in_force_in_paint_order`] and never
+    /// [`Self::features_in_paint_order`]**, which is the whole reason this
+    /// costs nothing: the former borrows each issuance, the latter deep-clones
+    /// every feature of every in-force product — polygons and both labels —
+    /// which is the allocation this refusal exists to avoid. Same walk,
+    /// same as-of filter ([`SpcOutlook::in_force_at`]) and same order as
+    /// [`Self::paint_input`], so the set tested is the set that would paint.
+    ///
+    /// **The hatch pass is why this is an argument and not an identity.**
+    /// [`rasterize::any_feature_paints_in`] is exactly what `draw_feature`
+    /// decides, so for a rasterizer whose only painter is `draw_feature` a
+    /// `false` here and an empty pixmap are one statement.
+    /// `rasterize_spc_outlooks` has a **second** painter,
+    /// `hatch::draw_hatch_pass`, which walks the features again and applies no
+    /// cull at all. The refusal is still sound, by this argument rather than by
+    /// the shared code: `OverlayFeature::geo_bounds` is computed by
+    /// `OverlayFeature::new` from the very polygons that pass projects, and a
+    /// box that misses the texture contains no point of the polygon it bounds —
+    /// so a feature this cull rejects cannot put a hatch line inside either.
+    /// **Re-check that if the hatch pass ever paints something not derived from
+    /// `feature.polygons`.**
+    fn paints_in(
+        &self,
+        bounds: &squallar_geo::GeoBounds,
+        ctx: &RasterizeContext,
+        pane: &PaneRef<'_>,
+    ) -> bool {
+        let view = self.view(pane);
+        rasterize::any_feature_paints_in(
+            self.in_force_in_paint_order(view, ctx.as_of)
+                .flat_map(|(_, outlook)| outlook.features.iter()),
+            bounds,
+        )
+    }
+
     /// **Built once per picture, not once per dispatch.** The input deep-clones
     /// every feature of every in-force product — polygons and both labels —
     /// and its terms are the combined generation and [`Self::paint_key`].
@@ -1052,6 +1095,133 @@ impl OverlayHandler for SpcOutlookHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The dispatch door's predicate agrees with what the rasterizer would
+    /// have painted**, on both sides — the twin of
+    /// `alert::tests::the_extent_predicate_agrees_with_what_the_rasterizer_paints`,
+    /// and it has one job that test does not.
+    ///
+    /// `SourceHandler::paints_in` refuses a raster and the refusal is delivered
+    /// as a blank, which is a *clear*. A `false` it gets wrong takes ink off the
+    /// glass, so the pin is the rasterizer's own answer over the same features
+    /// at the same bounds.
+    ///
+    /// **The far fixture is HATCHED on purpose.** `rasterize_spc_outlooks` runs
+    /// `hatch::draw_hatch_pass` after `draw_feature`, and that pass applies no
+    /// geo cull at all — so this layer's refusal is sound by an argument about
+    /// `OverlayFeature::geo_bounds` bounding the polygons the hatch pass
+    /// projects, not by the shared code that makes the alerts case an identity.
+    /// An unhatched fixture would leave that argument untested and the equality
+    /// would still read green.
+    ///
+    /// **Both arms are asserted absolutely as well as against each other**,
+    /// because the door and the rasterizer share one cull: a bug inside it makes
+    /// them AGREE, and only an absolute assertion sees that. The wrapped arm is
+    /// the same point on the longitude axis.
+    #[test]
+    fn the_extent_predicate_agrees_with_what_the_rasterizer_paints() {
+        use squallar_source::handler::SourceHandler;
+
+        let clock = chrono::NaiveDate::from_ymd_opt(2026, 9, 8)
+            .expect("a real date")
+            .and_hms_opt(19, 0, 0)
+            .expect("a real time");
+        let ctx = RasterizeContext {
+            is_dark: false,
+            zoom: 7.0,
+            device_scale: 1.0,
+            now: clock,
+            as_of: clock,
+            frame: None,
+        };
+        let pane = PaneRef::bare(0);
+
+        // Oklahoma, and Maine, and a viewport that has wrapped past the
+        // dateline expressed as -195..-165 with the feature at longitude 172.
+        let over = squallar_geo::GeoBounds {
+            min_lat: 34.0,
+            max_lat: 36.0,
+            min_lon: -98.5,
+            max_lon: -96.5,
+        };
+        let away = squallar_geo::GeoBounds {
+            min_lat: 44.0,
+            max_lat: 45.0,
+            min_lon: -70.0,
+            max_lon: -69.0,
+        };
+        let wrapped = squallar_geo::GeoBounds {
+            min_lat: 34.0,
+            max_lat: 36.0,
+            min_lon: -195.0,
+            max_lon: -165.0,
+        };
+
+        let painted = |h: &SpcOutlookHandler, bounds: &squallar_geo::GeoBounds| {
+            let input = h
+                .paint_input(&ctx, h.view(&pane))
+                .expect("the fixture holds one in-force issuance with a feature");
+            let out = crate::render::rasterize::rasterize_spc_outlooks(&input, bounds, 96, 48);
+            crate::render::rasterize::has_ink(&out.rgba)
+        };
+
+        let feature = |min_lon: f64, max_lon: f64, hatch| {
+            crate::types::OverlayFeature::new(
+                vec![vec![vec![
+                    (34.5, min_lon),
+                    (34.5, max_lon),
+                    (35.5, max_lon),
+                    (35.5, min_lon),
+                ]]],
+                [255, 0, 0, 128],
+                [0, 0, 0, 0],
+                "SLGT".into(),
+                String::new(),
+                hatch,
+            )
+        };
+        let with_feature = |f| {
+            let mut h = four_product_handler();
+            let mut o = outlook(OutlookProduct::Categorical);
+            o.features = vec![f];
+            land(&mut h, OutlookProduct::Categorical, Ok(o));
+            h
+        };
+        // Hatched, so the second painter is exercised by the far arm.
+        let handler = with_feature(feature(-98.0, -97.0, crate::types::HatchPattern::Cig2));
+        let handler_wrapped = with_feature(feature(170.0, 175.0, crate::types::HatchPattern::Cig2));
+
+        for (bounds, what) in [(over, "over the outlook"), (away, "far from it")] {
+            assert_eq!(
+                handler.paints_in(&bounds, &ctx, &pane),
+                painted(&handler, &bounds),
+                "the door and the rasterizer disagree {what}: a false refusal \
+                 clears a pane that should have ink, and a false admission \
+                 spends the raster this predicate exists to save",
+            );
+        }
+        assert!(
+            handler.paints_in(&over, &ctx, &pane),
+            "the near arm must admit, or every case here is false == false",
+        );
+        assert!(
+            !handler.paints_in(&away, &ctx, &pane),
+            "the far arm must refuse, or nothing separates this predicate from \
+             a constant — and the far fixture is hatched, so this is also what \
+             says the uncullled hatch pass painted nothing",
+        );
+
+        assert!(
+            painted(&handler_wrapped, &wrapped),
+            "precondition: the rasterizer must paint the wrapped fixture, or \
+             the door agreeing with it says nothing",
+        );
+        assert!(
+            handler_wrapped.paints_in(&wrapped, &ctx, &pane),
+            "a feature at longitude 172 was refused for a viewport covering it \
+             as -188: the cull compared longitudes in two different frames",
+        );
+    }
 
     #[test]
     fn the_master_toggle_restores_a_product_the_day_actually_publishes() {
