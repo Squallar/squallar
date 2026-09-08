@@ -99,11 +99,26 @@ fn grid_bytes(grid: &HrrrGridData) -> usize {
 ///
 /// At 7,620,564 bytes per CONUS grid the three arms buy:
 ///
-/// | target | budget | grids | pane cap |
-/// |---|---|---|---|
-/// | wasm32 | 96 MiB | 13 | 6 |
-/// | mobile | 192 MiB | 26 | 4 |
-/// | desktop | 512 MiB | 70 | 6 |
+/// | target | budget | grids | pane cap | spare |
+/// |---|---|---|---|---|
+/// | wasm32 | 64 MiB | 8 | 6 | 2 |
+/// | mobile | 64 MiB | 8 | 4 | 4 |
+/// | desktop | 96 MiB | 13 | 6 | 7 |
+///
+/// **The spare column is the whole of the scrub history**, and it is what
+/// these budgets are now sized for: the pinned set is one grid per enabled
+/// pane, and everything above it is hours a user stepped off and may step
+/// back onto. Before the loop frames were staged
+/// ([`MODEL_FRAME_STAGING_BYTES`]) this cache was also where a loop's frames
+/// lived, so the arms were 96/192/512 MiB — 13, 26 and 70 grids — and a
+/// 60-frame desktop loop really did fill 436.1 MiB of it. Nothing spends
+/// against loop length here any more, so the budget is the pane set plus a
+/// history, and the arms come down by 32, 128 and 416 MiB.
+///
+/// The figure is not only what the heap holds: `source_grid_budget_bytes`
+/// hands it to the admission door as what a pane enabling this layer asks the
+/// heap to be able to hold, so an over-large budget is priced against every
+/// other layer whether or not a grid ever arrives.
 ///
 /// **Never below the pane count.** Below it the budget stops being one: every
 /// pane's key is pinned, `ModelGridCache::insert` runs out of unpinned victims
@@ -123,9 +138,9 @@ fn grid_bytes(grid: &HrrrGridData) -> usize {
 /// exists to keep cut, and which today leaves this crate standing on exactly
 /// `{squallar-geo, squallar-source, squallar-units}`. It is also why the pane cap
 /// below is spelled and not imported from `squallar-egui`.
-pub const WASM_MODEL_GRID_BUDGET_BYTES: usize = 96 * 1024 * 1024;
-pub const MOBILE_MODEL_GRID_BUDGET_BYTES: usize = 192 * 1024 * 1024;
-pub const DESKTOP_MODEL_GRID_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+pub const WASM_MODEL_GRID_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+pub const MOBILE_MODEL_GRID_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+pub const DESKTOP_MODEL_GRID_BUDGET_BYTES: usize = 96 * 1024 * 1024;
 
 /// The pane cap the budget is measured against. Spelled, for the reason above;
 /// `squallar_device_profile::budget::MAX_PANES_DESKTOP` = 6 and
@@ -168,71 +183,26 @@ const _: () = {
     assert!(DESKTOP_MODEL_GRID_BUDGET_BYTES / HRRR_CONUS_GRID_BYTES >= MAX_PANES_DESKTOP);
 };
 
-/// **How many frames a model loop may hold — computed from the byte budget,
-/// never borrowed from the radar one.**
+/// **What one frame of a model loop passes through on its way to a texture.**
 ///
-/// `budget / HRRR_CONUS_GRID_BYTES` is everything the arm can hold at once.
-/// Every other pane still needs its own grid, so a looping pane gets that less
-/// `max_panes - 1`. Denominator throughout: one CONUS grid = 7,620,564 B =
-/// 7.268 MiB.
+/// One CONUS grid, on every arm, however many frames the loop holds — the
+/// same shape as [`crate::mrms::FRAME_STAGING_BYTES`] and
+/// [`super::gmgsi::FRAME_STAGING_BYTES`], and for the same reason: a loop
+/// frame's storage is its *texture*, held by the pane, and the grid is only
+/// what one frame is rasterized from. [`ModelDataHandler::frame_gate`]
+/// serialises the decodes, so this is what the layer holds rather than what
+/// it has in flight.
 ///
-/// **The collision this exists to prevent.**
-/// `squallar_device_profile::constants::WASM_MAX_LOOP_FRAMES` is 14. It is a cap
-/// on radar *textures*, sized against a pool this module does not spend from,
-/// and it is the obvious thing to reach for. Held as model grids those 14
-/// frames cost 14 × 7,620,564 = 106,687,896 B = **101.75 MiB against a 96 MiB
-/// pool — 6.0 % over, with zero grids left for any other pane.** The floor
-/// above does not catch it: one grid per pane and N grids in one pane are
-/// different questions, and it only asks the first. This overrun IS silent in
-/// the blanking way — a loop frame that is not the pane's current key is not
-/// pinned, so it is a victim like any other, and `prepare_job` then answers
-/// `None` and the pane goes on drawing its last texture.
-///
-/// | arm | budget | grids | reserved | this cap | after the caller's clamp |
-/// |---|---:|---:|---:|---:|---:|
-/// | wasm32 | 96 MiB | 13 | 5 | **8** | 8 — `WASM_MAX_LOOP_FRAMES` = 14 never binds |
-/// | mobile | 192 MiB | 26 | 3 | **23** | 20 — `MOBILE_MAX_LOOP_FRAMES` |
-/// | desktop | 512 MiB | 70 | 5 | **65** | 60 — `DESKTOP_MAX_LOOP_FRAMES` |
-///
-/// This function answers the middle column only. The clamp is the caller's,
-/// because the constants it clamps against live in `squallar-device-profile`,
-/// which this crate may not see — the reason is at
-/// [`WASM_MODEL_GRID_BUDGET_BYTES`]. `squallar-egui` sees both, so that is
-/// where the two are checked against each other:
-/// `the_model_loop_cap_covers_a_forecast_horizon_by_sampling`.
-///
-/// **What the clamped caps buy.** The loop covers a horizon by sampling with
-/// `squallar_egui::pane::listing_sample_indices` — existing machinery, and
-/// *not* a fixed stride. Handed more hours than it may hold it returns exactly
-/// the cap, anchored on both the first hour and the last, with the step
-/// alternating between the two integers around the ideal spacing:
-///
-/// | arm | clamped cap | 18 h (19 hours) | 48 h (49 hours) |
-/// |---|---:|---|---|
-/// | wasm | 8 | 8 frames, steps 2–3 h | 8 frames, steps 6–7 h |
-/// | mobile | 20 | all 19, step 1 h | 20 frames, steps 2–3 h |
-/// | desktop | 60 | all 19, step 1 h | all 49, step 1 h |
-///
-/// `the_model_loop_cap_leaves_a_grid_for_every_other_pane` holds the caps;
-/// the sampling table is held where the sampler lives, by
-/// `the_model_loop_cap_covers_a_forecast_horizon_by_sampling`.
-pub const fn model_loop_frame_cap(budget: usize, max_panes: usize) -> usize {
-    // Saturating on both sides. A zero-pane arm is not a thing, but a `pub
-    // const fn` that panics when handed one is worse than a cap of zero.
-    (budget / HRRR_CONUS_GRID_BYTES).saturating_sub(max_panes.saturating_sub(1))
-}
-
-/// **The loop floor, as a build failure.** An arm whose budget can no longer
-/// hold a four-frame loop beside a full pane layout has stopped being able to
-/// loop, and it stops in the same silent way: no frame arrives, the last
-/// texture stays on the glass. Four is where a loop stops reading as motion at
-/// all. Today the arms clear it by 2×, 5.75× and 16.25×, so this fires on a
-/// real regression rather than on rounding.
-const _: () = {
-    assert!(model_loop_frame_cap(WASM_MODEL_GRID_BUDGET_BYTES, MAX_PANES_DESKTOP) >= 4);
-    assert!(model_loop_frame_cap(MOBILE_MODEL_GRID_BUDGET_BYTES, MAX_PANES_MOBILE) >= 4);
-    assert!(model_loop_frame_cap(DESKTOP_MODEL_GRID_BUDGET_BYTES, MAX_PANES_DESKTOP) >= 4);
-};
+/// **This replaces `model_loop_frame_cap`**, which computed how many frames a
+/// model loop could hold against the grid budget — 8, 23 and 65 on the three
+/// arms. That function had no production caller: `layer_share` builds an
+/// overlay loop's frame list with `count_cap: None` and prices one frame at
+/// `overlay_frame_price`, which is the *texture*, so the 7.6 MB grid each
+/// frame pinned was in no bound the loop was ever built under. The question
+/// it answered is gone rather than re-sited — with a loop frame staged
+/// through one grid, how many frames a loop holds no longer bears on the grid
+/// budget at all.
+pub const MODEL_FRAME_STAGING_BYTES: usize = HRRR_CONUS_GRID_BYTES;
 
 // The device class, spelled as its rule rather than as the `mobile` cfg:
 // cargo scopes a build script's cfgs to the crate that declares it, so
@@ -400,9 +370,31 @@ impl ModelGridCache {
         self.entries.len()
     }
 
-    #[cfg(test)]
+    /// Whether `key` is resident, **without** marking it used — the
+    /// non-touching twin of [`Self::contains`], for
+    /// [`ModelFrameCache::is_staged`]'s reason: `fetch_frame` asking "must
+    /// this be fetched" is not a look at a picture, and answering it through
+    /// the touching accessor would let the dispatcher's walk reorder the
+    /// eviction queue behind the pane on the glass.
     fn is_resident(&self, key: GridKey) -> bool {
         self.entries.contains_key(&key)
+    }
+
+    /// **Drop every resident grid**, answering whether any were held.
+    ///
+    /// The pin set is not consulted, and that is the point rather than an
+    /// oversight: the one caller is [`ModelDataHandler::release_data`], which
+    /// runs only for a layer **no pane draws**, so there is nothing on the
+    /// glass for a pin to protect. `pinned_keys` already skips a disabled
+    /// pane, so on this path it answers empty anyway.
+    fn release_all(&mut self) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        self.entries.clear();
+        self.recency.borrow_mut().clear();
+        self.bytes = 0;
+        true
     }
 
     /// The eviction order, projected to parameters: the suite that asks about
@@ -411,6 +403,161 @@ impl ModelGridCache {
     #[cfg(test)]
     fn recency_params(&self) -> Vec<ModelParameter> {
         self.recency.borrow().iter().map(|k| k.param).collect()
+    }
+}
+
+/// **One frame's grid at a time, application-wide** — the same gate MRMS and
+/// GMGSI hold their loop-frame decodes behind, and needed here for the same
+/// reason: `dispatch_loop_frame_fetches` has no throttle of its own, so a
+/// forecast loop puts its whole render set on the wire at once. Forty-nine
+/// unthrottled decodes — f00 to f48 of one run — would hold 373.4 MB of
+/// decoded grid in flight before any cache saw a byte, which is the figure
+/// this whole item exists to remove.
+///
+/// Serialising costs almost no wall time: the bytes are the bottleneck either
+/// way, and FIFO fairness means grids arrive in render-set order, which is
+/// playhead outward.
+type FrameGate = Arc<futures::lock::Mutex<()>>;
+
+/// The staged loop-frame grids, bounded by **bytes** and evicted
+/// least-recently-used first.
+///
+/// Deliberately **not** [`ModelGridCache`], for the reason
+/// [`super::mrms::MrmsFrameCache`] is not that layer's live cache: this holds
+/// what one loop frame is passing through on its way to a texture, and the
+/// live cache holds what the panes are showing. Two stores, two purposes, two
+/// budgets — and the live one is bounded by the pane set rather than by how
+/// long a loop is.
+///
+/// **The same key space as the live cache**, which the mosaic layers cannot
+/// have: MRMS keys its live cache by product and its frame cache by
+/// `(product, stamp)`, so it must invent a second key. A model grid is
+/// `(param, run, hour)` whether a pane parked on it or a loop asked for it,
+/// so [`GridKey`] serves both — and that is what lets the readers below check
+/// one store and then the other rather than choosing between them.
+struct ModelFrameCache {
+    entries: HashMap<GridKey, Arc<HrrrGridData>>,
+    recency: RefCell<Vec<GridKey>>,
+    /// Sum of [`grid_bytes`] over `entries`, maintained rather than
+    /// recomputed — see [`ModelGridCache::bytes`].
+    bytes: usize,
+    /// The ceiling `bytes` is held under. A field and not the constant so a
+    /// test can state a budget in whole grids of its own fixture size — the
+    /// production value is [`MODEL_FRAME_STAGING_BYTES`].
+    budget: usize,
+}
+
+impl ModelFrameCache {
+    fn new() -> Self {
+        Self::with_budget(MODEL_FRAME_STAGING_BYTES)
+    }
+
+    fn with_budget(budget: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            recency: RefCell::new(Vec::new()),
+            bytes: 0,
+            budget,
+        }
+    }
+
+    fn touch(&self, key: GridKey) {
+        let mut recency = self.recency.borrow_mut();
+        if let Some(pos) = recency.iter().position(|k| *k == key) {
+            recency.remove(pos);
+            recency.push(key);
+        }
+    }
+
+    fn get(&self, key: GridKey) -> Option<&Arc<HrrrGridData>> {
+        let grid = self.entries.get(&key)?;
+        self.touch(key);
+        Some(grid)
+    }
+
+    /// Whether `key` is staged, **without** marking it used.
+    ///
+    /// The opposite choice to [`ModelGridCache::contains`], and the difference
+    /// is what each question is for: there, a bare predicate is still a look
+    /// at a picture, so it counts as a use. Here every caller is asking "must
+    /// this frame be fetched" — `fetch_frame`'s early-out and
+    /// `frames_resident`'s walk — and answering it through the touching
+    /// accessor would let the frame the dispatcher happened to ask about last
+    /// outlive the one it is about to rasterize.
+    fn is_staged(&self, key: GridKey) -> bool {
+        self.entries.contains_key(&key)
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Whether one of the staged entries **is this very allocation** — the
+    /// accounting question, answered on pointer identity for the reason at
+    /// [`ModelGridCache::holds`].
+    fn holds(&self, grid: &Arc<HrrrGridData>) -> bool {
+        self.entries.values().any(|g| Arc::ptr_eq(g, grid))
+    }
+
+    /// Stage `key`'s grid, evicting least-recently-used until the budget is
+    /// met.
+    ///
+    /// **Nothing is pinned here**, unlike the live cache. A staged grid that
+    /// is evicted before its frame was rasterized is not a blank pane: the
+    /// frame keeps no picture, `frames_resident` stops naming it, and
+    /// `refetch_owed_loop_frames` asks for it again on the next pass. That
+    /// supply is the app-side half of this design and it already exists — it
+    /// is what carries MRMS and GMGSI, whose staging area is one granule too.
+    ///
+    /// The arrival is never its own victim, so a budget smaller than one grid
+    /// stages one anyway rather than staging nothing.
+    fn insert(&mut self, key: GridKey, grid: Arc<HrrrGridData>) {
+        let cost = grid_bytes(&grid);
+        match self.entries.insert(key, grid) {
+            Some(old) => {
+                self.bytes = self.bytes - grid_bytes(&old) + cost;
+                self.touch(key);
+            }
+            None => {
+                self.bytes += cost;
+                self.recency.borrow_mut().push(key);
+            }
+        }
+        while self.bytes > self.budget {
+            let victim = {
+                let mut recency = self.recency.borrow_mut();
+                let Some(pos) = recency.iter().position(|k| *k != key) else {
+                    break;
+                };
+                recency.remove(pos)
+            };
+            if let Some(grid) = self.entries.remove(&victim) {
+                self.bytes -= grid_bytes(&grid);
+            }
+        }
+    }
+
+    /// Drop every staged grid `keep` does not name, answering whether
+    /// anything went.
+    fn retain(&mut self, keep: impl Fn(GridKey) -> bool) -> bool {
+        let doomed: Vec<GridKey> = self
+            .entries
+            .keys()
+            .copied()
+            .filter(|key| !keep(*key))
+            .collect();
+        for key in &doomed {
+            if let Some(grid) = self.entries.remove(key) {
+                self.bytes -= grid_bytes(&grid);
+            }
+        }
+        self.recency.borrow_mut().retain(|key| keep(*key));
+        !doomed.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -732,6 +879,13 @@ pub(crate) struct ModelDataHandler {
     /// answer prefers [`PaneRef::state`] when there is one.
     pub defaults: ModelPaneState,
     cached_grids: ModelGridCache,
+    /// **The loop's staging area**: one frame's grid at a time, whatever the
+    /// loop's length. Separate from `cached_grids` so a loop cannot spend the
+    /// pane set's budget — see [`MODEL_FRAME_STAGING_BYTES`].
+    frame_grids: ModelFrameCache,
+    /// Serialises the frame decodes that fill `frame_grids`; see
+    /// [`FrameGate`].
+    frame_gate: FrameGate,
     /// The run times an **analysis** listing named, filed under the scope it
     /// was dispatched for. A `Forecast` scope never appears here: its frames
     /// are a closed form of the run.
@@ -753,6 +907,8 @@ impl ModelDataHandler {
             state: OverlayState::new(),
             defaults: ModelPaneState::new(false),
             cached_grids: ModelGridCache::new(),
+            frame_grids: ModelFrameCache::new(),
+            frame_gate: FrameGate::default(),
             frame_listings: HashMap::new(),
             covered: HashMap::new(),
             last_error: None,
@@ -988,36 +1144,57 @@ impl FrameSource for ModelDataHandler {
         chrono::Duration::hours(i64::from(forecast_horizon(run)))
     }
 
-    /// **The frames this pane is holding**: every resident grid of its own
-    /// parameter that sits on its own axis — one run's forecast hours, or the
-    /// analysis hour of many runs. `valid` is the grid's valid time and `run`
+    /// **The frames this pane is holding**: every grid of its own parameter,
+    /// on its own axis, in **either** store — the one staged frame and the
+    /// pane set's live pictures. `valid` is the grid's valid time and `run`
     /// its reference time.
     ///
-    /// This pane's scope and not the cache's whole contents: the other
-    /// resident grids belong to other panes' parameters and runs, and pooling
-    /// them here would offer this pane frames it cannot draw.
+    /// This pane's scope and not the stores' whole contents: the other grids
+    /// belong to other panes' parameters and runs, and pooling them here would
+    /// offer this pane frames it cannot draw.
+    ///
+    /// **Both stores, and that is the one place this layer does better than
+    /// the mosaics it copies.** MRMS keys its live cache by product and its
+    /// frame cache by `(product, stamp)`, so it cannot ask its live cache
+    /// whether it is already holding a loop frame's granule, and re-fetches
+    /// one it has. A model grid has one identity either side of the seam, so
+    /// the pane's own parked hour — which is also a frame of its loop — is
+    /// named here, `prepare_job` draws it from wherever it sits, and no round
+    /// trip is spent on a grid the process is already holding.
+    ///
+    /// Neither walk goes through a touching accessor: which frames the
+    /// dispatcher asked about is not a fact about what the user is looking
+    /// at, and reordering either eviction queue behind this would age out the
+    /// grid on the glass.
     fn frames_resident(&self, pane: &PaneRef<'_>) -> Vec<FrameStamp> {
         let view = self.view(pane);
         let Some(scope) = self.scope_of(view) else {
             return Vec::new();
         };
+        let in_scope = |key: &GridKey| {
+            key.param == scope.param
+                && match scope.axis {
+                    ModelAxis::Forecast => key.run == scope.run,
+                    ModelAxis::Analysis => key.f_hour == scope.param.min_forecast_hour(),
+                }
+        };
         let mut frames: Vec<FrameStamp> = self
-            .cached_grids
+            .frame_grids
             .entries
-            .iter()
-            .filter(|(key, _)| {
-                key.param == scope.param
-                    && match scope.axis {
-                        ModelAxis::Forecast => key.run == scope.run,
-                        ModelAxis::Analysis => key.f_hour == scope.param.min_forecast_hour(),
-                    }
-            })
-            .map(|(_, grid)| FrameStamp {
-                valid: grid.valid_time(),
-                run: Some(grid.ref_time),
+            .keys()
+            .chain(self.cached_grids.entries.keys())
+            .filter(|key| in_scope(key))
+            .map(|key| FrameStamp {
+                // The same arithmetic as `HrrrGridData::valid_time`, which is
+                // the inverse of `frame_target`'s. Read off the key rather
+                // than the grid so one stamp cannot be minted two ways when a
+                // key is in both stores.
+                valid: key.run + chrono::Duration::hours(i64::from(key.f_hour)),
+                run: Some(key.run),
             })
             .collect();
         frames.sort_by_key(|stamp| stamp.valid);
+        frames.dedup();
         frames
     }
 
@@ -1178,13 +1355,25 @@ impl FrameSource for ModelDataHandler {
     ) -> Option<FetchTask> {
         let view = self.view(pane);
         let key = self.frame_target(view, stamp)?;
+        // **Already held, either side of the seam.** The staged grid is the
+        // ordinary case; the live cache answers for a frame the pane is
+        // itself parked on, which `frames_resident` also names, so the two
+        // agree about which frames are owed a round trip.
+        if self.frame_grids.is_staged(key) || self.cached_grids.is_resident(key) {
+            return None;
+        }
         let client = ctx.client.clone();
         let sources = ctx.sources.clone();
+        let gate = Arc::clone(&self.frame_gate);
         let GridKey { param, run, f_hour } = key;
         let run_pair = (run.date(), run.hour() as u8);
         Some(FetchTask {
             kind: known::MODEL_DATA,
             future: Box::pin(async move {
+                // Held across the fetch as well as the decode, so the peak is
+                // one grid rather than one per concurrent request. The bytes
+                // are the bottleneck either way; see [`FrameGate`].
+                let _one_at_a_time = gate.lock().await;
                 let result = if param.is_composite() {
                     crate::hrrr::fetch::fetch_composite_hrrr_data(
                         &client, &sources, &param, run_pair, f_hour,
@@ -1249,11 +1438,15 @@ impl FrameSource for ModelDataHandler {
         }
     }
 
-    /// Install one frame's grid under the key its fetch was dispatched for.
+    /// **Stage** one frame's grid under the key its fetch was dispatched for.
+    ///
+    /// Into [`ModelFrameCache`] and not the live cache, which is the whole of
+    /// this item: a loop frame is passing through on its way to a texture, and
+    /// the pane set's budget is not what pays for it.
     ///
     /// The key comes back on the payload rather than being recomputed from
     /// `stamp` and the pane, for the same reason the listing's scope does.
-    fn apply_frame(&mut self, _stamp: FrameStamp, data: FetchPayload, pane: &PaneRef<'_>) {
+    fn apply_frame(&mut self, _stamp: FrameStamp, data: FetchPayload, _pane: &PaneRef<'_>) {
         let Ok(frame) = data.downcast::<ModelFrameFetch>() else {
             log::error!("a frame reached the model layer under another layer's payload");
             return;
@@ -1261,14 +1454,39 @@ impl FrameSource for ModelDataHandler {
         let Some(grid) = frame.grid else {
             return;
         };
-        let pinned = self.pinned_keys(pane);
-        self.cached_grids.insert(frame.key, Arc::new(grid), &pinned);
+        self.frame_grids.insert(frame.key, Arc::new(grid));
     }
 
-    /// A no-op: this layer's residency is the grid cache's business
-    /// ([`MODEL_GRID_BUDGET_BYTES`], evicting by use under a byte budget), and
-    /// a second eviction authority would fight it.
-    fn retain_frames(&mut self, _pane: &PaneRef<'_>, _keep: &[FrameStamp]) {}
+    /// Drop every staged grid this pane's `keep` does not name.
+    ///
+    /// **Only the staging area.** The live cache holds what the panes are
+    /// showing and is evicted by its own byte budget; a second authority over
+    /// it would fight that, which is what the no-op this replaces was written
+    /// to avoid. Over the staging area there is no such conflict — nothing
+    /// there is pinned, and its budget is one grid.
+    ///
+    /// Matched on the stamp as this layer names it: `valid` **and** `run`,
+    /// because on the analysis axis two runs produce the same forecast hour
+    /// and on the forecast axis the run is what tells a frame from the
+    /// analysis of the hour it depicts. A stamp with no run keeps nothing,
+    /// which is correct — this layer names no such stamp.
+    ///
+    /// **Nothing above calls this yet** (the production frame-eviction
+    /// authority is still each layer's own budget), so it is exercised by this
+    /// layer's own suite rather than by the loop — the same position MRMS's is
+    /// in.
+    fn retain_frames(&mut self, pane: &PaneRef<'_>, keep: &[FrameStamp]) {
+        let Some(scope) = self.scope_of(self.view(pane)) else {
+            return;
+        };
+        self.frame_grids.retain(|key| {
+            key.param != scope.param
+                || keep.iter().any(|stamp| {
+                    stamp.run == Some(key.run)
+                        && stamp.valid == key.run + chrono::Duration::hours(i64::from(key.f_hour))
+                })
+        });
+    }
 }
 
 impl OverlayHandler for ModelDataHandler {
@@ -1599,9 +1817,19 @@ impl OverlayHandler for ModelDataHandler {
     /// unlabelled, as another's.
     fn prepare_job(&self, ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
         let grid = match ctx.frame {
-            Some(stamp) => self
-                .cached_grids
-                .get(self.frame_target(self.view(pane), &stamp)?)?,
+            Some(stamp) => {
+                let key = self.frame_target(self.view(pane), &stamp)?;
+                // **The staging area first, then the live cache** — one key
+                // space, two stores, and a named frame is drawn from whichever
+                // holds it. The second arm is not a fallback to another
+                // instant's picture: it is the same `GridKey`, so the grid it
+                // finds depicts exactly the stamp that was asked for. It is
+                // what lets a pane parked on an hour its own loop also names
+                // rasterize that frame without a round trip.
+                self.frame_grids
+                    .get(key)
+                    .or_else(|| self.cached_grids.get(key))?
+            }
             None => self.grid_of(pane)?,
         }
         .clone();
@@ -1989,28 +2217,75 @@ impl OverlayHandler for ModelDataHandler {
         out
     }
 
-    /// **One block**: the byte-budgeted grid cache, which is where this
-    /// layer's live pictures and its loop frames both live — a frame is a
-    /// `(param, run, hour)` key beside the others, not a second store.
+    /// **Two blocks**: the byte-budgeted live grid cache, which holds what the
+    /// panes are showing, and the one-grid staging area a loop's frames pass
+    /// through ([`MODEL_FRAME_STAGING_BYTES`]).
     ///
-    /// The figure is [`ModelGridCache::bytes`], maintained on every insert and
-    /// eviction, so this is a field read whatever the resident set — which
-    /// matters here more than for the mosaic layers: a desktop budget of
-    /// 512 MiB is seventy 7.6 MB grids, and a per-call walk of seventy entries
-    /// would be the only figure on the census that scaled with the scene.
+    /// Until the loop frames were staged there was one block, because a frame
+    /// was a `(param, run, hour)` key beside the live pictures in the same
+    /// store — which is what let a 60-frame desktop loop hold 436.1 MiB of
+    /// decoded grid under a figure nothing gated on.
+    ///
+    /// Both figures are maintained fields, so this is two reads whatever the
+    /// resident set — which matters more here than for the mosaic layers: a
+    /// per-call walk of the entries would be the only figure on the census
+    /// that scaled with the scene.
     ///
     /// **What is included beyond the values**: each entry's coordinate axes
     /// and the struct itself, exactly as [`grid_bytes`] prices them for the
     /// budget. **Excluded**: the pane's own carry (`state.data`), which is the
-    /// same allocation as its cache entry and is added only when the cache has
-    /// already let go of it; and the rasters and textures made from these
+    /// same allocation as its cache entry and is added only when *neither*
+    /// store still holds it; and the rasters and textures made from these
     /// grids, which belong to the overlay picture family and the GPU.
     fn resident_source_bytes(&self) -> u64 {
         let carried = match &self.state.data {
-            Some(grid) if !self.cached_grids.holds(grid) => grid_bytes(grid),
+            Some(grid) if !self.cached_grids.holds(grid) && !self.frame_grids.holds(grid) => {
+                grid_bytes(grid)
+            }
             _ => 0,
         };
-        (self.cached_grids.resident_bytes() + carried) as u64
+        (self.cached_grids.resident_bytes() + self.frame_grids.resident_bytes() + carried) as u64
+    }
+
+    /// **Let go of every decoded grid**, live cache and staging area both.
+    ///
+    /// Called once a frame by `Gui::release_data_of_layers_no_pane_draws` for
+    /// every layer no pane draws. Until this existed the model layer answered
+    /// the trait default `false` and released nothing, and that was the more
+    /// serious half of this item rather than an omission beside it: the only
+    /// route out of [`ModelGridCache`] is the eviction loop inside its own
+    /// `insert`, and inserts stop when the layer is switched off. Every trim
+    /// ran on an arrival, arrivals stop with the layer, so a model layer
+    /// toggled off held its grids **for the life of the process** — up to the
+    /// whole budget, which was 512 MiB on desktop.
+    ///
+    /// **More than MRMS and GMGSI release, deliberately.** Theirs give up only
+    /// their staging pool and keep their grid caches, calling the cache a
+    /// larger change that "trades a refetch on the way back". The trade is the
+    /// same here and the arithmetic is not: their caches are bounded at 98 MB
+    /// and 49 MB by a product count, and this one is the largest host-byte
+    /// family the crate has. A refetch is latency, which the campaign's
+    /// latitude covers; half a gigabyte held for a session by a layer nobody
+    /// is looking at is not.
+    ///
+    /// **The way back is covered on both routes.** `OverlayState::release_data`
+    /// clears the poll clock and bumps the generation, so the toggle asks
+    /// `enable_should_refetch` — true on no data — and a layer that becomes
+    /// visible some other way reads as due now. The pane's parked
+    /// `(run, hour)` is untouched, so what comes back is the frame it left on.
+    ///
+    /// Answers whether anything went, so a caller asking every frame does not
+    /// bump a generation — and invalidate every cache keyed on it — on a layer
+    /// that is already empty.
+    fn release_data(&mut self) -> bool {
+        // `|_| false` keeps nothing; `retain` answers whether it dropped
+        // anything, and both stores are asked before the `||` short-circuits
+        // — a `let` apiece rather than an inline disjunction, which would
+        // leave the staging area full whenever the live cache was not.
+        let staged = self.frame_grids.retain(|_| false);
+        let live = self.cached_grids.release_all();
+        let carried = self.state.release_data();
+        staged || live || carried
     }
 }
 
@@ -2459,11 +2734,27 @@ mod tests {
         CACHE_ENTRIES * grid_bytes(&grid(ModelParameter::all()[0], vec![300.0]))
     }
 
-    /// A handler whose cache holds exactly [`CACHE_ENTRIES`] fixture grids.
+    /// A handler whose live cache holds exactly [`CACHE_ENTRIES`] fixture
+    /// grids and whose staging area holds exactly **one** — the shipped
+    /// proportion, at the fixture's scale.
+    ///
+    /// The staging budget has to be scaled too, and that is not housekeeping:
+    /// it is spelled in *bytes* ([`MODEL_FRAME_STAGING_BYTES`] is one CONUS
+    /// grid), so against one-point fixtures the shipped figure holds hundreds
+    /// of them and every "the loop stages one frame" assertion passes on a
+    /// store that was simply never full. Measured while writing this: 48
+    /// fixture frames resident under the production budget.
     fn new_handler() -> ModelDataHandler {
         let mut h = ModelDataHandler::new();
         h.cached_grids = ModelGridCache::with_budget(test_budget());
+        h.frame_grids = ModelFrameCache::with_budget(one_fixture_grid());
         h
+    }
+
+    /// What [`grid_bytes`] charges for one fixture grid — the staging budget's
+    /// denominator, read out of the function rather than restated.
+    fn one_fixture_grid() -> usize {
+        grid_bytes(&grid(ModelParameter::all()[0], vec![300.0]))
     }
 
     /// The key a fixture grid of `param` files itself under: the fixture run,
@@ -3109,117 +3400,186 @@ mod tests {
                 MOBILE_MODEL_GRID_BUDGET_BYTES / HRRR_CONUS_GRID_BYTES,
                 DESKTOP_MODEL_GRID_BUDGET_BYTES / HRRR_CONUS_GRID_BYTES,
             ),
-            (13, 26, 70),
+            (8, 8, 13),
             "the figures the module doc states",
         );
     }
 
-    /// **A looping pane leaves a grid for every other pane.**
+    /// **A loop's frames cost the live cache nothing, however long the loop
+    /// is** — the property that replaced `model_loop_frame_cap`.
     ///
-    /// The sibling above asks whether every pane gets *one* grid. A loop makes
-    /// that a different question — whether one pane may hold N grids while the
-    /// others still get theirs — and the two do not imply each other. The wasm
-    /// arm passes the sibling and, at the radar loop cap it would otherwise
-    /// borrow, fails this one by 6.0 % with nothing left over at all.
+    /// The deleted test here asked what that function computed: how many
+    /// frames a loop could hold against the grid budget, 8/23/65 on the three
+    /// arms. It could not go red on the thing that was actually wrong, because
+    /// the function had **no production caller** — `layer_share` builds an
+    /// overlay loop's list with `count_cap: None` and prices a frame at
+    /// `overlay_frame_price`, the texture — so the grid each frame pinned was
+    /// in no bound at all and the real ceiling was the budget itself.
     ///
-    /// Every figure names its denominator: one CONUS grid is
-    /// [`HRRR_CONUS_GRID_BYTES`] = 7,620,564 B = 7.268 MiB, which the sibling
-    /// proves is what [`grid_bytes`] really charges rather than assuming it.
+    /// So the question is inverted: rather than pinning a cap nothing applied,
+    /// pin that the live cache is **independent of loop length**. Denominator:
+    /// one CONUS grid is [`HRRR_CONUS_GRID_BYTES`] = 7,620,564 B = 7.268 MiB,
+    /// which `the_byte_budget_holds_at_least_one_grid_per_pane` proves is what
+    /// [`grid_bytes`] really charges rather than assuming it.
+    ///
+    /// **Floor — route `apply_frame` back at `cached_grids`:** the live cache
+    /// grows one entry per frame and the first assertion fails naming the
+    /// count it got. Tampered both ways: with the staging budget raised to
+    /// hold every frame, the *staging* assertion still holds it to one grid's
+    /// worth of bytes, which is the conjunct that would otherwise pass on a
+    /// cache that simply had room.
     #[test]
-    fn the_model_loop_cap_leaves_a_grid_for_every_other_pane() {
-        const GRID: usize = HRRR_CONUS_GRID_BYTES;
-        // The radar *texture* cap, spelled and not imported for the reason at
-        // [`WASM_MODEL_GRID_BUDGET_BYTES`]; the definition is
-        // `squallar_device_profile::constants::WASM_MAX_LOOP_FRAMES`, and
-        // `the_model_loop_cap_covers_a_forecast_horizon_by_sampling` is what
-        // stops this spelling from drifting away from it.
-        const BORROWED_RADAR_CAP: usize = 14;
+    fn a_loop_of_any_length_leaves_the_live_cache_alone() {
+        let param = ModelParameter::SurfaceBasedCape;
+        let run = run_time();
+        let mut h = new_handler();
+        h.defaults.enabled = true;
+        h.defaults.selected_param = param;
+        h.defaults.axis = ModelAxis::Forecast;
+        h.defaults.selected_frame = Some((run, 0));
+        // The pane's own picture, in the live cache where it belongs.
+        h.cached_grids.insert(
+            GridKey {
+                param,
+                run,
+                f_hour: 0,
+            },
+            Arc::new(valued_grid_at_hour(param, 0, 1.0)),
+            &[],
+        );
+        let live_before = h.cached_grids.len();
+        let bytes_before = h.cached_grids.resident_bytes();
 
-        // The defect, stated as arithmetic. Borrowing the radar cap overruns
-        // the wasm model pool outright, before a single other pane is served,
-        // and it overruns silently. Every term is a constant, so this is
-        // checked at build time — a runtime assert would be a weaker check of
-        // exactly the same thing.
-        const {
-            assert!(
-                BORROWED_RADAR_CAP * GRID > WASM_MODEL_GRID_BUDGET_BYTES,
-                "14 radar loop frames held as CONUS model grids cost \
-                 14 × 7,620,564 = 106,687,896 B = 101.75 MiB against a 96 MiB \
-                 wasm model pool. If that now fits, the reason \
-                 `model_loop_frame_cap` is computed rather than borrowed has \
-                 gone away.",
+        // A whole 48-hour forecast loop, f01 through f48 — every frame the
+        // longest HRRR cycle publishes, delivered the way the loop delivers
+        // them.
+        for f_hour in 1..=48u8 {
+            h.apply_frame(
+                FrameStamp {
+                    valid: run + chrono::Duration::hours(i64::from(f_hour)),
+                    run: Some(run),
+                },
+                Box::new(ModelFrameFetch {
+                    key: GridKey { param, run, f_hour },
+                    grid: Some(valued_grid_at_hour(param, f_hour, f32::from(f_hour))),
+                }),
+                &PaneRef::bare(0),
             );
         }
 
-        for (name, budget, panes, expect) in [
-            (
-                "wasm32",
-                WASM_MODEL_GRID_BUDGET_BYTES,
-                MAX_PANES_DESKTOP,
-                8usize,
-            ),
-            (
-                "mobile",
-                MOBILE_MODEL_GRID_BUDGET_BYTES,
-                MAX_PANES_MOBILE,
-                23,
-            ),
-            (
-                "desktop",
-                DESKTOP_MODEL_GRID_BUDGET_BYTES,
-                MAX_PANES_DESKTOP,
-                65,
-            ),
-        ] {
-            let grids = budget / GRID;
-            let cap = model_loop_frame_cap(budget, panes);
-            assert_eq!(
-                cap,
-                expect,
-                "{name}: {budget} B / {GRID} B per CONUS grid = {grids} grids, \
-                 less {} reserved for the other {} of {panes} panes, is a loop \
-                 cap of {} — not the {expect} the module doc states",
-                panes - 1,
-                panes - 1,
-                cap,
-            );
-            // The reservation is the whole point: the loop plus one grid for
-            // every pane that is not looping is exactly what the arm holds.
-            assert_eq!(
-                cap + (panes - 1),
-                grids,
-                "{name}: a loop of {cap} beside {} single-grid panes is {} \
-                 grids, but the arm holds {grids} ({budget} B / {GRID} B)",
-                panes - 1,
-                cap + (panes - 1),
-            );
-            assert!(
-                cap * GRID <= budget,
-                "{name}: {cap} frames × {GRID} B = {} B against a {budget} B \
-                 pool. Over the pool `prepare_job` answers None and the pane \
-                 goes on drawing its last texture with nothing to re-ask.",
-                cap * GRID,
-            );
-        }
+        assert_eq!(
+            (h.cached_grids.len(), h.cached_grids.resident_bytes()),
+            (live_before, bytes_before),
+            "forty-eight loop frames moved the LIVE cache. That is the defect \
+             this item removed: a frame was a `(param, run, hour)` key beside \
+             the pane's own pictures, so a 60-frame desktop loop held \
+             60 x 7,620,780 = 436.1 MiB of decoded grid in a store budgeted \
+             for the pane set.",
+        );
+        assert_eq!(
+            h.frame_grids.len(),
+            1,
+            "the staging area holds more than the one frame it stages",
+        );
+        assert!(
+            h.frame_grids.resident_bytes() <= one_fixture_grid(),
+            "the staging area is over one grid's worth at {} bytes against a \
+             budget of {}, so the figure is bounded by the frame count after \
+             all",
+            h.frame_grids.resident_bytes(),
+            one_fixture_grid(),
+        );
+    }
 
-        // Non-triviality: an implementation that returns a constant, or one
-        // that ignores its `max_panes`, has to disagree with one of these.
-        let (wasm, mobile, desktop) = (
-            model_loop_frame_cap(WASM_MODEL_GRID_BUDGET_BYTES, MAX_PANES_DESKTOP),
-            model_loop_frame_cap(MOBILE_MODEL_GRID_BUDGET_BYTES, MAX_PANES_MOBILE),
-            model_loop_frame_cap(DESKTOP_MODEL_GRID_BUDGET_BYTES, MAX_PANES_DESKTOP),
+    /// **A layer no pane draws gives back every decoded grid, and says so
+    /// once.**
+    ///
+    /// Before this the model layer had no `release_data` at all and took the
+    /// trait default `false`. That was not a gap beside the loop-frame item
+    /// but the more serious half of it: the only route out of
+    /// [`ModelGridCache`] is the eviction loop inside its own `insert`, and
+    /// inserts stop when the layer is switched off — so every trim ran on an
+    /// arrival, arrivals stop with the layer, and a model layer toggled off
+    /// held its grids for the life of the process. Up to the whole budget,
+    /// which was 512 MiB on desktop when this was written.
+    ///
+    /// **Both stores and the carry**, which is why the first assertion is a
+    /// byte figure and not a pair of `is_empty()`s:
+    /// [`OverlayHandler::resident_source_bytes`] is the sum the census reads,
+    /// so it is the thing that has to reach zero.
+    ///
+    /// **Answering `false` on the second call is a contract, not an
+    /// optimisation.** `Gui::release_data_of_layers_no_pane_draws` asks every
+    /// layer no pane draws once a *frame*; a handler that answered `true` on
+    /// an empty store would bump its generation sixty times a second and
+    /// invalidate every cache keyed on it.
+    ///
+    /// **The way back is a refetch of the frame the pane was left on**, which
+    /// is the cost this trades for the bytes and is inside the campaign's
+    /// latitude — latency, not a lost affordance. So the pane's parked
+    /// `(run, hour)` must survive: releasing it would silently move the user
+    /// to `Latest`, which is a changed picture rather than a slower one.
+    ///
+    /// **Floor — return the trait default `false` and release nothing:** the
+    /// first assertion fails naming the bytes still held. Each conjunct
+    /// tampered on its own; the second-call conjunct needs its own tamper
+    /// (`release_all` answering `true` unconditionally), because a handler
+    /// that really did release everything passes the first three regardless.
+    #[test]
+    fn a_layer_no_pane_draws_gives_back_every_grid_and_says_so_once() {
+        let param = ModelParameter::SurfaceBasedCape;
+        let run = run_time();
+        let mut h = seeded(param, 0);
+        h.defaults.selected_frame = Some((run, 0));
+        // A staged loop frame beside the live picture, so both stores are
+        // non-empty when the layer goes off.
+        h.apply_frame(
+            FrameStamp {
+                valid: run + chrono::Duration::hours(6),
+                run: Some(run),
+            },
+            Box::new(ModelFrameFetch {
+                key: GridKey {
+                    param,
+                    run,
+                    f_hour: 6,
+                },
+                grid: Some(valued_grid_at_hour(param, 6, 6.0)),
+            }),
+            &PaneRef::bare(0),
         );
         assert!(
-            wasm < mobile && mobile < desktop,
-            "the three arms must not agree, or a constant-returning cap would \
-             pass: got wasm {wasm}, mobile {mobile}, desktop {desktop}",
+            h.cached_grids.len() > 0 && h.frame_grids.len() > 0,
+            "premise: both stores hold something before the release",
+        );
+        let parked = h.defaults.selected_frame;
+
+        assert!(h.release_data(), "there was something to release");
+
+        assert_eq!(
+            h.resident_source_bytes(),
+            0,
+            "a layer nobody draws is still holding decoded grid. The only \
+             other route out of the live cache is an arriving insert, and \
+             arrivals stop when the layer is off — so what is left here is \
+             held for the life of the process.",
+        );
+        assert_eq!(
+            (h.cached_grids.len(), h.frame_grids.len()),
+            (0, 0),
+            "one of the two stores survived the release",
+        );
+        assert_eq!(
+            h.defaults.selected_frame, parked,
+            "the release moved the pane off the frame it was parked on. The \
+             way back is a refetch of THAT frame; dropping the selection \
+             makes it a different picture instead of a slower one.",
         );
         assert!(
-            wasm < WASM_MODEL_GRID_BUDGET_BYTES / GRID,
-            "the wasm cap {wasm} is the arm's whole capacity of {} grids, so \
-             nothing was reserved for the other {} panes",
-            WASM_MODEL_GRID_BUDGET_BYTES / GRID,
-            MAX_PANES_DESKTOP - 1,
+            !h.release_data(),
+            "an already-empty layer answered `true`. This hook runs once a \
+             frame, so that is a generation bump per frame and every cache \
+             keyed on it invalidated.",
         );
     }
 
@@ -4052,20 +4412,26 @@ mod tests {
         }
     }
 
-    /// A frame installs under the key its own fetch was dispatched for, and
+    /// A frame **stages** under the key its own fetch was dispatched for, and
     /// leaves the live picture alone.
+    ///
+    /// The store moved with the item that gave the loop its own staging area;
+    /// what the test asks is unchanged — the key the payload carried, not one
+    /// recomputed from the pane — and the "leaves the live picture alone" half
+    /// is now literal rather than only about the generation.
     #[test]
-    fn an_arriving_frame_installs_under_its_own_key() {
+    fn an_arriving_frame_stages_under_its_own_key() {
         let mut h = seeded(ModelParameter::SurfaceBasedCape, 0);
         let generation = h.data_generation();
+        let live_before = h.cached_grids.len();
         let target = GridKey {
             param: ModelParameter::SurfaceBasedCape,
             run: run_time(),
             f_hour: 9,
         };
         assert!(
-            !h.cached_grids.is_resident(target),
-            "premise: f09 is not resident yet",
+            !h.frame_grids.is_staged(target) && !h.cached_grids.is_resident(target),
+            "premise: f09 is in neither store yet",
         );
 
         h.apply_frame(
@@ -4080,7 +4446,19 @@ mod tests {
             &PaneRef::across(&[]),
         );
 
-        assert!(h.cached_grids.is_resident(target), "the frame is resident");
+        assert!(h.frame_grids.is_staged(target), "the frame is staged");
+        assert!(
+            !h.cached_grids.is_resident(target),
+            "a loop frame landed in the LIVE cache, which is the defect the \
+             staging area exists to remove: it puts the frame on the pane \
+             set's byte budget and holds it there for as long as the key is \
+             named",
+        );
+        assert_eq!(
+            h.cached_grids.len(),
+            live_before,
+            "the live cache changed size on a frame arrival",
+        );
         assert_eq!(
             h.data_generation(),
             generation,

@@ -2032,71 +2032,46 @@ fn the_caption_reads_the_timeline_of_the_layer_the_clock_walks() {
     assert_eq!(bare.clock_layer(), None);
 }
 
-/// **The model loop cap covers a forecast horizon by sampling, and the radar
-/// texture cap it must not borrow really is 14.**
+/// **A loop covers a forecast horizon by sampling** — handed more hours than
+/// its cap it returns *exactly* the cap, anchored on both the first forecast
+/// hour and the last, stepping between the two integers around the ideal
+/// spacing rather than on a fixed stride.
 ///
-/// The overlays-side sibling
-/// `the_model_loop_cap_leaves_a_grid_for_every_other_pane` pins what the byte
-/// budget allows — exactly 8, 23 and 65 grids for a looping pane. It cannot ask
-/// the next two questions: `squallar-overlays` may not see
-/// `squallar-device-profile` (that crate declares `squallar-radar`, and the
-/// overlays → radar edge is charter-cut) and does not own the sampler. This
-/// crate sees both, so they are asked here.
+/// **What this test used to also assert, and why that half is gone.** It
+/// opened by pinning `WASM_MAX_LOOP_FRAMES == 14` and then, for each arm,
+/// `budget_cap.min(frame_cap) == expect` over the byte-budget caps 8/23/65 its
+/// overlays-side sibling computed with `model_loop_frame_cap`. Both the
+/// function and the sibling went with the item that staged the model layer's
+/// loop frames, because the question they answered — how many frames a model
+/// loop may hold against the *grid* budget — stopped existing when a loop
+/// frame stopped being charged to that budget.
 ///
-/// **One** — the 14 that sibling spells by hand, because the charter denies it
-/// the import, is the real `WASM_MAX_LOOP_FRAMES`. Without this its 6.0 %
-/// overrun could go stale with nothing going red.
+/// That half could never have failed on the thing that was wrong with it. The
+/// clamp it described had **no production caller**: `layer_share` builds an
+/// overlay loop's list with `count_cap: None`, `overlay_frame_price` prices a
+/// frame at its texture, and nothing anywhere applied `model_loop_frame_cap`
+/// to anything. The assertion was `min` over two literals retyped from a doc
+/// table, so it went on passing whether or not any clamp existed. It is
+/// recorded here rather than only deleted, because a reader who remembers the
+/// old name should find out that it proved less than it read.
 ///
-/// **Two** — the frame counts the model doc's table states are what
-/// [`listing_sample_indices`] really returns. It is **not** a fixed stride:
-/// handed more hours than the cap it returns *exactly* the cap, anchored on
-/// both the first forecast hour and the last.
-///
-/// The 8/23/65 below are the sibling's figures, restated because the import is
-/// forbidden; they are pinned exactly there, so a budget change reddens that
-/// test rather than passing quietly here.
+/// The caps below are therefore the device frame caps outright
+/// (`{WASM,MOBILE,DESKTOP}_MAX_LOOP_FRAMES`), which is what a loop of any
+/// layer is really sampled to.
 #[test]
-fn the_model_loop_cap_covers_a_forecast_horizon_by_sampling() {
+fn a_loop_covers_a_forecast_horizon_by_sampling() {
+    // What each cap yields over the two horizons an HRRR cycle publishes.
+    // A horizon of H hours is H + 1 forecast hours, hour 0 included.
     use squallar_device_profile::constants::{
         DESKTOP_MAX_LOOP_FRAMES, MOBILE_MAX_LOOP_FRAMES, WASM_MAX_LOOP_FRAMES,
     };
-
-    // One. The collision, checked against the definition rather than against a
-    // number retyped into a doc comment.
-    assert_eq!(
-        WASM_MAX_LOOP_FRAMES, 14,
-        "`model.rs` spells this 14 by hand, because the charter denies it the \
-         import, and computes a 6.0 % budget overrun from it. It has moved, so \
-         that arithmetic is now stale.",
-    );
-
-    // The byte-budget caps, clamped by the device's own frame cap. Both bind
-    // somewhere, which is why both are here: the budget binds on wasm, the
-    // frame cap on mobile and desktop.
-    for (name, budget_cap, frame_cap, expect) in [
-        ("wasm32", 8usize, WASM_MAX_LOOP_FRAMES, 8usize),
-        ("mobile", 23, MOBILE_MAX_LOOP_FRAMES, 20),
-        ("desktop", 65, DESKTOP_MAX_LOOP_FRAMES, 60),
-    ] {
-        assert_eq!(
-            budget_cap.min(frame_cap),
-            expect,
-            "{name}: min(byte-budget cap {budget_cap}, device frame cap \
-             {frame_cap}) is {}, not the {expect} the model doc's sampling \
-             table is computed from",
-            budget_cap.min(frame_cap),
-        );
-    }
-
-    // Two. What each clamped cap yields over the two horizons the plan names.
-    // A horizon of H hours is H + 1 forecast hours, hour 0 included.
     for (name, cap, hours, frames) in [
-        ("wasm", 8usize, 19usize, 8usize),
-        ("wasm", 8, 49, 8),
-        ("mobile", 20, 19, 19),
-        ("mobile", 20, 49, 20),
-        ("desktop", 60, 19, 19),
-        ("desktop", 60, 49, 49),
+        ("wasm", WASM_MAX_LOOP_FRAMES, 19usize, 14usize),
+        ("wasm", WASM_MAX_LOOP_FRAMES, 49, 14),
+        ("mobile", MOBILE_MAX_LOOP_FRAMES, 19, 19),
+        ("mobile", MOBILE_MAX_LOOP_FRAMES, 49, 20),
+        ("desktop", DESKTOP_MAX_LOOP_FRAMES, 19, 19),
+        ("desktop", DESKTOP_MAX_LOOP_FRAMES, 49, 49),
     ] {
         let horizon = hours - 1;
         let picked: Vec<usize> =
@@ -2139,12 +2114,14 @@ fn the_model_loop_cap_covers_a_forecast_horizon_by_sampling() {
     // decimate and declines on the rows that are not. Without this the whole
     // table could be satisfied by listings that happened to fit.
     assert!(
-        listing_sample_indices(19, 8).is_some() && listing_sample_indices(49, 8).is_some(),
+        listing_sample_indices(19, WASM_MAX_LOOP_FRAMES).is_some()
+            && listing_sample_indices(49, WASM_MAX_LOOP_FRAMES).is_some(),
         "the wasm rows are supposed to exercise decimation; if the sampler \
          declines them, they prove nothing",
     );
     assert!(
-        listing_sample_indices(49, 60).is_none() && listing_sample_indices(19, 20).is_none(),
+        listing_sample_indices(49, DESKTOP_MAX_LOOP_FRAMES).is_none()
+            && listing_sample_indices(19, MOBILE_MAX_LOOP_FRAMES).is_none(),
         "the desktop rows and mobile's 18 h row are supposed to be \
          undecimated, so a decimating sampler would be checked nowhere",
     );

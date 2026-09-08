@@ -78,8 +78,12 @@ pub fn source_grid_budget_bytes(id: &LayerId) -> u64 {
 ///   a second live block whatever the frame cache is holding: the slot is full
 ///   exactly when the cache is not.
 ///
-/// The model layer answers zero. It stages nothing: its `resident_source_bytes`
-/// is its cache plus the pane's carry, with no frame cache and no pool.
+/// The model layer stages **one grid and no pool**: its frame cache is
+/// `model::MODEL_FRAME_STAGING_BYTES`, and it retains no decode buffer between
+/// grids because a GRIB2 record is decoded once into a fresh values vector
+/// rather than out of a recycled block. It answered zero until its loop frames
+/// were staged, when a frame was a key in its live cache and the second
+/// population genuinely did not exist.
 ///
 /// **Why this is not a multiplier over [`source_grid_budget_bytes`].** MRMS's
 /// grid is half its cache budget and GMGSI's is a quarter of its, so no
@@ -97,6 +101,8 @@ pub fn source_grid_staging_bytes(id: &LayerId) -> u64 {
         (gmgsi::FRAME_STAGING_BYTES
             + crate::gmgsi::staging::STAGING_POINTS
                 * crate::gmgsi::staging::StagingPool::ELEMENT_BYTES) as u64
+    } else if *id == known::MODEL_DATA {
+        model::MODEL_FRAME_STAGING_BYTES as u64
     } else {
         0
     }
@@ -293,16 +299,18 @@ mod grid_budget_tests {
         }
     }
 
-    /// **The staging figure is two whole grids on each staging layer, and it
-    /// is not a multiple of the cache budget.**
+    /// **The staging figure is each layer's own grids, and it is no ratio of
+    /// that layer's cache budget.**
     ///
-    /// The first half is the property: one staged granule plus one retained
-    /// decode buffer, each of the layer's own shape. The second half is the
-    /// reason the figure has to exist separately at all — the same coefficient
-    /// over `budget_bytes` cannot produce both, because MRMS budgets two grids
-    /// and GMGSI four.
+    /// The first half is the property: for the mosaics, one staged granule
+    /// plus one retained decode buffer, each of the layer's own shape; for the
+    /// model, one staged grid and no pool, because a GRIB2 record is decoded
+    /// into a fresh values vector rather than out of a recycled block. The
+    /// second half is the reason the figure has to exist separately at all —
+    /// no one coefficient over `budget_bytes` produces all three, because the
+    /// three layers budget two grids, four, and a pane set.
     #[test]
-    fn a_staging_layer_answers_two_of_its_own_grids_and_no_ratio_of_its_budget() {
+    fn a_staging_layer_answers_its_own_grids_and_no_ratio_of_its_budget() {
         let mrms = source_grid_staging_bytes(&known::MRMS);
         assert_eq!(mrms, 2 * crate::mrms::CONUS_GRID_BYTES as u64);
 
@@ -315,8 +323,26 @@ mod grid_budget_tests {
         assert_eq!(mrms, source_grid_budget_bytes(&known::MRMS));
         assert_eq!(gmgsi_bytes * 2, source_grid_budget_bytes(&known::GMGSI));
 
-        // The model layer stages nothing: no frame cache, no pool.
-        assert_eq!(source_grid_staging_bytes(&known::MODEL_DATA), 0);
+        // The model stages ONE grid, not two: it retains no decode pool,
+        // because a GRIB2 record is decoded into a fresh values vector rather
+        // than out of a recycled block.
+        //
+        // Deliberately **not** also asserted against the model's own cache
+        // budget. `staging < budget` reads like the interesting half and
+        // cannot fail: the `const _` floor beside `MODEL_GRID_BUDGET_BYTES`
+        // already holds every arm at six grids or more, so one grid is under
+        // it on every target by construction. Tampered to confirm — setting
+        // this row to the whole budget reddens the equality above and the
+        // comparison never gets a turn. A conjunct that cannot fail is worse
+        // than no conjunct, so the budget relation is left where it is
+        // actually enforced.
+        assert_eq!(
+            source_grid_staging_bytes(&known::MODEL_DATA),
+            model::HRRR_CONUS_GRID_BYTES as u64,
+            "the model's staging area is not one CONUS grid. Two would mean \
+             it had grown a retained pool like the mosaics'; zero means its \
+             loop frames are charged to the live cache again",
+        );
 
         for id in [
             known::RADAR,
@@ -383,6 +409,11 @@ mod grid_budget_tests {
             .map(|h| h.id().clone())
             .filter(|id| source_grid_staging_bytes(id) > 0)
             .collect();
-        assert_eq!(staging, vec![known::MRMS, known::GMGSI]);
+        assert_eq!(
+            staging,
+            vec![known::MODEL_DATA, known::MRMS, known::GMGSI],
+            "the model layer stages one grid per loop frame in transit; a zero \
+             here means its frames are charged to the live cache again",
+        );
     }
 }

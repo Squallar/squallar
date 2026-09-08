@@ -157,6 +157,10 @@ fn the_table_prices_the_floor_and_the_readout_the_rung_the_scene_is_on() {
 /// under-pricing by exactly the family the second field exists to price, with
 /// the whole `squallar-device-profile` suite green. This is the one assertion
 /// that reads the application's own answer.
+///
+/// The two layers are chosen so no one coefficient over the budget column
+/// produces both staging figures; see the premise at the foot of the test for
+/// why that replaced "one layer stages and the other does not".
 #[test]
 fn a_shown_gridded_layer_carries_both_of_its_handlers_figures_onto_the_scene() {
     use squallar_overlays::render::handlers::{
@@ -165,10 +169,10 @@ fn a_shown_gridded_layer_carries_both_of_its_handlers_figures_onto_the_scene() {
     use squallar_source::id::known;
 
     // Two gridded layers with different answers, on purpose: MRMS stages two
-    // grids beside its cache, the model layer stages nothing at all. A site
-    // that derived the staging from the budget instead of asking the handler
-    // would charge the model layer for a population it does not hold, which is
-    // the over-firing direction and the worse of the two.
+    // of its grids beside a cache budgeted at exactly those two, and the model
+    // stages one against a cache budgeted at thirteen. A site that derived the
+    // staging from the budget instead of asking the handler cannot satisfy
+    // both rows with any one coefficient.
     let mut app = n_pane_app(1, SITE);
     {
         let pane = app.gui.pane_mut(0).expect("the fixture built a pane");
@@ -202,14 +206,39 @@ fn a_shown_gridded_layer_carries_both_of_its_handlers_figures_onto_the_scene() {
             "the scene is not carrying {row:?}; it carries {priced:?}",
         );
     }
+    // **The premise, re-pointed rather than relaxed.** It read
+    // `MRMS > 0 && MODEL_DATA == 0` — one layer stages, the other does not —
+    // because the model layer held its loop frames in its live cache and
+    // genuinely staged nothing. It stages one grid now, so that spelling
+    // asserts a fact that has stopped being true while the property it was
+    // guarding is untouched: that a construction site cannot pass this by
+    // deriving the staging column from the budget column.
+    //
+    // The distinguishing property is now the RATIO, which is a stronger guard
+    // than the old absence — MRMS stages its whole cache budget, the model a
+    // thirteenth of its — so no single coefficient fits both rows. Compared by
+    // cross-multiplication so it is exact integer arithmetic rather than a
+    // division that rounds two different ratios onto one answer.
+    let (mrms_stage, mrms_budget) = (
+        source_grid_staging_bytes(&known::MRMS),
+        source_grid_budget_bytes(&known::MRMS),
+    );
+    let (model_stage, model_budget) = (
+        source_grid_staging_bytes(&known::MODEL_DATA),
+        source_grid_budget_bytes(&known::MODEL_DATA),
+    );
     assert!(
-        expected.contains(&(
-            source_grid_budget_bytes(&known::MRMS),
-            source_grid_staging_bytes(&known::MRMS),
-        )) && source_grid_staging_bytes(&known::MRMS) > 0
-            && source_grid_staging_bytes(&known::MODEL_DATA) == 0,
-        "the premise: one layer here stages and the other does not, or neither \
-         assertion above can fail",
+        mrms_stage > 0 && model_stage > 0,
+        "a staging figure here is zero ({mrms_stage}, {model_stage}), so that \
+         row cannot tell the handler's real answer from a default of nothing",
+    );
+    assert_ne!(
+        mrms_stage as u128 * model_budget as u128,
+        model_stage as u128 * mrms_budget as u128,
+        "both layers now stage the same fraction of their cache budget \
+         ({mrms_stage}/{mrms_budget} and {model_stage}/{model_budget}), so a \
+         site that derived the staging column from the budget column would \
+         satisfy every assertion above",
     );
 }
 
