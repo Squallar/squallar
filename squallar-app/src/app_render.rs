@@ -3685,7 +3685,15 @@ impl super::App {
     fn dispatch_pane_renders(&mut self, ctx: &egui::Context) {
         self.apply_storm_motion_override();
         let mut uploads = PlanViewUploads::default();
-        for pane_idx in 0..self.gui.pane_count() {
+        // **What the upload pipe is already holding for the plan views**, read
+        // once before any pane is walked, because the quantity the door below
+        // bounds is the BATCH — six panes at a time on a resume — and not one
+        // pane's ask. The other half of the total is the dispatcher's own
+        // renders in flight, which rises as this walk spends, so the door
+        // tightens within the frame without this being re-read. See
+        // `RenderDispatcher::plan_view_picture_slot_free`.
+        let (pane_count, pictures_holding) = self.gui.plan_view_dispatch_frame();
+        for pane_idx in 0..pane_count {
             // **The draw path's own question, asked here** — see
             // `Gui::plan_view_demand_for_pane`. What a pane has SELECTED and
             // what it PAINTS are different questions and a render is gated on
@@ -3745,6 +3753,22 @@ impl super::App {
                         .render
                         .plan_view_in_flight(&pane_site, product, elevation)
                     {
+                        continue;
+                    }
+
+                    // **The aggregate door, and the only place that can see
+                    // the batch.** Everything above this line is free of it on
+                    // purpose: the shared-cache arm hands back an `Arc` the
+                    // cache is already holding, so its upload adds a queue
+                    // entry and no host bytes, and the sibling arm is a
+                    // picture already charged to the pane having it made.
+                    // What is charged is a NEW whole picture, and past
+                    // `MAX_PLAN_VIEW_PICTURES_OUTSTANDING` of them the band
+                    // queue cannot start it any sooner than it will start it
+                    // after a wait — see the constant. Nothing is written
+                    // here, so `needs_render` is still true and this pane asks
+                    // again on the next frame.
+                    if !self.render.plan_view_picture_slot_free(pictures_holding) {
                         continue;
                     }
 
@@ -3815,17 +3839,24 @@ impl super::App {
                 // and on this scene it never gains an entry in the first place
                 // because nothing is ever dispatched.
                 let not_drawn = demand == squallar_egui::PlanViewDemand::NotDrawn;
-                let (has_scan, site) = self
-                    .gui
-                    .pane(pane_idx)
-                    .map(|p| (p.scan_info.is_some(), p.site().to_string()))
-                    .unwrap_or_default();
-                if (not_drawn || !has_scan)
-                    && let Some(pane) = self.gui.pane_mut(pane_idx)
-                {
-                    let cache = pane.overlay_cache_mut(&squallar_source::id::known::RADAR);
-                    cache.clear();
-                }
+                // One reach for the read and the release alike. They were
+                // two — a `pane` for the pair and a `pane_mut` for the clear —
+                // and the second asked the seam again for the pane the first
+                // had just described. The `None` arm is the same answer the
+                // `unwrap_or_default` gave: a pane index naming nothing has no
+                // scan, no site and no cache to clear.
+                let site = match self.gui.pane_mut(pane_idx) {
+                    Some(pane) => {
+                        let has_scan = pane.scan_info.is_some();
+                        let site = pane.site().to_string();
+                        if not_drawn || !has_scan {
+                            pane.overlay_cache_mut(&squallar_source::id::known::RADAR)
+                                .clear();
+                        }
+                        site
+                    }
+                    None => String::new(),
+                };
                 if not_drawn {
                     if let Some((product, elevation)) =
                         self.render.pane_render[pane_idx].last_rendered
@@ -10155,6 +10186,13 @@ mod stamping_tests;
 #[path = "app_render/one_render_per_sweep_tests.rs"]
 #[cfg(test)]
 mod one_render_per_sweep_tests;
+
+/// The batch of first paints a resume asks for, against the pipe that carries
+/// it: the application-wide door on the plan-view pictures the upload queue
+/// holds.
+#[path = "app_render/plan_view_picture_door_tests.rs"]
+#[cfg(test)]
+mod plan_view_picture_door_tests;
 
 /// The arrival-time extraction cache: a volume's arrival performs
 /// the plan-view `RenderInput::extract` walks off-thread for the panes

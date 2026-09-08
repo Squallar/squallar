@@ -3707,6 +3707,26 @@ impl PaneState {
         Some(self.overlay_cache(&known::RADAR)?.held_texture()?.id())
     }
 
+    /// **Whether this pane has a whole plan-view picture in the upload pipe**:
+    /// a radar raster uploaded and not yet delivered to the GPU.
+    ///
+    /// The radar cache alone, and not [`Self::is_holding_raster`], which
+    /// answers for every layer: what this feeds is the plan-view door
+    /// (`squallar_device_profile::constants::MAX_PLAN_VIEW_PICTURES_OUTSTANDING`),
+    /// and the overlay layers have their own, asked where they are drawn. A
+    /// pane that holds an overlay picture and no radar one reads false here
+    /// and is charged there instead.
+    ///
+    /// **A hold is exactly the queue's window.** `App::apply_render_to_pane`
+    /// places a fresh upload with `whole` false, so the cache holds it;
+    /// `PaneState::promote_held_raster` takes it out on the frame the
+    /// renderer says every band has landed. Between those two the picture is
+    /// `squallar_gpu`'s `TextureUploads::pending`, whole, and this is true.
+    pub fn is_holding_plan_view_raster(&self) -> bool {
+        self.overlay_cache(&known::RADAR)
+            .is_some_and(OverlayTextureCache::is_holding)
+    }
+
     /// Let go of every raster that is still arriving, without showing any.
     pub fn release_held_raster(&mut self) {
         for cache in self.overlay_textures.values_mut() {

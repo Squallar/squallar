@@ -1122,6 +1122,100 @@ pub const MAX_OVERLAY_LOOP_RENDERS_PER_PASS: usize = 4;
 /// layers are early, not whether any is served.
 pub const MAX_OVERLAY_PICTURES_OUTSTANDING: usize = 4;
 
+/// How many whole **plan-view radar pictures** the application may have
+/// outstanding at once — dispatched to the renderer and not yet arrived, plus
+/// uploaded and not yet delivered to the GPU.
+///
+/// # The same quantity as [`MAX_OVERLAY_PICTURES_OUTSTANDING`], one producer over
+///
+/// That door is the draw pass's and is asked per layer per pane, so it reaches
+/// the overlay rasters and nothing else — its own note says radar is left out
+/// "because its rasters come from `App::dispatch_pane_renders`, not from the
+/// overlay door this figure feeds". This is that producer's door. The two are
+/// separate figures rather than one shared allowance for the reason that note
+/// gives: charging radar to the overlay door lets a playing loop close it
+/// against every other layer, and a single allowance would put the two
+/// producers back in one another's way.
+///
+/// # What is unbounded without it
+///
+/// A plan-view picture is `side² × 4` and `side` is the *adapter's*, not the
+/// pane's — [`Budgets::raster_side_for_adapter`](crate::budget::Budgets::raster_side_for_adapter)
+/// holds it into `[long_range_image_side_px, raster_side_ceiling_px]` — so the
+/// desktop bracket reaches 8192 px, 268,435,456 B a picture, and a measured
+/// WSR-88D surveillance cut takes 7362 px, 216,796,176 B. `squallar_gpu`'s
+/// band queue holds each of them **whole** until its last band crosses, and it
+/// moves [`BLOCKING_BAND_BYTES`] a frame on every device with no staging ring
+/// and two 8 MiB bands a frame on one that has, breaking after any frame on
+/// which it allocated a texture. So a picture occupies the queue for
+/// `ceil(bytes / band) ` frames and the queue works through them strictly
+/// oldest-first, one picture at a time.
+///
+/// Nothing counted them. `RenderDispatcher::render_slot_free` bounds the
+/// renders *in flight* at [`MAX_CONCURRENT_RENDERS`] — 6 on desktop, 3 on
+/// mobile, 1 on the web — and says nothing about a picture that has already
+/// arrived and is sitting in the queue, so the outstanding total was
+/// `concurrent_renders + (pictures the queue has not finished)`, whose second
+/// term had no ceiling at all. On a resume that is the whole batch: the
+/// `squallar_gpu` `texture_upload` module note prices a surveillance cut at
+/// "7362 px, once per distinct raster per volume, **six panes at a time on a
+/// resume**".
+///
+/// # Three, and why a refusal cannot cost an arrival
+///
+/// One picture being drained, one already queued behind it so the drain never
+/// idles at the handover, and one in flight from the renderer to replace the
+/// one that just left. That is the pipeline this bounds, and the third slot is
+/// the margin: the door only has to keep the *queue* fed, because the queue is
+/// what serialises the batch.
+///
+/// **A refusal cannot delay a picture that the queue would have reached
+/// sooner.** The queue is strictly oldest-first and holds every picture whole,
+/// so picture `k` of a batch cannot begin before picture `k-1` has finished
+/// whatever the producer did; a picture dispatched past what the queue can
+/// absorb does not arrive earlier, it waits in the queue instead of waiting to
+/// be asked for, and pays a whole picture of host memory for the difference.
+/// That is [`MAX_OVERLAY_PICTURES_OUTSTANDING`]'s argument, and it holds here
+/// on the same condition — that the producer is faster than the drain — which
+/// at boot is not an assumption but the **reading**: the batch was measured
+/// with four to five whole pictures resident in the queue at once, and a
+/// producer slower than the drain cannot put two there.
+///
+/// **It is a count and not a byte budget**, for
+/// [`MAX_OVERLAY_PICTURES_OUTSTANDING`]'s reason: the thing bounded is one
+/// picture per outstanding raster whatever its size, and the size is the
+/// adapter's own plan. A byte budget would re-derive that plan here.
+///
+/// # What a refusal costs, and why nothing is dropped
+///
+/// The door is asked in `App::dispatch_pane_renders`, which runs on every
+/// frame, and a refusal writes nothing: `PaneRenderState::last_rendered` is
+/// left where it was, so `needs_render` is still true and the same pane asks
+/// again on the next frame and every frame after until it is admitted. No
+/// raster is discarded and no pane is retired.
+///
+/// **A refusal cannot strand the app on a frame nobody asks for**, which is
+/// the one way a door on a `ControlFlow::Wait` loop could deadlock. The door
+/// closes only when the outstanding total has reached this figure, and every
+/// unit of that total is itself a wake: a render in flight wakes the loop when
+/// it arrives, and a picture the queue has not delivered keeps
+/// `TextureUploads::uploads_pending` true, which is what buys the next frame.
+/// A closed door therefore always has an event coming that will reopen it.
+///
+/// # What it does not charge
+///
+/// A pane served out of the shared `RenderCache` is charged nothing. Its
+/// picture is an `Arc` the cache is already holding, so uploading it adds a
+/// queue entry and no host bytes — the `upload pending` census family's own
+/// note says it "OVERLAPS the two raster families while a radar raster is in
+/// flight: the `Arc` it holds is the one `apply_render_to_pane` handed
+/// `ctx.load_texture`, which is the same `Arc` `render cache` and `cached
+/// renders` hold". Refusing a cache hit would delay a pane and free nothing.
+/// A loop frame and a cross-section cut are not charged either: they are not
+/// plan views, they do not set `PaneRenderState::in_flight_plan_view`, and
+/// their pictures are a twentieth of one of these.
+pub const MAX_PLAN_VIEW_PICTURES_OUTSTANDING: usize = 3;
+
 /// The blocking-upload band: on a device with **no staging ring** — all of
 /// web, and any native adapter without `MAPPABLE_PRIMARY_BUFFERS` — this is
 /// both the largest texture delta that crosses whole on the frame's own queue

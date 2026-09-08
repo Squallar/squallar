@@ -239,6 +239,18 @@ impl PaneRenderState {
         self.render_in_flight
     }
 
+    /// Whether the render this pane has in flight is a **plan view**.
+    ///
+    /// [`Self::in_flight_plan_view`] is `Some` only for the plan-view
+    /// dispatch: a cross-section cut calls `render_started(None)` on purpose,
+    /// and a loop frame's in-flight mark is the frame's rather than the
+    /// pane's. So this is the plan-view producer's own count and the loop
+    /// cannot close the plan-view door — the mistake
+    /// `MAX_OVERLAY_PICTURES_OUTSTANDING` records for the overlay one.
+    pub fn holds_plan_view_render(&self) -> bool {
+        self.in_flight_plan_view.is_some()
+    }
+
     /// Record that this pane's texture was uploaded from `image`. See
     /// [`Self::uploaded_from`].
     pub fn note_uploaded(&mut self, image: &Arc<egui::ColorImage>) {
@@ -2431,6 +2443,39 @@ impl RenderDispatcher {
     /// work that is only worth paying when a dispatch can actually follow.
     pub fn render_slot_free(&self) -> bool {
         self.renders_in_flight.load(Ordering::Relaxed) < self.concurrent_renders
+    }
+
+    /// **Plan-view renders this dispatcher has in flight**, counted off the
+    /// panes rather than off [`Self::renders_in_flight`], which is the shared
+    /// pool and carries the loop frames, the cross-section cuts and the
+    /// adjacent-tilt speculation as well. See
+    /// [`PaneRenderState::holds_plan_view_render`].
+    pub fn plan_view_renders_in_flight(&self) -> usize {
+        self.pane_render
+            .iter()
+            .filter(|pane| pane.holds_plan_view_render())
+            .count()
+    }
+
+    /// **Whether one more whole plan-view picture may be asked for**, for the
+    /// whole application: the renders in flight plus `holding`, the pictures
+    /// the visible panes have uploaded and not yet had delivered, against
+    /// [`squallar_device_profile::constants::MAX_PLAN_VIEW_PICTURES_OUTSTANDING`].
+    ///
+    /// `holding` is the caller's because it is the Gui's — see
+    /// `squallar_egui::Gui::plan_view_pictures_outstanding`. The two terms are
+    /// one charge and not two: they are one picture's bytes at two points of
+    /// the same journey, the reply on the way in and `squallar_gpu`'s band
+    /// queue on the way out, and a picture in neither costs nothing because
+    /// the pixels it is drawn from are the GPU's.
+    ///
+    /// **Asked beside [`Self::render_slot_free`], never instead of it.** That
+    /// one bounds the render *pool*, which is a CPU and a set of scratch
+    /// buffers; this one bounds the *host bytes on the way to the card*. A
+    /// device can be over one and under the other in either direction.
+    pub fn plan_view_picture_slot_free(&self, holding: usize) -> bool {
+        self.plan_view_renders_in_flight().saturating_add(holding)
+            < squallar_device_profile::constants::MAX_PLAN_VIEW_PICTURES_OUTSTANDING
     }
 
     /// Resample a volume into a voxel grid, away from the frame thread.

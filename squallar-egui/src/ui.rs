@@ -2783,6 +2783,41 @@ impl Gui {
     /// rasters are retired by the arrival path
     /// (`App::poll_overlay_render_results` drops a picture no visible pane
     /// wants), not held against the panes on screen.
+    /// **Whole plan-view pictures the visible panes have in the upload pipe**
+    /// — one per pane whose radar raster has been uploaded and whose last band
+    /// has not landed.
+    ///
+    /// The other half of the plan-view door's total; the renders it has in
+    /// flight are the dispatcher's own count. See
+    /// `squallar_device_profile::constants::MAX_PLAN_VIEW_PICTURES_OUTSTANDING`
+    /// for what the pair bounds, and [`Self::overlay_dispatch_budget`] for the
+    /// same question asked of the overlay layers.
+    ///
+    /// **The visible panes**, for [`Self::overlay_dispatch_budget`]'s reason:
+    /// a hidden pane is not walked by `App::dispatch_pane_renders` and so can
+    /// spend nothing, and counting what it still holds would shrink the
+    /// allowance of the panes that can. `PaneState::release_hidden_textures`
+    /// is what lets go of a hold that went out of view.
+    pub fn plan_view_pictures_outstanding(&self) -> usize {
+        self.panes[..self.visible_pane_count()]
+            .iter()
+            .filter(|pane| pane.is_holding_plan_view_raster())
+            .count()
+    }
+
+    /// **What one frame's plan-view dispatch walk opens with**: the panes it
+    /// visits, and the whole pictures those panes already have in the upload
+    /// pipe.
+    ///
+    /// One seam question and not two, because it is one question about one
+    /// set — `App::dispatch_pane_renders` walks `0..pane_count` and the door
+    /// it opens is over exactly those panes, so asking the count and the
+    /// occupancy separately reaches through the seam twice for the same
+    /// frame's answer.
+    pub fn plan_view_dispatch_frame(&self) -> (usize, usize) {
+        (self.pane_count(), self.plan_view_pictures_outstanding())
+    }
+
     pub fn overlay_dispatch_budget(&self, pane_count: usize) -> usize {
         let outstanding: usize = self
             .panes

@@ -242,6 +242,54 @@ fn the_volume_build_cap_paces_rather_than_stalls() {
     }
 }
 
+/// The plan-view picture door paces rather than stalls, and it bites.
+///
+/// Two conjuncts, each asserted against what IT needs rather than against the
+/// other:
+///
+/// **It may never idle the band queue.** The queue works through whole
+/// pictures oldest-first, one at a time, so a door that admits ONE leaves
+/// nothing queued behind the picture being drained: the drain empties, waits
+/// for the next render, and every pane past the first paints LATER than it
+/// does with no door at all. That is the one cost this door may not pay, so
+/// the floor is two — one being drained and one already queued behind it — and
+/// the shipped figure carries a third for the render replacing the one that
+/// just left.
+///
+/// **And it must be a bound on some bracket**, or it is a constant nobody
+/// reads: the burst it exists for is `concurrent_renders` whole pictures
+/// produced at once, and on the bracket where that was measured the door has
+/// to be under that figure. It is deliberately NOT under every bracket — on
+/// the web `concurrent_renders` is 1 and this door is already looser than the
+/// render pool, which is the safe direction.
+#[test]
+fn the_plan_view_picture_door_paces_rather_than_stalls() {
+    // A `const` assertion and not a runtime one, so a floor breach is a
+    // compile error rather than a red test: the figure is a constant and
+    // clippy's `assertions_on_constants` says so.
+    const {
+        assert!(
+            MAX_PLAN_VIEW_PICTURES_OUTSTANDING >= 2,
+            "the plan-view door admits fewer than two pictures: the band queue \
+             drains one whole picture at a time, so fewer than two leaves it \
+             with nothing queued behind the one it is moving and it idles at \
+             every handover, which paints every pane past the first LATER than \
+             no door at all",
+        )
+    };
+    let widest = arms()
+        .iter()
+        .map(|arm| arm.concurrent_renders)
+        .max()
+        .expect("there is at least one bracket");
+    assert!(
+        MAX_PLAN_VIEW_PICTURES_OUTSTANDING < widest,
+        "the plan-view door admits {MAX_PLAN_VIEW_PICTURES_OUTSTANDING} against \
+         a widest concurrent render budget of {widest}: it is not a bound on \
+         any bracket, so the batch it exists for is exactly as big as it was",
+    );
+}
+
 /// The teardown slice paces rather than stalls: a real slice of a frame, and a
 /// small one.
 #[test]
