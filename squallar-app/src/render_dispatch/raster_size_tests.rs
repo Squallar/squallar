@@ -31,7 +31,9 @@ fn a_wire_decoded_frame_gives_its_buffer_to_the_image_without_a_copy() {
     // being the codec's own answer the moment a tail is added.
     let mut head = Vec::new();
     frame.write_head(&mut head);
-    let polar_tail = frame.polar.to_bytes();
+    // Through `to_tail`, which leads with the byte naming which of the two
+    // value forms the payload is in -- the codec's own polar encoder.
+    let polar_tail = frame.polar.to_tail();
     let (codes, image) = frame.into_surface_tails();
     let tails = vec![polar_tail, codes, image];
     let decoded = RenderedFrame::from_parts(&head, tails).expect("the frame reply decodes");

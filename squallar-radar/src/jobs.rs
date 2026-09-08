@@ -30,7 +30,7 @@ macro_rules! frame_reply_codec {
             fn encode_out(v: RenderedFrame, head: &mut Vec<u8>, tails: &mut Vec<Vec<u8>>) {
                 head.reserve_exact(RenderedFrame::WIRE_HEAD_MAX_BYTES);
                 v.write_head(head);
-                tails.push(v.polar.to_bytes());
+                tails.push(v.polar.to_tail());
                 // The two surface tails, in the order `from_parts` reads them.
                 // Exactly one is non-empty, and which one the head's surface
                 // discriminant states.

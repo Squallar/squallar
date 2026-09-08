@@ -106,7 +106,7 @@ pub const WIRE_REPLY_ROWS: &[&str] = &[
     "blank | 6 | 0x0cf6ca5254a6cb0d",
 ];
 
-/// The 12 frame-reply framing rows, exactly as
+/// The 13 frame-reply framing rows, exactly as
 /// `offload::tests::the_frame_reply_framing_is_the_one_this_registry_ships`
 /// asserts them: the frame's head+tails wire form
 /// (`squallar_radar::frame::RenderedFrame::write_head` + the nominated
@@ -132,12 +132,15 @@ pub const WIRE_REPLY_ROWS: &[&str] = &[
 /// | `frame/full/head` | `29 \| 0x89dc568e54cf7abb` | `30 \| 0x10e1ceda1c8d8bc1` |
 /// | `frame/bare/head` | `11 \| 0xc813d3185b023723` | `12 \| 0xfbe6d562a4c3b079` |
 ///
-/// **Every other pre-existing row is byte-identical**, and that is an
-/// assertion rather than an expectation: `frame/full/polar`,
-/// `frame/bare/polar`, `frame/full/image` and `frame/bare/image` carry the
-/// same lengths and the same digests they carried before, because
-/// `PolarField` and `RasterImage` were not touched. A move in one of those
-/// would be a bug in this change, not a row to re-record.
+/// **Every other pre-existing row was byte-identical in THAT change**, and
+/// that was an assertion rather than an expectation: `frame/full/polar`,
+/// `frame/bare/polar`, `frame/full/image` and `frame/bare/image` carried the
+/// same lengths and the same digests they had carried before, because
+/// `PolarField` and `RasterImage` were not touched by it. A move in one of
+/// those would have been a bug in it, not a row to re-record. The three polar
+/// rows have since moved for a different deliberate change — the next block
+/// is what moved them and why; the image rows have not moved and still carry
+/// what they always did.
 ///
 /// Six rows are **new**: a code tail for each of the two raster fixtures
 /// (empty, which is the mutual exclusion made visible — exactly one of
@@ -152,28 +155,67 @@ pub const WIRE_REPLY_ROWS: &[&str] = &[
 /// [`WIRE_HEIGHT_REPLY_ROWS`] was written to close for the height reply, found
 /// again here before it could ship.
 ///
+/// # What moved when the polar tail learned to name its value form
+///
+/// **Re-pinned 2026-09-08, and the three polar rows MOVED BYTES ON PURPOSE.**
+/// `PolarField` holds a still pane's gate numbers in either of two forms —
+/// four bytes a gate, or one byte a gate indexing a table of the distinct
+/// patterns the render painted — and the tail now leads with a **form byte**
+/// saying which. Before it, the reply could only carry the wide form, so the
+/// worker compacted a plane and then widened it at the door and the page held
+/// four bytes a gate for numbers already narrowed. The two payloads are not
+/// distinguishable from their own bytes, which is why a byte in front of them
+/// is the whole change.
+///
+/// | row | was | is |
+/// |---|---|---|
+/// | `frame/full/polar` | `80 \| 0x9f0c3f4e5dce8435` | `81 \| 0xacf06f3c361ecebd` |
+/// | `frame/bare/polar` | `40 \| 0x3f3ecf0cef9be2c0` | `41 \| 0x257bc9fd74b17416` |
+/// | `frame/plane/polar` | `40 \| 0x3f3ecf0cef9be2c0` | `41 \| 0x257bc9fd74b17416` |
+///
+/// The head and every surface row are **unchanged**: the form byte leads the
+/// tail it describes, and the head's surface discriminant is about `codes` vs
+/// `image` and knows nothing about it. `frame/coded/polar` is the thirteenth
+/// row and the form the change admits — the `full` fixture's own six numbers,
+/// held once each and named by a byte apiece.
+///
+/// **The wide payload behind that byte is the payload it always was.**
+/// `polar::tests::the_polar_wire_layout_is_the_one_this_protocol_ships` pins
+/// those bytes and is unedited at `(112, 0x986a_92ef_b56e_c209)`; the tag went
+/// in FRONT of the payload rather than into it, which is the whole reason a
+/// second form could join a versionless encoding at all.
+///
+/// The `full` fixture's four counts were made **four different numbers** in
+/// the same change. They were `2, 3, 3, 6`, and a tamper that swapped `gates`
+/// with `reach_gates` inside the encoder left `frame/full/polar` byte-identical
+/// — the same blindness to a symmetric reorder the `plane` fixture above was
+/// added for, in the neighbouring block. `polar/full` moved for that as well
+/// as for the form byte; the two default fields moved for the form byte alone.
+///
 /// Row-length arithmetic (independent of the encoder): head/full
 /// 8 + (1+8) + (1+1) + (1+1+4+4) + 1 = 30; head/bare 8+1+1+1+1 = 12;
 /// head/plane 8+1+1+1+1 + 19 = 31, the trailing 19 being
 /// `CodePlane::WIRE_HEAD_BYTES` (4+4+2+4+4+1 — the constructor's own
-/// arguments but the codes); polar/full 80 = 16 header + 3x8 + 2x8 + 6x4;
-/// polar/bare and polar/plane 40 = 16 header + 3x8 (the default field);
-/// codes/plane 12 = 3 radials x 4 gates, **level 0 alone** — the mip chain is
-/// a pure function of it and is rebuilt at decode rather than sent;
-/// image and the empty tails = the fixture Vecs.
+/// arguments but the codes); polar/full 81 = 1 form + 16 header + 3x8 + 2x8 +
+/// 6x4; polar/bare and polar/plane 41 = 1 form + 16 header + 3x8 (the default
+/// field); polar/coded 91 = 1 form + 16 header + 3x8 + 2x8 + 4 table count +
+/// 6x4 table + 6x1 codes; codes/plane 12 = 3 radials x 4 gates, **level 0
+/// alone** — the mip chain is a pure function of it and is rebuilt at decode
+/// rather than sent; image and the empty tails = the fixture Vecs.
 pub const WIRE_FRAME_REPLY_ROWS: &[&str] = &[
     "frame/full/head | 30 | 0x10e1ceda1c8d8bc1",
-    "frame/full/polar | 80 | 0x9f0c3f4e5dce8435",
+    "frame/full/polar | 81 | 0xacf06f3c361ecebd",
     "frame/full/codes | 0 | 0xcbf29ce484222325",
     "frame/full/image | 8 | 0x0363b2a3926bce45",
     "frame/bare/head | 12 | 0xfbe6d562a4c3b079",
-    "frame/bare/polar | 40 | 0x3f3ecf0cef9be2c0",
+    "frame/bare/polar | 41 | 0x257bc9fd74b17416",
     "frame/bare/codes | 0 | 0xcbf29ce484222325",
     "frame/bare/image | 4 | 0xbe7a5e775165785d",
     "frame/plane/head | 31 | 0xe21c3f042291c176",
-    "frame/plane/polar | 40 | 0x3f3ecf0cef9be2c0",
+    "frame/plane/polar | 41 | 0x257bc9fd74b17416",
     "frame/plane/codes | 12 | 0x6c2b85b62288e8a5",
     "frame/plane/image | 0 | 0xcbf29ce484222325",
+    "frame/coded/polar | 91 | 0x8a7e554ed27594b3",
 ];
 
 /// The 2 height-reply framing rows, exactly as

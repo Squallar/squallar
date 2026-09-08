@@ -3788,9 +3788,15 @@ fn the_overlay_reply_framing_is_the_one_this_protocol_ships() {
 fn the_frame_reply_framing_is_the_one_this_registry_ships() {
     let polar = {
         let mut bytes = Vec::new();
+        // radials, gates, reach_gates, n_values -- four DIFFERENT numbers, so
+        // that any reorder of them moves these bytes. They were 2, 3, 3, 6,
+        // and a tamper that swapped `gates` with `reach_gates` inside the
+        // encoder left this row's digest byte-identical: the same blindness
+        // to a symmetric reorder that the `plane` fixture below was added
+        // for, and that `WIRE_HEIGHT_REPLY_ROWS` records for its box terms.
         bytes.extend_from_slice(&2u32.to_le_bytes());
         bytes.extend_from_slice(&3u32.to_le_bytes());
-        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
         bytes.extend_from_slice(&6u32.to_le_bytes());
         bytes.extend_from_slice(&2.125f64.to_le_bytes());
         bytes.extend_from_slice(&0.25f64.to_le_bytes());
@@ -3852,6 +3858,25 @@ fn the_frame_reply_framing_is_the_one_this_registry_ships() {
             .expect("the literal plane is inside every cap"),
         ),
     };
+    // The `full` frame holding its gate numbers the narrow way, which is what
+    // a still pane's reply carries since the polar tail learned to say which
+    // of `PolarField`'s two value forms it is in. Only the polar tail differs
+    // -- the form byte leads that tail, and the head's surface discriminant is
+    // about `codes` vs `image` and knows nothing about it -- so this fixture
+    // contributes the one row the three above cannot reach.
+    let coded = RenderedFrame {
+        polar: {
+            let mut polar = full.polar.clone();
+            polar.compact_values();
+            assert_eq!(
+                polar.wire_form(),
+                squallar_radar::render::polar::PolarWireForm::Coded,
+                "the coded row is vacuous unless this fixture's plane codes",
+            );
+            polar
+        },
+        ..full.clone()
+    };
     let radar_row = job_codecs()
         .find(|row| row.label == "radar")
         .expect("the radar row is composed");
@@ -3870,6 +3895,7 @@ fn the_frame_reply_framing_is_the_one_this_registry_ships() {
     let (full_head, full_tails) = encode(&full);
     let (bare_head, bare_tails) = encode(&bare);
     let (plane_head, plane_tails) = encode(&plane);
+    let (_, coded_tails) = encode(&coded);
     let row = |name: &str, bytes: &[u8]| {
         format!("{name} | {} | {:#018x}", bytes.len(), layout_digest(bytes))
     };
@@ -3886,6 +3912,7 @@ fn the_frame_reply_framing_is_the_one_this_registry_ships() {
         row("frame/plane/polar", &plane_tails[0]),
         row("frame/plane/codes", &plane_tails[1]),
         row("frame/plane/image", &plane_tails[2]),
+        row("frame/coded/polar", &coded_tails[0]),
     ];
     assert_eq!(
         rows,

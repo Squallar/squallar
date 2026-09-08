@@ -568,10 +568,15 @@ impl PolarField {
     /// plane in hand and not read out of a table of products, so a product
     /// that stops being exact stops being compacted on the same day.
     ///
-    /// **And it cannot move the wire.** [`Self::to_bytes`] writes the same
-    /// `f32`s from either form, which
-    /// `the_wire_is_the_same_bytes_from_either_form` asserts against the
-    /// pinned layout rather than against a second opinion.
+    /// **And it moves the wire only where the wire says so.**
+    /// [`Self::to_bytes`] writes the same `f32`s from either form — the
+    /// layout this protocol pins is one layout and stays one —, which
+    /// `the_wire_is_the_same_bytes_from_either_form` asserts against that
+    /// pinned fixture rather than against a second opinion.
+    /// [`Self::to_tail`] is the encoder the reply uses, and it writes a coded
+    /// plane coded behind a byte that says so, so a page across a worker port
+    /// receives and holds what was compacted here instead of a widening of
+    /// it.
     ///
     /// One walk of the plane, on whichever thread the render finished on;
     /// never on the frame thread, and never on a plane that is about to be
@@ -616,16 +621,70 @@ impl PolarField {
     }
 }
 
+/// **Which of [`PolarField`]'s two forms a polar tail carries**, as the byte
+/// that leads it.
+///
+/// The two payloads are not distinguishable from their own bytes and were
+/// never meant to be: both open on a radial count, both are a header then
+/// wedges then a block sized by the same `n_values`, and a reader handed one
+/// with no way to ask which it holds would read a table of codes as `f32`s
+/// and paint numbers nobody measured. A second form could not join a
+/// versionless encoding without that ambiguity, which is why one did not
+/// until this byte existed.
+///
+/// **The byte leads the tail rather than joining either payload**, so the
+/// wide payload's layout is exactly the layout it was before a second form
+/// existed — the same bytes, the same length, the same digest, and
+/// `the_polar_wire_layout_is_the_one_this_protocol_ships` still pins them
+/// unedited. What that payload gained is a name: it is *form 0*.
+///
+/// **What keeps a mispaired peer away from this byte is not this byte.** The
+/// page and the worker refuse each other's token at the HELLO handshake, and
+/// three of `wire_identity::WIRE_FRAME_REPLY_ROWS` are polar tails, so the
+/// local token moves when either form's layout does. The form byte is what
+/// keeps a *matched* pair from guessing between two payloads; it is not a
+/// version negotiation and does not claim to be one. A payload written
+/// before it existed leads with a radial count's low byte and would be read
+/// as a form or refused as one; nothing here says which, because the
+/// handshake is what says such a pair never attaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolarWireForm {
+    /// One `f32` a gate — the layout this protocol has always shipped.
+    Wide,
+    /// A table of the distinct numbers, then one byte a gate indexing it.
+    Coded,
+}
+
+impl PolarWireForm {
+    /// This form as the byte that leads a tail.
+    pub fn wire_code(self) -> u8 {
+        match self {
+            Self::Wide => 0,
+            Self::Coded => 1,
+        }
+    }
+
+    /// The inverse of [`wire_code`](Self::wire_code), or `None` for a form
+    /// this build does not write.
+    pub fn from_wire_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Wide),
+            1 => Some(Self::Coded),
+            _ => None,
+        }
+    }
+}
+
 impl PolarField {
     /// The header this field's byte form opens with: three counts and two
     /// ranges.
     const HEADER: usize = 4 * 4 + 8 * 3;
 
-    /// This field as bytes, little-endian, for the one boundary that can only
-    /// carry buffers.
-    pub fn to_bytes(&self) -> Vec<u8> {
+    /// The header and wedges — the prefix **both** forms open with, written
+    /// once so the two cannot come to describe the same geometry
+    /// differently.
+    fn write_geometry(&self, out: &mut Vec<u8>) {
         let g = &self.geometry;
-        let mut out = Vec::with_capacity(Self::HEADER + g.wedges.len() * 8 + self.values.len() * 4);
         out.extend_from_slice(&(g.wedges.len() as u32).to_le_bytes());
         out.extend_from_slice(&(g.gates as u32).to_le_bytes());
         out.extend_from_slice(&(g.reach_gates as u32).to_le_bytes());
@@ -638,18 +697,97 @@ impl PolarField {
             out.extend_from_slice(&w.azimuth_deg.to_le_bytes());
             out.extend_from_slice(&w.half_width_deg.to_le_bytes());
         }
-        // Widened here and not held wide: the coded form is a way of *holding*
-        // the numbers and never a way of writing them, so this encoding is the
-        // one it has always been whichever form the field is in.
+    }
+
+    /// This field as bytes, little-endian, for the one boundary that can only
+    /// carry buffers.
+    ///
+    /// **Always the wide form**, whichever form the field is in: the numbers
+    /// are widened here rather than held wide, so this is the layout it has
+    /// always been. [`Self::to_tail`] is what writes a coded plane coded.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            Self::HEADER + self.geometry.wedges.len() * 8 + self.values.len() * 4,
+        );
+        self.write_geometry(&mut out);
         for v in self.values.iter() {
             out.extend_from_slice(&v.to_le_bytes());
         }
         out
     }
 
-    /// The inverse of [`Self::to_bytes`], or `None` for anything this build did
-    /// not write.
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+    /// Which form [`Self::to_tail`] writes this field in.
+    pub fn wire_form(&self) -> PolarWireForm {
+        match self.values {
+            Values::Wide(_) => PolarWireForm::Wide,
+            Values::Coded { .. } => PolarWireForm::Coded,
+        }
+    }
+
+    /// **This field as a reply tail: the form byte, then that form's
+    /// payload.**
+    ///
+    /// The one encoder the frame reply uses, and the reason a page across a
+    /// worker port can hold a still pane's numbers a byte a gate rather than
+    /// four. A coded plane is written coded — `1 + header + wedges + 4 +
+    /// table + one byte a gate` against `1 + header + wedges + four bytes a
+    /// gate` — so the compaction the worker already paid for in
+    /// [`Self::compact_values`] is delivered across the port instead of being
+    /// widened at the door.
+    ///
+    /// The tag and the payload are written in the **same match arm** on the
+    /// same value, so there is no arrangement of this function in which a
+    /// tail says one form and carries the other.
+    pub fn to_tail(&self) -> Vec<u8> {
+        let wedge_bytes = self.geometry.wedges.len() * 8;
+        match &self.values {
+            Values::Wide(_) => {
+                let mut out =
+                    Vec::with_capacity(1 + Self::HEADER + wedge_bytes + self.values.len() * 4);
+                out.push(PolarWireForm::Wide.wire_code());
+                self.write_geometry(&mut out);
+                for v in self.values.iter() {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                out
+            }
+            Values::Coded { codes, table } => {
+                let mut out = Vec::with_capacity(
+                    1 + Self::HEADER + wedge_bytes + 4 + table.len() * 4 + codes.len(),
+                );
+                out.push(PolarWireForm::Coded.wire_code());
+                self.write_geometry(&mut out);
+                out.extend_from_slice(&(table.len() as u32).to_le_bytes());
+                for v in table {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                // Codes are bytes, so they have no order to write them in.
+                out.extend_from_slice(codes);
+                out
+            }
+        }
+    }
+
+    /// The inverse of [`Self::to_tail`], or `None` for anything this build
+    /// did not write — a form byte it does not know included.
+    ///
+    /// The form is read before a single byte of the payload is interpreted,
+    /// so the two layouts are never guessed between.
+    pub fn from_tail(bytes: &[u8]) -> Option<Self> {
+        let (&form, payload) = bytes.split_first()?;
+        match PolarWireForm::from_wire_code(form)? {
+            PolarWireForm::Wide => Self::from_bytes(payload),
+            PolarWireForm::Coded => Self::from_coded_bytes(payload),
+        }
+    }
+
+    /// The header and wedges both forms open with: the geometry, the count
+    /// the values block is shaped by, and where that block starts.
+    ///
+    /// The buffer is checked to hold the wedges **before** they are
+    /// allocated, so a header declaring four billion radials costs a length
+    /// comparison rather than a reservation.
+    fn read_geometry(bytes: &[u8]) -> Option<(PolarGeometry, usize, usize)> {
         if bytes.len() < Self::HEADER {
             return None;
         }
@@ -667,13 +805,8 @@ impl PolarField {
         let gate_interval_slant_km = f64_at(24);
         let elevation_deg = Some(f64_at(32)).filter(|e| !e.is_nan());
 
-        let wedge_bytes = radials.checked_mul(8)?;
-        let value_bytes = n_values.checked_mul(4)?;
-        if bytes.len()
-            != Self::HEADER
-                .checked_add(wedge_bytes)?
-                .checked_add(value_bytes)?
-        {
+        let values_at = Self::HEADER.checked_add(radials.checked_mul(8)?)?;
+        if bytes.len() < values_at {
             return None;
         }
         // A values buffer that is neither empty nor exactly the shape means the
@@ -692,6 +825,27 @@ impl PolarField {
             });
             at += 8;
         }
+        Some((
+            PolarGeometry {
+                wedges,
+                first_gate_slant_km,
+                gate_interval_slant_km,
+                elevation_deg,
+                gates,
+                reach_gates,
+            },
+            n_values,
+            values_at,
+        ))
+    }
+
+    /// The inverse of [`Self::to_bytes`], or `None` for anything this build did
+    /// not write.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let (geometry, n_values, mut at) = Self::read_geometry(bytes)?;
+        if bytes.len() != at.checked_add(n_values.checked_mul(4)?)? {
+            return None;
+        }
         let mut values = Vec::with_capacity(n_values);
         for _ in 0..n_values {
             values.push(f32::from_le_bytes(
@@ -700,15 +854,50 @@ impl PolarField {
             at += 4;
         }
         Some(Self {
-            geometry: PolarGeometry {
-                wedges,
-                first_gate_slant_km,
-                gate_interval_slant_km,
-                elevation_deg,
-                gates,
-                reach_gates,
-            },
+            geometry,
             values: Values::Wide(values),
+        })
+    }
+
+    /// The coded payload — form 1's body — decoded into the form it was
+    /// written in, so a page holds one byte a gate and never materializes the
+    /// wide plane at all.
+    ///
+    /// Every code is checked to name a number the table holds. `Values`
+    /// indexes that table directly rather than through `get`, and a code past
+    /// its end is a message this build did not write; refusing it here is
+    /// what keeps a truncated or doctored tail from being an index out of
+    /// bounds later, on the thread that reads a hover.
+    fn from_coded_bytes(bytes: &[u8]) -> Option<Self> {
+        let (geometry, n_values, at) = Self::read_geometry(bytes)?;
+        if bytes.len() < at.checked_add(4)? {
+            return None;
+        }
+        let table_len =
+            u32::from_le_bytes(bytes[at..at + 4].try_into().expect("bounds checked")) as usize;
+        // A table longer than a byte addresses names codes that cannot exist.
+        if table_len > Values::MAX_CODES {
+            return None;
+        }
+        let table_at = at + 4;
+        let codes_at = table_at.checked_add(table_len.checked_mul(4)?)?;
+        if bytes.len() != codes_at.checked_add(n_values)? {
+            return None;
+        }
+        let table: Vec<f32> = bytes[table_at..codes_at]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().expect("chunks of four")))
+            .collect();
+        let codes = &bytes[codes_at..];
+        if codes.iter().any(|&code| usize::from(code) >= table_len) {
+            return None;
+        }
+        Some(Self {
+            geometry,
+            values: Values::Coded {
+                codes: codes.to_vec(),
+                table,
+            },
         })
     }
 }

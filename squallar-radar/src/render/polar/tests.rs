@@ -303,11 +303,18 @@ fn the_polar_wire_layout_is_the_one_this_protocol_ships() {
         "the bytes `PolarField::to_bytes` writes are not the bytes this pin \
          was last told. Something about this payload's layout moved — a \
          field added, removed, reordered, retyped, or written at a different \
-         width. This encoding carries no version of its own, and nothing \
-         else in the workspace can see a change to these bytes — the \
-         reply-shape guard watches field names and these travel inside one \
-         of them, and the build token's local digest folds the framing rows \
-         and not this nested payload. If the change was deliberate, re-pin \
+         width. These bytes are **form 0** of the polar tail: `to_tail` \
+         writes the form byte in FRONT of this payload and never into it, so \
+         a second form did not move them and this pin still covers what the \
+         reply carries. A change to them is seen twice — here, and by \
+         `squallar_worker::wire_identity::WIRE_FRAME_REPLY_ROWS`, whose \
+         `frame/*/polar` rows digest this payload behind that byte and feed \
+         the local build token. (The clause this replaced said nothing else \
+         in the workspace could see a change to these bytes. That was true \
+         the day it was written, `24f8592f8` on 2026-08-18, and stopped \
+         being true the next day, when `b09c75294` gave the frame reply \
+         per-tail digest rows and one of them was this payload.) If the \
+         change was deliberate, re-pin \
          the length and digest here, deliberately. Deployed pages and \
          workers from opposite sides of a deploy refuse each other by \
          GITHUB_SHA at the HELLO handshake; a LOCAL pair differing only \
@@ -647,10 +654,11 @@ fn the_wire_is_the_same_bytes_from_either_form() {
     assert_eq!(
         narrow.to_bytes(),
         layout_fixture().to_bytes(),
-        "compacting moved the bytes this protocol ships. The coded form is a \
-         way of holding the numbers and never a way of writing them, so \
-         `to_bytes` widens whichever form it is handed and the pin in \
-         `the_polar_wire_layout_is_the_one_this_protocol_ships` covers both.",
+        "compacting moved the bytes `to_bytes` writes. That encoder widens \
+         whichever form it is handed, so the pin in \
+         `the_polar_wire_layout_is_the_one_this_protocol_ships` covers both \
+         forms; `to_tail` is the one that writes a coded plane coded, and \
+         `a_tail_names_the_form_it_carries` is what covers that.",
     );
 }
 
@@ -716,4 +724,239 @@ fn compacting_a_stripped_field_holds_nothing() {
     f.compact_values();
     assert!(!f.has_values());
     assert_eq!(f.resident_bytes(), f.geometry().resident_bytes());
+}
+
+/// **A tail says which of the two forms it carries, in front of it.**
+///
+/// The one fact the second form could not exist without: the payloads are not
+/// distinguishable from their own bytes, so what distinguishes them is a byte
+/// that is not part of either.
+#[test]
+fn a_tail_names_the_form_it_carries() {
+    let wide = ring(8, 45.0, 4);
+    let mut coded = wide.clone();
+    coded.compact_values();
+
+    assert_eq!(wide.wire_form(), PolarWireForm::Wide);
+    assert_eq!(coded.wire_form(), PolarWireForm::Coded);
+    assert_eq!(wide.to_tail()[0], PolarWireForm::Wide.wire_code());
+    assert_eq!(coded.to_tail()[0], PolarWireForm::Coded.wire_code());
+    assert_ne!(
+        PolarWireForm::Wide.wire_code(),
+        PolarWireForm::Coded.wire_code(),
+        "this test is vacuous unless the two forms spell themselves apart",
+    );
+}
+
+/// **The wide payload is the tail minus its form byte, unchanged.**
+///
+/// `the_polar_wire_layout_is_the_one_this_protocol_ships` pins those bytes,
+/// and this is what says the pin still covers what crosses the wire: the form
+/// byte was added in front of that payload rather than into it.
+#[test]
+fn the_wide_tail_is_the_pinned_payload_behind_a_form_byte() {
+    let f = layout_fixture();
+    let tail = f.to_tail();
+    assert_eq!(
+        &tail[1..],
+        f.to_bytes().as_slice(),
+        "the form byte moved bytes inside the payload this protocol pins",
+    );
+    assert_eq!(tail.len(), f.to_bytes().len() + 1);
+}
+
+/// **A coded tail comes back coded**, which is the whole point: a page across
+/// a worker port holds one byte a gate and never materializes the wide plane.
+#[test]
+fn a_coded_tail_arrives_still_coded() {
+    // 8 x 4 gates carry 32 distinct numbers, which a byte names.
+    let mut sent = ring(8, 45.0, 4);
+    sent.compact_values();
+    let back = PolarField::from_tail(&sent.to_tail()).expect("its own tail");
+
+    assert_eq!(
+        back.wire_form(),
+        PolarWireForm::Coded,
+        "widened at the door"
+    );
+    assert_eq!(
+        back.resident_bytes(),
+        sent.resident_bytes(),
+        "the receiver pays a different price from the sender for one plane",
+    );
+    assert_eq!(every_gate(&back), every_gate(&sent));
+    assert_eq!(back, sent);
+}
+
+/// **Neither form is ever read as the other**, which is what a versionless
+/// encoding could not say. Told the wrong form, the decoder declines rather
+/// than reading a table of codes as `f32`s.
+#[test]
+fn a_tail_read_as_the_other_form_is_declined_rather_than_misread() {
+    // The pinned layout fixture, which carries both NaNs — so the round trip
+    // below is asserted on the bytes rather than on `PartialEq`, which says a
+    // plane holding a NaN equals nothing, itself included.
+    let wide = layout_fixture();
+    let mut coded = wide.clone();
+    coded.compact_values();
+
+    for (name, f) in [("wide", &wide), ("coded", &coded)] {
+        let mut tail = f.to_tail();
+        assert_eq!(
+            PolarField::from_tail(&tail).map(|back| back.to_bytes()),
+            Some(f.to_bytes()),
+            "{name}: its own tail does not round-trip",
+        );
+        // The other form's byte over the same payload.
+        tail[0] = match PolarWireForm::from_wire_code(tail[0]).expect("this build wrote it") {
+            PolarWireForm::Wide => PolarWireForm::Coded.wire_code(),
+            PolarWireForm::Coded => PolarWireForm::Wide.wire_code(),
+        };
+        assert_eq!(
+            PolarField::from_tail(&tail),
+            None,
+            "{name}: a payload read as the form it is not was accepted",
+        );
+    }
+}
+
+/// A form byte this build does not write, and a tail with no form byte at
+/// all.
+///
+/// **Both payloads, because one of them alone cannot see this.** An unknown
+/// code that fell back to *wide* would still decline a coded payload — the
+/// two forms' length arithmetic disagrees, so the length check refuses it and
+/// a coded-only fixture reads green straight through the defect. The wide
+/// payload is what such a fallback accepts, and the coded payload is what a
+/// fallback to *coded* would. A tamper is what found that: with
+/// `from_wire_code` answering `Some(Wide)` to every code, the coded-only form
+/// of this test passed.
+#[test]
+fn a_form_this_build_does_not_write_is_declined() {
+    let wide = ring(8, 45.0, 4);
+    let mut coded = wide.clone();
+    coded.compact_values();
+    assert_eq!(wide.wire_form(), PolarWireForm::Wide);
+    assert_eq!(coded.wire_form(), PolarWireForm::Coded);
+
+    for (name, good) in [("wide", wide.to_tail()), ("coded", coded.to_tail())] {
+        for code in 2..=u8::MAX {
+            let mut tail = good.clone();
+            tail[0] = code;
+            assert_eq!(
+                PolarField::from_tail(&tail),
+                None,
+                "{name}: form {code} was read as a form this build writes",
+            );
+        }
+    }
+    assert_eq!(PolarField::from_tail(&[]), None, "an empty tail was read");
+}
+
+/// A coded tail this build did not write is declined rather than indexed
+/// into — at every truncation, one byte long, and with a code naming a table
+/// entry that is not there.
+#[test]
+fn a_coded_tail_this_build_did_not_write_is_declined_rather_than_indexed_into() {
+    let mut coded = ring(5, 60.0, 4);
+    coded.compact_values();
+    let good = coded.to_tail();
+    assert!(PolarField::from_tail(&good).is_some());
+
+    for n in 0..good.len() {
+        assert!(
+            PolarField::from_tail(&good[..n]).is_none(),
+            "a {n}-byte prefix was accepted"
+        );
+    }
+    let mut long = good.clone();
+    long.push(0);
+    assert!(PolarField::from_tail(&long).is_none());
+
+    // The last byte is a code; a table this field's plane cannot fill names
+    // nothing, and indexing it would be out of bounds on the hover thread.
+    let mut past_the_table = good.clone();
+    *past_the_table.last_mut().expect("a coded tail has codes") = u8::MAX;
+    assert!(
+        PolarField::from_tail(&past_the_table).is_none(),
+        "a code past the end of its own table was accepted",
+    );
+
+    // A table longer than a byte can address.
+    let mut huge_table = good.clone();
+    let table_at = 1 + 4 * 4 + 8 * 3 + 5 * 8;
+    huge_table[table_at..table_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(PolarField::from_tail(&huge_table).is_none());
+}
+
+/// **The two NaNs stay apart across the wire, in the coded form.**
+///
+/// `compacting_keeps_the_two_nans_apart` says the compaction preserves them;
+/// this says the *tail* does. `at` answers `None` for both the unpainted
+/// marker and the range-folded sentinel, so the only way to tell them apart
+/// is the bytes, and the assertion is made against the wide bytes of the
+/// plane the coded one was built from.
+#[test]
+fn a_coded_tail_keeps_the_two_nans_apart() {
+    let unpainted = f32::NAN;
+    let folded = super::super::RANGE_FOLDED_SENTINEL;
+    assert_ne!(
+        unpainted.to_bits(),
+        folded.to_bits(),
+        "this test is vacuous unless the two sentinels differ",
+    );
+
+    let wide = field_of(4, 2, &[unpainted, folded, 3.0, -0.0, 0.0, 7.5, -2.0, 9.0]);
+    let mut coded = wide.clone();
+    coded.compact_values();
+    assert_eq!(coded.wire_form(), PolarWireForm::Coded, "nothing was coded");
+
+    let back = PolarField::from_tail(&coded.to_tail()).expect("its own tail");
+    assert_eq!(
+        back.to_bytes(),
+        wide.to_bytes(),
+        "a bit pattern came back as another one across the coded tail",
+    );
+}
+
+/// The coded tail is a byte a gate plus its table, against four bytes a gate
+/// — computed off the shape, not a figure recorded here.
+#[test]
+fn the_coded_tail_costs_a_byte_a_gate_and_the_table() {
+    let numbers = every_kind_of_painted_number();
+    let (radials, gates) = (8, 32);
+    let wide = field_of(radials, gates, &numbers);
+    let mut coded = wide.clone();
+    coded.compact_values();
+
+    let front = 1 + 4 * 4 + 8 * 3 + radials * 8;
+    assert_eq!(wide.to_tail().len(), front + radials * gates * 4);
+    assert_eq!(
+        coded.to_tail().len(),
+        front + 4 + numbers.len() * size_of::<f32>() + radials * gates,
+        "a byte a gate, plus the table and its count",
+    );
+}
+
+/// A plane too various to code crosses the wire wide, and says so.
+#[test]
+fn a_plane_that_cannot_be_coded_crosses_the_wire_wide() {
+    let numbers: Vec<f32> = (0..257).map(|i| i as f32 * 0.25).collect();
+    let mut f = field_of(257, 257, &numbers);
+    f.compact_values();
+    assert_eq!(f.wire_form(), PolarWireForm::Wide);
+    let back = PolarField::from_tail(&f.to_tail()).expect("its own tail");
+    assert_eq!(back.wire_form(), PolarWireForm::Wide);
+    assert_eq!(every_gate(&back), every_gate(&f));
+}
+
+/// A stripped field — a loop frame's — crosses as the wide form with no
+/// values, which is the form it holds.
+#[test]
+fn a_stripped_field_crosses_the_wire_with_no_numbers() {
+    let mut f = ring(8, 45.0, 4);
+    f.strip_values();
+    let back = PolarField::from_tail(&f.to_tail()).expect("its own tail");
+    assert!(!back.has_values());
+    assert_eq!(back.geometry().wedges(), f.geometry().wedges());
 }

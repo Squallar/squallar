@@ -308,7 +308,10 @@ impl RenderedFrame {
         if !r.at_end() {
             return None;
         }
-        let polar = crate::render::polar::PolarField::from_bytes(&polar_bytes)?;
+        // Through the tail's own form byte and not through `from_bytes`: the
+        // reply carries whichever of `PolarField`'s two value forms the worker
+        // held, and the byte in front of the payload is what says which.
+        let polar = crate::render::polar::PolarField::from_tail(&polar_bytes)?;
         // The one decode-time materialization: the reply's bytes become the
         // pixel vec the consumer's `ColorImage` will take by move.
         let image = RasterImage::pixels_from_premultiplied(&image)?;
@@ -499,7 +502,7 @@ mod tests {
         let mut head = Vec::new();
         frame.write_head(&mut head);
         let (codes, image) = frame.clone().into_surface_tails();
-        (head, vec![frame.polar.to_bytes(), codes, image])
+        (head, vec![frame.polar.to_tail(), codes, image])
     }
 
     #[test]
