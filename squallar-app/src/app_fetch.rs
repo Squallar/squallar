@@ -3980,13 +3980,12 @@ fn as_of_for_layer(
     let Some(instant) = pane.time.mode.as_of() else {
         return fallback;
     };
-    let has_a_past = gui.overlays.handlers().any(|handler| {
-        handler.id() == *id
-            && matches!(
-                handler.time_axis(),
-                squallar_source::time::TimeAxis::EventLifetime
-                    | squallar_source::time::TimeAxis::FrameSeries { .. }
-            )
+    let has_a_past = gui.overlays.handler_by_id(id).is_some_and(|handler| {
+        matches!(
+            handler.time_axis(),
+            squallar_source::time::TimeAxis::EventLifetime
+                | squallar_source::time::TimeAxis::FrameSeries { .. }
+        )
     });
     if has_a_past { instant } else { fallback }
 }
@@ -4080,12 +4079,11 @@ fn depicted_reach_for_layer(
     id: &squallar_source::id::LayerId,
 ) -> Option<u64> {
     let pane = gui.pane(pane_idx)?;
-    let event_lifetime = gui.overlays.handlers().any(|handler| {
-        handler.id() == *id
-            && matches!(
-                handler.time_axis(),
-                squallar_source::time::TimeAxis::EventLifetime
-            )
+    let event_lifetime = gui.overlays.handler_by_id(id).is_some_and(|handler| {
+        matches!(
+            handler.time_axis(),
+            squallar_source::time::TimeAxis::EventLifetime
+        )
     });
     if !event_lifetime {
         return None;
@@ -4131,12 +4129,11 @@ fn depicted_frames_for_layer(
     if pane.time.mode.as_of().is_none() {
         return Vec::new();
     }
-    let event_lifetime = gui.overlays.handlers().any(|handler| {
-        handler.id() == *id
-            && matches!(
-                handler.time_axis(),
-                squallar_source::time::TimeAxis::EventLifetime
-            )
+    let event_lifetime = gui.overlays.handler_by_id(id).is_some_and(|handler| {
+        matches!(
+            handler.time_axis(),
+            squallar_source::time::TimeAxis::EventLifetime
+        )
     });
     if !event_lifetime {
         return Vec::new();
@@ -4244,6 +4241,10 @@ mod local_time_tests;
 #[path = "app_fetch/as_of_dispatch_tests.rs"]
 #[cfg(test)]
 mod as_of_dispatch_tests;
+
+#[path = "app_fetch/handler_scan_tests.rs"]
+#[cfg(test)]
+mod handler_scan_tests;
 
 #[path = "app_fetch/layer_budget_wiring_tests.rs"]
 #[cfg(test)]
