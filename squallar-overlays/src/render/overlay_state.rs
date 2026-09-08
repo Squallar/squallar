@@ -391,6 +391,37 @@ impl OverlayRegistry {
         self.handler(id).and_then(|h| h.auto_fetch_delay())
     }
 
+    /// **Every registered layer whose automatic round may start now**, in
+    /// registry order.
+    ///
+    /// The auto-poll check asks this of the whole registry once a frame, and
+    /// the shape it used to ask it in was a round trip: collect every
+    /// handler's id, then hand each id back to [`Self::auto_fetch_delay`],
+    /// which resolved it through [`Self::index_of`] to the very handler it had
+    /// just been read off. That is one linear id scan per registered layer — N
+    /// lookups and N(N+1)/2 full `LayerId` comparisons on a frame that has not
+    /// moved — plus a `Vec` of every id whether or not any of them were due.
+    /// Reading the delay off the handler beside its own cached id is the same
+    /// answer with **no lookups and no probes**.
+    ///
+    /// The pairing is [`Self::ids`]' documented invariant (`ids[i]` is
+    /// `handlers[i].id()`, held by `registry_ids_match_their_handlers`), and
+    /// distinctness — held by `registry_ids_are_distinct` — is what makes it
+    /// the same handler `auto_fetch_delay` would have found.
+    ///
+    /// **Nothing is due on the ordinary frame**, so the returned vector is
+    /// empty, and an empty `Vec` allocates nothing. It is owned rather than
+    /// borrowed because its caller needs the registry back, mutably, to act on
+    /// each answer.
+    pub fn ids_due_for_auto_fetch(&self) -> Vec<LayerId> {
+        self.handlers
+            .iter()
+            .zip(&self.ids)
+            .filter(|(handler, _)| handler.auto_fetch_delay().is_some_and(|d| d.is_zero()))
+            .map(|(_, id)| id.clone())
+            .collect()
+    }
+
     /// Wipe `kind`'s retry ledger because the **user** asked for a fetch.
     pub fn clear_retry(&mut self, id: &LayerId) {
         if let Some(r) = self.handler_mut(id).and_then(|h| h.retry_mut()) {
@@ -1497,6 +1528,33 @@ mod id_cache_tests {
                  {:?}: a lookup for either id reaches the wrong handler.",
                 handler.id(),
                 registry.ids[idx],
+            );
+        }
+    }
+
+    /// **And no two of them are the same id.**
+    ///
+    /// Agreement position-by-position is not enough on its own for a caller
+    /// that walks the two vectors in step rather than resolving: with a
+    /// duplicate id, `handlers[i]` and `index_of(&ids[i])` would be different
+    /// handlers, and [`OverlayRegistry::ids_due_for_auto_fetch`] would answer
+    /// for the second where every lookup in this file answers for the first.
+    /// Distinctness is what the whole id-resolver rests on and nothing pinned
+    /// it.
+    #[test]
+    fn registry_ids_are_distinct() {
+        let registry = OverlayRegistry::with_handlers(sources());
+        for (idx, id) in registry.ids.iter().enumerate() {
+            let first = registry
+                .ids
+                .iter()
+                .position(|held| held == id)
+                .expect("an id is found at its own position at worst");
+            assert_eq!(
+                first, idx,
+                "handlers {first} and {idx} both register {id:?}, so every \
+                 lookup for it reaches {first} and a walk in registry order \
+                 reaches both.",
             );
         }
     }

@@ -261,3 +261,64 @@ fn a_scrub_earns_a_round_where_the_request_carries_the_clock() {
          draws whichever alerts were in force now rather than then"
     );
 }
+
+/// **What the gate pays the registry to find out which layers are due**, read
+/// off the registry's own lookup ledger.
+///
+/// The check runs once per frame and its ordinary answer is "none of them".
+/// It used to reach that answer by collecting every registered handler's id
+/// and handing each one straight back to `OverlayRegistry::auto_fetch_delay`,
+/// which resolved it by scanning the id vector it had just been read out of —
+/// one linear scan per registered layer, per frame, plus a `Vec` of every id
+/// whether or not a single one was due. The registry now reads each handler's
+/// delay beside its own cached id
+/// (`OverlayRegistry::ids_due_for_auto_fetch`), so the walk costs no lookups
+/// at all and the vector it returns is empty.
+///
+/// **A ceiling that may only fall**, in the shape of the layer walk's
+/// (`crate::ui::map::lookup_tax_tests`): a measured figure with no headroom
+/// above it, because headroom is how a regression lands inside a pin.
+///
+/// **And it is deliberately not a function of how many layers are
+/// registered.** The remaining lookups are the radar arm's own two by name
+/// (`archive_poll_delay` and `archive_poll_started`, one `POLL_LAYER`
+/// resolution each) and whatever a started round costs. Registering a
+/// nineteenth source must not move this number; if it does, the fan-out has
+/// gone back to resolving identities it was already holding.
+///
+/// The denominator is **one turn of the gate on one pane**, not a frame and
+/// not a pane loop — `check_auto_polls` is called once per frame however many
+/// panes there are.
+#[test]
+fn the_auto_poll_gate_does_not_resolve_every_registered_layer_by_id() {
+    use squallar_overlays::render::overlay_state::lookup_ledger;
+
+    let mut gui = Gui::new();
+    // One warm turn first: the session's very first call starts the radar
+    // layer's opening round, which is a different (and legitimate) cost from
+    // the per-frame walk this pins.
+    let mut warm = Vec::new();
+    gui.check_auto_polls(&mut warm);
+
+    let registered = gui.overlays.handlers().count();
+    lookup_ledger::reset();
+    let mut actions = Vec::new();
+    gui.check_auto_polls(&mut actions);
+    let (lookups, probes, _) = lookup_ledger::read();
+
+    // Printed whether or not the assertion fires: the figure is the finding.
+    eprintln!(
+        "auto-poll gate over {registered} registered layers: {lookups} lookups, {probes} probes"
+    );
+    assert!(
+        lookups <= AUTO_POLL_LOOKUP_CEILING,
+        "one turn of the auto-poll gate asked the registry to resolve {lookups} \
+         ids ({probes} full id comparisons) over the {AUTO_POLL_LOOKUP_CEILING} \
+         this tree measured, with {registered} layers registered. This runs on \
+         every frame and the ceiling may only fall.",
+    );
+}
+
+/// See [`the_auto_poll_gate_does_not_resolve_every_registered_layer_by_id`] —
+/// measured off this tree, not chosen, and not to be raised.
+const AUTO_POLL_LOOKUP_CEILING: u64 = 2;

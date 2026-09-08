@@ -419,16 +419,18 @@ impl Gui {
         // fresh. The radar arm above has fanned out over its own distinct asks
         // (`seen_sites`) all along; this is the same shape for the layers whose
         // ask is a selection rather than a site.
-        let poll_ids: Vec<squallar_source::id::LayerId> =
-            self.overlays.handlers().map(|h| h.id()).collect();
-        for kind in poll_ids {
-            if !self
-                .overlays
-                .auto_fetch_delay(&kind)
-                .is_some_and(|d| d.is_zero())
-            {
-                continue;
-            }
+        //
+        // **The registry answers which ones are due; this used to ask it one
+        // id at a time.** The old spelling collected every handler's id and
+        // then handed each back to `auto_fetch_delay`, which resolved it by
+        // scanning the id vector it had just been read out of — one linear
+        // scan per registered layer, every frame, to arrive back at the
+        // handler the iterator had already been standing on. The registry
+        // reads the delay beside the id instead, so the ordinary frame — on
+        // which nothing is due — pays no lookup, no probe and no allocation
+        // at all, rather than eighteen lookups and a hundred and seventy-one
+        // comparisons for an empty answer.
+        for kind in self.overlays.ids_due_for_auto_fetch() {
             for pane_idx in self.panes_owed_a_round(&kind) {
                 actions.push(GuiAction::FetchOverlay {
                     kind: kind.clone(),
