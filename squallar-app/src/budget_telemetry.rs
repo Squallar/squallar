@@ -577,6 +577,166 @@ pub(crate) fn overlay_pictures_line(
     )
 }
 
+/// **Whether a host-heap pressure signal would ever have fired on this
+/// session, and on how many readings** — counted, never acted on.
+///
+/// # Why a counter and not a cause
+///
+/// No native target raises host-heap pressure at all. The two host-heap
+/// causes [`crate::pressure::Pressure`] carries — the wasm page instance's
+/// and the rasterization worker's — are both behind
+/// `crate::platform::PlatformBridge::linear_memory`, whose trait default is
+/// `None` and which no native bridge overrides; the platform memory warning
+/// is iOS and Android only (winit raises `Event::MemoryWarning` from
+/// `didReceiveMemoryWarning` and `onLowMemory` and nowhere else). What is
+/// left on a desktop is a lost surface and a wgpu allocation failure, and
+/// **neither is a reading**: both are a refusal already suffered. So on the
+/// platform this application's live-bytes figure is measured on, nothing
+/// sheds host memory *because host memory is high*.
+///
+/// Whether that gap costs anything is a measurement question, and it has been
+/// argued from source rather than measured. This is the measurement: the two
+/// figures such a signal would compare, and a running count of the readings
+/// on which the comparison would have said "pressure".
+///
+/// **It pulls no lever, raises no cause and gates nothing.** It is filed here
+/// beside the lines rather than in [`crate::pressure`] deliberately: a watch
+/// kept in that module would read as a fifth trigger, and there are four.
+///
+/// # The line it would fire at
+///
+/// `squallar_device_profile::linear_memory::act_line(allowance, headroom)` —
+/// the same function the page heap's watermark judges by, against a different
+/// ceiling. **`max` there is a hard wall and here it is not**, and the
+/// difference is the whole reason a desktop signal is possible at all: a
+/// browser page has a declared `WebAssembly.Memory` maximum it traps at,
+/// where a native process has the machine. What stands in its place is
+/// `Capacity::host_allowance()` — three quarters of what the OS said was
+/// available on this tick plus what this process already holds, scaled by the
+/// user's own `PoolPercents::host` share. Crossing it is not a trap; it is
+/// this process passing the share it declared for itself, on a pool the OS
+/// re-quoted two seconds ago. That figure **recedes** as the rest of the
+/// machine fills, which is the property a wall cannot have and the reason it
+/// is the right line rather than a constant.
+///
+/// An allowance of zero is "nobody said a usable figure", exactly as
+/// `linear_memory_verdict` reads a `max` of zero, and never a wall of zero:
+/// without that guard every reading of every profile carrying no host figure
+/// would count as over, since `act_line(0, h)` is 0 and any reading is at or
+/// past it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HostHeapWatch {
+    /// Readings on which both figures were present and the live figure stood
+    /// at or past the act line.
+    over: u32,
+    /// Readings on which both figures were present, whatever the verdict.
+    ///
+    /// **The denominator of [`Self::over`], and it is not the tick count.** A
+    /// reading with no host capacity figure, or one taken in a binary that
+    /// installed no counting allocator — every test binary in this workspace
+    /// — is neither over nor under, and is in neither figure. The line prints
+    /// both numbers for that reason.
+    judged: u32,
+    /// **The closest this session came to the line**, as a percentage of it,
+    /// over the judged readings — 100 or more on a session that crossed.
+    ///
+    /// Here because a bare `over 0 of 42` cannot tell a session that ran
+    /// comfortably from one that ran at 99 % and happened not to tip, and the
+    /// two mean opposite things for whether this application needs a desktop
+    /// host-heap signal at all. A null result with a peak of 7 % retires the
+    /// question; a null result with a peak of 96 % is a near miss and re-opens
+    /// it. Integer percent, and the product is taken in `u128` for the reason
+    /// `linear_memory_verdict` takes its own that way: saturating in `u64`
+    /// would make a nearly-full reading near the top of the range read as
+    /// under.
+    peak_percent: u32,
+}
+
+impl HostHeapWatch {
+    /// Judge one reading and count it. `live` is
+    /// `squallar_alloc::live_bytes()` and `allowance` is
+    /// `Capacity::host_allowance()`, both as their callers hold them, so an
+    /// absent figure stays absent rather than becoming a zero.
+    pub(crate) fn observe(&mut self, live: Option<u64>, allowance: Option<u64>, headroom: u64) {
+        let Some(line) = act_line_for(allowance, headroom) else {
+            return;
+        };
+        let Some(live) = live else {
+            return;
+        };
+        self.judged = self.judged.saturating_add(1);
+        if live >= line {
+            self.over = self.over.saturating_add(1);
+        }
+        // `line` is non-zero: `act_line_for` already refused a zero allowance,
+        // and the percentage term of a non-zero allowance is only zero for an
+        // allowance under 100 bytes, which the headroom bound would have to
+        // agree with. Guarded anyway, because a division that cannot happen is
+        // cheaper to guard than to argue.
+        if line > 0 {
+            let percent = (u128::from(live) * 100 / u128::from(line)).min(u128::from(u32::MAX));
+            self.peak_percent = self.peak_percent.max(percent as u32);
+        }
+    }
+
+    /// Readings on which a host-heap signal would have raised pressure, the
+    /// readings on which it could have judged at all, and the closest approach
+    /// as a percentage of the line.
+    pub(crate) fn counts(self) -> (u32, u32, u32) {
+        (self.over, self.judged, self.peak_percent)
+    }
+}
+
+/// Where a host-heap reading would become pressure, or `None` where the
+/// allowance says nothing. See [`HostHeapWatch`] for why a zero allowance is
+/// an absence.
+fn act_line_for(allowance: Option<u64>, headroom: u64) -> Option<u64> {
+    allowance
+        .filter(|bytes| *bytes > 0)
+        .map(|bytes| squallar_device_profile::linear_memory::act_line(bytes, headroom))
+}
+
+/// `host heap watch: live 3266 MiB, allowance 46080 MiB, act line 40089 MiB,
+/// headroom 512 MiB, over 0 of 42 readings` — the two figures a host-heap
+/// pressure signal would compare and how often it would have fired, said
+/// every telemetry period on every target.
+///
+/// **Nothing here gates anything and nothing here sheds a byte**; see
+/// [`HostHeapWatch`]. Its own line and never appended to `budget state:`,
+/// which is scraped by a regex whose groups are positional.
+///
+/// `headroom` is printed beside the line it bounds because without it a
+/// reader cannot tell which of the act line's two terms is in force — the
+/// percentage of the allowance, or the allowance less what the scene's next
+/// picture batch is about to take. Every byte figure is MiB by integer
+/// division, like every other figure in this module, and an absent one is
+/// `none` rather than `0`: a profile that carries no host capacity and a
+/// binary with no counting allocator are both silences, not zeroes.
+pub(crate) fn host_heap_watch_line(
+    live: Option<u64>,
+    allowance: Option<u64>,
+    headroom: u64,
+    watch: HostHeapWatch,
+) -> String {
+    // The same spelling as `budget_state_line`'s own, and local for the same
+    // reason: every byte figure in this module is MiB by integer division,
+    // because the rig's probe reads these sentences with `(\d+)` groups.
+    let mib = |bytes: u64| bytes / (1024 * 1024);
+    let say = |bytes: Option<u64>| match bytes {
+        Some(bytes) => format!("{} MiB", mib(bytes)),
+        None => "none".to_string(),
+    };
+    let (over, judged, peak) = watch.counts();
+    format!(
+        "host heap watch: live {}, allowance {}, act line {}, headroom {} MiB, \
+         over {over} of {judged} readings, peak {peak} percent",
+        say(live),
+        say(allowance),
+        say(act_line_for(allowance, headroom)),
+        mib(headroom),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1829,6 +1989,110 @@ mod tests {
         assert!(
             overlay_pictures_line(&many, (0, 0), 150).contains(&format!("bytes={expected}")),
             "the byte total wrapped",
+        );
+    }
+}
+
+/// The would-have-fired counter and the line that says what it counted.
+///
+/// These test the instrument's own arithmetic. What they do **not** test, and
+/// what nothing in this workspace can, is the campaign question the counter
+/// exists to settle: whether a real desktop session ever crosses the line.
+/// That is a reading off a running app, which is why this landed as an
+/// always-on instrument rather than as an argument.
+#[cfg(test)]
+mod host_heap_watch_tests {
+    use super::*;
+
+    const MIB: u64 = 1 << 20;
+
+    /// A reading at or past the act line is counted over; one under it is
+    /// counted judged and not over. The line here is the percentage term —
+    /// 87 % of 1,000 MiB is 870 — because the headroom is small enough that
+    /// `allowance - headroom` is the looser of the two bounds.
+    #[test]
+    fn a_reading_past_the_line_counts_over_and_one_under_it_does_not() {
+        let allowance = Some(1000 * MIB);
+        let headroom = 10 * MIB;
+        let mut watch = HostHeapWatch::default();
+        watch.observe(Some(500 * MIB), allowance, headroom);
+        assert_eq!(watch.counts(), (0, 1, 57), "500 of the 870 MiB line");
+        watch.observe(Some(900 * MIB), allowance, headroom);
+        assert_eq!(watch.counts(), (1, 2, 103));
+        watch.observe(Some(870 * MIB), allowance, headroom);
+        assert_eq!(
+            watch.counts(),
+            (2, 3, 103),
+            "at the line is at or past it, and the peak is a high-water mark",
+        );
+    }
+
+    /// **The headroom is the other bound, and it is the one that can bite.**
+    /// A scene whose next picture batch is 400 MiB of a 1,000 MiB allowance
+    /// puts the line at 600, not at 870, so a reading of 700 is over on the
+    /// same allowance that left it under above. This is the term that makes
+    /// pulling a lever RAISE the line, and a version of this instrument built
+    /// on the percentage alone would not have it.
+    #[test]
+    fn the_scenes_next_batch_lowers_the_line_below_the_percentage() {
+        let allowance = Some(1000 * MIB);
+        let mut under = HostHeapWatch::default();
+        under.observe(Some(700 * MIB), allowance, 10 * MIB);
+        assert_eq!(under.counts(), (0, 1, 80), "700 of an 870 MiB line");
+        let mut over = HostHeapWatch::default();
+        over.observe(Some(700 * MIB), allowance, 400 * MIB);
+        assert_eq!(over.counts(), (1, 1, 116), "700 of a 600 MiB line");
+    }
+
+    /// **An allowance of zero is a silence, not a wall of zero.** Without the
+    /// guard `act_line(0, h)` is 0, every reading is at or past it, and a
+    /// profile that carries no host figure would read as permanently
+    /// pressured — the exact false positive that would make the counter's
+    /// answer worthless. `linear_memory_verdict` spells a `max` of 0 `Quiet`
+    /// for the same reason.
+    #[test]
+    fn a_zero_allowance_is_absent_rather_than_a_wall_of_zero() {
+        let mut watch = HostHeapWatch::default();
+        watch.observe(Some(1), Some(0), 0);
+        assert_eq!(watch.counts(), (0, 0, 0), "neither over nor judged");
+        assert!(host_heap_watch_line(Some(1), Some(0), 0, watch).contains("act line none"));
+    }
+
+    /// **The denominator is readings it could judge, not ticks.** A profile
+    /// with no host figure and a binary with no counting allocator are both
+    /// silences, and counting either as "under the line" would report a
+    /// session as comfortable when it was only unmeasured.
+    #[test]
+    fn a_reading_missing_either_figure_is_in_neither_count() {
+        let mut watch = HostHeapWatch::default();
+        watch.observe(None, Some(1000 * MIB), 0);
+        watch.observe(Some(500 * MIB), None, 0);
+        assert_eq!(watch.counts(), (0, 0, 0));
+        watch.observe(Some(500 * MIB), Some(1000 * MIB), 0);
+        assert_eq!(watch.counts(), (0, 1, 57));
+    }
+
+    /// The line names both figures, the line derived from them, the headroom
+    /// term that derived it, and both halves of the count.
+    #[test]
+    fn the_line_says_both_figures_the_line_and_both_halves_of_the_count() {
+        let mut watch = HostHeapWatch::default();
+        watch.observe(Some(900 * MIB), Some(1000 * MIB), 10 * MIB);
+        assert_eq!(
+            host_heap_watch_line(Some(900 * MIB), Some(1000 * MIB), 10 * MIB, watch),
+            "host heap watch: live 900 MiB, allowance 1000 MiB, act line 870 MiB, \
+             headroom 10 MiB, over 1 of 1 readings, peak 103 percent",
+        );
+    }
+
+    /// A binary with no counting allocator and a profile with no host figure
+    /// both print `none`, and the count still says how little it saw.
+    #[test]
+    fn absent_figures_print_none_rather_than_zero() {
+        assert_eq!(
+            host_heap_watch_line(None, None, 0, HostHeapWatch::default()),
+            "host heap watch: live none, allowance none, act line none, headroom 0 MiB, \
+             over 0 of 0 readings, peak 0 percent",
         );
     }
 }

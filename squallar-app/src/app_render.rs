@@ -2640,6 +2640,26 @@ impl super::App {
         // request is refused; this tick is the slow copy, and on a scene that
         // climbs hundreds of MB between two ticks the hook's is the one to
         // believe.
+        // **The two figures a host-heap pressure signal would compare, and how
+        // often it would have fired.** Its own line, never appended to
+        // `budget state:` — that one is scraped by a positional regex — and
+        // acted on nowhere: `budget_telemetry::HostHeapWatch` carries the
+        // account of why a counter is the right answer here and a lever is
+        // not. Placed after the host pool was re-read above, so the allowance
+        // is this tick's and not the last one's.
+        let host_allowance = self.capacity().host_allowance();
+        let own_live = squallar_alloc::live_bytes();
+        self.host_heap_watch
+            .observe(own_live, host_allowance, self.host_headroom_bytes);
+        say_telemetry(
+            loud,
+            &crate::budget_telemetry::host_heap_watch_line(
+                own_live,
+                host_allowance,
+                self.host_headroom_bytes,
+                self.host_heap_watch,
+            ),
+        );
         self.publish_heap_census();
         // **One reading of the idle policy, off the level the call above just
         // folded.** `render pools` is the largest family on a quiet scene and

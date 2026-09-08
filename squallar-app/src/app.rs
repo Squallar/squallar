@@ -325,9 +325,19 @@ pub struct App {
     /// walk priced it — every shown overlay picture at the budget's
     /// oversampling plus one arrival — so the watermark's action line can be
     /// derived from the scene on every reading without a second pane walk
-    /// (`squallar_device_profile::linear_memory::act_line`). Zero natively
-    /// and before the first walk.
+    /// (`squallar_device_profile::linear_memory::act_line`). Zero before the
+    /// first walk, and **not** zero natively: `Self::observe_loop_demand`
+    /// writes it on every loop walk on every target, and it is `fit`'s own
+    /// picture terms rather than anything the page heap owns. Only the
+    /// watermark that READ it was native dead code, and it is not the only
+    /// reader any more ([`Self::host_heap_watch`]).
     host_headroom_bytes: u64,
+    /// **How often a host-heap pressure signal would have fired**, had this
+    /// application had one on this target. Judged on the telemetry tick,
+    /// printed on its own line, and acted on nowhere:
+    /// [`crate::budget_telemetry::HostHeapWatch`] carries the whole account
+    /// of why the question is open and why the answer is a counter.
+    host_heap_watch: crate::budget_telemetry::HostHeapWatch,
     /// **The budget system's readout** — per pane, what the scene costs and
     /// what the pane's stores hold; per pool, capacity, need and spare
     /// (`squallar_egui::shell_api::BudgetReadout`). Re-stated to the Gui with
@@ -975,6 +985,7 @@ impl App {
             memory_percents,
             texture_ceiling,
             host_headroom_bytes: 0,
+            host_heap_watch: crate::budget_telemetry::HostHeapWatch::default(),
             budget_readout: squallar_egui::shell_api::BudgetReadout::default(),
             admission_costs: squallar_egui::admission::AdmissionCosts::default(),
             admission: squallar_egui::admission::AdmissionLedger::default(),

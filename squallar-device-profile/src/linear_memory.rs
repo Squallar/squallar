@@ -19,10 +19,20 @@
 //! their walls are ever added. A ceiling of 0 is "nobody said" and is
 //! [`LinearMemoryVerdict::Quiet`] whatever the reading — never a wall of zero,
 //! and never silently replaced with the link flag, which on a handheld would
-//! be double the truth. A native
-//! bridge reads no heap, so nothing here is reached natively — that is the
-//! caller's job, held in `squallar-app` by
+//! be double the truth.
+//!
+//! **A native bridge reads no heap, so no PRESSURE is raised from here
+//! natively** — that is the caller's job, held in `squallar-app` by
 //! `a_native_profile_with_no_heap_reading_is_never_pressured_by_the_tick`.
+//!
+//! **That is a claim about pressure and not about reach, and the two come
+//! apart here.** [`linear_memory_verdict`] is what stays web-only, and it is
+//! web-only because of who calls it rather than because of anything in this
+//! module. [`act_line`] is pure arithmetic over two byte figures, and
+//! `squallar-app`'s `budget_telemetry::HostHeapWatch` calls it on every
+//! target — against that application's own host allowance rather than a
+//! declared wall — to count how often a host-heap signal would have fired on
+//! a platform that has none. It raises nothing, and neither does this.
 
 /// Percent of the ceiling at which a reading is worth one line in the log:
 /// 768 MiB of a 1 GiB instance, 384 MiB of a 512 MiB one.
