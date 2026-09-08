@@ -2756,6 +2756,36 @@ impl App {
             let Some(pane) = self.gui.pane(idx) else {
                 continue;
             };
+            // **A pane that needs no radar data retains none.**
+            //
+            // The fetch gates that landed on 2026-09-07 stopped a pane with
+            // its radar layer switched off from *acquiring* a volume — the
+            // notification sockets, the chunk feed and the archive cadence all
+            // ask `PaneState::needs_radar_data` through `Gui::live_sites`.
+            // Nothing asked it here, so a pane that had a volume when the user
+            // switched the layer off went on naming its site and its moment to
+            // every retention below, and the decoded volume, the base, the
+            // auto-poll's cached copy and the site's extractions stayed
+            // resident for the life of the process — a measured 48.4 MiB of
+            // `still scans` per pane, for a layer drawing nothing.
+            //
+            // The same accessor the fetch asks, so the two cannot disagree
+            // about which panes want volumes: wider than the draw question by
+            // the one case that reads a volume without the map drawing radar
+            // (a cross-section or a 3D pane), which is exactly the set that
+            // must go on being retained for.
+            //
+            // **A union over panes, so a sibling still showing the site keeps
+            // it**: two panes on one site part company only when neither wants
+            // it.
+            //
+            // The way back is the fetch's own: the site rejoins `live_sites`
+            // on the frame the layer comes back on, and the archive cadence
+            // and the chunk feed refill it. What this costs is a refetch,
+            // never fidelity.
+            if !pane.needs_radar_data() {
+                continue;
+            }
             shown.push(pane.site());
             if let Some(info) = pane.scan_info.as_ref() {
                 shown.push(info.site.name);
@@ -2866,6 +2896,21 @@ impl App {
         // walk exists to read loop state, which is what makes it WO-T3.7's to
         // shed.
         for pane in self.gui.panes() {
+            // **The parked volume of a pane that needs no radar data is not
+            // parked on by anybody** — `evict_unshown_scans` above has just
+            // dropped it from the still inventory on the same predicate, and
+            // the loop cache holds the very same `Arc`, so leaving this half
+            // alone would free nothing at all.
+            //
+            // Only the `scan_info` contribution is asked this. The loop walk
+            // below is untouched: a live loop's frames are still named by
+            // `needed`, and `site_needs_decoded_source` still decides which
+            // sites keep their moments — so a site something is still
+            // deriving from keeps everything it kept before, and nothing this
+            // drops is re-downloaded by a loop that is still running.
+            if !pane.needs_radar_data() {
+                continue;
+            }
             if let Some(info) = pane.scan_info.as_ref() {
                 needed
                     .entry(info.site.name)
@@ -3708,3 +3753,8 @@ mod time_group_delivery_tests;
 /// allocations a caller shares.
 #[cfg(test)]
 mod scan_ownership_tests;
+
+/// A pane that needs no radar data retains none of it: the eviction pass's own
+/// half of the gate the fetch already asks.
+#[cfg(test)]
+mod disabled_radar_retention_tests;
