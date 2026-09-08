@@ -2550,7 +2550,14 @@ impl Gui {
     ///
     /// [`PaneState::clock_layer`]: crate::pane::PaneState::clock_layer
     /// [`PaneState::topmost_frame_series_layer`]: crate::pane::PaneState::topmost_frame_series_layer
+    /// **Not a read**: the walk asks every enabled layer on the pane whether
+    /// it comes in stamped frames, and each of those questions scans the
+    /// registry, calling `OverlayHandler::id` on each handler until it
+    /// matches. Asked where it is drawn — inside the step picker's own
+    /// dropdown body — and nowhere else.
     pub fn pane_has_frame_series_layer(&self, idx: usize) -> bool {
+        #[cfg(test)]
+        frame_series_query_count::note();
         self.panes
             .get(idx)
             .is_some_and(|pane| pane.topmost_frame_series_layer(&self.overlays).is_some())
@@ -2908,3 +2915,30 @@ mod admission_door_tests;
 /// Which panes each scan-info event is addressed to.
 #[cfg(test)]
 mod scan_info_audience_tests;
+
+/// How many times [`Gui::pane_has_frame_series_layer`] has been asked on this
+/// thread — the counter behind
+/// `a_frame_with_the_step_picker_closed_asks_no_frame_series_question`.
+///
+/// Test-only, and a thread-local because the query takes `&self`.
+#[cfg(test)]
+pub(crate) mod frame_series_query_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ASKED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn note() {
+        ASKED.with(|c| c.set(c.get().wrapping_add(1)));
+    }
+
+    /// Questions asked on this thread since the last [`reset`].
+    pub(crate) fn read() -> u64 {
+        ASKED.with(Cell::get)
+    }
+
+    pub(crate) fn reset() {
+        ASKED.with(|c| c.set(0));
+    }
+}

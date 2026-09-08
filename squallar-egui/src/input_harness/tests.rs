@@ -9495,6 +9495,64 @@ fn the_site_pill_popover_searches_and_switches() {
     assert!(h.pill_popover().is_none(), "a pick closes the popover");
 }
 
+/// **A step picker nobody opened asks no frame-series question.**
+///
+/// `Gui::pane_has_frame_series_layer` is not a read: it walks the pane's
+/// enabled layers from the top and asks each one whether it comes in stamped
+/// frames, and each of those questions scans the whole handler registry,
+/// calling `OverlayHandler::id` on every handler until it matches. The
+/// timeline's transport row asked it above the step dropdown, on every frame
+/// the timeline was expanded, and its only consumer was the dropdown body —
+/// which `ComboBox::show_ui` runs through `Popup::menu(..).show(..)`, and
+/// egui does not run that while the dropdown is closed
+/// (`containers/combo_box.rs`, `containers/popup.rs`). Counted on the
+/// harness's own one-pane scene, repeat-identical across three runs: one
+/// query a frame, walking 6 of the pane's layers and making **106 handler
+/// probes** — each an `OverlayHandler::id` virtual call returning an owned
+/// `LayerId`, and a full `LayerId` comparison against it — now zero.
+///
+/// The question is now asked inside the body. The property, both ways:
+/// **zero on a frame with the dropdown closed, one on the frame it is open.**
+/// Zero on the open frame would offer "1 scan" to a pane that has no frames.
+#[test]
+fn a_frame_with_the_step_picker_closed_asks_no_frame_series_question() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+    h.close_layers();
+    h.warm_up();
+    assert!(
+        h.timeline().step_dropdown.is_positive(),
+        "premise: the expanded timeline must be drawing its step dropdown"
+    );
+
+    crate::ui::frame_series_query_count::reset();
+    h.frame();
+    let closed = crate::ui::frame_series_query_count::read();
+    assert_eq!(
+        closed, 0,
+        "a frame with the step dropdown closed asked the frame-series \
+         question {closed} time(s), each a walk of the pane's layers against \
+         the whole handler registry, for an entry nobody was looking at."
+    );
+
+    h.mouse_click(h.timeline().step_dropdown.center());
+    h.frame_after(FRAME_DT);
+    assert!(
+        h.painted_text_strings().iter().any(|text| text == "1 scan"),
+        "premise: the click must have opened the step dropdown"
+    );
+
+    crate::ui::frame_series_query_count::reset();
+    h.frame();
+    let open = crate::ui::frame_series_query_count::read();
+    assert_eq!(
+        open, 1,
+        "a frame with the step dropdown OPEN asked the frame-series question \
+         {open} time(s). One is what decides whether \"1 scan\" is offered; \
+         zero would offer it to a pane with no frames."
+    );
+}
+
 /// **A site picker nobody opened assembles no site sections.**
 ///
 /// `Gui::site_sections` is not a read. It clones the whole favourites list,

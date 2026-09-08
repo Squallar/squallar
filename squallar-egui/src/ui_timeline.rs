@@ -1027,10 +1027,6 @@ impl super::Gui {
             }
         }
 
-        // A one-frame step needs a layer that has frames. A pane with none
-        // still SEES the entry — disabled, with the reason on hover — because
-        // an option that vanishes is an option the user cannot ask about.
-        let offers_frames = self.pane_has_frame_series_layer(pane_idx);
         let step_label = TIME_STEP_OPTIONS
             .iter()
             .find(|(s, _)| *s == step)
@@ -1041,6 +1037,16 @@ impl super::Gui {
             .selected_text(step_label)
             .width(70.0)
             .show_ui(ui, |ui| {
+                // A one-frame step needs a layer that has frames. A pane with
+                // none still SEES the entry — disabled, with the reason on
+                // hover — because an option that vanishes is an option the
+                // user cannot ask about.
+                //
+                // Asked here rather than above the combo: `show_ui` runs this
+                // body through `Popup::menu(..).show(..)`, which egui skips
+                // while the dropdown is closed, and the question is a walk of
+                // the pane's layers against the whole handler registry.
+                let offers_frames = self.pane_has_frame_series_layer(pane_idx);
                 for &(option, label) in TIME_STEP_OPTIONS {
                     if option == TimeStep::OneFrame && !offers_frames {
                         ui.add_enabled_ui(false, |ui| {
