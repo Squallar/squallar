@@ -3245,6 +3245,17 @@ impl PaneState {
     /// a member actually differs, so a pane whose selection has not moved
     /// allocates nothing.
     ///
+    /// **That last sentence was false until 2026-09-08.** The comparison was
+    /// made against an owned `serde_json::Value` of the product and an owned
+    /// clone of the site, both built *before* the three freshness tests could
+    /// say they were not needed — two heap allocations on every call, on a
+    /// path `hydrate_layer_states` runs once per pane per frame from the draw
+    /// walk and again on every overlay dispatch. The tests now compare
+    /// borrowed `&str` against the held members and the owned spellings are
+    /// built only on the branch that writes them, which is what the sentence
+    /// had always claimed. `app_render`'s animating-layer walk still guards
+    /// its own call — the hydrate it avoids is more than this publish.
+    ///
     /// `live_chunks` is deliberately NOT projected: unlike the other three it
     /// has no field on the pane to be projected *from* — the slot's config is
     /// its only home, read by [`Self::radar_live_chunks`] and written by
@@ -3255,6 +3266,44 @@ impl PaneState {
         } else {
             0.0
         };
+        // **The freshness question is asked through borrows, before anything
+        // is allocated.** A pane with no radar slot has nowhere to publish to
+        // and leaves here; every other pane compares the three members
+        // against its own fields as `&str` and `f32`. The owned spellings —
+        // the serialized product and the cloned site — belong to the write,
+        // and the write is the rare path: a selection moves when the user
+        // moves it, while this runs once per pane per frame from the draw
+        // walk and again per overlay dispatch.
+        let Some(slot) = self.slot(&known::RADAR) else {
+            return;
+        };
+        let held = slot.config.as_object();
+        // **Compared in the pane's own precision, not the file's.** The tilt is
+        // an `f32` on the pane and an f64 in JSON, and widening `0.9f32` gives
+        // `0.8999999761581421` — so a value-wise comparison would call every
+        // slot stale on the first frame and rewrite a member the file's own
+        // round trip had preserved exactly. The save path widens it too, so
+        // nothing here changes what is eventually written; it only refuses to
+        // churn a member whose meaning has not moved.
+        let site_fresh =
+            held.and_then(|m| m.get("site")).and_then(|v| v.as_str()) == Some(self.site.as_str());
+        // `FieldId` is `#[serde(transparent)]` over a `Cow<'static, str>`, so
+        // the serialization this used to compare against is a `Value::String`
+        // of exactly `as_str`. Comparing the strings is the same question
+        // without building one: a held member that is not a string answers
+        // `None` here and is stale, which is what comparing it against a
+        // `Value::String` already said.
+        let product_fresh = held
+            .and_then(|m| m.get("product"))
+            .and_then(serde_json::Value::as_str)
+            == Some(self.selected_product.as_str());
+        let elevation_fresh = held
+            .and_then(|m| m.get("elevation"))
+            .and_then(serde_json::Value::as_f64)
+            .is_some_and(|held| held as f32 == elevation);
+        if site_fresh && product_fresh && elevation_fresh {
+            return;
+        }
         let product = match serde_json::to_value(&self.selected_product) {
             Ok(product) => product,
             Err(e) => {
@@ -3266,23 +3315,6 @@ impl PaneState {
         let Some(slot) = self.slot_mut(&known::RADAR) else {
             return;
         };
-        let held = slot.config.as_object();
-        // **Compared in the pane's own precision, not the file's.** The tilt is
-        // an `f32` on the pane and an f64 in JSON, and widening `0.9f32` gives
-        // `0.8999999761581421` — so a value-wise comparison would call every
-        // slot stale on the first frame and rewrite a member the file's own
-        // round trip had preserved exactly. The save path widens it too, so
-        // nothing here changes what is eventually written; it only refuses to
-        // churn a member whose meaning has not moved.
-        let site_fresh = held.and_then(|m| m.get("site")).and_then(|v| v.as_str()) == Some(&site);
-        let product_fresh = held.and_then(|m| m.get("product")) == Some(&product);
-        let elevation_fresh = held
-            .and_then(|m| m.get("elevation"))
-            .and_then(serde_json::Value::as_f64)
-            .is_some_and(|held| held as f32 == elevation);
-        if site_fresh && product_fresh && elevation_fresh {
-            return;
-        }
         let mut map = match slot.config.take() {
             serde_json::Value::Object(map) => map,
             _ => serde_json::Map::new(),
