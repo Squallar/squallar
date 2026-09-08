@@ -1277,6 +1277,66 @@ fn tile_disposition_line(d: &squallar_egui::tile_source::take_ledger::Dispositio
     )
 }
 
+/// A ratio with no denominator behind it, rendered as an absence rather than
+/// as a number. **Never `0`**: a zero here would read as "nothing was
+/// overdrawn", which is a measurement, where this is the absence of one — the
+/// same distinction `heap_census`'s `rss unread` draws.
+fn gridded_ratio(v: Option<f64>) -> String {
+    v.map_or_else(|| "unread".to_owned(), |r| format!("{r:.3}"))
+}
+
+/// The `gridded scatter:` running-total line — what the gridded overlay
+/// rasterizer has written, and what it wrote it into.
+///
+/// # The denominator, and it is the whole reason this line exists
+///
+/// **Process-wide, summed across every worker.** `rasterize_gridded` runs on
+/// the offload pool, so the app's reading is every thread's rasters added
+/// together — which is what
+/// [`squallar_overlays::render::rasterize::gridded_ledger::totals`] is. The
+/// ledger also keeps a thread-local (`thread_totals`) that exists so a test
+/// can take an exact delta while other tests raster on other threads; that one
+/// is **not** what belongs here, and a line built from it would report
+/// whichever worker happened to serve this frame and read as a collapse every
+/// time the pool handed the work to another thread.
+///
+/// # Three figures, three denominators, and only one pair is a ratio
+///
+/// * `written` is pixel **stores**, counted once per store: a pixel two cells
+///   both cover is two. This is *work*, not coverage — a change that cut it by
+///   drawing less data would be a regression wearing a win's figure.
+/// * `picture` is `width * height` of those pictures, summed. `written /
+///   picture` is the **overdraw ratio the campaign quotes**, and it is a ratio
+///   only because both terms are on this one line: 1.0 is one store per pixel
+///   and anything above it is overdraw.
+/// * `cells` is the third term the two are read against. Written per cell is
+///   what says whether a change moved the *rect* or moved the *grid* — the two
+///   ways the same `written` figure can fall.
+///
+/// **Never added to `overlay rasters:`.** That line counts dispatches across
+/// every layer kind and has no pixel term at all; this one counts pixel stores
+/// inside the gridded rasterizer alone. They share no denominator.
+///
+/// Said every tick rather than through an `*_if_moved` arm, on
+/// [`tile_disposition_line`]'s terms: these are running totals a reader
+/// brackets a window over, so there has to be a reading at each end of it, and
+/// a scene that rastered nothing has to be readable as a figure rather than as
+/// a sentence nobody wrote.
+fn gridded_scatter_line(
+    t: &squallar_overlays::render::rasterize::gridded_ledger::Totals,
+) -> String {
+    format!(
+        "gridded scatter: {} pictures, {} cells, {} px written, {} px of picture, \
+         overdraw {}, {} px per cell",
+        t.pictures,
+        t.cells,
+        t.written_px,
+        t.picture_px,
+        gridded_ratio(t.overdraw()),
+        gridded_ratio(t.per_cell()),
+    )
+}
+
 /// The `frame need:` line — **frames drawn against frames that needed
 /// drawing**, and what the ones that did not are charged to.
 ///
@@ -2366,6 +2426,14 @@ impl super::App {
         say_telemetry(
             loud,
             &tile_disposition_line(&squallar_egui::tile_source::take_ledger::disposition()),
+        );
+        // The gridded rasterizer's own cost, on the same unconditional terms.
+        // Its figures are pixel STORES and picture sizes, summed process-wide
+        // across every worker in the offload pool — no term here is shared
+        // with any line above it. See `gridded_scatter_line`.
+        say_telemetry(
+            loud,
+            &gridded_scatter_line(&squallar_overlays::render::rasterize::gridded_ledger::totals()),
         );
         if let Some(state) = self.state.as_ref() {
             say_telemetry(loud, &prep_costs_line(&state.egui_renderer.pass_costs()));

@@ -522,3 +522,50 @@ fn a_reading_is_due_once_a_period_and_not_once_a_frame() {
          reading of a run can be withheld for ever",
     );
 }
+
+/// **The `gridded scatter:` sentence, and the absence it has to be able to
+/// say.**
+///
+/// No rig probe reads this line yet, so there is no `drive.py` pattern to read
+/// it back from — what is pinned here is the sentence itself and, more to the
+/// point, the two `Option` arms. A ratio with no denominator behind it prints
+/// `unread`, never `0`: a zero would read as "nothing was overdrawn", which is
+/// a measurement, where this is the absence of one. The empty case is the
+/// reading every process has before its first gridded raster, so it is the one
+/// a reader meets first and the one a wrong rendering would mislead on.
+///
+/// Every figure is given a value no other position holds, on this file's own
+/// terms: what is pinned is the POSITION of each field, and a plausible value
+/// would let a transposition read as correct.
+#[test]
+fn the_gridded_scatter_line_says_its_figures_and_says_when_it_has_none() {
+    use squallar_overlays::render::rasterize::gridded_ledger::Totals;
+
+    let t = Totals {
+        pictures: 3,
+        cells: 2048,
+        written_px: 8192,
+        picture_px: 32768,
+    };
+    // Named at their own values rather than trusted to appear: 8192 / 32768
+    // and 8192 / 2048. Both are derived, neither is a field.
+    assert_eq!(t.overdraw(), Some(0.25));
+    assert_eq!(t.per_cell(), Some(4.0));
+    assert_eq!(
+        super::gridded_scatter_line(&t),
+        "gridded scatter: 3 pictures, 2048 cells, 8192 px written, \
+         32768 px of picture, overdraw 0.250, 4.000 px per cell",
+        "the `gridded scatter:` sentence has drifted from what its reader was \
+         told to expect",
+    );
+
+    assert_eq!(
+        super::gridded_scatter_line(&Totals::default()),
+        "gridded scatter: 0 pictures, 0 cells, 0 px written, 0 px of picture, \
+         overdraw unread, unread px per cell",
+        "a process that has rastered nothing must SAY it has no ratio. A \
+         `0.000` here would read as an overdraw measurement of zero — a \
+         scatter that wrote no pixels — which is a different claim entirely \
+         and the one a reader would act on",
+    );
+}
