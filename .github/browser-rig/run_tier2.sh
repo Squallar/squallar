@@ -525,7 +525,14 @@ WIDELOOP_FRAMES="${RIG_WIDELOOP_FRAMES:-30}"
 # bundle -- and every one of them is hashed or read rather than named: a
 # directory called `A` is not a commit and an mtime is not a leg start.
 sample_header_lines() {
+  # Canvas and window are PARAMETERS, not this function's guess. They were
+  # `$WIDELOOP_CANVAS`/`$WIDELOOP_WINDOW` while `wideloop` was the only caller,
+  # and `huge` adopting the sampler on 2026-09-08 would have stamped that leg's
+  # geometry into this one's identity header -- a TSV positively asserting a
+  # canvas the run never asked for, which is the exact failure the block below
+  # exists to prevent.
   local tsv="$1" seed="$2" tag="$3"
+  local canvas="${4:-$WIDELOOP_CANVAS}" window="${5:-$WIDELOOP_WINDOW}"
   local wasm="$WEB_DIR/pkg/squallar_web_bg.wasm"
   {
     echo "# tier2 leg=$tag rig=$RIG_DIR"
@@ -537,7 +544,7 @@ sample_header_lines() {
     echo "# wasm=$wasm"
     echo "# wasm_sha256=$(sha256sum "$wasm" 2>/dev/null | cut -d" " -f1)"
     echo "# wasm_bytes=$(stat -c%s "$wasm" 2>/dev/null)"
-    echo "# pin_clock=$LONG_PIN_CLOCK canvas_asked=$WIDELOOP_CANVAS window=$WIDELOOP_WINDOW"
+    echo "# pin_clock=$LONG_PIN_CLOCK canvas_asked=$canvas window=$window"
     echo "# host_uname=$(uname -sr) host_loadavg_at_start=$(cut -d" " -f1-3 /proc/loadavg 2>/dev/null)"
     echo "# clocks: t_host_iso is THIS BOX'\''s wall clock; t_page_ms is the PAGE'\''s"
     echo "#   Date.now(), which serve.py --pin-clock moves to $LONG_PIN_CLOCK."
@@ -691,6 +698,102 @@ sample_header_lines() {
 # instance that refused, so that line is the worker's own voice at the instant
 # of refusal rather than the page's cache of it.
 #
+# CORRECTION 2026-09-08, SECOND ROUND: THE RESIDUAL IS NOT UNNAMED, AND MOST
+# OF IT IS NOT HELD AT ALL.
+#
+# The block above computes its "325 MiB that no census family names" as page
+# `byteLength` MINUS the census `resident total`. That difference is TWO terms
+# and they want different fixes:
+#
+#   byteLength - live_bytes   freed-but-reserved headroom. dlmalloc reuses and
+#                             a linear memory never shrinks, so this is debris,
+#                             not holdings (`squallar-alloc/src/lib.rs:23`).
+#   live_bytes - census       live bytes no census family names.
+#
+# The `budget state:` line has carried `live <page>/<worker> MiB` beside
+# `linear <page>/<worker> MiB` since the arms under ~/.cache/rd-loopz-arms/ and
+# ~/.cache/rustdar-fb-rig-out/huge-651d289d1-*-ctl were taken, and those arms DO
+# carry `heap census` lines -- so the hole the block above records as open
+# ("not one of them carries a `heap census (...)` line") is closed by artefacts
+# that postdate it. Read the split at the last sample before the wall:
+#
+#   huge-651d289d1-chr-ctl attempt1   byteLen 1016  live 1006   freed  10.0 (1.0%)
+#   parta-011849 firefox              byteLen 1013  live  995   freed  18.2 (1.8%)
+#   parta-011849 chromium attempt1    byteLen 1015  live  962   freed  53.1 (5.2%)
+#   huge-651d289d1-ff-ctl attempt1    byteLen 1021  live  934   freed  87.1 (8.5%)
+#   parta-011849 chromium             byteLen  985  live  823   freed 162.0 (16.4%)
+#
+# **Live is 83-99% of byteLength at the wall on every arm that captured the
+# ascent.** The page dies with the heap genuinely full. The 34-52% freed
+# fractions appear ONLY in traces where byteLength was already pinned at its
+# final value at t+0 and live is FALLING -- post-mortem samples, the debris of
+# the trap. A retention figure averaged over those is measuring the corpse.
+#
+# AND THE BIG TERM IS NAMED. `upload pending` is 40-59% of the census at the
+# wall -- 356.5 MiB (ff-ctl), 523.3 (parta ff), 414.8 (parta chr), 417.9
+# (chr-ctl) -- and it reaches 302-579 MiB within 2.3-6 s of boot, while loop
+# scans, still scans and tile cache are all still ZERO. It is not a mystery
+# term; it is the texture-upload queue.
+#
+# WHY THE CANVAS DRIVES IT, as a number rather than a description.
+# `device_has_ring` is `device.features().contains(STAGING_RING_FEATURE)` and
+# is FALSE on web -- `band_cap`'s own note says "On a ringless device - all of
+# web". Confirmed empirically: `staged_bytes` is 0 and `blocking_bytes` equals
+# `bytes()` in every artefact here, so the ring was never used. So on web
+# `bands_per_frame` is 1 and `band_cap` is BLOCKING_BAND_BYTES = 4 MiB:
+# **the drain moves one 4 MiB band per frame, and its rate in bytes per second
+# is therefore 4 MiB x the frame rate.** Measured off the arms:
+#
+#   long  at 1280   ~18-24 fps  ->  ~80 MB/s of drain, pictures ~8.5 MB
+#   huge  at 2878   ~4.5 fps    ->  ~18 MB/s of drain, pictures 18.5-73.5 MB
+#
+# and `bands/frame` on the huge firefox arm reads 1.11, 1.00, 0.90, 1.00 --
+# **the drain is saturated at its structural cap**. One 73,087,216 B picture is
+# 18 bands and so 18 frames, which at 4.5 fps is four seconds for one picture;
+# this leg files 25 of them. The canvas raises arrival and lowers the drain at
+# the same time, which is why size is the amplifier and why `long` survives the
+# same scene: at 1280 the drain keeps `upload pending` at 0-64 MiB and the
+# loop's decoded volumes are what fill the heap instead.
+#
+# WHAT THE DRAIN ACTUALLY COSTS, MEASURED, because the obvious inference from
+# the paragraph above is wrong and it was made here first.
+#
+# `whole_budget`'s note prices 56 MiB of blocking `write_texture` at ~1 GB/s for
+# ~56 ms, which divides to ~4 ms for a 4 MiB band -- the whole of
+# TARGET_FRAME_SERVICE. **That pricing is for the WHOLE-crossing route and does
+# not transfer to the banded drain.** `upload_apply_us` is documented as "the
+# frame-thread side of texture_upload, memcpys into staging slots and any
+# blocking `write_texture` included", and differenced against `bands` on four
+# arms across both browsers it reads:
+#
+#   parent-011239 firefox        236 us/band   9.10 GB/s   215 us/pass
+#   parta-011849 chromium        333 us/band  12.55 GB/s   297 us/pass
+#   huge-651d289d1 chr-ctl       187 us/band  14.28 GB/s   179 us/pass
+#   long-651d289d1 ff-ctl        261 us/band   9.23 GB/s   189 us/pass
+#
+# **180-330 us, which is 4.5-8% of the 4 ms target, not 100%.** So "the drain
+# has no headroom" is REFUTED on this arm and a faster drain is back on the
+# table: eight bands a frame would still cost ~1.5-2.7 ms and would raise the
+# drain ceiling eightfold. Whether the cost merely RELOCATES to the browser's
+# GPU process -- glTexSubImage2D can hand off asynchronously, so a low
+# frame-thread figure is not a low system figure -- this instrument cannot say.
+#
+# AND THE FRAME RATE THIS LEG DRAINS AT IS THE SOFTWARE RASTERISER'S, NOT THE
+# PRODUCT'S. On the firefox arm prep is 933 us a pass (tessellate 577, upload
+# 214, buffers 141) against an rAF p50 of **261 ms** -- prep is 0.36% of the
+# frame. The other 99.6% is llvmpipe filling 2878x1651 = 4.75 Mpx. So the chain
+# is: software rasteriser -> ~4.5 fps -> drain ceiling of 4 MiB x 4.5 -> the
+# queue grows. A hardware arm at 60 fps has a thirteenfold higher ceiling, and
+# **nothing here establishes that `upload pending` builds up on a real driver
+# at all.** This gate is the software arm permanently and by design; that makes
+# it structurally unable to tell a product defect in the upload queue from
+# llvmpipe being slow at this canvas. `run_gpu_arm.sh` is the arm that can, and
+# until it has run this scene the queue finding is scoped to software.
+#
+# So the fix direction is NOT settled here. Three shapes are live -- a faster
+# drain, a bounded queue, refusing to file what cannot be drained -- and this
+# block picks none of them, for the reason the corrections above it record.
+#
 # 45 s of window and not 140: the death is at +14-16 s on a scene that
 # reproduces, so this clears it by ~3x while keeping the leg affordable. If a
 # larger margin is ever wanted, RIG_HUGE_WINDOW is the knob -- but a leg that
@@ -710,6 +813,32 @@ HUGE_WINDOW="${RIG_HUGE_WINDOW_SIZE:-3100x1900}"
 HUGE_SETTLE="${RIG_HUGE_SETTLE:-8}"
 HUGE_WINDOW_S="${RIG_HUGE_WINDOW:-45}"
 HUGE_PROGRESS_WINDOW="${RIG_HUGE_PROGRESS_WINDOW:-15}"
+
+# THE INSTRUMENT THIS LEG WAS MISSING, adopted wholesale from `wideloop` on
+# 2026-09-08 because the reason that leg carries it is this leg's reason.
+#
+# `--frames` is the load-bearing one and it is not about rAF. The warm rAF
+# sample is the one stretch of a leg the census sampler cannot see into, and
+# ITS LENGTH IS SET BY THE PAGE: 120 deltas is 2 s at 60 Hz and was **29.8 s**
+# on this leg's firefox arm (`raf_warm.wall_ms` 29832.56 at p50 261 ms, measured
+# off huge-651d289d1-firefox-ctl). The wall on this scene is reached at t+10-16 s
+# -- INSIDE that hole. Every recorded `huge` death therefore had its first
+# allocation refusal in a stretch nothing sampled. 30 deltas keeps a p50/p95
+# worth reading and shortens the blind stretch by 4x.
+HUGE_FRAMES="${RIG_HUGE_FRAMES:-30}"
+# The app's own telemetry tick; a faster cadence re-reads the same console
+# lines and buys nothing but rows.
+HUGE_SAMPLE_INTERVAL="${RIG_HUGE_SAMPLE_INTERVAL:-2}"
+# MiB of clearance from the ceiling THE PAGE REPORTS, on `wideloop`'s terms:
+# an allocation is refused at the wall, so a leg that only failed AT 1024 would
+# be reporting the trap the trap counter already reports.
+HUGE_LINEAR_HEADROOM="${RIG_HUGE_LINEAR_HEADROOM:-64}"
+
+# THESE TWO ASSERTIONS ARE NEW GATES AND A RED FROM THEM IS NOT COMPARABLE TO
+# THE HISTORICAL `huge` RECORD. Every verdict before 2026-09-08 turned on
+# `--expect-frame-progress` alone. Read `frame_progress` on its own when
+# comparing against those arms; the leg's overall pass/fail no longer answers
+# the same question they did.
 
 # ---------------------------------------------------------------------------
 # THE `tilecache` LEG: does the tile cache hold the tiles on the glass?
@@ -913,8 +1042,30 @@ EOF
     esac
   done <<< "$wl_check"
 
+  # The sampler's identity header stamps the CALLER'S geometry. Two arms and
+  # not one: a check that only asserted `huge` would pass for a function that
+  # had `huge`'s canvas hardcoded, which is the shape of the bug this
+  # parameterisation fixed (it wrote `wideloop`'s for every caller).
+  # Its own directory: `$st_dir` is removed by the preserve checks above.
+  hdr_dir="$(mktemp -d)"
+  sample_header_lines "$hdr_dir/h.tsv" "seed-h" huge "$HUGE_CANVAS" "$HUGE_WINDOW"
+  sample_header_lines "$hdr_dir/w.tsv" "seed-w" wideloop "$WIDELOOP_CANVAS" "$WIDELOOP_WINDOW"
+  st_chk "the huge sample header stamps huge's canvas" \
+    "canvas_asked=$HUGE_CANVAS" \
+    "$(grep -o 'canvas_asked=[0-9x]*' "$hdr_dir/h.tsv" | head -1)"
+  st_chk "the wideloop sample header stamps wideloop's canvas" \
+    "canvas_asked=$WIDELOOP_CANVAS" \
+    "$(grep -o 'canvas_asked=[0-9x]*' "$hdr_dir/w.tsv" | head -1)"
+  st_chk "and the two legs' headers are not the same geometry" \
+    "differ" \
+    "$([ "$(grep -o 'canvas_asked=[0-9x]*' "$hdr_dir/h.tsv" | head -1)" \
+        != "$(grep -o 'canvas_asked=[0-9x]*' "$hdr_dir/w.tsv" | head -1)" ] \
+        && echo differ || echo same)"
+
+  rm -rf "$hdr_dir"
+
   if [ "$st_fails" -eq 0 ]; then
-    echo "run_tier2 SELFTEST PASS (7 preserve checks + the wideloop seed)"; exit 0
+    echo "run_tier2 SELFTEST PASS (7 preserve checks + the wideloop seed + 3 header-identity)"; exit 0
   fi
   echo "run_tier2 SELFTEST FAIL ($st_fails)" >&2; exit 1
 fi
@@ -1177,7 +1328,8 @@ run_pass() {
                  --sample-tsv "$OUT_DIR/$tag.samples.tsv"
                  --sample-interval "$WIDELOOP_SAMPLE_INTERVAL"
                  --frames "$WIDELOOP_FRAMES")
-    sample_header_lines "$OUT_DIR/$tag.samples.tsv" "$SEED" "$tag"
+    sample_header_lines "$OUT_DIR/$tag.samples.tsv" "$SEED" "$tag" \
+                       "$WIDELOOP_CANVAS" "$WIDELOOP_WINDOW"
   elif [ "$leg" = huge ]; then
     # The long leg's scene at the user's canvas. Same seventeen layers and the
     # same playing loop -- the freeze reproduces on a scene that is drawing,
@@ -1193,7 +1345,14 @@ run_pass() {
     drive_args+=(--canvas "$HUGE_CANVAS" --expect-canvas
                  --window "$HUGE_WINDOW"
                  --settle "$HUGE_SETTLE" --data-window "$HUGE_WINDOW_S"
-                 --expect-frame-progress "$HUGE_PROGRESS_WINDOW")
+                 --expect-frame-progress "$HUGE_PROGRESS_WINDOW"
+                 --expect-no-alloc-failure
+                 --expect-linear-headroom "$HUGE_LINEAR_HEADROOM"
+                 --sample-tsv "$OUT_DIR/$tag.samples.tsv"
+                 --sample-interval "$HUGE_SAMPLE_INTERVAL"
+                 --frames "$HUGE_FRAMES")
+    sample_header_lines "$OUT_DIR/$tag.samples.tsv" "$SEED" "$tag" \
+                       "$HUGE_CANVAS" "$HUGE_WINDOW"
   elif [ "$leg" = tilecache ]; then
     # The static scene, then the settle assertion over its tail. See the
     # TILECACHE block above for the scene, the two sizes and the hold-out.
