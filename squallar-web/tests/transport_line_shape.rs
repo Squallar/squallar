@@ -55,6 +55,10 @@ fn the_transport_line_and_the_rig_regex_name_the_same_fields_in_order() {
         "B copied out of this page",
         "us encoding",
         "us posting",
+        "us copying replies in",
+        "us worst reply copy",
+        "us delivering replies",
+        "us worst delivery",
     ];
     let (mut f_at, mut r_at) = (0usize, 0usize);
     for label in labels {
@@ -147,7 +151,12 @@ fn every_transport_figure_the_rig_reads_is_also_printed() {
          was added to the pattern and not to the summary, so it reaches the \
          artifact and never reaches stdout: {printed}",
     );
-    for label in ["us encoding", "us posting"] {
+    for label in [
+        "us encoding",
+        "us posting",
+        "us copying replies in",
+        "us delivering replies",
+    ] {
         assert!(
             printed.contains(label),
             "the transport summary does not print {label:?}: {printed}",

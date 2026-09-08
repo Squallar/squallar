@@ -2765,7 +2765,7 @@ var rayon_re = /rayon: (\d+) threads/;
 // The LAST match wins, not the first: `worker_port::account` logs RUNNING
 // TOTALS, so the newest line is the whole answer and an older one is a prefix
 // of it. Scanning forward and overwriting is what makes that true.
-var transport_re = /transport: (\d+) replies, (\d+) B out with (\d+) B copied out of the worker, (\d+) B in with (\d+) B copied out of this page, (\d+) us encoding, (\d+) us posting/;
+var transport_re = /transport: (\d+) replies, (\d+) B out with (\d+) B copied out of the worker, (\d+) B in with (\d+) B copied out of this page, (\d+) us encoding, (\d+) us posting, (\d+) us copying replies in, (\d+) us worst reply copy, (\d+) us delivering replies, (\d+) us worst delivery/;
 // The two raster-telemetry lines, written once a frame by
 // `App::report_raster_telemetry` and only on a frame where something moved.
 // Running totals, so the LAST match wins here for the same reason it does for
@@ -2931,7 +2931,21 @@ for (var i = 0; i < C.length; i++) {
                         // these are a SUBSET of `frame dispatch (offload)`,
                         // which is itself a cut of `frame post (dispatch)`.
                         encode_us: parseInt(tm[6], 10),
-                        post_us: parseInt(tm[7], 10) };
+                        post_us: parseInt(tm[7], 10),
+                        // And the REPLY direction's two spans, on the browser's
+                        // main thread between two frames rather than inside a
+                        // frame: `copy_us` is `Uint8Array::to_vec` pulling the
+                        // reply into this instance's memory, `deliver_us` is
+                        // the row's decode and the caller's delivery, which run
+                        // inline after it. Disjoint, so their SUM is what a
+                        // reply cost the thread; neither is in any `frame
+                        // service` figure, which measures the redraw only.
+                        // The `worst_` pair is the single worst reply of the
+                        // leg, which is the tail figure a p99 question needs.
+                        copy_us: parseInt(tm[8], 10),
+                        worst_copy_us: parseInt(tm[9], 10),
+                        deliver_us: parseInt(tm[10], 10),
+                        worst_deliver_us: parseInt(tm[11], 10) };
   var rm2 = rasters_re.exec(m);
   if (rm2) rasters = { dispatched: parseInt(rm2[1], 10),
                        arrived: parseInt(rm2[2], 10),
@@ -8954,10 +8968,14 @@ def run_smoke(args):
         # not a windowed cost. Measured 2026-09-02: 99.3% / 98.7% encoding.
         print("[%s] SUMMARY transport: %s replies, %s B out with %s B copied "
               "out of the worker, %s B in with %s B copied out of the page, "
-              "%s us encoding, %s us posting (cumulative from boot)"
+              "%s us encoding, %s us posting, %s us copying replies in "
+              "(worst %s us), %s us delivering replies (worst %s us) "
+              "(cumulative from boot)"
               % (tag, tb.get("replies"), tb.get("out_moved"),
                  tb.get("out_copied"), tb.get("in_moved"), tb.get("in_copied"),
-                 tb.get("encode_us"), tb.get("post_us")))
+                 tb.get("encode_us"), tb.get("post_us"), tb.get("copy_us"),
+                 tb.get("worst_copy_us"), tb.get("deliver_us"),
+                 tb.get("worst_deliver_us")))
     ovr = result.get("overlay_rasters")
     if ovr is not None:
         print("[%s] SUMMARY overlay rasters: %s%s"

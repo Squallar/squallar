@@ -318,10 +318,26 @@ fn handle_message(generation: u64, worker: &web_sys::Worker, data: &JsValue) {
 /// The reply is the `OUT`/`OUT_KIND`/`TAILS` trio, or explicit nulls for a job
 /// that produced nothing. Reading each buffer is ONE copy into this page's
 /// linear memory, and **that copy does not retire**: `decode_out` takes a
-/// `Vec<u8>`, `egui::ColorImage` holds one and `wgpu`'s `write_texture` takes a
-/// `&[u8]` — all of them slices of THIS instance's memory, which a view onto a
-/// foreign buffer cannot be at any price. The second copy is a property of the
-/// types, not of the transport.
+/// `&[u8]` of THIS instance's memory, which a view onto a foreign buffer
+/// cannot be at any price.
+///
+/// **A raster reply then pays a second full-size buffer, and that is a
+/// property of the types AND of where the wire puts the picture — not of the
+/// types alone, as this sentence used to say.** `egui::ColorImage` holds
+/// `Vec<Color32>`, a `Vec` is freed with the `Layout` it was taken with, and
+/// so a `Vec<u8>` can never become one; the decode allocates the pixels while
+/// the bytes it is reading are still live, because
+/// `offload::deliver_encoded_reply` binds the head and passes it by borrow.
+/// Both buffers are therefore live at the same instant. What would remove the
+/// first one is not a cleverer cast here but the picture riding its own
+/// buffer at offset zero, which is a change to the reply codec's wire — the
+/// alignment reason it cannot be done from this side, and what moving it
+/// would cost, are recorded on
+/// `squallar_overlays::render::jobs::encode_overlay_out`.
+///
+/// Both spans are priced, cumulatively and at their worst, by [`account_reply`]
+/// — see [`Traffic::copy_ns`]. They are main-thread time between two frames and
+/// are in no `frame service` figure, which measures the redraw.
 ///
 /// What WS3c retires is the other one. A `SharedArrayBuffer` crosses
 /// `postMessage` by sharing, so when the browser is cross-origin isolated the
@@ -346,12 +362,26 @@ fn deliver(worker: &web_sys::Worker, data: &JsValue) {
 
     let mut moved = 0usize;
     let mut copied_at_worker = 0usize;
-    let mut count = |array: &js_sys::Uint8Array| {
+    // **Nanoseconds, not the microseconds the send direction accumulates in.**
+    // A reply is one head and zero or more tails, and a tail can be a few
+    // hundred bytes; a per-call truncation to whole microseconds would report
+    // zero for a hundred of those and understate the total by the whole of the
+    // small end.
+    let mut copy_ns = 0u64;
+    // Counting and copying are ONE step, so a buffer cannot be counted into
+    // `moved` and copied outside the clock — which is what a separate `count`
+    // made easy.
+    let mut take = |array: &js_sys::Uint8Array| {
         let len = array.length() as usize;
         moved += len;
         if !crate::shared_loan::is_foreign_shared(array) {
             copied_at_worker += len;
         }
+        note_block(len);
+        let start = web_time::Instant::now();
+        let bytes = array.to_vec();
+        copy_ns += ns(start, web_time::Instant::now());
+        bytes
     };
 
     let reply = (|| {
@@ -363,8 +393,7 @@ fn deliver(worker: &web_sys::Worker, data: &JsValue) {
             .and_then(|v| v.as_f64())
             .map(|v| v as u8)?;
         let out = out.dyn_into::<js_sys::Uint8Array>().ok()?;
-        count(&out);
-        let head = out.to_vec();
+        let head = take(&out);
         // TAILS null or absent reads as no tails.
         let tails = match proto::field(data, proto::TAILS).filter(|v| !v.is_null()) {
             None => Vec::new(),
@@ -374,8 +403,7 @@ fn deliver(worker: &web_sys::Worker, data: &JsValue) {
                 for tail in array.iter() {
                     // The same checked cast per tail — one copy each.
                     let tail = tail.dyn_into::<js_sys::Uint8Array>().ok()?;
-                    count(&tail);
-                    tails.push(tail.to_vec());
+                    tails.push(take(&tail));
                 }
                 tails
             }
@@ -388,10 +416,21 @@ fn deliver(worker: &web_sys::Worker, data: &JsValue) {
     // copied out by now, and the worker is holding multiple MiB until it hears
     // so. Releasing after the delivery would hold them across it for no reason.
     release_to_worker(worker, loan);
-    account(moved, copied_at_worker, 0, 0, 0, 0);
 
     // `None` still delivers: the caller's slot is released either way.
+    //
+    // Clocked here rather than inside the funnel because THIS thread is the
+    // browser's main thread and the funnel's is not: `deliver_encoded_reply`
+    // runs the row's decode and the caller's delivery inline, so on this
+    // target the whole of it is page-main-thread time between two frames.
+    let deliver_start = web_time::Instant::now();
     offload::deliver_encoded_reply(id as u64, reply);
+    account_reply(
+        moved,
+        copied_at_worker,
+        copy_ns,
+        ns(deliver_start, web_time::Instant::now()),
+    );
 }
 
 // ── The tile lane ────────────────────────────────────────────────────────────
@@ -585,6 +624,38 @@ struct Traffic {
     /// Whole microseconds spent in `postMessage` itself, cumulative. See
     /// [`Self::encode_us`].
     post_us: u64,
+    /// Whole NANOSECONDS this page has spent in `Uint8Array::to_vec` pulling a
+    /// reply's head and tails out of the worker's view and into this
+    /// instance's linear memory, on the browser's MAIN THREAD. Cumulative,
+    /// over [`Self::replies`].
+    ///
+    /// Nanoseconds because the denominator counts small buffers as well as
+    /// pictures; the line reports microseconds.
+    copy_ns: u64,
+    /// The single worst reply's [`Self::copy_ns`]. The cumulative figure
+    /// answers "what share of the thread", this one answers "how long was the
+    /// thread gone", and a p99 question needs the second.
+    worst_copy_ns: u64,
+    /// Whole nanoseconds in `offload::deliver_encoded_reply` — the row's
+    /// decode and the caller's delivery, both of which run inline on this
+    /// thread — cumulative over the same denominator. **Never added to
+    /// [`Self::copy_ns`]'s bytes and never subtracted from it either**: they
+    /// are two disjoint spans of one message's handling, and their sum is what
+    /// the reply cost the main thread.
+    deliver_ns: u64,
+    /// The single worst reply's [`Self::deliver_ns`].
+    worst_deliver_ns: u64,
+    /// Reply buffers of at least [`LARGE_BLOCK_BYTES`], counted per BUFFER
+    /// rather than per reply: `to_vec` makes one allocation per head and per
+    /// tail, and one allocation is what the allocator sees.
+    blocks_large: u64,
+    /// Reply buffers under that size, which reuse freely and are counted only
+    /// so the large figure has a denominator beside it.
+    blocks_small: u64,
+    /// Of [`Self::blocks_large`], how many arrived at an exact size the table
+    /// had no free slot left for. **Not folded into a neighbouring size** —
+    /// see [`BlockTable`].
+    blocks_unlisted: u64,
 }
 
 impl Traffic {
@@ -596,10 +667,28 @@ impl Traffic {
         in_copied: 0,
         encode_us: 0,
         post_us: 0,
+        copy_ns: 0,
+        worst_copy_ns: 0,
+        deliver_ns: 0,
+        worst_deliver_ns: 0,
+        blocks_large: 0,
+        blocks_small: 0,
+        blocks_unlisted: 0,
     };
 }
 
-/// Add one message to the ledger and log the running totals.
+/// Whole microseconds from `a` to `b`, saturating.
+fn us(a: web_time::Instant, b: web_time::Instant) -> u64 {
+    b.duration_since(a).as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+/// Whole nanoseconds from `a` to `b`, saturating. What the reply direction
+/// accumulates in; see [`Traffic::copy_ns`].
+fn ns(a: web_time::Instant, b: web_time::Instant) -> u64 {
+    b.duration_since(a).as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+/// Fold one message into the ledger and log the running totals.
 ///
 /// The line is the Tier-2 instrument (`drive.py --expect-zero-copy-replies`)
 /// and the measurement at once, which is deliberate: a gate that reads a
@@ -608,36 +697,23 @@ impl Traffic {
 /// `out_copied` would climb — and so that a transport that moved NOTHING
 /// cannot satisfy it either, because the assertion also requires `out_moved`
 /// to be positive.
-/// Whole microseconds from `a` to `b`, saturating.
-fn us(a: web_time::Instant, b: web_time::Instant) -> u64 {
-    b.duration_since(a).as_micros().min(u128::from(u64::MAX)) as u64
-}
-
-fn account(
-    out_moved: usize,
-    out_copied: usize,
-    in_moved: usize,
-    in_copied: usize,
-    encode_us: u64,
-    post_us: u64,
-) {
+///
+/// The two directions fold through [`account_sent`] and [`account_reply`]
+/// rather than through one call with the other direction's figures written as
+/// zeros: a zero passed positionally is indistinguishable from a measurement
+/// that came out zero.
+fn account(delta: impl FnOnce(&mut Traffic)) {
     let totals = TRAFFIC.with(|traffic| {
         let mut totals = traffic.get();
-        if out_moved > 0 || out_copied > 0 {
-            totals.replies += 1;
-        }
-        totals.out_moved += out_moved as u64;
-        totals.out_copied += out_copied as u64;
-        totals.in_moved += in_moved as u64;
-        totals.in_copied += in_copied as u64;
-        totals.encode_us += encode_us;
-        totals.post_us += post_us;
+        delta(&mut totals);
         traffic.set(totals);
         totals
     });
     log::info!(
         "transport: {} replies, {} B out with {} B copied out of the worker, \
-         {} B in with {} B copied out of this page, {} us encoding, {} us posting",
+         {} B in with {} B copied out of this page, {} us encoding, {} us posting, \
+         {} us copying replies in, {} us worst reply copy, {} us delivering replies, \
+         {} us worst delivery",
         totals.replies,
         totals.out_moved,
         totals.out_copied,
@@ -645,6 +721,145 @@ fn account(
         totals.in_copied,
         totals.encode_us,
         totals.post_us,
+        totals.copy_ns / 1_000,
+        totals.worst_copy_ns / 1_000,
+        totals.deliver_ns / 1_000,
+        totals.worst_deliver_ns / 1_000,
+    );
+}
+
+/// One request this page handed the worker.
+fn account_sent(in_moved: usize, in_copied: usize, encode_us: u64, post_us: u64) {
+    account(|totals| {
+        totals.in_moved += in_moved as u64;
+        totals.in_copied += in_copied as u64;
+        totals.encode_us += encode_us;
+        totals.post_us += post_us;
+    });
+}
+
+/// One reply this page copied out of the worker and delivered.
+///
+/// A reply that carried no buffer at all moves NOTHING here — not the count and
+/// not the two clocks — so every figure in the reply direction stands over the
+/// one denominator `replies` names. Its delivery is a `None` handed to a
+/// caller's channel and is not what these clocks are asked about.
+fn account_reply(out_moved: usize, out_copied: usize, copy_ns: u64, deliver_ns: u64) {
+    if out_moved == 0 && out_copied == 0 {
+        return;
+    }
+    account(|totals| {
+        totals.replies += 1;
+        totals.out_moved += out_moved as u64;
+        totals.out_copied += out_copied as u64;
+        totals.copy_ns += copy_ns;
+        totals.worst_copy_ns = totals.worst_copy_ns.max(copy_ns);
+        totals.deliver_ns += deliver_ns;
+        totals.worst_deliver_ns = totals.worst_deliver_ns.max(deliver_ns);
+    });
+    log_blocks(&TRAFFIC.with(Cell::get));
+}
+
+// ── The reply block table ────────────────────────────────────────────────────
+
+/// How big one reply buffer has to be to earn a row in [`BLOCKS`].
+///
+/// A `Vec<u8>` this size is served by `dlmalloc` out of a region it took from
+/// `memory.grow` and **never gives back**, so it is the size class whose
+/// distribution decides whether the page's linear memory ratchets. Anything
+/// under it is served out of the small bins and reuses freely.
+const LARGE_BLOCK_BYTES: usize = 1 << 20;
+
+/// How many DISTINCT exact sizes the table learns before it stops learning
+/// new ones. Fixed because this table may not allocate to grow — it is read
+/// on the path that is being measured for allocation.
+const BLOCK_SIZE_SLOTS: usize = 24;
+
+/// Every large reply buffer's **exact requested size**, with how many times
+/// that exact size was asked for.
+///
+/// **Exact, never a power-of-two class, and that is the whole point of the
+/// table.** The question it exists to answer is whether a picture-sized
+/// request can be served out of the hole its predecessor left, and 33,554,432
+/// and 35,651,584 answer that question differently while sharing every
+/// bucket a class-based histogram would put them in. A smear of near-but-not-
+/// equal sizes is a heap that ratchets under perfect reuse; spikes at a few
+/// exact sizes is a heap that reuses and sends the question back to how many
+/// large blocks are live at once.
+///
+/// A size the table has no slot for is counted in
+/// [`Traffic::blocks_unlisted`] rather than folded into a neighbour, because
+/// a size folded into a neighbour is indistinguishable from a size that was
+/// really asked for.
+type BlockTable = [(u64, u32); BLOCK_SIZE_SLOTS];
+
+thread_local! {
+    static BLOCKS: Cell<BlockTable> = const { Cell::new([(0, 0); BLOCK_SIZE_SLOTS]) };
+}
+
+/// File one reply buffer's exact size.
+fn note_block(len: usize) {
+    if len < LARGE_BLOCK_BYTES {
+        TRAFFIC.with(|traffic| {
+            let mut totals = traffic.get();
+            totals.blocks_small += 1;
+            traffic.set(totals);
+        });
+        return;
+    }
+    let len = len as u64;
+    let listed = BLOCKS.with(|blocks| {
+        let mut table = blocks.get();
+        // The first slot that is either this exact size or unused. Slots are
+        // filled front to back and never vacated, so a size already in the
+        // table is always found before the first free slot and a size is
+        // never listed twice.
+        let Some(at) = table
+            .iter()
+            .position(|(size, count)| *size == len || *count == 0)
+        else {
+            return false;
+        };
+        let seen = if table[at].0 == len { table[at].1 } else { 0 };
+        table[at] = (len, seen + 1);
+        blocks.set(table);
+        true
+    });
+    TRAFFIC.with(|traffic| {
+        let mut totals = traffic.get();
+        totals.blocks_large += 1;
+        if !listed {
+            totals.blocks_unlisted += 1;
+        }
+        traffic.set(totals);
+    });
+}
+
+/// The block table as one sentence, newest totals first and then every exact
+/// size the table holds, largest first.
+///
+/// A separate line from `transport:` deliberately: that sentence is held field
+/// for field against the rig's regex by `transport_line_shape.rs`, and a
+/// variable-length list cannot be held that way. This one is read off the
+/// console export the rig already keeps whole.
+fn log_blocks(totals: &Traffic) {
+    let mut table = BLOCKS.with(Cell::get);
+    table.sort_unstable_by_key(|(size, _)| std::cmp::Reverse(*size));
+    let sizes = table
+        .iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(size, count)| format!("{size}x{count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    log::info!(
+        "reply blocks: {} large (>= {} B) in {} exact sizes, {} small, \
+         {} unlisted; {}",
+        totals.blocks_large,
+        LARGE_BLOCK_BYTES,
+        table.iter().filter(|(_, count)| *count > 0).count(),
+        totals.blocks_small,
+        totals.blocks_unlisted,
+        sizes,
     );
 }
 
@@ -725,9 +940,7 @@ impl JobSink for Port {
         // trailing a dispatch behind into the next one.
         let post_start = web_time::Instant::now();
         let posted = self.worker.post_message_with_transfer(&message, &transfer);
-        account(
-            0,
-            0,
+        account_sent(
             moved,
             copied,
             encode_us,
