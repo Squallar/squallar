@@ -462,6 +462,47 @@ impl JobSpec for DecodeJob {
         out.extend_from_slice(&input.archive);
     }
 
+    /// **The archive itself, lent rather than written.**
+    ///
+    /// This row's whole message IS the downloaded volume — 0.34-17.96 MB,
+    /// median 5.56 MB over the 208 real volumes `volume_inventory` measures
+    /// against — and [`Self::encode`] memcpy'd every byte of it into a wire
+    /// buffer at the dispatch site, on the FRAME THREAD. The page already
+    /// holds it behind an `Arc` that `App::decode_offloaded` keeps a refcount
+    /// on for the compressed cache, so there is a live owner to lend against
+    /// and the write has nowhere it needs to be.
+    ///
+    /// `None` on an empty archive: a zero-length lend has no address worth
+    /// naming, and the whole-message path already refuses the buffer at
+    /// `decode_bytes` exactly as it did before.
+    fn resident_payload(
+        input: &DecodeJob,
+        _ctx: &EncodeCtx,
+    ) -> Option<squallar_source::job::ResidentBytes> {
+        (!input.archive.is_empty()).then(|| {
+            squallar_source::job::ResidentBytes::of(Arc::clone(&input.archive), |a| a.as_slice())
+        })
+    }
+
+    /// Nothing: the head is the envelope and the archive travels beside it.
+    fn encode_resident_head(_input: &DecodeJob, _ctx: &EncodeCtx, _out: &mut Vec<u8>) {}
+
+    /// The far end of [`Self::resident_payload`]. The copy here is the one
+    /// [`Self::decode`] already made out of `r.rest()`, and it is made in the
+    /// worker rather than at the dispatch site — which is the whole point.
+    fn decode_resident(
+        _r: &mut Reader<'_>,
+        geo: JobGeometry,
+        payload: &[u8],
+    ) -> Option<(DecodeJob, JobGeometry)> {
+        Some((
+            DecodeJob {
+                archive: Arc::new(payload.to_vec()),
+            },
+            geo,
+        ))
+    }
+
     fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(DecodeJob, JobGeometry)> {
         Some((
             DecodeJob {
