@@ -351,7 +351,10 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
             height,
             id_map,
             response,
-            app.channels.overlay_render_sender.clone(),
+            crate::channels::OverlayReplySink {
+                sender: app.channels.overlay_render_sender.clone(),
+                level: std::sync::Arc::clone(&app.channels.overlay_reply_bytes),
+            },
             None,
         )(Some(squallar_source::job::DescribedOut(Box::new(output))));
         app.channels

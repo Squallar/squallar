@@ -231,6 +231,102 @@ impl OverlayPicture {
     }
 }
 
+/// **The level of overlay picture bytes sitting in the render reply channel**
+/// — `squallar_egui::heap_census`'s `overlay replies`, and the two seams that
+/// move it.
+///
+/// One `Arc<AtomicUsize>` per [`ChannelHub`], not a module static: the level
+/// belongs to the channel it measures, and a process-global would make two
+/// `App`s in one test binary read each other's bytes.
+///
+/// The pattern is `crate::render_dispatch`'s `price_in_flight` /
+/// `settle_in_flight`, one producer over. Priced **before** the send, so no
+/// receipt can settle bytes that were never added; settled on the take, in
+/// the one drain, before either arm of it runs.
+pub(crate) mod overlay_reply_level {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    /// What one reply's picture holds on this heap: its `Color32` buffer, at
+    /// the buffer's own length rather than `w * h * 4` restated. A reply with
+    /// no picture, or a `Blank` — which allocated nothing — is zero.
+    ///
+    /// The one spelling both seams use, so the level cannot drift by the two
+    /// ends pricing the same reply differently.
+    pub(crate) fn reply_bytes(response: &super::OverlayRenderResponse) -> usize {
+        match &response.picture {
+            Some(super::OverlayPicture::Painted(image)) => image.as_raw().len(),
+            Some(super::OverlayPicture::Blank { .. }) | None => 0,
+        }
+    }
+
+    /// **The seam where a reply's picture enters the census.** Nothing for a
+    /// reply that carries no pixels.
+    pub(crate) fn price(level: &Arc<AtomicUsize>, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let now = level.fetch_add(bytes, Relaxed) + bytes;
+        squallar_egui::heap_census::set_overlay_reply_bytes(now as u64);
+    }
+
+    /// **The seam where a reply's picture leaves the census** — it was taken
+    /// off the channel, or the send found no receiver and the reply died with
+    /// it.
+    ///
+    /// Saturating: two threads can each publish the total as it stood at
+    /// their own operation and the later store can be the staler figure, but
+    /// neither may wrap the level into a 16-exabyte reading on the one line
+    /// the allocation-error hook gets to print.
+    pub(crate) fn settle(level: &Arc<AtomicUsize>, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let mut current = level.load(Relaxed);
+        let now = loop {
+            let next = current.saturating_sub(bytes);
+            match level.compare_exchange_weak(current, next, Relaxed, Relaxed) {
+                Ok(_) => break next,
+                Err(seen) => current = seen,
+            }
+        };
+        squallar_egui::heap_census::set_overlay_reply_bytes(now as u64);
+    }
+}
+
+/// **Where a finished overlay raster goes, and what it is priced onto** — the
+/// reply channel and its `overlay replies` level, carried together because
+/// neither is correct without the other.
+///
+/// One parameter rather than two on `App::overlay_job_deliver`, which is the
+/// honest shape as well as the one that keeps that signature under
+/// `clippy::too_many_arguments`: a sender handed over without the level is a
+/// picture that crosses the seam unpriced, which is the state this type was
+/// added to end.
+pub(crate) struct OverlayReplySink {
+    pub(crate) sender: Sender<OverlayRenderResponse>,
+    pub(crate) level: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl OverlayReplySink {
+    /// Price this reply's picture and send it.
+    ///
+    /// **Priced before the send**, so no receipt can settle bytes that were
+    /// never added — `crate::render_dispatch::LoopReplyTicket::price`'s rule,
+    /// one producer over. A picture is 42,772,836 B at the 4317x2477 plan and
+    /// this is the only thing that names it until the frame thread takes it.
+    ///
+    /// A send with no receiver drops the reply inside `send`, so its bytes
+    /// are settled here rather than left on a level no drain will reach.
+    pub(crate) fn send(self, response: OverlayRenderResponse) {
+        let priced = overlay_reply_level::reply_bytes(&response);
+        overlay_reply_level::price(&self.level, priced);
+        if self.sender.send(response).is_err() {
+            overlay_reply_level::settle(&self.level, priced);
+        }
+    }
+}
+
 pub struct OverlayRenderResponse {
     /// What the render answered, or `None` for a render that failed.
     ///
@@ -534,6 +630,11 @@ pub struct ChannelHub {
     pub overlay_fetch_receiver: Receiver<SourceEvent>,
     pub overlay_render_sender: Sender<OverlayRenderResponse>,
     pub overlay_render_receiver: Receiver<OverlayRenderResponse>,
+    /// **What the channel above is holding**, in overlay picture bytes — the
+    /// `overlay replies` census family. Kept beside the pair it measures
+    /// rather than on `App`, because it is a property of this channel and of
+    /// nothing else. Not a `Receiver`, so `arch_ratchets` row 6 is unmoved.
+    pub overlay_reply_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub loop_scan_download_sender: Sender<LoopScanDownloadResponse>,
     pub loop_scan_download_receiver: Receiver<LoopScanDownloadResponse>,
     pub loop_l3_list_sender: Sender<LoopL3ListResponse>,
@@ -597,6 +698,7 @@ impl ChannelHub {
             overlay_fetch_receiver,
             overlay_render_sender,
             overlay_render_receiver,
+            overlay_reply_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             loop_scan_download_sender,
             loop_scan_download_receiver,
             loop_l3_list_sender,

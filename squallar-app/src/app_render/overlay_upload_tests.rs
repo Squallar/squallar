@@ -265,3 +265,137 @@ fn every_arrival_is_either_a_picture_or_a_drop() {
         latest.dropped,
     );
 }
+
+/// Post `rgba` through the production deliver **without draining**, so the
+/// window `overlay replies` measures is observable from the outside.
+///
+/// Everything here is the real path: the production
+/// [`crate::app::App::overlay_job_deliver`], the production output stage
+/// (`JobOut::discard_blank_rasters`, which is `offload::execute`'s second
+/// half) deciding blank-versus-painted off the bytes, and the App's own
+/// channel and level.
+fn send_reply(app: &mut crate::app::App, generation: u64, rgba: Vec<u8>) {
+    use squallar_source::job::JobOut;
+
+    if let Some(pane) = app.gui.pane_mut(0) {
+        pane.overlay_cache_mut(&known::NWS_ALERTS).renders.record(
+            squallar_egui::overlay_cache::RenderTicket::whole(generation, bounds()),
+        );
+    }
+    let mut raster = squallar_overlays::render::rasterize::RasterizeOutput {
+        rgba: rgba.into(),
+        hit_cells: None,
+        alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
+        blank: None,
+    };
+    raster.discard_blank_rasters();
+    crate::app::App::overlay_job_deliver(
+        "test-reply-level",
+        W,
+        H,
+        None,
+        crate::channels::OverlayRenderResponse {
+            picture: None,
+            geo_bounds: bounds(),
+            overlay_kind: known::NWS_ALERTS,
+            generation,
+            pane_indices: vec![0],
+            zoom: 32,
+            hit_map: None,
+            frame: None,
+        },
+        crate::channels::OverlayReplySink {
+            sender: app.channels.overlay_render_sender.clone(),
+            level: std::sync::Arc::clone(&app.channels.overlay_reply_bytes),
+        },
+        None,
+    )(Some(squallar_source::job::DescribedOut(Box::new(raster))));
+}
+
+/// What the App's own `overlay replies` level reads, in bytes.
+fn reply_level(app: &crate::app::App) -> usize {
+    app.channels
+        .overlay_reply_bytes
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// **An overlay picture is priced from the send to the take, and by nothing
+/// else on either side of it.**
+///
+/// This is the family's whole claim, measured rather than described. The
+/// window it names — a finished overlay raster sitting in the reply channel —
+/// was priced by no census family at all until 2026-09-08: `renders in
+/// flight` is the same instrument for the RADAR replies and reaches no
+/// overlay picture, `overlay grids` and `overlay items` price the source data
+/// a handler decodes and never the raster drawn from it, and `upload pending`
+/// starts only once `Context::load_texture` has filed the picture and the
+/// renderer has banded it.
+///
+/// **Exact, not `>=`, because the level is the App's own.** The census static
+/// behind it is process-global and this binary runs its tests in parallel, so
+/// a `census()` reading here would be asserting the harness's scheduling; the
+/// `Arc<AtomicUsize>` on this `App`'s `ChannelHub` is reachable by nothing
+/// else in the process, which is why the level lives there and not in a
+/// module static.
+///
+/// **Three arms, and the third is not padding.** A level that only ever rose
+/// would pass the first two; a level that priced the *dispatch* rather than
+/// the picture would pass all three but read the same for a blank, so the
+/// blank arm is what separates "bytes that exist" from "a raster happened".
+/// A blank allocates no `ColorImage` at all — that is the saving
+/// `blank_raster_tests` holds — so the honest figure for it is zero.
+#[test]
+fn an_overlay_picture_is_priced_from_the_reply_until_the_frame_thread_takes_it() {
+    /// One picture at this fixture's plan. The real one is far larger — a
+    /// 4317x2477 overlay plan is 42,772,836 B — and the arithmetic is the
+    /// same at both ends: this family's level is the sum over every reply in
+    /// the channel.
+    const PICTURE: usize = (W * H * 4) as usize;
+
+    let ctx = egui::Context::default();
+    let mut app = n_pane_app(1);
+    let _ = drain_uploads(&ctx);
+
+    assert_eq!(
+        reply_level(&app),
+        0,
+        "a fresh App has sent no reply and must price none",
+    );
+
+    send_reply(&mut app, 7, rasterizer_output());
+    assert_eq!(
+        reply_level(&app),
+        PICTURE,
+        "one {W}x{H} RGBA picture is in the channel and the level does not \
+         name its {PICTURE} bytes",
+    );
+
+    send_reply(&mut app, 8, rasterizer_output());
+    assert_eq!(
+        reply_level(&app),
+        2 * PICTURE,
+        "two pictures are in the channel at once and the level is not their \
+         sum — it is a LEVEL over the whole channel, not one reply's size",
+    );
+
+    app.poll_overlay_render_results(&ctx);
+    assert_eq!(
+        reply_level(&app),
+        0,
+        "the frame thread took both replies and the level did not fall; from \
+         the take on, the picture is `load_texture`'s and then the renderer's \
+         band queue (`upload pending`), and a level that does not fall here \
+         double-counts every picture the census ever sees",
+    );
+
+    send_reply(&mut app, 9, vec![0u8; PICTURE]);
+    assert_eq!(
+        reply_level(&app),
+        0,
+        "a blank reply allocated no `ColorImage` — that is the saving \
+         `blank_raster_tests` holds — so there are no bytes to name, and a \
+         level that moved here is pricing the dispatch and not the picture",
+    );
+    app.poll_overlay_render_results(&ctx);
+    assert_eq!(reply_level(&app), 0);
+}

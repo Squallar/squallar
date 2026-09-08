@@ -92,7 +92,10 @@ fn delivered_for(
         H,
         None,
         response,
-        app.channels.overlay_render_sender.clone(),
+        crate::channels::OverlayReplySink {
+            sender: app.channels.overlay_render_sender.clone(),
+            level: std::sync::Arc::clone(&app.channels.overlay_reply_bytes),
+        },
         None,
     )(Some(squallar_source::job::DescribedOut(settled(rgba))));
     app.channels

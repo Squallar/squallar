@@ -41,6 +41,59 @@
 //! accounts for 400 MB of 1024 must be reported as accounting for 400 MB of
 //! 1024 — never as if the families it does name were the whole heap.
 //!
+//! # **MEASURED 2026-09-08: the residual is mostly ALLOCATOR RETENTION, and
+//! no family can ever reach it**
+//!
+//! Read this before hunting a holder for the residual. Two sessions have now
+//! spent a night doing exactly that, and the second was told to.
+//!
+//! [`Census::residual`] is taken against **`byteLength`, which only ever
+//! grows**. `dlmalloc` on `wasm32-unknown-unknown` extends linear memory with
+//! `memory.grow` and has no way to hand a page back, so every byte the
+//! application has ever *freed* is still on the reading the residual is
+//! subtracted from. [`squallar_alloc`] says it in its own module note: *"on
+//! wasm it is not `byteLength` — a linear memory never shrinks, so
+//! `byteLength − live_bytes` is exactly the freed-but-reserved headroom the
+//! high-water mark hides."*
+//!
+//! The figures are from the Tier-2 `long` leg's own console ring, where the
+//! `budget state:` line's `live <page>/<worker> MiB` and this line are
+//! written on one tick and land in the ring at the same millisecond, so they
+//! are a pairing and not an alignment:
+//!
+//! | arm | `byteLength` | `live_bytes` | RETENTION | this census's floor | unaccounted LIVE |
+//! |---|---|---|---|---|---|
+//! | firefox, 4 settled ticks | 889.1 | 490 | **399** | 454.6 | **35.4** (7.2 % of live) |
+//! | chromium, 5 settled ticks | 877.9 | 510–518 | **359–367** | 480.4 | **29.6–37.6** |
+//!
+//! So the 373.0 MiB that `byteLength − resident_total` reported on the
+//! firefox arm decomposes as 399.1 of retention **less** 26.1 of this census
+//! pricing *above* the live heap — and the ~35 MiB that is genuinely unnamed
+//! is a residual of a completely different size from the one the subtraction
+//! advertises. **The signature that settles it against every holder theory**:
+//! on chromium `live` FELL 671 → 517 MiB while `byteLength` ROSE 861.9 →
+//! 877.9. The application freed 150 MiB and the page grew anyway. No holder
+//! does that.
+//!
+//! **Two consequences, and the second is not about this module at all.**
+//!
+//! 1. **Take the unnamed term against [`ProcessCensus::live`], never against
+//!    `byteLength`.** [`Census::unaccounted`] is that reading and exists for
+//!    it. A `byteLength` residual is an upper bound on the unnamed holder and
+//!    is dominated by a term no family can be written for.
+//! 2. **A page can die at a `byteLength` ceiling while holding half of it
+//!    live**, which is a defect class this instrument is the wrong shape for.
+//!    Every family here is a LEVEL — what is held now — and retention is
+//!    driven by CHURN, the flow of large short-lived blocks. Nothing in this
+//!    tree counts that flow. The overlay path is the worked example: on wasm
+//!    a picture arrives as a `Vec<u8>` off the worker wire and
+//!    `RasterBuf::into_pixels` *collects* it into a `Vec<Color32>`, so two
+//!    blocks of 42,772,836 B at the 4317x2477 plan are allocated and freed
+//!    per picture, and `squallar_web::worker_port` calls that second copy "a
+//!    property of the types, not of the transport". Both are gone by the next
+//!    tick and neither is on any level here; the linear memory they grew is
+//!    not.
+//!
 //! # Shared ownership is double counted, on purpose
 //!
 //! Several families hold `Arc`s of the same decoded volume: the loop
@@ -83,9 +136,9 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// land. Sized against every figure at `u64::MAX` and the longest instance
 /// name, not against a plausible reading — and sized EXACTLY: the widest line
 /// is this many bytes, with no headroom, so a family added without re-deriving
-/// it is cut and the test says so. The arithmetic: twenty-four families (the
+/// it is cut and the test says so. The arithmetic: twenty-six families (the
 /// two GPU ones included), the resident total and the linear reading are
-/// twenty-six `u64::MAX` figures at 20 digits apiece, the prose between them
+/// twenty-eight `u64::MAX` figures at 20 digits apiece, the prose between them
 /// under `rasterization worker` makes up the rest — and the residual is the
 /// **`none` arm**: a reading of `u64::MAX - 1` against families that saturate
 /// prints `residual none (families price above it)`, 27 bytes wider than the
@@ -109,12 +162,19 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// `still l3` is 8 characters: `8 + 25 = 33`, so 1099 + 33 = 1132.
 /// `loop archives` is 13 characters: `13 + 25 = 38`, so 1132 + 38 = 1170.
 /// `font atlas` is 10 characters: `10 + 25 = 35`, so 1170 + 35 = 1205.
+/// `overlay replies` is 15 characters, so it adds `15 + 25 = 40`: 1205 + 40
+/// = 1245.
 ///
 /// This chain is a DERIVATION and not a record: every term in it moves
 /// when a family is added or removed, so re-derive it rather than nudging the
 /// constant, and let `the_widest_line_fits_the_hooks_buffer` be the check.
 /// That test asserts `<=`, so a constant that is too LARGE passes quietly.
-pub const CENSUS_LINE_CAPACITY: usize = 1205;
+/// **1245 was therefore checked against the measured width and not only
+/// against the arithmetic**: setting it to 1 makes the test report the true
+/// width, so the derivation above and the line agree exactly. Do that after
+/// any change here — the chain being right twice is worth ten seconds, and
+/// the `<=` will not tell you.
+pub const CENSUS_LINE_CAPACITY: usize = 1245;
 
 /// One family's level. A `u64` of bytes, `Relaxed` throughout: every reader
 /// wants a recent figure, none wants a synchronised one, and a census torn
@@ -335,6 +395,34 @@ families! {
         "What the finished 2D loop frames hold on THIS heap. A radar or \
          section frame's pixels are the GPU's behind a `TextureHandle`; what \
          is counted is the CPU side each frame keeps beside it.";
+    OVERLAY_REPLY_BYTES, overlay_reply_bytes, set_overlay_reply_bytes,
+        "**Finished OVERLAY pictures between the rasterizer and the frame \
+         thread** - the `Arc<egui::ColorImage>` an `OverlayRenderResponse` \
+         carries, priced at its `Color32` pixels, from the moment the deliver \
+         closure sends it until `App::poll_overlay_render_results` takes it \
+         off the channel. `renders in flight` is the same instrument one \
+         producer over: that one covers the RADAR replies (the pane renders, \
+         the adjacent-tilt speculation and the radar loop frames) and reaches \
+         no overlay picture at all, so until this family existed a picture \
+         that is 42,772,836 B at the 4317x2477 plan crossed that seam priced \
+         by nothing. Both overlay producers are here, live pane rasters and \
+         overlay LOOP frames alike, because both take the one deliver. \
+         Published at the seam - the deliver as it sends, the drain as it \
+         receives - for `renders in flight`'s reason: a reply lives about one \
+         frame and a 2 s tick would read it as zero almost always. \
+         DISJOINT from every other family here. The picture is not in \
+         `overlay grids` or `overlay items`, which price the SOURCE data a \
+         handler decodes, never the raster drawn from it; and it is not yet \
+         in `upload pending`, which starts naming the same allocation only \
+         once `Context::load_texture` has filed it and the renderer has \
+         banded it. The two windows abut and do not overlap: this one ends at \
+         the take, that one begins at the file, and the frame between them - \
+         while egui's own `TexturesDelta` holds it - is named by neither. \
+         NOT ZERO ON ANY TARGET, and the difference is the thread rather than \
+         the code: natively the deliver runs on an offload thread and the \
+         window is a channel hop, on wasm32 it runs on the page thread inside \
+         the worker's reply callback and the window is from that callback to \
+         the next drain.";
     UPLOAD_PENDING_BYTES, upload_pending_bytes, set_upload_pending_bytes,
         "Images the renderer is still banding to the GPU. A band crosses \
          ~4 MiB a frame where no staging ring exists - which is every browser \
@@ -550,6 +638,7 @@ impl Census {
             self.overlay_item_bytes,
             self.overlay_parked_bytes,
             self.loop_frame_bytes,
+            self.overlay_reply_bytes,
             self.upload_pending_bytes,
             self.tile_body_bytes,
             self.tile_parsed_bytes,
@@ -615,6 +704,14 @@ impl Census {
     /// shared can price above the heap. A caller printing this must print
     /// the reading beside it — a residual with no denominator is the exact
     /// mistake this module exists to stop.
+    ///
+    /// **This figure is NOT "how much is held by something unnamed", and on
+    /// wasm it is mostly not held by anything at all.** `linear_bytes` is a
+    /// high-water mark and this subtraction carries every byte the allocator
+    /// has freed and cannot give back — 359 to 399 MiB of a ~880 MiB page on
+    /// both browsers, measured. [`Self::unaccounted`] against
+    /// [`ProcessCensus::live`] is the reading that answers the holder
+    /// question; see the module note, which has the table.
     pub fn residual(&self, linear_bytes: u64) -> Option<u64> {
         linear_bytes.checked_sub(self.resident_total())
     }
@@ -730,6 +827,7 @@ pub fn write_line<W: core::fmt::Write>(
          render pools {} B, \
          renders in flight {} B, \
          overlay grids {} B, overlay items {} B, overlay parked {} B, loop frames {} B, \
+         overlay replies {} B, \
          upload pending {} B, tile bodies {} B, tile parsed {} B, \
          tile cache {} B, loans out {} B, volume store {} B, jobs in flight {} B, \
          font atlas {} B, deferred drops {} B; resident total {} B of ",
@@ -750,6 +848,7 @@ pub fn write_line<W: core::fmt::Write>(
         census.overlay_item_bytes,
         census.overlay_parked_bytes,
         census.loop_frame_bytes,
+        census.overlay_reply_bytes,
         census.upload_pending_bytes,
         census.tile_body_bytes,
         census.tile_parsed_bytes,
@@ -1080,6 +1179,16 @@ pub const PROCESS_WALK_EVERY: u32 = 8;
 /// and `loop archives` from 647 to 649 — a family costs this line two bytes,
 /// not the `name.len() + 25` it costs the census line, because only the
 /// saturated `unaccounted` figures widen here and not a per-family term.
+///
+/// **The two constants move for different reasons and neither implies the
+/// other**: [`CENSUS_LINE_CAPACITY`] grows by the family's NAME
+/// (`name.len() + 25`), this one only when a printed total gains a DIGIT.
+/// **So a family can cost this line nothing at all, and measuring is the only
+/// way to know.** `chunk feed` took it 645 to 647 and `loop archives` 647 to
+/// 649; `overlay replies` moved it not at all, because the `families` and
+/// `floor` totals it widens were already past the power of ten that would
+/// have cost a digit. Re-derive by running the test, which asserts equality
+/// rather than `<=`; never carry a delta across a rebase.
 pub const PROCESS_LINE_CAPACITY: usize = 649;
 
 /// **The process denominator as one line.**

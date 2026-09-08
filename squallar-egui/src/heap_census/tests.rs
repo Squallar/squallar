@@ -21,6 +21,7 @@ fn distinct() -> Census {
         overlay_item_bytes: 256,
         overlay_parked_bytes: 512,
         loop_frame_bytes: 1024,
+        overlay_reply_bytes: 1 << 28,
         upload_pending_bytes: 2048,
         tile_body_bytes: 4096,
         tile_parsed_bytes: 8192,
@@ -46,21 +47,28 @@ fn distinct() -> Census {
 fn the_resident_total_leaves_the_gpu_families_out() {
     let c = distinct();
     // One distinct power of two per family, so the sum of them all is
-    // `2^28 - 1`. `overlay pictures` was deleted and its `2^6` left a gap,
+    // `2^29 - 1`. `overlay pictures` was deleted and its `2^6` left a gap,
     // which stood here as an explicit `- 64` so the derivation named the
     // family that had left rather than hiding it in a literal. `font atlas`
     // has now taken that vacant `2^6`, so the gap closes and the subtraction
-    // goes: the run is contiguous again.
+    // goes: the run is contiguous again. `overlay replies` extends it by one
+    // at `2^28`.
     //
-    // The exponent moved from 27 to 28 when `loop archives` landed and took
-    // `2^27`: a family added without moving it would make this assertion fail
-    // by exactly its own figure, which is the failure a fixture like this is
-    // for and not a reason to write the sum as a literal.
+    // The exponent moved 27 -> 28 when `loop archives` landed and took `2^27`,
+    // then 28 -> 30 when those two landed. **`overlay replies` was written
+    // against 2^27 too, on a branch that did not yet have `loop archives`, and
+    // git merged the two silently** — they are additions in different hunks,
+    // so nothing conflicted and the fixture briefly had two families sharing
+    // one figure, which is the one thing it exists to prevent. What caught it
+    // was this assertion, by exactly the duplicated 2^27. A distinct figure
+    // per family is not decoration: it is the only reason a merge like that
+    // fails loudly instead of quietly making the sum right for the wrong
+    // reason.
     //
     // The exclusions are NAMED rather than spelled as their powers: a literal
     // here goes on passing while pointing at the wrong family after any
     // renumber, which is exactly what a fixture like this exists to catch.
-    let every_family = (1 << 28) - 1;
+    let every_family = (1u64 << 29) - 1;
     assert_eq!(
         c.resident_total(),
         every_family - c.tile_mesh_bytes - c.gpu_texture_bytes - c.raster_shared_bytes,
@@ -134,6 +142,7 @@ fn the_line_names_every_family_and_its_denominator() {
         "font atlas 64 B",
         "render pools 1048576 B",
         "renders in flight 2097152 B",
+        "overlay replies 268435456 B",
     ] {
         assert!(said.contains(field), "{field} missing from {said}");
     }
@@ -178,6 +187,7 @@ fn the_widest_line_fits_the_hooks_buffer() {
         overlay_item_bytes: u64::MAX,
         overlay_parked_bytes: u64::MAX,
         loop_frame_bytes: u64::MAX,
+        overlay_reply_bytes: u64::MAX,
         upload_pending_bytes: u64::MAX,
         tile_body_bytes: u64::MAX,
         tile_parsed_bytes: u64::MAX,

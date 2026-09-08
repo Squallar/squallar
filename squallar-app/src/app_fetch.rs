@@ -1130,7 +1130,7 @@ impl super::App {
         height: u32,
         id_map: Option<squallar_overlays::render::overlay_state::HitItems>,
         mut response: OverlayRenderResponse,
-        sender: Sender<OverlayRenderResponse>,
+        sink: crate::channels::OverlayReplySink,
         window: Option<crate::WindowRef>,
     ) -> impl FnOnce(squallar_worker::offload::JobResult) + Send + 'static {
         move |result| {
@@ -1243,7 +1243,10 @@ impl super::App {
                     }
                 }
             }
-            let _ = sender.send(response);
+            // The picture is priced onto `overlay replies` on its way out;
+            // see `crate::channels::OverlayReplySink::send`, which is where
+            // that seam lives so a sender cannot be handed over without it.
+            sink.send(response);
             super::notify_redraw(&window);
         }
     }
@@ -1349,6 +1352,7 @@ impl super::App {
         }
 
         let sender = self.channels.overlay_render_sender.clone();
+        let reply_level = std::sync::Arc::clone(&self.channels.overlay_reply_bytes);
         let window = self.window.clone();
 
         match &id {
@@ -1530,7 +1534,10 @@ impl super::App {
                             // the path it was already on.
                             frame,
                         },
-                        sender,
+                        crate::channels::OverlayReplySink {
+                            sender,
+                            level: reply_level,
+                        },
                         window,
                     ),
                 );

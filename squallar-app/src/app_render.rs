@@ -3157,6 +3157,15 @@ impl super::App {
         let mut arrived = 0usize;
         while let Ok(mut resp) = self.channels.overlay_render_receiver.try_recv_arrival() {
             arrived += 1;
+            // **The seam where a reply's picture leaves `overlay replies`.**
+            // Before either arm below, because both of them consume `resp`,
+            // and both of them end the window this family measures: from here
+            // on the picture is `Context::load_texture`'s, then egui's delta,
+            // then the renderer's band queue (`upload pending`).
+            crate::channels::overlay_reply_level::settle(
+                &self.channels.overlay_reply_bytes,
+                crate::channels::overlay_reply_level::reply_bytes(&resp),
+            );
             let id = resp.overlay_kind.clone();
 
             // **One loop frame's raster, filed on the frame that asked** — the

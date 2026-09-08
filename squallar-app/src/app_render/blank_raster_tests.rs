@@ -106,7 +106,10 @@ fn arrive(app: &mut crate::app::App, ctx: &egui::Context, generation: u64, rgba:
         H,
         None,
         response,
-        app.channels.overlay_render_sender.clone(),
+        crate::channels::OverlayReplySink {
+            sender: app.channels.overlay_render_sender.clone(),
+            level: std::sync::Arc::clone(&app.channels.overlay_reply_bytes),
+        },
         None,
     )(out);
     app.poll_overlay_render_results(ctx);
