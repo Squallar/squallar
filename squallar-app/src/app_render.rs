@@ -930,6 +930,55 @@ fn frame_ui_lines(u: &crate::frame_ledger::UiHists) -> [String; 9] {
     ]
 }
 
+/// The seven `frame stack (<name>):` lines — `frame ui (stack)`, opened up.
+///
+/// Denominator: **exactly `frame ui (stack)`'s**, and by construction rather
+/// than by inspection — the seven `record` calls sit inside the very guard
+/// the ninth `ui` cut's does, so the two families' `n` cannot differ. The
+/// seven are contiguous cuts of that one span, so their sums telescope to its
+/// sum to within the truncation [`named_hist_line`] describes.
+///
+/// **Never added to `frame ui (*)` and never to `frame segment (ui)`.** Each
+/// is the one below it, opened up, and adding any pair double-counts the same
+/// microseconds under two headings. The prefix is a third spelling —
+/// `frame stack`, not `frame ui` — precisely so that a reader pattern-matching
+/// on `frame ui` cannot sum two levels of one span.
+///
+/// **`frame stack (gate)` is the closed-panel reading.** All three of
+/// `render_stack_and_inspector`'s early returns are inside that cut, so a
+/// frame that decides to draw no panel files its whole `stack` there. A large
+/// `gate` is a finding about the decision, not about the drawing.
+///
+/// # These seven lines cannot answer the question the family was cut for
+///
+/// `stack` is a SPIKE on the **browser** legs it has been read on — p50
+/// 421-500 µs against a max of 8,000-9,514 µs — and a `Hist` **carries no
+/// maximum**. It is four bins per octave, so every
+/// percentile it answers is quantized to a bin edge and any true ratio
+/// between 1.68x and 2.38x prints as exactly 2.00x. So the seven lines below
+/// say which cut carries the WEIGHT (read as its `sum` over the parent's
+/// `sum`, which is carried exactly), and they cannot say how large the worst
+/// frame's cut was — the top occupied bin bounds it and nothing here pins it.
+///
+/// **That figure lives on `frame worst:`, in the `stack_*` columns**, which
+/// is why those landed in the same commit as these lines and not after them.
+/// One frame's seven microseconds, on a denominator that includes the idle
+/// frames these histograms never see — and half the measured `ui` spikes are
+/// on idle frames. Read the share here; read the spike there.
+///
+/// Emitted every tick, `n=0` included, on [`frame_segment_lines`]' terms.
+fn frame_stack_lines(s: &crate::frame_ledger::StackHists) -> [String; 7] {
+    [
+        named_hist_line("frame stack", "snap", &s.snap),
+        named_hist_line("frame stack", "gate", &s.gate),
+        named_hist_line("frame stack", "hydrate", &s.hydrate),
+        named_hist_line("frame stack", "statuses", &s.statuses),
+        named_hist_line("frame stack", "render", &s.render),
+        named_hist_line("frame stack", "inspector", &s.inspector),
+        named_hist_line("frame stack", "settle", &s.settle),
+    ]
+}
+
 /// The eight `frame pump (<name>):` lines — the `pump` segment, opened up.
 ///
 /// Same denominator as `frame segment (pump)` — presented interact frames —
@@ -1078,8 +1127,10 @@ fn frame_dispatch_lines(d: &crate::frame_ledger::DispatchHists) -> [String; 7] {
 ///
 /// The nine `ui_*` columns are that same frame's `ui` segment opened up — see
 /// [`ui_cut_columns`] for why they are on this line rather than left to
-/// `frame ui (*)`; the seven `pre_*` columns are the same for `pre`, and see
-/// [`pre_cut_columns`] for why that segment earned them.
+/// `frame ui (*)`; the seven `stack_*` columns are the fifth of those nine
+/// opened up one level further ([`stack_cut_columns`]); the seven `pre_*`
+/// columns are the same for `pre`, and see [`pre_cut_columns`] for why that
+/// segment earned them.
 fn frame_worst_line(
     worst: Option<crate::frame_ledger::WorstFrame>,
     since_boot: Option<crate::frame_ledger::WorstFrame>,
@@ -1094,7 +1145,7 @@ fn frame_worst_line(
             let [pre, pump, ui, prepare, finish, post] = b.segments;
             format!(
                 "boot: {}, pre={} us, pump={} us, ui={} us, prepare={} us, finish={} us, \
-                 post={} us, {}, {}",
+                 post={} us, {}, {}, {}",
                 if b.interact { "interact" } else { "idle" },
                 pre,
                 pump,
@@ -1103,6 +1154,7 @@ fn frame_worst_line(
                 finish,
                 post,
                 ui_cut_columns(b.ui_cuts),
+                stack_cut_columns(b.stack_cuts),
                 pre_cut_columns(b.pre_cuts),
             )
         }
@@ -1116,7 +1168,7 @@ fn frame_worst_line(
     let [pre, pump, ui, prepare, finish, post] = w.segments;
     format!(
         "frame worst: service={} us, family={}, since_boot={} us, pre={} us, pump={} us, \
-         ui={} us, prepare={} us, finish={} us, post={} us, {}, {}, {boot}",
+         ui={} us, prepare={} us, finish={} us, post={} us, {}, {}, {}, {boot}",
         w.service,
         if w.interact { "interact" } else { "idle" },
         since_boot_us,
@@ -1127,6 +1179,7 @@ fn frame_worst_line(
         finish,
         post,
         ui_cut_columns(w.ui_cuts),
+        stack_cut_columns(w.stack_cuts),
         pre_cut_columns(w.pre_cuts),
     )
 }
@@ -1197,6 +1250,34 @@ fn ui_cut_columns(cuts: [u32; 9]) -> String {
         "ui_poll={poll} us, ui_layout={layout} us, ui_topbar={topbar} us, \
          ui_statusbar={statusbar} us, ui_stack={stack} us, ui_dialog={dialog} us, \
          ui_panes={panes} us, ui_apply={apply} us, ui_chrome={chrome} us"
+    )
+}
+
+/// One frame's seven `stack` cuts as the `stack_*=<n> us` columns
+/// `frame worst:` carries, in `StackHists`' order.
+///
+/// **Prefixed `stack_` for [`ui_cut_columns`]' reason, and one level further
+/// down.** `render` is also a word this line's family uses, `settle` is a
+/// `pump` cut name and `gate` is a `pre` cut name; a bare `render=` beside a
+/// `ui_stack=` would read as a segment rather than as a slice of a slice.
+///
+/// **Never added to `frame stack (*)`, to `frame ui (*)` or to
+/// `frame segment (ui)`.** Those histograms record inside the ledger's
+/// `if interacted` arm; these seven are one frame's microseconds and half the
+/// measured `ui` spikes fall on IDLE frames — 8,339, 6,600, 8,219 and 7,879
+/// µs — which is precisely why the columns exist. Those figures are from
+/// **browser** legs and are the only arms this family has been read on; see
+/// `frame_ledger::StackHists`, which names them and the frame they sit in.
+///
+/// They sum to this line's own `ui_stack=` **to within 6 µs and never over
+/// it**, on `ui_cut_columns`' terms: seven truncating
+/// `frame_ledger::micros` calls against a parent that makes one.
+fn stack_cut_columns(cuts: [u32; 7]) -> String {
+    let [snap, gate, hydrate, statuses, render, inspector, settle] = cuts;
+    format!(
+        "stack_snap={snap} us, stack_gate={gate} us, stack_hydrate={hydrate} us, \
+         stack_statuses={statuses} us, stack_render={render} us, \
+         stack_inspector={inspector} us, stack_settle={settle} us"
     )
 }
 
@@ -2370,6 +2451,13 @@ impl super::App {
         // denominator, six contiguous cuts of that one span — a decomposition
         // of the line above, never a seventh segment beside it.
         for line in frame_ui_lines(ledger.ui_phases()) {
+            say_telemetry(loud, &line);
+        }
+        // One level below the nine above: which part of the layer stack owns
+        // the `ui` tail. Same denominator as `frame ui (stack)` by
+        // construction, seven contiguous cuts of that one cut — never added
+        // to it and never to `frame segment (ui)`. See `frame_stack_lines`.
+        for line in frame_stack_lines(ledger.stack_phases()) {
             say_telemetry(loud, &line);
         }
         // The `pump` segment above, opened up at the seams `setup_egui_frame`

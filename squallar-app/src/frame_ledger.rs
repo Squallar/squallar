@@ -4,23 +4,40 @@
 //! instants per frame; `finalize` folds them into fixed-shape histograms
 //! ([`squallar_device_profile::hist::Hist`]) once the frame's outcome is
 //! known. **Product telemetry, not a campaign instrument**: always on, no
-//! feature gate, and the per-frame cost is **forty-seven clock reads,
-//! fifty-six integer bin searches** and two `u32` comparisons.
+//! feature gate, and the per-frame cost is **fifty-three clock reads,
+//! sixty-three integer bin searches** and two `u32` comparisons.
 //!
 //! The clock reads, counted where they are taken: the ledger's own **eight**
 //! stamps (its six `mark_*`/`finalize` reads plus the pair the acquire
 //! closure hands back), the **six** `handle_redraw` takes across its head,
-//! the **seven** `setup_egui_frame` takes across `pump`, the **eight**
+//! the **seven** `setup_egui_frame` takes across `pump`, the **fourteen**
 //! `Gui::ui` takes on its way through (six in `ui_phased`, two inside
-//! `render_shell_phased`), the **five** the egui pass takes, the **six**
-//! `handle_redraw`'s tail takes (five in the tail, one inside
-//! `process_gui_actions`) and the **seven** `present_frame` takes after the
-//! acquire returns.
+//! `render_shell_phased`, six more inside `render_stack_and_inspector`), the
+//! **five** the egui pass takes, the **six** `handle_redraw`'s tail takes
+//! (five in the tail, one inside `process_gui_actions`) and the **seven**
+//! `present_frame` takes after the acquire returns.
+//!
+//! **Fifty-three is the frame that reaches the layer panel; a frame that does
+//! not costs forty-nine.** `render_stack_and_inspector` has three early
+//! returns — a compact width, a faded chrome, both slide factors at zero —
+//! and every one of them fills its remaining five stamps from ONE clock read
+//! (`shell_api::StackStamps::skipped_after`). So the [`StackHists`] split is
+//! six reads at most and two at least, and never a read per skipped region.
+//!
+//! **Two neighbouring instruments are NOT in the fifty-three, and naming them
+//! is what stops the next recount oscillating.** `EguiRenderer` takes a sixth
+//! unconditional read for `PassCosts::note` (and two more when a pane mirror
+//! is requested), and `handle_redraw`'s tail takes up to two more building
+//! `auto_poll_at` and `egui_repaint_at` — deadlines, not stamps, and
+//! conditional. None of the five feeds a figure in this file. The count above
+//! is **this ledger's** reads on the unconditional path.
 //!
 //! The bin searches, on a presented interact frame: ten outside the splits
 //! (one service, one service-less-present, six segments, one acquire, one
-//! cadence) and forty-six in them — **seven** the `pre` split ([`PreHists`]), **eight** the `pump`
-//! split ([`PumpHists`]), **nine** the `ui` split ([`UiHists`]), **six** the
+//! cadence) and fifty-three in them — **seven** the `pre` split ([`PreHists`]), **eight** the `pump`
+//! split ([`PumpHists`]), **nine** the `ui` split ([`UiHists`]), **seven**
+//! the `stack` split ([`StackHists`], one level below the `ui` nine and never
+//! added to them), **six** the
 //! `prepare` split ([`PrepareHists`]), **seven** the `post` split
 //! ([`PostHists`]) and **nine** the `finish` split ([`FinishHists`]). All but
 //! the last record only on the frames their own segment does; the `finish`
@@ -34,15 +51,18 @@
 //! split adds.** They read twenty-six and "about thirty-seven" while the `ui`
 //! split had grown from six cuts to nine, the `post` split from six to seven,
 //! and the eight `pump` stamps had never been counted at all. The `pre` split
-//! itself is six of the forty-seven and seven of the fifty-five; the other
-//! fifteen and eleven were drift. Recount here rather than adjust, or the
-//! next reader inherits the same arithmetic.
+//! itself was six of the then forty-seven and seven of the then fifty-five;
+//! the other fifteen and eleven were drift. Recount here rather than adjust,
+//! or the next reader inherits the same arithmetic. **Every figure in this
+//! block is a recount off the current source** — the `stack` split's six
+//! reads and seven searches were added by recounting all seven contributors,
+//! not by adding six and seven to what stood here.
 //!
 //! **`service less present` is one bin search of the ten and nothing else.**
 //! It is `service` with the `finish` split's eighth cut taken back out —
 //! arithmetic on two figures this file already has — and it records on
-//! exactly one of its two families per frame. So the forty-seven is
-//! unchanged by it and the fifty-five became fifty-six. See
+//! exactly one of its two families per frame. So it left the clock reads
+//! unchanged and took the bin searches from fifty-five to fifty-six. See
 //! [`service_less_present_micros`].
 //!
 //! **The unnecessary-frame verdict adds no clock read and no bin search**, and
@@ -527,10 +547,13 @@ pub(crate) struct PrepareHists {
 /// # Denominator
 ///
 /// **Exactly [`SegmentHists::ui`]'s** — presented interact frames — and that
-/// equality is the whole design. The six are contiguous cuts of the one span,
-/// so they telescope to it (`the_ui_phases_telescope_to_ui`), which makes the
-/// residual arithmetic rather than inference: any `ui` time these six do not
-/// name is a bug in this decomposition, not a mystery.
+/// equality is the whole design. The **nine** are contiguous cuts of the one
+/// span, so they telescope to it (`the_ui_phases_telescope_to_ui`), which
+/// makes the residual arithmetic rather than inference: any `ui` time these
+/// nine do not name is a bug in this decomposition, not a mystery.
+///
+/// The count read "six" from before the split widened, twice. Recounted off
+/// the fields rather than adjusted, on this module's own rule.
 ///
 /// **Never added to `frame segment (ui)`.** These are not a seventh segment
 /// beside it; they *are* it, opened up. The reporting prefix is deliberately
@@ -556,7 +579,11 @@ pub(crate) struct UiHists {
     pub(crate) topbar: Hist,
     /// `render_status_bar`.
     pub(crate) statusbar: Hist,
-    /// `render_stack_and_inspector` — the remainder of the shell.
+    /// `render_stack_and_inspector` — the remainder of the shell, and the
+    /// owner of this segment's tail: p50 421–500 µs against a max of
+    /// 8,000–9,514 µs on the measured legs, 16–20x its own median. Opened up
+    /// one level further by [`StackHists`], whose seven cuts telescope to
+    /// exactly this one.
     pub(crate) stack: Hist,
     /// The time dialog, between the shell and the panes. Its own cut because
     /// a dialog that is not open should not be charged to the map surfaces.
@@ -576,16 +603,131 @@ pub(crate) struct UiHists {
     pub(crate) chrome: Hist,
 }
 
+/// Where the `ui` split's `stack` cut went, one level below [`UiHists`].
+///
+/// # Denominator
+///
+/// **Exactly [`UiHists::stack`]'s** — the frames on which that cut records,
+/// which is presented interact frames that left `ui_phases` — and that
+/// equality is the design, not a coincidence: the seven `record` calls sit in
+/// the very block the ninth `ui` cut's do, so `stack.snap.total()` and
+/// `ui.stack.total()` cannot differ
+/// (`the_stack_family_records_on_exactly_the_frames_its_parent_does`).
+///
+/// A family with a NARROWER `n` than its parent would still telescope on the
+/// frames it holds, and every share read off it would be arithmetic over the
+/// wrong denominator. [`DispatchHists`] is allowed that only because its
+/// parent cut is itself near-zero on the frames it skips; `stack` is the
+/// opposite — the frames it would skip are the closed-panel ones, where the
+/// whole cut is one gate.
+///
+/// **Never added to `frame ui (stack)`.** These are not a tenth `ui` cut
+/// beside it; they *are* it, opened up. The reporting prefix is deliberately
+/// `frame stack` — a third spelling, so that no reader pattern-matching
+/// `frame ui` can add two levels of the same span together.
+///
+/// # What this split was cut to answer
+///
+/// `ui` is ~50 % of the frame, and `panes` + `stack` is 81–82 % of `ui`.
+/// `stack` owns the tail on every Firefox leg measured (max 8,000/8,000/9,514
+/// µs against `panes`' 5,657/3,364/4,000) and it is a SPIKE, not a level: p50
+/// 421–500 µs, so the maximum is 16–20x the median and one frame is more than
+/// twice the whole 4 ms bar. Every spike at or above 4,900 µs fell in the
+/// first ~13 s and then stopped, and the same loop phase 20 s later read 959
+/// µs — the shape of a cache filling rather than of per-click work. A
+/// percentile over one undivided cut cannot say which of seven things that
+/// is.
+///
+/// # Which arms those figures are from, and which they are not from
+///
+/// **Every number above was read on ONE arm**: a Mac at 3440x1440 and 175 Hz
+/// on hardware WebGPU, scene D's ui-sweep, 40 s windows, n=108/107 interact
+/// frames — **three Firefox 155 legs and one Chromium 152**. The
+/// "16–20x its median" spread is the three Firefox legs; Chromium is a single
+/// leg and is not what that range describes.
+///
+/// **Do not carry a figure across an engine.** The `overlay rasters` ledger,
+/// an always-on counter in this same family, reads 20 inked of 908 pictures
+/// on Chromium against 582 of 1,336 on Firefox for the same scene — 2 % and
+/// 44 %. A counter can be sound on both arms and still be answering a
+/// different question on each, and nothing here is licensed to describe an
+/// engine it was not read on.
+///
+/// **No native, Safari, Android or iOS arm has read this family at all**, for
+/// the plain reason that it did not exist until this landing. Those are
+/// absences, not zeros. Note what that makes the four legs above: Firefox and
+/// Chromium with hardware WebGPU are **browser** legs, so the Mac is the HOST
+/// and every figure here is a figure about the **web target**. There is no
+/// native reading of this family to compare them against.
+///
+/// # Attributing a frame between same-frame segments needs evidence
+///
+/// `stack` shares its frame with eight sibling `ui` cuts and five sibling
+/// segments, and a spike in one is not evidence about any other. The
+/// first-~13-s clustering above reads as a cache filling — but nothing in
+/// THIS family separates that from a same-frame segment with a warm-up of its
+/// own. So hold `stack` against the other cuts on the SAME leg before
+/// attributing a frame to either, and in both directions: this family can no
+/// more exonerate a neighbour than convict one.
+///
+/// **And check the leg produces the frames.** Every cut here is interact-only,
+/// so a leg that takes no input records `n=0` and the seven telescope
+/// perfectly over nothing — indistinguishable, on the artifact, from a
+/// correct instrument. The rig's `wide` leg reads `frame service (interact)`
+/// at `n=0` for exactly that reason. Read `n` before reading a share.
+///
+/// # There is no `residual`, and that is deliberate
+///
+/// `settle` closes on the parent's own right boundary, so no `stack` time can
+/// hide in an unnamed tail — [`PostHists::close`]'s reasoning verbatim. What
+/// a subtraction would leave is [`micros`]' truncation dust, bounded at
+/// `n - 1 = 6` µs and never over; printing six microseconds of arithmetic
+/// under a heading called "residual" invites exactly the misreading this
+/// family exists to prevent. **This split's residual is `settle`, a named
+/// span, not a subtraction.** [`DispatchHists`] carries one only because it
+/// accumulates in nanoseconds across a loop and cannot bracket its own span.
+#[derive(Default)]
+pub(crate) struct StackHists {
+    /// The two selection snaps — a pane that draws no map layers, and a layer
+    /// the active pane does not hold. `O(1)`: it scales with nothing, which
+    /// is what makes a non-zero reading here a finding rather than a size.
+    pub(crate) snap: Hist,
+    /// The compact-width gate, `chrome_fade` and the two slide animations.
+    /// Scales with nothing either — **but it holds the WHOLE cut on a frame
+    /// that draws no panel**, because all three of the early returns are
+    /// inside it. A `stack` that is large and all in `gate` is a frame that
+    /// spent its time deciding not to draw.
+    pub(crate) gate: Hist,
+    /// `PaneState::hydrate_layer_states`. Scales with the active pane's slot
+    /// count.
+    pub(crate) hydrate: Hist,
+    /// `stack_row_statuses` — one status line per row. Scales with the layer
+    /// count, and with the alert-set size through
+    /// `NwsAlertHandler::status_line`.
+    pub(crate) statuses: Hist,
+    /// `render_stack`. Scales with layer count times widgets per row.
+    pub(crate) render: Hist,
+    /// `render_inspector`. Scales with the selected layer's control surface,
+    /// so it moves with WHAT is selected rather than with how much there is.
+    pub(crate) inspector: Hist,
+    /// The pane restore, `propagate_pane_sync`, the `ShellPhased`
+    /// construction and the return out of `render_shell_phased`. Scales with
+    /// **pane count**, which makes it structurally weak on a one-pane scene —
+    /// and it is this family's residual, closing on the parent's own right
+    /// boundary so that nothing can hide behind it.
+    pub(crate) settle: Hist,
+}
+
 /// Where the `post` segment's time went, cut at the seams `handle_redraw`'s
 /// tail has.
 ///
 /// # Denominator
 ///
 /// **Exactly [`SegmentHists::post`]'s** — presented interact frames — and that
-/// equality is the whole design. The six are contiguous cuts of the one span,
-/// so they telescope to it (`the_post_phases_telescope_to_post`), which makes
-/// the residual arithmetic rather than inference: any `post` time these six do
-/// not name is a bug in this decomposition, not a mystery.
+/// equality is the whole design. The **seven** are contiguous cuts of the one
+/// span, so they telescope to it (`the_post_phases_telescope_to_post`), which
+/// makes the residual arithmetic rather than inference: any `post` time these
+/// seven do not name is a bug in this decomposition, not a mystery.
 ///
 /// **Never added to `frame segment (post)`.** These are not a seventh segment
 /// beside it; they *are* it, opened up. The reporting prefix is `frame post`
@@ -847,6 +989,27 @@ pub(crate) struct WorstFrame {
     /// sample of anything. **Zero new clock reads**: the stamps already exist
     /// on every presented frame; only the subtraction moved out of the arm.
     pub(crate) ui_cuts: [u32; 9],
+    /// The seven `stack` cuts of THIS frame, in [`StackHists`]' order:
+    /// `[snap, gate, hydrate, statuses, render, inspector, settle]` — the
+    /// fifth of [`WorstFrame::ui_cuts`], opened up. They telescope to
+    /// `ui_cuts[4]` **to within the six microseconds seven truncating
+    /// [`micros`] calls can lose, and never over it**.
+    ///
+    /// **Here for [`WorstFrame::ui_cuts`]' reason exactly, and it is the
+    /// reason this field is not optional.** [`StackHists`] records inside
+    /// `finalize`'s `if interacted` arm, and half the `ui` spikes measured on
+    /// scene D — on the **browser** legs [`StackHists`] names, which are the
+    /// only arms this family has been read on — fall on IDLE frames: 8,339,
+    /// 6,600, 8,219 and 7,879 µs, because the frame that PAYS for a click
+    /// carries no pointer event. A
+    /// split that existed only in the interact histograms would be blind to
+    /// half the frames the p99 verdict is about.
+    ///
+    /// Zeroed on a frame that left no `ui_phases`, on `ui_cuts`' terms.
+    /// **Zero new clock reads**: the six stamps are already taken on every
+    /// presented frame that reaches the pass; only seven `u32` subtractions
+    /// moved out of the arm.
+    pub(crate) stack_cuts: [u32; 7],
     /// The seven `pre` cuts of THIS frame, in [`PreHists`]' order:
     /// `[platform, ingest, evict, drops, autosave, gate, ensure]`. They
     /// telescope to `segments[0]` within [`micros`]' truncation — at most six
@@ -894,6 +1057,8 @@ pub(crate) struct FrameLedger {
     prepare: PrepareHists,
     /// See [`UiHists`] — `segments.ui`, opened up, same frames.
     ui: UiHists,
+    /// See [`StackHists`] — `ui.stack`, opened up, same frames.
+    stack: StackHists,
     /// See [`PumpHists`] — `segments.pump`, opened up, same frames.
     pump: PumpHists,
     /// See [`PostHists`] — `segments.post`, opened up, same frames.
@@ -1178,6 +1343,36 @@ fn ui_phase_micros(
     ]
 }
 
+/// The seven contiguous cuts of the `ui` split's `stack` cut, in call order:
+/// `[snap, gate, hydrate, statuses, render, inspector, settle]` — see
+/// [`StackHists`], whose fields these are.
+///
+/// Contiguous by construction: each cut ends where the next begins, and the
+/// pair at the ends are the PARENT CUT's own boundaries — `statusbar` and
+/// `shell`, the very two [`ui_phase_micros`]' fifth entry is taken from — so
+/// the seven sum to `micros(statusbar, shell)` to within the six microseconds
+/// seven truncating [`micros`] calls can lose, and never over it. A free
+/// function so the telescoping is testable without a frame.
+///
+/// **Both ends are the parent's, neither is this split's own.** That is what
+/// makes the last cut a named span rather than a subtraction: `settle` runs
+/// to the parent's right boundary, so a `stack` residual has nowhere to hide.
+fn stack_phase_micros(
+    statusbar: Instant,
+    stack: &squallar_egui::shell_api::StackStamps,
+    shell: Instant,
+) -> [u32; 7] {
+    [
+        micros(statusbar, stack.snapped),
+        micros(stack.snapped, stack.gated),
+        micros(stack.gated, stack.hydrated),
+        micros(stack.hydrated, stack.statused),
+        micros(stack.statused, stack.rendered),
+        micros(stack.rendered, stack.inspected),
+        micros(stack.inspected, shell),
+    ]
+}
+
 /// The eight contiguous cuts of the `pump` segment, in call order:
 /// `[begin, restore, promote, raster, apply, advance, dispatch, settle]` —
 /// see [`PumpHists`], whose fields these are.
@@ -1439,6 +1634,18 @@ impl FrameLedger {
             ui_phase_micros(ui_start, phases, ui_end)
         });
 
+        // **The same, one level down, and above the arm for the same reason.**
+        // These seven cut `ui_cuts[4]` -- the `stack` cut, which owns the `ui`
+        // tail and whose maximum is 16-20x its own median -- and HALF the
+        // measured spikes fall on idle frames, where `StackHists` records
+        // nothing. Zero new clock reads: `m.ui_phases` already carries the six
+        // stamps; only seven subtractions left the arm. The statement may not
+        // read `interacted` -- see
+        // `the_worst_frames_stack_cuts_are_computed_outside_the_interact_arm`.
+        let stack_cuts = m.ui_phases.as_ref().map_or([0u32; 7], |phases| {
+            stack_phase_micros(phases.statusbar, &phases.stack, phases.shell)
+        });
+
         // The same, and for the same reason: `pre` is the segment that read
         // 10,357 us on ONE latched frame, and a latched frame is as often
         // idle as not. Above the arm, and the statement may not read
@@ -1590,6 +1797,23 @@ impl FrameLedger {
                 self.ui.panes.record(panes);
                 self.ui.apply.record(apply);
                 self.ui.chrome.record(chrome);
+                // One level further down, inside the very guard the ninth cut
+                // above records under: these seven telescope to `stack`, the
+                // cut recorded four lines up, and the two families' `n` are
+                // equal BY CONSTRUCTION rather than by inspection. A frame
+                // that drew no panel still contributes a sample -- `gate`
+                // holds the whole cut on it, which is a reading and not an
+                // absence -- so this guard is `ui_phases`, never a panel
+                // test. See `StackHists` for why a narrower denominator here
+                // would break every share read off it.
+                let [snap, gate, hydrate, statuses, render, inspector, settle] = stack_cuts;
+                self.stack.snap.record(snap);
+                self.stack.gate.record(gate);
+                self.stack.hydrate.record(hydrate);
+                self.stack.statuses.record(statuses);
+                self.stack.render.record(render);
+                self.stack.inspector.record(inspector);
+                self.stack.settle.record(settle);
             }
             // And the same for `post`, whose right-hand boundary is `now` —
             // the very instant this function opened with, so the sixth cut
@@ -1660,6 +1884,7 @@ impl FrameLedger {
                 service,
                 segments,
                 ui_cuts,
+                stack_cuts,
                 pre_cuts,
                 interact: interacted,
             },
@@ -1669,6 +1894,7 @@ impl FrameLedger {
                 service,
                 segments,
                 ui_cuts,
+                stack_cuts,
                 pre_cuts,
                 interact: interacted,
             });
@@ -1711,6 +1937,12 @@ impl FrameLedger {
 
     pub(crate) fn prepare_phases(&self) -> &PrepareHists {
         &self.prepare
+    }
+
+    /// See [`StackHists`] — `ui_phases().stack`, opened up, and never added
+    /// to it.
+    pub(crate) fn stack_phases(&self) -> &StackHists {
+        &self.stack
     }
 
     pub(crate) fn ui_phases(&self) -> &UiHists {
@@ -1805,7 +2037,7 @@ mod tests {
         DispatchCuts, FinishPhaseStamps, Instant, PRESENT_CUT, PostPhaseStamps, PrePhaseStamps,
         PumpPhaseStamps, WorstFrame, dispatch_cut_micros, finish_phase_micros, latch_worst, micros,
         post_phase_micros, pre_phase_micros, prepare_phase_micros, pump_phase_micros,
-        service_less_present_micros, service_micros, ui_phase_micros,
+        service_less_present_micros, service_micros, stack_phase_micros, ui_phase_micros,
     };
     use squallar_egui::shell_api::UiPhaseStamps;
     use squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps;
@@ -1886,6 +2118,23 @@ mod tests {
     /// `ui_start`, so a test can state its stamps as arithmetic. Named apart
     /// from the `prepare` split's `phases_at`: the two decompositions share
     /// this module and answer with different stamp types.
+    /// Stack stamps for a fixture that says NOTHING about the stack split:
+    /// all six on the parent cut's own left boundary, so the seven cuts read
+    /// `[0, 0, 0, 0, 0, 0, whole]` -- coherent and telescoping, and
+    /// deliberately not a claim about where stack time goes. The stack split
+    /// has its own fixture (`stack_stamps_at`); a ui-level test that borrowed
+    /// this one's numbers would be reading a shape this helper invented.
+    fn stack_stamps_flat(statusbar: Instant) -> squallar_egui::shell_api::StackStamps {
+        squallar_egui::shell_api::StackStamps {
+            snapped: statusbar,
+            gated: statusbar,
+            hydrated: statusbar,
+            statused: statusbar,
+            rendered: statusbar,
+            inspected: statusbar,
+        }
+    }
+
     fn ui_phases_at(ui_start: Instant, offsets: [u64; 8]) -> UiPhaseStamps {
         let at = |us: u64| ui_start + std::time::Duration::from_micros(us);
         UiPhaseStamps {
@@ -1897,6 +2146,7 @@ mod tests {
             dialog: at(offsets[5]),
             panes: at(offsets[6]),
             applied: at(offsets[7]),
+            stack: stack_stamps_flat(at(offsets[3])),
         }
     }
 
@@ -1925,7 +2175,7 @@ mod tests {
         assert_eq!(
             cuts.iter().sum::<u32>(),
             micros(ui_start, ui_end),
-            "the six cuts do not sum to the ui span they decompose, so the \
+            "the nine cuts do not sum to the ui span they decompose, so the \
              residual this instrument reports is not a residual of ui",
         );
         assert_eq!(cuts.iter().sum::<u32>(), 41_000);
@@ -1996,6 +2246,690 @@ mod tests {
             cuts.iter().all(|&c| c > 0),
             "a cut is zero on stamps chosen to make all nine non-zero, so it \
              cannot be reading the span it is named for: {cuts:?}",
+        );
+    }
+
+    /// A `render_stack_and_inspector` whose six interior boundaries land at
+    /// the given microsecond offsets from the parent cut's LEFT boundary —
+    /// the `statusbar` stamp — so a test can state its stamps as arithmetic.
+    ///
+    /// **Offsets from `statusbar`, not from `snapped`**, because the first
+    /// cut is bounded on the left by the parent and a fixture that could not
+    /// move that boundary could not exercise it.
+    fn stack_stamps_at(
+        statusbar: Instant,
+        offsets: [u64; 6],
+    ) -> squallar_egui::shell_api::StackStamps {
+        let at = |us: u64| statusbar + std::time::Duration::from_micros(us);
+        squallar_egui::shell_api::StackStamps {
+            snapped: at(offsets[0]),
+            gated: at(offsets[1]),
+            hydrated: at(offsets[2]),
+            statused: at(offsets[3]),
+            rendered: at(offsets[4]),
+            inspected: at(offsets[5]),
+        }
+    }
+
+    /// **The seven cuts are a decomposition of `ui.stack`, not a sample of
+    /// it.**
+    ///
+    /// The sum telescopes to `micros(statusbar, shell)` — the very span
+    /// [`super::UiHists::stack`] records, and [`ui_phase_micros`]' fifth
+    /// entry — so "what is in the layer stack" is answered by subtraction
+    /// rather than by inference. `stack` owns the `ui` tail on every leg
+    /// measured and was one undivided cut while it did.
+    ///
+    /// **Both ends are the PARENT cut's**, which is the property a re-pointed
+    /// boundary breaks: reading cut 4's left edge off `gated` instead of
+    /// `hydrated` leaves `hydrate`'s span in no cut at all and the sum falls
+    /// short.
+    #[test]
+    fn the_stack_phases_telescope_to_stack() {
+        let statusbar = Instant::now();
+        let stack = stack_stamps_at(statusbar, [90, 410, 1_500, 4_900, 7_300, 8_950]);
+        let shell = statusbar + std::time::Duration::from_micros(9_514);
+
+        let cuts = stack_phase_micros(statusbar, &stack, shell);
+        assert_eq!(
+            cuts,
+            [90, 320, 1_090, 3_400, 2_400, 1_650, 564],
+            "a cut moved: the seven no longer bracket the regions they are \
+             named for",
+        );
+        assert_eq!(
+            cuts.iter().sum::<u32>(),
+            micros(statusbar, shell),
+            "the seven cuts do not sum to the stack span they decompose, so \
+             the attribution this instrument reports is not an attribution of \
+             ui.stack",
+        );
+        assert_eq!(cuts.iter().sum::<u32>(), 9_514);
+        // And the parent really is the `ui` split's fifth cut, taken from the
+        // same two instants -- not a span that merely resembles it.
+        let ui_start = statusbar - std::time::Duration::from_micros(4_000);
+        let ui_end = shell + std::time::Duration::from_micros(6_000);
+        let ui = ui_phase_micros(
+            ui_start,
+            &UiPhaseStamps {
+                polled: ui_start + std::time::Duration::from_micros(300),
+                laid_out: ui_start + std::time::Duration::from_micros(1_900),
+                topbar: ui_start + std::time::Duration::from_micros(2_500),
+                statusbar,
+                shell,
+                dialog: shell + std::time::Duration::from_micros(500),
+                panes: shell + std::time::Duration::from_micros(5_000),
+                applied: shell + std::time::Duration::from_micros(5_500),
+                stack,
+            },
+            ui_end,
+        );
+        assert_eq!(
+            ui[4],
+            cuts.iter().sum::<u32>(),
+            "the seven do not decompose the `ui` split's fifth cut, so this \
+             family names a span the level above it does not have",
+        );
+    }
+
+    /// **The non-vacuity floor: every stamp must be able to move the answer.**
+    ///
+    /// Telescoping alone is satisfied by a degenerate split — one cut holding
+    /// the whole span and six zeros telescopes perfectly and decomposes
+    /// nothing. `every_ui_stamp_is_load_bearing_in_two_cuts`' shape, one level
+    /// down: nudge one stamp and exactly two cuts change, by equal and
+    /// opposite amounts. A split that folded a boundary away — `inspected`
+    /// spelled as `rendered`, say — would move one cut or none.
+    #[test]
+    fn every_stack_stamp_is_load_bearing_in_two_cuts() {
+        let statusbar = Instant::now();
+        // Its own fixture, not the telescoping test's: every cut here is
+        // wider than the 100 us nudge, so a stamp that fails to move a cut
+        // fails this test rather than underflowing it.
+        let base_offsets = [500u64, 1_500, 3_000, 5_000, 7_000, 8_500];
+        let shell = statusbar + std::time::Duration::from_micros(9_514);
+        let base = stack_phase_micros(statusbar, &stack_stamps_at(statusbar, base_offsets), shell);
+
+        for stamp in 0..6 {
+            let mut moved = base_offsets;
+            moved[stamp] -= 100;
+            let cuts = stack_phase_micros(statusbar, &stack_stamps_at(statusbar, moved), shell);
+            let changed: Vec<usize> = (0..7).filter(|&i| cuts[i] != base[i]).collect();
+            assert_eq!(
+                changed,
+                vec![stamp, stamp + 1],
+                "moving stamp {stamp} did not move exactly the two cuts it \
+                 bounds, so one of them is not reading it and the split is \
+                 narrower than its seven names claim",
+            );
+            assert_eq!(
+                (cuts[stamp], cuts[stamp + 1]),
+                (base[stamp] - 100, base[stamp + 1] + 100),
+                "the two cuts around stamp {stamp} did not trade the 100 us \
+                 exactly, so the boundary between them is not the stamp",
+            );
+            assert_eq!(cuts.iter().sum::<u32>(), 9_514);
+        }
+    }
+
+    /// **The floor's other half: no cut may be structurally empty.**
+    ///
+    /// [`every_stack_stamp_is_load_bearing_in_two_cuts`] holds that the
+    /// boundaries are real; this holds that the *regions* are. A split whose
+    /// seven names covered `stack` but where six were pinned at zero would
+    /// pass the telescoping test and report a single opaque number under
+    /// seven headings — which is the instrument this replaces, renamed.
+    ///
+    /// `snap` is the cut this is sharpest about. It brackets two `O(1)`
+    /// selection snaps and it would be the natural one to fold into the gate
+    /// beside it; folded, `snapped` and `gated` become the same instant and
+    /// cut 1 reads zero on every frame the app will ever draw.
+    #[test]
+    fn no_stack_cut_is_structurally_pinned_to_zero() {
+        let statusbar = Instant::now();
+        let stack = stack_stamps_at(statusbar, [90, 410, 1_500, 4_900, 7_300, 8_950]);
+        let shell = statusbar + std::time::Duration::from_micros(9_514);
+        let cuts = stack_phase_micros(statusbar, &stack, shell);
+        assert!(
+            cuts.iter().all(|&c| c > 0),
+            "a cut is zero on stamps chosen to make all seven non-zero, so it \
+             cannot be reading the span it is named for: {cuts:?}",
+        );
+    }
+
+    /// **An early return zeroes only the regions it skipped, and the seven
+    /// still telescope.**
+    ///
+    /// Three of the seven regions do not run when the panel is closed — a
+    /// `Compact` width, a faded chrome, both slide factors at zero — and all
+    /// three returns are inside cut 2. `StackStamps::skipped_after` fills
+    /// every remaining stamp from ONE clock read, so:
+    ///
+    /// * `hydrate`, `statuses`, `render` and `inspector` read exactly zero —
+    ///   they are the four regions no code ran in;
+    /// * `gate` holds the remainder, which is the reading: a large `stack`
+    ///   all in `gate` is a frame that spent its time deciding not to draw;
+    /// * `settle` is NOT zeroed. It closes on the parent's own right
+    ///   boundary, so the `ShellPhased` construction and the return out of
+    ///   `render_shell_phased` stay inside a named span on this path too.
+    ///
+    /// The degenerate this is red against is a fresh `now()` per skipped
+    /// slot: the four cuts then carry the clock's own dust, `gate` loses it,
+    /// and four figures describe the instrument rather than the frame.
+    #[test]
+    fn an_early_return_zeroes_the_cuts_it_skipped_and_still_telescopes() {
+        // ---- Arm 1: the REAL constructor, structure only ----
+        //
+        // Every stamp comes off the same clock in call order. No magnitude is
+        // asserted here and that is deliberate: `skipped_after` reads the
+        // clock itself, so a fixture cannot both use the real constructor and
+        // dictate microsecond-scale gaps -- six back-to-back reads are tens of
+        // nanoseconds and truncate to zero. Mixing a synthetic offset into a
+        // real-clock constructor is what made the first version of this test
+        // assert a 90 us cut against stamps the clock had already placed.
+        let statusbar = Instant::now();
+        let snapped = Instant::now();
+        // The constructor the app calls, not a hand-built twin: a fixture
+        // that assembled the six itself would never exercise the one-read
+        // rule this gate exists for.
+        let stack = squallar_egui::shell_api::StackStamps::skipped_after(snapped);
+        let shell = Instant::now();
+
+        // **The stamps themselves, before the cuts.** Six back-to-back clock
+        // reads take tens of nanoseconds and every one of them truncates to
+        // zero microseconds, so a filler that read the clock per slot would
+        // produce the SAME four zeros below and this gate would be vacuous.
+        // The design rule is one read, and stamp identity is what says so.
+        assert!(
+            stack.gated == stack.hydrated
+                && stack.hydrated == stack.statused
+                && stack.statused == stack.rendered
+                && stack.rendered == stack.inspected,
+            "the five stamps an early return fills are not one instant, so \
+             the filler read the clock more than once and the four skipped \
+             cuts carry the clock's own dust rather than a structural zero",
+        );
+        assert_ne!(
+            stack.snapped, stack.gated,
+            "the filler overwrote the snap boundary, so cut 1 -- the one \
+             region that DID run on this path -- is folded into the gate",
+        );
+
+        let cuts = stack_phase_micros(statusbar, &stack, shell);
+        assert_eq!(
+            &cuts[2..6],
+            &[0, 0, 0, 0],
+            "a region no code ran in reported time, so the filler took more \
+             than one clock read and four cuts carry the clock's dust: \
+             {cuts:?}",
+        );
+        assert_eq!(
+            cuts.iter().sum::<u32>(),
+            micros(statusbar, shell),
+            "the seven cuts of an early-returning frame do not telescope to \
+             its own stack span",
+        );
+
+        // ---- Arm 2: synthetic stamps, where the MAGNITUDES are checkable ----
+        //
+        // The filler instant is placed far from `snapped`, which is what a
+        // real closed-panel frame produces once the gate has done real work.
+        // Legitimate to build by hand because arm 1 above already exercises
+        // the constructor: this arm is about the arithmetic, that one about
+        // `skipped_after`.
+        let base = Instant::now();
+        let syn_snapped = base + std::time::Duration::from_micros(90);
+        let filler = base + std::time::Duration::from_micros(1_600);
+        let syn = squallar_egui::shell_api::StackStamps {
+            snapped: syn_snapped,
+            gated: filler,
+            hydrated: filler,
+            statused: filler,
+            rendered: filler,
+            inspected: filler,
+        };
+        let syn_shell = base + std::time::Duration::from_micros(1_650);
+        let syn_cuts = stack_phase_micros(base, &syn, syn_shell);
+        assert_eq!(
+            syn_cuts,
+            [90, 1_510, 0, 0, 0, 0, 50],
+            "the closed-panel shape is wrong: cut 1 is the snap, cut 2 must \
+             HOLD THE WHOLE remainder of the decision, cuts 3-6 must be \
+             structurally zero, and cut 7 must still close on the parent's \
+             own right boundary",
+        );
+        assert!(
+            syn_cuts[1] > syn_cuts[0],
+            "the gate cut does not hold the remainder on a closed panel, so \
+             the time spent deciding not to draw is attributed to nothing",
+        );
+        assert_eq!(syn_cuts.iter().sum::<u32>(), micros(base, syn_shell));
+    }
+
+    /// **The family records on exactly the frames its parent cut does.**
+    ///
+    /// The denominator gate, and the one a split is most likely to ship
+    /// without. `stack.snap`'s `n` and `ui.stack`'s `n` must be equal on
+    /// every path through `finalize`, because every share this family
+    /// supports is its own `sum` over the parent cut's `sum` — two figures
+    /// over two different frame sets are not a share, they are a coincidence.
+    ///
+    /// Held against a ledger driven through both arms: a frame that reaches
+    /// the panel and an early-returning one, each recorded, plus a frame that
+    /// left no `ui_phases` at all, which must add a sample to neither.
+    ///
+    /// # The object is the trajectory, not the total
+    ///
+    /// A final `total()` is a COUNT, and a count discards which frames it
+    /// counted. A family that skipped one frame and double-recorded another
+    /// ends level with its parent while never once having shared its
+    /// denominator — so the claim, which is about the frame SET, would be
+    /// checked against a figure that cannot see frame sets. The equality is
+    /// therefore asserted after EVERY frame, and each step names which frame
+    /// it followed.
+    ///
+    /// **Two families agreeing on ZERO is not proof of anything**, and the
+    /// per-step count assertions are the half that says so — the first of
+    /// them runs before any frame, where the equality holds and means
+    /// nothing. The vacuous shape is one a real leg takes:
+    /// `frame service (interact)` was measured at `n=0` on the rig's `wide`
+    /// leg because that leg takes no input at all, so every interact-only
+    /// family on it telescoped perfectly over an empty sample and looked
+    /// correct while measuring nothing. The same caution applies one level
+    /// out, to whoever validates this family on a leg: **check the leg
+    /// produces interact frames before reading a share off it.**
+    #[test]
+    fn the_stack_family_records_on_exactly_the_frames_its_parent_does() {
+        let mut ledger = super::FrameLedger::default();
+
+        // **Checked after EVERY frame, not once at the end**, and the
+        // difference is the whole point of the gate. `total()` is a count, and
+        // a count discards WHICH frames contributed: a family that recorded on
+        // frame 1 and not frame 2, then twice on frame 3, ends level with its
+        // parent and has never once shared its denominator. The claim here is
+        // about the frame SET, so the object has to be the trajectory -- the
+        // pair after each frame -- and not the pair at the end.
+        let agree = |ledger: &super::FrameLedger, after: &str| {
+            let parent = ledger.ui.stack.total();
+            for (name, family) in [
+                ("snap", &ledger.stack.snap),
+                ("gate", &ledger.stack.gate),
+                ("hydrate", &ledger.stack.hydrate),
+                ("statuses", &ledger.stack.statuses),
+                ("render", &ledger.stack.render),
+                ("inspector", &ledger.stack.inspector),
+                ("settle", &ledger.stack.settle),
+            ] {
+                assert_eq!(
+                    family.total(),
+                    parent,
+                    "after {after}: `frame stack ({name})` stands at {} \
+                     samples against its parent `frame ui (stack)`'s {}. \
+                     Every share this family supports is its own sum over \
+                     that one, so a step where the two disagree is a share \
+                     computed between two different frame sets -- even if \
+                     they end level",
+                    family.total(),
+                    parent,
+                );
+            }
+            parent
+        };
+        agree(&ledger, "no frames at all");
+
+        for (nth, closed) in [false, true].into_iter().enumerate() {
+            // **Every stamp off the real clock, in the order a frame takes
+            // them.** `StackStamps::skipped_after` reads the clock itself, so
+            // a synthetic timeline could not carry the closed arm without the
+            // two disagreeing about when "now" is -- and a fixture whose
+            // stamps cannot be ordered is not a frame that could exist.
+            let start = Instant::now();
+            let statusbar = Instant::now();
+            let stack = if closed {
+                squallar_egui::shell_api::StackStamps::skipped_after(Instant::now())
+            } else {
+                squallar_egui::shell_api::StackStamps {
+                    snapped: Instant::now(),
+                    gated: Instant::now(),
+                    hydrated: Instant::now(),
+                    statused: Instant::now(),
+                    rendered: Instant::now(),
+                    inspected: Instant::now(),
+                }
+            };
+            let shell = Instant::now();
+            let ui_end = Instant::now();
+            ledger.cur.start = Some(start);
+            ledger.cur.setup = Some(start);
+            ledger.cur.ui_start = Some(start);
+            ledger.cur.ui_end = Some(ui_end);
+            ledger.cur.acquire = Some((ui_end, ui_end));
+            ledger.cur.present_return = Some(ui_end);
+            ledger.cur.ui_phases = Some(UiPhaseStamps {
+                polled: start,
+                laid_out: start,
+                topbar: start,
+                statusbar,
+                shell,
+                dialog: shell,
+                panes: shell,
+                applied: shell,
+                stack,
+            });
+            ledger.finalize(true);
+            let parent = agree(
+                &ledger,
+                if closed {
+                    "a frame that drew no panel"
+                } else {
+                    "a frame that reached the panel"
+                },
+            );
+            assert_eq!(
+                parent,
+                nth as u64 + 1,
+                "the parent cut did not take a sample from a frame that left \
+                 ui_phases, so the equality above is holding two families \
+                 level at a standstill rather than through a frame",
+            );
+        }
+
+        // **A frame with no `ui_phases` at all.** The parent cut takes no
+        // sample and neither may this family: seven zeros would be seven
+        // false readings, not an absence. This is the step that a family
+        // recording outside the guard fails, and it fails at the step rather
+        // than only in the total.
+        let start = Instant::now();
+        let end = Instant::now();
+        ledger.cur.start = Some(start);
+        ledger.cur.setup = Some(start);
+        ledger.cur.ui_start = Some(start);
+        ledger.cur.ui_end = Some(end);
+        ledger.cur.acquire = Some((end, end));
+        ledger.cur.present_return = Some(end);
+        ledger.finalize(true);
+        let parent = agree(&ledger, "a frame that left no ui_phases");
+
+        // **Two families agreeing on ZERO is not proof of anything.** The
+        // equality above is vacuously true on a ledger no frame ever reached,
+        // which is a shape a real leg takes: the rig's `wide` leg reads
+        // `frame service (interact)` at n=0 because it takes no input at all,
+        // so every interact-only family on it telescopes perfectly over an
+        // empty sample and looks correct while measuring nothing.
+        assert_eq!(
+            parent, 2,
+            "the parent cut does not hold the two samples this test drove \
+             through it, so the per-step equality above proved nothing",
+        );
+    }
+
+    /// **The latched frame's seven `stack` cuts telescope to its own
+    /// `ui_cuts[4]`**, so `frame worst`'s `stack_*` columns decompose the very
+    /// frame the line names rather than standing beside it.
+    ///
+    /// The property the field exists for, and it is not the property
+    /// `frame stack (*)` has: those seven histograms record inside
+    /// `finalize`'s `if interacted` arm, and half the `ui` spikes measured on
+    /// scene D fall on IDLE frames — 8,339, 6,600, 8,219 and 7,879 µs.
+    ///
+    /// **Both assertions are load-bearing and neither implies the other.**
+    /// The sum catches a cut taken from the wrong pair of stamps only when
+    /// the error changes the total; the exact array catches the degenerate
+    /// the sum cannot see — whole-`stack` parked in one slot with zeros
+    /// around it, which telescopes perfectly and attributes the tail to a
+    /// region that never ran.
+    #[test]
+    fn the_worst_frames_stack_cuts_telescope_to_its_stack() {
+        // ── Arm 1: whole-microsecond stamps, where the exactness IS true ──
+        let statusbar = Instant::now();
+        let stack = stack_stamps_at(statusbar, [90, 410, 1_500, 4_900, 7_300, 8_950]);
+        let shell = statusbar + std::time::Duration::from_micros(9_514);
+        let ui_stack = micros(statusbar, shell);
+        let w = WorstFrame {
+            service: 13_455,
+            segments: [64, 55, 11_000, 2_829, 700, 293],
+            ui_cuts: [11, 402, 1_207, 96, ui_stack, 4, 812, 3, 77],
+            stack_cuts: stack_phase_micros(statusbar, &stack, shell),
+            pre_cuts: [3, 21, 9, 14, 2, 7, 8],
+            interact: true,
+        };
+        assert_eq!(
+            assert_telescopes_within_truncation(&w.stack_cuts, w.ui_cuts[4], "whole-us stamps"),
+            0,
+            "six stamps with nothing below a microsecond on them still lost \
+             time, so the seven are not contiguous cuts of one span",
+        );
+        assert_eq!(
+            w.stack_cuts,
+            [90, 320, 1_090, 3_400, 2_400, 1_650, 564],
+            "a cut moved: the seven no longer bracket the regions they are \
+             named for, so `frame worst`'s stack_* columns name the wrong \
+             spans",
+        );
+        assert_eq!(w.stack_cuts.iter().sum::<u32>(), 9_514);
+
+        // ── Arm 2: the same seven spans with half a microsecond of dust on
+        // each, which is what a clock hands the constructor ──
+        //
+        // Deterministic, and chosen so the loss is provably NOT zero: seven
+        // fractions of 0.5 sum to 3.5, so the seven cuts fall exactly 3 us
+        // short of a parent that is itself truncated.
+        let dusty_statusbar = Instant::now();
+        let mut at = 0u64;
+        let mut ns = [0u64; 6];
+        for (slot, len) in [
+            90_500u64, 320_500, 1_090_500, 3_400_500, 2_400_500, 1_650_500,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            at += len;
+            ns[slot] = at;
+        }
+        let dusty = squallar_egui::shell_api::StackStamps {
+            snapped: dusty_statusbar + std::time::Duration::from_nanos(ns[0]),
+            gated: dusty_statusbar + std::time::Duration::from_nanos(ns[1]),
+            hydrated: dusty_statusbar + std::time::Duration::from_nanos(ns[2]),
+            statused: dusty_statusbar + std::time::Duration::from_nanos(ns[3]),
+            rendered: dusty_statusbar + std::time::Duration::from_nanos(ns[4]),
+            inspected: dusty_statusbar + std::time::Duration::from_nanos(ns[5]),
+        };
+        let dusty_shell = dusty_statusbar + std::time::Duration::from_nanos(at + 564_500);
+        let dusty_frame = WorstFrame {
+            ui_cuts: [
+                11,
+                402,
+                1_207,
+                96,
+                micros(dusty_statusbar, dusty_shell),
+                4,
+                812,
+                3,
+                77,
+            ],
+            stack_cuts: stack_phase_micros(dusty_statusbar, &dusty, dusty_shell),
+            ..w
+        };
+        assert_eq!(
+            assert_telescopes_within_truncation(
+                &dusty_frame.stack_cuts,
+                dusty_frame.ui_cuts[4],
+                "sub-microsecond stamps",
+            ),
+            3,
+            "the seven cuts of a frame whose stamps carry fractions did not \
+             lose the 3 us seven truncating micros() calls must lose, so this \
+             arm is not exercising the truncation it exists for",
+        );
+
+        // ── Arm 3: a real clock, which is the only one that produces the
+        // fractions the field will actually carry ──
+        let mut samples = 0u32;
+        for _ in 0..256 {
+            let live_statusbar = Instant::now();
+            let live = squallar_egui::shell_api::StackStamps {
+                snapped: Instant::now(),
+                gated: Instant::now(),
+                hydrated: Instant::now(),
+                statused: Instant::now(),
+                rendered: Instant::now(),
+                inspected: Instant::now(),
+            };
+            let live_shell = Instant::now();
+            let cuts = stack_phase_micros(live_statusbar, &live, live_shell);
+            assert_telescopes_within_truncation(
+                &cuts,
+                micros(live_statusbar, live_shell),
+                "a real clock",
+            );
+            samples += 1;
+        }
+        assert_eq!(
+            samples, 256,
+            "the real-clock arm did not take the samples it claims to have \
+             taken, so its greenness is an absence and not a reading",
+        );
+
+        // **The green arm, beside the red ones.** A frame whose `stack` really
+        // is all in one cut is a healthy input that RESEMBLES the degenerate
+        // failure, and the gate must not fire on it.
+        let single = WorstFrame {
+            stack_cuts: [0, 0, 0, 0, 9_514, 0, 0],
+            ..w
+        };
+        assert_eq!(
+            assert_telescopes_within_truncation(
+                &single.stack_cuts,
+                single.ui_cuts[4],
+                "a genuinely single-cut frame",
+            ),
+            0,
+            "a frame whose stack was genuinely spent in one cut fails the \
+             telescoping gate, so the gate over-fires on healthy input",
+        );
+    }
+
+    /// **The seven cuts are computed for EVERY presented frame, not only the
+    /// interact ones.** Held against `finalize`'s own source, on
+    /// [`the_worst_frames_ui_cuts_are_computed_outside_the_interact_arm`]'s
+    /// terms exactly: the binding must appear before the `if interacted {`
+    /// that opens the arm, and the statement itself may not read the flag.
+    ///
+    /// The degenerate this is red against is the natural one — leaving the
+    /// `stack_phase_micros` call where its seven `record` calls are. That
+    /// shape compiles, telescopes on the frames it does fill, and reports
+    /// seven zeros on exactly the frames the field was added to describe:
+    /// half of scene D's `ui` spikes are on idle frames.
+    #[test]
+    fn the_worst_frames_stack_cuts_are_computed_outside_the_interact_arm() {
+        let body = include_str!("frame_ledger.rs")
+            .split_once("pub(crate) fn finalize(")
+            .expect("finalize is no longer a method here")
+            .1;
+        let bound = body
+            .find("let stack_cuts = ")
+            .expect("finalize no longer binds the worst frame's seven stack cuts");
+        let interact_arm = body
+            .find("if interacted {")
+            .expect("finalize no longer splits on the interact flag");
+        assert!(
+            bound < interact_arm,
+            "the seven stack cuts are computed inside finalize's interact \
+             arm, so every frame that PAYS for a click -- all of which are \
+             filed idle, and where half the measured ui spikes live -- would \
+             carry seven zeros on the one line that reports it",
+        );
+        let statement = body[bound..]
+            .split_once("\n\n")
+            .expect("the stack_cuts binding is no longer a statement of its own")
+            .0;
+        assert!(
+            !statement.contains("interacted"),
+            "the stack cuts binding reads the interact flag, so an idle frame \
+             would carry seven zeros however early the binding sits: \
+             {statement:?}",
+        );
+    }
+
+    /// **Many sub-microsecond regions still telescope, and none of them is
+    /// rounded into a neighbour.**
+    ///
+    /// [`DispatchHists`]' twin, ported because this family is always on and
+    /// runs on a browser clock. Every one of the seven regions can be well
+    /// under a microsecond on a closed or nearly-empty panel, and what must
+    /// not happen is a cut absorbing a neighbour's fraction: each truncates
+    /// its OWN span, so the seven fall short of the parent by the derived
+    /// bound and never by more.
+    #[test]
+    fn many_sub_microsecond_stack_regions_survive_into_their_own_cuts() {
+        let statusbar = Instant::now();
+        let stack = squallar_egui::shell_api::StackStamps {
+            snapped: statusbar + std::time::Duration::from_nanos(700),
+            gated: statusbar + std::time::Duration::from_nanos(1_400),
+            hydrated: statusbar + std::time::Duration::from_nanos(2_100),
+            statused: statusbar + std::time::Duration::from_nanos(2_800),
+            rendered: statusbar + std::time::Duration::from_nanos(3_500),
+            inspected: statusbar + std::time::Duration::from_nanos(4_200),
+        };
+        let shell = statusbar + std::time::Duration::from_nanos(4_900);
+        let cuts = stack_phase_micros(statusbar, &stack, shell);
+        assert_eq!(
+            cuts, [0; 7],
+            "a 700 ns region reported a whole microsecond, so a cut is \
+             rounding rather than truncating and the seven can exceed their \
+             parent",
+        );
+        assert_eq!(
+            assert_telescopes_within_truncation(&cuts, micros(statusbar, shell), "700 ns regions"),
+            4,
+            "seven 700 ns regions did not lose the 4 us of a 4,900 ns parent, \
+             so this arm is not exercising the truncation it exists for",
+        );
+    }
+
+    /// **A backward-stepping clock does not panic the frame thread.**
+    ///
+    /// [`cuts_that_overrun_their_span_report_a_zero_residual`]'s reason, and
+    /// it is sharper here: this instrument is ALWAYS ON, it takes fourteen
+    /// reads per frame on a browser, and `Instant::duration_since` panics on
+    /// a negative interval on some platforms. A coarse or non-monotonic web
+    /// clock can order two of these stamps wrongly, and a frame-thread panic
+    /// in product telemetry is a worse outcome than a zero.
+    #[test]
+    fn stack_stamps_out_of_order_report_zeros_rather_than_panicking() {
+        let statusbar = Instant::now();
+        let later = statusbar + std::time::Duration::from_micros(5_000);
+        // Every interior stamp BEFORE the parent's left boundary, which is
+        // the worst ordering a clock can hand this function.
+        let backwards = squallar_egui::shell_api::StackStamps {
+            snapped: statusbar,
+            gated: statusbar,
+            hydrated: statusbar,
+            statused: statusbar,
+            rendered: statusbar,
+            inspected: statusbar,
+        };
+        // Right boundary backwards TOO: with `later` on the right, the
+        // seventh cut legitimately spans statusbar -> later and reads 5,000,
+        // which is correct saturating behaviour and not the all-zero case.
+        // The first version of this test asserted `[0; 7]` against that
+        // spelling and was wrong about its own arithmetic.
+        let cuts = stack_phase_micros(later, &backwards, statusbar);
+        assert_eq!(
+            cuts, [0; 7],
+            "a stamp ordering the clock can produce did not report zeros",
+        );
+
+        // The MIXED ordering -- interior stamps behind the left boundary, the
+        // right boundary ahead of them -- is the one a coarse clock actually
+        // produces. It must not panic, and the one cut that can still be
+        // non-zero is the seventh, which really does span those two instants.
+        let mixed = stack_phase_micros(later, &backwards, later);
+        assert_eq!(
+            mixed,
+            [0, 0, 0, 0, 0, 0, 5_000],
+            "a mixed backwards ordering did not saturate to zeros with the \
+             one genuine span intact",
         );
     }
 
@@ -2862,15 +3796,17 @@ mod tests {
         );
     }
 
-    /// A candidate frame whose six segments sum to `service` and whose nine
-    /// `ui` cuts sum to `segments[2]`, so a test can state a frame as one
-    /// number and still have both decompositions telescope.
+    /// A candidate frame whose six segments sum to `service`, whose nine
+    /// `ui` cuts sum to `segments[2]` and whose seven `stack` cuts sum to
+    /// `ui_cuts[4]`, so a test can state a frame as one number and still have
+    /// all three decompositions telescope.
     ///
     /// The nine are spread rather than parked on one cut on purpose: a fixture
     /// of `[0, 0, 0, 0, ui, 0, 0, 0, 0]` telescopes under a formatter that
     /// printed `segments[2]` in the `ui_stack=` slot, so it could not tell the
     /// two apart. `the_worst_frames_ui_cuts_telescope_to_its_ui` keeps that
-    /// degenerate shape as its own explicit green arm instead.
+    /// degenerate shape as its own explicit green arm instead. The seven are
+    /// spread for the same reason, one level down.
     fn frame(service: u32, interact: bool) -> WorstFrame {
         let sixth = service / 6;
         let mut segments = [sixth; 6];
@@ -2878,6 +3814,9 @@ mod tests {
         let ninth = segments[2] / 9;
         let mut ui_cuts = [ninth; 9];
         ui_cuts[8] = segments[2] - ninth * 8;
+        let stack_seventh = ui_cuts[4] / 7;
+        let mut stack_cuts = [stack_seventh; 7];
+        stack_cuts[6] = ui_cuts[4] - stack_seventh * 6;
         let seventh = segments[0] / 7;
         let mut pre_cuts = [seventh; 7];
         pre_cuts[6] = segments[0] - seventh * 6;
@@ -2885,6 +3824,7 @@ mod tests {
             service,
             segments,
             ui_cuts,
+            stack_cuts,
             pre_cuts,
             interact,
         }
@@ -3088,6 +4028,9 @@ mod tests {
             service: 60_000,
             segments: [1_000, 2_000, micros(ui_start, ui_end), 8_000, 4_000, 4_000],
             ui_cuts: ui_phase_micros(ui_start, &phases, ui_end),
+            // Spread across all seven and summing to `ui_cuts[4]`, so the
+            // fixture describes a frame that could exist at BOTH levels.
+            stack_cuts: [40, 260, 500, 900, 9_100, 1_200, 100],
             pre_cuts: [100, 300, 200, 250, 50, 50, 50],
             interact: false,
         };
@@ -3134,6 +4077,7 @@ mod tests {
             dialog: dusty_start + std::time::Duration::from_nanos(ns[5]),
             panes: dusty_start + std::time::Duration::from_nanos(ns[6]),
             applied: dusty_start + std::time::Duration::from_nanos(ns[7]),
+            stack: stack_stamps_flat(dusty_start + std::time::Duration::from_nanos(ns[3])),
         };
         let dusty_end = dusty_start + std::time::Duration::from_nanos(at + 1_549_500);
         let dusty_cuts = ui_phase_micros(dusty_start, &dusty, dusty_end);
@@ -3171,15 +4115,20 @@ mod tests {
         let mut samples = 0;
         for _ in 0..256 {
             let live_start = Instant::now();
+            let polled = Instant::now();
+            let laid_out = Instant::now();
+            let topbar = Instant::now();
+            let live_statusbar = Instant::now();
             let live = UiPhaseStamps {
-                polled: Instant::now(),
-                laid_out: Instant::now(),
-                topbar: Instant::now(),
-                statusbar: Instant::now(),
+                polled,
+                laid_out,
+                topbar,
+                statusbar: live_statusbar,
                 shell: Instant::now(),
                 dialog: Instant::now(),
                 panes: Instant::now(),
                 applied: Instant::now(),
+                stack: stack_stamps_flat(live_statusbar),
             };
             let live_end = Instant::now();
             assert_telescopes_within_truncation(
@@ -3201,6 +4150,11 @@ mod tests {
         // it. Over-firing here would block every real single-cut frame.
         let single = WorstFrame {
             ui_cuts: [0, 0, 0, 0, 41_000, 0, 0, 0, 0],
+            // Re-stated rather than inherited: `w`'s seven sum to its own
+            // 12,100 us `stack`, and carrying them onto a frame whose
+            // `ui_stack` is 41,000 would make this fixture describe a frame
+            // that cannot exist one level down.
+            stack_cuts: [1, 2, 3, 4, 40_985, 3, 2],
             ..w
         };
         assert_eq!(
@@ -3240,6 +4194,7 @@ mod tests {
             service: 11_248,
             segments: [micros(start, setup), 2_000, 4_000, 3_000, 1_000, 1_041],
             ui_cuts: [0, 0, 0, 0, 4_000, 0, 0, 0, 0],
+            stack_cuts: [10, 20, 30, 40, 3_860, 20, 20],
             pre_cuts: pre_phase_micros(start, &phases, setup),
             interact: false,
         };

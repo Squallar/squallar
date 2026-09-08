@@ -678,6 +678,13 @@ fn the_worst_frame_scrape_reads_back_the_line_the_app_formats() {
         service: 13_455,
         segments: [64, 55, 9_514, 2_829, 700, 293],
         ui_cuts: [11, 402, 1_207, 96, 6_902, 4, 812, 3, 77],
+        // Seven DISTINCT stack cuts summing to this frame's own `ui_stack`
+        // of 6902 — the fifth ui cut, opened up — for the nine's reason
+        // exactly: a repeat could not tell a transposed pair of columns from
+        // a correct one, and these seven sit between the ui nine and the pre
+        // seven in a positional regex, so a miscount lands here as plausible
+        // integers rather than as an absence.
+        stack_cuts: [21, 96, 340, 1_180, 4_100, 900, 265],
         pre_cuts: [3, 21, 9, 14, 2, 7, 8],
         interact: true,
     };
@@ -685,6 +692,7 @@ fn the_worst_frame_scrape_reads_back_the_line_the_app_formats() {
         service: 22_628,
         segments: [100, 90, 300, 21_000, 800, 338],
         ui_cuts: [7, 19, 41, 5, 133, 2, 61, 1, 31],
+        stack_cuts: [3, 8, 14, 27, 61, 12, 8],
         pre_cuts: [4, 31, 12, 20, 6, 9, 18],
         interact: false,
     };
@@ -737,11 +745,16 @@ console.log(JSON.stringify({{ threw: threw,
     assert_eq!(got[0]["boot_prepare"].as_u64(), Some(21_000));
     // **The nine ui cuts survive the scrape into the entry the artifact is
     // written from.** Reached by name and by VALUE, not by "the key exists":
-    // the nine are consecutive `(\d+)` groups in a 34-group positional regex,
+    // the nine are consecutive `(\d+)` groups in a 62-group positional regex,
     // so an off-by-one in the group numbers would leave every key present and
     // every figure wrong -- which reads as data rather than as a null. The
     // two ends and the middle are pinned, plus the telescoping the app's own
     // gate holds, so a shifted window cannot pass.
+    //
+    // The count was written as 34 and was 48 by the time the `pre` seven
+    // landed; it is 62 with the `stack` seven. Recounted off the pattern
+    // rather than adjusted -- the assertion below reads it out of drive.py so
+    // this comment cannot be the only thing that knows.
     assert_eq!(got[0]["ui_poll"].as_u64(), Some(11));
     assert_eq!(got[0]["ui_stack"].as_u64(), Some(6_902));
     assert_eq!(got[0]["ui_chrome"].as_u64(), Some(77));
@@ -766,6 +779,33 @@ console.log(JSON.stringify({{ threw: threw,
         "the scraped ui cuts do not sum to the scraped ui, so the rig read \
          the nine out of the wrong capture groups",
     );
+    // **The seven stack cuts survive the same scrape.** They sit BETWEEN the
+    // ui nine and the pre seven in the positional regex, so a miscount in
+    // either neighbour lands here as plausible integers rather than as an
+    // absence -- and they telescope to `ui_stack`, not to `ui`, which is the
+    // conjunct that catches a window shifted by exactly one block.
+    assert_eq!(got[0]["stack_snap"].as_u64(), Some(21));
+    assert_eq!(got[0]["stack_render"].as_u64(), Some(4_100));
+    assert_eq!(got[0]["stack_settle"].as_u64(), Some(265));
+    assert_eq!(
+        (0..7)
+            .map(|i| {
+                let key = [
+                    "snap",
+                    "gate",
+                    "hydrate",
+                    "statuses",
+                    "render",
+                    "inspector",
+                    "settle",
+                ][i];
+                got[0][format!("stack_{key}")].as_u64().unwrap_or_default()
+            })
+            .sum::<u64>(),
+        got[0]["ui_stack"].as_u64().unwrap_or_default(),
+        "the scraped stack cuts do not sum to the scraped ui_stack, so the \
+         rig read the seven out of the wrong capture groups",
+    );
     // **The seven pre cuts survive the same scrape**, on the nine's terms
     // exactly: they sit AFTER the nine in the positional regex, so a group
     // miscount in the ui block would land here as plausible integers rather
@@ -789,6 +829,9 @@ console.log(JSON.stringify({{ threw: threw,
     assert_eq!(got[0]["boot_ui_poll"].as_u64(), Some(7));
     assert_eq!(got[0]["boot_ui_stack"].as_u64(), Some(133));
     assert_eq!(got[0]["boot_ui_chrome"].as_u64(), Some(31));
+    assert_eq!(got[0]["boot_stack_snap"].as_u64(), Some(3));
+    assert_eq!(got[0]["boot_stack_render"].as_u64(), Some(61));
+    assert_eq!(got[0]["boot_stack_settle"].as_u64(), Some(8));
     assert_eq!(got[0]["boot_pre_platform"].as_u64(), Some(4));
     assert_eq!(got[0]["boot_pre_ensure"].as_u64(), Some(18));
     // The absence spelling: a period in which nothing presented still carries
@@ -800,8 +843,29 @@ console.log(JSON.stringify({{ threw: threw,
     assert_eq!(got[1]["boot_ui_poll"].as_u64(), Some(7));
     assert_eq!(got[1]["boot_ui_stack"].as_u64(), Some(133));
     assert_eq!(got[1]["boot_ui_chrome"].as_u64(), Some(31));
+    assert_eq!(got[1]["boot_stack_snap"].as_u64(), Some(3));
+    assert_eq!(got[1]["boot_stack_render"].as_u64(), Some(61));
+    assert_eq!(got[1]["boot_stack_settle"].as_u64(), Some(8));
     assert_eq!(got[1]["boot_pre_platform"].as_u64(), Some(4));
     assert_eq!(got[1]["boot_pre_ensure"].as_u64(), Some(18));
+
+    // **The group count is read off the pattern, not restated in prose.**
+    // Two positional blocks were widened here and the comment above has been
+    // stale twice; this is the half that cannot go stale silently.
+    let worst_re = DRIVE_PY
+        .split_once("var frame_worst_re = /")
+        .expect("drive.py no longer declares frame_worst_re")
+        .1
+        .split_once("/;")
+        .expect("the frame_worst_re literal is not closed on its own line")
+        .0;
+    assert_eq!(
+        worst_re.matches("(\\d+)").count() + worst_re.matches("([a-z0-9-]+)").count(),
+        62,
+        "the worst-frame pattern no longer has the 62 groups the scrape above \
+         indexes by number, so every field after the change reads the wrong \
+         column",
+    );
 }
 
 /// **Each gate above reddens on a driver that deserves it, and passes on one

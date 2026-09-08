@@ -26,14 +26,22 @@ impl Gui {
         self.overlays.take_retired()
     }
 
-    /// [`Gui::ui`], with the five instants at which it crossed its own phase
-    /// boundaries.
+    /// [`Gui::ui`], with the fourteen instants at which it crossed its own
+    /// phase boundaries.
     ///
-    /// The stamps are taken unconditionally — five clock reads on a call that
-    /// lays out a whole frame — so there is no armed/unarmed spelling of this
-    /// function to disagree about, and no frame where the instrument is off.
-    /// What the caller does with them is the caller's business; see
-    /// [`crate::shell_api::UiPhaseStamps`] for why they are instants.
+    /// The stamps are taken unconditionally — **six** clock reads here, two
+    /// more inside `render_shell_phased` and six inside
+    /// `render_stack_and_inspector` (one on a frame that draws no panel), on
+    /// a call that lays out a whole frame — so there is no armed/unarmed
+    /// spelling of this function to disagree about, and no frame where the
+    /// instrument is off. What the caller does with them is the caller's
+    /// business; see [`crate::shell_api::UiPhaseStamps`] for why they are
+    /// instants.
+    ///
+    /// The count read "five" from before the topbar/statusbar pair landed.
+    /// Recounted here rather than adjusted, on `frame_ledger`'s rule: its
+    /// figures have drifted every time a split landed and a reader who sizes
+    /// anything off a stale count writes against the wrong shape.
     pub fn ui_phased(
         &mut self,
         ctx: &egui::Context,
@@ -249,6 +257,10 @@ impl Gui {
                 dialog: dialog_done,
                 panes,
                 applied,
+                // The stack's own six, taken inside `render_shell_phased` and
+                // carried here rather than returned beside the tuple: the
+                // App's call site keeps its arity and gains no new reach.
+                stack: shell.stack,
             },
             retired,
         )

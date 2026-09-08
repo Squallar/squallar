@@ -399,9 +399,18 @@ pub struct FrameDiagnostics<'a> {
 /// would leave the prologue and the return outside every figure, which is the
 /// hole the renderer's own four-phase pass ledger had.
 ///
-/// Five stamps, six cuts: `ui_start → polled → laid_out → shell → panes →
-/// applied → ui_end`. The two outer boundaries are the ledger's, not this
-/// type's, which is why they are absent here.
+/// **Eight stamps, nine cuts**: `ui_start → polled → laid_out → topbar →
+/// statusbar → shell → dialog → panes → applied → ui_end`. The two outer
+/// boundaries are the ledger's, not this type's, which is why they are absent
+/// here.
+///
+/// The count read "five stamps, six cuts" on an eight-field struct returning
+/// nine cuts, from the two widenings that landed after it was written. A lane
+/// that sizes its arrays off a stated count rather than off the fields writes
+/// against the wrong shape, so the count is restated here whenever a stamp is
+/// added — [`StackStamps`] below is the ninth through the fourteenth, and it
+/// deliberately does NOT change the nine: those six bound cuts of `stack`,
+/// which is one cut of this family, not a tenth beside them.
 #[derive(Clone, Copy, Debug)]
 pub struct UiPhaseStamps {
     /// After the frame's polls: the site-table republish, the auto-poll
@@ -432,6 +441,92 @@ pub struct UiPhaseStamps {
     /// After the pending appliers (pane view, section line, region, section
     /// edit) and the fade toggle.
     pub applied: web_time::Instant,
+    /// Where `render_stack_and_inspector` crossed its own six interior
+    /// boundaries — [`UiPhaseStamps::statusbar`] to [`UiPhaseStamps::shell`],
+    /// opened up. See [`StackStamps`].
+    ///
+    /// **Carried inside this struct rather than returned beside it**, so the
+    /// App's call site keeps its tuple arity and the App layer gains no new
+    /// reach into the Gui: the six ride the stamps the ledger already takes.
+    pub stack: StackStamps,
+}
+
+/// Where `Gui::render_stack_and_inspector` crossed its own boundaries — the
+/// six interior stamps that cut `ui.stack`, the fifth of [`UiPhaseStamps`]'
+/// nine.
+///
+/// # Why this exists
+///
+/// `ui.stack` is one undivided cut and it owns the `ui` tail: measured on
+/// hardware WebGPU at 3440x1440, p50 421–500 µs against a max of 8,000–9,514
+/// µs — 16–20x its own median, and a single frame more than twice the whole
+/// 4 ms bar. Nothing in the tree could say which part of the span that was.
+///
+/// **Instants, not durations**, for [`UiPhaseStamps`]' reason exactly: the
+/// parent's own two boundaries already exist (`statusbar` and `shell`), so
+/// six interior instants make seven contiguous cuts that telescope to the
+/// parent rather than summing to something near it.
+///
+/// # No `residual` field, and that is deliberate
+///
+/// The seventh cut (`settle`) closes on the parent's own right boundary, so
+/// no `stack` time can hide in an unnamed tail — `PostHists::close`'s
+/// reasoning. What a subtraction would leave is `frame_ledger::micros`'
+/// truncation dust, bounded at six microseconds for seven cuts and never
+/// over; printing that under a heading called "residual" invites exactly the
+/// misreading this family exists to prevent. The residual here is a NAMED
+/// span, not a subtraction. `DispatchCuts` needs one only because it
+/// accumulates across a loop and cannot bracket its own span.
+#[derive(Clone, Copy, Debug)]
+pub struct StackStamps {
+    /// After the two selection snaps — a pane that draws no map layers, and a
+    /// layer the active pane does not hold. `O(1)`, and taken before the
+    /// width gate so that the cut it opens exists on every path.
+    pub snapped: web_time::Instant,
+    /// After the compact-width gate, the chrome fade and the two slide
+    /// animations: everything that can decide this frame draws no panel at
+    /// all. **Holds the whole span when the panel is closed** — the three
+    /// early returns are inside it.
+    pub gated: web_time::Instant,
+    /// After `PaneState::hydrate_layer_states`. Scales with the active pane's
+    /// slot count.
+    pub hydrated: web_time::Instant,
+    /// After `stack_row_statuses` — one status line per row. Scales with the
+    /// layer count, and with the alert-set size through
+    /// `NwsAlertHandler::status_line`.
+    pub statused: web_time::Instant,
+    /// After `render_stack`. Scales with layer count times widgets per row.
+    pub rendered: web_time::Instant,
+    /// After `render_inspector`. Scales with the selected layer's control
+    /// surface.
+    pub inspected: web_time::Instant,
+}
+
+impl StackStamps {
+    /// Every boundary the frame did not reach, at **one** clock read.
+    ///
+    /// The three early returns (`Compact` width, a faded chrome, both slides
+    /// at zero) skip four of the seven regions. Filling their stamps from a
+    /// single instant is what makes those four cuts read exactly zero and
+    /// leaves `gate` holding the remainder; a fresh `now()` per slot would
+    /// scatter the clock's own dust across cuts that ran no code, which is a
+    /// figure about the instrument rather than about the frame.
+    ///
+    /// **Recording is never skipped on these frames.** A narrower `n` than
+    /// the parent cut's would break the one property that makes the split
+    /// arithmetic — see `frame_ledger::StackHists`' denominator note.
+    #[must_use]
+    pub fn skipped_after(snapped: web_time::Instant) -> Self {
+        let now = web_time::Instant::now();
+        Self {
+            snapped,
+            gated: now,
+            hydrated: now,
+            statused: now,
+            rendered: now,
+            inspected: now,
+        }
+    }
 }
 
 /// One frame's facts, composed by the App from state it already owns, applied

@@ -870,6 +870,10 @@ fn every_frame_cut_family_the_app_writes_is_scraped_and_windowed_by_the_rig() {
         ("frame pre", "pre"),
         ("frame prepare", "prepare"),
         ("frame ui", "ui"),
+        // One level below `frame ui (stack)`. It is a cut family like the
+        // rest and is subject to both halves of this gate: a probe that reads
+        // it, and a window prefix that keeps it once read.
+        ("frame stack", "stack"),
         ("frame post", "post"),
         ("frame pump", "pump"),
         ("frame dispatch", "dispatch"),
@@ -945,6 +949,13 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
         service: 13_455,
         segments: [64, 55, 9_514, 2_829, 700, 293],
         ui_cuts: [11, 402, 1_207, 96, 6_902, 4, 812, 3, 77],
+        // Seven DISTINCT stack cuts summing to this frame's own `ui_stack`
+        // of 6902 — the fifth ui cut, opened up — for the nine's reason
+        // exactly: a repeat could not tell a transposed pair of columns from
+        // a correct one, and these seven sit between the ui nine and the pre
+        // seven in a positional regex, so a miscount lands here as plausible
+        // integers rather than as an absence.
+        stack_cuts: [21, 96, 340, 1_180, 4_100, 900, 265],
         // Seven DISTINCT pre cuts summing to this frame's own `pre` of 64,
         // for the ui nine's reason: a repeat could not tell a transposed pair
         // of columns from a correct one.
@@ -958,6 +969,7 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
         service: 22_628,
         segments: [100, 90, 300, 21_000, 800, 338],
         ui_cuts: [7, 19, 41, 5, 133, 2, 61, 1, 31],
+        stack_cuts: [3, 8, 14, 27, 61, 12, 8],
         pre_cuts: [4, 31, 12, 20, 6, 9, 18],
         interact: false,
     };
@@ -975,15 +987,26 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
          would pin a line describing no frame that could exist",
     );
     assert_eq!(boot.pre_cuts.iter().sum::<u32>(), boot.segments[0]);
+    // And one level further down: the seven telescope to the FIFTH ui cut,
+    // not to `ui`. A fixture whose stack cuts summed to `ui` would pin a line
+    // describing a frame that cannot exist.
+    assert_eq!(
+        w.stack_cuts.iter().sum::<u32>(),
+        w.ui_cuts[4],
+        "the fixture's stack cuts do not telescope to its ui_stack, so the \
+         pin below would pin a line whose stack_* columns decompose no frame",
+    );
+    assert_eq!(boot.stack_cuts.iter().sum::<u32>(), boot.ui_cuts[4]);
     assert_eq!(
         super::frame_worst_line(Some(w), Some(boot)),
         rendered(
             &pattern("frame_worst_re"),
             &[
                 "13455", "interact", "22628", "64", "55", "9514", "2829", "700", "293", "11",
-                "402", "1207", "96", "6902", "4", "812", "3", "77", "3", "21", "9", "14", "2", "7",
-                "8", "idle", "100", "90", "300", "21000", "800", "338", "7", "19", "41", "5",
-                "133", "2", "61", "1", "31", "4", "31", "12", "20", "6", "9", "18",
+                "402", "1207", "96", "6902", "4", "812", "3", "77", "21", "96", "340", "1180",
+                "4100", "900", "265", "3", "21", "9", "14", "2", "7", "8", "idle", "100", "90",
+                "300", "21000", "800", "338", "7", "19", "41", "5", "133", "2", "61", "1", "31",
+                "3", "8", "14", "27", "61", "12", "8", "4", "31", "12", "20", "6", "9", "18",
             ],
         ),
         "the `frame worst:` line and the rig's probe have drifted",
@@ -994,7 +1017,8 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
             &pattern("frame_worst_none_re"),
             &[
                 "22628", "idle", "100", "90", "300", "21000", "800", "338", "7", "19", "41", "5",
-                "133", "2", "61", "1", "31", "4", "31", "12", "20", "6", "9", "18",
+                "133", "2", "61", "1", "31", "3", "8", "14", "27", "61", "12", "8", "4", "31",
+                "12", "20", "6", "9", "18",
             ],
         ),
         "the no-frame spelling and the rig's probe have drifted",
@@ -1116,7 +1140,7 @@ fn report_frame_telemetry_body() -> &'static str {
 /// an empty list.
 #[test]
 fn every_frame_line_formatter_is_one_the_report_says() {
-    const KNOWN_FORMATTER_FLOOR: usize = 15;
+    const KNOWN_FORMATTER_FLOOR: usize = 16;
     let body = report_frame_telemetry_body();
     let mut names: Vec<&str> = APP_RENDER
         .match_indices("\nfn frame_")
@@ -1180,6 +1204,10 @@ fn every_frame_line_family_the_app_writes_has_a_named_rig_probe() {
         ("pump", &["frame_pump_re"]),
         ("segment", &["frame_segment_re"]),
         ("segments", &["segments_re"]),
+        // `frame ui (stack)`, opened up. A THIRD prefix on purpose: a reader
+        // pattern-matching `frame ui` must not be able to sum two levels of
+        // the same span, so this family is neither `ui` nor a `ui` cut name.
+        ("stack", &["frame_stack_re"]),
         // Three probes, one family word. `frame service less present (…)`
         // is the SAME `service` family word — the enumeration below reads to
         // the first non-lowercase character — and it is deliberately the
@@ -1596,6 +1624,161 @@ fn the_ui_cut_lines_are_not_mistakable_for_the_ui_segment_line() {
              reader would add to the span it decomposes",
         );
     }
+}
+/// The `frame stack (…)` sentence, pinned as a literal.
+///
+/// Same formatter as `frame ui (…)` and deliberately a **third prefix**: the
+/// seven are cuts of `frame ui (stack)`, which is itself a cut of
+/// `frame segment (ui)`. A reader who could mistake one for the other would
+/// add the same microseconds to the very span they decompose, twice over. The
+/// `sum=` is the load-bearing field for `frame ui`'s reason — 3 x 100 = 300,
+/// where every percentile of that histogram answers the bin's 106 us upper
+/// edge.
+#[test]
+fn the_frame_stack_line_reads_exactly_as_pinned() {
+    let mut h = Hist::new();
+    for _ in 0..3 {
+        h.record(100);
+    }
+    let mut slots = [0u32; 42];
+    slots[3] = 3;
+    let expected_hist = slots.map(|c| c.to_string()).join(",");
+    assert_eq!(
+        super::named_hist_line("frame stack", "gate", &h),
+        format!(
+            "frame stack (gate): n=3, sum=300 us, p50=106 us, p90=106 us, \
+             p99=106 us, hist={expected_hist}"
+        ),
+    );
+}
+
+/// All seven `stack` cuts are emitted, under their own names, every tick —
+/// and each carries its own histogram.
+///
+/// The `n` conjunct is what stops a mis-wired call from reading green:
+/// `render` carrying `inspector`'s histogram would keep every name right and
+/// every figure wrong. Those two are the neighbours across the one seam this
+/// split exists to resolve — is the stack tail the rows or the inspector —
+/// so a swap there would answer the question backwards.
+#[test]
+fn every_stack_phase_is_reported_under_its_own_name() {
+    let mut phases = crate::frame_ledger::StackHists::default();
+    // A different sample count per cut, so a swapped pair cannot pass.
+    for (slot, hist) in [
+        &mut phases.snap,
+        &mut phases.gate,
+        &mut phases.hydrate,
+        &mut phases.statuses,
+        &mut phases.render,
+        &mut phases.inspector,
+        &mut phases.settle,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for _ in 0..=slot {
+            hist.record(1_000);
+        }
+    }
+    let lines = super::frame_stack_lines(&phases);
+    let names = [
+        "snap",
+        "gate",
+        "hydrate",
+        "statuses",
+        "render",
+        "inspector",
+        "settle",
+    ];
+    assert_eq!(lines.len(), names.len());
+    for (slot, (line, name)) in lines.iter().zip(names).enumerate() {
+        assert!(
+            line.starts_with(&format!("frame stack ({name}): n={}, ", slot + 1)),
+            "stack cut {slot} reported as {line:?}, which is not {name}'s line \
+             carrying {name}'s histogram",
+        );
+    }
+}
+
+/// **The `stack` cuts do not collide with the two levels above them.**
+///
+/// Three spellings name a `stack`: `frame segment (ui)` contains it,
+/// `frame ui (stack)` IS it, and `frame stack (…)` opens it up. A rig regex
+/// anchored loosely enough to match two of them would read a cut as its own
+/// parent — and because the seven sum to `frame ui (stack)`, which sums into
+/// `frame segment (ui)`, the mistake is *plausible arithmetic* rather than an
+/// obvious null. Held in every direction: no `frame stack` line reads as a
+/// `frame ui` line or a segment line, and `frame ui (stack)` does not read as
+/// one of its own cuts.
+#[test]
+fn the_stack_cut_lines_are_not_mistakable_for_their_parents() {
+    let mut h = Hist::new();
+    h.record(1_000);
+    let parent_cut = super::named_hist_line("frame ui", "stack", &h);
+    assert!(
+        !parent_cut.starts_with("frame stack ("),
+        "the `frame ui (stack)` line {parent_cut:?} reads as one of its own \
+         cuts, so a reader would add the seven to the one they decompose",
+    );
+    let segment_line = super::named_hist_line("frame segment", "ui", &h);
+    assert!(
+        !segment_line.starts_with("frame stack ("),
+        "the ui segment line {segment_line:?} reads as a stack cut",
+    );
+    for line in super::frame_stack_lines(&crate::frame_ledger::StackHists::default()) {
+        assert!(
+            line.starts_with("frame stack ("),
+            "a stack cut is not under the cut prefix: {line:?}",
+        );
+        assert!(
+            !line.starts_with("frame ui ("),
+            "the stack cut {line:?} reads as a tenth `ui` cut, which a reader \
+             would add to the `ui` nine it is already inside",
+        );
+        assert!(
+            !line.starts_with("frame segment"),
+            "the stack cut {line:?} reads as a seventh frame segment",
+        );
+    }
+}
+
+/// The rig's `frame stack` probe reads what the app writes.
+///
+/// A family the app writes and the rig has no regex for is ABSENT from the
+/// artifact rather than empty — the failure that kept `frame ui (…)`, the
+/// largest segment of an interact frame, invisible for weeks. This family is
+/// the one below it and names the owner of its tail, so the same absence here
+/// would leave a 16-20x spike undecomposed for the same reason.
+#[test]
+fn the_rig_reads_the_stack_lines_the_app_actually_writes() {
+    let mut h = Hist::new();
+    h.record(100);
+    h.record(4_000);
+    let hist = counts_string(&h);
+    assert_eq!(
+        super::named_hist_line("frame stack", "hydrate", &h),
+        rendered(
+            &pattern("frame_stack_re"),
+            &["hydrate", "2", "4100", "106", "4757", "4757", &hist],
+        ),
+        "the `frame stack (…)` line and the rig's probe have drifted",
+    );
+    // **The probe's own anchor may not appear in the line it decomposes.**
+    // `frame_stack_re` is anchored on the literal `frame stack (`, and the
+    // parent cut's line spells `frame ui (stack):` — one substring away from
+    // being scraped as one of its own seven, which would read as plausible
+    // arithmetic rather than as a null.
+    let parent = super::named_hist_line("frame ui", "stack", &h);
+    assert!(
+        !parent.contains("frame stack ("),
+        "the rig's stack anchor appears in the `frame ui (stack)` line it \
+         decomposes: {parent:?}",
+    );
+    assert!(
+        pattern("frame_stack_re").starts_with("frame stack \\("),
+        "the rig's stack probe is no longer anchored on the literal the check \
+         above tests for, so that check has stopped covering the collision",
+    );
 }
 
 /// The `tile take (…)` sentence, pinned as a literal, and only for a family
@@ -2034,6 +2217,7 @@ fn the_worst_frame_line_reads_exactly_as_pinned() {
         service: 6_728,
         segments: [61, 54, 4_402, 1_580, 611, 20],
         ui_cuts: [12, 310, 903, 41, 2_800, 6, 288, 2, 40],
+        stack_cuts: [9, 41, 118, 402, 1_900, 300, 30],
         pre_cuts: [2, 18, 11, 21, 1, 4, 4],
         interact: false,
     };
@@ -2055,27 +2239,42 @@ fn the_worst_frame_line_reads_exactly_as_pinned() {
         "the fixture's seven pre cuts do not telescope to its pre, so the pin \
          below would pin a line whose pre_* columns decompose no frame",
     );
+    assert_eq!(
+        worst.stack_cuts.iter().sum::<u32>(),
+        worst.ui_cuts[4],
+        "the fixture's seven stack cuts do not telescope to its ui_stack, so \
+         the pin below would pin a line whose stack_* columns decompose no \
+         frame",
+    );
     let boot = crate::frame_ledger::WorstFrame {
         service: 9_513,
         segments: [1, 2, 3, 9_500, 4, 3],
         ui_cuts: [0, 1, 0, 0, 1, 0, 1, 0, 0],
+        stack_cuts: [0, 0, 0, 0, 1, 0, 0],
         pre_cuts: [0, 1, 0, 0, 0, 0, 0],
         interact: false,
     };
     assert_eq!(boot.ui_cuts.iter().sum::<u32>(), boot.segments[2]);
     assert_eq!(boot.pre_cuts.iter().sum::<u32>(), boot.segments[0]);
+    assert_eq!(boot.stack_cuts.iter().sum::<u32>(), boot.ui_cuts[4]);
     assert_eq!(
         super::frame_worst_line(Some(worst), Some(boot)),
         "frame worst: service=6728 us, family=idle, since_boot=9513 us, \
          pre=61 us, pump=54 us, ui=4402 us, prepare=1580 us, finish=611 us, \
          post=20 us, ui_poll=12 us, ui_layout=310 us, ui_topbar=903 us, \
          ui_statusbar=41 us, ui_stack=2800 us, ui_dialog=6 us, ui_panes=288 us, \
-         ui_apply=2 us, ui_chrome=40 us, pre_platform=2 us, pre_ingest=18 us, \
+         ui_apply=2 us, ui_chrome=40 us, stack_snap=9 us, stack_gate=41 us, \
+         stack_hydrate=118 us, stack_statuses=402 us, stack_render=1900 us, \
+         stack_inspector=300 us, stack_settle=30 us, pre_platform=2 us, \
+         pre_ingest=18 us, \
          pre_evict=11 us, pre_drops=21 us, pre_autosave=1 us, pre_gate=4 us, \
          pre_ensure=4 us, boot: idle, pre=1 us, pump=2 us, \
          ui=3 us, prepare=9500 us, finish=4 us, post=3 us, ui_poll=0 us, \
          ui_layout=1 us, ui_topbar=0 us, ui_statusbar=0 us, ui_stack=1 us, \
          ui_dialog=0 us, ui_panes=1 us, ui_apply=0 us, ui_chrome=0 us, \
+         stack_snap=0 us, stack_gate=0 us, stack_hydrate=0 us, \
+         stack_statuses=0 us, stack_render=1 us, stack_inspector=0 us, \
+         stack_settle=0 us, \
          pre_platform=0 us, pre_ingest=1 us, pre_evict=0 us, pre_drops=0 us, \
          pre_autosave=0 us, pre_gate=0 us, pre_ensure=0 us",
     );
@@ -2089,6 +2288,7 @@ fn the_worst_frame_line_names_the_interact_family_too() {
         service: 600,
         segments: [100; 6],
         ui_cuts: [1, 2, 3, 4, 80, 5, 3, 1, 1],
+        stack_cuts: [2, 4, 6, 8, 50, 7, 3],
         pre_cuts: [10, 30, 20, 25, 5, 4, 6],
         interact: true,
     };
@@ -2108,6 +2308,7 @@ fn the_worst_frame_line_says_absence_rather_than_a_zero_frame() {
         service: 9_513,
         segments: [1, 2, 3, 9_500, 4, 3],
         ui_cuts: [0, 1, 0, 0, 1, 0, 1, 0, 0],
+        stack_cuts: [0, 0, 0, 0, 1, 0, 0],
         pre_cuts: [0, 1, 0, 0, 0, 0, 0],
         interact: false,
     };
@@ -2122,6 +2323,8 @@ fn the_worst_frame_line_says_absence_rather_than_a_zero_frame() {
          pre=1 us, pump=2 us, ui=3 us, prepare=9500 us, finish=4 us, post=3 us, \
          ui_poll=0 us, ui_layout=1 us, ui_topbar=0 us, ui_statusbar=0 us, \
          ui_stack=1 us, ui_dialog=0 us, ui_panes=1 us, ui_apply=0 us, ui_chrome=0 us, \
+         stack_snap=0 us, stack_gate=0 us, stack_hydrate=0 us, stack_statuses=0 us, \
+         stack_render=1 us, stack_inspector=0 us, stack_settle=0 us, \
          pre_platform=0 us, pre_ingest=1 us, pre_evict=0 us, pre_drops=0 us, \
          pre_autosave=0 us, pre_gate=0 us, pre_ensure=0 us",
         "an empty period must still carry the session maximum, or a console \
@@ -2143,6 +2346,7 @@ fn the_worst_frame_line_is_not_mistakable_for_a_segment_line() {
         service: 600,
         segments: [100; 6],
         ui_cuts: [1, 2, 3, 4, 80, 5, 3, 1, 1],
+        stack_cuts: [2, 4, 6, 8, 50, 7, 3],
         pre_cuts: [10, 30, 20, 25, 5, 4, 6],
         interact: true,
     };

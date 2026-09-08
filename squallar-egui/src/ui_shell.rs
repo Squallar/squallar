@@ -97,6 +97,11 @@ pub(super) struct ShellPhased {
     pub topbar: web_time::Instant,
     /// After `render_status_bar`; the remainder is the stack and inspector.
     pub statusbar: web_time::Instant,
+    /// Where that remainder crossed its own six interior boundaries — see
+    /// [`crate::shell_api::StackStamps`]. The stack was the single largest
+    /// piece of the shell and the owner of the `ui` tail while it was one
+    /// undivided cut.
+    pub stack: crate::shell_api::StackStamps,
 }
 
 pub(super) struct ShellOutput {
@@ -127,7 +132,7 @@ impl super::Gui {
         self.render_status_bar(ui.ctx(), map_rect, &mut actions);
         let statusbar = web_time::Instant::now();
 
-        self.render_stack_and_inspector(ui.ctx(), map_rect, &mut actions);
+        let stack = self.render_stack_and_inspector(ui.ctx(), map_rect, &mut actions);
 
         ShellPhased {
             out: ShellOutput {
@@ -137,6 +142,7 @@ impl super::Gui {
             },
             topbar,
             statusbar,
+            stack,
         }
     }
 
@@ -147,7 +153,7 @@ impl super::Gui {
         ctx: &egui::Context,
         map_rect: egui::Rect,
         actions: &mut Vec<GuiAction>,
-    ) {
+    ) -> crate::shell_api::StackStamps {
         // A Layer selection describes a map layer, and a pane that draws none
         // has none — the stack shows it no rows to have selected one from. Snap
         // to the pane's own properties, which is what the inspector can still
@@ -184,12 +190,16 @@ impl super::Gui {
         if selection_has_nothing_to_describe {
             self.inspector_sel = InspectorSelection::PaneProps;
         }
+        // **Before the width gate, so cut 1 exists on every path.** The two
+        // snaps above are O(1) and scale with nothing; a cut that read zero
+        // structurally would be a name over a number nobody can move.
+        let snapped = web_time::Instant::now();
 
         // Below the breakpoint the same flags present as sheet pages — the
         // sheet pass late in the frame hosts the same bodies through the same
         // take window (`ui_sheet.rs`); nothing floats at the map's corners.
         if self.layout.width == crate::ui_layout::WidthClass::Compact {
-            return;
+            return crate::shell_api::StackStamps::skipped_after(snapped);
         }
 
         // The fade rule is total (the plan): the fade closes both panels for
@@ -198,7 +208,7 @@ impl super::Gui {
         // the chrome, and as the stated rule should anything ever render
         // here while faded.
         let Some(fade) = self.chrome_fade() else {
-            return;
+            return crate::shell_api::StackStamps::skipped_after(snapped);
         };
 
         // The slide animations (the plan): each panel's open flag drives a
@@ -221,8 +231,12 @@ impl super::Gui {
             super::fade::anim_time(),
         );
         if stack_slide <= 0.0 && insp_slide <= 0.0 {
-            return;
+            return crate::shell_api::StackStamps::skipped_after(snapped);
         }
+        // **The closed-panel span closes here.** All three returns above are
+        // inside this cut, which is why `gate` holds the whole remainder on a
+        // frame that draws no panel rather than leaving it unattributed.
+        let gated = web_time::Instant::now();
 
         let mut pane = std::mem::take(&mut self.panes[self.active_pane]);
 
@@ -232,12 +246,14 @@ impl super::Gui {
         // has to do is make sure the slots it will be asked about have their
         // state.
         pane.hydrate_layer_states(&self.overlays, self.active_pane);
+        let hydrated = web_time::Instant::now();
 
         let statuses: Vec<super::ui_stack::StackRowLines> = if stack_slide > 0.0 {
             self.stack_row_statuses(self.active_pane, &pane)
         } else {
             Vec::new()
         };
+        let statused = web_time::Instant::now();
 
         if stack_slide > 0.0 {
             // Sliding out to the left: the whole panel's travel is its width
@@ -262,6 +278,8 @@ impl super::Gui {
             };
             self.render_stack(ctx, slot, &mut pane, &statuses, actions);
         }
+        let rendered = web_time::Instant::now();
+
         if insp_slide > 0.0 {
             let travel = (1.0 - insp_slide)
                 * (super::ui_inspector::INSPECTOR_WIDTH
@@ -283,6 +301,7 @@ impl super::Gui {
             };
             self.render_inspector(ctx, slot, &mut pane, actions);
         }
+        let inspected = web_time::Instant::now();
 
         self.panes[self.active_pane] = pane;
         // After the restore, so the source it copies from is the real pane
@@ -293,6 +312,20 @@ impl super::Gui {
         // setting called "Sync Layers". The reasoning is written out on
         // `propagate_pane_sync` itself.
         self.propagate_pane_sync();
+
+        // **No stamp here.** The seventh cut closes on the PARENT's own right
+        // boundary — the `shell_done` read in `Gui::ui_phased` — so the pane
+        // restore, `propagate_pane_sync`, the `ShellPhased` construction and
+        // the return out of `render_shell_phased` are all inside a named span
+        // and no `stack` time can hide in an unnamed tail.
+        crate::shell_api::StackStamps {
+            snapped,
+            gated,
+            hydrated,
+            statused,
+            rendered,
+            inspected,
+        }
     }
 
     /// The stack rows' status lines, one per layer in the pane's own order —
