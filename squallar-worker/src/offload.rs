@@ -324,9 +324,11 @@ impl JobRequest {
         let ctx = squallar_source::job::EncodeCtx {
             geometry: self.geometry,
         };
-        let mut out = Vec::new();
-        self.write_envelope(row, &mut out);
+        let code = wire_code(row);
+        let mut out = head_buffer(code);
+        self.write_envelope(code, &mut out);
         (row.encode)(&self.job, &ctx, &mut out);
+        note_head(code, out.len());
         out
     }
 
@@ -349,13 +351,15 @@ impl JobRequest {
             geometry: self.geometry,
         };
         let payload = (row.resident_payload)(&self.job, &ctx);
-        let mut out = Vec::new();
-        self.write_envelope(row, &mut out);
+        let code = wire_code(row);
+        let mut out = head_buffer(code);
+        self.write_envelope(code, &mut out);
         if payload.is_some() {
             (row.encode_resident_head)(&self.job, &ctx, &mut out);
         } else {
             (row.encode)(&self.job, &ctx, &mut out);
         }
+        note_head(code, out.len());
         (out, payload)
     }
 
@@ -423,8 +427,8 @@ impl JobRequest {
 
     /// The canonical envelope, written once for both encoders so a field
     /// cannot be added to one spelling and missed by the other.
-    fn write_envelope(&self, row: &squallar_source::job::JobCodec, out: &mut Vec<u8>) {
-        out.push(wire_code(row));
+    fn write_envelope(&self, code: u8, out: &mut Vec<u8>) {
+        out.push(code);
         out.extend_from_slice(&self.geometry.width.to_le_bytes());
         out.extend_from_slice(&self.geometry.height.to_le_bytes());
         out.extend_from_slice(&self.geometry.bounds.min_lat.to_le_bytes());
@@ -477,6 +481,51 @@ fn wire_code(row: &squallar_source::job::JobCodec) -> u8 {
             )
         });
     u8::try_from(index + 1).expect("the composed registry outgrew the u8 code space")
+}
+
+thread_local! {
+    /// **The largest head each wire code has written on this thread**, so the
+    /// next message of that kind is ALLOCATED at its size instead of doubled
+    /// into it.
+    ///
+    /// [`JobRequest::to_parts`] runs at the dispatch site, on the FRAME
+    /// THREAD, and started from a `Vec::new()`. Doubling from empty into a
+    /// multi-megabyte head copies about 133 % of the head again across ~21
+    /// reallocations — the figure `GriddedJob::encode` records for the one row
+    /// that prices itself and reserves. No other row does: the NWS-alerts head
+    /// is polygon geometry written two `f64`s at a time (2.08 MB of it on the
+    /// live `/alerts/active` feed, measured 2026-09-08), and a pan re-encodes
+    /// it once per dispatch because only the input is memoised, never its
+    /// bytes.
+    ///
+    /// **A high-water mark rather than a per-row length function** because a
+    /// length function is a second statement of what `encode` writes and can
+    /// come to disagree with it; this cannot, since it is read back FROM what
+    /// `encode` wrote. It is a capacity hint and nothing else: too small and
+    /// the buffer grows exactly as it did before, too large and one dispatch
+    /// holds a few unused bytes until it is sent. Per code, so a
+    /// twelve-byte coverage message is not allocated at an alerts head's size.
+    ///
+    /// Indexed by the whole `u8` code space, so a registry that grows past
+    /// sixteen rows cannot walk off the end of it.
+    static HEAD_HIGH_WATER: [std::cell::Cell<usize>; 256] =
+        const { [const { std::cell::Cell::new(0) }; 256] };
+}
+
+/// A head buffer sized at what `code` has needed before. Empty capacity on the
+/// first message of a kind, which is the growth path this replaces.
+fn head_buffer(code: u8) -> Vec<u8> {
+    Vec::with_capacity(HEAD_HIGH_WATER.with(|marks| marks[code as usize].get()))
+}
+
+/// Record what `code` actually wrote, for the next one.
+fn note_head(code: u8, len: usize) {
+    HEAD_HIGH_WATER.with(|marks| {
+        let mark = &marks[code as usize];
+        if len > mark.get() {
+            mark.set(len);
+        }
+    });
 }
 
 /// The inverse of [`wire_code`]: the row a decoded code byte selects, or `None`
