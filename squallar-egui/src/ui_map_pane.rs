@@ -1321,7 +1321,16 @@ fn as_of_term(overlays: &OverlayRegistry, pane_idx: usize, pane: &PaneState, id:
     let TimeMode::AsOf(instant) = pane.time.mode else {
         return 0;
     };
-    let Some(handler) = overlays.handlers().find(|h| h.id() == *id) else {
+    // **Asked of the registry's index, not of its handlers.** This resolved
+    // the layer by walking the handler vector and calling the virtual
+    // `OverlayHandler::id` on each candidate -- so the walk's as-of term cost
+    // one indirect call and one `LayerId` compare per registered handler
+    // *ahead of* the one it wanted, per layer, per pane, per frame, on every
+    // scrubbed pane. It was also invisible to
+    // `squallar_overlays::render::overlay_state::lookup_ledger`, which only
+    // the registry's own resolver notes, so the ceiling that gates the rest of
+    // this walk could not see it.
+    let Some(handler) = overlays.handler_by_id(id) else {
         return 0;
     };
     if !matches!(handler.time_axis(), TimeAxis::EventLifetime) {
@@ -4733,3 +4742,7 @@ mod site_label_size_tests;
 #[path = "ui_map_pane/shadowed_text_tests.rs"]
 #[cfg(test)]
 mod shadowed_text_tests;
+
+#[path = "ui_map_pane/as_of_lookup_tests.rs"]
+#[cfg(test)]
+mod as_of_lookup_tests;
