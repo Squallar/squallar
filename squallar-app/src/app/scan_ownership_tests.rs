@@ -1188,6 +1188,86 @@ fn the_drain_alone_arms_the_joint_release() {
     );
 }
 
+/// **A released base's way back survives the pane moving off the volume it
+/// came from.**
+///
+/// The scene is the one every session opens with and then leaves within a
+/// minute: the boot volume lands, the pane draws it, the withdrawal takes the
+/// gates against the archive as its way back — and then a newer volume
+/// arrives and the pane parks on that one instead. From that moment the
+/// archive the released base is keyed to is named by nothing
+/// `evict_unneeded_loop_scans` asks: no loop frame names it, and `parked` is
+/// the new volume. It was swept, and the base stayed released on a skeleton
+/// with nothing to decode back — the state `App::ensure_base_whole` logs at
+/// `warn` as one "the withdrawal that released it should not have".
+///
+/// Measured on five 420 s single-pane legs of 2026-09-09 before this: `loop
+/// archives` fell to 0 within seconds on all five while `base skeletons`
+/// stood at 1.93 MiB for the rest of the leg — a released base that could not
+/// be made whole again for ~400 s, on 4 of the 5.
+///
+/// The pane is moved by writing `scan_info.timestamp`, which is the field the
+/// drain itself writes and the field `parked` is built from, so this asks the
+/// same question the application asks.
+///
+/// TAMPER: drop the `released_ways_back` clause from `retain_archives` and
+/// this reddens on its last assertion alone.
+#[test]
+fn a_released_bases_way_back_survives_the_pane_moving_off_it() {
+    let mut app = app_on_site();
+    land_one_archive_volume(&mut app, SITE, at(0));
+    the_pane_has_its_picture(&mut app);
+    app.evict_unshown_scans();
+
+    assert!(
+        app.volumes.base_is_released(SITE),
+        "fixture: nothing was withdrawn, so there is no way back to lose",
+    );
+    let collected = app
+        .volumes
+        .base_collected_at(SITE)
+        .expect("a released base is still keyed to its volume");
+    assert!(
+        app.loop_mgr.has_archive(SITE, &at(0)),
+        "fixture: the way back was already gone before the pane moved",
+    );
+
+    // The pane parks on a moment that is neither the archive's address nor
+    // the base's identity — what a newer arrival does to it.
+    let moved_to = at(9);
+    assert_ne!(
+        moved_to,
+        at(0),
+        "fixture: the pane did not move off the address"
+    );
+    assert_ne!(
+        Some(moved_to),
+        Some(collected),
+        "fixture: the pane did not move off the identity",
+    );
+    app.gui
+        .pane_mut(0)
+        .expect("a pane")
+        .scan_info
+        .as_mut()
+        .expect("the drain put scan info on the pane")
+        .timestamp = moved_to;
+
+    app.evict_unshown_scans();
+
+    assert!(
+        app.volumes.base_is_released(SITE),
+        "fixture: the base took its gates back on its own, so this scene no \
+         longer asks whether the way back survived",
+    );
+    assert!(
+        app.loop_mgr.has_archive(SITE, &at(0)),
+        "the residency pass took the way back out from under a base that is \
+         still released, so `ensure_base_whole` can never make it whole and a \
+         section pane on this site waits forever",
+    );
+}
+
 /// **A volume no pane has drawn yet is not taken**, however releasable it
 /// otherwise looks.
 ///

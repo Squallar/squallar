@@ -615,6 +615,15 @@ pub struct App {
     site_hint_pending: bool,
     /// The voxel grids 3D panes are holding, refcounted by the volume they were built from.
     volume_store: std::sync::Arc<squallar_volumetric::bridge::VolumeStore>,
+    /// **How many archives the last residency pass kept for a released merge
+    /// base alone**, and the reason it is a field rather than a local is that
+    /// the figure is only worth printing where it CHANGES.
+    ///
+    /// The pass runs every frame, so a line per pass would be a line per
+    /// frame; a released base holds its way back for minutes at a time, so a
+    /// line per transition is a handful per session and says exactly which
+    /// interval the hold covered. Read off a leg by counting the lines.
+    base_way_backs_held: usize,
     #[cfg(test)]
     pub(crate) volume_extractions: std::cell::Cell<u32>,
     /// **Decodes `ensure_base_whole` actually dispatched**, counted where the
@@ -1060,6 +1069,7 @@ impl App {
             catalogue_pending,
             site_hint_pending,
             volume_store: std::sync::Arc::new(squallar_volumetric::bridge::VolumeStore::new()),
+            base_way_backs_held: 0,
             #[cfg(test)]
             volume_extractions: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -3214,12 +3224,79 @@ impl App {
         // the cache learned from the decoded half. A false keep costs a
         // compressed buffer at a median 5.8 % of a volume; a false drop costs
         // the trade entirely.
+        //
+        // **And a released merge base's way back is a third reason to keep
+        // one**, because neither clause above can name it and the pass that
+        // built the base's dependency on it is a different pass.
+        //
+        // `release_unneeded_base_gates` refuses to withdraw a base it cannot
+        // decode back, and the way back it checks is this map. What it cannot
+        // check is the future: the withdrawal happens on the frame the pane
+        // has its first picture, and the pane moves off that volume the moment
+        // a newer one lands, at which point `parked` names the new volume, no
+        // loop frame names the old one, and the archive the released base is
+        // still keyed to fails both clauses and goes. The base does not go
+        // with it — it stays released, on a skeleton, waiting for bytes
+        // nothing holds any more, which is the state `App::ensure_base_whole`
+        // logs at `warn` as one "the withdrawal that released it should not
+        // have".
+        //
+        // The call order two passes up says this was already understood in
+        // the other direction — `release_unneeded_base_gates` runs AFTER this
+        // sweep "so a base whose archive that sweep just evicted is not
+        // released against a way back it no longer has". That covers a base
+        // about to be released and not one already released, and the gap is
+        // reachable on the plainest scene there is: measured on five 420 s
+        // single-pane legs of 2026-09-09, `loop archives` fell to 0 within
+        // seconds on all five while `base skeletons` stood at 1.93 MiB for
+        // the rest of the leg — a released base with no way back for ~400 s,
+        // on 4 of 5 legs.
+        //
+        // Priced the way the two clauses above are: a false keep costs one
+        // compressed buffer at a median 5.8 % of the volume it stands in for,
+        // and that is exactly the trade the withdrawal was taken on. It is
+        // asked by IDENTITY because that is what a base is keyed by.
+        //
+        // **What this does not cover**, said rather than implied:
+        // `evict_archives_to_ceiling` below takes no pinned predicate at all,
+        // so under archive pressure a way back can still be taken from a
+        // released base. That ceiling is 0 % subscribed on the legs above and
+        // closing it is a second change with a second reason.
+        let released_ways_back: Vec<(&str, chrono::NaiveDateTime)> = self
+            .volumes
+            .sites_with_base()
+            .filter(|site| self.volumes.base_is_released(site))
+            .filter_map(|site| self.volumes.base_collected_at(site).map(|at| (site, at)))
+            .collect();
+        // `retain_archives` takes an `Fn`, and the count is the only thing
+        // that says this clause ever fired on a live pane — the family it
+        // protects reads identically whether the archive was kept for this
+        // reason or for `parked`'s.
+        let way_backs_held = std::cell::Cell::new(0usize);
         self.loop_mgr.retain_archives(|site, ts, collected| {
-            keep(site, ts)
+            if keep(site, ts)
                 || parked
                     .iter()
                     .any(|&(at_site, at)| at_site == site && Some(at) == collected)
+            {
+                return true;
+            }
+            let held = released_ways_back
+                .iter()
+                .any(|&(at_site, at)| at_site == site && Some(at) == collected);
+            if held {
+                way_backs_held.set(way_backs_held.get() + 1);
+            }
+            held
         });
+        let way_backs_held = way_backs_held.get();
+        if way_backs_held != self.base_way_backs_held {
+            log::info!(
+                "released base way-backs held: {way_backs_held} (was {})",
+                self.base_way_backs_held,
+            );
+            self.base_way_backs_held = way_backs_held;
+        }
         squallar_worker::offload::discard_each(
             "evicted-loop-volume",
             crate::volume_inventory::volume_drop_parts(self.loop_mgr.retain_scans(keep_scan)),
