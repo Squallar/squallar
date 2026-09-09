@@ -1591,16 +1591,18 @@ impl super::Gui {
                     }
 
                     let play_label = if playing { "\u{23f8}" } else { "\u{23f5}" };
-                    let play_hover = if playing {
-                        "Pause".to_owned()
-                    } else if rendering {
-                        format!("Waiting for renders ({rendered}/{total})")
-                    } else {
-                        "Play".to_owned()
-                    };
+                    // `on_hover_ui`, not `on_hover_text`: the latter takes its
+                    // text ALREADY built, so every frame the transport's second
+                    // row was open allocated this String for a tooltip nobody
+                    // was hovering. egui runs this body only while it is up.
                     let play = ui
                         .add_enabled(!rendering || playing, egui::Button::new(play_label))
-                        .on_hover_text(play_hover);
+                        .on_hover_ui(|ui| {
+                            ui.set_max_width(ui.spacing().tooltip_width);
+                            ui.add(egui::Label::new(play_hover(
+                                playing, rendering, rendered, total,
+                            )));
+                        });
                     #[cfg(test)]
                     {
                         row2.play = play.rect;
@@ -1750,6 +1752,31 @@ impl super::Gui {
         {
             self.probes.last_timeline.row2 = Some(row2);
         }
+    }
+}
+
+/// What the play button says on hover.
+///
+/// A function rather than an argument: `Response::on_hover_text` takes its
+/// text already made, so the frame path can only leave this unbuilt by
+/// putting it inside the `on_hover_ui` body.
+///
+/// **The `rendering` branch is unreachable as a tooltip.** It needs
+/// `!playing && rendering`, which is exactly the state the caller spells
+/// `add_enabled(false)` in, and `on_hover_ui` is `Tooltip::for_enabled` — so
+/// those words have never been shown to anyone. Reaching them would take
+/// `on_disabled_hover_ui`, which is a product decision, not this cut's. Until
+/// then the branch is merely no longer *formatted* on every frame of a render
+/// wait, which is what it was doing.
+fn play_hover(playing: bool, rendering: bool, rendered: usize, total: usize) -> String {
+    #[cfg(test)]
+    crate::ui::hover_text_count::note();
+    if playing {
+        "Pause".to_owned()
+    } else if rendering {
+        format!("Waiting for renders ({rendered}/{total})")
+    } else {
+        "Play".to_owned()
     }
 }
 

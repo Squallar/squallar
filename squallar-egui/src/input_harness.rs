@@ -2670,3 +2670,10 @@ mod layer_opacity_tests;
 
 #[cfg(test)]
 mod overlay_dispatch_budget_tests;
+
+/// **Tooltip text is not built for a frame nobody is hovering** — the play
+/// button's, the layer-opacity slider's, and the catalogue's tiles. Each
+/// pinned in both directions, because "never build it at all" passes the
+/// closed-frame half on its own.
+#[cfg(test)]
+mod eager_tooltip_tests;
