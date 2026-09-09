@@ -268,6 +268,25 @@ pub enum BlankReason {
     /// texture**. The view is off this layer's ground: a geostationary
     /// composite panned past the top of its own latitude axis, say. **This is
     /// the one blank that is correct.**
+    ///
+    /// **Far narrower in practice than that sentence reads, and measured so.**
+    /// Over a 32-leg browser arm on 2026-09-08 it fired **24 times in 3,294
+    /// blanks — 0.7 %**, and the reason is upstream of it: `projection_window`
+    /// carries the box into the grid's own longitude frame and
+    /// `GridCoords::index_bounds` *clamps to an empty window* when the box
+    /// falls off the grid, so the ordinary "the view left this regional grid"
+    /// case returns [`Self::WindowEmpty`] before the cell walk that could
+    /// reach here ever starts. What is left for this variant is the case where
+    /// the window is **not** empty and its `interior` ring is — a window
+    /// pinned against the grid's own edge, which is the latitude-edge case
+    /// `rasterize_gridded` names.
+    ///
+    /// So the excluded set is small and
+    /// [`crate::render::rasterize::BlankReason::clears_covered_ground`] is
+    /// **more** conservative than reading its own doc suggests: most correct
+    /// off-grid clears are counted against covered ground under
+    /// `window-empty`. That is the safe direction, and it is why a `covered`
+    /// figure is a ceiling on the defect and never a measurement of it.
     OutsideCoverage,
     /// **No raster ran at all**: the handler's own `paints_in` answered that
     /// this layer cannot put a pixel in the bounds being rendered, so the
@@ -283,14 +302,102 @@ pub enum BlankReason {
     /// of confusion this enum exists to prevent — and it is the one variant
     /// whose truth is a claim and not a reading, because nothing downstream
     /// checks the handler's answer.
+    ///
+    /// **What the tree actually does, which is better than "unchecked".** All
+    /// three implementors of `SourceHandler::paints_in` — alerts, SPC outlooks
+    /// and fire weather — route through
+    /// [`any_feature_paints_in`](crate::render::rasterize::any_feature_paints_in),
+    /// which is `feature_survives_cull` over the features, and
+    /// `feature_survives_cull` is the **identical predicate `draw_feature`
+    /// culls with**. One function, not two spellings, and that is deliberate
+    /// (see `any_feature_paints_in`). So on these three handlers the refusal
+    /// is provably what the draw loop would have done, and the blank is a
+    /// correct clear for the same reason [`Self::OutsideView`] is.
+    ///
+    /// **The subtotal still counts it, and that is not an oversight.** What
+    /// the paragraph above establishes is a property of *today's three
+    /// implementors*, not of the trait: `paints_in` is the extension point a
+    /// new source overrides, and a fourth implementor answering from its own
+    /// arithmetic would land here with nothing to check it. The variant is a
+    /// *claim slot*, so it is the claim and not today's occupants that decides
+    /// which side of the subtotal it sits on. A reader who has read the three
+    /// implementations can subtract this count; the line prints it beside the
+    /// subtotal for exactly that.
     ExtentDeclaredEmpty,
+    /// **Nothing survived a filter that is not about where the view is**: an
+    /// alert whose category the pane has switched off or whose id is hidden, a
+    /// storm report or a lightning flash later than the depicted instant, a
+    /// flash older than the pane's own time window. The layer holds data and
+    /// the view is over it; the pane's own settings, or the depicted time,
+    /// removed every row.
+    ///
+    /// **Its own variant rather than [`Self::EmptyInput`], which it arrives
+    /// looking like.** `EmptyInput` says the raster was handed nothing;
+    /// this says it was handed rows and threw them all away, and the two are a
+    /// missing fetch against a working filter. It is also the shape of the one
+    /// blank a scrubbing user produces on purpose — every flash in the window
+    /// is in the future — so folding it into a geographic reason would file a
+    /// correct clear as a pan defect and a pan defect as a correct clear on
+    /// alternate frames.
+    FilteredOut,
+    /// **Every item was resolved and not one of them reached this texture.**
+    /// The point rasterizers' analogue of [`Self::OutsideCoverage`]: each
+    /// station, report, flash or coverage disc was projected and tested
+    /// against the texture rect, each feature's extent was carried into the
+    /// texture's frame and intersected with it, and every one missed.
+    ///
+    /// **Deliberately NOT folded into [`Self::OutsideCoverage`], and it counts
+    /// against covered ground.** For the four point rows the observation is as
+    /// strong as the cell walk's — a real latitude and longitude went through
+    /// `MercatorBounds::project` and the answer landed off the texture. For
+    /// the two feature rows it is not: `feature_survives_cull` tests
+    /// [`OverlayFeature::geo_bounds`], a bounding box the source computed, so a
+    /// wrong extent files itself here. One variant spanning both is kept on the
+    /// conservative side of that split rather than two, because a wrong extent
+    /// hidden inside a "correct clear" is the exact failure
+    /// [`Self::ExtentDeclaredEmpty`] is documented against. Split it the day a
+    /// reading makes the difference worth two counters.
+    OutsideView,
+    /// **Items reached this texture and none of them put a pixel down.** Not
+    /// an absence and not a pan: the raster had rows, they were neither
+    /// filtered out nor found off the texture, and the pixmap came back with
+    /// no ink in it. A fill and a stroke that are both fully transparent, a
+    /// ring that degenerates to fewer than three points, a coverage disc that
+    /// projects below a texel — and, when none of those explain it, a painter
+    /// that has stopped painting.
+    ///
+    /// The item rasterizers' analogue of [`Self::NoDataInWindow`], kept apart
+    /// from it because the mechanisms do not resemble each other: that one is
+    /// a grid cell carrying no finite value, this one is a draw call that
+    /// changed nothing. **This is the residue arm** — a rasterizer that can
+    /// place its items and still paints nothing lands here rather than in
+    /// [`Self::Unattributed`], so a reader knows the geometry was in range.
+    DrewNoInk,
+    /// **The pixmap could not be created at a non-zero size.** `Pixmap::new`
+    /// answered `None` for a width and height that are both positive, which is
+    /// an allocation this target refused; the raster gives back a zeroed
+    /// buffer and this reason. A zero-sized texture is [`Self::EmptyInput`]
+    /// and never this, because that one is an input that says nothing to draw
+    /// onto and this one is a request the allocator would not serve.
+    AllocationFailed,
     /// A raster settled blank with no reason armed.
     ///
-    /// **Not zero in a healthy tree, unlike its `RerenderReason` counterpart.**
-    /// Only the gridded row arms today; the polygon, alerts, GLM and marker
-    /// rasterizers all land here. Counted as its own variant rather than
-    /// folded into a neighbour, so the hole is visible instead of silently
-    /// inflating whichever reason it was merged with.
+    /// **Not zero in a healthy tree, unlike its `RerenderReason` counterpart**
+    /// — and the set that lands here is now much smaller than it was. Until
+    /// 2026-09-09 only the gridded row armed, so the seven rasterizers behind
+    /// the other eight overlay handlers all fell here: `Unattributed` was
+    /// **67.5 % of all blanks** pooled over a 32-leg browser arm, and 100 % of
+    /// blanks in every leg whose camera stayed over the data. All seven arm
+    /// now. What is left is a rasterizer that reaches
+    /// [`RasterizeOutput::settle_blank`] having armed nothing at all, which
+    /// today means only a rasterizer nobody has been through — radar's plan
+    /// view is not in this funnel and never reaches here.
+    ///
+    /// Counted as its own variant rather than folded into a neighbour, so the
+    /// hole is visible instead of silently inflating whichever reason it was
+    /// merged with. **It must stay a real counted variant**: the day it is
+    /// quietly mapped onto a plausible name is the day the next gap is
+    /// invisible.
     Unattributed,
 }
 
@@ -303,11 +410,15 @@ impl BlankReason {
         Self::NoDataInWindow,
         Self::OutsideCoverage,
         Self::ExtentDeclaredEmpty,
+        Self::FilteredOut,
+        Self::OutsideView,
+        Self::DrewNoInk,
+        Self::AllocationFailed,
         Self::Unattributed,
     ];
 
     /// How many variants there are — the width of the ledger's counter array.
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 11;
 
     /// This variant's slot in the ledger's array.
     ///
@@ -324,7 +435,11 @@ impl BlankReason {
             Self::NoDataInWindow => 3,
             Self::OutsideCoverage => 4,
             Self::ExtentDeclaredEmpty => 5,
-            Self::Unattributed => 6,
+            Self::FilteredOut => 6,
+            Self::OutsideView => 7,
+            Self::DrewNoInk => 8,
+            Self::AllocationFailed => 9,
+            Self::Unattributed => 10,
         }
     }
 
@@ -337,6 +452,10 @@ impl BlankReason {
             Self::NoDataInWindow => "no-data",
             Self::OutsideCoverage => "outside-coverage",
             Self::ExtentDeclaredEmpty => "extent-declared-empty",
+            Self::FilteredOut => "filtered-out",
+            Self::OutsideView => "outside-view",
+            Self::DrewNoInk => "drew-no-ink",
+            Self::AllocationFailed => "allocation-failed",
             Self::Unattributed => "unattributed",
         }
     }
@@ -366,6 +485,22 @@ impl BlankReason {
     /// `overlay blanks:` line prints beside the subtotal for exactly that.
     /// The reverse — recovering a hidden refusal from a subtotal that already
     /// absorbed it — is not possible at all.
+    ///
+    /// **Measured, and more conservative than the paragraphs above admit.**
+    /// The excluded variant is nearly unreachable: 24 of 3,294 blanks over a
+    /// 32-leg browser arm on 2026-09-08, because the ordinary off-grid case
+    /// exits at [`Self::WindowEmpty`] a step earlier — see
+    /// [`Self::OutsideCoverage`], which carries the mechanism. So this
+    /// predicate answers `true` for very nearly every blank a real run
+    /// produces, and the subtotal it feeds is a **ceiling** on the pictures a
+    /// user lost, never a count of them. Read a fall in it as progress and a
+    /// figure in it as an upper bound; do not read it as a defect count.
+    ///
+    /// **All four reasons added on 2026-09-09 count here**, including
+    /// [`Self::OutsideView`], which for the four point rasterizers is as
+    /// well-observed as `OutsideCoverage`. That variant's own doc says why it
+    /// was not admitted to the correct set instead: the two feature rows share
+    /// it and rest on an extent the source computed.
     pub const fn clears_covered_ground(self) -> bool {
         !matches!(self, Self::OutsideCoverage)
     }
@@ -384,6 +519,10 @@ impl BlankReason {
             // shipped with, so a reply written by a build that predates this
             // variant decodes to the reason it meant.
             Self::ExtentDeclaredEmpty => 6,
+            Self::FilteredOut => 7,
+            Self::OutsideView => 8,
+            Self::DrewNoInk => 9,
+            Self::AllocationFailed => 10,
             Self::Unattributed => 5,
         }
     }
@@ -399,6 +538,10 @@ impl BlankReason {
             4 => Some(Self::OutsideCoverage),
             5 => Some(Self::Unattributed),
             6 => Some(Self::ExtentDeclaredEmpty),
+            7 => Some(Self::FilteredOut),
+            8 => Some(Self::OutsideView),
+            9 => Some(Self::DrewNoInk),
+            10 => Some(Self::AllocationFailed),
             _ => None,
         }
     }
@@ -575,6 +718,117 @@ impl MercatorBounds {
     }
 }
 
+/// **What an item rasterizer counted while it drew, so it can say why it
+/// painted nothing.**
+///
+/// The seven non-gridded rasterizers all have the same shape — a list of
+/// items, a filter or two, a cull, a draw — and until 2026-09-09 not one of
+/// them armed a [`BlankReason`], so every blank they produced was counted
+/// `Unattributed`: **67.5 % of all blanks** over a 32-leg browser arm, and
+/// 100 % of them in every leg whose camera stayed over the data.
+///
+/// **One tally and one classifier rather than seven**, and that is the point
+/// of the type: seven hand-written `if` ladders would drift, and a reason is
+/// only worth counting while every row spells it the same way. The counters
+/// are three `u64`s kept in registers across the item loop and read once at
+/// the end — the same shape `rasterize_gridded` keeps `drawn_cells` in.
+///
+/// **Counted at the branch that decides, never recomputed after.** Each
+/// increment sits on the arm the loop actually took: the `continue` that a
+/// filter took, the `continue` that a cull took, the fall-through that
+/// reached a draw call. [`Self::reason`] does no geometry and reads no
+/// pixels — it only names which arm ran out of items — so it cannot agree
+/// with the loop by construction the way a reason re-derived from the
+/// window's shape would.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ItemTally {
+    /// Items dropped by a test that is **not about where the view is**: a
+    /// category the pane switched off, a hidden id, a timestamp past the
+    /// depicted instant, an age past the pane's window.
+    filtered: u64,
+    /// Items whose position or extent was resolved and found **off this
+    /// texture** — projected past the rect and its slack, or an extent carried
+    /// into the texture's frame that failed to intersect it.
+    off_texture: u64,
+    /// Items that survived everything and **reached a draw call on this
+    /// texture**. Not "put ink down": whether the draw changed a pixel is
+    /// `has_ink`'s answer later, and the difference between the two is exactly
+    /// what [`BlankReason::DrewNoInk`] names.
+    on_texture: u64,
+}
+
+impl ItemTally {
+    /// One item removed by a non-geographic filter.
+    fn filtered(&mut self) {
+        self.filtered += 1;
+    }
+
+    /// One item resolved and found off this texture.
+    fn off_texture(&mut self) {
+        self.off_texture += 1;
+    }
+
+    /// One item that reached a draw call on this texture.
+    fn on_texture(&mut self) {
+        self.on_texture += 1;
+    }
+
+    /// **Why a raster with this tally would have painted nothing.**
+    ///
+    /// `items` is the length of the list the rasterizer was handed, which is
+    /// the only term the tally cannot carry: a raster that counted nothing at
+    /// all is either an empty list or a list of items that reached no branch,
+    /// and those are different answers.
+    ///
+    /// The order of the arms is the order of the questions, and it is
+    /// deliberate:
+    ///
+    /// * **Nothing to draw from** comes first, because an empty list makes
+    ///   every other count zero and nothing else could be said.
+    /// * **Something reached the texture** comes next, and it wins over both
+    ///   culls: once one item was in range, "the view moved off the data" is
+    ///   false whatever the other rows did, and what is left to explain is a
+    ///   draw call that changed no pixel.
+    /// * **Something was off the texture** before **everything was filtered**,
+    ///   so a mixed raster — some rows in the future, some rows off screen —
+    ///   is named by position rather than by time. Both count against covered
+    ///   ground, so this ordering moves no figure across the subtotal; it
+    ///   picks which of two true sentences is printed.
+    /// * The fall-through is [`BlankReason::DrewNoInk`] and not
+    ///   [`BlankReason::Unattributed`]: a list that is not empty and whose
+    ///   items reached no branch at all is a degenerate row — a discussion
+    ///   with no rings, a ring of two points — which is a painter that drew
+    ///   nothing, not a rasterizer that armed nothing.
+    fn reason(self, items: usize) -> BlankReason {
+        if items == 0 {
+            BlankReason::EmptyInput
+        } else if self.on_texture == 0 && self.off_texture > 0 {
+            BlankReason::OutsideView
+        } else if self.on_texture == 0 && self.off_texture == 0 && self.filtered > 0 {
+            BlankReason::FilteredOut
+        } else {
+            BlankReason::DrewNoInk
+        }
+    }
+}
+
+/// The reason a rasterizer gives back when `Pixmap::new` answers `None`.
+///
+/// **Two causes behind one `None`, and they are not the same fault.**
+/// `tiny_skia` refuses a zero width or height, which is an input with nothing
+/// to draw onto — [`BlankReason::EmptyInput`], exactly as the gridded row
+/// spells a zero-sized texture. It also refuses a size whose buffer it cannot
+/// take, which is [`BlankReason::AllocationFailed`]: the request was
+/// well-formed and the allocator would not serve it. Reading the second as the
+/// first would file a target running out of memory as an empty layer.
+pub(crate) fn no_pixmap_reason(width: u32, height: u32) -> BlankReason {
+    if width == 0 || height == 0 {
+        BlankReason::EmptyInput
+    } else {
+        BlankReason::AllocationFailed
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutlooksInput {
     pub features: Vec<OverlayFeature>,
@@ -607,7 +861,7 @@ pub fn rasterize_spc_outlooks(
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
-            blank_reason: None,
+            blank_reason: Some(no_pixmap_reason(width, height)),
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -615,8 +869,13 @@ pub fn rasterize_spc_outlooks(
     let h = height as f32;
 
     // Two passes: hatching must go over every fill, including later features.
+    let mut tally = ItemTally::default();
     for feature in features {
-        draw_feature(&mut pixmap, feature, &mb, w, h, scale);
+        if draw_feature(&mut pixmap, feature, &mb, w, h, scale) {
+            tally.on_texture();
+        } else {
+            tally.off_texture();
+        }
     }
     crate::render::hatch::draw_hatch_pass(&mut pixmap, features, &mb, w, h, *hatch_color);
 
@@ -625,7 +884,15 @@ pub fn rasterize_spc_outlooks(
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
         blank: None,
-        blank_reason: None,
+        // **The hatch pass is not tallied, and does not need to be.** It walks
+        // the same `features` and applies no cull of its own, but
+        // `OverlayFeature::geo_bounds` is computed from the very polygons it
+        // projects — so a feature `draw_feature` culled cannot put hatching on
+        // this texture either, and `off_texture` stays true of it. See
+        // `feature_survives_cull`, which carries that argument and the note to
+        // re-check it if the hatch pass ever paints something not derived from
+        // `feature.polygons`.
+        blank_reason: Some(tally.reason(features.len())),
     }
 }
 
@@ -665,13 +932,14 @@ pub fn rasterize_spc_discussions(
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
-            blank_reason: None,
+            blank_reason: Some(no_pixmap_reason(width, height)),
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
     let w = width as f32;
     let h = height as f32;
 
+    let mut tally = ItemTally::default();
     for md in discussions {
         let fill_rgba = md_fill_color(&md.md_type);
         let stroke_rgba = md_stroke_color(&md.md_type);
@@ -687,6 +955,19 @@ pub fn rasterize_spc_discussions(
                 .map(|&(lat, lon)| mb.project(lat, lon, w, h))
                 .collect();
             if let Some(path) = build_polygon_path(&pts) {
+                // **This row has no cull of its own**, so the tally's position
+                // question is asked here, off the path already in hand: every
+                // other rasterizer answers it with the `continue` it takes,
+                // and this one projects every ring and lets `tiny_skia` clip.
+                // `Path::bounds` is the projected extent, so this is the same
+                // observation the clipper is about to make and not a
+                // re-derivation of it after the fact — which is why it sits
+                // before the fill rather than after the pixmap is read.
+                if path_reaches_texture(&path, w, h) {
+                    tally.on_texture();
+                } else {
+                    tally.off_texture();
+                }
                 fill_path(&mut pixmap, &path, fill_rgba, FillRule::Winding);
                 let sw = scaled_stroke_width(&path, 2.0, scale);
                 stroke_path(&mut pixmap, &path, stroke_rgba, sw);
@@ -699,7 +980,11 @@ pub fn rasterize_spc_discussions(
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
         blank: None,
-        blank_reason: None,
+        // **The item count is discussions, not rings.** A discussion carrying
+        // no ring the loop could build a path from counts on neither arm of the
+        // tally, so a page of them lands on `reason`'s fall-through — which is
+        // `DrewNoInk`, and is what a degenerate polygon is.
+        blank_reason: Some(tally.reason(discussions.len())),
     }
 }
 
@@ -744,20 +1029,38 @@ pub fn rasterize_nws_alerts(
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
-            blank_reason: None,
+            blank_reason: Some(no_pixmap_reason(width, height)),
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
     let w = width as f32;
     let h = height as f32;
 
+    // **Tallied per alert and not per feature**, so the denominator below is
+    // the `alerts` list the caller handed over. A multi-polygon alert with one
+    // feature on the texture is one item in range, which is what
+    // `reason`'s "something reached the texture" question means.
+    let mut tally = ItemTally::default();
     for alert in alerts {
         if !enabled_categories.contains(&alert.category) || hidden_ids.contains(&alert.id) {
+            // A category the pane switched off or an id the user hid: the
+            // layer holds this alert and the view may well be over it.
+            tally.filtered();
             continue;
         }
+        let mut reached = false;
         for feature in alert.features.iter() {
-            draw_feature(&mut pixmap, feature, &mb, w, h, scale);
+            reached |= draw_feature(&mut pixmap, feature, &mb, w, h, scale);
         }
+        if reached {
+            tally.on_texture();
+        } else if !alert.features.is_empty() {
+            tally.off_texture();
+        }
+        // An alert carrying no feature at all counts on neither arm: nothing
+        // was filtered and nothing was located, so a page of them falls
+        // through to `DrewNoInk` rather than claiming the view moved off
+        // geometry that was never there.
     }
 
     RasterizeOutput {
@@ -765,7 +1068,7 @@ pub fn rasterize_nws_alerts(
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
         blank: None,
-        blank_reason: None,
+        blank_reason: Some(tally.reason(alerts.len())),
     }
 }
 
@@ -843,7 +1146,7 @@ pub fn rasterize_radar_coverage(
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
-            blank_reason: None,
+            blank_reason: Some(no_pixmap_reason(width, height)),
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -851,6 +1154,7 @@ pub fn rasterize_radar_coverage(
     let h = height as f32;
 
     let mut pb = PathBuilder::new();
+    let mut tally = ItemTally::default();
     for site in sites {
         // Into the viewport's frame first: the catalogue folds longitude into
         // [-180, 180] while `bounds` is unfolded; 4 of 208 stations are east.
@@ -870,15 +1174,23 @@ pub fn rasterize_radar_coverage(
         // Cull on the disc, not on the station: a radar whose antenna is off the
         // texture still covers ground that is on it.
         if px < -radius || px > w + radius || py < -radius || py > h + radius {
+            tally.off_texture();
             continue;
         }
         // A sub-texel disc contributes nothing a reader can see and `push_circle`
         // is happy to build a degenerate one, so it is dropped here rather than
         // left for the rasterizer to round away.
         if !radius.is_finite() || radius < 1.0 {
+            // **On the texture and unpaintable**, which is the tally's
+            // fall-through and not either cull: the station's disc covers this
+            // view and rounds away, so a raster of nothing but sub-texel discs
+            // reads `drew-no-ink` rather than `outside-view`. Zoomed far out is
+            // exactly when that happens.
+            tally.on_texture();
             continue;
         }
 
+        tally.on_texture();
         pb.push_circle(px, py, radius);
     }
 
@@ -916,7 +1228,7 @@ pub fn rasterize_radar_coverage(
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
         blank: None,
-        blank_reason: None,
+        blank_reason: Some(tally.reason(sites.len())),
     }
 }
 
@@ -1101,7 +1413,7 @@ pub fn rasterize_metar_stations(
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
-            blank_reason: None,
+            blank_reason: Some(no_pixmap_reason(width, height)),
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -1110,6 +1422,7 @@ pub fn rasterize_metar_stations(
         zoom: *zoom as f32,
         is_dark: *is_dark,
     };
+    let mut tally = ItemTally::default();
     for ob in obs.iter() {
         // Into the viewport's frame first, as every point row does.
         let lon = mb.nearest_lon(ob.lon);
@@ -1120,8 +1433,10 @@ pub fn rasterize_metar_stations(
         // symbol culled at the edge is a missing station.
         let slack = 60.0 * scale;
         if px < -slack || px > w + slack || py < -slack || py > h + slack {
+            tally.off_texture();
             continue;
         }
+        tally.on_texture();
         {
             let mut painter = PixmapPointPainter {
                 pixmap: &mut pixmap,
@@ -1140,7 +1455,7 @@ pub fn rasterize_metar_stations(
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
         blank: None,
-        blank_reason: None,
+        blank_reason: Some(tally.reason(obs.len())),
     }
 }
 
@@ -1319,7 +1634,7 @@ pub fn rasterize_storm_reports(
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
-            blank_reason: None,
+            blank_reason: Some(no_pixmap_reason(width, height)),
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -1338,6 +1653,7 @@ pub fn rasterize_storm_reports(
     };
 
     let mut hit_cells = HitCells::new(width, height);
+    let mut tally = ItemTally::default();
 
     for (idx, report) in reports.iter().enumerate() {
         // **A report later than the depicted instant has not happened yet**
@@ -1350,6 +1666,9 @@ pub fn rasterize_storm_reports(
         // from the picture, aligned in the map. `None` passes: a report is
         // never dropped for want of a readable time.
         if report.valid.is_some_and(|valid| valid > *as_of) {
+            // A report the depicted instant has not reached: the layer holds
+            // it and the view may be right over where it will happen.
+            tally.filtered();
             continue;
         }
         // Into the viewport's frame first — see `rasterize_radar_sites`.
@@ -1357,8 +1676,10 @@ pub fn rasterize_storm_reports(
         let (px, py) = mb.project(report.lat, lon, w, h);
         let slack = 20.0 * scale;
         if px < -slack || px > w + slack || py < -slack || py > h + slack {
+            tally.off_texture();
             continue;
         }
+        tally.on_texture();
 
         let fill = match report.kind {
             StormReportKind::Tornado => Color::from_rgba8(220, 40, 40, 220),
@@ -1437,7 +1758,7 @@ pub fn rasterize_storm_reports(
         hit_cells: Some(hit_cells),
         alpha: AlphaMode::Premultiplied,
         blank: None,
-        blank_reason: None,
+        blank_reason: Some(tally.reason(reports.len())),
     }
 }
 
@@ -1558,7 +1879,7 @@ pub fn rasterize_glm_strikes(
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
-            blank_reason: None,
+            blank_reason: Some(no_pixmap_reason(width, height)),
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -1570,11 +1891,14 @@ pub fn rasterize_glm_strikes(
     let zoom_f32 = *zoom as f32;
     let base_size = (zoom_f32 * 2.0).clamp(6.0, 20.0) * sane_device_scale(*device_scale);
 
+    let mut tally = ItemTally::default();
+
     for (i, flash) in flashes.iter().enumerate() {
         // Into the viewport's frame before either test: the flash carries a
         // folded longitude and `bounds` carries an unfolded one.
         let lon = mb.wrap_lon(flash.lon);
         if flash.lat < bounds.min_lat || flash.lat > bounds.max_lat || lon > bounds.max_lon {
+            tally.off_texture();
             continue;
         }
 
@@ -1586,17 +1910,21 @@ pub fn rasterize_glm_strikes(
         // clamp to guard: this subtraction is exact integer arithmetic on two
         // `NaiveDateTime`s, so past the cull it cannot be negative.
         if flash.time > *now {
+            tally.filtered();
             continue;
         }
         let age_secs = (*now - flash.time).num_milliseconds() as f64 / 1000.0;
         if age_secs > *time_window_secs {
+            tally.filtered();
             continue;
         }
 
         let (px, py) = mb.project(flash.lat, lon, w, h);
         if px < -base_size || px > w + base_size || py < -base_size || py > h + base_size {
+            tally.off_texture();
             continue;
         }
+        tally.on_texture();
 
         let bolt_size = base_size * (0.8 + energy_size_scale(flash.energy) * 0.4);
 
@@ -1642,7 +1970,15 @@ pub fn rasterize_glm_strikes(
         hit_cells: Some(hit_cells),
         alpha: AlphaMode::Premultiplied,
         blank: None,
-        blank_reason: None,
+        // **The geographic test runs before the two time tests here**, and
+        // that ordering is the loop's, not the tally's. A flash outside the
+        // box never reaches the age cull, so `filtered` undercounts on a
+        // raster whose flashes are both stale and off screen — which is
+        // exactly why `ItemTally::reason` asks the position question first and
+        // reads `filtered` only when nothing was located at all. Both answers
+        // count against covered ground, so the ordering names a sentence and
+        // moves no figure across the subtotal.
+        blank_reason: Some(tally.reason(flashes.len())),
     }
 }
 
@@ -1660,6 +1996,21 @@ pub fn rasterize_glm_strikes(
 /// spellings: the dispatch door asks the same question one field earlier (see
 /// [`any_feature_paints_in`]) and a second spelling that disagreed with this
 /// one would refuse a raster the rasterizer would have painted.
+/// Whether a projected path's extent overlaps the texture at all.
+///
+/// **The tally's position question for a row with no cull of its own.** Only
+/// `rasterize_spc_discussions` needs it: every other item rasterizer already
+/// takes a `continue` on a point outside the rect, and that `continue` is
+/// where its tally is written. `tiny_skia` clips a path to the pixmap on its
+/// own, so this changes no pixel — it names, at the moment the path exists,
+/// the thing the clipper is about to do silently.
+///
+/// Half-open on neither side: a path that touches the edge is on the texture.
+fn path_reaches_texture(path: &tiny_skia::Path, w: f32, h: f32) -> bool {
+    let b = path.bounds();
+    b.right() >= 0.0 && b.left() <= w && b.bottom() >= 0.0 && b.top() <= h
+}
+
 fn feature_survives_cull(feature: &OverlayFeature, mb: &MercatorBounds) -> bool {
     let Some(ref fb) = feature.geo_bounds else {
         return true;
@@ -1719,6 +2070,15 @@ pub fn any_feature_paints_in<'a>(
         .any(|feature| feature_survives_cull(feature, &mb))
 }
 
+/// Draw one feature, and say whether its extent reached this texture.
+///
+/// **The answer is the cull's, not the painter's**: `true` means the feature
+/// survived [`feature_survives_cull`] and its polygons were handed to the
+/// rasterizer, and says nothing about whether a pixel changed. That is the
+/// distinction [`BlankReason::OutsideView`] and [`BlankReason::DrewNoInk`] are
+/// kept apart by, and it is why this returns the cull's verdict rather than
+/// "did any `fill_path` run": a feature whose every polygon fails to project
+/// is still a feature the view was over.
 fn draw_feature(
     pixmap: &mut Pixmap,
     feature: &OverlayFeature,
@@ -1726,9 +2086,9 @@ fn draw_feature(
     w: f32,
     h: f32,
     scale: f32,
-) {
+) -> bool {
     if !feature_survives_cull(feature, mb) {
-        return;
+        return false;
     }
 
     for polygon in &feature.polygons {
@@ -1744,6 +2104,7 @@ fn draw_feature(
             }
         }
     }
+    true
 }
 
 /// Thins the stroke below a 40-point minimum dimension, so a small polygon is
@@ -2897,6 +3258,9 @@ mod has_ink_tests;
 
 #[cfg(test)]
 mod hole_tests;
+
+#[cfg(test)]
+mod item_blank_reason_tests;
 
 #[cfg(test)]
 pub(crate) mod lambert_fixture;

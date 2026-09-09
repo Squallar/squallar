@@ -4081,13 +4081,21 @@ fn a_blank_overlay_reply_carries_no_picture_sized_payload() {
         Some((
             RasterBuf::empty(),
             Some(picture_bytes as u32),
-            // **`Unattributed` is the reading, not a shrug.** The alerts
-            // rasterizer arms no `BlankReason`; only the gridded row does, so
-            // this pins which rows still have to be taught, and it changes to
-            // a real reason on the day this one is. What it may never become
-            // is a *plausible* reason invented by the settle — see
-            // `BlankReason::Unattributed`.
-            Some(squallar_overlays::render::rasterize::BlankReason::Unattributed),
+            // **`EmptyInput`, and it used to be `Unattributed`.** This pin
+            // recorded the gap: until 2026-09-09 only the gridded row armed a
+            // `BlankReason`, so an alerts raster with nothing to draw crossed
+            // the wire saying only that it was blank. The fixture above hands
+            // the row an empty `alerts` list, which is precisely "there was
+            // nothing to draw from", and it now says so.
+            //
+            // **What this asserts that the rasterizer's own tests cannot**:
+            // the reason survives the whole production path — the run funnel's
+            // output stage settles it, the reply codec writes it as one byte,
+            // and `decode_overlay_out` reads it back. A reason armed and lost
+            // at the wire is a counter that reads `Unattributed` on a build
+            // where every rasterizer arms, which is indistinguishable from the
+            // gap this replaced.
+            Some(squallar_overlays::render::rasterize::BlankReason::EmptyInput),
             None
         )),
         "a blank reply must arrive AS a blank of the picture's own size. \

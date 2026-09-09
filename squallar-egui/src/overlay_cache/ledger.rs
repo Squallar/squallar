@@ -470,6 +470,17 @@ impl Totals {
     /// [`BlankReason::clears_covered_ground`] for why a handler's own
     /// `paints_in` refusal is counted here despite looking correct.
     ///
+    /// **A ceiling, and a loose one — measured.** The one excluded variant
+    /// fired 24 times in 3,294 blanks over a 32-leg browser arm on 2026-09-08
+    /// (0.7 %), because the ordinary "the view left this regional grid" case
+    /// exits at [`BlankReason::WindowEmpty`] a step before the cell walk that
+    /// could reach `OutsideCoverage` — `projection_window` clamps to an empty
+    /// window when the box falls off the grid. So this figure includes very
+    /// nearly every correct clear as well as every wrong one. **Read a fall in
+    /// it as progress and a figure in it as an upper bound**; a reader who
+    /// treats it as a count of pictures the user lost will over-read it by
+    /// most of its value.
+    ///
     /// This is the figure a correctness reading of the blank rate wants, and
     /// it did not exist before 2026-09-06. `pictures - inked` was measured at
     /// 37–63 % of dispatches on two browser legs and filed as *waste*; read as

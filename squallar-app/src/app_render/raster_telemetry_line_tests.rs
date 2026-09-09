@@ -638,8 +638,10 @@ fn the_gridded_scatter_line_says_its_figures_and_says_when_it_has_none() {
 fn the_blank_line_names_every_reason_at_its_own_count() {
     use squallar_egui::overlay_cache::ledger::BlankReason;
 
-    // 4 + 16 + 32 + 64 + 128 + 256 + 512 = 1012 blanks, of which every reason
-    // but `outside-coverage` is over covered ground: 1012 - 128 = 884.
+    // One distinct count per reason, `4 << 2n`, so a transposed pair cannot
+    // read as a correct line. Every reason but `outside-coverage` is over
+    // covered ground, and the subtotal below is stated as the difference
+    // rather than as a literal so it re-derives when a variant is appended.
     let mut blank_reasons = [0u64; BlankReason::COUNT];
     for (n, reason) in BlankReason::ALL.into_iter().enumerate() {
         blank_reasons[reason.index()] = 4u64 << (2 * n);
@@ -664,8 +666,9 @@ fn the_blank_line_names_every_reason_at_its_own_count() {
     let expected = format!(
         "overlay blanks: {posted} blank, {} covered, \
          4 empty-input, 16 unknown-field, 64 window-empty, 256 no-data, \
-         1024 outside-coverage, 4096 extent-declared-empty, \
-         16384 unattributed",
+         1024 outside-coverage, 4096 extent-declared-empty, 16384 filtered-out, \
+         65536 outside-view, 262144 drew-no-ink, 1048576 allocation-failed, \
+         4194304 unattributed",
         posted - 1024,
     );
     assert_eq!(
