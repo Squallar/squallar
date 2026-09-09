@@ -12,16 +12,19 @@
 //! can fire — published per script as `QUIET_PHASES`/`ZOOM_QUIET_PHASES` so a
 //! later gate can derive expected settle counts from the script alone.
 //!
-//! **A balanced stream of events is not a returning camera**, and a script
-//! that drags has to be built for the difference. What a widget is handed is
-//! not what the player wrote: `egui` gives it nothing until the pointer has
+//! **A balanced stream of events is not a returning camera**, and every script
+//! here that drags has to be built for the difference. What a widget is handed
+//! is not what the player wrote: `egui` gives it nothing until the pointer has
 //! left a 6 pt circle around the press point, gives it nothing again on the
 //! frame the release arrives, and `walkers` then coasts the map on a velocity
 //! estimated from the last 100 ms of sampled positions. All three are
 //! functions of where the frames fell, so a drag that *starts* at the press
 //! point or *ends* in motion delivers a different displacement at every
 //! cadence — which is what put five legs of one build between Tennessee and
-//! Brazil. See `pan_zoom_2d::STROKE_LEAD` and `pan_zoom_2d::STROKE_TRAVEL`.
+//! Brazil. Both drag scripts therefore leave the press point by a step over
+//! that 6 pt bar and come to rest before their release, and both saturations
+//! are closed forms in `t`. See `pan_zoom_2d::STROKE_LEAD`/`STROKE_TRAVEL` and
+//! `orbit_3d::ORBIT_LEAD`/`ORBIT_REST`.
 //!
 //! Armed by the `gesture_script` config key or the `SQUALLAR_GESTURE_SCRIPT`
 //! environment variable; absent both, nothing here runs and the raw input is
@@ -119,10 +122,30 @@ pub mod orbit_3d {
     pub(crate) const QUIET_2_END: f64 = 14.5;
     pub(crate) const DOLLY_OUT_END: f64 = 18.5;
     pub(crate) const NOTCHES_PER_LEG: i64 = 10;
+    /// Seconds at the end of the drag the pointer spends back at the press
+    /// point, at rest, before the release.
+    ///
+    /// The same two jobs [`pan_zoom_2d::STROKE_TRAVEL`]'s rest does, for the
+    /// same reasons: the release lands where the pointer already is, so its
+    /// own step is not the one handed to a frame whose `dragged()` is already
+    /// false, and what the widget was given telescopes to `press - press`.
+    pub(crate) const ORBIT_REST: f64 = 0.5;
+    /// When the orbit path closes. Whole cycles on both axes by here, so the
+    /// pointer is back at [`ORBIT_LEAD`] and the return step is that alone.
+    pub(crate) const ORBIT_CLOSE: f64 = DRAG_END - ORBIT_REST;
     /// Periods chosen so both axes complete whole cycles by
-    /// [`DRAG_END`]: the path closes and the loop's net orbit is zero.
-    pub(crate) const X_PERIOD: f64 = 3.5;
-    pub(crate) const Y_PERIOD: f64 = 7.0;
+    /// [`ORBIT_CLOSE`]: the path closes and the loop's net orbit is zero.
+    pub(crate) const X_PERIOD: f64 = ORBIT_CLOSE / 2.0;
+    pub(crate) const Y_PERIOD: f64 = ORBIT_CLOSE;
+    /// How far out of the press point the path's first step lands, points.
+    ///
+    /// [`pan_zoom_2d::STROKE_LEAD`]'s reason: `egui` hands a widget nothing
+    /// until the pointer has left a `max_click_dist` circle, and a path that
+    /// starts *at* the press point crosses that circle later the faster the
+    /// frames come. A Lissajous that leaves by a step is over the bar on its
+    /// first move at any rate. It is stepped back off before the release, so
+    /// the loop's net orbit is still zero.
+    pub(crate) const ORBIT_LEAD: f32 = 12.0;
 }
 
 /// The two-finger scenario, spoken in the web backend's per-finger touch
@@ -653,10 +676,37 @@ impl GesturePlayer {
 
     // ── orbit-3d ──
 
+    /// Where the orbit's pointer is at `t`: one
+    /// [`ORBIT_LEAD`](orbit_3d::ORBIT_LEAD) step out of the press point, then
+    /// the Lissajous, then — from [`ORBIT_CLOSE`](orbit_3d::ORBIT_CLOSE) on —
+    /// back **at** the press point and at rest there.
+    ///
+    /// A closed form in `t`, and the position the release lands on as well as
+    /// the one a frame inside the drag moves to. The two saturations are what
+    /// make the loop's net orbit zero rather than frame-gap luck: the step out
+    /// crosses `egui`'s drag threshold whole, and the step back is delivered
+    /// while the widget is still being dragged instead of on the release
+    /// frame, which is handed to nobody.
+    fn orbit_pos(screen: egui::Rect, t: f64) -> egui::Pos2 {
+        use orbit_3d::*;
+        let center = screen.center();
+        if t >= ORBIT_CLOSE {
+            return center;
+        }
+        let a = 0.22 * screen.width();
+        let b = 0.18 * screen.height();
+        center
+            + egui::vec2(ORBIT_LEAD, 0.0)
+            + egui::vec2(
+                a * (std::f64::consts::TAU * t / X_PERIOD).sin() as f32,
+                b * (std::f64::consts::TAU * t / Y_PERIOD).sin() as f32,
+            )
+    }
+
     fn orbit_3d(&mut self, events: &mut Vec<egui::Event>, screen: egui::Rect, t: f64) {
         use orbit_3d::*;
         let center = screen.center();
-        if t < DRAG_END - 0.05 {
+        if t < DRAG_END {
             if self.down_at.is_none() {
                 // Park, press alone, then orbit — see `press_parked`. The
                 // path is a function of `t`, so the frame after the press
@@ -664,17 +714,11 @@ impl GesturePlayer {
                 self.press_parked(events, center);
                 return;
             }
-            let a = 0.22 * screen.width();
-            let b = 0.18 * screen.height();
-            let pos = center
-                + egui::vec2(
-                    a * (std::f64::consts::TAU * t / X_PERIOD).sin() as f32,
-                    b * (std::f64::consts::TAU * t / Y_PERIOD).sin() as f32,
-                );
-            self.move_to(events, pos);
+            self.move_to(events, Self::orbit_pos(screen, t));
         } else {
-            // Both Lissajous axes complete whole cycles by DRAG_END, so the
-            // path closes here: release at the centre it started from.
+            // The path closed at ORBIT_CLOSE and has been resting at the press
+            // point since: release exactly there, so the drag the widget was
+            // handed telescopes to zero.
             self.release_if_down(events, center);
             // Past the legs' ends too — see the pan-zoom flush note.
             let due = Self::leg_notches(t, QUIET_1_END, DOLLY_IN_END, NOTCHES_PER_LEG)

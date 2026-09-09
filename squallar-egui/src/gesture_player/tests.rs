@@ -1100,3 +1100,145 @@ fn camera_end(frames: &[(f64, Vec<egui::Event>)]) -> CameraEnd {
         strokes,
     }
 }
+
+/// The orbit camera: a `Sense::click_and_drag` widget over `NATIVE`, summing
+/// `Response::drag_delta()` on the frames `dragged_by(Primary)` is true.
+///
+/// That is not a model of the 3D pane's orbit — it is the whole of what the
+/// orbit reads. `ui_map`'s `OrbitDelta` is `drag.x * ORBIT_YAW_DEG_PER_POINT`
+/// and `drag.y * ORBIT_PITCH_DEG_PER_POINT` off exactly this response, so
+/// points here are degrees there through a constant, and a net of zero points
+/// is a net of zero degrees.
+struct OrbitCamera {
+    ctx: egui::Context,
+    /// Drag delta the widget was handed, summed — the orbit's yaw and pitch
+    /// in points.
+    net: egui::Vec2,
+    /// Path length of that same drag: the "did the work happen" figure a net
+    /// of zero cannot fake.
+    travel: f64,
+}
+
+impl OrbitCamera {
+    fn new() -> Self {
+        Self {
+            ctx: egui::Context::default(),
+            net: egui::Vec2::ZERO,
+            travel: 0.0,
+        }
+    }
+
+    fn frame(&mut self, time: f64, events: Vec<egui::Event>) {
+        self.ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(NATIVE),
+            time: Some(time),
+            events,
+            ..Default::default()
+        });
+        let mut ui = egui::Ui::new(
+            self.ctx.clone(),
+            egui::Id::new("gesture player orbit"),
+            egui::UiBuilder::new()
+                .layer_id(egui::LayerId::background())
+                .max_rect(NATIVE),
+        );
+        ui.set_clip_rect(NATIVE);
+        let (_, response) = ui.allocate_exact_size(NATIVE.size(), egui::Sense::click_and_drag());
+        if response.dragged_by(egui::PointerButton::Primary) {
+            let drag = response.drag_delta();
+            self.net += drag;
+            self.travel += f64::from(drag.length());
+        }
+        let _ = self.ctx.end_pass();
+    }
+}
+
+/// The orbit script's net orbit is zero at every frame cadence — the path
+/// closes, and what the widget is *handed* closes with it.
+///
+/// The distinction is the whole test. The emitted path has always closed: its
+/// Lissajous periods divide the drag phase, so the last point is the first.
+/// What reaches the camera is a different quantity, and before the lead and
+/// the rest it was neither zero nor the same twice — a three-loop run left
+/// between -113.6 and -226.3 points of yaw over five cadences of one build,
+/// with the widest gap between 60 fps and 10 fps.
+///
+/// Both ends leaked, and each constant closes one: `egui` hands a widget
+/// nothing until the pointer has left a 6 pt circle around the press point,
+/// so a path starting *at* it loses more of itself the faster the frames come
+/// ([`ORBIT_LEAD`](orbit_3d::ORBIT_LEAD)); and on the frame the release
+/// arrives `dragged()` is already false, so the step from wherever the path
+/// had got to back to the press point reached nobody
+/// ([`ORBIT_REST`](orbit_3d::ORBIT_REST)).
+#[test]
+fn the_orbit_camera_comes_back_to_where_it_started_at_every_frame_cadence() {
+    use orbit_3d::*;
+    const LOOPS: usize = 3;
+    let until = LOOPS as f64 * LOOP_SECONDS - 0.5;
+
+    // The path's own length, from the schedule alone: the step out, the
+    // Lissajous sampled finely enough that its polyline is its arc, and the
+    // step back. A cadence coarser than this sampling cuts corners off the
+    // travel, so it is asserted as a floor rather than an equality — its job
+    // is to refuse a run that dragged nothing, which is the only way a net of
+    // zero lies.
+    let steps = 20_000;
+    let arc: f64 = (1..=steps)
+        .map(|i| {
+            let t = |k: usize| ORBIT_CLOSE * k as f64 / steps as f64;
+            f64::from(
+                (GesturePlayer::orbit_pos(NATIVE, t(i))
+                    - GesturePlayer::orbit_pos(NATIVE, t(i - 1)))
+                .length(),
+            )
+        })
+        .sum();
+    // 90 % of it: the coarsest cadence here samples the Lissajous every 100 ms
+    // and its polyline is shorter than the curve by that much.
+    let travel_floor = 0.9 * LOOPS as f64 * arc;
+
+    // One f32 direction and amplitude per sample, over a few thousand samples.
+    let tolerance = 1e-2;
+
+    let cadences: Vec<(String, Vec<f64>)> = vec![
+        ("60 fps".to_owned(), steady_times(1.0 / 60.0, until)),
+        ("16.7 fps".to_owned(), steady_times(0.06, until)),
+        ("10 fps".to_owned(), steady_times(0.1, until)),
+        (
+            "60 fps, first frames 40 ms late".to_owned(),
+            late_first_frames(1.0, until),
+        ),
+        (
+            "jittered ~41 ms".to_owned(),
+            jittered_around(7, 0.041, until),
+        ),
+        (
+            "jittered ~25 ms".to_owned(),
+            jittered_around(11, 0.025, until),
+        ),
+        // The rate that carries the property `ORBIT_LEAD` exists for: the
+        // path leaves the press point at 816 pt/s, so the first frame after
+        // the press clears `egui`'s 6 pt drag threshold on its own at 60 fps
+        // (13.6 pt) and does not at 175 (4.7 pt). Without a cadence up here
+        // the lead can be deleted and this test stays green.
+        ("175 fps".to_owned(), steady_times(1.0 / 175.0, until)),
+    ];
+
+    for (name, times) in &cadences {
+        let frames = replay("orbit-3d", times, NATIVE);
+        let mut camera = OrbitCamera::new();
+        for (time, events) in &frames {
+            camera.frame(*time, events.clone());
+        }
+        assert!(
+            camera.travel > travel_floor,
+            "{name}: the orbit dragged {} pt, the schedule's path is {arc} pt a loop",
+            camera.travel
+        );
+        assert!(
+            f64::from(camera.net.length()) < tolerance,
+            "{name}: the run left a net orbit of {:?} pt",
+            camera.net
+        );
+    }
+}
