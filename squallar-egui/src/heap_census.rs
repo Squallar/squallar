@@ -1190,8 +1190,15 @@ pub fn publish_resident(live: u64, resident: Option<squallar_alloc::process::Res
     // Nothing here samples it — a sampled peak is a false zero for every
     // transient shorter than the sample, which is the whole class it exists
     // to catch. See `squallar_alloc::live_peak_bytes`.
-    lv::LIVE_PEAK.store(squallar_alloc::live_peak_bytes().unwrap_or(0), Relaxed);
-    lv::LIVE_PEAK_LARGE.store(squallar_alloc::live_peak_large_blocks(), Relaxed);
+    //
+    // **One reading for the pair.** They were two calls until 2026-09-09, and
+    // an advance landing between them published a new peak beside the
+    // previous peak's composition — the same two-instants defect the counter
+    // below them was rebuilt to remove. `live_peak` is one load of the word
+    // that holds both.
+    let (peak, peak_large) = squallar_alloc::live_peak().unwrap_or((0, 0));
+    lv::LIVE_PEAK.store(peak, Relaxed);
+    lv::LIVE_PEAK_LARGE.store(peak_large, Relaxed);
     if let Some(r) = resident {
         lv::RSS.store(r.rss_bytes, Relaxed);
         lv::ANON.store(r.anon_bytes, Relaxed);

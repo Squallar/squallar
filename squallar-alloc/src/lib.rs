@@ -120,7 +120,7 @@ pub struct Counting;
 ///
 /// This is the one thing about this static that may not be "optimised" later,
 /// so it is written down rather than left to be inferred from where the
-/// `fetch_max` happens to sit.
+/// exchange in [`raise_peak`] happens to sit.
 ///
 /// A peak taken by a sampler — the 2 s telemetry tick, the 250 ms process
 /// sampler, anything periodic — is a **false zero for every transient shorter
@@ -132,19 +132,68 @@ pub struct Counting;
 /// in the direction that makes removing the copy look worthless** — the fix
 /// would move a number nothing observed, so it would read as no fix at all.
 ///
-/// A `fetch_max` at the allocation site cannot miss it: every grant that
+/// A maximum raised at the allocation site cannot miss it: every grant that
 /// could raise the peak raises it, because every grant runs through here.
 /// That is why the cost lives on the hot path and not on a tick, and it is
 /// why moving it to a tick would silently invert the instrument's verdict
 /// rather than merely blur it.
 ///
+/// # **The peak and its companion share this word**
+///
+/// The high-water mark takes the upper bits and the large blocks live when it
+/// was set take the lower [`PEAK_LARGE_BITS`], because
+/// two statics are two publications: a thread preempted between raising the
+/// peak and storing the companion beside it lands a companion for a heap that
+/// is gone. They were two until 2026-09-09; see [`raise_peak`], which is the
+/// only writer and publishes both in one exchange.
+///
 /// **It is also the crate's sentinel for "this binary installed the
-/// counter".** Every grant runs the `fetch_max` and the first one carries a
-/// non-zero live figure, so a zero here means no allocation has ever passed
-/// through [`Counting`] — which is what [`live_bytes`] and [`live_peak_bytes`]
-/// answer `None` on. Moving the peak off the grant path would break that as
-/// well as the peak.
+/// counter".** Every grant compares against this word and the first one
+/// carries a non-zero live figure, so a zero here means no allocation has
+/// ever passed through [`Counting`] — which is what [`live_bytes`] and
+/// [`live_peak_bytes`] answer `None` on. Moving the peak off the grant path
+/// would break that as well as the peak.
 static PEAK: AtomicU64 = AtomicU64::new(0);
+
+/// Bits of [`PEAK`] the companion occupies; the peak itself has the rest.
+///
+/// Twenty is a companion of up to 1,048,575 blocks, each of which is at least
+/// [`LARGE_GRANT_FLOOR`], so the cap describes a terabyte of large blocks
+/// alone; the healthy readings this was built to explain are 15-17. The peak
+/// keeps the other forty-four bits, which is 17.6 TB. Both saturate rather
+/// than wrap: a figure pinned at its ceiling is wrong by a knowable amount,
+/// where a wrapped one is wrong by everything.
+const PEAK_LARGE_BITS: u32 = 20;
+const PEAK_LARGE_CEIL: u64 = (1 << PEAK_LARGE_BITS) - 1;
+const PEAK_BYTES_CEIL: u64 = u64::MAX >> PEAK_LARGE_BITS;
+
+/// The high-water mark out of a [`PEAK`] word.
+#[inline]
+const fn peak_bytes_of(packed: u64) -> u64 {
+    packed >> PEAK_LARGE_BITS
+}
+
+/// The companion out of a [`PEAK`] word: large blocks live when it was set.
+#[inline]
+const fn peak_large_of(packed: u64) -> u64 {
+    packed & PEAK_LARGE_CEIL
+}
+
+/// One [`PEAK`] word from a peak and the companion that belongs to it.
+#[inline]
+const fn pack_peak(bytes: u64, large: u64) -> u64 {
+    let bytes = if bytes > PEAK_BYTES_CEIL {
+        PEAK_BYTES_CEIL
+    } else {
+        bytes
+    };
+    let large = if large > PEAK_LARGE_CEIL {
+        PEAK_LARGE_CEIL
+    } else {
+        large
+    };
+    (bytes << PEAK_LARGE_BITS) | large
+}
 
 /// A granted block of `bytes` came into being.
 ///
@@ -165,24 +214,55 @@ fn granted(bytes: usize) {
     note_large_grant(bytes);
     let live = live_from(LIVE.fetch_add(bytes as i64, Relaxed) + bytes as i64);
     // **A load guards the maximum, and the guard is not an approximation of
-    // it.** `fetch_max` is idempotent: where the peak already stands at or
-    // above this figure it writes the value back unchanged — and on x86-64
-    // there is no locked max, so that is a `lock cmpxchg` STORE to a line
-    // every thread's allocator shares, on every allocation, after the peak
-    // has stopped moving. The load short-circuits exactly the calls that
-    // would have changed nothing, so the result is the same maximum with the
-    // straight line carrying no locked instruction at all. A peer raising the
-    // peak between the load and the `fetch_max` is why the `fetch_max` is
-    // still there.
-    //
-    // **The companion is stored only on an ADVANCE.** A peak is monotone, so
-    // "the peak moved" is rare by construction — which is what makes it
-    // affordable to record what the peak was MADE OF at the instant it was
-    // set, rather than leaving a reader to infer it from a level sampled at
-    // some other time.
-    if PEAK.load(Relaxed) < live && PEAK.fetch_max(live, Relaxed) < live {
-        PEAK_LARGE.store(LIVE_LARGE.load(Relaxed), Relaxed);
+    // it.** Raising the peak is a read-modify-write on a line every thread's
+    // allocator shares, and after warm-up it would change nothing: a peak is
+    // monotone, so "the peak moved" is rare by construction. The load
+    // short-circuits exactly the calls that would have written the value
+    // back unchanged, so the straight line carries no locked instruction at
+    // all and the advance itself is out of line below.
+    if peak_bytes_of(PEAK.load(Relaxed)) < live {
+        raise_peak(live);
     }
+}
+
+/// **Publish a new peak AND what it was made of, in one word.**
+///
+/// The companion was a second static with a store of its own until
+/// 2026-09-09, and two stores are not one publication: a thread preempted
+/// between raising the peak and storing its companion resumes long after some
+/// other grant has taken a far higher peak, and lands a companion describing
+/// a heap that is gone. Forced with a handshake — a peer parked mid-`granted`
+/// having raised the peak by a few hundred KiB with no large block live, a
+/// 64 MiB block taken and released, then the peer let go — the companion of a
+/// 67,122,266 B peak read `0` where the block that set it was one of one.
+/// **The failure direction is downward**, which is exactly the shape a reader
+/// takes as evidence that the peak was set when almost nothing was live.
+///
+/// One `compare_exchange` publishes both, so the pair can never disagree: a
+/// stale thread's exchange fails, it re-reads a peak already above its own,
+/// and it writes nothing. The companion is loaded inside the loop, so it is
+/// the level as close to the winning exchange as a separate counter can be.
+#[cold]
+#[inline(never)]
+fn raise_peak(live: u64) {
+    raise_peak_from(PEAK.load(Relaxed), live);
+}
+
+/// [`raise_peak`] from a caller-supplied view of [`PEAK`], answering whether
+/// it published.
+///
+/// Split out so a test can hand it a view the world has already moved past —
+/// which is the whole defect, and the one thing a schedule cannot be relied
+/// on to produce.
+fn raise_peak_from(mut seen: u64, live: u64) -> bool {
+    while peak_bytes_of(seen) < live {
+        let next = pack_peak(live, LIVE_LARGE.load(Relaxed));
+        match PEAK.compare_exchange_weak(seen, next, Relaxed, Relaxed) {
+            Ok(_) => return true,
+            Err(again) => seen = again,
+        }
+    }
+    false
 }
 
 /// **What a running total of [`LIVE`] means as a live figure**, and the one
@@ -206,6 +286,17 @@ fn live_from(running: i64) -> u64 {
 #[inline(never)]
 fn note_unmatched_free() {
     UNMATCHED.fetch_add(1, Relaxed);
+    UNMATCHED_HERE.with(|n| n.set(n.get() + 1));
+}
+
+thread_local! {
+    /// [`UNMATCHED`] **for the calling thread alone**.
+    ///
+    /// Const-initialised and `Copy`, so reaching it is a TLS address and a
+    /// load with no lazy initialiser and no destructor — which is the
+    /// requirement, not an economy: this is read from inside the global
+    /// allocator, where a lazy init that allocated would re-enter it.
+    static UNMATCHED_HERE: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
 }
 
 /// **Frees counted against blocks this counter never granted.** Zero on a
@@ -214,6 +305,24 @@ fn note_unmatched_free() {
 /// than measured.
 pub fn unmatched_frees() -> u64 {
     UNMATCHED.load(Relaxed)
+}
+
+/// **Unmatched frees counted on the CALLING THREAD**, which is the figure a
+/// caller can take a delta of.
+///
+/// [`unmatched_frees`] is the process's, and a process-wide total is the
+/// right thing to *report*: an accounting bug is a property of the tree, not
+/// of whichever thread happened to meet it. It is the wrong thing to take an
+/// exact delta of, because any other thread can move it inside the window —
+/// which is how a correct tree red-gated peers under load on 2026-09-09, one
+/// test bracketing its own four allocator arms while a sibling test in the
+/// same binary drove the clamp twice on purpose.
+///
+/// This one is only ever moved by the thread reading it, so a delta over it
+/// attributes: it says *these* operations produced an unmatched free, where
+/// the process figure can only say somebody's did.
+pub fn unmatched_frees_here() -> u64 {
+    UNMATCHED_HERE.with(core::cell::Cell::get)
 }
 
 /// The smallest grant [`note_large_grant`] records.
@@ -259,16 +368,6 @@ static LARGE_MAX: [AtomicU64; LARGE_GRANT_BUCKETS] =
 /// Blocks at or above [`LARGE_GRANT_FLOOR`] that are live **right now**. A
 /// level, unlike the three histogram arrays, which are cumulative flow.
 static LIVE_LARGE: AtomicU64 = AtomicU64::new(0);
-
-/// [`LIVE_LARGE`] **at the instant [`PEAK`] was last set** — what the peak was
-/// made of, not what is live now.
-///
-/// Stored only when the peak advances, which is rare after warm-up. That is
-/// the whole design: a reader asking "the peak was 880 MiB — of what?" gets
-/// an answer taken at the peak rather than one sampled later, when the
-/// transients that set it are long gone. Sampling this on a tick would answer
-/// a different question and look like the same one.
-static PEAK_LARGE: AtomicU64 = AtomicU64::new(0);
 
 /// Which bucket `bytes` falls in, or `None` below [`LARGE_GRANT_FLOOR`].
 ///
@@ -358,9 +457,20 @@ pub fn large_grant(idx: usize) -> Option<LargeGrant> {
 /// is one of these two terms, and which one decides whether any residency
 /// lever in this tree can reach the death at all.
 pub fn live_peak_bytes() -> Option<u64> {
+    live_peak().map(|(bytes, _)| bytes)
+}
+
+/// **The peak and its companion out of ONE load** — the pair as it was
+/// published, never two figures read at two instants.
+///
+/// A caller that wants both wants them consistent: `live_peak_bytes()`
+/// followed by `live_peak_large_blocks()` is two loads with an advance able
+/// to land between them, which reports a new peak beside the old peak's
+/// composition. They live in one word precisely so this can be one load.
+pub fn live_peak() -> Option<(u64, u64)> {
     match PEAK.load(Relaxed) {
         0 => None,
-        peak => Some(peak),
+        packed => Some((peak_bytes_of(packed), peak_large_of(packed))),
     }
 }
 
@@ -369,10 +479,12 @@ pub fn live_peak_bytes() -> Option<u64> {
 ///
 /// Answers "the peak was 880 MiB and N large blocks were live" directly,
 /// where a level read on a tick can only answer it by inference and would be
-/// answering about a different instant. Taken at the peak, stored on the
-/// advance; see [`PEAK_LARGE`].
+/// answering about a different instant. Taken at the peak and published with
+/// it in the same word; see [`raise_peak`]. A caller that wants both figures
+/// should take [`live_peak`] rather than this and [`live_peak_bytes`], which
+/// are two loads.
 pub fn live_peak_large_blocks() -> u64 {
-    PEAK_LARGE.load(Relaxed)
+    peak_large_of(PEAK.load(Relaxed))
 }
 
 /// Blocks over [`LARGE_GRANT_FLOOR`] live right now — the level
@@ -503,38 +615,67 @@ mod tests {
     /// ran together. Anything that has to allocate belongs in this function.
     /// The bucketing arithmetic is tested separately because it allocates
     /// nothing.
+    ///
+    /// **And bundling did not buy exclusivity, which is why every reading
+    /// below is a bound or a figure only this thread moves.** The libtest
+    /// harness allocates and frees on its own threads throughout, and the
+    /// clamp test below drives `UNMATCHED` twice on purpose without
+    /// allocating a byte. At 4f68f77e9 this function failed 122 times in 300
+    /// runs at loadavg 51 while passing every time on a quiet box. A test
+    /// that has to be alone in a process is a test that will be red the day
+    /// somebody else is busy.
     #[test]
     fn one_block_moves_live_the_peak_and_the_histogram_and_a_refusal_moves_none() {
         let before = live_bytes().expect("this binary installed the counter, so it has counted");
 
         // `vec![0u8; N]` arrives through `alloc_zeroed`, so this also shows
-        // that arm counts. `SLACK` is for what the harness itself frees
-        // between the two reads (a first run measured 24 B of it): the block
-        // must account for all but a few KiB of the rise.
-        const SLACK: u64 = 64 << 10;
+        // that arm counts.
+        //
+        // **`SLACK` is a MEASURED noise floor, not a few KiB of politeness.**
+        // Every figure below is a level this whole process shares, and the
+        // libtest harness on the other threads allocates and frees against it
+        // throughout. At 64 KiB — a first quiet run measured 24 B of drift and
+        // the bound was set from that — this reddened a correct tree 12 times
+        // in 300 runs at loadavg 32 on 2026-09-09, on a harness release of
+        // 68,691 B. One mebibyte is fifteen times the drift measured under
+        // load, and it is still far under everything these bounds exist to
+        // catch: the smallest arm below is 3 MiB, a return counted without its
+        // grant moved the level 8.9 MiB when it was tampered in, and the block
+        // above is 64 MiB. Widening it costs no defect this suite can name.
+        const SLACK: u64 = 1 << 20;
         let bucket = large_grant_bucket(BLOCK).expect("64 MiB is over the floor");
         let filed_before = large_grant(bucket).expect("in range");
-        let peak_before = live_peak_bytes().expect("still counting");
+        let (peak_before, _) = live_peak().expect("still counting");
         let live_large_before = live_large_blocks();
         let block = vec![0u8; BLOCK];
         let held = live_bytes().expect("still counting");
-        let peak_held = live_peak_bytes().expect("still counting");
+        // **The peak and its companion, in ONE load.** Two loads report a new
+        // peak beside the previous peak's composition; and read late, the
+        // companion answers about whatever peak was standing by then rather
+        // than about this one.
+        let (peak_held, large_at_peak) = live_peak().expect("still counting");
         let filed_held = large_grant(bucket).expect("in range");
         assert!(
             held + SLACK >= before + BLOCK as u64,
             "a {BLOCK} B grant moved live bytes from {before} to {held}"
         );
 
-        // **The peak is taken at the GRANT, so it is already at or above the
-        // live figure read beside it.** A peak driven by any sampler instead
-        // would still be wherever it stood before this block existed, and a
-        // block that lives less than a sample interval — which is the entire
-        // class this instrument was built for — would never appear in it.
+        // **A BOUND on where the peak got to, not a comparison against a live
+        // figure read beside it.** `peak >= live` is not a statable property
+        // across threads: a peer's grant raises `LIVE` and publishes its peak
+        // as two steps, so a reader between them sees a live figure above the
+        // standing peak by whatever that peer just took. Measured 2026-09-09,
+        // that read 67,152,416 B live against a 67,152,415 B peak — one byte,
+        // and a red board. What discriminates the defect needs no such
+        // comparison: a peak driven by a SAMPLER would still be at
+        // `peak_before` (tens of KiB) because this block lives far less than
+        // any sample interval, and peers can only push a peak up, so a lower
+        // bound is immune to them.
         assert!(
-            peak_held >= held,
-            "the peak is {peak_held} B against a live figure of {held} B taken \
-             beside it: a peak below the heap it is a peak of was not taken at \
-             the grant"
+            peak_held + SLACK >= before + BLOCK as u64,
+            "the peak reached {peak_held} B over a {BLOCK} B block taken on a \
+             heap of {before} B: a peak that did not rise with this grant was \
+             not taken at the grant"
         );
 
         // **And the block is filed by SIZE**, so the histogram can say which
@@ -570,10 +711,13 @@ mod tests {
         // **A high-water mark does not go down.** The fall above is real —
         // the assertion before this one requires it — so this is the peak
         // holding through a fall it observed, not through a `drop` the
-        // optimiser removed.
+        // optimiser removed. Monotonicity alone: `peak_after >= after` was the
+        // same unstatable cross-thread comparison as the one above, and it
+        // said nothing this does not — `peak_after` is a 64 MiB peak and
+        // `after` is the heap without the block.
         let peak_after = live_peak_bytes().expect("still counting");
         assert!(
-            peak_after >= peak_held && peak_after >= after,
+            peak_after >= peak_held,
             "the peak went {peak_held} -> {peak_after} B across a free that \
              took live to {after} B"
         );
@@ -604,11 +748,10 @@ mod tests {
         // was live at some other time — usually nothing.
         if peak_held > peak_before {
             assert!(
-                live_peak_large_blocks() >= 1,
+                large_at_peak >= 1,
                 "the peak advanced from {peak_before} to {peak_held} B while a \
-                 {BLOCK} B block was live, and the companion says {} large \
-                 blocks were live at that instant",
-                live_peak_large_blocks(),
+                 {BLOCK} B block was live, and the companion says \
+                 {large_at_peak} large blocks were live at that instant",
             );
         }
         // Within one block of where it started: what the harness itself
@@ -624,13 +767,18 @@ mod tests {
         // negative, and the one a single counter does not by itself rule out —
         // a `realloc` filing a return and a grant that do not match, or a
         // `dealloc` carrying a layout `alloc` was never given. Both halves are
-        // asserted: `unmatched_frees` catches an imbalance that drives the
-        // total through zero, and the level catches one that does not.
+        // asserted: `unmatched_frees_here` catches an imbalance that drives
+        // the total through zero, and the level catches one that does not.
         //
         // In this function rather than a test of its own, for the reason the
         // doc comment above gives: it reads a process-global LEVEL, and a
         // second test allocating beside it would be reading this one's block.
-        let unmatched_before = unmatched_frees();
+        // **The thread's own unmatched count, not the process's.** The four
+        // arms below are this thread's, so what has to be zero is what THIS
+        // thread produced; `unmatched_frees()` is moved on purpose by the
+        // clamp test in this same binary, and an exact delta over it red-gated
+        // a correct tree 7 times in 200 runs under load on 2026-09-09.
+        let unmatched_before = unmatched_frees_here();
         let level_before = live_bytes().expect("still counting");
         let mut grown: Vec<u8> = Vec::with_capacity(3 << 20);
         grown.resize(3 << 20, 1);
@@ -640,7 +788,7 @@ mod tests {
         drop(vec![0u8; 5 << 20]); // `alloc_zeroed`
         let level_after = live_bytes().expect("still counting");
         assert_eq!(
-            unmatched_frees(),
+            unmatched_frees_here(),
             unmatched_before,
             "a grow, a shrink, a zeroed block and their frees left the running \
              total below zero, so the four arms do not balance"
@@ -767,8 +915,12 @@ mod tests {
     /// which is the excess below.
     ///
     /// It allocates nothing and touches neither [`PEAK`] nor the histogram,
-    /// so it does not race the workload test above; [`UNMATCHED`] is read as
-    /// a delta for the same reason.
+    /// so it does not race the workload test above on those. It DID race it on
+    /// [`UNMATCHED`]: a delta over a process-global is not private just
+    /// because it is a delta, and this test drives the clamp twice on purpose
+    /// while the test above brackets its own allocator arms with the same
+    /// reading. Both now take [`unmatched_frees_here`], which only the reading
+    /// thread moves.
     ///
     /// **Both halves are asserted.** That the clamp answers zero — a
     /// `running as u64` spelling answers `18446744065216086016` here and the
@@ -779,7 +931,8 @@ mod tests {
     fn a_running_total_below_zero_can_never_become_the_peak() {
         // The real leg's excess: 2^64 - 17592186044407.9 MiB, to the MiB.
         const EXCESS: i64 = -(8 << 20);
-        let before = unmatched_frees();
+        let before = unmatched_frees_here();
+        let process_before = unmatched_frees();
         assert_eq!(
             live_from(EXCESS),
             0,
@@ -791,9 +944,18 @@ mod tests {
             "the clamp is not total over the counter's own range"
         );
         assert_eq!(
-            unmatched_frees(),
+            unmatched_frees_here(),
             before + 2,
             "two negative running totals were floored and neither was counted,              so a real unmatched free would floor silently"
+        );
+        // The process figure is what gets REPORTED, so it has to move too --
+        // as a bound, because it is everyone's.
+        assert!(
+            unmatched_frees() >= process_before + 2,
+            "the thread counted two floored totals and the process figure went \
+             {process_before} -> {}, so the two counters are not fed by the \
+             same call",
+            unmatched_frees(),
         );
         // Zero cannot advance a maximum, which is the second half of "can
         // never become the peak": the clamp's answer is below every peak
@@ -802,6 +964,78 @@ mod tests {
             live_peak_bytes().is_none_or(|peak| peak >= live_from(EXCESS)),
             "the floored figure is above the peak it would be compared against"
         );
+    }
+
+    /// **A thread whose view of the peak is stale publishes NOTHING**, which
+    /// is the property a companion in a second static did not have.
+    ///
+    /// The defect this pins: `PEAK.fetch_max` authorised the advance and a
+    /// separate `PEAK_LARGE.store` carried the companion, so a thread
+    /// preempted between them resumed after some other grant had taken a far
+    /// higher peak and stored a companion describing a heap that was gone.
+    /// Forced with a handshake on 2026-09-09 — a peer parked between the two
+    /// with no large block live, a 64 MiB block taken and released, then the
+    /// peer let go — the companion of a 67,122,266 B peak read `0` where the
+    /// block that set it was one of one. **Downward**, which is the shape a
+    /// reader takes as proof the peak was set when almost nothing was live.
+    ///
+    /// It is asserted here rather than by a schedule because a schedule is
+    /// exactly what cannot be relied on: the natural reproduction was 3 runs
+    /// in 200 of a loaded box, and a pin that red-gates 1.5% of the time is
+    /// the defect this suite is being repaired for.
+    ///
+    /// Allocates nothing and can only be run against a peak this binary has
+    /// already stood up, so it does not race the workload test.
+    #[test]
+    fn a_stale_view_of_the_peak_publishes_no_companion() {
+        let standing = live_peak_bytes().expect("this binary installed the counter");
+        // A view from before anything real was allocated, and a live figure
+        // far under the standing peak: this call must not touch `PEAK`.
+        let stale = pack_peak(1 << 10, 0);
+        assert!(
+            !raise_peak_from(stale, 1 << 11),
+            "a caller holding a {stale:#x} view of a peak standing at \
+             {standing} B published anyway"
+        );
+        // The peak is monotone and nothing above lowered it, so this holds
+        // whatever else this binary is doing on other threads.
+        assert!(
+            live_peak_bytes().is_none_or(|now| now >= standing),
+            "the peak fell from {standing} B"
+        );
+    }
+
+    /// The peak and its companion share a word, so the split has to be exact
+    /// in the range it claims and saturating outside it — a wrap here writes
+    /// a companion into the peak's bits.
+    #[test]
+    fn the_peak_word_carries_both_figures_and_saturates_rather_than_wrapping() {
+        for (bytes, large) in [
+            (0u64, 0u64),
+            (1, 1),
+            (880 << 20, 17),
+            (PEAK_BYTES_CEIL, PEAK_LARGE_CEIL),
+        ] {
+            let packed = pack_peak(bytes, large);
+            assert_eq!(
+                (peak_bytes_of(packed), peak_large_of(packed)),
+                (bytes, large),
+                "{bytes} B with {large} large blocks packed to {packed:#x}",
+            );
+        }
+        // Above either ceiling the figure pins there and does NOT carry into
+        // the other field.
+        let over = pack_peak(PEAK_BYTES_CEIL + 9, PEAK_LARGE_CEIL + 9);
+        assert_eq!(
+            (peak_bytes_of(over), peak_large_of(over)),
+            (PEAK_BYTES_CEIL, PEAK_LARGE_CEIL),
+            "a peak and a companion past their ceilings did not saturate",
+        );
+        // The sentinel: only a peak of zero bytes with no large block gives a
+        // zero word, which is what `live_peak` answers `None` on.
+        assert_eq!(pack_peak(0, 0), 0);
+        assert_ne!(pack_peak(0, 1), 0);
+        assert_ne!(pack_peak(1, 0), 0);
     }
 
     /// The counter type is a zero-sized unit that a binary can name as a
