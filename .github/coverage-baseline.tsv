@@ -8,11 +8,11 @@ nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
 squallar-alloc/src/lib.rs	170	162
 squallar-alloc/src/process.rs	167	165
-squallar-app/src/app.rs	1903	1394
+squallar-app/src/app.rs	1904	1395
 squallar-app/src/app_chunks.rs	238	123
 squallar-app/src/app_fetch.rs	2187	1641
 squallar-app/src/app_offline.rs	31	30
-squallar-app/src/app_render.rs	4776	4050
+squallar-app/src/app_render.rs	4790	4053
 squallar-app/src/app_state.rs	77	0
 squallar-app/src/budget_arms.rs	17	17
 squallar-app/src/budget_memo.rs	52	52
@@ -86,9 +86,9 @@ squallar-egui/src/input_fidelity.rs	141	141
 squallar-egui/src/input_harness.rs	1539	1529
 squallar-egui/src/label_cache.rs	114	114
 squallar-egui/src/legend_ramp.rs	179	179
-squallar-egui/src/overlay_cache.rs	547	528
-squallar-egui/src/overlay_cache/ledger.rs	150	133
-squallar-egui/src/pane.rs	1810	1748
+squallar-egui/src/overlay_cache.rs	567	548
+squallar-egui/src/overlay_cache/ledger.rs	153	136
+squallar-egui/src/pane.rs	1807	1745
 squallar-egui/src/pane/layer_stack.rs	172	163
 squallar-egui/src/pane_content.rs	242	229
 squallar-egui/src/parity_walk.rs	344	302
@@ -104,7 +104,7 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	352	313
 squallar-egui/src/tile_mesh/ledger.rs	98	64
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	1597	1537
+squallar-egui/src/tile_source.rs	1597	1532
 squallar-egui/src/tile_source/byte_lru.rs	272	271
 squallar-egui/src/tile_source/cache_ledger.rs	181	165
 squallar-egui/src/tile_source/snap.rs	157	157
@@ -124,7 +124,7 @@ squallar-egui/src/ui_inspector/probe_only_ratchet.rs	56	49
 squallar-egui/src/ui_layout.rs	257	257
 squallar-egui/src/ui_map.rs	2290	2190
 squallar-egui/src/ui_map_overlays.rs	2196	2127
-squallar-egui/src/ui_map_pane.rs	2374	2268
+squallar-egui/src/ui_map_pane.rs	2379	2273
 squallar-egui/src/ui_menu.rs	416	382
 squallar-egui/src/ui_offline_areas.rs	201	155
 squallar-egui/src/ui_pills.rs	1027	985
@@ -134,7 +134,7 @@ squallar-egui/src/ui_section_edit.rs	376	365
 squallar-egui/src/ui_section_pane.rs	754	727
 squallar-egui/src/ui_section_pane/owned_text_ratchet.rs	53	50
 squallar-egui/src/ui_settings.rs	806	729
-squallar-egui/src/ui_sheet.rs	550	524
+squallar-egui/src/ui_sheet.rs	550	525
 squallar-egui/src/ui_shell.rs	290	285
 squallar-egui/src/ui_stack.rs	522	485
 squallar-egui/src/ui_statusbar.rs	384	371
@@ -165,8 +165,8 @@ squallar-gpu/src/egui_renderer/texture_upload/resident.rs	47	47
 squallar-gpu/src/gpu_probe.rs	148	6
 squallar-gpu/src/lib.rs	1	0
 squallar-gpu/src/pressure.rs	18	18
-squallar-gpu/src/radar_fan.rs	748	256
-squallar-gpu/src/radar_fan/chain_staging.rs	271	98
+squallar-gpu/src/radar_fan.rs	824	290
+squallar-gpu/src/radar_fan/chain_staging.rs	273	100
 squallar-gpu/src/staging_ring.rs	232	128
 squallar-gpu/src/tile_mesh.rs	453	55
 squallar-icon/src/lib.rs	213	198
@@ -239,7 +239,7 @@ squallar-overlays/src/render/handlers/labels.rs	76	58
 squallar-overlays/src/render/handlers/location.rs	76	58
 squallar-overlays/src/render/handlers/metar.rs	637	522
 squallar-overlays/src/render/handlers/mod.rs	169	167
-squallar-overlays/src/render/handlers/model.rs	2751	2583
+squallar-overlays/src/render/handlers/model.rs	2751	2585
 squallar-overlays/src/render/handlers/mrms.rs	674	604
 squallar-overlays/src/render/handlers/outlook.rs	1676	1620
 squallar-overlays/src/render/handlers/reports.rs	751	683
@@ -248,7 +248,7 @@ squallar-overlays/src/render/hatch.rs	279	275
 squallar-overlays/src/render/jobs.rs	2257	2155
 squallar-overlays/src/render/overlay_state.rs	937	865
 squallar-overlays/src/render/raster_buf.rs	78	70
-squallar-overlays/src/render/rasterize.rs	1449	1356
+squallar-overlays/src/render/rasterize.rs	1548	1464
 squallar-overlays/src/render/rasterize/gridded_ledger.rs	39	39
 squallar-overlays/src/render/rasterize/lambert_fixture.rs	116	116
 squallar-overlays/src/render/signature_memo.rs	271	270
