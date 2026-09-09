@@ -352,6 +352,23 @@ fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
 /// **The name matters.** This box carries both a discrete adapter and a
 /// software one, and a figure read off the wrong one is a different reading.
 fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
+    device_with(wgpu::Features::empty())
+}
+
+/// [`device`] with the staging ring's feature where the adapter has it.
+///
+/// The suite's ordinary device asks for nothing, so
+/// `radar_fan::chain_staging::available` reads `false` on it and the staged
+/// upload route is unreachable — a suite that never drives half the code it
+/// covers. Asked for separately rather than added to `device` because every
+/// other test here is about a picture and not about a route, and a device
+/// carrying a feature they do not use is a difference between what they run on
+/// and what CI's other rows run on.
+fn device_with_ring() -> Option<(wgpu::Device, wgpu::Queue)> {
+    device_with(squallar_gpu::staging_ring::STAGING_RING_FEATURE)
+}
+
+fn device_with(extra: wgpu::Features) -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance =
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -370,7 +387,7 @@ fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     });
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("radar-fan"),
-        required_features: wgpu::Features::empty(),
+        required_features: adapter.features() & extra,
         required_limits: adapter.limits(),
         memory_hints: wgpu::MemoryHints::default(),
         experimental_features: wgpu::ExperimentalFeatures::default(),
@@ -1792,5 +1809,238 @@ fn the_mip_level_is_chosen_by_the_pixel_footprint() {
          chain; the first is what the rest are downstream of:\n{}",
         raised.len(),
         raised.join("\n"),
+    );
+}
+
+/// **The staged chain upload draws the picture the window upload draws, at
+/// every level of the chain and for every sweep of a pass.**
+///
+/// `RadarFanStore::ensure` used to write the whole mip chain with
+/// `queue.write_texture` inside `egui_wgpu`'s `prepare`, which runs on the
+/// frame thread: a blocking host store per byte through the card's BAR window,
+/// once per sweep that becomes resident, and a frame may carry six.
+/// `radar_fan::chain_staging` files the sweeps instead and moves the pass out
+/// of one cached-memory staging slot with the copy engine, which is what
+/// `egui_renderer::texture_upload` does for egui's own rasters.
+///
+/// A buffer-to-texture copy reads at a stride held to
+/// `COPY_BYTES_PER_ROW_ALIGNMENT` where `write_texture` repacks internally, so
+/// the staged route pads every row and every level begins at its own offset in
+/// the slot. **That padding is the whole of what can be wrong here**, and it is
+/// wrong per level and per sweep: a level read at another level's stride is a
+/// radar picture whose every radial is sheared along the beam, and a second
+/// sweep laid at the first's offset is one pane drawing another pane's codes.
+///
+/// # What an input needs for this to reach that
+///
+/// Three properties, asserted below rather than assumed:
+///
+/// * **more than one mip level** — the suite's long-standing fixture is one
+///   level, where there is no second offset to get wrong at all;
+/// * **a level-0 row that is not already a multiple of the alignment** — where
+///   it is, padding is the identity and the staged route and the window route
+///   agree for free;
+/// * **more than one sweep in the pass** — one sweep's regions all begin at
+///   zero however the accumulation is spelled.
+///
+/// The under sweep is a constant code at every level, so a top sweep read out
+/// of the wrong region of the slot reads *that* rather than something merely
+/// different; and it is drawn first, so its own size is what places the sweep
+/// every assertion below is about.
+///
+/// TAMPER: hand `copy_buffer_to_texture` `row_bytes` instead of `padded_row`,
+/// or lay every sweep at offset 0, and the level rows go red. Feed both runs
+/// the same route and the two-route assertion goes red instead — which is the
+/// control that says the comparison is between two routes and not one run
+/// against itself.
+#[test]
+#[ignore = "needs a real wgpu adapter"]
+fn the_two_chain_upload_routes_draw_the_same_picture() {
+    let _serialised = gpu_lock();
+    let Some((device, queue)) = device_with_ring() else {
+        eprintln!("SKIPPED: no wgpu adapter");
+        return;
+    };
+    if !squallar_gpu::radar_fan::chain_staging::available(&device) {
+        eprintln!("SKIPPED: adapter has no MAPPABLE_PRIMARY_BUFFERS");
+        return;
+    }
+    // Every validation error the device raises, kept: a refused copy is a
+    // device error and not a wrong pixel, and what a running app shows for one
+    // is a log flood beside a pane with no radar.
+    let errors: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&errors);
+    device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
+        sink.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(format!("{e}"));
+    }));
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let lut = opaque_lut();
+
+    let levels = squallar_radar::render::codes::full_mip_levels(RADIALS, GATES);
+    assert!(
+        levels > 1,
+        "a one-level chain has no second level to place, so this suite would \
+         pass whatever the offsets were"
+    );
+    assert_ne!(
+        GATES % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize,
+        0,
+        "a fixture whose level-0 row is already aligned makes the padding an \
+         identity and the two routes agree for free"
+    );
+
+    /// The under sweep's code, at every level. Outside [`code_at`]'s range and
+    /// outside the per-level constants below, so reading it anywhere is
+    /// unambiguous.
+    const UNDER: u8 = 1;
+    /// Radials the top sweep draws. The rest of the circle is the under
+    /// sweep's.
+    const HALF: usize = RADIALS / 2;
+    let under = Arc::new(payload(
+        RADIALS,
+        GATES,
+        vec![UNDER; chain_bytes(RADIALS, GATES, levels)],
+        levels,
+        lut.clone(),
+        one_degree_edges(),
+        geometry(None),
+    ));
+
+    // Level 0 varies with both axes, so a sheared row is a different colour at
+    // almost every pixel; every deeper level is a constant of its own, so the
+    // level the view selects is readable without a second mirror.
+    let mut codes = plane_codes();
+    for level in 1..levels {
+        let cells = level_extent(RADIALS, level) * level_extent(GATES, level);
+        codes.extend(std::iter::repeat_n(40u8 + level as u8, cells));
+    }
+    // **The top sweep draws over half the circle and no more**, so the sweep
+    // beneath it is visible rather than merely present. Without that, two
+    // sweeps laid at one offset would still draw correctly — the second
+    // written wins the bytes and the first is invisible under it — and the
+    // whole per-sweep half of this suite would be an identity.
+    let half: Vec<[f32; 2]> = one_degree_edges()
+        .into_iter()
+        .enumerate()
+        .map(|(radial, edge)| if radial < HALF { edge } else { [0.0, 0.0] })
+        .collect();
+    let over = Arc::new(payload(
+        RADIALS,
+        GATES,
+        codes,
+        levels,
+        lut.clone(),
+        half,
+        geometry(None),
+    ));
+    for sweep in [&under, &over] {
+        assert!(sweep.is_well_formed(), "the fixture describes itself");
+        admit(sweep).expect("the fixture is inside every cap");
+    }
+    let carried = 2 * (chain_bytes(RADIALS, GATES, levels) + POLAR_LUT_BYTES) as u64;
+
+    // `gate_interval_km` is 1 km here, so `km_per_px` names the level:
+    // floor(log2(km_per_px)).
+    for (km_per_px, level) in [
+        (1.0f32, 0usize),
+        (2.0, 1),
+        (4.0, 2),
+        (8.0, 3),
+        (16.0, 4),
+        (32.0, 5),
+        (64.0, 6),
+        (128.0, 7),
+        (256.0, 8),
+    ] {
+        let mut at_zoom = view(1.0);
+        at_zoom.km_per_pt = km_per_px;
+        let mut shots = Vec::new();
+        for staged in [true, false] {
+            let store = RadarFanStore::with_staging(&device, attachments(format), staged);
+            let (pixels, renderer) = frame(
+                &device,
+                &queue,
+                Some(store),
+                format,
+                wgpu::Color::TRANSPARENT,
+                vec![
+                    RadarFanCallback::new(vec![Arc::clone(&under), Arc::clone(&over)], at_zoom, 1)
+                        .expect("two sweeps"),
+                ],
+            );
+            let totals = store_of(&renderer).chain_staging();
+            // One pass, both sweeps, one route — which is what says the two
+            // readbacks below really came from two different routes and not
+            // from one run compared with itself.
+            assert_eq!(
+                (totals.staged, totals.declined),
+                if staged { (1, 0) } else { (0, 1) },
+                "the store took the other route at km_per_px {km_per_px}, \
+                 staged={staged}"
+            );
+            assert_eq!(
+                totals.bytes,
+                if staged { carried } else { 0 },
+                "the ring carried something other than both chains and both \
+                 tables at km_per_px {km_per_px}"
+            );
+            shots.push(pixels);
+        }
+        assert_eq!(
+            shots[0], shots[1],
+            "the staged and window routes drew different pictures at \
+             km_per_px {km_per_px}"
+        );
+
+        // And the picture is the right one, not merely the same one twice.
+        let entry = |code: u8| {
+            let at = usize::from(code) * 4;
+            [lut[at], lut[at + 1], lut[at + 2], lut[at + 3]]
+        };
+        let (mut over_px, mut under_px) = (0usize, 0usize);
+        for py in 0..SIDE {
+            for px in 0..SIDE {
+                let Expect::Cell { radial, gate } = expect_at(px, py, None) else {
+                    continue;
+                };
+                let want = if radial < HALF {
+                    over_px += 1;
+                    if level == 0 {
+                        entry(code_at(radial, gate))
+                    } else {
+                        entry(40u8 + level as u8)
+                    }
+                } else {
+                    // The top sweep draws nothing over this half, so what is
+                    // on the glass is the sweep laid FIRST in the pass — and
+                    // it is one code at every level.
+                    under_px += 1;
+                    entry(UNDER)
+                };
+                assert_eq!(
+                    texel(&shots[0], px, py),
+                    want,
+                    "at km_per_px {km_per_px} the fan should be reading level \
+                     {level} of the {} sweep",
+                    if radial < HALF { "top" } else { "under" }
+                );
+            }
+        }
+        assert!(
+            over_px > 7_000 && under_px > 7_000,
+            "only {over_px} top and {under_px} under pixels were compared"
+        );
+    }
+
+    let raised = errors
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        raised.is_empty(),
+        "the device raised {} error(s) staging a chain: {}",
+        raised.len(),
+        raised.join("; ")
     );
 }

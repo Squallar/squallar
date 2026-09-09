@@ -60,6 +60,10 @@ use squallar_device_profile::constants::{
     MAX_POLAR_GATES, MAX_POLAR_RADIALS, POLAR_LUT_BYTES, POLAR_LUT_ENTRIES, full_mip_levels,
 };
 
+pub mod chain_staging;
+
+use chain_staging::{ChainStaging, ChainStagingTotals, Pending};
+
 /// **The payload this module draws** — `squallar_egui`'s, not one of its own.
 ///
 /// A type alias and never a second type. The plane is built off the frame
@@ -562,6 +566,9 @@ pub struct RadarFanStore {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     resident: HashMap<usize, Resident>,
+    /// The sweeps whose textures exist and whose bytes have not crossed yet,
+    /// and the ring they cross through. See [`chain_staging`].
+    staging: ChainStaging,
     resident_bytes: u64,
     uploads: u64,
     upload_bytes: u64,
@@ -585,7 +592,28 @@ pub struct RadarFanStore {
 impl RadarFanStore {
     /// Build the pipeline and the canonical mesh for a pass with these
     /// attachments.
+    ///
+    /// The chain upload route is the device's own answer —
+    /// [`chain_staging::available`] — so a build takes the ring where the
+    /// adapter has one and the window where it does not, with no `cfg` between
+    /// them.
     pub fn new(device: &wgpu::Device, attachments: crate::egui_renderer::AttachmentConfig) -> Self {
+        Self::with_staging(device, attachments, chain_staging::available(device))
+    }
+
+    /// [`Self::new`] with the chain upload route named rather than asked for.
+    ///
+    /// **Both values are production routes**: `false` is what every device
+    /// without [`crate::staging_ring::STAGING_RING_FEATURE`] takes, which is
+    /// all of the web. It is spelled out here so a suite on a device that has
+    /// a ring can draw the same sweep both ways and hold the two pictures
+    /// against each other, which is the only place the web arm's route can be
+    /// checked on this hardware.
+    pub fn with_staging(
+        device: &wgpu::Device,
+        attachments: crate::egui_renderer::AttachmentConfig,
+        staged: bool,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("radar fan"),
             source: wgpu::ShaderSource::Wgsl(RADAR_FAN_WGSL.into()),
@@ -758,6 +786,7 @@ impl RadarFanStore {
             vertices,
             indices,
             resident: HashMap::new(),
+            staging: ChainStaging::new(staged),
             resident_bytes: 0,
             uploads: 0,
             upload_bytes: 0,
@@ -830,37 +859,6 @@ impl RadarFanStore {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        for level in 0..levels {
-            let (Some(bytes), Some((r, g))) = (sweep.level(level), sweep.level_shape(level)) else {
-                // Unreachable through the bridge, which admits the chain
-                // length first. Skipped rather than asserted because this
-                // runs inside the renderer's prepare, where a panic takes the
-                // frame and every pane on it.
-                continue;
-            };
-            let (r, g) = (r as usize, g as usize);
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &codes,
-                    mip_level: level as u32,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                bytes,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    // Packed, not padded: `write_texture` repacks internally.
-                    bytes_per_row: Some(g as u32),
-                    rows_per_image: Some(r as u32),
-                },
-                wgpu::Extent3d {
-                    width: g as u32,
-                    height: r as u32,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
-
         let lut = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("radar fan lut"),
             size: wgpu::Extent3d {
@@ -880,20 +878,19 @@ impl RadarFanStore {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        queue.write_texture(
-            lut.as_image_copy(),
-            &sweep.lut_rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(POLAR_LUT_BYTES as u32),
-                rows_per_image: Some(1),
-            },
-            wgpu::Extent3d {
-                width: POLAR_LUT_ENTRIES as u32,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-        );
+
+        // **The chain and the table do not cross here.** Both textures are
+        // filed and the whole pass's filings move together out of one staging
+        // slot in `finish_prepare`, which runs after every callback's prepare
+        // and before the render pass. See [`chain_staging`] for what that
+        // buys and why one slot serves the pass rather than one serving a
+        // sweep.
+        self.staging.file(Pending {
+            sweep: Arc::clone(sweep),
+            codes: codes.clone(),
+            lut: lut.clone(),
+            levels,
+        });
 
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("radar fan sweep"),
@@ -1017,6 +1014,25 @@ impl RadarFanStore {
     /// per sweep lifetime, never per frame.
     pub fn uploads(&self) -> (u64, u64) {
         (self.uploads, self.upload_bytes)
+    }
+
+    /// Which route this store's chain uploads took. See
+    /// [`chain_staging::ChainStagingTotals`] for the denominator.
+    pub fn chain_staging(&self) -> ChainStagingTotals {
+        self.staging.totals()
+    }
+
+    /// Pinned host memory this store's staging ring is holding — zero until it
+    /// has uploaded a sweep, and zero for the life of a store on a device with
+    /// no ring.
+    pub fn staging_host_bytes(&self) -> usize {
+        self.staging.host_bytes()
+    }
+
+    /// **Move every sweep filed by this pass's prepares.** Once a pass, from
+    /// `finish_prepare`.
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.staging.drain(device, queue);
     }
 }
 
@@ -1154,14 +1170,20 @@ impl egui_wgpu::CallbackTrait for RadarFanCallback {
 
     fn finish_prepare(
         &self,
-        _device: &wgpu::Device,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         _egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         // Every callback of the pass is asked; the first finds the batch full
-        // and writes it, the rest find it empty.
+        // and the filings waiting, the rest find both empty.
+        //
+        // **Before any `paint`, which is what makes the deferral safe**:
+        // `egui_wgpu` runs every callback's `finish_prepare` after every
+        // `prepare` and before the render pass, so no sweep is ever drawn from
+        // a texture whose bytes are still on this side of the queue.
         if let Some(store) = callback_resources.get_mut::<RadarFanStore>() {
+            store.upload(device, queue);
             store.flush(queue);
         }
         Vec::new()
