@@ -2762,9 +2762,9 @@ impl Gui {
         self.panes.iter().any(PaneState::is_holding_raster)
     }
 
-    /// **How many more whole-picture overlay rasters this frame may ask for**,
-    /// for the whole application: the ceiling less what the visible panes
-    /// already have in the pipe.
+    /// **How many more BYTES of whole-picture overlay raster this frame may
+    /// ask for**, for the whole application: the ceiling less what the visible
+    /// panes already have in the pipe.
     ///
     /// # What this bounds that the per-cache door cannot
     ///
@@ -2775,8 +2775,13 @@ impl Gui {
     /// the aggregate IS the quantity, and each of its terms is a whole
     /// picture: 41.7 MB at a 2878x1651 pane, thirteen layers, one batch, and
     /// `squallar_gpu`'s band queue holding each of them whole until its last
-    /// band crosses. See
-    /// `squallar_device_profile::constants::MAX_OVERLAY_PICTURES_OUTSTANDING`.
+    /// band crosses.
+    ///
+    /// **The terms of that product are bytes, so the bound is too.** A count
+    /// of four pictures is 71.2 MiB at a 1920x1080 canvas and 170.1 MiB at a
+    /// 3440x1440 one, which is a bound on the display rather than on the pipe.
+    /// See
+    /// `squallar_device_profile::constants::MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING`.
     ///
     /// # The visible panes, and why a hidden one is not counted
     ///
@@ -2857,14 +2862,14 @@ impl Gui {
         (self.pane_count(), self.plan_view_pictures_outstanding())
     }
 
-    pub fn overlay_dispatch_budget(&self, pane_count: usize) -> usize {
-        let outstanding: usize = self
+    pub fn overlay_dispatch_budget(&self, pane_count: usize) -> u64 {
+        let outstanding = self
             .panes
             .iter()
             .take(pane_count)
-            .map(PaneState::overlay_pictures_outstanding)
-            .sum();
-        squallar_device_profile::constants::MAX_OVERLAY_PICTURES_OUTSTANDING
+            .map(PaneState::overlay_picture_bytes_outstanding)
+            .fold(0u64, u64::saturating_add);
+        squallar_device_profile::constants::MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING
             .saturating_sub(outstanding)
     }
 

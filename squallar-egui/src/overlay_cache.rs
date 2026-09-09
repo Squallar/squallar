@@ -335,6 +335,29 @@ pub struct OverlayTexturePlan {
 }
 
 impl OverlayTexturePlan {
+    /// **What a picture built to this plan costs on the host**, in bytes:
+    /// `width * height * 4`, the RGBA `egui::ColorImage` the rasterizer
+    /// returns and `squallar_gpu`'s band queue then holds whole until its last
+    /// band has crossed.
+    ///
+    /// The figure the application-wide dispatch door spends
+    /// (`squallar_device_profile::constants::MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING`),
+    /// and it is taken off the plan rather than re-derived from a rect: the
+    /// door is asked on the frame that planned the picture, so the size it
+    /// charges is the size that will be allocated, clamps to
+    /// `max_texture_side` included.
+    ///
+    /// `squallar_device_profile::fit::picture_bytes` is the same quantity
+    /// asked of the *budget's* description of a pane rather than of a planned
+    /// texture, and the two agree to the byte wherever the adapter's limit is
+    /// not binding — its own note says so, and says which way they part when
+    /// it is.
+    pub fn bytes(&self) -> u64 {
+        u64::from(self.width)
+            .saturating_mul(u64::from(self.height))
+            .saturating_mul(4)
+    }
+
     /// The geographic ground a texture built to this plan covers, when it is
     /// rasterised for `viewport`.
     pub fn coverage(&self, viewport: &GeoBounds) -> GeoBounds {
@@ -1068,6 +1091,22 @@ pub struct OverlayTextureCache {
     /// admitted exactly one dispatch per pane and layer whatever the device
     /// could afford; see [`RendersInFlight`] and [`RenderSlot`].
     pub renders: RendersInFlight,
+    /// **What the picture this cache last had dispatched was planned to
+    /// cost**, in host bytes — [`OverlayTexturePlan::bytes`] of the plan the
+    /// dispatch went out on.
+    ///
+    /// Read only while [`Self::renders`] still holds that dispatch, by
+    /// [`Self::outstanding_bytes`], which is the door's half of the aggregate
+    /// it bounds. A dispatch that has *arrived* is priced off the arrived
+    /// picture's own `width`/`height` instead and this is not consulted, so a
+    /// stale value cannot outlive the render it describes.
+    ///
+    /// **Not derived from the pane rect at read time.** The pane's rect on the
+    /// frame the door is asked is not the rect the outstanding render was
+    /// planned at — a resize is exactly when the two differ, and it is also
+    /// when the difference is largest — so the figure is carried from the
+    /// dispatch rather than re-taken.
+    planned_bytes: u64,
     /// The zoom [`Self::needs_rerender`] was asked about last time, which is
     /// how it notices the zoom moving and re-arms [`Self::settle_owed_frames`].
     last_seen_zoom: Option<f64>,
@@ -1141,6 +1180,7 @@ impl OverlayTextureCache {
             blank: None,
             hold_superseded: false,
             renders: RendersInFlight::default(),
+            planned_bytes: 0,
             last_seen_zoom: None,
             last_seen_token: None,
             // Full, so the first token this cache is ever asked about reads as
@@ -1255,6 +1295,40 @@ impl OverlayTextureCache {
 
     pub fn is_holding(&self) -> bool {
         self.held.is_some()
+    }
+
+    /// Say what the dispatch about to go out was planned to cost. Called by
+    /// the door that afforded it, on the plan it afforded. See
+    /// [`Self::planned_bytes`].
+    pub fn note_planned_bytes(&mut self, bytes: u64) {
+        self.planned_bytes = bytes;
+    }
+
+    /// **Host bytes this cache has occupying the overlay upload pipe** — a
+    /// whole picture dispatched and not yet arrived, plus a whole picture
+    /// arrived and not yet delivered to the GPU.
+    ///
+    /// The byte form of the two states
+    /// [`crate::pane::PaneState::overlay_picture_bytes_outstanding`]
+    /// describes, and they are **added** rather than taken as one: a cache
+    /// that is holding one picture while a second is being rasterized for it
+    /// has both resident, which is the state the arrival door creates every
+    /// time it re-asks under a hold.
+    ///
+    /// The held half is exact — the arrived picture's own `width x height x 4`
+    /// — and the in-flight half is the plan its dispatch went out on.
+    pub fn outstanding_bytes(&self) -> u64 {
+        let held = self.held.as_ref().map_or(0, |held| {
+            u64::from(held.data.width)
+                .saturating_mul(u64::from(held.data.height))
+                .saturating_mul(4)
+        });
+        let in_flight = if self.renders.holds(RenderSlot::WHOLE) {
+            self.planned_bytes
+        } else {
+            0
+        };
+        held.saturating_add(in_flight)
     }
 
     /// Take the held picture if `delivered` says its pixels have all landed.

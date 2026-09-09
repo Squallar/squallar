@@ -157,19 +157,30 @@ pub struct NeedTerms {
     /// arrival is one buffer for the whole application because one reply is
     /// converted at a time, and each pane's batch queues on its own.
     ///
-    /// **The steady state above is no longer the application's, and this term
-    /// is now an over-price rather than a reading.** The draw pass has an
-    /// application-wide door on it since 2026-09-08 --
-    /// [`crate::constants::MAX_OVERLAY_PICTURES_OUTSTANDING`], asked in
+    /// **The steady state above is no longer the DRAW PASS's, and this term is
+    /// an over-price against that path rather than a reading.** The draw pass
+    /// has an application-wide door on it since 2026-09-08, re-denominated in
+    /// bytes on 2026-09-09 --
+    /// [`crate::constants::MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING`], asked in
     /// `squallar_egui`'s `render_pane_map_content` beside the per-cache one --
-    /// so the pictures that can be in the pipe at once are four and not a
-    /// batch, whatever the pane count. **The arithmetic here is deliberately
-    /// left at a whole batch**: over-pricing a term sheds ladder rungs and
-    /// under-pricing one hands out memory the machine does not have, and
-    /// re-pricing this one moves which rungs every shipped device gets. That
-    /// is a ladder change with its own measurement, not a side effect of the
-    /// door. What must not survive is the *claim*: a whole batch queued is
-    /// what this term charges, and it is no longer what the application does.
+    /// so what that path can put in the pipe at once is 48 MiB and not a
+    /// batch, whatever the pane count or the canvas.
+    ///
+    /// **The arithmetic here is deliberately left at a whole batch, and the
+    /// door does not make it re-priceable.** The draw pass is not the only
+    /// producer: `App::arrived_overlay_asks` is a second door into the same
+    /// dispatch, it refuses only on this cache's own hold and on
+    /// `RendersInFlight::admits`, and it **never consults the aggregate
+    /// allowance at all**. So one arrival round can still put one whole
+    /// picture per pane and layer in flight — a batch — outside the byte
+    /// ceiling. Clamping this term to that ceiling would price a bound the
+    /// application does not have, and under-pricing here is a failed
+    /// allocation mid-session, which is worse than a refusal.
+    ///
+    /// Closing that second producer, and only then re-pricing this, is a
+    /// ladder change with its own measurement: over-pricing a term sheds
+    /// rungs, under-pricing one hands out memory the machine does not have,
+    /// and this one moves which rungs every shipped device gets.
     ///
     /// **What this term does NOT price, corrected 2026-09-07.** Until then
     /// the line above read "and this queue holds every band anyone has

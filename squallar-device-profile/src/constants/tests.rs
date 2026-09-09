@@ -1973,3 +1973,58 @@ fn the_price_weighs_the_plane_the_producer_actually_builds() {
         "the price's cap and the producer's refusal have come apart",
     );
 }
+
+/// **The outstanding ceiling is twelve band drains**, made loud rather than
+/// spelled as arithmetic.
+///
+/// [`MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING`] is a literal on purpose — a
+/// budget written as a product of other constants re-derives silently when one
+/// term moves — so the coupling it *does* have to
+/// [`BLOCKING_BAND_BYTES`] is stated here, where moving either term is a red
+/// row and a decision rather than a quiet new budget.
+///
+/// The reason the multiplier is twelve and not eight is on the constant: eight
+/// bands is one 133 ms rasterize at 60 Hz exactly, and a pipe holding exactly
+/// that runs dry while the picture behind it is being asked for.
+#[test]
+fn the_outstanding_ceiling_is_twelve_bands() {
+    assert_eq!(
+        MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING,
+        12 * BLOCKING_BAND_BYTES as u64,
+        "the overlay pipe's ceiling and the drain it is denominated in have \
+         come apart",
+    );
+}
+
+/// **Every canvas the ladder can plan affords at least two whole pictures.**
+///
+/// The failure mode a byte door has that a count door cannot: a ceiling under
+/// one picture admits nothing but the first, and a ceiling under two leaves
+/// the band queue with nothing behind the picture it is draining — the drain
+/// idles for a whole rasterize, and a batch that reached the glass in slices
+/// starts reaching it in slices with gaps. Both read green on every count the
+/// door's own suite takes, which is why this is a fact about the constant
+/// rather than a behaviour.
+///
+/// The property an input must have to reach the defect is that its picture be
+/// **large**, so the widest desktop canvases are the fixture and the
+/// oversampling is the ladder's top rung, where a picture costs the most.
+/// A `1.0`-rung entry could not fail this at any canvas on the list.
+#[test]
+fn the_widest_canvases_still_afford_two_pictures() {
+    for [w, h] in [[1920u32, 1080u32], [2878, 1651], [3440, 1440]] {
+        let picture = crate::fit::picture_bytes([w, h], OVERLAY_OVERSAMPLE_PERCENTS[0]);
+        assert!(
+            picture > 0,
+            "fixture: {w}x{h} priced at nothing, so the check below cannot fail",
+        );
+        // The door's own rule: admit while the pipe is BELOW the line, so the
+        // `k`th picture goes out when `(k - 1) * picture` is still under it.
+        assert!(
+            picture < MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING,
+            "a {w}x{h} pane's picture is {picture} B against a ceiling of \
+             {MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING} B, so only one is ever \
+             in the pipe and the drain idles for a whole rasterize",
+        );
+    }
+}

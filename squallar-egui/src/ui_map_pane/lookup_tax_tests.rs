@@ -133,7 +133,7 @@ fn walk_ledger_scene(panes: usize, on: LayersOn) -> ((u64, u64, u64), (u64, u64,
     lookup_ledger::reset();
     slot_ledger::reset();
     for (pane_idx, pane) in states.iter_mut().enumerate() {
-        let budget = std::cell::Cell::new(usize::MAX);
+        let budget = std::cell::Cell::new(u64::MAX);
         let mut ctx = PaneRenderCtx {
             admission_notice: None,
             cost: None,
@@ -492,7 +492,7 @@ mod point_pass {
                 .max_rect(canvas),
         );
         lookup_ledger::reset();
-        let budget = std::cell::Cell::new(usize::MAX);
+        let budget = std::cell::Cell::new(u64::MAX);
         let mut ctx = PaneRenderCtx {
             admission_notice: None,
             cost: None,

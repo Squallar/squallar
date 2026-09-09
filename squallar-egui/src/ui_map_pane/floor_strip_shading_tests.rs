@@ -102,7 +102,7 @@ fn dispatched(surfaces: PaneSurfaces, ground: GroundIsMesh) -> Vec<LayerId> {
             .max_rect(canvas),
     );
 
-    let budget = std::cell::Cell::new(usize::MAX);
+    let budget = std::cell::Cell::new(u64::MAX);
     let mut ctx = PaneRenderCtx {
         admission_notice: None,
         cost: None,

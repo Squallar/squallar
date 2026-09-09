@@ -1048,9 +1048,9 @@ pub const MAX_LOOP_SECTION_CUTS_PER_FRAME: usize = 1;
 /// arrives when it arrives.
 pub const MAX_OVERLAY_LOOP_RENDERS_PER_PASS: usize = 4;
 
-/// How many whole-picture overlay rasters the **whole application** may have
-/// outstanding at once — dispatched and not yet arrived, plus arrived and not
-/// yet delivered to the GPU.
+/// **How many BYTES of whole-picture overlay raster the whole application may
+/// have outstanding at once** — dispatched and not yet arrived, plus arrived
+/// and not yet delivered to the GPU.
 ///
 /// # The quantity nothing bounded
 ///
@@ -1064,33 +1064,68 @@ pub const MAX_OVERLAY_LOOP_RENDERS_PER_PASS: usize = 4;
 /// picture in `squallar_gpu`'s `TextureUploads::pending` (`upload pending`),
 /// which holds each picture **whole** until its last band has crossed.
 ///
+/// # Bytes, because a count of pictures is not a quantity of memory
+///
+/// This was a count of four until 2026-09-09, and a count bounds the wrong
+/// thing: one outstanding picture is `1.5 x 1.5` viewports at 4 bytes a texel
+/// ([`OVERLAY_OVERSAMPLE_PERCENTS`]`[0]`, taken by
+/// `squallar_egui::overlay_cache::plan_overlay_texture`), so what four of them
+/// cost is a property of the **canvas** and not of the door:
+///
+/// | canvas | one picture | four |
+/// |---|---|---|
+/// | 1920x1080 | 18,662,400 B | 71.2 MiB |
+/// | 2878x1651 | 42,755,568 B | 163.1 MiB |
+/// | 3440x1440 | 44,582,400 B | 170.1 MiB |
+///
+/// A ceiling sized for the median is over budget on the largest display by the
+/// square of the side, which is the argument this workspace already made for
+/// loop frames. **Bound the quantity.**
+///
+/// The count's own note argued the other way — "a byte budget would re-derive
+/// the plan here, and `budgets that silently re-derive` is the defect" — and
+/// that objection does not survive contact with the door's site. **Nothing is
+/// re-derived.** The bytes charged are the ones the planner already produced:
+/// `squallar_egui::overlay_cache::OverlayTexturePlan::bytes` for a dispatch,
+/// and the arrived picture's own `width x height` for a hold.
+/// The door spends the figure the plan carries; this constant is the only new
+/// number.
+///
+/// # Twelve bands, and why not eight
+///
 /// The band queue drains one [`BLOCKING_BAND_BYTES`] band a frame on every
-/// device without a staging ring — which is every browser — so a picture is
-/// held for `ceil(bytes / 4 MiB)` frames. That figure is a property of the
-/// *canvas*, not of the design: at a 1280-wide pane a picture is ~8 MiB and
-/// takes 2 frames, and the measured `upload pending` peaked at 64.3 MiB and
-/// returned to zero; at 2878x1651 the same picture is 41.7 MB and takes 11
-/// frames, and the same family read **302-579 MiB and never drained**.
-/// `squallar_device_profile::fit::NeedTerms::upload_pending_host` prices that
-/// steady state at a whole batch — 542,353,344 B for thirteen layers — and
-/// calls the measured range 78-97 % of it.
+/// device without a staging ring — which is every browser — so what the pipe
+/// must hold is **drain, measured in frames**, not pictures. A whole-picture
+/// rasterize is 133 ms median, which is 8 frames at 60 Hz, so a pipe holding
+/// fewer than 8 frames of drain runs dry before the picture behind it can
+/// arrive: the drain idles, and a batch that used to reach the glass in
+/// slices starts reaching it in slices *with gaps between them*. Eight bands
+/// is that floor exactly and leaves nothing for the frame the refusal latch
+/// costs; twelve is the floor and half again.
 ///
-/// # Four, and what the fifth would buy
+/// **Written as a literal and pinned by a test, not as arithmetic over
+/// [`BLOCKING_BAND_BYTES`].** A budget spelled as a product of other constants
+/// re-derives silently when one of its terms moves — the defect that produced
+/// the 7.6 ms blocking allowance nobody chose in `squallar_gpu`'s
+/// `whole_budget`. `tests::the_outstanding_ceiling_is_twelve_bands` is the
+/// coupling made loud instead.
 ///
-/// The band queue is the bottleneck on every ringless device, so a raster
-/// dispatched past what the queue can absorb does not arrive any sooner: it
-/// waits in a queue instead of waiting to be asked for, and pays a whole
-/// picture of host memory for the difference. Four keeps the rasterizer ahead
-/// of the drain at the *small* canvas, where a picture is two frames of drain
-/// against a ~133 ms rasterize — the case where a tighter bound would idle the
-/// queue — and it is the same figure, for the same funnel reason, as
-/// [`MAX_OVERLAY_LOOP_RENDERS_PER_PASS`].
+/// # What it affords, and the floor it may never cross
 ///
-/// **It is a count and not a byte budget on purpose.** The thing being bounded
-/// is one picture per outstanding raster whatever its size, and the size is
-/// the pane's own plan; a byte budget would re-derive the plan here, and
-/// `budgets that silently re-derive` is the defect that produced the 7.6 ms
-/// blocking allowance nobody chose in `squallar_gpu`'s `whole_budget`.
+/// The door admits while the pipe is **below** this line, so the pipe can
+/// overshoot by at most one picture and can never be short of one: at zero
+/// outstanding every canvas affords its first picture whatever its size.
+/// A ceiling that could afford *none* is the failure mode a prior door's
+/// vacuity check found — the one value that passes every gate while idling the
+/// handover — and `overlay_dispatch_budget_tests` gates the stronger property,
+/// that **every canvas the ladder can plan affords at least two**, which is
+/// what keeps a picture queued behind the one draining:
+///
+/// | canvas | afforded | outstanding | was |
+/// |---|---|---|---|
+/// | 1920x1080 | 3 | 53.4 MiB | 71.2 MiB |
+/// | 2878x1651 | 2 | 81.6 MiB | 163.1 MiB |
+/// | 3440x1440 | 2 | 85.0 MiB | 170.1 MiB |
 ///
 /// # What a refusal costs, and why it cannot lose a raster
 ///
@@ -1102,6 +1137,8 @@ pub const MAX_OVERLAY_LOOP_RENDERS_PER_PASS: usize = 4;
 /// stops working; what changes is that the layers of a batch reach the glass
 /// in sequence rather than all at the end of one, and the total is unchanged
 /// because the drain never moved faster than one band a frame either way.
+/// Re-denominating the door in bytes changes the size of a slice, not whether
+/// slicing happens.
 ///
 /// # The ordering it does not promise, stated rather than left to be found
 ///
@@ -1116,13 +1153,13 @@ pub const MAX_OVERLAY_LOOP_RENDERS_PER_PASS: usize = 4;
 /// what it showed before this door existed too: the batch's last picture was
 /// 135 frames of draining behind the move either way. The door changes which
 /// layers are early, not whether any is served.
-pub const MAX_OVERLAY_PICTURES_OUTSTANDING: usize = 4;
+pub const MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING: u64 = 50_331_648;
 
 /// How many whole **plan-view radar pictures** the application may have
 /// outstanding at once — dispatched to the renderer and not yet arrived, plus
 /// uploaded and not yet delivered to the GPU.
 ///
-/// # The same quantity as [`MAX_OVERLAY_PICTURES_OUTSTANDING`], one producer over
+/// # The same quantity as [`MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING`], one producer over
 ///
 /// That door is the draw pass's and is asked per layer per pane, so it reaches
 /// the overlay rasters and nothing else — its own note says radar is left out
@@ -1171,16 +1208,23 @@ pub const MAX_OVERLAY_PICTURES_OUTSTANDING: usize = 4;
 /// whatever the producer did; a picture dispatched past what the queue can
 /// absorb does not arrive earlier, it waits in the queue instead of waiting to
 /// be asked for, and pays a whole picture of host memory for the difference.
-/// That is [`MAX_OVERLAY_PICTURES_OUTSTANDING`]'s argument, and it holds here
+/// That is [`MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING`]'s argument, and it holds here
 /// on the same condition — that the producer is faster than the drain — which
 /// at boot is not an assumption but the **reading**: the batch was measured
 /// with four to five whole pictures resident in the queue at once, and a
 /// producer slower than the drain cannot put two there.
 ///
-/// **It is a count and not a byte budget**, for
-/// [`MAX_OVERLAY_PICTURES_OUTSTANDING`]'s reason: the thing bounded is one
-/// picture per outstanding raster whatever its size, and the size is the
-/// adapter's own plan. A byte budget would re-derive that plan here.
+/// **It is a count and not a byte budget, and the reason it used to give for
+/// that is gone.** Until 2026-09-09 this paragraph read "for
+/// `MAX_OVERLAY_PICTURES_OUTSTANDING`'s reason", and that door is now
+/// [`MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING`] — bytes, because a count of
+/// pictures is a property of the canvas and not of the door. What is left
+/// here is the narrower fact that door's re-denomination turned on: the
+/// overlay door is asked where the pane's own plan is already in hand, so it
+/// charges a figure the planner produced, while this one is asked in
+/// `App::dispatch_pane_renders` off the *adapter's* side. Re-denominating
+/// this door means putting that side on the wire; it is its own change with
+/// its own measurement, not a side effect of the overlay one.
 ///
 /// # What a refusal costs, and why nothing is dropped
 ///

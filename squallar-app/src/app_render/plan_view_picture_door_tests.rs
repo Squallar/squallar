@@ -360,7 +360,7 @@ fn a_picture_that_left_the_pipe_stops_being_charged() {
 }
 
 /// **A cross-section cut is not a plan-view picture**, so it does not close
-/// this door — the mistake `MAX_OVERLAY_PICTURES_OUTSTANDING` records for the
+/// this door — the mistake `MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING` records for the
 /// overlay one, where charging a producer the door cannot throttle lets a
 /// playing loop close it against everything else.
 #[test]

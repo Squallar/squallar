@@ -276,7 +276,7 @@ impl PaneRenderState {
     /// and a loop frame's in-flight mark is the frame's rather than the
     /// pane's. So this is the plan-view producer's own count and the loop
     /// cannot close the plan-view door — the mistake
-    /// `MAX_OVERLAY_PICTURES_OUTSTANDING` records for the overlay one.
+    /// `MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING` records for the overlay one.
     pub fn holds_plan_view_render(&self) -> bool {
         self.in_flight_plan_view.is_some()
     }

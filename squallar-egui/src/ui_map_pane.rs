@@ -432,16 +432,17 @@ pub(super) struct PaneRenderCtx<'a> {
     /// [`crate::overlay_cache::RendersInFlight::admits`].
     pub overlay_render_limit: usize,
     /// **What is left of this frame's application-wide allowance of new
-    /// whole-picture overlay rasters**, shared by every pane and layer the
-    /// frame draws and decremented as each one is admitted.
+    /// whole-picture overlay raster, in host bytes**, shared by every pane and
+    /// layer the frame draws and drawn down by each picture's own planned size
+    /// as it is admitted.
     ///
     /// A `Cell` and not a `&mut`: the pane loop holds one pane mutably at a
     /// time and the floor strip builds a second context for the same frame,
     /// so the allowance cannot be borrowed exclusively by either. See
-    /// `squallar_device_profile::constants::MAX_OVERLAY_PICTURES_OUTSTANDING`
+    /// `squallar_device_profile::constants::MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING`
     /// for what it is, and `crate::ui::Gui::overlay_dispatch_budget` for how
     /// the frame's opening figure is composed.
-    pub overlay_dispatch_budget: &'a std::cell::Cell<usize>,
+    pub overlay_dispatch_budget: &'a std::cell::Cell<u64>,
     /// The overdraw fraction this pane's whole-picture overlays ask for, per
     /// side — the ladder's oversampling rung, delivered through
     /// `crate::shell_api::FrameInputs::overlay_overdraw` and handed to
@@ -1089,21 +1090,39 @@ pub(super) fn render_pane_map_content(
                 .renders
                 .admits(RenderSlot::WHOLE, ctx.overlay_render_limit);
             // **The aggregate door**, beside the per-cache one above. See
-            // `squallar_device_profile::constants::MAX_OVERLAY_PICTURES_OUTSTANDING`
+            // `squallar_device_profile::constants::MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING`
             // for what it bounds and why the per-cache limit cannot: this is
             // the only place that can see the whole batch, because the batch
             // is every shown layer of every pane and the per-cache limit is
             // asked once per layer.
+            //
+            // **Admitted while the pipe is BELOW the line, not while the next
+            // picture fits under it**, and the difference is the whole reason
+            // the byte form is safe. "Fits" is a door that can refuse
+            // everything: a picture larger than the ceiling never fits at any
+            // occupancy, so the pipe would sit empty for ever on a canvas
+            // nobody had priced — the vacuity a count could not express and a
+            // ratio can. Below-the-line overshoots the ceiling by at most one
+            // picture and is short of one never.
+            //
+            // The charge is the plan's own bytes, carried onto the cache so
+            // the same figure is what `outstanding_bytes` reads back while the
+            // render is in flight. Nothing here re-derives a size.
+            let planned = tex_plan.bytes();
             let afforded = replaces || ctx.overlay_dispatch_budget.get() > 0;
             let dispatched = stale && admits && afforded;
+            if dispatched {
+                cache.note_planned_bytes(planned);
+            }
             if dispatched && !replaces {
                 // `saturating_sub` and not `-`: the two lines are a pair, and
-                // a pair is what a later edit can come apart. Nothing may
-                // reach here at zero today — `afforded` is the same read one
-                // line up — and an allowance that went negative would be a
-                // door that swings open, so it floors instead.
+                // a pair is what a later edit can come apart. The allowance
+                // CAN reach zero here, unlike the count this replaced — one
+                // picture may be worth more than what is left — and an
+                // allowance that went negative would be a door that swings
+                // open, so it floors instead.
                 ctx.overlay_dispatch_budget
-                    .set(ctx.overlay_dispatch_budget.get().saturating_sub(1));
+                    .set(ctx.overlay_dispatch_budget.get().saturating_sub(planned));
             }
             if dispatched {
                 ctx.actions.push(GuiAction::RenderOverlay {

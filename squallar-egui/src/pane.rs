@@ -3883,30 +3883,38 @@ impl PaneState {
         }
     }
 
-    /// **Whole-picture overlay rasters this pane has occupying the upload
-    /// pipe**: one per layer that has a whole raster dispatched and not yet
-    /// arrived, or arrived and not yet delivered to the GPU.
+    /// **Host bytes of whole-picture overlay raster this pane has occupying
+    /// the upload pipe**: for every non-radar layer, a picture dispatched and
+    /// not yet arrived, plus a picture arrived and not yet delivered to the
+    /// GPU.
     ///
-    /// The two states are one charge and not two because they are one
-    /// picture's bytes at two points of the same journey — `overlay replies`
-    /// on the way in, `upload pending` on the way out, two census families
-    /// whose own note says they "abut and do not overlap". A layer in neither
-    /// state costs nothing; the picture it is drawing is the GPU's.
+    /// **Bytes and not a count of pictures**, since 2026-09-09: a picture is
+    /// `1.5 x 1.5` viewports at four bytes a texel, so what a count of four
+    /// costs is 71.2 MiB at a 1920x1080 canvas and 170.1 MiB at a 3440x1440
+    /// one — a property of the display and not of the door. See
+    /// `squallar_device_profile::constants::MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING`.
+    ///
+    /// **The two states are added, not merged.** The count this replaced
+    /// charged one per layer in either state on the reading that they are one
+    /// picture's bytes at two points of one journey — `overlay replies` on the
+    /// way in, `upload pending` on the way out, "abut and do not overlap".
+    /// That is true of one picture and false of this cache: the arrival door
+    /// re-asks under a hold, so a layer can have an arrived picture in the
+    /// queue *and* a fresh one being rasterized, and both are resident. A
+    /// layer in neither state costs nothing; the picture it is drawing is the
+    /// GPU's.
     ///
     /// **Radar is not counted.** Its rasters come from
     /// `App::dispatch_pane_renders`, not from the overlay door this figure
     /// feeds, so charging them would close a door against traffic it cannot
     /// throttle — the way to make a loop playing on one pane stop every other
     /// layer from ever re-rendering.
-    pub fn overlay_pictures_outstanding(&self) -> usize {
+    pub fn overlay_picture_bytes_outstanding(&self) -> u64 {
         self.overlay_textures
             .iter()
-            .filter(|(id, cache)| {
-                **id != known::RADAR
-                    && (cache.is_holding()
-                        || cache.renders.holds(crate::overlay_cache::RenderSlot::WHOLE))
-            })
-            .count()
+            .filter(|(id, _)| **id != known::RADAR)
+            .map(|(_, cache)| cache.outstanding_bytes())
+            .fold(0u64, u64::saturating_add)
     }
 
     /// **The still plan view's polar sweeps, if that is what this pane's

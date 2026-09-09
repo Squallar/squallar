@@ -749,7 +749,7 @@ fn ordered_walk(order: impl FnOnce(&mut PaneState)) -> (Vec<LayerId>, Vec<&'stat
             .layer_id(egui::LayerId::background())
             .max_rect(canvas),
     );
-    let budget = std::cell::Cell::new(usize::MAX);
+    let budget = std::cell::Cell::new(u64::MAX);
     let mut ctx = PaneRenderCtx {
         admission_notice: None,
         cost: None,

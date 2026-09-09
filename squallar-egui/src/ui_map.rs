@@ -195,9 +195,10 @@ impl super::Gui {
         // One read for every pane this frame draws: the figure is the
         // device's, not the pane's.
         let overlay_render_limit = self.concurrent_renders;
-        // **What this frame may still ask the rasterizer for**, for the whole
-        // application rather than for one pane and layer. Opened here, before
-        // any pane is drawn, because the quantity it bounds is the batch —
+        // **What this frame may still ask the rasterizer for**, in host bytes
+        // and for the whole application rather than for one pane and layer.
+        // Opened here, before any pane is drawn, because the quantity it
+        // bounds is the batch —
         // every shown layer of every pane re-rasterizes together on a move —
         // and spent by `render_pane_map_content`'s door. See
         // `Gui::overlay_dispatch_budget`.
@@ -2265,7 +2266,7 @@ struct FloorStripCtx<'a> {
     /// the strip draws the same pane's layers and asks the same door, so a
     /// second allowance here would let one frame dispatch twice the batch.
     /// See [`pane_render::PaneRenderCtx::overlay_dispatch_budget`].
-    overlay_dispatch_budget: &'a std::cell::Cell<usize>,
+    overlay_dispatch_budget: &'a std::cell::Cell<u64>,
     pane: &'a mut crate::pane::PaneState,
     /// The viewport the strip is drawn through, **owned**.
     map_memory: walkers::MapMemory,

@@ -128,7 +128,7 @@ fn walk_at(run: Walk<'_>) -> Walked {
     // the only caller there is of the composition the walk does with it.
     ui.set_opacity(run.base);
 
-    let budget = std::cell::Cell::new(usize::MAX);
+    let budget = std::cell::Cell::new(u64::MAX);
     let mut ctx = PaneRenderCtx {
         admission_notice: None,
         cost: None,
