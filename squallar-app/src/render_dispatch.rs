@@ -2575,23 +2575,29 @@ impl RenderDispatcher {
     }
 
     /// **Whether one more whole plan-view picture may be asked for**, for the
-    /// whole application: the renders in flight plus `holding`, the pictures
-    /// the visible panes have uploaded and not yet had delivered, against
+    /// whole application: the renders in flight plus `in_pipe`, the distinct
+    /// pictures the visible panes have uploaded and not yet had delivered,
+    /// against
     /// [`squallar_device_profile::constants::MAX_PLAN_VIEW_PICTURES_OUTSTANDING`].
     ///
-    /// `holding` is the caller's because it is the Gui's — see
-    /// `squallar_egui::Gui::plan_view_pictures_outstanding`. The two terms are
-    /// one charge and not two: they are one picture's bytes at two points of
-    /// the same journey, the reply on the way in and `squallar_gpu`'s band
-    /// queue on the way out, and a picture in neither costs nothing because
-    /// the pixels it is drawn from are the GPU's.
+    /// `in_pipe` is the caller's because it is the Gui's — see
+    /// `squallar_egui::Gui::plan_view_pictures_outstanding`, which carries the
+    /// two ways that reading was a different set from the queue it describes.
+    /// The caller owes it one thing this side cannot see: **the pictures its
+    /// own walk has filed since it read that figure**, which is a snapshot and
+    /// which the shared-cache arm moves without moving either term here.
+    ///
+    /// The two terms are one charge and not two: they are one picture's bytes
+    /// at two points of the same journey, the reply on the way in and
+    /// `squallar_gpu`'s band queue on the way out, and a picture in neither
+    /// costs nothing because the pixels it is drawn from are the GPU's.
     ///
     /// **Asked beside [`Self::render_slot_free`], never instead of it.** That
     /// one bounds the render *pool*, which is a CPU and a set of scratch
     /// buffers; this one bounds the *host bytes on the way to the card*. A
     /// device can be over one and under the other in either direction.
-    pub fn plan_view_picture_slot_free(&self, holding: usize) -> bool {
-        self.plan_view_renders_in_flight().saturating_add(holding)
+    pub fn plan_view_picture_slot_free(&self, in_pipe: usize) -> bool {
+        self.plan_view_renders_in_flight().saturating_add(in_pipe)
             < squallar_device_profile::constants::MAX_PLAN_VIEW_PICTURES_OUTSTANDING
     }
 

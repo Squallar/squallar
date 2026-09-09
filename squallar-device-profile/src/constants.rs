@@ -1202,15 +1202,46 @@ pub const MAX_OVERLAY_PICTURES_OUTSTANDING: usize = 4;
 /// `TextureUploads::uploads_pending` true, which is what buys the next frame.
 /// A closed door therefore always has an event coming that will reopen it.
 ///
-/// # What it does not charge
+/// # What the total counts, and what it does not charge
 ///
-/// A pane served out of the shared `RenderCache` is charged nothing. Its
-/// picture is an `Arc` the cache is already holding, so uploading it adds a
-/// queue entry and no host bytes — the `upload pending` census family's own
-/// note says it "OVERLAPS the two raster families while a radar raster is in
-/// flight: the `Arc` it holds is the one `apply_render_to_pane` handed
-/// `ctx.load_texture`, which is the same `Arc` `render cache` and `cached
-/// renders` hold". Refusing a cache hit would delay a pane and free nothing.
+/// **The DISTINCT whole pictures in the queue**, which is
+/// `TextureUploads::publish_pending_level`'s own denominator, restricted to
+/// radar. `Gui::plan_view_pictures_outstanding` counted *panes holding a
+/// raster* until 2026-09-08 and that was a different set in both directions;
+/// both halves were measured over on the post-door tree, at 4.40 / 4.29 /
+/// 6.20 pictures resident against this ceiling of 3.
+///
+/// * A pane's FIRST picture is SHOWN rather than held —
+///   `PaneState::place_radar_raster` has nothing on the glass to protect, so
+///   the raster goes up and fills top-down as its bands land. It is whole in
+///   the queue the entire time and was charged nothing, so on a resume, the
+///   batch this door exists for, the occupancy term was structurally zero for
+///   the whole burst and this reduced to a bound on the renders in flight.
+///   `OverlayTextureCache::showing_arriving` is the missing half.
+/// * A picture shared by sibling panes was charged once PER PANE, where the
+///   queue holds one `Arc` and prices it once — closing the door against
+///   traffic that was never in the pipe.
+///
+/// **A pane served out of the shared `RenderCache` is not refused, and it is
+/// not free either.** These are two questions and they were one. It is not
+/// refused because its picture is an `Arc` the cache is already holding, so
+/// the upload files a refcount and no host bytes — the `upload pending`
+/// census family's own note says it "OVERLAPS the two raster families while a
+/// radar raster is in flight: the `Arc` it holds is the one
+/// `apply_render_to_pane` handed `ctx.load_texture`, which is the same `Arc`
+/// `render cache` and `cached renders` hold" — and refusing it would cost a
+/// paint to free nothing. But that upload IS a queue entry, sitting ahead of
+/// pictures that do cost host bytes and extending how long those are
+/// resident, so `App::dispatch_pane_renders` charges it against every pane
+/// the same walk visits after it. `a_cache_hit_files_the_buffer_the_cache_is_
+/// already_holding` proves the no-host-bytes half rather than asserting it.
+///
+/// **A sibling pane waiting on a picture already being made is charged
+/// nothing**, and that one holds: it uploads nothing at the door, and when
+/// the picture arrives `poll_render_results` hands every sibling the same
+/// `egui::TextureHandle` out of one `PlanViewUploads`, which is one entry in
+/// the queue and one charge here.
+///
 /// A loop frame and a cross-section cut are not charged either: they are not
 /// plan views, they do not set `PaneRenderState::in_flight_plan_view`, and
 /// their pictures are a twentieth of one of these.

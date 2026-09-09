@@ -118,7 +118,7 @@ fn a_placed_render_dates_the_pane_it_lands_on() {
         tilt(5, "MPX_EET_2026_07_26_01_55_52"),
     );
 
-    app.apply_render_to_pane(
+    let _ = app.apply_render_to_pane(
         &ctx,
         0,
         &finished(PRODUCT, 0.5),
@@ -150,7 +150,7 @@ fn switching_datasource_redates_the_pane_rather_than_undating_it() {
         tilt(5, "MPX_EET_2026_07_26_01_55_52"),
     );
 
-    app.apply_render_to_pane(
+    let _ = app.apply_render_to_pane(
         &ctx,
         0,
         &finished(PRODUCT, 0.5),
@@ -163,7 +163,7 @@ fn switching_datasource_redates_the_pane_rather_than_undating_it() {
              which has no predecessor to keep on screen and so goes up at once",
     );
 
-    app.apply_render_to_pane(
+    let _ = app.apply_render_to_pane(
         &ctx,
         0,
         &finished(RadarProduct::Reflectivity, 0.5),
@@ -197,7 +197,7 @@ fn a_placed_render_describes_what_it_depicts() {
         .pane_mut(0)
         .unwrap()
         .set_selected_product(squallar_radar::fields::known::REFLECTIVITY);
-    app.apply_render_to_pane(
+    let _ = app.apply_render_to_pane(
         &ctx,
         0,
         &finished(PRODUCT, 0.5),
@@ -220,7 +220,7 @@ fn a_placed_render_describes_what_it_depicts() {
         "the image is the selection now",
     );
 
-    app.apply_render_to_pane(
+    let _ = app.apply_render_to_pane(
         &ctx,
         0,
         &finished(RadarProduct::Reflectivity, 0.5),
@@ -262,7 +262,7 @@ fn a_long_range_render_is_placed_at_the_size_it_was_rendered_at() {
         melting_layer_source: None,
         storm_motion: None,
     };
-    app.apply_render_to_pane(&ctx, 0, &render, &mut PlanViewUploads::default());
+    let _ = app.apply_render_to_pane(&ctx, 0, &render, &mut PlanViewUploads::default());
 
     let pane = app.gui.pane_mut(0).unwrap();
     let cache = pane.overlay_cache_mut(&squallar_source::id::known::RADAR);
@@ -313,14 +313,14 @@ fn a_repaired_pane_puts_back_the_fold_limit_it_lost() {
         storm_motion: None,
         ..finished(PRODUCT, 0.5)
     };
-    app.apply_render_to_pane(&ctx, 0, &render, &mut PlanViewUploads::default());
+    let _ = app.apply_render_to_pane(&ctx, 0, &render, &mut PlanViewUploads::default());
 
     {
         let pane = app.gui.pane_mut(0).unwrap();
         let cache = pane.overlay_cache_mut(&squallar_source::id::known::RADAR);
         cache.clear();
     }
-    app.apply_render_to_pane(&ctx, 0, &render, &mut PlanViewUploads::default());
+    let _ = app.apply_render_to_pane(&ctx, 0, &render, &mut PlanViewUploads::default());
 
     let pane = app.gui.pane_mut(0).unwrap();
     let cache = pane.overlay_cache_mut(&squallar_source::id::known::RADAR);
@@ -349,7 +349,7 @@ fn a_repaired_velocity_pane_annotates_the_fold_again() {
         storm_motion: None,
         ..finished(RadarProduct::Velocity, 0.5)
     };
-    app.apply_render_to_pane(&ctx, 0, &render, &mut PlanViewUploads::default());
+    let _ = app.apply_render_to_pane(&ctx, 0, &render, &mut PlanViewUploads::default());
     assert_eq!(
         app.gui.pane(0).unwrap().displayed_nyquist_ms(),
         Some(26.42),
@@ -368,7 +368,7 @@ fn a_repaired_velocity_pane_annotates_the_fold_again() {
         "a pane whose picture is gone still claimed to know where it folded",
     );
 
-    app.apply_render_to_pane(&ctx, 0, &render, &mut PlanViewUploads::default());
+    let _ = app.apply_render_to_pane(&ctx, 0, &render, &mut PlanViewUploads::default());
     assert_eq!(
         app.gui.pane(0).unwrap().displayed_nyquist_ms(),
         Some(26.42),

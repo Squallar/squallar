@@ -69,7 +69,7 @@ fn render_of(image: Arc<egui::ColorImage>) -> crate::render_dispatch::CachedPane
 
 fn place(app: &mut crate::app::App, ctx: &egui::Context, idx: usize, image: Arc<egui::ColorImage>) {
     let mut uploads = PlanViewUploads::default();
-    app.apply_render_to_pane(ctx, idx, &render_of(image), &mut uploads);
+    let _ = app.apply_render_to_pane(ctx, idx, &render_of(image), &mut uploads);
 }
 
 fn holding(app: &crate::app::App, idx: usize) -> bool {
@@ -194,7 +194,8 @@ fn panes_sharing_a_sweep_hold_one_texture_between_them() {
     {
         let mut uploads = PlanViewUploads::default();
         for idx in 0..6 {
-            app.apply_render_to_pane(&ctx, idx, &render_of(Arc::clone(&first)), &mut uploads);
+            let _ =
+                app.apply_render_to_pane(&ctx, idx, &render_of(Arc::clone(&first)), &mut uploads);
         }
     }
     app.deliver_held_rasters();
@@ -205,7 +206,8 @@ fn panes_sharing_a_sweep_hold_one_texture_between_them() {
     {
         let mut uploads = PlanViewUploads::default();
         for idx in 0..6 {
-            app.apply_render_to_pane(&ctx, idx, &render_of(Arc::clone(&second)), &mut uploads);
+            let _ =
+                app.apply_render_to_pane(&ctx, idx, &render_of(Arc::clone(&second)), &mut uploads);
         }
     }
     assert_eq!(

@@ -3790,6 +3790,38 @@ impl PaneState {
         Some(self.overlay_cache(&known::RADAR)?.held_texture()?.id())
     }
 
+    /// **The whole plan-view pictures this pane has occupying the upload
+    /// pipe**, by texture id, at most two.
+    ///
+    /// # Why ids and not a count
+    ///
+    /// The thing being described is `squallar_gpu`'s `TextureUploads::pending`
+    /// restricted to radar, and that queue prices **distinct images**: its
+    /// `publish_pending_level` counts one charge per buffer however many bands
+    /// or panes name it. A count of panes is a different denominator, and the
+    /// two diverge on the ordinary case this app is built for — a sibling pane
+    /// on the same site, product and tilt is handed the *same*
+    /// `egui::TextureHandle` by `PlanViewUploads::handle`, so six panes
+    /// sharing one picture are one 216,796,176 B entry in the queue and were
+    /// six charges against the door.
+    ///
+    /// # Why two and not one
+    ///
+    /// A pane can have a picture on its glass that is still filling top-down
+    /// and a replacement held behind it, and both are whole in the queue. See
+    /// [`crate::overlay_cache::OverlayTextureCache::showing_arriving`]'s note
+    /// for the arm that had no charge at all until 2026-09-08 — the arm every
+    /// pane's FIRST picture takes, which is the whole of a resume.
+    pub fn plan_view_pictures_in_pipe(&self) -> [Option<egui::TextureId>; 2] {
+        let Some(cache) = self.overlay_cache(&known::RADAR) else {
+            return [None, None];
+        };
+        [
+            cache.held_texture().map(egui::TextureHandle::id),
+            cache.showing_arriving_id(),
+        ]
+    }
+
     /// **Whether this pane has a whole plan-view picture in the upload pipe**:
     /// a radar raster uploaded and not yet delivered to the GPU.
     ///
@@ -3820,7 +3852,12 @@ impl PaneState {
     /// Show the raster this pane is holding, if every texel of it has landed.
     pub fn promote_held_raster(&mut self, delivered: impl Fn(egui::TextureId) -> bool) -> bool {
         let cache = self.overlay_cache_mut(&known::RADAR);
-        let Some(held) = cache.take_held_if_delivered(delivered) else {
+        // The picture already on the glass, first and unconditionally: it can
+        // be crossing to the GPU with nothing held behind it at all, which is
+        // exactly a pane's first paint, and the early return below would then
+        // never reach it. See `OverlayTextureCache::settle_arrival`.
+        cache.settle_arrival(&delivered);
+        let Some(held) = cache.take_held_if_delivered(&delivered) else {
             return false;
         };
         cache.show(held.data);
@@ -3924,8 +3961,16 @@ impl PaneState {
         // reason: one layer, one picture.
         self.still_radar_fan = None;
         let cache = self.overlay_cache_mut(&known::RADAR);
-        if already_whole || cache.current().is_none() {
+        if already_whole {
             cache.show(data);
+            self.data_time = data_time;
+        } else if cache.current().is_none() {
+            // Nothing on the glass to protect, so the arriving picture goes up
+            // now and fills top-down as its bands land. **It is still in the
+            // band queue whole**, and saying so is what makes the plan-view
+            // door see a resume at all — see
+            // `OverlayTextureCache::showing_arriving`.
+            cache.show_arriving(data);
             self.data_time = data_time;
         } else {
             cache.hold(data, data_time);

@@ -1089,6 +1089,27 @@ pub struct OverlayTextureCache {
     /// movement, decremented by one per frame the pane asks, and the settle
     /// fires at zero. See [`Self::settle_is_counting_down`].
     settle_owed_frames: u8,
+    /// **Whether the picture in [`Self::current`] is still crossing to the
+    /// GPU.** [`Self::held`]'s twin for the one case a hold cannot describe.
+    ///
+    /// A hold exists so a *replacement* does not appear half-uploaded over
+    /// the picture already on the glass. When there is no picture on the
+    /// glass there is nothing to protect, so
+    /// [`crate::pane::PaneState::place_radar_raster`] shows the arriving
+    /// raster at once and it fills top-down as its bands land — which is the
+    /// behaviour, not a defect.
+    ///
+    /// What that costs is an accounting hole: the picture is whole in
+    /// `squallar_gpu`'s `TextureUploads::pending`, holding all of itself on
+    /// the host, and [`Self::is_holding`] reads false for it. Every pane's
+    /// FIRST radar picture takes that arm, so on a resume — the batch the
+    /// plan-view door exists for — the door's occupancy term was
+    /// structurally zero for the whole burst. This flag is the missing half.
+    ///
+    /// Set only by [`Self::show_arriving`], cleared by every other route into
+    /// [`Self::current`] and by [`Self::settle_arrival`] on the frame the
+    /// renderer says every band has landed.
+    showing_arriving: bool,
 }
 
 impl Default for OverlayTextureCache {
@@ -1113,6 +1134,7 @@ impl OverlayTextureCache {
             token_sweeping: false,
             sweep_discarded: false,
             settle_owed_frames: 0,
+            showing_arriving: false,
         }
     }
 
@@ -1121,11 +1143,54 @@ impl OverlayTextureCache {
     }
 
     /// Put `data` on screen now, and let go of anything being held.
+    ///
+    /// **The picture is whole.** Every caller of this is a promotion or a
+    /// picture the renderer took across on its own frame's queue, so nothing
+    /// of it is still in the band queue; [`Self::show_arriving`] is the same
+    /// swap for a picture that is.
     pub fn show(&mut self, data: OverlayTextureData) {
         self.held = None;
         self.hold_superseded = false;
         self.blank = None;
+        self.showing_arriving = false;
         self.current = Some(data);
+    }
+
+    /// Put `data` on screen now **while its bands are still crossing**, and
+    /// remember that they are.
+    ///
+    /// The pane paints it as it fills, top-down, which is what a first paint
+    /// is; see [`Self::showing_arriving`] for why the remembering is not
+    /// optional.
+    pub fn show_arriving(&mut self, data: OverlayTextureData) {
+        self.show(data);
+        self.showing_arriving = true;
+    }
+
+    /// Whether the picture on the glass is still crossing to the GPU.
+    pub fn is_showing_arriving(&self) -> bool {
+        self.showing_arriving
+    }
+
+    /// The id of the picture on the glass while it is still crossing.
+    pub fn showing_arriving_id(&self) -> Option<egui::TextureId> {
+        self.showing_arriving
+            .then(|| self.current.as_ref().map(|data| data.texture.id()))
+            .flatten()
+    }
+
+    /// Stop charging the picture on the glass once `delivered` says every one
+    /// of its bands has landed.
+    ///
+    /// The falling half of [`Self::show_arriving`], and it has to exist for
+    /// [`Self::hold`]'s reason: a level that only ever rises latches, and a
+    /// latched occupancy shuts the plan-view door for the life of the session.
+    pub fn settle_arrival(&mut self, delivered: impl Fn(egui::TextureId) -> bool) {
+        if let Some(id) = self.showing_arriving_id()
+            && delivered(id)
+        {
+            self.showing_arriving = false;
+        }
     }
 
     /// **Take an answer that painted nothing**: the pane stops drawing this
@@ -1145,6 +1210,7 @@ impl OverlayTextureCache {
         self.held = None;
         self.hold_superseded = false;
         self.current = None;
+        self.showing_arriving = false;
         self.blank = Some(shape);
     }
 
@@ -1195,6 +1261,7 @@ impl OverlayTextureCache {
         self.blank = None;
         self.hold_superseded = false;
         self.sweep_discarded = false;
+        self.showing_arriving = false;
     }
 
     /// Let go of a held picture without showing it.

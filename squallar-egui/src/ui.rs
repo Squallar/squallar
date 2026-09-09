@@ -2787,8 +2787,7 @@ impl Gui {
     /// (`App::poll_overlay_render_results` drops a picture no visible pane
     /// wants), not held against the panes on screen.
     /// **Whole plan-view pictures the visible panes have in the upload pipe**
-    /// — one per pane whose radar raster has been uploaded and whose last band
-    /// has not landed.
+    /// — the DISTINCT radar rasters uploaded whose last band has not landed.
     ///
     /// The other half of the plan-view door's total; the renders it has in
     /// flight are the dispatcher's own count. See
@@ -2796,16 +2795,53 @@ impl Gui {
     /// for what the pair bounds, and [`Self::overlay_dispatch_budget`] for the
     /// same question asked of the overlay layers.
     ///
+    /// # The denominator is the queue's own
+    ///
+    /// This counted **panes holding a raster** until 2026-09-08 and was wrong
+    /// in both directions against the thing it describes, which is
+    /// `squallar_gpu`'s `TextureUploads::pending`:
+    ///
+    /// * it charged nothing for a picture the pane put straight on its glass,
+    ///   and `PaneState::place_radar_raster` takes that arm for every pane's
+    ///   FIRST picture — so on a resume, the batch the door exists for, this
+    ///   term was structurally zero for the whole burst; and
+    /// * it charged a shared picture once per pane, where the queue holds one
+    ///   `Arc` and prices it once — so panes on one site shut the door against
+    ///   traffic that was never in the pipe.
+    ///
+    /// `PaneState::plan_view_pictures_in_pipe` is the corrected reading and
+    /// carries the mechanism for each half.
+    ///
+    /// **Distinct** is an `O(n²)` sweep over at most `2 x` the visible panes
+    /// and allocates nothing, which is `TextureUploads::publish_pending_level`
+    /// deciding the same question the same way and for the same reason: a
+    /// running total would owe every mutation site a scan of its own to know
+    /// whether its charge was the last one for that picture.
+    ///
     /// **The visible panes**, for [`Self::overlay_dispatch_budget`]'s reason:
     /// a hidden pane is not walked by `App::dispatch_pane_renders` and so can
     /// spend nothing, and counting what it still holds would shrink the
     /// allowance of the panes that can. `PaneState::release_hidden_textures`
     /// is what lets go of a hold that went out of view.
     pub fn plan_view_pictures_outstanding(&self) -> usize {
-        self.panes[..self.visible_pane_count()]
-            .iter()
-            .filter(|pane| pane.is_holding_plan_view_raster())
-            .count()
+        let visible = &self.panes[..self.visible_pane_count()];
+        let mut total = 0usize;
+        for (idx, pane) in visible.iter().enumerate() {
+            let mine = pane.plan_view_pictures_in_pipe();
+            for (slot, id) in mine.iter().enumerate() {
+                let Some(id) = *id else {
+                    continue;
+                };
+                let charged_already = mine[..slot].contains(&Some(id))
+                    || visible[..idx]
+                        .iter()
+                        .any(|earlier| earlier.plan_view_pictures_in_pipe().contains(&Some(id)));
+                if !charged_already {
+                    total += 1;
+                }
+            }
+        }
+        total
     }
 
     /// **What one frame's plan-view dispatch walk opens with**: the panes it

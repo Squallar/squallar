@@ -174,22 +174,28 @@ pub(super) struct PlanViewUploads {
 
 impl PlanViewUploads {
     /// The texture holding `image`, running `upload` only if this pass has not
-    /// uploaded that exact buffer already.
+    /// uploaded that exact buffer already — **and whether it ran**.
+    ///
+    /// The second half of the answer is the pass's own charge against the
+    /// plan-view door: `upload` running is one more whole picture filed into
+    /// `squallar_gpu`'s band queue, and it not running is a texture already
+    /// filed, which the queue prices once. See
+    /// `squallar_device_profile::constants::MAX_PLAN_VIEW_PICTURES_OUTSTANDING`.
     fn handle(
         &mut self,
         image: &Arc<egui::ColorImage>,
         upload: impl FnOnce() -> egui::TextureHandle,
-    ) -> egui::TextureHandle {
+    ) -> (egui::TextureHandle, bool) {
         if let Some((_, texture)) = self
             .uploaded
             .iter()
             .find(|(seen, _)| Arc::ptr_eq(seen, image))
         {
-            return texture.clone();
+            return (texture.clone(), false);
         }
         let texture = upload();
         self.uploaded.push((Arc::clone(image), texture.clone()));
-        texture
+        (texture, true)
     }
 }
 
@@ -2111,7 +2117,12 @@ impl super::App {
             );
 
             if origin_draws_plan {
-                self.apply_render_to_pane(ctx, origin_pane, &render_result, &mut uploads);
+                // The charge is not read here and must not be: this picture
+                // passed the door when it was ASKED for, and its bytes are
+                // already on the host. Refusing the upload would cost the
+                // paint and free nothing.
+                let _filed =
+                    self.apply_render_to_pane(ctx, origin_pane, &render_result, &mut uploads);
             }
 
             // Broadcast to sibling panes that need the same site+product+elevation.
@@ -2150,7 +2161,15 @@ impl super::App {
                             })
                             .unwrap_or(true);
                     if needs {
-                        self.apply_render_to_pane(ctx, other_idx, &render_result, &mut uploads);
+                        // Deliberately unread, and this is the arm that proves
+                        // the sibling exemption rather than asserting it: every
+                        // pane here is handed the SAME buffer, so
+                        // `PlanViewUploads::handle` mints once and answers
+                        // `false` for every pane after the first. N sibling
+                        // panes are one queue entry, which is what
+                        // `Gui::plan_view_pictures_outstanding` now charges.
+                        let _filed =
+                            self.apply_render_to_pane(ctx, other_idx, &render_result, &mut uploads);
                     }
                 }
             }
@@ -2252,14 +2271,26 @@ impl super::App {
         );
     }
 
-    /// Apply a rendered radar image to a specific pane (upload texture to overlay cache).
+    /// Apply a rendered radar image to a specific pane (upload texture to
+    /// overlay cache), and say **whether that put one more whole picture into
+    /// `squallar_gpu`'s band queue**.
+    ///
+    /// `false` on every arm that files nothing: the pane already has a handle
+    /// for these exact pixels, or an earlier pane in the same pass uploaded
+    /// the buffer and this one is being handed that texture. The caller in
+    /// `App::dispatch_pane_renders` adds the `true`s to the occupancy it read
+    /// at the head of the frame, because that reading is a snapshot and the
+    /// walk itself is what moves it — six panes served out of the shared
+    /// cache filed six pictures against a door that read the same zero for
+    /// all six.
+    #[must_use]
     fn apply_render_to_pane(
         &mut self,
         ctx: &egui::Context,
         pane_idx: usize,
         render: &CachedPaneRender,
         uploads: &mut PlanViewUploads,
-    ) {
+    ) -> bool {
         use squallar_egui::overlay_cache::{OverlayTextureData, RadarTextureMeta};
         use squallar_geo::PlacedRaster;
         use squallar_radar::types::ImageBounds;
@@ -2267,7 +2298,7 @@ impl super::App {
         // Extract site coordinates before mutable borrow
         let (lat, lon) = {
             let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
-                return;
+                return false;
             };
             (scan_info.site.lat, scan_info.site.lon)
         };
@@ -2316,7 +2347,7 @@ impl super::App {
                 // which is two disjoint fields of one struct rather than two
                 // trips through the seam.
                 let Some(pane) = self.gui.pane_mut(pane_idx) else {
-                    return;
+                    return false;
                 };
                 let data_time = self.render.data_time_for_render(pane, render);
                 pane.place_radar_fan(
@@ -2336,7 +2367,10 @@ impl super::App {
                     self.render.pane_render[pane_idx].last_rendered =
                         Some((render.product, render.elevation));
                 }
-                return;
+                // `false`: a fan is drawn from its own payload and uploads no
+                // egui texture, so nothing of it is in the band queue and it
+                // is not a plan-view picture the door counts.
+                return false;
             }
             crate::channels::StillSurface::Raster(image) => Arc::clone(image),
         };
@@ -2354,7 +2388,7 @@ impl super::App {
         // to go back, in which case it is kept rather than retired and
         // re-uploaded.
         let Some(pane) = self.gui.pane_mut(pane_idx) else {
-            return;
+            return false;
         };
         let cache = pane.overlay_cache_mut(&squallar_source::id::known::RADAR);
         // The pane's own handle for these exact pixels, if it has one, and
@@ -2374,14 +2408,14 @@ impl super::App {
         let data_time = self.render.data_time_for_render(pane, render);
 
         let side = image.width();
-        let (texture, whole) = match retained {
+        let (texture, whole, filed) = match retained {
             // The pane's own handle, preferred over anything `uploads` may hold
             // for the same raster. Not a lifetime question — see the note above
             // on why a replaced handle can just be dropped — but a churn one:
-            Some(pair) => pair,
+            Some((texture, whole)) => (texture, whole, false),
             None => {
                 let counter = &mut self.texture_counter;
-                let texture = uploads.handle(&image, || {
+                let (texture, minted) = uploads.handle(&image, || {
                     *counter += 1;
                     ctx.load_texture(
                         format!("radar_image_{counter}"),
@@ -2392,7 +2426,7 @@ impl super::App {
                 // A texture minted this frame — by this call or by an earlier
                 // pane in the same drain — has handed egui pixels that
                 // `end_pass` has not seen yet, let alone moved. Never whole.
-                (texture, false)
+                (texture, false, minted)
             }
         };
 
@@ -2423,6 +2457,7 @@ impl super::App {
             self.render.pane_render[pane_idx].last_rendered =
                 Some((render.product, render.elevation));
         }
+        filed
     }
 
     /// Show every held raster whose last band has landed.
@@ -3774,7 +3809,17 @@ impl super::App {
         // renders in flight, which rises as this walk spends, so the door
         // tightens within the frame without this being re-read. See
         // `RenderDispatcher::plan_view_picture_slot_free`.
-        let (pane_count, pictures_holding) = self.gui.plan_view_dispatch_frame();
+        let (pane_count, pictures_in_pipe) = self.gui.plan_view_dispatch_frame();
+        // **Pictures this walk has itself put into the band queue since that
+        // reading**, which is a snapshot and cannot see them.
+        //
+        // The shared-cache arm below uploads a whole picture and dispatches no
+        // render, so it moves neither term of the door's total: six panes
+        // served out of the cache in one frame filed six 216,796,176 B entries
+        // against a door that read the same occupancy for all six. Kept here
+        // rather than by re-asking the seam per pane, which would be the same
+        // answer at the cost of a counted reach into the UI layer.
+        let mut filed_this_walk = 0usize;
         for pane_idx in 0..pane_count {
             // **The draw path's own question, asked here** — see
             // `Gui::plan_view_demand_for_pane`. What a pane has SELECTED and
@@ -3826,7 +3871,9 @@ impl super::App {
                             product,
                             elevation
                         );
-                        self.apply_render_to_pane(ctx, pane_idx, &render_result, &mut uploads);
+                        if self.apply_render_to_pane(ctx, pane_idx, &render_result, &mut uploads) {
+                            filed_this_walk += 1;
+                        }
                         continue;
                     }
 
@@ -3839,18 +3886,31 @@ impl super::App {
                     }
 
                     // **The aggregate door, and the only place that can see
-                    // the batch.** Everything above this line is free of it on
-                    // purpose: the shared-cache arm hands back an `Arc` the
-                    // cache is already holding, so its upload adds a queue
-                    // entry and no host bytes, and the sibling arm is a
-                    // picture already charged to the pane having it made.
-                    // What is charged is a NEW whole picture, and past
-                    // `MAX_PLAN_VIEW_PICTURES_OUTSTANDING` of them the band
-                    // queue cannot start it any sooner than it will start it
-                    // after a wait — see the constant. Nothing is written
-                    // here, so `needs_render` is still true and this pane asks
-                    // again on the next frame.
-                    if !self.render.plan_view_picture_slot_free(pictures_holding) {
+                    // the batch.** Past
+                    // `MAX_PLAN_VIEW_PICTURES_OUTSTANDING` whole pictures the
+                    // band queue cannot start another any sooner than it will
+                    // start it after a wait — see the constant. Nothing is
+                    // written here, so `needs_render` is still true and this
+                    // pane asks again on the next frame.
+                    //
+                    // **The two arms above are not refused, and they are not
+                    // uncharged.** They are different questions and were one
+                    // until 2026-09-08. The shared-cache arm is not refused
+                    // because its picture is an `Arc` the cache is already
+                    // holding, so the upload files a refcount and no host
+                    // bytes and a refusal would cost a paint to free nothing —
+                    // but it does occupy a queue position ahead of pictures
+                    // that DO cost host bytes, so it is charged to
+                    // `filed_this_walk` for every pane after it. The sibling
+                    // arm is neither refused nor charged, and that one is
+                    // proved rather than asserted: it uploads nothing at all
+                    // here, and when the picture it is waiting on arrives
+                    // every sibling is handed the same texture through one
+                    // `PlanViewUploads::handle`, which is one entry in the
+                    // queue and now one charge at the door.
+                    if !self.render.plan_view_picture_slot_free(
+                        pictures_in_pipe.saturating_add(filed_this_walk),
+                    ) {
                         continue;
                     }
 
