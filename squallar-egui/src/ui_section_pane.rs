@@ -230,6 +230,27 @@ pub(super) fn render_cross_section(
     }
 }
 
+/// [`egui::Painter::text`] for a string the caller already owns.
+///
+/// `Painter::text` takes `impl ToString` and calls `to_string()` on it. For a
+/// `String` that is a clone, so a `format!` handed straight to it is allocated
+/// twice and one copy is dropped unread. This hands the layout the string it was
+/// given. Identical geometry: the anchor and paint below are what `Painter::text`
+/// does after the conversion.
+fn paint_owned_text(
+    painter: &egui::Painter,
+    pos: egui::Pos2,
+    anchor: egui::Align2,
+    text: String,
+    font_id: egui::FontId,
+    color: egui::Color32,
+) -> egui::Rect {
+    let galley = painter.layout_no_wrap(text, font_id, color);
+    let rect = anchor.anchor_size(pos, galley.size());
+    painter.galley(rect.min, galley, color);
+    rect
+}
+
 /// One step-control button: a small dark chip with a glyph, clickable.
 fn control_chip(
     ui: &egui::Ui,
@@ -313,7 +334,8 @@ fn render_line_controls(
     );
 
     let length_km = edit::length_km(line);
-    painter.text(
+    paint_owned_text(
+        painter,
         egui::pos2(right - 4.0, top + button.y * 0.5),
         egui::Align2::RIGHT_CENTER,
         line_readout(line, prefs),
@@ -473,7 +495,8 @@ fn paint_axes(
             ],
             egui::Stroke::new(1.0, grid),
         );
-        painter.text(
+        paint_owned_text(
+            painter,
             egui::pos2(layout.plot.left() - 4.0, y),
             egui::Align2::RIGHT_CENTER,
             format!("{shown:.0}"),
@@ -482,7 +505,8 @@ fn paint_axes(
         );
         shown += step;
     }
-    painter.text(
+    paint_owned_text(
+        painter,
         egui::pos2(layout.plot.left() - 4.0, layout.plot.top() - 2.0),
         egui::Align2::RIGHT_BOTTOM,
         format!("MSL {}", prefs.height.kilo_suffix()),
@@ -503,7 +527,8 @@ fn paint_axes(
             ],
             egui::Stroke::new(1.0, grid),
         );
-        painter.text(
+        paint_owned_text(
+            painter,
             egui::pos2(x, layout.plot.bottom() + 2.0),
             egui::Align2::CENTER_TOP,
             format!("{at:.0}"),
@@ -519,7 +544,8 @@ fn paint_axes(
         egui::FontId::proportional(11.0),
         super::SECTION_TRACK_COLOR,
     );
-    painter.text(
+    paint_owned_text(
+        painter,
         egui::pos2(layout.plot.right() - 2.0, layout.plot.bottom() + 2.0),
         egui::Align2::RIGHT_TOP,
         format!("B  ({})", prefs.distance.suffix()),
@@ -1025,3 +1051,7 @@ fn nice_step(span: f64, wanted: f64) -> f64 {
 #[path = "ui_section_pane/tests.rs"]
 #[cfg(test)]
 mod tests;
+
+#[path = "ui_section_pane/owned_text_ratchet.rs"]
+#[cfg(test)]
+mod owned_text_ratchet;
