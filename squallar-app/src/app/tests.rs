@@ -2499,14 +2499,17 @@ fn the_loop_caches_evictions_are_handed_over_and_the_sweep_is_called() {
     assert_eq!(
         body.matches("squallar_worker::offload::discard_each(")
             .count(),
-        4,
-        // Four since the loop cache gained a residency pass beside its
-        // retention one: volumes the loop no longer wants, MOMENTS of frames
-        // it wants but is not drawing, objects, and listings. The count tracks
-        // the number of holders and the property it pins is unchanged — every
-        // holder hands its evictions to the deferred-drop path rather than
-        // freeing them on the frame.
-        "one of the loop's four holders frees its evictions where it evicted \
+        5,
+        // Five since the decoded cache gained a BYTE ceiling beside its two
+        // predicate passes: volumes the loop no longer wants, MOMENTS of
+        // frames it wants but is not drawing, moments shed to bring the
+        // decoded cache back under `LOOP_DECODED_CEILING_BYTES`, objects, and
+        // listings. The count tracks the number of hand-over sites and the
+        // property it pins is unchanged — every one of them hands its
+        // evictions to the deferred-drop path rather than freeing them on the
+        // frame. A ceiling pass is the largest of them all by construction,
+        // since it only runs when the cache is over its budget.
+        "one of the loop's five holders frees its evictions where it evicted \
          them — on the frame thread, ~49 MiB median and 74.6 MiB maximum for a \
          volume (measured, `volume_inventory`), a decoded \
          message plus its own bytes for an object, a day's bucket keys for a \

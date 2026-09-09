@@ -294,3 +294,142 @@ fn a_latest_that_is_the_merge_base_adds_nothing_to_the_still_level() {
         "the shared latest moved the level the stores alone already read",
     );
 }
+
+/// **`radar shared` names the whole of one arrival**, because one arrival is
+/// one allocation the still side and the loop cache both price.
+///
+/// # What an input must carry for the defect to appear
+///
+/// **One `Arc<Scan>` reachable from both sides.** A fixture that files a
+/// volume into the inventory and a *different* one into the loop cache can
+/// run green on every assertion here and say nothing at all: it has no
+/// sharing to measure, so a `radar_shared_level` hard-coded to zero would
+/// satisfy it. That is why this drives `App::poll_data_channels` rather than
+/// filling the stores, and why the `Arc::ptr_eq` below is a precondition and
+/// not a conclusion — the whole finding rests on the arrival path putting one
+/// allocation in three holders, which only the arrival path can demonstrate.
+///
+/// # Why it matters
+///
+/// The census family table adds `still scans` and `loop scans`. On a scene
+/// where each pane is parked on a fetched volume this test says that sum is
+/// about double what emptying both would free, so a memory target read off it
+/// is a target against a quantity that is not on the heap.
+///
+/// TAMPER: return 0 from `App::radar_shared_level` and the sum goes back to
+/// double; return `still_scan_level()` and the loop-only control below fails.
+#[test]
+fn the_shared_level_names_the_whole_of_one_arrival() {
+    let mut app = app_on_site();
+    land_one_archive_volume(&mut app, SITE, at(0));
+
+    let (base, _) = app.volumes.base_for(SITE).expect("the base is resident");
+    let (cached, _) = app
+        .loop_mgr
+        .get_cached(SITE, &at(0))
+        .expect("every arrival is filed in the loop download cache");
+    assert!(
+        Arc::ptr_eq(&base, cached),
+        "fixture: the two sides hold different allocations, so there is no \
+         sharing here for this figure to measure",
+    );
+    let one = squallar_radar::scan_size::scan_bytes(&base) as u64;
+    assert!(one > 0, "fixture: a volume priced at nothing");
+
+    assert_eq!(
+        app.still_scan_level(),
+        one,
+        "precondition: the still side prices this arrival at one volume",
+    );
+    assert_eq!(
+        app.loop_mgr.cached_scan_bytes() as u64,
+        one,
+        "precondition: the loop cache prices the same arrival at one volume",
+    );
+    assert_eq!(
+        app.radar_shared_level(),
+        one,
+        "the two families name 2 x {one} B between them and this says none of \
+         it is shared, so the census's decoded-volume total stays double the \
+         allocation",
+    );
+}
+
+/// **A volume only the loop cache holds is not shared**, and one only the
+/// still side holds is not either — per volume, never as a fraction of the
+/// pair.
+///
+/// The control the test above cannot be read without, and it is built so that
+/// **no simpler expression than the union passes it**. The scene holds three
+/// distinct allocations arranged so the four figures a wrong implementation
+/// would most plausibly return are all different from the right one:
+///
+/// * two volumes on the still side, one of them evicted from the loop cache;
+/// * two volumes in the loop cache, one of them the loop's own frame;
+/// * exactly ONE allocation on both sides.
+///
+/// So `still scans` reads two volumes, `loop scans` reads two, their minimum
+/// reads two, and the answer is one. Returning either family, or the smaller
+/// of them, fails here; only a walk that compares allocations passes.
+///
+/// The fixture volumes all price alike, which is why the discrimination is
+/// built out of *counts* of distinct allocations rather than out of sizes: a
+/// scene where the shared volume happened to be half the cache could not tell
+/// "the shared one" from "half of it".
+#[test]
+fn only_the_allocation_on_both_sides_is_shared() {
+    let mut app = app_on_site();
+    land_one_archive_volume(&mut app, SITE, at(0));
+    land_one_archive_volume(&mut app, OTHER, at(0));
+
+    let (shared, _) = app.volumes.base_for(SITE).expect("KTLX has a base");
+    let (still_only, _) = app.volumes.base_for(OTHER).expect("KOUN has a base");
+    let one = squallar_radar::scan_size::scan_bytes(&shared) as u64;
+    assert!(one > 0, "fixture: a volume priced at nothing");
+    assert_eq!(
+        squallar_radar::scan_size::scan_bytes(&still_only) as u64,
+        one,
+        "fixture: the two arrivals price differently, so the counts below \
+         are not the arithmetic this reads them as",
+    );
+
+    // The other site's volume leaves the loop cache and stays on the still
+    // side: the still-only class, which the drain cannot produce on its own
+    // because `append_scan_to_active_loops` files every arrival in both.
+    let dropped = app.loop_mgr.retain_scans(|site, _, _| site == SITE);
+    assert_eq!(dropped.len(), 1, "fixture: the wrong site's volume left");
+    drop(dropped);
+
+    // A frame the loop downloaded for itself: in the loop cache and in no
+    // still-side holder.
+    let loop_only = crate::volume_fixture::ready_scan();
+    app.loop_mgr
+        .cache_scan(SITE, at(5), (Arc::clone(&loop_only), Default::default()));
+
+    assert_eq!(
+        app.still_scan_level(),
+        2 * one,
+        "precondition: the still side holds two distinct volumes",
+    );
+    assert_eq!(
+        app.loop_mgr.cached_scan_bytes() as u64,
+        2 * one,
+        "precondition: the loop cache holds two distinct volumes",
+    );
+    assert!(
+        Arc::strong_count(&still_only) >= 2 && Arc::strong_count(&loop_only) >= 2,
+        "precondition: the two unshared volumes are still held by their one \
+         side apiece",
+    );
+
+    assert_eq!(
+        app.radar_shared_level(),
+        one,
+        "the shared level is not the ONE allocation both sides name: it read \
+         {} B against a still side of {} B and a loop cache of {} B, so it is \
+         reporting a family rather than measuring an overlap",
+        app.radar_shared_level(),
+        app.still_scan_level(),
+        app.loop_mgr.cached_scan_bytes(),
+    );
+}

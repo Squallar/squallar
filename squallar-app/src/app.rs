@@ -3140,6 +3140,57 @@ impl App {
                 self.loop_mgr.evict_decoded_except(decoded_keep),
             ),
         );
+        // **The decoded cache's own byte bound**, the twin of the archive
+        // ceiling below and for the same reason: the predicate pass above
+        // asks a per-frame question and answers it correctly, and a cache
+        // every one of whose frames legitimately wants its moments can still
+        // be over the ceiling when it is done.
+        //
+        // It gets there through arrivals nothing gates. `cache_scan` admits
+        // every archive-drain volume and every chunk-feed volume without
+        // consulting the ceiling — rightly, those are on screen — while
+        // `decoded_room_for` gates only the loop's own decodes. So the
+        // ceiling refused new work and never reclaimed old, and the loop's
+        // own frames, the only ones that can be traded for a 5.8 % archive,
+        // were never asked to make the room the arrivals took.
+        //
+        // Furthest from a playhead goes first. A pinned volume — one a pane
+        // is parked on, by either of its clocks — is not a candidate at any
+        // ceiling, and neither is one with no archive behind it; both rules
+        // live in `evict_decoded_to_ceiling`, which asks them of the entry.
+        //
+        // **THIS CALL SITE IS UNGATED, and so is the archive twin's below.**
+        // The policy itself is gated at a ceiling a fixture can reach, because
+        // it takes one as a parameter; what no test in this tree reaches is
+        // the wiring here, since a test process cannot hold
+        // `LOOP_DECODED_CEILING_BYTES` of real volumes and the constant is
+        // compiled in rather than carried on `Budgets`. So a wrong ceiling, or
+        // a `pinned` closure that forgot `parked`, would read green
+        // everywhere. Said rather than papered over: a caller-level test that
+        // ran under the ceiling would pass whatever these arguments were,
+        // which is the shape of gate this campaign keeps finding.
+        squallar_worker::offload::discard_each(
+            "evicted-loop-decoded-ceiling",
+            crate::volume_inventory::volume_drop_parts(self.loop_mgr.evict_decoded_to_ceiling(
+                squallar_device_profile::constants::LOOP_DECODED_CEILING_BYTES,
+                |site, ts| {
+                    frame_distance
+                        .get(site)
+                        .and_then(|frames| frames.get(ts))
+                        .copied()
+                        .unwrap_or(u64::MAX)
+                },
+                |site, ts, scan| {
+                    if settling.contains(site) {
+                        return true;
+                    }
+                    let collected = squallar_radar::types::volume_collected_at(scan);
+                    parked.iter().any(|&(at_site, at)| {
+                        at_site == site && (at == *ts || Some(at) == collected)
+                    })
+                },
+            )),
+        );
         // **The compressed cache's own bound**, in bytes rather than frames
         // because the archive swings 16.5x across the measured corpus while
         // the frame count does not. Furthest from a playhead goes first; an

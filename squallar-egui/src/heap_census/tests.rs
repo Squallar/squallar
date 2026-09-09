@@ -14,6 +14,15 @@ fn distinct() -> Census {
         still_scan_bytes: 4,
         derive_memo_bytes: 8,
         loop_frame_scan_bytes: 16,
+        // **Not a power of two, and the one figure here that cannot be
+        // one.** Every other row is a distinct bit so the sum is `2^29 - 1`
+        // and a field swapped for its neighbour fails; this row is a
+        // CORRECTION to the radar families and is bounded by them, so a bit
+        // above `chunk feed`'s would saturate `radar_ceiling` to zero and the
+        // derivation below would be about a clamp rather than about the
+        // arithmetic. 3 is distinct from every other figure here, which is
+        // what the run exists to buy.
+        radar_shared_bytes: 3,
         render_cache_bytes: 32,
         cached_render_bytes: 16_777_216,
         raster_shared_bytes: 33_554_432,
@@ -71,11 +80,18 @@ fn the_resident_total_leaves_the_gpu_families_out() {
     let every_family = (1u64 << 29) - 1;
     assert_eq!(
         c.resident_total(),
-        every_family - c.tile_mesh_bytes - c.gpu_texture_bytes - c.raster_shared_bytes,
+        every_family
+            - c.tile_mesh_bytes
+            - c.gpu_texture_bytes
+            - c.raster_shared_bytes
+            - c.radar_shared_bytes,
         "the resident total swept in a family that holds nothing: the two GPU \
          ones (it is a residual against a linear-memory `byteLength`, which no \
-         device byte is on) or `raster shared`, which is one allocation two \
-         families counted and not a third copy of it",
+         device byte is on) or one of the two shared terms, each of which is \
+         one allocation two families counted and not a third copy of it. \
+         `radar shared` is subtracted rather than merely left out, because \
+         `resident_total` folds the radar families in through \
+         `radar_ceiling`, which has already taken it off their sum",
     );
     assert_eq!(c.radar_total(), 1 + 2 + 4 + 8 + 16 + 8_388_608);
 }
@@ -126,6 +142,7 @@ fn the_line_names_every_family_and_its_denominator() {
         "derive memo 8 B",
         "loop frame scans 16 B",
         "chunk feed 8388608 B",
+        "radar shared 3 B",
         "render cache 32 B",
         "overlay grids 128 B",
         "overlay items 256 B",
@@ -180,6 +197,7 @@ fn the_widest_line_fits_the_hooks_buffer() {
         still_scan_bytes: u64::MAX,
         derive_memo_bytes: u64::MAX,
         loop_frame_scan_bytes: u64::MAX,
+        radar_shared_bytes: u64::MAX,
         render_cache_bytes: u64::MAX,
         cached_render_bytes: u64::MAX,
         raster_shared_bytes: u64::MAX,
@@ -290,7 +308,7 @@ fn the_resident_floor_moves_only_the_shared_families() {
     let c = distinct();
     assert_eq!(
         c.resident_total() - c.resident_floor(),
-        (c.radar_total() - c.radar_floor()) + c.raster_shared_bytes,
+        (c.radar_ceiling() - c.radar_floor()) + c.raster_shared_bytes,
         "the floor moved a family that is not shared"
     );
     assert!(c.resident_floor() < c.resident_total());

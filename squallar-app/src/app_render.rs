@@ -3003,6 +3003,7 @@ impl super::App {
         census::set_loop_scan_bytes(self.loop_mgr.cached_scan_bytes() as u64);
         census::set_loop_l3_bytes(self.loop_mgr.cached_l3_bytes() as u64);
         census::set_still_scan_bytes(self.still_scan_level());
+        census::set_radar_shared_bytes(self.radar_shared_level());
         census::set_derive_memo_bytes(squallar_radar::derive::memo_bytes() as u64);
         census::set_render_cache_bytes(self.render.render_cache.resident_bytes() as u64);
         // `renders in flight` is published at its seams, where the bytes
@@ -3044,6 +3045,71 @@ impl super::App {
                     (site.as_str(), scan, self.volumes.latest_price(site))
                 }),
         ) as u64
+    }
+
+    /// **Bytes `still scans` and `loop scans` name twice between them**,
+    /// measured: what the two families publish, less what the allocator
+    /// actually granted for the distinct volumes behind them.
+    ///
+    /// The correction the census cannot make for itself. Its holders are
+    /// spread across two crates — `VolumeInventory` and `App` are this one's,
+    /// the loop download cache is `squallar_radar`'s — so only the app can
+    /// compare their pointers, which is the same reason `raster_shared_bytes`
+    /// lives on the dispatcher.
+    ///
+    /// **It is the ordinary case.** `App::poll_data_channels` clones one
+    /// arrival's `Arc<Scan>` into the base, into the still (or the latest),
+    /// and into the loop cache via `append_scan_to_active_loops`, which files
+    /// every arrival unconditionally. So on a scene where each pane is parked
+    /// on a fetched volume the two families are largely the same bytes, and
+    /// their sum is roughly double what emptying both would free.
+    ///
+    /// Written as `published − union` rather than as "the intersection", the
+    /// way the raster term is, so it also carries the loop cache's own
+    /// internal sharing: a volume filed under both of its clocks is one
+    /// allocation that family prices twice, and the correction to their sum
+    /// has to name it.
+    ///
+    /// **Each pointer takes the LARGEST price any row gives it.** The rows
+    /// should agree — every one of them is `scan_size::scan_bytes` of the
+    /// same allocation — but a holder with no price row answers 0
+    /// (`latest_price`, `base_bytes`), and taking the max makes an unpriced
+    /// row widen the union rather than shrink it. The union is what is
+    /// subtracted, so that resolves the uncertainty toward a SMALLER claimed
+    /// overlap and a looser ceiling: this figure can never say the heap is
+    /// smaller than it is.
+    ///
+    /// `Vec::contains` over a handful of pointers rather than a `HashSet`,
+    /// and on the 2 s telemetry tick, never on a frame: the still side is at
+    /// most `MAX_RESIDENT_STILL_VOLUMES` plus a base and a latest per site,
+    /// the loop side a few dozen, and no gate is read.
+    pub(crate) fn radar_shared_level(&self) -> u64 {
+        let published = self
+            .still_scan_level()
+            .saturating_add(self.loop_mgr.cached_scan_bytes() as u64);
+        published.saturating_sub(self.radar_union_level())
+    }
+
+    /// **What the allocator granted for every distinct decoded volume the
+    /// still side and the loop download cache hold between them** — each
+    /// `Arc` counted once, whichever holder names it.
+    fn radar_union_level(&self) -> u64 {
+        let still_side =
+            self.volumes
+                .priced_allocations_with(self.latest_cached_scans.iter().map(
+                    |(site, (scan, _, _, _))| {
+                        (site.as_str(), scan, self.volumes.latest_price(site))
+                    },
+                ));
+        let mut seen: Vec<(*const nexrad_model::data::Scan, usize)> = Vec::new();
+        for (ptr, bytes) in still_side.chain(self.loop_mgr.cached_scan_allocations()) {
+            match seen.iter_mut().find(|(held, _)| *held == ptr) {
+                Some((_, price)) => *price = (*price).max(bytes),
+                None => seen.push((ptr, bytes)),
+            }
+        }
+        seen.into_iter()
+            .fold(0u64, |sum, (_, bytes)| sum.saturating_add(bytes as u64))
     }
 
     /// **Judge one reading of the page's linear memory** against the line

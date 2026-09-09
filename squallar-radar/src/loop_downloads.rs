@@ -628,6 +628,134 @@ impl LoopDownloadManager {
         removed
     }
 
+    /// **Hold the DECODED volumes inside a BYTE ceiling**, evicting the ones
+    /// furthest from a playhead first and keeping their archives. Hands the
+    /// removed volumes back owned, for the deferred-drop path.
+    ///
+    /// # The gap this closes
+    ///
+    /// `LOOP_DECODED_CEILING_BYTES` was an **admission** gate and nothing
+    /// else: `decoded_room_for` refuses a new decode over the ceiling, and no
+    /// path took the cache back down to it once it was over. It gets over in
+    /// the first place because [`Self::cache_scan`] is ungated — every archive
+    /// drain arrival (the pane fetch, the auto-poll, the adjacent-volume
+    /// nudge) and every chunk-feed volume is filed here with no admission
+    /// check at all, which is right, because those volumes are on screen. The
+    /// consequence was not: a cache pushed past the ceiling by arrivals it
+    /// cannot refuse stayed past it, and the loop's own frames — which *can*
+    /// be traded for their archives at a median 5.8 % of the decoded cost —
+    /// were never asked to make the room.
+    ///
+    /// The archive half has had this bound since `d5b2dbe4e`
+    /// ([`Self::evict_archives_to_ceiling`]); this is its twin, and the
+    /// asymmetry between them was the defect.
+    ///
+    /// # What it will not evict
+    ///
+    /// Two hold-backs, and each is asked of the **entry**, never of the set:
+    ///
+    /// * **A volume with no archive behind it**, [`Self::evict_decoded_except`]'s
+    ///   premise and for its reason — this policy's cost is a decode, and for
+    ///   a volume with nothing to decode from it would silently become a
+    ///   re-download policy.
+    /// * **A volume `pinned` says something is drawing right now.** The
+    ///   caller answers that off the volume's own clocks, because a pane's
+    ///   `scan_info` may carry either the address or the identity. A pinned
+    ///   volume is skipped whatever the ceiling says: the ceiling may never
+    ///   take a picture off the glass.
+    ///
+    /// So the ceiling is a **target and not a guarantee**, exactly as the
+    /// archive twin's is. A cache that is entirely pinned stays over it, and
+    /// that is the correct failure — the alternative is a blank pane.
+    ///
+    /// `rank` is asked per held volume and orders eviction: **higher is
+    /// evicted first**, so a caller passes distance from the nearest
+    /// playhead. An evicted volume comes back through the decode arm of the
+    /// pump ([`Self::frames_needing_decode`]) at no network cost, which is why
+    /// the cost of being wrong here is a wait and never a gap.
+    ///
+    /// O(held) and only when over the ceiling; held is a few dozen.
+    pub fn evict_decoded_to_ceiling(
+        &mut self,
+        ceiling: usize,
+        rank: impl Fn(&str, &chrono::NaiveDateTime) -> u64,
+        pinned: impl Fn(&str, &chrono::NaiveDateTime, &nexrad_model::data::Scan) -> bool,
+    ) -> Vec<CachedVolume> {
+        if self.scan_bytes_cached <= ceiling {
+            return Vec::new();
+        }
+        // Candidates only: an entry with no archive or one something is
+        // drawing is not a candidate at all, so it is never ranked and can
+        // never be reached by the walk below however far over the ceiling
+        // this cache is.
+        let mut held: Vec<(u64, String, chrono::NaiveDateTime, usize)> = Vec::new();
+        for (site, scans) in &self.scan_cache {
+            let archived = self.archive_cache.get(site.as_str());
+            for (ts, (scan, _)) in scans {
+                if !archived.is_some_and(|archives| archives.contains_key(ts)) {
+                    continue;
+                }
+                if pinned(site.as_str(), ts, scan) {
+                    continue;
+                }
+                let price = self
+                    .scan_prices
+                    .get(&(site.clone(), *ts))
+                    .copied()
+                    .unwrap_or(0);
+                held.push((rank(site.as_str(), ts), site.clone(), *ts, price));
+            }
+        }
+        // Furthest first, and the stamp breaks a tie so two volumes at equal
+        // distance evict in a fixed order rather than in map order.
+        held.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(&b.2)));
+        let mut removed = Vec::new();
+        for (_, site, ts, price) in held {
+            if self.scan_bytes_cached <= ceiling {
+                break;
+            }
+            let Some(scans) = self.scan_cache.get_mut(&site) else {
+                continue;
+            };
+            let Some(volume) = scans.remove(&ts) else {
+                continue;
+            };
+            if scans.is_empty() {
+                self.scan_cache.remove(&site);
+            }
+            // The price row leaves with the volume, so a later re-decode
+            // files a fresh one rather than double-charging this cache.
+            self.scan_prices.remove(&(site, ts));
+            self.scan_bytes_cached = self.scan_bytes_cached.saturating_sub(price);
+            removed.push(volume);
+        }
+        removed
+    }
+
+    /// **Every decoded volume this cache holds, as its allocation and what it
+    /// was priced at** — for a caller measuring how much of `loop scans`
+    /// another family names too.
+    ///
+    /// Pointers and not volumes: the question is identity, no gate is read,
+    /// and a caller that walked the radials again would be paying
+    /// [`crate::scan_size::scan_bytes`] a second time for a figure this cache
+    /// already took at arrival.
+    pub fn cached_scan_allocations(
+        &self,
+    ) -> impl Iterator<Item = (*const nexrad_model::data::Scan, usize)> + '_ {
+        self.scan_cache.iter().flat_map(move |(site, scans)| {
+            scans.iter().map(move |(ts, (scan, _))| {
+                (
+                    Arc::as_ptr(scan),
+                    self.scan_prices
+                        .get(&(site.clone(), *ts))
+                        .copied()
+                        .unwrap_or(0),
+                )
+            })
+        })
+    }
+
     /// **Drop every archive whose `(site, timestamp)` fails `keep`.**
     ///
     /// Asked with the address alone and not with the volume, unlike
@@ -2468,6 +2596,246 @@ mod archive_tests {
             "not one of them left: this is a policy refusing to evict, not an \
              eviction that failed",
         );
+    }
+
+    /// **The decoded ceiling reclaims, and it reclaims the right entry** —
+    /// furthest from a playhead first, and never one that is drawing or one
+    /// with nothing to rebuild from.
+    ///
+    /// # What an input must carry for the defect to appear
+    ///
+    /// Three things at once, and a fixture missing any one of them is
+    /// structurally unable to reach this defect class however green it runs:
+    ///
+    /// 1. **The cache must be OVER the ceiling.** Only reachable because
+    ///    `ceiling` is a parameter — a policy that read
+    ///    `LOOP_DECODED_CEILING_BYTES` inside itself could not be driven into
+    ///    its own working range by any fixture that fits in a test process,
+    ///    and every assertion about it would be about the branch not taken.
+    /// 2. **At least one evictable candidate**: archived, unpinned, and far
+    ///    enough out that the ranking has something to order. Without it the
+    ///    walk returns empty and the hold-backs below are unfalsifiable, since
+    ///    "nothing was evicted" would be the right answer anyway.
+    /// 3. **At least one of EACH protected class, resident at the same
+    ///    time** — one pinned volume and one archive-less volume. A fixture
+    ///    holding only candidates proves the eviction and nothing about what
+    ///    the eviction refuses.
+    ///
+    /// Each entry is asserted against **what that entry needs**, by
+    /// `Arc::strong_count`, and never against a total: a cache that shed the
+    /// right number of bytes by evicting the pinned volume and keeping a far
+    /// one would satisfy any figure-shaped assertion and be the exact defect
+    /// this exists to catch.
+    ///
+    /// `Arc::strong_count` and not `cached_scan_count`: a store row is not a
+    /// byte, and the whole campaign this lands in turns on the difference —
+    /// the same allocation is held by the still inventory and by this cache,
+    /// so a count falling to zero here proves nothing about the heap. What
+    /// proves it is the refcount of the allocation itself, taken after the
+    /// returned volumes are dropped.
+    ///
+    /// TAMPER: drop the `pinned` skip and the parked volume is evicted from
+    /// under its pane; drop the `archived` skip and the archive-less volume
+    /// goes with nothing able to hand it back; reverse the sort and the
+    /// nearest frame to the playhead is the one that goes.
+    #[test]
+    fn the_decoded_ceiling_evicts_the_furthest_and_refuses_the_protected() {
+        use chrono::Timelike;
+        let one = crate::scan_size::scan_bytes(&priced_volume().0);
+        // Room for three of the five, so the walk must both evict and stop:
+        // a policy that emptied every candidate would also satisfy "under the
+        // ceiling" and is what the `ts(4)` assertion below rules out.
+        let ceiling = one * 3;
+
+        let mut mgr = LoopDownloadManager::new();
+        let mut held: Vec<(u32, Arc<nexrad_model::data::Scan>)> = Vec::new();
+        for minute in [0, 2, 4, 6, 8] {
+            let volume = priced_volume();
+            held.push((minute, Arc::clone(&volume.0)));
+            mgr.cache_scan("KTLX", ts(minute), volume);
+        }
+        // Every one but ts(2): that one is the archive-less class.
+        for minute in [0, 4, 6, 8] {
+            mgr.cache_archive("KTLX", ts(minute), archive(1024));
+        }
+        let at = |minute: u32| -> &Arc<nexrad_model::data::Scan> {
+            &held
+                .iter()
+                .find(|(m, _)| *m == minute)
+                .expect("the fixture filed this minute")
+                .1
+        };
+
+        assert_eq!(
+            mgr.cached_scan_bytes(),
+            one * 5,
+            "precondition: five distinct volumes at one price, so the \
+             arithmetic below is about which of them went",
+        );
+        assert!(
+            mgr.cached_scan_bytes() > ceiling,
+            "precondition: the cache is over the ceiling, which is the only \
+             state this policy acts in",
+        );
+        for (minute, volume) in &held {
+            assert_eq!(
+                Arc::strong_count(volume),
+                2,
+                "precondition: minute {minute} is held by the cache and by \
+                 this test and by nothing else",
+            );
+        }
+
+        // **The rank DESCENDS with the stamp, so the two protected entries
+        // are the two the walk would reach FIRST.** That is the whole design
+        // of this fixture and not an incidental ordering: with the protected
+        // entries ranked nearest, a walk that had lost its hold-backs would
+        // still stop at the ceiling before reaching them, and every assertion
+        // about what this policy refuses would be about a branch the fixture
+        // cannot enter. Ranked furthest, dropping either guard evicts a
+        // protected volume on the first or second step.
+        let rank = |minute: u32| 100u64 - u64::from(minute) * 5;
+        let removed = mgr.evict_decoded_to_ceiling(
+            ceiling,
+            |_, ts| rank(ts.and_utc().minute()),
+            |_, ts, _| ts.and_utc().minute() == 0,
+        );
+        drop(removed);
+
+        assert_eq!(
+            Arc::strong_count(at(4)),
+            1,
+            "the furthest evictable frame is archived and unpinned and was \
+             not evicted",
+        );
+        assert_eq!(
+            Arc::strong_count(at(6)),
+            1,
+            "the second-furthest evictable frame was needed to reach the \
+             ceiling and stayed",
+        );
+        assert_eq!(
+            Arc::strong_count(at(8)),
+            2,
+            "the ceiling was already met and the nearest frame was evicted \
+             anyway, so the walk empties rather than reclaiming",
+        );
+        assert_eq!(
+            Arc::strong_count(at(2)),
+            2,
+            "the volume with no archive behind it was evicted, which turns a \
+             residency policy into a re-download policy",
+        );
+        assert_eq!(
+            Arc::strong_count(at(0)),
+            2,
+            "the volume a pane is parked on was evicted by a byte ceiling, \
+             which is a blank pane",
+        );
+        assert_eq!(
+            mgr.cached_scan_bytes(),
+            ceiling,
+            "the running total did not follow the volumes out",
+        );
+        for minute in [4, 6] {
+            assert!(
+                mgr.has_archive("KTLX", &ts(minute)),
+                "minute {minute} lost its archive with its moments, so the \
+                 trade this policy is built on cannot be made back",
+            );
+        }
+    }
+
+    /// **Under the ceiling the policy is inert.** The control for the test
+    /// above: a walk that evicted whatever `rank` put last would satisfy
+    /// every assertion there and would be shedding volumes a cache with room
+    /// for them is entitled to keep.
+    ///
+    /// TAMPER: delete the early return **and** the eviction loop's own
+    /// `break`. Either alone is covered by the other — they are two spellings
+    /// of one predicate, the first there to skip building and ranking the
+    /// candidate list at all on a sweep with nothing to do — so naming only
+    /// one would be a tamper this gate cannot see, which is a claim about the
+    /// gate and not about the code. Removing both fails on the first volume.
+    #[test]
+    fn the_decoded_ceiling_evicts_nothing_while_the_cache_fits() {
+        let one = crate::scan_size::scan_bytes(&priced_volume().0);
+        let mut mgr = LoopDownloadManager::new();
+        let mut held = Vec::new();
+        for minute in [0, 2] {
+            let volume = priced_volume();
+            held.push(Arc::clone(&volume.0));
+            mgr.cache_scan("KTLX", ts(minute), volume);
+            mgr.cache_archive("KTLX", ts(minute), archive(1024));
+        }
+        assert!(
+            mgr.cached_scan_bytes() <= one * 2,
+            "precondition: the fixture is inside the ceiling it is given",
+        );
+
+        let removed = mgr.evict_decoded_to_ceiling(one * 2, |_, _| u64::MAX, |_, _, _| false);
+
+        assert!(removed.is_empty(), "a cache that fits shed volumes anyway");
+        for volume in &held {
+            assert_eq!(
+                Arc::strong_count(volume),
+                2,
+                "a volume left the cache while it was under its ceiling",
+            );
+        }
+    }
+
+    /// **A cache whose every volume is protected stays over the ceiling**, and
+    /// that is the correct failure.
+    ///
+    /// The ceiling is a target, not a guarantee, for the same reason the
+    /// archive twin's is: the alternative to holding a pinned volume past a
+    /// byte budget is taking a picture off the glass. Gated rather than
+    /// stated, because "it would never happen" is what the archive-less
+    /// arrivals were said to be.
+    ///
+    /// TAMPER: make either hold-back conditional on the ceiling and this goes
+    /// red on the class that loses its exemption.
+    #[test]
+    fn the_decoded_ceiling_never_takes_a_drawing_volume_off_the_glass() {
+        use chrono::Timelike;
+        let one = crate::scan_size::scan_bytes(&priced_volume().0);
+        let mut mgr = LoopDownloadManager::new();
+        let mut held = Vec::new();
+        for minute in [0, 2, 4] {
+            let volume = priced_volume();
+            held.push(Arc::clone(&volume.0));
+            mgr.cache_scan("KTLX", ts(minute), volume);
+        }
+        // **One entry per class, and each protected by exactly ONE guard**,
+        // so a tamper on either is reachable. ts(0) and ts(2) are archived
+        // and pinned, so only `pinned` stands between them and a ceiling of
+        // zero; ts(4) is unpinned with no archive, so only the archive rule
+        // stands between it and the same ceiling. Pinning all three would
+        // have made the archive rule unfalsifiable here.
+        for minute in [0, 2] {
+            mgr.cache_archive("KTLX", ts(minute), archive(1024));
+        }
+
+        let removed = mgr.evict_decoded_to_ceiling(
+            0,
+            |_, _| u64::MAX,
+            |_, ts, _| matches!(ts.and_utc().minute(), 0 | 2),
+        );
+
+        assert!(
+            removed.is_empty(),
+            "a ceiling of zero evicted a volume every hold-back protects",
+        );
+        assert_eq!(
+            mgr.cached_scan_bytes(),
+            one * 3,
+            "the cache is expected to sit over its ceiling here; a figure \
+             that fell means something was taken",
+        );
+        for volume in &held {
+            assert_eq!(Arc::strong_count(volume), 2);
+        }
     }
 
     /// **A moment no listing named is still offered back to the decode arm**,

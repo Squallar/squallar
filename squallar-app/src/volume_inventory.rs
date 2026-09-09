@@ -553,6 +553,24 @@ impl VolumeInventory {
             .fold(0usize, |sum, (_, _, bytes)| sum.saturating_add(bytes))
     }
 
+    /// **Every priced volume the still side holds, as its allocation and its
+    /// price**, with the per-site latest cache folded in the way
+    /// [`resident_scan_bytes_with`](Self::resident_scan_bytes_with) folds it.
+    ///
+    /// NOT de-duplicated, unlike that figure: the caller is building a union
+    /// across this side *and* the loop download cache, so it needs the rows
+    /// and does its own collapsing. Pointers and not volumes — the question
+    /// is identity, and re-walking a volume's radials to re-price it is the
+    /// cost every holder here already paid once at arrival.
+    pub(crate) fn priced_allocations_with<'s, 'a: 's>(
+        &'s self,
+        latest: impl Iterator<Item = LatestVolume<'a>> + 's,
+    ) -> impl Iterator<Item = (*const Scan, usize)> + 's {
+        self.priced_volumes()
+            .map(|(_, ptr, bytes)| (ptr, bytes))
+            .chain(latest.map(|(_, scan, bytes)| (Arc::as_ptr(scan), bytes)))
+    }
+
     /// Every priced volume in both stores, as `(key, allocation, bytes)`.
     ///
     /// `key` is a **total order over the entries**, which is what lets

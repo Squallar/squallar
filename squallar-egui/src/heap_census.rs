@@ -191,6 +191,8 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// `font atlas` is 10 characters: `10 + 25 = 35`, so 1170 + 35 = 1205.
 /// `overlay replies` is 15 characters, so it adds `15 + 25 = 40`: 1205 + 40
 /// = 1245.
+/// `radar shared` is 12 characters, so it adds `12 + 25 = 37`: 1245 + 37 =
+/// 1282.
 ///
 /// This chain is a DERIVATION and not a record: every term in it moves
 /// when a family is added or removed, so re-derive it rather than nudging the
@@ -201,7 +203,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// width, so the derivation above and the line agree exactly. Do that after
 /// any change here — the chain being right twice is worth ten seconds, and
 /// the `<=` will not tell you.
-pub const CENSUS_LINE_CAPACITY: usize = 1245;
+pub const CENSUS_LINE_CAPACITY: usize = 1282;
 
 /// One family's level. A `u64` of bytes, `Relaxed` throughout: every reader
 /// wants a recent figure, none wants a synchronised one, and a census torn
@@ -355,6 +357,34 @@ families! {
          is the behaviour test beside it, \
          `a_pane_does_not_keep_the_pixels_it_was_shown`, which lets go of \
          every other holder and requires the allocation to be gone.";
+    RADAR_SHARED_BYTES, radar_shared_bytes, set_radar_shared_bytes,
+        "**Bytes `still scans` and `loop scans` BOTH name** - one \
+         `Arc<Scan>` two families price, and NOT a holder of anything. Left \
+         out of the flat part of [`Census::resident_total`] for that reason, \
+         the way `rasters shared` is: nothing on this heap is these bytes a \
+         second time. \
+         IT IS THE ORDINARY CASE AND NOT AN EDGE. One archive arrival is \
+         `Arc::clone`d into `VolumeInventory::base`, `VolumeInventory::still` \
+         (or `App::latest_cached_scans`) and the loop download cache, in one \
+         statement in the drain - `App::append_scan_to_active_loops` files \
+         EVERY arrival in the loop cache unconditionally - so on a scene \
+         where each pane is parked on a fetched volume, every byte the still \
+         side names is named by the loop side too. Reading a target off \
+         `still scans + loop scans` on such a scene is reading roughly double \
+         the heap. \
+         A MEASURED UNION, not a `max`: the app walks both holders and \
+         compares `Arc` pointers, so it says exactly how much of the pair is \
+         one allocation, where [`Census::radar_floor`] can only give the \
+         largest member. \
+         **THE QUESTION IT ANSWERS**, said exactly: *how much do `still \
+         scans` and `loop scans` name twice between them*. It is NOT the \
+         wider question of how much of this census's decoded-volume bytes are \
+         double-counted - `derive memo` holds synthetic volumes that share \
+         nothing, `loop frame scans` holds its own cloned sweeps, and `chunk \
+         feed` overlaps `still scans` by a route this walk does not span \
+         (radar's assembler is not the app's inventory). Those stay inside \
+         [`Census::radar_floor`]'s range, which is why the range is still \
+         published.";
     RASTER_SHARED_BYTES, raster_shared_bytes, set_raster_shared_bytes,
         "**Bytes `render cache` and `cached renders` BOTH name** - the \
          correction term that turns their sum into a range, and NOT a holder \
@@ -684,7 +714,7 @@ impl Census {
     /// both: the truth is between them and this instrument cannot say where.
     pub fn resident_total(&self) -> u64 {
         [
-            self.radar_total(),
+            self.radar_ceiling(),
             // A real allocation that no other family names, so it is summed
             // flat rather than through `radar_total`'s upper bound: the
             // decoded-volume families share `Arc`s with each other and this
@@ -731,6 +761,24 @@ impl Census {
             .saturating_add(self.derive_memo_bytes)
             .saturating_add(self.loop_frame_scan_bytes)
             .saturating_add(self.chunk_feed_bytes)
+    }
+
+    /// **The decoded-volume families with the ONE overlap this census can
+    /// measure taken out** — the tightest upper bound it can publish.
+    ///
+    /// [`Self::radar_total`] is the plain sum and stays that way, because a
+    /// reader comparing family rows against a total has to be able to add the
+    /// rows up and get it. This is the figure everything downstream should
+    /// use instead: `still scans` and `loop scans` name one `Arc<Scan>`
+    /// between them on every arrival the drain files, and `radar shared` is
+    /// the measured size of that intersection.
+    ///
+    /// Still an upper bound and not a partition: the other overlaps named in
+    /// [`Self::radar_total`] — `chunk feed` against `still scans`, above all —
+    /// are not measured by any walk, so they are still counted twice here.
+    /// [`Self::radar_floor`] remains the other end.
+    pub fn radar_ceiling(&self) -> u64 {
+        self.radar_total().saturating_sub(self.radar_shared_bytes)
     }
 
     /// **The two plan-view raster families, summed as an upper bound.**
@@ -825,7 +873,7 @@ impl Census {
     /// the size of the caveat, not a correction to it.
     pub fn resident_floor(&self) -> u64 {
         self.resident_total()
-            .saturating_sub(self.radar_total())
+            .saturating_sub(self.radar_ceiling())
             .saturating_add(self.radar_floor())
             .saturating_sub(self.raster_shared_bytes)
     }
@@ -885,6 +933,7 @@ pub fn write_line<W: core::fmt::Write>(
          loop l3 {} B, still l3 {} B, \
          still scans {} B, \
          derive memo {} B, loop frame scans {} B, chunk feed {} B, \
+         radar shared {} B, \
          render cache {} B, cached renders {} B, rasters shared {} B, \
          render pools {} B, \
          renders in flight {} B, \
@@ -901,6 +950,7 @@ pub fn write_line<W: core::fmt::Write>(
         census.derive_memo_bytes,
         census.loop_frame_scan_bytes,
         census.chunk_feed_bytes,
+        census.radar_shared_bytes,
         census.render_cache_bytes,
         census.cached_render_bytes,
         census.raster_shared_bytes,
