@@ -1079,8 +1079,14 @@ fn a_jointly_released_volume_comes_back_whole() {
         "precondition: the joint release happened",
     );
 
-    // The volume arrives back in the loop cache — the one place a decode
-    // files it — and the state-derived pass takes it from there.
+    // **The whole production sequence, in its order.** A gate reader finds
+    // the base released and asks (`ensure_base_whole`, which with nothing
+    // cached and nothing in flight dispatches a decode and files the ask);
+    // the decode lands in the loop cache — the one place a decode files it —
+    // and the state-derived pass takes it from there. The ask is not
+    // decoration: the restore is gated on it, and a pass over a base nothing
+    // asked for is exactly what `restore_released_base` now declines.
+    app.ensure_base_whole(SITE);
     app.loop_mgr
         .cache_scan(SITE, at(0), (Arc::clone(&base), Default::default()));
     app.restore_released_bases();
@@ -1105,6 +1111,229 @@ fn a_jointly_released_volume_comes_back_whole() {
     assert!(
         app.still_scan_level() > 0,
         "the restored volume is priced at nothing",
+    );
+}
+
+/// **A loop frame landing on a released base does NOT put the volume back**,
+/// because a cached volume is not a demand.
+///
+/// This is the cut. `restore_released_bases` used to ask one question — does
+/// the loop download cache hold a whole volume keyed to what this base is
+/// waiting for — and every site the app loops answers yes within seconds of
+/// the withdrawal. So a base the residency pass had just correctly released
+/// came straight back, with no pane reading its gates and none owed a picture,
+/// and the release was worth nothing for the rest of the leg: about 48 MiB of
+/// `still scans`, observed on four legs across both arms.
+///
+/// The fixture is the shape that made it routine and not a corner: the loop
+/// cache holds the very volume the base was keyed to, which after
+/// `evict_decoded_except` files the frame again is the ordinary state of a
+/// looping site.
+///
+/// TAMPER: drop the `base_gate_asks` check from
+/// `App::restore_released_base`.
+#[test]
+fn a_cached_volume_alone_does_not_bring_a_released_base_back() {
+    let mut app = app_on_site();
+    land_one_archive_volume(&mut app, SITE, at(0));
+    the_pane_has_its_picture(&mut app);
+    app.loop_mgr
+        .cache_archive(SITE, at(0), std::sync::Arc::new(vec![0u8; 4096]));
+    let (base, _) = app.volumes.base_for(SITE).expect("a base");
+
+    app.evict_unshown_scans();
+    assert!(
+        app.volumes.base_is_released(SITE),
+        "precondition: nothing was released, so there is nothing to put back",
+    );
+    let released_level = app.still_scan_level();
+    assert_eq!(
+        released_level, 0,
+        "precondition: the joint release did not free the volume, so a restore \
+         cannot be shown to give it back",
+    );
+
+    // A loop frame lands on the site — the same volume, filed by the same
+    // cache, for a reason that has nothing to do with the base.
+    app.loop_mgr
+        .cache_scan(SITE, at(0), (Arc::clone(&base), Default::default()));
+    app.restore_released_bases();
+
+    assert!(
+        app.volumes.base_is_released(SITE),
+        "a loop frame arriving rebuilt a merge base no pane reads the gates of \
+         and none is owed a picture from, which undoes the withdrawal within \
+         seconds of every boot",
+    );
+    assert!(
+        app.volumes.still_for(SITE, at(0)).is_none(),
+        "the still came back beside a base that did not, which is the half \
+         state the joint release exists to make impossible",
+    );
+
+    let (offered, declined, restored) = app.base_restores.counts();
+    assert_eq!(
+        (offered, declined, restored),
+        (1, 1, 0),
+        "the counter did not price the refusal: a pass that declines nothing \
+         and a pass that is never offered anything both read as a working cut",
+    );
+}
+
+/// **A demand brings it straight back when the volume is already cached**, on
+/// the path where no decode is dispatched and therefore no download reply
+/// runs the restore pass.
+///
+/// The liveness half of the clause above, and the one a naive gate gets
+/// wrong. `ensure_base_whole` returns early when the loop cache is already
+/// holding the volume, on the reasoning that "the restore pass will take it";
+/// with the pass gated on the ask, there is no pass to take it — the batch
+/// that would run one is a download that never happens. A section pane would
+/// wait forever, which is the failure that reads as a hang.
+///
+/// TAMPER: make the `is_cached` arm of `App::ensure_base_whole` a bare
+/// `return`.
+#[test]
+fn a_gate_reader_takes_a_cached_volume_back_with_no_decode_at_all() {
+    let mut app = app_on_site();
+    land_one_archive_volume(&mut app, SITE, at(0));
+    the_pane_has_its_picture(&mut app);
+    app.loop_mgr
+        .cache_archive(SITE, at(0), std::sync::Arc::new(vec![0u8; 4096]));
+    let (base, _) = app.volumes.base_for(SITE).expect("a base");
+    let collected = app.volumes.base_collected_at(SITE).expect("a base");
+
+    app.evict_unshown_scans();
+    assert!(
+        app.volumes.base_is_released(SITE),
+        "precondition: nothing was released",
+    );
+    app.loop_mgr
+        .cache_scan(SITE, at(0), (Arc::clone(&base), Default::default()));
+
+    app.ensure_base_whole(SITE);
+
+    assert!(
+        app.volumes.base_for(SITE).is_some(),
+        "a gate reader asked for a base whose volume was already in the cache \
+         and was left waiting on a download that will never be dispatched",
+    );
+    assert!(
+        app.volumes.still_for(SITE, collected).is_some(),
+        "the base came back without the still, so the plan-view render asks \
+         forever",
+    );
+    assert_eq!(
+        app.base_restore_dispatches.get(),
+        0,
+        "the ask spent a whole-volume decode to rebuild bytes this process \
+         was already holding",
+    );
+    let (offered, declined, restored) = app.base_restores.counts();
+    assert_eq!(
+        (offered, declined, restored),
+        (1, 0, 1),
+        "the counter did not price the restore it just made",
+    );
+}
+
+/// **The withdrawal drops the ask with the gates**, so a demand that has since
+/// gone cannot let the next loop frame put a later volume back.
+///
+/// The ask outliving its reader is a one-shot leak of the whole cut, and the
+/// path is ordinary rather than a corner: a gate reader asks, its decode is
+/// still on the way when the pane moves off the site, and the auto-poll lands
+/// the next volume — which installs a fresh base WITH gates, by a route that
+/// runs no restore and therefore clears nothing. The residency pass then
+/// releases that base because nothing reads it, and a stale ask would wave the
+/// next cached volume straight back through.
+///
+/// The release is the moment that knows nothing wants the gates — it is the
+/// condition it fired on — so it is where the entry goes.
+///
+/// **The first cycle deliberately does not complete.** A restore that
+/// succeeds clears the ask itself, so a fixture that lets one happen proves
+/// nothing about this line: measured, a first draft of this test passed with
+/// the `remove` deleted.
+///
+/// TAMPER: delete the `base_gate_asks.remove` in
+/// `App::release_unneeded_base_gates`.
+#[test]
+fn releasing_the_gates_drops_the_ask_that_asked_for_them() {
+    let mut app = app_on_site();
+    land_one_archive_volume(&mut app, SITE, at(0));
+    the_pane_has_its_picture(&mut app);
+    app.loop_mgr
+        .cache_archive(SITE, at(0), std::sync::Arc::new(vec![0u8; 4096]));
+
+    app.evict_unshown_scans();
+    assert!(
+        app.volumes.base_is_released(SITE),
+        "fixture: nothing was released, so there is no ask to make",
+    );
+    // The ask, with no cached volume behind it: the joint release took the
+    // loop cache's decoded half, so this dispatches a decode and leaves the
+    // entry standing rather than restoring and clearing it.
+    app.ensure_base_whole(SITE);
+    assert_eq!(
+        app.base_restore_dispatches.get(),
+        1,
+        "fixture: the ask was served on the spot, so it cleared itself and \
+         this test cannot reach the line it is for",
+    );
+
+    // **The first cycle's archive goes before the second's lands, and the
+    // fixture is wrong without it.** Every arrival here carries the same
+    // fixture volume, so two archives filed under two addresses decode to ONE
+    // identity — and `archive_for_identity` answers by scanning a map and
+    // taking the first match, so with both filed it returns at(0) or at(1)
+    // depending on hash order. at(0) is the address the ask above marked in
+    // flight, and the withdrawal declines an in-flight address, so the second
+    // release fired or did not fire per run: measured 2 of 5 runs green on
+    // this fixture before the sweep was added. Production never sees the
+    // ambiguity — two arrivals are two volumes and two identities — so this
+    // is the fixture being made to describe one arrival at a time, not a
+    // hazard being papered over.
+    app.loop_mgr.retain_archives(|_, ts, _| *ts != at(0));
+
+    // The next volume lands and installs a base with gates — a route that
+    // runs no restore, so nothing here clears the ask.
+    land_one_archive_volume(&mut app, SITE, at(1));
+    let (base, _) = app
+        .volumes
+        .base_for(SITE)
+        .expect("the arrival installed a base");
+    let collected = app.volumes.base_collected_at(SITE).expect("a base");
+    app.loop_mgr
+        .cache_archive(SITE, at(1), std::sync::Arc::new(vec![0u8; 4096]));
+    the_pane_has_its_picture(&mut app);
+
+    app.evict_unshown_scans();
+    assert!(
+        app.volumes.base_is_released(SITE),
+        "fixture: the second withdrawal did not fire, so there is nothing for \
+         a stale ask to undo",
+    );
+
+    app.loop_mgr
+        .cache_scan(SITE, at(1), (Arc::clone(&base), Default::default()));
+    app.restore_released_bases();
+
+    assert!(
+        app.volumes.base_is_released(SITE),
+        "an ask left standing from a reader that has gone let the next cached \
+         volume rebuild the base, which is the defect with one more step in \
+         front of it",
+    );
+    assert!(
+        app.volumes.still_for(SITE, collected).is_none(),
+        "the still came back on a stale ask",
+    );
+    let (offered, declined, restored) = app.base_restores.counts();
+    assert_eq!(
+        (offered, declined, restored),
+        (1, 1, 0),
+        "the counter did not price the refusal",
     );
 }
 

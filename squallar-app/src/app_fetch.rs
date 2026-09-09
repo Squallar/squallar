@@ -2840,7 +2840,10 @@ impl super::App {
     ///
     /// Cheap enough to call from a per-pane walk: two map lookups and a set
     /// probe on the common path, where the base has its gates and this returns
-    /// at the first line.
+    /// at the first line. The arm that restores from the cache below is a map
+    /// insert and an `Arc` move, and it runs once per withdrawal rather than
+    /// once per frame — the first thing it does is put the gates back, so the
+    /// next call returns at that same first line.
     ///
     /// # Why it can decline
     ///
@@ -2883,6 +2886,16 @@ impl super::App {
         if !self.volumes.base_is_released(site) {
             return;
         }
+        // **The ask, recorded before anything can decline to act on it.**
+        //
+        // This call IS the demand — a gate read or a picture that could not be
+        // served — and the restore side is gated on it
+        // (`App::restore_released_base`), so it has to be filed on every path
+        // out of this function that leaves the base released, not only on the
+        // one that spends a decode. An ask filed after the `is_cached` return
+        // below would be an ask the caller never made on the one input where
+        // the volume is already there.
+        self.base_gate_asks.insert(site.to_string());
         let Some(collected) = self.volumes.base_collected_at(site) else {
             return;
         };
@@ -2894,9 +2907,24 @@ impl super::App {
             );
             return;
         };
-        // Already whole in the cache, or already on its way: the restore pass
-        // will take it. Both questions are the loop cache's own.
-        if self.loop_mgr.is_cached(site, &address) || self.loop_mgr.is_in_flight(site, &address) {
+        // **Already whole in the cache: take it here and now.**
+        //
+        // This used to return and leave it to the restore pass, which runs off
+        // a completed download batch — and there is no download to complete,
+        // because the volume is what a loop frame or an earlier decode already
+        // put there. That was harmless only while the restore pass took every
+        // cached volume it found for any released base whatever; once the
+        // restore asks whether anything wanted the gates, the pass has to be
+        // reachable from the ask itself or a section pane waits on a batch
+        // that is never coming.
+        if self.loop_mgr.is_cached(site, &address) {
+            self.restore_released_base(site);
+            return;
+        }
+        // Already on its way: the restore pass will take it when it lands, and
+        // the ask above is what will let it through. The question is the loop
+        // cache's own.
+        if self.loop_mgr.is_in_flight(site, &address) {
             return;
         }
         #[cfg(test)]

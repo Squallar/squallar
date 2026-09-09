@@ -347,6 +347,38 @@ pub struct App {
     /// [`crate::budget_telemetry::HostHeapWatch`] carries the whole account
     /// of why the question is open and why the answer is a counter.
     host_heap_watch: crate::budget_telemetry::HostHeapWatch,
+    /// **Sites that have asked for their merge base's gates back**, and the
+    /// whole of what [`Self::restore_released_bases`] is allowed to act on.
+    ///
+    /// The mirror of the withdrawal's own question. `release_unneeded_base_gates`
+    /// takes a base's gates only where no pane reads them and no pane is owed
+    /// a picture from the site; the restore used to ask nothing at all, and
+    /// gave a base its volume back the moment the loop download cache
+    /// happened to be holding one — so a volume released for good reason came
+    /// straight back on the next loop frame that landed, with nothing on the
+    /// screen wanting it.
+    ///
+    /// Written by [`Self::ensure_base_whole`], which is the demand side and
+    /// nothing else: the three callers are the gate reader's extraction, the
+    /// section dispatch and the plan-view dispatch that found its still gone.
+    /// So an entry here is not "a pane exists that might want this" but "a
+    /// read of these gates failed, this frame". Cleared where the base is
+    /// restored and where it is released again, so it is never a set that
+    /// grows.
+    ///
+    /// **Not the withdrawal's two sets themselves**, and the reason is
+    /// mechanical: they are built in a walk over the panes, this file's reads
+    /// through the GUI seam sit on a permanent ceiling with no slack, and the
+    /// restore runs from the download-reply path where no such walk is in
+    /// progress. The demand side answers the same question one step later and
+    /// costs no reach.
+    base_gate_asks: std::collections::HashSet<String>,
+    /// **How often a released base was offered its volume back, and how often
+    /// nothing wanted it** — the counter that says whether the ask-gate above
+    /// fires on a leg, and how much.
+    /// [`crate::budget_telemetry::BaseRestoreCounts`] says why the instrument
+    /// is a count and not a byte figure.
+    base_restores: crate::budget_telemetry::BaseRestoreCounts,
     /// **The budget system's readout** — per pane, what the scene costs and
     /// what the pane's stores hold; per pool, capacity, need and spare
     /// (`squallar_egui::shell_api::BudgetReadout`). Re-stated to the Gui with
@@ -1023,6 +1055,8 @@ impl App {
             texture_ceiling,
             host_headroom_bytes: 0,
             host_heap_watch: crate::budget_telemetry::HostHeapWatch::default(),
+            base_gate_asks: std::collections::HashSet::new(),
+            base_restores: crate::budget_telemetry::BaseRestoreCounts::default(),
             budget_readout: squallar_egui::shell_api::BudgetReadout::default(),
             admission_costs: squallar_egui::admission::AdmissionCosts::default(),
             admission: squallar_egui::admission::AdmissionLedger::default(),
@@ -3494,6 +3528,13 @@ impl App {
             let Some(released) = self.volumes.release_base_gates(&site) else {
                 continue;
             };
+            // **The ask goes with the gates.** Nothing reads them or this
+            // withdrawal would not have reached here, so any entry standing
+            // from an earlier demand describes a reader that has since gone —
+            // and left set it would let the next loop frame to land on this
+            // site put the volume straight back, which is the whole of what
+            // the ask-gate on the restore exists to stop.
+            self.base_gate_asks.remove(&site);
             // **The JOINT release, and it is joint because anything less frees
             // nothing.** Both arrival paths clone ONE `Arc<Scan>` into the
             // base, the still store and the loop download cache, and the
@@ -3540,20 +3581,19 @@ impl App {
         }
     }
 
-    /// **Give every released merge base its volume back, where the loop
-    /// download cache is now holding it.**
+    /// **Give a released merge base its volume back where something asked for
+    /// the gates**, from wherever the loop download cache is now holding it.
     ///
     /// A state re-derivation asked after a decode batch lands: which bases are
-    /// released, and does the cache hold a whole volume keyed to what each is
-    /// waiting for. Deliberately not a reply handler — a volume that arrived
-    /// because a loop wanted it restores the base just as well as one
-    /// `ensure_base_whole` asked for, and a dropped reply costs a pass rather
-    /// than a permanently released base.
+    /// released, has one of them been asked for, and does the cache hold a
+    /// whole volume keyed to what it is waiting for. Deliberately not a reply
+    /// handler — a volume that arrived because a loop wanted it serves an
+    /// outstanding ask just as well as one `ensure_base_whole` dispatched a
+    /// decode for, and a dropped reply costs a pass rather than a permanently
+    /// released base.
     ///
-    /// `restore_base_gates` refuses a mismatch: it compares the volume's own
-    /// first radial against the instant the base is keyed to, so a base that
-    /// advanced while a decode was in flight is not re-dated by bytes
-    /// belonging to the volume it replaced.
+    /// What is NOT enough is the volume alone, and that is the whole of the
+    /// change: [`Self::restore_released_base`] carries the account.
     pub(super) fn restore_released_bases(&mut self) {
         let released: Vec<String> = self
             .volumes
@@ -3562,37 +3602,90 @@ impl App {
             .map(str::to_string)
             .collect();
         for site in released {
-            let Some(collected) = self.volumes.base_collected_at(&site) else {
-                continue;
-            };
-            let Some((address, _)) = self.loop_mgr.archive_for_identity(&site, collected) else {
-                continue;
-            };
-            let Some((scan, declared)) = self.loop_mgr.get_cached(&site, &address) else {
-                continue;
-            };
-            let (scan, declared) = (Arc::clone(scan), Arc::clone(declared));
-            if self.volumes.restore_base_gates(&site, Arc::clone(&scan)) {
-                // **The still comes back with the base**, at the identity the
-                // base is keyed to — which is exactly the key a pane's
-                // `scan_info.timestamp` carries, so the plan-view render reads
-                // it back with the key it asks for. Both were released
-                // together and both are needed together: a base with gates
-                // beside a missing still would leave `dispatch_pane_renders`
-                // asking forever.
-                if self.volumes.still_for(&site, collected).is_none() {
-                    squallar_worker::offload::discard_each(
-                        "capped-still",
-                        crate::volume_inventory::volume_drop_parts(self.volumes.install_still(
-                            site.clone(),
-                            collected,
-                            (scan, declared),
-                        )),
-                    );
-                }
-                log::debug!("{site}: merge base and still restored from the archive");
-            }
+            self.restore_released_base(&site);
         }
+    }
+
+    /// **One released base's restore, and the ask-gate is here.**
+    ///
+    /// Split out of the pass above because [`Self::ensure_base_whole`] needs
+    /// exactly this and not the pass: when the volume a caller wants is
+    /// already sitting in the loop download cache there is no decode to
+    /// dispatch and therefore no download reply to run the pass, and a demand
+    /// that only marked itself would wait forever for a batch that is not
+    /// coming.
+    ///
+    /// # What it asks that the pass never used to
+    ///
+    /// A cached volume existing was the whole of the old predicate, and that
+    /// is the defect: `release_unneeded_base_gates` asks whether any pane
+    /// reads the site's gates or is owed a picture from it and takes the
+    /// volume only where the answer is no, and then the very next loop frame
+    /// to land on that site put it straight back. Measured on four legs across
+    /// both arms of the previous lane's A/B, worth about 48 MiB of `still
+    /// scans` for the rest of a leg.
+    ///
+    /// So the mirror: a base comes back where something asked for it
+    /// ([`Self::base_gate_asks`]), and a cached volume alone is not an ask.
+    /// The refusals are counted rather than silent — see
+    /// [`crate::budget_telemetry::BaseRestoreCounts`] for why the instrument
+    /// is a count.
+    ///
+    /// # It is still a state re-derivation
+    ///
+    /// The ask is a set membership and not a queued message, so a demand made
+    /// while the decode was in flight is still true when it lands, a demand
+    /// made twice restores once, and a restore that `restore_base_gates`
+    /// refuses on identity leaves the ask standing for the volume that
+    /// actually matches. `ensure_base_whole` re-derives on
+    /// `base_is_released`, so every frame a read of released gates fails the
+    /// ask is made again — which is what makes a dropped reply cost a pass
+    /// rather than a permanently released base.
+    pub(super) fn restore_released_base(&mut self, site: &str) {
+        let Some(collected) = self.volumes.base_collected_at(site) else {
+            return;
+        };
+        let Some((address, _)) = self.loop_mgr.archive_for_identity(site, collected) else {
+            return;
+        };
+        let Some((scan, declared)) = self.loop_mgr.get_cached(site, &address) else {
+            return;
+        };
+        let (scan, declared) = (Arc::clone(scan), Arc::clone(declared));
+        // Every condition the restore used to need is now met, which is what
+        // makes this the denominator the two counts below are read against.
+        self.base_restores.offered();
+        if !self.base_gate_asks.contains(site) {
+            self.base_restores.declined();
+            return;
+        }
+        // `restore_base_gates` refuses a mismatch: it compares the volume's
+        // own first radial against the instant the base is keyed to, so a base
+        // that advanced while a decode was in flight is not re-dated by bytes
+        // belonging to the volume it replaced.
+        if !self.volumes.restore_base_gates(site, Arc::clone(&scan)) {
+            return;
+        }
+        self.base_gate_asks.remove(site);
+        self.base_restores.restored();
+        // **The still comes back with the base**, at the identity the
+        // base is keyed to — which is exactly the key a pane's
+        // `scan_info.timestamp` carries, so the plan-view render reads
+        // it back with the key it asks for. Both were released
+        // together and both are needed together: a base with gates
+        // beside a missing still would leave `dispatch_pane_renders`
+        // asking forever.
+        if self.volumes.still_for(site, collected).is_none() {
+            squallar_worker::offload::discard_each(
+                "capped-still",
+                crate::volume_inventory::volume_drop_parts(self.volumes.install_still(
+                    site.to_string(),
+                    collected,
+                    (scan, declared),
+                )),
+            );
+        }
+        log::debug!("{site}: merge base and still restored from the archive");
     }
 
     /// Persist the config if it has changed and the interval has elapsed.

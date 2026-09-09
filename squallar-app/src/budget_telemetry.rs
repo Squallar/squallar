@@ -755,6 +755,73 @@ pub(crate) fn host_heap_watch_line(
     )
 }
 
+/// **How often a released merge base was offered its volume back, and how
+/// often nothing wanted its gates.**
+///
+/// Counts and not bytes, deliberately. What the ask-gate on the restore side
+/// separates is one volume — a measured 48.4 MiB, triple-named across `still
+/// scans`, `loop scans` and `radar shared` — and at three legs an arm the
+/// bytes cannot resolve it: the previous lane measured a within-arm spread
+/// wider than its between-arm difference and claimed nothing either way. A
+/// count of the times the clause fired has no such spread, so it is what says
+/// whether the cut is live on a leg at all, and how often.
+///
+/// Running totals for the life of the process, never levels, which is why
+/// they get a line of their own rather than a family on the census.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BaseRestoreCounts {
+    offered: u32,
+    declined: u32,
+    restored: u32,
+}
+
+impl BaseRestoreCounts {
+    /// A released base the loop download cache is holding a matching whole
+    /// volume for — every condition the restore used to need, and the
+    /// denominator the other two are read against.
+    pub(crate) fn offered(&mut self) {
+        self.offered = self.offered.saturating_add(1);
+    }
+
+    /// One of those turned away because nothing had asked for the gates.
+    /// **This is the cut**: every one of these was a rebuild the old
+    /// predicate made and nothing read.
+    pub(crate) fn declined(&mut self) {
+        self.declined = self.declined.saturating_add(1);
+    }
+
+    /// One of those carried through, because something had.
+    pub(crate) fn restored(&mut self) {
+        self.restored = self.restored.saturating_add(1);
+    }
+
+    pub(crate) fn counts(self) -> (u32, u32, u32) {
+        (self.offered, self.declined, self.restored)
+    }
+}
+
+/// `base restore: offered N, declined N, restored N` — said every telemetry
+/// period, on every target.
+///
+/// `offered` counts released bases the loop download cache could have rebuilt;
+/// `declined` those the ask-gate turned away because no pane read the gates
+/// and none was owed a picture; `restored` those something had asked for.
+/// The first is the denominator of the other two, and it is NOT their sum: a
+/// restore that passes the ask and is then refused by
+/// `VolumeInventory::restore_base_gates` on identity is offered and neither.
+///
+/// The fields are written as `N` on purpose. The example on
+/// [`host_heap_watch_line`] above was quoted back as a measured session result
+/// within the hour of it being written, so a line that has not been read on a
+/// running application carries no figures at all.
+///
+/// Its own line and never appended to `budget state:`, which is scraped by a
+/// regex whose groups are positional.
+pub(crate) fn base_restore_line(counts: BaseRestoreCounts) -> String {
+    let (offered, declined, restored) = counts.counts();
+    format!("base restore: offered {offered}, declined {declined}, restored {restored}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3025,6 +3025,15 @@ impl super::App {
                 self.host_heap_watch,
             ),
         );
+        // **How often a released merge base was offered its volume back and
+        // how often nothing wanted it.** Running totals, so a line of their
+        // own: everything the census line below carries is a level, and the
+        // two must never be added. `budget state:` is scraped by a positional
+        // regex and is never appended to.
+        say_telemetry(
+            loud,
+            &crate::budget_telemetry::base_restore_line(self.base_restores),
+        );
         self.publish_heap_census();
         // **One reading of the idle policy, off the level the call above just
         // folded.** `render pools` is the largest family on a quiet scene and
