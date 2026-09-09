@@ -193,6 +193,8 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// = 1245.
 /// `radar shared` is 12 characters, so it adds `12 + 25 = 37`: 1245 + 37 =
 /// 1282.
+/// `base skeletons` is 14 characters, so it adds `14 + 25 = 39`: 1282 + 39 =
+/// 1321.
 ///
 /// This chain is a DERIVATION and not a record: every term in it moves
 /// when a family is added or removed, so re-derive it rather than nudging the
@@ -203,7 +205,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// width, so the derivation above and the line agree exactly. Do that after
 /// any change here — the chain being right twice is worth ten seconds, and
 /// the `<=` will not tell you.
-pub const CENSUS_LINE_CAPACITY: usize = 1282;
+pub const CENSUS_LINE_CAPACITY: usize = 1321;
 
 /// One family's level. A `u64` of bytes, `Relaxed` throughout: every reader
 /// wants a recent figure, none wants a synchronised one, and a census torn
@@ -357,6 +359,21 @@ families! {
          is the behaviour test beside it, \
          `a_pane_does_not_keep_the_pixels_it_was_shown`, which lets go of \
          every other holder and requires the allocation to be gone.";
+    BASE_SKELETON_BYTES, base_skeleton_bytes, set_base_skeleton_bytes,
+        "**Merge-base STRUCTURES whose gate arrays have been released** - a \
+         real allocation, named once, sharing nothing with any decoded volume. \
+         A skeleton keeps every scalar a frame-thread reader consults (cut \
+         angles, elevation numbers, radial counts, azimuths, collection times, \
+         each moment's presence and its `gate_count`) and holds no gate bytes \
+         at all. Measured at 3.18 % of a VCP-212-shaped volume, so this row \
+         RISING while `still scans` falls by ~31x is the trade working, not two \
+         families disagreeing. \
+         Summed flat rather than through `radar_ceiling`: it is its own \
+         allocation, `Arc<VolumeSkeleton>` and not `Arc<Scan>`, so no \
+         pointer-keyed de-duplication reaches it and nothing else on this heap \
+         is these bytes a second time. It is also why a released base drops out \
+         of `still scans` entirely rather than being priced small there - that \
+         family is decoded volumes, and this is not one.";
     RADAR_SHARED_BYTES, radar_shared_bytes, set_radar_shared_bytes,
         "**Bytes `still scans` and `loop scans` BOTH name** - one \
          `Arc<Scan>` two families price, and NOT a holder of anything. Left \
@@ -720,6 +737,7 @@ impl Census {
             // decoded-volume families share `Arc`s with each other and this
             // shares with none of them.
             self.loop_archive_bytes,
+            self.base_skeleton_bytes,
             self.still_l3_bytes,
             self.render_cache_bytes,
             self.cached_render_bytes,
@@ -931,7 +949,7 @@ pub fn write_line<W: core::fmt::Write>(
         out,
         "heap census ({instance}): loop scans {} B, loop archives {} B, \
          loop l3 {} B, still l3 {} B, \
-         still scans {} B, \
+         still scans {} B, base skeletons {} B, \
          derive memo {} B, loop frame scans {} B, chunk feed {} B, \
          radar shared {} B, \
          render cache {} B, cached renders {} B, rasters shared {} B, \
@@ -947,6 +965,7 @@ pub fn write_line<W: core::fmt::Write>(
         census.loop_l3_bytes,
         census.still_l3_bytes,
         census.still_scan_bytes,
+        census.base_skeleton_bytes,
         census.derive_memo_bytes,
         census.loop_frame_scan_bytes,
         census.chunk_feed_bytes,

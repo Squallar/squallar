@@ -3054,6 +3054,7 @@ impl super::App {
         census::set_loop_l3_bytes(self.loop_mgr.cached_l3_bytes() as u64);
         census::set_still_scan_bytes(self.still_scan_level());
         census::set_radar_shared_bytes(self.radar_shared_level());
+        census::set_base_skeleton_bytes(self.volumes.base_skeleton_bytes() as u64);
         census::set_derive_memo_bytes(squallar_radar::derive::memo_bytes() as u64);
         census::set_render_cache_bytes(self.render.render_cache.resident_bytes() as u64);
         // `renders in flight` is published at its seams, where the bytes
@@ -4180,6 +4181,17 @@ impl super::App {
             };
             let (lat, lon) = (scan_info.site.lat, scan_info.site.lon);
 
+            // **A released base is not an absent one, and must not be
+            // reported as one.** `base_for` is `None` for a base whose gates
+            // have gone, and `section_source_refusal` would read that as
+            // `AwaitingVolume` and blank a pane that is showing a perfectly
+            // good cut. So the restore is asked for and this pass is skipped
+            // with the previous picture and its `rendered_for` key untouched:
+            // the pane keeps what it has and re-cuts when the gates land.
+            if self.volumes.base_is_released(site.as_str()) {
+                self.ensure_base_whole(site.as_str());
+                continue;
+            }
             let base = self.volumes.base_for(site.as_str());
             let overlay = self.chunk_feeds.snapshot(site.as_str());
 
@@ -5243,6 +5255,13 @@ impl super::App {
             completed_count += 1;
         }
         if completed_count > 0 {
+            // **A released base takes its volume back from the cache the
+            // decode filed it in.** A state re-derivation and not a reply
+            // handler: it asks which bases are released and whether the cache
+            // now holds what they are keyed to, so a volume that arrived for
+            // any other reason restores the base just as well as one this
+            // lane asked for.
+            self.restore_released_bases();
             self.loop_mgr.complete_batch(completed_count);
             // Both datasources: the concurrency budget is shared, so the slots this
             // batch released belong to whoever is owed work. See

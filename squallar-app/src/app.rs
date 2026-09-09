@@ -610,6 +610,17 @@ pub struct App {
     volume_store: std::sync::Arc<squallar_volumetric::bridge::VolumeStore>,
     #[cfg(test)]
     pub(crate) volume_extractions: std::cell::Cell<u32>,
+    /// **Decodes `ensure_base_whole` actually dispatched**, counted where the
+    /// dispatch happens.
+    ///
+    /// The in-flight SET cannot stand in for this: it is keyed by site, so its
+    /// length is 1 whether the guard that reads it is there or not — measured,
+    /// on a tamper that deleted the guard and left a length assertion green.
+    /// The replies cannot either, because the job funnel does not run in a
+    /// headless test and the count is 0 with or without the guard. This is the
+    /// quantity, and it is counted at the one line that spends it.
+    #[cfg(test)]
+    pub(crate) base_restore_dispatches: std::cell::Cell<u32>,
     /// How a thread that is not this one asks for a frame.
     redraw_waker: RedrawWaker,
     location: LocationFacade,
@@ -1043,6 +1054,8 @@ impl App {
             volume_store: std::sync::Arc::new(squallar_volumetric::bridge::VolumeStore::new()),
             #[cfg(test)]
             volume_extractions: std::cell::Cell::new(0),
+            #[cfg(test)]
+            base_restore_dispatches: std::cell::Cell::new(0),
             http_client,
             #[cfg(not(target_arch = "wasm32"))]
             tokio_runtime,
@@ -2241,6 +2254,12 @@ impl App {
         self.volume_extractions
             .set(self.volume_extractions.get() + 1);
         let radar = squallar_radar::sites::get_radar_site(site)?;
+        // **The gate reader's ask.** This walks a product's MOMENTS out of the
+        // merged volume, so a base whose arrays have been released cannot
+        // serve it. `base_for` already answers `None` there; the restore is
+        // asked for here so the next pass has the gates rather than this one
+        // failing silently forever.
+        self.ensure_base_whole(site);
         let base = self.volumes.base_for(site);
         let overlay = merge_live
             .then(|| self.chunk_feeds.snapshot(site))
@@ -2277,11 +2296,18 @@ impl App {
         site: &str,
         product: squallar_radar::types::RadarProduct,
     ) -> Option<u64> {
-        let base = self.volumes.base_for(site);
+        // **Structure, not gates.** `ladder_fingerprint` reads cut angles,
+        // elevation numbers, radial counts, the first radial's collection time
+        // and each moment's presence and `gate_count` — no gate byte, proven
+        // in `squallar_radar::skeleton`'s tests — so a base whose arrays have
+        // been released answers this identically and does not have to be
+        // restored to be asked.
+        let base = self.volumes.base_structure_for(site);
         let overlay = self.chunk_feeds.snapshot(site);
         squallar_radar::current::resolve(
-            base.as_ref()
-                .map(|(scan, declared)| squallar_radar::nyquist::Volume::new(scan, declared)),
+            base.as_ref().map(|(structure, declared, _)| {
+                squallar_radar::nyquist::Volume::new(structure.structure(), declared)
+            }),
             overlay
                 .as_ref()
                 .map(|live| squallar_radar::nyquist::Volume::new(&live.scan, &live.declared)),
@@ -2292,11 +2318,14 @@ impl App {
     /// The stamp of `site`'s current merged volume: the newest data time (its identity,
     /// advanced by every sealed sweep) and the base volume's start where one contributes.
     fn current_volume_stamp(&mut self, site: &str) -> Option<squallar_egui::CurrentVolumeStamp> {
-        let base = self.volumes.base_with_time(site);
+        // Structure, for `current_ladder_fingerprint`'s reason:
+        // `newest_data_time` reads collection times and nothing else.
+        let base = self.volumes.base_structure_for(site);
         let overlay = self.chunk_feeds.snapshot(site);
         let current = squallar_radar::current::resolve(
-            base.as_ref()
-                .map(|(scan, declared, _)| squallar_radar::nyquist::Volume::new(scan, declared)),
+            base.as_ref().map(|(structure, declared, _)| {
+                squallar_radar::nyquist::Volume::new(structure.structure(), declared)
+            }),
             overlay
                 .as_ref()
                 .map(|live| squallar_radar::nyquist::Volume::new(&live.scan, &live.declared)),
@@ -2808,10 +2837,30 @@ impl App {
         // fine enough question to retain by: two panes on one site at two
         // moments hold two volumes, and the one nobody is parked at has to go.
         let mut parked: Vec<(&str, chrono::NaiveDateTime)> = Vec::with_capacity(pane_count);
+        // **Sites some pane reads the merge base's GATES on** — a cross
+        // section cuts from its moments and a 3D pane resamples them, and a
+        // released structure serves neither. Collected in the walk that is
+        // already borrowing the panes rather than in one of its own: this
+        // file's reads through the GUI seam sit on a permanent ceiling with no
+        // slack, so a second walk would be a production add needing a
+        // production shed to pay for it.
+        //
+        // The needle is not spelled out above on purpose —
+        // `gui_seam_ratchet_tests` scrapes this file as TEXT, so writing it in
+        // prose costs a reach as surely as writing the code does. Measured:
+        // an earlier draft of this comment put the count at 36 against a
+        // ceiling of 35.
+        let mut gate_readers: std::collections::HashSet<String> = std::collections::HashSet::new();
         for idx in 0..pane_count {
             let Some(pane) = self.gui.pane(idx) else {
                 continue;
             };
+            // Read BEFORE `needs_radar_data`'s early return below, so a
+            // section pane that answers false there still protects its site's
+            // gates.
+            if pane.cross_section().is_some() || pane.volume().is_some() {
+                gate_readers.insert(pane.site().to_string());
+            }
             // **A pane that needs no radar data retains none.**
             //
             // The fetch gates that landed on 2026-09-07 stopped a pane with
@@ -2897,6 +2946,9 @@ impl App {
         );
         self.render.retain_extracts(|key| !unshown(&key.site));
         self.evict_unneeded_loop_scans();
+        // After the loop sweep, so a base whose archive that sweep just
+        // evicted is not released against a way back it no longer has.
+        self.release_unneeded_base_gates(&gate_readers);
         squallar_radar::derive::retain_volumes(
             self.volumes
                 .resident()
@@ -3242,6 +3294,113 @@ impl App {
             "evicted-loop-l3-listing",
             self.loop_mgr.retain_l3_keys(keep_site),
         );
+    }
+
+    /// **Release the gate arrays of every merge base nothing needs gates
+    /// from**, keeping the structure the frame-thread readers consult.
+    ///
+    /// A base's gates are read by exactly two things: the cross-section cut
+    /// and the 3D resample, both of which are dispatched rather than run per
+    /// frame. Its structure is read every frame — `current_ladder_fingerprint`
+    /// per section pane and `current_volume_stamp` once a site — and needs no
+    /// gate at all
+    /// (`squallar_radar::skeleton::tests::the_gateless_readers_answer_the_same_off_a_skeleton`).
+    /// So a site showing neither a section nor a 3D view is holding
+    /// 33.7-82.7 MiB to answer questions a 3.18 % skeleton answers identically.
+    ///
+    /// # What it will not release
+    ///
+    /// * **A base with no archive behind it.** The way back is a decode, and
+    ///   for a base with nothing to decode from this would be a re-download
+    ///   policy — or, on the chunk feed's assembled volumes, which are filed
+    ///   with `archive: None` and are outside the archive trade entirely, no
+    ///   way back at all. Asked through `archive_for_identity`, because a
+    ///   base is keyed by its own first radial and the archive by the second
+    ///   its S3 key names, and the two are equal on 0 of 171 measured volumes.
+    /// * **A site any pane is showing a section or a 3D view on.** Those are
+    ///   the gate readers. Asked of every pane, not of the pane the eviction
+    ///   happens to be walking: a section pane on the same site as a map pane
+    ///   must keep the site's gates whichever pane is asked first.
+    /// * **A site with a restore already in flight**, which would otherwise
+    ///   release the gates a decode is on its way to deliver.
+    ///
+    /// # What it does NOT yet buy on a live pane
+    ///
+    /// Nothing, and that is a property of the sharing rather than of this
+    /// policy. Both arrival paths clone ONE `Arc<Scan>` into the base and into
+    /// the still store, so releasing the base's reference leaves the still
+    /// holding the allocation and `live_bytes` does not move — pinned in
+    /// `emptying_the_still_store_frees_nothing_while_the_base_holds_the_same_volume`.
+    /// Where it pays today is a base the still store does NOT share: a pane
+    /// parked on a moment the base has advanced past. The joint release across
+    /// all four holders is the next change, and this is the half of it that
+    /// can be built and gated on its own.
+    fn release_unneeded_base_gates(&mut self, gate_readers: &std::collections::HashSet<String>) {
+        let sites: Vec<String> = self.volumes.sites_with_base().map(str::to_string).collect();
+        for site in sites {
+            if !self.volumes.base_has_gates(&site) || gate_readers.contains(&site) {
+                continue;
+            }
+            let Some(collected) = self.volumes.base_collected_at(&site) else {
+                continue;
+            };
+            let Some((address, _)) = self.loop_mgr.archive_for_identity(&site, collected) else {
+                continue;
+            };
+            // A decode already on its way would land on a base this is about
+            // to release, and the release would be undone by its own restore
+            // one pass later.
+            if self.loop_mgr.is_in_flight(&site, &address) {
+                continue;
+            }
+            if let Some(released) = self.volumes.release_base_gates(&site) {
+                squallar_worker::offload::discard_each(
+                    "released-base-gates",
+                    crate::volume_inventory::volume_drop_parts(std::iter::once((
+                        released,
+                        std::sync::Arc::new(squallar_radar::nyquist::DeclaredNyquist::empty()),
+                    ))),
+                );
+            }
+        }
+    }
+
+    /// **Give every released merge base its volume back, where the loop
+    /// download cache is now holding it.**
+    ///
+    /// A state re-derivation asked after a decode batch lands: which bases are
+    /// released, and does the cache hold a whole volume keyed to what each is
+    /// waiting for. Deliberately not a reply handler — a volume that arrived
+    /// because a loop wanted it restores the base just as well as one
+    /// `ensure_base_whole` asked for, and a dropped reply costs a pass rather
+    /// than a permanently released base.
+    ///
+    /// `restore_base_gates` refuses a mismatch: it compares the volume's own
+    /// first radial against the instant the base is keyed to, so a base that
+    /// advanced while a decode was in flight is not re-dated by bytes
+    /// belonging to the volume it replaced.
+    pub(super) fn restore_released_bases(&mut self) {
+        let released: Vec<String> = self
+            .volumes
+            .sites_with_base()
+            .filter(|site| self.volumes.base_is_released(site))
+            .map(str::to_string)
+            .collect();
+        for site in released {
+            let Some(collected) = self.volumes.base_collected_at(&site) else {
+                continue;
+            };
+            let Some((address, _)) = self.loop_mgr.archive_for_identity(&site, collected) else {
+                continue;
+            };
+            let Some((scan, _)) = self.loop_mgr.get_cached(&site, &address) else {
+                continue;
+            };
+            let scan = Arc::clone(scan);
+            if self.volumes.restore_base_gates(&site, scan) {
+                log::debug!("{site}: merge base restored from its archive");
+            }
+        }
     }
 
     /// Persist the config if it has changed and the interval has elapsed.

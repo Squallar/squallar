@@ -795,6 +795,39 @@ impl LoopDownloadManager {
         })
     }
 
+    /// **The compressed bytes a volume with this IDENTITY was decoded from**,
+    /// found through the address the cache filed it under.
+    ///
+    /// The reverse of what `archive_identity` is keyed by, and the direction a
+    /// restore asks in: a holder that keeps a volume by its own first radial —
+    /// `VolumeInventory`'s merge base does — knows the identity and not the
+    /// address, and the two are equal on 0 of the 171 local Archive II
+    /// volumes. Without this a released base could not find its own bytes.
+    ///
+    /// Returns the ADDRESS as well as the bytes: every other entry point into
+    /// this cache is keyed by the address, so a caller holding only the
+    /// archive could not ask whether the decode it wants is already held or
+    /// already in flight.
+    ///
+    /// A linear walk of the index, which is one entry per held archive: a few
+    /// dozen, and this runs where a restore is dispatched rather than on a
+    /// frame.
+    pub fn archive_for_identity(
+        &self,
+        site: &str,
+        collected: chrono::NaiveDateTime,
+    ) -> Option<(chrono::NaiveDateTime, Arc<Vec<u8>>)> {
+        let (address, _) = self
+            .archive_identity
+            .iter()
+            .find(|((held_site, _), identity)| {
+                held_site.as_str() == site && **identity == collected
+            })?;
+        let at = address.1;
+        let archive = self.archive_cache.get(site)?.get(&at).map(Arc::clone)?;
+        Some((at, archive))
+    }
+
     /// **Drop every archive whose `(site, timestamp)` fails `keep`.**
     ///
     /// Asked with the address alone and not with the volume, unlike

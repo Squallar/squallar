@@ -2824,6 +2824,89 @@ impl super::App {
         true
     }
 
+    /// **Put `site`'s merge base back together if something needs its gates
+    /// and they have been released.**
+    ///
+    /// # It re-derives on a STATE
+    ///
+    /// The question asked here is "does this holder have gates?"
+    /// (`VolumeInventory::base_has_gates`), not "was a withdrawal announced".
+    /// So the ask is idempotent and self-healing: a decode that failed, a
+    /// reply that was dropped, a base released by a path that did not know to
+    /// re-arm anything — every one of them is asked again on the next pass,
+    /// because the state that makes the ask true is still true. That is the
+    /// shape `LoopDownloadManager::plan_describes` had to be given for the
+    /// same reason, and the reason is the same: a way back armed by an EVENT
+    /// has no way back from the event being missed.
+    ///
+    /// Cheap enough to call from a per-pane walk: two map lookups and a set
+    /// probe on the common path, where the base has its gates and this returns
+    /// at the first line.
+    ///
+    /// # Why it can decline
+    ///
+    /// A released base with no archive behind it cannot be restored by a
+    /// decode, and this says so once rather than trying every frame. That
+    /// state is not supposed to exist — a withdrawal is only allowed where an
+    /// archive is held — so it is logged at `warn` and left alone. It is not
+    /// silent, because a section pane waiting on a restore nothing is doing is
+    /// exactly the failure that reads as a hang.
+    /// **Ask for `site`'s merge base to be made whole again**, when its gate
+    /// arrays have been released and something needs them.
+    ///
+    /// # It re-derives on a STATE, and rides machinery that already exists
+    ///
+    /// The question is "is this base released?"
+    /// (`VolumeInventory::base_is_released`), not "was a withdrawal
+    /// announced" — so the ask is idempotent and self-healing: a decode that
+    /// failed, a reply that was dropped, a base released by a path that knew
+    /// nothing about re-arming, all are asked again next pass because the
+    /// state that makes the ask true is still true. `plan_describes` had to be
+    /// given the same shape for the same reason.
+    ///
+    /// **It adds no channel and no in-flight set of its own.** The decode goes
+    /// through [`Self::spawn_loop_frame_decode`], which files the volume in the
+    /// loop download cache over the existing reply channel — new `ChannelHub`
+    /// channels are forbidden, and a second in-flight set would be a second
+    /// answer to a question `LoopDownloadManager` already answers. The base is
+    /// then taken from that cache by `App::restore_released_bases`, which is a
+    /// state re-derivation and not a reply handler, so a volume that arrives by
+    /// any other route restores the base just as well.
+    ///
+    /// # Why it can decline
+    ///
+    /// A released base with no archive behind it cannot be decoded back. That
+    /// state is not supposed to exist — a withdrawal is only allowed where an
+    /// archive is held — so it is logged at `warn` rather than retried
+    /// silently, because a section pane waiting on a restore nothing is doing
+    /// is the failure that reads as a hang.
+    pub(super) fn ensure_base_whole(&mut self, site: &str) {
+        if !self.volumes.base_is_released(site) {
+            return;
+        }
+        let Some(collected) = self.volumes.base_collected_at(site) else {
+            return;
+        };
+        let Some((address, archive)) = self.loop_mgr.archive_for_identity(site, collected) else {
+            log::warn!(
+                "{site}: its merge base has no gates and no archive to decode them from, \
+                 so nothing that needs the volume can be served; the withdrawal that \
+                 released it should not have"
+            );
+            return;
+        };
+        // Already whole in the cache, or already on its way: the restore pass
+        // will take it. Both questions are the loop cache's own.
+        if self.loop_mgr.is_cached(site, &address) || self.loop_mgr.is_in_flight(site, &address) {
+            return;
+        }
+        #[cfg(test)]
+        self.base_restore_dispatches
+            .set(self.base_restore_dispatches.get() + 1);
+        self.loop_mgr.mark_decode_in_flight(site, address);
+        self.spawn_loop_frame_decode(site.to_string(), address, archive);
+    }
+
     /// Append a freshly-polled scan to any active loops, evicting frames past
     /// the lookback window.
     ///

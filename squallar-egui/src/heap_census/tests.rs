@@ -23,6 +23,7 @@ fn distinct() -> Census {
         // arithmetic. 3 is distinct from every other figure here, which is
         // what the run exists to buy.
         radar_shared_bytes: 3,
+        base_skeleton_bytes: 5,
         render_cache_bytes: 32,
         cached_render_bytes: 16_777_216,
         raster_shared_bytes: 33_554_432,
@@ -80,7 +81,7 @@ fn the_resident_total_leaves_the_gpu_families_out() {
     let every_family = (1u64 << 29) - 1;
     assert_eq!(
         c.resident_total(),
-        every_family
+        every_family + c.base_skeleton_bytes
             - c.tile_mesh_bytes
             - c.gpu_texture_bytes
             - c.raster_shared_bytes
@@ -143,6 +144,7 @@ fn the_line_names_every_family_and_its_denominator() {
         "loop frame scans 16 B",
         "chunk feed 8388608 B",
         "radar shared 3 B",
+        "base skeletons 5 B",
         "render cache 32 B",
         "overlay grids 128 B",
         "overlay items 256 B",
@@ -198,6 +200,7 @@ fn the_widest_line_fits_the_hooks_buffer() {
         derive_memo_bytes: u64::MAX,
         loop_frame_scan_bytes: u64::MAX,
         radar_shared_bytes: u64::MAX,
+        base_skeleton_bytes: u64::MAX,
         render_cache_bytes: u64::MAX,
         cached_render_bytes: u64::MAX,
         raster_shared_bytes: u64::MAX,

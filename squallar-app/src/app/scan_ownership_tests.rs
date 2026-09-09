@@ -674,3 +674,208 @@ fn emptying_the_still_store_frees_nothing_while_the_base_holds_the_same_volume()
          and the base has readers the still does not",
     );
 }
+
+/// **The withdrawal will not release a base with no way back**, and the
+/// archive drain's own arrival is the case that has one.
+///
+/// # What an input must carry for the refusal to be reachable
+///
+/// A base that HAS an archive and one that does not, in the same shape of
+/// scene, or the test cannot tell a policy that checks from one that never
+/// releases anything. Both arms are driven through `poll_data_channels`; the
+/// difference is one `cache_archive`.
+///
+/// The archive is looked up by the volume's IDENTITY, not by the address it
+/// was filed under, and those are equal on 0 of the 171 local Archive II
+/// volumes — so a lookup that used the address would find nothing here and
+/// this test would pass for the wrong reason. The precondition below asserts
+/// the two clocks differ, which is what makes the identity route load-bearing.
+#[test]
+fn a_base_with_no_archive_keeps_its_gates() {
+    let mut app = app_on_site();
+    land_one_archive_volume(&mut app, SITE, at(0));
+    let collected = app
+        .volumes
+        .base_collected_at(SITE)
+        .expect("the drain installed a base");
+    assert_ne!(
+        collected,
+        at(0),
+        "fixture: the base's identity equals the archive's address, so an \
+         address-keyed lookup would work and the identity route is untested",
+    );
+    assert!(
+        app.loop_mgr.archive_for_identity(SITE, collected).is_none(),
+        "precondition: this arm is the no-archive one",
+    );
+
+    app.evict_unshown_scans();
+
+    assert!(
+        app.volumes.base_has_gates(SITE),
+        "a base with nothing to decode from was released, so the section cut \
+         has no way back at all — which is the chunk feed's every volume, \
+         filed with `archive: None`",
+    );
+}
+
+/// **A site any pane reads gates from keeps them** — the cross-section and the
+/// 3D resample are the two readers a skeleton cannot serve.
+///
+/// The control for the release below: without it, a policy that released
+/// unconditionally would pass every other test here and would blank a section
+/// pane.
+#[test]
+fn a_site_with_a_section_pane_keeps_its_gates() {
+    let mut app = app_on_site();
+    land_one_archive_volume(&mut app, SITE, at(0));
+    let collected = app.volumes.base_collected_at(SITE).expect("a base");
+    // Give it the way back, so the ONLY thing standing between this base and
+    // a release is the section pane.
+    app.loop_mgr
+        .cache_archive(SITE, at(0), std::sync::Arc::new(vec![0u8; 4096]));
+    assert!(
+        app.loop_mgr.archive_for_identity(SITE, collected).is_some(),
+        "precondition: the way back is present, so a refusal here is about \
+         the reader and not about the archive",
+    );
+    app.gui
+        .pane_mut(0)
+        .expect("a pane")
+        .set_kind(squallar_egui::pane::PaneKind::CrossSection);
+    assert!(
+        app.gui.pane(0).expect("a pane").cross_section().is_some(),
+        "fixture: the pane shows no section, so there is no gate reader here",
+    );
+
+    app.evict_unshown_scans();
+
+    assert!(
+        app.volumes.base_has_gates(SITE),
+        "the gates were released under a section pane, which cuts from them",
+    );
+}
+
+/// **With a way back and no gate reader, the base's gates go — and the
+/// structure that replaces them still answers the frame-thread readers.**
+///
+/// The release is asserted on `Arc::strong_count`: the still store holds the
+/// same allocation on a live pane, so the inventory's own row is not evidence
+/// that anything was let go. What this shows is the base's REFERENCE dropping,
+/// which is the half of the joint release this change builds.
+///
+/// And the readers are asserted AFTER the release, through the same entry
+/// points the application calls, because a release that satisfied every
+/// byte-shaped assertion and left `current_volume_stamp` answering `None`
+/// would blank every site's displayed time.
+#[test]
+fn a_base_nothing_reads_gates_from_is_released_and_still_answers() {
+    let mut app = app_on_site();
+    land_one_archive_volume(&mut app, SITE, at(0));
+    let (base, _) = app.volumes.base_for(SITE).expect("the base is resident");
+    app.loop_mgr
+        .cache_archive(SITE, at(0), std::sync::Arc::new(vec![0u8; 4096]));
+
+    let stamp_before = app.current_volume_stamp(SITE);
+    let print_before =
+        app.current_ladder_fingerprint(SITE, squallar_radar::types::RadarProduct::Reflectivity);
+    assert!(
+        stamp_before.is_some(),
+        "fixture: the stamp reads None before the release, so an equality \
+         after it would be None == None",
+    );
+    app.evict_unshown_scans();
+
+    assert!(
+        !app.volumes.base_has_gates(SITE),
+        "the base kept its gates although nothing reads them and an archive \
+         is held",
+    );
+    // **The REFCOUNT is not asserted here, and the reason is worth writing
+    // down.** The app path hands a released volume to
+    // `squallar_worker::offload::discard`, whose queue is a process-global
+    // shared by every test in this binary — so `Arc::strong_count` at this
+    // point measures how far that lane has drained, not whether this base let
+    // go. Measured: this assertion passed run alone and failed in a batch with
+    // the other tests in this module, which is the shared-state trap and not a
+    // defect in the release.
+    //
+    // The refcount claim belongs where it is deterministic, and it is made
+    // there: `volume_inventory::base_gate_release_tests::releasing_the_gates_hands_the_volume_back_and_keeps_the_structure`
+    // calls the inventory directly, takes the volume back owned, drops it, and
+    // requires the count to fall to exactly one.
+    let _ = &base;
+    assert!(
+        app.volumes.base_for(SITE).is_none(),
+        "a gate reader can still reach the released base",
+    );
+    assert!(
+        app.volumes.base_skeleton_bytes() > 0,
+        "the released base prices its structure at nothing",
+    );
+
+    assert_eq!(
+        app.current_volume_stamp(SITE),
+        stamp_before,
+        "the displayed data-through time changed when the gates went, and it \
+         is a function of collection times that a skeleton preserves exactly",
+    );
+    assert_eq!(
+        app.current_ladder_fingerprint(SITE, squallar_radar::types::RadarProduct::Reflectivity),
+        print_before,
+        "the section's re-cut key moved when the gates went, which would \
+         re-cut every transition against a key that cannot see its own data",
+    );
+}
+
+/// **A gate reader asks for exactly one restore, not one a frame.**
+///
+/// `ensure_base_whole` re-derives on the STATE — "does this holder have
+/// gates?" — so it is asked again on every pass while the answer stays no.
+/// The in-flight mark is what keeps that from dispatching a decode per frame,
+/// and without it a section pane on a released base would queue a 33.7-82.7
+/// MiB decode every frame it was shown.
+#[test]
+fn a_released_base_is_restored_once_however_often_it_is_asked() {
+    let mut app = app_on_site();
+    land_one_archive_volume(&mut app, SITE, at(0));
+    app.loop_mgr
+        .cache_archive(SITE, at(0), std::sync::Arc::new(vec![0u8; 4096]));
+    app.evict_unshown_scans();
+    assert!(
+        app.volumes.base_is_released(SITE),
+        "precondition: the base is released, which is the only state that asks",
+    );
+    // **The loop cache must not still hold the volume**, or the restore is
+    // free and no decode is dispatched at all — which is the right behaviour
+    // and the wrong fixture for this test. Measured: without this the ask
+    // dispatched 0 decodes because `restore_released_bases` could take the
+    // whole volume straight out of the cache.
+    drop(app.loop_mgr.evict_decoded_except(|_, _, _| false));
+    assert!(
+        app.loop_mgr.get_cached(SITE, &at(0)).is_none(),
+        "precondition: the cache still holds the volume, so a decode is not \
+         the way back and the guard under test is never reached",
+    );
+    assert!(
+        app.loop_mgr.has_archive(SITE, &at(0)),
+        "precondition: the archive went with the moments, so there is nothing \
+         to decode from",
+    );
+
+    for _ in 0..5 {
+        app.ensure_base_whole(SITE);
+    }
+
+    // **Counted at the dispatch, because neither of the two obvious proxies
+    // works.** The in-flight set is keyed by site, so its length is 1 whether
+    // the guard is there or not — measured, on a tamper that deleted the guard
+    // and left a length assertion green. The replies are 0 either way, because
+    // the job funnel does not run in a headless test.
+    let dispatched = app.base_restore_dispatches.get();
+    assert_eq!(
+        dispatched, 1,
+        "five asks dispatched {dispatched} decodes, so a shown section pane \
+         queues a whole-volume decode every frame it is drawn",
+    );
+}

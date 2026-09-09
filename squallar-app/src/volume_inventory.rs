@@ -62,6 +62,54 @@ pub(crate) type Still = (Arc<Scan>, Arc<DeclaredNyquist>);
 /// A [`Still`] plus the time the volume's first radial was collected.
 pub(crate) type Base = (Arc<Scan>, Arc<DeclaredNyquist>, NaiveDateTime);
 
+/// **What a site's merge base is holding**: the whole volume, or only its
+/// structure once the gate arrays have been released.
+///
+/// The invariant is that at least one is `Some`; [`BaseEntry::structure`]
+/// relies on it and there is no constructor that can break it.
+pub(crate) struct BaseEntry {
+    /// The decoded volume, while this base still has its gates.
+    volume: Option<Arc<Scan>>,
+    /// The structure, once the volume has been released. `None` while the
+    /// volume is here — a skeleton is built at withdrawal and not at install,
+    /// so a base nothing has withdrawn from costs exactly what it always did.
+    skeleton: Option<Arc<squallar_radar::skeleton::VolumeSkeleton>>,
+    declared: Arc<DeclaredNyquist>,
+    at: NaiveDateTime,
+}
+
+/// **A merge base's structure, however much of the volume is still here** —
+/// what the readers that consult scalars take.
+///
+/// Handed out instead of a `&Scan` so the two cases are visible at the call
+/// site, and so a caller cannot silently be given a gate-released volume
+/// where it meant to read gates. The gate readers take
+/// [`VolumeInventory::base_for`] instead, which is `None` for a withdrawn
+/// base.
+pub(crate) enum BaseStructure {
+    /// The base still has its gates. Reading them through
+    /// [`Self::structure`] is legal but is not what that method is for.
+    Whole(Arc<Scan>),
+    /// The gates are gone. Every scalar is present; every buffer is empty.
+    Released(Arc<squallar_radar::skeleton::VolumeSkeleton>),
+}
+
+impl BaseStructure {
+    /// **The scalars: cuts, elevation numbers, radial counts, azimuths,
+    /// collection times, and each moment's presence and `gate_count`.**
+    ///
+    /// Named for what it is FOR rather than for what it returns. A caller
+    /// that reads a gate through this gets an empty slice and no error on the
+    /// `Released` arm — see `squallar_radar::skeleton`'s note on the four
+    /// readers that consume that as real data.
+    pub(crate) fn structure(&self) -> &Scan {
+        match self {
+            Self::Whole(scan) => scan,
+            Self::Released(skeleton) => skeleton.as_scan_without_gates(),
+        }
+    }
+}
+
 /// Which store an entry came from, as a **total order** — the tie-break
 /// [`VolumeInventory::resident_scan_bytes`] uses to name one of two equal
 /// pointers as the payer.
@@ -231,7 +279,7 @@ pub(crate) struct VolumeInventory {
     /// Installs so far, the sequence [`MAX_RESIDENT_STILL_VOLUMES`] evicts by.
     installs: u64,
     /// The most recent complete volume for each site, with its collection time.
-    base: HashMap<String, Base>,
+    base: HashMap<String, BaseEntry>,
     /// Each merge base's host bytes, keyed as [`base`](Self::base) is.
     ///
     /// Beside the store rather than inside it because [`Base`] is a tuple
@@ -357,22 +405,112 @@ impl VolumeInventory {
 
     /// `site`'s merge base — the volume half of it, which is what
     /// [`squallar_radar::current::resolve`] takes.
+    /// **`None` for a base whose gates have been released**, which is the
+    /// whole point: every caller of this reads gates, so a withdrawn base has
+    /// to look absent to them rather than look empty. The readers that want
+    /// scalars take [`Self::base_structure_for`].
     pub(crate) fn base_for(&self, site: &str) -> Option<Still> {
-        self.base
-            .get(site)
-            .map(|(scan, declared, _)| (Arc::clone(scan), Arc::clone(declared)))
+        let entry = self.base.get(site)?;
+        let volume = entry.volume.as_ref()?;
+        Some((Arc::clone(volume), Arc::clone(&entry.declared)))
     }
 
-    /// `site`'s merge base together with the time it was collected.
-    pub(crate) fn base_with_time(&self, site: &str) -> Option<Base> {
+    /// `site`'s merge base as **structure**, whole or released — for the
+    /// readers that consult scalars only.
+    pub(crate) fn base_structure_for(
+        &self,
+        site: &str,
+    ) -> Option<(BaseStructure, Arc<DeclaredNyquist>, NaiveDateTime)> {
+        let entry = self.base.get(site)?;
+        let structure = match (&entry.volume, &entry.skeleton) {
+            (Some(scan), _) => BaseStructure::Whole(Arc::clone(scan)),
+            (None, Some(skeleton)) => BaseStructure::Released(Arc::clone(skeleton)),
+            // Unreachable by the type's invariant, and treated as absent
+            // rather than panicking on the frame thread.
+            (None, None) => return None,
+        };
+        Some((structure, Arc::clone(&entry.declared), entry.at))
+    }
+
+    /// **Whether `site`'s base still has its gate arrays** — the STATE the
+    /// restore re-derives on, rather than an event it has to be told about.
+    ///
+    /// False for a site with no base at all: there is nothing to restore, and
+    /// a caller that read this as "needs a decode" would dispatch one for a
+    /// site that has never fetched.
+    pub(crate) fn base_has_gates(&self, site: &str) -> bool {
         self.base
             .get(site)
-            .map(|(scan, declared, at)| (Arc::clone(scan), Arc::clone(declared), *at))
+            .is_some_and(|entry| entry.volume.is_some())
+    }
+
+    /// **Whether `site`'s base is holding a released structure** — the other
+    /// half of the state, and not the negation of
+    /// [`Self::base_has_gates`]: a site with no base answers false to both.
+    pub(crate) fn base_is_released(&self, site: &str) -> bool {
+        self.base
+            .get(site)
+            .is_some_and(|entry| entry.skeleton.is_some() && entry.volume.is_none())
+    }
+
+    /// **Release `site`'s base's gate arrays, keeping its structure**, and
+    /// hand the volume back owned for the deferred-drop path.
+    ///
+    /// `None` when there is no base, or when its gates are already gone —
+    /// so calling it twice costs one skeleton, not two.
+    #[must_use = "the released volume is tens of megabytes; hand it to the deferred-drop path"]
+    pub(crate) fn release_base_gates(&mut self, site: &str) -> Option<Arc<Scan>> {
+        let entry = self.base.get_mut(site)?;
+        let volume = entry.volume.take()?;
+        entry.skeleton = Some(Arc::new(squallar_radar::skeleton::VolumeSkeleton::of(
+            &volume,
+        )));
+        // The price row follows the gates out: `still scans` prices what the
+        // allocator is holding for this store, and a released base is holding
+        // a skeleton.
+        self.base_bytes.insert(
+            site.to_string(),
+            entry
+                .skeleton
+                .as_ref()
+                .map_or(0, |skeleton| skeleton.bytes()),
+        );
+        Some(volume)
+    }
+
+    /// **Give `site`'s base its gates back**, dropping the structure it stood
+    /// in for.
+    ///
+    /// Refuses a volume collected at a different instant than the base is
+    /// keyed to: a restore is meant to return the SAME volume, and a decode
+    /// that produced a different one would silently re-date the base.
+    pub(crate) fn restore_base_gates(&mut self, site: &str, volume: Arc<Scan>) -> bool {
+        let Some(entry) = self.base.get_mut(site) else {
+            return false;
+        };
+        if entry.volume.is_some() {
+            return false;
+        }
+        if squallar_radar::types::volume_collected_at(&volume) != Some(entry.at) {
+            log::warn!(
+                "{site}: a base restore decoded a volume collected at {:?}, not the                  {} the base is keyed to; refusing it",
+                squallar_radar::types::volume_collected_at(&volume),
+                entry.at,
+            );
+            return false;
+        }
+        self.base_bytes.insert(
+            site.to_string(),
+            squallar_radar::scan_size::scan_bytes(&volume),
+        );
+        entry.volume = Some(volume);
+        entry.skeleton = None;
+        true
     }
 
     /// When `site`'s merge base was collected, if it has one.
     pub(crate) fn base_collected_at(&self, site: &str) -> Option<NaiveDateTime> {
-        self.base.get(site).map(|(_, _, at)| *at)
+        self.base.get(site).map(|entry| entry.at)
     }
 
     /// Whether `site`'s merge base is *exactly* the volume collected at `when`
@@ -395,7 +533,32 @@ impl VolumeInventory {
             site.clone(),
             squallar_radar::scan_size::scan_bytes(&volume.0),
         );
-        self.base.insert(site, volume);
+        let (scan, declared, at) = volume;
+        // **Whole, with no skeleton.** A skeleton is built where a withdrawal
+        // releases the gates, not here, so an install costs exactly what it
+        // always did and a base nothing withdraws from never pays for one.
+        self.base.insert(
+            site,
+            BaseEntry {
+                volume: Some(scan),
+                skeleton: None,
+                declared,
+                at,
+            },
+        );
+    }
+
+    /// **What every released base's structure costs the allocator**, summed —
+    /// the bytes `still scans` stops naming when a base's gates go.
+    ///
+    /// A separate figure and not folded into the volume stores: a skeleton
+    /// shares no allocation with any decoded volume, so it belongs outside a
+    /// de-duplication built on `Arc<Scan>` pointers.
+    pub(crate) fn base_skeleton_bytes(&self) -> usize {
+        self.base
+            .values()
+            .filter_map(|entry| entry.skeleton.as_ref())
+            .fold(0usize, |sum, skeleton| sum.saturating_add(skeleton.bytes()))
     }
 
     /// Every site holding a merge base.
@@ -462,9 +625,14 @@ impl VolumeInventory {
 
     /// [`retain_still`](Self::retain_still)'s site-keyed twin for the merge
     /// bases, which name the doomed rather than the wanted.
+    /// A released base yields no volume here — there is none to drop, and its
+    /// skeleton is freed with the entry.
     pub(crate) fn evict_base(&mut self, doomed: &impl Fn(&String) -> bool) -> Vec<Base> {
         self.base_bytes.retain(|site, _| !doomed(site));
         crate::app::evicted(&mut self.base, doomed)
+            .into_iter()
+            .filter_map(|entry| Some((entry.volume?, entry.declared, entry.at)))
+            .collect()
     }
 
     /// **Host bytes both of this type's stores are holding**, by
@@ -598,12 +766,17 @@ impl VolumeInventory {
                 )
             })
         });
-        let bases = self.base.iter().map(move |(site, (scan, _, _))| {
-            (
+        // **A released base contributes no row.** Its bytes are a skeleton's,
+        // not a volume's, so pricing it here would put a figure that shares
+        // nothing with any still on a de-duplication keyed by `Arc<Scan>`
+        // pointers — and `still scans` is documented as decoded volumes. The
+        // skeleton is named by `base skeletons` instead.
+        let bases = self.base.iter().filter_map(move |(site, entry)| {
+            Some((
                 (site.as_str(), Store::Base, None),
-                Arc::as_ptr(scan),
+                Arc::as_ptr(entry.volume.as_ref()?),
                 self.base_bytes.get(site).copied().unwrap_or(0),
-            )
+            ))
         });
         stills.chain(bases)
     }
@@ -616,7 +789,11 @@ impl VolumeInventory {
             .values()
             .flat_map(HashMap::values)
             .map(|entry| entry.volume.0.as_ref())
-            .chain(self.base.values().map(|(scan, _, _)| scan.as_ref()))
+            .chain(
+                self.base
+                    .values()
+                    .filter_map(|entry| entry.volume.as_deref()),
+            )
     }
 
     /// Drop every merge base. Test scaffolding: production drops a base only
@@ -1379,5 +1556,243 @@ mod tests {
             "an emptied site left a husk row behind"
         );
         assert_eq!(inv.retain_still(&keep_all).len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod base_gate_release_tests {
+    use super::*;
+    use nexrad_model::data::DataMoment;
+
+    fn at(minute: u32) -> NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 9)
+            .expect("a real date")
+            .and_hms_opt(18, minute, 0)
+            .expect("a real time")
+    }
+
+    /// A base keyed to the volume's OWN first radial, the way both arrival
+    /// paths key it — which is what `restore_base_gates` compares against.
+    fn inventory_with_base() -> (VolumeInventory, Arc<Scan>, NaiveDateTime) {
+        let scan = crate::volume_fixture::ready_scan();
+        let collected = squallar_radar::types::volume_collected_at(&scan)
+            .expect("the fixture volume has a clocked radial");
+        let mut inv = VolumeInventory::default();
+        inv.install_base(
+            "KTLX".to_string(),
+            (Arc::clone(&scan), Arc::default(), collected),
+        );
+        (inv, scan, collected)
+    }
+
+    fn gate_bytes(scan: &Scan) -> usize {
+        scan.sweeps()
+            .iter()
+            .flat_map(nexrad_model::data::Sweep::radials)
+            .filter_map(nexrad_model::data::Radial::reflectivity)
+            .map(|m| m.raw_values().len())
+            .sum()
+    }
+
+    /// **Releasing a base's gates hands the volume back and leaves a structure
+    /// the gateless readers can still use.**
+    ///
+    /// Asserted on `Arc::strong_count`, not on a store row: the inventory's own
+    /// row would fall to zero for a base that is still reachable from the
+    /// still store, which is the exact reading this campaign keeps refusing.
+    #[test]
+    fn releasing_the_gates_hands_the_volume_back_and_keeps_the_structure() {
+        let (mut inv, scan, _) = inventory_with_base();
+        assert!(
+            inv.base_has_gates("KTLX") && !inv.base_is_released("KTLX"),
+            "precondition: a fresh base holds its gates and no skeleton",
+        );
+        assert!(
+            gate_bytes(&scan) > 0,
+            "fixture: the volume carries no gates, so releasing them proves \
+             nothing",
+        );
+        // The inventory's `Arc` plus this test's.
+        assert_eq!(Arc::strong_count(&scan), 2, "precondition");
+
+        let released = inv
+            .release_base_gates("KTLX")
+            .expect("a whole base releases");
+
+        assert!(
+            Arc::ptr_eq(&released, &scan),
+            "a different volume came back"
+        );
+        drop(released);
+        assert_eq!(
+            Arc::strong_count(&scan),
+            1,
+            "the inventory is still holding the volume, so releasing its gates \
+             freed nothing",
+        );
+        assert!(!inv.base_has_gates("KTLX"), "the base still reports gates");
+        assert!(
+            inv.base_is_released("KTLX"),
+            "the base reports no structure"
+        );
+        assert!(
+            inv.base_for("KTLX").is_none(),
+            "a gate reader can still reach a released base, which is a blank \
+             picture reported as a successful render",
+        );
+
+        // And the structure is there for the readers that consult scalars.
+        let (structure, _, _) = inv
+            .base_structure_for("KTLX")
+            .expect("a released base still answers for its structure");
+        assert_eq!(
+            structure.structure().sweeps().len(),
+            scan.sweeps().len(),
+            "the structure lost sweeps",
+        );
+        assert_eq!(gate_bytes(structure.structure()), 0, "gates survived");
+        // **The SIZE of the trade is not asserted here, and deliberately.**
+        // `ready_scan` carries four gates a moment, so its gate bytes are a
+        // few per radial and a skeleton of it is ~94 % of the whole — a true
+        // figure about a fixture no radar produces. The ratio is a property of
+        // real shapes and is gated where the fixture has them, in
+        // `squallar_radar::skeleton::tests::a_skeleton_is_a_small_fraction_of_the_volume_it_came_from`
+        // (3.18 % on a VCP-212 shape). What belongs here is that the row
+        // exists and is priced at the structure rather than at nothing.
+        assert!(
+            inv.base_skeleton_bytes() > 0,
+            "a released base prices its structure at nothing, so the bytes it \
+             really holds are unaccounted",
+        );
+    }
+
+    /// **A restore returns the SAME gates, not a plausible substitute.**
+    ///
+    /// Compared gate buffer by gate buffer against the volume that was
+    /// released, because "the pane draws something again" is exactly the
+    /// standard this must not be held to: a decode that produced a
+    /// structurally identical volume with different values would satisfy every
+    /// count and every length here and be a wrong picture.
+    #[test]
+    fn a_restore_returns_the_same_gates_it_released() {
+        let (mut inv, scan, _) = inventory_with_base();
+        let before: Vec<Vec<u8>> = scan
+            .sweeps()
+            .iter()
+            .flat_map(nexrad_model::data::Sweep::radials)
+            .filter_map(nexrad_model::data::Radial::reflectivity)
+            .map(|m| m.raw_values().to_vec())
+            .collect();
+        assert!(
+            before.iter().any(|gates| !gates.is_empty()),
+            "fixture: no gates to compare",
+        );
+
+        drop(
+            inv.release_base_gates("KTLX")
+                .expect("a whole base releases"),
+        );
+        assert!(
+            !inv.base_has_gates("KTLX"),
+            "precondition: the gates are gone"
+        );
+
+        assert!(
+            inv.restore_base_gates("KTLX", Arc::clone(&scan)),
+            "the restore was refused for the volume the base is keyed to",
+        );
+        assert!(
+            inv.base_has_gates("KTLX"),
+            "the base still reports no gates"
+        );
+        assert!(
+            !inv.base_is_released("KTLX"),
+            "the structure outlived the volume it stood in for, so the base is \
+             paying for both",
+        );
+
+        let (restored, _) = inv
+            .base_for("KTLX")
+            .expect("a whole base answers gate readers");
+        let after: Vec<Vec<u8>> = restored
+            .sweeps()
+            .iter()
+            .flat_map(nexrad_model::data::Sweep::radials)
+            .filter_map(nexrad_model::data::Radial::reflectivity)
+            .map(|m| m.raw_values().to_vec())
+            .collect();
+        assert_eq!(
+            after, before,
+            "the restored base's gates are not the gates that were released",
+        );
+    }
+
+    /// **A stale reply is refused.** A base that advanced while a decode was in
+    /// flight must not be re-dated by bytes belonging to the volume it
+    /// replaced — that would put an older volume's gates under a newer
+    /// volume's timestamp, which is a wrong readout and not a blank one.
+    #[test]
+    fn a_restore_of_a_volume_the_base_is_not_keyed_to_is_refused() {
+        let (mut inv, scan, collected) = inventory_with_base();
+        drop(
+            inv.release_base_gates("KTLX")
+                .expect("a whole base releases"),
+        );
+
+        // A different volume: same shape, its own allocation, and — the point
+        // — its own collection instant.
+        let other = crate::volume_fixture::ready_scan();
+        let other_at = squallar_radar::types::volume_collected_at(&other).expect("clocked");
+        assert_eq!(
+            other_at, collected,
+            "fixture: the two volumes are collected at different instants, so \
+             the guard would fire for the ordinary reason rather than the one \
+             under test",
+        );
+        // Re-key the base so the guard has something to disagree with.
+        inv.install_base(
+            "KTLX".to_string(),
+            (Arc::clone(&scan), Arc::default(), at(59)),
+        );
+        drop(inv.release_base_gates("KTLX").expect("releases again"));
+
+        assert!(
+            !inv.restore_base_gates("KTLX", other),
+            "a volume collected at {other_at} was accepted for a base keyed to \
+             {}, so a stale decode can re-date the base",
+            at(59),
+        );
+        assert!(
+            !inv.base_has_gates("KTLX") && inv.base_is_released("KTLX"),
+            "the refused restore left the base in neither state",
+        );
+    }
+
+    /// **Releasing twice costs one skeleton, not two**, and the second call
+    /// says so by handing nothing back — the property that lets the withdrawal
+    /// run on every sweep without checking whether it already ran.
+    #[test]
+    fn releasing_an_already_released_base_hands_nothing_back() {
+        let (mut inv, _scan, _) = inventory_with_base();
+        assert!(
+            inv.release_base_gates("KTLX").is_some(),
+            "the first release"
+        );
+        let first = inv.base_skeleton_bytes();
+
+        assert!(
+            inv.release_base_gates("KTLX").is_none(),
+            "a released base handed back a second volume, which means it built \
+             a second skeleton over the first",
+        );
+        assert_eq!(
+            inv.base_skeleton_bytes(),
+            first,
+            "the skeleton was rebuilt on a base that had already released",
+        );
+        assert!(
+            inv.release_base_gates("KOUN").is_none(),
+            "a site with no base at all released something",
+        );
     }
 }
