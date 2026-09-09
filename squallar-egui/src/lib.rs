@@ -28,6 +28,10 @@ pub mod basemap_ledger;
 /// 241 KB of JSON, carried by every build because every build renders the
 /// vector basemap from it.
 pub mod basemap_style;
+/// Raster tiles of one size share one texture, so a viewport of them is one
+/// draw instead of one draw each.
+/// Textures whose first upload carries no information — see the module.
+pub mod blank_page;
 pub(crate) mod field_facts;
 /// The 3D floor path's always-on counters: strips painted, mirrors rendered.
 pub mod floor_ledger;
@@ -64,8 +68,6 @@ pub mod radar_fan;
 /// The radar layer's own glue: what the presentation holds for radar that no
 /// other layer has.
 pub mod radar_layer;
-/// Raster tiles of one size share one texture, so a viewport of them is one
-/// draw instead of one draw each.
 pub(crate) mod raster_atlas;
 pub mod shell_api;
 /// A radar site's marker: sized in points, on glass, every frame.

@@ -206,6 +206,13 @@ fn reserve(
                 ColorImage::filled(page_size, egui::Color32::TRANSPARENT),
                 Default::default(),
             );
+            // **The page's own content is never transferred.** It is
+            // 13,046,544 B of transparent pixels on the shipped class, over
+            // the whole-crossing threshold on both device arms, and nothing
+            // ever samples it: a slot is read only through the `Rect` a lease
+            // hands out, and a leased slot is written in full — tile plus
+            // gutter — before that rect exists. See `crate::blank_page`.
+            crate::blank_page::note(texture.id());
             let page = Page {
                 texture,
                 // Popped from the back, so slots are handed out in row-major

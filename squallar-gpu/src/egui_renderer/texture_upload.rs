@@ -79,7 +79,7 @@ pub const DMA_BANDS_PER_FRAME: usize = crate::staging_ring::STAGING_RING_DEPTH;
 /// the frame thread, so both fall to
 /// [`squallar_device_profile::constants::BLOCKING_BAND_BYTES`], whose sweep
 /// note carries the dry-frame cost this choice was made against.
-fn band_cap(capable: bool) -> usize {
+const fn band_cap(capable: bool) -> usize {
     if capable {
         UPLOAD_BAND_BYTES
     } else {
@@ -97,9 +97,46 @@ fn band_cap(capable: bool) -> usize {
 /// what put a ring device's blocking allowance at 16 MiB; see [`whole_budget`]
 /// for the arithmetic that produced it. `band_cap` keeps its own job, which is
 /// how much of a raster one queued band carries.
-fn goes_whole(capable: bool, bytes: usize) -> bool {
+const fn goes_whole(capable: bool, bytes: usize) -> bool {
     bytes <= whole_budget(capable)
 }
+
+/// **Why `upload pending` reads LOWER on six panes than on one**, as a build
+/// failure rather than as prose.
+///
+/// This family charges the whole pixel buffer of every image with a band still
+/// queued, and an image is only banded when it is **larger than
+/// [`whole_budget`]**. That threshold is per *image*, and a pane's picture is
+/// sized from the pane — so splitting one canvas into six does not move a byte
+/// off the machine, it moves every picture under the threshold and out of the
+/// family. A one-pane leg reading more than a six-pane leg is that, and not a
+/// drain that fell behind: the renderer holds the frame's repaint delay at zero
+/// while bands remain, so neither leg is starved of frames to drain with.
+///
+/// Both directions are pinned, because a `goes_whole` that answered constantly
+/// would satisfy either alone.
+const _: () = {
+    // One pane of a 1920x1080 canvas: 8,294,400 B, ~4x the ring threshold.
+    assert!(!goes_whole(true, 1920 * 1080 * 4));
+    assert!(!goes_whole(false, 1920 * 1080 * 4));
+    // The same canvas as four panes: 2,073,600 B, and it crosses whole.
+    assert!(goes_whole(true, 960 * 540 * 4));
+    assert!(goes_whole(false, 960 * 540 * 4));
+    // And as six, 3x2: 1,382,400 B.
+    assert!(goes_whole(true, 640 * 540 * 4));
+    assert!(goes_whole(false, 640 * 540 * 4));
+};
+
+/// **The four-pane figure is 1.3 % under the ring threshold**, and that is a
+/// knife edge worth failing a build over rather than discovering from a leg.
+///
+/// 2,073,600 B against a [`WHOLE_CROSSING_BYTES`] of 2,100,000: a canvas 2 %
+/// wider, or a fifth pane, puts every picture back over the line and the
+/// `upload pending` family back up by a whole batch. Nothing is wrong with
+/// that — the bytes were always moving — but a reader comparing two legs across
+/// such a change would be comparing two different populations, so the margin is
+/// stated where it cannot rot.
+const _: () = assert!(960 * 540 * 4 * 100 / WHOLE_CROSSING_BYTES >= 98);
 
 /// Whether `id` is the font atlas, the one texture that crosses whole at any
 /// size.
@@ -241,7 +278,7 @@ const WHOLE_CROSSING_BYTES: usize = (BAR_WRITE_BYTES_PER_SEC
 /// [`TextureUploads::pending`] — which is published every frame as the
 /// `upload pending` census family and is the figure to read if a layer ever
 /// appears late after a pan.
-fn whole_budget(capable: bool) -> usize {
+const fn whole_budget(capable: bool) -> usize {
     if capable {
         WHOLE_CROSSING_BYTES
     } else {
@@ -252,7 +289,7 @@ fn whole_budget(capable: bool) -> usize {
 /// Bands one frame moves, by device capability. See
 /// [`TextureUploads::bands_per_frame`], which is this with the flag read off
 /// `self`.
-fn bands_per_frame(capable: bool) -> usize {
+const fn bands_per_frame(capable: bool) -> usize {
     if capable { DMA_BANDS_PER_FRAME } else { 1 }
 }
 
@@ -442,6 +479,37 @@ struct Band {
     /// Set while this raster's texture has not been created yet, holding the
     /// sampler its `load_texture` asked for. See [`TextureUploads::allocate`].
     allocate: Option<egui::TextureOptions>,
+    /// **The size to allocate for a page whose content is never transferred**,
+    /// and `None` for every band that carries pixels.
+    ///
+    /// A band in this arm holds a 1x1 stand-in rather than the page, so it is
+    /// four bytes on [`TextureUploads::publish_pending_level`] where the page
+    /// it replaces was 13,046,544. The size cannot be read off `image` for
+    /// that reason, and is carried here instead. See
+    /// `squallar_egui::blank_page`.
+    blank: Option<[usize; 2]>,
+}
+
+impl Band {
+    /// **The band a noted page files**: a 1x1 stand-in and the size to
+    /// allocate at.
+    ///
+    /// The stand-in is what makes the cut visible on the census — this band is
+    /// four bytes on [`TextureUploads::publish_pending_level`] where the page
+    /// it replaces was 13,046,544 — and it is a real `ColorImage` rather than
+    /// an `Option` so that every other reader of `Band::image` keeps working
+    /// without an arm for a band that has none.
+    fn blank_page(id: egui::TextureId, size: [usize; 2], options: egui::TextureOptions) -> Self {
+        Self {
+            id,
+            image: Arc::new(egui::ColorImage::filled([1, 1], egui::Color32::TRANSPARENT)),
+            origin: [0, 0],
+            done: 0,
+            declined: 0,
+            allocate: Some(options),
+            blank: Some(size),
+        }
+    }
 }
 
 impl TextureUploads {
@@ -597,6 +665,36 @@ impl TextureUploads {
             return;
         }
 
+        // **A page whose first upload carries no information.**
+        // `squallar_egui::raster_atlas` mints an atlas page through
+        // `load_texture`, which takes its size from an image, so the page
+        // arrives as 13,046,544 B of transparent pixels on the shipped class —
+        // over `whole_budget` on both arms, banded, and holding all of itself
+        // on this queue until its last band crosses. The producer says it
+        // carries nothing (`squallar_egui::blank_page`), so the texture is
+        // allocated at the delta's size and the image is dropped here.
+        //
+        // Claimed before the whole-crossing arm because a page is never small
+        // enough to reach it, and claimed *once*: the flag is removed by
+        // `take`, so a later re-allocation under the same id is a real image
+        // and takes the ordinary route.
+        if delta.pos.is_none() && !mine && squallar_egui::blank_page::take(id) {
+            self.seed(device, queue, renderer, id, delta.options);
+            self.pending.retain(|band| band.id != id);
+            self.owned.remove(&id);
+            self.resident.owned_dropped(id);
+            // Allocated on the frame the drain first has budget for it, the
+            // same deferral every whole delta takes — six 217 MB creations on
+            // one frame is what that deferral exists to stop, and a page is a
+            // creation like any other. The 1x1 stand-in is what the queue
+            // then holds instead of the page: `publish_pending_level` charges
+            // this band four bytes where it charged 13,046,544.
+            self.delivered.remove(&id);
+            self.pending
+                .push_back(Band::blank_page(id, image.size, delta.options));
+            return;
+        }
+
         let mut allocate = None;
         if delta.pos.is_none() {
             // A whole image: ours to allocate, but not now — six 217 MB
@@ -637,6 +735,7 @@ impl TextureUploads {
             done: 0,
             declined: 0,
             allocate,
+            blank: None,
         });
     }
 
@@ -712,6 +811,23 @@ impl TextureUploads {
             let Some(mut band) = self.pending.pop_front() else {
                 break;
             };
+            // **A blank page: allocate, transfer nothing, deliver.** The
+            // texture a device hands back is zero-filled, which is the
+            // `Color32::TRANSPARENT` the transfer would have written; and no
+            // unleased slot is ever sampled, so the two agree twice over. This
+            // costs the frame one texture creation and counts as an allocating
+            // frame like any other, so the `break` below still paces them.
+            if let Some(size) = band.blank {
+                self.allocate(
+                    device,
+                    renderer,
+                    band.id,
+                    size,
+                    band.allocate.unwrap_or_default(),
+                );
+                self.delivered.insert(band.id);
+                break;
+            }
             let mut allocated = false;
             let texture = match band.allocate.take() {
                 // The raster's own texture, created on the frame that first has
@@ -881,8 +997,20 @@ impl TextureUploads {
     /// drifts because one site forgot to pay is a worse instrument than a
     /// sweep that cannot drift.
     fn publish_pending_level(&self) {
-        let bytes = self
-            .pending
+        let bytes = self.pending_level_bytes();
+        if self.census_publisher {
+            squallar_egui::heap_census::set_upload_pending_bytes(bytes);
+        }
+    }
+
+    /// The figure [`Self::publish_pending_level`] publishes, as a value.
+    ///
+    /// Split out so a suite can read it without a census to publish to — and
+    /// as **one** implementation rather than two: a test-only copy of this
+    /// sweep would be a mutual-consistency pin over two spellings, green while
+    /// the shipped one drifted.
+    pub(crate) fn pending_level_bytes(&self) -> u64 {
+        self.pending
             .iter()
             .enumerate()
             .filter(|(seen, band)| {
@@ -893,10 +1021,7 @@ impl TextureUploads {
                     .any(|earlier| Arc::ptr_eq(&earlier.image, &band.image))
             })
             .map(|(_, band)| band.image.as_raw().len() as u64)
-            .sum();
-        if self.census_publisher {
-            squallar_egui::heap_census::set_upload_pending_bytes(bytes);
-        }
+            .sum()
     }
 
     /// Publish what the DEVICE is holding in egui's texture population, for
@@ -936,6 +1061,10 @@ impl TextureUploads {
             self.resident.freed(*id);
         }
         self.pending.retain(|band| !ids.contains(&band.id));
+        // A page retired before its allocation delta was filed would otherwise
+        // sit in the producer's list for the life of the session; this is what
+        // bounds it. Harmless for every id that was never noted.
+        squallar_egui::blank_page::forget(ids);
         self.publish_pending_level();
         self.publish_resident_level();
     }
@@ -950,6 +1079,36 @@ impl TextureUploads {
     #[cfg(test)]
     pub fn pending_bands(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Queue an ordinary whole-image band the way [`Self::file`] does, for the
+    /// non-triviality half of the blank-page suite: without it a level that
+    /// answered four bytes for everything would pass.
+    #[cfg(test)]
+    pub fn file_band_for_test(&mut self, id: egui::TextureId, image: Arc<egui::ColorImage>) {
+        self.pending.push_back(Band {
+            id,
+            image,
+            origin: [0, 0],
+            done: 0,
+            declined: 0,
+            allocate: Some(egui::TextureOptions::default()),
+            blank: None,
+        });
+    }
+
+    /// Queue what [`Self::file`] queues for a noted page, through the same
+    /// constructor, and publish the level over it.
+    ///
+    /// **The constructor and the sweep are the two halves under test**; what
+    /// this stands in for is the pair of device calls around them (`seed` and
+    /// the drain's `allocate`), which no test in this module can reach without
+    /// a GPU. A fixture that built the `Band` itself would prove nothing about
+    /// the band `file` actually files, which is the whole question.
+    #[cfg(test)]
+    pub fn file_blank_page_for_test(&mut self, id: egui::TextureId, size: [usize; 2]) {
+        self.pending
+            .push_back(Band::blank_page(id, size, egui::TextureOptions::default()));
     }
 
     /// File a resident charge for `id` the way [`Self::allocate`] does, with

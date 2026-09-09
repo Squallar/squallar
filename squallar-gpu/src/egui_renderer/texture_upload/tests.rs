@@ -808,3 +808,106 @@ fn the_census_carries_the_resident_texture_level() {
         "a GPU family entered the linear-memory residual: {line}",
     );
 }
+
+/// **A noted page files no pixels**, so the `upload pending` family charges it
+/// four bytes where it charged the whole page.
+///
+/// The two halves this reaches are the constructor `TextureUploads::file` uses
+/// for a page `squallar_egui::blank_page` has noted, and the census sweep that
+/// prices the queue. The pair of device calls around them — `seed`, and the
+/// drain's `allocate` — no test in this module can reach without a GPU, and
+/// nothing here claims to.
+///
+/// **The fixture property that lets this fail**: the page must be a size that
+/// would otherwise be BANDED. A delta under `whole_budget` crosses whole and
+/// never reaches the queue at all, so a small fixture would report a low level
+/// whether the cut existed or not — and the assertion would be green over a
+/// `blank_page` arm that did nothing. The premise below asserts that, on both
+/// device arms, before anything else.
+#[test]
+fn a_noted_page_is_four_bytes_on_the_queue_where_it_was_thirteen_megabytes() {
+    // The shipped 256-texel class: 7 slots of pitch 258 a side.
+    let page = [1806usize, 1806];
+    let page_bytes = page[0] * page[1] * 4;
+    assert_eq!(page_bytes, 13_046_544, "the shipped page, spelled out");
+    assert!(
+        !goes_whole(true, page_bytes) && !goes_whole(false, page_bytes),
+        "premise: a page is over the whole-crossing threshold on BOTH arms, so \
+         it really would be banded and the level below really has something to \
+         be lower than",
+    );
+
+    let mut uploads = TextureUploads::without_device();
+    assert_eq!(uploads.pending_level_bytes(), 0, "premise: an empty queue");
+
+    uploads.file_blank_page_for_test(egui::TextureId::Managed(4_001), page);
+    assert_eq!(
+        uploads.pending_bands(),
+        1,
+        "the page still takes a queue slot — the texture is allocated on the \
+         frame the drain first has budget for it, the same deferral every \
+         whole delta takes",
+    );
+    assert_eq!(
+        uploads.pending_level_bytes(),
+        4,
+        "the queue is holding the page's pixels, so the census still charges \
+         {page_bytes} B for content nothing samples",
+    );
+
+    // Non-triviality: an ordinary band of the same page is still charged in
+    // full, so the low figure above is this arm's doing and not a level that
+    // reads four bytes for everything.
+    let mut ordinary = TextureUploads::without_device();
+    ordinary.file_band_for_test(
+        egui::TextureId::Managed(4_002),
+        std::sync::Arc::new(egui::ColorImage::filled(page, egui::Color32::TRANSPARENT)),
+    );
+    assert_eq!(
+        ordinary.pending_level_bytes(),
+        page_bytes as u64,
+        "a band carrying the page is charged the page, which is what the arm \
+         above is measured against",
+    );
+}
+
+/// **The drain really allocates for a noted page**, pinned structurally
+/// because no test in this module can reach the drain.
+///
+/// This is a weaker gate than the rest of this file and it is here for a
+/// measured reason: deleting the drain's blank arm outright — so a noted page
+/// is never allocated, its texture stays the 1x1 seed, and every tile written
+/// into it goes nowhere — passes all 126 tests of this crate. `drain` takes a
+/// `wgpu::Device`, a `Queue` and an `egui_wgpu::Renderer`, and
+/// `TextureUploads::without_device()` is what this suite has instead. A
+/// structural pin turns a silent deletion into a failure; it does not turn it
+/// into a behavioural one, and nothing here pretends otherwise.
+///
+/// The presence control is the other half: a needle that rotted would pass
+/// over anything, so the arm's own marker is asserted to exist before its
+/// contents are.
+#[test]
+fn the_drain_allocates_for_a_noted_page_and_delivers_it() {
+    const SOURCE: &str = include_str!("../texture_upload.rs");
+    assert!(
+        SOURCE.contains("if let Some(size) = band.blank {"),
+        "the drain's blank-page arm is gone or renamed, so the two pins below \
+         read nothing",
+    );
+    let arm = SOURCE
+        .split_once("if let Some(size) = band.blank {")
+        .expect("the arm was just found")
+        .1;
+    let arm = &arm[..arm.find('}').unwrap_or(arm.len())];
+    assert!(
+        arm.contains("self.allocate("),
+        "the blank arm no longer creates the page's texture. The seed under \
+         this id is 1x1, so every `set_partial` a tile makes into it writes \
+         past the texture and the layer draws nothing at all",
+    );
+    assert!(
+        arm.contains("self.delivered.insert("),
+        "the blank arm no longer marks the page delivered, so a pane holding \
+         its previous raster waits for texels that will never be filed",
+    );
+}
