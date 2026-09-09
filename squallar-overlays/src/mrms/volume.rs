@@ -1081,8 +1081,7 @@ pub async fn fetch_level(
             format!("MRMS 3D {key}: HTTP {}", resp.status()),
         ));
     }
-    let body = resp
-        .bytes()
+    let body = squallar_source::http::body_to_vec(resp)
         .await
         .map_err(|e| FetchError::from_transport(&e, format!("MRMS 3D body read failed: {e}")))?;
     let compressed_bytes = body.len();

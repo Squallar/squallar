@@ -892,14 +892,11 @@ async fn execute(client: Client, url: Url, range: String) -> Result<RangeReply, 
         });
     }
 
-    let bytes = response
-        .bytes()
+    let bytes = squallar_source::http::body_to_vec(response)
         .await
         .map_err(|error| RangeError::Transport(format!("{url}: reading {range}: {error}")))?;
 
-    Ok(RangeReply::Range {
-        bytes: bytes.to_vec(),
-    })
+    Ok(RangeReply::Range { bytes })
 }
 
 /// Where an HTTP range request is driven.

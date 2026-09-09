@@ -401,8 +401,7 @@ pub async fn fetch_key(
             format!("MRMS {key}: HTTP {}", resp.status()),
         ));
     }
-    let body = resp
-        .bytes()
+    let body = squallar_source::http::body_to_vec(resp)
         .await
         .map_err(|e| FetchError::from_transport(&e, format!("MRMS body read failed: {e}")))?;
     decode_body(&body, product)

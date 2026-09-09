@@ -163,10 +163,12 @@ pub async fn fetch_key(
             format!("GMGSI granule {key} returned HTTP {}", resp.status()),
         ));
     }
-    let bytes = resp.bytes().await.map_err(|e| {
-        FetchError::from_transport(&e, format!("GMGSI granule body read failed: {e}"))
-    })?;
-    super::decode::decode(bytes.into(), channel).map_err(FetchError::transient)
+    let bytes = squallar_source::http::body_to_vec(resp)
+        .await
+        .map_err(|e| {
+            FetchError::from_transport(&e, format!("GMGSI granule body read failed: {e}"))
+        })?;
+    super::decode::decode(bytes, channel).map_err(FetchError::transient)
 }
 
 /// **The most hour prefixes one frame listing will ever request.**

@@ -349,7 +349,7 @@ pub(crate) async fn get_text(client: &reqwest::Client, url: String) -> Result<St
 pub(crate) async fn get_bytes(client: &reqwest::Client, url: String) -> Result<Vec<u8>> {
     let response = client.get(&url).send().await?;
     match classify(response.status()) {
-        StatusClass::Ok => Ok(response.bytes().await?.to_vec()),
+        StatusClass::Ok => Ok(squallar_source::http::body_to_vec(response).await?),
         StatusClass::NotFound => Err(ArchiveError::NotFound(url)),
         StatusClass::Failed => {
             let status = response.status();
@@ -402,7 +402,7 @@ pub async fn download_file(sources: &DataSources, identifier: Identifier) -> Res
     let response = client.get(&url).send().await?;
     match classify(response.status()) {
         StatusClass::Ok => {
-            let data = response.bytes().await?.to_vec();
+            let data = squallar_source::http::body_to_vec(response).await?;
             log::debug!("Object {key:?} is {} bytes", data.len());
             Ok(data)
         }

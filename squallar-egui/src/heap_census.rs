@@ -1559,6 +1559,33 @@ pub fn large_grants_line(instance: &str) -> String {
     out
 }
 
+/// **What the HTTP body reader is holding, and the transport residency it is
+/// not.**
+///
+/// Cumulative flow and two levels on one line, which is why it is its own line
+/// and joins nothing above: `bodies`/`body bytes` are totals since process
+/// start, `in flight` is a level, and the two `peak` figures are watermarks.
+///
+/// `peak shard` is the load-bearing one. It is the high-water mark of "bytes
+/// received but not yet at end-of-body, summed over every body being read at
+/// that instant" — exactly what a collecting reader (`Response::bytes`, i.e.
+/// `http_body_util`'s `collect`) would have been holding in live slices of
+/// hyper's read buffer at that moment, and therefore the transport backing
+/// residency `squallar_source::http::body_to_vec` avoids. A floor, not the
+/// figure: those backings are 32 KiB-granular, so the bytes actually held
+/// would have been this rounded up per frame.
+///
+/// A `String`, so not hook-safe — the same caveat [`large_grants_line`]
+/// carries, and for the same reason.
+pub fn http_bodies_line(instance: &str) -> String {
+    let t = squallar_source::http::totals();
+    format!(
+        "http bodies ({instance}): {} bodies, {} B; in flight {} (peak {}); \
+         shard {} B, peak shard {} B",
+        t.bodies, t.body_bytes, t.in_flight, t.peak_in_flight, t.shard_bytes, t.peak_shard_bytes,
+    )
+}
+
 /// [`write_process_line`] into a `String`, for the telemetry tick.
 pub fn process_line(census: &Census, process: &ProcessCensus, instance: &str) -> String {
     let mut out = String::new();

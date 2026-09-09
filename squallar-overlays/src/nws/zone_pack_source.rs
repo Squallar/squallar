@@ -191,10 +191,8 @@ async fn read_url(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, LoadEr
     if !response.status().is_success() {
         return Err(LoadError::Http(response.status().as_u16()));
     }
-    response
-        .bytes()
+    squallar_source::http::body_to_vec(response)
         .await
-        .map(|bytes| bytes.to_vec())
         .map_err(|e| LoadError::Unavailable(format!("{url}: {e}")))
 }
 

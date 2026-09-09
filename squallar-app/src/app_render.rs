@@ -3219,6 +3219,11 @@ impl super::App {
         // gives it back, so the transient pair that raised the peak is gone
         // from every level by the time any tick reads one.
         say_telemetry(loud, &squallar_egui::heap_census::large_grants_line("page"));
+        // **The HTTP body reader's own line**, beside the grants and never
+        // added to them: `peak shard` is the transport-buffer residency the
+        // frame-at-a-time read avoids, and the 32 KiB..64 KiB size class is
+        // where that residency was measured to land.
+        say_telemetry(loud, &squallar_egui::heap_census::http_bodies_line("page"));
         // The wasm heap watermarks, on the same tick. The bridge answers the
         // platform question: a native bridge reads no heap and neither arm
         // is entered there. The two instances are judged apart — each has

@@ -1028,16 +1028,15 @@ fn summarize_failures(in_window: usize, errors: Vec<String>) -> Option<FetchFail
 }
 
 async fn download_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
-    client
+    let response = client
         .get(url)
         .send()
         .await
         .map_err(|e| format!("HTTP error: {e}"))?
         .error_for_status()
-        .map_err(|e| format!("HTTP status error: {e}"))?
-        .bytes()
+        .map_err(|e| format!("HTTP status error: {e}"))?;
+    squallar_source::http::body_to_vec(response)
         .await
-        .map(|b| b.to_vec())
         .map_err(|e| format!("Failed to read body: {e}"))
 }
 

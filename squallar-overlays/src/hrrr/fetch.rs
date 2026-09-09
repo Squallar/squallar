@@ -703,14 +703,16 @@ async fn fetch_record(
         ));
     }
 
-    let bytes = response.bytes().await.map_err(|e| {
-        FetchError::from_transport(&e, format!("Failed to read response body: {e}"))
-    })?;
+    let bytes = squallar_source::http::body_to_vec(response)
+        .await
+        .map_err(|e| {
+            FetchError::from_transport(&e, format!("Failed to read response body: {e}"))
+        })?;
     log::info!(
         "Received {} bytes of GRIB2 data for {var}:{level}",
         bytes.len()
     );
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 /// Fetch HRRR model data for the given parameter, from `run` at `f_hour`.

@@ -13,6 +13,7 @@ pub mod fetch_policy;
 pub mod footprint;
 pub mod handler;
 pub mod hit;
+pub mod http;
 pub mod id;
 pub mod job;
 pub mod liveness;
