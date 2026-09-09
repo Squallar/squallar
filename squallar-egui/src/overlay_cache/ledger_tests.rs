@@ -231,3 +231,59 @@ fn a_sibling_threads_writes_stay_out_of_this_threads_figures() {
          'a sibling cannot reach me'",
     );
 }
+
+/// **`reset_for_test` puts every counter back, the blank breakdown included.**
+///
+/// It did not, from the day the breakdown landed until 2026-09-09: the array
+/// was added beside `reasons` and not to the loop that zeroes them. Under
+/// `--test-threads=1`, where libtest runs every test on one thread and one set
+/// of counters spans the whole run, a test asserting an absolute per-reason
+/// count would have read its predecessors' blanks on top of its own.
+///
+/// **Written as a walk over `BlankReason::ALL` rather than as a list**, so a
+/// variant appended to the enum is covered the day it exists — which is how
+/// the hole got in.
+///
+/// Both directions: the writes have to land before the reset is asked to
+/// remove them, or this passes on a build where `note_blank` counts nothing.
+#[test]
+fn the_reset_clears_the_blank_breakdown_and_not_only_the_dispatch_reasons() {
+    use ledger::BlankReason;
+
+    ledger::reset_for_test();
+    for reason in BlankReason::ALL {
+        ledger::note_blank(reason);
+    }
+
+    let posted = ledger::totals();
+    for reason in BlankReason::ALL {
+        assert_eq!(
+            posted.blank_reason(reason),
+            1,
+            "{reason:?} did not reach its own counter, so the reset below \
+             would be asked to clear a figure nothing wrote",
+        );
+    }
+    assert_eq!(
+        posted.blanks(),
+        BlankReason::ALL.len() as u64,
+        "the blank count and its breakdown disagree before the reset",
+    );
+
+    ledger::reset_for_test();
+    let cleared = ledger::totals();
+    for reason in BlankReason::ALL {
+        assert_eq!(
+            cleared.blank_reason(reason),
+            0,
+            "{reason:?} survived `reset_for_test`, so a test asserting an \
+             absolute blank figure under `--test-threads=1` reads its \
+             predecessors' blanks as its own",
+        );
+    }
+    assert!(
+        cleared.blank_reasons_balance(),
+        "the reset left the blank count and its breakdown out of step, which \
+         is a hole in the wiring rather than a stale figure",
+    );
+}

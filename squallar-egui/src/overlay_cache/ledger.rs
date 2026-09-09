@@ -700,4 +700,15 @@ pub fn reset_for_test() {
     for counter in &sink.reasons {
         counter.store(0, Relaxed);
     }
+    // **The blank breakdown too, and it was missed when it landed.** The array
+    // was added beside `reasons` and not to this loop, so under
+    // `--test-threads=1` — where libtest runs every test on one thread and one
+    // set of counters spans the whole run — a test asserting an absolute
+    // blank-reason figure read the previous test's blanks on top of its own.
+    // It survived because `blank_reasons_balance` held either way: `pictures`
+    // *was* reset, so a leaked reason count made the identity fail rather than
+    // read wrong, and no suite had yet asserted an absolute per-reason count.
+    for counter in &sink.blank_reasons {
+        counter.store(0, Relaxed);
+    }
 }
