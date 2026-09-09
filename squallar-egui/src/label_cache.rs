@@ -51,9 +51,22 @@ use std::sync::Arc;
 /// though the labels are unchanged. Both terms are
 /// [`crate::point_painter::PointTextKey`]'s, for the same reason and read the
 /// same way: `pixels_per_point` because it re-rasterizes every glyph, and the
-/// atlas stamp because egui rebuilds the atlas under the pass and puts the
-/// glyphs somewhere else. [`walkers::GalleyCache`] drops its own table on both
-/// events; this is the same two facts, held for the same span.
+/// atlas generation because egui rebuilds the atlas under the pass and puts
+/// the glyphs somewhere else.
+///
+/// **The atlas term is a generation and not a reading of the atlas, and that
+/// distinction is the whole of a defect.** It used to be
+/// [`walkers::AtlasStamp`]'s size and fill, taken here, once per pane per
+/// frame. Those are levels, and the only way a repack shows in them is the
+/// fill *falling* — so they answer only for two readings taken one pass apart.
+/// This key is compared across a gap by construction: a pane whose labels have
+/// not moved does not solve, so nothing here reads the atlas for as long as the
+/// map is still, and the fill has climbed back past the stored one under a
+/// height that is once again a power of two by the time anything looks. The
+/// key then matched over a raster that had moved entirely, and the pane
+/// re-painted galleys addressing the glyphs of whatever now occupies those
+/// texels. [`walkers::GalleyCache::generation`] counts the moves instead, so a
+/// key that skipped a thousand frames still compares.
 ///
 /// The projector, the pane rect, the zoom and the theme are all absent, and
 /// none of them is missing: each reaches the labels only by changing them — a
@@ -62,20 +75,18 @@ use std::sync::Arc;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct LabelKey {
     pixels_per_point: u32,
-    atlas_size: [usize; 2],
-    atlas_fill: u32,
+    atlas_generation: u64,
 }
 
 impl LabelKey {
-    /// One `Context::fonts` read, through [`walkers::AtlasStamp`]: a write lock
-    /// on the whole context, so this is taken once per pane per frame and
-    /// never per label.
-    pub(crate) fn new(ctx: &egui::Context) -> Self {
-        let atlas = walkers::AtlasStamp::read(ctx);
+    /// No `Context::fonts` read: the atlas term is the memo's own generation,
+    /// a `u64` load. The context lock this used to take once per pane per
+    /// frame is now taken once per frame, in `Gui::ui_phased`, where the
+    /// generation is maintained.
+    pub(crate) fn new(ctx: &egui::Context, galleys: &walkers::GalleyCache) -> Self {
         Self {
             pixels_per_point: ctx.pixels_per_point().to_bits(),
-            atlas_size: atlas.size,
-            atlas_fill: atlas.fill.to_bits(),
+            atlas_generation: galleys.generation(),
         }
     }
 }
@@ -194,11 +205,10 @@ mod tests {
         walkers::Text::new(egui::pos2(x, 10.0), name, 12.0, egui::Color32::WHITE, 0.0)
     }
 
-    fn key(fill: f32) -> LabelKey {
+    fn key(generation: u64) -> LabelKey {
         LabelKey {
             pixels_per_point: 1.0f32.to_bits(),
-            atlas_size: [64, 64],
-            atlas_fill: fill.to_bits(),
+            atlas_generation: generation,
         }
     }
 
@@ -264,15 +274,15 @@ mod tests {
         let mut cache = LabelCache::default();
         let labels = vec![label("Tulsa", 1.0)];
 
-        assert!(cache.lookup(0, key(0.5), &labels).is_none(), "nothing kept");
-        cache.store(0, key(0.5), labels.clone(), Vec::new());
-        assert!(cache.lookup(0, key(0.5), &labels).is_some(), "pane 0 kept");
+        assert!(cache.lookup(0, key(3), &labels).is_none(), "nothing kept");
+        cache.store(0, key(3), labels.clone(), Vec::new());
+        assert!(cache.lookup(0, key(3), &labels).is_some(), "pane 0 kept");
         assert!(
-            cache.lookup(1, key(0.5), &labels).is_none(),
+            cache.lookup(1, key(3), &labels).is_none(),
             "pane 1 must not read pane 0's solve"
         );
         assert!(
-            cache.lookup(0, key(0.9), &labels).is_none(),
+            cache.lookup(0, key(4), &labels).is_none(),
             "a moved atlas is a new key"
         );
         assert_eq!(cache.solves(), 1);

@@ -542,6 +542,13 @@ pub struct GalleyCache {
     /// The font atlas as it stood when the table was last checked against it.
     /// See [`Self::begin_frame`].
     atlas: AtlasStamp,
+    /// egui's pass number at that check, so the next one can tell whether it
+    /// is the *consecutive* reading [`AtlasStamp::invalidates`] requires.
+    /// `None` until the first check.
+    observed_pass: Option<u64>,
+    /// How many times the atlas has been seen to move under this table.
+    /// See [`Self::generation`].
+    generation: u64,
     entries: std::collections::HashMap<GalleyKey, std::sync::Arc<egui::Galley>>,
     /// The point-label table, keyed in two levels so a lookup can borrow.
     ///
@@ -647,7 +654,8 @@ impl GalleyCache {
         }
     }
 
-    /// Check the table against egui's font atlas, once per frame.
+    /// Check the table against egui's font atlas — **once per pass, from one
+    /// owner, at the head of the pass before anything has laid text out.**
     ///
     /// **A kept galley points into the atlas by pixel position, and egui
     /// rebuilds the atlas.** `Fonts::begin_pass` replaces the whole atlas when
@@ -659,14 +667,55 @@ impl GalleyCache {
     /// too — over-invalidation a handful of times as the atlas doubles at
     /// startup, and nothing after.
     ///
-    /// Once per frame per caller and not per lookup, because
-    /// `Context::fonts` is a write lock on the whole context.
+    /// The three words in the first sentence are each load-bearing, and the
+    /// argument for all three is [`AtlasStamp::invalidates`]': the check is a
+    /// difference of two levels, so it answers only for consecutive readings
+    /// taken at the same point in a pass, and only at a point where a repack
+    /// has not yet been papered over by the pass's own text. Called behind a
+    /// gate — the shape this had until a map's place names started drawing as
+    /// the right words in the wrong letters — the readings straddle a repack
+    /// and a regrowth and say nothing moved. A caller that cannot promise all
+    /// three should read [`Self::generation`] instead of holding geometry
+    /// across this. A pass this table can see it *missed* drops the table
+    /// outright rather than reasoning from a reading it did not take.
+    ///
+    /// Once per pass and not per lookup, because `Context::fonts` is a write
+    /// lock on the whole context.
     pub fn begin_frame(&mut self, ctx: &egui::Context) {
+        let pass = ctx.cumulative_pass_nr();
+        // **A pass this table did not watch is a pass it cannot vouch for.**
+        // The stamp is a level, not an event: a repack is visible only as the
+        // fill *falling*, and the fill climbs back. Two readings either side
+        // of a gap can therefore bracket a repack and a regrowth to the same
+        // size at a higher fill, and `invalidates` will say nothing moved --
+        // which is exactly what happened while every caller of this called it
+        // behind its own gate. Skipping is not a state this table can reason
+        // from, so it drops.
+        let skipped = self.observed_pass.is_some_and(|last| pass > last + 1);
         let stamp = AtlasStamp::read(ctx);
-        if stamp.invalidates(self.atlas) {
+        if skipped || stamp.invalidates(self.atlas) {
             self.drop_all();
+            self.generation = self.generation.wrapping_add(1);
         }
         self.atlas = stamp;
+        self.observed_pass = Some(pass);
+    }
+
+    /// How many times the glyph raster has moved under this table.
+    ///
+    /// **The number a caller stamps its own kept geometry with.** Anything
+    /// holding baked atlas coordinates -- a galley, a tessellated mesh, a
+    /// solved list of label shapes -- is valid only for the generation it was
+    /// built in, and comparing this against the generation it was built under
+    /// is a `u64` compare rather than a second `Context::fonts` read.
+    ///
+    /// It is a counter and not a level for the reason [`Self::begin_frame`]
+    /// gives: a level can return to a value it held before a repack, and a
+    /// cache that missed the frames in between would read that as "unmoved".
+    /// A counter only goes up, so a holder that skipped a hundred frames
+    /// still compares correctly.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     fn drop_all(&mut self) {
@@ -704,6 +753,22 @@ impl AtlasStamp {
     }
 
     /// Whether glyph positions recorded under `earlier` may no longer hold.
+    ///
+    /// **Only answers for the pass immediately after `earlier` was taken, and
+    /// only if both were taken before that pass laid any text out.** This is a
+    /// difference of two levels, and the level it watches is not monotone
+    /// across a repack -- it collapses and climbs back. Between two readings
+    /// far enough apart it has climbed back past `earlier` under a size that
+    /// is once again a power of two, and this returns `false` over a raster
+    /// that moved entirely. [`GalleyCache::begin_frame`] is what holds the
+    /// precondition; [`GalleyCache::generation`] is what a cache that cannot
+    /// watch every pass should compare instead.
+    ///
+    /// Held that way it is sound rather than likely: a repack fires only above
+    /// a fill of 0.8, a fill above 0.8 is reachable only once the atlas height
+    /// has doubled up to its width, and the atlas the repack leaves behind is
+    /// the constructor's -- 32 rows tall. So the reading taken at the head of
+    /// the pass after a repack differs from its predecessor in `size`, always.
     pub fn invalidates(self, earlier: Self) -> bool {
         self.size != earlier.size || self.fill < earlier.fill
     }

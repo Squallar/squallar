@@ -1951,11 +1951,6 @@ fn handle_radar_site_interactions(
     // ask finds nothing claimed and therefore always draws, so a viewport with
     // any station in it can never come back with every name suppressed.
     if zoom >= SITE_LABEL_MIN_ZOOM && !sites.is_empty() {
-        // The galley memo's own frame check, and it is inside this gate rather
-        // than at the top: it costs a `Context::fonts` read, which is a write
-        // lock on the whole context, and below the label zoom there is nothing
-        // for it to protect.
-        galley_cache.begin_frame(ui.ctx());
         let mut occupied = walkers::OccupiedAreas::new();
         let ranks = site_label_ranks(sites, pane);
         for idx in crate::site_marker::label_order(&ranks) {
@@ -3584,7 +3579,6 @@ fn render_per_frame_overlay(
     if points.is_empty() {
         return Vec::new();
     }
-    galleys.begin_frame(ui.ctx());
     // A layer that rasterizes a picture has already drawn its geometry in
     // the worker. Asking the registry rather than naming the layer means a
     // layer that gains a picture stops double-drawing on the frame thread
@@ -3634,6 +3628,7 @@ fn render_per_frame_overlay(
     let key = text_only.then(|| {
         crate::point_painter::PointTextKey::new(
             ui.ctx(),
+            galleys,
             projector,
             expanded,
             handler.data_generation(),

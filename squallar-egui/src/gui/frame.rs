@@ -15,6 +15,25 @@ impl Gui {
         self.ui_phased(ctx).0
     }
 
+    /// The glyph-raster generation this frame drive last observed.
+    ///
+    /// **Read-only, and it exists so the drive's own observation can be
+    /// gated.** Every cache in this crate that holds baked font-atlas
+    /// coordinates — the pane label solves, the point-pass meshes, and the
+    /// galley memo under both — keys itself on this number, and the one call
+    /// that moves it is the unconditional `begin_frame` at the head of
+    /// [`Gui::ui_phased`]. Take that call away and the number never leaves
+    /// zero: every key matches for ever, and the map re-serves label geometry
+    /// across an egui atlas repack, drawing the right words in the wrong
+    /// letters. Nothing else this type exposes changes when that happens, so
+    /// a test that drives real frames has to be able to ask.
+    ///
+    /// It is not a level and carries no units: compare two readings for
+    /// equality, and nothing else.
+    pub fn atlas_generation(&self) -> u64 {
+        self.galley_cache.generation()
+    }
+
     /// **What the overlay layers retired this frame**, for a caller that
     /// drives a frame without the app's discard seam.
     ///
@@ -51,6 +70,42 @@ impl Gui {
         Vec<Box<dyn std::any::Any + Send>>,
     ) {
         let mut actions = Vec::new();
+
+        // **The glyph raster, read once and before anything lays text out.**
+        // Everything this frame keeps that has atlas coordinates baked into it
+        // — the label solves, the point-pass meshes, the galleys under both —
+        // is stamped with `galley_cache.generation()`, and this is the only
+        // call that moves it.
+        //
+        // Two things about the position are load-bearing rather than tidy.
+        //
+        // **Unconditional**, because the check is a difference of two levels
+        // and a level says nothing across the frames nobody sampled it on.
+        // This used to be three calls, each behind its own gate — the label
+        // solve (skipped whenever the pane's labels had not moved, i.e. every
+        // frame on a still map), the site labels (below their zoom) and the
+        // point pass (no points). egui repacks the atlas when it passes 80 %
+        // full and re-rasterizes every glyph somewhere else; a table that was
+        // not looking on the frames the fill collapsed sees only that it has
+        // since climbed back, under a height that is a power of two either
+        // way, and keeps galleys addressing texels that now hold other
+        // letters. That is the garbled basemap city labels: right positions,
+        // right advances, wrong glyphs, on a map that had been panned a while,
+        // with every label egui drew itself clean in the same frame because
+        // egui drops its own galley cache in the same breath as the repack.
+        //
+        // **At the head of the pass**, because that is what makes the
+        // comparison sound rather than likely: a repack needs a fill above
+        // 0.8, that fill is reachable only once the height has doubled up to
+        // the width, and the atlas a repack leaves behind is the
+        // constructor's 32 rows. Read before this pass has rasterized
+        // anything, the reading after a repack therefore differs from its
+        // predecessor in `size`, always. Read later it may not, because the
+        // frame's own text has already regrown it.
+        //
+        // It costs one `Context::fonts` — a write lock on the context — and
+        // removes up to three of the same on the pane walk.
+        self.galley_cache.begin_frame(ctx);
 
         if !self.settings_visible() {
             self.storm_motion_editing = false;

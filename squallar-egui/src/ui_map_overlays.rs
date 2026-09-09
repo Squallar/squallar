@@ -1127,7 +1127,7 @@ pub(super) fn paint_labels(
     if labels.is_empty() {
         return;
     }
-    let key = crate::label_cache::LabelKey::new(painter.ctx());
+    let key = crate::label_cache::LabelKey::new(painter.ctx(), galleys);
     if let Some(kept) = cache.lookup(pane_idx, key, &labels) {
         // Cloned rather than moved: the entry has to outlive this frame, and a
         // shape clone is a refcount bump on a galley that is already laid out.
@@ -1150,8 +1150,6 @@ pub(super) fn solve_labels(
     labels: &[walkers::Text],
     galleys: &mut walkers::GalleyCache,
 ) -> Vec<egui::Shape> {
-    galleys.begin_frame(ctx);
-
     let mut occupied = walkers::OccupiedAreas::new();
     // Where each name has already been drawn, so a fragmented river is named
     // once per stretch of screen rather than once per OSM way. See

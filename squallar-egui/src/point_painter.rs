@@ -139,10 +139,21 @@ impl PointPainter for EguiPointPainter<'_> {
 ///
 /// A station model's text is decided by the layer's data (`generation`), the
 /// zoom tier and font size (`zoom`), the theme (`dark`), the glyph raster
-/// (`pixels_per_point` and the font atlas) and where the projector puts each
-/// station on the pane (`projector`, `rect`). Two projected reference points
-/// pin a Mercator projector — scale and translation — without reaching into
-/// its fields, and the rect is the culling window the points were walked with.
+/// (`pixels_per_point` and `atlas_generation`) and where the projector puts
+/// each station on the pane (`projector`, `rect`). Two projected reference
+/// points pin a Mercator projector — scale and translation — without reaching
+/// into its fields, and the rect is the culling window the points were walked
+/// with.
+///
+/// **A kept mesh has the atlas coordinates baked in twice over**, which is why
+/// the raster terms are here at all: the glyph UVs are normalized by the atlas
+/// size at tessellation time, so a mesh outlives both a repack that moves the
+/// glyphs and a growth that moves the divisor. `atlas_generation` covers both —
+/// see [`walkers::GalleyCache::generation`], which is bumped by a size change
+/// as well as by a fill that fell. It replaced a reading of the atlas taken
+/// here for the reason [`crate::label_cache::LabelKey`] gives at length: a
+/// reading is a level, and a level says nothing across the frames nobody read
+/// it on.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct PointTextKey {
     generation: u64,
@@ -151,13 +162,13 @@ pub(crate) struct PointTextKey {
     pixels_per_point: u32,
     rect: [u32; 4],
     projector: [u32; 4],
-    atlas_size: [usize; 2],
-    atlas_fill: u32,
+    atlas_generation: u64,
 }
 
 impl PointTextKey {
     pub(crate) fn new(
         ctx: &egui::Context,
+        galleys: &walkers::GalleyCache,
         projector: &walkers::Projector,
         rect: egui::Rect,
         generation: u64,
@@ -166,7 +177,6 @@ impl PointTextKey {
     ) -> Self {
         let a = projector.project(walkers::lat_lon(0.0, 0.0));
         let b = projector.project(walkers::lat_lon(45.0, 90.0));
-        let atlas = walkers::AtlasStamp::read(ctx);
         Self {
             generation,
             zoom: zoom.to_bits(),
@@ -179,8 +189,7 @@ impl PointTextKey {
                 rect.max.y.to_bits(),
             ],
             projector: [a.x.to_bits(), a.y.to_bits(), b.x.to_bits(), b.y.to_bits()],
-            atlas_size: atlas.size,
-            atlas_fill: atlas.fill.to_bits(),
+            atlas_generation: galleys.generation(),
         }
     }
 }
@@ -413,7 +422,10 @@ mod point_text_tests {
             let memory = walkers::MapMemory::default();
             let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN);
             let projector = walkers::Projector::new(rect, &memory, walkers::lat_lon(35.0, -97.0));
-            let key = |generation| PointTextKey::new(ctx, &projector, rect, generation, 7.0, false);
+            let galleys = walkers::GalleyCache::default();
+            let key = |generation| {
+                PointTextKey::new(ctx, &galleys, &projector, rect, generation, 7.0, false)
+            };
 
             assert!(
                 meshes.lookup(0, &layer, key(1)).is_none(),
@@ -435,13 +447,14 @@ mod point_text_tests {
             );
             assert_ne!(
                 key(1),
-                PointTextKey::new(ctx, &projector, rect, 1, 7.0, true),
+                PointTextKey::new(ctx, &galleys, &projector, rect, 1, 7.0, true),
                 "the theme is part of the key"
             );
             assert_ne!(
                 key(1),
                 PointTextKey::new(
                     ctx,
+                    &galleys,
                     &projector,
                     rect.translate(egui::vec2(1.0, 0.0)),
                     1,

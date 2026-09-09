@@ -2792,6 +2792,60 @@ layer rather than one per feature.
 137**, from **133** before the previous commit — one test new there and four
 here. (102 at the twenty-third commit; the rest landed between.)
 
+### Changed — source, thirty-fourth commit: the galley memo counts repacks instead of watching a level
+
+`src/text.rs`. `GalleyCache` gains a `generation()` counter and a skipped-pass
+guard; `AtlasStamp::invalidates` is unchanged in behaviour and gains the
+precondition it always had.
+
+**The memo held galleys across an egui font-atlas repack.** A `Galley`
+addresses the atlas by pixel position. egui replaces the atlas whole once it
+passes 80 % full (`epaint::text::Fonts::begin_pass`) and re-rasterizes every
+glyph somewhere else, dropping its own galley cache in the same breath — which
+is why egui's own text is never wrong and only a memo that outlives the pass
+has to look.
+
+`AtlasStamp` looked, and looked correctly, but it is a **level**: the atlas
+size and its fill ratio. A repack shows in those only as the fill *falling*,
+and the fill climbs straight back. The check is therefore an argument about two
+readings taken one pass apart, and it was called from three sites in
+`squallar-egui`, each behind its own gate — the pane's label solve (skipped
+whenever the labels had not moved, i.e. every frame on a still map), the site
+labels (below their zoom) and the point pass (no points). None of them was
+looking on the frames the fill collapsed. By the time one of them did, the fill
+had climbed back past the stored reading under a height that is a power of two
+either way, and `invalidates` answered "nothing moved" over a raster that had
+moved entirely.
+
+What that draws is the defect the user reported: basemap city names in the
+right places, with the right advances, in the wrong letters — `⊃r'sIoS⊃an` for
+a city — appearing only after the map had been panned and zoomed a while, with
+every label egui itself drew clean in the same frame. And because the memo is
+keyed by text and style rather than by position, zooming away and back re-served
+the same corrupted names rather than re-laying them out.
+
+The counter is what a holder that cannot watch every pass compares instead. It
+only goes up, so a cache that skipped a thousand frames still compares
+correctly. `begin_frame` moves it on every event that would have dropped the
+table, and additionally whenever `egui::Context::cumulative_pass_nr` shows the
+table missed a pass — a pass it did not watch is a pass it cannot reason from.
+
+The caller-side half is in `squallar-egui`: one unconditional
+`galley_cache.begin_frame(ctx)` at the head of `Gui::ui_phased`, replacing the
+three gated calls. The head of the pass is load-bearing and the doc on
+`AtlasStamp::invalidates` now says why: a repack needs a fill above 0.8, a fill
+above 0.8 is reachable only once the atlas height has doubled up to its width,
+and the atlas a repack leaves behind is the constructor's 32 rows — so a
+reading taken before the pass has rasterized anything always differs from its
+predecessor in `size`. Read later, after the frame's own chrome has regrown it,
+it may not.
+
+Gated by `squallar-egui/tests/label_glyphs_survive_an_atlas_repack.rs`, which
+drives a real repack headlessly with the memo not watching, and by
+`a_frame_drive_notices_the_atlas_being_repacked` in
+`squallar-egui/src/gui/frame.rs`, which drives real frames. Both were shown red
+against the code this replaces.
+
 ## rustfmt
 
 `cargo fmt -p walkers -- --check` is clean over this directory as vendored,
