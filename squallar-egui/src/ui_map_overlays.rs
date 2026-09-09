@@ -1122,13 +1122,30 @@ impl RunCursor {
 ///
 /// **The solve is skipped outright on a pane whose labels have not moved.**
 /// [`solve_labels`] reads the list and the fonts and nothing else, so `cache`
-/// answers with the shapes it produced last time whenever this pane hands over
-/// the same list under the same glyph raster — which, on a map nobody is
-/// touching, is every frame after the first. The shapes it hands back are the
-/// shapes a fresh solve would have built, painted through the same `extend`
-/// under the same clip and the same opacity, so nothing about the picture
-/// depends on which of the two answered. See [`crate::label_cache`] for what
-/// is in the key and what is deliberately not.
+/// answers with the geometry it produced last time whenever this pane hands
+/// over the same list under the same glyph raster — which, on a map nobody is
+/// touching, is every frame after the first. See [`crate::label_cache`] for
+/// what is in the key and what is deliberately not.
+///
+/// **What is kept and re-added is one tessellated mesh, not the shape list.**
+/// A shape list is re-walked by `Context::tessellate` on every frame it is
+/// added on, and on the native rig's scene A that is 430.2 text shapes and
+/// 14,663 glyph vertices per pane-frame, each vertex arriving at the value it
+/// already had. Tessellating the solve where it is made costs the same
+/// vertices once and a copy thereafter, and it is
+/// [`crate::point_painter::tessellate_text_shapes`] that does it, so the two
+/// text paths a pane has cannot drift apart.
+///
+/// **A solve fills the retired solve's buffers**, rather than asking the
+/// allocator for another ~850 kB on every frame a pan re-solves on. See
+/// [`crate::label_cache::LabelCache::recycle`], which is also where the
+/// argument that nothing else can still be holding them lives.
+///
+/// Placed under the pane's own painter, so the clip and the layer opacity
+/// still reach it exactly as they reached the shapes. Below full opacity that
+/// tint is `Arc::make_mut` on the kept mesh once a frame — the same known
+/// per-frame cost [`crate::point_painter::PointTextMeshes`] carries, bounded
+/// by the pane's own labels, and not fixed here.
 pub(super) fn paint_labels(
     painter: &egui::Painter,
     labels: Vec<walkers::Text>,
@@ -1140,16 +1157,23 @@ pub(super) fn paint_labels(
         return;
     }
     let key = crate::label_cache::LabelKey::new(painter.ctx(), galleys);
-    if let Some(kept) = cache.lookup(pane_idx, key, &labels) {
-        // Cloned rather than moved: the entry has to outlive this frame, and a
-        // shape clone is a refcount bump on a galley that is already laid out.
-        painter.extend(kept.to_vec());
-        return;
+    let mesh = match cache.lookup(pane_idx, key, &labels) {
+        Some(kept) => kept,
+        None => {
+            crate::tile_mesh::ledger::note_label_solve();
+            let placed = solve_labels(painter.ctx(), &labels, galleys);
+            // The solve this one replaces owns a buffer of exactly the right
+            // size; see `LabelCache::recycle`.
+            let recycled = cache.recycle(pane_idx);
+            let mesh =
+                crate::point_painter::tessellate_text_shapes_into(painter.ctx(), placed, recycled);
+            cache.store(pane_idx, key, labels, mesh.clone());
+            mesh
+        }
+    };
+    if let Some(mesh) = mesh {
+        painter.add(egui::Shape::Mesh(mesh));
     }
-    crate::tile_mesh::ledger::note_label_solve();
-    let placed = solve_labels(painter.ctx(), &labels, galleys);
-    painter.extend(placed.clone());
-    cache.store(pane_idx, key, labels, placed);
 }
 
 /// The label phase itself: lay every name out, and hand back the shapes that
@@ -1672,17 +1696,12 @@ mod tests {
         tiles.put_for_test(tile_id, extent_spanning_tile());
         let rect = projector.tile_rect(tile_id);
 
+        let mut placed = Vec::new();
         let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
             let labels = draw_tile_layer(ui, &projector, zoom, &mut tiles, 0, None).labels;
             // The pane's `CityLabels` arm, which is where the deferred labels
             // are painted; without it this pass draws ground and no names.
-            paint_labels(
-                ui.painter(),
-                labels,
-                &mut walkers::GalleyCache::default(),
-                &mut crate::label_cache::LabelCache::default(),
-                0,
-            );
+            placed = solve_and_paint(ui, labels);
         });
 
         // NON-VACUITY, and the specific thing that would have passed before:
@@ -1723,13 +1742,13 @@ mod tests {
         // The label was laid out and placed, not dropped. `Text` becomes a
         // `TextShape`, which is what proves `lay_out_label` ran rather than the
         // variant being skipped.
-        let label = shapes
+        let label = placed
             .iter()
-            .find_map(|c| match &c.shape {
+            .find_map(|s| match s {
                 egui::Shape::Text(t) => Some(t),
                 _ => None,
             })
-            .expect("the tile's label did not reach the painter");
+            .expect("the tile's label did not reach the label phase");
         assert_eq!(label.galley.job.text, "Monaco");
 
         // The label sat at the centre of the extent, so it must sit at the
@@ -1823,10 +1842,38 @@ mod tests {
         );
     }
 
+    /// Solve `labels` for this pane and paint them, and hand back the shapes
+    /// the phase produced.
+    ///
+    /// **The shapes are what the assertions below read, and the mesh is what
+    /// the glass gets.** `paint_labels` adds one `Shape::Mesh`, so a pass's
+    /// own shape list no longer carries a `TextShape` to inspect; every
+    /// placement, collision, wrapping and repeat rule is a property of
+    /// `solve_labels`' output, which is what this returns. The one thing that
+    /// says the painted mesh *is* those shapes is
+    /// `the_painted_mesh_is_what_the_solved_shapes_tessellate_to`.
+    ///
+    /// Both are run, and the second run is the shipped `paint_labels`, so
+    /// every test below still drives the real path end to end.
+    fn solve_and_paint(ui: &egui::Ui, labels: Vec<Text>) -> Vec<egui::Shape> {
+        let solved = solve_labels(ui.ctx(), &labels, &mut walkers::GalleyCache::default());
+        paint_labels(
+            ui.painter(),
+            labels,
+            &mut walkers::GalleyCache::default(),
+            &mut crate::label_cache::LabelCache::default(),
+            0,
+        );
+        solved
+    }
+
     /// Draw `tiles` as `(shapes, rect)` pieces through the ground phase, then
     /// run the one label phase over everything they deferred -- which is what
     /// `draw_tile_layer` does across a span, in miniature.
-    fn ground_then_labels(ui: &egui::Ui, tiles: &[(Vec<ShapeOrText>, egui::Rect)]) {
+    fn ground_then_labels(
+        ui: &egui::Ui,
+        tiles: &[(Vec<ShapeOrText>, egui::Rect)],
+    ) -> Vec<egui::Shape> {
         let whole = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         let mut labels = Vec::new();
         for (shapes, rect) in tiles {
@@ -1840,19 +1887,13 @@ mod tests {
                 Background::Inline,
             );
         }
-        paint_labels(
-            ui.painter(),
-            labels,
-            &mut walkers::GalleyCache::default(),
-            &mut crate::label_cache::LabelCache::default(),
-            0,
-        );
+        solve_and_paint(ui, labels)
     }
 
-    fn text_count(shapes: &[egui::epaint::ClippedShape]) -> usize {
+    fn text_count(shapes: &[egui::Shape]) -> usize {
         shapes
             .iter()
-            .filter(|c| matches!(&c.shape, egui::Shape::Text(_)))
+            .filter(|s| matches!(s, egui::Shape::Text(_)))
             .count()
     }
 
@@ -1878,8 +1919,9 @@ mod tests {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(256.0, 256.0));
 
         // Same point, twice.
-        let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            ground_then_labels(
+        let mut shapes = Vec::new();
+        let _ = shapes_of_one_pass(&ctx, canvas, |ui| {
+            shapes = ground_then_labels(
                 ui,
                 &[(
                     vec![
@@ -1898,8 +1940,9 @@ mod tests {
 
         // Far apart, and both survive -- the control that stops the assertion
         // above from passing because labels are simply never drawn.
-        let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            ground_then_labels(
+        let mut shapes = Vec::new();
+        let _ = shapes_of_one_pass(&ctx, canvas, |ui| {
+            shapes = ground_then_labels(
                 ui,
                 &[(
                     vec![
@@ -1933,8 +1976,9 @@ mod tests {
         // tile owns the anchor and the east tile carries it only in its buffer
         // -- a negative extent coordinate, west of its own origin, which lands
         // on the same screen point.
-        let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            ground_then_labels(
+        let mut shapes = Vec::new();
+        let _ = shapes_of_one_pass(&ctx, canvas, |ui| {
+            shapes = ground_then_labels(
                 ui,
                 &[
                     (vec![label_at(EXTENT * 0.99, "Topeka")], west),
@@ -1963,8 +2007,9 @@ mod tests {
         let west = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(256.0, 256.0));
         let east = egui::Rect::from_min_size(egui::pos2(256.0, 0.0), egui::vec2(256.0, 256.0));
 
-        let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            ground_then_labels(
+        let mut shapes = Vec::new();
+        let _ = shapes_of_one_pass(&ctx, canvas, |ui| {
+            shapes = ground_then_labels(
                 ui,
                 &[
                     (vec![label_at(EXTENT / 2.0, "Topeka")], west),
@@ -1987,13 +2032,17 @@ mod tests {
         let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         let tile = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(256.0, 256.0));
 
+        let mut solved = Vec::new();
         let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            ground_then_labels(ui, &[(vec![label_at(EXTENT * 0.99, "Topeka")], tile)]);
+            solved = ground_then_labels(ui, &[(vec![label_at(EXTENT * 0.99, "Topeka")], tile)]);
         });
+        assert_eq!(text_count(&solved), 1, "the label was not placed at all");
 
+        // The label's glyphs reach the painter as the phase's one mesh, and it
+        // is the CLIP it arrived under that this test is about.
         let label = shapes
             .iter()
-            .find(|c| matches!(&c.shape, egui::Shape::Text(_)))
+            .find(|c| matches!(&c.shape, egui::Shape::Mesh(m) if is_glyph_mesh(m)))
             .expect("the label reached the painter");
         assert!(
             label.clip_rect.max.x > tile.max.x,
@@ -2082,9 +2131,10 @@ mod tests {
     /// The unit tests in `walkers::text` hold the galley identity; this holds
     /// the one that matters on the glass, through the real `paint_labels`:
     /// three passes over the same names, one cache carried across all of them,
-    /// against three passes each with its own. Every `TextShape` must match in
-    /// position, colour and laid-out text — a memo that answered a stale
-    /// galley, or that changed placement order, shows up here.
+    /// against three passes each with its own. Every glyph vertex the pass put
+    /// on the painter must match in position, atlas UV and colour, in order —
+    /// a memo that answered a stale galley, or that changed placement order,
+    /// shows up here.
     ///
     /// The labels move between passes, because that is the case the memo is
     /// built for: panning re-uses every entry, so a kept cache must still lay
@@ -2096,13 +2146,7 @@ mod tests {
         let names = ["Washita River", "Oklahoma City", "Lake Thunderbird"];
         let offsets = [0.0_f32, 17.0, -23.0];
 
-        let describe =
-            |shapes: &[egui::epaint::ClippedShape]| -> Vec<(String, egui::Pos2, egui::Color32)> {
-                text_shapes(shapes)
-                    .iter()
-                    .map(|t| (t.galley.text().to_owned(), t.pos, t.fallback_color))
-                    .collect()
-            };
+        let describe = painted_glyph_vertices;
 
         let ctx_kept = egui::Context::default();
         let mut kept = walkers::GalleyCache::default();
@@ -2162,8 +2206,8 @@ mod tests {
     /// and is re-consulted every frame. This holds the memo of the whole
     /// phase: three passes over an UNMOVED label list against one
     /// [`crate::label_cache::LabelCache`], and three passes each with its own,
-    /// which is the arm that solves every time. Every `TextShape` must match
-    /// in position, colour and laid-out text.
+    /// which is the arm that solves every time. Every glyph vertex the pass
+    /// put on the painter must match in position, atlas UV and colour.
     ///
     /// The labels do not move between passes here, and that is the difference
     /// from the sibling: this is the case the phase memo exists for, and the
@@ -2184,13 +2228,7 @@ mod tests {
         ];
         let labels = || -> Vec<Text> { names.iter().map(|(n, at)| label(n, *at)).collect() };
 
-        let describe =
-            |shapes: &[egui::epaint::ClippedShape]| -> Vec<(String, egui::Pos2, egui::Color32)> {
-                text_shapes(shapes)
-                    .iter()
-                    .map(|t| (t.galley.text().to_owned(), t.pos, t.fallback_color))
-                    .collect()
-            };
+        let describe = painted_glyph_vertices;
 
         const PASSES: u64 = 3;
 
@@ -2225,8 +2263,15 @@ mod tests {
             !kept_frames[0].is_empty(),
             "the fixture drew no labels, so the comparison proves nothing",
         );
+        // The fixture property, read where it is countable: the frames above
+        // are glyph vertices, so "fewer than five" is a statement about the
+        // phase's shapes and is made against them.
+        let mut placed = Vec::new();
+        let _ = shapes_of_one_pass(&egui::Context::default(), canvas, |ui| {
+            placed = solve_labels(ui.ctx(), &labels(), &mut walkers::GalleyCache::default());
+        });
         assert!(
-            kept_frames[0].len() < names.len(),
+            text_shapes(&placed).len() < names.len(),
             "the fixture placed every label, so the comparison never covers a refusal",
         );
 
@@ -2241,6 +2286,239 @@ mod tests {
             touched,
             names.len() as u64,
             "a kept frame reached the galley memo, so the phase ran again",
+        );
+    }
+
+    /// **The mesh `paint_labels` paints is the solved shapes, vertex for
+    /// vertex.**
+    ///
+    /// Every placement, collision, wrapping and repeat assertion in this
+    /// module reads [`solve_labels`]' shapes. This is the one thing that says
+    /// what reaches the glass is those shapes: one arm adds them to a painter
+    /// and lets `Context::tessellate` walk them, which is what this path did
+    /// before it kept a mesh; the other is the shipped `paint_labels`.
+    /// Positions, atlas UVs, colours and indices must match in order.
+    ///
+    /// **The fixture has to carry three properties or it cannot reach the
+    /// thing it measures.** The atlas is warmed first, because a pass that
+    /// grows it changes every normalised UV and the comparison would be a
+    /// comparison of atlases rather than of paths. The names are placed well
+    /// inside the canvas, because the direct arm culls a text row against the
+    /// painter's clip and [`crate::point_painter::tessellate_text_shapes`]
+    /// tessellates under `Rect::EVERYTHING` — the two agree exactly on a row
+    /// the clip keeps, and only there. And more than one name is placed, at
+    /// more than one row, so the comparison covers ordering and not just a
+    /// single galley.
+    #[test]
+    fn the_painted_mesh_is_what_the_solved_shapes_tessellate_to() {
+        let _ledger = ledger_guard();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN);
+        let ctx = egui::Context::default();
+        let names = ["Washita River", "Oklahoma City", "Lake Thunderbird", "Enid"];
+        let labels = || -> Vec<Text> {
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| label(n, egui::pos2(300.0, 120.0 + 90.0 * i as f32)))
+                .collect()
+        };
+
+        // Warm the atlas with every glyph both arms use, so neither grows it
+        // under the other.
+        let _ = shapes_of_one_pass(&ctx, canvas, |ui| {
+            let _ = solve_labels(ui.ctx(), &labels(), &mut walkers::GalleyCache::default());
+        });
+
+        // The direct arm: the phase's shapes, added and tessellated by egui.
+        let mut solved = Vec::new();
+        let direct_pass = shapes_of_one_pass(&ctx, canvas, |ui| {
+            solved = solve_labels(ui.ctx(), &labels(), &mut walkers::GalleyCache::default());
+            ui.painter().extend(solved.clone());
+        });
+        assert_eq!(
+            text_shapes(&solved).len(),
+            names.len(),
+            "fixture: not every name placed, so the comparison is narrower \
+             than it reads"
+        );
+        let mut direct = egui::Mesh::default();
+        for prim in ctx.tessellate(direct_pass, ctx.pixels_per_point()) {
+            if let egui::epaint::Primitive::Mesh(m) = prim.primitive {
+                direct.append(m);
+            }
+        }
+
+        // The kept arm: `paint_labels`, which tessellates the same shapes once.
+        let painted = shapes_of_one_pass(&ctx, canvas, |ui| {
+            paint_labels(
+                ui.painter(),
+                labels(),
+                &mut walkers::GalleyCache::default(),
+                &mut crate::label_cache::LabelCache::default(),
+                0,
+            );
+        });
+        let mut kept = egui::Mesh::default();
+        for prim in ctx.tessellate(painted, ctx.pixels_per_point()) {
+            if let egui::epaint::Primitive::Mesh(m) = prim.primitive {
+                kept.append(m);
+            }
+        }
+
+        assert!(!direct.is_empty(), "the direct arm tessellated nothing");
+        let describe = |m: &egui::Mesh| -> Vec<(egui::Pos2, egui::Pos2, egui::Color32)> {
+            m.vertices.iter().map(|v| (v.pos, v.uv, v.color)).collect()
+        };
+        assert_eq!(describe(&kept), describe(&direct));
+        assert_eq!(kept.indices, direct.indices);
+    }
+
+    /// **A repack under a map nobody is touching does not re-paint the old
+    /// atlas.**
+    ///
+    /// This is the defect `8f2e1bb0f` fixed for the galley memo, asked of the
+    /// memo above it, and it bites harder here: a kept mesh carries the atlas
+    /// coordinates twice over — the glyph's texel, and the atlas size it was
+    /// divided by — so it is wrong after a *growth* as well as after a repack,
+    /// where a kept galley would still have been right. Nothing gated
+    /// [`crate::label_cache::LabelKey`]'s raster terms before this: setting
+    /// `atlas_generation` to a constant left the whole board green.
+    ///
+    /// **The property the fixture needs** is the one that file's header names:
+    /// enough distinct glyphs to drive egui past its 80 % repack mark, a label
+    /// solved before that and asked for again after, and — the part that makes
+    /// it a *memo* test — a label list that never moves, so the phase memo
+    /// answers from its entry on every frame in between and the raster terms
+    /// are the only thing that can invalidate it.
+    ///
+    /// The reference is solved and tessellated in the SAME pass, through a
+    /// cache holding nothing, so the two differ only where the memo served
+    /// geometry the current atlas no longer matches.
+    #[test]
+    fn a_repack_under_a_still_map_does_not_paint_the_old_atlas() {
+        let _ledger = ledger_guard();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN);
+        let ctx = egui::Context::default();
+        let mut galleys = walkers::GalleyCache::default();
+        let mut cache = crate::label_cache::LabelCache::default();
+        let names = || vec![label("Washita River", egui::pos2(200.0, 300.0))];
+
+        // Fresh atlas entries, the way panning onto new tiles makes them.
+        let mut size = 6.0f32;
+        let burn = |ctx: &egui::Context, size: &mut f32| {
+            for _ in 0..4 {
+                *size += 0.25;
+                let mut job = egui::text::LayoutJob::default();
+                job.append(
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+                    0.0,
+                    egui::TextFormat {
+                        font_id: egui::FontId::proportional(*size),
+                        color: egui::Color32::WHITE,
+                        ..Default::default()
+                    },
+                );
+                ctx.fonts_mut(|f| f.layout_job(job));
+            }
+        };
+        let stamp =
+            |ctx: &egui::Context| ctx.fonts(|f| (f.font_image_size(), f.font_atlas_fill_ratio()));
+
+        // One pass so the context has fonts to read.
+        let _ = shapes_of_one_pass(&ctx, canvas, |_| {});
+
+        let mut repacked = false;
+        let mut grew = false;
+        for _ in 0..4000 {
+            let before = stamp(&ctx);
+            let mut reference = None;
+            let painted = shapes_of_one_pass(&ctx, canvas, |ui| {
+                // The head of the pass, where the shell checks the raster.
+                galleys.begin_frame(ui.ctx());
+                paint_labels(ui.painter(), names(), &mut galleys, &mut cache, 0);
+                reference = crate::point_painter::tessellate_text_shapes(
+                    ui.ctx(),
+                    solve_labels(ui.ctx(), &names(), &mut walkers::GalleyCache::default()),
+                );
+                burn(ui.ctx(), &mut size);
+            });
+
+            let reference = reference.expect("the reference solve drew the label");
+            let expected: Vec<_> = reference
+                .vertices
+                .iter()
+                .map(|v| (v.pos, v.uv, v.color))
+                .collect();
+            assert_eq!(
+                painted_glyph_vertices(&painted),
+                expected,
+                "the pane painted geometry the current atlas no longer matches"
+            );
+
+            let now = stamp(&ctx);
+            repacked |= now.1 < before.1;
+            grew |= now.0 != before.0;
+            if repacked && grew {
+                break;
+            }
+        }
+
+        assert!(repacked, "fixture: never drove a repack");
+        assert!(grew, "fixture: never grew the atlas");
+        assert!(
+            cache.solves() > 1,
+            "fixture: an unmoved label list was re-solved by something other \
+             than the raster, so the comparison is not about the raster"
+        );
+        assert!(
+            cache.hits() > 0,
+            "fixture: the memo never answered, so nothing was held across \
+             anything"
+        );
+    }
+
+    /// **A solve fills the buffers of the solve it replaces.**
+    ///
+    /// A pane being panned re-solves on nearly half its frames, and a solve
+    /// that starts from `Mesh::default()` takes ~850 kB from the allocator and
+    /// gives it back a frame later, every one of those frames. This holds both
+    /// halves of the reuse: that `Arc::try_unwrap` really does find the kept
+    /// mesh unique by the next pass — which is the fact the whole thing stands
+    /// on, and the one that would silently stop being true if the painter's
+    /// clone outlived its frame — and that what comes back carries the
+    /// capacity rather than an emptied husk. `Mesh::clear` produces the husk;
+    /// that is why `recycle` does not call it.
+    #[test]
+    fn a_moved_label_set_refills_the_retired_mesh() {
+        let _ledger = ledger_guard();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN);
+        let ctx = egui::Context::default();
+        let mut galleys = walkers::GalleyCache::default();
+        let mut cache = crate::label_cache::LabelCache::default();
+        let at = |dx: f32| vec![label("Washita River", egui::pos2(200.0 + dx, 300.0))];
+
+        for dx in [0.0_f32, 11.0, 22.0] {
+            let _ = shapes_of_one_pass(&ctx, canvas, |ui| {
+                paint_labels(ui.painter(), at(dx), &mut galleys, &mut cache, 0);
+            });
+        }
+
+        assert_eq!(cache.solves(), 3, "fixture: the list must move every pass");
+        assert_eq!(
+            cache.recycled(),
+            2,
+            "a solve asked the allocator for a mesh the retired solve already \
+             owned; `Arc::try_unwrap` is finding the kept mesh still shared"
+        );
+
+        let retired = cache.recycle(0);
+        assert!(retired.is_empty(), "a recycled mesh must come back emptied");
+        assert!(
+            retired.vertices.capacity() > 0 && retired.indices.capacity() > 0,
+            "the retired mesh came back with no buffers ({} verts, {} indices \
+             of capacity), so every solve still allocates",
+            retired.vertices.capacity(),
+            retired.indices.capacity(),
         );
     }
 
@@ -2291,9 +2569,9 @@ mod tests {
         assert_eq!(cache.hits(), 4);
     }
 
-    /// Every `TextShape` a pass emitted, reaching inside a haloed label's
-    /// `Shape::Vec`.
-    fn text_shapes(shapes: &[egui::epaint::ClippedShape]) -> Vec<&egui::epaint::TextShape> {
+    /// Every `TextShape` the label phase produced, reaching inside a haloed
+    /// label's `Shape::Vec`.
+    fn text_shapes(shapes: &[egui::Shape]) -> Vec<&egui::epaint::TextShape> {
         fn walk<'a>(shape: &'a egui::Shape, into: &mut Vec<&'a egui::epaint::TextShape>) {
             match shape {
                 egui::Shape::Text(text) => into.push(text),
@@ -2302,10 +2580,39 @@ mod tests {
             }
         }
         let mut found = Vec::new();
-        for clipped in shapes {
-            walk(&clipped.shape, &mut found);
+        for shape in shapes {
+            walk(shape, &mut found);
         }
         found
+    }
+
+    /// Whether a mesh carries glyphs rather than flat fill.
+    ///
+    /// A ground fill's vertices all sample epaint's white texel; a glyph's
+    /// sample the font atlas. Both meshes carry `TextureId::Managed(0)`, so
+    /// the UV is what separates them — which is what keeps a shape-kind
+    /// sequence able to say "and then the label" now that the label is a mesh.
+    fn is_glyph_mesh(mesh: &egui::Mesh) -> bool {
+        mesh.vertices.iter().any(|v| v.uv != egui::epaint::WHITE_UV)
+    }
+
+    /// The vertices `paint_labels` put on the painter, in order.
+    ///
+    /// A stronger reading than the `(text, pos, colour)` triples this
+    /// replaced: it is the geometry itself, so a memo that answered a galley
+    /// addressing the wrong atlas texels is a difference here and was not
+    /// there.
+    fn painted_glyph_vertices(
+        shapes: &[egui::epaint::ClippedShape],
+    ) -> Vec<(egui::Pos2, egui::Pos2, egui::Color32)> {
+        shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Mesh(m) if is_glyph_mesh(m) => Some(m),
+                _ => None,
+            })
+            .flat_map(|m| m.vertices.iter().map(|v| (v.pos, v.uv, v.color)))
+            .collect()
     }
 
     /// **`text-max-width` wraps, and the collision box covers the block.**
@@ -2418,14 +2725,9 @@ mod tests {
             .enumerate()
             .map(|(i, at)| label(&format!("River {i}"), *at))
             .collect();
-        let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            paint_labels(
-                ui.painter(),
-                distinct,
-                &mut walkers::GalleyCache::default(),
-                &mut crate::label_cache::LabelCache::default(),
-                0,
-            );
+        let mut shapes = Vec::new();
+        let _ = shapes_of_one_pass(&ctx, canvas, |ui| {
+            shapes = solve_and_paint(ui, distinct);
         });
         assert_eq!(
             text_shapes(&shapes).len(),
@@ -2435,14 +2737,9 @@ mod tests {
         );
 
         let crowded: Vec<Text> = anchors.iter().map(|at| label("Rio Grande", *at)).collect();
-        let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            paint_labels(
-                ui.painter(),
-                crowded,
-                &mut walkers::GalleyCache::default(),
-                &mut crate::label_cache::LabelCache::default(),
-                0,
-            );
+        let mut shapes = Vec::new();
+        let _ = shapes_of_one_pass(&ctx, canvas, |ui| {
+            shapes = solve_and_paint(ui, crowded);
         });
         assert_eq!(
             text_shapes(&shapes).len(),
@@ -2465,14 +2762,9 @@ mod tests {
             // leaves it alone.
             label("Rio Salado", egui::pos2(140.0, 400.0)),
         ];
-        let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            paint_labels(
-                ui.painter(),
-                spread,
-                &mut walkers::GalleyCache::default(),
-                &mut crate::label_cache::LabelCache::default(),
-                0,
-            );
+        let mut shapes = Vec::new();
+        let _ = shapes_of_one_pass(&ctx, canvas, |ui| {
+            shapes = solve_and_paint(ui, spread);
         });
         let drawn: Vec<&str> = text_shapes(&shapes)
             .iter()
@@ -2509,17 +2801,12 @@ mod tests {
         let ctx = egui::Context::default();
         let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
 
+        let mut solved = Vec::new();
         let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            paint_labels(
-                ui.painter(),
-                vec![label("Washita River", egui::pos2(400.0, 300.0))],
-                &mut walkers::GalleyCache::default(),
-                &mut crate::label_cache::LabelCache::default(),
-                0,
-            );
+            solved = solve_and_paint(ui, vec![label("Washita River", egui::pos2(400.0, 300.0))]);
         });
 
-        let texts = text_shapes(&shapes);
+        let texts = text_shapes(&solved);
         assert_eq!(
             texts.len(),
             1,
@@ -2554,14 +2841,9 @@ mod tests {
         // `place_city_dot_z7`, the layer this name actually draws through, asks
         // for `text-max-width: 8`.
         let long = label(LONG_NAME, egui::pos2(400.0, 300.0)).with_wrapping(Some(8.0), None);
-        let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            paint_labels(
-                ui.painter(),
-                vec![long],
-                &mut walkers::GalleyCache::default(),
-                &mut crate::label_cache::LabelCache::default(),
-                0,
-            );
+        let mut shapes = Vec::new();
+        let _ = shapes_of_one_pass(&ctx, canvas, |ui| {
+            shapes = solve_and_paint(ui, vec![long]);
         });
         assert!(
             text_shapes(&shapes).is_empty(),
@@ -2584,14 +2866,9 @@ mod tests {
                 "fixture: {name:?} took {rows} rows, over the cap"
             );
 
-            let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-                paint_labels(
-                    ui.painter(),
-                    vec![text],
-                    &mut walkers::GalleyCache::default(),
-                    &mut crate::label_cache::LabelCache::default(),
-                    0,
-                );
+            let mut shapes = Vec::new();
+            let _ = shapes_of_one_pass(&ctx, canvas, |ui| {
+                shapes = solve_and_paint(ui, vec![text]);
             });
             assert_eq!(
                 text_shapes(&shapes).len(),
@@ -3114,13 +3391,14 @@ mod tests {
                 egui::Shape::Rect(_) => "rect",
                 egui::Shape::Callback(_) => "callback",
                 egui::Shape::Path(_) => "path",
-                egui::Shape::Text(_) => "text",
+                egui::Shape::Mesh(m) if is_glyph_mesh(m) => "glyphs",
+                egui::Shape::Mesh(_) => "mesh",
                 other => panic!("unexpected shape {other:?}"),
             })
             .collect();
         assert_eq!(
             kinds,
-            vec!["rect", "callback", "path", "callback", "text"],
+            vec!["rect", "callback", "path", "callback", "glyphs"],
             "the fills did not draw in the positions the style put them in"
         );
     }
@@ -3336,10 +3614,10 @@ mod tests {
             .map(|clipped| match &clipped.shape {
                 egui::Shape::Noop => "noop",
                 egui::Shape::Rect(_) => "rect",
+                egui::Shape::Mesh(m) if is_glyph_mesh(m) => "glyphs",
                 egui::Shape::Mesh(_) => "mesh",
                 egui::Shape::Callback(_) => "callback",
                 egui::Shape::Path(_) => "path",
-                egui::Shape::Text(_) => "text",
                 other => panic!("unexpected shape {other:?}"),
             })
             .collect()
@@ -3656,15 +3934,15 @@ mod tests {
         let kinds: Vec<&'static str> = emitted
             .iter()
             .map(|clipped| match &clipped.shape {
+                egui::Shape::Mesh(m) if is_glyph_mesh(m) => "glyphs",
                 egui::Shape::Mesh(_) => "mesh",
                 egui::Shape::Path(_) => "path",
-                egui::Shape::Text(_) => "text",
                 other => panic!("unexpected shape {other:?}"),
             })
             .collect();
         assert_eq!(
             kinds,
-            vec!["mesh", "mesh", "text"],
+            vec!["mesh", "mesh", "glyphs"],
             "the run did not draw as one mesh in the fill's wake"
         );
     }
@@ -3734,13 +4012,14 @@ mod tests {
                 egui::Shape::Rect(_) => "rect",
                 egui::Shape::Callback(_) => "callback",
                 egui::Shape::Path(_) => "path",
-                egui::Shape::Text(_) => "text",
+                egui::Shape::Mesh(m) if is_glyph_mesh(m) => "glyphs",
+                egui::Shape::Mesh(_) => "mesh",
                 other => panic!("unexpected shape {other:?}"),
             })
             .collect();
         assert_eq!(
             kinds,
-            vec!["rect", "callback", "text"],
+            vec!["rect", "callback", "glyphs"],
             "the tile's three runs are not one callback sitting where the \
              first of them sat, after the background rectangle"
         );
@@ -3788,7 +4067,7 @@ mod tests {
         assert_eq!(
             shapes
                 .iter()
-                .filter(|c| matches!(c.shape, egui::Shape::Mesh(_)))
+                .filter(|c| matches!(&c.shape, egui::Shape::Mesh(m) if !is_glyph_mesh(m)))
                 .count(),
             2,
             "a refused run was not placed exactly once"

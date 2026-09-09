@@ -11,15 +11,34 @@
 //!
 //! What that solve costs per name is a galley probe, a repeat-name probe, an
 //! oriented rectangle, a bucketed collision search and a shape; several
-//! hundred names sit on a 1920x1080 basemap pane. What re-painting a solved
-//! list costs is a run of shape clones, each a refcount bump on a galley that
-//! is already laid out.
+//! hundred names sit on a 1920x1080 basemap pane.
+//!
+//! # What is kept is the vertices, not the shapes
 //!
 //! This is [`crate::point_painter::PointTextMeshes`]' bargain applied to the
-//! other text a pane draws, and it keeps the same thing for the same reason:
-//! **the per-shape work, not the vertices.** The shapes are re-added every
-//! frame and egui tessellates them exactly as it always did, so what a frame
-//! stages does not fall and no pixel moves.
+//! other text a pane draws, and it is kept the same way and for the same
+//! reason: a `Vec<egui::Shape>` handed back to the painter is a list
+//! `Context::tessellate` walks again on every frame, and every glyph in it is
+//! re-placed, re-coloured and re-normalized against the font atlas to the same
+//! vertex it had last frame. So the solve is tessellated once, where it is
+//! made, and what a kept frame adds to the painter is one `egui::Shape::Mesh`.
+//!
+//! Measured on the native rig's scene A (one 1920x1080 pane, KTLX, every layer
+//! on, the `pan-zoom-2d` script, private Xvfb), counted over 200 consecutive
+//! passes: the pane hands the painter 430.2 label text shapes carrying
+//! 14,663 glyph vertices per pane-frame, which is 79.7 % of every glyph vertex
+//! the tessellator sees, and 59.5 % of pane-frames answer from this memo.
+//!
+//! **A kept mesh has the atlas coordinates baked in TWICE**, and a kept shape
+//! list had them once: a `TextShape` carries a galley whose glyph UVs are
+//! still in atlas *pixels*, and normalizing them by the atlas size is the last
+//! thing tessellation does. So a mesh is wrong after an atlas *growth* as well
+//! as after a repack — the divisor moved without a glyph moving.
+//! [`LabelKey`]'s `atlas_generation` covers both, and it did before this: what
+//! it did not have is anything that would go red if it stopped.
+//! `ui_map_overlays::tests::a_repack_under_a_still_map_does_not_paint_the_old_atlas`
+//! is that gate, and setting the term to a constant makes it red on the
+//! growth arm.
 //!
 //! # The key is exact, not a hash
 //!
@@ -44,11 +63,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// The glyph raster a kept solve's shapes were built against.
+/// The glyph raster a kept solve's mesh was built against.
 ///
 /// A solved label carries a laid-out `egui::Galley`, which points into the
-/// font atlas by pixel position, so a re-rasterization invalidates it even
-/// though the labels are unchanged. Both terms are
+/// font atlas by pixel position, and the mesh it tessellates to carries those
+/// coordinates a second time, divided by the atlas size. A re-rasterization
+/// invalidates both even though the labels are unchanged, and so does a
+/// growth, which moves the divisor without moving a glyph — `atlas_generation`
+/// covers both, because [`walkers::GalleyCache::begin_frame`] bumps it on a
+/// size change as well as on a fill that fell. Both terms are
 /// [`crate::point_painter::PointTextKey`]'s, for the same reason and read the
 /// same way: `pixels_per_point` because it re-rasterizes every glyph, and the
 /// atlas generation because egui rebuilds the atlas under the pass and puts
@@ -92,11 +115,15 @@ impl LabelKey {
 }
 
 /// One pane's kept solve: the key and the list it was solved from, and the
-/// shapes that survived, in paint order.
+/// mesh the surviving shapes tessellated to.
+///
+/// `None` is a solve that placed no label at all — every name refused by the
+/// collision or repeat rule, which a crowded pane at a low zoom reaches — kept
+/// so that case is not re-solved either.
 struct Kept {
     key: LabelKey,
     labels: Vec<walkers::Text>,
-    shapes: Vec<egui::Shape>,
+    mesh: Option<Arc<egui::Mesh>>,
 }
 
 /// The place-name solve each pane last made, kept between frames.
@@ -108,31 +135,75 @@ struct Kept {
 /// reproducible from the labels that made it.
 ///
 /// **Bounded by the glass, not by the session.** One entry per pane, replaced
-/// rather than accumulated, and each entry holds one viewport's labels. There
-/// is no ceiling to trip because there is no growth: a map panned across a
-/// country replaces the entry it has, it does not add to a table.
+/// rather than accumulated, and each entry holds one viewport's labels and the
+/// one mesh they drew. There is no ceiling to trip because there is no growth:
+/// a map panned across a country replaces the entry it has, it does not add to
+/// a table.
 #[derive(Default)]
 pub(crate) struct LabelCache {
     entries: HashMap<usize, Kept>,
     solves: u64,
     hits: u64,
+    recycled: u64,
 }
 
 impl LabelCache {
-    /// This pane's kept shapes, if they were solved under `key` from exactly
+    /// This pane's kept mesh, if it was solved under `key` from exactly
     /// `labels`.
+    ///
+    /// The outer `Option` is the memo's answer, the inner one the solve's: a
+    /// hit that placed nothing is `Some(None)`, and it is a hit.
     pub(crate) fn lookup(
         &mut self,
         pane: usize,
         key: LabelKey,
         labels: &[walkers::Text],
-    ) -> Option<&[egui::Shape]> {
+    ) -> Option<Option<Arc<egui::Mesh>>> {
         let kept = self.entries.get(&pane)?;
         if kept.key != key || !same_labels(&kept.labels, labels) {
             return None;
         }
         self.hits += 1;
-        Some(&kept.shapes)
+        // A refcount bump on geometry that is already tessellated.
+        Some(kept.mesh.clone())
+    }
+
+    /// This pane's retired mesh, emptied but keeping its buffers, for the
+    /// solve that is replacing it to fill.
+    ///
+    /// **The entry being replaced owns exactly the right allocation.** A
+    /// pane's names tessellate to on the order of 850 kB of vertices and
+    /// indices, and a map being panned re-solves on nearly half its frames, so
+    /// a solve that starts from `Mesh::default()` takes that buffer from the
+    /// allocator and hands it back one frame later, every frame — which is
+    /// most of what a miss-frame solve costs. See
+    /// [`crate::point_painter::tessellate_text_shapes_into`] for the figures.
+    ///
+    /// **Nothing else can be holding it.** The painter's clone of a kept mesh
+    /// dies with the paint list `Context::tessellate` consumed at the end of
+    /// the frame it was added on, so by the time the next pass reaches this
+    /// the cache's is the only reference. `Arc::try_unwrap` is what makes that
+    /// a fact rather than an argument: a reference that somehow survived gives
+    /// a fresh mesh and one wasted allocation, never a mutation of geometry
+    /// something is still drawing.
+    ///
+    /// The entry is REMOVED, so a caller that takes the buffers must store a
+    /// new solve; `paint_labels` calls this only on the miss path it is about
+    /// to store from.
+    pub(crate) fn recycle(&mut self, pane: usize) -> egui::Mesh {
+        let Some(mesh) = self.entries.remove(&pane).and_then(|kept| kept.mesh) else {
+            return egui::Mesh::default();
+        };
+        let Ok(mut mesh) = Arc::try_unwrap(mesh) else {
+            return egui::Mesh::default();
+        };
+        // Not `Mesh::clear`, which replaces the vertex buffer with a fresh
+        // empty one and so throws away the whole point of this.
+        mesh.vertices.clear();
+        mesh.indices.clear();
+        mesh.texture_id = egui::TextureId::default();
+        self.recycled += 1;
+        mesh
     }
 
     pub(crate) fn store(
@@ -140,17 +211,10 @@ impl LabelCache {
         pane: usize,
         key: LabelKey,
         labels: Vec<walkers::Text>,
-        shapes: Vec<egui::Shape>,
+        mesh: Option<Arc<egui::Mesh>>,
     ) {
         self.solves += 1;
-        self.entries.insert(
-            pane,
-            Kept {
-                key,
-                labels,
-                shapes,
-            },
-        );
+        self.entries.insert(pane, Kept { key, labels, mesh });
     }
 
     /// Label sets solved — one per list-and-raster the pane walk has seen.
@@ -167,6 +231,13 @@ impl LabelCache {
     #[cfg(test)]
     pub(crate) fn hits(&self) -> u64 {
         self.hits
+    }
+
+    /// Solves that filled the retired solve's buffers instead of asking the
+    /// allocator for new ones.
+    #[cfg(test)]
+    pub(crate) fn recycled(&self) -> u64 {
+        self.recycled
     }
 }
 
@@ -275,7 +346,7 @@ mod tests {
         let labels = vec![label("Tulsa", 1.0)];
 
         assert!(cache.lookup(0, key(3), &labels).is_none(), "nothing kept");
-        cache.store(0, key(3), labels.clone(), Vec::new());
+        cache.store(0, key(3), labels.clone(), None);
         assert!(cache.lookup(0, key(3), &labels).is_some(), "pane 0 kept");
         assert!(
             cache.lookup(1, key(3), &labels).is_none(),
