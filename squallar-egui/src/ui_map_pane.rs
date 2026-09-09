@@ -1441,19 +1441,37 @@ fn render_radar_overlay(
 /// cheaper way to draw radar as an overlay; it is not drawing it as one. The
 /// saving was never available, so there was no trade.
 ///
-/// # What the callback costs
+/// # What the callback costs, and what decides whether it costs it
 ///
 /// A painted callback sets `needs_reset`, and **the next *mesh* pays it** —
-/// the reset triple plus two buffer binds
+/// the reset triple plus two buffer binds, five wgpu commands
 /// (`squallar_gpu::egui_renderer::command_stream`, matching
 /// `vendor/egui-wgpu/src/renderer.rs`). The next mesh is not "the next layer
 /// above radar": it is the next mesh **anywhere in the pass**, so the pane's
 /// own deferred notices, the colour scale, another pane, and the app's chrome
-/// all qualify. Something almost always draws after a pane's radar layer, so
-/// budget one reset per pane per frame and treat a configuration that avoids
-/// it as luck rather than as a plan.
+/// all qualify.
 ///
-/// That price is real and it is **not avoidable by siting**, because the one
+/// **It is not one reset per pane per frame.** That was the budget written
+/// here, and it describes one of the three things that can happen rather than
+/// the rule. What the walk actually does is decide against the primitive
+/// *before* this one:
+///
+/// * the previous primitive was a **painted callback** — the basemap's own
+///   tile mesh, or another layer that draws through one — so `needs_reset` was
+///   already raised and the reset was already owed. This fan **adds nothing**.
+/// * the previous primitive was a **mesh**, and a mesh follows later in the
+///   pass. This fan **splits a mesh run and costs exactly one reset**, which is
+///   the case the old budget describes.
+/// * nothing meshes after it at all. No cost, and no pane's radar is the last
+///   primitive in a real frame.
+///
+/// So the price is a function of **what the user dragged radar next to**.
+/// Radar is a reorderable overlay, so both arms are reachable from the layers
+/// menu without a rebuild — which is why the cost is stated as a rule here
+/// rather than as a number, and why a number taken in one layer order is not
+/// the price of this path.
+///
+/// That price, when it is paid, is **not avoidable by siting**, because the one
 /// siting that avoids it — the ground-callback tail — is the one that takes
 /// radar out of the layer order. The design's "50 %" priced this arm against
 /// that one; with that one unavailable there is nothing to price it against.
