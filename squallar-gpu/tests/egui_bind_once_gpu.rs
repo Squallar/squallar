@@ -309,7 +309,7 @@ impl egui_wgpu::GeometryStager for WrongBase {
     fn stage(
         &mut self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
         index: (&wgpu::Buffer, u64),
         vertex: (&wgpu::Buffer, u64),
         fill: &mut dyn FnMut(&mut wgpu::BufferViewMut),
@@ -329,14 +329,14 @@ impl egui_wgpu::GeometryStager for WrongBase {
             region.slice(self.at.clone()).copy_from_slice(&self.wrong);
         }
         staging.unmap();
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        // The caller's encoder, as the trait now says: this stager submits
+        // nothing of its own, and the copies land with the frame's own draw.
         if index_bytes > 0 {
             encoder.copy_buffer_to_buffer(&staging, 0, index_buffer, 0, index_bytes);
         }
         if vertex_bytes > 0 {
             encoder.copy_buffer_to_buffer(&staging, index_bytes, vertex_buffer, 0, vertex_bytes);
         }
-        queue.submit(Some(encoder.finish()));
         self.applied.fetch_add(1, Ordering::Relaxed);
         true
     }

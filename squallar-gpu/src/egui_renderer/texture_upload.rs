@@ -20,6 +20,15 @@
 //! raster (437 MB resident pinned host memory at depth 2), and WebGL2 has no
 //! `MAPPABLE_PRIMARY_BUFFERS` at all.
 //!
+//! **A band's copy is recorded on the frame's own encoder and never submitted
+//! here.** The ring's slots are handed back at [`TextureUploads::after_submit`]
+//! instead, which is the one thing a slot's mapping has to wait for: a map
+//! asked for against a recorded-but-unsubmitted copy resolves early and panics
+//! at the submission. Submitting per band is what that ordering used to cost —
+//! **24.4 us of frame thread a band**, measured on the RTX 3090 / Vulkan
+//! native arm on scene A at one pane, against a frame's own submission of
+//! 149 us.
+//!
 //! A raster fills top-down over the frames its bands take (7 frames for 7362² on
 //! a ring device) and this module cannot hold it back — egui mints a fresh
 //! `TextureId` per `load_texture`. The drain must therefore keep asking for
@@ -643,6 +652,7 @@ impl TextureUploads {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
         renderer: &mut Renderer,
         set: &[(egui::TextureId, egui::epaint::ImageDelta)],
     ) -> bool {
@@ -655,7 +665,7 @@ impl TextureUploads {
         // **Here and not after the drain**: this is the instant the queue is
         // at its largest on this frame. See [`Self::pending_peak`].
         self.note_pending_peak();
-        self.drain(device, queue, renderer);
+        self.drain(device, queue, encoder, renderer);
         self.publish_pending_level();
         self.publish_resident_level();
         self.uploads_pending()
@@ -846,7 +856,13 @@ impl TextureUploads {
     }
 
     /// Move as many bands as the frame's budget allows.
-    fn drain(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut Renderer) {
+    fn drain(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        renderer: &mut Renderer,
+    ) {
         for _ in 0..self.bands_per_frame() {
             let Some(mut band) = self.pending.pop_front() else {
                 break;
@@ -900,7 +916,7 @@ impl TextureUploads {
                 continue;
             };
 
-            let staged = self.capable && self.stage_band(device, queue, &texture, &band, &plan);
+            let staged = self.capable && self.stage_band(device, encoder, &texture, &band, &plan);
             let moved = if staged {
                 true
             } else if !self.capable || band.declined + 1 >= DECLINE_PATIENCE {
@@ -945,7 +961,7 @@ impl TextureUploads {
     fn stage_band(
         &mut self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
         texture: &wgpu::Texture,
         band: &Band,
         plan: &BandPlan,
@@ -973,10 +989,10 @@ impl TextureUploads {
             }
         }
         slot.buffer().unmap();
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("squallar.raster.staging"),
-        });
+        // **The frame's own encoder, and no submission of our own.** The copy
+        // is recorded ahead of the pass that samples the texture, in the same
+        // command buffer, so the order the draw needs is the order it was
+        // recorded in.
         encoder.copy_buffer_to_texture(
             wgpu::TexelCopyBufferInfo {
                 buffer: slot.buffer(),
@@ -992,11 +1008,20 @@ impl TextureUploads {
             plan.destination(texture, band),
             plan.extent(),
         );
-        // Submitted here, not on the frame's encoder: a map asked for against
-        // an unsubmitted copy resolves early and panics at submission.
-        queue.submit(Some(encoder.finish()));
-        slot.remap();
         true
+    }
+
+    /// **The frame's encoder, carrying every band this frame recorded, has
+    /// been submitted**: ask the ring for its mappings back.
+    ///
+    /// Call once per frame, after the submission. A ring that is never told
+    /// runs out of mapped slots, [`Self::stage_band`] answers `false`, and the
+    /// bands take the blocking `write_texture` route this path exists to avoid
+    /// — degraded, never wrong.
+    pub fn after_submit(&mut self) {
+        if let Some(ring) = self.ring.as_mut() {
+            ring.remap_submitted();
+        }
     }
 
     /// Publish what [`Self::pending`] is holding on this instance's own heap,

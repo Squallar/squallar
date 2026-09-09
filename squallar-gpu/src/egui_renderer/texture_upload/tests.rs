@@ -946,7 +946,7 @@ fn the_peak_is_read_before_the_drain() {
          `upload residency:` is a constant zero",
     );
     let drain = body
-        .find("self.drain(device, queue, renderer);")
+        .find("self.drain(device, queue, encoder, renderer);")
         .expect("`apply` no longer drains");
     assert!(
         peak < drain,

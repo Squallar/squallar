@@ -604,6 +604,7 @@ impl EguiRenderer {
         let uploading = self.uploads.apply(
             device,
             queue,
+            encoder,
             &mut self.renderer,
             &full_output.textures_delta.set,
         );
@@ -896,6 +897,22 @@ impl EguiRenderer {
     /// `squallar_app::frame_need::WakeClaim::Upload`.
     pub fn uploads_pending(&self) -> bool {
         self.uploads.uploads_pending()
+    }
+
+    /// **This frame's command buffer went.** Both staging rings record their
+    /// copies on the frame's own encoder rather than submitting one of their
+    /// own, and neither may ask for its host mapping back until that
+    /// submission is on the queue — a map against a recorded-but-unsubmitted
+    /// copy resolves early and panics at the submission.
+    ///
+    /// Call once per frame, after `queue.submit`, on **every** frame that
+    /// submitted — a skipped surface submits too, and its bands are in that
+    /// command buffer like any other. A renderer that is never told runs both
+    /// rings out of mapped slots and each staging path falls back to the route
+    /// it takes on a device with no ring at all: degraded, never wrong.
+    pub fn after_submit(&mut self) {
+        self.uploads.after_submit();
+        self.renderer.geometry_submitted();
     }
 
     /// Free textures that are no longer needed.  Call after `queue.submit()`.

@@ -170,3 +170,50 @@ fn the_graphics_teardown_has_exactly_one_spelling() {
          agree today"
     );
 }
+
+/// **Every submission tells the staging rings it happened.**
+///
+/// Both rings — the raster bands' and the geometry's — record their copies on
+/// the frame's own encoder and submit nothing of their own, which is what took
+/// two whole `queue.submit` calls a frame off this thread. The price is that
+/// neither may ask for its host mapping back until that encoder is on the
+/// queue, so each submission owes them one `after_submit`. A submission that
+/// does not pay it runs both rings out of mapped slots
+/// (`squallar_gpu::staging_ring::STAGING_RING_DEPTH` of them) and every frame
+/// after that takes the route this path exists to avoid — the BAR window for
+/// the geometry, a blocking `write_texture` for every band — with no picture
+/// changing and nothing else going red.
+///
+/// The skipped-surface arm counts: that frame submits too, and this frame's
+/// bands are in the command buffer it submits.
+#[test]
+fn every_frame_submission_hands_the_staging_rings_back_their_mappings() {
+    let body = body_of(
+        include_str!("../app_render.rs"),
+        "pub(super) fn present_frame(",
+    );
+
+    let submits = body.match_indices("frame.submit(").count();
+    let told = body.match_indices("egui_renderer.after_submit()").count();
+    assert_eq!(
+        submits, told,
+        "present_frame submits {submits} time(s) and tells the staging rings \
+         {told} time(s); a submission that never says so costs the rings their \
+         slots and the frame thread the BAR window",
+    );
+
+    for (at, _) in body.match_indices("frame.submit(") {
+        let after = &body[at..];
+        let told_at = after
+            .find("egui_renderer.after_submit()")
+            .unwrap_or(usize::MAX);
+        let next_submit = after[1..]
+            .find("frame.submit(")
+            .map_or(usize::MAX, |at| at + 1);
+        assert!(
+            told_at < next_submit,
+            "a `frame.submit(` is followed by another before the staging \
+             rings are told the first one went",
+        );
+    }
+}

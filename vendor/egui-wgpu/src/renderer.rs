@@ -231,14 +231,35 @@ pub type BoxedGeometryStager = Box<dyn GeometryStager>;
 
 pub trait GeometryStager {
     /// Stage one frame's geometry, or answer `false` and leave it to the queue.
+    ///
+    /// The copies go on `encoder` — **the caller's own encoder**, the one this
+    /// frame's draw is recorded into and this frame's submission carries. A
+    /// stager records and does not submit; see [`GeometryStager::submitted`]
+    /// for the half of the contract that pays for that.
     fn stage(
         &mut self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
         index: (&wgpu::Buffer, u64),
         vertex: (&wgpu::Buffer, u64),
         fill: &mut dyn FnMut(&mut wgpu::BufferViewMut),
     ) -> bool;
+
+    /// **The encoder [`GeometryStager::stage`] recorded into has been
+    /// submitted.** Call once per frame, after the submission.
+    ///
+    /// A stager holding mappable host memory cannot ask for its mapping back
+    /// until the copy reading it is on the queue: a map asked for against a
+    /// recorded-but-unsubmitted copy resolves early and panics at the
+    /// submission. That is what used to make a stager submit its own command
+    /// buffer, and that submission was a whole `queue.submit` on the frame
+    /// thread, every frame, beside the one the frame already makes.
+    ///
+    /// A stager that never hears this is **degraded, never wrong**: its
+    /// mappings never come back, [`GeometryStager::stage`] answers `false`,
+    /// and `update_buffers` takes the queue's own mapping as it does on a
+    /// build with no stager at all.
+    fn submitted(&mut self) {}
 }
 
 /// Every mesh in a paint job list, in order — the walk both staging routes
@@ -614,6 +635,17 @@ impl Renderer {
             options,
             geometry_stager: None,
             callback_resources: CallbackResources::default(),
+        }
+    }
+
+    /// **Not upstream.** Tell this renderer's stager that the encoder
+    /// [`Renderer::update_buffers`] recorded its copies into has been
+    /// submitted. Call once per frame, after the submission; see
+    /// [`GeometryStager::submitted`] for what a stager that never hears it
+    /// does instead.
+    pub fn geometry_submitted(&mut self) {
+        if let Some(stager) = self.geometry_stager.as_mut() {
+            stager.submitted();
         }
     }
 
@@ -1240,7 +1272,7 @@ impl Renderer {
             profiling::scope!("stage_geometry");
             stager.stage(
                 device,
-                queue,
+                encoder,
                 (&index_buffer.buffer, required_index_buffer_size),
                 (&vertex_buffer.buffer, required_vertex_buffer_size),
                 &mut |region| {

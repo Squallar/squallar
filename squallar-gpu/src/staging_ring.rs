@@ -141,6 +141,13 @@ pub struct Ring {
     label: String,
     /// When this ring may give a past peak back. See [`ShrinkWatch`].
     shrink: ShrinkWatch,
+    /// Slots written since the last [`Ring::remap_submitted`], newest last.
+    ///
+    /// A slot's mapping is asked back **after** the copy reading it is on the
+    /// queue, and the copy is now recorded on the caller's own encoder rather
+    /// than on one this ring submits itself. So a written slot waits here
+    /// until the caller says that encoder went. See [`Ring::remap_submitted`].
+    written: Vec<usize>,
 }
 
 /// One staging buffer and whether the host may write it right now.
@@ -161,6 +168,7 @@ impl Ring {
             bytes,
             label: label.to_owned(),
             shrink: ShrinkWatch::default(),
+            written: Vec::with_capacity(STAGING_RING_DEPTH),
         }
     }
 
@@ -174,6 +182,12 @@ impl Ring {
     /// ring holds [`STAGING_RING_DEPTH`] of them. [`ShrinkWatch`] is the policy;
     /// [`STAGING_RING_SHRINK_HYSTERESIS`] carries what a resize costs and why
     /// the band is as wide as it is.
+    /// **A resize drops every slot**, [`Ring::remap_submitted`]'s waiting list
+    /// with them. That is safe where a caller stages once per frame and tells
+    /// the ring its encoder went before the next staging — the copies of a
+    /// dropped slot are already on the queue, and wgpu keeps the buffer alive
+    /// until they drain. A caller that resized with an unsubmitted copy
+    /// standing would lose it.
     pub fn fit(&mut self, device: &wgpu::Device, bytes: wgpu::BufferAddress) {
         let Some(size) = self.shrink.observe(self.bytes, bytes) else {
             return;
@@ -182,6 +196,10 @@ impl Ring {
     }
 
     /// A slot the host may write, or `None` when every one is still in flight.
+    ///
+    /// The slot is recorded as written before it is handed over: the caller's
+    /// copy goes on an encoder this ring does not submit, so the mapping is
+    /// asked back at [`Ring::remap_submitted`] and not here.
     pub fn claim(&mut self, device: &wgpu::Device) -> Option<&Slot> {
         let _ = device.poll(wgpu::PollType::Poll);
         let ready: Vec<bool> = self
@@ -194,7 +212,21 @@ impl Ring {
         // Before the caller writes a byte, so that a second claim in the same
         // frame cannot be handed the same slot.
         self.slots[index].mapped.store(false, Ordering::Release);
+        self.written.push(index);
         Some(&self.slots[index])
+    }
+
+    /// **The encoder every claimed slot's copy was recorded into has been
+    /// submitted**: ask for those mappings back.
+    ///
+    /// Idempotent and cheap on a frame that claimed nothing. A ring that is
+    /// never told runs out of mapped slots and [`Ring::claim`] answers `None`
+    /// from then on, which is the caller's own fallback route — degraded,
+    /// never wrong.
+    pub fn remap_submitted(&mut self) {
+        for index in self.written.drain(..) {
+            self.slots[index].remap();
+        }
     }
 
     /// Host bytes this ring is holding: every slot, whether idle or in flight.

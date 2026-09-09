@@ -21,8 +21,17 @@
 //! The same ring answers it, with one difference from the texture path: a
 //! frame's whole geometry has to be resident before the draw, so there is
 //! nothing to band. One slot carries both arrays — indices at 0, vertices
-//! after them — which is one claim, one unmap and one submit per staging
-//! rather than two.
+//! after them — which is one claim and one unmap per staging rather than two.
+//!
+//! **Neither copy is submitted here.** Both go on the encoder
+//! `update_buffers` was handed — the frame's own, the one the draw is being
+//! recorded into — so the frame makes one submission and not two. What that
+//! costs is an ordering the stager used to get for free: a slot's mapping may
+//! not be asked back until the copy reading it is on the queue, so the ring
+//! holds every slot it wrote until [`egui_wgpu::GeometryStager::submitted`]
+//! says the encoder went. Measured on the RTX 3090 / Vulkan native arm, scene
+//! A at one pane: the submission this path used to make was **21.1 us of the
+//! frame thread, every frame**.
 //!
 //! A slot is sized to [`GEOMETRY_SLOT_GRANULARITY`] rather than to the frame's
 //! exact total, because the ring rebuilds **both** slots when it resizes — two
@@ -154,7 +163,7 @@ impl egui_wgpu::GeometryStager for GeometryStaging {
     fn stage(
         &mut self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
         index: (&wgpu::Buffer, u64),
         vertex: (&wgpu::Buffer, u64),
         fill: &mut dyn FnMut(&mut wgpu::BufferViewMut),
@@ -188,13 +197,12 @@ impl egui_wgpu::GeometryStager for GeometryStaging {
             fill(&mut region);
         }
         slot.buffer().unmap();
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("squallar.geometry.staging"),
-        });
-        // Both counts are multiples of four — `u32` indices and a 20-byte
-        // `Vertex` — so the vertex half starts on a `COPY_BUFFER_ALIGNMENT`
-        // boundary and neither copy needs padding.
+        // **The caller's encoder, and no submission of our own.** Both counts
+        // are multiples of four — `u32` indices and a 20-byte `Vertex` — so the
+        // vertex half starts on a `COPY_BUFFER_ALIGNMENT` boundary and neither
+        // copy needs padding. The copies are recorded ahead of the pass that
+        // reads the two buffers, in the same command buffer, so the order the
+        // draw needs is the order they were recorded in.
         if index_bytes > 0 {
             encoder.copy_buffer_to_buffer(slot.buffer(), 0, index_buffer, 0, index_bytes);
         }
@@ -207,17 +215,15 @@ impl egui_wgpu::GeometryStager for GeometryStaging {
                 vertex_bytes,
             );
         }
-        // Submitted here rather than on the frame's own encoder, for the reason
-        // `super::texture_upload` submits its band copies here: a map asked for
-        // against an unsubmitted copy resolves early and panics at submission.
-        // Queue order is what makes it land before the draw — this submission
-        // is ahead of the one the caller has not made yet.
-        queue.submit(Some(encoder.finish()));
-        slot.remap();
-
         self.counters.staged.fetch_add(1, Ordering::Relaxed);
         self.counters.bytes.fetch_add(total, Ordering::Relaxed);
         true
+    }
+
+    fn submitted(&mut self) {
+        if let Some(ring) = self.ring.as_mut() {
+            ring.remap_submitted();
+        }
     }
 }
 

@@ -198,12 +198,14 @@ Nothing else in the manifest is touched: same version, same dependencies.
 
 ### Added — `src/renderer.rs`, the `GeometryStager` seam
 
-Three items, all new, none replacing anything:
+Four items, all new, none replacing anything:
 
-* `pub trait GeometryStager`, whose one method is handed the two destination
-  buffers with the byte count each needs and a closure that fills a single
-  contiguous region — indices at 0, vertices after them. Returning `false`
-  means it declined and nothing was written.
+* `pub trait GeometryStager`, whose two methods are: `stage`, handed the two
+  destination buffers with the byte count each needs, **the caller's own
+  command encoder**, and a closure that fills a single contiguous region —
+  indices at 0, vertices after them; returning `false` means it declined and
+  nothing was written. And `submitted`, told once per frame that the encoder
+  went.
 * `pub type BoxedGeometryStager`, cfg-selected exactly the way upstream selects
   `CallbackResources`, so that a `Renderer` carrying a stager stays as
   `Send + Sync` as it was without one. Upstream's own
@@ -211,6 +213,21 @@ Three items, all new, none replacing anything:
   first spelling of this field.
 * `Renderer::set_geometry_stager`, and the `geometry_stager: Option<..>` field
   it writes. `None` is the default and is upstream's behaviour exactly.
+* `Renderer::geometry_submitted`, which forwards `submitted` to the installed
+  stager.
+
+**Why the encoder and not the queue.** The first spelling handed the stager the
+`Queue`, and the stager did what it then had to: recorded its copies on a
+command encoder of its own and **submitted it**, because it may not ask for its
+host mapping back until the copy reading it is on the queue — a map against a
+recorded-but-unsubmitted copy resolves early and panics at the submission. That
+made a whole `queue.submit` per frame on the frame thread beside the one the
+frame already makes. Measured on the RTX 3090 / Vulkan native arm, scene A at
+one pane: **21.1 us a frame** for the geometry ring's own submission and
+**24.4 us a band** for the raster ring's, against a frame's own submission of
+149 us. Handing the stager the encoder that the draw is already being recorded
+into removes both submissions; `submitted` is what replaces the ordering the
+stager's own submit used to give it.
 
 Plus two private helpers, `meshes` and `fill_slices`, which hold the walk and
 the slice arithmetic that the two routes now share.

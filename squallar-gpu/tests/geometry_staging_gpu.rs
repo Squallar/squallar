@@ -61,7 +61,7 @@ use std::num::NonZeroU64;
 
 use egui_wgpu::wgpu;
 use squallar_gpu::egui_renderer::geometry_staging::{GeometryStaging, GeometryStagingLedger};
-use squallar_gpu::staging_ring::STAGING_RING_FEATURE;
+use squallar_gpu::staging_ring::{STAGING_RING_DEPTH, STAGING_RING_FEATURE};
 
 /// The offscreen target's side, in texels. Small: the picture is compared, not
 /// looked at, and every mesh in [`scene`] is placed inside it.
@@ -563,6 +563,14 @@ fn what_a_run_of_frames_costs_through_each_route() {
             let user = renderer.update_buffers(&device, &queue, &mut encoder, &tris, &descriptor);
             total += started.elapsed().as_micros();
             queue.submit(user.into_iter().chain([encoder.finish()]));
+            // The app's own second half of the staging contract: the stager
+            // records its copies on this encoder and submits nothing, so it
+            // may not ask for its host mapping back until the submission
+            // above. Without this the ring runs out of mapped slots after
+            // `STAGING_RING_DEPTH` frames and every frame after that is a
+            // decline — which the `declined` assertion below is here to catch,
+            // because the clocks either side of it read plausibly either way.
+            renderer.geometry_submitted();
             let _ = device.poll(wgpu::PollType::wait_indefinitely());
         }
         total
@@ -579,6 +587,16 @@ fn what_a_run_of_frames_costs_through_each_route() {
         "the ring route saw {} of {FRAMES} frames; the rest staged nothing, so \
          the clocks below are over two different sets of frames",
         totals.staged + totals.declined,
+    );
+    assert_eq!(
+        totals.declined, 0,
+        "{} of {FRAMES} frames were declined by a ring that was asked for \
+         nothing bigger than the frame before. A ring hands its slots back only \
+         when `Renderer::geometry_submitted` tells it the encoder its copies \
+         were recorded on has been submitted; a caller that never says so gets \
+         {STAGING_RING_DEPTH} frames of ring and the BAR mapping ever after, \
+         and the per-frame clocks below still read plausibly.",
+        totals.declined,
     );
 
     eprintln!(

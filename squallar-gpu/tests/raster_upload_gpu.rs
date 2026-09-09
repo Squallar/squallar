@@ -101,6 +101,28 @@ fn read_back(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture
     out
 }
 
+/// One frame of the app's own shape: the deltas are filed and drained onto the
+/// frame's encoder, that encoder is submitted, and only then are the staging
+/// rings told the copies went. `TextureUploads::after_submit` is the second
+/// half of that contract — without it the ring runs out of mapped slots and
+/// every band takes the blocking `write_texture` route, which
+/// `the_upload_ledger_counts_every_byte_of_a_banded_raster_once` fails on.
+fn upload_frame(
+    uploads: &mut TextureUploads,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer: &mut egui_wgpu::Renderer,
+    set: &[(egui::TextureId, egui::epaint::ImageDelta)],
+) -> bool {
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("raster-upload-test"),
+    });
+    let pending = uploads.apply(device, queue, &mut encoder, renderer, set);
+    queue.submit(Some(encoder.finish()));
+    uploads.after_submit();
+    pending
+}
+
 /// Drive frames until the upload says it is done, and say how many it took.
 fn run_to_completion(
     uploads: &mut TextureUploads,
@@ -111,7 +133,7 @@ fn run_to_completion(
     watch: Option<egui::TextureId>,
 ) -> u32 {
     let mut frames = 0;
-    let mut pending = uploads.apply(device, queue, renderer, set);
+    let mut pending = upload_frame(uploads, device, queue, renderer, set);
     while pending {
         // While a band is still to move, `is_delivered` has to answer *no*, or
         // a pane swaps onto a half-filled picture.
@@ -131,7 +153,7 @@ fn run_to_completion(
         // A declined ring hands the band back for the *next* frame, so a frame
         // that moved nothing has to be given the chance the app would give it.
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        pending = uploads.apply(device, queue, renderer, &[]);
+        pending = upload_frame(uploads, device, queue, renderer, &[]);
     }
     frames + 1
 }
@@ -514,7 +536,7 @@ fn the_resident_texture_level_rises_on_upload_and_falls_on_free() {
     );
     let set = take_deltas(&ctx, &device, small.id());
     assert_eq!(set.len(), 1, "the small delta did not reach the renderer");
-    uploads.apply(&device, &queue, &mut renderer, &set);
+    upload_frame(&mut uploads, &device, &queue, &mut renderer, &set);
     let small_bytes = (SMALL * SMALL * 4) as u64;
     assert_eq!(
         uploads.resident_texture_bytes(),

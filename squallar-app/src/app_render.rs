@@ -4906,6 +4906,10 @@ impl super::App {
                 // skipped surface is not a skipped measurement.
                 state.egui_renderer.probe_end_frame(&mut encoder);
                 frame.submit(&state.queue, encoder);
+                // The staging rings' copies were in that command buffer, this
+                // frame's bands included: a skipped surface is not a skipped
+                // upload. See `EguiRenderer::after_submit`.
+                state.egui_renderer.after_submit();
                 state.egui_renderer.probe_collect();
                 state.egui_renderer.free_textures(frame.textures_to_free());
 
@@ -4941,6 +4945,11 @@ impl super::App {
         let resolved = web_time::Instant::now();
         frame.submit(&state.queue, encoder);
         let submitted = web_time::Instant::now();
+        // Two `map_async` calls, asking the staging rings for the host memory
+        // whose copies that submission just carried. Inside the `collect` cut
+        // rather than the `submit` one so that the submit cut stays the
+        // submission alone; see `EguiRenderer::after_submit`.
+        state.egui_renderer.after_submit();
         state.egui_renderer.probe_collect();
         let collected = web_time::Instant::now();
         state.egui_renderer.free_textures(frame.textures_to_free());
