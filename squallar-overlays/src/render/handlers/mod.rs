@@ -278,10 +278,14 @@ mod grid_budget_tests {
         assert!(mrms >= crate::mrms::CONUS_GRID_BYTES as u64);
         assert_eq!(mrms % crate::mrms::CONUS_GRID_BYTES as u64, 0);
 
+        // **Measured in whole GRANULES**, not in point counts: a cache entry
+        // is the codes plus the absent set beside them, and the two were one
+        // constant while this row read `GLOBAL_GRID_BYTES` — so it could not
+        // have failed on a budget four granules did not fit inside.
         let gmgsi = source_grid_budget_bytes(&known::GMGSI);
         assert_eq!(gmgsi, gmgsi::GRID_CACHE_BYTES as u64);
-        assert!(gmgsi >= gmgsi::GLOBAL_GRID_BYTES as u64);
-        assert_eq!(gmgsi % gmgsi::GLOBAL_GRID_BYTES as u64, 0);
+        assert!(gmgsi >= gmgsi::GLOBAL_GRANULE_BYTES as u64);
+        assert_eq!(gmgsi % gmgsi::GLOBAL_GRANULE_BYTES as u64, 0);
 
         let hrrr = source_grid_budget_bytes(&known::MODEL_DATA);
         assert_eq!(hrrr, model::MODEL_GRID_BUDGET_BYTES as u64);
@@ -314,14 +318,36 @@ mod grid_budget_tests {
         let mrms = source_grid_staging_bytes(&known::MRMS);
         assert_eq!(mrms, 2 * crate::mrms::CONUS_GRID_BYTES as u64);
 
+        // **GMGSI's two halves are two different figures**, and asserting
+        // them apart is the point. The frame cache has to hold a whole
+        // granule — codes plus the absent set beside them — while the pool
+        // parks the codes `Vec` alone, because the absent set is a separate
+        // allocation `staging` never receives. They were equal while
+        // `GLOBAL_GRID_BYTES` stood in for both, so this row read
+        // `2 * GLOBAL_GRID_BYTES` and could not have failed on a granule the
+        // budget did not cover.
         let gmgsi_bytes = source_grid_staging_bytes(&known::GMGSI);
-        assert_eq!(gmgsi_bytes, 2 * gmgsi::GLOBAL_GRID_BYTES as u64);
-
+        assert_eq!(
+            gmgsi_bytes,
+            (gmgsi::GLOBAL_GRANULE_BYTES
+                + crate::gmgsi::staging::STAGING_POINTS
+                    * crate::gmgsi::staging::StagingPool::ELEMENT_BYTES) as u64,
+            "the staged granule at its real size, plus the block the pool \
+             parks — a sum of two unequal terms, not twice either of them. \
+             That they ARE unequal is a `const _` beside \
+             `GLOBAL_GRANULE_BYTES`: a runtime assertion over two constants is \
+             one clippy can see cannot fail and a reader cannot",
+        );
         // The two ratios differ, which is the whole reason for a second
-        // function: `staging = budget` on MRMS and `staging = budget / 2` on
-        // GMGSI, so neither spelling is the other layer's.
+        // function: `staging = budget` on MRMS, and on GMGSI the staged half
+        // is one granule of a four-granule cache while the pool half is not a
+        // fraction of that budget at all.
         assert_eq!(mrms, source_grid_budget_bytes(&known::MRMS));
-        assert_eq!(gmgsi_bytes * 2, source_grid_budget_bytes(&known::GMGSI));
+        assert_eq!(
+            gmgsi::GLOBAL_GRANULE_BYTES as u64 * 4,
+            source_grid_budget_bytes(&known::GMGSI),
+            "the GMGSI cache budget is four whole granules",
+        );
 
         // The model stages ONE grid, not two: it retains no decode pool,
         // because a GRIB2 record is decoded into a fresh values vector rather

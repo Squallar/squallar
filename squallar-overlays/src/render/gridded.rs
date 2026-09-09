@@ -173,6 +173,25 @@ pub struct ByteCodes {
 /// every sample pay for it.
 pub const MAX_ABSENT_POINTS: usize = 64;
 
+/// **What the absent set costs at its bound**, in bytes — the second
+/// allocation [`GridValues::resident_bytes`] counts beside the codes, and the
+/// term every byte-arm grid budget has to carry if it is to describe a real
+/// granule rather than a point count.
+///
+/// [`super::handlers::gmgsi::GLOBAL_GRID_BYTES`] was `GRID_POINTS * 1` and so
+/// under-stated every real granule by this set: the committed fixture reads
+/// 15,000,004 B against a budget of 15,000,000, and `GRID_CACHE_BYTES >= 4 *
+/// GLOBAL_GRID_BYTES` was therefore a claim about a constant rather than about
+/// four granules the cache actually holds. Under-stating is the direction that
+/// silently overruns — `insert` runs out of unpinned victims, takes its
+/// `break` arm and holds the entries anyway while the constant says otherwise —
+/// and it is the direction an admission door must never take.
+///
+/// `size_of::<u32>()` restated here would be the same defect one level down, so
+/// `the_door_charges_exactly_what_a_handler_at_its_ceiling_holds` pins this against a
+/// grid built at the bound rather than against the literal.
+pub const MAX_ABSENT_BYTES: usize = MAX_ABSENT_POINTS * size_of::<u32>();
+
 impl ByteCodes {
     /// **Bytes one stored code occupies**, off the field's own element — the
     /// width [`SampleKind::Bytes`] prices this arm at.

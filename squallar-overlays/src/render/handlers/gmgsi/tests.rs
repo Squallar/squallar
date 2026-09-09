@@ -206,14 +206,24 @@ fn a_refetch_of_a_resident_channel_replaces_its_own_key() {
 ///
 /// The `>=` half of this is already a `const _: () = assert!(..)` in the
 /// handler, so repeating it here would be an assertion clippy can see is
-/// constant and a reader cannot see is redundant. What is left is the figure
-/// itself: 3000 x 5000 points at one byte apiece, which is the number every
-/// budget arm is a multiple of.
+/// constant and a reader cannot see is redundant. What is left is the two
+/// figures: 3000 x 5000 points at one byte apiece, and the granule those points
+/// become once the absent set beside them is counted.
+///
+/// **The budget is a multiple of the GRANULE, not of the point count.** It was
+/// spelled against the latter while the two were one constant, which is how a
+/// cache that asserts it holds four channels came to be 16 B short of holding
+/// them.
 #[test]
 fn one_global_mosaic_is_fifteen_million_bytes() {
     assert_eq!(GLOBAL_GRID_BYTES, 15_000_000);
     assert_eq!(
-        GRID_CACHE_BYTES % GLOBAL_GRID_BYTES,
+        GLOBAL_GRANULE_BYTES,
+        15_000_000 + crate::render::gridded::MAX_ABSENT_BYTES,
+        "a granule is its codes plus its absent set at the bound",
+    );
+    assert_eq!(
+        GRID_CACHE_BYTES % GLOBAL_GRANULE_BYTES,
         0,
         "the budget is spent in whole channels"
     );
@@ -1096,8 +1106,10 @@ fn the_layer_stages_one_granule_however_many_frames_the_loop_holds() {
 
     // The shipped arithmetic the fixture stands in for.
     assert_eq!(
-        FRAME_STAGING_BYTES, GLOBAL_GRID_BYTES,
-        "one mosaic stages at a time on every arm"
+        FRAME_STAGING_BYTES, GLOBAL_GRANULE_BYTES,
+        "one mosaic stages at a time on every arm — and at the size a granule \
+         really is, absent set included, or the budget refuses the very arrival \
+         it was sized for",
     );
     assert_eq!(
         13 * GLOBAL_GRID_BYTES,

@@ -141,22 +141,20 @@ pub mod staging;
 /// because nothing here is a shape the decoder enforces — [`decode::decode_in`]
 /// reads `nj` and `ni` off the granule's own `data` variable.
 ///
-/// **What it still means.** `GLOBAL_GRID_BYTES` (and through it
-/// `GRID_CACHE_BYTES` and `FRAME_STAGING_BYTES`) is `GRID_POINTS` times four,
-/// so this is the size one resident channel is *priced* at. Two things
-/// over-provision that price and neither under-counts:
+/// **What it still means.** `GLOBAL_GRID_BYTES` is `GRID_POINTS` at the store's
+/// own width — one byte a point — and `GRID_CACHE_BYTES` and
+/// `FRAME_STAGING_BYTES` are spelled over `GLOBAL_GRANULE_BYTES`, which is that
+/// plus the absent set at its bound. So this is the number of points one
+/// resident channel is *priced* at, and it over-provisions rather than
+/// under-counting:
 ///
-/// * the width. A resident mosaic is `GridValues::Bytes` — one byte a point,
-///   because a GMGSI value is a byte reading — so a 5000-wide channel costs
-///   15,000,000 B against the 60,000,000 B priced here. The caches evict
-///   against `GridValues::resident_bytes`, which reports what the heap is
-///   carrying, so the budgets simply hold more headroom than they name until
-///   `render::handlers::gmgsi` re-prices them;
-/// * the shape. A 4999-wide mosaic is 14,997,000 B against the 15,000,000 B
-///   this figure's point count implies: **3,000 B per grid**, 0.02 %. Held at
-///   the round shape on purpose — a budget that follows a product's width from
-///   release to release buys nothing and moves four `const _` pins every time
-///   it does.
+/// * the shape. A 4999-wide mosaic holds 14,997,000 points against the
+///   15,000,000 priced here — **3,000 B per grid**, 0.02 % — so the price is
+///   headroom and never a shortfall. The caches evict against
+///   `GridValues::resident_bytes`, which reports what the heap is carrying, so
+///   the budgets simply hold a little more than they name. Kept at the round
+///   shape on purpose: a budget that follows a product's width from release to
+///   release buys nothing and moves four `const _` pins every time it does.
 ///
 /// **What it no longer means.** It is not the staging pool's capacity. That is
 /// discovered at runtime from the granule being decoded; [`staging`] and

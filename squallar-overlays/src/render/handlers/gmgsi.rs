@@ -96,8 +96,37 @@ use squallar_source::time::{FrameListing, FrameSource, FrameStamp, TimeAxis};
 /// phantom, on a web host allowance of 805 MB, shedding rungs of picture
 /// quality for bytes that do not exist. A budget spelled over a literal width
 /// is a budget whose pin cannot fail.
+///
+/// **The points at their width, and nothing else** — which is exactly what
+/// [`staging::StagingPool`] parks, and exactly what a budget that has to HOLD a
+/// granule is not. See [`GLOBAL_GRANULE_BYTES`]: the two were one constant, and
+/// the difference between them is a whole allocation.
 pub const GLOBAL_GRID_BYTES: usize =
     crate::gmgsi::GRID_POINTS * staging::StagingPool::ELEMENT_BYTES;
+
+/// **One decoded granule, at the largest it can be** — [`GLOBAL_GRID_BYTES`]
+/// plus the absent set at its bound.
+///
+/// **The figure every budget that holds a granule is spelled in**, and the one
+/// [`GLOBAL_GRID_BYTES`] used to stand in for. A byte-arm grid carries a second
+/// allocation beside its codes and `GridValues::resident_bytes` counts it, so a
+/// budget spelled as points × width under-states every granule the product
+/// publishes: the committed fixture reads 15,000,004 B. Four of those are
+/// 60,000,016 B against a `GRID_CACHE_BYTES` of 60,000,000, so the key space
+/// that budget asserts it holds did not fit inside it and the cache overran it
+/// **silently**, through `GmgsiGridCache::insert`'s `break` arm — the arm where
+/// the entries are kept and the constant under-reports what the heap carries.
+/// The `const _` below could not see it: both its sides were the same constant.
+///
+/// **Two constants and not one, because the pool is genuinely the other
+/// figure.** [`staging::StagingPool`] parks the codes `Vec`; the absent set is a
+/// separate allocation it never receives, so the block it retains is
+/// [`GLOBAL_GRID_BYTES`] while a cache entry costs this. They were equal, which
+/// is why `source_grid_staging_bytes` could be read as `2 *
+/// GLOBAL_GRID_BYTES` — an arithmetic coincidence between two different facts,
+/// and the shape that re-derives silently the day one of them moves.
+pub const GLOBAL_GRANULE_BYTES: usize =
+    GLOBAL_GRID_BYTES + crate::render::gridded::MAX_ABSENT_BYTES;
 
 /// How many bytes of decoded GMGSI raster may stay resident at once: **all four
 /// channels, on every arm**.
@@ -123,19 +152,19 @@ pub const GLOBAL_GRID_BYTES: usize =
 /// because that crate sits **above** this one in the crate graph
 /// (`ARCHITECTURE.md` §1), so the dependency cannot run back.
 #[cfg(target_arch = "wasm32")]
-pub const GRID_CACHE_BYTES: usize = 4 * GLOBAL_GRID_BYTES;
+pub const GRID_CACHE_BYTES: usize = 4 * GLOBAL_GRANULE_BYTES;
 /// See the wasm arm.
 #[cfg(all(
     not(target_arch = "wasm32"),
     any(target_os = "android", target_os = "ios")
 ))]
-pub const GRID_CACHE_BYTES: usize = 4 * GLOBAL_GRID_BYTES;
+pub const GRID_CACHE_BYTES: usize = 4 * GLOBAL_GRANULE_BYTES;
 /// See the wasm arm.
 #[cfg(all(
     not(target_arch = "wasm32"),
     not(any(target_os = "android", target_os = "ios"))
 ))]
-pub const GRID_CACHE_BYTES: usize = 4 * GLOBAL_GRID_BYTES;
+pub const GRID_CACHE_BYTES: usize = 4 * GLOBAL_GRANULE_BYTES;
 
 // **A build failure, not a test failure**: every term is a compile-time
 // constant, so a runtime assertion over them could not fail on a build that got
@@ -149,12 +178,18 @@ pub const GRID_CACHE_BYTES: usize = 4 * GLOBAL_GRID_BYTES;
 // takes its `break` arm, so the cache overruns the budget silently and the
 // constant under-reports what the heap is carrying. Two arms sat below it —
 // wasm at one channel, mobile at two — for as long as the layer had four.
-const _: () = assert!(GRID_CACHE_BYTES >= GmgsiChannel::all().len() * GLOBAL_GRID_BYTES);
+const _: () = assert!(GRID_CACHE_BYTES >= GmgsiChannel::all().len() * GLOBAL_GRANULE_BYTES);
 // At least one grid — implied by the key space, kept as the plainer statement.
 // (Not "or the cache settles empty": the arrival is never its own victim, so a
 // budget under one grid overruns exactly as one under the key space does.)
-const _: () = assert!(GRID_CACHE_BYTES >= GLOBAL_GRID_BYTES);
-const _: () = assert!(GRID_CACHE_BYTES.is_multiple_of(GLOBAL_GRID_BYTES));
+const _: () = assert!(GRID_CACHE_BYTES >= GLOBAL_GRANULE_BYTES);
+// **The two are not the same figure**, which is the whole reason there are two.
+// A build where they coincide is one where the absent set costs nothing, and
+// every budget below is back to pricing a point count — spelled here rather
+// than in a test, because a runtime assertion over two constants is one clippy
+// can see cannot fail and a reader cannot.
+const _: () = assert!(GLOBAL_GRANULE_BYTES > GLOBAL_GRID_BYTES);
+const _: () = assert!(GRID_CACHE_BYTES.is_multiple_of(GLOBAL_GRANULE_BYTES));
 // **The two terms pinned apart**, so a build failure names which one moved and
 // no reader can retype one figure green. The width pin is the one the old
 // spelling could not have had: `GLOBAL_GRID_BYTES` was arithmetic over a
@@ -164,6 +199,13 @@ const _: () = assert!(GRID_CACHE_BYTES.is_multiple_of(GLOBAL_GRID_BYTES));
 const _: () = assert!(crate::gmgsi::GRID_POINTS == 15_000_000);
 const _: () = assert!(staging::StagingPool::ELEMENT_BYTES == 1);
 const _: () = assert!(GLOBAL_GRID_BYTES == 15_000_000);
+// **And the granule those points become**, which is the figure every budget
+// that holds one is spelled in: the codes plus the absent set at its bound.
+// Pinned apart from the two terms above so a build failure names which of them
+// moved, and never derived from `GLOBAL_GRID_BYTES` alone — the two being equal
+// is what hid a whole allocation from `GRID_CACHE_BYTES`.
+const _: () = assert!(crate::render::gridded::MAX_ABSENT_BYTES == 256);
+const _: () = assert!(GLOBAL_GRANULE_BYTES == 15_000_256);
 
 /// How many grids a single pane that cycles selections keeps warm — the
 /// **unpinned history** the cache may retain beyond the pinned set: **none on
@@ -250,12 +292,12 @@ const _: () = {
 /// a 96 MiB wasm model pool and a 56 MiB wasm loop pool — 1.94x and 3.32x over.
 /// A grid-holding loop is not a smaller version of this design, it is an
 /// infeasible one.
-pub const FRAME_STAGING_BYTES: usize = GLOBAL_GRID_BYTES;
+pub const FRAME_STAGING_BYTES: usize = GLOBAL_GRANULE_BYTES;
 
 // The pipeline advances one granule at a time, so a staging area under one
 // grid settles empty and no frame is ever rasterized. Same reason the live
 // cache carries the same floor, and the same reason it is a **build** failure.
-const _: () = assert!(FRAME_STAGING_BYTES >= GLOBAL_GRID_BYTES);
+const _: () = assert!(FRAME_STAGING_BYTES >= GLOBAL_GRANULE_BYTES);
 
 /// **One frame's granule at a time, application-wide.**
 ///
