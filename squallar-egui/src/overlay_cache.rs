@@ -1005,6 +1005,21 @@ pub struct HeldOverlayTexture {
 pub struct OverlayTextureCache {
     /// Currently displayed texture (if any) — **whole**, always.
     current: Option<OverlayTextureData>,
+    /// **The picture the pane keeps drawing while the next one crosses to the
+    /// GPU** — the whole of "a pane keeps its picture until the next one is
+    /// whole".
+    ///
+    /// What each of `show`, `show_blank`, `clear` and `release_hold` does to a
+    /// hold is the difference between a pane that flickers, one that goes
+    /// stale and one that goes empty. [`Self::hold`] starts one,
+    /// [`Self::take_held_if_delivered`] ends one the ordinary way, and
+    /// `hold_tests` covers the four ways it can end.
+    ///
+    /// **A live gesture does not release a hold; it stands down the dispatch
+    /// that would replace it** — `rerender_reason_with_policy` answers `None`
+    /// while this is `Some`. `release_hold`'s only caller is a renderer
+    /// rebuild. So a picture that vanishes mid-gesture was replaced by an
+    /// arriving blank; it was not a hold let go of underneath it.
     held: Option<HeldOverlayTexture>,
     /// **The answer that painted nothing**, and the reason it is kept rather
     /// than discarded.
