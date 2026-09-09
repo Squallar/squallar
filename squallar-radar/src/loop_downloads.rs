@@ -231,6 +231,37 @@ pub struct LoopDownloadManager {
     /// [`scan_cache`](Self::scan_cache) is addressed, and every mutation of
     /// one is a mutation of the other.
     scan_prices: HashMap<(String, chrono::NaiveDateTime), usize>,
+    /// **What the archive at each address DECODES TO**, as the volume's own
+    /// first-radial moment — learned from the decoded half while it was here
+    /// and kept for as long as the archive is.
+    ///
+    /// # The two clocks, and why an address alone loses an archive
+    ///
+    /// A volume has an *address*, the `(site, timestamp)` this cache filed it
+    /// under, and an *identity*, [`crate::types::volume_collected_at`]. They
+    /// are different instants: an archive arrival is filed under the second
+    /// its S3 key names, and over the 171 local Archive II volumes the two are
+    /// equal on **0 of 171**, a median 437 ms apart.
+    ///
+    /// [`Self::retain_scans`] already asks both, because a pane's `scan_info`
+    /// may carry either. [`Self::retain_archives`] could not: its key is the
+    /// address and the identity lived only on the decoded volume, so an
+    /// archive the drain filed for a moment a pane is parked at by IDENTITY
+    /// matched nothing and was swept on the very next residency pass —
+    /// measured on the real drain, one pass after arrival, on a looping site
+    /// where the compressed bytes had already been paid for.
+    ///
+    /// What that cost is not a wasted download but a volume that can never be
+    /// traded: `evict_decoded_except` refuses to evict a volume with no
+    /// archive behind it, so the arrival was left resident and un-evictable at
+    /// 33.7-82.7 MiB for the life of the process, holding the decoded ceiling
+    /// shut against the loop's own frames.
+    ///
+    /// Filed in [`Self::cache_scan`], which is the one place a volume and its
+    /// address are both in hand, and cleaned wherever an archive is removed.
+    /// It outlives the DECODED half deliberately — that is the whole point,
+    /// since the question is asked exactly when the moments are gone.
+    archive_identity: HashMap<(String, chrono::NaiveDateTime), chrono::NaiveDateTime>,
     /// **What [`archive_cache`](Self::archive_cache) is holding, in host
     /// bytes**: each buffer's length and one allocator block for it.
     ///
@@ -335,6 +366,7 @@ impl LoopDownloadManager {
             scan_over_arrivals: 0,
             scan_over_arrival_bytes: 0,
             scan_prices: HashMap::new(),
+            archive_identity: HashMap::new(),
             l3_bytes_cached: 0,
         }
     }
@@ -451,6 +483,13 @@ impl LoopDownloadManager {
             self.scan_bytes_cached = self.scan_bytes_cached.saturating_sub(was);
         }
         self.scan_bytes_cached = self.scan_bytes_cached.saturating_add(price);
+        // **The identity, learned here because here is the one place both
+        // halves are in hand.** Kept past the volume's own eviction: see
+        // `archive_identity`.
+        if let Some(collected) = crate::types::volume_collected_at(&volume.0) {
+            self.archive_identity
+                .insert((site.to_string(), ts), collected);
+        }
         self.scan_cache
             .entry(site.to_string())
             .or_default()
@@ -768,19 +807,41 @@ impl LoopDownloadManager {
     /// residency. A site whose loop has retargeted to Level III keeps its
     /// archives while its frames stand, so retargeting back is a decode
     /// rather than the re-download it is today.
-    pub fn retain_archives(&mut self, keep: impl Fn(&str, &chrono::NaiveDateTime) -> bool) {
+    pub fn retain_archives(
+        &mut self,
+        keep: impl Fn(&str, &chrono::NaiveDateTime, Option<chrono::NaiveDateTime>) -> bool,
+    ) {
+        let Self {
+            archive_cache,
+            archive_identity,
+            archive_bytes_cached,
+            ..
+        } = self;
         let mut freed = 0usize;
-        self.archive_cache.retain(|site, archives| {
+        let mut gone: Vec<(String, chrono::NaiveDateTime)> = Vec::new();
+        archive_cache.retain(|site, archives| {
             archives.retain(|ts, archive| {
-                let kept = keep(site.as_str(), ts);
+                // **Resolved HERE and not by the caller.** The map is this
+                // type's, and a caller that wanted to ask it would have to
+                // borrow the manager immutably while this method holds it
+                // mutably. Resolving it inside is also what keeps the two
+                // predicates honest: `retain_scans` asks the volume for its
+                // identity, this asks the index, and neither caller has to
+                // know which.
+                let collected = archive_identity.get(&(site.clone(), *ts)).copied();
+                let kept = keep(site.as_str(), ts, collected);
                 if !kept {
                     freed = freed.saturating_add(Self::archive_price(archive));
+                    gone.push((site.clone(), *ts));
                 }
                 kept
             });
             !archives.is_empty()
         });
-        self.archive_bytes_cached = self.archive_bytes_cached.saturating_sub(freed);
+        for key in gone {
+            archive_identity.remove(&key);
+        }
+        *archive_bytes_cached = archive_bytes_cached.saturating_sub(freed);
     }
 
     /// **Hold the archives inside a BYTE ceiling, evicting the ones furthest
@@ -841,6 +902,9 @@ impl LoopDownloadManager {
             {
                 self.archive_bytes_cached = self.archive_bytes_cached.saturating_sub(price);
                 freed = freed.saturating_add(price);
+                // The index is the archive's, not the volume's, so it leaves
+                // with the archive and never with the moments.
+                self.archive_identity.remove(&(site.clone(), ts));
                 if archives.is_empty() {
                     self.archive_cache.remove(&site);
                 }
@@ -2598,6 +2662,72 @@ mod archive_tests {
         );
     }
 
+    /// **The identity index outlives the decoded half it was learned from**,
+    /// which is the only reason it is any use.
+    ///
+    /// `retain_archives` is asked exactly when an archive is all that is left,
+    /// so an index cleaned alongside the moments would answer `None` at the
+    /// one moment it is consulted and the two-clock repair would be a no-op
+    /// that reads as present. The fixture therefore **evicts the decoded half
+    /// first** and only then asks: an arrangement that queried the index while
+    /// the volume was still resident could not tell a surviving index from one
+    /// that dies with the volume.
+    ///
+    /// It is cleaned with the ARCHIVE, and the second half of this test is
+    /// what says so — an index that grew without bound would be a leak of its
+    /// own, small per entry and unbounded in time.
+    ///
+    /// TAMPER: clear `archive_identity` in `evict_decoded_except`, or stop
+    /// filling it in `cache_scan`, and the first assertion fails; stop
+    /// clearing it in `retain_archives` and the last one does.
+    #[test]
+    fn the_identity_index_outlives_the_volume_and_dies_with_the_archive() {
+        let volume = priced_volume();
+        let identity = crate::types::volume_collected_at(&volume.0)
+            .expect("fixture: the volume has no clocked radial, so there is no identity to index");
+        assert_ne!(
+            identity,
+            ts(0),
+            "fixture: the identity equals the address, so an address-only \
+             predicate answers correctly and nothing here is about two clocks",
+        );
+
+        let mut mgr = LoopDownloadManager::new();
+        mgr.cache_scan("KTLX", ts(0), volume);
+        mgr.cache_archive("KTLX", ts(0), archive(1024));
+
+        // The moments go, the compressed bytes stay: the state the index
+        // exists to survive.
+        drop(mgr.evict_decoded_except(|_, _, _| false));
+        assert!(
+            mgr.get_cached("KTLX", &ts(0)).is_none(),
+            "precondition: the decoded half is gone, which is when this index \
+             is consulted",
+        );
+
+        // Asked ONLY by identity — the address is deliberately refused, so a
+        // predicate that still resolved by address would fail here.
+        mgr.retain_archives(|_, _, collected| collected == Some(identity));
+        assert!(
+            mgr.has_archive("KTLX", &ts(0)),
+            "the index did not survive the volume, so an archive whose frame \
+             is named by identity is swept the moment its moments are traded \
+             away — which is the trade undoing itself",
+        );
+
+        // And it leaves with the archive rather than accumulating.
+        mgr.retain_archives(|_, _, _| false);
+        assert!(!mgr.has_archive("KTLX", &ts(0)));
+        mgr.retain_archives(|_, _, collected| {
+            assert_eq!(
+                collected, None,
+                "the index outlived the archive it belongs to, so it grows \
+                 for the life of the process",
+            );
+            true
+        });
+    }
+
     /// **The decoded ceiling reclaims, and it reclaims the right entry** —
     /// furthest from a playhead first, and never one that is drawing or one
     /// with nothing to rebuild from.
@@ -3068,7 +3198,7 @@ mod archive_tests {
         mgr.cache_archive("KOUN", ts(0), archive(CORPUS_MIN_ARCHIVE));
         let all = mgr.cached_archive_bytes();
 
-        mgr.retain_archives(|site, at| site == "KTLX" && *at == ts(0));
+        mgr.retain_archives(|site, at, _| site == "KTLX" && *at == ts(0));
 
         assert!(mgr.has_archive("KTLX", &ts(0)), "the kept archive left");
         assert!(
@@ -3089,7 +3219,7 @@ mod archive_tests {
             "the total did not fall at all"
         );
 
-        mgr.retain_archives(|_, _| false);
+        mgr.retain_archives(|_, _, _| false);
         assert_eq!(
             mgr.cached_archive_bytes(),
             0,

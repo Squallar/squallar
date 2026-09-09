@@ -3098,11 +3098,36 @@ impl App {
         // retargeting back a decode instead of the re-download it is today,
         // at a median 5.8 % of the decoded cost.
         //
-        // Asked with the address alone, which is safe here for a reason
-        // `keep_scan` cannot rely on: every archive was filed under the
-        // address the loop downloaded it at, so the two-clock hazard has
-        // nothing to bite.
-        self.loop_mgr.retain_archives(keep);
+        // **Asked with BOTH of a volume's clocks, because the premise that
+        // the address was enough was false.**
+        //
+        // It read "every archive was filed under the address the loop
+        // downloaded it at, so the two-clock hazard has nothing to bite". The
+        // loop's own downloads are indeed filed under their listing key. The
+        // archive DRAIN's are not: `append_scan_to_active_loops` files a pane
+        // fetch, an auto-poll and an adjacent-volume nudge under the second
+        // the S3 key names, while the pane those arrivals put on screen is
+        // parked at the volume's own first radial — instants that are equal on
+        // 0 of the 171 local Archive II volumes.
+        //
+        // So a drain arrival's archive matched nothing here and was swept on
+        // the very next residency pass, one pass after the bytes had been paid
+        // for. Measured on the real drain, not inferred. And the cost is not
+        // the wasted download: `evict_decoded_except` refuses to evict a
+        // volume with no archive behind it, so what the sweep actually created
+        // was a 33.7-82.7 MiB volume that could never be traded and that held
+        // the decoded ceiling shut against the loop's own frames.
+        //
+        // `parked` is the same union `keep_scan` takes, against the identity
+        // the cache learned from the decoded half. A false keep costs a
+        // compressed buffer at a median 5.8 % of a volume; a false drop costs
+        // the trade entirely.
+        self.loop_mgr.retain_archives(|site, ts, collected| {
+            keep(site, ts)
+                || parked
+                    .iter()
+                    .any(|&(at_site, at)| at_site == site && Some(at) == collected)
+        });
         squallar_worker::offload::discard_each(
             "evicted-loop-volume",
             crate::volume_inventory::volume_drop_parts(self.loop_mgr.retain_scans(keep_scan)),

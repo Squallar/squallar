@@ -433,3 +433,146 @@ fn only_the_allocation_on_both_sides_is_shared() {
         app.loop_mgr.cached_scan_bytes(),
     );
 }
+
+/// **A drain arrival's archive survives the residency sweep**, so the volume
+/// it came out of can be traded for it instead of sitting resident forever.
+///
+/// # The defect, measured on the real drain
+///
+/// `retain_archives` asked one question — "does a live loop frame name this
+/// ADDRESS" — on a premise that was true for the loop's own downloads and
+/// false for the archive drain's. The drain files a pane fetch, an auto-poll
+/// and an adjacent-volume nudge under the second the S3 key names, and puts
+/// the volume's own first radial on the pane. Those instants are equal on 0
+/// of the 171 local Archive II volumes.
+///
+/// So the archive was filed on arrival and swept one pass later. What that
+/// cost is not the download: `evict_decoded_except` refuses to evict a volume
+/// with **no archive behind it**, so the sweep manufactured exactly the
+/// un-evictable 33.7-82.7 MiB volume that
+/// `archive_less_volumes_hold_the_decoded_ceiling_shut` describes — holding
+/// the decoded ceiling shut against the loop's own frames, for the life of the
+/// process.
+///
+/// # What an input must carry for the guard to be reachable
+///
+/// Three arrangements, and the first is the one a hand-built fixture destroys
+/// without noticing:
+///
+/// 1. **The two clocks must actually DIFFER.** A `ScanInfo` written by hand at
+///    the same round timestamp the archive is filed under makes the address
+///    and the identity equal, the old address-only predicate answers
+///    correctly, and the fixture is structurally unable to see the bug. Only
+///    the real drain produces the split, which is why this test drives
+///    `poll_data_channels`. Asserted below rather than assumed.
+/// 2. **No OTHER route may name the address.** If the pane's loop frames
+///    named this moment, `keep` would already be true and the new clause would
+///    never run — green, and about nothing.
+/// 3. **A live loop on the site**, or the drain never files the archive at all
+///    (`append_scan_to_active_loops` gates that on `is_looping`) and there is
+///    nothing for the sweep to keep or drop.
+///
+/// The consequence is asserted where it is spent — the volume becomes
+/// tradeable — and by `Arc::strong_count`, not by a store row: the still
+/// inventory holds the same allocation, so the count falling by exactly one is
+/// what says the loop cache really let go.
+#[test]
+fn a_drain_arrivals_archive_survives_the_sweep_that_only_knew_its_address() {
+    let mut app = app_on_site();
+    // (3) A live loop on the site, whose frames are elsewhere — see (2).
+    app.loop_mgr.set_plan(
+        0,
+        squallar_radar::loop_downloads::FramePlan::new(SITE.to_string(), vec![at(30), at(35)]),
+    );
+    land_one_archive_volume(&mut app, SITE, at(0));
+
+    let parked_at = app
+        .gui
+        .pane(0)
+        .and_then(|p| p.scan_info.as_ref().map(|i| i.timestamp))
+        .expect("the drain put scan info on the pane");
+    // (1) The clocks differ, which is the whole defect class.
+    assert_ne!(
+        parked_at,
+        at(0),
+        "fixture: the address and the identity coincide, so an address-only \
+         predicate answers this scene correctly and the fixture cannot reach \
+         the bug",
+    );
+    // (2) Nothing else names the address.
+    assert!(
+        !app.gui
+            .pane(0)
+            .expect("a pane")
+            .time_state(&squallar_source::id::known::RADAR)
+            .frames
+            .iter()
+            .any(|f| f.timestamp == at(0)),
+        "fixture: a loop frame names this address, so `keep` is already true \
+         and the two-clock clause is never exercised",
+    );
+    assert!(
+        app.loop_mgr.has_archive(SITE, &at(0)),
+        "precondition: the drain filed the compressed half",
+    );
+
+    app.evict_unneeded_loop_scans();
+
+    assert!(
+        app.loop_mgr.has_archive(SITE, &at(0)),
+        "the archive was swept because the sweep only knew the address ({}) \
+         and the pane is parked at the identity ({parked_at}); the volume it \
+         came out of is now un-evictable",
+        at(0),
+    );
+
+    // And what the archive is FOR: the volume can now be traded for it.
+    let volume = Arc::clone(
+        &app.loop_mgr
+            .get_cached(SITE, &at(0))
+            .expect("the parked volume is still cached")
+            .0,
+    );
+    let before = Arc::strong_count(&volume);
+    drop(app.loop_mgr.evict_decoded_except(|_, _, _| false));
+    assert_eq!(
+        Arc::strong_count(&volume),
+        before - 1,
+        "the loop cache did not let go of the volume, so keeping the archive \
+         bought nothing",
+    );
+}
+
+/// **An archive no clock names is still swept.** The control: the fix widens
+/// `retain_archives` by exactly one clause, and a predicate that had instead
+/// become "keep everything" would pass the test above and would turn the
+/// compressed cache into a second unbounded holder.
+#[test]
+fn an_archive_neither_clock_names_is_still_swept() {
+    let mut app = app_on_site();
+    app.loop_mgr.set_plan(
+        0,
+        squallar_radar::loop_downloads::FramePlan::new(SITE.to_string(), vec![at(30), at(35)]),
+    );
+    land_one_archive_volume(&mut app, SITE, at(0));
+    // A moment nothing is parked at and no frame names, with neither half of
+    // its identity known to any pane.
+    app.loop_mgr
+        .cache_archive(SITE, at(45), std::sync::Arc::new(vec![0u8; 4096]));
+    assert!(
+        app.loop_mgr.has_archive(SITE, &at(45)),
+        "precondition: the unnamed archive is here to be swept",
+    );
+
+    app.evict_unneeded_loop_scans();
+
+    assert!(
+        !app.loop_mgr.has_archive(SITE, &at(45)),
+        "an archive no pane is parked at and no live frame names survived, so \
+         the compressed cache is retaining on a predicate that cannot say no",
+    );
+    assert!(
+        app.loop_mgr.has_archive(SITE, &at(0)),
+        "and the parked one went with it",
+    );
+}
