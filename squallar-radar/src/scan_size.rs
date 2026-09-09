@@ -112,27 +112,34 @@ use nexrad_model::data::{DataMoment, Radial, Scan, Sweep};
 /// **Bytes the allocator spends on its own bookkeeping for each block it
 /// hands out**, charged once per allocation this module can see.
 ///
-/// **16, and it is a choice rather than a measurement.** Neither instrument
-/// this workspace owns can measure it: `squallar-alloc`'s counting
-/// `GlobalAlloc` and the per-volume harness that priced the 208-volume corpus
-/// both count the sizes *requested*, and a chunk header is by construction
-/// what the allocator adds on top of the request. glibc's chunk rule puts it
-/// at 8 or 16 bytes depending on size class and alignment, so the honest
-/// statement of what is known is a factor of two.
+/// **16, and it is a choice rather than a measurement — but the factor of two
+/// it used to be resolved against is gone.** This paragraph said no
+/// instrument here could see a chunk header, because `squallar-alloc`'s
+/// counting `GlobalAlloc` and the per-volume harness both count the sizes
+/// *requested*. That was wrong about what is reachable: glibc's own
+/// `mallinfo2` reports `uordblks` in **chunk** bytes, header included, so the
+/// header is the difference between it and a known request total and needs no
+/// RSS instrument at all.
 ///
-/// Within that unresolvable factor, take the conservative end, because the
-/// two error directions are not symmetric. This figure prices what four
-/// caches are holding, and the budget model spends against it: **under-price
-/// and the process is lost — over-price and a rung of quality is.** One of
-/// those is recoverable and the other is not, so an uncertainty is resolved
-/// toward the recoverable failure.
+/// **Measured on glibc 2.44** (2026-09-09), N=20,000 allocations per size,
+/// `uordblks` delta less the request total: the rule is exactly
+/// `chunk = max(32, roundup16(request + 8))`, so the overhead is 8 B when
+/// `request % 16 == 8` and 16 B when `request % 16 == 0`, and 12 or 20 B on
+/// the odd residues. **The three sizes that dominate a decoded volume split
+/// across it**: 1832 B (surveillance reflectivity) and 1192 B (Doppler) cost
+/// **8 B**, and 2384 B (dual-pol) costs **16 B**. Weighted over a real
+/// HEAVY6 peak's whole 512 B..4 KiB population the mean is **10.9 B**, so 16
+/// over-prices that family by about half.
 ///
-/// **What would retire the uncertainty:** an RSS-based instrument. Every
-/// instrument here counts requested sizes, so no amount of care with them can
-/// see a header; only reading what the OS has actually given the process —
-/// `/proc/self/statm` on Linux against a controlled decode — separates the
-/// allocator's overhead from the request. Until that exists this constant is
-/// a documented bound, not a reading.
+/// **The constant stays 16 anyway, and the over-pricing is the point.** Two
+/// error directions are not symmetric: this figure prices what four caches
+/// are holding and the budget model spends against it, so **under-price and
+/// the process is lost — over-price and a rung of quality is.** The measured
+/// rule is also *glibc's*, and this function runs against dlmalloc on wasm
+/// and a different allocator again on macOS; a per-size arithmetic derived
+/// from one host's malloc would be a precise wrong answer on the other two.
+/// A measurement that is right about one platform does not license a
+/// cross-platform constant to follow it.
 ///
 /// Worth, for scale: a median archive volume holds ~32,400 blocks, so this
 /// term is ~519 KB against a ~48.9 MiB volume — about 1.0 %.
