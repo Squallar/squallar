@@ -104,7 +104,7 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	352	313
 squallar-egui/src/tile_mesh/ledger.rs	98	64
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	1597	1532
+squallar-egui/src/tile_source.rs	1597	1529
 squallar-egui/src/tile_source/byte_lru.rs	272	271
 squallar-egui/src/tile_source/cache_ledger.rs	181	165
 squallar-egui/src/tile_source/snap.rs	157	157
@@ -239,7 +239,7 @@ squallar-overlays/src/render/handlers/labels.rs	76	58
 squallar-overlays/src/render/handlers/location.rs	76	58
 squallar-overlays/src/render/handlers/metar.rs	637	522
 squallar-overlays/src/render/handlers/mod.rs	169	167
-squallar-overlays/src/render/handlers/model.rs	2751	2585
+squallar-overlays/src/render/handlers/model.rs	2751	2583
 squallar-overlays/src/render/handlers/mrms.rs	674	604
 squallar-overlays/src/render/handlers/outlook.rs	1676	1620
 squallar-overlays/src/render/handlers/reports.rs	751	683
@@ -253,8 +253,8 @@ squallar-overlays/src/render/rasterize/gridded_ledger.rs	39	39
 squallar-overlays/src/render/rasterize/lambert_fixture.rs	116	116
 squallar-overlays/src/render/signature_memo.rs	271	270
 squallar-overlays/src/render/station_model.rs	719	519
-squallar-overlays/src/spc/colors.rs	44	42
-squallar-overlays/src/spc/discussion.rs	386	371
+squallar-overlays/src/spc/colors.rs	44	44
+squallar-overlays/src/spc/discussion.rs	451	435
 squallar-overlays/src/spc/discussion_archive.rs	62	31
 squallar-overlays/src/spc/fetch.rs	167	104
 squallar-overlays/src/spc/firewx.rs	400	384
