@@ -147,6 +147,10 @@ fn satellite_app() -> crate::app::App {
 
     draw(&mut app, &known::GMGSI, true);
     draw(&mut app, &known::RADAR, false);
+    // The tally starts here, so what [`asks_made`] reports is what the loop
+    // under test asked for and not what building the app did. Measured 0 on
+    // this line, which is the offline switch doing its job.
+    crate::app::offline::reset();
     app
 }
 
@@ -448,29 +452,64 @@ fn a_radar_pane_and_a_model_pane_loop_exactly_as_they_did() {
     );
 }
 
-/// **Every frame fetch the app has put on the wire, in the order it answered**
-/// — the ask, not the answer, and not the dispatcher's own in-flight set,
-/// which is the thing under test and would agree with itself.
+/// **How many asks the app has put on the wire since this was last read**,
+/// counted at `App::spawn_detached` — the one door every frame fetch leaves
+/// the process through — and read back **synchronously, with no clock in it**.
 ///
-/// Drained until the wire stays quiet. Nothing is put back: the caller decides
+/// The door is not a second copy of the thing under test. What decides whether
+/// a frame is asked for is the in-flight mark, three call frames above this,
+/// and a guard that has stopped working reads 39 here against 13 (measured;
+/// see the floor on
+/// [`a_frame_owed_its_granule_is_asked_for_once_however_many_passes_run`]).
+/// The dispatcher's own in-flight *set* is the thing that would agree with
+/// itself: it holds one entry per granule whether it was asked for once or
+/// forty times.
+fn asks_made() -> usize {
+    let made = crate::app::offline::taken().detached_tasks as usize;
+    crate::app::offline::reset();
+    made
+}
+
+/// **Every frame fetch the app has put on the wire, in the order it answered**
+/// — the ask, not the answer.
+///
+/// Waited for as a **count**: [`asks_made`] says how many detached fetch tasks
+/// the app started, and every one of them answers, so this returns when the
+/// last of them has and not before. Nothing is put back: the caller decides
 /// whether the app takes delivery, and *that* is what clears the in-flight
 /// mark. A floor that needs the mark to stay set simply never calls
 /// [`deliver_fetch_answers`].
+///
+/// **It used to wait for a lull** — twenty consecutive 10 ms polls finding
+/// nothing — so what it reported was however many fetches had answered inside
+/// a 200 ms window rather than how many were made. Each fetch here is refused
+/// at `127.0.0.1:1` in microseconds on an idle box; on a loaded one the window
+/// closes first. Constructed rather than waited for, by answering each fetch
+/// 210 ms late: this read **0 asks of 13, five times out of five**, on a tree
+/// that had made every one of them. At 150 ms it read 13, five times out of
+/// five — the cliff is the lull, to the millisecond.
+///
+/// The deadline below is an instrument failure and says so; it is not the
+/// quantity anything is asserted against.
 fn fetch_asks(app: &crate::app::App) -> Vec<chrono::NaiveDateTime> {
+    let owed = asks_made();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut seen: Vec<chrono::NaiveDateTime> = Vec::new();
-    let mut quiet = 0;
-    while quiet < 20 {
-        let mut got = false;
+    while seen.len() < owed {
         while let Ok(event) = app.channels.overlay_fetch_receiver.try_recv() {
             if let SourceEvent::FrameReady { id, stamp, .. } = &event
                 && *id == known::GMGSI
             {
                 seen.push(stamp.valid);
-                got = true;
             }
         }
-        quiet = if got { quiet } else { quiet + 1 };
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the instrument, not the tree: {} of the {owed} fetch tasks the app started \
+             answered on the arrival path inside a minute",
+            seen.len(),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
     seen
 }
@@ -517,8 +556,12 @@ fn distinct_asks(app: &crate::app::App) -> Vec<chrono::NaiveDateTime> {
 /// **The fetch is made not to answer**, deterministically and with no clock in
 /// it: this drives `Dispatch` alone and never `Ingest`, so nothing takes
 /// delivery and the mark stays set exactly as it does while a granule is on
-/// the wire. `PUMPS` passes therefore ask `PUMPS` times or once, and nothing
-/// in between.
+/// the wire.
+///
+/// **The count is read at the app's own spawn door**, not off a quiet wire —
+/// see [`asks_made`]. Every figure below is a number of asks made, which a
+/// loaded box cannot move; what the box decides is only how long the answers
+/// take to come back, and nothing here is asserted against that.
 ///
 /// **Non-triviality is the second half**: once the answers are delivered and
 /// the marks clear, the frames are still owed and the very next pass asks
@@ -527,8 +570,19 @@ fn distinct_asks(app: &crate::app::App) -> Vec<chrono::NaiveDateTime> {
 /// floors from the opposite side.
 ///
 /// **Floor — `no_in_flight_guard`:** drop the `loop_frame_fetch_in_flight`
-/// half of the skip in `refetch_owed_loop_frames`. Observed red: 130 asks
-/// across 10 passes where 13 are allowed — one storm per pump frame.
+/// half of the skip in `refetch_owed_loop_frames`. **Observed red on
+/// 2026-09-09: 39 asks across the 10 passes where 13 are allowed**, and this
+/// is the only test of the 1,293 in this binary that notices — the whole rest
+/// of the board is green with the guard gone.
+///
+/// Thirty-nine and not 130: the figure this floor used to record predates
+/// `loop_frame_retry_wait`, whose rungs (0, 4, 16 passes) fall on passes 1, 2
+/// and 7 of the ten, so an unguarded tree asks three times per frame inside
+/// this window rather than once per pass. The ladder is a *second* bound on
+/// the same storm and it is not the one under test here: it paces a re-ask
+/// after an answer, where this paces one while the granule is still
+/// travelling. Three times over is still an order of magnitude clear of the
+/// thirteen allowed.
 #[test]
 fn a_frame_owed_its_granule_is_asked_for_once_however_many_passes_run() {
     let ctx = egui::Context::default();
@@ -565,10 +619,10 @@ fn a_frame_owed_its_granule_is_asked_for_once_however_many_passes_run() {
         asks.len(),
         FRAMES as usize,
         "{PUMPS} pump passes over {FRAMES} frames whose granules are still on \
-         the wire asked for {} of them. A frame owed its data is owed it once, \
-         however many frames of the pump walk past it; asking again per pass \
-         is {FRAMES} GETs of 7.4 MB every frame, for the whole time a loop is \
-         loading normally",
+         the wire started {} fetch tasks. A frame owed its data is owed it \
+         once, however many frames of the pump walk past it; asking again per \
+         pass is {FRAMES} GETs of 7.4 MB every frame, for the whole time a \
+         loop is loading normally",
         asks.len(),
     );
     let mut once_each = asks.clone();

@@ -2327,13 +2327,39 @@ fn a_tile_whose_marker_was_evicted_while_its_request_was_out_is_not_asked_again(
     );
 }
 
-/// **Open requests stop at what can be outstanding, and the first two terms
-/// of [`MAX_IN_FLIGHT`] are exact.** Against a server that never answers, the
-/// IO task holds [`MAX_PARALLEL_DOWNLOADS`] fetches and the request channel
-/// fills behind it — [`MAX_PARALLEL_DOWNLOADS`] plus its single sender's
-/// guaranteed slot — and the frame side, wanting far more, opens exactly that
-/// many and not one more: a full channel refuses the send, and a refused send
-/// opens nothing.
+/// **Open requests stop at what the fetch limit and the request channel hold,
+/// and a refused send opens nothing.** Against a server that never answers,
+/// the IO task takes [`MAX_PARALLEL_DOWNLOADS`] fetches and stops taking, the
+/// request channel fills behind it, and the frame side — wanting three times
+/// [`MAX_IN_FLIGHT`] cells — opens no more than the two hold between them,
+/// however many passes walk past. Every cell it could not open is queued to
+/// be asked first next pass rather than dropped.
+///
+/// **The upper term is a ceiling and not a settling point, and that is
+/// measured rather than assumed.** `channel(MAX_PARALLEL_DOWNLOADS)` admits
+/// `MAX_PARALLEL_DOWNLOADS + 1` messages from a single sender, and the extra
+/// one is *opportunistic*: `futures`' `Receiver::next_message` calls
+/// `unpark_one` **before** it decrements the message count, so a pop landing
+/// while the sender sits between `inc_num_messages` and `park` notifies
+/// nobody — and once the IO task is at its concurrency limit against a server
+/// that never answers, no further pop is coming to unpark it. The sender is
+/// left parked with room in the channel it can never be told about.
+///
+/// Measured 2026-09-09 on a bare `futures::channel::mpsc::channel(6)` with
+/// one sender and a receiver that pops six and stops — no squallar code in it
+/// at all — over 20,000 trials: **19,242 settle at 13, and 758 at 12, 11, 10,
+/// 9, 8 or 7, never below 7.** This test asserted 13 exactly, and read 12 and
+/// 8 on a loaded box on a tree that does everything it says it must — the two
+/// commonest losses of the seven hundred, at 220 and 317 of them. It is not a
+/// defect here: fewer asks queued behind six hung downloads changes nothing a
+/// user sees, and in production a fetch answering *is* a pop, so the next one
+/// unparks the sender.
+///
+/// So what is gated is the ceiling, the floor the channel does guarantee
+/// (`park_self` is `num_messages > buffer`, so the buffer-plus-one message is
+/// always admitted before a sender can park), and the conservation law that
+/// carries "a refused send opens nothing": every cell the pass wanted is open
+/// or queued, and none is silently dropped.
 #[test]
 fn open_requests_stop_at_the_fetch_limit_plus_the_request_channel() {
     let server = TileServer::start(Behaviour::Hang);
@@ -2343,30 +2369,70 @@ fn open_requests_stop_at_the_fetch_limit_plus_the_request_channel() {
     let wanted: Vec<TileId> = (0..3 * MAX_IN_FLIGHT as u32)
         .map(|x| TileId { x, y: 0, zoom: 10 })
         .collect();
-    let expected = 2 * MAX_PARALLEL_DOWNLOADS + 1;
+    // The IO task's own term plus the request channel's: what the two hold
+    // between them once neither will take another.
+    let ceiling = 2 * MAX_PARALLEL_DOWNLOADS + 1;
+    // The channel's own capacity, which one sender reaches before it can park
+    // at all.
+    let floor = MAX_PARALLEL_DOWNLOADS + 1;
 
+    // The quantity a slow box cannot move: every fetch slot the IO task has is
+    // spent, which under `Hang` is exactly what the server has been asked for
+    // and never answered.
     let reached = pump_until(DEFAULT_TIMEOUT, || {
         tiles.pump();
         for id in &wanted {
             tiles.at(*id);
         }
-        (tiles.in_flight_len() == expected && server.request_count() == MAX_PARALLEL_DOWNLOADS)
-            .then_some(())
+        (server.request_count() == MAX_PARALLEL_DOWNLOADS).then_some(())
     });
     assert!(
         reached.is_some(),
-        "open requests settled at {} with the server holding {}, not at {expected} and \
-         {MAX_PARALLEL_DOWNLOADS}",
-        tiles.in_flight_len(),
-        server.request_count()
+        "the IO task never spent all {MAX_PARALLEL_DOWNLOADS} of its fetch slots: the server \
+         holds {}, with {} requests open",
+        server.request_count(),
+        tiles.in_flight_len()
     );
-    // And stays there: more wanting cannot open more.
+    assert_eq!(
+        tiles.parallel_peak(),
+        MAX_PARALLEL_DOWNLOADS,
+        "the IO task's own term of the bound"
+    );
+
+    // And however much more the frame side wants, that is where it stops.
     for _ in 0..8 {
         tiles.pump();
         for id in &wanted {
             tiles.at(*id);
         }
-        assert_eq!(tiles.in_flight_len(), expected);
+        let open = tiles.in_flight_len();
+        assert!(
+            (floor..=ceiling).contains(&open),
+            "{open} requests open for {} cells wanted, outside the {floor}-{ceiling} the fetch \
+             limit and the request channel hold between them",
+            wanted.len()
+        );
+        // A refused send opens nothing — and loses nothing either: a cell the
+        // channel would not take is queued to be asked first next pass.
+        let missed: Vec<TileId> = wanted
+            .iter()
+            .copied()
+            .filter(|id| !tiles.asked_or_queued_for_test(*id))
+            .collect();
+        assert!(
+            missed.is_empty(),
+            "{} of {} cells were neither asked for nor queued, with {open} requests open, \
+             starting at {:?}",
+            missed.len(),
+            wanted.len(),
+            missed.first()
+        );
+        assert_eq!(
+            server.request_count(),
+            MAX_PARALLEL_DOWNLOADS,
+            "wanting more opened another fetch: {:?}",
+            server.requests()
+        );
     }
 }
 
