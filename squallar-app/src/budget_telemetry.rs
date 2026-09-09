@@ -862,6 +862,72 @@ pub(crate) fn radar_volume_line(
     )
 }
 
+/// **What a merge base is holding that nothing would free**, as a LEVEL read
+/// on the telemetry tick.
+///
+/// # The denominator the release histogram does not carry
+///
+/// [`BaseReleaseCounts`] says which of six guards kept a base's gates. It
+/// cannot say what taking them would have been WORTH, and on a scene where
+/// the answer is zero that difference is the whole reading: a lever unblocked
+/// against a volume some other store also names frees nothing, because both
+/// halves are one allocation and a refcount is not memory.
+///
+/// So this line is the second half of that question, and it is three figures
+/// with three different denominators:
+///
+/// * `bases` — sites holding a merge base **with its gates**. The
+///   denominator for everything else here. A released base is not counted:
+///   it has no rungs to price and no gates to free.
+/// * `sole` — of those, how many name an allocation **no other holder does**
+///   — not the still store, not the per-site latest, not the loop download
+///   cache. This is the count of bases where dropping the base's reference
+///   moves `live_bytes` at all. `bases - sole` is the count where it cannot.
+/// * `superseded` — rungs the live flight has already sealed, which
+///   [`squallar_radar::current::resolve`] therefore leaves out of the merged
+///   volume, and what those rungs cost. Summed over every base counted in
+///   `bases`, priced off the per-sweep prices the inventory took at install.
+/// * `freeable` — `superseded` bytes on the `sole` bases ALONE. **The only
+///   figure here a cut can bank**, and the one a rung-level release of the
+///   merge base would be worth.
+///
+/// A byte figure and a count of rungs are both here because the campaign has
+/// been burned reading one for the other: rungs say the merge has stopped
+/// wanting them, bytes say what the allocator is holding, and `freeable`
+/// says whether anyone could hand those bytes back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BaseHolderCensus {
+    pub(crate) bases: usize,
+    pub(crate) sole: usize,
+    pub(crate) rungs: usize,
+    pub(crate) superseded_rungs: usize,
+    pub(crate) superseded_bytes: usize,
+    pub(crate) freeable_bytes: usize,
+}
+
+/// Its own line, and never appended to `budget state:`, which is scraped by a
+/// positional regex.
+///
+/// MiB by integer division, the spelling every byte figure in this module
+/// uses, because the rig reads these sentences with `(\d+)` groups.
+pub(crate) fn base_holder_line(census: BaseHolderCensus) -> String {
+    let BaseHolderCensus {
+        bases,
+        sole,
+        rungs,
+        superseded_rungs,
+        superseded_bytes,
+        freeable_bytes,
+    } = census;
+    let mib = |bytes: usize| bytes / (1024 * 1024);
+    format!(
+        "base holders: {bases} base(s) with gates, {sole} held by nothing else; \
+         superseded {superseded_rungs} of {rungs} rung(s) at {} MiB, freeable {} MiB",
+        mib(superseded_bytes),
+        mib(freeable_bytes),
+    )
+}
+
 /// **Why a merge base's gates did not go**, as one running tally per reason.
 ///
 /// # Why a histogram and not a level

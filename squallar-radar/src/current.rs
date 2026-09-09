@@ -11,7 +11,7 @@
 //! fills every rung the current flight has not reached, and each sealed sweep
 //! replaces its rung the moment it lands.
 
-use nexrad_model::data::{Sweep, VolumeCoveragePattern};
+use nexrad_model::data::{Scan, Sweep, VolumeCoveragePattern};
 
 use crate::nyquist::{DeclaredNyquist, Volume};
 use crate::types::RadarProduct;
@@ -93,19 +93,11 @@ pub fn resolve<'a>(
                 .iter()
                 .map(Sweep::elevation_number)
                 .collect();
-            let admits = |sweep: &Sweep| -> bool {
-                let Some(index) = usize::from(sweep.elevation_number()).checked_sub(1) else {
-                    return false;
-                };
-                let (Some(base_cut), Some(overlay_cut)) =
-                    (base_cuts.get(index), overlay_cuts.get(index))
-                else {
-                    return false;
-                };
-                base_cut.elevation_angle_degrees() == overlay_cut.elevation_angle_degrees()
-                    && !overlay_numbers.contains(&sweep.elevation_number())
-            };
-            let mut sweeps: Vec<&Sweep> = base.sweeps().iter().filter(|s| admits(s)).collect();
+            let mut sweeps: Vec<&Sweep> = base
+                .sweeps()
+                .iter()
+                .filter(|s| admits_base_sweep(base_cuts, overlay_cuts, &overlay_numbers, s))
+                .collect();
             let base_sweeps = sweeps.len();
             sweeps.extend(
                 overlay
@@ -159,6 +151,64 @@ pub fn resolve<'a>(
         }
         (None, None) => None,
     }
+}
+
+/// **Whether the merged volume takes this base sweep**, given the two cut
+/// tables and the elevation numbers the live flight has already sealed.
+///
+/// Pulled out of [`resolve`] rather than left inline because a second caller
+/// needs the same answer — [`superseded_base_sweeps`] asks which base rungs
+/// the merge is *not* taking — and two spellings of one admission rule is how
+/// an instrument comes to report a prize the merge never gives up.
+fn admits_base_sweep(
+    base_cuts: &[nexrad_model::data::ElevationCut],
+    overlay_cuts: &[nexrad_model::data::ElevationCut],
+    overlay_numbers: &[u8],
+    sweep: &Sweep,
+) -> bool {
+    let Some(index) = usize::from(sweep.elevation_number()).checked_sub(1) else {
+        return false;
+    };
+    let (Some(base_cut), Some(overlay_cut)) = (base_cuts.get(index), overlay_cuts.get(index))
+    else {
+        return false;
+    };
+    base_cut.elevation_angle_degrees() == overlay_cut.elevation_angle_degrees()
+        && !overlay_numbers.contains(&sweep.elevation_number())
+}
+
+/// **The base rungs the live flight has already superseded** — the sweeps
+/// [`resolve`] would leave out of the merged volume, as INDICES into
+/// `base.sweeps()`.
+///
+/// Indices and not elevation numbers, although the number is what the merge
+/// keys on: nothing in the model forbids two sweeps carrying one elevation
+/// number, and a caller pricing these against a per-sweep price list would
+/// then charge one rung twice and report bytes no release can free. An index
+/// names one sweep and cannot.
+///
+/// `None` for `overlay` means no live flight, and then nothing is superseded:
+/// `resolve`'s base-only arm takes every sweep the base has. An overlay with
+/// no cut table is the same case — `resolve` discards it before the merge, so
+/// this does too.
+pub fn superseded_base_sweeps(base: &Scan, overlay: Option<&Scan>) -> Vec<usize> {
+    let Some(overlay) = overlay.filter(|v| !v.coverage_pattern().elevation_cuts().is_empty())
+    else {
+        return Vec::new();
+    };
+    let base_cuts = base.coverage_pattern().elevation_cuts();
+    let overlay_cuts = overlay.coverage_pattern().elevation_cuts();
+    let overlay_numbers: Vec<u8> = overlay
+        .sweeps()
+        .iter()
+        .map(Sweep::elevation_number)
+        .collect();
+    base.sweeps()
+        .iter()
+        .enumerate()
+        .filter(|(_, sweep)| !admits_base_sweep(base_cuts, overlay_cuts, &overlay_numbers, sweep))
+        .map(|(index, _)| index)
+        .collect()
 }
 
 /// The merged volume's declared Nyquist table, built from the **sweeps it

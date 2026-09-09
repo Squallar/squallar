@@ -1571,3 +1571,102 @@ fn a_base_no_pane_has_drawn_yet_keeps_its_gates() {
          withdrawal that never fires dressed as one that does",
     );
 }
+
+/// **A merge base another store also names frees nothing, however much of it
+/// the live flight has superseded** — and the instrument says so rather than
+/// counting those bytes as a prize.
+///
+/// # The claim this exists to refuse
+///
+/// A pane draws one sweep of a dozen or more, and by late in a volume's
+/// flight most of a merge base is rungs `current::resolve` has already
+/// stopped serving — the overlay carries them. That reads as a large,
+/// obviously safe cut: release the superseded rungs, no way back needed,
+/// because the live volume has them.
+///
+/// It frees nothing. **The base's volume is ONE allocation and the base is
+/// rarely its only holder** — the still store, the site's latest, the loop
+/// download cache and the chunk feed all clone the same `Arc`, which is the
+/// whole reason `App::release_unneeded_base_gates` is a JOINT release and not
+/// a base-side one. Dropping rungs from the base's reference while another
+/// store names the same allocation moves `live_bytes` by zero and costs the
+/// rungs it kept a fresh copy.
+///
+/// So `sole` and `freeable` are the figures that decide whether that cut
+/// exists on a given scene, and this pins both arms: one base another store
+/// names, and one nothing else does, in the same shape of scene.
+#[test]
+fn a_base_another_store_names_is_superseded_but_not_freeable() {
+    let mut app = app_on_site();
+    land_one_volume_with_no_archive(&mut app, SITE, at(0));
+    the_pane_has_its_picture(&mut app);
+    // A live flight over the same cut table, its OWN allocation: a shared one
+    // would make the chunk feed a holder of the base's volume and the two
+    // halves of this test would not be about different things.
+    app.chunk_feeds.ensure(SITE);
+    app.chunk_feeds
+        .force_serving(SITE, std::sync::Arc::new(arriving_volume()));
+
+    let (base, _) = app.volumes.base_for(SITE).expect("the drain installed one");
+    assert!(
+        app.volumes.stills_holding(&base) > 0,
+        "fixture: no other store names the base's allocation, so the arm \
+         below cannot be about a co-held one",
+    );
+
+    let census = app.base_holder_census();
+
+    assert_eq!(census.bases, 1, "the base with gates was not counted");
+    assert!(
+        census.superseded_rungs > 0 && census.superseded_bytes > 0,
+        "the overlay carries the base's every cut and nothing was called \
+         superseded, so this scene cannot tell a zero prize from a zero \
+         instrument",
+    );
+    assert_eq!(
+        census.sole, 0,
+        "a base the still store names was reported as held by nothing else",
+    );
+    assert_eq!(
+        census.freeable_bytes, 0,
+        "bytes another store is holding were banked as freeable, which is \
+         the arithmetic that would sell a rung-level release of the merge \
+         base as a saving it cannot make",
+    );
+
+    // **The control, and it is what keeps the assertions above from passing
+    // on an instrument that reads zero for everything.** The same base, the
+    // same overlay, in a store nothing else has cloned from.
+    let mut alone = app_on_site();
+    alone.chunk_feeds.ensure(SITE);
+    alone
+        .chunk_feeds
+        .force_serving(SITE, std::sync::Arc::new(arriving_volume()));
+    alone.volumes.install_base(
+        SITE.to_string(),
+        (
+            std::sync::Arc::new(arriving_volume()),
+            Default::default(),
+            at(0),
+        ),
+    );
+
+    let sole = alone.base_holder_census();
+
+    assert_eq!(sole.bases, 1);
+    assert_eq!(
+        sole.sole, 1,
+        "a base no other store names was reported as co-held",
+    );
+    assert_eq!(
+        sole.superseded_rungs, census.superseded_rungs,
+        "the two arms are not the same scene, so the difference between them \
+         is not the co-holder",
+    );
+    assert_eq!(
+        sole.freeable_bytes, sole.superseded_bytes,
+        "the superseded rungs of a base nothing else holds are exactly the \
+         bytes a release could hand back",
+    );
+    assert!(sole.freeable_bytes > 0);
+}

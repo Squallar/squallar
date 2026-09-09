@@ -74,6 +74,16 @@ pub(crate) struct BaseEntry {
     /// volume is here — a skeleton is built at withdrawal and not at install,
     /// so a base nothing has withdrawn from costs exactly what it always did.
     skeleton: Option<Arc<squallar_radar::skeleton::VolumeSkeleton>>,
+    /// **What each of the volume's sweeps costs**, `(elevation number,
+    /// bytes)` in the volume's own sweep order, taken in the same walk that
+    /// priced the whole at install.
+    ///
+    /// Kept because the price of a SUBSET of the rungs cannot be got at from
+    /// the total, and the question — what is a base holding in rungs the
+    /// live flight has already superseded — is asked on a telemetry tick,
+    /// where a second walk of every radial is not affordable. Empty for a
+    /// base whose gates have gone: there are no sweeps left to price.
+    sweep_prices: Vec<(u8, usize)>,
     declared: Arc<DeclaredNyquist>,
     at: NaiveDateTime,
 }
@@ -475,6 +485,10 @@ impl VolumeInventory {
                 .as_ref()
                 .map_or(0, |skeleton| skeleton.bytes()),
         );
+        // The per-sweep prices go with the gates: they describe rungs this
+        // base is no longer holding, and a figure left standing here would be
+        // read as bytes a release could still free.
+        entry.sweep_prices.clear();
         Some(volume)
     }
 
@@ -499,10 +513,12 @@ impl VolumeInventory {
             );
             return false;
         }
-        self.base_bytes.insert(
-            site.to_string(),
-            squallar_radar::scan_size::scan_bytes(&volume),
-        );
+        let (bytes, sweep_prices) = squallar_radar::scan_size::scan_bytes_by_sweep(&volume);
+        self.base_bytes.insert(site.to_string(), bytes);
+        // Re-taken and not remembered from before the release: capacity is a
+        // property of the decode and not of the bytes, so the restored
+        // volume's sweeps are priced as themselves.
+        entry.sweep_prices = sweep_prices;
         entry.volume = Some(volume);
         entry.skeleton = None;
         true
@@ -529,10 +545,11 @@ impl VolumeInventory {
 
     /// Make `volume` `site`'s merge base.
     pub(crate) fn install_base(&mut self, site: String, volume: Base) {
-        self.base_bytes.insert(
-            site.clone(),
-            squallar_radar::scan_size::scan_bytes(&volume.0),
-        );
+        // One walk for both figures — the whole and the per-sweep half. The
+        // total is exactly what `scan_bytes` charges; `scan_bytes_by_sweep`'s
+        // own tests pin the two together.
+        let (bytes, sweep_prices) = squallar_radar::scan_size::scan_bytes_by_sweep(&volume.0);
+        self.base_bytes.insert(site.clone(), bytes);
         let (scan, declared, at) = volume;
         // **Whole, with no skeleton.** A skeleton is built where a withdrawal
         // releases the gates, not here, so an install costs exactly what it
@@ -542,6 +559,7 @@ impl VolumeInventory {
             BaseEntry {
                 volume: Some(scan),
                 skeleton: None,
+                sweep_prices,
                 declared,
                 at,
             },
@@ -567,6 +585,30 @@ impl VolumeInventory {
             !times.is_empty()
         });
         dropped
+    }
+
+    /// **What each rung of `site`'s merge base costs**, `(elevation number,
+    /// bytes)` in the volume's own sweep order — empty for a site with no
+    /// base and for one whose gates have been released.
+    pub(crate) fn base_sweep_prices(&self, site: &str) -> &[(u8, usize)] {
+        self.base
+            .get(site)
+            .map_or(&[][..], |entry| entry.sweep_prices.as_slice())
+    }
+
+    /// **How many still entries hold this exact allocation** — by POINTER,
+    /// the identity question [`Self::release_stills_of`] answers when it
+    /// drops them, asked without dropping anything.
+    ///
+    /// A base's own reference is not counted here: this store is the still
+    /// store. Zero means the stills would free these bytes if the base let
+    /// go, and any other answer means they would not.
+    pub(crate) fn stills_holding(&self, volume: &Arc<Scan>) -> usize {
+        self.still
+            .values()
+            .flat_map(std::collections::HashMap::values)
+            .filter(|entry| Arc::ptr_eq(&entry.volume.0, volume))
+            .count()
     }
 
     /// **What every released base's structure costs the allocator**, summed —

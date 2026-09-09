@@ -174,6 +174,37 @@ pub fn scan_bytes(scan: &Scan) -> usize {
         })
 }
 
+/// **The volume's price and each sweep's own, from one walk.**
+///
+/// The same three terms [`scan_bytes`] charges, with the per-sweep half kept
+/// rather than folded away: a caller that has to ask what a SUBSET of a
+/// volume's rungs costs cannot get there from the total, and re-walking the
+/// radials to find out would pay this function's cost a second time on a
+/// thread that has no room for it.
+///
+/// The prices are `(elevation number, bytes)` in the volume's own sweep
+/// order. Two sweeps can carry the same elevation number — nothing in the
+/// model forbids it — so this is a list and not a map, and a caller
+/// selecting by elevation number sums every entry that matches.
+pub fn scan_bytes_by_sweep(scan: &Scan) -> (usize, Vec<(u8, usize)>) {
+    let capacity = scan.sweeps_capacity();
+    if capacity == 0 {
+        return (0, Vec::new());
+    }
+    let containers = capacity.saturating_mul(size_of::<Sweep>());
+    let overhead = (1 + SCAN_METADATA_BLOCKS).saturating_mul(ALLOCATOR_BLOCK_OVERHEAD);
+    let mut prices = Vec::with_capacity(scan.sweeps().len());
+    let total = scan
+        .sweeps()
+        .iter()
+        .fold(containers.saturating_add(overhead), |sum, sweep| {
+            let bytes = sweep_bytes(sweep);
+            prices.push((sweep.elevation_number(), bytes));
+            sum.saturating_add(bytes)
+        });
+    (total, prices)
+}
+
 /// The host bytes one sweep is holding, its radials included.
 ///
 /// Public for the eviction path: a volume this process held the last

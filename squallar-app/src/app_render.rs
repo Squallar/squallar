@@ -3073,6 +3073,14 @@ impl super::App {
             loud,
             &crate::budget_telemetry::base_release_line(self.base_releases),
         );
+        // **And what those bases are holding that nothing would free.** The
+        // release histogram above says which guard kept a base's gates; this
+        // says what taking them would have been worth, which is a different
+        // question and on this scene a different answer. A LEVEL, so never
+        // added to the two running totals above, and its own line because
+        // `budget state:` is scraped by a positional regex.
+        let holders = self.base_holder_census();
+        say_telemetry(loud, &crate::budget_telemetry::base_holder_line(holders));
         // **Every distinct decoded volume, counted once across all five
         // holders.** A LEVEL, unlike the two running totals above, and never
         // to be added to them or to the census families below — this is the
@@ -3412,6 +3420,73 @@ impl super::App {
             seen.into_iter()
                 .fold(0u64, |sum, (_, bytes)| sum.saturating_add(bytes)),
         )
+    }
+
+    /// **What every merge base with gates is holding, and how much of it any
+    /// release could hand back** — see
+    /// [`crate::budget_telemetry::BaseHolderCensus`] for the four figures and
+    /// their denominators.
+    ///
+    /// # What it costs to ask
+    ///
+    /// No walk of any radial. The co-holder question is a pointer compare
+    /// against the four stores that can name a base's allocation, each of
+    /// which already publishes its allocations as bare pointers for
+    /// [`Self::radar_all_union`]; the superseded set is a comparison of
+    /// elevation numbers and cut angles; and the bytes come off the per-sweep
+    /// prices `VolumeInventory::install_base` took in the walk it was already
+    /// doing. That is what makes this affordable on a 2 s tick when
+    /// `scan_bytes` per base would not be.
+    pub(crate) fn base_holder_census(&mut self) -> crate::budget_telemetry::BaseHolderCensus {
+        let mut census = crate::budget_telemetry::BaseHolderCensus::default();
+        // **Every holder of a decoded volume that is not a merge base**, as
+        // bare pointers. Built once for the whole pass rather than per site:
+        // a volume two sites both named would otherwise be walked twice, and
+        // the question each site asks of it is the same one.
+        let mut elsewhere: Vec<*const nexrad_model::data::Scan> = self
+            .latest_cached_scans
+            .values()
+            .map(|(scan, _, _, _)| std::sync::Arc::as_ptr(scan))
+            .collect();
+        elsewhere.extend(self.loop_mgr.cached_scan_allocations().map(|(ptr, _)| ptr));
+        elsewhere.extend(self.chunk_feeds.held_allocations().map(|(ptr, _)| ptr));
+
+        let sites: Vec<String> = self.volumes.sites_with_base().map(str::to_string).collect();
+        for site in sites {
+            // `base_for` and not `base_structure_for`: a released base has no
+            // rungs to price and no gates for anything to free, and counting
+            // it would put a zero in every numerator over a denominator it
+            // had inflated.
+            let Some((volume, _)) = self.volumes.base_for(&site) else {
+                continue;
+            };
+            census.bases += 1;
+            let held_elsewhere = self.volumes.stills_holding(&volume) > 0
+                || elsewhere.contains(&std::sync::Arc::as_ptr(&volume));
+            let overlay = self.chunk_feeds.snapshot(&site);
+            let superseded = squallar_radar::current::superseded_base_sweeps(
+                &volume,
+                overlay.as_ref().map(|live| live.scan.as_ref()),
+            );
+            let prices = self.volumes.base_sweep_prices(&site);
+            debug_assert_eq!(
+                prices.len(),
+                volume.sweeps().len(),
+                "a merge base and its per-sweep prices are out of step",
+            );
+            let bytes = superseded
+                .iter()
+                .filter_map(|&index| prices.get(index))
+                .fold(0usize, |sum, (_, bytes)| sum.saturating_add(*bytes));
+            census.rungs += prices.len();
+            census.superseded_rungs += superseded.len();
+            census.superseded_bytes = census.superseded_bytes.saturating_add(bytes);
+            if !held_elsewhere {
+                census.sole += 1;
+                census.freeable_bytes = census.freeable_bytes.saturating_add(bytes);
+            }
+        }
+        census
     }
 
     /// **Judge one reading of the page's linear memory** against the line

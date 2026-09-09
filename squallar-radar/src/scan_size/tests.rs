@@ -334,3 +334,49 @@ fn the_sweep_prices_sum_to_the_scan_price() {
         sweeps + scan.sweeps_capacity() * size_of::<Sweep>() + SCAN_LEVEL_BLOCKS
     );
 }
+
+/// **The per-sweep half and the whole come out of one walk and agree.**
+///
+/// The relation, not a byte count, for the module's own reason: what is
+/// asserted is that `scan_bytes_by_sweep`'s total is `scan_bytes`' to the
+/// byte and that its rows are the sweeps' own prices in the volume's own
+/// order — which is what makes a caller's sum over a SUBSET of the rows a
+/// real figure rather than a share of a total.
+#[test]
+fn the_per_sweep_prices_are_the_whole_price_split_at_the_sweep_seam() {
+    let scan = scan_of(4, 6, 100, 3);
+    let (total, prices) = scan_bytes_by_sweep(&scan);
+
+    assert_eq!(
+        total,
+        scan_bytes(&scan),
+        "one walk priced the volume differently from the other",
+    );
+    assert_eq!(
+        prices.len(),
+        scan.sweeps().len(),
+        "a sweep went unpriced, so an index into this list names the wrong \
+         rung",
+    );
+    for (index, sweep) in scan.sweeps().iter().enumerate() {
+        assert_eq!(
+            prices[index],
+            (sweep.elevation_number(), sweep_bytes(sweep)),
+            "row {index} does not price the sweep at that position",
+        );
+    }
+    assert_eq!(
+        total - prices.iter().map(|(_, bytes)| bytes).sum::<usize>(),
+        scan.sweeps_capacity() * size_of::<Sweep>() + SCAN_LEVEL_BLOCKS,
+        "what is left over after the sweeps is not the scan-level terms, so \
+         the split is not at the sweep seam",
+    );
+}
+
+/// **A volume with no sweep vector prices at nothing on both halves**, the
+/// boundary `scan_bytes` returns early on.
+#[test]
+fn an_empty_volume_has_no_sweep_prices() {
+    let scan = Scan::new(vcp(), Vec::new());
+    assert_eq!(scan_bytes_by_sweep(&scan), (0, Vec::new()));
+}

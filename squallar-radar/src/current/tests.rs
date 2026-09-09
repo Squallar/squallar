@@ -785,3 +785,70 @@ fn the_hot_readers_answer_the_same_without_a_single_gate_byte() {
          above is None == None",
     );
 }
+
+// ── What the merge has stopped wanting ──────────────────────────────────
+
+/// **`superseded_base_sweeps` names exactly the base sweeps the merge leaves
+/// out, at every seal depth there is.**
+///
+/// The anti-drift gate, and the reason the two share `admits_base_sweep`
+/// rather than each spelling the rule. An instrument that answered this
+/// question with a second copy of the admission test would, the first time
+/// one of them changed, report rungs the merge is still serving as bytes a
+/// release could take — a hole in the radar sized in megabytes and reported
+/// as a saving.
+///
+/// Asserted against `resolve`'s own `base_sweeps()` and not against a table
+/// of expected numbers: a pinned table is a third spelling of the same rule
+/// and would drift with neither.
+#[test]
+fn the_superseded_sweeps_are_the_ones_the_merge_leaves_out() {
+    let base = base_volume(0);
+    for sealed in 0..=8u8 {
+        let overlay = overlay_volume(0, sealed);
+        let merged =
+            resolve(Some((&base).into()), Some((&overlay).into())).expect("both volumes exist");
+        let superseded = superseded_base_sweeps(&base, Some(&overlay));
+        assert_eq!(
+            merged.base_sweeps() + superseded.len(),
+            base.sweeps().len(),
+            "at {sealed} sealed cut(s) the merge took {} base sweep(s) and \
+             {} were called superseded, which does not account for the \
+             base's {}",
+            merged.base_sweeps(),
+            superseded.len(),
+            base.sweeps().len(),
+        );
+        // Every index is a real sweep of the base, and none repeats — the
+        // property a caller pricing them against a per-sweep list relies on.
+        let mut seen = superseded.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), superseded.len(), "an index was named twice");
+        assert!(
+            superseded.iter().all(|&i| i < base.sweeps().len()),
+            "an index names no sweep of the base",
+        );
+    }
+}
+
+/// **With no live flight nothing is superseded**, which is the reading that
+/// keeps a boot — where the overlay has not arrived — from being reported as
+/// a whole base's worth of freeable bytes.
+#[test]
+fn a_base_with_no_overlay_has_superseded_nothing() {
+    let base = base_volume(0);
+    assert!(superseded_base_sweeps(&base, None).is_empty());
+    // An overlay with no cut table is the same case: `resolve` discards it
+    // before the merge, so every base sweep is still served.
+    let patternless = Scan::new(vcp(212, &[]), vec![sweep(1, 0.5, 0, true, false)]);
+    assert!(superseded_base_sweeps(&base, Some(&patternless)).is_empty());
+    assert_eq!(
+        resolve(Some((&base).into()), Some((&patternless).into()))
+            .expect("resolves")
+            .base_sweeps(),
+        base.sweeps().len(),
+        "fixture: the patternless overlay was merged after all, so the \
+         assertion above is not about the case it names",
+    );
+}
