@@ -549,6 +549,14 @@ fn place_one(
     // `placed` would apply, so the surviving label is the value that spelling
     // produced, built here instead of copied. The geometry arm is untouched:
     // its shapes have no anchor to cull on and every one of them draws.
+    //
+    // **A planned tile reaches this with most of them already gone.** An
+    // anchor outside the tile's own extent fails this test under every `uv`
+    // and every camera, so `tile_mesh::build_plan` emits no step for it at all
+    // and this runs only for the labels whose answer the frame actually
+    // decides -- the ones inside the extent but outside a stretched ancestor's
+    // window. The test stays here unchanged because it is also the un-planned
+    // walk's, and because it is what settles that remainder.
     if let walkers::ShapeOrText::Text(text) = shape {
         let position = placement.scaling * text.position + placement.translation;
         if !rect.contains(position) {
@@ -620,9 +628,11 @@ fn place_run_as_mesh(
 ///
 /// **A `Text` in the span is skipped, and that is the whole of the subtlety.**
 /// A label whose anchor falls inside a stroke run's span is not drawn by the
-/// run, so `tile_mesh::build_plan` already emits its own `PlanStep::Place` for
-/// it; placing it here as well would push the same label into `labels` twice
-/// and lay it out twice. Nothing else can be in a span — a fill run is one
+/// run, so `tile_mesh::build_plan` settles it on its own — a `PlanStep::Place`
+/// where the anchor can draw, and nothing at all where it cannot
+/// (`tile_mesh::anchor_is_off_the_tile`). Placing it here as well would push a
+/// label into `labels` twice and lay it out twice, or put back one the plan
+/// has already ruled out. Nothing else can be in a span — a fill run is one
 /// mesh, and any shape that draws closes a stroke run at flatten time
 /// (`tile_mesh::flatten`) — so skipping `Text` leaves exactly the geometry the
 /// run was going to draw.
@@ -940,8 +950,9 @@ fn paint_vector_tile(
     let mut placed: Vec<egui::Shape> = Vec::with_capacity(shapes.len());
 
     // **The walk is precomputed; this only applies the placement.** Which index
-    // opens a run, which span a run covers and which shapes the CPU still has
-    // to place are a pure function of (tile, style epoch) and were settled by
+    // opens a run, which span a run covers, which shapes the CPU still has to
+    // place and which labels can never be drawn by this tile at all are a pure
+    // function of (tile, style epoch) and were settled by
     // `tile_mesh::build_plan` off the frame thread. See `PlanStep`.
     //
     // The guard is the shape count: `TileMeshes` can also come from
@@ -4620,5 +4631,112 @@ mod tests {
                  lost something else"
             );
         }
+    }
+
+    /// **The planned walk and the un-planned walk defer the same labels, at
+    /// every `uv`.**
+    ///
+    /// `tile_mesh::build_plan` drops the steps for labels anchored off the
+    /// tile, so the planned walk never sees them and the un-planned one culls
+    /// them itself at `place_one`. That is only sound if the two lists are the
+    /// same list — and the failure it would produce is a *missing name*,
+    /// which no pixel comparison of a tile's ground draws would notice and
+    /// which `solve_labels`' repeat-distance rule would happily paper over at
+    /// a seam.
+    ///
+    /// The `uv` arms are the point. A window is what a stretched ancestor
+    /// draws while the deeper tile is still arriving, and it is the one input
+    /// the plan cannot know: an anchor inside the extent but outside the
+    /// window is still the frame's to answer, and must survive the plan to
+    /// reach it. Every quadrant is run, so a cull that quietly resolved
+    /// against the wrong window would have to agree with `place_one` on all
+    /// four to pass.
+    #[test]
+    fn the_planned_and_unplanned_walks_defer_the_same_labels() {
+        let _ledger = ledger_guard();
+        let quarter =
+            |x: f32, y: f32| egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(0.5, 0.5));
+
+        // A city core, three names in its buffer (one off each edge and one
+        // off a corner), and two more inside the extent but well apart, so
+        // every `uv` quadrant below keeps a different subset.
+        let mut shapes = a_styled_tile();
+        for (at, name) in [
+            ((EXTENT / 2.0, EXTENT / 2.0), "Monaco"),
+            ((-EXTENT * 0.02, EXTENT / 2.0), "Nice"),
+            ((EXTENT / 2.0, EXTENT * 1.02), "Menton"),
+            ((EXTENT * 1.03, -EXTENT * 0.03), "Cannes"),
+            ((EXTENT * 0.2, EXTENT * 0.2), "Fontvieille"),
+            ((EXTENT * 0.8, EXTENT * 0.8), "Larvotto"),
+        ] {
+            shapes.push(ShapeOrText::Text(Text::new(
+                egui::pos2(at.0, at.1),
+                name.to_owned(),
+                12.0,
+                egui::Color32::WHITE,
+                0.0,
+            )));
+        }
+        let flat = std::sync::Arc::new(crate::tile_mesh::flatten(&shapes, FEATHERING));
+        assert!(
+            flat.plan().is_some(),
+            "fixture: the flattened tile carries a plan"
+        );
+        let planned = GroundMeshes {
+            meshes: Some(&flat),
+            painter: None,
+            pass_nr: 1,
+            feathering: FEATHERING,
+            opacity: 1.0,
+        };
+
+        let ctx = egui::Context::default();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let piece = egui::Rect::from_min_size(egui::pos2(37.0, 61.0), egui::vec2(256.0, 256.0));
+
+        let deferred = |ground: GroundMeshes<'_>, uv: egui::Rect| {
+            let mut labels = Vec::new();
+            let _ = shapes_of_one_pass(&ctx, canvas, |ui| {
+                paint_vector_tile(
+                    ui.painter(),
+                    &shapes,
+                    ground,
+                    piece,
+                    uv,
+                    &mut labels,
+                    Background::Inline,
+                );
+            });
+            labels
+                .into_iter()
+                .map(|text| (text.text.to_string(), text.position))
+                .collect::<Vec<_>>()
+        };
+
+        let mut kept_somewhere = 0usize;
+        for uv in [
+            FULL_TILE_UV,
+            quarter(0.0, 0.0),
+            quarter(0.5, 0.0),
+            quarter(0.0, 0.5),
+            quarter(0.5, 0.5),
+        ] {
+            let unplanned = deferred(GroundMeshes::CPU_ONLY, uv);
+            kept_somewhere += unplanned.len();
+            assert_eq!(
+                deferred(planned, uv),
+                unplanned,
+                "at uv {uv:?} the planned walk deferred a different label list                  than the walk it stands in for"
+            );
+        }
+
+        // A non-triviality floor: two lists that were both empty would agree
+        // for the wrong reason, and this test's failure mode is a name that is
+        // never deferred at all.
+        assert!(
+            kept_somewhere >= 6,
+            "the fixture deferred only {kept_somewhere} labels across five uv \
+             windows, so the agreement above is not about labels that draw"
+        );
     }
 }

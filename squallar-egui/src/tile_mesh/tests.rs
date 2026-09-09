@@ -595,3 +595,145 @@ fn a_tile_that_gave_its_fills_to_an_earlier_store_draws_them_on_the_cpu() {
          store draws nothing for a run it has no buffers for"
     );
 }
+
+/// A label anchored `at` in extent units.
+fn label_at(at: (f32, f32), name: &str) -> ShapeOrText {
+    ShapeOrText::Text(walkers::Text::new(
+        egui::pos2(at.0, at.1),
+        name.to_owned(),
+        12.0,
+        egui::Color32::WHITE,
+        0.0,
+    ))
+}
+
+/// The `Place` steps of `shapes`' plan, as shape indices.
+fn placed_indices(shapes: &[ShapeOrText]) -> Vec<u32> {
+    let flat = flatten(shapes, FEATHERING);
+    flat.plan()
+        .expect("`flatten` builds a plan")
+        .steps()
+        .iter()
+        .filter_map(|step| match step {
+            PlanStep::Place(index) => Some(*index),
+            PlanStep::Runs { .. } => None,
+        })
+        .collect()
+}
+
+/// **A label no pass of this tile can draw gets no step at all.**
+///
+/// The frame's anchor test is the same answer every frame — it reads the
+/// label's own position and the `uv` window, and a `uv` is always inside the
+/// unit square — so an anchor outside the tile's own extent fails it under
+/// every camera there is. `build_plan` settles those once, off the frame
+/// thread, instead of the frame rediscovering it: on the native rig's scene A
+/// that is 86.7% of every text step the frame walked.
+///
+/// The survivors keep their order and their indices, because a label's place
+/// among the shapes is what decides which of two colliding names wins in
+/// `solve_labels`.
+#[test]
+fn a_label_anchored_off_the_tile_gets_no_plan_step() {
+    let shapes = vec![
+        a_background(),
+        label_at((EXTENT / 2.0, EXTENT / 2.0), "Monaco"),
+        // West of the tile's own origin, which is what a neighbour's place
+        // looks like in this tile's buffer.
+        label_at((-EXTENT * 0.01, EXTENT / 2.0), "Nice"),
+        label_at((EXTENT / 4.0, EXTENT * 1.01), "Menton"),
+        label_at((EXTENT / 4.0, EXTENT / 4.0), "Fontvieille"),
+    ];
+
+    assert_eq!(
+        placed_indices(&shapes),
+        vec![0, 1, 4],
+        "the plan did not drop exactly the two labels anchored off the tile"
+    );
+
+    // And the guard still describes the list it was built for, so the frame
+    // does not fall back to the un-planned walk over a plan that is now
+    // shorter than the shapes.
+    let flat = flatten(&shapes, FEATHERING);
+    assert!(
+        flat.plan().expect("a plan").matches(shapes.len()),
+        "the shape-count guard no longer matches the list the plan was built for"
+    );
+}
+
+/// **A label inside the extent keeps its step whatever the `uv` is.**
+///
+/// The cull is `uv`-free on purpose: a stretched ancestor draws a *window* of
+/// its tile and the frame decides that window per piece. What is dropped is
+/// only what no window could show, so an anchor on the tile is still the
+/// frame's to answer — and so is one a hair outside it, because the margin
+/// leans that way rather than the other.
+#[test]
+fn a_label_on_the_tile_or_a_hair_outside_it_keeps_its_step() {
+    for at in [
+        (0.0, 0.0),
+        (EXTENT, EXTENT),
+        (EXTENT * 0.999, EXTENT * 0.001),
+        // Inside the one-extent-unit margin: droppable in exact arithmetic,
+        // kept because the frame's own `f32` answer for it can round either
+        // way.
+        (-0.5, EXTENT / 2.0),
+        (EXTENT + 0.5, EXTENT / 2.0),
+    ] {
+        let shapes = vec![a_background(), label_at(at, "Monaco")];
+        assert_eq!(
+            placed_indices(&shapes),
+            vec![0, 1],
+            "the label at {at:?} lost its step"
+        );
+    }
+}
+
+/// **The two facts the off-tile cull rests on**, asserted rather than
+/// believed.
+///
+/// `place_one`'s test is `rect.contains(placement * anchor)` with `rect` the
+/// tile's piece and `placement` the whole tile's. Every `rect` term cancels
+/// out of it — leaving `uv.contains(anchor / extent)` — only because a piece
+/// is square, and `unit.contains(..)` is a necessary condition for that only
+/// because a `uv` is inside the unit square. Either fact changing is what
+/// would make [`anchor_is_off_the_tile`] start dropping labels a frame would
+/// have drawn, and neither is this crate's to keep.
+#[test]
+fn the_two_facts_the_off_tile_cull_rests_on() {
+    let mut memory = walkers::MapMemory::default();
+    memory.set_zoom(9.0).expect("nine is inside the zoom range");
+    let projector = walkers::Projector::new(
+        egui::Rect::from_min_size(egui::pos2(13.0, 29.0), egui::vec2(1920.0, 1040.0)),
+        &memory,
+        walkers::lat_lon(35.33, -97.28),
+    );
+
+    for (x, y, zoom) in [(0i64, 0u32, 0u8), (8529, 5974, 14), (-3, 12, 5), (60, 3, 6)] {
+        let rect = projector.tile_rect_at(x, y, zoom);
+        assert_eq!(
+            rect.width(),
+            rect.height(),
+            "a piece at {x}/{y}/z{zoom} is not square, so the anchor test is not \
+             independent of where the tile is drawn"
+        );
+    }
+
+    let unit = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    for zoom in 0..=6u8 {
+        for available in 0..=zoom {
+            for (x, y) in [(0u32, 0u32), (1, 1), ((1 << zoom) - 1, (1 << zoom) - 1)] {
+                let id = walkers::TileId { x, y, zoom };
+                let Some((_, uv)) = walkers::interpolate_from_lower_zoom(id, available) else {
+                    continue;
+                };
+                assert!(
+                    unit.contains(uv.min) && unit.contains(uv.max) && uv.min.x <= uv.max.x,
+                    "the uv window {uv:?} for {x}/{y}/z{zoom} from z{available} \
+                     reaches outside the tile, so an anchor outside the extent \
+                     could still be drawn"
+                );
+            }
+        }
+    }
+}

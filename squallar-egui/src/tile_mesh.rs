@@ -628,8 +628,11 @@ pub fn flatten(shapes: &[ShapeOrText], feathering: f32) -> TileMeshes {
 ///   one;
 /// * a **path** inside a run's span is dropped — the `covers` arm, which is
 ///   spelled for `Shape::Path` and nothing else;
-/// * everything remaining becomes [`PlanStep::Place`] — labels, the background
-///   rectangle, and any path no run claimed.
+/// * a **label anchored off the tile** is dropped — see
+///   [`anchor_is_off_the_tile`], the one decision here that the un-planned
+///   walk makes per frame instead;
+/// * everything remaining becomes [`PlanStep::Place`] — the labels that can
+///   draw, the background rectangle, and any path no run claimed.
 ///
 /// The `Path` test is the subtle one and it is deliberate rather than
 /// inherited: a `Text` whose anchor falls inside a stroke run's span is **not**
@@ -671,6 +674,11 @@ fn build_plan(shapes: &[ShapeOrText], runs: &[MeshRun]) -> TilePlan {
         if covered[index] && matches!(shape, ShapeOrText::Shape(egui::Shape::Path(_))) {
             continue;
         }
+        if let ShapeOrText::Text(text) = shape
+            && anchor_is_off_the_tile(text.position)
+        {
+            continue;
+        }
         steps.push(PlanStep::Place(index as u32));
     }
 
@@ -679,6 +687,70 @@ fn build_plan(shapes: &[ShapeOrText], runs: &[MeshRun]) -> TilePlan {
         steps,
         shape_count: shapes.len() as u32,
     }
+}
+
+/// Whether a label anchored at `position` in extent units can be drawn by
+/// **no** pass of this tile, whatever the frame does with it.
+///
+/// **This is the anchor test, answered once instead of every frame.** A tile
+/// carries every label whose feature reaches it, buffer included, so most of
+/// the names in a tile's shape list are anchored in a neighbour and belong to
+/// that neighbour's pass; `ui_map_overlays::place_one` drops them on
+/// `rect.contains(placed anchor)`. Measured on the native rig, scene A, one
+/// 1920x1080 pane with real tiles, over two legs of two whole `pan-zoom-2d`
+/// loops: of **18,909,323 text steps** the frame walked over 353,597 tile
+/// pieces, 2,187,638 (11.6%) passed that test and **16,425,271 (86.9%) failed
+/// it with an anchor outside the tile's own extent** — the population this
+/// drops, and 98.2% of every failure there was. The other 296,414 (1.6%) are
+/// anchors *on* the tile but outside a stretched ancestor's `uv` window, which
+/// is the frame's to answer and stays the frame's.
+///
+/// The same two legs after: **zero** off-tile anchors reach the frame, and a
+/// tile piece walks 7.1 text steps where it walked 53.3.
+///
+/// # Why the frame's answer does not depend on the frame
+///
+/// `place_one` tests `rect.contains(placement.scaling * position +
+/// placement.translation)`, where `rect` is the tile's **piece** on screen and
+/// `placement` is [`walkers::mvt::placement`] of the whole tile's rect,
+/// recovered from the piece and its `uv` window. Two structural facts collapse
+/// that to a test on `position` alone:
+///
+/// * a piece is `Projector::tile_rect_at`, which is `Vec2::splat(side)` —
+///   **square**, always; and
+/// * `uv` is `walkers::tiles::interpolate_from_lower_zoom`'s quadtree window,
+///   so `0 ≤ uv.min` and `uv.max ≤ 1` — **inside the unit square**, always.
+///
+/// Substituting both, every `rect` term cancels and the test is exactly
+/// `uv.contains(position / extent)`. Since `uv` is inside the unit square,
+/// `unit.contains(position / extent)` is a *necessary* condition for it, for
+/// every zoom, camera, pane rect, display scale and `uv` a cached plan can
+/// ever be drawn under. Nothing else the frame knows enters it: the anchor is
+/// `position`, and `position` changes only by restyling the tile, which builds
+/// a new plan. The two facts are pinned by
+/// `tests::the_two_facts_the_off_tile_cull_rests_on`.
+///
+/// # The margin
+///
+/// One extent unit, and it is the direction that matters: this may **keep** a
+/// label the frame then drops (one more test, no pixel), and must never drop
+/// one the frame would have kept. The frame's arithmetic is `f32` over screen
+/// points, so its answer for an anchor sitting on the boundary can round
+/// either way; one extent unit is four orders of magnitude more slack than the
+/// worst rounding of that expression at any zoom the map has, and the labels
+/// this exists for sit tens to hundreds of units outside.
+fn anchor_is_off_the_tile(position: egui::Pos2) -> bool {
+    // The tile placed on the unit square, which is `walkers::mvt::placement`'s
+    // own expression at the one rect where the answer is the fraction of the
+    // extent: `scaling` is `1 / extent`, exactly, and reading it here is what
+    // keeps the extent walkers' constant rather than a copy of it.
+    let unit = walkers::mvt::placement(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::Vec2::splat(1.0),
+    ));
+    let at = unit.scaling * position;
+    let margin = unit.scaling;
+    at.x < -margin || at.x > 1.0 + margin || at.y < -margin || at.y > 1.0 + margin
 }
 
 /// [`flatten`]'s fill half, over `(shape index, mesh)` pairs.

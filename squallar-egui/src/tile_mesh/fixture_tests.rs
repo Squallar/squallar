@@ -271,15 +271,23 @@ fn the_plan_visits_a_fraction_of_the_shapes_the_walk_did() {
     );
 }
 
-/// **The identity gate: the plan makes the same decisions the walk made.**
+/// **The identity gate: the plan makes the same decisions the walk made, less
+/// the labels no frame could draw.**
 ///
 /// Replays the un-planned walk's branches over every shape and requires the
 /// plan to agree step for step, in order. This is what stops a count win that
 /// is really a dropped label — in particular a `Text` whose anchor falls inside
 /// a stroke run's span, which the run does not draw and the plan must still
 /// place.
+///
+/// The one decision the plan makes that the walk does not is
+/// [`super::anchor_is_off_the_tile`], and the expected list gets it from
+/// [`the_frame_would_draw_it`] — `place_one`'s own test, spelled through
+/// `walkers::mvt::placement` against a real rect rather than through the
+/// predicate under test — so the two can disagree here rather than agree by
+/// construction. On this fixture that is 4 of its 27 labels.
 #[test]
-fn the_plan_reproduces_the_unplanned_walks_decisions_exactly() {
+fn the_plan_is_the_unplanned_walk_less_the_labels_no_frame_could_draw() {
     let Some(shapes) = monaco_shapes() else {
         return;
     };
@@ -288,6 +296,7 @@ fn the_plan_reproduces_the_unplanned_walks_decisions_exactly() {
 
     let covered = covered_by_a_stroke_run(&shapes, &flat);
     let mut expected: Vec<Decision> = Vec::new();
+    let mut dropped_labels = 0usize;
     let mut next_run = 0usize;
     for (index, shape) in shapes.iter().enumerate() {
         if next_run < flat.runs().len() && flat.runs()[next_run].shape_index as usize == index {
@@ -298,17 +307,29 @@ fn the_plan_reproduces_the_unplanned_walks_decisions_exactly() {
         if covered[index] && matches!(shape, ShapeOrText::Shape(egui::Shape::Path(_))) {
             continue;
         }
+        if let ShapeOrText::Text(text) = shape
+            && !the_frame_would_draw_it(text.position)
+        {
+            dropped_labels += 1;
+            continue;
+        }
         expected.push(Decision::Place(index as u32));
     }
 
     assert_eq!(decisions(plan), expected);
 
     // Non-triviality: the two lists agreeing proves nothing if neither holds
-    // the interesting cases. This fixture must exercise both kinds and must
-    // actually drop shapes, or the gate is comparing two empty walks.
+    // the interesting cases. This fixture must exercise both kinds, must
+    // actually drop shapes, and must reach the label arm at all -- two lists
+    // that dropped no label would agree for the wrong reason.
     assert!(expected.iter().any(|s| matches!(s, Decision::Run(_))));
     assert!(expected.iter().any(|s| matches!(s, Decision::Place(_))));
     assert!(expected.len() < shapes.len());
+    assert!(
+        dropped_labels > 0,
+        "the fixture carries no label anchored off its own tile, so the cull \
+         arm above was never reached"
+    );
 }
 
 /// **Every run of a real tile is one paint callback.**
@@ -414,30 +435,102 @@ fn decisions(plan: &TilePlan) -> Vec<Decision> {
     out
 }
 
-/// Every label survives the plan. The count gate rewards dropping work, and
-/// dropping a label is the cheapest way to score on it.
+/// **Whether the frame would draw a label anchored at `position`**, asked the
+/// way the frame asks it and not the way the plan does.
+///
+/// `ui_map_overlays::place_one` tests `rect.contains(placement * anchor)` with
+/// `placement` the whole tile's and `rect` the piece being drawn. This is that
+/// expression, at a real rect, over the whole-tile window and each of its four
+/// quadrants — the windows a stretched ancestor is drawn through. A label no
+/// window would draw is one the plan may drop; a label *any* window would draw
+/// is one it must keep, and the quadrants are what make that a real question
+/// rather than a restatement of the unit square.
+fn the_frame_would_draw_it(position: egui::Pos2) -> bool {
+    let piece = draw_rect();
+    let unit = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    let quarter =
+        |x: f32, y: f32| egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(0.5, 0.5));
+    [
+        unit,
+        quarter(0.0, 0.0),
+        quarter(0.5, 0.0),
+        quarter(0.0, 0.5),
+        quarter(0.5, 0.5),
+    ]
+    .into_iter()
+    .any(|uv| {
+        // `full_rect_of_clipped_tile`, which is `ui_map_overlays`-private:
+        // the whole tile's rect, given the rect its `uv` window was drawn at.
+        let size = egui::vec2(piece.width() / uv.width(), piece.height() / uv.height());
+        let full = egui::Rect::from_min_size(
+            piece.min - egui::vec2(size.x * uv.min.x, size.y * uv.min.y),
+            size,
+        );
+        let placement = walkers::mvt::placement(full);
+        piece.contains(placement.scaling * position + placement.translation)
+    })
+}
+
+/// **Every label the tile can ever draw survives the plan, and the ones the
+/// plan drops are exactly the ones no frame could have drawn.**
+///
+/// The count gate rewards dropping work, and dropping a label is the cheapest
+/// way to score on it — so both directions are asserted, against
+/// [`the_frame_would_draw_it`] rather than against the predicate that does the
+/// dropping.
 #[test]
-fn the_plan_places_every_label_the_tile_carries() {
+fn the_plan_places_every_label_the_tile_can_ever_draw() {
     let Some(shapes) = monaco_shapes() else {
         return;
     };
     let flat = flatten(&shapes, feathering());
     let plan = flat.plan().expect("flatten builds a plan");
 
-    let labels: Vec<usize> = shapes
+    let labels: Vec<(usize, egui::Pos2)> = shapes
         .iter()
         .enumerate()
-        .filter(|(_, s)| matches!(s, ShapeOrText::Text(_)))
-        .map(|(i, _)| i)
+        .filter_map(|(i, s)| match s {
+            ShapeOrText::Text(text) => Some((i, text.position)),
+            _ => None,
+        })
         .collect();
     assert!(!labels.is_empty(), "fixture carries no labels to check");
 
-    for index in labels {
-        assert!(
-            plan.steps().contains(&PlanStep::Place(index as u32)),
-            "label at shape {index} is not placed by the plan",
-        );
+    let mut dropped = 0usize;
+    for (index, position) in labels {
+        let planned = plan.steps().contains(&PlanStep::Place(index as u32));
+        if the_frame_would_draw_it(position) {
+            assert!(
+                planned,
+                "label at shape {index} is drawable through some window of this \
+                 tile and the plan does not place it",
+            );
+        } else {
+            assert!(
+                !planned,
+                "label at shape {index} is anchored off the tile and no window \
+                 of it can draw the name, but the plan still walks it",
+            );
+            dropped += 1;
+        }
     }
+
+    // Non-triviality, both ways: a fixture whose labels are all drawable
+    // would pass the first arm while asserting nothing about the second, and
+    // one whose labels are all off the tile would do the reverse.
+    assert!(
+        dropped > 0,
+        "the fixture carries no label anchored off its own tile"
+    );
+    assert!(
+        dropped
+            < shapes
+                .iter()
+                .filter(|s| matches!(s, ShapeOrText::Text(_)))
+                .count(),
+        "the fixture's labels are ALL off the tile, so the surviving arm above \
+         asserted nothing"
+    );
 }
 
 #[test]
