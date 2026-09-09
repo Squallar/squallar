@@ -53,6 +53,14 @@ pub enum Retirement {
 pub struct LiveVolume {
     pub scan: std::sync::Arc<nexrad_model::data::Scan>,
     pub declared: std::sync::Arc<crate::nyquist::DeclaredNyquist>,
+    /// **What the assembler priced this volume at when it handed it over**,
+    /// carried rather than re-walked.
+    ///
+    /// The bridge copy outlives the assembler's own reference — that is what
+    /// it is for — so a caller pricing it later cannot ask the assembler, and
+    /// `crate::scan_size::scan_bytes` here would be a walk of every radial on
+    /// a telemetry tick. Zero only where the poller had no snapshot to price.
+    pub bytes: u64,
 }
 
 /// One site's feed.
@@ -378,7 +386,17 @@ impl ChunkFeedManager {
                     .cloned()
                     .map(std::sync::Arc::new)
                     .unwrap_or_default();
-                let snapshot = poller.snapshot().map(|scan| LiveVolume { scan, declared });
+                let scan = poller.snapshot();
+                // Read AFTER the snapshot, because a rebuild is exactly when
+                // the price moves: `VolumeAssembler::snapshot` sets
+                // `cached_bytes` on the way out, and a figure taken before it
+                // would describe the volume this one replaced.
+                let bytes = poller.cached_allocation().map_or(0, |(_, bytes)| bytes);
+                let snapshot = scan.map(|scan| LiveVolume {
+                    scan,
+                    declared,
+                    bytes,
+                });
                 // Refreshed here, the one place the poller's answer passes.
                 feed.last_snapshot.clone_from(&snapshot);
                 snapshot
@@ -386,6 +404,60 @@ impl ChunkFeedManager {
             // The poller is away on a round.
             None => feed.last_snapshot.clone(),
         }
+    }
+
+    /// **Every decoded volume the live feeds hold, as allocation and price**,
+    /// so a caller can fold `chunk feed` into a union by pointer instead of
+    /// adding a family the census documents as overlapping.
+    ///
+    /// Two rows per site at most and usually one allocation between them: the
+    /// assembler's `cached`, and the bridge copy the poller left behind. At
+    /// rest those are the same `Arc` and a pointer union collapses them; they
+    /// diverge exactly while a round is in flight, and while it is the
+    /// assembler travels with the request and only the bridge row is here at
+    /// all. Both are yielded and neither is de-duplicated — collapsing is the
+    /// caller's, which is the only place that can also see the still store
+    /// and the loop cache.
+    ///
+    /// **No walk and no rebuild.** Every price is one the assembler already
+    /// paid; see [`crate::chunks::VolumeAssembler::cached_allocation`] for why
+    /// this is not spelled as a `snapshot()`. What it does NOT reach is the
+    /// parked queue — [`Self::parked_volumes`] carries that, and says why.
+    pub fn held_allocations(
+        &self,
+    ) -> impl Iterator<Item = (*const nexrad_model::data::Scan, u64)> + '_ {
+        self.feeds.values().flat_map(|feed| {
+            feed.poller
+                .as_ref()
+                .and_then(|poller| poller.cached_allocation())
+                .into_iter()
+                .chain(
+                    feed.last_snapshot
+                        .as_ref()
+                        .map(|live| (std::sync::Arc::as_ptr(&live.scan), live.bytes)),
+                )
+        })
+    }
+
+    /// **What every site's parked queue holds**, summed as a count and a byte
+    /// level. See [`crate::chunks::ChunkPoller::parked_volumes`] for why these
+    /// are not allocations and must be printed beside a union rather than
+    /// folded into it.
+    pub fn parked_volumes(&self) -> (usize, u64) {
+        self.feeds
+            .values()
+            .filter_map(|feed| feed.poller.as_ref())
+            .fold((0usize, 0u64), |(count, bytes), poller| {
+                let (n, b) = poller.parked_volumes();
+                (count.saturating_add(n), bytes.saturating_add(b))
+            })
+    }
+
+    /// How many sites are being fed. The denominator every per-site radar
+    /// figure is read against, and not the pane count: two panes on one site
+    /// share one feed.
+    pub fn feed_count(&self) -> usize {
+        self.feeds.len()
     }
 
     /// Drop the feeds of sites nothing is watching live.
@@ -400,11 +472,6 @@ impl ChunkFeedManager {
         self.delivered
             .retain(|(site, _), _| live_sites.iter().any(|s| s == site));
         evicted
-    }
-
-    #[cfg(test)]
-    pub(crate) fn feed_count(&self) -> usize {
-        self.feeds.len()
     }
 
     /// Make a site due for a round now, so a test can run several without
@@ -436,9 +503,11 @@ impl ChunkFeedManager {
     #[cfg(any(test, feature = "test-support"))]
     pub fn force_serving(&mut self, site: &str, scan: std::sync::Arc<nexrad_model::data::Scan>) {
         if let Some(feed) = self.feeds.get_mut(site) {
+            let bytes = crate::scan_size::scan_bytes(&scan) as u64;
             feed.last_snapshot = Some(LiveVolume {
                 scan,
                 declared: Default::default(),
+                bytes,
             });
             feed.poller = None;
             feed.in_flight = true;

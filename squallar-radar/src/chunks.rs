@@ -1216,6 +1216,25 @@ impl VolumeAssembler {
     pub fn declared_nyquist(&self) -> &crate::nyquist::DeclaredNyquist {
         &self.declared_nyquist
     }
+
+    /// **The assembled snapshot's allocation and its price**, for a caller
+    /// building a union across every holder of a decoded volume.
+    ///
+    /// The pointer and not the volume: the question is identity. The price is
+    /// [`Self::cached_bytes`] as [`Self::snapshot`] last set it, so this walks
+    /// nothing at all. `None` before any snapshot has been built.
+    ///
+    /// `chunk feed` is the one decoded-volume family the census publishes that
+    /// no union could reach, and the census's own doc says so — the overlap
+    /// against `still scans` "is not measured by any walk". This is that
+    /// walk's near end. It is deliberately NOT a [`Self::snapshot`] call:
+    /// that one rebuilds a stale assembler on the caller's thread, and a
+    /// telemetry tick must never be the thing that pays for a volume rebuild.
+    pub fn cached_allocation(&self) -> Option<(*const nexrad_model::data::Scan, u64)> {
+        self.cached
+            .as_ref()
+            .map(|scan| (std::sync::Arc::as_ptr(scan), self.cached_bytes))
+    }
 }
 
 /// Base delay between rounds.
@@ -1422,6 +1441,33 @@ impl ChunkPoller {
     /// What the volume being assembled declared its cuts' Nyquist velocities to be.
     pub fn declared_nyquist(&self) -> Option<&crate::nyquist::DeclaredNyquist> {
         self.current.as_ref().map(VolumeAssembler::declared_nyquist)
+    }
+
+    /// **The decoded volume this poller's assembler holds**, as allocation and
+    /// price. See [`VolumeAssembler::cached_allocation`]; no walk.
+    pub fn cached_allocation(&self) -> Option<(*const nexrad_model::data::Scan, u64)> {
+        self.current.as_ref()?.cached_allocation()
+    }
+
+    /// **What the parked queue is holding, as a count and its maintained
+    /// byte level** — never as allocations, and that asymmetry is the whole
+    /// point of this signature.
+    ///
+    /// [`Self::pending_closed`] is unbounded and its per-entry price is not
+    /// stored; the only figure kept is the running
+    /// [`Self::pending_bytes`] the four push/pop seams maintain. Pricing the
+    /// entries individually — which is what a union would need to fold them
+    /// in by pointer — means a [`crate::scan_size::scan_bytes`] walk of every
+    /// parked volume's radials, and this is asked on a telemetry tick.
+    ///
+    /// So a union built from [`Self::cached_allocation`] does not contain
+    /// these bytes, and a caller that prints the union must print this beside
+    /// it rather than fold it in or drop it. The queue is drained one per
+    /// round and is empty on an ordinary leg, so the count is normally 0 and
+    /// says so itself when it is not — which is the reading that tells a
+    /// reader whether the union it just read is missing anything.
+    pub fn parked_volumes(&self) -> (usize, u64) {
+        (self.pending_closed.len(), self.pending_bytes)
     }
 
     /// Advisory delay before the next [`Self::poll`].

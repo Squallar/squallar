@@ -379,6 +379,9 @@ pub struct App {
     /// [`crate::budget_telemetry::BaseRestoreCounts`] says why the instrument
     /// is a count and not a byte figure.
     base_restores: crate::budget_telemetry::BaseRestoreCounts,
+    /// **Why the withdrawal side declined**, per guard. The restore counts
+    /// above say what came back; these say what never left.
+    base_releases: crate::budget_telemetry::BaseReleaseCounts,
     /// **The budget system's readout** — per pane, what the scene costs and
     /// what the pane's stores hold; per pool, capacity, need and spare
     /// (`squallar_egui::shell_api::BudgetReadout`). Re-stated to the Gui with
@@ -1057,6 +1060,7 @@ impl App {
             host_heap_watch: crate::budget_telemetry::HostHeapWatch::default(),
             base_gate_asks: std::collections::HashSet::new(),
             base_restores: crate::budget_telemetry::BaseRestoreCounts::default(),
+            base_releases: crate::budget_telemetry::BaseReleaseCounts::default(),
             budget_readout: squallar_egui::shell_api::BudgetReadout::default(),
             admission_costs: squallar_egui::admission::AdmissionCosts::default(),
             admission: squallar_egui::admission::AdmissionLedger::default(),
@@ -3505,27 +3509,47 @@ impl App {
         gate_readers: &std::collections::HashSet<String>,
         picture_owed: &std::collections::HashSet<String>,
     ) {
+        use crate::budget_telemetry::BaseReleaseOutcome;
+
         let sites: Vec<String> = self.volumes.sites_with_base().map(str::to_string).collect();
         for site in sites {
-            if !self.volumes.base_has_gates(&site)
-                || gate_readers.contains(&site)
-                || picture_owed.contains(&site)
-            {
+            // **The six guards, counted apart.** Spelled as one arm each
+            // rather than the single disjunction this replaces, because a
+            // volume left resident is a fact every census already carries and
+            // WHICH guard left it there is not — see
+            // `budget_telemetry::BaseReleaseCounts`. Behaviour is unchanged:
+            // the arms are in the same order and each still `continue`s.
+            self.base_releases.considered();
+            if !self.volumes.base_has_gates(&site) {
+                self.base_releases
+                    .blocked(BaseReleaseOutcome::AlreadyReleased);
+                continue;
+            }
+            if gate_readers.contains(&site) {
+                self.base_releases.blocked(BaseReleaseOutcome::GateReader);
+                continue;
+            }
+            if picture_owed.contains(&site) {
+                self.base_releases.blocked(BaseReleaseOutcome::PictureOwed);
                 continue;
             }
             let Some(collected) = self.volumes.base_collected_at(&site) else {
+                self.base_releases.blocked(BaseReleaseOutcome::NoCollected);
                 continue;
             };
             let Some((address, _)) = self.loop_mgr.archive_for_identity(&site, collected) else {
+                self.base_releases.blocked(BaseReleaseOutcome::NoArchive);
                 continue;
             };
             // A decode already on its way would land on a base this is about
             // to release, and the release would be undone by its own restore
             // one pass later.
             if self.loop_mgr.is_in_flight(&site, &address) {
+                self.base_releases.blocked(BaseReleaseOutcome::InFlight);
                 continue;
             }
             let Some(released) = self.volumes.release_base_gates(&site) else {
+                self.base_releases.blocked(BaseReleaseOutcome::ReleaseNone);
                 continue;
             };
             // **The ask goes with the gates.** Nothing reads them or this
@@ -3570,10 +3594,16 @@ impl App {
                 self.loop_mgr
                     .evict_decoded_except(|held, at, _| !(held == site && *at == address)),
             );
+            // Priced BEFORE the `push`, which moves it, and against the
+            // volume the base actually let go rather than against a family
+            // level: what this lever is worth is the allocation it withdrew,
+            // once, however many holders were named on it.
+            let released_bytes = squallar_radar::scan_size::scan_bytes(&released) as u64;
             freed.push((
                 released,
                 std::sync::Arc::new(squallar_radar::nyquist::DeclaredNyquist::empty()),
             ));
+            self.base_releases.fired(freed.len(), released_bytes);
             squallar_worker::offload::discard_each(
                 "released-base-gates",
                 crate::volume_inventory::volume_drop_parts(freed),

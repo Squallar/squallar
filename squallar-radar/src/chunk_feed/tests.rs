@@ -15,6 +15,7 @@ fn a_round_in_flight_does_not_take_the_snapshot_with_it() {
     mgr.feeds.get_mut("KICT").expect("ensured").last_snapshot = Some(LiveVolume {
         scan: std::sync::Arc::clone(&volume),
         declared: Default::default(),
+        bytes: crate::scan_size::scan_bytes(&volume) as u64,
     });
 
     mgr.force_due("KICT");
@@ -79,6 +80,7 @@ fn a_retired_feed_serves_no_snapshot() {
     mgr.feeds.get_mut("KICT").expect("ensured").last_snapshot = Some(LiveVolume {
         scan: std::sync::Arc::clone(&volume),
         declared: Default::default(),
+        bytes: crate::scan_size::scan_bytes(&volume) as u64,
     });
     mgr.force_due("KICT");
     let _poller = mgr.take_for_round("KICT").expect("the poller leaves");
@@ -102,6 +104,7 @@ fn retirement_drops_the_bridge_copy_and_recovery_starts_fresh() {
     mgr.feeds.get_mut("KICT").expect("ensured").last_snapshot = Some(LiveVolume {
         scan: stub_volume(),
         declared: Default::default(),
+        bytes: 0,
     });
 
     mgr.force_stall("KICT");

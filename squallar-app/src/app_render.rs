@@ -3065,6 +3065,32 @@ impl super::App {
             loud,
             &crate::budget_telemetry::base_restore_line(self.base_restores),
         );
+        // **And why the withdrawal side declined**, per guard. A running
+        // tally and so its own line, beside the restore counts it is the
+        // other half of: the restore says what came back, this says what
+        // never left and which of six conditions kept it.
+        say_telemetry(
+            loud,
+            &crate::budget_telemetry::base_release_line(self.base_releases),
+        );
+        // **Every distinct decoded volume, counted once across all five
+        // holders.** A LEVEL, unlike the two running totals above, and never
+        // to be added to them or to the census families below — this is the
+        // de-duplicated truth those families are an upper bound on. Its own
+        // line for that reason, and because `budget state:` is scraped by a
+        // positional regex.
+        let (union_volumes, union_bytes) = self.radar_all_union();
+        let (parked_volumes, parked_bytes) = self.chunk_feeds.parked_volumes();
+        say_telemetry(
+            loud,
+            &crate::budget_telemetry::radar_volume_line(
+                union_volumes,
+                union_bytes,
+                self.chunk_feeds.feed_count(),
+                parked_volumes,
+                parked_bytes,
+            ),
+        );
         self.publish_heap_census();
         // **One reading of the idle policy, off the level the call above just
         // folded.** `render pools` is the largest family on a quiet scene and
@@ -3311,6 +3337,81 @@ impl super::App {
         }
         seen.into_iter()
             .fold(0u64, |sum, (_, bytes)| sum.saturating_add(bytes as u64))
+    }
+
+    /// **Every distinct decoded volume this process holds, counted and
+    /// priced** — the still store, the merge bases, the per-site latest, the
+    /// loop download cache AND the chunk feed, each allocation once.
+    ///
+    /// # Why this is a different figure from [`Self::radar_union_level`]
+    ///
+    /// That one is deliberately still∪loop and must stay that way: it is what
+    /// `radar shared` is defined as (`published − union`), and widening it
+    /// would silently redefine a published family.
+    ///
+    /// This one closes the gap the census names against itself. `chunk feed`
+    /// is a decoded-volume family the census publishes and its own doc admits
+    /// no walk measures: "the other overlaps named in `radar_total` — `chunk
+    /// feed` against `still scans`, above all — are not measured by any walk,
+    /// so they are still counted twice". At six live panes that family reads
+    /// 152.6 MiB at the peak tick, and whether those are 152.6 MiB of heap or
+    /// 152.6 MiB of double-counted refcount is the difference between a cut
+    /// worth three volumes and no cut at all. Nothing but a pointer union
+    /// across both crates can say, which is the same reason `radar shared`
+    /// lives here rather than in the census.
+    ///
+    /// **The count is returned beside the bytes** because they answer
+    /// different questions and this campaign has quoted one for the other: the
+    /// bytes say what emptying every holder would free, the count says how
+    /// many whole volumes six panes are actually resident on — the figure a
+    /// per-pane claim is made against, and the one that is immune to a leg
+    /// running under load.
+    ///
+    /// **What it does not reach**, stated rather than dropped: the chunk
+    /// feed's parked queue, whose per-entry price is not stored and whose
+    /// allocations therefore cannot be folded in without a radial walk on the
+    /// telemetry tick. `ChunkFeedManager::parked_volumes` carries it and the
+    /// line below prints it beside this, never added to it.
+    ///
+    /// Cost: `Vec::contains` over a few dozen pointers on the 2 s telemetry
+    /// tick, never on a frame, and no gate is read — the same bound
+    /// [`Self::radar_union_level`] documents, plus at most two rows per live
+    /// site.
+    fn radar_all_union(&self) -> (usize, u64) {
+        let still_side =
+            self.volumes
+                .priced_allocations_with(self.latest_cached_scans.iter().map(
+                    |(site, (scan, _, _, _))| {
+                        (site.as_str(), scan, self.volumes.latest_price(site))
+                    },
+                ));
+        let mut seen: Vec<(*const nexrad_model::data::Scan, u64)> = Vec::new();
+        let rows = still_side
+            .map(|(ptr, bytes)| (ptr, bytes as u64))
+            .chain(
+                self.loop_mgr
+                    .cached_scan_allocations()
+                    .map(|(ptr, bytes)| (ptr, bytes as u64)),
+            )
+            .chain(self.chunk_feeds.held_allocations());
+        for (ptr, bytes) in rows {
+            // **The largest price any row gives a pointer**, as
+            // `radar_union_level` does and for its reason: a holder with no
+            // price row answers 0, and taking the max lets an unpriced row
+            // widen the union rather than shrink it. The union is what a
+            // reader subtracts a sum against, so the uncertainty resolves
+            // toward a SMALLER claimed overlap — this figure can never say
+            // the heap is smaller than it is.
+            match seen.iter_mut().find(|(held, _)| *held == ptr) {
+                Some((_, price)) => *price = (*price).max(bytes),
+                None => seen.push((ptr, bytes)),
+            }
+        }
+        (
+            seen.len(),
+            seen.into_iter()
+                .fold(0u64, |sum, (_, bytes)| sum.saturating_add(bytes)),
+        )
     }
 
     /// **Judge one reading of the page's linear memory** against the line

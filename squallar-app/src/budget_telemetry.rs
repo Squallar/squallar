@@ -822,6 +822,173 @@ pub(crate) fn base_restore_line(counts: BaseRestoreCounts) -> String {
     format!("base restore: offered {offered}, declined {declined}, restored {restored}")
 }
 
+/// **The de-duplicated radar volume level, as a count and as bytes**, with
+/// the live-site denominator it is read against and the one holder a pointer
+/// union cannot reach printed beside it.
+///
+/// # Every figure here names its denominator
+///
+/// `volumes` is distinct allocations across the still store, the merge bases,
+/// the per-site latest, the loop download cache and the chunk feed — the
+/// number six panes are actually resident on, and the figure a per-pane claim
+/// is made against. `sites` is live chunk feeds and NOT the pane count: two
+/// panes on one site share one feed and one volume, so a scene whose panes
+/// are all on different sites has nothing to share and reads `volumes` at
+/// least `sites`. That distinction is the whole reading, and a line carrying
+/// the volume count without it invites exactly the wrong conclusion.
+///
+/// `parked` is the chunk feed's closed-volume queue. It is printed and
+/// **never added**: its per-entry price is not stored, so those allocations
+/// cannot be folded into the union without walking every parked volume's
+/// radials on this tick. The queue is drained one per round and is empty on an
+/// ordinary leg, so a non-zero count here is the reading that says the union
+/// beside it is missing something — which is the direction an instrument may
+/// fail in, as long as it says so.
+///
+/// MiB by integer division, the spelling every byte figure in this module
+/// uses, because the rig reads these sentences with `(\d+)` groups.
+pub(crate) fn radar_volume_line(
+    volumes: usize,
+    bytes: u64,
+    sites: usize,
+    parked: usize,
+    parked_bytes: u64,
+) -> String {
+    let mib = |bytes: u64| bytes / (1024 * 1024);
+    format!(
+        "radar volumes: union {volumes} distinct at {} MiB over {sites} live site(s); parked {parked} at {} MiB (not in the union)",
+        mib(bytes),
+        mib(parked_bytes),
+    )
+}
+
+/// **Why a merge base's gates did not go**, as one running tally per reason.
+///
+/// # Why a histogram and not a level
+///
+/// `App::release_unneeded_base_gates` is the only lever in this application
+/// that can withdraw a whole decoded volume — a measured 48.9 MiB median,
+/// held by the base, the still store, the site's latest and the loop cache
+/// off ONE allocation — and it is guarded by six conditions in a row. A
+/// census family says the volumes are still resident. It does not say which
+/// of the six is the one holding them, and the difference decides whether
+/// there is a cut here at all or whether the lever is simply correct to
+/// decline.
+///
+/// **This exists because the ledger has been wrong about that before.** A cut
+/// projected at ~94 MiB sat banked for days in this campaign while never
+/// executing once, because the precondition it needed never held on a real
+/// scene and nothing counted the times it was asked. A count of each refusal
+/// cannot fail that way: a reason that never fires reads 0, and a lever that
+/// is never even reached reads `considered 0`, which no byte figure can say.
+///
+/// Counts, and `freed` in bytes beside them, because the two answer different
+/// questions and the campaign has been burned quoting one for the other:
+/// `fired` says the lever executes on this scene, `freed` says what it was
+/// worth. Both are running totals for the life of the process, never levels,
+/// which is why they get a line of their own and are never added to the
+/// census.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BaseReleaseCounts {
+    considered: u32,
+    already_released: u32,
+    gate_reader: u32,
+    picture_owed: u32,
+    no_collected: u32,
+    no_archive: u32,
+    in_flight: u32,
+    release_none: u32,
+    fired: u32,
+    freed_holders: u32,
+    freed_bytes: u64,
+}
+
+/// Which of the six guards turned one site's base away, or that none did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BaseReleaseOutcome {
+    /// The gates are already gone — the steady state after a release, and so
+    /// the one arm here that is not a refusal to celebrate or mourn.
+    AlreadyReleased,
+    /// A cross-section or 3D pane on the site reads the gates.
+    GateReader,
+    /// A pane on the site has not been handed its picture yet.
+    PictureOwed,
+    /// The base has no collection time, so nothing can be keyed to it.
+    NoCollected,
+    /// **No archive to decode back from.** The trade this lever makes is
+    /// gates for a way back, and a base the chunk feed produced has none:
+    /// it is filed with `archive: None` and `archive_for_identity` finds
+    /// nothing for it.
+    NoArchive,
+    /// A decode is already on its way to this base.
+    InFlight,
+    /// The store declined the withdrawal.
+    ReleaseNone,
+}
+
+impl BaseReleaseCounts {
+    /// One site with a merge base, reached by the pass — the denominator
+    /// every arm below is read against, and the reading that separates "the
+    /// lever declined" from "the lever was never asked".
+    pub(crate) fn considered(&mut self) {
+        self.considered = self.considered.saturating_add(1);
+    }
+
+    /// One of those turned away, by the guard that turned it.
+    pub(crate) fn blocked(&mut self, outcome: BaseReleaseOutcome) {
+        let slot = match outcome {
+            BaseReleaseOutcome::AlreadyReleased => &mut self.already_released,
+            BaseReleaseOutcome::GateReader => &mut self.gate_reader,
+            BaseReleaseOutcome::PictureOwed => &mut self.picture_owed,
+            BaseReleaseOutcome::NoCollected => &mut self.no_collected,
+            BaseReleaseOutcome::NoArchive => &mut self.no_archive,
+            BaseReleaseOutcome::InFlight => &mut self.in_flight,
+            BaseReleaseOutcome::ReleaseNone => &mut self.release_none,
+        };
+        *slot = slot.saturating_add(1);
+    }
+
+    /// One withdrawal that carried through, with what the joint release
+    /// handed to the drop path: how many holders let go, and the bytes the
+    /// base itself was priced at.
+    ///
+    /// `holders` is the count and not a byte figure on purpose — every one of
+    /// them may be a refcount on the volume already counted in `bytes`, which
+    /// is exactly why dropping the base's reference alone frees nothing.
+    pub(crate) fn fired(&mut self, holders: usize, bytes: u64) {
+        self.fired = self.fired.saturating_add(1);
+        self.freed_holders = self
+            .freed_holders
+            .saturating_add(u32::try_from(holders).unwrap_or(u32::MAX));
+        self.freed_bytes = self.freed_bytes.saturating_add(bytes);
+    }
+}
+
+/// Its own line, and never appended to `budget state:`, which is scraped by a
+/// positional regex.
+///
+/// MiB by integer division, the same spelling every byte figure in this
+/// module uses, because the rig reads these sentences with `(\d+)` groups.
+pub(crate) fn base_release_line(counts: BaseReleaseCounts) -> String {
+    let BaseReleaseCounts {
+        considered,
+        already_released,
+        gate_reader,
+        picture_owed,
+        no_collected,
+        no_archive,
+        in_flight,
+        release_none,
+        fired,
+        freed_holders,
+        freed_bytes,
+    } = counts;
+    format!(
+        "base release: considered {considered}, fired {fired} freeing {} MiB from {freed_holders} holders; blocked already-released {already_released}, gate-reader {gate_reader}, picture-owed {picture_owed}, no-archive {no_archive}, in-flight {in_flight}, no-collected {no_collected}, release-none {release_none}",
+        freed_bytes / (1024 * 1024),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
