@@ -559,8 +559,7 @@ impl OverlayRegistry {
     /// `retain_selections` that ever starts filtering by pane must keep what
     /// any pane keeps.
     pub fn apply_fetch_result(&mut self, result: OverlayFetchResult, pane: &PaneRef<'_>) {
-        let id = result.kind;
-        if let Some(idx) = self.handlers.iter().position(|h| h.id() == id) {
+        if let Some(idx) = self.index_of(&result.kind) {
             self.handlers[idx].apply_fetch_result(result.data, pane);
             self.handlers[idx].retain_selections(&mut self.selected_overlays, pane);
         }
@@ -1626,6 +1625,73 @@ mod id_cache_tests {
         assert!(
             registry.handler(&known::FAKE_SOURCE).is_none(),
             "an unregistered id resolved to a handler",
+        );
+    }
+
+    /// **A data arrival is routed by the index, not by asking every handler
+    /// who it is.**
+    ///
+    /// [`OverlayRegistry::apply_fetch_result`] was the last site in this crate
+    /// spelling the resolution as `handlers.iter().position(|h| h.id() == id)`
+    /// — the idiom cut from five frame-path sites on 2026-09-08. It is a
+    /// **cold** path (one arrival, not one per frame), so what this pins is the
+    /// spelling rather than a frame cost.
+    ///
+    /// Asserted off [`lookup_ledger`] because that is what separates the two:
+    /// the scan makes no ledger entry at all and one virtual
+    /// [`OverlayHandler::id`] call per candidate ahead of the hit, while
+    /// [`OverlayRegistry::index_of`] notes exactly one lookup and zero vcalls.
+    /// So a scan that comes back reads `0` lookups here, not a bigger number.
+    ///
+    /// `squallar-overlays` is outside `arch_ratchets` row 14's haystack on
+    /// purpose — this crate keeps one deliberate scan, the parity test above —
+    /// so this in-crate gate is what covers the call sites that row cannot.
+    #[test]
+    fn a_fetch_arrival_is_routed_by_the_index() {
+        let mut registry = OverlayRegistry::default();
+        let kind = known::NWS_ALERTS;
+        let expected_probes = registry
+            .ids
+            .iter()
+            .position(|held| *held == kind)
+            .expect("the alerts layer is registered")
+            + 1;
+        assert!(
+            expected_probes > 1,
+            "premise: the alerts layer sits first in the registry, so a scan \
+             and the resolver would compare the same one id and the probe \
+             count below would not tell them apart",
+        );
+
+        lookup_ledger::reset();
+        registry.apply_fetch_result(
+            OverlayFetchResult {
+                kind: kind.clone(),
+                data: OverlayRegistry::nws_alerts_payload(Vec::new()),
+            },
+            &PaneRef::bare(0),
+        );
+        let (lookups, probes, vcalls) = lookup_ledger::read();
+
+        // Printed whether or not the assertion fires: the figures are the finding.
+        eprintln!("one arrival: {lookups} lookups, {probes} probes, {vcalls} vcalls");
+        assert_eq!(
+            lookups, 1,
+            "an arrival made {lookups} registry resolutions where the index \
+             answers in one. A scan makes ZERO of these — it never reaches the \
+             resolver — so a reading of 0 here is the scan having come back.",
+        );
+        assert_eq!(
+            vcalls, 0,
+            "resolving one arrival cost {vcalls} virtual `OverlayHandler::id` \
+             calls. The ids came off the handlers once, at construction.",
+        );
+        assert_eq!(
+            probes as usize,
+            expected_probes,
+            "the resolver compared {probes} ids to find a layer sitting at \
+             registry position {}, so it is not stopping at the hit",
+            expected_probes - 1,
         );
     }
 }
