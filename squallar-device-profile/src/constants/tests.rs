@@ -618,6 +618,10 @@ fn every_cfg_arm_selects_the_constant_named_for_its_device_class() {
         // The page-thread teardown allowance; wasm's arm is pinned below
         // desktop's by `the_wasm_drop_budget_is_tighter_than_desktops`.
         "DEFERRED_DROP_BUDGET_PER_FRAME",
+        // The arrival allowance the `Ingest` drains share, on the drop
+        // budget's terms: wasm and mobile hold the scarcer thread and take
+        // the tighter arm.
+        "INGEST_BUDGET_PER_FRAME",
         // The building geometry row: one number on every arm, pinned until a
         // second machine is measured.
         "PRISM_GEOMETRY_BYTES",

@@ -200,7 +200,13 @@ impl super::App {
 
     /// Drain finished rounds and apply them.
     pub(super) fn poll_chunk_results(&mut self) {
+        // One arrival always goes through, on `poll_scan_results`' terms.
+        let mut drained_one = false;
         while let Ok(resp) = self.channels.chunk_receiver.try_recv_arrival() {
+            if drained_one && self.ingest_budget_spent() {
+                break;
+            }
+            drained_one = true;
             let ChunkResponse {
                 generation,
                 site,

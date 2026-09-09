@@ -273,3 +273,76 @@ fn the_pump_rows_are_in_the_pinned_order() {
          here.",
     );
 }
+
+/// The body of `name` in `source`, braces balanced.
+fn fn_body<'a>(source: &'a str, name: &str) -> &'a str {
+    let start = source
+        .find(name)
+        .unwrap_or_else(|| panic!("{name} is gone"));
+    let rest = &source[start..];
+    let open = rest.find('{').expect("a body");
+    let mut depth = 0usize;
+    for (i, c) in rest[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &rest[open..open + i];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced braces in {name}");
+}
+
+/// **Every unbounded arrival drain of `Ingest` consults the frame's budget.**
+///
+/// The three `while let Ok(..) = try_recv_arrival()` loops apply whatever a
+/// burst delivered on whichever frame follows it. Measured on the Mac against
+/// the `frame worst:` latch, the worst of a 300-frame latched sample spent
+/// 36,017 µs of 39,567 in `pre_ingest`, on the frame after fourteen overlay
+/// payloads and four Level III products landed together.
+///
+/// A source probe and not a behavioural one for the reason the chunk drain's
+/// own run-moment pin is: an `App` cannot be stood up in a unit test, so what
+/// is checkable here is that the deadline is set around the phase, cleared
+/// after it, and read by each drain. It gates the wiring, not the duration —
+/// said plainly so the next reader does not take it for a timing test.
+#[test]
+fn every_ingest_arrival_drain_consults_the_frame_budget() {
+    let app = include_str!("../app.rs");
+    let chunks = include_str!("../app_chunks.rs");
+
+    let poll = fn_body(app, "fn poll_data_channels(");
+    assert!(
+        poll.contains("ingest_deadline = Some(") && poll.contains("INGEST_BUDGET_PER_FRAME"),
+        "poll_data_channels no longer opens the frame's arrival budget, so \
+         every drain below reads `None` and is unbounded again"
+    );
+    assert!(
+        poll.contains("ingest_deadline = None"),
+        "the deadline outlives the Ingest phase, so a drain called from \
+         anywhere else would silently inherit this frame's budget"
+    );
+
+    for (source, name, what) in [
+        (app, "fn poll_scan_results(", "scan"),
+        (chunks, "fn poll_chunk_results(", "chunk"),
+        (app, "fn poll_overlay_fetch_results(", "overlay fetch"),
+    ] {
+        let body = fn_body(source, name);
+        assert!(
+            body.contains("ingest_budget_spent()") || body.contains("ingest_deadline"),
+            "the {what} drain no longer consults the frame's arrival budget, \
+             so one burst is applied whole on one frame"
+        );
+        assert!(
+            body.contains("drained_one"),
+            "the {what} drain lost its always-one-arrival guarantee, so a \
+             drain ahead of it in the phase can starve it for the length of \
+             a burst"
+        );
+    }
+}

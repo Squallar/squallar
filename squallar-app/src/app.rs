@@ -592,6 +592,13 @@ pub struct App {
     #[cfg(target_arch = "wasm32")]
     pending_state: Option<std::sync::mpsc::Receiver<app_state::AppState>>,
     http_client: reqwest::Client,
+    /// When this frame's arrival drains must stop and leave the rest queued.
+    ///
+    /// Set at the head of [`App::poll_data_channels`] and read by the three
+    /// unbounded `try_recv` loops of `PumpPhase::Ingest`; `None` outside that
+    /// phase, which is what makes a drain called from anywhere else unbounded
+    /// exactly as it was.
+    ingest_deadline: Option<web_time::Instant>,
     loop_mgr: LoopDownloadManager,
     /// **Frame listings that landed this frame**, one entry per arrival.
     ///
@@ -1055,6 +1062,7 @@ impl App {
             mirror_rungs: squallar_gpu::egui_renderer::MirrorRungs::default(),
             mirror_plan_applied: None,
             mirror_plan_stamp: 0,
+            ingest_deadline: None,
             budgets,
             device_profile,
             loop_pool,
@@ -2553,7 +2561,15 @@ impl App {
 
     /// Drain the archive scan channel and apply every queued volume.
     fn poll_scan_results(&mut self) {
+        // One arrival always goes through before the budget is consulted, so a
+        // drain that follows an expensive one still makes progress rather than
+        // being starved by it for as long as the burst lasts.
+        let mut drained_one = false;
         while let Ok(scan_resp) = self.channels.scan_receiver.try_recv_arrival() {
+            if drained_one && self.ingest_budget_spent() {
+                break;
+            }
+            drained_one = true;
             if self
                 .render
                 .is_scan_stale(&scan_resp.site, scan_resp.requester, scan_resp.generation)
@@ -2698,7 +2714,31 @@ impl App {
 
     /// Poll all data channels for completed async results (scan, overlays).
     fn poll_data_channels(&mut self) {
+        self.ingest_deadline = Some(
+            web_time::Instant::now() + squallar_device_profile::constants::INGEST_BUDGET_PER_FRAME,
+        );
         self.run_frame_pump(frame_pump::PumpPhase::Ingest, None);
+        self.ingest_deadline = None;
+    }
+
+    /// Whether this frame has spent its arrival budget, and if so ask for the
+    /// frame that will drain the rest.
+    ///
+    /// Called by the `Ingest` drains **between** arrivals, so the frame pays
+    /// this budget plus the one arrival that crossed it — see
+    /// [`squallar_device_profile::constants::INGEST_BUDGET_PER_FRAME`]. The
+    /// redraw ask is here rather than at each call site so that no drain can
+    /// stop early without one: what is left in the channel raises no frame
+    /// need of its own, and a deferral nobody asked a frame for would wait for
+    /// an unrelated repaint.
+    fn ingest_budget_spent(&self) -> bool {
+        let spent = self
+            .ingest_deadline
+            .is_some_and(|deadline| web_time::Instant::now() >= deadline);
+        if spent {
+            notify_redraw(&self.window);
+        }
+        spent
     }
 
     /// Drain the unified overlay fetch channel — **every** arrival a source
@@ -2719,9 +2759,23 @@ impl App {
         // the mark lives on the dispatcher. Cleared below whether or not the
         // fetch carried a granule — see `clear_loop_frame_fetch`.
         let mut answered: Vec<(squallar_source::id::LayerId, chrono::NaiveDateTime)> = Vec::new();
+        // Read before `gui` borrows `self`: `ingest_budget_spent` takes
+        // `&self` and cannot be called while that borrow is live, so the
+        // deadline is copied out and the redraw ask deferred to below the
+        // loop, where the borrow has ended.
+        let deadline = self.ingest_deadline;
+        let mut deferred = false;
+        // One arrival always goes through, on `poll_scan_results`' terms.
+        let mut drained_one = false;
         // Bound once for the whole drain, not per arrival.
         let gui = &mut self.gui;
         while let Ok(event) = self.channels.overlay_fetch_receiver.try_recv_arrival() {
+            if drained_one && deadline.is_some_and(|deadline| web_time::Instant::now() >= deadline)
+            {
+                deferred = true;
+                break;
+            }
+            drained_one = true;
             // Not "the pane the fetch was for": the arrival carries a layer
             // id and no pane, and what the handler needs of it is the whole
             // layer's — every pane's selection, unioned. `Gui` owns the panes
@@ -2786,6 +2840,12 @@ impl App {
                     }
                 }
             }
+        }
+        // Below the loop because `gui` borrowed `self` for the whole of it.
+        // What this drain collected is applied either way; only the arrivals
+        // still in the channel are owed the frame.
+        if deferred {
+            notify_redraw(&self.window);
         }
         for (id, valid) in answered {
             self.render.clear_loop_frame_fetch(&id, valid);

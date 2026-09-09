@@ -1374,6 +1374,39 @@ pub const WASM_DEFERRED_DROP_BUDGET_PER_FRAME: Duration = Duration::from_micros(
 pub const MOBILE_DEFERRED_DROP_BUDGET_PER_FRAME: Duration = Duration::from_micros(500);
 pub const DESKTOP_DEFERRED_DROP_BUDGET_PER_FRAME: Duration = Duration::from_millis(2);
 
+/// How long one frame may spend applying arrivals before the rest wait for the
+/// next one.
+///
+/// The arrival drains of [`PumpPhase::Ingest`] are `while let Ok(..) =
+/// try_recv()` loops with no bound, so a frame that happens to follow a burst
+/// applies the whole burst. Measured on the Mac (M2, Metal, 1920x1000 native,
+/// scene A, one pane) against the `frame worst:` latch: the worst frame of a
+/// 300-frame latched sample spent **36,017 µs of its 39,567 µs in
+/// `pre_ingest`**, on the frame after fourteen overlay payloads and four
+/// Level III products landed together; 25 of those 300 spent over 500 µs
+/// there. A second leg, instrumented per drain, caught nine spikes over two
+/// runs at 1.5–3.3 ms, spread across three different rows — `poll_chunk_results`,
+/// `poll_overlay_fetch_results` and `publish_base_volumes` — so no one drain
+/// owns it and the bound belongs to the phase.
+///
+/// Checked **between** arrivals, so a frame's real spend is this budget plus
+/// one whole arrival, on [`DEFERRED_DROP_BUDGET_PER_FRAME`]'s terms. What is
+/// left stays queued and the window is asked for another frame, which is the
+/// product rule directly: interaction is realtime, data may lag.
+///
+/// A cascade for that constant's reason — wasm and mobile hold the scarcer
+/// thread — and it selects a value, never behaviour.
+#[cfg(target_arch = "wasm32")]
+pub const INGEST_BUDGET_PER_FRAME: Duration = WASM_INGEST_BUDGET_PER_FRAME;
+#[cfg(all(not(target_arch = "wasm32"), mobile))]
+pub const INGEST_BUDGET_PER_FRAME: Duration = MOBILE_INGEST_BUDGET_PER_FRAME;
+#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
+pub const INGEST_BUDGET_PER_FRAME: Duration = DESKTOP_INGEST_BUDGET_PER_FRAME;
+
+pub const WASM_INGEST_BUDGET_PER_FRAME: Duration = Duration::from_micros(500);
+pub const MOBILE_INGEST_BUDGET_PER_FRAME: Duration = Duration::from_micros(500);
+pub const DESKTOP_INGEST_BUDGET_PER_FRAME: Duration = Duration::from_millis(1);
+
 /// The **whole application's** loop allowance on a device that can tell us
 /// nothing about itself, in bytes. One pool, divided among the loops that want
 /// one, by squallar-app's `loop_pool`. The floor is exactly what one loop's span
