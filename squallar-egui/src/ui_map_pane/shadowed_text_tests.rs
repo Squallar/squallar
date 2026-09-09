@@ -37,10 +37,17 @@
 //!
 //! The block also has a *measuring* half — [`super::color_scale_gutter`], which
 //! a pane runs every frame to find out how far in from its own edge the
-//! legends reach, and which lays out every threshold of every bar to do it.
-//! Its vocabulary is a superset of the drawn one, so the last test here asks
-//! the sharpest available question: after the measuring pass, the drawing pass
-//! must add **no** layouts at all.
+//! legends reach, and which lays out every threshold of every bar the first
+//! time it is asked for a given bar. Its vocabulary is a superset of the drawn
+//! one, so the third test here asks the sharpest available question: after the
+//! measuring pass, the drawing pass must add **no** layouts at all.
+//!
+//! **That measurement is memoised per bar** (`super::memoized_radar_reach`,
+//! `super::memoized_overlay_reach`), so on a warm context the gutter lays
+//! nothing out. Neither is a contradiction and the two are gated separately:
+//! the third test builds its own context and takes the *cold* reading, which
+//! is the pass the memo builds on and the only one where the two halves' jobs
+//! can be compared at all; the fourth takes the warm one.
 
 use super::*;
 use crate::pane::PaneState;
@@ -229,10 +236,17 @@ fn every_shadowed_label_still_draws_both_its_copies() {
 /// **The measuring half and the drawing half share their galleys.**
 ///
 /// A pane asks [`super::color_scale_gutter`] every frame how far in its
-/// legends reach, and that walks the same bars laying out **every** threshold
-/// — not the thinned subset the painter draws — plus each bar's unit title.
-/// Its vocabulary therefore contains the painter's, and the two run one after
-/// the other on the same context in the same frame.
+/// legends reach, and the first such ask on a context walks the same bars
+/// laying out **every** threshold — not the thinned subset the painter draws
+/// — plus each bar's unit title. Its vocabulary therefore contains the
+/// painter's, and the two run one after the other on the same context in the
+/// same frame.
+///
+/// **Cold on purpose.** The context is built here, so the gutter's ask is the
+/// memo's build and the measuring pass really does lay its whole vocabulary
+/// out. That is also the only pass on which this question can be asked: on a
+/// warm context the gutter lays nothing out, `measured` reads zero and the
+/// premise below fails loudly rather than passing vacuously.
 ///
 /// So the exact question is: how many layouts does the *drawing* pass add on
 /// top of the measuring one? Zero, if the two agree that a string's metrics do
@@ -295,5 +309,121 @@ fn the_gutter_measures_the_same_galleys_the_painter_draws() {
          had already made for the same strings on the same frame. One of the \
          two is baking an ink colour into its layout job, and epaint keys its \
          galley cache by the whole job — colour included.",
+    );
+}
+
+/// **A pane measures its legend block once, not once per pane per frame.**
+///
+/// [`super::color_scale_gutter`] runs `panes + 2` times a frame and the answer
+/// it returns cannot move while the bar's thresholds, its unit label, the
+/// orientation and the pixel grid all hold still. epaint's galley cache spares
+/// the *layout* on a repeat measurement; it does not spare the `String`
+/// [`super::laid_out_width`] allocates from a `&str` the caller already holds,
+/// nor the `Context::fonts` write lock each one takes. So the measurement
+/// itself is memoised, per bar, on the context.
+///
+/// **Counted through epaint's own eviction**, which is what makes the second
+/// reading mean anything. A galley the cache still holds is a hit whether the
+/// gutter asked for it or not, so a warm second call reads zero either way.
+/// An intervening pass that draws nothing drops every galley nothing used, so
+/// the third pass below starts from an empty cache: a gutter that re-measures
+/// puts its whole vocabulary back, and a gutter reading a memo puts back none
+/// of it.
+///
+/// The other direction is the second half: **a version that moves must
+/// re-measure.** Flipping the orientation is the cheapest move available and
+/// the one the layout genuinely depends on, so the fourth pass must lay text
+/// out again — a memo that never rebuilds is a stale gutter, which paints
+/// chrome through a legend.
+#[test]
+fn the_gutter_measures_a_bar_once_until_its_version_moves() {
+    let canvas = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+    let egui_ctx = egui::Context::default();
+    let overlays = OverlayRegistry::with_handlers(crate::sources::all());
+    let mut pane = PaneState::new();
+    let ids: Vec<LayerId> = overlays.handlers().map(|h| h.id()).collect();
+    for id in ids {
+        pane.set_overlay_enabled(id, true);
+    }
+    pane.hydrate_layer_states(&overlays, 0);
+    let preferences = UserPreferences::default();
+
+    /// One pass that measures the gutter, returning `(gutter, galleys epaint
+    /// had to lay out)`. `None` runs a pass that draws nothing, which is what
+    /// clears the galley cache between the two readings.
+    fn pass(
+        egui_ctx: &egui::Context,
+        canvas: egui::Rect,
+        ask: Option<(bool, &PaneState, &OverlayRegistry, &UserPreferences)>,
+    ) -> (f32, usize) {
+        egui_ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(canvas),
+            ..Default::default()
+        });
+        let painter = egui::Painter::new(egui_ctx.clone(), egui::LayerId::background(), canvas);
+        let before = egui_ctx.fonts(|f| f.num_galleys_in_cache());
+        let gutter = ask.map_or(0.0, |(horizontal, pane, overlays, prefs)| {
+            color_scale_gutter(&painter, canvas, horizontal, 0, pane, overlays, prefs)
+        });
+        let laid_out = egui_ctx
+            .fonts(|f| f.num_galleys_in_cache())
+            .saturating_sub(before);
+        let _ = egui_ctx.end_pass();
+        (gutter, laid_out)
+    }
+
+    let vertical = Some((false, &pane, &overlays, &preferences));
+    let (cold_gutter, cold) = pass(&egui_ctx, canvas, vertical);
+    // A pass that uses nothing: epaint drops every galley it held.
+    let (_, idle) = pass(&egui_ctx, canvas, None);
+    let (warm_gutter, warm) = pass(&egui_ctx, canvas, vertical);
+    let (flipped_gutter, flipped) = pass(
+        &egui_ctx,
+        canvas,
+        Some((true, &pane, &overlays, &preferences)),
+    );
+
+    // Printed whether or not the assertions fire: the figures are the finding.
+    eprintln!(
+        "one pane, every layer on: cold {cold} layouts (gutter {cold_gutter:.1} pt), \
+         idle {idle}, warm {warm} (gutter {warm_gutter:.1} pt), \
+         flipped {flipped} (gutter {flipped_gutter:.1} pt)"
+    );
+
+    assert!(
+        cold > 1,
+        "premise: the first measurement laid out {cold} strings, so a second \
+         one repeating it would be invisible in the count below",
+    );
+    assert_eq!(
+        idle, 0,
+        "premise: a pass that asked for nothing laid out {idle} strings, so \
+         this fixture is not measuring the gutter alone",
+    );
+    assert_eq!(
+        warm, 0,
+        "the gutter laid {warm} strings out a second time for a bar whose \
+         thresholds, unit label, orientation and pixel grid had not moved. It \
+         runs `panes + 2` times a frame and each layout allocates a `String` \
+         from a `&str` the caller already holds and takes a `Context::fonts` \
+         write lock.",
+    );
+    assert_eq!(
+        warm_gutter, cold_gutter,
+        "the memoised gutter answered {warm_gutter} where measuring answered \
+         {cold_gutter}: the memo is not returning what the measurement does",
+    );
+    assert!(
+        flipped > 0,
+        "flipping the gutter from vertical to horizontal laid out nothing, so \
+         the memo is answering across a version it does not cover. A stale \
+         gutter is chrome painted through a legend.",
+    );
+    assert_ne!(
+        flipped_gutter, warm_gutter,
+        "a horizontal gutter and a vertical one over the same bars both came \
+         back {flipped_gutter}. The two measure different things — a row's \
+         height against the widest tick — so one of them is a memo answering \
+         for the other, and the count above is not the only way that shows.",
     );
 }

@@ -2160,19 +2160,11 @@ pub(super) fn color_scale_gutter(
     // switched off (`PaneState::color_bar_shown`) frees its slot rather than
     // leaving a gap, exactly as the painters place them. Every one is
     // measured, not the innermost alone.
-    let product = pane.selected_product();
     let radar_shown = radar_bar_drawn(pane);
     let mut reach = 0.0_f32;
     let mut slots = 0usize;
     if radar_shown {
-        let ticks = memoized_ticks(measure.ctx(), pane, prefs);
-        reach = legend_block_reach(
-            measure,
-            horizontal,
-            0.0,
-            &ticks,
-            crate::field_facts::unit_label(&product, prefs),
-        );
+        reach = SCALE_BAR_WIDTH + memoized_radar_reach(measure, horizontal, pane, prefs);
         slots = 1;
     }
     let view = pane.view(pane_idx);
@@ -2188,14 +2180,9 @@ pub(super) fn color_scale_gutter(
         }
         let offset = slots as f32 * (SCALE_BAR_WIDTH + SCALE_STACK_GAP);
         slots += 1;
-        let ticks = memoized_overlay_ticks(measure.ctx(), id, &overlay);
-        reach = reach.max(legend_block_reach(
-            measure,
-            horizontal,
-            offset,
-            &ticks,
-            overlay.items.unit_label,
-        ));
+        reach = reach.max(
+            offset + SCALE_BAR_WIDTH + memoized_overlay_reach(measure, horizontal, id, &overlay),
+        );
     }
     if slots == 0 {
         return 0.0;
@@ -2248,16 +2235,17 @@ fn laid_out_width(measure: &egui::Painter, text: &str, size: f32) -> f32 {
         .width()
 }
 
-/// How far in from the pane edge one bar's block reaches: the bar itself, the
-/// value labels read against it, and the unit title centred on it.
-fn legend_block_reach(
+/// How far past its own bar one legend block reaches: the value labels read
+/// against the bar, and the unit title centred on it. The bar's width and the
+/// slot it stands in are the caller's arithmetic — **only this half lays any
+/// text out**, which is what makes it the half worth memoising.
+fn legend_block_past_the_bar(
     measure: &egui::Painter,
     horizontal: bool,
-    offset: f32,
     ticks: &[String],
     title: &str,
 ) -> f32 {
-    let past_the_bar = if horizontal {
+    if horizontal {
         let row = measure
             .layout_no_wrap(
                 "0".to_owned(),
@@ -2279,8 +2267,7 @@ fn legend_block_reach(
             .fold(0.0_f32, f32::max);
         let title = laid_out_width(measure, title, SCALE_TITLE_FONT_SIZE);
         (SCALE_LABEL_GAP + widest).max((title - SCALE_BAR_WIDTH) / 2.0)
-    };
-    offset + SCALE_BAR_WIDTH + past_the_bar
+    }
 }
 
 /// The part of `pane_rect` the colour scale has *not* claimed: where a pane's
@@ -2403,6 +2390,79 @@ fn memoized_ticks(
         egui::Id::new(("squallar::legend_ticks::radar", product.as_str())),
         prefs.clone(),
         || legend_ticks(&product, prefs),
+    )
+}
+
+/// **The radar bar's block reach, measured at most once per version.**
+///
+/// [`color_scale_gutter`] runs `panes + 2` times a frame and every run laid
+/// every threshold of every bar out to answer one `f32`. epaint's galley cache
+/// spares the *layout* on the second and later calls; it does not spare the
+/// `String` [`laid_out_width`] allocates from a `&str` the caller already
+/// holds, nor the `Context::fonts` write lock each one takes. So the
+/// measurement is memoised rather than its galleys.
+///
+/// **The version names every input the measurement reads.** The ticks are a
+/// function of `(product, prefs)` — the key [`memoized_ticks`] is already
+/// built on — the title is `unit_label(product, prefs)`, and the layout is a
+/// function of the orientation and of the pixel grid the glyphs are rasterised
+/// on. `pixels_per_point` is therefore in the key: a window dragged to a
+/// display with a different scale factor re-measures.
+///
+/// The tick lookup sits *inside* the closure on purpose, so a memo hit skips
+/// that `ctx.data` read too.
+fn memoized_radar_reach(
+    measure: &egui::Painter,
+    horizontal: bool,
+    pane: &PaneState,
+    prefs: &UserPreferences,
+) -> f32 {
+    let ctx = measure.ctx();
+    let product = pane.selected_product();
+    let title = crate::field_facts::unit_label(&product, prefs);
+    legend_ramp::measured(
+        ctx,
+        egui::Id::new(("squallar::legend_reach::radar", product.as_str())),
+        (
+            horizontal,
+            prefs.clone(),
+            title,
+            ctx.pixels_per_point().to_bits(),
+        ),
+        || {
+            let ticks = memoized_ticks(ctx, pane, prefs);
+            legend_block_past_the_bar(measure, horizontal, &ticks, title)
+        },
+    )
+}
+
+/// **One overlay bar's block reach, measured at most once per version.**
+///
+/// [`memoized_radar_reach`]'s half of the same cut, keyed on the signature the
+/// legend already carries rather than on prefs: an overlay's thresholds are
+/// the handler's, and the unit label is a `&'static str` put in the key beside
+/// it rather than assumed to be covered by the signature.
+fn memoized_overlay_reach(
+    measure: &egui::Painter,
+    horizontal: bool,
+    id: &LayerId,
+    legend: &Signed<OverlayLegend>,
+) -> f32 {
+    let ctx = measure.ctx();
+    let title = legend.items.unit_label;
+    legend_ramp::measured(
+        ctx,
+        egui::Id::new(("squallar::legend_reach::overlay", id.as_str())),
+        (
+            horizontal,
+            legend.signature,
+            title,
+            ctx.pixels_per_point().to_bits(),
+        ),
+        || {
+            let ticks = memoized_overlay_ticks(ctx, id, legend);
+            legend_block_past_the_bar(measure, horizontal, &ticks, title)
+        },
     )
 }
 

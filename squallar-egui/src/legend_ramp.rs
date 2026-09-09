@@ -22,6 +22,13 @@ struct Labels<K> {
     labels: Arc<Vec<String>>,
 }
 
+/// A memoized measurement, and the version key it was measured at.
+#[derive(Clone)]
+struct Measured<K> {
+    version: K,
+    value: f32,
+}
+
 /// Look a ramp up, baking it if the slot is empty or holds a different
 /// signature.
 pub(crate) fn ramp(
@@ -112,6 +119,38 @@ where
         );
     });
     built
+}
+
+/// A memoized **text measurement**, remeasured when `version` stops matching.
+///
+/// [`labels`]'s shape for the other half of a colour bar's per-frame text
+/// cost. A list of labels is cheap to hold and expensive to format; the width
+/// they lay out to is one `f32` and expensive to *measure* — every
+/// `Painter::layout_no_wrap` allocates a `String` from a `&str` the caller
+/// already holds and takes a `Context::fonts` write lock, for glyph metrics
+/// that cannot move while `version` holds still.
+///
+/// **The version key must name every input the measurement reads**, the font
+/// metrics included: `pixels_per_point` changes the pixel grid the glyphs are
+/// rasterised on and therefore the advances the layout sums, so it belongs in
+/// the key of any caller that memoises a width across frames.
+pub(crate) fn measured<K>(
+    ctx: &egui::Context,
+    slot: egui::Id,
+    version: K,
+    measure: impl FnOnce() -> f32,
+) -> f32
+where
+    K: PartialEq + Clone + Send + Sync + 'static,
+{
+    if let Some(memo) = ctx.data(|d| d.get_temp::<Measured<K>>(slot))
+        && memo.version == version
+    {
+        return memo.value;
+    }
+    let value = measure();
+    ctx.data_mut(|d| d.insert_temp(slot, Measured { version, value }));
+    value
 }
 
 #[cfg(test)]
@@ -240,5 +279,33 @@ mod tests {
             builds, 3,
             "the memo is one entry per slot — going back rebuilds, by design",
         );
+    }
+
+    /// A measurement is taken once until the version key moves.
+    ///
+    /// [`labels_are_built_once_until_the_version_moves`]' question for
+    /// [`measured`], and the reason it is asked separately: the value is a
+    /// plain `f32` rather than an `Arc`, so a memo that quietly re-measured
+    /// would hand back an *equal* answer and nothing about the answer would
+    /// say so. Only the build count can.
+    #[test]
+    fn a_measurement_is_taken_once_until_the_version_moves() {
+        let ctx = egui::Context::default();
+        let mut takes = 0;
+        let ask = |version: u64, takes: &mut i32| {
+            measured(&ctx, slot("measured"), version, || {
+                *takes += 1;
+                7.5
+            })
+        };
+
+        assert_eq!(ask(1, &mut takes), 7.5, "the first ask must measure");
+        assert_eq!(ask(1, &mut takes), 7.5, "and the second must answer alike");
+        assert_eq!(takes, 1, "the second ask must be answered from the memo");
+
+        let _ = ask(2, &mut takes);
+        assert_eq!(takes, 2, "a version change must re-measure");
+        let _ = ask(2, &mut takes);
+        assert_eq!(takes, 2, "and then be memoized in its turn");
     }
 }
