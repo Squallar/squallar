@@ -36,6 +36,16 @@
 //!   answers; see `squallar_egui::label_cache`.
 //! * [`Totals::mesh_draws`] — **paint callbacks pushed for fill runs**, one
 //!   per run per tile per frame. The floor under the first figure's zero.
+//! * [`Totals::ground_shapes`] — **shapes the ground phase handed the
+//!   painter**, and so what reaches `Context::tessellate` from the ground.
+//!   The parent the two figures below are cuts of. Its denominator is TILES
+//!   AND FRAMES; it is never divided into a vertex figure.
+//! * [`Totals::stroke_run_meshes`] and [`Totals::stroke_mesh_vertices`] —
+//!   **stroke runs a painterless pass drew from the buffers they were already
+//!   tessellated into**, and the vertices those meshes carried. A floor strip
+//!   is the pass that ships. These are what `path_points_placed` fell to, and
+//!   the two are never added: one counts path points, the other tessellated
+//!   vertices.
 //! * [`Totals::stroke_draws`] — **paint callbacks pushed for stroke runs**,
 //!   likewise one per run per tile per frame, and the floor under the
 //!   *second* figure's zero. A stroke run covers a span of consecutive paths,
@@ -55,6 +65,9 @@ static LABEL_ANCHORS_PLACED: AtomicU64 = AtomicU64::new(0);
 static LABEL_SOLVES: AtomicU64 = AtomicU64::new(0);
 static MESH_DRAWS: AtomicU64 = AtomicU64::new(0);
 static STROKE_DRAWS: AtomicU64 = AtomicU64::new(0);
+static STROKE_RUN_MESHES: AtomicU64 = AtomicU64::new(0);
+static STROKE_MESH_VERTICES: AtomicU64 = AtomicU64::new(0);
+static GROUND_SHAPES: AtomicU64 = AtomicU64::new(0);
 static MESH_UPLOADS: AtomicU64 = AtomicU64::new(0);
 static MESH_UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
 static MESH_EVICTIONS: AtomicU64 = AtomicU64::new(0);
@@ -72,6 +85,27 @@ pub struct Totals {
     pub label_solves: u64,
     pub mesh_draws: u64,
     pub stroke_draws: u64,
+    /// Stroke runs a pass with no painter drew from the buffers they were
+    /// already tessellated into, rather than by putting their paths back
+    /// through epaint. One per run per tile per frame; see
+    /// [`Totals::stroke_mesh_vertices`] for what they cost.
+    pub stroke_run_meshes: u64,
+    /// **Vertices those meshes carry.** The relocation half of the pair: the
+    /// figure [`Totals::path_points_placed`] must not simply have moved into.
+    /// The two are different quantities with different denominators -- path
+    /// POINTS against tessellated VERTICES, four or three of the second per
+    /// one of the first on epaint's two branches -- so they are never
+    /// subtracted from one another. What they say together is that the
+    /// per-frame work fell from tessellating the points to copying the
+    /// vertices.
+    pub stroke_mesh_vertices: u64,
+    /// **Shapes the ground phase handed the painter**, over every tile of
+    /// every pane: the parent total the two figures above are cuts of, and
+    /// what actually reaches `Context::tessellate` from the ground. Counted
+    /// once per tile off the length of the list, so a callback, a mesh and a
+    /// path each count one. A cut that moved work rather than removing it
+    /// leaves this unchanged.
+    pub ground_shapes: u64,
     pub mesh_uploads: u64,
     pub mesh_upload_bytes: u64,
     pub mesh_evictions: u64,
@@ -117,6 +151,18 @@ pub fn note_stroke_draws(n: u64) {
     STROKE_DRAWS.fetch_add(n, Relaxed);
 }
 
+/// Stroke runs this tile drew from its pre-tessellated buffers, and the
+/// vertices they carried. One call per tile.
+pub fn note_stroke_run_meshes(runs: u64, vertices: u64) {
+    STROKE_RUN_MESHES.fetch_add(runs, Relaxed);
+    STROKE_MESH_VERTICES.fetch_add(vertices, Relaxed);
+}
+
+/// Shapes this tile handed the painter. One call per tile.
+pub fn note_ground_shapes(n: u64) {
+    GROUND_SHAPES.fetch_add(n, Relaxed);
+}
+
 /// One tile's buffers crossed to the GPU. Called by the renderer.
 pub fn note_mesh_upload(bytes: u64) {
     MESH_UPLOADS.fetch_add(1, Relaxed);
@@ -152,6 +198,8 @@ impl Totals {
             .wrapping_add(self.label_solves)
             .wrapping_add(self.mesh_draws)
             .wrapping_add(self.stroke_draws)
+            .wrapping_add(self.stroke_run_meshes)
+            .wrapping_add(self.ground_shapes)
             .wrapping_add(self.mesh_uploads)
             .wrapping_add(self.mesh_evictions)
             .wrapping_add(self.mesh_store_missing)
@@ -181,6 +229,9 @@ pub fn totals() -> Totals {
         label_solves: LABEL_SOLVES.load(Relaxed),
         mesh_draws: MESH_DRAWS.load(Relaxed),
         stroke_draws: STROKE_DRAWS.load(Relaxed),
+        stroke_run_meshes: STROKE_RUN_MESHES.load(Relaxed),
+        stroke_mesh_vertices: STROKE_MESH_VERTICES.load(Relaxed),
+        ground_shapes: GROUND_SHAPES.load(Relaxed),
         mesh_uploads: MESH_UPLOADS.load(Relaxed),
         mesh_upload_bytes: MESH_UPLOAD_BYTES.load(Relaxed),
         mesh_evictions: MESH_EVICTIONS.load(Relaxed),
@@ -203,6 +254,9 @@ pub(crate) fn reset() {
         &LABEL_SOLVES,
         &MESH_DRAWS,
         &STROKE_DRAWS,
+        &STROKE_RUN_MESHES,
+        &STROKE_MESH_VERTICES,
+        &GROUND_SHAPES,
         &MESH_UPLOADS,
         &MESH_UPLOAD_BYTES,
         &MESH_EVICTIONS,

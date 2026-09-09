@@ -298,6 +298,85 @@ impl TileMeshes {
         self.feathering
     }
 
+    /// **One stroke run's triangles, placed** — the mesh the GPU pipeline
+    /// would have drawn, built on this thread instead.
+    ///
+    /// The arithmetic is the shader's own line, `scale * pos + translation +
+    /// offset`, so what comes back is the run's vertices at the same screen
+    /// positions the callback route would have put them, in the same order,
+    /// with the same indices and the same colours.
+    ///
+    /// **For the pass that has no painter to hand the run to.** A floor strip
+    /// is the one of those that ships: its primitives are copied into the
+    /// mirror with every callback swapped for an empty mesh, so it cannot draw
+    /// a run through one — see
+    /// `crate::ui_map_pane::PaneRenderCtx::ground_mesh_painter`. Before this,
+    /// such a pass put the run's `Shape::Path`s back through epaint's
+    /// tessellator on every frame; this hands the tessellator one already
+    /// tessellated mesh instead.
+    ///
+    /// The caller owns the feathering test. These offsets were computed at
+    /// [`Self::feathering`] and are wrong-width roads under any other, exactly
+    /// as they are for the renderer; the two routes decline on the same
+    /// comparison rather than on two spellings of it.
+    ///
+    /// `None` for a fill run, an empty run, or a run whose range is not in
+    /// these buffers.
+    pub fn placed_stroke_mesh(&self, run: MeshRun, place: Placement) -> Option<egui::Mesh> {
+        if run.kind != RunKind::Stroke || run.index_count == 0 {
+            return None;
+        }
+        let index_bytes = stroke::STROKE_INDEX_BYTES as usize;
+        let from = (run.first_index as usize).checked_mul(index_bytes)?;
+        let to = from.checked_add((run.index_count as usize).checked_mul(index_bytes)?)?;
+        let packed = self.stroke_indices.get(from..to)?;
+
+        // The run's own highest index, which is how far into the vertex buffer
+        // this run reaches: indices are rebased onto `first_vertex`, and the
+        // run's vertex count is not carried on `MeshRun` because the renderer
+        // never needs it -- it binds the buffer at the offset and draws.
+        let mut indices: Vec<u32> = Vec::with_capacity(run.index_count as usize);
+        let mut highest = 0u32;
+        for pair in packed.chunks_exact(index_bytes) {
+            let index = u32::from(u16::from_ne_bytes([pair[0], pair[1]]));
+            highest = highest.max(index);
+            indices.push(index);
+        }
+
+        let vertex_bytes = stroke::STROKE_VERTEX_BYTES as usize;
+        let from = (run.first_vertex as usize).checked_mul(vertex_bytes)?;
+        let to = from.checked_add((highest as usize + 1).checked_mul(vertex_bytes)?)?;
+        let packed = self.stroke_vertices.get(from..to)?;
+
+        let mut vertices = Vec::with_capacity(highest as usize + 1);
+        for vertex in packed.chunks_exact(vertex_bytes) {
+            let x = f32::from(i16::from_ne_bytes([vertex[0], vertex[1]]));
+            let y = f32::from(i16::from_ne_bytes([vertex[2], vertex[3]]));
+            let offset_x = f32::from_ne_bytes([vertex[4], vertex[5], vertex[6], vertex[7]]);
+            let offset_y = f32::from_ne_bytes([vertex[8], vertex[9], vertex[10], vertex[11]]);
+            vertices.push(egui::epaint::Vertex {
+                pos: egui::pos2(
+                    place.scale * x + place.translation[0] + offset_x,
+                    place.scale * y + place.translation[1] + offset_y,
+                ),
+                // As the fills': `mvt::render` emits every stroke at the
+                // atlas's reserved opaque-white texel, which is what lets the
+                // renderer's shader omit the texture factor. See
+                // [`TileVertex`].
+                uv: egui::epaint::WHITE_UV,
+                color: egui::Color32::from_rgba_premultiplied(
+                    vertex[12], vertex[13], vertex[14], vertex[15],
+                ),
+            });
+        }
+
+        Some(egui::Mesh {
+            indices,
+            vertices,
+            texture_id: egui::TextureId::default(),
+        })
+    }
+
     /// One stroke vertex, decoded back out of the bytes. Tests only, as
     /// [`Self::vertex`].
     pub fn stroke_vertex(&self, index: usize) -> Option<stroke::StrokeVertex> {

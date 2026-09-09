@@ -447,7 +447,7 @@ fn floor_strip_line(t: &squallar_egui::floor_ledger::Totals) -> String {
 /// The `ground tiles:` running-total line. See [`overlay_raster_line`] for why
 /// this is a value.
 ///
-/// **Seven denominators, none of them added.** `placed` counts fill vertices the
+/// **Ten denominators, none of them added.** `placed` counts fill vertices the
 /// frame thread copied and `stroke pts` counts stroke points it copied — two
 /// halves of one tile's ground phase, reported apart because they reach the
 /// GPU through different vertex formats and a display change can put the
@@ -461,7 +461,7 @@ fn floor_strip_line(t: &squallar_egui::floor_ledger::Totals) -> String {
 /// buffer writes, once per tile lifetime rather than once per frame, and
 /// `resident` is a **level** — the only figure here that goes down.
 ///
-/// `label solves` is the seventh and the only one counted in PANE-FRAMES:
+/// `label solves` is the only one counted in PANE-FRAMES:
 /// times the label phase ran rather than re-painting the solve it made last
 /// frame. It is never divided into `labels`, which counts anchors — what the
 /// two say together is how much of the deferred label work the memo removed,
@@ -471,12 +471,23 @@ fn floor_strip_line(t: &squallar_egui::floor_ledger::Totals) -> String {
 /// `stroke draws` is **appended** rather than placed beside `draws` because
 /// the browser rig parses this line by an unanchored regex
 /// (`.github/browser-rig/drive.py`); a field added at the end leaves every
-/// existing capture where it was.
+/// existing capture where it was. `stroke run meshes`, `stroke mesh verts`
+/// and `shapes` are appended for the same reason.
+///
+/// The last three are the painterless pass's — a floor strip's. `stroke run
+/// meshes` and `stroke mesh verts` count runs drawn from the buffers they
+/// were already tessellated into and the vertices those meshes carried, and
+/// they are what `stroke pts` fell to rather than a second reading of it:
+/// points against tessellated vertices, never added. `shapes` is the parent
+/// of every one of these — what the ground phase handed the painter, and so
+/// what `Context::tessellate` sees of the ground — counted in TILES AND
+/// FRAMES, so no vertex figure is ever divided into it.
 fn ground_tile_line(t: &squallar_egui::tile_mesh::ledger::Totals) -> String {
     format!(
         "ground tiles: {} placed, {} stroke pts, {} labels, {} draws, \
          {} uploads of {} B, {} evicted, {} B resident, {} unrendered, \
-         {} stroke draws, {} label solves",
+         {} stroke draws, {} label solves, {} stroke run meshes, \
+         {} stroke mesh verts, {} shapes",
         t.mesh_vertices_placed,
         t.path_points_placed,
         t.label_anchors_placed,
@@ -488,6 +499,9 @@ fn ground_tile_line(t: &squallar_egui::tile_mesh::ledger::Totals) -> String {
         t.mesh_store_missing,
         t.stroke_draws,
         t.label_solves,
+        t.stroke_run_meshes,
+        t.stroke_mesh_vertices,
+        t.ground_shapes,
     )
 }
 

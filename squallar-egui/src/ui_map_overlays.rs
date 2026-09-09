@@ -545,6 +545,53 @@ fn place_one(
     }
 }
 
+/// Draw a declined **stroke** run from the buffers it was already tessellated
+/// into, instead of putting its paths back through epaint.
+///
+/// **This is the floor strip's cut.** A `GroundOnly` pass has no painter to
+/// hand a run to — its primitives are copied into the mirror with every
+/// callback swapped for an empty mesh
+/// ([`PaneRenderCtx::ground_mesh_painter`](super::pane_render::PaneRenderCtx::ground_mesh_painter)) —
+/// so every run of every tile it draws fell through to
+/// [`place_run_on_cpu`], and a dense tile is hundreds of `Shape::Path`s that
+/// `Context::tessellate` walked again on every frame of a gesture. The
+/// geometry those paths tessellate to was already computed once, at tile
+/// build, in extent space; all that is per-frame about it is the affine, and
+/// [`TileMeshes::placed_stroke_mesh`](crate::tile_mesh::TileMeshes::placed_stroke_mesh)
+/// applies it.
+///
+/// **The feathering test is the same one the renderer makes**, and it is here
+/// for the same reason: the offsets are wrong-width roads under any other
+/// `pixels_per_point`, and a tile whose flatten has not caught up with a
+/// display change goes back to placing its paths until it does. Fills are not
+/// taken — a fill run's shape is already a `Shape::Mesh`, so placing it costs
+/// one transform either way and there is nothing here to win.
+///
+/// `false` when nothing was drawn and the caller must place the run's shapes.
+fn place_run_as_mesh(
+    run: crate::tile_mesh::MeshRun,
+    meshes: &crate::tile_mesh::TileMeshes,
+    ground: &GroundMeshes<'_>,
+    placement: egui::emath::TSTransform,
+    counted: &mut Counted,
+    placed: &mut Vec<egui::Shape>,
+) -> bool {
+    if run.kind != crate::tile_mesh::RunKind::Stroke || meshes.feathering() != ground.feathering {
+        return false;
+    }
+    let place = crate::tile_mesh::Placement {
+        scale: placement.scaling,
+        translation: [placement.translation.x, placement.translation.y],
+    };
+    let Some(mesh) = meshes.placed_stroke_mesh(run, place) else {
+        return false;
+    };
+    counted.stroke_run_meshes += 1;
+    counted.stroke_mesh_vertices += mesh.vertices.len() as u64;
+    placed.push(egui::Shape::mesh(mesh));
+    true
+}
+
 /// Place every shape a declined run would have drawn, each at its own place
 /// among the shapes.
 ///
@@ -697,29 +744,20 @@ fn take_run_batch(
                 // The renderer refused the span outright. Every run in it goes
                 // back on the CPU, in order, exactly as a per-run decline does.
                 for index in at..reach {
-                    place_run_on_cpu(
-                        meshes.runs()[index],
-                        shapes,
-                        placement,
-                        rect,
-                        counted,
-                        placed,
-                        labels,
-                    );
+                    let run = meshes.runs()[index];
+                    if place_run_as_mesh(run, meshes, ground, placement, counted, placed) {
+                        continue;
+                    }
+                    place_run_on_cpu(run, shapes, placement, rect, counted, placed, labels);
                 }
             }
             at = reach;
             continue;
         }
-        place_run_on_cpu(
-            meshes.runs()[at],
-            shapes,
-            placement,
-            rect,
-            counted,
-            placed,
-            labels,
-        );
+        let run = meshes.runs()[at];
+        if !place_run_as_mesh(run, meshes, ground, placement, counted, placed) {
+            place_run_on_cpu(run, shapes, placement, rect, counted, placed, labels);
+        }
         at += 1;
     }
 }
@@ -929,6 +967,7 @@ fn paint_vector_tile(
         }
     }
 
+    counted.ground_shapes = placed.len() as u64;
     counted.report();
     painter.extend(placed);
 }
@@ -941,6 +980,12 @@ struct Counted {
     label_anchors: u64,
     mesh_draws: u64,
     stroke_draws: u64,
+    stroke_run_meshes: u64,
+    stroke_mesh_vertices: u64,
+    /// Shapes handed to the painter — the parent the rest are cuts of, set
+    /// from the list's length after the walk rather than incremented, so
+    /// nothing can count itself into it twice.
+    ground_shapes: u64,
 }
 
 impl Counted {
@@ -951,6 +996,8 @@ impl Counted {
         ledger::note_label_anchors_placed(self.label_anchors);
         ledger::note_mesh_draws(self.mesh_draws);
         ledger::note_stroke_draws(self.stroke_draws);
+        ledger::note_stroke_run_meshes(self.stroke_run_meshes, self.stroke_mesh_vertices);
+        ledger::note_ground_shapes(self.ground_shapes);
     }
 }
 
@@ -3402,19 +3449,31 @@ mod tests {
     /// `ground_fills_stop_being_placed_on_the_cpu_while_labels_still_place`,
     /// and **RED on the unmodified baseline**, where the flatten had no stroke
     /// arm at all and every stroke point was copied on the frame thread every
-    /// frame. The `without` arm is the same tile at the same feathering with
-    /// no painter, so the zero is a move and not an absence.
+    /// frame.
+    ///
+    /// **The `without` arm is a tile with no stroke runs**, and it has to be:
+    /// a painterless pass over a tile that *has* them no longer places its
+    /// points either, because it draws them from the buffers they were already
+    /// tessellated into (`place_run_as_mesh`). What still places points is a
+    /// tile flattened where the stroke arm produced no run at all, which
+    /// [`NO_FEATHERING`] gives, so the zero below remains a move and not an
+    /// absence.
     #[test]
     fn ground_strokes_stop_being_placed_on_the_cpu() {
         let _ledger = ledger_guard();
 
-        let (_, without) = one_ground_pass_at(None, FEATHERING, FEATHERING);
+        let (_, without) = one_ground_pass_at(None, NO_FEATHERING, FEATHERING);
         assert!(
             without.path_points_placed > 0,
             "non-triviality: the CPU path placed no stroke points either, so \
              the zero below would prove nothing"
         );
         assert_eq!(without.stroke_draws, 0, "no painter, no stroke draws");
+        assert_eq!(
+            without.stroke_run_meshes, 0,
+            "non-triviality: the `without` arm materialised a run, so its \
+             points were never the CPU-placed ones this compares against"
+        );
 
         let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> =
             std::sync::Arc::new(RecordingPainter::default());
@@ -3432,6 +3491,171 @@ mod tests {
             with.label_anchors_placed > 0,
             "the labels stopped placing, so the zero above is a tile pass \
              that did not run rather than a stroke that moved to the GPU"
+        );
+    }
+
+    /// Paths in the dense fixture's single stroke run — enough that the shape
+    /// count this run collapses to is unmistakably a collapse and not noise.
+    /// A real city-core tile carries 708 of them
+    /// (`tile_mesh::fixture_tests`); this is the same shape in miniature.
+    const DENSE_RUN_PATHS: usize = 64;
+
+    /// A tile whose ground is one fill and then a **run of many** strokes,
+    /// with a label after them.
+    ///
+    /// Nothing that draws sits between the paths, so `flatten` puts all of
+    /// them in one run — which is what a styled city tile does and what
+    /// [`a_styled_tile`]'s single path cannot show.
+    fn a_tile_with_a_dense_stroke_run() -> Vec<ShapeOrText> {
+        let mut mesh = egui::epaint::Mesh::default();
+        mesh.add_rect_with_uv(
+            egui::Rect::from_min_size(egui::pos2(8.0, 8.0), egui::vec2(64.0, 64.0)),
+            egui::Rect::from_min_max(egui::epaint::WHITE_UV, egui::epaint::WHITE_UV),
+            egui::Color32::RED,
+        );
+        let mut shapes = vec![ShapeOrText::Shape(egui::Shape::Mesh(mesh.into()))];
+        for step in 0..DENSE_RUN_PATHS {
+            let at = 16.0 + step as f32;
+            shapes.push(ShapeOrText::Shape(egui::Shape::line(
+                vec![egui::pos2(at, 0.0), egui::pos2(at, EXTENT)],
+                egui::Stroke::new(DENSE_RUN_WIDTH, egui::Color32::GREEN),
+            )));
+        }
+        shapes.push(ShapeOrText::Text(Text::new(
+            egui::pos2(EXTENT / 2.0, EXTENT / 2.0),
+            "Monaco".to_owned(),
+            12.0,
+            egui::Color32::WHITE,
+            0.0,
+        )));
+        shapes
+    }
+
+    /// The dense fixture's stroke width, in points. Thick enough at
+    /// [`FEATHERING`] to take epaint's thick branch, which is the one a real
+    /// road takes.
+    const DENSE_RUN_WIDTH: f32 = 2.0;
+
+    /// **A pass with no painter draws its stroke runs from the buffers they
+    /// were already tessellated into, instead of putting their paths back
+    /// through the tessellator.**
+    ///
+    /// **The floor strip's cut.** A `GroundOnly` pass has no painter — its
+    /// primitives are copied into the mirror with every callback swapped for
+    /// an empty mesh — so every run of every tile it draws used to fall back
+    /// to placing the run's `Shape::Path`s, and `Context::tessellate` walked
+    /// all of them again on every frame of a gesture. The geometry was already
+    /// computed once, at tile build.
+    ///
+    /// **The before arm is the same tile with the same runs**, declined by the
+    /// feathering guard rather than by having no runs, so what it reports is
+    /// exactly what this pass did before this cut.
+    ///
+    /// **It fails in both directions.** A cut that simply stopped drawing
+    /// would take `ground_shapes` to one and pass a count assertion; the
+    /// vertex equality below is against epaint's own arithmetic for this
+    /// stroke — [`crate::tile_mesh::stroke::vertices_per_path_point`] times
+    /// the points the paths carry — so a run that lost its geometry, or drew
+    /// it twice, moves it.
+    ///
+    /// RED on the unmodified baseline: `stroke_run_meshes` reads 0 and
+    /// `ground_shapes` reads the path count.
+    #[test]
+    fn a_painterless_pass_draws_a_stroke_run_from_the_buffers_it_was_tessellated_into() {
+        let _ledger = ledger_guard();
+
+        let shapes = a_tile_with_a_dense_stroke_run();
+        let flat = crate::tile_mesh::flatten(&shapes, FEATHERING);
+        let runs: Vec<crate::tile_mesh::MeshRun> = flat
+            .runs()
+            .iter()
+            .filter(|run| run.kind == crate::tile_mesh::RunKind::Stroke)
+            .copied()
+            .collect();
+        assert_eq!(
+            runs.len(),
+            1,
+            "fixture: the paths did not flatten into one stroke run, so the \
+             collapse below is not the collapse under test"
+        );
+        assert_eq!(
+            runs[0].shape_span as usize, DENSE_RUN_PATHS,
+            "fixture: the run covers {} of the {DENSE_RUN_PATHS} paths",
+            runs[0].shape_span
+        );
+
+        // Before: the same tile, the same runs, declined by the feathering
+        // guard — which is what every painterless pass did to every run.
+        let (_, before) = one_ground_pass_of(shapes.clone(), None, FEATHERING, FEATHERING / 2.0);
+        assert_eq!(
+            before.stroke_run_meshes, 0,
+            "the before arm materialised a run, so it is not the before arm"
+        );
+        assert!(
+            before.path_points_placed > 0,
+            "non-triviality: the before arm placed no stroke points, so the \
+             zero below would prove nothing"
+        );
+        assert_eq!(
+            before.ground_shapes,
+            DENSE_RUN_PATHS as u64 + 1,
+            "the before arm handed the tessellator {} shapes, not the fill \
+             plus one per path",
+            before.ground_shapes
+        );
+
+        let (emitted, after) = one_ground_pass_of(shapes, None, FEATHERING, FEATHERING);
+
+        assert_eq!(
+            after.path_points_placed, 0,
+            "stroke points are still being copied on the frame thread"
+        );
+        assert_eq!(
+            after.stroke_run_meshes, 1,
+            "the run was not drawn from the buffers it was tessellated into"
+        );
+        assert_eq!(
+            after.ground_shapes, 2,
+            "the ground handed the tessellator {} shapes; the tile is a fill \
+             and a run, so it is two",
+            after.ground_shapes
+        );
+
+        // The picture, not the count: every vertex the paths tessellate to is
+        // in the mesh, by epaint's own arithmetic for this stroke.
+        let per_point = u64::from(crate::tile_mesh::stroke::vertices_per_path_point(
+            DENSE_RUN_WIDTH,
+            FEATHERING,
+        ));
+        assert_eq!(
+            after.stroke_mesh_vertices,
+            before.path_points_placed * per_point,
+            "the run's mesh carries {} vertices against the {} epaint \
+             tessellates {} path points to",
+            after.stroke_mesh_vertices,
+            before.path_points_placed * per_point,
+            before.path_points_placed
+        );
+        assert_eq!(
+            after.label_anchors_placed, before.label_anchors_placed,
+            "the label stopped placing, so the figures above are a tile pass \
+             that did not run"
+        );
+
+        // And it draws where the style put it: the fill, then the run over it.
+        let kinds: Vec<&'static str> = emitted
+            .iter()
+            .map(|clipped| match &clipped.shape {
+                egui::Shape::Mesh(_) => "mesh",
+                egui::Shape::Path(_) => "path",
+                egui::Shape::Text(_) => "text",
+                other => panic!("unexpected shape {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["mesh", "mesh", "text"],
+            "the run did not draw as one mesh in the fill's wake"
         );
     }
 
@@ -3996,15 +4220,26 @@ mod tests {
             feathering: FEATHERING,
             opacity: 1.0,
         };
-        for (name, ground) in [("planned", planned), ("un-planned", GroundMeshes::CPU_ONLY)] {
+        // **The two arms differ by one shape KIND and by nothing else.** The
+        // planned arm has the tile's flattened buffers, so its declined stroke
+        // run is materialised into the mesh those buffers already hold
+        // (`place_run_as_mesh`) and arrives as a third `Shape::Mesh` where the
+        // un-planned arm, which has no buffers to materialise from, still
+        // places the `Shape::Path`. Same geometry either way; what this test
+        // is about is the rectangle, and in both arms hoisting removes exactly
+        // it.
+        for (name, ground, meshes, paths) in [
+            ("planned", planned, 3, 0),
+            ("un-planned", GroundMeshes::CPU_ONLY, 2, 1),
+        ] {
             assert_eq!(
                 counts(ground, Background::Inline),
-                (1, 2, 1, 1),
+                (1, meshes, paths, 1),
                 "{name}: the control, inline, does not draw the tile as itself"
             );
             assert_eq!(
                 counts(ground, Background::Hoisted),
-                (0, 2, 1, 1),
+                (0, meshes, paths, 1),
                 "{name}: hoisted, the tile drew its background a second time or \
                  lost something else"
             );

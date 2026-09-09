@@ -494,6 +494,148 @@ fn the_offsets_reproduce_epaints_own_tessellation() {
     );
 }
 
+/// **The mesh the painterless pass draws is epaint's own tessellation** — the
+/// picture proof under [`TileMeshes::placed_stroke_mesh`].
+///
+/// A floor strip has no painter to hand a run to, so before this its runs went
+/// back through epaint's tessellator on every frame. This runs epaint's real
+/// tessellator over every covered path of a real tile, *placed*, concatenates
+/// the meshes in the order the run draws them, and compares the whole thing
+/// against the one mesh the run is now materialised into: indices, colours and
+/// uvs exactly, positions to within the ulp
+/// [`the_offsets_reproduce_epaints_own_tessellation`] pins.
+///
+/// **Both of epaint's feathered branches**, for the reason that test states.
+///
+/// RED on the unmodified baseline three ways: there is no `placed_stroke_mesh`
+/// at all, and once there is, an index dropped or a lane of the placement
+/// arithmetic left off moves the comparison.
+#[test]
+fn the_materialised_stroke_mesh_is_epaints_own_tessellation() {
+    let Some(shapes) = monaco_shapes() else {
+        return;
+    };
+
+    let mut reached_thick = 0usize;
+    let mut reached_hairline = 0usize;
+    let mut runs_compared = 0usize;
+
+    for pixels_per_point in [PIXELS_PER_POINT, HAIRLINE_PIXELS_PER_POINT] {
+        let feathering = feathering_at(pixels_per_point);
+        let flat = flatten(&shapes, feathering);
+        let rect = draw_rect();
+        let place = Placement::of(rect);
+        let placement = walkers::mvt::placement(rect);
+        let mut tess = tessellator_at(pixels_per_point);
+        let ulp = f32::EPSILON * rect.max.x.max(rect.max.y);
+
+        // Per arm, never across the two: the arms are the same tile flattened
+        // at two feathering values, so adding them would count each path twice.
+        let mut runs_here = 0usize;
+        let mut paths_replaced = 0usize;
+        let mut vertices_materialised = 0usize;
+
+        for run in flat.runs() {
+            if run.kind != RunKind::Stroke {
+                continue;
+            }
+            let mesh = flat
+                .placed_stroke_mesh(*run, place)
+                .expect("a stroke run materialises");
+
+            // epaint's answer for the whole run, path by path, rebased as the
+            // run's own indices are: onto the run's first vertex.
+            let mut oracle = egui::epaint::Mesh::default();
+            for shape_index in run.shape_index..run.shape_index + run.shape_span {
+                let ShapeOrText::Shape(egui::Shape::Path(placed)) =
+                    shapes[shape_index as usize].placed(placement)
+                else {
+                    continue;
+                };
+                if stroke::vertices_per_path_point(placed.stroke.width, feathering)
+                    == stroke::HAIRLINE_VERTICES_PER_PATH_POINT
+                {
+                    reached_hairline += 1;
+                } else {
+                    reached_thick += 1;
+                }
+                let mut one = egui::epaint::Mesh::default();
+                tess.tessellate_path(&placed, &mut one);
+                oracle.append(one);
+            }
+            assert!(
+                !oracle.vertices.is_empty(),
+                "epaint tessellated run {run:?} to nothing, so the comparison \
+                 below is vacuous"
+            );
+
+            assert_eq!(
+                mesh.indices, oracle.indices,
+                "run {run:?}'s materialised indices are not epaint's"
+            );
+            assert_eq!(
+                mesh.vertices.len(),
+                oracle.vertices.len(),
+                "run {run:?} materialised {} vertices against epaint's {}",
+                mesh.vertices.len(),
+                oracle.vertices.len()
+            );
+            assert_eq!(
+                mesh.texture_id,
+                egui::TextureId::default(),
+                "run {run:?}'s mesh samples something other than the font \
+                 atlas, which the ground has no texture in"
+            );
+
+            let mut worst = 0.0f32;
+            for (lane, (ours, expected)) in
+                mesh.vertices.iter().zip(oracle.vertices.iter()).enumerate()
+            {
+                assert_eq!(
+                    ours.color, expected.color,
+                    "run {run:?} vertex {lane}'s colour is not epaint's"
+                );
+                assert_eq!(
+                    ours.uv,
+                    egui::epaint::WHITE_UV,
+                    "run {run:?} vertex {lane} samples off the atlas's opaque \
+                     white texel"
+                );
+                worst = worst
+                    .max((ours.pos.x - expected.pos.x).abs())
+                    .max((ours.pos.y - expected.pos.y).abs());
+            }
+            assert!(
+                worst <= ulp,
+                "at pixels_per_point {pixels_per_point} run {run:?} put a \
+                 vertex {worst} points from where epaint's own tessellator \
+                 put it, more than the {ulp} that is one ulp of the placed \
+                 coordinate"
+            );
+            runs_here += 1;
+            runs_compared += 1;
+            paths_replaced += run.shape_span as usize;
+            vertices_materialised += mesh.vertices.len();
+        }
+        println!(
+            "  pixels_per_point {pixels_per_point}: {runs_here} stroke runs \
+             materialised, replacing {paths_replaced} `Shape::Path`s into the \
+             tessellator, carrying {vertices_materialised} vertices"
+        );
+    }
+
+    assert!(
+        runs_compared > 0,
+        "no stroke run was compared, so this test proves nothing"
+    );
+    assert!(
+        reached_thick > 0 && reached_hairline > 0,
+        "the comparison reached {reached_thick} thick paths and \
+         {reached_hairline} hairline ones; both of epaint's feathered \
+         branches have to be exercised or one of the two arms is unproven"
+    );
+}
+
 /// **Every path is drawn once.** A path inside two runs would draw twice; the
 /// runs must therefore be disjoint, in shape order, and cover only paths.
 #[test]
