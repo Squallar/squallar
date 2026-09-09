@@ -113,3 +113,65 @@ fn a_down_socket_is_retried_regardless_of_other_activity() {
              feed off drops the archive socket and stops reconnecting"
     );
 }
+
+/// **The frame's chunk-feed path reaches the radar layer's control surface
+/// exactly once**, and that once is the fold.
+///
+/// The counted gate is `squallar-egui`'s
+/// (`radar_layer/chunk_controls_fold_tests.rs`): it holds
+/// `chunk_feed_controls` to one walk of the door against the four the single
+/// readers take. That gate cannot see this crate — a dependency's
+/// `#[cfg(test)]` counter is not compiled when the dependency is built as one
+/// — so what is held here is the half that lives on this side: how many times
+/// the two functions of the per-frame path name that door between them.
+///
+/// **It fails in both directions.** A second read added back reads two and
+/// reddens; the arm deleted, or the module renamed out from under it, reads
+/// zero and reddens on the same assertion. The `chunk_feed_controls` presence
+/// control beside it is what stops a zero passing as "one, elsewhere".
+#[test]
+fn the_chunk_feed_path_reads_the_radar_control_surface_once_a_frame() {
+    let chunks = include_str!("../app_chunks.rs");
+    let bodies: String = ["fn drive_chunk_feeds(", "fn drive_chunk_notifications("]
+        .iter()
+        .map(|head| {
+            let start = chunks
+                .find(head)
+                .unwrap_or_else(|| panic!("`{head}` is gone from app_chunks.rs"));
+            let rest = &chunks[start..];
+            let open = rest.find('{').expect("a body");
+            let mut depth = 0usize;
+            for (i, c) in rest[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return rest[open..open + i].to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unbalanced braces in {head}");
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let reads = bodies.matches("squallar_egui::radar_layer::").count();
+    assert_eq!(
+        reads, 1,
+        "the per-frame chunk-feed path names the radar layer's control door \
+         {reads} time(s). Every one of them is a `Gui::layer_controls` walk, \
+         and a walk is a fresh seven-item `Vec` with nine owned `String`s and \
+         a nested `Vec` in it, plus the slot list `Pane::view` collects to \
+         reach it — for three booleans and an endpoint, on a `FRAME_PUMP` \
+         Ingest row that runs every frame. Read them off the one \
+         `ChunkFeedControls` this path already holds"
+    );
+    assert!(
+        bodies.contains("radar_layer::chunk_feed_controls("),
+        "the one read left is not the fold, so the count above says nothing \
+         about how many surfaces this path builds"
+    );
+}

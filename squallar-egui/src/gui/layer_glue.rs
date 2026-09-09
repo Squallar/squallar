@@ -753,6 +753,8 @@ impl Gui {
     /// refused, so a switch that lives inside a handler is read back off the
     /// control it declares for it.
     pub fn layer_controls(&self, kind: &LayerId) -> Vec<ControlItem> {
+        #[cfg(test)]
+        control_walks::record(kind);
         let view = self.panes[self.active_pane].view(self.active_pane);
         self.overlays.controls(kind, &view.layer(kind))
     }
@@ -919,5 +921,38 @@ impl Gui {
             return self.is_any_pane_live();
         }
         self.any_pane_has_overlay_enabled(kind)
+    }
+}
+
+/// **How many times this door has been walked**, per layer — the probe behind
+/// the readers that fold several answers out of one walk.
+///
+/// `#[cfg(test)]` and nothing else: production never increments it, so this is
+/// not a counter that ships. It exists because the cost the fold removes is a
+/// *walk*, and a walk leaves no trace in the value it returns — two spellings
+/// that answer identically can cost four surface builds or one, and only a
+/// count tells them apart.
+#[cfg(test)]
+pub(crate) mod control_walks {
+    use squallar_source::id::LayerId;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static WALKS: RefCell<Vec<LayerId>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn record(kind: &LayerId) {
+        WALKS.with(|w| w.borrow_mut().push(kind.clone()));
+    }
+
+    /// Walks of `kind`'s surface during `body`.
+    ///
+    /// Thread-local, so a suite running tests in parallel does not have to
+    /// serialise on it — each test counts only its own thread's walks.
+    pub(crate) fn during<T>(kind: &LayerId, body: impl FnOnce() -> T) -> (T, usize) {
+        WALKS.with(|w| w.borrow_mut().clear());
+        let value = body();
+        let count = WALKS.with(|w| w.borrow().iter().filter(|id| *id == kind).count());
+        (value, count)
     }
 }

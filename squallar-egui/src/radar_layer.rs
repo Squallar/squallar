@@ -132,6 +132,87 @@ fn control_text<'a>(controls: &'a [ControlItem], id: &str) -> Option<&'a str> {
     })
 }
 
+/// **Everything the chunk-feed path reads off the radar layer's control
+/// surface**, taken in one walk of it.
+///
+/// [`crate::Gui::layer_controls`] is the only door the shell has to a
+/// handler's own fields, and it answers by *building* the surface:
+/// `RadarSource::controls` returns a fresh seven-item `Vec` holding nine owned
+/// `String`s and a nested `Vec`, and `Pane::view` collects a slot list to hand
+/// it. `App::drive_chunk_feeds` asked that door four times a frame — for the
+/// live-chunk switch twice, the notification switch, and the endpoint — for
+/// three booleans and a string. This asks once and keeps all four.
+///
+/// **Not a memo, and it cannot be one.** `live_chunks` is the *active pane's*
+/// answer: `RadarSource::live_chunks_for` reads the pane's own slot config
+/// before falling back to the layer's global. A
+/// [`squallar_source::handler::SourceHandler::layer_state_revision`] says
+/// nothing about per-pane state by construction — its own doc refuses it —
+/// so nothing keyed on one could tell a pane switch from no change at all.
+/// The surface is still walked every frame; it is walked once.
+pub struct ChunkFeedControls {
+    /// [`live_chunks_enabled`]'s answer — the active pane's.
+    pub live_chunks: bool,
+    /// [`chunk_notifications_enabled`]'s answer — the layer's global.
+    pub notifications: bool,
+    /// [`notifier_endpoint`]'s answer: the box's contents with an empty one
+    /// resolved to the built-in, never the raw text.
+    pub notifier_endpoint: String,
+}
+
+/// Read [`ChunkFeedControls`] out of one walk of the radar layer's surface.
+///
+/// The endpoint is **moved** out of the walked item rather than copied off it,
+/// so a box that needs no trimming costs the one `String` `controls` had
+/// already allocated inside itself.
+pub fn chunk_feed_controls(gui: &crate::Gui) -> ChunkFeedControls {
+    // The same fallbacks the four single reads carried, and for the same
+    // reason: a build whose radar layer declares no such control answers as if
+    // the switch were on, which is what the shipped surface says.
+    let mut live_chunks = true;
+    let mut notifications = true;
+    let mut raw_endpoint: Option<String> = None;
+    for item in gui.layer_controls(&POLL_LAYER) {
+        match item {
+            ControlItem::Toggle {
+                id: squallar_radar::source::LIVE_CHUNKS_CONTROL,
+                enabled,
+                ..
+            } => live_chunks = enabled,
+            ControlItem::Toggle {
+                id: squallar_radar::source::CHUNK_NOTIFICATIONS_CONTROL,
+                enabled,
+                ..
+            } => notifications = enabled,
+            ControlItem::TextField {
+                id: squallar_radar::source::NOTIFIER_ENDPOINT_CONTROL,
+                value,
+                ..
+            } => raw_endpoint = Some(value),
+            _ => {}
+        }
+    }
+    ChunkFeedControls {
+        live_chunks,
+        notifications,
+        // `notifier_endpoint`'s rule, spelled over an owned box: empty or all
+        // space means "the one this build ships with", and is not an off
+        // switch.
+        notifier_endpoint: raw_endpoint
+            .filter(|raw| !raw.trim().is_empty())
+            .map_or_else(
+                || squallar_radar::source::DEFAULT_NOTIFIER_ENDPOINT.to_string(),
+                |raw| {
+                    if raw.len() == raw.trim().len() {
+                        raw
+                    } else {
+                        raw.trim().to_string()
+                    }
+                },
+            ),
+    }
+}
+
 /// **Whether live panes should be fed from the real-time chunk bucket.**
 ///
 /// The active pane's radar slot answers and the layer's global is the
@@ -318,3 +399,7 @@ pub fn current_volume_for(entries: &[SourceLiveness], site: &str) -> Option<Curr
 pub fn liveness_entry(live: RadarLiveness) -> SourceLiveness {
     SourceLiveness::new(POLL_LAYER, live)
 }
+
+#[path = "radar_layer/chunk_controls_fold_tests.rs"]
+#[cfg(test)]
+mod chunk_controls_fold_tests;

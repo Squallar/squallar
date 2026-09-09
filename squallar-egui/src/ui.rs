@@ -190,6 +190,10 @@ mod frame;
 #[path = "gui/layer_glue.rs"]
 mod layer_glue;
 pub(crate) use layer_glue::RoundOutcome;
+/// The `#[cfg(test)]` probe over [`Gui::layer_controls`], re-exported the way
+/// `RoundOutcome` is so the module itself stays private.
+#[cfg(test)]
+pub(crate) use layer_glue::control_walks;
 #[path = "gui/sync.rs"]
 mod sync;
 

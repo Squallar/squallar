@@ -14,7 +14,11 @@ impl super::App {
     /// Start or stop feeds so the set matches the sites panes are watching live,
     /// and dispatch a round for any that is due. Called once a frame.
     pub(super) fn drive_chunk_feeds(&mut self) {
-        let enabled = squallar_egui::radar_layer::live_chunks_enabled(&self.gui);
+        // One walk of the radar layer's control surface for the whole path:
+        // this arm and `drive_chunk_notifications` between them asked that
+        // door four times a frame. See `ChunkFeedControls`.
+        let controls = squallar_egui::radar_layer::chunk_feed_controls(&self.gui);
+        let enabled = controls.live_chunks;
         let live = self.gui.live_sites();
         // Published every frame, so the status bar never shows a stale claim.
         let showing = self
@@ -36,7 +40,7 @@ impl super::App {
         }
         // Ahead of the `enabled` gate on purpose: archive pushes matter most when
         // the chunk feed is off, and reconnection runs from here.
-        self.drive_chunk_notifications(&live);
+        self.drive_chunk_notifications(&live, &controls);
         if !enabled {
             // The feeds go with the setting, not merely the rounds: kept, their
             // assemblers serve frozen partial overlays and hold dead volumes.
@@ -95,12 +99,19 @@ impl super::App {
     /// Keep the notification subscriptions matched to the live sites, and turn
     /// anything they said into an early round. A notification never carries data
     /// — it marks the site due and the ordinary poller does the rest.
-    fn drive_chunk_notifications(&mut self, live: &[String]) {
-        // The switch is asked second so that a build with notifications off
-        // counts nothing: it never reaches the endpoint either way, and a step
-        // that was not going to be taken is not one this instrument should
-        // report as taken.
-        if !squallar_egui::radar_layer::chunk_notifications_enabled(&self.gui)
+    fn drive_chunk_notifications(
+        &mut self,
+        live: &[String],
+        controls: &squallar_egui::radar_layer::ChunkFeedControls,
+    ) {
+        // The switch stands first in the `||` so that a build with
+        // notifications off counts nothing: it never reaches the endpoint
+        // either way, and a step that was not going to be taken is not one
+        // this instrument should report as taken. Reading the switch off
+        // `controls` rather than off its own walk does not change that — what
+        // the ordering protects is `may_reach_the_network`'s tally, and it is
+        // still never reached with the switch off.
+        if !controls.notifications
             || !self.may_reach_the_network(crate::app::offline::Origin::NotifierSocket)
         {
             // Drop every socket rather than ignoring them, so the setting off
@@ -112,12 +123,12 @@ impl super::App {
         }
         // Chunk pushes only matter while the live feed runs; archive pushes stand
         // on their own.
-        let chunks = squallar_egui::radar_layer::live_chunks_enabled(&self.gui);
+        let chunks = controls.live_chunks;
         let feeds: &[Feed] = if chunks { &Feed::ALL } else { &[Feed::Archive] };
-        let endpoint = squallar_egui::radar_layer::notifier_endpoint(&self.gui);
+        let endpoint = &controls.notifier_endpoint;
         let window = self.window.clone();
         self.chunk_notify
-            .sync_sites(live, feeds, &endpoint, move || {
+            .sync_sites(live, feeds, endpoint, move || {
                 // From the socket's own thread: else the frame loop can sleep
                 // through the very notification that was supposed to wake it.
                 crate::app::notify_redraw(&window);
