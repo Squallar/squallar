@@ -3081,6 +3081,17 @@ impl super::App {
         // `budget state:` is scraped by a positional regex.
         let holders = self.base_holder_census();
         say_telemetry(loud, &crate::budget_telemetry::base_holder_line(holders));
+        // **And what the loop's decoded cache is holding that no eviction path
+        // can take.** A LEVEL, computed on the residency pass against that
+        // pass's own predicate and read back here — never added to the running
+        // totals above, and its own line for `budget state:`'s regex.
+        say_telemetry(
+            loud,
+            &crate::budget_telemetry::loop_decoded_line(self.loop_decoded),
+        );
+        // Arm the next pass to take a fresh one, so the walk behind it is paid
+        // once a tick rather than once a frame.
+        self.loop_decoded_due = true;
         // **Every distinct decoded volume, counted once across all five
         // holders.** A LEVEL, unlike the two running totals above, and never
         // to be added to them or to the census families below — this is the
@@ -3420,6 +3431,75 @@ impl super::App {
             seen.into_iter()
                 .fold(0u64, |sum, (_, bytes)| sum.saturating_add(bytes)),
         )
+    }
+
+    /// **What the loop's decoded cache is holding that no eviction can take**
+    /// — see [`crate::budget_telemetry::LoopDecodedCensus`] for the five
+    /// figures and their denominators.
+    ///
+    /// `wanted` is the caller's own residency predicate, the very closure
+    /// `evict_decoded_except` was handed, so "unwanted" here means exactly
+    /// what the policy meant by it and not a second spelling of the rule.
+    /// Asked AFTER the eviction passes have run, so every entry it finds
+    /// unwanted is one a guard refused rather than one nobody had got to yet.
+    ///
+    /// # What it costs to ask
+    ///
+    /// No walk of any radial, on the pattern of [`Self::base_holder_census`]:
+    /// the price of each volume is the one the cache took at arrival, the
+    /// archive question is a map lookup, and the co-holder question is a
+    /// pointer compare against the stores that already publish their
+    /// allocations as bare pointers for [`Self::radar_all_union`]. The cache
+    /// is bounded by frame count.
+    pub(crate) fn loop_decoded_census(
+        &self,
+        wanted: impl Fn(&str, &chrono::NaiveDateTime, &nexrad_model::data::Scan) -> bool,
+        now: chrono::NaiveDateTime,
+    ) -> crate::budget_telemetry::LoopDecodedCensus {
+        let mut census = crate::budget_telemetry::LoopDecodedCensus::default();
+        // **Every holder of a decoded volume that is not this cache**, as bare
+        // pointers, built once for the pass. The still inventory's two stores
+        // and the per-site latest come through the inventory's own priced
+        // walk; the chunk feed publishes its own.
+        let elsewhere: Vec<*const nexrad_model::data::Scan> = self
+            .volumes
+            .priced_allocations_with(self.latest_cached_scans.iter().map(
+                |(site, (scan, _, _, _))| (site.as_str(), scan, self.volumes.latest_price(site)),
+            ))
+            .map(|(ptr, _)| ptr)
+            .chain(self.chunk_feeds.held_allocations().map(|(ptr, _)| ptr))
+            .collect();
+        for entry in self.loop_mgr.decoded_entries() {
+            census.volumes += 1;
+            census.bytes = census.bytes.saturating_add(entry.bytes);
+            if entry.has_archive {
+                continue;
+            }
+            census.no_archive += 1;
+            census.no_archive_bytes = census.no_archive_bytes.saturating_add(entry.bytes);
+            if wanted(entry.site, &entry.timestamp, entry.scan) {
+                continue;
+            }
+            census.unwanted += 1;
+            census.unwanted_bytes = census.unwanted_bytes.saturating_add(entry.bytes);
+            if !entry.ever_had_archive {
+                census.never_archived += 1;
+                census.never_archived_bytes =
+                    census.never_archived_bytes.saturating_add(entry.bytes);
+            }
+            // **The volume's own clock, not the address it is filed at**: the
+            // exposure is how long ago the radar flew this volume, and the two
+            // instants are equal on 0 of the 171 local Archive II volumes.
+            let collected =
+                squallar_radar::types::volume_collected_at(entry.scan).unwrap_or(entry.timestamp);
+            let age = now.signed_duration_since(collected).num_seconds().max(0) as u64;
+            census.oldest_unwanted_s = census.oldest_unwanted_s.max(age);
+            if !elsewhere.contains(&std::sync::Arc::as_ptr(entry.scan)) {
+                census.sole += 1;
+                census.sole_bytes = census.sole_bytes.saturating_add(entry.bytes);
+            }
+        }
+        census
     }
 
     /// **What every merge base with gates is holding, and how much of it any
@@ -10641,6 +10721,12 @@ fn render_already_queued<'a>(
 #[path = "app_render/raster_telemetry_line_tests.rs"]
 #[cfg(test)]
 mod raster_telemetry_line_tests;
+
+/// What the loop decoded cache holds that nothing can evict, and what letting
+/// go of one of those volumes costs the reader.
+#[path = "app_render/loop_decoded_census_tests.rs"]
+#[cfg(test)]
+mod loop_decoded_census_tests;
 
 /// The native rig seeds the keys this app reads, into the filenames its store
 /// opens — one scene's path through shell, python and two rust crates.

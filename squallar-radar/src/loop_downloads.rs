@@ -95,6 +95,32 @@ pub type CachedVolume = (
     Arc<crate::nyquist::DeclaredNyquist>,
 );
 
+/// **One decoded volume as a census reads it** — see
+/// [`LoopDownloadManager::decoded_entries`].
+///
+/// Borrowed rather than owned: every field is a figure the cache already
+/// holds, and a census that cloned the volume out to ask about it would be
+/// holding the very allocation it is trying to describe.
+pub struct DecodedEntry<'a> {
+    /// The site this volume is filed under.
+    pub site: &'a str,
+    /// The ADDRESS it is filed at, which is not
+    /// [`crate::types::volume_collected_at`] — the two are equal on 0 of the
+    /// 171 local Archive II volumes.
+    pub timestamp: chrono::NaiveDateTime,
+    pub scan: &'a Arc<nexrad_model::data::Scan>,
+    /// [`crate::scan_size::scan_bytes`], taken at arrival.
+    pub bytes: usize,
+    /// Whether an archive stands behind it, which is exactly whether either
+    /// decoded eviction path may take it at all.
+    pub has_archive: bool,
+    /// Whether one ever did. `has_archive == false && ever_had_archive` is a
+    /// volume whose way back was taken by the archive ceiling: the S3 object
+    /// exists, so re-obtaining it is a download. `!ever_had_archive` is a
+    /// chunk-feed volume, which nothing can re-obtain until the bucket has it.
+    pub ever_had_archive: bool,
+}
+
 /// Whether a frame's Level III objects have arrived.
 #[derive(Debug, PartialEq, Eq)]
 pub enum L3FrameState {
@@ -231,6 +257,23 @@ pub struct LoopDownloadManager {
     /// [`scan_cache`](Self::scan_cache) is addressed, and every mutation of
     /// one is a mutation of the other.
     scan_prices: HashMap<(String, chrono::NaiveDateTime), usize>,
+    /// **Addresses an archive has ever been filed for**, for as long as their
+    /// decoded half is here.
+    ///
+    /// The one thing `archive_cache` cannot answer once its entry has gone:
+    /// whether a resident decoded volume with no way back **never had one** —
+    /// a chunk-feed arrival, whose S3 object this process has never held — or
+    /// **lost it** to [`Self::evict_archives_to_ceiling`], in which case the
+    /// object exists and re-obtaining the volume is a download rather than
+    /// data that cannot be had at all. Those are two different prices for the
+    /// same eviction and a census that could not tell them apart would report
+    /// a fidelity cost where the cost is bandwidth.
+    ///
+    /// A key lives exactly as long as the decoded entry it describes: filed in
+    /// [`Self::cache_archive`], dropped wherever the volume's price row is.
+    /// Two `String`s and a stamp per resident volume, against a volume that
+    /// runs to tens of MiB.
+    archives_ever: std::collections::HashSet<(String, chrono::NaiveDateTime)>,
     /// **What the archive at each address DECODES TO**, as the volume's own
     /// first-radial moment — learned from the decoded half while it was here
     /// and kept for as long as the archive is.
@@ -366,6 +409,7 @@ impl LoopDownloadManager {
             scan_over_arrivals: 0,
             scan_over_arrival_bytes: 0,
             scan_prices: HashMap::new(),
+            archives_ever: std::collections::HashSet::new(),
             archive_identity: HashMap::new(),
             l3_bytes_cached: 0,
         }
@@ -555,6 +599,7 @@ impl LoopDownloadManager {
                 .saturating_sub(Self::archive_price(&was));
         }
         self.archive_bytes_cached = self.archive_bytes_cached.saturating_add(price);
+        self.archives_ever.insert((site.to_string(), ts));
     }
 
     /// Whether the compressed archive for this frame is held, whatever the
@@ -639,6 +684,7 @@ impl LoopDownloadManager {
             archive_cache,
             scan_prices,
             scan_bytes_cached,
+            archives_ever,
             ..
         } = self;
         let mut removed = Vec::new();
@@ -663,6 +709,7 @@ impl LoopDownloadManager {
             if let Some(price) = scan_prices.remove(&key) {
                 *scan_bytes_cached = scan_bytes_cached.saturating_sub(price);
             }
+            archives_ever.remove(&key);
         }
         removed
     }
@@ -764,11 +811,46 @@ impl LoopDownloadManager {
             }
             // The price row leaves with the volume, so a later re-decode
             // files a fresh one rather than double-charging this cache.
-            self.scan_prices.remove(&(site, ts));
+            self.scan_prices.remove(&(site.clone(), ts));
+            self.archives_ever.remove(&(site, ts));
             self.scan_bytes_cached = self.scan_bytes_cached.saturating_sub(price);
             removed.push(volume);
         }
         removed
+    }
+
+    /// **Every decoded volume this cache holds, as the census reads it**: where
+    /// it is filed, its allocation, what it was priced at, and whether an
+    /// archive stands behind it.
+    ///
+    /// The one question this answers that [`Self::cached_scan_allocations`]
+    /// cannot is `has_archive`, which is the whole of whether
+    /// [`Self::evict_decoded_except`] and [`Self::evict_decoded_to_ceiling`]
+    /// are even allowed to consider the entry. It hands back the volume by
+    /// reference so a caller's own residency predicate — the very closure it
+    /// passed to the eviction — can be asked of the entries that survived it.
+    ///
+    /// No walk of any radial: the price is the one taken at arrival and the
+    /// archive question is a map lookup per entry, over a cache bounded by
+    /// frame count.
+    pub fn decoded_entries(&self) -> impl Iterator<Item = DecodedEntry<'_>> + '_ {
+        self.scan_cache.iter().flat_map(move |(site, scans)| {
+            scans.iter().map(move |(ts, (scan, _))| DecodedEntry {
+                site: site.as_str(),
+                timestamp: *ts,
+                scan,
+                bytes: self
+                    .scan_prices
+                    .get(&(site.clone(), *ts))
+                    .copied()
+                    .unwrap_or(0),
+                has_archive: self
+                    .archive_cache
+                    .get(site.as_str())
+                    .is_some_and(|archives| archives.contains_key(ts)),
+                ever_had_archive: self.archives_ever.contains(&(site.clone(), *ts)),
+            })
+        })
     }
 
     /// **Every decoded volume this cache holds, as its allocation and what it
@@ -848,6 +930,8 @@ impl LoopDownloadManager {
             archive_cache,
             archive_identity,
             archive_bytes_cached,
+            scan_cache,
+            archives_ever,
             ..
         } = self;
         let mut freed = 0usize;
@@ -873,6 +957,16 @@ impl LoopDownloadManager {
         });
         for key in gone {
             archive_identity.remove(&key);
+            // **The memory of having had one outlives the archive, but only
+            // while the volume it describes is here.** With both halves gone
+            // the key answers a question nobody can ask, and keeping it would
+            // let this set grow with every stamp a long session ever listed.
+            if !scan_cache
+                .get(key.0.as_str())
+                .is_some_and(|scans| scans.contains_key(&key.1))
+            {
+                archives_ever.remove(&key);
+            }
         }
         *archive_bytes_cached = archive_bytes_cached.saturating_sub(freed);
     }
@@ -938,6 +1032,13 @@ impl LoopDownloadManager {
                 // The index is the archive's, not the volume's, so it leaves
                 // with the archive and never with the moments.
                 self.archive_identity.remove(&(site.clone(), ts));
+                if !self
+                    .scan_cache
+                    .get(site.as_str())
+                    .is_some_and(|scans| scans.contains_key(&ts))
+                {
+                    self.archives_ever.remove(&(site.clone(), ts));
+                }
                 if archives.is_empty() {
                     self.archive_cache.remove(&site);
                 }
@@ -1073,6 +1174,7 @@ impl LoopDownloadManager {
             if let Some(price) = self.scan_prices.remove(&key) {
                 self.scan_bytes_cached = self.scan_bytes_cached.saturating_sub(price);
             }
+            self.archives_ever.remove(&key);
         }
         removed
     }
@@ -3193,6 +3295,72 @@ mod archive_tests {
     /// someone simplifying the closure, and the one whose loss is invisible
     /// until a user on a slow link scrubs a loop.
     ///
+    /// **What "no archive" means, told apart from "never had one"** — the
+    /// two prices of the same eviction, and the memory that keeps them apart
+    /// lives exactly as long as the volume it describes.
+    ///
+    /// A resident volume whose archive the ceiling took still answers
+    /// `ever_had_archive`, because the object is in the bucket and getting it
+    /// back is a download. Once BOTH halves are gone the key goes too, so this
+    /// set cannot grow with every stamp a long session lists.
+    ///
+    /// TAMPER: drop the `archives_ever.insert` in `cache_archive` and the
+    /// first assertion reads false; drop either cleanup and the last reads 1.
+    #[test]
+    fn a_volume_that_lost_its_archive_is_told_apart_from_one_that_never_had_one() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.cache_scan("KTLX", ts(0), priced_volume());
+        mgr.cache_scan("KTLX", ts(1), priced_volume());
+        mgr.cache_archive("KTLX", ts(0), Arc::new(vec![0u8; 64]));
+
+        mgr.retain_archives(|_, _, _| false);
+
+        let ever: Vec<(chrono::NaiveDateTime, bool)> = mgr
+            .decoded_entries()
+            .map(|e| (e.timestamp, e.ever_had_archive))
+            .collect();
+        assert!(
+            ever.contains(&(ts(0), true)),
+            "the volume whose way back the sweep took reads as never having \
+             had one, which prices a download as lost data: {ever:?}",
+        );
+        assert!(
+            ever.contains(&(ts(1), false)),
+            "the volume nothing ever filed an archive for reads as having had \
+             one: {ever:?}",
+        );
+
+        // Both halves gone: the question dies with them.
+        let keep = ts(1);
+        mgr.retain_scans(|_, at, _| *at == keep);
+        mgr.retain_archives(|_, _, _| false);
+
+        assert_eq!(
+            mgr.archives_ever.len(),
+            0,
+            "a key outlived both halves of the frame it describes, so this set \
+             grows with every stamp the session ever listed",
+        );
+
+        // And the archive that never had a decoded half beside it — the shape
+        // the decoded evictions' own cleanup can never reach — through both
+        // paths that drop an archive.
+        mgr.cache_archive("KTLX", ts(2), Arc::new(vec![0u8; 64]));
+        mgr.retain_archives(|_, _, _| false);
+        assert_eq!(
+            mgr.archives_ever.len(),
+            0,
+            "an archive with no volume beside it left its key behind",
+        );
+        mgr.cache_archive("KTLX", ts(3), Arc::new(vec![0u8; 64]));
+        mgr.evict_archives_to_ceiling(0, |_, _| 0);
+        assert_eq!(
+            mgr.archives_ever.len(),
+            0,
+            "the byte ceiling drops an archive and leaves its key behind",
+        );
+    }
+
     /// TAMPER: remove the `rebuildable &&` guard in `evict_decoded_except`.
     #[test]
     fn a_volume_with_no_archive_survives_the_residency_policy() {

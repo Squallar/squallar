@@ -382,6 +382,18 @@ pub struct App {
     /// **Why the withdrawal side declined**, per guard. The restore counts
     /// above say what came back; these say what never left.
     base_releases: crate::budget_telemetry::BaseReleaseCounts,
+    /// **The loop decoded cache's last census**, taken on the residency pass
+    /// because that is where the pass's own `decoded_keep` predicate is in
+    /// hand, and read on the telemetry tick. A level: the tick reports what
+    /// the last pass found, never a sum over passes.
+    loop_decoded: crate::budget_telemetry::LoopDecodedCensus,
+    /// **Whether the next residency pass should take that census.** Armed by
+    /// the telemetry tick and by construction, so the census is paid once a
+    /// tick and not once a frame: the residency pass itself runs in
+    /// `handle_redraw`, and a per-frame walk of every store's allocations is
+    /// exactly the kind of thing this campaign is trying to take OFF the
+    /// frame thread.
+    loop_decoded_due: bool,
     /// **The budget system's readout** — per pane, what the scene costs and
     /// what the pane's stores hold; per pool, capacity, need and spare
     /// (`squallar_egui::shell_api::BudgetReadout`). Re-stated to the Gui with
@@ -1061,6 +1073,8 @@ impl App {
             base_gate_asks: std::collections::HashSet::new(),
             base_restores: crate::budget_telemetry::BaseRestoreCounts::default(),
             base_releases: crate::budget_telemetry::BaseReleaseCounts::default(),
+            loop_decoded: crate::budget_telemetry::LoopDecodedCensus::default(),
+            loop_decoded_due: true,
             budget_readout: squallar_egui::shell_api::BudgetReadout::default(),
             admission_costs: squallar_egui::admission::AdmissionCosts::default(),
             admission: squallar_egui::admission::AdmissionLedger::default(),
@@ -3423,6 +3437,16 @@ impl App {
                 },
             )),
         );
+        // **What the pass could not take**, censused here because here is
+        // where `decoded_keep` is in hand: an entry this predicate does not
+        // want that is still resident after both passes above is one the
+        // archive-less guard refused, and no second spelling of the residency
+        // rule can say that. A read, not a lever — see
+        // `crate::budget_telemetry::LoopDecodedCensus`.
+        if std::mem::take(&mut self.loop_decoded_due) {
+            self.loop_decoded =
+                self.loop_decoded_census(decoded_keep, chrono::Utc::now().naive_utc());
+        }
         // **The compressed cache's own bound**, in bytes rather than frames
         // because the archive swings 16.5x across the measured corpus while
         // the frame count does not. Furthest from a playhead goes first; an

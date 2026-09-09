@@ -928,6 +928,89 @@ pub(crate) fn base_holder_line(census: BaseHolderCensus) -> String {
     )
 }
 
+/// **What the loop's decoded cache is holding that no eviction path can
+/// take**, as a LEVEL read on the telemetry tick.
+///
+/// # Six figures, and four of them are subsets of the one above
+///
+/// `evict_decoded_except` and `evict_decoded_to_ceiling` both refuse a volume
+/// with no archive behind it, because their premise is that eviction costs a
+/// decode and a chunk-feed volume has nothing to decode from. So the residency
+/// policy can *decide* it does not want a frame's moments and still be unable
+/// to act, and every family this campaign publishes reports those bytes as
+/// `loop scans` with no way to say that.
+///
+/// * `volumes` / `bytes` — every decoded volume the loop cache holds. The
+///   denominator for everything below, and the same quantity
+///   `LoopDownloadManager::cached_scan_bytes` reports.
+/// * `no_archive` / `no_archive_bytes` — of those, the ones with no archive
+///   behind them. **Not a prize**: most of these are frames the policy still
+///   wants, and wanting them is why they are here.
+/// * `unwanted` / `unwanted_bytes` — of the archive-less, the ones the
+///   residency predicate has *already excluded* (textured, outside the
+///   decoded lookahead, not parked on by a pane, not in a settling site).
+///   This is the set the policy would evict today if the guard let it.
+/// * `never_archived` / `never_archived_bytes` — of the unwanted, the ones no
+///   archive was **ever** filed for: chunk-feed volumes, whose S3 object this
+///   process has never held. The rest of `unwanted` lost its way back to
+///   `evict_archives_to_ceiling`, and for those re-obtaining the volume is a
+///   download rather than data nobody can get. **This split is the ruling**:
+///   only these bytes cost fidelity.
+/// * `sole` / `sole_bytes` — of the unwanted, the ones whose allocation **no
+///   other holder names** — not the still inventory, not a merge base, not the
+///   per-site latest, not the chunk feed. `0f3de05db` is why this column
+///   exists: a base's superseded rungs read 148 MB and freed nothing because
+///   six bases of six were co-held. **`sole_bytes` is the only figure here a
+///   cut could bank.**
+/// * `oldest_unwanted_s` — how long ago the oldest volume in the `unwanted`
+///   set was collected, seconds, against the wall clock. The exposure window,
+///   and the figure that says whether "the archive turns up minutes later" is
+///   true of this cache: an entry that is still here an hour on has been
+///   un-evictable for that hour.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LoopDecodedCensus {
+    pub(crate) volumes: usize,
+    pub(crate) bytes: usize,
+    pub(crate) no_archive: usize,
+    pub(crate) no_archive_bytes: usize,
+    pub(crate) unwanted: usize,
+    pub(crate) unwanted_bytes: usize,
+    pub(crate) never_archived: usize,
+    pub(crate) never_archived_bytes: usize,
+    pub(crate) sole: usize,
+    pub(crate) sole_bytes: usize,
+    pub(crate) oldest_unwanted_s: u64,
+}
+
+/// Its own line, never appended to `budget state:`, which is scraped by a
+/// positional regex; MiB by integer division, as every byte figure here is.
+pub(crate) fn loop_decoded_line(census: LoopDecodedCensus) -> String {
+    let LoopDecodedCensus {
+        volumes,
+        bytes,
+        no_archive,
+        no_archive_bytes,
+        unwanted,
+        unwanted_bytes,
+        never_archived,
+        never_archived_bytes,
+        sole,
+        sole_bytes,
+        oldest_unwanted_s,
+    } = census;
+    let mib = |bytes: usize| bytes / (1024 * 1024);
+    format!(
+        "loop decoded: {volumes} volume(s) at {} MiB; no archive {no_archive} at {} MiB; \
+         unwanted {unwanted} at {} MiB, never archived {never_archived} at {} MiB, \
+         sole {sole} at {} MiB; oldest unwanted {oldest_unwanted_s} s",
+        mib(bytes),
+        mib(no_archive_bytes),
+        mib(unwanted_bytes),
+        mib(never_archived_bytes),
+        mib(sole_bytes),
+    )
+}
+
 /// **Why a merge base's gates did not go**, as one running tally per reason.
 ///
 /// # Why a histogram and not a level
