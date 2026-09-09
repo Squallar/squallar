@@ -41,6 +41,29 @@
 //! actually holding — `squallar_egui::radar_fan::FanSweep::resident_bytes`,
 //! measured — so a frame that fell back to a raster is still priced as one.
 //!
+//! # What crosses on the frame thread
+//!
+//! `prepare` runs there, so what [`RadarFanStore::ensure`] hands the queue is
+//! frame-thread work — and on the web the frame thread is the page's main
+//! thread, where [`chain_staging`]'s ring is unavailable by device feature and
+//! the bytes go through `queue.write_texture` itself.
+//!
+//! **So what crosses is the level the draw reads, and the levels coarser than
+//! it.** [`selected_level`] is the fragment stage's own expression over two
+//! draw-uniform lanes, which is what makes "the level this draw reads" one
+//! number a store can know before the pass. A 720 x 1832 surveillance tilt
+//! first drawn at 2 km a pixel files 20,610 B of chain rather than 1,758,630;
+//! six panes stepping their loops together file 129,804 B of chain and table
+//! where they filed 10,557,924. Even at the finest zoom, where level 0 is what
+//! the view is really reading, the rest of the chain is 439,590 B nothing was
+//! going to look at — 25.0% of the crossing. A level a later zoom selects is
+//! filed on the pass that first selects it, which is the same bytes and never a
+//! later frame.
+//!
+//! Nothing is deferred and nothing is approximated. A level a draw selects is
+//! filed on that draw's own pass, so a pane never shows a level its view did
+//! not ask for, a partial chain, or an empty rect.
+//!
 //! # What this module does NOT decide
 //!
 //! **Which products may ride an R8 plane.** `squallar_radar`'s `CodePlane::build`
@@ -372,6 +395,19 @@ fn sweep_scalars(sweep: &UiSweep) -> FanScalars {
     }
 }
 
+/// **Payload bytes levels `first..last` of `sweep`'s chain carry**, off the
+/// payload's own slices rather than recomputed from its shape.
+///
+/// A level the payload cannot answer for contributes nothing, exactly as
+/// [`chain_staging`] leaves it out of the plan — so this is the traffic that
+/// filing that range creates and not an upper bound on it.
+fn level_bytes(sweep: &UiSweep, first: usize, last: usize) -> u64 {
+    (first..last)
+        .filter_map(|level| sweep.level(level))
+        .map(|bytes| bytes.len() as u64)
+        .sum()
+}
+
 /// Bytes a `radials x gates` chain of `levels` levels occupies at one byte a
 /// code.
 ///
@@ -429,6 +465,59 @@ pub struct FanView {
     pub opacity: f32,
 }
 
+/// **Ground kilometres one physical pixel covers**, which is what the level
+/// selection is a question about.
+///
+/// Spelled once and read twice — into the `Locals` lane the fragment stage
+/// selects with, and by [`RadarFanStore::ensure`], which has to know which
+/// level a draw will read in order to upload that one. A second spelling would
+/// be a store filling one level while the fragment stage read another.
+///
+/// A points figure would select a level too fine by the scale factor on every
+/// high-DPI display. A frame with no usable scale factor, or a view whose own
+/// figure is not finite, yields zero — which selects level 0, the finest, and
+/// never the wrong picture.
+fn km_per_px(view: &FanView, screen: &egui_wgpu::ScreenDescriptor) -> f32 {
+    let ppp = screen.pixels_per_point;
+    if !ppp.is_finite() || ppp <= 0.0 || !view.km_per_pt.is_finite() {
+        return 0.0;
+    }
+    view.km_per_pt / ppp
+}
+
+/// **The one chain level a draw at `km_per_px` reads**, of a sweep whose gates
+/// are `gate_interval_km` of ground deep and whose chain is `mip_levels` long.
+///
+/// `radar_fan.wgsl`'s own expression, in Rust, and this is why it is worth
+/// having twice: the fragment stage's two operands are both draw-uniform, so
+/// one draw of one sweep reads **exactly one level** — and a store that knows
+/// which one can upload that level and leave the rest of the chain alone. A
+/// surveillance tilt seen at 2 km a pixel is 20,610 B of chain against
+/// 1,758,630 B, and on the web those bytes cross on the page's main thread.
+///
+/// **The two spellings are held together by arithmetic and not by care.**
+/// `floor(log2(ratio))` for a finite `ratio >= 1` *is* the IEEE-754 exponent
+/// field, and both sides read that field rather than calling `log2`: WGSL's
+/// `log2` is specified to 3 ULP, and one ULP either side of a power of two is a
+/// whole level once it is floored — which would be the fragment stage reading a
+/// level nothing had uploaded, at particular zooms only.
+///
+/// `the_mip_level_is_chosen_by_the_pixel_footprint` holds the two against each
+/// other on a device, at nine powers of two with every level of the chain
+/// planted with a code of its own. It is `#[ignore]`d — run it with
+/// `cargo test -p squallar-gpu --test radar_fan_gpu -- --ignored`.
+/// `the_selected_level_is_the_floor_of_the_footprint_ratio` needs no adapter
+/// and holds this side of it against `f64::log2` on both sides of every
+/// boundary.
+pub fn selected_level(km_per_px: f32, gate_interval_km: f32, mip_levels: u32) -> u32 {
+    // `f32::max` answers the non-NaN side, so a NaN ratio selects the finest
+    // level rather than an arbitrary one. `admit` has already refused a
+    // non-finite or non-positive gate depth by the time a callback exists.
+    let ratio = (km_per_px / gate_interval_km).max(1.0);
+    let exponent = (ratio.to_bits() >> 23) as i32 - 127;
+    exponent.clamp(0, mip_levels.saturating_sub(1) as i32) as u32
+}
+
 /// One [`FanView`] against one frame's screen, in the byte layout the WGSL
 /// `Locals` block declares.
 ///
@@ -457,13 +546,7 @@ fn prepare_locals(
     // Web Mercator's y is `atanh(sin lat)`. Formed in f64 and handed over,
     // because the fragment stage adds a small offset to it and inverts.
     let merc_y = sin_lat0.clamp(-1.0, 1.0).atanh();
-    // A zero-scale frame is one nothing can be placed on; the LOD it selects
-    // is level 0, which is the finest and never the wrong picture.
-    let km_per_px = if ppp.is_finite() && ppp > 0.0 {
-        view.km_per_pt / ppp
-    } else {
-        0.0
-    };
+    let km_per_px = km_per_px(view, screen);
     let lanes: [[u8; 4]; 12] = [
         (ppp * view.site_pt.x - left).to_ne_bytes(),
         (ppp * view.site_pt.y - top).to_ne_bytes(),
@@ -571,10 +654,19 @@ impl ViewBatch {
 struct Resident {
     /// The code plane, the table and the sweep's own uniform, in one group.
     bind_group: wgpu::BindGroup,
-    /// Held so the textures outlive the bind group.
-    _codes: wgpu::Texture,
-    _lut: wgpu::Texture,
+    /// Held so the textures outlive the bind group — and, since the chain is
+    /// filled a level at a time, so a later demand has somewhere to put one.
+    codes: wgpu::Texture,
+    lut: wgpu::Texture,
     _uniform: wgpu::Buffer,
+    /// **The chain levels whose bytes have been filed**, `filed`. Every level
+    /// outside it is texture the device allocated and nothing has written,
+    /// because no draw of this sweep has ever selected one. See
+    /// [`RadarFanStore::ensure`].
+    filed: std::ops::Range<u32>,
+    /// Levels the code texture was created with — the bound [`Self::filed`] is
+    /// measured against, and the clamp the sweep's uniform declares.
+    levels: u32,
     bytes: u64,
     /// The owner's handle, seen from here. Dead means the sweep is gone and so
     /// are these textures, next sweep — and, while it is held, no later
@@ -857,16 +949,69 @@ impl RadarFanStore {
         self.resident_bytes -= bytes;
     }
 
-    /// Make one sweep resident, uploading it if this is the first frame it has
-    /// been drawn on.
+    /// Make one sweep drawable at `km_per_px`, filing whatever of its chain
+    /// that draw will read and has not been filed before.
     ///
     /// **Nothing is uploaded twice and nothing is copied.** The payload is the
     /// one `squallar_egui` built off the frame thread, held here through the
     /// callback's `Arc`; a loop step that returns to a sweep already resident
-    /// finds its key and writes no bytes at all.
-    fn ensure(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, sweep: &Arc<UiSweep>) {
+    /// at a level it already has files no bytes at all.
+    ///
+    /// # Only the level the draw reads
+    ///
+    /// The fragment stage's level selection is over two draw-uniform lanes —
+    /// see [`selected_level`] — so one draw of one sweep reads exactly one
+    /// level of the chain, and the rest of it was bytes the frame thread
+    /// pushed for nothing. This files that level, and keeps
+    /// [`Resident::filed`] as the range of levels it has filed so far.
+    ///
+    /// **An interval and not a set.** A zoom moves through the levels in order,
+    /// so the levels a session ever selects for one sweep are contiguous but
+    /// for the ones a fast gesture skipped, and filling those in costs the
+    /// levels between two the view really visited. Two integers, a comparison
+    /// per demand, and no search — where a set would be one bit per level and
+    /// a per-fragment lookup to go with it.
+    ///
+    /// Each level is filed on the pass that first reads it, so the picture is
+    /// never a level the view did not ask for, never partial and never blank.
+    /// **This is not a deferral**: nothing is postponed to a later frame. It is
+    /// the same upload, minus the levels no draw has ever selected.
+    fn ensure(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        sweep: &Arc<UiSweep>,
+        km_per_px: f32,
+    ) {
         let key = sweep_key(sweep);
-        if self.resident.contains_key(&key) {
+        let gate_interval_km = sweep_scalars(sweep).gate_interval_km;
+        if let Some(entry) = self.resident.get_mut(&key) {
+            let want = selected_level(km_per_px, gate_interval_km, entry.levels);
+            // The gap this draw opened, on whichever side of the filed range it
+            // opened it, and nothing else. The table crossed with the first
+            // filing and does not cross again.
+            let gap = if want < entry.filed.start {
+                let to = entry.filed.start;
+                entry.filed.start = want;
+                want..to
+            } else if want >= entry.filed.end {
+                let from = entry.filed.end;
+                entry.filed.end = want + 1;
+                from..want + 1
+            } else {
+                return;
+            };
+            let pending = Pending {
+                sweep: Arc::clone(sweep),
+                codes: entry.codes.clone(),
+                lut: entry.lut.clone(),
+                first: gap.start as usize,
+                last: gap.end as usize,
+                table: false,
+            };
+            self.upload_bytes += level_bytes(sweep, pending.first, pending.last);
+            self.uploads += 1;
+            self.staging.file(pending);
             return;
         }
         let (radials, gates) = (sweep.radials as usize, sweep.gates as usize);
@@ -926,11 +1071,18 @@ impl RadarFanStore {
         // and before the render pass. See [`chain_staging`] for what that
         // buys and why one slot serves the pass rather than one serving a
         // sweep.
+        //
+        // The one level this draw reads, and not the chain. See the head of
+        // this function.
+        let want = selected_level(km_per_px, gate_interval_km, levels as u32);
+        let filed = want..want + 1;
         self.staging.file(Pending {
             sweep: Arc::clone(sweep),
             codes: codes.clone(),
             lut: lut.clone(),
-            levels,
+            first: filed.start as usize,
+            last: filed.end as usize,
+            table: true,
         });
 
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
@@ -968,17 +1120,25 @@ impl RadarFanStore {
         // vectors rather than recomputed from its shape: the whole chain, the
         // table and the drawn-edge lanes, which is what
         // `squallar_egui::radar_fan::FanSweep::resident_bytes` measures.
+        //
+        // The whole chain and not the levels filed: `create_texture` allocates
+        // every level of the descriptor's `mip_level_count` whether or not one
+        // has been written, so this prices the allocation and not the traffic.
+        // [`Self::uploads`] is where the traffic is.
         let bytes = sweep.resident_bytes() as u64;
         self.resident_bytes += bytes;
         self.uploads += 1;
-        self.upload_bytes += bytes;
+        self.upload_bytes += level_bytes(sweep, filed.start as usize, filed.end as usize)
+            + sweep.lut_rgba.len() as u64;
         self.resident.insert(
             key,
             Resident {
                 bind_group,
-                _codes: codes,
-                _lut: lut,
+                codes,
+                lut,
                 _uniform: uniform,
+                filed,
+                levels: levels as u32,
                 bytes,
                 alive: Arc::downgrade(sweep),
             },
@@ -1057,8 +1217,21 @@ impl RadarFanStore {
         self.resident.len()
     }
 
-    /// Texture and buffer writes this store has made, and their bytes — one set
-    /// per sweep lifetime, never per frame.
+    /// **Filings this store has made, and the payload bytes they carried.**
+    ///
+    /// # Denominator
+    ///
+    /// A *filing* is a round of chain levels handed to [`chain_staging`], never
+    /// a frame and no longer quite a sweep: a sweep is filed once when it
+    /// becomes resident, and again on the pass a draw first selects a level
+    /// finer than any it has been asked for — see [`Self::ensure`]. A sweep
+    /// that stays at one zoom is filed exactly once, and a sweep drawn at a
+    /// coarser zoom than it arrived at is not filed again at all.
+    ///
+    /// The bytes are the payload's own — the chain levels actually filed and
+    /// the table, padding excluded — so they are comparable with
+    /// [`Self::resident_bytes`], which prices the whole allocation, and the gap
+    /// between the two is the chain nothing has ever looked at.
     pub fn uploads(&self) -> (u64, u64) {
         (self.uploads, self.upload_bytes)
     }
@@ -1207,8 +1380,12 @@ impl egui_wgpu::CallbackTrait for RadarFanCallback {
             return Vec::new();
         };
         store.sweep(self.pass_nr);
+        // The frame's own selector, computed once for the callback: every
+        // sweep of one fan is drawn at one view, and this is the number the
+        // `Locals` lane below carries. See [`km_per_px`].
+        let km_per_px = km_per_px(&self.view, screen_descriptor);
         for sweep in &self.sweeps {
-            store.ensure(device, queue, sweep);
+            store.ensure(device, queue, sweep, km_per_px);
         }
         let slot = store.slot(queue, &self.view, screen_descriptor);
         self.slot.store(slot, Ordering::Relaxed);
@@ -1338,6 +1515,64 @@ impl squallar_egui::radar_fan::RadarFanPainter for RadarFanBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The level a draw selects is `floor(log2(km_per_px / gate depth))`,
+    /// clamped to the chain — on the boundary and not merely near it.**
+    ///
+    /// The GPU suites drive this at exact powers of two, which is where an
+    /// off-by-one is most visible and where a *boundary* mistake is least: a
+    /// `ratio` a hair under 4 must select level 1 and `ratio == 4.0` exactly
+    /// must select 2, and no arm of a suite driven at powers of two can tell a
+    /// `>` from a `>=` there. Both sides of every boundary are driven below.
+    ///
+    /// The oracle is `f64::log2().floor()` and not a second copy of the
+    /// exponent read: `f64` carries an `f32` ratio and its whole binade
+    /// exactly, so it answers the question this function is a fast spelling of
+    /// rather than agreeing with it by construction.
+    ///
+    /// TAMPER: move the bias off 127, or clamp to `mip_levels` instead of
+    /// `mip_levels - 1`, and the rows go red.
+    #[test]
+    fn the_selected_level_is_the_floor_of_the_footprint_ratio() {
+        let mut checked = 0;
+        for level in 0..12u32 {
+            let at = (1u32 << level) as f32;
+            for (ratio, want) in [
+                (at, level),
+                (f32::from_bits(at.to_bits() + 1), level),
+                // The last value of the binade below: still the level under.
+                (f32::from_bits(at.to_bits() - 1), level.saturating_sub(1)),
+            ] {
+                // Driven through the two operands rather than the ratio, so
+                // this is the expression `ensure` and the shader both evaluate
+                // and not an inner one.
+                let got = selected_level(ratio * 0.25, 0.25, 16);
+                assert_eq!(got, want, "ratio {ratio} (level {level})");
+                assert_eq!(
+                    u32::try_from(f64::from(ratio).log2().floor().max(0.0) as i64)
+                        .expect("a level inside the chain"),
+                    got,
+                    "ratio {ratio} disagrees with floor(log2)"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 36, "the loop compared nothing");
+
+        // The clamp, both ends. Below one gate a pixel the finest level is the
+        // right one; past the chain there is nothing coarser to read, and a
+        // one-level plane — a categorical field, which must never be reduced —
+        // stays on level 0 however far out the view is.
+        assert_eq!(selected_level(0.0, 0.25, 11), 0);
+        assert_eq!(selected_level(0.1, 0.25, 11), 0);
+        assert_eq!(selected_level(1e30, 0.25, 11), 10);
+        assert_eq!(selected_level(1e30, 0.25, 1), 0);
+        assert_eq!(selected_level(f32::INFINITY, 0.25, 11), 10);
+        // A `mip_levels` of zero is not a shape this store builds — the
+        // texture is created with at least one level — but it must not
+        // underflow the clamp into a level no texture has.
+        assert_eq!(selected_level(1e30, 0.25, 0), 0);
+    }
 
     /// **A sweep's sectors are the canonical mesh's first `radials`, and
     /// `sector_indices` names exactly them.**

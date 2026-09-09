@@ -230,8 +230,34 @@ fn shade(in: VertexOutput) -> vec4<f32> {
 
     // One level of the chain, chosen by how much ground a pixel covers. At
     // `mip_levels == 1` the clamp pins level 0 whatever `km_per_px` is.
+    //
+    // **Both operands are draw-uniform**, so every fragment of one sweep in one
+    // callback selects the SAME level. That is what lets the store upload the
+    // level a draw will read and leave the rest of the chain alone —
+    // `RadarFanStore::ensure` — and it is a property of these two lanes rather
+    // than of the arithmetic: `km_per_px` is a `Locals` lane and
+    // `gate_interval_km` a `Sweep` one, neither varying across a triangle.
     let ratio = max(r_locals.km_per_px / r_sweep.gate_interval_km, 1.0);
-    let lod = i32(clamp(floor(log2(ratio)), 0.0, f32(r_sweep.mip_levels - 1u)));
+    // `floor(log2(ratio))` for `ratio >= 1`, read straight off the IEEE-754
+    // exponent field rather than through `log2`.
+    //
+    // **Not an optimisation — the thing that makes the two spellings of this
+    // expression the same number.** `radar_fan::selected_level` computes the
+    // level in Rust so the store knows which one to upload, and WGSL's `log2`
+    // is specified to 3 ULP: at a `ratio` a hair under a power of two a sloppy
+    // `log2` floors to the level ABOVE the one Rust picked, and the fragment
+    // reads a level nothing wrote — every code 0, which is below threshold, so
+    // the pane carries no echo at all, at that zoom and no other. An exponent
+    // field is exact on both sides and cannot disagree.
+    //
+    // `ratio` is finite and `>= 1` here, so its sign bit is clear and the shift
+    // isolates the exponent; an infinite `ratio` reads 255 and clamps, which is
+    // where `log2` sent it too.
+    let lod = clamp(
+        i32(bitcast<u32>(ratio) >> 23u) - 127,
+        0,
+        i32(r_sweep.mip_levels - 1u),
+    );
     // **The index is clamped to the level, and the clamp is load-bearing on
     // every odd extent.** A mip level is `max(1, extent >> lod)` wide, so on an
     // odd parent the last gate's `gate >> lod` lands one past the last texel —

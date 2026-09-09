@@ -1705,8 +1705,25 @@ fn a_callback_with_no_store_draws_nothing_and_is_counted() {
 /// bounds and the outer gates read unpainted, which the constant code makes
 /// visible.
 ///
+/// # It is also where the shader's level and the store's level are held equal
+///
+/// `RadarFanStore::ensure` uploads the level the draw reads and every level
+/// coarser than it, so `radar_fan::selected_level` and the WGSL expression have
+/// to name the SAME level or the fragment stage reads one that was never
+/// written. Nothing is written there, and code 0 is `[0, 0, 0, 0]` in
+/// [`opaque_lut`] — so a disagreement is an unpainted pane and every arm below
+/// but the first is red. That is why both spellings read the IEEE-754 exponent
+/// field instead of calling `log2`, whose WGSL accuracy is 3 ULP: one ULP
+/// either side of a power of two is a whole level after the floor, and every
+/// `km_per_px` this suite drives is a power of two.
+///
+/// The first arm cannot see it — level 0 is the finest, so its filing is the
+/// whole chain whatever the store selected — and the other eight can.
+///
 /// TAMPER: drop the fragment's `min` against `textureDimensions`, or
 /// ceil-halve either side of the chain arithmetic, and the deep arms go red.
+/// Add one to `selected_level`'s exponent and every arm but the first goes red
+/// on the colour, and on the filed bytes before that.
 #[test]
 #[ignore = "needs a real wgpu adapter"]
 fn the_mip_level_is_chosen_by_the_pixel_footprint() {
@@ -1768,13 +1785,32 @@ fn the_mip_level_is_chosen_by_the_pixel_footprint() {
         let mut at_zoom = view(1.0);
         at_zoom.km_per_pt = km_per_px;
         let store = RadarFanStore::new(&device, attachments(format));
-        let (pixels, _) = frame(
+        let (pixels, renderer) = frame(
             &device,
             &queue,
             Some(store),
             format,
             wgpu::Color::TRANSPARENT,
             vec![RadarFanCallback::new(vec![Arc::clone(&sweep)], at_zoom, 1).expect("one sweep")],
+        );
+        // **What crossed is this view's own level and the table, and nothing
+        // else.** Spelled as the level's own extents rather than as a figure,
+        // so a store that went back to filing the whole chain is red here and
+        // not merely slower. The colour rows below are what says the level it
+        // filed is also the level the fragment stage read.
+        assert_eq!(
+            renderer
+                .callback_resources
+                .get::<RadarFanStore>()
+                .expect("the store this frame was drawn with")
+                .uploads(),
+            (
+                1,
+                (level_extent(RADIALS, level) * level_extent(GATES, level) + POLAR_LUT_BYTES)
+                    as u64
+            ),
+            "at km_per_px {km_per_px} the store filed something other than \
+             level {level} and the table",
         );
         let code = 10u8 + level as u8;
         let at = usize::from(code) * 4;
@@ -1837,6 +1873,185 @@ fn the_mip_level_is_chosen_by_the_pixel_footprint() {
         raised.is_empty(),
         "the device raised {} validation errors uploading and drawing this \
          chain; the first is what the rest are downstream of:\n{}",
+        raised.len(),
+        raised.join("\n"),
+    );
+}
+
+/// **A sweep already resident at one zoom draws the right picture at a FINER
+/// zoom, and files exactly the levels the move needs.**
+///
+/// `RadarFanStore::ensure` no longer files a whole chain. It files the one
+/// level `radar_fan::selected_level` names, keeps the range of levels it has
+/// filed, and files another only when a draw first selects one outside that
+/// range. That second path is the one the picture depends on and the one
+/// nothing else here reaches:
+/// `the_mip_level_is_chosen_by_the_pixel_footprint` — `#[ignore]`d beside this
+/// one, and run by the same
+/// `cargo test -p squallar-gpu --test radar_fan_gpu -- --ignored` — builds a
+/// fresh store for every zoom, so every one of its arms is a FIRST filing, and
+/// an `ensure` that returned early on every resident hit would be green through
+/// all nine.
+///
+/// **The property an input needs to reach that**, asserted below rather than
+/// assumed:
+///
+/// * **more than one level, each carrying a code of its own** — one level, or a
+///   chain a level of which is indistinguishable, and a pane reading the wrong
+///   level is the right colour anyway;
+/// * **later views selecting levels on BOTH sides of the first** — the range
+///   grows at two ends and they are two arms of the same `if`, so a walk that
+///   only ever went one way would leave the other unreached;
+/// * **a view landing INSIDE the range already filed** — otherwise nothing
+///   distinguishes the range from a store that files on every draw;
+/// * **one store carried across the frames** — a fresh store per frame is a
+///   first filing again, which is the shape this suite exists beside.
+///
+/// A level nothing filed reads zero, and code 0 is `[0, 0, 0, 0]` in
+/// [`opaque_lut`], so the failure this covers is a pane that draws nothing at
+/// all — not a pane that draws something slightly wrong.
+///
+/// TAMPER: return from `ensure` on any resident key and the second arm goes red
+/// on an unpainted pane; drop either extension of `filed` and the arm on that
+/// side does; widen a filing back to the whole chain and the byte rows do.
+#[test]
+#[ignore = "needs a real wgpu adapter"]
+fn a_resident_sweep_files_the_levels_a_zoom_brings_it_to() {
+    let _serialised = gpu_lock();
+    let Some((device, queue)) = device() else {
+        eprintln!("SKIPPED: no wgpu adapter");
+        return;
+    };
+    let errors: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&errors);
+    device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
+        sink.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(format!("{e}"));
+    }));
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let lut = opaque_lut();
+
+    let levels = squallar_radar::render::codes::full_mip_levels(RADIALS, GATES);
+    assert!(
+        levels > 1,
+        "a one-level chain clamps every zoom to level 0, so no draw can ever \
+         demand a level the store has not filed"
+    );
+    let mut codes = Vec::new();
+    for level in 0..levels {
+        let cells = level_extent(RADIALS, level) * level_extent(GATES, level);
+        codes.extend(std::iter::repeat_n(10u8 + level as u8, cells));
+    }
+    let sweep = Arc::new(payload(
+        RADIALS,
+        GATES,
+        codes,
+        levels,
+        lut.clone(),
+        one_degree_edges(),
+        geometry(None),
+    ));
+    assert!(sweep.is_well_formed(), "the fixture describes itself");
+    admit(&sweep).expect("the fixture is inside every cap");
+
+    // Bytes levels `from..to` of this shape carry, by the level extents the
+    // producer and wgpu both halve at — never a figure of this suite's own.
+    let span = |from: usize, to: usize| {
+        (from..to)
+            .map(|l| (level_extent(RADIALS, l) * level_extent(GATES, l)) as u64)
+            .sum::<u64>()
+    };
+
+    // `gate_interval_km` is 1 km here, so `km_per_px` names the level. The walk
+    // goes OUT first and then IN, so the early return, the extension at the
+    // coarse end and the extension at the fine end are each reached, and none
+    // of them is the only thing being exercised.
+    //
+    // `(km_per_px, level, filings, filed bytes)` — running totals, and the
+    // levels the store has filed after each step:
+    //
+    //   64  -> level 6 alone            6..7
+    //   256 -> extends coarse to 8      6..9
+    //   1   -> extends fine to 0        0..9
+    //   4   -> already inside it        0..9, nothing filed
+    //   256 -> already inside it        0..9, nothing filed
+    let walk: [(f32, usize, u64, u64); 5] = [
+        (64.0, 6, 1, span(6, 7) + POLAR_LUT_BYTES as u64),
+        (256.0, 8, 2, span(6, 9) + POLAR_LUT_BYTES as u64),
+        (1.0, 0, 3, span(0, 9) + POLAR_LUT_BYTES as u64),
+        (4.0, 2, 3, span(0, 9) + POLAR_LUT_BYTES as u64),
+        (256.0, 8, 3, span(0, 9) + POLAR_LUT_BYTES as u64),
+    ];
+    assert!(
+        walk.iter().any(|&(_, level, ..)| level < walk[0].1)
+            && walk.iter().any(|&(_, level, ..)| level > walk[0].1)
+            && walk.iter().any(|&(_, level, ..)| level == levels - 1),
+        "the walk must reach levels on BOTH sides of the one the sweep arrived \
+         at, or one of the two extensions is never entered at all"
+    );
+    assert_eq!(
+        span(0, levels) as usize,
+        chain_bytes(RADIALS, GATES, levels),
+        "the level extents this walk is priced by are not the producer's chain"
+    );
+
+    let mut store = Some(RadarFanStore::new(&device, attachments(format)));
+    for (pass, &(km_per_px, level, filings, bytes)) in walk.iter().enumerate() {
+        let mut at_zoom = view(1.0);
+        at_zoom.km_per_pt = km_per_px;
+        let (pixels, mut renderer) = frame(
+            &device,
+            &queue,
+            store.take(),
+            format,
+            wgpu::Color::TRANSPARENT,
+            vec![
+                RadarFanCallback::new(vec![Arc::clone(&sweep)], at_zoom, pass as u64 + 1)
+                    .expect("one sweep"),
+            ],
+        );
+        let code = 10u8 + level as u8;
+        let at = usize::from(code) * 4;
+        let want = [lut[at], lut[at + 1], lut[at + 2], lut[at + 3]];
+        let mut compared = 0usize;
+        for py in 0..SIDE {
+            for px in 0..SIDE {
+                if !matches!(expect_at(px, py, None), Expect::Cell { .. }) {
+                    continue;
+                }
+                compared += 1;
+                assert_eq!(
+                    texel(&pixels, px, py),
+                    want,
+                    "at km_per_px {km_per_px} (pass {pass}) the fan should be \
+                     reading level {level}, whose code is {code}"
+                );
+            }
+        }
+        assert!(compared > 15_000, "only {compared} pixels were compared");
+
+        let held = renderer
+            .callback_resources
+            .remove::<RadarFanStore>()
+            .expect("the store this frame was drawn with");
+        assert_eq!(
+            held.uploads(),
+            (filings, bytes),
+            "at km_per_px {km_per_px} (pass {pass}) the store had filed \
+             something other than the levels the walk has reached"
+        );
+        assert_eq!(held.resident_sweeps(), 1, "one sweep, held across the walk");
+        store = Some(held);
+    }
+
+    let raised = errors
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        raised.is_empty(),
+        "the device raised {} validation errors over the walk; the first is \
+         what the rest are downstream of:\n{}",
         raised.len(),
         raised.join("\n"),
     );
@@ -1969,7 +2184,13 @@ fn the_two_chain_upload_routes_draw_the_same_picture() {
         assert!(sweep.is_well_formed(), "the fixture describes itself");
         admit(sweep).expect("the fixture is inside every cap");
     }
-    let carried = 2 * (chain_bytes(RADIALS, GATES, levels) + POLAR_LUT_BYTES) as u64;
+    // **What one pass carries is what the view reads**, both sweeps: the level
+    // `selected_level` names, plus one table each. `ensure` files no level a
+    // draw has not selected, so this falls with the zoom instead of being the
+    // whole chain twice.
+    let carried = |level: usize| {
+        2 * (level_extent(RADIALS, level) * level_extent(GATES, level) + POLAR_LUT_BYTES) as u64
+    };
 
     // `gate_interval_km` is 1 km here, so `km_per_px` names the level:
     // floor(log2(km_per_px)).
@@ -2012,9 +2233,9 @@ fn the_two_chain_upload_routes_draw_the_same_picture() {
             );
             assert_eq!(
                 totals.bytes,
-                if staged { carried } else { 0 },
-                "the ring carried something other than both chains and both \
-                 tables at km_per_px {km_per_px}"
+                if staged { carried(level) } else { 0 },
+                "the ring carried something other than level {level} of \
+                 both chains and both tables at km_per_px {km_per_px}"
             );
             shots.push(pixels);
         }

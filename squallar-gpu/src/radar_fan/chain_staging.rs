@@ -16,6 +16,21 @@
 //! six loops stepping together, or six panes retargeted at once — and every one
 //! of those bytes went through the window.
 //!
+//! # What is filed is not the whole chain
+//!
+//! [`super::RadarFanStore::ensure`] files the chain level a draw actually
+//! reads — the one [`super::selected_level`] picks — and files another only on
+//! the pass a draw first selects it. So a [`Pending`] carries a level RANGE and
+//! not a depth, and one sweep may be filed more than once over its life. A
+//! surveillance tilt first drawn at 2 km a pixel files 20,610 B of chain here
+//! rather than 1,758,630.
+//!
+//! **That matters most on the arm this module cannot help**, below: a device
+//! with no ring pushes whatever is filed through the window itself, so the
+//! levels no draw selects are the difference between 10,557,924 B of frame
+//! thread and 129,804 B of it at six panes — both figures chain and table, six
+//! sweeps of the worst shape.
+//!
 //! # One slot a pass, not one a sweep
 //!
 //! The ring holds [`crate::staging_ring::STAGING_RING_DEPTH`] slots and a slot
@@ -43,6 +58,18 @@
 //! module existed, to the same places. The fallback is therefore not an
 //! untested branch but the web arm's production route, and the GPU suite holds
 //! the two against each other on a device that can take either.
+//!
+//! **And the web arm cannot be moved off its main thread by staging it here.**
+//! `queue.write_texture` reaches `GPUQueue.writeTexture` with a
+//! `wasm-bindgen` view straight over the wasm heap, so the browser makes one
+//! copy and the page makes none. A mapped staging buffer is worse and not
+//! better there: `wgpu`'s WebGPU backend answers `get_mapped_range_mut` with a
+//! `Vec` it fills from the JS `ArrayBuffer` (`WebBufferMappedRange`, wgpu
+//! 29.0.4), and copies the whole range back on drop — two crossings and a
+//! transient wasm allocation the size of the pass, on a heap that never
+//! shrinks. Which is why the route this module takes is a device-feature
+//! question and stays one, and why the web's saving had to come from filing
+//! fewer bytes rather than from filing them somewhere else.
 
 use std::sync::Arc;
 
@@ -163,9 +190,21 @@ pub(super) struct Pending {
     pub sweep: Arc<UiSweep>,
     pub codes: wgpu::Texture,
     pub lut: wgpu::Texture,
-    /// Levels the code texture was created with, which is the depth the plan
-    /// covers — never the payload's own claim, which may be deeper.
-    pub levels: usize,
+    /// **The chain levels this filing carries**, `first..last`, finest first.
+    ///
+    /// A range and not a depth, because a sweep is filed a piece at a time:
+    /// [`super::RadarFanStore::ensure`] files the level a draw selects and
+    /// every level coarser than it, and files the finer ones only if a draw
+    /// ever selects one. `last` is bounded by the levels the code texture was
+    /// created with and never by the payload's own claim, which may be deeper.
+    pub first: usize,
+    pub last: usize,
+    /// Whether this filing carries the colour table as well as the chain.
+    ///
+    /// True on the filing that created the textures and false on every later
+    /// one: the table does not change with the level, so a second copy of it
+    /// would be 1,024 B and a `write_texture` bought for nothing.
+    pub table: bool,
 }
 
 impl Pending {
@@ -190,21 +229,21 @@ impl Pending {
         }
     }
 
-    /// This sweep's plan, laid from `base`, and the offset the next sweep
+    /// This filing's plan, laid from `base`, and the offset the next filing
     /// starts at.
     fn plan(&self, base: u64) -> (Vec<Placed>, u64) {
-        place(&chain(&self.sweep, self.levels), base)
+        place(&chain(&self.sweep, self.first, self.last), self.table, base)
     }
 }
 
-/// **The levels of `sweep` that can actually be copied**, as
+/// **The levels of `sweep` in `first..last` that can actually be copied**, as
 /// `(level, rows, gates)`.
 ///
 /// A level the payload is too short for, or one whose index does not fit a
 /// texture's, is left out entirely rather than placed and skipped later — so
 /// both routes agree on the whole question by construction.
-fn chain(sweep: &UiSweep, levels: usize) -> Vec<(u32, u32, u32)> {
-    (0..levels)
+fn chain(sweep: &UiSweep, first: usize, last: usize) -> Vec<(u32, u32, u32)> {
+    (first..last)
         .filter_map(|level| {
             let (rows, gates) = sweep.level_shape(level)?;
             sweep.level(level)?;
@@ -214,10 +253,13 @@ fn chain(sweep: &UiSweep, levels: usize) -> Vec<(u32, u32, u32)> {
 }
 
 /// **Where every region of a chain and its table sits**, laid from `base`, and
-/// the offset the next sweep starts at.
-fn place(levels: &[(u32, u32, u32)], base: u64) -> (Vec<Placed>, u64) {
+/// the offset the next filing starts at.
+///
+/// `table` is whether the colour table rides along — false on a filing that is
+/// extending a chain whose table crossed with the first one.
+fn place(levels: &[(u32, u32, u32)], table: bool, base: u64) -> (Vec<Placed>, u64) {
     let mut at = base;
-    let mut out = Vec::with_capacity(levels.len() + 1);
+    let mut out = Vec::with_capacity(levels.len() + usize::from(table));
     let mut push = |face, row_bytes: u32, rows: u32, width: u32, at: &mut u64| {
         let region = Placed {
             face,
@@ -234,13 +276,15 @@ fn place(levels: &[(u32, u32, u32)], base: u64) -> (Vec<Placed>, u64) {
         // One byte a code, so a row's texels and its bytes are one number.
         push(Face::Codes(level), gates, rows, gates, &mut at);
     }
-    push(
-        Face::Lut,
-        POLAR_LUT_BYTES as u32,
-        1,
-        POLAR_LUT_ENTRIES as u32,
-        &mut at,
-    );
+    if table {
+        push(
+            Face::Lut,
+            POLAR_LUT_BYTES as u32,
+            1,
+            POLAR_LUT_ENTRIES as u32,
+            &mut at,
+        );
+    }
     (out, at)
 }
 
@@ -487,7 +531,7 @@ mod tests {
                 levels.len() > 1,
                 "a one-level fixture cannot reach a per-level offset at all"
             );
-            let (placed, total) = place(&levels, 0);
+            let (placed, total) = place(&levels, true, 0);
             assert_eq!(
                 placed.len(),
                 levels.len() + 1,
@@ -533,7 +577,7 @@ mod tests {
         // The premise every alignment row above rests on: a real sweep's rows
         // are NOT already aligned, so those assertions are the padding firing
         // and not an identity.
-        let (surveillance, _) = place(&chain_of(720, 1832), 0);
+        let (surveillance, _) = place(&chain_of(720, 1832), true, 0);
         assert_ne!(
             surveillance[0].row_bytes % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
             0,
@@ -548,8 +592,8 @@ mod tests {
     /// A pass's second sweep is laid after the first, so one slot holds both.
     #[test]
     fn a_pass_lays_its_sweeps_end_to_end() {
-        let (first, after_first) = place(&chain_of(720, 1832), 0);
-        let (second, after_second) = place(&chain_of(720, 1192), after_first);
+        let (first, after_first) = place(&chain_of(720, 1832), true, 0);
+        let (second, after_second) = place(&chain_of(720, 1192), true, after_first);
         assert_eq!(
             second[0].offset, after_first,
             "the second sweep starts where the first ended"
@@ -568,7 +612,7 @@ mod tests {
         // ask for, and it has to fit a slot this path will build.
         let mut at = 0;
         for _ in 0..6 {
-            let (_, next) = place(&chain_of(720, 1832), at);
+            let (_, next) = place(&chain_of(720, 1832), true, at);
             at = next;
         }
         assert!(
