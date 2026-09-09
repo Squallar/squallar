@@ -45,7 +45,24 @@ macro_rules! resolve {
 /// Viewport size used by the harness — a landscape desktop-ish window.
 const SCREEN_SIZE: egui::Vec2 = egui::vec2(1024.0, 768.0);
 
-/// Nominal seconds between harness frames (only used by [`InputHarness::frame`]).
+/// How many frames [`InputHarness::settle_scroll`] gives an animation to
+/// come to rest before it calls the wait a bug — two seconds at
+/// [`FRAME_DT`], against an egui scroll animation that is tenths of a second.
+const SETTLE_FRAME_CAP: usize = 120;
+
+/// Seconds one [`InputHarness::frame`] advances the harness clock by.
+///
+/// A pass that does not move the clock is not a frame. egui takes
+/// `InputState::stable_dt` from the difference between two readings of
+/// `input.time`, so a pass at a pinned clock runs every animation at zero
+/// elapsed time. The visible one is [`egui::Area::fade_in`], on by default:
+/// its opacity is `input.time - last_became_visible_at`, so every floating
+/// surface sits part-way through its fade at an opacity no real frame is ever
+/// in, forever, and every colour and shape count this harness reads back out
+/// of one is that opacity multiplied through the app's own decision. It is
+/// self-sustaining, too: a mid-fade `Area` asks for an immediate repaint, and
+/// that is exactly the condition under which egui trusts the zero it just
+/// measured.
 const FRAME_DT: f64 = 1.0 / 60.0;
 
 /// The pane pointer state produced by one harness frame.
@@ -626,6 +643,32 @@ impl InputHarness {
     /// Scroll the widget under `pos`, as a wheel or a two-finger drag does.
     pub(crate) fn scroll_at(&mut self, pos: egui::Pos2, delta: egui::Vec2) {
         input_fidelity::wheel(&mut self.events, pos, egui::MouseWheelUnit::Point, delta);
+    }
+
+    /// Run frames until the scroll area under `id` stops moving, and return
+    /// where it came to rest.
+    ///
+    /// egui smooth-scrolls toward the offset a wheel asked for, so a reading
+    /// taken a fixed number of frames after the wheel is a sample of an
+    /// animation still in flight. Two such samples taken at different points
+    /// differ by how far the animation got between them, which is a fact
+    /// about the clock and not about the state egui kept under the id.
+    pub(crate) fn settle_scroll(&mut self, id: egui::Id) -> Option<egui::Vec2> {
+        let mut previous = self.scroll_offset(id);
+        let mut still = 0;
+        for _ in 0..SETTLE_FRAME_CAP {
+            self.frame();
+            let now = self.scroll_offset(id);
+            still = if now == previous { still + 1 } else { 0 };
+            if still == 2 {
+                return now;
+            }
+            previous = now;
+        }
+        panic!(
+            "the scroll area under {id:?} was still moving after \
+             {SETTLE_FRAME_CAP} frames, last at {previous:?}"
+        );
     }
 
     /// One wheel notch over `pos`, in whichever unit the browser chose to
@@ -2179,9 +2222,18 @@ impl InputHarness {
     /// Run a few input-free frames so panels, areas and windows have registered
     /// their layer rects before any assertion depends on them.
     pub(crate) fn warm_up(&mut self) {
-        for _ in 0..3 {
-            self.frame();
-        }
+        self.frame();
+        // The floating chrome became visible on the frame above, and egui
+        // fades an `Area` in over `animation_time` from there. A test that
+        // asked for a harness wants the settled UI the app spends all but its
+        // first fifth of a second in, not a sample of the fade, so the clock
+        // steps past it before the warm-up's last two frames. Read off the
+        // live style rather than written down here: a second copy of egui's
+        // number is a copy that goes stale.
+        let fade = f64::from(self.ctx.global_style().animation_time);
+        self.advance(fade + FRAME_DT);
+        self.frame();
+        self.frame();
     }
 
     /// The centre of the map pane — a safe "on the map" position.
@@ -2240,10 +2292,42 @@ impl InputHarness {
         self.time += seconds;
     }
 
+    /// What the harness clock reads, in seconds.
+    pub(crate) fn clock(&self) -> f64 {
+        self.time
+    }
+
+    /// Every floating surface the last frame painted that egui is still
+    /// fading in.
+    ///
+    /// [`egui::Area::fade_in`] is on by default and takes its opacity from
+    /// `input.time - last_became_visible_at`, so a surface listed here paints
+    /// as an opacity-multiplied copy of the colours the app asked for, and
+    /// asks for an immediate repaint on the way out. Every colour, and every
+    /// shape count, this harness reads back out of such a surface is that
+    /// multiplication, not the app's own decision.
+    pub(crate) fn areas_mid_fade(&self) -> Vec<egui::Id> {
+        let (time, predicted_dt) = self.ctx.input(|i| (i.time, i.predicted_dt));
+        let fade = self.ctx.global_style().animation_time;
+        let mut ids: Vec<egui::Id> = self
+            .ctx
+            .memory(|memory| memory.areas().visible_layer_ids())
+            .into_iter()
+            .filter(|layer| {
+                egui::AreaState::load(&self.ctx, layer.id)
+                    .and_then(|state| state.last_became_visible_at)
+                    .is_some_and(|since| (time - since) as f32 + predicted_dt / 2.0 < fade)
+            })
+            .map(|layer| layer.id)
+            .collect();
+        ids.sort_by_key(|id| id.value());
+        ids
+    }
+
     /// Advance the clock by `seconds`, then run one frame.
     pub(crate) fn frame_after(&mut self, seconds: f64) -> FrameOutcome {
         self.advance(seconds);
-        self.frame()
+        self.pass()
     }
 
     /// Run `count` frames spaced `seconds` apart and return the last outcome.
@@ -2483,8 +2567,17 @@ impl InputHarness {
         self.events.extend(events);
     }
 
-    /// Run one egui pass: `Gui::ui` followed by the pane pointer resolution.
+    /// Run one egui pass one nominal frame after the last one.
+    ///
+    /// The clock moves: see [`FRAME_DT`] for what a pass at a pinned time
+    /// does to everything egui animates.
     pub(crate) fn frame(&mut self) -> FrameOutcome {
+        self.frame_after(FRAME_DT)
+    }
+
+    /// Run one egui pass at the clock's current reading: `Gui::ui` followed by
+    /// the pane pointer resolution.
+    fn pass(&mut self) -> FrameOutcome {
         let mut raw_input = egui::RawInput {
             screen_rect: Some(self.screen_rect),
             time: Some(self.time),

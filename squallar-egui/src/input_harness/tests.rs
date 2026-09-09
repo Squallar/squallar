@@ -2105,8 +2105,11 @@ fn crossing_a_breakpoint_does_not_move_any_widget_id() {
         .expect("precondition: the scroll area must report an id")
         .1;
     h.scroll_at(egui::pos2(80.0, 400.0), egui::vec2(0.0, -120.0));
-    h.frames_for(3, FRAME_DT);
-    let scrolled = h.scroll_offset(scroll_id);
+    // Settled, not sampled: egui smooth-scrolls toward the offset the wheel
+    // asked for, so a reading taken a fixed number of frames after it is a
+    // sample of an animation still in flight. What this test is about is the
+    // state egui kept under the id, not how far that animation had got.
+    let scrolled = h.settle_scroll(scroll_id);
     assert!(
         scrolled.is_some_and(|o| o.y > 0.0),
         "precondition: the layers panel must have actually scrolled under \
@@ -2791,8 +2794,11 @@ fn the_layers_toggle_hides_and_restores_the_expanded_sidebar_with_its_state() {
         .expect("precondition: the panel must report its scroll id")
         .1;
     h.scroll_at(egui::pos2(80.0, 400.0), egui::vec2(0.0, -120.0));
-    h.frames_for(3, FRAME_DT);
-    let scrolled = h.scroll_offset(scroll_id);
+    // Settled, not sampled: egui smooth-scrolls toward the offset the wheel
+    // asked for, so a reading taken a fixed number of frames after it is a
+    // sample of an animation still in flight. What this test is about is the
+    // state egui kept under the id, not how far that animation had got.
+    let scrolled = h.settle_scroll(scroll_id);
     assert!(
         scrolled.is_some_and(|o| o.y > 0.0),
         "precondition: the panel must really have scrolled, got {scrolled:?}"
@@ -7046,8 +7052,11 @@ fn converting_a_pane_moves_no_widget_id() {
         .expect("precondition: the layers panel must report a scroll id")
         .1;
     h.scroll_at(egui::pos2(80.0, 400.0), egui::vec2(0.0, -120.0));
-    h.frames_for(3, FRAME_DT);
-    let scrolled = h.scroll_offset(scroll_id);
+    // Settled, not sampled: egui smooth-scrolls toward the offset the wheel
+    // asked for, so a reading taken a fixed number of frames after it is a
+    // sample of an animation still in flight. What this test is about is the
+    // state egui kept under the id, not how far that animation had got.
+    let scrolled = h.settle_scroll(scroll_id);
     assert!(
         scrolled.is_some_and(|offset| offset.y > 0.0),
         "precondition: the layers panel must have scrolled, got {scrolled:?}"
@@ -17443,5 +17452,52 @@ fn a_frame_with_the_menu_closed_builds_no_menu_model() {
         "a frame with the menu OPEN built {open} menu model(s). One is what \
          the dropdown draws from; zero would be an empty menu, and more than \
          one is the same waste moved rather than removed.",
+    );
+}
+
+/// **A harness frame is a frame, and a fresh harness is a settled UI.**
+///
+/// `InputHarness::frame` used to run its pass at a pinned `input.time`. egui
+/// derives every animation from that clock — `InputState::stable_dt` is the
+/// difference between two readings of it — so a pass driven this way ran at
+/// `stable_dt = 0` and nothing egui animates ever moved. The visible one is
+/// [`egui::Area::fade_in`], on by default: its opacity is
+/// `input.time - last_became_visible_at` remapped over `animation_time`, so
+/// every floating surface the app owns painted at 8% opacity on every frame,
+/// forever — a state no real frame is ever in. Every colour and every shape
+/// count read back out of those surfaces was that opacity multiplied through
+/// the app's own decision, and `Area` asked for an immediate repaint each
+/// pass, so the harness never settled either.
+///
+/// Three assertions, because each is satisfiable without the others: that a
+/// harness handed to a test starts settled, that a frame moves the clock at
+/// all, and that driving it the default way keeps it settled.
+#[test]
+fn a_frame_moves_the_harness_clock_and_leaves_no_surface_mid_fade() {
+    let mut h = InputHarness::new();
+    assert!(
+        h.areas_mid_fade().is_empty(),
+        "a fresh harness hands the test surfaces part-way through egui's \
+         fade-in: {:?}. Every colour and shape count read out of them is an \
+         opacity multiplied through the app's own decision, not the decision",
+        h.areas_mid_fade()
+    );
+
+    let before = h.clock();
+    h.frame();
+    assert!(
+        h.clock() > before,
+        "frame() ran the pass at {before}s and left the clock there: egui \
+         animates against input.time, so nothing driven this way can ever \
+         leave the state it started in"
+    );
+
+    for _ in 0..30 {
+        h.frame();
+    }
+    assert!(
+        h.areas_mid_fade().is_empty(),
+        "30 frames driven the default way left these surfaces mid-fade: {:?}",
+        h.areas_mid_fade()
     );
 }
