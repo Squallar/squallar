@@ -583,27 +583,60 @@ fn paint_tilt_ladder(
     let color = tilt_rung_color();
     let painter = painter.with_clip_rect(layout.plot);
 
-    for points in curves {
-        for pair in points.windows(2) {
-            let mid = pair[0] + (pair[1] - pair[0]) * 0.55;
-            painter.line_segment([pair[0], mid], egui::Stroke::new(3.0, halo));
-            painter.line_segment([pair[0], mid], egui::Stroke::new(1.0, color));
+    for points in curves.rows() {
+        let mut previous = None;
+        for point in points {
+            if let Some(from) = previous.replace(point) {
+                let mid = from + (point - from) * 0.55;
+                painter.line_segment([from, mid], egui::Stroke::new(3.0, halo));
+                painter.line_segment([from, mid], egui::Stroke::new(1.0, color));
+            }
         }
     }
 }
 
 /// Where each rung's beam centre crosses the section, in pane coordinates — one
 /// polyline per elevation, ascending with the ladder.
+///
+/// The polylines are **not materialised**. Every point is one beam-height call and
+/// one axis map over the shared range table, and the only consumer walks each rung
+/// once and draws it, so a `Vec` per rung would be filled and dropped inside the
+/// loop that reads it — fifteen allocations a frame on a fourteen-rung ladder.
+struct TiltCurves<'a> {
+    layout: &'a SectionLayout,
+    axes: &'a SectionAxes,
+    /// Each sample point along the line: its x in pane coordinates, and its ground
+    /// range from the site. Shared by every rung, which is why this one **is**
+    /// built — the great-circle walk behind it would otherwise run once per rung.
+    ranges: Vec<(f32, f64)>,
+    elevations: &'a [f64],
+}
+
+impl TiltCurves<'_> {
+    /// One polyline per elevation, in cut order, each `TILT_CURVE_SAMPLES + 1`
+    /// points long.
+    fn rows(&self) -> impl Iterator<Item = impl Iterator<Item = egui::Pos2> + '_> + '_ {
+        self.elevations.iter().map(move |&elev| {
+            self.ranges.iter().map(move |&(x, ground_km)| {
+                let km_msl = self.axes.base_km_msl + beam::height_at_ground_km(ground_km, elev);
+                egui::pos2(x, self.layout.y_of_height(self.axes, km_msl))
+            })
+        })
+    }
+}
+
+/// The ladder's curves, or `None` for a volume that has flown no cut yet — which
+/// is also what spares the range table below being built for nothing.
 #[allow(clippy::too_many_arguments)]
-fn tilt_curves(
-    layout: &SectionLayout,
-    axes: &SectionAxes,
+fn tilt_curves<'a>(
+    layout: &'a SectionLayout,
+    axes: &'a SectionAxes,
     a: (f64, f64),
     b: (f64, f64),
     site_lat: f64,
     site_lon: f64,
-    elevations: &[f64],
-) -> Option<Vec<Vec<egui::Pos2>>> {
+    elevations: &'a [f64],
+) -> Option<TiltCurves<'a>> {
     if elevations.is_empty() {
         return None;
     }
@@ -616,20 +649,12 @@ fn tilt_curves(
         })
         .collect();
 
-    Some(
-        elevations
-            .iter()
-            .map(|&elev| {
-                ranges
-                    .iter()
-                    .map(|&(x, ground_km)| {
-                        let km_msl = axes.base_km_msl + beam::height_at_ground_km(ground_km, elev);
-                        egui::pos2(x, layout.y_of_height(axes, km_msl))
-                    })
-                    .collect()
-            })
-            .collect(),
-    )
+    Some(TiltCurves {
+        layout,
+        axes,
+        ranges,
+        elevations,
+    })
 }
 
 /// Whether the ladder this section was cut from reached the top of the coverage

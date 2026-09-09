@@ -15,6 +15,15 @@ const BARE_LADDER: Ladder<'static> = Ladder {
 /// Two wrapped rows, for the tests about the caption taking room.
 const TWO_LINES: f32 = 30.0;
 
+/// The ladder's rungs as points, materialised **here**.
+///
+/// [`TiltCurves`] streams them: the painter walks each rung once and draws it, so
+/// nothing in production holds one. These pins read a rung by index, which is what
+/// this collect is for — the points and their order are the iterator's own.
+fn rung_points(curves: &TiltCurves<'_>) -> Vec<Vec<egui::Pos2>> {
+    curves.rows().map(Iterator::collect).collect()
+}
+
 fn axes() -> SectionAxes {
     SectionAxes {
         length_km: 100.0,
@@ -670,8 +679,10 @@ fn a_real_tilt_ladder_draws_and_fans_apart_with_range() {
         ..axes()
     };
 
-    let curves = tilt_curves(&layout, &axes, a, b, site_lat, site_lon, &VCP_212)
-        .expect("a complete VCP 212 reflectivity ladder must draw its rungs");
+    let curves = rung_points(
+        &tilt_curves(&layout, &axes, a, b, site_lat, site_lon, &VCP_212)
+            .expect("a complete VCP 212 reflectivity ladder must draw its rungs"),
+    );
     assert_eq!(curves.len(), VCP_212.len(), "one polyline per rung");
 
     for pair in curves.windows(2) {
@@ -699,8 +710,10 @@ fn a_real_tilt_ladder_draws_and_fans_apart_with_range() {
         tilt_count: partial.len(),
         ..axes
     };
-    let curves = tilt_curves(&layout, &mid_flight, a, b, site_lat, site_lon, partial)
-        .expect("a volume four cuts into its flight still has four real rungs");
+    let curves = rung_points(
+        &tilt_curves(&layout, &mid_flight, a, b, site_lat, site_lon, partial)
+            .expect("a volume four cuts into its flight still has four real rungs"),
+    );
     assert_eq!(curves.len(), partial.len());
 }
 
