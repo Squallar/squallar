@@ -511,9 +511,31 @@ fn only_the_allocation_on_both_sides_is_shared() {
 ///    nothing for the sweep to keep or drop.
 ///
 /// The consequence is asserted where it is spent — the volume becomes
-/// tradeable — and by `Arc::strong_count`, not by a store row: the still
-/// inventory holds the same allocation, so the count falling by exactly one is
-/// what says the loop cache really let go.
+/// tradeable — and it is asserted as a PROPERTY of the cache and not as a
+/// refcount.
+///
+/// **It was a refcount, and a refcount is a clock here.** The assertion read
+/// `Arc::strong_count` before the trade and demanded it be exactly one lower
+/// after, and it went red once at loadavg 16.1 with `left: 3, right: 4` — the
+/// count had fallen by TWO, because the sample it was measured against was
+/// one too high. `volume_drop_parts` hands a SHARED volume to
+/// `squallar_worker::offload::discard` whole (`VolumeDropPart::Shared`), and
+/// on native that payload is held by a free-lane worker THREAD until it is
+/// scheduled. So between the two samples a holder the application had already
+/// let go of can disappear, and under load it does. The neighbouring
+/// `the_drain_alone_arms_the_joint_release` had already written this down —
+/// "`Arc::strong_count`, which measures the process-global deferred-drop lane
+/// and is not deterministic here" — and this test used it anyway.
+///
+/// Nothing about the application was wrong on the red run: it had handed the
+/// allocation away and the drop worker had not got to it yet. What was wrong
+/// was asking how far that worker had got.
+///
+/// So the question is asked of the cache instead, and the answer is stronger
+/// than the count was: the eviction must hand back **this allocation**
+/// (`Arc::ptr_eq`, not a count that any holder letting go would satisfy), and
+/// the cache must no longer name it. Neither reads a clock, and neither can
+/// be moved by a thread.
 #[test]
 fn a_drain_arrivals_archive_survives_the_sweep_that_only_knew_its_address() {
     let mut app = app_on_site();
@@ -571,13 +593,16 @@ fn a_drain_arrivals_archive_survives_the_sweep_that_only_knew_its_address() {
             .expect("the parked volume is still cached")
             .0,
     );
-    let before = Arc::strong_count(&volume);
-    drop(app.loop_mgr.evict_decoded_except(|_, _, _| false));
-    assert_eq!(
-        Arc::strong_count(&volume),
-        before - 1,
+    let traded = app.loop_mgr.evict_decoded_except(|_, _, _| false);
+    assert!(
+        traded.iter().any(|(scan, _)| Arc::ptr_eq(scan, &volume)),
         "the loop cache did not let go of the volume, so keeping the archive \
          bought nothing",
+    );
+    assert!(
+        app.loop_mgr.get_cached(SITE, &at(0)).is_none(),
+        "the loop cache handed the volume back and is still serving it, so \
+         the trade freed nothing it could not immediately undo",
     );
 }
 
