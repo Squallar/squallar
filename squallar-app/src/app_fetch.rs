@@ -2985,8 +2985,21 @@ impl super::App {
         // archive on the next residency pass exactly as before; what changed
         // is that the pass in between can now trade 33.7-82.7 MiB of decoded
         // volume for it, at a median 5.8 % of the cost.
-        if let Some(archive) = archive {
-            self.loop_mgr.cache_archive(site, timestamp, archive);
+        match archive {
+            Some(archive) => {
+                // **The same physical volume may already be here under its
+                // other clock**, filed by the chunk feed with no compressed
+                // half and therefore un-evictable for the life of the
+                // process. It can have this one: same sweep, same bytes, no
+                // network. See `LoopDownloadManager::share_archive_with_twin`.
+                self.loop_mgr
+                    .share_archive_with_twin(site, timestamp, &archive);
+                self.loop_mgr.cache_archive(site, timestamp, archive);
+            }
+            // The reachability denominator for `radar dup volumes:`. On this
+            // tree the chunk feed's assembled volumes are the only arrivals
+            // with no compressed half, so this counts them and nothing else.
+            None => self.loop_mgr.note_archiveless_file(),
         }
 
         let allocation = self.loop_allocation();

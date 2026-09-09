@@ -252,6 +252,20 @@ pub struct LoopDownloadManager {
     /// field instead.
     scan_over_arrivals: u64,
     scan_over_arrival_bytes: u64,
+    /// **One physical volume decoded twice, arriving at a second address** —
+    /// the counters behind [`Self::identity_duplication`].
+    ///
+    /// A volume has an address (the `(site, timestamp)` it is filed under) and
+    /// an identity ([`crate::types::volume_collected_at`]), and the two are
+    /// equal on 0 of the 171 local Archive II volumes. So the chunk feed's
+    /// assembled volume and the S3 archive of the SAME sweep are filed under
+    /// two addresses, and nothing in this cache asks whether it is already
+    /// holding what has just been handed to it.
+    ///
+    /// Counted at the seam and never sampled on a tick: a duplicate that the
+    /// residency pass evicts between two 2 s readings is a real duplicate the
+    /// level would report as zero.
+    identity_dup: IdentityDuplication,
     /// The price of each cached volume, so [`Self::retain_scans`] subtracts
     /// what it removes instead of re-walking it. Keyed exactly as
     /// [`scan_cache`](Self::scan_cache) is addressed, and every mutation of
@@ -333,6 +347,83 @@ pub struct LoopDownloadManager {
     l3_bytes_cached: usize,
 }
 
+/// **How often this cache was handed a volume it was already holding under
+/// another address**, and what the second copy cost.
+///
+/// # Why an address is not an identity
+///
+/// [`LoopDownloadManager::cache_scan`] files a volume under the
+/// `(site, timestamp)` its arrival names. The chunk feed's assembled volume
+/// is addressed by the moment the feed closed it; the S3 archive of the same
+/// sweep is addressed by the second its object key names. Over the 171 local
+/// Archive II volumes those two instants are equal on **0**, a median 437 ms
+/// apart, so the same physical volume filed by both routes never collides by
+/// luck and this cache holds it twice.
+///
+/// # Every field's denominator
+///
+/// * `files` — every [`LoopDownloadManager::cache_scan`] call whose volume
+///   states an identity at all. The denominator for all of the below, and
+///   the figure that says whether the mechanism was reachable on this leg:
+///   a zero here means nothing was cached, not that nothing was duplicated.
+/// * `archiveless_files` — of the volumes filed, the ones that arrived with
+///   no compressed half. On this tree that is the chunk feed's assembled
+///   whole volumes and nothing else, so it is the **reachability
+///   denominator**: a duplicate needs one of these resident before an archive
+///   of the same sweep arrives, and a `dup 0` beside an `archiveless_files 0`
+///   says the mechanism never had a chance rather than that it has none.
+/// * `duplicates` — of those, files landing on a DIFFERENT address whose
+///   volume this cache is still holding at the same identity.
+/// * `same_allocation` — duplicates whose arriving `Arc` **is** the resident
+///   one, pointer-equal. One allocation under two keys: a merge over these
+///   frees nothing at all, and the count exists so the two readings can never
+///   be confused for each other. This campaign has read `sole 0` on three
+///   cuts whose bytes looked certain, and this is the field that tells the
+///   two apart before a line of the cut is written.
+/// * `twin_archiveless` — duplicates whose resident twin has no archive
+///   behind it, so [`LoopDownloadManager::evict_decoded_except`] refuses to
+///   evict it. These are the chunk feed's assembled volumes.
+///
+/// # Two prices, because there are two merges and they free different bytes
+///
+/// * `arrival_bytes` / `arrival_sole_bytes` — the arriving copy's price, and
+///   the part of it on arrivals **no other holder names**. Declining to file
+///   one frees `arrival_sole_bytes`; the rest is a refcount.
+/// * `twin_bytes` / `twin_sole_bytes` — the RESIDENT copy's price, and the
+///   part of it this cache holds alone. Evicting the superseded twin frees
+///   `twin_sole_bytes`.
+///
+/// The two are counted separately and are never summed: they are the same
+/// physical volume, and only one of the two copies can be dropped.
+///
+/// # What the merge does, and what it is worth
+///
+/// * `merges` — resident twins handed the arriving volume's compressed half
+///   by [`LoopDownloadManager::share_archive_with_twin`], which is what turns
+///   an un-evictable chunk-fed volume into one the residency pass may trade.
+/// * `merge_bytes` — those twins' decoded prices, summed. An UPPER BOUND on
+///   what the merge frees and never a claim that it was freed: the residency
+///   pass still has to want the volume gone, and a twin some other store also
+///   names frees a refcount when it goes. `twin_sole_bytes` above is the part
+///   that was already sole AT THE SEAM, and it is measured 0 on the real
+///   arrival — the chunk feed's own volume is the site's merge base at the
+///   moment its archive lands, and only stops being one when the base
+///   advances.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IdentityDuplication {
+    pub files: u64,
+    pub archiveless_files: u64,
+    pub duplicates: u64,
+    pub arrival_bytes: u64,
+    pub arrival_sole_bytes: u64,
+    pub twin_bytes: u64,
+    pub twin_sole_bytes: u64,
+    pub same_allocation: u64,
+    pub twin_archiveless: u64,
+    pub merges: u64,
+    pub merge_bytes: u64,
+}
+
 /// A pane's undispatched loop downloads, with the site they belong to.
 pub struct PendingDownloads {
     /// The site the listing was made for. Every volume in `queue` is one of
@@ -408,6 +499,7 @@ impl LoopDownloadManager {
             scan_reserve_bootstrap: 0,
             scan_over_arrivals: 0,
             scan_over_arrival_bytes: 0,
+            identity_dup: IdentityDuplication::default(),
             scan_prices: HashMap::new(),
             archives_ever: std::collections::HashSet::new(),
             archive_identity: HashMap::new(),
@@ -531,6 +623,10 @@ impl LoopDownloadManager {
         // halves are in hand.** Kept past the volume's own eviction: see
         // `archive_identity`.
         if let Some(collected) = crate::types::volume_collected_at(&volume.0) {
+            // Asked before the insert, so the walk below cannot find the
+            // arrival itself, and before `archive_identity` learns this
+            // address for the same reason.
+            self.note_identity_duplication(site, ts, &volume.0, price, collected);
             self.archive_identity
                 .insert((site.to_string(), ts), collected);
         }
@@ -1077,6 +1173,200 @@ impl LoopDownloadManager {
     pub fn site_scan_reserve_bytes(&self, site: &str) -> usize {
         self.scan_reserve_bootstrap
             .max(self.site_scan_peak.get(site).copied().unwrap_or(0))
+    }
+
+    /// **Score one arrival against what this cache is already holding at the
+    /// same identity**, for [`Self::identity_duplication`]. Called from
+    /// [`Self::cache_scan`] before the arrival is filed.
+    ///
+    /// `holders` is read off the arriving `Arc` while this cache still holds
+    /// none of it, so `1` is "the caller has let go and the cache is about to
+    /// become the only reference" — the state in which declining to file the
+    /// volume frees its whole price rather than a refcount.
+    ///
+    /// A linear walk of `archive_identity`, which is one entry per address
+    /// this cache has filed: a few dozen, once per decode.
+    fn note_identity_duplication(
+        &mut self,
+        site: &str,
+        ts: chrono::NaiveDateTime,
+        arriving: &Arc<nexrad_model::data::Scan>,
+        price: usize,
+        collected: chrono::NaiveDateTime,
+    ) {
+        self.identity_dup.files = self.identity_dup.files.saturating_add(1);
+        let twin = self
+            .archive_identity
+            .iter()
+            .find(|((held_site, held_ts), identity)| {
+                held_site.as_str() == site
+                    && *held_ts != ts
+                    && **identity == collected
+                    && self
+                        .scan_cache
+                        .get(site)
+                        .is_some_and(|scans| scans.contains_key(held_ts))
+            });
+        let Some(((_, twin_ts), _)) = twin else {
+            return;
+        };
+        let twin_ts = *twin_ts;
+        // Pointer and holder count off the RESIDENT copy: what evicting the
+        // superseded twin would free is its own sole-ness, not the arrival's.
+        let (resident, twin_holders) = self
+            .scan_cache
+            .get(site)
+            .and_then(|scans| scans.get(&twin_ts))
+            .map_or((None, 0), |(scan, _)| {
+                (Some(Arc::as_ptr(scan)), Arc::strong_count(scan))
+            });
+        let twin_price = self
+            .scan_prices
+            .get(&(site.to_string(), twin_ts))
+            .copied()
+            .unwrap_or(0);
+        let arrival_holders = Arc::strong_count(arriving);
+        let dup = &mut self.identity_dup;
+        dup.duplicates = dup.duplicates.saturating_add(1);
+        dup.arrival_bytes = dup.arrival_bytes.saturating_add(price as u64);
+        dup.twin_bytes = dup.twin_bytes.saturating_add(twin_price as u64);
+        if resident == Some(Arc::as_ptr(arriving)) {
+            dup.same_allocation = dup.same_allocation.saturating_add(1);
+        } else {
+            // The arrival: this cache holds none of it yet, so `1` is the
+            // caller having let go.
+            if arrival_holders == 1 {
+                dup.arrival_sole_bytes = dup.arrival_sole_bytes.saturating_add(price as u64);
+            }
+            // The twin: this cache is already one of its holders, so `1` is
+            // the cache alone.
+            if twin_holders == 1 {
+                dup.twin_sole_bytes = dup.twin_sole_bytes.saturating_add(twin_price as u64);
+            }
+        }
+        if !self
+            .archive_cache
+            .get(site)
+            .is_some_and(|archives| archives.contains_key(&twin_ts))
+        {
+            dup.twin_archiveless = dup.twin_archiveless.saturating_add(1);
+        }
+        log::debug!(
+            "{site}: a volume collected at {collected} arrived at {ts} while this cache \
+             already holds it at {twin_ts} (arrival {} B/{} holder(s), twin {} B/{} holder(s), \
+             twin archive {})",
+            price,
+            arrival_holders,
+            twin_price,
+            twin_holders,
+            if self
+                .archive_cache
+                .get(site)
+                .is_some_and(|archives| archives.contains_key(&twin_ts))
+            {
+                "held"
+            } else {
+                "absent"
+            },
+        );
+    }
+
+    /// **Give a resident copy of this same physical volume the compressed half
+    /// it never had**, from the archive that has just arrived for it under the
+    /// other clock. Returns whether a twin was found.
+    ///
+    /// # Why there is a twin at all
+    ///
+    /// A volume's ADDRESS is the `(site, timestamp)` it was filed under and
+    /// its IDENTITY is [`crate::types::volume_collected_at`]. The chunk feed
+    /// closes a whole volume and files it at one; the S3 object for the same
+    /// sweep is filed at the second its key names. Measured on a real
+    /// six-site leg: KINX's 21:07:05.736 volume arrived again at 21:07:05,
+    /// 736 ms apart, **pointer-distinct** — two decodes of one sweep, 58.1
+    /// MiB each. Over the 171 local Archive II volumes the two clocks are
+    /// equal on 0, so this never collides by luck.
+    ///
+    /// # Why the archive and not the volume
+    ///
+    /// The arriving decoded half cannot simply be dropped: the loop frame the
+    /// listing appended names the ARRIVAL's address, and a frame whose volume
+    /// is not cached is one the pump downloads again. What can be moved at no
+    /// cost is the compressed half, which is an `Arc` clone and not a copy of
+    /// 1.0-16.1 MiB. With it the twin becomes `rebuildable`, and
+    /// [`Self::evict_decoded_except`] — which refuses a volume with nothing to
+    /// decode from, and for the chunk feed's volumes therefore refuses
+    /// forever — may trade it on the next residency pass.
+    ///
+    /// **The archive is priced under both addresses** while both stand. One
+    /// allocation, two rows: `archive_bytes_cached` is a retention bound and
+    /// over-counting inside it can only evict earlier, never later, and
+    /// [`Self::evict_archives_to_ceiling`] degrades to a re-download, which is
+    /// what a frame costs today. Under-counting could hold the ceiling open
+    /// on bytes nobody had budgeted, which is the direction that cannot be
+    /// allowed.
+    ///
+    /// Skips a twin that already has an archive: it is already tradeable, and
+    /// re-filing would replace a live buffer for nothing.
+    ///
+    /// A linear walk of the identity index — one entry per filed address, a
+    /// few dozen — once per arrival that carries an archive.
+    pub fn share_archive_with_twin(
+        &mut self,
+        site: &str,
+        ts: chrono::NaiveDateTime,
+        archive: &Arc<Vec<u8>>,
+    ) -> bool {
+        let Some(collected) = self.archive_identity.get(&(site.to_string(), ts)).copied() else {
+            return false;
+        };
+        let twin = self
+            .archive_identity
+            .iter()
+            .find(|((held_site, held_ts), identity)| {
+                held_site.as_str() == site
+                    && *held_ts != ts
+                    && **identity == collected
+                    && self
+                        .scan_cache
+                        .get(site)
+                        .is_some_and(|scans| scans.contains_key(held_ts))
+                    && !self
+                        .archive_cache
+                        .get(site)
+                        .is_some_and(|archives| archives.contains_key(held_ts))
+            })
+            .map(|((_, held_ts), _)| *held_ts);
+        let Some(twin_ts) = twin else {
+            return false;
+        };
+        let price = self
+            .scan_prices
+            .get(&(site.to_string(), twin_ts))
+            .copied()
+            .unwrap_or(0);
+        self.identity_dup.merges = self.identity_dup.merges.saturating_add(1);
+        self.identity_dup.merge_bytes = self.identity_dup.merge_bytes.saturating_add(price as u64);
+        log::debug!(
+            "{site}: the volume at {twin_ts} is the one that arrived at {ts}, so it takes \
+             that archive and becomes evictable ({price} B decoded)"
+        );
+        self.cache_archive(site, twin_ts, Arc::clone(archive));
+        true
+    }
+
+    /// **Note a volume filed with no compressed half**, the reachability
+    /// denominator for [`Self::identity_duplication`]. Called by the app
+    /// beside [`Self::cache_scan`], because whether an arrival brought an
+    /// archive is the caller's fact and never this cache's.
+    pub fn note_archiveless_file(&mut self) {
+        self.identity_dup.archiveless_files = self.identity_dup.archiveless_files.saturating_add(1);
+    }
+
+    /// **One physical volume decoded twice**, as counters taken at the seam.
+    ///
+    /// Always on, and reported whether or not anything gates on it.
+    pub fn identity_duplication(&self) -> IdentityDuplication {
+        self.identity_dup
     }
 
     /// **Volumes that arrived larger than the reserve in force for them**,
@@ -1906,6 +2196,151 @@ mod tests {
             )),
             Arc::default(),
         )
+    }
+
+    /// **One physical volume, two addresses, TWO ALLOCATIONS** — the reading
+    /// the whole duplicate-volume question turns on.
+    ///
+    /// `priced_volume` stamps every radial with one collection timestamp, so
+    /// two of them are one identity at two addresses: exactly the shape the
+    /// chunk feed and the S3 archive produce for one sweep, whose two clocks
+    /// are equal on 0 of the 171 local volumes.
+    ///
+    /// The third file is the OTHER reading, and it is asserted in the same
+    /// test on purpose: the same `Arc` under two keys is one allocation, a
+    /// merge over it would free a refcount and no memory, and three cuts in
+    /// this campaign have been priced against exactly that confusion. If the
+    /// two ever collapsed into one counter this test would still pass on
+    /// `duplicates` alone, so it reads `same_allocation` and `sole_bytes`
+    /// separately.
+    ///
+    /// TAMPER: make `note_identity_duplication` compare `held_ts == ts`
+    /// instead of `!=`, or drop the `scan_cache` residency conjunct, and the
+    /// counts move.
+    #[test]
+    fn one_volume_at_two_addresses_is_two_allocations_and_the_second_is_sole() {
+        let mut mgr = LoopDownloadManager::new();
+        assert_eq!(mgr.identity_duplication(), IdentityDuplication::default());
+
+        mgr.cache_scan("KTLX", ts(0), priced_volume());
+        let first = mgr.identity_duplication();
+        assert_eq!(first.files, 1, "the volume states an identity");
+        assert_eq!(first.duplicates, 0, "nothing was held to duplicate");
+
+        // The same physical volume, arriving at the address its archive names.
+        mgr.cache_scan("KTLX", ts(1), priced_volume());
+        let dup = mgr.identity_duplication();
+        assert_eq!(dup.files, 2);
+        assert_eq!(dup.duplicates, 1, "the second file is the same identity");
+        assert_eq!(
+            dup.same_allocation, 0,
+            "two decodes are two allocations, and a pointer compare says so"
+        );
+        assert!(
+            dup.arrival_sole_bytes > 0,
+            "nothing else holds the arriving volume, so declining to file it \
+             frees its whole price and not a refcount"
+        );
+        assert_eq!(
+            dup.arrival_sole_bytes, dup.arrival_bytes,
+            "the fixture has no other holder"
+        );
+        assert_eq!(
+            dup.twin_sole_bytes, dup.twin_bytes,
+            "this cache is the resident twin's only holder, so evicting the \
+             superseded copy frees its whole price"
+        );
+        assert!(dup.twin_bytes > 0, "the twin priced at nothing");
+        assert_eq!(
+            dup.twin_archiveless, 1,
+            "the resident twin has no archive, so `evict_decoded_except` \
+             cannot drop it either"
+        );
+
+        // The OTHER reading: one allocation filed under two keys.
+        let shared = priced_volume();
+        mgr.cache_scan("KINX", ts(0), shared.clone());
+        mgr.cache_scan("KINX", ts(1), shared);
+        let both = mgr.identity_duplication();
+        assert_eq!(both.duplicates, 2, "the second KINX file duplicates too");
+        assert_eq!(
+            both.same_allocation, 1,
+            "pointer-equal, so a merge over it frees nothing"
+        );
+        assert_eq!(
+            (both.arrival_sole_bytes, both.twin_sole_bytes),
+            (dup.arrival_sole_bytes, dup.twin_sole_bytes),
+            "a pointer-equal duplicate adds no freeable bytes on either side"
+        );
+    }
+
+    /// **The merge hands a chunk-fed volume a way back, and the residency
+    /// pass can then take it** — the whole point of the cut, asserted through
+    /// `evict_decoded_except` rather than through `has_archive` alone, because
+    /// an archive filed somewhere the evictor does not look would satisfy the
+    /// weaker assertion and buy nothing.
+    ///
+    /// The control is the second half: a twin that ALREADY has an archive is
+    /// not re-filed, and a site with no twin at all fires nothing. Without
+    /// them a `share_archive_with_twin` that returned `true` unconditionally
+    /// would pass on the fires counter.
+    ///
+    /// TAMPER: drop the `!archive_cache.contains_key` conjunct and the
+    /// already-archived control fires; drop the `*held_ts != ts` conjunct and
+    /// the no-twin control fires.
+    #[test]
+    fn the_merge_gives_a_chunk_fed_twin_a_way_back_and_the_evictor_takes_it() {
+        let mut mgr = LoopDownloadManager::new();
+        let archive: Arc<Vec<u8>> = Arc::new(vec![7u8; 4096]);
+
+        // The chunk feed's volume, with no compressed half, and the archive of
+        // the same sweep arriving under the other clock.
+        mgr.cache_scan("KTLX", ts(0), priced_volume());
+        mgr.cache_scan("KTLX", ts(1), priced_volume());
+
+        // Precondition: the residency pass cannot take either of them.
+        assert!(
+            mgr.evict_decoded_except(|_, _, _| false).is_empty(),
+            "precondition: a volume with no archive is never evicted"
+        );
+
+        assert!(
+            mgr.share_archive_with_twin("KTLX", ts(1), &archive),
+            "the twin at ts(0) is the same physical volume and has no archive"
+        );
+        let fired = mgr.identity_duplication();
+        assert_eq!(
+            fired.merges, 1,
+            "the fires counter did not record the merge"
+        );
+        assert!(fired.merge_bytes > 0, "the merged twin priced at nothing");
+        assert!(mgr.has_archive("KTLX", &ts(0)), "the twin took the archive");
+
+        // The reading the cut is FOR: the evictor may now trade it.
+        let taken = mgr.evict_decoded_except(|_, at, _| *at != ts(0));
+        assert_eq!(taken.len(), 1, "the merged twin is still un-evictable");
+        assert!(!mgr.is_cached("KTLX", &ts(0)), "the twin is gone");
+
+        // Control: a twin that already has an archive is not re-filed.
+        mgr.cache_scan("KINX", ts(0), priced_volume());
+        mgr.cache_archive("KINX", ts(0), Arc::clone(&archive));
+        mgr.cache_scan("KINX", ts(1), priced_volume());
+        assert!(
+            !mgr.share_archive_with_twin("KINX", ts(1), &archive),
+            "a twin that can already be rebuilt was merged again"
+        );
+
+        // Control: a site holding one volume has no twin to merge with.
+        mgr.cache_scan("KVNX", ts(0), priced_volume());
+        assert!(
+            !mgr.share_archive_with_twin("KVNX", ts(0), &archive),
+            "a volume was merged with itself"
+        );
+        assert_eq!(
+            mgr.identity_duplication().merges,
+            1,
+            "a control fired the counter"
+        );
     }
 
     /// **The byte totals track what the caches hold**, over a file, a

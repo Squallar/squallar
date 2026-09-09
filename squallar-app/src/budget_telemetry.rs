@@ -862,6 +862,50 @@ pub(crate) fn radar_volume_line(
     )
 }
 
+/// `radar dup volumes: files N (archive-less N), dup N (twin archive-less N, same allocation N),
+/// arrival N MiB sole N MiB, twin N MiB sole N MiB; merged N at N MiB` — said
+/// every telemetry period.
+///
+/// `merged` is the FIRES counter: how many resident twins were handed a
+/// compressed half they never had, and what those twins are holding decoded.
+/// It is an upper bound on what the merge frees and never a claim that it was
+/// freed — three cuts in this campaign were binned for mechanisms that
+/// executed zero times, and this is the field a reader checks first.
+///
+/// The two byte pairs are the two copies of ONE physical volume and are never
+/// added: only one of them can be dropped, and which one is the cut's choice.
+///
+/// The seam counters behind [`squallar_radar::loop_downloads::IdentityDuplication`],
+/// whose doc carries what each denominator is. Printed here because the
+/// question it answers — is one physical volume decoded twice — cannot be
+/// read off any level: a duplicate the residency pass drops between two 2 s
+/// readings is a real duplicate a sampled level reports as zero.
+///
+/// `same allocation` is the null reading and is printed even when it is zero.
+/// A merge over pointer-equal entries frees a refcount and no memory, and
+/// this campaign has read `sole 0` three times on cuts whose bytes looked
+/// certain; a line that could not distinguish the two would be worse than no
+/// line.
+pub(crate) fn radar_duplicate_volume_line(
+    dup: squallar_radar::loop_downloads::IdentityDuplication,
+) -> String {
+    let mib = |bytes: u64| bytes / (1024 * 1024);
+    format!(
+        "radar dup volumes: files {} (archive-less {}), dup {} (twin archive-less {}, same allocation {}), arrival {} MiB sole {} MiB, twin {} MiB sole {} MiB; merged {} at {} MiB",
+        dup.files,
+        dup.archiveless_files,
+        dup.duplicates,
+        dup.twin_archiveless,
+        dup.same_allocation,
+        mib(dup.arrival_bytes),
+        mib(dup.arrival_sole_bytes),
+        mib(dup.twin_bytes),
+        mib(dup.twin_sole_bytes),
+        dup.merges,
+        mib(dup.merge_bytes),
+    )
+}
+
 /// **What a merge base is holding that nothing would free**, as a LEVEL read
 /// on the telemetry tick.
 ///

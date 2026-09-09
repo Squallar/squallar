@@ -3181,6 +3181,12 @@ impl super::App {
                 parked_bytes,
             ),
         );
+        say_telemetry(
+            loud,
+            &crate::budget_telemetry::radar_duplicate_volume_line(
+                self.loop_mgr.identity_duplication(),
+            ),
+        );
         self.publish_heap_census();
         // **One reading of the idle policy, off the level the call above just
         // folded.** `render pools` is the largest family on a quiet scene and
