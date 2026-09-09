@@ -2923,6 +2923,14 @@ impl super::App {
         // tick that notices. See [`crate::render_pool_trim`] — the trim itself
         // is a `take` and a hand-off to the free lane, never a free here.
         crate::render_pool_trim::observe_reading(self.render.in_flight_image_bytes() == 0);
+        // **And the same reading for the grid-decode pools.** `overlay grids`
+        // is the largest family on a still scene and half of it is the two
+        // parked decode blocks, which nothing reads and which only the
+        // pressure step above has ever given back — so a session that never
+        // hits a wall holds 64,000,000 B for its whole life. See
+        // [`crate::grid_pool_trim`] for the measured prices on both sides of
+        // the trade and for why the wasm32 arm does not take it.
+        crate::grid_pool_trim::observe_reading();
         say_telemetry(
             loud,
             &squallar_egui::heap_census::line(

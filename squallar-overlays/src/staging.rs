@@ -61,7 +61,7 @@
 //!   assert on.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// **One retained grid-sized buffer, and the running count of what it saved.**
 ///
@@ -88,6 +88,23 @@ pub struct StagingPool<T> {
     /// differing is the product having moved, which is a fact worth reading
     /// rather than an error.
     nominal_points: usize,
+    /// **Whether an offered buffer may be parked here at all**, `true` until
+    /// something turns it off.
+    ///
+    /// The idle trim's other half, and the reason the trim moves a *peak*
+    /// rather than only an average. Releasing the block on its own gives it
+    /// back for as long as it takes the next granule to arrive and be
+    /// displaced — on a still MRMS leg about eight seconds out of every two
+    /// minutes — so a census sampling every two seconds still catches a
+    /// parked mosaic and the family's high-water mark does not move at all.
+    /// A trim that also stops the *parking* holds the released state until a
+    /// decode cadence that the pool is worth something to comes back.
+    ///
+    /// `true` here and never set false by this module: the one caller is an
+    /// idle policy in the layer that owns the source, which on a target where
+    /// an idle trim buys nothing never runs. A pool nobody has told otherwise
+    /// behaves exactly as it did before this field existed.
+    retaining: AtomicBool,
     /// Grid-sized buffers this pool had to allocate. **The figure the shipping
     /// defect is about**: one per granule without a pool, one per process, per
     /// live block, with it.
@@ -189,6 +206,7 @@ impl<T: Copy> StagingPool<T> {
         Self {
             slot: Mutex::new(None),
             nominal_points: points,
+            retaining: AtomicBool::new(true),
             allocated: AtomicUsize::new(0),
             reused: AtomicUsize::new(0),
             declined: AtomicUsize::new(0),
@@ -281,6 +299,13 @@ impl<T: Copy> StagingPool<T> {
     /// buffer is dropped here, which is what every buffer did before this
     /// module existed.
     pub fn give(&self, mut values: Vec<T>) {
+        // **Parking turned off** — see [`Self::retaining`]. Counted as a
+        // decline like every other refusal, so a pool held open reads as one
+        // refusing offers rather than as one nobody is offering to.
+        if !self.is_retaining() {
+            self.declined.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         // A zero-capacity `Vec` owns nothing, so retaining it would park no
         // block at all while making the next real offer read as a full slot and
         // the next decode read as a resize.
@@ -329,6 +354,55 @@ impl<T: Copy> StagingPool<T> {
     /// pressure the block is worth more free than parked, whereas a short idle
     /// threshold re-introduces exactly one mosaic-sized allocate-and-free per
     /// poll, on a heap that cannot coalesce, for a layer that is still on.
+    /// **The retained buffer itself**, for a caller that must free it
+    /// somewhere other than here.
+    ///
+    /// [`Self::release_retained`] drops the block on the calling thread, which
+    /// is right for the pressure step — a governor that has just been refused
+    /// an allocation wants the bytes back before it returns. An *idle* trim is
+    /// the other case: it runs on the frame thread on an ordinary tick, so the
+    /// free belongs on `squallar_worker::offload`'s lane and the block has to
+    /// leave here still owned. Measured on this workspace's own box, dropping
+    /// both shipped blocks (64,000,000 B) is 0.218-0.467 ms over twelve
+    /// samples — small, and still not something an interaction frame should be
+    /// asked to spend when a lane exists that need not.
+    ///
+    /// `None` means nothing was retained, or — vanishingly rarely — a decode
+    /// held the lock. `try_lock`, never `lock`, for the reason [`Self::take`]
+    /// gives.
+    pub fn take_retained(&self) -> Option<Vec<T>> {
+        let mut slot = self.slot.try_lock().ok()?;
+        let buffer = slot.take()?;
+        self.retained_points.store(0, Ordering::Relaxed);
+        Some(buffer)
+    }
+
+    /// **Whether this pool may park an offered buffer.** See
+    /// [`Self::retaining`].
+    pub fn is_retaining(&self) -> bool {
+        self.retaining.load(Ordering::Relaxed)
+    }
+
+    /// Turn parking on or off. `false` also leaves whatever is already in the
+    /// slot alone: taking it out is [`Self::take_retained`]'s job and the two
+    /// are called together by the one policy that owns both.
+    pub fn set_retaining(&self, retaining: bool) {
+        self.retaining.store(retaining, Ordering::Relaxed);
+    }
+
+    /// **Decodes this pool has served** — one per [`Self::take`], whether the
+    /// buffer came out of the slot or out of the allocator, so the figure
+    /// counts *decodes* rather than the pool's luck at serving them.
+    ///
+    /// Monotone, and that is the point: two readings that agree mean no
+    /// granule was decoded in the interval between them, which is the one fact
+    /// an idle policy over this pool needs and the only one it can get without
+    /// a clock of its own.
+    pub fn decodes_served(&self) -> u64 {
+        let totals = self.totals();
+        (totals.allocated as u64).saturating_add(totals.reused as u64)
+    }
+
     pub fn release_retained(&self) -> bool {
         let Ok(mut slot) = self.slot.try_lock() else {
             return false;
@@ -453,6 +527,66 @@ pub fn release_all_retained() -> u64 {
         0
     };
     mrms + gmgsi
+}
+
+/// **Decodes every shipped staging pool has served, summed** — see
+/// [`StagingPool::decodes_served`].
+///
+/// Named rather than walked, the same trade [`release_all_retained`] takes and
+/// for the same reason: there is no registry of pools to iterate, and a third
+/// source is a review question in one file.
+pub fn decodes_served() -> u64 {
+    crate::mrms::staging::global()
+        .decodes_served()
+        .saturating_add(crate::gmgsi::staging::global().decodes_served())
+}
+
+/// **Every shipped staging pool's parked block, taken out still owned** — the
+/// hand-off shape of [`release_all_retained`], for a caller that frees
+/// elsewhere.
+///
+/// Holds the blocks and the bytes they were priced at, so the caller can hand
+/// this whole value to a free lane under one figure without naming either
+/// element type. [`Self::bytes`] is read from the buffers' own capacities
+/// rather than from the constants they were sized for: a product that has
+/// moved off its nominal shape is priced at what it is holding.
+pub struct RetainedBlocks {
+    mrms: Option<Vec<crate::mrms::staging::StagedCode>>,
+    gmgsi: Option<Vec<u8>>,
+}
+
+impl RetainedBlocks {
+    /// What freeing these blocks gives back. Zero when both slots were empty,
+    /// which is what a caller checks before filing anything: a payload of two
+    /// `None`s is a queue entry that frees nothing.
+    pub fn bytes(&self) -> u64 {
+        let mrms = self.mrms.as_ref().map_or(0, |b| {
+            b.capacity()
+                .saturating_mul(crate::mrms::staging::StagingPool::ELEMENT_BYTES)
+        });
+        let gmgsi = self.gmgsi.as_ref().map_or(0, |b| {
+            b.capacity()
+                .saturating_mul(crate::gmgsi::staging::StagingPool::ELEMENT_BYTES)
+        });
+        (mrms as u64).saturating_add(gmgsi as u64)
+    }
+}
+
+/// **Turn parking on or off in every shipped pool** — see
+/// [`StagingPool::retaining`]. Named rather than walked, the same trade
+/// [`release_all_retained`] takes.
+pub fn set_retaining_all(retaining: bool) {
+    crate::mrms::staging::global().set_retaining(retaining);
+    crate::gmgsi::staging::global().set_retaining(retaining);
+}
+
+/// See [`RetainedBlocks`]. Both pools are asked, never short-circuited, for the
+/// reason [`release_all_retained`] spells out.
+pub fn take_all_retained() -> RetainedBlocks {
+    RetainedBlocks {
+        mrms: crate::mrms::staging::global().take_retained(),
+        gmgsi: crate::gmgsi::staging::global().take_retained(),
+    }
 }
 
 #[cfg(test)]

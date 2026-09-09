@@ -244,6 +244,29 @@ impl StagingPool {
         self.0.release_retained()
     }
 
+    /// **The retained buffer itself**, still owned, for a caller that frees it
+    /// on a lane rather than here. See [`crate::staging::StagingPool`].
+    pub fn take_retained(&self) -> Option<Vec<StagedCode>> {
+        self.0.take_retained()
+    }
+
+    /// **Whether this pool may park an offered buffer.** See
+    /// [`crate::staging::StagingPool`].
+    pub fn is_retaining(&self) -> bool {
+        self.0.is_retaining()
+    }
+
+    /// Turn parking on or off. See [`crate::staging::StagingPool`].
+    pub fn set_retaining(&self, retaining: bool) {
+        self.0.set_retaining(retaining);
+    }
+
+    /// **Decodes this pool has served** — one per [`Self::take`], however it
+    /// was served. See [`crate::staging::StagingPool::decodes_served`].
+    pub fn decodes_served(&self) -> u64 {
+        self.0.decodes_served()
+    }
+
     /// Take a [`MrmsGrid`](super::MrmsGrid)'s values back into the pool, if
     /// this is the last reference to them.
     ///
