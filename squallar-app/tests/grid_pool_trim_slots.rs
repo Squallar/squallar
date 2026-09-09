@@ -26,7 +26,7 @@ fn a_quiet_session_gives_both_staging_blocks_up_and_the_next_decode_is_served() 
     // retain: `take` on an empty slot allocates and `give` parks what came out.
     mrms.give(
         mrms.take(squallar_overlays::mrms::staging::STAGING_POINTS)
-            .expect("a mosaic buffer fits on a test host"),
+            .expect("a staging band fits on a test host"),
     );
     gmgsi.give(
         gmgsi
@@ -35,8 +35,8 @@ fn a_quiet_session_gives_both_staging_blocks_up_and_the_next_decode_is_served() 
     );
     assert_eq!(
         mrms.retained_bytes(),
-        squallar_overlays::mrms::CONUS_GRID_BYTES,
-        "premise: the MRMS slot is holding a mosaic, so there is something for \
+        squallar_overlays::mrms::CONUS_BAND_BYTES,
+        "premise: the MRMS slot is holding its band, so there is something for \
          the trim below to be observed taking",
     );
     assert_eq!(
@@ -69,7 +69,7 @@ fn a_quiet_session_gives_both_staging_blocks_up_and_the_next_decode_is_served() 
         );
         assert_eq!(
             mrms.retained_bytes(),
-            squallar_overlays::mrms::CONUS_GRID_BYTES,
+            squallar_overlays::mrms::CONUS_BAND_BYTES,
             "and the block is still parked at quiet reading {n}: a policy that \
              trimmed early fails on this row rather than passing on the end \
              state",
@@ -109,15 +109,16 @@ fn a_quiet_session_gives_both_staging_blocks_up_and_the_next_decode_is_served() 
     // block back for eight seconds out of every two-minute poll and the
     // family's high-water mark would not move.
     //
-    // The property that makes this able to fail is that `fresh` is a **real
-    // 49,000,000 B buffer** — `give` already refuses a zero-capacity `Vec`
-    // whatever the flag says, so an empty offer would be declined for the wrong
-    // reason and this assertion would pass over a flag that does nothing.
+    // The property that makes this able to fail is that `fresh` owns a **real
+    // allocation** at the slot's own shape — `give` already refuses a
+    // zero-capacity `Vec` whatever the flag says, so an empty offer would be
+    // declined for the wrong reason and this assertion would pass over a flag
+    // that does nothing.
     assert_eq!(
         fresh.capacity() * squallar_overlays::mrms::staging::StagingPool::ELEMENT_BYTES,
-        squallar_overlays::mrms::CONUS_GRID_BYTES,
-        "premise: the buffer offered below owns a whole mosaic, so a decline \
-         can only be the trim's doing",
+        squallar_overlays::mrms::CONUS_BAND_BYTES,
+        "premise: the buffer offered below owns a whole staging band, so a \
+         decline can only be the trim's doing",
     );
     assert!(!mrms.is_retaining(), "the trim turned parking off");
     mrms.give(fresh);
@@ -146,12 +147,12 @@ fn a_quiet_session_gives_both_staging_blocks_up_and_the_next_decode_is_served() 
     mrms.give(reused);
     assert_eq!(
         mrms.retained_bytes(),
-        squallar_overlays::mrms::CONUS_GRID_BYTES,
+        squallar_overlays::mrms::CONUS_BAND_BYTES,
         "and the pool parks again, so nothing about the loop case changed",
     );
     assert_eq!(
         squallar_overlays::staging::release_all_retained(),
-        squallar_overlays::mrms::CONUS_GRID_BYTES as u64,
+        squallar_overlays::mrms::CONUS_BAND_BYTES as u64,
         "left as this binary found it, and the pressure lever prices what it \
          took",
     );

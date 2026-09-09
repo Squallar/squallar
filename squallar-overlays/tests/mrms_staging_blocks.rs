@@ -163,13 +163,19 @@ fn granules_decode_through_one_retained_mosaic_block() {
     COUNTING.store(true, Ordering::Relaxed);
     let before = LARGE_ALLOCS.load(Ordering::Relaxed);
     // **`Vec<u16>`, which is the width the decode's buffer actually is.** A
-    // `Vec<f32>` here would reserve 98,000,000 B and clear any bar the real
-    // 49,000,000 B block could not — a control that passes for a reason the
-    // measurement cannot share, which is how the bar was left above the block
-    // it counts.
+    // `Vec<f32>` here would reserve twice the bytes and clear any bar the real
+    // block could not — a control that passes for a reason the measurement
+    // cannot share, which is how the bar was left above the block it counts.
+    //
+    // **One MOSAIC, not one slot.** `STAGING_POINTS` used to be both: the slot
+    // held the decode's whole plane. It holds a 16-row band now, 224,000 B,
+    // which is a seventieth of this file's 16 MiB bar — a control reserving one
+    // would register zero large blocks and the non-triviality check below would
+    // be asserting that the instrument is broken. What the bar is set to catch
+    // is a block that scales with the grid's AREA, so the control is one.
     let mut mosaic: Vec<u16> = Vec::new();
     mosaic
-        .try_reserve_exact(staging::STAGING_POINTS)
+        .try_reserve_exact(squallar_overlays::mrms::CONUS_GRID_BYTES / size_of::<u16>())
         .expect("a mosaic buffer fits on a test host");
     let seen = LARGE_ALLOCS.load(Ordering::Relaxed) - before;
     COUNTING.store(false, Ordering::Relaxed);

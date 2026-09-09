@@ -1598,12 +1598,13 @@ fn a_listing_carries_the_mosaic_the_window_opened_after() {
 
 // ── The retained staging buffer ─────────────────────────────────────────────
 
-/// A mosaic-shaped grid: `resident_bytes()` is a real 49 MB and its buffer is
-/// exactly what [`staging::StagingPool`] retains.
+/// A **slot-shaped** grid: its buffer is exactly what
+/// [`staging::StagingPool`] retains, which is one tile-row band since
+/// `decode::tile_png_codes` stopped building a plane for the tiler to read.
 ///
 /// The other grids in this file are one row wide, because the budgets they
 /// exercise have to be overflowable. This one cannot be: what it is here to
-/// exercise **is** the mosaic capacity rule, and a 400-byte grid would be
+/// exercise **is** the capacity-exact rule, and a 400-byte grid would be
 /// declined by the pool for exactly the reason the pool declines one in
 /// production.
 ///
@@ -1646,9 +1647,13 @@ fn mosaic_grid(product: MrmsProduct, valid: chrono::NaiveDateTime) -> MrmsGrid {
 #[test]
 fn an_evicted_frame_granule_is_offered_to_the_staging_pool() {
     static POOL: staging::StagingPool = staging::StagingPool::new();
-    // One mosaic of budget, which is the shipped `FRAME_STAGING_BYTES` — this
-    // is the one frame-cache test that can afford the real figure.
-    let mut h = MrmsHandler::with_frame_budget_and_staging(FRAME_STAGING_BYTES, &POOL);
+    // **One `mosaic_grid` of budget**, stated as the fixture's own bytes rather
+    // than as `FRAME_STAGING_BYTES`. The two were the same number while the
+    // slot held a whole mosaic; the slot holds a band now, so the fixture is a
+    // band and the shipped frame budget would hold 218 of them — the premise
+    // below ("the budget evicted one") would read green on a cache that
+    // evicted nothing, which is the shape a vacuous gate takes.
+    let mut h = MrmsHandler::with_frame_budget_and_staging(crate::mrms::CONUS_BAND_BYTES, &POOL);
     let product = MrmsProduct::ReflectivityComposite;
     let stamp = |m: u32| {
         chrono::NaiveDate::from_ymd_opt(2026, 8, 31)

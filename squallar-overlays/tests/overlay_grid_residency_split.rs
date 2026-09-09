@@ -75,7 +75,7 @@ fn at(h: u32, m: u32) -> chrono::NaiveDateTime {
         .expect("a real time")
 }
 
-/// **Three holders, and they are no longer one mosaic each.**
+/// **Three holders, and only two of them are a mosaic.**
 ///
 /// The three, in the order a playing loop fills them:
 ///
@@ -85,28 +85,39 @@ fn at(h: u32, m: u32) -> chrono::NaiveDateTime {
 ///    change.
 /// 2. `MrmsHandler::frame_grids` — one loop frame's staged granule, tiled the
 ///    same way, one at a time however many frames the loop holds.
-/// 3. `mrms::staging::global()` — the **plane** the pool parks between decodes,
-///    which is still 24.5 M `u16` and still 49,000,000 B: the decoder reads a
-///    granule into one and the tiler reads it back out. **Nothing else reads
-///    it**, and its only release is `SourceHandler::release_data`, which fires
-///    when no pane draws the layer.
+/// 3. `mrms::staging::global()` — the **band buffer** the pool parks between
+///    decodes: 16 rows of the mosaic, 224,000 B. **Nothing else reads it**, and
+///    its only release is `SourceHandler::release_data`, which fires when no
+///    pane draws the layer.
 ///
-/// So the family is now `2 x granule + 1 plane` where it was `3 x mosaic`, and
-/// the granule is the term that moved: 5,554,748 B for the committed composite
-/// against the 49,000,000 it used to be. The plane did not move and is now
-/// **81 % of what one looping pane holds** — the largest single term left, and
-/// the one a governor can take without trading anything a pane is drawing.
+/// So the family is `2 x granule + 1 band`, and the term that moved twice is
+/// the third. It was a whole 49,000,000 B **plane** — the decode built one and
+/// the tiler read it once — which the tiled store left untouched and which
+/// therefore became **81 % of what one looping pane held**. It also charged the
+/// FIRST granule more than the flat store ever had: the plane came back to the
+/// slot at the first decode rather than at the first eviction, so one live
+/// granule read 5,554,748 + 49,000,000 = **54,554,748 B against 49,000,000
+/// before**, a +5,554,748 B regression that only flipped negative from the
+/// second granule on. `decode::tile_png_codes` builds the store out of the PNG
+/// row walk instead and no plane exists, which closes both: the first granule
+/// is **5,778,748 B**, under the flat store's 49,000,000 from the first
+/// granule rather than from the second.
 ///
 /// Floor — delete any one of the three terms from
 /// `MrmsHandler::resident_source_bytes`: that step's delta reads 0 and the
 /// total lands short by that term.
 #[test]
-fn the_overlay_grid_family_is_two_granules_and_a_plane() {
-    let plane = squallar_overlays::mrms::CONUS_GRID_BYTES as u64;
+fn the_overlay_grid_family_is_two_granules_and_a_band() {
+    let band = squallar_overlays::mrms::CONUS_BAND_BYTES as u64;
     assert_eq!(
-        plane, 49_000_000,
-        "the decode plane, which the tiled store did not move",
+        band, 224_000,
+        "the parked decode buffer: 16 rows, which is all a tiler that decides \
+         a tile from 16 rows ever has to hold",
     );
+    /// What the same three holders cost while the decode still built a plane
+    /// for the tiler to read. Held here so the win is a *difference* this
+    /// suite states rather than one a reader has to compute.
+    const PLANE: u64 = 49_000_000;
     /// The committed 2026-08-21 composite, tiled. Pinned here as well as at
     /// `mrms::decode::tests` so a granule that stopped being elided fails in
     /// the census suite that would then be reporting the wrong family.
@@ -135,18 +146,27 @@ fn the_overlay_grid_family_is_two_granules_and_a_plane() {
     let after_live = registry.resident_source_bytes();
     assert_eq!(
         squallar_overlays::mrms::staging::global().retained_bytes() as u64,
-        plane,
-        "the decode hands its plane back the instant the tiler has read it, \
-         so the pool is warm from the FIRST granule rather than from the \
-         first eviction",
+        band,
+        "the decode hands its band buffer back the instant the last row is \
+         tiled, so the pool is warm from the FIRST granule rather than from \
+         the first eviction",
     );
     assert_eq!(
         after_live,
-        GRANULE + plane,
-        "one live granule is one TILED mosaic plus the plane it was read out \
-         of: the pane's carry and the cache entry are the same allocation, so \
-         a figure of two granules here would be `resident_source_bytes` \
-         double-counting the carry",
+        GRANULE + band,
+        "one live granule is one TILED mosaic plus the 16-row buffer it was \
+         streamed through: the pane's carry and the cache entry are the same \
+         allocation, so a figure of two granules here would be \
+         `resident_source_bytes` double-counting the carry",
+    );
+    // **The first-granule regression, closed.** While the tiler read a plane
+    // this line was 54,554,748 — above the 49,000,000 the flat store held, and
+    // only below it from the second granule on.
+    assert_eq!(after_live, 5_778_748);
+    assert!(
+        after_live < PLANE,
+        "one live granule must be under the flat store from the FIRST granule, \
+         not from the second: {after_live} against {PLANE}",
     );
 
     // ── 2. the loop frame's staged granule ───────────────────────────────
@@ -173,29 +193,31 @@ fn the_overlay_grid_family_is_two_granules_and_a_plane() {
     );
     assert_eq!(
         squallar_overlays::mrms::staging::global().retained_bytes() as u64,
-        plane,
-        "and it is NOT a second plane: the slot held one and the second decode \
-         was handed it back",
+        band,
+        "and it is NOT a second band buffer: the slot held one and the second \
+         decode was handed it back",
     );
 
     assert_eq!(
         after_frame,
-        2 * GRANULE + plane,
+        2 * GRANULE + band,
         "the steady state of one pane looping one MRMS product is two tiled \
-         granules and one plane — 60,109,496 B, against 147,000,000 with the \
-         flat store and against the 155.8 to 219.0 MB the wasm32 page reads \
-         for this whole family on the Tier-2 legs",
+         granules and one 16-row band — 11,333,496 B, against 60,109,496 with \
+         the plane, 147,000,000 with the flat store, and the 155.8 to 219.0 MB \
+         the wasm32 page reads for this whole family on the Tier-2 legs",
     );
-    assert_eq!(after_frame, 60_109_496);
+    assert_eq!(after_frame, 11_333_496);
 
     // ── What the pressure lever can give back, and what it cannot ────────
-    // Nothing reads the parked plane, so it is the one of the three a memory
-    // governor may take without trading anything a pane is drawing — and it is
-    // now four fifths of the total rather than one third of it.
+    // Nothing reads the parked band, so it is still the one of the three a
+    // memory governor may take without trading anything a pane is drawing.
+    // **What it is worth has collapsed**, and that is the point: it was 81 % of
+    // this family and it is 1.98 % of it. The lever is no longer where the
+    // bytes are, because the bytes are no longer there to take.
     assert_eq!(
         squallar_overlays::staging::release_all_retained(),
-        plane,
-        "the crate-wide release must find the parked plane and price it — a \
+        band,
+        "the crate-wide release must find the parked band and price it — a \
          zero here is a lever that ran and gave nothing back, which reads \
          exactly like one nothing called",
     );
@@ -203,8 +225,8 @@ fn the_overlay_grid_family_is_two_granules_and_a_plane() {
         registry.resident_source_bytes(),
         2 * GRANULE,
         "releasing the pools takes the family to the two granules a pane is \
-         actually using: 11,109,496 B, 81 % of it freed with nothing \
-         refetched and nothing redrawn",
+         actually using: 11,109,496 B, and the whole of what a governor can \
+         still reclaim here is 224,000 B",
     );
 
     // Non-triviality: the release is not simply zeroing the whole family.

@@ -484,6 +484,14 @@ impl TiledU16 {
     /// `None` for a plane whose length is not the shape beside it — the same
     /// refusal `parse_grib2_raw_in` already makes, restated here because this
     /// is the one place the two are read against each other.
+    ///
+    /// **A plane is no longer how a shipped mosaic is built.** [`TileBands`]
+    /// is, one [`TILE`]-row band at a time out of the PNG decoder's own row
+    /// walk, and this is that same builder fed from a plane a caller already
+    /// holds. One tiler, not two spellings of it that could come to disagree
+    /// about a granule — which is what makes `mrms::decode`'s streamed store
+    /// and this one the same bytes by construction rather than by two suites
+    /// agreeing.
     pub fn from_plane(
         codes: &[ScaledCode],
         ni: usize,
@@ -496,83 +504,12 @@ impl TiledU16 {
         if ni == 0 || nj == 0 || codes.len() != ni.checked_mul(nj)? {
             return None;
         }
-        let tiles_i = ni.div_ceil(TILE);
-        let tiles_j = nj.div_ceil(TILE);
-        // **Two passes, so the arena is one exact allocation.** Growing it from
-        // empty would double ~20 times to a multi-megabyte block, which is the
-        // large-block churn `mrms::decode`'s header exists to keep off a wasm32
-        // heap that only grows — and every one of those growths would be an
-        // infallible reserve on a target where an allocation failure aborts
-        // without unwinding. The first pass reads the plane and decides each
-        // tile; the second copies only the tiles that are kept.
-        let mut index: Vec<u32> = Vec::new();
-        index.try_reserve_exact(tiles_i * tiles_j).ok()?;
-        let mut row_slot: Vec<u32> = Vec::new();
-        row_slot.try_reserve_exact(tiles_j + 1).ok()?;
-        let uniform_at = |ti: usize, tj: usize| -> Option<ScaledCode> {
-            let (j0, j1) = (tj * TILE, ((tj + 1) * TILE).min(nj));
-            let (i0, i1) = (ti * TILE, ((ti + 1) * TILE).min(ni));
-            let first = codes[j0 * ni + i0];
-            (j0..j1)
-                .all(|j| codes[j * ni + i0..j * ni + i1].iter().all(|&c| c == first))
-                .then_some(first)
-        };
-        let mut slots = 0usize;
-        for tj in 0..tiles_j {
-            row_slot.push(u32::try_from(slots).ok()?);
-            for ti in 0..tiles_i {
-                match uniform_at(ti, tj) {
-                    Some(first) => index.push(TILE_UNIFORM | u32::from(first)),
-                    None => {
-                        index.push(u32::try_from(slots).ok()?);
-                        slots += 1;
-                    }
-                }
-            }
+        let mut bands =
+            TileBands::new(ni, nj, Vec::new(), ref_val, two_pow, dig_factor, nan_codes)?;
+        for row in codes.chunks_exact(ni) {
+            bands.fill_row(|dst| dst.copy_from_slice(row))?;
         }
-        row_slot.push(u32::try_from(slots).ok()?);
-
-        let mut arena: Vec<ScaledCode> = Vec::new();
-        arena
-            .try_reserve_exact(slots.checked_mul(TILE_CELLS)?)
-            .ok()?;
-        for tj in 0..tiles_j {
-            let (j0, j1) = (tj * TILE, ((tj + 1) * TILE).min(nj));
-            for ti in 0..tiles_i {
-                if index[tj * tiles_i + ti] & TILE_UNIFORM != 0 {
-                    continue;
-                }
-                let (i0, i1) = (ti * TILE, ((ti + 1) * TILE).min(ni));
-                // The padding is the tile's first code rather than zero: a
-                // padded cell is never read back — `get` bounds-checks against
-                // the grid — and writing a code that is already in the tile
-                // keeps the slot's own byte range free of a value the source
-                // never published, which is what a wire reader would otherwise
-                // see in a hexdump and have to be told to ignore.
-                let slot = arena.len();
-                arena.resize(slot + TILE_CELLS, codes[j0 * ni + i0]);
-                for j in j0..j1 {
-                    let src = &codes[j * ni + i0..j * ni + i1];
-                    let dst = slot + (j - j0) * TILE;
-                    arena[dst..dst + src.len()].copy_from_slice(src);
-                }
-            }
-        }
-        debug_assert_eq!(arena.len(), slots * TILE_CELLS);
-        Some(Self {
-            ni,
-            nj,
-            origin_j: 0,
-            tiles_i,
-            tiles_j,
-            index,
-            arena,
-            row_slot,
-            ref_val,
-            two_pow,
-            dig_factor,
-            nan_codes,
-        })
+        bands.finish().map(|(tiled, _spent_band)| tiled)
     }
 
     /// A band's store, built at the far end of the wire from the index rows the
@@ -808,6 +745,274 @@ impl TiledU16 {
                 }
             })
             .collect()
+    }
+}
+
+/// **A [`TiledU16`] built one [`TILE`]-row band at a time, so no whole plane
+/// ever exists.**
+///
+/// The store this yields is byte-for-byte the one [`TiledU16::from_plane`] used
+/// to build — that function *is* this builder now — and the difference is
+/// entirely in what is live while it is being built. MRMS decodes a
+/// 7000 x 3500 mosaic; the plane the tiler read was **49,000,000 B**, parked
+/// between granules by `mrms::staging` and, once the store itself had gone
+/// tiled, **81 % of what one looping pane held**. What is live here instead is
+/// `TILE` rows of it — **224,000 B at that width** — plus the tiles already
+/// kept.
+///
+/// # A tile cannot be decided before its sixteenth row
+///
+/// That is the whole shape of this type. Uniformity is a property of the
+/// tile's 256 points, so a band is *accumulated* and only flushed when it is
+/// [`TILE`] rows tall; nothing about a tile is written until the row that
+/// completes it arrives. The band buffer is the smallest thing that can hold
+/// that decision, and it is one allocation reused across all 219 bands rather
+/// than one per band.
+///
+/// # The last band is short, and that is not a special case
+///
+/// 3500 rows is 218 whole bands and a **12-row remainder**, and 7000 columns is
+/// 437 whole tile columns and an **8-column remainder**. Both are handled the
+/// same way [`TiledU16::from_plane`] always handled the column remainder: the
+/// tile's own extent is `rows` by `i1 - i0`, uniformity is tested over exactly
+/// that, and a kept tile still takes a whole fixed [`TILE_CELLS`] slot with the
+/// unreached cells padded with a code the tile already carries. **Fixed slots
+/// are load-bearing** — every offset is `slot * TILE_CELLS` and the zero-copy
+/// wire lend is built on that arithmetic — so a short band costs the same slot
+/// a tall one does and no second table is needed to say which is which.
+/// [`Self::finish`] flushes whatever partial band is standing, so the remainder
+/// needs no caller to know it is there.
+///
+/// # Why the arena is the one thing that grows
+///
+/// `index` and `row_slot` are `tiles_i * tiles_j` and `tiles_j + 1` — known at
+/// [`Self::new`] and reserved exactly there. The arena is not: how many tiles
+/// are kept is what the *data* says, and the only way to know it before reading
+/// the data would be to decode section 7 twice, which at ~235 ms a granule is a
+/// worse trade than any allocation on this path.
+///
+/// So it is reserved **one band's worst case at a time**, exactly —
+/// `try_reserve_exact`, fallible for the reason `mrms::decode`'s header gives
+/// about a target where an allocation failure aborts without unwinding. Exactly
+/// rather than amortised, and that is a measured choice: `try_reserve`'s
+/// doubling took the decode's peak live bytes to **15,033,896 B** at the worst
+/// granule for an arena of 8,943,164, because the last doubling is most of the
+/// block. Asking for what the band can need holds the capacity within one
+/// band's worst case of the length — **9,464,328 B peak at that same granule**,
+/// a third off — and the decode-time difference between the two policies was
+/// inside the run-to-run spread. Reserving before the band rather than before
+/// each tile is what keeps an allocation out of the middle of one either way.
+///
+/// [`Self::finish`] then shrinks the arena to its exact length, because
+/// `TiledU16::resident_bytes` prices the slice and a tail the allocator is
+/// holding would be a block the census cannot see.
+pub struct TileBands {
+    ni: usize,
+    nj: usize,
+    tiles_i: usize,
+    tiles_j: usize,
+    /// Grid rows accepted so far — the count [`Self::finish`] checks against
+    /// `nj`, because a store built from fewer rows than the grid declares is a
+    /// mosaic with a hole in it and not a smaller mosaic.
+    rows: usize,
+    /// The band under construction: up to [`TILE`] whole rows of `ni` samples,
+    /// row-major. Handed in and handed back so a caller that pools it — the
+    /// shipped decode does — keeps the one allocation across granules.
+    band: Vec<ScaledCode>,
+    /// [`Self::band`]'s length when it is full, in samples — `min(TILE, nj) *
+    /// ni`, which is its capacity. Held rather than recomputed so the compare
+    /// in [`Self::fill_row`] cannot be the one place `TILE * ni` overflows a
+    /// grid [`Self::new`] already accepted.
+    band_points: usize,
+    index: Vec<u32>,
+    row_slot: Vec<u32>,
+    arena: Vec<ScaledCode>,
+    slots: usize,
+    ref_val: f32,
+    two_pow: f32,
+    dig_factor: f32,
+    nan_codes: Vec<u16>,
+}
+
+impl TileBands {
+    /// A builder for an `ni` x `nj` grid, taking `band` as its row buffer.
+    ///
+    /// `band`'s contents are discarded; what it is taken for is its
+    /// **allocation**, so a caller holding a spent buffer of the right shape
+    /// pays nothing here. `None` for a shape this target cannot address or an
+    /// allocation this build cannot serve — never a panic, for the reason
+    /// `mrms::decode`'s header gives about a target where nothing unwinds.
+    pub fn new(
+        ni: usize,
+        nj: usize,
+        mut band: Vec<ScaledCode>,
+        ref_val: f32,
+        two_pow: f32,
+        dig_factor: f32,
+        nan_codes: Vec<u16>,
+    ) -> Option<Self> {
+        if ni == 0 || nj == 0 {
+            return None;
+        }
+        let tiles_i = ni.div_ceil(TILE);
+        let tiles_j = nj.div_ceil(TILE);
+        band.clear();
+        // `min(TILE, nj)` rather than `TILE`: a grid shorter than one band
+        // never fills one, and a test grid should not be handed a buffer sized
+        // for a mosaic.
+        let band_points = TILE.min(nj).checked_mul(ni)?;
+        band.try_reserve_exact(band_points.saturating_sub(band.capacity()))
+            .ok()?;
+        debug_assert!(band.capacity() >= band_points);
+        let mut index: Vec<u32> = Vec::new();
+        index
+            .try_reserve_exact(tiles_i.checked_mul(tiles_j)?)
+            .ok()?;
+        let mut row_slot: Vec<u32> = Vec::new();
+        row_slot.try_reserve_exact(tiles_j.checked_add(1)?).ok()?;
+        let mut arena: Vec<ScaledCode> = Vec::new();
+        // One band's worst case up front, so the first band cannot realloc
+        // either. Every later band asks for the same again.
+        arena
+            .try_reserve_exact(tiles_i.checked_mul(TILE_CELLS)?)
+            .ok()?;
+        Some(Self {
+            ni,
+            nj,
+            tiles_i,
+            tiles_j,
+            rows: 0,
+            band,
+            band_points,
+            index,
+            row_slot,
+            arena,
+            slots: 0,
+            ref_val,
+            two_pow,
+            dig_factor,
+            nan_codes,
+        })
+    }
+
+    /// **Take the next grid row**, written in place by `f` into the band's own
+    /// storage.
+    ///
+    /// A slice rather than a `&[ScaledCode]` argument so the caller's decode
+    /// writes its codes straight into the band and no row is copied twice: the
+    /// PNG walk unpacks a 14,000 B row of big-endian samples directly into
+    /// this.
+    ///
+    /// `None` for a row past the `nj` this builder was told about, or for a
+    /// band whose flush could not be served — both of which leave the builder
+    /// unusable, and neither of which is a store to finish.
+    pub fn fill_row(&mut self, f: impl FnOnce(&mut [ScaledCode])) -> Option<()> {
+        if self.rows >= self.nj {
+            return None;
+        }
+        let at = self.band.len();
+        // Never allocates: `new` reserved `min(TILE, nj) * ni` and a band is
+        // flushed and cleared the moment it reaches that.
+        self.band.resize(at + self.ni, 0);
+        f(&mut self.band[at..]);
+        self.rows += 1;
+        if self.band.len() == self.band_points {
+            self.flush()?;
+        }
+        Some(())
+    }
+
+    /// Tile the standing band and clear it. A no-op on an empty one, which is
+    /// what makes [`Self::finish`] able to call it unconditionally.
+    fn flush(&mut self) -> Option<()> {
+        let rows = self.band.len() / self.ni;
+        if rows == 0 {
+            return Some(());
+        }
+        self.row_slot.push(u32::try_from(self.slots).ok()?);
+        // This band's worst case, before a tile is written: every tile kept.
+        // Fallible, exact, and asked once a band rather than once a tile — so
+        // no allocation can land in the middle of a band, and the capacity
+        // never runs more than one band ahead of the length.
+        self.arena
+            .try_reserve_exact(self.tiles_i.checked_mul(TILE_CELLS)?)
+            .ok()?;
+        let ni = self.ni;
+        for ti in 0..self.tiles_i {
+            let (i0, i1) = (ti * TILE, ((ti + 1) * TILE).min(ni));
+            let first = self.band[i0];
+            let uniform = (0..rows).all(|r| {
+                self.band[r * ni + i0..r * ni + i1]
+                    .iter()
+                    .all(|&c| c == first)
+            });
+            if uniform {
+                self.index.push(TILE_UNIFORM | u32::from(first));
+                continue;
+            }
+            self.index.push(u32::try_from(self.slots).ok()?);
+            self.slots += 1;
+            // The padding is the tile's first code rather than zero: a padded
+            // cell is never read back — `code_at` bounds-checks against the
+            // grid — and writing a code that is already in the tile keeps the
+            // slot's own byte range free of a value the source never
+            // published, which is what a wire reader would otherwise see in a
+            // hexdump and have to be told to ignore.
+            let slot = self.arena.len();
+            self.arena.resize(slot + TILE_CELLS, first);
+            for r in 0..rows {
+                let src = &self.band[r * ni + i0..r * ni + i1];
+                let dst = slot + r * TILE;
+                self.arena[dst..dst + src.len()].copy_from_slice(src);
+            }
+        }
+        self.band.clear();
+        Some(())
+    }
+
+    /// The finished store, and the band buffer back for the next granule.
+    ///
+    /// `None` for a builder that was fed fewer rows than its grid declares —
+    /// **refused, not padded**: a mosaic short of its last bands would
+    /// otherwise reach the raster as sentinel, which is a picture and not an
+    /// error.
+    pub fn finish(mut self) -> Option<(TiledU16, Vec<ScaledCode>)> {
+        // Whatever partial band is standing — 12 rows at the CONUS shape.
+        self.flush()?;
+        if self.rows != self.nj {
+            return None;
+        }
+        self.row_slot.push(u32::try_from(self.slots).ok()?);
+        if self.index.len() != self.tiles_i.checked_mul(self.tiles_j)?
+            || self.row_slot.len() != self.tiles_j + 1
+            || self.arena.len() != self.slots.checked_mul(TILE_CELLS)?
+        {
+            return None;
+        }
+        // The arena is the one block that grew, so it is the one that can be
+        // holding more than it filled — and `TiledU16::resident_bytes` prices
+        // the slice, so an unshrunk tail would be a block the census cannot
+        // see. Shrinking a `Vec` splits its chunk rather than asking for
+        // another, on dlmalloc and on the host allocators alike, so this is
+        // the one place a fallible reserve buys nothing.
+        self.arena.shrink_to_fit();
+        Some((
+            TiledU16 {
+                ni: self.ni,
+                nj: self.nj,
+                origin_j: 0,
+                tiles_i: self.tiles_i,
+                tiles_j: self.tiles_j,
+                index: self.index,
+                arena: self.arena,
+                row_slot: self.row_slot,
+                ref_val: self.ref_val,
+                two_pow: self.two_pow,
+                dig_factor: self.dig_factor,
+                nan_codes: self.nan_codes,
+            },
+            self.band,
+        ))
     }
 }
 

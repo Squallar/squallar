@@ -533,47 +533,43 @@ pub fn parse_grib2_raw_in(
 
     let values = match (plan, narrow) {
         (Some(plan), Some((two_pow, dig_factor, nan_codes))) => {
-            // The pooled buffer, in the store's own width. See `super::staging`.
-            let mut codes = staging
-                .take(points)
+            // **The band buffer, in the store's own width.** See
+            // `super::staging` — the slot holds 16 rows of the mosaic now, not
+            // all 3500 of them.
+            //
+            // **No plane is built at all.** The store was assembled in two
+            // moves — 24,500,000 codes into a 49,000,000 B buffer, then one
+            // read of that buffer to tile it — and the buffer was the pool's
+            // parked block, live for the life of the process. Once the store
+            // itself went tiled it was **81 % of what one looping pane held**,
+            // and it also charged the FIRST granule 5,554,748 + 49,000,000 B
+            // where the flat store had charged 49,000,000: the plane came back
+            // at the first decode rather than at the first eviction, so it was
+            // resident beside the tiles from the start. `tile_png_codes` feeds
+            // the tiler straight out of the row walk instead, so what is live
+            // is `TILE` rows — 224,000 B — plus the tiles already kept, and
+            // both of those go away.
+            //
+            // The band buffer comes back here rather than at
+            // `StagingPool::recycle`, for the same reason the plane did: it is
+            // spent the instant the last row is tiled, and a grid holds none of
+            // it.
+            let band = staging
+                .take(crate::render::gridded::TILE * ni)
                 .map_err(|_| too_big(size_of::<u16>()))?;
-            decode_png_codes_into(&plan, points, &mut codes)?;
-            // **Tiled, then the plane goes straight back to the pool.**
-            //
-            // The plane is scratch now rather than the store: `TiledU16` reads
-            // it once and keeps only the tiles that carry more than one code,
-            // which on this corpus is a fifth of the bytes and never more than
-            // the plane plus its index. What the grid holds afterwards is that,
-            // and the 49,000,000 B buffer is parked for the next granule
-            // instead of living in the cache for the life of the entry — so the
-            // slot's whole reason for existing is unchanged and there is one of
-            // it rather than one per resident grid.
-            //
-            // A grid whose shape the tiler will not take — an empty axis, or a
-            // count that is not `ni * nj`, both already refused above — keeps
-            // the flat store and the plane with it, which is the arm that was
-            // always here.
-            match crate::render::gridded::TiledU16::from_plane(
-                &codes,
+            let (tiled, spent) = tile_png_codes(
+                &plan,
+                points,
                 ni,
                 nj,
+                band,
                 plan.simple.ref_val,
                 two_pow,
                 dig_factor,
-                nan_codes.clone(),
-            ) {
-                Some(tiled) => {
-                    staging.give(codes);
-                    GridValues::Tiled(tiled)
-                }
-                None => GridValues::Scaled(ScaledU16 {
-                    codes,
-                    ref_val: plan.simple.ref_val,
-                    two_pow,
-                    dig_factor,
-                    nan_codes,
-                }),
-            }
+                nan_codes,
+            )?;
+            staging.give(spent);
+            GridValues::Tiled(tiled)
         }
         (Some(plan), None) => {
             // Streamable, but wider than the narrow arm holds. Fallible for the
@@ -582,7 +578,7 @@ pub fn parse_grib2_raw_in(
             floats
                 .try_reserve_exact(points)
                 .map_err(|_| too_big(size_of::<f32>()))?;
-            decode_png_into(&plan, points, missing, &mut floats)?;
+            decode_png_into(&plan, points, ni, missing, &mut floats)?;
             GridValues::F32(floats)
         }
         (None, _) => {
@@ -781,6 +777,7 @@ fn png_stream_plan<'b, R>(
 fn decode_png_into(
     plan: &PngPlan<'_>,
     points: usize,
+    ni: usize,
     missing: &[f32],
     values: &mut Vec<f32>,
 ) -> Result<(), String> {
@@ -795,42 +792,98 @@ fn decode_png_into(
     let dig_factor = 10_f32.powi(-i32::from(plan.simple.dec));
     let ref_val = plan.simple.ref_val;
 
-    png_rows(plan, points, |sample| {
-        // Big-endian, most significant bit first -- the order
-        // `NBitwiseIterator` reads the same bytes in.
-        let mut encoded: u32 = 0;
-        for &byte in sample {
-            encoded = (encoded << 8) | u32::from(byte);
+    let sample_bytes = plan.sample_bytes;
+    png_rows(plan, points, ni, |row| {
+        for sample in row.chunks_exact(sample_bytes) {
+            // Big-endian, most significant bit first -- the order
+            // `NBitwiseIterator` reads the same bytes in.
+            let mut encoded: u32 = 0;
+            for &byte in sample {
+                encoded = (encoded << 8) | u32::from(byte);
+            }
+            let raw = (ref_val + encoded as f32 * two_pow) * dig_factor;
+            values.push(reading(missing, raw));
         }
-        let raw = (ref_val + encoded as f32 * two_pow) * dig_factor;
-        values.push(reading(missing, raw));
     })
 }
 
-/// **The same walk, stopping at the code.**
+/// **The same walk, stopping at the code — and tiling as it goes.**
 ///
 /// What [`decode_png_into`] does minus the arithmetic and minus the sentinel
 /// test: the code IS the stored value on the narrow arm, and
-/// [`ScaledU16::value`] applies the identical expression at the far end of
-/// whatever the code travelled through. Splitting them is what makes the
-/// mosaic 49,000,000 B instead of 98,000,000 B without a second decoder
-/// existing to disagree with the first — both walk one [`png_rows`].
+/// [`TiledU16::value`](crate::render::gridded::TiledU16::value) applies the
+/// identical expression at the far end of whatever the code travelled through.
+/// Splitting them is what makes the mosaic 16-bit codes instead of `f32`
+/// values without a second decoder existing to disagree with the first — both
+/// walk one [`png_rows`].
+///
+/// **No plane is ever built.** The store used to be assembled in two moves —
+/// decode 24,500,000 codes into a 49,000,000 B buffer, then read that buffer
+/// once to tile it — and the buffer was `mrms::staging`'s parked block, live
+/// for the life of the process and, once the store itself went tiled,
+/// **81 % of what one looping pane held**. The tiler is a
+/// [`TileBands`](crate::render::gridded::TileBands) fed straight out of the row
+/// walk now, so what is live is [`TILE`](crate::render::gridded::TILE) rows —
+/// **224,000 B** — plus the tiles already kept. `staging`'s slot holds that
+/// band buffer instead, which is the same one-allocation-per-process property
+/// at 1/219th of the bytes.
 ///
 /// `sample` is one or two bytes here and never more: the caller has already
 /// established `num_bits <= 16`, which is what makes the accumulator a `u16`
 /// rather than a truncation of a wider one.
-fn decode_png_codes_into(
+#[allow(clippy::too_many_arguments)]
+fn tile_png_codes(
     plan: &PngPlan<'_>,
     points: usize,
-    codes: &mut Vec<u16>,
-) -> Result<(), String> {
-    png_rows(plan, points, |sample| {
-        let mut encoded: u16 = 0;
-        for &byte in sample {
-            encoded = (encoded << 8) | u16::from(byte);
+    ni: usize,
+    nj: usize,
+    band: Vec<crate::render::gridded::ScaledCode>,
+    ref_val: f32,
+    two_pow: f32,
+    dig_factor: f32,
+    nan_codes: Vec<u16>,
+) -> Result<
+    (
+        crate::render::gridded::TiledU16,
+        Vec<crate::render::gridded::ScaledCode>,
+    ),
+    String,
+> {
+    let shape = || format!("MRMS: cannot tile a {ni}x{nj} grid in this build's memory");
+    let mut bands = crate::render::gridded::TileBands::new(
+        ni, nj, band, ref_val, two_pow, dig_factor, nan_codes,
+    )
+    .ok_or_else(shape)?;
+    let sample_bytes = plan.sample_bytes;
+    // **The one place a band flush can fail**, and it fails by leaving the
+    // builder unusable rather than by unwinding out of a `png` callback on a
+    // target where nothing unwinds. `png_rows`'s own refusals stay `?`.
+    let mut refused = false;
+    png_rows(plan, points, ni, |row| {
+        if refused {
+            return;
         }
-        codes.push(encoded);
-    })
+        if bands
+            .fill_row(|dst| {
+                for (sample, slot) in row.chunks_exact(sample_bytes).zip(dst.iter_mut()) {
+                    let mut encoded: u16 = 0;
+                    for &byte in sample {
+                        encoded = (encoded << 8) | u16::from(byte);
+                    }
+                    *slot = encoded;
+                }
+            })
+            .is_none()
+        {
+            refused = true;
+        }
+    })?;
+    if refused {
+        return Err(shape());
+    }
+    bands
+        .finish()
+        .ok_or_else(|| format!("MRMS: section 7 carried no {ni}x{nj} mosaic to tile"))
 }
 
 /// **Stream `plan`'s PNG a row at a time, handing each sample's bytes to `f`.**
@@ -856,12 +909,20 @@ fn decode_png_codes_into(
 /// asked to fill a buffer this function owns (`read_row`) rather than its own
 /// (`next_row`), so there is one row buffer in the process and not two.
 ///
+/// `f` is handed the **whole row** rather than each sample: the tiling walk
+/// needs to know where a row ends, because a tile is decided by 16 of them.
+///
 /// This is the decision `regular_grid` already makes one section earlier, for
 /// the same reason: `grib` will answer with a materialised whole, section 3's
 /// coordinates or section 7's values, and at 24.5 M points neither fits a
 /// budget the browser gives us. Reading the seven numbers, or the one row, is
 /// what fits.
-fn png_rows(plan: &PngPlan<'_>, points: usize, mut f: impl FnMut(&[u8])) -> Result<(), String> {
+fn png_rows(
+    plan: &PngPlan<'_>,
+    points: usize,
+    ni: usize,
+    mut f: impl FnMut(&[u8]),
+) -> Result<(), String> {
     let decoder = png::Decoder::new(std::io::Cursor::new(plan.payload));
     let mut reader = decoder
         .read_info()
@@ -890,6 +951,19 @@ fn png_rows(plan: &PngPlan<'_>, points: usize, mut f: impl FnMut(&[u8])) -> Resu
              section 3 declares",
         ));
     }
+    // **And the image's rows are the GRID's rows.** `width * height == points`
+    // alone admits a transposed image, or any other factorisation of the same
+    // count, and every consumer here walks the result row-major against
+    // section 3's own `ni`: the flat arm indexes it that way and the tiling arm
+    // cuts tiles out of it that way. A mosaic whose PNG is not `ni` wide is one
+    // this path must not read, not one to read approximately -- the same
+    // posture the line-size check above already takes.
+    if width != ni {
+        return Err(format!(
+            "MRMS PNG: a {width}-sample row is not the {ni} points section 3 \
+             declares along a parallel",
+        ));
+    }
 
     let mut row = vec![0u8; line];
     while reader
@@ -897,9 +971,7 @@ fn png_rows(plan: &PngPlan<'_>, points: usize, mut f: impl FnMut(&[u8])) -> Resu
         .map_err(|e| format!("MRMS PNG row decode error: {e}"))?
         .is_some()
     {
-        for sample in row.chunks_exact(plan.sample_bytes) {
-            f(sample);
-        }
+        f(&row);
     }
     Ok(())
 }

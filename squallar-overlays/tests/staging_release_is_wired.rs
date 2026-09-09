@@ -10,8 +10,9 @@
 //!
 //! `gmgsi_staging_release.rs` already proves the lever hands the block back.
 //! What it cannot prove is that anything pulls it, and a lever nothing pulls is
-//! the whole defect: two sources retain a grid apiece — GMGSI 15,000,000 B and
-//! MRMS 49,000,000 B — resident whether or not anything is decoding. So this
+//! the whole defect: two sources retain a decode buffer apiece — GMGSI a
+//! 15,000,000 B mosaic and MRMS a 224,000 B band — resident whether or not
+//! anything is decoding. So this
 //! suite goes through `OverlayRegistry::default()`, the same construction the
 //! application ships, and asks the handlers by their `LayerId`.
 //!
@@ -26,9 +27,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use squallar_overlays::render::overlay_state::OverlayRegistry;
 use squallar_source::id::known;
 
-/// Under both mosaics (15,000,000 B and 49,000,000 B) and over everything else
-/// either release touches.
-const LARGE: usize = 12 * 1024 * 1024;
+/// Under both parked blocks and over everything else either release touches.
+///
+/// **It was `12 * 1024 * 1024`**, chosen to sit under 15,000,000 B and
+/// 49,000,000 B when both slots held a whole mosaic. MRMS's slot holds a 16-row
+/// **band** now — `decode::tile_png_codes` tiles out of the PNG row walk and no
+/// plane is built for it to keep — so a 12 MiB bar counts GMGSI's release and
+/// reads **zero blocks freed** for MRMS's, which is exactly what a lever
+/// nothing pulls looks like. Stated as the smaller of the two slots, off its
+/// own constant, so a slot that changes shape again carries this with it.
+const LARGE: usize = squallar_overlays::mrms::CONUS_BAND_BYTES;
 
 static LARGE_FREES: AtomicUsize = AtomicUsize::new(0);
 static COUNTING: AtomicBool = AtomicBool::new(false);

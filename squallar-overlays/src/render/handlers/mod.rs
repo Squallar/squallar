@@ -318,10 +318,25 @@ mod grid_budget_tests {
     /// second half is the reason the figure has to exist separately at all —
     /// no one coefficient over `budget_bytes` produces all three, because the
     /// three layers budget two grids, four, and a pane set.
+    ///
+    /// That MRMS's two terms are unequal is a `const _` beside
+    /// `CONUS_BAND_BYTES`, on the same rule GMGSI's row states below: a runtime
+    /// assertion over two constants is one clippy can see cannot fail and a
+    /// reader cannot.
     #[test]
     fn a_staging_layer_answers_its_own_grids_and_no_ratio_of_its_budget() {
+        // **MRMS's two halves stopped being the same figure**, and asserting
+        // them apart is the point here too. The frame cache still has to hold
+        // a whole staged granule, priced at the flat mosaic; the slot parks
+        // one tile-row BAND, because `decode::tile_png_codes` tiles out of the
+        // PNG row walk and no plane is built for it to keep. This row read
+        // `2 * CONUS_GRID_BYTES` while the slot held a mosaic and could not
+        // have failed on a slot that had stopped holding one.
         let mrms = source_grid_staging_bytes(&known::MRMS);
-        assert_eq!(mrms, 2 * crate::mrms::CONUS_GRID_BYTES as u64);
+        assert_eq!(
+            mrms,
+            (crate::mrms::CONUS_GRID_BYTES + crate::mrms::CONUS_BAND_BYTES) as u64,
+        );
 
         // **GMGSI's two halves are two different figures**, and asserting
         // them apart is the point. The frame cache has to hold a whole
@@ -346,17 +361,16 @@ mod grid_budget_tests {
         // The two ratios differ, which is the whole reason for a second
         // function: on GMGSI the staged half is one granule of a four-granule
         // cache while the pool half is not a fraction of that budget at all,
-        // and on MRMS the two figures are now in **different units** — the
-        // staging pair is two flat PLANES, because a decode still reads one
-        // and the frame cache still passes one through, while the cache
-        // budget is two TILED grids. They were equal while both were the flat
-        // plane, and a reader who took that for a rule would be reading a
-        // coincidence.
+        // and on MRMS the staging pair is not even two of one thing — a flat
+        // PLANE for the frame the cache passes through, and a 16-row BAND for
+        // the slot, because a decode no longer reads a plane to tile. All
+        // three of those were the same 49,000,000 B figure once, and a reader
+        // who took that for a rule would be reading a coincidence.
         assert_ne!(mrms, source_grid_budget_bytes(&known::MRMS));
         assert_eq!(
             mrms,
-            2 * crate::mrms::CONUS_GRID_BYTES as u64,
-            "the staging pair is planes, and a plane is what a decode reads",
+            (crate::mrms::CONUS_GRID_BYTES + crate::mrms::CONUS_BAND_BYTES) as u64,
+            "the staged frame is a plane and the slot is a band",
         );
         assert_eq!(
             gmgsi::GLOBAL_GRANULE_BYTES as u64 * 4,

@@ -899,6 +899,10 @@ const CARIB_GZ: &[u8] = include_bytes!(
 /// The Caribbean domain in points — 3000 × 1500.
 const CARIB_POINTS: usize = 3000 * 1500;
 
+/// One tile-row band of that domain — what the slot holds after a decode of it,
+/// since the tiler stopped needing a plane.
+const CARIB_BAND_POINTS: usize = crate::render::gridded::TILE * 3000;
+
 /// **The whole shipped decode, twice, over a slot this build was not sized
 /// for.**
 ///
@@ -963,13 +967,15 @@ fn a_granule_at_a_shape_the_conus_constant_does_not_describe_reuses_the_slot() {
         "premise: a cold pool allocated the first one",
     );
 
-    // **The plane is already back**, before anything recycles anything: the
-    // tiler reads it once at the decode and hands it over, which is what keeps
-    // one 49 MB block in the process rather than one per resident grid.
+    // **The band is already back**, before anything recycles anything: it is
+    // spent the instant the last row is tiled, which is what keeps one band
+    // buffer in the process rather than one per decode — and what makes the
+    // slot's shape follow the *grid*, since a band is `TILE` rows of whatever
+    // `ni` the granule declares.
     assert_eq!(
         pool.retained_points(),
-        CARIB_POINTS,
-        "the decode returns its plane to the slot itself",
+        CARIB_BAND_POINTS,
+        "the decode returns its band buffer to the slot itself",
     );
     let address = retained_address(&pool);
     pool.recycle(grid_around(first, product));
@@ -983,7 +989,7 @@ fn a_granule_at_a_shape_the_conus_constant_does_not_describe_reuses_the_slot() {
     );
     assert_eq!(
         pool.retained_bytes(),
-        CARIB_POINTS * size_of::<crate::mrms::staging::StagedCode>(),
+        CARIB_BAND_POINTS * size_of::<crate::mrms::staging::StagedCode>(),
         "and the level follows the block the slot is actually holding",
     );
 
@@ -1028,11 +1034,12 @@ fn the_conus_granule_this_build_is_sized_for_is_pooled_too() {
     let pool = crate::mrms::staging::StagingPool::new();
 
     let first = parse_grib2_raw_in(&bytes, product.missing_codes(), &pool).expect("decodes");
-    assert_eq!(first.values.len(), crate::mrms::staging::STAGING_POINTS);
+    assert_eq!(first.values.len(), 7000 * 3500);
     assert_eq!(
         pool.retained_points(),
         crate::mrms::staging::STAGING_POINTS,
-        "the nominal shape is retained like any other, and by the decode itself",
+        "the nominal shape is retained like any other, and by the decode \
+         itself — a BAND of the mosaic, which is all the tiler ever holds",
     );
     let address = retained_address(&pool);
     pool.recycle(grid_around(first, product));
@@ -1042,9 +1049,9 @@ fn the_conus_granule_this_build_is_sized_for_is_pooled_too() {
     assert_eq!(retained_address(&pool), address);
     assert_eq!(
         second.values.len(),
-        crate::mrms::staging::STAGING_POINTS,
-        "with the whole mosaic in it — a decode into a pooled block pushes its \
-         own values or none",
+        7000 * 3500,
+        "with the whole mosaic in it — a decode through a pooled band buffer \
+         tiles every row of the grid or refuses",
     );
     assert_eq!(pool.resizes(), 0, "and nothing about it is a shape change");
 }
@@ -1053,14 +1060,15 @@ fn the_conus_granule_this_build_is_sized_for_is_pooled_too() {
 /// buffer" a claim about the allocation and not about its size.
 ///
 /// Read off the pool rather than off a decoded grid, because the decoded grid
-/// no longer holds it: the tiler reads the plane once and hands it straight
-/// back, so the block is in the slot from the moment `parse_grib2_raw_in`
-/// returns. Through `take_retained` and `give` — the pool's own doors — with
-/// the block put back immediately, so the next decode still finds it.
+/// never holds it: the tiler streams its 16-row band buffer and hands it
+/// straight back, so the block is in the slot from the moment
+/// `parse_grib2_raw_in` returns. Through `take_retained` and `give` — the
+/// pool's own doors — with the block put back immediately, so the next decode
+/// still finds it.
 fn retained_address(pool: &crate::mrms::staging::StagingPool) -> usize {
     let block = pool
         .take_retained()
-        .expect("the slot is holding the decode's plane");
+        .expect("the slot is holding the decode's band buffer");
     let address = block.as_ptr() as usize;
     pool.give(block);
     address

@@ -25,9 +25,10 @@
 //!
 //! This suite therefore holds three separate things: the door never charges
 //! LESS than a handler at its populations holds; the gap between the two is
-//! the elision and is named here in bytes; and the staging half is still
-//! attained to the byte, because a decode plane is a point count and has not
-//! moved.
+//! the elision and is named here in bytes; and the staging half is now
+//! **over**-charged too, because the decode's own buffer stopped being a plane
+//! — the slot holds 16 rows and the door still prices a staged frame at the
+//! flat mosaic. Both halves therefore err in the one direction a door may.
 //!
 //! **Its own binary, and one test**, for the reason
 //! `overlay_grid_residency_split.rs` gives: the staging slots are
@@ -74,7 +75,7 @@ fn at(h: u32, m: u32) -> chrono::NaiveDateTime {
 
 #[test]
 fn the_door_charges_exactly_what_a_handler_at_its_ceiling_holds() {
-    let mosaic = squallar_overlays::mrms::CONUS_GRID_BYTES as u64;
+    let band = squallar_overlays::mrms::CONUS_BAND_BYTES as u64;
     let pool = squallar_overlays::mrms::staging::global();
     let mut registry = OverlayRegistry::default();
     let pane_a = PaneRef::bare(0);
@@ -112,8 +113,8 @@ fn the_door_charges_exactly_what_a_handler_at_its_ceiling_holds() {
         .expect("MRMS")
         .resident_source_bytes();
     // **The key space is full — both products resident — and it is far under
-    // the ceiling the door prices.** The pool is already holding the plane of
-    // the second decode, so the cache's own half is the difference.
+    // the ceiling the door prices.** The pool is already holding the band
+    // buffer of the second decode, so the cache's own half is the difference.
     let parked = pool.retained_bytes() as u64;
     let cache_grids = cache_only - parked;
     assert_eq!(
@@ -162,7 +163,7 @@ fn the_door_charges_exactly_what_a_handler_at_its_ceiling_holds() {
     }
     assert_eq!(
         pool.retained_bytes() as u64,
-        mosaic,
+        band,
         "premise: the decode pool is holding its block, so all three \
          populations are non-empty at once",
     );
@@ -183,24 +184,33 @@ fn the_door_charges_exactly_what_a_handler_at_its_ceiling_holds() {
          to prevent",
     );
     assert_eq!(
-        ceiling, 63_390_962,
+        ceiling, 14_614_962,
         "what THIS handler holds with all three populations non-empty: two \
-         tiled granules in the cache, one staged loop frame, and the 49 MB \
-         decode plane the pool parks. It was 196,000,000 with a flat store",
+         tiled granules in the cache, one staged loop frame, and the 224,000 B \
+         band buffer the pool parks. It was 196,000,000 with a flat store and \
+         63,390,962 while the tiler still read a whole 49 MB plane",
     );
     assert_eq!(
-        door, 196_993_296,
-        "and what the door charges: two ceiling-sized grids plus two planes. \
-         The gap to the line above is the elision — 133,602,334 B a granule \
-         with no uniform tile would take up and the shipped ones do not. It is \
-         the direction the door has to err in; a price set at what granules \
-         actually cost is one the next granule can exceed",
+        door, 148_217_296,
+        "and what the door charges: two ceiling-sized grids, one flat plane \
+         for the staged frame, and one band. The gap to the line above is \
+         133,602,334 B — unchanged, because the plane came off BOTH sides — \
+         and it is the elision a granule with no uniform tile would take up \
+         and the shipped ones do not. It is the direction the door has to err \
+         in; a price set at what granules actually cost is one the next \
+         granule can exceed",
+    );
+    assert_eq!(
+        door - ceiling,
+        133_602_334,
+        "the over-charge, stated as the difference it is: the door's error \
+         direction did not move when the plane went, only its size",
     );
 
     // Left as this binary found it.
     assert_eq!(
         squallar_overlays::staging::release_all_retained(),
-        mosaic,
+        band,
         "the pressure lever finds the block this test parked and prices it",
     );
 

@@ -9,6 +9,19 @@
 //! one *slot* and N *allocations*. This module makes the buffer itself the
 //! staging area, so the slot and the allocation are the same object.
 //!
+//! ## What it stages is a BAND, not a mosaic
+//!
+//! The buffer was the decode's whole plane: 24.5 M codes in, one read out by
+//! the tiler, parked for the next granule. It is
+//! [`CONUS_BAND_BYTES`](super::CONUS_BAND_BYTES) — **224,000 B, 16 rows** —
+//! since `decode::tile_png_codes` began building the store out of the row walk
+//! instead, because a tile is decided by 16 rows and 16 rows is therefore the
+//! largest thing a decode has to hold. **Nothing else about this module
+//! changes**: one slot, one allocation, cleared at both ends, keyed on the
+//! shape the last granule handed back, and handed back by the decode itself the
+//! instant it is spent. The paragraphs below are about a 49 MB block and are
+//! kept as written — they are why the slot exists, and the slot still exists.
+//!
 //! ## Why that is the shipping fix and a bigger budget is not
 //!
 //! wasm32 linear memory only ever **grows**, and the browser build is capped at
@@ -129,9 +142,17 @@
 //! name. A free function like GMGSI's would be a change to that handler; a
 //! wrapper is not.
 
-/// **The mosaic shape this build's byte budgets were sized for**, in points —
-/// [`FRAME_STAGING_BYTES`](super::FRAME_STAGING_BYTES) divided by the width of
-/// one staged value.
+/// **The band shape this build's decode stages**, in points —
+/// [`CONUS_BAND_BYTES`](super::CONUS_BAND_BYTES) divided by the width of one
+/// staged value: 16 rows of 7000 codes, **112,000**.
+///
+/// **It was the whole mosaic, 24,500,000.** The decode built a 49,000,000 B
+/// plane and the tiler read it once; the plane was this slot, parked between
+/// granules, and once the store itself had gone tiled it was **81 % of what one
+/// looping pane held**. `TileBands` is fed from the PNG row walk now, so the
+/// largest buffer a decode holds is one tile-row band and that is what the slot
+/// holds too — the same "one allocation, not one per granule" property this
+/// module exists for, at 1/219th of the bytes.
 ///
 /// **Not the slot's capacity.** It was, and on GMGSI that exact spelling was
 /// the defect: a product whose grid moves by one column leaves a pool keyed on
@@ -164,17 +185,19 @@
 /// The assertion below is the guard, because prose is not a gate: the budget
 /// holds one CONUS mosaic and that is a **point** count, so a divisor error
 /// moves it and fails the build.
-pub const STAGING_POINTS: usize = super::FRAME_STAGING_BYTES / StagingPool::ELEMENT_BYTES;
+pub const STAGING_POINTS: usize = super::CONUS_BAND_BYTES / StagingPool::ELEMENT_BYTES;
 
 // The two terms, pinned APART, so a build failure names which one moved rather
 // than only that the quotient did. The point count is stated as a literal on
 // purpose: deriving it from `FRAME_STAGING_BYTES` again would be the same
 // division restated and could not disagree with itself.
 const _: () = assert!(StagingPool::ELEMENT_BYTES == 2);
-// One CONUS mosaic, in points — 7000 x 3500, which is what every granule
-// `noaa-mrms-pds` has published since 2020-10-14 declares in section 3. A
-// *nominal* figure now: it prices the budgets and no longer keys the slot.
-const _: () = assert!(STAGING_POINTS == 24_500_000);
+// One tile-row band of the CONUS mosaic, in points — 16 of the 3500 rows every
+// granule `noaa-mrms-pds` has published since 2020-10-14 declares in section 3.
+// A *nominal* figure: it is what the slot holds on the shipped product and it
+// does not key the slot, which takes its shape from the grid that hands a
+// buffer back.
+const _: () = assert!(STAGING_POINTS == 112_000);
 
 /// **The element the slot holds** — the store's own, not a restatement of it.
 ///

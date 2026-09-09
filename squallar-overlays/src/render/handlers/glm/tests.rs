@@ -2273,10 +2273,21 @@ fn the_registry_sum_carries_the_lightning_cache() {
         "the registry's `overlay grids` sum does not carry the lightning \
          cache's bytes",
     );
+    // **Against the staging slots, not against zero.** The shipped registry
+    // carries the mosaic handlers too and their `resident_source_bytes` reads
+    // a *process-global* pool, so "a fresh registry holds nothing" was a claim
+    // about whether any other test in this binary had decoded a granule yet.
+    // It failed at `--test-threads=1` on both sides of this change — 49,000,000
+    // before the decode plane went and 224,000 after — which is a race
+    // deciding a red, not a defect this test can see. What it is actually
+    // asserting is that a registry nobody has fetched into carries no CACHE,
+    // and the slots are the only other term.
+    let parked = crate::mrms::staging::global().retained_bytes() as u64
+        + crate::gmgsi::staging::global().retained_bytes() as u64;
     assert_eq!(
         OverlayRegistry::default().resident_source_bytes(),
-        0,
-        "and a build that has fetched nothing prices its source bytes at \
-         nothing, lightning included",
+        parked,
+        "and a build that has fetched nothing prices its source bytes at the \
+         parked decode buffers and nothing else, lightning included",
     );
 }

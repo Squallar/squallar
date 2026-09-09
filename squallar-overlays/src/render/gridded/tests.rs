@@ -547,3 +547,163 @@ fn a_band_index_that_does_not_match_its_arena_is_refused() {
     // An index of the wrong length for the shape beside it.
     assert!(build(index[..index.len() - 1].to_vec(), arena).is_none());
 }
+
+// ── The band builder: what a plane no longer has to exist for ────────────────
+
+/// Build the same store the shipped decode does — one row at a time, with no
+/// plane ever live — out of a plane this test holds only so it has something to
+/// compare against.
+fn banded_of(plane: &[ScaledCode], ni: usize, nj: usize) -> TiledU16 {
+    let mut bands = TileBands::new(ni, nj, Vec::new(), -9990.0, 1.0, 0.1, vec![0, 9000])
+        .expect("a builder for a real shape");
+    for row in plane.chunks_exact(ni) {
+        bands
+            .fill_row(|dst| dst.copy_from_slice(row))
+            .expect("a row inside the grid");
+    }
+    bands.finish().expect("a full grid finishes").0
+}
+
+/// **The store is the same bytes whether a plane existed or not.**
+///
+/// [`TiledU16::from_plane`] delegates to [`TileBands`], so this is not two
+/// implementations agreeing — it is the pin that says so, and the row that
+/// fails if a second tiler is ever written beside this one. The shape is 101 x
+/// 67 for the reason the suites above use it: **both axes have a remainder**,
+/// 5 columns past 6 whole tile columns and 3 rows past 4 whole bands, so the
+/// short band and the short tile column are inside every equality here.
+#[test]
+fn a_banded_build_is_the_same_store_as_a_plane_and_never_holds_one() {
+    let (ni, nj) = (101usize, 67usize);
+    let plane = mixed_plane(ni, nj);
+    assert_eq!(
+        banded_of(&plane, ni, nj),
+        tiled_of(&plane, ni, nj),
+        "a store built a row at a time must be the store built from the whole \
+         plane — index, arena, prefix sum and scalars alike",
+    );
+}
+
+/// **The band buffer is handed back, and it is 16 rows and not the grid.**
+///
+/// The whole point of the builder: what is live while a granule is tiled is
+/// `TILE` rows of it. At the CONUS mosaic that is 224,000 B against the
+/// 49,000,000 B plane the tiler used to read.
+#[test]
+fn the_only_row_buffer_a_build_holds_is_one_band_of_it() {
+    let (ni, nj) = (101usize, 67usize);
+    let plane = mixed_plane(ni, nj);
+    let mut bands = TileBands::new(ni, nj, Vec::new(), -9990.0, 1.0, 0.1, vec![0, 9000])
+        .expect("a builder for a real shape");
+    for row in plane.chunks_exact(ni) {
+        bands
+            .fill_row(|dst| dst.copy_from_slice(row))
+            .expect("a row");
+    }
+    let (_tiled, band) = bands.finish().expect("a full grid finishes");
+    assert_eq!(
+        band.capacity(),
+        TILE * ni,
+        "the buffer handed back is one band, so a caller that pools it pools a \
+         band — and it is a whole one, not the short last one it happened to \
+         end on",
+    );
+    assert!(
+        band.capacity() < ni * nj,
+        "and it is not the plane: {} against {}",
+        band.capacity(),
+        ni * nj,
+    );
+}
+
+/// **A tile is decided by the rows it actually has, and the last band has 3.**
+///
+/// The band boundary is where a streaming tiler can go wrong in a way no
+/// equality above would catch: a tile cannot be finalised until its sixteenth
+/// row arrives, so a builder that concluded early would decide the last band's
+/// tiles off however many rows were standing, and one that never concluded
+/// would drop them. This plane is distinct everywhere in its first four bands
+/// and one code across its last three rows, so the answer is exactly
+/// `4 * tiles_i` stored slots — a builder that missed the short band reads
+/// `5 * tiles_i` or `4 * tiles_i` with three rows of the grid gone.
+#[test]
+fn the_last_band_is_short_and_its_tiles_are_decided_over_the_rows_it_has() {
+    let (ni, nj) = (101usize, 67usize);
+    let tiles_i = ni.div_ceil(TILE);
+    assert_eq!(nj.div_ceil(TILE), 5, "premise: five bands");
+    assert_eq!(nj - 4 * TILE, 3, "premise: and the last one is three rows");
+
+    let mut plane: Vec<ScaledCode> = (0..(ni * nj) as u32)
+        .map(|k| (k % 60_000) as ScaledCode + 1)
+        .collect();
+    for point in plane[4 * TILE * ni..].iter_mut() {
+        *point = 7;
+    }
+    let tiled = banded_of(&plane, ni, nj);
+    assert_eq!(
+        tiled.arena().len(),
+        4 * tiles_i * TILE_CELLS,
+        "the short band's tiles are uniform over their three rows and take no \
+         arena at all",
+    );
+    assert_eq!(
+        tiled.get_grid(ni - 1, nj - 1),
+        Some((-9990.0 + 7.0) * 0.1),
+        "and its last point is still the code the plane put there",
+    );
+    // Every point, so "elided" cannot mean "lost".
+    for j in 0..nj {
+        for i in 0..ni {
+            assert_eq!(
+                tiled.get_grid(i, j).map(f32::to_bits),
+                flat_of(plane.clone()).get(j * ni + i).map(f32::to_bits),
+                "point ({i}, {j})",
+            );
+        }
+    }
+}
+
+/// **A grid short of its last rows is refused, not padded.**
+///
+/// A mosaic missing its final bands would otherwise reach the raster as
+/// sentinel, which is a picture and not an error — and the shipped decode's
+/// only defence against a truncated section 7 is this refusal.
+#[test]
+fn a_builder_fed_fewer_rows_than_its_grid_declares_refuses() {
+    let (ni, nj) = (101usize, 67usize);
+    let plane = mixed_plane(ni, nj);
+    for short in [0usize, 1, 4 * TILE, nj - 1] {
+        let mut bands = TileBands::new(ni, nj, Vec::new(), -9990.0, 1.0, 0.1, vec![0, 9000])
+            .expect("a builder for a real shape");
+        for row in plane.chunks_exact(ni).take(short) {
+            bands
+                .fill_row(|dst| dst.copy_from_slice(row))
+                .expect("a row");
+        }
+        assert!(
+            bands.finish().is_none(),
+            "{short} of {nj} rows finished a store",
+        );
+    }
+    // Non-triviality: the same builder at the full row count does finish.
+    assert_eq!(banded_of(&plane, ni, nj).nj(), nj);
+}
+
+/// **And a row past the grid is refused too**, rather than growing the band
+/// buffer past the one allocation it was given.
+#[test]
+fn a_builder_refuses_a_row_past_the_grid_it_was_told_about() {
+    let (ni, nj) = (101usize, 67usize);
+    let plane = mixed_plane(ni, nj);
+    let mut bands = TileBands::new(ni, nj, Vec::new(), -9990.0, 1.0, 0.1, vec![0, 9000])
+        .expect("a builder for a real shape");
+    for row in plane.chunks_exact(ni) {
+        bands
+            .fill_row(|dst| dst.copy_from_slice(row))
+            .expect("a row");
+    }
+    assert!(
+        bands.fill_row(|dst| dst.fill(0)).is_none(),
+        "row {nj} of a {nj}-row grid was accepted",
+    );
+}

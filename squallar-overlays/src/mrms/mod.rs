@@ -44,12 +44,15 @@
 //! and [`MrmsProduct::missing_codes`] records the counts the table was measured
 //! from.
 //!
-//! **2.4 to 8.9 MB per grid, from a 49 MB plane.** The decode still reads a
-//! plane of 24.5 M `u16` codes — the width section 5 actually declares — but
-//! that plane is scratch: [`GridValues::Tiled`] keeps only the 16x16 tiles
-//! carrying more than one code, and the plane goes straight back to
-//! [`staging`]. Measured over 28 granules of both shipped products, 8 dates
-//! from 2021-10-05 to 2026-09-08: **2,350,138 to 8,943,164 B**, against
+//! **2.4 to 8.9 MB per grid, and no plane at all.** [`GridValues::Tiled`] keeps
+//! only the 16x16 tiles carrying more than one code, and it is built one
+//! [`TILE`](crate::render::gridded::TILE)-row band at a time straight out of
+//! the PNG row walk — so the 49,000,000 B plane the tiler used to read, which
+//! [`staging`] parked between granules and which was **81 % of what one looping
+//! pane held** once the store itself had gone tiled, is not built. What is live
+//! while a granule decodes is 16 rows of it, [`CONUS_BAND_BYTES`], plus the
+//! tiles already kept. Measured over 28 granules of both shipped products, 8
+//! dates from 2021-10-05 to 2026-09-08: **2,350,138 to 8,943,164 B**, against
 //! 49,000,000 flat, every point bit-identical. The corpus and the four forms it
 //! was chosen against are at
 //! [`TiledU16`](crate::render::gridded::TiledU16).
@@ -275,6 +278,24 @@ pub const MRMS_DOMAIN_LON: std::ops::RangeInclusive<f64> = -130.0..=-60.0;
 /// this figure follows it.
 pub const CONUS_GRID_BYTES: usize = 7000 * 3500 * crate::render::gridded::ScaledU16::ELEMENT_BYTES;
 
+/// **One tile-row band of the CONUS mosaic**, in bytes — 16 rows of 7000 codes,
+/// **224,000 B**, and the largest plane-shaped buffer a decode holds.
+///
+/// [`CONUS_GRID_BYTES`] used to be that buffer as well as the store: the mosaic
+/// was decoded whole into a 49,000,000 B plane and the tiler read the plane
+/// once. Both halves are gone —
+/// [`TileBands`](crate::render::gridded::TileBands) is fed straight out of the
+/// PNG row walk, so what is live while a granule decodes is [`TILE`] rows of it
+/// plus the tiles already kept. `mrms::staging`'s one retained block is this
+/// now, which is the same "one allocation, not one per granule" property at
+/// **1/219th** of the bytes.
+///
+/// Derived from the tile geometry rather than stated, so a tile side that moved
+/// moves this with it — an arm of the arithmetic left behind is how
+/// `GLOBAL_GRID_BYTES` came to price four bytes a point for a one-byte store.
+pub const CONUS_BAND_BYTES: usize =
+    7000 * crate::render::gridded::TILE * crate::render::gridded::ScaledU16::ELEMENT_BYTES;
+
 /// **The most a TILED CONUS mosaic can cost resident** — every tile stored,
 /// plus the index and the prefix sum that address them.
 ///
@@ -404,6 +425,11 @@ const _: () = assert!(GRID_CACHE_BYTES.is_multiple_of(CONUS_TILED_CEILING_BYTES)
 // the product of it and the shape.
 const _: () = assert!(crate::render::gridded::ScaledU16::ELEMENT_BYTES == 2);
 const _: () = assert!(CONUS_GRID_BYTES == 49_000_000);
+// The band beside it, pinned APART for the same reason: 16 rows of 7000 codes.
+// This is the figure the "no plane is built" claim is made of, and the one the
+// staging slot is keyed on.
+const _: () = assert!(CONUS_BAND_BYTES == 224_000);
+const _: () = assert!(CONUS_GRID_BYTES / CONUS_BAND_BYTES == 218);
 // The tiled ceiling, pinned APART from the flat one so a build failure names
 // which moved. It is the flat plane plus 0.78 % of addressing overhead — the
 // whole of what this representation can cost above the one it replaces, and the
@@ -483,8 +509,17 @@ const _: () = {
 ///
 /// Not a per-arm cascade, because the figure is not a guess about the device —
 /// it is what the pipeline needs. A loop frame's storage is its **texture**,
-/// held by the pane; the granule is a 49,000,000 B staging buffer a frame
-/// passes through on its way to one. A described job takes its own refcount on
+/// held by the pane; the granule is a staging buffer a frame passes through on
+/// its way to one.
+///
+/// **It over-charges, deliberately.** A staged granule is tiled now and reads
+/// 2,349,256 to 8,942,280 B over the 28-granule corpus, against the
+/// 49,000,000 B flat mosaic this still prices. Under-charging is the direction
+/// that silently overruns — the door admits a pane, the handler holds more than
+/// the door believes, and nothing says so — so this stays at the flat figure
+/// until something measures the ceiling rather than the plane.
+///
+/// A described job takes its own refcount on
 /// the raster, so the slot is free again the moment `prepare_job` has run, and
 /// the handler's frame gate admits one fetch at a time so nothing else can ask
 /// for the slot in the meantime.
@@ -492,9 +527,11 @@ const _: () = {
 /// The gate matters even more here than at GMGSI: **the slot is one grid, and
 /// only one decode can be handed it.** [`staging::StagingPool::take`] answers
 /// the retained buffer to whoever asks first and every other caller allocates
-/// its own 49 MB, so N concurrent frame fetches hold N x 49 MB inside the
+/// its own band, so N concurrent frame fetches hold N tiled mosaics inside the
 /// futures before any cache sees a byte. Thirty unthrottled fetches — one
-/// slider-default hour at the ~2-minute cadence — would be ~1.5 GB in flight.
+/// slider-default hour at the ~2-minute cadence — were ~1.5 GB in flight at the
+/// plane the decode used to build, and are ~70 to 270 MB at the tiled granules
+/// it builds now: smaller, and still a reason the gate is the gate.
 /// **And since 2026-08-31 it is one *allocation* as well as one slot.** The
 /// figure named a slot and nothing enforced the rest of what it says: each
 /// granule built a fresh 98 MB vector (`f32` then) and freed the last one, so a
@@ -502,7 +539,9 @@ const _: () = {
 /// put ~147 MB of large-block churn on a heap that only grows. [`staging`] holds
 /// the buffer between granules and refills it, which is what makes the code
 /// match this constant's claim; the freeze it fixes and why a wider budget
-/// would not have is written up there.
+/// would not have is written up there. What that slot holds is
+/// [`CONUS_BAND_BYTES`] rather than a mosaic since the tiler stopped needing a
+/// plane to read.
 ///
 /// The other 49 MB of that churn was `grib`'s whole-image PNG buffer, and
 /// since the row walk landed (`decode::decode_png_into`) there is no

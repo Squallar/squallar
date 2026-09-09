@@ -23,6 +23,13 @@ use super::*;
 /// has never been anything else.
 const CONUS_POINTS: usize = 7000 * 3500;
 
+/// **One tile-row band of that mosaic** — 16 x 7000 = 112,000 points, which is
+/// what the slot holds since `decode::tile_png_codes` stopped building a plane
+/// for the tiler to read. [`STAGING_POINTS`] is this; [`CONUS_POINTS`] is the
+/// grid it is 1/219th of, and the two being different numbers is what the file
+/// header above asks for.
+const CONUS_BAND_POINTS: usize = crate::render::gridded::TILE * 7000;
+
 /// **A shape MRMS publishes that this build's constant does not describe** —
 /// the Caribbean domain's 3000 x 1500 = 4,500,000 points, read off
 /// `CARIB/MergedReflectivityQCComposite_00.50/20260904/` on 2026-09-04. Same
@@ -51,12 +58,17 @@ fn buffer_of(points: usize) -> Vec<u16> {
 /// **The nominal figure prices the budgets and does not key the slot.**
 #[test]
 fn the_nominal_shape_prices_the_budgets_and_does_not_key_the_slot() {
-    assert_eq!(STAGING_POINTS, CONUS_POINTS);
+    assert_eq!(STAGING_POINTS, CONUS_BAND_POINTS);
+    assert_ne!(
+        STAGING_POINTS, CONUS_POINTS,
+        "the slot holds a BAND, not a mosaic: the decode tiles out of the row \
+         walk and never builds the plane this used to be",
+    );
     assert_eq!(StagingPool::new().nominal_points(), STAGING_POINTS);
     assert_eq!(
         STAGING_POINTS * size_of::<StagedCode>(),
-        crate::mrms::FRAME_STAGING_BYTES,
-        "one staged mosaic, which is what the frame budget is",
+        crate::mrms::CONUS_BAND_BYTES,
+        "one staged band, which is what the slot is",
     );
     assert_ne!(
         OFF_NOMINAL_POINTS, STAGING_POINTS,
@@ -567,9 +579,9 @@ fn the_retained_level_follows_the_slot_in_both_directions() {
     pool.give(mosaic_buffer());
     assert_eq!(
         pool.retained_bytes(),
-        crate::mrms::FRAME_STAGING_BYTES,
+        crate::mrms::CONUS_BAND_BYTES,
         "the capacity, not the length: the slot's buffer is always empty, so a \
-         level off `len` would read zero over a live 49 MB block",
+         level off `len` would read zero over a live block",
     );
 
     let buffer = pool.take(STAGING_POINTS).expect("the slot is full");

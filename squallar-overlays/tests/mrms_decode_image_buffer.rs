@@ -1,9 +1,11 @@
 //! **The largest block one MRMS decode takes, once the staging buffer is
 //! warm.**
 //!
-//! The mosaic's values are 49,000,000 B — 24,500,000 points at the 16-bit
-//! width MRMS publishes — and `super::staging` retains them between granules,
-//! so on the shipped path that block is allocated once per process. What was still allocated **per granule** is `grib`'s PNG stage:
+//! The mosaic's values were 49,000,000 B — 24,500,000 points at the 16-bit
+//! width MRMS publishes — held whole while the tiler read them, and
+//! `super::staging` retained that block between granules so it was allocated
+//! once per process. The store is tiled out of the row walk now and no plane is
+//! built at all; what the slot retains is one 16-row band, 224,000 B. What was still allocated **per granule** is `grib`'s PNG stage:
 //! `read_image_buffer` does `vec![0; reader.output_buffer_size()]`, and at
 //! 7000 x 3500 samples of 16 bits that is **49,000,000 B**, measured, every
 //! granule, on all three committed fixtures.
@@ -48,14 +50,15 @@ use std::cell::Cell;
 use squallar_overlays::mrms::{MrmsProduct, decode, staging};
 use squallar_overlays::render::gridded::GridValues;
 
-/// **The decode returned its plane to the pool itself.**
+/// **The decode returned its band buffer to the pool itself.**
 ///
 /// Panics on any other arm rather than declining quietly: the pool's slot is a
-/// `Vec<u16>` and only the narrow arm's plane goes into it, so a shipped
+/// `Vec<u16>` and only the narrow arm's buffer goes into it, so a shipped
 /// granule that stopped taking that arm would leave the pool cold and this
-/// measurement "warm" in name only. The tiler reads the plane once and hands it
-/// straight back, which is why nothing is given here — and asserting the slot
-/// is holding it is the honest replacement for the `give` that used to be.
+/// measurement "warm" in name only. The buffer is spent the instant the last
+/// row is tiled and handed straight back, which is why nothing is given here —
+/// and asserting the slot is holding it is the honest replacement for the
+/// `give` that used to be.
 fn assert_plane_is_parked(values: &GridValues, pool: &staging::StagingPool) {
     assert!(
         matches!(values, GridValues::Tiled(_)),
@@ -64,9 +67,9 @@ fn assert_plane_is_parked(values: &GridValues, pool: &staging::StagingPool) {
     );
     assert_eq!(
         pool.retained_points(),
-        values.len(),
-        "the decode must hand its plane back to the slot, or the next one \
-         allocates a fresh 49 MB block and this measurement is of a cold pool",
+        squallar_overlays::mrms::staging::STAGING_POINTS,
+        "the decode must hand its band buffer back to the slot, or the next \
+         one allocates a fresh one and this measurement is of a cold pool",
     );
 }
 
