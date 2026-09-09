@@ -148,6 +148,62 @@ fn four_panes_share_one_overlay_texture() {
     }
 }
 
+/// **A first picture is charged to the overlay door for as long as its bands
+/// are crossing**, and is charged nothing once they have landed.
+///
+/// The arm this pins is the one every layer's FIRST picture takes: the cache
+/// has nothing on the glass to protect, so the arrival goes up at once and
+/// fills top-down rather than being held behind the picture it replaces. It is
+/// still whole in `squallar_gpu`'s `TextureUploads::pending` for as many frames
+/// as it has bands, and until 2026-09-09 the door
+/// (`squallar_device_profile::constants::MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING`)
+/// charged it nothing — so on a boot, the burst the door exists for, its
+/// occupancy term was structurally zero and the pipe was bounded by nothing.
+/// Measured on the REST1 arm the morning this landed: 9-14 whole pictures of
+/// 17,971,200 B dispatched into a 50,331,648 B ceiling, 7-8 of them through
+/// this arm, and `upload pending` at 78.0-138.3 MB on the tick the process's
+/// `live_bytes` peak was set.
+///
+/// **Both halves, because either alone is satisfied by a constant.** A charge
+/// that never fell would shut the door for the life of the session, which is
+/// the failure `OverlayTextureCache::settle_arrival` exists to prevent; a
+/// charge that is never made is the defect itself.
+#[test]
+fn a_first_overlay_picture_is_charged_while_its_bands_cross() {
+    let ctx = egui::Context::default();
+    let mut app = n_pane_app(1);
+    deliver(&mut app, &ctx, vec![0]);
+
+    let picture = u64::from(W) * u64::from(H) * 4;
+    let pane = app.gui.pane_mut(0).expect("pane exists");
+    assert!(
+        pane.overlay_cache_mut(&known::NWS_ALERTS)
+            .current()
+            .is_some(),
+        "fixture: the arrival did not reach the glass, so nothing below is \
+         reading the arm this test is about",
+    );
+    assert_eq!(
+        pane.overlay_picture_bytes_outstanding(),
+        picture,
+        "a picture that went straight on the glass is still whole on the \
+         upload queue, and the door read it as an empty pipe",
+    );
+
+    // The renderer says every band has landed. `promote_held_rasters` is what
+    // the frame calls with that answer.
+    app.gui.promote_held_rasters(|_| true);
+    assert_eq!(
+        app.gui
+            .pane_mut(0)
+            .expect("pane exists")
+            .overlay_picture_bytes_outstanding(),
+        0,
+        "the charge did not fall when the bands landed, so the door stays \
+         shut for the rest of the session",
+    );
+}
+
 /// Post a reply nothing is waiting for. `RendersInFlight::retire` answers
 /// stale, `retain` empties the pane list, and the picture is thrown away
 /// **before** `Context::load_texture` — the drop arm of the arrival path.

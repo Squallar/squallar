@@ -1148,17 +1148,21 @@ pub struct OverlayTextureCache {
     ///
     /// A hold exists so a *replacement* does not appear half-uploaded over
     /// the picture already on the glass. When there is no picture on the
-    /// glass there is nothing to protect, so
-    /// [`crate::pane::PaneState::place_radar_raster`] shows the arriving
-    /// raster at once and it fills top-down as its bands land — which is the
-    /// behaviour, not a defect.
+    /// glass there is nothing to protect, so both arrival paths —
+    /// [`crate::pane::PaneState::place_radar_raster`] and
+    /// `App::poll_overlay_render_results` — show the arriving raster at once
+    /// and it fills top-down as its bands land, which is the behaviour and not
+    /// a defect.
     ///
     /// What that costs is an accounting hole: the picture is whole in
     /// `squallar_gpu`'s `TextureUploads::pending`, holding all of itself on
-    /// the host, and [`Self::is_holding`] reads false for it. Every pane's
-    /// FIRST radar picture takes that arm, so on a resume — the batch the
-    /// plan-view door exists for — the door's occupancy term was
-    /// structurally zero for the whole burst. This flag is the missing half.
+    /// the host, and [`Self::is_holding`] reads false for it. **Every pane's
+    /// FIRST picture of a layer takes that arm**, so the burst each door
+    /// exists for is the one burst its occupancy term was structurally zero
+    /// for: a resume for the plan-view door, a boot for the overlay one. This
+    /// flag is the missing half of both, closed a day apart —
+    /// [`crate::pane::PaneState::plan_view_pictures_in_pipe`] reads it for
+    /// radar, [`Self::outstanding_bytes`] for every other texture layer.
     ///
     /// Set only by [`Self::show_arriving`], cleared by every other route into
     /// [`Self::current`] and by [`Self::settle_arrival`] on the frame the
@@ -1315,20 +1319,49 @@ impl OverlayTextureCache {
     /// has both resident, which is the state the arrival door creates every
     /// time it re-asks under a hold.
     ///
-    /// The held half is exact — the arrived picture's own `width x height x 4`
-    /// — and the in-flight half is the plan its dispatch went out on.
+    /// The two arrived halves are exact — the picture's own
+    /// `width x height x 4` — and the in-flight half is the plan its dispatch
+    /// went out on.
+    ///
+    /// # The third term, and why a door without it is open at boot
+    ///
+    /// A picture that arrives to an **empty** cache goes straight on the glass
+    /// and fills top-down ([`Self::show_arriving`]); there is no picture under
+    /// it to protect, so nothing is held. It is still whole in
+    /// `squallar_gpu`'s `TextureUploads::pending` until its last band crosses,
+    /// and until 2026-09-09 this figure charged it nothing — so the arm every
+    /// layer's FIRST picture takes was structurally zero for the whole of a
+    /// boot. Measured on the REST1 arm (1 pane, 18 layers), that is what the
+    /// door was worth at the one instant the process's `live_bytes` peak is
+    /// set: five of five legs dispatched 9-14 whole pictures of 17,971,200 B
+    /// in the boot burst against a ceiling of 50,331,648 B, 7-8 of them
+    /// reached the glass through this arm, and `upload pending` read 78.0 to
+    /// 138.3 MB at the peak tick. The plan-view door had the identical hole
+    /// and it was closed a day earlier; see
+    /// [`Self::showing_arriving`] and
+    /// [`crate::pane::PaneState::plan_view_pictures_in_pipe`].
     pub fn outstanding_bytes(&self) -> u64 {
-        let held = self.held.as_ref().map_or(0, |held| {
-            u64::from(held.data.width)
-                .saturating_mul(u64::from(held.data.height))
+        let picture = |data: &OverlayTextureData| {
+            u64::from(data.width)
+                .saturating_mul(u64::from(data.height))
                 .saturating_mul(4)
-        });
+        };
+        let held = self.held.as_ref().map_or(0, |held| picture(&held.data));
+        // **Added to the held half rather than merged with it.** A cache can
+        // be filling a first picture top-down with a replacement held behind
+        // it, and both are whole on the queue at once — the same pair
+        // `plan_view_pictures_in_pipe` returns two slots for.
+        let arriving = if self.showing_arriving {
+            self.current.as_ref().map_or(0, picture)
+        } else {
+            0
+        };
         let in_flight = if self.renders.holds(RenderSlot::WHOLE) {
             self.planned_bytes
         } else {
             0
         };
-        held.saturating_add(in_flight)
+        held.saturating_add(arriving).saturating_add(in_flight)
     }
 
     /// Take the held picture if `delivered` says its pixels have all landed.

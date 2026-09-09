@@ -3865,6 +3865,13 @@ impl PaneState {
             if *id == known::RADAR {
                 continue;
             }
+            // The picture already on the glass, first and unconditionally, for
+            // `promote_held_raster`'s reason: it can be crossing to the GPU
+            // with nothing held behind it at all, which is exactly a layer's
+            // first picture, and the `let Some` below would then never reach
+            // it. A charge that only ever rose would shut the overlay door for
+            // the life of the session.
+            cache.settle_arrival(&delivered);
             if let Some(held) = cache.take_held_if_delivered(&delivered) {
                 // A promotion, counted where one happens rather than inside
                 // `show`: `show` is also how a first picture reaches the
@@ -3887,15 +3894,22 @@ impl PaneState {
     /// one — a property of the display and not of the door. See
     /// `squallar_device_profile::constants::MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING`.
     ///
-    /// **The two states are added, not merged.** The count this replaced
-    /// charged one per layer in either state on the reading that they are one
-    /// picture's bytes at two points of one journey — `overlay replies` on the
-    /// way in, `upload pending` on the way out, "abut and do not overlap".
-    /// That is true of one picture and false of this cache: the arrival door
-    /// re-asks under a hold, so a layer can have an arrived picture in the
-    /// queue *and* a fresh one being rasterized, and both are resident. A
-    /// layer in neither state costs nothing; the picture it is drawing is the
-    /// GPU's.
+    /// **The states are added, not merged.** The count this replaced charged
+    /// one per layer in any of them on the reading that they are one picture's
+    /// bytes at points of one journey — `overlay replies` on the way in,
+    /// `upload pending` on the way out, "abut and do not overlap". That is
+    /// true of one picture and false of this cache: the arrival door re-asks
+    /// under a hold, so a layer can have an arrived picture in the queue *and*
+    /// a fresh one being rasterized, and both are resident. A layer in none of
+    /// them costs nothing; the picture it is drawing is the GPU's.
+    ///
+    /// **And "arrived" is two states, not one**, since 2026-09-09: a picture
+    /// held behind the one on the glass, and a picture that *is* the one on
+    /// the glass and is still filling top-down. Both are whole on
+    /// `squallar_gpu`'s queue; the second was charged nothing, and it is the
+    /// arm every layer's first picture takes. See
+    /// [`crate::overlay_cache::OverlayTextureCache::outstanding_bytes`] for
+    /// what that was worth at boot.
     ///
     /// **Radar is not counted.** Its rasters come from
     /// `App::dispatch_pane_renders`, not from the overlay door this figure

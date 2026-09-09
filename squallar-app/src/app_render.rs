@@ -3816,7 +3816,15 @@ impl super::App {
                 };
                 if cache.current().is_none() {
                     squallar_egui::overlay_cache::ledger::note_shown();
-                    cache.show(data);
+                    // **`show_arriving`, never `show`.** This handle was
+                    // minted by the `load_texture` above, on this frame, so
+                    // egui has not even handed its delta to the renderer yet
+                    // and not one of its bands has crossed — the same reason
+                    // `App::apply_render_to_pane` passes `whole: false` for
+                    // every texture it mints. Saying so is what puts the
+                    // picture on the overlay door's occupancy term; see
+                    // `OverlayTextureCache::outstanding_bytes`.
+                    cache.show_arriving(data);
                 } else {
                     // A hold replaces rather than queues, so handing one to a
                     // cache that is already holding throws away an upload that

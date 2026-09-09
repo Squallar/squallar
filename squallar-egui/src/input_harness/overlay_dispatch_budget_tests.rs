@@ -320,6 +320,67 @@ fn pictures_already_in_the_pipe_spend_the_allowance() {
     }
 }
 
+/// **A picture filling the glass top-down spends the allowance too**, at its
+/// own size.
+///
+/// [`pictures_already_in_the_pipe_spend_the_allowance`] puts the occupants in
+/// the cache's `held` slot, which is where a picture goes when there is one
+/// under it to protect. This is the other arm and it is the one a **boot**
+/// takes: an arrival to an empty cache goes on the glass at once
+/// (`OverlayTextureCache::show_arriving`), fills top-down as its bands land,
+/// and is whole on `squallar_gpu`'s queue the whole time. The two arms are one
+/// picture in one queue and the door has to read both; it read only the first
+/// until 2026-09-09, so on the burst it exists for — every layer's first
+/// picture, all of them at once — its occupancy term was zero.
+///
+/// The same shape as the `held` suite above, control included: at
+/// `allowance - 1` exactly one more is afforded, so this reads the *bytes* of
+/// what is arriving rather than merely "something is arriving".
+#[test]
+fn pictures_filling_the_glass_top_down_spend_the_allowance() {
+    let plan = picture_plan();
+    let allowance = afforded(plan.bytes());
+    assert!(
+        allowance >= 2,
+        "fixture: the allowance is {allowance}, so the `allowance - 1` control \
+         below is the empty pipe and not a partly spent one",
+    );
+    for arriving in [allowance - 1, allowance] {
+        let mut h = scene();
+        h.gui_mut().enable_overlay_for_test(&OCCUPANT);
+        for idx in 0..arriving {
+            let mut picture = raster(&h, &format!("arriving-{idx}"));
+            picture.width = plan.width;
+            picture.height = plan.height;
+            h.gui_mut().panes_mut()[idx]
+                .overlay_cache_mut(&OCCUPANT)
+                .show_arriving(picture);
+        }
+        let outstanding: u64 = h
+            .gui()
+            .panes()
+            .iter()
+            .map(crate::pane::PaneState::overlay_picture_bytes_outstanding)
+            .sum();
+        assert_eq!(
+            outstanding,
+            (arriving as u64) * plan.bytes(),
+            "fixture: {arriving} pictures of {} B are filling the glass and \
+             the walk reads {outstanding} B",
+            plan.bytes(),
+        );
+
+        h.frame_after(FRAME_DT);
+        let asked = rasterizes_requested(&h, &ASKING);
+        assert_eq!(
+            asked,
+            allowance - arriving,
+            "with {arriving} pictures still crossing to the GPU the frame \
+             asked for {asked} more",
+        );
+    }
+}
+
 /// **A supersede is charged nothing**, because it is net zero on the pipe:
 /// the `hold` drops the handle it was keeping, egui retires that texture and
 /// `squallar_gpu`'s `TextureUploads::free` takes its bands out of the queue
