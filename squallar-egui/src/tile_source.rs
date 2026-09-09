@@ -914,14 +914,40 @@ impl TileCache {
     /// stands alone.
     fn ask(&mut self, tile_id: TileId, epoch: u64, wanted_last_pass: bool) {
         if let Some(let_go_on) = self.evicted.pop(&tile_id) {
-            // The eviction has to be no older than the pass that wanted it:
-            // a cell the walk reached last pass for the first time in twenty
-            // is a cell that *did* leave the glass, however recently the ask
-            // for it was made. Without this the refused-ask queue reports
-            // turnover as a dropped cell — every retry it makes is for a cell
-            // last pass wanted by construction — which read 0 or ~150 of 330
+            // Two conditions, and each closes a way the refused-ask queue
+            // reports plain turnover as a dropped cell.
+            //
+            // The eviction has to be no older than the pass that wanted it: a
+            // cell the walk reached last pass for the first time in twenty is
+            // a cell that *did* leave the glass, however recently the ask for
+            // it was made. Without this the counter read 0 or ~150 of 330
             // refetches on the reversing sweep depending on how the channel
             // happened to fill, once in forty runs.
+            //
+            // And `wanted_last_pass` is only ever true of an ask the **walk**
+            // made, because the queue keeps exactly the cells the last pass
+            // wanted and so satisfies that test by construction. The age guard
+            // alone left the boundary case open — an eviction on pass N and
+            // the queue's retry at the head of pass N+1 — and it fired:
+            // fifteen sampled occurrences on a healthy tree, **all fifteen**
+            // from the retry and not the walk, and all fifteen with
+            // `let_go_on == pass_nr - 1`. Ten of the fifteen were taken on an
+            // unmodified main, so this is neither new nor an artifact of the
+            // fixture beside it. That is
+            // how `a_refetch_a_reversing_pan_earns_is_never_a_cell_that_stayed_on_the_glass`
+            // read 1 twice in sixteen whole-binary runs at loadavg 52-94, on a
+            // cache that had dropped nothing it was drawing.
+            //
+            // **The price, measured.** A retry on a viewport that has *not*
+            // moved is for a cell still on the glass, so this drops true
+            // positives with the false ones: the two-part tamper below
+            // (`set_floor_entries(0)` with the budget under one window) read
+            // 33 still-wanted before and 17 after. The counter's own contract
+            // is what makes that the right trade — it exists to under-report
+            // a broken cache and never to over-report one, every assertion
+            // written against it is `== 0`, and 17 against 0 is the same
+            // verdict 33 against 0 was. Over-reporting had no such margin: 1
+            // against 0 is a red board.
             let dropped_from_the_glass =
                 wanted_last_pass && let_go_on.saturating_add(1) >= self.pass_nr;
             self.note(cache_ledger::CacheEvent::RefetchAfterEviction {
@@ -3224,7 +3250,7 @@ impl HttpsTiles {
             let Some(tile_id) = self.asks.pop_front() else {
                 break;
             };
-            if self.try_request(tile_id) == Ask::Refused {
+            if self.try_request(tile_id, AskSource::Retry) == Ask::Refused {
                 self.asks.push_front(tile_id);
                 break;
             }
@@ -3704,14 +3730,14 @@ impl HttpsTiles {
         // that, and only what the walk still wants survives the next pass's
         // purge — see `AskQueue::new_pass`.
         self.asks.wanted(tile_id);
-        if self.try_request(tile_id) == Ask::Refused {
+        if self.try_request(tile_id, AskSource::Walk) == Ask::Refused {
             self.asks.refuse(tile_id);
         }
     }
 
     /// [`Self::request_once`]'s decision and send, with the outcome named so
     /// the refused-ask queue can act on it. Records nothing in the queue.
-    fn try_request(&mut self, tile_id: TileId) -> Ask {
+    fn try_request(&mut self, tile_id: TileId, source: AskSource) -> Ask {
         if self.requests_closed {
             return Ask::Unneeded;
         }
@@ -3740,7 +3766,14 @@ impl HttpsTiles {
         // this pass's walk so far — which `request_once` has already added
         // this very cell to, and testing against it would answer "yes" for
         // every cell.
-        let wanted_last_pass = self.asks.wanted_last_pass(&tile_id);
+        // **`AskSource::Walk` only**, and that is the whole of what makes this
+        // a reading. The queue keeps exactly the cells the last pass wanted
+        // (`AskQueue::new_pass`), so `wanted_last_pass` is true of every cell
+        // it hands back **by construction** and says nothing about the glass —
+        // while the window has moved a column since, so the cell it hands back
+        // is as likely to have left the glass as to be on it. See
+        // [`TileCache::ask`].
+        let wanted_last_pass = source == AskSource::Walk && self.asks.wanted_last_pass(&tile_id);
 
         // Split borrow: the sender is needed while the cache is borrowed.
         let Self {
@@ -5277,6 +5310,18 @@ enum Ask {
     /// Nothing to send: cached at the current generation, a request already
     /// out, or a source that has stopped fetching.
     Unneeded,
+}
+
+/// Which side of a pass made an ask. Only one classification needs it, and
+/// that one cannot be made without it — see [`TileCache::ask`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AskSource {
+    /// The pass's own drawing: [`HttpsTiles::ground_at`]'s walk, or
+    /// [`HttpsTiles::warm`]'s ancestor net. The cell is on the glass now.
+    Walk,
+    /// [`HttpsTiles::retry_refused_asks`] handing back a cell the channel
+    /// turned away last pass. The cell may have left the glass since.
+    Retry,
 }
 
 /// The working set the passes drawing one source measure, pass by pass.
