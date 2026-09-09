@@ -251,6 +251,7 @@ fn the_rig_reads_the_tile_cache_line_the_app_actually_writes() {
         requests: 1001,
         restyle_asks: 12,
         refetch_after_eviction: 103,
+        refetch_still_wanted: 0,
         puts_first: 904,
         puts_restyle: 15,
         puts_duplicate: 26,
@@ -260,9 +261,10 @@ fn the_rig_reads_the_tile_cache_line_the_app_actually_writes() {
         evicted_bytes: 6_000_060,
         resident_entries: 71,
         resident_bytes: 8_000_082,
-        // Levels the line does not carry: distinct from every printed
-        // figure, so a formatter that started printing one would be caught
-        // by the position check below rather than pass by coincidence.
+        // Four levels the line ends on, and `parsed_bytes` which it does
+        // not carry: every one distinct from every other printed figure, so
+        // a formatter that put one in the wrong position is caught by the
+        // pin below rather than passing by coincidence.
         overrun_bytes: 4_004,
         floor_entries: 5_005,
         wanted_on_glass: 6_006,
@@ -280,7 +282,8 @@ fn the_rig_reads_the_tile_cache_line_the_app_actually_writes() {
     let body = rendered(
         &pattern[head.len()..],
         &[
-            1001, 12, 103, 904, 15, 26, 37, 48, 59, 6_000_060, 71, 8_000_082, 93, 1,
+            1001, 12, 103, 0, 904, 15, 26, 37, 48, 59, 6_000_060, 71, 8_000_082, 93, 1, 5_005,
+            4_004, 6_006, 7_007,
         ],
     );
     for role in ROLES {

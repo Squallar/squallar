@@ -74,7 +74,10 @@
 //!   pass's cells at the drawn level and in the ancestor net, which is the
 //!   tile term the application prices its scene with; `snapped` is `1` while
 //!   the tile-sharpness rung holds the source at the whole zoom
-//!   ([`super::snap`]) and is the one level the reported line carries.
+//!   ([`super::snap`]). The reported line carries all of these but
+//!   [`Totals::parsed_bytes`], because `overrun`, `floor` and the two
+//!   `wanted` figures are what price [`Totals::refetch_still_wanted`] against
+//!   the scene rather than against a number.
 //!
 //! `requests − puts` is asks still in flight or failed, not a rate. `uploads`
 //! (the GPU store's) is never compared to any figure here by subtraction: an
@@ -146,9 +149,16 @@ pub enum EvictedKind {
 pub enum CacheEvent {
     Request,
     RestyleAsk,
-    RefetchAfterEviction,
+    RefetchAfterEviction {
+        /// Whether the previous pass's walk asked for this id too — see
+        /// [`Totals::refetch_still_wanted`].
+        still_wanted: bool,
+    },
     Put(PutKind),
-    Evicted { kind: EvictedKind, bytes: u64 },
+    Evicted {
+        kind: EvictedKind,
+        bytes: u64,
+    },
 }
 
 /// A reading of one role, taken together.
@@ -157,6 +167,50 @@ pub struct Totals {
     pub requests: u64,
     pub restyle_asks: u64,
     pub refetch_after_eviction: u64,
+    /// **The subset of [`Self::refetch_after_eviction`] the cache dropped
+    /// off the glass** — the reading that tells the two refetches apart,
+    /// because they have opposite repairs.
+    ///
+    /// A refetch on its own says nothing. A viewport that panned or zoomed
+    /// away and came back legitimately re-asks for what the cache dropped
+    /// behind it, and the answer there is *nothing*: holding it would be
+    /// holding history for a scene the user had left. But a cell the cache
+    /// let go of while the walk still had it is a cache under its working
+    /// set, and the answer there is the floor or the budget. `refetch after
+    /// eviction` alone cannot separate them, and it was read at 60-67 % of
+    /// asks on a panning web leg with no way to say which it was.
+    ///
+    /// **Two conditions, and neither is sufficient.** The id has to be one
+    /// the previous pass's walk asked for (`super::AskQueue`, rotated at
+    /// `HttpsTiles::note_wanted`) *and* the eviction has to be no older than
+    /// that pass. Dropping the second half is not a smaller reading, it is a
+    /// wrong one: the refused-ask queue retries cells the last pass wanted by
+    /// construction, so a cell that genuinely left the glass twenty passes
+    /// ago and is retried now would satisfy the walk's test alone. Measured,
+    /// that misreading was **bimodal** — 0 or ~150 of 330 refetches on the
+    /// same reversing sweep, once in forty runs, depending on how the request
+    /// channel happened to fill.
+    ///
+    /// Dropping the *first* half is no better: the pass distance alone
+    /// cannot tell a cell the walk is still asking for from one it has left,
+    /// and a channel refusal delays a re-ask by however many passes it takes
+    /// the queue to reach it.
+    ///
+    /// Zero on every fixture run against a healthy tree — a static window, a
+    /// window sliding one and three columns a pass, and one that reverses and
+    /// refetches half its asks. With the floor removed and the budget put
+    /// under one window's cells it reads **36 of 211 refetches on a window
+    /// that never moved**, holding 22 entries against 36 on the glass.
+    ///
+    /// That 36 is the figure to read the counter's direction from: it
+    /// **under**-reports a broken cache and never over-reports one. Both
+    /// conditions have to hold at the moment of the ask, and under real
+    /// pressure the re-ask is often several passes behind the eviction that
+    /// caused it, because the request channel refused it in between. What the
+    /// counter is for is the sign and not the size — zero against non-zero —
+    /// and the resident-against-wanted levels beside it on the line are what
+    /// price how far under the cache is.
+    pub refetch_still_wanted: u64,
     pub puts_first: u64,
     pub puts_restyle: u64,
     pub puts_duplicate: u64,
@@ -205,7 +259,12 @@ impl Totals {
         match event {
             CacheEvent::Request => self.requests += 1,
             CacheEvent::RestyleAsk => self.restyle_asks += 1,
-            CacheEvent::RefetchAfterEviction => self.refetch_after_eviction += 1,
+            CacheEvent::RefetchAfterEviction { still_wanted } => {
+                self.refetch_after_eviction += 1;
+                if still_wanted {
+                    self.refetch_still_wanted += 1;
+                }
+            }
             CacheEvent::Put(PutKind::First) => self.puts_first += 1,
             CacheEvent::Put(PutKind::Restyle) => self.puts_restyle += 1,
             CacheEvent::Put(PutKind::Duplicate) => self.puts_duplicate += 1,
@@ -241,6 +300,7 @@ impl Totals {
         self.requests
             .wrapping_add(self.restyle_asks)
             .wrapping_add(self.refetch_after_eviction)
+            .wrapping_add(self.refetch_still_wanted)
             .wrapping_add(self.puts())
             .wrapping_add(self.evicted())
             .wrapping_add(self.evicted_bytes)
@@ -255,6 +315,9 @@ impl Totals {
             refetch_after_eviction: self
                 .refetch_after_eviction
                 .saturating_sub(earlier.refetch_after_eviction),
+            refetch_still_wanted: self
+                .refetch_still_wanted
+                .saturating_sub(earlier.refetch_still_wanted),
             puts_first: self.puts_first.saturating_sub(earlier.puts_first),
             puts_restyle: self.puts_restyle.saturating_sub(earlier.puts_restyle),
             puts_duplicate: self.puts_duplicate.saturating_sub(earlier.puts_duplicate),
@@ -282,6 +345,7 @@ struct RoleLedger {
     requests: AtomicU64,
     restyle_asks: AtomicU64,
     refetch_after_eviction: AtomicU64,
+    refetch_still_wanted: AtomicU64,
     puts_first: AtomicU64,
     puts_restyle: AtomicU64,
     puts_duplicate: AtomicU64,
@@ -308,6 +372,7 @@ impl RoleLedger {
             requests: AtomicU64::new(0),
             restyle_asks: AtomicU64::new(0),
             refetch_after_eviction: AtomicU64::new(0),
+            refetch_still_wanted: AtomicU64::new(0),
             puts_first: AtomicU64::new(0),
             puts_restyle: AtomicU64::new(0),
             puts_duplicate: AtomicU64::new(0),
@@ -383,7 +448,13 @@ pub fn note(role: CacheRole, event: CacheEvent) {
     match event {
         CacheEvent::Request => ledger.requests.fetch_add(1, Relaxed),
         CacheEvent::RestyleAsk => ledger.restyle_asks.fetch_add(1, Relaxed),
-        CacheEvent::RefetchAfterEviction => ledger.refetch_after_eviction.fetch_add(1, Relaxed),
+        CacheEvent::RefetchAfterEviction { still_wanted } => {
+            ledger.refetch_after_eviction.fetch_add(1, Relaxed);
+            if still_wanted {
+                ledger.refetch_still_wanted.fetch_add(1, Relaxed);
+            }
+            0
+        }
         CacheEvent::Put(PutKind::First) => ledger.puts_first.fetch_add(1, Relaxed),
         CacheEvent::Put(PutKind::Restyle) => ledger.puts_restyle.fetch_add(1, Relaxed),
         CacheEvent::Put(PutKind::Duplicate) => ledger.puts_duplicate.fetch_add(1, Relaxed),
@@ -482,6 +553,7 @@ pub fn totals(role: CacheRole) -> Totals {
         requests: ledger.requests.load(Relaxed),
         restyle_asks: ledger.restyle_asks.load(Relaxed),
         refetch_after_eviction: ledger.refetch_after_eviction.load(Relaxed),
+        refetch_still_wanted: ledger.refetch_still_wanted.load(Relaxed),
         puts_first: ledger.puts_first.load(Relaxed),
         puts_restyle: ledger.puts_restyle.load(Relaxed),
         puts_duplicate: ledger.puts_duplicate.load(Relaxed),

@@ -2355,8 +2355,8 @@ fn the_cache_tells_a_first_sight_from_a_refetch_a_restyle_a_duplicate_and_an_orp
     let id = |x: u32| TileId { x, y: 0, zoom: 3 };
     let body = |epoch: u64| slot_for(Tile::Vector(Arc::new(Vec::new())), epoch, 0.0);
 
-    cache.ask(id(0), 1);
-    cache.ask(id(1), 1);
+    cache.ask(id(0), 1, false);
+    cache.ask(id(1), 1, false);
     let s = cache.stats();
     assert_eq!(
         (s.requests, s.refetch_after_eviction, s.evicted()),
@@ -2371,7 +2371,7 @@ fn the_cache_tells_a_first_sight_from_a_refetch_a_restyle_a_duplicate_and_an_orp
     // A third ask at the cap evicts the least recently touched slot — id 1's
     // pending marker, since the put just touched id 0. The marker was the
     // LRU's to evict; the request was not.
-    cache.ask(id(2), 1);
+    cache.ask(id(2), 1, false);
     let s = cache.stats();
     assert_eq!((s.evicted_pending, s.evicted_resident), (1, 0));
     assert!(!cache.contains(&id(1)));
@@ -2393,7 +2393,7 @@ fn the_cache_tells_a_first_sight_from_a_refetch_a_restyle_a_duplicate_and_an_orp
     );
 
     // id 0 is wanted again: a refetch, and a request.
-    cache.ask(id(0), 1);
+    cache.ask(id(0), 1, false);
     let s = cache.stats();
     assert_eq!((s.requests, s.refetch_after_eviction), (4, 1), "{s:?}");
 
@@ -2456,7 +2456,7 @@ fn the_resident_level_prices_a_raster_at_its_texture_and_releases_it_on_eviction
         )))
     };
 
-    cache.ask(id(0), 0);
+    cache.ask(id(0), 0, false);
     assert_eq!(
         cache.stats().resident_bytes,
         MARKER_BYTES,
@@ -2475,7 +2475,7 @@ fn the_resident_level_prices_a_raster_at_its_texture_and_releases_it_on_eviction
 
     // A second slot over a budget of one raster evicts the raster and its
     // bytes with it.
-    cache.ask(id(1), 0);
+    cache.ask(id(1), 0, false);
     let s = cache.stats();
     assert_eq!(
         (s.evicted_resident, s.evicted_bytes),
@@ -5491,5 +5491,193 @@ fn the_demand_cap_never_wedges_the_sharpness_rung() {
          unsnapped set needs to release, so the map never draws sharp again — a fidelity loss, \
          not a refetch. Budget {} B against an unsnapped set of {HALF_STEP_TILES} cells",
         tiles.styled_budget_bytes(),
+    );
+}
+
+/// Slide a window along `sweep`'s west edges, **without waiting for anything
+/// to land** — what a drag gesture is — walking the whole sweep at least
+/// once and then cycling it until `enough` is true of the source's counters.
+/// Answers whether it ever was.
+///
+/// The whole sweep first, because the sweep *is* the gesture: a reversing
+/// sweep that stopped early would never have reversed, and the arms below
+/// assert on what the motion produced. `enough` is the floor under the
+/// arrivals on top of that.
+///
+/// Driven by landings and not by a pass count, for the reason
+/// [`a_working_set_the_budget_cannot_hold_is_held_by_the_floor_and_refetches_nothing`]
+/// is: the loopback server's rate is the box's, so a fixed number of passes
+/// is a fixed number of *asks* and an unknown number of *arrivals*, and a
+/// contended box reaches the end of the sweep having landed a quarter of what
+/// an idle one does. What must not vary is the property the reading needs —
+/// that the cache filled and overflowed — so that is what is waited on.
+fn sweep_until(
+    tiles: &mut HttpsTiles,
+    sweep: &[u32],
+    enough: impl Fn(&cache_ledger::Totals) -> bool,
+) -> bool {
+    let deadline = Instant::now() + DEFAULT_TIMEOUT;
+    let mut pass = 0u64;
+    let mut cycles = 0u32;
+    loop {
+        for &x0 in sweep {
+            pass += 1;
+            pass_over_window(tiles, pass, x0, PAN_SIDE, GRID_ZOOM);
+            std::thread::sleep(Duration::from_millis(2));
+            if Instant::now() >= deadline {
+                return false;
+            }
+        }
+        cycles += 1;
+        if cycles >= 1 && enough(&tiles.cache_stats()) {
+            return true;
+        }
+    }
+}
+
+/// **A refetch a pan earned is not a refetch the cache owes, and this is the
+/// reading that tells them apart.**
+///
+/// A panning web leg read `266-319 refetch after eviction of 395-529 asks` —
+/// 60-67 % of asks — against a static-viewport control that read none, and
+/// the ratio alone could not say whether that was a viewport turning over
+/// ground it had left or a cache below its working set. The two have opposite
+/// repairs. [`cache_ledger::Totals::refetch_still_wanted`] is the separation.
+///
+/// **What the fixture has to carry, and what the pan test beside it does
+/// not.** [`a_panning_map_holds_the_working_set_and_its_reuse_margin_not_the_allowance`]
+/// hops a whole window east at a time and waits for every cell to land at
+/// each stop, so its stops are disjoint and it never asks twice for anything:
+/// it reads zero refetches for want of a way to have one, and could not tell
+/// a healthy cache from a broken one. The property a refetch needs is a
+/// viewport that **returns** to ground it left; the property a *still wanted*
+/// refetch needs is a cache that cannot hold one window. The sweeps below
+/// carry the first, and the tamper below carries the second.
+///
+/// The one-way sweeps are the control on the reversing one: they evict by the
+/// hundred and refetch **nothing**, which is what says the refetches the
+/// reversing sweep does read come from the reversal and not from the eviction
+/// count.
+///
+/// **Shown red.** With the working-set floor removed (`set_floor_entries(0)`)
+/// and the budget put under one window's cells, the *static* sweep alone —
+/// the arm that reads nothing at all on a healthy tree — reads 247 asks, 211
+/// refetches, 36 of them still wanted, and 22 entries resident against a
+/// 36-cell window, which reddens two of the assertions below. Neither half of
+/// that tamper reaches it alone: zeroing only the budget leaves the floor
+/// holding all 42 entries and reads zero refetches, which is the floor's own
+/// arm, and removing only the floor leaves the demand cap holding 85.
+#[test]
+fn a_refetch_a_reversing_pan_earns_is_never_a_cell_that_stayed_on_the_glass() {
+    // West edges: a static window, two one-way sweeps at different speeds,
+    // and one that reverses. Only the last returns to ground it left.
+    let reversing: Vec<u32> = (0..40).chain((0..40).rev()).chain(0..40).collect();
+    let sweeps: [(&str, Vec<u32>); 4] = [
+        ("static", vec![0; 40]),
+        ("east, a column a pass", (0..120).collect()),
+        (
+            "east, three columns a pass",
+            (0..120).map(|i| i * 3).collect(),
+        ),
+        ("east 40, back west, east again", reversing),
+    ];
+
+    for (name, sweep) in sweeps {
+        let server = TileServer::start(Behaviour::Serve(Arc::new(fixture_png())));
+        let ctx = Context::default();
+        let mut tiles = loopback_tiles_with_budget(&server, &ctx, ALLOWANCE_FOR_EVERYTHING);
+        let reverses = name.contains("west");
+        let stationary = name == "static";
+
+        // The control, waited on rather than assumed, and it is what makes
+        // the reading below a reading: the sweep has to have filled the cache
+        // past the demand cap and evicted, or there is no eviction to
+        // classify. The stationary arm is the opposite control — it must
+        // reach a full window and evict *nothing*, so it waits on the window
+        // instead.
+        let enough = |s: &cache_ledger::Totals| {
+            if stationary {
+                s.puts_first >= PAN_CELLS
+            } else {
+                s.evicted() > 3 * PAN_CELLS
+            }
+        };
+        let reached = sweep_until(&mut tiles, &sweep, enough);
+
+        let stats = tiles.cache_stats();
+        eprintln!(
+            "[{name}]: {} asks, {} refetch after eviction, {} of them still \
+             wanted, {} evicted, {} entries resident against a floor of {}, \
+             {} B overrun",
+            stats.requests,
+            stats.refetch_after_eviction,
+            stats.refetch_still_wanted,
+            stats.evicted(),
+            stats.resident_entries,
+            stats.floor_entries,
+            stats.overrun_bytes,
+        );
+        assert!(
+            reached,
+            "[{name}]: the sweep never filled the cache inside the timeout, so \
+             nothing below is a bound on anything — this is the box being too \
+             slow to serve the fixture, not a reading: {stats:?}"
+        );
+
+        assert_eq!(
+            stats.refetch_still_wanted, 0,
+            "[{name}]: the cache let go of a cell the walk still had — the \
+             previous pass asked for it and the eviction is no older than that \
+             pass — so this is a cache under its working set and not a \
+             viewport turning ground over: {stats:?}"
+        );
+        assert!(
+            stats.resident_entries >= PAN_CELLS,
+            "[{name}]: the cache holds {} entries against a window of \
+             {PAN_CELLS} cells, so the glass cannot be resident whatever the \
+             refetch figures say: {stats:?}",
+            stats.resident_entries,
+        );
+        if stationary {
+            assert_eq!(
+                (stats.evicted(), stats.refetch_after_eviction),
+                (0, 0),
+                "[{name}]: a window that never moved evicted or refetched, \
+                 which is the resting floor and not this test's subject: \
+                 {stats:?}"
+            );
+        } else if !reverses {
+            assert_eq!(
+                stats.refetch_after_eviction, 0,
+                "[{name}]: a sweep that never returns to a cell refetched one, \
+                 so the reversing sweep's refetches are not the reversal's: \
+                 {stats:?}"
+            );
+        }
+    }
+
+    // The other half of the discrimination, on its own arm so it is driven to
+    // the shape it is asserting: the reversing sweep really does reproduce
+    // the web leg's ratio, so `still wanted == 0` above is a reading taken on
+    // refetches and not on their absence.
+    let server = TileServer::start(Behaviour::Serve(Arc::new(fixture_png())));
+    let ctx = Context::default();
+    let mut tiles = loopback_tiles_with_budget(&server, &ctx, ALLOWANCE_FOR_EVERYTHING);
+    let reversing: Vec<u32> = (0..40).chain((0..40).rev()).collect();
+    let many = |s: &cache_ledger::Totals| s.refetch_after_eviction > 2 * PAN_CELLS;
+    let reached = sweep_until(&mut tiles, &reversing, many);
+    let stats = tiles.cache_stats();
+    eprintln!("[reversing, driven to the web leg's shape]: {stats:?}");
+    assert!(
+        reached,
+        "the reversing sweep refetched only {} cells inside the timeout, \
+         against the several hundred the web leg read: the fixture no longer \
+         reaches the class it exists to classify: {stats:?}",
+        stats.refetch_after_eviction,
+    );
+    assert_eq!(
+        stats.refetch_still_wanted, 0,
+        "driven to the web leg's own ratio, the cache still dropped a cell the \
+         walk had: {stats:?}"
     );
 }

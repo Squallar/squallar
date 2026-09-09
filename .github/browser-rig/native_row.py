@@ -631,7 +631,7 @@ def scrape(lines, probes):
             # silently vanished from a green run. Recorded so it can say so.
             out["unparsed"].append((idx, "budget_state_re", line.strip()[:200]))
         # `tile cache (<role>)` is running totals with a WORD first, like
-        # `budget state`: its own arm, the role kept as text and the fourteen
+        # `budget state`: its own arm, the role kept as text and the nineteen
         # figures after it as ints. No match leaves the family empty, which the
         # row prints as n/a -- a binary older than the line, never a zero.
         m = probes["tile_cache_re"].search(line)
@@ -2825,8 +2825,12 @@ def print_row(row):
             % (tb["offloaded"], tb["inline"])
         )
     # Events AT the tile cache, per role: what `ground tiles:`' GPU-store
-    # uploads and evictions cannot classify. `refetch` is a subset of `asks`;
-    # the four put kinds are disjoint; entries/resident/parsed are LEVELS.
+    # uploads and evictions cannot classify. `refetch` is a subset of `asks`
+    # and `refetch_still_wanted` a subset of THAT -- the one that says whether
+    # a refetch ratio is a pan turning ground over (zero) or a cache under its
+    # working set (tracking it);
+    # the four put kinds are disjoint; entries/resident/parsed, floor, overrun
+    # and the two wanted figures are LEVELS.
     # Never subtracted from uploads. Absent when the log has no line: a binary
     # older than the line, printed as such and never as zeroes.
     tc = row.get("tile_cache")
@@ -2835,11 +2839,14 @@ def print_row(row):
             _line, f = tc[role]
             print(
                 "ROW   tile cache (%s): asks=%s restyle_asks=%s refetch_after_eviction=%s "
+                "refetch_still_wanted=%s "
                 "puts_first=%s puts_restyle=%s puts_duplicate=%s puts_orphan=%s "
                 "evicted_pending=%s evicted_resident=%s evicted_bytes=%s "
-                "entries=%s resident_bytes=%s parsed=%s snap=%s"
+                "entries=%s resident_bytes=%s parsed=%s snap=%s "
+                "floor_entries=%s overrun_bytes=%s wanted_on_glass=%s wanted_net=%s"
                 % (role, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8],
-                   f[9], f[10], f[11], f[12], f[13])
+                   f[9], f[10], f[11], f[12], f[13], f[14], f[15], f[16], f[17],
+                   f[18])
             )
     else:
         print(
@@ -4611,7 +4618,7 @@ class SharedFormatTests(unittest.TestCase):
         self.assertEqual(m.group(1), "7")
 
     def test_the_tile_cache_line_scrapes_into_its_own_arm(self):
-        """A word group first, fourteen ints after -- `budget state`'s shape.
+        """A word group first, nineteen ints after -- `budget state`'s shape.
 
         The all-`int()` loop would die on the role word, which is why the arm
         is its own; and the sentence here is the app's exactly, so a drift in
@@ -4621,9 +4628,10 @@ class SharedFormatTests(unittest.TestCase):
         line = (
             "[2026-09-02T00:00:00Z INFO  squallar_app::app::render] tile cache "
             "(base): 1001 asks, 12 restyle asks, 103 refetch after eviction, "
-            "904 puts first, 15 restyle, 26 duplicate, 37 orphan, 48 evicted "
-            "pending, 59 evicted resident of 6000060 B, 71 entries, 8000082 B "
-            "resident, 93 parsed, snap 1"
+            "0 of them still wanted, 904 puts first, 15 restyle, 26 duplicate, "
+            "37 orphan, 48 evicted pending, 59 evicted resident of 6000060 B, "
+            "71 entries, 8000082 B resident, 93 parsed, snap 1, floor 111 "
+            "entries, 222 B overrun, 84 wanted on glass, 4 wanted net"
         )
         s = scrape([line], probes)
         self.assertEqual(len(s["tile_cache"]), 1)
@@ -4631,7 +4639,8 @@ class SharedFormatTests(unittest.TestCase):
         self.assertEqual(role, "base")
         self.assertEqual(
             figures,
-            [1001, 12, 103, 904, 15, 26, 37, 48, 59, 6000060, 71, 8000082, 93, 1],
+            [1001, 12, 103, 0, 904, 15, 26, 37, 48, 59, 6000060, 71, 8000082,
+             93, 1, 111, 222, 84, 4],
         )
         by_role = tile_cache_by_role(s["tile_cache"])
         self.assertEqual(set(by_role), {"base"})
@@ -4698,10 +4707,15 @@ class SharedFormatTests(unittest.TestCase):
         text = _capture(lambda: print_row(row))
         self.assertIn("tile cache: n/a", text)
         self.assertNotIn("tile cache (base)", text)
-        row["tile_cache"] = {"base": (7, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])}
+        row["tile_cache"] = {"base": (7, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+                                          13, 14, 15, 16, 17, 18, 19])}
         text = _capture(lambda: print_row(row))
         self.assertIn("tile cache (base): asks=1 restyle_asks=2 refetch_after_eviction=3", text)
-        self.assertIn("parsed=13 snap=14", text)
+        self.assertIn("parsed=14 snap=15", text)
+        self.assertIn(
+            "floor_entries=16 overrun_bytes=17 wanted_on_glass=18 wanted_net=19",
+            text,
+        )
 
     def test_the_two_stamps_are_distinct_and_each_greppable(self):
         """`** INVALID **` and `** UNCHECKED: ... **` never stand in for each

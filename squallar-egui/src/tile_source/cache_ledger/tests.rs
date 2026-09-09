@@ -84,11 +84,21 @@ fn the_asks_are_three_counters_and_a_refetch_is_a_request() {
         (0, 1, 0)
     );
     // The cache records a refetch as both events, in this order.
-    t.apply(CacheEvent::RefetchAfterEviction);
+    t.apply(CacheEvent::RefetchAfterEviction {
+        still_wanted: false,
+    });
     t.apply(CacheEvent::Request);
     assert_eq!(
         (t.requests, t.restyle_asks, t.refetch_after_eviction),
         (1, 1, 1)
+    );
+    // A still-wanted refetch is counted in both fields, so the subset is
+    // never read as an alternative to the total.
+    t.apply(CacheEvent::RefetchAfterEviction { still_wanted: true });
+    assert_eq!(
+        (t.refetch_after_eviction, t.refetch_still_wanted),
+        (2, 1),
+        "the within-a-pass refetch is a subset of the total, not a sibling of it"
     );
 }
 
@@ -101,6 +111,7 @@ fn a_diff_subtracts_counters_and_keeps_levels() {
         requests: 10,
         restyle_asks: 2,
         refetch_after_eviction: 3,
+        refetch_still_wanted: 1,
         puts_first: 8,
         puts_restyle: 1,
         puts_duplicate: 1,
@@ -122,6 +133,7 @@ fn a_diff_subtracts_counters_and_keeps_levels() {
         requests: 25,
         restyle_asks: 2,
         refetch_after_eviction: 9,
+        refetch_still_wanted: 4,
         puts_first: 20,
         puts_restyle: 1,
         puts_duplicate: 3,
@@ -146,6 +158,7 @@ fn a_diff_subtracts_counters_and_keeps_levels() {
             requests: 15,
             restyle_asks: 0,
             refetch_after_eviction: 6,
+            refetch_still_wanted: 3,
             puts_first: 12,
             puts_restyle: 0,
             puts_duplicate: 2,
@@ -202,7 +215,7 @@ fn the_statics_move_by_at_least_what_one_source_applied() {
         let events = [
             CacheEvent::Request,
             CacheEvent::Request,
-            CacheEvent::RefetchAfterEviction,
+            CacheEvent::RefetchAfterEviction { still_wanted: true },
             CacheEvent::RestyleAsk,
             CacheEvent::Put(PutKind::First),
             CacheEvent::Put(PutKind::Orphan),

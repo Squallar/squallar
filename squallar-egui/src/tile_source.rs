@@ -669,11 +669,19 @@ struct TileCache {
     /// last pass measured — see [`byte_lru`] for the two conditions an
     /// eviction needs.
     slots: byte_lru::ByteLru<TileId, CachedTile>,
-    /// Ids this cache evicted recently, most recent last — bounded at
+    /// Ids this cache evicted recently, most recent last, each against **the
+    /// pass it was let go on** — bounded at
     /// [`EVICTED_MEMORY_PER_FLOOR_ENTRY`] times the floor, so it follows the
     /// working set it remembers for. Probed and popped by [`Self::ask`] and by
     /// a [`Self::put`] that finds no slot.
-    evicted: LruCache<TileId, ()>,
+    ///
+    /// The pass is half of what tells the two refetches apart; the other half
+    /// is the walk's own set, and neither is sufficient alone — see
+    /// [`cache_ledger::Totals::refetch_still_wanted`].
+    evicted: LruCache<TileId, u64>,
+    /// The pass [`HttpsTiles::note_wanted`] last named. Zero until a pass has
+    /// drawn, which is also when nothing has been evicted.
+    pass_nr: u64,
     /// Ids with a request out — asked for, and not yet answered by a body
     /// landing, a body dropped for its generation, or the IO side's word
     /// that none is coming. **The authority for "do not ask again".**
@@ -710,6 +718,7 @@ impl TileCache {
             role,
             slots: byte_lru::ByteLru::new(budget_bytes),
             evicted: LruCache::new(evicted_memory(0)),
+            pass_nr: 0,
             in_flight: HashSet::with_capacity(MAX_IN_FLIGHT),
             stats: cache_ledger::Totals::default(),
         }
@@ -733,6 +742,12 @@ impl TileCache {
             self.evicted.resize(remembered);
         }
         self.publish_levels();
+    }
+
+    /// The pass now drawing, from [`HttpsTiles::note_wanted`] — what dates an
+    /// eviction against the ask that comes back for it.
+    fn set_pass(&mut self, pass_nr: u64) {
+        self.pass_nr = pass_nr;
     }
 
     /// Pay one entry of shrink debt, if there is any: the least recent slot
@@ -821,9 +836,28 @@ impl TileCache {
     /// [`Self::in_flight`], a `None` marker under `tile_id` at `epoch`, and
     /// one request counted — a refetch if this cache remembers evicting the
     /// id.
-    fn ask(&mut self, tile_id: TileId, epoch: u64) {
-        if self.evicted.pop(&tile_id).is_some() {
-            self.note(cache_ledger::CacheEvent::RefetchAfterEviction);
+    ///
+    /// `wanted_last_pass` is whether the previous pass's walk asked for this
+    /// id too; the caller reads it, because the walk's own set lives on
+    /// [`HttpsTiles::asks`]. It is **and**ed here with how old the eviction
+    /// is, and the conjunction is the whole classification — see
+    /// [`cache_ledger::Totals::refetch_still_wanted`] for why neither half
+    /// stands alone.
+    fn ask(&mut self, tile_id: TileId, epoch: u64, wanted_last_pass: bool) {
+        if let Some(let_go_on) = self.evicted.pop(&tile_id) {
+            // The eviction has to be no older than the pass that wanted it:
+            // a cell the walk reached last pass for the first time in twenty
+            // is a cell that *did* leave the glass, however recently the ask
+            // for it was made. Without this the refused-ask queue reports
+            // turnover as a dropped cell — every retry it makes is for a cell
+            // last pass wanted by construction — which read 0 or ~150 of 330
+            // refetches on the reversing sweep depending on how the channel
+            // happened to fill, once in forty runs.
+            let dropped_from_the_glass =
+                wanted_last_pass && let_go_on.saturating_add(1) >= self.pass_nr;
+            self.note(cache_ledger::CacheEvent::RefetchAfterEviction {
+                still_wanted: dropped_from_the_glass,
+            });
         }
         self.note(cache_ledger::CacheEvent::Request);
         self.in_flight.insert(tile_id);
@@ -895,7 +929,7 @@ impl TileCache {
     /// counted, the payload handed to the discard sink so a styled tile's
     /// shapes are never freed on the frame thread. See [`discard_slot`].
     fn let_go(&mut self, gone: byte_lru::Evicted<TileId, CachedTile>) {
-        self.evicted.push(gone.key, ());
+        self.evicted.push(gone.key, self.pass_nr);
         let kind = if gone.value.tile.is_none() {
             cache_ledger::EvictedKind::Pending
         } else {
@@ -2921,6 +2955,7 @@ impl HttpsTiles {
         if self.wanted.note(pass_nr, on_glass, net) {
             self.asks.new_pass();
         }
+        self.cache.set_pass(pass_nr);
         let floor = self.wanted.floor().saturating_add(MAX_PARALLEL_DOWNLOADS);
         self.cache.set_floor_entries(floor);
         self.apply_styled_budget();
@@ -3586,23 +3621,35 @@ impl HttpsTiles {
         }
         let epoch = self.style_epoch;
 
-        // Split borrow: the sender is needed while the cache is borrowed.
-        let Self {
-            cache, request_tx, ..
-        } = self;
-
         // `get`, not `peek`: a hit refreshes recency exactly as the old
         // `try_get_or_insert` did.
-        let known = cache.get(&tile_id).map(|slot| slot.epoch);
+        let known = self.cache.get(&tile_id).map(|slot| slot.epoch);
         if known == Some(epoch) {
             return Ask::Unneeded;
         }
         // After the `get`, so a wanted tile whose request is out still has
         // its recency refreshed; before the send, so the LRU's treatment of
         // the marker decides nothing.
-        if cache.is_in_flight(&tile_id) {
+        if self.cache.is_in_flight(&tile_id) {
             return Ask::Unneeded;
         }
+
+        // **Below the two returns above**, which is where the walk's cells go
+        // once the map is drawn: on a settled pane every cell is cached at
+        // this epoch and leaves at the first of them, so this probe is paid
+        // by the cells about to be asked for and not by the whole span every
+        // frame. Read here rather than at the cache because the walk's own set
+        // is this side of the source, and against the *previous* pass's set:
+        // `AskQueue::new_pass` rotated it at `note_wanted`, so `wanted_now` is
+        // this pass's walk so far — which `request_once` has already added
+        // this very cell to, and testing against it would answer "yes" for
+        // every cell.
+        let wanted_last_pass = self.asks.wanted_last_pass(&tile_id);
+
+        // Split borrow: the sender is needed while the cache is borrowed.
+        let Self {
+            cache, request_tx, ..
+        } = self;
 
         let outcome = request_tx.try_send(tile_id).map(|()| {
             if known.is_some() {
@@ -3610,7 +3657,7 @@ impl HttpsTiles {
                 // request is out" record.
                 cache.re_ask(tile_id, epoch);
             } else {
-                cache.ask(tile_id, epoch);
+                cache.ask(tile_id, epoch, wanted_last_pass);
             }
         });
 
@@ -5179,6 +5226,12 @@ impl AskQueue {
     /// The walk asked for `tile_id` this pass.
     fn wanted(&mut self, tile_id: TileId) {
         self.wanted_now.insert(tile_id);
+    }
+
+    /// Whether the previous pass's walk asked for `tile_id` — the test that
+    /// says a cell the cache let go of never left the glass.
+    fn wanted_last_pass(&self, tile_id: &TileId) -> bool {
+        self.wanted_before.contains(tile_id)
     }
 
     /// The channel refused `tile_id`; queue it once, at the back.

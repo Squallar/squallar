@@ -2846,7 +2846,7 @@ var ground_stroke_draws_re = /ground tiles: .*, (\d+) stroke draws/;
 // probes; the role group is a WORD, so that file gives this its own arm, as
 // it does `budget_state_re`. Running totals: the LAST match per role wins for
 // the headline reading; every match is kept for the settle assertion.
-var tile_cache_re = /tile cache \(([a-z0-9-]+)\): (\d+) asks, (\d+) restyle asks, (\d+) refetch after eviction, (\d+) puts first, (\d+) restyle, (\d+) duplicate, (\d+) orphan, (\d+) evicted pending, (\d+) evicted resident of (\d+) B, (\d+) entries, (\d+) B resident, (\d+) parsed, snap (\d+)/;
+var tile_cache_re = /tile cache \(([a-z0-9-]+)\): (\d+) asks, (\d+) restyle asks, (\d+) refetch after eviction, (\d+) of them still wanted, (\d+) puts first, (\d+) restyle, (\d+) duplicate, (\d+) orphan, (\d+) evicted pending, (\d+) evicted resident of (\d+) B, (\d+) entries, (\d+) B resident, (\d+) parsed, snap (\d+), floor (\d+) entries, (\d+) B overrun, (\d+) wanted on glass, (\d+) wanted net/;
 // A FIFTH, and the only one about the 3D floor path. `paints` is per 3D pane
 // per frame its off-screen map strip really drew, `mirror renders` per mirror
 // pass encoded (per frame, not per pane) -- two denominators, never added, and
@@ -3035,20 +3035,35 @@ for (var i = 0; i < C.length; i++) {
                asks: parseInt(tcm[2], 10),
                restyle_asks: parseInt(tcm[3], 10),
                refetch_after_eviction: parseInt(tcm[4], 10),
-               puts_first: parseInt(tcm[5], 10),
-               puts_restyle: parseInt(tcm[6], 10),
-               puts_duplicate: parseInt(tcm[7], 10),
-               puts_orphan: parseInt(tcm[8], 10),
-               evicted_pending: parseInt(tcm[9], 10),
-               evicted_resident: parseInt(tcm[10], 10),
-               evicted_bytes: parseInt(tcm[11], 10),
-               resident_entries: parseInt(tcm[12], 10),
-               resident_bytes: parseInt(tcm[13], 10),
-               parsed_entries: parseInt(tcm[14], 10),
+               // The SUBSET of the field above whose id the previous pass's
+               // walk asked for too: the cell never left the glass. A
+               // refetch ratio says nothing on its own -- a pan that turns
+               // ground over refetches by design -- and this is what tells
+               // that from a cache under its working set.
+               refetch_still_wanted: parseInt(tcm[5], 10),
+               puts_first: parseInt(tcm[6], 10),
+               puts_restyle: parseInt(tcm[7], 10),
+               puts_duplicate: parseInt(tcm[8], 10),
+               puts_orphan: parseInt(tcm[9], 10),
+               evicted_pending: parseInt(tcm[10], 10),
+               evicted_resident: parseInt(tcm[11], 10),
+               evicted_bytes: parseInt(tcm[12], 10),
+               resident_entries: parseInt(tcm[13], 10),
+               resident_bytes: parseInt(tcm[14], 10),
+               parsed_entries: parseInt(tcm[15], 10),
                // A LEVEL: 1 while the role's source is held at the whole
                // zoom below the fractional one. The settle assertion counts
                // its flips; nothing differences it.
-               snap: parseInt(tcm[15], 10) };
+               snap: parseInt(tcm[16], 10),
+               // Three more LEVELS, and they price the reading above against
+               // the scene rather than against a number: the entries the
+               // cache holds whatever the budget says, what that floor
+               // carries past the budget, and the last whole pass's cells on
+               // the glass and in the ancestor net. Never differenced.
+               floor_entries: parseInt(tcm[17], 10),
+               overrun_bytes: parseInt(tcm[18], 10),
+               wanted_on_glass: parseInt(tcm[19], 10),
+               wanted_net: parseInt(tcm[20], 10) };
     if (!tile_cache) tile_cache = {};
     tile_cache[tcm[1]] = tc;
     tile_cache_all.push(tc);

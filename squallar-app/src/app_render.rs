@@ -589,7 +589,17 @@ fn ground_tile_line(t: &squallar_egui::tile_mesh::ledger::Totals) -> String {
 /// `evicted` are the GPU store's, keyed on a minted identity, so they cannot
 /// say whether an upload was a tile's first sight, a restyle, or the same tile
 /// fetched again after the cache dropped it. `refetch after eviction` is the
-/// subset of `asks` that answers that; `duplicate` and `orphan` are the two
+/// subset of `asks` that answers that — and `still wanted` is the subset of
+/// *it* that says **which** of the two refetches this is, because a viewport
+/// that left ground and came back owes the cache nothing, while a cell the
+/// walk asked for on the pass before is a cache under its working set. That
+/// second reading is priced against the scene by the three levels the line
+/// now ends on: `floor` is the entries the cache holds whatever the budget
+/// says, `overrun` is what the floor carries past it, and the two `wanted`
+/// figures are the last whole pass's cells on the glass and in the ancestor
+/// net. A `refetch after eviction` at 60 % of asks with `still wanted` at
+/// zero is a pan turning ground over; the same ratio with `still wanted`
+/// tracking it is the cache dropping the glass. `duplicate` and `orphan` are the two
 /// shapes of a body fetched for nothing. `entries`, `B resident` and `parsed`
 /// are levels and go down; `B` figures are the lower bound the slot can price
 /// today. `snap` is a level too, `1` while the tile-sharpness rung holds the
@@ -605,12 +615,15 @@ fn tile_cache_line(
 ) -> String {
     format!(
         "tile cache ({}): {} asks, {} restyle asks, {} refetch after eviction, \
-         {} puts first, {} restyle, {} duplicate, {} orphan, {} evicted pending, \
-         {} evicted resident of {} B, {} entries, {} B resident, {} parsed, snap {}",
+         {} of them still wanted, {} puts first, {} restyle, {} duplicate, \
+         {} orphan, {} evicted pending, {} evicted resident of {} B, \
+         {} entries, {} B resident, {} parsed, snap {}, floor {} entries, \
+         {} B overrun, {} wanted on glass, {} wanted net",
         role.label(),
         t.requests,
         t.restyle_asks,
         t.refetch_after_eviction,
+        t.refetch_still_wanted,
         t.puts_first,
         t.puts_restyle,
         t.puts_duplicate,
@@ -622,6 +635,10 @@ fn tile_cache_line(
         t.resident_bytes,
         t.parsed_entries,
         t.snapped,
+        t.floor_entries,
+        t.overrun_bytes,
+        t.wanted_on_glass,
+        t.wanted_net,
     )
 }
 
