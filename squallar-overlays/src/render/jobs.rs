@@ -15,8 +15,8 @@ use squallar_source::wire::Reader;
 
 use crate::render::raster_buf::RasterBuf;
 use crate::render::rasterize::{
-    AlertsInput, AlphaMode, CoverageInput, DiscussionsInput, GlmStrikesInput, GriddedInput,
-    HitCells, OutlooksInput, RasterizeOutput, ReportsInput, rasterize_glm_strikes,
+    AlertsInput, AlphaMode, BlankReason, CoverageInput, DiscussionsInput, GlmStrikesInput,
+    GriddedInput, HitCells, OutlooksInput, RasterizeOutput, ReportsInput, rasterize_glm_strikes,
     rasterize_gridded, rasterize_nws_alerts, rasterize_radar_coverage, rasterize_spc_discussions,
     rasterize_spc_outlooks, rasterize_storm_reports,
 };
@@ -1330,7 +1330,7 @@ impl JobOutCodec for GriddedJob {
 // ── The shared reply pair ────────────────────────────────────────────────
 
 fn encode_raster_reply(v: RasterizeOutput, head: &mut Vec<u8>) {
-    encode_overlay_out(&v.rgba, v.blank, v.hit_cells.as_ref(), head);
+    encode_overlay_out(&v.rgba, v.blank, v.blank_reason, v.hit_cells.as_ref(), head);
 }
 
 /// The reply adapter every row's [`JobOutCodec::decode_out`] shares.
@@ -1342,12 +1342,13 @@ fn decode_raster_reply(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutp
     if !tails.is_empty() {
         return None;
     }
-    let (rgba, blank, hit_cells) = decode_overlay_out(head)?;
+    let (rgba, blank, blank_reason, hit_cells) = decode_overlay_out(head)?;
     Some(RasterizeOutput {
         rgba,
         hit_cells,
         alpha: AlphaMode::Premultiplied,
         blank,
+        blank_reason,
     })
 }
 
@@ -1371,6 +1372,12 @@ pub fn decode_raster_reply_split(
         hit_cells,
         alpha: AlphaMode::Premultiplied,
         blank,
+        // **`None` is the reading, not a gap.** This path refuses a blank
+        // (`decode_overlay_out_split` returns `None` on pixels tag `0`), so
+        // every reply that reaches here painted, and a raster with ink has no
+        // reason to be blank. `RasterizeOutput::blank_reason` gates its answer
+        // on `blank` for the same reason.
+        blank_reason: None,
     })
 }
 
@@ -1448,7 +1455,8 @@ pub fn decode_raster_reply_split(
 /// buys nothing on time.
 ///
 /// **`blank` is transported, never re-decided.** `Some(len)` writes the pixels
-/// tag `0` and that length and no pixels at all — the whole of what a raster
+/// tag `0`, that length, one byte of [`BlankReason`], and no pixels at all —
+/// the whole of what a raster
 /// with no ink in it costs the wire, against `len` bytes before
 /// (8.26 MB a picture on the measured Chromium legs, 8.92 MB on the Firefox
 /// ones, two targets never added). `None` writes tag `1` and the RGBA takes
@@ -1542,6 +1550,7 @@ fn decode_hit_cells(r: &mut Reader<'_>) -> Option<Option<HitCells>> {
 pub fn encode_overlay_out(
     rgba: &[u8],
     blank: Option<u32>,
+    blank_reason: Option<BlankReason>,
     hit_cells: Option<&HitCells>,
     out: &mut Vec<u8>,
 ) {
@@ -1564,20 +1573,42 @@ pub fn encode_overlay_out(
         Some(len) => {
             out.push(0);
             out.extend_from_slice(&len.to_le_bytes());
+            // **The sixth byte of a blank: why.** A blank is a *clear* — the
+            // pane stops drawing this layer — so the one figure that says
+            // whether that clear was right travels with it. Without it the page
+            // counts a blank and can say nothing about it, and on the web the
+            // page is the only side that counts: the decision is taken in the
+            // worker, and this reply is the whole of what crosses back.
+            //
+            // **After the length, so `OVERLAY_PIXEL_PREFIX_BYTES` is untouched.**
+            // That constant is the painted arm's contract — where the picture
+            // starts — and `overlay_pixel_span` answers `None` on tag `0`
+            // before it could reach this byte. A blank's head grows by one; a
+            // painted head does not move at all.
+            //
+            // A blank with no reason armed is written `Unattributed` rather
+            // than left off, so the byte is unconditional and a blank reply is
+            // one fixed length. See [`BlankReason`].
+            out.push(
+                blank_reason
+                    .unwrap_or(BlankReason::Unattributed)
+                    .wire_code(),
+            );
         }
     }
     encode_hit_cells(hit_cells, out);
 }
 
-/// The inverse of [`encode_overlay_out`], answering `(rgba, blank, cells)` on
-/// the same terms the encoder took them.
+/// The inverse of [`encode_overlay_out`], answering
+/// `(rgba, blank, blank_reason, cells)` on the same terms the encoder took
+/// them.
 ///
 /// `None` for a hit-cells or pixels tag outside `{0, 1}`, a cell index at or
 /// past the grid the stated dimensions span, indices out of ascending order or
 /// repeated (the canonical form the encoder writes and the only one accepted,
 /// so one value has one byte string), an empty id list (the rasterizer never
 /// records one), a buffer shorter than its own counts claim, or **bytes after
-/// a blank's length** — a blank's payload is exactly those four bytes, so a
+/// a blank's reason** — a blank's payload is exactly those five bytes, so a
 /// tail there is a corrupt or foreign message rather than pixels this build
 /// should read. The RGBA tail is handed back **unjudged**: only the dispatch
 /// knows the dimensions it must match.
@@ -1590,18 +1621,41 @@ pub fn encode_overlay_out(
 /// alignment it is freed with. Every row that replies with a raster shares
 /// this decode, so every overlay kind gets the move — on the web target,
 /// where this codec is the whole of how a reply arrives.
-pub fn decode_overlay_out(bytes: &[u8]) -> Option<(RasterBuf, Option<u32>, Option<HitCells>)> {
+/// What [`decode_overlay_out`] answers, in the order [`encode_overlay_out`]
+/// takes them: the pixels, the length a blank says its picture would have had,
+/// **why** it was blank, and the hit cells.
+///
+/// Named rather than spelled inline because the reason made it a four-tuple,
+/// and a bare four-tuple at a crate boundary is a shape a caller has to
+/// re-derive from the encoder every time it destructures one.
+pub type OverlayReplyParts = (
+    RasterBuf,
+    Option<u32>,
+    Option<BlankReason>,
+    Option<HitCells>,
+);
+
+pub fn decode_overlay_out(bytes: &[u8]) -> Option<OverlayReplyParts> {
     let mut r = Reader::new(bytes);
-    let (rgba, blank) = match r.u8()? {
+    let (rgba, blank, blank_reason) = match r.u8()? {
         1 => {
             let len = r.u32()? as usize;
-            (RasterBuf::from_premultiplied_wire(r.take(len)?), None)
+            (RasterBuf::from_premultiplied_wire(r.take(len)?), None, None)
         }
-        0 => (RasterBuf::empty(), Some(r.u32()?)),
+        0 => {
+            let len = r.u32()?;
+            // **Refused, never defaulted.** A code this build does not know is
+            // a newer build's reply, and reading it as some reason of ours
+            // would put a wrong figure on an always-on counter with nothing to
+            // say so — which is the failure the reason byte exists to end, not
+            // to repeat.
+            let reason = BlankReason::from_wire_code(r.u8()?)?;
+            (RasterBuf::empty(), Some(len), Some(reason))
+        }
         _ => return None,
     };
     let hit_cells = decode_hit_cells(&mut r)?;
-    r.at_end().then_some((rgba, blank, hit_cells))
+    r.at_end().then_some((rgba, blank, blank_reason, hit_cells))
 }
 
 /// [`decode_overlay_out`] for a reply whose picture the transport has ALREADY
@@ -3485,6 +3539,7 @@ mod tests {
             // one of its own, so these bytes are the painted form whatever is
             // in them.
             blank: None,
+            blank_reason: None,
         }));
         let mut head = Vec::new();
         let mut tails = Vec::new();
@@ -3589,6 +3644,7 @@ mod tests {
                     hit_cells: cells,
                     alpha: AlphaMode::Premultiplied,
                     blank: out.blank,
+                    blank_reason: out.blank_reason,
                 })),
                 &mut head,
                 &mut tails,
@@ -3632,6 +3688,7 @@ mod tests {
         encode_overlay_out(
             &rgba,
             None,
+            None,
             Some(&HitCells {
                 width: 8,
                 height: 4,
@@ -3642,6 +3699,7 @@ mod tests {
         let mut b = Vec::new();
         encode_overlay_out(
             &rgba,
+            None,
             None,
             Some(&HitCells {
                 width: 8,

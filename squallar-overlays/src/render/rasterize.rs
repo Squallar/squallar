@@ -224,6 +224,186 @@ pub fn has_ink(rgba: &[u8]) -> bool {
     head.iter().any(|&b| b != 0) || words.iter().any(|&w| w != 0) || tail.iter().any(|&b| b != 0)
 }
 
+/// **Why a raster painted nothing.**
+///
+/// A blank is a *clear*: `OverlayTextureCache::show_blank` takes the picture
+/// off the glass. So the difference between "the view left this layer's
+/// ground" and "the window collapsed while the layer still covered the view"
+/// is the difference between correct behaviour and a user watching data
+/// disappear — and until this enum existed the always-on counters recorded
+/// that a picture was blank and nothing whatever about which of the two it
+/// was. A high blank rate was readable only as waste.
+///
+/// **This is also what keeps two different defects apart.** A blank that names
+/// its reason cannot be confused with a picture that was never dispatched: the
+/// first is a pane cleared, the second a pane never filled, and both end in
+/// "nothing on screen". They have already been attributed to each other once.
+/// [`crate::render::rasterize::BlankReason`] counts only the first, because
+/// only the first reaches this type at all.
+///
+/// **Armed where the decision is made, never inferred downstream.** Each
+/// variant is written at the branch that took it, and
+/// [`RasterizeOutput::settle_blank`] spends what it finds. A reason
+/// recomputed from the window's shape after the fact is precisely the failure
+/// this exists to make visible: it would agree with the code that produced it
+/// by construction, and so could never disagree with it. Same posture as
+/// `squallar_egui::overlay_cache::RerenderReason`, which splits the dispatch
+/// count the same way.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum BlankReason {
+    /// There was nothing to draw *from* or nothing to draw *onto*: no values,
+    /// a zero-sized grid, or a zero-sized texture.
+    EmptyInput,
+    /// The field is one this build registers no colours for — a refusal, not
+    /// an absence. Painting it through some other field's scale would be a
+    /// silent misread, so the raster declines and says so here.
+    UnknownField,
+    /// The projection window collapsed: no grid index range to walk.
+    WindowEmpty,
+    /// The window held grid cells and **not one carried a paintable value** —
+    /// every one non-finite or fully transparent. A gap in the data, over
+    /// ground the grid does cover.
+    NoDataInWindow,
+    /// The window held paintable values and **not one of them landed on this
+    /// texture**. The view is off this layer's ground: a geostationary
+    /// composite panned past the top of its own latitude axis, say. **This is
+    /// the one blank that is correct.**
+    OutsideCoverage,
+    /// **No raster ran at all**: the handler's own `paints_in` answered that
+    /// this layer cannot put a pixel in the bounds being rendered, so the
+    /// dispatch was short-circuited to a blank on the page and no paint input,
+    /// hit list, wire message or pixmap was ever built.
+    ///
+    /// **Its own variant rather than [`Self::OutsideCoverage`], which it looks
+    /// like.** The two are different claims taken on different sides by
+    /// different predicates: this one is the handler *declaring* it has no ink
+    /// here, before anything is built; `OutsideCoverage` is the cell walk
+    /// *observing* that nothing landed. Folding them would hide a wrong
+    /// `paints_in` inside a count of correct blanks, which is the exact shape
+    /// of confusion this enum exists to prevent — and it is the one variant
+    /// whose truth is a claim and not a reading, because nothing downstream
+    /// checks the handler's answer.
+    ExtentDeclaredEmpty,
+    /// A raster settled blank with no reason armed.
+    ///
+    /// **Not zero in a healthy tree, unlike its `RerenderReason` counterpart.**
+    /// Only the gridded row arms today; the polygon, alerts, GLM and marker
+    /// rasterizers all land here. Counted as its own variant rather than
+    /// folded into a neighbour, so the hole is visible instead of silently
+    /// inflating whichever reason it was merged with.
+    Unattributed,
+}
+
+impl BlankReason {
+    /// Every variant, in the order [`Self::index`] assigns.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::EmptyInput,
+        Self::UnknownField,
+        Self::WindowEmpty,
+        Self::NoDataInWindow,
+        Self::OutsideCoverage,
+        Self::ExtentDeclaredEmpty,
+        Self::Unattributed,
+    ];
+
+    /// How many variants there are — the width of the ledger's counter array.
+    pub const COUNT: usize = 7;
+
+    /// This variant's slot in the ledger's array.
+    ///
+    /// **Not [`Self::wire_code`].** The two agreed until `ExtentDeclaredEmpty`
+    /// was appended: the wire's numbers may never move, so that variant took
+    /// code 6 and sits at index 5 of a 7-wide array. Spelling the ledger's
+    /// index as the wire's code would leave a permanent hole at index 5 and
+    /// put a variant past the end of the array the day another is appended.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::EmptyInput => 0,
+            Self::UnknownField => 1,
+            Self::WindowEmpty => 2,
+            Self::NoDataInWindow => 3,
+            Self::OutsideCoverage => 4,
+            Self::ExtentDeclaredEmpty => 5,
+            Self::Unattributed => 6,
+        }
+    }
+
+    /// A short name for a log line. Stable — the Tier-2 rig reads these.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::EmptyInput => "empty-input",
+            Self::UnknownField => "unknown-field",
+            Self::WindowEmpty => "window-empty",
+            Self::NoDataInWindow => "no-data",
+            Self::OutsideCoverage => "outside-coverage",
+            Self::ExtentDeclaredEmpty => "extent-declared-empty",
+            Self::Unattributed => "unattributed",
+        }
+    }
+
+    /// **Whether a blank for this reason has NOT been shown to be correct.**
+    ///
+    /// [`Self::OutsideCoverage`] is the one reason a clear is proven right,
+    /// and it is proven by an *observation*: the cell walk resolved paintable
+    /// values and watched none of them land on the texture. Every other reason
+    /// counts here, and the counted set is deliberately wider than "known
+    /// wrong".
+    ///
+    /// **[`Self::ExtentDeclaredEmpty`] counts, and it is the one that looks
+    /// like it should not.** It says the layer is absent here, which if true
+    /// is a correct clear — but it is the handler's own *claim*, taken before
+    /// anything was built and checked by nothing downstream. Excluding it
+    /// would file every wrong `paints_in` as a correct blank, and a leg whose
+    /// blanks were all wrong `paints_in` refusals would report **zero** over
+    /// covered ground: the counter would read perfect at the exact moment it
+    /// was needed. `SourceHandler::paints_in`'s own doc names that direction
+    /// as the one it may not be wrong in — "a wrong `false` clears a pane that
+    /// should have had ink".
+    ///
+    /// So the subtotal is **conservative by construction**: blanks not shown
+    /// to be correct, not blanks shown to be wrong. A reader who trusts a
+    /// handler can subtract its `extent-declared-empty` count, which the
+    /// `overlay blanks:` line prints beside the subtotal for exactly that.
+    /// The reverse — recovering a hidden refusal from a subtotal that already
+    /// absorbed it — is not possible at all.
+    pub const fn clears_covered_ground(self) -> bool {
+        !matches!(self, Self::OutsideCoverage)
+    }
+
+    /// The wire's spelling, and the ledger's index. Explicit rather than
+    /// `as u8` so a reordering of the variants cannot silently renumber a byte
+    /// two builds exchange.
+    pub const fn wire_code(self) -> u8 {
+        match self {
+            Self::EmptyInput => 0,
+            Self::UnknownField => 1,
+            Self::WindowEmpty => 2,
+            Self::NoDataInWindow => 3,
+            Self::OutsideCoverage => 4,
+            // **Appended, not inserted.** Codes 0..=5 keep the numbers they
+            // shipped with, so a reply written by a build that predates this
+            // variant decodes to the reason it meant.
+            Self::ExtentDeclaredEmpty => 6,
+            Self::Unattributed => 5,
+        }
+    }
+
+    /// The inverse of [`Self::wire_code`]; `None` for a code this build does
+    /// not know, which a decoder must refuse rather than default.
+    pub const fn from_wire_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::EmptyInput),
+            1 => Some(Self::UnknownField),
+            2 => Some(Self::WindowEmpty),
+            3 => Some(Self::NoDataInWindow),
+            4 => Some(Self::OutsideCoverage),
+            5 => Some(Self::Unattributed),
+            6 => Some(Self::ExtentDeclaredEmpty),
+            _ => None,
+        }
+    }
+}
+
 pub struct RasterizeOutput {
     /// The picture's premultiplied bytes — **empty when `blank` is `Some`**.
     ///
@@ -249,6 +429,16 @@ pub struct RasterizeOutput {
     /// checks the answer's size by: a handler answering the wrong size is a
     /// failed render, and a blank has to be separable from one.
     pub blank: Option<u32>,
+    /// **Why**, when this raster turns out to have painted nothing — armed by
+    /// the branch that decided it and spent by [`Self::settle_blank`].
+    ///
+    /// Independent of `blank`, and deliberately so. `blank` is *whether* the
+    /// buffer was given up, written in one place after the premultiply; this
+    /// is *why there was nothing in it*, which only the rasterizer knows and
+    /// only at the moment it stopped. A rasterizer that leaves this `None` and
+    /// then paints nothing is counted [`BlankReason::Unattributed`] rather
+    /// than guessed at.
+    pub blank_reason: Option<BlankReason>,
 }
 
 impl std::fmt::Debug for RasterizeOutput {
@@ -261,6 +451,7 @@ impl std::fmt::Debug for RasterizeOutput {
             )
             .field("alpha", &self.alpha)
             .field("blank", &self.blank)
+            .field("blank_reason", &self.blank_reason)
             .finish()
     }
 }
@@ -283,7 +474,24 @@ impl RasterizeOutput {
         if let Ok(len) = u32::try_from(self.rgba.len()) {
             self.blank = Some(len);
             self.rgba = RasterBuf::empty();
+            // **Spent here, never decided here.** A rasterizer that armed a
+            // reason has it recorded; one that did not is counted
+            // [`BlankReason::Unattributed`] rather than given a plausible
+            // reason this function would be inventing. Filling it in from the
+            // buffer's shape is the failure mode the whole enum exists to
+            // avoid — see [`BlankReason`].
+            self.blank_reason.get_or_insert(BlankReason::Unattributed);
         }
+    }
+
+    /// Why this raster painted nothing, for a raster that has been settled
+    /// blank; `None` for one that has ink in it.
+    ///
+    /// Reading it off a raster that is *not* blank would answer with the
+    /// reason its producer armed against the possibility, which is a
+    /// prediction and not a reading — so the blank is what gates the answer.
+    pub fn blank_reason(&self) -> Option<BlankReason> {
+        self.blank.and(self.blank_reason)
     }
 }
 
@@ -399,6 +607,7 @@ pub fn rasterize_spc_outlooks(
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
+            blank_reason: None,
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -416,6 +625,7 @@ pub fn rasterize_spc_outlooks(
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
         blank: None,
+        blank_reason: None,
     }
 }
 
@@ -455,6 +665,7 @@ pub fn rasterize_spc_discussions(
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
+            blank_reason: None,
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -488,6 +699,7 @@ pub fn rasterize_spc_discussions(
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
         blank: None,
+        blank_reason: None,
     }
 }
 
@@ -532,6 +744,7 @@ pub fn rasterize_nws_alerts(
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
+            blank_reason: None,
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -552,6 +765,7 @@ pub fn rasterize_nws_alerts(
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
         blank: None,
+        blank_reason: None,
     }
 }
 
@@ -629,6 +843,7 @@ pub fn rasterize_radar_coverage(
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
+            blank_reason: None,
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -701,6 +916,7 @@ pub fn rasterize_radar_coverage(
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
         blank: None,
+        blank_reason: None,
     }
 }
 
@@ -885,6 +1101,7 @@ pub fn rasterize_metar_stations(
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
+            blank_reason: None,
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -923,6 +1140,7 @@ pub fn rasterize_metar_stations(
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
         blank: None,
+        blank_reason: None,
     }
 }
 
@@ -1101,6 +1319,7 @@ pub fn rasterize_storm_reports(
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
+            blank_reason: None,
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -1218,6 +1437,7 @@ pub fn rasterize_storm_reports(
         hit_cells: Some(hit_cells),
         alpha: AlphaMode::Premultiplied,
         blank: None,
+        blank_reason: None,
     }
 }
 
@@ -1338,6 +1558,7 @@ pub fn rasterize_glm_strikes(
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
             blank: None,
+            blank_reason: None,
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -1421,6 +1642,7 @@ pub fn rasterize_glm_strikes(
         hit_cells: Some(hit_cells),
         alpha: AlphaMode::Premultiplied,
         blank: None,
+        blank_reason: None,
     }
 }
 
@@ -2390,6 +2612,7 @@ pub fn rasterize_gridded(
             hit_cells: None,
             alpha: AlphaMode::Straight,
             blank: None,
+            blank_reason: Some(BlankReason::EmptyInput),
         };
     }
 
@@ -2402,6 +2625,7 @@ pub fn rasterize_gridded(
             hit_cells: None,
             alpha: AlphaMode::Straight,
             blank: None,
+            blank_reason: Some(BlankReason::UnknownField),
         };
     };
 
@@ -2418,6 +2642,7 @@ pub fn rasterize_gridded(
             hit_cells: None,
             alpha: AlphaMode::Straight,
             blank: None,
+            blank_reason: Some(BlankReason::WindowEmpty),
         };
     }
     let win_w = win.i1 - win.i0;
@@ -2621,6 +2846,35 @@ pub fn rasterize_gridded(
         hit_cells: None,
         alpha: AlphaMode::Straight,
         blank: None,
+        // **Armed whether or not it is spent.** Whether this raster is blank is
+        // settled once, later, after the premultiply
+        // ([`RasterizeOutput::settle_blank`]); what only this call can say is
+        // *why* there would be nothing in it, and it says it now while the
+        // count is in hand. `settle_blank` spends this on a raster that turns
+        // out blank and ignores it on one that painted.
+        //
+        // Three outcomes, and `drawn_cells` is what keeps the first two apart:
+        // it counts the cells that resolved a value AND a finite place to put
+        // it, which is exactly "the window held something paintable".
+        //
+        // `interior` gives back the ring the loop may draw from, since sizing a
+        // cell reads its four neighbours; a window pinned against the grid's
+        // own edge — `j 0..1` on a box entirely north of the top row — has **no
+        // interior at all** and the loop above never ran. That is the view
+        // being off this grid's ground, and reading it as "no data" would file
+        // GMGSI's correct polar blanks as a defect.
+        //
+        // A window away from the edges is at least two cells each way, because
+        // `window_for` widens by one index either side; so an empty interior
+        // means an edge clamp, which means the box reached past the grid. With
+        // an interior to walk, `drawn_cells == 0` is a real data gap over
+        // ground the grid does cover, and any other count means the values were
+        // there and none of them landed on this texture.
+        blank_reason: Some(if draw.area() > 0 && drawn_cells == 0 {
+            BlankReason::NoDataInWindow
+        } else {
+            BlankReason::OutsideCoverage
+        }),
     }
 }
 
@@ -2682,3 +2936,9 @@ mod seam_frame_tests;
 
 #[cfg(test)]
 mod regional_window_frame_tests;
+
+#[cfg(test)]
+mod blank_reason_tests;
+
+#[cfg(test)]
+mod gmgsi_blank_probe_tests;

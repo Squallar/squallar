@@ -287,6 +287,11 @@ fn send_reply(app: &mut crate::app::App, generation: u64, rgba: Vec<u8>) {
         hit_cells: None,
         alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
         blank: None,
+        // Left unarmed exactly as the shipping rasterizers this stands in for
+        // leave it: what `discard_blank_rasters` does with an unarmed reason
+        // is part of what this fixture exercises, and setting it here would
+        // assert the fixture's own input.
+        blank_reason: None,
     };
     raster.discard_blank_rasters();
     crate::app::App::overlay_job_deliver(

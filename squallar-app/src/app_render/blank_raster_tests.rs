@@ -69,6 +69,23 @@ fn blank() -> Vec<u8> {
 /// still waiting for that very dispatch, so a reply posted against no mark
 /// exercises the drop path instead of the one under test.
 fn arrive(app: &mut crate::app::App, ctx: &egui::Context, generation: u64, rgba: Option<Vec<u8>>) {
+    arrive_for(app, ctx, generation, rgba, None)
+}
+
+/// [`arrive`] with a [`BlankReason`] armed on the way in, standing in for the
+/// gridded rasterizer, which is the one row that arms today.
+///
+/// **The reason is armed and never settled here.** `discard_blank_rasters`
+/// below is the production output stage: what it does with an armed reason —
+/// keep it — and with an unarmed one — write `Unattributed` — is part of what
+/// these tests exercise, so the fixture states only what a rasterizer states.
+fn arrive_for(
+    app: &mut crate::app::App,
+    ctx: &egui::Context,
+    generation: u64,
+    rgba: Option<Vec<u8>>,
+    reason: Option<squallar_overlays::render::rasterize::BlankReason>,
+) {
     if let Some(pane) = app.gui.pane_mut(0) {
         pane.overlay_cache_mut(&KIND).renders.record(
             squallar_egui::overlay_cache::RenderTicket::whole(generation, bounds()),
@@ -96,6 +113,7 @@ fn arrive(app: &mut crate::app::App, ctx: &egui::Context, generation: u64, rgba:
             // decides. A fixture that set this itself would assert its own
             // input.
             blank: None,
+            blank_reason: reason,
         };
         raster.discard_blank_rasters();
         squallar_source::job::DescribedOut(Box::new(raster))
@@ -327,5 +345,154 @@ fn a_pane_that_took_a_blank_does_not_ask_for_it_again() {
         "the pane asked for the same empty raster again on the very next \
          frame. A blank that is not remembered is a re-dispatch every frame \
          for as long as the layer keeps rasterizing empty",
+    );
+}
+
+/// **A blank names its reason on the always-on counters, and the split is a
+/// partition of the blanks.**
+///
+/// The figure this closes the hole under: `pictures - inked` was measured at
+/// 37-63 % of dispatches on two browser legs and filed as *waste*. Read as "a
+/// picture disappeared from under the user whenever the previous one had ink",
+/// the same number is a *correctness* figure — and nothing in the tree could
+/// say which of the two a given run deserved, because the reason went
+/// unrecorded. A count of blanks is what already existed four times over; what
+/// did not exist is why any individual one blanked.
+///
+/// Three conjuncts, and the second and third are what keep the first from
+/// being vacuous:
+///
+/// * each reason lands on **its own** counter, at a count no other holds, so a
+///   transposition between two slots cannot read as correct;
+/// * the reasons **partition** the blanks (`blank_reasons_balance`), which is
+///   an identity rather than an expectation because `note_blank` writes both
+///   sides — it reading false is a blank counted by one path and not the
+///   other;
+/// * and `blanks_over_covered_ground` is **strictly between zero and the blank
+///   total**, which is the only shape that proves the split discriminates. A
+///   counter that answered one variant for everything would satisfy the
+///   balance completely and say nothing.
+#[test]
+fn a_blank_names_its_reason_and_the_reasons_partition_the_blanks() {
+    use squallar_overlays::render::rasterize::BlankReason;
+
+    let ctx = egui::Context::default();
+    let mut app = crate::app::tests::n_pane_app(1, "KTLX");
+    let _ = drain_uploads(&ctx);
+
+    // Distinct counts, none a multiple or prefix of another, and one of them
+    // the CORRECT clear so the covered-ground subtotal has both sides in it.
+    let plan = [
+        (BlankReason::NoDataInWindow, 3u64),
+        (BlankReason::OutsideCoverage, 5),
+        (BlankReason::ExtentDeclaredEmpty, 2),
+    ];
+
+    let before = ledger::totals();
+    let mut generation = 700;
+    for (reason, times) in plan {
+        for _ in 0..times {
+            generation += 1;
+            arrive_for(&mut app, &ctx, generation, Some(blank()), Some(reason));
+        }
+    }
+    let after = ledger::totals();
+
+    // The ledger is process-global and other tests in this binary write it, so
+    // every reading below is a DIFFERENCE across this arrival run and never an
+    // absolute. See the crate note on filtered runs.
+    let posted: u64 = plan.iter().map(|(_, n)| n).sum();
+    assert_eq!(
+        after.blanks() - before.blanks(),
+        posted,
+        "the {posted} blanks posted here did not all reach `pictures - inked`",
+    );
+    for (reason, times) in plan {
+        assert_eq!(
+            after.blank_reason(reason) - before.blank_reason(reason),
+            times,
+            "{times} blanks were posted as {reason:?} and the counter for it \
+             moved by {}. A reason that lands on a neighbour's slot balances \
+             perfectly and attributes every one of them wrongly",
+            after.blank_reason(reason) - before.blank_reason(reason),
+        );
+    }
+    assert!(
+        after.blank_reasons_balance(),
+        "the reasons do not account for every blank. `note_blank` writes both \
+         sides, so this is not an expectation that can drift — it is a blank \
+         counted by one path and not the other",
+    );
+
+    // The only proven-correct clear is `OutsideCoverage`; every other reason
+    // may have cleared a pane the layer still covered.
+    // 3 `NoDataInWindow` + 2 `ExtentDeclaredEmpty`. The second pair is the
+    // arm worth stating: a handler's own refusal LOOKS like a correct clear
+    // and counts here anyway, because nothing downstream checks it.
+    let covered = after.blanks_over_covered_ground() - before.blanks_over_covered_ground();
+    assert_eq!(
+        covered, 5,
+        "of the {posted} blanks posted, 5 were not shown to be correct and \
+         {covered} were counted so",
+    );
+    assert!(
+        covered > 0 && covered < posted,
+        "the covered-ground subtotal is all or nothing of the blanks, so it \
+         discriminates nothing and a run cannot be read as a loss or a saving",
+    );
+    assert!(
+        after.distinct_blank_reasons() >= 3,
+        "fewer than three reasons have ever been observed, so the breakdown \
+         is not shown to split anything",
+    );
+}
+
+/// **An unarmed blank arrives as `Unattributed`, and is never given a
+/// plausible reason.**
+///
+/// The alerts rasterizer this file drives arms nothing, and that is the
+/// shipping state of every row but the gridded one. What must not happen is
+/// `settle_blank` filling the gap in from the buffer's shape: a reason derived
+/// downstream agrees with the code that produced it by construction, so it can
+/// never contradict it, and the whole point of the counter is that it can.
+/// `Unattributed` is a reading — "this row has not been taught yet" — and the
+/// hole stays visible instead of inflating whichever reason it was merged
+/// with.
+#[test]
+fn a_blank_no_rasterizer_explained_is_counted_as_unexplained() {
+    use squallar_overlays::render::rasterize::BlankReason;
+
+    let ctx = egui::Context::default();
+    let mut app = crate::app::tests::n_pane_app(1, "KTLX");
+    let _ = drain_uploads(&ctx);
+
+    let before = ledger::totals();
+    arrive(&mut app, &ctx, 811, Some(blank()));
+    let after = ledger::totals();
+
+    assert_eq!(
+        after.blank_reason(BlankReason::Unattributed)
+            - before.blank_reason(BlankReason::Unattributed),
+        1,
+        "a blank whose producer armed no reason was not counted as \
+         unattributed",
+    );
+    for reason in BlankReason::ALL {
+        if reason == BlankReason::Unattributed {
+            continue;
+        }
+        assert_eq!(
+            after.blank_reason(reason) - before.blank_reason(reason),
+            0,
+            "an unarmed blank was filed as {reason:?}. That reason was \
+             invented downstream of the branch that would have known it, \
+             which is the failure `BlankReason` exists to make impossible",
+        );
+    }
+    assert!(
+        after.blanks_over_covered_ground() - before.blanks_over_covered_ground() == 1,
+        "an unattributed blank must count AGAINST covered ground: nothing \
+         said the layer was absent here, so the pane was cleared over ground \
+         the layer may well still cover",
     );
 }

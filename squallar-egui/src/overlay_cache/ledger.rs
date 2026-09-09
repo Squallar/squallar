@@ -110,6 +110,11 @@ struct Counters {
     /// [`Self::dispatched`], so the two cannot drift — see
     /// [`Totals::reasons_balance`].
     reasons: [AtomicU64; RerenderReason::COUNT],
+    /// The blank arrivals split by [`BlankReason`], indexed by
+    /// [`BlankReason::index`]. Written by [`note_blank`], the same call that
+    /// counts the blank as a picture, so the two cannot drift — see
+    /// [`Totals::blank_reasons_balance`].
+    blank_reasons: [AtomicU64; BlankReason::COUNT],
     /// Rasterized responses received. See [`note_arrived`].
     arrived: AtomicU64,
     /// Responses thrown away before their pixels were handed over.
@@ -140,6 +145,7 @@ impl Counters {
         Self {
             dispatched: AtomicU64::new(0),
             reasons: [const { AtomicU64::new(0) }; RerenderReason::COUNT],
+            blank_reasons: [const { AtomicU64::new(0) }; BlankReason::COUNT],
             arrived: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             pictures: AtomicU64::new(0),
@@ -362,6 +368,21 @@ pub struct Totals {
     /// refused appears in neither — it spent no raster — so this is a
     /// breakdown of rasters *spent*, never of rasters *wanted*.
     pub reasons: [u64; RerenderReason::COUNT],
+    /// **The blanks split by why they were blank**, indexed by
+    /// [`BlankReason::index`]. Read it through [`Self::blank_reason`].
+    ///
+    /// Its denominator is `pictures - inked` and nothing else — the arrivals
+    /// that painted nothing — and [`Self::blank_reasons_balance`] is that
+    /// identity rather than an expectation, because [`note_blank`] writes both
+    /// sides.
+    ///
+    /// **This is the line that separates a saving from a loss.** A blank is a
+    /// clear: the pane stops drawing the layer. `pictures - inked` on its own
+    /// says only how often that happened, which reads as waste avoided; what
+    /// it cannot say is whether the layer still covered the view when it
+    /// happened, and that is the difference between a correct clear and a user
+    /// watching loaded data disappear. See [`Self::blanks_over_covered_ground`].
+    pub blank_reasons: [u64; BlankReason::COUNT],
     /// Of [`Self::dispatched`], those withdrawn at the supersede seam (WO-8)
     /// before their answer was used: a newer dispatch replaced every
     /// destination the raster was for, so the job was cancelled at the
@@ -407,6 +428,61 @@ impl Totals {
     /// How many rasters `reason` asked for.
     pub fn reason(&self, reason: RerenderReason) -> u64 {
         self.reasons[reason.index()]
+    }
+
+    /// How many blank arrivals were blank for `reason`.
+    pub fn blank_reason(&self, reason: BlankReason) -> u64 {
+        self.blank_reasons[reason.index()]
+    }
+
+    /// The blanks account for every arrival that painted nothing.
+    ///
+    /// An identity and not an expectation: [`note_blank`] is the only writer
+    /// of either side. It reading false is a picture counted by one path and
+    /// not the other, which is a hole in this wiring.
+    pub fn blank_reasons_balance(&self) -> bool {
+        self.blank_reasons.iter().sum::<u64>() == self.blanks()
+    }
+
+    /// Arrivals that painted nothing: [`Self::pictures`] less [`Self::inked`].
+    ///
+    /// `saturating_sub` because this type is public and a hand-built `Totals`
+    /// — the telemetry line tests build one whose fields are deliberately
+    /// implausible, so a transposition cannot read as correct — may state more
+    /// ink than pictures. A debug overflow there would be this accessor
+    /// asserting a fixture's realism, which is not its job.
+    pub fn blanks(&self) -> u64 {
+        self.pictures.saturating_sub(self.inked)
+    }
+
+    /// How many distinct blank reasons were observed at all.
+    ///
+    /// **The anti-vacuity conjunct for this breakdown**, on the same terms as
+    /// [`Self::distinct_reasons`]: a counter that only ever answered one
+    /// variant satisfies every other check here and says nothing.
+    pub fn distinct_blank_reasons(&self) -> usize {
+        self.blank_reasons.iter().filter(|n| **n > 0).count()
+    }
+
+    /// **Blanks not shown to be correct** — every reason but
+    /// [`BlankReason::OutsideCoverage`], which is the only one proven right by
+    /// an observation rather than a claim. Conservative on purpose; see
+    /// [`BlankReason::clears_covered_ground`] for why a handler's own
+    /// `paints_in` refusal is counted here despite looking correct.
+    ///
+    /// This is the figure a correctness reading of the blank rate wants, and
+    /// it did not exist before 2026-09-06. `pictures - inked` was measured at
+    /// 37–63 % of dispatches on two browser legs and filed as *waste*; read as
+    /// "a picture disappeared from under the user whenever the previous one
+    /// had ink", the same number is a *correctness* figure. Which of the two
+    /// readings a given run deserves is exactly what this splits out, and
+    /// nothing could answer it while the reason went unrecorded.
+    pub fn blanks_over_covered_ground(&self) -> u64 {
+        BlankReason::ALL
+            .iter()
+            .filter(|r| r.clears_covered_ground())
+            .map(|r| self.blank_reasons[r.index()])
+            .sum()
     }
 
     /// How many distinct reasons were observed at all.
@@ -492,6 +568,11 @@ pub fn note_dropped() {
 /// thread on both targets.
 pub use squallar_overlays::render::rasterize::has_ink;
 
+/// Re-exported for the same reason [`has_ink`] is: the answer is decided below
+/// the wire, in the crate that rasterizes, and a second spelling of it here
+/// could disagree with the one the reply carries.
+pub use squallar_overlays::render::rasterize::BlankReason;
+
 /// Record `bytes` of picture handed to egui, and whether [`has_ink`] found
 /// anything in it.
 ///
@@ -504,6 +585,19 @@ pub fn note_picture(bytes: u64, inked: bool) {
     if inked {
         sink.inked.fetch_add(1, Relaxed);
     }
+}
+
+/// Record a **blank** arrival: one that reached a pane, cleared it, and cost
+/// no buffer, no texture and no upload — and **why** it was blank.
+///
+/// [`note_picture`] with `bytes` of zero and `inked` false, plus the reason,
+/// written by this one call so the blank count and its breakdown cannot drift
+/// (`Totals::blank_reasons_balance`). Three relaxed `fetch_add`s and a `match`
+/// on a fieldless enum; nothing here allocates or takes a clock.
+pub fn note_blank(reason: BlankReason) {
+    let sink = sink();
+    sink.pictures.fetch_add(1, Relaxed);
+    sink.blank_reasons[reason.index()].fetch_add(1, Relaxed);
 }
 
 /// Record a picture put straight on screen.
@@ -555,6 +649,7 @@ pub fn totals() -> Totals {
         superseded: sink.superseded.load(Relaxed),
         cancelled: sink.cancelled.load(Relaxed),
         reasons: std::array::from_fn(|i| sink.reasons[i].load(Relaxed)),
+        blank_reasons: std::array::from_fn(|i| sink.blank_reasons[i].load(Relaxed)),
     }
 }
 

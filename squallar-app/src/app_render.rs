@@ -409,6 +409,43 @@ fn overlay_reason_line(t: &squallar_egui::overlay_cache::ledger::Totals) -> Stri
     line
 }
 
+/// The `overlay blanks:` running-total line — the arrivals that painted
+/// nothing, split by **why** they painted nothing.
+///
+/// **A third line rather than fields on either of the first two**, for the
+/// reason [`overlay_reason_line`] gives: the rig's regexes are anchored over
+/// whole sentences, and a field inserted into one of them reads as "the path
+/// never ran". This line is additive.
+///
+/// Its denominator is `pictures - inked` — see
+/// [`ledger::Totals::blank_reasons_balance`] — and it is **never added to**
+/// `overlay reasons:`, whose denominator is `dispatched`. `covered` is the
+/// subtotal that matters: every reason but `outside-coverage` MAY have cleared
+/// a pane over ground the layer still covers, which is a picture the user lost
+/// rather than a buffer the app saved. Conservative — it counts blanks not
+/// shown to be correct, `extent-declared-empty` included, because that one is
+/// a handler's unchecked claim; a reader who trusts a handler subtracts its
+/// count, which is printed beside the subtotal for exactly that.
+///
+/// **`blank` and `covered` are the same denominator; the per-reason counts are
+/// a partition of `blank`.** So `covered` may be compared with `blank` and the
+/// reasons summed to it, and none of them may be added to anything on the
+/// other two lines.
+///
+/// [`ledger::Totals::blank_reasons_balance`]: squallar_egui::overlay_cache::ledger::Totals::blank_reasons_balance
+fn overlay_blank_line(t: &squallar_egui::overlay_cache::ledger::Totals) -> String {
+    use std::fmt::Write as _;
+    let mut line = format!(
+        "overlay blanks: {} blank, {} covered",
+        t.blanks(),
+        t.blanks_over_covered_ground(),
+    );
+    for reason in squallar_egui::overlay_cache::ledger::BlankReason::ALL {
+        let _ = write!(line, ", {} {}", t.blank_reason(reason), reason.name());
+    }
+    line
+}
+
 /// The `texture uploads:` running-total line. See [`overlay_raster_line`] for
 /// why this is a value.
 ///
@@ -2565,6 +2602,11 @@ impl super::App {
             // Beside the line it splits, and off the same reading, so the two
             // sentences can never be a frame apart.
             say_telemetry(loud, &overlay_reason_line(&t));
+            // And the blank breakdown, off that same reading. Always emitted
+            // rather than gated on a nonzero blank count: a line that speaks
+            // only when something went wrong is indistinguishable from a rig
+            // that never scraped it. See `overlay_blank_line`.
+            say_telemetry(loud, &overlay_blank_line(&t));
         }
         if let Some(u) = uploads {
             say_telemetry(loud, &texture_upload_line(&u));
@@ -3600,11 +3642,14 @@ impl super::App {
                     );
                     Some(texture)
                 }
-                crate::channels::OverlayPicture::Blank { .. } => {
+                crate::channels::OverlayPicture::Blank { reason, .. } => {
                     // Zero bytes, and it is not an estimate: no `ColorImage`
                     // was allocated, no texture was minted and nothing was
-                    // uploaded. `pictures - inked` is still the blank count.
-                    squallar_egui::overlay_cache::ledger::note_picture(0, false);
+                    // uploaded. `pictures - inked` is still the blank count,
+                    // and `note_blank` splits it by **why** — the figure that
+                    // says whether this clear was correct or was data
+                    // disappearing from under the user.
+                    squallar_egui::overlay_cache::ledger::note_blank(*reason);
                     None
                 }
             };
@@ -3617,7 +3662,7 @@ impl super::App {
                     let [width, height] = image.size;
                     (width as u32, height as u32)
                 }
-                crate::channels::OverlayPicture::Blank { width, height } => (*width, *height),
+                crate::channels::OverlayPicture::Blank { width, height, .. } => (*width, *height),
             };
 
             // Every pane still named here wants the answer: the retain above is

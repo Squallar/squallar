@@ -113,6 +113,7 @@ fn settled(rgba: Vec<u8>) -> Box<dyn squallar_source::job::JobOut> {
         hit_cells: None,
         alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
         blank: None,
+        blank_reason: None,
     };
     out.discard_blank_rasters();
     Box::new(out)
@@ -178,7 +179,7 @@ fn a_fully_transparent_picture_is_marked_as_painting_nothing() {
     );
 
     match empty.picture {
-        Some(crate::channels::OverlayPicture::Blank { width, height }) => {
+        Some(crate::channels::OverlayPicture::Blank { width, height, .. }) => {
             assert_eq!(
                 (width, height),
                 (W, H),

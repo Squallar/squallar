@@ -303,7 +303,20 @@ pub enum OverlayPicture {
     /// rasterizes blank, and that blank is what replaces the ink the pane was
     /// drawing — see `OverlayTextureCache::show_blank`. Skipping it would
     /// leave the old picture on screen with every figure reading better.
-    Blank { width: u32, height: u32 },
+    Blank {
+        width: u32,
+        height: u32,
+        /// **Why this raster painted nothing** — carried from the branch that
+        /// decided it, through the reply, to the ledger.
+        ///
+        /// A blank is a clear, so this is what separates a clear that is right
+        /// (the view left the layer's ground) from one that takes loaded data
+        /// off the glass. It rides the message rather than being worked out on
+        /// arrival because only the rasterizer can know it: on the web the
+        /// raster runs in the worker, and this and the size are the whole of
+        /// what comes back.
+        reason: squallar_egui::overlay_cache::ledger::BlankReason,
+    },
 }
 
 impl OverlayPicture {

@@ -3576,28 +3576,57 @@ fn the_overlay_reply_round_trips_and_is_canonical() {
     let rgba: Vec<u8> = (0..32).collect();
     // `encode_overlay_out` writes into a sink since WO-M7d (the codec's head).
     let encode = |blank: Option<u32>,
+                  reason: Option<squallar_overlays::render::rasterize::BlankReason>,
                   cells: Option<&squallar_overlays::render::rasterize::HitCells>| {
         let mut out = Vec::new();
-        encode_overlay_out(&rgba, blank, cells, &mut out);
+        encode_overlay_out(&rgba, blank, reason, cells, &mut out);
         out
     };
     for cells in [None, Some(a_hit_cells_fixture())] {
         assert_eq!(
-            decode_overlay_out(&encode(None, cells.as_ref())),
-            Some((rgba.clone().into(), None, cells.clone())),
+            decode_overlay_out(&encode(None, None, cells.as_ref())),
+            Some((rgba.clone().into(), None, None, cells.clone())),
             "the overlay reply did not survive its own codec",
         );
         // The blank form: no pixels on the wire, and the length the picture
-        // would have had comes back instead of them.
+        // would have had comes back instead of them — **with the reason it was
+        // blank**, which is what tells a page whether the clear it is about to
+        // make is correct. Every variant, because a reason byte that only
+        // carried the one the fixture happened to pick would let a truncated
+        // or transposed code table pass.
+        for reason in squallar_overlays::render::rasterize::BlankReason::ALL {
+            assert_eq!(
+                decode_overlay_out(&encode(
+                    Some(rgba.len() as u32),
+                    Some(reason),
+                    cells.as_ref()
+                )),
+                Some((
+                    RasterBuf::empty(),
+                    Some(rgba.len() as u32),
+                    Some(reason),
+                    cells.clone()
+                )),
+                "the blank overlay reply did not survive its own codec \
+                 carrying {reason:?}",
+            );
+        }
+        // A blank with no reason armed travels as `Unattributed` rather than
+        // as an absent field, so a blank reply is one fixed length.
         assert_eq!(
-            decode_overlay_out(&encode(Some(rgba.len() as u32), cells.as_ref())),
-            Some((RasterBuf::empty(), Some(rgba.len() as u32), cells.clone())),
-            "the blank overlay reply did not survive its own codec",
+            decode_overlay_out(&encode(Some(rgba.len() as u32), None, cells.as_ref())),
+            Some((
+                RasterBuf::empty(),
+                Some(rgba.len() as u32),
+                Some(squallar_overlays::render::rasterize::BlankReason::Unattributed),
+                cells.clone()
+            )),
+            "an unarmed blank did not arrive as `Unattributed`",
         );
     }
     assert_eq!(
-        encode(None, Some(&a_hit_cells_fixture())),
-        encode(None, Some(&a_hit_cells_fixture())),
+        encode(None, None, Some(&a_hit_cells_fixture())),
+        encode(None, None, Some(&a_hit_cells_fixture())),
         "two encodes of one reply disagree: the cell walk is not canonical",
     );
 }
@@ -3614,7 +3643,7 @@ fn the_picture_starts_at_a_constant_offset_whatever_the_cells_say() {
     let mut seen = Vec::new();
     for cells in [None, Some(a_hit_cells_fixture())] {
         let mut encoded = Vec::new();
-        encode_overlay_out(&rgba, None, cells.as_ref(), &mut encoded);
+        encode_overlay_out(&rgba, None, None, cells.as_ref(), &mut encoded);
         let prefix = &encoded[..squallar_overlays::render::jobs::OVERLAY_PIXEL_PREFIX_BYTES];
         let span = squallar_overlays::render::jobs::overlay_pixel_span(prefix)
             .expect("a painted reply states a pixel span in its prefix");
@@ -3644,7 +3673,13 @@ fn the_picture_starts_at_a_constant_offset_whatever_the_cells_say() {
     // A blank states no span, so the transport does not take the split path
     // for one and the whole-head decode still owns that case.
     let mut blank = Vec::new();
-    encode_overlay_out(&[], Some(64), None, &mut blank);
+    encode_overlay_out(
+        &[],
+        Some(64),
+        Some(squallar_overlays::render::rasterize::BlankReason::OutsideCoverage),
+        None,
+        &mut blank,
+    );
     assert_eq!(
         squallar_overlays::render::jobs::overlay_pixel_span(
             &blank[..squallar_overlays::render::jobs::OVERLAY_PIXEL_PREFIX_BYTES]
@@ -3663,7 +3698,7 @@ fn the_split_decode_and_the_whole_decode_agree() {
     let rgba: Vec<u8> = (0..64).collect();
     for cells in [None, Some(a_hit_cells_fixture())] {
         let mut encoded = Vec::new();
-        encode_overlay_out(&rgba, None, cells.as_ref(), &mut encoded);
+        encode_overlay_out(&rgba, None, None, cells.as_ref(), &mut encoded);
         let (offset, len) = squallar_overlays::render::jobs::overlay_pixel_span(
             &encoded[..squallar_overlays::render::jobs::OVERLAY_PIXEL_PREFIX_BYTES],
         )
@@ -3690,7 +3725,7 @@ fn the_split_decode_and_the_whole_decode_agree() {
         );
         assert_eq!(
             split.hit_cells.map(|c| c.cells),
-            whole.2.map(|c| c.cells),
+            whole.3.map(|c| c.cells),
             "the two decodes disagree on the hit cells",
         );
     }
@@ -3703,7 +3738,7 @@ fn a_split_reply_whose_stated_length_does_not_match_its_picture_is_refused() {
     // prefix states is the only thing that can catch it.
     let rgba: Vec<u8> = (0..64).collect();
     let mut encoded = Vec::new();
-    encode_overlay_out(&rgba, None, None, &mut encoded);
+    encode_overlay_out(&rgba, None, None, None, &mut encoded);
     let (offset, len) = squallar_overlays::render::jobs::overlay_pixel_span(
         &encoded[..squallar_overlays::render::jobs::OVERLAY_PIXEL_PREFIX_BYTES],
     )
@@ -3749,14 +3784,26 @@ fn the_overlay_reply_framing_is_the_one_this_protocol_ships() {
     // Sink-shaped construction since WO-M7d; the byte VALUES these rows pin
     // are the proof the flatten changed no stream.
     let mut bare = Vec::new();
-    encode_overlay_out(&rgba, None, None, &mut bare);
+    encode_overlay_out(&rgba, None, None, None, &mut bare);
     let mut with_cells = Vec::new();
-    encode_overlay_out(&rgba, None, Some(&a_hit_cells_fixture()), &mut with_cells);
+    encode_overlay_out(
+        &rgba,
+        None,
+        None,
+        Some(&a_hit_cells_fixture()),
+        &mut with_cells,
+    );
     // The blank form, pinned as its own row: it is the one whose LENGTH is the
     // saving, and a row that only pinned the painted forms would not see a
     // blank that quietly started carrying pixels again.
     let mut blank = Vec::new();
-    encode_overlay_out(&[], Some(rgba.len() as u32), None, &mut blank);
+    encode_overlay_out(
+        &[],
+        Some(rgba.len() as u32),
+        Some(squallar_overlays::render::rasterize::BlankReason::OutsideCoverage),
+        None,
+        &mut blank,
+    );
     let rows = vec![
         format!("bare | {} | {:#018x}", bare.len(), layout_digest(&bare)),
         format!(
@@ -4005,11 +4052,11 @@ fn a_blank_overlay_reply_carries_no_picture_sized_payload() {
          {picture_bytes}-byte raster",
         painted_head.len(),
     );
-    let (via_wire, blank, _) =
+    let (via_wire, blank, blank_reason, _) =
         decode_overlay_out(&painted_head).expect("the painted reply decodes");
     assert_eq!(
-        (via_wire.into_bytes(), blank),
-        (direct.rgba.into_bytes(), None),
+        (via_wire.into_bytes(), blank, blank_reason),
+        (direct.rgba.into_bytes(), None, None),
         "the inked raster did not arrive byte-identical through its own wire \
          form",
     );
@@ -4031,7 +4078,18 @@ fn a_blank_overlay_reply_carries_no_picture_sized_payload() {
     );
     assert_eq!(
         decode_overlay_out(&blank_head),
-        Some((RasterBuf::empty(), Some(picture_bytes as u32), None)),
+        Some((
+            RasterBuf::empty(),
+            Some(picture_bytes as u32),
+            // **`Unattributed` is the reading, not a shrug.** The alerts
+            // rasterizer arms no `BlankReason`; only the gridded row does, so
+            // this pins which rows still have to be taught, and it changes to
+            // a real reason on the day this one is. What it may never become
+            // is a *plausible* reason invented by the settle — see
+            // `BlankReason::Unattributed`.
+            Some(squallar_overlays::render::rasterize::BlankReason::Unattributed),
+            None
+        )),
         "a blank reply must arrive AS a blank of the picture's own size. \
          Arriving as nothing is a failed render, which the pane ignores — so \
          the ink of a layer whose data has gone away stays on the glass while \
@@ -4045,7 +4103,13 @@ fn a_blank_overlay_reply_carries_no_picture_sized_payload() {
 fn a_malformed_overlay_reply_is_refused_rather_than_misread() {
     let rgba: Vec<u8> = (0..16).collect();
     let mut encoded = Vec::new();
-    encode_overlay_out(&rgba, None, Some(&a_hit_cells_fixture()), &mut encoded);
+    encode_overlay_out(
+        &rgba,
+        None,
+        None,
+        Some(&a_hit_cells_fixture()),
+        &mut encoded,
+    );
 
     // Control first: untouched bytes decode, so every refusal below is the
     // mutation's doing.
@@ -4083,7 +4147,7 @@ fn a_malformed_overlay_reply_is_refused_rather_than_misread() {
     // The last entry's index: 8 is one past the 4×2 grid.
     let mut moved = encoded.clone();
     moved[cells_at + 41..cells_at + 45].copy_from_slice(&6u32.to_le_bytes());
-    let (_, _, cells) = decode_overlay_out(&moved).expect("index 6 is a legal cell");
+    let (_, _, _, cells) = decode_overlay_out(&moved).expect("index 6 is a legal cell");
     assert!(
         cells.expect("cells").cells.contains_key(&6),
         "the bytes at cells_at+41 are not the last entry's index; the refusal below \
@@ -4568,6 +4632,7 @@ fn an_overlay_reply_travels_as_its_own_out_kind() {
         rgba,
         hit_cells,
         blank,
+        blank_reason,
         ..
     } = output.take::<RasterizeOutput>().expect("an overlay raster");
     let sites_row = job_codecs()
@@ -4581,12 +4646,19 @@ fn an_overlay_reply_travels_as_its_own_out_kind() {
             hit_cells: hit_cells.clone(),
             alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
             blank,
+            blank_reason,
         })),
         &mut head,
         &mut tails,
     );
     let mut expected = Vec::new();
-    encode_overlay_out(&rgba, blank, hit_cells.as_ref(), &mut expected);
+    encode_overlay_out(
+        &rgba,
+        blank,
+        blank_reason,
+        hit_cells.as_ref(),
+        &mut expected,
+    );
     assert_eq!(head, expected);
     // Handing the (empty) tails straight back through is the emptiness check.
     let back = (sites_row.decode_out)(&head, tails)

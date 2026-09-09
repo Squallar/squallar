@@ -373,6 +373,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
             // The reply contract: pixels arrive premultiplied.
             alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
             blank: None,
+            blank_reason: None,
         },
     );
     // An answer rather than a failure, which is the contrast every mismatch
@@ -417,6 +418,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
                 }),
                 alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
                 blank: None,
+                blank_reason: None,
             },
         ),
         (
@@ -427,6 +429,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
                 hit_cells: Some(cells(33, 2)),
                 alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
                 blank: None,
+                blank_reason: None,
             },
         ),
         (
@@ -437,6 +440,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
                 hit_cells: Some(cells(33, 0)),
                 alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
                 blank: None,
+                blank_reason: None,
             },
         ),
         (
@@ -447,6 +451,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
                 hit_cells: None,
                 alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
                 blank: None,
+                blank_reason: None,
             },
         ),
         (
@@ -457,6 +462,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
                 hit_cells: Some(cells(33, 1)),
                 alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
                 blank: None,
+                blank_reason: None,
             },
         ),
     ];

@@ -162,6 +162,7 @@ fn arrive(row: &JobCodec, source: &[u8], cells: HitCells) -> Arrival {
             hit_cells: Some(cells),
             alpha: AlphaMode::Premultiplied,
             blank: None,
+            blank_reason: None,
         })),
         &mut head,
         &mut tails,

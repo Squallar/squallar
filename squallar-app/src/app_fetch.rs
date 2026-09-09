@@ -1141,6 +1141,7 @@ impl super::App {
                 rgba,
                 hit_cells,
                 blank,
+                blank_reason,
                 ..
             }) = result
                 .and_then(|out| out.take::<squallar_overlays::render::rasterize::RasterizeOutput>())
@@ -1251,7 +1252,19 @@ impl super::App {
                                     ),
                                 ))
                             }
-                            Some(_) => crate::channels::OverlayPicture::Blank { width, height },
+                            Some(_) => crate::channels::OverlayPicture::Blank {
+                                width,
+                                height,
+                                // **Never re-decided here.** A reply whose
+                                // producer armed no reason is `Unattributed`,
+                                // which is a reading; inventing a plausible
+                                // one from what this side can see would put a
+                                // figure on an always-on counter that agrees
+                                // with nothing. See `BlankReason`.
+                                reason: blank_reason.unwrap_or(
+                                    squallar_egui::overlay_cache::ledger::BlankReason::Unattributed,
+                                ),
+                            },
                         });
                     }
                     Ok(_) => {}
@@ -1500,7 +1513,18 @@ impl super::App {
                     // so. Pinned by
                     // `an_empty_extent_delivers_a_blank_rather_than_no_response`.
                     let _ = sender.send(OverlayRenderResponse {
-                        picture: Some(crate::channels::OverlayPicture::Blank { width, height }),
+                        picture: Some(crate::channels::OverlayPicture::Blank {
+                            width,
+                            height,
+                            // **Armed here, at the branch that decided it.**
+                            // This blank never met a rasterizer: `paints_in`
+                            // said the layer has no ink in these bounds and the
+                            // whole dispatch was short-circuited. That is a
+                            // different claim from the cell walk finding
+                            // nothing, and it is counted as one — see
+                            // `BlankReason::ExtentDeclaredEmpty`.
+                            reason: squallar_egui::overlay_cache::ledger::BlankReason::ExtentDeclaredEmpty,
+                        }),
                         geo_bounds: render_bounds,
                         overlay_kind: id.clone(),
                         generation: data_generation,

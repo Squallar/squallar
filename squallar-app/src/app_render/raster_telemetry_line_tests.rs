@@ -119,6 +119,9 @@ fn the_rig_reads_the_lines_the_app_actually_writes() {
         // that the rig's anchored `rasters_re` keeps matching. See
         // `app_render::overlay_reason_line`.
         reasons: [0; squallar_egui::overlay_cache::RerenderReason::COUNT],
+        // Nor in this one, and for the same reason: the blank split is its
+        // own line. See `app_render::overlay_blank_line`.
+        blank_reasons: [0; squallar_egui::overlay_cache::ledger::BlankReason::COUNT],
     };
     assert_eq!(
         super::overlay_raster_line(&rasters),
@@ -567,5 +570,72 @@ fn the_gridded_scatter_line_says_its_figures_and_says_when_it_has_none() {
          `0.000` here would read as an overdraw measurement of zero — a \
          scatter that wrote no pixels — which is a different claim entirely \
          and the one a reader would act on",
+    );
+}
+
+/// **The `overlay blanks:` line names every reason, at its own count, in the
+/// order the enum declares.**
+///
+/// No rig pattern to compare against yet — this line is newer than the rig's
+/// probes — so what is pinned is the SENTENCE, which is what a probe will be
+/// written from. Every count below is distinct and none is a prefix of
+/// another, for the reason the test above gives: a transposed pair reads
+/// identically to a correct line if the numbers agree, and the readout would
+/// then report a real defect under an innocent name for as long as nobody
+/// looked. That is the failure this whole breakdown exists to end, so it may
+/// not arrive through the breakdown's own log line.
+#[test]
+fn the_blank_line_names_every_reason_at_its_own_count() {
+    use squallar_egui::overlay_cache::ledger::BlankReason;
+
+    // 4 + 16 + 32 + 64 + 128 + 256 + 512 = 1012 blanks, of which every reason
+    // but `outside-coverage` is over covered ground: 1012 - 128 = 884.
+    let mut blank_reasons = [0u64; BlankReason::COUNT];
+    for (n, reason) in BlankReason::ALL.into_iter().enumerate() {
+        blank_reasons[reason.index()] = 4u64 << (2 * n);
+    }
+    let posted: u64 = blank_reasons.iter().sum();
+
+    let t = ledger::Totals {
+        // `blanks()` is `pictures - inked`, and the reasons must account for
+        // exactly that. Stated as the difference rather than as a round number
+        // so the identity is what the fixture carries.
+        pictures: posted + 7,
+        inked: 7,
+        blank_reasons,
+        ..Default::default()
+    };
+    assert!(
+        t.blank_reasons_balance(),
+        "the fixture's own reasons do not add to its blanks, so the line \
+         below would be pinned against an impossible ledger",
+    );
+
+    let expected = format!(
+        "overlay blanks: {posted} blank, {} covered, \
+         4 empty-input, 16 unknown-field, 64 window-empty, 256 no-data, \
+         1024 outside-coverage, 4096 extent-declared-empty, \
+         16384 unattributed",
+        posted - 1024,
+    );
+    assert_eq!(
+        super::overlay_blank_line(&t),
+        expected,
+        "the `overlay blanks:` sentence has moved. It is the only place the \
+         reason a pane was cleared is ever reported, and a reader that cannot \
+         parse it is back to a bare blank count -- which reads as waste \
+         avoided whether the blanks were correct or were data disappearing \
+         from under the user",
+    );
+    // The subtotal is genuinely a subtotal, and genuinely a proper one: it is
+    // neither zero nor the whole. A `covered` equal to `blank` would mean the
+    // split discriminates nothing, which is how a breakdown passes every
+    // arithmetic check and says nothing at all.
+    assert!(t.blanks_over_covered_ground() > 0 && t.blanks_over_covered_ground() < t.blanks(),);
+    assert_eq!(
+        t.distinct_blank_reasons(),
+        BlankReason::COUNT,
+        "not every reason is represented, so the line above does not show \
+         that every one of them can be reported",
     );
 }

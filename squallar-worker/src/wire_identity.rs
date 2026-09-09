@@ -110,10 +110,28 @@ pub const WIRE_FRAMING_ROWS: &[&str] = &[
 /// a deliberate framing change and nothing else**: the row feeds the local
 /// build token, so two builds with different framings refuse each other and
 /// respawn rather than exchanging a reply either would misread.
+///
+/// **Re-pinned a third time, later on 2026-09-08, and ONLY the `blank` row
+/// moved** — `bare` and `cells` are byte-identical, which is the evidence the
+/// change is confined to the arm it was meant for and did not disturb the
+/// constant pixel offset the row above bought. A blank reply gained a
+/// **reason byte** (`squallar_overlays::render::rasterize::BlankReason`), so it
+/// costs 7 bytes rather than 6, and the byte sits *after* the length so
+/// `OVERLAY_PIXEL_PREFIX_BYTES` is untouched.
+///
+/// The byte is not a saving and does not pretend to be one; it is what makes
+/// the saving *readable*. A blank is a **clear** — the pane stops drawing the
+/// layer — and until this byte existed the page counted how often that happened
+/// and could say nothing about whether the layer still covered the view when it
+/// did. The same figure was therefore readable only as waste avoided, never as
+/// data disappearing from under the user, and on the web the page is the only
+/// side that counts: the decision is taken in the worker and this reply is the
+/// whole of what comes back. One byte against the 8.26-8.92 MB the same row
+/// already declines to send.
 pub const WIRE_REPLY_ROWS: &[&str] = &[
     "bare | 22 | 0x2a894fce9e16cbd4",
     "cells | 74 | 0xed8f0851ce2dd001",
-    "blank | 6 | 0x0cf6ca5254a6cb0d",
+    "blank | 7 | 0xae173ee5d75f7a73",
 ];
 
 /// The 13 frame-reply framing rows, exactly as
