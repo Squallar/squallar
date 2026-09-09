@@ -416,6 +416,59 @@ fn a_pane_replacing_the_picture_it_is_already_uploading_is_charged_nothing() {
     );
 }
 
+/// **The exemption is counted, and this is what makes that figure readable.**
+///
+/// The test above asserts that a supersede is admitted past the ceiling; this
+/// asserts that the ledger says so. Without it `overlay door:`' `exempt`
+/// figure is a number nothing holds to the path it describes — a counter
+/// wired to the wrong arm, or to no arm, reads `0` and `0` is exactly what a
+/// healthy ceiling looks like.
+///
+/// The fixture is the one above, term for term: every pane holds a picture,
+/// `PANES` of them are already past the ceiling, so every ask on this frame
+/// is admitted on a budget with nothing left on it — which is the arm
+/// `note_door_exempt` counts and the only one it counts.
+///
+/// **A delta and not an absolute.** In a test build the ledger is one sink
+/// per thread and libtest under `--test-threads=1` runs the whole binary on
+/// one, so an absolute figure here would carry every earlier test's asks.
+#[test]
+fn the_ledger_counts_the_supersedes_the_ceiling_let_past() {
+    let plan = picture_plan();
+    assert!(
+        (PANES as u64) * plan.bytes() > MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING,
+        "fixture: {PANES} held pictures do not even reach the ceiling, so \
+         nothing on this frame rides the exemption and the counter below \
+         would read zero for the wrong reason",
+    );
+    let before = crate::overlay_cache::ledger::totals();
+    let mut h = scene();
+    for idx in 0..PANES {
+        let mut picture = raster(&h, &format!("held-{idx}"));
+        picture.width = plan.width;
+        picture.height = plan.height;
+        h.gui_mut().panes_mut()[idx]
+            .overlay_cache_mut(&ASKING)
+            .hold(picture, None);
+    }
+    h.frame_after(FRAME_DT);
+    let after = crate::overlay_cache::ledger::totals();
+    let exempt = after.door_exempt - before.door_exempt;
+    let bytes = after.door_exempt_bytes - before.door_exempt_bytes;
+    assert_eq!(
+        exempt, PANES as u64,
+        "{PANES} panes were let past a spent ceiling and the ledger counted \
+         {exempt} of them",
+    );
+    assert_eq!(
+        bytes,
+        PANES as u64 * plan.bytes(),
+        "the exempt asks were counted at {bytes} B against the {} B their \
+         own plans came to",
+        PANES as u64 * plan.bytes(),
+    );
+}
+
 /// **Radar is not counted.** Its rasters come from the app's own
 /// `dispatch_pane_renders`, which this door cannot throttle, so charging them
 /// would let a playing radar loop close the door on every other layer for as

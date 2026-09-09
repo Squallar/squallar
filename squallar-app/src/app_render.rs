@@ -412,6 +412,40 @@ fn overlay_raster_line(t: &squallar_egui::overlay_cache::ledger::Totals) -> Stri
     )
 }
 
+/// The `overlay door:` running-total line — what the **aggregate** overlay
+/// picture door has done, as against `overlay rasters:`' record of what got
+/// through it.
+///
+/// **A third line and not more fields on the first**, for
+/// [`overlay_reason_line`]'s reason verbatim: the Tier-2 rig matches
+/// `overlay rasters:` with one anchored regex over the whole sentence and a
+/// field inserted into it turns that reading into `null`.
+///
+/// `peak` is the highest occupancy the door ever subtracted and `ceiling` the
+/// constant it is read against, printed beside it so a reading is judged
+/// without a second lookup. `refused` counts asks the ceiling turned away.
+/// `exempt` counts the ones it did **not** — supersedes let past a ceiling
+/// with nothing left on it — and is the figure that says what closing that
+/// exemption would be worth.
+///
+/// **Its denominator is this door alone.** `App::arrived_overlay_asks` is a
+/// second way into `spawn_overlay_render` and consults no aggregate, so a
+/// picture dispatched from there is in none of these numbers and is still on
+/// the heap. Read `peak` as a floor for that reason as well as for the
+/// obvious one — a picture already promoted to the glass has left this figure
+/// and not the heap.
+fn overlay_door_line(t: &squallar_egui::overlay_cache::ledger::Totals) -> String {
+    format!(
+        "overlay door: {} B peak outstanding of {} B ceiling, \
+         {} refused, {} exempt of {} B",
+        t.door_peak_bytes,
+        squallar_device_profile::constants::MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING,
+        t.door_refused,
+        t.door_exempt,
+        t.door_exempt_bytes,
+    )
+}
+
 /// The `overlay reasons:` running-total line — [`overlay_raster_line`]'s
 /// `dispatched` figure split by the arm that asked for each raster.
 ///
@@ -2739,6 +2773,10 @@ impl super::App {
             // could read. `OVERLAY_TELEMETRY_HEARTBEAT` is what makes it true
             // of both.
             say_telemetry(loud, &overlay_blank_line(&t));
+            // And the door, off that same reading: `overlay rasters:` counts
+            // what got through and this counts what the ceiling held back, so
+            // the two are only readable together.
+            say_telemetry(loud, &overlay_door_line(&t));
         }
         if let Some((u, peak)) = uploads {
             say_telemetry(loud, &texture_upload_line(&u));

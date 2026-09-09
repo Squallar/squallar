@@ -1085,6 +1085,29 @@ pub(super) fn render_pane_map_content(
             // `squallar_gpu`'s `TextureUploads::free` takes its bands out of
             // the queue in the same breath. A supersede is net zero on the
             // aggregate and is charged nothing.
+            //
+            // **Every clause of that is true and it is about the arrival, not
+            // this instant.** None of those frees happens at the dispatch;
+            // they happen when the replacement lands, a whole rasterization
+            // later, and between the two the cache holds its old picture
+            // *and* has a new one being built for it —
+            // `OverlayTextureCache::outstanding_bytes` adds its `held` and
+            // `in_flight` terms rather than merging them for exactly that
+            // reason. So while the exemption stands, a frame on which every
+            // live cache is holding admits a batch this ceiling did not
+            // bound.
+            //
+            // **It is instrumented rather than closed, and that is a measured
+            // decision.** Closing it was built and run against three paired
+            // HEAVY6 legs a side on `0f3de05db`: whole 2,995,200 B pictures
+            // live at the process peak went 17/17/15 to 15/23/19 — no fall,
+            // and the medians move the wrong way. The peak is not set by this
+            // door, because `App::arrived_overlay_asks` is a second way into
+            // `spawn_overlay_render` that consults no aggregate at all. Until
+            // that path is bounded too, charging here changes which asks are
+            // refused and not how much picture is resident.
+            // `ledger::note_door_exempt` is what says how much rides the
+            // exemption, so the decision is made on a figure next time.
             let replaces = cache.is_holding();
             let admits = cache
                 .renders
@@ -1109,8 +1132,20 @@ pub(super) fn render_pane_map_content(
             // the same figure is what `outstanding_bytes` reads back while the
             // render is in flight. Nothing here re-derives a size.
             let planned = tex_plan.bytes();
-            let afforded = replaces || ctx.overlay_dispatch_budget.get() > 0;
+            let budget_open = ctx.overlay_dispatch_budget.get() > 0;
+            let afforded = replaces || budget_open;
             let dispatched = stale && admits && afforded;
+            // The door's own fires counters, over asks that had got as far as
+            // the ceiling — stale, and admitted by the per-cache limit. The
+            // three arms partition that set: turned away, admitted on a
+            // ceiling with room, and admitted on a ceiling with none.
+            if stale && admits {
+                if !afforded {
+                    crate::overlay_cache::ledger::note_door_refused();
+                } else if !budget_open {
+                    crate::overlay_cache::ledger::note_door_exempt(planned);
+                }
+            }
             if dispatched {
                 cache.note_planned_bytes(planned);
             }

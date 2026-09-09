@@ -2874,6 +2874,12 @@ impl Gui {
             .take(pane_count)
             .map(PaneState::overlay_picture_bytes_outstanding)
             .fold(0u64, u64::saturating_add);
+        // The figure the door spends, reported as the door's own peak. It is
+        // recorded here rather than at the subtraction below because this is
+        // the occupancy, and the difference matters at the ceiling: the
+        // subtraction saturates and would report a settled scene as an empty
+        // pipe.
+        crate::overlay_cache::ledger::note_door_occupancy(outstanding);
         squallar_device_profile::constants::MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING
             .saturating_sub(outstanding)
     }

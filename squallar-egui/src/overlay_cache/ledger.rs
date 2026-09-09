@@ -135,6 +135,10 @@ struct Counters {
     /// Dispatches withdrawn at the supersede seam before their answer was
     /// used.
     cancelled: AtomicU64,
+    door_refused: AtomicU64,
+    door_exempt: AtomicU64,
+    door_exempt_bytes: AtomicU64,
+    door_peak_bytes: AtomicU64,
     /// The last [`Totals::progress`] a caller was handed by
     /// [`totals_if_moved`].
     reported: AtomicU64,
@@ -155,6 +159,10 @@ impl Counters {
             promoted: AtomicU64::new(0),
             superseded: AtomicU64::new(0),
             cancelled: AtomicU64::new(0),
+            door_refused: AtomicU64::new(0),
+            door_exempt: AtomicU64::new(0),
+            door_exempt_bytes: AtomicU64::new(0),
+            door_peak_bytes: AtomicU64::new(0),
             reported: AtomicU64::new(0),
         }
     }
@@ -392,6 +400,47 @@ pub struct Totals {
     /// [`Self::arrivals_balance`] holds unchanged; what this figure names is
     /// raster work the pipeline declined to spend, not a fourth arrival exit.
     pub cancelled: u64,
+    /// **Asks the aggregate byte door turned away** — stale, admitted by
+    /// the per-cache limit, and refused for want of room in
+    /// `MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING`. The door's fires counter.
+    ///
+    /// Not a loss: the layer is still stale on the next frame and asks
+    /// again, so this counts *deferrals* and never dropped work. Zero with
+    /// [`Self::dispatched`] rising is a ceiling no scene reaches; rising with
+    /// [`Self::dispatched`] rising is the door doing the only thing it can
+    /// do.
+    pub door_refused: u64,
+    /// **Asks admitted past a ceiling that had nothing left** — the size of
+    /// the supersede exemption, counted rather than argued about.
+    ///
+    /// A re-ask under a cache that is already holding a picture skips the
+    /// aggregate ceiling entirely, on the argument that the replacement frees
+    /// what it replaces. It does, at the *arrival*; the door is asked at the
+    /// dispatch, and in between both buffers are resident. This counts the
+    /// asks that got through on that argument **and only when the ceiling was
+    /// already spent** — an exempt ask on a door with room is charged nothing
+    /// here, because it would have been afforded either way.
+    ///
+    /// Zero with [`Self::door_refused`] also zero is a ceiling no scene
+    /// reaches. Zero with [`Self::door_refused`] rising is an exemption that
+    /// never fires. Both rising is the door bounding one path while the other
+    /// walks past it.
+    pub door_exempt: u64,
+    /// Bytes of [`Self::door_exempt`], at each ask's own plan — what the pipe
+    /// was allowed to take on past a spent ceiling, summed over the run. A
+    /// flow and never a level: the same picture is counted once per ask, and
+    /// most of them are freed long before the next.
+    pub door_exempt_bytes: u64,
+    /// **The highest occupancy the door has ever subtracted** — bytes the
+    /// overlay pipe held at the frame with the most in it, summed over every
+    /// counted pane's caches by `Gui::overlay_dispatch_budget`.
+    ///
+    /// The peak-simultaneous residency figure for whole overlay pictures, and
+    /// the one to read against `MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING`. It is
+    /// the door's own view and therefore a **floor** on what the heap held: a
+    /// picture already promoted to the glass is out of this figure and still
+    /// on the heap until the pane replaces it.
+    pub door_peak_bytes: u64,
 }
 
 impl Totals {
@@ -537,7 +586,13 @@ impl Totals {
     /// How far along this ledger is, as one number, so a caller can tell
     /// "nothing has happened since I last looked" in a single compare.
     fn progress(&self) -> u64 {
-        self.dispatched + self.arrived + self.on_screen() + self.superseded + self.cancelled
+        self.dispatched
+            + self.arrived
+            + self.on_screen()
+            + self.superseded
+            + self.cancelled
+            + self.door_refused
+            + self.door_exempt
     }
 }
 
@@ -639,6 +694,33 @@ pub fn note_cancelled() {
     sink().cancelled.fetch_add(1, Relaxed);
 }
 
+/// Record an ask the **aggregate byte door** turned away — see
+/// [`Totals::door_refused`].
+///
+/// One relaxed `fetch_add` on the frame thread, which is where the door is
+/// asked; nothing here allocates, formats or takes a clock.
+pub fn note_door_refused() {
+    sink().door_refused.fetch_add(1, Relaxed);
+}
+
+/// Record an ask the **supersede exemption** let past a spent ceiling — see
+/// [`Totals::door_exempt`]. `bytes` is that ask's own plan.
+pub fn note_door_exempt(bytes: u64) {
+    let sink = sink();
+    sink.door_exempt.fetch_add(1, Relaxed);
+    sink.door_exempt_bytes.fetch_add(bytes, Relaxed);
+}
+
+/// Record the occupancy the door subtracted this frame — see
+/// [`Totals::door_peak_bytes`]. A load and, on the rare advance, one
+/// `fetch_max`.
+pub fn note_door_occupancy(bytes: u64) {
+    let sink = sink();
+    if sink.door_peak_bytes.load(Relaxed) < bytes {
+        sink.door_peak_bytes.fetch_max(bytes, Relaxed);
+    }
+}
+
 /// Read every counter.
 ///
 /// Nine [`Relaxed`] loads, and they are **not** an atomic snapshot: a
@@ -659,6 +741,10 @@ pub fn totals() -> Totals {
         promoted: sink.promoted.load(Relaxed),
         superseded: sink.superseded.load(Relaxed),
         cancelled: sink.cancelled.load(Relaxed),
+        door_refused: sink.door_refused.load(Relaxed),
+        door_exempt: sink.door_exempt.load(Relaxed),
+        door_exempt_bytes: sink.door_exempt_bytes.load(Relaxed),
+        door_peak_bytes: sink.door_peak_bytes.load(Relaxed),
         reasons: std::array::from_fn(|i| sink.reasons[i].load(Relaxed)),
         blank_reasons: std::array::from_fn(|i| sink.blank_reasons[i].load(Relaxed)),
     }
@@ -695,6 +781,10 @@ pub fn reset_for_test() {
     let sink = sink();
     for counter in [
         &sink.dispatched,
+        &sink.door_refused,
+        &sink.door_exempt,
+        &sink.door_exempt_bytes,
+        &sink.door_peak_bytes,
         &sink.arrived,
         &sink.dropped,
         &sink.pictures,

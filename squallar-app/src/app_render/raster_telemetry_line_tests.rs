@@ -122,7 +122,27 @@ fn the_rig_reads_the_lines_the_app_actually_writes() {
         // Nor in this one, and for the same reason: the blank split is its
         // own line. See `app_render::overlay_blank_line`.
         blank_reasons: [0; squallar_egui::overlay_cache::ledger::BlankReason::COUNT],
+        // The door's four, on their own line for the same reason again — and
+        // the rig has no probe for that one yet, so the sentence is asserted
+        // literally below rather than against a pattern it would have to
+        // invent. Distinct values, like every field above, so a transposition
+        // cannot read as correct.
+        door_refused: 101,
+        door_exempt: 202,
+        door_exempt_bytes: 303_000,
+        door_peak_bytes: 404_000_000,
     };
+    assert_eq!(
+        super::overlay_door_line(&rasters),
+        format!(
+            "overlay door: 404000000 B peak outstanding of {} B ceiling, \
+             101 refused, 202 exempt of 303000 B",
+            squallar_device_profile::constants::MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING,
+        ),
+        "the `overlay door:` line's fields have moved. Nothing scrapes it \
+         yet, so this assertion is the only thing holding the sentence to \
+         the counters it names",
+    );
     assert_eq!(
         super::overlay_raster_line(&rasters),
         rendered(
