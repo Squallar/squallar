@@ -100,6 +100,37 @@ pub const MESH_VERTICES: usize = SECTORS * (RINGS + 1) * 2;
 /// ring.
 pub const MESH_INDICES: usize = SECTORS * RINGS * 6;
 
+/// **Indices a sweep of `radials` radials occupies in the canonical mesh** —
+/// and therefore the whole of what a draw has to submit for it.
+///
+/// [`disk_mesh`] is sector-major: sector `s`'s six indices per ring are emitted
+/// before sector `s + 1`'s, so a sweep's sectors are the mesh's FIRST
+/// `radials`, contiguously, and `0..sector_indices(radials)` is exactly them.
+/// `the_canonical_mesh_is_sector_major_and_a_sweep_owns_its_prefix` is what
+/// holds that, decoded out of the mesh this function is about rather than
+/// asserted of it.
+///
+/// The mesh carries a sector per radial [`MAX_POLAR_RADIALS`] admits — 1440 —
+/// and both real WSR-88D shapes declare 720, so **half of every fan draw was a
+/// vertex stage run over sectors whose two triangles are degenerate by
+/// construction**. They were never pixels; they were `SECTORS - radials`
+/// wedges' worth of transcendentals per pane per frame, and the fragment stage
+/// could not see the difference.
+///
+/// The clamp is not a second opinion on [`admit`], which refuses a payload past
+/// [`MAX_POLAR_RADIALS`] before a callback is ever built. It bounds an index
+/// range handed straight to `draw_indexed`, which is a device error rather than
+/// a wrong picture if it runs off the buffer — and `paint` has no way to refuse
+/// a callback that reached it.
+pub const fn sector_indices(radials: u32) -> u32 {
+    let sectors = if radials < SECTORS as u32 {
+        radials
+    } else {
+        SECTORS as u32
+    };
+    sectors * RINGS as u32 * 6
+}
+
 /// Bits the sector index occupies in a mesh vertex.
 const SECTOR_BITS: u32 = 11;
 /// Bits the ring index occupies, above the sector.
@@ -582,6 +613,15 @@ pub struct RadarFanStore {
     /// which is also why they are the only counters here that are.
     recorded: AtomicU64,
     paints: AtomicU64,
+    /// Mesh indices those draws submitted.
+    ///
+    /// Always on, and for the same reason as the two above. "A draw submits
+    /// the sweep's own sectors and not the whole canonical mesh" is a claim
+    /// **the picture cannot report**: a surplus sector's triangles are
+    /// degenerate whether or not they are submitted, so a range that went back
+    /// to the whole mesh would draw an identical frame and only this number
+    /// would move.
+    drawn: AtomicU64,
     /// Callbacks that found no store — the one wiring mistake that produces an
     /// ordinary-looking map with no radar in it. Counted rather than logged:
     /// this crate declares no `log` dependency.
@@ -794,6 +834,7 @@ impl RadarFanStore {
             ring_writes: 0,
             recorded: AtomicU64::new(0),
             paints: AtomicU64::new(0),
+            drawn: AtomicU64::new(0),
             store_missing: AtomicU64::new(0),
             swept_pass: None,
         }
@@ -984,6 +1025,12 @@ impl RadarFanStore {
             self.recorded.load(Ordering::Relaxed),
             self.paints.load(Ordering::Relaxed),
         )
+    }
+
+    /// Mesh indices this store's draws have submitted, since the process
+    /// started. See the field.
+    pub fn indices_drawn(&self) -> u64 {
+        self.drawn.load(Ordering::Relaxed)
     }
 
     /// Callbacks that found no store in the callback resources.
@@ -1200,6 +1247,7 @@ impl egui_wgpu::CallbackTrait for RadarFanCallback {
             return;
         };
         let mut recorded = 0u64;
+        let mut drawn = 0u64;
         // **No `set_viewport`.** `tile_mesh` overrides egui's courtesy viewport
         // because its geometry is already placed in whole-screen points; the
         // fan does not, because the callback's rect IS the pane's map rect and
@@ -1220,11 +1268,20 @@ impl egui_wgpu::CallbackTrait for RadarFanCallback {
                 continue;
             };
             render_pass.set_bind_group(1, &resident.bind_group, &[]);
-            render_pass.draw_indexed(0..MESH_INDICES as u32, 0, 0..1);
+            // **The sweep's own sectors, not the whole canonical mesh.** The
+            // mesh carries one per radial `MAX_POLAR_RADIALS` admits and a
+            // real sweep declares half that; the rest are degenerate by
+            // construction and were being vertex-shaded anyway. See
+            // [`sector_indices`], which is also why this range is a prefix and
+            // needs no second index buffer, no rebuild and no cache.
+            let range = sector_indices(sweep.radials);
+            render_pass.draw_indexed(0..range, 0, 0..1);
             recorded += 2;
+            drawn += u64::from(range);
         }
         store.recorded.fetch_add(recorded, Ordering::Relaxed);
         store.paints.fetch_add(1, Ordering::Relaxed);
+        store.drawn.fetch_add(drawn, Ordering::Relaxed);
     }
 }
 
@@ -1281,6 +1338,85 @@ impl squallar_egui::radar_fan::RadarFanPainter for RadarFanBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A sweep's sectors are the canonical mesh's first `radials`, and
+    /// `sector_indices` names exactly them.**
+    ///
+    /// The whole of why a fan needs no second index buffer and no rebuild to
+    /// stop shading sectors it has no radial for. Decoded out of
+    /// [`disk_mesh`]'s own bytes through [`pack_vertex`]'s own fields, so this
+    /// is the mesh the pipeline is fed and not a second description of it.
+    ///
+    /// **The property an input needs to reach the defect**: a radial count
+    /// BELOW [`SECTORS`]. At `radials == SECTORS` the fitted range is the whole
+    /// mesh and every assertion below holds for a function that ignored its
+    /// argument. Both real WSR-88D shapes declare 720 against a 1440-sector
+    /// mesh, and the premise is asserted rather than assumed.
+    ///
+    /// The picture cannot report this: a surplus sector's drawn edges are
+    /// equal, so its triangles are degenerate whether they are submitted or
+    /// not, and a range that went back to the whole mesh would draw the same
+    /// frame. That is why `RadarFanStore::indices_drawn` exists and why this
+    /// suite reads the mesh rather than a readback.
+    ///
+    /// TAMPER: emit the mesh ring-major, or drop the `RINGS * 6` from
+    /// [`sector_indices`], and the prefix rows go red.
+    #[test]
+    fn the_canonical_mesh_is_sector_major_and_a_sweep_owns_its_prefix() {
+        let (vertex_bytes, index_bytes) = disk_mesh();
+        let vertices: Vec<u32> = vertex_bytes
+            .chunks_exact(4)
+            .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
+            .collect();
+        let indices: Vec<u32> = index_bytes
+            .chunks_exact(4)
+            .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
+            .collect();
+        assert_eq!(vertices.len(), MESH_VERTICES);
+        assert_eq!(indices.len(), MESH_INDICES);
+        assert_eq!(sector_indices(SECTORS as u32) as usize, MESH_INDICES);
+
+        // The two real WSR-88D radial counts and a coarse legacy one.
+        let mut checked = 0;
+        for radials in [720u32, 360, 180] {
+            assert!(
+                (radials as usize) < SECTORS,
+                "a sweep filling the mesh cannot show that the range fits it"
+            );
+            let range = sector_indices(radials) as usize;
+            assert!(range < MESH_INDICES, "the fitted range is the whole mesh");
+            // Every index inside the range names a vertex of a sector the
+            // sweep has a radial for...
+            for &index in &indices[..range] {
+                let sector = vertices[index as usize] & ((1 << SECTOR_BITS) - 1);
+                assert!(
+                    sector < radials,
+                    "index {index} inside a {radials}-radial sweep's range                      names sector {sector}, which the sweep has no radial for"
+                );
+                checked += 1;
+            }
+            // ...and every index outside it names one the sweep does not, so
+            // the range is exactly the sweep's sectors and never a prefix of
+            // them.
+            for &index in &indices[range..] {
+                let sector = vertices[index as usize] & ((1 << SECTOR_BITS) - 1);
+                assert!(
+                    sector >= radials,
+                    "index {index} outside a {radials}-radial sweep's range                      names sector {sector}, which the sweep DOES carry — the                      range drops geometry the picture needs"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 3 * MESH_INDICES, "the loop compared nothing");
+
+        // And the saving is the one the shapes make it: both real sweeps
+        // declare half the sectors the mesh carries.
+        assert_eq!(
+            sector_indices(720) as usize * 2,
+            MESH_INDICES,
+            "a 720-radial sweep no longer submits half the mesh"
+        );
+    }
 
     /// **The viewport this pass places a fan in is egui's own, at every scale
     /// factor** — not an approximation of it.

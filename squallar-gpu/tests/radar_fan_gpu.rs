@@ -1504,11 +1504,26 @@ fn sectors_past_the_sweeps_radials_draw_nothing() {
     );
 }
 
-/// **Six render-pass calls for one sweep, and two more for each extra one.**
+/// **Six render-pass calls for one sweep, and two more for each extra one —
+/// and each draw submits the sweep's own sectors, not the whole mesh.**
 ///
-/// The reason this path exists rather than a callback per radial. Counted by
-/// the store itself, always on, because a claim about a per-frame cost that
-/// nothing counts is prose.
+/// The call count is the reason this path exists rather than a callback per
+/// radial. The index count is the other half of a fan's per-frame price and
+/// **the picture cannot report it at all**: the canonical mesh carries a sector
+/// per radial `MAX_POLAR_RADIALS` admits (1440) and a real sweep declares half
+/// that, the surplus sectors' drawn edges are equal, and degenerate triangles
+/// paint the same nothing whether they are submitted or not. So a draw that
+/// went back to `0..MESH_INDICES` would render an identical frame and every
+/// readback in this file would still pass. Both are counted by the store
+/// itself, always on, because a claim about a per-frame cost that nothing
+/// counts is prose.
+///
+/// The fixture declares `RADIALS` of `SECTORS`, asserted below: at a sweep
+/// filling the mesh the fitted range IS the whole mesh and the assertion could
+/// not fail.
+///
+/// TAMPER: draw `0..MESH_INDICES` and the index rows go red while every pixel
+/// assertion in this file stays green.
 #[test]
 #[ignore = "needs a real wgpu adapter"]
 fn the_callback_records_six_calls_and_two_more_per_extra_sweep() {
@@ -1543,6 +1558,21 @@ fn the_callback_records_six_calls_and_two_more_per_extra_sweep() {
         assert_eq!(store.resident_sweeps(), sweeps);
         // One ring write for the pass, not one per draw.
         assert_eq!(store.view_writes(), (1, 1));
+
+        // A build failure rather than a row, because it is a statement about
+        // two constants: a fixture filling the mesh would make the fitted
+        // range the whole mesh and the row below could not fail.
+        const { assert!(RADIALS < SECTORS) };
+        assert_eq!(
+            store.indices_drawn(),
+            sweeps as u64 * squallar_gpu::radar_fan::sector_indices(RADIALS as u32) as u64,
+            "{sweeps} sweeps of {RADIALS} radials submitted {} indices against              a {MESH_INDICES}-index mesh; a fan draws the sectors its sweep              has radials for and the rest are degenerate by construction",
+            store.indices_drawn()
+        );
+        assert!(
+            store.indices_drawn() < sweeps as u64 * MESH_INDICES as u64,
+            "the fitted range is the whole mesh, so this row cannot fail"
+        );
     }
 }
 
