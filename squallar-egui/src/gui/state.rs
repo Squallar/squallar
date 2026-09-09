@@ -373,6 +373,12 @@ pub struct Gui {
     /// later; see `ui_pills.rs`'s module note on stacking for why the raise
     /// cannot happen on the debut frame itself. Session-only bookkeeping.
     pub(super) pills_raise_pending: bool,
+    /// The pill row's dimmed style, kept for as long as the style it was
+    /// derived from and the opacity it was derived at both hold. Session-only
+    /// bookkeeping, and never persisted: it is a pure function of two things
+    /// the frame already has, memoised because the idle row asks for the same
+    /// answer every frame. See `ui_pills.rs`'s `dim_visuals`.
+    pub(super) pill_dim_style: Option<crate::ui::pills::DimmedStyle>,
     /// Whether the pane pill rows render at full opacity unconditionally.
     pub(super) pin_pane_controls: bool,
     /// Whether the frame diagnostics overlay is showing — the Interface
@@ -730,6 +736,7 @@ impl Gui {
             pill_revealed: None,
             pills_drawn_last_frame: 0,
             pills_raise_pending: false,
+            pill_dim_style: None,
             pin_pane_controls: false,
             diagnostics_panel: false,
             memory_figures: false,

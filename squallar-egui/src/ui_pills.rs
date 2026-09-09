@@ -45,6 +45,183 @@ const SITE_LIST_HEIGHT: f32 = 150.0;
 /// `\u{2297} Solo` — in no group at all; the flags reach nobody.
 pub(super) const SYNC_PILL_SOLO: &str = "\u{2297} Solo";
 
+/// Dim every colour in `visuals` by `opacity` — the pill row's idle dimming,
+/// applied to the **colours** it is about to paint with instead of to the
+/// painter it paints through.
+///
+/// `ui.set_opacity` is not a layer composite. egui applies it per shape, on the
+/// way into the paint list: `Painter::add` calls
+/// `epaint::shape_transform::adjust_colors`, which `gamma_multiply`s every
+/// colour the shape carries. For a `TextShape` that means `Arc::make_mut` over
+/// the galley *and* over each of its rows — a deep clone of a cached, shared
+/// galley and of its vertex mesh, per pill, per pane, every frame. The row's
+/// idle state is a sub-1.0 opacity ([`PILL_IDLE_OPACITY`]), so a frame on which
+/// nothing is hovered and nothing is animating paid that clone for every pill
+/// it drew.
+///
+/// Because the factor is applied per shape and never to a composited layer,
+/// multiplying it into the colours first is not an approximation of the same
+/// picture: it is the same arithmetic on the same colours, one step earlier, so
+/// the shapes that reach the paint list are equal — asserted in
+/// `dimming_the_colours_paints_exactly_what_dimming_the_painter_painted`. What
+/// changes is that `Painter::add` then takes its untransformed path and the
+/// galleys are never cloned.
+///
+/// Every colour-bearing field of `egui::Visuals` is dimmed, and the struct is
+/// destructured exhaustively so that a field added by a future egui fails the
+/// build here rather than silently painting one part of the row at full
+/// strength. `Color32::PLACEHOLDER` is skipped for the reason egui skips it: it
+/// is a sentinel a later stage replaces, not a colour.
+///
+/// One colour is *not* exactly equivalent, and the row does not paint it:
+/// `Visuals::weak_text_color()`, when the app leaves it unset, is derived by a
+/// second `gamma_multiply` off `text_color()`, so dimming first gives
+/// `gm(gm(c, o), a)` where the painter gave `gm(gm(c, a), o)` — two `u8`
+/// roundings against one, up to one least-significant bit apart per channel.
+/// Nothing in the row draws weak text; setting the field to close the gap would
+/// be worse than the gap, because a colour present in `Visuals` is a colour
+/// egui bakes into the `LayoutJob`, which re-keys the galley cache and makes
+/// the two spellings paint structurally different shapes.
+fn dim_visuals(visuals: &mut egui::Visuals, opacity: f32) {
+    let dim = |c: &mut egui::Color32| {
+        if *c != egui::Color32::PLACEHOLDER {
+            *c = c.gamma_multiply(opacity);
+        }
+    };
+    let dim_stroke = |s: &mut egui::Stroke| dim(&mut s.color);
+
+    let egui::Visuals {
+        dark_mode: _,
+        text_options: _,
+        override_text_color,
+        weak_text_alpha: _,
+        weak_text_color,
+        widgets,
+        selection,
+        ime_composition,
+        hyperlink_color,
+        faint_bg_color,
+        extreme_bg_color,
+        text_edit_bg_color,
+        code_bg_color,
+        warn_fg_color,
+        error_fg_color,
+        window_corner_radius: _,
+        window_shadow,
+        window_fill,
+        window_stroke,
+        window_highlight_topmost: _,
+        menu_corner_radius: _,
+        panel_fill,
+        popup_shadow,
+        resize_corner_size: _,
+        text_cursor,
+        clip_rect_margin: _,
+        button_frame: _,
+        collapsing_header_frame: _,
+        indent_has_left_vline: _,
+        striped: _,
+        slider_trailing_fill: _,
+        handle_shape: _,
+        interact_cursor: _,
+        image_loading_spinners: _,
+        numeric_color_space: _,
+        // Not a colour: `Ui::disable` multiplies the painter by it, which is
+        // why a fading row keeps the painter (see `render_pill_row`).
+        disabled_alpha: _,
+    } = visuals;
+
+    // Dimmed where the app has set them, never *introduced*: a colour written
+    // into `Visuals` here is a colour egui writes into the `LayoutJob` at
+    // layout time, which both re-keys the galley cache and moves the dimming
+    // out of the shape and into the text run. Left alone, the row's galleys
+    // stay `Color32::PLACEHOLDER` and the one colour that reaches the shape is
+    // `visuals.text_color()` — which is `widgets.noninteractive.fg_stroke`,
+    // dimmed below.
+    if let Some(colour) = override_text_color.as_mut() {
+        dim(colour);
+    }
+    if let Some(colour) = weak_text_color.as_mut() {
+        dim(colour);
+    }
+
+    let egui::style::Widgets {
+        noninteractive,
+        inactive,
+        hovered,
+        active,
+        open,
+    } = widgets;
+    for w in [noninteractive, inactive, hovered, active, open] {
+        dim(&mut w.bg_fill);
+        dim(&mut w.weak_bg_fill);
+        dim_stroke(&mut w.bg_stroke);
+        dim_stroke(&mut w.fg_stroke);
+    }
+
+    dim(&mut selection.bg_fill);
+    dim_stroke(&mut selection.stroke);
+    dim_stroke(&mut ime_composition.active_underline_stroke);
+    dim_stroke(&mut ime_composition.inactive_underline_stroke);
+    dim(hyperlink_color);
+    dim(faint_bg_color);
+    dim(extreme_bg_color);
+    if let Some(colour) = text_edit_bg_color.as_mut() {
+        dim(colour);
+    }
+    dim(code_bg_color);
+    dim(warn_fg_color);
+    dim(error_fg_color);
+    dim(&mut window_shadow.color);
+    dim(window_fill);
+    dim_stroke(window_stroke);
+    dim(panel_fill);
+    dim(&mut popup_shadow.color);
+    dim_stroke(&mut text_cursor.stroke);
+}
+
+/// A dimmed [`egui::Style`] and the two inputs it was derived from.
+///
+/// The pill row's dimming is a pure function of the style it inherits and the
+/// opacity it is drawn at, and in the idle steady state neither moves — so a
+/// frame that recomputed it walked ~45 colours through `gamma_multiply` to
+/// arrive at last frame's answer. The source `Arc` is **held**, not just
+/// addressed: a pointer compared against an `Arc` nobody owns is comparing
+/// against an address the allocator is free to hand to a different `Style`.
+#[derive(Clone)]
+pub(crate) struct DimmedStyle {
+    source: std::sync::Arc<egui::Style>,
+    opacity_bits: u32,
+    dimmed: std::sync::Arc<egui::Style>,
+}
+
+impl super::Gui {
+    /// `source` with every colour dimmed by `opacity`, from the memo when the
+    /// memo was derived from this same style at this same opacity.
+    fn dimmed_pill_style(
+        &mut self,
+        source: &std::sync::Arc<egui::Style>,
+        opacity: f32,
+    ) -> std::sync::Arc<egui::Style> {
+        let opacity_bits = opacity.to_bits();
+        if let Some(memo) = &self.pill_dim_style
+            && memo.opacity_bits == opacity_bits
+            && std::sync::Arc::ptr_eq(&memo.source, source)
+        {
+            return std::sync::Arc::clone(&memo.dimmed);
+        }
+        let mut style = (**source).clone();
+        dim_visuals(&mut style.visuals, opacity);
+        let dimmed = std::sync::Arc::new(style);
+        self.pill_dim_style = Some(DimmedStyle {
+            source: std::sync::Arc::clone(source),
+            opacity_bits,
+            dimmed: std::sync::Arc::clone(&dimmed),
+        });
+        dimmed
+    }
+}
+
 fn sync_pill_label(group: Option<crate::pane::GroupId>, fully_linked: bool) -> String {
     match group {
         None => SYNC_PILL_SOLO.to_owned(),
@@ -1345,9 +1522,18 @@ impl super::Gui {
             .order(egui::Order::Middle)
             .fixed_pos(pane_rect.min + egui::vec2(PILL_INSET, PILL_INSET))
             .show(ctx, |ui| {
-                ui.set_opacity(row_opacity);
                 if chrome < 1.0 {
+                    // The chrome fade dims and disables together, and
+                    // `Ui::disable` multiplies the painter a second time. Two
+                    // factors egui folds into one before it touches a colour,
+                    // so this arm leaves both where they were: a fading row is
+                    // the picture it has always been, down to the byte.
+                    ui.set_opacity(row_opacity);
                     ui.disable();
+                } else if row_opacity < 1.0 && row_opacity.is_finite() {
+                    let source = std::sync::Arc::clone(ui.style());
+                    let dimmed = self.dimmed_pill_style(&source, row_opacity.clamp(0.0, 1.0));
+                    ui.set_style(dimmed);
                 }
                 ui.set_max_width((pane_rect.width() - 2.0 * PILL_INSET).max(40.0));
                 ui.horizontal_wrapped(|ui| {
@@ -1794,6 +1980,201 @@ mod clearance_tests {
             pill_row_clearance(&ctx, 1),
             PILL_ROW_CLEARANCE,
             "a pane with no measured row keeps the one-row floor"
+        );
+    }
+}
+
+/// **The idle row's dimming is a colour change, not a painter change** — and
+/// the two must reach the paint list as the same shapes.
+#[cfg(test)]
+mod dim_tests {
+    use super::{PILL_IDLE_OPACITY, dim_visuals};
+
+    /// The production spelling, minus the memo: `render_pill_row` swaps the
+    /// `Ui`'s whole style for a dimmed clone of it.
+    fn dim_row(ui: &mut egui::Ui, opacity: f32) {
+        let mut style = (**ui.style()).clone();
+        dim_visuals(&mut style.visuals, opacity);
+        ui.set_style(style);
+    }
+
+    /// The pill row's whole widget vocabulary: a wrapped strip of text
+    /// buttons, one of them carrying a label body of the kind the Sync pill's
+    /// hover puts on the glass. Everything the row paints is in here, which is
+    /// what makes a shape-for-shape comparison over it a statement about the
+    /// row rather than about buttons in general.
+    fn draw_row(ui: &mut egui::Ui) {
+        ui.set_max_width(400.0);
+        ui.horizontal_wrapped(|ui| {
+            for label in ["1", "KTLX", "REF", "0.5\u{b0}", "A\u{2022}", "Map"] {
+                let _ = ui.button(label);
+            }
+            ui.add(egui::Label::new("linked with pane 2"));
+        });
+    }
+
+    /// One pass of [`draw_row`] inside an `Area`, dimmed by `dim`, returned as
+    /// the shapes it put on the glass.
+    fn shapes(
+        ctx: &egui::Context,
+        dim: impl FnOnce(&mut egui::Ui),
+    ) -> Vec<egui::epaint::ClippedShape> {
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        });
+        egui::Area::new(egui::Id::new("dim_probe"))
+            .fade_in(false)
+            .fixed_pos(egui::pos2(8.0, 8.0))
+            .show(ctx, |ui| {
+                dim(ui);
+                draw_row(ui);
+            });
+        ctx.end_pass().shapes
+    }
+
+    /// The equivalence the cut rests on: multiplying the factor into the
+    /// colours up front and letting egui multiply it into each shape on the
+    /// way into the paint list produce the *same shapes*, byte for byte.
+    ///
+    /// This is not a general claim about opacity. It holds because
+    /// `ui.set_opacity` is not a layer composite — egui applies the factor per
+    /// shape, to that shape's own colours — so the two spellings differ only in
+    /// where the same multiplication happens. A shape list is what the
+    /// tessellator turns into pixels, so equal shape lists are equal pixels.
+    #[test]
+    fn dimming_the_colours_paints_exactly_what_dimming_the_painter_painted() {
+        for opacity in [PILL_IDLE_OPACITY, 0.5, 0.87, 1.0] {
+            let ctx = egui::Context::default();
+            // Two passes each: the first sizes the area, and only the second
+            // paints the row where it will really sit.
+            let mut painter_dimmed = Vec::new();
+            let mut colour_dimmed = Vec::new();
+            for _ in 0..2 {
+                painter_dimmed = shapes(&ctx, |ui| ui.set_opacity(opacity));
+            }
+            let ctx = egui::Context::default();
+            for _ in 0..2 {
+                colour_dimmed = shapes(&ctx, |ui| dim_row(ui, opacity));
+            }
+            assert!(
+                !painter_dimmed.is_empty(),
+                "the probe row painted nothing at opacity {opacity}, so the \
+                 comparison below is vacuous"
+            );
+            assert!(
+                painter_dimmed
+                    .iter()
+                    .any(|s| matches!(s.shape, egui::Shape::Text(_))),
+                "the probe row painted no text at opacity {opacity}, and the \
+                 galley is the shape this cut exists to stop cloning"
+            );
+            assert_eq!(
+                colour_dimmed, painter_dimmed,
+                "dimming the colours at {opacity} did not paint what dimming \
+                 the painter painted"
+            );
+        }
+    }
+
+    /// The cut itself, stated as the thing that makes it a cut: after the
+    /// colours are dimmed the painter is still at 1.0, so `Painter::add` never
+    /// enters `adjust_colors` and no galley is cloned.
+    #[test]
+    fn a_colour_dimmed_row_paints_through_a_full_strength_painter() {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        });
+        egui::Area::new(egui::Id::new("dim_probe"))
+            .fade_in(false)
+            .show(&ctx, |ui| {
+                let painter_before = ui.painter().opacity();
+                let fill_before = ui.visuals().widgets.inactive.weak_bg_fill;
+                dim_row(ui, PILL_IDLE_OPACITY);
+                assert_eq!(
+                    ui.painter().opacity(),
+                    painter_before,
+                    "the idle row moved the painter, which is the cost this cut \
+                     exists to stop paying"
+                );
+                assert_eq!(
+                    ui.visuals().widgets.inactive.weak_bg_fill,
+                    fill_before.gamma_multiply(PILL_IDLE_OPACITY),
+                    "a pill's own fill was not dimmed"
+                );
+            });
+        let _ = ctx.end_pass();
+    }
+}
+
+/// **The dimmed style is memoised on the two things it is derived from**, and
+/// nothing else.
+#[cfg(test)]
+mod dim_memo_tests {
+    use crate::Gui;
+
+    fn style(alpha: u8) -> std::sync::Arc<egui::Style> {
+        let mut style = egui::Style::default();
+        style.visuals.widgets.inactive.weak_bg_fill =
+            egui::Color32::from_rgba_unmultiplied(10, 20, 30, alpha);
+        std::sync::Arc::new(style)
+    }
+
+    /// A second ask at the same style and the same opacity is the *same*
+    /// allocation, and either input moving produces a new one.
+    #[test]
+    fn the_memo_holds_for_one_style_at_one_opacity_and_no_further() {
+        let mut gui = Gui::new();
+        let source = style(255);
+        let first = gui.dimmed_pill_style(&source, 0.35);
+        let again = gui.dimmed_pill_style(&source, 0.35);
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &again),
+            "the second ask rebuilt the style"
+        );
+
+        let other_opacity = gui.dimmed_pill_style(&source, 0.7);
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &other_opacity),
+            "a different opacity was served last opacity's colours"
+        );
+
+        // A different style, and the old one dropped first: the memo holds its
+        // source, so this address cannot be the old one's.
+        let other_source = style(128);
+        let other = gui.dimmed_pill_style(&other_source, 0.35);
+        assert_eq!(
+            other.visuals.widgets.inactive.weak_bg_fill,
+            other_source
+                .visuals
+                .widgets
+                .inactive
+                .weak_bg_fill
+                .gamma_multiply(0.35),
+            "a different style was served the previous style's colours"
+        );
+    }
+
+    /// The memoised answer is the answer, not a stale one: it is what
+    /// `dim_visuals` produces from the same inputs.
+    #[test]
+    fn the_memoised_style_is_the_dimmed_style() {
+        let mut gui = Gui::new();
+        let source = style(255);
+        let memoised = gui.dimmed_pill_style(&source, super::PILL_IDLE_OPACITY);
+        let mut expected = (*source).clone();
+        super::dim_visuals(&mut expected.visuals, super::PILL_IDLE_OPACITY);
+        assert_eq!(
+            memoised.visuals, expected.visuals,
+            "the memo served something other than the dimmed style"
         );
     }
 }
