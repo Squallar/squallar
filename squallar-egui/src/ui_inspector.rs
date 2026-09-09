@@ -370,7 +370,7 @@ impl super::Gui {
             map::pane_render::resolved_layer_opacity(&self.overlays, self.active_pane, pane, kind);
         let mut percent = (resolved * 100.0).round();
         let shown = percent;
-        let name = self.overlays.display_name(kind).to_owned();
+        let name = self.overlays.display_name(kind);
         let row = ui.horizontal(|ui| {
             ui.label(OPACITY_LABEL);
             ui.add(
@@ -379,10 +379,15 @@ impl super::Gui {
                     .suffix("%")
                     .clamping(egui::SliderClamping::Always),
             )
-            .on_hover_text(format!(
-                "How strongly {name} paints over the layers beneath it in this pane. \
-                 Linked panes share it."
-            ))
+            // `on_hover_ui`, not `on_hover_text`: the latter takes its text
+            // ALREADY built, so an expanded layer body owned the layer's name
+            // and formatted this sentence over it on every frame, for a
+            // tooltip nobody was hovering. Two allocations a frame per open
+            // body; egui runs this one only while the tooltip is up.
+            .on_hover_ui(|ui| {
+                ui.set_max_width(ui.spacing().tooltip_width);
+                ui.add(egui::Label::new(layer_opacity_hover(name)));
+            })
         });
         if (percent - shown).abs() > f32::EPSILON {
             pane.set_layer_opacity(kind, percent / 100.0);
@@ -576,4 +581,18 @@ impl super::Gui {
             // and the site search is one control among many in it.
         });
     }
+}
+
+/// What the layer-opacity slider says on hover.
+///
+/// A function rather than an argument: `Response::on_hover_text` takes its
+/// text already made, so the frame path can only leave this unbuilt by
+/// putting it inside the `on_hover_ui` body.
+fn layer_opacity_hover(name: &str) -> String {
+    #[cfg(test)]
+    crate::ui::hover_text_count::note();
+    format!(
+        "How strongly {name} paints over the layers beneath it in this pane. \
+         Linked panes share it."
+    )
 }

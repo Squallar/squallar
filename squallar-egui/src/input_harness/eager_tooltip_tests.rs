@@ -97,3 +97,56 @@ fn a_frame_hovering_nothing_builds_no_play_button_tooltip_string() {
          One is the word it draws; zero is a tooltip with nothing in it."
     );
 }
+
+/// **A layer body's opacity slider does not build its hover sentence on a
+/// frame nobody is hovering.**
+///
+/// Two allocations, not one: the layer's display name was owned so the
+/// `format!` could interpolate it, and neither was read on a frame with no
+/// tooltip up. The inspector is a standing panel, so an expanded body pays
+/// this on every frame it is open.
+#[test]
+fn a_frame_hovering_nothing_builds_no_layer_opacity_tooltip_string() {
+    let mut h = InputHarness::new();
+    h.open_layer_in_inspector(&known::RADAR);
+    h.warm_up();
+
+    let slider = h
+        .control_items()
+        .into_iter()
+        .find(|item| {
+            item.handler.as_ref() == Some(&known::RADAR) && item.label == crate::ui::OPACITY_LABEL
+        })
+        .expect("premise: an open layer body must draw its opacity slider")
+        .rect;
+
+    h.mouse_move(nowhere(&h));
+    h.frames_for(4, 0.1);
+    hover_text_count::reset();
+    h.frame();
+    let closed = hover_text_count::read();
+    assert_eq!(
+        closed, 0,
+        "a frame hovering nothing built {closed} opacity tooltip string(s), \
+         each a `format!` over an owned layer name nobody read."
+    );
+
+    h.mouse_move(slider.center());
+    h.frames_for(12, 0.1);
+    assert!(
+        h.painted_text_strings()
+            .iter()
+            .any(|t| t.contains("paints over the layers beneath it")),
+        "premise: hovering the opacity slider must raise its tooltip; \
+         painted: {:?}",
+        h.painted_text_strings()
+    );
+    hover_text_count::reset();
+    h.frame();
+    let open = hover_text_count::read();
+    assert_eq!(
+        open, 1,
+        "a frame with the opacity tooltip OPEN built {open} string(s). One is \
+         the sentence it draws; zero is an empty tooltip."
+    );
+}
