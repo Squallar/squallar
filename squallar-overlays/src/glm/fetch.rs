@@ -824,9 +824,11 @@ async fn list_glm_files(
                 ));
             }
 
-            let body = resp.text().await.map_err(|e| {
-                FetchError::from_transport(&e, format!("Failed to read S3 list response: {e}"))
-            })?;
+            let body = squallar_source::http::body_to_string(resp)
+                .await
+                .map_err(|e| {
+                    FetchError::from_transport(&e, format!("Failed to read S3 list response: {e}"))
+                })?;
 
             let doc = roxmltree::Document::parse(&body)
                 .map_err(|e| FetchError::transient(format!("Failed to parse S3 XML: {e}")))?;

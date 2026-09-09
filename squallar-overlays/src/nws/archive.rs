@@ -172,9 +172,10 @@ pub async fn fetch_archived_alerts(
         )));
     }
 
-    let body: serde_json::Value = response
-        .json()
+    let raw = squallar_source::http::body_to_vec(response)
         .await
+        .map_err(|e| FetchError::permanent(format!("archived NWS alerts were not read: {e}")))?;
+    let body: serde_json::Value = serde_json::from_slice(&raw)
         .map_err(|e| FetchError::permanent(format!("archived NWS alerts were not JSON: {e}")))?;
 
     let alerts: Vec<NwsAlert> = super::alert::parse_alerts(&translate(&body));

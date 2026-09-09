@@ -65,7 +65,7 @@ pub async fn fetch_env_heights(sources: &DataSources, lat: f64, lon: f64) -> Opt
         log::warn!("Sounding fetch: HTTP {} from {url}", response.status());
         return None;
     }
-    let body = response.text().await.ok()?;
+    let body = squallar_source::http::body_to_string(response).await.ok()?;
     let (h0c_km_msl, hm20c_km_msl) = parse_env_heights(&body)?;
     Some(EnvHeights {
         h0c_km_msl,

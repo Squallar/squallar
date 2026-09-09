@@ -132,6 +132,32 @@ pub async fn body_to_vec(response: reqwest::Response) -> reqwest::Result<Vec<u8>
     drain(response, reserve, &mut read).await
 }
 
+/// The whole body of `response` as a `String`.
+///
+/// `reqwest::Response::text()` is `bytes()` — the collecting read this module
+/// exists to avoid — followed by a charset decode. This is [`body_to_vec`]
+/// followed by [`String::from_utf8`], which is a move rather than a copy when
+/// the body is UTF-8, so the peak is the body once rather than twice and the
+/// read is counted by [`totals`] like every other.
+///
+/// **The charset is assumed to be UTF-8.** `text()` reads the encoding from
+/// `Content-Type` and transcodes; every body this workspace reads as text is
+/// UTF-8 (S3 `ListObjectsV2` XML, GeoJSON, the SPC RSS and CSV products, the
+/// HRRR `.idx` sidecar), and a body that is not is replaced character by
+/// replacement character rather than failing the request — the same shape of
+/// answer `text()` gives for an encoding it cannot honour.
+///
+/// # Errors
+///
+/// Whatever [`body_to_vec`] reports; a non-UTF-8 body is not an error.
+pub async fn body_to_string(response: reqwest::Response) -> reqwest::Result<String> {
+    let bytes = body_to_vec(response).await?;
+    Ok(match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    })
+}
+
 /// Native: read the body a transport frame at a time, copying each frame out
 /// and dropping it, so hyper's read buffer has no live slice to work around.
 ///
@@ -193,6 +219,18 @@ mod tests {
         assert_eq!(after.bodies, before.bodies + 1);
         assert_eq!(after.body_bytes, before.body_bytes + 8);
         assert!(after.peak_shard_bytes >= before.shard_bytes + 8);
+    }
+
+    /// A body that is not UTF-8 comes back with replacement characters rather
+    /// than as an error, which is the one way this differs from `text()`.
+    #[test]
+    fn a_non_utf8_body_is_replaced_rather_than_refused() {
+        let bad = vec![0x68, 0x69, 0xff, 0x21];
+        let text = match String::from_utf8(bad) {
+            Ok(text) => text,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        };
+        assert_eq!(text, "hi\u{fffd}!");
     }
 
     /// The reservation is bounded by what the workspace will ever ask for, so

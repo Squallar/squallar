@@ -57,9 +57,11 @@ pub async fn fetch_outlook(
         ));
     }
 
-    let text = response.text().await.map_err(|e| {
-        FetchError::from_transport(&e, format!("Failed to read response body: {e}"))
-    })?;
+    let text = squallar_source::http::body_to_string(response)
+        .await
+        .map_err(|e| {
+            FetchError::from_transport(&e, format!("Failed to read response body: {e}"))
+        })?;
 
     let json: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| FetchError::transient(format!("Invalid JSON from {url}: {e}")))?;
@@ -92,9 +94,11 @@ pub async fn fetch_firewx(
         ));
     }
 
-    let text = response.text().await.map_err(|e| {
-        FetchError::from_transport(&e, format!("Failed to read response body: {e}"))
-    })?;
+    let text = squallar_source::http::body_to_string(response)
+        .await
+        .map_err(|e| {
+            FetchError::from_transport(&e, format!("Failed to read response body: {e}"))
+        })?;
 
     let json: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| FetchError::transient(format!("Invalid JSON from {url}: {e}")))?;
@@ -125,9 +129,11 @@ pub async fn fetch_active_discussions(
         ));
     }
 
-    let text = response.text().await.map_err(|e| {
-        FetchError::from_transport(&e, format!("Failed to read SPC MD RSS body: {e}"))
-    })?;
+    let text = squallar_source::http::body_to_string(response)
+        .await
+        .map_err(|e| {
+            FetchError::from_transport(&e, format!("Failed to read SPC MD RSS body: {e}"))
+        })?;
 
     parse_md_rss(&text).map_err(FetchError::transient)
 }

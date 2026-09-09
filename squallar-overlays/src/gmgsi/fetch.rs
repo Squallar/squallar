@@ -80,9 +80,11 @@ pub(crate) async fn list_hour(
             format!("GMGSI listing returned HTTP {}", resp.status()),
         ));
     }
-    let body = resp.text().await.map_err(|e| {
-        FetchError::from_transport(&e, format!("GMGSI listing body read failed: {e}"))
-    })?;
+    let body = squallar_source::http::body_to_string(resp)
+        .await
+        .map_err(|e| {
+            FetchError::from_transport(&e, format!("GMGSI listing body read failed: {e}"))
+        })?;
     Ok(newest_blend_key(&body, channel))
 }
 

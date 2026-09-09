@@ -85,9 +85,10 @@ pub async fn fetch_archived_discussions(
             "archived MD index returned {status} for {url}"
         )));
     }
-    let index: serde_json::Value = response
-        .json()
+    let raw = squallar_source::http::body_to_vec(response)
         .await
+        .map_err(|e| FetchError::permanent(format!("the archived MD index was not read: {e}")))?;
+    let index: serde_json::Value = serde_json::from_slice(&raw)
         .map_err(|e| FetchError::permanent(format!("the archived MD index was not JSON: {e}")))?;
 
     let entries = index_entries(&index);
@@ -95,7 +96,7 @@ pub async fn fetch_archived_discussions(
     for (product_id, year, number) in entries {
         let text_url = sources.nws_text_product_url(&product_id);
         let body = match client.get(&text_url).send().await {
-            Ok(r) if r.status().is_success() => r.text().await.ok(),
+            Ok(r) if r.status().is_success() => squallar_source::http::body_to_string(r).await.ok(),
             Ok(r) => {
                 log::warn!("archived MD {product_id} returned {}", r.status());
                 None

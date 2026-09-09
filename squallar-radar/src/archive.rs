@@ -335,7 +335,7 @@ fn classify(status: StatusCode) -> StatusClass {
 pub(crate) async fn get_text(client: &reqwest::Client, url: String) -> Result<String> {
     let response = client.get(&url).send().await?;
     match classify(response.status()) {
-        StatusClass::Ok => Ok(response.text().await?),
+        StatusClass::Ok => Ok(squallar_source::http::body_to_string(response).await?),
         StatusClass::NotFound => Err(ArchiveError::NotFound(url)),
         StatusClass::Failed => {
             let status = response.status();

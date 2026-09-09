@@ -240,9 +240,11 @@ async fn fetch_csv(
         ));
     }
 
-    let text = response.text().await.map_err(|e| {
-        FetchError::from_transport(&e, format!("Failed to read response body: {e}"))
-    })?;
+    let text = squallar_source::http::body_to_string(response)
+        .await
+        .map_err(|e| {
+            FetchError::from_transport(&e, format!("Failed to read response body: {e}"))
+        })?;
 
     parse_csv(&text, kind, anchor).map_err(FetchError::transient)
 }

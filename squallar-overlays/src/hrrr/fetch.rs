@@ -297,9 +297,11 @@ async fn list_runs_for_day(
                 format!("S3 returned HTTP {}", resp.status()),
             ));
         }
-        let body = resp.text().await.map_err(|e| {
-            FetchError::from_transport(&e, format!("Failed to read S3 list response: {e}"))
-        })?;
+        let body = squallar_source::http::body_to_string(resp)
+            .await
+            .map_err(|e| {
+                FetchError::from_transport(&e, format!("Failed to read S3 list response: {e}"))
+            })?;
 
         let doc = roxmltree::Document::parse(&body)
             .map_err(|e| FetchError::transient(format!("Failed to parse S3 XML: {e}")))?;
@@ -653,8 +655,7 @@ async fn fetch_record(
             format!("index {idx_url}: HTTP {}", idx_response.status()),
         ));
     }
-    let idx_text = idx_response
-        .text()
+    let idx_text = squallar_source::http::body_to_string(idx_response)
         .await
         .map_err(|e| FetchError::from_transport(&e, format!("index body read failed: {e}")))?;
 

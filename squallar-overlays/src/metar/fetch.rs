@@ -240,7 +240,7 @@ pub async fn fetch_current_metars(
     let requests = states.iter().map(|state| {
         let url = sources.metar_state_url(state);
         async move {
-            let body = client
+            let response = client
                 .get(&url)
                 .send()
                 .await
@@ -248,8 +248,8 @@ pub async fn fetch_current_metars(
                     FetchError::from_transport(&e, format!("{state}: request failed: {e}"))
                 })?
                 .error_for_status()
-                .map_err(|e| FetchError::from_transport(&e, format!("{state}: {e}")))?
-                .text()
+                .map_err(|e| FetchError::from_transport(&e, format!("{state}: {e}")))?;
+            let body = squallar_source::http::body_to_string(response)
                 .await
                 .map_err(|e| {
                     FetchError::from_transport(&e, format!("{state}: body read failed: {e}"))

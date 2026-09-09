@@ -295,7 +295,7 @@ async fn fetch_station_positions(
         log::debug!("site catalogue: HTTP {} from {url}", response.status());
         return None;
     }
-    let body = response.text().await.ok()?;
+    let body = squallar_source::http::body_to_string(response).await.ok()?;
     let stations = parse_stations(&body);
     if stations.is_empty() {
         log::debug!("site catalogue: {url} placed no stations");

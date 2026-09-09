@@ -388,10 +388,12 @@ async fn fetch_zone_json(
         return Err(ZoneFailure::Http(response.status().as_u16()));
     }
 
-    let text = response.text().await.map_err(|e| {
-        log::debug!("Failed to read zone response body for {}: {}", url, e);
-        ZoneFailure::Unreadable
-    })?;
+    let text = squallar_source::http::body_to_string(response)
+        .await
+        .map_err(|e| {
+            log::debug!("Failed to read zone response body for {}: {}", url, e);
+            ZoneFailure::Unreadable
+        })?;
 
     serde_json::from_str(&text).map_err(|e| {
         log::debug!("Invalid JSON from zone {}: {}", url, e);

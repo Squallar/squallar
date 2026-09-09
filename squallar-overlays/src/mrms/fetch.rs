@@ -122,9 +122,11 @@ pub(crate) async fn list_day(
                 format!("MRMS listing returned HTTP {}", resp.status()),
             ));
         }
-        let body = resp.text().await.map_err(|e| {
-            FetchError::from_transport(&e, format!("MRMS listing body read failed: {e}"))
-        })?;
+        let body = squallar_source::http::body_to_string(resp)
+            .await
+            .map_err(|e| {
+                FetchError::from_transport(&e, format!("MRMS listing body read failed: {e}"))
+            })?;
 
         let doc = roxmltree::Document::parse(&body)
             .map_err(|e| FetchError::transient(format!("MRMS listing is not XML: {e}")))?;

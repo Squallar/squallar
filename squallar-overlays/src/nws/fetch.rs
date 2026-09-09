@@ -63,9 +63,11 @@ pub async fn fetch_active_alerts(
         ));
     }
 
-    let text = response.text().await.map_err(|e| {
-        FetchError::from_transport(&e, format!("Failed to read NWS alerts response body: {e}"))
-    })?;
+    let text = squallar_source::http::body_to_string(response)
+        .await
+        .map_err(|e| {
+            FetchError::from_transport(&e, format!("Failed to read NWS alerts response body: {e}"))
+        })?;
 
     let json: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| FetchError::transient(format!("Invalid JSON from NWS alerts: {e}")))?;
