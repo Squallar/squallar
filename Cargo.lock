@@ -5039,6 +5039,7 @@ name = "squallar-netcdf"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "flate2",
  "hdf5-pure",
  "log",
  "serde_json",

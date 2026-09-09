@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::bandstream;
 use crate::cf::{self, CfAttr, RawValues, RawVar, VarType};
 use hdf5_pure::{AttrValue, DType, DatasetAccessProperties, Datatype, DatatypeByteOrder};
 
@@ -239,11 +240,16 @@ impl Granule {
     /// appended from it, so no width is refused and no CF rule is spelled
     /// twice.
     ///
-    /// What this cannot remove: `hdf5_pure` 0.44 offers a whole-dataset read
-    /// and a first-dimension row window and nothing finer, so the assembled
-    /// stored bytes — 60,000,000 B for that raster — are still one block, held
-    /// for the length of this call. Per granule that is one transient block
-    /// where there were three.
+    /// **And the stored bytes are not one block either.** `hdf5_pure` 0.44
+    /// offers a whole-dataset read and a first-dimension row window and
+    /// nothing finer, so a `(time=1, yc, xc)` variable — whose first dimension
+    /// is one row — had no window at all, and its 60,000,000 B of assembled
+    /// storage was the very block this appending form exists to remove, taken
+    /// one layer down. [`crate::bandstream`] reads such a variable at the
+    /// granularity it is *stored* in instead, holding one band of chunks:
+    /// 16,773,536 B for that raster, four blocks rather than thirty-three, and
+    /// the whole variable never exists. A variable it cannot reproduce exactly
+    /// takes the whole read, unchanged.
     pub fn read_unpacked_f32_into(
         &self,
         name: &str,
@@ -321,6 +327,22 @@ impl Granule {
         };
 
         let (packing, _units) = cf::Packing::resolve(var.vartype, var.unsigned, &var.attrs, name);
+
+        // **The storage is chunked far finer than the variable, so read it
+        // that way.** `hdf5_pure`'s narrowest read is a window along the first
+        // dimension, and `data(time=1, yc, xc)` has one row there — but its
+        // chunks are `1 x 793 x 1322`, and `crate::bandstream` assembles them
+        // a band at a time straight into `out`. `None` when the variable is
+        // not one this can reproduce exactly; then the whole read below, which
+        // is what every caller had before.
+        if let Some(plan) = bandstream::BandPlan::build(&var.ds, &var.shape)
+            && plan.elements() == Some(count)
+        {
+            return plan
+                .stream_to(self.file.as_bytes(), &packing, little, name, out)
+                .map(Some);
+        }
+
         let bytes = var
             .ds
             .read_raw()

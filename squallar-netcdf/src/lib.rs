@@ -42,11 +42,16 @@
 //! [`cf::UnpackedSink`] takes them one at a time, for a consumer whose own
 //! store is narrower than `f32` and which would otherwise allocate the wide
 //! array only to narrow it. Same body, same CF rules — see
-//! [`h5::Granule::read_unpacked_f32_to`].
+//! [`h5::Granule::read_unpacked_f32_to`]. Where that read gets its bytes
+//! *from* is [`bandstream`], for a variable whose storage is chunked finer
+//! than `hdf5_pure`'s narrowest public read: without it a sink that never
+//! holds the array is fed out of a buffer that is the array.
 
+pub mod bandstream;
 pub mod cf;
 pub mod h5;
 
+pub use bandstream::{BandStreamTotals, band_stream_totals};
 pub use cf::{
     CfAttr, RawValues, RawVar, TimeUnits, UnpackedF32, UnpackedSink, UnpackedVar, VarType,
     attr_is_true, parse_cf_epoch, parse_time_units, reinterpret_unsigned, unpack, unpack_f32,

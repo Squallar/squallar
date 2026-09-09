@@ -99,12 +99,18 @@ pub fn decode(bytes: Vec<u8>, channel: GmgsiChannel) -> Result<GmgsiGrid, String
 /// [`read_unpacked_f32_to`](squallar_netcdf::Granule::read_unpacked_f32_to) and
 /// [`Narrowing`], one value at a time and at the width the values are — so no
 /// fresh raster-sized block is taken past the first granule, and no wide array
-/// exists at any point to be narrowed from. What
-/// remains, per steady-state granule, is **one** transient 60,000,000 B
-/// block — the stored bytes `hdf5_pure` assembles for `data` before decoding
-/// them — because its public API in 0.44 reads a dataset whole or by
-/// first-dimension row window and `data` is `(time=1, yc, xc)`.
-/// `tests/gmgsi_staging_blocks.rs` counts exactly that.
+/// exists at any point to be narrowed from.
+///
+/// That read used to leave **one** transient 60,000,000 B block behind it —
+/// the stored bytes `hdf5_pure` assembles for `data`, because its public API
+/// in 0.44 reads a dataset whole or by first-dimension row window and `data`
+/// is `(time=1, yc, xc)`, whose first dimension is one row.
+/// [`squallar_netcdf::bandstream`] walks the storage instead: `data` is 16
+/// chunks of `1 x 793 x 1322`, and a band of four is what row-major delivery
+/// needs held at once. So a steady-state granule's largest transient is
+/// 16,773,536 B and **nothing a decode asks for is grid-sized any more**.
+/// `tests/gmgsi_staging_blocks.rs` counts the blocks over a mosaic bar — zero
+/// — and `tests/gmgsi_band_stream.rs` counts what replaced them.
 pub fn decode_in(
     bytes: Vec<u8>,
     channel: GmgsiChannel,
@@ -211,6 +217,15 @@ pub fn decode_in(
 /// and nothing is ever re-read**: the widening walks the codes already taken,
 /// which cost 15,000,000 B rather than the 60,000,000 B a read-wide-then-narrow
 /// design would have had to allocate before it could ask the question.
+///
+/// **And the layer below no longer defeats that.** Until 2026-09-09 the claim
+/// was true of this type and false of a decode: `read_unpacked_f32_to` fed the
+/// values in one at a time but got them out of a 60,000,000 B buffer
+/// `hdf5_pure` assembled for the whole variable first, so the block the
+/// narrowing exists to remove was allocated anyway, one frame lower.
+/// [`squallar_netcdf::bandstream`] reads `data` at the granularity it is
+/// stored in, and what a steady-state decode holds is now 15,000,000 B of
+/// codes beside one 16,773,536 B band.
 struct Narrowing {
     /// The codes so far. After a widening it is the emptied buffer waiting to
     /// go back to the staging pool, so the slot keeps its block either way.

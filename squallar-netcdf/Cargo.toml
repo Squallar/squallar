@@ -20,6 +20,15 @@ chrono = { workspace = true }
 # dark. Do NOT enable `fast-deflate` either: it selects `flate2/zlib-ng`, which
 # is C and breaks wasm32/iOS cross-compilation.
 hdf5-pure = "=0.44.1"
+# The zlib side of an HDF5 filter pipeline, for `bandstream`: reading a chunked
+# variable band by band means inflating its chunks here rather than through
+# `hdf5_pure`'s whole-dataset read, which is the whole point — that read
+# allocates the variable. Deliberately the same crate and the same version
+# `hdf5-pure` itself inflates with, so the two produce the same bytes by
+# construction rather than by agreement. Defaults ON: `rust_backend`
+# (`miniz_oxide`) is pure Rust, and the `zlib-ng` backends are C and break
+# wasm32/iOS cross-compilation.
+flate2 = { workspace = true }
 # A malformed `valid_range` is warned about and ignored rather than being made
 # fatal; see `cf::unpack`.
 log = { workspace = true }

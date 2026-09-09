@@ -1207,3 +1207,153 @@ fn the_vec_sink_reserves_exactly_the_count_and_not_twice_what_it_holds() {
         appended.capacity(),
     );
 }
+
+/// A mosaic-shaped fixture: `(time=1, yc, xc)` stored in chunks that do **not**
+/// divide it, shuffled and deflated — GMGSI's storage in miniature.
+///
+/// The chunk dimensions are deliberately coprime with the grid's, so the last
+/// band and the last chunk of every band are ragged. A walk that assumed whole
+/// chunks would read the padding every chunk carries past the dataset edge, and
+/// that padding is the one part of a chunk whose content is not a value.
+const BAND_ROWS: usize = 1000;
+const BAND_COLS: usize = 1000;
+const BAND_CHUNK_ROWS: usize = 257;
+const BAND_CHUNK_COLS: usize = 263;
+
+/// [`BAND_ROWS`] x [`BAND_COLS`] of `f32`, chunked, shuffled, deflated, with
+/// every CF rule live so a difference in any of them shows up as a difference
+/// in bits.
+fn banded_var_file() -> Vec<u8> {
+    let mut values = vec![0f32; BAND_ROWS * BAND_COLS];
+    for j in 0..BAND_ROWS {
+        for i in 0..BAND_COLS {
+            let at = j * BAND_COLS + i;
+            values[at] = match at % 97 {
+                // The fill, which unpacks to `NaN` — so the comparison below is
+                // on bits and not on `==`, which every `NaN` passes.
+                0 => -9999.0,
+                // Outside `valid_range`, missing for the other reason.
+                1 => 5000.0,
+                _ => (j * 1000 + i) as f32,
+            };
+        }
+    }
+    let mut w = hdf5_pure::FileBuilder::new();
+    let b = w.create_dataset("data");
+    b.with_f32_data(&values)
+        .with_shape(&[1, BAND_ROWS as u64, BAND_COLS as u64])
+        .with_chunks(&[1, BAND_CHUNK_ROWS as u64, BAND_CHUNK_COLS as u64])
+        .with_shuffle()
+        .with_deflate(5);
+    b.set_attr("_FillValue", hdf5_pure::AttrValue::F32(-9999.0));
+    b.set_attr("add_offset", hdf5_pure::AttrValue::F64(0.25));
+    b.set_attr("scale_factor", hdf5_pure::AttrValue::F64(0.5));
+    b.set_attr(
+        "valid_range",
+        hdf5_pure::AttrValue::F32Array(vec![-9999.0, 4000.0]),
+    );
+    w.finish().expect("write the banded fixture")
+}
+
+/// **The band-streamed read is the whole read, bit for bit.**
+///
+/// The whole read assembles the variable's storage bytes into one buffer and
+/// walks it; the band-streamed read inflates a band of chunks at a time and
+/// gathers each element from the shuffle's four planes without ever
+/// materialising the unshuffled chunk, let alone the variable. Those are two
+/// places to do one permutation, and this is what says so — over a grid whose
+/// chunks are ragged in both directions, with a fill, a `valid_range`, a
+/// `scale_factor` and an `add_offset` all live.
+///
+/// Compared by `to_bits`: both arms map a fill to `NaN`, which `==` never
+/// matches, so an `assert_eq!` on the values themselves would pass whatever
+/// the arms did with the rest.
+///
+/// The counter delta is the falsifiability floor. Every assertion below is
+/// equally true of a build in which `BandPlan::build` returned `None` for
+/// everything and both arms were the same code — so the test first shows the
+/// band path actually ran.
+#[test]
+fn a_band_streamed_read_is_the_whole_read_bit_for_bit() {
+    let bytes = banded_var_file();
+    let file = crate::h5::Granule::open(&bytes).expect("open");
+
+    let whole = file
+        .read_unpacked_f32("data")
+        .expect("read")
+        .expect("present");
+    assert_eq!(whole.values.len(), BAND_ROWS * BAND_COLS);
+    assert!(
+        whole.values.iter().any(|v| v.is_nan()),
+        "premise: the missing rules are live on this fixture",
+    );
+
+    let before = crate::bandstream::band_stream_totals();
+    let mut streamed: Vec<f32> = Vec::new();
+    let count = file
+        .read_unpacked_f32_into("data", &mut streamed)
+        .expect("read")
+        .expect("present");
+    let after = crate::bandstream::band_stream_totals();
+
+    assert!(
+        after.reads > before.reads,
+        "the band path did not fire, so everything below compares one arm with \
+         itself: {before:?} -> {after:?}",
+    );
+    assert!(
+        after.bytes_avoided > before.bytes_avoided,
+        "a band-streamed read that avoided nothing is not a cut: {before:?} -> {after:?}",
+    );
+
+    assert_eq!(count, whole.values.len());
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        bits(&streamed),
+        bits(&whole.values),
+        "the band-streamed values must be the whole read's, bit for bit",
+    );
+}
+
+/// **What the band path refuses**, each for the reason that makes the whole
+/// read the right read there.
+///
+/// A plan built for one of these would either produce wrong values (an
+/// unwritten chunk decodes to the fill, which no stored byte carries) or the
+/// same peak under another name (one chunk *is* the variable), so the refusals
+/// are the load-bearing half of the design and are asserted rather than
+/// assumed.
+#[test]
+fn the_band_path_refuses_what_it_cannot_better_or_reproduce() {
+    // One chunk that is the whole variable — GMGSI's `lat`/`lon`. A band is the
+    // variable, so there is nothing to stream.
+    let one_chunk = one_chunk_var_file();
+    let file = hdf5_pure::File::from_bytes(one_chunk).expect("open");
+    let ds = file.dataset("v").expect("present");
+    let shape = ds.shape().expect("shape");
+    assert!(
+        crate::bandstream::BandPlan::build(&ds, &shape).is_none(),
+        "a single-chunk variable has no band smaller than itself",
+    );
+
+    // Contiguous storage: no chunks to walk at all.
+    let flat = float_var_file(&[1.0, 2.0, 3.0], None);
+    let file = hdf5_pure::File::from_bytes(flat).expect("open");
+    let ds = file.dataset("v").expect("present");
+    let shape = ds.shape().expect("shape");
+    assert!(
+        crate::bandstream::BandPlan::build(&ds, &shape).is_none(),
+        "an unchunked variable has no chunk index to walk",
+    );
+
+    // The falsifiability floor: the shape this *does* accept, so the two
+    // refusals above are this function's judgement and not its inability to
+    // build any plan at all.
+    let banded = banded_var_file();
+    let file = hdf5_pure::File::from_bytes(banded).expect("open");
+    let ds = file.dataset("data").expect("present");
+    let shape = ds.shape().expect("shape");
+    let plan = crate::bandstream::BandPlan::build(&ds, &shape)
+        .expect("the banded fixture is exactly what this path is for");
+    assert_eq!(plan.elements(), Some(BAND_ROWS * BAND_COLS));
+}

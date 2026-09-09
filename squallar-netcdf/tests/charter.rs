@@ -68,6 +68,13 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
 /// That is what makes it a Band 0 leaf. The allow-list is exact rather than a
 /// prefix rule: each name is here because a NetCDF4/CF reader genuinely needs
 /// it, and a new one is a decision to write down, not to discover in a diff.
+///
+/// `flate2` is the fourth, added 2026-09-09 for `crate::bandstream`: reading a
+/// chunked variable band by band means inflating its chunks here rather than
+/// through `hdf5_pure`'s whole-dataset read, which allocates the variable. It
+/// is the same crate at the same pinned version `hdf5-pure` inflates with, so
+/// the two produce the same bytes by construction; a *different* zlib would be
+/// a new decision rather than a version bump.
 #[test]
 fn the_crate_is_a_band_zero_leaf() {
     let meta = metadata();
@@ -83,7 +90,7 @@ fn the_crate_is_a_band_zero_leaf() {
              squallar-source keeps the overlays->radar edge cut.",
         );
         let allowed = match kind.as_str() {
-            "normal" => matches!(name.as_str(), "chrono" | "hdf5-pure" | "log"),
+            "normal" => matches!(name.as_str(), "chrono" | "flate2" | "hdf5-pure" | "log"),
             "dev" => name == "serde_json",
             other => panic!(
                 "squallar-netcdf declares a `{other}` dependency on {name}; \
@@ -99,7 +106,7 @@ fn the_crate_is_a_band_zero_leaf() {
 
     // Falsifiability floor: an empty or misread parse cannot pass the loop
     // above, because the loop is vacuous over an empty set.
-    for required in ["chrono", "hdf5-pure", "log"] {
+    for required in ["chrono", "flate2", "hdf5-pure", "log"] {
         assert!(
             deps.iter().any(|(k, n)| k == "normal" && n == required),
             "squallar-netcdf no longer declares {required} (normal) — either the \

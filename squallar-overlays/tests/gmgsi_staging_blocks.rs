@@ -25,7 +25,8 @@
 //! |---|---|
 //! | before (`833bad45`) | **91** |
 //! | pool + one handle per coordinate variable | 5 |
-//! | and the axis cache, steady state | **1** |
+//! | and the axis cache, steady state | 1 |
+//! | and the band-streamed read (2026-09-09) | **0** |
 //!
 //! The 91 were: 88 from the two 2-D coordinate variables — each stored as
 //! one 60 MB chunk that `hdf5_pure` re-inflated **and re-unshuffled** for
@@ -39,12 +40,24 @@
 //! unshuffle, once each — and the byte-identity axis cache
 //! (`gmgsi::decode::AxisCache`) makes those 4 into 0 on every granule that
 //! stores the same coordinate arrays as the last, which is every granule of
-//! the product. The 1 that remains is `hdf5_pure`'s and transient: the
-//! stored bytes it assembles for `data` before decoding them — `data` is
-//! `(time=1, yc, xc)`, so its public API in 0.44 has no window narrower than
-//! the whole. **The raster is not among them**: it is decoded into the slot's
+//! the product.
+//!
+//! The 1 that used to remain was `hdf5_pure`'s and transient: the stored bytes
+//! it assembled for `data` before decoding them, because its public API in
+//! 0.44 has no window narrower than the whole and `data` is `(time=1, yc,
+//! xc)`. `squallar_netcdf::bandstream` reads that variable at the granularity
+//! it is actually stored in — 16 chunks of `1 x 793 x 1322` — holding one band
+//! of four at a time, so the block is not made smaller, it is **not made**.
+//! What replaced it is four buffers of 4,193,384 B, and
+//! `gmgsi_band_stream.rs` is what counts *those*: this bar is above them by
+//! construction and would read the same zero whether they were four blocks or
+//! forty.
+//!
+//! **The raster is not among any of them**: it is decoded into the slot's
 //! retained buffer, and the first control below is what shows that; the
-//! second shows the 4 the axis cache removed.
+//! second shows the 4 the axis cache removed. With the steady-state figure at
+//! zero those two differences are the whole of this gate's power, which is
+//! why both are asserted as differences and not as levels.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
@@ -61,8 +74,9 @@ use squallar_overlays::gmgsi::{GmgsiChannel, decode, staging};
 /// bar sits between everything a decode touches that is not a whole grid (a
 /// `data` chunk is 1 x 793 x 1322 `f32` = 4,193,384 B, a 256-row coordinate
 /// window 5,120,000 B, the committed granule's own bytes 533,762 B) and the
-/// 15,000,000 B raster. The reader's assembled `data` bytes are 60,000,000 B
-/// and are over both bars, which is why `READER_BLOCKS` is unmoved.
+/// 15,000,000 B raster. The reader's assembled `data` bytes were 60,000,000 B
+/// and over both bars; they are what `READER_BLOCKS` counted, and they are
+/// gone.
 const LARGE: usize = 12 * 1024 * 1024;
 
 static LARGE_ALLOCS: AtomicUsize = AtomicUsize::new(0);
@@ -117,10 +131,16 @@ const GRANULE: &[u8] = include_bytes!(
     "../testdata/GLOBCOMPLIR_v3r0_blend_s202506011200000_e202506011209599_c202506011234579.nc"
 );
 
-/// The transient stored-byte blocks one steady-state decode costs inside
-/// `hdf5_pure` — the assembled `data` bytes — so a moved count names what
-/// moved. See the header.
-const READER_BLOCKS: usize = 1;
+/// The grid-sized blocks one steady-state decode costs, so a moved count
+/// names what moved. See the header.
+///
+/// **Zero since 2026-09-09**, down from 1: the one that remained was the
+/// stored bytes `hdf5_pure` assembled for `data`, and
+/// `squallar_netcdf::bandstream` reads that variable band by band instead, so
+/// no buffer the size of the variable is ever asked for. Zero is a level a
+/// stopped instrument would also report, which is what the two controls below
+/// are for — each asserts a *difference* from this figure.
+const READER_BLOCKS: usize = 0;
 
 /// What reading the two coordinate variables costs on top: inflate and
 /// unshuffle, once each. Paid by the first granule and by any granule whose
@@ -214,11 +234,11 @@ fn granules_decode_through_one_retained_mosaic_block() {
         took,
         GRANULES * READER_BLOCKS,
         "{GRANULES} granules decoded one at a time took {took} blocks at or \
-         above {LARGE} B; the reader alone costs {READER_BLOCKS} per granule \
-         (the assembled `data` bytes), the coordinate arrays are remembered, \
-         and the raster must not add to that: past the warm-up a staged \
-         granule's buffer IS the next granule's buffer. Blocks seen, in \
-         order: {seen:?}",
+         above {LARGE} B; the reader costs {READER_BLOCKS} per granule now \
+         that `data` is read band by band, the coordinate arrays are \
+         remembered, and the raster must not add to that: past the warm-up a \
+         staged granule's buffer IS the next granule's buffer. Blocks seen, \
+         in order: {seen:?}",
     );
     assert_eq!(
         staging::global().totals().reused,
