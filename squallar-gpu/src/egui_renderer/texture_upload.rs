@@ -204,6 +204,87 @@ const WHOLE_CROSSING_BYTES: usize = (BAR_WRITE_BYTES_PER_SEC
     / WHOLE_CROSSING_SHARE
     / 1_000_000) as usize;
 
+/// What creating a `wgpu::Texture` costs the frame thread, in bytes of texture
+/// a second: this module's own measured figure — 4.82 ms for a 7362² RGBA
+/// texture, which is 216,796,176 B, so 44.98 GB/s. Rounded down.
+///
+/// A creation is not a transfer and nothing is copied through it; the cost is
+/// the driver's allocation, and it is the *size* of the texture that sets it.
+/// That is the whole reason [`TEXTURE_CREATE_BUDGET_BYTES`] can exist at all.
+const TEXTURE_CREATE_BYTES_PER_SEC: u64 = 44_900_000_000;
+
+/// The share of
+/// [`squallar_device_profile::constants::TARGET_FRAME_SERVICE`] the drain's
+/// texture creations may hold — a quarter, [`WHOLE_CROSSING_SHARE`]'s, and for
+/// the same reason.
+const TEXTURE_CREATE_SHARE: u64 = 4;
+
+/// **Texture a frame's [`TextureUploads::drain`] may create before it stops**,
+/// in bytes: [`TEXTURE_CREATE_SHARE`] of the target frame at
+/// [`TEXTURE_CREATE_BYTES_PER_SEC`]. 1 ms, and 44,900,000 B.
+///
+/// # What this replaced, and what that cost
+///
+/// The drain used to `break` after **any** band that allocated a texture,
+/// whatever the texture was, on the reading that "creating the texture is
+/// 4.82 ms for a 7362² raster against ~0.7 ms for a band by DMA, so a frame
+/// that allocated one has spent its budget". The measurement is this module's
+/// own and is not in doubt; what it does not carry is the *size* it was taken
+/// at. 4.82 ms is 216,796,176 B of texture. A six-pane overlay picture is
+/// 960x780x4 = 2,995,200 B — **72 times smaller, and 0.067 ms** — and the
+/// break spent a whole frame's drain budget on it exactly as if it had cost
+/// the 4.82 ms.
+///
+/// **Every whole-image delta allocates**, which is every overlay picture,
+/// every loop frame and every basemap tile: [`TextureUploads::file`] takes the
+/// `delta.pos.is_none()` arm, drops the id's old texture and files the band
+/// with `allocate: Some(..)`. So the break fired on the first band of every
+/// frame and [`bands_per_frame`] — which is 2 on a ring device — was **1** for
+/// the whole life of the process on any scene made of pictures.
+///
+/// Measured on three 420 s HEAVY6 legs (6 panes, 6 sites, a playing 1 h loop,
+/// `pan-zoom-2d`, 1920x1080 on Xvfb, RTX 3090 / Vulkan, base 0f067c847):
+/// **8,439 bands moved across 8,473 frames** — 0.996 a frame, against a
+/// [`bands_per_frame`] of 2. The drain was pinned at exactly half the ring's
+/// capacity, and it was the producer's rate that lost: 9,649 inked pictures
+/// over 420 s is 23 a second against a drain of 20 a second, so
+/// [`TextureUploads::pending`] grew until it held **52 whole 960x780 pictures,
+/// 155,750,400 B of HOST memory** (`upload residency:`, two legs of three
+/// exactly, the third 49). Those bytes are `squallar_alloc`'s, not the
+/// device's.
+///
+/// # Why a byte budget and not simply no break
+///
+/// The 216 MB case is real and the break was right about it: one such creation
+/// is 4.82 ms, past a whole `TARGET_FRAME_SERVICE`, and a second on the same
+/// frame would be a dropped frame with nothing gained. A budget in bytes keeps
+/// that — 216,796,176 B is 4.8x this figure, so a frame that creates one stops
+/// after it, exactly as before — and stops charging a 3 MB creation the same
+/// price. The budget is checked *after* the creation, so a frame always moves
+/// at least one band however large it is; nothing can be starved by this.
+///
+/// **On this scene the ring, not this figure, is what binds.** Two 2,995,200 B
+/// creations are 0.13 ms, well under the 1 ms here, so what stops the drain
+/// is [`bands_per_frame`] — [`crate::staging_ring::STAGING_RING_DEPTH`], a
+/// count of staging slots and a real constraint on how many bands one frame
+/// can stage. That is the honest ceiling and this budget is deliberately not
+/// underneath it: a budget written low enough to bind twice would be the same
+/// mistake in the other direction.
+const TEXTURE_CREATE_BUDGET_BYTES: u64 = TEXTURE_CREATE_BYTES_PER_SEC
+    * squallar_device_profile::constants::TARGET_FRAME_SERVICE.as_micros() as u64
+    / TEXTURE_CREATE_SHARE
+    / 1_000_000;
+
+/// The break still fires on the texture it was measured at, and does not fire
+/// on the picture the app is actually made of. Both directions, because a
+/// budget that answered constantly would satisfy either alone.
+const _: () = {
+    // 7362² RGBA — the creation the 4.82 ms was measured on.
+    assert!(7362 * 7362 * 4 >= TEXTURE_CREATE_BUDGET_BYTES);
+    // Two six-pane overlay pictures, 960x780x4 each.
+    assert!(2 * 960 * 780 * 4 < TEXTURE_CREATE_BUDGET_BYTES);
+};
+
 /// Whole-crossing bytes one frame may push through `Renderer::update_texture`
 /// before the rest are filed as bands.
 ///
@@ -382,6 +463,27 @@ pub struct UploadTotals {
     /// ~7.57 MB pictures went whole and counted ~0.1 GB — the same ringless
     /// traffic, opposite readings, flipped by 32 px of canvas width.
     pub blocking_bytes: u64,
+    /// **`wgpu::Texture`s [`TextureUploads::drain`] created**, and the
+    /// non-vacuity partner of [`Self::paced_creations`]: a leg reading zero
+    /// paced creations out of zero creations says the drain never ran, not
+    /// that the pacing never bound.
+    ///
+    /// Creations only — the deltas this module hands to
+    /// `Renderer::update_texture` allocate nothing here, and neither does a
+    /// band into a texture egui already owns.
+    pub creations: u64,
+    /// Bytes of the textures counted in [`Self::creations`], four to a texel.
+    /// What [`TEXTURE_CREATE_BUDGET_BYTES`] is spent in.
+    pub creation_bytes: u64,
+    /// **Creations that happened on a frame that had already made one** — the
+    /// subset of [`Self::creations`] the drain's old unconditional
+    /// allocate-break refused, and so the exact count of bands
+    /// [`TEXTURE_CREATE_BUDGET_BYTES`] let through.
+    ///
+    /// A subset of `creations`, never added to it. Bounded above by
+    /// `creations - frames the drain ran on`, and on a ring device by
+    /// `bands_per_frame - 1` per frame.
+    pub paced_creations: u64,
 }
 
 impl UploadTotals {
@@ -406,6 +508,16 @@ impl UploadTotals {
         self.blocking_bytes += bytes;
     }
 
+    /// Count one texture creation of `bytes`, `paced` naming whether the frame
+    /// had already made one — see [`Self::paced_creations`].
+    fn count_creation(&mut self, bytes: u64, paced: bool) {
+        self.creations += 1;
+        self.creation_bytes += bytes;
+        if paced {
+            self.paced_creations += 1;
+        }
+    }
+
     /// Count one band of `bytes`, `staged` naming the route that moved it.
     /// The one ledger arithmetic for the banded routes, shared the way
     /// [`Self::count_whole_write`] is.
@@ -421,7 +533,10 @@ impl UploadTotals {
     /// How far along this ledger is, as one number, so a caller can tell
     /// "nothing has happened since I last looked" in a single compare.
     fn progress(&self) -> u64 {
-        self.deltas + self.bands
+        // Creations included: a drain that moved only blank pages counts no
+        // band, and without this term a frame of them reads as no progress at
+        // all.
+        self.deltas + self.bands + self.creations
     }
 }
 
@@ -863,6 +978,11 @@ impl TextureUploads {
         encoder: &mut wgpu::CommandEncoder,
         renderer: &mut Renderer,
     ) {
+        // **What this frame has already spent creating textures**, against
+        // [`TEXTURE_CREATE_BUDGET_BYTES`]. Bytes and not a count, because the
+        // cost of a creation is its size and the break this replaced charged
+        // a 2,995,200 B picture what a 216,796,176 B one costs.
+        let mut created = 0u64;
         for _ in 0..self.bands_per_frame() {
             let Some(mut band) = self.pending.pop_front() else {
                 break;
@@ -882,15 +1002,32 @@ impl TextureUploads {
                     band.allocate.unwrap_or_default(),
                 );
                 self.delivered.insert(band.id);
-                break;
+                // A blank page is a creation and nothing else, so it is priced
+                // as one — the same [`TEXTURE_CREATE_BUDGET_BYTES`] the drain's
+                // other allocating arm spends, rather than a whole frame's
+                // drain for a page that transferred no texels at all.
+                let paced = created > 0;
+                let bytes = (size[0] as u64).saturating_mul(size[1] as u64) * 4;
+                created = created.saturating_add(bytes);
+                self.totals.count_creation(bytes, paced);
+                if created >= TEXTURE_CREATE_BUDGET_BYTES {
+                    break;
+                }
+                continue;
             }
             let mut allocated = false;
+            // The bytes of the texture this iteration created, for the budget
+            // above — four to a texel, the same arithmetic
+            // [`resident`](crate::egui_renderer::texture_upload::resident)
+            // charges a texture at.
+            let mut created_bytes = 0u64;
             let texture = match band.allocate.take() {
                 // The raster's own texture, created on the frame that first has
                 // budget for a band of it rather than on the frame it arrived.
                 Some(options) => {
                     allocated = true;
                     let size = band.image.size;
+                    created_bytes = (size[0] as u64).saturating_mul(size[1] as u64) * 4;
                     self.allocate(device, renderer, band.id, size, options)
                 }
                 None => {
@@ -942,10 +1079,28 @@ impl TextureUploads {
                     self.pending.push_front(band);
                 }
                 if allocated {
-                    // Creating the texture is 4.82 ms for a 7362² raster against
-                    // ~0.7 ms for a band by DMA, so a frame that allocated one
-                    // has spent its budget.
-                    break;
+                    // **Charged at its size, and checked after.** Creating the
+                    // texture is 4.82 ms for a 7362² raster against ~0.7 ms
+                    // for a band by DMA, so a frame that created one that
+                    // large has spent its budget — but the same statement made
+                    // about *any* creation pinned the drain at one band a
+                    // frame on a scene of ordinary pictures, and half a ring
+                    // of capacity went unused for the life of the process.
+                    // See [`TEXTURE_CREATE_BUDGET_BYTES`] for the measured
+                    // cost of that.
+                    //
+                    // After, so a frame always moves at least one band however
+                    // large its texture is.
+                    // **The fires counter**: a creation on a frame that had
+                    // already made one is exactly what the old break refused,
+                    // so `paced` is the count of bands this change let
+                    // through and nothing else.
+                    let paced = created > 0;
+                    created = created.saturating_add(created_bytes);
+                    self.totals.count_creation(created_bytes, paced);
+                    if created >= TEXTURE_CREATE_BUDGET_BYTES {
+                        break;
+                    }
                 }
             } else {
                 // The ring is behind. Put it back and stop: every other band

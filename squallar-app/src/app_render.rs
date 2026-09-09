@@ -556,6 +556,34 @@ fn upload_residency_line(peak: u64) -> String {
     format!("upload residency: {peak} B peak pending")
 }
 
+/// The `upload pacing:` line — **what the band drain's texture-creation budget
+/// let through**.
+///
+/// # Why this is not a field on `texture uploads:`
+///
+/// [`upload_residency_line`]'s reason verbatim: `.github/browser-rig/drive.py`
+/// matches that sentence with one anchored regex over all six of its fields,
+/// and a seventh inserted into it turns the rig's whole upload reading into
+/// `null`. This line is additive.
+///
+/// # Two denominators, never added
+///
+/// `creations` is every `wgpu::Texture` the drain made — the deltas that go
+/// whole through `Renderer::update_texture` allocate none, and neither does a
+/// band into a texture egui already owns. `paced` is the **subset** of them
+/// that happened on a frame that had already made one, which is exactly the
+/// set the drain's old unconditional allocate-break refused. So `paced` is the
+/// count of bands
+/// `squallar_gpu::egui_renderer::texture_upload::TEXTURE_CREATE_BUDGET_BYTES`
+/// let through and nothing else, and `creations` is what makes a zero in it
+/// readable: no creations at all is a drain that never ran.
+fn upload_pacing_line(u: &squallar_gpu::egui_renderer::texture_upload::UploadTotals) -> String {
+    format!(
+        "upload pacing: {} creations, {} B created, {} paced",
+        u.creations, u.creation_bytes, u.paced_creations,
+    )
+}
+
 /// The `floor strips:` running-total line. See [`overlay_raster_line`] for why
 /// this is a value. Two denominators, never added:
 /// [`squallar_egui::floor_ledger`]'s strip paints are per pane per painted
@@ -2786,6 +2814,11 @@ impl super::App {
             // flow, this one is a level's high-water mark, and adding them
             // describes neither.
             say_telemetry(loud, &upload_residency_line(peak));
+            // And what paced the drain that fills the level above, on the same
+            // reading the door line is emitted beside `overlay rasters:` on:
+            // the residency is what the queue held and this is the rate it was
+            // allowed to give it back, so the two are only readable together.
+            say_telemetry(loud, &upload_pacing_line(&u));
         }
         if let Some(s) = strips {
             say_telemetry(loud, &floor_strip_line(&s));

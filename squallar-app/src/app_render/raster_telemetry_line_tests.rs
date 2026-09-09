@@ -162,6 +162,11 @@ fn the_rig_reads_the_lines_the_app_actually_writes() {
         bands: 37,
         staged_bytes: 49,
         blocking_bytes: 86,
+        // Not on the `texture uploads:` sentence at all — `upload pacing:` is
+        // its own line. Distinct values so a fold-in would show.
+        creations: 91,
+        creation_bytes: 94,
+        paced_creations: 95,
     };
     // `bytes()` is derived, not a field, so it is named here at its own value
     // rather than trusted to appear: 49 + 86.
@@ -714,5 +719,53 @@ fn the_blank_line_names_every_reason_at_its_own_count() {
         BlankReason::COUNT,
         "not every reason is represented, so the line above does not show \
          that every one of them can be reported",
+    );
+}
+
+/// **`upload pacing:` is its own sentence and never a field on `texture
+/// uploads:`.**
+///
+/// The module note above is the whole argument: `drive.py`'s `uploads_re` is
+/// anchored over all six of that line's fields, so a seventh inserted into it
+/// turns the rig's upload reading into `null` — the reading that is
+/// indistinguishable from "the upload path never ran". This pin reads the
+/// rig's own regex rather than restating it, on the same terms the rest of
+/// this file does.
+#[test]
+fn upload_pacing_is_additive_and_leaves_the_rigs_upload_regex_alone() {
+    const DRIVE: &str = include_str!("../../../.github/browser-rig/drive.py");
+    let u = squallar_gpu::egui_renderer::texture_upload::UploadTotals {
+        deltas: 11_732,
+        whole_bytes: 2_428_228,
+        bands: 8_439,
+        staged_bytes: 24_435_978_048,
+        blocking_bytes: 2_428_228,
+        creations: 8_439,
+        creation_bytes: 25_275_292_800,
+        paced_creations: 3_104,
+    };
+    let uploads = super::texture_upload_line(&u);
+    let pacing = super::upload_pacing_line(&u);
+    assert_eq!(
+        pacing,
+        "upload pacing: 8439 creations, 25275292800 B created, 3104 paced",
+    );
+    // The rig's own sentence, taken out of `drive.py` rather than restated.
+    assert!(
+        DRIVE.contains(
+            "texture uploads: (\\d+) deltas, (\\d+) B to the GPU, \
+                        (\\d+) B whole, (\\d+) bands, (\\d+) B staged, \
+                        (\\d+) B blocking"
+        ) || DRIVE.contains("texture uploads: (\\d+) deltas"),
+        "drive.py's upload regex is gone or renamed; this pin reads nothing",
+    );
+    assert!(
+        !uploads.contains("pacing") && !uploads.contains("creations"),
+        "a pacing field was folded into `texture uploads:`, which is the \
+         anchored sentence the rig scrapes: {uploads}",
+    );
+    assert!(
+        pacing.starts_with("upload pacing: "),
+        "the pacing line must be its own sentence: {pacing}",
     );
 }

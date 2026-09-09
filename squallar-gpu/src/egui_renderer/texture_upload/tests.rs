@@ -995,3 +995,77 @@ fn the_drain_allocates_for_a_noted_page_and_delivers_it() {
          its previous raster waits for texels that will never be filed",
     );
 }
+
+/// **The drain paces its texture creations by their size, not by the fact of
+/// one**, and a structural pin for [`the_drain_allocates_for_a_noted_page_and_delivers_it`]'s
+/// reason: `drain` takes a `wgpu::Device`, a `Queue` and an
+/// `egui_wgpu::Renderer`, and this suite has `TextureUploads::without_device()`
+/// instead, so nothing here can drive it.
+///
+/// What it protects is a measured regression, not a style: the arm used to
+/// `break` after **any** allocating band, and every whole-image delta
+/// allocates — so `bands_per_frame`, which is 2 on a ring device, was 1 for the
+/// life of the process. Three 420 s HEAVY6 legs read 8,439 bands across 8,473
+/// frames against that 2. See `TEXTURE_CREATE_BUDGET_BYTES`.
+///
+/// The presence control is the other half, as above: a needle that rotted
+/// would pass over anything.
+#[test]
+fn the_drain_paces_creations_by_bytes_and_not_by_count() {
+    const SOURCE: &str = include_str!("../texture_upload.rs");
+    assert!(
+        SOURCE.contains("if allocated {"),
+        "the drain's allocating arm is gone or renamed, so the pins below read \
+         nothing",
+    );
+    let arm = SOURCE
+        .split_once("if allocated {")
+        .expect("the arm was just found")
+        .1;
+    let arm = &arm[..arm.find("\n            }").unwrap_or(arm.len())];
+    assert!(
+        arm.contains("created >= TEXTURE_CREATE_BUDGET_BYTES"),
+        "the drain no longer stops on a byte budget. An unconditional break \
+         here charges a 2,995,200 B overlay picture what a 216,796,176 B \
+         raster costs and pins the drain at one band a frame",
+    );
+    assert!(
+        arm.contains("count_creation("),
+        "the drain's creations are no longer counted, so `upload pacing:` \
+         reads zero on a leg that created thousands and the budget above \
+         cannot be told from a break that never fires",
+    );
+}
+
+/// `paced_creations` is a **subset** of `creations` and never a second
+/// denominator, and `creation_bytes` is the quantity the budget is spent in.
+///
+/// The pin exists because all three read zero on a still scene, which is the
+/// same reading a counter that was never wired would give.
+#[test]
+fn a_paced_creation_is_a_subset_of_the_creations() {
+    let mut t = super::UploadTotals::default();
+    assert_eq!(
+        (t.creations, t.creation_bytes, t.paced_creations),
+        (0, 0, 0)
+    );
+    // The first creation of a frame is never paced: it is the one the old
+    // break allowed.
+    t.count_creation(2_995_200, false);
+    // The second is exactly what it refused.
+    t.count_creation(2_995_200, true);
+    assert_eq!(t.creations, 2, "both creations counted");
+    assert_eq!(t.creation_bytes, 5_990_400, "at four bytes a texel");
+    assert_eq!(t.paced_creations, 1, "one of the two was the paced one");
+    assert!(
+        t.paced_creations <= t.creations,
+        "a subset, never a term to add",
+    );
+    // And a creation moves the report fingerprint: a drain that made only
+    // blank pages counts no band, and a `progress` without this term reads a
+    // frame of them as no progress at all.
+    assert!(
+        t.progress() >= t.creations,
+        "creations are in the fingerprint"
+    );
+}
