@@ -79,6 +79,77 @@ IPHONEOS_DEPLOYMENT_TARGET = "14.0"
 # cargo does not merge them — so a caller who sets it must carry both flags.
 [target.x86_64-pc-windows-gnullvm]
 rustflags = [
-    "-C", "target-feature=+crt-static",
+    # `+sse4.1` is the x86-64 desktop floor documented below, spelled into this
+    # same value rather than as a second `-C target-feature` so that nothing
+    # here depends on how rustc merges repeated occurrences of the flag.
+    "-C", "target-feature=+crt-static,+sse4.1",
     "-C", "link-arg=-Wno-unused-command-line-argument",
 ]
+
+# x86-64 desktops build with SSE4.1.
+#
+# `f32::round()` does not lower to an instruction at base x86-64. There is no
+# SSE2 round-half-away-from-zero, so rustc emits a call to `roundf`, and with
+# no system libm in the picture that call lands in compiler-builtins' software
+# implementation — a `t roundf` local symbol linked into every binary here,
+# doing the rounding with integer bit operations on the exponent. `floorf`,
+# `truncf` and `ceilf` are the same story. SSE4.1 has `roundss`/`roundsd`, and
+# all four collapse to a single instruction; the same flag also lets LLVM
+# vectorize the shape and layout arithmetic an egui frame is made of.
+#
+# Measured on this workspace, x86-64 Linux: `squallar-egui`'s `InputHarness`
+# driving 200 real UI frames on an ADVANCING clock — release codegen with LTO
+# off so the symbols survive, counted with callgrind, the two builds differing
+# in nothing but this flag.
+#
+#   Gui::ui_phased inclusive     946,428 -> 876,481 Ir/frame  -69,947 (-7.39%)
+#   whole harness frame        1,252,646 -> 1,173,927 Ir/frame -78,718 (-6.28%)
+#
+# The unchanged-tree spread over a repeat of each arm is 95 and 76 Ir/frame, so
+# the delta clears the noise by three orders of magnitude. The four software
+# implementations are 51,376 Ir/frame of it and are gone outright: `nm` finds
+# no `roundf`, `floorf`, `truncf` or `ceilf` symbol in the binary at all, and
+# `objdump` finds `roundss` and `roundsd` where they were. The rest is
+# vectorization, and 8,771 Ir/frame of the win lands outside `ui_phased` —
+# which is why the two rows do not move by the same amount.
+#
+# The clock is the part to keep. On a harness whose `time` never advances,
+# every `egui::Area` sits part-way through `fade_in` forever, painting at a
+# fractional opacity that sends every shape through a deep-clone recolour path
+# that no real frame runs. An earlier reading of this same flag was taken that
+# way: it reported a bigger absolute saving, because a large share of the
+# rounding it removed belonged to fade-in work a shipped frame never does.
+#
+# **This sets a minimum CPU.** SSE4.1 arrived with Intel Penryn (January 2008)
+# and is on every Nehalem and later; on AMD it arrived with Bulldozer (October
+# 2011). AMD K10 — Phenom, Phenom II, Athlon II — has SSE4**a**, a different
+# and disjoint instruction set, and **will not run these binaries**: the
+# failure is SIGILL at the first `roundss`, with no diagnostic and no log. That
+# floor costs nothing real, because it sits far below the floor this app
+# already had — a machine that cannot do SSE4.1 has no GPU that can run a
+# wgpu/Vulkan application either. It is stated for users in `README.md`;
+# changing it here without changing it there is a support incident.
+#
+# Per-target blocks, and deliberately not `build.rustflags` or a `RUSTFLAGS` in
+# CI:
+#
+# * `wasm32-unknown-unknown` gains nothing. `f32.nearest` is ties-to-even, so
+#   `round()` stays a call there however this is spelled, and an x86 feature
+#   name on a wasm target is a warning to nobody's benefit.
+# * `aarch64` gains nothing either. `frinta` is in the base ISA, so Apple
+#   Silicon, Android and iOS already round inline.
+# * A `RUSTFLAGS` in the environment **replaces** every block in this file
+#   wholesale — cargo does not merge them — so a global spelling would take
+#   `+crt-static` off the Windows row above and stop that binary booting.
+# * `.github/scripts/wasm-threads.sh` builds by exporting its own `RUSTFLAGS`.
+#   These being per-target config blocks and not an env var is what makes it
+#   impossible for this flag to append itself to that line.
+#
+# Not applied to `x86_64-linux-android`, on purpose: that is an emulator and
+# Chromebook target rather than a desktop, and it is not what was measured.
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+sse4.1"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-feature=+sse4.1"]
