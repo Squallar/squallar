@@ -1436,7 +1436,7 @@ impl SweepLayout {
 /// The saving is the absence: `render_with_projection` holds one atomic cell
 /// per output pixel (8 B) and the RGBA texture (4 B) live at once, and at the
 /// desktop side a 1832-gate cut needs, that pair is 650,388,528 B. This builds
-/// neither. What it produces instead is a plane whose chain sums to 1,758,832 B
+/// neither. What it produces instead is a plane whose chain sums to 1,758,630 B
 /// for a surveillance sweep — the figure `codes::tests` computes off the shape.
 ///
 /// **`None` is not a failure, it is the raster.** Every reason a sweep cannot

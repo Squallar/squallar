@@ -30,7 +30,7 @@ from `chunks.rs:450-455` and `types/tests.rs:231-236`):
 | form | bytes | vs a 2048 native loop frame | vs a 1024 wasm loop frame |
 |---|---:|---:|---:|
 | R8 codes, level 0 | 1,319,040 (1.258 MiB) | 0.0786× | 0.3145× |
-| R8 + full max-mip chain | 1,758,832 (1.677 MiB) | **0.1048×** | **0.4193×** |
+| R8 + full max-mip chain | 1,758,630 (1.677 MiB) | **0.1048×** | **0.4193×** |
 | today's `PolarField` f32 values | 5,276,160 (5.03 MiB) | 0.3145× | 1.258× |
 
 `9.54×` more GPU-resident frames per byte on the native arm, `2.39×` on wasm
@@ -96,7 +96,7 @@ A new type in `squallar-radar`, **beside** `PolarField` and not replacing it:
 ```rust
 pub struct CodePlane {
     codes: Vec<u8>,          // radials * gates, radial-major, level 0
-    mips: Vec<u8>,           // levels 1..=L, concatenated, each ceil-halved
+    mips: Vec<u8>,           // levels 1..=L, concatenated, each max(1, n >> 1)
     radials: usize,
     gates: usize,
     width: CodeWidth,        // R8 today; R16 is the phase-F widening
@@ -227,14 +227,27 @@ with `queue.write_texture(.. mip_level: 1 ..)`. Built once per sweep at upload,
 never per frame.
 
 ```
-chain(R, G) = Σ_{l=0}^{L} ceil(R/2^l) · ceil(G/2^l),  L = floor(log2 max(R,G))
+chain(R, G) = Σ_{l=0}^{L} max(1, R>>l) · max(1, G>>l),  L = floor(log2 max(R,G))
 ```
-720 × 1832: 1,319,040 + 329,760 + 82,440 + 20,610 + 5,175 + 1,334 + 348 + 90 +
-24 + 8 + 2 + 1 = **1,758,832 B**, a factor of **1.33338** (**inferred**).
-720 × 1192: **1,144,411 B**, factor 1.33344.
+720 × 1832: 1,319,040 + 329,760 + 82,440 + 20,610 + 5,130 + 1,254 + 308 + 70 +
+14 + 3 + 1 = **1,758,630 B**, a factor of **1.33327** (**measured**).
+720 × 1192: **1,144,248 B**, factor 1.33325.
+
+**Settled 2026-09-08, and against this section's own first draft.** It read
+`ceil(R/2^l) · ceil(G/2^l)` above a twelve-term sum of 1,758,832 B, which the
+`L = floor(log2 max(R,G))` on the same line already contradicted. The chain is
+uploaded as a **texture's own mip chain**, and WebGPU fixes both halves of that
+arithmetic — a level's extent is `max(1, extent >> level)` and a texture admits
+`floor(log2(max(w,h))) + 1` levels — so the `floor` half of the line is the one
+that survives. The ceil-halved chain was built and shipped for a fortnight, and
+no device would take it: `create_texture` answered *"mip level count 12 is
+invalid, maximum allowed is 11"* for a 720 × 1832 sweep, and clamping the count
+alone still overran seven of the eleven levels.
 
 **What "max" means — the reduce operator, declared per family.** Each level's
-cell reduces the ≤ 4 cells under it by:
+cell reduces the cells under it by the operator below — two per axis, and
+three at the last cell of an odd axis, which is what keeps the footprints a
+partition of level 0 once the extents halve by `floor`:
 
 ```
 data = { c in cells : c >= 2 }              // 0 = below threshold, 1 = range folded
@@ -647,11 +660,11 @@ added):
 
 | | today | polar, one surveillance tilt | ratio |
 |---|---:|---:|---:|
-| GPU / frame, native (2048) | 16,777,216 | 1,758,832 | 0.105× |
-| GPU / frame, wasm (1024) | 4,194,304 | 1,758,832 | 0.419× |
+| GPU / frame, native (2048) | 16,777,216 | 1,758,630 | 0.105× |
+| GPU / frame, wasm (1024) | 4,194,304 | 1,758,630 | 0.419× |
 | host_held / frame, native still | 33,554,432 | 1,319,040 | 0.039× |
-| host_scratch / frame, native still | 33,554,432 | 439,792 | 0.013× |
-| host_peak / frame, native still | 67,108,864 | 1,758,832 | 0.026× |
+| host_scratch / frame, native still | 33,554,432 | 439,590 | 0.013× |
+| host_peak / frame, native still | 67,108,864 | 1,758,630 | 0.026× |
 | GPU at `DESKTOP_MAX_LOOP_FRAMES = 60` | 1,006,632,960 (960.0 MiB) | 105,529,920 (100.6 MiB) | 0.105× |
 | GPU at `WASM_MAX_LOOP_FRAMES = 14` | 58,720,256 (56.0 MiB) | 24,623,648 (23.5 MiB) | 0.419× |
 
@@ -701,7 +714,7 @@ a layer supplying its own measured per-frame cost. Mirror it:
 * The loop pool's `plan_view` model term takes the same measured figure.
   `loop_pool`'s pinned `arm.model.overlay != arm.model.plan_view` must keep
   holding, and the measured polar figure must not collide with
-  `2880 × 1620 × 4 = 18,662,400`. 1,758,832 does not (**inferred**).
+  `2880 × 1620 × 4 = 18,662,400`. 1,758,630 does not (**inferred**).
 
 `render_cache_budget_bytes` = `entries × plan_view_frame_cost(long_range_image_side_px).host_held`
 (`budget.rs:986-989`) becomes `entries × polar_frame_cost(..).host_held` for a

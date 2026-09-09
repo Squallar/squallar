@@ -1312,37 +1312,35 @@ fn shape(dims: (usize, usize), levels: usize, retained: bool) -> PolarFrameShape
 }
 
 /// **The mip chain the long way, in a second implementation** — a level list
-/// built by repeated ceil-halving, each level's texels multiplied out and
-/// summed. Shares no line with `chain_texels`: it materialises the extents
-/// rather than accumulating, so a defect in the accumulator cannot hide here.
+/// materialised straight off each level's own index, `max(1, size / 2^level)`
+/// as a division rather than a shift, each level's texels multiplied out and
+/// summed. Shares no line with `chain_texels`: that one accumulates and halves
+/// as it goes, so a defect in the accumulator cannot hide here.
 fn chain_the_long_way(radials: usize, gates: usize, levels: usize) -> usize {
     if radials == 0 || gates == 0 {
         return 0;
     }
-    let mut extents = Vec::new();
-    let (mut r, mut g) = (radials, gates);
-    for _ in 0..levels {
-        extents.push((r, g));
-        r = if r > 1 {
-            (r as f64 / 2.0).ceil() as usize
-        } else {
-            1
-        };
-        g = if g > 1 {
-            (g as f64 / 2.0).ceil() as usize
-        } else {
-            1
-        };
-    }
-    extents.into_iter().map(|(r, g)| r * g).sum()
+    (0..levels)
+        .map(|l| {
+            let span = 2usize.saturating_pow(u32::try_from(l).unwrap_or(u32::MAX));
+            (radials / span).max(1) * (gates / span).max(1)
+        })
+        .sum()
 }
 
-/// **The mip chain as WebGPU would size it** — `max(1, floor(size / 2^level))`
-/// — for the comparison that shows the ceil form cannot under-price.
-fn chain_floor_halved(radials: usize, gates: usize, levels: usize) -> usize {
-    (0..levels)
-        .map(|l| (radials >> l).max(1) * (gates >> l).max(1))
-        .sum()
+/// **The chain this crate priced until 2026-09-08** — extents halved by
+/// `ceil`, per design §2.1. Kept as the live control for
+/// `the_price_walks_webgpus_own_mip_chain`: without a form the price is NOT,
+/// that test would compare a function with itself.
+fn chain_ceil_halved(radials: usize, gates: usize, levels: usize) -> usize {
+    let (mut r, mut g) = (radials, gates);
+    let mut sum = 0;
+    for _ in 0..levels {
+        sum += r * g;
+        r = if r > 1 { r.div_ceil(2) } else { 1 };
+        g = if g > 1 { g.div_ceil(2) } else { 1 };
+    }
+    sum
 }
 
 /// **`chain_texels` against a second implementation of the same sum**, over
@@ -1399,7 +1397,11 @@ fn the_mip_chain_closed_form_brackets_the_long_sum() {
         let levels = full_mip_levels(r, g);
         let exact = chain_texels(r, g, levels) as f64;
         let rg = (r * g) as f64;
-        let lower = 4.0 / 3.0 * rg * (1.0 - 4f64.powi(-(levels as i32)));
+        // The lower term loses up to one texel per axis per level to the
+        // floor, which is what the `2(R + G)` slack on this side pays for.
+        let lower = 4.0 / 3.0 * rg * (1.0 - 4f64.powi(-(levels as i32)))
+            - 2.0 * (r + g) as f64
+            - levels as f64;
         let upper = 4.0 / 3.0 * rg + 2.0 * (r + g) as f64 + levels as f64;
         assert!(
             lower <= exact && exact < upper,
@@ -1426,21 +1428,25 @@ fn the_mip_chain_closed_form_brackets_the_long_sum() {
     // Six figures, because the design quotes six and one of them is a slip.
     let factor =
         |(r, g): (usize, usize)| chain_texels(r, g, full_mip_levels(r, g)) as f64 / (r * g) as f64;
-    assert!((factor(SURVEILLANCE) - 1.333_418).abs() < 5e-7);
-    assert!((factor(DOPPLER) - 1.333_439).abs() < 5e-7);
+    assert!((factor(SURVEILLANCE) - 1.333_265).abs() < 5e-7);
+    assert!((factor(DOPPLER) - 1.333_249).abs() < 5e-7);
 }
 
-/// **The ceil-halved chain never prices below a floor-halved one.**
+/// **The price walks WebGPU's own mip chain, level count and all.**
 ///
-/// Design §2.1 halves by `ceil`; WebGPU sizes a mip level `max(1, floor(size /
-/// 2^level))`. Nothing in this tree builds a chain yet, so the code cannot
-/// arbitrate — but the price must be conservative whichever the renderer picks,
-/// and `ceil(x) >= max(1, floor(x))` for every `x > 0` makes it termwise so.
+/// This crate priced a `ceil`-halved chain until 2026-09-08 on the strength of
+/// design §2.1, with a note saying the code could not arbitrate. It can: the
+/// plane is uploaded as a texture's mip chain, so a level's extent is
+/// `max(1, extent >> level)` and the levels a texture may declare are
+/// `floor(log2(max(w, h))) + 1`, and a price over any other chain is a price
+/// for a frame no device will take. `squallar-gpu`'s
+/// `the_chain_arithmetic_is_the_producers` is the arm that holds the same two
+/// rules against wgpu itself.
 ///
-/// The control is the second assertion: at the real shapes the two forms
-/// **differ**, so this is not a comparison of a function with itself.
+/// The control is the last block: at these shapes the `ceil` form **differs**,
+/// so this is not a comparison of a function with itself.
 #[test]
-fn ceil_halving_never_underprices_a_floor_halved_chain() {
+fn the_price_walks_webgpus_own_mip_chain() {
     let mut differed = 0usize;
     for (r, g) in [
         SURVEILLANCE,
@@ -1451,31 +1457,50 @@ fn ceil_halving_never_underprices_a_floor_halved_chain() {
         (721, 1833),
         (MAX_POLAR_RADIALS, MAX_POLAR_GATES),
     ] {
+        // The level count is `floor(log2(max(R, G))) + 1`, spelled off the bit
+        // width rather than by halving so it is not `full_mip_levels` again.
+        let widest = r.max(g) as u64;
+        assert_eq!(
+            full_mip_levels(r, g),
+            (u64::BITS - widest.leading_zeros()) as usize,
+            "{r}x{g}: the chain's level count is not the one a texture admits",
+        );
         for levels in 1..=full_mip_levels(r, g) {
-            let ceiled = chain_texels(r, g, levels);
-            let floored = chain_floor_halved(r, g, levels);
-            assert!(
-                ceiled >= floored,
-                "{r}x{g} at {levels}: ceil chain {ceiled} < floor chain {floored}",
+            assert_eq!(
+                chain_texels(r, g, levels),
+                (0..levels)
+                    .map(|l| (r >> l).max(1) * (g >> l).max(1))
+                    .sum::<usize>(),
+                "{r}x{g} at {levels}: the price is not WebGPU's chain",
             );
-            if ceiled != floored {
+            if chain_texels(r, g, levels) != chain_ceil_halved(r, g, levels) {
                 differed += 1;
             }
         }
     }
     assert!(
         differed > 0,
-        "the two halvings agreed everywhere, so this test compared a function \
-         with itself and would pass on a `chain_floor_halved` that called \
-         `chain_texels`",
+        "the priced chain and the ceil-halved one agreed everywhere, so this \
+         test compared a function with itself and would pass on a \
+         `chain_ceil_halved` that called `chain_texels`",
     );
-    // The gap at the surveillance shape, so its size is on the record: 201
-    // texels on 1,758,832 — immaterial to a budget, material to the upload.
+    // The gap at the surveillance shape, so its size is on the record: at the
+    // eleven levels a texture admits, the ceil form holds 201 texels more —
+    // immaterial to a budget, and the reason a 720x1832 sweep drew nothing at
+    // all until 2026-09-08. The ceil form also wants a TWELFTH level, which is
+    // the half the level-count assertion above covers.
     let levels = full_mip_levels(SURVEILLANCE.0, SURVEILLANCE.1);
     assert_eq!(
-        chain_texels(SURVEILLANCE.0, SURVEILLANCE.1, levels)
-            - chain_floor_halved(SURVEILLANCE.0, SURVEILLANCE.1, levels),
+        chain_ceil_halved(SURVEILLANCE.0, SURVEILLANCE.1, levels)
+            - chain_texels(SURVEILLANCE.0, SURVEILLANCE.1, levels),
         201,
+    );
+    // And that twelfth level, so its existence is pinned and not merely
+    // described: one more 1x1 term the plane cannot be given room for.
+    assert_eq!(
+        chain_ceil_halved(SURVEILLANCE.0, SURVEILLANCE.1, levels + 1)
+            - chain_texels(SURVEILLANCE.0, SURVEILLANCE.1, levels),
+        202,
     );
 }
 
@@ -1551,10 +1576,10 @@ fn a_polar_frame_is_priced_from_its_own_buffers() {
 ///
 /// | | raster @ 7362 | polar, one tilt | ratio |
 /// |---|---:|---:|---:|
-/// | GPU | 216,796,176 | 1,758,832 | 123× |
+/// | GPU | 216,796,176 | 1,758,630 | 123× |
 /// | host held (still) | 216,796,176 | 1,319,040 | 164× |
-/// | host scratch | 433,592,352 | 439,792 | 986× |
-/// | **host peak** | **650,388,528** | **1,758,832** | **369×** |
+/// | host scratch | 433,592,352 | 439,590 | 986× |
+/// | **host peak** | **650,388,528** | **1,758,630** | **369×** |
 ///
 /// The held row and the peak fell on 2026-09-08, when the `Vec<f32>` value
 /// grid came out of the plan-view render for being written once a pixel and
@@ -1594,10 +1619,10 @@ fn what_a_polar_frame_costs_against_the_raster_it_replaces() {
 
     let levels = full_mip_levels(SURVEILLANCE.0, SURVEILLANCE.1);
     let polar = polar_frame_cost(shape(SURVEILLANCE, levels, true));
-    assert_eq!(polar.gpu, 1_758_832);
+    assert_eq!(polar.gpu, 1_758_630);
     assert_eq!(polar.host_held, 1_319_040);
-    assert_eq!(polar.host_scratch, 439_792);
-    assert_eq!(polar.host_peak(), 1_758_832);
+    assert_eq!(polar.host_scratch, 439_590);
+    assert_eq!(polar.host_peak(), 1_758_630);
 
     // The ratio, integer-floored so it cannot be read as more precise than it
     // is. 369x is the number the admission door must never be wrong about; it
@@ -1615,7 +1640,7 @@ fn what_a_polar_frame_costs_against_the_raster_it_replaces() {
 
     // The Doppler figure, which shares no denominator with either of the above.
     let doppler = polar_frame_cost(shape(DOPPLER, full_mip_levels(DOPPLER.0, DOPPLER.1), true));
-    assert_eq!(doppler.host_peak(), 1_144_411);
+    assert_eq!(doppler.host_peak(), 1_144_248);
 }
 
 /// **The per-sweep-key terms are not in the per-frame price**, and charging
@@ -1866,7 +1891,8 @@ fn the_price_weighs_the_plane_the_producer_actually_builds() {
         (RadarProduct::Velocity, 720, 1192),
         (RadarProduct::CorrelationCoefficient, 720, 1832),
         (RadarProduct::SpectrumWidth, 720, 1192),
-        // A ragged shape, where ceil-halving leaves edges on both axes.
+        // A ragged shape, where the halving leaves an odd remainder on both
+        // axes at more than one level.
         (RadarProduct::Reflectivity, 367, 913),
     ];
     for (product, radials, gates) in arms {

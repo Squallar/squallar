@@ -232,7 +232,20 @@ fn shade(in: VertexOutput) -> vec4<f32> {
     // `mip_levels == 1` the clamp pins level 0 whatever `km_per_px` is.
     let ratio = max(r_locals.km_per_px / r_sweep.gate_interval_km, 1.0);
     let lod = i32(clamp(floor(log2(ratio)), 0.0, f32(r_sweep.mip_levels - 1u)));
-    let at = vec2<i32>(gate >> u32(lod), i32(in.radial) >> u32(lod));
+    // **The index is clamped to the level, and the clamp is load-bearing on
+    // every odd extent.** A mip level is `max(1, extent >> lod)` wide, so on an
+    // odd parent the last gate's `gate >> lod` lands one past the last texel —
+    // 1831 >> 4 is 114 where level 4 of an 1832-gate plane holds 0..113. The
+    // producer's own chain reduces that odd remainder INTO the last cell
+    // (`CodePlane::build_chain`), so clamping reads the footprint the gate
+    // really belongs to; without it `textureLoad` answers zero out of bounds
+    // and the outermost gates vanish into unpainted as soon as a fragment
+    // covers more than one gate.
+    let dim = vec2<i32>(textureDimensions(t_codes, u32(lod)));
+    let at = min(
+        vec2<i32>(gate >> u32(lod), i32(in.radial) >> u32(lod)),
+        dim - vec2<i32>(1, 1),
+    );
     let code = textureLoad(t_codes, at, lod).r;
 
     // The table is STRAIGHT alpha (`Lut::to_rgba_bytes`), so the premultiply

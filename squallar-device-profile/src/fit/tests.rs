@@ -3795,7 +3795,7 @@ fn a_pane_holding_polar_frames_is_charged_for_polar_frames() {
     // one measures. Stated here rather than imported: this test is about the
     // substitution, and it must fail if the substitution stops happening
     // whatever that figure becomes.
-    const POLAR_FRAME: usize = 1_758_832;
+    const POLAR_FRAME: usize = 1_758_630;
     assert!(
         (POLAR_FRAME as u64) < raster_frame,
         "premise: the polar figure is the smaller of the two ({POLAR_FRAME} vs \

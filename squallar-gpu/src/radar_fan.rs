@@ -5,7 +5,7 @@
 //! describes: the sweep reaches the card as the **codes the wire carried**, one
 //! byte a gate, and the colour is resolved per fragment out of a
 //! `256 x 1` RGBA table instead of per gate on the CPU into a plan-view raster.
-//! A surveillance tilt is 1,758,832 B of code plane against 650,388,528 B of
+//! A surveillance tilt is 1,758,630 B of code plane against 650,388,528 B of
 //! raster at the side one is actually rendered at.
 //!
 //! # Why this is a paint callback and not an egui texture
@@ -237,8 +237,8 @@ pub fn admit(sweep: &UiSweep) -> Result<(), FanRefusal> {
         return Err(FanRefusal::Shape { radials, gates });
     }
     // Clamped the way the upload loop clamps it: a payload declaring more
-    // levels than ceil-halving can produce is uploaded to the depth that
-    // exists, so the length this checks is the length the loop will read.
+    // levels than the shape has is uploaded to the depth that exists, so the
+    // length this checks is the length the loop will read.
     let levels = sweep.levels().clamp(1, full_mip_levels(radials, gates));
     let want = chain_bytes(radials, gates, levels);
     if sweep.codes.len() != want {
@@ -344,12 +344,12 @@ fn sweep_scalars(sweep: &UiSweep) -> FanScalars {
 /// a buffer by it. `the_chain_arithmetic_is_the_producers` in
 /// `tests/radar_fan_gpu.rs` holds it against `CodePlane`.
 pub fn chain_bytes(radials: usize, gates: usize, levels: usize) -> usize {
-    let (mut r, mut g) = (radials, gates);
     let mut total = 0usize;
-    for _ in 0..levels {
+    for level in 0..levels {
+        let shift = u32::try_from(level).unwrap_or(u32::MAX);
+        let r = radials.checked_shr(shift).unwrap_or(0).max(1);
+        let g = gates.checked_shr(shift).unwrap_or(0).max(1);
         total += r * g;
-        r = r.div_ceil(2);
-        g = g.div_ceil(2);
     }
     total
 }
@@ -805,6 +805,16 @@ impl RadarFanStore {
         // the texture is created with, and a descriptor that promised more
         // levels than the loop below writes would leave a level of the chain
         // undefined for the shader to read.
+        //
+        // **`full_mip_levels` is wgpu's `Extent3d::max_mips` and each level's
+        // shape is its `mip_level_size`** — the same arithmetic, not a
+        // conservative bound on it, which is what
+        // `the_chain_arithmetic_is_the_producers` holds against wgpu itself.
+        // It was not, until 2026-09-08: the producer ceil-halved, so a
+        // 720 × 1832 sweep asked for twelve levels of a texture that admits
+        // eleven, `create_texture` refused it, and every frame after that
+        // recorded a `set_bind_group` against the invalid bind group the
+        // refusal left behind.
         let levels = sweep.levels().clamp(1, full_mip_levels(radials, gates));
         let codes = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("radar fan codes"),

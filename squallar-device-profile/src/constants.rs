@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use squallar_radar::render::codes::half_level;
+
 /// Default width for the application window in pixels
 pub const RENDER_WIDTH: u32 = 1920;
 
@@ -317,7 +319,7 @@ pub struct PolarFrameShape {
 /// any path that can reach `crate::fit::NeedTerms`. That is a hard safety
 /// constraint, not a staging convenience.
 ///
-/// A surveillance tilt prices at **1,758,832 B** here and at **650,388,528 B
+/// A surveillance tilt prices at **1,758,630 B** here and at **650,388,528 B
 /// (620.3 MiB)** under `plan_view_frame_cost(7362)` — the side a desktop arm
 /// really renders that sweep at, bound by the data's own 1832 gates and not by
 /// [`DESKTOP_RASTER_SIDE_CEILING`]. That is a factor of **369**, and it was
@@ -410,26 +412,29 @@ pub const fn polar_frame_cost(shape: PolarFrameShape) -> FrameCost {
 /// `(4/3)·R·G − 1/3` and shows where the clean factor comes from.
 ///
 /// At the two real surveillance shapes the factor is measured off the sum, not
-/// assumed: **1.333418** at 720 × 1832 and **1.333439** at 720 × 1192.
-/// (Design §6.1 prints `1.33338` for the first; the sum it prints in §2.4
-/// gives `1.333418`, so that factor is a slip in its last two digits. The
-/// second, `1.33344`, is right.)
+/// assumed: **1.333265** at 720 × 1832 and **1.333249** at 720 × 1192.
+/// (Design §6.1 prints `1.33338` and `1.33344`; both are its ceil-halved
+/// chain's factors, and the chain a texture takes is a little smaller.)
 ///
-/// # Ceil-halving, and why it cannot under-price
+/// # Which halving, and how it was settled
 ///
-/// The extents halve by `ceil`, per design §2.1 (*"each ceil-halved"*), which
-/// is **not** how WebGPU sizes a mip level — the specification's is
-/// `max(1, floor(size / 2^level))`. Nothing in this tree builds a chain today
-/// (`mip_level_count: 1` at every site), so the code cannot arbitrate and the
-/// GPU-store lane must settle it against wgpu.
+/// Design §2.1 said *"each ceil-halved"*, and this function priced a
+/// ceil-halved chain until 2026-09-08 with a note saying the question could
+/// not be arbitrated from the code and that the GPU-store lane had to settle
+/// it against wgpu. It has been settled, and against that line: a code plane
+/// is uploaded as a **texture's own mip chain**, and WebGPU fixes that
+/// arithmetic — a level's extent is `max(1, extent >> level)` and a texture
+/// may declare `floor(log2(max(w, h))) + 1` levels. A ceil-halved chain is
+/// therefore not a chain a texture will take: at 720 × 1832 wgpu answered
+/// *"Texture descriptor mip level count 12 is invalid, maximum allowed is
+/// 11"*, and clamping the count alone still overran seven of the eleven
+/// levels, the first by *"Copy of X 0..115 would end up overrunning the bounds
+/// of the Destination texture of X size 114"*.
 ///
-/// For the price it does not matter which wins, and it matters in the safe
-/// direction: `ceil(x) ≥ max(1, floor(x))` for every `x > 0`, so at equal
-/// level counts the ceil chain is **termwise ≥** the floor chain and this
-/// function never under-prices a frame the renderer builds the other way.
-/// Pinned by `ceil_halving_never_underprices_a_floor_halved_chain`. At
-/// 720 × 1832 the gap is 201 texels — immaterial to a budget, material to
-/// whoever writes the upload.
+/// So the halving is `squallar_radar::render::codes::half_level`, read from
+/// the producer rather than restated here for the reason
+/// [`MAX_POLAR_RADIALS`] is: a price computed over a chain shape the encoder
+/// does not build is a price for a frame that cannot exist.
 pub const fn chain_texels(radials: usize, gates: usize, mip_levels: usize) -> usize {
     // An empty sweep costs nothing, matching `PolarGeometry::is_empty`: a
     // render that painted no gates has no plane to reduce.
@@ -441,45 +446,36 @@ pub const fn chain_texels(radials: usize, gates: usize, mip_levels: usize) -> us
     let mut level = 0;
     while level < mip_levels {
         sum += r * g;
-        // Clamped at 1 so a chain asked for more levels than the shape has
-        // keeps adding 1×1 rather than collapsing to zero and under-pricing.
-        r = if r > 1 { ceil_half(r) } else { 1 };
-        g = if g > 1 { ceil_half(g) } else { 1 };
+        // `half_level` clamps at 1, so a chain asked for more levels than the
+        // shape has keeps adding 1×1 rather than collapsing to zero and
+        // under-pricing.
+        r = half_level(r);
+        g = half_level(g);
         level += 1;
     }
     sum
 }
 
-/// **Levels in the full ceil-halved chain over `radials × gates`**, counting
-/// level 0 — the chain that runs until both extents are 1.
+/// **Levels in the full chain over `radials × gates`**, counting level 0 — the
+/// chain that runs until both extents are 1.
 ///
-/// `ceil(log2(max(R, G))) + 1`, computed by halving rather than by a log so
-/// the answer and [`chain_texels`]'s own halving cannot disagree. 12 at
+/// `floor(log2(max(R, G))) + 1`, computed by halving rather than by a log so
+/// the answer and [`chain_texels`]'s own halving cannot disagree. 11 at
 /// 720 × 1832 and at 720 × 1192.
 ///
-/// **Design §2.4 states `L = floor(log2 max(R,G))`, and its own arithmetic
-/// contradicts that line**: the 720 × 1832 sum it prints has twelve terms and
-/// totals 1,758,832, where `floor(log2 1832) = 10` admits eleven and totals
-/// 1,758,831. The twelve-term figure is the one §6.1 prices with, so the
-/// arithmetic is the claim that survives and the formula line is the typo.
-/// (`floor` is the right level index for a **floor**-halved chain, which is
-/// how that line reads as plausible.)
+/// **Design §2.4's `L = floor(log2 max(R,G))` is the line that survives**, and
+/// the twelve-term sum it prints in the same section is the slip. This crate
+/// read it the other way round until 2026-09-08 — see [`chain_texels`] for
+/// what wgpu said about the twelve-term chain.
 pub const fn full_mip_levels(radials: usize, gates: usize) -> usize {
     let (mut r, mut g) = (radials, gates);
     let mut levels = 1;
     while r > 1 || g > 1 {
-        r = if r > 1 { ceil_half(r) } else { 1 };
-        g = if g > 1 { ceil_half(g) } else { 1 };
+        r = half_level(r);
+        g = half_level(g);
         levels += 1;
     }
     levels
-}
-
-/// `ceil(n / 2)`, spelled as a quotient plus its remainder so it is
-/// const-evaluable on this toolchain and cannot overflow the way `(n + 1) / 2`
-/// can at the top of the range.
-const fn ceil_half(n: usize) -> usize {
-    n / 2 + n % 2
 }
 
 /// One gate's code in the 8-bit plane every family migrated in design §7's
@@ -578,13 +574,13 @@ const _: () = const {
     assert!(chain_texels(720, 1832, 1) == 720 * 1832);
     assert!(chain_texels(1, 1, 1) == 1);
     // The two real surveillance shapes, off the sum rather than off a factor.
-    assert!(chain_texels(720, 1832, full_mip_levels(720, 1832)) == 1_758_832);
-    assert!(chain_texels(720, 1192, full_mip_levels(720, 1192)) == 1_144_411);
-    assert!(full_mip_levels(720, 1832) == 12);
+    assert!(chain_texels(720, 1832, full_mip_levels(720, 1832)) == 1_758_630);
+    assert!(chain_texels(720, 1192, full_mip_levels(720, 1192)) == 1_144_248);
+    assert!(full_mip_levels(720, 1832) == 11);
     // A chain asked for more levels than the shape has keeps adding 1x1 rather
     // than collapsing: an over-long request must never price at less than the
     // full chain.
-    assert!(chain_texels(720, 1832, 40) == 1_758_832 + (40 - 12));
+    assert!(chain_texels(720, 1832, 40) == 1_758_630 + (40 - 11));
 
     // The caps bound arithmetic, and the observed shapes sit inside them --
     // an observed maximum is not a bound, and these are the bounds.

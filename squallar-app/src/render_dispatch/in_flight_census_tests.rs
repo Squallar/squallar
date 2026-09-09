@@ -397,7 +397,7 @@ fn a_loop_reply_that_drew_nothing_prices_nothing() {
 /// The gap this closes is a specific one: a polar reply carries no picture, so
 /// the raster term of the price is zero for it, and a function that only knew
 /// about pictures would report a plane in flight as nothing at all. It is
-/// 1,758,832 B for a surveillance sweep — small beside the raster it replaces
+/// 1,758,630 B for a surveillance sweep — small beside the raster it replaces
 /// and not small enough to be nowhere.
 ///
 /// The picture arm is the control: it must still price its own pixels and

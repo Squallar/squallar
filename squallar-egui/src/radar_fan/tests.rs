@@ -77,7 +77,7 @@ fn a_healthy_payload_is_well_formed_in_both_shapes() {
 }
 
 #[test]
-fn the_chain_ceil_halves_both_axes_and_ends_at_one_cell() {
+fn the_chain_halves_both_axes_and_ends_at_one_cell() {
     let sweep = chained();
     assert_eq!(sweep.levels(), 4);
     let shapes: Vec<_> = (0..sweep.levels())
@@ -99,14 +99,20 @@ fn the_chain_ceil_halves_both_axes_and_ends_at_one_cell() {
 /// A shape whose halving is **ragged** — 5 and 3 both leave an odd cell — so
 /// the offsets are not power-of-two arithmetic that a wrong rule would agree
 /// with by accident.
+///
+/// It is the shape that separates the two rules, and it was pinned to the
+/// wrong one until 2026-09-08: `ceil` gives 5 → 3 → 2 → 1 and four levels,
+/// where a texture of that size holds `max(1, extent >> level)` and admits
+/// three. A payload built the other way is one `create_texture` refuses.
 #[test]
-fn a_ragged_chain_is_well_formed_at_the_lengths_ceil_halving_gives() {
-    // 5x3 -> 3x2 -> 2x1 -> 1x1 = 15 + 6 + 2 + 1 = 24.
+fn a_ragged_chain_is_well_formed_at_the_lengths_the_texture_gives() {
+    // 5x3 -> 2x1 -> 1x1 = 15 + 2 + 1 = 18, and three levels because
+    // floor(log2 5) + 1 is 3.
     let sweep = FanSweep {
         radials: 5,
         gates: 3,
-        codes: vec![1; 24],
-        level_offsets: vec![0, 15, 21, 23],
+        codes: vec![1; 18],
+        level_offsets: vec![0, 15, 17],
         edges: vec![[0.0, 72.0]; 5],
         geometry: FanGeometry {
             reach_gates: 3,
@@ -116,11 +122,12 @@ fn a_ragged_chain_is_well_formed_at_the_lengths_ceil_halving_gives() {
     };
     assert!(sweep.is_well_formed());
     assert_eq!(
-        (0..4)
+        (0..3)
             .map(|l| sweep.level_shape(l).expect("inside the chain"))
             .collect::<Vec<_>>(),
-        vec![(5, 3), (3, 2), (2, 1), (1, 1)]
+        vec![(5, 3), (2, 1), (1, 1)]
     );
+    assert_eq!(sweep.level_shape(3), None);
 }
 
 /// Each defect on its own, against the healthy payload that differs from it by

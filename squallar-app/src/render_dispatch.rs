@@ -90,8 +90,8 @@ pub fn fan_sweep(
 
     // Level 0 then the chain, in level order, with an offset per level. The
     // renderer sizes each texture level from `radials`/`gates` by the same
-    // ceil-halving the producer used, so the offsets are the only thing that
-    // has to travel.
+    // `max(1, extent >> level)` the producer built them at, so the offsets are
+    // the only thing that has to travel.
     let levels = plane.levels();
     let mut codes = Vec::with_capacity(plane.resident_bytes());
     let mut level_offsets = Vec::with_capacity(levels);

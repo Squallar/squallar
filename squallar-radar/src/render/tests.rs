@@ -3245,8 +3245,8 @@ fn a_raster_and_a_code_plane_are_weighed_against_each_other() {
     assert_eq!(side, 2048);
     assert_eq!((radials, plane_gates), (720, 600));
     assert_eq!(rendered.image.len(), 16_777_216);
-    assert_eq!(plane.levels(), 11);
-    assert_eq!(plane.resident_bytes(), 576_061);
+    assert_eq!(plane.levels(), 10);
+    assert_eq!(plane.resident_bytes(), 575_935);
 
     // The polar field is not an extra the plane adds -- it is what the plane
     // REPLACES. Today's raster path already carries a `Vec<f32>` of the same

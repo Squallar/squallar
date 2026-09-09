@@ -441,18 +441,33 @@ impl Reduce {
     }
 }
 
+/// **One level down: `max(1, n >> 1)`** — the halving a GPU mip chain is
+/// defined by, and therefore the only halving this chain may use.
+///
+/// A code plane is uploaded as a texture's own mip chain, and WebGPU fixes
+/// both halves of that arithmetic: a level's extent is
+/// `max(1, extent >> level)` and the levels a texture may declare are
+/// `floor(log2(max(w, h))) + 1`. A chain halved any other way is not a mip
+/// chain — it is a set of buffers whose shapes the texture will refuse, which
+/// is what a ceil-halved chain was until 2026-09-08.
+pub const fn half_level(n: usize) -> usize {
+    if n > 1 { n >> 1 } else { 1 }
+}
+
 /// Levels in a full chain over `radials x gates`, **counting level 0**.
 ///
 /// The last level is the one whose both dimensions have reached 1 under
-/// repeated ceil-halving. `squallar_device_profile::constants::full_mip_levels`
-/// answers the same question on the pricing side; this is the producer's own,
-/// and `the_price_weighs_the_plane_the_producer_actually_builds` holds them equal.
+/// repeated [`half_level`], which is `floor(log2(max(radials, gates))) + 1` —
+/// wgpu's `Extent3d::max_mips` verbatim, because the chain IS the texture's
+/// mip chain. `squallar_device_profile::constants::full_mip_levels` answers
+/// the same question on the pricing side; this is the producer's own, and
+/// `the_price_weighs_the_plane_the_producer_actually_builds` holds them equal.
 pub fn full_mip_levels(radials: usize, gates: usize) -> usize {
     let mut levels = 1;
     let (mut r, mut g) = (radials, gates);
     while r > 1 || g > 1 {
-        r = r.div_ceil(2);
-        g = g.div_ceil(2);
+        r = half_level(r);
+        g = half_level(g);
         levels += 1;
     }
     levels
@@ -461,12 +476,13 @@ pub fn full_mip_levels(radials: usize, gates: usize) -> usize {
 /// **A sweep's gates as the codes the wire carried, plus a max-reducing mip
 /// chain** — the polar representation's payload.
 ///
-/// Radial-major, one byte per gate at level 0. Each further level ceil-halves
-/// both dimensions and reduces the up-to-four cells beneath it by the
-/// product's [`Reduce`], so a zoomed-out fragment reads the strongest echo in
-/// its footprint instead of whichever radial happened to be written last. That
-/// is a deliberate change from the raster, whose `RenderBuffers::claim` orders
-/// by `write_key` and is therefore last-radial-wins.
+/// Radial-major, one byte per gate at level 0. Each further level halves both
+/// dimensions by [`half_level`] — the texture mip chain's own arithmetic, and
+/// not a shape of this crate's choosing — and reduces the cells beneath it by
+/// the product's [`Reduce`], so a zoomed-out fragment reads the strongest echo
+/// in its footprint instead of whichever radial happened to be written last.
+/// That is a deliberate change from the raster, whose `RenderBuffers::claim`
+/// orders by `write_key` and is therefore last-radial-wins.
 ///
 /// **A renderer emits these now** and nothing draws them yet, which are two
 /// different statements: [`crate::render::render_sweep_plane`] builds a plane
@@ -479,7 +495,7 @@ pub fn full_mip_levels(radials: usize, gates: usize) -> usize {
 pub struct CodePlane {
     /// Level 0, radial-major, `radials * gates` bytes.
     codes: Vec<u8>,
-    /// Levels 1..=L concatenated, each ceil-halved from the one before.
+    /// Levels 1..=L concatenated, each [`half_level`] of the one before.
     mips: Vec<u8>,
     /// Where each level begins in [`CodePlane::mips`], indexed by
     /// `level - 1`; one entry per level above zero.
@@ -578,20 +594,25 @@ impl CodePlane {
         let (mut r, mut g) = (self.radials, self.gates);
         for level in 1..levels {
             let (pr, pg) = (r, g);
-            r = r.div_ceil(2);
-            g = g.div_ceil(2);
+            r = half_level(pr);
+            g = half_level(pg);
             self.mip_offsets.push(self.mips.len());
             for radial in 0..r {
+                // **The last cell of an odd axis takes the remainder**, so the
+                // footprints still PARTITION the level above: `half_level`
+                // rounds down, and a cell that stopped at two would leave the
+                // parent's odd last row or column in no footprint at all — a
+                // gate the sweep measured that no zoomed-out fragment can
+                // read. Up to three either way, so up to nine cells.
+                let r_end = if radial + 1 == r { pr } else { radial * 2 + 2 };
                 for gate in 0..g {
-                    let mut cells = [None; 4];
+                    let g_end = if gate + 1 == g { pg } else { gate * 2 + 2 };
+                    let mut cells = [0u8; 9];
                     let mut n = 0;
-                    for dr in 0..2 {
-                        for dg in 0..2 {
-                            let (sr, sg) = (radial * 2 + dr, gate * 2 + dg);
-                            if sr < pr && sg < pg {
-                                cells[n] = Some(self.level_code(level - 1, pg, sr, sg));
-                                n += 1;
-                            }
+                    for sr in radial * 2..r_end {
+                        for sg in gate * 2..g_end {
+                            cells[n] = self.level_code(level - 1, pg, sr, sg);
+                            n += 1;
                         }
                     }
                     let reduced = self.reduce_cells(&cells[..n]);
@@ -613,18 +634,18 @@ impl CodePlane {
         }
     }
 
-    /// The declared reduce over up to four cells, with the sentinel rule.
+    /// The declared reduce over a cell's footprint, with the sentinel rule.
     ///
     /// Codes 0 and 1 are status and not measurement, so they are excluded from
     /// the comparison and only survive when nothing under the cell measured
     /// anything. Excluding them from [`Reduce::MaxMagnitude`] is load-bearing:
     /// code 0 sits 129 away from a mid-scale zero and would otherwise beat
     /// every real velocity.
-    fn reduce_cells(&self, cells: &[Option<u8>]) -> u8 {
+    fn reduce_cells(&self, cells: &[u8]) -> u8 {
         let zero_code = self.key.offset.round();
         let mut best: Option<u8> = None;
         let mut folded = false;
-        for code in cells.iter().flatten().copied() {
+        for code in cells.iter().copied() {
             match code {
                 BELOW_THRESHOLD_CODE => {}
                 RANGE_FOLDED_CODE => folded = true,
@@ -666,8 +687,8 @@ impl CodePlane {
     pub fn level(&self, level: usize) -> Option<(&[u8], usize, usize)> {
         let (mut r, mut g) = (self.radials, self.gates);
         for _ in 0..level {
-            r = r.div_ceil(2);
-            g = g.div_ceil(2);
+            r = half_level(r);
+            g = half_level(g);
         }
         if level == 0 {
             return Some((&self.codes, r, g));
@@ -779,7 +800,7 @@ impl CodePlane {
     /// the chain at upload for the same reason it is not a wire field.
     ///
     /// The saving is real and on the campaign's own axis: a surveillance
-    /// sweep's level 0 is 1,319,040 B against the whole chain's 1,758,832 B
+    /// sweep's level 0 is 1,319,040 B against the whole chain's 1,758,630 B
     /// (`a_surveillance_sweeps_plane_costs_what_the_chain_sums_to`), so the
     /// transient the receiving side allocates is 25% smaller than the object
     /// it builds.

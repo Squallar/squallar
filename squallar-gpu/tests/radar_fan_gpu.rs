@@ -191,17 +191,23 @@ fn geometry(elevation_deg: Option<f32>) -> FanGeometry {
 }
 
 /// One payload's level offsets, for a chain laid out level 0 first with no gap.
+///
+/// `max(1, extent >> level)`, which is the texture's own mip extent and
+/// therefore the producer's: see `the_chain_arithmetic_is_the_producers`.
 fn level_offsets(radials: usize, gates: usize, levels: usize) -> Vec<u32> {
-    let (mut r, mut g) = (radials, gates);
     let mut at = 0u32;
     let mut out = Vec::with_capacity(levels);
-    for _ in 0..levels {
+    for level in 0..levels {
         out.push(at);
-        at += (r * g) as u32;
-        r = r.div_ceil(2);
-        g = g.div_ceil(2);
+        at += (level_extent(radials, level) * level_extent(gates, level)) as u32;
     }
     out
+}
+
+/// One axis at one level, the way a texture sizes it.
+fn level_extent(extent: usize, level: usize) -> usize {
+    let shift = u32::try_from(level).unwrap_or(u32::MAX);
+    extent.checked_shr(shift).unwrap_or(0).max(1)
 }
 
 /// One payload from its parts, laid out level 0 first with no gap.
@@ -710,12 +716,27 @@ fn the_sweep_uniform_fits_the_webgl2_guaranteed_block() {
     assert_eq!(SECTORS, MAX_POLAR_RADIALS);
 }
 
-/// **The chain arithmetic this module slices by is the producer's own.**
+/// **The chain arithmetic this module slices by is the producer's own — and
+/// both are the TEXTURE's.**
 ///
 /// The store cuts one uploaded buffer into mip levels with [`chain_bytes`];
 /// `squallar_radar`'s `CodePlane` fills that buffer with its own. Two spellings
 /// of one sum is how a level gets uploaded from the wrong offset — a picture
 /// that is plausible at every zoom and wrong at all but one.
+///
+/// **The third party is wgpu**, and it is the one that was missing until
+/// 2026-09-08. A code plane is uploaded as a texture's own mip chain, so the
+/// level count and every level's extent are the texture's to decide:
+/// `Extent3d::max_mips` and `Extent3d::mip_level_size`, asked here as pure
+/// functions so this needs no adapter. The producer ceil-halved instead, and a
+/// 720 × 1832 sweep — the commonest shape there is — asked for twelve levels
+/// of a texture that admits eleven. `create_texture` refused it, the refusal
+/// made the bind group invalid, and every frame afterwards logged
+/// *"BindGroup with 'radar fan sweep' label is invalid"* against a pane with
+/// no radar on it.
+///
+/// TAMPER: ceil-halve either `full_mip_levels` or `FanSweep::level_shape` and
+/// the wgpu rows below go red at 720 × 1832 and at 17 × 5.
 #[test]
 fn the_chain_arithmetic_is_the_producers() {
     use squallar_radar::render::codes::{CodePlane, LutKey, full_mip_levels};
@@ -737,6 +758,22 @@ fn the_chain_arithmetic_is_the_producers() {
             plane.resident_bytes(),
             "the store's chain arithmetic disagrees with the producer's at \
              {radials}x{gates}"
+        );
+        // **The texture's own answer.** `RadarFanStore::ensure` creates the
+        // plane at `width = gates, height = radials`, so this is that
+        // descriptor and not a restatement of the shape.
+        let extent = wgpu::Extent3d {
+            width: gates as u32,
+            height: radials as u32,
+            depth_or_array_layers: 1,
+        };
+        assert_eq!(
+            levels as u32,
+            extent.max_mips(wgpu::TextureDimension::D2),
+            "a {radials}x{gates} plane declares {levels} levels and a texture \
+             of that size admits {}; `create_texture` refuses the descriptor \
+             and every later `set_bind_group` names an invalid bind group",
+            extent.max_mips(wgpu::TextureDimension::D2),
         );
         // And level by level, which is what the upload actually slices.
         let mut geom = geometry(Some(0.5));
@@ -767,6 +804,19 @@ fn the_chain_arithmetic_is_the_producers() {
                 "level {level} at {radials}x{gates}"
             );
             assert_eq!(mine, theirs, "level {level} at {radials}x{gates}");
+            // And the extent the texture will hold that level at, which is
+            // what `queue.write_texture` copies into. A level one texel wider
+            // than its own mip overruns it — the second half of the same
+            // defect, and the half a level-count clamp alone would have left.
+            let gpu = extent.mip_level_size(level as u32, wgpu::TextureDimension::D2);
+            assert_eq!(
+                (r, g),
+                (gpu.height, gpu.width),
+                "level {level} at {radials}x{gates} is {r}x{g} and its mip is \
+                 {}x{}",
+                gpu.height,
+                gpu.width,
+            );
         }
     }
 }
@@ -1583,13 +1633,33 @@ fn a_callback_with_no_store_draws_nothing_and_is_counted() {
     );
 }
 
-/// **The mip level is chosen by how much ground a pixel covers.**
+/// **The mip level is chosen by how much ground a pixel covers — over the
+/// WHOLE chain, and the device raises no error uploading it.**
 ///
 /// A zoomed-out fragment must read the strongest echo in its footprint rather
 /// than whichever radial happened to be written last, and the mechanism is an
 /// explicit level chosen from `km_per_px` against the gate's own ground depth.
-/// Two levels are planted with disjoint codes, so the level being read names
-/// itself in the colour.
+/// Every level is planted with a constant code of its own, so the level being
+/// read names itself in the colour.
+///
+/// **The chain is the full one, and that is what this test was missing.** It
+/// drove four levels of a 360 × 200 plane until 2026-09-08 — 360, 180, 90, 45
+/// and 200, 100, 50, 25, every one of them an exact halving — so it never
+/// reached a level where an extent goes odd and never asked a texture for more
+/// levels than it admits. A real 720 × 1832 sweep does both at once: it asked
+/// for twelve levels of a texture that takes eleven, `create_texture` refused
+/// the descriptor, and the invalid bind group that left behind was recorded
+/// into the encoder on every frame for the rest of the session. Fifteen GPU
+/// suites were green through all of it.
+///
+/// From level 4 the fixture's own extents go odd (45 → 22, 25 → 12), which is
+/// where the fragment's index needs its clamp: gate 199 shifts to 12 where
+/// level 4 holds 0..11. Without the clamp `textureLoad` answers zero out of
+/// bounds and the outer gates read unpainted, which the constant code makes
+/// visible.
+///
+/// TAMPER: drop the fragment's `min` against `textureDimensions`, or
+/// ceil-halve either side of the chain arithmetic, and the deep arms go red.
 #[test]
 #[ignore = "needs a real wgpu adapter"]
 fn the_mip_level_is_chosen_by_the_pixel_footprint() {
@@ -1598,32 +1668,56 @@ fn the_mip_level_is_chosen_by_the_pixel_footprint() {
         eprintln!("SKIPPED: no wgpu adapter");
         return;
     };
+    // **Every validation error the device raises, kept.** The symptom this
+    // test now covers is a device error and not a wrong pixel: a refused
+    // `create_texture` leaves an invalid bind group, and what a running app
+    // shows for it is an unbounded log flood beside a pane with no radar.
+    let errors: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&errors);
+    device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
+        sink.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(format!("{e}"));
+    }));
     let format = wgpu::TextureFormat::Rgba8Unorm;
     let lut = opaque_lut();
 
-    // Four levels, each a constant code of its own.
-    const LEVELS: usize = 4;
+    // The whole chain, each level a constant code of its own.
+    let levels = squallar_radar::render::codes::full_mip_levels(RADIALS, GATES);
+    assert_eq!(levels, 9, "the fixture shape's full chain");
     let mut codes = Vec::new();
-    let (mut r, mut g) = (RADIALS, GATES);
-    for level in 0..LEVELS {
-        codes.extend(std::iter::repeat_n(10u8 + level as u8, r * g));
-        r = r.div_ceil(2);
-        g = g.div_ceil(2);
+    for level in 0..levels {
+        let cells = level_extent(RADIALS, level) * level_extent(GATES, level);
+        codes.extend(std::iter::repeat_n(10u8 + level as u8, cells));
     }
     let sweep = Arc::new(payload(
         RADIALS,
         GATES,
         codes,
-        LEVELS,
+        levels,
         lut.clone(),
         one_degree_edges(),
         geometry(None),
     ));
-    admit(&sweep).expect("four levels of the fixture shape");
+    assert!(
+        sweep.is_well_formed(),
+        "the full-chain fixture describes itself"
+    );
+    admit(&sweep).expect("the whole chain of the fixture shape");
 
     // `gate_interval_km` is 1 km here, so `km_per_px` names the level directly:
     // floor(log2(km_per_px)).
-    for (km_per_px, level) in [(1.0f32, 0usize), (2.0, 1), (4.0, 2), (16.0, 3)] {
+    for (km_per_px, level) in [
+        (1.0f32, 0usize),
+        (2.0, 1),
+        (4.0, 2),
+        (8.0, 3),
+        (16.0, 4),
+        (32.0, 5),
+        (64.0, 6),
+        (128.0, 7),
+        (256.0, 8),
+    ] {
         let mut at_zoom = view(1.0);
         at_zoom.km_per_pt = km_per_px;
         let store = RadarFanStore::new(&device, attachments(format));
@@ -1688,4 +1782,15 @@ fn the_mip_level_is_chosen_by_the_pixel_footprint() {
         }
     }
     assert!(compared > 15_000, "only {compared} pixels were compared");
+
+    let raised = errors
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        raised.is_empty(),
+        "the device raised {} validation errors uploading and drawing this \
+         chain; the first is what the rest are downstream of:\n{}",
+        raised.len(),
+        raised.join("\n"),
+    );
 }

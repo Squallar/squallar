@@ -458,11 +458,23 @@ fn woven_codes(radials: usize, gates: usize, seed: u64) -> Vec<u8> {
 fn reduce_footprint(plane: &CodePlane, reduce: Reduce, level: usize, r: usize, g: usize) -> u8 {
     let (radials, gates) = plane.shape();
     let span = 1usize << level;
+    // The footprint is `[i·2^L, (i+1)·2^L)` — **except at the last cell of an
+    // axis, which takes the odd remainder the halving rounded off.** Written
+    // from the partition rather than from the builder: a `min` against the
+    // extent, which is what stood here, silently agreed with a chain that
+    // dropped those gates.
+    let end = |i: usize, extent: usize| {
+        if i + 1 == (extent >> level).max(1) {
+            extent
+        } else {
+            (i + 1) * span
+        }
+    };
     let zero = plane.key().offset.round();
     let mut best: Option<u8> = None;
     let mut folded = false;
-    for radial in r * span..((r + 1) * span).min(radials) {
-        for gate in g * span..((g + 1) * span).min(gates) {
+    for radial in r * span..end(r, radials) {
+        for gate in g * span..end(g, gates) {
             let code = plane.code_at(0, radial, gate).expect("inside level 0");
             match code {
                 0 => {}
@@ -495,9 +507,10 @@ fn reduce_footprint(plane: &CodePlane, reduce: Reduce, level: usize, r: usize, g
 /// The property the zoomed-out picture rests on. The chain is built level from
 /// level, which is only equal to reducing the whole footprint at once because
 /// each operator is a maximum over a total order with the same fallback; this
-/// asserts that rather than arguing it. Shapes are deliberately odd so
-/// ceil-halving leaves ragged edges, where a footprint is smaller than
-/// `2^level` on one or both axes.
+/// asserts that rather than arguing it. Shapes are deliberately odd so the
+/// halving leaves a remainder, where a footprint is LARGER than `2^level` on
+/// one or both axes — the last cell of an odd extent takes it, which is what
+/// keeps the footprints a partition of level 0.
 #[test]
 fn max_mip_is_max() {
     let shapes = [(720usize, 1832usize), (360, 230), (37, 5), (1, 1), (2, 3)];
@@ -760,10 +773,10 @@ fn a_surveillance_sweeps_plane_costs_what_the_chain_sums_to() {
         })
         .sum();
     assert_eq!(plane.resident_bytes(), summed);
-    assert_eq!(plane.levels(), 12);
+    assert_eq!(plane.levels(), 11);
     assert_eq!(
         plane.resident_bytes(),
-        1_758_832,
+        1_758_630,
         "the measured plane and the price's arithmetic must agree, or one of them is wrong \
          about the representation",
     );
@@ -836,7 +849,7 @@ fn the_plane_wire_layout_is_the_one_this_protocol_ships() {
 /// **A plane survives its own wire form, chain and all.**
 ///
 /// Over every product an R8 plane admits, at both wire word sizes and at
-/// shapes that exercise the odd-dimension ceil-halving, because the chain is
+/// shapes that exercise the odd-dimension halving, because the chain is
 /// rebuilt on the far side rather than carried and a rebuild that disagreed
 /// with the original would be a different picture at every zoom but the
 /// closest.

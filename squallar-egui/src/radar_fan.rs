@@ -126,8 +126,8 @@ pub struct FanGeometry {
 /// radial was drawn over.
 ///
 /// Radial-major at every level. Level 0 is `radials * gates` bytes; each
-/// further level ceil-halves both dimensions and holds the strongest code
-/// beneath it, so a fragment covering many gates reads the strongest echo in
+/// further level is `max(1, extent >> level)` on both axes — a texture mip
+/// chain's own arithmetic — and holds the strongest code beneath it, so a fragment covering many gates reads the strongest echo in
 /// its footprint rather than whichever radial happened to be written last.
 /// That is a deliberate change from the raster's arbitration and the design
 /// records it as ruling (1).
@@ -170,19 +170,22 @@ impl FanSweep {
         self.level_offsets.len()
     }
 
-    /// A level's dimensions, by repeated ceil-halving — the producer's own
-    /// rule, restated on the consumer's side because the renderer has to size
-    /// a texture level from it and the two must not disagree.
+    /// A level's dimensions, `max(1, extent >> level)` — which is the
+    /// producer's own halving AND WebGPU's mip-level extent, the two being one
+    /// rule for the reason the producer states: the chain is uploaded as a
+    /// texture's mip chain, so a level's shape is not a choice either side
+    /// gets to make. Restated on the consumer's side because the renderer has
+    /// to size a texture level from it, and held equal to the producer's by
+    /// `squallar-gpu`'s `the_chain_arithmetic_is_the_producers`.
     pub fn level_shape(&self, level: usize) -> Option<(u32, u32)> {
         if level >= self.levels() {
             return None;
         }
-        let (mut r, mut g) = (self.radials, self.gates);
-        for _ in 0..level {
-            r = r.div_ceil(2);
-            g = g.div_ceil(2);
-        }
-        Some((r, g))
+        let shift = u32::try_from(level).ok()?;
+        Some((
+            self.radials.checked_shr(shift).unwrap_or(0).max(1),
+            self.gates.checked_shr(shift).unwrap_or(0).max(1),
+        ))
     }
 
     /// A level's bytes, or `None` past the chain or where the payload is
