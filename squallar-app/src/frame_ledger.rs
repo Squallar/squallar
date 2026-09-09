@@ -523,6 +523,16 @@ pub(crate) struct FinishHists {
 /// are now one figure derived from that frame and that bandwidth
 /// (`texture_upload::whole_budget`), so the six-pane `upload` reading above is
 /// a reading of the OLD routing and is kept as the before half of the pair.
+///
+/// **The table is one box's arms, and `upload`'s share does not port.** Both
+/// columns are Linux legs; on Metal the same segment is
+/// **tessellate-dominated**. Scene C, Firefox: `prepare`'s `tessellate` is
+/// **1,513 us — 51 %**, and `upload` is **33 us — 1.1 %**, against the
+/// 85.2 % above. That is not a small difference in a share, it is two orders
+/// of magnitude in the cut's absolute cost, and it inverts which of the six
+/// is worth opening. A reader prioritising `prepare` off the six-pane column
+/// alone would optimise the wrong cut on Apple hardware. Read the arm your
+/// target runs on; these are never merged.
 #[derive(Default)]
 pub(crate) struct PrepareHists {
     /// `Gui::ui` return to the egui pass's close: the app's own prologue —
@@ -792,9 +802,43 @@ pub(crate) struct StackHists {
 ///
 /// **Those figures are from software rasterisers on a contended box** (1-min
 /// loadavg 14.4–25.5), so the absolutes are inflated; the shares and the
-/// leader-counts are what they support. On hardware `finish` shrinks — it is
-/// 95.6 % `finish:submit` on llvmpipe — so `ui`'s share would RISE. That is a
-/// mechanism and not a measurement, and no number is quoted for it here.
+/// leader-counts are what they support.
+///
+/// # The hardware prediction, and how it scored
+///
+/// This paragraph used to end by saying that on hardware `finish` shrinks —
+/// it is 95.6 % `finish:submit` on llvmpipe — so `ui`'s share would RISE, and
+/// that this was a mechanism rather than a measurement with no number behind
+/// it. It has since been measured on **two independent hardware arms**, and it
+/// scored.
+///
+/// **Three measurement arms, never merged and never averaged**: the browser
+/// *software* pair the paragraph above is read on, a browser *hardware* pair,
+/// and a *native* adapter pair. Each has its own denominator and its own box.
+/// (Unrelated to the three *pane kinds* the `widget` section below counts.)
+///
+/// **Mac M2, real EDID sink 1080p60, Metal through `BrowserWebGpu`, canvas
+/// 1248x714, settled window, Firefox 155.0.1.** `finish` fell from
+/// 28.7–35.5 % of the frame to **5.1–5.6 %**. Over the same denominator the
+/// llvmpipe figure uses — `finish:submit` against `finish:whole` — it fell
+/// from 95.6 % to **16.7–20.0 %**, and on Chromium from 88 % to
+/// **9.9–12.5 %**. `finish` never exceeded **439 us** in any latched worst
+/// frame. `ui` rose from 42.6–52.3 % to **58.5 %** on Firefox at one pane;
+/// Chromium's 49.2–50.1 % sits *inside* its own software range, so on this
+/// arm the rise is clear **on the governing browser only**.
+///
+/// **Linux, RTX 3090, adapter-isolated native pair** — the same binary, the
+/// same display, the only difference the Vulkan ICD, so llvmpipe was
+/// unreachable on one leg and nothing else could account for the gap.
+/// `finish` 86.0 % → **8.1 %**; `ui` 5.1 % → **48.9 %**. **8.3x on the
+/// adapter alone.**
+///
+/// **The correction that matters, and it is a narrowing.** Read against the
+/// *browser software* arms, hardware `ui` at 48.9–58.5 % OVERLAPS Firefox's
+/// software 42.6–52.3 %: those two do not separate, and a reader quoting the
+/// rise off the table above would be quoting an overlap. The rise is measured
+/// against the **native llvmpipe control** — 5.1 % → 48.9 % on one binary,
+/// one display and one ICD swap — and that is the pair to cite it from.
 ///
 /// # `widget` is structurally absent, not small, on two of the three arms
 ///
