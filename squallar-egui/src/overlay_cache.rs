@@ -82,6 +82,28 @@ pub const SETTLE_QUIET_FRAMES: u8 = 2;
 /// pathology move together.
 const SWEEP_QUIET_FRAMES: u8 = 8;
 
+/// How many **blank** answers one cache remembers, by the token each answered.
+///
+/// A playing loop is a cyclic walk over a *fixed, small* set of depicted
+/// instants — the frames in the transport's lookback — and every one of them
+/// mints its own cache token. A layer whose picture at most of those instants
+/// is empty therefore re-rasterizes the same blank once per stop per cycle,
+/// for ever: at the seed's 10 fps over a 3,600 s lookback of ~5 min volumes
+/// that is a dozen stops revisited every 1.2 s, and the single-slot
+/// [`OverlayTextureCache::blank`] can only recognise the one it answered last.
+///
+/// **The number is the loop's frame count, not a memory budget.** An entry is
+/// a [`PictureShape`] and nothing else — no buffer, no texture, no upload —
+/// so 64 of them is under 4 kB in a cache whose *pictures* are 2,995,200 B
+/// each, and the ring is a `Vec` that grows only as far as a pane actually
+/// goes blank. What the size buys is coverage of a whole cycle: a walk of N
+/// stops is recognised completely while `N <= 64` and not at all above it,
+/// because a FIFO ring under a cyclic walk longer than itself evicts each
+/// entry exactly before it is next asked for. 64 is four times the seed's
+/// twelve and covers a 12-hour lookback at hourly stops; past it this
+/// degrades to the behaviour it replaces rather than to anything worse.
+const BLANK_MEMO_SLOTS: usize = 64;
+
 /// Whether the map's zoom is being driven this frame.
 ///
 /// **The state the settle used to infer from a clock.** The question the settle
@@ -1168,6 +1190,32 @@ pub struct OverlayTextureCache {
     /// [`Self::current`] and by [`Self::settle_arrival`] on the frame the
     /// renderer says every band has landed.
     showing_arriving: bool,
+    /// **The tokens this cache has been handed a blank for**, newest last,
+    /// bounded by [`BLANK_MEMO_SLOTS`].
+    ///
+    /// [`Self::blank`] is what the pane is *drawing*; this is what it has been
+    /// *told*, and the two are different questions the moment a pane's clock
+    /// walks a loop. The content arm dispatches whenever the incoming token is
+    /// not the displayed picture's, which is right for a picture and wasteful
+    /// for an absence: a stop whose answer was empty a cycle ago has an empty
+    /// answer now, and re-asking mints a whole-viewport raster whose entire
+    /// content is that there is nothing to draw.
+    ///
+    /// Each entry is the [`PictureShape`] the blank was rendered for, so the
+    /// claim it supports is the exact one: *a raster of this token, at this
+    /// plan size and this quantized zoom, over ground containing the viewport
+    /// being asked about, painted nothing.* Every one of those terms is
+    /// checked before the memo is allowed to answer — see
+    /// [`Self::content_answer_is_known_blank`] — and a mismatch on any of them
+    /// falls through to the dispatch that would have happened anyway.
+    ///
+    /// **It cannot delay a new item appearing.** A token is a function of the
+    /// layer's `data_generation`, so an arrival moves every one of this
+    /// layer's tokens at once and no entry here can be reached again; the very
+    /// next frame misses the memo and dispatches exactly as it does today.
+    blank_memo: Vec<PictureShape>,
+    /// Where the next [`Self::blank_memo`] entry goes once the ring is full.
+    blank_memo_next: usize,
 }
 
 impl Default for OverlayTextureCache {
@@ -1194,6 +1242,8 @@ impl OverlayTextureCache {
             sweep_discarded: false,
             settle_owed_frames: 0,
             showing_arriving: false,
+            blank_memo: Vec::new(),
+            blank_memo_next: 0,
         }
     }
 
@@ -1271,6 +1321,70 @@ impl OverlayTextureCache {
         self.current = None;
         self.showing_arriving = false;
         self.blank = Some(shape);
+        self.remember_blank(shape);
+    }
+
+    /// File `shape` under its own token in [`Self::blank_memo`], so the next
+    /// pass of a looping clock over the same stop can recognise it.
+    ///
+    /// **Replaces in place on a token already filed**, rather than appending:
+    /// a token re-answered at a new zoom or size must not hold two entries,
+    /// because the ring is the loop's cycle and a duplicate costs a stop.
+    fn remember_blank(&mut self, shape: PictureShape) {
+        if let Some(slot) = self
+            .blank_memo
+            .iter_mut()
+            .find(|m| m.data_generation == shape.data_generation)
+        {
+            *slot = shape;
+            return;
+        }
+        if self.blank_memo.len() < BLANK_MEMO_SLOTS {
+            self.blank_memo.push(shape);
+            return;
+        }
+        self.blank_memo[self.blank_memo_next] = shape;
+        self.blank_memo_next = (self.blank_memo_next + 1) % BLANK_MEMO_SLOTS;
+    }
+
+    /// **Whether the content arm's raster is one this cache has already been
+    /// told is empty**, over ground that contains `viewport_bounds`.
+    ///
+    /// Every term of the claim is checked and none is inferred:
+    ///
+    /// * the pane must be **drawing nothing** for this layer right now
+    ///   ([`Self::blank`]), so the suppressed raster would replace an absence
+    ///   with the same absence and the glass is pixel-for-pixel identical
+    ///   either way. A pane drawing ink is never held on it — that would be
+    ///   stale ink, which is the one thing a blank exists to clear;
+    /// * a filed answer must carry **this exact token**, which is the whole of
+    ///   the cache-token contract: equal token, equal picture;
+    /// * at **this plan size and this quantized zoom**, because both reach the
+    ///   rasterizer (item sizes scale with zoom) and neither is in the token;
+    /// * over **ground the viewport is inside of**, by the same
+    ///   [`pan_exceeds_coverage`] the coverage arm judges a picture by. Nothing
+    ///   painted over the whole of that ground cannot paint inside part of it.
+    ///
+    /// A miss on any term falls through to the dispatch that would have
+    /// happened, and so does a token this cache has never seen blank.
+    fn content_answer_is_known_blank(
+        &self,
+        token: u64,
+        zoom: f64,
+        viewport_bounds: &GeoBounds,
+        plan: &OverlayTexturePlan,
+    ) -> bool {
+        if self.blank.is_none() {
+            return false;
+        }
+        let render_zoom = quantize_zoom(zoom);
+        self.blank_memo.iter().any(|m| {
+            m.data_generation == token
+                && m.width == plan.width
+                && m.height == plan.height
+                && m.render_zoom == render_zoom
+                && !pan_exceeds_coverage(&m.placed.geo, viewport_bounds)
+        })
     }
 
     /// Whether the last answer this cache took painted nothing.
@@ -1384,6 +1498,13 @@ impl OverlayTextureCache {
         self.hold_superseded = false;
         self.sweep_discarded = false;
         self.showing_arriving = false;
+        // **The filed answers go with the answer they qualify.** A cleared
+        // cache is one whose layer was switched off or whose pane was reset,
+        // and `blank` is what every memo hit is gated on; keeping the ring
+        // across a clear would hold answers about a posture the pane no
+        // longer has, and cost the bytes for nothing.
+        self.blank_memo.clear();
+        self.blank_memo_next = 0;
     }
 
     /// Let go of a held picture without showing it.
@@ -1586,7 +1707,19 @@ impl OverlayTextureCache {
         // dispatch exactly as they did before. What it removes is the second
         // and later dispatch into a pane that has *demonstrated* it cannot
         // land the first.
-        if tex.data_generation != token {
+        // **And the answer for it is not one this cache has already been told
+        // is empty.** The conjunct is the whole of the blank memo's effect on
+        // this gate, and it is deliberately a *fall-through* rather than an
+        // early `return None`: every arm below — plan size, zoom band, zoom
+        // settle, coverage — still gets to speak, judged against the blank the
+        // pane is drawing exactly as it would be judged against a picture. So
+        // the memo can only ever remove the raster the content arm was about
+        // to spend on an absence the pane already displays; it can withhold
+        // nothing any other arm was owed. See
+        // [`Self::content_answer_is_known_blank`] for the terms.
+        if tex.data_generation != token
+            && !self.content_answer_is_known_blank(token, zoom, viewport_bounds, plan)
+        {
             // **A sweeping token is not the same event as a token that moved
             // once**, and the difference is what a dispatch can possibly
             // achieve. A one-shot move — data arrived, the theme flipped, a
@@ -2098,6 +2231,11 @@ mod coverage_dispatch_tests;
 /// is still waiting on its replacement, and nothing else.
 #[cfg(test)]
 mod content_brake_tests;
+
+/// What a cache may decline to re-ask for: the empty answers a looping clock
+/// has already been given, and the seven terms that make one reusable.
+#[cfg(test)]
+mod blank_memo_tests;
 
 /// What a sweeping pane clock costs the whole-picture dispatch: how many
 /// rasters it spends, how many of those uploads it throws away, and how far
