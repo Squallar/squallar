@@ -10,8 +10,8 @@
 //! `OutOfMemory` event says nothing about recovery. A governor that lowers a
 //! presumption on such a signal and cannot observe the heap coming back is a
 //! ratchet. This crate is the figure that can fall: what the process has
-//! allocated less what it has freed, read off two `Relaxed` atomics that the
-//! global allocator bumps on every call.
+//! allocated less what it has freed, kept in one `Relaxed` atomic that the
+//! global allocator adds to on every grant and subtracts from on every free.
 //!
 //! # What it is, and what it is not
 //!
@@ -40,10 +40,12 @@
 //! * **Nothing here allocates.** The hooks are a delegation and two atomic
 //!   adds; a `log::`, a `format!` or a `Vec` inside the allocator re-enters
 //!   it.
-//! * **Two atomics, `Relaxed`.** A reader wants a recent figure, not a
-//!   synchronised one; the cost is one fetch-add on each call, which is the
-//!   prediction the frame-time lane's `frame prepare` p50/p99 gate this
-//!   against.
+//! * **One atomic, `Relaxed`.** A reader wants a recent figure, not a
+//!   synchronised one; the cost is one read-modify-write on each call, which
+//!   is the prediction the frame-time lane's `frame prepare` p50/p99 gate this
+//!   against. It is one counter and not a granted/freed pair because the
+//!   grant path reads the live figure on every allocation and files it in a
+//!   maximum that never comes back down — see [`LIVE`].
 //!
 //! # Installing it
 //!
@@ -61,14 +63,37 @@
 pub mod process;
 
 use core::alloc::{GlobalAlloc, Layout};
-use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use core::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 use std::alloc::System;
 
-/// Bytes every granted allocation has ever asked for, summed. Monotone.
-static ALLOCATED: AtomicU64 = AtomicU64::new(0);
+/// **Bytes granted less bytes returned, in ONE atomic.**
+///
+/// Not a monotone `ALLOCATED` and a monotone `FREED` subtracted at the point
+/// of use, which is what this was until 2026-09-09. Two counters cannot be
+/// read together: a reader that loads the first and then the second sees a
+/// `FREED` carrying frees whose grants its `ALLOCATED` never saw, so the
+/// difference can pass through zero. In a `u64` that is `2^64`, and the grant
+/// path below files the difference in a maximum that never comes back down,
+/// so one such read poisons the peak for the life of the process. A measured
+/// leg latched `17592186044407.9 MiB`.
+///
+/// A `fetch_add` on a single counter returns a value from this counter's own
+/// modification order, so the live figure at the grant is exact and there is
+/// no second load for anything to land between.
+///
+/// **Signed**, so an unmatched free shows as a small negative that
+/// [`granted`] counts and floors, rather than as sixteen exabytes. `i64` is
+/// wide enough by construction: the live figure never exceeds what has been
+/// granted, and one grant is bounded by `isize::MAX`.
+static LIVE: AtomicI64 = AtomicI64::new(0);
 
-/// Bytes every freed allocation had, summed. Monotone.
-static FREED: AtomicU64 = AtomicU64::new(0);
+/// Times [`granted`] found the running total **below zero** — a free counted
+/// against a block this counter never granted.
+///
+/// Zero on a sound tree, and read by [`unmatched_frees`] rather than left to
+/// be inferred: with one counter a negative can no longer be a torn read, so
+/// it is the accounting bug and nothing else.
+static UNMATCHED: AtomicU64 = AtomicU64::new(0);
 
 /// `std::alloc::System`, counted. Declare it as the global allocator in a
 /// binary crate:
@@ -112,23 +137,24 @@ pub struct Counting;
 /// That is why the cost lives on the hot path and not on a tick, and it is
 /// why moving it to a tick would silently invert the instrument's verdict
 /// rather than merely blur it.
+///
+/// **It is also the crate's sentinel for "this binary installed the
+/// counter".** Every grant runs the `fetch_max` and the first one carries a
+/// non-zero live figure, so a zero here means no allocation has ever passed
+/// through [`Counting`] — which is what [`live_bytes`] and [`live_peak_bytes`]
+/// answer `None` on. Moving the peak off the grant path would break that as
+/// well as the peak.
 static PEAK: AtomicU64 = AtomicU64::new(0);
 
 /// A granted block of `bytes` came into being.
 ///
-/// **Three memory operations rather than one, and the two new ones are the
-/// price of [`PEAK`].** The `fetch_add` already answers what `ALLOCATED` was,
-/// so the live figure at this instant is that plus this block less `FREED` —
-/// one `Relaxed` load — and the peak is one `fetch_max`. On the wasm page,
-/// which is single-threaded and where this instrument matters most, those are
-/// plain loads and stores with no fence at all.
-///
-/// **The skew is named and it is bounded by one block.** `FREED` can advance
-/// between the two reads, which makes the live figure read high and the peak
-/// over-report by at most the concurrent free; it can also lag, which makes
-/// it under-report by the same. That is the skew [`live_bytes`] already
-/// documents for its own two loads, and a high-water mark tolerates it for
-/// the same reason: a reader wants a recent figure, not a synchronised one.
+/// **One read-modify-write answers the whole figure, and that is the
+/// requirement rather than an economy.** `fetch_add` returns what [`LIVE`]
+/// was, so that plus this block is the live total at the instruction's own
+/// linearization point — a real value this heap held, not a subtraction of
+/// two loads taken at two instants. The peak is a maximum that never comes
+/// back down, so a figure this heap never held is not a blurred reading here:
+/// it is permanent.
 #[inline]
 fn granted(bytes: usize) {
     // **Filed BEFORE the peak is taken, and the order is load-bearing.** The
@@ -137,7 +163,7 @@ fn granted(bytes: usize) {
     // this very grant set would be described as having one fewer large block
     // than it did — and the block that set it would be the missing one.
     note_large_grant(bytes);
-    let live = ALLOCATED.fetch_add(bytes as u64, Relaxed) + bytes as u64 - FREED.load(Relaxed);
+    let live = live_from(LIVE.fetch_add(bytes as i64, Relaxed) + bytes as i64);
     // **The companion is stored only on an ADVANCE**, and the branch is free:
     // `fetch_max` already answers what the peak was, so the comparison costs
     // nothing extra and the store is on a path that after warm-up almost
@@ -148,6 +174,37 @@ fn granted(bytes: usize) {
     if PEAK.fetch_max(live, Relaxed) < live {
         PEAK_LARGE.store(LIVE_LARGE.load(Relaxed), Relaxed);
     }
+}
+
+/// **What a running total of [`LIVE`] means as a live figure**, and the one
+/// place a negative one becomes a number.
+///
+/// A negative cannot be a torn read — there is one counter — so it is a free
+/// counted against a grant this counter never saw. It is counted in
+/// [`UNMATCHED`] rather than quietly floored, because a floor that nothing
+/// reports is a defect made invisible instead of fixed.
+#[inline]
+fn live_from(running: i64) -> u64 {
+    if running < 0 {
+        note_unmatched_free();
+        return 0;
+    }
+    running as u64
+}
+
+/// Off the hot path's straight line: on a sound tree this never runs.
+#[cold]
+#[inline(never)]
+fn note_unmatched_free() {
+    UNMATCHED.fetch_add(1, Relaxed);
+}
+
+/// **Frees counted against blocks this counter never granted.** Zero on a
+/// sound tree; a non-zero reading says the live figure is short by however
+/// many bytes those frees carried, and that [`live_bytes`] is floored rather
+/// than measured.
+pub fn unmatched_frees() -> u64 {
+    UNMATCHED.load(Relaxed)
 }
 
 /// The smallest grant [`note_large_grant`] records.
@@ -292,10 +349,10 @@ pub fn large_grant(idx: usize) -> Option<LargeGrant> {
 /// is one of these two terms, and which one decides whether any residency
 /// lever in this tree can reach the death at all.
 pub fn live_peak_bytes() -> Option<u64> {
-    if ALLOCATED.load(Relaxed) == 0 {
-        return None;
+    match PEAK.load(Relaxed) {
+        0 => None,
+        peak => Some(peak),
     }
-    Some(PEAK.load(Relaxed))
 }
 
 /// **How many blocks over [`LARGE_GRANT_FLOOR`] were live when
@@ -318,7 +375,7 @@ pub fn live_large_blocks() -> u64 {
 /// A block of `bytes` went back.
 #[inline]
 fn returned(bytes: usize) {
-    FREED.fetch_add(bytes as u64, Relaxed);
+    LIVE.fetch_sub(bytes as i64, Relaxed);
     if bytes >= LARGE_GRANT_FLOOR {
         // Saturating, and only on the rare path where it costs nothing. The
         // two sides are balanced by construction — every block over the floor
@@ -397,17 +454,16 @@ unsafe impl GlobalAlloc for Counting {
 /// zero. The distinction matters: a `0` printed beside a real heap reading
 /// would read as an empty heap, where it means "not counted here".
 ///
-/// Two loads, not one snapshot: a free that lands between them can read the
-/// figure one allocation low, and a grant one high. That is a skew of one
-/// block for one reader, which is what `Relaxed` buys and what every consumer
-/// of a heap figure already tolerates; the subtraction saturates so the skew
-/// can never print as a wrapped `u64`.
+/// **One load, so it is a snapshot.** The figure is a value [`LIVE`] really
+/// held; nothing here subtracts two counters read at two instants, which is
+/// what could pass through zero and print as a wrapped `u64`. A negative
+/// reading floors at zero and is counted by [`unmatched_frees`] on the grant
+/// path that meets it.
 pub fn live_bytes() -> Option<u64> {
-    let allocated = ALLOCATED.load(Relaxed);
-    if allocated == 0 {
+    if PEAK.load(Relaxed) == 0 {
         return None;
     }
-    Some(allocated.saturating_sub(FREED.load(Relaxed)))
+    Some(LIVE.load(Relaxed).max(0) as u64)
 }
 
 #[cfg(test)]
@@ -554,6 +610,39 @@ mod tests {
             "live bytes {after} did not return to within a block of {before}"
         );
 
+        // **Every arm balances: a grow, a shrink and a zeroed block leave the
+        // level where they found it.** The other way the live figure could go
+        // negative, and the one a single counter does not by itself rule out —
+        // a `realloc` filing a return and a grant that do not match, or a
+        // `dealloc` carrying a layout `alloc` was never given. Both halves are
+        // asserted: `unmatched_frees` catches an imbalance that drives the
+        // total through zero, and the level catches one that does not.
+        //
+        // In this function rather than a test of its own, for the reason the
+        // doc comment above gives: it reads a process-global LEVEL, and a
+        // second test allocating beside it would be reading this one's block.
+        let unmatched_before = unmatched_frees();
+        let level_before = live_bytes().expect("still counting");
+        let mut grown: Vec<u8> = Vec::with_capacity(3 << 20);
+        grown.resize(3 << 20, 1);
+        grown.resize(9 << 20, 2); // grows through `realloc`
+        grown.shrink_to_fit(); // and shrinks through it
+        drop(grown);
+        drop(vec![0u8; 5 << 20]); // `alloc_zeroed`
+        let level_after = live_bytes().expect("still counting");
+        assert_eq!(
+            unmatched_frees(),
+            unmatched_before,
+            "a grow, a shrink, a zeroed block and their frees left the running \
+             total below zero, so the four arms do not balance"
+        );
+        assert!(
+            level_after.abs_diff(level_before) < SLACK,
+            "a grow, a shrink and a zeroed block all freed left the level at \
+             {level_after} B against {level_before} B before them: an arm \
+             counted a return without its grant, or a grant without its return"
+        );
+
         // A request the system cannot serve returns null, and the counters
         // must not have moved for it — the rule that keeps the live figure
         // from drifting upward at exactly the moment it matters.
@@ -654,6 +743,56 @@ mod tests {
             "a grant under the floor is not a large grant",
         );
         assert_eq!(large_grant_bucket(LARGE_GRANT_FLOOR), Some(0));
+    }
+
+    /// **A live figure below zero can never become the peak**, which is the
+    /// property the two-counter spelling did not have and the whole reason
+    /// this crate keeps one signed counter.
+    ///
+    /// The defect this pins: `ALLOCATED - FREED` over two `Relaxed` atomics
+    /// is not a snapshot, so a thread could load a `FREED` carrying frees
+    /// whose grants its `ALLOCATED` had not seen. The difference passed
+    /// through zero, `u64` wrapped it to within a few MiB of `2^64`, and the
+    /// `fetch_max` on the grant path latched it for the life of the process.
+    /// A measured leg read `17592186044407.9 MiB` — `2^64` less 8.1 MiB,
+    /// which is the excess below.
+    ///
+    /// It allocates nothing and touches neither [`PEAK`] nor the histogram,
+    /// so it does not race the workload test above; [`UNMATCHED`] is read as
+    /// a delta for the same reason.
+    ///
+    /// **Both halves are asserted.** That the clamp answers zero — a
+    /// `running as u64` spelling answers `18446744065216086016` here and the
+    /// peak is poisoned again — and that the clamp is not silent, because a
+    /// negative can no longer be a torn read and is therefore an accounting
+    /// bug somebody has to be told about.
+    #[test]
+    fn a_running_total_below_zero_can_never_become_the_peak() {
+        // The real leg's excess: 2^64 - 17592186044407.9 MiB, to the MiB.
+        const EXCESS: i64 = -(8 << 20);
+        let before = unmatched_frees();
+        assert_eq!(
+            live_from(EXCESS),
+            0,
+            "a running total of {EXCESS} B answered a live figure a monotone              maximum would keep forever"
+        );
+        assert_eq!(
+            live_from(i64::MIN),
+            0,
+            "the clamp is not total over the counter's own range"
+        );
+        assert_eq!(
+            unmatched_frees(),
+            before + 2,
+            "two negative running totals were floored and neither was counted,              so a real unmatched free would floor silently"
+        );
+        // Zero cannot advance a maximum, which is the second half of "can
+        // never become the peak": the clamp's answer is below every peak
+        // there has ever been.
+        assert!(
+            live_peak_bytes().is_none_or(|peak| peak >= live_from(EXCESS)),
+            "the floored figure is above the peak it would be compared against"
+        );
     }
 
     /// The counter type is a zero-sized unit that a binary can name as a

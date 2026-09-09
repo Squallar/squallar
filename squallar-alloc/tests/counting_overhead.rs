@@ -1,18 +1,19 @@
 //! **What the counting wrapper costs per allocation, measured rather than
 //! predicted.**
 //!
-//! The design predicted "two relaxed atomics per allocation"; this is the
-//! figure that prediction is checked against. The same alloc/dealloc workload
-//! runs through [`System`] directly and through [`Counting`], which delegates
-//! to `System` and adds one `fetch_add` on the way out of `alloc` and one on
-//! the way into `dealloc` — so the delta is the wrapper and nothing else.
+//! The design predicted "one relaxed read-modify-write per allocation"; this
+//! is the figure that prediction is checked against. The same alloc/dealloc
+//! workload runs through [`System`] directly and through [`Counting`], which
+//! delegates to `System` and adds one `fetch_add` on the way out of `alloc`
+//! and one `fetch_sub` on the way into `dealloc` — so the delta is the
+//! wrapper and nothing else.
 //! Neither is installed as the global allocator here: both are called
 //! directly, so what is measured is the wrapper's own instructions and not
 //! whatever else a process does.
 //!
 //! **The denominator is one alloc+dealloc PAIR**, not one `alloc`. A pair
-//! carries two atomic adds, one per side, which is what "two relaxed atomics
-//! per allocation" amounts to once both halves are counted.
+//! carries two read-modify-writes on the live counter, one per side, plus the
+//! peak's own compare on the grant side.
 //!
 //! `#[ignore]`d: a measurement instrument, not a criterion. Its answer is this
 //! box's, and a threshold asserted on a shared machine would be a load
@@ -38,7 +39,7 @@
 use squallar_alloc::Counting;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 /// Sizes one round cycles through, so the measurement is not a single
@@ -131,15 +132,15 @@ fn counting_accounts_for_a_block_it_is_holding() {
     );
 }
 
-/// Stand-ins for the crate's own two counters, so the control below executes
+/// A stand-in for the crate's own live counter, so the control below executes
 /// the same instruction sequence `Counting` does without going near an
-/// allocator. Separate cache lines are NOT forced: the real pair share a
-/// module and are adjacent, and the point is to reproduce what the wrapper
-/// does, not to model a better version of it.
-static CONTROL_ALLOCATED: AtomicU64 = AtomicU64::new(0);
-static CONTROL_FREED: AtomicU64 = AtomicU64::new(0);
+/// allocator. It carries the pair the wrapper carries — one add on the grant
+/// side, one subtract on the free side — and not the peak's compare, so it is
+/// a floor on the wrapper's cost rather than a model of all of it.
+static CONTROL_LIVE: AtomicI64 = AtomicI64::new(0);
 
-/// **The control: two relaxed `fetch_add`s and nothing else**, `pairs` times.
+/// **The control: one relaxed `fetch_add` and one `fetch_sub`, and nothing
+/// else**, `pairs` times.
 ///
 /// This is what the delta above is a measurement OF, isolated from the
 /// allocator it normally hides inside. Without it the delta is a number with
@@ -152,12 +153,11 @@ static CONTROL_FREED: AtomicU64 = AtomicU64::new(0);
 fn atomics_only(pairs: usize) -> Duration {
     let started = Instant::now();
     for i in 0..pairs {
-        let bytes = black_box(i as u64 & 0xff);
-        CONTROL_ALLOCATED.fetch_add(bytes, Relaxed);
-        CONTROL_FREED.fetch_add(bytes, Relaxed);
+        let bytes = black_box(i as i64 & 0xff);
+        CONTROL_LIVE.fetch_add(bytes, Relaxed);
+        CONTROL_LIVE.fetch_sub(bytes, Relaxed);
     }
-    black_box(CONTROL_ALLOCATED.load(Relaxed));
-    black_box(CONTROL_FREED.load(Relaxed));
+    black_box(CONTROL_LIVE.load(Relaxed));
     started.elapsed()
 }
 

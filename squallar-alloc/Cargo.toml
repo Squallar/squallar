@@ -8,6 +8,6 @@ version.workspace = true
 edition.workspace = true
 
 # Deliberately nothing: the allocator wraps `std::alloc::System` and counts
-# through two atomics. A dependency here would be compiled into every binary
+# through one atomic. A dependency here would be compiled into every binary
 # below the frame thread's first allocation.
 [dependencies]
