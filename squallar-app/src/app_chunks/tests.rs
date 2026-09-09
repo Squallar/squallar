@@ -175,3 +175,53 @@ fn the_chunk_feed_path_reads_the_radar_control_surface_once_a_frame() {
          about how many surfaces this path builds"
     );
 }
+
+/// **Every whole volume this file stops holding leaves off the frame thread.**
+///
+/// Two of them, and they are different mechanisms with the same price. The
+/// chunk landing files a latest for a site no pane watches live and this
+/// process is that volume's last owner, so superseding it with a bare `insert`
+/// freed it in `poll_chunk_results`. And `ChunkFeedManager::snapshot` — called
+/// from the frame thread several times a frame — lets go of the bridge copy
+/// the moment the poller has rebuilt, which is likewise the last reference.
+///
+/// Measured on a VCP 212-shaped volume (17 cuts, 7,560 radials, six moments):
+/// **45,379 deallocations and 58.43 MiB** per volume, on the frame thread.
+#[test]
+fn the_volumes_this_file_stops_holding_are_freed_off_the_frame() {
+    let source = include_str!("../app_chunks.rs");
+    // To the method's own closing brace, which is the one at four spaces —
+    // brace counting cannot be used here, the bodies below carrying `{site}`
+    // inside format strings.
+    let body = |name: &str| {
+        let (_, rest) = source
+            .split_once(name)
+            .unwrap_or_else(|| panic!("{name} is gone from app_chunks.rs"));
+        rest.split_once("\n    }")
+            .map(|(body, _)| body.to_string())
+            .unwrap_or_else(|| panic!("{name} has no recognisable body"))
+    };
+
+    let landing = body("fn apply_chunk_outcome(");
+    assert!(
+        landing.contains("self.discard_superseded_latest("),
+        "the chunk landing supersedes the site's latest without the volume it \
+         replaced coming out, so a whole decoded volume is freed inside \
+         `poll_chunk_results`: {landing}"
+    );
+
+    let drive = body("fn drive_chunk_feeds(");
+    assert!(
+        drive.contains(".take_superseded()"),
+        "nothing drains the chunk feed's superseded bridge copies, so the \
+         manager holds every one of them for the life of the process — a leak \
+         wearing an eviction's clothes: {drive}"
+    );
+    assert!(
+        drive.contains("squallar_worker::offload::discard_each(")
+            && drive.contains("volume_drop_parts("),
+        "the superseded bridge copies no longer leave through the \
+         deferred-drop path, or no longer at the sweep seam the eviction \
+         paths use: {drive}"
+    );
+}

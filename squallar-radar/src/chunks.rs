@@ -1438,6 +1438,17 @@ impl ChunkPoller {
         self.current.as_mut().map(VolumeAssembler::snapshot)
     }
 
+    /// **The assembler this poller is filling**, so a test in a sibling module
+    /// can drive real chunks through [`VolumeAssembler::ingest_contents`]
+    /// rather than reach for a hand-set field.
+    ///
+    /// `chunk_feed`'s bridge-copy suite needs a feed whose poller has actually
+    /// rebuilt, and a poller that never ingested cannot produce one.
+    #[cfg(test)]
+    pub(crate) fn assembler_mut(&mut self) -> Option<&mut VolumeAssembler> {
+        self.current.as_mut()
+    }
+
     /// What the volume being assembled declared its cuts' Nyquist velocities to be.
     pub fn declared_nyquist(&self) -> Option<&crate::nyquist::DeclaredNyquist> {
         self.current.as_ref().map(VolumeAssembler::declared_nyquist)

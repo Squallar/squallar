@@ -154,6 +154,21 @@ pub struct ChunkFeedManager {
     /// Keyed by site and elevation in tenths of a degree, matching
     /// `render_dispatch`'s cache key.
     delivered: HashMap<(String, i32), Delivered>,
+    /// **Bridge copies this manager stopped holding, waiting to be freed
+    /// somewhere other than here.**
+    ///
+    /// [`Self::snapshot`] runs on the frame thread, several times a frame.
+    /// When the poller has rebuilt since the last one it hands back a
+    /// different `Arc`, and the copy being replaced is by then the volume's
+    /// last owner — the assembler let go of it during the rebuild. Dropping it
+    /// in place freed a whole decoded volume (47–69 MiB across thousands of
+    /// per-radial buffers) on the frame thread.
+    ///
+    /// It comes out through [`Self::take_superseded`] instead, whose caller
+    /// frees it off the frame. A queue and not a call because this crate
+    /// cannot reach `squallar_worker::offload`: the worker crate depends on
+    /// this one.
+    superseded: Vec<LiveVolume>,
 }
 
 impl ChunkFeedManager {
@@ -276,12 +291,14 @@ impl ChunkFeedManager {
         } else {
             None
         };
-        if let Some(reason) = retirement {
+        let dying = retirement.and_then(|reason| {
             log::warn!("{site}: retiring the chunk feed ({reason:?}); falling back to the archive");
             feed.retired = Some((reason, now));
-            // The bridge copy dies with the flight.
-            feed.last_snapshot = None;
-        }
+            // The bridge copy dies with the flight — off the frame thread,
+            // like every other one this manager lets go of.
+            feed.last_snapshot.take()
+        });
+        self.superseded.extend(dying);
         retirement
     }
 
@@ -374,36 +391,63 @@ impl ChunkFeedManager {
     }
 
     /// The volume so far for a site, complete sweeps only.
+    ///
+    /// **The bridge copy this replaces is set aside, not dropped** — see
+    /// [`Self::take_superseded`].
     pub fn snapshot(&mut self, site: &str) -> Option<LiveVolume> {
-        let feed = self.feeds.get_mut(site)?;
-        if feed.retired.is_some() {
-            return None;
-        }
-        match feed.poller.as_mut() {
-            Some(poller) => {
-                let declared = poller
-                    .declared_nyquist()
-                    .cloned()
-                    .map(std::sync::Arc::new)
-                    .unwrap_or_default();
-                let scan = poller.snapshot();
-                // Read AFTER the snapshot, because a rebuild is exactly when
-                // the price moves: `VolumeAssembler::snapshot` sets
-                // `cached_bytes` on the way out, and a figure taken before it
-                // would describe the volume this one replaced.
-                let bytes = poller.cached_allocation().map_or(0, |(_, bytes)| bytes);
-                let snapshot = scan.map(|scan| LiveVolume {
-                    scan,
-                    declared,
-                    bytes,
-                });
-                // Refreshed here, the one place the poller's answer passes.
-                feed.last_snapshot.clone_from(&snapshot);
-                snapshot
+        let (snapshot, superseded) = {
+            let feed = self.feeds.get_mut(site)?;
+            if feed.retired.is_some() {
+                return None;
             }
-            // The poller is away on a round.
-            None => feed.last_snapshot.clone(),
+            match feed.poller.as_mut() {
+                Some(poller) => {
+                    let declared = poller
+                        .declared_nyquist()
+                        .cloned()
+                        .map(std::sync::Arc::new)
+                        .unwrap_or_default();
+                    let scan = poller.snapshot();
+                    // Read AFTER the snapshot, because a rebuild is exactly when
+                    // the price moves: `VolumeAssembler::snapshot` sets
+                    // `cached_bytes` on the way out, and a figure taken before it
+                    // would describe the volume this one replaced.
+                    let bytes = poller.cached_allocation().map_or(0, |(_, bytes)| bytes);
+                    let snapshot = scan.map(|scan| LiveVolume {
+                        scan,
+                        declared,
+                        bytes,
+                    });
+                    // Refreshed here, the one place the poller's answer passes.
+                    // `replace` rather than `clone_from`: what was here comes
+                    // back out so the free lands off the frame thread.
+                    let superseded = std::mem::replace(&mut feed.last_snapshot, snapshot.clone());
+                    (snapshot, superseded)
+                }
+                // The poller is away on a round.
+                None => (feed.last_snapshot.clone(), None),
+            }
+        };
+        // Only a copy of a DIFFERENT volume is worth carrying out: the warm
+        // case hands back the same `Arc` every frame, and queueing that would
+        // be a refcount decrement filed as an eviction.
+        if let Some(previous) = superseded {
+            match &snapshot {
+                Some(now) if std::sync::Arc::ptr_eq(&now.scan, &previous.scan) => {}
+                _ => self.superseded.push(previous),
+            }
         }
+        snapshot
+    }
+
+    /// **The bridge copies this manager has stopped holding**, for a caller
+    /// that can free them away from the frame thread.
+    ///
+    /// Drain it every frame: until it is drained the manager is still holding
+    /// the volumes, which is the one thing a bridge copy set aside must not
+    /// become — a leak wearing an eviction's clothes.
+    pub fn take_superseded(&mut self) -> Vec<LiveVolume> {
+        std::mem::take(&mut self.superseded)
     }
 
     /// **Every decoded volume the live feeds hold, as allocation and price**,
@@ -419,6 +463,12 @@ impl ChunkFeedManager {
     /// caller's, which is the only place that can also see the still store
     /// and the loop cache.
     ///
+    /// **Plus whatever [`Self::take_superseded`] has not been asked for yet**,
+    /// which is a bridge copy this manager is still the owner of. It is
+    /// normally empty — the drain runs every frame — but a row missing while
+    /// the bytes are resident is the one direction this instrument may not
+    /// fail in, so it is yielded on the same terms as the others.
+    ///
     /// **No walk and no rebuild.** Every price is one the assembler already
     /// paid; see [`crate::chunks::VolumeAssembler::cached_allocation`] for why
     /// this is not spelled as a `snapshot()`. What it does NOT reach is the
@@ -426,17 +476,24 @@ impl ChunkFeedManager {
     pub fn held_allocations(
         &self,
     ) -> impl Iterator<Item = (*const nexrad_model::data::Scan, u64)> + '_ {
-        self.feeds.values().flat_map(|feed| {
-            feed.poller
-                .as_ref()
-                .and_then(|poller| poller.cached_allocation())
-                .into_iter()
-                .chain(
-                    feed.last_snapshot
-                        .as_ref()
-                        .map(|live| (std::sync::Arc::as_ptr(&live.scan), live.bytes)),
-                )
-        })
+        self.feeds
+            .values()
+            .flat_map(|feed| {
+                feed.poller
+                    .as_ref()
+                    .and_then(|poller| poller.cached_allocation())
+                    .into_iter()
+                    .chain(
+                        feed.last_snapshot
+                            .as_ref()
+                            .map(|live| (std::sync::Arc::as_ptr(&live.scan), live.bytes)),
+                    )
+            })
+            .chain(
+                self.superseded
+                    .iter()
+                    .map(|live| (std::sync::Arc::as_ptr(&live.scan), live.bytes)),
+            )
     }
 
     /// **What every site's parked queue holds**, summed as a count and a byte

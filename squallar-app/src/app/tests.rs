@@ -2488,6 +2488,35 @@ fn an_evicted_volume_is_handed_over_rather_than_freed_on_the_frame() {
     );
 }
 
+/// **The twin of [`an_evicted_volume_is_handed_over_rather_than_freed_on_the_frame`]
+/// for the other way a volume leaves a store: being replaced.**
+///
+/// `latest_cached_scans` holds one whole decoded volume per site, and for the
+/// site it exists for — one no pane is watching live — this process is its
+/// last owner. An arrival that superseded it with a bare `insert` freed it
+/// where it stood: **45,379 deallocations and 58.43 MiB** across per-radial
+/// buffers (measured on a VCP 212-shaped volume, 17 cuts, 7,560 radials, six
+/// moments), on the frame thread, inside a drain.
+///
+/// Both arrival paths file a latest and both are pinned: the archive drain's
+/// auto-poll arm and the chunk landing's parked-site arm.
+#[test]
+fn a_superseded_latest_is_handed_over_rather_than_freed_on_the_frame() {
+    let body = fn_body("fn poll_scan_results(");
+    assert!(
+        body.contains("self.discard_superseded_latest("),
+        "the archive drain's latest is superseded without the volume it \
+         replaced coming out, so it is freed on the frame thread: {body}"
+    );
+    let helper = fn_body("fn discard_superseded_latest(");
+    assert!(
+        helper.contains("squallar_worker::offload::discard_each(")
+            && helper.contains("volume_drop_parts("),
+        "the superseded latest no longer leaves through the deferred-drop \
+         path, or no longer at the sweep seam the eviction twin uses: {helper}"
+    );
+}
+
 #[test]
 fn the_loop_caches_evictions_are_handed_over_and_the_sweep_is_called() {
     assert!(

@@ -262,3 +262,225 @@ fn a_round_landing_after_its_site_was_dropped_is_discarded() {
     assert_eq!(mgr.finish_round("KTLX", poller, &outcome()), None);
     assert_eq!(mgr.feed_count(), 0);
 }
+
+/// **A bridge copy the frame thread stops holding must leave through the
+/// queue, not through its own `drop`.**
+///
+/// `ChunkFeedManager::snapshot` runs on the frame thread several times a
+/// frame. The moment the poller has rebuilt since the last one it hands back a
+/// different `Arc`, and by then the assembler has let go of the volume the
+/// bridge is holding — `VolumeAssembler::snapshot` takes `cached` out with
+/// `take()` and either unwraps it or clones the sweeps out of it, and drops
+/// its own reference either way. So the bridge is the last owner, and
+/// `clone_from` freed the whole thing where it stood.
+///
+/// Measured on a VCP 212-shaped volume (17 cuts, 7,560 radials, six moments):
+/// **45,379 deallocations and 58.43 MiB**, on the frame thread, per rebuild.
+///
+/// The fixture carries real gate arrays for that reason — a volume of empty
+/// radials frees a few hundred bytes and could not show this whatever the code
+/// did — and the assertions below check that it does.
+#[test]
+fn a_superseded_bridge_copy_leaves_through_the_queue_rather_than_the_frame_thread() {
+    const SITE: &str = "KTLX";
+    let mut mgr = mgr_assembling(SITE);
+
+    // The start chunk, then a whole cut: the assembler seals on the radial
+    // that carries `ElevationEnd`, which is what makes a snapshot buildable.
+    ingest(&mut mgr, SITE, 1, ChunkKind::Start, start_chunk());
+    ingest(&mut mgr, SITE, 2, ChunkKind::Intermediate, cut(1, 0.5));
+
+    let first = mgr
+        .snapshot(SITE)
+        .expect("a sealed cut is a volume the bridge can serve");
+    let superseded = std::sync::Arc::clone(&first.scan);
+    assert!(
+        first.bytes > 1 << 20,
+        "fixture: the bridge copy is priced at {} B, so nothing built on it \
+         could show a whole-volume free",
+        first.bytes,
+    );
+    drop(first);
+
+    // The rebuild the round would do on the poller's thread: a second cut
+    // seals, and the assembler builds a new `Scan` and lets go of the old one.
+    ingest(&mut mgr, SITE, 3, ChunkKind::Intermediate, cut(2, 0.9));
+    let rebuilt = mgr
+        .feeds
+        .get_mut(SITE)
+        .expect("ensured")
+        .poller
+        .as_mut()
+        .expect("the poller is home")
+        .snapshot()
+        .expect("the second cut sealed");
+    assert!(
+        !std::sync::Arc::ptr_eq(&rebuilt, &superseded),
+        "fixture: the assembler handed back the same volume, so nothing was \
+         superseded and this test asserts nothing",
+    );
+    drop(rebuilt);
+    assert_eq!(
+        std::sync::Arc::strong_count(&superseded),
+        2,
+        "fixture: this test's own handle and the bridge must be the only \
+         owners left, or the frame-thread `drop` under test would have been a \
+         refcount decrement rather than a whole-volume free",
+    );
+
+    // The next frame's ask. The bridge lets go of the old volume here.
+    let second = mgr.snapshot(SITE).expect("the poller is still home");
+    assert!(
+        !std::sync::Arc::ptr_eq(&second.scan, &superseded),
+        "precondition: the bridge is still serving the old volume",
+    );
+
+    let carried = mgr.take_superseded();
+    assert_eq!(
+        carried.len(),
+        1,
+        "the bridge copy was freed on the frame thread instead of being \
+         carried out: 45,379 deallocations and 58.43 MiB of per-radial \
+         buffers, inside `publish_base_volumes`",
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(&carried[0].scan, &superseded),
+        "something other than the superseded bridge copy came out of the queue",
+    );
+    assert!(
+        mgr.take_superseded().is_empty(),
+        "the queue hands its entries out twice, so the volume is freed once \
+         and priced against the drop budget again",
+    );
+}
+
+/// **The warm case queues nothing.** The poller hands back the same `Arc`
+/// every frame it has not rebuilt on, and a queue that filed those would turn
+/// a refcount decrement into an eviction — and hold a live volume against the
+/// drop budget on every frame of a quiet leg.
+#[test]
+fn a_bridge_copy_that_did_not_move_is_not_queued() {
+    const SITE: &str = "KTLX";
+    let mut mgr = mgr_assembling(SITE);
+    ingest(&mut mgr, SITE, 1, ChunkKind::Start, start_chunk());
+    ingest(&mut mgr, SITE, 2, ChunkKind::Intermediate, cut(1, 0.5));
+
+    let first = mgr.snapshot(SITE).expect("a sealed cut");
+    let held = std::sync::Arc::clone(&first.scan);
+    drop(first);
+    let second = mgr.snapshot(SITE).expect("still there");
+    assert!(
+        std::sync::Arc::ptr_eq(&second.scan, &held),
+        "fixture: the poller rebuilt with nothing ingested between the asks",
+    );
+    drop(second);
+
+    assert!(
+        mgr.take_superseded().is_empty(),
+        "a frame that superseded nothing queued a volume anyway",
+    );
+}
+
+use crate::chunks::{ChunkContents, ChunkKind};
+
+/// A whole cut: `RADIALS` radials of real gate arrays, the last carrying the
+/// terminator that seals it.
+const RADIALS: usize = 360;
+/// Reflectivity's own gate count at 250 m, and the Doppler moments' — the
+/// fixture's payload bytes, at the shape a real cut carries them in.
+const REFL_GATES: usize = 1832;
+const DOPPLER_GATES: usize = 1192;
+
+fn chunk_time() -> chrono::NaiveDateTime {
+    chrono::NaiveDate::from_ymd_opt(2026, 9, 9)
+        .expect("a real date")
+        .and_hms_opt(7, 22, 0)
+        .expect("a real time")
+}
+
+fn start_chunk() -> ChunkContents {
+    ChunkContents {
+        radials: Vec::new(),
+        coverage_pattern: Some(crate::volumetric::tests::vcp()),
+        ..Default::default()
+    }
+}
+
+fn moment(gates: usize) -> nexrad_model::data::MomentData {
+    nexrad_model::data::MomentData::from_fixed_point(
+        gates as u16,
+        2125,
+        250,
+        8,
+        2.0,
+        66.0,
+        vec![7u8; gates],
+    )
+}
+
+fn cut(elevation_number: u8, elevation: f32) -> ChunkContents {
+    use nexrad_model::data::{Radial, RadialStatus};
+    let spacing = 360.0 / RADIALS as f32;
+    let radials = (0..RADIALS)
+        .map(|i| {
+            let status = if i + 1 == RADIALS {
+                RadialStatus::ElevationEnd
+            } else {
+                RadialStatus::IntermediateRadialData
+            };
+            Radial::new(
+                1_760_000_000_000 + i as i64,
+                i as u16 + 1,
+                i as f32 * spacing,
+                spacing,
+                status,
+                elevation_number,
+                elevation,
+                Some(moment(REFL_GATES)),
+                Some(moment(DOPPLER_GATES)),
+                Some(moment(DOPPLER_GATES)),
+                Some(moment(DOPPLER_GATES)),
+                Some(moment(DOPPLER_GATES)),
+                Some(moment(DOPPLER_GATES)),
+                None,
+            )
+        })
+        .collect();
+    ChunkContents {
+        radials,
+        coverage_pattern: None,
+        ..Default::default()
+    }
+}
+
+/// A manager whose feed for `site` has a poller already on a volume — the
+/// state a feed reaches after its discovery round, and the only one from
+/// which a chunk can be ingested at all.
+fn mgr_assembling(site: &str) -> ChunkFeedManager {
+    let mut mgr = ChunkFeedManager::new();
+    mgr.ensure(site);
+    mgr.feeds.get_mut(site).expect("ensured").poller =
+        Some(Box::new(crate::chunks::ChunkPoller::resume(
+            site,
+            crate::chunks::VolumeIndex::new(42).expect("a real volume index"),
+        )));
+    mgr
+}
+
+fn ingest(
+    mgr: &mut ChunkFeedManager,
+    site: &str,
+    sequence: u16,
+    kind: ChunkKind,
+    contents: ChunkContents,
+) {
+    mgr.feeds
+        .get_mut(site)
+        .expect("ensured")
+        .poller
+        .as_mut()
+        .expect("the poller is home")
+        .assembler_mut()
+        .expect("a volume is being assembled")
+        .ingest_contents(sequence, kind, chunk_time(), contents);
+}

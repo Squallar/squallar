@@ -14,6 +14,24 @@ impl super::App {
     /// Start or stop feeds so the set matches the sites panes are watching live,
     /// and dispatch a round for any that is due. Called once a frame.
     pub(super) fn drive_chunk_feeds(&mut self) {
+        // **The bridge copies the manager stopped holding**, freed here rather
+        // than where they were let go of. `ChunkFeedManager::snapshot` runs on
+        // the frame thread several times a frame and used to drop the whole
+        // superseded volume in place; this row is the one place a frame is
+        // guaranteed to pass through, so it is where they leave.
+        //
+        // A frame late by construction — the calls that supersede a copy run
+        // in this row and after it — which is the same pacing
+        // `offload::discard`'s own queue gives everything else.
+        squallar_worker::offload::discard_each(
+            "superseded-bridge-copy",
+            crate::volume_inventory::volume_drop_parts(
+                self.chunk_feeds
+                    .take_superseded()
+                    .into_iter()
+                    .map(|live| (live.scan, live.declared)),
+            ),
+        );
         // One walk of the radar layer's control surface for the whole path:
         // this arm and `drive_chunk_notifications` between them asked that
         // door four times a frame. See `ChunkFeedControls`.
@@ -292,8 +310,15 @@ impl super::App {
         if !self.any_pane_live_for_site(site) {
             // Priced where it is filed — see the archive drain's twin.
             self.volumes.price_latest(site, &scan);
-            self.latest_cached_scans
+            // **The entry this replaces is a whole decoded volume**, and this
+            // process is normally its last owner — nothing else keeps a
+            // volume for a site no pane is watching. Freed on the free lane;
+            // in place it was 47–69 MiB of per-radial buffers released on the
+            // frame thread, inside `poll_chunk_results`.
+            let superseded = self
+                .latest_cached_scans
                 .insert(site.to_string(), (scan, declared, info, timestamp));
+            self.discard_superseded_latest(superseded);
             return;
         }
 

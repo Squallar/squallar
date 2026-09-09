@@ -2646,8 +2646,12 @@ impl App {
                             // name it: the inventory carries the price, the
                             // volume stays here (see `VolumeInventory::latest_bytes`).
                             self.volumes.price_latest(&site, &scan_arc);
-                            self.latest_cached_scans
+                            // The entry this replaces is the site's previous
+                            // whole volume; see `discard_superseded_latest`.
+                            let superseded = self
+                                .latest_cached_scans
                                 .insert(site, (scan_arc, declared_nyquist, scan_info, timestamp));
+                            self.discard_superseded_latest(superseded);
                         } else if feed_is_ahead {
                             log::info!(
                                 "Keeping the real-time volume for {site}: the archive's \
@@ -2954,6 +2958,38 @@ impl App {
             Some(slot) => *slot = entry,
             None => self.liveness.push(entry),
         }
+    }
+
+    /// **Free the per-site latest entry an arrival just replaced, off the
+    /// frame thread.**
+    ///
+    /// `latest_cached_scans` holds a whole decoded volume per site and this
+    /// process is normally its last owner: a site no pane is watching live is
+    /// exactly the case the entry exists for, and nothing else keeps that
+    /// volume. Superseding it in place freed 47–69 MiB across thousands of
+    /// per-radial buffers inside a drain — `poll_scan_results` on the archive
+    /// arm, `poll_chunk_results` on the feed's.
+    ///
+    /// The same split and the same pricing the eviction path uses
+    /// (`evicted-cached-volume`), so a volume leaving by supersession and one
+    /// leaving by eviction cost the queue the same.
+    fn discard_superseded_latest(
+        &mut self,
+        superseded: Option<(
+            Arc<nexrad_model::data::Scan>,
+            Arc<squallar_radar::nyquist::DeclaredNyquist>,
+            ScanInfo,
+            chrono::NaiveDateTime,
+        )>,
+    ) {
+        squallar_worker::offload::discard_each(
+            "superseded-cached-volume",
+            crate::volume_inventory::volume_drop_parts(
+                superseded
+                    .into_iter()
+                    .map(|(scan, nyquist, _, _)| (scan, nyquist)),
+            ),
+        );
     }
 
     /// Drop the decoded volumes no pane is showing.
