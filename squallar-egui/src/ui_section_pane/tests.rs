@@ -230,6 +230,100 @@ fn the_axis_unit_label_has_room_above_the_plot() {
     );
 }
 
+/// **Dropping a caption line never moves the lines that stay.**
+///
+/// This is the property that lets `lay_out_caption` lay the caption out once and
+/// take galleys out by the same index it takes lines out by. Before, the squeeze
+/// laid *every surviving line* out again for each line it dropped — an owned copy
+/// of each sentence per pass — because nothing said the survivors could not have
+/// moved. If a future wrap width ever came to depend on how many lines there are,
+/// this is what would go red, and the drop loop would owe its re-layout again.
+#[test]
+fn dropping_a_caption_line_leaves_every_other_galley_where_it_was() {
+    let ctx = egui::Context::default();
+    let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+    let prefs = UserPreferences::default();
+    let visuals = egui::Visuals::dark();
+    let truncated = SectionAxes {
+        coverage_ground_range_km: 64.0,
+        top_tilt_deg: 6.4,
+        ..axes()
+    };
+
+    // Tall on purpose: the squeeze must not fire here, so that what is compared
+    // is one deliberate drop rather than whatever the budget did.
+    let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(620.0, 4000.0));
+    let painter = egui::Painter::new(ctx.clone(), egui::LayerId::debug(), rect);
+    let lines = || {
+        caption_lines(
+            &truncated,
+            &radar_fields::known::REFLECTIVITY,
+            None,
+            BARE_LADDER,
+            None,
+            true,
+            &visuals,
+            &prefs,
+        )
+    };
+
+    let full = lines();
+    let dropped_at = full
+        .iter()
+        .rposition(|l| !l.essential)
+        .expect("premise: an open detail must give the squeeze something to drop");
+    assert!(
+        full.len() >= 3,
+        "premise: {} caption line(s) is too few for a drop to be able to move a          survivor",
+        full.len()
+    );
+
+    let before = lay_out_caption(&painter, rect, false, lines());
+    assert_eq!(
+        before.len(),
+        full.len(),
+        "premise: this pane must be tall enough that nothing was squeezed out"
+    );
+
+    let mut shorter = lines();
+    shorter.remove(dropped_at);
+    let after = lay_out_caption(&painter, rect, false, shorter);
+
+    let survivors: Vec<_> = before
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != dropped_at)
+        .map(|(_, g)| g)
+        .collect();
+    assert_eq!(survivors.len(), after.len());
+    for (was, now) in survivors.iter().zip(&after) {
+        assert_eq!(
+            was.text(),
+            now.text(),
+            "the drop reordered the caption rather than removing one line"
+        );
+        assert_eq!(
+            was.rect,
+            now.rect,
+            "line {:?} was laid out differently once a *different* line was \
+             dropped, so the survivors cannot be reused and the squeeze owes \
+             each of them a fresh layout",
+            was.text()
+        );
+        // The sharp half. epaint's galley cache is keyed on the whole layout job
+        // — text, font, colour and **wrap width** — so the same `Arc` coming back
+        // is the only statement that the job was identical. The rect above is
+        // satisfied by a wrap width that moved without moving a line break, which
+        // is most of them: a 3-point perturbation passes the rect and fails here.
+        assert!(
+            std::sync::Arc::ptr_eq(was, now),
+            "line {:?} was laid out from a *different* job once another line was \
+             dropped, so nothing licenses reusing the galleys of the survivors",
+            was.text()
+        );
+    }
+}
+
 /// The caption is **wrapped and then measured**, so no sentence in it is ever
 /// clipped and no wrapped row is ever painted over the picture.
 #[test]

@@ -907,31 +907,33 @@ fn lay_out_caption(
     mut lines: Vec<CaptionLine>,
 ) -> Vec<std::sync::Arc<egui::Galley>> {
     let wrap = caption_wrap_width(pane_rect, horizontal_color_scale);
-    let layout_all = |lines: &[CaptionLine]| -> Vec<std::sync::Arc<egui::Galley>> {
-        lines
-            .iter()
-            .map(|l| {
-                painter.layout(
-                    l.text.clone(),
-                    egui::FontId::proportional(l.size),
-                    l.color,
-                    wrap,
-                )
-            })
-            .collect()
-    };
+    // Every line is laid out against the same wrap width and nothing else, so
+    // dropping one never moves another: these are laid out **once**, and the
+    // squeeze below takes galleys out by the same index it takes lines out by.
+    // The text is moved into its galley rather than copied — what is left of
+    // `lines` after this is read only for `essential`.
+    let mut galleys: Vec<std::sync::Arc<egui::Galley>> = lines
+        .iter_mut()
+        .map(|l| {
+            painter.layout(
+                std::mem::take(&mut l.text),
+                egui::FontId::proportional(l.size),
+                l.color,
+                wrap,
+            )
+        })
+        .collect();
     let total = |galleys: &[std::sync::Arc<egui::Galley>]| -> f32 {
         galleys.iter().map(|g| g.rect.height()).sum()
     };
 
     let budget = pane_rect.height() * CAPTION_MAX_HEIGHT_FRACTION;
-    let mut galleys = layout_all(&lines);
     while total(&galleys) > budget {
         let Some(idx) = lines.iter().rposition(|l| !l.essential) else {
             return galleys;
         };
         lines.remove(idx);
-        galleys = layout_all(&lines);
+        galleys.remove(idx);
     }
     galleys
 }
