@@ -150,3 +150,61 @@ fn a_frame_hovering_nothing_builds_no_layer_opacity_tooltip_string() {
          the sentence it draws; zero is an empty tooltip."
     );
 }
+
+/// **An open catalogue does not build every tile's hover text every frame.**
+///
+/// This one is per *tile*, not per frame: the inventory is deliberately the
+/// complete registered set, so the cost was one `format!` per registered layer
+/// plus one per preset plus one per delete control, on every frame the
+/// catalogue was up — for the single tooltip a pointer can be over. Measured
+/// on the open catalogue rather than an ordinary frame, which is the scene it
+/// is absent from.
+#[test]
+fn a_frame_hovering_no_catalog_tile_builds_no_tile_tooltip_strings() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.open_catalog();
+    h.warm_up();
+
+    let tiles = h.catalog().tiles.len();
+    assert!(
+        tiles > 1,
+        "premise: the cost is per tile, so it is only visible on a catalogue \
+         drawing more than one; drew {tiles}"
+    );
+    let name = h.overlay_display_name(&known::NWS_ALERTS).to_owned();
+    let tile = h
+        .catalog_tile(crate::ui::CatalogGroup::Layers, &name)
+        .expect("premise: the catalogue must draw a tile to hover")
+        .rect;
+
+    h.mouse_move(nowhere(&h));
+    h.frames_for(4, 0.1);
+    hover_text_count::reset();
+    h.frame();
+    let closed = hover_text_count::read();
+    assert_eq!(
+        closed, 0,
+        "a frame hovering no tile built {closed} catalogue tooltip string(s) \
+         across {tiles} tile(s), every one of them dropped undrawn."
+    );
+
+    h.mouse_move(tile.center());
+    h.frames_for(12, 0.1);
+    assert!(
+        h.painted_text_strings()
+            .iter()
+            .any(|t| *t == format!("{name} is already in this pane - show it")),
+        "premise: hovering a catalogue tile must raise its tooltip; \
+         painted: {:?}",
+        h.painted_text_strings()
+    );
+    hover_text_count::reset();
+    h.frame();
+    let open = hover_text_count::read();
+    assert_eq!(
+        open, 1,
+        "a frame with one tile's tooltip OPEN built {open} string(s) across \
+         {tiles} tile(s). One is the hovered tile's; more would mean the tiles \
+         nobody is over built theirs as well."
+    );
+}

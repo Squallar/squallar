@@ -385,10 +385,15 @@ impl super::Gui {
                         } else {
                             egui::RichText::new(name.as_str())
                         })
-                        .on_hover_text(if in_stack {
-                            format!("{name} is already in this pane - show it")
-                        } else {
-                            format!("Add {name} to this pane")
+                        // `on_hover_ui`, not `on_hover_text`: the latter takes
+                        // its text ALREADY built, so every tile in the
+                        // inventory formatted its sentence on every frame the
+                        // catalogue was open — one allocation per registered
+                        // layer per frame, for the one tooltip a pointer can
+                        // be over. egui runs this body only while it is up.
+                        .on_hover_ui(|ui| {
+                            ui.set_max_width(ui.spacing().tooltip_width);
+                            ui.add(egui::Label::new(tile_hover(&name, in_stack)));
                         });
                     #[cfg(test)]
                     probe.tiles.push(CatalogTileProbe {
@@ -483,9 +488,10 @@ impl super::Gui {
         let mut delete: Option<usize> = None;
         ui.horizontal_wrapped(|ui| {
             for preset in shown_builtin {
-                let tile = ui
-                    .button(preset.name.as_str())
-                    .on_hover_text(preset_hover(&self.overlays, preset));
+                let tile = ui.button(preset.name.as_str()).on_hover_ui(|ui| {
+                    ui.set_max_width(ui.spacing().tooltip_width);
+                    ui.add(egui::Label::new(preset_hover(&self.overlays, preset)));
+                });
                 #[cfg(test)]
                 probe.tiles.push(CatalogTileProbe {
                     group: CatalogGroup::Presets,
@@ -499,16 +505,20 @@ impl super::Gui {
             }
             for i in shown_user {
                 let preset = &self.presets[i];
-                let tile = ui
-                    .button(preset.name.as_str())
-                    .on_hover_text(preset_hover(&self.overlays, preset));
+                let tile = ui.button(preset.name.as_str()).on_hover_ui(|ui| {
+                    ui.set_max_width(ui.spacing().tooltip_width);
+                    ui.add(egui::Label::new(preset_hover(&self.overlays, preset)));
+                });
                 // A word, not a `\u{d7}`: this deletes the user's saved preset,
                 // and `\u{d7}` is the app's close glyph and nothing else
                 // (`ui_glyphs.rs`). A destructive control wearing the dismissal
                 // glyph is the same defect the inspector's crumb carried.
                 let remove = ui
                     .add(egui::Button::new(egui::RichText::new(DELETE_LABEL).small()).frame(false))
-                    .on_hover_text(format!("Delete \"{}\"", preset.name));
+                    .on_hover_ui(|ui| {
+                        ui.set_max_width(ui.spacing().tooltip_width);
+                        ui.add(egui::Label::new(delete_hover(&preset.name)));
+                    });
                 #[cfg(test)]
                 probe.tiles.push(CatalogTileProbe {
                     group: CatalogGroup::Presets,
@@ -893,7 +903,32 @@ impl super::Gui {
 /// Field names come from the registry, so a preset naming a field this build
 /// does not register shows **the id it actually holds** rather than a
 /// substituted default — the hover tells the truth about the file.
+/// What one inventory tile says on hover.
+///
+/// A function rather than an argument: `Response::on_hover_text` takes its
+/// text already made, so the frame path can only leave this unbuilt by
+/// putting it inside the `on_hover_ui` body.
+fn tile_hover(name: &str, in_stack: bool) -> String {
+    #[cfg(test)]
+    crate::ui::hover_text_count::note();
+    if in_stack {
+        format!("{name} is already in this pane - show it")
+    } else {
+        format!("Add {name} to this pane")
+    }
+}
+
+/// What a saved preset's delete control says on hover. A function for the
+/// same reason as [`tile_hover`].
+fn delete_hover(name: &str) -> String {
+    #[cfg(test)]
+    crate::ui::hover_text_count::note();
+    format!("Delete \"{name}\"")
+}
+
 fn preset_hover(registry: &OverlayRegistry, preset: &PresetConfig) -> String {
+    #[cfg(test)]
+    crate::ui::hover_text_count::note();
     let products: Vec<&str> = preset
         .panes
         .iter()
