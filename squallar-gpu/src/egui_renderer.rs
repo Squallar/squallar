@@ -878,6 +878,14 @@ impl EguiRenderer {
         self.uploads.is_delivered(id)
     }
 
+    /// **The most host bytes the texture upload queue has ever held at
+    /// once.** See
+    /// [`texture_upload::TextureUploads::pending_peak_bytes`] — a high-water
+    /// mark rather than the `upload pending` census family's sampled level.
+    pub fn upload_pending_peak_bytes(&self) -> u64 {
+        self.uploads.pending_peak_bytes()
+    }
+
     /// **Whether the texture upload queue still holds bands.**
     ///
     /// The same fact [`Self::end_pass_and_upload`] already acts on when it

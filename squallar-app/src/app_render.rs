@@ -498,6 +498,30 @@ fn texture_upload_line(u: &squallar_gpu::egui_renderer::texture_upload::UploadTo
     )
 }
 
+/// The `upload residency:` line — **the most host bytes the renderer's band
+/// queue has ever held at once**.
+///
+/// # Why this is not a field on `texture uploads:`
+///
+/// That line is cumulative flow and every figure on it only rises with work
+/// done; this is a **high-water mark of a level**, and the two must never be
+/// added or read as one series. It is also its own sentence for
+/// [`overlay_reason_line`]'s reason: the rig's regexes are anchored over whole
+/// sentences, so a field inserted into one of them reads as "the path never
+/// ran". This line is additive.
+///
+/// # Why a peak and not the level the census already publishes
+///
+/// `squallar_egui::heap_census`'s `upload pending` is the same quantity
+/// sampled on a two-second tick, and a picture crosses the queue in fewer
+/// frames than that: measured over five 420 s legs it is 97-99 % zeros with a
+/// p50 of 0.0, so its whole-leg maximum is a lottery over which transient a
+/// tick landed on. The peak is taken where the quantity moves — the argument
+/// `squallar_alloc::live_peak_bytes` is built on — so it cannot miss one.
+fn upload_residency_line(peak: u64) -> String {
+    format!("upload residency: {peak} B peak pending")
+}
+
 /// The `floor strips:` running-total line. See [`overlay_raster_line`] for why
 /// this is a value. Two denominators, never added:
 /// [`squallar_egui::floor_ledger`]'s strip paints are per pane per painted
@@ -2635,10 +2659,15 @@ impl super::App {
             overlay_heartbeat_is_due(self.overlay_telemetry_said, now)
                 .then(squallar_egui::overlay_cache::ledger::totals)
         });
-        let uploads = self
-            .state
-            .as_mut()
-            .and_then(|state| state.egui_renderer.upload_totals_if_moved());
+        let uploads = self.state.as_mut().and_then(|state| {
+            // The peak read beside the totals rather than on its own seam, so
+            // the two sentences can never be a frame apart.
+            let peak = state.egui_renderer.upload_pending_peak_bytes();
+            state
+                .egui_renderer
+                .upload_totals_if_moved()
+                .map(|totals| (totals, peak))
+        });
         let strips = squallar_egui::floor_ledger::totals_if_moved();
         let ground = squallar_egui::tile_mesh::ledger::totals_if_moved();
         let basemap = squallar_egui::basemap_ledger::totals_if_moved();
@@ -2673,8 +2702,14 @@ impl super::App {
             // of both.
             say_telemetry(loud, &overlay_blank_line(&t));
         }
-        if let Some(u) = uploads {
+        if let Some((u, peak)) = uploads {
             say_telemetry(loud, &texture_upload_line(&u));
+            // Beside the line it shares a denominator with, and after it. The
+            // denominator is the same — every texture delta egui hands this
+            // renderer — and the statistic is not: that one is cumulative
+            // flow, this one is a level's high-water mark, and adding them
+            // describes neither.
+            say_telemetry(loud, &upload_residency_line(peak));
         }
         if let Some(s) = strips {
             say_telemetry(loud, &floor_strip_line(&s));

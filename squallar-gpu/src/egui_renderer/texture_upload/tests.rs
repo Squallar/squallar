@@ -871,6 +871,90 @@ fn a_noted_page_is_four_bytes_on_the_queue_where_it_was_thirteen_megabytes() {
     );
 }
 
+/// **The queue's peak does not fall when the queue does**, which is the whole
+/// of why the high-water mark exists beside the level.
+///
+/// `upload pending` — the same quantity, published every frame and read by a
+/// census line every two seconds — is 97-99 % zeros with a p50 of 0.0 on a
+/// 420 s leg, because a picture crosses this queue in fewer frames than the
+/// tick. Its own census note carries the reproduction: "a 206.75 MiB raster
+/// crossed this queue between two samples and it read 0 B at all 100 ticks".
+/// A cut to the queue's simultaneous residency cannot be scored against a
+/// figure like that.
+///
+/// Three readings, and the third is the one a plain store would fail: an empty
+/// queue after a full one still answers what the full one held.
+#[test]
+fn the_pending_peak_survives_the_queue_emptying() {
+    let page = [1806usize, 1806];
+    let page_bytes = (page[0] * page[1] * 4) as u64;
+    let mut uploads = TextureUploads::without_device();
+    uploads.note_pending_peak();
+    assert_eq!(uploads.pending_peak_bytes(), 0, "premise: an empty queue");
+
+    uploads.file_band_for_test(
+        egui::TextureId::Managed(4_101),
+        std::sync::Arc::new(egui::ColorImage::filled(page, egui::Color32::TRANSPARENT)),
+    );
+    uploads.file_band_for_test(
+        egui::TextureId::Managed(4_102),
+        std::sync::Arc::new(egui::ColorImage::filled(page, egui::Color32::TRANSPARENT)),
+    );
+    uploads.note_pending_peak();
+    assert_eq!(
+        uploads.pending_peak_bytes(),
+        2 * page_bytes,
+        "the peak is the level at the instant it was taken, over BOTH \
+         pictures — the simultaneous residency, which is the quantity",
+    );
+
+    // What the drain does, and what a level published after it reads.
+    uploads.pending.clear();
+    assert_eq!(
+        uploads.pending_level_bytes(),
+        0,
+        "premise: the level really did fall to nothing",
+    );
+    uploads.note_pending_peak();
+    assert_eq!(
+        uploads.pending_peak_bytes(),
+        2 * page_bytes,
+        "the peak fell with the queue, so it is a second spelling of the \
+         sampled level and scores nothing the level could not",
+    );
+}
+
+/// **The peak is taken between the file loop and the drain**, pinned
+/// structurally for the reason [`the_drain_allocates_for_a_noted_page_and_delivers_it`]
+/// gives: `apply` takes a `wgpu::Device`, a `Queue` and an
+/// `egui_wgpu::Renderer`, and this suite has `TextureUploads::without_device()`
+/// instead.
+///
+/// The order is the whole figure. `file` is the only thing that adds to the
+/// queue and `drain` the only thing that takes away, so a reading moved after
+/// the drain misses every picture that arrived and finished on one frame — and
+/// on a device with a staging ring that is two whole bands of it.
+#[test]
+fn the_peak_is_read_before_the_drain() {
+    const SOURCE: &str = include_str!("../texture_upload.rs");
+    let body = SOURCE
+        .split_once("        self.whole_spent = 0;")
+        .expect("`apply` resets the whole-crossing budget at its head")
+        .1;
+    let peak = body.find("self.note_pending_peak();").expect(
+        "`apply` no longer takes the queue's high-water mark at all, so \
+         `upload residency:` is a constant zero",
+    );
+    let drain = body
+        .find("self.drain(device, queue, renderer);")
+        .expect("`apply` no longer drains");
+    assert!(
+        peak < drain,
+        "the peak is taken after the drain, so a picture filed and finished \
+         on one frame is missing from it entirely",
+    );
+}
+
 /// **The drain really allocates for a noted page**, pinned structurally
 /// because no test in this module can reach the drain.
 ///

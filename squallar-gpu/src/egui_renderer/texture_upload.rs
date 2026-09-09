@@ -452,6 +452,27 @@ pub struct TextureUploads {
     /// [`UploadTotals::progress`] at the last line [`Self::report`] logged, so
     /// a frame that moved nothing costs one `u64` compare and says nothing.
     reported: u64,
+    /// **The high-water mark of [`Self::pending_level_bytes`]**, over the life
+    /// of this renderer.
+    ///
+    /// The level itself is a level, published every frame and read by a census
+    /// line every two seconds — and a picture crosses this queue in fewer
+    /// frames than that, so the sampled family is 97-99 % zeros with a p50 of
+    /// 0.0 and its whole-leg maximum is a lottery over which transient a tick
+    /// happened to land on. Its own census note already says so
+    /// (`squallar_egui::heap_census`'s `UPLOAD_PENDING_BYTES`: "a 206.75 MiB
+    /// raster crossed this queue between two samples and it read 0 B at all
+    /// 100 ticks"). **This is the figure that cannot miss one**, on the same
+    /// argument `squallar_alloc::live_peak_bytes` is built on: a maximum taken
+    /// where the quantity moves rather than on a clock.
+    ///
+    /// Taken once per [`Self::apply`], between the file loop and the drain,
+    /// which is exactly where a frame's queue is at its largest: [`Self::file`]
+    /// is the only thing that adds to it and [`Self::drain`] the only thing
+    /// that takes away. One sweep of the queue per frame, allocation-free —
+    /// the same sweep [`Self::publish_pending_level`] already runs at the other
+    /// end of the frame, and see its note for the cost.
+    pending_peak: u64,
     /// Whether this instance publishes into `squallar_egui::heap_census`.
     ///
     /// Those families are process-wide slots, each holding one level, so each
@@ -532,6 +553,7 @@ impl TextureUploads {
             resident: ResidentTextures::default(),
             reported: 0,
             whole_spent: 0,
+            pending_peak: 0,
             census_publisher: true,
         }
     }
@@ -553,6 +575,7 @@ impl TextureUploads {
             resident: ResidentTextures::default(),
             reported: 0,
             whole_spent: 0,
+            pending_peak: 0,
             census_publisher: false,
         }
     }
@@ -596,6 +619,20 @@ impl TextureUploads {
         !self.pending.is_empty()
     }
 
+    /// **The most this queue has ever held at once**, in host bytes. See
+    /// [`Self::pending_peak`] — a high-water mark, never a sample, and so the
+    /// figure a residency cut on the staging path is scored against.
+    pub fn pending_peak_bytes(&self) -> u64 {
+        self.pending_peak
+    }
+
+    /// Raise [`Self::pending_peak`] to this instant's level. A max and never
+    /// a store: the whole point of the figure is that it does not fall when
+    /// the drain empties the queue between two readers.
+    fn note_pending_peak(&mut self) {
+        self.pending_peak = self.pending_peak.max(self.pending_level_bytes());
+    }
+
     /// Bands this may move in one frame.
     fn bands_per_frame(&self) -> usize {
         bands_per_frame(self.capable)
@@ -615,6 +652,9 @@ impl TextureUploads {
         for (id, delta) in set {
             self.file(device, queue, renderer, *id, delta);
         }
+        // **Here and not after the drain**: this is the instant the queue is
+        // at its largest on this frame. See [`Self::pending_peak`].
+        self.note_pending_peak();
         self.drain(device, queue, renderer);
         self.publish_pending_level();
         self.publish_resident_level();
