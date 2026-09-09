@@ -542,6 +542,13 @@ pub struct MapTileState {
     /// slot holds the vector source; the raster fallback has no style to
     /// filter.
     base_disabled_source_layers: std::collections::BTreeSet<String>,
+    /// The BasemapTiles handler's [`layer_state_revision`] the set above was
+    /// read at, so `ensure_base_tiles` can be told the set has not moved
+    /// instead of being handed a rebuilt copy of it. `None` before the first
+    /// read and for a handler that publishes no revision — both mean "read".
+    ///
+    /// [`layer_state_revision`]: squallar_source::handler::SourceHandler::layer_state_revision
+    base_controls_revision: Option<u64>,
 
     /// How many times a base source has been constructed — the probe the
     /// restyle-not-rebuild pin reads, because two `HttpsTiles` cannot be
@@ -554,6 +561,13 @@ pub struct MapTileState {
     /// not [`Self::base_builds`].
     #[cfg(test)]
     pub(crate) base_restyles: usize,
+
+    /// How many times [`Self::ensure_base_tiles`] was handed a set rather than
+    /// told the layer's state had not moved — that is, how many times the
+    /// frame path walked the control surface. The memo's own probe: a settled
+    /// frame must not move it, and a toggled detail must move it by one.
+    #[cfg(test)]
+    pub(crate) base_detail_reads: usize,
 
     /// [`Self::base_unreachable`]'s twin for the terrain slot, latched for
     /// the same reason. A failed terrain archive means the layer draws
@@ -623,10 +637,13 @@ impl Default for MapTileState {
             base_reads_failing: false,
             offline: false,
             base_disabled_source_layers: std::collections::BTreeSet::new(),
+            base_controls_revision: None,
             #[cfg(test)]
             base_builds: 0,
             #[cfg(test)]
             base_restyles: 0,
+            #[cfg(test)]
+            base_detail_reads: 0,
             terrain_failed: false,
             parked_base: None,
             parked_terrain: None,
@@ -713,6 +730,18 @@ impl MapTileState {
         self.terrain_entry_bytes
     }
 
+    /// Whether the control surface has to be re-read to answer
+    /// [`Self::ensure_base_tiles`] this frame, given the layer's own
+    /// `layer_state_revision`. Bookkeeps the answer, so it is asked once per
+    /// frame and the second ask of the same revision would say `false`.
+    pub fn base_controls_moved(&mut self, revision: Option<u64>) -> bool {
+        // `None` means the layer publishes no revision, so nothing can be
+        // concluded from two `None`s being equal: re-read, every time.
+        let moved = revision.is_none() || revision != self.base_controls_revision;
+        self.base_controls_revision = revision;
+        moved
+    }
+
     /// Ensure the base-map tiles for the current theme and detail set are
     /// initialized, and retire a source that has reported itself unusable.
     ///
@@ -738,10 +767,21 @@ impl MapTileState {
     /// old note here recorded as accepted with the parsed cache as future
     /// work. The terrain slot is untouched by any of it: the hillshade remap
     /// is theme-independent by design (see the `terrain` field's docs).
+    ///
+    /// `disabled_source_layers` is `Some` only when the caller has re-read the
+    /// layer's control surface this frame; `None` says "the layer's own state
+    /// has not moved since the last call, so the committed set still stands".
+    /// The caller decides that off
+    /// [`squallar_source::handler::SourceHandler::layer_state_revision`], and a
+    /// layer publishing no revision hands `Some` every frame — which is what
+    /// every frame did before the option existed.
+    ///
+    /// **`None` is not "no detail is disabled".** An empty set is that, and it
+    /// arrives as `Some` of an empty set.
     pub fn ensure_base_tiles(
         &mut self,
         is_dark: bool,
-        disabled_source_layers: &std::collections::BTreeSet<String>,
+        disabled_source_layers: Option<&std::collections::BTreeSet<String>>,
         ctx: &egui::Context,
     ) {
         // Unpark first, before anything reads the slot. A theme or detail flip
@@ -764,15 +804,27 @@ impl MapTileState {
             self.parked_base = None;
         }
 
-        let style_changed = self.current_theme_is_dark != is_dark
-            || self.base_disabled_source_layers != *disabled_source_layers;
+        #[cfg(test)]
+        if disabled_source_layers.is_some() {
+            self.base_detail_reads += 1;
+        }
+
+        // Committed before anything reads it, so the restyle and the build
+        // arm below both take one set. The build arm cannot take the argument
+        // any more: on a frame the caller memoised there is no argument to
+        // take, and the committed set is the same bytes it would have held.
+        let detail_changed = disabled_source_layers
+            .is_some_and(|disabled| self.base_disabled_source_layers != *disabled);
+        if let Some(disabled) = disabled_source_layers.filter(|_| detail_changed) {
+            self.base_disabled_source_layers = disabled.clone();
+        }
+        let style_changed = self.current_theme_is_dark != is_dark || detail_changed;
         if style_changed {
             self.current_theme_is_dark = is_dark;
-            self.base_disabled_source_layers = disabled_source_layers.clone();
             if let Some(tiles) = self.tiles.as_mut() {
                 tiles.set_style(crate::tile_source::BasemapStyling::committed(
                     is_dark,
-                    disabled_source_layers,
+                    &self.base_disabled_source_layers,
                 ));
                 #[cfg(test)]
                 {
@@ -783,7 +835,6 @@ impl MapTileState {
 
         if self.tiles.is_none() && !self.base_unreachable {
             self.current_theme_is_dark = is_dark;
-            self.base_disabled_source_layers = disabled_source_layers.clone();
             #[cfg(test)]
             {
                 self.base_builds += 1;
@@ -801,7 +852,7 @@ impl MapTileState {
             } else {
                 base_source(
                     is_dark,
-                    disabled_source_layers,
+                    &self.base_disabled_source_layers,
                     ctx,
                     self.basemap_dir.as_deref(),
                 )
@@ -850,6 +901,14 @@ impl MapTileState {
     /// tile read keeps its slot, keeps its IO task, and recovers on its own —
     /// so this can go back down, and the caller must ask every frame rather
     /// than remembering the answer.
+    /// The source-layer set the live base style is committed to. For the
+    /// memo's pin, which has to assert the detail *landed* and not only that a
+    /// restyle was counted.
+    #[cfg(test)]
+    pub(crate) fn committed_disabled_source_layers(&self) -> &std::collections::BTreeSet<String> {
+        &self.base_disabled_source_layers
+    }
+
     pub fn base_archive_is_unreachable(&self) -> bool {
         self.base_unreachable || self.base_reads_failing
     }

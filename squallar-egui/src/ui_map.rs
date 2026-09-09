@@ -154,13 +154,26 @@ impl super::Gui {
             .iter()
             .any(|pane| pane.is_overlay_enabled(&known::BASEMAP_TILES));
         if basemap_on {
-            let disabled = crate::basemap_layer::disabled_from_controls(
-                &self
-                    .overlays
-                    .controls(&known::BASEMAP_TILES, &PaneRef::bare(0)),
-            );
+            // **Read off the control surface, but only on a frame the layer
+            // says its own state moved.** `controls` answers in owned
+            // `String`s — one per toggle, and the layer declares fifteen — so
+            // asking costs the same allocations whether or not the answer
+            // changed, and the answer changes only when a control is applied.
+            // The revision is the layer's own, bumped beside every write to
+            // the set; a layer publishing none reads every frame, which is
+            // what this did unconditionally.
+            let moved = self
+                .map_tiles
+                .base_controls_moved(self.overlays.layer_state_revision(&known::BASEMAP_TILES));
+            let disabled = moved.then(|| {
+                crate::basemap_layer::disabled_from_controls(
+                    &self
+                        .overlays
+                        .controls(&known::BASEMAP_TILES, &PaneRef::bare(0)),
+                )
+            });
             self.map_tiles
-                .ensure_base_tiles(is_dark_theme, &disabled, &ctx);
+                .ensure_base_tiles(is_dark_theme, disabled.as_ref(), &ctx);
         } else {
             self.map_tiles.release_base_tiles();
         }
@@ -3794,3 +3807,7 @@ mod download_pick_tests;
 #[path = "ui_map/basemap_park_tests.rs"]
 #[cfg(test)]
 mod basemap_park_tests;
+
+#[path = "ui_map/basemap_detail_memo_tests.rs"]
+#[cfg(test)]
+mod basemap_detail_memo_tests;

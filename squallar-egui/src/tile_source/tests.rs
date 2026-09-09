@@ -3513,7 +3513,7 @@ mod archive {
                 let _ = tiles.at(*id);
             }
         }
-        state.ensure_base_tiles(true, &std::collections::BTreeSet::new(), ctx);
+        state.ensure_base_tiles(true, Some(&std::collections::BTreeSet::new()), ctx);
     }
 
     /// A source over the committed fixture, in a `MapTileState`, with its
@@ -3557,7 +3557,7 @@ mod archive {
             )
         })
         .expect("the archive never served a tile, so it never opened");
-        state.ensure_base_tiles(true, &std::collections::BTreeSet::new(), ctx);
+        state.ensure_base_tiles(true, Some(&std::collections::BTreeSet::new()), ctx);
 
         assert!(
             !state.base_archive_is_unreachable(),

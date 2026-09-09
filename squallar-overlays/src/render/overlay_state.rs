@@ -788,6 +788,13 @@ impl OverlayRegistry {
         items
     }
 
+    /// [`SourceHandler::layer_state_revision`] for `id`, or `None` for an id
+    /// no handler serves — which reads as "re-read", the same as a handler
+    /// that publishes no revision.
+    pub fn layer_state_revision(&self, id: &LayerId) -> Option<u64> {
+        self.handler(id)?.layer_state_revision()
+    }
+
     pub fn apply_control(
         &mut self,
         id: &LayerId,

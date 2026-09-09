@@ -1154,7 +1154,7 @@ fn a_theme_flip_restyles_the_live_source_instead_of_rebuilding() {
     let ctx = egui::Context::default();
     let mut state = MapTileState::default();
 
-    state.ensure_base_tiles(true, &Default::default(), &ctx);
+    state.ensure_base_tiles(true, Some(&Default::default()), &ctx);
     assert!(
         state.tiles.is_some() && state.current_theme_is_dark,
         "fixture: a dark frame must make the dark source"
@@ -1162,7 +1162,7 @@ fn a_theme_flip_restyles_the_live_source_instead_of_rebuilding() {
     assert_eq!(state.base_builds, 1, "fixture: the first frame builds");
     assert_eq!(state.base_restyles, 0, "fixture: nothing has flipped yet");
 
-    state.ensure_base_tiles(false, &Default::default(), &ctx);
+    state.ensure_base_tiles(false, Some(&Default::default()), &ctx);
     assert!(
         state.tiles.is_some() && !state.current_theme_is_dark,
         "the flip must keep a live source in the slot"
@@ -1173,14 +1173,14 @@ fn a_theme_flip_restyles_the_live_source_instead_of_rebuilding() {
         "a theme flip is a restyle of the live source, not a rebuild"
     );
 
-    state.ensure_base_tiles(false, &Default::default(), &ctx);
+    state.ensure_base_tiles(false, Some(&Default::default()), &ctx);
     assert_eq!(
         (state.base_builds, state.base_restyles),
         (1, 1),
         "an unchanged frame must neither rebuild nor restyle"
     );
 
-    state.ensure_base_tiles(true, &Default::default(), &ctx);
+    state.ensure_base_tiles(true, Some(&Default::default()), &ctx);
     assert_eq!(
         (state.base_builds, state.base_restyles),
         (1, 2),
@@ -1198,10 +1198,10 @@ fn the_flip_keeps_the_source_whose_caches_serve_the_restyle() {
     let ctx = egui::Context::default();
     let mut state = MapTileState::default();
 
-    state.ensure_base_tiles(true, &Default::default(), &ctx);
+    state.ensure_base_tiles(true, Some(&Default::default()), &ctx);
     assert!(state.tiles.is_some(), "fixture: the dark source exists");
 
-    state.ensure_base_tiles(false, &Default::default(), &ctx);
+    state.ensure_base_tiles(false, Some(&Default::default()), &ctx);
     assert!(
         !state.current_theme_is_dark,
         "the state must have adopted the light theme"
@@ -1230,10 +1230,10 @@ fn a_changed_source_layer_set_restyles_the_base_source() {
     let mut state = MapTileState::default();
     let empty = std::collections::BTreeSet::new();
 
-    state.ensure_base_tiles(true, &empty, &ctx);
+    state.ensure_base_tiles(true, Some(&empty), &ctx);
     assert_eq!(state.base_builds, 1, "fixture: the first frame builds");
 
-    state.ensure_base_tiles(true, &empty, &ctx);
+    state.ensure_base_tiles(true, Some(&empty), &ctx);
     assert_eq!(
         (state.base_builds, state.base_restyles),
         (1, 0),
@@ -1241,7 +1241,7 @@ fn a_changed_source_layer_set_restyles_the_base_source() {
     );
 
     let disabled: std::collections::BTreeSet<String> = ["water".to_owned()].into();
-    state.ensure_base_tiles(true, &disabled, &ctx);
+    state.ensure_base_tiles(true, Some(&disabled), &ctx);
     assert_eq!(
         (state.base_builds, state.base_restyles),
         (1, 1),
@@ -1252,7 +1252,7 @@ fn a_changed_source_layer_set_restyles_the_base_source() {
         "the restyle left a source in the slot"
     );
 
-    state.ensure_base_tiles(true, &disabled, &ctx);
+    state.ensure_base_tiles(true, Some(&disabled), &ctx);
     assert_eq!(
         (state.base_builds, state.base_restyles),
         (1, 1),
@@ -1266,7 +1266,7 @@ fn a_changed_source_layer_set_restyles_the_base_source() {
     // `MapTileState::parked_base` for the measured reason it changed.
     state.release_base_tiles();
     assert!(state.tiles.is_none(), "the release must empty the slot");
-    state.ensure_base_tiles(true, &disabled, &ctx);
+    state.ensure_base_tiles(true, Some(&disabled), &ctx);
     assert_eq!(
         state.base_builds, 1,
         "coming back built a second source, so the release dropped the first \
@@ -1304,7 +1304,7 @@ fn a_flip_while_the_layer_is_off_restyles_the_source_that_comes_back() {
     let mut state = MapTileState::default();
     let empty = std::collections::BTreeSet::new();
 
-    state.ensure_base_tiles(true, &empty, &ctx);
+    state.ensure_base_tiles(true, Some(&empty), &ctx);
     state
         .tiles
         .as_mut()
@@ -1326,7 +1326,7 @@ fn a_flip_while_the_layer_is_off_restyles_the_source_that_comes_back() {
     // while the basemap layer is switched off.
     state.release_base_tiles();
     let disabled: std::collections::BTreeSet<String> = ["water".to_owned()].into();
-    state.ensure_base_tiles(false, &disabled, &ctx);
+    state.ensure_base_tiles(false, Some(&disabled), &ctx);
 
     assert_eq!(
         state
@@ -1384,7 +1384,7 @@ fn a_layer_toggle_parks_the_base_source_rather_than_joining_its_io_thread() {
     let mut state = MapTileState::default();
     let empty = std::collections::BTreeSet::new();
 
-    state.ensure_base_tiles(true, &empty, &ctx);
+    state.ensure_base_tiles(true, Some(&empty), &ctx);
     for _ in 0..3 {
         state
             .tiles
@@ -1409,7 +1409,7 @@ fn a_layer_toggle_parks_the_base_source_rather_than_joining_its_io_thread() {
         "a switched-off layer must draw nothing, parked or not"
     );
 
-    state.ensure_base_tiles(true, &empty, &ctx);
+    state.ensure_base_tiles(true, Some(&empty), &ctx);
     assert_eq!(
         state
             .tiles
@@ -1479,7 +1479,7 @@ fn a_clear_lets_go_of_the_parked_sources_as_well() {
     let mut state = MapTileState::default();
     let empty = std::collections::BTreeSet::new();
 
-    state.ensure_base_tiles(true, &empty, &ctx);
+    state.ensure_base_tiles(true, Some(&empty), &ctx);
     state.ensure_terrain_tiles(&ctx);
     state
         .tiles
@@ -1493,7 +1493,7 @@ fn a_clear_lets_go_of_the_parked_sources_as_well() {
     state.release_terrain_tiles();
     state.clear();
 
-    state.ensure_base_tiles(true, &empty, &ctx);
+    state.ensure_base_tiles(true, Some(&empty), &ctx);
     assert_eq!(
         state.tiles.as_ref().expect("rebuilt after clear").pumps(),
         0,
@@ -1515,7 +1515,7 @@ fn repeated_flips_never_hold_more_than_the_one_live_source() {
 
     for round in 0..6 {
         let is_dark = round % 2 == 0;
-        state.ensure_base_tiles(is_dark, &Default::default(), &ctx);
+        state.ensure_base_tiles(is_dark, Some(&Default::default()), &ctx);
         assert_eq!(
             state.current_theme_is_dark, is_dark,
             "round {round} did not adopt the theme it was handed"

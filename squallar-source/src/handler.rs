@@ -1104,6 +1104,33 @@ pub trait SourceHandler: Send {
 
     fn deserialize_state(&mut self, _value: serde_json::Value) {}
 
+    /// A counter over the handler's own **layer-global** state — exactly the
+    /// state [`serialize_state`](Self::serialize_state) carries, as opposed to
+    /// the per-pane state [`create_pane_state`](Self::create_pane_state)
+    /// hands to the pane. It must move on every write to that state and on no
+    /// other event.
+    ///
+    /// It exists for a reader on the frame path that would otherwise rebuild a
+    /// derived value out of [`controls`](Self::controls) every frame to find
+    /// out whether it moved: `controls` returns owned `String`s, so asking it
+    /// is an allocation whether or not the answer changed, and the answer
+    /// changes only when a control is applied.
+    ///
+    /// **`None` is the safe answer and the default**, and it means "I publish
+    /// no revision" rather than "nothing of mine ever changes" — a reader that
+    /// gets it must re-read every time, which is what every reader did before
+    /// this method existed. A default of `0` could not say that: it is
+    /// indistinguishable from a handler whose state has never moved, and a
+    /// memo keyed on it would go stale silently.
+    ///
+    /// A revision says nothing about per-pane state, because per-pane state is
+    /// not the handler's to count: `controls` for one pane can differ from
+    /// `controls` for another with no handler write between them. Only a
+    /// reading that is layer-global by construction may be memoised on this.
+    fn layer_state_revision(&self) -> Option<u64> {
+        None
+    }
+
     fn serialize_pane_state(&self, _state: &dyn Any) -> serde_json::Value {
         serde_json::Value::Null
     }

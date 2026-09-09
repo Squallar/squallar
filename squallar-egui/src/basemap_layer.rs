@@ -185,6 +185,12 @@ pub(crate) struct BasemapTilesHandler {
     /// is empty-of-surprises: a config that has never touched a toggle whose
     /// default is ON carries nothing about it.
     disabled_source_layers: BTreeSet<String>,
+    /// Bumped by [`BasemapTilesHandler::wrote_layer_state`] on every write to
+    /// the two fields above, and published as
+    /// [`SourceHandler::layer_state_revision`] so the frame path can skip
+    /// rebuilding the disabled set out of `controls` on the frames — nearly
+    /// all of them — where nothing was applied. See that trait method.
+    layer_state_revision: u64,
 }
 
 impl BasemapTilesHandler {
@@ -195,7 +201,17 @@ impl BasemapTilesHandler {
             // without touching anything.
             enabled: true,
             disabled_source_layers: default_disabled_source_layers(),
+            // Any start is as good as any other: the frame path's memo holds
+            // `Option<u64>` and misses on its first read whatever this is.
+            layer_state_revision: 0,
         }
+    }
+
+    /// Call after **every** write to this handler's layer-global state. The
+    /// published revision is what a frame-path memo is keyed on, so a write
+    /// that skips this is a stale basemap style rather than a slow one.
+    fn wrote_layer_state(&mut self) {
+        self.layer_state_revision = self.layer_state_revision.wrapping_add(1);
     }
 }
 
@@ -299,17 +315,21 @@ impl SourceHandler for BasemapTilesHandler {
         if update.id == "enabled" {
             if !PaneToggle::set(pane, val) {
                 self.enabled = val;
+                self.wrote_layer_state();
             }
         } else if let Some(source_layer) = update.id.strip_prefix(SOURCE_LAYER_CONTROL_PREFIX) {
             // The frame loop notices the set changed and re-styles the live
             // tile source from its parsed-geometry cache
             // (`MapTileState::ensure_base_tiles` -> `HttpsTiles::set_style`)
-            // — zero fetches, zero re-parses; nothing to signal here.
+            // — zero fetches, zero re-parses. What it notices it by is the
+            // revision bumped here: without the bump the frame path keeps
+            // last frame's set and the ground never re-styles.
             if val {
                 self.disabled_source_layers.remove(source_layer);
             } else {
                 self.disabled_source_layers.insert(source_layer.to_owned());
             }
+            self.wrote_layer_state();
         }
         ControlEffect::None
     }
@@ -357,7 +377,16 @@ impl SourceHandler for BasemapTilesHandler {
                 .iter()
                 .filter_map(|v| v.as_str().map(str::to_owned))
                 .collect();
+            self.wrote_layer_state();
         }
+    }
+
+    /// The counter [`BasemapTilesHandler::wrote_layer_state`] keeps. This is
+    /// the one handler that publishes one, because it is the one whose control
+    /// surface a frame reads: `ui_map`'s basemap arm asks every frame which
+    /// source layers are off.
+    fn layer_state_revision(&self) -> Option<u64> {
+        Some(self.layer_state_revision)
     }
 }
 
