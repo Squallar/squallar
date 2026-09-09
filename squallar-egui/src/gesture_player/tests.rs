@@ -590,8 +590,22 @@ fn the_registry_collects_only_while_armed() {
 /// emitted rather than skipped. `dragged` is the path length the pressed
 /// pointer travelled — a "did the work happen" figure a stroke that never
 /// pressed cannot fake, where the net pan can.
+///
+/// **This is the event stream, and it is not the camera.** Everything here is
+/// a sum over the events the player wrote, so it reads a balanced stream as a
+/// returning state — and the two are different things. Nothing between an
+/// event and the map is modelled: not the drag threshold that hands
+/// `Response::drag_delta()` nothing until the pointer has left a 6 pt circle,
+/// not the release frame on which `dragged()` is already false and its step
+/// goes to nobody, not `walkers`' inertia coast off `egui`'s smoothed pointer
+/// velocity, not the zoom-to-cursor anchor, not the viewport zoom floor, not
+/// the centre's latitude band. A run whose camera ended 5.5° of longitude
+/// from where it started scores zero net pan here.
+///
+/// It is kept for what it *can* say — that the gesture was emitted at all —
+/// and [`MapCamera`] is what says where the map went.
 #[derive(Debug, Clone, PartialEq)]
-struct CameraEnd {
+struct StreamEnd {
     /// Summed in f64 so the harness contributes no error of its own: an f32
     /// running total over a few thousand deltas loses ~0.1 pt by itself.
     pan: (f64, f64),
@@ -601,17 +615,17 @@ struct CameraEnd {
     wheel_events: usize,
 }
 
-fn camera_end(frames: &[(f64, Vec<egui::Event>)]) -> CameraEnd {
+fn stream_end(frames: &[(f64, Vec<egui::Event>)]) -> StreamEnd {
     let mut down = false;
     let mut pos: Option<egui::Pos2> = None;
-    let mut end = CameraEnd {
+    let mut end = StreamEnd {
         pan: (0.0, 0.0),
         zoom_notches: 0.0,
         dragged: 0.0,
         presses: 0,
         wheel_events: 0,
     };
-    let apply = |end: &mut CameraEnd, to: egui::Pos2, down: bool, pos: &mut Option<egui::Pos2>| {
+    let apply = |end: &mut StreamEnd, to: egui::Pos2, down: bool, pos: &mut Option<egui::Pos2>| {
         if down && let Some(prev) = *pos {
             let (dx, dy) = (f64::from(to.x - prev.x), f64::from(to.y - prev.y));
             end.pan.0 += dx;
@@ -711,19 +725,60 @@ fn jittered_around(seed: u64, mean: f64, until: f64) -> Vec<f64> {
 }
 
 /// The script's end camera state is a function of elapsed time and nothing
-/// else — the same pan, the same zoom, and the same per-stroke displacements
-/// under every frame cadence.
+/// else — the same map centre, the same zoom, and the same per-stroke map
+/// displacements under every frame cadence.
 ///
-/// The mechanism this pins: a stroke's release used to be emitted only by a
-/// frame that landed inside its coast window, `STROKE_PERIOD - STROKE_HOLD`
-/// = 50 ms wide. Any frame gap wider than that stepped over the window, left
-/// the button down into the next stroke, and that stroke's first move dragged
-/// the pointer back to the centre — so the stranded stroke netted nothing,
-/// its mirrored pair stopped cancelling, and the loop kept the pair's whole
-/// displacement (up to `REACH_FRACTION` of the shorter edge, 432 pt at
-/// 1920x1080) as a net pan. Which strokes were stranded was pure frame-gap
-/// luck: five Mac Firefox legs of the same build, script and seed ended
-/// between 36.41 N / 430 km and 79.89 N / 4,973 km.
+/// **The camera here is a real `walkers::Map`** ([`MapCamera`]), built with
+/// the same options `ui_map` builds the app's with. The version of this gate
+/// that shipped with the release fix asserted a *reduction of the event
+/// stream* instead — a sum of pointer deltas and wheel notches — and it
+/// passed on a tree whose map, driven by the same events, ended anywhere
+/// between Tennessee and Brazil across repeats of one build. A balanced
+/// stream of events is not a returning camera, and only the map can tell the
+/// two apart, because every mechanism that separates them lives between the
+/// event and the map:
+///
+/// - `egui` hands a widget nothing (`Response::drag_delta() == ZERO`) until
+///   the pointer has left a `max_click_dist` circle around the press point,
+///   6 pt, and then only *this* frame's delta — so a ramp that starts at zero
+///   loses `speed x t` of its first frames, a different amount per cadence;
+/// - on the frame the release arrives `dragged()` is already false, so the
+///   step from the last in-stroke frame to the release position reaches
+///   nobody. That step is `reach(HOLD) - reach(t_of_last_frame)`: pure frame
+///   luck, and it was worth up to 38 pt a stroke;
+/// - `walkers` then coasts on `egui`'s smoothed `pointer.velocity()`
+///   (`center.rs`, `velocity * INERTIA_TAU`), which is an estimate off the
+///   last 100 ms of sampled positions and so is cadence-shaped too;
+/// - the notches land over the *window's* centre, which is not the pane's, so
+///   each is a zoom-to-cursor about an off-centre anchor;
+/// - and the zoom has a floor and the centre a latitude band.
+///
+/// [`stream_end`] models none of that and cannot be made to without becoming
+/// the widget. It is kept for the half it *can* speak to — that the gesture
+/// was emitted at all — and asserted first, because a player that emitted
+/// nothing would satisfy every "it landed in the same place" line below.
+///
+/// **What the player had to change to pass**: a stroke now comes to rest at
+/// its reach for [`STROKE_HOLD - STROKE_TRAVEL`](pan_zoom_2d::STROKE_TRAVEL)
+/// before the release, and starts one [`STROKE_LEAD`](pan_zoom_2d::STROKE_LEAD)
+/// step clear of the press point. Both are saturations of the same closed
+/// form in `t`, and between them the frame deltas telescope to the reach: the
+/// first move crosses the drag threshold whole, and the release lands where
+/// the pointer already is, with a velocity history 100 ms flat behind it.
+///
+/// **The floor, measured**: the map's displacement is exact from 10 fps up
+/// and at every jittered cadence with a mean at or under 41 ms. Below that a
+/// stroke does not get the four frames its sequence needs inside one 500 ms
+/// period — release, park, press, move — and one is skipped outright, which
+/// was true before this too.
+///
+/// The earlier mechanism this still pins: a stroke's release used to be
+/// emitted only by a frame that landed inside its coast window,
+/// `STROKE_PERIOD - STROKE_HOLD` = 50 ms wide. Any frame gap wider than that
+/// stepped over the window, left the button down into the next stroke, and
+/// that stroke's first move dragged the pointer back to the centre — so the
+/// stranded stroke netted nothing, its mirrored pair stopped cancelling, and
+/// the loop kept the pair's whole displacement as a net pan.
 #[test]
 fn the_pan_zoom_camera_lands_in_the_same_place_at_every_frame_cadence() {
     use pan_zoom_2d::*;
@@ -736,7 +791,7 @@ fn the_pan_zoom_camera_lands_in_the_same_place_at_every_frame_cadence() {
     let reach_cap = REACH_FRACTION * NATIVE.width().min(NATIVE.height());
     let stroke_reach = |stroke: u32| {
         let speed = STROKE_SPEED_BASE + STROKE_SPEED_STEP * (stroke / 2) as f32;
-        f64::from((speed * STROKE_HOLD as f32).min(reach_cap))
+        f64::from((STROKE_LEAD + speed * STROKE_TRAVEL as f32).min(reach_cap))
     };
     // Each stroke presses at the centre and travels outward only, so its
     // pressed path length is exactly the reach its hold time buys.
@@ -746,11 +801,11 @@ fn the_pan_zoom_camera_lands_in_the_same_place_at_every_frame_cadence() {
 
     // A tolerance of the f32 direction vector the player scales by: its
     // length is 1 only to f32 precision, so a stroke's delivered reach is its
-    // scheduled reach times 1 +/- ~1e-7, and the run's 16,173 pt of pressed
-    // travel carries a few thousandths of a point of that. Nothing else is
-    // approximate — the sums above are f64. It is four orders of magnitude
-    // under the smallest thing a stranded stroke could be worth, pair 0's
-    // 90 pt reach, so it cannot swallow one.
+    // scheduled reach times 1 +/- ~1e-7, and the run's pressed travel carries
+    // a few thousandths of a point of that. Nothing else is approximate — the
+    // sums above are f64. It is three orders of magnitude under the smallest
+    // thing a stranded stroke could be worth, pair 0's 57 pt reach, so it
+    // cannot swallow one.
     let tolerance = 1e-2;
 
     let cadences: Vec<(String, Vec<f64>)> = vec![
@@ -775,65 +830,273 @@ fn the_pan_zoom_camera_lands_in_the_same_place_at_every_frame_cadence() {
             "jittered ~25 ms".to_owned(),
             jittered_around(11, 0.025, until),
         ),
+        // Above 137 fps, and the reason the list reaches up here rather than
+        // only down: the first frame after a press is what has to clear
+        // `egui`'s 6 pt drag threshold in one step, and the faster the frames
+        // come the less of the ramp there is in it. Pair 0 runs at 200 pt/s,
+        // so a 5.7 ms frame carries 1.1 pt of it — a fifth of the bar. A list
+        // that stopped at 60 fps would let `STROKE_LEAD` go to zero and stay
+        // green.
+        ("175 fps".to_owned(), steady_times(1.0 / 175.0, until)),
     ];
 
-    let mut reference: Option<(&str, CameraEnd, Vec<egui::Vec2>)> = None;
+    // Every scripted stroke's own displacement, from the schedule alone.
+    let scripted_stroke =
+        |stroke: u32| GesturePlayer::stroke_pos(NATIVE, stroke, STROKE_HOLD) - NATIVE.center();
+
+    // What the map's zoom may differ by between two cadences, in zoom levels.
+    //
+    // Not zero, and not a fudge: `egui` hands a discrete wheel notch out over
+    // several frames (`wheel_state.rs` drains `unprocessed_wheel_delta` by an
+    // `exponential_smooth_factor` of the frame time), and `walkers` ignores
+    // any frame whose zoom delta is inside its own 0.001 deadband
+    // (`map.rs::handle_gestures`). The drained tail below that deadband is
+    // dropped, and how much lands there is a function of where the frames
+    // fell. The bound is one deadband's worth of a notch, `0.001 * zoom_speed`
+    // — `zoom_speed` is 2 — which is the most a single frame can silently
+    // lose. The pan below is asserted a hundred times tighter, because
+    // nothing in the drag path has an equivalent.
+    let zoom_tolerance = 0.002;
+
+    let mut reference: Option<(&str, CameraEnd)> = None;
     for (name, times) in &cadences {
         let frames = replay("pan-zoom-2d", times, NATIVE);
-        let end = camera_end(&frames);
-        let nets: Vec<egui::Vec2> = strokes(&frames).iter().map(|s| s.net).collect();
+        let stream = stream_end(&frames);
+        let camera = camera_end(&frames);
 
         // The gesture really did its work: every stroke pressed, every notch
         // emitted, and the pressed pointer travelled the whole scripted path.
+        // A player that emitted nothing would satisfy every "it landed in the
+        // same place" assertion below, so these come first.
         assert_eq!(
-            end.presses, expected_presses,
+            stream.presses, expected_presses,
             "{name}: {} strokes pressed, the schedule has {expected_presses}",
-            end.presses
+            stream.presses
         );
         assert_eq!(
-            end.wheel_events, expected_wheel_events,
+            stream.wheel_events, expected_wheel_events,
             "{name}: {} wheel notches, the schedule has {expected_wheel_events}",
-            end.wheel_events
+            stream.wheel_events
         );
         assert!(
-            (end.dragged - expected_dragged).abs() < tolerance,
+            (stream.dragged - expected_dragged).abs() < tolerance,
             "{name}: the pressed pointer travelled {} pt, the schedule's strokes total \
              {expected_dragged} pt",
-            end.dragged
+            stream.dragged
         );
+        assert_eq!(
+            stream.zoom_notches, 0.0,
+            "{name}: the stream left a net zoom"
+        );
+
+        // And the map took every stroke whole. This is the assertion the
+        // stream cannot make: what reaches the camera is the drag `egui`
+        // decided on, minus the release frame's own step, plus whatever
+        // inertia `walkers` coasts on afterwards.
+        assert_eq!(
+            camera.strokes.len(),
+            expected_presses,
+            "{name}: the camera saw {} drag strokes, the schedule has {expected_presses}",
+            camera.strokes.len()
+        );
+        for (i, applied) in camera.strokes.iter().enumerate() {
+            let want = scripted_stroke(i as u32 % STROKES);
+            assert!(
+                f64::from((*applied - want).length()) < tolerance,
+                "{name}: stroke {i} moved the map {applied:?} pt, the schedule says {want:?}"
+            );
+        }
+
         // And it landed back where it started: mirrored pairs, equal legs.
         assert!(
-            end.pan.0.hypot(end.pan.1) < tolerance,
-            "{name}: the run left a net pan of {:?} pt",
-            end.pan
+            camera.pan.0.hypot(camera.pan.1) < tolerance,
+            "{name}: the run left the map centre {:?} pt from where it started",
+            camera.pan
         );
-        assert_eq!(end.zoom_notches, 0.0, "{name}: the run left a net zoom");
+        assert!(
+            (camera.zoom - START_ZOOM).abs() < zoom_tolerance,
+            "{name}: the run left the map at zoom {}, not {START_ZOOM}",
+            camera.zoom
+        );
 
         match &reference {
-            None => reference = Some((name, end, nets)),
-            Some((ref_name, ref_end, ref_nets)) => {
+            None => reference = Some((name, camera)),
+            Some((ref_name, ref_camera)) => {
                 assert!(
-                    (end.pan.0 - ref_end.pan.0).hypot(end.pan.1 - ref_end.pan.1) < tolerance
-                        && end.zoom_notches == ref_end.zoom_notches
-                        && (end.dragged - ref_end.dragged).abs() < tolerance
-                        && end.presses == ref_end.presses
-                        && end.wheel_events == ref_end.wheel_events,
-                    "the camera ends at {end:?} under {name} but at {ref_end:?} under {ref_name}"
+                    (camera.pan.0 - ref_camera.pan.0).hypot(camera.pan.1 - ref_camera.pan.1)
+                        < tolerance
+                        && (camera.zoom - ref_camera.zoom).abs() < zoom_tolerance,
+                    "the camera ends at pan {:?} zoom {} under {name} but at pan {:?} zoom {} \
+                     under {ref_name}",
+                    camera.pan,
+                    camera.zoom,
+                    ref_camera.pan,
+                    ref_camera.zoom
                 );
-                assert_eq!(
-                    nets.len(),
-                    ref_nets.len(),
-                    "{name}: {} stroke displacements against {ref_name}'s {}",
-                    nets.len(),
-                    ref_nets.len()
-                );
-                for (i, (a, b)) in nets.iter().zip(ref_nets).enumerate() {
+                for (i, (a, b)) in camera.strokes.iter().zip(&ref_camera.strokes).enumerate() {
                     assert!(
                         f64::from((*a - *b).length()) < tolerance,
-                        "{name}: stroke {i} displaced {a:?}, {ref_name} displaced {b:?}"
+                        "{name}: stroke {i} moved the map {a:?}, {ref_name} moved it {b:?}"
                     );
                 }
             }
         }
+    }
+}
+
+/// The map pane inside [`NATIVE`], inset by the shipped top bar.
+///
+/// Inset on purpose rather than filling the window: the script's wheel notches
+/// go out over the **window's** centre, which is not the pane's, so every notch
+/// is a zoom-to-cursor about an off-centre anchor — the same asymmetry the app
+/// has and a whole-screen fixture would not.
+const PANE: egui::Rect = egui::Rect {
+    min: egui::pos2(0.0, 40.0),
+    max: egui::pos2(1920.0, 1080.0),
+};
+
+/// The zoom the fixture starts at, and the one displacements are reported in.
+const START_ZOOM: f64 = 4.0;
+
+/// A real `walkers` map camera driven by the player's events — the app's own
+/// widget, with the app's own options, over a headless [`egui::Context`].
+///
+/// The point of driving the widget rather than reducing the stream is that
+/// everything the divergence lived in is *between* the two: `egui`'s drag
+/// decision and per-frame `delta()`, the release frame's dropped step,
+/// `walkers`' inertia coast, the zoom-to-cursor anchor and the viewport
+/// clamps. A fixture that models the map itself has to be right about all of
+/// them; this one is the map.
+struct MapCamera {
+    ctx: egui::Context,
+    memory: walkers::MapMemory,
+}
+
+impl MapCamera {
+    fn new() -> Self {
+        let mut memory = walkers::MapMemory::default();
+        memory
+            .set_zoom(START_ZOOM)
+            .expect("the start zoom is in walkers' range");
+        memory.center_at(walkers::lon_lat(-97.28, 35.33));
+        Self {
+            ctx: egui::Context::default(),
+            memory,
+        }
+    }
+
+    /// One frame: the events the player wrote for it, through the same
+    /// wheel-unit rewrite `EguiRenderer::begin_frame` applies, into the same
+    /// `Map` builder `ui_map` uses.
+    fn frame(&mut self, time: f64, events: Vec<egui::Event>) {
+        let mut raw_input = egui::RawInput {
+            screen_rect: Some(NATIVE),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        crate::ui_input::normalize_wheel_units(&mut raw_input, 1.0);
+        self.ctx.begin_pass(raw_input);
+        let mut ui = egui::Ui::new(
+            self.ctx.clone(),
+            egui::Id::new("gesture player camera"),
+            egui::UiBuilder::new()
+                .layer_id(egui::LayerId::background())
+                .max_rect(PANE),
+        );
+        ui.set_clip_rect(PANE);
+        walkers::Map::new(None, &mut self.memory, walkers::lon_lat(-97.28, 35.33))
+            .zoom_with_ctrl(false)
+            .panning(false)
+            .wheel_zoom_scales_with_frame_time(false)
+            .drag_pan_buttons(egui::DragPanButtons::PRIMARY)
+            .show(&mut ui, |_, _, _, _| ());
+        let _ = self.ctx.end_pass();
+    }
+
+    fn zoom(&self) -> f64 {
+        self.memory.zoom()
+    }
+
+    /// Where the map centre is, in Web Mercator points at `zoom`.
+    fn centre_at(&self, zoom: f64) -> (f64, f64) {
+        let p = self
+            .memory
+            .detached()
+            .expect("the fixture centres the map itself, so it is always detached");
+        let world = 256.0 * 2f64.powf(zoom);
+        let lat = p.y().to_radians();
+        (
+            (p.x() + 180.0) / 360.0 * world,
+            (1.0 - ((lat.tan() + 1.0 / lat.cos()).ln()) / std::f64::consts::PI) / 2.0 * world,
+        )
+    }
+
+    /// Where the map centre is, in points at the map's **own** zoom.
+    ///
+    /// The live zoom is the right unit for a *drag*: the pointer's points are
+    /// the map's points at the zoom the drag happened at, and a drag phase
+    /// runs at one zoom throughout. It is the wrong unit for comparing two
+    /// readings taken at different zooms, which is why the run's own start and
+    /// end are read through [`Self::centre_at`] at one fixed zoom instead: a
+    /// world coordinate is ~1618 pt from the origin here, and reading it in a
+    /// world 1.8e-4 of a level wider moves it 0.29 pt without the map having
+    /// gone anywhere.
+    fn centre_points(&self) -> (f64, f64) {
+        self.centre_at(self.memory.zoom())
+    }
+}
+
+/// What one cadence did to a real map: where the centre finished relative to
+/// where it started, what the zoom finished at, and the displacement the map
+/// took from each drag stroke.
+#[derive(Debug, Clone)]
+struct CameraEnd {
+    /// Centre displacement over the whole run, in points at [`START_ZOOM`].
+    pan: (f64, f64),
+    zoom: f64,
+    /// Per stroke, the pointer travel the map actually applied — the centre's
+    /// own move, negated, since the map goes the other way.
+    strokes: Vec<egui::Vec2>,
+}
+
+/// Drive `frames` — the player's own output — through a real map camera.
+///
+/// The per-stroke list is read at the schedule's own stroke boundaries: the
+/// centre's move over `(k·STROKE_PERIOD, (k+1)·STROKE_PERIOD]`, kept only for
+/// the `k` that are drag strokes. The boundary reading is taken on every
+/// boundary either way, so the quiet and zoom phases are absorbed into a
+/// reading nobody keeps rather than into the next stroke's.
+fn camera_end(frames: &[(f64, Vec<egui::Event>)]) -> CameraEnd {
+    // Stroke slots in one loop — the drag strokes and then the quiet and
+    // zoom phases, all of it cut on the same period.
+    let slots = (LOOP_SECONDS / pan_zoom_2d::STROKE_PERIOD) as u32;
+    let mut cam = MapCamera::new();
+    let start = cam.centre_at(START_ZOOM);
+    let mut at_boundary = cam.centre_points();
+    let mut slot = 0u32;
+    let mut strokes = Vec::new();
+    for (time, events) in frames {
+        cam.frame(*time, events.clone());
+        let seen = (time / pan_zoom_2d::STROKE_PERIOD) as u32;
+        if seen != slot {
+            let now = cam.centre_points();
+            // The slot that just closed. Only the drag strokes are kept; the
+            // map goes the other way from the pointer, hence the negation.
+            if slot % slots < pan_zoom_2d::STROKES {
+                strokes.push(egui::vec2(
+                    -(now.0 - at_boundary.0) as f32,
+                    -(now.1 - at_boundary.1) as f32,
+                ));
+            }
+            at_boundary = now;
+            slot = seen;
+        }
+    }
+    let end = cam.centre_at(START_ZOOM);
+    CameraEnd {
+        pan: (end.0 - start.0, end.1 - start.1),
+        zoom: cam.zoom(),
+        strokes,
     }
 }

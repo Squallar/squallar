@@ -12,6 +12,17 @@
 //! can fire — published per script as `QUIET_PHASES`/`ZOOM_QUIET_PHASES` so a
 //! later gate can derive expected settle counts from the script alone.
 //!
+//! **A balanced stream of events is not a returning camera**, and a script
+//! that drags has to be built for the difference. What a widget is handed is
+//! not what the player wrote: `egui` gives it nothing until the pointer has
+//! left a 6 pt circle around the press point, gives it nothing again on the
+//! frame the release arrives, and `walkers` then coasts the map on a velocity
+//! estimated from the last 100 ms of sampled positions. All three are
+//! functions of where the frames fell, so a drag that *starts* at the press
+//! point or *ends* in motion delivers a different displacement at every
+//! cadence — which is what put five legs of one build between Tennessee and
+//! Brazil. See `pan_zoom_2d::STROKE_LEAD` and `pan_zoom_2d::STROKE_TRAVEL`.
+//!
 //! Armed by the `gesture_script` config key or the `SQUALLAR_GESTURE_SCRIPT`
 //! environment variable; absent both, nothing here runs and the raw input is
 //! byte-identical to an unarmed build.
@@ -40,8 +51,45 @@ pub mod pan_zoom_2d {
     /// Sixteen strokes: mirrored pairs, so the loop's net pan is zero.
     pub(crate) const STROKES: u32 = 16;
     pub(crate) const STROKE_PERIOD: f64 = 0.5;
-    /// Seconds of each period spent pressed; the rest coasts on inertia.
+    /// Seconds of each period the button is down for; the rest of the period
+    /// is the gap the release and the next stroke's park and press fall in.
     pub(crate) const STROKE_HOLD: f64 = 0.45;
+    /// Seconds of the hold the pointer is **moving** for. The rest of the hold
+    /// it rests at the stroke's reach, and the release fires from that
+    /// standstill.
+    ///
+    /// Half the hold, so the rest is as wide as the travel and the cadence a
+    /// stroke needs is the one it already needed: two frames inside
+    /// [`STROKE_HOLD`]. A shorter rest would be a *narrower* window than the
+    /// script already depends on, which is the shape of the release defect
+    /// this replaced.
+    ///
+    /// **What the rest buys**, both measured through a real `walkers::Map` at
+    /// seven cadences (`gesture_player::tests`):
+    /// - the release lands where the pointer already is, so the drag's last
+    ///   step is not the one egui hands the widget on a frame where
+    ///   `dragged()` is already false — a step worth `reach(HOLD) -
+    ///   reach(t_of_last_frame)`, which is frame-gap luck and nothing else;
+    /// - `egui`'s `pointer.velocity()` reads exactly zero at the release,
+    ///   because every position in its 100 ms history window is the same
+    ///   point, so `walkers`' inertia coast (`velocity * INERTIA_TAU`, up to
+    ///   355 pt on the fast pairs) is zero rather than cadence-shaped.
+    pub(crate) const STROKE_TRAVEL: f64 = STROKE_HOLD / 2.0;
+    /// How far out of the press point the stroke's first step lands, points.
+    ///
+    /// `egui` refuses to call a pressed pointer a drag until it has moved more
+    /// than `Options::max_click_dist` (6.0) from the press point — until then
+    /// the button could still be a click — and the travel spent under that
+    /// bar is handed to nobody: `Response::drag_delta()` is `ZERO` on those
+    /// frames and only *this* frame's delta on the one that crosses. A ramp
+    /// that starts at zero therefore loses `speed x t` of its first frames,
+    /// which is a different amount at every cadence.
+    ///
+    /// Starting the ramp already clear of the bar makes the first step cross
+    /// it whole, so the drag is decided on the first move and the deltas
+    /// telescope to the reach. Twice `max_click_dist`, so the margin is not a
+    /// rounding.
+    pub(crate) const STROKE_LEAD: f32 = 12.0;
     pub(crate) const DRAG_END: f64 = 8.0;
     pub(crate) const QUIET_1_END: f64 = 10.0;
     pub(crate) const ZOOM_IN_END: f64 = 13.5;
@@ -510,16 +558,24 @@ impl GesturePlayer {
 
     // ── pan-zoom-2d ──
 
-    /// Where stroke `stroke`'s pointer is `t_in` seconds into it: out from
-    /// the screen centre along the pair's angle, at the pair's speed, capped
-    /// at [`REACH_FRACTION`](pan_zoom_2d::REACH_FRACTION) of the shorter
-    /// screen edge and held there once the hold time is reached. Odd strokes
+    /// Where stroke `stroke`'s pointer is `t_in` seconds into it: one
+    /// [`STROKE_LEAD`](pan_zoom_2d::STROKE_LEAD) step out from the screen
+    /// centre along the pair's angle, then on at the pair's speed for
+    /// [`STROKE_TRAVEL`](pan_zoom_2d::STROKE_TRAVEL) seconds, capped at
+    /// [`REACH_FRACTION`](pan_zoom_2d::REACH_FRACTION) of the shorter screen
+    /// edge, and **at rest** there for the remainder of the hold. Odd strokes
     /// take the mirrored angle — same speed, opposite direction, so the
     /// pair's displacements cancel and the loop re-centres.
     ///
     /// A closed form in `(stroke, t_in)` on purpose: it is both the position
     /// a frame inside the stroke moves to and the position the stroke's
     /// release lands on, so the two can never disagree.
+    ///
+    /// **Both saturations are what make the map's displacement a function of
+    /// the schedule rather than of the frame cadence**, and each closes one
+    /// end of the drag egui was dropping — the lead the pre-drag-threshold
+    /// frames at the start, the rest the release frame's own step and the
+    /// inertia coast after it. Their constants carry the mechanisms.
     fn stroke_pos(screen: egui::Rect, stroke: u32, t_in: f64) -> egui::Pos2 {
         use pan_zoom_2d::*;
         let pair = stroke / 2;
@@ -529,7 +585,7 @@ impl GesturePlayer {
             angle += std::f32::consts::PI;
         }
         let reach_cap = REACH_FRACTION * screen.width().min(screen.height());
-        let reach = (speed * t_in.min(STROKE_HOLD) as f32).min(reach_cap);
+        let reach = (STROKE_LEAD + speed * t_in.min(STROKE_TRAVEL) as f32).min(reach_cap);
         screen.center() + egui::vec2(angle.cos(), angle.sin()) * reach
     }
 
