@@ -508,6 +508,7 @@ impl super::Gui {
                                 child_ui.painter(),
                                 pane_render::clear_of_bottom_chrome(pane_rect, color_scale_floor),
                                 horizontal_color_scale,
+                                pane_idx,
                                 &pane,
                                 &self.preferences,
                             );

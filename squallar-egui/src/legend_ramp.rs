@@ -29,6 +29,13 @@ struct Measured<K> {
     value: f32,
 }
 
+/// A memoized shape list, and the version key it was built at.
+#[derive(Clone)]
+struct Painted<K> {
+    version: K,
+    shapes: Arc<Vec<egui::Shape>>,
+}
+
 /// Look a ramp up, baking it if the slot is empty or holds a different
 /// signature.
 pub(crate) fn ramp(
@@ -151,6 +158,50 @@ where
     let value = measure();
     ctx.data_mut(|d| d.insert_temp(slot, Measured { version, value }));
     value
+}
+
+/// A memoized **shape list**, rebuilt when `version` stops matching.
+///
+/// [`measured`]'s shape for a whole picture rather than one width. A legend is
+/// a few dozen `Shape`s that are a pure function of the pane's product, its
+/// rect and the reader's units, and it was rebuilt from those inputs on every
+/// frame — every tick label allocating a `String` from a `&str` the caller
+/// already holds and taking a `Context::fonts` write lock to be handed back
+/// the galley it was handed last frame, and every finished shape taking the
+/// `Context::graphics` write lock of its own on the way to the paint list.
+///
+/// Held as an `Arc` and replayed through one `Painter::extend`, so a hit is a
+/// clone of the vector (a refcount bump per galley) and a single lock.
+///
+/// **The version key must name every input the shapes read**, the font metrics
+/// included, for [`measured`]'s reason: `pixels_per_point` changes the pixel
+/// grid the glyphs are rasterised on, so a memo that outlives a scale-factor
+/// change would replay galleys laid out for the old one.
+pub(crate) fn painted<K>(
+    ctx: &egui::Context,
+    slot: egui::Id,
+    version: K,
+    build: impl FnOnce() -> Vec<egui::Shape>,
+) -> Arc<Vec<egui::Shape>>
+where
+    K: PartialEq + Clone + Send + Sync + 'static,
+{
+    if let Some(memo) = ctx.data(|d| d.get_temp::<Painted<K>>(slot))
+        && memo.version == version
+    {
+        return memo.shapes;
+    }
+    let built = Arc::new(build());
+    ctx.data_mut(|d| {
+        d.insert_temp(
+            slot,
+            Painted {
+                version,
+                shapes: Arc::clone(&built),
+            },
+        );
+    });
+    built
 }
 
 #[cfg(test)]
@@ -279,6 +330,42 @@ mod tests {
             builds, 3,
             "the memo is one entry per slot — going back rebuilds, by design",
         );
+    }
+
+    /// A shape list is built once until the version key moves.
+    ///
+    /// [`labels_are_built_once_until_the_version_moves`]' question for
+    /// [`painted`]. Asked separately because what this memo holds is a
+    /// *picture*: a stale hit is not a stale number somewhere in a layout
+    /// calculation, it is last frame's legend still on the glass, so the
+    /// rebuild half of the contract is the load-bearing one here.
+    #[test]
+    fn a_shape_list_is_built_once_until_the_version_moves() {
+        let ctx = egui::Context::default();
+        let mut builds = 0;
+        let ask = |version: u64, builds: &mut i32| {
+            painted(&ctx, slot("painted"), version, || {
+                *builds += 1;
+                vec![egui::Shape::rect_filled(
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1.0, 1.0)),
+                    0.0,
+                    egui::Color32::RED,
+                )]
+            })
+        };
+
+        let first = ask(1, &mut builds);
+        let again = ask(1, &mut builds);
+        assert_eq!(builds, 1, "the second ask must be answered from the memo");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "the memo hit must hand back the same allocation, not an equal one",
+        );
+
+        let _ = ask(2, &mut builds);
+        assert_eq!(builds, 2, "a version change must rebuild");
+        let _ = ask(2, &mut builds);
+        assert_eq!(builds, 2, "and then be memoized in its turn");
     }
 
     /// A measurement is taken once until the version key moves.

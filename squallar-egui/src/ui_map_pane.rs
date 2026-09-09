@@ -2875,23 +2875,110 @@ fn draw_shadowed_text(
     text: &str,
     font: egui::FontId,
 ) {
-    let galley = painter.layout_no_wrap(text.to_owned(), font, egui::Color32::PLACEHOLDER);
+    painter.extend(shadowed_text(painter, pos, anchor, text, font));
+}
+
+/// [`draw_shadowed_text`]'s two shapes, without a paint list to put them on.
+///
+/// The form the memoised legend builds in: a shape list is what
+/// [`legend_ramp::painted`] holds, and a `Painter` is what it does not have on
+/// the frames it replays one. `measure` is still a real painter because the
+/// galley has to come from the live font set; nothing is painted through it.
+fn shadowed_text(
+    measure: &egui::Painter,
+    pos: egui::Pos2,
+    anchor: egui::Align2,
+    text: &str,
+    font: egui::FontId,
+) -> [egui::Shape; 2] {
+    let galley = measure.layout_no_wrap(text.to_owned(), font, egui::Color32::PLACEHOLDER);
     // Anchored from the one galley's size, which is what makes the two draws
     // register: they were already the same size, because a colour does not
     // move a glyph.
     let size = galley.size();
-    painter.galley(
-        anchor
-            .anchor_size(pos + egui::vec2(SHADOW_OFFSET, SHADOW_OFFSET), size)
-            .min,
-        galley.clone(),
-        egui::Color32::from_black_alpha(200),
-    );
-    painter.galley(
-        anchor.anchor_size(pos, size).min,
-        galley,
-        egui::Color32::WHITE,
-    );
+    [
+        egui::Shape::galley(
+            anchor
+                .anchor_size(pos + egui::vec2(SHADOW_OFFSET, SHADOW_OFFSET), size)
+                .min,
+            galley.clone(),
+            egui::Color32::from_black_alpha(200),
+        ),
+        egui::Shape::galley(
+            anchor.anchor_size(pos, size).min,
+            galley,
+            egui::Color32::WHITE,
+        ),
+    ]
+}
+
+/// A paint list under construction, with a live painter behind it for the
+/// measurements a shape needs before it exists.
+///
+/// [`render_color_scale`] memoises its legend as [`egui::Shape`]s, so its body
+/// has to build them rather than paint them. This is the same three calls a
+/// `Painter` offers, with the same arguments, landing in a `Vec` instead of
+/// the frame's paint list — which keeps the body a description of the bar
+/// rather than a rewrite of it, and leaves one `Context::graphics` lock at the
+/// replay in place of one per shape.
+struct ShapeSink<'a> {
+    /// The frame's painter. Read for fonts and the context; never painted to.
+    measure: &'a egui::Painter,
+    shapes: Vec<egui::Shape>,
+}
+
+impl<'a> ShapeSink<'a> {
+    fn new(measure: &'a egui::Painter) -> Self {
+        Self {
+            measure,
+            shapes: Vec::new(),
+        }
+    }
+
+    fn ctx(&self) -> &egui::Context {
+        self.measure.ctx()
+    }
+
+    fn layout_no_wrap(
+        &self,
+        text: String,
+        font_id: egui::FontId,
+        color: egui::Color32,
+    ) -> std::sync::Arc<egui::Galley> {
+        self.measure.layout_no_wrap(text, font_id, color)
+    }
+
+    fn image(
+        &mut self,
+        texture_id: egui::TextureId,
+        rect: egui::Rect,
+        uv: egui::Rect,
+        tint: egui::Color32,
+    ) {
+        self.shapes
+            .push(egui::Shape::image(texture_id, rect, uv, tint));
+    }
+
+    fn rect_filled(
+        &mut self,
+        rect: egui::Rect,
+        corner_radius: impl Into<egui::CornerRadius>,
+        fill_color: impl Into<egui::Color32>,
+    ) {
+        self.shapes
+            .push(egui::Shape::rect_filled(rect, corner_radius, fill_color));
+    }
+
+    fn shadowed_text(
+        &mut self,
+        pos: egui::Pos2,
+        anchor: egui::Align2,
+        text: &str,
+        font: egui::FontId,
+    ) {
+        self.shapes
+            .extend(shadowed_text(self.measure, pos, anchor, text, font));
+    }
 }
 
 /// Every colour-scale legend a pane shows: the radar product's own bar, and
@@ -2905,7 +2992,7 @@ pub(super) fn render_color_scales(
     overlays: &OverlayRegistry,
     prefs: &UserPreferences,
 ) {
-    render_color_scale(painter, pane_rect, horizontal, pane, prefs);
+    render_color_scale(painter, pane_rect, horizontal, pane_idx, pane, prefs);
     render_overlay_color_scales(painter, pane_rect, horizontal, pane_idx, pane, overlays);
 }
 
@@ -2925,6 +3012,7 @@ pub(super) fn render_color_scale(
     painter: &egui::Painter,
     pane_rect: egui::Rect,
     horizontal: bool,
+    pane_idx: usize,
     pane: &PaneState,
     prefs: &UserPreferences,
 ) {
@@ -2974,254 +3062,288 @@ pub(super) fn render_color_scale(
     }
 
     let n = legend.thresholds.len();
-
-    if legend.is_gradient {
-        // Gradient scales: one image over a ramp baked once per product.
-        // See `crate::legend_ramp`.
-        painter.image(
-            radar_ramp(painter.ctx(), pane, horizontal).id(),
-            bar_rect,
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
-        );
-    } else {
-        // Discrete scales: equal-sized blocks, one per threshold. Left as
-        // blocks on purpose: these are hard edges at exact fractions of the
-        // bar, and a stretched `NEAREST` texture would move each boundary.
-        for i in 0..n {
-            let (_, rgb) = legend.thresholds[i];
-            let color = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-
-            let t0 = i as f32 / n as f32;
-            let t1 = (i + 1) as f32 / n as f32;
-
-            if horizontal {
-                let x0 = bar_rect.left() + t0 * bar_rect.width();
-                let x1 = bar_rect.left() + t1 * bar_rect.width();
-                let strip = egui::Rect::from_min_max(
-                    egui::pos2(x0, bar_rect.top()),
-                    egui::pos2(x1, bar_rect.bottom()),
+    // **The bar is a picture of things that do not move between frames.**
+    //
+    // Every shape below is a pure function of the product, the rect, the
+    // reader's units and the pane's own fold figure, and it was rebuilt from
+    // those on every frame of a map nobody had touched: two dozen tick labels
+    // each allocating a `String` from a `&str` the caller already holds and
+    // taking a `Context::fonts` write lock to be handed back the galley it
+    // was handed last frame, and every finished shape taking the
+    // `Context::graphics` write lock of its own on the way to the paint list.
+    //
+    // So it is built once per version and replayed through **one**
+    // `Painter::extend`: a hit is a clone of the vector — a refcount bump per
+    // galley — and a single lock.
+    //
+    // **The version names every input the shapes read**, and nothing else
+    // reaches them. The palette and its thresholds are a function of
+    // `product`; the tick strings and the unit title of `(product, prefs)`;
+    // the fold markers of the nyquist figure; the second line of
+    // `legend_second_line`, which is that figure *or* the storm motion, so
+    // the composed line is what the key carries rather than either input; the
+    // range-folded key of `(product, PaneState::is_map)`; and the gradient
+    // branch of the ramp texture it draws. The glyphs are laid out on the
+    // pixel grid `pixels_per_point` sets, so that is in the key for
+    // [`legend_ramp::measured`]'s reason; the font set itself cannot move
+    // after startup, because nothing in this workspace calls
+    // `Context::set_fonts`. Every colour here is a constant or a palette
+    // entry -- no `Visuals` is read -- so a theme switch has nothing to
+    // invalidate.
+    //
+    // One slot per pane: two panes draw two bars at two rects, and a shared
+    // slot would have each rebuild the other's on every frame.
+    //
+    // **The replay is a clone, and it has to be.** `Painter::extend` tints
+    // what it is given when the layer's own opacity is under 1, and for a
+    // `Shape::Text` that tint is an `Arc::make_mut` on the galley — which is a
+    // deep copy while this memo holds the other reference. Cloning first is
+    // what keeps that copy off the held list rather than mutating it; the cost
+    // of the copy itself is not new, because epaint's galley cache holds a
+    // reference of its own and the painter that laid out afresh every frame
+    // deep-copied there too.
+    let ramp_id = legend
+        .is_gradient
+        .then(|| radar_ramp(painter.ctx(), pane, horizontal).id());
+    let second_line = legend_second_line(pane, prefs);
+    let version = (
+        pane_rect,
+        horizontal,
+        product.clone(),
+        prefs.clone(),
+        pane.displayed_nyquist_ms().map(f64::to_bits),
+        second_line.clone(),
+        range_folded_is_painted(&product, pane),
+        ramp_id,
+        painter.ctx().pixels_per_point().to_bits(),
+    );
+    let shapes = legend_ramp::painted(
+        painter.ctx(),
+        egui::Id::new(("squallar::legend_shapes::radar", pane_idx)),
+        version,
+        || {
+            let mut sink = ShapeSink::new(painter);
+            if legend.is_gradient {
+                // Gradient scales: one image over a ramp baked once per product.
+                // See `crate::legend_ramp`.
+                sink.image(
+                    ramp_id.expect("a gradient legend resolves its ramp above the memo"),
+                    bar_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
                 );
-                painter.rect_filled(strip, 0.0, color);
             } else {
-                let y0 = bar_rect.bottom() - t0 * bar_rect.height();
-                let y1 = bar_rect.bottom() - t1 * bar_rect.height();
-                let strip = egui::Rect::from_min_max(
-                    egui::pos2(bar_rect.left(), y1),
-                    egui::pos2(bar_rect.right(), y0),
-                );
-                painter.rect_filled(strip, 0.0, color);
+                // Discrete scales: equal-sized blocks, one per threshold. Left as
+                // blocks on purpose: these are hard edges at exact fractions of the
+                // bar, and a stretched `NEAREST` texture would move each boundary.
+                for i in 0..n {
+                    let (_, rgb) = legend.thresholds[i];
+                    let color = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+
+                    let t0 = i as f32 / n as f32;
+                    let t1 = (i + 1) as f32 / n as f32;
+
+                    if horizontal {
+                        let x0 = bar_rect.left() + t0 * bar_rect.width();
+                        let x1 = bar_rect.left() + t1 * bar_rect.width();
+                        let strip = egui::Rect::from_min_max(
+                            egui::pos2(x0, bar_rect.top()),
+                            egui::pos2(x1, bar_rect.bottom()),
+                        );
+                        sink.rect_filled(strip, 0.0, color);
+                    } else {
+                        let y0 = bar_rect.bottom() - t0 * bar_rect.height();
+                        let y1 = bar_rect.bottom() - t1 * bar_rect.height();
+                        let strip = egui::Rect::from_min_max(
+                            egui::pos2(bar_rect.left(), y1),
+                            egui::pos2(bar_rect.right(), y0),
+                        );
+                        sink.rect_filled(strip, 0.0, color);
+                    }
+                }
             }
-        }
-    }
 
-    // --- Fold markers: where the picture on the glass wraps ---
-    let folds_at = pane
-        .displayed_nyquist_ms()
-        .filter(|ms| ms.is_finite() && *ms > 0.0);
-    if let Some(nyquist_ms) = folds_at {
-        for value in fold_marker_positions(nyquist_ms as f32, min_val, max_val)
-            .into_iter()
-            .flatten()
-        {
-            let t = (value - min_val) / range;
-            let marker = if horizontal {
-                egui::Rect::from_min_size(
-                    egui::pos2(
-                        bar_rect.left() + t * bar_rect.width() - FOLD_TICK_THICKNESS / 2.0,
-                        bar_rect.top() - FOLD_TICK_OVERHANG,
-                    ),
-                    egui::vec2(
-                        FOLD_TICK_THICKNESS,
-                        SCALE_BAR_WIDTH + FOLD_TICK_OVERHANG * 2.0,
-                    ),
-                )
-            } else {
-                egui::Rect::from_min_size(
-                    egui::pos2(
-                        bar_rect.left() - FOLD_TICK_OVERHANG,
-                        bar_rect.bottom() - t * bar_rect.height() - FOLD_TICK_THICKNESS / 2.0,
-                    ),
-                    egui::vec2(
-                        SCALE_BAR_WIDTH + FOLD_TICK_OVERHANG * 2.0,
-                        FOLD_TICK_THICKNESS,
-                    ),
-                )
-            };
-            // The same dark backing `draw_shadowed_text` gives every label on
-            // this bar: a bare white line reads as a highlight over mid green.
-            painter.rect_filled(
-                marker.expand(1.0),
-                0.0,
-                egui::Color32::from_black_alpha(200),
-            );
-            painter.rect_filled(marker, 0.0, egui::Color32::WHITE);
-        }
-    }
-
-    let label_font = egui::FontId::proportional(SCALE_FONT_SIZE);
-    let title_font = egui::FontId::proportional(SCALE_TITLE_FONT_SIZE);
-
-    let mut label_positions: Vec<(f32, &str)> = Vec::new();
-    let tick_text = memoized_ticks(painter.ctx(), pane, prefs);
-    for ((i, &(val, _)), text) in legend.thresholds.iter().enumerate().zip(tick_text.iter()) {
-        let pixel_pos = if legend.is_gradient {
-            let t = (val - min_val) / range;
-            if horizontal {
-                bar_rect.left() + t * bar_rect.width()
-            } else {
-                bar_rect.bottom() - t * bar_rect.height()
+            // --- Fold markers: where the picture on the glass wraps ---
+            let folds_at = pane
+                .displayed_nyquist_ms()
+                .filter(|ms| ms.is_finite() && *ms > 0.0);
+            if let Some(nyquist_ms) = folds_at {
+                for value in fold_marker_positions(nyquist_ms as f32, min_val, max_val)
+                    .into_iter()
+                    .flatten()
+                {
+                    let t = (value - min_val) / range;
+                    let marker = if horizontal {
+                        egui::Rect::from_min_size(
+                            egui::pos2(
+                                bar_rect.left() + t * bar_rect.width() - FOLD_TICK_THICKNESS / 2.0,
+                                bar_rect.top() - FOLD_TICK_OVERHANG,
+                            ),
+                            egui::vec2(
+                                FOLD_TICK_THICKNESS,
+                                SCALE_BAR_WIDTH + FOLD_TICK_OVERHANG * 2.0,
+                            ),
+                        )
+                    } else {
+                        egui::Rect::from_min_size(
+                            egui::pos2(
+                                bar_rect.left() - FOLD_TICK_OVERHANG,
+                                bar_rect.bottom()
+                                    - t * bar_rect.height()
+                                    - FOLD_TICK_THICKNESS / 2.0,
+                            ),
+                            egui::vec2(
+                                SCALE_BAR_WIDTH + FOLD_TICK_OVERHANG * 2.0,
+                                FOLD_TICK_THICKNESS,
+                            ),
+                        )
+                    };
+                    // The same dark backing `shadowed_text` gives every label on
+                    // this bar: a bare white line reads as a highlight over mid green.
+                    sink.rect_filled(
+                        marker.expand(1.0),
+                        0.0,
+                        egui::Color32::from_black_alpha(200),
+                    );
+                    sink.rect_filled(marker, 0.0, egui::Color32::WHITE);
+                }
             }
-        } else {
-            let t = i as f32 / n as f32;
-            if horizontal {
-                bar_rect.left() + t * bar_rect.width()
-            } else {
-                bar_rect.bottom() - t * bar_rect.height()
-            }
-        };
-        label_positions.push((pixel_pos, text));
-    }
 
-    let mut prev_pos: Option<f32> = None;
-    let thinned: Vec<(f32, &str)> = label_positions
-        .iter()
-        .filter(|(pos, _)| {
-            if let Some(prev) = prev_pos
-                && (pos - prev).abs() < MIN_LABEL_SPACING
+            let label_font = egui::FontId::proportional(SCALE_FONT_SIZE);
+            let title_font = egui::FontId::proportional(SCALE_TITLE_FONT_SIZE);
+
+            let mut label_positions: Vec<(f32, &str)> = Vec::new();
+            let tick_text = memoized_ticks(sink.ctx(), pane, prefs);
+            for ((i, &(val, _)), text) in legend.thresholds.iter().enumerate().zip(tick_text.iter())
             {
-                return false;
+                let pixel_pos = if legend.is_gradient {
+                    let t = (val - min_val) / range;
+                    if horizontal {
+                        bar_rect.left() + t * bar_rect.width()
+                    } else {
+                        bar_rect.bottom() - t * bar_rect.height()
+                    }
+                } else {
+                    let t = i as f32 / n as f32;
+                    if horizontal {
+                        bar_rect.left() + t * bar_rect.width()
+                    } else {
+                        bar_rect.bottom() - t * bar_rect.height()
+                    }
+                };
+                label_positions.push((pixel_pos, text));
             }
-            prev_pos = Some(*pos);
-            true
-        })
-        .copied()
-        .collect();
 
-    for (pixel_pos, text) in &thinned {
-        if horizontal {
-            let pos = egui::pos2(*pixel_pos, bar_rect.top() - SCALE_LABEL_LIFT);
-            draw_shadowed_text(
-                painter,
-                pos,
-                egui::Align2::CENTER_BOTTOM,
-                text,
-                label_font.clone(),
-            );
-        } else {
-            let pos = egui::pos2(bar_rect.left() - SCALE_LABEL_GAP, *pixel_pos);
-            draw_shadowed_text(
-                painter,
-                pos,
-                egui::Align2::RIGHT_CENTER,
-                text,
-                label_font.clone(),
-            );
-        }
-    }
+            let mut prev_pos: Option<f32> = None;
+            let thinned: Vec<(f32, &str)> = label_positions
+                .iter()
+                .filter(|(pos, _)| {
+                    if let Some(prev) = prev_pos
+                        && (pos - prev).abs() < MIN_LABEL_SPACING
+                    {
+                        return false;
+                    }
+                    prev_pos = Some(*pos);
+                    true
+                })
+                .copied()
+                .collect();
 
-    // --- Title: unit label above the bar (desktop) or under it (mobile),
-    //     with velocity's fold annotation on the line after it ---
-    let unit = crate::field_facts::unit_label(&product, prefs);
-    let fold_line = legend_second_line(pane, prefs);
-    if horizontal {
-        // Under the bar's left end, reading left to right: `mph  folds ±50`.
-        let title_pos = egui::pos2(pane_rect.left() + 2.0, bar_rect.bottom() + 1.0);
-        draw_shadowed_text(
-            painter,
-            title_pos,
-            egui::Align2::LEFT_TOP,
-            unit,
-            title_font.clone(),
-        );
-        if let Some(line) = &fold_line {
-            // Measured rather than reserved, because the gap between the two
-            // has to look the same after `m/s` as after `km/h`.
-            let unit_width = painter
-                .layout_no_wrap(unit.to_owned(), title_font, egui::Color32::PLACEHOLDER)
-                .rect
-                .width();
-            draw_shadowed_text(
-                painter,
-                title_pos + egui::vec2(unit_width + 6.0, 0.0),
-                egui::Align2::LEFT_TOP,
-                line,
-                label_font.clone(),
-            );
-        }
-    } else {
-        // Two lines stacked above the bar, unit on top. `SCALE_TITLE_MARGIN`
-        // reserves 16 points and the pane's edge gives the second line 16 more.
-        let stacked = fold_line.as_ref().map_or(0.0, |_| FOLD_TITLE_LINE);
-        let title_pos = egui::pos2(bar_rect.center().x, bar_rect.top() - 4.0 - stacked);
-        draw_shadowed_text(
-            painter,
-            title_pos,
-            egui::Align2::CENTER_BOTTOM,
-            unit,
-            title_font,
-        );
-        if let Some(line) = &fold_line {
-            // Hung off the pane's own edge rather than centred on the bar:
-            // `folds ±229` is 52 points over a 20-point bar 16 points in.
-            draw_shadowed_text(
-                painter,
-                egui::pos2(pane_rect.right() - FOLD_TITLE_INSET, bar_rect.top() - 4.0),
-                egui::Align2::RIGHT_BOTTOM,
-                line,
-                label_font.clone(),
-            );
-        }
-    }
+            for (pixel_pos, text) in &thinned {
+                if horizontal {
+                    let pos = egui::pos2(*pixel_pos, bar_rect.top() - SCALE_LABEL_LIFT);
+                    sink.shadowed_text(pos, egui::Align2::CENTER_BOTTOM, text, label_font.clone());
+                } else {
+                    let pos = egui::pos2(bar_rect.left() - SCALE_LABEL_GAP, *pixel_pos);
+                    sink.shadowed_text(pos, egui::Align2::RIGHT_CENTER, text, label_font.clone());
+                }
+            }
 
-    // --- The range-folded key ---
-    if range_folded_is_painted(&product, pane) {
-        // In both orientations the key stands past the end of the bar, in the
-        // pane's bottom-right corner, label reading outward from the swatch —
-        // a label on the bar's own side prints through the ±80 tick.
-        let (swatch, label_pos, label_anchor) = if horizontal {
-            let swatch = egui::Rect::from_min_size(
-                egui::pos2(
-                    bar_rect.right() + (SCALE_MARGIN - RF_SWATCH_SIZE) / 2.0,
-                    bar_rect.center().y - RF_SWATCH_SIZE / 2.0,
-                ),
-                egui::Vec2::splat(RF_SWATCH_SIZE),
-            );
-            (
-                swatch,
-                egui::pos2(swatch.center().x, swatch.bottom() + 1.0),
-                egui::Align2::CENTER_TOP,
-            )
-        } else {
-            let swatch = egui::Rect::from_min_size(
-                egui::pos2(
-                    bar_rect.center().x - RF_SWATCH_SIZE / 2.0,
-                    bar_rect.bottom() + (SCALE_MARGIN - RF_SWATCH_SIZE) / 2.0,
-                ),
-                egui::Vec2::splat(RF_SWATCH_SIZE),
-            );
-            (
-                swatch,
-                egui::pos2(swatch.right() + 3.0, swatch.center().y),
-                egui::Align2::LEFT_CENTER,
-            )
-        };
-        let (r, g, b, a) = squallar_radar::RANGE_FOLDED;
-        painter.rect_filled(
-            swatch,
-            0.0,
-            egui::Color32::from_rgba_unmultiplied(r, g, b, a),
-        );
-        draw_shadowed_text(
-            painter,
-            label_pos,
-            label_anchor,
-            RF_SWATCH_LABEL,
-            label_font,
-        );
-    }
+            // --- Title: unit label above the bar (desktop) or under it (mobile),
+            //     with velocity's fold annotation on the line after it ---
+            let unit = crate::field_facts::unit_label(&product, prefs);
+            let fold_line = legend_second_line(pane, prefs);
+            if horizontal {
+                // Under the bar's left end, reading left to right: `mph  folds ±50`.
+                let title_pos = egui::pos2(pane_rect.left() + 2.0, bar_rect.bottom() + 1.0);
+                sink.shadowed_text(title_pos, egui::Align2::LEFT_TOP, unit, title_font.clone());
+                if let Some(line) = &fold_line {
+                    // Measured rather than reserved, because the gap between the two
+                    // has to look the same after `m/s` as after `km/h`.
+                    let unit_width = sink
+                        .layout_no_wrap(unit.to_owned(), title_font, egui::Color32::PLACEHOLDER)
+                        .rect
+                        .width();
+                    sink.shadowed_text(
+                        title_pos + egui::vec2(unit_width + 6.0, 0.0),
+                        egui::Align2::LEFT_TOP,
+                        line,
+                        label_font.clone(),
+                    );
+                }
+            } else {
+                // Two lines stacked above the bar, unit on top. `SCALE_TITLE_MARGIN`
+                // reserves 16 points and the pane's edge gives the second line 16 more.
+                let stacked = fold_line.as_ref().map_or(0.0, |_| FOLD_TITLE_LINE);
+                let title_pos = egui::pos2(bar_rect.center().x, bar_rect.top() - 4.0 - stacked);
+                sink.shadowed_text(title_pos, egui::Align2::CENTER_BOTTOM, unit, title_font);
+                if let Some(line) = &fold_line {
+                    // Hung off the pane's own edge rather than centred on the bar:
+                    // `folds ±229` is 52 points over a 20-point bar 16 points in.
+                    sink.shadowed_text(
+                        egui::pos2(pane_rect.right() - FOLD_TITLE_INSET, bar_rect.top() - 4.0),
+                        egui::Align2::RIGHT_BOTTOM,
+                        line,
+                        label_font.clone(),
+                    );
+                }
+            }
+
+            // --- The range-folded key ---
+            if range_folded_is_painted(&product, pane) {
+                // In both orientations the key stands past the end of the bar, in the
+                // pane's bottom-right corner, label reading outward from the swatch —
+                // a label on the bar's own side prints through the ±80 tick.
+                let (swatch, label_pos, label_anchor) = if horizontal {
+                    let swatch = egui::Rect::from_min_size(
+                        egui::pos2(
+                            bar_rect.right() + (SCALE_MARGIN - RF_SWATCH_SIZE) / 2.0,
+                            bar_rect.center().y - RF_SWATCH_SIZE / 2.0,
+                        ),
+                        egui::Vec2::splat(RF_SWATCH_SIZE),
+                    );
+                    (
+                        swatch,
+                        egui::pos2(swatch.center().x, swatch.bottom() + 1.0),
+                        egui::Align2::CENTER_TOP,
+                    )
+                } else {
+                    let swatch = egui::Rect::from_min_size(
+                        egui::pos2(
+                            bar_rect.center().x - RF_SWATCH_SIZE / 2.0,
+                            bar_rect.bottom() + (SCALE_MARGIN - RF_SWATCH_SIZE) / 2.0,
+                        ),
+                        egui::Vec2::splat(RF_SWATCH_SIZE),
+                    );
+                    (
+                        swatch,
+                        egui::pos2(swatch.right() + 3.0, swatch.center().y),
+                        egui::Align2::LEFT_CENTER,
+                    )
+                };
+                let (r, g, b, a) = squallar_radar::RANGE_FOLDED;
+                sink.rect_filled(
+                    swatch,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(r, g, b, a),
+                );
+                sink.shadowed_text(label_pos, label_anchor, RF_SWATCH_LABEL, label_font);
+            }
+            sink.shapes
+        },
+    );
+    painter.extend(shapes.iter().cloned());
 }
-
 /// Which ends of the fold, in the ramp's own m/s domain, have a place on the
 /// bar — both, or neither.
 fn fold_marker_positions(nyquist_ms: f32, min_val: f32, max_val: f32) -> Option<[f32; 2]> {
@@ -4847,6 +4969,10 @@ mod site_label_size_tests;
 #[path = "ui_map_pane/shadowed_text_tests.rs"]
 #[cfg(test)]
 mod shadowed_text_tests;
+
+#[path = "ui_map_pane/legend_memo_tests.rs"]
+#[cfg(test)]
+mod legend_memo_tests;
 
 #[path = "ui_map_pane/as_of_lookup_tests.rs"]
 #[cfg(test)]
