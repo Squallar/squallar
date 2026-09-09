@@ -437,6 +437,30 @@ impl GmgsiFrameCache {
         self.recency.borrow_mut().retain(|key| keep(*key));
     }
 
+    /// **Whether one of the staged granules holds this very raster** — the
+    /// pointer question, asked exactly as [`GmgsiGridCache::holds`] asks it:
+    /// a granule keeps its raster behind an `Arc`, and the pane's carry is an
+    /// `Arc` on the same kind of allocation, so the two can be the same bytes.
+    fn holds(&self, grid: &Arc<ResidentGrid>) -> bool {
+        self.entries.values().any(|g| Arc::ptr_eq(&g.grid, grid))
+    }
+
+    /// **Drop every staged granule**, answering whether anything went.
+    ///
+    /// Not [`Self::retain`] with a `false` predicate, which offers each
+    /// granule to [`staging`]: the point of this door is to stop holding a
+    /// mosaic, and this layer's granules really are the pool's element — a
+    /// recycle here would park 15 MB in the process-wide slot one statement
+    /// before `release_data` empties it.
+    fn release_all(&mut self) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        self.entries.clear();
+        self.recency.borrow_mut().clear();
+        true
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
@@ -639,6 +663,19 @@ impl GmgsiGridCache {
                 staging::recycle_shared(self.staging, evicted.grid);
             }
         }
+    }
+
+    /// **Drop every resident granule**, answering whether anything went.
+    ///
+    /// Not [`Self::evict_beyond`] with an empty pin set, for the reason
+    /// [`GmgsiFrameCache::release_all`] gives.
+    fn release_all(&mut self) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        self.entries.clear();
+        self.recency.borrow_mut().clear();
+        true
     }
 
     #[cfg(test)]
@@ -1582,7 +1619,7 @@ impl OverlayHandler for GmgsiHandler {
     /// read beside prices values only. Not counted at all: the rasters made
     /// from these grids, which are the overlay picture family's, and the
     /// textures those became, which are the GPU's.
-    /// **No pane draws this layer, so the staging pool's parked mosaic goes.**
+    /// **No pane draws this layer, so every one of those blocks goes.**
     ///
     /// [`StagingPool::release_retained`] was written for two callers and had
     /// neither: "an idle policy in the layer that owns the source, and a memory
@@ -1603,17 +1640,73 @@ impl OverlayHandler for GmgsiHandler {
     /// takes a `try_lock`, answers `false` on an empty slot and allocates
     /// nothing to say so.
     ///
-    /// **What this does NOT release**, deliberately: the granule the state
-    /// carries and the two grid caches. Those are the layer's fetched data, and
-    /// giving them up here is the larger change the contract above describes —
-    /// it trades a refetch on the way back, which the staging buffer does not.
+    /// **And the grid caches and the carry with it**, which this hook used to
+    /// keep.
+    ///
+    /// It kept them on one argument — that giving them up "trades a refetch on
+    /// the way back", which parking a staging buffer does not — and the trade
+    /// does not survive being priced. What stays behind a layer nobody is
+    /// looking at is up to [`GRID_CACHE_BYTES`] of live cache (four channels,
+    /// 60,001,024 B) plus one staged loop granule (15,000,256 B), and unlike
+    /// MRMS's tiled mosaic none of it shrinks: a GMGSI granule is one byte a
+    /// point and [`GLOBAL_GRANULE_BYTES`] is what one costs resident. The
+    /// 15,000,000 B pool this hook was giving back is a fifth of that.
+    ///
+    /// **The way back costs one fetch of one channel**, and it is a fetch this
+    /// layer was going to make anyway: `auto_poll_interval` is 600 s here, so
+    /// a granule held through a layer being off for longer than ten minutes is
+    /// a granule the next poll replaces on arrival. The layer whose data is
+    /// good for longest is the model layer at 3600 s, and
+    /// `ModelHandler::release_data` releases everything — "half a gigabyte
+    /// held for a session by a layer nobody is looking at" is not worth a
+    /// refetch, and neither is 75 MB.
+    ///
+    /// **The way back is covered on both routes.** `OverlayState::release_data`
+    /// clears the poll clock and bumps the generation; `has_data` reads the
+    /// live cache, so `enable_should_refetch` answers `true` the moment the
+    /// toggle comes back on and `apply_control` returns `ControlEffect::Fetch`.
+    /// The pane's selected channel is untouched, so what comes back is the
+    /// channel it left on. Nothing re-fetches while the layer is off: a due
+    /// auto-poll asks `panes_owed_a_round`, which is empty for a layer no pane
+    /// has enabled.
+    ///
+    /// **The pool is emptied LAST and the order is load-bearing.** The two
+    /// caches drop their granules rather than recycling them — a recycle would
+    /// hand the slot 15 MB on the way past — and a decode that finished before
+    /// the layer went dark has already given its buffer back, so releasing the
+    /// slot after the caches is what stops this hook answering `true` while
+    /// 15,000,000 B is still parked.
+    ///
+    /// Answers whether anything went, so a caller asking every frame does not
+    /// bump a generation — and invalidate every cache keyed on it — on a layer
+    /// that is already empty.
     fn release_data(&mut self) -> bool {
-        self.frame_grids.staging.release_retained()
+        // A `let` apiece and not an inline disjunction: `||` short-circuits,
+        // and a live cache that answered `true` would leave the staged
+        // granule, the carry and the pool exactly where they were.
+        let live = self.cached_grids.release_all();
+        let staged = self.frame_grids.release_all();
+        let carried = self.state.release_data();
+        let pooled = self.frame_grids.staging.release_retained();
+        live || staged || carried || pooled
     }
 
+    /// **The carry is guarded against BOTH stores**, not just the live cache.
+    ///
+    /// `state.data` is the same `Arc<ResidentGrid>` as its live cache entry on
+    /// every path that sets it, so the live-cache test is the one that fires
+    /// in practice; it is added only once the cache has dropped that granule.
+    /// The frame store's test is the one that was missing, and it is asked at
+    /// the same level — a staged granule keeps its raster behind an `Arc` too,
+    /// so a carry a staged granule also held was **priced twice**: a whole
+    /// 15 MB mosaic of over-report on a census a memory governor sheds
+    /// against. `ModelHandler::resident_source_bytes` has asked both stores
+    /// all along; this is that guard.
     fn resident_source_bytes(&self) -> u64 {
         let carried = match &self.state.data {
-            Some(grid) if !self.cached_grids.holds(grid) => grid.values.resident_bytes(),
+            Some(grid) if !self.cached_grids.holds(grid) && !self.frame_grids.holds(grid) => {
+                grid.values.resident_bytes()
+            }
             _ => 0,
         };
         (self.cached_grids.resident_bytes()

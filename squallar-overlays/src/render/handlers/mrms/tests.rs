@@ -2007,3 +2007,152 @@ fn hover_hits_past_the_seam_whichever_way_the_pointer_is_written() {
     );
     assert_eq!(at(0.0), None, "half a world away in either spelling");
 }
+
+// ── The idle-layer release, and the carry it must not price twice ───────────
+
+/// **The carry is guarded against the FRAME store too**, not the live cache
+/// alone — the double-count `MrmsHandler::resident_source_bytes` shipped with.
+///
+/// `state.data` and its live cache entry are the same `Arc<MrmsGrid>` on every
+/// shipped path, so the live-cache half of the guard is the one that fires in
+/// practice and the frame half looks like a formality. It is not: this store
+/// keeps its granules **by value**, so what can alias between it and the carry
+/// is the `ResidentGrid` inside one — the very allocation `resident_bytes`
+/// prices — and nothing was asking about it. A carry whose values a staged
+/// granule also held was priced once by `frame_grids.resident_bytes()` and
+/// again by the `carried` arm: a whole mosaic of over-report on the figure the
+/// memory governor sheds against.
+///
+/// Built by field, deliberately. No shipped path reaches this state today —
+/// `apply_fetch_result` and `apply_frame` decode separately and never share an
+/// allocation — so the hazard is **latent**, and a test that could only reach
+/// it through the public doors could not exist. What is pinned is that the
+/// arithmetic is right when the state does occur, which is what stops the next
+/// caller that shares an `Arc` here landing a silent double-count.
+///
+/// **Floor** — drop `&& !self.frame_grids.holds_values(&grid.grid)` from the
+/// guard: the final figure reads `2 * one` where `one` is required.
+#[test]
+fn a_carry_a_staged_granule_also_holds_is_priced_once() {
+    static POOL: staging::StagingPool = staging::StagingPool::new();
+    let product = MrmsProduct::ReflectivityComposite;
+    let mut h = MrmsHandler::with_staging(&POOL);
+    h.defaults.enabled = true;
+    h.defaults.selected_product = product;
+    h.apply_fetch_result(
+        Box::new(MrmsFetchResult(Ok(sized(product, 100)))),
+        &PaneRef::across(&[]),
+    );
+
+    let carried = h.state.data.clone().expect("the fetch installed a carry");
+    let one = carried.resident_bytes() as u64;
+    assert_eq!(
+        one, 400,
+        "premise: a 100-value mosaic at four bytes a value"
+    );
+
+    // A staged granule that shares the carry's values allocation: `MrmsGrid`
+    // holds its `ResidentGrid` behind an `Arc`, so a clone of the carry is a
+    // refcount on the same block rather than a second one.
+    h.frame_grids.insert(
+        FrameKey {
+            product,
+            valid: carried.valid,
+        },
+        (*carried).clone(),
+    );
+    assert!(
+        h.frame_grids.holds_values(&carried.grid),
+        "premise: the staged granule really is the carry's own allocation",
+    );
+
+    // And let the live cache go, so the `carried` arm is the one under test:
+    // while the cache still holds it, the first half of the guard answers and
+    // the second is never reached.
+    assert!(h.cached_grids.release_all());
+    assert!(
+        !h.cached_grids.holds(&carried),
+        "premise: the live cache has let go, so the carry is priced by the \
+         `carried` arm rather than by the cache's own sum",
+    );
+
+    assert_eq!(
+        h.resident_source_bytes(),
+        one,
+        "one allocation, held by two names, priced once — the staged granule's \
+         sum already covers the carry's bytes",
+    );
+}
+
+/// **A layer no pane draws gives up its grids, its carry and its pool** — the
+/// whole of what the idle release pass exists to reclaim.
+///
+/// This hook used to answer with the staging slot alone and keep both caches
+/// on the argument that letting them go "trades a refetch on the way back".
+/// The trade is one fetch of one product against everything below, and the
+/// fetch was owed anyway: `auto_poll_interval` is 120 s here, so a mosaic held
+/// across a layer being off for longer than that is one the next poll replaces
+/// on arrival.
+///
+/// **The order is asserted, not just the total.** The caches drop their
+/// granules rather than recycling them, and the pool is emptied last; a
+/// release that recycled on the way out would leave a parked buffer behind and
+/// this figure would not reach zero.
+///
+/// **Floor** — restore the old body
+/// (`self.frame_grids.staging.release_retained()`): the figure after the
+/// release reads the two granules instead of zero.
+#[test]
+fn the_idle_release_gives_up_every_store_this_layer_holds() {
+    static POOL: staging::StagingPool = staging::StagingPool::new();
+    let product = MrmsProduct::ReflectivityComposite;
+    let mut h = MrmsHandler::with_staging(&POOL);
+    h.defaults.enabled = true;
+    h.defaults.selected_product = product;
+    h.apply_fetch_result(
+        Box::new(MrmsFetchResult(Ok(sized(product, 100)))),
+        &PaneRef::across(&[]),
+    );
+    h.frame_grids.insert(
+        FrameKey {
+            product,
+            valid: chrono::NaiveDate::from_ymd_opt(2026, 8, 21)
+                .expect("a real date")
+                .and_hms_opt(0, 0, 0)
+                .expect("a real time"),
+        },
+        sized(product, 100),
+    );
+    // Park a buffer the way a finished decode does, so the pool term is a real
+    // one rather than an already-empty slot the release cannot fail on.
+    POOL.give(
+        POOL.take(staging::STAGING_POINTS)
+            .expect("a band buffer fits on a test host"),
+    );
+
+    let held = h.resident_source_bytes();
+    assert_eq!(
+        held,
+        800 + (staging::STAGING_POINTS * size_of::<u16>()) as u64,
+        "premise: two 100-value mosaics and one parked band",
+    );
+
+    assert!(h.release_data(), "the pass released something");
+    assert_eq!(
+        h.resident_source_bytes(),
+        0,
+        "and it released ALL of it: live cache, staged frame, carry and pool",
+    );
+    assert!(
+        !h.has_data(&PaneRef::across(&[])),
+        "so the toggle's `enable_should_refetch` answers true on the way back \
+         — the way back is a fetch, and it has to be asked for",
+    );
+
+    assert!(
+        !h.release_data(),
+        "a second ask on an empty layer answers false, so a caller running \
+         every frame does not bump the generation and invalidate every cache \
+         keyed on it",
+    );
+}

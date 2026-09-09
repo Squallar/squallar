@@ -218,6 +218,35 @@ impl MrmsFrameCache {
         self.recency.borrow_mut().retain(|key| keep(*key));
     }
 
+    /// **Whether one of the staged granules holds this very values
+    /// allocation** — the pointer question, at the level where a staged
+    /// granule and the pane's carry can be the same bytes.
+    ///
+    /// Not an `Arc<MrmsGrid>` comparison, as [`MrmsGridCache::holds`] is: this
+    /// store keeps its granules by value, so there is no outer `Arc` here to
+    /// match. What CAN alias is the `ResidentGrid` inside one — the same
+    /// allocation `resident_bytes` prices — so that is what is compared.
+    fn holds_values(&self, grid: &Arc<crate::render::gridded::ResidentGrid>) -> bool {
+        self.entries.values().any(|g| Arc::ptr_eq(&g.grid, grid))
+    }
+
+    /// **Drop every staged granule**, answering whether anything went.
+    ///
+    /// Not [`Self::retain`] with a `false` predicate, which offers each
+    /// granule to [`staging`]: the point of this door is to stop holding a
+    /// mosaic, and parking one in the process-wide slot on the way out moves
+    /// the bytes rather than releasing them. `release_data` empties that slot
+    /// on the next line, so a recycle here is an allocation handed to a pool
+    /// one statement before the pool is emptied.
+    fn release_all(&mut self) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        self.entries.clear();
+        self.recency.borrow_mut().clear();
+        true
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
@@ -415,6 +444,21 @@ impl MrmsGridCache {
                 self.staging.recycle_shared(evicted);
             }
         }
+    }
+
+    /// **Drop every resident grid**, answering whether anything went.
+    ///
+    /// Not [`Self::evict_beyond`] with an empty pin set, for the reason
+    /// [`MrmsFrameCache::release_all`] gives: that path recycles each victim
+    /// into [`staging`], and this door exists to stop holding a mosaic rather
+    /// than to move one into the process-wide slot.
+    fn release_all(&mut self) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        self.entries.clear();
+        self.recency.borrow_mut().clear();
+        true
     }
 
     #[cfg(test)]
@@ -1338,14 +1382,14 @@ impl OverlayHandler for MrmsHandler {
     /// Not counted at all: the rasters made from these grids, which are the
     /// overlay picture family's, and the textures those became, which are the
     /// GPU's.
-    /// **No pane draws this layer, so the staging pool's parked mosaic goes.**
+    /// **No pane draws this layer, so every one of those blocks goes.**
     ///
     /// [`StagingPool::release_retained`] was written for two callers and had
     /// neither: "an idle policy in the layer that owns the source, and a memory
     /// governor's tier-2 pressure step". This is the first. The pool holds one
-    /// grid-sized buffer **whether or not anything is decoding** — 49,000,000 B on MRMS — and
-    /// while no pane has this layer enabled nothing decodes, so the block is
-    /// pure carry.
+    /// decode buffer **whether or not anything is decoding** — [`crate::mrms::CONUS_BAND_BYTES`],
+    /// 224,000 B, since the tiler stopped reading a whole plane — and while no
+    /// pane has this layer enabled nothing decodes, so the block is pure carry.
     ///
     /// It costs the next decode one allocation, which is the allocation this
     /// pool exists to remove — and that is why the trigger is this and not a
@@ -1359,17 +1403,77 @@ impl OverlayHandler for MrmsHandler {
     /// takes a `try_lock`, answers `false` on an empty slot and allocates
     /// nothing to say so.
     ///
-    /// **What this does NOT release**, deliberately: the granule the state
-    /// carries and the two grid caches. Those are the layer's fetched data, and
-    /// giving them up here is the larger change the contract above describes —
-    /// it trades a refetch on the way back, which the staging buffer does not.
+    /// **And the grid caches and the carry with it**, which this hook used to
+    /// keep.
+    ///
+    /// It kept them on one argument — that giving them up "trades a refetch on
+    /// the way back", which parking a staging buffer does not — and that
+    /// argument does not survive being priced. The way back costs **one fetch
+    /// of one product**, and it is a fetch this layer was going to make
+    /// anyway: `auto_poll_interval` is 120 s here, so a
+    /// mosaic held through a layer being off for longer than two minutes is a
+    /// mosaic the next poll replaces on arrival. The layer that DOES pay a
+    /// real re-fetch penalty for this is the model layer, whose run is good
+    /// for an hour — and `ModelHandler::release_data` releases anyway, on the
+    /// ground that "half a gigabyte held for a session by a layer nobody is
+    /// looking at" is not worth a refetch. The same ground reaches further
+    /// down than that doc thought: it read this layer's ceiling off
+    /// [`GRID_CACHE_BYTES`] at 98 MB, and 98 MB is not what a tiled mosaic
+    /// costs — but a looping pane's 11,333,496 B
+    /// (`overlay_grid_residency_split`) is 11,109,496 B this hook was leaving
+    /// behind against the 224,000 B band it took, which is 49x.
+    ///
+    /// **The way back is covered on both routes**, exactly as it is for the
+    /// model layer. `OverlayState::release_data` clears the poll clock and
+    /// bumps the generation; `has_data` reads the live cache, so
+    /// `enable_should_refetch` answers `true` the moment the toggle comes back
+    /// on and `apply_control` returns `ControlEffect::Fetch`. The pane's
+    /// selected product is untouched, so what comes back is the product it
+    /// left on. Nothing re-fetches while the layer is off: a due auto-poll
+    /// asks `panes_owed_a_round`, which is empty for a layer no pane has
+    /// enabled.
+    ///
+    /// **The pool is emptied LAST and the order is load-bearing.** The two
+    /// caches drop their granules rather than recycling them, but a decode
+    /// that finished before the layer went dark has already handed its band
+    /// back; releasing the slot after the caches is what stops this hook
+    /// answering `true` while 224,000 B is still parked.
+    ///
+    /// Answers whether anything went, so a caller asking every frame does not
+    /// bump a generation — and invalidate every cache keyed on it — on a layer
+    /// that is already empty.
     fn release_data(&mut self) -> bool {
-        self.frame_grids.staging.release_retained()
+        // A `let` apiece and not an inline disjunction: `||` short-circuits,
+        // and a live cache that answered `true` would leave the staged
+        // granule, the carry and the pool exactly where they were.
+        let live = self.cached_grids.release_all();
+        let staged = self.frame_grids.release_all();
+        let carried = self.state.release_data();
+        let pooled = self.frame_grids.staging.release_retained();
+        live || staged || carried || pooled
     }
 
+    /// **The carry is guarded against BOTH stores**, not just the live cache.
+    ///
+    /// `state.data` is the same `Arc<MrmsGrid>` as its live cache entry on
+    /// every path that sets it, so the live-cache test is the one that fires
+    /// in practice; it is added only once the cache has let go. The frame
+    /// store's test is the one that was missing, and the level it is asked at
+    /// is the level MRMS can alias on: this store keeps `MrmsGrid` by value,
+    /// so no outer `Arc` of it can be in there, but the `ResidentGrid` inside
+    /// one is behind an `Arc` and is the allocation `resident_bytes` prices.
+    /// Un-guarded, a carry whose values a staged granule also held was
+    /// **priced twice** — a whole mosaic of over-report on a census a memory
+    /// governor sheds against. `ModelHandler::resident_source_bytes` has
+    /// asked both stores all along; this is the same guard, at this layer's
+    /// own aliasing level.
     fn resident_source_bytes(&self) -> u64 {
         let carried = match &self.state.data {
-            Some(grid) if !self.cached_grids.holds(grid) => grid.resident_bytes(),
+            Some(grid)
+                if !self.cached_grids.holds(grid) && !self.frame_grids.holds_values(&grid.grid) =>
+            {
+                grid.resident_bytes()
+            }
             _ => 0,
         };
         (self.cached_grids.resident_bytes()

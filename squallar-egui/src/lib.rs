@@ -69,6 +69,10 @@ pub mod radar_fan;
 /// other layer has.
 pub mod radar_layer;
 pub(crate) mod raster_atlas;
+/// **What the idle-layer release pass has actually given back** — the always-on
+/// fires counter behind `Gui::release_data_of_layers_no_pane_draws`, so a cut
+/// that never executes cannot read as one that did.
+pub mod release_ledger;
 pub mod shell_api;
 /// A radar site's marker: sized in points, on glass, every frame.
 pub(crate) mod site_marker;

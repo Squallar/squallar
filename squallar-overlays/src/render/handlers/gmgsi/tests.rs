@@ -2405,3 +2405,166 @@ fn a_pointer_beside_the_seam_column_reads_the_seam_column() {
     // 0.028 from column 1, 0.100 from column 0: column 1, the other side.
     assert_eq!(at(-179.9).as_deref(), Some("Longwave IR: 82 count"));
 }
+
+// -- The idle-layer release, and the carry it must not price twice -----------
+
+/// **The carry is guarded against the FRAME store too**, not the live cache
+/// alone — the double-count `GmgsiHandler::resident_source_bytes` shipped with.
+///
+/// `state.data` and its live cache entry are the same `Arc<ResidentGrid>` on
+/// every shipped path, so the live-cache half of the guard is the one that
+/// fires in practice and the frame half looks like a formality. It is not: a
+/// staged granule holds its raster behind an `Arc` of exactly the same kind, so
+/// a carry a staged granule also held was priced once by
+/// `frame_grids.resident_bytes()` and again by the `carried` arm — a whole
+/// 15 MB mosaic of over-report on the figure the memory governor sheds against.
+///
+/// Built by field, deliberately. No shipped path reaches this state today —
+/// `apply_fetch_result` and `apply_frame` decode separately and never share an
+/// allocation — so the hazard is **latent**, and a test that could only reach
+/// it through the public doors could not exist. What is pinned is that the
+/// arithmetic is right when the state does occur.
+///
+/// **Floor** — drop `&& !self.frame_grids.holds(grid)` from the guard: the
+/// final figure reads `2 * one` where `one` is required.
+#[test]
+fn a_carry_a_staged_granule_also_holds_is_priced_once() {
+    static POOL: staging::StagingPool = staging::StagingPool::new(staging::STAGING_POINTS);
+    let channel = GmgsiChannel::LongwaveIr;
+    let mut h = GmgsiHandler::with_frame_budget_and_staging(MOSAIC_BYTES, &POOL);
+    h.defaults.enabled = true;
+    h.defaults.selected_channel = channel;
+    h.apply_fetch_result(
+        Box::new(GmgsiFetchResult(Ok(sized(channel, 100)))),
+        &PaneRef::across(&[]),
+    );
+
+    // The granule's own valid time, read back off the cache rather than
+    // restated: a key written as a second literal is one that can drift from
+    // the fixture's and quietly stage a granule under a stamp nothing shares.
+    let valid = h
+        .cached_grids
+        .entries
+        .values()
+        .map(|g| g.valid_time)
+        .next()
+        .expect("the fetch installed a cache entry");
+    let bounds = h
+        .cached_grids
+        .entries
+        .values()
+        .map(|g| g.bounds)
+        .next()
+        .expect("the fetch installed a cache entry");
+    let carried = h.state.data.clone().expect("the fetch installed a carry");
+    let one = carried.values.resident_bytes() as u64;
+    assert_eq!(
+        one, 400,
+        "premise: a 100-value mosaic at four bytes a value"
+    );
+
+    // A staged granule that shares the carry's raster allocation.
+    h.frame_grids.insert(
+        FrameKey { channel, valid },
+        GmgsiGranule {
+            grid: Arc::clone(&carried),
+            bounds,
+            valid_time: valid,
+        },
+    );
+    assert!(
+        h.frame_grids.holds(&carried),
+        "premise: the staged granule really is the carry's own allocation",
+    );
+
+    // And let the live cache go, so the `carried` arm is the one under test:
+    // while the cache still holds it, the first half of the guard answers and
+    // the second is never reached.
+    assert!(h.cached_grids.release_all());
+    assert!(
+        !h.cached_grids.holds(&carried),
+        "premise: the live cache has let go, so the carry is priced by the \
+         `carried` arm rather than by the cache's own sum",
+    );
+
+    assert_eq!(
+        h.resident_source_bytes(),
+        one,
+        "one allocation, held by two names, priced once — the staged granule's \
+         sum already covers the carry's bytes",
+    );
+}
+
+/// **A layer no pane draws gives up its grids, its carry and its pool** — the
+/// whole of what the idle release pass exists to reclaim.
+///
+/// This hook used to answer with the staging slot alone and keep both caches
+/// on the argument that letting them go "trades a refetch on the way back".
+/// The trade is one fetch of one channel against everything below, and the
+/// fetch was owed anyway: `auto_poll_interval` is 600 s here, so a granule held
+/// across a layer being off for longer than ten minutes is one the next poll
+/// replaces on arrival.
+///
+/// **The order is asserted, not just the total.** The caches drop their
+/// granules rather than recycling them — a recycle would hand this layer's own
+/// pool a 15 MB block on the way past — and the pool is emptied last; a release
+/// that recycled on the way out would leave a parked buffer behind and this
+/// figure would not reach zero.
+///
+/// **Floor** — restore the old body
+/// (`self.frame_grids.staging.release_retained()`): the figure after the
+/// release reads the two granules instead of zero.
+#[test]
+fn the_idle_release_gives_up_every_store_this_layer_holds() {
+    static POOL: staging::StagingPool = staging::StagingPool::new(staging::STAGING_POINTS);
+    let channel = GmgsiChannel::LongwaveIr;
+    let mut h = GmgsiHandler::with_frame_budget_and_staging(MOSAIC_BYTES, &POOL);
+    h.defaults.enabled = true;
+    h.defaults.selected_channel = channel;
+    h.apply_fetch_result(
+        Box::new(GmgsiFetchResult(Ok(sized(channel, 100)))),
+        &PaneRef::across(&[]),
+    );
+    h.frame_grids.insert(
+        FrameKey {
+            channel,
+            valid: chrono::NaiveDate::from_ymd_opt(2025, 6, 1)
+                .expect("a real date")
+                .and_hms_opt(13, 0, 0)
+                .expect("a real time"),
+        },
+        granule_of(channel, 100),
+    );
+    // Park a buffer the way a finished decode does, so the pool term is a real
+    // one rather than an already-empty slot the release cannot fail on.
+    POOL.give(
+        POOL.take(staging::STAGING_POINTS)
+            .expect("a mosaic buffer fits on a test host"),
+    );
+
+    let held = h.resident_source_bytes();
+    assert_eq!(
+        held,
+        800 + MOSAIC_BYTES as u64,
+        "premise: two 100-value mosaics and one parked block",
+    );
+
+    assert!(h.release_data(), "the pass released something");
+    assert_eq!(
+        h.resident_source_bytes(),
+        0,
+        "and it released ALL of it: live cache, staged frame, carry and pool",
+    );
+    assert!(
+        !h.has_data(&PaneRef::across(&[])),
+        "so the toggle's `enable_should_refetch` answers true on the way back \
+         — the way back is a fetch, and it has to be asked for",
+    );
+
+    assert!(
+        !h.release_data(),
+        "a second ask on an empty layer answers false, so a caller running \
+         every frame does not bump the generation and invalidate every cache \
+         keyed on it",
+    );
+}

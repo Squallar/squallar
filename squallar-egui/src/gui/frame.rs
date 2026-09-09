@@ -374,7 +374,22 @@ impl Gui {
             .collect();
         for id in idle {
             if let Some(handler) = self.overlays.get_handler_mut(&id) {
-                handler.release_data();
+                // **Priced across the call, through the handler's own
+                // accessor.** `resident_source_bytes` is a maintained-field or
+                // key-space-bounded read by its own contract — it may not walk
+                // grid contents, allocate or take a blocking lock — so a
+                // reading either side of the release costs a handful of loads
+                // on a layer nobody is drawing. The `before` read is the price
+                // of the counter: it has to be taken before the answer is
+                // known, so it is paid on every ask, and it is what makes a
+                // fire report a byte figure rather than a bare tally.
+                let before = handler.resident_source_bytes();
+                if handler.release_data() {
+                    let after = handler.resident_source_bytes();
+                    crate::release_ledger::note_fire(before.saturating_sub(after));
+                } else {
+                    crate::release_ledger::note_ask();
+                }
             }
         }
     }

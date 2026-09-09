@@ -2259,14 +2259,18 @@ impl OverlayHandler for ModelDataHandler {
     /// toggled off held its grids **for the life of the process** — up to the
     /// whole budget, which was 512 MiB on desktop.
     ///
-    /// **More than MRMS and GMGSI release, deliberately.** Theirs give up only
-    /// their staging pool and keep their grid caches, calling the cache a
-    /// larger change that "trades a refetch on the way back". The trade is the
-    /// same here and the arithmetic is not: their caches are bounded at 98 MB
-    /// and 49 MB by a product count, and this one is the largest host-byte
-    /// family the crate has. A refetch is latency, which the campaign's
-    /// latitude covers; half a gigabyte held for a session by a layer nobody
-    /// is looking at is not.
+    /// **The same shape MRMS and GMGSI release**, since 2026-09-09. This hook
+    /// was written first and argued against theirs on an arithmetic that has
+    /// not held up: it read their ceilings off their `GRID_CACHE_BYTES` at
+    /// 98 MB and 49 MB and called this one — the largest host-byte family the
+    /// crate has — the only one worth a refetch. Measured, MRMS's tiled mosaic
+    /// costs 11,333,496 B for a looping pane rather than 98 MB, and GMGSI's
+    /// four channels really are 60,001,024 B; and the layer with the *longest
+    /// grace* on a released grid is this one, whose run is good for an hour
+    /// against their 120 s and 600 s polls. So the ground given here — a
+    /// refetch is latency, which the campaign's latitude covers; data held for
+    /// a session by a layer nobody is looking at is not — reached all three,
+    /// and all three now take it.
     ///
     /// **The way back is covered on both routes.** `OverlayState::release_data`
     /// clears the poll clock and bumps the generation, so the toggle asks

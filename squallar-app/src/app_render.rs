@@ -541,6 +541,27 @@ fn floor_strip_line(t: &squallar_egui::floor_ledger::Totals) -> String {
     )
 }
 
+/// The `layer releases:` running-total line — what the idle-layer release pass
+/// has given back. See [`overlay_raster_line`] for why this is a value.
+///
+/// **Three denominators, never added.** `asks` is one per layer per frame the
+/// pass reached a handler; `fires` is the subset whose `release_data` answered
+/// `true`; `B released` is the fall in those handlers' own
+/// `resident_source_bytes` summed over the fires. See
+/// [`squallar_egui::release_ledger`].
+///
+/// **A `fires 0` reading is the point of the line.** A release that never
+/// executes and a release that executed and found nothing are the same zero in
+/// every byte figure the app publishes; this is the sentence that tells them
+/// apart, and it is why the line is emitted from the counter rather than
+/// derived from a census delta.
+fn layer_release_line(t: &squallar_egui::release_ledger::Totals) -> String {
+    format!(
+        "layer releases: {} asks, {} fires, {} B released",
+        t.asks, t.fires, t.bytes,
+    )
+}
+
 /// The `ground tiles:` running-total line. See [`overlay_raster_line`] for why
 /// this is a value.
 ///
@@ -2681,11 +2702,18 @@ impl super::App {
         let strips = squallar_egui::floor_ledger::totals_if_moved();
         let ground = squallar_egui::tile_mesh::ledger::totals_if_moved();
         let basemap = squallar_egui::basemap_ledger::totals_if_moved();
+        // **Only when a release really happened.** The pass behind this ledger
+        // runs on every frame of every session, so its `asks` are deliberately
+        // outside `progress` — see `release_ledger::Totals::progress`. A
+        // session in which no layer is ever switched off writes no line here
+        // at all, and that silence is itself the reading.
+        let releases = squallar_egui::release_ledger::totals_if_moved();
         if rasters.is_none()
             && uploads.is_none()
             && strips.is_none()
             && ground.is_none()
             && basemap.is_none()
+            && releases.is_none()
         {
             return;
         }
@@ -2737,6 +2765,9 @@ impl super::App {
         }
         if let Some(b) = basemap {
             say_telemetry(loud, &basemap_tile_line(&b));
+        }
+        if let Some(r) = releases {
+            say_telemetry(loud, &layer_release_line(&r));
         }
     }
 
