@@ -484,6 +484,16 @@ impl super::Gui {
         // `order` positionally, and a list that lost an entry halfway through
         // would land a drag on the wrong layer.
         let mut removing: Option<LayerId> = None;
+        // **Two style reads for the whole list, not two per row.** A text
+        // style's row height is a property of the style and the font set, and
+        // every row below lays out under the one style this panel was entered
+        // with -- the only thing a row changes is its own `item_spacing`. Each
+        // read is a `Context::fonts` lock plus a font lookup, and the four
+        // sites in the loop asked for one of these two answers on every row,
+        // so a stack of N layers took 4N locks a frame to be told the same two
+        // numbers N times.
+        let small_height = ui.text_style_height(&egui::TextStyle::Small);
+        let body_height = ui.text_style_height(&egui::TextStyle::Body);
 
         for kind in order.iter() {
             // Keyed on the layer, not the position, so a row's widget state
@@ -511,7 +521,6 @@ impl super::Gui {
                 // the memory line is measured the same way the status is, so
                 // a row that has both grows by exactly one small line rather
                 // than pushing its own text out of its box.
-                let small = ui.text_style_height(&egui::TextStyle::Small);
                 // **The memory line is a band of its own under the row**, not
                 // a third line inside the name block, and the reason is
                 // measured. The block sits between the eye and the can, which
@@ -521,12 +530,10 @@ impl super::Gui {
                 // on both. Under the controls it has the whole row -- the
                 // same figure, legible, and the controls keep the height they
                 // had because the band is taken off the rect they centre in.
-                let memory_band = memory.map_or(0.0, |_| small);
-                let row_height = (ui.text_style_height(&egui::TextStyle::Body)
-                    + status.map_or(0.0, |_| small)
-                    + memory_band
-                    + 6.0)
-                    .max(MIN_ROW_HEIGHT);
+                let memory_band = memory.map_or(0.0, |_| small_height);
+                let row_height =
+                    (body_height + status.map_or(0.0, |_| small_height) + memory_band + 6.0)
+                        .max(MIN_ROW_HEIGHT);
                 let (row_rect, row) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), row_height),
                     egui::Sense::click(),
@@ -740,9 +747,8 @@ impl super::Gui {
                         let block =
                             ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                                 ui.spacing_mut().item_spacing.y = 0.0;
-                                let small = ui.text_style_height(&egui::TextStyle::Small);
-                                let text_height = ui.text_style_height(&egui::TextStyle::Body)
-                                    + status.map_or(0.0, |_| small);
+                                let text_height =
+                                    body_height + status.map_or(0.0, |_| small_height);
                                 ui.add_space(((content_height - text_height) / 2.0).max(0.0));
                                 let name_text = if enabled {
                                     egui::RichText::new(name.as_str())
