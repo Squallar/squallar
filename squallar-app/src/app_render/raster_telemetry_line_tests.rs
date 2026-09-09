@@ -526,6 +526,56 @@ fn a_reading_is_due_once_a_period_and_not_once_a_frame() {
     );
 }
 
+/// **The three overlay sentences have a heartbeat, and it is a heartbeat and
+/// not a second period.**
+///
+/// The trio is gated on `ledger::totals_if_moved`, so a still scene stops
+/// emitting it entirely: 3 of 32 legs on the 2026-09-08 browser arm — every
+/// still one — finished with no readable trio, the last reading having aged
+/// out of the rig's console ring behind the frame family, which prints every
+/// period whatever happened. A still scene is where "the layer cleared and
+/// nothing redrew it" lives, so the missing reading was the wanted one.
+///
+/// Two directions, because either alone is satisfied by a constant: the
+/// heartbeat must **fire** on a pipeline that has stopped moving, and must
+/// **not** fire so often that it becomes the period — which would delete the
+/// `if_moved` gate rather than back it up.
+#[test]
+fn the_overlay_trio_speaks_again_on_a_scene_that_has_stopped_moving() {
+    let t0 = web_time::Instant::now();
+    assert!(
+        super::overlay_heartbeat_is_due(None, t0),
+        "the first trio must go out at once, or a rig leg that starts still \
+         hears nothing at all",
+    );
+    assert!(
+        !super::overlay_heartbeat_is_due(Some(t0), t0 + super::RASTER_TELEMETRY_PERIOD),
+        "the heartbeat fired one period after the last trio, which makes it \
+         the period: `totals_if_moved` would then gate nothing and an idle \
+         pipeline is back to 30 readings a minute about nothing",
+    );
+    assert!(
+        super::overlay_heartbeat_is_due(Some(t0), t0 + super::OVERLAY_TELEMETRY_HEARTBEAT),
+        "a pane nobody has touched for a whole heartbeat still said nothing, \
+         so the `overlay blanks:` line remains unreadable on exactly the \
+         scene it is most needed on",
+    );
+
+    // The gap the rig has to live with, stated as a count of the lines that
+    // can get between two trios rather than as a duration: the frame family
+    // writes five sentences a period unconditionally, and the ring is what
+    // they push the trio out of.
+    let periods = super::OVERLAY_TELEMETRY_HEARTBEAT.as_secs_f64()
+        / super::RASTER_TELEMETRY_PERIOD.as_secs_f64();
+    assert!(
+        (2.0..=10.0).contains(&periods),
+        "the heartbeat is {periods} periods. Below two it has replaced the \
+         `if_moved` gate; above ten the trio sits deeper in the console ring \
+         than the frame lines it competes with, which is the failure it was \
+         added to fix",
+    );
+}
+
 /// **The `gridded scatter:` sentence, and the absence it has to be able to
 /// say.**
 ///

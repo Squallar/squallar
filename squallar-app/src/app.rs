@@ -494,6 +494,13 @@ pub struct App {
     /// before the first one. The running totals are a periodic readout and
     /// this is its clock; see that function.
     raster_telemetry_said: Option<web_time::Instant>,
+    /// When the three `overlay …:` sentences last went out, or `None` before
+    /// the first trio. **A second clock beside
+    /// [`Self::raster_telemetry_said`] and not the same one**: that one paces
+    /// the whole report, this one is the heartbeat that makes the trio speak
+    /// on a still scene where the overlay ledger has stopped moving. See
+    /// `render::OVERLAY_TELEMETRY_HEARTBEAT`.
+    overlay_telemetry_said: Option<web_time::Instant>,
     /// What each frame cost this thread — see [`crate::frame_ledger`].
     frame_ledger: crate::frame_ledger::FrameLedger,
     /// Whether this install says the frame timing lines out loud — see
@@ -1030,6 +1037,7 @@ impl App {
             cached_dark_theme: None,
             raster_telemetry_loud,
             raster_telemetry_said: None,
+            overlay_telemetry_said: None,
             frame_ledger: crate::frame_ledger::FrameLedger::default(),
             frame_telemetry_loud,
             frame_telemetry_said: None,

@@ -272,6 +272,36 @@ fn telemetry_is_due(said: Option<web_time::Instant>, now: web_time::Instant) -> 
     said.is_none_or(|last| now.duration_since(last) >= RASTER_TELEMETRY_PERIOD)
 }
 
+/// How long the three overlay sentences may go unsaid before they are said
+/// anyway, with no movement behind them.
+///
+/// **A measurement you cannot read on a still scene is the one you most need
+/// on a still scene.** The trio is gated on
+/// `ledger::totals_if_moved`, so a pane nobody is touching stops emitting
+/// entirely; a 32-leg browser arm on 2026-09-08 finished with **3 legs — every
+/// still one — carrying no readable trio at all**, because the last reading had
+/// aged out of the rig's console ring behind the frame lines, which print
+/// every period unconditionally. A still scene is exactly where "the layer
+/// cleared and nothing redrew it" lives, so the absent reading was the wanted
+/// one.
+///
+/// **Five periods and not one**, which is the whole of the compromise:
+/// `totals_if_moved` still keeps an idle pipeline from writing 30 readings a
+/// minute about nothing, and the trio is still never more than about 25 lines
+/// deep in a ring the frame family is filling at five lines a period. Making it
+/// one period would be deleting the gate, which is the shape
+/// [`App::report_frame_telemetry`] takes for its own reasons and this family
+/// deliberately does not.
+const OVERLAY_TELEMETRY_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether the overlay trio is overdue, given when it last went out.
+///
+/// Asked and not timed, exactly as [`telemetry_is_due`] is, and for the same
+/// reason: the alternative pins a property on a wall clock.
+fn overlay_heartbeat_is_due(said: Option<web_time::Instant>, now: web_time::Instant) -> bool {
+    said.is_none_or(|last| now.duration_since(last) >= OVERLAY_TELEMETRY_HEARTBEAT)
+}
+
 /// Write one telemetry line at the level this install asked for.
 /// What the heap itself says about host spare, beside the model's own figure.
 ///
@@ -2577,7 +2607,17 @@ impl super::App {
         if !telemetry_is_due(self.raster_telemetry_said, now) {
             return;
         }
-        let rasters = squallar_egui::overlay_cache::ledger::totals_if_moved();
+        // **Moved, or overdue.** `totals_if_moved` answers `None` on a pane
+        // nobody is touching, and the trio then stops entirely — see
+        // [`OVERLAY_TELEMETRY_HEARTBEAT`], which is what the second arm is.
+        // The fallback reads the same counters with no side effect of its own:
+        // `totals_if_moved` has already stamped `reported` by the time it
+        // answers `None`, so a heartbeat reading cannot make the next real
+        // movement go unreported.
+        let rasters = squallar_egui::overlay_cache::ledger::totals_if_moved().or_else(|| {
+            overlay_heartbeat_is_due(self.overlay_telemetry_said, now)
+                .then(squallar_egui::overlay_cache::ledger::totals)
+        });
         let uploads = self
             .state
             .as_mut()
@@ -2598,6 +2638,7 @@ impl super::App {
         self.raster_telemetry_said = Some(now);
         let loud = self.raster_telemetry_loud;
         if let Some(t) = rasters {
+            self.overlay_telemetry_said = Some(now);
             say_telemetry(loud, &overlay_raster_line(&t));
             // Beside the line it splits, and off the same reading, so the two
             // sentences can never be a frame apart.
@@ -2606,6 +2647,13 @@ impl super::App {
             // rather than gated on a nonzero blank count: a line that speaks
             // only when something went wrong is indistinguishable from a rig
             // that never scraped it. See `overlay_blank_line`.
+            //
+            // **That was true of the line and false of the function around
+            // it** until 2026-09-09: the trio was gated on
+            // `ledger::totals_if_moved`, so a still scene emitted no blank
+            // line at all and the claim above described a sentence nobody
+            // could read. `OVERLAY_TELEMETRY_HEARTBEAT` is what makes it true
+            // of both.
             say_telemetry(loud, &overlay_blank_line(&t));
         }
         if let Some(u) = uploads {
