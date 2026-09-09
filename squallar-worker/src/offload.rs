@@ -327,7 +327,7 @@ impl JobRequest {
         let code = wire_code(row);
         let mut out = head_buffer(code);
         self.write_envelope(code, &mut out);
-        (row.encode)(&self.job, &ctx, &mut out);
+        crate::encode_cache::encode_row(row, code, &self.job, &ctx, &mut out);
         note_head(code, out.len());
         out
     }
@@ -355,9 +355,13 @@ impl JobRequest {
         let mut out = head_buffer(code);
         self.write_envelope(code, &mut out);
         if payload.is_some() {
+            // NOT routed through `encode_cache`: the only row that nominates a
+            // payload is the gridded one, whose head is cut to the viewport and
+            // so is the one row in the workspace that must be written again for
+            // every dispatch.
             (row.encode_resident_head)(&self.job, &ctx, &mut out);
         } else {
-            (row.encode)(&self.job, &ctx, &mut out);
+            crate::encode_cache::encode_row(row, code, &self.job, &ctx, &mut out);
         }
         note_head(code, out.len());
         (out, payload)
@@ -494,9 +498,13 @@ thread_local! {
     /// reallocations — the figure `GriddedJob::encode` records for the one row
     /// that prices itself and reserves. No other row does: the NWS-alerts head
     /// is polygon geometry written two `f64`s at a time (2.08 MB of it on the
-    /// live `/alerts/active` feed, measured 2026-09-08), and a pan re-encodes
-    /// it once per dispatch because only the input is memoised, never its
-    /// bytes.
+    /// live `/alerts/active` feed, measured 2026-09-08).
+    ///
+    /// A pan used to re-encode that head once per dispatch, because only the
+    /// input was memoised and never its bytes;
+    /// [`crate::encode_cache`] holds the bytes now. This mark still governs
+    /// every first encode of an input, every row that reads the viewport, and
+    /// every row whose input is rebuilt per dispatch.
     ///
     /// **A high-water mark rather than a per-row length function** because a
     /// length function is a second statement of what `encode` writes and can

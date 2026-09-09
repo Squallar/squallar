@@ -9,10 +9,23 @@
 //!
 //! The NWS-alerts row is the one this suite drives because it is the shape
 //! that loses most: its head is polygon geometry written two `f64`s at a time
-//! with no bulk block anywhere, and a pan re-encodes it once per dispatch —
-//! `prepare_job` memoises the built input, never its bytes, so a settled
-//! window of 138-167 overlay dispatches is 138-167 encodes of one unchanged
-//! polygon set.
+//! with no bulk block anywhere.
+//!
+//! **The window that repeats is a gesture, not a settled one.** This paragraph
+//! used to say "a settled window of 138-167 overlay dispatches is 138-167
+//! encodes", and that was wrong in the direction that matters: a settled pane
+//! dispatches *nothing*. `squallar-app`'s
+//! `an_idle_pane_asks_for_no_further_rasters_once_its_layers_hold_a_picture`
+//! is the pin on it, and a census over 350 settled frames at 175 Hz recorded
+//! zero encodes. What repeats is the pan — the input is memoised behind a
+//! stable `Arc` while the envelope's viewport moves — and over two loops of
+//! the `pan-zoom-2d` script, 7,000 frames, this row encoded 27 times from one
+//! input with 26 of those writing identical bytes.
+//!
+//! Those 26 are gone now: `encode_cache` remembers a context-independent row's
+//! bytes against its input. So the warm window below is served without running
+//! the encoder at all, and the third window clears the table to keep a real
+//! encode under the sizing claim.
 //!
 //! What replaced the `Vec::new()` is a per-wire-code high-water mark of what
 //! that code has actually written, so **the first message of a kind grows
@@ -208,7 +221,14 @@ fn a_repeat_dispatch_allocates_its_head_once_and_grows_nothing() {
     );
 
     // Every dispatch after it, which is what a pan is made of.
+    let encodes_before = squallar_worker::encode_cache::totals().encoded;
     let ((warm, _), warm_allocs, warm_moved, warm_sizes) = counting(|| request.to_parts());
+    assert_eq!(
+        squallar_worker::encode_cache::totals().encoded,
+        encodes_before,
+        "the repeat dispatch ran the encoder again; `encode_cache` is supposed \
+         to have served it from the first encode of this same input",
+    );
     assert_eq!(
         warm, cold,
         "the sized buffer changed the bytes on the wire; it may only change \
@@ -232,5 +252,34 @@ fn a_repeat_dispatch_allocates_its_head_once_and_grows_nothing() {
          the copy this sizing exists to remove — on the frame thread, once \
          per dispatch.",
         cold.len(),
+    );
+
+    // **The sizing still governs a real encode.** The window above no longer
+    // runs the encoder at all, so on its own it would stop being evidence
+    // about how an encode allocates. Clearing the table puts the encoder back
+    // under the same high-water mark.
+    squallar_worker::encode_cache::clear();
+    let encodes_before = squallar_worker::encode_cache::totals().encoded;
+    let ((again, _), again_allocs, again_moved, again_sizes) = counting(|| request.to_parts());
+    assert_eq!(
+        squallar_worker::encode_cache::totals().encoded,
+        encodes_before + 1,
+        "a cleared table did not fall back to the encoder, so the counts below \
+         are about a copy and not about an encode",
+    );
+    assert_eq!(again, cold, "the re-encode wrote different bytes");
+    assert_eq!(
+        again_moved, 0,
+        "a re-encode into a buffer sized at this code's high-water mark \
+         carried {again_moved} B across reallocations ({again_sizes:?}); the \
+         cold walk carried {cold_moved} B, and that is the copy this sizing \
+         exists to remove",
+    );
+    assert_eq!(
+        again_allocs, 2,
+        "a re-encode took {again_allocs} blocks of at least {LARGE} B \
+         ({again_sizes:?}); it must take exactly two — the head itself, at the \
+         size the last one needed, and the copy `encode_cache` files so the \
+         next dispatch of this input needs neither",
     );
 }

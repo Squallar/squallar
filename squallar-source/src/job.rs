@@ -325,6 +325,9 @@ pub struct JobCodec {
     /// const-stable and a `const`-built row must store `TypeId::of::<In>`.
     pub input_type: fn() -> std::any::TypeId,
     pub encode: fn(&DescribedJob, &EncodeCtx, &mut Vec<u8>),
+    /// [`JobSpec::ENCODE_IGNORES_CTX`], so a transport can ask the row rather
+    /// than knowing which crate the row came from.
+    pub encode_ignores_ctx: bool,
     /// Decodes one job off the cursor. Takes AND returns the [`JobGeometry`]: a
     /// row whose payload amends the envelope returns the amended one, and that
     /// is the one the job runs under.
@@ -362,6 +365,28 @@ pub trait JobSpec: 'static {
     type Out: JobOut;
     const LABEL: &'static str;
     const COST: JobCost;
+
+    /// Whether [`Self::encode`] writes the same bytes for one input whatever
+    /// the [`EncodeCtx`] says — so a caller holding an earlier encode of *that
+    /// same input* may reuse it instead of running this again.
+    ///
+    /// **Defaulted `false`, and the default is always correct**: a row that
+    /// says nothing keeps being encoded on every dispatch, which is what every
+    /// row did before this existed. The opt-in direction is the load-bearing
+    /// one. A row that reads the context and claimed `true` would be served an
+    /// encode taken under a *different* viewport and rasterize the wrong
+    /// ground — a wrong picture, with nothing to say so. A row that ignores
+    /// the context and leaves this `false` merely does the work again.
+    ///
+    /// So the next row someone writes is safe by not having an opinion, and
+    /// only a row whose `encode` body demonstrably never names `ctx` sets it.
+    /// Every row that does binds the context to `_` rather than `_ctx`, so the
+    /// claim is the compiler's and not a comment's: reading it back would not
+    /// build without also editing the signature this sits beside.
+    /// One row in this workspace cannot: `GriddedJob` cuts its payload to the
+    /// texture bounds at encode time, which is the whole reason [`EncodeCtx`]
+    /// exists.
+    const ENCODE_IGNORES_CTX: bool = false;
 
     fn encode(input: &Self::In, ctx: &EncodeCtx, out: &mut Vec<u8>);
     /// Takes AND returns the [`JobGeometry`] on the same contract as
@@ -445,6 +470,7 @@ impl JobCodec {
             label: S::LABEL,
             input_type: TypeId::of::<S::In>,
             encode: encode_shim::<S>,
+            encode_ignores_ctx: S::ENCODE_IGNORES_CTX,
             decode: decode_shim::<S>,
             run: run_shim::<S>,
             resident_payload: resident_payload_shim::<S>,

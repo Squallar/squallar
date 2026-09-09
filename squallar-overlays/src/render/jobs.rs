@@ -50,8 +50,9 @@ impl JobSpec for CoverageJob {
     type Out = RasterizeOutput;
     const LABEL: &'static str = "overlay/coverage";
     const COST: JobCost = JobCost::Raster;
+    const ENCODE_IGNORES_CTX: bool = true;
 
-    fn encode(input: &CoverageInput, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
+    fn encode(input: &CoverageInput, _: &EncodeCtx, out: &mut Vec<u8>) {
         out.extend_from_slice(&input.device_scale.to_le_bytes());
         out.extend_from_slice(&(input.sites.len() as u32).to_le_bytes());
         for site in &input.sites {
@@ -116,8 +117,9 @@ impl JobSpec for AlertsJob {
     type Out = RasterizeOutput;
     const LABEL: &'static str = "overlay/alerts";
     const COST: JobCost = JobCost::Raster;
+    const ENCODE_IGNORES_CTX: bool = true;
 
-    fn encode(alerts: &AlertsInput, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
+    fn encode(alerts: &AlertsInput, _: &EncodeCtx, out: &mut Vec<u8>) {
         out.extend_from_slice(&alerts.device_scale.to_le_bytes());
         out.extend_from_slice(&(alerts.enabled_categories.len() as u32).to_le_bytes());
         for category in &alerts.enabled_categories {
@@ -221,8 +223,9 @@ impl JobSpec for OutlooksJob {
     type Out = RasterizeOutput;
     const LABEL: &'static str = "overlay/outlooks";
     const COST: JobCost = JobCost::Raster;
+    const ENCODE_IGNORES_CTX: bool = true;
 
-    fn encode(outlooks: &OutlooksInput, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
+    fn encode(outlooks: &OutlooksInput, _: &EncodeCtx, out: &mut Vec<u8>) {
         out.extend_from_slice(&outlooks.device_scale.to_le_bytes());
         out.extend_from_slice(&outlooks.hatch_color);
         out.extend_from_slice(&(outlooks.features.len() as u32).to_le_bytes());
@@ -287,8 +290,9 @@ impl JobSpec for DiscussionsJob {
     type Out = RasterizeOutput;
     const LABEL: &'static str = "overlay/discussions";
     const COST: JobCost = JobCost::Raster;
+    const ENCODE_IGNORES_CTX: bool = true;
 
-    fn encode(discussions: &DiscussionsInput, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
+    fn encode(discussions: &DiscussionsInput, _: &EncodeCtx, out: &mut Vec<u8>) {
         out.extend_from_slice(&discussions.device_scale.to_le_bytes());
         out.extend_from_slice(&(discussions.discussions.len() as u32).to_le_bytes());
         for md in &discussions.discussions {
@@ -353,8 +357,9 @@ impl JobSpec for ReportsJob {
     type Out = RasterizeOutput;
     const LABEL: &'static str = "overlay/reports";
     const COST: JobCost = JobCost::Raster;
+    const ENCODE_IGNORES_CTX: bool = true;
 
-    fn encode(reports: &ReportsInput, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
+    fn encode(reports: &ReportsInput, _: &EncodeCtx, out: &mut Vec<u8>) {
         // One of the two hit-map kinds. **Row order is load-bearing**: a
         // row's position is its hit-map id, so a reorder would hand hovers to
         // the wrong items.
@@ -511,8 +516,9 @@ impl JobSpec for MetarJob {
     type Out = RasterizeOutput;
     const LABEL: &'static str = "overlay/metar";
     const COST: JobCost = JobCost::Raster;
+    const ENCODE_IGNORES_CTX: bool = true;
 
-    fn encode(input: &crate::render::rasterize::MetarInput, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
+    fn encode(input: &crate::render::rasterize::MetarInput, _: &EncodeCtx, out: &mut Vec<u8>) {
         use crate::metar::types::FlightCategory;
         out.extend_from_slice(&input.zoom.to_le_bytes());
         out.push(u8::from(input.is_dark));
@@ -706,8 +712,9 @@ impl JobSpec for GlmJob {
     type Out = RasterizeOutput;
     const LABEL: &'static str = "overlay/glm";
     const COST: JobCost = JobCost::Raster;
+    const ENCODE_IGNORES_CTX: bool = true;
 
-    fn encode(glm: &GlmStrikesInput, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
+    fn encode(glm: &GlmStrikesInput, _: &EncodeCtx, out: &mut Vec<u8>) {
         // One of the two hit-map kinds. **Row order is load-bearing**: a
         // row's position is its hit-map id, so a reorder would hand hovers to
         // the wrong items.

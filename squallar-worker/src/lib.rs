@@ -7,6 +7,7 @@
 //! squallar-radar/squallar-overlays/squallar-elevation; this crate composes and
 //! runs them.
 
+pub mod encode_cache;
 /// The composed job-codec registry — the one module that names the source
 /// crates' `JOB_CODECS`.
 pub(crate) mod job_registry;
