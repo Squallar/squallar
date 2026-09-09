@@ -873,6 +873,12 @@ impl Gui {
                 self.volume_painter = painter;
             }
             GuiEvent::TileMeshPainter(painter) => {
+                // **The store behind it is new, and the tiles are not.** A
+                // cached tile's flattened fills were handed to whichever store
+                // uploaded them and are gone from the host; this one has never
+                // seen them. The bump is what makes those tiles draw their
+                // fills on the CPU instead of asking a store that cannot.
+                crate::tile_mesh::note_painter_installed();
                 self.tile_mesh_painter = painter;
             }
             GuiEvent::RadarFanPainter(painter) => {

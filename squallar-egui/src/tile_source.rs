@@ -139,8 +139,31 @@ const RECOVERED: &str = "the archive is answering tile reads again, so it draws 
                          again";
 
 /// The measured worst-case cost of one **styled** cache entry, in bytes: a
-/// vector tile's shapes plus the flattened [`crate::tile_mesh::TileMeshes`]
-/// built beside them, as [`slot_for`] prices the slot it makes.
+/// vector tile's shapes plus the part of the flattened
+/// [`crate::tile_mesh::TileMeshes`] that stays on the host, as [`slot_for`]
+/// prices the slot it makes.
+///
+/// # **This constant is now a deliberate over-estimate, and here is by how much**
+///
+/// It was derived when a slot carried the whole flatten. It no longer does:
+/// a tile's **fill** buffers leave the host at its first draw, taken by
+/// `squallar_gpu`'s `TileMeshStore::ensure` for the one upload they exist for
+/// (see [`crate::tile_mesh::TileMeshes::fills`]), and only the stroke pair —
+/// which the frame thread draws from when a pass has no painter to hand a run
+/// to — is charged here. Re-measured on the same committed Monaco z14 tile,
+/// same fixture, same style: the slot fell from **1,457,236 B to 1,077,772 B**,
+/// the difference being that tile's 379,464 B of fills (18,018 vertices and
+/// 40,812 indices).
+///
+/// The constant was **not** lowered to meet it. It is read by
+/// [`worst_case_entries`], and every consumer of that asks "how few entries
+/// might a budget hold" — the wasm and desktop brackets, and `squallar_gpu`'s
+/// mirror rung cap. A high entry price answers that conservatively; lowering
+/// it would let every one of those claim more entries fit than the tail
+/// justifies, which is the direction that breaks things. The band in
+/// `tile_source::tests::the_vector_entry_cost_is_what_the_fixture_actually_renders`
+/// still holds it (`heap <= CONST <= 2 * heap`), and that test now also pins
+/// the fill pair being *out* of the charge.
 ///
 /// # How the tile caches are bounded
 ///
@@ -224,7 +247,8 @@ const RECOVERED: &str = "the archive is answering tile reads again, so it draws 
 /// counted at **capacity** measured 652,112 bytes (2026-08-28), and the
 /// flattened buffers beside them — fills **and strokes**, at a feathering of
 /// 1.0 point — measured 810,468 (2026-09-02), which with the marker's node is
-/// the figure below. It is the slot's own [`CachedTile::bytes`], so what is
+/// the figure below. Of that 810,468, **379,464 is the fill pair the slot no
+/// longer carries** (2026-09-09); see the over-estimate note above. It is the slot's own [`CachedTile::bytes`], so what is
 /// priced is what is resident. The plan this landed under quoted ~1.03 MB;
 /// that figure had the fills and not the strokes, and the strokes are more
 /// than half the flattened half. The brackets were argued from 1.03 MB and
@@ -612,8 +636,17 @@ impl CachedTile {
                 let [width, height] = raster.size();
                 (width * height * 4) as u64
             }
+            // **The stroke pair and not the whole flatten.** A tile's fill
+            // buffers leave the host at its first draw — `TileMeshStore::ensure`
+            // takes them for the one upload they exist for and the device
+            // holds them from there, where `tile meshes` names them — so
+            // charging them here would price a device allocation into a host
+            // residency level for the whole life of the slot. What stays is
+            // the stroke pair, which the frame thread draws from when a pass
+            // has no painter. See `crate::tile_mesh::TileMeshes::fills`.
             Tile::Vector(shapes) => {
-                styled_heap_bytes(shapes) as u64 + meshes.map_or(0, |meshes| meshes.bytes())
+                styled_heap_bytes(shapes) as u64
+                    + meshes.map_or(0, |meshes| meshes.resident_host_bytes())
             }
         }
     }

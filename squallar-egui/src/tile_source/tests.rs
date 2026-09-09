@@ -1609,7 +1609,7 @@ fn the_vector_entry_cost_is_what_the_fixture_actually_renders() {
     );
 
     // The slot exactly as an arrival makes it: shapes priced at capacity plus
-    // the fills and strokes flattened at a feathering of one point — the
+    // the STROKE half of the flatten, at a feathering of one point — the
     // value `feathering_of` answers on a 1x display — plus the marker's node.
     // What is measured is what is resident.
     let slot = slot_for(tile, 1, 1.0);
@@ -1618,7 +1618,10 @@ fn the_vector_entry_cost_is_what_the_fixture_actually_renders() {
         Some(Tile::Vector(shapes)) => super::styled_heap_bytes(shapes),
         _ => unreachable!("the slot holds the vector tile it was built from"),
     };
-    let flattened = slot.meshes.as_ref().map_or(0, |meshes| meshes.bytes()) as usize;
+    let meshes = slot.meshes.as_ref().expect("the fixture tile flattened");
+    let flattened = meshes.bytes() as usize;
+    let strokes = meshes.resident_host_bytes() as usize;
+    let fills = meshes.fill_bytes_len() as usize;
     assert!(
         flattened > 0,
         "the fixture tile flattened to no buffers, so this is not measuring the entry \
@@ -1626,8 +1629,31 @@ fn the_vector_entry_cost_is_what_the_fixture_actually_renders() {
     );
     assert_eq!(
         heap,
-        MARKER_BYTES as usize + shapes_alone + flattened,
+        MARKER_BYTES as usize + shapes_alone + strokes,
         "the slot's charge is not the sum of its parts"
+    );
+
+    // **The fill pair is not in the charge, and it is not nothing.** It leaves
+    // the host at the tile's first draw — `TileMeshStore::ensure` takes it for
+    // the single upload it exists for — so a slot that carried it would price
+    // a device allocation as host residency for the whole life of the entry,
+    // and `tile cache` would read that high for ever. The two assertions are
+    // separate on purpose: the equality above passes just as happily if the
+    // fills were zero, which is the way this could go quiet.
+    assert!(
+        fills > 0,
+        "the fixture tile flattened no fills, so nothing here shows the fill pair \
+         being left out of the charge"
+    );
+    assert_eq!(
+        flattened,
+        strokes + fills,
+        "the flatten is no longer the two pairs this test splits it into"
+    );
+    assert!(
+        !(MARKER_BYTES as usize + shapes_alone + flattened == heap),
+        "the slot is charged for the fill pair again: {fills} B of a {flattened} B \
+         flatten, on top of {shapes_alone} B of shapes"
     );
 
     // Not an equality: `size_of` and allocator rounding are toolchain
@@ -1637,14 +1663,15 @@ fn the_vector_entry_cost_is_what_the_fixture_actually_renders() {
     // constant by reading the figure out of this message, never by inference.
     assert!(
         heap <= super::MEASURED_STYLED_ENTRY_BYTES,
-        "one styled entry measures {heap} bytes ({shapes_alone} of shapes, {flattened} \
-         flattened, {MARKER_BYTES} marker), over the {} the brackets are derived from",
+        "one styled entry measures {heap} bytes ({shapes_alone} of shapes, {strokes} of \
+         strokes, {MARKER_BYTES} marker; the {fills} B fill pair is the device's), over \
+         the {} the brackets are derived from",
         super::MEASURED_STYLED_ENTRY_BYTES
     );
     assert!(
         heap * 2 >= super::MEASURED_STYLED_ENTRY_BYTES,
-        "one styled entry measures {heap} bytes ({shapes_alone} of shapes, {flattened} \
-         flattened), less than half the {} the brackets are derived from: the derivation \
+        "one styled entry measures {heap} bytes ({shapes_alone} of shapes, {strokes} of \
+         strokes), less than half the {} the brackets are derived from: the derivation \
          has gone stale in the safe direction, which still means it is not measuring this",
         super::MEASURED_STYLED_ENTRY_BYTES
     );

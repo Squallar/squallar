@@ -634,9 +634,21 @@ fn run_is_drawable(
     meshes: &crate::tile_mesh::TileMeshes,
     ground: &GroundMeshes<'_>,
 ) -> bool {
-    ground.painter.is_some()
-        && !(run.kind == crate::tile_mesh::RunKind::Stroke
-            && meshes.feathering() != ground.feathering)
+    if ground.painter.is_none() {
+        return false;
+    }
+    match run.kind {
+        // **A tile whose fill bytes an EARLIER store took.** The buffers this
+        // run would draw from live in a store that has been dropped — a
+        // surface lost and rebuilt — and the store this frame draws through
+        // has nothing to make them resident with, so handing it the run would
+        // draw nothing at all. Declining puts the tile's own `Shape::Mesh`
+        // back on the CPU path, which is where it was before any of this and
+        // is what a build with no wgpu renderer gets. See
+        // `tile_mesh::TileMeshes::fills_epoch`.
+        crate::tile_mesh::RunKind::Fill => meshes.fill_runs_drawable(),
+        crate::tile_mesh::RunKind::Stroke => meshes.feathering() == ground.feathering,
+    }
 }
 
 /// One paint callback for `runs[first..first + count]`, drawn in that order.

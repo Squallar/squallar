@@ -413,14 +413,25 @@ impl TileMeshStore {
         if self.resident.contains_key(&meshes.id()) {
             return;
         }
-        // The one write per tile lifetime this whole mechanism is for.
-        let fills = upload_pair(
-            device,
-            queue,
-            "tile mesh",
-            meshes.vertex_bytes(),
-            meshes.index_bytes(),
-        );
+        // **The one write per tile lifetime this whole mechanism is for — and
+        // the take that ends the host's copy of it.**
+        //
+        // `take_fill_bytes` leaves the tile holding no fill buffers, because
+        // this call is their only reader: the pair is written into a device
+        // buffer here, and every later frame draws it from there. Nothing on
+        // the frame thread reads them (a painterless pass places the tile's
+        // own `Shape::Mesh` instead), so a host copy kept past this line is a
+        // second copy of a device allocation held for the life of the cached
+        // tile. See `TileMeshes::fills`.
+        //
+        // `None` is a tile whose bytes a **previous** store already took — a
+        // surface lost and rebuilt, which drops this whole store and builds a
+        // fresh one over a tile cache that survived. Its fills are simply not
+        // made resident and the shape list draws them, exactly as it does on
+        // a build with no wgpu renderer at all.
+        let fills = meshes.take_fill_bytes().and_then(|fills| {
+            upload_pair(device, queue, "tile mesh", &fills.vertices, &fills.indices)
+        });
         let strokes = upload_pair(
             device,
             queue,

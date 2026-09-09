@@ -204,10 +204,51 @@ pub struct MeshRun {
 #[derive(Debug)]
 pub struct TileMeshes {
     id: u64,
-    /// [`TileVertex`]-shaped bytes, ready for the renderer's buffer write.
-    vertices: Vec<u8>,
-    /// `u32` indices, rebased into [`Self::vertices`], likewise as bytes.
-    indices: Vec<u8>,
+    /// **The fill buffers, held only until the one upload takes them.**
+    ///
+    /// [`TileVertex`]-shaped bytes and the `u32` indices rebased into them,
+    /// ready for the renderer's buffer write — and read by **exactly one
+    /// caller once per tile lifetime**, `squallar_gpu`'s
+    /// `TileMeshStore::ensure`, which is keyed on [`Self::id`] and returns
+    /// early for a tile it has already made resident. Nothing on the frame
+    /// thread reads them: a fill run is a `Shape::Mesh` in the styled shape
+    /// list, so the painterless route places that shape rather than these
+    /// bytes ([`crate::ui_map_overlays`]'s `place_run_as_mesh` takes stroke
+    /// runs and returns `false` for fills, "there is nothing here to win").
+    ///
+    /// So they were a **second host copy of a buffer already on the device**,
+    /// held for the life of every cached tile. Measured on this box, one
+    /// pane, fresh config, the shipped binary: the styled cache held 68.5 MB
+    /// and `tile meshes` — this pair plus the stroke pair — was 38.6 MB of
+    /// it, on a `live_peak` of 265-371 MB whose target is 250.
+    ///
+    /// [`Self::take_fill_bytes`] is the upload's take. Once taken, a store
+    /// built *later* (a surface lost and rebuilt, which is
+    /// `App::ensure_rendering_state` on a mobile resume) finds nothing to
+    /// upload and simply does not make the tile's fills resident; the draw
+    /// then places the tile's own `Shape::Mesh` shapes, which is what a build
+    /// with no wgpu renderer has always done. Correct, and slower for those
+    /// tiles until the LRU turns them over or a restyle re-flattens them.
+    fills: std::sync::Mutex<Option<FillBytes>>,
+    /// **Which painter's store took [`Self::fills`]**, as
+    /// [`painter_epoch`] read it — zero while they are still here.
+    ///
+    /// The take is one-way and the buffers it hands over live in a *store*,
+    /// so a store that is built after the take has nothing to make this tile's
+    /// fills resident with and its draw would skip the run: a hole, not a
+    /// fallback. That store is a real thing — a surface lost and rebuilt drops
+    /// it and installs a fresh painter over a tile cache that survived — so
+    /// the frame side asks [`Self::fill_runs_drawable`] before it hands a fill
+    /// run to a callback at all, and places the tile's own `Shape::Mesh`
+    /// instead when the answer is no.
+    fills_epoch: std::sync::atomic::AtomicU64,
+    /// What [`Self::fills`] held when it was flattened, kept after the take.
+    ///
+    /// [`Self::bytes`] is the **renderer's** residency figure — what the
+    /// device holds while this value is alive — and the device keeps holding
+    /// it after the host copy is gone, so the price may not fall with the
+    /// take. See [`Self::host_bytes`] for the reading that does.
+    fill_bytes: u64,
     vertex_count: u32,
     index_count: u32,
     /// [`stroke::StrokeVertex`]-shaped bytes.
@@ -233,10 +274,47 @@ pub struct TileMeshes {
     plan: Option<TilePlan>,
 }
 
+/// One tile's fill buffers on their way to the device, and nowhere else.
+///
+/// A named pair rather than a tuple because the two are only ever handed over
+/// together and a swapped pair is a wrong picture, not a compile error.
+#[derive(Debug)]
+pub struct FillBytes {
+    /// [`TileVertex`]-shaped bytes.
+    pub vertices: Vec<u8>,
+    /// `u32` indices, rebased into [`Self::vertices`].
+    pub indices: Vec<u8>,
+}
+
 /// Identities are minted, never derived from a tile id: one `TileId` is a
 /// different mesh under a different style epoch, and a stale GPU buffer drawn
 /// under a re-used key is a wrong picture rather than a missing one.
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// **How many times a [`TileMeshPainter`] has been installed**, starting at
+/// one so that no tile's stamp can read as "never taken".
+///
+/// A painter arrives with the store behind it (`App::install_volume_bridge`
+/// makes the `TileMeshStore` and publishes the painter in the same block), so
+/// this counts stores as well, and a tile whose fill bytes an earlier store
+/// took is exactly a tile whose stamp is behind this. See
+/// [`TileMeshes::fills_epoch`].
+static PAINTER_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The epoch a take stamps and a draw compares against.
+pub fn painter_epoch() -> u64 {
+    PAINTER_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// **A painter was installed**: every tile whose fills an earlier store took
+/// stops offering its fill runs to a callback from here.
+///
+/// Called from the one place a painter is installed,
+/// `Gui::apply(GuiEvent::TileMeshPainter)`. Bumped for a `None` too — there is
+/// no store then either, and the CPU path is the right answer for both.
+pub fn note_painter_installed() {
+    PAINTER_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 impl TileMeshes {
     /// This tile's renderer-side identity. Unique for the process.
@@ -244,15 +322,57 @@ impl TileMeshes {
         self.id
     }
 
-    /// The vertex buffer's contents, in [`TileVertex`]'s layout.
-    pub fn vertex_bytes(&self) -> &[u8] {
-        &self.vertices
+    /// **Take the fill buffers for the one upload that reads them**, leaving
+    /// this value holding none. See [`Self::fills`].
+    ///
+    /// `None` for a tile that flattened no fills, and for one whose bytes a
+    /// store has already taken — the caller must then leave the tile's fills
+    /// off the device and let the shape list draw them.
+    pub fn take_fill_bytes(&self) -> Option<FillBytes> {
+        let taken = self.fills.lock().ok()?.take()?;
+        self.fills_epoch
+            .store(painter_epoch(), std::sync::atomic::Ordering::Relaxed);
+        Some(taken)
     }
 
-    /// The index buffer's contents: `u32`s rebased into the vertex buffer, so
-    /// a run draws over its own index range with a zero base vertex.
-    pub fn index_bytes(&self) -> &[u8] {
-        &self.indices
+    /// **Whether this tile's fill runs can be drawn through a callback**, or
+    /// whether the frame must place their `Shape::Mesh` shapes itself.
+    ///
+    /// True while the fill bytes are still here — the store this frame is
+    /// drawing through will upload them — and true once they have been taken
+    /// by *this* painter's store. False for a tile whose bytes an earlier
+    /// store took, which is a rebuilt surface; see [`Self::fills_epoch`].
+    pub fn fill_runs_drawable(&self) -> bool {
+        if self.fills_epoch.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return true;
+        }
+        self.fills_epoch.load(std::sync::atomic::Ordering::Relaxed) == painter_epoch()
+    }
+
+    /// Read the fill buffers, if they are still here — `None` once
+    /// [`Self::take_fill_bytes`] has taken them.
+    pub fn with_fill_bytes<R>(&self, read: impl FnOnce(&[u8], &[u8]) -> R) -> Option<R> {
+        let held = self.fills.lock().ok()?;
+        let fills = held.as_ref()?;
+        Some(read(&fills.vertices, &fills.indices))
+    }
+
+    /// What the fill buffers held when they were flattened, whether or not
+    /// they are still here. The figure [`Self::bytes`] carries them at.
+    pub fn fill_bytes_len(&self) -> u64 {
+        self.fill_bytes
+    }
+
+    /// **What this value holds on the host for the whole of its life** — the
+    /// stroke pair, which no upload takes because the frame thread draws from
+    /// it (`ui_map_overlays::place_run_as_mesh`, for a pass with no painter to
+    /// hand a run to; the 3D floor strip is the one that ships).
+    ///
+    /// The figure the styled tile cache charges a slot, since the fill pair is
+    /// the device's from the first draw and is named by the `tile meshes`
+    /// census family. See [`Self::fills`].
+    pub fn resident_host_bytes(&self) -> u64 {
+        self.stroke_vertices.len() as u64 + self.stroke_indices.len() as u64
     }
 
     pub fn vertex_count(&self) -> u32 {
@@ -407,7 +527,10 @@ impl TileMeshes {
     /// what was flattened; nothing shipped reads a vertex individually.
     pub fn vertex(&self, index: usize) -> Option<TileVertex> {
         let at = index * TILE_VERTEX_BYTES as usize;
-        let bytes: &[u8; 12] = self.vertices.get(at..at + 12)?.try_into().ok()?;
+        let bytes: [u8; 12] = self.with_fill_bytes(|vertices, _| {
+            vertices.get(at..at + 12).and_then(|b| b.try_into().ok())
+        })??;
+        let bytes = &bytes;
         Some(TileVertex {
             pos: [
                 f32::from_ne_bytes(bytes[0..4].try_into().ok()?),
@@ -420,16 +543,34 @@ impl TileMeshes {
     /// One index, decoded back out of the bytes. Tests only, as [`Self::vertex`].
     pub fn index(&self, index: usize) -> Option<u32> {
         let at = index * TILE_INDEX_BYTES as usize;
-        Some(u32::from_ne_bytes(
-            self.indices.get(at..at + 4)?.try_into().ok()?,
-        ))
+        Some(u32::from_ne_bytes(self.with_fill_bytes(
+            |_, indices| indices.get(at..at + 4).and_then(|b| b.try_into().ok()),
+        )??))
     }
 
     /// What one residency costs the GPU, counted the way the renderer budgets
     /// it: the two buffers' contents, nothing else.
     pub fn bytes(&self) -> u64 {
-        self.vertices.len() as u64
-            + self.indices.len() as u64
+        self.fill_bytes + self.stroke_vertices.len() as u64 + self.stroke_indices.len() as u64
+    }
+
+    /// **What this value holds on the HOST right now** — the same sum as
+    /// [`Self::bytes`] until the upload takes the fills, and the stroke pair
+    /// alone after it.
+    ///
+    /// The two are different questions and neither answers the other: the
+    /// device keeps its copy for as long as this value is alive, so the
+    /// renderer's residency is [`Self::bytes`]; the host gives the fills back
+    /// at the first draw, so what the allocator is holding is this.
+    pub fn host_bytes(&self) -> u64 {
+        self.fills
+            .lock()
+            .ok()
+            .and_then(|held| {
+                held.as_ref()
+                    .map(|fills| (fills.vertices.len() + fills.indices.len()) as u64)
+            })
+            .unwrap_or(0)
             + self.stroke_vertices.len() as u64
             + self.stroke_indices.len() as u64
     }
@@ -732,11 +873,16 @@ impl Flattening {
         self.stroke_indices.shrink_to_fit();
         self.runs.shrink_to_fit();
 
+        let fill_bytes = (self.vertices.len() + self.indices.len()) as u64;
         TileMeshes {
             plan: None,
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            vertices: self.vertices,
-            indices: self.indices,
+            fills: std::sync::Mutex::new(Some(FillBytes {
+                vertices: self.vertices,
+                indices: self.indices,
+            })),
+            fills_epoch: std::sync::atomic::AtomicU64::new(0),
+            fill_bytes,
             vertex_count: self.vertex_count,
             index_count: self.index_count,
             stroke_vertices: self.stroke_vertices,

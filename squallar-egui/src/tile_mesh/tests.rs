@@ -227,7 +227,8 @@ fn the_byte_figure_is_the_four_buffers() {
             + u64::from(flat.stroke_index_count()) * stroke::STROKE_INDEX_BYTES
     );
     assert_eq!(
-        flat.vertex_bytes().len() as u64,
+        flat.with_fill_bytes(|vertices, _| vertices.len() as u64)
+            .expect("nothing has taken the fill buffers yet"),
         u64::from(flat.vertex_count()) * TILE_VERTEX_BYTES
     );
     assert_eq!(
@@ -528,4 +529,69 @@ fn stroke_indices_are_rebased_onto_each_runs_own_first_vertex() {
             );
         }
     }
+}
+
+/// **The fill bytes leave the host at the upload, and a tile that has given
+/// them up stops offering its fill runs to a painter that never saw them.**
+///
+/// The take is the whole memory cut — a flattened fill pair was a second host
+/// copy of a device allocation, held for the life of every cached tile — and
+/// the epoch is the only thing standing between it and a hole. A store is
+/// built with the painter that reaches it (`App::install_volume_bridge`), so a
+/// surface lost and rebuilt puts a *new* store over a tile cache that
+/// survived; that store cannot make an already-taken tile's fills resident and
+/// its draw skips the run rather than falling back. Nothing else in the tree
+/// notices: the tile draws, the runs are there, and the fills are simply
+/// missing from the picture.
+///
+/// Three states, because only the middle one is obvious: bytes still here,
+/// bytes taken by the painter now installed, bytes taken by an earlier one.
+#[test]
+fn a_tile_that_gave_its_fills_to_an_earlier_store_draws_them_on_the_cpu() {
+    let mut mesh = egui::epaint::Mesh::default();
+    mesh.colored_vertex(egui::pos2(0.0, 0.0), egui::Color32::RED);
+    mesh.colored_vertex(egui::pos2(64.0, 0.0), egui::Color32::RED);
+    mesh.colored_vertex(egui::pos2(0.0, 64.0), egui::Color32::RED);
+    mesh.add_triangle(0, 1, 2);
+    let flat = flatten(
+        &[ShapeOrText::Shape(egui::Shape::Mesh(mesh.into()))],
+        NO_FEATHERING,
+    );
+
+    assert!(
+        flat.fill_bytes_len() > 0,
+        "the fixture flattened no fills, so nothing below is about fills"
+    );
+    assert!(
+        flat.fill_runs_drawable(),
+        "a tile still holding its fill bytes must let the store upload them"
+    );
+
+    let taken = flat.take_fill_bytes().expect("the fill bytes are here");
+    assert_eq!(
+        taken.vertices.len() as u64 + taken.indices.len() as u64,
+        flat.fill_bytes_len(),
+        "the take handed over something other than the fill pair it was priced at"
+    );
+    assert!(
+        flat.take_fill_bytes().is_none(),
+        "the take is one-way: a second store must not be told it has bytes to upload"
+    );
+    assert_eq!(
+        flat.host_bytes(),
+        flat.resident_host_bytes(),
+        "the host is still holding the fill pair after the take"
+    );
+    assert!(
+        flat.fill_runs_drawable(),
+        "the store that took the bytes cannot draw what it uploaded"
+    );
+
+    // The rebuilt surface. The bytes are in a store that no longer exists.
+    super::note_painter_installed();
+    assert!(
+        !flat.fill_runs_drawable(),
+        "a painter that never saw these bytes was offered the run anyway, and its \
+         store draws nothing for a run it has no buffers for"
+    );
 }
