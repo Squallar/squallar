@@ -5681,3 +5681,229 @@ fn a_refetch_a_reversing_pan_earns_is_never_a_cell_that_stayed_on_the_glass() {
          walk had: {stats:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+
+/// The side of the window the return-traversal pin pans, in cells: the same
+/// 12x12 grid [`GRID_SIDE`] names, so the working set is one the demand cap
+/// cannot hold outright and the pan really turns entries over.
+const RETURN_SIDE: u32 = 12;
+/// The level the pin draws. Deep enough to have an ancestor net under it at
+/// [`crate::tiles::WARM_ANCESTOR_STEPS`], which is the whole subject.
+const RETURN_ZOOM: u8 = 10;
+const RETURN_CELLS: usize = (RETURN_SIDE * RETURN_SIDE) as usize;
+/// How many windows east the pan walks before it turns round. Eight windows
+/// is 96 columns, which is six cells of the net — comfortably more than the
+/// net cell over the origin can survive on recency alone, and the control
+/// below asserts the origin's own tiles really did go.
+const RETURN_STOPS: u32 = 8;
+
+/// The net cell one column of `x0` sits under, on the row this pin draws.
+fn net_over(x0: u32) -> TileId {
+    TileId {
+        x: x0 >> crate::tiles::WARM_ANCESTOR_STEPS,
+        y: 0,
+        zoom: RETURN_ZOOM - crate::tiles::WARM_ANCESTOR_STEPS,
+    }
+}
+
+/// One `ui_map_overlays::draw_tile_layer` pass over a [`RETURN_SIDE`]-square
+/// window whose west edge is `x0`, in that function's own order: the pump, the
+/// **ancestor net** warmed, the working set reported with the net's own cell
+/// count in it, then the walk.
+///
+/// The net is what [`pass_over_window`] leaves out, and leaving it out is what
+/// puts a fixture out of reach of this defect: the net is the only ancestor
+/// level anything ever fetches, so a walk that never warms one can neither
+/// keep an ancestor nor lose one, and every cell it misses is a hole for
+/// reasons that have nothing to do with eviction.
+///
+/// Answers `(blank, stretched)`: cells `ground_at` could draw **nothing** for,
+/// and cells it answered with an ancestor stretched over them rather than with
+/// the tile itself.
+fn net_pass(tiles: &mut HttpsTiles, pass_nr: u64, x0: u32) -> (usize, usize) {
+    tiles.pump();
+    let step = crate::tiles::WARM_ANCESTOR_STEPS;
+    let mut net = 0usize;
+    for ny in 0..=((RETURN_SIDE - 1) >> step) {
+        for nx in (x0 >> step)..=((x0 + RETURN_SIDE - 1) >> step) {
+            tiles.warm(TileId {
+                x: nx,
+                y: ny,
+                zoom: RETURN_ZOOM - step,
+            });
+            net += 1;
+        }
+    }
+    tiles.note_wanted(pass_nr, RETURN_CELLS, net);
+
+    let (mut blank, mut stretched) = (0, 0);
+    for y in 0..RETURN_SIDE {
+        for x in x0..x0 + RETURN_SIDE {
+            match tiles.ground_at(TileId {
+                x,
+                y,
+                zoom: RETURN_ZOOM,
+            }) {
+                None => blank += 1,
+                Some(piece) if piece.uv != whole_tile_uv() => stretched += 1,
+                Some(_) => {}
+            }
+        }
+    }
+    (blank, stretched)
+}
+
+/// Drive the window at `x0` with [`net_pass`] until every cell draws from its
+/// own tile, so the next stop starts from ground that really landed rather
+/// than from ground the net was covering. Answers what the **first** pass onto
+/// the window saw.
+fn window_until_sharp(tiles: &mut HttpsTiles, pass: &mut u64, x0: u32) -> (usize, usize) {
+    let mut first = None;
+    let sharp = pump_until(Duration::from_secs(30), || {
+        *pass += 1;
+        let seen = net_pass(tiles, *pass, x0);
+        first.get_or_insert(seen);
+        std::thread::sleep(Duration::from_millis(1));
+        (seen == (0, 0)).then_some(())
+    });
+    assert!(
+        sharp.is_some(),
+        "the window at {x0} never drew every cell from its own tile, so nothing below is a \
+         reading on a settled window"
+    );
+    first.expect("a pass ran, so a first reading was taken")
+}
+
+/// **A pan back onto ground the viewport left draws a stretched ancestor where
+/// it drew a hole.**
+///
+/// The vanishing basemap tile, in the one shape that produces it. A cell is
+/// blank exactly when `cached_or_interpolated` finds neither the tile nor any
+/// ancestor of it resident, and the levels between the drawn one and the net
+/// at [`crate::tiles::WARM_ANCESTOR_STEPS`] are never requested by anything —
+/// `ground_at` asks for the drawn level alone. So the net cell is the whole of
+/// what stands between the returning viewport and 144 holes, and plain LRU
+/// recency cannot keep it: it ages at the rate of the one drawn cell beside it
+/// while covering 256 of them, and a pan turns over a windowful per window.
+/// See [`super::RETAINED_NET_CELLS`], which is what holds it.
+///
+/// **Three controls, because a green here is worth nothing without them.**
+///
+/// 1. *The pan really evicted.* `evicted_resident` has to have moved, or the
+///    return is a return to a cache that never let anything go.
+/// 2. *None of the origin's own tiles survived.* Asserted as a count before
+///    the return pass, and again as `stretched == RETURN_CELLS` on the pass
+///    itself: every cell drew, and every cell drew from an **ancestor**. Drop
+///    this and "no blanks" would read green for a cache that simply held the
+///    whole pan.
+/// 3. *The blank is reachable in this fixture at all.* The first pass onto
+///    fresh ground is asserted blank and the `blank_cells` counter asserted to
+///    move for it, so the zero on the return is a measurement and not an
+///    instrument that cannot read.
+///
+/// Tampered by deleting the `refresh_warm_history` call in
+/// `HttpsTiles::note_wanted`: the net cell over the origin is gone by stop 3
+/// of 8, `any ancestor resident` reads 0 of 144, and the return pass draws
+/// **144 of 144 cells blank**. Raising `MAX_PARALLEL_DOWNLOADS` from 6 to 12
+/// against that same tamper moves the passes-to-sharp from 22 to 13 and leaves
+/// the blank at 144 of 144: the refill rate is the channel's, the hole is the
+/// ancestor's.
+#[test]
+fn a_pan_back_onto_ground_it_left_draws_an_ancestor_where_it_drew_a_hole() {
+    let server = TileServer::start(Behaviour::Serve(Arc::new(fixture_png())));
+    let ctx = Context::default();
+    let mut tiles = loopback_tiles_with_budget(&server, &ctx, ALLOWANCE_FOR_EVERYTHING);
+
+    let mut pass = 0u64;
+
+    // Control 3: the origin is fresh ground and has to draw as a hole, with
+    // the counter reading it. Nothing has been fetched, so the whole window is
+    // blank on its first pass by construction — which is the point: this is
+    // the reading the return is compared against.
+    let (blank_fresh, _) = window_until_sharp(&mut tiles, &mut pass, 0);
+    let after_origin = tiles.cache_stats();
+    assert_eq!(
+        blank_fresh, RETURN_CELLS,
+        "the first pass onto ground nothing had ever fetched drew something, so this fixture \
+         cannot produce the hole it is about: {after_origin:?}"
+    );
+    assert!(
+        after_origin.blank_cells >= RETURN_CELLS as u64,
+        "the blank-cell counter did not move over a window that drew {RETURN_CELLS} holes, so \
+         its zero on the return below would say nothing: {after_origin:?}"
+    );
+
+    for stop in 1..RETURN_STOPS {
+        window_until_sharp(&mut tiles, &mut pass, stop * RETURN_SIDE);
+    }
+
+    // What the cache is holding for the origin, just before the viewport comes
+    // back to it. Peeks: `tile_is_cached` leaves recency alone, so measuring
+    // this cannot be what keeps anything alive.
+    let before = tiles.cache_stats();
+    let own_tiles_held = (0..RETURN_SIDE)
+        .flat_map(|y| (0..RETURN_SIDE).map(move |x| (x, y)))
+        .filter(|(x, y)| {
+            tiles.tile_is_cached(TileId {
+                x: *x,
+                y: *y,
+                zoom: RETURN_ZOOM,
+            })
+        })
+        .count();
+
+    // Control 1.
+    assert!(
+        before.evicted_resident > 0,
+        "the pan let nothing go, so the return below is not a return to evicted ground: \
+         {before:?}"
+    );
+    // Control 2, first half.
+    assert_eq!(
+        own_tiles_held, 0,
+        "the cache still holds {own_tiles_held} of the origin's own {RETURN_CELLS} tiles, so a \
+         zero blank count below would be those tiles and not the ancestor: {before:?}"
+    );
+    // Sampled before the pass, asserted after it: the pass would warm this
+    // cell itself, so reading it afterwards could not tell a cell that was
+    // held from one that was re-asked for.
+    let net_held = tiles.tile_is_cached(net_over(0));
+
+    // The return.
+    let (blank, stretched) = net_pass(&mut tiles, pass + 1, 0);
+    let after = tiles.cache_stats();
+    eprintln!(
+        "{RETURN_STOPS} windows of {RETURN_SIDE}x{RETURN_SIDE} east and back, at zoom \
+         {RETURN_ZOOM} with the net at {}: the return pass drew {blank} blank and {stretched} \
+         stretched of {RETURN_CELLS}, holding {} entries: {after:?}",
+        RETURN_ZOOM - crate::tiles::WARM_ANCESTOR_STEPS,
+        after.resident_entries,
+    );
+
+    assert_eq!(
+        blank, 0,
+        "the pan back onto ground it left drew {blank} of {RETURN_CELLS} cells as holes: the \
+         one ancestor level anything fetches was evicted behind the pan: {after:?}"
+    );
+    // Control 2, second half: every cell drew, and every one of them drew from
+    // an ancestor rather than from its own tile.
+    assert_eq!(
+        stretched, RETURN_CELLS,
+        "{} of {RETURN_CELLS} cells drew from their own tile, so the cache held the origin's \
+         drawn level after all and the zero above is not the net's doing: {after:?}",
+        RETURN_CELLS - stretched,
+    );
+    assert!(
+        net_held,
+        "the net cell over the origin was let go behind the pan, which is the eviction \
+         RETAINED_NET_CELLS exists to stop: {before:?}"
+    );
+    assert_eq!(
+        after.blank_cells, before.blank_cells,
+        "the return pass counted {} blank cells against the {} the outbound pan left, so the \
+         hole is still there and only the assertions above missed it",
+        after.blank_cells - before.blank_cells,
+        before.blank_cells,
+    );
+}

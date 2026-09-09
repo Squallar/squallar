@@ -1316,7 +1316,7 @@ by `the_rig_reads_the_tile_cache_line_the_app_actually_writes`
 (`squallar-app/src/app_render.rs`, `tile_cache_line`):
 
 ```text
-tile cache (<base|terrain>): N asks, N restyle asks, N refetch after eviction, N puts first, N restyle, N duplicate, N orphan, N evicted pending, N evicted resident of N B, N entries, N B resident, N parsed, snap 0|1
+tile cache (<base|terrain>): N asks, N restyle asks, N refetch after eviction, N of them still wanted, N puts first, N restyle, N duplicate, N orphan, N evicted pending, N evicted resident of N B, N entries, N B resident, N parsed, snap 0|1, floor N entries, N B overrun, N wanted on glass, N wanted net, N blank cells
 ```
 
 Running totals, one event at the cache each, denominators never added: `asks`
@@ -1325,13 +1325,21 @@ the cache remembers evicting — the `tilecache` leg's settle field), the four
 disjoint `puts`, the two `evicted` kinds and the bytes the resident ones were
 charged; then the levels `entries`, `B resident`, `parsed` and — since WO-12 —
 `snap`, `1` while the tile-sharpness rung holds that role's source at the whole
-zoom below the fractional one, else `0` (§11.2). The ledger's other levels
-(`overrun`, `floor`, the two `wanted`) are on `cache_ledger::Totals` and not
-printed. A binary older than the `snap` group matches nothing and the rig
-reads `n/a`, never `snap 0`. `drive.py`'s scraped object does not yet carry the
-new group (its `tile_cache_re` consumer is a one-line follow-on for that file's
-owner), so on the browser the reading is the console line itself and
-`native_row.py`'s row, whose arm `int()`s every group.
+zoom below the fractional one, else `0` (§11.2); then the levels `floor`,
+`overrun` and the two `wanted` figures, which price a refetch ratio against the
+scene rather than against a number. A binary older than a group matches nothing
+and the rig reads `n/a`, never a zero.
+
+`blank cells` is last and is a **counter**, not a level, sitting after the
+levels only because both readers are positional and an appended group costs no
+renumbering. It counts grid cells one pass could draw nothing at all for —
+neither the tile nor any ancestor of it resident — so its denominator is cells
+walked and its comparison is `wanted on glass`, one pass's worth of the same
+walk. Never compared with `asks` or `puts`, which count tiles. It is the only
+figure that sees an ancestor-net eviction from the glass: the net at
+`WARM_ANCESTOR_STEPS` is the sole ancestor level anything fetches, and until
+this group existed its loss showed up nowhere (`RETAINED_NET_CELLS`, which
+holds it, landed with the counter).
 
 **Figures, as landed and measured (WO-6/WO-12, 2026-09-02).** A styled entry's
 city-core tail is `MEASURED_STYLED_ENTRY_BYTES` = 1,462,708 B (shapes at

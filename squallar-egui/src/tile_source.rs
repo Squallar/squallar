@@ -31,7 +31,7 @@
 //! The pump is called **once per layer**, by `ui_map_overlays::draw_tile_layer`
 //! before its grid loop, and never from [`Tiles::at`] — see
 //! [`HttpsTiles::pump`] for why, and for the one thing that would break.
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -96,6 +96,42 @@ impl ParallelPeak {
 /// A read *answers* with a body or with the archive's authoritative "no tile
 /// at this coordinate", so a viewport of open ocean is not a fault.
 const SUSTAINED_READ_FAILURES: usize = MAX_PARALLEL_DOWNLOADS;
+
+/// How many cells of the ancestor net stay warm **after the viewport has left
+/// the ground they cover**.
+///
+/// The net ([`crate::tiles::WARM_ANCESTOR_STEPS`]) is the only ancestor level
+/// anything ever fetches: [`HttpsTiles::ground_at`] asks for the drawn level
+/// alone, so the levels between it and the net are never requested by anyone
+/// and are resident only where a session happened to draw them. That makes one
+/// net cell the whole of what stands between a cell and a hole, and
+/// [`HttpsTiles::cached_or_interpolated`] answers `None` — a blank cell, not a
+/// blurry one — the moment it is gone.
+///
+/// And it goes, because the LRU cannot see what it is worth. A net cell covers
+/// `2^WARM_ANCESTOR_STEPS` drawn cells on a side — 256 of them — and ages at
+/// exactly the rate of the one drawn cell next to it in the recency list. Once
+/// the span moves off it nothing touches it again, and a pan turns over a
+/// screenful of drawn cells per screen: measured on the loopback pin, a net
+/// cell was evicted three window-widths after the window left it, and the
+/// return to that ground drew **144 of 144 cells blank** with no ancestor
+/// resident at any level.
+///
+/// So the cells the net has covered are refreshed as a *use* once per pass
+/// ([`HttpsTiles::note_wanted`]) while they remain resident. This costs no
+/// fetch and no byte: the entries are already held, and the budget still binds
+/// the same total — what changes is which entries the trim reaches first, and
+/// it now reaches a drawn cell of last screen's history before a net cell
+/// covering forty screens of ground.
+///
+/// Sixteen because that is a 4x4 block of net cells, 64 drawn cells on a side:
+/// about five screen-widths of pan in any direction from where the viewport
+/// has been, against a 1920x1200 pane's 12x8 drawn span. The price is sixteen
+/// entries of *drawn history* — the cache's own economy, which
+/// [`WORKING_SET_REUSE_MULTIPLE`] sizes at one screen — and the floor holds the
+/// glass whatever this does. Nothing is pinned: an entry here is refreshed, not
+/// exempted, so a budget too small to hold it still lets it go.
+const RETAINED_NET_CELLS: usize = 16;
 
 /// Said once per run, when [`ReadFailureRun::answered`] ends one. Named
 /// because both arms of the serve loop's success path say it.
@@ -1737,6 +1773,13 @@ pub struct HttpsTiles {
     /// the next pass asks for them first. See [`AskQueue`].
     asks: AskQueue,
 
+    /// The ancestor-net cells [`Self::warm`] has asked for, most recent first
+    /// and bounded at [`RETAINED_NET_CELLS`] — the set [`Self::note_wanted`]
+    /// refreshes once per pass so a net cell the viewport has moved off does
+    /// not age out behind the drawn cells that replaced it. See
+    /// [`RETAINED_NET_CELLS`].
+    warm_history: VecDeque<TileId>,
+
     /// Where this source stands on the tile-sharpness rung, stepped once per
     /// pass by [`Self::snap_for_pass`]. See [`snap`].
     snap: snap::SnapState,
@@ -2690,6 +2733,7 @@ impl HttpsTiles {
             bodies: None,
             wanted: WantedTally::default(),
             asks: AskQueue::default(),
+            warm_history: VecDeque::with_capacity(RETAINED_NET_CELLS),
             snap: snap::SnapState::default(),
             whole_zoom_rung: false,
             unsnapped: WantedTally::default(),
@@ -2930,8 +2974,8 @@ impl HttpsTiles {
     /// `ui_map_overlays::draw_tile_layer`, after the net is asked for and
     /// before the grid is walked.
     ///
-    /// Two things happen here, because this is the one per-pass hook a source
-    /// has that knows where in the pass it is. **The floor**: the cache is
+    /// Three things happen here, because this is the one per-pass hook a
+    /// source has that knows where in the pass it is. **The floor**: the cache is
     /// told to hold the larger of the last completed pass's total and this
     /// pass's running total, plus [`MAX_PARALLEL_DOWNLOADS`] for the markers
     /// of requests in flight for it — so a window that grows is held from
@@ -2940,6 +2984,10 @@ impl HttpsTiles {
     /// are asked for now, in the order they were refused, before this pass's
     /// walk reaches its own head — the fix for a tail that was never asked.
     /// See [`AskQueue`] for why the order and not the depth is what moves.
+    /// **The retained net**: the cells [`Self::warm`] covered on earlier
+    /// passes are touched, so the one ancestor level anything fetches is not
+    /// aged out by the drawn cells that replaced it — see
+    /// [`RETAINED_NET_CELLS`].
     ///
     /// The floor counts entries and the budget counts bytes: while the
     /// working set costs more than the budget the difference is the
@@ -2949,13 +2997,15 @@ impl HttpsTiles {
     /// **The budget follows too**, and this is the hook that moves it: the
     /// allowance is a ceiling and the working set is what the cache is
     /// actually sized for ([`Self::apply_styled_budget`]). Integers over
-    /// fields this call already touched — no allocation and no eviction, both
-    /// of which the byte LRU defers.
+    /// fields this call already touched, plus at most [`RETAINED_NET_CELLS`]
+    /// cache probes — no allocation and no eviction, both of which the byte
+    /// LRU defers.
     pub(crate) fn note_wanted(&mut self, pass_nr: u64, on_glass: usize, net: usize) {
         if self.wanted.note(pass_nr, on_glass, net) {
             self.asks.new_pass();
         }
         self.cache.set_pass(pass_nr);
+        self.refresh_warm_history();
         let floor = self.wanted.floor().saturating_add(MAX_PARALLEL_DOWNLOADS);
         self.cache.set_floor_entries(floor);
         self.apply_styled_budget();
@@ -3714,8 +3764,17 @@ impl HttpsTiles {
                 });
             }
 
-            // Out of ancestors: nothing to draw for this tile yet.
-            zoom_candidate = zoom_candidate.checked_sub(1)?;
+            // Out of ancestors: nothing to draw for this cell — a hole on the
+            // glass, and the one thing the ledger could not see until it
+            // counted this. Only the exhausted walk counts: an id off the
+            // world, or a source whose header has not landed, are `ground_at`'s
+            // own `None`s and are not a cell that lost its ink. See
+            // [`cache_ledger::Totals::blank_cells`].
+            let Some(shallower) = zoom_candidate.checked_sub(1) else {
+                self.cache.note(cache_ledger::CacheEvent::BlankCell);
+                break None;
+            };
+            zoom_candidate = shallower;
         }
     }
 
@@ -3772,6 +3831,43 @@ impl HttpsTiles {
             return;
         }
         self.request_once(tile_id);
+        self.remember_warm(tile_id);
+    }
+
+    /// Hold `tile_id` in [`Self::warm_history`] as the most recent net cell,
+    /// dropping the oldest past [`RETAINED_NET_CELLS`]. A linear scan over
+    /// sixteen ids, once per net cell per pass — four of them on a
+    /// 1920x1200 pane, beside the same pass's ninety-six `ground_at` calls.
+    fn remember_warm(&mut self, tile_id: TileId) {
+        if let Some(at) = self.warm_history.iter().position(|held| *held == tile_id) {
+            self.warm_history.remove(at);
+        }
+        self.warm_history.push_front(tile_id);
+        while self.warm_history.len() > RETAINED_NET_CELLS {
+            self.warm_history.pop_back();
+        }
+    }
+
+    /// Touch every net cell [`Self::warm_history`] still holds, so the LRU
+    /// dates it from this pass rather than from the pass the viewport last
+    /// drew over its ground — the whole of [`RETAINED_NET_CELLS`].
+    ///
+    /// A cell no longer resident is dropped rather than re-asked: this
+    /// retains what the session already fetched and never resurrects it, so
+    /// the pass sends no request it would not have sent anyway. Called from
+    /// [`Self::note_wanted`], which is after the current span's own net has
+    /// been warmed and before the walk, so the glass is still the most recent
+    /// thing in the cache when the pass ends.
+    fn refresh_warm_history(&mut self) {
+        let mut at = 0;
+        while at < self.warm_history.len() {
+            let tile_id = self.warm_history[at];
+            if self.cache.get(&tile_id).is_some() {
+                at += 1;
+            } else {
+                self.warm_history.remove(at);
+            }
+        }
     }
 
     /// The source's deepest zoom, so a consumer picking its own zoom level
@@ -4367,6 +4463,7 @@ impl HttpsTiles {
             bodies: frame_bodies,
             wanted: WantedTally::default(),
             asks: AskQueue::default(),
+            warm_history: VecDeque::with_capacity(RETAINED_NET_CELLS),
             snap: snap::SnapState::default(),
             whole_zoom_rung: false,
             unsnapped: WantedTally::default(),
@@ -4450,6 +4547,7 @@ impl HttpsTiles {
             bodies: None,
             wanted: WantedTally::default(),
             asks: AskQueue::default(),
+            warm_history: VecDeque::with_capacity(RETAINED_NET_CELLS),
             snap: snap::SnapState::default(),
             whole_zoom_rung: false,
             unsnapped: WantedTally::default(),

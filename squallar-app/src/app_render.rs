@@ -626,7 +626,16 @@ fn ground_tile_line(t: &squallar_egui::tile_mesh::ledger::Totals) -> String {
 /// tracking it is the cache dropping the glass. `duplicate` and `orphan` are the two
 /// shapes of a body fetched for nothing. `entries`, `B resident` and `parsed`
 /// are levels and go down; `B` figures are the lower bound the slot can price
-/// today. `snap` is a level too, `1` while the tile-sharpness rung holds the
+/// today. `blank cells` is a counter and it is last, after the levels, rather
+/// than beside the counters it belongs with: every reader of this line is
+/// positional (`drive.py`'s `tile_cache_re` and `native_row.py`'s own arm), so
+/// a figure appended costs one group and a figure inserted renumbers every
+/// group after it. It counts **grid cells a pass could draw nothing at all
+/// for** — neither the tile nor any ancestor of it resident, which is the
+/// vanishing basemap tile as the user sees it — and its denominator is cells
+/// walked, not tiles: read it against `wanted on glass`, which is one pass's
+/// worth of the same walk, and never against `asks` or `puts`, which count
+/// tiles. `snap` is a level too, `1` while the tile-sharpness rung holds the
 /// role's source at the whole zoom below the fractional one
 /// (`squallar_egui::tile_source::snap`), else `0`.
 ///
@@ -642,7 +651,7 @@ fn tile_cache_line(
          {} of them still wanted, {} puts first, {} restyle, {} duplicate, \
          {} orphan, {} evicted pending, {} evicted resident of {} B, \
          {} entries, {} B resident, {} parsed, snap {}, floor {} entries, \
-         {} B overrun, {} wanted on glass, {} wanted net",
+         {} B overrun, {} wanted on glass, {} wanted net, {} blank cells",
         role.label(),
         t.requests,
         t.restyle_asks,
@@ -663,6 +672,7 @@ fn tile_cache_line(
         t.overrun_bytes,
         t.wanted_on_glass,
         t.wanted_net,
+        t.blank_cells,
     )
 }
 

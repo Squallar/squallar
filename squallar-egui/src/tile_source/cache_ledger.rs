@@ -159,6 +159,9 @@ pub enum CacheEvent {
         kind: EvictedKind,
         bytes: u64,
     },
+    /// One grid cell a pass could draw **nothing** for. See
+    /// [`Totals::blank_cells`].
+    BlankCell,
 }
 
 /// A reading of one role, taken together.
@@ -218,6 +221,25 @@ pub struct Totals {
     pub evicted_pending: u64,
     pub evicted_resident: u64,
     pub evicted_bytes: u64,
+    /// **Cells a pass drew as a hole** — one per `HttpsTiles::ground_at` that
+    /// found neither the tile nor any ancestor of it resident, which is the
+    /// vanishing basemap tile as the user sees it.
+    ///
+    /// The denominator is **grid cells walked, not tiles**: `draw_tile_layer`
+    /// calls `ground_at` once per cell per pass per pane, so a pane blank for
+    /// ten passes counts its span ten times. Read it against `wanted on
+    /// glass`, which is that same walk's cell count for one pass, and never
+    /// against `asks` or `puts`, which count tiles.
+    ///
+    /// **Why it is here and not in a draw counter.** The only ancestor level
+    /// anything ever fetches is the net at
+    /// [`crate::tiles::WARM_ANCESTOR_STEPS`]; every level between it and the
+    /// drawn one is resident by accident or not at all, so this is what a net
+    /// cell's eviction looks like from the glass, and until this counter
+    /// existed that eviction was invisible to every figure the ledger
+    /// published. It is one `fetch_add` on the miss path and none on the hit
+    /// path.
+    pub blank_cells: u64,
     /// A level: slots held right now, markers included.
     pub resident_entries: u64,
     /// A level: what those slots are charged, every entry at least the
@@ -280,6 +302,7 @@ impl Totals {
                 self.evicted_resident += 1;
                 self.evicted_bytes += bytes;
             }
+            CacheEvent::BlankCell => self.blank_cells += 1,
         }
     }
 
@@ -304,6 +327,7 @@ impl Totals {
             .wrapping_add(self.puts())
             .wrapping_add(self.evicted())
             .wrapping_add(self.evicted_bytes)
+            .wrapping_add(self.blank_cells)
     }
 
     /// The windowed reading between two snapshots: counters subtracted,
@@ -327,6 +351,7 @@ impl Totals {
                 .evicted_resident
                 .saturating_sub(earlier.evicted_resident),
             evicted_bytes: self.evicted_bytes.saturating_sub(earlier.evicted_bytes),
+            blank_cells: self.blank_cells.saturating_sub(earlier.blank_cells),
             resident_entries: self.resident_entries,
             resident_bytes: self.resident_bytes,
             overrun_bytes: self.overrun_bytes,
@@ -353,6 +378,7 @@ struct RoleLedger {
     evicted_pending: AtomicU64,
     evicted_resident: AtomicU64,
     evicted_bytes: AtomicU64,
+    blank_cells: AtomicU64,
     resident_entries: AtomicU64,
     resident_bytes: AtomicU64,
     overrun_bytes: AtomicU64,
@@ -380,6 +406,7 @@ impl RoleLedger {
             evicted_pending: AtomicU64::new(0),
             evicted_resident: AtomicU64::new(0),
             evicted_bytes: AtomicU64::new(0),
+            blank_cells: AtomicU64::new(0),
             resident_entries: AtomicU64::new(0),
             resident_bytes: AtomicU64::new(0),
             overrun_bytes: AtomicU64::new(0),
@@ -470,6 +497,7 @@ pub fn note(role: CacheRole, event: CacheEvent) {
             ledger.evicted_bytes.fetch_add(bytes, Relaxed);
             ledger.evicted_resident.fetch_add(1, Relaxed)
         }
+        CacheEvent::BlankCell => ledger.blank_cells.fetch_add(1, Relaxed),
     };
 }
 
@@ -561,6 +589,7 @@ pub fn totals(role: CacheRole) -> Totals {
         evicted_pending: ledger.evicted_pending.load(Relaxed),
         evicted_resident: ledger.evicted_resident.load(Relaxed),
         evicted_bytes: ledger.evicted_bytes.load(Relaxed),
+        blank_cells: ledger.blank_cells.load(Relaxed),
         resident_entries: ledger.resident_entries.load(Relaxed),
         resident_bytes: ledger.resident_bytes.load(Relaxed),
         overrun_bytes: ledger.overrun_bytes.load(Relaxed),
