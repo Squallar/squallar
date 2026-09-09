@@ -3117,6 +3117,11 @@ mod cached_render_census_tests;
 #[cfg(test)]
 mod fan_sweep_tests;
 
+/// What one still plan-view entry costs the cache, on a sweep the shape a
+/// WSR-88D delivers — the `render cache` census family's own denominator.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod still_entry_price_tests;
+
 // Native-only, like the gated renders it is built on: `Job::Opaque` and the
 // offload pool's threads have no wasm arm.
 #[cfg(all(test, not(target_arch = "wasm32")))]
