@@ -3200,6 +3200,19 @@ impl HttpsTiles {
         self.cache.contains(&tile_id) || self.asks.queued.contains(&tile_id)
     }
 
+    /// How many refused asks the queue is holding right now.
+    ///
+    /// The queue's other half. [`Self::asked_or_queued_for_test`] says a
+    /// refusal was *recorded*; this says it was handed back out. A source that
+    /// records a refusal and never retries it reads identically to a healthy
+    /// one from every other counter in this file — the walk re-offers the cell
+    /// next pass and the grid fills anyway — and leaves a queue that only
+    /// grows.
+    #[cfg(test)]
+    pub(crate) fn refused_asks_for_test(&self) -> usize {
+        self.asks.len()
+    }
+
     /// Ask for the cells the channel refused, oldest first, until it refuses
     /// again. A refused cell goes back to the front so the order holds; a cell
     /// that has since arrived or been asked for by another route is simply

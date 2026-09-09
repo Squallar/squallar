@@ -2010,18 +2010,51 @@ fn a_working_set_the_budget_cannot_hold_is_held_by_the_floor_and_refetches_nothi
     }
 }
 
-/// **Every visible cell is asked for, and within the channel's worth of
-/// passes.** The request channel holds seven; a 144-cell walk asks for seven
-/// a pass and is refused the rest, and before the refused-ask queue the
-/// walk's head took the seven every pass while cells at the tail were never
-/// asked at all — 10-20 of 144 in 120 frames at the old cap, the second
-/// "broken on web" mechanism beside the eviction churn. Now the refused cells
-/// are asked for first next pass, in the order they were refused, so a cell
-/// reaches the channel within `ceil(144 / 7)` = 21 passes of asking. The bound
-/// asserted is looser than that arithmetic — the IO thread has to take the
-/// channel between passes, and a loaded box takes longer — but it is the
-/// property that counts: every cell asked, and long before the 120 passes
-/// that used to leave a tenth of them unasked.
+/// **Every visible cell is asked for, and no ask is ever spent twice.** The
+/// request channel holds seven; a 144-cell walk asks for seven a pass and is
+/// refused the rest, and before the refused-ask queue the walk's head took
+/// the seven every pass while cells at the tail were never asked at all —
+/// 10-20 of 144 in 120 frames at the old cap, the second "broken on web"
+/// mechanism beside the eviction churn. Now the refused cells are asked for
+/// first next pass, in the order they were refused.
+///
+/// **What this asserted before was the box.** The gate was
+/// `asked <= GRID_FRAMES / 2` — the number of *passes* the walk took to cover
+/// the grid, against 60 — and a pass count here is a clock. A pass can push
+/// only as many asks as the IO task has freed channel slots for since the
+/// last one, so the figure is the loopback server's own rate divided by the
+/// pass rate and nothing else. Answering that server 12 ms slower reads 68,
+/// 69, 70, 70 and 71 passes over five runs, on a tree that asked for all 144
+/// cells exactly once, refetched nothing, and covered the grid. A loaded box
+/// does the same thing to it more slowly, which is how a correct tree
+/// red-gated a peer.
+///
+/// **And it was not gating the queue.** With `request_once` no longer
+/// recording a refusal at all — the pre-queue behaviour, the whole defect
+/// this test is named for — the old bound read pass 22 against its 60 and
+/// passed, and so did the other 1,960 tests in this binary; so did a build
+/// whose `retry_refused_asks` returns without popping anything. The bound
+/// could fail, and did; it just could not fail for its own reason. Both
+/// halves of the queue were ungated.
+///
+/// So the queue is asserted where it lives, in counts:
+///
+/// * **One pass speaks for the whole grid.** Every one of the 144 cells is
+///   either asked for (a marker in the cache) or queued to be asked first
+///   next pass. Nothing has to have been drained for this to hold — the walk
+///   records the refusal itself — so it reads the same on any box, and it is
+///   the one thing a source that forgets its refusals cannot do.
+/// * **The queue hands them back.** One pass after the grid is covered it
+///   holds nothing: every cell it took in came out again. The retry is
+///   invisible to every other counter here, because the walk re-offers a
+///   forgotten cell next pass and the grid fills anyway.
+/// * **No ask is spent twice.** At the moment the last of the 144 cells
+///   reaches the server, the source has issued exactly 144 asks and the
+///   server has logged exactly 144 arrivals. That is the strongest form of
+///   "within the channel's worth of passes" there is without a clock: the
+///   channel's worth is `ceil(144 / 7)` = 21 passes precisely when no pass
+///   spends its room on a cell already asked for, and a pass that is handed
+///   no room is the box being slow rather than the tail being starved.
 #[test]
 fn every_visible_cell_is_asked_within_the_channels_worth_of_passes() {
     let server = TileServer::start(Behaviour::Serve(Arc::new(fixture_png())));
@@ -2029,7 +2062,30 @@ fn every_visible_cell_is_asked_within_the_channels_worth_of_passes() {
     let mut tiles = loopback_tiles_with_budget(&server, &ctx, BUDGET_FOR_200);
     let ideal = GRID_CELLS.div_ceil(MAX_PARALLEL_DOWNLOADS as u64 + 1);
 
-    let mut pass = 0u64;
+    // One pass, and every cell is spoken for. The channel took the seven it
+    // had room for and the queue holds the rest, and neither half of that
+    // waits on anything: the walk records the refusal as it makes it.
+    let mut pass = 1u64;
+    pass_over_grid(&mut tiles, pass, GRID_SIDE, GRID_ZOOM);
+    let mut unspoken = 0u64;
+    for y in 0..GRID_SIDE {
+        for x in 0..GRID_SIDE {
+            if !tiles.asked_or_queued_for_test(TileId {
+                x,
+                y,
+                zoom: GRID_ZOOM,
+            }) {
+                unspoken += 1;
+            }
+        }
+    }
+    assert_eq!(
+        unspoken, 0,
+        "one pass over the grid left {unspoken} of {GRID_CELLS} cells neither asked for nor \
+         queued to be asked: the channel refused them and the source forgot, which is the tail \
+         going unasked"
+    );
+
     let all_asked = pump_until(DEFAULT_TIMEOUT, || {
         pass += 1;
         pass_over_grid(&mut tiles, pass, GRID_SIDE, GRID_ZOOM);
@@ -2049,17 +2105,33 @@ fn every_visible_cell_is_asked_within_the_channels_worth_of_passes() {
         "every cell of a {GRID_SIDE}x{GRID_SIDE} grid was asked for by pass {asked} (the channel \
          alone allows {ideal}): {stats:?}"
     );
-    assert!(
-        asked <= GRID_FRAMES as u64 / 2,
-        "every cell was asked for only by pass {asked}, against {ideal} the channel allows and \
-         the {GRID_FRAMES} that used to leave the tail unasked: the refused-ask queue is not \
-         serving the tail first"
-    );
     assert_eq!(
         stats.requests, GRID_CELLS,
-        "each cell asked for once: {stats:?}"
+        "covering the grid took {} asks for {GRID_CELLS} cells, so a pass spent the channel's \
+         room on a cell it had already asked for while another waited: {stats:?}",
+        stats.requests
+    );
+    assert_eq!(
+        server.request_count() as u64,
+        GRID_CELLS,
+        "the server logged {} arrivals for {GRID_CELLS} cells covered: {stats:?}",
+        server.request_count()
     );
     assert_eq!(stats.refetch_after_eviction, 0, "{stats:?}");
+
+    // Every cell is asked for now, so a pass that retries the queue empties
+    // it: each cell it pops has a marker and needs no send. Nothing about this
+    // waits — the drain is the same call the pass boundary always makes.
+    pass += 1;
+    pass_over_grid(&mut tiles, pass, GRID_SIDE, GRID_ZOOM);
+    assert_eq!(
+        tiles.refused_asks_for_test(),
+        0,
+        "the queue still holds {} refused asks for a grid every cell of which has been asked \
+         for, so it records refusals and never hands them back: the tail is served by the walk \
+         re-offering it and not by the queue",
+        tiles.refused_asks_for_test()
+    );
 }
 
 /// **The control**: the same walk over a cap the working set fits in evicts
@@ -5521,10 +5593,40 @@ fn the_demand_cap_never_wedges_the_sharpness_rung() {
     );
 }
 
+/// The level the sweeps below pan across. Deeper than [`GRID_ZOOM`] for one
+/// reason: the world has to be wider than any sweep can cross inside
+/// [`DEFAULT_TIMEOUT`]. A cell past the east edge is not asked for at all
+/// (`tile_id_is_valid`) and is not counted as a hole either, so a sweep that
+/// ran out of columns would quietly become a window that stopped moving —
+/// 2^14 columns against the few thousand passes the deadline affords.
+const SWEEP_ZOOM: u8 = 14;
+
+/// What [`sweep_until`] does when it has run the whole sweep and `enough` is
+/// still not true.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Again {
+    /// Cover the same ground again. The static window never moved, and the
+    /// reversing sweep's whole subject is ground it returns to, so repeating
+    /// either changes nothing about what it is.
+    Same,
+    /// Carry on past the far end, a whole sweep-length further east each time.
+    ///
+    /// **The one-way arms need this and repeating destroyed them.** Their
+    /// premise is that they never return to a cell, and restarting at the west
+    /// edge is a return — the largest one the fixture can make. Answering the
+    /// fixture's own server 12 ms slower is enough to keep `enough` false
+    /// through a first traversal, and a correct tree then read 42-62
+    /// `refetch after eviction` on `east, a column a pass`, the arm whose
+    /// assertion is that it reads none. The instrument printed `sweep cycle 2
+    /// finished at pass 240` on the run that says so. Under load the box
+    /// starves the arrivals the same way.
+    Onward,
+}
+
 /// Slide a window along `sweep`'s west edges, **without waiting for anything
 /// to land** — what a drag gesture is — walking the whole sweep at least
-/// once and then cycling it until `enough` is true of the source's counters.
-/// Answers whether it ever was.
+/// once and then continuing it, as `again` says to, until `enough` is true of
+/// the source's counters. Answers whether it ever was.
 ///
 /// The whole sweep first, because the sweep *is* the gesture: a reversing
 /// sweep that stopped early would never have reversed, and the arms below
@@ -5538,25 +5640,48 @@ fn the_demand_cap_never_wedges_the_sharpness_rung() {
 /// contended box reaches the end of the sweep having landed a quarter of what
 /// an idle one does. What must not vary is the property the reading needs —
 /// that the cache filled and overflowed — so that is what is waited on.
+///
+/// **And what the continuation must not vary is the gesture.** How many
+/// traversals it takes to reach `enough` is the box's business; whether the
+/// window ever turns round is the caller's claim about its own arm. See
+/// [`Again`].
 fn sweep_until(
     tiles: &mut HttpsTiles,
     sweep: &[u32],
+    again: Again,
     enough: impl Fn(&cache_ledger::Totals) -> bool,
 ) -> bool {
     let deadline = Instant::now() + DEFAULT_TIMEOUT;
+    let length = sweep
+        .iter()
+        .max()
+        .copied()
+        .expect("a sweep has at least one west edge")
+        + 1;
+    let world = 1u32 << SWEEP_ZOOM;
     let mut pass = 0u64;
     let mut cycles = 0u32;
     loop {
+        let offset = match again {
+            Again::Same => 0,
+            Again::Onward => cycles * length,
+        };
+        assert!(
+            offset + length + PAN_SIDE <= world,
+            "the sweep ran east off the world after {cycles} lengths of {length}, and a cell \
+             past the edge is neither asked for nor counted as a hole: what follows would be a \
+             reading on a window that had stopped moving"
+        );
         for &x0 in sweep {
             pass += 1;
-            pass_over_window(tiles, pass, x0, PAN_SIDE, GRID_ZOOM);
+            pass_over_window(tiles, pass, x0 + offset, PAN_SIDE, SWEEP_ZOOM);
             std::thread::sleep(Duration::from_millis(2));
             if Instant::now() >= deadline {
                 return false;
             }
         }
         cycles += 1;
-        if cycles >= 1 && enough(&tiles.cache_stats()) {
+        if enough(&tiles.cache_stats()) {
             return true;
         }
     }
@@ -5586,6 +5711,19 @@ fn sweep_until(
 /// reversing sweep does read come from the reversal and not from the eviction
 /// count.
 ///
+/// **That control was the box, not the cache, and it is what went red under
+/// load.** `refetch_still_wanted` — this test's own subject, the assertion its
+/// name is about — read 0 on every arm of every failing run. What failed was
+/// `east, a column a pass` reading 42-62 refetches against its 0, because
+/// [`sweep_until`] used to *restart* a sweep that had not yet reached the
+/// eviction floor, and restarting a one-way sweep at its west edge is the
+/// largest return to left ground the fixture can make. So the arm that
+/// asserts "a sweep that never returns to a cell refetched one" was gated on
+/// the box being fast enough to evict 108 cells inside a single traversal.
+/// Answering the fixture's own server 12 ms slower takes that away five times
+/// out of five, on a tree nothing is wrong with. [`Again`] is the repair: the
+/// number of traversals is still the box's business, the direction is not.
+///
 /// **Shown red.** With the working-set floor removed (`set_floor_entries(0)`)
 /// and the budget put under one window's cells, the *static* sweep alone —
 /// the arm that reads nothing at all on a healthy tree — reads 247 asks, 211
@@ -5599,17 +5737,18 @@ fn a_refetch_a_reversing_pan_earns_is_never_a_cell_that_stayed_on_the_glass() {
     // West edges: a static window, two one-way sweeps at different speeds,
     // and one that reverses. Only the last returns to ground it left.
     let reversing: Vec<u32> = (0..40).chain((0..40).rev()).chain(0..40).collect();
-    let sweeps: [(&str, Vec<u32>); 4] = [
-        ("static", vec![0; 40]),
-        ("east, a column a pass", (0..120).collect()),
+    let sweeps: [(&str, Vec<u32>, Again); 4] = [
+        ("static", vec![0; 40], Again::Same),
+        ("east, a column a pass", (0..120).collect(), Again::Onward),
         (
             "east, three columns a pass",
             (0..120).map(|i| i * 3).collect(),
+            Again::Onward,
         ),
-        ("east 40, back west, east again", reversing),
+        ("east 40, back west, east again", reversing, Again::Same),
     ];
 
-    for (name, sweep) in sweeps {
+    for (name, sweep, again) in sweeps {
         let server = TileServer::start(Behaviour::Serve(Arc::new(fixture_png())));
         let ctx = Context::default();
         let mut tiles = loopback_tiles_with_budget(&server, &ctx, ALLOWANCE_FOR_EVERYTHING);
@@ -5629,7 +5768,7 @@ fn a_refetch_a_reversing_pan_earns_is_never_a_cell_that_stayed_on_the_glass() {
                 s.evicted() > 3 * PAN_CELLS
             }
         };
-        let reached = sweep_until(&mut tiles, &sweep, enough);
+        let reached = sweep_until(&mut tiles, &sweep, again, enough);
 
         let stats = tiles.cache_stats();
         eprintln!(
@@ -5692,7 +5831,7 @@ fn a_refetch_a_reversing_pan_earns_is_never_a_cell_that_stayed_on_the_glass() {
     let mut tiles = loopback_tiles_with_budget(&server, &ctx, ALLOWANCE_FOR_EVERYTHING);
     let reversing: Vec<u32> = (0..40).chain((0..40).rev()).collect();
     let many = |s: &cache_ledger::Totals| s.refetch_after_eviction > 2 * PAN_CELLS;
-    let reached = sweep_until(&mut tiles, &reversing, many);
+    let reached = sweep_until(&mut tiles, &reversing, Again::Same, many);
     let stats = tiles.cache_stats();
     eprintln!("[reversing, driven to the web leg's shape]: {stats:?}");
     assert!(
