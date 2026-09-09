@@ -5916,7 +5916,8 @@ fn a_pan_back_onto_ground_it_left_draws_an_ancestor_where_it_drew_a_hole() {
     // Control 2, second half: every cell drew, and every one of them drew from
     // an ancestor rather than from its own tile.
     assert_eq!(
-        stretched, RETURN_CELLS,
+        stretched,
+        RETURN_CELLS,
         "{} of {RETURN_CELLS} cells drew from their own tile, so the cache held the origin's \
          drawn level after all and the zero above is not the net's doing: {after:?}",
         RETURN_CELLS - stretched,
@@ -5927,7 +5928,8 @@ fn a_pan_back_onto_ground_it_left_draws_an_ancestor_where_it_drew_a_hole() {
          RETAINED_NET_CELLS exists to stop: {before:?}"
     );
     assert_eq!(
-        after.blank_cells, before.blank_cells,
+        after.blank_cells,
+        before.blank_cells,
         "the return pass counted {} blank cells against the {} the outbound pan left, so the \
          hole is still there and only the assertions above missed it",
         after.blank_cells - before.blank_cells,
