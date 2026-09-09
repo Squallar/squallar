@@ -124,6 +124,13 @@ struct Kept {
     key: LabelKey,
     labels: Vec<walkers::Text>,
     mesh: Option<Arc<egui::Mesh>>,
+    /// The same mesh with a painter opacity already multiplied in, and the
+    /// factor it was multiplied by. Empty at full opacity, which is what the
+    /// layer draws at unless a user has moved its slider, so a pane that never
+    /// dims its names never holds a second mesh at all. Dropped with the entry
+    /// it sits in, so a new solve — or a moved atlas — retints rather than
+    /// re-serving.
+    tinted: crate::point_painter::TintMemo,
 }
 
 /// The place-name solve each pane last made, kept between frames.
@@ -166,6 +173,36 @@ impl LabelCache {
         self.hits += 1;
         // A refcount bump on geometry that is already tessellated.
         Some(kept.mesh.clone())
+    }
+
+    /// Paint this pane's kept mesh through `painter`.
+    ///
+    /// Here rather than at the call site because the painter's opacity is
+    /// multiplied into a copy that lives in the entry, and that copy is made
+    /// once per factor instead of once per frame; see
+    /// [`crate::point_painter::add_kept_mesh`] for why `Painter::add` cannot
+    /// do it without deep-cloning the mesh the memo is holding, and for the
+    /// argument that doing it here is the same picture.
+    pub(crate) fn paint(
+        &mut self,
+        pane: usize,
+        painter: &egui::Painter,
+        mesh: Option<Arc<egui::Mesh>>,
+    ) {
+        let Some(mesh) = mesh else {
+            return;
+        };
+        // The entry is looked up again only when there is a tint to keep in
+        // it, so a pane at full opacity pays the `Painter::add` it always paid
+        // and no more.
+        let Some(kept) = crate::point_painter::tint_wanted(painter)
+            .then(|| self.entries.get_mut(&pane))
+            .flatten()
+        else {
+            painter.add(egui::Shape::Mesh(mesh));
+            return;
+        };
+        crate::point_painter::add_kept_mesh(painter, mesh, &mut kept.tinted);
     }
 
     /// This pane's retired mesh, emptied but keeping its buffers, for the
@@ -214,7 +251,15 @@ impl LabelCache {
         mesh: Option<Arc<egui::Mesh>>,
     ) {
         self.solves += 1;
-        self.entries.insert(pane, Kept { key, labels, mesh });
+        self.entries.insert(
+            pane,
+            Kept {
+                key,
+                labels,
+                mesh,
+                tinted: None,
+            },
+        );
     }
 
     /// Label sets solved — one per list-and-raster the pane walk has seen.

@@ -1142,10 +1142,13 @@ impl RunCursor {
 /// argument that nothing else can still be holding them lives.
 ///
 /// Placed under the pane's own painter, so the clip and the layer opacity
-/// still reach it exactly as they reached the shapes. Below full opacity that
-/// tint is `Arc::make_mut` on the kept mesh once a frame — the same known
-/// per-frame cost [`crate::point_painter::PointTextMeshes`] carries, bounded
-/// by the pane's own labels, and not fixed here.
+/// still reach it exactly as they reached the shapes. **Below full opacity the
+/// tint is made once per factor rather than once per frame**, because
+/// `Painter::add` tints a `Shape::Mesh` through `Arc::make_mut` and a memo
+/// still holding the `Arc` turns that into a deep clone of the whole mesh on
+/// every frame; [`LabelCache::paint`](crate::label_cache::LabelCache::paint)
+/// and [`crate::point_painter::add_kept_mesh`] carry the argument that doing
+/// it there is the same picture.
 pub(super) fn paint_labels(
     painter: &egui::Painter,
     labels: Vec<walkers::Text>,
@@ -1171,9 +1174,7 @@ pub(super) fn paint_labels(
             mesh
         }
     };
-    if let Some(mesh) = mesh {
-        painter.add(egui::Shape::Mesh(mesh));
-    }
+    cache.paint(pane_idx, painter, mesh);
 }
 
 /// The label phase itself: lay every name out, and hand back the shapes that

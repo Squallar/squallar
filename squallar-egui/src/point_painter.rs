@@ -217,6 +217,11 @@ pub(crate) struct PointTextMeshes {
 struct Kept {
     key: PointTextKey,
     mesh: Option<Arc<egui::Mesh>>,
+    /// The same mesh with a painter opacity already multiplied in. Every
+    /// gridded layer's default opacity is below 1.0
+    /// (`squallar_source::product::REFLECTIVITY_DEFAULT_OPACITY`), so this is
+    /// the shipped case here and not the slider case. See [`add_kept_mesh`].
+    tinted: TintMemo,
 }
 
 impl PointTextMeshes {
@@ -243,8 +248,38 @@ impl PointTextMeshes {
         mesh: Option<Arc<egui::Mesh>>,
     ) {
         self.builds += 1;
-        self.entries
-            .insert((pane, layer.clone()), Kept { key, mesh });
+        self.entries.insert(
+            (pane, layer.clone()),
+            Kept {
+                key,
+                mesh,
+                tinted: None,
+            },
+        );
+    }
+
+    /// Paint this pane-and-layer's kept mesh through `painter`, tinting once
+    /// per opacity rather than once per frame; see [`add_kept_mesh`].
+    ///
+    /// The entry is looked up again only when there is a tint to keep in it.
+    pub(crate) fn paint(
+        &mut self,
+        pane: usize,
+        layer: &LayerId,
+        painter: &egui::Painter,
+        mesh: Option<Arc<egui::Mesh>>,
+    ) {
+        let Some(mesh) = mesh else {
+            return;
+        };
+        let Some(kept) = tint_wanted(painter)
+            .then(|| self.entries.get_mut(&(pane, layer.clone())))
+            .flatten()
+        else {
+            painter.add(egui::Shape::Mesh(mesh));
+            return;
+        };
+        add_kept_mesh(painter, mesh, &mut kept.tinted);
     }
 
     /// Meshes built — one per key the pass has seen.
@@ -258,6 +293,85 @@ impl PointTextMeshes {
     pub(crate) fn hits(&self) -> u64 {
         self.hits
     }
+}
+
+/// A kept mesh, and the opacity already multiplied into the copy beside it.
+///
+/// `u32` is `f32::to_bits` of the factor, compared by bits so a slider that
+/// lands on the same number twice is the same tint and `-0.0` is not `0.0`.
+pub(crate) type TintMemo = Option<(u32, Arc<egui::Mesh>)>;
+
+/// Add a kept mesh to `painter`, paying the painter's opacity **once per
+/// opacity** instead of once per frame.
+///
+/// **`Painter::add` cannot tint a kept mesh without copying all of it.** Its
+/// one transform is `multiply_opacity`, which reaches a `Shape::Mesh` through
+/// `epaint::shape_transform::adjust_colors` — and that arm opens with
+/// `Arc::make_mut`. The `Arc` a memo hands over is held by the memo as well,
+/// so `make_mut` is never the in-place case: it deep-clones every vertex and
+/// every index the pane's text has, on every frame, before multiplying a
+/// factor that did not move into colours that did not move.
+///
+/// Doing it here instead is exactly what egui would have done, and the reason
+/// it is exact is that **opacity is the only transform a `Painter::add` can
+/// apply to a mesh**: `Painter::fade_to_color` is assigned in one place in the
+/// whole of egui (`Painter::set_invisible`) and the value is always
+/// `Color32::TRANSPARENT`, which `add` answers with `Shape::Noop` before
+/// `transform_shape` runs. So there is no second transform to commute with and
+/// no order to get wrong.
+///
+/// The two ends egui handles itself are left to it: at `1.0` there is no tint
+/// to make, and at `0.0` `add` emits `Shape::Noop`, which is cheaper than any
+/// mesh and is what the layer walk's "a transparent layer still hit-tests"
+/// behaviour is built on.
+/// Whether [`add_kept_mesh`] would keep a tint for this painter.
+///
+/// Asked by the memos **before** they look their entry up, so a pane at full
+/// opacity — which is what every layer draws at until a user moves its slider
+/// — reaches `Painter::add` through exactly the calls it reached it through
+/// before, and pays nothing for a tint it will not make.
+pub(crate) fn tint_wanted(painter: &egui::Painter) -> bool {
+    let opacity = painter.opacity();
+    opacity > 0.0 && opacity < 1.0
+}
+
+pub(crate) fn add_kept_mesh(painter: &egui::Painter, mesh: Arc<egui::Mesh>, memo: &mut TintMemo) {
+    let opacity = painter.opacity();
+    if !tint_wanted(painter) {
+        painter.add(egui::Shape::Mesh(mesh));
+        return;
+    }
+    let tinted = tinted_mesh(memo, &mesh, opacity);
+    // Set to 1.0 and not left alone: the factor is in the vertices now, and a
+    // painter that still carried it would apply it twice.
+    let mut painter = painter.clone();
+    painter.set_opacity(1.0);
+    painter.add(egui::Shape::Mesh(tinted));
+}
+
+/// `base` with `opacity` multiplied into every vertex colour, from `memo` when
+/// it already holds that factor.
+///
+/// The body is `egui::painter::multiply_opacity`'s closure, including its
+/// `Color32::PLACEHOLDER` guard — a galley painted with an overridden colour
+/// tessellates to placeholder vertices, and egui leaves those for the renderer
+/// rather than scaling them.
+fn tinted_mesh(memo: &mut TintMemo, base: &Arc<egui::Mesh>, opacity: f32) -> Arc<egui::Mesh> {
+    let bits = opacity.to_bits();
+    if let Some((at, mesh)) = memo.as_ref()
+        && *at == bits
+    {
+        return mesh.clone();
+    }
+    let mut mesh = (**base).clone();
+    for v in &mut mesh.vertices {
+        if v.color != egui::Color32::PLACEHOLDER {
+            v.color = v.color.gamma_multiply(opacity);
+        }
+    }
+    let mesh = Arc::new(mesh);
+    *memo = Some((bits, mesh.clone()));
+    mesh
 }
 
 /// One mesh from a pass's collected text shapes, tessellated exactly as egui
@@ -532,6 +646,170 @@ mod tests {
             !PANE.contains("text_only = pf.id == squallar_source::id::known::METAR"),
             "`text_only` is decided by naming a layer; a second layer with a \
              picture would double-draw and nothing would say so",
+        );
+    }
+}
+
+/// **The tint a painter would have applied, applied once instead of once a
+/// frame** — [`add_kept_mesh`]'s gates.
+#[cfg(test)]
+mod tint_tests {
+    use super::*;
+
+    const CANVAS: egui::Rect =
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(400.0, 300.0));
+    /// A layer's shipped opacity, not a round number: every gridded handler
+    /// answers `default_opacity` with
+    /// `squallar_source::product::REFLECTIVITY_DEFAULT_OPACITY`.
+    const DIMMED: f32 = 0.63;
+
+    /// A mesh shaped like the one the caches keep: quads with real colours,
+    /// and one `Color32::PLACEHOLDER` vertex.
+    ///
+    /// The placeholder is the fixture's whole reason for being a fixture and
+    /// not a single quad. `egui::painter::multiply_opacity` skips that colour
+    /// and leaves it for the renderer to substitute; a tint written without
+    /// that guard scales it, and every other vertex in the mesh would still
+    /// agree.
+    fn kept_mesh() -> Arc<egui::Mesh> {
+        let colors = [
+            egui::Color32::WHITE,
+            egui::Color32::from_rgba_unmultiplied(200, 40, 40, 128),
+            egui::Color32::PLACEHOLDER,
+            egui::Color32::from_rgb(10, 90, 200),
+        ];
+        let mut mesh = egui::Mesh::default();
+        for (i, color) in colors.iter().enumerate() {
+            let x = 20.0 + i as f32 * 30.0;
+            let base = mesh.vertices.len() as u32;
+            for (dx, dy) in [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)] {
+                mesh.vertices.push(egui::epaint::Vertex {
+                    pos: egui::pos2(x + dx, 40.0 + dy),
+                    uv: egui::pos2(dx / 64.0, dy / 64.0),
+                    color: *color,
+                });
+            }
+            mesh.indices
+                .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+        assert!(mesh.is_valid(), "fixture: the mesh must be paintable");
+        Arc::new(mesh)
+    }
+
+    /// One pass at `opacity`, tessellated, flattened to the one mesh it drew.
+    fn painted(opacity: f32, draw: impl FnOnce(&egui::Painter)) -> egui::Mesh {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(CANVAS),
+            ..Default::default()
+        });
+        let mut painter = egui::Painter::new(ctx.clone(), egui::LayerId::background(), CANVAS);
+        painter.set_opacity(opacity);
+        draw(&painter);
+        let shapes = ctx.end_pass().shapes;
+        let mut out = egui::Mesh::default();
+        for prim in ctx.tessellate(shapes, ctx.pixels_per_point()) {
+            if let egui::epaint::Primitive::Mesh(m) = prim.primitive {
+                out.append(m);
+            }
+        }
+        out
+    }
+
+    fn describe(m: &egui::Mesh) -> Vec<(egui::Pos2, egui::Pos2, egui::Color32)> {
+        m.vertices.iter().map(|v| (v.pos, v.uv, v.color)).collect()
+    }
+
+    /// **The glass does not move.** What a dimmed painter puts on it through
+    /// [`add_kept_mesh`] is what it put there when `Painter::add` did the
+    /// tinting, vertex for vertex and index for index.
+    ///
+    /// Shown red three ways: by scaling the factor (`opacity * 0.99`), by
+    /// dropping the `PLACEHOLDER` guard, and by leaving the painter's own
+    /// opacity in place so the factor lands twice.
+    #[test]
+    fn a_dimmed_painter_draws_what_it_drew_before() {
+        let mesh = kept_mesh();
+        let by_egui = painted(DIMMED, |p| {
+            p.add(egui::Shape::Mesh(mesh.clone()));
+        });
+        let by_memo = painted(DIMMED, |p| {
+            add_kept_mesh(p, mesh.clone(), &mut None);
+        });
+        assert!(!by_egui.is_empty(), "fixture: egui's arm drew nothing");
+        assert_eq!(describe(&by_memo), describe(&by_egui));
+        assert_eq!(by_memo.indices, by_egui.indices);
+    }
+
+    /// The two ends are egui's, and stay egui's: at 1.0 there is nothing to
+    /// multiply, and at 0.0 `Painter::add` files a `Shape::Noop`, which is
+    /// what the layer walk's transparent-but-still-hit-testing behaviour
+    /// stands on.
+    #[test]
+    fn full_and_zero_opacity_are_left_to_the_painter() {
+        let mesh = kept_mesh();
+        for opacity in [1.0, 0.0] {
+            let by_egui = painted(opacity, |p| {
+                p.add(egui::Shape::Mesh(mesh.clone()));
+            });
+            let mut memo = None;
+            let by_memo = painted(opacity, |p| add_kept_mesh(p, mesh.clone(), &mut memo));
+            assert_eq!(describe(&by_memo), describe(&by_egui), "at {opacity}");
+            assert!(
+                memo.is_none(),
+                "at {opacity} nothing should have been tinted"
+            );
+        }
+    }
+
+    /// **The copy is made once, not once a frame** — which is the whole cut.
+    ///
+    /// Asserted on the identity of the `Arc` the paint list received, not on a
+    /// counter: two frames that hand the painter the same allocation are two
+    /// frames that did not clone the mesh between them. `Painter::add` on the
+    /// kept mesh would have handed over a different one every time, because
+    /// `Arc::make_mut` clones whenever the memo is still holding it.
+    #[test]
+    fn a_second_frame_at_the_same_opacity_reuses_the_tinted_mesh() {
+        let mesh = kept_mesh();
+        let mut memo = None;
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let ctx = egui::Context::default();
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(CANVAS),
+                ..Default::default()
+            });
+            let mut painter = egui::Painter::new(ctx.clone(), egui::LayerId::background(), CANVAS);
+            painter.set_opacity(DIMMED);
+            add_kept_mesh(&painter, mesh.clone(), &mut memo);
+            let shapes = ctx.end_pass().shapes;
+            let egui::Shape::Mesh(m) = &shapes[0].shape else {
+                panic!("a kept mesh must be added as a mesh");
+            };
+            seen.push(Arc::as_ptr(m));
+            let _ = ctx.tessellate(shapes, ctx.pixels_per_point());
+        }
+        assert!(
+            seen.windows(2).all(|w| w[0] == w[1]),
+            "every frame tinted the mesh again: {seen:?}"
+        );
+    }
+
+    /// A moved slider is a new tint, and the old one is not served under it.
+    #[test]
+    fn a_changed_opacity_retints() {
+        let mesh = kept_mesh();
+        let mut memo = None;
+        let dim = painted(DIMMED, |p| add_kept_mesh(p, mesh.clone(), &mut memo));
+        let dimmer = painted(0.25, |p| add_kept_mesh(p, mesh.clone(), &mut memo));
+        assert_ne!(describe(&dim), describe(&dimmer));
+        assert_eq!(
+            describe(&dimmer),
+            describe(&painted(0.25, |p| {
+                p.add(egui::Shape::Mesh(mesh.clone()));
+            })),
+            "the retint must be what the painter would have made"
         );
     }
 }

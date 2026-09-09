@@ -3703,13 +3703,12 @@ fn render_per_frame_overlay(
                 mesh
             }
         };
-        if let Some(mesh) = mesh {
-            // Known per-frame cost: while this layer sits below 1.0 the
-            // painter tints the shape, and `Arc::make_mut` clones the cached
-            // mesh to do it, every frame. Bounded by the layer's own text;
-            // not fixed here.
-            painter.add(egui::Shape::Mesh(mesh));
-        }
+        // The layer's opacity is multiplied into a copy kept beside the mesh,
+        // once per factor. It used to reach the mesh through `Painter::add`,
+        // which tints a `Shape::Mesh` by `Arc::make_mut` — a deep clone of a
+        // mesh the memo is holding, on every frame, at a factor that had not
+        // moved. See `point_painter::add_kept_mesh`.
+        point_text.paint(pf.pane_idx, pf.id, painter, mesh);
     }
 
     if let Some((_, id)) = closest_hover
