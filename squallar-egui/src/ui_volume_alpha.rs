@@ -1,6 +1,7 @@
 //! The Volume Alpha editor: GR2Analyst's drag-editable opacity curve, drawn
 //! over the product's own palette strip.
 
+use crate::ui_hover::HoverTip;
 use crate::volume_alpha::{AlphaCurve, AlphaCurves, CURVE_LEN, apply_stroke};
 
 /// The pane-corner button's label. Named here so the input harness can find
@@ -70,7 +71,7 @@ pub(crate) fn editor_ui(
             })
             .inner;
         if drawn
-            .on_hover_text(
+            .hover_text(
                 "Redraw the volume's opacity over the value scale - GR2Analyst's Volume Alpha. \
                  Drag on the curve to strip or restore a range of values.",
             )
@@ -150,7 +151,7 @@ fn editor_contents(
     ui.horizontal(|ui| {
         if ui
             .add_enabled(curves.is_edited(&facts.id), egui::Button::new(RESET_LABEL))
-            .on_hover_text(
+            .hover_text(
                 "Forget the drawn curve and render through the default volume opacity \
                  again - a straight line from transparent to solid at the top of the \
                  scale, and for reflectivity clear through 10 dBZ first. That is not the \

@@ -43,6 +43,7 @@
 //! The header says what the areas hold and what still needs a connection; that
 //! boundary is a decision, not a gap.
 
+use crate::ui_hover::HoverTip;
 use egui::RichText;
 
 use crate::basemap_areas::{
@@ -361,7 +362,7 @@ fn render_area(
         };
         if ui
             .button(label)
-            .on_hover_text("Outline this area's box on the map, to check the ground it covers")
+            .hover_text("Outline this area's box on the map, to check the ground it covers")
             .clicked()
         {
             command = Some(if outlined {

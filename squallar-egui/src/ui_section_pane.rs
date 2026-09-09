@@ -1,6 +1,7 @@
 //! Drawing a vertical cross-section, and being honest about what it is.
 
 use crate::pane::PaneState;
+use crate::ui_hover::HoverTip;
 use squallar_radar::beam;
 use squallar_radar::sampler::SampleStatus;
 use squallar_radar::xsect::{CrossSection, SECTION_HEIGHT, SECTION_WIDTH, SectionAxes};
@@ -197,7 +198,7 @@ pub(super) fn render_cross_section(
             ui.id().with("section_detail_toggle"),
             egui::Sense::click(),
         )
-        .on_hover_text("What this picture is - and what it is not");
+        .hover_text("What this picture is - and what it is not");
     if response.clicked()
         && let Some(state) = pane.cross_section_mut()
     {
@@ -283,7 +284,7 @@ fn control_chip(
         egui::FontId::proportional(12.0),
         ui.visuals().text_color(),
     );
-    response.on_hover_text(tooltip).clicked()
+    response.hover_text(tooltip).clicked()
 }
 
 /// The section pane's own line controls: pan the line across itself, sweep it about

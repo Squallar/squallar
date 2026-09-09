@@ -1,6 +1,7 @@
 //! The layer catalog: one modal over everything, four groups, one search.
 
 use crate::actions::GuiAction;
+use crate::ui_hover::HoverTip;
 use serde::{Deserialize, Serialize};
 use squallar_overlays::render::controls::{ControlEffect, ControlUpdate, ControlValue};
 use squallar_overlays::render::overlay_state::OverlayRegistry;
@@ -271,7 +272,7 @@ impl super::Gui {
     ) {
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let close = ui.button(CLOSE_LABEL).on_hover_text("Close the catalog");
+                let close = ui.button(CLOSE_LABEL).hover_text("Close the catalog");
                 #[cfg(test)]
                 {
                     probe.close = close.rect;
@@ -391,7 +392,7 @@ impl super::Gui {
                         // catalogue was open — one allocation per registered
                         // layer per frame, for the one tooltip a pointer can
                         // be over. egui runs this body only while it is up.
-                        .on_hover_ui(|ui| {
+                        .hover_ui(|ui| {
                             ui.set_max_width(ui.spacing().tooltip_width);
                             ui.add(egui::Label::new(tile_hover(&name, in_stack)));
                         });
@@ -488,7 +489,7 @@ impl super::Gui {
         let mut delete: Option<usize> = None;
         ui.horizontal_wrapped(|ui| {
             for preset in shown_builtin {
-                let tile = ui.button(preset.name.as_str()).on_hover_ui(|ui| {
+                let tile = ui.button(preset.name.as_str()).hover_ui(|ui| {
                     ui.set_max_width(ui.spacing().tooltip_width);
                     ui.add(egui::Label::new(preset_hover(&self.overlays, preset)));
                 });
@@ -505,7 +506,7 @@ impl super::Gui {
             }
             for i in shown_user {
                 let preset = &self.presets[i];
-                let tile = ui.button(preset.name.as_str()).on_hover_ui(|ui| {
+                let tile = ui.button(preset.name.as_str()).hover_ui(|ui| {
                     ui.set_max_width(ui.spacing().tooltip_width);
                     ui.add(egui::Label::new(preset_hover(&self.overlays, preset)));
                 });
@@ -515,7 +516,7 @@ impl super::Gui {
                 // glyph is the same defect the inspector's crumb carried.
                 let remove = ui
                     .add(egui::Button::new(egui::RichText::new(DELETE_LABEL).small()).frame(false))
-                    .on_hover_ui(|ui| {
+                    .hover_ui(|ui| {
                         ui.set_max_width(ui.spacing().tooltip_width);
                         ui.add(egui::Label::new(delete_hover(&preset.name)));
                     });

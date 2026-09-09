@@ -2,6 +2,7 @@
 //! wide widths.
 
 use crate::actions::GuiAction;
+use crate::ui_hover::HoverTip;
 use crate::ui_layout::{PointerModality, WidthClass};
 use squallar_radar::types::ScanInfo;
 use squallar_units::UserPreferences;
@@ -76,7 +77,7 @@ impl super::Gui {
                         fade::dim(ui, restore_factor);
                         let restore = ui
                             .button(RESTORE_LABEL)
-                            .on_hover_text("Restore the status bar");
+                            .hover_text("Restore the status bar");
                         #[cfg(test)]
                         {
                             probe.collapse = restore.rect;
@@ -96,7 +97,7 @@ impl super::Gui {
 
                         let collapse = ui
                             .button(COLLAPSE_LABEL)
-                            .on_hover_text("Collapse the status bar");
+                            .hover_text("Collapse the status bar");
                         #[cfg(test)]
                         {
                             probe.collapse = collapse.rect;
@@ -117,7 +118,7 @@ impl super::Gui {
                             actions
                                 .push(GuiAction::FetchRadarScan(self.active_pane_fetch_config()));
                         }
-                        refresh_button.on_hover_text("Refresh radar data");
+                        refresh_button.hover_text("Refresh radar data");
 
                         ui.separator();
 
@@ -410,17 +411,17 @@ fn render_auto_poll_status(
         // closure with its text ALREADY built, so a paragraph nobody was
         // hovering was formatted on every frame of a live feed. egui runs
         // this body only while the tooltip is up.
-        response.on_hover_ui(|ui| {
+        response.hover_ui(|ui| {
             ui.set_max_width(ui.spacing().tooltip_width);
             ui.add(egui::Label::new(chunk_feed_hover(chunks)));
         })
     } else if chunks.retired {
-        response.on_hover_text(
+        response.hover_text(
             "The real-time feed stopped responding for this site; falling back \
              to completed archive volumes, which are several minutes old.",
         )
     } else {
-        response.on_hover_text("Toggle auto-poll from the \u{2630} menu")
+        response.hover_text("Toggle auto-poll from the \u{2630} menu")
     };
     Some((response.rect, label, tick))
 }

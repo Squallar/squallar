@@ -1,5 +1,6 @@
 use crate::actions::GuiAction;
 use crate::shell_api::PanesCuts;
+use crate::ui_hover::HoverTip;
 use squallar_overlays::render::overlay_state::PaneRef;
 use squallar_radar::hover::{HoverSource, Reading};
 use squallar_radar::types::RenderView;
@@ -2861,7 +2862,7 @@ pub(crate) fn render_volume_controls(
             if response.changed() {
                 volume.camera.set_vertical_exaggeration(exaggeration);
             }
-            response.on_hover_text(
+            response.hover_text(
                 "Stretches the box vertically so storm structure is legible. Heights the pane \
                  reports stay in real kft MSL at every setting.",
             );
@@ -2882,7 +2883,7 @@ pub(crate) fn render_volume_controls(
             if response.changed() {
                 volume.camera.set_eye_distance(standoff);
             }
-            response.on_hover_text(
+            response.hover_text(
                 "How far back the eye sits, in box framing radii - the framing. Under 1 puts \
                  the eye inside the box. Scroll and pinch zoom the ground instead, the same \
                  way they do on a flat pane.",
@@ -2896,13 +2897,13 @@ pub(crate) fn render_volume_controls(
                 crate::pane::VolumeViewMode::LitVolume,
                 "Lit volume",
             )
-            .on_hover_text("The translucent accumulation: cloud shaped by the product's transparency profile and your Volume Alpha curve.");
+            .hover_text("The translucent accumulation: cloud shaped by the product's transparency profile and your Volume Alpha curve.");
             ui.radio_value(
                 &mut volume.view_mode,
                 crate::pane::VolumeViewMode::Isosurface,
                 "Isosurface",
             )
-            .on_hover_text("One opaque, lit surface at the threshold below - the shell of everything at or beyond it.");
+            .hover_text("One opaque, lit surface at the threshold below - the shell of everything at or beyond it.");
         });
         if volume.view_mode == crate::pane::VolumeViewMode::Isosurface {
             // The slider's travel and the meaning of its number are the
@@ -2924,11 +2925,13 @@ pub(crate) fn render_volume_controls(
                 if response.changed() {
                     iso_thresholds.set(&facts.id, threshold);
                 }
-                response.on_hover_text(format!(
-                    "Where {}'s surface sits. Per product - every 3D pane showing this \
-                     product shares it.",
-                    facts.name,
-                ));
+                response.hover_text_lazy(|| {
+                    format!(
+                        "Where {}'s surface sits. Per product - every 3D pane showing this \
+                         product shares it.",
+                        facts.name,
+                    )
+                });
             });
             if alpha_curves.is_edited(&facts.id) {
                 ui.label(
@@ -2945,7 +2948,7 @@ pub(crate) fn render_volume_controls(
         let mut sunlight = volume.sun_lighting;
         if ui
             .checkbox(&mut sunlight, SUN_LIGHT_LABEL)
-            .on_hover_text(
+            .hover_text(
                 "Lights the ground and the storm above it by the real sun, from where the box \
                  is on Earth and when the volume was collected - warm and low near sunrise \
                  and sunset, cool and dim through twilight, and down to a night floor the \
@@ -2993,7 +2996,7 @@ pub(crate) fn render_volume_controls(
         let mut show_floor = !volume.hide_floor;
         if ui
             .checkbox(&mut show_floor, MAP_FLOOR_LABEL)
-            .on_hover_text(
+            .hover_text(
                 "Draws the ground under the volume: the basemap, SPC outlooks, the base \
                  reflectivity as the 2D map shows it, the range ring, mesoscale discussion, \
                  warning and watch polygons, and city labels, registered to the box. \
@@ -3027,7 +3030,7 @@ pub(crate) fn render_volume_controls(
                 ui.label("km");
                 if ui
                     .button(WHOLE_RING_LABEL)
-                    .on_hover_text(
+                    .hover_text(
                         "Drops the picked region and goes back to the volume's own data reach - \
                          the whole ring, at whatever range the scan in hand carries. The camera \
                          is left exactly as it is. Picking a region is the only way to spend the \
@@ -3044,7 +3047,7 @@ pub(crate) fn render_volume_controls(
 
         if ui
             .button("Reset view")
-            .on_hover_text("Back to the default angle, zoom, centre and region.")
+            .hover_text("Back to the default angle, zoom, centre and region.")
             .clicked()
         {
             reset_volume_view(volume);

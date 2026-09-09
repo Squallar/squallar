@@ -3,6 +3,7 @@
 
 use super::ui_menu;
 use crate::actions::GuiAction;
+use crate::ui_hover::HoverTip;
 
 /// The app-menu button's glyph — the whole menu lives behind it.
 const MENU_BUTTON_LABEL: &str = "\u{2630}";
@@ -152,7 +153,7 @@ impl super::Gui {
                         let offline_armed = self.download_pick_armed();
                         let offline = ui
                             .selectable_label(offline_armed, OFFLINE_TOGGLE_GLYPH)
-                            .on_hover_text(OFFLINE_TOGGLE_HINT);
+                            .hover_text(OFFLINE_TOGGLE_HINT);
                         #[cfg(test)]
                         {
                             probe.offline_arm = (offline.rect, offline_armed);
@@ -215,7 +216,7 @@ impl super::Gui {
                 let armed = self.section_draw_armed();
                 let section = ui
                     .selectable_label(armed, "\u{2215}")
-                    .on_hover_text("Draw cross-section");
+                    .hover_text("Draw cross-section");
                 #[cfg(test)]
                 {
                     probe.section_arm = (section.rect, armed);
@@ -230,7 +231,7 @@ impl super::Gui {
                 let region_armed = self.region_pick_armed();
                 let region = ui
                     .selectable_label(region_armed, "\u{26f6}")
-                    .on_hover_text("Pick 3D region");
+                    .hover_text("Pick 3D region");
                 #[cfg(test)]
                 {
                     probe.region_arm = (region.rect, region_armed);
@@ -245,7 +246,7 @@ impl super::Gui {
                 let offline_armed = self.download_pick_armed();
                 let offline = ui
                     .selectable_label(offline_armed, OFFLINE_TOGGLE_GLYPH)
-                    .on_hover_text(OFFLINE_TOGGLE_HINT);
+                    .hover_text(OFFLINE_TOGGLE_HINT);
                 #[cfg(test)]
                 {
                     probe.offline_arm = (offline.rect, offline_armed);
@@ -267,7 +268,7 @@ impl super::Gui {
                     } else {
                         super::statusbar::COLLAPSE_LABEL
                     })
-                    .on_hover_text(if collapsed {
+                    .hover_text(if collapsed {
                         "Restore the top bar"
                     } else {
                         "Collapse the top bar"
@@ -464,7 +465,7 @@ impl super::Gui {
                 let label = if roomy { roomy_label } else { tight_label };
                 let button = ui
                     .add(egui::Button::selectable(selected, label))
-                    .on_hover_text(hover);
+                    .hover_text(hover);
                 #[cfg(test)]
                 self.probes
                     .last_split_options

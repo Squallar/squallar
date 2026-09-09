@@ -85,6 +85,8 @@ mod ui;
 /// selection UI spends them on. The detail vocabulary itself lives in
 /// [`basemap_areas`], which the manage screen reads it back through.
 pub(crate) mod ui_download_area;
+/// Tooltips, asked for only by a widget the pointer is actually on.
+pub(crate) mod ui_hover;
 pub(crate) mod ui_input;
 pub(crate) mod ui_layout;
 pub(crate) mod ui_region;

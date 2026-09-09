@@ -1,4 +1,5 @@
 use crate::actions::{GuiAction, RadarConfig};
+use crate::ui_hover::HoverTip;
 use squallar_overlays::render::controls::{
     ControlEffect, ControlItem, ControlUpdate, ControlValue,
 };
@@ -1334,9 +1335,7 @@ impl Gui {
                         let elev_combo = if elevations.is_empty() {
                             let scope = ui.add_enabled_ui(false, |ui| combo.show_ui(ui, |_| {}));
                             let id = scope.inner.response.id;
-                            scope
-                                .response
-                                .on_hover_text("Waiting for this product's data");
+                            scope.response.hover_text("Waiting for this product's data");
                             id
                         } else {
                             let shown = combo.show_ui(ui, |ui| {

@@ -2,6 +2,7 @@
 //! every panel and dialog presents in below the Compact breakpoint.
 
 use crate::actions::GuiAction;
+use crate::ui_hover::HoverTip;
 
 use super::shell::SurfaceSlot;
 use super::{InspectorSelection, ui_menu};
@@ -372,7 +373,7 @@ impl super::Gui {
                                 |ui| {
                                     let chip = ui
                                         .selectable_label(expanded, chip_text)
-                                        .on_hover_text("Show or hide the timeline");
+                                        .hover_text("Show or hide the timeline");
                                     #[cfg(test)]
                                     {
                                         probe.live_chip = (chip.rect, expanded);
@@ -587,7 +588,7 @@ impl super::Gui {
 
                     ui.horizontal(|ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let close = ui.button(CLOSE_LABEL).on_hover_text("Close the sheet");
+                            let close = ui.button(CLOSE_LABEL).hover_text("Close the sheet");
                             #[cfg(test)]
                             {
                                 probe.close = close.rect;

@@ -1,6 +1,7 @@
 //! The layer stack: one row per layer of the active pane, in draw order.
 
 use crate::actions::GuiAction;
+use crate::ui_hover::HoverTip;
 use squallar_overlays::render::overlay_state::STATUS_MARK;
 use squallar_source::id::LayerId;
 
@@ -234,23 +235,6 @@ impl Default for StackProbe {
     }
 }
 
-/// [`egui::Response::on_hover_text`], with the text composed only on the frame
-/// the tooltip is actually drawn.
-///
-/// `on_hover_text` takes its text by value, so every caller pays for the
-/// string whether or not the pointer is anywhere near the widget. A layer row
-/// carries three of these and a stack carries a row per layer, which made the
-/// panel compose a tooltip for every control on every row every frame to show
-/// one. The body is `Response::on_hover_text`'s own (egui 0.35) with the
-/// argument moved inside the closure, so what is drawn is the same widget in
-/// the same box.
-fn on_hover_text_lazy(response: egui::Response, text: impl FnOnce() -> String) -> egui::Response {
-    response.on_hover_ui(|ui| {
-        ui.set_max_width(ui.spacing().tooltip_width);
-        ui.add(egui::Label::new(text()));
-    })
-}
-
 impl super::Gui {
     /// The stack, in the slot its host chose — the map's top-left corner
     /// from the shell, the sheet's body from the phone shell.
@@ -320,7 +304,7 @@ impl super::Gui {
                                 |ui| {
                                     let collapse = ui
                                         .button(COLLAPSE_LABEL)
-                                        .on_hover_text("Collapse the layer stack");
+                                        .hover_text("Collapse the layer stack");
                                     #[cfg(test)]
                                     {
                                         probe.collapse = collapse.rect;
@@ -349,7 +333,7 @@ impl super::Gui {
                                                     .truncate()
                                                     .sense(egui::Sense::click()),
                                                 )
-                                                .on_hover_text("Layer order: top = drawn last");
+                                                .hover_text("Layer order: top = drawn last");
                                             #[cfg(test)]
                                             {
                                                 probe.header = header.rect;
@@ -635,10 +619,9 @@ impl super::Gui {
                         );
                     }
                 }
-                let handle =
-                    on_hover_text_lazy(handle.on_hover_cursor(egui::CursorIcon::Grab), || {
-                        format!("Drag to reorder {name}")
-                    });
+                let handle = handle
+                    .on_hover_cursor(egui::CursorIcon::Grab)
+                    .hover_text_lazy(|| format!("Drag to reorder {name}"));
                 if handle.drag_started() {
                     self.stack_drag = Some(kind.clone());
                 }
@@ -657,20 +640,19 @@ impl super::Gui {
                 } else {
                     egui::RichText::new("-").size(EYE_GLYPH_SIZE).weak()
                 };
-                let eye = on_hover_text_lazy(
-                    ui.add(
+                let eye = ui
+                    .add(
                         egui::Button::new(eye_text)
                             .frame(false)
                             .min_size(egui::Vec2::splat(CONTROL_SIDE)),
-                    ),
-                    || {
+                    )
+                    .hover_text_lazy(|| {
                         if enabled {
                             format!("Hide {name}")
                         } else {
                             format!("Show {name}")
                         }
-                    },
-                );
+                    });
                 // A UiSweep target: the sweep toggles every eye it can see.
                 if crate::gesture_player::click_registry::collecting() {
                     crate::gesture_player::click_registry::register(
@@ -745,8 +727,8 @@ impl super::Gui {
                             .min_size(egui::Vec2::splat(CONTROL_SIDE)),
                         );
                         let remove =
-                            on_hover_text_lazy(remove, || format!("Remove {name} from this pane"));
-                        let remove = remove.on_disabled_hover_ui(|ui| {
+                            remove.hover_text_lazy(|| format!("Remove {name} from this pane"));
+                        let remove = remove.disabled_hover_ui(|ui| {
                             ui.set_max_width(ui.spacing().tooltip_width);
                             ui.add(egui::Label::new(refusal.unwrap_or_default()));
                         });

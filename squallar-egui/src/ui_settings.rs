@@ -1,4 +1,5 @@
 use crate::actions::GuiAction;
+use crate::ui_hover::HoverTip;
 use squallar_location::HeadingSource;
 use squallar_units::{
     DistanceUnit, HailSizeUnit, HeightUnit, PrecipRateUnit, SpeedUnit, TemperatureUnit,
@@ -357,7 +358,7 @@ impl super::Gui {
                         });
                 })
                 .response
-                .on_hover_text(
+                .hover_text(
                     "Most volumes carry the National Weather Service's own storm motion \
                      and it is used whenever it does. This is what stands in when one \
                      does not: the 0-6 km mean wind, which measures closest to it, or \
@@ -371,7 +372,7 @@ impl super::Gui {
                     &mut self.storm_motion_override.enabled,
                     STORM_MOTION_OVERRIDE_LABEL,
                 )
-                .on_hover_text(
+                .hover_text(
                     "On, storm-relative velocity uses the vector below and nothing else \
                      - in the plan view, the 3D volume and the cross-section alike, and \
                      ahead of the National Weather Service's own.",

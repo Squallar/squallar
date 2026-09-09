@@ -2677,3 +2677,8 @@ mod overlay_dispatch_budget_tests;
 /// closed-frame half on its own.
 #[cfg(test)]
 mod eager_tooltip_tests;
+
+/// **A tooltip is asked for only by the widget the pointer is on** — the gate
+/// in `crate::ui_hover`, pinned in both directions.
+#[cfg(test)]
+mod tooltip_gate_tests;

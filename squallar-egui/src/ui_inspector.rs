@@ -2,6 +2,7 @@
 //! properties, or the app's settings.
 
 use crate::actions::GuiAction;
+use crate::ui_hover::HoverTip;
 use squallar_source::id::{LayerId, known};
 
 use super::shell::SurfaceSlot;
@@ -127,7 +128,7 @@ fn pane_label(active_pane: usize) -> String {
 /// `&str`.
 fn crumb_head(ui: &mut egui::Ui, active_pane: usize, hover: &'static str) -> egui::Response {
     ui.selectable_label(false, egui::RichText::new(pane_label(active_pane)).strong())
-        .on_hover_text(hover)
+        .hover_text(hover)
 }
 
 impl super::Gui {
@@ -255,7 +256,7 @@ impl super::Gui {
     ) {
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let close = ui.button(CLOSE_LABEL).on_hover_text("Close the inspector");
+                let close = ui.button(CLOSE_LABEL).hover_text("Close the inspector");
                 #[cfg(test)]
                 {
                     probe.close = close.rect;
@@ -428,7 +429,7 @@ impl super::Gui {
             // and formatted this sentence over it on every frame, for a
             // tooltip nobody was hovering. Two allocations a frame per open
             // body; egui runs this one only while the tooltip is up.
-            .on_hover_ui(|ui| {
+            .hover_ui(|ui| {
                 ui.set_max_width(ui.spacing().tooltip_width);
                 ui.add(egui::Label::new(layer_opacity_hover(name)));
             })
@@ -554,7 +555,7 @@ impl super::Gui {
             ui.separator();
             let close = ui
                 .button(format!("Close pane {}", self.active_pane + 1))
-                .on_hover_text(CLOSE_PANE_HOVER);
+                .hover_text(CLOSE_PANE_HOVER);
             #[cfg(test)]
             {
                 probe.close_pane = close.rect;
