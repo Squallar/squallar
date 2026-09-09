@@ -599,11 +599,19 @@ fn an_archive_neither_clock_names_is_still_swept() {
 /// **So the withdrawable set is the still entries that are NOT their site's
 /// base, and on a live pane that set is empty.** What `still scans` actually
 /// prices on those arms is the merge bases, and the base is not free to go:
-/// `section_source_refusal`, `App::current_render_input`,
+/// `section_source_refusal`, `App::extract_current_volume`,
+/// `App::dispatch_section_renders`' extract closure,
 /// `App::current_ladder_fingerprint` and `App::current_volume_stamp` all read
-/// it, the first two for the section cut's moments and the last two for its
-/// structure and its times. A withdrawal there is a different change from
-/// this one and needs those derived facts memoised first.
+/// it — the first three for the section cut's GATES and the last two for its
+/// structure and its times only. A withdrawal there is a different change
+/// from this one.
+///
+/// Memoising the last two was tried and refuted
+/// (`squallar_radar::current::tests::the_fingerprint_and_the_stamp_move_with_the_overlay_while_the_base_stands`):
+/// both are functions of the LIVE overlay, which advances every sealed sweep.
+/// What they are not is functions of a gate, so the route that remains is
+/// `squallar_radar::skeleton::VolumeSkeleton` — structure resident, arrays
+/// released, measured at 3.18 % of a VCP-212-shaped volume.
 ///
 /// # Why the assertion is on the refcount
 ///

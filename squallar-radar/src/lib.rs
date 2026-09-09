@@ -34,6 +34,7 @@ pub mod scan;
 pub mod scan_size;
 pub mod site_position;
 pub mod sites;
+pub mod skeleton;
 pub mod sounding;
 /// The radar layer's `SourceHandler` registration.
 pub mod source;

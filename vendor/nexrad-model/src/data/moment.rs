@@ -122,6 +122,35 @@ pub(crate) struct MomentDataBlock {
 }
 
 impl MomentDataBlock {
+    /// **LOCAL CHANGE.** The same block with its gate buffer released and
+    /// every scalar kept: `gate_count`, `first_gate_range`, `gate_interval`,
+    /// `data_word_size`, `scale` and `offset` all carry over unchanged, and
+    /// only `values` is emptied.
+    ///
+    /// Added for `squallar_radar::skeleton`, which keeps a volume's structure
+    /// resident while releasing the arrays — the gate buffers are 95.9 % of
+    /// what a decoded volume costs the allocator. It is written here rather
+    /// than rebuilt through the public accessors on purpose: `first_gate_range`
+    /// and `gate_interval` are stored as fixed-point `u16` and read back as
+    /// `f64` kilometres, so an accessor round trip would not reproduce the
+    /// block exactly, and `gate_count` in particular is HASHED by
+    /// `squallar_radar::sampler::ladder_fingerprint` — a skeleton that
+    /// changed it would silently move a re-cut key.
+    ///
+    /// No representation change: this constructs the same struct the decoder
+    /// does, with one field empty.
+    pub(crate) fn without_values(&self) -> Self {
+        Self {
+            gate_count: self.gate_count,
+            first_gate_range: self.first_gate_range,
+            gate_interval: self.gate_interval,
+            data_word_size: self.data_word_size,
+            scale: self.scale,
+            offset: self.offset,
+            values: BinaryData::from(Vec::new()),
+        }
+    }
+
     /// Create new moment data block from fixed-point encoding.
     pub(crate) fn from_fixed_point(
         gate_count: u16,
@@ -228,6 +257,14 @@ pub struct MomentData {
 }
 
 impl MomentData {
+    /// **LOCAL CHANGE.** This moment with its gate buffer released and every
+    /// scalar kept — see [`MomentDataBlock::without_values`].
+    pub fn without_values(&self) -> Self {
+        Self {
+            inner: self.inner.without_values(),
+        }
+    }
+
     /// Create new moment data from fixed-point encoding.
     pub fn from_fixed_point(
         gate_count: u16,
@@ -345,6 +382,14 @@ pub struct CFPMomentData {
 }
 
 impl CFPMomentData {
+    /// **LOCAL CHANGE.** This moment with its gate buffer released and every
+    /// scalar kept — see [`MomentDataBlock::without_values`].
+    pub fn without_values(&self) -> Self {
+        Self {
+            inner: self.inner.without_values(),
+        }
+    }
+
     /// Create new CFP moment data from fixed-point encoding.
     pub fn from_fixed_point(
         gate_count: u16,
