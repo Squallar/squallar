@@ -59,7 +59,48 @@ fn land_one_auto_poll_volume(app: &mut App, site: &str, timestamp: chrono::Naive
     land_archive(app, site, timestamp, true);
 }
 
+/// The chunk feed's shape: an assembled volume with no compressed half behind
+/// it, which is the one arrival the archive trade cannot reach.
+fn land_one_volume_with_no_archive(app: &mut App, site: &str, timestamp: chrono::NaiveDateTime) {
+    land_archive_inner(app, site, timestamp, false, None);
+}
+
+/// **Hand the pane the picture the arrival owes it.**
+///
+/// `RenderDispatcher::reset_panes_for_site` clears `last_rendered` for every
+/// pane on the site and the arrival path calls it before it files anything, so
+/// a volume that has just landed is one no pane has drawn — and
+/// `App::release_unneeded_base_gates` will not take a volume in that state,
+/// because this pass runs ahead of `App::dispatch_pane_renders` in the frame
+/// and the release would be undone by `ensure_base_whole` one dispatch later.
+/// Every scene below that expects a release is therefore a scene where the
+/// picture exists, which is what the application reaches a frame or two after
+/// the arrival.
+fn the_pane_has_its_picture(app: &mut App) {
+    app.render.pane_render[0].last_rendered =
+        Some((squallar_radar::types::RadarProduct::Reflectivity, 0.5));
+}
+
 fn land_archive(app: &mut App, site: &str, timestamp: chrono::NaiveDateTime, is_auto_poll: bool) {
+    // The compressed half of the same arrival. It shares nothing with the
+    // volume, so the allocation identities this module asserts are untouched
+    // by it.
+    land_archive_inner(
+        app,
+        site,
+        timestamp,
+        is_auto_poll,
+        Some(std::sync::Arc::new(vec![0u8; 64])),
+    );
+}
+
+fn land_archive_inner(
+    app: &mut App,
+    site: &str,
+    timestamp: chrono::NaiveDateTime,
+    is_auto_poll: bool,
+    archive: Option<std::sync::Arc<Vec<u8>>>,
+) {
     let generation = app.render.fetch_generation_for(site);
     app.channels
         .scan_sender
@@ -72,10 +113,7 @@ fn land_archive(app: &mut App, site: &str, timestamp: chrono::NaiveDateTime, is_
                 declared_nyquist: Default::default(),
                 site: site.to_string(),
                 timestamp,
-                // The compressed half of the same arrival. It shares nothing
-                // with the volume, so the allocation identities this module
-                // asserts are untouched by it.
-                archive: Some(std::sync::Arc::new(vec![0u8; 64])),
+                archive,
             }),
             is_auto_poll,
         })
@@ -693,7 +731,8 @@ fn emptying_the_still_store_frees_nothing_while_the_base_holds_the_same_volume()
 #[test]
 fn a_base_with_no_archive_keeps_its_gates() {
     let mut app = app_on_site();
-    land_one_archive_volume(&mut app, SITE, at(0));
+    land_one_volume_with_no_archive(&mut app, SITE, at(0));
+    the_pane_has_its_picture(&mut app);
     let collected = app
         .volumes
         .base_collected_at(SITE)
@@ -729,6 +768,7 @@ fn a_base_with_no_archive_keeps_its_gates() {
 fn a_site_with_a_section_pane_keeps_its_gates() {
     let mut app = app_on_site();
     land_one_archive_volume(&mut app, SITE, at(0));
+    the_pane_has_its_picture(&mut app);
     let collected = app.volumes.base_collected_at(SITE).expect("a base");
     // Give it the way back, so the ONLY thing standing between this base and
     // a release is the section pane.
@@ -772,6 +812,7 @@ fn a_site_with_a_section_pane_keeps_its_gates() {
 fn a_base_nothing_reads_gates_from_is_released_and_still_answers() {
     let mut app = app_on_site();
     land_one_archive_volume(&mut app, SITE, at(0));
+    the_pane_has_its_picture(&mut app);
     let (base, _) = app.volumes.base_for(SITE).expect("the base is resident");
     app.loop_mgr
         .cache_archive(SITE, at(0), std::sync::Arc::new(vec![0u8; 4096]));
@@ -839,6 +880,7 @@ fn a_base_nothing_reads_gates_from_is_released_and_still_answers() {
 fn a_released_base_is_restored_once_however_often_it_is_asked() {
     let mut app = app_on_site();
     land_one_archive_volume(&mut app, SITE, at(0));
+    the_pane_has_its_picture(&mut app);
     app.loop_mgr
         .cache_archive(SITE, at(0), std::sync::Arc::new(vec![0u8; 4096]));
     app.evict_unshown_scans();
@@ -907,6 +949,7 @@ fn a_released_base_is_restored_once_however_often_it_is_asked() {
 fn the_joint_release_drops_every_holder_of_one_allocation() {
     let mut app = app_on_site();
     land_one_archive_volume(&mut app, SITE, at(0));
+    the_pane_has_its_picture(&mut app);
     app.loop_mgr
         .cache_archive(SITE, at(0), std::sync::Arc::new(vec![0u8; 4096]));
 
@@ -988,6 +1031,7 @@ fn a_jointly_released_volume_comes_back_whole() {
 
     let mut app = app_on_site();
     land_one_archive_volume(&mut app, SITE, at(0));
+    the_pane_has_its_picture(&mut app);
     app.loop_mgr
         .cache_archive(SITE, at(0), std::sync::Arc::new(vec![0u8; 4096]));
     let (base, _) = app.volumes.base_for(SITE).expect("a base");
@@ -1036,5 +1080,160 @@ fn a_jointly_released_volume_comes_back_whole() {
     assert!(
         app.still_scan_level() > 0,
         "the restored volume is priced at nothing",
+    );
+}
+
+/// **The arrival path leaves the withdrawal a way back, on the site shape the
+/// application actually boots into: nothing looping.**
+///
+/// This is the test the withdrawal never had, and its absence is why the cut
+/// landed dormant. Every release scene above hands the loop cache an archive
+/// with a `cache_archive` call of its own, so all of them were green while
+/// `App::append_scan_to_active_loops` was filing the compressed half only on a
+/// site `LoopDownloadManager::is_looping` said yes to — which is no site at
+/// boot. `archive_for_identity` then answered `None` for every base the drain
+/// installed, `release_unneeded_base_gates` took its `continue` every time,
+/// and the measurement said so: `base skeletons` 0 B on all 530 census ticks
+/// of a 5-leg run, `still scans` peaking at 101,596,480 B on every leg, byte
+/// for byte what the tree read before the withdrawal existed.
+///
+/// The `is_looping` assertion is the load-bearing one. Without it a fixture
+/// that happened to arm a loop would pass against the old code and this would
+/// be a test of nothing.
+#[test]
+fn a_boot_arrival_leaves_the_withdrawal_a_way_back_with_no_loop_running() {
+    let mut app = app_on_site();
+    land_one_archive_volume(&mut app, SITE, at(0));
+
+    assert!(
+        !app.loop_mgr.is_looping(SITE),
+        "fixture: a loop is running, so the archive would be filed by the old \
+         rule too and this asserts nothing",
+    );
+    let collected = app
+        .volumes
+        .base_collected_at(SITE)
+        .expect("the drain installed a base");
+    assert_ne!(
+        collected,
+        at(0),
+        "fixture: the base's identity equals the address the archive was filed \
+         under, so an address-keyed lookup would answer and the identity route \
+         this depends on is untested",
+    );
+    assert!(
+        app.loop_mgr.archive_for_identity(SITE, collected).is_some(),
+        "the arrival that installed the base filed no archive for it, so \
+         `release_unneeded_base_gates` can never find a way back and the \
+         joint release is dead code on every live pane",
+    );
+}
+
+/// **The withdrawal fires end to end off the drain alone**, with nothing
+/// filed by hand.
+///
+/// The one above shows the way back exists; this shows the whole policy runs
+/// on it. Deliberately no `cache_archive` call anywhere: the only compressed
+/// bytes in this process are the ones the arrival carried, and if the
+/// residency pass sweeps them before the withdrawal is asked — it runs first,
+/// and asks a two-clock question the drain's arrivals used to fail — nothing
+/// is released and this reddens.
+///
+/// The byte claim is `still_scan_level`, the figure the census publishes,
+/// rather than `Arc::strong_count`, which measures the process-global
+/// deferred-drop lane and is not deterministic here.
+#[test]
+fn the_drain_alone_arms_the_joint_release() {
+    let mut app = app_on_site();
+    land_one_archive_volume(&mut app, SITE, at(0));
+    the_pane_has_its_picture(&mut app);
+
+    let parked = app
+        .volumes
+        .newest_still_for(SITE)
+        .expect("the arrival installed a still");
+    let before = app.still_scan_level();
+    assert!(before > 0, "fixture: a volume priced at nothing");
+
+    app.evict_unshown_scans();
+
+    assert!(
+        app.volumes.base_is_released(SITE),
+        "the base kept its gates on an arrival that carried its own archive, \
+         so the withdrawal is still unreachable from the application's own \
+         path",
+    );
+    assert!(
+        app.volumes.still_for(SITE, parked).is_none(),
+        "the still store still holds the allocation, so the release freed \
+         nothing",
+    );
+    assert!(
+        app.loop_mgr.get_cached(SITE, &at(0)).is_none(),
+        "the loop download cache still holds the allocation",
+    );
+    assert!(
+        app.loop_mgr.has_archive(SITE, &at(0)),
+        "the residency pass swept the way back before the withdrawal was \
+         asked, so a section pane on this site has nothing to wait for",
+    );
+    assert_eq!(
+        app.still_scan_level(),
+        0,
+        "`still scans` did not fall for a volume every holder let go",
+    );
+    assert!(
+        app.volumes.base_skeleton_bytes() > 0,
+        "the structure that replaced it is priced at nothing",
+    );
+}
+
+/// **A volume no pane has drawn yet is not taken**, however releasable it
+/// otherwise looks.
+///
+/// The frame order is the whole of the reason. `App::evict_unshown_scans` runs
+/// before `App::dispatch_pane_renders` in `App::handle_redraw`, so on the
+/// frame an arrival lands the withdrawal would always be first: it would take
+/// the still the drain had just installed, the dispatch would find nothing,
+/// and `ensure_base_whole` would spend a whole volume decode rebuilding bytes
+/// this process decoded milliseconds earlier — a first paint delayed by a
+/// decode, on every arrival, to free nothing that stays freed.
+///
+/// TAMPER: drop `picture_owed` from `release_unneeded_base_gates`' guard and
+/// this reddens while every other test in this module stays green, which is
+/// what makes the hold-back gated rather than assumed.
+#[test]
+fn a_base_no_pane_has_drawn_yet_keeps_its_gates() {
+    let mut app = app_on_site();
+    land_one_archive_volume(&mut app, SITE, at(0));
+
+    let collected = app.volumes.base_collected_at(SITE).expect("a base");
+    assert!(
+        app.loop_mgr.archive_for_identity(SITE, collected).is_some(),
+        "precondition: the way back is present, so a refusal here is about \
+         the picture and not about the archive",
+    );
+    assert!(
+        app.render.pane_render[0].last_rendered.is_none(),
+        "fixture: the pane already has a picture, so nothing is owed and this \
+         test is about a state the arrival path does not build",
+    );
+
+    app.evict_unshown_scans();
+
+    assert!(
+        app.volumes.base_has_gates(SITE),
+        "the volume was taken out from under a pane that has not drawn it, so \
+         the next dispatch pays a decode for bytes this process just had",
+    );
+
+    // And it goes as soon as the picture exists, so the hold-back is a wait
+    // and never a permanent refusal.
+    the_pane_has_its_picture(&mut app);
+    app.evict_unshown_scans();
+    assert!(
+        app.volumes.base_is_released(SITE),
+        "the hold-back outlived the picture it was waiting for, which is a \
+         withdrawal that never fires dressed as one that does",
     );
 }

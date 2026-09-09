@@ -2934,14 +2934,30 @@ impl super::App {
         // Store in the shared cache under this scan's own site, for every loop on that
         // site to use.
         self.loop_mgr.cache_scan(site, timestamp, (scan, declared));
-        // **The compressed half, but only where a loop can ever trade it in.**
-        // `evict_decoded_except` keeps the volume a pane is parked at whatever
-        // else it drops, so on a site nothing loops the archive would be a
-        // held buffer waiting for a swap that cannot happen — a pane scrubbed
-        // to a past instant with no loop running is exactly that shape.
-        if let Some(archive) = archive
-            && self.loop_mgr.is_looping(site)
-        {
+        // **The compressed half, whatever the site's loop state is doing.**
+        //
+        // It used to be filed only where `is_looping` said yes, and the
+        // reasoning was that on a site nothing loops the archive is a held
+        // buffer waiting for a swap that cannot happen. That was true when
+        // `evict_decoded_except` was the only trade in the process. It stopped
+        // being true when `App::release_unneeded_base_gates` landed: that
+        // withdrawal asks `archive_for_identity` for its way back and refuses
+        // to release a base without one, and it is asked of every site,
+        // looping or not. So the guard was denying the way back to the one
+        // caller that had come to depend on it, and the withdrawal never fired
+        // on a live pane at all — measured, 0 B of `base skeletons` across 530
+        // census ticks and a `still scans` peak byte-identical to the tree
+        // before the cut.
+        //
+        // What bounds the buffer is retention and not admission.
+        // `App::evict_unneeded_loop_scans` keeps an archive only while a live
+        // loop frame names it or a pane is parked on the volume it decodes to,
+        // and `evict_archives_to_ceiling` bounds what survives that in bytes.
+        // A site nothing loops and nothing is parked on therefore drops its
+        // archive on the next residency pass exactly as before; what changed
+        // is that the pass in between can now trade 33.7-82.7 MiB of decoded
+        // volume for it, at a median 5.8 % of the cost.
+        if let Some(archive) = archive {
             self.loop_mgr.cache_archive(site, timestamp, archive);
         }
 

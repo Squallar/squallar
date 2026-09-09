@@ -2859,6 +2859,11 @@ impl App {
         // an earlier draft of this comment put the count at 36 against a
         // ceiling of 35.
         let mut gate_readers: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // **Sites some pane is still owed a picture from** — the other reason
+        // a merge base's gates may not go, and a different one from the set
+        // above: these panes read no gate, they are simply waiting on the
+        // volume the withdrawal would take.
+        let mut picture_owed: std::collections::HashSet<String> = std::collections::HashSet::new();
         for idx in 0..pane_count {
             let Some(pane) = self.gui.pane(idx) else {
                 continue;
@@ -2898,6 +2903,33 @@ impl App {
             // never fidelity.
             if !pane.needs_radar_data() {
                 continue;
+            }
+            // **A pane that has not been handed its picture yet is owed the
+            // volume, and the joint release must not take it first.**
+            //
+            // This pass runs ahead of `dispatch_pane_renders` in the same
+            // frame (`handle_redraw`), so on the frame an arrival lands the
+            // release would always come first: the still it just installed
+            // would go, the dispatch would find nothing, and
+            // `ensure_base_whole` would spend a decode rebuilding bytes this
+            // process decoded seconds earlier — a first paint delayed by a
+            // whole volume decode, on every arrival, to free nothing that
+            // stays freed.
+            //
+            // `last_rendered` is exactly the right question rather than a
+            // boot-only special case: `RenderDispatcher::reset_panes_for_site`
+            // clears it for every pane on the site, and the arrival path calls
+            // that before it files anything, so a new volume owes a new
+            // picture and says so here until the picture exists. Read off
+            // `render`, never off a pane, so the seam this file is ratcheted
+            // on is untouched.
+            if self
+                .render
+                .pane_render
+                .get(idx)
+                .is_none_or(|prs| prs.last_rendered.is_none() || prs.render_in_flight())
+            {
+                picture_owed.insert(pane.site().to_string());
             }
             shown.push(pane.site());
             if let Some(info) = pane.scan_info.as_ref() {
@@ -2956,7 +2988,7 @@ impl App {
         self.evict_unneeded_loop_scans();
         // After the loop sweep, so a base whose archive that sweep just
         // evicted is not released against a way back it no longer has.
-        self.release_unneeded_base_gates(&gate_readers);
+        self.release_unneeded_base_gates(&gate_readers, &picture_owed);
         squallar_radar::derive::retain_volumes(
             self.volumes
                 .resident()
@@ -3331,22 +3363,43 @@ impl App {
     ///   must keep the site's gates whichever pane is asked first.
     /// * **A site with a restore already in flight**, which would otherwise
     ///   release the gates a decode is on its way to deliver.
+    /// * **A site some pane is still owed a picture from.** The caller answers
+    ///   that off `RenderDispatcher::pane_render`, and the reason it has to is
+    ///   the frame order: this pass runs before `dispatch_pane_renders`, so on
+    ///   an arrival's own frame a release would always be first and
+    ///   `ensure_base_whole` would always undo it, at the price of a decode
+    ///   and a delayed first paint.
     ///
-    /// # What it does NOT yet buy on a live pane
+    /// # When it fires, and when it did not
     ///
-    /// Nothing, and that is a property of the sharing rather than of this
-    /// policy. Both arrival paths clone ONE `Arc<Scan>` into the base and into
-    /// the still store, so releasing the base's reference leaves the still
-    /// holding the allocation and `live_bytes` does not move — pinned in
-    /// `emptying_the_still_store_frees_nothing_while_the_base_holds_the_same_volume`.
-    /// Where it pays today is a base the still store does NOT share: a pane
-    /// parked on a moment the base has advanced past. The joint release across
-    /// all four holders is the next change, and this is the half of it that
-    /// can be built and gated on its own.
-    fn release_unneeded_base_gates(&mut self, gate_readers: &std::collections::HashSet<String>) {
+    /// **It never fired at all until 2026-09-09**, and no test in the tree
+    /// said so: every green one here hands the loop cache its archive with a
+    /// `cache_archive` call of its own, and the application had none to find.
+    /// `App::append_scan_to_active_loops` filed the compressed half only on a
+    /// site `is_looping` said yes to — which is no site at boot — so
+    /// `archive_for_identity` answered `None` for every base the drain
+    /// installed and the `continue` above was taken every time. Measured
+    /// before the guard came off: `base skeletons` read 0 B on all 530 census
+    /// ticks of a 5-leg run, and `still scans` peaked at 101,596,480 B on
+    /// every leg, byte-identical to the tree before the withdrawal existed.
+    ///
+    /// So what it buys is **not** the first volume's own bytes at the instant
+    /// it arrives: nothing can release a volume no pane has drawn yet, and the
+    /// hold-back above says so. What it buys is every volume a site is holding
+    /// once its panes have their pictures — the merge base of a site whose
+    /// pane is parked on an earlier moment, and the whole of a site nothing is
+    /// looking at a section or a 3D view on.
+    fn release_unneeded_base_gates(
+        &mut self,
+        gate_readers: &std::collections::HashSet<String>,
+        picture_owed: &std::collections::HashSet<String>,
+    ) {
         let sites: Vec<String> = self.volumes.sites_with_base().map(str::to_string).collect();
         for site in sites {
-            if !self.volumes.base_has_gates(&site) || gate_readers.contains(&site) {
+            if !self.volumes.base_has_gates(&site)
+                || gate_readers.contains(&site)
+                || picture_owed.contains(&site)
+            {
                 continue;
             }
             let Some(collected) = self.volumes.base_collected_at(&site) else {

@@ -226,24 +226,56 @@ fn the_pump_offers_an_evicted_drain_arrival_back_without_a_new_listing() {
     );
 }
 
-/// **An arrival on a site nothing loops keeps no compressed bytes.**
+/// **An arrival on a site nothing loops keeps its compressed bytes**, because
+/// there is a swap for them there.
 ///
-/// The archive is held so `evict_decoded_except` can trade it for a decoded
-/// volume, and that pass keeps whatever volume a pane is parked at whatever
-/// else it drops. So on a site with no loop the compressed half would be a
-/// buffer waiting for a swap that cannot happen — a pane scrubbed to a past
-/// instant with no loop running is exactly that shape, and it is the one case
-/// where filing the archive is a pure addition.
+/// **This test asserted the opposite until 2026-09-09 and its reasoning was
+/// out of date rather than wrong when written.** It read: the archive is held
+/// so `evict_decoded_except` can trade it for a decoded volume, that pass
+/// keeps whatever a pane is parked at, so on a site with no loop the
+/// compressed half waits for a swap that cannot happen. Every step of that was
+/// true while the loop's own residency was the only trade in the process.
 ///
-/// TAMPER: drop the `self.loop_mgr.is_looping(site)` conjunct in
+/// `App::release_unneeded_base_gates` is a second one, and it is asked of
+/// every site, looping or not: it takes the merge base, the still, the loop
+/// cache's decoded half and the per-site latest together — 33.7-82.7 MiB — and
+/// refuses outright unless `archive_for_identity` can find it a way back. So
+/// the `is_looping` conjunct was denying the way back to the one caller that
+/// had come to depend on it, and the withdrawal never fired on a live pane at
+/// all: measured across five legs, `base skeletons` read 0 B on all 530 census
+/// ticks and `still scans` peaked at 101,596,480 B, byte for byte what the
+/// tree read before the withdrawal was written.
+///
+/// **The addition is still bounded, and by retention rather than by
+/// admission.** `App::evict_unneeded_loop_scans` keeps an archive only while a
+/// live loop frame names it or a pane is parked on the volume it decodes to,
+/// which is pinned next door in
+/// `scan_ownership_tests::an_archive_neither_clock_names_is_still_swept`; what
+/// survives that is bounded in bytes by `evict_archives_to_ceiling`. What the
+/// old rule bought was never a smaller resident set, only an earlier drop of
+/// a buffer at a median 5.8 % of the volume it can now buy back.
+///
+/// **The count is not the reach**, and this fixture cannot show the reach:
+/// `poll_scan` files a volume straight into the loop cache with no base
+/// behind it, and the withdrawal asks by the base's own first radial. That the
+/// held archive is findable by identity is asserted where a real drain
+/// arrival installs a real base —
+/// `scan_ownership_tests::a_boot_arrival_leaves_the_withdrawal_a_way_back_with_no_loop_running`.
+///
+/// TAMPER: restore the `self.loop_mgr.is_looping(site)` conjunct in
 /// `App::append_scan_to_active_loops`.
 #[test]
-fn an_arrival_on_a_site_nothing_loops_keeps_no_archive() {
+fn an_arrival_on_a_site_nothing_loops_keeps_its_archive_for_the_withdrawal() {
     const PARKED: u32 = 4;
 
     let mut app = app_on_site();
     poll_scan(&mut app, PARKED);
 
+    assert!(
+        !app.loop_mgr.is_looping(SITE),
+        "fixture: a loop is running, so the archive would be filed by the old \
+         rule too and this asserts nothing",
+    );
     assert_eq!(
         app.loop_mgr.cached_scan_count(SITE),
         1,
@@ -252,9 +284,9 @@ fn an_arrival_on_a_site_nothing_loops_keeps_no_archive() {
     );
     assert_eq!(
         app.loop_mgr.cached_archive_count(SITE),
-        0,
-        "and nothing loops the site, so its compressed bytes are dropped \
-         rather than parked against an eviction that cannot happen",
+        1,
+        "the compressed half was dropped on a site nothing loops, so the base \
+         withdrawal has no way back and releases nothing",
     );
 }
 
