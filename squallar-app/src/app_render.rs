@@ -4077,6 +4077,17 @@ impl super::App {
                             self.channels.render_sender.clone(),
                             self.window.clone(),
                         );
+                    } else {
+                        // **A missing still is asked for, not fallen off.**
+                        // This arm used to end the `if let` and nothing else:
+                        // a pane whose volume was gone re-asked the same
+                        // question every frame forever, drew nothing new, and
+                        // said nothing anywhere — the shape a joint release
+                        // turns from impossible into routine. The ask is
+                        // state-derived, so it is made again next frame while
+                        // the answer stays no, and `ensure_base_whole` is what
+                        // bounds it to one decode.
+                        self.ensure_base_whole(scan_info.site.name);
                     }
                 }
             } else if pane_idx < self.render.pane_render.len() {

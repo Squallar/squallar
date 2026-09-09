@@ -548,6 +548,27 @@ impl VolumeInventory {
         );
     }
 
+    /// **Drop every still entry holding this exact allocation**, handing them
+    /// back owned for the deferred-drop path.
+    ///
+    /// By POINTER and not by key: a still is keyed by the volume's own first
+    /// radial and a joint release starts from the volume the base let go, so
+    /// the question is "is this the same allocation", which a key cannot
+    /// answer for a store two sites could file the same arrival into.
+    #[must_use = "a released volume is tens of megabytes; hand it to the deferred-drop path"]
+    pub(crate) fn release_stills_of(&mut self, volume: &Arc<Scan>) -> Vec<Still> {
+        let mut dropped = Vec::new();
+        self.still.retain(|_, times| {
+            dropped.extend(
+                times
+                    .extract_if(|_, entry| Arc::ptr_eq(&entry.volume.0, volume))
+                    .map(|(_, entry)| entry.volume),
+            );
+            !times.is_empty()
+        });
+        dropped
+    }
+
     /// **What every released base's structure costs the allocator**, summed —
     /// the bytes `still scans` stops naming when a base's gates go.
     ///

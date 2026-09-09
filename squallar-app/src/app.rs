@@ -3353,15 +3353,52 @@ impl App {
             if self.loop_mgr.is_in_flight(&site, &address) {
                 continue;
             }
-            if let Some(released) = self.volumes.release_base_gates(&site) {
-                squallar_worker::offload::discard_each(
-                    "released-base-gates",
-                    crate::volume_inventory::volume_drop_parts(std::iter::once((
-                        released,
-                        std::sync::Arc::new(squallar_radar::nyquist::DeclaredNyquist::empty()),
-                    ))),
-                );
+            let Some(released) = self.volumes.release_base_gates(&site) else {
+                continue;
+            };
+            // **The JOINT release, and it is joint because anything less frees
+            // nothing.** Both arrival paths clone ONE `Arc<Scan>` into the
+            // base, the still store and the loop download cache, and the
+            // auto-poll arm files the same one as the site's latest — so
+            // dropping the base's reference alone leaves three holders on the
+            // allocation and `live_bytes` does not move. Pinned in
+            // `emptying_the_still_store_frees_nothing_while_the_base_holds_the_same_volume`.
+            //
+            // Every one of them is addressed by POINTER against the volume the
+            // base just let go, never by key: the still is keyed by the
+            // volume's own first radial, the loop cache by the second its S3
+            // key names, and the two are equal on 0 of 171 measured volumes.
+            //
+            // The chunk feed's assembled volume is deliberately NOT here. It is
+            // a sixth holder, filed with `archive: None` and outside the trade
+            // entirely, and `release_unneeded_base_gates` never reaches a base
+            // it produced because `archive_for_identity` finds nothing for one.
+            let mut freed: Vec<crate::volume_inventory::Still> =
+                self.volumes.release_stills_of(&released);
+            if self
+                .latest_cached_scans
+                .get(&site)
+                .is_some_and(|(scan, _, _, _)| std::sync::Arc::ptr_eq(scan, &released))
+                && let Some((scan, declared, _, _)) = self.latest_cached_scans.remove(&site)
+            {
+                self.volumes.forget_latest_site(&site);
+                freed.push((scan, declared));
             }
+            // The loop cache's decoded half, keeping its archive — the way
+            // back for all four. `evict_decoded_except` refuses a volume with
+            // no archive behind it, so this cannot strand one.
+            freed.extend(
+                self.loop_mgr
+                    .evict_decoded_except(|held, at, _| !(held == site && *at == address)),
+            );
+            freed.push((
+                released,
+                std::sync::Arc::new(squallar_radar::nyquist::DeclaredNyquist::empty()),
+            ));
+            squallar_worker::offload::discard_each(
+                "released-base-gates",
+                crate::volume_inventory::volume_drop_parts(freed),
+            );
         }
     }
 
@@ -3393,12 +3430,29 @@ impl App {
             let Some((address, _)) = self.loop_mgr.archive_for_identity(&site, collected) else {
                 continue;
             };
-            let Some((scan, _)) = self.loop_mgr.get_cached(&site, &address) else {
+            let Some((scan, declared)) = self.loop_mgr.get_cached(&site, &address) else {
                 continue;
             };
-            let scan = Arc::clone(scan);
-            if self.volumes.restore_base_gates(&site, scan) {
-                log::debug!("{site}: merge base restored from its archive");
+            let (scan, declared) = (Arc::clone(scan), Arc::clone(declared));
+            if self.volumes.restore_base_gates(&site, Arc::clone(&scan)) {
+                // **The still comes back with the base**, at the identity the
+                // base is keyed to — which is exactly the key a pane's
+                // `scan_info.timestamp` carries, so the plan-view render reads
+                // it back with the key it asks for. Both were released
+                // together and both are needed together: a base with gates
+                // beside a missing still would leave `dispatch_pane_renders`
+                // asking forever.
+                if self.volumes.still_for(&site, collected).is_none() {
+                    squallar_worker::offload::discard_each(
+                        "capped-still",
+                        crate::volume_inventory::volume_drop_parts(self.volumes.install_still(
+                            site.clone(),
+                            collected,
+                            (scan, declared),
+                        )),
+                    );
+                }
+                log::debug!("{site}: merge base and still restored from the archive");
             }
         }
     }

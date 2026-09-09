@@ -879,3 +879,162 @@ fn a_released_base_is_restored_once_however_often_it_is_asked() {
          queues a whole-volume decode every frame it is drawn",
     );
 }
+
+/// **The joint release: all four holders let go of one allocation, and
+/// `still scans` goes to zero for it.**
+///
+/// This is the cut. Releasing fewer frees nothing — both arrival paths clone
+/// ONE `Arc<Scan>` into the base, the still store and the loop download cache,
+/// so three holders would remain and `live_bytes` would not move. Each holder
+/// is asserted individually against what IT needs, never the set against a
+/// total: a release that dropped three and kept the loop cache's would satisfy
+/// any figure-shaped assertion and free nothing.
+///
+/// The byte claim is `still_scan_level()`, which is what the census publishes
+/// as `still scans` and is deterministic here — unlike `Arc::strong_count` at
+/// this level, which measures the process-global deferred-drop lane's
+/// occupancy and is asserted in `base_gate_release_tests` instead.
+///
+/// **No gate reader can obtain a gateless volume**, asserted rather than left
+/// to the type: `still_for` and `base_for` must answer `None`, not `Some` with
+/// empty buffers. That is the whole reason the skeleton lives in its own field
+/// behind its own type — the four readers that consume an empty buffer as real
+/// data (the raster fill that paints nothing and returns `Some`, the code
+/// plane refusal logged at `info!` and fallen through, `velocity::grid`'s
+/// all-`NaN` sweep sized from the scalar count, and `estimate_fold_limit`
+/// disarming by returning `None`) are unreachable only while that holds.
+#[test]
+fn the_joint_release_drops_every_holder_of_one_allocation() {
+    let mut app = app_on_site();
+    land_one_archive_volume(&mut app, SITE, at(0));
+    app.loop_mgr
+        .cache_archive(SITE, at(0), std::sync::Arc::new(vec![0u8; 4096]));
+
+    let (base, _) = app.volumes.base_for(SITE).expect("the base is resident");
+    let parked = app
+        .volumes
+        .newest_still_for(SITE)
+        .expect("the arrival installed a still");
+    assert!(
+        Arc::ptr_eq(
+            &app.volumes.still_for(SITE, parked).expect("a still").0,
+            &base
+        ),
+        "fixture: the still and the base are different allocations, so this \
+         scene is not the one the joint release exists for",
+    );
+    assert!(
+        app.loop_mgr
+            .get_cached(SITE, &at(0))
+            .is_some_and(|(scan, _)| Arc::ptr_eq(scan, &base)),
+        "fixture: the loop cache holds a different volume",
+    );
+    let one = app.still_scan_level();
+    assert!(one > 0, "fixture: a volume priced at nothing");
+
+    app.evict_unshown_scans();
+
+    // Each holder, against what IT needs.
+    assert!(
+        app.volumes.base_for(SITE).is_none(),
+        "the base still answers gate readers",
+    );
+    assert!(
+        app.volumes.still_for(SITE, parked).is_none(),
+        "the still store still holds the allocation, so the base's release \
+         freed nothing",
+    );
+    assert!(
+        !app.latest_cached_scans.contains_key(SITE),
+        "the per-site latest still holds the allocation",
+    );
+    assert!(
+        app.loop_mgr.get_cached(SITE, &at(0)).is_none(),
+        "the loop download cache still holds the allocation, which is three \
+         holders released and no bytes freed",
+    );
+    // The way back survived the release.
+    assert!(
+        app.loop_mgr.has_archive(SITE, &at(0)),
+        "the archive went with the volume, so nothing can decode it back",
+    );
+    assert!(
+        app.volumes.base_is_released(SITE),
+        "the base kept no structure, so the frame-thread readers have nothing",
+    );
+
+    assert_eq!(
+        app.still_scan_level(),
+        0,
+        "`still scans` did not fall to zero for a volume every holder let go",
+    );
+    assert!(
+        app.volumes.base_skeleton_bytes() > 0,
+        "the structure that replaced it is priced at nothing",
+    );
+}
+
+/// **What was released comes back whole**, base and still together, off the
+/// archive the release kept.
+///
+/// A release with no way back is a blank pane, so this drives the real restore:
+/// the decode lands in the loop cache and `restore_released_bases` takes it
+/// from there. Asserted on the GATES, not on presence — a restore that
+/// reinstalled a structurally plausible volume with different values would
+/// satisfy every count here and be a wrong picture.
+#[test]
+fn a_jointly_released_volume_comes_back_whole() {
+    use nexrad_model::data::DataMoment;
+
+    let mut app = app_on_site();
+    land_one_archive_volume(&mut app, SITE, at(0));
+    app.loop_mgr
+        .cache_archive(SITE, at(0), std::sync::Arc::new(vec![0u8; 4096]));
+    let (base, _) = app.volumes.base_for(SITE).expect("a base");
+    let collected = app.volumes.base_collected_at(SITE).expect("a base");
+    let gates: Vec<Vec<u8>> = base
+        .sweeps()
+        .iter()
+        .flat_map(nexrad_model::data::Sweep::radials)
+        .filter_map(nexrad_model::data::Radial::reflectivity)
+        .map(|m| m.raw_values().to_vec())
+        .collect();
+    assert!(
+        gates.iter().any(|g| !g.is_empty()),
+        "fixture: no gates to compare"
+    );
+
+    app.evict_unshown_scans();
+    assert!(
+        app.volumes.base_is_released(SITE) && app.volumes.still_for(SITE, collected).is_none(),
+        "precondition: the joint release happened",
+    );
+
+    // The volume arrives back in the loop cache — the one place a decode
+    // files it — and the state-derived pass takes it from there.
+    app.loop_mgr
+        .cache_scan(SITE, at(0), (Arc::clone(&base), Default::default()));
+    app.restore_released_bases();
+
+    let (restored, _) = app
+        .volumes
+        .base_for(SITE)
+        .expect("the base did not come back, so nothing that needs gates can be served");
+    assert!(
+        app.volumes.still_for(SITE, collected).is_some(),
+        "the base came back without the still, so the plan-view render asks \
+         forever for a volume nothing will reinstall",
+    );
+    let after: Vec<Vec<u8>> = restored
+        .sweeps()
+        .iter()
+        .flat_map(nexrad_model::data::Sweep::radials)
+        .filter_map(nexrad_model::data::Radial::reflectivity)
+        .map(|m| m.raw_values().to_vec())
+        .collect();
+    assert_eq!(after, gates, "the restored volume is not the one released");
+    assert!(
+        app.still_scan_level() > 0,
+        "the restored volume is priced at nothing",
+    );
+}
