@@ -106,6 +106,30 @@ impl Default for InspectorProbe {
     }
 }
 
+/// Where a click on the head of the crumb goes.
+///
+/// Recorded rather than acted on: the arms that raise it are reading
+/// `inspector_sel`, so nothing in them may take `self` mutably.
+enum CrumbHead {
+    AppSettings,
+    PaneProps,
+}
+
+/// The crumb's name for a pane, one-based as the pills and the title bar say it.
+fn pane_label(active_pane: usize) -> String {
+    format!("Pane {}", active_pane + 1)
+}
+
+/// The crumb's head: the pane, as a button that goes one level up.
+///
+/// `RichText::new` takes `impl Into<String>` and a `String` goes in unmoved, so
+/// the label is built once here rather than formatted and then copied out of a
+/// `&str`.
+fn crumb_head(ui: &mut egui::Ui, active_pane: usize, hover: &'static str) -> egui::Response {
+    ui.selectable_label(false, egui::RichText::new(pane_label(active_pane)).strong())
+        .on_hover_text(hover)
+}
+
 impl super::Gui {
     /// The inspector, in the slot its host chose — the map's top-right corner from
     /// the shell, the sheet's body from the phone shell.
@@ -247,57 +271,77 @@ impl super::Gui {
                 }
 
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    let pane_label = format!("Pane {}", self.active_pane + 1);
-                    let tail: String = match self.inspector_sel.clone() {
+                    // What the crumb's tail says is read by the probe and by
+                    // nothing else, so on a production build the `String` the
+                    // match used to return was allocated and dropped, once a
+                    // frame, for as long as the inspector stood open. The arms
+                    // below read `self.inspector_sel` by reference, so where the
+                    // head goes is recorded here and acted on under the match.
+                    #[cfg(test)]
+                    let tail;
+                    let mut head = None;
+
+                    match &self.inspector_sel {
                         InspectorSelection::AppSettings => {
                             ui.label(egui::RichText::new("App").strong());
                             ui.label("\u{203a}");
                             ui.label("Settings");
-                            "Settings".to_owned()
+                            #[cfg(test)]
+                            {
+                                tail = "Settings".to_owned();
+                            }
                         }
                         InspectorSelection::PaneProps => {
-                            let seg = ui
-                                .selectable_label(
-                                    false,
-                                    egui::RichText::new(pane_label.as_str()).strong(),
-                                )
-                                .on_hover_text("App \u{203a} Settings");
+                            let seg = crumb_head(ui, self.active_pane, "App \u{203a} Settings");
                             #[cfg(test)]
-                            probe.crumb_links.push((pane_label.clone(), seg.rect));
+                            probe
+                                .crumb_links
+                                .push((pane_label(self.active_pane), seg.rect));
                             if seg.clicked() {
-                                self.open_settings();
+                                head = Some(CrumbHead::AppSettings);
                             }
                             ui.label("\u{203a}");
                             ui.label("Properties");
-                            "Properties".to_owned()
+                            #[cfg(test)]
+                            {
+                                tail = "Properties".to_owned();
+                            }
                         }
                         InspectorSelection::Layer(kind) => {
-                            let seg = ui
-                                .selectable_label(
-                                    false,
-                                    egui::RichText::new(pane_label.as_str()).strong(),
-                                )
-                                .on_hover_text("This pane's properties");
+                            let seg = crumb_head(ui, self.active_pane, "This pane's properties");
                             #[cfg(test)]
-                            probe.crumb_links.push((pane_label.clone(), seg.rect));
+                            probe
+                                .crumb_links
+                                .push((pane_label(self.active_pane), seg.rect));
                             if seg.clicked() {
-                                self.select_pane_props();
+                                head = Some(CrumbHead::PaneProps);
                             }
                             ui.label("\u{203a}");
-                            let name = self.overlays.display_name(&kind).to_owned();
-                            ui.add(egui::Label::new(name.as_str()).truncate());
-                            name
+                            // Borrowed, and handed to the label as it is: an
+                            // owned copy here would be a second allocation
+                            // beside the one `Label::new` makes anyway.
+                            let name = self.overlays.display_name(kind);
+                            #[cfg(test)]
+                            {
+                                tail = name.to_owned();
+                            }
+                            ui.add(egui::Label::new(name).truncate());
                         }
-                    };
+                    }
+
+                    match head {
+                        Some(CrumbHead::AppSettings) => self.open_settings(),
+                        Some(CrumbHead::PaneProps) => self.select_pane_props(),
+                        None => {}
+                    }
+
                     #[cfg(test)]
                     {
                         probe.crumb = match self.inspector_sel {
                             InspectorSelection::AppSettings => "App \u{203a} Settings".to_owned(),
-                            _ => format!("{pane_label} \u{203a} {tail}"),
+                            _ => format!("{} \u{203a} {tail}", pane_label(self.active_pane)),
                         };
                     }
-                    #[cfg(not(test))]
-                    let _ = tail;
                 });
             });
         });
@@ -596,3 +640,7 @@ fn layer_opacity_hover(name: &str) -> String {
          Linked panes share it."
     )
 }
+
+#[path = "ui_inspector/probe_only_ratchet.rs"]
+#[cfg(test)]
+mod probe_only_ratchet;
