@@ -355,10 +355,35 @@ pub struct PolarFrameShape {
 ///
 /// Under `codes_retained` the peak is therefore exactly the chain:
 /// `host_peak() = sweeps × base + sweeps × (chain − base) = sweeps × chain`.
-/// With `codes_retained` false — the shipped loop default — `host_held` is 0
-/// and the peak is the scratch alone, which is still the mip tail and **not**
-/// zero: the codes must exist to be reduced, they are simply freed after the
-/// upload rather than kept.
+///
+/// # `codes_retained: false` does not describe any frame this tree builds
+///
+/// This paragraph read "with `codes_retained` false — the shipped loop
+/// default — `host_held` is 0 and the peak is the scratch alone … they are
+/// simply freed after the upload rather than kept". **Nothing frees them, and
+/// nothing can.**
+///
+/// A loop frame's payload is built by `squallar_app::render_dispatch`'s
+/// `fan_sweep` as ONE `Vec` of `CodePlane::resident_bytes()` — level 0
+/// followed by every mip level — handed to the pane inside an
+/// `Arc<FanSweep>`, and it is held for as long as the pane holds the frame.
+/// There is no free-after-upload step: `squallar_gpu::radar_fan` uploads only
+/// the levels `selected_level` says a draw will read and comes back to the
+/// host buffer when the zoom selects another, and its residency is a
+/// `Weak<FanSweep>` — so the payload IS the thing that keeps the GPU texture
+/// alive.
+///
+/// So the loop's real shape is `codes_retained` **true at the whole chain**,
+/// not at `base`, and it is retained per resident loop frame rather than once.
+/// Measured on a HEAVY6 leg (six panes, all playing, 720 × 1832 surveillance
+/// cuts): 22 to 34 payloads of 1,758,630 B live at the process peak — 36.9 to
+/// 57.0 MiB — which `squallar_egui::heap_census`' `loop frames` family reports
+/// as 40,737,002 B on the same leg and prices correctly.
+///
+/// The `false` arm is kept because it is what the design asks for and what a
+/// frame *could* cost; it is not what one costs today. Whoever wires this
+/// price up (see the darkness constraint below) must either select `true` for
+/// a loop frame or land the release the `false` arm describes first.
 ///
 /// # Not in this figure, because they are per **sweep-key**
 ///
