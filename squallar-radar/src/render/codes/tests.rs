@@ -218,9 +218,9 @@ impl CodeSource {
 
 /// Every product, where its gate values come from, and **whether an R8 code
 /// plane can carry it without dropping a distinction the raster paints
-/// today**. The last column is a claim the test recomputes from two
-/// independent measurements; it is never read back from the thing it
-/// describes.
+/// today**. The last column is a claim the test recomputes from the middle
+/// one — the format's own bound on a gate — and never reads back from the
+/// thing it describes.
 ///
 /// Complete by assertion: a new [`RadarProduct`] with no row here fails the
 /// walk rather than defaulting into a verdict.
@@ -275,42 +275,47 @@ const R8_FIDELITY: &[(RadarProduct, CodeSource, bool)] = &[
     (
         RadarProduct::ProbabilityOfSevereHail,
         CodeSource::Computed,
-        true,
+        false,
     ),
     (
         RadarProduct::MaxExpectedHailSize,
         CodeSource::Computed,
-        true,
+        false,
     ),
 ];
 
-/// **An R8 plane is exact for a wire-coded byte moment and lossy for a
-/// computed field with a gradient palette — measured, per product.**
+/// **An R8 plane is exact for a wire-coded byte moment and lossy for every
+/// computed field — measured, per product.**
 ///
 /// This is the fidelity question the polar representation has to answer before
-/// anything renders through it, and it has two independent halves that must
-/// not be conflated:
+/// anything renders through it, and the quantity that answers it is **how many
+/// distinct values a gate can hold**. For an 8-bit moment that is 254, because
+/// the wire says so; an R8 plane stores those codes *as measured*, which is
+/// why polar is not a quality trade there. For a computed field there is no
+/// wire code at all, so nothing bounds it: quantising a continuous `f32` into
+/// 254 codes drops every distinction finer than the quantum.
 ///
-/// * **How many values a gate can hold.** For an 8-bit moment that is 254,
-///   because the wire says so. An R8 plane stores those codes *as measured*,
-///   which is why polar is not a quality trade there — and it is why the
-///   width of the palette is irrelevant for such a product. Reflectivity's
-///   palette resolves several thousand distinct colours across its extent, and
-///   a real reflectivity sweep still shows at most 254 of them, today and
-///   under a code plane alike.
-/// * **How many colours the palette can show.** That decides the *computed*
-///   fields, which have no wire code at all: quantising a continuous `f32`
-///   into 254 codes drops every distinction finer than the quantum.
+/// The verdict is therefore `reachable values <= PAINTABLE_CODES`, and each
+/// side is sound rather than estimated — an upper bound from the encoding for
+/// lossless, its absence for lossy. Nothing here is decided on a sample.
 ///
-/// The verdict is `min(reachable values, palette width) <= PAINTABLE_CODES`,
-/// and each side is established soundly rather than by a converged estimate:
+/// **The palette does not enter the verdict, and that is a correction.** Until
+/// 2026-09-09 a banded scale's own stop count could license a *lossless*
+/// verdict, on the argument that a picture with twelve colours in it loses
+/// nothing to 254 codes. The picture does not; the readout does. A plane is
+/// read twice — `Lut::entry` colours it and `Lut::value_of` answers a hover off
+/// it, and `PolarField::at` has to return the number the raster's own grid
+/// held — so the count that must fit is the count of values, and a banded
+/// palette bounds the count of colours.
+/// `the_palette_bounds_the_colours_and_a_plane_has_to_hold_the_values`
+/// exhibits the two products where those two answers disagree, so the rule
+/// cannot quietly come back.
 ///
-/// * a **lossy** verdict needs a *lower* bound on the palette's width, and
-///   sampling gives exactly that — a probe can miss a colour between two
-///   samples, never invent one;
-/// * a **lossless** verdict needs an *upper* bound, which comes either from
-///   the encoding (254 wire codes) or, for a banded scale, from its own stop
-///   count. No gradient-palette product is declared lossless on a sample.
+/// The palette walk stays, because it is a real measurement of a real
+/// quantity: it is asserted to find *something* inside every product's own
+/// legend extent, and never to exceed a banded scale's stop count. A sampled
+/// count of distinct outputs can only miss a colour between two probes, never
+/// invent one, so it is a floor and is used as one.
 #[test]
 fn an_r8_plane_is_exact_for_wire_bytes_and_lossy_for_computed_gradients() {
     const SAMPLES: usize = 200_000;
@@ -354,27 +359,12 @@ fn an_r8_plane_is_exact_for_wire_bytes_and_lossy_for_computed_gradients() {
             );
         }
 
-        // Lossless needs an upper bound from SOME side.
+        // Lossless needs an upper bound on the VALUES, and only the encoding
+        // gives one: a palette ceiling bounds colours, which is a different
+        // quantity and not the one a plane has to hold.
         let bounded_lossless = source
             .reachable_values()
-            .is_some_and(|v| v <= PAINTABLE_CODES)
-            || palette_ceiling.is_some_and(|c| c <= PAINTABLE_CODES);
-        // Lossy needs a lower bound, on both sides at once: the encoding must
-        // be able to produce more values than the plane holds AND the palette
-        // must actually distinguish more of them than the plane can index.
-        let bounded_lossy = source
-            .reachable_values()
-            .is_none_or(|v| v > PAINTABLE_CODES)
-            && floor > PAINTABLE_CODES;
-
-        assert!(
-            bounded_lossless != bounded_lossy,
-            "{product:?} is neither soundly lossless nor soundly lossy: source {source:?} \
-             ({:?} reachable values), palette floor {floor}, palette ceiling \
-             {palette_ceiling:?}. A gradient palette over a wide encoding cannot be declared \
-             exact on a sampled floor.",
-            source.reachable_values(),
-        );
+            .is_some_and(|v| v <= PAINTABLE_CODES);
         assert_eq!(
             bounded_lossless,
             claimed_lossless,
@@ -392,12 +382,13 @@ fn an_r8_plane_is_exact_for_wire_bytes_and_lossy_for_computed_gradients() {
         // Without this the module would carry an unmeasured second opinion.
         let narrow_lossless = source
             .reachable_values_narrow()
-            .is_some_and(|v| v <= PAINTABLE_CODES)
-            || palette_ceiling.is_some_and(|c| c <= PAINTABLE_CODES);
+            .is_some_and(|v| v <= PAINTABLE_CODES);
         assert_eq!(
             crate::render::codes::r8_fidelity(product).admits_eight_bit_wire(),
             narrow_lossless,
-            "{product:?}: `r8_fidelity` says {:?} while the measurement says lossless=             {bounded_lossless}. `CodePlane::build` gates on the former, so a disagreement              means the encoder admits or refuses the wrong product.",
+            "{product:?}: `r8_fidelity` says {:?} while the measurement says \
+             lossless={bounded_lossless}. `CodePlane::build` gates on the former, so a \
+             disagreement means the encoder admits or refuses the wrong product.",
             crate::render::codes::r8_fidelity(product),
         );
 
@@ -433,6 +424,68 @@ fn an_r8_plane_is_exact_for_wire_bytes_and_lossy_for_computed_gradients() {
             );
         }
     }
+}
+
+/// **A banded palette bounds the colours, and a plane has to hold the
+/// values** — exhibited at the two products where those two answers disagree.
+///
+/// The rule the walk above dropped on 2026-09-09 read a lossless verdict off a
+/// banded scale's own stop count. That rule is sound about the *picture* and
+/// silent about the *readout*, and probability of severe hail and maximum
+/// expected hail size are where the difference shows: ten and twelve stops
+/// against 352 and 6,167 distinct painted values on real archive volumes.
+///
+/// This asserts the disagreement rather than the figures, because the figures
+/// come off data this suite does not carry. What it holds is the shape of the
+/// mistake: both products have a banded palette narrow enough that the dropped
+/// rule *would* have admitted them, their encoding bounds nothing, and
+/// [`r8_fidelity`] refuses them anyway. Reinstate the palette clause in either
+/// place and this goes red naming the product.
+#[test]
+fn the_palette_bounds_the_colours_and_a_plane_has_to_hold_the_values() {
+    let mut witnesses = Vec::new();
+    for &(product, source, _) in R8_FIDELITY {
+        let scale = palette::get_legend_scale_ref(product);
+        // The dropped rule, spelled out so it is the thing under test rather
+        // than a description of it.
+        let palette_would_admit = !scale.is_gradient && scale.thresholds.len() <= PAINTABLE_CODES;
+        if source != CodeSource::Computed || !palette_would_admit {
+            continue;
+        }
+        witnesses.push(product);
+        assert_eq!(
+            source.reachable_values(),
+            None,
+            "{product:?} is a computed field, so nothing in the encoding bounds a gate; a \
+             bound here would mean the source column is wrong",
+        );
+        assert!(
+            !r8_fidelity(product).admits_eight_bit_wire(),
+            "{product:?} has a palette of {} stops and would be admitted by the palette rule, \
+             and it paints far more distinct values than {PAINTABLE_CODES} on real \
+             volumes. `r8_fidelity` says {:?}.",
+            scale.thresholds.len(),
+            r8_fidelity(product),
+        );
+        assert_eq!(
+            r8_fidelity(product),
+            R8Fidelity::ComputedValuesTooWide,
+            "{product:?} is refused for what its values do and not for what its palette \
+             does, and the verdict has to say which",
+        );
+    }
+    // Named and not counted: the whole test is vacuous if the disagreement
+    // stops occurring, and a rename or a re-banded palette is exactly how it
+    // would stop occurring quietly.
+    assert_eq!(
+        witnesses,
+        [
+            RadarProduct::ProbabilityOfSevereHail,
+            RadarProduct::MaxExpectedHailSize,
+        ],
+        "the products where a narrow palette disagrees with a wide value set are not the \
+         ones they were",
+    );
 }
 
 /// A deterministic code field with every feature the reduce has to handle:
@@ -680,6 +733,11 @@ fn a_hostile_polar_payload_is_refused() {
 /// planes and its §2.4 reduce table adds KDP, VIL, EchoTops and VIL density;
 /// all six are refused here, so following the document cannot produce the
 /// regression.
+///
+/// **The refusal is asserted as a variant and not as an `Err`.** Two of these
+/// eleven changed sides on 2026-09-09 and the reason they changed is the whole
+/// of the finding, so a conjunct that only checked *that* something refused
+/// would read the same before and after.
 #[test]
 fn a_product_an_r8_plane_cannot_carry_is_refused() {
     // This test refuses payloads too, so it is one of the neighbours whose
@@ -691,7 +749,7 @@ fn a_product_an_r8_plane_cannot_carry_is_refused() {
         let key = LutKey::identity(product);
         let built = CodePlane::build(4, 4, vec![0; 16], key, 8);
         match r8_fidelity(product) {
-            R8Fidelity::WireByteExact | R8Fidelity::ComputedPaletteFits => {
+            R8Fidelity::WireByteExact => {
                 assert!(
                     built.is_ok(),
                     "{product:?} is exact at eight bits and was refused"
@@ -736,8 +794,25 @@ fn a_product_an_r8_plane_cannot_carry_is_refused() {
              plane, and it is measurably lossy there",
         );
     }
-    assert_eq!(refused.len(), 9, "{refused:?}");
-    assert_eq!(admitted.len(), 8, "{admitted:?}");
+    // And the two that a narrow palette used to walk past this door, named
+    // with the verdict that stops them, because the count alone would be
+    // satisfied by any other pair moving the other way.
+    for product in [
+        RadarProduct::ProbabilityOfSevereHail,
+        RadarProduct::MaxExpectedHailSize,
+    ] {
+        assert_eq!(
+            CodePlane::build(4, 4, vec![0; 16], LutKey::identity(product), 8),
+            Err(PlaneRefusal::NotRepresentable {
+                product,
+                fidelity: R8Fidelity::ComputedValuesTooWide,
+            }),
+            "{product:?} paints more distinct values than a byte can address on real volumes, \
+             and its banded palette is not a second way onto a plane",
+        );
+    }
+    assert_eq!(refused.len(), 11, "{refused:?}");
+    assert_eq!(admitted.len(), 6, "{admitted:?}");
     assert_eq!(refused.len() + admitted.len(), RadarProduct::all().len());
 }
 

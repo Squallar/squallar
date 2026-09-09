@@ -14,8 +14,8 @@
 //! What decides the figure is how often anything still asks for the pair, and
 //! that is a **product roster**, not a policy. `render::codes::r8_fidelity`
 //! admits five products outright and a sixth on an eight-bit wire; the other
-//! ten are refused a plane and render exactly the raster this build has always
-//! produced. Every one of those checks out the pooled pair.
+//! eleven are refused a plane and render exactly the raster this build has
+//! always produced. Every one of those checks out the pooled pair.
 //!
 //! This file pins the two ends of that fork on ONE sweep:
 //!
@@ -262,9 +262,9 @@ fn a_plane_arm_touches_neither_pooled_buffer_and_a_refused_wire_word_reaches_bot
 
     // ── The roster's live half ───────────────────────────────────────────────
     // Differential phase is `R8Fidelity::WireWordTooWide`: its moment block is
-    // sixteen bits and truncating one would be a silent quantiser. Ten of the
-    // sixteen products are refused a plane for reasons of this kind, and every
-    // one of them renders exactly this.
+    // sixteen bits and truncating one would be a silent quantiser. Eleven of
+    // the seventeen products are refused a plane for reasons of this kind, and
+    // every one of them renders exactly this.
     // **The reason and the consequence, and the reason first.** `is_none()`
     // alone would not pin the arm this names: with the width guard removed the
     // producer still refuses a sixteen-bit moment further down, where the

@@ -30,13 +30,21 @@
 //! asserts that as byte equality over every entry, not as a tolerance.
 //!
 //! Where the codes are **not** the wire's — a derived field computed as `f32`,
-//! or a 16-bit moment — a 256-entry table is a **quantiser**, and whether that
-//! is lossless is a property of the product's own palette rather than of the
-//! representation. `an_r8_plane_is_exact_for_wire_bytes_and_lossy_for_computed_gradients`
-//! measures both halves per product and derives the verdict, and it finds the
-//! split real in both directions: an R8 plane carries every 8-bit wire moment
-//! exactly and drops distinctions on every computed field with a gradient
-//! palette.
+//! or a 16-bit moment — a 256-entry table is a **quantiser**, and nothing in
+//! the encoding bounds what it would have to quantise.
+//! `an_r8_plane_is_exact_for_wire_bytes_and_lossy_for_computed_gradients`
+//! derives the verdict from that and finds the split real in both directions:
+//! an R8 plane carries every 8-bit wire moment exactly and drops distinctions
+//! on every computed field.
+//!
+//! **A narrow palette is not a second way in.** It was, until 2026-09-09: two
+//! computed products rode a banded scale of ten and twelve stops into the
+//! admitted set on the argument that 254 codes hold every colour they can
+//! show. They do. But a plane is read twice — the table colours it and
+//! `Lut::value_of` answers a hover off it — so the count that has to fit is
+//! the count of distinct **values**, and on 124 real archive volumes across 15
+//! sites those two paint up to 352 and 6,167 of them. See
+//! [`R8Fidelity::ComputedValuesTooWide`].
 
 use crate::palette::{self, get_color_for_value};
 use crate::types::RadarProduct;
@@ -321,10 +329,14 @@ pub enum PlaneRefusal {
 /// distinction the raster paints today.
 ///
 /// Measured, not assumed — `an_r8_plane_is_exact_for_wire_bytes_and_lossy_for_computed_gradients`
-/// derives every one of these from two independent quantities (how many values
-/// the encoding can produce, and how many colours the palette resolves over
-/// the extent its own legend declares) and fails if this table disagrees with
-/// the measurement.
+/// derives every one of these from how many **values** the encoding can
+/// produce, and fails if this table disagrees with it. The palette walk that
+/// runs beside it is a second, independent measurement of a *different*
+/// quantity — how many colours the product resolves over the extent its own
+/// legend declares — and it corroborates the computed products' verdict
+/// without deciding it, because a plane answers a hover as well as painting a
+/// picture. `the_palette_bounds_the_colours_and_a_plane_has_to_hold_the_values`
+/// holds the two apart at the products where they disagree.
 ///
 /// **`docs/radar-polar-design.md` §7 and §2.4 put six lossy products on R8
 /// planes** — NROT and SRV in phase D, and KDP, VIL, EchoTops and VIL density
@@ -352,28 +364,58 @@ pub enum R8Fidelity {
     /// distinct colours over the product's own extent than the plane has
     /// paintable codes.
     ComputedPaletteTooWide,
-    /// Computed like the arm above, but over a **banded** palette narrow
-    /// enough that 254 codes hold every colour it can show. Fidelity admits
-    /// it; note that no quantiser is defined for these products anywhere, so
-    /// admitting one is not the same as being ready to build it.
-    ComputedPaletteFits,
+    /// Computed like the arm above, over a **banded** palette narrow enough
+    /// that 254 codes hold every colour it can show — and refused anyway,
+    /// because a plane has to answer the *numbers* and not only the picture.
+    ///
+    /// A code plane is read twice: [`Lut::entry`] colours it and
+    /// [`Lut::value_of`] answers a hover off it, and
+    /// `crate::render::polar::PolarField::at` returns the number the raster's
+    /// own grid held. So what a byte has to address is the count of distinct
+    /// **values** a render paints, and a banded palette bounds the count of
+    /// distinct **colours** — a different quantity, and for these two an
+    /// enormously smaller one.
+    ///
+    /// **Measured on 124 real archive volumes across 15 sites**, as the
+    /// distinct `f32` bit patterns each render's own `PolarField` holds over
+    /// every gate it painted:
+    ///
+    /// | product | distinct values, max | volumes past 254 |
+    /// |---|---|---|
+    /// | probability of severe hail | 352 | 3 of 124 |
+    /// | maximum expected hail size | 6,167 | 21 of 124 |
+    ///
+    /// against 10 and 12 distinct colours respectively on the same renders.
+    /// Restricting the count to gates the palette actually inks does not
+    /// rescue either — 295 and 637 at the top, past 254 on 2 and 9 volumes.
+    /// The first volume over the line reads exactly 255, so the bound is live
+    /// and not decorative.
+    ComputedValuesTooWide,
 }
 
 impl R8Fidelity {
     /// Whether an R8 plane is lossless for this verdict on the **narrow** wire
-    /// form — the question the palette measurement answers, with the wide-word
-    /// case held out because that is a domain refusal and not a palette one.
+    /// form, with the wide-word case held out because that is a domain refusal
+    /// rather than a question about the values.
     pub fn admits_eight_bit_wire(self) -> bool {
         self.admits(8)
     }
 
     /// Whether a plane may be built for this verdict at all, given the wire
     /// word size the sweep carried.
+    ///
+    /// **Only an encoding admits.** Every arm that says yes says it because
+    /// the wire bounds one gate at [`PAINTABLE_CODES`] distinct values; no arm
+    /// says it because a palette is narrow, and
+    /// `the_palette_bounds_the_colours_and_a_plane_has_to_hold_the_values`
+    /// exhibits the two products where those answers differ.
     fn admits(self, word_bits: u8) -> bool {
         match self {
-            R8Fidelity::WireByteExact | R8Fidelity::ComputedPaletteFits => true,
+            R8Fidelity::WireByteExact => true,
             R8Fidelity::ExactOnEightBitWireOnly => word_bits == 8,
-            R8Fidelity::WireWordTooWide | R8Fidelity::ComputedPaletteTooWide => false,
+            R8Fidelity::WireWordTooWide
+            | R8Fidelity::ComputedPaletteTooWide
+            | R8Fidelity::ComputedValuesTooWide => false,
         }
     }
 }
@@ -396,12 +438,12 @@ pub fn r8_fidelity(product: RadarProduct) -> R8Fidelity {
         | RadarProduct::VerticallyIntegratedLiquid
         | RadarProduct::VilDensity
         | RadarProduct::PrecipitationRate => R8Fidelity::ComputedPaletteTooWide,
-        // Banded scales of ten and twelve stops: an R8 plane holds them with
-        // room to spare. They are not migrated for size reasons rather than
-        // fidelity ones -- 360 x 230 cells is 82.8 KB and the polar win does
-        // not pay for defining a quantiser -- but nothing here forbids it.
+        // Banded scales of ten and twelve stops, and the plane still cannot
+        // carry them: what a byte has to address is the numbers a hover reads
+        // back, not the colours the picture shows. See
+        // `R8Fidelity::ComputedValuesTooWide` for the counts.
         RadarProduct::ProbabilityOfSevereHail | RadarProduct::MaxExpectedHailSize => {
-            R8Fidelity::ComputedPaletteFits
+            R8Fidelity::ComputedValuesTooWide
         }
     }
 }

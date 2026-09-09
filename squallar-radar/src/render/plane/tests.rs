@@ -288,17 +288,18 @@ fn a_sweep_with_no_moment_is_refused() {
     );
 }
 
-/// **The nine products an eight-bit plane cannot carry never come back as
+/// **The eleven products an eight-bit plane cannot carry never come back as
 /// one**, and where the sweep carries their field the refusal is the fidelity
 /// verdict rather than the absence of data.
 ///
-/// The split is the whole test. Five of the nine read a moment slot, so a
+/// The split is the whole test. Six of the eleven read a moment slot, so a
 /// sweep carrying reflectivity, velocity and differential phase reaches
 /// `CodePlane::build`'s own verdict for them — and a bare
-/// `is_err()` over all nine would have been satisfied by `NoMoment` for every
-/// one, which is a refusal that says nothing about fidelity. The other four
-/// are computed from a whole volume and have no slot at all; for those the
-/// domain verdict is asserted directly, because this producer cannot reach it.
+/// `is_err()` over all eleven would have been satisfied by `NoMoment` for
+/// every one, which is a refusal that says nothing about fidelity. The other
+/// five are computed from a whole volume and have no slot at all; for those
+/// the domain verdict is asserted directly, because this producer cannot reach
+/// it.
 ///
 /// Both group sizes are pinned, so a product that moved between them shows up
 /// here rather than sliding quietly into the vacuous half.
@@ -314,8 +315,10 @@ fn the_lossy_products_are_refused_at_the_producer() {
         RadarProduct::EchoTopsInterpolated,
         RadarProduct::VilDensity,
         RadarProduct::DifferentialPhase,
+        RadarProduct::ProbabilityOfSevereHail,
+        RadarProduct::MaxExpectedHailSize,
     ];
-    assert_eq!(refused.len(), 9, "nine refused, eight admitted");
+    assert_eq!(refused.len(), 11, "eleven refused, six admitted");
     let _ledger = crate::render::codes::hold_refusal_ledger();
     let radials = a_three_moment_sweep(4, 12);
     let (mut with_field, mut without_field) = (Vec::new(), Vec::new());
@@ -356,6 +359,12 @@ fn the_lossy_products_are_refused_at_the_producer() {
             "StormRelativeVelocity",
             "EchoTopsInterpolated",
             "DifferentialPhase",
+            // The hail pair reads the reflectivity slot, so this sweep really
+            // does put their verdict through `CodePlane::build` rather than
+            // stopping at `NoMoment` — which is what makes their move to the
+            // refused set observable here at all.
+            "ProbabilityOfSevereHail",
+            "MaxExpectedHailSize",
         ],
         "the refused products this sweep can actually put through the fidelity \
          verdict are not the ones they were",
@@ -373,8 +382,8 @@ fn the_lossy_products_are_refused_at_the_producer() {
 }
 
 /// A sweep whose radials carry reflectivity and velocity at eight bits and
-/// differential phase at sixteen — every moment slot the nine refused products
-/// read between them.
+/// differential phase at sixteen — every moment slot the eleven refused
+/// products read between them.
 fn a_three_moment_sweep(n_radials: usize, gates: usize) -> Vec<Radial> {
     let spacing = 360.0 / n_radials as f32;
     (0..n_radials)
