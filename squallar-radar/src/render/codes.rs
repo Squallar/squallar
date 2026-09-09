@@ -8,15 +8,8 @@
 //!
 //! **A renderer emits planes now** — [`crate::render::render_sweep_plane`],
 //! through [`crate::render::plane`], for a Level II plan view whose caller
-//! asked for the polar surface. What is still dark is the *draw*: no build
-//! installs a `RadarFanPainter`, so nothing paints through this table on a
-//! shipped scene, and `squallar_device_profile`'s polar price stays unselected
-//! with it — that crate scrapes for its own function's name as a literal, so
-//! this sentence names it only by description. The fidelity question was
-//! answerable before any pixel
-//! moved for the same reason it still is: a 256-entry table is exact for some
-//! products and cannot be for others, and `codes/tests.rs` settles which is
-//! which by measurement rather than by assumption.
+//! asked for the polar surface. The fidelity question is answered by
+//! measurement rather than by assumption, and `codes/tests.rs` settles it.
 //!
 //! # Why a bake loses nothing where it is exact
 //!
@@ -37,14 +30,24 @@
 //! an R8 plane carries every 8-bit wire moment exactly and drops distinctions
 //! on every computed field.
 //!
-//! **A narrow palette is not a second way in.** It was, until 2026-09-09: two
-//! computed products rode a banded scale of ten and twelve stops into the
-//! admitted set on the argument that 254 codes hold every colour they can
-//! show. They do. But a plane is read twice — the table colours it and
-//! `Lut::value_of` answers a hover off it — so the count that has to fit is
-//! the count of distinct **values**, and on 124 real archive volumes across 15
-//! sites those two paint up to 352 and 6,167 of them. See
-//! [`R8Fidelity::ComputedValuesTooWide`].
+//! **A narrow palette is not a second way in.** A plane is read twice — the
+//! table colours it and `Lut::value_of` answers a hover off it — so the count
+//! that has to fit is the count of distinct **values** and never the count of
+//! distinct colours. Two computed products rode a banded scale of ten and
+//! twelve stops into the admitted set on the second count until 2026-09-09,
+//! and on 124 real archive volumes across 15 sites they paint up to 352 and
+//! 6,167 numbers. See [`R8Fidelity::ComputedValuesTooWide`].
+//!
+//! # The count is a sweep's, not a product's
+//!
+//! Everything above is about [`PlaneDecode::Affine`], where the codes are the
+//! wire's own words and a product's verdict is the same for every sweep of it.
+//! [`PlaneDecode::Table`] is the other half: its codes index the numbers **one
+//! sweep actually painted**, so the question "do these fit a byte?" is asked
+//! of the plane in hand. A computed field refused wholesale by
+//! [`r8_fidelity`] still takes a plane on the sweeps whose realised values
+//! number 254 or fewer, and stays a raster on the rest. Neither form ever
+//! rounds: the table holds the painted bit patterns themselves.
 
 use crate::palette::{self, get_color_for_value};
 use crate::types::RadarProduct;
@@ -101,6 +104,154 @@ impl LutKey {
     }
 }
 
+/// **The first code a [`PlaneDecode::Table`] entry may take.**
+///
+/// The two sentinels keep the meanings they have in the affine form —
+/// [`BELOW_THRESHOLD_CODE`] paints nothing and [`RANGE_FOLDED_CODE`] paints
+/// [`palette::RANGE_FOLDED`] — so [`Reduce`]'s exclusion of them, the mip
+/// chain's fallback and the raster's own "no gate here" all read the same in
+/// both forms. What is left is [`PAINTABLE_CODES`], which is therefore both
+/// the ceiling on a table and the bar a sweep is measured against.
+pub const FIRST_TABLE_CODE: u8 = (LUT_ENTRIES - PAINTABLE_CODES) as u8;
+
+/// **What one plane's codes mean**, in the two forms a code plane decodes
+/// through.
+///
+/// The split is a fidelity one and not a stylistic one. A wire moment's 256
+/// reachable values *are* `(c - offset) / scale` over every byte, so naming
+/// that pair names all of them in nine bytes and the affine arm is exact by
+/// construction. A field computed as `f32` per gate has no such rule: what it
+/// paints is whatever the arithmetic produced, and the only exact description
+/// of that is the list of patterns themselves.
+///
+/// **The table arm is admitted per sweep and never per product.**
+/// [`r8_fidelity`] refuses a computed field wholesale because *some* of its
+/// sweeps paint tens of thousands of distinct numbers, and a particular sweep
+/// that paints two hundred is refused with them. A table is measured off the
+/// plane in hand instead — `PolarField::compact_values`'s own rule, in the
+/// form the picture can be drawn from — so a sweep that fits takes the plane
+/// losslessly and a sweep that does not stays a raster and says so through
+/// [`PlaneRefusal::TableWidth`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum PlaneDecode {
+    /// The codes are the wire's own words and [`LutKey`] says what each means.
+    Affine {
+        key: LutKey,
+        /// The wire word size the codes arrived at — 8 or 16.
+        ///
+        /// **Provenance, and not re-derivable from what the plane stores.**
+        /// [`r8_fidelity`] answers which widths a product *admits*, which for
+        /// differential reflectivity is a strictly wider set than the one
+        /// width a given sweep carried. An inference would be a second
+        /// opinion about admissibility on the decode side.
+        word_bits: u8,
+    },
+    /// The codes index the distinct bit patterns this sweep actually painted.
+    ///
+    /// **An indexing and never a rounding.** `values` holds the painted
+    /// numbers themselves, so a read-back through [`CodePlane::value_table`]
+    /// returns the pattern the raster's own grid held; what bounds the form is
+    /// the *count* of them, and a sweep with more than [`PAINTABLE_CODES`] is
+    /// refused rather than quantised onto the ones that fit.
+    Table {
+        product: RadarProduct,
+        /// **Strictly ascending under [`f32::total_cmp`] and every entry
+        /// finite**, indexed by `code - FIRST_TABLE_CODE`.
+        ///
+        /// Ascending because [`Reduce::MaxCode`] is defined as "the strongest
+        /// echo is the largest code", which is a statement about the numbers
+        /// and is false for a table in first-seen order. Finite because a NaN
+        /// entry would be a third spelling of "nothing here" beside the two
+        /// sentinels, and `PolarField::at` answers `None` for all three
+        /// without being able to say which.
+        values: Vec<f32>,
+    },
+}
+
+impl PlaneDecode {
+    /// The product this plane paints, whichever form says so.
+    pub fn product(&self) -> RadarProduct {
+        match self {
+            Self::Affine { key, .. } => key.product,
+            Self::Table { product, .. } => *product,
+        }
+    }
+
+    /// The wire word size an affine plane's codes arrived at, or `None` for a
+    /// table plane, whose codes arrived at no wire width at all.
+    pub fn word_bits(&self) -> Option<u8> {
+        match self {
+            Self::Affine { word_bits, .. } => Some(*word_bits),
+            Self::Table { .. } => None,
+        }
+    }
+
+    /// **What every code a byte can address decodes to as a number** — the
+    /// [`LUT_ENTRIES`]-long table a coded `PolarField` indexes.
+    ///
+    /// Whole rather than only the codes a sweep happens to carry, so it is a
+    /// function of the decode alone and two planes decoded the same way cannot
+    /// come to hold different tables. A code past a table plane's entries
+    /// takes the unpainted marker, which is what [`CodePlane::build`] has
+    /// already refused a plane for carrying.
+    pub fn value_table(&self) -> Vec<f32> {
+        match self {
+            Self::Affine { key, .. } => Lut::value_table(*key),
+            Self::Table { values, .. } => {
+                let mut out = vec![crate::render::polar::UNPAINTED; LUT_ENTRIES];
+                out[usize::from(RANGE_FOLDED_CODE)] = crate::render::RANGE_FOLDED_SENTINEL;
+                let first = usize::from(FIRST_TABLE_CODE);
+                out[first..first + values.len()].copy_from_slice(values);
+                out
+            }
+        }
+    }
+
+    /// The magnitude [`Reduce::MaxMagnitude`] ranks `code` by, scaled to an
+    /// integer so the ordering is total and the reduction associative.
+    ///
+    /// Read in each form's own space, and the two are the same ordering said
+    /// twice: an affine map is monotone in `|c − offset|` whatever its scale's
+    /// sign, and a table is ascending in the numbers themselves.
+    ///
+    /// The affine arm measures from the **rounded** offset — the code at which
+    /// the decode reaches zero — because the quantity being ranked is a
+    /// distance in code space and the zero it is measured from is a code.
+    fn magnitude_of(&self, code: u8) -> i64 {
+        let value = match self {
+            Self::Affine { key, .. } => f32::from(code) - key.offset.round(),
+            Self::Table { values, .. } => usize::from(code)
+                .checked_sub(usize::from(FIRST_TABLE_CODE))
+                .and_then(|i| values.get(i).copied())
+                .unwrap_or(0.0),
+        };
+        (value.abs() * 1_000.0) as i64
+    }
+}
+
+/// The first index at which `values` is not a strictly ascending run of finite
+/// numbers, or `None` where it is one.
+///
+/// [`f32::total_cmp`] and not `<`: the ordering has to separate `-0.0` from
+/// `0.0`, because the table's entries are the **bit patterns** a render
+/// painted and the wire has to bring them back byte for byte. A `<` that
+/// called those two equal would admit a table with a duplicate in it, and the
+/// duplicate would be one gate's measurement answering under another gate's
+/// code.
+fn first_disordered(values: &[f32]) -> Option<usize> {
+    for (i, value) in values.iter().enumerate() {
+        if !value.is_finite() {
+            return Some(i);
+        }
+        if let Some(next) = values.get(i + 1)
+            && value.total_cmp(next) != std::cmp::Ordering::Less
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
 /// A baked 256-entry RGBA colour table: [`crate::palette::get_color_for_value`]
 /// evaluated once per code instead of once per gate.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,6 +293,35 @@ impl Lut {
             BELOW_THRESHOLD_CODE => (0, 0, 0, 0),
             RANGE_FOLDED_CODE => palette::RANGE_FOLDED,
             _ => get_color_for_value(key.product, (f32::from(code) - key.offset) / key.scale),
+        }
+    }
+
+    /// Bake the table for a whole [`PlaneDecode`] — the one entry point a
+    /// consumer of a plane uses, so neither form is reached by naming it.
+    ///
+    /// The affine arm is [`Self::build`] unchanged. The table arm colours the
+    /// numbers the sweep painted, and it reads them through
+    /// [`PlaneDecode::value_table`] rather than off `values` directly, so the
+    /// colour a code shows and the number a hover reads back come out of one
+    /// array — including at the two sentinels, whose colours are the same in
+    /// both forms because their codes are.
+    pub fn of(decode: &PlaneDecode) -> Self {
+        match decode {
+            PlaneDecode::Affine { key, .. } => Self::build(*key),
+            PlaneDecode::Table { product, .. } => {
+                let values = decode.value_table();
+                let mut entries = [(0, 0, 0, 0); LUT_ENTRIES];
+                for (entry, value) in entries.iter_mut().zip(values) {
+                    *entry = match value.to_bits() {
+                        bits if bits == crate::render::polar::UNPAINTED.to_bits() => (0, 0, 0, 0),
+                        bits if bits == crate::render::RANGE_FOLDED_SENTINEL.to_bits() => {
+                            palette::RANGE_FOLDED
+                        }
+                        _ => get_color_for_value(*product, value),
+                    };
+                }
+                Self { entries }
+            }
         }
     }
 
@@ -323,6 +503,27 @@ pub enum PlaneRefusal {
         product: RadarProduct,
         word_bits: u8,
     },
+    /// **This sweep painted more distinct numbers than a byte can name**, or
+    /// none at all — the per-sweep half of the fidelity door, and the arm that
+    /// makes a [`PlaneDecode::Table`] plane lossless rather than merely small.
+    ///
+    /// Refused and never truncated: dropping the entries past the ceiling
+    /// would map every gate holding one onto a number nobody measured.
+    TableWidth { entries: usize },
+    /// A table that is not a strictly ascending run of finite numbers, at the
+    /// first index where it stops being one.
+    ///
+    /// [`Reduce::MaxCode`] means "the largest code is the strongest echo", so
+    /// a table in any other order paints the wrong cell at every zoom above
+    /// the closest, and a non-finite entry is a third spelling of "nothing
+    /// here" beside the two sentinels.
+    TableNotAscending { at: usize },
+    /// A code naming an entry the table does not hold.
+    ///
+    /// One sweep's codes read against another sweep's table answer a plausible
+    /// number for a gate nobody measured, which is why this is a refusal on
+    /// both sides of the wire rather than a clamp on either.
+    CodeOutsideTable { code: u8, entries: usize },
 }
 
 /// Whether an R8 code plane can carry a product's gates without dropping a
@@ -344,6 +545,14 @@ pub enum PlaneRefusal {
 /// it stops: [`CodePlane::build`] refuses them, so the design's schedule
 /// cannot be followed into the mistake by a later lane that reads the document
 /// and not this table.
+///
+/// **This table is about the affine form alone**, and a refusal here is not
+/// the last word on a product. [`PlaneDecode::Table`] carries a sweep on the
+/// numbers it actually painted, and that door is opened per sweep by
+/// [`CodePlane::build_values`] rather than by any row of this table — so a
+/// product refused here still takes a plane on the sweeps whose realised
+/// values number [`PAINTABLE_CODES`] or fewer, losslessly, and stays a raster
+/// on the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum R8Fidelity {
     /// The wire carries this moment's codes at eight bits, so a gate can hold
@@ -544,25 +753,18 @@ pub struct CodePlane {
     mip_offsets: Vec<usize>,
     radials: usize,
     gates: usize,
-    key: LutKey,
+    /// What the codes mean — the wire's affine pair, or the table of patterns
+    /// this sweep painted. See [`PlaneDecode`].
+    decode: PlaneDecode,
     reduce: Reduce,
-    /// The wire word size the codes arrived at, as [`CodePlane::build`] was
-    /// told — provenance, and the one build argument the plane cannot
-    /// re-derive from what it stores. See [`CodePlane::word_bits`].
-    word_bits: u8,
 }
 
 impl CodePlane {
-    /// Build a plane from a sweep's raw codes.
+    /// Build a plane whose codes are the wire's own words.
     ///
     /// `word_bits` is the wire word size the moment was carried at — 8 or 16 —
     /// and it is a parameter rather than an assumption because differential
     /// reflectivity appears as both and only the narrow form is exact.
-    ///
-    /// Refuses, never truncates and never panics: a shape past the caps, a
-    /// code buffer that does not match the shape, a product whose gates cannot
-    /// survive eight bits, and a wide word for a product that is exact only at
-    /// eight. Every refusal increments [`CodePlane::refusals`].
     pub fn build(
         radials: usize,
         gates: usize,
@@ -570,7 +772,51 @@ impl CodePlane {
         key: LutKey,
         word_bits: u8,
     ) -> Result<Self, PlaneRefusal> {
-        Self::build_inner(radials, gates, codes, key, word_bits).inspect_err(|_| {
+        Self::build_decoded(
+            radials,
+            gates,
+            codes,
+            PlaneDecode::Affine { key, word_bits },
+        )
+    }
+
+    /// **Build a plane whose codes index the numbers this sweep painted** —
+    /// the per-sweep form.
+    ///
+    /// `values` is the distinct bit patterns, strictly ascending; code
+    /// `FIRST_TABLE_CODE + i` names `values[i]` and the two sentinels keep
+    /// their meanings. Refused where the table is empty, wider than
+    /// [`PAINTABLE_CODES`], out of order, or does not hold every code the
+    /// buffer carries.
+    pub fn build_values(
+        radials: usize,
+        gates: usize,
+        codes: Vec<u8>,
+        product: RadarProduct,
+        values: Vec<f32>,
+    ) -> Result<Self, PlaneRefusal> {
+        Self::build_decoded(
+            radials,
+            gates,
+            codes,
+            PlaneDecode::Table { product, values },
+        )
+    }
+
+    /// Build a plane from a sweep's codes and what they decode through.
+    ///
+    /// Refuses, never truncates and never panics: a shape past the caps, a
+    /// code buffer that does not match the shape, a product whose gates cannot
+    /// survive eight bits on the wire form, a wide word for a product exact
+    /// only at eight, and — for a table — a set of numbers a byte cannot name.
+    /// Every refusal increments [`CodePlane::refusals`].
+    pub fn build_decoded(
+        radials: usize,
+        gates: usize,
+        codes: Vec<u8>,
+        decode: PlaneDecode,
+    ) -> Result<Self, PlaneRefusal> {
+        Self::build_inner(radials, gates, codes, decode).inspect_err(|_| {
             REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         })
     }
@@ -579,21 +825,39 @@ impl CodePlane {
         radials: usize,
         gates: usize,
         codes: Vec<u8>,
-        key: LutKey,
-        word_bits: u8,
+        decode: PlaneDecode,
     ) -> Result<Self, PlaneRefusal> {
-        let fidelity = r8_fidelity(key.product);
-        if !fidelity.admits(word_bits) {
-            return Err(match fidelity {
-                R8Fidelity::ExactOnEightBitWireOnly => PlaneRefusal::WideWireWord {
-                    product: key.product,
-                    word_bits,
-                },
-                _ => PlaneRefusal::NotRepresentable {
-                    product: key.product,
-                    fidelity,
-                },
-            });
+        // **The fidelity door, and it is asked of the decode rather than of
+        // the product.** An affine plane is exact for the products whose wire
+        // words are one byte, which is a table of products; a table plane is
+        // exact for the sweep whose numbers it holds, which is a property of
+        // the plane in hand and of no product at all.
+        match &decode {
+            PlaneDecode::Affine { key, word_bits } => {
+                let fidelity = r8_fidelity(key.product);
+                if !fidelity.admits(*word_bits) {
+                    return Err(match fidelity {
+                        R8Fidelity::ExactOnEightBitWireOnly => PlaneRefusal::WideWireWord {
+                            product: key.product,
+                            word_bits: *word_bits,
+                        },
+                        _ => PlaneRefusal::NotRepresentable {
+                            product: key.product,
+                            fidelity,
+                        },
+                    });
+                }
+            }
+            PlaneDecode::Table { values, .. } => {
+                if values.is_empty() || values.len() > PAINTABLE_CODES {
+                    return Err(PlaneRefusal::TableWidth {
+                        entries: values.len(),
+                    });
+                }
+                if let Some(at) = first_disordered(values) {
+                    return Err(PlaneRefusal::TableNotAscending { at });
+                }
+            }
         }
         if radials == 0 || gates == 0 || radials > MAX_POLAR_RADIALS || gates > MAX_POLAR_GATES {
             return Err(PlaneRefusal::Shape { radials, gates });
@@ -605,17 +869,28 @@ impl CodePlane {
                 want,
             });
         }
+        // Behind the length check on purpose: this is the one refusal whose
+        // cost is a walk of the whole buffer, and a payload that is the wrong
+        // size is already refused by a comparison of two numbers.
+        if let PlaneDecode::Table { values, .. } = &decode {
+            let ceiling = usize::from(FIRST_TABLE_CODE) + values.len();
+            if let Some(&code) = codes.iter().find(|&&code| usize::from(code) >= ceiling) {
+                return Err(PlaneRefusal::CodeOutsideTable {
+                    code,
+                    entries: values.len(),
+                });
+            }
+        }
 
-        let reduce = Reduce::for_product(key.product);
+        let reduce = Reduce::for_product(decode.product());
         let mut plane = Self {
             codes,
             mips: Vec::new(),
             mip_offsets: Vec::new(),
             radials,
             gates,
-            key,
+            decode,
             reduce,
-            word_bits,
         };
         plane.build_chain();
         Ok(plane)
@@ -684,7 +959,6 @@ impl CodePlane {
     /// code 0 sits 129 away from a mid-scale zero and would otherwise beat
     /// every real velocity.
     fn reduce_cells(&self, cells: &[u8]) -> u8 {
-        let zero_code = self.key.offset.round();
         let mut best: Option<u8> = None;
         let mut folded = false;
         for code in cells.iter().copied() {
@@ -699,9 +973,7 @@ impl CodePlane {
                             // Ties to the larger code, so the key is a total
                             // order and the reduction is associative.
                             Reduce::MaxMagnitude => {
-                                let key = |c: u8| {
-                                    (((f32::from(c) - zero_code).abs() * 1_000.0) as i64, c)
-                                };
+                                let key = |c: u8| (self.decode.magnitude_of(c), c);
                                 key(code) > key(current)
                             }
                             Reduce::None => false,
@@ -748,8 +1020,24 @@ impl CodePlane {
     }
 
     /// What decodes and colours this plane.
-    pub fn key(&self) -> LutKey {
-        self.key
+    pub fn decode(&self) -> &PlaneDecode {
+        &self.decode
+    }
+
+    /// The product this plane paints.
+    pub fn product(&self) -> RadarProduct {
+        self.decode.product()
+    }
+
+    /// What each of the 256 codes decodes to as a number — the table a coded
+    /// `PolarField` beside this plane indexes.
+    pub fn value_table(&self) -> Vec<f32> {
+        self.decode.value_table()
+    }
+
+    /// The baked colour table this plane is painted through.
+    pub fn lut(&self) -> Lut {
+        Lut::of(&self.decode)
     }
 
     /// The operator its chain was reduced by.
@@ -771,18 +1059,11 @@ impl CodePlane {
         self.codes.len() + self.mips.len()
     }
 
-    /// The wire word size this plane's codes arrived at — 8 or 16, whichever
-    /// [`CodePlane::build`] was told.
-    ///
-    /// **Provenance, and not re-derivable from what the plane stores.**
-    /// [`r8_fidelity`] answers which widths a product *admits*, which for
-    /// differential reflectivity is a strictly wider set than the one width
-    /// this sweep actually carried. So the wire carries the byte rather than
-    /// inferring it: an inference would be a second opinion about
-    /// admissibility on the decode side, and the two halves could then differ
-    /// about which sweeps are representable.
-    pub fn word_bits(&self) -> u8 {
-        self.word_bits
+    /// The wire word size this plane's codes arrived at — 8 or 16 — or `None`
+    /// for a table plane, whose codes were assigned here and arrived at no
+    /// wire width at all. See [`PlaneDecode::Affine::word_bits`].
+    pub fn word_bits(&self) -> Option<u8> {
+        self.decode.word_bits()
     }
 
     /// Payloads refused since the process started.
@@ -805,31 +1086,81 @@ impl CodePlane {
 /// starts at offset zero, so the codes are addressable without walking
 /// anything.
 ///
-/// The block is **exactly [`CodePlane::build`]'s arguments but the codes**, in
-/// declaration order, so the encoder and the decoder cannot come to disagree
-/// about what a plane is made of: `radials` `u32`, `gates` `u32`, the
-/// product's `u16` wire code, `scale` `f32`, `offset` `f32`, `word_bits` `u8`.
+/// The block is **exactly [`CodePlane::build_decoded`]'s arguments but the
+/// codes**, in declaration order, so the encoder and the decoder cannot come
+/// to disagree about what a plane is made of: a form byte, `radials` `u32`,
+/// `gates` `u32`, the product's `u16` wire code, then that form's own decode —
+/// `scale` `f32`, `offset` `f32`, `word_bits` `u8` for the affine form, or a
+/// `u32` count and that many `f32`s for the table.
+///
+/// **The form byte leads the block**, [`crate::render::polar::PolarWireForm`]'s
+/// pattern to the letter: the two decodes are not distinguishable from their
+/// own bytes, the tag is written in the same match arm as the payload it
+/// describes, and a code this build does not write is declined rather than
+/// assumed. It leads rather than trails because the shape fields are shared
+/// and the *decode* is what the reader has to know the form of before it
+/// interprets a byte of it.
 impl CodePlane {
-    /// Bytes [`CodePlane::write_wire_head`] writes. Fixed — every field is a
-    /// scalar of stated width.
-    pub const WIRE_HEAD_BYTES: usize = 4 + 4 + 2 + 4 + 4 + 1;
+    /// An affine plane — `scale`, `offset` and a wire word size.
+    pub const WIRE_FORM_AFFINE: u8 = 0;
 
-    /// The head block, little-endian.
+    /// A table plane — the numbers the sweep painted, ascending.
+    pub const WIRE_FORM_TABLE: u8 = 1;
+
+    /// The form byte and the shape both forms open with.
+    const WIRE_SHAPE_BYTES: usize = 1 + 4 + 4 + 2;
+
+    /// Bytes an affine plane's head takes. Fixed — every field is a scalar of
+    /// stated width.
+    pub const WIRE_HEAD_AFFINE_BYTES: usize = Self::WIRE_SHAPE_BYTES + 4 + 4 + 1;
+
+    /// **The widest head this block can be**: the shape, a table's count, and
+    /// a full table. What a reply reserves, since a table's length is the one
+    /// thing here that is not fixed.
+    pub const WIRE_HEAD_MAX_BYTES: usize = Self::WIRE_SHAPE_BYTES + 4 + PAINTABLE_CODES * 4;
+
+    /// The shape, little-endian — what both forms carry, written once so the
+    /// two cannot come to describe one plane differently.
     ///
     /// `radials` and `gates` are written as `u32` and cannot truncate:
-    /// [`CodePlane::build`] refuses anything past [`MAX_POLAR_RADIALS`] and
-    /// [`MAX_POLAR_GATES`], both far below `u32::MAX`, so a plane that exists
-    /// fits by construction.
-    pub fn write_wire_head(&self, out: &mut Vec<u8>) {
+    /// [`CodePlane::build_decoded`] refuses anything past
+    /// [`MAX_POLAR_RADIALS`] and [`MAX_POLAR_GATES`], both far below
+    /// `u32::MAX`, so a plane that exists fits by construction.
+    fn write_wire_shape(&self, out: &mut Vec<u8>) {
         let dim = |n: usize| {
             u32::try_from(n).expect("the shape caps bound both dimensions well below u32::MAX")
         };
         out.extend_from_slice(&dim(self.radials).to_le_bytes());
         out.extend_from_slice(&dim(self.gates).to_le_bytes());
-        out.extend_from_slice(&self.key.product.wire_code().to_le_bytes());
-        out.extend_from_slice(&self.key.scale.to_le_bytes());
-        out.extend_from_slice(&self.key.offset.to_le_bytes());
-        out.push(self.word_bits);
+        out.extend_from_slice(&self.decode.product().wire_code().to_le_bytes());
+    }
+
+    /// The head block, little-endian: the form byte, the shape, and that
+    /// form's decode — the tag and the payload written in the same arm, so
+    /// there is no arrangement of this function in which a head says one form
+    /// and carries the other.
+    pub fn write_wire_head(&self, out: &mut Vec<u8>) {
+        match &self.decode {
+            PlaneDecode::Affine { key, word_bits } => {
+                out.push(Self::WIRE_FORM_AFFINE);
+                self.write_wire_shape(out);
+                out.extend_from_slice(&key.scale.to_le_bytes());
+                out.extend_from_slice(&key.offset.to_le_bytes());
+                out.push(*word_bits);
+            }
+            PlaneDecode::Table { values, .. } => {
+                out.push(Self::WIRE_FORM_TABLE);
+                self.write_wire_shape(out);
+                out.extend_from_slice(
+                    &u32::try_from(values.len())
+                        .expect("a table is capped at PAINTABLE_CODES entries")
+                        .to_le_bytes(),
+                );
+                for value in values {
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
     }
 
     /// **Level 0's codes and nothing else** — the flat tail.
@@ -872,24 +1203,43 @@ impl CodePlane {
     /// plane is ever attempted. It is an ordinary `None`, and the reply is
     /// treated as a failed job.
     pub fn from_wire(r: &mut squallar_source::wire::Reader<'_>, codes: Vec<u8>) -> Option<Self> {
+        let form = r.u8()?;
         let radials = r.u32()? as usize;
         let gates = r.u32()? as usize;
         let product = RadarProduct::from_wire_code(r.u16()?)?;
-        let scale = r.f32()?;
-        let offset = r.f32()?;
-        let word_bits = r.u8()?;
-        Self::build(
-            radials,
-            gates,
-            codes,
-            LutKey {
-                product,
-                scale,
-                offset,
-            },
-            word_bits,
-        )
-        .ok()
+        let decode = match form {
+            Self::WIRE_FORM_AFFINE => {
+                let scale = r.f32()?;
+                let offset = r.f32()?;
+                let word_bits = r.u8()?;
+                PlaneDecode::Affine {
+                    key: LutKey {
+                        product,
+                        scale,
+                        offset,
+                    },
+                    word_bits,
+                }
+            }
+            Self::WIRE_FORM_TABLE => {
+                let entries = r.u32()? as usize;
+                // In front of the reservation and not behind it: a head
+                // declaring four billion entries costs a comparison here and a
+                // four-billion-element `Vec` one line later. `build_decoded`
+                // refuses the same width again, and this is not that check —
+                // it is the one that keeps the refusal reachable.
+                if entries > PAINTABLE_CODES {
+                    return None;
+                }
+                let mut values = Vec::with_capacity(entries);
+                for _ in 0..entries {
+                    values.push(r.f32()?);
+                }
+                PlaneDecode::Table { product, values }
+            }
+            _ => return None,
+        };
+        Self::build_decoded(radials, gates, codes, decode).ok()
     }
 }
 

@@ -9000,9 +9000,11 @@ fn build_loop_frames(
 /// switch for the polar representation. A polar frame and a raster of one
 /// surveillance tilt are ~369x apart, so which of the two a pane is holding
 /// cannot be inferred from a flag, from the presence of a renderer, or from
-/// what the dispatch asked for: `CodePlane::build` refuses nine products by
-/// domain and `sweep_code_plane` refuses five more conditions, and the answer
-/// to every one of them is today's raster. So this asks the frames.
+/// what the dispatch asked for: a plane's admission is refused by domain for
+/// most products, by wire word width for one, by six conditions of the sweep
+/// itself, and — for a computed field carried on a table of its own realised
+/// numbers — by how many distinct numbers *that* sweep painted. The answer to
+/// every one of them is today's raster. So this asks the frames.
 ///
 /// **The worst frame, not the mean**, because a budget is a commitment against
 /// a peak — and `0` from an empty loop is "price it as a raster", which is the
@@ -9013,7 +9015,10 @@ fn build_loop_frames(
 /// choice. A loop's frames really can differ: `CodePlane::build`'s refusals
 /// are per product and so agree across a loop, but `sweep_code_plane`'s are
 /// per sweep — a clear-air volume with nothing above threshold gets a raster
-/// while the volume before it got a plane. The consumers spend ONE figure per
+/// while the volume before it got a plane, and a computed field's table door
+/// is per sweep by construction: measured on 183 archive volumes, normalized
+/// rotation fits a byte on 58 of them and interpolated echo tops on 112, so a
+/// loop of either really does hold both surfaces. The consumers spend ONE figure per
 /// frame, so a set holding both has to be priced at the larger, and the larger
 /// is the raster by ~369x. Taking the fan's bytes there would price a raster
 /// at a fraction of what it allocates, which is the mechanism the polar price

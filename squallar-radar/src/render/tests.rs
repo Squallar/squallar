@@ -3270,3 +3270,403 @@ fn a_raster_and_a_code_plane_are_weighed_against_each_other() {
         plane.resident_bytes(),
     );
 }
+
+// ── The per-sweep admission, at the layer the readout lives in ──────────────
+
+/// **The number a hover reads back off a plane is the number it reads back off
+/// the raster, gate for gate** — for a *computed* product, which is the whole
+/// of what the table form buys.
+///
+/// The gate at the layer the symptom lives in. Everything below `render` can
+/// be green while the two arms of `render_sweep_plane` still disagree about
+/// what one volume paints: the plane arm computes the field and codes it, the
+/// raster arm computes the field and projects it, and only a comparison of the
+/// two finished frames catches an arm that walked a different grid, placed it
+/// at a different extent, or skipped a gate the other kept.
+///
+/// **`at` is what is compared, because `at` is what a hover calls.** It
+/// answers `None` for both NaN markers and cannot hold them apart; the bits
+/// that separate them are asserted where they are held, in
+/// `codes::tests::a_table_plane_hands_back_the_bits_it_was_given`.
+///
+/// The fixture is [`inner_core_volume`] — 100 distinct heights over 36,000
+/// painted cells and 46,800 blank ones, so both sides of the sentinel and a
+/// real spread of numbers are walked.
+#[test]
+fn a_computed_planes_numbers_are_the_rasters_numbers_gate_for_gate() {
+    let scan = inner_core_volume();
+    let product = types::RadarProduct::EchoTopsInterpolated;
+    let raster = render_echo_tops_interp_to_image(&scan, LAT, LON, types::IMAGE_SIZE)
+        .expect("the golden volume rasterizes");
+    let plane = render_sweep_plane(
+        &scan,
+        0.5,
+        product,
+        &crate::nyquist::DeclaredNyquist::empty(),
+        true,
+    )
+    .expect("the golden volume's echo tops fit a byte");
+
+    assert!(
+        plane.codes.is_some(),
+        "the plane arm answered a render with no plane in it",
+    );
+    assert!(
+        plane.image.is_empty(),
+        "the plane arm also built a raster; that is both surfaces at once",
+    );
+    assert_eq!(
+        plane.max_range_km, raster.max_range_km,
+        "the two arms place one volume at two extents",
+    );
+
+    let (rg, pg) = (raster.polar.geometry(), plane.polar.geometry());
+    assert_eq!((rg.radials(), rg.gates()), (pg.radials(), pg.gates()));
+    assert_eq!(
+        rg.reach_gates(),
+        pg.reach_gates(),
+        "the two arms measured different reaches off one field",
+    );
+    assert_eq!(rg.first_gate_slant_km(), pg.first_gate_slant_km());
+    assert_eq!(rg.gate_interval_slant_km(), pg.gate_interval_slant_km());
+    assert_eq!(rg.elevation_deg(), pg.elevation_deg());
+
+    let mut painted = 0usize;
+    let mut blank = 0usize;
+    for radial in 0..rg.radials() {
+        for gate in 0..rg.gates() {
+            let at = polar::GateAt { radial, gate };
+            let (want, got) = (raster.polar.at(at), plane.polar.at(at));
+            match want {
+                Some(want) => {
+                    let got = got.unwrap_or_else(|| {
+                        panic!("gate ({radial}, {gate}) is {want} on the raster and nothing on the plane")
+                    });
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "gate ({radial}, {gate}): the plane reads {got} where the raster reads {want}",
+                    );
+                    painted += 1;
+                }
+                None => {
+                    assert!(
+                        got.is_none(),
+                        "gate ({radial}, {gate}) is nothing on the raster and {got:?} on the plane",
+                    );
+                    blank += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(painted + blank, rg.radials() * rg.gates());
+    assert!(
+        painted > 5_000 && blank > 5_000,
+        "{painted} painted and {blank} blank gates: one side is too thin to be evidence",
+    );
+    // And the numbers really are many, or an equality over a two-valued field
+    // would hold whatever the codes did.
+    let distinct: std::collections::BTreeSet<u32> = (0..rg.radials())
+        .flat_map(|r| (0..rg.gates()).map(move |g| polar::GateAt { radial: r, gate: g }))
+        .filter_map(|at| raster.polar.at(at).map(f32::to_bits))
+        .collect();
+    assert!(
+        distinct.len() > 20,
+        "the golden volume paints only {} distinct numbers",
+        distinct.len(),
+    );
+}
+
+/// **Whatever a plane carries, its table names it — and a readout off it never
+/// answers a number the sweep did not paint.**
+///
+/// The rounding this whole form could have been, stated as a set inclusion:
+/// the numbers the readout hands back must be a subset of the numbers the
+/// plane's own table holds, and the table must be inside what a byte can name.
+/// A quantiser would break the first by answering a table entry no gate held,
+/// and a truncation would break the second.
+///
+/// Walked over **both sides of the door on both products**, so neither the
+/// admitting arm nor the refusing one is left unvisited: `inner_core_volume`
+/// and `nrot_shear_volume(1)` are inside it, `golden_scan` and
+/// `nrot_shear_volume(2)` are past it, and a refusal is asserted to leave a
+/// raster behind rather than nothing.
+#[test]
+fn a_computed_field_takes_a_plane_or_the_raster_and_never_a_rounding() {
+    let nyquist = crate::nyquist::DeclaredNyquist::empty();
+    let cases: [(&str, types::RadarProduct, Scan, bool); 4] = [
+        (
+            "echo tops, inside",
+            types::RadarProduct::EchoTopsInterpolated,
+            inner_core_volume(),
+            true,
+        ),
+        (
+            "echo tops, past",
+            types::RadarProduct::EchoTopsInterpolated,
+            crate::volumetric::tests::golden_scan(),
+            false,
+        ),
+        (
+            "nrot, inside",
+            types::RadarProduct::NormalizedRotation,
+            nrot_shear_volume(1),
+            true,
+        ),
+        (
+            "nrot, past",
+            types::RadarProduct::NormalizedRotation,
+            nrot_shear_volume(2),
+            false,
+        ),
+    ];
+    for (what, product, scan, admitted) in cases {
+        let plane = render_sweep_plane(&scan, 0.5, product, &nyquist, true);
+        assert_eq!(
+            plane.is_some(),
+            admitted,
+            "{what}: the per-sweep door answered the wrong way",
+        );
+        let Some(plane) = plane else {
+            assert!(
+                render_radar_to_image(&scan, 0.5, product, LAT, LON).is_some(),
+                "{what}: refused a plane and has no raster to fall back to",
+            );
+            continue;
+        };
+        let codes = plane.codes.expect("a plane arm answers with a plane");
+        let table = codes.value_table();
+        let (level0, _, _) = codes.level(0).expect("level 0");
+        let named: std::collections::BTreeSet<u32> = level0
+            .iter()
+            .map(|&code| table[usize::from(code)].to_bits())
+            .collect();
+        let g = plane.polar.geometry();
+        let held: std::collections::BTreeSet<u32> = (0..g.radials())
+            .flat_map(|r| (0..g.gates()).map(move |gate| polar::GateAt { radial: r, gate }))
+            .filter_map(|at| plane.polar.at(at).map(f32::to_bits))
+            .collect();
+        assert!(
+            held.len() <= codes::PAINTABLE_CODES,
+            "{what}: rode a plane holding {} distinct numbers, past what a byte names",
+            held.len(),
+        );
+        assert!(
+            held.len() > 20,
+            "{what}: only {} distinct numbers, so the inclusion below holds over nothing",
+            held.len(),
+        );
+        assert!(
+            held.is_subset(&named),
+            "{what}: the readout answers numbers the plane's own table does not name",
+        );
+    }
+}
+
+/// **A volume whose interpolated echo tops fit a byte**: 45 dBZ over the inner
+/// 400 gates of one 0.5° cut and nothing above it, so the crossing height is
+/// defined over 36,000 of the grid's 82,800 cells and takes 100 distinct
+/// values.
+///
+/// Not `volumetric::tests::golden_scan`, and the difference is the whole
+/// subject: that volume's three Gaussian cores paint **2,552** distinct
+/// heights, so it is a sweep the per-sweep door refuses and
+/// `a_computed_field_takes_a_plane_or_the_raster_and_never_a_rounding` uses it
+/// for exactly that. A fixture on one side of the door cannot exercise the
+/// other, and a plane arm this volume refused would make every comparison
+/// below a comparison of the raster with itself.
+fn inner_core_volume() -> Scan {
+    use crate::volumetric::tests::{flat_sweep, vcp};
+    let gates = 1000usize;
+    let lower: Vec<Radial> = (0..360)
+        .map(|i| {
+            let bytes: Vec<u8> = (0..gates)
+                .map(|g| {
+                    if g < 400 {
+                        ((45.0f32 * 2.0 + 66.0).round() as i64) as u8
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            Radial::new(
+                0,
+                i as u16,
+                i as f32 + 0.5,
+                1.0,
+                nexrad_model::data::RadialStatus::IntermediateRadialData,
+                1,
+                0.5,
+                Some(nexrad_model::data::MomentData::from_fixed_point(
+                    gates as u16,
+                    0,
+                    250,
+                    8,
+                    2.0,
+                    66.0,
+                    bytes,
+                )),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        })
+        .collect();
+    Scan::new(
+        vcp(),
+        vec![
+            nexrad_model::data::Sweep::new(1, lower),
+            flat_sweep(2, 1.5, None),
+        ],
+    )
+}
+
+/// **A one-cut velocity volume whose azimuthal shear steps by `step`** — the
+/// NROT fixture, and the one knob that moves a sweep across the per-sweep
+/// door.
+///
+/// 720 half-degree radials of 400 gates, velocity banded in azimuth (seven
+/// bands, `step` codes apart) and in range (five bands), so the shear NROT
+/// derives from is a real two-dimensional field rather than a constant. At
+/// `step = 1` the sweep paints 42 distinct numbers and takes a plane; at
+/// `step = 2` it paints 684 and stays a raster. One fixture, both sides,
+/// differing in one integer — so what the door is measuring is the sweep's own
+/// realised width and nothing else about it.
+fn nrot_shear_volume(step: u8) -> Scan {
+    use crate::volumetric::tests::vcp;
+    let gates = 400usize;
+    let radials: Vec<Radial> = (0..720i32)
+        .map(|i| {
+            let bytes: Vec<u8> = (0..gates)
+                .map(|g| {
+                    let v = 100i32 + ((i / 8) % 7) * i32::from(step) + ((g as i32 / 40) % 5) * 2;
+                    v.clamp(2, 254) as u8
+                })
+                .collect();
+            Radial::new(
+                0,
+                i as u16,
+                i as f32 * 0.5,
+                0.5,
+                nexrad_model::data::RadialStatus::IntermediateRadialData,
+                1,
+                0.5,
+                None,
+                Some(nexrad_model::data::MomentData::from_fixed_point(
+                    gates as u16,
+                    2125,
+                    250,
+                    8,
+                    2.0,
+                    129.0,
+                    bytes,
+                )),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        })
+        .collect();
+    Scan::new(vcp(), vec![nexrad_model::data::Sweep::new(1, radials)])
+}
+
+/// **NROT: the door opens on the sweep and not on the product, and what comes
+/// through it is the raster's own numbers.**
+///
+/// `codes::r8_fidelity` refuses normalized rotation outright — it is a
+/// computed `f32` field and most sweeps of it paint tens of thousands of
+/// distinct numbers. This asserts both halves of the per-sweep answer on one
+/// fixture family:
+///
+/// * `step = 1` paints 42 numbers, takes a plane, and every gate of it reads
+///   back the bit pattern the raster's own polar grid holds;
+/// * `step = 2` paints 684 and stays a raster — the plane arm answers `None`
+///   and the raster exists to be the answer.
+///
+/// **The boundary is live in both directions**, so neither half is a fixture
+/// that could never have gone the other way. And the comparison is against the
+/// *raster's* field rather than against a recomputation, because the question
+/// is whether a hover over the plane says what a hover over today's picture
+/// says.
+#[test]
+fn nrot_takes_a_plane_where_its_own_sweep_fits_and_a_raster_where_it_does_not() {
+    let product = types::RadarProduct::NormalizedRotation;
+    let nyquist = crate::nyquist::DeclaredNyquist::empty();
+    let distinct_of = |render: &SweepRender| -> std::collections::BTreeSet<u32> {
+        let g = render.polar.geometry();
+        (0..g.radials())
+            .flat_map(|a| (0..g.gates()).map(move |b| polar::GateAt { radial: a, gate: b }))
+            .filter_map(|at| render.polar.at(at).map(f32::to_bits))
+            .collect()
+    };
+
+    // ── Inside the door ──────────────────────────────────────────────────────
+    let narrow = nrot_shear_volume(1);
+    let raster =
+        render_radar_to_image(&narrow, 0.5, product, LAT, LON).expect("the fixture rasterizes");
+    let held = distinct_of(&raster);
+    assert!(
+        (2..=codes::PAINTABLE_CODES).contains(&held.len()),
+        "premise: this fixture paints {} numbers, which is not a sweep inside the door \
+         with anything in it",
+        held.len(),
+    );
+    let plane = render_sweep_plane(&narrow, 0.5, product, &nyquist, true)
+        .expect("a sweep painting 42 numbers is carried by a plane");
+    assert!(plane.codes.is_some() && plane.image.is_empty());
+    assert_eq!(plane.max_range_km, raster.max_range_km);
+    let (rg, pg) = (raster.polar.geometry(), plane.polar.geometry());
+    assert_eq!((rg.radials(), rg.gates()), (pg.radials(), pg.gates()));
+    assert_eq!(rg.reach_gates(), pg.reach_gates());
+    let mut painted = 0usize;
+    let mut blank = 0usize;
+    for radial in 0..rg.radials() {
+        for gate in 0..rg.gates() {
+            let at = polar::GateAt { radial, gate };
+            match (raster.polar.at(at), plane.polar.at(at)) {
+                (Some(want), Some(got)) => {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "gate ({radial}, {gate}): the plane reads {got}, the raster {want}",
+                    );
+                    painted += 1;
+                }
+                (None, None) => blank += 1,
+                (want, got) => panic!("gate ({radial}, {gate}): raster {want:?}, plane {got:?}"),
+            }
+        }
+    }
+    // 700 painted against 287,300 blank: NROT's palette inks nothing below its
+    // own shear threshold, so a sweep narrow enough to fit a byte is also a
+    // sweep that paints sparsely. What makes the walk evidence is that the 700
+    // carry 42 distinct numbers between them — asserted above — rather than
+    // that there are many of them.
+    assert!(
+        painted > 500 && blank > 10_000,
+        "{painted} painted and {blank} blank: one side is too thin to be evidence",
+    );
+    assert!(
+        held.len() > 20,
+        "the sweep under comparison paints only {} distinct numbers",
+        held.len(),
+    );
+
+    // ── Past it ──────────────────────────────────────────────────────────────
+    let wide = nrot_shear_volume(2);
+    let wide_raster = render_radar_to_image(&wide, 0.5, product, LAT, LON)
+        .expect("the answer to every refusal is the raster, which must exist");
+    assert!(
+        distinct_of(&wide_raster).len() > codes::PAINTABLE_CODES,
+        "premise: the wide fixture is not actually past the door",
+    );
+    assert!(
+        render_sweep_plane(&wide, 0.5, product, &nyquist, true).is_none(),
+        "a sweep painting more numbers than a byte can name rode a plane",
+    );
+}

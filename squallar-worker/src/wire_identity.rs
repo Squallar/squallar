@@ -220,14 +220,47 @@ pub const WIRE_REPLY_ROWS: &[&str] = &[
 /// added for, in the neighbouring block. `polar/full` moved for that as well
 /// as for the form byte; the two default fields moved for the form byte alone.
 ///
+/// # What moved when the plane block learned to name its decode form
+///
+/// **Re-pinned 2026-09-09, and exactly one row moved.** A `CodePlane` decodes
+/// through either the wire's own affine pair or a table of the bit patterns
+/// one sweep painted, and the block now leads with a **form byte** saying
+/// which. The two decodes are not distinguishable from their own bytes, which
+/// is the same reason the polar tail grew its form byte a day earlier.
+///
+/// | row | was | is |
+/// |---|---|---|
+/// | `frame/plane/head` | `31 \| 0xe21c3f042291c176` | `32 \| 0xa35db09a7c5eceea` |
+///
+/// **Accounted byte for byte, not re-recorded.** The old 31 bytes were
+/// `0000000000c06c40 00 00 00 01` — 230.0 km, three absent optionals and
+/// `SURFACE_CODES` — followed by the plane's 19:
+/// `03000000 04000000 0100 00004000 00844208`, which is the fixture's
+/// 3 radials, 4 gates, Reflectivity's wire code 1, 2.0, 66.0 and 8. FNV-1a
+/// over that run is `0xe21c3f042291c176`, the pin it replaced, computed from
+/// those literals and not from the encoder. The new 32 are that run with one
+/// `0x00` inserted at **offset 12**, in front of the plane block and behind
+/// the frame's own fields, and FNV-1a over *that* is `0xa35db09a7c5eceea`.
+/// A prepended byte has no multiplicative shortcut the way an appended `0x00`
+/// does (`new == old * FNV_prime`), so the account is the byte positions and
+/// the recomputation rather than a one-line identity.
+///
+/// Every other row is **unchanged**, the three polar rows and the code tail
+/// included: the form byte went into the head block, and the tail is still
+/// level 0's codes and nothing else. `frame/table/head` is the fourteenth row
+/// and the form the change admits — the same fixture plane, held as the two
+/// numbers it actually paints and a byte apiece naming them.
+///
 /// Row-length arithmetic (independent of the encoder): head/full
 /// 8 + (1+8) + (1+1) + (1+1+4+4) + 1 = 30; head/bare 8+1+1+1+1 = 12;
-/// head/plane 8+1+1+1+1 + 19 = 31, the trailing 19 being
-/// `CodePlane::WIRE_HEAD_BYTES` (4+4+2+4+4+1 — the constructor's own
-/// arguments but the codes); polar/full 81 = 1 form + 16 header + 3x8 + 2x8 +
-/// 6x4; polar/bare and polar/plane 41 = 1 form + 16 header + 3x8 (the default
-/// field); polar/coded 91 = 1 form + 16 header + 3x8 + 2x8 + 4 table count +
-/// 6x4 table + 6x1 codes; codes/plane 12 = 3 radials x 4 gates, **level 0
+/// head/plane 8+1+1+1+1 + 20 = 32, the trailing 20 being
+/// `CodePlane::WIRE_HEAD_AFFINE_BYTES` (1+4+4+2+4+4+1 — a form byte, the
+/// shape, and the affine decode); head/table 8+1+1+1+1 + (1+4+4+2+4 + 2x4) =
+/// 35, the table's own block being a count and its two entries; polar/full
+/// 81 = 1 form + 16 header + 3x8 + 2x8 + 6x4; polar/bare, polar/plane and
+/// polar/table 41 = 1 form + 16 header + 3x8 (the default field); polar/coded
+/// 91 = 1 form + 16 header + 3x8 + 2x8 + 4 table count + 6x4 table + 6x1
+/// codes; codes/plane and codes/table 12 = 3 radials x 4 gates, **level 0
 /// alone** — the mip chain is a pure function of it and is rebuilt at decode
 /// rather than sent; image and the empty tails = the fixture Vecs.
 pub const WIRE_FRAME_REPLY_ROWS: &[&str] = &[
@@ -239,11 +272,12 @@ pub const WIRE_FRAME_REPLY_ROWS: &[&str] = &[
     "frame/bare/polar | 41 | 0x257bc9fd74b17416",
     "frame/bare/codes | 0 | 0xcbf29ce484222325",
     "frame/bare/image | 4 | 0xbe7a5e775165785d",
-    "frame/plane/head | 31 | 0xe21c3f042291c176",
+    "frame/plane/head | 32 | 0xa35db09a7c5eceea",
     "frame/plane/polar | 41 | 0x257bc9fd74b17416",
     "frame/plane/codes | 12 | 0x6c2b85b62288e8a5",
     "frame/plane/image | 0 | 0xcbf29ce484222325",
     "frame/coded/polar | 91 | 0x8a7e554ed27594b3",
+    "frame/table/head | 35 | 0xbc2c96ba6fb7830f",
 ];
 
 /// The 2 height-reply framing rows, exactly as

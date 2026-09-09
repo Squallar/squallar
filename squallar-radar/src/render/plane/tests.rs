@@ -96,7 +96,7 @@ fn the_plane_paints_what_the_raster_paints() {
     let radials = ascending_sweep(7, 60);
     let product = RadarProduct::Reflectivity;
     let built = sweep_code_plane(&radials, product, 60).expect("the sweep admits a plane");
-    let lut = Lut::build(built.plane.key());
+    let lut = built.plane.lut();
     for (r, radial) in radials.iter().enumerate() {
         let moment = product.get_moment(radial).expect("every radial has one");
         for g in 0..moment.raw_values().len() {
@@ -635,4 +635,136 @@ fn a_code_the_table_does_not_name_is_refused() {
             .is_some(),
         "the control: a well-formed triple is admitted, or the refusals above prove nothing",
     );
+}
+
+// ── The per-sweep admission ─────────────────────────────────────────────────
+
+/// **A computed sweep whose realised numbers fit a byte becomes a plane, and
+/// every gate reads back the pattern it was given** — at a surveillance cut's
+/// own shape.
+///
+/// The shape is load-bearing and not decoration. `value_code_plane` walks
+/// `radials × gates`, assigns codes through an open-addressed table sized to a
+/// cache, and remaps the whole buffer; at the 9×40 and 36×120 shapes the other
+/// fixtures in this file use, every one of those is a few hundred operations
+/// and a probe error or an off-by-one in the remap has nowhere to show. This
+/// is 1,319,040 gates and 254 distinct patterns, which is the top of the form.
+///
+/// **The values arrive DESCENDING.** The table the plane keeps must be
+/// ascending — `Reduce::MaxCode` is a statement about the numbers — so a
+/// producer that kept first-seen order would pass a read-back test and paint
+/// the wrong cell at every zoom above the closest. A fixture whose first-seen
+/// order already happened to be ascending could not tell the two apart.
+#[test]
+fn a_computed_sweep_inside_the_ceiling_reads_back_its_own_bits() {
+    let (radials, gates) = (720usize, 1832usize);
+    // 254 distinct patterns, straddling zero, with the unpainted gates woven
+    // through so the sentinel is exercised too.
+    let value_of = |radial: usize, gate: usize| -> Option<f32> {
+        let i = radial * gates + gate;
+        if i.is_multiple_of(7) {
+            return None;
+        }
+        // Descending in the order the walk sees them: the first radial hands
+        // over the largest numbers first.
+        Some((PAINTABLE_CODES - 1 - (i % PAINTABLE_CODES)) as f32 * 0.125 - 12.0)
+    };
+    let built = value_code_plane(radials, gates, RadarProduct::NormalizedRotation, value_of)
+        .expect("254 distinct numbers are exactly what a byte can name");
+    assert_eq!(built.plane.shape(), (radials, gates));
+    assert_eq!(built.reach_gates, gates);
+
+    let table = built.plane.value_table();
+    // The table is ascending over the codes it names, which is what the
+    // reduce reads.
+    let named = &table[usize::from(crate::render::codes::FIRST_TABLE_CODE)
+        ..usize::from(crate::render::codes::FIRST_TABLE_CODE) + PAINTABLE_CODES];
+    assert!(
+        named.windows(2).all(|w| w[0] < w[1]),
+        "the table kept the order the gates arrived in rather than the numbers' own",
+    );
+
+    let (level0, _, _) = built.plane.level(0).expect("level 0");
+    let mut painted = 0usize;
+    let mut unpainted = 0usize;
+    for radial in 0..radials {
+        for gate in 0..gates {
+            let got = table[usize::from(level0[radial * gates + gate])];
+            match value_of(radial, gate) {
+                Some(want) => {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "gate ({radial}, {gate}) reads back {got} for {want}",
+                    );
+                    painted += 1;
+                }
+                None => {
+                    assert_eq!(
+                        got.to_bits(),
+                        crate::render::polar::UNPAINTED.to_bits(),
+                        "gate ({radial}, {gate}) the raster paints nothing at carries a number",
+                    );
+                    unpainted += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(painted + unpainted, radials * gates);
+    assert!(
+        unpainted > 100_000 && painted > 1_000_000,
+        "{painted} painted and {unpainted} unpainted: one side is too thin to be evidence",
+    );
+}
+
+/// **One number past the ceiling is a refusal and not a rounding**, and the
+/// refusal names its own reason.
+///
+/// Asserted as the variant rather than as an `Err`: `value_code_plane` has
+/// four other ways to refuse — a shape that overflows, nothing painted, and
+/// `CodePlane::build_values`'s own two — and a test reading only `is_err`
+/// stays green with the width check deleted, because the table would then be
+/// 255 entries and the constructor behind it would refuse the same payload for
+/// `TableWidth`. The two are different guards and this names which fired.
+///
+/// The bound is walked in both directions at the boundary, so it is live.
+#[test]
+fn a_computed_sweep_past_the_ceiling_stays_a_raster_and_says_so() {
+    let distinct = |n: usize| {
+        move |radial: usize, gate: usize| -> Option<f32> {
+            Some(((radial * 97 + gate) % n) as f32 * 0.5)
+        }
+    };
+    let product = RadarProduct::NormalizedRotation;
+    assert!(
+        value_code_plane(64, 64, product, distinct(PAINTABLE_CODES)).is_ok(),
+        "a sweep painting exactly PAINTABLE_CODES numbers was refused",
+    );
+    assert_eq!(
+        value_code_plane(64, 64, product, distinct(PAINTABLE_CODES + 1)).err(),
+        Some(PlaneUnavailable::ValuesTooWide {
+            entries: PAINTABLE_CODES + 1
+        }),
+        "one number past the ceiling was admitted, or refused for another reason",
+    );
+    // A sweep that paints nothing is the other end of the same door.
+    assert_eq!(
+        value_code_plane(8, 8, product, |_, _| None).err(),
+        Some(PlaneUnavailable::NothingPainted),
+    );
+}
+
+/// **The reach is measured off what was painted, not off the shape.**
+///
+/// A gate past it is one the sweep carried and nothing was above threshold in,
+/// and drawing the disc out to it would put a ring of nothing outside the
+/// weather. Same quantity `PolarBuffers::into_field` reads off the raster.
+#[test]
+fn a_value_planes_reach_is_the_last_painted_gate() {
+    let built = value_code_plane(4, 100, RadarProduct::NormalizedRotation, |_, gate| {
+        (gate < 37).then_some(gate as f32)
+    })
+    .expect("a narrow, well-formed sweep");
+    assert_eq!(built.reach_gates, 37);
+    assert_eq!(built.plane.shape(), (4, 100));
 }

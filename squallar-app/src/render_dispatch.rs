@@ -146,12 +146,12 @@ pub fn fan_sweep(
     let first_gate_km = ground_km(near_slant_km);
 
     Some(squallar_egui::radar_fan::FanSweep {
-        field: crate::render_key::field_id_of(plane.key().product),
+        field: crate::render_key::field_id_of(plane.product()),
         radials: u32::try_from(radials).ok()?,
         gates: u32::try_from(gates).ok()?,
         codes,
         level_offsets,
-        lut_rgba: squallar_radar::render::codes::Lut::build(plane.key()).to_rgba_bytes(),
+        lut_rgba: plane.lut().to_rgba_bytes(),
         edges,
         geometry: squallar_egui::radar_fan::FanGeometry {
             site_lat,

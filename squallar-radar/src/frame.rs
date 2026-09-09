@@ -186,7 +186,7 @@ impl RenderedFrame {
         + (1 + 1)
         + (1 + 1 + 4 + 4)
         + 1
-        + crate::render::codes::CodePlane::WIRE_HEAD_BYTES;
+        + crate::render::codes::CodePlane::WIRE_HEAD_MAX_BYTES;
 
     /// **The two mutually exclusive surface tails, in wire order —
     /// `(codes, image)`.** Exactly one is non-empty.
@@ -689,9 +689,9 @@ mod tests {
             "premise: the code tail is level 0 and nothing else",
         );
 
-        // The surface byte, then the plane's own block: shape, product, scale,
-        // offset, word size.
-        let surface_at = head.len() - 1 - CodePlane::WIRE_HEAD_BYTES;
+        // The surface byte, then the plane's own block: the decode form, the
+        // shape, the product, and that form's decode — here the affine one.
+        let surface_at = head.len() - 1 - CodePlane::WIRE_HEAD_AFFINE_BYTES;
         assert_eq!(
             head[surface_at], SURFACE_CODES,
             "premise: a frame with a plane names the code surface",
@@ -701,7 +701,7 @@ mod tests {
             // A Nyquist and nothing else, so this fixture's absent-optional
             // tags cost a byte each: the head's length is not the raster
             // fixture's, and both are re-derived rather than copied.
-            8 + (1 + 8) + 1 + 1 + 1 + CodePlane::WIRE_HEAD_BYTES,
+            8 + (1 + 8) + 1 + 1 + 1 + CodePlane::WIRE_HEAD_AFFINE_BYTES,
             "the polar fixture's head moved; re-derive the offsets",
         );
 
@@ -738,8 +738,17 @@ mod tests {
         // The plane's own refusals reach `CodePlane::build`, so they land in
         // the producer's counter rather than in one the wire minted. Each
         // mutation is checked to move it by exactly one.
-        let shape_at = surface_at + 1;
+        // The plane block opens with its own decode-form byte, and the shape
+        // follows it — so this is `surface_at + 1` for the surface byte and one
+        // more for the form.
+        let form_at = surface_at + 1;
+        let shape_at = form_at + 1;
         let product_at = shape_at + 8;
+        assert_eq!(
+            head[form_at],
+            CodePlane::WIRE_FORM_AFFINE,
+            "premise: this fixture's plane carries the wire's own words",
+        );
         for (what, doctor) in [
             (
                 "a code tail that is not the declared shape",
@@ -782,6 +791,23 @@ mod tests {
                  constructor, so the refusal counter did not see it",
             );
         }
+
+        // A decode form this build does not write is refused BEFORE a plane is
+        // attempted -- there is nothing to build one out of -- so like the
+        // unknown product below it is not in that counter.
+        let before = CodePlane::refusals();
+        let mut unknown_form = head.clone();
+        unknown_form[form_at] = u8::MAX;
+        assert_eq!(
+            RenderedFrame::from_parts(&unknown_form, tails.clone()),
+            None,
+            "an unknown plane decode form was accepted",
+        );
+        assert_eq!(
+            CodePlane::refusals(),
+            before,
+            "an unreadable head reached the plane constructor",
+        );
 
         // A product code this build does not know is refused BEFORE a plane is
         // attempted -- there is no key to build one with -- so it is the one

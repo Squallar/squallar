@@ -26,7 +26,9 @@
 
 use nexrad_model::data::{DataMoment as _, Radial};
 
-use super::codes::{BELOW_THRESHOLD_CODE, CodePlane, LutKey, PlaneRefusal};
+use super::codes::{
+    BELOW_THRESHOLD_CODE, CodePlane, FIRST_TABLE_CODE, LutKey, PAINTABLE_CODES, PlaneRefusal,
+};
 use crate::types::RadarProduct;
 
 /// **Why a sweep could not become a code plane**, past the refusals
@@ -68,6 +70,21 @@ pub enum PlaneUnavailable {
     /// such a key to a fully unpainted table, which is a blank disc where the
     /// raster still draws whatever the arithmetic produced.
     NonFiniteDecode { scale: f32, offset: f32 },
+    /// **This sweep paints more distinct numbers than a byte can name.**
+    ///
+    /// The per-sweep half of the fidelity door, and the reason a computed
+    /// field can ride a plane at all: `super::codes::r8_fidelity` refuses such
+    /// a product wholesale because *some* of its sweeps are this wide, and
+    /// this refuses the ones that actually are. The count is of distinct bit
+    /// patterns over the gates the render painted — the quantity a hover reads
+    /// back, never the count of colours the picture shows.
+    ///
+    /// `entries` is [`super::codes::PAINTABLE_CODES`] + 1 and not the sweep's
+    /// true width: the walk stops at the first pattern past the ceiling, so
+    /// what is reported is where it stopped. A sweep that disagrees with a
+    /// byte usually does so within its first few radials, and finishing the
+    /// walk to name a number nothing acts on would be the large one.
+    ValuesTooWide { entries: usize },
     /// Not one gate of the sweep is painted.
     ///
     /// Refused rather than shipped as an empty disc, because a fan has no
@@ -241,6 +258,161 @@ pub fn sweep_code_plane(
     }
 
     let plane = CodePlane::build(radials.len(), gates, codes, key, decode.word_bits)
+        .map_err(PlaneUnavailable::Refused)?;
+    Ok(SweepPlane { plane, reach_gates })
+}
+
+/// **A code per distinct bit pattern**, assigned in the order the patterns are
+/// first seen.
+///
+/// Keyed on the bits and not on the number, for the reason
+/// `polar::CodeTable`'s is: two of the things a render paints are NaNs that
+/// mean different things, `f32` equality neither distinguishes those nor
+/// separates `-0.0` from `0.0`, and what has to come back byte for byte is the
+/// pattern. Open-addressed over twice what a byte can address, so the table is
+/// at most half full and a probe always reaches an empty slot.
+struct Realised {
+    keys: [u32; Self::SLOTS],
+    codes: [u8; Self::SLOTS],
+    used: [bool; Self::SLOTS],
+    /// The distinct patterns, in the order they were first seen.
+    bits: Vec<u32>,
+}
+
+impl Realised {
+    const SLOTS: usize = 2 * super::codes::LUT_ENTRIES;
+
+    fn new() -> Self {
+        Self {
+            keys: [0; Self::SLOTS],
+            codes: [0; Self::SLOTS],
+            used: [false; Self::SLOTS],
+            bits: Vec::new(),
+        }
+    }
+
+    /// The **provisional** code for `bits` — `FIRST_TABLE_CODE` plus its
+    /// first-seen index — or `None` at the pattern one past the ceiling.
+    ///
+    /// Provisional because the table it indexes is not yet sorted, and
+    /// [`Reduce::MaxCode`](super::codes::Reduce::MaxCode) is a statement about
+    /// the numbers. [`Realised::finish`] is the remap.
+    fn code_for(&mut self, bits: u32) -> Option<u8> {
+        // Fibonacci hashing, as in `polar::CodeTable`: the bits of a float
+        // differ in their low end across adjacent gates and in their high end
+        // across products, and a multiply mixes both ends into the slot index.
+        let mut slot = (bits.wrapping_mul(0x9E37_79B9) >> 23) as usize & (Self::SLOTS - 1);
+        loop {
+            if !self.used[slot] {
+                if self.bits.len() >= PAINTABLE_CODES {
+                    return None;
+                }
+                let code = FIRST_TABLE_CODE + self.bits.len() as u8;
+                self.used[slot] = true;
+                self.keys[slot] = bits;
+                self.codes[slot] = code;
+                self.bits.push(bits);
+                return Some(code);
+            }
+            if self.keys[slot] == bits {
+                return Some(self.codes[slot]);
+            }
+            slot = (slot + 1) & (Self::SLOTS - 1);
+        }
+    }
+
+    /// **The ascending table, and the map from provisional code to final
+    /// code.**
+    ///
+    /// Sorted by [`f32::total_cmp`] and not by `<`: the ordering has to be
+    /// total over the patterns actually collected, and it has to separate
+    /// `-0.0` from `0.0`, which a `<` sort would leave in whichever order the
+    /// gates happened to arrive in and `CodePlane::build_values` would then
+    /// refuse as a duplicate.
+    ///
+    /// The map is [`super::codes::LUT_ENTRIES`] wide and the identity at the
+    /// two sentinels, so remapping a code buffer is one indexed lookup a gate
+    /// with no branch on whether the gate was painted.
+    fn finish(self) -> (Vec<f32>, [u8; super::codes::LUT_ENTRIES]) {
+        let mut order: Vec<usize> = (0..self.bits.len()).collect();
+        order.sort_by(|&a, &b| {
+            f32::from_bits(self.bits[a]).total_cmp(&f32::from_bits(self.bits[b]))
+        });
+        let mut remap = [0u8; super::codes::LUT_ENTRIES];
+        for (code, entry) in remap.iter_mut().enumerate() {
+            *entry = code as u8;
+        }
+        let mut values = Vec::with_capacity(order.len());
+        for (rank, &first_seen) in order.iter().enumerate() {
+            remap[usize::from(FIRST_TABLE_CODE) + first_seen] = FIRST_TABLE_CODE + rank as u8;
+            values.push(f32::from_bits(self.bits[first_seen]));
+        }
+        (values, remap)
+    }
+}
+
+/// **One computed sweep's gates as a plane whose codes index the numbers it
+/// painted** — the per-sweep admission, measured off the plane in hand.
+///
+/// `painted_at(radial, gate)` answers the number the raster's own polar buffer
+/// would hold at that cell, or `None` where the raster paints nothing there.
+/// The two are the caller's to decide because they differ per product: NROT
+/// refuses a gate its palette inks at zero alpha *before* the gate is claimed,
+/// and interpolated echo tops records one and lets the colour be transparent.
+/// A second spelling of that rule here would be a second opinion about what
+/// the picture is, so this function has none.
+///
+/// **Never quantises.** The codes name the patterns themselves, so a read-back
+/// through `CodePlane::value_table` is an indexing; a sweep that paints more
+/// than [`PAINTABLE_CODES`] of them is [`PlaneUnavailable::ValuesTooWide`] and
+/// the caller's answer to that is the raster, exactly as it is to every other
+/// arm here.
+///
+/// Two walks of the plane and no allocation of the wide grid: the first
+/// assigns provisional codes and stops at the first pattern past the ceiling,
+/// the second is an indexed remap into the ascending table.
+pub fn value_code_plane<F>(
+    radials: usize,
+    gates: usize,
+    product: RadarProduct,
+    painted_at: F,
+) -> Result<SweepPlane, PlaneUnavailable>
+where
+    F: Fn(usize, usize) -> Option<f32>,
+{
+    let cells =
+        radials
+            .checked_mul(gates)
+            .ok_or(PlaneUnavailable::Refused(PlaneRefusal::Shape {
+                radials,
+                gates,
+            }))?;
+    let mut assigned = Realised::new();
+    let mut codes = vec![BELOW_THRESHOLD_CODE; cells];
+    let mut reach_gates = 0usize;
+    for radial in 0..radials {
+        for gate in 0..gates {
+            let Some(value) = painted_at(radial, gate) else {
+                continue;
+            };
+            let Some(code) = assigned.code_for(value.to_bits()) else {
+                return Err(PlaneUnavailable::ValuesTooWide {
+                    entries: PAINTABLE_CODES + 1,
+                });
+            };
+            codes[radial * gates + gate] = code;
+            reach_gates = reach_gates.max(gate + 1);
+        }
+    }
+    if reach_gates == 0 {
+        return Err(PlaneUnavailable::NothingPainted);
+    }
+
+    let (values, remap) = assigned.finish();
+    for code in codes.iter_mut() {
+        *code = remap[usize::from(*code)];
+    }
+    let plane = CodePlane::build_values(radials, gates, codes, product, values)
         .map_err(PlaneUnavailable::Refused)?;
     Ok(SweepPlane { plane, reach_gates })
 }

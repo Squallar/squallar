@@ -1467,9 +1467,24 @@ pub fn render_sweep_plane(
     declared_nyquist: &crate::nyquist::DeclaredNyquist,
     values_wanted: bool,
 ) -> Option<SweepRender> {
+    // The two computed fields that can carry a plane on the sweeps whose own
+    // numbers fit a byte. Dispatched here for the same reason
+    // `render_radar_to_image_full_sized` dispatches interpolated echo tops
+    // before `find_sweep_owner`: a volume product has no owning cut.
+    if product == types::RadarProduct::EchoTopsInterpolated {
+        return echo_tops_interp_sweep_plane(data, values_wanted);
+    }
     // The same owner the raster path finds, so a plane and a raster of one
     // request are never two different cuts.
     let owner = find_sweep_owner(data, product, elevation_angle)?;
+    if product == types::RadarProduct::NormalizedRotation {
+        return nrot_sweep_plane(
+            data,
+            owner.radials(),
+            declared_nyquist.get(owner.elevation_number()),
+            values_wanted,
+        );
+    }
     let radials = owner.radials();
     let nyquist_ms = declared_nyquist.get(owner.elevation_number());
 
@@ -1484,16 +1499,41 @@ pub fn render_sweep_plane(
     let geometry = layout
         .plane_geometry(radials, product)
         .reaching(built.reach_gates);
+    plane_render(
+        built,
+        geometry,
+        layout.ground_reach_km,
+        nyquist_ms,
+        values_wanted,
+    )
+}
+
+/// **A plane and its geometry as the frame a pane places** — the tail every
+/// polar arm shares, so three producers cannot come to describe one surface
+/// three ways.
+///
+/// `values_wanted` decides whether the field beside the plane carries numbers,
+/// and it costs one byte a gate rather than a raster: the field is built from
+/// the plane's own level-0 codes and its
+/// [`codes::CodePlane::value_table`], which is the same arithmetic the raster's
+/// fill loop ran per gate, evaluated once per code. A read-back through it is
+/// an indexing of that arithmetic and never a rounding of it.
+///
+/// `None` if the field refuses the three parts, for the same reason every
+/// other `None` on this path is: the caller's answer is the raster.
+fn plane_render(
+    built: plane::SweepPlane,
+    geometry: polar::PolarGeometry,
+    ground_reach_km: f64,
+    nyquist_ms: Option<f64>,
+    values_wanted: bool,
+) -> Option<SweepRender> {
     let polar = if values_wanted {
         // Level 0 alone: the mip chain is what the *picture* is drawn from and
         // a readout never samples it. One copy of the plane's own bytes, on
         // whichever pool lane the render finished on.
         let (level0, _, _) = built.plane.level(0)?;
-        polar::PolarField::from_code_table(
-            geometry,
-            level0.to_vec(),
-            codes::Lut::value_table(built.plane.key()),
-        )?
+        polar::PolarField::from_code_table(geometry, level0.to_vec(), built.plane.value_table())?
     } else {
         polar::PolarField::from_parts(geometry, Vec::new())
     };
@@ -1503,13 +1543,142 @@ pub fn render_sweep_plane(
         image: Vec::new(),
         // The extent the raster would have been projected at, so a pane placing
         // this frame puts it exactly where the raster went.
-        max_range_km: types::plan_view_extent_km(layout.ground_reach_km),
+        max_range_km: types::plan_view_extent_km(ground_reach_km),
         polar,
         nyquist_ms,
         melting_layer_source: None,
         storm_motion: None,
         codes: Some(built.plane),
     })
+}
+
+/// **NROT as a plane**, on the sweeps whose realised shear values fit a byte.
+///
+/// The setup is [`render_nrot_to_image`]'s, term for term and in the same
+/// order — the same velocity grid, the same two elevations (the one the
+/// physics divided by and the one the sweep is drawn at), the same wind
+/// profile — because a plane and a raster of one request must be the same
+/// field. What is absent is the projection: no cell buffer, no image, and no
+/// walk of a `side²` picture.
+///
+/// **The painted rule is the raster's own.** `render_nrot_to_image` skips a
+/// gate whose value is `NaN` and one whose palette inks it at zero alpha,
+/// *before* `render_gate` claims the pixel, so those gates hold nothing in the
+/// raster's polar field. This skips exactly those, which is why a hover over
+/// the plane answers what a hover over the raster would.
+///
+/// `None` — the raster — for every sweep the plane refuses, the width of the
+/// realised set included.
+fn nrot_sweep_plane(
+    scan: &Scan,
+    radials: &[Radial],
+    declared_nyquist_ms: Option<f64>,
+    values_wanted: bool,
+) -> Option<SweepRender> {
+    if radials.len() < 3 {
+        return None;
+    }
+    let vg = crate::velocity::grid(radials)?;
+    let sweep_elevation = sweep_elevation_deg_or_flat(radials);
+    let slant_reach_km = vg.first_gate_range_km + vg.gate_count as f64 * vg.gate_interval_km;
+    let cos_e = sweep_ground_factor(slant_reach_km, sweep_elevation);
+    let ground_reach_km = slant_reach_km * cos_e;
+    let half_widths = derived_grid_half_widths_deg(&vg.azimuths_deg);
+    let elevation_deg = radials
+        .first()
+        .map(|r| r.elevation_angle_degrees() as f64)
+        .unwrap_or(0.5);
+    let profile = crate::velocity::volume_wind_profile(scan);
+    let nrot_grid = crate::nrot::compute_nrot_grid_with_profile(
+        &vg.sweep(declared_nyquist_ms),
+        elevation_deg,
+        profile.as_ref(),
+    );
+
+    let product = types::RadarProduct::NormalizedRotation;
+    let gates = nrot_grid.iter().map(Vec::len).max().unwrap_or(0);
+    let built = match plane::value_code_plane(nrot_grid.len(), gates, product, |radial, gate| {
+        let value = *nrot_grid.get(radial)?.get(gate)? as f32;
+        if value.is_nan() || get_color_for_value(product, value).3 == 0 {
+            return None;
+        }
+        Some(value)
+    }) {
+        Ok(built) => built,
+        Err(why) => {
+            log::info!("{product:?} renders as a raster rather than a plane: {why:?}");
+            return None;
+        }
+    };
+    let geometry = polar::PolarGeometry::from_parts(
+        derived_wedges(&vg.azimuths_deg, &half_widths),
+        vg.first_gate_range_km,
+        vg.gate_interval_km,
+        Some(sweep_elevation),
+        gates,
+    )
+    .reaching(built.reach_gates);
+    plane_render(
+        built,
+        geometry,
+        ground_reach_km,
+        declared_nyquist_ms,
+        values_wanted,
+    )
+}
+
+/// **Interpolated echo tops as a plane**, on the volumes whose realised
+/// threshold-crossing heights fit a byte.
+///
+/// [`render_echo_tops_interp_to_image`]'s field without its projection: the
+/// same 1° × 1 km grid over the same volume, in the same
+/// [`volume_grid_shape`] geometry — one degree a radial at a half-degree
+/// half-width, gate 0 centred half a bin out, and **no elevation**, because
+/// this grid's ranges are ground ranges already and converting one would bend
+/// a beam twice.
+///
+/// The raster skips a `NaN` cell and claims every other one, whatever its
+/// alpha, so this does the same. That is the difference from NROT above, and
+/// it is the raster's difference rather than this module's.
+fn echo_tops_interp_sweep_plane(scan: &Scan, values_wanted: bool) -> Option<SweepRender> {
+    let grid = crate::volumetric::compute_echo_tops(scan);
+    let product = types::RadarProduct::EchoTopsInterpolated;
+    let shape = volume_grid_shape(grid.values.len(), grid.range_bins);
+    let built =
+        match plane::value_code_plane(shape.radials, shape.gates, product, |radial, gate| {
+            let value = *grid.values.get(radial)?.get(gate)?;
+            (!value.is_nan()).then_some(value)
+        }) {
+            Ok(built) => built,
+            Err(why) => {
+                log::info!("{product:?} renders as a raster rather than a plane: {why:?}");
+                return None;
+            }
+        };
+    let azimuths: Vec<f64> = (0..shape.radials).map(|az| az as f64 + 0.5).collect();
+    let geometry = polar::PolarGeometry::from_parts(
+        derived_wedges(&azimuths, &vec![0.5; shape.radials]),
+        shape.first_gate_slant_km,
+        shape.gate_interval_slant_km,
+        shape.elevation_deg,
+        shape.gates,
+    )
+    .reaching(built.reach_gates);
+    plane_render(built, geometry, grid.range_bins as f64, None, values_wanted)
+}
+
+/// The wedges a derived grid's radials were drawn over, from the two arrays the
+/// raster's `RadialContext` is built out of — so a plane's geometry and a
+/// raster's are the same angles and not two readings of them.
+fn derived_wedges(azimuths_deg: &[f64], half_widths_deg: &[f64]) -> Vec<polar::Wedge> {
+    azimuths_deg
+        .iter()
+        .zip(half_widths_deg)
+        .map(|(&azimuth, &half)| polar::Wedge {
+            azimuth_deg: azimuth as f32,
+            half_width_deg: half as f32,
+        })
+        .collect()
 }
 
 /// How far a field's samples go along a radial and how far apart they are, both

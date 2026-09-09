@@ -1012,7 +1012,7 @@ fn expected_centre_kft(r: usize, elev_deg: f64) -> f64 {
     crate::beam::height_at_ground_km(r as f64 + 0.5, elev_deg) * 3.28084
 }
 
-fn flat_sweep(elevation_number: u8, elevation_deg: f32, dbz: Option<f64>) -> Sweep {
+pub(crate) fn flat_sweep(elevation_number: u8, elevation_deg: f32, dbz: Option<f64>) -> Sweep {
     let n_radials = 360;
     let radials = (0..n_radials)
         .map(|i| {

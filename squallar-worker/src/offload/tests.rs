@@ -3906,6 +3906,26 @@ fn the_frame_reply_framing_is_the_one_this_registry_ships() {
             .expect("the literal plane is inside every cap"),
         ),
     };
+    // The plane's other decode form. The block leads with a form byte and the
+    // two forms carry different fields behind it, so without this fixture a
+    // build could reorder or retype the table's own block and no row here
+    // would move -- the same hole the `plane` fixture above was added for, one
+    // level down.
+    let table = squallar_radar::frame::RenderedFrame {
+        codes: Some(
+            squallar_radar::render::codes::CodePlane::build_values(
+                3,
+                4,
+                // Code 0 is the unpainted sentinel, 1 the range-folded one,
+                // and 2 and 3 name the two numbers below.
+                vec![0, 1, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3],
+                squallar_radar::types::RadarProduct::NormalizedRotation,
+                vec![-1.5, 2.25],
+            )
+            .expect("the literal table is ascending, finite and inside the ceiling"),
+        ),
+        ..plane.clone()
+    };
     // The `full` frame holding its gate numbers the narrow way, which is what
     // a still pane's reply carries since the polar tail learned to say which
     // of `PolarField`'s two value forms it is in. Only the polar tail differs
@@ -3943,6 +3963,7 @@ fn the_frame_reply_framing_is_the_one_this_registry_ships() {
     let (full_head, full_tails) = encode(&full);
     let (bare_head, bare_tails) = encode(&bare);
     let (plane_head, plane_tails) = encode(&plane);
+    let (table_head, _) = encode(&table);
     let (_, coded_tails) = encode(&coded);
     let row = |name: &str, bytes: &[u8]| {
         format!("{name} | {} | {:#018x}", bytes.len(), layout_digest(bytes))
@@ -3961,6 +3982,7 @@ fn the_frame_reply_framing_is_the_one_this_registry_ships() {
         row("frame/plane/codes", &plane_tails[1]),
         row("frame/plane/image", &plane_tails[2]),
         row("frame/coded/polar", &coded_tails[0]),
+        row("frame/table/head", &table_head),
     ];
     assert_eq!(
         rows,

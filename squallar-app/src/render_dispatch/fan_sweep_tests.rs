@@ -138,13 +138,13 @@ fn every_level_arrives_unreordered_and_at_its_own_length() {
 }
 
 /// The table is the product's own palette, baked once — the same bytes
-/// `Lut::build` produces for the plane's own key, not a table rebuilt from a
-/// key assembled here.
+/// `Lut::of` produces for the plane's own decode, not a table rebuilt from a
+/// decode assembled here.
 #[test]
 fn the_table_is_the_planes_own_key_baked() {
     let (plane, geometry) = (plane(), geometry());
     let sweep = fan_sweep(&plane, &geometry, SITE_LAT, SITE_LON).expect("matched pair");
-    assert_eq!(sweep.lut_rgba, Lut::build(plane.key()).to_rgba_bytes());
+    assert_eq!(sweep.lut_rgba, Lut::of(plane.decode()).to_rgba_bytes());
     // And it is a real table rather than a run of one colour, or the equality
     // above would hold over anything.
     let distinct: std::collections::BTreeSet<&[u8]> = sweep.lut_rgba.chunks(4).collect();

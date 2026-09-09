@@ -523,7 +523,20 @@ fn reduce_footprint(plane: &CodePlane, reduce: Reduce, level: usize, r: usize, g
             (i + 1) * span
         }
     };
-    let zero = plane.key().offset.round();
+    // The magnitude ordering, spelled a second time and out of the decode
+    // rather than out of the builder — an error shared by both would have to
+    // be written twice, in two shapes, in two forms.
+    let magnitude = |c: u8| -> i64 {
+        match plane.decode() {
+            PlaneDecode::Affine { key, .. } => {
+                ((f32::from(c) - key.offset.round()).abs() * 1_000.0) as i64
+            }
+            PlaneDecode::Table { values, .. } => {
+                let v = values[usize::from(c) - usize::from(FIRST_TABLE_CODE)];
+                (v.abs() * 1_000.0) as i64
+            }
+        }
+    };
     let mut best: Option<u8> = None;
     let mut folded = false;
     for radial in r * span..end(r, radials) {
@@ -538,7 +551,7 @@ fn reduce_footprint(plane: &CodePlane, reduce: Reduce, level: usize, r: usize, g
                         Some(cur) => match reduce {
                             Reduce::MaxCode => code > cur,
                             Reduce::MaxMagnitude => {
-                                let k = |c: u8| (((f32::from(c) - zero).abs() * 1_000.0) as i64, c);
+                                let k = |c: u8| (magnitude(c), c);
                                 k(code) > k(cur)
                             }
                             Reduce::None => false,
@@ -616,6 +629,77 @@ fn max_mip_is_max() {
     assert!(
         cells_checked > 500_000,
         "only {cells_checked} mip cells were compared, which is not the shape set this claims",
+    );
+}
+
+/// **The chain over a TABLE plane reduces by the numbers, not by the codes.**
+///
+/// `max_mip_is_max` above covers the affine form, where the magnitude is read
+/// in code space off a rounded offset. A table plane's is read in value space
+/// off the table, and the two arms share no line — so a shape set that never
+/// builds one leaves the reduce's other half unwalked.
+///
+/// The property is the same and the walker is the same: `reduce_footprint`
+/// asks the plane's own decode which form it is in and spells the magnitude a
+/// second time. What makes this non-vacuous is the fixture's **sign spread** —
+/// NROT is `Reduce::MaxMagnitude`, and a table whose entries were all positive
+/// would make magnitude and code order agree and hide any confusion between
+/// them.
+#[test]
+fn max_mip_is_max_over_a_tables_numbers() {
+    // Every test that refuses a payload takes the ledger: `REFUSALS` is
+    // process-global and always on, and a neighbour's refusals landing
+    // between another test's `before` and its assertion is a race that was
+    // observed rather than hypothesised. See `REFUSAL_LEDGER`.
+    let _ledger = super::hold_refusal_ledger();
+    // Ascending, so code order is value order — and straddling zero, so
+    // magnitude order is NEITHER: the largest magnitude here is the first
+    // entry, which is the smallest code.
+    let values: Vec<f32> = (0..64).map(|i| (i as f32 - 48.0) * 0.5).collect();
+    assert!(
+        values[0].abs() > values[values.len() - 1].abs(),
+        "premise: the widest magnitude is at the low end, so magnitude and code order differ",
+    );
+    let mut cells_checked = 0usize;
+    for (radials, gates) in [(360usize, 230usize), (37, 5), (2, 3)] {
+        let codes: Vec<u8> = woven_codes(radials, gates, (radials + gates) as u64)
+            .into_iter()
+            // Onto the codes this table actually names, sentinels included.
+            .map(|c| c % (FIRST_TABLE_CODE + values.len() as u8))
+            .collect();
+        let plane = CodePlane::build_values(
+            radials,
+            gates,
+            codes,
+            RadarProduct::NormalizedRotation,
+            values.clone(),
+        )
+        .expect("a well-formed table payload inside both caps");
+        assert_eq!(plane.reduce(), Reduce::MaxMagnitude);
+        for level in 1..plane.levels() {
+            let (_, r, g) = plane.level(level).expect("inside the chain");
+            for radial in 0..r {
+                for gate in 0..g {
+                    assert_eq!(
+                        plane.code_at(level, radial, gate),
+                        Some(reduce_footprint(
+                            &plane,
+                            Reduce::MaxMagnitude,
+                            level,
+                            radial,
+                            gate
+                        )),
+                        "{radials}x{gates} level {level} cell ({radial}, {gate}): the chain and \
+                         a direct walk of the footprint disagree about the strongest number",
+                    );
+                    cells_checked += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        cells_checked > 20_000,
+        "only {cells_checked} mip cells were compared",
     );
 }
 
@@ -900,17 +984,35 @@ fn the_plane_wire_layout_is_the_one_this_protocol_ships() {
     plane.write_wire_head(&mut head);
     assert_eq!(
         (head.len(), crate::wire::layout_digest(&head)),
-        (19, 0xe6e4_4710_6e47_1997),
+        (20, 0x121b_1400_f782_db55),
         "the head block `write_wire_head` writes moved. A field was added, \
          removed, reordered or retyped -- and because `from_wire` is the same \
          codec read backwards, nothing else in this crate can see that. The \
-         block is `CodePlane::build`'s own arguments but the codes: radials \
-         u32, gates u32, product u16, scale f32, offset f32, word_bits u8.",
+         block is `CodePlane::build_decoded`'s own arguments but the codes: a \
+         decode-form byte, radials u32, gates u32, product u16, and then that \
+         form's own decode -- for the affine form scale f32, offset f32, \
+         word_bits u8.",
     );
     assert_eq!(
         head.len(),
-        CodePlane::WIRE_HEAD_BYTES,
+        CodePlane::WIRE_HEAD_AFFINE_BYTES,
         "the constant and the writer disagree about the block's width",
+    );
+    // **The whole of what moved when the block learned to name its decode
+    // form**, spelled out rather than re-recorded. The pin was
+    // `(19, 0xe6e4_4710_6e47_1997)` over
+    // `03000000 04000000 0100 00004000 00844208` — this fixture's radials,
+    // gates, Reflectivity's wire code, 2.0, 66.0, 8 — and the bytes above are
+    // that run with one `0x00` in front of it and nothing else touched.
+    assert_eq!(
+        &head[1..],
+        &[3, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0, 64, 0, 0, 132, 66, 8][..],
+        "the affine block behind the form byte is not the block it always was",
+    );
+    assert_eq!(
+        head[0],
+        CodePlane::WIRE_FORM_AFFINE,
+        "the byte in front of it is not the form byte",
     );
 
     let tail = plane.to_bytes();
@@ -977,7 +1079,7 @@ fn a_plane_survives_its_own_wire_form() {
                     // The provenance byte is carried, not inferred: nothing in
                     // the plane could re-derive it, and inferring it would be
                     // a second opinion about which sweeps are representable.
-                    assert_eq!(back.word_bits(), word_bits);
+                    assert_eq!(back.word_bits(), Some(word_bits));
                     checked += 1;
                 }
             }
@@ -1062,7 +1164,7 @@ fn a_doctored_plane_payload_is_refused_and_counted() {
         "a radial count past the cap",
         &{
             let mut h = head.clone();
-            h[0..4].copy_from_slice(&(MAX_POLAR_RADIALS as u32 + 1).to_le_bytes());
+            h[1..5].copy_from_slice(&(MAX_POLAR_RADIALS as u32 + 1).to_le_bytes());
             h
         },
         tail.clone(),
@@ -1071,7 +1173,7 @@ fn a_doctored_plane_payload_is_refused_and_counted() {
         "a gate count past the cap",
         &{
             let mut h = head.clone();
-            h[4..8].copy_from_slice(&(MAX_POLAR_GATES as u32 + 1).to_le_bytes());
+            h[5..9].copy_from_slice(&(MAX_POLAR_GATES as u32 + 1).to_le_bytes());
             h
         },
         tail.clone(),
@@ -1080,7 +1182,7 @@ fn a_doctored_plane_payload_is_refused_and_counted() {
         "a product an R8 plane cannot carry",
         &{
             let mut h = head.clone();
-            h[8..10].copy_from_slice(&RadarProduct::NormalizedRotation.wire_code().to_le_bytes());
+            h[9..11].copy_from_slice(&RadarProduct::NormalizedRotation.wire_code().to_le_bytes());
             h
         },
         tail.clone(),
@@ -1089,12 +1191,12 @@ fn a_doctored_plane_payload_is_refused_and_counted() {
         "a wide wire word for a product that is exact only at eight bits",
         &{
             let mut h = head.clone();
-            h[8..10].copy_from_slice(
+            h[9..11].copy_from_slice(
                 &RadarProduct::DifferentialReflectivity
                     .wire_code()
                     .to_le_bytes(),
             );
-            h[18] = 16;
+            h[19] = 16;
             h
         },
         tail.clone(),
@@ -1130,5 +1232,320 @@ fn a_doctored_plane_payload_is_refused_and_counted() {
         CodePlane::refusals(),
         before,
         "a head that ran out mid-field reached the plane constructor",
+    );
+}
+
+// ── The table form: admission measured off the plane in hand ─────────────────
+
+/// A table plane over `values`, with every code the table names used at least
+/// once plus both sentinels — so no assertion below is vacuous for the want of
+/// a code appearing.
+fn a_table_plane(product: RadarProduct, values: Vec<f32>) -> Result<CodePlane, PlaneRefusal> {
+    let gates = values.len() + 2;
+    let codes: Vec<u8> = (0..gates).map(|i| i as u8).collect();
+    CodePlane::build_values(1, gates, codes, product, values)
+}
+
+/// **A table plane hands back the bit patterns it was given** — every code, on
+/// the bits, including the two NaNs that mean different things.
+///
+/// The property the whole form rests on: a read-back is an *indexing* of the
+/// numbers the render painted and never a rounding of them. Asserted on
+/// `to_bits` rather than on `==`, because `-0.0 == 0.0` and no NaN equals
+/// itself, and those are exactly the three patterns a value equality would
+/// wave through.
+#[test]
+fn a_table_plane_hands_back_the_bits_it_was_given() {
+    // Every test that refuses a payload takes the ledger: `REFUSALS` is
+    // process-global and always on, and a neighbour's refusals landing
+    // between another test's `before` and its assertion is a race that was
+    // observed rather than hypothesised. See `REFUSAL_LEDGER`.
+    let _ledger = super::hold_refusal_ledger();
+    // `-0.0` before `0.0` is `total_cmp`'s order and not `<`'s: a table sorted
+    // by `<` could hold them either way round and this fixture is what says
+    // which one the encoder means.
+    let values = vec![-3.5f32, -0.0, 0.0, 1.0e-30, 2.25, f32::MAX];
+    let plane = a_table_plane(RadarProduct::NormalizedRotation, values.clone())
+        .expect("ascending, finite and inside the ceiling");
+    let table = plane.value_table();
+    assert_eq!(table.len(), LUT_ENTRIES);
+    for (i, want) in values.iter().enumerate() {
+        let got = table[usize::from(FIRST_TABLE_CODE) + i];
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "code {} handed back {got} for {want}",
+            usize::from(FIRST_TABLE_CODE) + i,
+        );
+    }
+    // **The two sentinels stay apart on the bits.** Both are NaNs, both make
+    // `PolarField::at` answer `None`, and only the pattern says which — so
+    // this is asserted here, at the one place that holds them, rather than
+    // through a reader that cannot tell them apart.
+    assert_eq!(
+        table[usize::from(BELOW_THRESHOLD_CODE)].to_bits(),
+        crate::render::polar::UNPAINTED.to_bits(),
+    );
+    assert_eq!(
+        table[usize::from(RANGE_FOLDED_CODE)].to_bits(),
+        crate::render::RANGE_FOLDED_SENTINEL.to_bits(),
+    );
+    assert_ne!(
+        crate::render::polar::UNPAINTED.to_bits(),
+        crate::render::RANGE_FOLDED_SENTINEL.to_bits(),
+        "premise: the two markers are distinguishable at all",
+    );
+    // Every code past the table is unpainted rather than a stale entry.
+    for (code, entry) in table
+        .iter()
+        .enumerate()
+        .skip(usize::from(FIRST_TABLE_CODE) + values.len())
+    {
+        assert_eq!(
+            entry.to_bits(),
+            crate::render::polar::UNPAINTED.to_bits(),
+            "code {code} names a number the sweep never painted",
+        );
+    }
+}
+
+/// **A sweep that paints more numbers than a byte can name is refused, not
+/// rounded onto the ones that fit** — and the refusal names its own reason.
+///
+/// The bound is asserted live in both directions at the boundary: 254 is a
+/// plane and 255 is a refusal, so `PAINTABLE_CODES` is the number the door
+/// actually opens at rather than a constant nothing reaches.
+#[test]
+fn a_table_wider_than_a_byte_is_refused_rather_than_quantised() {
+    // Every test that refuses a payload takes the ledger: `REFUSALS` is
+    // process-global and always on, and a neighbour's refusals landing
+    // between another test's `before` and its assertion is a race that was
+    // observed rather than hypothesised. See `REFUSAL_LEDGER`.
+    let _ledger = super::hold_refusal_ledger();
+    let ascending = |n: usize| -> Vec<f32> { (0..n).map(|i| i as f32 * 0.25).collect() };
+    let widest = a_table_plane(RadarProduct::NormalizedRotation, ascending(PAINTABLE_CODES))
+        .expect("exactly PAINTABLE_CODES numbers fit");
+    assert_eq!(widest.value_table().len(), LUT_ENTRIES);
+    assert_eq!(
+        a_table_plane(
+            RadarProduct::NormalizedRotation,
+            ascending(PAINTABLE_CODES + 1)
+        )
+        .err(),
+        Some(PlaneRefusal::TableWidth {
+            entries: PAINTABLE_CODES + 1
+        }),
+        "one number past the ceiling was admitted, or refused for another reason",
+    );
+    assert_eq!(
+        a_table_plane(RadarProduct::NormalizedRotation, Vec::new()).err(),
+        Some(PlaneRefusal::TableWidth { entries: 0 }),
+        "a plane with no numbers in it was admitted",
+    );
+}
+
+/// **A table that is not a strictly ascending run of finite numbers is
+/// refused**, at the index where it stops being one.
+///
+/// Ascending is not decoration: `Reduce::MaxCode` says the largest code is the
+/// strongest echo, so a table in any other order paints the wrong cell at
+/// every zoom above the closest. A duplicate is refused for the same reason a
+/// disorder is — two codes naming one number is one gate's measurement
+/// answering under another gate's code.
+#[test]
+fn a_table_out_of_order_or_non_finite_is_refused() {
+    // Every test that refuses a payload takes the ledger: `REFUSALS` is
+    // process-global and always on, and a neighbour's refusals landing
+    // between another test's `before` and its assertion is a race that was
+    // observed rather than hypothesised. See `REFUSAL_LEDGER`.
+    let _ledger = super::hold_refusal_ledger();
+    let product = RadarProduct::NormalizedRotation;
+    for (what, values, at) in [
+        ("descending", vec![1.0f32, 0.5], 0),
+        ("a duplicate", vec![0.0f32, 1.0, 1.0, 2.0], 1),
+        // `-0.0` and `0.0` are one number under `<` and two under `total_cmp`.
+        // The order below is the one `total_cmp` calls descending, and a `<`
+        // comparison would call it neither and let it through.
+        ("a signed zero out of order", vec![0.0f32, -0.0], 0),
+        ("a NaN", vec![0.0f32, f32::NAN], 1),
+        ("an infinity", vec![f32::INFINITY], 0),
+    ] {
+        assert_eq!(
+            a_table_plane(product, values).err(),
+            Some(PlaneRefusal::TableNotAscending { at }),
+            "{what} was admitted, or refused for another reason",
+        );
+    }
+}
+
+/// **A code naming an entry the table does not hold is refused**, on both
+/// sides of the wire.
+///
+/// One sweep's codes against another sweep's table answer a plausible number
+/// for a gate nobody measured. Cheaper to refuse than to detect afterwards,
+/// and the arm is asserted rather than the `None`: the shape and code-count
+/// checks would refuse plenty of neighbouring malformations and a test reading
+/// only `None` could not say which fired.
+#[test]
+fn a_code_outside_the_table_is_refused() {
+    // Every test that refuses a payload takes the ledger: `REFUSALS` is
+    // process-global and always on, and a neighbour's refusals landing
+    // between another test's `before` and its assertion is a race that was
+    // observed rather than hypothesised. See `REFUSAL_LEDGER`.
+    let _ledger = super::hold_refusal_ledger();
+    let product = RadarProduct::NormalizedRotation;
+    assert_eq!(
+        CodePlane::build_values(1, 3, vec![0, 2, 3], product, vec![1.0, 2.0])
+            .expect("codes 2 and 3 name the two entries")
+            .shape(),
+        (1, 3),
+    );
+    assert_eq!(
+        CodePlane::build_values(1, 3, vec![0, 2, 4], product, vec![1.0, 2.0]).err(),
+        Some(PlaneRefusal::CodeOutsideTable {
+            code: 4,
+            entries: 2
+        }),
+        "a code one past the table was admitted, or refused for another reason",
+    );
+}
+
+/// **The colour a table plane shows is its own numbers through the product's
+/// palette**, and the two sentinels keep the colours their codes have in the
+/// affine form.
+///
+/// The bake is the thing a plane is drawn through, so an error here is a
+/// picture and not a readout. Written against `get_color_for_value` directly
+/// — the raster's own call — rather than against `Lut::build` of some key,
+/// because a table plane has no key to build one from and that is the point.
+#[test]
+fn a_table_lut_is_the_palette_over_the_numbers_it_holds() {
+    // Every test that refuses a payload takes the ledger: `REFUSALS` is
+    // process-global and always on, and a neighbour's refusals landing
+    // between another test's `before` and its assertion is a race that was
+    // observed rather than hypothesised. See `REFUSAL_LEDGER`.
+    let _ledger = super::hold_refusal_ledger();
+    let product = RadarProduct::NormalizedRotation;
+    let values = vec![-2.0f32, -0.5, 0.75, 1.5, 3.0];
+    let plane = a_table_plane(product, values.clone()).expect("a well-formed table");
+    let lut = plane.lut();
+    assert_eq!(lut.entry(BELOW_THRESHOLD_CODE), (0, 0, 0, 0));
+    assert_eq!(lut.entry(RANGE_FOLDED_CODE), crate::palette::RANGE_FOLDED);
+    for (i, value) in values.iter().enumerate() {
+        assert_eq!(
+            lut.entry(FIRST_TABLE_CODE + i as u8),
+            get_color_for_value(product, *value),
+            "code {} does not show the colour {value} paints",
+            FIRST_TABLE_CODE + i as u8,
+        );
+    }
+    // Not a run of one colour, or the loop above would hold over anything.
+    let distinct: std::collections::BTreeSet<(u8, u8, u8, u8)> = values
+        .iter()
+        .map(|v| get_color_for_value(product, *v))
+        .collect();
+    assert!(distinct.len() > 2, "{} distinct colours", distinct.len());
+}
+
+/// **A table plane survives its own wire form, chain and all** — at a real
+/// sweep's shape and with a table at the widest the form admits.
+///
+/// The shape is load-bearing. Every other plane fixture in this file is a
+/// handful of gates, and at that size the mip chain is one or two levels and
+/// the code-validity walk is a few dozen comparisons; a surveillance cut is
+/// 1,319,040 gates and eleven levels, which is where a chain arithmetic or a
+/// bounds error actually lives.
+#[test]
+fn a_table_plane_survives_its_own_wire_form() {
+    let _ledger = super::hold_refusal_ledger();
+    let (radials, gates) = (720usize, 1832usize);
+    let values: Vec<f32> = (0..PAINTABLE_CODES)
+        .map(|i| i as f32 * 0.125 - 8.0)
+        .collect();
+    // Every code the table names, plus both sentinels, woven so no level of
+    // the chain is uniform.
+    let codes: Vec<u8> = (0..radials * gates)
+        .map(|i| (i % LUT_ENTRIES) as u8)
+        .collect();
+    let plane = CodePlane::build_values(
+        radials,
+        gates,
+        codes,
+        RadarProduct::NormalizedRotation,
+        values.clone(),
+    )
+    .expect("a full table at a surveillance cut's shape");
+    assert_eq!(plane.levels(), full_mip_levels(radials, gates));
+    assert!(plane.levels() > 1, "premise: there is a chain to rebuild");
+
+    let mut head = Vec::new();
+    plane.write_wire_head(&mut head);
+    assert_eq!(head[0], CodePlane::WIRE_FORM_TABLE);
+    assert_eq!(
+        head.len(),
+        CodePlane::WIRE_SHAPE_BYTES + 4 + values.len() * 4,
+        "the table head is not the shape, a count and the numbers",
+    );
+    assert!(
+        head.len() <= CodePlane::WIRE_HEAD_MAX_BYTES,
+        "the widest table this form admits is past the reservation a reply makes",
+    );
+    let tail = plane.to_bytes();
+    assert_eq!(tail.len(), radials * gates, "the tail is level 0 alone");
+
+    let back = CodePlane::from_wire(&mut crate::wire::Reader::new(&head), tail.clone())
+        .expect("the plane's own bytes decode");
+    assert_eq!(back, plane, "the plane did not survive its own codec");
+    assert_eq!(back.word_bits(), None, "a table plane has no wire word");
+
+    // And the two forms are not confused for one another: relabelling the
+    // block reads the table's count as a scale and is refused rather than
+    // guessed at.
+    let mut as_affine = head.clone();
+    as_affine[0] = CodePlane::WIRE_FORM_AFFINE;
+    assert_eq!(
+        CodePlane::from_wire(&mut crate::wire::Reader::new(&as_affine), tail.clone()),
+        None,
+        "a table block read as an affine one was accepted",
+    );
+    // **A count past the ceiling is refused where the count is read, in front
+    // of the buffer it would fill** — and the ledger is what says so. This
+    // payload is well formed apart from its width: 300 entries, all 300 of
+    // them present. Read at the door, it is declined and no plane is ever
+    // attempted, so `CodePlane::refusals` does not move. Read behind the
+    // buffer, the same bytes reach `build_decoded`, are refused for
+    // `TableWidth` and are counted — which is the difference this assertion
+    // is made of, and the reason it is a delta rather than a `None`.
+    let mut wide = Vec::new();
+    wide.push(CodePlane::WIRE_FORM_TABLE);
+    wide.extend_from_slice(&(radials as u32).to_le_bytes());
+    wide.extend_from_slice(&(gates as u32).to_le_bytes());
+    wide.extend_from_slice(&RadarProduct::NormalizedRotation.wire_code().to_le_bytes());
+    wide.extend_from_slice(&300u32.to_le_bytes());
+    for i in 0..300u32 {
+        wide.extend_from_slice(&(i as f32).to_le_bytes());
+    }
+    let before = CodePlane::refusals();
+    assert_eq!(
+        CodePlane::from_wire(&mut crate::wire::Reader::new(&wide), tail.clone()),
+        None,
+        "a table of 300 entries was accepted",
+    );
+    assert_eq!(
+        CodePlane::refusals(),
+        before,
+        "a count past the ceiling reached the plane constructor, so the buffer \
+         it declares was filled before the width was looked at",
+    );
+
+    // And a count no buffer could hold is declined on the same line, without
+    // the reservation it names.
+    let mut huge = head.clone();
+    huge[CodePlane::WIRE_SHAPE_BYTES..CodePlane::WIRE_SHAPE_BYTES + 4]
+        .copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(
+        CodePlane::from_wire(&mut crate::wire::Reader::new(&huge), tail),
+        None,
+        "a table declaring four billion entries was accepted",
     );
 }
