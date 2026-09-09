@@ -2733,15 +2733,12 @@ impl super::App {
             srv_fallback: self.render.srv_fallback(),
             melting_layer,
             rpg_storm_motion,
-            // **The producer asks the same question the draw asks**, off the
-            // one field that holds the answer. A frame built in the polar
-            // shape on a machine with no renderer for it is a pane with no
-            // radar on it, because the raster it would fall back to is the
-            // allocation the representation exists not to make.
-            surface: match self.radar_fan_painter {
-                Some(_) => squallar_radar::jobs::PlanSurface::Fan,
-                None => squallar_radar::jobs::PlanSurface::Raster,
-            },
+            // **The producer asks the same question the draw asks**, through
+            // the one door that answers it — `App::plan_surface`. A frame
+            // built in the polar shape on a machine with no renderer for it is
+            // a pane with no radar on it, because the raster it would fall
+            // back to is the allocation the representation exists not to make.
+            surface: self.plan_surface(),
         };
         // Which job input this frame's data makes is radar's answer, not this
         // crate's: the described job crosses back with its input type erased and

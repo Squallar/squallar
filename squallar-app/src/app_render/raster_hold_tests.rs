@@ -56,7 +56,7 @@ fn app_with_panes(n: usize) -> crate::app::App {
 
 fn render_of(image: Arc<egui::ColorImage>) -> crate::render_dispatch::CachedPaneRender {
     crate::render_dispatch::CachedPaneRender {
-        image,
+        surface: crate::channels::StillSurface::Raster(image),
         max_range_km: 230.0,
         hover: Arc::new(squallar_radar::hover::HoverSource::empty()),
         product: squallar_radar::types::RadarProduct::Reflectivity,

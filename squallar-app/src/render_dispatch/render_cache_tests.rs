@@ -16,7 +16,7 @@ fn key(site: &str, elevation_tenths: i32) -> RenderKey {
 /// which render it got back.
 fn output(range: f64) -> CachedRenderOutput {
     CachedRenderOutput {
-        image: Arc::new(egui::ColorImage::default()),
+        surface: crate::channels::StillSurface::Raster(Arc::new(egui::ColorImage::default())),
         max_range_km: range,
         hover: Arc::new(squallar_radar::hover::HoverSource::empty()),
         nyquist_ms: None,
@@ -47,10 +47,10 @@ fn hover_field(side: usize) -> squallar_radar::render::polar::PolarField {
 /// the gates behind it.
 fn output_of_side(range: f64, side: usize) -> CachedRenderOutput {
     CachedRenderOutput {
-        image: Arc::new(egui::ColorImage::new(
+        surface: crate::channels::StillSurface::Raster(Arc::new(egui::ColorImage::new(
             [side, side],
             vec![egui::Color32::BLACK; side * side],
-        )),
+        ))),
         max_range_km: range,
         hover: Arc::new(squallar_radar::hover::HoverSource::resident(hover_field(
             side,

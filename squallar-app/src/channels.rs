@@ -111,17 +111,79 @@ pub struct ScanResponse {
     pub is_auto_poll: bool,
 }
 
-/// What a render produced: the texture, the half-width it was projected at,
-/// and the per-pixel value grid a hover reads.
-pub struct RenderedImage {
-    /// Already in egui's pixel layout, and already an `Arc`, because the frame
-    /// thread must neither convert it nor copy it.
+/// **Which of the two surfaces a still plan-view render came back as.**
+///
+/// The same split [`squallar_egui::pane::RadarSurface`] draws, one step
+/// earlier: this is what the reply carries and that is what the pane holds. A
+/// render is one or the other and never both, which is what makes the size win
+/// real rather than a second copy — see
+/// [`squallar_radar::jobs::PlanSurface`] for which one the *caller* asks for
+/// and why the answer belongs to the caller.
+#[derive(Clone)]
+pub enum StillSurface {
+    /// The rasterizer resolved a colour per gate into a square image. Its
+    /// producer holds `side²` cells (8 B) and the RGBA texture (4 B) live at
+    /// once, which is the pair the polar arm exists not to allocate.
+    Raster(Arc<egui::ColorImage>),
+    /// The sweep itself, one byte a gate in the frame the radar measured in,
+    /// already turned into the payload the renderer draws — see
+    /// `render_dispatch::fan_sweep`, which says in as many words that the turn
+    /// does not belong on the frame thread.
+    Fan(Arc<squallar_egui::radar_fan::FanSweep>),
+}
+
+impl StillSurface {
+    /// The image, for the raster arm only.
     ///
-    /// The per-pixel unmultiply is 16 MiB at the base size and 64 MiB long range;
-    /// on the frame thread it measured 6.4 ms at 2048² and 31.0 ms at 4096² (7950X,
-    /// release, medians of 11 runs of a real KDMX 0.5° cut) against a 16.7 ms
-    /// budget. `offload::execute` premultiplies inside the job instead.
-    pub image: Arc<egui::ColorImage>,
+    /// **Deliberately not a "get me something to draw" accessor**, for the
+    /// reason `RadarSurface::raster` gives: a caller that needs a `ColorImage`
+    /// needs the raster arm specifically — an upload, a retained-buffer
+    /// comparison, a test asserting which picture a pane is showing — and a
+    /// fan has none to give it.
+    pub fn raster(&self) -> Option<&Arc<egui::ColorImage>> {
+        match self {
+            Self::Raster(image) => Some(image),
+            Self::Fan(_) => None,
+        }
+    }
+
+    /// The sweep, for the polar arm only.
+    pub fn fan(&self) -> Option<&Arc<squallar_egui::radar_fan::FanSweep>> {
+        match self {
+            Self::Fan(sweep) => Some(sweep),
+            Self::Raster(_) => None,
+        }
+    }
+
+    /// **What this reply is holding, bytes — priced off the payload it
+    /// actually carries and never off a constant.**
+    ///
+    /// The two arms have two prices because they are two objects: a raster is
+    /// its `Color32` pixels, a fan is its own chain and table. A figure taken
+    /// off the shape a render was *asked* for would price a sweep that fell
+    /// back to the raster at a fraction of what it allocated.
+    pub fn resident_bytes(&self) -> usize {
+        match self {
+            Self::Raster(image) => image.pixels.len() * std::mem::size_of::<egui::Color32>(),
+            Self::Fan(sweep) => sweep.resident_bytes(),
+        }
+    }
+}
+
+/// What a render produced: the surface it drew, the half-width it was
+/// projected at, and the gates a hover reads.
+pub struct RenderedImage {
+    /// **The picture, in whichever of the two forms the render produced.**
+    ///
+    /// A raster arrives already in egui's pixel layout and already an `Arc`,
+    /// because the frame thread must neither convert it nor copy it: the
+    /// per-pixel unmultiply is 16 MiB at the base size and 64 MiB long range,
+    /// and on the frame thread it measured 6.4 ms at 2048² and 31.0 ms at
+    /// 4096² (7950X, release, medians of 11 runs of a real KDMX 0.5° cut)
+    /// against a 16.7 ms budget. `offload::execute` premultiplies inside the
+    /// job instead. A fan arrives as a finished renderer payload for the same
+    /// reason: building one walks the mip chain and bakes a colour table.
+    pub surface: StillSurface,
     /// [`squallar_radar::types::plan_view_extent_km`] of the sweep's reach, and so
     /// the only thing that says where these pixels sit on the ground.
     pub max_range_km: f64,

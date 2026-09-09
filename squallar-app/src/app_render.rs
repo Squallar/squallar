@@ -2004,7 +2004,7 @@ impl super::App {
                         squallar_radar::types::RenderView::PlanView,
                         rr.elevation,
                         crate::render_dispatch::CachedRenderOutput {
-                            image: rendered.image,
+                            surface: rendered.surface,
                             max_range_km: rendered.max_range_km,
                             hover: rendered.hover,
                             nyquist_ms: rendered.nyquist_ms,
@@ -2052,7 +2052,7 @@ impl super::App {
             // Extract fields to avoid borrow issues
             let origin_pane = rr.pane_idx;
             let render_result = CachedPaneRender {
-                image: rendered.image,
+                surface: rendered.surface,
                 max_range_km: rendered.max_range_km,
                 hover: rendered.hover,
                 product: rr.product,
@@ -2087,7 +2087,7 @@ impl super::App {
                 squallar_radar::types::RenderView::PlanView,
                 render_result.elevation,
                 crate::render_dispatch::CachedRenderOutput {
-                    image: Arc::clone(&render_result.image),
+                    surface: render_result.surface.clone(),
                     max_range_km: render_result.max_range_km,
                     hover: Arc::clone(&render_result.hover),
                     nyquist_ms: render_result.nyquist_ms,
@@ -2220,6 +2220,9 @@ impl super::App {
         else {
             return;
         };
+        // The same question the interactive dispatch asks, read before the
+        // dispatcher is borrowed.
+        let surface = self.plan_surface();
         self.render.spawn_speculative_render(
             site,
             product,
@@ -2229,6 +2232,7 @@ impl super::App {
             inputs.lon,
             data,
             &declared,
+            surface,
             self.channels.render_sender.clone(),
             self.window.clone(),
         );
@@ -2254,6 +2258,75 @@ impl super::App {
             (scan_info.site.lat, scan_info.site.lon)
         };
 
+        // **What the picture says about itself**, built once and identical
+        // across the two surfaces: everything a pane reports about the plan
+        // view on its glass is a property of the render, not of the shape it
+        // came back in.
+        let meta = RadarTextureMeta {
+            hover: Arc::clone(&render.hover),
+            lat,
+            lon,
+            max_range_km: render.max_range_km,
+            nyquist_ms: render.nyquist_ms,
+            melting_layer_source: render.melting_layer_source,
+            storm_motion: render.storm_motion,
+            product: crate::render_key::field_id_of(render.product),
+            elevation: render.elevation,
+        };
+
+        // **The polar arm, and it mints no texture** — which is the whole of
+        // the saving rather than a detail of it. A still pane that also
+        // uploaded a raster would hold both representations and cost more than
+        // the raster alone did, so the upload below is reached only on the
+        // arm that has pixels.
+        //
+        // No hold and no promotion either: those exist because a texture's
+        // texels reach the GPU over several frames, and a fan's payload is a
+        // host buffer the renderer uploads inside its own callback. See
+        // `PaneState::place_radar_fan`.
+        //
+        // **No renderer check here, unlike the loop's arrival path**, and the
+        // difference is which side builds the payload. `loop_frame_fan` runs on
+        // the frame thread and turns a reply into a *surface*, so it asks
+        // whether one can be drawn; this arm receives a payload the reply
+        // already carries, and a reply carries one only because
+        // `App::plan_surface` asked for it — which is the same field the draw
+        // reads, published once at GPU bring-up and never withdrawn.
+        let image = match &render.surface {
+            crate::channels::StillSurface::Fan(sweep) => {
+                let sweeps: Arc<[Arc<squallar_egui::radar_fan::FanSweep>]> =
+                    Arc::from(vec![Arc::clone(sweep)]);
+                // **One reach for the read and the place alike**, the way
+                // the disabled-layer branch below spells the same pair: the
+                // stamp is asked of `self.render` while the pane is borrowed,
+                // which is two disjoint fields of one struct rather than two
+                // trips through the seam.
+                let Some(pane) = self.gui.pane_mut(pane_idx) else {
+                    return;
+                };
+                let data_time = self.render.data_time_for_render(pane, render);
+                pane.place_radar_fan(
+                    squallar_egui::pane::StillRadarFan { sweeps, meta },
+                    data_time,
+                );
+                if pane_idx < self.render.pane_render.len() {
+                    // **Recorded weakly, and the record is what prices it.**
+                    // A fan's payload is host bytes this pane holds for as
+                    // long as the picture is on the glass, and the render
+                    // cache's copy of the same `Arc` is evicted on its own
+                    // schedule — so without this the bytes leave every family
+                    // that named them the moment the cache does. It also
+                    // clears the `uploaded_from` claim, because a pane
+                    // drawing a fan is showing no texture.
+                    self.render.pane_render[pane_idx].note_fan(sweep);
+                    self.render.pane_render[pane_idx].last_rendered =
+                        Some((render.product, render.elevation));
+                }
+                return;
+            }
+            crate::channels::StillSurface::Raster(image) => Arc::clone(image),
+        };
+
         // Whether the picture being applied is the picture already on this
         // pane — the *same buffer*, not a buffer that compares equal. The pane
         // remembers that buffer weakly; see `PaneRenderState::uploaded_from`.
@@ -2261,7 +2334,7 @@ impl super::App {
             .render
             .pane_render
             .get(pane_idx)
-            .is_some_and(|prs| prs.shows_buffer(&render.image));
+            .is_some_and(|prs| prs.shows_buffer(&image));
 
         // Let go of the old radar overlay texture — unless it is the one about
         // to go back, in which case it is kept rather than retired and
@@ -2278,8 +2351,15 @@ impl super::App {
                 None => cache.current().map(|old| (old.texture.clone(), true)),
             })
             .flatten();
+        // **Asked while the pane is still borrowed**, which is what makes the
+        // place below the same trip through the seam as the read above rather
+        // than a second one — the shed the disabled-layer branch already made
+        // for its own pair. The stamp comes off `self.render` and the pane off
+        // `self.gui`: two disjoint fields of one struct, so the upload between
+        // here and the place borrows neither.
+        let data_time = self.render.data_time_for_render(pane, render);
 
-        let side = render.image.width();
+        let side = image.width();
         let (texture, whole) = match retained {
             // The pane's own handle, preferred over anything `uploads` may hold
             // for the same raster. Not a lifetime question — see the note above
@@ -2287,11 +2367,11 @@ impl super::App {
             Some(pair) => pair,
             None => {
                 let counter = &mut self.texture_counter;
-                let texture = uploads.handle(&render.image, || {
+                let texture = uploads.handle(&image, || {
                     *counter += 1;
                     ctx.load_texture(
                         format!("radar_image_{counter}"),
-                        Arc::clone(&render.image),
+                        Arc::clone(&image),
                         egui::TextureOptions::NEAREST,
                     )
                 });
@@ -2306,13 +2386,11 @@ impl super::App {
         // and not the pixels. Recorded whichever branch ran: the retained
         // handle was uploaded from this same buffer.
         if pane_idx < self.render.pane_render.len() {
-            self.render.pane_render[pane_idx].note_uploaded(&render.image);
+            self.render.pane_render[pane_idx].note_uploaded(&image);
         }
 
         let bounds = ImageBounds::from_radar_site(lat, lon, render.max_range_km);
         let placed_raster: PlacedRaster = bounds.into();
-        let pane = self.gui.pane_mut(pane_idx).unwrap();
-        let data_time = self.render.data_time_for_render(pane, render);
         let placed = OverlayTextureData {
             texture,
             placed: placed_raster,
@@ -2320,17 +2398,7 @@ impl super::App {
             render_zoom: 0,
             width: side as u32,
             height: side as u32,
-            radar_meta: Some(RadarTextureMeta {
-                hover: Arc::clone(&render.hover),
-                lat,
-                lon,
-                max_range_km: render.max_range_km,
-                nyquist_ms: render.nyquist_ms,
-                melting_layer_source: render.melting_layer_source,
-                storm_motion: render.storm_motion,
-                product: crate::render_key::field_id_of(render.product),
-                elevation: render.elevation,
-            }),
+            radar_meta: Some(meta),
             hit_map: None,
         };
 
@@ -3729,7 +3797,7 @@ impl super::App {
                         elevation,
                     ) {
                         let render_result = CachedPaneRender {
-                            image: Arc::clone(&cached.image),
+                            surface: cached.surface.clone(),
                             max_range_km: cached.max_range_km,
                             hover: Arc::clone(&cached.hover),
                             product,
@@ -3797,6 +3865,13 @@ impl super::App {
                     {
                         // Handed back as refcounts, so the dispatcher below can be
                         // borrowed mutably in the same statement.
+                        // **The producer asks the same question the draw
+                        // asks**, off the one field that holds the answer —
+                        // the loop dispatch's own line, for the same reason:
+                        // a plane built on a machine with no renderer for one
+                        // is a pane with no radar on it. Read before the
+                        // dispatcher is borrowed.
+                        let surface = self.plan_surface();
                         self.render.spawn_level2_render(
                             pane_idx,
                             &params,
@@ -3804,6 +3879,7 @@ impl super::App {
                             data,
                             &declared,
                             scan_info.timestamp,
+                            surface,
                             self.channels.render_sender.clone(),
                             self.window.clone(),
                         );
@@ -3852,6 +3928,12 @@ impl super::App {
                         if not_drawn || !has_scan {
                             pane.overlay_cache_mut(&squallar_source::id::known::RADAR)
                                 .clear();
+                            // The plan view's other surface, on the same
+                            // condition — and it is the one that is host
+                            // bytes, so releasing only the texture here would
+                            // leave the larger holder standing on exactly the
+                            // pane this branch exists to empty.
+                            pane.release_radar_still_fan();
                         }
                         site
                     }
@@ -3865,6 +3947,9 @@ impl super::App {
                             .release_plan_view_render(&self.gui, &site, product, elevation);
                     }
                     self.render.pane_render[pane_idx].uploaded_from = None;
+                    // The same claim for the polar arm: left set, it would
+                    // price a payload this pane has just let go of.
+                    self.render.pane_render[pane_idx].showing_fan = None;
                 }
                 self.render.pane_render[pane_idx].last_rendered = None;
             }
@@ -10043,6 +10128,12 @@ mod overlay_upload_tests;
 #[path = "app_render/radar_texture_sharing_tests.rs"]
 #[cfg(test)]
 mod radar_texture_sharing_tests;
+
+/// A still plan view that came back a plane: what the pane holds, what it no
+/// longer mints, and what it still says about the picture.
+#[path = "app_render/still_fan_tests.rs"]
+#[cfg(test)]
+mod still_fan_tests;
 
 /// One arriving raster's hit map is one allocation, however many panes draw
 /// it — and every one of them answers a click the same way.

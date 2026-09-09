@@ -252,7 +252,7 @@ fn the_panes_that_asked_for_nothing_are_served_anyway() {
         .render_sender
         .send(crate::channels::RenderResponse {
             rendered: Some(crate::channels::RenderedImage {
-                image: Arc::clone(&image),
+                surface: crate::channels::StillSurface::Raster(Arc::clone(&image)),
                 max_range_km: 230.0,
                 hover: Arc::new(squallar_radar::hover::HoverSource::empty()),
                 nyquist_ms: None,

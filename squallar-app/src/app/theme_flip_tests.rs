@@ -19,7 +19,7 @@ fn a_radar_entry() -> (RenderKey, CachedRenderOutput) {
             0.5,
         ),
         CachedRenderOutput {
-            image: Arc::new(egui::ColorImage::default()),
+            surface: crate::channels::StillSurface::Raster(Arc::new(egui::ColorImage::default())),
             max_range_km: 230.0,
             hover: Arc::new(squallar_radar::hover::HoverSource::empty()),
             nyquist_ms: None,

@@ -181,6 +181,7 @@ fn both_dispatch_paths_classify_against_this_volumes_melting_layer_and_no_other(
         std::sync::Arc::new(dual_pol_scan()),
         &squallar_radar::nyquist::DeclaredNyquist::empty(),
         volume(0),
+        squallar_radar::jobs::PlanSurface::Raster,
         sender,
         None,
     );
@@ -266,6 +267,7 @@ fn a_product_that_classifies_nothing_carries_no_melting_layer() {
         std::sync::Arc::new(dual_pol_scan()),
         &squallar_radar::nyquist::DeclaredNyquist::empty(),
         volume(0),
+        squallar_radar::jobs::PlanSurface::Raster,
         sender,
         None,
     );
@@ -335,6 +337,7 @@ fn both_dispatch_paths_shift_by_this_volumes_storm_motion_and_no_other() {
         std::sync::Arc::new(dual_pol_scan()),
         &squallar_radar::nyquist::DeclaredNyquist::empty(),
         volume(0),
+        squallar_radar::jobs::PlanSurface::Raster,
         sender,
         None,
     );
@@ -426,6 +429,7 @@ fn a_product_that_applies_no_storm_motion_carries_none() {
             std::sync::Arc::new(dual_pol_scan()),
             &squallar_radar::nyquist::DeclaredNyquist::empty(),
             volume(0),
+            squallar_radar::jobs::PlanSurface::Raster,
             sender,
             None,
         );

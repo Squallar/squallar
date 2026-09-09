@@ -436,7 +436,7 @@ fn the_draw_carries_the_frames_own_view() {
         draw_radar_fan(
             &ui,
             &projector,
-            &img,
+            (img.lat, img.lon),
             sweeps,
             Some(&painter),
             PaneSurfaces::GroundAndGlass
@@ -494,7 +494,14 @@ fn one_issue(
     let RadarSurface::Fan(sweeps) = &img.surface else {
         unreachable!("the fixture is a fan")
     };
-    let outcome = draw_radar_fan(&ui, &projector, &img, sweeps, painter, surfaces);
+    let outcome = draw_radar_fan(
+        &ui,
+        &projector,
+        (img.lat, img.lon),
+        sweeps,
+        painter,
+        surfaces,
+    );
     let _ = ctx.end_pass();
     outcome
 }
@@ -860,4 +867,69 @@ fn the_fan_draws_at_the_position_the_user_ordered_radar_into() {
     // count is what the reset cost is a function of.
     assert_eq!(first_shapes.iter().filter(|s| **s == "callback").count(), 1);
     assert_eq!(last_shapes.iter().filter(|s| **s == "callback").count(), 1);
+}
+
+// ── The still pane's own arm ────────────────────────────────────────────────
+
+/// **A still pane holding a plane draws it through the renderer**, at radar's
+/// own position in the pane's layer walk.
+///
+/// The loop arm above is exercised through `render_radar_overlay` directly;
+/// this one has to go through the whole walk, because the still branch is
+/// *selected* there — the pane holds one surface or the other and the walk is
+/// where it asks which. So the harness runs real frames, and what is asserted
+/// is that the installed painter was asked for a payload with this pane's
+/// sweep in it.
+///
+/// **The raster control is the second half**, and it is what stops this
+/// reading green through a walk that asks the painter about everything: the
+/// same pane, the same site, the same frames, a texture instead of a plane,
+/// and the painter is never asked.
+///
+/// TAMPER: drop the `still_radar_fan` arm from the walk's radar branch and the
+/// first assertion goes red; ask the painter unconditionally and the control
+/// goes red.
+#[test]
+fn a_still_pane_holding_a_plane_draws_it_through_the_renderer() {
+    let recorder = Recorder::new(true);
+    let painter: Arc<dyn RadarFanPainter> = recorder.clone();
+    let mut harness = crate::input_harness::InputHarness::new();
+    harness.install_fan_painter(Arc::clone(&painter));
+    harness.load_scan("KTLX");
+    harness.place_radar_fan(
+        0,
+        &squallar_radar::fields::known::REFLECTIVITY,
+        0.5,
+        Arc::new(sweep()),
+    );
+
+    let seen = recorder.seen();
+    assert!(
+        !seen.is_empty(),
+        "a still pane holding a plane never reached the renderer, so its \
+         radar layer drew nothing at all",
+    );
+    assert!(
+        seen.iter().all(|s| s.sweeps == 1),
+        "the still pane submitted {seen:?}, not its one cut",
+    );
+
+    // The control: the same pane, the same frames, a texture instead.
+    let control = Recorder::new(true);
+    let control_painter: Arc<dyn RadarFanPainter> = control.clone();
+    let mut harness = crate::input_harness::InputHarness::new();
+    harness.install_fan_painter(Arc::clone(&control_painter));
+    harness.load_scan("KTLX");
+    harness.place_radar_image(
+        0,
+        &squallar_radar::fields::known::REFLECTIVITY,
+        0.5,
+        None,
+        None,
+        None,
+    );
+    assert!(
+        control.seen().is_empty(),
+        "a still pane showing a texture asked the fan renderer for a payload",
+    );
 }

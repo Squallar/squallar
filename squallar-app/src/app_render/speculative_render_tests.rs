@@ -182,7 +182,10 @@ fn post_interactive(app: &mut crate::app::App, product: RadarProduct, elevation:
         .render_sender
         .send(crate::channels::RenderResponse {
             rendered: Some(crate::channels::RenderedImage {
-                image: Arc::new(egui::ColorImage::filled([4, 4], egui::Color32::TRANSPARENT)),
+                surface: crate::channels::StillSurface::Raster(Arc::new(egui::ColorImage::filled(
+                    [4, 4],
+                    egui::Color32::TRANSPARENT,
+                ))),
                 max_range_km: 230.0,
                 hover: Arc::new(squallar_radar::hover::HoverSource::empty()),
                 nyquist_ms: None,
@@ -205,7 +208,10 @@ fn post_speculative(app: &mut crate::app::App, product: RadarProduct, elevation:
         .render_sender
         .send(crate::channels::RenderResponse {
             rendered: Some(crate::channels::RenderedImage {
-                image: Arc::new(egui::ColorImage::filled([4, 4], egui::Color32::TRANSPARENT)),
+                surface: crate::channels::StillSurface::Raster(Arc::new(egui::ColorImage::filled(
+                    [4, 4],
+                    egui::Color32::TRANSPARENT,
+                ))),
                 max_range_km: 230.0,
                 hover: Arc::new(squallar_radar::hover::HoverSource::empty()),
                 nyquist_ms: None,

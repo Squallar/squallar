@@ -32,9 +32,10 @@ impl Drop for RenderGuard {
 /// than that: until 2026-09-07 every pane kept a clone of one for restore, and
 /// [`PaneRenderState::uploaded_from`] is what replaced it.
 pub struct CachedPaneRender {
-    /// See [`crate::channels::RenderedImage::image`] — held converted, so an
-    /// apply is an upload and not a second walk of 64 MiB.
-    pub image: Arc<egui::ColorImage>,
+    /// See [`crate::channels::RenderedImage::surface`] — a raster is held
+    /// converted, so an apply is an upload and not a second walk of 64 MiB,
+    /// and a fan is held as the finished payload the renderer draws.
+    pub surface: crate::channels::StillSurface,
     /// The half-width the cached pixels were projected at, km.
     pub max_range_km: f64,
     /// The gates behind these pixels, for the readout — see
@@ -215,6 +216,22 @@ pub struct PaneRenderState {
     /// longer has, and the upload that pane needs would be skipped. So the
     /// clears stayed when the bytes went.
     pub uploaded_from: Option<Weak<egui::ColorImage>>,
+    /// **The polar payload this pane is showing**, weakly — the fan arm's
+    /// counterpart of [`Self::uploaded_from`], and held for a different
+    /// reason.
+    ///
+    /// A raster's pixels are the GPU's once uploaded and the pane owns none of
+    /// them; a fan's payload is a host buffer the pane holds for as long as
+    /// the picture is on the glass, and the render cache's copy of the same
+    /// `Arc` is evicted on its own schedule. So when the cache lets go, the
+    /// pane is the sole owner and the bytes leave every family that named
+    /// them — which is the shape of the defect `cached renders` was created
+    /// by. This is what lets [`RenderDispatcher::cached_render_bytes`] name
+    /// them without owning them.
+    ///
+    /// A `Weak`, so this never keeps a payload alive: an entry whose picture
+    /// has been replaced upgrades to `None` and prices nothing.
+    pub showing_fan: Option<Weak<squallar_egui::radar_fan::FanSweep>>,
     /// One flag per render dispatched for this pane and not yet finished, held
     /// alongside the copy the render thread carries.
     results_wanted: Vec<Arc<AtomicBool>>,
@@ -240,6 +257,7 @@ impl PaneRenderState {
             in_flight_plan_view: None,
             last_rendered: None,
             uploaded_from: None,
+            showing_fan: None,
             results_wanted: Vec::new(),
             reply_bytes: Arc::new(AtomicUsize::new(0)),
             in_flight_total,
@@ -267,6 +285,30 @@ impl PaneRenderState {
     /// [`Self::uploaded_from`].
     pub fn note_uploaded(&mut self, image: &Arc<egui::ColorImage>) {
         self.uploaded_from = Some(Arc::downgrade(image));
+        // One picture at a time: a pane showing a raster is not showing a fan,
+        // and a stale weak here would price a payload this pane let go of.
+        self.showing_fan = None;
+    }
+
+    /// Record that this pane is drawing `sweep`. See [`Self::showing_fan`].
+    pub fn note_fan(&mut self, sweep: &Arc<squallar_egui::radar_fan::FanSweep>) {
+        self.showing_fan = Some(Arc::downgrade(sweep));
+        // The counterpart clear, for the reason `note_uploaded`'s is there.
+        self.uploaded_from = None;
+    }
+
+    /// **What this pane's own picture is holding on this heap, bytes.**
+    ///
+    /// Zero on the raster arm — those pixels are the GPU's and
+    /// [`Self::uploaded_from`] owns none of them — and the payload's own
+    /// measured figure on the polar one. Never a nominal: a plane is sized by
+    /// the radials and gates the radar chose, and a sweep that fell back to a
+    /// raster reads zero here rather than a plane's price.
+    pub fn showing_bytes(&self) -> u64 {
+        self.showing_fan
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map_or(0, |sweep| sweep.resident_bytes() as u64)
     }
 
     /// Whether `image` is the buffer this pane's texture was uploaded from —
@@ -318,7 +360,9 @@ impl PaneRenderState {
 
 /// Cached radar render output, shared across panes that show the same product/elevation.
 pub struct CachedRenderOutput {
-    pub image: Arc<egui::ColorImage>,
+    /// The picture this entry shares, in whichever of the two forms the render
+    /// produced it — see [`crate::channels::StillSurface`].
+    pub surface: crate::channels::StillSurface,
     pub max_range_km: f64,
     /// The gates behind this shared raster, shared with it for the reason the
     /// extent is.
@@ -407,8 +451,21 @@ impl RenderCache {
     /// all — it bought back 211.8 MiB of a census figure and 0 B of heap.
     /// `the_budget_and_the_price_are_one_expression` is what stops the two
     /// drifting apart again.
+    ///
+    /// **Priced off the surface the entry actually holds, per arm.** A raster
+    /// is its pixels at the plan-view texel width; a fan is the buffers its
+    /// payload allocated, read back through `FanSweep::resident_bytes`. A
+    /// single figure taken off the shape a render was *asked* for would price
+    /// a sweep that fell back to the raster at a fraction of what it holds,
+    /// and this cache mixes the two arms freely — a pane on a refused product
+    /// shares it with a pane on an admitted one.
     fn entry_budget_bytes(value: &CachedRenderOutput) -> usize {
-        value.image.pixels.len() * squallar_device_profile::constants::PLAN_VIEW_TEXEL_BYTES
+        match &value.surface {
+            crate::channels::StillSurface::Raster(image) => {
+                image.pixels.len() * squallar_device_profile::constants::PLAN_VIEW_TEXEL_BYTES
+            }
+            crate::channels::StillSurface::Fan(sweep) => sweep.resident_bytes(),
+        }
     }
 
     /// Move `key` to the most-recently-used end. No-op if absent.
@@ -823,17 +880,40 @@ pub(crate) fn speculative_render_allowed(web: bool, concurrent_renders: usize) -
 /// lands on, which on wasm is the page thread.
 fn rendered_image_from(
     frame: squallar_radar::frame::RenderedFrame,
+    site: (f64, f64),
 ) -> Option<crate::channels::RenderedImage> {
-    let picture = match frame.image {
-        squallar_radar::frame::RasterImage::Bytes(bytes) => {
-            let picture = plan_view_image(&bytes);
-            squallar_radar::render::recycle_image(bytes);
-            picture
+    // **The polar arm first, and it never falls through.** A frame carries one
+    // surface: `codes` is `Some` exactly where the renderer built a plane and
+    // left `image` empty, so trying the raster afterwards would only ever find
+    // nothing. Building the payload here — where the reply is delivered, a
+    // pool lane natively — is the same placement `loop_reply_surface` makes
+    // and for the reason `fan_sweep` states: it walks the chain and bakes a
+    // table, and neither belongs on the frame thread.
+    //
+    // A `None` from `fan_sweep` is a plane and a geometry that are not the
+    // same sweep, which is a picture of nothing rather than a slower picture;
+    // the frame is dropped, exactly as a raster that failed to convert is.
+    let surface = match frame.codes.as_ref() {
+        Some(plane) => crate::channels::StillSurface::Fan(Arc::new(fan_sweep(
+            plane,
+            frame.polar.geometry(),
+            site.0,
+            site.1,
+        )?)),
+        None => {
+            let picture = match frame.image {
+                squallar_radar::frame::RasterImage::Bytes(bytes) => {
+                    let picture = plan_view_image(&bytes);
+                    squallar_radar::render::recycle_image(bytes);
+                    picture
+                }
+                squallar_radar::frame::RasterImage::Pixels(pixels) => plan_view_image_owned(pixels),
+            };
+            crate::channels::StillSurface::Raster(Arc::new(picture?))
         }
-        squallar_radar::frame::RasterImage::Pixels(pixels) => plan_view_image_owned(pixels),
     };
     Some(crate::channels::RenderedImage {
-        image: Arc::new(picture?),
+        surface,
         max_range_km: frame.max_range_km,
         hover: Arc::new(squallar_radar::hover::HoverSource::resident(frame.polar)),
         nyquist_ms: frame.nyquist_ms,
@@ -956,15 +1036,21 @@ fn plan_view_image(rgba: &[u8]) -> Option<egui::ColorImage> {
     ))
 }
 
-/// What a reply's raster costs on this heap while it is in flight — its
-/// `Color32` pixels: the pixel term of `RenderCache::entry_bytes`, and only
-/// that. The reply's hover field (`HoverSource`, about a fortieth of the
-/// pixels) rides unpriced until receipt installs it under `render cache`.
-/// Zero for a reply that drew nothing.
+/// What a still reply's surface costs on this heap while it is in flight,
+/// **whichever of the two it carried** — a raster's `Color32` pixels, or a
+/// polar payload's own `resident_bytes`.
+///
+/// The pixel term of `RenderCache::entry_bytes`, and only that: the reply's
+/// hover field (`HoverSource`, about a fortieth of a raster's pixels) rides
+/// unpriced until receipt installs it under `render cache`. Zero for a reply
+/// that drew nothing.
+///
+/// **Read off the payload and never off the shape that was asked for**, for
+/// the reason `loop_reply_bytes` gives on the loop's side of the same seam: a
+/// sweep a plane could not carry falls back to the raster, and a figure keyed
+/// on the request would price that at a fraction of what it allocated.
 fn in_flight_bytes(rendered: Option<&crate::channels::RenderedImage>) -> usize {
-    rendered.map_or(0, |r| {
-        r.image.pixels.len() * std::mem::size_of::<egui::Color32>()
-    })
+    rendered.map_or(0, |r| r.surface.resident_bytes())
 }
 
 /// **What a loop reply costs on this heap while it is in flight**, whichever
@@ -2060,6 +2146,7 @@ impl RenderDispatcher {
                 site,
                 params.product,
                 params.elevation,
+                (params.lat, params.lon),
                 sender,
                 window,
                 squallar_worker::offload::Job::Described(
@@ -2099,6 +2186,7 @@ impl RenderDispatcher {
             site,
             params.product,
             params.elevation,
+            (lat, lon),
             sender,
             window,
             // The product's bytes rather than its decoded form: a `Level3Message` has
@@ -2128,6 +2216,10 @@ impl RenderDispatcher {
         data: Arc<nexrad_model::data::Scan>,
         declared: &squallar_radar::nyquist::DeclaredNyquist,
         volume_start: chrono::NaiveDateTime,
+        // **Which surface this build can draw**, decided by the caller for the
+        // reason `PlanSurface` states: a polar surface has no fallback, so a
+        // machine with no renderer for one must not ask.
+        surface: squallar_radar::jobs::PlanSurface,
         sender: std::sync::mpsc::Sender<RenderResponse>,
         window: Option<WindowRef>,
     ) {
@@ -2188,12 +2280,16 @@ impl RenderDispatcher {
                                     .with_melting_layer_product(melting_layer)
                                     .with_rpg_storm_motion(rpg_storm_motion),
                             ),
-                            // A static pane keeps the grid: it is what a hover reads.
+                            // A static pane keeps the numbers: they are what a
+                            // hover reads.
                             values_wanted: true,
-                            // And therefore the raster: a plane's numbers are
-                            // its codes, and the polar field beside one carries
-                            // geometry alone. See `RadarPlanJob::run`.
-                            surface: squallar_radar::jobs::PlanSurface::Raster,
+                            // **And that no longer forces the raster.** A
+                            // plane's numbers are its codes, and the field
+                            // beside one now carries them a byte a gate — so
+                            // the flag asks for information the polar surface
+                            // has rather than for the representation the
+                            // raster held it in. See `RadarPlanJob::run`.
+                            surface,
                         },
                         // And it is the one render kind that may take the
                         // long-range raster, if this device can hold one.
@@ -2205,7 +2301,16 @@ impl RenderDispatcher {
             }
             None => squallar_worker::offload::Job::renders_nothing(),
         };
-        self.spawn_render(pane_idx, site, product, elevation, sender, window, job);
+        self.spawn_render(
+            pane_idx,
+            site,
+            product,
+            elevation,
+            (lat, lon),
+            sender,
+            window,
+            job,
+        );
     }
 
     /// The extract tuple a pane's arrival-time populate must build — **the same reads
@@ -2546,6 +2651,10 @@ impl RenderDispatcher {
         site: &str,
         product: RadarProduct,
         elevation: f32,
+        // Where the sweep was flown from, for a reply that came back a plane:
+        // a fan is placed by its own site rather than by the corners of a
+        // raster, so the payload cannot be built without it.
+        site_coords: (f64, f64),
         sender: std::sync::mpsc::Sender<RenderResponse>,
         window: Option<WindowRef>,
         job: squallar_worker::offload::Job,
@@ -2572,7 +2681,7 @@ impl RenderDispatcher {
             let still_wanted = wanted.load(Ordering::Relaxed);
             drop(wanted);
             if still_wanted {
-                let rendered = frame.and_then(rendered_image_from);
+                let rendered = frame.and_then(|f| rendered_image_from(f, site_coords));
                 // Priced and PUBLISHED before the send: a receipt that settles
                 // the cell can then never run ahead of the increment it is
                 // settling, which would leave a phantom raster on the census
@@ -2615,6 +2724,7 @@ impl RenderDispatcher {
         lon: f64,
         data: Arc<nexrad_model::data::Scan>,
         declared: &squallar_radar::nyquist::DeclaredNyquist,
+        surface: squallar_radar::jobs::PlanSurface,
         sender: std::sync::mpsc::Sender<RenderResponse>,
         window: Option<WindowRef>,
     ) {
@@ -2658,12 +2768,14 @@ impl RenderDispatcher {
                             .with_melting_layer_product(melting_layer)
                             .with_rpg_storm_motion(rpg_storm_motion),
                     ),
-                    // The body's trap, held: this raster becomes the pane's
-                    // static render on tilt-step, and a hover reads the grid.
+                    // The body's trap, held: this picture becomes the pane's
+                    // static render on tilt-step, and a hover reads its
+                    // numbers.
                     values_wanted: true,
-                    // And the raster with it, for the reason the interactive
-                    // dispatch above gives.
-                    surface: squallar_radar::jobs::PlanSurface::Raster,
+                    // And the same surface the interactive dispatch asks for,
+                    // for the reason it gives — a pre-render in the other
+                    // shape would be a picture this pane cannot show.
+                    surface,
                 },
                 squallar_worker::offload::ceiling_only_geometry(
                     self.static_side_ceiling_px() as u32
@@ -2680,7 +2792,7 @@ impl RenderDispatcher {
         squallar_worker::offload::offload_job("radar-render", job, move |output| {
             let _guard = guard;
             let frame = output.and_then(|out| out.take::<squallar_radar::frame::RenderedFrame>());
-            let rendered = frame.and_then(rendered_image_from);
+            let rendered = frame.and_then(|f| rendered_image_from(f, (lat, lon)));
             // Before the send, for the reason `spawn_render` gives.
             price_in_flight(
                 &reply_bytes,
@@ -2831,32 +2943,64 @@ impl RenderDispatcher {
     /// families hold between them** — each `Arc` counted once, whichever
     /// holder names it.
     ///
-    /// Today that is the render cache alone: the panes hold no rasters, so
-    /// there is no second holder to chain on here. See
-    /// [`Self::cached_render_bytes`] for what they used to hold and why the
-    /// family naming it is still published.
+    /// The render cache **and** the panes' own polar payloads: a pane showing
+    /// a fan holds the same `Arc` the cache filed, so counting the cache alone
+    /// would leave `raster_shared_bytes` naming an overlap that is really
+    /// there as if it were not. The panes still hold no *rasters* — that
+    /// holder went on 2026-09-07 — so the raster half has one contributor and
+    /// the polar half has two. See [`Self::cached_render_bytes`].
     ///
     /// `Vec::contains` over a handful of pointers rather than a `HashSet`: the
     /// cache is a few entries, this runs on the 2 s telemetry tick and never
     /// on a frame, and the allocation-error hook reads the published level
     /// rather than this walk.
     fn raster_union_bytes(&self) -> u64 {
-        let entries = self.render_cache.entries().map(|e| (&e.image, &e.hover));
+        let entries = self.render_cache.entries().map(|e| (&e.surface, &e.hover));
+        // **Two pointer sets, because a raster and a fan are two allocations
+        // and one `Vec<*const ()>` over both would let an address reused by
+        // the allocator for the other kind read as already counted.** The
+        // families they land in differ too: a fan's payload is not a raster
+        // and summing them into the raster figure would smuggle it in.
         let mut images: Vec<*const egui::ColorImage> = Vec::new();
+        let mut fans: Vec<*const squallar_egui::radar_fan::FanSweep> = Vec::new();
         let mut hovers: Vec<*const squallar_radar::hover::HoverSource> = Vec::new();
         let mut union = 0u64;
-        for (image, hover) in entries {
-            let image_ptr = Arc::as_ptr(image);
-            if !images.contains(&image_ptr) {
-                images.push(image_ptr);
-                union = union.saturating_add(
-                    (image.pixels.len() * std::mem::size_of::<egui::Color32>()) as u64,
-                );
+        for (surface, hover) in entries {
+            match surface {
+                crate::channels::StillSurface::Raster(image) => {
+                    let image_ptr = Arc::as_ptr(image);
+                    if !images.contains(&image_ptr) {
+                        images.push(image_ptr);
+                        union = union.saturating_add(
+                            (image.pixels.len() * std::mem::size_of::<egui::Color32>()) as u64,
+                        );
+                    }
+                }
+                crate::channels::StillSurface::Fan(sweep) => {
+                    let fan_ptr = Arc::as_ptr(sweep);
+                    if !fans.contains(&fan_ptr) {
+                        fans.push(fan_ptr);
+                        union = union.saturating_add(sweep.resident_bytes() as u64);
+                    }
+                }
             }
             let hover_ptr = Arc::as_ptr(hover);
             if !hovers.contains(&hover_ptr) {
                 hovers.push(hover_ptr);
                 union = union.saturating_add(hover.resident_bytes() as u64);
+            }
+        }
+        // The second holder, chained on the same de-duplication: a pane whose
+        // payload the cache has since evicted contributes here and nowhere
+        // else, and one the cache still holds contributes to neither twice.
+        for prs in &self.pane_render {
+            let Some(sweep) = prs.showing_fan.as_ref().and_then(Weak::upgrade) else {
+                continue;
+            };
+            let fan_ptr = Arc::as_ptr(&sweep);
+            if !fans.contains(&fan_ptr) {
+                fans.push(fan_ptr);
+                union = union.saturating_add(sweep.resident_bytes() as u64);
             }
         }
         union
@@ -2885,8 +3029,21 @@ impl RenderDispatcher {
     /// after every other holder has let go and requires it to be dead. That
     /// test fails if a pane starts holding pixels again; this function cannot,
     /// and saying so is the point of the paragraph above.
+    /// **And it is no longer only a zero.** A still plan view can come back a
+    /// code plane rather than a raster, and that payload is a host buffer the
+    /// pane holds for as long as the picture is on the glass — the render
+    /// cache's copy of the same `Arc` is evicted on its own schedule, so the
+    /// pane really can end up the sole owner. Those bytes are named here,
+    /// through [`PaneRenderState::showing_fan`], which is a `Weak` and owns
+    /// none of them.
+    ///
+    /// The raster arm still reads zero, and for the original reason: a
+    /// texture's pixels are the GPU's. So a scene with no fan on any pane
+    /// prints exactly the row the paragraphs above describe.
     pub fn cached_render_bytes(&self) -> u64 {
-        0
+        self.pane_render
+            .iter()
+            .fold(0u64, |sum, prs| sum.saturating_add(prs.showing_bytes()))
     }
 
     /// **The tick's reconciliation of the `renders in flight` level.** The

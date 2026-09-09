@@ -180,7 +180,9 @@ impl Lut {
     /// table is a function of the key alone and two planes decoded under one
     /// key cannot come to hold different tables.
     pub fn value_table(key: LutKey) -> Vec<f32> {
-        (0..LUT_ENTRIES).map(|code| Self::value_of(key, code as u8)).collect()
+        (0..LUT_ENTRIES)
+            .map(|code| Self::value_of(key, code as u8))
+            .collect()
     }
 
     /// The table as the bytes a `256 x 1` `Rgba8Unorm` texture takes.

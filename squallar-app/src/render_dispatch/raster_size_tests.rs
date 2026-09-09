@@ -48,9 +48,12 @@ fn a_wire_decoded_frame_gives_its_buffer_to_the_image_without_a_copy() {
     let decode_ptr = pixels.as_ptr();
 
     let expected = egui::ColorImage::from_rgba_premultiplied([side, side], &rgba);
-    let image = rendered_image_from(decoded)
+    let image = rendered_image_from(decoded, (35.0, -97.0))
         .expect("the frame becomes an image")
-        .image;
+        .surface
+        .raster()
+        .expect("a raster frame becomes a raster surface")
+        .clone();
     assert_eq!(image.size, expected.size);
     assert_eq!(
         image.pixels, expected.pixels,

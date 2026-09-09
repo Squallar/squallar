@@ -1328,11 +1328,12 @@ mod tests {
                 let Some(painted) = raster.polar.at(at) else {
                     continue;
                 };
-                let read_back = fan
-                    .polar
-                    .at(at)
-                    .unwrap_or_else(|| panic!("radial {radial} gate {gate}: the raster painted a \
-                         number here and the plane reads nothing"));
+                let read_back = fan.polar.at(at).unwrap_or_else(|| {
+                    panic!(
+                        "radial {radial} gate {gate}: the raster painted a \
+                         number here and the plane reads nothing"
+                    )
+                });
                 assert_eq!(
                     read_back.to_bits(),
                     painted.to_bits(),

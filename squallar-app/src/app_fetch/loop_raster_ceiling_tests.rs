@@ -156,6 +156,7 @@ fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
         std::sync::Arc::new(sample_scan()),
         &squallar_radar::nyquist::DeclaredNyquist::empty(),
         chrono::NaiveDateTime::default(),
+        squallar_radar::jobs::PlanSurface::Raster,
         sender,
         None,
     );

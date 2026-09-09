@@ -234,6 +234,7 @@ fn dispatch(
         "KOUN",
         RadarProduct::Reflectivity,
         0.5,
+        (35.0, -97.0),
         results.clone(),
         None,
         render,
@@ -346,6 +347,7 @@ fn a_render_that_finds_nothing_still_reports_back() {
         "KOUN",
         RadarProduct::Reflectivity,
         0.5,
+        (35.0, -97.0),
         results.clone(),
         None,
         nothing,
@@ -380,6 +382,7 @@ fn an_abandoned_render_that_finds_nothing_reports_nothing() {
         "KOUN",
         RadarProduct::Reflectivity,
         0.5,
+        (35.0, -97.0),
         results.clone(),
         None,
         nothing,
@@ -432,7 +435,7 @@ fn gui_on_tilt(
 
 fn cached(range: f64) -> CachedRenderOutput {
     CachedRenderOutput {
-        image: Arc::new(egui::ColorImage::default()),
+        surface: crate::channels::StillSurface::Raster(Arc::new(egui::ColorImage::default())),
         max_range_km: range,
         hover: Arc::new(squallar_radar::hover::HoverSource::empty()),
         nyquist_ms: None,

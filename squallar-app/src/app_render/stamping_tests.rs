@@ -57,9 +57,8 @@ pub(super) fn tilt(elevation_tenths: i16, key: &str) -> Level3Product {
 fn finished(product: RadarProduct, elevation: f32) -> CachedPaneRender {
     let side = squallar_radar::types::IMAGE_SIZE;
     CachedPaneRender {
-        image: Arc::new(egui::ColorImage::from_rgba_unmultiplied(
-            [side, side],
-            &vec![0u8; side * side * 4],
+        surface: crate::channels::StillSurface::Raster(Arc::new(
+            egui::ColorImage::from_rgba_unmultiplied([side, side], &vec![0u8; side * side * 4]),
         )),
         max_range_km: 230.0,
         hover: Arc::new(squallar_radar::hover::HoverSource::empty()),
@@ -252,9 +251,8 @@ fn a_long_range_render_is_placed_at_the_size_it_was_rendered_at() {
     let mut app = app_showing_site();
 
     let render = CachedPaneRender {
-        image: std::sync::Arc::new(egui::ColorImage::from_rgba_unmultiplied(
-            [side, side],
-            &vec![0u8; side * side * 4],
+        surface: crate::channels::StillSurface::Raster(std::sync::Arc::new(
+            egui::ColorImage::from_rgba_unmultiplied([side, side], &vec![0u8; side * side * 4]),
         )),
         max_range_km: 417.0,
         hover: std::sync::Arc::new(squallar_radar::hover::HoverSource::empty()),
@@ -290,7 +288,8 @@ fn a_long_range_render_is_placed_at_the_size_it_was_rendered_at() {
          picture wraps",
     );
     assert!(
-        app.render.pane_render[0].shows_buffer(&render.image),
+        app.render.pane_render[0]
+            .shows_buffer(&render.surface.raster().expect("a raster render").clone()),
         "the pane did not record the buffer its texture was uploaded from",
     );
 }

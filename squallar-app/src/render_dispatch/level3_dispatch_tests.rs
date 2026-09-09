@@ -294,7 +294,7 @@ fn two_resolvable_objects_pick_the_same_one_every_time() {
 
 fn rendered(product: RadarProduct, elevation: f32) -> CachedPaneRender {
     CachedPaneRender {
-        image: Arc::new(egui::ColorImage::default()),
+        surface: crate::channels::StillSurface::Raster(Arc::new(egui::ColorImage::default())),
         max_range_km: 230.0,
         hover: Arc::new(squallar_radar::hover::HoverSource::empty()),
         product,
@@ -485,7 +485,7 @@ fn an_unchanged_override_invalidates_nothing() {
 
 fn output() -> CachedRenderOutput {
     CachedRenderOutput {
-        image: Arc::new(egui::ColorImage::default()),
+        surface: crate::channels::StillSurface::Raster(Arc::new(egui::ColorImage::default())),
         max_range_km: 230.0,
         hover: Arc::new(squallar_radar::hover::HoverSource::empty()),
         nyquist_ms: None,

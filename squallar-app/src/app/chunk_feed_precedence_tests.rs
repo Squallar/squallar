@@ -1252,9 +1252,8 @@ fn seed_render_cache(app: &mut App) {
     app.render.render_cache.insert(
         key,
         CachedRenderOutput {
-            image: std::sync::Arc::new(egui::ColorImage::new(
-                [64, 64],
-                vec![egui::Color32::BLACK; 64 * 64],
+            surface: crate::channels::StillSurface::Raster(std::sync::Arc::new(
+                egui::ColorImage::new([64, 64], vec![egui::Color32::BLACK; 64 * 64]),
             )),
             max_range_km: 230.0,
             hover: std::sync::Arc::new(squallar_radar::hover::HoverSource::empty()),

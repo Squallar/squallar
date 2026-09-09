@@ -195,7 +195,7 @@ fn radar_texture_px(app: &mut crate::app::App) -> Option<(u32, u32)> {
 /// directly.
 fn cached_output() -> crate::render_dispatch::CachedRenderOutput {
     crate::render_dispatch::CachedRenderOutput {
-        image: small_raster(),
+        surface: crate::channels::StillSurface::Raster(small_raster()),
         max_range_km: 230.0,
         hover: Arc::new(squallar_radar::hover::HoverSource::empty()),
         nyquist_ms: None,
@@ -212,7 +212,7 @@ fn deliver_a_raster(app: &mut crate::app::App, elevation: f32) {
         .render_sender
         .send(crate::channels::RenderResponse {
             rendered: Some(crate::channels::RenderedImage {
-                image: small_raster(),
+                surface: crate::channels::StillSurface::Raster(small_raster()),
                 max_range_km: 230.0,
                 hover: Arc::new(squallar_radar::hover::HoverSource::empty()),
                 nyquist_ms: None,

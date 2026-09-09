@@ -1901,6 +1901,65 @@ impl InputHarness {
         self.warm_up();
     }
 
+    /// **Place a finished still plan view that came back a plane**, as
+    /// `apply_render_to_pane`'s polar arm does: a payload on the pane and no
+    /// texture anywhere.
+    ///
+    /// The metadata is the same object the raster arm files, because
+    /// everything a pane says about the picture on its glass is a property of
+    /// the render rather than of its shape — see
+    /// `PaneState::radar_meta_on_screen`.
+    pub(crate) fn place_radar_fan(
+        &mut self,
+        idx: usize,
+        product: &squallar_source::product::FieldId,
+        elevation: f32,
+        sweep: std::sync::Arc<crate::radar_fan::FanSweep>,
+    ) {
+        use crate::overlay_cache::RadarTextureMeta;
+        use squallar_radar::types::BASE_EXTENT_KM;
+
+        let (lat, lon) = {
+            let pane = self
+                .gui
+                .pane(idx)
+                .unwrap_or_else(|| panic!("no pane {idx}"));
+            let info = pane
+                .scan_info
+                .as_ref()
+                .expect("load_scan first: a picture is placed against a site");
+            (info.site.lat, info.site.lon)
+        };
+        self.gui.pane_mut(idx).unwrap().place_radar_fan(
+            crate::pane::StillRadarFan {
+                sweeps: std::sync::Arc::from(vec![sweep]),
+                meta: RadarTextureMeta {
+                    hover: std::sync::Arc::new(squallar_radar::hover::HoverSource::empty()),
+                    lat,
+                    lon,
+                    max_range_km: BASE_EXTENT_KM,
+                    nyquist_ms: None,
+                    melting_layer_source: None,
+                    storm_motion: None,
+                    product: product.clone(),
+                    elevation,
+                },
+            },
+            None,
+        );
+        self.warm_up();
+    }
+
+    /// Install a fan renderer on this harness's `Gui`, the way the shell
+    /// publishes one once its GPU resources exist.
+    pub(crate) fn install_fan_painter(
+        &mut self,
+        painter: std::sync::Arc<dyn crate::radar_fan::RadarFanPainter>,
+    ) {
+        self.gui
+            .apply(crate::shell_api::GuiEvent::RadarFanPainter(Some(painter)));
+    }
+
     /// Every rect painted during the last frame, in paint order.
     pub(crate) fn painted_rects(&self) -> &[egui::Rect] {
         &self.last_rects

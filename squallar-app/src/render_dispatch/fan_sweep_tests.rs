@@ -474,6 +474,7 @@ fn a_rendered_plane_is_a_payload_this_function_accepts() {
         0.5,
         RadarProduct::Reflectivity,
         &squallar_radar::nyquist::DeclaredNyquist::empty(),
+        false,
     )
     .expect("an eight-bit reflectivity sweep renders as a plane");
     assert!(
@@ -521,6 +522,7 @@ fn a_radial_with_no_moment_claims_no_sector() {
         0.5,
         RadarProduct::Reflectivity,
         &squallar_radar::nyquist::DeclaredNyquist::empty(),
+        false,
     )
     .expect("the remaining radials still make a plane");
     let plane = render.codes.as_ref().expect("a plane");

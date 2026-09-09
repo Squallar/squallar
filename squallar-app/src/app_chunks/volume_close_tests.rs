@@ -121,7 +121,7 @@ fn app_showing_a_drawn_volume(product: RadarProduct) -> App {
         squallar_radar::types::RenderView::PlanView,
         0.5,
         CachedRenderOutput {
-            image: Arc::new(egui::ColorImage::default()),
+            surface: crate::channels::StillSurface::Raster(Arc::new(egui::ColorImage::default())),
             max_range_km: 100.0,
             hover: Arc::new(squallar_radar::hover::HoverSource::empty()),
             nyquist_ms: None,

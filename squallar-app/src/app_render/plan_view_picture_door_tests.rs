@@ -109,7 +109,7 @@ fn other_raster() -> Arc<egui::ColorImage> {
 /// The picture wrapped as the apply path takes it.
 fn finished(image: Arc<egui::ColorImage>) -> crate::render_dispatch::CachedPaneRender {
     crate::render_dispatch::CachedPaneRender {
-        image,
+        surface: crate::channels::StillSurface::Raster(image),
         max_range_km: 230.0,
         hover: Arc::new(squallar_radar::hover::HoverSource::empty()),
         product: PRODUCT,
@@ -127,7 +127,7 @@ fn answer(app: &mut crate::app::App, ctx: &egui::Context, idx: usize) {
         .render_sender
         .send(crate::channels::RenderResponse {
             rendered: Some(crate::channels::RenderedImage {
-                image: raster(),
+                surface: crate::channels::StillSurface::Raster(raster()),
                 max_range_km: 230.0,
                 hover: Arc::new(squallar_radar::hover::HoverSource::empty()),
                 nyquist_ms: None,
@@ -391,7 +391,7 @@ fn a_pane_served_from_the_shared_cache_is_not_charged() {
         squallar_radar::types::RenderView::PlanView,
         TILT,
         crate::render_dispatch::CachedRenderOutput {
-            image: raster(),
+            surface: crate::channels::StillSurface::Raster(raster()),
             max_range_km: 230.0,
             hover: Arc::new(squallar_radar::hover::HoverSource::empty()),
             nyquist_ms: None,

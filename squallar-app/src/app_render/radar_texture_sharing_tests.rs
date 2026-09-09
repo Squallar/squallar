@@ -111,7 +111,7 @@ fn post(
         .render_sender
         .send(crate::channels::RenderResponse {
             rendered: Some(crate::channels::RenderedImage {
-                image,
+                surface: crate::channels::StillSurface::Raster(image),
                 max_range_km: 230.0,
                 hover: Arc::new(squallar_radar::hover::HoverSource::empty()),
                 nyquist_ms: None,
@@ -545,7 +545,8 @@ fn a_pane_does_not_keep_the_pixels_it_was_shown() {
         )
         .expect("precondition: the render cache must be holding the delivered raster");
     assert_eq!(
-        held.image.pixels.len() * std::mem::size_of::<egui::Color32>(),
+        held.surface.raster().expect("a raster entry").pixels.len()
+            * std::mem::size_of::<egui::Color32>(),
         RELEASED_BYTES,
         "precondition: the holder is not holding {RELEASED_BYTES} B of pixels, \
          so the release below is a release of something else -- or of nothing",
@@ -631,7 +632,8 @@ fn a_resume_the_render_cache_cannot_answer_puts_no_picture_back() {
                 squallar_radar::types::RenderView::PlanView,
                 TILT,
             )
-            .map(|e| e.image.pixels.len() * std::mem::size_of::<egui::Color32>()),
+            .map(|e| e.surface.raster().expect("a raster entry").pixels.len()
+                * std::mem::size_of::<egui::Color32>()),
         Some(served_bytes),
         "precondition: the render cache must be holding {served_bytes} B of \
          pixels, or emptying it below empties nothing",

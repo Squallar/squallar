@@ -1941,6 +1941,30 @@ impl App {
         }
     }
 
+    /// **Which plan-view surface this build may ask a renderer for**, and the
+    /// one place the question is answered.
+    ///
+    /// A polar surface has no fallback — the raster it would fall back to is
+    /// the allocation the representation exists not to make — so a machine
+    /// with no `RadarFanPainter` installed asking for one would be a pane with
+    /// no radar on it. Every dispatch that can produce a plan view reads this:
+    /// the still render, the adjacent-tilt pre-render it files, and each loop
+    /// frame. Three spellings of one field are three chances for a producer
+    /// and the draw to disagree, and the disagreement is a blank pane rather
+    /// than a slower one.
+    ///
+    /// **Not a promise of a plane.** Every reason `render_sweep_plane` refuses
+    /// a sweep is a fidelity reason and the answer to all of them is today's
+    /// raster, so a `Fan` here is an offer the renderer may decline per sweep.
+    /// Nothing downstream may key a price on this answer for that reason; what
+    /// a frame cost is read off the payload it came back with.
+    pub(crate) fn plan_surface(&self) -> squallar_radar::jobs::PlanSurface {
+        match self.radar_fan_painter {
+            Some(_) => squallar_radar::jobs::PlanSurface::Fan,
+            None => squallar_radar::jobs::PlanSurface::Raster,
+        }
+    }
+
     /// Dispatch the voxel build a 3D pane asked for, unless the volume is already in hand
     /// or in flight.
     fn volume_grid_axis_limit(&self) -> u32 {

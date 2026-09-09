@@ -82,6 +82,7 @@ fn dispatch(
         "KOUN",
         RadarProduct::Reflectivity,
         0.5,
+        (35.0, -97.0),
         results.clone(),
         None,
         job,

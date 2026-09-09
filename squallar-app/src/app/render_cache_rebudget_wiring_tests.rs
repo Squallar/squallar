@@ -45,10 +45,10 @@ fn hover_field(side: usize) -> squallar_radar::render::polar::PolarField {
 /// identity.
 fn output(range: f64) -> CachedRenderOutput {
     CachedRenderOutput {
-        image: Arc::new(egui::ColorImage::new(
+        surface: crate::channels::StillSurface::Raster(Arc::new(egui::ColorImage::new(
             [SIDE, SIDE],
             vec![egui::Color32::BLACK; SIDE * SIDE],
-        )),
+        ))),
         max_range_km: range,
         hover: Arc::new(squallar_radar::hover::HoverSource::resident(hover_field(
             SIDE,

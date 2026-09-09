@@ -82,7 +82,7 @@ fn loop_frame_pixels() -> egui::ColorImage {
 
 fn cached_output() -> crate::render_dispatch::CachedRenderOutput {
     crate::render_dispatch::CachedRenderOutput {
-        image: finished_pixels(),
+        surface: crate::channels::StillSurface::Raster(finished_pixels()),
         max_range_km: 230.0,
         hover: Arc::new(squallar_radar::hover::HoverSource::empty()),
         nyquist_ms: None,
@@ -105,7 +105,7 @@ fn deliver(app: &mut crate::app::App, pane_idx: usize) {
         .render_sender
         .send(crate::channels::RenderResponse {
             rendered: Some(crate::channels::RenderedImage {
-                image: finished_pixels(),
+                surface: crate::channels::StillSurface::Raster(finished_pixels()),
                 max_range_km: 230.0,
                 hover: Arc::new(squallar_radar::hover::HoverSource::empty()),
                 nyquist_ms: None,

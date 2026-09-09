@@ -1093,6 +1093,38 @@ fn merge_radar_slot(config: &mut serde_json::Value, fresh: &serde_json::Value) {
 /// what says the two owners never collide.
 pub const RADAR_SLOT_PANE_KEYS: [&str; 4] = ["site", "product", "elevation", "live_chunks"];
 
+/// **A still plan view drawn as a fan**: the sweeps the renderer paints, and
+/// the same [`RadarTextureMeta`](crate::overlay_cache::RadarTextureMeta) a
+/// raster of the same render would have been filed with.
+///
+/// A pane holds one of these **or** a picture in its radar overlay cache,
+/// never both — which is what makes the size win real rather than a second
+/// copy, and is why [`PaneState::place_radar_fan`] and
+/// [`PaneState::place_radar_raster`] each retire the other.
+///
+/// The meta rides along rather than being re-derived because everything the
+/// pane says *about* the picture on the glass — its extent, its readout, which
+/// product and sweep it really is, what its classification stood on — is
+/// identical across the two surfaces and is answered through one accessor
+/// ([`PaneState::radar_meta_on_screen`]).
+pub struct StillRadarFan {
+    /// The sweeps behind this plan view, in submission order — one today, the
+    /// slice for the same reason [`RadarSurface::Fan`]'s is.
+    pub sweeps: Arc<[Arc<crate::radar_fan::FanSweep>]>,
+    pub meta: crate::overlay_cache::RadarTextureMeta,
+}
+
+impl StillRadarFan {
+    /// **Host bytes the sweeps are holding**, read off their own payloads.
+    ///
+    /// The same figure the renderer's card is holding, for the reason
+    /// [`RadarSurface::resident_bytes`] gives: residency is a `Weak` handle to
+    /// these very buffers.
+    pub fn resident_bytes(&self) -> usize {
+        self.sweeps.iter().map(|s| s.resident_bytes()).sum()
+    }
+}
+
 /// Per-pane state: each pane independently selects a radar product,
 /// elevation, layer toggles, and maintains its own map viewport.
 pub struct PaneState {
@@ -1173,6 +1205,14 @@ pub struct PaneState {
     /// [`LayerId`]. Only texture overlay kinds (SPC, NWS, discussions) have
     /// cache entries; entries are created lazily.
     pub overlay_textures: HashMap<LayerId, OverlayTextureCache>,
+    /// **The still plan view when it came back a plane rather than a raster**
+    /// — see [`StillRadarFan`]. `None` on every pane whose picture is a
+    /// texture, which is the arm this cache's `known::RADAR` entry holds.
+    ///
+    /// Not persisted, for the reason no texture handle is: a picture is
+    /// re-rendered from the volume on reopen, and what the reopen has to
+    /// reproduce is the *selection*, which lives in the radar slot's config.
+    still_radar_fan: Option<StillRadarFan>,
     /// **This pane's curated layer stack: one [`LayerSlot`] per layer the pane
     /// draws, bottom to top.** The list's order is the draw order; each slot
     /// carries its own enabled flag and its own saved config. Replaces the
@@ -1910,6 +1950,7 @@ impl PaneState {
             // Lazily filled by `overlay_cache_mut`; an absent entry answers
             // every read exactly as a fresh empty cache did.
             overlay_textures: HashMap::new(),
+            still_radar_fan: None,
             // **Empty on purpose**, and it is the pane's whole layer state
             // that starts empty rather than only its flags: a pane born here
             // has no saved opinion about any layer, and `Gui` seeds it from
@@ -2224,6 +2265,31 @@ impl PaneState {
         depicted.is_some_and(|t| t > now)
     }
 
+    /// **What the picture on the glass says about itself**, whichever surface
+    /// it is.
+    ///
+    /// A still plan view is a texture in the radar overlay cache or a fan
+    /// ([`StillRadarFan`]), and every question below this line — its extent,
+    /// its readout, which product and sweep it depicts, what its
+    /// classification stood on — has one answer that does not depend on which.
+    /// Asked in one place so a pane drawing a fan cannot come to report a
+    /// retired raster's provenance, which is what four copies of the cache
+    /// read would have allowed the day the second surface landed.
+    ///
+    /// The fan is preferred and not merged: the two are mutually exclusive by
+    /// construction ([`Self::place_radar_fan`], [`Self::place_radar_raster`]),
+    /// so the order states which is authoritative rather than resolving a
+    /// conflict that cannot arise.
+    pub fn radar_meta_on_screen(&self) -> Option<&crate::overlay_cache::RadarTextureMeta> {
+        if let Some(fan) = self.still_radar_fan.as_ref() {
+            return Some(&fan.meta);
+        }
+        self.overlay_cache(&known::RADAR)?
+            .current()?
+            .radar_meta
+            .as_ref()
+    }
+
     /// What the radar image on screen depicts, **when that is not what this pane
     /// has selected** — the product and sweep the pixels really are, so a caller
     /// can say so.
@@ -2235,11 +2301,7 @@ impl PaneState {
         if self.time_state(&known::RADAR).is_active() {
             return None;
         }
-        let meta = self
-            .overlay_cache(&known::RADAR)?
-            .current()?
-            .radar_meta
-            .as_ref()?;
+        let meta = self.radar_meta_on_screen()?;
         let matches_selection = match self.get_rendering_params() {
             Some((product, elevation)) => {
                 meta.product == product && (meta.elevation - elevation).abs() <= ELEVATION_TOLERANCE
@@ -2274,11 +2336,7 @@ impl PaneState {
         if self.stale_image_on_screen().is_some() {
             return None;
         }
-        self.overlay_cache(&known::RADAR)?
-            .current()?
-            .radar_meta
-            .as_ref()?
-            .nyquist_ms
+        self.radar_meta_on_screen()?.nyquist_ms
     }
 
     /// Where the melting layer behind the classification **on screen** came
@@ -2300,11 +2358,7 @@ impl PaneState {
         if self.stale_image_on_screen().is_some() {
             return None;
         }
-        self.overlay_cache(&known::RADAR)?
-            .current()?
-            .radar_meta
-            .as_ref()?
-            .melting_layer_source
+        self.radar_meta_on_screen()?.melting_layer_source
     }
 
     /// The storm motion vector behind the storm-relative field **on screen**,
@@ -2321,11 +2375,7 @@ impl PaneState {
         if self.stale_image_on_screen().is_some() {
             return None;
         }
-        self.overlay_cache(&known::RADAR)?
-            .current()?
-            .radar_meta
-            .as_ref()?
-            .storm_motion
+        self.radar_meta_on_screen()?.storm_motion
     }
 
     /// **One layer's `PaneRef`, for a caller that asks about exactly one.**
@@ -3702,6 +3752,11 @@ impl PaneState {
         for cache in self.overlay_textures.values_mut() {
             cache.clear();
         }
+        // The plan view's other surface, released on the same terms: it is
+        // rebuilt from the same selection the textures are, and it is host
+        // bytes rather than GPU ones — so a hidden pane keeping one would be
+        // the larger of the two mistakes.
+        self.still_radar_fan = None;
         for slot in self.layers.iter_mut() {
             // The frame list and its stamps stand; only the textures go.
             slot.time.evict_textures_outside_render_set(0);
@@ -3710,6 +3765,11 @@ impl PaneState {
 
     /// Let go of the GPU texture of every overlay this pane no longer draws.
     pub fn release_disabled_overlay_textures(&mut self) {
+        // The plan view's polar surface answers the same predicate the radar
+        // cache does, and is asked first so the borrow below stays disjoint.
+        if Self::overlay_texture_releasable(&self.layers, &known::RADAR) {
+            self.still_radar_fan = None;
+        }
         // Two fields of one struct, borrowed disjointly, which is the whole
         // reason the predicate above is an associated function over the list.
         let layers = &self.layers;
@@ -3812,6 +3872,47 @@ impl PaneState {
             .count()
     }
 
+    /// **The still plan view's polar sweeps, if that is what this pane's
+    /// picture is.**
+    pub fn still_radar_fan(&self) -> Option<&StillRadarFan> {
+        self.still_radar_fan.as_ref()
+    }
+
+    /// Let go of the still plan view's polar payload.
+    ///
+    /// The counterpart of clearing the radar overlay cache, and it has to be
+    /// asked separately for the same reason it is a separate field: the two
+    /// surfaces are two objects and a caller releasing one is releasing this
+    /// pane's picture either way. Host bytes, unlike a texture, so a caller
+    /// that clears the cache and not this leaves the larger holder standing.
+    pub fn release_radar_still_fan(&mut self) {
+        self.still_radar_fan = None;
+    }
+
+    /// Put a freshly rendered fan on this pane, retiring whatever raster it
+    /// replaces.
+    ///
+    /// **No hold and no promotion**, unlike [`Self::place_radar_raster`]:
+    /// those exist because a texture's texels reach the GPU over several
+    /// frames and a half-uploaded picture must not be shown. A fan's payload
+    /// is a host buffer the renderer uploads inside its own callback, so there
+    /// is no window in which this picture is partly on the glass, and nothing
+    /// here to hold.
+    ///
+    /// The raster cache is cleared rather than left standing: the two surfaces
+    /// are two pictures of the same layer, and a pane that kept both would
+    /// draw the stale one under the fresh one and hold its texture for as long
+    /// as it did so.
+    pub fn place_radar_fan(
+        &mut self,
+        fan: StillRadarFan,
+        data_time: Option<chrono::NaiveDateTime>,
+    ) {
+        self.overlay_cache_mut(&known::RADAR).clear();
+        self.still_radar_fan = Some(fan);
+        self.data_time = data_time;
+    }
+
     /// Put a freshly placed raster on this pane — now, or when it is whole.
     pub fn place_radar_raster(
         &mut self,
@@ -3819,6 +3920,9 @@ impl PaneState {
         data_time: Option<chrono::NaiveDateTime>,
         already_whole: bool,
     ) {
+        // The counterpart of the clear in `place_radar_fan`, and for the same
+        // reason: one layer, one picture.
+        self.still_radar_fan = None;
         let cache = self.overlay_cache_mut(&known::RADAR);
         if already_whole || cache.current().is_none() {
             cache.show(data);

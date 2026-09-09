@@ -677,21 +677,37 @@ pub(super) fn render_pane_map_content(
                             );
                         }
                     } else {
-                        let meta_snapshot = ctx
-                            .pane
-                            .overlay_cache(id)
-                            .and_then(|c| c.current())
-                            .and_then(|tex| tex.radar_meta.as_ref())
-                            .map(|m| {
-                                (
-                                    m.lat,
-                                    m.lon,
-                                    m.max_range_km,
-                                    std::sync::Arc::clone(&m.hover),
-                                )
-                            });
+                        // **Whichever surface the still render came back as**
+                        // — the pane holds one or the other and never both, so
+                        // this asks once and the meta below answers for both.
+                        let meta_snapshot = ctx.pane.radar_meta_on_screen().map(|m| {
+                            (
+                                m.lat,
+                                m.lon,
+                                m.max_range_km,
+                                std::sync::Arc::clone(&m.hover),
+                            )
+                        });
 
-                        if let Some(tex) = ctx.pane.overlay_cache(id).and_then(|c| c.current()) {
+                        if let Some(still) = ctx.pane.still_radar_fan() {
+                            // The fan arm, at radar's own ordered position in
+                            // the walk — the same `ui.painter()`, at the same
+                            // point in it, `draw_overlay_texture` would have
+                            // been called from. See `draw_radar_fan`.
+                            let sweeps = std::sync::Arc::clone(&still.sweeps);
+                            let site = (still.meta.lat, still.meta.lon);
+                            let painter = ctx.radar_fan.cloned();
+                            draw_radar_fan(
+                                ui,
+                                projector,
+                                site,
+                                &sweeps,
+                                painter.as_ref(),
+                                ctx.surfaces,
+                            );
+                        } else if let Some(tex) =
+                            ctx.pane.overlay_cache(id).and_then(|c| c.current())
+                        {
                             let screen_rect = ui.max_rect();
                             draw_overlay_texture(ui.painter(), projector, tex, screen_rect);
                         }
@@ -1198,9 +1214,7 @@ pub(super) fn render_pane_map_content(
     {
         let raw_meta = ctx
             .pane
-            .overlay_cache(&known::RADAR)
-            .and_then(|c| c.current())
-            .and_then(|tex| tex.radar_meta.as_ref())
+            .radar_meta_on_screen()
             .map(|m| (m.lat, m.lon, std::sync::Arc::clone(&m.hover)));
         if let Some((lat, lon, hover)) = raw_meta {
             draw_long_press_tooltip(
@@ -1385,7 +1399,7 @@ fn render_radar_overlay(
             );
         }
         crate::pane::RadarSurface::Fan(sweeps) => {
-            draw_radar_fan(ui, projector, img, sweeps, fan, surfaces);
+            draw_radar_fan(ui, projector, (img.lat, img.lon), sweeps, fan, surfaces);
         }
     }
 
@@ -1451,12 +1465,12 @@ fn render_radar_overlay(
 fn draw_radar_fan(
     ui: &egui::Ui,
     projector: &walkers::Projector,
-    img: &RadarImageData,
+    site: (f64, f64),
     sweeps: &Arc<[Arc<crate::radar_fan::FanSweep>]>,
     painter: Option<&Arc<dyn crate::radar_fan::RadarFanPainter>>,
     surfaces: PaneSurfaces,
 ) -> crate::radar_fan::FanOutcome {
-    let outcome = issue_radar_fan(ui, projector, img, sweeps, painter, surfaces);
+    let outcome = issue_radar_fan(ui, projector, site, sweeps, painter, surfaces);
     crate::radar_fan::ledger::note(outcome);
     outcome
 }
@@ -1466,7 +1480,7 @@ fn draw_radar_fan(
 fn issue_radar_fan(
     ui: &egui::Ui,
     projector: &walkers::Projector,
-    img: &RadarImageData,
+    site: (f64, f64),
     sweeps: &Arc<[Arc<crate::radar_fan::FanSweep>]>,
     painter: Option<&Arc<dyn crate::radar_fan::RadarFanPainter>>,
     surfaces: PaneSurfaces,
@@ -1490,7 +1504,7 @@ fn issue_radar_fan(
         return FanOutcome::Refused(FanRefusal::Malformed);
     }
 
-    let view = fan_view(ui, projector, img.lat, img.lon);
+    let view = fan_view(ui, projector, site.0, site.1);
     let Some(payload) = painter.payload(crate::radar_fan::FanDraw {
         sweeps,
         view,

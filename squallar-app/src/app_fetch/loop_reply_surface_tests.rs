@@ -95,6 +95,7 @@ fn a_polar_frame() -> RenderedFrame {
         0.5,
         squallar_radar::types::RadarProduct::Reflectivity,
         &squallar_radar::nyquist::DeclaredNyquist::empty(),
+        false,
     )
     .expect("the fixture renders as a plane");
     RenderedFrame::from(render)

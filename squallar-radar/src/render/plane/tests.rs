@@ -474,7 +474,11 @@ fn the_value_table_is_the_fill_loops_decode_code_for_code() {
                 offset,
             };
             let table = Lut::value_table(key);
-            assert_eq!(table.len(), 256, "the table addresses every code a byte holds");
+            assert_eq!(
+                table.len(),
+                256,
+                "the table addresses every code a byte holds"
+            );
             for code in 0..=u8::MAX {
                 let block = moment(vec![code], 8, scale, offset);
                 let expected = moment_value_at(&block, 0)
