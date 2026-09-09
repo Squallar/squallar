@@ -576,3 +576,93 @@ fn an_archive_neither_clock_names_is_still_swept() {
         "and the parked one went with it",
     );
 }
+
+/// **Emptying the still store frees nothing on a live pane, and the merge
+/// base is why** — so a still-side withdrawal cannot pay on any scene whose
+/// panes are live.
+///
+/// # What this settles, and what it cost to find out
+///
+/// `still scans` reads 403.8 MiB on the HEAVY6 arm and 96.9 on REST1, which
+/// invites the reading that there is a still-side cache to reclaim. There is
+/// not. **Both** arrival paths `Arc::clone` ONE decoded volume into the still
+/// store and into the site's merge base in a single statement — the archive
+/// drain in `App::poll_data_channels`, and the chunk feed in
+/// `App::land_chunk_outcome` when a closed volume completes — so on a live
+/// pane the two stores name one allocation and the still store's copy is a
+/// refcount, not bytes.
+///
+/// The residency policy leaves no slack either: `retain_still`'s `wanted` is
+/// "what a pane is parked at, plus the newest per shown site", so the store
+/// already holds only what is on screen.
+///
+/// **So the withdrawable set is the still entries that are NOT their site's
+/// base, and on a live pane that set is empty.** What `still scans` actually
+/// prices on those arms is the merge bases, and the base is not free to go:
+/// `section_source_refusal`, `App::current_render_input`,
+/// `App::current_ladder_fingerprint` and `App::current_volume_stamp` all read
+/// it, the first two for the section cut's moments and the last two for its
+/// structure and its times. A withdrawal there is a different change from
+/// this one and needs those derived facts memoised first.
+///
+/// # Why the assertion is on the refcount
+///
+/// A store row is not a byte. `still_count` would fall to zero here and the
+/// heap would not move at all, which is the exact reading this test exists to
+/// refuse. `Arc::strong_count` is the only thing that can tell them apart.
+///
+/// **The fixture must land through the real drain** for the same reason every
+/// test in this module does: a store filled by hand can put two DIFFERENT
+/// volumes in the two stores, and then emptying one really would free
+/// something — green, and about a scene the application never builds.
+#[test]
+fn emptying_the_still_store_frees_nothing_while_the_base_holds_the_same_volume() {
+    let mut app = app_on_site();
+    land_one_archive_volume(&mut app, SITE, at(0));
+
+    let (base, _) = app.volumes.base_for(SITE).expect("the base is resident");
+    let at_moment = app
+        .volumes
+        .newest_still_for(SITE)
+        .expect("the arrival installed a still");
+    let (still, _) = app
+        .volumes
+        .still_for(SITE, at_moment)
+        .expect("the still is resident");
+    assert!(
+        Arc::ptr_eq(&still, &base),
+        "fixture: the drain installed two different volumes, so emptying the \
+         still store would free something and this test is about a scene the \
+         app does not build",
+    );
+    let one = squallar_radar::scan_size::scan_bytes(&base) as u64;
+    assert_eq!(
+        app.still_scan_level(),
+        one,
+        "precondition: the level prices the shared allocation once",
+    );
+
+    // Everything the still store holds, handed back owned and dropped: the
+    // strongest form of "the still side let go".
+    let dropped = app.volumes.retain_still(&|_, _| false);
+    assert_eq!(dropped.len(), 1, "fixture: the still store held one volume");
+    drop(dropped);
+    drop(still);
+
+    assert!(
+        app.volumes.holds_no_still(),
+        "precondition: the still store really is empty",
+    );
+    assert!(
+        Arc::strong_count(&base) > 1,
+        "the allocation was freed by emptying the still store alone, so a \
+         still-side withdrawal would pay after all and this test is stale",
+    );
+    assert_eq!(
+        app.still_scan_level(),
+        one,
+        "`still scans` did not fall when the still store emptied, which is \
+         the point: what that row prices on a live pane is the merge base, \
+         and the base has readers the still does not",
+    );
+}
