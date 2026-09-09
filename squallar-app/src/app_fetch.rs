@@ -1434,9 +1434,8 @@ impl super::App {
                     // handler — see the parameter's own note above.
                     frame,
                 };
-                // **The real pane, with its siblings.** `PaneView` and not
-                // `layer_ref`: the site table reads the radar slot's `"site"`
-                // out of `pane.slots`, and `layer_ref` carries none.
+                // **The real pane**, held across the three asks below off one
+                // borrow.
                 // Three cuts are taken inside the borrow below and added
                 // after it: `self.frame_ledger` cannot be reached while
                 // `self.gui` is borrowed mutably, so the stamps land in
@@ -3593,7 +3592,6 @@ fn begin_loop_for_pane(
             let view = panes[pane_idx].view(pane_idx);
             armed =
                 overlays.create_frame_list_task(&layer, config, &view.layer(&layer), (start, end));
-            drop(view);
             if armed.is_none() {
                 // Armed with nothing coming for it. Put the slot back rather
                 // than leave it in `FetchingScanList` for ever, drawing
@@ -3748,7 +3746,6 @@ fn arm_layer_loop(
         .map_or_else(chrono::Duration::zero, |f| {
             f.frame_horizon(&pane_view.layer(&layer))
         });
-    drop(pane_view);
 
     // Anchored on the wall clock, not on a scan: the past region and the
     // forecast are two halves of one rail, and a forecast layer's "now" is

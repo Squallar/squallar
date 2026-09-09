@@ -885,7 +885,6 @@ mod tests {
             pane_idx: 0,
             config,
             state: None,
-            slots: &[],
             loading_site: None,
             peers: &[],
         }

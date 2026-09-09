@@ -129,7 +129,6 @@ impl Slot {
             pane_idx: 0,
             config: &self.config,
             state: self.state.as_ref().map(|s| &**s as &dyn Any),
-            slots: &[],
             loading_site: None,
             peers: &[],
         }

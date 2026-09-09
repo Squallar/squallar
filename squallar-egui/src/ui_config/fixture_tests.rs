@@ -1539,10 +1539,10 @@ fn two_panes_hold_different_hrrr_parameters_through_every_read_and_a_reopen() {
 //
 // `RADAR_SLOT_PANE_KEYS` declares that the radar slot's config carries this
 // pane's site, product and tilt, and it is the only thing a handler is given
-// that names them: `PaneRef` carries the layer's own config, its state and the
-// sibling slots' configs, and nothing else. The members were written by the
-// load and re-derived at the save and never in between, so every reader saw
-// the load-time selection. These four hold the repair open.
+// that names them: `PaneRef` carries the layer's own config and its state, and
+// nothing else. The members were written by the load and re-derived at the
+// save and never in between, so every reader saw the load-time selection.
+// These four hold the repair open.
 
 /// The handler-visible radar config for `pane`, as a `PaneRef` carries it.
 fn radar_config_seen_by_a_handler(gui: &Gui, idx: usize) -> serde_json::Value {

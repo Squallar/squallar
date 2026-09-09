@@ -455,8 +455,8 @@ impl Gui {
     /// things: this layer's own per-pane state, through the handler's own view
     /// of [`PaneRef::state`]; and the instant and window the pane depicts,
     /// which `fetch_config_for_layer` narrows `FetchConfig::as_of` and the
-    /// depicted span by. None of them reads the pane's site, its index or its
-    /// sibling slots. So the key is those two members and no more — a wider key
+    /// depicted span by. None of them reads the pane's site or its index. So
+    /// the key is those two members and no more — a wider key
     /// turns two panes showing one product into two identical downloads, and a
     /// narrower one collapses two panes scrubbed to different hours into a
     /// single round, which is this very defect on the other axis.

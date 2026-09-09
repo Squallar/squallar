@@ -486,15 +486,6 @@ pub struct PaneRef<'a> {
     /// This layer's live per-pane state, when the handler defined
     /// [`SourceHandler::create_pane_state`]. Downcast with [`Self::state_as`].
     pub state: Option<&'a dyn Any>,
-    /// The **sibling** slots' configs — the same pane's other layers, so a
-    /// layer can read a fact another one owns (the site picker reads the radar
-    /// slot's `"site"`). Look one up with [`Self::sibling`].
-    ///
-    /// The id is **borrowed**, not owned: an id read from a config file is a
-    /// `Cow::Owned`, and this table is rebuilt once per pane per frame, so
-    /// owning it would allocate a string per layer per pane per frame for a
-    /// list almost every handler ignores.
-    pub slots: &'a [(&'a LayerId, &'a serde_json::Value)],
     /// **Radar-transitional.** The site this pane is currently loading, which
     /// today lives on `Gui` rather than in any slot. WO-E8 dissolves the field
     /// it is read from; this member goes with it, and nothing new may read it.
@@ -524,7 +515,6 @@ impl<'a> PaneRef<'a> {
             pane_idx,
             config: &NULL_CONFIG,
             state: None,
-            slots: &[],
             loading_site: None,
             peers: &[],
         }
@@ -544,7 +534,6 @@ impl<'a> PaneRef<'a> {
             pane_idx: 0,
             config: &NULL_CONFIG,
             state: None,
-            slots: &[],
             loading_site: None,
             peers,
         }
@@ -566,14 +555,6 @@ impl<'a> PaneRef<'a> {
         self.state_as::<T>()
             .into_iter()
             .chain(self.peers.iter().filter_map(|p| p.downcast_ref::<T>()))
-    }
-
-    /// Another layer's saved config **in this same pane**.
-    pub fn sibling(&self, id: &LayerId) -> Option<&'a serde_json::Value> {
-        self.slots
-            .iter()
-            .find(|(slot_id, _)| *slot_id == id)
-            .map(|(_, config)| *config)
     }
 }
 
@@ -617,7 +598,6 @@ impl PaneMut<'_> {
             pane_idx: self.pane_idx,
             config: &NULL_CONFIG,
             state: self.state.as_deref(),
-            slots: &[],
             loading_site: None,
             peers: self.peers,
         }

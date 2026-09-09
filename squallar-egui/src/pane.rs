@@ -1027,14 +1027,13 @@ impl LayerSlot {
     }
 }
 
-/// **One pane's layer stack, in the shape [`PaneRef`] borrows from.**
+/// **One pane, in the shape [`PaneRef`] borrows from.**
 ///
-/// The sibling-config table is built once here and shared by every
-/// [`Self::layer`] call, so asking twelve handlers about one pane costs one
-/// allocation rather than twelve.
+/// One borrow of the pane that a walk holds across the handlers it asks, so
+/// twelve questions about one pane are twelve [`Self::layer`] calls and no
+/// per-question setup. It owns nothing and allocates nothing.
 pub struct PaneView<'a> {
     pane_idx: usize,
-    slots: Vec<(&'a LayerId, &'a serde_json::Value)>,
     loading_site: Option<&'a str>,
     pane: &'a PaneState,
 }
@@ -1051,7 +1050,6 @@ impl<'a> PaneView<'a> {
             state: slot
                 .and_then(|slot| slot.state.as_deref())
                 .map(|s| s as &dyn Any),
-            slots: &self.slots,
             loading_site: self.loading_site,
             // One pane's view carries no peers: a caller that has to weigh
             // the whole layer across panes builds a `PaneRef::across`.
@@ -2380,12 +2378,9 @@ impl PaneState {
 
     /// **One layer's `PaneRef`, for a caller that asks about exactly one.**
     ///
-    /// The sibling table is **empty**: materialising it needs a `Vec` that
-    /// outlives the call, which is what [`Self::view`] exists for. A caller
-    /// whose handler reads a sibling slot (the site picker reading the radar
-    /// slot's `"site"`) must go through `view()`; every other caller wants
-    /// this, because it composes into one expression and borrows nothing that
-    /// has to be kept alive.
+    /// The same answer [`PaneView::layer`] gives, in one expression and
+    /// without a handle to keep alive. `view()` is for a walk that asks about
+    /// several layers off one borrow.
     pub fn layer_ref(&self, pane_idx: usize, id: &LayerId) -> PaneRef<'_> {
         let slot = self.slot(id);
         PaneRef {
@@ -2394,23 +2389,23 @@ impl PaneState {
             state: slot
                 .and_then(|slot| slot.state.as_deref())
                 .map(|s| s as &dyn Any),
-            slots: &[],
             loading_site: self.loading_site.as_deref(),
             peers: &[],
         }
     }
 
-    /// **This pane, as handlers see it.** Build once per pane per frame and
-    /// ask it for each layer in turn: the sibling table is materialised here
-    /// rather than per layer, which is the whole reason the type exists.
+    /// **This pane, as handlers see it.** One borrow of the pane, asked about
+    /// each layer in turn by a walk that has several to ask about.
+    ///
+    /// Allocates nothing, and is pinned that way by
+    /// `squallar-egui/tests/pane_view_allocates_nothing.rs`: this used to
+    /// materialise a table of every slot's `(id, config)` for
+    /// [`squallar_source::handler::PaneRef`]'s sibling lookup, one `Vec` of
+    /// the pane's whole slot count per call, on a path the draw walk and every
+    /// overlay dispatch reach. No handler in the workspace ever read it.
     pub fn view(&self, pane_idx: usize) -> PaneView<'_> {
         PaneView {
             pane_idx,
-            slots: self
-                .layers
-                .iter()
-                .map(|slot| (&slot.id, &slot.config))
-                .collect(),
             loading_site: self.loading_site.as_deref(),
             pane: self,
         }
@@ -3412,7 +3407,6 @@ impl PaneState {
                 pane_idx,
                 config: &slot.config,
                 state: Some(state as &dyn Any),
-                slots: &[],
                 loading_site: None,
                 peers: &[],
             };
@@ -3616,7 +3610,6 @@ impl PaneState {
                 pane_idx: 0,
                 config: &serde_json::Value::Null,
                 state: Some(state as &dyn Any),
-                slots: &[],
                 loading_site: None,
                 peers: &[],
             };
