@@ -183,6 +183,34 @@ fn shrink_to_content(rect: egui::Rect, top: f32, bottom: f32, left: f32, right: 
     egui::Rect::from_min_max(min, max)
 }
 
+/// One horizontal row laid out in `layout`, at `ui`'s ambient row height.
+///
+/// [`egui::Ui::horizontal`] is `allocate_ui_with_layout` at the *ambient*
+/// direction, so a row whose content wants the other one — a trailing control
+/// owning the right edge, with the rest truncating into what is left — used to
+/// be spelled `horizontal(|ui| ui.with_layout(right_to_left, ..))`. That is
+/// two [`egui::Ui`]s where the row needs one, and an `egui::Ui` is not free:
+/// `new_child` registers a widget and an accesskit node, and the
+/// `remember_min_rect` its `Drop` runs registers the same widget again, so
+/// every nested scope costs two `Context::create_widget` calls a frame
+/// whatever it contains.
+///
+/// The rect is the one the nested spelling produced: `horizontal` sizes its
+/// child from `(available_size_before_wrap().x, spacing().interact_size.y)`,
+/// and the `with_layout` inside it inherited exactly that rect, nothing having
+/// been allocated out of it yet.
+pub(crate) fn row_with_layout<R>(
+    ui: &mut egui::Ui,
+    layout: egui::Layout,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let size = egui::vec2(
+        ui.available_size_before_wrap().x,
+        ui.spacing().interact_size.y,
+    );
+    ui.allocate_ui_with_layout(size, layout, add_contents).inner
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

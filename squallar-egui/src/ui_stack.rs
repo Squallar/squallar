@@ -78,6 +78,14 @@ const CONTROL_SIDE: f32 = MIN_ROW_HEIGHT;
 const EYE_GLYPH_SIZE: f32 = 20.0;
 const REMOVE_GLYPH_SIZE: f32 = 18.0;
 
+/// The salt the whole-row click target's id is built from.
+///
+/// The row's own id and the id salt its body's `Ui` carries are the same
+/// layer string, so they are namespaced apart here rather than left to
+/// collide: `Ui::scope_builder`'s salt hashes to the body's *stable* id and
+/// the row response would otherwise land on it.
+const ROW_ID_SALT: &str = "stack_row";
+
 /// The drag grip's hit width. Full row height; the painted dots are smaller.
 const GRIP_WIDTH: f32 = 18.0;
 
@@ -295,63 +303,63 @@ impl super::Gui {
                     // closes the page (the plan's no-back-buttons rule; M7's
                     // sheet-header polish). The wider hosts keep both.
                     if !slot.sheet {
-                        ui.horizontal(|ui| {
-                            // Right-to-left so the collapse button owns the
-                            // right edge and the title truncates in what is
-                            // left.
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    let collapse = ui
-                                        .button(COLLAPSE_LABEL)
-                                        .hover_text("Collapse the layer stack");
-                                    #[cfg(test)]
-                                    {
-                                        probe.collapse = collapse.rect;
+                        // Right-to-left so the collapse button owns the right
+                        // edge and the title truncates in what is left, in one
+                        // `egui::Ui` rather than an `horizontal` wrapping a
+                        // `with_layout` that reverses it — see
+                        // `ui_layout::row_with_layout`.
+                        crate::ui_layout::row_with_layout(
+                            ui,
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let collapse = ui
+                                    .button(COLLAPSE_LABEL)
+                                    .hover_text("Collapse the layer stack");
+                                #[cfg(test)]
+                                {
+                                    probe.collapse = collapse.rect;
+                                }
+                                if collapse.clicked() {
+                                    // The same split the top bar's Layers
+                                    // toggle writes through: an explicit
+                                    // choice over the Expanded default,
+                                    // the drawer flag elsewhere.
+                                    if self.layout.width.has_persistent_sidebar() {
+                                        self.stack_open = Some(false);
+                                    } else {
+                                        self.drawer_open = false;
                                     }
-                                    if collapse.clicked() {
-                                        // The same split the top bar's Layers
-                                        // toggle writes through: an explicit
-                                        // choice over the Expanded default,
-                                        // the drawer flag elsewhere.
-                                        if self.layout.width.has_persistent_sidebar() {
-                                            self.stack_open = Some(false);
-                                        } else {
-                                            self.drawer_open = false;
-                                        }
-                                    }
+                                }
 
-                                    ui.with_layout(
-                                        egui::Layout::left_to_right(egui::Align::Center),
-                                        |ui| {
-                                            let header = ui
-                                                .add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(title.as_str())
-                                                            .strong(),
-                                                    )
-                                                    .truncate()
-                                                    .sense(egui::Sense::click()),
+                                ui.with_layout(
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        let header = ui
+                                            .add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(title.as_str()).strong(),
                                                 )
-                                                .hover_text("Layer order: top = drawn last");
-                                            #[cfg(test)]
-                                            {
-                                                probe.header = header.rect;
-                                            }
-                                            // A route to Pane properties, for
-                                            // every pane kind — the header
-                                            // names the pane, so clicking it
-                                            // selects the pane. The pills are
-                                            // the primary route now; this
-                                            // stays as the panel's own way in.
-                                            if header.clicked() {
-                                                self.select_pane_props();
-                                            }
-                                        },
-                                    );
-                                },
-                            );
-                        });
+                                                .truncate()
+                                                .sense(egui::Sense::click()),
+                                            )
+                                            .hover_text("Layer order: top = drawn last");
+                                        #[cfg(test)]
+                                        {
+                                            probe.header = header.rect;
+                                        }
+                                        // A route to Pane properties, for
+                                        // every pane kind — the header
+                                        // names the pane, so clicking it
+                                        // selects the pane. The pills are
+                                        // the primary route now; this
+                                        // stays as the panel's own way in.
+                                        if header.clicked() {
+                                            self.select_pane_props();
+                                        }
+                                    },
+                                );
+                            },
+                        );
                         ui.separator();
                     }
 
@@ -496,367 +504,381 @@ impl super::Gui {
         let body_height = ui.text_style_height(&egui::TextStyle::Body);
 
         for kind in order.iter() {
-            // Keyed on the layer, not the position, so a row's widget state
-            // travels with it when it is reordered. `as_str` because the id
-            // itself is the stable identity.
-            ui.push_id(kind.as_str(), |ui| {
-                let enabled = pane.is_overlay_enabled(kind);
-                let selected =
-                    self.insp_open && self.inspector_sel == InspectorSelection::Layer(kind.clone());
-                let name = self.overlays.display_name(kind).to_owned();
-                let lines = rows.iter().find(|row| row.layer == *kind);
-                // Borrowed, not cloned. The composer already owns both lines
-                // for the whole pass and nothing here outlives it, so the two
-                // `String`s a row used to copy every frame bought nothing.
-                let status: Option<&str> = lines.and_then(|row| row.status.as_deref());
-                let memory: Option<&str> = lines.and_then(|row| row.memory.as_deref());
+            let enabled = pane.is_overlay_enabled(kind);
+            let selected =
+                self.insp_open && self.inspector_sel == InspectorSelection::Layer(kind.clone());
+            let name = self.overlays.display_name(kind).to_owned();
+            let lines = rows.iter().find(|row| row.layer == *kind);
+            // Borrowed, not cloned. The composer already owns both lines
+            // for the whole pass and nothing here outlives it, so the two
+            // `String`s a row used to copy every frame bought nothing.
+            let status: Option<&str> = lines.and_then(|row| row.status.as_deref());
+            let memory: Option<&str> = lines.and_then(|row| row.memory.as_deref());
 
-                // The whole row is the click target (the M8 full-row fix):
-                // the full panel width at a comfortable height, allocated
-                // with its own click sense **before** the row's buttons —
-                // egui resolves an overlap to the later registration, so the
-                // reorder pair and the eye, drawn after inside this rect,
-                // keep their own clicks by sitting on top. Sized from the
-                // real text styles so a themed font cannot clip the block —
-                // the memory line is measured the same way the status is, so
-                // a row that has both grows by exactly one small line rather
-                // than pushing its own text out of its box.
-                // **The memory line is a band of its own under the row**, not
-                // a third line inside the name block, and the reason is
-                // measured. The block sits between the eye and the can, which
-                // leaves it 130 pt on the drawer host and 137 on the sidebar;
-                // `shared 49 MB + own 18 MB of 3.1 GB` lays out at 147.8, so
-                // in the block it would lose its allowance to the truncation
-                // on both. Under the controls it has the whole row -- the
-                // same figure, legible, and the controls keep the height they
-                // had because the band is taken off the rect they centre in.
-                let memory_band = memory.map_or(0.0, |_| small_height);
-                let row_height =
-                    (body_height + status.map_or(0.0, |_| small_height) + memory_band + 6.0)
-                        .max(MIN_ROW_HEIGHT);
-                let (row_rect, row) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), row_height),
-                    egui::Sense::click(),
-                );
-                row_rects.push(row_rect);
-                // The catalog's other half: applying a tile selects the layer
-                // in the inspector, and this brings its row into view, so the
-                // two surfaces visibly name the same thing. One-shot — a
-                // standing target would fight every scroll the user makes.
-                if self.stack_scroll_to.as_ref() == Some(kind) {
-                    self.stack_scroll_to = None;
-                    row.scroll_to_me(Some(egui::Align::Center));
+            // The whole row is the click target (the M8 full-row fix):
+            // the full panel width at a comfortable height, allocated
+            // with its own click sense **before** the row's buttons —
+            // egui resolves an overlap to the later registration, so the
+            // reorder pair and the eye, drawn after inside this rect,
+            // keep their own clicks by sitting on top. Sized from the
+            // real text styles so a themed font cannot clip the block —
+            // the memory line is measured the same way the status is, so
+            // a row that has both grows by exactly one small line rather
+            // than pushing its own text out of its box.
+            // **The memory line is a band of its own under the row**, not
+            // a third line inside the name block, and the reason is
+            // measured. The block sits between the eye and the can, which
+            // leaves it 130 pt on the drawer host and 137 on the sidebar;
+            // `shared 49 MB + own 18 MB of 3.1 GB` lays out at 147.8, so
+            // in the block it would lose its allowance to the truncation
+            // on both. Under the controls it has the whole row -- the
+            // same figure, legible, and the controls keep the height they
+            // had because the band is taken off the rect they centre in.
+            let memory_band = memory.map_or(0.0, |_| small_height);
+            let row_height =
+                (body_height + status.map_or(0.0, |_| small_height) + memory_band + 6.0)
+                    .max(MIN_ROW_HEIGHT);
+            // **Allocated, then interacted, in two calls rather than
+            // `allocate_exact_size`'s one**, because the id has to be
+            // this layer's rather than the position's. That used to come
+            // free from a `push_id` scope wrapped round the whole row;
+            // the scope was an `egui::Ui`, and every `Ui` costs two
+            // `Context::create_widget` calls — one in `new_child`, one in
+            // the `remember_min_rect` its `Drop` runs — plus an accesskit
+            // node, for a stack of N layers, every frame. Naming the id
+            // here is what let the salt move onto the row body's own
+            // child `Ui` below, so a row is one `Ui` instead of two.
+            let row_width = ui.available_width();
+            let row_id = ui.id().with((ROW_ID_SALT, kind.as_str()));
+            let (_, row_rect) = ui.allocate_space(egui::vec2(row_width, row_height));
+            let row = ui.interact(row_rect, row_id, egui::Sense::click());
+            row_rects.push(row_rect);
+            // The catalog's other half: applying a tile selects the layer
+            // in the inspector, and this brings its row into view, so the
+            // two surfaces visibly name the same thing. One-shot — a
+            // standing target would fight every scroll the user makes.
+            if self.stack_scroll_to.as_ref() == Some(kind) {
+                self.stack_scroll_to = None;
+                row.scroll_to_me(Some(egui::Align::Center));
+            }
+            let lifting = self.stack_drag.as_ref() == Some(kind);
+
+            // Hover and selection read as the whole row, in the stock
+            // theme's own selectable visuals — painted first, so the
+            // content draws over the highlight. The hover read is
+            // `contains_pointer`, not `hovered`: the eye and the grip
+            // sit on top of this rect and take `hovered` with them,
+            // blinking the highlight off as the pointer crosses. The
+            // union read is for the highlight only — clicks keep egui's
+            // later-registration precedence untouched.
+            let hovered = row.contains_pointer();
+            if selected || hovered || row.has_focus() {
+                let mut visuals = if hovered {
+                    ui.style().visuals.widgets.hovered
+                } else {
+                    ui.style().interact_selectable(&row, selected)
+                };
+                if selected {
+                    // `interact_selectable`'s own override, re-applied on
+                    // the hovered branch so selection paints one fill
+                    // wherever the pointer is inside the row.
+                    visuals.weak_bg_fill = ui.visuals().selection.bg_fill;
                 }
-                let lifting = self.stack_drag.as_ref() == Some(kind);
+                ui.painter().rect(
+                    row_rect,
+                    visuals.corner_radius,
+                    visuals.weak_bg_fill,
+                    visuals.bg_stroke,
+                    egui::StrokeKind::Inside,
+                );
+            }
 
-                // Hover and selection read as the whole row, in the stock
-                // theme's own selectable visuals — painted first, so the
-                // content draws over the highlight. The hover read is
-                // `contains_pointer`, not `hovered`: the eye and the grip
-                // sit on top of this rect and take `hovered` with them,
-                // blinking the highlight off as the pointer crosses. The
-                // union read is for the highlight only — clicks keep egui's
-                // later-registration precedence untouched.
-                let hovered = row.contains_pointer();
-                if selected || hovered || row.has_focus() {
-                    let mut visuals = if hovered {
-                        ui.style().visuals.widgets.hovered
+            // The controls' band: the row less whatever the memory line
+            // takes off its bottom. Everything that centres itself in the
+            // row centres in this instead, so a priced row's eye, can and
+            // grip sit exactly where an unpriced row's do.
+            let content_rect = egui::Rect::from_min_max(
+                row_rect.min,
+                egui::pos2(row_rect.max.x, row_rect.max.y - memory_band),
+            );
+            let content_height = content_rect.height();
+            // **The row body's one child `Ui`**, carrying both the
+            // layout the controls lay out in and the id salt that keys
+            // every widget in the row on the layer rather than on the
+            // position, so a row's widget state travels with it when it
+            // is reordered.
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .id_salt(kind.as_str())
+                    .max_rect(content_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                |ui| {
+                    // The lift: the source row dims while its ghost follows the
+                    // pointer (painted after the loop).
+                    if lifting {
+                        ui.multiply_opacity(0.4);
+                    }
+
+                    // The drag grip — the only part of the row that senses a
+                    // drag, so a swipe anywhere else on the row still scrolls
+                    // the list on touch. The dots are painted: no glyph egui's
+                    // bundled fonts carry draws a grip (`ui_glyphs.rs`).
+                    let (handle_rect, handle) = ui.allocate_exact_size(
+                        egui::vec2(GRIP_WIDTH, content_height),
+                        egui::Sense::drag(),
+                    );
+                    let grip_color = if handle.hovered() || lifting {
+                        ui.visuals().strong_text_color()
                     } else {
-                        ui.style().interact_selectable(&row, selected)
+                        ui.visuals().weak_text_color()
                     };
-                    if selected {
-                        // `interact_selectable`'s own override, re-applied on
-                        // the hovered branch so selection paints one fill
-                        // wherever the pointer is inside the row.
-                        visuals.weak_bg_fill = ui.visuals().selection.bg_fill;
-                    }
-                    ui.painter().rect(
-                        row_rect,
-                        visuals.corner_radius,
-                        visuals.weak_bg_fill,
-                        visuals.bg_stroke,
-                        egui::StrokeKind::Inside,
-                    );
-                }
-
-                // The controls' band: the row less whatever the memory line
-                // takes off its bottom. Everything that centres itself in the
-                // row centres in this instead, so a priced row's eye, can and
-                // grip sit exactly where an unpriced row's do.
-                let content_rect = egui::Rect::from_min_max(
-                    row_rect.min,
-                    egui::pos2(row_rect.max.x, row_rect.max.y - memory_band),
-                );
-                let content_height = content_rect.height();
-                let mut row_ui = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(content_rect)
-                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                );
-                let ui = &mut row_ui;
-                // The lift: the source row dims while its ghost follows the
-                // pointer (painted after the loop).
-                if lifting {
-                    ui.multiply_opacity(0.4);
-                }
-
-                // The drag grip — the only part of the row that senses a
-                // drag, so a swipe anywhere else on the row still scrolls
-                // the list on touch. The dots are painted: no glyph egui's
-                // bundled fonts carry draws a grip (`ui_glyphs.rs`).
-                let (handle_rect, handle) = ui.allocate_exact_size(
-                    egui::vec2(GRIP_WIDTH, content_height),
-                    egui::Sense::drag(),
-                );
-                let grip_color = if handle.hovered() || lifting {
-                    ui.visuals().strong_text_color()
-                } else {
-                    ui.visuals().weak_text_color()
-                };
-                for col in 0..2 {
-                    for dot in 0..3 {
-                        let offset = egui::vec2(
-                            (col as f32 - 0.5) * GRIP_DOT_SPACING,
-                            (dot as f32 - 1.0) * GRIP_DOT_SPACING,
-                        );
-                        ui.painter().circle_filled(
-                            handle_rect.center() + offset,
-                            GRIP_DOT_RADIUS,
-                            grip_color,
-                        );
-                    }
-                }
-                let handle = handle
-                    .on_hover_cursor(egui::CursorIcon::Grab)
-                    .hover_text_lazy(|| format!("Drag to reorder {name}"));
-                if handle.drag_started() {
-                    self.stack_drag = Some(kind.clone());
-                }
-                if lifting {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-                    if handle.drag_stopped() {
-                        drag_released = true;
-                    }
-                }
-
-                // The 👁 eye. Both halves through `write_pane_overlay`,
-                // on the *taken* pane — `set_active_pane_overlay` would
-                // write the placeholder in the vector.
-                let eye_text = if enabled {
-                    egui::RichText::new("\u{1f441}").size(EYE_GLYPH_SIZE)
-                } else {
-                    egui::RichText::new("-").size(EYE_GLYPH_SIZE).weak()
-                };
-                let eye = ui
-                    .add(
-                        egui::Button::new(eye_text)
-                            .frame(false)
-                            .min_size(egui::Vec2::splat(CONTROL_SIDE)),
-                    )
-                    .hover_text_lazy(|| {
-                        if enabled {
-                            format!("Hide {name}")
-                        } else {
-                            format!("Show {name}")
-                        }
-                    });
-                // A UiSweep target: the sweep toggles every eye it can see.
-                if crate::gesture_player::click_registry::collecting() {
-                    crate::gesture_player::click_registry::register(
-                        &format!(
-                            "{}{}",
-                            crate::gesture_player::ui_sweep::EYE_PREFIX,
-                            kind.as_str()
-                        ),
-                        eye.rect,
-                    );
-                }
-                if eye.clicked() {
-                    // Both halves plus the enable-fetch rule, through the
-                    // one helper the inspector's Show toggle and the
-                    // catalog's tiles share.
-                    let idx = self.active_pane;
-                    self.set_pane_overlay_with_fetch(pane, idx, kind, !enabled, actions);
-                }
-
-                // The rest of the row lays out from its far end: the drawer's
-                // `›` last where there is one, then the 🗑 can, then the name
-                // block in what is left.
-                let refusal = pane.layer_removal_refusal(kind);
-                #[cfg(test)]
-                let mut chevron_rect = None;
-                #[cfg(test)]
-                let mut name_rect = egui::Rect::NOTHING;
-                let remove = ui
-                    .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // A trailing `›` on the drawer and sheet hosts: there a
-                        // row click *pushes* the inspector over this list, and
-                        // the chevron says so — at the very edge, where a list's
-                        // navigation mark lives, so the can inside it is not the
-                        // first thing a thumb finds at the row's end. The
-                        // desktop sidebar, where the inspector opens beside the
-                        // stack, carries none.
-                        if is_drawer {
-                            let chevron = ui.add(
-                                egui::Label::new(egui::RichText::new("\u{203a}").weak())
-                                    .selectable(false),
+                    // **One `Painter::extend`, not six `circle_filled`**:
+                    // each of those is its own write lock on the context's
+                    // graphics, and the six dots are one glyph. Same shapes,
+                    // same order, same clip.
+                    let centre = handle_rect.center();
+                    ui.painter().extend((0..2).flat_map(|col: u8| {
+                        (0..3).map(move |dot: u8| {
+                            let offset = egui::vec2(
+                                (f32::from(col) - 0.5) * GRIP_DOT_SPACING,
+                                (f32::from(dot) - 1.0) * GRIP_DOT_SPACING,
                             );
+                            egui::Shape::circle_filled(centre + offset, GRIP_DOT_RADIUS, grip_color)
+                        })
+                    }));
+                    let handle = handle
+                        .on_hover_cursor(egui::CursorIcon::Grab)
+                        .hover_text_lazy(|| format!("Drag to reorder {name}"));
+                    if handle.drag_started() {
+                        self.stack_drag = Some(kind.clone());
+                    }
+                    if lifting {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                        if handle.drag_stopped() {
+                            drag_released = true;
+                        }
+                    }
+
+                    // The 👁 eye. Both halves through `write_pane_overlay`,
+                    // on the *taken* pane — `set_active_pane_overlay` would
+                    // write the placeholder in the vector.
+                    let eye_text = if enabled {
+                        egui::RichText::new("\u{1f441}").size(EYE_GLYPH_SIZE)
+                    } else {
+                        egui::RichText::new("-").size(EYE_GLYPH_SIZE).weak()
+                    };
+                    let eye = ui
+                        .add(
+                            egui::Button::new(eye_text)
+                                .frame(false)
+                                .min_size(egui::Vec2::splat(CONTROL_SIDE)),
+                        )
+                        .hover_text_lazy(|| {
+                            if enabled {
+                                format!("Hide {name}")
+                            } else {
+                                format!("Show {name}")
+                            }
+                        });
+                    // A UiSweep target: the sweep toggles every eye it can see.
+                    if crate::gesture_player::click_registry::collecting() {
+                        crate::gesture_player::click_registry::register(
+                            &format!(
+                                "{}{}",
+                                crate::gesture_player::ui_sweep::EYE_PREFIX,
+                                kind.as_str()
+                            ),
+                            eye.rect,
+                        );
+                    }
+                    if eye.clicked() {
+                        // Both halves plus the enable-fetch rule, through the
+                        // one helper the inspector's Show toggle and the
+                        // catalog's tiles share.
+                        let idx = self.active_pane;
+                        self.set_pane_overlay_with_fetch(pane, idx, kind, !enabled, actions);
+                    }
+
+                    // The rest of the row lays out from its far end: the drawer's
+                    // `›` last where there is one, then the 🗑 can, then the name
+                    // block in what is left.
+                    let refusal = pane.layer_removal_refusal(kind);
+                    #[cfg(test)]
+                    let mut chevron_rect = None;
+                    #[cfg(test)]
+                    let mut name_rect = egui::Rect::NOTHING;
+                    let remove = ui
+                        .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // A trailing `›` on the drawer and sheet hosts: there a
+                            // row click *pushes* the inspector over this list, and
+                            // the chevron says so — at the very edge, where a list's
+                            // navigation mark lives, so the can inside it is not the
+                            // first thing a thumb finds at the row's end. The
+                            // desktop sidebar, where the inspector opens beside the
+                            // stack, carries none.
+                            if is_drawer {
+                                let chevron = ui.add(
+                                    egui::Label::new(egui::RichText::new("\u{203a}").weak())
+                                        .selectable(false),
+                                );
+                                #[cfg(test)]
+                                {
+                                    chevron_rect = Some(chevron.rect);
+                                }
+                                #[cfg(not(test))]
+                                let _ = chevron;
+                            }
+
+                            // The 🗑 remove control, at the end of the line. The eye
+                            // hides the layer; this takes it out of the pane's stack,
+                            // which is a different act — and a destructive one — so it
+                            // stands a row's width from the eye rather than one gap
+                            // beside it, where a miss on one landed on the other.
+                            // **Drawn on every row, live or not**: a layer the pane
+                            // cannot give up gets a greyed can whose hover says why,
+                            // rather than no control at all — an absent affordance
+                            // reads as an oversight, and one that silently does
+                            // nothing is worse than both.
+                            let remove = ui.add_enabled(
+                                refusal.is_none(),
+                                egui::Button::new(
+                                    egui::RichText::new(REMOVE_LABEL)
+                                        .size(REMOVE_GLYPH_SIZE)
+                                        .color(if refusal.is_none() {
+                                            ui.visuals().weak_text_color()
+                                        } else {
+                                            ui.visuals().widgets.noninteractive.fg_stroke.color
+                                        }),
+                                )
+                                .frame(false)
+                                .min_size(egui::Vec2::splat(CONTROL_SIDE)),
+                            );
+                            let remove =
+                                remove.hover_text_lazy(|| format!("Remove {name} from this pane"));
+                            let remove = remove.disabled_hover_ui(|ui| {
+                                ui.set_max_width(ui.spacing().tooltip_width);
+                                ui.add(egui::Label::new(refusal.unwrap_or_default()));
+                            });
+
+                            // The name and status block. Hidden layers render
+                            // dimmed — weak text is the stock theme's own dimming.
+                            // The memory line is not in here: it is the band under
+                            // this whole row, for the width reason on `row_height`.
+                            let block =
+                                ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    let text_height =
+                                        body_height + status.map_or(0.0, |_| small_height);
+                                    ui.add_space(((content_height - text_height) / 2.0).max(0.0));
+                                    let name_text = if enabled {
+                                        egui::RichText::new(name.as_str())
+                                    } else {
+                                        egui::RichText::new(name.as_str()).weak()
+                                    };
+                                    let name_label = ui.add(
+                                        egui::Label::new(name_text).selectable(false).truncate(),
+                                    );
+                                    let mut text_rect = name_label.rect;
+                                    if let Some(line) = status {
+                                        // A line that opens with the fault mark is not a
+                                        // count, and `.weak()` is the theme's own way of
+                                        // saying "this is a detail" — the same dim grey
+                                        // `3 shown - W/Wa` sits in. A layer that stopped
+                                        // updating, or is drawing 85 of 297 warnings, gets
+                                        // the warning colour instead: same size, same
+                                        // place, same rect, legible as a fault.
+                                        let text = egui::RichText::new(line).small();
+                                        let text = if line.starts_with(STATUS_MARK) {
+                                            text.color(ui.visuals().warn_fg_color)
+                                        } else {
+                                            text.weak()
+                                        };
+                                        let status_label = ui.add(
+                                            egui::Label::new(text).selectable(false).truncate(),
+                                        );
+                                        text_rect = text_rect.union(status_label.rect);
+                                    }
+                                    text_rect
+                                });
+                            let mut text_rect = block.inner;
+                            if let Some(line) = memory {
+                                // **A quantity, never a warning.** What this layer
+                                // costs is a fact about the scene the user built,
+                                // not a fault, and it is drawn in the same dim
+                                // grey the handler's own detail line sits in
+                                // whatever the figure says. The one place the
+                                // budget system raises its voice is a refusal, and
+                                // that is a plate on the map with a control named
+                                // on it.
+                                //
+                                // Painted rather than added, because this line is
+                                // the *row's* and not the block's: it starts under
+                                // the name and runs to the row's own right edge,
+                                // past the can that bounds every widget above it.
+                                // Clipped to the row, so a font that laid it out
+                                // wider than the panel cannot reach the row below.
+                                let galley = ui.painter().layout_no_wrap(
+                                    line.to_owned(),
+                                    egui::TextStyle::Small.resolve(ui.style()),
+                                    ui.visuals().weak_text_color(),
+                                );
+                                // **Aligned with the eye, not with the name**, and
+                                // measured: from the name's left the drawer host
+                                // leaves 178 pt and the widest line this format
+                                // prints — `system: shared 999 MB + own 999 MB of
+                                // 999 GB` — lays out at 193. From the eye there
+                                // are 218, and the grip is the only thing to the
+                                // left of it, which is the row's drag affordance
+                                // rather than any of its content.
+                                let at = egui::pos2(
+                                    eye.rect.left(),
+                                    row_rect.max.y - memory_band - MEMORY_BAND_LIFT,
+                                );
+                                text_rect =
+                                    text_rect.union(egui::Rect::from_min_size(at, galley.size()));
+                                ui.painter().with_clip_rect(row_rect).galley(
+                                    at,
+                                    galley,
+                                    egui::Color32::PLACEHOLDER,
+                                );
+                            }
                             #[cfg(test)]
                             {
-                                chevron_rect = Some(chevron.rect);
+                                name_rect = text_rect;
                             }
                             #[cfg(not(test))]
-                            let _ = chevron;
-                        }
+                            let _ = text_rect;
+                            remove
+                        })
+                        .inner;
+                    if remove.clicked() {
+                        removing = Some(kind.clone());
+                    }
 
-                        // The 🗑 remove control, at the end of the line. The eye
-                        // hides the layer; this takes it out of the pane's stack,
-                        // which is a different act — and a destructive one — so it
-                        // stands a row's width from the eye rather than one gap
-                        // beside it, where a miss on one landed on the other.
-                        // **Drawn on every row, live or not**: a layer the pane
-                        // cannot give up gets a greyed can whose hover says why,
-                        // rather than no control at all — an absent affordance
-                        // reads as an oversight, and one that silently does
-                        // nothing is worse than both.
-                        let remove = ui.add_enabled(
-                            refusal.is_none(),
-                            egui::Button::new(
-                                egui::RichText::new(REMOVE_LABEL)
-                                    .size(REMOVE_GLYPH_SIZE)
-                                    .color(if refusal.is_none() {
-                                        ui.visuals().weak_text_color()
-                                    } else {
-                                        ui.visuals().widgets.noninteractive.fg_stroke.color
-                                    }),
-                            )
-                            .frame(false)
-                            .min_size(egui::Vec2::splat(CONTROL_SIDE)),
-                        );
-                        let remove =
-                            remove.hover_text_lazy(|| format!("Remove {name} from this pane"));
-                        let remove = remove.disabled_hover_ui(|ui| {
-                            ui.set_max_width(ui.spacing().tooltip_width);
-                            ui.add(egui::Label::new(refusal.unwrap_or_default()));
-                        });
-
-                        // The name and status block. Hidden layers render
-                        // dimmed — weak text is the stock theme's own dimming.
-                        // The memory line is not in here: it is the band under
-                        // this whole row, for the width reason on `row_height`.
-                        let block =
-                            ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                                ui.spacing_mut().item_spacing.y = 0.0;
-                                let text_height =
-                                    body_height + status.map_or(0.0, |_| small_height);
-                                ui.add_space(((content_height - text_height) / 2.0).max(0.0));
-                                let name_text = if enabled {
-                                    egui::RichText::new(name.as_str())
-                                } else {
-                                    egui::RichText::new(name.as_str()).weak()
-                                };
-                                let name_label = ui
-                                    .add(egui::Label::new(name_text).selectable(false).truncate());
-                                let mut text_rect = name_label.rect;
-                                if let Some(line) = status {
-                                    // A line that opens with the fault mark is not a
-                                    // count, and `.weak()` is the theme's own way of
-                                    // saying "this is a detail" — the same dim grey
-                                    // `3 shown - W/Wa` sits in. A layer that stopped
-                                    // updating, or is drawing 85 of 297 warnings, gets
-                                    // the warning colour instead: same size, same
-                                    // place, same rect, legible as a fault.
-                                    let text = egui::RichText::new(line).small();
-                                    let text = if line.starts_with(STATUS_MARK) {
-                                        text.color(ui.visuals().warn_fg_color)
-                                    } else {
-                                        text.weak()
-                                    };
-                                    let status_label =
-                                        ui.add(egui::Label::new(text).selectable(false).truncate());
-                                    text_rect = text_rect.union(status_label.rect);
-                                }
-                                text_rect
-                            });
-                        let mut text_rect = block.inner;
-                        if let Some(line) = memory {
-                            // **A quantity, never a warning.** What this layer
-                            // costs is a fact about the scene the user built,
-                            // not a fault, and it is drawn in the same dim
-                            // grey the handler's own detail line sits in
-                            // whatever the figure says. The one place the
-                            // budget system raises its voice is a refusal, and
-                            // that is a plate on the map with a control named
-                            // on it.
-                            //
-                            // Painted rather than added, because this line is
-                            // the *row's* and not the block's: it starts under
-                            // the name and runs to the row's own right edge,
-                            // past the can that bounds every widget above it.
-                            // Clipped to the row, so a font that laid it out
-                            // wider than the panel cannot reach the row below.
-                            let galley = ui.painter().layout_no_wrap(
-                                line.to_owned(),
-                                egui::TextStyle::Small.resolve(ui.style()),
-                                ui.visuals().weak_text_color(),
-                            );
-                            // **Aligned with the eye, not with the name**, and
-                            // measured: from the name's left the drawer host
-                            // leaves 178 pt and the widest line this format
-                            // prints — `system: shared 999 MB + own 999 MB of
-                            // 999 GB` — lays out at 193. From the eye there
-                            // are 218, and the grip is the only thing to the
-                            // left of it, which is the row's drag affordance
-                            // rather than any of its content.
-                            let at = egui::pos2(
-                                eye.rect.left(),
-                                row_rect.max.y - memory_band - MEMORY_BAND_LIFT,
-                            );
-                            text_rect =
-                                text_rect.union(egui::Rect::from_min_size(at, galley.size()));
-                            ui.painter().with_clip_rect(row_rect).galley(
-                                at,
-                                galley,
-                                egui::Color32::PLACEHOLDER,
-                            );
-                        }
-                        #[cfg(test)]
-                        {
-                            name_rect = text_rect;
-                        }
-                        #[cfg(not(test))]
-                        let _ = text_rect;
-                        remove
-                    })
-                    .inner;
-                if remove.clicked() {
-                    removing = Some(kind.clone());
-                }
-
-                #[cfg(test)]
-                probe.rows.push(StackRowProbe {
-                    kind: kind.clone(),
-                    rect: row_rect,
-                    eye: eye.rect,
-                    eye_on: enabled,
-                    remove: remove.rect,
-                    remove_enabled: refusal.is_none(),
-                    handle: handle.rect,
-                    name: name_rect,
-                    status_line: status.map(str::to_owned),
-                    memory_line: memory.map(str::to_owned),
-                    selected,
-                    chevron: chevron_rect,
-                });
-
-                if row.clicked() {
-                    // The inspector opens over or beside this list per host;
-                    // the list stays open beneath either way — the M3-era
-                    // rule that closed the Compact drawer died with the
-                    // slide-over it served.
-                    self.select_layer(kind.clone());
-                }
-            });
+                    #[cfg(test)]
+                    probe.rows.push(StackRowProbe {
+                        kind: kind.clone(),
+                        rect: row_rect,
+                        eye: eye.rect,
+                        eye_on: enabled,
+                        remove: remove.rect,
+                        remove_enabled: refusal.is_none(),
+                        handle: handle.rect,
+                        name: name_rect,
+                        status_line: status.map(str::to_owned),
+                        memory_line: memory.map(str::to_owned),
+                        selected,
+                        chevron: chevron_rect,
+                    });
+                },
+            );
+            if row.clicked() {
+                // The inspector opens over or beside this list per host;
+                // the list stays open beneath either way — the M3-era
+                // rule that closed the Compact drawer died with the
+                // slide-over it served.
+                self.select_layer(kind.clone());
+            }
         }
 
         let add_bottom = ui.button(ADD_LAYER_LABEL);
@@ -1022,6 +1044,12 @@ impl super::Gui {
         painter.galley(plate.min + pad, galley, egui::Color32::PLACEHOLDER);
     }
 }
+
+/// **What one row asks egui's interaction registry to remember** — the
+/// nested-`Ui` count no paint memo can remove.
+#[cfg(test)]
+#[path = "ui_stack/row_scope_tests.rs"]
+mod row_scope_tests;
 
 #[path = "ui_stack/layer_memory_tests.rs"]
 #[cfg(test)]

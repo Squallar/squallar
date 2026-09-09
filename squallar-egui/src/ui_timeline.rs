@@ -850,8 +850,13 @@ impl super::Gui {
 
         let narrow = !self.timeline_row1_fits(ui, &stamp_text, &age_text);
 
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        // Right-to-left so the collapse and the loop-settings chip own the
+        // right edge, in one `egui::Ui` rather than an `horizontal` wrapping a
+        // `with_layout` that reverses it — see `ui_layout::row_with_layout`.
+        crate::ui_layout::row_with_layout(
+            ui,
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
                 let collapse = ui.button("\u{23f7}").on_hover_text("Collapse the timeline");
                 #[cfg(test)]
                 {
@@ -900,8 +905,8 @@ impl super::Gui {
                 ui.scope_builder(nav_scope, |ui| {
                     self.render_timeline_nav(ui, actions, !narrow);
                 });
-            });
-        });
+            },
+        );
 
         if narrow {
             ui.horizontal(|ui| {

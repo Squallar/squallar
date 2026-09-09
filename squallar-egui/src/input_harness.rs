@@ -2040,6 +2040,24 @@ impl InputHarness {
         &self.id_changes
     }
 
+    /// **How many widgets egui registered inside `rect` on the last frame** —
+    /// every `Ui` scope included.
+    ///
+    /// This is `WidgetRects`, the per-frame interaction registry, not the
+    /// paint list: a nested [`egui::Ui`] is in here exactly once (its
+    /// `new_child` inserts it at `Rect::NOTHING` and the `remember_min_rect`
+    /// its `Drop` runs updates the same id in place), beside every widget it
+    /// contains. It is therefore the count that says what one frame of this
+    /// surface asks the context to remember, which is a cost no paint memo
+    /// can remove — a replayed surface still has to register.
+    pub(crate) fn widgets_within(&self, rect: egui::Rect) -> usize {
+        self.prev_widgets
+            .layers()
+            .flat_map(|(_, widgets)| widgets.iter())
+            .filter(|widget| rect.contains_rect(widget.rect))
+            .count()
+    }
+
     /// Forget the id changes seen so far, so a test can attribute later ones to
     /// one specific transition.
     pub(crate) fn clear_id_changes(&mut self) {
