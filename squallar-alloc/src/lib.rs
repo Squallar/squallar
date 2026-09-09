@@ -164,14 +164,23 @@ fn granted(bytes: usize) {
     // than it did — and the block that set it would be the missing one.
     note_large_grant(bytes);
     let live = live_from(LIVE.fetch_add(bytes as i64, Relaxed) + bytes as i64);
-    // **The companion is stored only on an ADVANCE**, and the branch is free:
-    // `fetch_max` already answers what the peak was, so the comparison costs
-    // nothing extra and the store is on a path that after warm-up almost
-    // never runs. A peak is monotone, so "the peak moved" is rare by
-    // construction — which is what makes it affordable to record what the
-    // peak was MADE OF at the instant it was set, rather than leaving a
-    // reader to infer it from a level sampled at some other time.
-    if PEAK.fetch_max(live, Relaxed) < live {
+    // **A load guards the maximum, and the guard is not an approximation of
+    // it.** `fetch_max` is idempotent: where the peak already stands at or
+    // above this figure it writes the value back unchanged — and on x86-64
+    // there is no locked max, so that is a `lock cmpxchg` STORE to a line
+    // every thread's allocator shares, on every allocation, after the peak
+    // has stopped moving. The load short-circuits exactly the calls that
+    // would have changed nothing, so the result is the same maximum with the
+    // straight line carrying no locked instruction at all. A peer raising the
+    // peak between the load and the `fetch_max` is why the `fetch_max` is
+    // still there.
+    //
+    // **The companion is stored only on an ADVANCE.** A peak is monotone, so
+    // "the peak moved" is rare by construction — which is what makes it
+    // affordable to record what the peak was MADE OF at the instant it was
+    // set, rather than leaving a reader to infer it from a level sampled at
+    // some other time.
+    if PEAK.load(Relaxed) < live && PEAK.fetch_max(live, Relaxed) < live {
         PEAK_LARGE.store(LIVE_LARGE.load(Relaxed), Relaxed);
     }
 }
