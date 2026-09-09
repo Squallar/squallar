@@ -667,15 +667,33 @@ fn the_valid_time_is_the_one_in_the_key() {
 
 /// The residency figure the cache budget is spent against is the real one.
 ///
-/// **The literal moved 98,000,000 -> 49,000,000 with the store**, and both
-/// halves are here on purpose: the first line holds the *real decoded granule*
-/// against the constant every budget is stated in, and the second holds that
-/// constant against a figure written out by hand, so a store and a budget that
-/// drifted together still fail here.
+/// **The literal moved 98,000,000 -> 49,000,000 with the `u16` store and
+/// 49,000,000 -> 7,171,958 with the tiled one.** All three halves are here on
+/// purpose: the real decoded granule, the ceiling every budget is stated in,
+/// and a figure written out by hand — so a store and a budget that drifted
+/// together still fail here.
+///
+/// **The two figures are no longer the same number and must not be.** A tiled
+/// mosaic's bytes are a property of the granule, not of its point count, which
+/// is the whole of what this representation buys; what a budget can hold
+/// against it is the *ceiling*, and what a reader needs beside that is one real
+/// granule's distance from it.
 #[test]
-fn one_resident_grid_is_the_forty_nine_megabytes_the_budget_assumes() {
-    assert_eq!(FIXTURE.resident_bytes(), crate::mrms::CONUS_GRID_BYTES);
-    assert_eq!(FIXTURE.resident_bytes(), 49_000_000);
+fn one_resident_grid_is_far_under_the_ceiling_the_budget_assumes() {
+    let held = FIXTURE.resident_bytes();
+    assert_eq!(
+        held, 5_554_748,
+        "the committed 2026-08-21 composite granule, tiled — 4.57 % of its          points drawable, which is the middle of the 0.83-8.02 % range 28          granules of both products span",
+    );
+    assert!(
+        held < crate::mrms::CONUS_TILED_CEILING_BYTES,
+        "a granule may not exceed the ceiling the live cache is priced          against: {held} vs {}",
+        crate::mrms::CONUS_TILED_CEILING_BYTES,
+    );
+    assert_eq!(crate::mrms::CONUS_TILED_CEILING_BYTES, 49_496_648);
+    // And the flat store it replaced, held here so the win is a *difference*
+    // this suite states rather than one a reader has to compute.
+    assert_eq!(FIXTURE.grid.values.len() * 2, 49_000_000);
 }
 
 // ── Refusals ────────────────────────────────────────────────────────────────
@@ -917,7 +935,7 @@ fn a_granule_at_a_shape_the_conus_constant_does_not_describe_reuses_the_slot() {
         "premise: and so the slot cannot be keyed on that constant and reuse",
     );
     assert!(
-        matches!(first.values, GridValues::Scaled(_)),
+        matches!(first.values, GridValues::Tiled(_)),
         "premise: it takes the narrow arm, which is the only arm that touches \
          the pool — a granule that fell to the f32 arm would exercise the \
          decline path under a test name that says it exercised the slot",
@@ -945,7 +963,15 @@ fn a_granule_at_a_shape_the_conus_constant_does_not_describe_reuses_the_slot() {
         "premise: a cold pool allocated the first one",
     );
 
-    let address = codes_address(&first.values);
+    // **The plane is already back**, before anything recycles anything: the
+    // tiler reads it once at the decode and hands it over, which is what keeps
+    // one 49 MB block in the process rather than one per resident grid.
+    assert_eq!(
+        pool.retained_points(),
+        CARIB_POINTS,
+        "the decode returns its plane to the slot itself",
+    );
+    let address = retained_address(&pool);
     pool.recycle(grid_around(first, product));
     assert_eq!(
         pool.totals().declined,
@@ -978,7 +1004,7 @@ fn a_granule_at_a_shape_the_conus_constant_does_not_describe_reuses_the_slot() {
         "and the pool must read as working rather than as merely untouched",
     );
     assert_eq!(
-        codes_address(&second.values),
+        retained_address(&pool),
         address,
         "into the FIRST decode's block, by pointer: a pool that reallocated a \
          buffer of the same size would satisfy every count above and leave the \
@@ -1003,29 +1029,41 @@ fn the_conus_granule_this_build_is_sized_for_is_pooled_too() {
 
     let first = parse_grib2_raw_in(&bytes, product.missing_codes(), &pool).expect("decodes");
     assert_eq!(first.values.len(), crate::mrms::staging::STAGING_POINTS);
-    let address = codes_address(&first.values);
-    pool.recycle(grid_around(first, product));
     assert_eq!(
         pool.retained_points(),
         crate::mrms::staging::STAGING_POINTS,
-        "the nominal shape is retained like any other",
+        "the nominal shape is retained like any other, and by the decode itself",
     );
+    let address = retained_address(&pool);
+    pool.recycle(grid_around(first, product));
 
     let second = parse_grib2_raw_in(&bytes, product.missing_codes(), &pool).expect("decodes");
     assert_eq!(pool.totals().reused, 1);
-    assert_eq!(codes_address(&second.values), address);
+    assert_eq!(retained_address(&pool), address);
+    assert_eq!(
+        second.values.len(),
+        crate::mrms::staging::STAGING_POINTS,
+        "with the whole mosaic in it — a decode into a pooled block pushes its \
+         own values or none",
+    );
     assert_eq!(pool.resizes(), 0, "and nothing about it is a shape change");
 }
 
-/// The address of the block a decoded grid's codes are held in — what makes
-/// "the same buffer" a claim about the allocation and not about its size.
-fn codes_address(values: &GridValues) -> usize {
-    match values {
-        GridValues::Scaled(scaled) => scaled.codes.as_ptr() as usize,
-        GridValues::F32(_) | GridValues::Bytes(_) => {
-            panic!("a pooled MRMS grid is stored as 16-bit codes")
-        }
-    }
+/// The address of the block **the slot** is holding — what makes "the same
+/// buffer" a claim about the allocation and not about its size.
+///
+/// Read off the pool rather than off a decoded grid, because the decoded grid
+/// no longer holds it: the tiler reads the plane once and hands it straight
+/// back, so the block is in the slot from the moment `parse_grib2_raw_in`
+/// returns. Through `take_retained` and `give` — the pool's own doors — with
+/// the block put back immediately, so the next decode still finds it.
+fn retained_address(pool: &crate::mrms::staging::StagingPool) -> usize {
+    let block = pool
+        .take_retained()
+        .expect("the slot is holding the decode's plane");
+    let address = block.as_ptr() as usize;
+    pool.give(block);
+    address
 }
 
 /// A one-reference [`MrmsGrid`] around a decoded [`RawGrid`] — what

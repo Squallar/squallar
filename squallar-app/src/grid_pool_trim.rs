@@ -27,6 +27,14 @@
 //!                    of leg-to-leg spread is the lightning cache above it.
 //! ```
 //!
+//! **That table is the reading it was, and its MRMS live row has since
+//! moved.** The mosaic is tiled now
+//! (`squallar_overlays::render::gridded::TiledU16`) and reads 2,350,138 to
+//! 8,943,164 B over 28 granules of both shipped products; the parked block is
+//! the decode PLANE and did not move, so it is no longer half of MRMS's share
+//! but about nine tenths of it. Everything below applies unchanged and applies
+//! harder.
+//!
 //! **Half of that family is a block nothing reads.** It is not dead — the next
 //! decode takes it — but a still leg decodes MRMS about once every two minutes,
 //! so the block is held for two minutes to save one allocation. Measured on

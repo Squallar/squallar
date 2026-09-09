@@ -44,12 +44,20 @@
 //! and [`MrmsProduct::missing_codes`] records the counts the table was measured
 //! from.
 //!
-//! **49 MB per grid.** `values` is 24.5 M `u16` codes, the width section 5
-//! actually declares; it was 24.5 M `f32` until the store followed the source.
+//! **2.4 to 8.9 MB per grid, from a 49 MB plane.** The decode still reads a
+//! plane of 24.5 M `u16` codes — the width section 5 actually declares — but
+//! that plane is scratch: [`GridValues::Tiled`] keeps only the 16x16 tiles
+//! carrying more than one code, and the plane goes straight back to
+//! [`staging`]. Measured over 28 granules of both shipped products, 8 dates
+//! from 2021-10-05 to 2026-09-08: **2,350,138 to 8,943,164 B**, against
+//! 49,000,000 flat, every point bit-identical. The corpus and the four forms it
+//! was chosen against are at
+//! [`TiledU16`](crate::render::gridded::TiledU16).
+//!
 //! The decode streams grib's lazy iterator straight into a pre-sized buffer
 //! rather than collecting an intermediate, and the cache is bounded by
 //! [`GRID_CACHE_BYTES`] rather than by an entry count — six panes at an entry
-//! cap would be 294 MB.
+//! cap would have been 294 MB at the flat store.
 
 use std::sync::Arc;
 
@@ -267,6 +275,40 @@ pub const MRMS_DOMAIN_LON: std::ops::RangeInclusive<f64> = -130.0..=-60.0;
 /// this figure follows it.
 pub const CONUS_GRID_BYTES: usize = 7000 * 3500 * crate::render::gridded::ScaledU16::ELEMENT_BYTES;
 
+/// **The most a TILED CONUS mosaic can cost resident** — every tile stored,
+/// plus the index and the prefix sum that address them.
+///
+/// The live cache is priced against this and not against what a granule
+/// actually costs, because the budget's job is a *guarantee*: below the key
+/// space `MrmsGridCache::insert` runs out of unpinned victims, takes its
+/// `break` arm and holds the entries anyway while the constant says otherwise.
+/// A ceiling read off measured granules would be exactly that under-statement,
+/// waiting for the granule that exceeded it.
+///
+/// So the ceiling barely moves — 49,496,648 B against the flat store's
+/// 49,000,000 — and **what moves is the residency**. Over 28 granules of both
+/// shipped products, 8 dates from 2021-10-05 to 2026-09-08, a tiled mosaic
+/// reads **2,349,256 to 8,942,280 B**: the cache's two entries are ~12 MB in
+/// practice under a ceiling of ~99. The gap is the point, and
+/// [`crate::render::gridded::TiledU16`] carries the corpus the shape was chosen
+/// against.
+///
+/// Derived from the tile geometry rather than stated, so a tile size that moved
+/// moves this with it: an arm of the arithmetic left behind is how
+/// `GLOBAL_GRID_BYTES` came to price four bytes a point for a one-byte store.
+pub const CONUS_TILED_CEILING_BYTES: usize = {
+    use crate::render::gridded::{MAX_NAN_CODES, TILE, TILE_CELLS, TiledU16};
+    let tiles_i = 7000usize.div_ceil(TILE);
+    let tiles_j = 3500usize.div_ceil(TILE);
+    let tiles = tiles_i * tiles_j;
+    // The arena at its worst — not one tile elided — plus the index, the
+    // prefix sum and the reserved-code list at its own bound.
+    tiles * TILE_CELLS * TiledU16::ELEMENT_BYTES
+        + tiles * size_of::<u32>()
+        + (tiles_j + 1) * size_of::<u32>()
+        + MAX_NAN_CODES * size_of::<u16>()
+};
+
 /// How many bytes of decoded MRMS grid may stay resident at once: **two grids
 /// on every arm** — never fewer than the layer has products, which the
 /// `const _` below holds as a build failure, and no more than it has products,
@@ -312,19 +354,19 @@ pub const CONUS_GRID_BYTES: usize = 7000 * 3500 * crate::render::gridded::Scaled
 /// [`GRID_HISTORY_ENTRIES`]'s. The `const _` below is what keeps every arm
 /// here.
 #[cfg(target_arch = "wasm32")]
-pub const GRID_CACHE_BYTES: usize = 2 * CONUS_GRID_BYTES;
+pub const GRID_CACHE_BYTES: usize = 2 * CONUS_TILED_CEILING_BYTES;
 /// See the wasm arm.
 #[cfg(all(
     not(target_arch = "wasm32"),
     any(target_os = "android", target_os = "ios")
 ))]
-pub const GRID_CACHE_BYTES: usize = 2 * CONUS_GRID_BYTES;
+pub const GRID_CACHE_BYTES: usize = 2 * CONUS_TILED_CEILING_BYTES;
 /// See the wasm arm.
 #[cfg(all(
     not(target_arch = "wasm32"),
     not(any(target_os = "android", target_os = "ios"))
 ))]
-pub const GRID_CACHE_BYTES: usize = 2 * CONUS_GRID_BYTES;
+pub const GRID_CACHE_BYTES: usize = 2 * CONUS_TILED_CEILING_BYTES;
 
 // **A build failure, not a test failure.** Every term here is a compile-time
 // constant, so a runtime assertion over them is one that cannot fail on a build
@@ -340,13 +382,13 @@ pub const GRID_CACHE_BYTES: usize = 2 * CONUS_GRID_BYTES;
 // takes its `break` arm, so the cache overruns the budget silently and the
 // constant under-reports what the heap is carrying. The wasm arm sat one grid
 // under this for as long as the layer had two products.
-const _: () = assert!(GRID_CACHE_BYTES >= MrmsProduct::all().len() * CONUS_GRID_BYTES);
+const _: () = assert!(GRID_CACHE_BYTES >= MrmsProduct::all().len() * CONUS_TILED_CEILING_BYTES);
 // At least one grid — implied by the key space, kept as the plainer statement.
 // (Not "or the cache settles empty": the arrival is never its own victim, so a
 // budget under one grid overruns exactly as one under the key space does.)
-const _: () = assert!(GRID_CACHE_BYTES >= CONUS_GRID_BYTES);
+const _: () = assert!(GRID_CACHE_BYTES >= CONUS_TILED_CEILING_BYTES);
 // And a whole number of grids, which is what the doc above claims.
-const _: () = assert!(GRID_CACHE_BYTES.is_multiple_of(CONUS_GRID_BYTES));
+const _: () = assert!(GRID_CACHE_BYTES.is_multiple_of(CONUS_TILED_CEILING_BYTES));
 // **The width gate, which until this commit gated nothing.** It claimed a store
 // that went back to `f32` "fails the BUILD here"; it did not, and could not.
 // The constant was `7000 * 3500 * size_of::<u16>()` — a literal width, not the
@@ -362,6 +404,11 @@ const _: () = assert!(GRID_CACHE_BYTES.is_multiple_of(CONUS_GRID_BYTES));
 // the product of it and the shape.
 const _: () = assert!(crate::render::gridded::ScaledU16::ELEMENT_BYTES == 2);
 const _: () = assert!(CONUS_GRID_BYTES == 49_000_000);
+// The tiled ceiling, pinned APART from the flat one so a build failure names
+// which moved. It is the flat plane plus 0.78 % of addressing overhead — the
+// whole of what this representation can cost above the one it replaces, and the
+// figure the "bounded worst case" claim in `TiledU16` is made of.
+const _: () = assert!(CONUS_TILED_CEILING_BYTES == 49_496_648);
 
 /// How many grids a single pane that cycles selections keeps warm — the
 /// **unpinned history** the cache retains beyond the pinned set: **none on

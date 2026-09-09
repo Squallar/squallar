@@ -14,10 +14,20 @@
 //!   meets a layer that will not enable, and the cause is an accounting error
 //!   rather than a shortage.
 //!
-//! So the door has to price the ceiling, and the ceiling has to be *attained* —
-//! a price above it is a false refusal and a price below it is a failed
-//! allocation. This suite drives one handler to that ceiling through the
-//! shipped doors and holds the door's figure against it.
+//! So the door has to price the ceiling. **What it can no longer do is meet a
+//! real granule to the byte**, and the reason is the point of the MRMS store:
+//! a tiled mosaic's bytes are a property of the *granule*, not of its point
+//! count, and over 28 granules of both shipped products they run 2,350,138 to
+//! 8,943,164 B against a ceiling of 49,496,648 — the figure a granule with no
+//! uniform tile would attain and which nothing about the format forbids. The
+//! door prices that ceiling, because the alternative is admitting a layer on a
+//! measured average and failing to allocate on the granule that exceeds it.
+//!
+//! This suite therefore holds three separate things: the door never charges
+//! LESS than a handler at its populations holds; the gap between the two is
+//! the elision and is named here in bytes; and the staging half is still
+//! attained to the byte, because a decode plane is a point count and has not
+//! moved.
 //!
 //! **Its own binary, and one test**, for the reason
 //! `overlay_grid_residency_split.rs` gives: the staging slots are
@@ -101,11 +111,20 @@ fn the_door_charges_exactly_what_a_handler_at_its_ceiling_holds() {
         .get_handler_mut(&known::MRMS)
         .expect("MRMS")
         .resident_source_bytes();
+    // **The key space is full — both products resident — and it is far under
+    // the ceiling the door prices.** The pool is already holding the plane of
+    // the second decode, so the cache's own half is the difference.
+    let parked = pool.retained_bytes() as u64;
+    let cache_grids = cache_only - parked;
     assert_eq!(
-        cache_only,
-        source_grid_budget_bytes(&known::MRMS),
-        "premise: the live cache is at the key space the door prices it at — \
-         both products resident, which is what `GRID_CACHE_BYTES` states",
+        cache_grids, 8_836_214,
+        "the two committed granules, tiled: 5,554,748 for the composite and \
+         3,281,466 for the rate. They were 98,000,000 flat",
+    );
+    assert!(
+        cache_grids < source_grid_budget_bytes(&known::MRMS),
+        "premise: the key space is under the ceiling the door prices, which is \
+         what the gap below is a measurement of",
     );
 
     // ── 2. the staged frame granule ──
@@ -128,9 +147,10 @@ fn the_door_charges_exactly_what_a_handler_at_its_ceiling_holds() {
         .resident_source_bytes();
     assert_eq!(
         with_frame - cache_only,
-        mosaic,
+        5_554_748,
         "premise: a loop frame's granule is staged beside the cache, not \
-         inside it",
+         inside it — and it is the same committed composite the cache holds, \
+         at the same tiled size",
     );
 
     // ── 3. the parked decode block ──
@@ -153,18 +173,28 @@ fn the_door_charges_exactly_what_a_handler_at_its_ceiling_holds() {
         .expect("MRMS")
         .resident_source_bytes();
     let door = source_grid_budget_bytes(&known::MRMS) + source_grid_staging_bytes(&known::MRMS);
-    assert_eq!(
-        ceiling, door,
-        "the door's price is ATTAINED, to the byte. Lowering it — dropping the \
-         parked block's half on the argument that a still session no longer \
-         holds one — under-charges by exactly that block the moment a loop of \
-         the layer runs, and an admitted layer that then cannot allocate is \
-         the failure a door exists to prevent",
+    assert!(
+        ceiling <= door,
+        "the door must never charge LESS than the handler holds: {ceiling} \
+         against {door}. Lowering it — dropping the parked block's half on the \
+         argument that a still session no longer holds one — under-charges by \
+         exactly that block the moment a loop of the layer runs, and an \
+         admitted layer that then cannot allocate is the failure a door exists \
+         to prevent",
     );
     assert_eq!(
-        ceiling, 196_000_000,
-        "and the figure, so a build that moved a grid shape says which side \
-         moved rather than only that the two still agree",
+        ceiling, 63_390_962,
+        "what THIS handler holds with all three populations non-empty: two \
+         tiled granules in the cache, one staged loop frame, and the 49 MB \
+         decode plane the pool parks. It was 196,000,000 with a flat store",
+    );
+    assert_eq!(
+        door, 196_993_296,
+        "and what the door charges: two ceiling-sized grids plus two planes. \
+         The gap to the line above is the elision — 133,602,334 B a granule \
+         with no uniform tile would take up and the shipped ones do not. It is \
+         the direction the door has to err in; a price set at what granules \
+         actually cost is one the next granule can exceed",
     );
 
     // Left as this binary found it.

@@ -1842,11 +1842,21 @@ fn the_registry_sums_what_each_handler_is_holding() {
         400,
         "and the registry's sum is the handlers' figures, not a re-derivation",
     );
+    // **Against the two process-wide slots, not against zero.** A default
+    // registry's handlers hold no decoded grid, but they read the SHIPPED
+    // staging pools, and those are process-global: a decode anywhere in this
+    // binary parks a plane in one the instant the tiler has read it, so a bare
+    // `== 0` here is a claim about which other tests ran. Stated as the sum of
+    // the two slots, it is the same property — every other registered layer
+    // takes the trait's zero, and a build that has fetched nothing holds
+    // nothing but what the pools are parking — and it is self-contained.
     assert_eq!(
         OverlayRegistry::default().resident_source_bytes(),
-        0,
+        staging::global().retained_bytes() as u64
+            + crate::gmgsi::staging::global().retained_bytes() as u64,
         "every other registered layer takes the trait's zero, so a build that \
-         has fetched nothing prices its grids at nothing",
+         has fetched nothing prices its grids at nothing beyond the blocks the \
+         two decode pools are parking",
     );
 }
 

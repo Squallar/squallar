@@ -538,13 +538,42 @@ pub fn parse_grib2_raw_in(
                 .take(points)
                 .map_err(|_| too_big(size_of::<u16>()))?;
             decode_png_codes_into(&plan, points, &mut codes)?;
-            GridValues::Scaled(ScaledU16 {
-                codes,
-                ref_val: plan.simple.ref_val,
+            // **Tiled, then the plane goes straight back to the pool.**
+            //
+            // The plane is scratch now rather than the store: `TiledU16` reads
+            // it once and keeps only the tiles that carry more than one code,
+            // which on this corpus is a fifth of the bytes and never more than
+            // the plane plus its index. What the grid holds afterwards is that,
+            // and the 49,000,000 B buffer is parked for the next granule
+            // instead of living in the cache for the life of the entry — so the
+            // slot's whole reason for existing is unchanged and there is one of
+            // it rather than one per resident grid.
+            //
+            // A grid whose shape the tiler will not take — an empty axis, or a
+            // count that is not `ni * nj`, both already refused above — keeps
+            // the flat store and the plane with it, which is the arm that was
+            // always here.
+            match crate::render::gridded::TiledU16::from_plane(
+                &codes,
+                ni,
+                nj,
+                plan.simple.ref_val,
                 two_pow,
                 dig_factor,
-                nan_codes,
-            })
+                nan_codes.clone(),
+            ) {
+                Some(tiled) => {
+                    staging.give(codes);
+                    GridValues::Tiled(tiled)
+                }
+                None => GridValues::Scaled(ScaledU16 {
+                    codes,
+                    ref_val: plan.simple.ref_val,
+                    two_pow,
+                    dig_factor,
+                    nan_codes,
+                }),
+            }
         }
         (Some(plan), None) => {
             // Streamable, but wider than the narrow arm holds. Fallible for the

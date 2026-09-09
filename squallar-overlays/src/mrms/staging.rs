@@ -286,6 +286,16 @@ impl StagingPool {
                 values: crate::render::gridded::GridValues::Scaled(scaled),
                 ..
             }) => self.give(scaled.codes),
+            // **A tiled grid has already given its plane back**, at the decode,
+            // the instant the tiler had read it — which is the whole reason the
+            // slot is one buffer rather than one per resident grid. There is
+            // nothing here to offer and nothing was refused, so this is neither
+            // a `give` nor a `decline`: counting it as either would make the
+            // shipped path read like a pool that stopped being refilled.
+            Some(crate::render::gridded::ResidentGrid {
+                values: crate::render::gridded::GridValues::Tiled(_),
+                ..
+            }) => {}
             _ => self.0.decline(),
         }
     }

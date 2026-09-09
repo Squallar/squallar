@@ -275,8 +275,13 @@ mod grid_budget_tests {
     fn a_gridded_layer_answers_its_handlers_budget_and_the_rest_answer_zero() {
         let mrms = source_grid_budget_bytes(&known::MRMS);
         assert_eq!(mrms, crate::mrms::GRID_CACHE_BYTES as u64);
-        assert!(mrms >= crate::mrms::CONUS_GRID_BYTES as u64);
-        assert_eq!(mrms % crate::mrms::CONUS_GRID_BYTES as u64, 0);
+        // **The tiled CEILING**, which is what a whole grid of this layer's
+        // shape can cost since the mosaic stopped being a flat plane. The flat
+        // figure would still divide this today — it is 99 % of it — and would
+        // go on dividing it if the ceiling stopped covering a granule, which
+        // is the failure this row is here to catch.
+        assert!(mrms >= crate::mrms::CONUS_TILED_CEILING_BYTES as u64);
+        assert_eq!(mrms % crate::mrms::CONUS_TILED_CEILING_BYTES as u64, 0);
 
         // **Measured in whole GRANULES**, not in point counts: a cache entry
         // is the codes plus the absent set beside them, and the two were one
@@ -339,10 +344,20 @@ mod grid_budget_tests {
              one clippy can see cannot fail and a reader cannot",
         );
         // The two ratios differ, which is the whole reason for a second
-        // function: `staging = budget` on MRMS, and on GMGSI the staged half
-        // is one granule of a four-granule cache while the pool half is not a
-        // fraction of that budget at all.
-        assert_eq!(mrms, source_grid_budget_bytes(&known::MRMS));
+        // function: on GMGSI the staged half is one granule of a four-granule
+        // cache while the pool half is not a fraction of that budget at all,
+        // and on MRMS the two figures are now in **different units** — the
+        // staging pair is two flat PLANES, because a decode still reads one
+        // and the frame cache still passes one through, while the cache
+        // budget is two TILED grids. They were equal while both were the flat
+        // plane, and a reader who took that for a rule would be reading a
+        // coincidence.
+        assert_ne!(mrms, source_grid_budget_bytes(&known::MRMS));
+        assert_eq!(
+            mrms,
+            2 * crate::mrms::CONUS_GRID_BYTES as u64,
+            "the staging pair is planes, and a plane is what a decode reads",
+        );
         assert_eq!(
             gmgsi::GLOBAL_GRANULE_BYTES as u64 * 4,
             source_grid_budget_bytes(&known::GMGSI),

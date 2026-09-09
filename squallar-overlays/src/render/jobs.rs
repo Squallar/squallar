@@ -855,9 +855,20 @@ impl JobSpec for GriddedJob {
         // **In the store's own width**, which is what the head has just
         // named. Both arms write exactly what is reserved here.
         let repr = WireValues::of(input, &win);
-        out.reserve(win.area().saturating_mul(repr.bytes_per_sample()));
+        out.reserve(repr.payload_len(win.area()).unwrap_or(0));
         match repr {
             WireValues::F32 => input.for_each_window_row(&win, |row| encode_f32s(out, row)),
+            // **The band's arena, lent from the store and copied once.** Not
+            // `for_each_window_row_raw`: this store's rows are not runs of its
+            // bytes, and the tag beside this has already named the band the
+            // arena run belongs to.
+            WireValues::Tiled { .. } => {
+                if let crate::render::gridded::ValuesRef::Tiled(t) = input.values_ref()
+                    && let Some((_, _, range)) = t.band_for(win.j0, win.j1)
+                {
+                    out.extend_from_slice(bytemuck::cast_slice(&t.arena()[range]));
+                }
+            }
             // **No expansion and no scratch.** This runs inside
             // `JobRequest::to_bytes` on the FRAME THREAD, so a per-row
             // widening buffer here would spend the footprint win on frame
@@ -875,7 +886,7 @@ impl JobSpec for GriddedJob {
         // The values length is the window's own area **in the tag's width** —
         // no second count on the wire to disagree with it, and `take` refuses
         // a buffer shorter than the area claims before anything allocates.
-        let values = repr.values_from(r.take(win.area().checked_mul(repr.bytes_per_sample())?)?)?;
+        let values = repr.values_from(r.take(repr.payload_len(win.area())?)?, ni)?;
         Some((
             GriddedInput::Window(GridWindow {
                 field,
@@ -927,6 +938,23 @@ impl JobSpec for GriddedJob {
         // grid's own allocation, so a narrower store simply lends half as
         // many bytes — the transport never learns what a sample is.
         let bps = input.values_ref().bytes_per_sample();
+        // **The tiled store lends its ARENA, cut to the window's tile rows.**
+        // Slots are handed out in tile-scan order, so those tiles are one
+        // unbroken run — the same property the flat stores get from rows
+        // sitting end to end, one level down. A window this store does not
+        // reach lends nothing rather than a range it would have to invent.
+        if let crate::render::gridded::ValuesRef::Tiled(t) = input.values_ref() {
+            let GriddedInput::Resident(grid) = input else {
+                return None;
+            };
+            let (_, _, range) = t.band_for(win.j0, win.j1)?;
+            return Some(ResidentBytes::of_range(
+                std::sync::Arc::clone(grid),
+                |g| g.values.stored_bytes(),
+                range.start * bps,
+                range.len() * bps,
+            ));
+        }
         let start = win.j0.saturating_mul(ni).saturating_mul(bps);
         let len = win
             .j1
@@ -982,6 +1010,27 @@ impl JobSpec for GriddedJob {
         // **The width comes from the head's own tag**, never from a hardcoded
         // four: the same head that named the window named the store's width,
         // so the two cannot drift apart.
+        // **The tiled arm's band is not cut here.** Its payload is the arena
+        // run the head's index names — no rows to walk, no columns to copy —
+        // and the store keeps the grid's own numbering, so the window below is
+        // the one the raster iterates and nothing about it is rebased.
+        if matches!(repr, WireValues::Tiled { .. }) {
+            if payload.len() != repr.payload_len(win.area())? {
+                return None;
+            }
+            let values = repr.values_from(payload, ni)?;
+            return Some((
+                GriddedInput::Window(GridWindow {
+                    field,
+                    ni,
+                    nj,
+                    coords,
+                    win,
+                    values,
+                }),
+                geo,
+            ));
+        }
         let bps = repr.bytes_per_sample();
         if payload.len()
             != win
@@ -1003,7 +1052,7 @@ impl JobSpec for GriddedJob {
             let end = ((j - win.j0) * ni + win.i1) * bps;
             cut.extend_from_slice(payload.get(start..end)?);
         }
-        let values = repr.values_from(&cut)?;
+        let values = repr.values_from(&cut, ni)?;
         Some((
             GriddedInput::Window(GridWindow {
                 field,
@@ -1058,6 +1107,32 @@ enum WireValues {
         /// Indices into the window's own values, ascending.
         absent: Vec<u32>,
     },
+    /// **The tiled 16-bit store, cut to whole tile ROWS.**
+    ///
+    /// The one arm whose payload is not `win.area()` samples: a uniform tile
+    /// carries no samples at all, so the length is what this index names and
+    /// nothing else can state it. The index rides here for the same reason the
+    /// byte arm's absent set does — it is the fact a payload of bare codes
+    /// cannot carry — and it is what keeps the payload a **lend** rather than a
+    /// widening on the frame thread.
+    ///
+    /// Cut in rows and not in columns because that is the cut the arena can
+    /// serve without a copy: slots are handed out in tile-scan order, so the
+    /// tiles of a row band are one unbroken run. The columns are still cut —
+    /// by the window the head names, which the raster iterates — they are just
+    /// not cut out of the bytes.
+    Tiled {
+        ref_val: f32,
+        two_pow: f32,
+        dig_factor: f32,
+        nan_codes: Vec<u16>,
+        /// The band's first grid row. A multiple of `gridded::TILE`.
+        origin_j: u32,
+        /// Grid rows the band covers.
+        rows: u32,
+        /// The band's tile index, every slot rebased to the band's own arena.
+        index: Vec<u32>,
+    },
 }
 
 /// Values tag: one `f32` a point.
@@ -1066,6 +1141,16 @@ const WIRE_VALUES_F32: u8 = 0;
 const WIRE_VALUES_SCALED_U16: u8 = 1;
 /// Values tag: one byte a point, plus the window's absent points.
 const WIRE_VALUES_BYTES: u8 = 2;
+/// Values tag: the tiled 16-bit store, a band of whole tile rows.
+const WIRE_VALUES_TILED_U16: u8 = 3;
+
+/// **How many tile index entries a head may name.**
+///
+/// The band is at most the whole grid, and the grid this store serves is
+/// 7000 x 3500. A bound rather than a trust because `decode` allocates against
+/// this count before a byte of payload is read, and a head is bytes from
+/// another build.
+const MAX_TILE_INDEX: usize = 1 << 22;
 
 impl WireValues {
     /// **From the input and the window the head is naming**, never from the
@@ -1085,6 +1170,48 @@ impl WireValues {
             crate::render::gridded::ValuesRef::Bytes(_) => Self::Bytes {
                 absent: input.absent_in_window(win),
             },
+            crate::render::gridded::ValuesRef::Tiled(t) => {
+                // The band the window falls in, or — for a window this store
+                // does not reach — an empty one, which the length check at the
+                // far end then refuses rather than drawing a short band.
+                let (tj0, tj1) = t
+                    .band_for(win.j0, win.j1)
+                    .map_or((0, 0), |(tj0, tj1, _)| (tj0, tj1));
+                let origin_j = t.origin_j() + tj0 * crate::render::gridded::TILE;
+                let rows = (t.origin_j() + t.nj())
+                    .saturating_sub(origin_j)
+                    .min(tj1.saturating_sub(tj0) * crate::render::gridded::TILE);
+                Self::Tiled {
+                    ref_val: t.ref_val,
+                    two_pow: t.two_pow,
+                    dig_factor: t.dig_factor,
+                    nan_codes: t.nan_codes.clone(),
+                    origin_j: origin_j as u32,
+                    rows: rows as u32,
+                    index: t.band_index(tj0, tj1),
+                }
+            }
+        }
+    }
+
+    /// **The payload this tag describes, in bytes** — `None` for a tag whose
+    /// own arithmetic overflows.
+    ///
+    /// The flat arms are the window's area in their own width. The tiled arm is
+    /// the slots its index names, which is the whole point: a form whose bytes
+    /// are not a function of its point count cannot have its length restated
+    /// anywhere else without the two coming apart.
+    fn payload_len(&self, area: usize) -> Option<usize> {
+        match self {
+            Self::Tiled { index, .. } => index
+                .iter()
+                .filter(|&&e| e & (1 << 31) == 0)
+                .count()
+                .checked_mul(crate::render::gridded::TILE_CELLS)?
+                .checked_mul(self.bytes_per_sample()),
+            Self::F32 | Self::ScaledU16 { .. } | Self::Bytes { .. } => {
+                area.checked_mul(self.bytes_per_sample())
+            }
         }
     }
 
@@ -1096,6 +1223,7 @@ impl WireValues {
             Self::F32 => SampleKind::F32,
             Self::ScaledU16 { .. } => SampleKind::ScaledU16,
             Self::Bytes { .. } => SampleKind::Bytes,
+            Self::Tiled { .. } => SampleKind::TiledU16,
         }
     }
 
@@ -1140,6 +1268,31 @@ impl WireValues {
                     out.extend_from_slice(&index.to_le_bytes());
                 }
             }
+            Self::Tiled {
+                ref_val,
+                two_pow,
+                dig_factor,
+                nan_codes,
+                origin_j,
+                rows,
+                index,
+            } => {
+                out.push(WIRE_VALUES_TILED_U16);
+                out.extend_from_slice(&ref_val.to_le_bytes());
+                out.extend_from_slice(&two_pow.to_le_bytes());
+                out.extend_from_slice(&dig_factor.to_le_bytes());
+                out.push(nan_codes.len() as u8);
+                for code in nan_codes {
+                    out.extend_from_slice(&code.to_le_bytes());
+                }
+                out.extend_from_slice(&origin_j.to_le_bytes());
+                out.extend_from_slice(&rows.to_le_bytes());
+                out.extend_from_slice(&(index.len() as u32).to_le_bytes());
+                // One copy of the whole index rather than an entry at a time:
+                // this runs inside `JobRequest::to_bytes` on the FRAME THREAD,
+                // and the band of a full-CONUS pane is 95,922 entries.
+                out.extend_from_slice(bytemuck::cast_slice(index));
+            }
         }
     }
 
@@ -1181,6 +1334,42 @@ impl WireValues {
                 }
                 Some(Self::Bytes { absent })
             }
+            WIRE_VALUES_TILED_U16 => {
+                let ref_val = r.f32()?;
+                let two_pow = r.f32()?;
+                let dig_factor = r.f32()?;
+                let count = usize::from(r.u8()?);
+                if count > crate::render::gridded::MAX_NAN_CODES {
+                    return None;
+                }
+                let mut nan_codes = Vec::with_capacity(count);
+                for _ in 0..count {
+                    nan_codes.push(r.u16()?);
+                }
+                let origin_j = r.u32()?;
+                let rows = r.u32()?;
+                let entries = r.u32()? as usize;
+                // Bounded BEFORE the reservation: the count is a number from
+                // another build's head, and `with_capacity` of it would be an
+                // infallible allocation of whatever it says.
+                if entries > MAX_TILE_INDEX {
+                    return None;
+                }
+                let bytes = r.take(entries.checked_mul(size_of::<u32>())?)?;
+                let index = bytes
+                    .chunks_exact(size_of::<u32>())
+                    .map(|c| u32::from_le_bytes(c.try_into().expect("`chunks_exact` yields four")))
+                    .collect();
+                Some(Self::Tiled {
+                    ref_val,
+                    two_pow,
+                    dig_factor,
+                    nan_codes,
+                    origin_j,
+                    rows,
+                    index,
+                })
+            }
             _ => None,
         }
     }
@@ -1192,7 +1381,7 @@ impl WireValues {
     /// alignment at all, so a cast would refuse on exactly the platforms this
     /// path exists for. The bytes are the same either way — the wire is
     /// little-endian by the assertion beside [`encode_f32s`].
-    fn values_from(&self, bytes: &[u8]) -> Option<crate::render::gridded::GridValues> {
+    fn values_from(&self, bytes: &[u8], ni: usize) -> Option<crate::render::gridded::GridValues> {
         use crate::render::gridded::{ByteCodes, GridValues, ScaledU16};
         if !bytes.len().is_multiple_of(self.bytes_per_sample()) {
             return None;
@@ -1231,6 +1420,38 @@ impl WireValues {
             Self::Bytes { absent } => {
                 ByteCodes::new(bytes.to_vec(), absent.clone()).map(GridValues::Bytes)
             }
+            // `TiledU16::from_band` is the refusal, and it is a real one: it
+            // holds the index, the arena length and the tile shape against each
+            // other, so a head describing an arena laid out differently from
+            // the one it lent is answered `None` here rather than sampled at
+            // the wrong tile.
+            Self::Tiled {
+                ref_val,
+                two_pow,
+                dig_factor,
+                nan_codes,
+                origin_j,
+                rows,
+                index,
+            } => crate::render::gridded::TiledU16::from_band(
+                ni,
+                *rows as usize,
+                *origin_j as usize,
+                index.clone(),
+                bytes
+                    .chunks_exact(crate::render::gridded::TiledU16::ELEMENT_BYTES)
+                    .map(|c| {
+                        crate::render::gridded::ScaledCode::from_le_bytes(
+                            c.try_into().expect("`chunks_exact` yields ELEMENT_BYTES"),
+                        )
+                    })
+                    .collect(),
+                *ref_val,
+                *two_pow,
+                *dig_factor,
+                nan_codes.clone(),
+            )
+            .map(GridValues::Tiled),
         }
     }
 }
@@ -2704,6 +2925,140 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **A tiled grid crosses the wire as a band of tile ROWS, and every point
+    /// of the window reads back bit for bit.**
+    ///
+    /// The MRMS twin of [`a_lent_band_is_read_back_at_the_width_it_was_lent`]
+    /// for the store that replaced its flat one, and it has to be its own test
+    /// because nothing about the shape is the same: the payload is not
+    /// `win.area()` samples, the far end does not cut columns out of it, and
+    /// the store keeps the grid's own numbering rather than the window's. A
+    /// band read as a flat plane would be off by whatever the elided tiles
+    /// would have occupied — every point wrong, nothing short, nothing refused.
+    ///
+    /// The window is INTERIOR on both axes on purpose: a band starting at row
+    /// zero would have every slot number already correct, so a rebasing error
+    /// would read green.
+    #[test]
+    fn a_tiled_grid_crosses_the_wire_as_a_band_of_tile_rows() {
+        use crate::hrrr::GridCoords;
+        use crate::render::gridded::{GridValues, ResidentGrid, TILE, TiledU16};
+        use squallar_source::job::EncodeCtx;
+
+        // Not a multiple of `TILE` on either axis, so the padded edge tiles are
+        // in the band this crosses.
+        let (ni, nj) = (101usize, 67usize);
+        // Whole uniform tiles beside tiles where every point differs: a plane
+        // of one code would cross as an empty arena and prove nothing about the
+        // samples, and a plane of all-distinct codes would elide no tile and
+        // prove nothing about the index.
+        let plane: Vec<u16> = (0..ni * nj)
+            .map(|k| {
+                let (i, j) = (k % ni, k / ni);
+                if (i / TILE + j / TILE).is_multiple_of(2) {
+                    9000
+                } else {
+                    (k % 60_000) as u16
+                }
+            })
+            .collect();
+        let tiled = TiledU16::from_plane(&plane, ni, nj, -9990.0, 1.0, 0.1, vec![0, 9000])
+            .expect("a plane of the shape beside it tiles");
+        let page = GridValues::Tiled(tiled.clone());
+        assert!(
+            page.resident_bytes() < ni * nj * 2,
+            "premise: tiles were actually elided, so the payload below is not \
+             simply the plane under another name",
+        );
+
+        let coords = GridCoords::Regular {
+            lat0: 30.0,
+            lon0: -100.0,
+            dlat: 0.5,
+            dlon: 0.5,
+            ni,
+            nj,
+            scan_mode: 0,
+        };
+        let field = crate::render::gridded::paint_for_code("vis")
+            .expect("this build registers the `vis` field")
+            .id
+            .clone();
+        let sender = GriddedInput::Resident(std::sync::Arc::new(ResidentGrid {
+            field,
+            ni,
+            nj,
+            coords,
+            values: page.clone(),
+        }));
+
+        let geo = JobGeometry {
+            width: 64,
+            height: 64,
+            bounds: squallar_geo::GeoBounds {
+                min_lat: 40.0,
+                max_lat: 48.0,
+                min_lon: -92.0,
+                max_lon: -84.0,
+            },
+            side_ceiling_px: 0,
+        };
+        let ctx = EncodeCtx { geometry: geo };
+        let win = sender.window_for(
+            &ctx.geometry.bounds,
+            ctx.geometry.width,
+            ctx.geometry.height,
+        );
+        assert!(
+            win.j0 > 0 && win.j1 < nj && win.i0 > 0 && win.i1 < ni,
+            "this test needs an INTERIOR window ({}..{} x {}..{} of {ni}x{nj})",
+            win.i0,
+            win.i1,
+            win.j0,
+            win.j1,
+        );
+
+        let payload = <GriddedJob as JobSpec>::resident_payload(&sender, &ctx)
+            .expect("a tiled grid lends its band");
+        let mut head = Vec::new();
+        <GriddedJob as JobSpec>::encode_resident_head(&sender, &ctx, &mut head);
+
+        let mut r = Reader::new(&head);
+        let (input, _) = <GriddedJob as JobSpec>::decode_resident(&mut r, geo, payload.bytes())
+            .expect("the band the lend just cut is the band the head names");
+        let GriddedInput::Window(window) = &input else {
+            panic!("a lent grid decodes to a window");
+        };
+        assert!(
+            matches!(window.values, GridValues::Tiled(_)),
+            "a tiled band must not be read back as a plane",
+        );
+
+        // Every point of the window, through the door the raster reads —
+        // `value_at`, which is where a store that numbered its band from the
+        // window's corner instead of the grid's would go wrong.
+        for j in win.j0..win.j1 {
+            for i in win.i0..win.i1 {
+                let far = input.value_at(i, j).expect("inside the window");
+                let here = page.get(j * ni + i).expect("inside the grid");
+                assert_eq!(
+                    far.to_bits(),
+                    here.to_bits(),
+                    "point ({i}, {j}) read back as {far} where the page holds {here}",
+                );
+            }
+        }
+
+        // And the band really is smaller than the rows a flat store would have
+        // lent — the reason the arm exists at all.
+        assert!(
+            payload.bytes().len() < (win.j1 - win.j0) * ni * 2,
+            "the tiled band lent {} B where the flat rows would have lent {}",
+            payload.bytes().len(),
+            (win.j1 - win.j0) * ni * 2,
+        );
     }
 
     /// **A byte grid crosses the whole wire at one byte a point, absent points

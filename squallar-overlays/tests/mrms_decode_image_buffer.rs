@@ -48,20 +48,26 @@ use std::cell::Cell;
 use squallar_overlays::mrms::{MrmsProduct, decode, staging};
 use squallar_overlays::render::gridded::GridValues;
 
-/// The staged buffer back out of a decoded grid, so the pool can retain it.
+/// **The decode returned its plane to the pool itself.**
 ///
-/// Panics on the `f32` arm rather than declining quietly: the pool's slot is a
-/// `Vec<u16>` and only the narrow arm's buffer can go back into it, so a
-/// shipped granule that stopped taking that arm would leave the pool cold and
-/// this measurement "warm" in name only.
-fn staged(values: GridValues) -> Vec<u16> {
-    match values {
-        GridValues::Scaled(scaled) => scaled.codes,
-        GridValues::F32(_) | GridValues::Bytes(_) => panic!(
-            "premise: a shipped MRMS granule decodes to 16-bit codes; this one \
-             fell to another arm and can never be staged through the pool",
-        ),
-    }
+/// Panics on any other arm rather than declining quietly: the pool's slot is a
+/// `Vec<u16>` and only the narrow arm's plane goes into it, so a shipped
+/// granule that stopped taking that arm would leave the pool cold and this
+/// measurement "warm" in name only. The tiler reads the plane once and hands it
+/// straight back, which is why nothing is given here — and asserting the slot
+/// is holding it is the honest replacement for the `give` that used to be.
+fn assert_plane_is_parked(values: &GridValues, pool: &staging::StagingPool) {
+    assert!(
+        matches!(values, GridValues::Tiled(_)),
+        "premise: a shipped MRMS granule decodes to tiled 16-bit codes; this \
+         one fell to another arm and can never be staged through the pool",
+    );
+    assert_eq!(
+        pool.retained_points(),
+        values.len(),
+        "the decode must hand its plane back to the slot, or the next one \
+         allocates a fresh 49 MB block and this measurement is of a cold pool",
+    );
 }
 
 /// See the header: a gap, not a bound anything sits near.
@@ -184,7 +190,7 @@ fn a_warm_decode_takes_no_grid_sized_block() {
         // cannot tell its own reuse from another test's leftovers.
         let pool = staging::StagingPool::new();
         let warm = decode::parse_grib2_raw_in(&grib, missing, &pool).expect("warm-up decodes");
-        pool.give(staged(warm.values));
+        assert_plane_is_parked(&warm.values, &pool);
         assert_eq!(
             pool.totals().allocated,
             1,
@@ -230,7 +236,7 @@ fn a_warm_decode_takes_no_grid_sized_block() {
             product.as_str(),
         );
 
-        pool.give(staged(raw.values));
+        assert_plane_is_parked(&raw.values, &pool);
     }
 }
 

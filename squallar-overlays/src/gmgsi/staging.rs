@@ -73,7 +73,10 @@ pub fn recycle(pool: &StagingPool, grid: ResidentGrid) {
         // never comes from here. Counted rather than silently dropped, for the
         // same reason `give` reports a wrong capacity: a slot that stops being
         // refilled must say so rather than read like a slot nobody used.
-        GridValues::F32(_) | GridValues::Scaled(_) => pool.decline(),
+        // `Tiled` is MRMS's store and never GMGSI's, for the same reason
+        // `Scaled` is not: the byte arm has no affine and no tile index, and a
+        // grid that arrived in one of them did not come from this decode.
+        GridValues::F32(_) | GridValues::Scaled(_) | GridValues::Tiled(_) => pool.decline(),
     }
 }
 

@@ -2602,9 +2602,9 @@ impl GriddedInput {
     /// a walk of at most `MAX_NAN_CODES` reserved codes — strictly less than
     /// the `partition_point` the `color_for_value` on the next line already
     /// pays. Nothing here allocates.
-    fn value_at(&self, i: usize, j: usize) -> Option<f32> {
+    pub(crate) fn value_at(&self, i: usize, j: usize) -> Option<f32> {
         if let Some((values, stride)) = self.whole_values() {
-            return values.get(j * stride + i);
+            return values.grid_value(i, j, stride);
         }
         let Self::Window(window) = self else {
             return None;
@@ -2613,9 +2613,11 @@ impl GriddedInput {
         if i < win.i0 || i >= win.i1 || j < win.j0 || j >= win.j1 {
             return None;
         }
-        window
-            .values
-            .get((j - win.j0) * (win.i1 - win.i0) + (i - win.i0))
+        // **Through the store**, not through one flat index computed here: a
+        // tiled band is cut in whole tile rows and keeps the grid's own
+        // numbering, where the flat stores are cut column by column and are
+        // numbered from the window's corner. See `ValuesRef::window_value`.
+        window.values.view().window_value(i, j, win)
     }
 
     /// One row of `win`'s values as `f32`; the whole arm pads with NaN where
@@ -2690,7 +2692,9 @@ impl GriddedInput {
         let (absent, i0, j0, stride) = match self {
             Self::Resident(grid) => match grid.values.view() {
                 ValuesRef::Bytes(b) => (b.absent(), 0, 0, grid.ni),
-                ValuesRef::F32(_) | ValuesRef::Scaled(_) => return Vec::new(),
+                ValuesRef::F32(_) | ValuesRef::Scaled(_) | ValuesRef::Tiled(_) => {
+                    return Vec::new();
+                }
             },
             Self::Window(window) => match window.values.view() {
                 ValuesRef::Bytes(b) => (
@@ -2699,7 +2703,9 @@ impl GriddedInput {
                     window.win.j0,
                     window.win.i1.saturating_sub(window.win.i0),
                 ),
-                ValuesRef::F32(_) | ValuesRef::Scaled(_) => return Vec::new(),
+                ValuesRef::F32(_) | ValuesRef::Scaled(_) | ValuesRef::Tiled(_) => {
+                    return Vec::new();
+                }
             },
             Self::Whole(_) => return Vec::new(),
         };

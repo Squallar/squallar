@@ -304,3 +304,246 @@ fn a_byte_store_widens_exactly_and_prices_both_of_its_blocks() {
         "and what the transport lends is the codes alone",
     );
 }
+
+// ── The tiled store ─────────────────────────────────────────────────────────
+
+/// A plane whose tiles are a deliberate mix: whole tiles of one code (the two
+/// sentinels a real mosaic is mostly made of), tiles with one point different,
+/// and tiles where every point differs.
+///
+/// **Not a multiple of [`TILE`] on either axis.** The edge tiles are the shape
+/// a padded slot has to get right, and a grid that divided evenly would leave
+/// every padding read unreached.
+fn mixed_plane(ni: usize, nj: usize) -> Vec<ScaledCode> {
+    let mut plane = vec![0u16; ni * nj];
+    for j in 0..nj {
+        for i in 0..ni {
+            let (ti, tj) = (i / TILE, j / TILE);
+            plane[j * ni + i] = match (ti + tj) % 4 {
+                // The no-coverage sentinel, whole tiles of it.
+                0 => 0,
+                // The no-echo sentinel.
+                1 => 9000,
+                // One point off an otherwise uniform tile.
+                2 => {
+                    if i % TILE == 3 && j % TILE == 5 {
+                        12_345
+                    } else {
+                        9000
+                    }
+                }
+                // Every point its own code.
+                _ => ((j * ni + i) % 60_000) as u16,
+            };
+        }
+    }
+    plane
+}
+
+fn flat_of(plane: Vec<ScaledCode>) -> ScaledU16 {
+    ScaledU16 {
+        codes: plane,
+        ref_val: -9990.0,
+        two_pow: 1.0,
+        dig_factor: 0.1,
+        nan_codes: vec![0, 9000],
+    }
+}
+
+fn tiled_of(plane: &[ScaledCode], ni: usize, nj: usize) -> TiledU16 {
+    TiledU16::from_plane(plane, ni, nj, -9990.0, 1.0, 0.1, vec![0, 9000])
+        .expect("a plane of the shape beside it tiles")
+}
+
+/// **Every point, bit for bit, against the flat store it replaces** — the whole
+/// claim the representation is allowed to make.
+///
+/// `to_bits`, not `==`: the two sentinels read back as `NaN`, and `NaN == NaN`
+/// is false, so an equality comparison would pass over a store that had lost
+/// every reserved point and turned it into a different `NaN`.
+#[test]
+fn a_tiled_store_reads_back_every_point_of_a_plane_bit_for_bit() {
+    let (ni, nj) = (101usize, 67usize);
+    let plane = mixed_plane(ni, nj);
+    let flat = flat_of(plane.clone());
+    let tiled = tiled_of(&plane, ni, nj);
+
+    assert_eq!(tiled.len(), ni * nj);
+    let mut nans = 0usize;
+    for k in 0..ni * nj {
+        let here = flat.get(k).expect("inside the flat store");
+        let there = tiled.get(k).expect("inside the tiled store");
+        assert_eq!(
+            here.to_bits(),
+            there.to_bits(),
+            "point {k} (i={}, j={}) reads {there} where the plane holds {here}",
+            k % ni,
+            k / ni,
+        );
+        if here.is_nan() {
+            nans += 1;
+        }
+        // And by grid coordinates, which is the door the raster reads through.
+        assert_eq!(
+            tiled
+                .get_grid(k % ni, k / ni)
+                .expect("inside the grid")
+                .to_bits(),
+            here.to_bits(),
+        );
+    }
+    assert!(
+        nans > ni * nj / 4,
+        "premise: the plane must really carry reserved codes, or the `to_bits` \
+         comparison above never reached its NaN arm ({nans} of {})",
+        ni * nj,
+    );
+    assert_eq!(tiled.get(ni * nj), None, "one past the end is not a point");
+    assert_eq!(tiled.get_grid(ni, 0), None, "and neither is one past a row");
+}
+
+/// **The elision is where the bytes go**, and it is measured against the plane
+/// rather than asserted as a ratio: a store that elided nothing would satisfy
+/// every equality above.
+#[test]
+fn a_tiled_store_holds_only_the_tiles_that_carry_more_than_one_code() {
+    let (ni, nj) = (101usize, 67usize);
+    let plane = mixed_plane(ni, nj);
+    let tiled = tiled_of(&plane, ni, nj);
+    let flat = flat_of(plane.clone()).codes.len() * ScaledU16::ELEMENT_BYTES;
+    assert!(
+        tiled.resident_bytes() < flat,
+        "{} is not under the {flat} B plane it replaces",
+        tiled.resident_bytes(),
+    );
+
+    // A plane of one code anywhere is index, prefix sum and reserved codes and
+    // nothing else — the shape a mosaic's ocean is made of.
+    let empty = TiledU16::from_plane(&vec![0u16; ni * nj], ni, nj, -9990.0, 1.0, 0.1, vec![0])
+        .expect("tiles");
+    let tiles = ni.div_ceil(TILE) * nj.div_ceil(TILE);
+    assert_eq!(
+        empty.resident_bytes(),
+        tiles * size_of::<u32>() + (nj.div_ceil(TILE) + 1) * size_of::<u32>() + 2,
+        "a uniform plane must hold no arena at all",
+    );
+    assert_eq!(empty.arena().len(), 0);
+
+    // **And the worst case is bounded.** Every tile distinct: the arena is the
+    // plane rounded up to whole slots, and the overhead above it is the index.
+    let all_distinct: Vec<u16> = (0..(ni * nj) as u32).map(|k| (k % 65_536) as u16).collect();
+    let worst =
+        TiledU16::from_plane(&all_distinct, ni, nj, -9990.0, 1.0, 0.1, vec![]).expect("tiles");
+    assert_eq!(worst.arena().len(), tiles * TILE_CELLS);
+    assert_eq!(
+        worst.resident_bytes(),
+        tiles * TILE_CELLS * TiledU16::ELEMENT_BYTES
+            + tiles * size_of::<u32>()
+            + (nj.div_ceil(TILE) + 1) * size_of::<u32>(),
+        "the ceiling every budget stated in `CONUS_TILED_CEILING_BYTES` is \
+         derived from — a granule may reach it and may not pass it",
+    );
+}
+
+/// **A row band is one unbroken run of the arena**, which is the property the
+/// wire's zero-copy lend rests on, and it rebuilds into a store that answers
+/// the band's points in the grid's own numbering.
+#[test]
+fn a_row_band_is_contiguous_and_rebuilds_to_the_same_values() {
+    let (ni, nj) = (101usize, 67usize);
+    let plane = mixed_plane(ni, nj);
+    let flat = flat_of(plane.clone());
+    let tiled = tiled_of(&plane, ni, nj);
+
+    // An INTERIOR band: one starting at row zero is the shape that masks a
+    // rebasing error, because every slot number would already be right.
+    let (j0, j1) = (20usize, 50usize);
+    let (tj0, tj1, range) = tiled.band_for(j0, j1).expect("a band inside the grid");
+    assert!(
+        tj0 > 0,
+        "premise: the band must not start at the first tile row"
+    );
+    assert!(!range.is_empty(), "premise: it must carry stored tiles");
+
+    let band = TiledU16::from_band(
+        ni,
+        (tj1 - tj0) * TILE,
+        tj0 * TILE,
+        tiled.band_index(tj0, tj1),
+        tiled.arena()[range].to_vec(),
+        tiled.ref_val,
+        tiled.two_pow,
+        tiled.dig_factor,
+        tiled.nan_codes.clone(),
+    )
+    .expect("the band the lend cut is the band the index names");
+
+    for j in tj0 * TILE..(tj1 * TILE).min(nj) {
+        for i in 0..ni {
+            let here = flat.get(j * ni + i).expect("inside the plane");
+            let there = band.get_grid(i, j).expect("inside the band");
+            assert_eq!(
+                here.to_bits(),
+                there.to_bits(),
+                "band point ({i}, {j}) reads {there} where the plane holds {here}",
+            );
+        }
+    }
+    assert_eq!(
+        band.get_grid(0, tj0 * TILE - 1),
+        None,
+        "and the band answers nothing for a row it does not carry",
+    );
+}
+
+/// **A band whose index does not describe the arena beside it is refused**, not
+/// sampled at whatever tile the arithmetic lands on.
+#[test]
+fn a_band_index_that_does_not_match_its_arena_is_refused() {
+    let (ni, nj) = (101usize, 67usize);
+    let plane = mixed_plane(ni, nj);
+    let tiled = tiled_of(&plane, ni, nj);
+    let (tj0, tj1, range) = tiled.band_for(20, 50).expect("a band");
+    let index = tiled.band_index(tj0, tj1);
+    let arena = tiled.arena()[range].to_vec();
+    let rows = (tj1 - tj0) * TILE;
+    let build = |index: Vec<u32>, arena: Vec<u16>| {
+        TiledU16::from_band(
+            ni,
+            rows,
+            tj0 * TILE,
+            index,
+            arena,
+            tiled.ref_val,
+            tiled.two_pow,
+            tiled.dig_factor,
+            tiled.nan_codes.clone(),
+        )
+    };
+    assert!(
+        build(index.clone(), arena.clone()).is_some(),
+        "premise: the untampered pair builds, so every refusal below is the \
+         tamper and not the fixture",
+    );
+
+    // Two stored tiles swapped: the arena is the right length and every entry
+    // is in range, so nothing but the ORDER is wrong — which is the failure a
+    // lenient read turns into a band drawn from another band's rows.
+    let mut swapped = index.clone();
+    let stored: Vec<usize> = swapped
+        .iter()
+        .enumerate()
+        .filter(|&(_, &e)| e & (1 << 31) == 0)
+        .map(|(k, _)| k)
+        .collect();
+    assert!(stored.len() >= 2, "premise: two tiles to swap");
+    swapped.swap(stored[0], stored[1]);
+    assert!(build(swapped, arena.clone()).is_none());
+
+    // An arena one slot short of what the index names.
+    assert!(build(index.clone(), arena[..arena.len() - TILE_CELLS].to_vec()).is_none());
+    // An arena that is not a whole number of slots.
+    assert!(build(index.clone(), arena[..arena.len() - 1].to_vec()).is_none());
+    // An index of the wrong length for the shape beside it.
+    assert!(build(index[..index.len() - 1].to_vec(), arena).is_none());
+}

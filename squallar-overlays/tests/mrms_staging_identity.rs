@@ -59,15 +59,21 @@ fn poisoned_mosaic() -> Vec<u16> {
     vec![POISON_CODE; staging::STAGING_POINTS]
 }
 
-/// The stored codes of a granule that took the narrow arm.
+/// Whether any point of a granule that took the narrow arm holds `code`.
 ///
 /// Panics on [`GridValues::F32`], which is itself part of the premise: the pool
-/// is a `Vec<u16>` slot and only the narrow arm's buffer can round-trip through
-/// it, so a shipped product that stopped taking that arm must fail here loudly
-/// rather than turn this whole gate into a test of the unpooled path.
-fn codes(grid: &MrmsGrid) -> &[u16] {
+/// is a `Vec<u16>` slot and only the narrow arm's plane goes through it, so a
+/// shipped product that stopped taking that arm must fail here loudly rather
+/// than turn this whole gate into a test of the unpooled path.
+///
+/// A predicate rather than the codes themselves, because the narrow arm no
+/// longer holds a plane to lend: the tiler reads one and gives it back, and
+/// what the grid keeps is tiles. The question this file asks of it is the same
+/// one either way.
+fn carries(grid: &MrmsGrid, code: u16) -> bool {
     match &grid.grid.values {
-        GridValues::Scaled(scaled) => &scaled.codes,
+        GridValues::Scaled(scaled) => scaled.codes.contains(&code),
+        GridValues::Tiled(tiled) => tiled.contains_code(code),
         GridValues::F32(_) | GridValues::Bytes(_) => panic!(
             "premise: a shipped MRMS granule decodes to 16-bit codes; this one \
              fell to another arm, so it can never be staged through the pool",
@@ -81,7 +87,7 @@ fn codes(grid: &MrmsGrid) -> &[u16] {
 fn no_cold_mosaic_carries_the_poison_code(a: &MrmsGrid, b: &MrmsGrid) {
     for (name, grid) in [("composite", a), ("rate", b)] {
         assert!(
-            !codes(grid).contains(&POISON_CODE),
+            !carries(grid, POISON_CODE),
             "premise: the {name} mosaic carries code {POISON_CODE:#06x} itself, \
              so poison surviving at those points would read as the real \
              granule; pick another code",

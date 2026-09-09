@@ -68,6 +68,10 @@ pub enum GridValues {
     Scaled(ScaledU16),
     /// One byte a point, read back as the byte's own value.
     Bytes(ByteCodes),
+    /// The same 16-bit codes, **tiled**, with a tile that carries one code
+    /// carrying it in its index entry and no samples at all. See [`TiledU16`]
+    /// for the corpus the shape was chosen against.
+    Tiled(TiledU16),
 }
 
 /// The element [`ScaledU16`] stores one of a point.
@@ -98,6 +102,10 @@ pub enum SampleKind {
     F32,
     ScaledU16,
     Bytes,
+    /// The tiled 16-bit store. Its width is one ARENA sample: the store's byte
+    /// total is not `points * width` — see [`TiledU16::resident_bytes`] — but
+    /// every length on the wire is still a count of samples times this.
+    TiledU16,
 }
 
 impl SampleKind {
@@ -115,6 +123,7 @@ impl SampleKind {
             Self::F32 => size_of::<f32>(),
             Self::ScaledU16 => ScaledU16::ELEMENT_BYTES,
             Self::Bytes => ByteCodes::ELEMENT_BYTES,
+            Self::TiledU16 => TiledU16::ELEMENT_BYTES,
         }
     }
 }
@@ -126,6 +135,7 @@ impl SampleKind {
 const _: () = assert!(SampleKind::F32.bytes_per_sample() == 4);
 const _: () = assert!(SampleKind::ScaledU16.bytes_per_sample() == 2);
 const _: () = assert!(SampleKind::Bytes.bytes_per_sample() == 1);
+const _: () = assert!(SampleKind::TiledU16.bytes_per_sample() == 2);
 
 /// **A byte a point, and the points that carry no reading.**
 ///
@@ -363,6 +373,444 @@ impl ScaledU16 {
     }
 }
 
+/// **Tile side, in points, on both axes.**
+///
+/// Chosen against the corpus rather than by taste: 28 granules of both shipped
+/// products spanning 2021-10-05 to 2026-09-08, priced at 8, 16 and 32 with this
+/// same fixed-slot layout. 16 holds the lowest bytes on 24 of the 28 and the
+/// lowest mean; 8 is 7 % better on the single densest granule and 1.5 MB worse
+/// in index alone on every one; 32 is 20-30 % worse throughout. See
+/// [`TiledU16`].
+pub const TILE: usize = 16;
+
+/// Points one stored tile holds — the fixed slot width every offset in
+/// [`TiledU16`] is a multiple of, and what makes a tile-row band of the arena a
+/// contiguous byte range.
+pub const TILE_CELLS: usize = TILE * TILE;
+
+/// The index entry's discriminant bit: set means the low 16 bits are the tile's
+/// one code, clear means they are its slot in the arena.
+///
+/// The top bit rather than a side vector because the entry is read on the
+/// sampling path: a slot number needs 25 bits at the largest grid this store
+/// will hold (24.5 M points is 95,704 tiles) and a code needs 16, so one `u32`
+/// carries either with room to spare and the test is a single `and`.
+const TILE_UNIFORM: u32 = 1 << 31;
+
+/// **GRIB2 simple packing, kept packed AND kept sparse.**
+///
+/// The same `(ref_val + code * two_pow) * dig_factor` [`ScaledU16`] evaluates,
+/// over the same operands in the same order — this store changes *where a code
+/// lives*, never what it decodes to.
+///
+/// # What it stores
+///
+/// The grid is cut into [`TILE`]x[`TILE`] tiles, row-major. A tile whose points
+/// all carry one code keeps that code in its index entry and **no arena space
+/// at all**; any other tile takes one fixed [`TILE_CELLS`]-sample slot. Edge
+/// tiles take a whole slot too, padded, so every offset is `slot * TILE_CELLS`
+/// and no second table is needed to find one.
+///
+/// # Why tiles and not the three other shapes
+///
+/// Measured over 28 granules — both shipped products, 8 dates from 2021-10-05
+/// to 2026-09-08, chosen off the bucket's own object sizes so the densest and
+/// the emptiest granules of each day are in the set. Drawable points run from
+/// **0.83 % to 8.02 %** of the mosaic across it, so a form is judged at its
+/// worst granule, not its typical one:
+///
+/// | form | worst granule | emptiest granule |
+/// |---|---|---|
+/// | the flat `ScaledU16` | 49,000,000 B | 49,000,000 B |
+/// | index + code per drawable point | **97,459,950 B** | 2,735,064 B |
+/// | present-bitmap + packed codes | **35,740,558 B** | 4,165,596 B |
+/// | run-length along rows | 8,648,472 B | 694,300 B |
+/// | **this** | **8,942,280 B** | 2,349,256 B |
+///
+/// The two sparse forms **lose to the flat store** on the precipitation rate
+/// and it is not close: rate `0.0` is a *reading*, not a sentinel, so 66 % of
+/// that mosaic's points are ones a sparse form must carry. That is the whole
+/// case against choosing on "4 % of points are drawable" — the drawable
+/// fraction is not the fraction a representation has to hold.
+///
+/// Row RLE prices within 3 % of this at the worst granule and beats it on the
+/// empty ones. It is not taken for two reasons that are both about the *other*
+/// consumers: a point lookup becomes a search of its row's runs (618 runs a row
+/// at the worst granule measured, so ~10 dependent loads) where this is two,
+/// and it is the raster's per-cell reader as well as hover's; and its worst
+/// case is unbounded above the flat store — a checkerboard row costs 4 B a
+/// point — where this one cannot exceed the flat store by more than its index,
+/// **0.78 %**, whatever arrives.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TiledU16 {
+    /// Points along a parallel — the FULL grid's width. A band cut for the wire
+    /// narrows rows, never columns.
+    ni: usize,
+    /// Rows this store covers, starting at [`Self::origin_j`].
+    nj: usize,
+    /// The grid row [`Self::nj`] starts at. Zero for a whole grid; a multiple of
+    /// [`TILE`] for a band.
+    origin_j: usize,
+    tiles_i: usize,
+    tiles_j: usize,
+    /// One entry per tile, row-major over tiles. See [`TILE_UNIFORM`].
+    index: Vec<u32>,
+    /// The stored tiles, [`TILE_CELLS`] samples each, in tile-scan order — so
+    /// the tiles of rows `tj0..tj1` are one unbroken run, which is what lets a
+    /// band be LENT rather than copied.
+    arena: Vec<ScaledCode>,
+    /// Slots stored before each tile row, `tiles_j + 1` entries. The prefix sum
+    /// that turns a row band into that run.
+    row_slot: Vec<u32>,
+    pub ref_val: f32,
+    /// `2^exp` — section 5's binary scale, pre-raised.
+    pub two_pow: f32,
+    /// `10^-dec` — section 5's decimal scale, pre-raised and negated.
+    pub dig_factor: f32,
+    /// Every code that reads back as `NaN`. [`ScaledU16::nan_codes`] carries the
+    /// reasoning; this store holds the same list because it decodes codes the
+    /// same way.
+    pub nan_codes: Vec<u16>,
+}
+
+impl TiledU16 {
+    /// **Bytes one stored sample occupies** — the arena's own element, the
+    /// width [`SampleKind::TiledU16`] prices and every wire length is built
+    /// from.
+    pub const ELEMENT_BYTES: usize = size_of::<ScaledCode>();
+
+    /// Tile the whole plane `codes`, which must be `ni * nj` row-major samples.
+    ///
+    /// `None` for a plane whose length is not the shape beside it — the same
+    /// refusal `parse_grib2_raw_in` already makes, restated here because this
+    /// is the one place the two are read against each other.
+    pub fn from_plane(
+        codes: &[ScaledCode],
+        ni: usize,
+        nj: usize,
+        ref_val: f32,
+        two_pow: f32,
+        dig_factor: f32,
+        nan_codes: Vec<u16>,
+    ) -> Option<Self> {
+        if ni == 0 || nj == 0 || codes.len() != ni.checked_mul(nj)? {
+            return None;
+        }
+        let tiles_i = ni.div_ceil(TILE);
+        let tiles_j = nj.div_ceil(TILE);
+        // **Two passes, so the arena is one exact allocation.** Growing it from
+        // empty would double ~20 times to a multi-megabyte block, which is the
+        // large-block churn `mrms::decode`'s header exists to keep off a wasm32
+        // heap that only grows — and every one of those growths would be an
+        // infallible reserve on a target where an allocation failure aborts
+        // without unwinding. The first pass reads the plane and decides each
+        // tile; the second copies only the tiles that are kept.
+        let mut index: Vec<u32> = Vec::new();
+        index.try_reserve_exact(tiles_i * tiles_j).ok()?;
+        let mut row_slot: Vec<u32> = Vec::new();
+        row_slot.try_reserve_exact(tiles_j + 1).ok()?;
+        let uniform_at = |ti: usize, tj: usize| -> Option<ScaledCode> {
+            let (j0, j1) = (tj * TILE, ((tj + 1) * TILE).min(nj));
+            let (i0, i1) = (ti * TILE, ((ti + 1) * TILE).min(ni));
+            let first = codes[j0 * ni + i0];
+            (j0..j1)
+                .all(|j| codes[j * ni + i0..j * ni + i1].iter().all(|&c| c == first))
+                .then_some(first)
+        };
+        let mut slots = 0usize;
+        for tj in 0..tiles_j {
+            row_slot.push(u32::try_from(slots).ok()?);
+            for ti in 0..tiles_i {
+                match uniform_at(ti, tj) {
+                    Some(first) => index.push(TILE_UNIFORM | u32::from(first)),
+                    None => {
+                        index.push(u32::try_from(slots).ok()?);
+                        slots += 1;
+                    }
+                }
+            }
+        }
+        row_slot.push(u32::try_from(slots).ok()?);
+
+        let mut arena: Vec<ScaledCode> = Vec::new();
+        arena
+            .try_reserve_exact(slots.checked_mul(TILE_CELLS)?)
+            .ok()?;
+        for tj in 0..tiles_j {
+            let (j0, j1) = (tj * TILE, ((tj + 1) * TILE).min(nj));
+            for ti in 0..tiles_i {
+                if index[tj * tiles_i + ti] & TILE_UNIFORM != 0 {
+                    continue;
+                }
+                let (i0, i1) = (ti * TILE, ((ti + 1) * TILE).min(ni));
+                // The padding is the tile's first code rather than zero: a
+                // padded cell is never read back — `get` bounds-checks against
+                // the grid — and writing a code that is already in the tile
+                // keeps the slot's own byte range free of a value the source
+                // never published, which is what a wire reader would otherwise
+                // see in a hexdump and have to be told to ignore.
+                let slot = arena.len();
+                arena.resize(slot + TILE_CELLS, codes[j0 * ni + i0]);
+                for j in j0..j1 {
+                    let src = &codes[j * ni + i0..j * ni + i1];
+                    let dst = slot + (j - j0) * TILE;
+                    arena[dst..dst + src.len()].copy_from_slice(src);
+                }
+            }
+        }
+        debug_assert_eq!(arena.len(), slots * TILE_CELLS);
+        Some(Self {
+            ni,
+            nj,
+            origin_j: 0,
+            tiles_i,
+            tiles_j,
+            index,
+            arena,
+            row_slot,
+            ref_val,
+            two_pow,
+            dig_factor,
+            nan_codes,
+        })
+    }
+
+    /// A band's store, built at the far end of the wire from the index rows the
+    /// head carried and the arena run the payload lent.
+    ///
+    /// Every refusal here is a head this build cannot honour rather than a
+    /// panic: the length has to be the slots the index names, every non-uniform
+    /// entry has to point inside them, and the shape has to be the one the
+    /// tile counts describe. A head that fails any of them leaves the pane its
+    /// last texture — the posture `ByteCodes::new` already takes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_band(
+        ni: usize,
+        nj: usize,
+        origin_j: usize,
+        index: Vec<u32>,
+        arena: Vec<ScaledCode>,
+        ref_val: f32,
+        two_pow: f32,
+        dig_factor: f32,
+        nan_codes: Vec<u16>,
+    ) -> Option<Self> {
+        if ni == 0 || nj == 0 {
+            return None;
+        }
+        let tiles_i = ni.div_ceil(TILE);
+        let tiles_j = nj.div_ceil(TILE);
+        if index.len() != tiles_i.checked_mul(tiles_j)? {
+            return None;
+        }
+        if !arena.len().is_multiple_of(TILE_CELLS) {
+            return None;
+        }
+        let slots = arena.len() / TILE_CELLS;
+        let mut stored = 0usize;
+        let mut row_slot = Vec::with_capacity(tiles_j + 1);
+        for tj in 0..tiles_j {
+            row_slot.push(u32::try_from(stored).ok()?);
+            for entry in &index[tj * tiles_i..(tj + 1) * tiles_i] {
+                if entry & TILE_UNIFORM != 0 {
+                    // A uniform entry's payload is a 16-bit code, so nothing
+                    // above the low half may be set beside the flag: an entry
+                    // that carries more is not one this build wrote.
+                    if entry & !(TILE_UNIFORM | 0xffff) != 0 {
+                        return None;
+                    }
+                    continue;
+                }
+                // Slots are handed out in tile-scan order, so the run is
+                // dense and checked as such: an entry naming any slot but the
+                // next one describes an arena laid out differently from the
+                // one this reads, and a lenient read would sample another
+                // tile's rows with nothing to say so.
+                if *entry as usize != stored {
+                    return None;
+                }
+                stored += 1;
+            }
+        }
+        row_slot.push(u32::try_from(stored).ok()?);
+        if stored != slots {
+            return None;
+        }
+        Some(Self {
+            ni,
+            nj,
+            origin_j,
+            tiles_i,
+            tiles_j,
+            index,
+            arena,
+            row_slot,
+            ref_val,
+            two_pow,
+            dig_factor,
+            nan_codes,
+        })
+    }
+
+    /// Points along a parallel — the full grid's width.
+    #[inline]
+    pub fn ni(&self) -> usize {
+        self.ni
+    }
+
+    /// Rows this store covers.
+    #[inline]
+    pub fn nj(&self) -> usize {
+        self.nj
+    }
+
+    /// The grid row this store's first row is.
+    #[inline]
+    pub fn origin_j(&self) -> usize {
+        self.origin_j
+    }
+
+    /// The tile index, row-major over tiles.
+    #[inline]
+    pub fn index(&self) -> &[u32] {
+        &self.index
+    }
+
+    /// The stored tiles, unwidened — what the transport lends and the wire
+    /// writes.
+    #[inline]
+    pub fn arena(&self) -> &[ScaledCode] {
+        &self.arena
+    }
+
+    /// **The stored code at `(i, j)` in this store's own row space**, or `None`
+    /// outside it.
+    ///
+    /// Two dependent loads and no branch on a search: the tile's entry, then —
+    /// only when the tile is not uniform — the sample. `TILE` is a power of two,
+    /// so every division here is a shift.
+    #[inline]
+    pub fn code_at(&self, i: usize, j: usize) -> Option<ScaledCode> {
+        if i >= self.ni || j >= self.nj {
+            return None;
+        }
+        let entry = *self.index.get((j / TILE) * self.tiles_i + i / TILE)?;
+        if entry & TILE_UNIFORM != 0 {
+            return Some(entry as ScaledCode);
+        }
+        self.arena
+            .get(entry as usize * TILE_CELLS + (j % TILE) * TILE + i % TILE)
+            .copied()
+    }
+
+    /// One code read back as the value it stands for — [`ScaledU16::value`]'s
+    /// body over this store's own operands.
+    #[inline]
+    pub fn value(&self, code: ScaledCode) -> f32 {
+        if self.nan_codes.contains(&code) {
+            return f32::NAN;
+        }
+        (self.ref_val + f32::from(code) * self.two_pow) * self.dig_factor
+    }
+
+    /// The value at a flat index in this store's own `ni * nj` space.
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<f32> {
+        if index >= self.len() {
+            return None;
+        }
+        self.code_at(index % self.ni, index / self.ni)
+            .map(|c| self.value(c))
+    }
+
+    /// The value at a point in the **whole grid's** coordinates, or `None` for
+    /// one this store does not cover.
+    ///
+    /// What a band answers through: a cut store keeps the grid's own numbering
+    /// rather than rebasing it, so the raster asks the same question of a whole
+    /// grid and of a band.
+    #[inline]
+    pub fn get_grid(&self, i: usize, j: usize) -> Option<f32> {
+        self.code_at(i, j.checked_sub(self.origin_j)?)
+            .map(|c| self.value(c))
+    }
+
+    /// Points this store covers.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.ni * self.nj
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// **What this store costs resident**, every block of it — the arena, the
+    /// index and the prefix sum. Never `len() * ELEMENT_BYTES`: that is the
+    /// figure this store exists to be smaller than.
+    #[inline]
+    pub fn resident_bytes(&self) -> usize {
+        size_of_val(self.arena.as_slice())
+            + size_of_val(self.index.as_slice())
+            + size_of_val(self.row_slot.as_slice())
+            + size_of_val(self.nan_codes.as_slice())
+    }
+
+    /// **Whether any point of this store holds `code`.**
+    ///
+    /// Exact rather than approximate over the padding: a padded cell is filled
+    /// with a code its own tile already carries, so a hit inside one is a hit
+    /// at a real point of that tile.
+    pub fn contains_code(&self, code: ScaledCode) -> bool {
+        self.arena.contains(&code)
+            || self
+                .index
+                .iter()
+                .any(|&e| e & TILE_UNIFORM != 0 && e as ScaledCode == code)
+    }
+
+    /// **The tile rows spanning grid rows `j0..j1`**, as the half-open tile-row
+    /// interval and the arena's own sample range for it.
+    ///
+    /// The range is contiguous because slots are handed out in tile-scan order;
+    /// that is the property the zero-copy lend rests on, and
+    /// [`Self::from_band`] refuses an arena laid out any other way.
+    pub fn band_for(&self, j0: usize, j1: usize) -> Option<(usize, usize, std::ops::Range<usize>)> {
+        if j1 <= j0 {
+            return None;
+        }
+        let tj0 = j0.checked_sub(self.origin_j)? / TILE;
+        let tj1 = j1
+            .saturating_sub(self.origin_j)
+            .div_ceil(TILE)
+            .min(self.tiles_j);
+        if tj1 <= tj0 {
+            return None;
+        }
+        let slot0 = *self.row_slot.get(tj0)? as usize;
+        let slot1 = *self.row_slot.get(tj1)? as usize;
+        Some((tj0, tj1, slot0 * TILE_CELLS..slot1 * TILE_CELLS))
+    }
+
+    /// The index entries of tile rows `tj0..tj1`, with every slot rebased to
+    /// the band's own arena — the head's half of what [`Self::from_band`] reads
+    /// back.
+    pub fn band_index(&self, tj0: usize, tj1: usize) -> Vec<u32> {
+        let base = self.row_slot.get(tj0).copied().unwrap_or(0);
+        self.index[tj0 * self.tiles_i..tj1 * self.tiles_i]
+            .iter()
+            .map(|&entry| {
+                if entry & TILE_UNIFORM != 0 {
+                    entry
+                } else {
+                    entry - base
+                }
+            })
+            .collect()
+    }
+}
+
 impl GridValues {
     #[inline]
     pub fn len(&self) -> usize {
@@ -370,6 +818,7 @@ impl GridValues {
             Self::F32(v) => v.len(),
             Self::Scaled(s) => s.codes.len(),
             Self::Bytes(b) => b.codes.len(),
+            Self::Tiled(t) => t.len(),
         }
     }
 
@@ -385,6 +834,7 @@ impl GridValues {
             Self::F32(v) => v.get(index).copied(),
             Self::Scaled(s) => s.get(index),
             Self::Bytes(b) => b.get(index),
+            Self::Tiled(t) => t.get(index),
         }
     }
 
@@ -395,6 +845,7 @@ impl GridValues {
             Self::F32(_) => SampleKind::F32,
             Self::Scaled(_) => SampleKind::ScaledU16,
             Self::Bytes(_) => SampleKind::Bytes,
+            Self::Tiled(_) => SampleKind::TiledU16,
         }
     }
 
@@ -420,11 +871,17 @@ impl GridValues {
         // codes alone would let a cache hold more than it believes it does —
         // the same misreading a store that narrowed while this did not would
         // produce. It is at most `MAX_ABSENT_POINTS * 4` = 256 B.
-        self.len() * self.bytes_per_sample()
-            + match self {
-                Self::Bytes(b) => size_of_val(b.absent.as_slice()),
-                Self::F32(_) | Self::Scaled(_) => 0,
+        match self {
+            // **Not `points * width`.** A tiled store's whole reason to exist
+            // is that the two are no longer the same number, and a census that
+            // priced it by the point count would report the flat figure for a
+            // store holding a fifth of it.
+            Self::Tiled(t) => t.resident_bytes(),
+            Self::Bytes(b) => {
+                self.len() * self.bytes_per_sample() + size_of_val(b.absent.as_slice())
             }
+            Self::F32(_) | Self::Scaled(_) => self.len() * self.bytes_per_sample(),
+        }
     }
 
     /// Every value in order — for the passes that read a whole grid once and
@@ -452,6 +909,14 @@ impl GridValues {
             // and is missing all the same — so a walk over the codes alone
             // could not tell the two apart.
             Self::Bytes(b) => GridValuesIter::Bytes { bytes: b, next: 0 },
+            // By index for the same reason the byte arm is: on this store a
+            // value is a function of WHERE it sits, because a uniform tile
+            // holds one code standing for up to 256 points.
+            Self::Tiled(t) => GridValuesIter::Tiled {
+                tiled: t,
+                i: 0,
+                j: 0,
+            },
         }
     }
 
@@ -475,6 +940,17 @@ impl GridValues {
             }
             Self::Bytes(b) => crate::hrrr::summarize_values_iter(
                 (0..b.codes.len()).map(|k| b.get(k).unwrap_or(f32::NAN)),
+                paints,
+            ),
+            // **By row and column, never by flat index.** `get` splits a flat
+            // index with a division and a remainder by a runtime `ni`, and
+            // this walks 24.5 M points on the fetch path — the pass
+            // `parse_grib2` runs before a granule is handed over. Walking the
+            // two coordinates it already has costs neither.
+            Self::Tiled(t) => crate::hrrr::summarize_values_iter(
+                (0..t.nj()).flat_map(|j| {
+                    (0..t.ni()).map(move |i| t.code_at(i, j).map_or(f32::NAN, |c| t.value(c)))
+                }),
                 paints,
             ),
         }
@@ -505,6 +981,11 @@ impl GridValues {
             // indices is not a range of samples. It rides the head instead,
             // cut to the window — see `jobs::WireValues`.
             Self::Bytes(b) => &b.codes,
+            // The ARENA, which is not a plane: it is meaningless without the
+            // index beside it, and the index rides the head. Nothing may read
+            // this as `points * width` bytes of samples — `sample_bytes`
+            // refuses the flat cut for exactly that reason.
+            Self::Tiled(t) => bytemuck::cast_slice(t.arena()),
         }
     }
 
@@ -514,6 +995,7 @@ impl GridValues {
             Self::F32(v) => ValuesRef::F32(v),
             Self::Scaled(s) => ValuesRef::Scaled(s),
             Self::Bytes(b) => ValuesRef::Bytes(b),
+            Self::Tiled(t) => ValuesRef::Tiled(t),
         }
     }
 }
@@ -527,6 +1009,7 @@ pub enum ValuesRef<'a> {
     F32(&'a [f32]),
     Scaled(&'a ScaledU16),
     Bytes(&'a ByteCodes),
+    Tiled(&'a TiledU16),
 }
 
 impl<'a> ValuesRef<'a> {
@@ -536,6 +1019,7 @@ impl<'a> ValuesRef<'a> {
             Self::F32(v) => v.len(),
             Self::Scaled(s) => s.codes.len(),
             Self::Bytes(b) => b.codes.len(),
+            Self::Tiled(t) => t.len(),
         }
     }
 
@@ -550,6 +1034,48 @@ impl<'a> ValuesRef<'a> {
             Self::F32(v) => v.get(index).copied(),
             Self::Scaled(s) => s.get(index),
             Self::Bytes(b) => b.get(index),
+            Self::Tiled(t) => t.get(index),
+        }
+    }
+
+    /// **The value at grid point `(i, j)` of a store held WHOLE**, given the
+    /// row stride.
+    ///
+    /// The flat stores multiply back out to their own flat index; the tiled one
+    /// is addressed by tile and offset, and asking it for a flat index would
+    /// make it divide the product straight back apart — two divisions by a
+    /// runtime stride on the raster's per-cell reader. Measured over the
+    /// 28-granule corpus, a row-major window sweep: 2.24 ns a point flat and
+    /// 2.61 ns tiled through this door.
+    #[inline]
+    pub fn grid_value(self, i: usize, j: usize, stride: usize) -> Option<f32> {
+        match self {
+            Self::Tiled(t) => t.get_grid(i, j),
+            Self::F32(_) | Self::Scaled(_) | Self::Bytes(_) => self.get(j * stride + i),
+        }
+    }
+
+    /// **The value at a point in the WHOLE GRID's coordinates**, given the
+    /// window this store was cut to.
+    ///
+    /// The flat stores are cut column by column, so their own index space is
+    /// the window's; the tiled store is cut in whole tile rows and keeps the
+    /// grid's numbering. Asking each store where a grid point lives — rather
+    /// than computing one flat index for all of them — is what lets a tiled
+    /// band be lent uncut while the raster still iterates only the window the
+    /// head named.
+    #[inline]
+    pub fn window_value(
+        self,
+        i: usize,
+        j: usize,
+        win: &crate::render::rasterize::IndexWindow,
+    ) -> Option<f32> {
+        match self {
+            Self::Tiled(t) => t.get_grid(i, j),
+            Self::F32(_) | Self::Scaled(_) | Self::Bytes(_) => {
+                self.get((j - win.j0) * (win.i1 - win.i0) + (i - win.i0))
+            }
         }
     }
 
@@ -560,6 +1086,7 @@ impl<'a> ValuesRef<'a> {
             Self::F32(_) => SampleKind::F32,
             Self::Scaled(_) => SampleKind::ScaledU16,
             Self::Bytes(_) => SampleKind::Bytes,
+            Self::Tiled(_) => SampleKind::TiledU16,
         }
     }
 
@@ -580,6 +1107,12 @@ impl<'a> ValuesRef<'a> {
             Self::F32(v) => v.get(range).map(bytemuck::cast_slice),
             Self::Scaled(s) => s.codes.get(range).map(bytemuck::cast_slice),
             Self::Bytes(b) => b.codes.get(range),
+            // **Refused, never approximated.** A flat run of points is not a
+            // run of this store's bytes: the arena holds tiles, and a uniform
+            // tile holds no samples at all. Every caller of this treats `None`
+            // as "write nothing", and the tiled arm's own wire path is taken
+            // before any of them is reached.
+            Self::Tiled(_) => None,
         }
     }
 }
@@ -849,6 +1382,15 @@ pub enum GridValuesIter<'a> {
         bytes: &'a ByteCodes,
         next: usize,
     },
+    Tiled {
+        tiled: &'a TiledU16,
+        /// The next point, as a **coordinate pair** rather than a flat index:
+        /// this store is addressed by tile and offset, and a flat index would
+        /// be divided straight back apart once a point over a 24.5 M-point
+        /// walk.
+        i: usize,
+        j: usize,
+    },
 }
 
 impl Iterator for GridValuesIter<'_> {
@@ -864,6 +1406,15 @@ impl Iterator for GridValuesIter<'_> {
                 *next += 1;
                 Some(value)
             }
+            Self::Tiled { tiled, i, j } => {
+                let value = tiled.code_at(*i, *j).map(|c| tiled.value(c))?;
+                *i += 1;
+                if *i == tiled.ni() {
+                    *i = 0;
+                    *j += 1;
+                }
+                Some(value)
+            }
         }
     }
 
@@ -874,6 +1425,11 @@ impl Iterator for GridValuesIter<'_> {
             Self::Scaled { codes, .. } => codes.size_hint(),
             Self::Bytes { bytes, next } => {
                 let left = bytes.codes.len() - next.min(&bytes.codes.len());
+                (left, Some(left))
+            }
+            Self::Tiled { tiled, i, j } => {
+                let done = (*j * tiled.ni() + *i).min(tiled.len());
+                let left = tiled.len() - done;
                 (left, Some(left))
             }
         }

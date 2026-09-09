@@ -27,7 +27,9 @@
 //! The one figure that decomposes uniquely is the `huge` leg's FIRST sample,
 //! at t+0.001 s: **56,620,748 = 49,000,000 + 7,620,748**, one MRMS mosaic plus
 //! one HRRR grid (its values plus the 184 B of `HrrrGridData`), to the byte.
-//! That is the anchor every unit price below is checked against.
+//! That is the anchor every unit price below is checked against — and it is a
+//! reading of the FLAT store. The mosaic term is 5,554,748 B on this tree; the
+//! decomposition above is kept as the measurement it was, not re-derived.
 //!
 //! **The settled figures do not.** A search over `a` mosaics, `b` HRRR grids,
 //! `c` GMGSI granules and a GLM remainder finds several exact fits for each of
@@ -73,56 +75,78 @@ fn at(h: u32, m: u32) -> chrono::NaiveDateTime {
         .expect("a real time")
 }
 
-/// **Three holders, one mosaic each, and the census family is their sum.**
+/// **Three holders, and they are no longer one mosaic each.**
 ///
-/// Each step below adds exactly one mosaic and the assertion after it names
-/// the holder that took it. The three are, in the order a playing loop fills
-/// them:
+/// The three, in the order a playing loop fills them:
 ///
 /// 1. `MrmsHandler::cached_grids` — the live mosaic of the pane's selected
-///    product. **Live**: `hover_value_at` reads values out of it and
+///    product, **tiled**. **Live**: `hover_value_at` reads values out of it and
 ///    `prepare_job` re-rasterizes from it on every pan, zoom and product
 ///    change.
-/// 2. `MrmsHandler::frame_grids` — one loop frame's staged granule, bounded at
-///    `FRAME_STAGING_BYTES` (one mosaic) however many frames the loop holds.
-/// 3. `mrms::staging::global()` — the buffer the pool parks between decodes.
-///    **Nothing reads it.** It exists to remove an allocation, and its only
-///    release is `SourceHandler::release_data`, which fires when no pane draws
-///    the layer.
+/// 2. `MrmsHandler::frame_grids` — one loop frame's staged granule, tiled the
+///    same way, one at a time however many frames the loop holds.
+/// 3. `mrms::staging::global()` — the **plane** the pool parks between decodes,
+///    which is still 24.5 M `u16` and still 49,000,000 B: the decoder reads a
+///    granule into one and the tiler reads it back out. **Nothing else reads
+///    it**, and its only release is `SourceHandler::release_data`, which fires
+///    when no pane draws the layer.
+///
+/// So the family is now `2 x granule + 1 plane` where it was `3 x mosaic`, and
+/// the granule is the term that moved: 5,554,748 B for the committed composite
+/// against the 49,000,000 it used to be. The plane did not move and is now
+/// **81 % of what one looping pane holds** — the largest single term left, and
+/// the one a governor can take without trading anything a pane is drawing.
 ///
 /// Floor — delete any one of the three terms from
 /// `MrmsHandler::resident_source_bytes`: that step's delta reads 0 and the
-/// total lands a mosaic short.
+/// total lands short by that term.
 #[test]
-fn the_overlay_grid_family_is_three_named_mosaics() {
-    let mosaic = squallar_overlays::mrms::CONUS_GRID_BYTES as u64;
+fn the_overlay_grid_family_is_two_granules_and_a_plane() {
+    let plane = squallar_overlays::mrms::CONUS_GRID_BYTES as u64;
     assert_eq!(
-        mosaic, 49_000_000,
-        "the denominator this whole suite is written in",
+        plane, 49_000_000,
+        "the decode plane, which the tiled store did not move",
     );
+    /// The committed 2026-08-21 composite, tiled. Pinned here as well as at
+    /// `mrms::decode::tests` so a granule that stopped being elided fails in
+    /// the census suite that would then be reporting the wrong family.
+    const GRANULE: u64 = 5_554_748;
 
     let mut registry = OverlayRegistry::default();
     let pane = PaneRef::bare(0);
 
+    // **The shipped slot is process-global**, and this binary's own decodes
+    // fill it, so the level every delta below is measured from is one this
+    // test set rather than one it inherited.
+    squallar_overlays::staging::release_all_retained();
     assert_eq!(
         registry.resident_source_bytes(),
         0,
-        "premise: a fresh registry holds no decoded source at all. A non-zero \
-         here is another handler answering, and every delta below would be \
-         measured against it",
+        "premise: a fresh registry with the pools emptied holds no decoded \
+         source at all. A non-zero here is another handler answering, and \
+         every delta below would be measured against it",
     );
 
-    // ── 1. the live cache ────────────────────────────────────────────────
+    // ── 1. the live cache, and the plane the decode parks ────────────────
     registry
         .get_handler_mut(&known::MRMS)
         .expect("the shipped registry carries MRMS")
         .apply_fetch_result(Box::new(MrmsFetchResult(Ok(decode_granule()))), &pane);
     let after_live = registry.resident_source_bytes();
     assert_eq!(
-        after_live, mosaic,
-        "one live granule is one mosaic in the family: the pane's carry and \
-         the cache entry are the SAME allocation, so a figure of two here \
-         would be `resident_source_bytes` double-counting the carry",
+        squallar_overlays::mrms::staging::global().retained_bytes() as u64,
+        plane,
+        "the decode hands its plane back the instant the tiler has read it, \
+         so the pool is warm from the FIRST granule rather than from the \
+         first eviction",
+    );
+    assert_eq!(
+        after_live,
+        GRANULE + plane,
+        "one live granule is one TILED mosaic plus the plane it was read out \
+         of: the pane's carry and the cache entry are the same allocation, so \
+         a figure of two granules here would be `resident_source_bytes` \
+         double-counting the carry",
     );
 
     // ── 2. the loop frame's staged granule ───────────────────────────────
@@ -142,55 +166,45 @@ fn the_overlay_grid_family_is_three_named_mosaics() {
     let after_frame = registry.resident_source_bytes();
     assert_eq!(
         after_frame - after_live,
-        mosaic,
-        "a staged loop granule is a SECOND mosaic beside the live one — the \
-         frame store is not the live cache and a frame is never drawn from it",
+        GRANULE,
+        "a staged loop granule is a SECOND tiled mosaic beside the live one — \
+         the frame store is not the live cache and a frame is never drawn \
+         from it",
     );
-
-    // ── 3. the pool's parked buffer ──────────────────────────────────────
-    // Through the pool's own door, which is what `MrmsGridCache::insert` and
-    // `MrmsFrameCache::insert` call when they displace a granule.
-    squallar_overlays::mrms::staging::global().recycle(decode_granule());
     assert_eq!(
         squallar_overlays::mrms::staging::global().retained_bytes() as u64,
-        mosaic,
-        "premise: the shipped slot took the offered buffer",
-    );
-    let after_park = registry.resident_source_bytes();
-    assert_eq!(
-        after_park - after_frame,
-        mosaic,
-        "the parked buffer is a THIRD mosaic, and it is in the census family \
-         because it is on the heap — `resident_source_bytes` reads \
-         `staging.retained_bytes()` for exactly this reason",
+        plane,
+        "and it is NOT a second plane: the slot held one and the second decode \
+         was handed it back",
     );
 
     assert_eq!(
-        after_park,
-        3 * mosaic,
-        "the steady state of one pane looping one MRMS product is three \
-         mosaics — 147,000,000 B, against the 155.8 to 219.0 MB the wasm32 \
-         page reads for this whole family on the Tier-2 legs. One layer's \
-         three stores account for most of a family that four layers publish \
-         into",
+        after_frame,
+        2 * GRANULE + plane,
+        "the steady state of one pane looping one MRMS product is two tiled \
+         granules and one plane — 60,109,496 B, against 147,000,000 with the \
+         flat store and against the 155.8 to 219.0 MB the wasm32 page reads \
+         for this whole family on the Tier-2 legs",
     );
+    assert_eq!(after_frame, 60_109_496);
 
     // ── What the pressure lever can give back, and what it cannot ────────
-    // Nothing reads the parked buffer, so it is the one of the three a
-    // memory governor may take without trading anything a pane is drawing.
+    // Nothing reads the parked plane, so it is the one of the three a memory
+    // governor may take without trading anything a pane is drawing — and it is
+    // now four fifths of the total rather than one third of it.
     assert_eq!(
         squallar_overlays::staging::release_all_retained(),
-        mosaic,
-        "the crate-wide release must find the parked mosaic and price it — a \
+        plane,
+        "the crate-wide release must find the parked plane and price it — a \
          zero here is a lever that ran and gave nothing back, which reads \
          exactly like one nothing called",
     );
     assert_eq!(
         registry.resident_source_bytes(),
-        2 * mosaic,
-        "releasing the pools takes the family back to the two mosaics a pane \
-         is actually using — one third of it, freed with nothing refetched \
-         and nothing redrawn",
+        2 * GRANULE,
+        "releasing the pools takes the family to the two granules a pane is \
+         actually using: 11,109,496 B, 81 % of it freed with nothing \
+         refetched and nothing redrawn",
     );
 
     // Non-triviality: the release is not simply zeroing the whole family.

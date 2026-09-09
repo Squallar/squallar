@@ -602,8 +602,9 @@ fn codes_capacity(values: &crate::render::gridded::GridValues) -> usize {
     match values {
         crate::render::gridded::GridValues::Scaled(scaled) => scaled.codes.capacity(),
         crate::render::gridded::GridValues::F32(_)
-        | crate::render::gridded::GridValues::Bytes(_) => {
-            panic!("a mosaic grid is stored as 16-bit codes, not as f32 or bytes")
+        | crate::render::gridded::GridValues::Bytes(_)
+        | crate::render::gridded::GridValues::Tiled(_) => {
+            panic!("a mosaic grid is stored as 16-bit codes, not as f32, bytes or tiles")
         }
     }
 }
