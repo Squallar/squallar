@@ -166,25 +166,54 @@ fn extract_concerning(text: &str) -> Option<String> {
     None
 }
 
+/// The words an MD number follows in this product's titles. Neither occurs
+/// inside the other, so the order is specificity and not correctness.
+const MD_NUMBER_MARKERS: [&str; 2] = ["Mesoscale Discussion", "MD"];
+
+/// The MD number in an `spcmdrss.xml` item title, or `None` for a title that
+/// carries none.
+///
+/// **The number has to follow a marker.** A digit run anywhere in a title is
+/// not evidence of an MD number, and the feed proves it: when nothing is in
+/// force `spcmdrss.xml` still carries one `<item>`, titled
+/// `SPC - No MDs are in effect as of Wed Sep  9 02:31:02 UTC 2026`, with no
+/// `LAT...LON` block. A scan that took the title's trailing digits read that
+/// as **MD 2026**, and [`discussion_from_text`]'s guard passes anything with a
+/// number *or* a polygon — so the placeholder became a numbered discussion
+/// with no geometry, held for the session. Measured on the browser rig
+/// 2026-09-09 (Firefox 155, `BrowserWebGpu`, scene A at KTLX, six legs): it
+/// was **100 % of the `drew-no-ink` blanks** — 98 to 110 of them per leg,
+/// against 791 to 895 overlay dispatches of every layer together — a
+/// picture-sized pixmap built in a worker and shipped back empty on every pan
+/// and zoom-settle, by a layer that put ink down **not once**: on the leg that
+/// split the counts by layer it took 100 blanks and 0 paintings of its own.
+/// Dropping the placeholder took `drew-no-ink` to 6 on the same rig.
+///
+/// The placeholder does carry a marker — `MDs` — so what rejects it is the
+/// digit test and not the marker's absence: the scan walks past a marker that
+/// is not followed by digits, and there is no second one.
 fn extract_md_number(title: &str) -> Option<u32> {
     if let Some(hash_pos) = title.find('#') {
         let after = &title[hash_pos + 1..];
         let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
         return digits.parse().ok();
     }
-    let mut num_str = String::new();
-    for ch in title.chars().rev() {
-        if ch.is_ascii_digit() {
-            num_str.insert(0, ch);
-        } else if !num_str.is_empty() {
-            break;
+    for marker in MD_NUMBER_MARKERS {
+        let mut rest = title;
+        while let Some(pos) = rest.find(marker) {
+            let after = &rest[pos + marker.len()..];
+            let digits: String = after
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(number) = digits.parse::<u32>() {
+                return Some(number);
+            }
+            rest = after;
         }
     }
-    if num_str.is_empty() {
-        None
-    } else {
-        num_str.parse().ok()
-    }
+    None
 }
 
 /// `spcmdrss.xml` items carry `<title>`, `<link>` and a `<description>` holding
@@ -503,6 +532,128 @@ mod tests {
     fn test_extract_md_number() {
         assert_eq!(extract_md_number("Mesoscale Discussion #0153"), Some(153));
         assert_eq!(extract_md_number("Mesoscale Discussion #42"), Some(42));
+        // The two markered forms the feed really uses, neither of which has a
+        // `#`. Both were already read by the trailing-digit scan this
+        // replaces, so they are the direction a fix could break.
+        assert_eq!(extract_md_number("SPC MD 0001"), Some(1));
+        assert_eq!(extract_md_number("Mesoscale Discussion 0001"), Some(1));
+    }
+
+    /// `spcmdrss.xml`'s standing placeholder, verbatim off the live feed on
+    /// 2026-09-09 02:31 UTC. Its title ends in a year and it carries no
+    /// `LAT...LON` block, which is the pair that made it a discussion.
+    const NO_MDS_PLACEHOLDER_TITLE: &str =
+        "SPC - No MDs are in effect as of Wed Sep  9 02:31:02 UTC 2026";
+
+    /// **What the fixture has to carry for the test below to be able to
+    /// fail.** The placeholder only reached [`discussion_from_text`]'s
+    /// `number == 0 && polygon.is_empty()` guard on the number side, so a
+    /// fixture whose title had no trailing digits would pass that test
+    /// against the OLD code too and prove nothing. Asserted here rather than
+    /// assumed, so an edit that softens the fixture fails loudly instead of
+    /// quietly hollowing out the gate.
+    #[test]
+    fn the_placeholder_fixture_carries_the_trap_it_is_a_fixture_for() {
+        let trailing: String = NO_MDS_PLACEHOLDER_TITLE
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        assert!(
+            trailing.parse::<u32>().is_ok_and(|n| n != 0),
+            "the fixture title must END in a non-zero digit run -- that run is \
+             what the old trailing-digit scan read as an MD number: {NO_MDS_PLACEHOLDER_TITLE:?}"
+        );
+        assert!(
+            !NO_MDS_PLACEHOLDER_TITLE.contains('#'),
+            "a `#` in the fixture takes the hash branch and never reaches the \
+             scan this test is about"
+        );
+        assert!(
+            NO_MDS_PLACEHOLDER_TITLE.contains("MD"),
+            "the marker has to BE in the title -- rejecting it for want of a \
+             marker at all would be a weaker claim than the one made here"
+        );
+    }
+
+    #[test]
+    fn the_no_mds_placeholder_title_carries_no_md_number() {
+        assert_eq!(extract_md_number(NO_MDS_PLACEHOLDER_TITLE), None);
+    }
+
+    /// The whole path, from the bytes the feed serves to what the layer
+    /// holds: the placeholder item must not become a discussion.
+    ///
+    /// Red before the fix with `discussions.len() == 1`, a `SpcDiscussion`
+    /// numbered 2026 whose `polygon` is empty -- which `paint_input` then
+    /// dispatched a picture for on every pan and zoom-settle, to be
+    /// rasterized `DrewNoInk` and clear the pane's layer, ~100 times a minute
+    /// on the browser rig.
+    #[test]
+    fn the_no_mds_placeholder_item_is_not_a_discussion() {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0"><channel>
+  <title>SPC Mesoscale Discussions</title>
+  <item>
+    <link>https://www.spc.noaa.gov/products/md/</link>
+    <title>{NO_MDS_PLACEHOLDER_TITLE}</title>
+    <description>No Mesoscale Discussions are in effect as of Wed Sep  9 02:31:02 UTC 2026.</description>
+    <pubDate>Wed, 09 Sep 2026 02:30:05 +0000</pubDate>
+    <guid isPermaLink="false">https://www.spc.noaa.gov/products/md/20260909</guid>
+  </item>
+</channel></rss>"#
+        );
+        let reference = chrono::NaiveDate::from_ymd_opt(2026, 9, 9)
+            .unwrap()
+            .and_hms_opt(2, 31, 2)
+            .unwrap();
+        let discussions = parse_md_rss_at(&xml, reference).expect("the placeholder feed parses");
+        assert!(
+            discussions.is_empty(),
+            "the `No MDs are in effect` placeholder became {} discussion(s): {:?}",
+            discussions.len(),
+            discussions
+                .iter()
+                .map(|d| (d.number, d.polygon.len()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The other direction, on the same call: a real item in a feed shaped
+    /// exactly like the one above still parses, so "reject the placeholder"
+    /// cannot be satisfied by rejecting everything.
+    #[test]
+    fn a_real_md_in_a_placeholder_shaped_feed_still_parses() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0"><channel>
+  <title>SPC Mesoscale Discussions</title>
+  <item>
+    <link>https://www.spc.noaa.gov/products/md/md0001.html</link>
+    <title>SPC MD 0001</title>
+    <description>
+Mesoscale Discussion 0001
+
+Concerning...Severe potential
+
+LAT...LON   35179718 34899754 34449768 34209745 35179718
+
+</description>
+    <pubDate>Wed, 09 Sep 2026 02:30:05 +0000</pubDate>
+  </item>
+</channel></rss>"#;
+        let reference = chrono::NaiveDate::from_ymd_opt(2026, 9, 9)
+            .unwrap()
+            .and_hms_opt(2, 31, 2)
+            .unwrap();
+        let discussions = parse_md_rss_at(xml, reference).expect("the feed parses");
+        assert_eq!(discussions.len(), 1, "{discussions:?}");
+        assert_eq!(discussions[0].number, 1);
+        assert!(
+            !discussions[0].polygon.is_empty(),
+            "the fixture must carry a ring, or this test cannot tell a kept \
+             discussion from a kept placeholder"
+        );
     }
 
     #[test]
