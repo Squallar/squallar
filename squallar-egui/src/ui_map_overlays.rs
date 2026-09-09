@@ -534,14 +534,37 @@ fn place_one(
         }
         _ => {}
     }
+    // **A label is culled on its anchor before it is placed, not after.**
+    // An MVT tile carries every label whose feature reaches it, buffer
+    // included, so most of the names in a tile's shape list are anchored in a
+    // neighbour and belong to that neighbour's pass. `ShapeOrText::placed`
+    // builds a whole new value to answer where one point lands, and the test
+    // below then dropped ~88% of them unread: measured on scene A at 1920x1080
+    // with real vector tiles, 3,843 text placements per frame of which 3,374
+    // were cloned and discarded -- an `Arc<str>` bump and its matching drop,
+    // two atomics on a line every tile of the pane shares, plus the value
+    // copy, for a name nothing was going to draw.
+    //
+    // The anchor is one affine on one point and it is the same arithmetic
+    // `placed` would apply, so the surviving label is the value that spelling
+    // produced, built here instead of copied. The geometry arm is untouched:
+    // its shapes have no anchor to cull on and every one of them draws.
+    if let walkers::ShapeOrText::Text(text) = shape {
+        let position = placement.scaling * text.position + placement.translation;
+        if !rect.contains(position) {
+            return;
+        }
+        counted.label_anchors += 1;
+        let mut text = text.clone();
+        text.position = position;
+        labels.push(text);
+        return;
+    }
     match shape.placed(placement) {
         walkers::ShapeOrText::Shape(shape) => placed.push(shape),
-        walkers::ShapeOrText::Text(text) => {
-            if rect.contains(text.position) {
-                counted.label_anchors += 1;
-                labels.push(text);
-            }
-        }
+        // `placed` maps `Text` to `Text`, and the arm above took every one of
+        // them before this match was reached.
+        walkers::ShapeOrText::Text(_) => {}
     }
 }
 
@@ -1907,6 +1930,69 @@ mod tests {
             egui::Color32::WHITE,
             0.0,
         ))
+    }
+
+    /// **A label is culled on its own anchor, and the cull is what does it.**
+    ///
+    /// An MVT tile carries every name whose feature reaches it, buffer
+    /// included, so most of the labels in a tile's shape list are anchored in
+    /// a neighbour and belong to that neighbour's pass. `place_one` drops
+    /// those and keeps the rest placed by the same affine.
+    ///
+    /// **This is a unit test of `place_one` and not of a rendered pass on
+    /// purpose.** The two tile-seam tests below draw the duplicate case end to
+    /// end and stay green with this cull disabled outright — `solve_labels`'
+    /// own repeat-distance rule catches the duplicate name downstream — so
+    /// they pin the pixel and cannot pin this. Reached directly, the branch
+    /// has nothing standing in front of it.
+    #[test]
+    fn a_label_anchored_outside_its_tile_is_dropped_before_it_is_placed() {
+        // The tile drawn 256 points wide at (100, 50), which is the scale
+        // `walkers::mvt::placement` builds for a tile of `EXTENT` units.
+        let side = 256.0;
+        let placement = egui::emath::TSTransform::new(egui::vec2(100.0, 50.0), side / EXTENT);
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(side, side));
+
+        // Inside its own tile; and west of its own origin, which is what a
+        // neighbour's place looks like in this tile's buffer.
+        let inside = label_at(EXTENT / 2.0, "Topeka");
+        let outside = label_at(-EXTENT * 0.01, "Lawrence");
+
+        let mut counted = Counted::default();
+        let mut placed: Vec<egui::Shape> = Vec::new();
+        let mut labels: Vec<Text> = Vec::new();
+        for shape in [&inside, &outside] {
+            place_one(
+                shape,
+                placement,
+                rect,
+                &mut counted,
+                &mut placed,
+                &mut labels,
+            );
+        }
+
+        assert_eq!(
+            labels.iter().map(|t| &*t.text).collect::<Vec<_>>(),
+            ["Topeka"],
+            "the label anchored in a neighbouring tile was kept by this tile's pass"
+        );
+        assert_eq!(
+            counted.label_anchors, 1,
+            "the anchor count follows the list"
+        );
+        assert!(placed.is_empty(), "a label is not geometry");
+
+        // **And the survivor is the value the old spelling produced.** The
+        // cull moved in front of `ShapeOrText::placed`; what it hands on must
+        // still be that call's answer, or the reorder moved a pixel.
+        let walkers::ShapeOrText::Text(expected) = inside.placed(placement) else {
+            panic!("`placed` maps a `Text` to a `Text`");
+        };
+        assert_eq!(labels[0].position, expected.position, "the anchor moved");
+        assert_eq!(labels[0].font_size, expected.font_size);
+        assert_eq!(labels[0].text_color, expected.text_color);
+        assert_eq!(labels[0].angle, expected.angle);
     }
 
     /// **Two labels claiming the same screen: one wins.** The collision is what
