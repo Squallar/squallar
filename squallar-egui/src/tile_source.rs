@@ -3788,17 +3788,45 @@ impl HttpsTiles {
         }
     }
 
+    /// [`Self::request_once`] for a caller that has already read the slot —
+    /// [`Self::ground_at`], which needs the same slot's tile in the same
+    /// breath. `known` is what [`Self::try_request`]'s own probe would have
+    /// answered, taken **before** anything here touched the cache, which is
+    /// where that probe sat.
+    fn request_once_known(&mut self, tile_id: TileId, known: Option<u64>) {
+        self.asks.wanted(tile_id);
+        if self.try_request_known(tile_id, AskSource::Walk, known) == Ask::Refused {
+            self.asks.refuse(tile_id);
+        }
+    }
+
     /// [`Self::request_once`]'s decision and send, with the outcome named so
     /// the refused-ask queue can act on it. Records nothing in the queue.
     fn try_request(&mut self, tile_id: TileId, source: AskSource) -> Ask {
         if self.requests_closed {
             return Ask::Unneeded;
         }
-        let epoch = self.style_epoch;
-
         // `get`, not `peek`: a hit refreshes recency exactly as the old
         // `try_get_or_insert` did.
         let known = self.cache.get(&tile_id).map(|slot| slot.epoch);
+        self.try_request_known(tile_id, source, known)
+    }
+
+    /// [`Self::try_request`] with the slot already read.
+    ///
+    /// `known` is the epoch of the slot under `tile_id`, or `None` for no
+    /// slot. Split out because the walk asks one slot two questions — "is a
+    /// request owed for it" and "what does it draw" — and each half used to
+    /// probe the LRU for itself: 45 cells of a 1920x1080 pane cost 90 hashes
+    /// and 90 recency splices where 45 answer both. The probe is a `get` and
+    /// so a use, and two uses of one key in a row leave the same order one
+    /// does, which is why the halves can share it.
+    fn try_request_known(&mut self, tile_id: TileId, source: AskSource, known: Option<u64>) -> Ask {
+        if self.requests_closed {
+            return Ask::Unneeded;
+        }
+        let epoch = self.style_epoch;
+
         if known == Some(epoch) {
             return Ask::Unneeded;
         }
@@ -3878,8 +3906,17 @@ impl HttpsTiles {
     /// blank beat, and its slot is already re-stamped for replacement by
     /// [`Self::request_once`].
     fn cached_or_interpolated(&mut self, tile_id: TileId) -> Option<GroundPiece> {
-        let mut zoom_candidate = tile_id.zoom;
+        self.cached_or_interpolated_from(tile_id, tile_id.zoom)
+    }
 
+    /// [`Self::cached_or_interpolated`] resumed at `zoom_candidate` rather
+    /// than at the tile's own level — what [`Self::ground_at`] takes once its
+    /// single probe has settled the tile's own level itself.
+    fn cached_or_interpolated_from(
+        &mut self,
+        tile_id: TileId,
+        mut zoom_candidate: u8,
+    ) -> Option<GroundPiece> {
         loop {
             let (ancestor, uv) = interpolate_from_lower_zoom(tile_id, zoom_candidate);
 
@@ -3918,13 +3955,72 @@ impl HttpsTiles {
             return None;
         }
         let max_zoom = self.source_max_zoom()?;
-        let to_fetch = if tile_id.zoom > max_zoom {
-            interpolate_from_lower_zoom(tile_id, max_zoom).0
-        } else {
-            tile_id
+        if tile_id.zoom > max_zoom {
+            // The level asked for and the level drawn are different slots, so
+            // there is one probe for each and nothing to share.
+            let to_fetch = interpolate_from_lower_zoom(tile_id, max_zoom).0;
+            self.request_once(to_fetch);
+            return self.cached_or_interpolated(tile_id);
+        }
+
+        // **One probe, two questions.** Below the source's deepest level the
+        // cell is fetched at the level it draws, so `request_once`'s "is a
+        // request owed" and `cached_or_interpolated`'s "what does this draw"
+        // are asked of the same slot — and were two `LruCache::get`s, two
+        // hashes and two recency splices, for one answer. The probe stays
+        // exactly where `try_request`'s was: before the send, before `ask`
+        // reserves a slot and before `re_ask` re-stamps one, neither of which
+        // touches a slot's tile.
+        let (known, resident) = self.probe_for_ground(tile_id);
+        self.request_once_known(tile_id, known);
+        if resident.is_some() {
+            return resident;
+        }
+
+        // The exact level draws nothing — no slot, or a slot holding a
+        // pending marker — so the ancestor walk carries on from where the
+        // probe left it. Its first turn was this cell.
+        let Some(shallower) = tile_id.zoom.checked_sub(1) else {
+            self.cache.note(cache_ledger::CacheEvent::BlankCell);
+            return None;
         };
-        self.request_once(to_fetch);
-        self.cached_or_interpolated(tile_id)
+        self.cached_or_interpolated_from(tile_id, shallower)
+    }
+
+    /// The slot under `tile_id` read once, as both of [`Self::ground_at`]'s
+    /// halves read it: the epoch [`Self::try_request_known`] decides on, and
+    /// the piece [`Self::cached_or_interpolated_from`]'s first turn would have
+    /// answered with.
+    ///
+    /// A slot with no tile in it — a pending marker, a failed fetch — is
+    /// `(Some(epoch), None)`, which is the same "keep walking" the loop's
+    /// first turn made of it.
+    fn probe_for_ground(&mut self, tile_id: TileId) -> (Option<u64>, Option<GroundPiece>) {
+        // The `uv` from the same helper the loop's first turn used, so the
+        // full-tile window is that function's answer and not a second
+        // spelling of it.
+        let (ancestor, uv) = interpolate_from_lower_zoom(tile_id, tile_id.zoom);
+        debug_assert_eq!(
+            ancestor, tile_id,
+            "a tile interpolated from its own level is itself"
+        );
+        match self.cache.get(&tile_id) {
+            Some(CachedTile {
+                tile,
+                meshes,
+                epoch,
+                ..
+            }) => {
+                let epoch = *epoch;
+                let piece = tile.as_ref().map(|cached| GroundPiece {
+                    tile: cached.clone(),
+                    uv,
+                    meshes: meshes.clone(),
+                });
+                (Some(epoch), piece)
+            }
+            None => (None, None),
+        }
     }
 
     /// Ask for `tile_id` without drawing it — the ancestor net.
