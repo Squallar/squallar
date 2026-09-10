@@ -612,6 +612,61 @@ fn move_feed_level(was: u64, now: u64) {
     });
 }
 
+/// **Compressed chunk bytes the live assemblers are keeping**, this instant —
+/// see [`VolumeAssembler::raw`]. Moved through [`feed_level_serial`] for the
+/// reason `CHUNK_FEED_BYTES` is, and deliberately a SEPARATE total from it:
+/// that family is decoded volumes and this is their compressed form, two
+/// orders of magnitude apart and released by different rules, so a line that
+/// added them could not say which had moved.
+static CHUNK_RAW_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Archives handed to the loop cache at a roll, and the bytes they carried.
+static CHUNK_ARCHIVES_KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CHUNK_ARCHIVE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// **Whole volumes offered nothing**: their bytes were not all retained, or
+/// their concatenation would not split back into LDM records. The
+/// denominator's other half — `whole = kept + refused` — and the reading that
+/// says whether a way back this feed offers is one. A non-zero refusal is not
+/// a failure to act on, it is the guard doing its job; a non-zero KEPT that
+/// the withdrawal then cannot decode would be, which is why the framing walk
+/// is on the offering side.
+static CHUNK_ARCHIVES_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Volumes that closed whole — what the two above are read against.
+static CHUNK_WHOLE_CLOSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn move_raw_level(was: u64, now: u64) {
+    feed_level_serial::with_move(|| {
+        CHUNK_RAW_BYTES.fetch_add(now.wrapping_sub(was), std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
+fn note_archive_kept(bytes: u64) {
+    CHUNK_ARCHIVES_KEPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    CHUNK_ARCHIVE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn note_archive_refused() {
+    CHUNK_ARCHIVES_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// **What the live assemblers are holding as their volumes' way back**, this
+/// instant. A LEVEL, never added to [`feed_bytes`].
+pub fn retained_chunk_bytes() -> u64 {
+    CHUNK_RAW_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// **Whole volumes handed over with their compressed form, the bytes they
+/// carried, and the ones refused for framing** — running totals for the life
+/// of the process, so a line of their own and never added to a level.
+pub fn chunk_archive_totals() -> (u64, u64, u64, u64) {
+    (
+        CHUNK_WHOLE_CLOSES.load(std::sync::atomic::Ordering::Relaxed),
+        CHUNK_ARCHIVES_KEPT.load(std::sync::atomic::Ordering::Relaxed),
+        CHUNK_ARCHIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+        CHUNK_ARCHIVES_REFUSED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// **Host bytes the chunk feed's decoded volumes are holding**, this instant.
 ///
 /// Two terms per assembler and one per poller:
@@ -950,6 +1005,54 @@ pub struct VolumeProgress {
     pub late_radials_dropped: usize,
 }
 
+/// **One volume's retained chunks, concatenated into its Archive II form** —
+/// or `None` where the result would not be one.
+///
+/// Free rather than a method so the property can be driven from real chunk
+/// bytes without a whole volume behind them: what could break here is the
+/// JOIN, and a start chunk followed by one more record is enough to show the
+/// record framing survives it.
+///
+/// Two refusals, both cheap and both on the offering side:
+///
+/// * the buffer must begin `AR2`, which is the volume header a start chunk
+///   carries and no other chunk does;
+/// * it must split back into LDM records — [`volume::File::records`] reads
+///   each record's control word and decompresses none, so this is a walk of
+///   ~100 words against the 4-11 s a volume decode costs.
+///
+/// The alternative to refusing is worse than a missing archive: what takes
+/// this is `App::release_unneeded_base_gates`, whose restore has no second
+/// way back, so a way back that is not one is a merge base that never comes
+/// home.
+fn archive_from_chunks(
+    pieces: std::collections::BTreeMap<u16, Vec<u8>>,
+) -> Option<std::sync::Arc<Vec<u8>>> {
+    let total: usize = pieces.values().map(Vec::len).sum();
+    let mut out: Vec<u8> = Vec::with_capacity(total);
+    // Consumed in sequence order, each piece dropped as it goes, so the peak
+    // is the buffer plus one chunk rather than twice the compressed volume.
+    for (_, piece) in pieces {
+        out.extend_from_slice(&piece);
+        drop(piece);
+    }
+    if out.get(..3) != Some(b"AR2".as_slice()) {
+        note_archive_refused();
+        return None;
+    }
+    let archive = std::sync::Arc::new(out);
+    match volume::File::from_shared(std::sync::Arc::clone(&archive)).records() {
+        Ok(records) if !records.is_empty() => {
+            note_archive_kept(archive.len() as u64);
+            Some(archive)
+        }
+        _ => {
+            note_archive_refused();
+            None
+        }
+    }
+}
+
 /// Accumulates one volume's chunks into complete sweeps.
 pub struct VolumeAssembler {
     site: String,
@@ -1003,6 +1106,41 @@ pub struct VolumeAssembler {
     /// Where the radar said it was, off the first chunk that carried a Volume
     /// Data Block.
     reported_site: Option<nexrad_model::meta::Site>,
+    /// **The compressed bytes of every chunk this volume accepted**, by
+    /// sequence — the volume's own way back, kept because this feed is
+    /// already holding them.
+    ///
+    /// A chunk-assembled volume has always been filed with `archive: None`,
+    /// on the reasoning that it "was never one compressed object". It was:
+    /// the start chunk is an Archive II header followed by LDM records, every
+    /// later chunk is one more LDM record with its control word
+    /// ([`decode_chunk`] is where both shapes are read), and the S3 object the
+    /// bucket publishes minutes later is their concatenation. So the way back
+    /// costs a retention rather than a download.
+    ///
+    /// **What it buys is the only lever that can withdraw a whole decoded
+    /// volume.** `App::release_unneeded_base_gates` refuses a base it cannot
+    /// decode back, and on a 420 s single-pane leg of 2026-09-10 that refusal
+    /// was 298 of 511 considerations — every one of them with the identity
+    /// index knowing the base's own address and no compressed half standing
+    /// anywhere for it (`base way-back: unlearned 0, archive-gone 298,
+    /// shadowed 0`). The archive drain does not close that gap on its own:
+    /// the 60 s check is skipped while a feed serves the site, so over that
+    /// whole leg two volumes reached the loop cache and one of them was this
+    /// feed's, with nothing behind it.
+    ///
+    /// Kept by sequence and not appended in arrival order because a
+    /// notification-driven fetch may land out of order, and an archive whose
+    /// records are transposed is one that decodes to nothing.
+    ///
+    /// **Bounded by the volume it belongs to**: dropped with the assembler,
+    /// and taken (not copied) by [`Self::take_archive`] at the roll. The
+    /// compressed form is 1.0-16.1 MiB against a 33.7-82.7 MiB decoded
+    /// volume.
+    raw: std::collections::BTreeMap<u16, Vec<u8>>,
+    /// Host bytes [`Self::raw`] holds, its own running term of the level —
+    /// see [`retained_chunk_bytes`].
+    raw_bytes: u64,
 }
 
 impl VolumeAssembler {
@@ -1029,6 +1167,8 @@ impl VolumeAssembler {
             stale: false,
             declared_nyquist: crate::nyquist::DeclaredNyquist::empty(),
             reported_site: None,
+            raw: Default::default(),
+            raw_bytes: 0,
         }
     }
 
@@ -1048,7 +1188,57 @@ impl VolumeAssembler {
             return Ok(IngestOutcome::default());
         }
         let contents = decode_chunk(id.name(), bytes)?;
-        Ok(self.ingest_contents(id.sequence(), id.kind(), id.volume_time(), contents))
+        let outcome = self.ingest_contents(id.sequence(), id.kind(), id.volume_time(), contents);
+        // **Kept only for a chunk the assembler took**, so a duplicate, a
+        // stale rotation's leftover and a chunk for another volume cost
+        // nothing. This is the one seam that has the compressed bytes at all
+        // — `ingest_contents` is reached by the equivalence tests with a
+        // golden `Scan` re-sliced and no encoder, and an assembler driven
+        // that way retains nothing and offers no archive, which
+        // `take_archive` checks rather than assumes.
+        if outcome.accepted {
+            let was = self.raw_bytes;
+            self.raw_bytes = self
+                .raw_bytes
+                .saturating_add(bytes.len() as u64)
+                .saturating_add(crate::scan_size::ALLOCATOR_BLOCK_OVERHEAD as u64);
+            move_raw_level(was, self.raw_bytes);
+            self.raw.insert(id.sequence(), bytes.to_vec());
+        }
+        Ok(outcome)
+    }
+
+    /// **Take the volume's compressed form**, and release the retention
+    /// either way.
+    ///
+    /// `Some` only for a volume that is whole ([`Self::is_whole_volume_complete`]),
+    /// whose every accepted chunk's bytes are held, and whose concatenation
+    /// splits back into LDM records — the framing walk, not a decode: it
+    /// reads each record's control word and never decompresses one, so it
+    /// costs a walk of ~100 records against the 4-11 s a volume decode
+    /// costs. A buffer that fails it is not offered, because what would take
+    /// it is a merge-base withdrawal whose restore has no second way back.
+    ///
+    /// Called at the roll, which runs on the poller and never on the frame
+    /// thread. One concatenation of the compressed volume, with each piece
+    /// dropped as it is consumed, so the peak is the buffer plus one chunk
+    /// rather than twice the volume.
+    pub(crate) fn take_archive(&mut self) -> Option<std::sync::Arc<Vec<u8>>> {
+        let pieces = std::mem::take(&mut self.raw);
+        move_raw_level(self.raw_bytes, 0);
+        self.raw_bytes = 0;
+        if !self.is_whole_volume_complete() {
+            return None;
+        }
+        CHUNK_WHOLE_CLOSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if pieces.len() != self.ingested.len() {
+            // An assembler fed through `ingest_contents` — the test seam —
+            // holds no bytes, and a partial retention would concatenate to a
+            // hole.
+            note_archive_refused();
+            return None;
+        }
+        archive_from_chunks(pieces)
     }
 
     /// The decode-free half, and the seam the equivalence test drives: a golden
@@ -1577,6 +1767,11 @@ pub struct ClosedVolume {
     pub scan: Option<std::sync::Arc<nexrad_model::data::Scan>>,
     /// What the closed volume's cuts declared their Nyquist velocities to be.
     pub declared_nyquist: crate::nyquist::DeclaredNyquist,
+    /// **The volume's compressed form**, from the chunks it was built out of
+    /// — see [`VolumeAssembler::take_archive`]. `None` for a volume that did
+    /// not close whole, whose bytes were not all retained, or whose
+    /// concatenation would not split back into records.
+    pub archive: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 /// Summarised rather than derived: a derived `Debug` is a sha256 over every
@@ -1645,6 +1840,7 @@ impl Drop for VolumeAssembler {
     fn drop(&mut self) {
         move_feed_level(self.staged_bytes.saturating_add(self.cached_bytes), 0);
         move_shared_overlap(self.shared_overlap, 0);
+        move_raw_level(self.raw_bytes, 0);
     }
 }
 
@@ -1836,10 +2032,14 @@ impl ChunkPoller {
             let progress = current.close();
             let declared_nyquist = current.declared_nyquist().clone();
             let scan = progress.volume_complete.then(|| current.snapshot());
+            // Unconditional, because it is also what releases the retention:
+            // a volume that closed short offers nothing and keeps nothing.
+            let archive = current.take_archive();
             ClosedVolume {
                 progress,
                 scan,
                 declared_nyquist,
+                archive,
             }
         });
         let mut next = VolumeAssembler::new(self.site.clone(), to);

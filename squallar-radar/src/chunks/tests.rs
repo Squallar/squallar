@@ -2719,3 +2719,143 @@ fn the_chunk_feed_prices_its_volumes_and_gives_them_back() {
         before_drop.saturating_sub(after_drop)
     );
 }
+
+/// A real WSR-88D Archive II prefix: the 24-byte volume header verbatim and
+/// the first LDM record behind it. It is what a START chunk is, and
+/// `[24..]` is what every later chunk is — one LDM record with its control
+/// word, which is why the same file makes both.
+const FIRST_MESSAGE: &[u8] = include_bytes!("../../testdata/KTLX20260811_000049_V06.first-message");
+
+/// **The join is the whole claim.** A chunk-assembled volume was filed with
+/// `archive: None` on the reasoning that it "was never one compressed
+/// object"; the concatenation of its chunks IS that object, and the property
+/// that could fail is that the record framing survives the seam between two
+/// of them.
+///
+/// Driven from real bytes rather than a synthesised stream: the fixture is a
+/// header plus one record, so `start ++ start[24..]` is a two-record Archive
+/// II file, and both records have to come back out.
+///
+/// TAMPER: concatenate the pieces in `BTreeMap` value order reversed, or drop
+/// the first four bytes of the second piece, and `records()` reads a control
+/// word out of the middle of a bzip2 stream and this goes red.
+#[test]
+fn a_start_chunk_and_one_more_record_concatenate_into_an_archive() {
+    let start = FIRST_MESSAGE.to_vec();
+    let intermediate = FIRST_MESSAGE[std::mem::size_of::<volume::Header>()..].to_vec();
+    assert_eq!(
+        start.get(..3),
+        Some(b"AR2".as_slice()),
+        "precondition: the fixture is a start chunk",
+    );
+    assert_eq!(
+        intermediate.get(4..6),
+        Some(b"BZ".as_slice()),
+        "precondition: the tail is one LDM record, as an intermediate chunk is",
+    );
+
+    let mut pieces = std::collections::BTreeMap::new();
+    pieces.insert(2u16, intermediate.clone());
+    pieces.insert(1u16, start.clone());
+    let archive = archive_from_chunks(pieces).expect("two real chunks make an archive");
+
+    let mut expected = start.clone();
+    expected.extend_from_slice(&intermediate);
+    assert_eq!(
+        archive.as_slice(),
+        expected.as_slice(),
+        "the pieces were not joined in sequence order, so the archive is transposed",
+    );
+    let file = volume::File::from_shared(std::sync::Arc::clone(&archive));
+    let records = file
+        .records()
+        .expect("the joined buffer is an Archive II file");
+    assert_eq!(
+        records.len(),
+        2,
+        "the record framing did not survive the join between two chunks",
+    );
+}
+
+/// A buffer that is not an Archive II file is refused rather than offered:
+/// what takes it is a merge-base withdrawal whose restore has no second way
+/// back, so an archive that does not decode is worse than none.
+#[test]
+fn chunks_with_no_volume_header_are_not_an_archive() {
+    let mut pieces = std::collections::BTreeMap::new();
+    pieces.insert(
+        1u16,
+        FIRST_MESSAGE[std::mem::size_of::<volume::Header>()..].to_vec(),
+    );
+    assert!(
+        archive_from_chunks(pieces).is_none(),
+        "a stream with no volume header was offered as one",
+    );
+}
+
+/// **The bytes are kept for a chunk the assembler took, and given back with
+/// the volume.**
+///
+/// The level is read under the serialiser for the reason every other level
+/// assertion in this file is: `CHUNK_RAW_BYTES` is process-global and this
+/// crate's tests run on several threads.
+///
+/// TAMPER: drop the `outcome.accepted` guard in `ingest` and this still
+/// passes; drop the retention itself and the first assertion goes red.
+#[test]
+fn an_ingested_chunk_is_kept_as_the_volumes_way_back_and_released_with_it() {
+    let _serial = feed_level_serial::exclusive();
+    let before = retained_chunk_bytes();
+    let mut assembler = VolumeAssembler::new("KTLX", vol(7));
+    let id = ChunkId::parse("KTLX", vol(7), "20260811-000049-001-S").expect("parses");
+
+    assembler.ingest(&id, FIRST_MESSAGE).expect("real chunk");
+    let held = retained_chunk_bytes();
+    assert!(
+        held >= before + FIRST_MESSAGE.len() as u64,
+        "the chunk's compressed bytes were not kept: level {before} -> {held}",
+    );
+
+    // A repeat of the same sequence is not accepted and must not be paid for
+    // twice.
+    assembler.ingest(&id, FIRST_MESSAGE).expect("real chunk");
+    assert_eq!(
+        retained_chunk_bytes(),
+        held,
+        "a chunk the assembler refused was charged to the level",
+    );
+
+    // Nothing sealed and no scan end, so the volume is not whole and offers
+    // nothing — and the retention still goes.
+    assert!(
+        assembler.take_archive().is_none(),
+        "a volume that did not close whole offered an archive anyway",
+    );
+    assert_eq!(
+        retained_chunk_bytes(),
+        before,
+        "the retention outlived the volume it belonged to",
+    );
+}
+
+/// The decode-free seam retains nothing, so an assembler driven through it
+/// offers no archive however complete it looks. Said here rather than
+/// assumed: `take_archive` checks that every accepted chunk's bytes are held,
+/// and a partial retention would concatenate to a hole.
+#[test]
+fn an_assembler_fed_without_bytes_offers_no_archive() {
+    let mut assembler = VolumeAssembler::new("KTLX", vol(7));
+    assembler.ingest_contents(
+        1,
+        ChunkKind::Start,
+        chrono::NaiveDate::from_ymd_opt(2026, 8, 11)
+            .unwrap()
+            .and_hms_opt(0, 0, 49)
+            .unwrap(),
+        ChunkContents::default(),
+    );
+    assert!(
+        assembler.take_archive().is_none(),
+        "an assembler holding no compressed bytes offered an archive",
+    );
+}

@@ -382,6 +382,10 @@ pub struct App {
     /// **Why the withdrawal side declined**, per guard. The restore counts
     /// above say what came back; these say what never left.
     base_releases: crate::budget_telemetry::BaseReleaseCounts,
+    /// **Why `no-archive` fired**, split three ways — see
+    /// [`crate::budget_telemetry::BaseWayBackCounts`]. Read off the loop
+    /// cache at the refusal and never sampled on a tick.
+    base_way_backs: crate::budget_telemetry::BaseWayBackCounts,
     /// **The loop decoded cache's last census**, taken on the residency pass
     /// because that is where the pass's own `decoded_keep` predicate is in
     /// hand, and read on the telemetry tick. A level: the tick reports what
@@ -1081,6 +1085,7 @@ impl App {
             base_gate_asks: std::collections::HashSet::new(),
             base_restores: crate::budget_telemetry::BaseRestoreCounts::default(),
             base_releases: crate::budget_telemetry::BaseReleaseCounts::default(),
+            base_way_backs: crate::budget_telemetry::BaseWayBackCounts::default(),
             loop_decoded: crate::budget_telemetry::LoopDecodedCensus::default(),
             loop_decoded_due: true,
             budget_readout: squallar_egui::shell_api::BudgetReadout::default(),
@@ -3659,6 +3664,12 @@ impl App {
             };
             let Some((address, _)) = self.loop_mgr.archive_for_identity(&site, collected) else {
                 self.base_releases.blocked(BaseReleaseOutcome::NoArchive);
+                // Asked only on the refusal, which is the one state whose
+                // cause the count above cannot name.
+                let (learned, with_archive, with_decoded) =
+                    self.loop_mgr.identity_way_backs(&site, collected);
+                self.base_way_backs
+                    .observe(learned, with_archive, with_decoded);
                 continue;
             };
             // A decode already on its way would land on a base this is about

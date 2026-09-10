@@ -1182,6 +1182,84 @@ pub(crate) fn base_release_line(counts: BaseReleaseCounts) -> String {
     )
 }
 
+/// **Why a base's way back could not be found**, as one running tally per
+/// cause — the split behind `no-archive` in [`base_release_line`].
+///
+/// That guard is 83 % and 43 % of every blocked consideration on the two
+/// probe legs of 2026-09-09, and the count alone cannot say which of three
+/// states the cache was in when it fired. A base filed by the chunk feed has
+/// no compressed half of its own, but the S3 object for the same physical
+/// volume arrives in this process minutes later under the OTHER clock, so
+/// "no way back" and "a way back the search did not reach" are different
+/// findings with different repairs, and two attempts have already been binned
+/// for building the wrong one.
+///
+/// Running totals, so a line of their own and never added to a census level.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BaseWayBackCounts {
+    asked: u32,
+    unlearned: u32,
+    archive_gone: u32,
+    shadowed: u32,
+    shadowed_decoded: u32,
+}
+
+impl BaseWayBackCounts {
+    /// One `no-archive` refusal, against what
+    /// `LoopDownloadManager::identity_way_backs` says the cache holds for the
+    /// identity that was asked for.
+    pub(crate) fn observe(&mut self, learned: usize, with_archive: usize, with_decoded: usize) {
+        self.asked = self.asked.saturating_add(1);
+        if learned == 0 {
+            self.unlearned = self.unlearned.saturating_add(1);
+        } else if with_archive == 0 {
+            self.archive_gone = self.archive_gone.saturating_add(1);
+        } else {
+            self.shadowed = self.shadowed.saturating_add(1);
+            if with_decoded > 0 {
+                self.shadowed_decoded = self.shadowed_decoded.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// Its own line, and never appended to `budget state:`, which is scraped by a
+/// positional regex.
+pub(crate) fn base_way_back_line(counts: BaseWayBackCounts) -> String {
+    let BaseWayBackCounts {
+        asked,
+        unlearned,
+        archive_gone,
+        shadowed,
+        shadowed_decoded,
+    } = counts;
+    format!(
+        "base way-back: asked {asked}, unlearned {unlearned}, archive-gone {archive_gone}, shadowed {shadowed}, shadowed-decoded {shadowed_decoded}"
+    )
+}
+
+/// **The way back the chunk feed keeps for its own volumes**, as running
+/// totals and one level.
+///
+/// `whole` is the denominator: volumes that closed whole and were therefore
+/// offered to the loop cache at all. `kept` is how many carried their
+/// compressed form with them, `refused` the ones whose retained bytes were
+/// incomplete or would not split back into LDM records. `retained` is a LEVEL
+/// — what the live assemblers are holding this instant — and is never added
+/// to the two totals.
+///
+/// It exists because two attempts at this have already read zero. A mechanism
+/// that never executes reads exactly like one that works, so the count is
+/// always on and published whether or not anything gates on it.
+pub(crate) fn chunk_archive_line() -> String {
+    let (whole, kept, bytes, refused) = squallar_radar::chunks::chunk_archive_totals();
+    format!(
+        "chunk archives: {kept} of {whole} whole volume(s) kept at {} MiB, refused {refused}; retained {} MiB live",
+        bytes / (1024 * 1024),
+        squallar_radar::chunks::retained_chunk_bytes() / (1024 * 1024),
+    )
+}
+
 /// **What the decoder did not build**, as a running total.
 ///
 /// The clutter-filter-power moment is decoded past rather than materialised

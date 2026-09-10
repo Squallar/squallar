@@ -90,15 +90,26 @@ fn complete(sweeps: u8, whole: bool) -> VolumeProgress {
 /// A round that closed a whole `sweeps`-cut volume and rolled to the next,
 /// exactly as `ChunkPoller::roll` reports one.
 pub(super) fn closing_round(sweeps: u8) -> PollOutcome {
-    closing_round_of(sweeps, true)
+    closing_round_of(sweeps, true, None)
 }
 
-fn closing_round_of(sweeps: u8, whole: bool) -> PollOutcome {
+/// The same, carrying the volume's compressed form — what a roll hands over
+/// for a volume whose chunks were all retained.
+pub(super) fn closing_round_with_archive(sweeps: u8, archive: Vec<u8>) -> PollOutcome {
+    closing_round_of(sweeps, true, Some(std::sync::Arc::new(archive)))
+}
+
+fn closing_round_of(
+    sweeps: u8,
+    whole: bool,
+    archive: Option<std::sync::Arc<Vec<u8>>>,
+) -> PollOutcome {
     PollOutcome {
         closed: Some(ClosedVolume {
             progress: complete(sweeps, whole),
             scan: Some(volume(sweeps)),
             declared_nyquist: Default::default(),
+            archive,
         }),
         rolled_to: Some(vol(43)),
         ..Default::default()
@@ -272,7 +283,7 @@ fn a_completed_volume_stamps_freshness_for_its_own_cuts() {
 #[test]
 fn a_volume_complete_only_for_its_selection_stays_out_of_the_loop_cache() {
     let mut app = app_showing_a_drawn_volume(RadarProduct::Reflectivity);
-    let outcome = closing_round_of(1, false);
+    let outcome = closing_round_of(1, false, None);
 
     app.apply_chunk_outcome("KTLX", &outcome);
 
@@ -303,7 +314,7 @@ fn a_whole_closed_volume_becomes_the_merge_base() {
         "precondition: no base yet, so the write below is this round's"
     );
 
-    app.apply_chunk_outcome("KTLX", &closing_round_of(5, true));
+    app.apply_chunk_outcome("KTLX", &closing_round_of(5, true, None));
     let based = app
         .volumes
         .base_for("KTLX")
@@ -316,7 +327,7 @@ fn a_whole_closed_volume_becomes_the_merge_base() {
     );
 
     let mut short = app_showing_a_drawn_volume(RadarProduct::Reflectivity);
-    short.apply_chunk_outcome("KTLX", &closing_round_of(1, false));
+    short.apply_chunk_outcome("KTLX", &closing_round_of(1, false, None));
     assert!(
         !short.volumes.holds_base("KTLX"),
         "a volume that closed short of whole was installed as the merge \
@@ -330,7 +341,7 @@ fn a_whole_closed_volume_becomes_the_merge_base() {
 fn a_whole_volume_does_reach_the_loop_cache() {
     let mut app = app_showing_a_drawn_volume(RadarProduct::Reflectivity);
 
-    app.apply_chunk_outcome("KTLX", &closing_round_of(5, true));
+    app.apply_chunk_outcome("KTLX", &closing_round_of(5, true, None));
 
     let shown = app
         .gui
@@ -448,5 +459,66 @@ fn an_incomplete_closed_volume_is_not_applied() {
         Some((product, 0.5)),
         "a volume that closed short ran the site reset, so the pane \
              re-rendered from it"
+    );
+}
+
+/// **A chunk-assembled volume arrives with its own way back.**
+///
+/// `App::release_unneeded_base_gates` is the only lever in this application
+/// that can withdraw a whole decoded volume, and it refuses a base whose
+/// identity `archive_for_identity` answers `None` for. A chunk-fed base
+/// answered `None` for the life of the process — measured on a 420 s
+/// single-pane leg of 2026-09-10 as 298 of 511 considerations, with the
+/// identity index knowing the base's own address and nothing standing behind
+/// it. The bytes were never missing; the feed was throwing them away.
+///
+/// Asked through `archive_for_identity` and not through `has_archive`,
+/// because the identity is what a merge base is keyed by and the address is
+/// not: the two are equal on 0 of the 171 local Archive II volumes for an S3
+/// arrival, and it is only this path that files them at the same instant.
+///
+/// TAMPER: pass `None` for the archive here, or restore the `None` in
+/// `apply_chunk_outcome`, and this goes red while every other assertion in
+/// this file stays green.
+#[test]
+fn a_whole_chunk_volume_brings_the_compressed_form_the_withdrawal_needs() {
+    let mut app = app_showing_a_drawn_volume(RadarProduct::Reflectivity);
+    let bytes = vec![7u8; 64];
+
+    app.apply_chunk_outcome("KTLX", &closing_round_with_archive(5, bytes.clone()));
+
+    let collected = app
+        .volumes
+        .base_collected_at("KTLX")
+        .expect("the whole volume became the merge base");
+    let (_, held) = app
+        .loop_mgr
+        .archive_for_identity("KTLX", collected)
+        .expect("the base has no way back, so its gates can never be withdrawn");
+    assert_eq!(
+        held.as_slice(),
+        bytes.as_slice(),
+        "a different buffer was filed for this volume",
+    );
+}
+
+/// The counterweight, so the assertion above is about the archive travelling
+/// rather than about anything a whole round does: the same round without one
+/// still has no way back.
+#[test]
+fn a_whole_chunk_volume_with_no_retained_bytes_still_has_no_way_back() {
+    let mut app = app_showing_a_drawn_volume(RadarProduct::Reflectivity);
+
+    app.apply_chunk_outcome("KTLX", &closing_round_of(5, true, None));
+
+    let collected = app
+        .volumes
+        .base_collected_at("KTLX")
+        .expect("the whole volume became the merge base");
+    assert!(
+        app.loop_mgr
+            .archive_for_identity("KTLX", collected)
+            .is_none(),
+        "a way back appeared for a volume whose chunks were not retained",
     );
 }

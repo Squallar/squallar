@@ -362,12 +362,31 @@ impl super::App {
             // behind this call is read product-blind and never re-downloaded, so
             // it takes `whole_volume_complete`.
             if closed.progress.whole_volume_complete {
-                // **No archive: this volume was assembled from chunks and was
-                // never one compressed object**, so there is nothing to
-                // rebuild it from and `evict_decoded_except` will refuse to
-                // drop it. The archive of the same volume appears in the S3
-                // bucket minutes later and arrives down the drain's own path.
-                self.append_scan_to_active_loops(site, timestamp, scan, declared, None);
+                // **The volume's own compressed form**, from the chunks the
+                // feed was already holding — see
+                // `chunks::VolumeAssembler::take_archive`. It used to be
+                // `None`, on the reasoning that a chunk-assembled volume "was
+                // never one compressed object"; it was, and the S3 object
+                // published minutes later is the same concatenation.
+                //
+                // What that `None` cost is the one lever that can withdraw a
+                // whole decoded volume: `App::release_unneeded_base_gates`
+                // refuses a base with no way back, and `evict_decoded_except`
+                // refuses to trade a volume with nothing to decode from — so
+                // a chunk-fed base was un-withdrawable and its 33.7-82.7 MiB
+                // resident for the life of the process. Measured on a 420 s
+                // single-pane leg: 298 of 511 considerations refused for
+                // exactly this, on a scene where the archive drain's 60 s
+                // check is skipped because this feed is serving the site.
+                //
+                // An `Arc` clone, so the bytes travel by pointer.
+                self.append_scan_to_active_loops(
+                    site,
+                    timestamp,
+                    scan,
+                    declared,
+                    closed.archive.clone(),
+                );
             } else {
                 log::debug!(
                     "{site}: volume complete on the {} cut(s) the feed asked for but \

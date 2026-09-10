@@ -995,15 +995,69 @@ impl LoopDownloadManager {
         site: &str,
         collected: chrono::NaiveDateTime,
     ) -> Option<(chrono::NaiveDateTime, Arc<Vec<u8>>)> {
-        let (address, _) = self
-            .archive_identity
+        // **Every address for this identity is tried, not the first one.**
+        // One physical volume can be filed at two addresses — the chunk
+        // feed's own clock and the second an S3 key names, equal on 0 of the
+        // 171 local Archive II volumes — and only one of them may be holding
+        // the compressed half. A `find` that stopped at the first match and
+        // then asked the archive map answered `None` for a volume this cache
+        // was holding the bytes of, with which of the two came out of the map
+        // first deciding it.
+        let archives = self.archive_cache.get(site);
+        self.archive_identity
             .iter()
-            .find(|((held_site, _), identity)| {
+            .filter(|((held_site, _), identity)| {
                 held_site.as_str() == site && **identity == collected
-            })?;
-        let at = address.1;
-        let archive = self.archive_cache.get(site)?.get(&at).map(Arc::clone)?;
-        Some((at, archive))
+            })
+            .find_map(|((_, at), _)| {
+                let archive = archives?.get(at).map(Arc::clone)?;
+                Some((*at, archive))
+            })
+    }
+
+    /// **Every address this cache has learned decodes to `collected`, split
+    /// by what still stands behind it**: `(learned, with_archive,
+    /// with_decoded)`.
+    ///
+    /// The diagnostic beside [`Self::archive_for_identity`], which answers
+    /// "is there a way back" with one address or a `None`. That `None` has
+    /// three causes a byte figure cannot separate — no address for this
+    /// identity was ever learned, one was and its compressed half has since
+    /// gone, or one holds its compressed half and the search did not reach
+    /// it. Reads nothing this type does not already hold and mutates
+    /// nothing.
+    ///
+    /// A linear walk of the identity index, one entry per filed address, and
+    /// it runs where the withdrawal above runs rather than on a frame.
+    pub fn identity_way_backs(
+        &self,
+        site: &str,
+        collected: chrono::NaiveDateTime,
+    ) -> (usize, usize, usize) {
+        let mut learned = 0usize;
+        let mut with_archive = 0usize;
+        let mut with_decoded = 0usize;
+        for ((held_site, held_ts), identity) in &self.archive_identity {
+            if held_site.as_str() != site || *identity != collected {
+                continue;
+            }
+            learned = learned.saturating_add(1);
+            if self
+                .archive_cache
+                .get(site)
+                .is_some_and(|archives| archives.contains_key(held_ts))
+            {
+                with_archive = with_archive.saturating_add(1);
+                if self
+                    .scan_cache
+                    .get(site)
+                    .is_some_and(|scans| scans.contains_key(held_ts))
+                {
+                    with_decoded = with_decoded.saturating_add(1);
+                }
+            }
+        }
+        (learned, with_archive, with_decoded)
     }
 
     /// **Drop every archive whose `(site, timestamp)` fails `keep`.**
@@ -2271,6 +2325,58 @@ mod tests {
             (both.arrival_sole_bytes, both.twin_sole_bytes),
             (dup.arrival_sole_bytes, dup.twin_sole_bytes),
             "a pointer-equal duplicate adds no freeable bytes on either side"
+        );
+    }
+
+    /// **A way back is found through whichever address holds it, not through
+    /// whichever comes out of the map first.**
+    ///
+    /// One physical volume can be filed at two addresses — the chunk feed's
+    /// own clock and the second an S3 key names — and only one of them may
+    /// hold the compressed half. `archive_for_identity` used to take the
+    /// first identity match and then ask the archive map about that one
+    /// address, so which of the two the `HashMap` yielded first decided
+    /// whether a base had a way back at all. Deterministic within a process
+    /// and a coin flip between them, which is the shape of a defect that
+    /// hides for a whole leg.
+    ///
+    /// TAMPER: put the `?` back on the first match — spell it `find(..)?`
+    /// and then look the archive up — and this goes red about half the time,
+    /// which is why the fixture files the archive-less address FIRST and
+    /// asserts the address that comes back rather than only that one did.
+    #[test]
+    fn a_way_back_is_found_past_an_address_that_shares_the_identity_and_holds_nothing() {
+        let mut mgr = LoopDownloadManager::new();
+        let archive: Arc<Vec<u8>> = Arc::new(vec![3u8; 2048]);
+        let collected = crate::types::volume_collected_at(&priced_volume().0)
+            .expect("the fixture states an identity");
+
+        mgr.cache_scan("KTLX", ts(0), priced_volume());
+        mgr.cache_scan("KTLX", ts(1), priced_volume());
+        mgr.cache_archive("KTLX", ts(1), Arc::clone(&archive));
+
+        let (at, found) = mgr
+            .archive_for_identity("KTLX", collected)
+            .expect("the cache is holding this identity's bytes at one of two addresses");
+        assert_eq!(
+            at,
+            ts(1),
+            "the address handed back is not the one holding the archive, so \
+             the restore would decode from nothing",
+        );
+        assert!(
+            Arc::ptr_eq(&found, &archive),
+            "a different buffer came back"
+        );
+
+        // And the control: with no archive anywhere, both addresses still
+        // answer nothing.
+        let mut bare = LoopDownloadManager::new();
+        bare.cache_scan("KTLX", ts(0), priced_volume());
+        bare.cache_scan("KTLX", ts(1), priced_volume());
+        assert!(
+            bare.archive_for_identity("KTLX", collected).is_none(),
+            "a way back was invented for a volume nothing is holding bytes for",
         );
     }
 

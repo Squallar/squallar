@@ -3231,11 +3231,24 @@ impl super::App {
             loud,
             &crate::budget_telemetry::base_release_line(self.base_releases),
         );
+        // **And which of three states `no-archive` was refusing in.** The
+        // histogram above says that guard fired; this says whether the cache
+        // had never learned an address for the base's identity, had learned
+        // one and lost its compressed half, or was holding the bytes all
+        // along. A running total, so its own line.
+        say_telemetry(
+            loud,
+            &crate::budget_telemetry::base_way_back_line(self.base_way_backs),
+        );
         // **And what the decoder never built.** A running total and so its own
         // line, beside the two above rather than in the census: the census
         // carries levels and this is bytes that were never allocated in any of
         // them, so the two must never be added.
         say_telemetry(loud, &crate::budget_telemetry::moment_drop_line());
+        // **And what the chunk feed kept so its own volumes could be traded.**
+        // Running totals beside a level, so its own line for the reason the
+        // two above have one.
+        say_telemetry(loud, &crate::budget_telemetry::chunk_archive_line());
         // **And what those bases are holding that nothing would free.** The
         // release histogram above says which guard kept a base's gates; this
         // says what taking them would have been worth, which is a different
