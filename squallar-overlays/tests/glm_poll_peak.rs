@@ -579,10 +579,17 @@ fn archive_keys(designator: &str, count: usize) -> Vec<(String, NaiveDateTime)> 
 ///
 /// Every byte it allocates is on a server thread, and the high-water mark is
 /// thread-local — the reply buffers are in no figure below.
+/// `object_gets` counts **object** requests this archive answered and not
+/// listings — the wire's own reading of what a poll asked for, per archive
+/// instance and therefore immune to the neighbouring arms in this binary that
+/// the process-global `gauge` counters are not.
+use std::sync::atomic::AtomicUsize;
+
 fn s3_two_bucket_archive(
     east: Vec<(String, Vec<u8>)>,
     west: Vec<(String, Vec<u8>)>,
     gate: Option<Arc<BodiesInFlight>>,
+    object_gets: Arc<AtomicUsize>,
 ) -> DataSources {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
@@ -595,6 +602,7 @@ fn s3_two_bucket_archive(
             let east = Arc::clone(&east);
             let west = Arc::clone(&west);
             let gate = gate.clone();
+            let object_gets = Arc::clone(&object_gets);
             std::thread::spawn(move || {
                 let mut scratch = [0u8; 8192];
                 let read = stream.read(&mut scratch).unwrap_or(0);
@@ -609,10 +617,11 @@ fn s3_two_bucket_archive(
                 // Objects only. A listing is one request per satellite and is
                 // not a body in flight; holding it would gate the round on a
                 // window that can never fill.
-                if let Some(gate) = &gate
-                    && !is_a_listing(&path)
-                {
-                    gate.hold(GRANULE_FETCH_CONCURRENCY, A_QUIET_WIRE);
+                if !is_a_listing(&path) {
+                    object_gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(gate) = &gate {
+                        gate.hold(GRANULE_FETCH_CONCURRENCY, A_QUIET_WIRE);
+                    }
                 }
                 let _ = stream.write_all(&archive_reply(&path, granules));
                 let _ = stream.flush();
@@ -788,8 +797,14 @@ fn peak_of_a_cold_poll(
     west: Vec<(String, Vec<u8>)>,
     window: Residency,
     gate: Option<Arc<BodiesInFlight>>,
-) -> (GlmStore, squallar_overlays::glm::GlmFetchOutcome, i64) {
-    let sources = s3_two_bucket_archive(east, west, gate);
+) -> (
+    GlmStore,
+    squallar_overlays::glm::GlmFetchOutcome,
+    i64,
+    Arc<AtomicUsize>,
+) {
+    let object_gets = Arc::new(AtomicUsize::new(0));
+    let sources = s3_two_bucket_archive(east, west, gate, Arc::clone(&object_gets));
     let store = GlmStore::default();
     assert_eq!(
         store.retained_bytes(),
@@ -816,7 +831,12 @@ fn peak_of_a_cold_poll(
             window,
         ))
     });
-    (store, result.expect("the cold poll must succeed"), peak)
+    (
+        store,
+        result.expect("the cold poll must succeed"),
+        peak,
+        object_gets,
+    )
 }
 
 /// **The delivery.** A round that caches `N` rows must not hold more than one
@@ -840,7 +860,7 @@ fn a_cold_poll_holds_one_row_buffer_per_delivery() {
         .collect();
     let granule_bytes = east[0].1.len();
 
-    let (store, outcome, peak) = peak_of_a_cold_poll(east, west, a_live_window(), None);
+    let (store, outcome, peak, _gets) = peak_of_a_cold_poll(east, west, a_live_window(), None);
 
     let rows = cold_rows_total();
     assert_eq!(
@@ -1019,7 +1039,7 @@ fn a_batch_holds_no_more_bodies_than_the_concurrency_cap() {
     let granule_bytes = east[0].1.len();
 
     let gate = BodiesInFlight::new();
-    let (store, outcome, peak) =
+    let (store, outcome, peak, _gets) =
         peak_of_a_cold_poll(east, west, a_wire_window(), Some(Arc::clone(&gate)));
     let bodies = gate.peak();
 
@@ -1141,7 +1161,8 @@ fn a_spanned_poll_holds_no_more_rows_than_it_is_allowed_to_keep() {
     );
 
     let before = squallar_overlays::glm::fetch::gauge::read();
-    let (store, outcome, peak) = peak_of_a_cold_poll(east, west, a_spanned_window(), None);
+    let (store, outcome, peak, object_gets) =
+        peak_of_a_cold_poll(east, west, a_spanned_window(), None);
     let after = squallar_overlays::glm::fetch::gauge::read();
 
     // ── What survived, by key ──
@@ -1222,27 +1243,80 @@ fn a_spanned_poll_holds_no_more_rows_than_it_is_allowed_to_keep() {
 
     // ── The fires-counter, in both its halves ──
     //
-    // A granule the ceiling does not admit is accounted for exactly once: the
-    // trim evicted it after it was cached, or the retention floor refused it
-    // before it ever was. The second half is the one that costs nothing at all
-    // — rows that never enter the map — so the split is worth reporting rather
-    // than summing away.
+    // A granule the ceiling does not admit is accounted for exactly once, in
+    // one of **three** buckets, and they are three different prices: the trim
+    // evicted it after it was cached, the retention floor refused it after it
+    // was downloaded and parsed, or the early stop never asked for it at all.
+    // The third costs nothing anywhere — no body buffer, no row vector, no
+    // wire — so the split is worth reporting rather than summing away.
     let trim_granules = after.3 - before.3;
     let trim_rows = after.4 - before.4;
     let trim_sole_rows = after.5 - before.5;
     let refused_granules = after.6 - before.6;
     let refused_rows = after.7 - before.7;
+    let stopped_granules = after.14 - before.14;
+    let stopped_bytes = after.15 - before.15;
+    let fetched_granules = after.16 - before.16;
+    let fetched_bytes = after.17 - before.17;
+    let planned_bytes = after.18 - before.18;
+    let bound_exceeded = after.19 - before.19;
     assert_eq!(
-        trim_granules + refused_granules,
+        trim_granules + refused_granules + stopped_granules,
         SPAN_GRANULES_PER_SAT * 2 - retained,
-        "every granule the ceiling did not admit must have been either trimmed \
-         or refused, and the counters must have seen it — a mechanism that \
-         fires zero times is the defect these counters exist to catch",
+        "every granule the ceiling did not admit must have been trimmed, \
+         refused or stopped, and the counters must have seen it — a mechanism \
+         that fires zero times is the defect these counters exist to catch",
+    );
+    // **`fetched_granules` is not asserted against this fixture's key count**,
+    // and the reason is the counters' scope rather than the mechanism's: they
+    // are process-global and the other arms in this binary poll concurrently.
+    // Those arms run with no cap, so they add to `fetched` and to nothing else
+    // — 77 fetched against this fixture's 100 planned keys was 30 of a
+    // neighbour's on top of 47 of this one's. The three-bucket identity above
+    // survives that because a poll with no ceiling trims, refuses and stops
+    // nothing.
+    assert!(
+        fetched_granules + stopped_granules >= SPAN_GRANULES_PER_SAT * 2,
+        "every planned key of this fixture is either fetched or stopped, so the \
+         two counters together cannot be short of it: {fetched_granules} \
+         fetched and {stopped_granules} stopped against {} planned",
+        SPAN_GRANULES_PER_SAT * 2,
+    );
+    // **The early stop's soundness, measured on this fixture rather than
+    // argued.** `granule_bound_of` substitutes an upper bound read off the
+    // key's `_e` field for the newest flash the granule actually carries; every
+    // granule that parses is checked against it. Nonzero here is the bound
+    // failing to bound, which is the early stop able to refuse a granule
+    // `GranuleSink::install` would have kept.
+    assert_eq!(
+        bound_exceeded, 0,
+        "{bound_exceeded} parsed granules carried a flash later than their \
+         key's declared end: the early stop's substitute quantity does not \
+         bound the one the floor tests, so it can refuse a granule the floor \
+         would have admitted",
     );
     assert!(
-        trim_granules > 0 && refused_granules > 0,
-        "both halves must fire on this fixture, or one of them is untested \
-         here: trimmed {trim_granules}, refused {refused_granules}",
+        trim_granules > 0 && stopped_granules > 0,
+        "the trim and the early stop must both fire on this fixture, or one of \
+         them is untested here: trimmed {trim_granules}, stopped \
+         {stopped_granules}",
+    );
+    // **The wire's own count, which is the claim itself.** The counters above
+    // say the mechanism fired; this says the GETs it refused were never issued.
+    // Per-archive and so uncontaminated by the neighbouring arms, and tied to
+    // the process-global `stopped_granules` by the fact that an arm with no
+    // ceiling stops nothing.
+    assert_eq!(
+        object_gets.load(std::sync::atomic::Ordering::Relaxed),
+        SPAN_GRANULES_PER_SAT * 2 - stopped_granules,
+        "the archive answered a GET for a granule the early stop refused: \
+         {stopped_granules} stopped of {} planned",
+        SPAN_GRANULES_PER_SAT * 2,
+    );
+    assert!(
+        stopped_bytes > 0 && stopped_bytes < planned_bytes,
+        "the stopped bytes must be a real fraction of the planned download, \
+         not all of it and not none: {stopped_bytes} of {planned_bytes} B",
     );
     assert_eq!(
         (trim_rows + refused_rows) / rows_per_granule,
@@ -1259,7 +1333,10 @@ fn a_spanned_poll_holds_no_more_rows_than_it_is_allowed_to_keep() {
     println!(
         "counters: trimmed {trim_granules} granules / {trim_rows} rows ({} B, \
          all sole); floor refused {refused_granules} granules / {refused_rows} \
-         rows before they were cached ({} B never inserted)",
+         rows before they were cached ({} B never inserted); the early stop \
+         refused {stopped_granules} granules / {stopped_bytes} B of object \
+         before a GET, against {fetched_granules} fetched / {fetched_bytes} B, \
+         of {planned_bytes} B planned",
         trim_rows * FLASH_BYTES,
         refused_rows * FLASH_BYTES,
     );
@@ -1332,7 +1409,12 @@ fn two_rounds_in_flight_at_once_both_reach_the_store() {
         .into_iter()
         .map(|(key, start)| (key, a_granule(start, 41.0, ROWS, 0)))
         .collect();
-    let sources = s3_two_bucket_archive(east.clone(), west.clone(), None);
+    let sources = s3_two_bucket_archive(
+        east.clone(),
+        west.clone(),
+        None,
+        Arc::new(AtomicUsize::new(0)),
+    );
     let store = GlmStore::default();
     let client = loopback_client();
     let runtime = tokio::runtime::Builder::new_current_thread()

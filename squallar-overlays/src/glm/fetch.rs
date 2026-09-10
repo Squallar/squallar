@@ -574,7 +574,7 @@ pub async fn poll_glm_into_store(
 /// a refcount and not a free; only a granule this cache was the last owner of
 /// returns bytes. See [`GlmCache::evict_oldest_over`].
 pub mod gauge {
-    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
     static POLLS: AtomicUsize = AtomicUsize::new(0);
     static PEAK_ROWS: AtomicUsize = AtomicUsize::new(0);
@@ -590,6 +590,12 @@ pub mod gauge {
     static KEYS_ALREADY_HELD: AtomicUsize = AtomicUsize::new(0);
     static EMPTY_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
     static EMPTY_DELIVERY_ROWS: AtomicUsize = AtomicUsize::new(0);
+    static STOPPED_GRANULES: AtomicUsize = AtomicUsize::new(0);
+    static STOPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+    static FETCHED_GRANULES: AtomicUsize = AtomicUsize::new(0);
+    static FETCHED_BYTES: AtomicU64 = AtomicU64::new(0);
+    static PLANNED_BYTES: AtomicU64 = AtomicU64::new(0);
+    static BOUND_EXCEEDED: AtomicUsize = AtomicUsize::new(0);
 
     /// **A round that found the gate held**, and therefore a round that used to
     /// race the one holding it — the fires-counter for
@@ -614,9 +620,37 @@ pub mod gauge {
     /// follower of a coalesced round plans against its predecessor's granules,
     /// so an ask over the same instants reads `planned == 0` and every one of
     /// its keys lands here instead.
-    pub(super) fn planned(planned: usize, already_held: usize) {
+    pub(super) fn planned(planned: usize, already_held: usize, planned_bytes: u64) {
         KEYS_PLANNED.fetch_add(planned, Relaxed);
         KEYS_ALREADY_HELD.fetch_add(already_held, Relaxed);
+        PLANNED_BYTES.fetch_add(planned_bytes, Relaxed);
+    }
+
+    /// **The early stop's fires-counter** — see [`super::FloorCell::refuses`].
+    ///
+    /// `stopped` against `fetched` is the cut priced in the units the wire is
+    /// billed in, and `planned_bytes` above is the denominator both share, all
+    /// three summed over the same polls of the same leg. A mechanism that
+    /// executed zero times reads zero here, which is the only thing that
+    /// distinguishes it from one that did.
+    ///
+    /// `bound_exceeded` is the soundness witness rather than a saving:
+    /// [`super::granule_bound_of`] substitutes a key-derived upper bound for a
+    /// quantity only the parsed rows carry, and this is the count of granules
+    /// whose rows went past it. Nonzero means the early stop can refuse a
+    /// granule [`super::GranuleSink::install`] would have kept.
+    pub(super) fn early_stop(
+        stopped_granules: usize,
+        stopped_bytes: u64,
+        fetched_granules: usize,
+        fetched_bytes: u64,
+        bound_exceeded: usize,
+    ) {
+        STOPPED_GRANULES.fetch_add(stopped_granules, Relaxed);
+        STOPPED_BYTES.fetch_add(stopped_bytes, Relaxed);
+        FETCHED_GRANULES.fetch_add(fetched_granules, Relaxed);
+        FETCHED_BYTES.fetch_add(fetched_bytes, Relaxed);
+        BOUND_EXCEEDED.fetch_add(bound_exceeded, Relaxed);
     }
 
     /// **A poll that downloaded granules and then delivered no flashes at
@@ -660,7 +694,9 @@ pub mod gauge {
     /// `(polls, peak_rows, unstreamed_peak_rows, trim_granules, trim_rows,
     /// trim_sole_rows, refused_granules, refused_rows, rounds_queued,
     /// rounds_discarded_stale, keys_planned, keys_already_held,
-    /// empty_deliveries, empty_delivery_rows)`.
+    /// empty_deliveries, empty_delivery_rows, stopped_granules,
+    /// stopped_bytes, fetched_granules, fetched_bytes, planned_bytes,
+    /// bound_exceeded)`.
     ///
     /// Appended to rather than reshaped: the readers index it positionally, and
     /// a row's position is what a published figure was read at.
@@ -680,6 +716,12 @@ pub mod gauge {
         usize,
         usize,
         usize,
+        usize,
+        u64,
+        usize,
+        u64,
+        u64,
+        usize,
     ) {
         (
             POLLS.load(Relaxed),
@@ -696,7 +738,58 @@ pub mod gauge {
             KEYS_ALREADY_HELD.load(Relaxed),
             EMPTY_DELIVERIES.load(Relaxed),
             EMPTY_DELIVERY_ROWS.load(Relaxed),
+            STOPPED_GRANULES.load(Relaxed),
+            STOPPED_BYTES.load(Relaxed),
+            FETCHED_GRANULES.load(Relaxed),
+            FETCHED_BYTES.load(Relaxed),
+            PLANNED_BYTES.load(Relaxed),
+            BOUND_EXCEEDED.load(Relaxed),
         )
+    }
+}
+
+/// **The retention floor as it stands right now**, shared between
+/// [`GranuleSink::install`], which is the only thing that raises it, and the
+/// in-flight downloads of [`download_and_parse_batch`], which read it before
+/// they ask for a byte.
+///
+/// **One authority and not two.** `install` applies its refusal test to *this*
+/// value rather than to its own [`Eviction::floor`] copy, so a floor the sink
+/// stopped publishing is a floor `install` stops enforcing — which
+/// `the_streamed_trim_keeps_what_one_end_of_poll_trim_would_have_kept` fails on
+/// over all 40,320 permutations of its fixture. A second copy read only by the
+/// downloads could have drifted silently.
+///
+/// An `Arc<Mutex<_>>` rather than a `Rc<RefCell<_>>` because the poll's future
+/// is spawned and must stay `Send`; the lock is taken once per granule, on the
+/// fetch task, between network awaits.
+#[derive(Clone, Default)]
+struct FloorCell(std::sync::Arc<std::sync::Mutex<Option<(NaiveDateTime, String)>>>);
+
+impl FloorCell {
+    fn publish(&self, floor: Option<(NaiveDateTime, String)>) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = floor;
+    }
+
+    /// **The floor test, spelled once and applied to two arguments.**
+    ///
+    /// [`GranuleSink::install`] passes the granule's own [`granule_newest`];
+    /// the early stop passes [`granule_bound_of`]'s upper bound on that same
+    /// quantity for the same key. The bound is never below `newest` and the key
+    /// half of the tuple is identical, so `(newest, key) <= (bound, key)`
+    /// lexicographically and a `true` on the bound implies a `true` on
+    /// `newest`: **every granule stopped early is one `install` would have
+    /// refused.** The converse does not hold, and does not need to — a granule
+    /// the bound is too generous for is downloaded and then refused by this
+    /// same test, exactly as it was before.
+    fn refuses(&self, newest: NaiveDateTime, key: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|(floor_newest, floor_key)| {
+                (newest, key) <= (*floor_newest, floor_key.as_str())
+            })
     }
 }
 
@@ -742,6 +835,24 @@ struct GranuleSink<'a> {
     /// shape never inserts at all.
     refused_granules: usize,
     refused_rows: usize,
+    /// The live floor every in-flight download reads — see [`FloorCell`].
+    floor: FloorCell,
+    /// **The early stop's fires-counter**: granules whose GET was never issued
+    /// because the floor had already risen above the newest flash their key can
+    /// carry, and the object bytes that GET would have put on the wire and into
+    /// a body buffer.
+    stopped_granules: usize,
+    stopped_bytes: u64,
+    /// Bodies this poll did download, so [`Self::stopped_bytes`] has an
+    /// in-poll denominator instead of a cross-leg one.
+    fetched_granules: usize,
+    fetched_bytes: u64,
+    /// Granules whose parsed newest flash sat **later** than
+    /// [`granule_bound_of`]'s bound on it. The witness for the early stop's
+    /// soundness, and zero is the whole claim: a nonzero reading is the bound
+    /// failing to bound, which is the early stop refusing a granule `install`
+    /// would have kept.
+    bound_exceeded: usize,
 }
 
 impl<'a> GranuleSink<'a> {
@@ -758,7 +869,26 @@ impl<'a> GranuleSink<'a> {
             evicted: Eviction::default(),
             refused_granules: 0,
             refused_rows: 0,
+            floor: FloorCell::default(),
+            stopped_granules: 0,
+            stopped_bytes: 0,
+            fetched_granules: 0,
+            fetched_bytes: 0,
+            bound_exceeded: 0,
         }
+    }
+
+    /// A download the early stop never issued — see [`FloorCell::refuses`].
+    fn stopped(&mut self, object_bytes: u64) {
+        self.stopped_granules += 1;
+        self.stopped_bytes += object_bytes;
+    }
+
+    /// A body that did arrive, counted where its length is still known: the
+    /// parse takes the `Vec` and nothing downstream can ask how long it was.
+    fn fetched(&mut self, body_bytes: usize) {
+        self.fetched_granules += 1;
+        self.fetched_bytes += body_bytes as u64;
     }
 
     /// **A granule below the retention floor is not admitted at all.**
@@ -781,9 +911,12 @@ impl<'a> GranuleSink<'a> {
     fn install(&mut self, key: String, flashes: Vec<GlmFlash>) {
         let granule_start = granule_start_of(&key, self.as_of);
         let newest = granule_newest(granule_start, &flashes);
-        if let Some(floor) = self.evicted.floor.as_ref()
-            && (newest, key.as_str()) <= (floor.0, floor.1.as_str())
-        {
+        // The early stop's substitute quantity, checked against the real one on
+        // every granule that gets this far. See [`granule_bound_of`].
+        if granule_bound_of(&key).is_some_and(|bound| newest > bound) {
+            self.bound_exceeded += 1;
+        }
+        if self.floor.refuses(newest, &key) {
             self.refused_granules += 1;
             self.refused_rows += flashes.len();
             return;
@@ -795,6 +928,8 @@ impl<'a> GranuleSink<'a> {
         if let Some(cap) = self.cap {
             let evicted = self.cache.evict_oldest_over(cap);
             self.evicted.absorb(evicted);
+            // The downloads still in flight read this, not a copy of it.
+            self.floor.publish(self.evicted.floor.clone());
         }
     }
 
@@ -823,6 +958,11 @@ impl<'a> GranuleSink<'a> {
             mut evicted,
             refused_granules,
             refused_rows,
+            stopped_granules,
+            stopped_bytes,
+            fetched_granules,
+            fetched_bytes,
+            bound_exceeded,
             ..
         } = self;
         if let Some(cap) = cap {
@@ -836,6 +976,11 @@ impl<'a> GranuleSink<'a> {
             evicted,
             refused_granules,
             refused_rows,
+            stopped_granules,
+            stopped_bytes,
+            fetched_granules,
+            fetched_bytes,
+            bound_exceeded,
         }
     }
 }
@@ -854,10 +999,26 @@ struct PollLevels {
     /// row it carried in plus every row it installed, none of them freed until
     /// the last download returned. **This poll's own control for its own
     /// peak**, which is the only kind this app can price a memory cut with.
+    ///
+    /// **Its denominator moved when the early stop landed, and it is a
+    /// different figure now.** It is a control over the granules the poll
+    /// *fetched*, and the early stop is a cut in exactly that set: rows it
+    /// stops are absent from both sides of the ratio, because a granule whose
+    /// GET was never issued has no row count to add to either. So the ratio
+    /// this reports fell — from 12.501× on the poll that installed 3.2 M rows —
+    /// and nothing about the streamed install regressed; the poll simply no
+    /// longer downloads the rows the trim used to throw away. What prices the
+    /// early stop is [`gauge::early_stop`]'s bytes, not this.
     unstreamed_peak_rows: usize,
     evicted: Eviction,
     refused_granules: usize,
     refused_rows: usize,
+    /// The early stop's own figures — see [`GranuleSink::stopped_granules`].
+    stopped_granules: usize,
+    stopped_bytes: u64,
+    fetched_granules: usize,
+    fetched_bytes: u64,
+    bound_exceeded: usize,
 }
 
 /// The instant a granule is aged against, from the S3 key it was listed under;
@@ -1041,6 +1202,11 @@ pub async fn fetch_glm_flashes(
         evicted,
         refused_granules,
         refused_rows,
+        stopped_granules,
+        stopped_bytes,
+        fetched_granules,
+        fetched_bytes,
+        bound_exceeded,
     } = sink.finish();
     gauge::record(
         peak_rows,
@@ -1049,14 +1215,25 @@ pub async fn fetch_glm_flashes(
         refused_granules,
         refused_rows,
     );
-    gauge::planned(tally.planned, tally.already_held);
+    gauge::planned(tally.planned, tally.already_held, tally.planned_bytes);
+    gauge::early_stop(
+        stopped_granules,
+        stopped_bytes,
+        fetched_granules,
+        fetched_bytes,
+        bound_exceeded,
+    );
     log::info!(
         "GLM poll: {installed_granules} granules installed, peak {peak_rows} rows \
          ({} B), unstreamed peak would be {unstreamed_peak_rows} rows ({} B); \
          in-poll trim dropped {} granules / {} rows, {} of them sole ({} B \
          freed); the floor refused {refused_granules} granules / \
          {refused_rows} rows before they were cached; the plan asked for {} \
-         keys and skipped {} the store already held",
+         keys and skipped {} the store already held; the early stop refused \
+         {stopped_granules} granules / {stopped_bytes} B of object before a \
+         GET against {fetched_granules} fetched / {fetched_bytes} B, of {} B \
+         planned, and {bound_exceeded} parsed granules ran past their key's \
+         bound",
         peak_rows * FLASH_BYTES,
         unstreamed_peak_rows * FLASH_BYTES,
         evicted.granules,
@@ -1065,6 +1242,7 @@ pub async fn fetch_glm_flashes(
         evicted.sole_rows * FLASH_BYTES,
         tally.planned,
         tally.already_held,
+        tally.planned_bytes,
     );
 
     // Still keyed on `satellites`, not `queried`: a satellite whose listing
@@ -1216,26 +1394,55 @@ struct PollTally {
     /// and `planned + already_held` is the covered set.
     planned: usize,
     already_held: usize,
+    /// The object bytes those planned keys named — the denominator
+    /// `stopped_bytes` is a fraction of, summed in the same poll that stopped
+    /// them so no cross-leg pairing is involved.
+    planned_bytes: u64,
 }
 
 /// The tally counts every listed key, not the returned ones: a download-count
 /// denominator makes one persistent failure look like a total outage.
 fn plan_downloads<'a>(
-    keys: &'a [String],
+    keys: &'a [ListedObject],
     cache: &GlmCache,
     listed: &[(NaiveDateTime, NaiveDateTime)],
     tally: &mut PollTally,
-) -> Vec<&'a str> {
+) -> Vec<&'a ListedObject> {
     tally.in_window += keys.len();
-    let planned: Vec<&'a str> = keys
+    let mut planned: Vec<&'a ListedObject> = keys
         .iter()
-        .filter(|k| covers(listed, k.as_str()))
-        .filter(|k| !cache.contains_key(k.as_str()))
-        .map(|k| k.as_str())
+        .filter(|o| covers(listed, o.key.as_str()))
+        .filter(|o| !cache.contains_key(o.key.as_str()))
         .collect();
-    let covered = keys.iter().filter(|k| covers(listed, k.as_str())).count();
+    let covered = keys
+        .iter()
+        .filter(|o| covers(listed, o.key.as_str()))
+        .count();
     tally.planned += planned.len();
     tally.already_held += covered - planned.len();
+    tally.planned_bytes += planned.iter().map(|o| o.bytes).sum::<u64>();
+    // **Newest first, and that ordering is what makes the early stop worth
+    // having.** The retention floor only ever rises, and it rises when the
+    // ceiling refuses a granule; a batch taken oldest-first fills the ceiling
+    // with rows the newest arrivals then evict, so the floor arrives late and
+    // the downloads it would have stopped have already been paid for. Taken
+    // newest-first the ceiling is full after its first ~16 granules and the
+    // floor stands above every remaining key in the batch.
+    //
+    // **It cannot change what the poll retains.** The retained set is the
+    // newest suffix within the ceiling in *every* arrival order, pinned over
+    // all 40,320 permutations of an 8-granule fixture by
+    // `the_streamed_trim_keeps_what_one_end_of_poll_trim_would_have_kept`. This
+    // reorders which of them are asked for first, not which survive.
+    //
+    // Descending on [`granule_bound_of`] and then on the key, which is
+    // [`GlmCache::evict_oldest_over`]'s own sort reversed; `None` bounds sort
+    // last and are never stopped.
+    planned.sort_unstable_by(|a, b| {
+        granule_bound_of(&b.key)
+            .cmp(&granule_bound_of(&a.key))
+            .then_with(|| b.key.cmp(&a.key))
+    });
     planned
 }
 
@@ -1297,10 +1504,36 @@ fn covers(listed: &[(NaiveDateTime, NaiveDateTime)], key: &str) -> bool {
         .any(|&(from, to)| start >= from && start <= to)
 }
 
+/// **One object the listing named, with the size it declared.**
+///
+/// The size is carried because the early stop's whole figure is a download it
+/// did not make, and a GET that never happens can only be priced by what the
+/// listing said the object weighed. An average over the ones that *were*
+/// fetched would be a scaled figure, which is not a measurement.
+struct ListedObject {
+    key: String,
+    /// The object's own `Size` element. `0` when the listing named none, so the
+    /// counter under-reports rather than invents — the same direction
+    /// [`granule_bound_of`] fails in.
+    bytes: u64,
+}
+
 struct GlmListing {
-    keys: Vec<String>,
+    keys: Vec<ListedObject>,
     objects_seen: usize,
     prefixes: Vec<String>,
+}
+
+/// The `Size` beside a `Key` in the same `Contents` element.
+fn object_size(key_node: roxmltree::Node<'_, '_>) -> u64 {
+    key_node
+        .parent()
+        .into_iter()
+        .flat_map(|contents| contents.children())
+        .find(|n| n.tag_name().name() == "Size")
+        .and_then(|n| n.text())
+        .and_then(|t| t.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 /// S3 path: `GLM-L2-LCFA/{year}/{day_of_year}/{hour}/`
@@ -1383,7 +1616,10 @@ async fn list_glm_files(
                         && file_start >= start
                         && file_start <= end
                     {
-                        all_keys.push(key.to_string());
+                        all_keys.push(ListedObject {
+                            key: key.to_string(),
+                            bytes: object_size(node),
+                        });
                     }
                 }
             }
@@ -1439,11 +1675,40 @@ async fn list_glm_files(
 /// `OR_GLM-L2-LCFA_G19_s20261120145200_e...nc` is `YYYYDDDHHMMSSf`, DDD = day of
 /// year, f = tenths of a second.
 fn parse_filename_start_time(key: &str) -> Option<NaiveDateTime> {
+    parse_filename_field_time(key, "_s")
+}
+
+/// **An upper bound on a granule's newest flash, from its key alone** — the
+/// substitute quantity the early stop in [`download_and_parse_batch`] applies
+/// [`FloorCell::refuses`] to, because the real one ([`granule_newest`]) is a
+/// fold over rows that only exist once the body has been downloaded and parsed.
+///
+/// The `_e` field of the key is the granule's own declared coverage end, so no
+/// flash it carries is stamped later. The reader keeps whole seconds while the
+/// field names tenths, so the bound is rounded up by one second: a bound a
+/// tenth short of the content would refuse a granule [`GranuleSink::install`]
+/// admits, and the whole soundness of the early stop is that it cannot.
+///
+/// `None` on a key with no datable `_e`, which stops nothing — the same
+/// direction [`covers`] fails in.
+///
+/// **That the bound really bounds is measured, not assumed.**
+/// [`GranuleSink::install`] compares every granule it parses against this
+/// function's answer for its own key and counts the excesses
+/// ([`PollLevels::bound_exceeded`]); a leg reporting anything but zero there is
+/// reporting that the early stop can refuse a granule the floor would not.
+fn granule_bound_of(key: &str) -> Option<NaiveDateTime> {
+    Some(parse_filename_field_time(key, "_e")? + TimeDelta::seconds(1))
+}
+
+/// The 14-digit `YYYYDDDHHMMSSf` field named by `field` (`_s` or `_e`),
+/// truncated to the second.
+fn parse_filename_field_time(key: &str, field: &str) -> Option<NaiveDateTime> {
     let filename = key.rsplit('/').next()?;
-    let s_idx = filename.find("_s")?;
-    let s_field = &filename[s_idx + 2..];
-    // `get`, not `[..14]`: a multi-byte character in the `_s` field would put
-    // a range boundary inside a UTF-8 sequence and panic.
+    let idx = filename.find(field)?;
+    let s_field = &filename[idx + field.len()..];
+    // `get`, not `[..14]`: a multi-byte character in the field would put a
+    // range boundary inside a UTF-8 sequence and panic.
     let digits = s_field.get(..14)?;
     let year: i32 = digits.get(0..4)?.parse().ok()?;
     let doy: u32 = digits.get(4..7)?.parse().ok()?;
@@ -1488,23 +1753,43 @@ async fn download_and_parse_batch(
     sources: &DataSources,
     satellite: GlmSatellite,
     bucket: &str,
-    keys: &[&str],
+    objects: &[&ListedObject],
     levels: &[GlmDataLevel],
     sink: &mut GranuleSink<'_>,
 ) -> BatchOutcome {
     use futures::stream::StreamExt;
 
     let levels_owned: Vec<GlmDataLevel> = levels.to_vec();
-    let futs: Vec<_> = keys
+    let futs: Vec<_> = objects
         .iter()
-        .map(|&key| {
+        .map(|&object| {
             let client = client.clone();
-            let url = sources.s3_object_url(bucket, key);
-            let key_owned = key.to_string();
+            let url = sources.s3_object_url(bucket, &object.key);
+            let key_owned = object.key.clone();
+            let object_bytes = object.bytes;
+            let bound = granule_bound_of(&object.key);
+            let floor = sink.floor.clone();
             let lvls = levels_owned.clone();
             async move {
+                // **The floor as it stands at this instant, not as it stood
+                // when the batch was planned.** A plan-time filter cannot work
+                // here and the reason is arithmetic: the retained level sits
+                // one granule *under* the ceiling when a poll begins, so the
+                // sound floor at plan time is almost always "none" — measured
+                // at 355 of 12,463 keys, 2.8%. The floor this reads was raised
+                // by the granules of this same batch that have already
+                // installed, which is why the ordering above is newest-first.
+                if let Some(bound) = bound
+                    && floor.refuses(bound, &key_owned)
+                {
+                    return Ok(Fetched::Stopped { object_bytes });
+                }
                 match download_and_parse_one(&client, &url, satellite, &lvls).await {
-                    Ok(parsed) => Ok((key_owned, parsed)),
+                    Ok((body_bytes, parsed)) => Ok(Fetched::Parsed {
+                        key: key_owned,
+                        body_bytes,
+                        parsed,
+                    }),
                     Err(e) => {
                         // Debug, not warn: with `GRANULE_FETCH_CONCURRENCY`
                         // files in flight one schema change would produce a
@@ -1533,13 +1818,15 @@ impl BatchOutcome {
     /// One finished download, folded in — and its rows handed to the sink
     /// rather than parked in this struct. The failure bookkeeping is byte for
     /// byte what `from_results` did; only the rows changed owner.
-    fn absorb_one(
-        &mut self,
-        result: Result<(String, GranuleParse), FileError>,
-        sink: &mut GranuleSink<'_>,
-    ) {
+    fn absorb_one(&mut self, result: Result<Fetched, FileError>, sink: &mut GranuleSink<'_>) {
         match result {
-            Ok((key, parsed)) => {
+            Ok(Fetched::Stopped { object_bytes }) => sink.stopped(object_bytes),
+            Ok(Fetched::Parsed {
+                key,
+                body_bytes,
+                parsed,
+            }) => {
+                sink.fetched(body_bytes);
                 self.drops.absorb(parsed.drops);
                 for failure in parsed.level_failures {
                     if !self.level_failures.iter().any(|f: &LevelFailure| {
@@ -1565,7 +1852,7 @@ impl BatchOutcome {
     /// need somewhere to go, so it folds through a sink over a scratch cache
     /// with no cap — the arms assert on the failure buckets and the installed
     /// count, never on the cache.
-    fn from_results(results: Vec<Result<(String, GranuleParse), FileError>>) -> Self {
+    fn from_results(results: Vec<Result<Fetched, FileError>>) -> Self {
         let mut cache = GlmCache::default();
         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
             .unwrap()
@@ -1578,6 +1865,26 @@ impl BatchOutcome {
         }
         outcome
     }
+}
+
+/// **What one slot of the batch produced**, which is now two different things:
+/// a granule that was downloaded and parsed, or one whose GET was never issued
+/// because the retention floor had already risen above it.
+///
+/// A third `FileError` variant would have been wrong — a stop is not a failure
+/// and must not reach [`BatchOutcome::transport_errors`], where it would be
+/// reported to the user as a feed problem and counted against the batch.
+enum Fetched {
+    Parsed {
+        key: String,
+        /// The body's length, taken here because [`parse_downloaded_file`]
+        /// consumes the `Vec` and nothing downstream can ask how long it was.
+        body_bytes: usize,
+        parsed: GranuleParse,
+    },
+    Stopped {
+        object_bytes: u64,
+    },
 }
 
 /// Why one file did not contribute: a file that arrives and will not parse
@@ -1624,11 +1931,12 @@ async fn download_and_parse_one(
     url: &str,
     satellite: GlmSatellite,
     levels: &[GlmDataLevel],
-) -> Result<GranuleParse, FileError> {
+) -> Result<(usize, GranuleParse), FileError> {
     let bytes = download_bytes(client, url)
         .await
         .map_err(FileError::Transport)?;
-    parse_downloaded_file(bytes, satellite, levels)
+    let body_bytes = bytes.len();
+    parse_downloaded_file(bytes, satellite, levels).map(|parsed| (body_bytes, parsed))
 }
 
 /// **Takes the body**, so the buffer the transport allocated is the only copy

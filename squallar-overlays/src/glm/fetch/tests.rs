@@ -246,17 +246,39 @@ fn a_level_that_failed_contributes_no_denominator() {
     );
 }
 
+/// A finished download, as [`download_and_parse_batch`]'s stream hands one
+/// over. The body length is the arm's own figure: these arms assert on the
+/// failure buckets and the installed count, never on bytes.
+fn fetched(key: &str, parsed: GranuleParse) -> Result<Fetched, FileError> {
+    Ok(Fetched::Parsed {
+        key: key.to_string(),
+        body_bytes: 0,
+        parsed,
+    })
+}
+
+/// The listing rows [`plan_downloads`] plans over, from keys alone: these arms
+/// count keys, and the `Size` an object declared is not one of their subjects.
+fn listing_of(keys: &[String]) -> Vec<ListedObject> {
+    keys.iter()
+        .map(|key| ListedObject {
+            key: key.clone(),
+            bytes: 0,
+        })
+        .collect()
+}
+
 #[test]
 fn batch_partition_keeps_every_error_and_separates_the_kinds() {
     let outcome = BatchOutcome::from_results(vec![
-        Ok((
-            "a.nc".into(),
+        fetched(
+            "a.nc",
             GranuleParse {
                 records: Vec::new(),
                 level_failures: Vec::new(),
                 drops: RecordDrops::default(),
             },
-        )),
+        ),
         Err(FileError::Parse("b.nc: bad variable".into())),
         Err(FileError::Transport("c.nc: HTTP status error: 503".into())),
         Err(FileError::Parse("d.nc: bad variable".into())),
@@ -282,30 +304,30 @@ fn batch_partition_dedups_level_failures_per_level_not_per_file() {
         ]
     };
     let outcome = BatchOutcome::from_results(vec![
-        Ok((
-            "a.nc".into(),
+        fetched(
+            "a.nc",
             GranuleParse {
                 records: Vec::new(),
                 level_failures: both_broken(),
                 drops: RecordDrops::default(),
             },
-        )),
-        Ok((
-            "b.nc".into(),
+        ),
+        fetched(
+            "b.nc",
             GranuleParse {
                 records: Vec::new(),
                 level_failures: both_broken(),
                 drops: RecordDrops::default(),
             },
-        )),
-        Ok((
-            "c.nc".into(),
+        ),
+        fetched(
+            "c.nc",
             GranuleParse {
                 records: Vec::new(),
                 level_failures: both_broken(),
                 drops: RecordDrops::default(),
             },
-        )),
+        ),
     ]);
 
     assert_eq!(
@@ -326,8 +348,8 @@ fn batch_partition_dedups_level_failures_per_level_not_per_file() {
 #[test]
 fn batch_partition_sums_record_drops_rather_than_deduping_them() {
     let with_drops = |considered, fill_values, off_globe| {
-        Ok((
-            "x.nc".to_string(),
+        fetched(
+            "x.nc",
             GranuleParse {
                 records: Vec::new(),
                 level_failures: Vec::new(),
@@ -337,7 +359,7 @@ fn batch_partition_sums_record_drops_rather_than_deduping_them() {
                     off_globe,
                 },
             },
-        ))
+        )
     };
     let outcome = BatchOutcome::from_results(vec![
         with_drops(100, 3, 1),
@@ -445,7 +467,8 @@ fn poll_plan_separates_window_size_from_work_to_do() {
     }
 
     let mut tally = PollTally::default();
-    let new_keys = plan_downloads(&keys, &cache, &live_round(), &mut tally);
+    let listing = listing_of(&keys);
+    let new_keys = plan_downloads(&listing, &cache, &live_round(), &mut tally);
     assert_eq!(
         tally.in_window, 12,
         "the window still contains every listed file, cached or not"
@@ -453,7 +476,12 @@ fn poll_plan_separates_window_size_from_work_to_do() {
     assert_eq!(new_keys.len(), 3, "only the uncached ones need downloading");
 
     let other: Vec<String> = (0..4).map(|i| format!("w{i}.nc")).collect();
-    plan_downloads(&other, &GlmCache::default(), &live_round(), &mut tally);
+    plan_downloads(
+        &listing_of(&other),
+        &GlmCache::default(),
+        &live_round(),
+        &mut tally,
+    );
     assert_eq!(tally.in_window, 16);
 
     let mut cache = GlmCache::default();
@@ -461,7 +489,7 @@ fn poll_plan_separates_window_size_from_work_to_do() {
         cache.insert(key.clone(), t0(), Vec::new());
     }
     let mut tally = PollTally::default();
-    let new_keys = plan_downloads(&keys, &cache, &live_round(), &mut tally);
+    let new_keys = plan_downloads(&listing, &cache, &live_round(), &mut tally);
     assert_eq!(new_keys.len(), 1);
     let report =
         summarize_failures(tally.in_window, vec!["k11.nc: boom".into()]).expect("one failure");
@@ -657,7 +685,7 @@ fn a_quiet_granule_is_downloaded_once_not_once_per_poll() {
     let key = "GLM-L2-LCFA/2026/205/12/\
                    OR_GLM-L2-LCFA_G19_s20262051200000_e20262051200200_c20262051200214.nc";
     let start = parse_filename_start_time(key).expect("fixture key must be datable");
-    let listing = vec![key.to_string()];
+    let listing = listing_of(&[key.to_string()]);
 
     let mut cache = GlmCache::default();
     let mut tally = PollTally::default();
