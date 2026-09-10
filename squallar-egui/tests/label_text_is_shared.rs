@@ -270,13 +270,13 @@ fn probing_the_galley_memo_for_every_label_allocates_no_names() {
 
     // Warm every entry. This is the miss path and it is not measured.
     for text in &texts {
-        let _ = text.galley_cached(&ctx, &mut galleys);
+        let _ = text.galley_cached(&ctx, &mut galleys, ctx.pixels_per_point());
     }
     let warmed = galleys.hits();
 
     let (_, allocs) = allocations_during(|| {
         for text in &texts {
-            let _ = text.galley_cached(&ctx, &mut galleys);
+            let _ = text.galley_cached(&ctx, &mut galleys, ctx.pixels_per_point());
         }
     });
 

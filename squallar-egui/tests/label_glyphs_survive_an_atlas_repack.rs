@@ -109,7 +109,7 @@ fn a_memo_that_missed_the_repack_frames_does_not_serve_stale_glyphs() {
 
     // On screen: the label enters the memo, on a frame the memo watched.
     let kept = frame(&ctx, &mut cache, true, |ctx, cache| {
-        label("Tulsa").galley_cached(ctx, cache)
+        label("Tulsa").galley_cached(ctx, cache, ctx.pixels_per_point())
     });
     let stored = stamp(&ctx);
     assert_eq!(stored.0, full);
@@ -142,7 +142,7 @@ fn a_memo_that_missed_the_repack_frames_does_not_serve_stale_glyphs() {
     // Back: the same name is asked for again.
     let (served, truth) = frame(&ctx, &mut cache, true, |ctx, cache| {
         (
-            label("Tulsa").galley_cached(ctx, cache),
+            label("Tulsa").galley_cached(ctx, cache, ctx.pixels_per_point()),
             label("Tulsa").galley(ctx),
         )
     });
@@ -174,7 +174,7 @@ fn a_memo_watched_every_pass_does_not_serve_stale_glyphs() {
     for _ in 0..4000 {
         let before = stamp(&ctx);
         let (served, truth) = frame(&ctx, &mut cache, true, |ctx, cache| {
-            let served = label("Tulsa").galley_cached(ctx, cache);
+            let served = label("Tulsa").galley_cached(ctx, cache, ctx.pixels_per_point());
             let truth = label("Tulsa").galley(ctx);
             burn(ctx, &mut size);
             (served, truth)
@@ -205,12 +205,12 @@ fn the_generation_moves_only_when_the_raster_does() {
 
     // A still map: the same label, frame after frame, moves nothing.
     let settled = frame(&ctx, &mut cache, true, |ctx, cache| {
-        label("Tulsa").galley_cached(ctx, cache);
+        label("Tulsa").galley_cached(ctx, cache, ctx.pixels_per_point());
         cache.generation()
     });
     for _ in 0..8 {
         let g = frame(&ctx, &mut cache, true, |ctx, cache| {
-            label("Tulsa").galley_cached(ctx, cache);
+            label("Tulsa").galley_cached(ctx, cache, ctx.pixels_per_point());
             cache.generation()
         });
         assert_eq!(g, settled, "a still map must not churn the generation");

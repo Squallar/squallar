@@ -742,7 +742,7 @@ fn ground_tile_line(t: &squallar_egui::tile_mesh::ledger::Totals) -> String {
         "ground tiles: {} placed, {} stroke pts, {} labels, {} draws, \
          {} uploads of {} B, {} evicted, {} B resident, {} unrendered, \
          {} stroke draws, {} label solves, {} stroke run meshes, \
-         {} stroke mesh verts, {} shapes",
+         {} stroke mesh verts, {} shapes, {} shape slots",
         t.mesh_vertices_placed,
         t.path_points_placed,
         t.label_anchors_placed,
@@ -757,6 +757,7 @@ fn ground_tile_line(t: &squallar_egui::tile_mesh::ledger::Totals) -> String {
         t.stroke_run_meshes,
         t.stroke_mesh_vertices,
         t.ground_shapes,
+        t.ground_shape_slots,
     )
 }
 

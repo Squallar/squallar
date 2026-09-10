@@ -1190,3 +1190,73 @@ fn the_hairline_branch_begins_where_the_arithmetic_says_it_does() {
         feathering()
     );
 }
+
+/// **What a tile hands the painter is one shape, and it used to reserve room
+/// for every shape it holds.**
+///
+/// `ui_map_overlays::paint_vector_tile` collects the frame's placed shapes
+/// into a `Vec<egui::Shape>` and hands the whole thing to `Painter::extend`.
+/// Sized from the tile's shape list, that vector was `size_of::<egui::Shape>()`
+/// times a dense tile's shape count — tens of kilobytes asked of the allocator
+/// and handed back on the same frame, once per drawn tile — while what a
+/// planned tile actually places is its run batches and the handful of shapes
+/// that are neither a run nor a deferred label.
+///
+/// This is the gate on [`TilePlan::shape_slots`] being that number. It reads
+/// the count off the real fixture's plan and compares it against a replay of
+/// the walk's own pushes; a `shape_slots` that counted the label steps — which
+/// push onto the deferred list and nothing here — reads red, and so does one
+/// that missed a run batch.
+///
+/// **The fixture has to be able to show the difference**, so the first
+/// assertion is that this tile reserves far fewer slots than it has shapes.
+/// On a tile of a dozen shapes the two numbers are close enough that a wrong
+/// answer would still look plausible.
+#[test]
+fn a_planned_tile_reserves_the_shapes_it_places_and_not_its_whole_shape_list() {
+    let Some(shapes) = monaco_shapes() else {
+        return;
+    };
+    let flat = flatten(&shapes, feathering());
+    let plan = flat.plan().expect("flatten builds a plan");
+
+    // What the walk pushes, replayed off the plan's own steps: a `Runs` batch
+    // is one `Shape::Callback`, a `Place` is one shape unless the shape is a
+    // label, which goes to `paint_labels` and puts nothing in the painter's
+    // list.
+    let mut pushes = 0usize;
+    for step in plan.steps() {
+        match *step {
+            PlanStep::Runs { .. } => pushes += 1,
+            PlanStep::Place(index) => {
+                if !matches!(shapes.get(index as usize), Some(ShapeOrText::Text(_))) {
+                    pushes += 1;
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        plan.shape_slots(),
+        pushes,
+        "the plan reserves {} slots for a walk that pushes {pushes}",
+        plan.shape_slots()
+    );
+    assert!(
+        plan.shape_slots() * 8 < shapes.len(),
+        "fixture: this tile places {} of its {} shapes, which is not far enough \
+         apart for the over-reservation to be visible at all",
+        plan.shape_slots(),
+        shapes.len()
+    );
+    // The labels are the population the two numbers differ by, so a fixture
+    // with none would compare a shape count against itself.
+    let labels = shapes
+        .iter()
+        .filter(|s| matches!(s, ShapeOrText::Text(_)))
+        .count();
+    assert!(
+        labels > 0,
+        "fixture: the tile carries no labels, so nothing here is deferred"
+    );
+}

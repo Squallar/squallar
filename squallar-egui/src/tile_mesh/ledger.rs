@@ -40,6 +40,11 @@
 //!   painter**, and so what reaches `Context::tessellate` from the ground.
 //!   The parent the two figures below are cuts of. Its denominator is TILES
 //!   AND FRAMES; it is never divided into a vertex figure.
+//! * [`Totals::ground_shape_slots`] — **slots the walk reserved to hold
+//!   them**, over the same tiles and frames, so the two divide into one
+//!   another and the quotient is what a frame asked the allocator for against
+//!   what it used. It is the figure the walk's `Vec::with_capacity` sizing
+//!   moves and `ground_shapes` is the one it must not.
 //! * [`Totals::stroke_run_meshes`] and [`Totals::stroke_mesh_vertices`] —
 //!   **stroke runs a painterless pass drew from the buffers they were already
 //!   tessellated into**, and the vertices those meshes carried. A floor strip
@@ -68,6 +73,7 @@ static STROKE_DRAWS: AtomicU64 = AtomicU64::new(0);
 static STROKE_RUN_MESHES: AtomicU64 = AtomicU64::new(0);
 static STROKE_MESH_VERTICES: AtomicU64 = AtomicU64::new(0);
 static GROUND_SHAPES: AtomicU64 = AtomicU64::new(0);
+static GROUND_SHAPE_SLOTS: AtomicU64 = AtomicU64::new(0);
 static MESH_UPLOADS: AtomicU64 = AtomicU64::new(0);
 static MESH_UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
 static MESH_EVICTIONS: AtomicU64 = AtomicU64::new(0);
@@ -106,6 +112,19 @@ pub struct Totals {
     /// path each count one. A cut that moved work rather than removing it
     /// leaves this unchanged.
     pub ground_shapes: u64,
+    /// **Slots the ground phase reserved for those shapes**, over the same
+    /// tiles and frames [`Self::ground_shapes`] counts, so the two divide into
+    /// one another and the quotient is what the frame asked the allocator for
+    /// against what it used.
+    ///
+    /// The vector is `Vec::with_capacity`-ed once per drawn tile and handed to
+    /// `Painter::extend`, which consumes it, so this is a buffer minted and
+    /// released every frame. Sized from the tile's shape list it was
+    /// `size_of::<egui::Shape>()` times a dense tile's shape count; sized from
+    /// the plan (`crate::tile_mesh::TilePlan::shape_slots`) it is what the walk
+    /// will place. Against a `ground_shapes` that must not move, this is the
+    /// figure the sizing changes.
+    pub ground_shape_slots: u64,
     pub mesh_uploads: u64,
     pub mesh_upload_bytes: u64,
     pub mesh_evictions: u64,
@@ -158,9 +177,11 @@ pub fn note_stroke_run_meshes(runs: u64, vertices: u64) {
     STROKE_MESH_VERTICES.fetch_add(vertices, Relaxed);
 }
 
-/// Shapes this tile handed the painter. One call per tile.
-pub fn note_ground_shapes(n: u64) {
+/// Shapes this tile handed the painter, and the slots it reserved for them.
+/// One call per tile.
+pub fn note_ground_shapes(n: u64, slots: u64) {
     GROUND_SHAPES.fetch_add(n, Relaxed);
+    GROUND_SHAPE_SLOTS.fetch_add(slots, Relaxed);
 }
 
 /// One tile's buffers crossed to the GPU. Called by the renderer.
@@ -200,6 +221,7 @@ impl Totals {
             .wrapping_add(self.stroke_draws)
             .wrapping_add(self.stroke_run_meshes)
             .wrapping_add(self.ground_shapes)
+            .wrapping_add(self.ground_shape_slots)
             .wrapping_add(self.mesh_uploads)
             .wrapping_add(self.mesh_evictions)
             .wrapping_add(self.mesh_store_missing)
@@ -232,6 +254,7 @@ pub fn totals() -> Totals {
         stroke_run_meshes: STROKE_RUN_MESHES.load(Relaxed),
         stroke_mesh_vertices: STROKE_MESH_VERTICES.load(Relaxed),
         ground_shapes: GROUND_SHAPES.load(Relaxed),
+        ground_shape_slots: GROUND_SHAPE_SLOTS.load(Relaxed),
         mesh_uploads: MESH_UPLOADS.load(Relaxed),
         mesh_upload_bytes: MESH_UPLOAD_BYTES.load(Relaxed),
         mesh_evictions: MESH_EVICTIONS.load(Relaxed),
@@ -257,6 +280,7 @@ pub(crate) fn reset() {
         &STROKE_RUN_MESHES,
         &STROKE_MESH_VERTICES,
         &GROUND_SHAPES,
+        &GROUND_SHAPE_SLOTS,
         &MESH_UPLOADS,
         &MESH_UPLOAD_BYTES,
         &MESH_EVICTIONS,

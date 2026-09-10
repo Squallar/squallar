@@ -506,8 +506,9 @@ fn lay_out_label(
     text: &walkers::Text,
     occupied: &mut walkers::OccupiedAreas,
     galleys: &mut walkers::GalleyCache,
+    pixels_per_point: f32,
 ) -> egui::Shape {
-    let galley = text.galley_cached(ctx, galleys);
+    let galley = text.galley_cached(ctx, galleys, pixels_per_point);
 
     // Before `try_occupy`, so an unplaceable name does not first claim the
     // screen it was never going to be drawn on and evict a label that fits.
@@ -966,7 +967,6 @@ fn paint_vector_tile(
     let mut counted = Counted::default();
 
     let mut runs = GroundMeshes::runs();
-    let mut placed: Vec<egui::Shape> = Vec::with_capacity(shapes.len());
 
     // **The walk is precomputed; this only applies the placement.** Which index
     // opens a run, which span a run covers, which shapes the CPU still has to
@@ -982,6 +982,18 @@ fn paint_vector_tile(
         .meshes
         .and_then(|meshes| meshes.plan().map(|plan| (meshes, plan)))
         .filter(|(_, plan)| plan.matches(shapes.len()));
+
+    // **What this tile will hand the painter, not how many shapes it holds.**
+    // Every run of a planned tile is one callback and every other step of one
+    // is a label, which is deferred to `paint_labels` and pushes nothing here;
+    // measured on the native rig's scene A, a vector tile placed exactly ONE
+    // shape while reserving room for 316. That is 41 buffers a pane-frame,
+    // each tens of kilobytes, asked of the allocator and handed straight back.
+    // `TilePlan::shape_slots` settles the figure where the plan is settled,
+    // off the frame thread. A tile with no plan has nothing to ask, so it
+    // keeps the shape count the un-planned walk really can fill.
+    let mut placed: Vec<egui::Shape> =
+        Vec::with_capacity(planned.map_or(shapes.len(), |(_, plan)| plan.shape_slots()));
 
     if let Some((meshes, plan)) = planned {
         for step in plan.steps() {
@@ -1033,6 +1045,7 @@ fn paint_vector_tile(
     }
 
     counted.ground_shapes = placed.len() as u64;
+    counted.ground_shape_slots = placed.capacity() as u64;
     counted.report();
     painter.extend(placed);
 }
@@ -1051,6 +1064,9 @@ struct Counted {
     /// from the list's length after the walk rather than incremented, so
     /// nothing can count itself into it twice.
     ground_shapes: u64,
+    /// Slots reserved to hold them, read off the same vector's capacity for
+    /// the same reason.
+    ground_shape_slots: u64,
 }
 
 impl Counted {
@@ -1062,7 +1078,7 @@ impl Counted {
         ledger::note_mesh_draws(self.mesh_draws);
         ledger::note_stroke_draws(self.stroke_draws);
         ledger::note_stroke_run_meshes(self.stroke_run_meshes, self.stroke_mesh_vertices);
-        ledger::note_ground_shapes(self.ground_shapes);
+        ledger::note_ground_shapes(self.ground_shapes, self.ground_shape_slots);
     }
 }
 
@@ -1240,6 +1256,11 @@ pub(super) fn solve_labels(
     labels: &[walkers::Text],
     galleys: &mut walkers::GalleyCache,
 ) -> Vec<egui::Shape> {
+    // **Once for the solve.** `Context::pixels_per_point` is `Context::write`,
+    // and the galley memo used to take it per label — see
+    // `walkers::Text::galley_cached`. It cannot differ between two labels of
+    // one pass.
+    let pixels_per_point = ctx.pixels_per_point();
     let mut occupied = walkers::OccupiedAreas::new();
     // Where each name has already been drawn, so a fragmented river is named
     // once per stretch of screen rather than once per OSM way. See
@@ -1264,7 +1285,7 @@ pub(super) fn solve_labels(
             continue;
         }
 
-        let shape = lay_out_label(ctx, text, &mut occupied, galleys);
+        let shape = lay_out_label(ctx, text, &mut occupied, galleys, pixels_per_point);
 
         // Only a label that actually drew claims the spot. A name suppressed by
         // the collision test must not stop the same name drawing further along,
@@ -2240,6 +2261,93 @@ mod tests {
 
     fn label(name: &str, at: egui::Pos2) -> Text {
         Text::new(at, name.to_owned(), 12.0, egui::Color32::WHITE, 0.0)
+    }
+
+    /// **The label solve settles the galley memo on the CONTEXT's
+    /// `pixels_per_point`, and that is a live gate because the solve now reads
+    /// it itself.**
+    ///
+    /// `walkers::Text::galley_cached` used to take `Context::pixels_per_point`
+    /// per label — `Context::write`, an exclusive lock on the whole context and
+    /// a probe of its viewport table, 459 times a solve on the native rig's
+    /// scene A — for a number that is fixed for the pass. It is now the
+    /// caller's to read once, which puts the *choice of value* on the caller
+    /// and creates a hazard nothing had before: a caller that passes a stale or
+    /// invented figure leaves the memo settled on a scale the display is not at
+    /// and serves galleys rasterized for another one, which is glyph geometry
+    /// at the wrong size on a real display change.
+    ///
+    /// So this drives the shipped `solve_labels` across a `pixels_per_point`
+    /// change and requires the memo to have been dropped and re-laid at the
+    /// new scale — and requires the glyphs to actually move, so a solve that
+    /// answered from the stale table cannot pass by drawing the same thing.
+    /// Pinning the value `solve_labels` reads to a constant makes it red.
+    #[test]
+    fn the_label_solve_settles_the_galley_memo_on_the_contexts_own_scale() {
+        let _ledger = ledger_guard();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN);
+        let ctx = egui::Context::default();
+        let mut galleys = walkers::GalleyCache::default();
+        let names = vec![label("Washita River", egui::pos2(200.0, 300.0))];
+
+        // Through the viewport, which is how a real display change arrives.
+        let pass_at = |ppp: Option<f32>| {
+            let mut input = egui::RawInput {
+                screen_rect: Some(canvas),
+                ..Default::default()
+            };
+            if let Some(ppp) = ppp {
+                input
+                    .viewports
+                    .get_mut(&input.viewport_id)
+                    .expect("the root viewport is in every RawInput")
+                    .native_pixels_per_point = Some(ppp);
+            }
+            input
+        };
+
+        let solve = |ctx: &egui::Context, galleys: &mut walkers::GalleyCache| {
+            let placed = solve_labels(ctx, &names, galleys);
+            assert_eq!(
+                placed.len(),
+                1,
+                "fixture: the one name must place, or this compares nothing"
+            );
+            match &placed[0] {
+                egui::Shape::Text(text) => text.galley.size(),
+                other => panic!("the label placed as {other:?} rather than text"),
+            }
+        };
+
+        ctx.begin_pass(pass_at(None));
+        let one = solve(&ctx, &mut galleys);
+        let laid_out_at_one = galleys.layouts();
+        let _ = ctx.end_pass();
+        assert_eq!(
+            laid_out_at_one, 1,
+            "fixture: the first solve lays the name out"
+        );
+
+        ctx.begin_pass(pass_at(Some(2.0)));
+        assert_eq!(
+            ctx.pixels_per_point(),
+            2.0,
+            "fixture: the display change did not reach the context"
+        );
+        let two = solve(&ctx, &mut galleys);
+        let laid_out_at_two = galleys.layouts();
+        let _ = ctx.end_pass();
+
+        assert_eq!(
+            laid_out_at_two, 2,
+            "the memo answered the moved display from the table it built at the \
+             old scale: {laid_out_at_two} layouts across the two passes, not 2"
+        );
+        assert_ne!(
+            one, two,
+            "fixture: the galley measures the same at both scales, so a stale \
+             answer would be indistinguishable from a fresh one here"
+        );
     }
 
     /// **A kept galley memo paints what a fresh one paints, frame after

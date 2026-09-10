@@ -34,6 +34,15 @@ pub(crate) struct EguiPointPainter<'a> {
     /// a layer's text to tessellate once. See [`PointTextMeshes`]. `None`
     /// paints each label as `Painter::galley` would.
     pub sink: Option<&'a mut Vec<Shape>>,
+    /// The pass's `pixels_per_point`, read by the caller once for the layer.
+    ///
+    /// **Carried rather than asked for**, because this value is built per
+    /// POINT: `Context::pixels_per_point` is `Context::write`, and a station
+    /// model draws several strings, so asking inside
+    /// [`walkers::GalleyCache::galley_for_point`] took an exclusive lock on
+    /// the whole context once per string per station for a number that is
+    /// fixed for the pass.
+    pub pixels_per_point: f32,
 }
 
 impl EguiPointPainter<'_> {
@@ -95,6 +104,7 @@ impl PointPainter for EguiPointPainter<'_> {
             text,
             FontId::proportional(size),
             color,
+            self.pixels_per_point,
         );
         let rect = align.anchor_size(self.pos(offset), galley.size());
         match self.sink.as_deref_mut() {
@@ -496,6 +506,7 @@ mod point_text_tests {
                 galleys,
                 text_only: true,
                 sink: sink.as_deref_mut(),
+                pixels_per_point: painter.ctx().pixels_per_point(),
             };
             draw_station_text(&mut ep, temp, dewp);
         }

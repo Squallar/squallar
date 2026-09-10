@@ -483,6 +483,10 @@ fn label_colors(is_dark: bool) -> (egui::Color32, egui::Color32) {
 /// the font atlas by pixel position and egui rebuilds that atlas.
 ///
 /// Returns whether the label drew.
+// The last two are the pass's, not the station's: both are read once for the
+// whole table and handed down, which is the point of `pixels_per_point` being
+// here at all.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn try_draw_site_label(
     painter: &egui::Painter,
     galleys: &mut walkers::GalleyCache,
@@ -491,9 +495,10 @@ pub(crate) fn try_draw_site_label(
     name: &str,
     font: egui::FontId,
     is_dark: bool,
+    pixels_per_point: f32,
 ) -> bool {
     let (text_color, plate) = label_colors(is_dark);
-    let galley = galleys.galley_for_point(painter.ctx(), name, font, text_color);
+    let galley = galleys.galley_for_point(painter.ctx(), name, font, text_color, pixels_per_point);
     let text_rect = egui::Align2::CENTER_TOP.anchor_size(anchor, galley.size());
     let plate_rect = text_rect.expand2(egui::vec2(2.0, 1.0));
 

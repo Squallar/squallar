@@ -409,6 +409,7 @@ fn label_pass(
             name,
             egui::FontId::monospace(10.0),
             is_dark,
+            ctx.pixels_per_point(),
         ) {
             drew.push((*name).to_owned());
         }

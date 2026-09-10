@@ -167,6 +167,7 @@ pub enum PlanStep {
 pub struct TilePlan {
     steps: Vec<PlanStep>,
     shape_count: u32,
+    shape_slots: u32,
 }
 
 impl TilePlan {
@@ -177,6 +178,25 @@ impl TilePlan {
     /// Whether this plan was built for a shape list of exactly this length.
     pub fn matches(&self, shape_count: usize) -> bool {
         self.shape_count as usize == shape_count
+    }
+
+    /// **How many shapes this plan can hand the painter**, which is not how
+    /// many steps it has.
+    ///
+    /// A `Runs` batch is one `Shape::Callback`. A `Place` is one shape unless
+    /// the shape is a label -- a label is pushed onto the deferred list for
+    /// [`crate::ui_map_overlays::paint_labels`] and puts nothing in the
+    /// painter's list at all -- and on a real tile the labels are nearly all
+    /// of it. So this is the ground walk's own `Vec::with_capacity`, settled
+    /// where the plan is, off the frame thread.
+    ///
+    /// It is an exact count for the pass the renderer accepts, and a floor
+    /// for the one it declines: a refused run puts its span's geometry back on
+    /// the CPU (`ui_map_overlays::place_run_on_cpu`), which pushes more shapes
+    /// than the one callback would have. The vector grows there, as it did
+    /// before any of this.
+    pub fn shape_slots(&self) -> usize {
+        self.shape_slots as usize
     }
 }
 
@@ -683,9 +703,20 @@ fn build_plan(shapes: &[ShapeOrText], runs: &[MeshRun]) -> TilePlan {
     }
 
     steps.shrink_to_fit();
+    // See `TilePlan::shape_slots`: a step that defers a label draws nothing.
+    let shape_slots = steps
+        .iter()
+        .filter(|step| match step {
+            PlanStep::Runs { .. } => true,
+            PlanStep::Place(index) => {
+                !matches!(shapes.get(*index as usize), Some(ShapeOrText::Text(_)))
+            }
+        })
+        .count() as u32;
     TilePlan {
         steps,
         shape_count: shapes.len() as u32,
+        shape_slots,
     }
 }
 

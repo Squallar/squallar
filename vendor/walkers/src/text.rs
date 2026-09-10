@@ -113,12 +113,21 @@ impl Text {
     /// and `angle` are deliberately absent: a galley is laid out about its own
     /// origin and placed by [`Self::shape`], so panning the map re-uses every
     /// entry rather than invalidating it — which is the case this exists for.
+    ///
+    /// **`pixels_per_point` is the caller's to read, once, and that is not a
+    /// convenience.** `Context::pixels_per_point` is `Context::input`, which is
+    /// `Context::write`: an exclusive lock on the whole context plus a probe of
+    /// its viewport table. Read here it was one of those per label, for a value
+    /// that is fixed for the pass and identical for every label in it — a
+    /// basemap pane's label solve took it 459 times a solve. The table still
+    /// settles on it exactly as before; only who reads it moved.
     pub fn galley_cached(
         &self,
         ctx: &egui::Context,
         cache: &mut GalleyCache,
+        pixels_per_point: f32,
     ) -> std::sync::Arc<egui::Galley> {
-        cache.settle(ctx.pixels_per_point());
+        cache.settle(pixels_per_point);
 
         let key = GalleyKey {
             text: self.text.clone(),
@@ -585,14 +594,19 @@ impl GalleyCache {
     /// Unwrapped, matching `Painter::layout_no_wrap`: the caller places the
     /// result with `Align2::anchor_size` exactly as `Painter::text` does, so
     /// the drawn output is the same galley at the same origin.
+    ///
+    /// `pixels_per_point` is the caller's, for [`Text::galley_cached`]'s
+    /// reason: a station model draws several strings and every one of them was
+    /// taking `Context::write` to read the same number.
     pub fn galley_for_point(
         &mut self,
         ctx: &egui::Context,
         text: &str,
         font: egui::FontId,
         color: Color32,
+        pixels_per_point: f32,
     ) -> std::sync::Arc<egui::Galley> {
-        self.settle(ctx.pixels_per_point());
+        self.settle(pixels_per_point);
         let style = PointStyle {
             font_size: font.size.to_bits(),
             family: font.family.clone(),
@@ -819,6 +833,7 @@ mod tests {
                 "72",
                 egui::FontId::proportional(11.0),
                 egui::Color32::WHITE,
+                ctx.pixels_per_point(),
             );
             assert_eq!(cache.len(), 1);
             // The same atlas, or one that only allocated more: kept.
@@ -884,9 +899,9 @@ mod tests {
         for name in ["Washita River", "Oklahoma City", "Lake Thunderbird"] {
             let text = label(name);
             let fresh = text.galley(&ctx);
-            let cached = text.galley_cached(&ctx, &mut cache);
+            let cached = text.galley_cached(&ctx, &mut cache, ctx.pixels_per_point());
             // Second time through is the one that comes off the table.
-            let hit = text.galley_cached(&ctx, &mut cache);
+            let hit = text.galley_cached(&ctx, &mut cache, ctx.pixels_per_point());
 
             assert_eq!(fresh.text(), cached.text());
             assert_eq!(fresh.text(), hit.text());
@@ -913,13 +928,13 @@ mod tests {
 
         let mut kept = GalleyCache::default();
         for name in names {
-            let _ = label(name).galley_cached(&ctx, &mut kept);
+            let _ = label(name).galley_cached(&ctx, &mut kept, ctx.pixels_per_point());
         }
         let after_first = kept.layouts();
         assert_eq!(after_first, names.len() as u64);
 
         for name in names {
-            let _ = label(name).galley_cached(&ctx, &mut kept);
+            let _ = label(name).galley_cached(&ctx, &mut kept, ctx.pixels_per_point());
         }
         assert_eq!(
             kept.layouts(),
@@ -933,11 +948,11 @@ mod tests {
         // pass, the same three labels are laid out all over again.
         let mut dropped = GalleyCache::default();
         for name in names {
-            let _ = label(name).galley_cached(&ctx, &mut dropped);
+            let _ = label(name).galley_cached(&ctx, &mut dropped, ctx.pixels_per_point());
         }
         dropped.clear();
         for name in names {
-            let _ = label(name).galley_cached(&ctx, &mut dropped);
+            let _ = label(name).galley_cached(&ctx, &mut dropped, ctx.pixels_per_point());
         }
         assert_eq!(dropped.layouts(), 2 * names.len() as u64);
     }
@@ -992,9 +1007,9 @@ mod tests {
 
         for (field, variant) in variants {
             let mut cache = GalleyCache::default();
-            let _ = base.galley_cached(&ctx, &mut cache);
+            let _ = base.galley_cached(&ctx, &mut cache, ctx.pixels_per_point());
             assert_eq!(cache.layouts(), 1, "{field}: setup");
-            let _ = variant.galley_cached(&ctx, &mut cache);
+            let _ = variant.galley_cached(&ctx, &mut cache, ctx.pixels_per_point());
             assert_eq!(
                 cache.layouts(),
                 2,
@@ -1011,7 +1026,7 @@ mod tests {
         let ctx = ctx_with_fonts();
         let mut cache = GalleyCache::default();
         let base = label("Washita River");
-        let _ = base.galley_cached(&ctx, &mut cache);
+        let _ = base.galley_cached(&ctx, &mut cache, ctx.pixels_per_point());
 
         for (x, y) in [(11.0, 20.0), (400.0, 300.0), (-50.0, 900.0)] {
             let moved = Text {
@@ -1019,7 +1034,7 @@ mod tests {
                 angle: FRAC_PI_4,
                 ..base.clone()
             };
-            let _ = moved.galley_cached(&ctx, &mut cache);
+            let _ = moved.galley_cached(&ctx, &mut cache, ctx.pixels_per_point());
         }
         assert_eq!(cache.layouts(), 1, "a moved label was laid out again");
         assert_eq!(cache.hits(), 3);
@@ -1033,7 +1048,7 @@ mod tests {
         let mut cache = GalleyCache::default();
         let text = label("Washita River");
 
-        let _ = text.galley_cached(&ctx, &mut cache);
+        let _ = text.galley_cached(&ctx, &mut cache, ctx.pixels_per_point());
         assert_eq!(cache.layouts(), 1);
         assert_eq!(cache.len(), 1);
 
@@ -1053,7 +1068,7 @@ mod tests {
         ctx.begin_pass(input);
         assert_eq!(ctx.pixels_per_point(), 2.0, "the test did not move ppp");
 
-        let _ = text.galley_cached(&ctx, &mut cache);
+        let _ = text.galley_cached(&ctx, &mut cache, ctx.pixels_per_point());
         assert_eq!(
             cache.layouts(),
             2,
@@ -1078,8 +1093,20 @@ mod tests {
             let direct = ctx.fonts_mut(|f| {
                 f.layout(body.to_owned(), font.clone(), Color32::WHITE, f32::INFINITY)
             });
-            let first = cache.galley_for_point(&ctx, body, font.clone(), Color32::WHITE);
-            let second = cache.galley_for_point(&ctx, body, font.clone(), Color32::WHITE);
+            let first = cache.galley_for_point(
+                &ctx,
+                body,
+                font.clone(),
+                Color32::WHITE,
+                ctx.pixels_per_point(),
+            );
+            let second = cache.galley_for_point(
+                &ctx,
+                body,
+                font.clone(),
+                Color32::WHITE,
+                ctx.pixels_per_point(),
+            );
 
             assert_eq!(direct.text(), first.text());
             assert_eq!(direct.text(), second.text());
@@ -1102,7 +1129,13 @@ mod tests {
 
         for _frame in 0..5 {
             for body in readings {
-                let _ = cache.galley_for_point(&ctx, body, font.clone(), Color32::WHITE);
+                let _ = cache.galley_for_point(
+                    &ctx,
+                    body,
+                    font.clone(),
+                    Color32::WHITE,
+                    ctx.pixels_per_point(),
+                );
             }
         }
         assert_eq!(cache.layouts(), readings.len() as u64);
@@ -1117,14 +1150,37 @@ mod tests {
         let mut cache = GalleyCache::default();
         let base = egui::FontId::proportional(11.0);
 
-        let _ = cache.galley_for_point(&ctx, "24", base.clone(), Color32::WHITE);
+        let _ = cache.galley_for_point(
+            &ctx,
+            "24",
+            base.clone(),
+            Color32::WHITE,
+            ctx.pixels_per_point(),
+        );
         assert_eq!(cache.layouts(), 1);
-        let _ =
-            cache.galley_for_point(&ctx, "24", egui::FontId::proportional(14.0), Color32::WHITE);
+        let _ = cache.galley_for_point(
+            &ctx,
+            "24",
+            egui::FontId::proportional(14.0),
+            Color32::WHITE,
+            ctx.pixels_per_point(),
+        );
         assert_eq!(cache.layouts(), 2, "font size was not keyed");
-        let _ = cache.galley_for_point(&ctx, "24", base.clone(), Color32::RED);
+        let _ = cache.galley_for_point(
+            &ctx,
+            "24",
+            base.clone(),
+            Color32::RED,
+            ctx.pixels_per_point(),
+        );
         assert_eq!(cache.layouts(), 3, "colour was not keyed");
-        let _ = cache.galley_for_point(&ctx, "25", base.clone(), Color32::WHITE);
+        let _ = cache.galley_for_point(
+            &ctx,
+            "25",
+            base.clone(),
+            Color32::WHITE,
+            ctx.pixels_per_point(),
+        );
         assert_eq!(cache.layouts(), 4, "text was not keyed");
 
         // **Without this the test is vacuous.** The four assertions above all
@@ -1132,7 +1188,7 @@ mod tests {
         // every one of them. Re-asking for the first key proves the table is
         // actually answering, so "these are four keys" and "nothing is stored"
         // stop being indistinguishable.
-        let _ = cache.galley_for_point(&ctx, "24", base, Color32::WHITE);
+        let _ = cache.galley_for_point(&ctx, "24", base, Color32::WHITE, ctx.pixels_per_point());
         assert_eq!(
             cache.layouts(),
             4,
@@ -1148,9 +1204,15 @@ mod tests {
         let ctx = ctx_with_fonts();
         let mut cache = GalleyCache::default();
         let font = egui::FontId::proportional(11.0);
-        let _ = label("Washita River").galley_cached(&ctx, &mut cache);
+        let _ = label("Washita River").galley_cached(&ctx, &mut cache, ctx.pixels_per_point());
         for i in 0..GalleyCache::MAX_ENTRIES {
-            let _ = cache.galley_for_point(&ctx, &format!("r{i}"), font.clone(), Color32::WHITE);
+            let _ = cache.galley_for_point(
+                &ctx,
+                &format!("r{i}"),
+                font.clone(),
+                Color32::WHITE,
+                ctx.pixels_per_point(),
+            );
         }
         assert!(cache.len() <= GalleyCache::MAX_ENTRIES);
     }
@@ -1162,7 +1224,8 @@ mod tests {
         let ctx = ctx_with_fonts();
         let mut cache = GalleyCache::default();
         for i in 0..=GalleyCache::MAX_ENTRIES {
-            let _ = label(&format!("name {i}")).galley_cached(&ctx, &mut cache);
+            let _ =
+                label(&format!("name {i}")).galley_cached(&ctx, &mut cache, ctx.pixels_per_point());
         }
         assert!(cache.len() <= GalleyCache::MAX_ENTRIES);
     }

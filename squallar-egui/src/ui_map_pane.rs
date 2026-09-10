@@ -1992,6 +1992,9 @@ fn handle_radar_site_interactions(
     // ask finds nothing claimed and therefore always draws, so a viewport with
     // any station in it can never come back with every name suppressed.
     if zoom >= SITE_LABEL_MIN_ZOOM && !sites.is_empty() {
+        // Once for the table, not once per station: see
+        // `walkers::GalleyCache::galley_for_point`.
+        let pixels_per_point = ui.ctx().pixels_per_point();
         let mut occupied = walkers::OccupiedAreas::new();
         let ranks = site_label_ranks(sites, pane);
         for idx in crate::site_marker::label_order(&ranks) {
@@ -2005,6 +2008,7 @@ fn handle_radar_site_interactions(
                 site.site.name,
                 egui::FontId::monospace(font_size),
                 is_dark,
+                pixels_per_point,
             );
         }
     }
@@ -3777,6 +3781,9 @@ fn render_per_frame_overlay(
     let geo_bounds = viewport_geo_bounds(projector, expanded);
 
     let painter = ui.painter();
+    // Once for the layer, not once per point: `Context::pixels_per_point` is
+    // `Context::write`. See `point_painter::EguiPointPainter::pixels_per_point`.
+    let pixels_per_point = ui.ctx().pixels_per_point();
 
     // Blocked-ness is a property of the *position*, not of the point tested
     // against it, so it is settled once here. Per-station it was ~41,000 rect
@@ -3841,6 +3848,7 @@ fn render_per_frame_overlay(
                 galleys,
                 text_only,
                 sink: collecting.then_some(&mut sink),
+                pixels_per_point,
             };
             handler.draw_point(pt.id, &mut ep, &draw_ctx);
         }
