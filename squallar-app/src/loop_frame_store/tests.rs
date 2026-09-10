@@ -396,6 +396,7 @@ fn overlay_frame(
 ) -> LoopFrameImage {
     let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 0]);
     LoopFrameImage::Overlay(squallar_egui::overlay_cache::OverlayTextureData {
+        crop: None,
         texture: ctx.load_texture("overlay", image, egui::TextureOptions::NEAREST),
         placed: squallar_radar::types::ImageBounds::from_radar_site(35.33, -97.27, 230.0).into(),
         data_generation: 0,

@@ -117,6 +117,7 @@ fn live_radar_raster(h: &mut InputHarness) -> egui::TextureId {
     h.gui_mut().panes_mut()[0]
         .overlay_cache_mut(&known::RADAR)
         .show(OverlayTextureData {
+            crop: None,
             texture,
             placed: squallar_geo::PlacedRaster::of(squallar_geo::GeoBounds {
                 min_lat: nw.y().min(se.y()),

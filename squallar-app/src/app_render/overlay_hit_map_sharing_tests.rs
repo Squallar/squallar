@@ -123,6 +123,7 @@ fn deliver(
     app.channels
         .overlay_render_sender
         .send(crate::channels::OverlayRenderResponse {
+            crop: None,
             picture: Some(crate::channels::OverlayPicture::Painted(image)),
             geo_bounds: bounds(),
             overlay_kind: known::NWS_ALERTS,

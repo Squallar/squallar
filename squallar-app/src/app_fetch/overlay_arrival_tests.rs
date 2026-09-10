@@ -550,6 +550,7 @@ fn an_arrival_is_refused_while_a_picture_is_still_landing() {
 fn a_landing_picture() -> squallar_egui::overlay_cache::OverlayTextureData {
     let ctx = egui::Context::default();
     squallar_egui::overlay_cache::OverlayTextureData {
+        crop: None,
         texture: ctx.load_texture(
             "landing",
             egui::ColorImage::filled([1, 1], egui::Color32::RED),

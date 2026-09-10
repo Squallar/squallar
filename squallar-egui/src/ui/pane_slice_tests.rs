@@ -1026,6 +1026,7 @@ fn clearing_graphics_state_reaches_panes_of_every_kind() {
 /// that goes away below.
 fn device_raster(ctx: &egui::Context, name: &str) -> crate::overlay_cache::OverlayTextureData {
     crate::overlay_cache::OverlayTextureData {
+        crop: None,
         texture: ctx.load_texture(
             name.to_owned(),
             egui::ColorImage::filled([1, 1], egui::Color32::RED),

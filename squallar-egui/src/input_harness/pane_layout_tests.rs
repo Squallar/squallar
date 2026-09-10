@@ -555,6 +555,7 @@ fn lowering_the_pane_count_releases_the_hidden_panes_and_keeps_them() {
         pane.time.span_secs = spans[n];
         pane.overlay_cache_mut(&known::RADAR)
             .show(crate::overlay_cache::OverlayTextureData {
+                crop: None,
                 texture: texture.clone(),
                 placed: squallar_geo::PlacedRaster::of(squallar_geo::GeoBounds {
                     min_lat: 34.0,

@@ -335,6 +335,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
 
     let deliver = |id_map, output| {
         let response = super::OverlayRenderResponse {
+            crop: None,
             picture: None,
             geo_bounds: a_render_request().geo_bounds,
             overlay_kind: known::STORM_REPORTS,
@@ -368,6 +369,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
     let ok = deliver(
         Some(items.clone()),
         squallar_overlays::render::rasterize::RasterizeOutput {
+            crop: None,
             rgba: rgba.clone().into(),
             hit_cells: Some(cells(33, 1)),
             // The reply contract: pixels arrive premultiplied.
@@ -407,6 +409,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
             "a wrong-grid reply",
             Some(items.clone()),
             squallar_overlays::render::rasterize::RasterizeOutput {
+                crop: None,
                 rgba: rgba.clone().into(),
                 hit_cells: Some(HitCells {
                     width: 17,
@@ -425,6 +428,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
             "an id past the captured items",
             Some(items.clone()),
             squallar_overlays::render::rasterize::RasterizeOutput {
+                crop: None,
                 rgba: rgba.clone().into(),
                 hit_cells: Some(cells(33, 2)),
                 alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
@@ -436,6 +440,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
             "cells with no items captured",
             None,
             squallar_overlays::render::rasterize::RasterizeOutput {
+                crop: None,
                 rgba: rgba.clone().into(),
                 hit_cells: Some(cells(33, 0)),
                 alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
@@ -447,6 +452,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
             "no cells where items were captured",
             Some(items.clone()),
             squallar_overlays::render::rasterize::RasterizeOutput {
+                crop: None,
                 rgba: rgba.clone().into(),
                 hit_cells: None,
                 alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
@@ -458,6 +464,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
             "a short buffer beside well-formed cells",
             Some(items.clone()),
             squallar_overlays::render::rasterize::RasterizeOutput {
+                crop: None,
                 rgba: vec![0u8; 16].into(),
                 hit_cells: Some(cells(33, 1)),
                 alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,

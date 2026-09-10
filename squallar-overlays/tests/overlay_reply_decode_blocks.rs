@@ -158,6 +158,7 @@ fn arrive(row: &JobCodec, source: &[u8], cells: HitCells) -> Arrival {
     let mut tails = Vec::new();
     (row.encode_out)(
         DescribedOut(Box::new(RasterizeOutput {
+            crop: None,
             rgba: RasterBuf::Bytes(source.to_vec()),
             hit_cells: Some(cells),
             alpha: AlphaMode::Premultiplied,

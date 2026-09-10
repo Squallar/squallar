@@ -368,6 +368,7 @@ fn pane_showing_a_static_radar_render(
     pane.set_selected_product(selected.clone());
     pane.overlay_cache_mut(&known::RADAR)
         .show(OverlayTextureData {
+            crop: None,
             texture: ctx.load_texture("static-scan", image, egui::TextureOptions::NEAREST),
             placed: squallar_geo::PlacedRaster::of(squallar_geo::GeoBounds {
                 min_lat: 34.0,

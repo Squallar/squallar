@@ -92,6 +92,7 @@ fn arrive_for(
         );
     }
     let response = crate::channels::OverlayRenderResponse {
+        crop: None,
         picture: None,
         geo_bounds: bounds(),
         overlay_kind: KIND,
@@ -105,6 +106,7 @@ fn arrive_for(
     let out = rgba.map(|rgba| {
         use squallar_source::job::JobOut;
         let mut raster = squallar_overlays::render::rasterize::RasterizeOutput {
+            crop: None,
             rgba: rgba.into(),
             hit_cells: None,
             alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,

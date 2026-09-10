@@ -40,6 +40,7 @@ fn plan() -> OverlayTexturePlan {
 
 fn data_at(texture: &egui::TextureHandle, token: u64) -> OverlayTextureData {
     OverlayTextureData {
+        crop: None,
         texture: texture.clone(),
         placed: PlacedRaster::of(plan().coverage(&viewport())),
         data_generation: token,

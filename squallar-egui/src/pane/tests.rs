@@ -1178,6 +1178,7 @@ fn pane_showing_render(
     pane.set_selected_product(product.clone());
     pane.overlay_cache_mut(&known::RADAR)
         .show(OverlayTextureData {
+            crop: None,
             texture: ctx.load_texture("fold", image, egui::TextureOptions::NEAREST),
             placed: squallar_geo::PlacedRaster::of(squallar_geo::GeoBounds {
                 min_lat: 34.0,

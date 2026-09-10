@@ -433,6 +433,18 @@ pub struct OverlayRenderResponse {
     /// `squallar_egui::overlay_cache::RenderTicket`.
     pub picture: Option<OverlayPicture>,
     pub geo_bounds: GeoBounds,
+    /// **Which texel window of `geo_bounds` the picture is**, or `None` for the
+    /// whole of it.
+    ///
+    /// Beside `geo_bounds` and never instead of it. `geo_bounds` is half the
+    /// key an in-flight mark is retired on and the ground the picture was
+    /// rendered *for*; this says which part of that ground the pixels cover, so
+    /// a sparse layer can rasterize a bounding box of its content instead of a
+    /// whole viewport. Written by `App::overlay_job_deliver` off the reply and
+    /// read only by the placement.
+    ///
+    /// See `squallar_overlays::render::rasterize::PictureCrop`.
+    pub crop: Option<squallar_overlays::render::rasterize::PictureCrop>,
     /// Which layer this raster is for, carried back to find each pane's cache.
     pub overlay_kind: LayerId,
     pub generation: u64,

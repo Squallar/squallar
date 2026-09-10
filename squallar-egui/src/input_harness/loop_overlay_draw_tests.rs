@@ -41,6 +41,7 @@ pub(super) fn raster(h: &InputHarness, name: &str) -> OverlayTextureData {
         egui::TextureOptions::default(),
     );
     OverlayTextureData {
+        crop: None,
         texture,
         placed: squallar_geo::PlacedRaster::of(squallar_geo::GeoBounds {
             min_lat: nw.y().min(se.y()),
@@ -256,6 +257,7 @@ fn an_overlay_frame_is_not_a_radar_render_view() {
         egui::TextureOptions::default(),
     );
     let overlay = LoopFrameImage::Overlay(OverlayTextureData {
+        crop: None,
         texture,
         placed: squallar_geo::PlacedRaster::of(squallar_geo::GeoBounds {
             min_lat: 30.0,

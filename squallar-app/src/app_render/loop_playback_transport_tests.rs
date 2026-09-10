@@ -104,6 +104,7 @@ pub(super) fn textured_frames(
             timestamp,
             image: Some(squallar_egui::pane::LoopFrameImage::Overlay(
                 squallar_egui::overlay_cache::OverlayTextureData {
+                    crop: None,
                     texture: ctx.load_texture(
                         format!("frame_{timestamp}"),
                         egui::ColorImage::from_rgba_unmultiplied([1, 1], &[9, 9, 9, 255]),

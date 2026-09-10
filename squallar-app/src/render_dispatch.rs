@@ -1792,6 +1792,25 @@ impl RenderDispatcher {
     /// A sum over a set, so the `HashMap`'s order does not reach the answer.
     /// Loop-frame dispatches are not in the record at all — see
     /// [`Self::overlay_picture_sizes`] — so this is the live rasters' load.
+    ///
+    /// # It is a PLANNED load and, since 2026-09-10, no longer a resident one
+    ///
+    /// The record this sums is the *dispatch*'s — the plan the pane asked
+    /// for — and four sparse rows now rasterize into a bounding box of their
+    /// own content and answer a smaller picture than they were asked for
+    /// (`squallar_overlays::render::rasterize::PictureCrop`). Nothing in this
+    /// record sees the reply, so a scene whose alerts cover one county is
+    /// counted here at a whole viewport and is a few tens of kilobytes on the
+    /// heap.
+    ///
+    /// **So this figure is a ceiling on picture residency and must not be
+    /// scored a saving against.** What the windows really bought is on the
+    /// app's own always-on counter — `overlay windows:`, off
+    /// `squallar_egui::overlay_cache::ledger::Totals::cropped_saved_bytes` —
+    /// which is measured off each arriving picture's real buffer. What the
+    /// pipeline *holds* is `OverlayTextureCache::outstanding_bytes`, which does
+    /// read the window. Three quantities, three denominators; none of them is
+    /// another one restated.
     pub(crate) fn resident_overlay_pictures(&self) -> (usize, u64) {
         self.last_overlay_dispatch
             .values()

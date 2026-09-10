@@ -158,8 +158,24 @@ fn two_overlapping_stations_leave_no_hole_between_them() {
 
     // The midpoint of the two stations, in texels. Inside both discs, so it is
     // exactly the texel an even-odd fill would punch out.
+    //
+    // **Read through the picture's own window.** The coverage raster allocates
+    // a bounding box of the discs it paints rather than the whole viewport
+    // (`PictureCrop`), so a viewport texel is at the window's offset in these
+    // bytes — and a whole-picture index into a smaller buffer is an out-of-range
+    // panic rather than a wrong answer, which is the one mercy in it.
+    let crop = out.crop.unwrap_or_else(|| super::PictureCrop::whole(W, H));
     let mid = ((W / 2) as usize, (H / 2) as usize);
-    let px = &out.rgba[(mid.1 * W as usize + mid.0) * 4..][..4];
+    assert!(
+        mid.0 >= crop.x as usize
+            && mid.1 >= crop.y as usize
+            && mid.0 < (crop.x + crop.width) as usize
+            && mid.1 < (crop.y + crop.height) as usize,
+        "the window {crop:?} does not cover the midpoint of two overlapping \
+         discs, so the fill rule cannot be read there at all",
+    );
+    let local = (mid.0 - crop.x as usize, mid.1 - crop.y as usize);
+    let px = &out.rgba[(local.1 * crop.width as usize + local.0) * 4..][..4];
     assert!(
         px[3] > 0,
         "the ground both stations cover came back transparent -- an even-odd \

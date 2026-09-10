@@ -106,6 +106,7 @@ fn a_pane_drawing_ink_is_never_held_on_a_filed_blank() {
     let ctx = egui::Context::default();
     let mut cache = walked_two_stops();
     cache.show(OverlayTextureData {
+        crop: None,
         texture: ctx.load_texture(
             "ink",
             egui::ColorImage::filled([1, 1], egui::Color32::RED),

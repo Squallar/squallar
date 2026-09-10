@@ -76,6 +76,7 @@ fn park_texture(ctx: &egui::Context, pane: &mut PaneState, kind: &squallar_sourc
         &vec![255u8; (W * H) as usize * 4],
     );
     pane.overlay_cache_mut(kind).show(OverlayTextureData {
+        crop: None,
         texture: ctx.load_texture(
             format!("{kind:?}_fixture"),
             image,

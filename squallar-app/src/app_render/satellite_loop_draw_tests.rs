@@ -447,6 +447,7 @@ fn live_raster(app: &mut crate::app::App, ctx: &egui::Context, id: squallar_sour
     app.channels
         .overlay_render_sender
         .send(crate::channels::OverlayRenderResponse {
+            crop: None,
             picture: Some(crate::channels::OverlayPicture::Painted(Arc::new(
                 egui::ColorImage::from_rgba_unmultiplied([32, 32], &[7u8; 32 * 32 * 4]),
             ))),

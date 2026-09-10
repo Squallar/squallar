@@ -16,9 +16,9 @@ use squallar_source::wire::Reader;
 use crate::render::raster_buf::RasterBuf;
 use crate::render::rasterize::{
     AlertsInput, AlphaMode, BlankReason, CoverageInput, DiscussionsInput, GlmStrikesInput,
-    GriddedInput, HitCells, OutlooksInput, RasterizeOutput, ReportsInput, rasterize_glm_strikes,
-    rasterize_gridded, rasterize_nws_alerts, rasterize_radar_coverage, rasterize_spc_discussions,
-    rasterize_spc_outlooks, rasterize_storm_reports,
+    GriddedInput, HitCells, OutlooksInput, PictureCrop, RasterizeOutput, ReportsInput,
+    rasterize_glm_strikes, rasterize_gridded, rasterize_nws_alerts, rasterize_radar_coverage,
+    rasterize_spc_discussions, rasterize_spc_outlooks, rasterize_storm_reports,
 };
 
 /// The seven overlay rows, in dispatch order: **coverage, alerts, outlooks,
@@ -1551,7 +1551,14 @@ impl JobOutCodec for GriddedJob {
 // ── The shared reply pair ────────────────────────────────────────────────
 
 fn encode_raster_reply(v: RasterizeOutput, head: &mut Vec<u8>) {
-    encode_overlay_out(&v.rgba, v.blank, v.blank_reason, v.hit_cells.as_ref(), head);
+    encode_overlay_out(
+        &v.rgba,
+        v.blank,
+        v.blank_reason,
+        v.hit_cells.as_ref(),
+        v.crop,
+        head,
+    );
 }
 
 /// The reply adapter every row's [`JobOutCodec::decode_out`] shares.
@@ -1563,8 +1570,9 @@ fn decode_raster_reply(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutp
     if !tails.is_empty() {
         return None;
     }
-    let (rgba, blank, blank_reason, hit_cells) = decode_overlay_out(head)?;
+    let (rgba, blank, blank_reason, hit_cells, crop) = decode_overlay_out(head)?;
     Some(RasterizeOutput {
+        crop,
         rgba,
         hit_cells,
         alpha: AlphaMode::Premultiplied,
@@ -1587,8 +1595,10 @@ pub fn decode_raster_reply_split(
     if !tails.is_empty() {
         return None;
     }
-    let (rgba, blank, hit_cells) = decode_overlay_out_split(head, RasterBuf::from_wire(picture))?;
+    let (rgba, blank, hit_cells, crop) =
+        decode_overlay_out_split(head, RasterBuf::from_wire(picture))?;
     Some(RasterizeOutput {
+        crop,
         rgba,
         hit_cells,
         alpha: AlphaMode::Premultiplied,
@@ -1773,6 +1783,7 @@ pub fn encode_overlay_out(
     blank: Option<u32>,
     blank_reason: Option<BlankReason>,
     hit_cells: Option<&HitCells>,
+    crop: Option<PictureCrop>,
     out: &mut Vec<u8>,
 ) {
     out.reserve(rgba.len() + 64);
@@ -1818,6 +1829,64 @@ pub fn encode_overlay_out(
         }
     }
     encode_hit_cells(hit_cells, out);
+    encode_crop(crop, out);
+}
+
+/// The picture's window, as one tag byte and — when there is one — four
+/// `u32`s.
+///
+/// **Last in the reply, after the cells block**, and that position is the whole
+/// of its compatibility story: the painted arm's contract is
+/// [`OVERLAY_PIXEL_PREFIX_BYTES`], the constant offset the browser transport
+/// finds the picture at before it copies anything, and a field written after
+/// both variable blocks cannot move it. `decode_overlay_out_split` sees the
+/// head with the picture's span already removed and reads this from the same
+/// place, because the cells block states its own length.
+///
+/// A tag outside `{0, 1}` is refused rather than read as absent: this is a
+/// same-build wire, and a byte we did not write is a message we cannot place
+/// a picture from.
+fn encode_crop(crop: Option<PictureCrop>, out: &mut Vec<u8>) {
+    match crop {
+        None => out.push(0),
+        Some(crop) => {
+            out.push(1);
+            for field in [
+                crop.x,
+                crop.y,
+                crop.width,
+                crop.height,
+                crop.of_width,
+                crop.of_height,
+            ] {
+                out.extend_from_slice(&field.to_le_bytes());
+            }
+        }
+    }
+}
+
+/// The inverse of [`encode_crop`]. A zero-sized window is refused: the picture
+/// it would describe has no texels and nothing downstream could place it.
+fn decode_crop(r: &mut Reader<'_>) -> Option<Option<PictureCrop>> {
+    match r.u8()? {
+        0 => Some(None),
+        1 => {
+            let crop = PictureCrop {
+                x: r.u32()?,
+                y: r.u32()?,
+                width: r.u32()?,
+                height: r.u32()?,
+                of_width: r.u32()?,
+                of_height: r.u32()?,
+            };
+            // Refused rather than clamped, on the wire as at the arrival: a
+            // window outside the grid it names is a message this build never
+            // writes, and reading it as anything places a picture off the
+            // ground it was rendered for.
+            crop.fits().then_some(Some(crop))
+        }
+        _ => None,
+    }
 }
 
 /// The inverse of [`encode_overlay_out`], answering
@@ -1854,6 +1923,7 @@ pub type OverlayReplyParts = (
     Option<u32>,
     Option<BlankReason>,
     Option<HitCells>,
+    Option<PictureCrop>,
 );
 
 pub fn decode_overlay_out(bytes: &[u8]) -> Option<OverlayReplyParts> {
@@ -1876,7 +1946,9 @@ pub fn decode_overlay_out(bytes: &[u8]) -> Option<OverlayReplyParts> {
         _ => return None,
     };
     let hit_cells = decode_hit_cells(&mut r)?;
-    r.at_end().then_some((rgba, blank, blank_reason, hit_cells))
+    let crop = decode_crop(&mut r)?;
+    r.at_end()
+        .then_some((rgba, blank, blank_reason, hit_cells, crop))
 }
 
 /// [`decode_overlay_out`] for a reply whose picture the transport has ALREADY
@@ -1891,10 +1963,18 @@ pub fn decode_overlay_out(bytes: &[u8]) -> Option<OverlayReplyParts> {
 ///
 /// Refuses a blank, because a blank has no span to lift and the caller should
 /// not have taken this path for one.
-pub fn decode_overlay_out_split(
-    head: &[u8],
-    picture: RasterBuf,
-) -> Option<(RasterBuf, Option<u32>, Option<HitCells>)> {
+/// [`decode_overlay_out_split`]'s answer, named for [`OverlayReplyParts`]'
+/// reason: a bare tuple at a crate boundary is a shape every caller has to
+/// re-derive from the encoder. No `blank_reason`, because this path refuses a
+/// blank.
+pub type OverlaySplitParts = (
+    RasterBuf,
+    Option<u32>,
+    Option<HitCells>,
+    Option<PictureCrop>,
+);
+
+pub fn decode_overlay_out_split(head: &[u8], picture: RasterBuf) -> Option<OverlaySplitParts> {
     let mut r = Reader::new(head);
     if r.u8()? != 1 {
         return None;
@@ -1903,7 +1983,8 @@ pub fn decode_overlay_out_split(
         return None;
     }
     let hit_cells = decode_hit_cells(&mut r)?;
-    r.at_end().then_some((picture, None, hit_cells))
+    let crop = decode_crop(&mut r)?;
+    r.at_end().then_some((picture, None, hit_cells, crop))
 }
 
 // ── The field codecs the rows share ──────────────────────────────────────
@@ -3886,6 +3967,7 @@ mod tests {
 
     fn assert_reply_round_trips(row: &JobCodec, rgba: Vec<u8>, hit_cells: Option<HitCells>) {
         let reply = DescribedOut(Box::new(RasterizeOutput {
+            crop: None,
             rgba: rgba.clone().into(),
             hit_cells: hit_cells.clone(),
             alpha: AlphaMode::Premultiplied,
@@ -3995,6 +4077,7 @@ mod tests {
             let mut tails = Vec::new();
             (row.encode_out)(
                 DescribedOut(Box::new(RasterizeOutput {
+                    crop: None,
                     rgba: out.rgba.clone(),
                     hit_cells: cells,
                     alpha: AlphaMode::Premultiplied,
@@ -4049,6 +4132,7 @@ mod tests {
                 height: 4,
                 cells: forward,
             }),
+            None,
             &mut a,
         );
         let mut b = Vec::new();
@@ -4061,6 +4145,7 @@ mod tests {
                 height: 4,
                 cells: backward,
             }),
+            None,
             &mut b,
         );
         assert_eq!(

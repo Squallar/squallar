@@ -13,6 +13,7 @@ fn texture(ctx: &egui::Context, name: &str) -> egui::TextureHandle {
 
 fn data(texture: egui::TextureHandle, max_lat: f64) -> OverlayTextureData {
     OverlayTextureData {
+        crop: None,
         texture,
         placed: PlacedRaster::of(GeoBounds {
             min_lat: 34.0,

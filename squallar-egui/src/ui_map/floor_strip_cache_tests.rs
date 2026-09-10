@@ -325,6 +325,7 @@ fn an_overlay_raster_arrival_repaints_exactly_once() {
             .expect("pane 1")
             .overlay_cache_mut(&known::NWS_ALERTS)
             .show(crate::overlay_cache::OverlayTextureData {
+                crop: None,
                 texture,
                 placed: squallar_geo::PlacedRaster::of(squallar_geo::GeoBounds {
                     min_lat: 30.0,

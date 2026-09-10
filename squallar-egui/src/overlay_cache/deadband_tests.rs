@@ -57,6 +57,7 @@ fn a_texture(ctx: &egui::Context) -> egui::TextureHandle {
 /// A picture rasterised for `vp`, satisfying every arm of the gate but coverage.
 fn data_for(texture: &egui::TextureHandle, vp: &GeoBounds, overdraw: f32) -> OverlayTextureData {
     OverlayTextureData {
+        crop: None,
         texture: texture.clone(),
         placed: PlacedRaster::of(plan(overdraw).coverage(vp)),
         data_generation: TOKEN,

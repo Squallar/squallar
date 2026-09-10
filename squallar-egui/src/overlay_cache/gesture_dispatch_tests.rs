@@ -110,6 +110,7 @@ fn data_for(
     zoom: f64,
 ) -> OverlayTextureData {
     OverlayTextureData {
+        crop: None,
         texture: texture.clone(),
         placed: PlacedRaster::of(plan.coverage(vp)),
         data_generation: TOKEN,

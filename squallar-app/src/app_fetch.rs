@@ -1136,12 +1136,12 @@ impl super::App {
         window: Option<crate::WindowRef>,
     ) -> impl FnOnce(squallar_worker::offload::JobResult) + Send + 'static {
         move |result| {
-            let expected = (width as usize) * (height as usize) * 4;
             if let Some(squallar_overlays::render::rasterize::RasterizeOutput {
                 rgba,
                 hit_cells,
                 blank,
                 blank_reason,
+                crop,
                 ..
             }) = result
                 .and_then(|out| out.take::<squallar_overlays::render::rasterize::RasterizeOutput>())
@@ -1151,12 +1151,41 @@ impl super::App {
                 // below is what separates a raster that painted nothing from a
                 // handler that answered the wrong size, and collapsing the two
                 // would turn a bug into a silent clear.
+                // **The size the answer OWES, which the answer's own window
+                // decides.** A sparse overlay rasterizes into a bounding box of
+                // its content rather than the whole viewport
+                // (`squallar_overlays::render::rasterize::PictureCrop`), so the
+                // contract is the window's bytes and not the plan's; `None` is
+                // the whole picture and is what every unchanged row answers.
+                //
+                // **The window is refused before it is believed**, because
+                // nothing else downstream can: a window reaching past the grid
+                // it indexes would place a picture off the ground it was
+                // rendered for, which is a visibly misplaced overlay and not a
+                // failed render. A refusal here files it as the second, which
+                // is a layer that clears rather than a layer that lies.
+                let fits = crop.is_none_or(|crop| {
+                    // **And that it is a window into THIS dispatch's grid.** A
+                    // window that fits some other picture would be placed
+                    // against this one's ground.
+                    crop.fits() && crop.of_width == width && crop.of_height == height
+                });
+                let expected = match crop {
+                    Some(crop) if fits => crop.bytes() as usize,
+                    _ => (width as usize) * (height as usize) * 4,
+                };
                 let answered = blank.map_or(rgba.len(), |len| len as usize);
-                let sized = answered == expected;
-                if !sized {
+                let sized = fits && answered == expected;
+                if !fits {
                     log::error!(
-                        "{label} answered {answered} bytes where {width}x{height} \
-                         needs {expected}; treating it as a failed render",
+                        "{label} answered a {crop:?} window of {width}x{height}, \
+                         which is not inside it; treating it as a failed render",
+                    );
+                } else if !sized {
+                    log::error!(
+                        "{label} answered {answered} bytes where {crop:?} of \
+                         {width}x{height} needs {expected}; treating it as a \
+                         failed render",
                     );
                 }
                 let hit_map = match (hit_cells, &id_map) {
@@ -1225,7 +1254,17 @@ impl super::App {
                         // rasterizer's own buffer straight over; every other
                         // producer still pays the copy it always paid, and the
                         // picture is the same either way.
-                        let size = [width as usize, height as usize];
+                        // **The window's size, not the plan's.** These are
+                        // the picture's own texels; the plan's pair still
+                        // travels beside it on the response, because the
+                        // rebuild gate compares *that* against the plan to
+                        // catch a display-density change and a window reaching
+                        // it would read as a resize on every frame.
+                        let size = match crop {
+                            Some(crop) => [crop.width as usize, crop.height as usize],
+                            None => [width as usize, height as usize],
+                        };
+                        response.crop = crop;
                         response.picture = Some(match blank {
                             None => crate::channels::OverlayPicture::Painted(std::sync::Arc::new(
                                 egui::ColorImage::new(size, rgba.into_pixels()),
@@ -1512,6 +1551,10 @@ impl super::App {
                     // so. Pinned by
                     // `an_empty_extent_delivers_a_blank_rather_than_no_response`.
                     let _ = sender.send(OverlayRenderResponse {
+                        // **No window, because no picture.** This blank never
+                        // met a rasterizer, so nothing cut one; the pane is
+                        // being cleared over the whole ground it asked about.
+                        crop: None,
                         picture: Some(crate::channels::OverlayPicture::Blank {
                             width,
                             height,
@@ -1565,6 +1608,9 @@ impl super::App {
                             // Set by the deliver above once the answer is
                             // known; `None` is the render that failed.
                             picture: None,
+                            // Set by the deliver above off the reply's own
+                            // window, on the same terms `picture` is.
+                            crop: None,
                             geo_bounds: render_bounds,
                             overlay_kind: id.clone(),
                             generation: data_generation,

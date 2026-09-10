@@ -40,6 +40,33 @@ const WIDTH: u32 = 512;
 const HEIGHT: u32 = 512;
 const PICTURE_BYTES: usize = (WIDTH * HEIGHT * 4) as usize;
 
+/// **What counts as picture-sized**, an eighth of the whole viewport.
+///
+/// It used to be [`PICTURE_BYTES`] itself, because the raster used to *be* the
+/// whole viewport. Since 2026-09-10 it is a bounding box of the stations it
+/// paints (`squallar_overlays::render::rasterize::PictureCrop`), so a threshold
+/// at the plan's size counts **zero** allocations for a function that certainly
+/// makes one — and this gate would have passed by measuring nothing. The
+/// fixtures below spread their stations across the viewport so the window is a
+/// large fraction of it, and every assertion states the raster's own length
+/// rather than a constant, so the size the harness sees is the size the
+/// rasterizer produced.
+///
+/// Nothing else in the call reaches an eighth of a megapixel: tiny-skia's
+/// scratch is per-scanline and the station list is two dozen triples.
+const PICTURE_FLOOR: usize = PICTURE_BYTES / 8;
+
+/// The station spread every case here shares: 24 observations across the
+/// viewport, so the window is a large fraction of it and the harness above can
+/// see the raster at all.
+fn spread() -> MetarInput {
+    input(
+        (0..24)
+            .map(|i| station(31.0 + i as f64 * 0.3, -99.0 + i as f64 * 0.3))
+            .collect(),
+    )
+}
+
 static PICTURE_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 static PICTURE_BYTES_SEEN: AtomicUsize = AtomicUsize::new(0);
 
@@ -61,7 +88,7 @@ fn counting() -> bool {
 }
 
 fn record(size: usize) {
-    if size >= PICTURE_BYTES && counting() {
+    if size >= PICTURE_FLOOR && counting() {
         PICTURE_ALLOCS.fetch_add(1, Ordering::Relaxed);
         PICTURE_BYTES_SEEN.fetch_add(size, Ordering::Relaxed);
     }
@@ -173,19 +200,16 @@ fn input(obs: Vec<MetarOb>) -> MetarInput {
 /// for the whole call.
 #[test]
 fn a_station_raster_allocates_one_picture_and_not_two() {
-    let input = input(
-        (0..24)
-            .map(|i| station(31.0 + i as f64 * 0.3, -99.0 + i as f64 * 0.3))
-            .collect(),
-    );
+    let input = spread();
     let (out, allocs, bytes) =
         picture_allocations_during(|| rasterize_metar_stations(&input, &bounds(), WIDTH, HEIGHT));
 
-    assert_eq!(
+    assert!(
+        out.rgba.len() >= PICTURE_FLOOR,
+        "control: the call produced a {} B raster, below the {PICTURE_FLOOR} B \
+         floor the harness counts at, so the allocation figures below are not \
+         measuring what this test names",
         out.rgba.len(),
-        PICTURE_BYTES,
-        "control: the call did not produce a {WIDTH}x{HEIGHT} raster, so the \
-         allocation figures below are not measuring what this test names",
     );
     assert_eq!(
         allocs, 1,
@@ -198,9 +222,11 @@ fn a_station_raster_allocates_one_picture_and_not_two() {
          per dispatch. Move the buffer instead.",
     );
     assert_eq!(
-        bytes, PICTURE_BYTES,
-        "the one picture-sized allocation was {bytes} B where the texture is \
-         {PICTURE_BYTES} B",
+        bytes,
+        out.rgba.len(),
+        "the one picture-sized allocation was {bytes} B where the raster this \
+         call produced is {} B",
+        out.rgba.len(),
     );
 }
 
@@ -210,16 +236,17 @@ fn a_station_raster_allocates_one_picture_and_not_two() {
 /// counting would pass exactly as the fixed tree does.
 #[test]
 fn the_counter_sees_a_second_picture_when_one_is_made() {
-    let input = input(vec![station(35.0, -95.0)]);
+    let input = spread();
     let (copy, allocs, bytes) = picture_allocations_during(|| {
         let out = rasterize_metar_stations(&input, &bounds(), WIDTH, HEIGHT);
         out.rgba.to_vec()
     });
 
-    assert_eq!(
+    assert!(
+        copy.len() >= PICTURE_FLOOR,
+        "control: the copy is {} B, below the {PICTURE_FLOOR} B floor the \
+         harness counts at",
         copy.len(),
-        PICTURE_BYTES,
-        "control: the copy is a whole raster"
     );
     assert_eq!(
         allocs, 2,
@@ -229,7 +256,7 @@ fn the_counter_sees_a_second_picture_when_one_is_made() {
     );
     assert_eq!(
         bytes,
-        PICTURE_BYTES * 2,
+        copy.len() * 2,
         "two pictures, by size as well as by count"
     );
 }

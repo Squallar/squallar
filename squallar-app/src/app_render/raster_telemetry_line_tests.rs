@@ -105,6 +105,9 @@ fn the_rig_reads_the_lines_the_app_actually_writes() {
     // POSITION of each field in the sentence and a plausible value would let a
     // transposition read as correct.
     let rasters = ledger::Totals {
+        cropped: 3,
+        cropped_saved_bytes: 41_940_480,
+        whole: 5,
         dispatched: 11,
         arrived: 22,
         pictures: 33,

@@ -97,12 +97,23 @@ fn distance_bands(out: &RasterizeOutput, at: (f64, f64)) -> (usize, usize, usize
     );
     let ring_r = (cy - north).abs();
 
+    // **The picture is a window into the viewport, not the viewport.** The
+    // coverage raster allocates a bounding box of the discs it is about to
+    // paint (`PictureCrop`), so a texel's index is a coordinate in the window
+    // and the distances below are measured in the viewport. Walking it at
+    // whole-picture coordinates read the ink of one continent as though it were
+    // somewhere else entirely.
+    let crop = out.crop.unwrap_or_else(|| super::PictureCrop::whole(W, H));
     let (mut inner, mut on_ring, mut beyond) = (0usize, 0usize, 0usize);
     for (i, px) in out.rgba.chunks_exact(4).enumerate() {
         if px[3] == 0 {
             continue;
         }
-        let (x, y) = ((i as u32 % W) as f32, (i as u32 / W) as f32);
+        let i = i as u32;
+        let (x, y) = (
+            (crop.x + i % crop.width) as f32,
+            (crop.y + i / crop.width) as f32,
+        );
         let d = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
         if d < ring_r * 0.25 {
             inner += 1;

@@ -412,6 +412,36 @@ fn overlay_raster_line(t: &squallar_egui::overlay_cache::ledger::Totals) -> Stri
     )
 }
 
+/// The `overlay windows:` running-total line — **how many pictures were
+/// rasterized into a bounding box of their own content, and the bytes that
+/// were never allocated because they were**.
+///
+/// **A separate line and not more fields on `overlay rasters:`**, for
+/// [`overlay_reason_line`]'s reason verbatim: the Tier-2 rig matches that
+/// sentence with one anchored regex and a field inserted into it turns the
+/// whole overlay reading into `null`.
+///
+/// **Always emitted, including all-zero.** A mechanism that never fires is what
+/// this exists to catch, and a line that speaks only when something happened is
+/// indistinguishable from a rig that never scraped it — the argument
+/// `overlay_blank_line` makes, and it applies here with more force, because a
+/// zero on the first field is the exact reading that says a landing bought
+/// nothing.
+///
+/// `whole` is the other arm of the same denominator, printed rather than left
+/// to be subtracted: without it a reader cannot separate a mechanism that
+/// rarely fires from a scene that rarely has anything in it. `saved` is
+/// **churn** — bytes not allocated across the leg — and is never added to a
+/// residency figure; what the pipeline *holds* is `overlay door:`'s peak and
+/// the process's own. The pair have different denominators and describe
+/// different quantities.
+fn overlay_window_line(t: &squallar_egui::overlay_cache::ledger::Totals) -> String {
+    format!(
+        "overlay windows: {} cropped, {} whole, {} B saved",
+        t.cropped, t.whole, t.cropped_saved_bytes,
+    )
+}
+
 /// The `overlay door:` running-total line — what the **aggregate** overlay
 /// picture door has done, as against `overlay rasters:`' record of what got
 /// through it.
@@ -2730,6 +2760,9 @@ impl super::App {
             render_zoom: 0,
             width: side as u32,
             height: side as u32,
+            // Radar's plan view fills its own square and is not in the overlay
+            // job funnel at all; there is no window to cut and none to carry.
+            crop: None,
             radar_meta: Some(meta),
             hit_map: None,
         };
@@ -2892,6 +2925,12 @@ impl super::App {
             // what got through and this counts what the ceiling held back, so
             // the two are only readable together.
             say_telemetry(loud, &overlay_door_line(&t));
+            // And what size the pictures that got through it were, off that
+            // same reading: the door line is bytes the pipeline was allowed to
+            // have outstanding and this is bytes it never asked for, so the two
+            // are only readable together — and neither may be added to the
+            // other.
+            say_telemetry(loud, &overlay_window_line(&t));
         }
         if let Some((u, peak)) = uploads {
             say_telemetry(loud, &texture_upload_line(&u));
@@ -4257,6 +4296,20 @@ impl super::App {
                         image.as_raw().len() as u64,
                         true,
                     );
+                    // **Beside it and off the same picture.** `note_picture`
+                    // says what this picture cost; this says what it would have
+                    // cost at the plan's whole size, so the difference is bytes
+                    // the rasterizer never allocated. `as_raw().len()` again
+                    // rather than the window restated: the real buffer is the
+                    // only figure that cannot be a claim.
+                    let planned = resp.crop.map_or_else(
+                        || image.as_raw().len() as u64,
+                        |crop| u64::from(crop.of_width) * u64::from(crop.of_height) * 4,
+                    );
+                    squallar_egui::overlay_cache::ledger::note_picture_size(
+                        planned,
+                        image.as_raw().len() as u64,
+                    );
                     Some(texture)
                 }
                 crate::channels::OverlayPicture::Blank { reason, .. } => {
@@ -4271,14 +4324,20 @@ impl super::App {
                 }
             };
 
-            // The picture's own dimensions rather than a pair carried beside
-            // it — and the blank's are the plan's, recorded by the deliver
-            // that decided not to build it.
+            // **The pair the pane PLANNED, which is the picture's own only
+            // while the picture is the whole plan.** A picture cut to a window
+            // of its content is not, and this is the pair the rebuild gate
+            // judges against the plan — so it comes off the window's own record
+            // of the grid it is a window into (`PictureCrop::of_width`) when
+            // there is one. A blank has always stated the pair directly.
             let (width, height) = match &answer {
-                crate::channels::OverlayPicture::Painted(image) => {
-                    let [width, height] = image.size;
-                    (width as u32, height as u32)
-                }
+                crate::channels::OverlayPicture::Painted(image) => resp.crop.map_or_else(
+                    || {
+                        let [width, height] = image.size;
+                        (width as u32, height as u32)
+                    },
+                    |crop| (crop.of_width, crop.of_height),
+                ),
                 crate::channels::OverlayPicture::Blank { width, height, .. } => (*width, *height),
             };
 
@@ -4319,6 +4378,7 @@ impl super::App {
                     render_zoom: shape.render_zoom,
                     width,
                     height,
+                    crop: resp.crop,
                     radar_meta: None,
                     hit_map: resp.hit_map.clone(),
                 };
@@ -4382,10 +4442,21 @@ impl super::App {
         let uploaded = match resp.picture {
             Some(crate::channels::OverlayPicture::Painted(image)) => {
                 self.texture_counter += 1;
-                let [width, height] = image.size;
                 let name = format!("overlay_loop_{}", self.texture_counter);
+                let planned = resp.crop.map_or_else(
+                    || {
+                        let [width, height] = image.size;
+                        (width as u32, height as u32)
+                    },
+                    |crop| (crop.of_width, crop.of_height),
+                );
                 let texture = ctx.load_texture(name, image, egui::TextureOptions::LINEAR);
-                Some((texture, width as u32, height as u32))
+                // **The plan's pair, not the picture's**, on the same terms
+                // the live arm takes it: a frame cut to a window of its content
+                // is placed by `crop` against the whole picture's rect, and
+                // that rect is what these two describe.
+                let (width, height) = planned;
+                Some((texture, width, height))
             }
             // **`Blank` cannot reach here** and is not silently equated with a
             // failure: `overlay_job_deliver` builds a picture for every loop
@@ -4415,6 +4486,7 @@ impl super::App {
                             render_zoom: resp.zoom,
                             width: *width,
                             height: *height,
+                            crop: resp.crop,
                             // Radar's hover payload and radar's hit map: an
                             // overlay loop frame is a picture and nothing else.
                             // Hovers are answered by the live layer state,

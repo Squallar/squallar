@@ -36,6 +36,7 @@ const TOKEN: u64 = 7;
 /// speak is the one this module is about.
 fn data(ctx: &egui::Context, name: &str, side: u32) -> OverlayTextureData {
     OverlayTextureData {
+        crop: None,
         texture: texture(ctx, name),
         placed: PlacedRaster::of(GeoBounds {
             min_lat: 30.0,

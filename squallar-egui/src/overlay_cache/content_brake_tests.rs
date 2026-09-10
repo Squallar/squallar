@@ -27,6 +27,7 @@ fn texture(ctx: &egui::Context, name: &str) -> egui::TextureHandle {
 /// that no arm below the content one can fire and answer for it.
 fn data(ctx: &egui::Context, name: &str, generation: u64) -> OverlayTextureData {
     OverlayTextureData {
+        crop: None,
         texture: texture(ctx, name),
         placed: PlacedRaster::of(GeoBounds {
             min_lat: 30.0,

@@ -259,6 +259,7 @@ fn fill_transport(app: &mut crate::app::App, ctx: &egui::Context) {
         app.channels
             .overlay_render_sender
             .send(crate::channels::OverlayRenderResponse {
+                crop: None,
                 picture: Some(crate::channels::OverlayPicture::Painted(Arc::new(
                     egui::ColorImage::from_rgba_unmultiplied([1, 1], &[10, 10, 10, 255]),
                 ))),
@@ -410,6 +411,7 @@ fn overlay_pass(
     app.channels
         .overlay_render_sender
         .send(crate::channels::OverlayRenderResponse {
+            crop: None,
             picture: Some(crate::channels::OverlayPicture::Painted(Arc::new(
                 egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]),
             ))),
@@ -546,6 +548,7 @@ fn treadmill_census(latency: usize, cycles: i64) -> String {
         app.channels
             .overlay_render_sender
             .send(crate::channels::OverlayRenderResponse {
+                crop: None,
                 picture: Some(crate::channels::OverlayPicture::Painted(Arc::new(
                     egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]),
                 ))),

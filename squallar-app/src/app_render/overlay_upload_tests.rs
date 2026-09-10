@@ -59,6 +59,7 @@ fn deliver(app: &mut crate::app::App, ctx: &egui::Context, pane_indices: Vec<usi
     app.channels
         .overlay_render_sender
         .send(crate::channels::OverlayRenderResponse {
+            crop: None,
             picture: Some(crate::channels::OverlayPicture::Painted(image)),
             geo_bounds: bounds(),
             overlay_kind: known::NWS_ALERTS,
@@ -215,6 +216,7 @@ fn deliver_unmarked(app: &mut crate::app::App, ctx: &egui::Context, pane_indices
     app.channels
         .overlay_render_sender
         .send(crate::channels::OverlayRenderResponse {
+            crop: None,
             picture: Some(crate::channels::OverlayPicture::Painted(image)),
             geo_bounds: bounds(),
             overlay_kind: known::NWS_ALERTS,
@@ -339,6 +341,7 @@ fn send_reply(app: &mut crate::app::App, generation: u64, rgba: Vec<u8>) {
         );
     }
     let mut raster = squallar_overlays::render::rasterize::RasterizeOutput {
+        crop: None,
         rgba: rgba.into(),
         hit_cells: None,
         alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
@@ -356,6 +359,7 @@ fn send_reply(app: &mut crate::app::App, generation: u64, rgba: Vec<u8>) {
         H,
         None,
         crate::channels::OverlayRenderResponse {
+            crop: None,
             picture: None,
             geo_bounds: bounds(),
             overlay_kind: known::NWS_ALERTS,

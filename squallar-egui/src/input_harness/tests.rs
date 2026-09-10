@@ -13454,6 +13454,7 @@ fn settle_metar_cache(
         h.gui_mut().panes_mut()[pane_idx]
             .overlay_cache_mut(&known::METAR)
             .show(crate::overlay_cache::OverlayTextureData {
+                crop: None,
                 texture,
                 placed: squallar_geo::PlacedRaster::of(coverage),
                 data_generation: token,
@@ -13769,6 +13770,7 @@ fn settle_overlay_cache(h: &mut InputHarness, kind: &LayerId) {
         h.gui_mut().panes_mut()[pane_idx]
             .overlay_cache_mut(kind)
             .show(crate::overlay_cache::OverlayTextureData {
+                crop: None,
                 texture,
                 placed: squallar_geo::PlacedRaster::of(plan.coverage(&geo_bounds)),
                 data_generation: token,
@@ -16841,6 +16843,7 @@ pub(super) fn land_requested_rasters(h: &mut InputHarness, kind: &LayerId) {
         let cache = pane.overlay_cache_mut(kind);
         cache.renders = Default::default();
         cache.show(crate::overlay_cache::OverlayTextureData {
+            crop: None,
             texture,
             placed: squallar_geo::PlacedRaster::of(plan.coverage(&geo_bounds)),
             data_generation: token,

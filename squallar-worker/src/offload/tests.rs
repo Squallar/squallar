@@ -2835,7 +2835,17 @@ fn the_sites_render_is_byte_identical_direct_and_via_the_wire() {
 
     assert_eq!(
         via_wire.len(),
-        (width * height * 4) as usize,
+        // **The WINDOW's bytes, which is what the consumer checks.** This used
+        // to be the plan's `width * height * 4` and moved on 2026-09-10 with
+        // the change that made it move: a sparse row rasterizes into a bounding
+        // box of its content, and `App::overlay_job_deliver` sizes its answer
+        // check off the reply's own window for exactly that reason. Taken from
+        // the direct call's window rather than restated, so a codec that
+        // dropped the window on the wire fails here instead of agreeing with
+        // itself.
+        direct
+            .crop
+            .map_or((width * height * 4) as usize, |crop| crop.bytes() as usize),
         "the reply's length is the one statement of shape the consumer checks",
     );
     assert_eq!(
@@ -2911,7 +2921,17 @@ fn the_alerts_render_is_byte_identical_direct_and_via_the_wire() {
     });
     assert_eq!(
         via_wire.len(),
-        (width * height * 4) as usize,
+        // **The WINDOW's bytes, which is what the consumer checks.** This used
+        // to be the plan's `width * height * 4` and moved on 2026-09-10 with
+        // the change that made it move: a sparse row rasterizes into a bounding
+        // box of its content, and `App::overlay_job_deliver` sizes its answer
+        // check off the reply's own window for exactly that reason. Taken from
+        // the direct call's window rather than restated, so a codec that
+        // dropped the window on the wire fails here instead of agreeing with
+        // itself.
+        direct
+            .crop
+            .map_or((width * height * 4) as usize, |crop| crop.bytes() as usize),
         "the reply's length is the one statement of shape the consumer checks",
     );
     assert_eq!(
@@ -2983,7 +3003,17 @@ fn the_outlooks_render_is_byte_identical_direct_and_via_the_wire() {
     });
     assert_eq!(
         via_wire.len(),
-        (width * height * 4) as usize,
+        // **The WINDOW's bytes, which is what the consumer checks.** This used
+        // to be the plan's `width * height * 4` and moved on 2026-09-10 with
+        // the change that made it move: a sparse row rasterizes into a bounding
+        // box of its content, and `App::overlay_job_deliver` sizes its answer
+        // check off the reply's own window for exactly that reason. Taken from
+        // the direct call's window rather than restated, so a codec that
+        // dropped the window on the wire fails here instead of agreeing with
+        // itself.
+        direct
+            .crop
+            .map_or((width * height * 4) as usize, |crop| crop.bytes() as usize),
         "the reply's length is the one statement of shape the consumer checks",
     );
     assert_eq!(
@@ -3026,7 +3056,17 @@ fn the_discussions_render_is_byte_identical_direct_and_via_the_wire() {
     });
     assert_eq!(
         via_wire.len(),
-        (width * height * 4) as usize,
+        // **The WINDOW's bytes, which is what the consumer checks.** This used
+        // to be the plan's `width * height * 4` and moved on 2026-09-10 with
+        // the change that made it move: a sparse row rasterizes into a bounding
+        // box of its content, and `App::overlay_job_deliver` sizes its answer
+        // check off the reply's own window for exactly that reason. Taken from
+        // the direct call's window rather than restated, so a codec that
+        // dropped the window on the wire fails here instead of agreeing with
+        // itself.
+        direct
+            .crop
+            .map_or((width * height * 4) as usize, |crop| crop.bytes() as usize),
         "the reply's length is the one statement of shape the consumer checks",
     );
     assert_eq!(
@@ -3098,7 +3138,17 @@ fn the_metar_render_is_byte_identical_direct_and_via_the_wire() {
     });
     assert_eq!(
         via_wire.len(),
-        (width * height * 4) as usize,
+        // **The WINDOW's bytes, which is what the consumer checks.** This used
+        // to be the plan's `width * height * 4` and moved on 2026-09-10 with
+        // the change that made it move: a sparse row rasterizes into a bounding
+        // box of its content, and `App::overlay_job_deliver` sizes its answer
+        // check off the reply's own window for exactly that reason. Taken from
+        // the direct call's window rather than restated, so a codec that
+        // dropped the window on the wire fails here instead of agreeing with
+        // itself.
+        direct
+            .crop
+            .map_or((width * height * 4) as usize, |crop| crop.bytes() as usize),
         "the reply's length is the one statement of shape the consumer checks",
     );
     assert_eq!(
@@ -3153,7 +3203,17 @@ fn the_reports_render_is_byte_identical_direct_and_via_the_wire() {
     });
     assert_eq!(
         via_wire.len(),
-        (width * height * 4) as usize,
+        // **The WINDOW's bytes, which is what the consumer checks.** This used
+        // to be the plan's `width * height * 4` and moved on 2026-09-10 with
+        // the change that made it move: a sparse row rasterizes into a bounding
+        // box of its content, and `App::overlay_job_deliver` sizes its answer
+        // check off the reply's own window for exactly that reason. Taken from
+        // the direct call's window rather than restated, so a codec that
+        // dropped the window on the wire fails here instead of agreeing with
+        // itself.
+        direct
+            .crop
+            .map_or((width * height * 4) as usize, |crop| crop.bytes() as usize),
         "the reply's length is the one statement of shape the consumer checks",
     );
     assert_eq!(
@@ -3222,7 +3282,17 @@ fn the_glm_render_is_byte_identical_direct_and_via_the_wire() {
     });
     assert_eq!(
         via_wire.len(),
-        (width * height * 4) as usize,
+        // **The WINDOW's bytes, which is what the consumer checks.** This used
+        // to be the plan's `width * height * 4` and moved on 2026-09-10 with
+        // the change that made it move: a sparse row rasterizes into a bounding
+        // box of its content, and `App::overlay_job_deliver` sizes its answer
+        // check off the reply's own window for exactly that reason. Taken from
+        // the direct call's window rather than restated, so a codec that
+        // dropped the window on the wire fails here instead of agreeing with
+        // itself.
+        direct
+            .crop
+            .map_or((width * height * 4) as usize, |crop| crop.bytes() as usize),
         "the reply's length is the one statement of shape the consumer checks",
     );
     assert_eq!(
@@ -3579,13 +3649,13 @@ fn the_overlay_reply_round_trips_and_is_canonical() {
                   reason: Option<squallar_overlays::render::rasterize::BlankReason>,
                   cells: Option<&squallar_overlays::render::rasterize::HitCells>| {
         let mut out = Vec::new();
-        encode_overlay_out(&rgba, blank, reason, cells, &mut out);
+        encode_overlay_out(&rgba, blank, reason, cells, None, &mut out);
         out
     };
     for cells in [None, Some(a_hit_cells_fixture())] {
         assert_eq!(
             decode_overlay_out(&encode(None, None, cells.as_ref())),
-            Some((rgba.clone().into(), None, None, cells.clone())),
+            Some((rgba.clone().into(), None, None, cells.clone(), None)),
             "the overlay reply did not survive its own codec",
         );
         // The blank form: no pixels on the wire, and the length the picture
@@ -3605,7 +3675,8 @@ fn the_overlay_reply_round_trips_and_is_canonical() {
                     RasterBuf::empty(),
                     Some(rgba.len() as u32),
                     Some(reason),
-                    cells.clone()
+                    cells.clone(),
+                    None
                 )),
                 "the blank overlay reply did not survive its own codec \
                  carrying {reason:?}",
@@ -3619,7 +3690,8 @@ fn the_overlay_reply_round_trips_and_is_canonical() {
                 RasterBuf::empty(),
                 Some(rgba.len() as u32),
                 Some(squallar_overlays::render::rasterize::BlankReason::Unattributed),
-                cells.clone()
+                cells.clone(),
+                None
             )),
             "an unarmed blank did not arrive as `Unattributed`",
         );
@@ -3643,7 +3715,7 @@ fn the_picture_starts_at_a_constant_offset_whatever_the_cells_say() {
     let mut seen = Vec::new();
     for cells in [None, Some(a_hit_cells_fixture())] {
         let mut encoded = Vec::new();
-        encode_overlay_out(&rgba, None, None, cells.as_ref(), &mut encoded);
+        encode_overlay_out(&rgba, None, None, cells.as_ref(), None, &mut encoded);
         let prefix = &encoded[..squallar_overlays::render::jobs::OVERLAY_PIXEL_PREFIX_BYTES];
         let span = squallar_overlays::render::jobs::overlay_pixel_span(prefix)
             .expect("a painted reply states a pixel span in its prefix");
@@ -3678,6 +3750,7 @@ fn the_picture_starts_at_a_constant_offset_whatever_the_cells_say() {
         Some(64),
         Some(squallar_overlays::render::rasterize::BlankReason::OutsideCoverage),
         None,
+        None,
         &mut blank,
     );
     assert_eq!(
@@ -3698,7 +3771,7 @@ fn the_split_decode_and_the_whole_decode_agree() {
     let rgba: Vec<u8> = (0..64).collect();
     for cells in [None, Some(a_hit_cells_fixture())] {
         let mut encoded = Vec::new();
-        encode_overlay_out(&rgba, None, None, cells.as_ref(), &mut encoded);
+        encode_overlay_out(&rgba, None, None, cells.as_ref(), None, &mut encoded);
         let (offset, len) = squallar_overlays::render::jobs::overlay_pixel_span(
             &encoded[..squallar_overlays::render::jobs::OVERLAY_PIXEL_PREFIX_BYTES],
         )
@@ -3738,7 +3811,7 @@ fn a_split_reply_whose_stated_length_does_not_match_its_picture_is_refused() {
     // prefix states is the only thing that can catch it.
     let rgba: Vec<u8> = (0..64).collect();
     let mut encoded = Vec::new();
-    encode_overlay_out(&rgba, None, None, None, &mut encoded);
+    encode_overlay_out(&rgba, None, None, None, None, &mut encoded);
     let (offset, len) = squallar_overlays::render::jobs::overlay_pixel_span(
         &encoded[..squallar_overlays::render::jobs::OVERLAY_PIXEL_PREFIX_BYTES],
     )
@@ -3784,13 +3857,14 @@ fn the_overlay_reply_framing_is_the_one_this_protocol_ships() {
     // Sink-shaped construction since WO-M7d; the byte VALUES these rows pin
     // are the proof the flatten changed no stream.
     let mut bare = Vec::new();
-    encode_overlay_out(&rgba, None, None, None, &mut bare);
+    encode_overlay_out(&rgba, None, None, None, None, &mut bare);
     let mut with_cells = Vec::new();
     encode_overlay_out(
         &rgba,
         None,
         None,
         Some(&a_hit_cells_fixture()),
+        None,
         &mut with_cells,
     );
     // The blank form, pinned as its own row: it is the one whose LENGTH is the
@@ -3801,6 +3875,7 @@ fn the_overlay_reply_framing_is_the_one_this_protocol_ships() {
         &[],
         Some(rgba.len() as u32),
         Some(squallar_overlays::render::rasterize::BlankReason::OutsideCoverage),
+        None,
         None,
         &mut blank,
     );
@@ -4068,13 +4143,20 @@ fn a_blank_overlay_reply_carries_no_picture_sized_payload() {
     let (_, painted_head, painted_tails) =
         execute_encoded(&painted_job.to_bytes(), None).expect("the alerts job answers");
     assert!(painted_tails.is_empty(), "the overlay rows write no tails");
+    // **Against the raster's own bytes and not the plan's**, which moved on
+    // 2026-09-10 with the change that made them differ: the alerts row cuts its
+    // pixmap down to a bounding box of what it paints, so `picture_bytes` — the
+    // plan's whole viewport — is no longer what an inked reply carries. What
+    // this case is about is unchanged: a reply with ink in it puts its pixels
+    // on the wire, and a blank one does not.
+    let painted_bytes = direct.rgba.as_bytes().len();
     assert!(
-        painted_head.len() > picture_bytes,
+        painted_head.len() > painted_bytes,
         "an inked reply lost its picture: {} bytes on the wire for a \
-         {picture_bytes}-byte raster",
+         {painted_bytes}-byte raster (the plan was {picture_bytes} B)",
         painted_head.len(),
     );
-    let (via_wire, blank, blank_reason, _) =
+    let (via_wire, blank, blank_reason, _, _) =
         decode_overlay_out(&painted_head).expect("the painted reply decodes");
     assert_eq!(
         (via_wire.into_bytes(), blank, blank_reason),
@@ -4102,7 +4184,14 @@ fn a_blank_overlay_reply_carries_no_picture_sized_payload() {
         decode_overlay_out(&blank_head),
         Some((
             RasterBuf::empty(),
-            Some(picture_bytes as u32),
+            // **The buffer that was given up, which is the window's and not the
+            // plan's.** 24,576 to 4 on 2026-09-10: `blank` has always been the
+            // length of the picture this raster declined to keep, and that
+            // picture is now the one-texel window an empty alerts list asks for.
+            // The arrival checks this against the window it also carries, so
+            // the two cannot disagree; `picture_bytes` — the plan — is what a
+            // cleared pane still remembers, and it travels separately.
+            Some(4),
             // **`EmptyInput`, and it used to be `Unattributed`.** This pin
             // recorded the gap: until 2026-09-09 only the gridded row armed a
             // `BlankReason`, so an alerts raster with nothing to draw crossed
@@ -4118,7 +4207,24 @@ fn a_blank_overlay_reply_carries_no_picture_sized_payload() {
             // where every rasterizer arms, which is indistinguishable from the
             // gap this replaced.
             Some(squallar_overlays::render::rasterize::BlankReason::EmptyInput),
-            None
+            None,
+            // **The window, and it is one texel.** This value moved on
+            // 2026-09-10 and the move is the subject of the change, not a
+            // re-point: `rasterize_nws_alerts` now allocates a bounding box of
+            // what it is about to paint, and an empty alerts list is about to
+            // paint nothing, so the pixmap it declines to draw into is 1x1
+            // rather than the whole viewport. `picture_bytes` above is
+            // unchanged, because a blank still states the length of the buffer
+            // it gave up — that buffer is now four bytes, and the arrival
+            // checks it against the window and not against the plan.
+            Some(squallar_overlays::render::rasterize::PictureCrop {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                of_width: 96,
+                of_height: 64,
+            })
         )),
         "a blank reply must arrive AS a blank of the picture's own size. \
          Arriving as nothing is a failed render, which the pane ignores — so \
@@ -4138,6 +4244,7 @@ fn a_malformed_overlay_reply_is_refused_rather_than_misread() {
         None,
         None,
         Some(&a_hit_cells_fixture()),
+        None,
         &mut encoded,
     );
 
@@ -4147,12 +4254,17 @@ fn a_malformed_overlay_reply_is_refused_rather_than_misread() {
 
     // Layout, stated once: pixels tag(1) + pixel length(4) = 5, then the RGBA,
     // then the cells block — tag(1) + width(4) + height(4) + count(4) = 13 and
-    // then the sorted entries. Every offset below is relative to `cells_at`
-    // rather than to the head, so the fixture's own size is not baked in twice.
+    // then the sorted entries, and finally the window tag(1). Every offset
+    // below is relative to `cells_at` rather than to the head, so the fixture's
+    // own size is not baked in twice.
+    //
+    // 58 to 59 on 2026-09-10: the window tag, `0` here because this fixture's
+    // raster is the whole of what was dispatched. It is written last, after the
+    // cells block, so every offset below is unmoved.
     let cells_at = squallar_overlays::render::jobs::OVERLAY_PIXEL_PREFIX_BYTES + rgba.len();
     assert_eq!(
         encoded.len() - rgba.len(),
-        58,
+        59,
         "the fixture's framing moved; re-derive the offsets"
     );
 
@@ -4177,7 +4289,7 @@ fn a_malformed_overlay_reply_is_refused_rather_than_misread() {
     // The last entry's index: 8 is one past the 4×2 grid.
     let mut moved = encoded.clone();
     moved[cells_at + 41..cells_at + 45].copy_from_slice(&6u32.to_le_bytes());
-    let (_, _, _, cells) = decode_overlay_out(&moved).expect("index 6 is a legal cell");
+    let (_, _, _, cells, _) = decode_overlay_out(&moved).expect("index 6 is a legal cell");
     assert!(
         cells.expect("cells").cells.contains_key(&6),
         "the bytes at cells_at+41 are not the last entry's index; the refusal below \
@@ -4418,7 +4530,17 @@ fn the_model_render_is_byte_identical_direct_and_via_the_wire() {
     let (via_wire, hit_cells) = overlay_reply_via_wire(&request);
     assert_eq!(
         via_wire.len(),
-        (width * height * 4) as usize,
+        // **The WINDOW's bytes, which is what the consumer checks.** This used
+        // to be the plan's `width * height * 4` and moved on 2026-09-10 with
+        // the change that made it move: a sparse row rasterizes into a bounding
+        // box of its content, and `App::overlay_job_deliver` sizes its answer
+        // check off the reply's own window for exactly that reason. Taken from
+        // the direct call's window rather than restated, so a codec that
+        // dropped the window on the wire fails here instead of agreeing with
+        // itself.
+        direct
+            .crop
+            .map_or((width * height * 4) as usize, |crop| crop.bytes() as usize),
         "the reply's length is the one statement of shape the consumer checks",
     );
     assert_eq!(
@@ -4672,6 +4794,7 @@ fn an_overlay_reply_travels_as_its_own_out_kind() {
     let mut tails = Vec::new();
     (sites_row.encode_out)(
         DescribedOut(Box::new(RasterizeOutput {
+            crop: None,
             rgba: rgba.clone(),
             hit_cells: hit_cells.clone(),
             alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
@@ -4687,6 +4810,7 @@ fn an_overlay_reply_travels_as_its_own_out_kind() {
         blank,
         blank_reason,
         hit_cells.as_ref(),
+        None,
         &mut expected,
     );
     assert_eq!(head, expected);

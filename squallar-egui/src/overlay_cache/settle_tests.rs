@@ -60,6 +60,7 @@ fn plan() -> OverlayTexturePlan {
 /// gate for [`viewport`] and [`plan`].
 fn data_at(ctx: &egui::Context, name: &str, render_zoom: f64) -> OverlayTextureData {
     OverlayTextureData {
+        crop: None,
         texture: ctx.load_texture(
             name,
             egui::ColorImage::filled([1, 1], egui::Color32::RED),

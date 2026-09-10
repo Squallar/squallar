@@ -42,6 +42,7 @@ fn app_awaiting_a_render(ctx: &egui::Context) -> (crate::app::App, egui::Texture
     pane.set_overlay_enabled(KIND, true);
     let cache = pane.overlay_cache_mut(&KIND);
     cache.show(OverlayTextureData {
+        crop: None,
         texture: parked,
         placed: squallar_geo::PlacedRaster::of(bounds()),
         data_generation: 1,
@@ -70,6 +71,7 @@ fn deliver(app: &mut crate::app::App, ctx: &egui::Context) {
     app.channels
         .overlay_render_sender
         .send(crate::channels::OverlayRenderResponse {
+            crop: None,
             picture: Some(crate::channels::OverlayPicture::Painted(Arc::new(
                 egui::ColorImage::from_rgba_unmultiplied(
                     [W as usize, H as usize],
@@ -203,6 +205,7 @@ fn a_failed_render_clears_the_in_flight_mark_and_touches_nothing() {
     app.channels
         .overlay_render_sender
         .send(crate::channels::OverlayRenderResponse {
+            crop: None,
             picture: None,
             geo_bounds: bounds(),
             overlay_kind: KIND,

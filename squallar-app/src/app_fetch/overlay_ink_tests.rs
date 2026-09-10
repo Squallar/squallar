@@ -77,6 +77,7 @@ fn delivered_for(
     frame: Option<squallar_source::time::FrameStamp>,
 ) -> crate::channels::OverlayRenderResponse {
     let response = crate::channels::OverlayRenderResponse {
+        crop: None,
         picture: None,
         geo_bounds: bounds(),
         overlay_kind: known::NWS_ALERTS,
@@ -109,6 +110,7 @@ fn delivered_for(
 fn settled(rgba: Vec<u8>) -> Box<dyn squallar_source::job::JobOut> {
     use squallar_source::job::JobOut;
     let mut out = squallar_overlays::render::rasterize::RasterizeOutput {
+        crop: None,
         rgba: rgba.into(),
         hit_cells: None,
         alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,

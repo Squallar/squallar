@@ -128,10 +128,23 @@ pub const WIRE_FRAMING_ROWS: &[&str] = &[
 /// side that counts: the decision is taken in the worker and this reply is the
 /// whole of what comes back. One byte against the 8.26-8.92 MB the same row
 /// already declines to send.
+/// **Every row grew one byte on 2026-09-10**, and it is the same byte in all
+/// three: a **window tag** at the very end of the reply, `0` for a picture that
+/// is the whole of what was dispatched and `1` followed by four `u32`s for one
+/// cut down to a bounding box of its content
+/// (`squallar_overlays::render::rasterize::PictureCrop`).
+///
+/// **At the end, after the cells block, and that placement is the compatibility
+/// story.** `OVERLAY_PIXEL_PREFIX_BYTES` is the constant offset the browser
+/// transport finds the picture at before it copies anything, and a field
+/// written after both variable-length blocks cannot move it; the split decoder
+/// reads the window from the same place because the cells block states its own
+/// length. One byte, or seventeen on a row that cut a window, against the
+/// 17,971,200 B picture a window is there to avoid allocating.
 pub const WIRE_REPLY_ROWS: &[&str] = &[
-    "bare | 22 | 0x2a894fce9e16cbd4",
-    "cells | 74 | 0xed8f0851ce2dd001",
-    "blank | 7 | 0xae173ee5d75f7a73",
+    "bare | 23 | 0x5e1e7016a0bc593c",
+    "cells | 75 | 0xd7db240157d871b3",
+    "blank | 8 | 0x30fa538cf73d1169",
 ];
 
 /// The 13 frame-reply framing rows, exactly as

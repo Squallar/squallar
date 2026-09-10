@@ -165,6 +165,9 @@ struct Counters {
     door_exempt: AtomicU64,
     door_exempt_bytes: AtomicU64,
     door_peak_bytes: AtomicU64,
+    cropped: AtomicU64,
+    cropped_saved_bytes: AtomicU64,
+    whole: AtomicU64,
     /// The last [`Totals::progress`] a caller was handed by
     /// [`totals_if_moved`].
     reported: AtomicU64,
@@ -191,6 +194,9 @@ impl Counters {
             door_exempt: AtomicU64::new(0),
             door_exempt_bytes: AtomicU64::new(0),
             door_peak_bytes: AtomicU64::new(0),
+            cropped: AtomicU64::new(0),
+            cropped_saved_bytes: AtomicU64::new(0),
+            whole: AtomicU64::new(0),
             reported: AtomicU64::new(0),
         }
     }
@@ -307,6 +313,36 @@ pub struct Totals {
     ///
     /// [`RendersInFlight::record`]: super::RendersInFlight::record
     pub dispatched: u64,
+    /// **Pictures rasterized into a bounding box of their own content**, of
+    /// the [`Self::cropped`] + [`Self::whole`] pictures that reached a pane.
+    ///
+    /// A mechanism that never fires is the failure this counter exists to make
+    /// impossible to miss, so it is always on and always printed: several
+    /// landings have shipped a saving whose code executed zero times, and the
+    /// only thing that caught them was a counter beside the claim.
+    ///
+    /// The denominator is [`Self::pictures`] minus the blanks — the same
+    /// arrivals `note_picture` counts, which is the live pane's picture and
+    /// **not** a loop frame; loop frames are outside this ledger entirely.
+    pub cropped: u64,
+    /// **Bytes not allocated** because of [`Self::cropped`]: the plan's
+    /// `width * height * 4` less the window's, summed.
+    ///
+    /// **Churn, not residency, and the two are never added.** This is what the
+    /// pipeline did not allocate across a leg; what it does not *hold* at any
+    /// one instant is a different quantity and is read off the door's occupancy
+    /// and the process's own peak. A leg that saved a gigabyte of churn may
+    /// hold no less at its peak, and a leg that holds 30 MB less may have saved
+    /// far more than 30 MB of churn.
+    pub cropped_saved_bytes: u64,
+    /// Pictures that reached a pane at their **whole** planned size — a row
+    /// that cuts no window, or one whose content spanned the viewport.
+    ///
+    /// Printed beside [`Self::cropped`] rather than left to be subtracted: the
+    /// two together are the denominator, and a reader who has only the numerator
+    /// cannot tell a mechanism that fires rarely from one that fires often on a
+    /// scene with little in it.
+    pub whole: u64,
     /// Rasterized responses that came back. `dispatched > 0` with this at zero
     /// is a dispatch path whose answers never arrive.
     pub arrived: u64,
@@ -759,6 +795,29 @@ pub fn note_picture(bytes: u64, inked: bool) {
     }
 }
 
+/// Record which size a picture arrived at: `planned` is the bytes the pane's
+/// plan asked for and `actual` the bytes the picture really is.
+///
+/// **Called once per picture that reached a pane, whichever it was.** Both arms
+/// are recorded, because a numerator alone cannot separate a mechanism that
+/// rarely fires from a scene that rarely has anything in it — see
+/// [`Totals::cropped`]. `actual > planned` is impossible by the arrival's own
+/// size check and is treated as whole rather than as a negative saving.
+///
+/// Two relaxed `fetch_add`s and a compare. It runs once per arriving picture,
+/// which is the same seam [`note_picture`] is on and orders of magnitude
+/// rarer than a frame.
+pub fn note_picture_size(planned: u64, actual: u64) {
+    let sink = sink();
+    if actual < planned {
+        sink.cropped.fetch_add(1, Relaxed);
+        sink.cropped_saved_bytes
+            .fetch_add(planned - actual, Relaxed);
+    } else {
+        sink.whole.fetch_add(1, Relaxed);
+    }
+}
+
 /// Record a **blank** arrival: one that reached a pane, cleared it, and cost
 /// no buffer, no texture and no upload — and **why** it was blank.
 ///
@@ -861,6 +920,9 @@ pub fn totals() -> Totals {
         door_exempt: sink.door_exempt.load(Relaxed),
         door_exempt_bytes: sink.door_exempt_bytes.load(Relaxed),
         door_peak_bytes: sink.door_peak_bytes.load(Relaxed),
+        cropped: sink.cropped.load(Relaxed),
+        cropped_saved_bytes: sink.cropped_saved_bytes.load(Relaxed),
+        whole: sink.whole.load(Relaxed),
         reasons: std::array::from_fn(|i| sink.reasons[i].load(Relaxed)),
         blank_reasons: std::array::from_fn(|i| sink.blank_reasons[i].load(Relaxed)),
         blank_layers: std::array::from_fn(|slot| {

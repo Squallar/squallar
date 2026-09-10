@@ -994,8 +994,36 @@ pub struct OverlayTextureData {
     /// The cache token these pixels were rendered for (detects stale results).
     pub data_generation: u64,
     pub render_zoom: i32,
+    /// **The picture the pane ASKED for**, in texels — the plan's, always, and
+    /// never the texture's own size when the two differ.
+    ///
+    /// [`OverlayTextureCache::needs_rerender_with_policy`] compares this pair
+    /// against the plan's to catch a display-density change, which nothing else
+    /// can see: a second monitor, an OS scale setting or a browser zoom leaves
+    /// the zoom and the ground exactly as they were and changes only how many
+    /// texels a point is worth. A picture that reported its own smaller size
+    /// here would read as a resize on every frame and re-render for ever.
     pub width: u32,
     pub height: u32,
+    /// **Which texel window of that picture the texture actually is**, or
+    /// `None` for the whole of it.
+    ///
+    /// A sparse overlay — alerts, storm reports, METAR, radar coverage — paints
+    /// a fraction of the viewport it is dispatched for, so its rasterizer cuts
+    /// the pixmap down to a bounding box of its content and says here which box
+    /// it was. Two things read it and nothing else does: [`draw_overlay_texture`],
+    /// which reads the window out of the picture's own screen rect as a
+    /// fraction, and [`OverlayTextureCache::outstanding_bytes`], which prices
+    /// the texels that really exist.
+    ///
+    /// **The hit map is NOT one of them.** It is a quarter-resolution grid over
+    /// the whole dispatched picture and the click test reads it through the
+    /// full screen rect, so it is in the plan's frame and the window does not
+    /// reach it. See `rasterize_storm_reports`, which records its cells in the
+    /// whole picture's coordinates on purpose.
+    ///
+    /// See `squallar_overlays::render::rasterize::PictureCrop`.
+    pub crop: Option<squallar_overlays::render::rasterize::PictureCrop>,
     pub radar_meta: Option<RadarTextureMeta>,
     pub hit_map: Option<Arc<HitMap>>,
 }
@@ -1455,10 +1483,18 @@ impl OverlayTextureCache {
     /// [`Self::showing_arriving`] and
     /// [`crate::pane::PaneState::plan_view_pictures_in_pipe`].
     pub fn outstanding_bytes(&self) -> u64 {
-        let picture = |data: &OverlayTextureData| {
-            u64::from(data.width)
+        // **The texels that exist, not the ones that were planned.** A picture
+        // cut to a window of its content is a smaller upload and a smaller
+        // residency, and pricing it at `width * height` here would hold the
+        // door shut against bytes nobody allocated. The in-flight term below is
+        // the plan's and stays the plan's: the charge is taken at dispatch,
+        // before any rasterizer has cut a window, and this figure has to be the
+        // one `note_planned_bytes` recorded or the two come apart.
+        let picture = |data: &OverlayTextureData| match data.crop {
+            Some(crop) => crop.bytes(),
+            None => u64::from(data.width)
                 .saturating_mul(u64::from(data.height))
-                .saturating_mul(4)
+                .saturating_mul(4),
         };
         let held = self.held.as_ref().map_or(0, |held| picture(&held.data));
         // **Added to the held half rather than merged with it.** A cache can
@@ -2120,7 +2156,7 @@ pub fn draw_overlay_texture(
     tex: &OverlayTextureData,
     screen_rect: egui::Rect,
 ) {
-    let rect = placed_rect(projector, &tex.placed);
+    let rect = crop_rect(placed_rect(projector, &tex.placed), tex);
 
     if !screen_rect.intersects(rect) {
         return;
@@ -2132,6 +2168,41 @@ pub fn draw_overlay_texture(
         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
         egui::Color32::WHITE,
     );
+}
+
+/// The screen rect a picture's **window** covers, given the rect its whole
+/// picture would have.
+///
+/// **Read out of the whole picture's rect as a fraction, and not projected on
+/// its own.** The window's ground could be computed and projected — its texel
+/// edges name two longitudes and two Mercator Ys exactly — but that would be a
+/// second placement that can disagree with the first, and the way it disagrees
+/// is a dateline fold: [`geo_corner_rect`] folds a rect by its own middle
+/// towards the pane's turn, and a window's middle is not its picture's. A
+/// fraction of the parent rect cannot fold anywhere the parent did not, so a
+/// window is always exactly where the picture said it was.
+///
+/// The arithmetic is linear because the picture's grid is: longitude across the
+/// width and Mercator Y down the height, which is what `MercatorBounds::project`
+/// wrote and what the projector reads back.
+fn crop_rect(rect: egui::Rect, tex: &OverlayTextureData) -> egui::Rect {
+    let Some(crop) = tex.crop else {
+        return rect;
+    };
+    // **The window's own record of the grid it is a window into**, not the
+    // texture's `width`/`height` beside it. They are the same pair on every
+    // picture the arrival admits — it refuses a window that names a different
+    // grid — and taking it from the window is what makes that true by
+    // construction here rather than by an invariant held one crate away.
+    if crop.of_width == 0 || crop.of_height == 0 {
+        return rect;
+    }
+    let fx = |x: u32| rect.width() * (x as f32 / crop.of_width as f32);
+    let fy = |y: u32| rect.height() * (y as f32 / crop.of_height as f32);
+    egui::Rect::from_min_size(
+        rect.min + egui::vec2(fx(crop.x), fy(crop.y)),
+        egui::vec2(fx(crop.width), fy(crop.height)),
+    )
 }
 
 // ── Geo-coordinate click detection ───────────────────────────────────────

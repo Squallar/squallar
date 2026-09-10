@@ -242,6 +242,7 @@ fn deliver_raster(app: &mut crate::app::App, ctx: &egui::Context, k: i64) {
     app.channels
         .overlay_render_sender
         .send(crate::channels::OverlayRenderResponse {
+            crop: None,
             picture: Some(crate::channels::OverlayPicture::Painted(Arc::new(
                 egui::ColorImage::from_rgba_unmultiplied([1, 1], &[shade, shade, shade, 255]),
             ))),

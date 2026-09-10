@@ -224,6 +224,347 @@ pub fn has_ink(rgba: &[u8]) -> bool {
     head.iter().any(|&b| b != 0) || words.iter().any(|&w| w != 0) || tail.iter().any(|&b| b != 0)
 }
 
+/// **The texel window of a picture the rasterizer actually painted into.**
+///
+/// A point or small-polygon overlay covers a fraction of the viewport it is
+/// dispatched for: measured by `valgrind --tool=dhat` on the REST1 scene, the
+/// four sparse rows — alerts, storm reports, METAR and radar coverage —
+/// allocated 233,625,600 B of `tiny_skia::Pixmap` across a leg and *wrote*
+/// 6,862,992 B of it, **2.9 %**. Storm reports alone wrote 0.13 % of their four
+/// pictures. The rest was allocated, scanned by [`has_ink`], premultiplied
+/// where a row declares straight alpha, carried to the pane and uploaded, and
+/// was transparent in every byte.
+///
+/// This is the window the pixmap is allocated at instead. `x`/`y` are its
+/// offset in the **dispatched** grid — the one [`JobGeometry`] names and the
+/// one `MercatorBounds::project` still projects into — so the picture's texels
+/// coincide exactly with the texels the whole-viewport picture would have had
+/// there. That is what makes the crop *byte*-identical rather than merely
+/// close: every drawing coordinate is the whole-picture coordinate minus an
+/// **integer**, and an integer subtracted from an `f32` whose magnitude it does
+/// not exceed is exact in binary floating point — the difference is a multiple
+/// of the minuend's ulp and no larger than it, so it is representable. No
+/// coordinate is rescaled and no path is resampled.
+///
+/// **`None` is the whole picture** and stays the meaning of an absent crop
+/// everywhere below, so a row that computes no extent — and any row that has
+/// not adopted this at all — behaves exactly as it did.
+///
+/// # What it is not
+///
+/// It is **not** the door's unit. `MAX_OVERLAY_PICTURE_BYTES_OUTSTANDING` is
+/// debited at dispatch from `OverlayTexturePlan::bytes()`, a whole-viewport
+/// figure decided a rasterization before this window exists, and nothing here
+/// changes that charge. What it does move is the *held* term of
+/// `OverlayTextureCache::outstanding_bytes`, which prices the picture a cache
+/// is really holding — so the door's occupancy falls without its admission
+/// arithmetic being touched. Report those separately.
+///
+/// It is also **not** the rebuild gate's unit.
+/// `OverlayTextureCache::needs_rerender_with_policy` compares a held picture's
+/// `width`/`height` against the plan's to catch a display-density change, and
+/// those two fields stay the **plan's** on every picture. A crop that reached
+/// that comparison would read as a resize on every frame and re-render for
+/// ever.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PictureCrop {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    /// **The grid this is a window into** — the dispatched picture's own texel
+    /// pair, carried on the window rather than looked up beside it.
+    ///
+    /// Two things need it and neither has it to hand. The **draw** reads the
+    /// window out of the whole picture's screen rect as a fraction, so it needs
+    /// the denominator of that fraction. And the **arrival** is what decides
+    /// whether the pane's rebuild gate is looking at a plan-sized pair or a
+    /// window-sized one; before this field the picture's own `size` was the
+    /// plan's, and once a window exists it is not.
+    ///
+    /// Carried and not restated, because the alternative is a second spelling
+    /// of the dispatch's own `width`/`height` at every hop — and the arrival
+    /// checks this pair against the dispatch it answers precisely so that a
+    /// window from some other dispatch cannot be placed against this one.
+    pub of_width: u32,
+    pub of_height: u32,
+}
+
+impl PictureCrop {
+    /// The bytes a picture of this window costs, at 4 per texel.
+    pub const fn bytes(&self) -> u64 {
+        (self.width as u64) * (self.height as u64) * 4
+    }
+
+    /// Whether this window is the whole of the grid it names — the case a
+    /// rasterizer answers when its content spans the viewport, and the one the
+    /// fires counter must not count as a saving.
+    pub const fn is_whole(&self) -> bool {
+        self.x == 0 && self.y == 0 && self.width == self.of_width && self.height == self.of_height
+    }
+
+    /// Whether this window sits inside the grid it names and has texels in it.
+    ///
+    /// **Asked at the arrival, before anything is placed**, because nothing
+    /// downstream can: a window reaching past its grid places a picture off the
+    /// ground it was rendered for, which is a visibly misplaced overlay rather
+    /// than a failed render, and no counter in the tree would say so.
+    pub const fn fits(&self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && self.of_width > 0
+            && self.of_height > 0
+            && self.x + self.width <= self.of_width
+            && self.y + self.height <= self.of_height
+    }
+
+    /// The whole of a `width` x `height` grid.
+    pub const fn whole(width: u32, height: u32) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width,
+            height,
+            of_width: width,
+            of_height: height,
+        }
+    }
+
+    /// The ground this window covers, given the ground and grid of the picture
+    /// it is a window into.
+    ///
+    /// **Linear in Mercator Y and in longitude, which is what the grid is.**
+    /// `MercatorBounds::project` maps longitude linearly across `width` and
+    /// Mercator Y linearly down `height`, so a texel-aligned window's ground is
+    /// the same linear map read backwards. Taken through `MercatorBounds` and
+    /// not through latitude arithmetic: the projection clamps to
+    /// `MERCATOR_LAT_LIMIT_DEG` before it maps, and a second spelling that
+    /// forgot the clamp would place a polar picture wrong by degrees.
+    ///
+    /// Nothing downstream needs this today — the draw takes the whole
+    /// picture's screen rect and reads the window out of it as a fraction,
+    /// which cannot disagree with the placement of the picture it is inside —
+    /// but the gate uses it to state what the window covers.
+    pub fn ground(&self, bounds: &GeoBounds) -> GeoBounds {
+        let (width, height) = (self.of_width, self.of_height);
+        let mb = MercatorBounds::from_geo(bounds);
+        let lon_at = |x: u32| {
+            mb.min_lon + (mb.max_lon - mb.min_lon) * (f64::from(x) / f64::from(width.max(1)))
+        };
+        let lat_at = |y: u32| {
+            let frac = f64::from(y) / f64::from(height.max(1));
+            let merc_y = mb.merc_y_max - (mb.merc_y_max - mb.merc_y_min) * frac;
+            merc_y_to_lat(merc_y)
+        };
+        GeoBounds {
+            min_lon: lon_at(self.x),
+            max_lon: lon_at(self.x + self.width),
+            // Y is inverted: the window's top row is its NORTH edge.
+            max_lat: lat_at(self.y),
+            min_lat: lat_at(self.y + self.height),
+        }
+    }
+}
+
+/// **The texel extent a rasterizer is about to paint into**, accumulated as it
+/// locates its items and spent once, before the pixmap exists.
+///
+/// Every `add_*` takes a reach in **texels** and the reach is the caller's
+/// claim, not this type's: a window narrower than what the painter goes on to
+/// draw clips it, and a clipped overlay is a visible defect that no counter
+/// reports. So each caller states the reach from the same figure its own cull
+/// states, and [`ContentExtent::unbounded`] exists for the cases where no
+/// figure can be stated at all — a feature carrying no `geo_bounds` is the
+/// live one — which fall back to the whole picture rather than guess.
+///
+/// The three degenerate cases, each explicit:
+///
+/// * **Content spanning the viewport.** The window clamps to the grid, so the
+///   answer is the whole picture and the pipeline is exactly what it was. This
+///   is the case that must not get *worse*, and it cannot: the clamp is two
+///   `min`s and the pixmap that follows is the one it always allocated.
+/// * **No content at all.** [`Self::crop`] answers a 1x1 window rather than a
+///   whole picture: the raster is going to settle blank either way, and a 4 B
+///   buffer is what a blank costs when the door has already let the dispatch
+///   through. `SourceHandler::paints_in` short-circuits most of these one
+///   field earlier, before a job is built at all — that path is untouched, and
+///   this is the residue it cannot see (a page of storm reports all later than
+///   the depicted instant, every METAR off the texture).
+/// * **Content in several distant clusters.** One window is what this
+///   computes, so two clusters at opposite corners give a window close to the
+///   viewport and close to no saving. That is deliberate and is not a defect:
+///   a picture is one texture at one offset, and splitting it into several
+///   would multiply the upload, the texture handle and the draw call per
+///   layer. The fires counter reports the window's own bytes, so a scene whose
+///   clusters spread reports itself as a small saving rather than as a claim.
+#[derive(Debug, Clone, Copy)]
+pub struct ContentExtent {
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+    any: bool,
+    unbounded: bool,
+}
+
+impl Default for ContentExtent {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ContentExtent {
+    pub const fn new() -> Self {
+        Self {
+            min_x: f32::INFINITY,
+            min_y: f32::INFINITY,
+            max_x: f32::NEG_INFINITY,
+            max_y: f32::NEG_INFINITY,
+            any: false,
+            unbounded: false,
+        }
+    }
+
+    /// **This rasterizer cannot state where it paints.** Every later `add_*` is
+    /// still recorded and [`Self::crop`] still answers, but it answers `None` —
+    /// the whole picture — because a window computed from a partial extent is
+    /// a clip.
+    pub fn unbounded(&mut self) {
+        self.unbounded = true;
+    }
+
+    /// An item at `(x, y)` reaching `reach` texels in every direction.
+    pub fn add_point(&mut self, x: f32, y: f32, reach: f32) {
+        self.add_rect(x - reach, y - reach, x + reach, y + reach);
+    }
+
+    /// A box in texels, already grown by whatever the painter adds to it.
+    pub fn add_rect(&mut self, min_x: f32, min_y: f32, max_x: f32, max_y: f32) {
+        if !(min_x.is_finite() && min_y.is_finite() && max_x.is_finite() && max_y.is_finite()) {
+            // A non-finite coordinate is a projection that failed, and a
+            // window grown to `NaN` swallows every comparison silently. The
+            // safe direction is the whole picture.
+            self.unbounded();
+            return;
+        }
+        self.min_x = self.min_x.min(min_x);
+        self.min_y = self.min_y.min(min_y);
+        self.max_x = self.max_x.max(max_x);
+        self.max_y = self.max_y.max(max_y);
+        self.any = true;
+    }
+
+    /// Every projected point of a ring, grown by `reach`.
+    pub fn add_points(&mut self, pts: &[(f32, f32)], reach: f32) {
+        for &(x, y) in pts {
+            self.add_point(x, y, reach);
+        }
+    }
+
+    /// The window to allocate, or `None` for the whole `width` x `height`
+    /// picture.
+    ///
+    /// The edges are taken **outward** — `floor` on the near side, `ceil` on
+    /// the far — so the window can only be wider than the extent and never
+    /// narrower, and then grown by [`CROP_GUARD_TEXELS`] on every side.
+    pub fn crop(&self, width: u32, height: u32) -> Option<PictureCrop> {
+        if width == 0 || height == 0 || self.unbounded {
+            return None;
+        }
+        if !self.any {
+            // Nothing to paint. The raster settles blank; this is the smallest
+            // buffer that can carry that answer.
+            return Some(PictureCrop {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                of_width: width,
+                of_height: height,
+            });
+        }
+        let guard = CROP_GUARD_TEXELS as f32;
+        let x0 = (self.min_x - guard).floor().max(0.0) as u32;
+        let y0 = (self.min_y - guard).floor().max(0.0) as u32;
+        let x1 = ((self.max_x + guard).ceil().max(0.0) as u32 + 1).min(width);
+        let y1 = ((self.max_y + guard).ceil().max(0.0) as u32 + 1).min(height);
+        let x0 = x0.min(width.saturating_sub(1));
+        let y0 = y0.min(height.saturating_sub(1));
+        Some(PictureCrop {
+            x: x0,
+            y: y0,
+            width: x1.saturating_sub(x0).max(1),
+            height: y1.saturating_sub(y0).max(1),
+            of_width: width,
+            of_height: height,
+        })
+    }
+}
+
+/// The transparent margin every window keeps around its content, in texels.
+///
+/// **It is about the composite, not about the raster.** The picture is drawn
+/// with `TextureOptions::LINEAR` and its own screen rect, so the sampler reads
+/// half a texel outside the outermost texel row at each edge and clamps. In the
+/// whole-viewport picture what lies there is the transparent texel the content
+/// stops short of; in a window cut flush to the content it would be the content
+/// itself, smeared one half-texel outward along the seam. One transparent row
+/// on every side makes the two the same read.
+///
+/// One and not two: the guard is a floor under the rounding above, which
+/// already takes both edges outward, and every texel of it is a texel
+/// allocated. At the measured densities a 2-texel guard on a 40 x 40 window is
+/// 20 % more picture for nothing.
+pub const CROP_GUARD_TEXELS: u32 = 1;
+
+/// **Whether a rasterizer may cut its picture down to its content.**
+///
+/// It is an argument and not a `cfg` or a hidden switch, because the whole
+/// claim this feature rests on is that the two answers are the *same picture* —
+/// and a claim like that is worth only as much as the thing that can ask for
+/// both and compare them. `crop_identity_tests` does exactly that, over every
+/// scene it can build, and it could not exist if `Whole` were unreachable.
+///
+/// Production passes [`Self::Content`] everywhere; the four-argument
+/// `rasterize_*` names below are that call, kept so nothing else in the tree
+/// has to say it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CropPolicy {
+    /// Allocate the bounding box of what will be painted.
+    Content,
+    /// Allocate the whole dispatched grid, as every row did before windows
+    /// existed. The reference arm of the identity gate.
+    Whole,
+}
+
+impl CropPolicy {
+    /// The window this policy allows, given the one the content asks for.
+    fn allow(self, crop: Option<PictureCrop>) -> Option<PictureCrop> {
+        match self {
+            Self::Content => crop,
+            Self::Whole => None,
+        }
+    }
+}
+
+/// The pixmap dimensions and the drawing origin a window implies — and the
+/// whole picture's when there is none, which is what makes `None` cost every
+/// caller a subtraction of zero and nothing else.
+///
+/// The origin comes back as `f32` because that is what it is subtracted from.
+/// It is a whole number of texels, and that is the load-bearing part: `px - ox`
+/// for an integral `ox` no larger in magnitude than `px` is **exact** in binary
+/// floating point, so the coordinate the window is painted at is the same
+/// coordinate the whole picture would have painted at, to the bit. A
+/// fractional origin would resample every path and the two pictures would
+/// differ in the anti-aliased fringe of every edge.
+fn crop_dims(crop: Option<PictureCrop>, width: u32, height: u32) -> (u32, u32, f32, f32) {
+    match crop {
+        Some(c) => (c.width, c.height, c.x as f32, c.y as f32),
+        None => (width, height, 0.0, 0.0),
+    }
+}
+
 /// **Why a raster painted nothing.**
 ///
 /// A blank is a *clear*: `OverlayTextureCache::show_blank` takes the picture
@@ -582,6 +923,24 @@ pub struct RasterizeOutput {
     /// then paints nothing is counted [`BlankReason::Unattributed`] rather
     /// than guessed at.
     pub blank_reason: Option<BlankReason>,
+    /// **The texel window of the dispatched grid these pixels are**, or `None`
+    /// for the whole picture.
+    ///
+    /// Written by the rasterizer that allocated the pixmap and read by
+    /// `App::overlay_job_deliver`, which sizes its answer check, its
+    /// `ColorImage` and the pane's placement off it. `None` is what every row
+    /// that has not adopted a window answers and what every row answers when
+    /// its content spans the viewport, and it means exactly what it always
+    /// meant: `width` x `height` texels at the origin.
+    ///
+    /// **`blank` is stated in the window's own terms.** A raster that settles
+    /// blank gives up a buffer of `crop.bytes()`, not of the plan's, because
+    /// `blank` is the length the *picture* would have had and the picture is
+    /// the window. The arrival's size check reads both off this same field, so
+    /// the two cannot disagree.
+    ///
+    /// See [`PictureCrop`].
+    pub crop: Option<PictureCrop>,
 }
 
 impl std::fmt::Debug for RasterizeOutput {
@@ -595,6 +954,7 @@ impl std::fmt::Debug for RasterizeOutput {
             .field("alpha", &self.alpha)
             .field("blank", &self.blank)
             .field("blank_reason", &self.blank_reason)
+            .field("crop", &self.crop)
             .finish()
     }
 }
@@ -857,6 +1217,7 @@ pub fn rasterize_spc_outlooks(
             height
         );
         return RasterizeOutput {
+            crop: None,
             rgba: vec![0u8; (width * height * 4) as usize].into(),
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
@@ -880,6 +1241,7 @@ pub fn rasterize_spc_outlooks(
     crate::render::hatch::draw_hatch_pass(&mut pixmap, features, &mb, w, h, *hatch_color);
 
     RasterizeOutput {
+        crop: None,
         rgba: pixmap.take().into(),
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
@@ -928,6 +1290,7 @@ pub fn rasterize_spc_discussions(
             height
         );
         return RasterizeOutput {
+            crop: None,
             rgba: vec![0u8; (width * height * 4) as usize].into(),
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
@@ -976,6 +1339,7 @@ pub fn rasterize_spc_discussions(
     }
 
     RasterizeOutput {
+        crop: None,
         rgba: pixmap.take().into(),
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
@@ -1011,6 +1375,17 @@ pub fn rasterize_nws_alerts(
     width: u32,
     height: u32,
 ) -> RasterizeOutput {
+    rasterize_nws_alerts_windowed(input, bounds, width, height, CropPolicy::Content)
+}
+
+/// [`rasterize_nws_alerts`] with the window policy stated. See [`CropPolicy`].
+pub fn rasterize_nws_alerts_windowed(
+    input: &AlertsInput,
+    bounds: &GeoBounds,
+    width: u32,
+    height: u32,
+    policy: CropPolicy,
+) -> RasterizeOutput {
     let AlertsInput {
         alerts,
         enabled_categories,
@@ -1018,20 +1393,6 @@ pub fn rasterize_nws_alerts(
         device_scale,
     } = input;
     let scale = sane_device_scale(*device_scale);
-    let Some(mut pixmap) = Pixmap::new(width, height) else {
-        log::error!(
-            "Pixmap allocation failed in rasterize_nws_alerts ({}×{})",
-            width,
-            height
-        );
-        return RasterizeOutput {
-            rgba: vec![0u8; (width * height * 4) as usize].into(),
-            hit_cells: None,
-            alpha: AlphaMode::Premultiplied,
-            blank: None,
-            blank_reason: Some(no_pixmap_reason(width, height)),
-        };
-    };
     let mb = MercatorBounds::from_geo(bounds);
     let w = width as f32;
     let h = height as f32;
@@ -1041,6 +1402,28 @@ pub fn rasterize_nws_alerts(
     // feature on the texture is one item in range, which is what
     // `reason`'s "something reached the texture" question means.
     let mut tally = ItemTally::default();
+
+    // **Projected first, painted second, and the window cut between them.**
+    //
+    // The window is taken from the polygons' own **projected** points and not
+    // from `OverlayFeature::geo_bounds`, and the difference is a real one
+    // rather than a matter of taste: `feature_survives_cull` shifts a feature's
+    // geo box by `lon_shift` of the whole *feature*, while `project_polygon`
+    // shifts each polygon by `ring_lon_shift` of its own *exterior ring*. On a
+    // multi-polygon feature straddling the antimeridian those are two different
+    // whole turns, so a window cut from the feature's box can sit 360° from the
+    // polygon that gets drawn into it — and what that looks like on screen is a
+    // county-shaped hole where an alert should be. Cutting the window from the
+    // points that are about to be painted cannot make that mistake, because
+    // there is only one projection and both passes read it.
+    //
+    // The projected rings are kept rather than re-projected. That is a real
+    // transient — a national alert page is on the order of a megabyte of
+    // `(f32, f32)` — but it is a fraction of the 17,971,200 B picture it is
+    // buying back, and it replaces a per-polygon transient the old loop already
+    // paid one polygon at a time.
+    let mut painted: Vec<([u8; 4], [u8; 4], ProjectedPolygon)> = Vec::new();
+    let mut extent = ContentExtent::new();
     for alert in alerts {
         if !enabled_categories.contains(&alert.category) || hidden_ids.contains(&alert.id) {
             // A category the pane switched off or an id the user hid: the
@@ -1050,7 +1433,21 @@ pub fn rasterize_nws_alerts(
         }
         let mut reached = false;
         for feature in alert.features.iter() {
-            reached |= draw_feature(&mut pixmap, feature, &mb, w, h, scale);
+            // **The cull's verdict, exactly as `draw_feature` returns it** —
+            // `true` means the feature survived and its polygons were handed
+            // over, and says nothing about whether a pixel changed. Splitting
+            // the draw in two may not move that line; see `draw_feature`.
+            if !feature_survives_cull(feature, &mb) {
+                continue;
+            }
+            reached = true;
+            for polygon in &feature.polygons {
+                let Some(projected) = project_polygon(polygon, &mb, w, h) else {
+                    continue;
+                };
+                extent.add_points(&projected.exterior, stroke_reach(feature, scale));
+                painted.push((feature.fill_rgba, feature.stroke_rgba, projected));
+            }
         }
         if reached {
             tally.on_texture();
@@ -1063,12 +1460,86 @@ pub fn rasterize_nws_alerts(
         // geometry that was never there.
     }
 
+    let crop = policy.allow(extent.crop(width, height));
+    let (cw, ch, ox, oy) = crop_dims(crop, width, height);
+    let Some(mut pixmap) = Pixmap::new(cw, ch) else {
+        log::error!(
+            "Pixmap allocation failed in rasterize_nws_alerts ({}×{})",
+            cw,
+            ch
+        );
+        return RasterizeOutput {
+            crop,
+            rgba: vec![0u8; (cw as usize) * (ch as usize) * 4].into(),
+            hit_cells: None,
+            alpha: AlphaMode::Premultiplied,
+            blank: None,
+            blank_reason: Some(no_pixmap_reason(cw, ch)),
+        };
+    };
+
+    for (fill_rgba, stroke_rgba, mut projected) in painted {
+        // Into the window's frame, in place. A whole number of texels off every
+        // coordinate, which is exact — see [`crop_dims`] — so the path this
+        // builds is the whole picture's path translated and not a resampling of
+        // it. `build_filled_polygon_path`'s hole tests are areas and perimeters
+        // and `scaled_stroke_width` reads a bounding box's width and height, all
+        // of which a translation leaves alone.
+        shift_polygon(&mut projected, ox, oy);
+        if let Some((path, rule)) = build_filled_polygon_path(&projected.exterior, &projected.holes)
+        {
+            fill_path(&mut pixmap, &path, fill_rgba, rule);
+            if stroke_rgba[3] > 0 {
+                let sw = scaled_stroke_width(&path, 1.5, scale);
+                stroke_path(&mut pixmap, &path, stroke_rgba, sw);
+            }
+        }
+    }
+
     RasterizeOutput {
+        crop,
         rgba: pixmap.take().into(),
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
         blank: None,
         blank_reason: Some(tally.reason(alerts.len())),
+    }
+}
+
+/// How far past its own vertices a feature's outline can reach, in texels.
+///
+/// `scaled_stroke_width` caps the width at `base * scale` — `base` is 1.5 at
+/// every call site here — and the stroke is centred on the path, so half of it
+/// lies outside. **The factor of four is the miter**: `Stroke::default()` joins
+/// with `LineJoin::Miter` at the default `miter_limit` of 4.0, and a sharp
+/// corner in a county boundary extends the join up to that multiple of the
+/// half-width beyond the vertex itself. A polygon layer is full of sharp
+/// corners, so this is the term that actually decides the window's margin, and
+/// leaving it out would shave a few texels off the point of every spike.
+///
+/// A feature with a transparent outline strokes nothing and reaches only its
+/// own anti-aliased fringe.
+fn stroke_reach(feature: &OverlayFeature, scale: f32) -> f32 {
+    if feature.stroke_rgba[3] == 0 {
+        return AA_FRINGE_TEXELS;
+    }
+    1.5 * scale * 0.5 * 4.0 + AA_FRINGE_TEXELS
+}
+
+/// Move a projected polygon into a window's frame, in place.
+fn shift_polygon(projected: &mut ProjectedPolygon, ox: f32, oy: f32) {
+    if ox == 0.0 && oy == 0.0 {
+        return;
+    }
+    for point in projected.exterior.iter_mut() {
+        point.0 -= ox;
+        point.1 -= oy;
+    }
+    for hole in projected.holes.iter_mut() {
+        for point in hole.iter_mut() {
+            point.0 -= ox;
+            point.1 -= oy;
+        }
     }
 }
 
@@ -1130,30 +1601,38 @@ pub fn rasterize_radar_coverage(
     width: u32,
     height: u32,
 ) -> RasterizeOutput {
+    rasterize_radar_coverage_windowed(input, bounds, width, height, CropPolicy::Content)
+}
+
+/// [`rasterize_radar_coverage`] with the window policy stated. See [`CropPolicy`].
+pub fn rasterize_radar_coverage_windowed(
+    input: &CoverageInput,
+    bounds: &GeoBounds,
+    width: u32,
+    height: u32,
+    policy: CropPolicy,
+) -> RasterizeOutput {
     let CoverageInput {
         sites,
         device_scale,
     } = input;
     let scale = sane_device_scale(*device_scale);
-    let Some(mut pixmap) = Pixmap::new(width, height) else {
-        log::error!(
-            "Pixmap allocation failed in rasterize_radar_coverage ({}×{})",
-            width,
-            height
-        );
-        return RasterizeOutput {
-            rgba: vec![0u8; (width * height * 4) as usize].into(),
-            hit_cells: None,
-            alpha: AlphaMode::Premultiplied,
-            blank: None,
-            blank_reason: Some(no_pixmap_reason(width, height)),
-        };
-    };
     let mb = MercatorBounds::from_geo(bounds);
     let w = width as f32;
     let h = height as f32;
 
-    let mut pb = PathBuilder::new();
+    // **Located before anything is allocated.** The wash is one filled path
+    // over every station's disc, so where it paints is settled once the discs
+    // are projected and before a texel exists; the pixmap below is allocated at
+    // that window rather than at the viewport. See [`PictureCrop`].
+    //
+    // The discs are kept rather than re-projected for the paint pass. At 208
+    // stations that is 2,496 B against a second walk of `project` and
+    // `lat_rad_to_mercator_y` — and, the part that matters, it is the *same*
+    // `f32` triple both passes read, so the window cannot be computed off one
+    // projection and painted off another.
+    let mut discs: Vec<(f32, f32, f32)> = Vec::new();
+    let mut extent = ContentExtent::new();
     let mut tally = ItemTally::default();
     for site in sites {
         // Into the viewport's frame first: the catalogue folds longitude into
@@ -1191,7 +1670,35 @@ pub fn rasterize_radar_coverage(
         }
 
         tally.on_texture();
-        pb.push_circle(px, py, radius);
+        // The disc, plus the outline that is stroked **centred on its edge** so
+        // half the width lies outside the radius, plus one texel for the
+        // anti-aliased rim. `COVERAGE_EDGE_WIDTH` is a hairline and the path is
+        // conics with no corners, so there is no miter to allow for.
+        extent.add_point(px, py, radius + COVERAGE_EDGE_WIDTH * scale * 0.5 + 1.0);
+        discs.push((px, py, radius));
+    }
+
+    let crop = policy.allow(extent.crop(width, height));
+    let (cw, ch, ox, oy) = crop_dims(crop, width, height);
+    let Some(mut pixmap) = Pixmap::new(cw, ch) else {
+        log::error!(
+            "Pixmap allocation failed in rasterize_radar_coverage ({}×{})",
+            cw,
+            ch
+        );
+        return RasterizeOutput {
+            crop,
+            rgba: vec![0u8; (cw as usize) * (ch as usize) * 4].into(),
+            hit_cells: None,
+            alpha: AlphaMode::Premultiplied,
+            blank: None,
+            blank_reason: Some(no_pixmap_reason(cw, ch)),
+        };
+    };
+
+    let mut pb = PathBuilder::new();
+    for (px, py, radius) in discs {
+        pb.push_circle(px - ox, py - oy, radius);
     }
 
     if let Some(path) = pb.finish() {
@@ -1224,6 +1731,7 @@ pub fn rasterize_radar_coverage(
     }
 
     RasterizeOutput {
+        crop,
         rgba: pixmap.take().into(),
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
@@ -1378,6 +1886,118 @@ squallar_source::impl_job_input!(MetarInput);
 /// texts a station draws stay behind, and what the 41 shapes that move were
 /// costing.
 ///
+/// A [`PointPainter`](crate::render::draw::PointPainter) that **measures a
+/// station model instead of drawing it**: the texel box the shapes would cover,
+/// relative to the station's own position.
+///
+/// **Why this and not a constant.** The METAR row's cull allows 60 points of
+/// slack around a station because "a station model reaches well past its
+/// centre", and that figure is a *cull* bound — deliberately generous, and
+/// nobody's claim about how far the shapes actually go. A window cut from a
+/// number like that is a number that has to stay true as the model changes, and
+/// the failure when it stops being true is a station clipped at the edge of its
+/// own picture, which nothing counts and nothing gates. So the reach is
+/// measured through the same `draw_metar_station` call that paints it: one
+/// model, walked twice.
+///
+/// **`text` is a no-op here for the same reason it is one in
+/// [`PixmapPointPainter`]** — the picture carries no text at all, the frame
+/// thread draws it — and that is not a conservative approximation but the
+/// matching one: measuring text this painter never draws would grow every
+/// window by a string's worth of texels that stay transparent.
+///
+/// Every pad below mirrors what `PixmapPointPainter` hands tiny-skia one method
+/// at a time: `radius * scale` for a fill, plus half of `width * scale` for a
+/// stroke centred on its path, and one texel everywhere for the anti-aliased
+/// fringe. Both stroke sites use `LineCap::Round` and single-segment paths, so
+/// a cap is a half-width disc at each end and there is no miter join anywhere
+/// in the model.
+#[derive(Debug, Clone, Copy)]
+struct PointExtentPainter {
+    scale: f32,
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+    any: bool,
+}
+
+impl PointExtentPainter {
+    fn new(scale: f32) -> Self {
+        Self {
+            scale,
+            min_x: f32::INFINITY,
+            min_y: f32::INFINITY,
+            max_x: f32::NEG_INFINITY,
+            max_y: f32::NEG_INFINITY,
+            any: false,
+        }
+    }
+
+    fn at(&self, offset: [f32; 2]) -> (f32, f32) {
+        (offset[0] * self.scale, offset[1] * self.scale)
+    }
+
+    fn grow(&mut self, x: f32, y: f32, pad: f32) {
+        self.min_x = self.min_x.min(x - pad);
+        self.min_y = self.min_y.min(y - pad);
+        self.max_x = self.max_x.max(x + pad);
+        self.max_y = self.max_y.max(y + pad);
+        self.any = true;
+    }
+
+    /// The box, relative to the station, or `None` for a model that emitted no
+    /// geometry at all.
+    fn box_of(&self) -> Option<(f32, f32, f32, f32)> {
+        self.any
+            .then_some((self.min_x, self.min_y, self.max_x, self.max_y))
+    }
+}
+
+/// One texel of anti-aliased fringe, allowed on every measured edge.
+const AA_FRINGE_TEXELS: f32 = 1.0;
+
+impl crate::render::draw::PointPainter for PointExtentPainter {
+    fn circle_filled(&mut self, offset: [f32; 2], radius: f32, _color: [u8; 4]) {
+        let (x, y) = self.at(offset);
+        self.grow(x, y, radius * self.scale + AA_FRINGE_TEXELS);
+    }
+
+    fn circle_stroke(&mut self, offset: [f32; 2], radius: f32, _color: [u8; 4], width: f32) {
+        let (x, y) = self.at(offset);
+        self.grow(
+            x,
+            y,
+            radius * self.scale + width * self.scale * 0.5 + AA_FRINGE_TEXELS,
+        );
+    }
+
+    fn text(
+        &mut self,
+        _offset: [f32; 2],
+        _text: &str,
+        _color: [u8; 4],
+        _size: f32,
+        _anchor: crate::render::draw::TextAnchor,
+    ) {
+    }
+
+    fn line(&mut self, from: [f32; 2], to: [f32; 2], _color: [u8; 4], width: f32) {
+        let pad = width * self.scale * 0.5 + AA_FRINGE_TEXELS;
+        let (x0, y0) = self.at(from);
+        let (x1, y1) = self.at(to);
+        self.grow(x0, y0, pad);
+        self.grow(x1, y1, pad);
+    }
+
+    fn filled_polygon(&mut self, points: &[[f32; 2]], _color: [u8; 4]) {
+        for point in points {
+            let (x, y) = self.at(*point);
+            self.grow(x, y, AA_FRINGE_TEXELS);
+        }
+    }
+}
+
 /// **No hit map, deliberately** — the one texture layer that builds none. A
 /// METAR click is resolved by the pane's point pass against live projected
 /// positions ([`crate::render::handlers`]' METAR `per_frame_points`), which
@@ -1395,6 +2015,17 @@ pub fn rasterize_metar_stations(
     width: u32,
     height: u32,
 ) -> RasterizeOutput {
+    rasterize_metar_stations_windowed(input, bounds, width, height, CropPolicy::Content)
+}
+
+/// [`rasterize_metar_stations`] with the window policy stated. See [`CropPolicy`].
+pub fn rasterize_metar_stations_windowed(
+    input: &MetarInput,
+    bounds: &GeoBounds,
+    width: u32,
+    height: u32,
+    policy: CropPolicy,
+) -> RasterizeOutput {
     let MetarInput {
         obs,
         zoom,
@@ -1402,20 +2033,6 @@ pub fn rasterize_metar_stations(
         device_scale,
     } = input;
     let scale = sane_device_scale(*device_scale);
-    let Some(mut pixmap) = Pixmap::new(width, height) else {
-        log::error!(
-            "Pixmap allocation failed in rasterize_metar_stations ({}x{})",
-            width,
-            height
-        );
-        return RasterizeOutput {
-            rgba: vec![0u8; (width * height * 4) as usize].into(),
-            hit_cells: None,
-            alpha: AlphaMode::Premultiplied,
-            blank: None,
-            blank_reason: Some(no_pixmap_reason(width, height)),
-        };
-    };
     let mb = MercatorBounds::from_geo(bounds);
     let (w, h) = (width as f32, height as f32);
     let ctx = crate::render::draw::DrawPointContext {
@@ -1423,7 +2040,14 @@ pub fn rasterize_metar_stations(
         is_dark: *is_dark,
     };
     let mut tally = ItemTally::default();
-    for ob in obs.iter() {
+
+    // **Measured before a texel is allocated**, through the same model the
+    // paint pass draws — see [`PointExtentPainter`]. The stations that survive
+    // the cull are kept with the box each one measured, so the second walk
+    // draws exactly the list the window was cut from.
+    let mut placed: Vec<(usize, f32, f32)> = Vec::new();
+    let mut extent = ContentExtent::new();
+    for (idx, ob) in obs.iter().enumerate() {
         // Into the viewport's frame first, as every point row does.
         let lon = mb.nearest_lon(ob.lon);
         let (px, py) = mb.project(ob.lat, lon, w, h);
@@ -1438,19 +2062,52 @@ pub fn rasterize_metar_stations(
         }
         tally.on_texture();
         {
-            let mut painter = PixmapPointPainter {
-                pixmap: &mut pixmap,
-                center: (px, py),
-                scale,
-            };
-            // Text is a no-op in this painter, but the draw still asks for
-            // it; building it here is per station per PICTURE, in the worker.
+            let mut measure = PointExtentPainter::new(scale);
             let text = crate::render::station_model::StationText::of(ob);
-            crate::render::station_model::draw_metar_station(ob, &text, &mut painter, &ctx);
+            crate::render::station_model::draw_metar_station(ob, &text, &mut measure, &ctx);
+            // A model that emitted no geometry occupies nothing, so it widens
+            // no window — and it is not `unbounded` either: nothing about it is
+            // unknown.
+            if let Some((min_x, min_y, max_x, max_y)) = measure.box_of() {
+                extent.add_rect(px + min_x, py + min_y, px + max_x, py + max_y);
+            }
         }
+        placed.push((idx, px, py));
+    }
+
+    let crop = policy.allow(extent.crop(width, height));
+    let (cw, ch, ox, oy) = crop_dims(crop, width, height);
+    let Some(mut pixmap) = Pixmap::new(cw, ch) else {
+        log::error!(
+            "Pixmap allocation failed in rasterize_metar_stations ({}x{})",
+            cw,
+            ch
+        );
+        return RasterizeOutput {
+            crop,
+            rgba: vec![0u8; (cw as usize) * (ch as usize) * 4].into(),
+            hit_cells: None,
+            alpha: AlphaMode::Premultiplied,
+            blank: None,
+            blank_reason: Some(no_pixmap_reason(cw, ch)),
+        };
+    };
+
+    for (idx, px, py) in placed {
+        let ob = &obs[idx];
+        let mut painter = PixmapPointPainter {
+            pixmap: &mut pixmap,
+            center: (px - ox, py - oy),
+            scale,
+        };
+        // Text is a no-op in this painter, but the draw still asks for it;
+        // building it here is per station per PICTURE, in the worker.
+        let text = crate::render::station_model::StationText::of(ob);
+        crate::render::station_model::draw_metar_station(ob, &text, &mut painter, &ctx);
     }
 
     RasterizeOutput {
+        crop,
         rgba: pixmap.take().into(),
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
@@ -1614,6 +2271,17 @@ pub fn rasterize_storm_reports(
     width: u32,
     height: u32,
 ) -> RasterizeOutput {
+    rasterize_storm_reports_windowed(input, bounds, width, height, CropPolicy::Content)
+}
+
+/// [`rasterize_storm_reports`] with the window policy stated. See [`CropPolicy`].
+pub fn rasterize_storm_reports_windowed(
+    input: &ReportsInput,
+    bounds: &GeoBounds,
+    width: u32,
+    height: u32,
+    policy: CropPolicy,
+) -> RasterizeOutput {
     let ReportsInput {
         reports,
         zoom,
@@ -1623,20 +2291,6 @@ pub fn rasterize_storm_reports(
     } = input;
     let (zoom, is_dark) = (*zoom, *is_dark);
     let scale = sane_device_scale(*device_scale);
-    let Some(mut pixmap) = Pixmap::new(width, height) else {
-        log::error!(
-            "Pixmap allocation failed in rasterize_storm_reports ({}×{})",
-            width,
-            height
-        );
-        return RasterizeOutput {
-            rgba: vec![0u8; (width * height * 4) as usize].into(),
-            hit_cells: None,
-            alpha: AlphaMode::Premultiplied,
-            blank: None,
-            blank_reason: Some(no_pixmap_reason(width, height)),
-        };
-    };
     let mb = MercatorBounds::from_geo(bounds);
     let w = width as f32;
     let h = height as f32;
@@ -1655,6 +2309,19 @@ pub fn rasterize_storm_reports(
     let mut hit_cells = HitCells::new(width, height);
     let mut tally = ItemTally::default();
 
+    // **Where the marks land, before a texel is allocated.** This is the row
+    // the DHAT reading singled out: four whole-viewport pictures, 71,884,800 B
+    // allocated and **96,384 B written — 0.13 %**. A storm report is a disc of
+    // at most ten texels' radius and a page of them is a handful of counties,
+    // so the window below is a fraction of the viewport on every scene that has
+    // any reports at all. See [`PictureCrop`].
+    //
+    // The filter and the cull keep their order and their tallies exactly: this
+    // walk is the old loop with the drawing lifted out of it, and the second
+    // walk below draws the list it leaves. Both read the same `(px, py)`, so the
+    // window and the paint cannot come from two projections.
+    let mut placed: Vec<(usize, f32, f32)> = Vec::new();
+    let mut extent = ContentExtent::new();
     for (idx, report) in reports.iter().enumerate() {
         // **A report later than the depicted instant has not happened yet**
         // (`TimeAxis::EventLifetime`): the picture at `as_of` is which of
@@ -1680,6 +2347,47 @@ pub fn rasterize_storm_reports(
             continue;
         }
         tally.on_texture();
+        // The disc, its outline stroked centred so half the width lies outside
+        // the radius, and one texel for the anti-aliased rim — the whole stroke
+        // width allowed rather than half, because the symbols inside
+        // (`draw_tornado_symbol` and its two siblings) are filled paths within
+        // `radius` and splitting hairs at this size buys nothing. `hit_radius`
+        // is `radius + stroke_w` and so sits inside it; the hit cells are
+        // recorded in the WHOLE picture's grid regardless (see below), so
+        // nothing about the window constrains them.
+        extent.add_point(px, py, radius + stroke_w + 2.0);
+        placed.push((idx, px, py));
+    }
+
+    let crop = policy.allow(extent.crop(width, height));
+    let (cw, ch, ox, oy) = crop_dims(crop, width, height);
+    let Some(mut pixmap) = Pixmap::new(cw, ch) else {
+        log::error!(
+            "Pixmap allocation failed in rasterize_storm_reports ({}×{})",
+            cw,
+            ch
+        );
+        return RasterizeOutput {
+            crop,
+            rgba: vec![0u8; (cw as usize) * (ch as usize) * 4].into(),
+            hit_cells: None,
+            alpha: AlphaMode::Premultiplied,
+            blank: None,
+            blank_reason: Some(no_pixmap_reason(cw, ch)),
+        };
+    };
+
+    for (idx, ppx, ppy) in placed {
+        let report = &reports[idx];
+        // **Two coordinates from here down, and they are not interchangeable.**
+        // `(px, py)` is where the mark is drawn: the window's frame, which is
+        // the whole picture's coordinate minus a whole number of texels.
+        // `(ppx, ppy)` is the whole picture's own, and it is what the hit cells
+        // are recorded in — the hit map is a quarter-resolution grid over the
+        // WHOLE dispatched texture and the pane's click test reads it through
+        // the picture's full screen rect (`ui_map_overlays`), so recording it in
+        // the window's frame would hand every hover to the wrong report.
+        let (px, py) = (ppx - ox, ppy - oy);
 
         let fill = match report.kind {
             StormReportKind::Tornado => Color::from_rgba8(220, 40, 40, 220),
@@ -1733,17 +2441,17 @@ pub fn rasterize_storm_reports(
 
         // The report's position in the input list **is** its id.
         let item_id = idx as u32;
-        let min_x = (px - hit_radius).max(0.0) as i32;
-        let max_x = ((px + hit_radius) as i32).min(width as i32 - 1);
-        let min_y = (py - hit_radius).max(0.0) as i32;
-        let max_y = ((py + hit_radius) as i32).min(height as i32 - 1);
+        let min_x = (ppx - hit_radius).max(0.0) as i32;
+        let max_x = ((ppx + hit_radius) as i32).min(width as i32 - 1);
+        let min_y = (ppy - hit_radius).max(0.0) as i32;
+        let max_y = ((ppy + hit_radius) as i32).min(height as i32 - 1);
         let r2 = hit_radius * hit_radius;
         let mut sy = min_y;
         while sy <= max_y {
             let mut sx = min_x;
             while sx <= max_x {
-                let dx = sx as f32 - px;
-                let dy = sy as f32 - py;
+                let dx = sx as f32 - ppx;
+                let dy = sy as f32 - ppy;
                 if dx * dx + dy * dy <= r2 {
                     hit_cells.record(sx as f32, sy as f32, item_id);
                 }
@@ -1754,6 +2462,7 @@ pub fn rasterize_storm_reports(
     }
 
     RasterizeOutput {
+        crop,
         rgba: pixmap.take().into(),
         hit_cells: Some(hit_cells),
         alpha: AlphaMode::Premultiplied,
@@ -2332,6 +3041,7 @@ pub fn rasterize_glm_strikes(
             height
         );
         return RasterizeOutput {
+            crop: None,
             rgba: vec![0u8; (width * height * 4) as usize].into(),
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
@@ -2421,6 +3131,7 @@ pub fn rasterize_glm_strikes(
     }
 
     RasterizeOutput {
+        crop: None,
         rgba: pixmap.take().into(),
         hit_cells: Some(hit_cells),
         alpha: AlphaMode::Premultiplied,
@@ -3430,6 +4141,7 @@ pub fn rasterize_gridded(
     let empty = input.whole_values().is_some_and(|(v, _)| v.is_empty());
     if empty || width == 0 || height == 0 || ni == 0 || nj == 0 {
         return RasterizeOutput {
+            crop: None,
             rgba: px.into(),
             hit_cells: None,
             alpha: AlphaMode::Straight,
@@ -3443,6 +4155,7 @@ pub fn rasterize_gridded(
     // painting it through some other field's colours would be a silent misread.
     let Some(paint) = crate::render::gridded::field_paint(input.field()) else {
         return RasterizeOutput {
+            crop: None,
             rgba: px.into(),
             hit_cells: None,
             alpha: AlphaMode::Straight,
@@ -3460,6 +4173,7 @@ pub fn rasterize_gridded(
     let win = input.window_for(bounds, width, height);
     if win.is_empty() {
         return RasterizeOutput {
+            crop: None,
             rgba: px.into(),
             hit_cells: None,
             alpha: AlphaMode::Straight,
@@ -3664,6 +4378,7 @@ pub fn rasterize_gridded(
     );
 
     RasterizeOutput {
+        crop: None,
         rgba: px.into(),
         hit_cells: None,
         alpha: AlphaMode::Straight,
@@ -3722,6 +4437,12 @@ mod hole_tests;
 
 #[cfg(test)]
 mod item_blank_reason_tests;
+
+/// **A picture cut to a bounding box of its content is the same picture.**
+/// The identity gate behind [`PictureCrop`], its anti-vacuity floor, and the
+/// tamper that shows the comparison is live.
+#[cfg(test)]
+mod crop_identity_tests;
 
 #[cfg(test)]
 pub(crate) mod lambert_fixture;

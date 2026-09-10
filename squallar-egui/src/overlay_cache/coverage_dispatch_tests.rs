@@ -51,6 +51,7 @@ fn covers(tex: &GeoBounds, vp: &GeoBounds) -> bool {
 /// coverage.
 fn data_for(texture: &egui::TextureHandle, vp: &GeoBounds) -> OverlayTextureData {
     OverlayTextureData {
+        crop: None,
         texture: texture.clone(),
         placed: PlacedRaster::of(plan().coverage(vp)),
         data_generation: TOKEN,

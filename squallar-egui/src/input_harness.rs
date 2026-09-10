@@ -1917,6 +1917,7 @@ impl InputHarness {
             .unwrap()
             .overlay_cache_mut(&squallar_source::id::known::RADAR);
         cache.show(OverlayTextureData {
+            crop: None,
             texture,
             placed: squallar_geo::PlacedRaster::of(squallar_geo::GeoBounds {
                 min_lat: bounds.min_lat,
