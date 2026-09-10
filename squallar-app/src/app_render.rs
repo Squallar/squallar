@@ -878,6 +878,53 @@ fn tile_cache_line(
     )
 }
 
+/// The `parsed geometry:` running-total line, or `None` where this process has
+/// parsed no vector body at all.
+///
+/// Denominator: **one feature decoded out of an MVT body** — not a tile, and
+/// never to be read against the `tile cache` line's `asks`, `puts` or
+/// `parsed`, every one of which counts tiles. A single basemap tile carries
+/// anywhere from a handful to a few thousand features.
+///
+/// **A fires-counter.** Both savings are things that did *not* happen, so a
+/// mechanism that never executed reads zero here rather than being assumed:
+/// `boxed` in particular is the arm `walkers::mvt::FeatureGeometry::Other`
+/// exists for, and a reading above zero means the decoder started producing a
+/// shape this workspace has never seen.
+///
+/// **Three figures, three currencies, and none is added to another.**
+/// `B inline` is width every feature stopped occupying in its layer's
+/// `Vec<ParsedFeature>` (a `ParsedFeature` went 56 bytes to 40 when its
+/// geometry stopped being sized by a `geo_types::Polygon` no basemap feature
+/// is). `blocks` is **allocations that did not happen** — one heap `Vec` per
+/// single-coordinate point feature — which is what allocator work scales with
+/// and is the reason this line reports a count at all. `B chunk` prices those
+/// same blocks as the allocator sized them (glibc rounds an 8-byte request to
+/// a 32-byte chunk) and `B content` prices them as
+/// `walkers::mvt::ParsedTile::heap_bytes` charged them; they are two readings
+/// of one population, so quoting both and adding neither is the point.
+///
+/// Every figure is a running total for the life of the process and is a
+/// **steady-state** reading: the population it describes is the parsed-tile
+/// cache, which is byte-bounded and live — 94.4 % of a pan's reads are served
+/// from it — so this is a cache made cheaper and never a cache made smaller.
+fn parsed_geometry_line(t: &squallar_egui::tile_source::parsed_census::Totals) -> Option<String> {
+    if t.features == 0 {
+        return None;
+    }
+    Some(format!(
+        "parsed geometry: {} features, {} points inline, {} blocks not allocated, \
+         {} B chunk not held, {} B content not held, {} B inline shed, {} boxed",
+        t.features,
+        t.points_inlined,
+        t.point_blocks(),
+        t.point_chunk_bytes(),
+        t.point_content_bytes(),
+        t.slack_bytes(),
+        t.boxed_other,
+    ))
+}
+
 /// The `basemap tiles:` running-total line. See [`overlay_raster_line`] for
 /// why this is a value rather than an argument to `log::info!` — and this one
 /// most of all, because the Tier-2 rig **gates** on it
@@ -3040,6 +3087,13 @@ impl super::App {
             if let Some(t) = squallar_egui::tile_source::cache_ledger::totals_if_moved(role) {
                 say_telemetry(loud, &tile_cache_line(role, &t));
             }
+        }
+        // Beside the cache lines, and on its own denominator: those count
+        // tiles, this counts the features inside them.
+        if let Some(line) =
+            parsed_geometry_line(&squallar_egui::tile_source::parsed_census::totals())
+        {
+            say_telemetry(loud, &line);
         }
         if let Some(b) = basemap {
             say_telemetry(loud, &basemap_tile_line(&b));

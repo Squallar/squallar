@@ -62,4 +62,6 @@ pub use zoom::InvalidZoom;
 #[cfg(feature = "mvt")]
 pub use expression::Context;
 #[cfg(feature = "mvt")]
-pub use mvt::{Geometry, PolygonTessellator, ShapeOrText, render_line, tessellate_polygon};
+pub use mvt::{
+    FeatureGeometry, Geometry, PolygonTessellator, ShapeOrText, render_line, tessellate_polygon,
+};

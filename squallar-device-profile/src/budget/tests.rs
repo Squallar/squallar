@@ -1659,7 +1659,7 @@ fn the_tile_allowances_are_the_written_figures_on_every_bracket() {
         (
             BudgetLimits::DESKTOP,
             [160, 256, 512],
-            [62, 93, 192],
+            [56, 84, 175],
             [64, 80, 128],
             [320, 448, 832],
         ),
@@ -1750,7 +1750,7 @@ fn the_tile_allowances_are_the_written_figures_on_every_bracket() {
     // real constant one crate up, in squallar-egui's
     // `the_two_slots_price_against_the_brackets_they_are_handed`, which reads
     // both — so a tail that moves without this line moving reddens there.
-    const PARSED_TAIL: usize = 670_110;
+    const PARSED_TAIL: usize = 610_286;
     let desktop_parsed = BudgetLimits::DESKTOP.tile_parsed_bytes;
     for (rung, bytes, canvas, want) in [
         ("floor", desktop_parsed.floor, "1920x1200", 96_usize),

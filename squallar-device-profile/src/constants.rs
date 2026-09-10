@@ -1641,11 +1641,14 @@ pub const fn mib(n: usize) -> usize {
 ///
 /// Stated in both directions, because one alone misreads it: **parsed
 /// coverage RISES at two rungs while parsed bytes fall at all three.**
-/// 96/128/192 parses become 96/144/299; 192/256/384 MiB become 62/93/192.
+/// 96/128/192 parses become 96/144/299; 192/256/384 MiB become 56/84/175.
 ///
 /// The arithmetic, rounded up to the whole MiB the way the floor already was
-/// (96 x 2,092,002 = 191.53 -> mib(192)): 96 x 670,110 = 61.35 -> 62 MiB,
-/// 144 x 670,110 = 92.03 -> 93 MiB, 299 x 670,110 = 191.08 -> 192 MiB.
+/// (96 x 2,092,002 = 191.53 -> mib(192)): 96 x 610,286 = 55.87 -> 56 MiB,
+/// 144 x 610,286 = 83.81 -> 84 MiB, 299 x 610,286 = 174.02 -> 175 MiB. They
+/// fell again on 2026-09-10 with the tail (670,110 -> 610,286, a narrower
+/// `ParsedFeature` and inline single points), which is the mechanism this
+/// paragraph describes working: the counts did not move.
 /// `the_tile_allowances_are_the_written_figures_on_every_bracket` holds each
 /// rung against `count x tail` in **both** directions rather than against a
 /// byte literal, so the next tail measurement moves these for free — and
@@ -1675,15 +1678,15 @@ pub const MOBILE_TILE_HOST_CEILING_BYTES: usize = WASM_TILE_HOST_CEILING_BYTES[0
 
 /// The desktop arm. See [`WASM_TILE_STYLED_BYTES`].
 pub const DESKTOP_TILE_STYLED_BYTES: [usize; 3] = [mib(160), mib(256), mib(512)];
-pub const DESKTOP_TILE_PARSED_BYTES: [usize; 3] = [mib(62), mib(93), mib(192)];
+pub const DESKTOP_TILE_PARSED_BYTES: [usize; 3] = [mib(56), mib(84), mib(175)];
 pub const DESKTOP_TILE_TERRAIN_BYTES: [usize; 3] = [mib(64), mib(80), mib(128)];
-/// 286 / 429 / 832 MiB of allowances at the three rungs, each rounded up to
+/// 280 / 420 / 815 MiB of allowances at the three rungs, each rounded up to
 /// the next 64 MiB — which is what every host ceiling in this block already
 /// was, checked in `the_host_ceilings_are_their_sums_rounded_up_to_64_mib`.
-/// The ceiling rung is still exactly its sum, 832 being a multiple of 64:
-/// nothing is slack there. These fell with the parsed allowances; leaving
-/// them where they were would have failed `check_budgets`'s 1.25x snugness
-/// at the floor (448 over 286) and at the step (640 over 429).
+/// These fell once with the parsed allowances, and the parsed allowances fell
+/// again on 2026-09-10 without moving them: the rounding to 64 MiB absorbed
+/// 6 / 9 / 17 MiB, and `check_budgets`'s 1.25x snugness still holds at every
+/// rung (320 over 280, 448 over 420, 832 over 815).
 pub const DESKTOP_TILE_HOST_CEILING_BYTES: [usize; 3] = [mib(320), mib(448), mib(832)];
 
 /// The share of a **measured, probed or derived** GPU capacity the scene's

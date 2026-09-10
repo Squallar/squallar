@@ -2917,6 +2917,91 @@ across both commits is a graph that is 48 packages *smaller* than before walkers
 was vendored at all. That reduction is the concrete thing this pair of commits
 buys, ahead of any patch.
 
+### Changed — source, thirty-fifth commit: a feature's geometry stops being sized by a variant the decoder cannot produce
+
+`src/mvt.rs`. `ParsedFeature::geometry` becomes a local `FeatureGeometry`
+instead of a `geo_types::Geometry<f32>`, and `render_line`, `render_polygon`,
+`render_symbol`, `geometry_type_to_str` and `geometry_heap_bytes` match on it.
+`src/lib.rs` exports the new type beside `Geometry`, which stays exported and
+stays what `Other` holds.
+
+**The finding.** `geo_types::Geometry<f32>` is 48 bytes because of `Polygon`,
+which is a `LineString` (a `Vec`, 24 B) beside a `Vec` of interiors (24 B).
+`mvt-reader`'s `parse_geometry` cannot produce that variant. Its
+`GeomType::Polygon` arm accumulates rings into `linestrings` and flushes a
+`Polygon` into `polygons` only when a *later* exterior ring arrives, so the
+last ring is always still pending at the end and the `!linestrings.is_empty()`
+branch is always the one taken — the answer is always `MultiPolygon`. The other
+arms yield `MultiPoint`, `LineString` and `MultiLineString`. Every one of those
+is a single `Vec` and fits in 24 bytes: **the variant that sized the enum was
+unreachable, so the slack was 24 B on every feature, not on a mix of them.**
+
+`FeatureGeometry` is those four shapes, an inline one-coordinate `Point`, and
+`Other(Box<Geometry<f32>>)` for the arms the decoder cannot reach. 32 bytes, so
+`ParsedFeature` is **40** where the thirty-second commit above measured it at
+56.
+
+**The point case, and why it is the larger half.** Measured over 8,359 tiles of
+the shipped `omt-20260828` basemap — the ones this box already had cached on
+disk, 934,029 features — **44.12 % are `GeomType::Point` carrying exactly one
+coordinate**, mean 1.00. Each was 8 bytes of content in a 32-byte glibc chunk
+plus a 24-byte `Vec` header inline. `FeatureGeometry::Point` holds the
+`Coord<f32>` itself: 8 inline bytes and **no allocation at all**. That is a
+count as much as a byte saving, and count is what allocator work scales with.
+
+**The alternative loses, on this mix, and is not taken.** Boxing the wide
+variant — the shape the `pahole` reading suggested — would put the single
+polygons behind a fresh 64-byte chunk to save 16 inline bytes each: on the
+corpus above, **+13.5 B and +0.43 blocks per feature**, a net loss in both
+currencies.
+
+**`Other` is unconverted on purpose.** Mapping `Geometry::Polygon` onto
+`FeatureGeometry::Polygons` would change what it draws: `render_polygon`
+matches `MultiPolygon` alone, so a bare `Polygon` renders nothing today and
+folding it in would start drawing a shape that never has been.
+`census::Totals::boxed_other` is the reading that says the arm is never taken;
+the app prints it on `parsed geometry:` every telemetry period.
+
+**Nothing rounds.** `pack` moves each `Vec` rather than converting it, the
+inlined `Coord<f32>` is the decoder's own bits, and `geometry_type_to_str`
+answers `"Point"` for the inline case exactly as it did for the one-element
+`MultiPoint`, so no `$type` filter sees a different tile.
+`mvt::tests::rendering_the_fixture_reproduces_the_recorded_shapes_exactly` and
+`a_cursor_cut_at_any_allowance_reproduces_the_recorded_shapes_exactly` pass
+**unedited**.
+
+**Added, and it is a new public surface**: `mvt::census`, three relaxed atomics
+added once per tile rather than per feature. It is a fires-counter — features
+parsed, points inlined, blocks not allocated, and the boxed fallback — so a
+mechanism that never executed reads zero rather than being assumed.
+
+**Measured**, one REST1 leg paired against the same seed on the tree before
+this commit, both parsing the same 93 vector tiles: the app's own heap census
+reads `tile parsed` **24,710,033 -> 24,143,385 B**, a fall of **566,648**,
+which is to the byte what `parsed geometry:` reports as `413,008 B inline shed`
+plus `153,640 B content not held` — and **19,205 allocations** that did not
+happen, worth 614,560 B of glibc chunk that no level can see.
+
+`squallar_egui::tile_source::MEASURED_PARSED_TILE_BYTES` falls **670,110 ->
+610,286** on the committed Monaco fixture, re-derived by the method its doc
+names and not by subtraction; the desktop parsed brackets follow it as
+`count x tail` with the counts untouched.
+
+**Pins**: `mvt::tests::a_parsed_feature_is_forty_bytes` (both sizes, and the
+`geo_types::Polygon` width that is the reason),
+`a_one_coordinate_point_is_inline_and_a_two_point_one_is_not` (the coordinate
+and the `$type` answer), `the_census_counts_a_parse_and_never_boxes` and
+`the_census_starts_empty`.
+
+**Maintenance cost**: this is a change to a vendored crate and it cannot be a
+wrapper. `ParsedTile`'s fields are private and `parse` is the only producer, so
+nothing in `squallar-egui` can change what a feature's geometry *is*; a wrapper
+could only re-walk the result and allocate a second copy of it, which is the
+opposite of the cut. The cost is one more entry in this list, and it is small
+in the direction that matters: `FeatureGeometry` is a type this file owns, so
+an upstream `mvt.rs` change touching the render arms conflicts on the arm names
+and not on the data model.
+
 ### Turning `mvt` on, and why the lockfile does not move
 
 The fourth commit sets `walkers = { workspace = true, features = ["mvt"] }` in

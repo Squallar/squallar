@@ -2508,7 +2508,7 @@ mod tests {
         let context = walkers::Context::new("LineString", Default::default(), 14);
         let mut shapes = Vec::new();
         walkers::render_line(
-            &walkers::mvt::Geometry::LineString(vec![(0.0_f32, 0.0_f32), (EXTENT, EXTENT)].into()),
+            &walkers::mvt::FeatureGeometry::Line(vec![(0.0_f32, 0.0_f32), (EXTENT, EXTENT)].into()),
             &context,
             &mut shapes,
             paint,

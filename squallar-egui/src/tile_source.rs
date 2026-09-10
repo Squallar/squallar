@@ -379,14 +379,21 @@ pub const RASTER_TILE_BYTES: usize = 256 * 256 * 4;
 /// | 2026-08-29, after shrinking | 2,092,002 | `mvt-reader` grew every ring at `Vec::with_capacity(<whole feature's command count>)`, so geometry capacity was 28.1 MB for 318 KB of shrunk content; `walkers::mvt::parse` shrinks per feature |
 /// | 2026-09-07 | 1,928,874 | the features `Vec` was collected **in place** out of the decode's own buffer, so it held two `ParsedFeature` slots per feature: 163,128 B of slack, 7.8% |
 /// | 2026-09-07 | 670,110 | the per-feature `HashMap<String, Value>` property bags — **1,447,103 B, 69.2% of the tile** — became per-layer interned tables plus an eight-byte index span per feature, which is how the wire carries them in the first place |
+/// | 2026-09-10 | 610,286 | a `ParsedFeature` stopped being sized by a `geo_types::Polygon` no MVT feature is (56 B to 40, **46,608 B** over the tile's 2,913 features) and its single-coordinate points came inline (**13,216 B and 1,652 allocations**, 56.7% of the tile's features) — see `walkers::mvt::FeatureGeometry` |
 ///
-/// What is left, on that tile: **317,736 B of geometry** (47.4%), **188,227 of
-/// properties** (28.1% — 73,803 of shared key and value tables over 14 source
-/// layers, 114,424 of index pairs over 14,303 properties), **163,128 of
-/// feature spine** (24.3%), and 1,019 of layers and names. It is now **under
+/// What is left, on that tile: **304,520 B of geometry** (49.9%), **188,227 of
+/// properties** (30.8% — 73,803 of shared key and value tables over 14 source
+/// layers, 114,424 of index pairs over 14,303 properties), **116,520 of
+/// feature spine** (19.1%), and 1,019 of layers and names. It is now **under
 /// half the styled entry** rather than twice it; the parsed cache keeps its
 /// own byte allowance because it is a separate population, not because it is
 /// the larger one.
+///
+/// **This figure is bytes, and the 2026-09-10 fall is also 1,652 blocks** —
+/// allocations the tile no longer makes at all. `heap_bytes` cannot see that,
+/// because a block's cost to the allocator is not its content: those 1,652
+/// were 8-byte `Vec`s in 32-byte glibc chunks. [`parsed_census`] is where the
+/// count is read; do not infer it from this constant.
 ///
 /// The desktop parsed brackets are a canvas tile count times this figure:
 /// `squallar_device_profile::constants::WASM_TILE_STYLED_BYTES` carries the
@@ -398,7 +405,19 @@ pub const RASTER_TILE_BYTES: usize = 256 * 256 * 4;
 /// Like its styled sibling: re-derive it by forcing the test's band to fail,
 /// never by inference from a type's field list — the band cannot catch this
 /// constant drifting upward into a safe over-estimate.
-pub const MEASURED_PARSED_TILE_BYTES: usize = 670_110;
+pub const MEASURED_PARSED_TILE_BYTES: usize = 610_286;
+
+/// What [`walkers::mvt::parse`] packed, always on — the feature-level counter
+/// beside this module's tile-level ones.
+///
+/// Re-exported here rather than reached for through `walkers` directly,
+/// because the app layer has no `walkers` of its own and this module is
+/// already where every reading of the parsed population is published. Its
+/// denominator is **one decoded feature**, which is neither
+/// [`cache_ledger::Totals::parsed_entries`] (tiles held) nor
+/// [`MEASURED_PARSED_TILE_BYTES`] (one tile's price); see
+/// `squallar_app::app_render::parsed_geometry_line`.
+pub use walkers::mvt::census as parsed_census;
 
 /// A basemap styling: the built style, and the key that built it.
 ///
