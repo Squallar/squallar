@@ -910,11 +910,19 @@ pub const NON_MOBILE_MAX_CONCURRENT_LOOP_DOWNLOADS: usize = 8;
 /// # What is still PROVISIONAL, and what replaces it
 ///
 /// The decoded ceiling's real driver is decode latency against playback
-/// cadence, and that latency is UNMEASURED: the harness exists
-/// (`squallar-radar/tests/mem_loop_decode_cost.rs`) and has never been run.
-/// The archive ceiling's right shape is a per-site observed archive peak that
-/// only rises, the archive twin of `LoopDownloadManager::site_scan_peak`. Both
-/// figures below are the honest bootstrap for that measurement, not its result.
+/// cadence. **That latency is now MEASURED** — see
+/// [`LOOP_DECODED_LOOKAHEAD_FRAMES`], which is the constant it sizes. The
+/// harness this paragraph used to name as existing,
+/// `squallar-radar/tests/mem_loop_decode_cost.rs`, is not in this tree and
+/// never has been: it lives on the branch-only commit `29c6ce215`, which is
+/// where a campaign instrument belongs, so the citation read as a file a
+/// reader could open and was not one.
+///
+/// The archive ceiling's right shape is still a per-site observed archive peak
+/// that only rises, the archive twin of `LoopDownloadManager::site_scan_peak`,
+/// and that figure is still a bootstrap rather than a result. It is also the
+/// wrong ceiling to LOWER, which is a separate claim with its own evidence —
+/// see [`LOOP_ARCHIVE_CEILING_BYTES`].
 #[cfg(target_arch = "wasm32")]
 pub const LOOP_DECODED_CEILING_BYTES: usize = WASM_LOOP_DECODED_CEILING_BYTES;
 #[cfg(all(not(target_arch = "wasm32"), mobile))]
@@ -930,6 +938,48 @@ pub const MOBILE_LOOP_DECODED_CEILING_BYTES: usize = 320 * 1024 * 1024;
 /// 25-stamp desktop loop was 1,222 MiB of decoded volumes before this.
 pub const DESKTOP_LOOP_DECODED_CEILING_BYTES: usize = 256 * 1024 * 1024;
 
+/// **How many compressed bytes the loop may hold. Do not lower this to save
+/// memory: it is the one ceiling here where taking bytes can RAISE the
+/// process's resident total.**
+///
+/// Stated at the constant rather than in a hand-back because a cut that
+/// backfires gets attempted twice if the reason it backfires is not written
+/// where the next person will hit it.
+///
+/// An archive is not slack. It is two things at once:
+///
+/// 1. **The cheapest retention this application has.** Measured over 39
+///    Archive II volumes of the 171-file `/home/reddragon/nrot-synth` corpus,
+///    an archive is 2.93 / 6.45 / 25.09 % (min / median / max) of the decoded
+///    volume it stands in for — a median **15.5x leverage**. Nothing else in
+///    the census returns a volume for 6 % of its bytes.
+///
+/// 2. **The precondition for evicting the DECODED half at all.** Both of the
+///    policies that reclaim decoded volumes (they live in `squallar-radar`,
+///    which this crate does not depend on, so they are named and not linked) —
+///    `LoopDownloadManager::evict_decoded_except` and
+///    `evict_decoded_to_ceiling` — refuse a volume with no archive behind it,
+///    by design: their cost is a decode, and for a volume with nothing to
+///    decode from they would silently become a re-download policy.
+///
+/// Put together: **taking an archive strands the 15.5x-larger decoded volume
+/// as permanently un-evictable.** Lowering this ceiling frees a median 2.9 MiB
+/// and can cost a median 45.0 MiB that no later pass is allowed to reclaim, so
+/// the arithmetic runs the wrong way and the loss is not recoverable inside
+/// the process. On a six-site scene this ceiling is already binding, which
+/// means the stranding is not hypothetical.
+///
+/// The lever for a smaller archive total is the FRAME LIST the archives
+/// follow, not this number. That list is bounded by a count
+/// ([`MAX_LOOP_FRAMES`], 60 on desktop) over a time span
+/// ([`LOOP_SPAN_BUDGET_SECS`], two hours on desktop) and by **no byte term at
+/// all**, so its bytes scale with volume cadence: a precipitation VCP yields
+/// 1.84x the volumes per span at flat bytes per volume, and the count cap does
+/// not bite at that cadence — the rig's pinned instant measures 78 volumes
+/// across six sites in one hour, all six in VCP 212, or ~26 per site over the
+/// two-hour span against a cap of 60. The severe day is therefore the
+/// expensive day, and nothing here is denominated in the currency that is
+/// short.
 #[cfg(target_arch = "wasm32")]
 pub const LOOP_ARCHIVE_CEILING_BYTES: usize = WASM_LOOP_ARCHIVE_CEILING_BYTES;
 #[cfg(all(not(target_arch = "wasm32"), mobile))]
@@ -950,10 +1000,51 @@ pub const DESKTOP_LOOP_ARCHIVE_CEILING_BYTES: usize = 256 * 1024 * 1024;
 /// `None` on wasm, because the death above is what a spare 42-75 MiB volume
 /// costs on a 1 GiB page carrying 381 MiB of other families, and a retarget
 /// that waits one decode is a wait and not a wall. `Some(0)` on mobile keeps
-/// the playhead alone. `Some(2)` on desktop is PROVISIONAL: the right value is
-/// `ceil(decode_latency / frame_interval)` and the latency is unmeasured (see
-/// above). Do not inherit the campaign's 250-300 MiB/s-per-lane figure for it;
-/// that came from an eight-lane arm under contention.
+/// the playhead alone.
+///
+/// # Desktop's `Some(1)`, from the measurement rather than from a bootstrap
+///
+/// The rule is `ceil(decode_latency / frame_interval)`, and both terms are now
+/// numbers.
+///
+/// **Latency**, measured 2026-09-10 over 39 Archive II volumes from the
+/// 171-file `/home/reddragon/nrot-synth` corpus — release profile, x86_64
+/// Linux, best of three per volume, one volume at a time, no custom global
+/// allocator, `scan::decode_shared` over an `Arc`-held archive, which is the
+/// production loop path:
+///
+/// * decode 6.0 / 10.7 / 40.9 ms (min / median / max)
+/// * the volume it rebuilds, 30.6 / 45.0 / 74.8 MiB priced
+/// * `RenderInput::extract`, the per-frame work the calling thread already
+///   does, 57 / 67 / 93 us — three orders below the decode, so re-deciding
+///   this constant does not move it.
+///
+/// **Interval**: [`DEFAULT_LOOP_SPEED_FPS`] is 5, a 200 ms frame.
+/// `ceil(40.9 / 200) = 1` on the WORST volume in the corpus, and
+/// `ceil(10.7 / 200) = 1` at the median. One frame of runway covers a decode
+/// up to 200 ms; the corpus maximum is 40.9, a 4.9x margin. `Some(1)` holds
+/// the corpus maximum out to 24.4 fps and the median out to 93 fps, against a
+/// [`MAX_LOOP_SPEED_FPS`] of 30 — so the only exposure is the largest volumes
+/// in the corpus at speeds above 24.4 fps, where playback may wait one decode
+/// on a frame it is retargeting onto. Desktop decodes are dispatched to the
+/// worker pool rather than run serially, so that is a ceiling on the cost and
+/// not an estimate of it.
+///
+/// **What the second frame was buying**, priced: a median 45.0 MiB resident to
+/// save a median 10.7 ms decode, or 4.2 MiB per millisecond. And it buys it
+/// for a *retarget* — a product or tilt change, which `retarget_renders`
+/// blanks every frame for, so the whole loop re-decodes anyway and the spare
+/// volume is a head start on 2 frames of 14, not a saved wait. Playback itself
+/// reads none of it: `App::evict_unneeded_loop_scans` is explicit that only a
+/// first render and a retarget re-render read a decoded volume. Under the
+/// standing product rule — interaction is realtime, data may lag — a retarget
+/// is data.
+///
+/// This still leaves desktop the loosest of the three arms: wasm keeps none,
+/// mobile keeps the playhead alone, desktop keeps the playhead and one ahead.
+///
+/// Do not inherit the campaign's 250-300 MiB/s-per-lane figure for it; that
+/// came from an eight-lane arm under contention.
 #[cfg(target_arch = "wasm32")]
 pub const LOOP_DECODED_LOOKAHEAD_FRAMES: Option<usize> = WASM_LOOP_DECODED_LOOKAHEAD_FRAMES;
 #[cfg(all(not(target_arch = "wasm32"), mobile))]
@@ -963,7 +1054,7 @@ pub const LOOP_DECODED_LOOKAHEAD_FRAMES: Option<usize> = DESKTOP_LOOP_DECODED_LO
 
 pub const WASM_LOOP_DECODED_LOOKAHEAD_FRAMES: Option<usize> = None;
 pub const MOBILE_LOOP_DECODED_LOOKAHEAD_FRAMES: Option<usize> = Some(0);
-pub const DESKTOP_LOOP_DECODED_LOOKAHEAD_FRAMES: Option<usize> = Some(2);
+pub const DESKTOP_LOOP_DECODED_LOOKAHEAD_FRAMES: Option<usize> = Some(1);
 
 /// **The census at death, as this crate's own record of the scene the wasm
 /// budgets above were sized against** — bytes, from the rig json, so the test

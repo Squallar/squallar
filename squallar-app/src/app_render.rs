@@ -3509,6 +3509,17 @@ impl super::App {
             loud,
             &crate::budget_telemetry::way_back_pin_line(self.loop_mgr.archives_pinned_to_ceiling()),
         );
+        // **And what the decoded residency pass traded away to get there.**
+        // Its own line, running totals, for the reasons the two above have
+        // one — and because it is the only instrument that can tell a
+        // lookahead that frees bytes from one whose trade was never available.
+        say_telemetry(
+            loud,
+            &crate::budget_telemetry::lookahead_trade_line(
+                self.loop_decoded_traded,
+                self.loop_decoded_traded_bytes,
+            ),
+        );
         // **And what those bases are holding that nothing would free.** The
         // release histogram above says which guard kept a base's gates; this
         // says what taking them would have been worth, which is a different

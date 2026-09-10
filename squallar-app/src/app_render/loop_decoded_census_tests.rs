@@ -487,3 +487,130 @@ fn an_unwanted_volume_the_still_store_also_names_is_counted_but_not_sole() {
          cache's reference would not move a byte",
     );
 }
+
+/// **A textured frame two ahead of the playhead keeps a whole decoded volume
+/// that nothing reads.**
+///
+/// `LOOP_DECODED_LOOKAHEAD_FRAMES` is retarget insurance and nothing else:
+/// `App::evict_unneeded_loop_scans`' own comment says only a first render and
+/// a retarget re-render read a decoded volume, and "playback reads neither".
+/// So on a loop whose frames are all textured, every volume the lookahead
+/// holds is idle — and the desktop arm held two of them per site.
+///
+/// The size of that insurance is now measured rather than assumed. Over 39
+/// Archive II volumes, release build, x86_64 Linux, best of three, one volume
+/// at a time: `scan::decode_shared` costs 6.0 / 10.7 / 40.9 ms
+/// (min / median / max) and the volume it rebuilds is 30.6 / 45.0 / 74.8 MiB.
+/// The constant's own doc gives the rule — `ceil(decode_latency /
+/// frame_interval)` — and at `DEFAULT_LOOP_SPEED_FPS` (5 fps, a 200 ms frame)
+/// that is `ceil(40.9 / 200) = 1` on the WORST volume in the corpus, not 2.
+///
+/// This asserts the frame at forward distance 2, which is the one the second
+/// frame of lookahead was buying.
+#[test]
+fn a_textured_frame_two_ahead_of_the_playhead_does_not_keep_its_moments() {
+    let ctx = egui::Context::default();
+    let mut app = looping_pane(&[at(1), at(2), at(3), at(4), at(5)]);
+    // A way back, so the residency pass is allowed to consider the entry at
+    // all: `evict_decoded_except` refuses a volume with no archive behind it
+    // whatever the predicate says.
+    app.loop_mgr
+        .cache_archive(SITE, at(4), Arc::new(vec![0u8; 64]));
+    let ls = app
+        .gui
+        .pane_mut(0)
+        .expect("a headless app has a pane")
+        .time_state_mut(&known::RADAR);
+    // Textured, so `decoded_wanted`'s `frame.image.is_none()` arm cannot be
+    // what keeps it — the lookahead is then the only thing that can.
+    ls.frames[3].image = Some(textured(&ctx));
+    ls.settle_playhead(squallar_egui::pane::TimeMode::AsOf(at(2)));
+    assert_eq!(ls.current_frame(), 1, "fixture: the playhead is on frame 1");
+    // (idx + (total - playhead)) % total = (3 + 4) % 5 = 2.
+    assert_eq!(
+        (3 + (5 - ls.current_frame())) % 5,
+        2,
+        "fixture: frame 3 is two ahead of the playhead",
+    );
+
+    app.evict_unneeded_loop_scans();
+
+    assert!(
+        app.loop_mgr.get_cached(SITE, &at(4)).is_none(),
+        "a textured frame two ahead of the playhead, with an archive to come \
+         back from, still holds its decoded volume. Nothing reads it: \
+         playback draws the texture. It is retarget insurance priced at a \
+         median 45.0 MiB to save a median 10.7 ms decode.",
+    );
+}
+
+/// **The fires-counter fires**, on the arm the cut is aimed at.
+///
+/// `decoded trades:` is a new row rather than a new number on an existing one,
+/// so the binary before the cut prints no such row at all and cannot be
+/// mistaken for one reading zero.
+#[test]
+fn the_trade_counter_counts_the_volume_the_lookahead_stopped_wanting() {
+    let ctx = egui::Context::default();
+    let mut app = looping_pane(&[at(1), at(2), at(3), at(4), at(5)]);
+    app.loop_mgr
+        .cache_archive(SITE, at(4), Arc::new(vec![0u8; 64]));
+    let ls = app
+        .gui
+        .pane_mut(0)
+        .expect("a headless app has a pane")
+        .time_state_mut(&known::RADAR);
+    ls.frames[3].image = Some(textured(&ctx));
+    ls.settle_playhead(squallar_egui::pane::TimeMode::AsOf(at(2)));
+    assert_eq!(
+        (app.loop_decoded_traded, app.loop_decoded_traded_bytes),
+        (0, 0),
+        "premise: nothing has been traded before the pass runs",
+    );
+
+    app.evict_unneeded_loop_scans();
+
+    assert_eq!(
+        app.loop_decoded_traded, 1,
+        "the pass traded exactly the one textured frame outside the lookahead",
+    );
+    assert!(
+        app.loop_decoded_traded_bytes > 0,
+        "a traded volume weighed nothing: the byte arm of the counter is \
+         reading a total the cache never moved. Counts and bytes are \
+         different currencies and a live count does not vouch for the bytes.",
+    );
+}
+
+/// **And it stays silent where the trade is UNAVAILABLE** — the direction that
+/// matters, because this is the shape that let a ~94 MiB cut on this campaign
+/// deliver exactly zero.
+///
+/// Identical to the test above but for the archive. `evict_decoded_except`
+/// refuses a volume with no way back whatever the residency rule says, so on a
+/// chunk-fed scene a narrower lookahead frees nothing — and the counter has to
+/// be able to say so rather than reporting the trade it did not make.
+#[test]
+fn the_trade_counter_stays_zero_when_there_is_no_archive_to_trade_for() {
+    let ctx = egui::Context::default();
+    let mut app = looping_pane(&[at(1), at(2), at(3), at(4), at(5)]);
+    let ls = app
+        .gui
+        .pane_mut(0)
+        .expect("a headless app has a pane")
+        .time_state_mut(&known::RADAR);
+    ls.frames[3].image = Some(textured(&ctx));
+    ls.settle_playhead(squallar_egui::pane::TimeMode::AsOf(at(2)));
+
+    app.evict_unneeded_loop_scans();
+
+    assert!(
+        app.loop_mgr.get_cached(SITE, &at(4)).is_some(),
+        "premise: with no archive behind it the volume is not evictable",
+    );
+    assert_eq!(
+        (app.loop_decoded_traded, app.loop_decoded_traded_bytes),
+        (0, 0),
+        "the counter reported a trade the policy refused to make",
+    );
+}

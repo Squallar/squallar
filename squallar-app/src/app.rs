@@ -682,6 +682,22 @@ pub struct App {
     /// line per transition is a handful per session and says exactly which
     /// interval the hold covered. Read off a leg by counting the lines.
     base_way_backs_held: usize,
+    /// **Volumes the decoded residency pass traded for their archives**, and
+    /// what they weighed, as running totals rather than levels.
+    ///
+    /// This is the fires-counter for `LOOP_DECODED_LOOKAHEAD_FRAMES`. That
+    /// constant is retarget insurance and nothing else — playback reads a
+    /// texture, not a volume — so a narrower lookahead frees bytes only if
+    /// `evict_decoded_except` actually reaches the frames it stops wanting.
+    /// Whether it does depends on a precondition this application has been
+    /// wrong about before: the policy refuses any volume with no archive
+    /// behind it, so on a scene fed by the chunk feed the trade is unavailable
+    /// and a narrower lookahead frees exactly nothing while every level around
+    /// it still looks healthy.
+    ///
+    /// Counts and bytes are DIFFERENT CURRENCIES and are never added.
+    loop_decoded_traded: u64,
+    loop_decoded_traded_bytes: u64,
     #[cfg(test)]
     pub(crate) volume_extractions: std::cell::Cell<u32>,
     /// **Decodes `ensure_base_whole` actually dispatched**, counted where the
@@ -1135,6 +1151,8 @@ impl App {
             site_hint_pending,
             volume_store: std::sync::Arc::new(squallar_volumetric::bridge::VolumeStore::new()),
             base_way_backs_held: 0,
+            loop_decoded_traded: 0,
+            loop_decoded_traded_bytes: 0,
             #[cfg(test)]
             volume_extractions: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -3481,11 +3499,27 @@ impl App {
                     .get(site)
                     .is_some_and(|frames| frames.contains(ts))
             };
+        // **What the trade actually returned, in both currencies.** O(1) on
+        // either side: `cached_scan_bytes` is a running total the cache
+        // maintains at arrival and eviction, so this is two integer reads and
+        // not a walk of anything.
+        //
+        // The denominator, said rather than implied: this is every volume
+        // `decoded_keep` stopped wanting, which on a live loop is exactly the
+        // textured frames outside `LOOP_DECODED_LOOKAHEAD_FRAMES` — an
+        // untextured frame is in `decoded_wanted` by the other arm, a parked
+        // one is held above it, and a volume no frame names at all left
+        // through `retain_scans` one pass earlier. It is not attributed to the
+        // lookahead by inference: it is what this call removed.
+        let traded_before = self.loop_mgr.cached_scan_bytes() as u64;
+        let traded = self.loop_mgr.evict_decoded_except(decoded_keep);
+        self.loop_decoded_traded = self.loop_decoded_traded.saturating_add(traded.len() as u64);
+        self.loop_decoded_traded_bytes = self
+            .loop_decoded_traded_bytes
+            .saturating_add(traded_before.saturating_sub(self.loop_mgr.cached_scan_bytes() as u64));
         squallar_worker::offload::discard_each(
             "evicted-loop-decoded",
-            crate::volume_inventory::volume_drop_parts(
-                self.loop_mgr.evict_decoded_except(decoded_keep),
-            ),
+            crate::volume_inventory::volume_drop_parts(traded),
         );
         // **The decoded cache's own byte bound**, the twin of the archive
         // ceiling below and for the same reason: the predicate pass above

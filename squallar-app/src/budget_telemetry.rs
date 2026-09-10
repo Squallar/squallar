@@ -1254,6 +1254,32 @@ pub(crate) fn way_back_pin_line(held: u64) -> String {
     format!("way-back pins: archive ceiling held {held}")
 }
 
+/// **What the decoded residency pass traded for archives**, as running totals,
+/// beside the lookahead that decided it.
+///
+/// `volumes` and `bytes` are different currencies and are never added; `keep`
+/// is the `LOOP_DECODED_LOOKAHEAD_FRAMES` of the running binary, printed so a
+/// row can be read without knowing which arm produced it — `none` is wasm's
+/// `None`, an integer is `Some(n)`.
+///
+/// **This row is the fires-counter for that constant**, and it is always on
+/// for the reason `way_back_pin_line` is. `evict_decoded_except` refuses any
+/// volume with no archive behind it, so a narrower lookahead frees bytes only
+/// where the trade is actually available; on a chunk-fed scene it is not, and
+/// a policy that never fires and a policy that works are indistinguishable
+/// from every level this application publishes. A cut on this campaign already
+/// delivered exactly zero for that reason and nothing noticed for a day.
+///
+/// A running total and never a level: a volume traded between two telemetry
+/// ticks is invisible to anything sampled, and the trade is the event.
+pub(crate) fn lookahead_trade_line(volumes: u64, bytes: u64) -> String {
+    let keep = match squallar_device_profile::constants::LOOP_DECODED_LOOKAHEAD_FRAMES {
+        Some(frames) => frames.to_string(),
+        None => "none".to_string(),
+    };
+    format!("decoded trades: keep {keep} ahead, traded {volumes} volumes, {bytes} B")
+}
+
 /// **The way back the chunk feed keeps for its own volumes**, as running
 /// totals and one level.
 ///
