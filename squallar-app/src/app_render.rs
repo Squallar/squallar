@@ -757,8 +757,12 @@ fn layer_release_line(t: &squallar_egui::release_ledger::Totals) -> String {
 /// the browser rig parses this line by an unanchored regex
 /// (`.github/browser-rig/drive.py`); a field added at the end leaves every
 /// existing capture where it was. `stroke run meshes`, `stroke mesh verts`
-/// and `shapes` are appended for the same reason, as are `raster quads` and
-/// `raster quad meshes`.
+/// and `shapes` are appended for the same reason, as are `raster quads`,
+/// `raster quad meshes`, `ground callbacks` and `raster pages` -- which is
+/// why `raster pages` sits at the end of the line rather than beside the two
+/// figures it belongs with, `raster quads` and `raster quad meshes`. The
+/// three divide into one another and the line's order says nothing about
+/// that; see `squallar_egui::tile_mesh::ledger` for what they are.
 ///
 /// The last three are the painterless pass's — a floor strip's. `stroke run
 /// meshes` and `stroke mesh verts` count runs drawn from the buffers they
@@ -774,7 +778,8 @@ fn ground_tile_line(t: &squallar_egui::tile_mesh::ledger::Totals) -> String {
          {} uploads of {} B, {} evicted, {} B resident, {} unrendered, \
          {} stroke draws, {} label solves, {} stroke run meshes, \
          {} stroke mesh verts, {} shapes, {} shape slots, \
-         {} raster quads, {} raster quad meshes, {} ground callbacks",
+         {} raster quads, {} raster quad meshes, {} ground callbacks, \
+         {} raster pages",
         t.mesh_vertices_placed,
         t.path_points_placed,
         t.label_anchors_placed,
@@ -793,6 +798,7 @@ fn ground_tile_line(t: &squallar_egui::tile_mesh::ledger::Totals) -> String {
         t.raster_quads,
         t.raster_quad_meshes,
         t.ground_callbacks,
+        t.raster_pages,
     )
 }
 

@@ -908,41 +908,79 @@ const RASTER_CLIP: egui::Rect =
 
 /// Batch [`raster_grid`] exactly as the tile walk does, handing back the
 /// shapes in the order the painter was given them.
+///
+/// One stretch: `raster_grid` is what one uninterrupted run of raster cells
+/// looks like, which is what a shipped terrain pass is.
 fn batched_raster_shapes() -> Vec<egui::Shape> {
     let mut quads = RasterQuads::default();
-    let mut shapes = Vec::new();
     for (texture, rect, uv) in raster_grid() {
-        if let Some(run) = quads.push(texture, rect, uv, egui::Color32::WHITE, RASTER_CLIP) {
-            shapes.push(run);
-        }
+        quads.push(texture, rect, uv, egui::Color32::WHITE, RASTER_CLIP);
     }
-    shapes.extend(quads.finish());
-    shapes
+    quads.finish()
 }
 
-/// **The batch draws the cells the one-`Painter::image`-per-cell spelling
-/// drew, byte for byte — texture ids included.**
-///
-/// `Painter::image` is `Shape::image`, which is `Mesh::with_texture` plus one
-/// `add_rect_with_uv`, so the per-cell arm here is what the shipped call
-/// produced before this cut; what is compared is the tessellated
-/// `ClippedPrimitive` stream, which is what the renderer sees.
-///
-/// The fixture carries the three cases a real pass has — cells inside the
-/// pane, one straddling its edge, one off it entirely — and the case a
-/// coloured background run cannot have: **two textures, interleaved**. A
-/// batch that merged across the page boundary would put one page's quads in
-/// the other page's mesh and this digest would name the wrong `tex=`.
-#[test]
-fn a_batched_raster_run_tessellates_to_the_same_bytes_as_one_image_per_tile() {
-    const PPP: f32 = 1.0;
-    let per_tile: Vec<egui::epaint::ClippedShape> = raster_grid()
+/// The one-`Painter::image`-per-cell spelling of [`raster_grid`] -- what the
+/// shipped call produced before any of this -- in the walk's own order.
+fn per_cell_raster_shapes() -> Vec<egui::epaint::ClippedShape> {
+    raster_grid()
         .into_iter()
         .map(|(texture, rect, uv)| egui::epaint::ClippedShape {
             clip_rect: RASTER_CLIP,
             shape: egui::Shape::image(texture, rect, uv, egui::Color32::WHITE),
         })
-        .collect();
+        .collect()
+}
+
+/// [`per_cell_raster_shapes`] **stably sorted by page**, first-seen page
+/// first: the per-cell spelling of exactly the order the page grouping draws
+/// its quads in.
+fn per_cell_raster_shapes_in_page_order() -> Vec<egui::epaint::ClippedShape> {
+    let mut pages: Vec<egui::TextureId> = Vec::new();
+    for (texture, rect, _) in raster_grid() {
+        // The cull is the batch's, so the reference order has to make it too:
+        // a culled cell puts no page on the glass and cannot be what opens
+        // one.
+        if RASTER_CLIP.intersects(rect) && !pages.contains(&texture) {
+            pages.push(texture);
+        }
+    }
+    let mut out: Vec<egui::epaint::ClippedShape> = Vec::new();
+    for page in pages {
+        for clipped in per_cell_raster_shapes() {
+            let egui::Shape::Mesh(ref mesh) = clipped.shape else {
+                panic!("Shape::image is a mesh");
+            };
+            if mesh.texture_id == page {
+                out.push(clipped.clone());
+            }
+        }
+    }
+    out
+}
+
+/// **The batch draws the cells the one-`Painter::image`-per-cell spelling
+/// drew, byte for byte — texture ids included — once that spelling is put in
+/// the order the grouping draws them in.**
+///
+/// This is the equivalence the cut asserts at the stream, and it is
+/// deliberately **weaker than the byte identity the consecutive-run batch
+/// held**: grouping by page reorders the primitive stream, so full-stream
+/// identity is false by construction and would be the wrong thing to demand.
+/// What is true, and what this holds, is that the reorder is a **permutation
+/// by page that keeps walk order inside each page** -- every quad the walk
+/// drew, with the vertices, uvs, colours and texture id it drew them with,
+/// and no others.
+///
+/// **What it does not cover: the glass.** A permutation of the stream is only
+/// invisible because the cells are a disjoint cover, and that argument is
+/// about fragments rather than about vertices; nothing here can see it. It is
+/// held by a readback through a real adapter --
+/// `squallar-gpu/tests/tile_mesh_gpu.rs`,
+/// `page_grouped_raster_cells_put_the_same_bytes_on_screen_as_one_image_per_cell`
+/// -- which is the tool `013d2f480` established for exactly this case.
+#[test]
+fn a_page_grouped_raster_pass_is_the_per_cell_stream_permuted_by_page() {
+    const PPP: f32 = 1.0;
     let batched: Vec<egui::epaint::ClippedShape> = batched_raster_shapes()
         .into_iter()
         .map(|shape| egui::epaint::ClippedShape {
@@ -951,33 +989,49 @@ fn a_batched_raster_run_tessellates_to_the_same_bytes_as_one_image_per_tile() {
         })
         .collect();
 
-    let before = primitive_digest(&frame_tessellator(PPP).tessellate_shapes(per_tile));
+    let walk_order =
+        primitive_digest(&frame_tessellator(PPP).tessellate_shapes(per_cell_raster_shapes()));
+    let page_order = primitive_digest(
+        &frame_tessellator(PPP).tessellate_shapes(per_cell_raster_shapes_in_page_order()),
+    );
     let after = primitive_digest(&frame_tessellator(PPP).tessellate_shapes(batched));
+
     assert!(
-        before.len() > 1 && before.iter().any(|p| p.contains("vertices=[(")),
+        walk_order.len() > 1 && walk_order.iter().any(|p| p.contains("vertices=[(")),
         "fixture: the per-cell run must emit more than one primitive with vertices \
          in it, else this compares nothing"
     );
     assert!(
-        before.iter().any(|p| p.contains("tex=Managed(7)"))
-            && before.iter().any(|p| p.contains("tex=Managed(9)")),
+        walk_order.iter().any(|p| p.contains("tex=Managed(7)"))
+            && walk_order.iter().any(|p| p.contains("tex=Managed(9)")),
         "fixture: both pages must reach the stream, else the texture-id claim is vacuous"
     );
+    // **The fixture must actually interleave**, or the reorder is the
+    // identity and every assertion below is answered by a walk that never
+    // needed grouping.
+    assert_ne!(
+        walk_order, page_order,
+        "fixture: the walk order already is page order, so this test cannot \
+         tell a page-grouped stream from a consecutive-run one"
+    );
     assert_eq!(
-        before, after,
-        "batching the raster cells moved the stream the renderer sees"
+        page_order, after,
+        "the page grouping is not the per-cell stream permuted by page: it \
+         moved a vertex, a uv, a colour or a texture id, or it reordered two \
+         cells of ONE page"
     );
 }
 
-/// **One shape per consecutive run of one page, and a culled cell ends no
-/// run.**
+/// **One shape per page, and a culled cell puts no page on the glass.**
 ///
-/// The byte-identity gate above holds the stream; this holds the quantity the
-/// cut is for. [`raster_grid`] draws five of its seven cells — page A three
-/// times, page B once, page A once — in three runs. Seven `Painter::add`
-/// calls become three.
+/// The permutation gate above holds the stream; this holds the quantity the
+/// cut is for. [`raster_grid`] draws five of its seven cells — page A four
+/// times and page B once, interleaved — which the consecutive-run batch drew
+/// as three shapes and this draws as **two**: seven `Painter::add` calls
+/// become two, and two is the floor, because a textured quad can only join a
+/// mesh of its own texture.
 #[test]
-fn a_raster_run_is_one_shape_per_consecutive_page() {
+fn a_raster_pass_is_one_shape_per_page() {
     let shapes = batched_raster_shapes();
     let textures: Vec<egui::TextureId> = shapes
         .iter()
@@ -988,12 +1042,8 @@ fn a_raster_run_is_one_shape_per_consecutive_page() {
         .collect();
     assert_eq!(
         textures,
-        vec![
-            egui::TextureId::Managed(7),
-            egui::TextureId::Managed(9),
-            egui::TextureId::Managed(7),
-        ],
-        "the runs did not follow the walk's page order"
+        vec![egui::TextureId::Managed(7), egui::TextureId::Managed(9)],
+        "the pass did not hand over one shape per page, first-seen page first"
     );
     let quads: Vec<usize> = shapes
         .iter()
@@ -1004,7 +1054,7 @@ fn a_raster_run_is_one_shape_per_consecutive_page() {
         .collect();
     assert_eq!(
         quads,
-        vec![3, 1, 1],
+        vec![4, 1],
         "an off-pane cell was kept, or a drawn one was dropped"
     );
     assert_eq!(
@@ -1012,4 +1062,71 @@ fn a_raster_run_is_one_shape_per_consecutive_page() {
         raster_grid().len() - 2,
         "every cell but the two off-pane ones draws"
     );
+}
+
+/// **The pass counts the pages it drew on, and a culled cell is not one of
+/// them.**
+///
+/// `raster_pages` is the floor the shape count is claimed to have fallen to,
+/// so it has to be a reading rather than a restatement: [`raster_grid`] names
+/// two pages and its two off-pane cells sit on both of them, so a counter
+/// that counted asks rather than draws would still say two here -- which is
+/// why the second half of this drives the count to ONE by culling every cell
+/// of page B.
+#[test]
+fn the_pass_counts_the_pages_its_drawn_cells_sat_on() {
+    let mut quads = RasterQuads::default();
+    assert_eq!(quads.pages(), 0, "a pass that drew nothing sat on no page");
+    for (texture, rect, uv) in raster_grid() {
+        quads.push(texture, rect, uv, egui::Color32::WHITE, RASTER_CLIP);
+    }
+    assert_eq!(
+        quads.pages(),
+        2,
+        "the pass did not count the two pages its cells sat on"
+    );
+    assert_eq!(
+        quads.pages() as usize,
+        quads.finish().len(),
+        "the shapes handed over and the pages counted disagree"
+    );
+
+    // Page B's only drawn cell, culled: the page is asked for and never
+    // drawn.
+    let mut one_page = RasterQuads::default();
+    for (texture, rect, uv) in raster_grid() {
+        let rect = if texture == egui::TextureId::Managed(9) {
+            egui::Rect::from_min_size(egui::pos2(-4096.0, -4096.0), rect.size())
+        } else {
+            rect
+        };
+        one_page.push(texture, rect, uv, egui::Color32::WHITE, RASTER_CLIP);
+    }
+    assert_eq!(
+        one_page.pages(),
+        1,
+        "a page every cell of which was culled was counted as drawn on"
+    );
+}
+
+/// **A stretch is handed over whole, and what interrupts it is not reordered
+/// across.**
+///
+/// The reorder is only sound inside one stretch: a vector tile drawn between
+/// two raster cells used to end a run for a reason, and it still ends the
+/// stretch. Two stretches of the same page are two shapes, not one.
+#[test]
+fn a_page_drawn_in_two_stretches_is_two_shapes() {
+    let page = egui::TextureId::Managed(7);
+    let uv = egui::Rect::from_min_max(egui::epaint::WHITE_UV, egui::epaint::WHITE_UV);
+    let at = |x: f32| egui::Rect::from_min_size(egui::pos2(x, 0.0), egui::vec2(64.0, 64.0));
+
+    let mut quads = RasterQuads::default();
+    quads.push(page, at(0.0), uv, egui::Color32::WHITE, RASTER_CLIP);
+    let first: Vec<egui::Shape> = quads.take().collect();
+    quads.push(page, at(64.0), uv, egui::Color32::WHITE, RASTER_CLIP);
+    let second = quads.finish();
+
+    assert_eq!(first.len(), 1, "the first stretch did not go over whole");
+    assert_eq!(second.len(), 1, "the second stretch did not go over whole");
 }

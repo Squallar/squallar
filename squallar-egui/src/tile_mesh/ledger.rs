@@ -98,6 +98,7 @@ static GROUND_SHAPES: AtomicU64 = AtomicU64::new(0);
 static GROUND_SHAPE_SLOTS: AtomicU64 = AtomicU64::new(0);
 static RASTER_QUADS: AtomicU64 = AtomicU64::new(0);
 static RASTER_QUAD_MESHES: AtomicU64 = AtomicU64::new(0);
+static RASTER_PAGES: AtomicU64 = AtomicU64::new(0);
 static MESH_UPLOADS: AtomicU64 = AtomicU64::new(0);
 static MESH_UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
 static MESH_EVICTIONS: AtomicU64 = AtomicU64::new(0);
@@ -171,6 +172,18 @@ pub struct Totals {
     /// [`Self::raster_quads`] must not. Equal counts are a viewport whose
     /// cells never share a page two in a row.
     pub raster_quad_meshes: u64,
+    /// **Distinct atlas pages the pass's drawn cells sat on**, over the same
+    /// cells and frames [`Self::raster_quads`] counts. The FLOOR under
+    /// [`Self::raster_quad_meshes`]: a textured quad can only join a mesh of
+    /// its own texture, so no arrangement of one pass's cells can hand the
+    /// painter fewer shapes than there are pages under them.
+    ///
+    /// Counted over the whole pass, so the two are equal exactly when the
+    /// pass is one uninterrupted stretch of raster cells -- which every
+    /// shipped terrain pass is, and a pass whose cells are interleaved with
+    /// vector tiles is not. Culled cells are not in it: a quad epaint would
+    /// drop puts no page on the glass.
+    pub raster_pages: u64,
     pub mesh_uploads: u64,
     pub mesh_upload_bytes: u64,
     pub mesh_evictions: u64,
@@ -185,11 +198,13 @@ pub struct Totals {
     pub mesh_store_missing: u64,
 }
 
-/// Raster cells one tile pass placed, and the shapes it handed the painter
-/// for them. One call per tile layer per pane per frame.
-pub fn note_raster_quads(quads: u64, meshes: u64) {
+/// Raster cells one tile pass placed, the shapes it handed the painter for
+/// them, and the atlas pages under them. One call per tile layer per pane
+/// per frame.
+pub fn note_raster_quads(quads: u64, meshes: u64, pages: u64) {
     RASTER_QUADS.fetch_add(quads, Relaxed);
     RASTER_QUAD_MESHES.fetch_add(meshes, Relaxed);
+    RASTER_PAGES.fetch_add(pages, Relaxed);
 }
 
 /// Fill vertices this tile placed on the CPU. One call per tile.
@@ -283,6 +298,7 @@ impl Totals {
             .wrapping_add(self.ground_shape_slots)
             .wrapping_add(self.raster_quads)
             .wrapping_add(self.raster_quad_meshes)
+            .wrapping_add(self.raster_pages)
             .wrapping_add(self.mesh_uploads)
             .wrapping_add(self.mesh_evictions)
             .wrapping_add(self.mesh_store_missing)
@@ -319,6 +335,7 @@ pub fn totals() -> Totals {
         ground_shape_slots: GROUND_SHAPE_SLOTS.load(Relaxed),
         raster_quads: RASTER_QUADS.load(Relaxed),
         raster_quad_meshes: RASTER_QUAD_MESHES.load(Relaxed),
+        raster_pages: RASTER_PAGES.load(Relaxed),
         mesh_uploads: MESH_UPLOADS.load(Relaxed),
         mesh_upload_bytes: MESH_UPLOAD_BYTES.load(Relaxed),
         mesh_evictions: MESH_EVICTIONS.load(Relaxed),
@@ -348,6 +365,7 @@ pub(crate) fn reset() {
         &GROUND_SHAPE_SLOTS,
         &RASTER_QUADS,
         &RASTER_QUAD_MESHES,
+        &RASTER_PAGES,
         &MESH_UPLOADS,
         &MESH_UPLOAD_BYTES,
         &MESH_EVICTIONS,

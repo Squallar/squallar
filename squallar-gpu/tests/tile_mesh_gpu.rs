@@ -437,8 +437,36 @@ fn frame_groups(
     opacity: f32,
     groups: Vec<(egui::Rect, Vec<egui::Shape>)>,
 ) -> (Vec<u8>, Vec<egui::ClippedPrimitive>) {
+    frame_built(device, queue, renderer, format, opacity, |_| {
+        (groups, Vec::new())
+    })
+}
+
+/// [`frame_groups`], but the shapes are built **against the context the frame
+/// runs in**, and any texture handles they name are held until the render is
+/// over.
+///
+/// A textured fixture needs both: `egui::Context::load_texture` allocates in
+/// one context's manager, so a `TextureId` minted anywhere else names nothing
+/// here and egui's mesh arm draws an empty picture without saying so; and a
+/// handle dropped before `end_pass` puts its texture in `textures_delta.free`
+/// rather than `set`, which is the same empty picture by another route.
+fn frame_built(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer: &mut egui_wgpu::Renderer,
+    format: wgpu::TextureFormat,
+    opacity: f32,
+    build: impl FnOnce(
+        &egui::Context,
+    ) -> (
+        Vec<(egui::Rect, Vec<egui::Shape>)>,
+        Vec<egui::TextureHandle>,
+    ),
+) -> (Vec<u8>, Vec<egui::ClippedPrimitive>) {
     let ctx = egui::Context::default();
     let canvas = canvas();
+    let (groups, _held) = build(&ctx);
     ctx.begin_pass(egui::RawInput {
         screen_rect: Some(canvas),
         ..Default::default()
@@ -2037,5 +2065,381 @@ fn the_hoisted_background_rectangles_put_the_same_bytes_on_screen_as_per_tile_cl
         4 * 4,
         "the one background mesh holds {} vertices, not four hard rectangles' 16",
         first.vertices.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The page-grouped raster grid.
+//
+// `squallar_egui::tile_mesh::RasterQuads` used to batch a tile pass's raster
+// cells into one mesh per CONSECUTIVE run of one atlas page; it now batches
+// them into one mesh per PAGE, which reorders the primitive stream. Byte
+// identity of that stream is therefore false by construction, and the gate
+// that held it (`tile_mesh::tests::a_batched_raster_run_...`) was re-pointed
+// at the permutation it really is. What is left to hold is the glass, and
+// this is the tool `013d2f480` established for it: two readbacks through a
+// real adapter.
+//
+// The claim under test is not "the two streams agree" -- they do not -- but
+// "the cells of one stretch are a disjoint cover, so no fragment is written
+// twice and the order cannot matter". A disjointness claim can only be
+// checked where fragments are, which is here.
+// ---------------------------------------------------------------------------
+
+/// The raster grid's cell side, in points.
+const CELL: f32 = 64.0;
+
+/// Where the grid starts.
+///
+/// Off the pixel grid on both axes and with every x edge on an exact
+/// half-pixel, for [`GRID_ORIGIN`]'s reason: a seam that lands on a pixel
+/// centre is where two watertight triangles' shared edge is a tie, and a tie
+/// is the only place a disjoint cover could still read differently between
+/// two orders. A grid on whole pixels would never put one there.
+const RASTER_ORIGIN: egui::Pos2 = egui::pos2(12.5, 11.3);
+
+/// One raster cell as `draw_tile_layer`'s second walk meets it.
+struct RasterCell {
+    page: usize,
+    rect: egui::Rect,
+    uv: egui::Rect,
+}
+
+/// A slippy grid of raster cells over the canvas: **two pages in a
+/// checkerboard**, so no two cells consecutive in walk order share a page and
+/// the consecutive-run batch degenerates to one mesh per cell -- the maximum
+/// the page grouping has to reorder.
+///
+/// Carries the three cases a real pass has: cells wholly inside the canvas,
+/// cells straddling its right and bottom edges (the grid runs past 256), and
+/// one wholly off it **in the middle of the walk**, which is the cull case.
+fn raster_cells() -> Vec<RasterCell> {
+    let mut cells = Vec::new();
+    for row in 0..4 {
+        for column in 0..4 {
+            // A distinct window of the page per cell, as `RasterTile::window_of`
+            // hands them over -- so a cell drawn with its neighbour's window
+            // is a different picture.
+            let uv = egui::Rect::from_min_size(
+                egui::pos2(column as f32 / 4.0, row as f32 / 4.0),
+                egui::vec2(1.0 / 4.0, 1.0 / 4.0),
+            );
+            cells.push(RasterCell {
+                // **Assigned along the WALK, not across the grid.** A
+                // checkerboard over the grid repeats its parity wherever an
+                // even number of columns draw, which silently hands two
+                // consecutive drawn cells the same page and shrinks the
+                // reorder under test; the alternation is asserted at the top
+                // of the case either way.
+                page: 0,
+                rect: egui::Rect::from_min_size(
+                    RASTER_ORIGIN + egui::vec2(column as f32 * CELL, row as f32 * CELL),
+                    egui::vec2(CELL, CELL),
+                ),
+                uv,
+            });
+            // Mid-walk, off the canvas entirely: a batched mesh is bounded by
+            // the union of its quads, so without `RasterQuads`' own cull this
+            // cell's vertices would join a mesh epaint keeps.
+            if row == 1 && column == 1 {
+                cells.push(RasterCell {
+                    page: usize::MAX,
+                    rect: egui::Rect::from_min_size(
+                        egui::pos2(-4.0 * CELL, -4.0 * CELL),
+                        egui::vec2(CELL, CELL),
+                    ),
+                    uv,
+                });
+            }
+        }
+    }
+    // Pages alternate along the drawn walk; the off-canvas cell keeps a page
+    // of its own so a cull that failed to happen would also be a page that
+    // should not be there.
+    let clip = canvas();
+    let mut drawn = 0;
+    for cell in &mut cells {
+        if cell.page == usize::MAX {
+            cell.page = 0;
+            continue;
+        }
+        cell.page = drawn % 2;
+        if clip.intersects(cell.rect) {
+            drawn += 1;
+        }
+    }
+    cells
+}
+
+/// Two atlas pages, **translucent**, each with its own pattern.
+///
+/// Translucent on purpose: over a premultiplied blend, two orders of two
+/// opaque quads differ only where they overlap, and two orders of two
+/// translucent ones differ there by more. It is the sensitive choice for a
+/// comparison whose whole subject is whether any overlap exists -- and it is
+/// also what the shipped raster layer is, a hillshade drawn over the basemap.
+fn atlas_pages(ctx: &egui::Context) -> Vec<egui::TextureHandle> {
+    (0..2)
+        .map(|page| {
+            let side = 32;
+            let mut image = egui::ColorImage::filled([side, side], egui::Color32::TRANSPARENT);
+            for y in 0..side {
+                for x in 0..side {
+                    // A pattern that varies across the page, so a cell drawn
+                    // from the wrong window or the wrong page is a different
+                    // picture rather than the same flat colour.
+                    let a = 90 + ((x * 5 + y * 3) % 120) as u8;
+                    image.pixels[y * side + x] = if page == 0 {
+                        egui::Color32::from_rgba_unmultiplied(220, 40 + (x * 6 % 200) as u8, 30, a)
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(20, 60, 200 - (y * 5 % 180) as u8, a)
+                    };
+                }
+            }
+            ctx.load_texture(
+                format!("atlas-page-{page}"),
+                image,
+                egui::TextureOptions::NEAREST,
+            )
+        })
+        .collect()
+}
+
+/// The one-`Painter::image`-per-cell arrangement: what the walk emitted
+/// before any batching, in walk order.
+fn per_cell_images(cells: &[RasterCell], pages: &[egui::TextureHandle]) -> Vec<egui::Shape> {
+    cells
+        .iter()
+        .map(|cell| {
+            egui::Shape::image(
+                pages[cell.page].id(),
+                cell.rect,
+                cell.uv,
+                egui::Color32::WHITE,
+            )
+        })
+        .collect()
+}
+
+/// What the walk emits now: the cells through the **shipped**
+/// `RasterQuads`, one mesh per page.
+fn page_grouped_images(
+    cells: &[RasterCell],
+    pages: &[egui::TextureHandle],
+    clip: egui::Rect,
+) -> Vec<egui::Shape> {
+    let mut quads = tile_mesh::RasterQuads::default();
+    for cell in cells {
+        quads.push(
+            pages[cell.page].id(),
+            cell.rect,
+            cell.uv,
+            egui::Color32::WHITE,
+            clip,
+        );
+    }
+    quads.finish()
+}
+
+/// **The page-grouped raster pass puts the same bytes on screen as one
+/// `Painter::image` per cell.**
+///
+/// This is the equivalence the reorder is asserted on, and it is a different
+/// one from the byte-identity of the primitive stream that the
+/// consecutive-run batch held: grouping by page permutes that stream, so the
+/// old claim is false and this is what replaces it.
+///
+/// **What it does not cover**, stated rather than implied:
+///
+/// * **MSAA.** Two triangles meeting on a shared edge are watertight per
+///   *pixel*; the disjointness argument is a fill-rule argument and the fill
+///   rule decides samples. This renders to a single-sampled target, which is
+///   what the tile path uses; a multisampled one would need its own reading.
+/// * **Synthetic pages, not the real atlas.** The pages here are two
+///   `ctx.load_texture` images, not `crate::raster_atlas` slots with their
+///   gutters. What the atlas contributes -- that a cell samples only its own
+///   texels -- is `raster_atlas::tests`' to hold and is not re-argued here.
+/// * **Native readback only, and one format.** As with every case in this
+///   file, WebGL2 is argued from the same egui pipeline rather than measured.
+/// * **One clip.** The grid draws under the pane's rect, which is the only
+///   arrangement `draw_tile_layer` produces for raster cells.
+///
+/// Two controls make the compare's blindness testable rather than assumed:
+/// the same cells **overlapped** must give two different pictures under the
+/// two orders (so the compare sees order at all), and a cell drawn from the
+/// **wrong page** must give a different picture (so it sees texture identity).
+#[test]
+#[ignore = "needs a real wgpu adapter"]
+fn page_grouped_raster_cells_put_the_same_bytes_on_screen_as_one_image_per_cell() {
+    let _serialised = gpu_lock();
+    let Some((device, queue)) = device() else {
+        eprintln!("SKIPPED: no wgpu adapter");
+        return;
+    };
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let mut renderer = renderer_for(&device, format);
+    let clip = canvas();
+    let cells = raster_cells();
+
+    // ---- fixture non-triviality -------------------------------------------
+    // Every x edge on a half-pixel, and the walk order really does alternate
+    // pages, or the grouping is the identity and everything below is vacuous.
+    let drawn: Vec<&RasterCell> = cells
+        .iter()
+        .filter(|cell| clip.intersects(cell.rect))
+        .collect();
+    // Only of the cells that draw: the cull case is placed four cells off the
+    // canvas and is not on the grid the seams are on.
+    for cell in &drawn {
+        for edge in [cell.rect.min.x, cell.rect.max.x] {
+            assert!(
+                (edge.fract() - 0.5).abs() < 1e-4,
+                "fixture: the x edge {edge} is not on a half-pixel, so the seam \
+                 tie a disjoint cover has to survive is untested"
+            );
+        }
+    }
+    assert!(
+        drawn.windows(2).all(|pair| pair[0].page != pair[1].page),
+        "fixture: two consecutive drawn cells share a page, so the \
+         consecutive-run batch already merged them and the reorder under test \
+         is smaller than it claims"
+    );
+    assert!(
+        drawn.len() < cells.len(),
+        "fixture: no cell is off the canvas, so the cull is untested"
+    );
+
+    // ---- the two arms ------------------------------------------------------
+    let (per_cell, per_cell_prims) =
+        frame_built(&device, &queue, &mut renderer, format, 1.0, |ctx| {
+            let pages = atlas_pages(ctx);
+            (vec![(clip, per_cell_images(&cells, &pages))], pages)
+        });
+    let (grouped, grouped_prims) =
+        frame_built(&device, &queue, &mut renderer, format, 1.0, |ctx| {
+            let pages = atlas_pages(ctx);
+            (
+                vec![(clip, page_grouped_images(&cells, &pages, clip))],
+                pages,
+            )
+        });
+
+    let drew = painted(&per_cell);
+    assert!(
+        drew > (SIDE * SIDE / 2) as usize,
+        "non-triviality: the per-cell arrangement painted {drew} texels of \
+         {}, so the pictures compared below are mostly empty",
+        SIDE * SIDE
+    );
+    // The cut's own quantity, read off the same frames the pixels came from.
+    assert_eq!(
+        per_cell_prims.len(),
+        drawn.len(),
+        "fixture: the per-cell arm did not record one primitive per drawn \
+         cell, so the primitive figure below is not a cut of it"
+    );
+    assert_eq!(
+        grouped_prims.len(),
+        2,
+        "the page grouping did not take the pass to one primitive per page"
+    );
+
+    // ---- control one: the compare can see ORDER ----------------------------
+    // The same cells, overlapped by half a cell. They are then NOT a disjoint
+    // cover, fragments are written twice, and the two orders must disagree --
+    // which is what makes their agreement above evidence about disjointness
+    // rather than about a blind compare.
+    let overlapped: Vec<RasterCell> = cells
+        .iter()
+        .map(|cell| RasterCell {
+            page: cell.page,
+            rect: egui::Rect::from_min_size(
+                cell.rect.min,
+                cell.rect.size() + egui::vec2(CELL / 2.0, CELL / 2.0),
+            ),
+            uv: cell.uv,
+        })
+        .collect();
+    let (overlap_per_cell, _) = frame_built(&device, &queue, &mut renderer, format, 1.0, |ctx| {
+        let pages = atlas_pages(ctx);
+        (vec![(clip, per_cell_images(&overlapped, &pages))], pages)
+    });
+    let (overlap_grouped, _) = frame_built(&device, &queue, &mut renderer, format, 1.0, |ctx| {
+        let pages = atlas_pages(ctx);
+        (
+            vec![(clip, page_grouped_images(&overlapped, &pages, clip))],
+            pages,
+        )
+    });
+    assert_ne!(
+        overlap_per_cell, overlap_grouped,
+        "the control is blind: cells that OVERLAP produced the same picture \
+         under the walk order and under the page order, so this compare \
+         cannot see a reorder at all and the agreement it reports proves \
+         nothing"
+    );
+
+    // ---- control two: the compare can see TEXTURE IDENTITY -----------------
+    let mut swapped = raster_cells();
+    swapped[0].page = 1 - swapped[0].page;
+    let (swapped, _) = frame_built(&device, &queue, &mut renderer, format, 1.0, |ctx| {
+        let pages = atlas_pages(ctx);
+        (vec![(clip, per_cell_images(&swapped, &pages))], pages)
+    });
+    assert_ne!(
+        swapped, per_cell,
+        "the control is blind: one cell drawn from the other page produced \
+         the same picture, so this compare cannot see which page a quad \
+         sampled"
+    );
+
+    // ---- the comparison ----------------------------------------------------
+    let differing: Vec<String> = per_cell
+        .chunks_exact(4)
+        .zip(grouped.chunks_exact(4))
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(i, (a, b))| {
+            format!(
+                "({}, {}): per-cell {a:?} grouped {b:?}",
+                i % SIDE as usize,
+                i / SIDE as usize
+            )
+        })
+        .collect();
+    let worst = per_cell
+        .iter()
+        .zip(grouped.iter())
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    println!(
+        "{format:?}: {} of {} texels differ between the per-cell and \
+         page-grouped raster grids, worst channel delta {worst}, over {drew} \
+         painted; primitives {} -> {}",
+        differing.len(),
+        SIDE * SIDE,
+        per_cell_prims.len(),
+        grouped_prims.len(),
+    );
+    // **Exact, not a budget.** Both arms hand the tessellator the same
+    // vertices with the same uvs and the same texture, and every fragment is
+    // written by exactly one of them, so there is no arithmetic here that can
+    // round two ways -- unlike the feathered-rectangle and stroke-offset
+    // pairs above, this pair is the SAME triangles in a different order.
+    assert!(
+        differing.is_empty(),
+        "{} texels differ between one `Painter::image` per cell and one mesh \
+         per atlas page, worst channel delta {worst} -- the cells of a \
+         stretch are not the disjoint cover the reorder rests on. The first \
+         of them:\n{}",
+        differing.len(),
+        differing
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }

@@ -1244,8 +1244,7 @@ fn quad_bounds(rect: egui::Rect) -> egui::Rect {
     )
 }
 
-/// One tile pass's raster quads, batched into one mesh per consecutive run of
-/// one texture.
+/// One tile pass's raster quads, batched into one mesh **per atlas page**.
 ///
 /// **The quads were already going to end up in one mesh per texture run.**
 /// `Painter::image` is `Mesh::with_texture` plus one `add_rect_with_uv`
@@ -1258,21 +1257,58 @@ fn quad_bounds(rect: egui::Rect) -> egui::Rect {
 /// put it in a `Shape::Mesh`, and a `Context::write` for `Painter::add` to
 /// hand it over.
 ///
-/// This accumulates the run instead and hands the painter one shape for it.
-/// The vertices go in in the same order with the same texture, so the stream
-/// the tessellator emits is the one it emitted before, which
-/// `tests::a_batched_raster_run_tessellates_to_the_same_bytes_as_one_image_per_tile`
-/// holds byte for byte -- texture ids included.
+/// # Why a page and not a run
 ///
-/// # Two things end a run
+/// `crate::raster_atlas` puts every tile of one size class in a page of 49
+/// slots, so a viewport's cells share pages -- but a viewport spans more than
+/// one page, nothing sorts the walk by page, and the row-major walk order
+/// interleaves them. Grouping by *consecutive* run therefore left the pass
+/// handing over one shape per page-change rather than one per page: measured
+/// on the native rig's scene A, **13.05 shapes for 40.0 cells** sitting on
+/// far fewer pages than that.
 ///
-/// * **A different texture id.** A viewport whose tiles do not all fit one
-///   atlas page spills into a second, and two pages are two textures: they
-///   were two primitives before this type and they still are. Batching across
-///   them would put one texture's quads in the other's mesh.
-/// * **Anything drawn between two quads.** The grid's second walk interleaves
-///   raster and vector tiles, and a vector tile's geometry goes in where it
-///   goes in. [`Self::take`] is what the caller hands over first.
+/// Grouping by page instead takes the figure to the number of pages the
+/// stretch actually touched, which is the floor a textured quad allows at all
+/// -- and with it the primitive, draw-call and bind-group count that
+/// [`crate::raster_atlas`] exists to bound. [`ledger::Totals::raster_pages`]
+/// is that floor, counted beside the shapes so the claim reads off the
+/// app's own line.
+///
+/// # Why reordering the quads changes no pixel
+///
+/// **The cells of one stretch are a disjoint cover.** `Projector::tile_rect`
+/// is affine in the tile index, so two neighbours share an edge bit for bit
+/// and no two cells of one grid overlap anywhere. A watertight edge is
+/// covered by exactly one of the two triangles that meet on it under the
+/// rasterizer's fill rule, so every pixel of the stretch takes its colour
+/// from exactly one cell however the cells are ordered -- there is no
+/// fragment that two of them both write, and so nothing for an order to
+/// decide. It is the same argument [`HoistedBackgrounds`] already makes for
+/// hoisting every tile's background rectangle ahead of every tile's geometry,
+/// and it is held on the glass the same way: by a readback through a real
+/// adapter rather than by the shape of the stream
+/// (`squallar-gpu/tests/tile_mesh_gpu.rs`,
+/// `page_grouped_raster_cells_put_the_same_bytes_on_screen_as_one_image_per_cell`).
+///
+/// **What it does NOT cover: MSAA.** Two triangles meeting on a shared edge
+/// are watertight per *pixel*, not per *sample*, only because there is one
+/// sample. This workspace resolves no multisampled target on the tile path,
+/// which is what makes the disjointness argument sound; a pass that gained
+/// one would have to re-make it per sample.
+///
+/// # What still ends a batch
+///
+/// **Anything drawn between two quads.** The grid's second walk interleaves
+/// raster and vector tiles, and a vector tile's geometry goes in where it
+/// goes in. [`Self::take`] is what the caller hands over first, and it hands
+/// over *every* open page at once -- so a stretch's quads never cross
+/// something that used to draw over or under them, and the reorder is
+/// confined to within one stretch. A pass that is one uninterrupted stretch
+/// -- which every shipped terrain pass is, a raster archive answering no
+/// vector tile -- reorders across the whole pass; a mixed one reorders only
+/// inside each stretch.
+///
+/// A page change no longer ends anything: that is the whole of the cut.
 ///
 /// # The cull is epaint's, applied here
 ///
@@ -1280,27 +1316,33 @@ fn quad_bounds(rect: egui::Rect) -> egui::Rect {
 /// cull would KEEP a quad it drops today -- invisible either way, since the
 /// scissor takes it, but it would put vertices in the stream that were not
 /// there. So the same test is made here, per quad, against the same clip:
-/// [`quad_bounds`].
+/// [`quad_bounds`]. Grouping by page widens that union from a run to a whole
+/// stretch, which makes the cull matter more rather than less.
 #[derive(Default)]
 pub struct RasterQuads {
-    /// The run being accumulated: `None` before the first quad and after
+    /// The open batches of the current stretch, one per page, in the order
+    /// the stretch first drew on each. Empty before the first quad and after
     /// every hand-over. An empty `Mesh` carries `TextureId::default()`,
     /// which is the font atlas and a texture a tile could in principle be
-    /// in, so emptiness is spelled here rather than read off the mesh.
-    run: Option<egui::epaint::Mesh>,
+    /// in, so emptiness is spelled by the vector rather than read off a mesh.
+    open: Vec<egui::epaint::Mesh>,
+    /// Every page this **pass** has drawn a cell on, in first-seen order.
+    /// Kept across hand-overs, unlike [`Self::open`], because it is the
+    /// pass's figure and not the stretch's: see
+    /// [`ledger::Totals::raster_pages`].
+    pages: Vec<egui::TextureId>,
 }
 
 impl RasterQuads {
-    /// Add one tile's quad, handing back the run it ended, if any.
+    /// Add one tile's quad to its page's batch.
     ///
-    /// The returned shape is the run that was open **before** this quad and
-    /// must be given to the painter before this quad's own run is: the
-    /// caller adds it immediately, and the new run is not handed over until
-    /// a later `push`, [`Self::take`] or [`Self::finish`].
+    /// Nothing is handed over: which pages the stretch touched is only known
+    /// when the stretch ends, so every hand-over goes through [`Self::take`]
+    /// or [`Self::finish`].
     ///
-    /// A quad epaint would cull is dropped here and ends no run -- exactly as
-    /// it reaches the renderer today, where the cull happens after the shape
-    /// is submitted and so cannot separate two shapes either.
+    /// A quad epaint would cull is dropped here and puts no page on the
+    /// glass -- exactly as it reaches the renderer today, where the cull
+    /// happens after the shape is submitted.
     pub fn push(
         &mut self,
         texture: egui::TextureId,
@@ -1308,30 +1350,48 @@ impl RasterQuads {
         uv: egui::Rect,
         tint: egui::Color32,
         clip: egui::Rect,
-    ) -> Option<egui::Shape> {
+    ) {
         if !clip.intersects(quad_bounds(rect)) {
-            return None;
+            return;
         }
-        let ended = match &self.run {
-            Some(run) if run.texture_id == texture => None,
-            Some(_) => self.take(),
-            None => None,
+        if !self.pages.contains(&texture) {
+            self.pages.push(texture);
+        }
+        // A linear scan, not a map: a stretch touches a handful of pages --
+        // 49 tiles to a page against a viewport of forty-odd cells -- and at
+        // that size the scan is the cheaper lookup.
+        let at = match self.open.iter().position(|run| run.texture_id == texture) {
+            Some(at) => at,
+            None => {
+                self.open.push(egui::epaint::Mesh::with_texture(texture));
+                self.open.len() - 1
+            }
         };
-        self.run
-            .get_or_insert_with(|| egui::epaint::Mesh::with_texture(texture))
-            .add_rect_with_uv(rect, uv, tint);
-        ended
+        self.open[at].add_rect_with_uv(rect, uv, tint);
     }
 
-    /// Hand over the open run because something else is about to be drawn.
-    pub fn take(&mut self) -> Option<egui::Shape> {
-        self.run.take().map(|run| egui::Shape::Mesh(run.into()))
+    /// Whether anything is waiting to be drawn.
+    pub fn is_empty(&self) -> bool {
+        self.open.is_empty()
     }
 
-    /// The last run of the pass, or `None` when every quad was culled or
-    /// there were none.
-    pub fn finish(mut self) -> Option<egui::Shape> {
-        self.take()
+    /// Hand over every open page, in the order the stretch first drew on
+    /// them, because something else is about to be drawn.
+    pub fn take(&mut self) -> impl Iterator<Item = egui::Shape> + use<> {
+        std::mem::take(&mut self.open)
+            .into_iter()
+            .map(|run| egui::Shape::Mesh(run.into()))
+    }
+
+    /// The last stretch of the pass.
+    pub fn finish(mut self) -> Vec<egui::Shape> {
+        self.take().collect()
+    }
+
+    /// **Distinct pages this pass drew a cell on** -- the floor under the
+    /// number of shapes it hands the painter, whatever the walk order.
+    pub fn pages(&self) -> u64 {
+        self.pages.len() as u64
     }
 }
 

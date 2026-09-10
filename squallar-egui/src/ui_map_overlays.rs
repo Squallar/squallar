@@ -391,10 +391,11 @@ pub(super) fn draw_tile_layer(
         ui.painter().add(shape);
     }
 
-    // Every raster cell of this pass, in one mesh per consecutive run of one
-    // atlas page rather than one `Shape::Mesh` and one `Painter::add` each.
-    // See [`crate::tile_mesh::RasterQuads`] for why that changes no vertex and
-    // for the two things that end a run.
+    // Every raster cell of this pass, in one mesh per atlas PAGE rather than
+    // one per consecutive run of one -- and one `Shape::Mesh` and one
+    // `Painter::add` per cell before that. See
+    // [`crate::tile_mesh::RasterQuads`] for why reordering a stretch's quads
+    // changes no pixel, and for what still ends a stretch.
     let mut quads = crate::tile_mesh::RasterQuads::default();
     let mut quad_count: u64 = 0;
     let mut quad_meshes: u64 = 0;
@@ -412,30 +413,22 @@ pub(super) fn draw_tile_layer(
             // a texture to itself.
             Tile::Raster(ref raster) => {
                 quad_count += 1;
-                if let Some(run) = quads.push(
+                // Nothing is handed over here: a page change no longer ends a
+                // batch, so the stretch runs on until something has to draw.
+                quads.push(
                     raster.id(),
                     rect,
                     raster.window_of(piece.uv),
                     egui::Color32::WHITE,
                     pane_clip,
-                ) {
-                    // The quads this run holds were pushed after the spans the
-                    // batch is holding, so the batch goes in first.
-                    hand_over_spans(ui, &mut spans, ground, pass_nr);
-                    ui.painter().add(run);
-                    quad_meshes += 1;
-                }
+                );
             }
             Tile::Vector(ref shapes) => {
-                // The run this tile interrupts goes in ahead of its geometry,
-                // because that is where those quads went in before -- and the
-                // batch goes in ahead of the run, because its spans were held
-                // before those quads were pushed.
-                if let Some(run) = quads.take() {
-                    hand_over_spans(ui, &mut spans, ground, pass_nr);
-                    ui.painter().add(run);
-                    quad_meshes += 1;
-                }
+                // The stretch this tile interrupts goes in ahead of its
+                // geometry, because that is where those quads went in before
+                // -- and the batch goes in ahead of the stretch, because its
+                // spans were held before those quads were pushed.
+                quad_meshes += hand_over_quads(ui, &mut quads, &mut spans, ground, pass_nr);
                 paint_vector_tile(
                     ui.painter(),
                     shapes,
@@ -455,15 +448,11 @@ pub(super) fn draw_tile_layer(
             }
         }
     }
-    if let Some(run) = quads.finish() {
-        hand_over_spans(ui, &mut spans, ground, pass_nr);
-        ui.painter().add(run);
-        quad_meshes += 1;
-    }
+    quad_meshes += hand_over_quads(ui, &mut quads, &mut spans, ground, pass_nr);
     // The pass is over: whatever the batch is still holding draws now.
     hand_over_spans(ui, &mut spans, ground, pass_nr);
     if quad_count > 0 {
-        crate::tile_mesh::ledger::note_raster_quads(quad_count, quad_meshes);
+        crate::tile_mesh::ledger::note_raster_quads(quad_count, quad_meshes, quads.pages());
     }
 
     TileLayerPaint {
@@ -762,6 +751,33 @@ fn hand_over_spans(
     {
         ui.painter().add(shape);
     }
+}
+
+/// Draw every page the raster stretch is holding, because something else is
+/// about to be drawn -- the layer's ground batch first, because its spans were
+/// held before these quads were pushed.
+///
+/// Hands back how many shapes went in, which is what
+/// `crate::tile_mesh::ledger::Totals::raster_quad_meshes` counts. A no-op, and
+/// zero, on an empty stretch: `hand_over_spans` is not called either, because
+/// nothing is going in between the batch and whatever comes next.
+fn hand_over_quads(
+    ui: &egui::Ui,
+    quads: &mut crate::tile_mesh::RasterQuads,
+    spans: &mut GroundSpans,
+    painter: Option<&std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>>,
+    pass_nr: u64,
+) -> u64 {
+    if quads.is_empty() {
+        return 0;
+    }
+    hand_over_spans(ui, spans, painter, pass_nr);
+    let mut drawn = 0;
+    for run in quads.take() {
+        ui.painter().add(run);
+        drawn += 1;
+    }
+    drawn
 }
 
 /// One tile's span of runs, waiting to be drawn with its neighbours'.
