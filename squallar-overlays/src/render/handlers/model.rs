@@ -78,9 +78,9 @@ fn grid_bytes(grid: &HrrrGridData) -> usize {
         }
         // One entry per row plus one per column, not one pair per point: 64 KB
         // on GMGSI's 3000 x 5000 grid, where `Explicit` would be 240 MB.
-        crate::hrrr::GridCoords::Separable { lat_axis, lon_axis } => {
-            (lat_axis.len() + lon_axis.len()) * std::mem::size_of::<f64>()
-        }
+        crate::hrrr::GridCoords::Separable {
+            lat_axis, lon_axis, ..
+        } => (lat_axis.len() + lon_axis.len()) * std::mem::size_of::<f64>(),
         // Closed forms: the whole grid is its scalars, already counted by the
         // `size_of` below.
         crate::hrrr::GridCoords::Lambert(_) | crate::hrrr::GridCoords::Regular { .. } => 0,

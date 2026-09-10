@@ -48,6 +48,7 @@ fn grid_from(mut values: Vec<u8>, ny: usize, nx: usize) -> ResidentGrid {
         coords: GridCoords::Separable {
             lat_axis: vec![0.0; ny],
             lon_axis: vec![0.0; nx],
+            index: crate::hrrr::SeparableIndex::default(),
         },
         values: GridValues::Bytes(
             crate::render::gridded::ByteCodes::new(values, Vec::new())

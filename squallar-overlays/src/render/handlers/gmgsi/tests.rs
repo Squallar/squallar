@@ -32,7 +32,7 @@ fn grid_of(channel: GmgsiChannel, values: Vec<f32>) -> GmgsiGrid {
             field: spec.id.clone(),
             ni,
             nj: 1,
-            coords: GridCoords::Separable { lat_axis, lon_axis },
+            coords: GridCoords::separable(lat_axis, lon_axis),
             values: crate::render::gridded::GridValues::F32(values),
         },
         bounds,
@@ -2054,6 +2054,7 @@ fn mosaic_granule(channel: GmgsiChannel, k: i64) -> GmgsiGranule {
             coords: GridCoords::Separable {
                 lat_axis: vec![0.0; 3000],
                 lon_axis: vec![0.0; 5000],
+                index: crate::hrrr::SeparableIndex::default(),
             },
             values: crate::render::gridded::GridValues::Bytes(
                 crate::render::gridded::ByteCodes::new(values, Vec::new())
@@ -2317,6 +2318,7 @@ fn seam_handler_over(lon_axis: Vec<f64>, values: Vec<f32>, bounds: GeoBounds) ->
             coords: GridCoords::Separable {
                 lat_axis: vec![35.0],
                 lon_axis,
+                index: crate::hrrr::SeparableIndex::default(),
             },
             values: crate::render::gridded::GridValues::F32(values),
         },

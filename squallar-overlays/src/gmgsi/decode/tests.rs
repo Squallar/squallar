@@ -42,7 +42,9 @@ fn grid() -> GmgsiGrid {
 
 fn axes(g: &GmgsiGrid) -> (&[f64], &[f64]) {
     match &g.grid.coords {
-        GridCoords::Separable { lat_axis, lon_axis } => (lat_axis, lon_axis),
+        GridCoords::Separable {
+            lat_axis, lon_axis, ..
+        } => (lat_axis, lon_axis),
         other => panic!("GMGSI must decode onto Separable, got {other:?}"),
     }
 }
@@ -220,6 +222,7 @@ fn wraps_longitude_is_true_for_a_global_mosaic() {
     let regional = GridCoords::Separable {
         lat_axis: vec![40.0, 39.0, 38.0],
         lon_axis: (0..100).map(|i| -100.0 + i as f64 * 0.1).collect(),
+        index: crate::hrrr::SeparableIndex::default(),
     };
     assert!(!regional.wraps_longitude());
 }
@@ -324,6 +327,7 @@ fn index_bounds_brackets_both_axes_when_the_longitude_axis_is_monotonic() {
     let coords = GridCoords::Separable {
         lat_axis: (0..100).map(|j| 50.0 - j as f64 * 0.5).collect(),
         lon_axis: (0..200).map(|i| -120.0 + i as f64 * 0.25).collect(),
+        index: crate::hrrr::SeparableIndex::default(),
     };
     let bounds = squallar_geo::GeoBounds {
         min_lat: 30.0,
@@ -425,6 +429,7 @@ fn cell_span_degrees_covers_the_local_cell_at_every_latitude() {
             })
             .collect(),
         lon_axis: (0..40).map(|i| -100.0 + i as f64 * 0.1).collect(),
+        index: crate::hrrr::SeparableIndex::default(),
     };
     let near_the_top = tall.cell_span_degrees(59.0).expect("answers");
     let down_the_tall_part = tall.cell_span_degrees(40.0).expect("answers");

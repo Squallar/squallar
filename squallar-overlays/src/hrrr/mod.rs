@@ -1242,7 +1242,201 @@ pub enum GridCoords {
     Separable {
         lat_axis: Vec<f64>,
         lon_axis: Vec<f64>,
+        /// What the two axes above are *shaped* like, worked out once. See
+        /// [`SeparableIndex`] for why it is here and not recomputed per call.
+        index: SeparableIndex,
     },
+}
+
+/// **The `Separable` axes' own shape, settled once instead of per lookup.**
+///
+/// Nothing here is a cache of an answer: it is a description of the two `Vec`s
+/// beside it, and those never change once a granule is decoded. Every field
+/// was being re-derived from a full pass over one of the axes on **every**
+/// call, and the calls are on the frame thread: `hover_value_at` asks a
+/// granule for the value under the pointer once per pane per frame, and that
+/// reached `nearest` and `cell_span_degrees`, which between them scanned
+/// GMGSI's 3,000-row axis twice and its 5,000-column axis twice — 16,000
+/// probes, 5,000 of them through an `fmod`, for a pointer that moves every
+/// frame of a pan.
+///
+/// [`PartialEq`] is `true` for any two of these on purpose: the facts are a
+/// pure function of the axes, and the axes are compared as siblings by the
+/// derive on [`GridCoords`]. Two grids with equal axes are equal whether or
+/// not either has looked at itself yet.
+#[derive(Debug, Clone, Default)]
+pub struct SeparableIndex(std::sync::OnceLock<SeparableFacts>);
+
+impl PartialEq for SeparableIndex {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl SeparableIndex {
+    fn facts(&self, lat_axis: &[f64], lon_axis: &[f64]) -> &SeparableFacts {
+        self.0
+            .get_or_init(|| SeparableFacts::of(lat_axis, lon_axis))
+    }
+}
+
+/// The measured shape of one [`GridCoords::Separable`] pair.
+#[derive(Debug, Clone)]
+struct SeparableFacts {
+    /// [`axis_is_ascending`] of the latitude axis.
+    lat_ascending: Option<bool>,
+    /// **The longitude axis as a rotated ascending ring**, when it is one:
+    /// `Some(r)` says `lon_axis[..r]` and `lon_axis[r..]` are each *strictly*
+    /// ascending, so the axis steps back exactly once — at `r` — and `r == 0`
+    /// is the ordinary ascending axis that steps back nowhere. `None` is any
+    /// other shape, and sends every query back to the linear scan.
+    lon_rotation: Option<usize>,
+    /// The fold [`GridCoords::lon_frame`] used to run per call.
+    lon_min: f64,
+    lon_max: f64,
+    /// [`separable_lon_span`] and [`separable_lon_step`] of the longitude axis.
+    lon_span: f64,
+    lon_step: f64,
+}
+
+impl SeparableFacts {
+    fn of(lat_axis: &[f64], lon_axis: &[f64]) -> Self {
+        let (lon_min, lon_max) = lon_axis
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                (lo.min(v), hi.max(v))
+            });
+        Self {
+            lat_ascending: axis_is_ascending(lat_axis),
+            lon_rotation: ring_rotation(lon_axis),
+            lon_min,
+            lon_max,
+            lon_span: separable_lon_span(lon_axis),
+            lon_step: separable_lon_step(lon_axis),
+        }
+    }
+
+    /// [`nearest_on_axis`] over the latitude axis, by bisection where the axis
+    /// is strictly monotonic and by the scan where it is not.
+    fn nearest_lat(&self, lat_axis: &[f64], lat: f64) -> Option<usize> {
+        match self.lat_ascending {
+            Some(ascending) => monotone_nearest(lat_axis, lat, ascending),
+            None => nearest_on_axis(lat_axis, lat, |a, b| (a - b).abs()),
+        }
+    }
+
+    /// [`nearest_on_axis`] over the longitude axis with [`longitude_distance`],
+    /// by bisection where the axis is a rotated ascending ring and the query
+    /// is inside a turn of it, and by the scan where it is not.
+    fn nearest_lon(&self, lon_axis: &[f64], lon: f64) -> Option<usize> {
+        // The guard is what makes the three-target reduction below exact: with
+        // every axis value within a turn of the query, the shortest angular
+        // separation is `min(|a - lon|, 360 - |a - lon|)`, which is the nearest
+        // of `lon`, `lon - 360` and `lon + 360` on the plain scale.
+        let inside_a_turn = lon.is_finite()
+            && self.lon_min.is_finite()
+            && self.lon_max.is_finite()
+            && lon >= self.lon_max - 360.0
+            && lon <= self.lon_min + 360.0;
+        match self.lon_rotation {
+            Some(rotation) if inside_a_turn => ring_nearest(lon_axis, rotation, lon),
+            _ => nearest_on_axis(lon_axis, lon, longitude_distance),
+        }
+    }
+}
+
+/// Where a strictly ascending ring steps back, if it does so at most once.
+///
+/// `Some(0)` is an axis that ascends throughout; `Some(r)` an axis that
+/// ascends on `..r` and on `r..` with one step back between; `None` anything
+/// else, including an axis holding a repeat, a non-finite value, or fewer than
+/// two entries. The strictness is load-bearing: a repeated value makes the
+/// bracketing search below able to answer with a *higher* index than the scan
+/// would have, and the scan's answer is what is on the glass.
+fn ring_rotation(axis: &[f64]) -> Option<usize> {
+    if axis.len() < 2 || axis.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let mut rotation = 0usize;
+    let mut breaks = 0usize;
+    for i in 1..axis.len() {
+        if axis[i] <= axis[i - 1] {
+            breaks += 1;
+            if breaks > 1 {
+                return None;
+            }
+            rotation = i;
+        }
+    }
+    Some(rotation)
+}
+
+/// [`nearest_on_axis`] with `|a - v|` over a strictly monotonic axis, by
+/// bisection.
+///
+/// Identical to the scan, and the tie rule is why the comparison below is
+/// `<=`: `nearest_on_axis` keeps the FIRST index that beats every earlier one,
+/// so where two entries are equidistant it answers the lower of them.
+fn monotone_nearest(axis: &[f64], v: f64, ascending: bool) -> Option<usize> {
+    // A non-finite query makes every distance `NaN`, and `NaN < best` is
+    // false at every step, so the scan answers `None`. Say the same.
+    if axis.is_empty() || !v.is_finite() {
+        return None;
+    }
+    let above = if ascending {
+        axis.partition_point(|&a| a < v)
+    } else {
+        axis.partition_point(|&a| a > v)
+    };
+    match (above.checked_sub(1), axis.get(above)) {
+        (None, _) => Some(0),
+        (Some(below), None) => Some(below),
+        (Some(below), Some(&at)) => {
+            let (d_below, d_at) = ((axis[below] - v).abs(), (at - v).abs());
+            Some(if d_below <= d_at { below } else { above })
+        }
+    }
+}
+
+/// [`nearest_on_axis`] with [`longitude_distance`] over a rotated ascending
+/// ring, by bisection.
+///
+/// **Why three targets and two runs.** The ring is two strictly ascending runs
+/// — `..rotation` and `rotation..` — and inside one of those the plain
+/// distance `|a - w|` is strictly V-shaped, so its minimisers are exactly the
+/// two entries bracketing `w`. The angular distance to `lon` is the plain
+/// distance to whichever of `lon - 360`, `lon` and `lon + 360` is closer, so
+/// every index that attains the angular minimum is a bracketing entry of one
+/// of those three targets in one of the two runs. Collecting all of them and
+/// then scoring each with the real [`longitude_distance`] answers with the
+/// same index the scan answers with, ties included.
+fn ring_nearest(axis: &[f64], rotation: usize, lon: f64) -> Option<usize> {
+    if axis.is_empty() {
+        return None;
+    }
+    let runs: [(usize, usize); 2] = [(0, rotation), (rotation, axis.len())];
+    let mut best: Option<(f64, usize)> = None;
+    for target in [lon - 360.0, lon, lon + 360.0] {
+        for (start, end) in runs {
+            let run = &axis[start..end];
+            if run.is_empty() {
+                continue;
+            }
+            let above = run.partition_point(|&a| a < target);
+            for candidate in [above.checked_sub(1), (above < run.len()).then_some(above)]
+                .into_iter()
+                .flatten()
+            {
+                let index = start + candidate;
+                let d = longitude_distance(axis[index], lon);
+                if best.is_none_or(|(best_d, best_i)| d < best_d || (d == best_d && index < best_i))
+                {
+                    best = Some((d, index));
+                }
+            }
+        }
+    }
+    best.map(|(_, index)| index)
 }
 
 /// Whether `axis` is strictly monotonic, and ascending if so.
@@ -1315,11 +1509,11 @@ fn axis_bracket(axis: &[f64], lo: f64, hi: f64) -> (f64, f64) {
 /// box that does walk over it covers two disjoint runs, and the honest single
 /// interval is then the whole axis: not narrower than the truth, which is what
 /// the window contract asks for.
-fn lon_axis_bracket(axis: &[f64], lo: f64, hi: f64) -> (f64, f64) {
+fn lon_axis_bracket(axis: &[f64], facts: &SeparableFacts, lo: f64, hi: f64) -> (f64, f64) {
     let whole = (0.0, axis.len().saturating_sub(1) as f64);
     // The wrap test of `GridCoords::wraps_longitude`'s `Separable` arm, asked
     // of the axis itself: below it the arithmetic search is the right one.
-    if separable_lon_span(axis) + 2.0 * separable_lon_step(axis) < 360.0 {
+    if facts.lon_span + 2.0 * facts.lon_step < 360.0 {
         return axis_bracket(axis, lo, hi);
     }
     // At most one backward step, so the axis really does sweep east once
@@ -1333,10 +1527,7 @@ fn lon_axis_bracket(axis: &[f64], lo: f64, hi: f64) -> (f64, f64) {
     {
         return whole;
     }
-    let (Some(a), Some(b)) = (
-        nearest_on_axis(axis, lo, longitude_distance),
-        nearest_on_axis(axis, hi, longitude_distance),
-    ) else {
+    let (Some(a), Some(b)) = (facts.nearest_lon(axis, lo), facts.nearest_lon(axis, hi)) else {
         return whole;
     };
     if a > b {
@@ -1362,8 +1553,22 @@ fn nearest_on_axis(axis: &[f64], v: f64, distance: impl Fn(f64, f64) -> f64) -> 
 }
 
 /// Shortest angular separation between two longitudes, in degrees.
+///
+/// **The reduction is guarded rather than unconditional**, and the guard is
+/// the whole of this function's cost. `f64::rem` is not an instruction on
+/// x86-64: it lowers to a call into `fmod`, ~165 of the ~460 thousand
+/// instructions one `hover_value_at` over a GMGSI granule used to cost,
+/// because the column search calls this once per column and GMGSI has five
+/// thousand of them. Every separation below a turn is already reduced, which
+/// is every pair of longitudes either axis and any pointer can produce, so the
+/// call is skipped there and kept for the values that need it. Bit-identical
+/// either way: `d % 360.0` is `d` for `0 <= d < 360`, and `NaN`, an infinity
+/// and anything at or above a turn still take the original path.
 fn longitude_distance(a: f64, b: f64) -> f64 {
-    let d = (a - b).abs() % 360.0;
+    let mut d = (a - b).abs();
+    if d >= 360.0 {
+        d %= 360.0;
+    }
     d.min(360.0 - d)
 }
 
@@ -1450,12 +1655,25 @@ fn regular_index_of(i: usize, j: usize, ni: usize, nj: usize, scan_mode: u8) -> 
 }
 
 impl GridCoords {
+    /// A [`GridCoords::Separable`] over the two axes, with its shape not yet
+    /// worked out. The one door, so no caller has to name the memo beside
+    /// them.
+    pub fn separable(lat_axis: Vec<f64>, lon_axis: Vec<f64>) -> Self {
+        GridCoords::Separable {
+            lat_axis,
+            lon_axis,
+            index: SeparableIndex::default(),
+        }
+    }
+
     pub fn len(&self) -> usize {
         match self {
             GridCoords::Lambert(g) => g.len(),
             GridCoords::Regular { ni, nj, .. } => ni * nj,
             GridCoords::Explicit { lats, lons } => lats.len().min(lons.len()),
-            GridCoords::Separable { lat_axis, lon_axis } => lat_axis.len() * lon_axis.len(),
+            GridCoords::Separable {
+                lat_axis, lon_axis, ..
+            } => lat_axis.len() * lon_axis.len(),
         }
     }
 
@@ -1480,7 +1698,9 @@ impl GridCoords {
             }
             GridCoords::Explicit { lats, lons } => Some((*lats.get(index)?, *lons.get(index)?)),
             // Row-major, longitude fastest -- see the variant's own doc.
-            GridCoords::Separable { lat_axis, lon_axis } => {
+            GridCoords::Separable {
+                lat_axis, lon_axis, ..
+            } => {
                 let nx = lon_axis.len();
                 if nx == 0 {
                     return None;
@@ -1558,7 +1778,11 @@ impl GridCoords {
             // The same row-major precondition the two arms above state, for the
             // same reason: the caller steps `index ± 1` and `index ± ni`, which
             // is this arm's ordering only at this arm's own shape.
-            GridCoords::Separable { lat_axis, lon_axis } => {
+            GridCoords::Separable {
+                lat_axis,
+                lon_axis,
+                index,
+            } => {
                 if lon_axis.len() != ni
                     || lat_axis.len() != nj
                     || bounds.min_lat > bounds.max_lat
@@ -1571,8 +1795,10 @@ impl GridCoords {
                 // then neither its values nor the box's are on one scale. A
                 // window that is merely *not narrower* than the truth is
                 // correct; one that is narrower silently crops the raster.
+                let facts = index.facts(lat_axis, lon_axis);
                 let (j_min, j_max) = axis_bracket(lat_axis, bounds.min_lat, bounds.max_lat);
-                let (i_min, i_max) = lon_axis_bracket(lon_axis, bounds.min_lon, bounds.max_lon);
+                let (i_min, i_max) =
+                    lon_axis_bracket(lon_axis, facts, bounds.min_lon, bounds.max_lon);
                 Some((i_min, i_max, j_min, j_max))
             }
             _ => None,
@@ -1591,8 +1817,14 @@ impl GridCoords {
             // The latitude step is *local*: GMGSI's rows span 0.029° at the
             // equator and 0.068° at the top of the grid, so a single global
             // figure would under-cover one end or over-cover the other.
-            GridCoords::Separable { lat_axis, lon_axis } => {
-                let dlat = nearest_on_axis(lat_axis, lat, |a, b| (a - b).abs())
+            GridCoords::Separable {
+                lat_axis,
+                lon_axis,
+                index,
+            } => {
+                let facts = index.facts(lat_axis, lon_axis);
+                let dlat = facts
+                    .nearest_lat(lat_axis, lat)
                     .map(|j| {
                         let lo = j.saturating_sub(1);
                         let hi = (j + 1).min(lat_axis.len() - 1);
@@ -1601,7 +1833,7 @@ impl GridCoords {
                             .max((lat_axis[hi] - lat_axis[j]).abs())
                     })
                     .unwrap_or(0.0);
-                Some(dlat.max(separable_lon_step(lon_axis)))
+                Some(dlat.max(facts.lon_step))
             }
         }
     }
@@ -1617,8 +1849,13 @@ impl GridCoords {
             // GMGSI spans 359.928° in 5000 columns of 0.0720089°, so the seam
             // between its last column and its first is one ordinary cell wide
             // and the raster must be allowed to close across it.
-            GridCoords::Separable { lon_axis, .. } => {
-                separable_lon_span(lon_axis) + 2.0 * separable_lon_step(lon_axis) >= 360.0
+            GridCoords::Separable {
+                lat_axis,
+                lon_axis,
+                index,
+            } => {
+                let facts = index.facts(lat_axis, lon_axis);
+                facts.lon_span + 2.0 * facts.lon_step >= 360.0
             }
         }
     }
@@ -1665,13 +1902,14 @@ impl GridCoords {
                 Some((lon0.min(far), lon0.max(far)))
             }
             GridCoords::Explicit { .. } => None,
-            GridCoords::Separable { lon_axis, .. } => {
-                let (west, east) = lon_axis
-                    .iter()
-                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
-                        (lo.min(v), hi.max(v))
-                    });
-                (west.is_finite() && east.is_finite()).then_some((west, east))
+            GridCoords::Separable {
+                lat_axis,
+                lon_axis,
+                index,
+            } => {
+                let facts = index.facts(lat_axis, lon_axis);
+                (facts.lon_min.is_finite() && facts.lon_max.is_finite())
+                    .then_some((facts.lon_min, facts.lon_max))
             }
         }
     }
@@ -1719,9 +1957,14 @@ impl GridCoords {
             // where `Explicit` at GMGSI's size would be 15,000,000. Longitude
             // is compared the short way round so a query just east of the
             // antimeridian finds column 0 rather than the far side of the grid.
-            GridCoords::Separable { lat_axis, lon_axis } => {
-                let j = nearest_on_axis(lat_axis, lat, |a, b| (a - b).abs())?;
-                let i = nearest_on_axis(lon_axis, lon, longitude_distance)?;
+            GridCoords::Separable {
+                lat_axis,
+                lon_axis,
+                index,
+            } => {
+                let facts = index.facts(lat_axis, lon_axis);
+                let j = facts.nearest_lat(lat_axis, lat)?;
+                let i = facts.nearest_lon(lon_axis, lon)?;
                 Some(j * lon_axis.len() + i)
             }
         }
@@ -2328,5 +2571,245 @@ mod tests {
         assert_eq!(all, 3);
         let (none, _) = summarize_values(&values, |_| false);
         assert_eq!(none, 0);
+    }
+}
+
+/// **The bisection answers what the scan answered, on every axis shape and
+/// every query the app can produce.**
+///
+/// [`SeparableFacts::nearest_lat`] and [`SeparableFacts::nearest_lon`] replaced
+/// a linear pass over the axis with a bisection, and the value they pick is a
+/// number the pointer readout puts on the glass. So the oracle here is the
+/// **scan itself**, copied in, and the property is equality of the *index* —
+/// not of the distance, and not "close enough": two columns a cell apart hold
+/// different pixels.
+///
+/// The queries below carry the properties the win depends on being reachable:
+/// a query in the middle of a run, a query outside both ends, a query exactly
+/// on an entry, a query on either side of a ring's seam, and a query stated a
+/// turn away from the axis's own frame. The axes carry the shapes: GMGSI's own
+/// rotated ring, a plain ascending axis, a descending axis, an axis that steps
+/// back twice, and an axis holding a repeat — the last two being the shapes the
+/// bisection must *refuse* and hand back to the scan.
+#[cfg(test)]
+mod separable_bisection_agrees_with_the_scan {
+    use super::*;
+
+    /// The pass this replaced, verbatim, as the oracle.
+    fn scan(axis: &[f64], v: f64, distance: impl Fn(f64, f64) -> f64) -> Option<usize> {
+        let mut best = None;
+        let mut best_d = f64::MAX;
+        for (i, &a) in axis.iter().enumerate() {
+            let d = distance(a, v);
+            if d < best_d {
+                best_d = d;
+                best = Some(i);
+            }
+        }
+        best
+    }
+
+    /// GMGSI's real longitude axis shape: 5,000 columns stepping 0.0720089
+    /// east, with the seam between column 0 and column 1.
+    fn gmgsi_lon() -> Vec<f64> {
+        let mut axis = vec![179.999_61_f64];
+        axis.extend((1..5000).map(|i| -179.928_38 + (i - 1) as f64 * 0.072_008_9));
+        axis
+    }
+
+    /// GMGSI's real latitude axis shape: uniform in Mercator y, north to south.
+    fn gmgsi_lat() -> Vec<f64> {
+        let y = |deg: f64| {
+            (deg.to_radians() / 2.0 + std::f64::consts::FRAC_PI_4)
+                .tan()
+                .ln()
+        };
+        let (top, bottom) = (y(81.0), y(-81.0));
+        (0..3000)
+            .map(|j| {
+                let yj = top + (bottom - top) * j as f64 / 2999.0;
+                (2.0 * yj.exp().atan() - std::f64::consts::FRAC_PI_2).to_degrees()
+            })
+            .collect()
+    }
+
+    /// Every longitude axis shape the fast path must handle or refuse, named.
+    fn lon_axes() -> Vec<(&'static str, Vec<f64>)> {
+        vec![
+            ("gmgsi ring", gmgsi_lon()),
+            (
+                "plain ascending",
+                (0..64).map(|i| -100.0 + i as f64 * 0.25).collect(),
+            ),
+            (
+                "descending",
+                (0..64).map(|i| 100.0 - i as f64 * 0.25).collect(),
+            ),
+            ("two steps back", vec![0.0, 1.0, 0.5, 1.5, 1.0, 2.0]),
+            ("holds a repeat", vec![0.0, 1.0, 1.0, 2.0, 3.0]),
+            ("one entry", vec![7.0]),
+            ("empty", Vec::new()),
+            ("holds a NaN", vec![0.0, f64::NAN, 2.0]),
+            (
+                "equidistant pair",
+                vec![-1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            ),
+        ]
+    }
+
+    fn lon_queries() -> Vec<f64> {
+        let mut qs = vec![
+            -97.28,
+            0.0,
+            0.5,
+            1.5,
+            179.999_61,
+            -179.928_38,
+            179.99,
+            -179.99,
+            180.0,
+            -180.0,
+            100.0,
+            -100.0,
+            7.0,
+            2.5,
+        ];
+        // Stated a turn away from the axis's own frame, which is what
+        // `walkers` hands out at low zoom.
+        qs.extend([185.0, -185.0, 400.0, -400.0, 540.0]);
+        // Dense, so a tie or an off-by-one anywhere in a run is reachable.
+        qs.extend((0..200).map(|i| -180.0 + i as f64 * 1.8));
+        qs.push(f64::NAN);
+        qs.push(f64::INFINITY);
+        qs
+    }
+
+    #[test]
+    fn the_longitude_bisection_picks_the_index_the_scan_picks() {
+        let lat_axis = vec![10.0, 9.0, 8.0];
+        let mut checked = 0u32;
+        for (name, lon_axis) in lon_axes() {
+            let coords = GridCoords::separable(lat_axis.clone(), lon_axis.clone());
+            let GridCoords::Separable { index, .. } = &coords else {
+                unreachable!("built as separable")
+            };
+            let facts = index.facts(&lat_axis, &lon_axis);
+            for lon in lon_queries() {
+                let want = scan(&lon_axis, lon, longitude_distance);
+                let got = facts.nearest_lon(&lon_axis, lon);
+                assert_eq!(
+                    got, want,
+                    "{name} axis, longitude {lon}: the bisection answered \
+                     column {got:?} where the scan answers column {want:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 9 * 20,
+            "only {checked} (axis, query) pairs were compared; this fixture is \
+             not covering the shapes it names"
+        );
+    }
+
+    #[test]
+    fn the_latitude_bisection_picks_the_index_the_scan_picks() {
+        let axes: Vec<(&str, Vec<f64>)> = vec![
+            ("gmgsi", gmgsi_lat()),
+            (
+                "ascending",
+                (0..64).map(|j| -40.0 + j as f64 * 1.25).collect(),
+            ),
+            (
+                "descending",
+                (0..64).map(|j| 40.0 - j as f64 * 1.25).collect(),
+            ),
+            ("holds a repeat", vec![0.0, 1.0, 1.0, 2.0]),
+            ("not monotonic", vec![0.0, 5.0, 1.0, 9.0]),
+            ("one entry", vec![7.0]),
+            ("empty", Vec::new()),
+            ("equidistant pair", vec![0.0, 2.0, 4.0, 6.0]),
+        ];
+        let lon_axis = vec![-1.0, 0.0, 1.0];
+        let mut queries: Vec<f64> = vec![
+            35.33, 0.0, 1.0, 7.0, 81.0, -81.0, 90.0, -90.0, 3.0, 5.0, 1e9, -1e9,
+        ];
+        queries.extend((0..200).map(|i| -90.0 + i as f64 * 0.9));
+        queries.push(f64::NAN);
+        for (name, lat_axis) in axes {
+            let coords = GridCoords::separable(lat_axis.clone(), lon_axis.clone());
+            let GridCoords::Separable { index, .. } = &coords else {
+                unreachable!("built as separable")
+            };
+            let facts = index.facts(&lat_axis, &lon_axis);
+            for &lat in &queries {
+                let want = scan(&lat_axis, lat, |a, b| (a - b).abs());
+                let got = facts.nearest_lat(&lat_axis, lat);
+                assert_eq!(
+                    got, want,
+                    "{name} axis, latitude {lat}: the bisection answered row \
+                     {got:?} where the scan answers row {want:?}"
+                );
+            }
+        }
+    }
+
+    /// **The two axis-derived scalars are the numbers the folds returned.**
+    ///
+    /// `cell_span_degrees` pads the projection window and `wraps_longitude`
+    /// decides whether a raster may close across the seam, so a memo that
+    /// rounded either would move pixels rather than cost.
+    #[test]
+    fn the_memo_holds_the_figures_the_folds_returned() {
+        for (name, lon_axis) in lon_axes() {
+            let lat_axis = gmgsi_lat();
+            let coords = GridCoords::separable(lat_axis.clone(), lon_axis.clone());
+            let GridCoords::Separable { index, .. } = &coords else {
+                unreachable!("built as separable")
+            };
+            let facts = index.facts(&lat_axis, &lon_axis);
+            assert_eq!(
+                facts.lon_span,
+                separable_lon_span(&lon_axis),
+                "{name}: memoised span"
+            );
+            assert_eq!(
+                facts.lon_step,
+                separable_lon_step(&lon_axis),
+                "{name}: memoised step"
+            );
+            let (west, east) = lon_axis
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                    (lo.min(v), hi.max(v))
+                });
+            assert_eq!(
+                (facts.lon_min, facts.lon_max),
+                (west, east),
+                "{name}: frame"
+            );
+        }
+    }
+
+    /// **A whole grid answers what it answered**, through the public doors the
+    /// hover readout actually calls, rather than through the two helpers above.
+    #[test]
+    fn a_gmgsi_shaped_grid_answers_the_same_cell_for_a_pointer_anywhere() {
+        let (lat_axis, lon_axis) = (gmgsi_lat(), gmgsi_lon());
+        let coords = GridCoords::separable(lat_axis.clone(), lon_axis.clone());
+        let nx = lon_axis.len();
+        let mut moved = 0u32;
+        for i in 0..97 {
+            for j in 0..29 {
+                let lat = 81.0 - i as f64 * 1.67;
+                let lon = -180.0 + j as f64 * 12.41;
+                let want = scan(&lat_axis, lat, |a, b| (a - b).abs())
+                    .zip(scan(&lon_axis, lon, longitude_distance))
+                    .map(|(row, col)| row * nx + col);
+                assert_eq!(coords.nearest(lat, lon), want, "pointer at ({lat}, {lon})");
+                moved += 1;
+            }
+        }
+        assert!(moved > 2_000, "only {moved} pointer positions were asked");
     }
 }

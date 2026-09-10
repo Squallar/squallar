@@ -98,6 +98,7 @@ fn grid() -> GriddedInput {
                 coords: crate::hrrr::GridCoords::Separable {
                     lat_axis: lat_axis(),
                     lon_axis: lon_axis(),
+                    index: crate::hrrr::SeparableIndex::default(),
                 },
                 // Every point a real reading, so no cell can decline for want
                 // of a value. `color_for` paints the whole 0..255 count range.
@@ -499,6 +500,7 @@ fn a_hole_in_the_mosaic_is_a_different_blank_from_a_pan_off_the_grid() {
         coords: crate::hrrr::GridCoords::Separable {
             lat_axis: lat_axis(),
             lon_axis: lon_axis(),
+            index: crate::hrrr::SeparableIndex::default(),
         },
         // `render::gridded::color_for`'s non-finite guard paints NaN fully
         // transparent, which is how an absent GMGSI point is stored.

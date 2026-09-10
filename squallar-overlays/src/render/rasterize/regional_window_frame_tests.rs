@@ -80,6 +80,7 @@ fn regional_separable() -> GridCoords {
     let coords = GridCoords::Separable {
         lat_axis: (0..100).map(|j| 50.0 - j as f64 * 0.5).collect(),
         lon_axis: (0..200).map(|i| -120.0 + i as f64 * 0.25).collect(),
+        index: crate::hrrr::SeparableIndex::default(),
     };
     assert!(!coords.wraps_longitude());
     coords

@@ -2114,7 +2114,9 @@ fn encode_grid_coords(out: &mut Vec<u8>, coords: &crate::hrrr::GridCoords) {
                 out.extend_from_slice(&v.to_le_bytes());
             }
         }
-        GridCoords::Separable { lat_axis, lon_axis } => {
+        GridCoords::Separable {
+            lat_axis, lon_axis, ..
+        } => {
             out.push(GRID_COORDS_SEPARABLE);
             // Two counts for the same reason the explicit arm writes two: the
             // axes are independent lengths, and here they are the grid's two
@@ -2212,7 +2214,7 @@ fn decode_grid_coords(r: &mut Reader) -> Option<crate::hrrr::GridCoords> {
             let lat_axis = decode_f64s(r, lat_count)?;
             let lon_count = r.u32()? as usize;
             let lon_axis = decode_f64s(r, lon_count)?;
-            Some(GridCoords::Separable { lat_axis, lon_axis })
+            Some(GridCoords::separable(lat_axis, lon_axis))
         }
         _ => None,
     }
@@ -3861,6 +3863,7 @@ mod tests {
         let coords = crate::hrrr::GridCoords::Separable {
             lat_axis: vec![55.0, 54.5, 53.0],
             lon_axis: vec![-129.995, -129.0, -128.5, -120.25],
+            index: crate::hrrr::SeparableIndex::default(),
         };
         let job = DescribedJob::new(GriddedInput::Window(GridWindow {
             field: crate::hrrr::fields::spec(crate::hrrr::ModelParameter::SurfaceBasedCape)
@@ -3886,7 +3889,10 @@ mod tests {
         assert_eq!(bytes[0], super::GRID_COORDS_SEPARABLE);
         let back = super::decode_grid_coords(&mut Reader::new(&bytes))
             .expect("the arm this build writes decodes");
-        let crate::hrrr::GridCoords::Separable { lat_axis, lon_axis } = back else {
+        let crate::hrrr::GridCoords::Separable {
+            lat_axis, lon_axis, ..
+        } = back
+        else {
             panic!("tag 4 must decode as Separable");
         };
         assert_eq!(lat_axis, vec![55.0, 54.5, 53.0]);

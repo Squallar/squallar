@@ -319,7 +319,7 @@ fn separable_grid(lat_axis: Vec<f64>, lon_axis: Vec<f64>) -> HrrrGridData {
     HrrrGridData {
         parameter,
         values,
-        coords: GridCoords::Separable { lat_axis, lon_axis },
+        coords: GridCoords::separable(lat_axis, lon_axis),
         ni,
         nj,
         bounds,

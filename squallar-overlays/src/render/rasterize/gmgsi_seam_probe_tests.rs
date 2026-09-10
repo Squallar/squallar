@@ -164,6 +164,7 @@ pub(super) fn grid(lon_axis: Vec<f64>, values: GridValues) -> GriddedInput {
         coords: crate::hrrr::GridCoords::Separable {
             lat_axis: lat_axis(),
             lon_axis,
+            index: crate::hrrr::SeparableIndex::default(),
         },
         values,
     }))

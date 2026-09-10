@@ -189,7 +189,7 @@ pub fn decode_in(
             field: FieldId::from_static(channel.as_str()),
             ni,
             nj,
-            coords: GridCoords::Separable { lat_axis, lon_axis },
+            coords: GridCoords::separable(lat_axis, lon_axis),
             values,
         },
         bounds,

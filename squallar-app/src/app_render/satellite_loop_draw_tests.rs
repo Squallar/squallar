@@ -109,6 +109,7 @@ fn satellite_granule(valid: chrono::NaiveDateTime, hour: i64) -> GmgsiGrid {
             coords: GridCoords::Separable {
                 lat_axis: (0..8).map(|j| 30.0 + f64::from(j) * 1.4).collect(),
                 lon_axis: (0..8).map(|i| -105.0 + f64::from(i) * 1.4).collect(),
+                index: squallar_overlays::hrrr::SeparableIndex::default(),
             },
             // Brightness temperatures a whole colour step apart, **inside the
             // band the IR ramp actually discriminates over**. The ramp is

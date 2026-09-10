@@ -371,6 +371,7 @@ fn gmgsi_grid() -> crate::gmgsi::decode::GmgsiGrid {
                 lon_axis: (0..ni)
                     .map(|i| step(BOUNDS.min_lon, BOUNDS.max_lon, ni, i))
                     .collect(),
+                index: crate::hrrr::SeparableIndex::default(),
             },
             values: crate::render::gridded::GridValues::F32(vec![255.0f32; ni * nj]),
         },

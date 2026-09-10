@@ -76,7 +76,9 @@ fn the_cold_mosaic_does_not_carry_the_poison_code(g: &decode::GmgsiGrid) {
 
 fn axes(g: &decode::GmgsiGrid) -> (&[f64], &[f64]) {
     match &g.grid.coords {
-        GridCoords::Separable { lat_axis, lon_axis } => (lat_axis, lon_axis),
+        GridCoords::Separable {
+            lat_axis, lon_axis, ..
+        } => (lat_axis, lon_axis),
         other => panic!("GMGSI must decode onto Separable, got {other:?}"),
     }
 }
