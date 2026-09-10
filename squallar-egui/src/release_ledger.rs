@@ -49,6 +49,22 @@
 //! A handler whose `resident_source_bytes` does not fall — every feature layer
 //! that releases a `Vec` the trait's default figure never counted — fires here
 //! with a zero byte delta, which is the honest reading rather than a silence.
+//!
+//! # Testing these counters
+//!
+//! They are process-global `static`s and
+//! [`crate::ui::Gui::release_data_of_layers_no_pane_draws`] writes to them on
+//! **every frame**, so any test in a binary that drives a frame shares them
+//! with a live writer running on another thread.
+//!
+//! **Reading a delta instead of a level does not make that safe.** A delta is
+//! immune to whatever the counters held *before* the window and completely
+//! defenceless against anything written *inside* it, which is precisely what a
+//! concurrently scheduled frame is. A test that needs an exact difference
+//! needs a process with no frame driver in it — put it in its own file under
+//! `tests/`, as `tests/release_ledger_fire_is_an_ask.rs` does. Widening its
+//! assertion to `>=` instead would only hide the collision, and would stop the
+//! test detecting the lost fire it exists for.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -128,22 +144,11 @@ pub fn totals_if_moved() -> Option<Totals> {
 mod tests {
     use super::*;
 
-    /// **A fire is an ask too**, so `fires <= asks` holds without the caller
-    /// having to remember two calls — the shape that would otherwise let a
-    /// leg report more releases than the pass made.
-    ///
-    /// Read as deltas, not levels: this ledger is process-global and the test
-    /// binary's other tests write to it.
-    #[test]
-    fn a_fire_counts_as_an_ask_and_carries_its_bytes() {
-        let before = totals();
-        note_ask();
-        note_fire(11_109_496);
-        let after = totals();
-        assert_eq!(after.asks - before.asks, 2, "one plain ask and one fire");
-        assert_eq!(after.fires - before.fires, 1);
-        assert_eq!(after.bytes - before.bytes, 11_109_496);
-    }
+    // `a_fire_counts_as_an_ask_and_carries_its_bytes` is deliberately NOT here.
+    // It reads the counters twice and asserts an exact difference, and this
+    // binary drives frames — so the production writer runs inside its window.
+    // It lives in `tests/release_ledger_fire_is_an_ask.rs`, whose process
+    // drives none. See this module's doc.
 
     /// **`asks` is deliberately outside `progress`.** A pass that asked and
     /// released nothing must not make the telemetry writer emit a line — see
