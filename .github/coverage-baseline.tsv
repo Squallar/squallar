@@ -244,7 +244,7 @@ squallar-overlays/src/render/handlers/location.rs	76	58
 squallar-overlays/src/render/handlers/metar.rs	637	522
 squallar-overlays/src/render/handlers/mod.rs	172	170
 squallar-overlays/src/render/handlers/model.rs	2751	2582
-squallar-overlays/src/render/handlers/mrms.rs	699	627
+squallar-overlays/src/render/handlers/mrms.rs	699	628
 squallar-overlays/src/render/handlers/outlook.rs	1676	1620
 squallar-overlays/src/render/handlers/reports.rs	768	700
 squallar-overlays/src/render/handlers/sites.rs	98	80
