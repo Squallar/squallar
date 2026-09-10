@@ -1958,6 +1958,21 @@ impl PointExtentPainter {
 const AA_FRINGE_TEXELS: f32 = 1.0;
 
 impl crate::render::draw::PointPainter for PointExtentPainter {
+    /// **The same answer [`PixmapPointPainter`] gives, and it has to be.**
+    ///
+    /// `wants_geometry` is a capability a point model asks *before* it builds a
+    /// symbol, so a painter answering `false` is handed less geometry than one
+    /// answering `true`. This painter exists to measure the box the pixmap
+    /// painter will draw into; if the two disagreed here, the window would be
+    /// cut from one set of shapes and painted with another — the station model
+    /// would be clipped at the edge of its own picture, and nothing in the tree
+    /// counts that. Written out rather than defaulted so the coupling is at
+    /// least visible; `a_measuring_painter_is_handed_what_the_pixmap_painter_is`
+    /// is what actually holds the two together.
+    fn wants_geometry(&self) -> bool {
+        true
+    }
+
     fn circle_filled(&mut self, offset: [f32; 2], radius: f32, _color: [u8; 4]) {
         let (x, y) = self.at(offset);
         self.grow(x, y, radius * self.scale + AA_FRINGE_TEXELS);

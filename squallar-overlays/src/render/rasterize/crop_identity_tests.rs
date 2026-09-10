@@ -777,3 +777,35 @@ fn coverage_is_cut_down_at_the_zoom_its_wash_is_for() {
          {worst} — inside what this gate tolerates",
     );
 }
+
+/// **The measuring painter and the painting painter are handed the same
+/// geometry.**
+///
+/// `PointPainter::wants_geometry` is a capability a point model asks before it
+/// builds a symbol at all, so two painters that answer it differently are shown
+/// different sets of shapes. `PointExtentPainter` measures the box
+/// `PixmapPointPainter` will paint into; if they disagreed, the window would be
+/// cut from one set and painted with another and a station would be clipped at
+/// the edge of its own picture — silently, because the picture is the right
+/// size and the byte figures are right.
+///
+/// The default is `true` and both take it today. This is what fails the day one
+/// of them stops.
+#[test]
+fn a_measuring_painter_is_handed_what_the_pixmap_painter_is() {
+    use crate::render::draw::PointPainter;
+    let mut pixmap = tiny_skia::Pixmap::new(4, 4).expect("a pixmap");
+    let painting = PixmapPointPainter {
+        pixmap: &mut pixmap,
+        center: (0.0, 0.0),
+        scale: 1.0,
+    };
+    let measuring = PointExtentPainter::new(1.0);
+    assert_eq!(
+        measuring.wants_geometry(),
+        painting.wants_geometry(),
+        "the painter that measures a station model's extent and the painter \
+         that draws it disagree about whether they are shown geometry, so the \
+         window is cut from a different set of shapes than lands in it",
+    );
+}
