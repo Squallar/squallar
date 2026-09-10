@@ -359,12 +359,16 @@ impl super::Gui {
             .and_then(|readout| readout.pane_layers.get(pane_idx))
             .map_or(&[][..], Vec::as_slice);
         let view = pane.view(pane_idx);
-        pane.draw_order()
-            .map(|kind| {
+        // Over the slots: `draw_order` would give this walk an id it then sends
+        // back through the stack's position index to reach the very slot it
+        // came from, once per row per frame.
+        pane.slots()
+            .map(|slot| {
+                let kind = &slot.id;
                 let status = if *kind == known::RADAR {
                     radar_row_status(pane)
                 } else {
-                    self.overlays.status_line(kind, &view.layer(kind))
+                    self.overlays.status_line(kind, &view.layer_of(slot))
                 };
                 super::ui_stack::StackRowLines {
                     layer: kind.clone(),

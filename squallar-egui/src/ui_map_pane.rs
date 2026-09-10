@@ -2249,11 +2249,17 @@ pub(super) fn color_scale_gutter(
         slots = 1;
     }
     let view = pane.view(pane_idx);
-    for id in pane.draw_order() {
-        if *id == known::COLOR_SCALE || !pane.is_overlay_enabled(id) || !pane.color_bar_shown(id) {
+    // **Over the slots, not over the ids.** `draw_order` would hand this loop
+    // a `&LayerId` lifted out of a slot and then send it back through the
+    // stack's position index twice a layer — once for the enabled flag, once
+    // for the `PaneRef` — to arrive at the slot it was standing on. Every
+    // bar-measuring pane pays that per layer per frame.
+    for slot in pane.slots() {
+        let id = &slot.id;
+        if *id == known::COLOR_SCALE || !slot.enabled || !pane.color_bar_shown(id) {
             continue;
         }
-        let Some(overlay) = overlays.legend(id, &view.layer(id)) else {
+        let Some(overlay) = overlays.legend(id, &view.layer_of(slot)) else {
             continue;
         };
         if overlay.items.thresholds.len() < 2 {
@@ -3457,11 +3463,15 @@ fn render_overlay_color_scales(
     // `color_scale_gutter` measures.
     let mut slot = usize::from(radar_bar_drawn(pane));
 
-    for id in pane.draw_order() {
-        if !pane.is_overlay_enabled(id) || *id == known::COLOR_SCALE || !pane.color_bar_shown(id) {
+    // The slot list itself, for the reason `color_scale_gutter` walks it: the
+    // painter asks the same two slot-resolved questions per layer the measure
+    // does, and the two must place the bars identically.
+    for held in pane.slots() {
+        let id = &held.id;
+        if !held.enabled || *id == known::COLOR_SCALE || !pane.color_bar_shown(id) {
             continue;
         }
-        let Some(legend) = overlays.legend(id, &view.layer(id)) else {
+        let Some(legend) = overlays.legend(id, &view.layer_of(held)) else {
             continue;
         };
         if legend.items.thresholds.len() < 2 {

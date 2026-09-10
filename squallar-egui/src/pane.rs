@@ -1057,6 +1057,24 @@ impl<'a> PaneView<'a> {
         }
     }
 
+    /// [`Self::layer`] for a caller that already holds the slot — the walk
+    /// over [`PaneState::slots`], which has the element `layer` would have
+    /// gone looking for.
+    ///
+    /// `slot` must be one of this pane's own; nothing here checks, because
+    /// nothing here could: a `&LayerSlot` carries no evidence of where it came
+    /// from. The one caller shape that is safe is the one this exists for —
+    /// iterating the pane's own slot list.
+    pub fn layer_of(&'a self, slot: &'a LayerSlot) -> PaneRef<'a> {
+        PaneRef {
+            pane_idx: self.pane_idx,
+            config: &slot.config,
+            state: slot.state.as_deref().map(|s| s as &dyn Any),
+            loading_site: self.loading_site,
+            peers: &[],
+        }
+    }
+
     /// Which pane this is.
     pub fn pane_idx(&self) -> usize {
         self.pane_idx
@@ -2831,6 +2849,22 @@ impl PaneState {
         self.layers.iter().map(|slot| &slot.id)
     }
 
+    /// **The same list [`Self::draw_order`] walks, with each slot still
+    /// attached to its id** — for a walk that wants the layer's state as well
+    /// as its name.
+    ///
+    /// `draw_order` hands out `&LayerId`s taken *from* the slots, and a caller
+    /// that then asks [`Self::is_overlay_enabled`] or [`PaneView::layer`]
+    /// about one of them sends that id back through
+    /// `LayerStack::position_of` to find the slot it was just standing on.
+    /// The index makes that cheap; it does not make it free, and the walks
+    /// that do it make two or three such round trips per layer per pane per
+    /// frame. Iterating the slots skips the round trip entirely: the answer is
+    /// the element in hand.
+    pub fn slots(&self) -> impl DoubleEndedIterator<Item = &LayerSlot> + ExactSizeIterator + '_ {
+        self.layers.iter()
+    }
+
     /// The draw order as an owned list, for the callers that reorder it or
     /// hold it across a borrow of the pane.
     pub fn draw_order_vec(&self) -> Vec<LayerId> {
@@ -3405,7 +3439,7 @@ impl PaneState {
             };
             let view = PaneRef {
                 pane_idx,
-                config: &slot.config,
+                config: &serde_json::Value::Null,
                 state: Some(state as &dyn Any),
                 loading_site: None,
                 peers: &[],
