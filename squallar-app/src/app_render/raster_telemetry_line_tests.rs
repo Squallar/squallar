@@ -151,6 +151,17 @@ fn the_rig_reads_the_lines_the_app_actually_writes() {
          the counters it names",
     );
     assert_eq!(
+        super::overlay_window_line(&rasters),
+        "overlay windows: 3 cropped, 5 whole, 41940480 B saved",
+        "the `overlay windows:` line's fields have moved. This is the fires \
+         counter for the bounding-box rasters — the figure that says whether \
+         that mechanism ran at all — and nothing else in the tree would say \
+         so if it stopped. Three distinct values, so a transposition cannot \
+         read as correct, and the saving is not `cropped * anything`: it is a \
+         sum of per-picture differences and a line that derived it would agree \
+         with itself.",
+    );
+    assert_eq!(
         super::overlay_raster_line(&rasters),
         rendered(
             &pattern("rasters_re"),

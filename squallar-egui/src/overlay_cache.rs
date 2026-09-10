@@ -2346,3 +2346,9 @@ mod gesture_dispatch_tests;
 /// needs no brake of its own while a raster is already in flight.
 #[cfg(test)]
 mod resize_arm_tests;
+
+/// **Where a window lands on the glass**, and the two things the placement may
+/// not do: move a whole picture, or fold a window somewhere its picture did
+/// not.
+#[cfg(test)]
+mod crop_placement_tests;
