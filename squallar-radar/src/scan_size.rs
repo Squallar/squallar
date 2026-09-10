@@ -165,20 +165,43 @@ pub const SCAN_METADATA_BLOCKS: usize = 3;
 /// The host bytes `scan` is holding. See the module note for the three terms
 /// and for the one residual that is not in them.
 pub fn scan_bytes(scan: &Scan) -> usize {
+    scan_bytes_and_blocks(scan).0
+}
+
+/// **The same walk, reporting the block count beside the byte count.**
+///
+/// `blocks` is exactly the set of allocations [`scan_bytes`] charged
+/// [`ALLOCATOR_BLOCK_OVERHEAD`] for: the sweep vector, the scan's own
+/// metadata, one radial vector per sweep and one gate buffer per non-empty
+/// moment. It is the answer to "how many allocations is this volume", which
+/// a byte figure alone cannot give — 95.9 % of a decoded volume's bytes are
+/// gate buffers and each is its own block, so a copy of one is tens of
+/// thousands of allocations as well as tens of megabytes.
+///
+/// **One walk, not two.** The caller that wants both is
+/// [`crate::chunks::VolumeAssembler::snapshot`], which pays exactly one pass
+/// over the volume per rebuild and must not pay a second to say how many
+/// blocks the pass just accounted for.
+pub fn scan_bytes_and_blocks(scan: &Scan) -> (usize, usize) {
     let capacity = scan.sweeps_capacity();
     if capacity == 0 {
         // No allocation was made for the sweep vector, so there is no block to
         // charge and no scan-level metadata to attribute to a volume that
         // holds nothing.
-        return 0;
+        return (0, 0);
     }
     let containers = capacity.saturating_mul(size_of::<Sweep>());
     let overhead = (1 + SCAN_METADATA_BLOCKS).saturating_mul(ALLOCATOR_BLOCK_OVERHEAD);
-    scan.sweeps()
-        .iter()
-        .fold(containers.saturating_add(overhead), |sum, sweep| {
-            sum.saturating_add(sweep_bytes(sweep))
-        })
+    scan.sweeps().iter().fold(
+        (
+            containers.saturating_add(overhead),
+            1 + SCAN_METADATA_BLOCKS,
+        ),
+        |(sum, blocks), sweep| {
+            let (b, n) = sweep_bytes_and_blocks(sweep);
+            (sum.saturating_add(b), blocks.saturating_add(n))
+        },
+    )
 }
 
 /// **The volume's price and each sweep's own, from one walk.**
@@ -225,25 +248,35 @@ pub fn scan_bytes_by_sweep(scan: &Scan) -> (usize, Vec<(u8, usize)>) {
 /// queue is told it holds and what the cache was told it released are the
 /// same bytes.
 pub fn sweep_bytes(sweep: &Sweep) -> usize {
+    sweep_bytes_and_blocks(sweep).0
+}
+
+/// One sweep's bytes and its block count, on [`scan_bytes_and_blocks`]'
+/// terms: the radial vector, and one gate buffer per non-empty moment.
+pub fn sweep_bytes_and_blocks(sweep: &Sweep) -> (usize, usize) {
     let capacity = sweep.radials_capacity();
     if capacity == 0 {
-        return 0;
+        return (0, 0);
     }
     let containers = capacity
         .saturating_mul(size_of::<Radial>())
         .saturating_add(ALLOCATOR_BLOCK_OVERHEAD);
-    sweep.radials().iter().fold(containers, |sum, radial| {
-        sum.saturating_add(radial_bytes(radial))
-    })
+    sweep
+        .radials()
+        .iter()
+        .fold((containers, 1usize), |(sum, blocks), radial| {
+            let (b, n) = radial_bytes_and_blocks(radial);
+            (sum.saturating_add(b), blocks.saturating_add(n))
+        })
 }
 
 /// The gate bytes one radial's moments are holding, and one allocator block
-/// apiece.
+/// apiece — the count returned beside them.
 ///
 /// The `Radial` struct's own size is charged by its owning sweep, with the
 /// rest of the `Vec`'s slots — charging it here as well would count every
 /// radial twice.
-fn radial_bytes(radial: &Radial) -> usize {
+fn radial_bytes_and_blocks(radial: &Radial) -> (usize, usize) {
     // Every moment a radial can carry, named rather than iterated: the model
     // has no iterator over them, and a moment added to the model later will
     // read as zero here until it is added to this list. That is the honest
@@ -256,11 +289,16 @@ fn radial_bytes(radial: &Radial) -> usize {
         radial.differential_phase(),
         radial.correlation_coefficient(),
     ];
-    let dual_pol = moments
-        .into_iter()
-        .flatten()
-        .fold(0usize, |sum, m| sum.saturating_add(gate_bytes(m)));
-    dual_pol.saturating_add(radial.clutter_filter_power().map_or(0, gate_bytes))
+    let (dual_pol, blocks) =
+        moments
+            .into_iter()
+            .flatten()
+            .fold((0usize, 0usize), |(sum, blocks), m| {
+                let b = gate_bytes(m);
+                (sum.saturating_add(b), blocks + usize::from(b > 0))
+            });
+    let cfp = radial.clutter_filter_power().map_or(0, gate_bytes);
+    (dual_pol.saturating_add(cfp), blocks + usize::from(cfp > 0))
 }
 
 /// One moment's gate buffer: its bytes, and the block holding them.

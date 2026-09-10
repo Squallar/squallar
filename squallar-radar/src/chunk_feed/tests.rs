@@ -484,3 +484,110 @@ fn ingest(
         .expect("a volume is being assembled")
         .ingest_contents(sequence, kind, chunk_time(), contents);
 }
+
+/// **Both arms of the rebuild counter, against the real bridge.**
+///
+/// `crate::chunks::rebuild_totals` is the only thing that can tell a landed
+/// ownership change from one that executes zero times, so it is gated on a
+/// rebuild that really copies and a rebuild that really moves — the same
+/// assembler, the same fixture, the bridge the only difference between them.
+/// A counter wired to a constant, or an arm nothing can reach, fails here.
+///
+/// Deltas and not absolutes: the totals are process-wide and this crate's
+/// lib-test binary is multi-threaded. `feed_level_serial::exclusive` covers
+/// the window, which is why `record_rebuild` writes through the same
+/// serialiser the byte level does.
+#[test]
+fn the_rebuild_counter_separates_a_copied_volume_from_a_moved_one() {
+    const SITE: &str = "KTLX";
+    let _exclusive = crate::chunks::feed_level_serial::exclusive();
+    let mut mgr = mgr_assembling(SITE);
+    ingest(&mut mgr, SITE, 1, ChunkKind::Start, start_chunk());
+    ingest(&mut mgr, SITE, 2, ChunkKind::Intermediate, cut(1, 0.5));
+
+    // The frame thread's ask. It leaves the bridge holding the built volume,
+    // which is the second owner the next rebuild will find.
+    let first = mgr.snapshot(SITE).expect("a sealed cut is a volume");
+    let priced = first.bytes;
+    assert!(
+        priced > 1 << 20,
+        "fixture: the volume is priced at {priced} B, so a copy of it would \
+         not show up as a whole-volume copy",
+    );
+    drop(first);
+
+    // ---- the copy arm: the bridge is holding it -------------------------
+    let before = crate::chunks::rebuild_totals();
+    ingest(&mut mgr, SITE, 3, ChunkKind::Intermediate, cut(2, 0.9));
+    rebuild(&mut mgr, SITE);
+    let after_copy = crate::chunks::rebuild_totals();
+    assert_eq!(
+        after_copy.copies - before.copies,
+        1,
+        "a rebuild with the bridge holding the volume did not count as a copy",
+    );
+    assert_eq!(
+        after_copy.moves, before.moves,
+        "the move arm counted a rebuild that cloned the volume",
+    );
+    assert_eq!(
+        after_copy.copied_bytes - before.copied_bytes,
+        priced,
+        "the copy was priced at something other than what the volume holds",
+    );
+    assert!(
+        after_copy.copied_blocks - before.copied_blocks > 1_000,
+        "a whole cut of real gate arrays was copied in {} blocks; the block \
+         count is not counting gate buffers",
+        after_copy.copied_blocks - before.copied_blocks,
+    );
+
+    // ---- the move arm: nothing else holds it ----------------------------
+    // Exactly the counterfactual an ownership fix would create. It is done
+    // here by hand because no shipped path produces it: the rebuild runs
+    // inside a round, which is the window the bridge must be held.
+    mgr.feeds.get_mut(SITE).expect("ensured").last_snapshot = None;
+    assert!(
+        mgr.take_superseded().len() <= 1,
+        "the queue is drained so the superseded volumes it holds cannot be \
+         the second owner this half of the test is about",
+    );
+    let before_move = crate::chunks::rebuild_totals();
+    ingest(&mut mgr, SITE, 4, ChunkKind::Intermediate, cut(3, 1.3));
+    rebuild(&mut mgr, SITE);
+    let after_move = crate::chunks::rebuild_totals();
+    assert_eq!(
+        after_move.moves - before_move.moves,
+        1,
+        "a rebuild whose assembler was the volume's last owner still copied",
+    );
+    assert_eq!(
+        after_move.copies, before_move.copies,
+        "the copy arm counted a rebuild that moved the volume",
+    );
+    assert!(
+        after_move.moved_bytes - before_move.moved_bytes > 1 << 20,
+        "the move was priced at {} B, so nothing was reported as not copied",
+        after_move.moved_bytes - before_move.moved_bytes,
+    );
+    assert!(
+        after_move.moved_blocks - before_move.moved_blocks > 1_000,
+        "the move reported {} blocks not allocated",
+        after_move.moved_blocks - before_move.moved_blocks,
+    );
+}
+
+/// One rebuild on the poller's own terms, and the handle dropped immediately:
+/// a `Scan` kept alive here would be the second owner the next rebuild sees.
+fn rebuild(mgr: &mut ChunkFeedManager, site: &str) {
+    let built = mgr
+        .feeds
+        .get_mut(site)
+        .expect("ensured")
+        .poller
+        .as_mut()
+        .expect("the poller is home")
+        .snapshot()
+        .expect("a sealed cut");
+    drop(built);
+}

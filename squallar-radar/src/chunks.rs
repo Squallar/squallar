@@ -630,17 +630,19 @@ fn move_feed_level(was: u64, now: u64) {
 /// per assembler is open at a time — a sixteenth of a volume on a VCP 212.
 /// Nothing here ever prices bytes that have gone.
 ///
-/// **The one whole-volume under-count left is a rebuild a consumer forced.**
-/// `chunk_feed::SiteFeed::last_snapshot` holds an `Arc` of whatever
-/// [`VolumeAssembler::snapshot`] last handed out, to serve the frame thread
-/// while the poller is away on a round. At rest that is the same allocation
-/// the assembler holds, so it costs nothing extra and `cached_bytes` prices
-/// it. A round that seals while the bridge is holding it is the case
-/// [`VolumeAssembler::snapshot`] cannot move out of: it copies for that
-/// rebuild, and the old allocation — the bridge's, and the still inventory's
-/// where a round has delivered — is resident and not in this figure. It goes
-/// when they let go of it: the frame thread's next `ChunkFeedManager::snapshot`
-/// refreshes the bridge, and `still scans` prices the inventory's meanwhile.
+/// **The one whole-volume under-count left is a rebuild a consumer forced,
+/// and MEASURED it is every rebuild.** `chunk_feed::SiteFeed::last_snapshot`
+/// holds an `Arc` of whatever [`VolumeAssembler::snapshot`] last handed out,
+/// to serve the frame thread while the poller is away on a round; the still
+/// inventory holds the same `Arc` from the moment a round delivers. At rest
+/// those are the same allocation the assembler holds, so they cost nothing
+/// extra and `cached_bytes` prices them. A round that seals while they are
+/// holding it is the case [`VolumeAssembler::snapshot`] cannot move out of:
+/// it copies for that rebuild, and the old allocation is resident and not in
+/// this figure. On a 420 s HEAVY6 leg that was 156 of 156 rebuilds — see
+/// [`rebuild_totals`], which is the reading. It goes when they let go of it:
+/// the frame thread's next `ChunkFeedManager::snapshot` refreshes the bridge,
+/// and `still scans` prices the inventory's meanwhile.
 /// **Unbounded for a live site the frame thread stops asking about**, as
 /// before — but one volume rather than two, because the assembler no longer
 /// keeps a copy of its own besides.
@@ -652,6 +654,104 @@ fn move_feed_level(was: u64, now: u64) {
 pub fn feed_bytes() -> usize {
     usize::try_from(CHUNK_FEED_BYTES.load(std::sync::atomic::Ordering::Relaxed))
         .unwrap_or(usize::MAX)
+}
+
+/// **Rebuilds that moved the previous volume, and rebuilds that copied it.**
+///
+/// [`VolumeAssembler::snapshot`] takes the previous `Scan` apart with
+/// `Arc::try_unwrap`. When the assembler is the last owner the sweeps MOVE and
+/// the rebuild allocates nothing; when somebody else is holding it the sweeps
+/// are cloned — a whole decoded volume, tens of megabytes across tens of
+/// thousands of gate buffers, on the poller's thread.
+///
+/// Six running totals, always on, `Relaxed`: they are read against themselves
+/// on a telemetry tick, never against another thread's clock.
+static REBUILD_MOVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REBUILD_MOVED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REBUILD_MOVED_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REBUILD_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REBUILD_COPIED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REBUILD_COPIED_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What [`rebuild_totals`] answers. Bytes AND blocks, because a decoded
+/// volume's bytes are 95.9 % gate buffers at one block apiece: a figure in
+/// megabytes alone hides that the same copy is tens of thousands of
+/// allocations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RebuildTotals {
+    /// Rebuilds where `Arc::try_unwrap` succeeded and the sweeps moved.
+    pub moves: u64,
+    /// Bytes those moves did NOT copy — what the previous volume was priced at.
+    pub moved_bytes: u64,
+    /// Allocations those moves did not make.
+    pub moved_blocks: u64,
+    /// Rebuilds where another owner held the volume and the sweeps were cloned.
+    pub copies: u64,
+    /// Bytes those clones copied.
+    pub copied_bytes: u64,
+    /// Allocations those clones made.
+    pub copied_blocks: u64,
+}
+
+/// File one rebuild against [`rebuild_totals`], and say so at `debug`.
+///
+/// `owners` is the strong count the rebuild saw, `previous` included, so 1 is
+/// the sole-owner case the move arm needs and anything above it names how many
+/// other holders there were. It is on the line because the count is the whole
+/// diagnosis: which holder is second matters far less than whether removing
+/// any one of them could have got the count to 1.
+///
+/// Off the frame thread wherever a rebuild is — `ChunkPoller::warm_snapshot`
+/// runs inside a round — and one line per sealed cut per site, which is about
+/// one every sixteen seconds on a VCP 212.
+fn record_rebuild(site: &str, copied: bool, owners: usize, bytes: u64, blocks: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // Through the same serialiser the byte level uses, for the same reason: a
+    // test that brackets one rebuild with two reads of a process-wide counter
+    // is otherwise measuring every other thread's assemblers too. The shipped
+    // arm of `feed_level_serial` is an inlined call of the closure.
+    feed_level_serial::with_move(|| {
+        if copied {
+            REBUILD_COPIES.fetch_add(1, Relaxed);
+            REBUILD_COPIED_BYTES.fetch_add(bytes, Relaxed);
+            REBUILD_COPIED_BLOCKS.fetch_add(blocks, Relaxed);
+        } else {
+            REBUILD_MOVES.fetch_add(1, Relaxed);
+            REBUILD_MOVED_BYTES.fetch_add(bytes, Relaxed);
+            REBUILD_MOVED_BLOCKS.fetch_add(blocks, Relaxed);
+        }
+    });
+    let totals = rebuild_totals();
+    log::debug!(
+        "{site}: volume rebuild {} with {owners} owner(s), {bytes} B in {blocks} blocks; \
+         totals copied {} rebuilds / {} B / {} blocks, moved {} rebuilds / {} B / {} blocks",
+        if copied { "COPIED" } else { "moved" },
+        totals.copies,
+        totals.copied_bytes,
+        totals.copied_blocks,
+        totals.moves,
+        totals.moved_bytes,
+        totals.moved_blocks,
+    );
+}
+
+/// **Whether a rebuild moved the previous volume or had to copy it**, as
+/// running totals over the life of the process.
+///
+/// A rebuild that finds itself the volume's last owner costs nothing; one that
+/// finds a second owner clones every gate buffer in it. Both arms are counted,
+/// because a mechanism that never fires and one that always fires are
+/// indistinguishable from the arm that fired alone.
+pub fn rebuild_totals() -> RebuildTotals {
+    use std::sync::atomic::Ordering::Relaxed;
+    RebuildTotals {
+        moves: REBUILD_MOVES.load(Relaxed),
+        moved_bytes: REBUILD_MOVED_BYTES.load(Relaxed),
+        moved_blocks: REBUILD_MOVED_BLOCKS.load(Relaxed),
+        copies: REBUILD_COPIES.load(Relaxed),
+        copied_bytes: REBUILD_COPIED_BYTES.load(Relaxed),
+        copied_blocks: REBUILD_COPIED_BLOCKS.load(Relaxed),
+    }
 }
 
 /// **Move the feed level from a dependent crate's test.**
@@ -779,6 +879,9 @@ pub struct VolumeAssembler {
     /// Host bytes [`Self::cached`] holds — the volume itself, once, not a copy
     /// of it. Zero exactly when no snapshot has been built.
     cached_bytes: u64,
+    /// Allocations [`Self::cached`] holds, off the same walk that priced it —
+    /// what a rebuild forced to clone the volume allocates all over again.
+    cached_blocks: u64,
     /// Every cut's declared Nyquist velocity, accumulated across the chunks as
     /// they arrive. See [`Self::declared_nyquist`].
     declared_nyquist: crate::nyquist::DeclaredNyquist,
@@ -798,6 +901,7 @@ impl VolumeAssembler {
             staged: Default::default(),
             staged_bytes: 0,
             cached_bytes: 0,
+            cached_blocks: 0,
             coverage_pattern: None,
             saw_start_chunk: false,
             saw_scan_end: false,
@@ -1125,13 +1229,34 @@ impl VolumeAssembler {
     /// sweeps into the new one. One volume per live site, in one place —
     /// which place it is depends only on how much of it has been built.
     ///
-    /// **One case copies, and `try_unwrap` is what identifies it**: another
-    /// owner still holds the volume being rebuilt — the bridge
-    /// (`chunk_feed::SiteFeed::last_snapshot`), the still inventory, a pane.
-    /// Then this rebuild, and only this one, clones the sweeps out of the
-    /// shared `Scan`, so the second copy exists exactly while somebody else
-    /// legitimately holds the old volume and dies when they let go. It is the
-    /// same memcpy every rebuild used to pay unconditionally.
+    /// **The copy is not the exception — MEASURED, it is every rebuild.**
+    /// `try_unwrap` identifies the case where another owner still holds the
+    /// volume being rebuilt, and on a 420 s HEAVY6 leg (six live sites,
+    /// 2026-09-09) it failed on **156 of 156** rebuilds that had a previous
+    /// volume: 4,744.9 MiB cloned across 2,944,230 allocator blocks, a mean
+    /// 30.4 MiB and 18,873 blocks a rebuild. A second leg of the same arm read
+    /// 154 of 154 and 4,406.7 MiB. [`rebuild_totals`] is that reading, always
+    /// on, and the `debug` line beside it carries the per-rebuild figures and
+    /// the running totals together so a reader of either can check itself
+    /// against the other.
+    ///
+    /// **And the owner count says no single holder can be removed to fix it.**
+    /// The strong count seen at the rebuild, this `Arc` included, was **3 on
+    /// 135** of those 156 and 2 on the other 21 — of which 20 were volumes
+    /// priced at zero bytes. So exactly ONE rebuild in 156 had a second owner
+    /// that removing one holder could have made sole. The holders are the
+    /// bridge (`chunk_feed::SiteFeed::last_snapshot`), the still inventory
+    /// (`squallar-app`'s `install_still`, which clones this very `Arc` on
+    /// every applied round) and a pane.
+    ///
+    /// **Confining the bridge to the away window cannot help, by
+    /// construction.** Every copy was on `tokio-rt-worker` — inside a round,
+    /// which is precisely the window the poller is away and the bridge MUST be
+    /// held. The bridge is not a holder that overstays; it is a holder whose
+    /// whole purpose overlaps the rebuild. What would delete this copy is
+    /// making a `Sweep` clone cheap — 95.9 % of a volume's bytes are
+    /// per-(ray, moment) gate buffers at one block apiece — not moving
+    /// ownership around.
     ///
     /// **The warm path stays free**, which is what the frame thread's several
     /// calls a frame depend on; a build happens on the poller's thread, inside
@@ -1146,10 +1271,20 @@ impl VolumeAssembler {
         // owner when `try_unwrap` asks whether anybody else is one.
         let mut sweeps: Vec<nexrad_model::data::Sweep> = match self.cached.take() {
             None => Vec::new(),
-            Some(previous) => match std::sync::Arc::try_unwrap(previous) {
-                Ok(scan) => scan.into_sweeps(),
-                Err(shared) => shared.sweeps().to_vec(),
-            },
+            Some(previous) => {
+                let owners = std::sync::Arc::strong_count(&previous);
+                let (bytes, blocks) = (self.cached_bytes, self.cached_blocks);
+                match std::sync::Arc::try_unwrap(previous) {
+                    Ok(scan) => {
+                        record_rebuild(&self.site, false, owners, bytes, blocks);
+                        scan.into_sweeps()
+                    }
+                    Err(shared) => {
+                        record_rebuild(&self.site, true, owners, bytes, blocks);
+                        shared.sweeps().to_vec()
+                    }
+                }
+            }
         };
         sweeps.extend(std::mem::take(&mut self.staged).into_values());
         // Both sources are already ascending and a cut seals once, so this
@@ -1169,10 +1304,12 @@ impl VolumeAssembler {
         // blocks. The walk is one pass over the volume on the poller's thread,
         // about as often as a cut seals; the warm return above does no work at
         // all, which is what keeps the frame thread's calls free.
-        let now = crate::scan_size::scan_bytes(&scan) as u64;
+        let (now, blocks) = crate::scan_size::scan_bytes_and_blocks(&scan);
+        let now = now as u64;
         move_feed_level(self.staged_bytes + self.cached_bytes, now);
         self.staged_bytes = 0;
         self.cached_bytes = now;
+        self.cached_blocks = blocks as u64;
         self.stale = false;
         self.cached = Some(std::sync::Arc::clone(&scan));
         scan
