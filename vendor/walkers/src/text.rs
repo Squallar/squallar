@@ -445,6 +445,30 @@ impl OccupiedAreas {
         }
     }
 
+    /// Drop every claim, keeping every buffer this has already grown.
+    ///
+    /// **A pane builds one of these per solve, and its size is a property of
+    /// the pane rather than of the frame.** Built with [`Self::new`] each
+    /// time, a solve grows `areas`, `filed`, `seen` and the bucket table from
+    /// empty and hands the lot back to the allocator one frame later — for a
+    /// claim count that is the same few hundred every frame a pan re-solves
+    /// on. This empties them instead, so the second solve writes into memory
+    /// the first already has.
+    ///
+    /// The result is the same as a fresh one, claim for claim: every field
+    /// that decides an answer is emptied, and the only thing kept besides
+    /// capacity is [`Self::query`], which is deliberately NOT reset — it
+    /// stamps [`Self::seen`], and a counter that only goes up cannot collide
+    /// with a stamp left behind, whether or not the stamps were cleared.
+    pub fn clear(&mut self) {
+        self.areas.clear();
+        self.heads.clear();
+        self.filed.clear();
+        self.unbucketed.clear();
+        self.seen.clear();
+        self.candidates.clear();
+    }
+
     pub fn try_occupy(&mut self, rect: OrientedRect) -> bool {
         // Taken out by name so the gather below can read `self.heads` and
         // `self.filed` while it writes the stamps. Both go back before this
@@ -1232,6 +1256,92 @@ mod tests {
 
     fn rect(cx: f32, cy: f32, angle: f32, w: f32, h: f32) -> OrientedRect {
         OrientedRect::new(pos2(cx, cy), angle, vec2(w, h))
+    }
+
+    /// **A cleared `OccupiedAreas` answers exactly as a fresh one, and keeps
+    /// what it grew.**
+    ///
+    /// The caller builds one of these per solve and empties it rather than
+    /// dropping it, so both halves matter and neither is visible by eye: a
+    /// claim left behind would refuse a label the map should draw, and a
+    /// buffer released would put the allocator back in the solve it was taken
+    /// out of.
+    ///
+    /// The sequence is asked twice over the same claims, so "answers the
+    /// same" covers acceptance AND refusal rather than only the first claim.
+    #[test]
+    fn a_cleared_claim_set_answers_as_a_fresh_one_and_keeps_its_buffers() {
+        let claim = |i: usize| {
+            {
+                rect(
+                    20.0 + (i % 8) as f32 * 30.0,
+                    20.0 + (i / 8) as f32 * 25.0,
+                    if i % 3 == 0 { 0.4 } else { 0.0 },
+                    70.0,
+                    22.0,
+                )
+            }
+        };
+        // **One claim with no usable bucket span**, so `unbucketed` is not an
+        // empty list nothing can leave a stale index in. It is far enough
+        // away that it never refuses one of the sixty-four, so what it tests
+        // is the filing and not the rule.
+        let sprawl = || rect(200_000.0, 200_000.0, 0.0, 40_000.0, 40_000.0);
+        let answers = |areas: &mut OccupiedAreas| -> Vec<bool> {
+            let mut out: Vec<bool> = (0..32).map(|i| areas.try_occupy(claim(i))).collect();
+            out.push(areas.try_occupy(sprawl()));
+            out.extend((32..64).map(|i| areas.try_occupy(claim(i))));
+            out
+        };
+
+        let mut fresh = OccupiedAreas::new();
+        let expected = answers(&mut fresh);
+        assert!(
+            expected.iter().any(|a| *a) && expected.iter().any(|a| !*a),
+            "fixture: every claim got the same answer, so a stale claim set \
+             could not change one: {expected:?}"
+        );
+
+        let mut reused = OccupiedAreas::new();
+        assert_eq!(answers(&mut reused), expected);
+        let grown = (
+            reused.areas.capacity(),
+            reused.filed.capacity(),
+            reused.seen.capacity(),
+            reused.candidates.capacity(),
+            reused.heads.capacity(),
+        );
+        assert!(grown.0 > 0 && grown.1 > 0 && grown.2 > 0 && grown.4 > 0);
+
+        reused.clear();
+        assert_eq!(
+            (
+                reused.areas.len(),
+                reused.filed.len(),
+                reused.seen.len(),
+                reused.unbucketed.len(),
+                reused.candidates.len(),
+                reused.heads.len(),
+            ),
+            (0, 0, 0, 0, 0, 0),
+            "`clear` left a claim behind"
+        );
+        assert_eq!(
+            (
+                reused.areas.capacity(),
+                reused.filed.capacity(),
+                reused.seen.capacity(),
+                reused.candidates.capacity(),
+                reused.heads.capacity(),
+            ),
+            grown,
+            "`clear` released the buffers instead of emptying them"
+        );
+        assert_eq!(
+            answers(&mut reused),
+            expected,
+            "a cleared claim set answered differently from a fresh one"
+        );
     }
 
     /// Every expected value below was read off the `geo::Polygon`-based

@@ -3002,6 +3002,41 @@ in the direction that matters: `FeatureGeometry` is a type this file owns, so
 an upstream `mvt.rs` change touching the render arms conflicts on the arm names
 and not on the data model.
 
+### Changed — source, thirty-sixth commit: the claim set is emptied, not rebuilt
+
+`src/text.rs`. `OccupiedAreas` gains `clear()`. Nothing else moves: no field,
+no rule, no signature, and `try_occupy`/`file` are untouched.
+
+**The caller builds one of these per label solve, and its size is a property
+of the pane rather than of the frame.** `squallar-egui`'s label phase makes one
+`OccupiedAreas` for the whole pane and drops it at the end of the solve, and on
+a map being panned it solves on nearly every frame. Built with `new()` each
+time, a solve grows `areas`, `filed`, `seen`, `candidates` and the bucket table
+from empty — the same few hundred claims and the same two hundred-odd occupied
+buckets, every frame — and hands the lot back to the allocator. Measured under
+callgrind on a 600-name pane over 200 consecutive solves, the bucket table's
+own `reserve_rehash` alone was 3,836,294 instructions, and the whole solve made
+68,501 `malloc` calls where it now makes 17,976.
+
+`clear()` empties every field that decides an answer and releases none of them.
+`query` is deliberately **not** reset: it stamps `seen`, and the comment on that
+field says a stamp can never collide with a live one because the counter only
+goes up. Clearing `seen` removes every stamp, so resetting `query` would also
+be correct — keeping it monotonic is correct without needing that argument, and
+costs nothing.
+
+The upstream crate has no such caller: its `OccupiedAreas` is built inside the
+per-tile draw and dies with it. That is the same fact the neighbourhood search
+(thirty-first commit) was measured against, and this is its allocation half.
+
+`text::tests::a_cleared_claim_set_answers_as_a_fresh_one_and_keeps_its_buffers`
+is the gate. It asks the same sixty-five claims — sixty-four ordinary ones and
+one whose bounding box spans too many buckets to file, so `unbucketed` is not an
+empty list nothing can leave a stale index in — of a fresh set and of a cleared
+one, and requires the two answer sequences to be equal, the cleared set to hold
+nothing, and every capacity to survive. Each of the six `clear` calls has been
+shown to redden it on its own, and so has replacing the body with `*self =
+Self::new()`.
 ### Turning `mvt` on, and why the lockfile does not move
 
 The fourth commit sets `walkers = { workspace = true, features = ["mvt"] }` in
