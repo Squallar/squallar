@@ -3727,3 +3727,37 @@ fn evicting_a_granule_takes_its_slots_too() {
     assert_eq!(cache.retained_flashes(), 1);
     assert_eq!(cache.retained_slots(), 10);
 }
+
+/// **A dropped record must not leave its slot behind.**
+///
+/// `parse_level_records` sizes its vec with `with_capacity(count)` against the
+/// records it *looks at*, so a fill value or an off-globe coordinate leaves a
+/// slot the granule then carries for its whole retention. Measured at 0 drops
+/// in 1584507 records, which is why this needs a fixture that forces one: the
+/// day a product change starts dropping is the day the slack appears, and the
+/// real-granule pin in `glm::tests` could never see it.
+#[test]
+fn a_dropped_record_leaves_no_slot_behind() {
+    let filled = synthetic_glm_file(Fixture {
+        flash_lats: Some(&[35.0, -999.0]),
+        flash_lat_fill: Some(-999.0),
+        ..Default::default()
+    });
+    let (before, ..) = gauge::read_pack();
+    let parsed = parse_glm_netcdf(&filled, GlmSatellite::GoesEast, &[GlmDataLevel::Flash])
+        .expect("one bad record must not fail the granule");
+
+    assert_eq!(parsed.drops.dropped(), 1, "the fixture must force a drop");
+    assert_eq!(parsed.records.len(), 1);
+    assert_eq!(
+        parsed.records.capacity(),
+        1,
+        "the dropped record's slot rode into the cache with the good one"
+    );
+    let (after, ..) = gauge::read_pack();
+    assert!(
+        after > before,
+        "the parse must count itself: a pack nothing can show ever ran is a \
+         pack nobody can tell from an absent one"
+    );
+}

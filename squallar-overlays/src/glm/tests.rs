@@ -1257,3 +1257,51 @@ fn the_glm_buckets_come_from_the_declared_origins() {
     );
     assert_eq!(GlmSatellite::GoesWest.bucket(&overridden), "noaa-goes18");
 }
+
+/// **A granule's rows leave the parser in a vec sized to exactly those rows**,
+/// on every posture the UI can select.
+///
+/// Not a tidiness assertion. `GranuleSink::install` moves this vec — buffer and
+/// all — into the `Arc` `GlmCache` retains, so spare capacity here is resident
+/// for the granule's whole life and is invisible to `retained_bytes`, which
+/// prices rows.
+///
+/// The shape this refuses is a plain `extend` per level. `Vec` grows
+/// amortized, so the second level's `extend` doubles a capacity already big
+/// enough instead of growing to the length asked for. On this granule, under
+/// the shipped default posture (groups then flashes, 2172 and 148), that ended
+/// at **4344 slots holding 2320 rows** — 46.6 % of the block empty — and with
+/// events on as well, 11882 slots for 8261 rows.
+#[test]
+fn a_parsed_granule_carries_no_spare_slots() {
+    use GlmDataLevel::{Event, Flash, Group};
+    let bytes = std::fs::read(REAL_GRANULE).expect("the real granule fixture");
+
+    // `(levels, rows)` — the row counts are the golden per-level element counts
+    // above, summed, and every one of them was a capacity before this pin.
+    for (levels, rows) in [
+        (&[Group, Flash][..], 2172 + 148),
+        (&[Group][..], 2172),
+        (&[Flash][..], 148),
+        (&[Event][..], 5941),
+        (&[Event, Group, Flash][..], 5941 + 2172 + 148),
+        (&[Flash, Group][..], 148 + 2172),
+    ] {
+        let parsed = super::fetch::parse_glm_granule(bytes.clone(), GlmSatellite::GoesEast, levels)
+            .expect("the real granule parses");
+        assert_eq!(
+            parsed.records.len(),
+            rows,
+            "row count moved for {levels:?}, so the slot pin below is measuring \
+             something else"
+        );
+        assert_eq!(
+            parsed.records.capacity(),
+            parsed.records.len(),
+            "{levels:?} left {} spare slots ({} B) in the vec the cache is about \
+             to retain for the granule's whole life",
+            parsed.records.capacity() - parsed.records.len(),
+            (parsed.records.capacity() - parsed.records.len()) * super::fetch::FLASH_BYTES,
+        );
+    }
+}

@@ -619,6 +619,42 @@ pub mod gauge {
     static FETCHED_BYTES: AtomicU64 = AtomicU64::new(0);
     static PLANNED_BYTES: AtomicU64 = AtomicU64::new(0);
     static BOUND_EXCEEDED: AtomicUsize = AtomicUsize::new(0);
+    static PARSED_GRANULES: AtomicUsize = AtomicUsize::new(0);
+    static PARSED_ROWS: AtomicUsize = AtomicUsize::new(0);
+    static PARSE_SLACK_SHRUNK: AtomicUsize = AtomicUsize::new(0);
+
+    /// **The pack's fires-counter**: granules whose rows left the parser in a
+    /// vec sized to exactly the rows in it, and the spare slots a shrink had to
+    /// take off the end to get there.
+    ///
+    /// The two are different claims. `granules`/`rows` say the pack ran at all,
+    /// on every granule, and cannot read zero on a leg that parsed anything —
+    /// which is the only thing separating a mechanism that executed from one
+    /// that did not. `slack_shrunk` is a **soundness witness and not the
+    /// saving**, in the same sense as [`early_stop`]'s `bound_exceeded`: it
+    /// counts only the slots `parse_level_records`' `with_capacity(count)` left
+    /// behind on a dropped record, measured at 0 drops in 1584507 records, so a
+    /// healthy leg reads zero here and should.
+    ///
+    /// **The saving is not in this counter.** It is the gap between
+    /// [`super::GlmCache::retained_flashes`] and
+    /// [`super::GlmCache::retained_slots`] in the poll's residency line, which
+    /// this pack closes to zero and which the level-only census could never
+    /// see.
+    pub(super) fn parsed_granule(rows: usize, slack_shrunk: usize) {
+        PARSED_GRANULES.fetch_add(1, Relaxed);
+        PARSED_ROWS.fetch_add(rows, Relaxed);
+        PARSE_SLACK_SHRUNK.fetch_add(slack_shrunk, Relaxed);
+    }
+
+    /// `(granules, rows, slack_shrunk)` — see [`parsed_granule`].
+    pub fn read_pack() -> (usize, usize, usize) {
+        (
+            PARSED_GRANULES.load(Relaxed),
+            PARSED_ROWS.load(Relaxed),
+            PARSE_SLACK_SHRUNK.load(Relaxed),
+        )
+    }
 
     /// **A round that found the gate held**, and therefore a round that used to
     /// race the one holding it — the fires-counter for
@@ -1246,6 +1282,9 @@ pub async fn fetch_glm_flashes(
         fetched_bytes,
         bound_exceeded,
     );
+    // Summed over the process, not this poll: the parse runs per granule and
+    // has no poll of its own to belong to.
+    let (pack_granules, pack_rows, pack_slack) = gauge::read_pack();
     log::info!(
         "GLM poll: {installed_granules} granules installed, peak {peak_rows} rows \
          ({} B), unstreamed peak would be {unstreamed_peak_rows} rows ({} B); \
@@ -1256,7 +1295,8 @@ pub async fn fetch_glm_flashes(
          {stopped_granules} granules / {stopped_bytes} B of object before a \
          GET against {fetched_granules} fetched / {fetched_bytes} B, of {} B \
          planned, and {bound_exceeded} parsed granules ran past their key's \
-         bound",
+         bound; the parse packed {} rows into {} granule vecs sized to them, \
+         shrinking {} spare slots ({} B) off dropped records",
         peak_rows * FLASH_BYTES,
         unstreamed_peak_rows * FLASH_BYTES,
         evicted.granules,
@@ -1266,6 +1306,10 @@ pub async fn fetch_glm_flashes(
         tally.planned,
         tally.already_held,
         tally.planned_bytes,
+        pack_rows,
+        pack_granules,
+        pack_slack,
+        pack_slack * FLASH_BYTES,
     );
 
     // Still keyed on `satellites`, not `queried`: a satellite whose listing
@@ -2088,7 +2132,20 @@ fn parse_with_source<S: VarSource>(
         .and_then(cf::parse_cf_epoch)
         .ok_or_else(|| "Missing or invalid time_coverage_start attribute".to_string())?;
 
-    let mut all_records = Vec::new();
+    // **Grown exactly, never by doubling**, and adopted rather than copied
+    // where it can be. This vec is not scratch: `install` moves it, buffer and
+    // all, into the `Arc` the cache retains, so whatever capacity it ends the
+    // parse with is resident for the granule's whole life.
+    //
+    // A plain `extend` per level is what made that a bill. `Vec`'s growth is
+    // amortized, so a second level's `extend` doubles a capacity that is
+    // already big enough rather than growing to the length asked for: under the
+    // shipped default posture — groups then flashes, and groups outnumber
+    // flashes by more than one — the vec ends at `2 * groups` slots holding
+    // `groups + flashes` rows. Measured on the product granule
+    // `testdata/OR_GLM-L2-LCFA_G19_…nc`: 4344 slots for 2320 rows, 46.6 % of
+    // the block empty and retained.
+    let mut all_records: Vec<GlmFlash> = Vec::new();
     let mut failures: Vec<LevelFailure> = Vec::new();
     let mut drops = RecordDrops::default();
 
@@ -2101,7 +2158,17 @@ fn parse_with_source<S: VarSource>(
         // One level failing must not take the others with it.
         match parse_level_records(file, vars, &time_origin, satellite) {
             Ok((records, level_drops)) => {
-                all_records.extend(records);
+                if all_records.is_empty() {
+                    // The first level that produced anything hands over its own
+                    // vec whole — no second allocation and no copy. Order is
+                    // preserved because nothing precedes it.
+                    all_records = records;
+                } else {
+                    // `reserve_exact` and not `reserve`: the latter is the
+                    // amortizing door and would double.
+                    all_records.reserve_exact(records.len());
+                    all_records.extend(records);
+                }
                 // Only levels that *parsed* contribute a denominator.
                 drops.absorb(level_drops);
             }
@@ -2128,6 +2195,17 @@ fn parse_with_source<S: VarSource>(
     if !failures.is_empty() && failures.len() == levels.len() {
         return Err(failures.swap_remove(0).sample_error);
     }
+
+    // The adopted vec was sized by `parse_level_records`' `with_capacity(count)`
+    // against the records it *looked at*, so a dropped record leaves a slot
+    // behind. Measured at 0 drops in 1584507 records, which is exactly why this
+    // has to be a shrink and not an assertion: the day a product change starts
+    // dropping is the day the slack appears, and nothing else would notice.
+    let slack = all_records.capacity() - all_records.len();
+    if slack > 0 {
+        all_records.shrink_to_fit();
+    }
+    gauge::parsed_granule(all_records.len(), slack);
 
     // A *partial* failure keeps the healthy levels and reports the broken one:
     // `Err` would discard good group records, and a bare `Ok` reads as
