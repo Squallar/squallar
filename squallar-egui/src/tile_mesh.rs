@@ -1288,7 +1288,9 @@ fn quad_bounds(rect: egui::Rect) -> egui::Rect {
 /// and it is held on the glass the same way: by a readback through a real
 /// adapter rather than by the shape of the stream
 /// (`squallar-gpu/tests/tile_mesh_gpu.rs`,
-/// `page_grouped_raster_cells_put_the_same_bytes_on_screen_as_one_image_per_cell`).
+/// `page_grouped_raster_cells_put_the_same_bytes_on_screen_as_one_image_per_cell`,
+/// `#[ignore]`d because it needs one: run it with
+/// `cargo test -p squallar-gpu --test tile_mesh_gpu -- --ignored`).
 ///
 /// **What it does NOT cover: MSAA.** Two triangles meeting on a shared edge
 /// are watertight per *pixel*, not per *sample*, only because there is one

@@ -977,7 +977,10 @@ fn per_cell_raster_shapes_in_page_order() -> Vec<egui::epaint::ClippedShape> {
 /// held by a readback through a real adapter --
 /// `squallar-gpu/tests/tile_mesh_gpu.rs`,
 /// `page_grouped_raster_cells_put_the_same_bytes_on_screen_as_one_image_per_cell`
-/// -- which is the tool `013d2f480` established for exactly this case.
+/// -- which is the tool `013d2f480` established for exactly this case. It is
+/// `#[ignore]`d because it needs a real adapter, so the default `cargo test`
+/// row does not run it: `cargo test -p squallar-gpu --test tile_mesh_gpu --
+/// --ignored`.
 #[test]
 fn a_page_grouped_raster_pass_is_the_per_cell_stream_permuted_by_page() {
     const PPP: f32 = 1.0;

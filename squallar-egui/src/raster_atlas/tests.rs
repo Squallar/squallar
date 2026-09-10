@@ -203,11 +203,18 @@ fn the_slot_holds_the_tile_and_the_gutter_holds_its_edge() {
 /// before this landed (47 tiles, 47 primitives, 47 draws).
 ///
 /// **One `Painter::image` per cell is no longer how the tile walk spells it**
-/// — `crate::tile_mesh::RasterQuads` batches a consecutive run of one page
-/// into one shape — but it is still what the walk's stream must come out
-/// equal to, and it is the arrangement this file's claim is about. The
-/// batch's own equality with it is
-/// `crate::tile_mesh::tests::a_batched_raster_run_tessellates_to_the_same_bytes_as_one_image_per_tile`.
+/// — `crate::tile_mesh::RasterQuads` batches every cell of one page into one
+/// shape — but it is still the arrangement this file's claim is about, and
+/// the primitive count here is still what a page buys.
+///
+/// The walk's stream is no longer *equal* to the per-cell one, and the two
+/// tests that say what it is instead are the pair to read beside this:
+/// `crate::tile_mesh::tests::a_page_grouped_raster_pass_is_the_per_cell_stream_permuted_by_page`
+/// holds that it is that stream permuted by page, and the glass is held by a
+/// readback through a real adapter --
+/// `page_grouped_raster_cells_put_the_same_bytes_on_screen_as_one_image_per_cell`,
+/// which is `#[ignore]`d because it needs one: run it with
+/// `cargo test -p squallar-gpu --test tile_mesh_gpu -- --ignored`.
 #[test]
 fn a_row_of_raster_tiles_is_one_primitive_when_they_share_a_texture() {
     let ctx = Context::default();
