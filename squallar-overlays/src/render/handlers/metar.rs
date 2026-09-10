@@ -453,14 +453,25 @@ impl OverlayHandler for MetarHandler {
                 // have moved again while the round was in flight, and a
                 // recomputed set would claim coverage the bytes do not have.
                 self.round_networks = Some(round.networks);
-                let items = round
-                    .observations
-                    .into_iter()
-                    .map(|ob| {
-                        let text = station_model::StationText::of(&ob);
-                        Arc::new(MetarItem { ob, text })
-                    })
-                    .collect();
+                // **Built into an exactly sized list, not `collect`ed.** A
+                // `collect` here takes the standard library's in-place
+                // specialization -- same alignment, and the destination
+                // element is not larger -- so the `Arc` pointers are written
+                // over the observations and the round's own buffer becomes
+                // the parked list's. A `MetarOb` is 272 B against an `Arc`'s
+                // 8, so the layer parks a buffer 34x the pointers in it,
+                // whatever the round's own reservation was: measured at 1000
+                // stations, `installed_item_bytes` reported 716,000 B, of
+                // which the carried buffer was 272,000 B holding 8,000 B of
+                // pointers. `Vec::extend` into an already-sized destination
+                // appends instead, and the round's buffer is freed with the
+                // iterator.
+                let observations = round.observations;
+                let mut items = Vec::with_capacity(observations.len());
+                items.extend(observations.into_iter().map(|ob| {
+                    let text = station_model::StationText::of(&ob);
+                    Arc::new(MetarItem { ob, text })
+                }));
                 self.state.set_data_with_coverage(items, coverage);
                 self.recheck_coverage();
             }
@@ -949,6 +960,55 @@ mod prepare_memo_tests {
             wx_string: None,
             obs_time: String::new(),
         }
+    }
+
+    /// **The parked list is sized by the pointers in it, not by the
+    /// observations they were built from.**
+    ///
+    /// A `collect` from the round's `Vec<MetarOb>` into `Vec<Arc<MetarItem>>`
+    /// takes the standard library's in-place specialization: the alignments
+    /// match and the destination element is not larger, so the pointers are
+    /// written over the observations and **the round's buffer is kept as the
+    /// parked list's**. A `MetarOb` is 272 B against an `Arc`'s 8, so the
+    /// layer parks a buffer 34 slots deep per pointer -- and the census
+    /// prices `capacity`, so it reports every one of them.
+    ///
+    /// Red on `95980a8de`: capacity 34,000 for 1,000 stations. The source
+    /// here is exactly sized, so what this pins is the conversion and not the
+    /// round's own reservation.
+    #[test]
+    fn the_parked_list_is_sized_by_its_pointers_not_its_observations() {
+        const STATIONS: usize = 1000;
+        let mut handler = MetarHandler::new();
+
+        let mut observations = Vec::with_capacity(STATIONS);
+        observations.extend((0..STATIONS).map(|i| station(&format!("K{i:03}"))));
+        assert_eq!(
+            observations.capacity(),
+            STATIONS,
+            "the round's own buffer is exact, so only the conversion is on trial",
+        );
+
+        handler.apply_fetch_result(
+            Box::new(MetarFetchResult(Ok(crate::metar::fetch::MetarRound {
+                observations,
+                failed_networks: Vec::new(),
+                networks: vec!["OK"],
+            }))) as FetchPayload,
+            &PaneRef::bare(0),
+        );
+
+        assert_eq!(handler.state.data.len(), STATIONS, "every station parked");
+        assert_eq!(
+            handler.state.data.capacity(),
+            STATIONS,
+            "the parked list holds {} slots for {STATIONS} pointers -- {} B of \
+             buffer for {} B of content, the round's Vec<MetarOb> allocation \
+             carried forward by an in-place collect",
+            handler.state.data.capacity(),
+            handler.state.data.capacity() * size_of::<Arc<MetarItem>>(),
+            STATIONS * size_of::<Arc<MetarItem>>(),
+        );
     }
 
     fn handler_with(n: usize) -> MetarHandler {
