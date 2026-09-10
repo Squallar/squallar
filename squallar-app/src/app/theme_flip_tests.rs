@@ -53,7 +53,7 @@ fn a_theme_flip_never_touches_the_radar_render_cache() {
     );
 
     let (key, entry) = a_radar_entry();
-    app.render.render_cache.insert(key.clone(), entry);
+    app.render.render_cache.insert(key.clone(), entry, &[]);
     let entries_before = app.render.render_cache.entry_count();
     let gens_before = radar_sites_gens(&mut app);
     assert!(

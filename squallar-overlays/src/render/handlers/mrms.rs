@@ -162,11 +162,27 @@ impl MrmsFrameCache {
         self.entries.values().map(|g| g.resident_bytes()).sum()
     }
 
-    /// **Nothing is pinned.** A staged granule evicted before its job is
-    /// described costs one frame its picture until the next listing; a staged
-    /// granule *kept* past the budget costs 49 MB on an arm that has already
-    /// said it cannot spare it. The live cache makes the opposite trade
-    /// because a pane with no live granule has nothing that will re-ask.
+    /// **Ranked by what the panes still ask for, not by age.** A staged
+    /// granule evicted before its job is described costs one frame its picture
+    /// until the next listing; a staged granule *kept* past the budget costs
+    /// 49 MB on an arm that has already said it cannot spare it. So the budget
+    /// still decides how many granules go, and `demanded` decides which.
+    ///
+    /// Age alone is the right order only while every pane is live, because
+    /// "least recently used" and "least wanted" are then the same granule. The
+    /// moment one pane parks, its single granule is touched once and then sits
+    /// at the front of `recency` while a live pane's loop streams arrivals past
+    /// it — so plain LRU takes the parked pane's only picture on the very next
+    /// overflow, with its product still selected and still enabled.
+    /// [`PaneRef::peers`] states the rule for a cache a whole layer draws from:
+    /// the answer is the **union**, and dropping what one pane selects to
+    /// satisfy another is the failure mode it exists to prevent.
+    ///
+    /// `demanded` is that union — [`MrmsHandler::pinned_products`], every
+    /// enabled pane's selection. See [`Self::victim_position`] for the order it
+    /// buys. **The ceiling is untouched**: the loop still runs on
+    /// `resident_bytes() > budget` and the arrival is still exempt, so this
+    /// reorders which granules go and never how many are kept.
     ///
     /// **Every granule that leaves here is offered to [`staging`].** This is
     /// the hot eviction of the whole layer — one per arriving loop frame — and
@@ -174,7 +190,7 @@ impl MrmsFrameCache {
     /// instead is what made the browser build allocate a fresh 98 MB block per
     /// granule (at the `f32` width of the time) and fragment its 1 GiB heap to
     /// death.
-    fn insert(&mut self, key: FrameKey, grid: MrmsGrid) {
+    fn insert(&mut self, key: FrameKey, grid: MrmsGrid, demanded: &[MrmsProduct]) {
         if let Some(replaced) = self.entries.insert(key, grid) {
             self.touch(key);
             self.staging.recycle(replaced);
@@ -184,19 +200,80 @@ impl MrmsFrameCache {
         while self.resident_bytes() > self.budget {
             let victim = {
                 let mut recency = self.recency.borrow_mut();
-                let Some(pos) = recency.iter().position(|k| *k != key) else {
+                let Some(pos) = Self::victim_position(&recency, key, demanded) else {
                     // The arrival alone is left and it is over budget by
                     // itself: keeping it is what lets the pipeline advance at
                     // all, and the build-time floor makes this unreachable in
                     // the shipped configuration.
                     break;
                 };
+                // What age order on its own would have taken. A different
+                // answer is one granule a pane keeps that plain LRU would have
+                // dropped. Every eviction is counted, fired or not, so that a
+                // rank which never fires stays distinguishable from a build
+                // that has no rank at all.
+                crate::render::demand_ledger::note_mrms_eviction(
+                    recency.iter().position(|k| *k != key) != Some(pos),
+                );
                 recency.remove(pos)
             };
             if let Some(evicted) = self.entries.remove(&victim) {
                 self.staging.recycle(evicted);
             }
         }
+    }
+
+    /// **The index in `recency` of the granule to give up** — least wanted
+    /// first, then the deepest tail of its own product, then oldest use.
+    /// `None` when the arrival is the only thing left.
+    ///
+    /// A granule of a product no enabled pane selects goes before any granule
+    /// of a product some pane does: that is the union tier, and it is the only
+    /// tier a boolean "is this wanted" could express. It is not enough on its
+    /// own. In the scene this exists for — one pane live, one pane parked —
+    /// **both** products are wanted, so a boolean leaves age as the tiebreak
+    /// and the parked pane stays exactly as dark.
+    ///
+    /// So within the wanted tier the victim is the one sitting **deepest into
+    /// its own product's staged run**, counted from the most recently used end:
+    /// a product holding twenty granules gives up its twentieth before a
+    /// product holding one gives up its only. That is what turns the single
+    /// ceiling into a share per pane rather than a race, and it is the same
+    /// rank `evict_oldest_over` took for GLM.
+    ///
+    /// **An empty `demanded` is plain LRU exactly** — the shipped order, and
+    /// what a pre-hydration caller with no pane to speak for passes.
+    fn victim_position(
+        recency: &[FrameKey],
+        arrival: FrameKey,
+        demanded: &[MrmsProduct],
+    ) -> Option<usize> {
+        if demanded.is_empty() {
+            return recency.iter().position(|k| *k != arrival);
+        }
+        let mut best: Option<(usize, (bool, usize))> = None;
+        for (pos, key) in recency.iter().enumerate() {
+            if *key == arrival {
+                continue;
+            }
+            let rank = (
+                !demanded.contains(&key.product),
+                // How many granules of this same product are held more
+                // recently than this one — its depth into that product's run.
+                recency
+                    .iter()
+                    .skip(pos + 1)
+                    .filter(|other| other.product == key.product)
+                    .count(),
+            );
+            // Walked oldest-use first with a strict `>`, so a tie is settled by
+            // the staler granule and age remains the last word rather than the
+            // first.
+            if best.is_none_or(|(_, seen)| rank > seen) {
+                best = Some((pos, rank));
+            }
+        }
+        best.map(|(pos, _)| pos)
     }
 
     /// Drop everything but `keep` — the [`FrameSource::retain_frames`] door.
@@ -851,7 +928,7 @@ impl FrameSource for MrmsHandler {
     /// Stage one frame's granule under the `(product, stamp)` its fetch was
     /// dispatched for. A failed fetch stages nothing and the frame keeps no
     /// picture.
-    fn apply_frame(&mut self, _stamp: FrameStamp, data: FetchPayload, _pane: &PaneRef<'_>) {
+    fn apply_frame(&mut self, _stamp: FrameStamp, data: FetchPayload, pane: &PaneRef<'_>) {
         let Ok(frame) = data.downcast::<MrmsFrameFetch>() else {
             log::error!("a frame reached the MRMS layer under another layer's payload");
             return;
@@ -864,7 +941,13 @@ impl FrameSource for MrmsHandler {
         let Some(grid) = grid else {
             return;
         };
-        self.frame_grids.insert(FrameKey { product, valid }, grid);
+        // The union across every enabled pane, read before the store is
+        // borrowed. `pane` is `PaneRef::across` on this path by construction —
+        // an arrival names a layer and no pane — so this is the whole layer's
+        // demand rather than one pane's.
+        let demanded = self.pinned_products(pane);
+        self.frame_grids
+            .insert(FrameKey { product, valid }, grid, &demanded);
     }
 
     /// **Zero, and it is a decision rather than an omission.** A national

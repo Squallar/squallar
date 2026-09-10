@@ -2611,3 +2611,49 @@ fn the_dispatch_cuts_are_readable_as_neither_post_cuts_nor_segments() {
          carries the total they sum to",
     );
 }
+
+/// **The fires-counter row reads in both directions.**
+///
+/// The failure this guards is not "the number is wrong", it is "the number is
+/// missing and nothing says so". A row that is omitted whenever the saving is
+/// zero cannot be told apart from a build that has no counter at all, and that
+/// is precisely how a ~94 MiB cut on this campaign shipped delivering exactly
+/// nothing for a day: its precondition never held, its counter read zero, and a
+/// silent zero looked identical to a mechanism nobody had wired yet.
+///
+/// So the row is gated on the **denominator** — evictions actually performed —
+/// and never on the saving. No evictions at all is a genuinely empty
+/// population and prints nothing; evictions that spared nothing print a real
+/// `0`, which is the reading that says the rank ran and did not fire.
+#[test]
+fn the_demand_ranked_row_is_absent_without_evictions_and_says_zero_with_them() {
+    assert_eq!(
+        super::demand_ranked_eviction_line((0, 0), (0, 0), (0, 0)),
+        None,
+        "no eviction anywhere is an empty population, and an empty population \
+         has no row rather than a row of zeroes",
+    );
+
+    let fired_nothing = super::demand_ranked_eviction_line((40, 0), (0, 0), (0, 0))
+        .expect("evictions happened, so the population is not empty");
+    assert!(
+        fired_nothing.contains("mrms frames 0 of 40 spared"),
+        "a rank that ran and never fired must SAY zero, not go quiet: {fired_nothing:?}",
+    );
+
+    let fired =
+        super::demand_ranked_eviction_line((40, 3), (12, 1), (30, 5)).expect("evictions happened");
+    assert_eq!(
+        fired,
+        "demand-ranked evictions: mrms frames 3 of 40 spared, \
+         gmgsi frames 1 of 12 spared, render cache 5 of 30 spared",
+        "the sentence is an interface the browser rig reads with its own regex",
+    );
+
+    // A store that never evicted must not be able to hide a store that did.
+    assert!(
+        super::demand_ranked_eviction_line((0, 0), (0, 0), (7, 2)).is_some(),
+        "the denominator is the SUM across the three stores, so one silent \
+         store cannot suppress another's reading",
+    );
+}

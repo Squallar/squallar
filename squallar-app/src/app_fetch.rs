@@ -2176,7 +2176,7 @@ impl super::App {
         }
         self.loop_mgr.remove_pending(pane_idx);
         if pane_idx < self.render.pane_render.len() {
-            self.render.pane_render[pane_idx].last_rendered = None;
+            self.render.pane_render[pane_idx].forget_picture();
         }
     }
 

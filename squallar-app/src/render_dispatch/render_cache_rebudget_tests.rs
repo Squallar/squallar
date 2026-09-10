@@ -86,7 +86,7 @@ fn index_of(k: &RenderKey) -> usize {
 fn four_with_zero_touched() -> RenderCache {
     let mut cache = RenderCache::new(usize::MAX, usize::MAX);
     for i in 0..4 {
-        cache.insert(key("KTLX", i), output(i as f64));
+        cache.insert(key("KTLX", i), output(i as f64), &[]);
     }
     assert!(cache.get(&key("KTLX", 0)).is_some());
     assert_eq!(
@@ -112,7 +112,7 @@ fn shrinking_the_budget_evicts_least_recently_used_first_and_hands_them_back() {
     let budgeted_before = cache.budgeted_bytes;
     let budget = 2 * raster();
 
-    let evicted = cache.set_byte_capacity(budget);
+    let evicted = cache.set_byte_capacity(budget, &[]);
 
     assert!(
         !evicted.is_empty(),
@@ -178,13 +178,13 @@ fn shrinking_the_budget_evicts_least_recently_used_first_and_hands_them_back() {
 fn raising_the_budget_evicts_nothing() {
     let mut cache = RenderCache::new(usize::MAX, 4 * raster());
     for i in 0..4 {
-        cache.insert(key("KTLX", i), output(i as f64));
+        cache.insert(key("KTLX", i), output(i as f64), &[]);
     }
     assert_eq!(cache.entry_count(), 4, "fixture: four rasters did not fit");
     let order_before = cache.recency_order();
     let resident_before = cache.resident_bytes();
 
-    let evicted = cache.set_byte_capacity(8 * raster());
+    let evicted = cache.set_byte_capacity(8 * raster(), &[]);
     assert!(
         evicted.is_empty(),
         "raising the budget evicted {} entries",
@@ -202,14 +202,14 @@ fn raising_the_budget_evicts_nothing() {
         "a raise moved the ledger"
     );
 
-    let evicted = cache.set_byte_capacity(usize::MAX);
+    let evicted = cache.set_byte_capacity(usize::MAX, &[]);
     assert!(evicted.is_empty(), "raising to unbounded evicted something");
 
     // The raise was written, not just harmless: a fifth entry now fits where
     // the old budget would have evicted for it.
-    let evicted = cache.set_byte_capacity(8 * raster());
+    let evicted = cache.set_byte_capacity(8 * raster(), &[]);
     assert!(evicted.is_empty());
-    cache.insert(key("KTLX", 4), output(4.0));
+    cache.insert(key("KTLX", 4), output(4.0), &[]);
     assert_eq!(
         cache.entry_count(),
         5,
@@ -225,7 +225,7 @@ fn shrinking_below_one_entry_keeps_what_insert_keeps() {
     // What `insert` keeps when the budget cannot pay for one entry.
     let mut by_insert = RenderCache::new(usize::MAX, 1);
     for i in 0..4 {
-        by_insert.insert(key("KTLX", i), output(i as f64));
+        by_insert.insert(key("KTLX", i), output(i as f64), &[]);
     }
     let floor = by_insert.entry_count();
     assert!(
@@ -239,7 +239,7 @@ fn shrinking_below_one_entry_keeps_what_insert_keeps() {
 
     let mut cache = four_with_zero_touched();
     let order_before = cache.recency_order();
-    let evicted = cache.set_byte_capacity(1);
+    let evicted = cache.set_byte_capacity(1, &[]);
 
     assert_eq!(
         cache.entry_count(),
@@ -284,10 +284,10 @@ fn shrinking_agrees_with_what_insert_would_have_kept() {
         let mut shrunk = RenderCache::new(usize::MAX, usize::MAX);
         let mut built = RenderCache::new(usize::MAX, budget);
         for i in 0..ENTRIES {
-            shrunk.insert(key("KTLX", i), output(i as f64));
-            built.insert(key("KTLX", i), output(i as f64));
+            shrunk.insert(key("KTLX", i), output(i as f64), &[]);
+            built.insert(key("KTLX", i), output(i as f64), &[]);
         }
-        let evicted = shrunk.set_byte_capacity(budget);
+        let evicted = shrunk.set_byte_capacity(budget, &[]);
 
         assert_eq!(
             shrunk.recency_order(),

@@ -155,7 +155,7 @@ fn a_raster_a_pane_shows_is_priced_once_by_the_cache() {
     let mut dispatcher = showing(vec![Some(Arc::clone(&image))]);
     dispatcher
         .render_cache
-        .insert(plan_key(0.5), cache_entry(image, hover));
+        .insert(plan_key(0.5), cache_entry(image, hover), &[]);
 
     assert_eq!(
         dispatcher.render_cache.resident_bytes() as u64 + dispatcher.cached_render_bytes(),
@@ -179,7 +179,7 @@ fn a_cache_entry_no_pane_is_showing_shares_nothing() {
     let mut dispatcher = showing(vec![Some(raster())]);
     dispatcher
         .render_cache
-        .insert(plan_key(0.5), cache_entry(raster(), hover()));
+        .insert(plan_key(0.5), cache_entry(raster(), hover()), &[]);
     assert_eq!(
         dispatcher.raster_shared_bytes(),
         0,
@@ -200,10 +200,11 @@ fn two_cache_keys_on_one_raster_are_shared_within_the_cache() {
     dispatcher.render_cache.insert(
         plan_key(0.5),
         cache_entry(Arc::clone(&image), Arc::clone(&hover)),
+        &[],
     );
     dispatcher
         .render_cache
-        .insert(plan_key(0.9), cache_entry(image, hover));
+        .insert(plan_key(0.9), cache_entry(image, hover), &[]);
 
     assert_eq!(dispatcher.render_cache.resident_bytes() as u64, 2 * one);
     assert_eq!(
@@ -345,7 +346,7 @@ fn a_fan_the_cache_and_a_pane_both_hold_is_shared_between_them() {
     dispatcher.pane_render[0].note_fan(&sweep);
     dispatcher
         .render_cache
-        .insert(plan_key(0.5), fan_entry(Arc::clone(&sweep), hover));
+        .insert(plan_key(0.5), fan_entry(Arc::clone(&sweep), hover), &[]);
 
     assert_eq!(
         dispatcher.render_cache.resident_bytes() as u64 + dispatcher.cached_render_bytes(),

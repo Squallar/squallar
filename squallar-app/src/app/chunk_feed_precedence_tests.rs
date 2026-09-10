@@ -1261,6 +1261,7 @@ fn seed_render_cache(app: &mut App) {
             melting_layer_source: None,
             storm_motion: None,
         },
+        &[],
     );
     assert_eq!(
         app.render.render_cache.entry_count(),

@@ -381,19 +381,35 @@ impl GmgsiFrameCache {
         self.entries.values().map(|g| g.resident_bytes()).sum()
     }
 
-    /// **Nothing is pinned.** A staged granule that is evicted before its job
-    /// is described costs one frame its picture until the next listing; a
-    /// staged granule that is *kept* past the budget costs 15 MB on an arm
-    /// that has already said it cannot spare it. The live cache makes the
-    /// opposite trade because a pane with no live granule has nothing that
-    /// will re-ask.
+    /// **Ranked by what the panes still ask for, not by age.** A staged
+    /// granule that is evicted before its job is described costs one frame its
+    /// picture until the next listing; a staged granule that is *kept* past the
+    /// budget costs 15 MB on an arm that has already said it cannot spare it.
+    /// So the budget still decides how many granules go, and `demanded`
+    /// decides which.
+    ///
+    /// Age alone is the right order only while every pane is live, because
+    /// "least recently used" and "least wanted" are then the same granule. The
+    /// moment one pane parks, its single granule is touched once and then sits
+    /// at the front of `recency` while a live pane's loop streams arrivals past
+    /// it — so plain LRU takes the parked pane's only picture on the very next
+    /// overflow, with its channel still selected and still enabled.
+    /// [`PaneRef::peers`] states the rule for a cache a whole layer draws from:
+    /// the answer is the **union**, and dropping what one pane selects to
+    /// satisfy another is the failure mode it exists to prevent.
+    ///
+    /// `demanded` is that union — [`GmgsiHandler::pinned_channels`], every
+    /// enabled pane's selection. See [`Self::victim_position`] for the order it
+    /// buys. **The ceiling is untouched**: the loop still runs on
+    /// `resident_bytes() > budget` and the arrival is still exempt, so this
+    /// reorders which granules go and never how many are kept.
     ///
     /// **Every granule that leaves here is offered to [`staging`].** This is
     /// the hot eviction of the whole layer — one per arriving loop frame — and
     /// it is where the retained mosaic buffer comes from: dropping the victim
     /// instead is what made every granule take a fresh 15 MB block off a heap
     /// that only grows.
-    fn insert(&mut self, key: FrameKey, granule: GmgsiGranule) {
+    fn insert(&mut self, key: FrameKey, granule: GmgsiGranule, demanded: &[GmgsiChannel]) {
         if let Some(replaced) = self.entries.insert(key, granule) {
             self.touch(key);
             staging::recycle_shared(self.staging, replaced.grid);
@@ -403,19 +419,79 @@ impl GmgsiFrameCache {
         while self.resident_bytes() > self.budget {
             let victim = {
                 let mut recency = self.recency.borrow_mut();
-                let Some(pos) = recency.iter().position(|k| *k != key) else {
+                let Some(pos) = Self::victim_position(&recency, key, demanded) else {
                     // The arrival alone is left and it is over budget by
                     // itself: keeping it is what lets the pipeline advance at
                     // all, and the floor above makes this unreachable in the
                     // shipped configuration.
                     break;
                 };
+                // What age order on its own would have taken. A different
+                // answer is one granule a pane keeps that plain LRU would have
+                // dropped. Every eviction is counted, fired or not, so that a
+                // rank which never fires stays distinguishable from a build
+                // that has no rank at all.
+                crate::render::demand_ledger::note_gmgsi_eviction(
+                    recency.iter().position(|k| *k != key) != Some(pos),
+                );
                 recency.remove(pos)
             };
             if let Some(evicted) = self.entries.remove(&victim) {
                 staging::recycle_shared(self.staging, evicted.grid);
             }
         }
+    }
+
+    /// **The index in `recency` of the granule to give up** — least wanted
+    /// first, then the deepest tail of its own channel, then oldest use.
+    /// `None` when the arrival is the only thing left.
+    ///
+    /// A granule of a channel no enabled pane selects goes before any granule
+    /// of a channel some pane does: that is the union tier, and it is the only
+    /// tier a boolean "is this wanted" could express. It is not enough on its
+    /// own. In the scene this exists for — one pane live, one pane parked —
+    /// **both** channels are wanted, so a boolean leaves age as the tiebreak
+    /// and the parked pane stays exactly as dark.
+    ///
+    /// So within the wanted tier the victim is the one sitting **deepest into
+    /// its own channel's staged run**, counted from the most recently used end:
+    /// a channel holding thirteen granules gives up its thirteenth before a
+    /// channel holding one gives up its only. That is what turns the single
+    /// ceiling into a share per pane rather than a race.
+    ///
+    /// **An empty `demanded` is plain LRU exactly** — the shipped order, and
+    /// what a pre-hydration caller with no pane to speak for passes.
+    fn victim_position(
+        recency: &[FrameKey],
+        arrival: FrameKey,
+        demanded: &[GmgsiChannel],
+    ) -> Option<usize> {
+        if demanded.is_empty() {
+            return recency.iter().position(|k| *k != arrival);
+        }
+        let mut best: Option<(usize, (bool, usize))> = None;
+        for (pos, key) in recency.iter().enumerate() {
+            if *key == arrival {
+                continue;
+            }
+            let rank = (
+                !demanded.contains(&key.channel),
+                // How many granules of this same channel are held more
+                // recently than this one — its depth into that channel's run.
+                recency
+                    .iter()
+                    .skip(pos + 1)
+                    .filter(|other| other.channel == key.channel)
+                    .count(),
+            );
+            // Walked oldest-use first with a strict `>`, so a tie is settled by
+            // the staler granule and age remains the last word rather than the
+            // first.
+            if best.is_none_or(|(_, seen)| rank > seen) {
+                best = Some((pos, rank));
+            }
+        }
+        best.map(|(pos, _)| pos)
     }
 
     /// Drop everything but `keep` — the [`FrameSource::retain_frames`] door.
@@ -1068,7 +1144,7 @@ impl FrameSource for GmgsiHandler {
     /// Stage one frame's granule under the `(channel, hour)` its fetch was
     /// dispatched for. A failed fetch stages nothing and the frame keeps no
     /// picture.
-    fn apply_frame(&mut self, _stamp: FrameStamp, data: FetchPayload, _pane: &PaneRef<'_>) {
+    fn apply_frame(&mut self, _stamp: FrameStamp, data: FetchPayload, pane: &PaneRef<'_>) {
         let Ok(frame) = data.downcast::<GmgsiFrameFetch>() else {
             log::error!("a frame reached the GMGSI layer under another layer's payload");
             return;
@@ -1081,6 +1157,11 @@ impl FrameSource for GmgsiHandler {
         let Some(granule) = grid else {
             return;
         };
+        // The union across every enabled pane, read before the store is
+        // borrowed. `pane` is `PaneRef::across` on this path by construction —
+        // an arrival names a layer and no pane — so this is the whole layer's
+        // demand rather than one pane's.
+        let demanded = self.pinned_channels(pane);
         self.frame_grids.insert(
             FrameKey { channel, valid },
             GmgsiGranule {
@@ -1088,6 +1169,7 @@ impl FrameSource for GmgsiHandler {
                 bounds: granule.bounds,
                 valid_time: granule.valid_time,
             },
+            &demanded,
         );
     }
 

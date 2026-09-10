@@ -908,6 +908,46 @@ fn tile_cache_line(
 /// **steady-state** reading: the population it describes is the parsed-tile
 /// cache, which is byte-bounded and live — 94.4 % of a pan's reads are served
 /// from it — so this is a cache made cheaper and never a cache made smaller.
+/// The `demand-ranked evictions:` running-total line, or `None` where this
+/// process has evicted nothing from any of the three stores.
+///
+/// **A fires-counter, and the denominator is what gates the row.** Three caches
+/// bounded by a budget used to choose their victim by age alone, which is the
+/// same granule as "least wanted" only while every pane is live. The moment one
+/// pane parks or settles, its picture is the least recently *used* thing in a
+/// store still filling with a working pane's arrivals, and age order takes it
+/// on the next overflow — a pane going dark holding a selection it never let
+/// go of. Each store now ranks its victims by the union of what the panes still
+/// ask for; `spared` counts the evictions where that rank named a different
+/// entry than age order would have.
+///
+/// **A zero here is a reading, not a silence.** `considered` is every eviction
+/// the budget actually performed, and the row prints whenever that is non-zero
+/// — so a build where the rank ran and never fired says `0 of 40` rather than
+/// vanishing. That distinction is the whole point: on this campaign a ~94 MiB
+/// cut once delivered exactly nothing because its precondition never held on
+/// the arm it shipped to, its counter read zero on all 530 ticks, and nothing
+/// noticed for a day. A build with no rank at all prints no row.
+///
+/// **Blocks, never bytes, and the two are not added.** The ceiling that decides
+/// *how many* entries go is untouched by the rank that decides *which*, so a
+/// reordered eviction saves no bytes by itself; pricing these in bytes would be
+/// a second currency over the same population.
+fn demand_ranked_eviction_line(
+    mrms: (u64, u64),
+    gmgsi: (u64, u64),
+    render: (u64, u64),
+) -> Option<String> {
+    if mrms.0 + gmgsi.0 + render.0 == 0 {
+        return None;
+    }
+    Some(format!(
+        "demand-ranked evictions: mrms frames {} of {} spared, \
+         gmgsi frames {} of {} spared, render cache {} of {} spared",
+        mrms.1, mrms.0, gmgsi.1, gmgsi.0, render.1, render.0,
+    ))
+}
+
 fn parsed_geometry_line(t: &squallar_egui::tile_source::parsed_census::Totals) -> Option<String> {
     if t.features == 0 {
         return None;
@@ -2737,12 +2777,19 @@ impl super::App {
         use squallar_geo::PlacedRaster;
         use squallar_radar::types::ImageBounds;
 
-        // Extract site coordinates before mutable borrow
-        let (lat, lon) = {
+        // Extract site coordinates before mutable borrow. The site's NAME
+        // comes out of the same read rather than a second one: it is what the
+        // render was cached under, and it is what the pane's pin on the shared
+        // cache has to be spelled with to name an entry that exists.
+        let (lat, lon, scan_site) = {
             let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
                 return false;
             };
-            (scan_info.site.lat, scan_info.site.lon)
+            (
+                scan_info.site.lat,
+                scan_info.site.lon,
+                scan_info.site.name.to_string(),
+            )
         };
 
         // **What the picture says about itself**, built once and identical
@@ -2899,8 +2946,11 @@ impl super::App {
         pane.place_radar_raster(placed, data_time, whole);
 
         if pane_idx < self.render.pane_render.len() {
-            self.render.pane_render[pane_idx].last_rendered =
-                Some((render.product, render.elevation));
+            self.render.pane_render[pane_idx].note_picture(
+                &scan_site,
+                render.product,
+                render.elevation,
+            );
         }
         filed
     }
@@ -3093,6 +3143,15 @@ impl super::App {
         if let Some(line) =
             parsed_geometry_line(&squallar_egui::tile_source::parsed_census::totals())
         {
+            say_telemetry(loud, &line);
+        }
+        // Its own sentence, on its own denominator: this counts evictions, and
+        // every other figure on this path counts tiles, features or bytes.
+        if let Some(line) = demand_ranked_eviction_line(
+            squallar_overlays::render::demand_ledger::mrms_totals(),
+            squallar_overlays::render::demand_ledger::gmgsi_totals(),
+            crate::render_dispatch::pin_ledger::totals(),
+        ) {
             say_telemetry(loud, &line);
         }
         if let Some(b) = basemap {
@@ -4309,7 +4368,7 @@ impl super::App {
                         .and_then(|(id, _)| crate::render_key::radar_field(&id))
                         .is_some_and(|p| readers.contains(&p))
                 {
-                    prs.last_rendered = None;
+                    prs.forget_picture();
                 }
             }
 
@@ -5013,7 +5072,7 @@ impl super::App {
                     // price a payload this pane has just let go of.
                     self.render.pane_render[pane_idx].showing_fan = None;
                 }
-                self.render.pane_render[pane_idx].last_rendered = None;
+                self.render.pane_render[pane_idx].forget_picture();
             }
         }
     }
@@ -6512,7 +6571,7 @@ impl super::App {
             // `dispatch_pane_renders` put its static image back.
             self.loop_mgr.remove_pending(pidx);
             if pidx < self.render.pane_render.len() {
-                self.render.pane_render[pidx].last_rendered = None;
+                self.render.pane_render[pidx].forget_picture();
             }
         }
 

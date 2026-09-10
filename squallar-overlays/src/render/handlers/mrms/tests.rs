@@ -1668,6 +1668,7 @@ fn an_evicted_frame_granule_is_offered_to_the_staging_pool() {
             valid: stamp(0),
         },
         mosaic_grid(product, stamp(0)),
+        &[],
     );
     assert_eq!(
         POOL.totals(),
@@ -1686,6 +1687,7 @@ fn an_evicted_frame_granule_is_offered_to_the_staging_pool() {
             valid: stamp(2),
         },
         mosaic_grid(product, stamp(2)),
+        &[],
     );
     assert_eq!(h.frame_grids.len(), 1, "premise: the budget evicted one");
 
@@ -1718,8 +1720,11 @@ fn a_retained_frame_set_offers_the_dropped_granules_to_the_staging_pool() {
         .expect("a real date")
         .and_hms_opt(0, 0, 0)
         .expect("a real time");
-    h.frame_grids
-        .insert(FrameKey { product, valid }, mosaic_grid(product, valid));
+    h.frame_grids.insert(
+        FrameKey { product, valid },
+        mosaic_grid(product, valid),
+        &[],
+    );
 
     h.retain_frames(&PaneRef::across(&[]), &[]);
     assert_eq!(h.frame_grids.len(), 0, "premise: the granule was dropped");
@@ -2060,6 +2065,7 @@ fn a_carry_a_staged_granule_also_holds_is_priced_once() {
             valid: carried.valid,
         },
         (*carried).clone(),
+        &[],
     );
     assert!(
         h.frame_grids.holds_values(&carried.grid),
@@ -2122,6 +2128,7 @@ fn the_idle_release_gives_up_every_store_this_layer_holds() {
                 .expect("a real time"),
         },
         sized(product, 100),
+        &[],
     );
     // Park a buffer the way a finished decode does, so the pool term is a real
     // one rather than an already-empty slot the release cannot fail on.
@@ -2154,5 +2161,85 @@ fn the_idle_release_gives_up_every_store_this_layer_holds() {
         "a second ask on an empty layer answers false, so a caller running \
          every frame does not bump the generation and invalidate every cache \
          keyed on it",
+    );
+}
+
+// ── The frame store's eviction order ────────────────────────────────────────
+
+/// File one granule through the public arrival path with a real union of pane
+/// states behind it. [`file_frame`] passes `PaneRef::across(&[])`, which names
+/// no pane at all, so it cannot express a scene where two panes want two
+/// different products — and that scene is the whole of what is under test.
+fn file_frame_across(
+    h: &mut MrmsHandler,
+    peers: &[&dyn std::any::Any],
+    product: MrmsProduct,
+    k: i64,
+    n: usize,
+) {
+    h.apply_frame(
+        FrameStamp {
+            valid: t(k),
+            run: None,
+        },
+        Box::new(MrmsFrameFetch {
+            product,
+            valid: t(k),
+            grid: Some(granule_at(product, k, n)),
+        }),
+        &PaneRef::across(peers),
+    );
+}
+
+/// **One pane live, one pane parked, and the parked pane's only granule is the
+/// first thing age order takes.**
+///
+/// The parked pane files its single granule and then stops asking: nothing
+/// touches it again, so it sits at the front of `recency` while the live pane's
+/// loop streams arrivals past it. Least-recently-used gives it up on the very
+/// next overflow, and the parked pane is dark until the next listing — with its
+/// product still selected, still enabled, still asked for by a real pane.
+///
+/// The scene has to be **mixed** to say anything. With both panes parked, both
+/// products are equally unwanted and age order is right by accident; with both
+/// live, "oldest" and "least wanted" are the same granule. And a demand term
+/// that only asked *is this product wanted* would leave this scene unchanged,
+/// because both products are wanted — what separates them is that one pane's
+/// ask is one granule deep and the other's is eight.
+#[test]
+fn a_parked_panes_only_granule_outlives_a_live_panes_loop_tail() {
+    // Four granules of eight values on the wide fixture arm: 4 * 8 * 4 B.
+    let mut h = MrmsHandler::with_frame_budget(4 * 8 * 4);
+    let live = pane_state(MrmsProduct::ReflectivityComposite);
+    let parked = pane_state(MrmsProduct::PrecipRate);
+    let peers: [&dyn std::any::Any; 2] = [&*live, &*parked];
+
+    // The parked pane's picture lands first and is never touched again.
+    file_frame_across(&mut h, &peers, MrmsProduct::PrecipRate, 0, 8);
+    assert!(
+        h.frame_grids.entries.contains_key(&FrameKey {
+            product: MrmsProduct::PrecipRate,
+            valid: t(0),
+        }),
+        "premise: the parked pane's granule is staged before the loop runs"
+    );
+
+    // The live pane's loop, driven well past the ceiling.
+    for k in 1..=8 {
+        file_frame_across(&mut h, &peers, MrmsProduct::ReflectivityComposite, k, 8);
+    }
+
+    assert!(
+        h.frame_grids.entries.contains_key(&FrameKey {
+            product: MrmsProduct::PrecipRate,
+            valid: t(0),
+        }),
+        "the parked pane still selects PrecipRate, so its one granule is the \
+         shallowest thing in the store and the loop's own tail goes before it"
+    );
+    assert_eq!(
+        h.frame_grids.len(),
+        4,
+        "the ceiling is untouched: which granules go changed, how many are kept did not"
     );
 }

@@ -66,7 +66,7 @@ fn output_of_side(range: f64, side: usize) -> CachedRenderOutput {
 fn inserting_past_capacity_evicts_instead_of_growing() {
     let mut cache = RenderCache::new(3, usize::MAX);
     for i in 0..10 {
-        cache.insert(key("KTLX", i), output(i as f64));
+        cache.insert(key("KTLX", i), output(i as f64), &[]);
     }
     assert_eq!(cache.entry_count(), 3, "capacity must bound the cache");
     // The three newest survived; everything older is gone.
@@ -81,13 +81,13 @@ fn inserting_past_capacity_evicts_instead_of_growing() {
 #[test]
 fn a_read_protects_an_entry_from_eviction() {
     let mut cache = RenderCache::new(3, usize::MAX);
-    cache.insert(key("KTLX", 0), output(0.0));
-    cache.insert(key("KTLX", 1), output(1.0));
-    cache.insert(key("KTLX", 2), output(2.0));
+    cache.insert(key("KTLX", 0), output(0.0), &[]);
+    cache.insert(key("KTLX", 1), output(1.0), &[]);
+    cache.insert(key("KTLX", 2), output(2.0), &[]);
 
     // Touch the oldest, making the *second* oldest the eviction candidate.
     assert!(cache.get(&key("KTLX", 0)).is_some());
-    cache.insert(key("KTLX", 3), output(3.0));
+    cache.insert(key("KTLX", 3), output(3.0), &[]);
 
     assert!(
         cache.get(&key("KTLX", 0)).is_some(),
@@ -105,16 +105,16 @@ fn a_read_protects_an_entry_from_eviction() {
 #[test]
 fn reinserting_a_key_replaces_it_without_duplicating_it() {
     let mut cache = RenderCache::new(2, usize::MAX);
-    cache.insert(key("KTLX", 0), output(0.0));
-    cache.insert(key("KTLX", 1), output(1.0));
-    cache.insert(key("KTLX", 0), output(99.0));
+    cache.insert(key("KTLX", 0), output(0.0), &[]);
+    cache.insert(key("KTLX", 1), output(1.0), &[]);
+    cache.insert(key("KTLX", 0), output(99.0), &[]);
 
     assert_eq!(cache.entry_count(), 2, "a replacement is not a new entry");
     assert_eq!(cache.recency_order(), vec![key("KTLX", 1), key("KTLX", 0)]);
     assert_eq!(cache.get(&key("KTLX", 0)).unwrap().max_range_km, 99.0);
 
     // With `0` refreshed, `1` is now the oldest and is what a third insert evicts.
-    cache.insert(key("KTLX", 2), output(2.0));
+    cache.insert(key("KTLX", 2), output(2.0), &[]);
     assert!(cache.get(&key("KTLX", 1)).is_none());
     assert!(cache.get(&key("KTLX", 0)).is_some());
 }
@@ -123,9 +123,9 @@ fn reinserting_a_key_replaces_it_without_duplicating_it() {
 #[test]
 fn retain_drops_keys_from_the_recency_queue_as_well() {
     let mut cache = RenderCache::new(4, usize::MAX);
-    cache.insert(key("KTLX", 0), output(0.0));
-    cache.insert(key("KOUN", 1), output(1.0));
-    cache.insert(key("KTLX", 2), output(2.0));
+    cache.insert(key("KTLX", 0), output(0.0), &[]);
+    cache.insert(key("KOUN", 1), output(1.0), &[]);
+    cache.insert(key("KTLX", 2), output(2.0), &[]);
 
     cache.retain(|k| k.select.site != "KTLX");
 
@@ -134,7 +134,7 @@ fn retain_drops_keys_from_the_recency_queue_as_well() {
 
     // Fill past capacity; KOUN is the oldest real entry and must be the one to go.
     for i in 10..14 {
-        cache.insert(key("KDDC", i), output(i as f64));
+        cache.insert(key("KDDC", i), output(i as f64), &[]);
     }
     assert_eq!(cache.entry_count(), 4);
     assert!(cache.get(&key("KOUN", 1)).is_none());
@@ -144,8 +144,8 @@ fn retain_drops_keys_from_the_recency_queue_as_well() {
 #[test]
 fn clear_empties_both_halves() {
     let mut cache = RenderCache::new(4, usize::MAX);
-    cache.insert(key("KTLX", 0), output(0.0));
-    cache.insert(key("KTLX", 1), output(1.0));
+    cache.insert(key("KTLX", 0), output(0.0), &[]);
+    cache.insert(key("KTLX", 1), output(1.0), &[]);
     cache.clear();
     assert_eq!(cache.entry_count(), 0);
     assert!(cache.recency_order().is_empty());
@@ -157,8 +157,8 @@ fn clear_empties_both_halves() {
 #[test]
 fn take_all_hands_every_entry_back_with_the_bytes_they_held() {
     let mut cache = RenderCache::new(4, usize::MAX);
-    cache.insert(key("KTLX", 0), output_of_side(0.0, 64));
-    cache.insert(key("KTLX", 1), output_of_side(1.0, 64));
+    cache.insert(key("KTLX", 0), output_of_side(0.0, 64), &[]);
+    cache.insert(key("KTLX", 1), output_of_side(1.0, 64), &[]);
     let held = cache.resident_bytes();
     assert!(
         held > 0,
@@ -182,7 +182,7 @@ fn take_all_hands_every_entry_back_with_the_bytes_they_held() {
 #[test]
 fn capacity_is_floored_at_one() {
     let mut cache = RenderCache::new(0, usize::MAX);
-    cache.insert(key("KTLX", 0), output(0.0));
+    cache.insert(key("KTLX", 0), output(0.0), &[]);
     assert_eq!(cache.entry_count(), 1);
     assert!(cache.get(&key("KTLX", 0)).is_some());
 }
@@ -493,7 +493,7 @@ fn a_cache_of_long_range_rasters_is_bounded_by_bytes_not_by_entries() {
     ] {
         let mut cache = RenderCache::new(usize::MAX, BUDGET);
         for i in 0..12 {
-            cache.insert(key("KTLX", i), output_of_side(i as f64, side));
+            cache.insert(key("KTLX", i), output_of_side(i as f64, side), &[]);
         }
         assert!(
             cache.resident_bytes() <= BUDGET,
@@ -526,12 +526,12 @@ fn a_cache_of_long_range_rasters_is_bounded_by_bytes_not_by_entries() {
 #[test]
 fn a_single_raster_over_the_whole_budget_is_still_cached() {
     let mut cache = RenderCache::new(usize::MAX, 1);
-    cache.insert(key("KTLX", 5), output_of_side(460.0, 512));
+    cache.insert(key("KTLX", 5), output_of_side(460.0, 512), &[]);
     assert_eq!(cache.entry_count(), 1);
     assert!(cache.get(&key("KTLX", 5)).is_some());
 
     // A second one evicts the first rather than accumulating.
-    cache.insert(key("KTLX", 6), output_of_side(300.0, 512));
+    cache.insert(key("KTLX", 6), output_of_side(300.0, 512), &[]);
     assert_eq!(cache.entry_count(), 1);
     assert!(cache.get(&key("KTLX", 6)).is_some());
 }
@@ -544,12 +544,12 @@ fn the_resident_total_survives_replacement_retention_and_clearing() {
     // written down.
     let one = 512 * 512 * 4 + hover_field(512).resident_bytes();
 
-    cache.insert(key("KTLX", 5), output_of_side(1.0, 512));
-    cache.insert(key("KOUN", 5), output_of_side(2.0, 512));
+    cache.insert(key("KTLX", 5), output_of_side(1.0, 512), &[]);
+    cache.insert(key("KOUN", 5), output_of_side(2.0, 512), &[]);
     assert_eq!(cache.resident_bytes(), 2 * one);
 
     // Replacing a key must not count the old entry twice.
-    cache.insert(key("KTLX", 5), output_of_side(3.0, 512));
+    cache.insert(key("KTLX", 5), output_of_side(3.0, 512), &[]);
     assert_eq!(
         cache.resident_bytes(),
         2 * one,
@@ -606,8 +606,8 @@ fn a_byte_budget_of_n_rasters_holds_n_rasters() {
     const SIDE: usize = 64;
     let budget = 2 * squallar_device_profile::constants::converted_raster_bytes(SIDE);
     let mut cache = RenderCache::new(MAX_RENDER_CACHE_ENTRIES, budget);
-    cache.insert(key("KTLX", 5), output_of_side(230.0, SIDE));
-    cache.insert(key("KTLX", 9), output_of_side(240.0, SIDE));
+    cache.insert(key("KTLX", 5), output_of_side(230.0, SIDE), &[]);
+    cache.insert(key("KTLX", 9), output_of_side(240.0, SIDE), &[]);
     assert_eq!(
         cache.entry_count(),
         2,
@@ -625,8 +625,8 @@ fn a_byte_budget_of_one_raster_holds_one_raster() {
     const SIDE: usize = 64;
     let budget = squallar_device_profile::constants::converted_raster_bytes(SIDE);
     let mut cache = RenderCache::new(MAX_RENDER_CACHE_ENTRIES, budget);
-    cache.insert(key("KTLX", 5), output_of_side(230.0, SIDE));
-    cache.insert(key("KTLX", 9), output_of_side(240.0, SIDE));
+    cache.insert(key("KTLX", 5), output_of_side(230.0, SIDE), &[]);
+    cache.insert(key("KTLX", 9), output_of_side(240.0, SIDE), &[]);
     assert_eq!(
         cache.entry_count(),
         1,
@@ -648,10 +648,122 @@ fn the_census_figure_still_carries_the_hover_field() {
         "the fixture's hover is empty; this proves nothing"
     );
     let mut cache = RenderCache::new(MAX_RENDER_CACHE_ENTRIES, usize::MAX);
-    cache.insert(key("KTLX", 5), entry);
+    cache.insert(key("KTLX", 5), entry, &[]);
     assert_eq!(
         cache.resident_bytes(),
         squallar_device_profile::constants::converted_raster_bytes(SIDE) + hover,
         "the census family lost the hover field when the budget gave it up"
+    );
+}
+
+// ── What the panes are drawing ──────────────────────────────────────────────
+
+/// A dispatcher with `panes` pane slots and a render cache of exactly
+/// `capacity` entries, so the ceiling is a figure the test names rather than
+/// whatever the shipped ladder happens to hand it.
+fn dispatcher_with(panes: usize, capacity: usize) -> RenderDispatcher {
+    let mut d = RenderDispatcher::new();
+    d.pane_render = (0..panes)
+        .map(|_| PaneRenderState::new(Arc::new(AtomicUsize::new(0))))
+        .collect();
+    d.render_cache = RenderCache::new(capacity, usize::MAX);
+    d
+}
+
+/// **The pin a pane records has to be spelled the way the cache keys entries**,
+/// or it names nothing and the rank below is a mechanism whose precondition
+/// never holds.
+///
+/// This is the cheap half of the test that matters. A pin built from the
+/// *pane's* selected site while the entry was filed under the *scan's* site
+/// would read as a working mechanism on every instrument except a hit rate.
+#[test]
+fn the_pin_a_pane_records_is_the_key_the_cache_filed_it_under() {
+    let mut d = dispatcher_with(1, 4);
+    d.pane_render[0].note_picture("KTLX", RadarProduct::Reflectivity, 0.5);
+    assert_eq!(
+        d.pane_render[0].showing_plan_view.as_ref(),
+        Some(&key("KTLX", 5)),
+        "the pane's claim and the cache's key are the same string or the pin is inert",
+    );
+}
+
+/// **One pane settled on its picture, one pane live, and age order takes the
+/// settled pane's picture out from under it.**
+///
+/// The shared cache is keyed by site, product and tilt rather than by pane, and
+/// `app_render` says in as many words that it is not evicted when one pane
+/// stops drawing because "a sibling pane may still be showing the same
+/// picture". Nothing told the capacity policy that. A pane holding a steady
+/// picture re-reads nothing — `needs_render` is false while `last_rendered`
+/// matches what the pane wants, so the lookup that would touch the entry is
+/// never reached — and the entry drifts to the front of the recency list while
+/// it is still on screen.
+///
+/// The scene has to be **mixed**. With every pane settled, nothing new arrives
+/// and the cache never overflows; with every pane live, whatever is evicted was
+/// about to be replaced anyway. It is one settled pane beside one working pane
+/// that separates "oldest" from "least wanted".
+#[test]
+fn a_settled_panes_picture_outlives_a_working_panes_churn() {
+    let mut d = dispatcher_with(2, 4);
+
+    // Pane 0 settles on KTLX 0.5 and then stops asking for anything.
+    d.cache_render(
+        "KTLX",
+        RadarProduct::Reflectivity,
+        RenderView::PlanView,
+        0.5,
+        output(0.5),
+    );
+    d.pane_render[0].note_picture("KTLX", RadarProduct::Reflectivity, 0.5);
+    assert!(
+        d.render_cache.get(&key("KTLX", 5)).is_some(),
+        "premise: the settled pane's picture is resident before the churn",
+    );
+
+    // Pane 1 works through tilt after tilt, well past the ceiling.
+    for tenths in 10..24 {
+        d.pane_render[1].note_picture("KTLX", RadarProduct::Reflectivity, tenths as f32 / 10.0);
+        d.cache_render(
+            "KTLX",
+            RadarProduct::Reflectivity,
+            RenderView::PlanView,
+            tenths as f32 / 10.0,
+            output(f64::from(tenths)),
+        );
+    }
+
+    assert!(
+        d.render_cache.get(&key("KTLX", 5)).is_some(),
+        "pane 0 is still showing this picture, so the churn's own tail goes first",
+    );
+    assert_eq!(
+        d.render_cache.entry_count(),
+        4,
+        "the ceiling is untouched: which entry goes changed, how many are kept did not",
+    );
+}
+
+/// **The ceiling still binds when every resident entry is pinned.** A rank that
+/// could refuse to evict would turn a reorder into an unbounded cache, which is
+/// a worse defect than the one it fixes.
+#[test]
+fn panes_demanding_more_than_the_ceiling_still_get_exactly_the_ceiling() {
+    let mut d = dispatcher_with(12, 4);
+    for (pane, tenths) in (5..17).enumerate() {
+        d.pane_render[pane].note_picture("KTLX", RadarProduct::Reflectivity, tenths as f32 / 10.0);
+        d.cache_render(
+            "KTLX",
+            RadarProduct::Reflectivity,
+            RenderView::PlanView,
+            tenths as f32 / 10.0,
+            output(f64::from(tenths)),
+        );
+    }
+    assert_eq!(
+        d.render_cache.entry_count(),
+        4,
+        "twelve panes each pinning a different picture must not raise the ceiling",
     );
 }

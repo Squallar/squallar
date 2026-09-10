@@ -2092,6 +2092,7 @@ fn an_evicted_frame_granule_is_offered_to_the_staging_pool() {
             valid: hour(0),
         },
         mosaic_granule(channel, 0),
+        &[],
     );
     assert_eq!(
         POOL.totals(),
@@ -2110,6 +2111,7 @@ fn an_evicted_frame_granule_is_offered_to_the_staging_pool() {
             valid: hour(1),
         },
         mosaic_granule(channel, 1),
+        &[],
     );
     assert_eq!(h.frame_grids.len(), 1, "premise: the budget evicted one");
     assert_eq!(
@@ -2149,6 +2151,7 @@ fn a_frame_dropped_by_retain_frames_is_offered_to_the_staging_pool() {
             valid: hour(0),
         },
         mosaic_granule(channel, 0),
+        &[],
     );
 
     h.retain_frames(&PaneRef::across(&[]), &[]);
@@ -2181,6 +2184,7 @@ fn an_evicted_granule_a_job_still_holds_is_declined() {
             valid: hour(0),
         },
         first,
+        &[],
     );
     h.frame_grids.insert(
         FrameKey {
@@ -2188,6 +2192,7 @@ fn an_evicted_granule_a_job_still_holds_is_declined() {
             valid: hour(1),
         },
         mosaic_granule(channel, 1),
+        &[],
     );
     assert_eq!(h.frame_grids.len(), 1, "premise: the budget evicted one");
     assert_eq!(
@@ -2473,6 +2478,7 @@ fn a_carry_a_staged_granule_also_holds_is_priced_once() {
             bounds,
             valid_time: valid,
         },
+        &[],
     );
     assert!(
         h.frame_grids.holds(&carried),
@@ -2536,6 +2542,7 @@ fn the_idle_release_gives_up_every_store_this_layer_holds() {
                 .expect("a real time"),
         },
         granule_of(channel, 100),
+        &[],
     );
     // Park a buffer the way a finished decode does, so the pool term is a real
     // one rather than an already-empty slot the release cannot fail on.
@@ -2568,5 +2575,80 @@ fn the_idle_release_gives_up_every_store_this_layer_holds() {
         "a second ask on an empty layer answers false, so a caller running \
          every frame does not bump the generation and invalidate every cache \
          keyed on it",
+    );
+}
+
+// -- The frame store's eviction order ----------------------------------------
+
+/// File one granule through the public arrival path with a real union of pane
+/// states behind it. [`file_frame`] passes `PaneRef::across(&[])`, which names
+/// no pane at all, so it cannot express a scene where two panes want two
+/// different channels — and that scene is the whole of what is under test.
+fn file_frame_across(
+    h: &mut GmgsiHandler,
+    peers: &[&dyn std::any::Any],
+    channel: GmgsiChannel,
+    k: i64,
+    n: usize,
+) {
+    h.apply_frame(
+        FrameStamp {
+            valid: hour(k),
+            run: None,
+        },
+        Box::new(GmgsiFrameFetch {
+            channel,
+            valid: hour(k),
+            grid: Some(granule_at(channel, k, n)),
+        }),
+        &PaneRef::across(peers),
+    );
+}
+
+/// **One pane live, one pane parked, and the parked pane's only granule is the
+/// first thing age order takes.** MRMS's twin, on the layer that shares its
+/// shape — see `mrms::tests::a_parked_panes_only_granule_outlives_a_live_panes_loop_tail`
+/// for the full statement of the defect.
+///
+/// The scene has to be **mixed**: with both panes parked both channels are
+/// equally unwanted and age order is right by accident, and a demand term that
+/// only asked *is this channel wanted* would leave this scene unchanged,
+/// because both channels are wanted. What separates them is that one pane's ask
+/// is one granule deep and the other's is eight.
+#[test]
+fn a_parked_panes_only_granule_outlives_a_live_panes_loop_tail() {
+    // Four granules of eight values, and GMGSI stays on the wide arm: 4 * 8 * 4 B.
+    let mut h = GmgsiHandler::with_frame_budget(4 * 8 * 4);
+    let live = pane_state(GmgsiChannel::LongwaveIr);
+    let parked = pane_state(GmgsiChannel::WaterVapor);
+    let peers: [&dyn std::any::Any; 2] = [&*live, &*parked];
+
+    // The parked pane's picture lands first and is never touched again.
+    file_frame_across(&mut h, &peers, GmgsiChannel::WaterVapor, 0, 8);
+    assert!(
+        h.frame_grids.entries.contains_key(&FrameKey {
+            channel: GmgsiChannel::WaterVapor,
+            valid: hour(0),
+        }),
+        "premise: the parked pane's granule is staged before the loop runs"
+    );
+
+    // The live pane's loop, driven well past the ceiling.
+    for k in 1..=8 {
+        file_frame_across(&mut h, &peers, GmgsiChannel::LongwaveIr, k, 8);
+    }
+
+    assert!(
+        h.frame_grids.entries.contains_key(&FrameKey {
+            channel: GmgsiChannel::WaterVapor,
+            valid: hour(0),
+        }),
+        "the parked pane still selects WaterVapor, so its one granule is the \
+         shallowest thing in the store and the loop's own tail goes before it"
+    );
+    assert_eq!(
+        h.frame_grids.len(),
+        4,
+        "the ceiling is untouched: which granules go changed, how many are kept did not"
     );
 }

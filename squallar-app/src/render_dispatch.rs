@@ -180,6 +180,24 @@ pub struct PaneRenderState {
     in_flight_plan_view: Option<RenderKey>,
     /// Last rendered radar parameters to detect changes.
     pub last_rendered: Option<(RadarProduct, f32)>,
+    /// **Which plan view is on this pane's glass right now**, as the same
+    /// `(site, product, view, elevation)` key [`render_cache_key`] builds for
+    /// [`Self::in_flight_plan_view`].
+    ///
+    /// The in-flight key answers *what is being drawn*; this answers *what is
+    /// already drawn*, and the shared [`RenderCache`] needs the second one to
+    /// know what it must not evict. A pane that is steadily showing its picture
+    /// re-reads nothing: `needs_render` is false while `last_rendered` matches
+    /// what the pane wants, so the cache lookup is never reached and the entry
+    /// ages to the front of the recency list while the sibling pane that is
+    /// still showing it says nothing. Age order then takes the picture out from
+    /// under it.
+    ///
+    /// Moves with [`Self::last_rendered`] at every site, through
+    /// [`Self::note_picture`] and [`Self::forget_picture`], because a pin left
+    /// behind by a pane that has stopped drawing is a stale claim on a shared
+    /// budget.
+    pub showing_plan_view: Option<RenderKey>,
     /// **The buffer behind the texture this pane is showing** — an identity,
     /// held weakly, and not a picture.
     ///
@@ -256,6 +274,7 @@ impl PaneRenderState {
             render_in_flight: false,
             in_flight_plan_view: None,
             last_rendered: None,
+            showing_plan_view: None,
             uploaded_from: None,
             showing_fan: None,
             results_wanted: Vec::new(),
@@ -295,6 +314,11 @@ impl PaneRenderState {
         self.showing_fan = Some(Arc::downgrade(sweep));
         // The counterpart clear, for the reason `note_uploaded`'s is there.
         self.uploaded_from = None;
+        // And the plan-view pin goes with it: a fan is drawn from its own
+        // payload and mints no texture, so this pane is holding nothing in the
+        // shared render cache and must not spend a slot of its budget claiming
+        // it is.
+        self.showing_plan_view = None;
     }
 
     /// **What this pane's own picture is holding on this heap, bytes.**
@@ -321,6 +345,35 @@ impl PaneRenderState {
         self.uploaded_from
             .as_ref()
             .is_some_and(|seen| std::ptr::eq(seen.as_ptr(), Arc::as_ptr(image)))
+    }
+
+    /// **This pane is now showing `product` at `elevation` of `site`** — the
+    /// pair [`Self::last_rendered`] has always carried, plus the cache key that
+    /// pair names, recorded together so the two cannot disagree.
+    ///
+    /// `site` is the scan's own site rather than the pane's selection: it is
+    /// what the render was keyed under, and a pin under any other spelling
+    /// names an entry that is not there.
+    pub fn note_picture(&mut self, site: &str, product: RadarProduct, elevation: f32) {
+        self.last_rendered = Some((product, elevation));
+        self.showing_plan_view = Some(render_cache_key(
+            site,
+            &squallar_radar::fields::spec(product).id,
+            RenderView::PlanView,
+            elevation,
+        ));
+    }
+
+    /// **This pane is showing no plan view** — the clear half of
+    /// [`Self::note_picture`], and every site that used to drop
+    /// [`Self::last_rendered`] alone goes through it.
+    ///
+    /// The pin has to go with the mark. Left behind, it is a claim on the
+    /// shared cache's capacity made by a pane that has stopped drawing, and the
+    /// budget would spend a slot defending a picture nobody is looking at.
+    pub fn forget_picture(&mut self) {
+        self.last_rendered = None;
+        self.showing_plan_view = None;
     }
 
     /// Mark a render dispatched for this pane, `key` naming the plan view it draws —
@@ -376,6 +429,57 @@ pub struct CachedRenderOutput {
     /// Where the storm motion vector behind this shared raster came from — shared for
     /// the same argument as the three above: one buffer.
     pub storm_motion: Option<squallar_radar::srv::SrvMotion>,
+}
+
+/// **How often ranking the shared render cache by what the panes are drawing
+/// kept a picture that age order would have taken.**
+///
+/// Always on, in release as much as in a test build. A cache whose pin never
+/// fires and a cache that has no pin read identically from every other
+/// instrument this application has, so without this "a sibling pane keeps its
+/// picture now" is an argument rather than a reading.
+///
+/// **Two figures, and the denominator is the one that decides whether the row
+/// prints at all.** `considered` counts every eviction the capacity policy
+/// actually performed; `spared` counts the subset where the pin named a
+/// different victim than plain least-recently-used would have. A session that
+/// evicted nothing has no population to report and prints no row; a session
+/// that evicted and spared nothing prints a real `0`, which is a reading — it
+/// says the mechanism ran and did not fire, and that is exactly the state a
+/// silent row would hide.
+///
+/// Blocks, never bytes. The ceiling that decides *how many* entries go is
+/// untouched by the rank that decides *which*, so an eviction reordered saves
+/// no bytes by itself and pricing these in bytes would add two currencies that
+/// share no denominator.
+pub mod pin_ledger {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    static CONSIDERED: AtomicU64 = AtomicU64::new(0);
+    static SPARED: AtomicU64 = AtomicU64::new(0);
+
+    /// One eviction from the shared render cache. `spared` when the pin named a
+    /// different entry than age order would have.
+    pub fn note_render_eviction(spared: bool) {
+        CONSIDERED.fetch_add(1, Relaxed);
+        if spared {
+            SPARED.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// `(considered, spared)` as running totals.
+    #[must_use]
+    pub fn totals() -> (u64, u64) {
+        (CONSIDERED.load(Relaxed), SPARED.load(Relaxed))
+    }
+
+    /// Zero both figures. These are process-wide, so a suite reading them takes
+    /// this first and does not run beside another test that writes them.
+    #[doc(hidden)]
+    pub fn reset_for_test() {
+        CONSIDERED.store(0, Relaxed);
+        SPARED.store(0, Relaxed);
+    }
 }
 
 /// Bounded least-recently-used cache of render outputs shared between panes.
@@ -490,7 +594,7 @@ impl RenderCache {
 
     /// Insert an entry, evicting the least recently used until within **both**
     /// capacities.
-    pub fn insert(&mut self, key: RenderKey, value: CachedRenderOutput) {
+    pub fn insert(&mut self, key: RenderKey, value: CachedRenderOutput, pinned: &[RenderKey]) {
         let bytes = Self::entry_bytes(&value);
         let budgeted = Self::entry_budget_bytes(&value);
         if let Some(old) = self.entries.insert(key.clone(), value) {
@@ -506,7 +610,7 @@ impl RenderCache {
         self.resident_bytes += bytes;
         self.budgeted_bytes += budgeted;
         while self.over_capacity() {
-            if self.evict_lru().is_none() {
+            if self.evict_lru(pinned).is_none() {
                 break;
             }
         }
@@ -599,12 +703,24 @@ impl RenderCache {
             || (self.budgeted_bytes > self.byte_capacity && self.entries.len() > 1)
     }
 
-    /// Evict the least-recently-used entry, debit both ledgers for it and
-    /// hand it back owned. `None` once nothing is left to evict.
-    fn evict_lru(&mut self) -> Option<CachedRenderOutput> {
+    /// Evict one entry, debit both ledgers for it and hand it back owned.
+    /// `None` once nothing is left to evict.
+    ///
+    /// **Least-recently-used among the entries no pane is drawing**, and only
+    /// then the least-recently-used of the rest. `pinned` is the union of what
+    /// every pane has on its glass or in flight; see
+    /// [`Self::victim_position`] for why age alone is the wrong order here.
+    fn evict_lru(&mut self, pinned: &[RenderKey]) -> Option<CachedRenderOutput> {
         loop {
-            let oldest = self.recency.pop_front()?;
-            if let Some(gone) = self.entries.remove(&oldest) {
+            let pos = self.victim_position(pinned)?;
+            let victim = self.recency.remove(pos)?;
+            if let Some(gone) = self.entries.remove(&victim) {
+                // What age order on its own would have taken. A different
+                // answer is one picture a sibling pane keeps that plain LRU
+                // would have pulled out from under it. Every eviction is
+                // counted, fired or not, so that a pin which never fires stays
+                // distinguishable from a build that has no pin at all.
+                pin_ledger::note_render_eviction(pos != 0);
                 self.resident_bytes = self.resident_bytes.saturating_sub(Self::entry_bytes(&gone));
                 self.budgeted_bytes = self
                     .budgeted_bytes
@@ -612,6 +728,41 @@ impl RenderCache {
                 return Some(gone);
             }
         }
+    }
+
+    /// **The index in `recency` of the entry to give up** — anything no pane is
+    /// drawing before anything a pane is.
+    ///
+    /// This cache is the pane-**sharing** one: it is keyed by site, product and
+    /// tilt rather than by pane, and `app_render` says in as many words that it
+    /// is not evicted when one pane stops drawing because "a sibling pane may
+    /// still be showing the same picture". Nothing told the capacity policy
+    /// that. A pane holding a steady picture re-reads nothing — `needs_render`
+    /// is false while `last_rendered` matches, so the lookup that would touch
+    /// the entry is never reached — and the entry drifts to the front of the
+    /// recency list while still on screen. The byte arm then takes it, and the
+    /// sibling's next invalidation re-renders a picture that was resident a
+    /// moment ago.
+    ///
+    /// `pinned` is the union across panes ([`RenderDispatcher::drawn_plan_views`]),
+    /// which is the rule `PaneRef::peers` states for a cache a whole layer draws
+    /// from. **The ceiling is untouched**: when every resident entry is pinned
+    /// this still answers the front of the list, so `over_capacity` bounds the
+    /// cache exactly as before and this reorders which entry goes rather than
+    /// how many are kept. An empty `pinned` is the shipped order exactly.
+    fn victim_position(&self, pinned: &[RenderKey]) -> Option<usize> {
+        if self.recency.is_empty() {
+            return None;
+        }
+        if pinned.is_empty() {
+            return Some(0);
+        }
+        Some(
+            self.recency
+                .iter()
+                .position(|key| !pinned.contains(key))
+                .unwrap_or(0),
+        )
     }
 
     /// **Re-apply the byte budget** — the ladder's lever on this cache when a
@@ -630,11 +781,15 @@ impl RenderCache {
     /// The returned entries carry their census bytes ([`Self::entry_bytes`],
     /// pixels and hover) for whoever prices the discard; what decided they had
     /// to go is the budgeted figure, as it is for an insert.
-    pub fn set_byte_capacity(&mut self, bytes: usize) -> Vec<CachedRenderOutput> {
+    pub fn set_byte_capacity(
+        &mut self,
+        bytes: usize,
+        pinned: &[RenderKey],
+    ) -> Vec<CachedRenderOutput> {
         self.byte_capacity = bytes;
         let mut evicted = Vec::new();
         while self.over_capacity() {
-            match self.evict_lru() {
+            match self.evict_lru(pinned) {
                 Some(gone) => evicted.push(gone),
                 None => break,
             }
@@ -1290,7 +1445,7 @@ impl RenderDispatcher {
                 prs.last_rendered,
                 Some((RadarProduct::StormRelativeVelocity, _))
             ) {
-                prs.last_rendered = None;
+                prs.forget_picture();
             }
         }
         self.render_cache
@@ -1338,7 +1493,7 @@ impl RenderDispatcher {
                     .last_rendered
                     .is_some_and(|(p, _)| p.reads_env_heights())
             {
-                prs.last_rendered = None;
+                prs.forget_picture();
             }
         }
         self.render_cache.retain(|k| {
@@ -1371,7 +1526,7 @@ impl RenderDispatcher {
                     .last_rendered
                     .is_some_and(|(p, _)| p == RadarProduct::HydrometeorClassification)
             {
-                prs.last_rendered = None;
+                prs.forget_picture();
             }
         }
         self.render_cache.retain(|k| {
@@ -1403,7 +1558,7 @@ impl RenderDispatcher {
                     .last_rendered
                     .is_some_and(|(p, _)| p == RadarProduct::StormRelativeVelocity)
             {
-                prs.last_rendered = None;
+                prs.forget_picture();
             }
         }
         self.render_cache.retain(|k| {
@@ -1430,7 +1585,7 @@ impl RenderDispatcher {
     /// instead, and they are much larger than this.
     pub fn forget_panes_from(&mut self, from: usize) {
         for prs in self.pane_render.iter_mut().skip(from) {
-            prs.last_rendered = None;
+            prs.forget_picture();
             prs.uploaded_from = None;
             prs.render_finished();
             // Paired with the line above: see `results_wanted`.
@@ -1460,7 +1615,7 @@ impl RenderDispatcher {
     pub fn reset_panes_for_site(&mut self, site: &str, gui: &squallar_egui::Gui) {
         for (idx, prs) in self.pane_render.iter_mut().enumerate() {
             if gui.pane(idx).is_some_and(|p| p.site() == site) {
-                prs.last_rendered = None;
+                prs.forget_picture();
                 prs.uploaded_from = None;
                 prs.render_finished();
                 // Paired with the line above: see `results_wanted`.
@@ -1588,7 +1743,7 @@ impl RenderDispatcher {
                     })
                     .is_some_and(|(product, elevation)| want(product, elevation));
             if matches {
-                prs.last_rendered = None;
+                prs.forget_picture();
                 prs.uploaded_from = None;
                 prs.render_finished();
                 // Paired with the line above: see `results_wanted`.
@@ -1603,7 +1758,7 @@ impl RenderDispatcher {
     /// [`render_generation`](Self::render_generation).
     pub fn reset_panes(&mut self) {
         for prs in &mut self.pane_render {
-            prs.last_rendered = None;
+            prs.forget_picture();
             prs.uploaded_from = None;
             prs.render_finished();
             prs.abandon_results();
@@ -1627,7 +1782,7 @@ impl RenderDispatcher {
     /// not exist.
     pub fn clear_last_rendered(&mut self) {
         for prs in &mut self.pane_render {
-            prs.last_rendered = None;
+            prs.forget_picture();
             prs.uploaded_from = None;
         }
     }
@@ -1644,7 +1799,37 @@ impl RenderDispatcher {
     /// first, for the same deferred-drop path [`Self::clear_render_cache`]'s
     /// entries take.
     pub fn set_render_cache_budget_bytes(&mut self, bytes: usize) -> Vec<CachedRenderOutput> {
-        self.render_cache.set_byte_capacity(bytes)
+        let pinned = self.drawn_plan_views();
+        self.render_cache.set_byte_capacity(bytes, &pinned)
+    }
+
+    /// **What the panes are drawing right now**, as render-cache keys — the
+    /// union this shared cache's capacity policy must rank by.
+    ///
+    /// Both halves count. `showing_plan_view` is the picture already on a
+    /// pane's glass, which is the one age order loses track of because a
+    /// settled pane touches nothing; `in_flight_plan_view` is the one a pane
+    /// has asked for and will apply, and evicting an entry a render is about to
+    /// answer with is the same waste one move earlier.
+    ///
+    /// Deduplicated, because two panes on the same site, product and tilt share
+    /// one entry — which is the whole reason this cache is keyed the way it is.
+    fn drawn_plan_views(&self) -> Vec<RenderKey> {
+        let mut pinned: Vec<RenderKey> = Vec::new();
+        for prs in &self.pane_render {
+            for key in [
+                prs.showing_plan_view.as_ref(),
+                prs.in_flight_plan_view.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !pinned.contains(key) {
+                    pinned.push(key.clone());
+                }
+            }
+        }
+        pinned
     }
 
     /// Check if any pane has a render in flight.
@@ -1731,6 +1916,7 @@ impl RenderDispatcher {
         elevation: f32,
         output: CachedRenderOutput,
     ) {
+        let pinned = self.drawn_plan_views();
         self.render_cache.insert(
             render_cache_key(
                 site,
@@ -1739,6 +1925,7 @@ impl RenderDispatcher {
                 elevation,
             ),
             output,
+            &pinned,
         );
     }
 }
