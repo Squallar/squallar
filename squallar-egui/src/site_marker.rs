@@ -188,7 +188,8 @@ pub(crate) fn draw_coverage_ring(
     );
 }
 
-/// Draw one station's marker at a screen position.
+/// Draw a whole table of station markers, as **one** mesh off **one** sprite
+/// lookup.
 ///
 /// **Every length here is a point on the display**, so the marker is whatever
 /// size the live map zoom says and nothing between the map and the glass can
@@ -196,12 +197,46 @@ pub(crate) fn draw_coverage_ring(
 /// texture is placed by its geographic corners and therefore scales with the
 /// gesture, which put the marker four times its size two zoom levels into a
 /// pinch and snapped it back when the zoom went still.
-pub(crate) fn draw_site_marker(
-    painter: &egui::Painter,
-    center: egui::Pos2,
-    zoom: f64,
-    role: MarkerRole,
-) {
+///
+/// # What was per station and had no reason to be
+///
+/// Every marker in a frame is the same sprite at the same size: the sprite is
+/// keyed on the zoom's radius and the display's `pixels_per_point`, and
+/// neither moves between two stations of one frame. Resolving it per station
+/// cost a `Context::write` (`data_mut`), a `Mutex`, a map probe and a
+/// `TextureHandle` clone **per station**, for an answer that could not differ.
+///
+/// And every marker was its own `Mesh` — two `Vec`s — in its own `Arc`, handed
+/// to the painter by its own `Painter::add`, which is another `Context::write`
+/// each. Two quads of eight vertices, four allocations and two lock
+/// acquisitions apiece. The tessellator then appended every one of them into
+/// the same output mesh, because they share a clip and a texture: the merge
+/// was already happening and only the cost of getting there was per station.
+///
+/// So the sprite is resolved once for the table and the quads go into one
+/// mesh, in the order the caller hands them over — which is the order they
+/// were added in before, so the vertex and index stream is unchanged, which
+/// `tests::a_batched_marker_run_tessellates_to_the_same_bytes_as_one_mesh_per_station`
+/// holds byte for byte.
+///
+/// # The cull is epaint's, applied here
+///
+/// `visible_radar_sites` keeps a station within 100 points of the pane so a
+/// marker straddling the edge still draws and still takes a click, so a frame
+/// really does carry markers that miss the pane's clip outright. epaint drops
+/// each of those today (`coarse_tessellation_culling` against the shape's own
+/// bounds); one batched mesh is bounded by the union and would keep them. The
+/// same test is therefore made here, against the marker's quad — which is
+/// exactly what `Mesh::calc_bounds` would have answered, since both quads of a
+/// marker are that rectangle.
+pub(crate) fn draw_site_markers<I>(painter: &egui::Painter, zoom: f64, markers: I)
+where
+    I: IntoIterator<Item = (egui::Pos2, MarkerRole)>,
+{
+    let mut markers = markers.into_iter().peekable();
+    if markers.peek().is_none() {
+        return;
+    }
     let shape = marker_shape(zoom);
     let sprite = marker_sprite(painter.ctx(), shape);
     // Snapped to the pixel grid so each texel lands on one pixel: the quad's
@@ -209,14 +244,23 @@ pub(crate) fn draw_site_marker(
     // the ring's one-pixel core across two pixels at half strength.
     let ppp = painter.ctx().pixels_per_point();
     let snap = |v: f32| (v * ppp).round() / ppp;
-    let min = egui::pos2(
-        snap(center.x - sprite.half_points),
-        snap(center.y - sprite.half_points),
-    );
-    let rect = egui::Rect::from_min_size(min, egui::Vec2::splat(2.0 * sprite.half_points));
+    let clip = painter.clip_rect();
     let mut mesh = egui::Mesh::with_texture(sprite.texture.id());
-    mesh.add_rect_with_uv(rect, sprite.disc_uv, role.fill());
-    mesh.add_rect_with_uv(rect, sprite.ring_uv, egui::Color32::WHITE);
+    for (center, role) in markers {
+        let min = egui::pos2(
+            snap(center.x - sprite.half_points),
+            snap(center.y - sprite.half_points),
+        );
+        let rect = egui::Rect::from_min_size(min, egui::Vec2::splat(2.0 * sprite.half_points));
+        if !clip.intersects(rect) {
+            continue;
+        }
+        mesh.add_rect_with_uv(rect, sprite.disc_uv, role.fill());
+        mesh.add_rect_with_uv(rect, sprite.ring_uv, egui::Color32::WHITE);
+    }
+    if mesh.is_empty() {
+        return;
+    }
     painter.add(egui::Shape::mesh(mesh));
 }
 

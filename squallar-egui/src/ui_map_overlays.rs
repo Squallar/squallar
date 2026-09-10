@@ -327,8 +327,14 @@ pub(super) fn draw_tile_layer(
     // primitive where the per-tile clip opened one per tile (45 on a
     // 1920x1080 pane: the ground's largest remaining primitive source once
     // its callbacks were batched). The second walk draws the tiles. Why the
-    // hoist changes no pixel is `hoisted_background`'s to say.
+    // hoist changes no pixel is `hoist_background`'s to say.
     let mut answered: Vec<(egui::Rect, GroundPiece, Background)> = Vec::with_capacity(span.tiles());
+    // Every hoisted rectangle of this pass, in one mesh rather than one
+    // `Shape::Mesh` and one `Painter::add` each. See
+    // [`crate::tile_mesh::HoistedBackgrounds`] for why that changes no
+    // vertex, and `hoist_background` for why the hoist is legal at all.
+    let mut backgrounds = crate::tile_mesh::HoistedBackgrounds::default();
+    let background_clip = ui.painter().clip_rect();
     for ty in span.north..=span.south {
         for tx in span.west..=span.east {
             // **Two different columns, and that is the wrap.** `tx` is the
@@ -359,12 +365,17 @@ pub(super) fn draw_tile_layer(
 
             let background = match &piece.tile {
                 Tile::Vector(shapes) => {
-                    match hoisted_background(shapes, rect, piece.uv, ui.pixels_per_point()) {
-                        Some(shape) => {
-                            ui.painter().add(shape);
-                            Background::Hoisted
-                        }
-                        None => Background::Inline,
+                    if hoist_background(
+                        &mut backgrounds,
+                        shapes,
+                        rect,
+                        piece.uv,
+                        ui.pixels_per_point(),
+                        background_clip,
+                    ) {
+                        Background::Hoisted
+                    } else {
+                        Background::Inline
                     }
                 }
                 // A raster tile has no background rectangle to take.
@@ -372,6 +383,10 @@ pub(super) fn draw_tile_layer(
             };
             answered.push((rect, piece, background));
         }
+    }
+
+    if let Some(shape) = backgrounds.finish() {
+        ui.painter().add(shape);
     }
 
     for (rect, piece, background) in answered {
@@ -818,7 +833,7 @@ enum Background {
     /// Inside the tile's own walk, placed and clipped like every other shape.
     Inline,
     /// Already drawn by the caller, ahead of every tile's geometry, from
-    /// [`hoisted_background`]; the tile's walk skips [`BACKGROUND_SHAPE`].
+    /// [`hoist_background`]; the tile's walk skips [`BACKGROUND_SHAPE`].
     Hoisted,
 }
 
@@ -848,26 +863,30 @@ impl Background {
 ///
 /// `None` leaves the shape to the tile's clipped walk: a tile whose first
 /// shape is not a plain fill, or a background that misses its piece.
-fn hoisted_background(
+fn hoist_background(
+    into: &mut crate::tile_mesh::HoistedBackgrounds,
     shapes: &[walkers::ShapeOrText],
     piece: egui::Rect,
     uv: egui::Rect,
     pixels_per_point: f32,
-) -> Option<egui::Shape> {
-    let first = shapes.get(BACKGROUND_SHAPE)?;
+    clip: egui::Rect,
+) -> bool {
+    let Some(first) = shapes.get(BACKGROUND_SHAPE) else {
+        return false;
+    };
     let walkers::ShapeOrText::Shape(egui::Shape::Rect(background)) = first else {
-        return None;
+        return false;
     };
     if !crate::tile_mesh::is_hoistable_background(background) {
-        return None;
+        return false;
     }
     // `placed`, not a hand-written transform: the same arithmetic `place_one`
     // applies to every shape the tile's own walk draws.
     let placement = walkers::mvt::placement(full_rect_of_clipped_tile(piece, uv));
     let walkers::ShapeOrText::Shape(egui::Shape::Rect(placed)) = first.placed(placement) else {
-        return None;
+        return false;
     };
-    crate::tile_mesh::background_within(&placed, piece, pixels_per_point)
+    into.push(&placed, piece, pixels_per_point, clip)
 }
 
 /// Paint one decoded vector tile.
@@ -916,7 +935,7 @@ fn hoisted_background(
 /// that was asked for. The one shape that does not take that clip is the
 /// background rectangle when `background` is [`Background::Hoisted`]: the
 /// caller has already drawn it, cut to the piece rather than clipped to it,
-/// ahead of every tile -- see [`hoisted_background`] -- and this walk skips it.
+/// ahead of every tile -- see [`hoist_background`] -- and this walk skips it.
 ///
 /// **This is the ground phase: it paints geometry and defers every label.**
 /// Text is pushed onto `labels` for [`paint_labels`] to lay out once the whole
@@ -4284,11 +4303,42 @@ mod tests {
         )
     }
 
-    fn bounds_of(clipped: &egui::epaint::ClippedShape) -> egui::Rect {
-        let egui::Shape::Mesh(m) = &clipped.shape else {
-            panic!("{:?} is not a mesh", clipped.shape)
+    /// The quads of the walk's leading background mesh, in the order they were
+    /// added -- four vertices each, so quad `i` is `vertices[4i..4i+4]`.
+    ///
+    /// **The arrangement the assertions below read.** Until 2026-09-09 each
+    /// tile's background was its own `Shape::Mesh` and each was read off the
+    /// shape list directly; they are now appended to one mesh in walk order
+    /// (`tile_mesh::HoistedBackgrounds`), which is the arrangement epaint
+    /// tessellated them into either way. Every geometric claim the per-shape
+    /// reads made -- walk order, one quad per tile, each on its own tile's
+    /// pixel-rounded rect, in that tile's colour -- is made here against the
+    /// quads instead.
+    fn background_quads(clipped: &egui::epaint::ClippedShape) -> Vec<(egui::Rect, egui::Color32)> {
+        let egui::Shape::Mesh(mesh) = &clipped.shape else {
+            panic!("{:?} is not the batched background mesh", clipped.shape)
         };
-        m.calc_bounds()
+        assert_eq!(
+            mesh.vertices.len() % 4,
+            0,
+            "the background mesh holds {} vertices, not whole hard rectangles",
+            mesh.vertices.len()
+        );
+        (0..mesh.vertices.len() / 4)
+            .map(|quad| {
+                let corners = &mesh.vertices[4 * quad..4 * quad + 4];
+                let colour = corners[0].color;
+                assert!(
+                    corners.iter().all(|v| v.color == colour),
+                    "background quad {quad} is not one colour"
+                );
+                let mut rect = egui::Rect::NOTHING;
+                for corner in corners {
+                    rect.extend_with(corner.pos);
+                }
+                (rect, colour)
+            })
+            .collect()
     }
 
     fn within(a: egui::Rect, b: egui::Rect, tolerance: f32) -> bool {
@@ -4319,35 +4369,40 @@ mod tests {
         let (shapes, pane_clip) = one_pane_pass(&ctx, canvas, &projector, &mut tiles);
         let n = cells.len();
         assert!(
-            shapes.len() > n,
+            shapes.len() > 1,
             "the walk emitted {} shapes for {n} tiles",
             shapes.len()
         );
 
-        // The first `n` shapes are the `n` backgrounds, in walk order, each the
-        // hard mesh on its own tile's pixel-rounded rect, none under its
-        // tile's clip.
-        for (clipped, cell) in shapes[..n].iter().zip(&cells) {
-            assert!(
-                is_solid_quad(clipped, background),
-                "{:?} leads the walk where {cell:?}'s background should",
-                clipped.shape
+        // ONE shape leads the walk and it carries the `n` backgrounds, in walk
+        // order, each the hard quad on its own tile's pixel-rounded rect, and
+        // it is under the pane's clip rather than any tile's.
+        assert_eq!(
+            shapes[0].clip_rect, pane_clip,
+            "the background mesh carries a clip of its own"
+        );
+        let quads = background_quads(&shapes[0]);
+        assert_eq!(
+            quads.len(),
+            n,
+            "the background mesh holds {} quads for {n} tiles",
+            quads.len()
+        );
+        for ((bounds, colour), cell) in quads.iter().zip(&cells) {
+            assert_eq!(
+                *colour, background,
+                "the quad for {cell:?} is not the background colour"
             );
             let rect = projector.tile_rect(*cell).round_to_pixels(1.0);
             assert!(
-                within(bounds_of(clipped), rect, 0.01),
-                "the background for {cell:?} sits at {:?}, not on its tile {rect:?}",
-                bounds_of(clipped)
-            );
-            assert_eq!(
-                clipped.clip_rect, pane_clip,
-                "the background for {cell:?} still carries a clip of its own"
+                within(*bounds, rect, 0.01),
+                "the background for {cell:?} sits at {bounds:?}, not on its tile {rect:?}"
             );
         }
 
         // No tile placed its background a second time, in either form, and
         // every tile's quad follows the backgrounds under that tile's own clip.
-        let later = shapes[n..]
+        let later = shapes[1..]
             .iter()
             .filter(|clipped| is_fill(clipped, background) || is_solid_quad(clipped, background))
             .count();
@@ -4355,17 +4410,17 @@ mod tests {
             later, 0,
             "{later} background rectangles were also placed inside their tiles"
         );
-        let quads: Vec<&egui::epaint::ClippedShape> = shapes[n..]
+        let tile_quads: Vec<&egui::epaint::ClippedShape> = shapes[1..]
             .iter()
             .filter(|clipped| is_solid_quad(clipped, egui::Color32::RED))
             .collect();
         assert_eq!(
-            quads.len(),
+            tile_quads.len(),
             n,
             "{} quads followed the backgrounds for {n} tiles",
-            quads.len()
+            tile_quads.len()
         );
-        for (quad, cell) in quads.iter().zip(&cells) {
+        for (quad, cell) in tile_quads.iter().zip(&cells) {
             assert_eq!(
                 quad.clip_rect,
                 projector.tile_rect(*cell).intersect(pane_clip),
@@ -4441,35 +4496,43 @@ mod tests {
         );
 
         let (shapes, pane_clip) = one_pane_pass(&ctx, canvas, &projector, &mut tiles);
-        let drawn: Vec<(usize, &egui::epaint::ClippedShape)> = shapes
+        // Nowhere but the batched background mesh: not as a clipped rectangle
+        // inside its own tile, and not as a mesh of its own after it.
+        let elsewhere = shapes[1..]
+            .iter()
+            .filter(|clipped| is_fill(clipped, ancestor) || is_solid_quad(clipped, ancestor))
+            .count();
+        assert_eq!(
+            elsewhere, 0,
+            "the ancestor's background was also drawn {elsewhere} times inside a tile"
+        );
+        assert_eq!(
+            shapes[0].clip_rect, pane_clip,
+            "the background mesh kept a clip of its own"
+        );
+        let quads = background_quads(&shapes[0]);
+        let at: Vec<usize> = quads
             .iter()
             .enumerate()
-            .filter(|(_, clipped)| is_fill(clipped, ancestor) || is_solid_quad(clipped, ancestor))
+            .filter(|(_, (_, colour))| *colour == ancestor)
+            .map(|(at, _)| at)
             .collect();
         assert_eq!(
-            drawn.len(),
+            at.len(),
             1,
-            "the ancestor's background was drawn {} times",
-            drawn.len()
-        );
-        let (at, clipped) = drawn[0];
-        assert!(
-            is_solid_quad(clipped, ancestor),
-            "the ancestor's background is still the clipped rectangle, not the cut mesh"
+            "the ancestor's background is {} of the mesh's quads",
+            at.len()
         );
         assert_eq!(
-            clipped.clip_rect, pane_clip,
-            "the ancestor's background kept a clip of its own"
+            at[0], 0,
+            "the hole is the walk's first cell, so its background leads; it sat at {}",
+            at[0]
         );
         let piece = piece.round_to_pixels(1.0);
         assert!(
-            within(bounds_of(clipped), piece, 0.01),
+            within(quads[0].0, piece, 0.01),
             "the ancestor's background covers {:?}; the piece it may cover is {piece:?}",
-            bounds_of(clipped)
-        );
-        assert_eq!(
-            at, 0,
-            "the hole is the walk's first cell, so its background leads; it sat at {at}"
+            quads[0].0
         );
     }
 

@@ -737,3 +737,118 @@ fn the_two_facts_the_off_tile_cull_rests_on() {
         }
     }
 }
+
+/// A tessellator configured the way egui configures one for a frame, so a
+/// batched run is compared against the per-tile run under the options the app
+/// really tessellates at — `coarse_tessellation_culling` included, which is
+/// the whole reason [`HoistedBackgrounds`] makes a cull test of its own.
+fn frame_tessellator(pixels_per_point: f32) -> egui::epaint::Tessellator {
+    egui::epaint::Tessellator::new(
+        pixels_per_point,
+        egui::epaint::TessellationOptions::default(),
+        [1, 1],
+        Vec::new(),
+    )
+}
+
+/// Every byte a tessellated run puts in front of the renderer, in order.
+fn primitive_digest(prims: &[egui::epaint::ClippedPrimitive]) -> Vec<String> {
+    prims
+        .iter()
+        .map(|p| match &p.primitive {
+            egui::epaint::Primitive::Mesh(mesh) => format!(
+                "clip=({:?},{:?},{:?},{:?}) tex={:?} indices={:?} vertices={:?}",
+                p.clip_rect.min.x.to_bits(),
+                p.clip_rect.min.y.to_bits(),
+                p.clip_rect.max.x.to_bits(),
+                p.clip_rect.max.y.to_bits(),
+                mesh.texture_id,
+                mesh.indices,
+                mesh.vertices
+                    .iter()
+                    .map(|v| (
+                        v.pos.x.to_bits(),
+                        v.pos.y.to_bits(),
+                        v.uv.x.to_bits(),
+                        v.uv.y.to_bits(),
+                        v.color.to_array(),
+                    ))
+                    .collect::<Vec<_>>(),
+            ),
+            egui::epaint::Primitive::Callback(_) => "callback".to_owned(),
+        })
+        .collect()
+}
+
+/// A tile background as `mvt::render` emits it, already placed at `piece`.
+fn placed_background(piece: egui::Rect, fill: egui::Color32) -> egui::epaint::RectShape {
+    egui::epaint::RectShape::filled(piece, egui::CornerRadius::ZERO, fill)
+}
+
+/// **The batch draws the tiles the one-shape-per-tile spelling drew, byte for
+/// byte.**
+///
+/// The span carries the three cases a real pass has: pieces wholly inside the
+/// pane, a piece straddling its edge, and a piece off the pane entirely —
+/// which `tile_span` produces at the edges of the grid and which epaint culls
+/// today off the shape's own bounds. A batched mesh is bounded by the union
+/// of its quads, so if [`HoistedBackgrounds`] did not make that cull itself
+/// the off-pane quad's vertices would appear in the stream and this would
+/// read them.
+#[test]
+fn a_batched_background_run_tessellates_to_the_same_bytes_as_one_shape_per_tile() {
+    const PPP: f32 = 1.0;
+    let clip = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(512.0, 384.0));
+    let fill = egui::Color32::from_rgb(0x10, 0x20, 0x30);
+    // Four pieces of a 256-point grid plus one a whole tile off the pane.
+    let pieces = [
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(256.0, 256.0)),
+        egui::Rect::from_min_size(egui::pos2(256.0, 0.0), egui::vec2(256.0, 256.0)),
+        egui::Rect::from_min_size(egui::pos2(0.0, 256.0), egui::vec2(256.0, 256.0)),
+        egui::Rect::from_min_size(egui::pos2(256.0, 256.0), egui::vec2(256.0, 256.0)),
+        egui::Rect::from_min_size(egui::pos2(-512.0, -512.0), egui::vec2(256.0, 256.0)),
+    ];
+
+    let per_tile: Vec<egui::epaint::ClippedShape> = pieces
+        .iter()
+        .filter_map(|piece| {
+            background_within(&placed_background(*piece, fill), *piece, PPP).map(|shape| {
+                egui::epaint::ClippedShape {
+                    clip_rect: clip,
+                    shape,
+                }
+            })
+        })
+        .collect();
+    assert_eq!(
+        per_tile.len(),
+        pieces.len(),
+        "fixture: every piece must produce a background shape, including the off-pane one"
+    );
+
+    let mut batched = HoistedBackgrounds::default();
+    let hoisted = pieces
+        .iter()
+        .filter(|piece| batched.push(&placed_background(**piece, fill), **piece, PPP, clip))
+        .count();
+    assert_eq!(
+        hoisted,
+        pieces.len(),
+        "every piece is hoisted whether or not its quad survives the cull"
+    );
+    let batched = vec![egui::epaint::ClippedShape {
+        clip_rect: clip,
+        shape: batched.finish().expect("four pieces are on the pane"),
+    }];
+
+    let before = primitive_digest(&frame_tessellator(PPP).tessellate_shapes(per_tile));
+    let after = primitive_digest(&frame_tessellator(PPP).tessellate_shapes(batched));
+    assert!(
+        !before.is_empty() && before.iter().any(|p| p.contains("vertices=[(")),
+        "fixture: the per-tile run must actually emit vertices, else this compares nothing"
+    );
+    assert_eq!(
+        before, after,
+        "batching the hoisted backgrounds moved the stream the renderer sees"
+    );
+}

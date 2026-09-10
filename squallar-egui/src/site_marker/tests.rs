@@ -30,7 +30,7 @@ fn on_glass_radius_at(zoom: f64) -> f32 {
         ..Default::default()
     });
     let painter = egui::Painter::new(ctx.clone(), egui::LayerId::background(), canvas());
-    draw_site_marker(&painter, canvas().center(), zoom, MarkerRole::Ordinary);
+    draw_site_markers(&painter, zoom, [(canvas().center(), MarkerRole::Ordinary)]);
     let output = ctx.end_pass();
 
     // The marker is a textured quad pair; its disc's radius on glass is the
@@ -607,5 +607,136 @@ fn folding_leaves_a_degenerate_turn_alone() {
         ((folded - -947.5) / 2048.0).fract().abs() < 1e-4,
         "folded by {} points, which is not a whole turn of 2048",
         folded - -947.5,
+    );
+}
+
+/// One station's marker, spelled the way it was before the table was batched:
+/// its own sprite lookup, its own `Mesh`, its own `Painter::add`.
+///
+/// **The reference the batch is held against.** It is a copy of the pre-batch
+/// body on purpose — the property under test is that the new spelling puts the
+/// same bytes on the glass as the old one did, and that needs the old one to
+/// compare with.
+fn draw_one_marker_unbatched(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    zoom: f64,
+    role: MarkerRole,
+) {
+    let shape = marker_shape(zoom);
+    let sprite = marker_sprite(painter.ctx(), shape);
+    let ppp = painter.ctx().pixels_per_point();
+    let snap = |v: f32| (v * ppp).round() / ppp;
+    let min = egui::pos2(
+        snap(center.x - sprite.half_points),
+        snap(center.y - sprite.half_points),
+    );
+    let rect = egui::Rect::from_min_size(min, egui::Vec2::splat(2.0 * sprite.half_points));
+    let mut mesh = egui::Mesh::with_texture(sprite.texture.id());
+    mesh.add_rect_with_uv(rect, sprite.disc_uv, role.fill());
+    mesh.add_rect_with_uv(rect, sprite.ring_uv, egui::Color32::WHITE);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// Every byte a tessellated run puts in front of the renderer, in order.
+fn marker_primitive_digest(prims: &[egui::epaint::ClippedPrimitive]) -> Vec<String> {
+    prims
+        .iter()
+        .map(|p| match &p.primitive {
+            egui::epaint::Primitive::Mesh(mesh) => format!(
+                "clip=({:?},{:?},{:?},{:?}) tex={:?} indices={:?} vertices={:?}",
+                p.clip_rect.min.x.to_bits(),
+                p.clip_rect.min.y.to_bits(),
+                p.clip_rect.max.x.to_bits(),
+                p.clip_rect.max.y.to_bits(),
+                mesh.texture_id,
+                mesh.indices,
+                mesh.vertices
+                    .iter()
+                    .map(|v| (
+                        v.pos.x.to_bits(),
+                        v.pos.y.to_bits(),
+                        v.uv.x.to_bits(),
+                        v.uv.y.to_bits(),
+                        v.color.to_array(),
+                    ))
+                    .collect::<Vec<_>>(),
+            ),
+            egui::epaint::Primitive::Callback(_) => "callback".to_owned(),
+        })
+        .collect()
+}
+
+/// **The batched table draws what one-mesh-per-station drew, byte for byte.**
+///
+/// The stations carry the three cases a real frame has: the three marker roles
+/// (three fills), a marker straddling the pane's edge, and a marker off the
+/// pane entirely — which `visible_radar_sites` really produces, because it
+/// keeps a station within 100 points of the pane so an edge marker still draws
+/// and still takes a click. epaint culls that last one off the shape's own
+/// bounds today; a batched mesh is bounded by the union of its quads, so if
+/// `draw_site_markers` did not make that cull itself its vertices would appear
+/// in the stream and this would read them.
+#[test]
+fn a_batched_marker_run_tessellates_to_the_same_bytes_as_one_mesh_per_station() {
+    const ZOOM: f64 = 7.0;
+    let canvas = canvas();
+    let stations = [
+        (egui::pos2(400.0, 300.0), MarkerRole::Ordinary),
+        (egui::pos2(900.0, 700.0), MarkerRole::Current),
+        (egui::pos2(1500.0, 200.0), MarkerRole::Loading),
+        // Straddling the right edge, and a whole marker past the left one.
+        (egui::pos2(canvas.max.x - 2.0, 500.0), MarkerRole::Ordinary),
+        (egui::pos2(-90.0, 500.0), MarkerRole::Ordinary),
+    ];
+
+    // One context for both passes: the sprite is loaded into it on first use
+    // and both arms must draw through the same `TextureId`.
+    let ctx = egui::Context::default();
+    let shapes_of = |draw: &dyn Fn(&egui::Painter)| {
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(canvas),
+            ..Default::default()
+        });
+        let painter = egui::Painter::new(ctx.clone(), egui::LayerId::background(), canvas);
+        draw(&painter);
+        ctx.end_pass().shapes
+    };
+
+    let unbatched = shapes_of(&|painter| {
+        for (center, role) in stations {
+            draw_one_marker_unbatched(painter, center, ZOOM, role);
+        }
+    });
+    let batched = shapes_of(&|painter| draw_site_markers(painter, ZOOM, stations));
+
+    assert_eq!(
+        unbatched.len(),
+        stations.len(),
+        "fixture: the unbatched arm must hand the painter one shape per station"
+    );
+    assert_eq!(
+        batched.len(),
+        1,
+        "the batched arm hands the painter exactly one shape for the whole table"
+    );
+
+    let tess = || {
+        egui::epaint::Tessellator::new(
+            1.0,
+            egui::epaint::TessellationOptions::default(),
+            [1, 1],
+            Vec::new(),
+        )
+    };
+    let before = marker_primitive_digest(&tess().tessellate_shapes(unbatched));
+    let after = marker_primitive_digest(&tess().tessellate_shapes(batched));
+    assert!(
+        before.iter().any(|p| p.contains("vertices=[(")),
+        "fixture: the unbatched run must actually emit vertices, else this compares nothing"
+    );
+    assert_eq!(
+        before, after,
+        "batching the station markers moved the stream the renderer sees"
     );
 }

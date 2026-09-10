@@ -1971,14 +1971,20 @@ fn handle_radar_site_interactions(
     // what makes the network discoverable, and only the ring is gated by the
     // selection. This loop runs first and separately from the labels because a
     // dot must not be able to lose a contest to a name.
-    for site in sites {
-        let role = crate::site_marker::MarkerRole::for_station(
-            site.site.name,
-            &current_site,
-            loading_site.as_deref(),
-        );
-        crate::site_marker::draw_site_marker(ui.painter(), site.screen, zoom, role);
-    }
+    crate::site_marker::draw_site_markers(
+        ui.painter(),
+        zoom,
+        sites.iter().map(|site| {
+            (
+                site.screen,
+                crate::site_marker::MarkerRole::for_station(
+                    site.site.name,
+                    &current_site,
+                    loading_site.as_deref(),
+                ),
+            )
+        }),
+    );
 
     // **One set of claimed areas for the whole pane**, exactly as the city
     // labels run — see `ui_map_overlays::paint_labels`. Asking in

@@ -1082,6 +1082,25 @@ pub fn background_within(
     piece: egui::Rect,
     pixels_per_point: f32,
 ) -> Option<egui::Shape> {
+    let (within, fill) = background_quad_within(placed, piece, pixels_per_point)?;
+    let mut mesh = egui::epaint::Mesh::default();
+    mesh.add_colored_rect(within, fill);
+    Some(egui::Shape::Mesh(mesh.into()))
+}
+
+/// [`background_within`]'s answer before it is made a shape: the hard
+/// rectangle and the colour to fill it with.
+///
+/// Split out so a pass drawing many tiles can put every quad in **one** mesh
+/// rather than minting one `Mesh` and one `Arc` per tile — see
+/// [`HoistedBackgrounds`]. The arithmetic is `background_within`'s, unmoved,
+/// and that function is now this one plus the shape it wraps it in, so the
+/// two cannot answer differently.
+pub fn background_quad_within(
+    placed: &egui::epaint::RectShape,
+    piece: egui::Rect,
+    pixels_per_point: f32,
+) -> Option<(egui::Rect, egui::Color32)> {
     let within = placed
         .rect
         .intersect(piece)
@@ -1089,9 +1108,73 @@ pub fn background_within(
     if !within.is_positive() {
         return None;
     }
-    let mut mesh = egui::epaint::Mesh::default();
-    mesh.add_colored_rect(within, placed.fill);
-    Some(egui::Shape::Mesh(mesh.into()))
+    Some((within, placed.fill))
+}
+
+/// Every hoisted background quad of one tile pass, in one mesh.
+///
+/// **The quads were always going to end up in one mesh.** They are flat,
+/// untextured, submitted consecutively ahead of every tile's geometry and
+/// under one clip, so epaint's tessellator already appended each one into the
+/// primitive the one before it opened
+/// (`Tessellator::tessellate_clipped_shape` starts a new mesh only on a clip
+/// or texture change). What it could not do is un-spend what reaching it
+/// cost: per tile, a `Mesh` with two `Vec`s, an `Arc` to put it in a
+/// `Shape::Mesh`, and a `Context::write` for `Painter::add` to hand it over.
+/// On a 1920x1080 pane that is 41 tiles a frame — 123 allocations and 41 lock
+/// acquisitions to draw 41 rectangles of one colour.
+///
+/// This accumulates them instead and hands the painter one shape. The
+/// vertices go in in the same order, so the stream the tessellator emits is
+/// the one it emitted before, which
+/// `tests::a_batched_background_run_tessellates_to_the_same_bytes_as_one_shape_per_tile`
+/// holds byte for byte.
+///
+/// # The cull is epaint's, applied here
+///
+/// A batched mesh is bounded by the union of its quads, and epaint's coarse
+/// culling drops a `Shape::Mesh` whose bounds miss the clip
+/// (`coarse_tessellation_culling`, on by default). Batching would therefore
+/// KEEP a quad epaint drops today — invisible either way, since the scissor
+/// takes it, but it would put vertices in the stream that were not there. So
+/// the same test is made here, against the same rectangle: a colour-quad
+/// mesh's `calc_bounds` is exactly the rectangle it was built from.
+#[derive(Default)]
+pub struct HoistedBackgrounds {
+    mesh: egui::epaint::Mesh,
+}
+
+impl HoistedBackgrounds {
+    /// Take the quad `placed` contributes to `piece`, or say there is none.
+    ///
+    /// The answer is [`background_quad_within`]'s and nothing else decides it:
+    /// a quad culled against `clip` is still a quad the caller has hoisted, so
+    /// the tile's own walk skips its shape either way — exactly as it does
+    /// today for a shape epaint goes on to cull.
+    pub fn push(
+        &mut self,
+        placed: &egui::epaint::RectShape,
+        piece: egui::Rect,
+        pixels_per_point: f32,
+        clip: egui::Rect,
+    ) -> bool {
+        let Some((within, fill)) = background_quad_within(placed, piece, pixels_per_point) else {
+            return false;
+        };
+        if clip.intersects(within) {
+            self.mesh.add_colored_rect(within, fill);
+        }
+        true
+    }
+
+    /// The one shape the pass hands the painter, or `None` when every quad
+    /// was culled or there were none.
+    pub fn finish(self) -> Option<egui::Shape> {
+        if self.mesh.is_empty() {
+            return None;
+        }
+        Some(egui::Shape::Mesh(self.mesh.into()))
+    }
 }
 
 /// A consecutive span of one tile's runs, at one placement, on one frame.
