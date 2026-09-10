@@ -686,6 +686,13 @@ fn the_worst_frame_scrape_reads_back_the_line_the_app_formats() {
         // integers rather than as an absence.
         stack_cuts: [21, 96, 340, 1_180, 4_100, 900, 265],
         pre_cuts: [3, 21, 9, 14, 2, 7, 8],
+        // Seven DISTINCT post cuts summing to this frame's own `post` of 293,
+        // and seven DISTINCT dispatch cuts summing to the SECOND of those --
+        // `post_dispatch`, opened up. These two blocks are LAST in the
+        // positional regex before `boot:`, so a miscount anywhere upstream
+        // lands here, and the boot half's own thirty columns move with them.
+        post_cuts: [7, 240, 3, 19, 5, 11, 8],
+        dispatch_cuts: [4, 9, 17, 180, 12, 15, 3],
         interact: true,
     };
     let boot = crate::frame_ledger::WorstFrame {
@@ -694,6 +701,8 @@ fn the_worst_frame_scrape_reads_back_the_line_the_app_formats() {
         ui_cuts: [7, 19, 41, 5, 133, 2, 61, 1, 31],
         stack_cuts: [3, 8, 14, 27, 61, 12, 8],
         pre_cuts: [4, 31, 12, 20, 6, 9, 18],
+        post_cuts: [6, 300, 2, 12, 4, 9, 5],
+        dispatch_cuts: [3, 7, 21, 240, 14, 13, 2],
         interact: false,
     };
     let payload = serde_json::to_string(&serde_json::json!({
@@ -752,7 +761,8 @@ console.log(JSON.stringify({{ threw: threw,
     // gate holds, so a shifted window cannot pass.
     //
     // The count was written as 34 and was 48 by the time the `pre` seven
-    // landed; it is 62 with the `stack` seven. Recounted off the pattern
+    // landed, 62 with the `stack` seven, and is 90 with the `post` seven and
+    // the `dispatch` seven on both halves. Recounted off the pattern
     // rather than adjusted -- the assertion below reads it out of drive.py so
     // this comment cannot be the only thing that knows.
     assert_eq!(got[0]["ui_poll"].as_u64(), Some(11));
@@ -826,6 +836,45 @@ console.log(JSON.stringify({{ threw: threw,
         "the scraped pre cuts do not sum to the scraped pre, so the rig read \
          the seven out of the wrong capture groups",
     );
+    // **The seven post cuts and the seven dispatch cuts survive the same
+    // scrape.** They are the LAST two blocks of the presented-frame half, so
+    // a miscount in any earlier block lands here — and `disp_*` telescopes to
+    // `post_dispatch`, not to `post`, which is the conjunct that catches a
+    // window shifted by exactly one block. This is the pair the tail hunt
+    // needs: `post` latched 15,409 µs on a Mac scene A idle frame and nothing
+    // could say which cut it was.
+    assert_eq!(got[0]["post_handle"].as_u64(), Some(7));
+    assert_eq!(got[0]["post_dispatch"].as_u64(), Some(240));
+    assert_eq!(got[0]["post_close"].as_u64(), Some(8));
+    assert_eq!(
+        (0..7)
+            .map(|i| {
+                let key = [
+                    "handle", "dispatch", "back", "wake", "poll", "repaint", "close",
+                ][i];
+                got[0][format!("post_{key}")].as_u64().unwrap_or_default()
+            })
+            .sum::<u64>(),
+        got[0]["post"].as_u64().unwrap_or_default(),
+        "the scraped post cuts do not sum to the scraped post, so the rig \
+         read the seven out of the wrong capture groups",
+    );
+    assert_eq!(got[0]["disp_dedupe"].as_u64(), Some(4));
+    assert_eq!(got[0]["disp_prepare"].as_u64(), Some(180));
+    assert_eq!(got[0]["disp_residual"].as_u64(), Some(3));
+    assert_eq!(
+        (0..7)
+            .map(|i| {
+                let key = [
+                    "dedupe", "marks", "hydrate", "prepare", "hitmap", "offload", "residual",
+                ][i];
+                got[0][format!("disp_{key}")].as_u64().unwrap_or_default()
+            })
+            .sum::<u64>(),
+        got[0]["post_dispatch"].as_u64().unwrap_or_default(),
+        "the scraped dispatch cuts do not sum to the scraped post_dispatch, \
+         so the rig read the seven out of the wrong capture groups",
+    );
     assert_eq!(got[0]["boot_ui_poll"].as_u64(), Some(7));
     assert_eq!(got[0]["boot_ui_stack"].as_u64(), Some(133));
     assert_eq!(got[0]["boot_ui_chrome"].as_u64(), Some(31));
@@ -834,6 +883,9 @@ console.log(JSON.stringify({{ threw: threw,
     assert_eq!(got[0]["boot_stack_settle"].as_u64(), Some(8));
     assert_eq!(got[0]["boot_pre_platform"].as_u64(), Some(4));
     assert_eq!(got[0]["boot_pre_ensure"].as_u64(), Some(18));
+    assert_eq!(got[0]["boot_post_dispatch"].as_u64(), Some(300));
+    assert_eq!(got[0]["boot_disp_prepare"].as_u64(), Some(240));
+    assert_eq!(got[0]["boot_disp_residual"].as_u64(), Some(2));
     // The absence spelling: a period in which nothing presented still carries
     // the since-boot maximum and its stamp.
     assert_eq!(got[1]["t"].as_u64(), Some(4201), "the wrong console stamp");
@@ -848,6 +900,9 @@ console.log(JSON.stringify({{ threw: threw,
     assert_eq!(got[1]["boot_stack_settle"].as_u64(), Some(8));
     assert_eq!(got[1]["boot_pre_platform"].as_u64(), Some(4));
     assert_eq!(got[1]["boot_pre_ensure"].as_u64(), Some(18));
+    assert_eq!(got[1]["boot_post_dispatch"].as_u64(), Some(300));
+    assert_eq!(got[1]["boot_disp_prepare"].as_u64(), Some(240));
+    assert_eq!(got[1]["boot_disp_residual"].as_u64(), Some(2));
 
     // **The group count is read off the pattern, not restated in prose.**
     // Two positional blocks were widened here and the comment above has been
@@ -861,8 +916,8 @@ console.log(JSON.stringify({{ threw: threw,
         .0;
     assert_eq!(
         worst_re.matches("(\\d+)").count() + worst_re.matches("([a-z0-9-]+)").count(),
-        62,
-        "the worst-frame pattern no longer has the 62 groups the scrape above \
+        90,
+        "the worst-frame pattern no longer has the 90 groups the scrape above \
          indexes by number, so every field after the change reads the wrong \
          column",
     );

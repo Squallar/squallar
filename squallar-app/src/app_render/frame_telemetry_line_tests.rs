@@ -964,6 +964,13 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
         // for the ui nine's reason: a repeat could not tell a transposed pair
         // of columns from a correct one.
         pre_cuts: [3, 21, 9, 14, 2, 7, 8],
+        // Seven DISTINCT post cuts summing to this frame's own `post` of 293,
+        // and seven DISTINCT dispatch cuts summing to the SECOND of them --
+        // `post_dispatch`, opened up -- for the ui nine's reason: these two
+        // families sit last in a positional regex, where a miscount anywhere
+        // upstream lands as plausible integers rather than as an absence.
+        post_cuts: [7, 240, 3, 19, 5, 11, 8],
+        dispatch_cuts: [4, 9, 17, 180, 12, 15, 3],
         interact: true,
     };
     // The since-boot maximum is a whole frame too: a boot-time compile spike
@@ -975,6 +982,8 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
         ui_cuts: [7, 19, 41, 5, 133, 2, 61, 1, 31],
         stack_cuts: [3, 8, 14, 27, 61, 12, 8],
         pre_cuts: [4, 31, 12, 20, 6, 9, 18],
+        post_cuts: [6, 300, 2, 12, 4, 9, 5],
+        dispatch_cuts: [3, 7, 21, 240, 14, 13, 2],
         interact: false,
     };
     assert_eq!(
@@ -1001,6 +1010,25 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
          pin below would pin a line whose stack_* columns decompose no frame",
     );
     assert_eq!(boot.stack_cuts.iter().sum::<u32>(), boot.ui_cuts[4]);
+    // And the two newest families, on the same terms: the seven `post` cuts
+    // telescope to `post`, and the seven `dispatch` cuts to the SECOND of
+    // those seven -- not to `post`. A fixture whose dispatch cuts summed to
+    // `post` would pin a line describing a frame that cannot exist.
+    assert_eq!(
+        w.post_cuts.iter().sum::<u32>(),
+        w.segments[5],
+        "the fixture's post cuts do not telescope to its post, so the pin \
+         below would pin a line describing no frame that could exist",
+    );
+    assert_eq!(boot.post_cuts.iter().sum::<u32>(), boot.segments[5]);
+    assert_eq!(
+        w.dispatch_cuts.iter().sum::<u32>(),
+        w.post_cuts[1],
+        "the fixture's dispatch cuts do not telescope to its post_dispatch, \
+         so the pin below would pin a line whose disp_* columns decompose no \
+         frame",
+    );
+    assert_eq!(boot.dispatch_cuts.iter().sum::<u32>(), boot.post_cuts[1]);
     assert_eq!(
         super::frame_worst_line(Some(w), Some(boot)),
         rendered(
@@ -1008,9 +1036,11 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
             &[
                 "13455", "interact", "22628", "64", "55", "9514", "2829", "700", "293", "11",
                 "402", "1207", "96", "6902", "4", "812", "3", "77", "21", "96", "340", "1180",
-                "4100", "900", "265", "3", "21", "9", "14", "2", "7", "8", "idle", "100", "90",
-                "300", "21000", "800", "338", "7", "19", "41", "5", "133", "2", "61", "1", "31",
-                "3", "8", "14", "27", "61", "12", "8", "4", "31", "12", "20", "6", "9", "18",
+                "4100", "900", "265", "3", "21", "9", "14", "2", "7", "8", "7", "240", "3", "19",
+                "5", "11", "8", "4", "9", "17", "180", "12", "15", "3", "idle", "100", "90", "300",
+                "21000", "800", "338", "7", "19", "41", "5", "133", "2", "61", "1", "31", "3", "8",
+                "14", "27", "61", "12", "8", "4", "31", "12", "20", "6", "9", "18", "6", "300",
+                "2", "12", "4", "9", "5", "3", "7", "21", "240", "14", "13", "2",
             ],
         ),
         "the `frame worst:` line and the rig's probe have drifted",
@@ -1022,7 +1052,8 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
             &[
                 "22628", "idle", "100", "90", "300", "21000", "800", "338", "7", "19", "41", "5",
                 "133", "2", "61", "1", "31", "3", "8", "14", "27", "61", "12", "8", "4", "31",
-                "12", "20", "6", "9", "18",
+                "12", "20", "6", "9", "18", "6", "300", "2", "12", "4", "9", "5", "3", "7", "21",
+                "240", "14", "13", "2",
             ],
         ),
         "the no-frame spelling and the rig's probe have drifted",
@@ -2387,6 +2418,8 @@ fn the_worst_frame_line_reads_exactly_as_pinned() {
         ui_cuts: [12, 310, 903, 41, 2_800, 6, 288, 2, 40],
         stack_cuts: [9, 41, 118, 402, 1_900, 300, 30],
         pre_cuts: [2, 18, 11, 21, 1, 4, 4],
+        post_cuts: [0u32; 7],
+        dispatch_cuts: [0u32; 7],
         interact: false,
     };
     assert_eq!(
@@ -2420,6 +2453,8 @@ fn the_worst_frame_line_reads_exactly_as_pinned() {
         ui_cuts: [0, 1, 0, 0, 1, 0, 1, 0, 0],
         stack_cuts: [0, 0, 0, 0, 1, 0, 0],
         pre_cuts: [0, 1, 0, 0, 0, 0, 0],
+        post_cuts: [0u32; 7],
+        dispatch_cuts: [0u32; 7],
         interact: false,
     };
     assert_eq!(boot.ui_cuts.iter().sum::<u32>(), boot.segments[2]);
@@ -2436,7 +2471,11 @@ fn the_worst_frame_line_reads_exactly_as_pinned() {
          stack_inspector=300 us, stack_settle=30 us, pre_platform=2 us, \
          pre_ingest=18 us, \
          pre_evict=11 us, pre_drops=21 us, pre_autosave=1 us, pre_gate=4 us, \
-         pre_ensure=4 us, boot: idle, pre=1 us, pump=2 us, \
+         pre_ensure=4 us, post_handle=0 us, post_dispatch=0 us, post_back=0 us, \
+         post_wake=0 us, post_poll=0 us, post_repaint=0 us, post_close=0 us, \
+         disp_dedupe=0 us, disp_marks=0 us, disp_hydrate=0 us, \
+         disp_prepare=0 us, disp_hitmap=0 us, disp_offload=0 us, \
+         disp_residual=0 us, boot: idle, pre=1 us, pump=2 us, \
          ui=3 us, prepare=9500 us, finish=4 us, post=3 us, ui_poll=0 us, \
          ui_layout=1 us, ui_topbar=0 us, ui_statusbar=0 us, ui_stack=1 us, \
          ui_dialog=0 us, ui_panes=1 us, ui_apply=0 us, ui_chrome=0 us, \
@@ -2444,7 +2483,11 @@ fn the_worst_frame_line_reads_exactly_as_pinned() {
          stack_statuses=0 us, stack_render=1 us, stack_inspector=0 us, \
          stack_settle=0 us, \
          pre_platform=0 us, pre_ingest=1 us, pre_evict=0 us, pre_drops=0 us, \
-         pre_autosave=0 us, pre_gate=0 us, pre_ensure=0 us",
+         pre_autosave=0 us, pre_gate=0 us, pre_ensure=0 us, post_handle=0 us, post_dispatch=0 us, post_back=0 us, \
+         post_wake=0 us, post_poll=0 us, post_repaint=0 us, post_close=0 us, \
+         disp_dedupe=0 us, disp_marks=0 us, disp_hydrate=0 us, \
+         disp_prepare=0 us, disp_hitmap=0 us, disp_offload=0 us, \
+         disp_residual=0 us"
     );
 }
 
@@ -2458,6 +2501,8 @@ fn the_worst_frame_line_names_the_interact_family_too() {
         ui_cuts: [1, 2, 3, 4, 80, 5, 3, 1, 1],
         stack_cuts: [2, 4, 6, 8, 50, 7, 3],
         pre_cuts: [10, 30, 20, 25, 5, 4, 6],
+        post_cuts: [0u32; 7],
+        dispatch_cuts: [0u32; 7],
         interact: true,
     };
     assert!(
@@ -2478,6 +2523,8 @@ fn the_worst_frame_line_says_absence_rather_than_a_zero_frame() {
         ui_cuts: [0, 1, 0, 0, 1, 0, 1, 0, 0],
         stack_cuts: [0, 0, 0, 0, 1, 0, 0],
         pre_cuts: [0, 1, 0, 0, 0, 0, 0],
+        post_cuts: [0u32; 7],
+        dispatch_cuts: [0u32; 7],
         interact: false,
     };
     let line = super::frame_worst_line(None, Some(boot));
@@ -2494,7 +2541,11 @@ fn the_worst_frame_line_says_absence_rather_than_a_zero_frame() {
          stack_snap=0 us, stack_gate=0 us, stack_hydrate=0 us, stack_statuses=0 us, \
          stack_render=1 us, stack_inspector=0 us, stack_settle=0 us, \
          pre_platform=0 us, pre_ingest=1 us, pre_evict=0 us, pre_drops=0 us, \
-         pre_autosave=0 us, pre_gate=0 us, pre_ensure=0 us",
+         pre_autosave=0 us, pre_gate=0 us, pre_ensure=0 us, post_handle=0 us, post_dispatch=0 us, post_back=0 us, \
+         post_wake=0 us, post_poll=0 us, post_repaint=0 us, post_close=0 us, \
+         disp_dedupe=0 us, disp_marks=0 us, disp_hydrate=0 us, \
+         disp_prepare=0 us, disp_hitmap=0 us, disp_offload=0 us, \
+         disp_residual=0 us",
         "an empty period must still carry the session maximum, or a console \
          ring that dropped the bad tick reads as a run with no bad frame",
     );
@@ -2516,6 +2567,8 @@ fn the_worst_frame_line_is_not_mistakable_for_a_segment_line() {
         ui_cuts: [1, 2, 3, 4, 80, 5, 3, 1, 1],
         stack_cuts: [2, 4, 6, 8, 50, 7, 3],
         pre_cuts: [10, 30, 20, 25, 5, 4, 6],
+        post_cuts: [0u32; 7],
+        dispatch_cuts: [0u32; 7],
         interact: true,
     };
     let worst_line = super::frame_worst_line(Some(worst), None);

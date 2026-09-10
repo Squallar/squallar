@@ -1213,6 +1213,44 @@ pub(crate) struct WorstFrame {
     /// already taken on every frame that reaches the pass; only the
     /// subtraction moved out of the arm.
     pub(crate) pre_cuts: [u32; 7],
+    /// The seven `post` cuts of THIS frame, in [`PostHists`]' order:
+    /// `[handle, dispatch, back, wake, poll, repaint, close]`. They telescope
+    /// to `segments[5]` within [`micros`]' truncation — at most six
+    /// microseconds for seven cuts — so the worst frame's `post` is
+    /// decomposed by arithmetic on ONE frame.
+    ///
+    /// **Here for [`WorstFrame::ui_cuts`]' reason exactly, and this is the
+    /// segment where the gap was widest.** [`PostHists`] records inside
+    /// `finalize`'s `if interacted` arm, and `post` is not a per-frame cost
+    /// at all — it is one occasional event on an otherwise 46 µs span. Every
+    /// such event measured so far has landed on an IDLE frame: the Mac
+    /// scene A leg of 2026-09-10 latched `post=15,409 µs` on a
+    /// `family=idle` frame, a 335x outlier, and NOTHING in this tree could
+    /// name which of the seven cuts it was — the interact histograms never
+    /// saw the frame and this line carried no `post_*` column.
+    ///
+    /// Zeroed on a frame that left no `post_phases`. **Zero new clock
+    /// reads**: the six stamps are already taken on every frame that reaches
+    /// the tail; only the subtraction moved out of the arm.
+    pub(crate) post_cuts: [u32; 7],
+    /// The seven `dispatch` cuts of THIS frame, in [`DispatchHists`]' order:
+    /// `[dedupe, marks, hydrate, prepare, hitmap, offload, residual]` — the
+    /// second of [`WorstFrame::post_cuts`], opened up. They telescope to
+    /// `post_cuts[1]` by construction, the residual being the parent minus
+    /// the six.
+    ///
+    /// **One level further down for [`WorstFrame::stack_cuts`]' reason.**
+    /// `dispatch` held 84 % of `post` on the Firefox scene D leg
+    /// [`DispatchHists`] names, so a `post` spike is a `dispatch` spike until
+    /// shown otherwise — and the six named cuts are the difference between
+    /// "the tail dispatched" and "the tail built a paint input on the frame
+    /// thread".
+    ///
+    /// Zeroed on a frame whose tail dispatched nothing, which is most of
+    /// them; that is the same absence [`FrameLedger::record_dispatch_cuts`]
+    /// files, spelled as zeros here because this record is one frame's
+    /// anatomy and not a distribution.
+    pub(crate) dispatch_cuts: [u32; 7],
     /// Whether this frame's raw input carried interaction. Reported rather
     /// than filtered on: a scene whose worst frame is always idle is saying
     /// something, and a family column is how it says it.
@@ -1906,6 +1944,26 @@ impl FrameLedger {
             .as_ref()
             .map(|phases| finish_phase_micros(acquire_end, phases, present_return));
 
+        // Above the arm, and for the sharpest instance of the three
+        // bindings above's reason. `post` is the one segment whose cost is
+        // NOT per-frame: a 46 us span that once read 15,409 us, and every
+        // such event observed has landed on an idle frame, where `PostHists`
+        // records nothing. Zero new clock reads: `m.post_phases` is stamped
+        // on every frame that reaches the tail; only seven subtractions left
+        // the arm. The statement may not read `interacted` -- see
+        // `the_worst_frames_post_cuts_are_computed_outside_the_interact_arm`.
+        let post_cuts = m.post_phases.as_ref().map_or([0u32; 7], |phases| {
+            post_phase_micros(present_return, phases, now)
+        });
+
+        // The same, one level down: these seven cut `post_cuts[1]` -- the
+        // `dispatch` cut, which held 84% of `post` on the leg `DispatchHists`
+        // names. Zeros on a frame whose tail dispatched nothing, which is the
+        // absence `record_dispatch_cuts` files.
+        let dispatch_cuts = m
+            .dispatch
+            .map_or([0u32; 7], |cuts| dispatch_cut_micros(cuts, post_cuts[1]));
+
         // EVERY split below is interact-only, and that is a limit worth
         // stating rather than rediscovering. A frame the renderer did not call
         // interacted -- boot among them -- contributes to `service_idle`, to
@@ -2075,9 +2133,8 @@ impl FrameLedger {
             // And the same for `post`, whose right-hand boundary is `now` —
             // the very instant this function opened with, so the sixth cut
             // closes on the same stamp the segment above did.
-            if let Some(phases) = m.post_phases.as_ref() {
-                let [handle, dispatch, back, wake, poll, repaint, close] =
-                    post_phase_micros(present_return, phases, now);
+            if m.post_phases.is_some() {
+                let [handle, dispatch, back, wake, poll, repaint, close] = post_cuts;
                 self.post.handle.record(handle);
                 self.post.dispatch.record(dispatch);
                 self.post.back.record(back);
@@ -2091,9 +2148,9 @@ impl FrameLedger {
                 // it. A frame that dispatched nothing leaves `cur.dispatch`
                 // empty and contributes no sample here — see
                 // `record_dispatch_cuts`.
-                if let Some(cuts) = m.dispatch {
+                if m.dispatch.is_some() {
                     let [dedupe, marks, hydrate, prepare, hitmap, offload, residual] =
-                        dispatch_cut_micros(cuts, dispatch);
+                        dispatch_cuts;
                     self.dispatch.dedupe.record(dedupe);
                     self.dispatch.marks.record(marks);
                     self.dispatch.hydrate.record(hydrate);
@@ -2143,6 +2200,8 @@ impl FrameLedger {
                 ui_cuts,
                 stack_cuts,
                 pre_cuts,
+                post_cuts,
+                dispatch_cuts,
                 interact: interacted,
             },
         ));
@@ -2153,6 +2212,8 @@ impl FrameLedger {
                 ui_cuts,
                 stack_cuts,
                 pre_cuts,
+                post_cuts,
+                dispatch_cuts,
                 interact: interacted,
             });
         }
@@ -3181,6 +3242,8 @@ mod tests {
             ui_cuts: [11, 402, 1_207, 96, ui_stack, 4, 812, 3, 77],
             stack_cuts: stack_phase_micros(statusbar, &stack, shell),
             pre_cuts: [3, 21, 9, 14, 2, 7, 8],
+            post_cuts: [0u32; 7],
+            dispatch_cuts: [0u32; 7],
             interact: true,
         };
         assert_eq!(
@@ -4316,6 +4379,8 @@ mod tests {
             ui_cuts,
             stack_cuts,
             pre_cuts,
+            post_cuts: [0u32; 7],
+            dispatch_cuts: [0u32; 7],
             interact,
         }
     }
@@ -4522,6 +4587,8 @@ mod tests {
             // fixture describes a frame that could exist at BOTH levels.
             stack_cuts: [40, 260, 500, 900, 9_100, 1_200, 100],
             pre_cuts: [100, 300, 200, 250, 50, 50, 50],
+            post_cuts: [0u32; 7],
+            dispatch_cuts: [0u32; 7],
             interact: false,
         };
         assert_eq!(
@@ -4688,6 +4755,8 @@ mod tests {
             ui_cuts: [0, 0, 0, 0, 4_000, 0, 0, 0, 0],
             stack_cuts: [10, 20, 30, 40, 3_860, 20, 20],
             pre_cuts: pre_phase_micros(start, &phases, setup),
+            post_cuts: [0u32; 7],
+            dispatch_cuts: [0u32; 7],
             interact: false,
         };
         assert_eq!(
@@ -4800,6 +4869,92 @@ mod tests {
             "the pre cuts binding reads the interact flag, so an idle frame \
              would carry seven zeros however early the binding sits: \
              {statement:?}",
+        );
+    }
+
+    /// **The seven `post` cuts and the seven `dispatch` cuts are computed for
+    /// EVERY presented frame, not only the interact ones.** Held against
+    /// `finalize`'s own source, on
+    /// [`the_worst_frames_pre_cuts_are_computed_outside_the_interact_arm`]'s
+    /// terms.
+    ///
+    /// **This is the segment where the degenerate had actually shipped.**
+    /// Until these two bindings moved out, `post` was decomposed by
+    /// [`PostHists`] alone — interact frames only — and `frame worst:`
+    /// carried no `post_*` column at all. `post` is not a per-frame cost: it
+    /// is a 46 µs span that latched **15,409 µs** on a Mac scene A frame of
+    /// 2026-09-10, a 335x outlier, and that frame was `family=idle`. Nothing
+    /// in the tree could name which of the seven cuts it was, so the
+    /// campaign's strongest tail lead was unattributable by construction.
+    #[test]
+    fn the_worst_frames_post_cuts_are_computed_outside_the_interact_arm() {
+        let body = include_str!("frame_ledger.rs")
+            .split_once("pub(crate) fn finalize(")
+            .expect("finalize is no longer a method here")
+            .1;
+        let interact_arm = body
+            .find("if interacted {")
+            .expect("finalize no longer splits on the interact flag");
+        for (binding, cuts) in [
+            ("let post_cuts = ", "seven post cuts"),
+            ("let dispatch_cuts = ", "seven dispatch cuts"),
+        ] {
+            let bound = body
+                .find(binding)
+                .unwrap_or_else(|| panic!("finalize no longer binds the worst frame's {cuts}"));
+            assert!(
+                bound < interact_arm,
+                "the {cuts} are computed inside finalize's interact arm, so \
+                 every frame that PAYS for a click -- all of which are filed \
+                 idle, and where every `post` spike measured so far has \
+                 landed -- would carry seven zeros on the one line that \
+                 reports it",
+            );
+            let statement = body[bound..]
+                .split_once("\n\n")
+                .unwrap_or_else(|| panic!("the {cuts} binding is no longer a statement of its own"))
+                .0;
+            assert!(
+                !statement.contains("interacted"),
+                "the {cuts} binding reads the interact flag, so an idle frame \
+                 would carry seven zeros however early the binding sits: \
+                 {statement:?}",
+            );
+        }
+    }
+
+    /// **The seven `post` cuts on the latched frame telescope to its `post`**,
+    /// to within the six microseconds seven truncating [`micros`] calls can
+    /// lose — the property that makes `frame worst:`'s `post_*` columns a
+    /// decomposition of one frame rather than seven figures beside a total.
+    #[test]
+    fn the_worst_frames_post_cuts_telescope_to_its_post() {
+        let base = Instant::now();
+        let at = |us: u64| base + std::time::Duration::from_micros(us);
+        // A tail whose seven spans are deliberately uneven and whose second
+        // -- `dispatch` -- holds nearly all of it, which is the shape every
+        // measured `post` spike has had.
+        let phases = PostPhaseStamps {
+            handled: at(37),
+            actions: at(15_402),
+            back: at(15_409),
+            wake: at(15_431),
+            poll: at(15_436),
+            repaint: at(15_452),
+        };
+        let cuts = post_phase_micros(base, &phases, at(15_463));
+        let post = micros(base, at(15_463));
+        let summed: u32 = cuts.iter().sum();
+        assert!(
+            post >= summed && post - summed <= 6,
+            "the seven post cuts sum to {summed} against a post of {post}; \
+             seven truncating `micros` calls may lose at most six \
+             microseconds and may never gain any",
+        );
+        assert_eq!(
+            cuts[1], 15_365,
+            "the second cut is not `dispatch`, so the `disp_*` columns \
+             decompose the wrong parent",
         );
     }
 

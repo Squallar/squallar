@@ -1660,7 +1660,7 @@ fn frame_worst_line(
             let [pre, pump, ui, prepare, finish, post] = b.segments;
             format!(
                 "boot: {}, pre={} us, pump={} us, ui={} us, prepare={} us, finish={} us, \
-                 post={} us, {}, {}, {}",
+                 post={} us, {}, {}, {}, {}, {}",
                 if b.interact { "interact" } else { "idle" },
                 pre,
                 pump,
@@ -1671,6 +1671,8 @@ fn frame_worst_line(
                 ui_cut_columns(b.ui_cuts),
                 stack_cut_columns(b.stack_cuts),
                 pre_cut_columns(b.pre_cuts),
+                post_cut_columns(b.post_cuts),
+                dispatch_cut_columns(b.dispatch_cuts),
             )
         }
     };
@@ -1683,7 +1685,7 @@ fn frame_worst_line(
     let [pre, pump, ui, prepare, finish, post] = w.segments;
     format!(
         "frame worst: service={} us, family={}, since_boot={} us, pre={} us, pump={} us, \
-         ui={} us, prepare={} us, finish={} us, post={} us, {}, {}, {}, {boot}",
+         ui={} us, prepare={} us, finish={} us, post={} us, {}, {}, {}, {}, {}, {boot}",
         w.service,
         if w.interact { "interact" } else { "idle" },
         since_boot_us,
@@ -1696,6 +1698,8 @@ fn frame_worst_line(
         ui_cut_columns(w.ui_cuts),
         stack_cut_columns(w.stack_cuts),
         pre_cut_columns(w.pre_cuts),
+        post_cut_columns(w.post_cuts),
+        dispatch_cut_columns(w.dispatch_cuts),
     )
 }
 
@@ -1793,6 +1797,60 @@ fn stack_cut_columns(cuts: [u32; 7]) -> String {
         "stack_snap={snap} us, stack_gate={gate} us, stack_hydrate={hydrate} us, \
          stack_statuses={statuses} us, stack_render={render} us, \
          stack_inspector={inspector} us, stack_settle={settle} us"
+    )
+}
+
+/// One frame's seven `post` cuts as the `post_*=<n> us` columns
+/// `frame worst:` carries, in `PostHists`' order.
+///
+/// **Prefixed `post_` for [`ui_cut_columns`]' reason**: `handle`, `dispatch`,
+/// `poll` and `close` are all words other cut families on this line use, and
+/// a bare `dispatch=` beside a `post=` would read as a seventh segment.
+///
+/// **Never added to `frame post (*)`, and not comparable to it either.**
+/// Those seven histograms record inside the ledger's `if interacted` arm;
+/// these seven are one frame's microseconds and every `post` spike observed
+/// so far has been on an IDLE frame — the Mac scene A leg of 2026-09-10
+/// latched `post=15,409 µs`, a 335x outlier over the segment's own 46 µs
+/// normal, on a `family=idle` frame that no `post` histogram in this tree
+/// ever saw.
+///
+/// They sum to this line's own `post=` **to within 6 µs and never over it**,
+/// on [`ui_cut_columns`]' terms: seven truncating `frame_ledger::micros`
+/// calls against a parent that makes one.
+fn post_cut_columns(cuts: [u32; 7]) -> String {
+    let [handle, dispatch, back, wake, poll, repaint, close] = cuts;
+    format!(
+        "post_handle={handle} us, post_dispatch={dispatch} us, post_back={back} us, \
+         post_wake={wake} us, post_poll={poll} us, post_repaint={repaint} us, \
+         post_close={close} us"
+    )
+}
+
+/// One frame's seven `dispatch` cuts as the `disp_*=<n> us` columns
+/// `frame worst:` carries, in `DispatchHists`' order — the second of
+/// [`post_cut_columns`]' seven, opened up.
+///
+/// **Prefixed `disp_` and not `dispatch_`**, so that a reader matching
+/// `post_dispatch=` — the parent — cannot also match its own children.
+/// `hydrate` is a `stack` cut name and `prepare` is a segment name, which is
+/// [`stack_cut_columns`]' reason for a prefix one level further down.
+///
+/// **Never added to `frame dispatch (*)`, to `frame post (*)` or to
+/// `frame segment (post)`.** Those record inside the ledger's `if interacted`
+/// arm and only on frames whose tail dispatched; these seven are one frame's
+/// microseconds, zeroed on a frame that dispatched nothing.
+///
+/// They telescope to this line's own `post_dispatch=` by construction — the
+/// seventh is the parent minus the six, as `frame_ledger::dispatch_cut_micros`
+/// computes it — so a residual of a few microseconds is that function's
+/// truncation and not an unnamed cost.
+fn dispatch_cut_columns(cuts: [u32; 7]) -> String {
+    let [dedupe, marks, hydrate, prepare, hitmap, offload, residual] = cuts;
+    format!(
+        "disp_dedupe={dedupe} us, disp_marks={marks} us, disp_hydrate={hydrate} us, \
+         disp_prepare={prepare} us, disp_hitmap={hitmap} us, disp_offload={offload} us, \
+         disp_residual={residual} us"
     )
 }
 

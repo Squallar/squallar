@@ -3303,8 +3303,8 @@ var prep_costs_re = /frame prep costs: (\d+) passes, (\d+) us tessellate, (\d+) 
 // once at the end: a family the watcher never ingests can only ever be read as
 // a last-period fallback, which is what silently voided every windowed
 // worst-frame reading this instrument produced.
-var frame_worst_re = /frame worst: service=(\d+) us, family=([a-z0-9-]+), since_boot=(\d+) us, pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us, stack_snap=(\d+) us, stack_gate=(\d+) us, stack_hydrate=(\d+) us, stack_statuses=(\d+) us, stack_render=(\d+) us, stack_inspector=(\d+) us, stack_settle=(\d+) us, pre_platform=(\d+) us, pre_ingest=(\d+) us, pre_evict=(\d+) us, pre_drops=(\d+) us, pre_autosave=(\d+) us, pre_gate=(\d+) us, pre_ensure=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us, stack_snap=(\d+) us, stack_gate=(\d+) us, stack_hydrate=(\d+) us, stack_statuses=(\d+) us, stack_render=(\d+) us, stack_inspector=(\d+) us, stack_settle=(\d+) us, pre_platform=(\d+) us, pre_ingest=(\d+) us, pre_evict=(\d+) us, pre_drops=(\d+) us, pre_autosave=(\d+) us, pre_gate=(\d+) us, pre_ensure=(\d+) us/;
-var frame_worst_none_re = /frame worst: no frame presented this period, since_boot=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us, stack_snap=(\d+) us, stack_gate=(\d+) us, stack_hydrate=(\d+) us, stack_statuses=(\d+) us, stack_render=(\d+) us, stack_inspector=(\d+) us, stack_settle=(\d+) us, pre_platform=(\d+) us, pre_ingest=(\d+) us, pre_evict=(\d+) us, pre_drops=(\d+) us, pre_autosave=(\d+) us, pre_gate=(\d+) us, pre_ensure=(\d+) us/;
+var frame_worst_re = /frame worst: service=(\d+) us, family=([a-z0-9-]+), since_boot=(\d+) us, pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us, stack_snap=(\d+) us, stack_gate=(\d+) us, stack_hydrate=(\d+) us, stack_statuses=(\d+) us, stack_render=(\d+) us, stack_inspector=(\d+) us, stack_settle=(\d+) us, pre_platform=(\d+) us, pre_ingest=(\d+) us, pre_evict=(\d+) us, pre_drops=(\d+) us, pre_autosave=(\d+) us, pre_gate=(\d+) us, pre_ensure=(\d+) us, post_handle=(\d+) us, post_dispatch=(\d+) us, post_back=(\d+) us, post_wake=(\d+) us, post_poll=(\d+) us, post_repaint=(\d+) us, post_close=(\d+) us, disp_dedupe=(\d+) us, disp_marks=(\d+) us, disp_hydrate=(\d+) us, disp_prepare=(\d+) us, disp_hitmap=(\d+) us, disp_offload=(\d+) us, disp_residual=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us, stack_snap=(\d+) us, stack_gate=(\d+) us, stack_hydrate=(\d+) us, stack_statuses=(\d+) us, stack_render=(\d+) us, stack_inspector=(\d+) us, stack_settle=(\d+) us, pre_platform=(\d+) us, pre_ingest=(\d+) us, pre_evict=(\d+) us, pre_drops=(\d+) us, pre_autosave=(\d+) us, pre_gate=(\d+) us, pre_ensure=(\d+) us, post_handle=(\d+) us, post_dispatch=(\d+) us, post_back=(\d+) us, post_wake=(\d+) us, post_poll=(\d+) us, post_repaint=(\d+) us, post_close=(\d+) us, disp_dedupe=(\d+) us, disp_marks=(\d+) us, disp_hydrate=(\d+) us, disp_prepare=(\d+) us, disp_hitmap=(\d+) us, disp_offload=(\d+) us, disp_residual=(\d+) us/;
+var frame_worst_none_re = /frame worst: no frame presented this period, since_boot=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us, stack_snap=(\d+) us, stack_gate=(\d+) us, stack_hydrate=(\d+) us, stack_statuses=(\d+) us, stack_render=(\d+) us, stack_inspector=(\d+) us, stack_settle=(\d+) us, pre_platform=(\d+) us, pre_ingest=(\d+) us, pre_evict=(\d+) us, pre_drops=(\d+) us, pre_autosave=(\d+) us, pre_gate=(\d+) us, pre_ensure=(\d+) us, post_handle=(\d+) us, post_dispatch=(\d+) us, post_back=(\d+) us, post_wake=(\d+) us, post_poll=(\d+) us, post_repaint=(\d+) us, post_close=(\d+) us, disp_dedupe=(\d+) us, disp_marks=(\d+) us, disp_hydrate=(\d+) us, disp_prepare=(\d+) us, disp_hitmap=(\d+) us, disp_offload=(\d+) us, disp_residual=(\d+) us/;
 var prep_geometry_re = /frame prep geometry: (\d+) stagings, (\d+) vertices, (\d+) indices, (\d+) B staged, (\d+) through the ring, (\d+) declined/;
 var gpu_passes_re = /gpu passes: raymarch n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; ground n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; mirror n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; main n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; (\d+) frames/;
 var cadence_re = /frame cadence: n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
@@ -3739,69 +3739,124 @@ for (var i = 0; i < C.length; i++) {
   // They are never added to, and never ratio'd against, the `frame ui (*)`
   // families: those record interact frames only, and the frame reported here
   // is usually an idle one that contributed to none of them.
-  if (wm) frame_worst_all.push({ t: C[i].t, service: parseInt(wm[1], 10), family: wm[2],
+  // Widened: the seven `post` cuts and the seven `dispatch` cuts of the same
+  // frame ride here now. `post` is the one segment whose cost is not per-frame
+  // -- a 46 us span that latched 15,409 us on a Mac scene A idle frame -- and
+  // until these columns nothing in the tree could name which cut that was: the
+  // `frame post (*)` and `frame dispatch (*)` histograms record interact frames
+  // only. Never added to those families, and `disp_*` telescopes to
+  // `post_dispatch` rather than to `post`.
+  if (wm) frame_worst_all.push({ t: C[i].t,
+                          service: parseInt(wm[1], 10),
+                          family: wm[2],
                           since_boot: parseInt(wm[3], 10),
-                          pre: parseInt(wm[4], 10), pump: parseInt(wm[5], 10),
-                          ui: parseInt(wm[6], 10), prepare: parseInt(wm[7], 10),
-                          finish: parseInt(wm[8], 10), post: parseInt(wm[9], 10),
-                          ui_poll: parseInt(wm[10], 10), ui_layout: parseInt(wm[11], 10),
-                          ui_topbar: parseInt(wm[12], 10), ui_statusbar: parseInt(wm[13], 10),
-                          ui_stack: parseInt(wm[14], 10), ui_dialog: parseInt(wm[15], 10),
-                          ui_panes: parseInt(wm[16], 10), ui_apply: parseInt(wm[17], 10),
+                          pre: parseInt(wm[4], 10),
+                          pump: parseInt(wm[5], 10),
+                          ui: parseInt(wm[6], 10),
+                          prepare: parseInt(wm[7], 10),
+                          finish: parseInt(wm[8], 10),
+                          post: parseInt(wm[9], 10),
+                          ui_poll: parseInt(wm[10], 10),
+                          ui_layout: parseInt(wm[11], 10),
+                          ui_topbar: parseInt(wm[12], 10),
+                          ui_statusbar: parseInt(wm[13], 10),
+                          ui_stack: parseInt(wm[14], 10),
+                          ui_dialog: parseInt(wm[15], 10),
+                          ui_panes: parseInt(wm[16], 10),
+                          ui_apply: parseInt(wm[17], 10),
                           ui_chrome: parseInt(wm[18], 10),
-                          // The seven `stack` cuts: `ui_stack` above, opened up. They
-                          // telescope to IT, not to `ui`, and are never added to either
-                          // -- each is the one above it opened up, and summing any pair
-                          // double-counts the same microseconds. `stack` owns the `ui`
-                          // tail (max 16-20x its own median) and half the spikes fall on
-                          // idle frames, which no `stack:` histogram ever sees.
-                          stack_snap: parseInt(wm[19], 10), stack_gate: parseInt(wm[20], 10),
+                          stack_snap: parseInt(wm[19], 10),
+                          stack_gate: parseInt(wm[20], 10),
                           stack_hydrate: parseInt(wm[21], 10),
                           stack_statuses: parseInt(wm[22], 10),
                           stack_render: parseInt(wm[23], 10),
                           stack_inspector: parseInt(wm[24], 10),
                           stack_settle: parseInt(wm[25], 10),
-                          // The seven `pre` cuts of the same frame, telescoping to its
-                          // `pre` for the ui nine's reason: `pre` is the segment that
-                          // read 10,357 us on one latched frame, and half the expensive
-                          // frames are idle ones no `pre:` histogram ever sees.
-                          pre_platform: parseInt(wm[26], 10), pre_ingest: parseInt(wm[27], 10),
-                          pre_evict: parseInt(wm[28], 10), pre_drops: parseInt(wm[29], 10),
-                          pre_autosave: parseInt(wm[30], 10), pre_gate: parseInt(wm[31], 10),
+                          pre_platform: parseInt(wm[26], 10),
+                          pre_ingest: parseInt(wm[27], 10),
+                          pre_evict: parseInt(wm[28], 10),
+                          pre_drops: parseInt(wm[29], 10),
+                          pre_autosave: parseInt(wm[30], 10),
+                          pre_gate: parseInt(wm[31], 10),
                           pre_ensure: parseInt(wm[32], 10),
-                          boot_family: wm[33],
-                          boot_pre: parseInt(wm[34], 10), boot_pump: parseInt(wm[35], 10),
-                          boot_ui: parseInt(wm[36], 10), boot_prepare: parseInt(wm[37], 10),
-                          boot_finish: parseInt(wm[38], 10), boot_post: parseInt(wm[39], 10),
-                          boot_ui_poll: parseInt(wm[40], 10), boot_ui_layout: parseInt(wm[41], 10),
-                          boot_ui_topbar: parseInt(wm[42], 10), boot_ui_statusbar: parseInt(wm[43], 10),
-                          boot_ui_stack: parseInt(wm[44], 10), boot_ui_dialog: parseInt(wm[45], 10),
-                          boot_ui_panes: parseInt(wm[46], 10), boot_ui_apply: parseInt(wm[47], 10),
-                          boot_ui_chrome: parseInt(wm[48], 10),
-                          boot_stack_snap: parseInt(wm[49], 10),
-                          boot_stack_gate: parseInt(wm[50], 10),
-                          boot_stack_hydrate: parseInt(wm[51], 10),
-                          boot_stack_statuses: parseInt(wm[52], 10),
-                          boot_stack_render: parseInt(wm[53], 10),
-                          boot_stack_inspector: parseInt(wm[54], 10),
-                          boot_stack_settle: parseInt(wm[55], 10),
-                          boot_pre_platform: parseInt(wm[56], 10),
-                          boot_pre_ingest: parseInt(wm[57], 10),
-                          boot_pre_evict: parseInt(wm[58], 10),
-                          boot_pre_drops: parseInt(wm[59], 10),
-                          boot_pre_autosave: parseInt(wm[60], 10),
-                          boot_pre_gate: parseInt(wm[61], 10),
-                          boot_pre_ensure: parseInt(wm[62], 10) });
+                          post_handle: parseInt(wm[33], 10),
+                          post_dispatch: parseInt(wm[34], 10),
+                          post_back: parseInt(wm[35], 10),
+                          post_wake: parseInt(wm[36], 10),
+                          post_poll: parseInt(wm[37], 10),
+                          post_repaint: parseInt(wm[38], 10),
+                          post_close: parseInt(wm[39], 10),
+                          disp_dedupe: parseInt(wm[40], 10),
+                          disp_marks: parseInt(wm[41], 10),
+                          disp_hydrate: parseInt(wm[42], 10),
+                          disp_prepare: parseInt(wm[43], 10),
+                          disp_hitmap: parseInt(wm[44], 10),
+                          disp_offload: parseInt(wm[45], 10),
+                          disp_residual: parseInt(wm[46], 10),
+                          boot_family: wm[47],
+                          boot_pre: parseInt(wm[48], 10),
+                          boot_pump: parseInt(wm[49], 10),
+                          boot_ui: parseInt(wm[50], 10),
+                          boot_prepare: parseInt(wm[51], 10),
+                          boot_finish: parseInt(wm[52], 10),
+                          boot_post: parseInt(wm[53], 10),
+                          boot_ui_poll: parseInt(wm[54], 10),
+                          boot_ui_layout: parseInt(wm[55], 10),
+                          boot_ui_topbar: parseInt(wm[56], 10),
+                          boot_ui_statusbar: parseInt(wm[57], 10),
+                          boot_ui_stack: parseInt(wm[58], 10),
+                          boot_ui_dialog: parseInt(wm[59], 10),
+                          boot_ui_panes: parseInt(wm[60], 10),
+                          boot_ui_apply: parseInt(wm[61], 10),
+                          boot_ui_chrome: parseInt(wm[62], 10),
+                          boot_stack_snap: parseInt(wm[63], 10),
+                          boot_stack_gate: parseInt(wm[64], 10),
+                          boot_stack_hydrate: parseInt(wm[65], 10),
+                          boot_stack_statuses: parseInt(wm[66], 10),
+                          boot_stack_render: parseInt(wm[67], 10),
+                          boot_stack_inspector: parseInt(wm[68], 10),
+                          boot_stack_settle: parseInt(wm[69], 10),
+                          boot_pre_platform: parseInt(wm[70], 10),
+                          boot_pre_ingest: parseInt(wm[71], 10),
+                          boot_pre_evict: parseInt(wm[72], 10),
+                          boot_pre_drops: parseInt(wm[73], 10),
+                          boot_pre_autosave: parseInt(wm[74], 10),
+                          boot_pre_gate: parseInt(wm[75], 10),
+                          boot_pre_ensure: parseInt(wm[76], 10),
+                          boot_post_handle: parseInt(wm[77], 10),
+                          boot_post_dispatch: parseInt(wm[78], 10),
+                          boot_post_back: parseInt(wm[79], 10),
+                          boot_post_wake: parseInt(wm[80], 10),
+                          boot_post_poll: parseInt(wm[81], 10),
+                          boot_post_repaint: parseInt(wm[82], 10),
+                          boot_post_close: parseInt(wm[83], 10),
+                          boot_disp_dedupe: parseInt(wm[84], 10),
+                          boot_disp_marks: parseInt(wm[85], 10),
+                          boot_disp_hydrate: parseInt(wm[86], 10),
+                          boot_disp_prepare: parseInt(wm[87], 10),
+                          boot_disp_hitmap: parseInt(wm[88], 10),
+                          boot_disp_offload: parseInt(wm[89], 10),
+                          boot_disp_residual: parseInt(wm[90], 10) });
   var wn = frame_worst_none_re.exec(m);
-  if (wn) frame_worst_all.push({ t: C[i].t, service: null, family: null,
-                                 since_boot: parseInt(wn[1], 10), boot_family: wn[2],
-                                 boot_pre: parseInt(wn[3], 10), boot_pump: parseInt(wn[4], 10),
-                                 boot_ui: parseInt(wn[5], 10), boot_prepare: parseInt(wn[6], 10),
-                                 boot_finish: parseInt(wn[7], 10), boot_post: parseInt(wn[8], 10),
-                                 boot_ui_poll: parseInt(wn[9], 10), boot_ui_layout: parseInt(wn[10], 10),
-                                 boot_ui_topbar: parseInt(wn[11], 10), boot_ui_statusbar: parseInt(wn[12], 10),
-                                 boot_ui_stack: parseInt(wn[13], 10), boot_ui_dialog: parseInt(wn[14], 10),
-                                 boot_ui_panes: parseInt(wn[15], 10), boot_ui_apply: parseInt(wn[16], 10),
+  if (wn) frame_worst_all.push({ t: C[i].t,
+                                 service: null,
+                                 family: null,
+                                 since_boot: parseInt(wn[1], 10),
+                                 boot_family: wn[2],
+                                 boot_pre: parseInt(wn[3], 10),
+                                 boot_pump: parseInt(wn[4], 10),
+                                 boot_ui: parseInt(wn[5], 10),
+                                 boot_prepare: parseInt(wn[6], 10),
+                                 boot_finish: parseInt(wn[7], 10),
+                                 boot_post: parseInt(wn[8], 10),
+                                 boot_ui_poll: parseInt(wn[9], 10),
+                                 boot_ui_layout: parseInt(wn[10], 10),
+                                 boot_ui_topbar: parseInt(wn[11], 10),
+                                 boot_ui_statusbar: parseInt(wn[12], 10),
+                                 boot_ui_stack: parseInt(wn[13], 10),
+                                 boot_ui_dialog: parseInt(wn[14], 10),
+                                 boot_ui_panes: parseInt(wn[15], 10),
+                                 boot_ui_apply: parseInt(wn[16], 10),
                                  boot_ui_chrome: parseInt(wn[17], 10),
                                  boot_stack_snap: parseInt(wn[18], 10),
                                  boot_stack_gate: parseInt(wn[19], 10),
@@ -3816,7 +3871,21 @@ for (var i = 0; i < C.length; i++) {
                                  boot_pre_drops: parseInt(wn[28], 10),
                                  boot_pre_autosave: parseInt(wn[29], 10),
                                  boot_pre_gate: parseInt(wn[30], 10),
-                                 boot_pre_ensure: parseInt(wn[31], 10) });
+                                 boot_pre_ensure: parseInt(wn[31], 10),
+                                 boot_post_handle: parseInt(wn[32], 10),
+                                 boot_post_dispatch: parseInt(wn[33], 10),
+                                 boot_post_back: parseInt(wn[34], 10),
+                                 boot_post_wake: parseInt(wn[35], 10),
+                                 boot_post_poll: parseInt(wn[36], 10),
+                                 boot_post_repaint: parseInt(wn[37], 10),
+                                 boot_post_close: parseInt(wn[38], 10),
+                                 boot_disp_dedupe: parseInt(wn[39], 10),
+                                 boot_disp_marks: parseInt(wn[40], 10),
+                                 boot_disp_hydrate: parseInt(wn[41], 10),
+                                 boot_disp_prepare: parseInt(wn[42], 10),
+                                 boot_disp_hitmap: parseInt(wn[43], 10),
+                                 boot_disp_offload: parseInt(wn[44], 10),
+                                 boot_disp_residual: parseInt(wn[45], 10) });
   x = tile_take_re.exec(m);
   if (x) tile_take_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                               sum: parseInt(x[3], 10), p50: x[4],
@@ -9178,6 +9247,32 @@ def run_smoke(args):
                  fw.get("pre_evict"), fw.get("pre_drops"),
                  fw.get("pre_autosave"), fw.get("pre_gate"),
                  fw.get("pre_ensure")))
+        # The same frame's `post` segment, opened up. `post` is the one
+        # segment whose cost is not per-frame at all: a 46 us span that
+        # latched 15,409 us on a Mac scene A frame -- a 335x outlier -- and
+        # that frame was family=idle, so `post:*` (interact only) never saw
+        # it. The seven sum to `post=` above to within 6 us of truncation and
+        # are never added to the `post:` histograms.
+        print("[%s] SUMMARY frame worst post cuts (one frame; sum == post above "
+              "to within 6 us of truncation): "
+              "handle=%s dispatch=%s back=%s wake=%s poll=%s repaint=%s "
+              "close=%s"
+              % (tag, fw.get("post_handle"), fw.get("post_dispatch"),
+                 fw.get("post_back"), fw.get("post_wake"), fw.get("post_poll"),
+                 fw.get("post_repaint"), fw.get("post_close")))
+        # One level below those seven: which part of `dispatch_overlay_renders`
+        # the `post` tail is. These seven sum to `dispatch=` in the line above
+        # -- NOT to `post` -- and `prepare` or `hitmap` holding the cut means
+        # the frame thread BUILT A PAINT INPUT, which is the thing that has no
+        # business being there.
+        print("[%s] SUMMARY frame worst dispatch cuts (one frame; sum == "
+              "post dispatch above): "
+              "dedupe=%s marks=%s hydrate=%s prepare=%s hitmap=%s offload=%s "
+              "residual=%s"
+              % (tag, fw.get("disp_dedupe"), fw.get("disp_marks"),
+                 fw.get("disp_hydrate"), fw.get("disp_prepare"),
+                 fw.get("disp_hitmap"), fw.get("disp_offload"),
+                 fw.get("disp_residual")))
         print("[%s] SUMMARY frame worst since boot (NOT a tail; may be boot): service=%s us "
               "family=%s | pre=%s pump=%s ui=%s prepare=%s finish=%s post=%s"
               % (tag, fw.get("since_boot"), fw.get("boot_family"),
