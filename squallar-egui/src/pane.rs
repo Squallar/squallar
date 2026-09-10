@@ -1051,6 +1051,7 @@ impl<'a> PaneView<'a> {
                 .and_then(|slot| slot.state.as_deref())
                 .map(|s| s as &dyn Any),
             loading_site: self.loading_site,
+            as_of: self.pane.time.mode.as_of(),
             // One pane's view carries no peers: a caller that has to weigh
             // the whole layer across panes builds a `PaneRef::across`.
             peers: &[],
@@ -1071,6 +1072,7 @@ impl<'a> PaneView<'a> {
             config: &slot.config,
             state: slot.state.as_deref().map(|s| s as &dyn Any),
             loading_site: self.loading_site,
+            as_of: self.pane.time.mode.as_of(),
             peers: &[],
         }
     }
@@ -2408,6 +2410,7 @@ impl PaneState {
                 .and_then(|slot| slot.state.as_deref())
                 .map(|s| s as &dyn Any),
             loading_site: self.loading_site.as_deref(),
+            as_of: self.time.mode.as_of(),
             peers: &[],
         }
     }
@@ -3442,6 +3445,9 @@ impl PaneState {
                 config: &serde_json::Value::Null,
                 state: Some(state as &dyn Any),
                 loading_site: None,
+                // The question asked below is the enabled flag, which no
+                // handler answers from a clock.
+                as_of: None,
                 peers: &[],
             };
             slot.enabled = registry.is_enabled(&slot.id, &view);
@@ -3590,6 +3596,8 @@ impl PaneState {
                 return;
             }
         }
+        // Read before the slot borrow, which takes `self` mutably.
+        let as_of = self.time.mode.as_of();
         let Some(slot) = self.slot_mut(id) else {
             // Unreachable through `add_layer` above, which only declines an id
             // no handler serves — and this pane holds no slot for one of those
@@ -3604,6 +3612,7 @@ impl PaneState {
         let mut write = PaneMut {
             pane_idx,
             state: Some(state as &mut dyn Any),
+            as_of,
             peers: &[],
         };
         registry.set_enabled(id, enabled, &mut write);
@@ -3645,6 +3654,9 @@ impl PaneState {
                 config: &serde_json::Value::Null,
                 state: Some(state as &dyn Any),
                 loading_site: None,
+                // No pane: this walks the registry's own slots, which is why
+                // the index above is a literal zero.
+                as_of: None,
                 peers: &[],
             };
             slot.enabled = registry.is_enabled(&slot.id, &view);

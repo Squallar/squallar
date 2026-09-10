@@ -886,6 +886,7 @@ mod tests {
             config,
             state: None,
             loading_site: None,
+            as_of: None,
             peers: &[],
         }
     }

@@ -130,6 +130,7 @@ impl Slot {
             config: &self.config,
             state: self.state.as_ref().map(|s| &**s as &dyn Any),
             loading_site: None,
+            as_of: None,
             peers: &[],
         }
     }

@@ -1462,6 +1462,7 @@ fn two_panes_hold_different_glm_selections_and_the_registry_keeps_none_of_them()
         &mut PaneMut {
             pane_idx: 0,
             state: Some(&mut *a),
+            as_of: None,
             peers: &[],
         },
     );
@@ -1473,6 +1474,7 @@ fn two_panes_hold_different_glm_selections_and_the_registry_keeps_none_of_them()
         &mut PaneMut {
             pane_idx: 1,
             state: Some(&mut *b),
+            as_of: None,
             peers: &[],
         },
     );

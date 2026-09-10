@@ -2264,6 +2264,7 @@ mod tests {
             &mut PaneMut {
                 pane_idx: 1,
                 state: Some(&mut *b),
+                as_of: None,
                 peers: &[&*a],
             },
         );

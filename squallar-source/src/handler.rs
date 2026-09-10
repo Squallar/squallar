@@ -490,6 +490,22 @@ pub struct PaneRef<'a> {
     /// today lives on `Gui` rather than in any slot. WO-E8 dissolves the field
     /// it is read from; this member goes with it, and nothing new may read it.
     pub loading_site: Option<&'a str>,
+    /// **The instant this pane depicts**, UTC — `None` while the pane is
+    /// following live.
+    ///
+    /// The pane-shaped half of the same quantity
+    /// [`RasterizeContext::as_of`] carries down the paint path and
+    /// [`FetchConfig::as_of`] carries down the fetch path. Those two are
+    /// already *resolved* (a live pane writes the wall clock); this one is
+    /// not, because a `PaneRef` is built per pane per layer per frame and
+    /// sampling a clock there would put a `Utc::now()` on the frame thread
+    /// once per handler. A reader that wants the resolved instant asks
+    /// [`Self::as_of_or_now`], which samples exactly where the handler used
+    /// to sample anyway.
+    ///
+    /// `None` is also what a paneless [`Self::across`] and a [`Self::bare`]
+    /// carry: neither names a pane, so neither names an instant.
+    pub as_of: Option<chrono::NaiveDateTime>,
     /// **The same layer's state in the OTHER panes**, in pane order, for the
     /// panes that have one.
     ///
@@ -516,6 +532,7 @@ impl<'a> PaneRef<'a> {
             config: &NULL_CONFIG,
             state: None,
             loading_site: None,
+            as_of: None,
             peers: &[],
         }
     }
@@ -535,6 +552,7 @@ impl<'a> PaneRef<'a> {
             config: &NULL_CONFIG,
             state: None,
             loading_site: None,
+            as_of: None,
             peers,
         }
     }
@@ -543,6 +561,21 @@ impl<'a> PaneRef<'a> {
     /// layer (or it is not a `T`).
     pub fn state_as<T: 'static>(&self) -> Option<&'a T> {
         self.state?.downcast_ref::<T>()
+    }
+
+    /// **The instant to answer about**: this pane's depicted instant, or the
+    /// wall clock while it follows live.
+    ///
+    /// The one door a handler asks a time question through. A handler that
+    /// spells `Utc::now()` instead answers about *today* on a pane parked in
+    /// April — that is the whole of the defect class this exists to close —
+    /// and a handler that reads [`Self::as_of`] raw has to invent the live
+    /// arm itself.
+    ///
+    /// The sample is taken here rather than at construction so a live pane
+    /// costs exactly the clock read it always cost, in the same place.
+    pub fn as_of_or_now(&self) -> chrono::NaiveDateTime {
+        self.as_of.unwrap_or_else(|| chrono::Utc::now().naive_utc())
     }
 
     /// **Every pane's state for this layer as `T`** — this one first, then the
@@ -564,6 +597,16 @@ impl<'a> PaneRef<'a> {
 pub struct PaneMut<'a> {
     pub pane_idx: usize,
     pub state: Option<&'a mut dyn Any>,
+    /// **The instant this pane depicts** — see [`PaneRef::as_of`], of which
+    /// this is the write side's copy.
+    ///
+    /// A control edit needs it for the same reason the control *list* does:
+    /// the model layer's run menu spells its options as choices relative to
+    /// the latest run (`latest-3`), so the clock that built the menu and the
+    /// clock that reads the pick back have to be one clock. Carrying it on
+    /// the read half alone would leave a scrubbed pane offered April's runs
+    /// and resolving the chosen one against today.
+    pub as_of: Option<chrono::NaiveDateTime>,
     /// The same layer's state in the **other** panes, read-only — see
     /// [`PaneRef::peers`]. A control edit that changes what the layer as a
     /// whole is asking for (the outlook's day and product set) has to weigh
@@ -579,6 +622,7 @@ impl PaneMut<'_> {
         Self {
             pane_idx,
             state: None,
+            as_of: None,
             peers: &[],
         }
     }
@@ -586,6 +630,11 @@ impl PaneMut<'_> {
     /// This pane's state as `T`, mutably.
     pub fn state_as<T: 'static>(&mut self) -> Option<&mut T> {
         self.state.as_deref_mut()?.downcast_mut::<T>()
+    }
+
+    /// **The instant to answer about** — see [`PaneRef::as_of_or_now`].
+    pub fn as_of_or_now(&self) -> chrono::NaiveDateTime {
+        self.as_of.unwrap_or_else(|| chrono::Utc::now().naive_utc())
     }
 
     /// The **read** view of the same pane, for the handler methods a control
@@ -599,6 +648,7 @@ impl PaneMut<'_> {
             config: &NULL_CONFIG,
             state: self.state.as_deref(),
             loading_site: None,
+            as_of: self.as_of,
             peers: self.peers,
         }
     }
@@ -1720,4 +1770,49 @@ pub struct PopupAction {
 
 pub enum PopupActionKind {
     HideFromMap,
+}
+
+#[cfg(test)]
+mod pane_ref_tests {
+    use super::*;
+
+    /// **What the pane clock costs a type built per pane per layer per
+    /// frame.**
+    ///
+    /// [`PaneRef`] is a stack temporary — nothing in the workspace holds one
+    /// in a field, a `Vec` or a map — so the price is per call and not per
+    /// item. That is the whole reason a clock could go on it at all, and this
+    /// pins the price to exactly one `Option` with no padding bought
+    /// alongside it.
+    #[test]
+    fn the_pane_clock_costs_one_aligned_option() {
+        /// The shape [`PaneRef`] had before it carried a clock, field for
+        /// field — the denominator, spelled out rather than written as a
+        /// number that would rot.
+        struct Before<'a> {
+            _pane_idx: usize,
+            _config: &'a serde_json::Value,
+            _state: Option<&'a dyn Any>,
+            _loading_site: Option<&'a str>,
+            _peers: &'a [&'a dyn Any],
+        }
+
+        let before = std::mem::size_of::<Before<'_>>();
+        let after = std::mem::size_of::<PaneRef<'_>>();
+        let clock = std::mem::size_of::<Option<chrono::NaiveDateTime>>();
+        let align = std::mem::align_of::<PaneRef<'_>>();
+        println!("PaneRef: {before} B before, {after} B after, clock {clock} B");
+        // The clock is 12 B on its own — `NaiveDate` has a niche, so the
+        // `Option` is free — but every other member of this struct is
+        // pointer-aligned, so it is charged 16. Spelled as the rounding
+        // rather than as 16, because the number is a consequence of the
+        // alignment and not a fact anyone chose.
+        assert_eq!(
+            after - before,
+            clock.next_multiple_of(align),
+            "PaneRef is {after} B and was {before} B: the clock must cost one \
+             {clock} B Option rounded up to the struct's {align} B alignment, \
+             and nothing else",
+        );
+    }
 }
