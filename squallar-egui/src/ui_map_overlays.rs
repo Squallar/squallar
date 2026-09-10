@@ -425,6 +425,13 @@ pub(super) fn draw_tile_layer(
     // stretch is anything that has to draw between two of its members, and
     // every hand-over below is one of those.
     let mut spans = GroundSpans::default();
+    // **One set of ledger writes for the pass, not one per tile.** Every
+    // figure here is a running total whose denominator is TILES AND FRAMES,
+    // so a pass adds the same numbers whether it adds them once or forty-five
+    // times -- and each `note_*` is a relaxed `fetch_add` on a `static`, nine
+    // of them per call. `note_raster_quads` is already spelled this way for
+    // the raster half of the same walk; this is the vector half catching up.
+    let mut counted = Counted::default();
     for (rect, piece, background, placement) in answered {
         match piece.tile {
             // `window_of` and not `piece.uv`: the tile may be a slot
@@ -471,6 +478,7 @@ pub(super) fn draw_tile_layer(
                     placement,
                     &mut labels,
                     background,
+                    &mut counted,
                 );
             }
         }
@@ -478,6 +486,7 @@ pub(super) fn draw_tile_layer(
     quad_meshes += hand_over_quads(ui, &mut quads, &mut spans, ground, pass_nr);
     // The pass is over: whatever the batch is still holding draws now.
     hand_over_spans(ui, &mut spans, ground, pass_nr);
+    counted.report();
     if quad_count > 0 {
         crate::tile_mesh::ledger::note_raster_quads(quad_count, quad_meshes, quads.pages());
     }
@@ -1217,6 +1226,7 @@ fn paint_vector_tile(
     placement: egui::emath::TSTransform,
     labels: &mut Vec<walkers::Text>,
     background: Background,
+    counted: &mut Counted,
 ) {
     // The pane's painter, kept: the tile's own shapes go in under the tile's
     // clip below, and the layer's batch goes in under the pane's, which is
@@ -1229,10 +1239,6 @@ fn paint_vector_tile(
     // batch carries this and the renderer sets it itself; see
     // `crate::tile_mesh::GroundBatch`.
     let span_clip = painter.clip_rect();
-
-    // Accumulated and written once per tile per counter, not once per shape:
-    // a dense tile is hundreds of shapes and these are `static` atomics.
-    let mut counted = Counted::default();
 
     let mut runs = GroundMeshes::runs();
 
@@ -1295,7 +1301,7 @@ fn paint_vector_tile(
                         rect,
                         span_clip,
                         shapes,
-                        &mut counted,
+                        counted,
                         &mut placed,
                         labels,
                     );
@@ -1305,7 +1311,7 @@ fn paint_vector_tile(
                         continue;
                     }
                     if let Some(shape) = shapes.get(index as usize) {
-                        place_one(shape, placement, rect, &mut counted, &mut placed, labels);
+                        place_one(shape, placement, rect, counted, &mut placed, labels);
                     }
                 }
             }
@@ -1337,13 +1343,12 @@ fn paint_vector_tile(
             if background.already_drew(index) {
                 continue;
             }
-            place_one(shape, placement, rect, &mut counted, &mut placed, labels);
+            place_one(shape, placement, rect, counted, &mut placed, labels);
         }
     }
 
-    counted.ground_shapes = placed.len() as u64;
-    counted.ground_shape_slots = placed.capacity() as u64;
-    counted.report();
+    counted.ground_shapes += placed.len() as u64;
+    counted.ground_shape_slots += placed.capacity() as u64;
     if placed.is_empty() {
         // Nothing of this tile draws on the CPU, so nothing of it has to cross
         // the batch and the batch stays open for the next tile. `extend` is
@@ -1362,7 +1367,14 @@ fn paint_vector_tile(
     painter.extend(placed);
 }
 
-/// What one tile's ground phase placed, before it is reported.
+/// What one layer pass's ground phase placed, before it is reported.
+///
+/// **One of these per pass, not per tile.** Nine of the ten figures below are
+/// running totals a pass contributes to; adding a tile's numbers into a local
+/// and reporting the pass costs nine relaxed `fetch_add`s where reporting each
+/// tile cost nine times the cells on the glass -- 405 against 9 on a 1920x1080
+/// pane at zoom 6. The totals the ledger publishes are the same either way,
+/// because addition is.
 #[derive(Default)]
 struct Counted {
     mesh_vertices: u64,
@@ -1372,11 +1384,12 @@ struct Counted {
     stroke_draws: u64,
     stroke_run_meshes: u64,
     stroke_mesh_vertices: u64,
-    /// Shapes handed to the painter — the parent the rest are cuts of, set
-    /// from the list's length after the walk rather than incremented, so
-    /// nothing can count itself into it twice.
+    /// Shapes handed to the painter — the parent the rest are cuts of, taken
+    /// from each tile's list length once its walk is over rather than
+    /// incremented as shapes are placed, so nothing can count itself into it
+    /// twice.
     ground_shapes: u64,
-    /// Slots reserved to hold them, read off the same vector's capacity for
+    /// Slots reserved to hold them, read off the same vectors' capacities for
     /// the same reason.
     ground_shape_slots: u64,
 }
@@ -4172,6 +4185,10 @@ mod tests {
         // The placement the walk hands down, spelled here so a case still
         // names the `uv` it is about.
         let placement = walkers::mvt::placement(full_rect_of_clipped_tile(rect, uv));
+        // The pass's ledger accumulator, one tile long — the shipped walk
+        // keeps one across every tile of a layer and reports it once, and a
+        // case that draws one tile is that walk with a span of one.
+        let mut counted = Counted::default();
         paint_vector_tile(
             ui.painter(),
             shapes,
@@ -4181,7 +4198,9 @@ mod tests {
             placement,
             labels,
             background,
+            &mut counted,
         );
+        counted.report();
         hand_over_spans(ui, &mut spans, ground.painter, ground.pass_nr);
     }
 

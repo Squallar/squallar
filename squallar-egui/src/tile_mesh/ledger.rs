@@ -3,8 +3,14 @@
 //! **Product telemetry, not a campaign instrument**, on the terms of
 //! [`crate::floor_ledger`] and [`crate::overlay_cache::ledger`]: always on, no
 //! feature gate, every write one `fetch_add` with [`Relaxed`] ordering on a
-//! `static`, and one write per tile per counter rather than one per shape. The
-//! sentence that reports these numbers is written by `squallar-app`.
+//! `static`, and **one write per layer pass per counter** — not one per shape,
+//! and since 2026-09-10 not one per tile either: a tile's figures are added
+//! into a local the walk keeps across the span and reported once when the
+//! span is over, which is what `note_raster_quads` already did for the raster
+//! half of the same walk. The totals are the same numbers either way, because
+//! addition is; what changes is that a 45-cell pane pays nine relaxed
+//! `fetch_add`s for them and not 405. The sentence that reports these numbers
+//! is written by `squallar-app`.
 //!
 //! # The denominators — four, and no two of them are added
 //!
@@ -207,17 +213,18 @@ pub fn note_raster_quads(quads: u64, meshes: u64, pages: u64) {
     RASTER_PAGES.fetch_add(pages, Relaxed);
 }
 
-/// Fill vertices this tile placed on the CPU. One call per tile.
+/// Fill vertices this layer pass placed on the CPU. One call per pass.
 pub fn note_mesh_vertices_placed(n: u64) {
     MESH_VERTICES_PLACED.fetch_add(n, Relaxed);
 }
 
-/// Stroke points this tile placed on the CPU. One call per tile.
+/// Stroke points this layer pass placed on the CPU. One call per pass.
 pub fn note_path_points_placed(n: u64) {
     PATH_POINTS_PLACED.fetch_add(n, Relaxed);
 }
 
-/// Label anchors this tile deferred to the label phase. One call per tile.
+/// Label anchors this layer pass deferred to the label phase. One call per
+/// pass.
 pub fn note_label_anchors_placed(n: u64) {
     LABEL_ANCHORS_PLACED.fetch_add(n, Relaxed);
 }
@@ -234,25 +241,25 @@ pub fn note_ground_callback() {
     GROUND_CALLBACKS.fetch_add(1, Relaxed);
 }
 
-/// Fill runs this tile handed to the renderer. One call per tile.
+/// Fill runs this layer pass handed to the renderer. One call per pass.
 pub fn note_mesh_draws(n: u64) {
     MESH_DRAWS.fetch_add(n, Relaxed);
 }
 
-/// Stroke runs this tile handed to the renderer. One call per tile.
+/// Stroke runs this layer pass handed to the renderer. One call per pass.
 pub fn note_stroke_draws(n: u64) {
     STROKE_DRAWS.fetch_add(n, Relaxed);
 }
 
-/// Stroke runs this tile drew from its pre-tessellated buffers, and the
-/// vertices they carried. One call per tile.
+/// Stroke runs this layer pass drew from its pre-tessellated buffers, and
+/// the vertices they carried. One call per pass.
 pub fn note_stroke_run_meshes(runs: u64, vertices: u64) {
     STROKE_RUN_MESHES.fetch_add(runs, Relaxed);
     STROKE_MESH_VERTICES.fetch_add(vertices, Relaxed);
 }
 
-/// Shapes this tile handed the painter, and the slots it reserved for them.
-/// One call per tile.
+/// Shapes this layer pass handed the painter, and the slots it reserved for
+/// them. One call per pass.
 pub fn note_ground_shapes(n: u64, slots: u64) {
     GROUND_SHAPES.fetch_add(n, Relaxed);
     GROUND_SHAPE_SLOTS.fetch_add(slots, Relaxed);
