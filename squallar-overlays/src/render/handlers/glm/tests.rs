@@ -6,8 +6,8 @@ fn item(level: GlmDataLevel, energy: Option<f32>, area: Option<f32>) -> GlmFlash
         flash: GlmFlash {
             lat: 35.0,
             lon: -97.0,
-            energy,
-            area,
+            energy: energy.unwrap_or(f32::NAN),
+            area: area.unwrap_or(f32::NAN),
             time: chrono::NaiveDate::from_ymd_opt(2026, 7, 24)
                 .unwrap()
                 .and_hms_opt(12, 0, 0)
@@ -1046,8 +1046,8 @@ fn half_listed_round() -> FetchPayload {
         flashes: vec![crate::glm::GlmFlash {
             lat: 35.0,
             lon: -97.0,
-            energy: None,
-            area: None,
+            energy: f32::NAN,
+            area: f32::NAN,
             time: chrono::NaiveDate::from_ymd_opt(2026, 7, 24)
                 .unwrap()
                 .and_hms_opt(12, 0, 0)
@@ -2160,8 +2160,8 @@ fn seed_cache(handler: &GlmHandler, granules: usize, per_granule: usize) -> usiz
                 .map(|i| GlmFlash {
                     lat: 35.0,
                     lon: -97.0,
-                    energy: Some(1.0e-14),
-                    area: Some(1.0e8),
+                    energy: 1.0e-14,
+                    area: 1.0e8,
                     time: start + chrono::TimeDelta::milliseconds(i as i64),
                     satellite: GlmSatellite::GoesEast,
                     level: GlmDataLevel::Flash,
@@ -2179,7 +2179,7 @@ fn seed_cache(handler: &GlmHandler, granules: usize, per_granule: usize) -> usiz
 /// The store is `Arc<Mutex<GlmCache>>` plus a level beside it. A census that
 /// answered by locking would have to `try_lock` — a frame's telemetry tick may
 /// not block — and a `try_lock` that misses answers **zero** on a store holding
-/// up to 12,000,000 B. A false zero is worse than a missing family: a missing
+/// up to 10,000,000 B. A false zero is worse than a missing family: a missing
 /// family is visible in the census residual and a false zero is not.
 ///
 /// So the read happens *inside* `with_mut`, with the lock held on this very

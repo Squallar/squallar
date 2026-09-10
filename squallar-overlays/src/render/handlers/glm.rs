@@ -222,10 +222,10 @@ impl OverlayItem for GlmFlashItem {
         ];
         // Omitted when the product did not report them: an absent row says
         // "not reported", a "0.0 km²" row would claim a measurement.
-        if let Some(energy) = f.energy {
+        if let Some(energy) = f.energy_j() {
             grid.push(("Energy".into(), format!("{energy:.2e} J")));
         }
-        if let Some(area) = f.area {
+        if let Some(area) = f.area_km2() {
             grid.push(("Area".into(), format!("{area:.1} km²")));
         }
 
@@ -546,7 +546,7 @@ impl GlmHandler {
                             lat: f.lat,
                             lon: f.lon,
                             time: f.time,
-                            energy: f.energy,
+                            energy: f.energy_j(),
                         }
                     })
                     .collect::<Vec<_>>();

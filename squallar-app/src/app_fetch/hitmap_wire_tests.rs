@@ -137,8 +137,8 @@ fn seed(app: &mut crate::app::App, id: &LayerId) {
             let flash = |age_secs: i64, lat: f64, lon: f64| GlmFlash {
                 lat,
                 lon,
-                energy: Some(1e-14),
-                area: None,
+                energy: 1e-14,
+                area: f32::NAN,
                 time: now - chrono::Duration::seconds(age_secs),
                 satellite: GlmSatellite::GoesEast,
                 level: GlmDataLevel::Flash,

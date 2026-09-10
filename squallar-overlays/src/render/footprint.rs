@@ -357,7 +357,7 @@ pub(crate) fn reports_hit_slab(
 ///
 /// `arc_body`, not the pointer price: the memo CREATED this body out of the
 /// slab, so nothing else in the census holds it. The slab those rows were
-/// taken off is the same layer's item data and a separate 48 bytes a flash —
+/// taken off is the same layer's item data and a separate 40 bytes a flash —
 /// two disjoint figures over one granule, which is the whole reason the item
 /// and parked families are read apart.
 pub(crate) fn glm_paint_rows(rows: &crate::render::handlers::glm::GlmPaintRows) -> u64 {

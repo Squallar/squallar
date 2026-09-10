@@ -170,7 +170,7 @@ fn produced(job: &squallar_source::job::DescribedJob, items: &HitItems) -> Produ
                 it.flash.lat,
                 it.flash.lon,
                 &it.flash.time,
-                &it.flash.energy,
+                &it.flash.energy_j(),
             ));
             indices.push(it.index);
         }

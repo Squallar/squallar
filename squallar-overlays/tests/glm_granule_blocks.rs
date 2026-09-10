@@ -165,8 +165,8 @@ fn a_granule(n: usize) -> OverlayFetchResult {
         .map(|i| GlmFlash {
             lat: 33.0 + (i % 400) as f64 * 0.01,
             lon: -99.0 + (i % 300) as f64 * 0.01,
-            energy: Some(1e-14),
-            area: None,
+            energy: 1e-14,
+            area: f32::NAN,
             time: now() - chrono::Duration::seconds((i % 250) as i64),
             satellite: GlmSatellite::GoesEast,
             level: GlmDataLevel::Flash,
@@ -295,15 +295,15 @@ fn a_resident_granule_is_the_rows_and_little_else() {
          per flash",
         net as f64 / FLASHES as f64,
     );
-    // A `GlmFlash` is 48 bytes with its padding, so the rows alone are 48 per
+    // A `GlmFlash` is 40 bytes with its padding, so the rows alone are 40 per
     // flash and nothing else this layer holds scales with the flash count. The
-    // bar is 64 rather than 48 so that a row growing a field is not a red gate
+    // bar is 64 rather than 40 so that a row growing a field is not a red gate
     // on its own; a per-flash heap block on top of the rows is 72 bytes and
     // lands well above it.
     assert!(
         net < FLASHES * 64,
         "a resident granule of {FLASHES} flashes is {net} bytes, {} per flash \
-         — the rows themselves are 48 per flash, so anything approaching 120 \
+         — the rows themselves are 40 per flash, so anything approaching 112 \
          is a second per-flash block beside them",
         net as f64 / FLASHES as f64,
     );

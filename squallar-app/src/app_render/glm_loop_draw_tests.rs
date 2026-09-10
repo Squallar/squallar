@@ -98,8 +98,8 @@ fn flash(k: i64) -> GlmFlash {
     GlmFlash {
         lat: 34.1 + 0.15 * k as f64,
         lon: -98.5,
-        energy: Some(1.0e-14),
-        area: None,
+        energy: 1.0e-14,
+        area: f32::NAN,
         time: hour(k) - chrono::Duration::seconds(100),
         satellite: GlmSatellite::GoesEast,
         level: GlmDataLevel::Flash,

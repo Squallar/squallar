@@ -913,7 +913,7 @@ impl OverlayRegistry {
     /// The three gridded layers are the bulk of it: MRMS at 49 MB a mosaic,
     /// GMGSI at 15 MB a blend — one byte a point, the width its values are —
     /// HRRR at 7.6 MB a grid. **And one that is not gridded**: the lightning
-    /// layer's S3 granule cache, up to `MAX_RETAINED_FLASHES` rows at 48 bytes
+    /// layer's S3 granule cache, up to `MAX_RETAINED_FLASHES` rows at 40 bytes
     /// apiece — 12 MB — held beside its `OverlayState` and therefore in no
     /// other family. Every other handler takes the trait's `0` default, which
     /// is a claim about scale rather than an omission — a few hundred parsed

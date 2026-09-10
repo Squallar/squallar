@@ -48,8 +48,8 @@ fn a_flash() -> GlmFlash {
     GlmFlash {
         lat: 35.22,
         lon: -97.44,
-        energy: None,
-        area: None,
+        energy: f32::NAN,
+        area: f32::NAN,
         time: chrono::NaiveDate::from_ymd_opt(2026, 7, 24)
             .unwrap()
             .and_hms_opt(12, 0, 0)

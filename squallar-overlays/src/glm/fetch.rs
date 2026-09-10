@@ -27,7 +27,8 @@ struct CachedGranule {
     /// second `Vec<GlmFlash>` per granule, resident for the whole poll (list,
     /// download **and** parse) rather than momentarily, so the peak was
     /// **twice** [`GlmCache::retained_bytes`]: 6,681,600 B at the shipped
-    /// default posture and 24,000,000 B at [`MAX_RETAINED_FLASHES`]. Shared,
+    /// default posture and 24,000,000 B at [`MAX_RETAINED_FLASHES`], both
+    /// measured against the 48-byte row of the time. Shared,
     /// the clone is the `HashMap`'s table and one `String` key per granule —
     /// kilobytes at the ~16 granules the cap holds, and it does not scale with
     /// the flash count at all.
@@ -104,7 +105,7 @@ pub const FLASH_BYTES: usize = size_of::<GlmFlash>();
 ///
 /// The denominator: `250_000 × size_of::<GlmFlash>()`, measured by
 /// `a_spanned_poll_caps_what_it_retains_and_drops_its_oldest_hours_first` as
-/// **12 000 000 bytes at 48 bytes a row** — the whole cost, since `GlmFlash`
+/// **10 000 000 bytes at 40 bytes a row** — the whole cost, since `GlmFlash`
 /// owns nothing on the heap. Every raster job ships at most this many rows.
 ///
 /// **How much *time* 250 000 rows covers is not measured here**, and it is a
@@ -327,7 +328,7 @@ impl GlmCache {
 /// The handler's store used to be a bare `Arc<Mutex<GlmCache>>`, which is a
 /// store held *beside* its `OverlayState` and therefore in no census family at
 /// all: [`crate::render::footprint`] prices what an `OverlayState` installed,
-/// and up to [`MAX_RETAINED_FLASHES`] rows — 12,000,000 B — were in neither
+/// and up to [`MAX_RETAINED_FLASHES`] rows — 10,000,000 B — were in neither
 /// that figure nor `overlay grids`. Dark bytes in the governor's residual are
 /// exactly what makes a whole-heap reading unattributable.
 ///
@@ -432,7 +433,8 @@ impl GlmStore {
     /// shares every row with the store. It used to clone the rows as well,
     /// which put a second [`Self::retained_bytes`] on the heap for the whole
     /// length of a poll — list, download and parse — and made the peak
-    /// 6,681,600 B at the shipped default posture and 24,000,000 B at
+    /// 6,681,600 B at the shipped default posture and 24,000,000 B at the
+    /// ceiling, both against the 48-byte row of the time,
     /// [`MAX_RETAINED_FLASHES`].
     ///
     /// What this costs is still not in [`Self::retained_bytes`], which is a
@@ -2362,15 +2364,18 @@ fn parse_level_records<S: VarSource>(
         }
 
         // Energy and area are descriptive, not locating: an unreported value
-        // leaves the field `None`. Never zero — `0f32.log10()` is -inf and
-        // `rasterize` draws unknown as the smallest possible bolt.
-        // `_FillValue = -1s` means a value can be absent in a present column.
+        // leaves the field at its `f32::NAN` sentinel (see [`GlmFlash::energy`]).
+        // Never zero — `0f32.log10()` is -inf and `rasterize` draws unknown as
+        // the smallest possible bolt. `_FillValue = -1s` means a value can be
+        // absent in a present column.
         let energy = column_value(Some(&energies), i)
             .zip(energy_to_j)
-            .map(|(v, to_j)| (v * to_j) as f32);
+            .map(|(v, to_j)| (v * to_j) as f32)
+            .unwrap_or(f32::NAN);
         let area = column_value(areas.as_ref(), i)
             .zip(area_to_km2)
-            .map(|(v, to_km2)| (v * to_km2) as f32);
+            .map(|(v, to_km2)| (v * to_km2) as f32)
+            .unwrap_or(f32::NAN);
 
         // Microseconds, not milliseconds: GLM's time `scale_factor` is
         // 3.814756e-4 s, so representable instants are 0.38 ms apart and

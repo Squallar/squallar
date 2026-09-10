@@ -240,8 +240,8 @@ fn glm_fixture() -> crate::glm::GlmFlash {
     GlmFlash {
         lat: 35.0,
         lon: -98.0,
-        energy: None,
-        area: None,
+        energy: f32::NAN,
+        area: f32::NAN,
         // **A minute in the past, not `now`.** A flash later than the
         // depicted instant is culled, and a bare `Utc::now()` here races the
         // clock `rctx()` captured: whichever is read second wins, so the
@@ -675,7 +675,7 @@ fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
             lat: flash.lat,
             lon: flash.lon,
             time: flash.time,
-            energy: flash.energy,
+            energy: flash.energy_j(),
         }]),
         device_scale: 1.0,
         zoom: 7.0,

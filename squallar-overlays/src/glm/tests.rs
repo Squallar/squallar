@@ -472,13 +472,14 @@ fn fill_valued_energy_becomes_unknown_without_dropping_the_record() {
     let events = events_of(&synthetic_granule());
 
     // raw 79 → 79 * 1.9024e-17 + 2.8515e-16 = 1.788e-15 J
-    let first = events[0].energy.expect("first event has a real energy");
+    let first = events[0].energy_j().expect("first event has a real energy");
     assert!(
         (f64::from(first) - 1.788e-15).abs() < 1e-17,
         "energy was {first:e}"
     );
     assert_eq!(
-        events[1].energy, None,
+        events[1].energy_j(),
+        None,
         "a fill energy must not become a number"
     );
 }
@@ -487,7 +488,7 @@ fn fill_valued_energy_becomes_unknown_without_dropping_the_record() {
 fn absent_event_area_variable_reports_unknown_not_zero() {
     let events = events_of(&synthetic_granule());
     assert_eq!(events.len(), 2);
-    assert!(events.iter().all(|e| e.area.is_none()));
+    assert!(events.iter().all(|e| e.area_km2().is_none()));
 }
 
 #[test]
@@ -495,11 +496,11 @@ fn flash_area_unpacks_from_m2_counts_into_km2() {
     let flashes = flashes_of(&synthetic_granule());
 
     // 1826 * 152601.9 m² = 2.7865e8 m² = 278.65 km²
-    let first = flashes[0].area.expect("flash area is reported");
+    let first = flashes[0].area_km2().expect("flash area is reported");
     assert!((first - 278.65).abs() < 0.1, "area was {first}");
     // 40000 stored as -25536; unpacking the signed reading would give a
     // negative area.
-    let second = flashes[1].area.expect("flash area is reported");
+    let second = flashes[1].area_km2().expect("flash area is reported");
     assert!((second - 6104.08).abs() < 1.0, "area was {second}");
     assert!((first - 1826.0).abs() > 1000.0);
 }
@@ -522,7 +523,7 @@ fn unconvertible_area_units_make_the_field_unknown() {
         "unit trouble must not cost us the records"
     );
     assert!(
-        flashes.iter().all(|f| f.area.is_none()),
+        flashes.iter().all(|f| f.area_km2().is_none()),
         "an unconvertible unit must not be reported as km²"
     );
 }
@@ -537,7 +538,7 @@ fn absent_area_units_are_treated_the_same_as_unconvertible_ones() {
 
     assert_eq!(flashes.len(), 2);
     assert!(
-        flashes.iter().all(|f| f.area.is_none()),
+        flashes.iter().all(|f| f.area_km2().is_none()),
         "without a declared unit the value must not be assumed canonical"
     );
 }
@@ -556,10 +557,10 @@ fn unconvertible_energy_units_make_the_field_unknown() {
         "unit trouble must not cost us the records"
     );
     assert!(
-        flashes.iter().all(|f| f.energy.is_none()),
+        flashes.iter().all(|f| f.energy_j().is_none()),
         "an unconvertible unit must not be reported as joules"
     );
-    assert!(flashes.iter().all(|f| f.area.is_some()));
+    assert!(flashes.iter().all(|f| f.area_km2().is_some()));
 }
 
 #[test]
@@ -570,7 +571,7 @@ fn absent_energy_units_are_treated_the_same_as_unconvertible_ones() {
     });
     let flashes = flashes_of(&bytes);
     assert_eq!(flashes.len(), 2);
-    assert!(flashes.iter().all(|f| f.energy.is_none()));
+    assert!(flashes.iter().all(|f| f.energy_j().is_none()));
 }
 
 #[test]
@@ -584,7 +585,7 @@ fn unit_trouble_is_scoped_to_the_field_it_describes() {
     assert_eq!(flashes[0].lat, f64::from(39.033424_f32));
     assert_eq!((flashes[0].time - epoch()).num_milliseconds(), -785);
     assert!(
-        flashes[0].energy.is_some(),
+        flashes[0].energy_j().is_some(),
         "energy must survive an area unit problem"
     );
 
@@ -1201,7 +1202,7 @@ fn a_real_granule_parses_into_plottable_lightning() {
             r.time
         );
 
-        if let Some(e) = r.energy {
+        if let Some(e) = r.energy_j() {
             // GLM reports radiant energy around 1e-15 J. A missing
             // `scale_factor` puts this at ~1e4 (the raw count), a doubled one
             // at ~1e-31.
@@ -1210,7 +1211,7 @@ fn a_real_granule_parses_into_plottable_lightning() {
                 "energy outside the range GLM reports: {e}"
             );
         }
-        if let Some(a) = r.area {
+        if let Some(a) = r.area_km2() {
             // Groups and flashes span tens to thousands of km²; the packed
             // count is in `m2` and must have been converted.
             assert!(
@@ -1225,7 +1226,7 @@ fn a_real_granule_parses_into_plottable_lightning() {
             .records
             .iter()
             .filter(|r| r.level == GlmDataLevel::Event)
-            .all(|r| r.area.is_none()),
+            .all(|r| r.area_km2().is_none()),
         "events must not report an area"
     );
     assert!(
@@ -1233,7 +1234,7 @@ fn a_real_granule_parses_into_plottable_lightning() {
             .records
             .iter()
             .filter(|r| r.level == GlmDataLevel::Flash)
-            .all(|r| r.area.is_some()),
+            .all(|r| r.area_km2().is_some()),
         "flashes must report an area"
     );
 }

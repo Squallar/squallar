@@ -115,8 +115,8 @@ fn a_granule(n: usize, lat_base: f64) -> OverlayFetchResult {
         .map(|i| squallar_overlays::glm::GlmFlash {
             lat: lat_base + i as f64 * 0.01,
             lon: -97.0 + i as f64 * 0.01,
-            energy: Some(1e-14),
-            area: None,
+            energy: 1e-14,
+            area: f32::NAN,
             time,
             satellite: squallar_overlays::glm::GlmSatellite::GoesEast,
             level: squallar_overlays::glm::GlmDataLevel::Flash,

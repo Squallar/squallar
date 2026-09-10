@@ -67,17 +67,44 @@ impl GlmDataLevel {
 pub struct GlmFlash {
     pub lat: f64,
     pub lon: f64,
-    /// `None` means unknown; do not substitute 0.0. Every GLM energy variable
-    /// carries `add_offset = 2.8515e-16`, so zero is out of band, and `rasterize`
-    /// sizes bolts by `energy.log10()`.
-    pub energy: Option<f32>,
-    /// Stored as an `_Unsigned` packed `short` with `scale_factor = 152601.9` and
-    /// `units = "m2"`. `None` at [`GlmDataLevel::Event`]: the L2 LCFA product has
-    /// only `group_area` and `flash_area`.
-    pub area: Option<f32>,
+    /// Radiant energy in joules, **or `f32::NAN` for unknown** — read it
+    /// through [`GlmFlash::energy_j`] rather than directly. Never 0.0: every
+    /// GLM energy variable carries `add_offset = 2.8515e-16`, so zero is out of
+    /// band, and `rasterize` sizes bolts by `energy.log10()`.
+    ///
+    /// **Why a sentinel and not an `Option`.** `f32` has no niche, so an
+    /// `Option<f32>` spends 8 bytes to carry 4 — twice, here, which with the
+    /// trailing padding it forces took the row from 40 bytes to 48. NaN is not
+    /// a value this field can otherwise hold: the product packs energies as
+    /// `_Unsigned short`s under a finite `scale_factor`/`add_offset`, and
+    /// `scale * raw + offset` over the integers is always finite. A NaN
+    /// arriving anyway is not information either — `energy_size_scale` already
+    /// turns `Some(NAN)` into a NaN bolt size, which is not a drawing.
+    pub energy: f32,
+    /// Area in km², **or `f32::NAN` for unknown** — read it through
+    /// [`GlmFlash::area_km2`]. Stored as an `_Unsigned` packed `short` with
+    /// `scale_factor = 152601.9` and `units = "m2"`. Always unknown at
+    /// [`GlmDataLevel::Event`]: the L2 LCFA product has only `group_area` and
+    /// `flash_area`. Sentinel for the same reason as [`Self::energy`].
+    pub area: f32,
     pub time: chrono::NaiveDateTime,
     pub satellite: GlmSatellite,
     pub level: GlmDataLevel,
+}
+
+impl GlmFlash {
+    /// Radiant energy in joules, or `None` where the product did not report
+    /// one — the reading side of the [`Self::energy`] sentinel, and the only
+    /// door callers should use.
+    pub fn energy_j(&self) -> Option<f32> {
+        (!self.energy.is_nan()).then_some(self.energy)
+    }
+
+    /// Area in km², or `None` where the product did not report one — the
+    /// reading side of the [`Self::area`] sentinel.
+    pub fn area_km2(&self) -> Option<f32> {
+        (!self.area.is_nan()).then_some(self.area)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

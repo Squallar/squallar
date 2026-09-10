@@ -50,8 +50,8 @@ fn render_one(energy: Option<f32>) -> usize {
     let flash = GlmFlash {
         lat: 35.0,
         lon: -97.0,
-        energy,
-        area: None,
+        energy: energy.unwrap_or(f32::NAN),
+        area: f32::NAN,
         time: chrono::NaiveDate::from_ymd_opt(2026, 7, 24)
             .unwrap()
             .and_hms_opt(12, 0, 0)
@@ -71,7 +71,7 @@ fn render_one(energy: Option<f32>) -> usize {
                 lat: flash.lat,
                 lon: flash.lon,
                 time: flash.time,
-                energy: flash.energy,
+                energy: flash.energy_j(),
             }]),
             device_scale: 1.0,
             zoom: 8.0,
@@ -114,8 +114,8 @@ fn render_at(lon: f64, min_lon: f64, max_lon: f64) -> usize {
     let flash = GlmFlash {
         lat: 20.0,
         lon,
-        energy: Some(1e-14),
-        area: None,
+        energy: 1e-14,
+        area: f32::NAN,
         time: chrono::NaiveDate::from_ymd_opt(2026, 7, 24)
             .unwrap()
             .and_hms_opt(12, 0, 0)
@@ -135,7 +135,7 @@ fn render_at(lon: f64, min_lon: f64, max_lon: f64) -> usize {
                 lat: flash.lat,
                 lon: flash.lon,
                 time: flash.time,
-                energy: flash.energy,
+                energy: flash.energy_j(),
             }]),
             device_scale: 1.0,
             zoom: 8.0,

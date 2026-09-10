@@ -105,7 +105,7 @@ fn flash_level_reports_area_and_event_level_reports_none() {
     assert_eq!(flashes.len(), 2);
     let areas: Vec<f32> = flashes
         .iter()
-        .map(|f| f.area.expect("flash area"))
+        .map(|f| f.area_km2().expect("flash area"))
         .collect();
     assert!(
         (areas[1] / areas[0] - 2.0).abs() < 1e-3,
@@ -117,7 +117,7 @@ fn flash_level_reports_area_and_event_level_reports_none() {
         .expect("parse event level");
     assert_eq!(events.len(), 2);
     assert!(
-        events.iter().all(|e| e.area.is_none()),
+        events.iter().all(|e| e.area_km2().is_none()),
         "events must not report a fabricated area"
     );
     assert!((events[0].lat - 35.5).abs() < 1e-4);
@@ -514,8 +514,8 @@ fn flash_at(time: NaiveDateTime) -> GlmFlash {
     GlmFlash {
         lat: 38.967,
         lon: -82.1,
-        energy: Some(1.0e-14),
-        area: Some(278.65),
+        energy: 1.0e-14,
+        area: 278.65,
         time,
         satellite: GlmSatellite::GoesEast,
         level: GlmDataLevel::Flash,
@@ -1130,7 +1130,7 @@ fn a_short_area_column_degrades_to_no_area() {
     });
     let flashes = parse_flashes(&bytes).expect("a short area must not fail the file");
     assert_eq!(flashes.len(), 2);
-    assert!(flashes.iter().all(|f| f.area.is_none()));
+    assert!(flashes.iter().all(|f| f.area_km2().is_none()));
 }
 
 #[test]
@@ -1141,9 +1141,9 @@ fn missing_optional_area_degrades_without_failing_the_file() {
     });
     let flashes = parse_flashes(&bytes).expect("a missing area must not blank the whole overlay");
     assert_eq!(flashes.len(), 2);
-    assert!(flashes.iter().all(|f| f.area.is_none()));
+    assert!(flashes.iter().all(|f| f.area_km2().is_none()));
     assert!((flashes[0].lat - 35.0).abs() < 1e-4);
-    assert!(flashes[0].energy.is_some_and(|e| e > 0.0));
+    assert!(flashes[0].energy_j().is_some_and(|e| e > 0.0));
 }
 
 #[test]
@@ -1267,8 +1267,8 @@ fn cached_flash(cache: &mut GlmCache, key: &str, satellite: GlmSatellite) {
         vec![GlmFlash {
             lat: 35.0,
             lon: -97.0,
-            energy: Some(1.0),
-            area: Some(1.0),
+            energy: 1.0,
+            area: 1.0,
             time,
             satellite,
             level: GlmDataLevel::Flash,
@@ -1535,8 +1535,8 @@ fn seed_flash(cache: &mut GlmCache, key: &str, time: NaiveDateTime) {
         vec![GlmFlash {
             lat: 35.0,
             lon: -97.0,
-            energy: Some(1.0),
-            area: Some(1.0),
+            energy: 1.0,
+            area: 1.0,
             time,
             satellite: GlmSatellite::GoesEast,
             level: GlmDataLevel::Flash,
@@ -1811,8 +1811,8 @@ fn loop_flash_at(lat: f64, lon: f64, time: NaiveDateTime) -> GlmFlash {
     GlmFlash {
         lat,
         lon,
-        energy: Some(1.0e-14),
-        area: Some(128.0),
+        energy: 1.0e-14,
+        area: 128.0,
         time,
         satellite: GlmSatellite::GoesEast,
         level: GlmDataLevel::Flash,
@@ -3172,22 +3172,29 @@ fn a_polls_retention_level_is_the_one_a_walk_of_its_cache_reports() {
     );
 }
 
-/// **The denominator the cap's byte figure is quoted with.** `GlmFlash` owns
-/// nothing on the heap, so a row's whole price is its `size_of`, and
-/// [`MAX_RETAINED_FLASHES`] rows are that many bytes. A field added to
-/// `GlmFlash` moves this and every figure derived from it, which is what this
-/// pin exists to say out loud.
+/// **The denominator the cap's byte figure is quoted with, and a ceiling that
+/// may only fall.** `GlmFlash` owns nothing on the heap, so a row's whole price
+/// is its `size_of`, and [`MAX_RETAINED_FLASHES`] rows are that many bytes. A
+/// field added to `GlmFlash` moves this and every figure derived from it, which
+/// is what this pin exists to say out loud.
+///
+/// It was 48 until the two `Option<f32>` fields became `f32::NAN` sentinels:
+/// `f32` has no niche, so each `Option` spent 8 bytes to carry 4 and the pair
+/// forced 2 bytes of trailing padding on top. This is the one type in the crate
+/// whose `size_of` is multiplied by a six-figure population — a live-posture
+/// pane retains around a quarter of a million rows — so a byte here is a
+/// quarter-megabyte of resident heap.
 #[test]
 fn a_retained_row_costs_its_size_of_and_the_cap_is_that_times_the_ceiling() {
     assert_eq!(
         size_of::<GlmFlash>(),
-        48,
-        "the 48 bytes a row every GLM byte figure in this tree is quoted at",
+        40,
+        "the bytes a row every GLM byte figure in this tree is quoted at",
     );
     assert_eq!(super::FLASH_BYTES, size_of::<GlmFlash>());
     assert_eq!(
         MAX_RETAINED_FLASHES * super::FLASH_BYTES,
-        12_000_000,
+        10_000_000,
         "the ceiling `MAX_RETAINED_FLASHES` documents, in bytes",
     );
 }
@@ -3760,4 +3767,27 @@ fn a_dropped_record_leaves_no_slot_behind() {
         "the parse must count itself: a pack nothing can show ever ran is a \
          pack nobody can tell from an absent one"
     );
+}
+
+/// **The sentinel reads back as the `Option` it replaced**, in both directions
+/// and for both fields.
+#[test]
+fn the_unknown_sentinel_round_trips_through_the_accessors() {
+    let mut f = flash_at(t0());
+    f.energy = 1.5e-14;
+    f.area = 278.65;
+    assert_eq!(f.energy_j(), Some(1.5e-14));
+    assert_eq!(f.area_km2(), Some(278.65));
+
+    f.energy = f32::NAN;
+    f.area = f32::NAN;
+    assert_eq!(f.energy_j(), None, "NAN is the unknown, not a number");
+    assert_eq!(f.area_km2(), None);
+
+    // Zero is a *value* and must not be swallowed by the sentinel: every GLM
+    // energy variable carries `add_offset = 2.8515e-16`, so a zero reaching
+    // this field is the product disagreeing with its own schema and has to
+    // stay visible rather than read as "not reported".
+    f.energy = 0.0;
+    assert_eq!(f.energy_j(), Some(0.0));
 }

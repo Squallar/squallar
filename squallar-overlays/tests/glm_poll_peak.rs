@@ -8,7 +8,8 @@
 //! While the rows were owned inline by each `CachedGranule`, that clone was a
 //! second copy of every row, resident for the whole poll rather than
 //! momentarily, and the peak was **twice** the level: 6,681,600 B at the
-//! shipped default posture and 24,000,000 B at `MAX_RETAINED_FLASHES`.
+//! shipped default posture and 24,000,000 B at `MAX_RETAINED_FLASHES`, both
+//! measured against the 48-byte row of the time.
 //!
 //! Its own binary with a counting `#[global_allocator]`, for the reason
 //! `glm_granule_blocks.rs` sets out: the instrument counts real `GlobalAlloc`
@@ -156,8 +157,8 @@ fn a_flash(i: usize) -> GlmFlash {
     GlmFlash {
         lat: 33.0 + (i % 400) as f64 * 0.01,
         lon: -99.0 + (i % 300) as f64 * 0.01,
-        energy: Some(1e-14),
-        area: None,
+        energy: 1e-14,
+        area: f32::NAN,
         // Inside the 300 s window above, so `evict_before` keeps every seeded
         // granule and the level under measurement is the whole fixture.
         time: as_of() - TimeDelta::seconds((i % 200) as i64),
@@ -412,13 +413,16 @@ fn granule_contents(store: &GlmStore) -> (Vec<String>, Vec<GlmFlash>) {
     })
 }
 
-/// Field-for-field, including the `Option`s — `GlmFlash` derives no `PartialEq`
-/// and a comparison that skipped a column could not see a poll that rewrote it.
+/// Field-for-field and bit-for-bit — `GlmFlash` derives no `PartialEq` and a
+/// comparison that skipped a column could not see a poll that rewrote it. The
+/// energy and area sentinels are compared as raw bits rather than through
+/// `energy_j`/`area_km2`, which is the stronger claim: it refuses a NaN payload
+/// that changed as well as a value that did.
 fn same_flash(a: &GlmFlash, b: &GlmFlash) -> bool {
     a.lat.to_bits() == b.lat.to_bits()
         && a.lon.to_bits() == b.lon.to_bits()
-        && a.energy.map(f32::to_bits) == b.energy.map(f32::to_bits)
-        && a.area.map(f32::to_bits) == b.area.map(f32::to_bits)
+        && a.energy.to_bits() == b.energy.to_bits()
+        && a.area.to_bits() == b.area.to_bits()
         && a.time == b.time
         && a.satellite == b.satellite
         && a.level == b.level
