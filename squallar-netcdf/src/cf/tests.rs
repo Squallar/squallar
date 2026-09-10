@@ -982,8 +982,9 @@ fn the_appending_read_is_the_owning_read_bit_for_bit() {
 
 /// Rows and columns of the one-chunk fixture below: 600 x 600 `f32` is
 /// 1,440,000 B, **over** `hdf5_pure`'s 1 MiB default chunk-cache budget, so a
-/// default handle cannot retain it and a sized one can. That gap is the whole
-/// reason [`crate::h5::Granule::variable`] exists.
+/// default handle cannot retain it and a sized one can. That gap is why
+/// [`crate::h5::Granule::variable`] exists, and holding the chunk at all is
+/// why [`crate::h5::Granule::read_picked_f32`] does not use it.
 const ONE_CHUNK_ROWS: usize = 600;
 const ONE_CHUNK_COLS: usize = 600;
 const ONE_CHUNK_WINDOW: usize = 75;
@@ -1312,6 +1313,163 @@ fn a_band_streamed_read_is_the_whole_read_bit_for_bit() {
         bits(&streamed),
         bits(&whole.values),
         "the band-streamed values must be the whole read's, bit for bit",
+    );
+}
+
+/// **A picked read is the whole read, bit for bit**, on both storages a real
+/// caller meets: one chunk that *is* the variable — GMGSI's `lat`/`lon`, the
+/// read this exists for — and many chunks, where the picks reach only some of
+/// them and the rest must be skipped rather than inflated.
+///
+/// The pick set is the shape of a GMGSI axis read: one column, one row, and a
+/// coprime lattice. How many chunks it reaches is asserted rather than
+/// asserted-about, so the skip arm is known to be on the path. On the
+/// many-chunk fixture every CF rule is live and two of every 97 elements are
+/// missing, so a `NaN` is among the picks and the comparison is on bits —
+/// which is also what makes a fill that arrived as a stored byte pattern
+/// rather than through the packing rules a failure here.
+#[test]
+fn a_picked_read_is_the_whole_read_bit_for_bit() {
+    let cases = [
+        (
+            "one chunk that is the variable",
+            one_chunk_var_file(),
+            "v",
+            ONE_CHUNK_ROWS,
+            ONE_CHUNK_COLS,
+            (ONE_CHUNK_ROWS, ONE_CHUNK_COLS),
+            true,
+            (1, 1),
+        ),
+        (
+            "many chunks, most with no pick in them",
+            banded_var_file(),
+            "data",
+            BAND_ROWS,
+            BAND_COLS,
+            (BAND_CHUNK_ROWS, BAND_CHUNK_COLS),
+            false,
+            (7, 16),
+        ),
+    ];
+    for (what, bytes, name, nj, ni, chunk, lattice, expected_chunks) in cases {
+        let file = crate::h5::Granule::open(&bytes).expect("open");
+        let whole = file
+            .read_unpacked_f32(name)
+            .expect("read")
+            .expect("present");
+        assert_eq!(whole.values.len(), nj * ni, "({what}) premise: the shape");
+
+        let mut picks: Vec<usize> = (0..nj).map(|j| j * ni).chain(0..ni).collect();
+        if lattice {
+            for j in (0..nj).step_by(97) {
+                for i in (0..ni).step_by(97) {
+                    picks.push(j * ni + i);
+                }
+            }
+        }
+        picks.sort_unstable();
+        picks.dedup();
+
+        // Which of the variable's chunks the picks reach, and which are
+        // therefore never inflated.
+        let (cj, ci) = chunk;
+        let chunks = nj.div_ceil(cj) * ni.div_ceil(ci);
+        let mut reached: Vec<usize> = picks
+            .iter()
+            .map(|&p| (p / ni / cj) * ni.div_ceil(ci) + (p % ni) / ci)
+            .collect();
+        reached.sort_unstable();
+        reached.dedup();
+        assert_eq!(
+            (reached.len(), chunks),
+            expected_chunks,
+            "({what}) premise: how much of the storage the picks reach",
+        );
+
+        let before = crate::bandstream::picked_read_totals();
+        let picked = file
+            .read_picked_f32(name, &picks)
+            .expect("read")
+            .expect("present");
+        let after = crate::bandstream::picked_read_totals();
+        assert_eq!(
+            after.reads,
+            before.reads + 1,
+            "({what}) the picked path did not fire, so everything below \
+             compares the whole read with itself: {before:?} -> {after:?}",
+        );
+        assert_eq!(
+            after.elements - before.elements,
+            picks.len() as u64,
+            "({what}) the counter must count the picks it was given",
+        );
+        assert!(
+            after.bytes_avoided > before.bytes_avoided,
+            "({what}) a picked read that avoided nothing is not a cut: \
+             {before:?} -> {after:?}",
+        );
+
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(&picked),
+            picks
+                .iter()
+                .map(|&p| whole.values[p].to_bits())
+                .collect::<Vec<_>>(),
+            "({what}) the picked values must be the whole read's, bit for bit",
+        );
+    }
+}
+
+/// **What a picked read will not answer**, and the storage it answers the slow
+/// way.
+///
+/// A pick set that does not ascend or reaches past the variable is a caller
+/// bug that would otherwise hand back some other element, so it is an error
+/// rather than a best effort. Storage with no chunks has nothing to stream and
+/// takes the whole read — the cost every caller paid before the picked read
+/// existed — and the values are still the right ones, which is what makes the
+/// refusal a fallback and not a hole.
+#[test]
+fn the_picked_read_refuses_a_pick_set_it_cannot_trust() {
+    let bytes = one_chunk_var_file();
+    let file = crate::h5::Granule::open(&bytes).expect("open");
+    let last = ONE_CHUNK_ROWS * ONE_CHUNK_COLS - 1;
+    for (what, picks) in [
+        ("descending", vec![7usize, 3]),
+        ("repeated", vec![3usize, 3]),
+        ("past the end", vec![last + 1]),
+    ] {
+        let err = file.read_picked_f32("v", &picks).expect_err(what);
+        assert!(
+            err.contains("picks must ascend") || err.contains("was asked for"),
+            "({what}) said {err:?}",
+        );
+    }
+
+    // Contiguous storage: no chunks, so nothing to stream.
+    let plain = float_var_file(&[1.0, 2.0, 3.0, 4.0], None);
+    let file = crate::h5::Granule::open(&plain).expect("open");
+    let before = crate::bandstream::picked_read_totals();
+    let picked = file
+        .read_picked_f32("v", &[1, 3])
+        .expect("read")
+        .expect("present");
+    assert_eq!(
+        picked,
+        vec![2.0, 4.0],
+        "the fallback must read the elements"
+    );
+    assert_eq!(
+        crate::bandstream::picked_read_totals(),
+        before,
+        "and it must not report itself as a picked read",
+    );
+    assert_eq!(
+        file.read_picked_f32("absent", &[0]).expect("read"),
+        None,
+        "an absent variable is absent on this read too",
     );
 }
 

@@ -46,12 +46,19 @@
 //! *from* is [`bandstream`], for a variable whose storage is chunked finer
 //! than `hdf5_pure`'s narrowest public read: without it a sink that never
 //! holds the array is fed out of a buffer that is the array.
+//!
+//! And a fourth, for a caller that wants a *handful* of a variable's elements:
+//! [`h5::Granule::read_picked_f32`], which takes the bytes of the elements it
+//! was asked for out of the inflating stream as they go past and never holds a
+//! chunk at all. A 2-D coordinate array stored as one 60,000,000 B chunk, of
+//! which a decode wants one row and one column, is the read that exists for —
+//! see [`bandstream::PickPlan`].
 
 pub mod bandstream;
 pub mod cf;
 pub mod h5;
 
-pub use bandstream::{BandStreamTotals, band_stream_totals};
+pub use bandstream::{BandStreamTotals, PickedReadTotals, band_stream_totals, picked_read_totals};
 pub use cf::{
     CfAttr, RawValues, RawVar, TimeUnits, UnpackedF32, UnpackedSink, UnpackedVar, VarType,
     attr_is_true, parse_cf_epoch, parse_time_units, reinterpret_unsigned, unpack, unpack_f32,

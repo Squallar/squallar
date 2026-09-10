@@ -67,6 +67,20 @@ static READS: AtomicU64 = AtomicU64::new(0);
 static ELEMENTS: AtomicU64 = AtomicU64::new(0);
 static BYTES_AVOIDED: AtomicU64 = AtomicU64::new(0);
 
+static PICKED_READS: AtomicU64 = AtomicU64::new(0);
+static PICKED_ELEMENTS: AtomicU64 = AtomicU64::new(0);
+static PICKED_BYTES_AVOIDED: AtomicU64 = AtomicU64::new(0);
+
+/// Output bytes one inflate step of a picked read may produce at a time.
+///
+/// The whole point of the picked read is that the chunk never exists, so this
+/// is the buffer that stands in for it: the inflate is driven a window at a
+/// time and the window is thrown away as soon as the bytes this read wants
+/// have been taken out of it. 64 KiB because it is large enough that the
+/// per-call overhead is nothing beside the inflating and small enough to be
+/// noise beside a granule.
+const WINDOW: usize = 64 * 1024;
+
 /// What the band-streamed reads have done, process-wide and always on.
 ///
 /// **A cut that never executes reads identical to one that works**, so this is
@@ -203,6 +217,27 @@ impl BandPlan {
     /// `shape` is the caller's already-read dimensions, so this does not
     /// re-read them.
     pub(crate) fn build(ds: &hdf5_pure::Dataset, shape: &[u64]) -> Option<Self> {
+        let plan = Self::layout(ds, shape)?;
+        // A band that is not materially smaller than the variable buys
+        // nothing, and a single-chunk variable — GMGSI's `lat` and `lon` are
+        // one 60,000,000 B chunk each — is exactly that case. The whole read
+        // is simpler and costs the same, so take it. [`PickPlan`] is what
+        // reads such a variable for a caller that wants a handful of its
+        // elements rather than all of them.
+        let whole_bytes = plan.nj.checked_mul(plan.ni)?.checked_mul(WIDTH)?;
+        if plan.band_bytes().saturating_mul(2) > whole_bytes {
+            return None;
+        }
+        Some(plan)
+    }
+
+    /// The storage as this reads it — shape, chunking, reversal and every
+    /// chunk's extent — with no judgement about which read is the right one.
+    ///
+    /// Shared with [`PickPlan`], which refuses on different grounds: a band
+    /// read wants chunks materially smaller than the variable, and a picked
+    /// read wants the variable's storage reproducible at all.
+    fn layout(ds: &hdf5_pure::Dataset, shape: &[u64]) -> Option<Self> {
         let chunk_shape = ds.chunk_shape().ok()??;
         if chunk_shape.len() != shape.len() || shape.len() < 2 {
             return None;
@@ -225,17 +260,9 @@ impl BandPlan {
         let across = ni.div_ceil(ci);
         let bands = nj.div_ceil(cj);
         let chunk_elems = cj.checked_mul(ci)?;
-        let chunk_bytes = chunk_elems.checked_mul(WIDTH)?;
-        let band_bytes = chunk_bytes.checked_mul(across)?;
-        let whole_bytes = nj.checked_mul(ni)?.checked_mul(WIDTH)?;
-
-        // A band that is not materially smaller than the variable buys
-        // nothing, and a single-chunk variable — GMGSI's `lat` and `lon` are
-        // one 60,000,000 B chunk each — is exactly that case. The whole read
-        // is simpler and costs the same, so take it.
-        if band_bytes.saturating_mul(2) > whole_bytes {
-            return None;
-        }
+        // Overflow-checked here so neither plan has to: a band is `across`
+        // chunks of this and a picked read inflates one of them.
+        chunk_elems.checked_mul(WIDTH)?.checked_mul(across)?;
 
         // Only chunks that were written are enumerated. A variable with an
         // unwritten chunk decodes it to the fill value, which this does not
@@ -421,6 +448,293 @@ impl BandPlan {
             band_stream_totals(),
         );
         Ok(count)
+    }
+}
+
+/// What the picked reads have done, process-wide and always on.
+///
+/// The same evidence [`BandStreamTotals`] carries, for the same reason: a cut
+/// that never fires reads exactly like one that works, and `reads` is zero on
+/// a build where every variable was refused at plan time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PickedReadTotals {
+    /// Variables read element by picked element rather than whole.
+    pub reads: u64,
+    /// Elements those reads delivered — the picks, not the variable.
+    pub elements: u64,
+    /// Whole-variable storage bytes that were never allocated: for each read,
+    /// the whole variable's byte length less the window and the gathered
+    /// bytes it held.
+    pub bytes_avoided: u64,
+}
+
+/// [`PickedReadTotals`] as they stand.
+pub fn picked_read_totals() -> PickedReadTotals {
+    PickedReadTotals {
+        reads: PICKED_READS.load(Ordering::Relaxed),
+        elements: PICKED_ELEMENTS.load(Ordering::Relaxed),
+        bytes_avoided: PICKED_BYTES_AVOIDED.load(Ordering::Relaxed),
+    }
+}
+
+/// **A plan to read a named handful of a chunked variable's elements** without
+/// the variable, or even one of its chunks, ever existing as a buffer.
+///
+/// # The read this exists for
+///
+/// GMGSI's `lat` and `lon` are 2-D coordinate arrays stored as **one**
+/// 3000 x 5000 chunk each, and a decode wants a few thousand of those
+/// 15,000,000 elements: one column of `lat`, one row of `lon`, and the
+/// scattered pairs that prove the arrays repeat. [`BandPlan`] cannot help —
+/// there is one chunk, so a band is the variable — and reading a window
+/// through `hdf5_pure` inflates and unshuffles the whole chunk into its cache:
+/// two 60,000,000 B blocks per coordinate variable, four per cold decode,
+/// for 64 KB of axis.
+///
+/// # Why a window is enough
+///
+/// Inflating is sequential and so is the shuffle's layout — element `i`'s byte
+/// `k` sits at `k * n + i`, which for a fixed `k` ascends with `i` — so the
+/// bytes a picked read wants can be *taken as they go past*, in one pass, in
+/// ascending output order, with nothing behind the window retained. What is
+/// held is [`WINDOW`] plus four bytes per pick.
+///
+/// **The inflating itself is not avoided and is not claimed to be.** The chunk
+/// is one deflate stream and its last byte depends on its first, so every byte
+/// is still produced; what is removed is the buffer it was produced into, the
+/// second buffer it was unshuffled into, and the unpacking of the 15,000,000
+/// values nobody asked for.
+///
+/// # Why the values are the same values
+///
+/// The same decoder, the same reversals and the same [`Packing`] as
+/// [`BandPlan::stream_to`] and [`crate::h5::Granule::read_unpacked_f32_to`],
+/// applied to the same stored bytes — the unshuffle is a gather here too, one
+/// plane byte at a time instead of one row at a time. Pinned bit-for-bit
+/// against the whole read by
+/// [`crate::cf::tests::a_picked_read_is_the_whole_read_bit_for_bit`].
+pub(crate) struct PickPlan(BandPlan);
+
+impl PickPlan {
+    /// A plan for `ds`, or `None` for storage this cannot reproduce exactly.
+    ///
+    /// Every refusal [`BandPlan::layout`] makes, and none of the ones about
+    /// size: a single chunk is the case this is *for*.
+    pub(crate) fn build(ds: &hdf5_pure::Dataset, shape: &[u64]) -> Option<Self> {
+        Some(Self(BandPlan::layout(ds, shape)?))
+    }
+
+    /// Elements the variable holds, so the caller can bound its picks.
+    pub(crate) fn elements(&self) -> Option<usize> {
+        self.0.elements()
+    }
+
+    /// **The elements at `picks`, appended to `out` in `picks` order.**
+    ///
+    /// `picks` are row-major element indices, strictly ascending and inside
+    /// the variable — a caller that cannot say that gets an error rather than
+    /// a wrong element. `file` is the whole file's bytes, which is what the
+    /// chunk addresses index; `little` is the storage byte order the caller
+    /// resolved.
+    ///
+    /// A chunk no pick falls in is never touched, let alone inflated.
+    pub(crate) fn read_picks(
+        &self,
+        file: &[u8],
+        packing: &Packing,
+        little: bool,
+        name: &str,
+        picks: &[usize],
+        out: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        let plan = &self.0;
+        let count = plan
+            .elements()
+            .ok_or_else(|| format!("Variable {name} is too large for this platform"))?;
+        let mut previous: Option<usize> = None;
+        for &pick in picks {
+            if pick >= count {
+                return Err(format!(
+                    "Variable {name}: element {pick} was asked for and it holds {count}"
+                ));
+            }
+            if previous.is_some_and(|q| pick <= q) {
+                return Err(format!(
+                    "Variable {name}: picks must ascend, and {pick} does not follow {}",
+                    previous.unwrap_or_default()
+                ));
+            }
+            previous = Some(pick);
+        }
+        if picks.is_empty() {
+            return Ok(());
+        }
+
+        let chunk_bytes = plan.chunk_elems * WIDTH;
+        // The gathered bytes, in `picks` order, four to a pick. Written to by
+        // absolute position because a chunk carries a subsequence of the
+        // picks, not a run of them.
+        let mut words: Vec<u8> = Vec::new();
+        let want = picks.len() * WIDTH;
+        words
+            .try_reserve_exact(want)
+            .map_err(|_| format!("Variable {name}: cannot hold {} picks", picks.len()))?;
+        words.resize(want, 0);
+        let mut window: Vec<u8> = Vec::new();
+        window
+            .try_reserve_exact(WINDOW)
+            .map_err(|_| format!("Variable {name}: cannot hold a {WINDOW} B window of it"))?;
+        window.resize(WINDOW, 0);
+        let mut inflater = flate2::Decompress::new(true);
+        // Which picks the chunk in hand carries: `(pick, element in chunk)`.
+        let mut here: Vec<(usize, usize)> = Vec::new();
+        let mut taken = 0usize;
+
+        for band in 0..plan.bands {
+            let (j0, j1) = (band * plan.cj, ((band + 1) * plan.cj).min(plan.nj));
+            for column in 0..plan.across {
+                let (i0, i1) = (column * plan.ci, ((column + 1) * plan.ci).min(plan.ni));
+                here.clear();
+                for (slot, &pick) in picks.iter().enumerate() {
+                    let (j, i) = (pick / plan.ni, pick % plan.ni);
+                    if j >= j0 && j < j1 && i >= i0 && i < i1 {
+                        here.push((slot, (j - j0) * plan.ci + (i - i0)));
+                    }
+                }
+                if here.is_empty() {
+                    continue;
+                }
+                let stored = &plan.stored[band * plan.across + column];
+                let bytes = file
+                    .get(stored.start..stored.start.saturating_add(stored.len))
+                    .ok_or_else(|| {
+                        format!("Variable {name}: a chunk is stored past the end of the file")
+                    })?;
+                let reversal = plan.reversal.masked(stored.mask);
+                // Every byte this chunk owes, as `(offset in the chunk's
+                // inflated bytes, offset in `words`)`, ascending in the first
+                // — shuffled, that is plane by plane; plain, it is the four
+                // bytes of each element in turn.
+                let n = plan.chunk_elems;
+                let owed = here.len() * WIDTH;
+                let byte = |t: usize| -> (usize, usize) {
+                    if reversal.gathers() {
+                        let (k, which) = (t / here.len(), t % here.len());
+                        (k * n + here[which].1, here[which].0 * WIDTH + k)
+                    } else {
+                        let (which, k) = (t / WIDTH, t % WIDTH);
+                        (here[which].1 * WIDTH + k, here[which].0 * WIDTH + k)
+                    }
+                };
+
+                if reversal.inflates() {
+                    inflater.reset(true);
+                    let (mut produced, mut cursor) = (0usize, 0usize);
+                    loop {
+                        let consumed = usize::try_from(inflater.total_in()).unwrap_or(usize::MAX);
+                        let input = bytes.get(consumed..).unwrap_or(&[]);
+                        let before_in = inflater.total_in();
+                        let before_out = inflater.total_out();
+                        let status = inflater
+                            .decompress(input, &mut window, flate2::FlushDecompress::None)
+                            .map_err(|e| {
+                                format!("Variable {name}: a chunk did not inflate: {e}")
+                            })?;
+                        let got = usize::try_from(inflater.total_out() - before_out)
+                            .unwrap_or(usize::MAX);
+                        if produced.saturating_add(got) > chunk_bytes {
+                            return Err(format!(
+                                "Variable {name}: a chunk inflated past its {chunk_bytes} B chunk \
+                                 size"
+                            ));
+                        }
+                        while cursor < owed {
+                            let (at, into) = byte(cursor);
+                            if at >= produced + got {
+                                break;
+                            }
+                            let offset = at.checked_sub(produced).ok_or_else(|| {
+                                format!("Variable {name}: a chunk's bytes arrived out of order")
+                            })?;
+                            words[into] = window[offset];
+                            cursor += 1;
+                        }
+                        produced += got;
+                        if status == flate2::Status::StreamEnd {
+                            break;
+                        }
+                        if got == 0 && inflater.total_in() == before_in {
+                            return Err(format!(
+                                "Variable {name}: a chunk's stream ended before the chunk was \
+                                 complete"
+                            ));
+                        }
+                    }
+                    if produced != chunk_bytes {
+                        return Err(format!(
+                            "Variable {name}: a chunk inflated to {produced} B, not the \
+                             {chunk_bytes} B its shape declares"
+                        ));
+                    }
+                    if cursor != owed {
+                        return Err(format!(
+                            "Variable {name}: a chunk owed {owed} B and gave {cursor}"
+                        ));
+                    }
+                } else {
+                    if bytes.len() != chunk_bytes {
+                        return Err(format!(
+                            "Variable {name}: an unfiltered chunk stores {} B, not {chunk_bytes} B",
+                            bytes.len()
+                        ));
+                    }
+                    for t in 0..owed {
+                        let (at, into) = byte(t);
+                        words[into] = *bytes.get(at).ok_or_else(|| {
+                            format!("Variable {name}: a chunk is shorter than its shape declares")
+                        })?;
+                    }
+                }
+                taken += here.len();
+            }
+        }
+        if taken != picks.len() {
+            return Err(format!(
+                "Variable {name}: {taken} of {} picks fell inside a chunk",
+                picks.len()
+            ));
+        }
+
+        out.try_reserve(picks.len())
+            .map_err(|_| format!("Variable {name}: cannot hold {} values", picks.len()))?;
+        for word in words.chunks_exact(WIDTH) {
+            let word: [u8; WIDTH] = word.try_into().expect("chunks_exact yields four bytes");
+            let stored = if little {
+                f32::from_le_bytes(word)
+            } else {
+                f32::from_be_bytes(word)
+            };
+            out.push(
+                packing
+                    .apply(f64::from(stored))
+                    .map_or(f32::NAN, |v| v as f32),
+            );
+        }
+
+        let whole = count as u64 * WIDTH as u64;
+        let held = (WINDOW + words.len()) as u64;
+        PICKED_READS.fetch_add(1, Ordering::Relaxed);
+        PICKED_ELEMENTS.fetch_add(picks.len() as u64, Ordering::Relaxed);
+        PICKED_BYTES_AVOIDED.fetch_add(whole.saturating_sub(held), Ordering::Relaxed);
+        log::debug!(
+            "netcdf picked read: {name} {}x{}, {} of {count} elements, {held} B held rather than \
+             {whole} B; totals {:?}",
+            plan.nj,
+            plan.ni,
+            picks.len(),
+            picked_read_totals(),
+        );
+        Ok(())
     }
 }
 

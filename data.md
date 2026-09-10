@@ -328,7 +328,19 @@ note below.
   declared corners linearly puts row 500 at 48.4653° where the array says
   **58.19307°**, off by **9.73°**. Both axes must be read from the arrays.
 - **`lat` and `lon` are two-dimensional `(yc, xc)`** — 15,000,000 floats each,
-  60 MB apiece — not the 1-D axes the separability would allow.
+  60 MB apiece — not the 1-D axes the separability would allow. Each is stored
+  as **one** chunk, SHUFFLE + DEFLATE, so any read of either used to inflate and
+  unshuffle the whole 60 MB; `squallar_netcdf::Granule::read_picked_f32` gathers
+  the 11,141 elements an axis walk wants out of the inflating stream instead.
+- **The grid itself moves between product generations.** The arrays are
+  byte-identical — stored bytes, not just values — across all four channels and
+  across dates within a generation, and the column count went **5000 → 4999**
+  between 2025-12-25 and 2026-09-08: the 4999-column axis is the 5000-column one
+  with its last column dropped, the latitude axis unchanged. Measured on six
+  real granules (LW/SW/VIS/WV, 2025-06-01, 2025-06-02, 2025-12-25, 2026-09-08)
+  on 2026-09-10. So the axes may be remembered from the last granule — keyed on
+  the stored bytes, which is what `gmgsi::decode::AxisCache` does — but never
+  shipped as a constant.
 - **The longitude axis is not monotonic.** Column 0 holds `+179.99962` and
   column 1 `−179.92838`: the grid starts a hair west of the antimeridian and
   every longitude is already wrapped into [−180, 180]. `geospatial_lon_min` /

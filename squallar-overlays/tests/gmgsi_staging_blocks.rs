@@ -27,6 +27,7 @@
 //! | pool + one handle per coordinate variable | 5 |
 //! | and the axis cache, steady state | 1 |
 //! | and the band-streamed read (2026-09-09) | **0** |
+//! | and the picked coordinate read (2026-09-10), cold as well | **0** |
 //!
 //! The 91 were: 88 from the two 2-D coordinate variables — each stored as
 //! one 60 MB chunk that `hdf5_pure` re-inflated **and re-unshuffled** for
@@ -35,12 +36,19 @@
 //! assembled stored bytes, the storage-width `f32` copy, and the unpacked
 //! raster.
 //!
-//! Holding each coordinate variable's chunk across its windows
-//! ([`squallar_netcdf::Variable`]) makes the 88 into 4 — inflate and
-//! unshuffle, once each — and the byte-identity axis cache
-//! (`gmgsi::decode::AxisCache`) makes those 4 into 0 on every granule that
-//! stores the same coordinate arrays as the last, which is every granule of
-//! the product.
+//! Holding each coordinate variable's chunk across its windows made the 88
+//! into 4 — inflate and unshuffle, once each — and the byte-identity axis
+//! cache (`gmgsi::decode::AxisCache`) makes those 4 into 0 on every granule
+//! that stores the same coordinate arrays as the last, which is every granule
+//! of a grid generation.
+//!
+//! The 4 a *cold* decode still paid are gone as well since 2026-09-10:
+//! [`squallar_netcdf::Granule::read_picked_f32`] takes the few thousand
+//! elements the axes and their separability probe are made of out of the
+//! inflating chunk as it goes past, so no buffer the size of the chunk is ever
+//! asked for. That makes the second control below a zero against a zero, and
+//! what carries it instead is the picked read's own always-on counters —
+//! which read nothing at all on a build where the path did not fire.
 //!
 //! The 1 that used to remain was `hdf5_pure`'s and transient: the stored bytes
 //! it assembled for `data` before decoding them, because its public API in
@@ -142,10 +150,20 @@ const GRANULE: &[u8] = include_bytes!(
 /// are for — each asserts a *difference* from this figure.
 const READER_BLOCKS: usize = 0;
 
-/// What reading the two coordinate variables costs on top: inflate and
-/// unshuffle, once each. Paid by the first granule and by any granule whose
-/// stored geometry differs from the last.
-const COORDINATE_BLOCKS: usize = 4;
+/// What reading the two coordinate variables costs on top.
+///
+/// **Zero since 2026-09-10**, down from 4 — one inflate and one unshuffle of
+/// each variable's single 60,000,000 B chunk, paid by the first granule and by
+/// any granule whose stored geometry differs from the last. The elements the
+/// axes are made of are taken out of the inflating stream now, so the chunk is
+/// never a buffer. See the second control below for what asserts it, since a
+/// level of zero on its own would also be what a stopped instrument reports.
+const COORDINATE_BLOCKS: usize = 0;
+
+/// The two axes of the committed granule: 3000 rows and 5000 columns. What a
+/// cold coordinate read is *for*, and the extent its element count is gated
+/// against below — a read of the whole two variables is 30,000,000 elements.
+const COORDINATE_ELEMENTS: u64 = 3000 + 5000;
 
 /// One granule through the whole shipped path, exactly as
 /// `gmgsi::fetch::fetch_key` runs it.
@@ -200,9 +218,11 @@ fn counting<T>(f: impl FnOnce() -> T) -> (T, usize, Vec<usize>) {
 /// **Floor — `always_fresh`:** make `StagingPool::take` skip the slot and
 /// always allocate; the pooled arm then reads `READER_BLOCKS + 1` and the
 /// first control's difference reads zero. **Floor — `never_remember`:** make
-/// `AxisCache::axis` skip the lookup; the pooled arm reads
-/// `READER_BLOCKS + COORDINATE_BLOCKS` and the second control's difference
-/// reads zero.
+/// `AxisCache::axis` skip the lookup; every decode then pays a cold
+/// coordinate read, and the second control's picked-read counters move by
+/// twice what they should. **Floor — refuse the picked read** (have
+/// `PickPlan::build` return `None`): the second control's block difference
+/// goes back to 4 and its `reads` to zero.
 #[test]
 fn granules_decode_through_one_retained_mosaic_block() {
     /// Three, so an unpooled path is a clear multiple over the ceiling
@@ -300,6 +320,7 @@ fn granules_decode_through_one_retained_mosaic_block() {
     // read and verified — exactly what every granule did before the cache
     // existed. Through the shipped pool, so the raster is not in the figure.
     let forgetful = decode::AxisCache::new();
+    let before_picked = squallar_netcdf::picked_read_totals();
     let (grid, unremembered, seen) = counting(|| {
         decode::decode_in(
             GRANULE.to_vec(),
@@ -317,9 +338,34 @@ fn granules_decode_through_one_retained_mosaic_block() {
     assert_eq!(
         unremembered,
         READER_BLOCKS + COORDINATE_BLOCKS,
-        "with nothing remembered one decode must cost exactly the two \
-         coordinate chunks more (inflated and unshuffled once each) than a \
-         steady-state one. Blocks seen: {seen:?}",
+        "with nothing remembered one decode must cost {COORDINATE_BLOCKS} \
+         blocks more than a steady-state one: the two coordinate variables are \
+         one 60,000,000 B chunk each and neither is ever a buffer. Blocks \
+         seen: {seen:?}",
+    );
+    // What that zero is standing on. `COORDINATE_BLOCKS` is a level, and a
+    // level of zero is also what an instrument that stopped counting reports;
+    // these are the picked read's own totals over the same window, and they
+    // read nothing at all if the path did not fire.
+    let picked = squallar_netcdf::picked_read_totals();
+    assert_eq!(
+        picked.reads - before_picked.reads,
+        2,
+        "the cold decode must have read both coordinate variables the picked \
+         way; it did not, so its zero above says nothing: {before_picked:?} -> \
+         {picked:?}",
+    );
+    let elements = picked.elements - before_picked.elements;
+    assert!(
+        (COORDINATE_ELEMENTS..=2 * COORDINATE_ELEMENTS).contains(&elements),
+        "and it must have asked for the axes and their separability probe and \
+         not for the arrays: {elements} elements against {COORDINATE_ELEMENTS} \
+         of axis, out of 30,000,000 stored",
+    );
+    assert!(
+        picked.bytes_avoided - before_picked.bytes_avoided >= 2 * 59_000_000,
+        "and the whole of both variables must be what it did not allocate: \
+         {before_picked:?} -> {picked:?}",
     );
     evict(grid);
 

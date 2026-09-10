@@ -170,6 +170,13 @@ impl Granule {
     /// Pinned by
     /// [`crate::cf::tests::a_variable_handle_serves_its_windows_off_one_inflation`].
     /// `Ok(None)` when the variable is absent.
+    ///
+    /// **The GMGSI walk above no longer takes this read**, and no shipped
+    /// caller does: one inflation is still one 60,000,000 B block held plus
+    /// one unshuffled into, for 64 KB of axis, and
+    /// [`read_picked_f32`](Self::read_picked_f32) holds neither. What this is
+    /// for is a caller that genuinely wants whole rows of a coarsely chunked
+    /// variable more than once.
     pub fn variable(&self, name: &str) -> Result<Option<Variable>, String> {
         // The chunk shape has to be read off the dataset before the handle
         // that will keep it can be sized, so the first open is only a look.
@@ -282,28 +289,7 @@ impl Granule {
         let count = usize::try_from(count)
             .map_err(|_| format!("Variable {name} declares {count} elements, more than fit"))?;
 
-        let datatype = var
-            .ds
-            .datatype()
-            .map_err(|e| format!("Failed to read the type of {name}: {e}"))?;
-        let order = match (&var.dtype, &datatype) {
-            (
-                DType::F32,
-                Datatype::FloatingPoint {
-                    size: 4,
-                    byte_order,
-                    bit_offset: 0,
-                    bit_precision: 32,
-                    ..
-                },
-            ) => match byte_order {
-                DatatypeByteOrder::LittleEndian => Some(true),
-                DatatypeByteOrder::BigEndian => Some(false),
-                _ => None,
-            },
-            _ => None,
-        };
-        let Some(little) = order else {
+        let Some(little) = bulk_order(&var, name)? else {
             let raw = read_raw(&var.ds, name, &var.dtype, Span::All)?;
             if raw.len() != count {
                 return Err(format!(
@@ -371,6 +357,72 @@ impl Granule {
         Ok(Some(count))
     }
 
+    /// **The elements at `picks` — row-major indices, strictly ascending —
+    /// with neither the variable nor one of its chunks ever existing as a
+    /// buffer.**
+    ///
+    /// The values are the whole read's, bit for bit, and missing is `NaN` as
+    /// everywhere else in this crate; the returned vector is one value per
+    /// pick, in `picks` order. `Ok(None)` when the variable is absent.
+    ///
+    /// Why it exists: `hdf5_pure`'s narrowest read is a window along the first
+    /// dimension, and it serves one out of a chunk cache — so a variable
+    /// stored as a **single** chunk costs that whole chunk, inflated and
+    /// unshuffled, however few elements are wanted. GMGSI's `lat` and `lon`
+    /// are one 3000 x 5000 `f32` chunk each and a decode wants a few thousand
+    /// elements of them; that read was two 60,000,000 B blocks per variable.
+    /// [`crate::bandstream::PickPlan`] takes the bytes out of the inflating
+    /// stream as they pass and holds 64 KiB and four bytes a pick.
+    ///
+    /// **Storage the picked path cannot reproduce exactly takes the whole
+    /// read** — a filter it does not implement, an unwritten chunk, a layout
+    /// with no chunks at all, a width or byte order the bulk decode refuses —
+    /// and the picks are read out of the array. That is the cost every caller
+    /// paid before this existed, so a refusal is never worse than before, and
+    /// [`crate::bandstream::picked_read_totals`] is what says which arm ran.
+    pub fn read_picked_f32(&self, name: &str, picks: &[usize]) -> Result<Option<Vec<f32>>, String> {
+        let Some(var) = self.describe(name, DatasetAccessProperties::new())? else {
+            return Ok(None);
+        };
+        let count = Span::All.elements(&var.shape);
+        let count = usize::try_from(count)
+            .map_err(|_| format!("Variable {name} declares {count} elements, more than fit"))?;
+        let (packing, _units) = cf::Packing::resolve(var.vartype, var.unsigned, &var.attrs, name);
+
+        if let Some(little) = bulk_order(&var, name)?
+            && let Some(plan) = bandstream::PickPlan::build(&var.ds, &var.shape)
+            && plan.elements() == Some(count)
+        {
+            let mut out: Vec<f32> = Vec::new();
+            plan.read_picks(
+                self.file.as_bytes(),
+                &packing,
+                little,
+                name,
+                picks,
+                &mut out,
+            )?;
+            return Ok(Some(out));
+        }
+
+        // The refusal arm: the whole variable, then the picks out of it.
+        let Some(whole) = self.read_unpacked_f32(name)? else {
+            return Ok(None);
+        };
+        let mut out: Vec<f32> = Vec::new();
+        out.try_reserve_exact(picks.len())
+            .map_err(|_| format!("Variable {name}: cannot hold {} values", picks.len()))?;
+        for &pick in picks {
+            out.push(*whole.values.get(pick).ok_or_else(|| {
+                format!(
+                    "Variable {name}: element {pick} was asked for and it read {}",
+                    whole.values.len()
+                )
+            })?);
+        }
+        Ok(Some(out))
+    }
+
     /// Open a variable and resolve everything about it that is not its values.
     fn describe(
         &self,
@@ -412,6 +464,39 @@ impl Granule {
             shape,
         }))
     }
+}
+
+/// **Is this variable's storage a plain IEEE `f32` array, and if so which way
+/// round?** `Some(true)` little-endian, `Some(false)` big, `None` for storage
+/// that must go through the library's own decode instead.
+///
+/// The test mirrors `hdf5_pure`'s own bulk-decode gate — full width, no bit
+/// offset, full precision — because a caller that reads the stored bytes
+/// itself has to agree with it or the two reads differ. One spelling, so the
+/// whole read and the picked read cannot come to disagree about which storage
+/// they can handle.
+fn bulk_order(var: &Described, name: &str) -> Result<Option<bool>, String> {
+    let datatype = var
+        .ds
+        .datatype()
+        .map_err(|e| format!("Failed to read the type of {name}: {e}"))?;
+    Ok(match (&var.dtype, &datatype) {
+        (
+            DType::F32,
+            Datatype::FloatingPoint {
+                size: 4,
+                byte_order,
+                bit_offset: 0,
+                bit_precision: 32,
+                ..
+            },
+        ) => match byte_order {
+            DatatypeByteOrder::LittleEndian => Some(true),
+            DatatypeByteOrder::BigEndian => Some(false),
+            _ => None,
+        },
+        _ => None,
+    })
 }
 
 /// A variable's handle and its resolved CF facts, before any value is read.

@@ -44,17 +44,6 @@ const SEPARABLE_EPS: f64 = 1e-6;
 /// on the same few columns.
 const SEPARABLE_PROBE_STRIDE: usize = 97;
 
-/// Rows held resident at once while streaming a coordinate variable.
-///
-/// The latitude axis is column 0 of *every* row, so it cannot be narrowed to a
-/// window — but it can be blocked, which bounds the window a read copies out
-/// at `ROW_BLOCK * ni` elements rather than `nj * ni`: 5 MB against 60 MB on
-/// the reference granule.
-///
-/// Not coprime with anything and not required to be: this only decides how the
-/// same rows are grouped, never which ones are read.
-const ROW_BLOCK: usize = 256;
-
 /// Decode a granule, **taking its bytes**.
 ///
 /// By value on purpose: the reader needs an owned buffer, a GMGSI body is
@@ -78,22 +67,31 @@ pub fn decode(bytes: Vec<u8>, channel: GmgsiChannel) -> Result<GmgsiGrid, String
 /// # What one decode costs, and in what order
 ///
 /// The two coordinate variables come first and the slot is taken **after**
-/// them, deliberately. `lat` and `lon` are each stored as one 3000 x 5000
-/// chunk, and reading any window of one costs `hdf5_pure` two 60 MB blocks
-/// while it inflates and unshuffles the chunk — so a 60 MB slot already in
-/// hand at that moment would put a cold decode's peak a whole mosaic higher
-/// than it has to be (measured: 240 MB against 130 MB, one cold decode of
-/// the committed granule).
+/// them. `lat` and `lon` are each stored as one 3000 x 5000 chunk, so a read
+/// of either used to cost `hdf5_pure` two chunk-sized blocks — it inflates the
+/// chunk and unshuffles it into its cache — whatever window was asked for.
+/// Reading them first kept a 60 MB slot out of the decode's hand at that
+/// moment (measured: 240 MB against 130 MB, one cold decode of the committed
+/// granule), and the order is kept now that the blocks are gone.
 ///
 /// In the steady state the coordinate variables are not read at all: every
 /// granule of the product stores the same two arrays, and [`AxisCache`]
 /// proves it granule by granule from their stored bytes before handing back
 /// the axes it derived last time. When they do have to be read — the first
-/// granule, or a granule whose stored geometry differs — each is opened
-/// **once**, as a [`Variable`](squallar_netcdf::Variable) whose chunk cache
-/// holds its one chunk, so the walk's row windows share a single inflation.
-/// Before that, every window re-inflated the chunk: 44 windows, 88 blocks of
-/// 60,000,000 B per decode, measured.
+/// granule, or a granule whose stored geometry differs, which the product did
+/// change between 2025 and 2026 — the read asks for the elements the axis and
+/// its separability probe are actually made of, 4,581 for `lat` and 6,560 for
+/// `lon` of 15,000,000 each, through
+/// [`read_picked_f32`](squallar_netcdf::Granule::read_picked_f32): it takes
+/// their bytes out of the inflating chunk as they go past and holds 64 KiB
+/// rather than the chunk. Nothing about the values changes: they are the whole
+/// read's, bit for bit. The blocks that read cost, per cold decode:
+///
+/// | | grid-sized blocks |
+/// |---|---|
+/// | a window per row block, chunk cache off (`833bad45`) | 88 |
+/// | one handle per variable, its chunk cache holding the chunk | 4 |
+/// | picked reads (2026-09-10) | **0** |
 ///
 /// Then the raster: `data` lands straight in the slot's buffer through
 /// [`read_unpacked_f32_to`](squallar_netcdf::Granule::read_unpacked_f32_to) and
@@ -544,6 +542,20 @@ enum Axis {
 /// The refusal is the point. A separable representation of a non-separable
 /// grid does not misplace one point — it misplaces the whole raster along one
 /// dimension, and it does so silently, because every method still answers.
+///
+/// **What is read is exactly what is compared**: the axis itself and the probe
+/// pairs — 4,581 elements for `lat` and 6,560 for `lon`, of a coordinate
+/// array's 15,000,000 — taken out of the inflating chunk as it goes past by
+/// [`read_picked_f32`](squallar_netcdf::Granule::read_picked_f32). The values
+/// are the whole read's, bit for bit — this is a different place to gather the
+/// same stored bytes, not a different reading of them, and nothing here
+/// interpolates, rounds or infers a coordinate. It cannot: the mosaic's
+/// latitude axis is uniform in *Mercator y*, not in degrees — its row spacing
+/// runs 0.0214° at the top edge to 0.0720° at the equator — so no affine
+/// function of the row index describes it and every row's own stored value is
+/// needed. Measured over six real granules on four channels and four dates
+/// plus the committed fixture, 2026-09-10: a straight line through the
+/// latitude axis is out by up to 10.8°.
 fn axis_from_2d(
     granule: &squallar_netcdf::Granule,
     name: &str,
@@ -551,42 +563,106 @@ fn axis_from_2d(
     ni: usize,
     axis: Axis,
 ) -> Result<Vec<f64>, String> {
-    let var = granule
-        .variable(name)?
+    let shape = granule
+        .shape(name)?
         .ok_or_else(|| format!("GMGSI granule has no `{name}` variable"))?;
-    if var.shape() != [nj as u64, ni as u64] {
+    if shape != [nj as u64, ni as u64] {
         return Err(format!(
-            "GMGSI `{name}` has shape {:?}; expected ({nj}, {ni}) to match `data`",
-            var.shape()
+            "GMGSI `{name}` has shape {shape:?}; expected ({nj}, {ni}) to match `data`",
         ));
     }
-    match axis {
-        Axis::Row => row_axis(&var, name, nj, ni),
-        Axis::Column => column_axis(&var, name, nj, ni),
+    let picks = picks_of(&axis, nj, ni);
+    let values = granule
+        .read_picked_f32(name, &picks)?
+        .ok_or_else(|| format!("GMGSI granule has no `{name}` variable"))?;
+    if values.len() != picks.len() {
+        return Err(format!(
+            "GMGSI `{name}`: {} elements were asked for and {} were read",
+            picks.len(),
+            values.len()
+        ));
     }
+    // `picks` ascends, so this is the position of `(j, i)` in what was read.
+    let at = |j: usize, i: usize| -> Result<f64, String> {
+        let k = picks
+            .binary_search(&(j * ni + i))
+            .map_err(|_| format!("GMGSI `{name}`: ({j}, {i}) is not among the elements read"))?;
+        present(values[k], name, j, i)
+    };
+
+    let mut out: Vec<f64> = Vec::with_capacity(match axis {
+        Axis::Row => nj,
+        Axis::Column => ni,
+    });
+    match axis {
+        // Column 0 of every row.
+        Axis::Row => {
+            for j in 0..nj {
+                out.push(at(j, 0)?);
+            }
+        }
+        // Row 0, and nothing else.
+        Axis::Column => {
+            for i in 0..ni {
+                out.push(at(0, i)?);
+            }
+        }
+    }
+
+    // The probe, in the order each axis has always compared it: the axis's own
+    // entry against the same entry of every probe row or column the stride
+    // lands on.
+    match axis {
+        Axis::Row => {
+            for k in (0..nj).step_by(SEPARABLE_PROBE_STRIDE) {
+                for s in (0..ni).step_by(SEPARABLE_PROBE_STRIDE) {
+                    let v = at(k, s)?;
+                    if (v - out[k]).abs() > SEPARABLE_EPS {
+                        return Err(not_separable(name, k, v, out[k]));
+                    }
+                }
+            }
+        }
+        Axis::Column => {
+            for k in (0..ni).step_by(SEPARABLE_PROBE_STRIDE) {
+                for s in (0..nj).step_by(SEPARABLE_PROBE_STRIDE) {
+                    let v = at(s, k)?;
+                    if (v - out[k]).abs() > SEPARABLE_EPS {
+                        return Err(not_separable(name, k, v, out[k]));
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
-/// Rows `[start, start + count)` of a 2-D variable, `ni` wide, row-major.
+/// **Every element one axis read needs**, as ascending row-major indices.
 ///
-/// The raster form rather than the `Option<f64>` one: a 256-row window is
-/// 5 MB this way and 20 MB that way, and a coordinate the file marked missing
-/// is a `NaN` either way — see [`present`].
-fn rows_of(
-    var: &squallar_netcdf::Variable,
-    name: &str,
-    start: usize,
-    count: usize,
-    ni: usize,
-) -> Result<Vec<f32>, String> {
-    let rows = var.read_unpacked_rows_f32(start as u64, count as u64)?;
-    if rows.values.len() != count * ni {
-        return Err(format!(
-            "GMGSI `{name}` rows {start}..{} declare {count} x {ni} but {} values were read",
-            start + count,
-            rows.values.len()
-        ));
+/// The axis itself — one column, or one row — plus the probe lattice, which is
+/// the same lattice for both axes and overlaps the axis at the entries whose
+/// index the stride divides. Sorted and deduplicated because that is what a
+/// picked read is defined over, and because a probe that read a second copy of
+/// an entry could not disagree with the first.
+fn picks_of(axis: &Axis, nj: usize, ni: usize) -> Vec<usize> {
+    let mut picks: Vec<usize> = Vec::with_capacity(
+        match axis {
+            Axis::Row => nj,
+            Axis::Column => ni,
+        } + nj.div_ceil(SEPARABLE_PROBE_STRIDE) * ni.div_ceil(SEPARABLE_PROBE_STRIDE),
+    );
+    match axis {
+        Axis::Row => picks.extend((0..nj).map(|j| j * ni)),
+        Axis::Column => picks.extend(0..ni),
     }
-    Ok(rows.values)
+    for k in (0..nj).step_by(SEPARABLE_PROBE_STRIDE) {
+        for s in (0..ni).step_by(SEPARABLE_PROBE_STRIDE) {
+            picks.push(k * ni + s);
+        }
+    }
+    picks.sort_unstable();
+    picks.dedup();
+    picks
 }
 
 /// A coordinate the file marked missing is `NaN` in the raster form, and an
@@ -604,78 +680,6 @@ fn not_separable(name: &str, k: usize, v: f64, on_axis: f64) -> String {
         "GMGSI `{name}` is not separable: entry {k} reads {v} off-axis \
          against {on_axis} on it"
     )
-}
-
-/// The axis that varies **down** the rows: column 0 of every row.
-///
-/// Every row is needed, so this streams in blocks rather than windowing —
-/// what is resident is [`ROW_BLOCK`] rows of the variable plus the one chunk
-/// the variable's handle keeps. The separability probe runs inside the block
-/// that carries its row, which visits the same `(k, s)` pairs in the same
-/// order as a whole-variable walk.
-fn row_axis(
-    var: &squallar_netcdf::Variable,
-    name: &str,
-    nj: usize,
-    ni: usize,
-) -> Result<Vec<f64>, String> {
-    let mut out: Vec<f64> = Vec::with_capacity(nj);
-    for start in (0..nj).step_by(ROW_BLOCK) {
-        let count = ROW_BLOCK.min(nj - start);
-        let block = rows_of(var, name, start, count, ni)?;
-        for r in 0..count {
-            out.push(present(block[r * ni], name, start + r, 0)?);
-        }
-        // Probe the columns of every row in this block that the stride lands
-        // on. `(0..nj).step_by(S)` is exactly `k % S == 0`.
-        for r in 0..count {
-            let k = start + r;
-            if !k.is_multiple_of(SEPARABLE_PROBE_STRIDE) {
-                continue;
-            }
-            for s in (0..ni).step_by(SEPARABLE_PROBE_STRIDE) {
-                let v = present(block[r * ni + s], name, k, s)?;
-                if (v - out[k]).abs() > SEPARABLE_EPS {
-                    return Err(not_separable(name, k, v, out[k]));
-                }
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// The axis that varies **along** the columns: row 0, and nothing else.
-///
-/// Only the probe rows are read beyond that, and there are
-/// `nj / SEPARABLE_PROBE_STRIDE` of them; they are collected first so the
-/// comparison keeps its original column-outer order. Each is a one-row
-/// window off the handle's cached chunk.
-fn column_axis(
-    var: &squallar_netcdf::Variable,
-    name: &str,
-    nj: usize,
-    ni: usize,
-) -> Result<Vec<f64>, String> {
-    let first = rows_of(var, name, 0, 1, ni)?;
-    let mut out: Vec<f64> = Vec::with_capacity(ni);
-    for (k, v) in first.iter().enumerate() {
-        out.push(present(*v, name, 0, k)?);
-    }
-
-    let probes: Vec<(usize, Vec<f32>)> = (0..nj)
-        .step_by(SEPARABLE_PROBE_STRIDE)
-        .map(|s| rows_of(var, name, s, 1, ni).map(|row| (s, row)))
-        .collect::<Result<_, _>>()?;
-
-    for k in (0..ni).step_by(SEPARABLE_PROBE_STRIDE) {
-        for (s, row) in &probes {
-            let v = present(row[k], name, *s, k)?;
-            if (v - out[k]).abs() > SEPARABLE_EPS {
-                return Err(not_separable(name, k, v, out[k]));
-            }
-        }
-    }
-    Ok(out)
 }
 
 /// The envelope the two axes span.
