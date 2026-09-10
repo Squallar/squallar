@@ -90,18 +90,29 @@ static REDECODES: AtomicU64 = AtomicU64::new(0);
 
 /// Record one radial's skipped CFP block, `encoded` bytes of gate data.
 ///
-/// A zero-length block is charged nothing at all, block included — the same
+/// A zero-length block is charged nothing at all, blocks included — the same
 /// convention [`crate::scan_size::gate_bytes`] uses, because a `Vec` of zero
 /// length never asked the allocator for anything. A radial that carried no
 /// CFP block at all reaches here with `encoded == 0` and is likewise not
 /// counted: it had nothing to drop.
+///
+/// **Two blocks apiece, on the same convention**: a decoded moment's gates
+/// live in a `Vec<u8>` behind a `nexrad_model::data::GateBuffer`, which is an
+/// `Arc` so that cloning a volume shares them, so the block this drop avoided
+/// came with [`crate::scan_size::GATE_BUFFER_SHARE_BYTES`] and a header of its
+/// own. Spelled through `scan_size`'s constants rather than as numbers, so a
+/// change to the model moves both figures together instead of silently
+/// separating them.
 pub fn dropped_cfp(encoded: usize) {
     if encoded == 0 {
         return;
     }
     DROPPED.fetch_add(1, Relaxed);
     BYTES.fetch_add(
-        (encoded + crate::scan_size::ALLOCATOR_BLOCK_OVERHEAD) as u64,
+        (encoded
+            + crate::scan_size::ALLOCATOR_BLOCK_OVERHEAD
+            + crate::scan_size::GATE_BUFFER_SHARE_BYTES
+            + crate::scan_size::ALLOCATOR_BLOCK_OVERHEAD) as u64,
         Relaxed,
     );
 }
@@ -112,20 +123,23 @@ pub fn redecoded() {
     REDECODES.fetch_add(1, Relaxed);
 }
 
-/// CFP moments dropped since the process started. One block apiece, so this
-/// is also the block count.
+/// CFP moments dropped since the process started. TWO allocator blocks
+/// apiece — the gate `Vec` and the `Arc` that would have shared it — so the
+/// block count is twice this.
 #[must_use]
 pub fn dropped() -> u64 {
     DROPPED.load(Relaxed)
 }
 
-/// Blocks never allocated. Equal to [`dropped`] — one gate buffer is one
-/// allocation — and spelled separately because a population of ~32,400 blocks
-/// per volume is a block story as much as a byte one, and a reader should not
-/// have to know they are the same number to quote it.
+/// Blocks never allocated. **Twice [`dropped`]** — one gate buffer is two
+/// allocations, the `Vec<u8>` holding the gates and the
+/// `nexrad_model::data::GateBuffer` `Arc` that lets a clone of the volume share
+/// them — and spelled separately because a population of ~32,400 moments per
+/// volume is a block story as much as a byte one, and a reader should not have
+/// to derive the factor to quote it.
 #[must_use]
 pub fn blocks() -> u64 {
-    DROPPED.load(Relaxed)
+    DROPPED.load(Relaxed).saturating_mul(2)
 }
 
 /// Bytes never allocated, block overhead included.

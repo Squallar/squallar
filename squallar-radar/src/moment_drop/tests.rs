@@ -12,16 +12,22 @@ fn hold() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[test]
-fn a_dropped_moment_is_counted_once_in_bytes_and_once_in_blocks() {
+fn a_dropped_moment_is_counted_once_in_bytes_and_in_both_its_blocks() {
     let _guard = hold();
     let before = (dropped(), blocks(), bytes());
     dropped_cfp(1832);
     assert_eq!(dropped() - before.0, 1, "one moment");
-    assert_eq!(blocks() - before.1, 1, "one block");
+    assert_eq!(
+        blocks() - before.1,
+        2,
+        "two blocks: the gate `Vec` and the `Arc` that would have shared it"
+    );
     assert_eq!(
         bytes() - before.2,
-        1832 + crate::scan_size::ALLOCATOR_BLOCK_OVERHEAD as u64,
-        "the gate bytes and the block holding them"
+        1832 + crate::scan_size::ALLOCATOR_BLOCK_OVERHEAD as u64
+            + crate::scan_size::GATE_BUFFER_SHARE_BYTES as u64
+            + crate::scan_size::ALLOCATOR_BLOCK_OVERHEAD as u64,
+        "the gate bytes and the two blocks holding them"
     );
 }
 

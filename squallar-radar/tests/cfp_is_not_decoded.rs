@@ -75,10 +75,11 @@ fn a_decoded_radial_carries_no_clutter_filter_power_and_keeps_every_other_moment
         }
     }
 
-    // The ledger saw exactly those radials, one block apiece, at the block
-    // size the fixtures carry plus this crate's own per-allocation charge —
-    // so the figure a leg quotes is the same bytes `scan_size` would have
-    // priced had they been allocated.
+    // The ledger saw exactly those radials, TWO blocks apiece — a decoded
+    // moment's gates live in a `Vec<u8>` behind a `GateBuffer` `Arc` — at the
+    // block size the fixtures carry plus this crate's own per-allocation
+    // charge on each, so the figure a leg quotes is the same bytes
+    // `scan_size` would have priced had they been allocated.
     assert!(
         carried_cfp && dropping_radials > 0,
         "no fixture carried a CFP block, so the drop was never exercised"
@@ -90,13 +91,17 @@ fn a_decoded_radial_carries_no_clutter_filter_power_and_keeps_every_other_moment
     );
     assert_eq!(
         squallar_radar::moment_drop::blocks(),
-        dropping_radials,
-        "one block per drop"
+        dropping_radials * 2,
+        "two blocks per drop: the gate `Vec` and the `Arc` that would have \
+         shared it"
     );
     assert_eq!(
         squallar_radar::moment_drop::bytes(),
         dropping_radials
-            * (CFP_ENCODED_BYTES + squallar_radar::scan_size::ALLOCATOR_BLOCK_OVERHEAD as u64),
+            * (CFP_ENCODED_BYTES
+                + squallar_radar::scan_size::ALLOCATOR_BLOCK_OVERHEAD as u64
+                + squallar_radar::scan_size::GATE_BUFFER_SHARE_BYTES as u64
+                + squallar_radar::scan_size::ALLOCATOR_BLOCK_OVERHEAD as u64),
         "the gate bytes and the blocks holding them"
     );
     // Zero by construction: nothing reads a moment this drops, so nothing can
