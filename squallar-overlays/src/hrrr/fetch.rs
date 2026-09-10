@@ -174,6 +174,14 @@ pub fn run_for(now: NaiveDateTime) -> (NaiveDate, u8) {
 }
 
 /// [`run_for`] against the wall clock. The one place the clock is read.
+///
+/// **No production caller, deliberately.** Every pane-facing path resolves its
+/// run from the instant the pane depicts — `run_for(ctx.as_of)`, which is this
+/// function on a live pane and the scrub instant on a parked one. The
+/// wall-clock spelling is what drew `hrrr.<today>/...t13z` on panes parked in
+/// April. This is kept for the live-network tests and as the name of the
+/// concept; a new caller on a render or fetch path is that defect returning,
+/// and must be given `as_of` instead.
 pub fn latest_available_run() -> (NaiveDate, u8) {
     run_for(Utc::now().naive_utc())
 }

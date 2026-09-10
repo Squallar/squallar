@@ -321,6 +321,28 @@ impl ModelGridCache {
             .copied()
     }
 
+    /// [`Self::latest_of`], but never past `ceiling`.
+    ///
+    /// This cache is shared by every pane and ordered by **use**, so
+    /// `latest_of` will hand a pane parked in April a grid another pane pulled
+    /// off today's run — the two panes differ in nothing this search can see.
+    /// A pane resolving its own run through [`ModelDataHandler::run_at`] passes
+    /// the newest run its depicted instant could name, and a live pane's
+    /// ceiling is at or above every run the cache can hold, so its answer is
+    /// `latest_of`'s unchanged.
+    fn latest_not_after(
+        &self,
+        param: ModelParameter,
+        ceiling: chrono::NaiveDateTime,
+    ) -> Option<GridKey> {
+        self.recency
+            .borrow()
+            .iter()
+            .rev()
+            .find(|key| key.param == param && key.run <= ceiling)
+            .copied()
+    }
+
     /// Neither the entry going in nor anything in `pinned` is ever evicted.
     ///
     /// `pinned` is the **union** of every ENABLED pane's current key, not one pane's:
@@ -759,14 +781,31 @@ fn frame_label(grid: &HrrrGridData) -> String {
 /// dispatch and not inside the fetch.
 ///
 /// A pane parked on a frame asks for **that** frame — which is what makes a
-/// reopen 1:1 rather than snapping the pane back to the live hour. An unparked
-/// pane asks for the latest run at the parameter's own floor, the behaviour
-/// the fetch used to hardcode.
-fn fetch_frame(view: &ModelPaneState) -> ((chrono::NaiveDate, u8), u8) {
+/// reopen 1:1 rather than snapping the pane back to the live hour. A pane with
+/// no frame selected asks for the latest run **the instant it depicts** could
+/// name, at the parameter's own floor.
+///
+/// `as_of` and not `latest_available_run()`. The wall-clock spelling put
+/// `hrrr.<today>/...t13z` on panes parked in April: `as_of` is the wall clock
+/// on a live pane, so that arm is unchanged there, and is the scrub instant on
+/// a parked one, which is the whole of the difference.
+///
+/// **The second arm stays reachable, and is the primary path for a scrubbed
+/// pane whose transport is off.** `selected_frame` is written only by the
+/// `run`/`f_hour` controls and by the transport applying a listed frame, so a
+/// pane scrubbed into the past with no loop running never acquires one and
+/// draws from this arm on every poll. Closing the listing dispatch
+/// ([`ModelDataHandler::run_at`]) made the arm *survivable* — a pane with a
+/// loop lists frames and selects one — but it did not make it rare, which is
+/// why the run here is resolved from `as_of` rather than merely guarded.
+fn fetch_frame(
+    view: &ModelPaneState,
+    as_of: chrono::NaiveDateTime,
+) -> ((chrono::NaiveDate, u8), u8) {
     match view.selected_frame {
         Some((run, f_hour)) => ((run.date(), run.hour() as u8), f_hour),
         None => (
-            crate::hrrr::fetch::latest_available_run(),
+            crate::hrrr::fetch::run_for(as_of),
             view.selected_param.min_forecast_hour(),
         ),
     }
@@ -1004,10 +1043,11 @@ impl ModelDataHandler {
     /// resident grid.
     ///
     /// Deliberately does **not** fall back to `latest_available_run()`. That
-    /// reads the wall clock, and `list_frames` is a synchronous read every
-    /// frame may make — a clock in it would walk the whole frame list forward
-    /// under a parked pane. "I do not know yet" is the honest answer, and the
-    /// first fetch settles it.
+    /// reads the wall clock, and a pane parked in the past would have its whole
+    /// frame list walked forward under it. Every caller that holds the pane's
+    /// own depicted instant asks [`Self::run_at`] instead, which answers the
+    /// same two arms and then falls back to *that* instant; `None` is left for
+    /// the callers that hold no instant at all.
     fn run_of(&self, view: &ModelPaneState) -> Option<chrono::NaiveDateTime> {
         view.selected_frame.map(|(run, _)| run).or_else(|| {
             self.cached_grids
@@ -1016,12 +1056,56 @@ impl ModelDataHandler {
         })
     }
 
+    /// **The run this pane's frames belong to, as of the instant it depicts.**
+    ///
+    /// [`Self::run_of`] with the "I do not know yet" hole closed by the pane's
+    /// own clock rather than by the wall clock — the distinction the whole
+    /// scrub path turns on. Under a parked pane `as_of` is *fixed*, so nothing
+    /// here walks forward between frames; under a live pane it is the wall
+    /// clock, and this is `latest_available_run()` by another route.
+    ///
+    /// Closing the hole is what makes a parked pane work at all. `run_of`
+    /// answers `None` until the pane has a selection or the cache has a grid,
+    /// and a freshly scrubbed pane has neither — so `scope_of` was `None`, so
+    /// `create_frame_list_task` dispatched nothing, so the pane had no frame
+    /// series, so nothing ever wrote `selected_frame`, so the fetch fell back
+    /// to the wall clock and put today's run on a pane parked in April. The
+    /// cycle has no entry point except this one.
+    ///
+    /// The cache arm is bounded by the same instant for the same reason: see
+    /// [`ModelGridCache::latest_not_after`].
+    fn run_at(&self, view: &ModelPaneState, as_of: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
+        let ceiling = latest_run_at(as_of);
+        view.selected_frame
+            .map(|(run, _)| run)
+            .or_else(|| {
+                self.cached_grids
+                    .latest_not_after(view.selected_param, ceiling)
+                    .map(|k| k.run)
+            })
+            .unwrap_or(ceiling)
+    }
+
     fn scope_of(&self, view: &ModelPaneState) -> Option<ModelScope> {
         Some(ModelScope {
             param: view.selected_param,
             run: self.run_of(view)?,
             axis: view.axis,
         })
+    }
+
+    /// [`Self::scope_of`] against the instant the pane depicts, and therefore
+    /// **total** — see [`Self::run_at`].
+    ///
+    /// Every caller that holds an instant uses this, and they must all use it:
+    /// `create_frame_list_task` files a listing under the scope it computes
+    /// here, and `list_frames` reads it back by that same key.
+    fn scope_at(&self, view: &ModelPaneState, as_of: chrono::NaiveDateTime) -> ModelScope {
+        ModelScope {
+            param: view.selected_param,
+            run: self.run_at(view, as_of),
+            axis: view.axis,
+        }
     }
 
     /// **The forecast hours of one run, as a closed form.** No listing, no
@@ -1078,14 +1162,19 @@ impl ModelDataHandler {
     /// `f_hour = (valid - run).num_hours()` — the inverse of
     /// [`HrrrGridData::valid_time`], which is the only arithmetic either
     /// direction of this axis uses.
-    fn frame_target(&self, view: &ModelPaneState, stamp: &FrameStamp) -> Option<GridKey> {
+    fn frame_target(
+        &self,
+        view: &ModelPaneState,
+        as_of: chrono::NaiveDateTime,
+        stamp: &FrameStamp,
+    ) -> Option<GridKey> {
         let run = stamp.run?;
         let hours = (stamp.valid - run).num_hours();
         let f_hour = u8::try_from(hours).ok()?;
         if f_hour < view.selected_param.min_forecast_hour() {
             return None;
         }
-        let scope = self.scope_of(view)?;
+        let scope = self.scope_at(view, as_of);
         let named = match view.axis {
             // The set is the closed form, so "did a listing name it" is
             // answered by arithmetic rather than by a map.
@@ -1206,15 +1295,14 @@ impl FrameSource for ModelDataHandler {
     /// and on `Forecast` the whole set belongs to one run whose identity is
     /// what tells a forecast frame from the analysis of the hour it depicts.
     ///
-    /// `None` before anything has named this pane's run — the state a pane is
-    /// in when its loop is first switched on. A synchronous read must not
-    /// reach for the wall clock; see [`Self::run_of`].
+    /// `t` is the instant the pane depicts, so the scope is resolved against
+    /// *it* rather than against the wall clock — see [`Self::run_at`].
     fn latest_at(
         &self,
         pane: &PaneRef<'_>,
         t: chrono::NaiveDateTime,
     ) -> Option<squallar_source::time::FrameStamp> {
-        let scope = self.scope_of(self.view(pane))?;
+        let scope = self.scope_at(self.view(pane), t);
         let mut frames = self.stamps_of(&scope);
         frames.sort_by_key(|stamp| stamp.valid);
         squallar_source::time::newest_at_or_before(&frames, t)
@@ -1228,18 +1316,17 @@ impl FrameSource for ModelDataHandler {
     /// `Analysis` is a bucket listing, and is `complete` only where one has
     /// landed covering the whole window: "I found none" is not "none exist".
     ///
-    /// Both answer empty before anything has named this pane's run. A synchronous
-    /// read must not reach for the wall clock — see [`Self::run_of`].
+    /// The scope is resolved against [`FetchConfig::as_of`] — the instant this
+    /// pane depicts — so a pane parked in the past lists that window's runs and
+    /// not the wall clock's. See [`Self::run_at`].
     fn list_frames(
         &self,
-        _ctx: &FetchConfig,
+        ctx: &FetchConfig,
         pane: &PaneRef<'_>,
         range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
     ) -> FrameListing {
         let view = self.view(pane);
-        let Some(scope) = self.scope_of(view) else {
-            return FrameListing::empty(range);
-        };
+        let scope = self.scope_at(view, ctx.as_of);
         let (mut frames, complete) = match scope.axis {
             ModelAxis::Forecast => (self.stamps_of(&scope), true),
             ModelAxis::Analysis => (self.stamps_of(&scope), self.covers(&scope, range)),
@@ -1275,7 +1362,11 @@ impl FrameSource for ModelDataHandler {
         // arrives with the answer is a `PaneRef::across` union whose config is
         // null by construction, so reading any of these three back on arrival
         // files the listing under whatever the pane holds by then.
-        let scope = self.scope_of(view)?;
+        // Total, and that is the fix: `scope_of` answers `None` for a pane
+        // that has neither a selection nor a resident grid, and returning
+        // `None` here left such a pane with no frame series at all — an empty
+        // scrubber, and a `selected_frame` nothing would ever write.
+        let scope = self.scope_at(view, ctx.as_of);
         let ModelScope { param, run, axis } = scope;
 
         if axis == ModelAxis::Forecast {
@@ -1354,7 +1445,7 @@ impl FrameSource for ModelDataHandler {
         stamp: &FrameStamp,
     ) -> Option<FetchTask> {
         let view = self.view(pane);
-        let key = self.frame_target(view, stamp)?;
+        let key = self.frame_target(view, ctx.as_of, stamp)?;
         // **Already held, either side of the seam.** The staged grid is the
         // ordinary case; the live cache answers for a frame the pane is
         // itself parked on, which `frames_resident` also names, so the two
@@ -1818,7 +1909,7 @@ impl OverlayHandler for ModelDataHandler {
     fn prepare_job(&self, ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
         let grid = match ctx.frame {
             Some(stamp) => {
-                let key = self.frame_target(self.view(pane), &stamp)?;
+                let key = self.frame_target(self.view(pane), ctx.as_of, &stamp)?;
                 // **The staging area first, then the live cache** — one key
                 // space, two stores, and a named frame is drawn from whichever
                 // holds it. The second arm is not a fallback to another
@@ -1847,7 +1938,7 @@ impl OverlayHandler for ModelDataHandler {
         let sources = ctx.sources.clone();
         let view = self.view(pane);
         let param = view.selected_param;
-        let (run, f_hour) = fetch_frame(view);
+        let (run, f_hour) = fetch_frame(view, ctx.as_of);
         vec![FetchTask {
             kind: known::MODEL_DATA,
             future: Box::pin(async move {
@@ -4405,7 +4496,7 @@ mod tests {
                 run: Some(run),
             };
             assert_eq!(
-                h.frame_target(&h.defaults, &stamp),
+                h.frame_target(&h.defaults, run + chrono::Duration::hours(2), &stamp),
                 Some(GridKey {
                     param: ModelParameter::SurfaceBasedCape,
                     run,
@@ -4745,7 +4836,8 @@ mod tests {
 
             // The dispatch's own choice, off the same function `create_fetch_tasks`
             // reads — not a re-derivation of it.
-            let ((date, run_hour), f_hour) = fetch_frame(view_of(&state));
+            let ((date, run_hour), f_hour) =
+                fetch_frame(view_of(&state), chrono::Utc::now().naive_utc());
             assert_eq!(
                 (date, run_hour, f_hour),
                 (run.date(), run.hour() as u8, hour),
@@ -4810,12 +4902,10 @@ mod tests {
             None,
             "`Latest` must unpark the pane, not pin it to this instant",
         );
+        let now = chrono::Utc::now().naive_utc();
         assert_eq!(
-            fetch_frame(view_of(&state)),
-            (
-                crate::hrrr::fetch::latest_available_run(),
-                param.min_forecast_hour()
-            ),
+            fetch_frame(view_of(&state), now),
+            (crate::hrrr::fetch::run_for(now), param.min_forecast_hour()),
             "an unparked pane must fetch exactly what the old `None` arm did",
         );
         assert_eq!(
@@ -5095,7 +5185,10 @@ mod tests {
         );
 
         // And a floor parameter never fetches below its floor either.
-        assert_eq!(fetch_frame(view_of(&state)).1, 18);
+        assert_eq!(
+            fetch_frame(view_of(&state), chrono::Utc::now().naive_utc()).1,
+            18
+        );
     }
 
     /// An hour picked against a 48-hour run comes back onto whatever run the
@@ -5159,5 +5252,84 @@ mod tests {
              timeline reading this would offer the wrong step or refuse the \
              future half of its own range",
         );
+    }
+
+    /// **A pane parked in the past resolves its run from the instant it
+    /// depicts, not from the wall clock.**
+    ///
+    /// The rig leg that found this parked six panes at 2026-04-27T06:00Z
+    /// through the shipped scrub path and watched HRRR fetch
+    /// `hrrr.20260910/...t13z` — that day's run, on panes parked in April.
+    /// Two defects in one: `run_of` answers `None` for a pane that has neither
+    /// a selection nor a resident grid, so `scope_of` is `None`, so **no
+    /// listing is ever dispatched** and the pane has no frame series at all;
+    /// and with `selected_frame` still `None`, `fetch_frame` falls back to
+    /// `latest_available_run()`, which is `run_for(Utc::now())`.
+    ///
+    /// Both halves are asserted here against a fixed `as_of` with an empty
+    /// cache and no selection — the exact state a freshly scrubbed pane is in.
+    #[test]
+    fn a_parked_pane_resolves_its_run_from_the_instant_it_depicts() {
+        let h = new_handler();
+        let as_of = at(2026, 4, 27, 6);
+        let ctx = FetchConfig {
+            as_of,
+            ..fetch_cfg()
+        };
+        let pane = PaneRef::bare(0);
+        let range = (
+            as_of - chrono::Duration::hours(6),
+            as_of + chrono::Duration::hours(6),
+        );
+
+        // The listing is dispatched at all. `None` here is the root: a pane
+        // with no frame series has an empty scrubber, and never acquires the
+        // `selected_frame` that would keep the fetch off the wall clock.
+        assert!(
+            h.create_frame_list_task(&ctx, &pane, range).is_some(),
+            "a pane parked at {as_of} dispatched no frame listing, so it has no \
+             frame series to scrub and nothing will ever write its selection",
+        );
+
+        let listing = h.list_frames(&ctx, &pane, range);
+        assert!(
+            !listing.frames.is_empty(),
+            "a pane parked at {as_of} offers no frames over {range:?}",
+        );
+
+        // Every frame belongs to a run inside the depicted window. The bound
+        // is the window itself, not a magic number: `run_for` is two hours
+        // behind the instant it is given, and the clip is +/- 6 h.
+        for stamp in &listing.frames {
+            let run = stamp.run.expect("a model frame names the run it is off");
+            assert!(
+                (run - as_of).num_hours().abs() <= 6,
+                "frame valid {} is off run {run}, which is not in the window \
+                 around the depicted instant {as_of}",
+                stamp.valid,
+            );
+        }
+
+        // And the fetch asks for that run rather than today's. Stated against
+        // the wall clock directly, because "today's run" is precisely what the
+        // rig saw on the glass.
+        let now = chrono::Utc::now().naive_utc();
+        let ((date, hour), _f_hour) = fetch_frame(view_of_default(&h), as_of);
+        assert_eq!(
+            date,
+            as_of.date(),
+            "the fetch asked for the {date} run on a pane parked at {as_of}; \
+             the wall clock reads {now}",
+        );
+        assert!(
+            hour <= 6,
+            "the fetch asked for the {hour:02}Z run on a pane parked at {as_of}",
+        );
+    }
+
+    /// [`ModelDataHandler::view`] for a handler whose panes carry no state —
+    /// the registry copy, which is what [`PaneRef::bare`] resolves to.
+    fn view_of_default(h: &ModelDataHandler) -> &ModelPaneState {
+        h.view(&PaneRef::bare(0))
     }
 }
