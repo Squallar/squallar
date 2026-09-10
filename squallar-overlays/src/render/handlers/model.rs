@@ -1836,6 +1836,10 @@ impl OverlayHandler for ModelDataHandler {
     ) {
     }
 
+    fn answers_hover(&self) -> bool {
+        true
+    }
+
     fn hover_value_at(&self, lat: f64, lon: f64, pane: &PaneRef<'_>) -> Option<String> {
         let grid = self.grid_of(pane)?;
         // The pointer arrives in the pane's continuous frame — 190 past the

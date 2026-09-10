@@ -361,6 +361,101 @@ mod registry_identity_tests {
         }
     }
 
+    /// **Which registered layers declare [`SourceHandler::answers_hover`],
+    /// pinned by name.**
+    ///
+    /// The layer walk asks a hovering pane only these; a layer that implements
+    /// `hover_value_at` and forgets the declaration draws its picture, keeps
+    /// its click and its legend, and silently has no pointer readout — a
+    /// failure with no error, no log and no other test.
+    ///
+    /// So the table is **exhaustive over the live registry**, not a list of the
+    /// three: a handler this build registers and this table does not name fails
+    /// here, whichever way its `answers_hover` reads. That is what makes a new
+    /// source's author answer the question rather than inherit an answer.
+    ///
+    /// **Hand-kept, and never derived from `answers_hover()`** — the discipline
+    /// [`super::REGISTERED_LAYER_COUNT`] states: a table read off the thing it
+    /// is meant to pin compares the registry against itself and cannot fail.
+    #[test]
+    fn every_hover_answering_handler_declares_it() {
+        let declared: &[&str] = &["ModelData", "Mrms", "Gmgsi"];
+        let silent: &[&str] = &[
+            "SpcOutlook",
+            "Radar",
+            "SpcDiscussions",
+            "NwsAlerts",
+            "StormReports",
+            "Lightning",
+            "Metar",
+            "CityLabels",
+            "RadarSites",
+            "UserLocation",
+            "ColorScale",
+            "SpcFireOutlook",
+            "Terrain",
+            "BasemapTiles",
+            "RadarCoverage",
+        ];
+        for h in &all() {
+            let id = h.id();
+            let name = id.as_str();
+            let expected = if declared.contains(&name) {
+                true
+            } else if silent.contains(&name) {
+                false
+            } else {
+                panic!(
+                    "{name} is registered and this table does not name it. Say \
+                     whether it answers `hover_value_at`: a layer that \
+                     implements it without overriding `answers_hover` has no \
+                     pointer readout and nothing else says so."
+                );
+            };
+            assert_eq!(
+                h.answers_hover(),
+                expected,
+                "{name} answers_hover() = {}, table says {expected}",
+                h.answers_hover(),
+            );
+        }
+        assert_eq!(
+            declared.len() + silent.len(),
+            super::REGISTERED_LAYER_COUNT,
+            "the table names {} layers against the {} this build registers",
+            declared.len() + silent.len(),
+            super::REGISTERED_LAYER_COUNT,
+        );
+    }
+
+    /// **The registry's held hover list is its handlers' own answer.**
+    ///
+    /// `OverlayRegistry::hover_ids` is taken once at construction, like
+    /// `texture_ids`, and the layer walk reads it instead of asking. Both
+    /// halves: every declaring handler is in the list, and nothing else is.
+    #[test]
+    fn registry_hover_ids_match_their_handlers() {
+        let registry =
+            squallar_overlays::render::overlay_state::OverlayRegistry::with_handlers(all());
+        for h in registry.handlers() {
+            assert_eq!(
+                registry.may_answer_hover(&h.id()),
+                h.answers_hover(),
+                "{} declares answers_hover() = {} and the registry's held list \
+                 says {}",
+                h.display_name(),
+                h.answers_hover(),
+                registry.may_answer_hover(&h.id()),
+            );
+        }
+        assert_eq!(
+            registry.hover_ids().len(),
+            registry.handlers().filter(|h| h.answers_hover()).count(),
+            "the held list and the handlers disagree about how many layers \
+             answer hover"
+        );
+    }
+
     /// b1 pin: every handler's id sits in the append-only ledger — a handler
     /// cannot register a spelling `LAYER_ID_LEDGER` does not carry.
     ///

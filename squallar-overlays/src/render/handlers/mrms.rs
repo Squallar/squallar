@@ -1206,6 +1206,10 @@ impl OverlayHandler for MrmsHandler {
     /// [`crate::mrms::decode::to_reading`] made it `NaN` and
     /// [`MrmsProduct::format_value`] formats a non-finite reading as nothing.
     /// That is what stops the tooltip claiming "−999.0 dBZ" over the ocean.
+    fn answers_hover(&self) -> bool {
+        true
+    }
+
     fn hover_value_at(&self, lat: f64, lon: f64, pane: &PaneRef<'_>) -> Option<String> {
         let grid = self.cached_grids.get(self.view(pane).selected_product)?;
         // The pointer arrives in the pane's continuous frame — 190 past the

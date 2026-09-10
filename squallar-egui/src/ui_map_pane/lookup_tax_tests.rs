@@ -346,6 +346,271 @@ fn a_layer_the_pane_switched_off_is_not_probed_as_if_it_were_on() {
     );
 }
 
+/// **The hovering pane's own walk: what it asks, and that it still answers.**
+///
+/// The layer walk resolves a handler for every enabled layer under the pointer
+/// to ask [`OverlayHandler::hover_value_at`], and fifteen of the eighteen
+/// registered layers cannot answer anything but `None`.
+/// `OverlayRegistry::may_answer_hover` decides that before the resolution;
+/// these say the decision costs the layers that CAN answer nothing, and that
+/// the saving is real.
+///
+/// The fixture's whole point is the pointer. `render_pane_map_content`'s hover
+/// block runs only inside `pane_rect.contains(pointer_hover_pos())`, so
+/// [`walk_ledger_scene`]'s pointer-free scene — the one every figure above is
+/// measured on — never enters it at all, and no ceiling above moves whatever
+/// the block does.
+mod hover_pass {
+    use super::*;
+    use squallar_overlays::render::overlay_state::{
+        FetchPayload, OverlayHandler, OverlayItem, PaneRef, RenderMode, Surface,
+    };
+    use squallar_source::time::TimeAxis;
+    use std::sync::Arc;
+
+    /// A layer that answers hover with a fixed string, and says separately
+    /// whether it declares that it does.
+    struct HoverProbe {
+        id: LayerId,
+        weight: u32,
+        answers: bool,
+        says: &'static str,
+    }
+
+    impl OverlayHandler for HoverProbe {
+        fn id(&self) -> LayerId {
+            self.id.clone()
+        }
+        fn surface(&self) -> Surface {
+            Surface::Glass
+        }
+        fn draw_order_weight(&self) -> u32 {
+            self.weight
+        }
+        fn display_name(&self) -> &str {
+            "HoverProbe"
+        }
+        fn render_mode(&self) -> RenderMode {
+            RenderMode::PerFrameDirect
+        }
+        fn data_generation(&self) -> u64 {
+            0
+        }
+        fn has_data(&self, _pane: &PaneRef<'_>) -> bool {
+            true
+        }
+        fn is_fetching(&self) -> bool {
+            false
+        }
+        fn set_fetching(&mut self, _fetching: bool, _pane: &PaneRef<'_>) {}
+        fn fetch_time(&self) -> Option<web_time::Instant> {
+            None
+        }
+        fn apply_fetch_result(&mut self, _result: FetchPayload, _pane: &PaneRef<'_>) {}
+        fn retain_selections(
+            &self,
+            _selections: &mut Vec<Arc<dyn OverlayItem>>,
+            _pane: &PaneRef<'_>,
+        ) {
+        }
+        fn time_axis(&self) -> TimeAxis {
+            TimeAxis::Live
+        }
+        fn answers_hover(&self) -> bool {
+            self.answers
+        }
+        fn hover_value_at(&self, _lat: f64, _lon: f64, _pane: &PaneRef<'_>) -> Option<String> {
+            Some(self.says.to_string())
+        }
+    }
+
+    /// One `(id, draw weight, declares hover, what it answers)` probe.
+    type Probe = (LayerId, u32, bool, &'static str);
+
+    /// Run one walk over a pane holding every registered layer plus `probes`,
+    /// with the pointer parked in the middle of the pane or absent. Returns
+    /// what the walk left in `overlay_hover_value` and the registry lookups it
+    /// made.
+    fn hover_walk(probes: Vec<Probe>, pointer_in_pane: bool) -> (Option<String>, u64) {
+        let canvas = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let pointer = canvas.center();
+        let egui_ctx = egui::Context::default();
+        let mut handlers = crate::sources::all();
+        for (id, weight, answers, says) in probes {
+            handlers.push(Box::new(HoverProbe {
+                id,
+                weight,
+                answers,
+                says,
+            }));
+        }
+        let mut overlays = OverlayRegistry::with_handlers(handlers);
+        let mut weights: Vec<(LayerId, u32)> = overlays
+            .handlers()
+            .map(|h| (h.id(), h.draw_order_weight()))
+            .collect();
+        weights.sort_by_key(|(_, w)| *w);
+        let order: Vec<LayerId> = weights.into_iter().map(|(id, _)| id).collect();
+        let mut pane = PaneState::new();
+        for id in &order {
+            pane.set_overlay_enabled(id.clone(), true);
+        }
+        pane.set_draw_order(&order);
+        pane.hydrate_layer_states(&overlays, 0);
+
+        let mut memory = walkers::MapMemory::default();
+        memory.set_zoom(7.0).expect("7 is a zoom walkers accepts");
+        let projector = walkers::Projector::new(canvas, &memory, walkers::lat_lon(35.33, -97.28));
+        let preferences = UserPreferences::default();
+        let mut actions = Vec::new();
+        let mut click_consumed = false;
+        let mut galley_cache = walkers::GalleyCache::default();
+        let mut point_text_meshes = crate::point_painter::PointTextMeshes::default();
+        let mut label_cache = crate::label_cache::LabelCache::default();
+
+        // The pointer is the fixture. Without it `pointer_hover_pos()` is
+        // `None` and the block under test never runs.
+        egui_ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(canvas),
+            events: if pointer_in_pane {
+                vec![egui::Event::PointerMoved(pointer)]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        });
+        let mut ui = egui::Ui::new(
+            egui_ctx.clone(),
+            egui::Id::new("hover_tax"),
+            egui::UiBuilder::new()
+                .layer_id(egui::LayerId::background())
+                .max_rect(canvas),
+        );
+        assert_eq!(
+            ui.ctx().pointer_hover_pos(),
+            pointer_in_pane.then_some(pointer),
+            "the fixture did not place the pointer it was asked for, so the \
+             hover block did not run and nothing below means anything"
+        );
+        lookup_ledger::reset();
+        let budget = std::cell::Cell::new(u64::MAX);
+        let mut ctx = PaneRenderCtx {
+            admission_notice: None,
+            cost: None,
+            pane_idx: 0,
+            pane: &mut pane,
+            overlays: &mut overlays,
+            user_location: None,
+            user_heading: None,
+            user_fix: None,
+            basemap_labels: Vec::new(),
+            galley_cache: &mut galley_cache,
+            point_text_meshes: &mut point_text_meshes,
+            label_cache: &mut label_cache,
+            ground_meshes: None,
+            radar_fan: None,
+            basemap_tiles: None,
+            terrain_tiles: None,
+            tile_zoom_bias: 0,
+            overlay_render_limit: 1,
+            overlay_dispatch_budget: &budget,
+            overlay_overdraw: crate::overlay_cache::OVERDRAW_FRACTION,
+            actions: &mut actions,
+            pane_rect: canvas,
+            surfaces: PaneSurfaces::GroundAndGlass,
+            draws_3d_ground: GroundIsMesh::PLAN_VIEW,
+            horizontal_color_scale: true,
+            color_scale_floor: canvas.max.y,
+            pointer_available: pointer_in_pane,
+            excluded_rects: Vec::new(),
+            long_press_pos: None,
+            overlay_click_pos: None,
+            click_consumed: &mut click_consumed,
+            preferences: &preferences,
+            paint_order: Vec::new(),
+        };
+        render_pane_map_content(&mut ui, &projector, memory.zoom(), &mut ctx);
+        let (lookups, _, _) = lookup_ledger::read();
+        let value = pane.overlay_hover_value.clone();
+        let _ = egui_ctx.end_pass();
+        (value, lookups)
+    }
+
+    /// **A declaring layer is still asked, and its answer still lands.**
+    ///
+    /// The gate on the skip, and the one no pixel digest can stand in for: a
+    /// walk that filtered too hard leaves `overlay_hover_value` at `None` and
+    /// the status bar's pointer readout blank, with every pixel of the map
+    /// identical.
+    #[test]
+    fn a_declaring_layer_still_puts_its_value_on_the_pane() {
+        let (value, _) = hover_walk(vec![(LayerId::new("HoverA"), 900, true, "A says 7")], true);
+        assert_eq!(
+            value.as_deref(),
+            Some("A says 7"),
+            "a layer that declares `answers_hover` and answers was not asked"
+        );
+    }
+
+    /// **Draw order decides, exactly as it did.**
+    ///
+    /// Two declaring layers both answer; the walk takes the first in the
+    /// pane's own bottom-to-top order. `PaneState::slots()` is the same list
+    /// `draw_order()` iterates, and this says so through the walk rather than
+    /// through the container.
+    #[test]
+    fn the_lowest_answering_layer_in_the_stack_wins() {
+        let (value, _) = hover_walk(
+            vec![
+                (LayerId::new("HoverHigh"), 950, true, "high"),
+                (LayerId::new("HoverLow"), 900, true, "low"),
+            ],
+            true,
+        );
+        assert_eq!(
+            value.as_deref(),
+            Some("low"),
+            "the walk took the higher layer's answer: draw order is no longer \
+             what decides the pointer readout"
+        );
+    }
+
+    /// **What the pointer costs the walk, as a ceiling that may only fall.**
+    ///
+    /// The same pane and the same registry, walked twice with the pointer as
+    /// the only difference, so the figure is the pointer's own tax rather than
+    /// the walk's total. The hover block is what used to make that tax scale
+    /// with the registry — one resolution per *enabled* layer — and the bound
+    /// says it now scales with the layers that **declare** hover.
+    ///
+    /// No headroom above the declaring count, in the shape of every other
+    /// ceiling in this file: the walk's other pointer arms — the per-frame
+    /// point pass's hover position, the site icons' — cost **zero** further
+    /// registry resolutions on this fixture, measured, so the bound is the
+    /// declaring layers and nothing else.
+    #[test]
+    fn hovering_costs_a_lookup_only_for_the_layers_that_can_answer() {
+        // ModelData, Mrms, Gmgsi, and the probe.
+        const DECLARING: u64 = 4;
+        let probes: Vec<Probe> = vec![(LayerId::new("HoverA"), 900, true, "A says 7")];
+        let (_, hovering) = hover_walk(probes.clone(), true);
+        let (_, still) = hover_walk(probes, false);
+        let tax = hovering - still;
+        eprintln!(
+            "same pane, pointer on = {hovering} registry lookups, pointer off \
+             = {still}: the pointer costs {tax}, of which {DECLARING} are the \
+             layers that declare hover"
+        );
+        assert!(
+            tax <= DECLARING,
+            "the pointer cost the walk {tax} registry lookups over a \
+             pointer-free walk of the same pane, above the {DECLARING} layers \
+             that declare hover. The hover block is resolving handlers that \
+             cannot answer."
+        );
+    }
+}
+
 /// **The point pass, priced against the number of points it draws.**
 ///
 /// A registry with exactly one layer in it, whose only interesting property is

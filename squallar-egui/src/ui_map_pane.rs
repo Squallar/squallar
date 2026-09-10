@@ -1000,19 +1000,39 @@ pub(super) fn render_pane_map_content(
                 let map_pos = projector.unproject(egui::vec2(pos.x, pos.y));
                 let hover_lat = map_pos.y();
                 let hover_lon = map_pos.x();
-                for id in &draw_order {
-                    if ctx.pane.is_overlay_enabled(id)
-                        && let Some(text) = ctx.overlays.hover_value_at(
-                            id,
-                            hover_lat,
-                            hover_lon,
-                            &ctx.pane.layer_ref(ctx.pane_idx, id),
-                        )
-                    {
-                        ctx.pane.overlay_hover_value = Some(text);
+                // **The slots, and only the ones that can answer.** The walk
+                // is the pane's own slot list rather than a list of ids sent
+                // back through `PaneState::slot` — `slots()` has the element
+                // `is_overlay_enabled` and `layer_ref` would each have gone
+                // looking for — and `may_answer_hover` decides whether
+                // resolving a handler could change the answer before any
+                // resolution happens. Fifteen of the eighteen registered
+                // layers do not implement `hover_value_at`, and every one of
+                // them used to cost a registry resolution, two slot lookups,
+                // a `PaneRef` and a virtual call per hovering frame to be
+                // told `None`.
+                //
+                // Draw order is preserved exactly: `slots()` walks the same
+                // list in the same order `draw_order` does, so the first
+                // layer with something to say still wins by its position in
+                // the stack.
+                let view = ctx.pane.view(ctx.pane_idx);
+                let mut found = None;
+                for slot in ctx.pane.slots() {
+                    if !slot.enabled || !ctx.overlays.may_answer_hover(&slot.id) {
+                        continue;
+                    }
+                    if let Some(text) = ctx.overlays.hover_value_at(
+                        &slot.id,
+                        hover_lat,
+                        hover_lon,
+                        &view.layer_of(slot),
+                    ) {
+                        found = Some(text);
                         break;
                     }
                 }
+                ctx.pane.overlay_hover_value = found;
             }
         }
 

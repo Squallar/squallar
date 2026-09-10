@@ -1076,6 +1076,24 @@ pub trait SourceHandler: Send {
         None
     }
 
+    /// Whether this layer ever answers [`Self::hover_value_at`] with a value.
+    ///
+    /// Asked without a pane and without a position, so the layer walk can
+    /// decide **before** resolving a handler whether resolving one could
+    /// change the answer. Every layer under the pointer used to be resolved
+    /// and called; on a full stack that was fifteen registry resolutions, a
+    /// slot lookup each and a virtual call each, per hovering frame, to be
+    /// told `None` by handlers that cannot say anything else.
+    ///
+    /// **A handler that overrides `hover_value_at` overrides this too** — the
+    /// same contract [`Self::carries_legend`] carries for `legend`, and the
+    /// same way to get it wrong: a layer that answers here `false` and
+    /// implements `hover_value_at` has no hover readout, and nothing but
+    /// `every_hover_answering_handler_declares_it` says so.
+    fn answers_hover(&self) -> bool {
+        false
+    }
+
     /// This layer's colour bar, [`Signed`] so a caller can keep what it baked:
     /// the bar is sampled once per pixel of its length, at frame rate.
     fn legend(&self, pane: &PaneRef<'_>) -> Option<Signed<OverlayLegend>> {

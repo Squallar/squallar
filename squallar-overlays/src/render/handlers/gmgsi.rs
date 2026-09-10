@@ -1439,6 +1439,10 @@ impl OverlayHandler for GmgsiHandler {
     /// global figure would over-reach at one end.
     ///
     /// [`GridCoords::cell_span_degrees`]: crate::hrrr::GridCoords::cell_span_degrees
+    fn answers_hover(&self) -> bool {
+        true
+    }
+
     fn hover_value_at(&self, lat: f64, lon: f64, pane: &PaneRef<'_>) -> Option<String> {
         let view = self.view(pane);
         let granule = self.cached_grids.get(view.selected_channel)?;

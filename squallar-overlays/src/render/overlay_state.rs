@@ -182,6 +182,17 @@ pub struct OverlayRegistry {
     /// by a constant in every implementation this workspace has.
     /// `registry_texture_ids_match_their_handlers` holds both halves.
     texture_ids: Vec<LayerId>,
+    /// **The ids of the handlers that declare
+    /// [`OverlayHandler::answers_hover`]**, in `handlers`' own order, taken
+    /// once when the registry was built.
+    ///
+    /// Sound for the same reason [`Self::texture_ids`] is: `handlers` is fixed
+    /// by construction and every implementation of `answers_hover` in this
+    /// workspace returns a constant.
+    /// `registry_hover_ids_match_their_handlers` holds both halves, and
+    /// `every_hover_answering_handler_declares_it` holds the declaration
+    /// against the implementations.
+    hover_ids: Vec<LayerId>,
     /// Populated by map clicks; paged through in the popup.
     pub selected_overlays: Vec<Arc<dyn OverlayItem>>,
     pub selected_overlay_page: usize,
@@ -223,10 +234,17 @@ impl OverlayRegistry {
             .filter(|(handler, _)| handler.render_mode().has_texture())
             .map(|(_, id)| id.clone())
             .collect();
+        let hover_ids = handlers
+            .iter()
+            .zip(ids.iter())
+            .filter(|(handler, _)| handler.answers_hover())
+            .map(|(_, id)| id.clone())
+            .collect();
         Self {
             handlers,
             ids,
             texture_ids,
+            hover_ids,
             selected_overlays: Vec::new(),
             selected_overlay_page: 0,
             frame_viewport: None,
@@ -273,6 +291,26 @@ impl OverlayRegistry {
     /// Held rather than rebuilt: see [`Self::texture_ids`].
     pub fn texture_ids(&self) -> &[LayerId] {
         &self.texture_ids
+    }
+
+    /// **Every registered layer that declares
+    /// [`OverlayHandler::answers_hover`]**, in registry order.
+    ///
+    /// Built once at construction beside [`Self::texture_ids`], for the same
+    /// reason: the set cannot change after `with_handlers`.
+    pub fn hover_ids(&self) -> &[LayerId] {
+        &self.hover_ids
+    }
+
+    /// Whether resolving `id`'s handler could produce a hover readout.
+    ///
+    /// **A scan, and deliberately so**: it walks the three ids that declare
+    /// hover rather than the eighteen the registry holds, and it answers
+    /// without a resolution — so it costs neither a
+    /// [`lookup_ledger`] entry nor a `PaneRef`. That is the whole saving; a
+    /// map here would only replace three short comparisons with a hash.
+    pub fn may_answer_hover(&self, id: &LayerId) -> bool {
+        self.hover_ids.iter().any(|held| held == id)
     }
 
     /// The default draw order, bottom to top — every registered handler's id
