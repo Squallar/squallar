@@ -4085,3 +4085,258 @@ fn a_listing_over_one_window_does_not_build_a_loop_asking_about_another() {
         "the half-hour loop was retired by a listing that never answered it",
     );
 }
+
+// --------------------------------------------------------------------------- The per-frame action budget
+//
+// The four properties `crate::action_budget` claims, driven through the real
+// `process_gui_actions` on a real `App`. The budget is a wall clock and a test
+// cannot make an action slow, so every leg here sets `app.action_budget` to
+// zero: a spent budget is exactly the state the properties are about, and it
+// is unreachable any other way. The shipping value is a `cfg` cascade in
+// `squallar-device-profile` and is checked there.
+
+/// The starved case, and it is the one that matters: with the budget already
+/// spent, **one action still goes through** and the rest are carried rather
+/// than dropped.
+#[test]
+fn a_spent_action_budget_still_lets_one_action_through_and_queues_the_rest() {
+    let mut app = headless(TestBridge::desktop());
+    app.action_budget = std::time::Duration::ZERO;
+
+    let before = app.location.serial_active();
+    assert!(!before, "the fixture started with the reader already open");
+
+    app.process_gui_actions(vec![
+        GuiAction::StartGps {
+            config: squallar_nmea_serial::SerialConfig {
+                port_path: Some("/dev/ttyPROBE".to_string()),
+                baud_rate: 38400,
+            },
+        },
+        GuiAction::StopGps,
+        GuiAction::StopLocation,
+    ]);
+
+    assert!(
+        app.location.serial_active(),
+        "the first action did not run: a budget that is already spent when the \
+         loop starts has starved the frame instead of pacing it",
+    );
+    assert_eq!(
+        app.action_queue.queued_len(),
+        2,
+        "the tail the budget stopped was not carried to a later frame; a \
+         dropped action is a one-shot edge the UI never emits again",
+    );
+
+    // And the very next frame drains it, ahead of anything that frame emits.
+    app.process_gui_actions(Vec::new());
+    assert!(
+        !app.location.serial_active(),
+        "the deferred `StopGps` never ran on the frame after the one that \
+         deferred it",
+    );
+    assert_eq!(
+        app.action_queue.queued_len(),
+        1,
+        "the second frame took more than its own spent budget allowed",
+    );
+}
+
+/// Order across the seam: what a frame deferred runs **before** what the next
+/// frame emitted, not after it.
+#[test]
+fn a_deferred_action_runs_ahead_of_the_next_frames_own() {
+    let mut app = headless(TestBridge::desktop());
+    app.action_budget = std::time::Duration::ZERO;
+
+    // Two panes' worth of asks so the tail is non-empty; the identity of the
+    // layer is what the assertion reads, not its behaviour.
+    let first = known::NWS_ALERTS;
+    let second = known::METAR;
+
+    app.process_gui_actions(vec![
+        GuiAction::StopLocation,
+        GuiAction::FetchOverlay {
+            kind: first.clone(),
+            pane_idx: 0,
+        },
+    ]);
+    assert_eq!(app.action_queue.queued_len(), 1, "nothing was deferred");
+
+    // A *different* ask on the next frame. The queue drains ahead of it, so
+    // the deferred `first` runs and the new `second` is what is left; a queue
+    // that drained after would leave `first` still waiting.
+    app.process_gui_actions(vec![GuiAction::FetchOverlay {
+        kind: second.clone(),
+        pane_idx: 0,
+    }]);
+
+    assert_eq!(
+        app.action_queue.head_fetch_layer(),
+        Some(second),
+        "the frame ran its own new ask ahead of the one an earlier frame \
+         deferred: the budget is reordering the action stream rather than \
+         delaying it, and `{first:?}` is still waiting",
+    );
+}
+
+/// The re-emission the queue has to collapse: a deferred fetch ask stands, the
+/// UI emits it again next frame, and appending both would spawn the same
+/// download twice.
+#[test]
+fn a_re_emitted_fetch_ask_is_collapsed_against_the_one_already_queued() {
+    let mut app = headless(TestBridge::desktop());
+    app.action_budget = std::time::Duration::ZERO;
+
+    let kind = known::NWS_ALERTS;
+    app.process_gui_actions(vec![
+        GuiAction::StopLocation,
+        GuiAction::FetchOverlay {
+            kind: kind.clone(),
+            pane_idx: 0,
+        },
+        GuiAction::FetchOverlay {
+            kind: kind.clone(),
+            pane_idx: 1,
+        },
+    ]);
+    assert_eq!(
+        app.action_queue.queued_len(),
+        2,
+        "the two asks are for different panes and are two different asks",
+    );
+
+    // The next frame re-emits both, exactly as `check_auto_polls` does while
+    // the layer is still due, and adds a third that is genuinely new.
+    app.process_gui_actions(vec![
+        GuiAction::FetchOverlay {
+            kind: kind.clone(),
+            pane_idx: 0,
+        },
+        GuiAction::FetchOverlay {
+            kind: kind.clone(),
+            pane_idx: 1,
+        },
+        GuiAction::FetchOverlay {
+            kind: known::METAR,
+            pane_idx: 0,
+        },
+    ]);
+
+    assert_eq!(
+        app.action_queue.queued_len(),
+        2,
+        "the queue grew by more than the one genuinely new ask: a re-emitted \
+         ask was appended beside the identical one already waiting, and both \
+         will spawn a download",
+    );
+}
+
+/// `RenderOverlay` is intercepted, never budgeted and never deferred — it is
+/// the one action the loop does not handle, and its cost is the dispatch cut
+/// below it.
+#[test]
+fn a_raster_ask_is_never_held_back_by_the_action_budget() {
+    let mut app = headless(TestBridge::desktop());
+    app.action_budget = std::time::Duration::ZERO;
+
+    let bounds = bounds();
+    app.process_gui_actions(vec![
+        GuiAction::StopLocation,
+        GuiAction::StopGps,
+        GuiAction::RenderOverlay {
+            pane_idx: 0,
+            overlay_kind: known::NWS_ALERTS,
+            geo_bounds: bounds,
+            texture: OverlayTexturePlan {
+                width: 256,
+                height: 256,
+                overdraw: 0.0,
+                pixels_per_point: 1.0,
+                pane_px: [256, 256],
+            },
+            data_generation: 1,
+            zoom: 6,
+        },
+    ]);
+
+    assert_eq!(
+        app.last_viewport,
+        Some(bounds),
+        "the raster ask was deferred with the handled actions: a picture the \
+         pane is already showing a stale version of now waits a frame for no \
+         saving at all",
+    );
+    assert_eq!(
+        app.action_queue.queued_len(),
+        1,
+        "the deferred tail is not the one handled action the budget stopped",
+    );
+}
+
+/// The healthy-input control the four legs above need: on the **shipping**
+/// budget an ordinary frame's actions all run, and nothing is carried. Without
+/// it, a budget wired to defer everything unconditionally would pass all four.
+#[test]
+fn the_shipping_action_budget_does_not_defer_an_ordinary_frames_actions() {
+    let mut app = headless(TestBridge::desktop());
+    assert_eq!(
+        app.action_budget,
+        squallar_device_profile::constants::ACTION_BUDGET_PER_FRAME,
+        "the fixture is not measuring the value the app ships with",
+    );
+
+    app.process_gui_actions(vec![
+        GuiAction::StartGps {
+            config: squallar_nmea_serial::SerialConfig {
+                port_path: Some("/dev/ttyPROBE".to_string()),
+                baud_rate: 38400,
+            },
+        },
+        GuiAction::StopGps,
+        GuiAction::StopLocation,
+    ]);
+
+    assert_eq!(
+        app.action_queue.queued_len(),
+        0,
+        "the shipping budget deferred an ordinary frame's three cheap \
+         actions, so it is pacing every frame rather than the rare burst it \
+         was measured against",
+    );
+}
+
+/// **The budget never spans a renumbering.** Every deferred action naming a
+/// pane names it by position, and `PaneClosed` moves them; a tail carried
+/// across one would ask for a pane that no longer has that number.
+#[test]
+fn a_frame_that_closes_a_pane_runs_its_whole_list_however_spent_the_budget_is() {
+    let mut app = headless(TestBridge::desktop());
+    app.action_budget = std::time::Duration::ZERO;
+
+    app.process_gui_actions(vec![
+        GuiAction::StartGps {
+            config: squallar_nmea_serial::SerialConfig {
+                port_path: Some("/dev/ttyPROBE".to_string()),
+                baud_rate: 38400,
+            },
+        },
+        GuiAction::PaneClosed { pane_idx: 1 },
+        GuiAction::StopGps,
+        GuiAction::StopLocation,
+    ]);
+
+    assert_eq!(
+        app.action_queue.queued_len(),
+        0,
+        "a pane-indexed action was carried past the `PaneClosed` that \
+         renumbered the panes: whatever index it holds now names a different \
+         pane, and it will be served with that pane's layer",
+    );
+    assert!(
+        !app.location.serial_active(),
+        "the whole list did not run: the fixture proves nothing about the \
+         renumbering exemption if the actions after `PaneClosed` were skipped",
+    );
+}

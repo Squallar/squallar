@@ -661,6 +661,36 @@ fn upload_residency_line(peak: u64) -> String {
     format!("upload residency: {peak} B peak pending")
 }
 
+/// The `action budget:` running-total line — **what the per-frame GUI-action
+/// allowance actually held back**. See [`overlay_raster_line`] for why this is
+/// a value rather than an argument to `log::info!`.
+///
+/// # Why it is its own sentence
+///
+/// [`upload_pacing_line`]'s reason verbatim: `.github/browser-rig/drive.py`
+/// matches each of the lines above with one anchored regex, and a field
+/// inserted into one of them turns that whole reading into `null`. This line
+/// is additive.
+///
+/// # Four denominators, never added
+///
+/// `handled` is actions run on the frame thread, `bites` is frames the budget
+/// stopped the loop on, `deferred` is actions those bites carried to a later
+/// frame, and `coalesced` is re-emitted asks dropped against an identical
+/// queued one — a saving in downloads, not in frame time. `deepest` is a
+/// high-water mark, not a total. See [`crate::action_budget`].
+///
+/// **A `bites 0` reading is the point of the line.** A budget whose
+/// precondition never holds delivers exactly zero and looks landed; this is
+/// the counter that says whether it ever bit.
+fn action_budget_line(t: &crate::action_budget::Totals) -> String {
+    format!(
+        "action budget: {} handled, {} bites, {} deferred, {} coalesced, \
+         {} deepest",
+        t.handled, t.bites, t.deferred, t.coalesced, t.deepest,
+    )
+}
+
 /// The `upload pacing:` line — **what the band drain's texture-creation budget
 /// let through**.
 ///
@@ -3122,12 +3152,19 @@ impl super::App {
         // session in which no layer is ever switched off writes no line here
         // at all, and that silence is itself the reading.
         let releases = squallar_egui::release_ledger::totals_if_moved();
+        // **Only when the budget has done something.** An ordinary session
+        // never overruns a frame's action allowance and writes no line here at
+        // all, and that silence is the reading — see
+        // `crate::action_budget::Totals::progress`, which deliberately leaves
+        // `handled` out for exactly that reason.
+        let actions = crate::action_budget::totals_if_moved();
         if rasters.is_none()
             && uploads.is_none()
             && strips.is_none()
             && ground.is_none()
             && basemap.is_none()
             && releases.is_none()
+            && actions.is_none()
         {
             return;
         }
@@ -3217,6 +3254,9 @@ impl super::App {
         }
         if let Some(r) = releases {
             say_telemetry(loud, &layer_release_line(&r));
+        }
+        if let Some(a) = actions {
+            say_telemetry(loud, &action_budget_line(&a));
         }
     }
 

@@ -1498,6 +1498,39 @@ pub const WASM_INGEST_BUDGET_PER_FRAME: Duration = Duration::from_micros(500);
 pub const MOBILE_INGEST_BUDGET_PER_FRAME: Duration = Duration::from_micros(500);
 pub const DESKTOP_INGEST_BUDGET_PER_FRAME: Duration = Duration::from_millis(1);
 
+/// How long one frame may spend running the GUI actions its own pass emitted
+/// before the rest wait for the next one.
+///
+/// [`INGEST_BUDGET_PER_FRAME`]'s sibling, and it exists because the two loops
+/// beside each other were not held to the same rule. `App::process_gui_actions`
+/// is a `for action in actions` with no bound at all, so a frame that emits a
+/// burst runs the whole burst; the arrival drain three lines away, and the
+/// deferred drops beside it, each stop at a clock. Measured native scene A
+/// (`pan-zoom-2d`, one pane KTLX, all eighteen layers, 1920x1080) against the
+/// `frame worst:` latch: one frame spent **8,172 us of its 8,436 us in
+/// `post_handle`** — the frame on which every enabled layer's first fetch was
+/// built and spawned back to back.
+///
+/// Checked **between** actions and never before the first, so a frame's real
+/// spend is this budget plus one whole action and no frame can be starved of
+/// progress — [`INGEST_BUDGET_PER_FRAME`]'s terms verbatim. What is left is
+/// **queued in order** and the window is asked for another frame: an action is
+/// deferred, never dropped, and never reordered against another action that
+/// was also deferred.
+///
+/// A cascade for those constants' reason — wasm and mobile hold the scarcer
+/// thread — and it selects a value, never behaviour.
+#[cfg(target_arch = "wasm32")]
+pub const ACTION_BUDGET_PER_FRAME: Duration = WASM_ACTION_BUDGET_PER_FRAME;
+#[cfg(all(not(target_arch = "wasm32"), mobile))]
+pub const ACTION_BUDGET_PER_FRAME: Duration = MOBILE_ACTION_BUDGET_PER_FRAME;
+#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
+pub const ACTION_BUDGET_PER_FRAME: Duration = DESKTOP_ACTION_BUDGET_PER_FRAME;
+
+pub const WASM_ACTION_BUDGET_PER_FRAME: Duration = Duration::from_micros(500);
+pub const MOBILE_ACTION_BUDGET_PER_FRAME: Duration = Duration::from_micros(500);
+pub const DESKTOP_ACTION_BUDGET_PER_FRAME: Duration = Duration::from_millis(1);
+
 /// The **whole application's** loop allowance on a device that can tell us
 /// nothing about itself, in bytes. One pool, divided among the loops that want
 /// one, by squallar-app's `loop_pool`. The floor is exactly what one loop's span

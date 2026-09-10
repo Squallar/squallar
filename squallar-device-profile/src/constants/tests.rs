@@ -622,6 +622,9 @@ fn every_cfg_arm_selects_the_constant_named_for_its_device_class() {
         // budget's terms: wasm and mobile hold the scarcer thread and take
         // the tighter arm.
         "INGEST_BUDGET_PER_FRAME",
+        // The action allowance `App::process_gui_actions` holds its own loop
+        // to, on the ingest budget's terms and for the same reason.
+        "ACTION_BUDGET_PER_FRAME",
         // The building geometry row: one number on every arm, pinned until a
         // second machine is measured.
         "PRISM_GEOMETRY_BYTES",

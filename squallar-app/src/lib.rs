@@ -14,6 +14,10 @@ pub type WindowRef = Arc<Window>;
 
 pub mod app;
 
+/// The per-frame allowance `App::process_gui_actions` holds its own loop to,
+/// and the tail it carries when that allowance runs out.
+pub(crate) mod action_budget;
+
 /// Route the browser frame pump's basemap tiles through the rasterization
 /// worker. `squallar-web` calls this once at startup; `app::fetch` is
 /// `pub(crate)`, so the one item that crosses is named here rather than the

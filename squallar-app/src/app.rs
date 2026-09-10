@@ -603,6 +603,22 @@ pub struct App {
     /// phase, which is what makes a drain called from anywhere else unbounded
     /// exactly as it was.
     ingest_deadline: Option<web_time::Instant>,
+    /// How long one frame may spend running GUI actions before the rest wait
+    /// for the next one.
+    ///
+    /// A field rather than the constant read at the call site for one reason:
+    /// a test cannot make an action slow, and the property worth pinning —
+    /// exactly one action through, the tail deferred in order — is reachable
+    /// only from a budget that is already spent. `App::new` sets it from
+    /// [`squallar_device_profile::constants::ACTION_BUDGET_PER_FRAME`] and
+    /// nothing in the shipping app writes it again.
+    action_budget: std::time::Duration,
+    /// The GUI actions an earlier frame could not afford, in emission order.
+    ///
+    /// Empty on every frame that finished its list, which is every frame of an
+    /// ordinary session; see [`crate::action_budget`] for what fills it and
+    /// what the counters beside it mean.
+    action_queue: crate::action_budget::ActionQueue,
     loop_mgr: LoopDownloadManager,
     /// **Frame listings that landed this frame**, one entry per arrival.
     ///
@@ -1083,6 +1099,8 @@ impl App {
             mirror_plan_applied: None,
             mirror_plan_stamp: 0,
             ingest_deadline: None,
+            action_budget: squallar_device_profile::constants::ACTION_BUDGET_PER_FRAME,
+            action_queue: crate::action_budget::ActionQueue::default(),
             budgets,
             device_profile,
             loop_pool,
@@ -2499,7 +2517,44 @@ impl App {
     ) -> (web_time::Instant, crate::frame_ledger::DispatchCuts) {
         let mut overlay_renders: Vec<(usize, LayerId, fetch::OverlayRenderRequest)> = Vec::new();
 
+        // **The tail an earlier frame could not afford, ahead of this frame's
+        // own actions and in the order they were emitted.** Draining it first
+        // is what makes the budget a deferral rather than a reordering: the
+        // stream `handle_gui_action` sees is the stream it saw before, later.
+        // See `crate::action_budget`.
+        let mut work = self.action_queue.take();
         for action in actions {
+            // A layer's fetch ask stands until the fetch is spawned, so a
+            // deferred one is re-emitted on the very next frame; appending
+            // both would spawn the same download twice.
+            if crate::action_budget::would_duplicate(&work, &action) {
+                crate::action_budget::note_coalesced();
+                continue;
+            }
+            work.push_back(action);
+        }
+
+        // **The budget never spans a renumbering.** Every deferred action
+        // carrying a `pane_idx` names a pane by POSITION, and `PaneClosed` is
+        // the one action that moves them: a tail carried across it would ask
+        // for one pane's layer and be served with whichever pane took its
+        // number. So a frame that closes a pane runs its whole list, however
+        // long it is. The alternative — dropping the tail — is the one thing a
+        // budget may not do, and re-indexing a queued action needs state the
+        // action does not carry.
+        let renumbers = work
+            .iter()
+            .any(|action| matches!(action, GuiAction::PaneClosed { .. }));
+        // **Read only when there is a second action to protect.** A frame
+        // whose list is one action long — every ordinary frame — cannot
+        // overrun a budget that is never consulted before the first action, so
+        // it pays no clock read at all rather than one per frame.
+        let deadline =
+            (work.len() > 1 && !renumbers).then(|| web_time::Instant::now() + self.action_budget);
+        let mut ran_one = false;
+        let mut spent = false;
+
+        for action in work {
             if let GuiAction::RenderOverlay {
                 pane_idx,
                 overlay_kind,
@@ -2523,10 +2578,45 @@ impl App {
                         zoom,
                     },
                 ));
-            } else {
-                log::debug!("GUI action received: {}", action);
-                self.handle_gui_action(action, None);
+                // **Never budgeted and never deferred.** This arm handles
+                // nothing; the cost it stands for is in the dispatch below,
+                // which is its own `post` cut with its own decomposition.
+                //
+                // And queueing one would be worse than useless:
+                // `deduplicate_overlay_renders` keys on
+                // `(layer, zoom, generation, width, height)` and the FIRST
+                // request under a key wins, so a carried-over ask would beat
+                // the fresh re-emission behind it and place the picture at a
+                // viewport one frame old — a visibly wrong crop mid-pan, in
+                // exchange for a frame the raster would have had anyway. An
+                // undispatched request carries no in-flight mark and is
+                // re-asked next frame by construction; see
+                // `Self::dispatch_overlay_renders`.
+                continue;
             }
+            if spent {
+                self.action_queue.defer(action);
+                continue;
+            }
+            // Checked BETWEEN actions and never before the first, so the
+            // frame's real spend is this budget plus one whole action and no
+            // frame can be starved of progress — `INGEST_BUDGET_PER_FRAME`'s
+            // terms verbatim.
+            if ran_one && deadline.is_some_and(|deadline| web_time::Instant::now() >= deadline) {
+                spent = true;
+                crate::action_budget::note_bite();
+                // What is left raises no frame need of its own, so the ask is
+                // made here rather than left to an unrelated repaint — the
+                // reason `ingest_budget_spent` posts one too. `push_back_claim`
+                // names the claim.
+                notify_redraw(&self.window);
+                self.action_queue.defer(action);
+                continue;
+            }
+            ran_one = true;
+            crate::action_budget::note_handled();
+            log::debug!("GUI action received: {}", action);
+            self.handle_gui_action(action, None);
         }
 
         let handled = web_time::Instant::now();
