@@ -12,25 +12,49 @@
 //! this layer's memory, which is the correct reading of a real cost.
 
 use std::alloc::{GlobalAlloc, Layout};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::cell::Cell;
 
 /// Delegates to the shipped counter so `squallar_alloc::live_bytes()` reads a
 /// real heap here, and counts the **grant calls** on top, which that counter
 /// does not expose.
 struct CountingCalls;
 
-static GRANTS: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// **Per thread, not per process.** `cargo test` runs a binary's tests on
+    /// parallel threads, and a process-wide counter read around one call
+    /// returns that call's grants plus whatever a neighbouring test happened
+    /// to allocate while it ran -- measured here as 4,950.75 grants "per
+    /// call" over 20 calls, a figure that is not even an integer. "Allocations
+    /// per call" means the calling thread's, so this counts the calling
+    /// thread's.
+    ///
+    /// `const`-initialised and holding a `Cell<u64>`, which has no destructor:
+    /// this is read and written from inside the global allocator, so it must
+    /// not itself allocate or register a TLS destructor. `try_with` because a
+    /// thread tearing down may have dropped its TLS already, and an allocator
+    /// that panics there would take the process with it.
+    static GRANTS: Cell<u64> = const { Cell::new(0) };
+}
+
+fn granted() {
+    let _ = GRANTS.try_with(|g| g.set(g.get().wrapping_add(1)));
+}
+
+/// This thread's grants so far.
+fn grants() -> u64 {
+    GRANTS.try_with(Cell::get).unwrap_or(0)
+}
 
 unsafe impl GlobalAlloc for CountingCalls {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        GRANTS.fetch_add(1, Relaxed);
+        granted();
         unsafe { squallar_alloc::Counting.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { squallar_alloc::Counting.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        GRANTS.fetch_add(1, Relaxed);
+        granted();
         unsafe { squallar_alloc::Counting.realloc(ptr, layout, new_size) }
     }
 }
@@ -124,6 +148,15 @@ fn a_feed_that_drops_nothing_still_reserves_exactly_what_it_keeps() {
 /// **The saving, and the price, in one place.** Not an assertion — a reading,
 /// printed with its denominators so the figure in the commit message is
 /// reproducible.
+///
+/// **Run it with `--test-threads=1` to believe the `live_bytes` column.**
+/// Grants are this thread's and are immune to a neighbouring test (they come
+/// back identical either way), but `squallar_alloc::live_bytes` is a
+/// process-wide level: read around a call while another test in this binary
+/// is allocating, its delta is that test's heap as much as this one's, and it
+/// goes as far wrong as a *negative* delta on a call that only allocates.
+/// The capacity and buffer columns are properties of the returned `Vec` and
+/// hold under any scheduling.
 #[test]
 fn reservation_figures() {
     const REPEATS: u32 = 20;
@@ -140,20 +173,21 @@ fn reservation_figures() {
         drop(squallar_overlays::nws::alert::parse_alerts(&json));
 
         let before_bytes = squallar_alloc::live_bytes().expect("the counter is installed");
-        let before_grants = GRANTS.load(Relaxed);
+        let before_grants = grants();
         let start = std::time::Instant::now();
         let mut alerts = squallar_overlays::nws::alert::parse_alerts(&json);
         for _ in 1..REPEATS {
             alerts = squallar_overlays::nws::alert::parse_alerts(&json);
         }
         let elapsed = start.elapsed() / REPEATS;
-        let after_grants = GRANTS.load(Relaxed);
+        let after_grants = grants();
         let after_bytes = squallar_alloc::live_bytes().expect("the counter is installed");
 
         println!(
             "offered {offered} features, kept {} alerts: \
              capacity {} rows, buffer {} B, content {} B, slack {} B; \
-             live_bytes {} -> {} (delta {} B, whole round incl. strings/rings); \
+             live_bytes {} -> {} (delta {} B, whole round incl. strings/rings, \
+             trustworthy only under --test-threads=1); \
              grants over {REPEATS} calls {}; {:?} per call",
             alerts.len(),
             alerts.capacity(),
