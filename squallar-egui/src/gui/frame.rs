@@ -423,6 +423,12 @@ impl Gui {
     /// Check timers and emit fetch actions for auto-polling radar scans, NWS
     /// alerts, and SPC discussions.
     pub(super) fn check_auto_polls(&mut self, actions: &mut Vec<GuiAction>) {
+        // **Before anything asks what is due.** A layer whose request is scoped
+        // to the map extent is stale when the map has moved somewhere its round
+        // never asked about, and this is where it is told the map moved. The
+        // last completed frame's extents are what it publishes; the panes of
+        // THIS frame have not drawn yet.
+        self.overlays.commit_viewport();
         // The radar layer answers the same question every other polling layer
         // answers — "may an automatic round start now?" — through the one gate
         // `auto_fetch_delay` is: the poll clock and the failure ladder, taken

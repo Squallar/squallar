@@ -523,7 +523,7 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
                     obs_time: String::new(),
                 }],
                 failed_networks: Vec::new(),
-                networks_asked: 1,
+                networks: vec!["OK"],
             },
         ))),
         other => panic!(

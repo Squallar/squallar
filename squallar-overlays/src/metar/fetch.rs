@@ -35,6 +35,8 @@ use std::cell::{Cell, RefCell};
 use serde::Deserialize;
 use serde_json::Value;
 
+use futures::stream::StreamExt;
+
 use super::networks;
 use super::types::{CloudLayer, FlightCategory, MetarOb, Visibility, WindDir};
 use crate::fetch_policy::FetchError;
@@ -190,16 +192,24 @@ pub struct MetarRound {
     pub observations: Vec<MetarOb>,
     /// The state networks that did not answer, and why. Empty on a whole round.
     pub failed_networks: Vec<(String, FetchError)>,
-    /// How many networks the viewport asked for at all — the denominator the
-    /// failures are measured against, and not a number the survivors can reveal.
-    pub networks_asked: usize,
+    /// **The networks this round asked for** — the denominator the failures are
+    /// measured against, and not a number the survivors can reveal.
+    ///
+    /// The list and not a count, because it is also what the layer holding this
+    /// round compares the map's extent against
+    /// ([`networks::viewport_reaches_beyond`]). It was a count, and a count
+    /// taken after a cap had already dropped thirty-six states: the round then
+    /// reported the number it had kept as the number it had wanted, so a map
+    /// blank over two thirds of the country rendered as `expected: 12,
+    /// missing: 0`.
+    pub networks: Vec<&'static str>,
 }
 
 impl MetarRound {
     /// The layer-agnostic report the UI renders.
     pub fn completeness(&self) -> crate::fetch_policy::DataCompleteness {
         crate::fetch_policy::DataCompleteness {
-            expected: self.networks_asked,
+            expected: self.networks.len(),
             partial: 0,
             missing: self.failed_networks.len(),
             parts_requested: 0,
@@ -215,6 +225,15 @@ impl MetarRound {
     }
 }
 
+/// **What one network's request came back with**, and which network it was:
+/// the observations it parsed and how many of its cells were present but
+/// unparseable, or why it did not answer.
+///
+/// The state travels with the answer because the answers arrive in completion
+/// order — see [`networks::MAX_IN_FLIGHT`] — so there is no position left to
+/// pair them by.
+type NetworkAnswer = (&'static str, Result<(Vec<MetarOb>, u32), FetchError>);
+
 /// One request per state network the viewport overlaps, concurrently. A failed
 /// network is skipped, not fatal, unless every one fails — and a skipped one is
 /// reported, see [`MetarRound`].
@@ -229,7 +248,7 @@ pub async fn fetch_current_metars(
         return Ok(MetarRound {
             observations: Vec::new(),
             failed_networks: Vec::new(),
-            networks_asked: 0,
+            networks: Vec::new(),
         });
     }
     log::info!(
@@ -237,33 +256,64 @@ pub async fn fetch_current_metars(
         states.len()
     );
 
-    let requests = states.iter().map(|state| {
-        let url = sources.metar_state_url(state);
-        async move {
-            let response = client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| {
-                    FetchError::from_transport(&e, format!("{state}: request failed: {e}"))
-                })?
-                .error_for_status()
-                .map_err(|e| FetchError::from_transport(&e, format!("{state}: {e}")))?;
-            let body = squallar_source::http::body_to_string(response)
-                .await
-                .map_err(|e| {
-                    FetchError::from_transport(&e, format!("{state}: body read failed: {e}"))
-                })?;
-            parse_currents(&body).map_err(|e| FetchError::transient(format!("{state}: {e}")))
-        }
-    });
+    // **Collected, not left lazy.** A `Map` iterator carries its closure, and
+    // `stream::iter` over one makes the closure part of the stream's type,
+    // which the round's own `Box::pin` then cannot prove `'static` over — the
+    // compiler asks the closure to be general over lifetimes it was never
+    // written for. Building the futures here leaves the stream holding
+    // futures and no closure at all.
+    let requests: Vec<_> = states
+        .iter()
+        .copied()
+        .map(|state| {
+            let url = sources.metar_state_url(state);
+            async move {
+                let outcome = async {
+                    let response = client
+                        .get(&url)
+                        .send()
+                        .await
+                        .map_err(|e| {
+                            FetchError::from_transport(&e, format!("{state}: request failed: {e}"))
+                        })?
+                        .error_for_status()
+                        .map_err(|e| FetchError::from_transport(&e, format!("{state}: {e}")))?;
+                    let body = squallar_source::http::body_to_string(response)
+                        .await
+                        .map_err(|e| {
+                            FetchError::from_transport(
+                                &e,
+                                format!("{state}: body read failed: {e}"),
+                            )
+                        })?;
+                    parse_currents(&body)
+                        .map_err(|e| FetchError::transient(format!("{state}: {e}")))
+                }
+                .await;
+                // The state travels with its own answer: the results arrive in
+                // completion order, so there is no position left to pair them by.
+                (state, outcome)
+            }
+        })
+        .collect();
 
-    let results = futures::future::join_all(requests).await;
+    // **Six at a time, not all of them.** `join_all` starts every request at
+    // once, so a round holds every body it has received so far and the peak is
+    // the whole round — 48 networks of JSON resident together on a continental
+    // view, measured at 4.4x the streamed round's transient, with one of the
+    // 48 refused for good measure. Streaming holds the bodies of the requests
+    // actually in flight and moves the same total transfer. The round is still
+    // concurrent: a serial round would pay 48 round trips end to end. See
+    // `networks::MAX_IN_FLIGHT` for the figures.
+    let results: Vec<NetworkAnswer> = futures::stream::iter(requests)
+        .buffer_unordered(networks::MAX_IN_FLIGHT)
+        .collect()
+        .await;
 
     let mut all = Vec::new();
     let mut rejected_total = 0u32;
     let mut failed_networks: Vec<(String, FetchError)> = Vec::new();
-    for (state, result) in states.iter().zip(results) {
+    for (state, result) in results {
         match result {
             Ok((obs, rejected)) => {
                 all.extend(obs);
@@ -275,6 +325,9 @@ pub async fn fetch_current_metars(
             }
         }
     }
+    // Completion order is arrival order and nothing else; the report names
+    // states, so it is ordered like the table the states came from.
+    failed_networks.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Only a *total* failure is a failure at all: one state network being down
     // still leaves observations to draw. When every one of them failed, the
@@ -314,7 +367,7 @@ pub async fn fetch_current_metars(
     Ok(MetarRound {
         observations: all,
         failed_networks,
-        networks_asked: states.len(),
+        networks: states,
     })
 }
 

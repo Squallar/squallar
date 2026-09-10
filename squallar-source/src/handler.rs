@@ -864,10 +864,44 @@ pub trait SourceHandler: Send {
         let _ = by;
     }
 
+    /// **The map is showing `view`.** Called with the extent the panes drew,
+    /// on the frame it changes and on the first frame it holds still — see
+    /// `OverlayRegistry::commit_viewport`, which is where those two frames are
+    /// picked out.
+    ///
+    /// Default: nothing. Only a layer whose *request* is scoped to the extent
+    /// has anything to do with this, and METAR is the one such layer in the
+    /// tree. What it is for is [`Self::round_covers_viewport`].
+    fn note_viewport(&mut self, view: &squallar_geo::GeoBounds, motion: ViewportMotion) {
+        let _ = (view, motion);
+    }
+
+    /// **Whether the round this layer is holding answers the extent the map is
+    /// showing now.**
+    ///
+    /// `true` for every layer whose request is not a function of the extent —
+    /// a national feed answers the same bytes wherever the map is — and that
+    /// is the default.
+    ///
+    /// A viewport-scoped layer answers `false` when the map has moved somewhere
+    /// its round never asked about, and [`Self::auto_fetch_delay`] then drops
+    /// the poll clock: what the layer holds is not a fresher-or-staler version
+    /// of the right answer, it is the answer to a different question. It does
+    /// **not** drop the failure ladder, which is what keeps a moving map over a
+    /// dead origin from becoming a request storm.
+    fn round_covers_viewport(&self) -> bool {
+        true
+    }
+
     /// How long until an **automatic** fetch may start; `None` for a layer that
     /// does not auto-poll, or one already in flight. Two terms, whichever is
     /// later: the poll clock `fetch_time + interval`, and the backoff from
     /// [`crate::fetch_policy`].
+    ///
+    /// The poll clock is about *staleness*, so it holds only while the round is
+    /// still an answer to the current question; see
+    /// [`Self::round_covers_viewport`]. The backoff is about the origin's
+    /// health and holds either way.
     fn auto_fetch_delay(&self) -> Option<std::time::Duration> {
         let interval = std::time::Duration::from_secs(self.auto_poll_interval()?);
         if self.is_fetching() {
@@ -878,6 +912,13 @@ pub trait SourceHandler: Send {
         let by_clock = self.fetch_time().map_or(std::time::Duration::ZERO, |t| {
             interval.saturating_sub(t.elapsed())
         });
+        // Asked only when the clock would otherwise hold the round back, which
+        // is the one case where the answer can change anything.
+        let by_clock = if by_clock.is_zero() || self.round_covers_viewport() {
+            by_clock
+        } else {
+            std::time::Duration::ZERO
+        };
         let by_backoff = retry.map_or(std::time::Duration::ZERO, |r| r.backoff_remaining(interval));
         Some(by_clock.max(by_backoff))
     }
@@ -1474,6 +1515,23 @@ pub trait SourceHandler: Send {
     fn resident_source_bytes(&self) -> u64 {
         0
     }
+}
+
+/// **Whether the map is being moved, or has come to rest** — the two frames
+/// [`SourceHandler::note_viewport`] is called on.
+///
+/// A viewport-scoped layer must not start a round on `Moving`. A gesture is
+/// dozens of frames and every one of them shows a different extent, so a round
+/// started on one is fetched for an extent the gesture has already left, and
+/// the frame after it would start another: a single zoom-out becomes a request
+/// per frame of it. `Settled` is one frame per gesture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewportMotion {
+    /// The extent changed on this frame.
+    Moving,
+    /// The extent is what it was on the previous frame, and this is the first
+    /// frame that has been true since it last changed.
+    Settled,
 }
 
 pub struct FetchConfig {

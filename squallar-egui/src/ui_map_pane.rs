@@ -1018,6 +1018,11 @@ pub(super) fn render_pane_map_content(
 
         let screen_rect = ui.max_rect();
         let viewport_bounds = viewport_geo_bounds(projector, screen_rect);
+        // **What this pane is showing, told to the layers whose REQUEST is a
+        // function of it.** Folded into the frame's union here and published
+        // once, at the head of the next frame, beside the auto-poll check that
+        // reads it — see `OverlayRegistry::commit_viewport`.
+        ctx.overlays.note_viewport(&viewport_bounds);
         let qzoom = current_quantized_zoom(zoom);
         // As much overdraw as the ladder's rung asks for and the adapter's
         // texture limit allows; egui only `debug_assert!`s the bound, so

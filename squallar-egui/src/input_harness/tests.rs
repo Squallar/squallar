@@ -13368,14 +13368,14 @@ fn a_station(id: &str, lat: f64, lon: f64) -> squallar_overlays::metar::types::M
 /// Feed observations in through the production ingest path.
 fn ingest_metar(h: &mut InputHarness, obs: Vec<squallar_overlays::metar::types::MetarOb>) {
     use squallar_overlays::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
-    let networks_asked = 1;
+    let networks = vec!["OK"];
     h.gui_mut().overlays.apply_fetch_result(
         OverlayFetchResult {
             kind: known::METAR,
             data: OverlayRegistry::metar_payload(squallar_overlays::metar::fetch::MetarRound {
                 observations: obs,
                 failed_networks: Vec::new(),
-                networks_asked,
+                networks,
             }),
         },
         &PaneRef::bare(0),

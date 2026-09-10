@@ -51,14 +51,20 @@ fn station(id: &str, lat: f64, lon: f64) -> MetarOb {
 
 /// A round as the fetch builds one, delivered through the door the app's
 /// drain uses.
-fn deliver(registry: &mut OverlayRegistry, stations: &[(&str, f64, f64)]) {
+///
+/// `network` is the one state network the round asked for. Nothing here reads
+/// it — it is the denominator `MetarRound::failed_networks` is measured
+/// against, and these legs deliver whole rounds — but naming the network the
+/// stations actually sit in keeps the second leg's "different network" true of
+/// the fixture and not just of its comment.
+fn deliver(registry: &mut OverlayRegistry, network: &'static str, stations: &[(&str, f64, f64)]) {
     let round = MetarRound {
         observations: stations
             .iter()
             .map(|&(id, lat, lon)| station(id, lat, lon))
             .collect(),
         failed_networks: Vec::new(),
-        networks_asked: 1,
+        networks: vec![network],
     };
     registry.apply_fetch_result(
         OverlayFetchResult {
@@ -98,6 +104,7 @@ fn a_round_that_changes_the_drawn_set_moves_the_generation() {
 
     deliver(
         &mut registry,
+        "OK",
         &[("K001", 35.0, -97.0), ("K002", 36.0, -98.0)],
     );
     let first = drawn(&registry);
@@ -113,6 +120,7 @@ fn a_round_that_changes_the_drawn_set_moves_the_generation() {
     let after_first = registry.data_generation(&id);
     deliver(
         &mut registry,
+        "IL",
         &[
             ("K003", 41.0, -87.0),
             ("K004", 42.0, -88.0),
@@ -162,6 +170,7 @@ fn the_doors_that_change_no_drawn_set_leave_the_generation_alone() {
     let id = known::METAR;
     deliver(
         &mut registry,
+        "OK",
         &[("K001", 35.0, -97.0), ("K002", 36.0, -98.0)],
     );
 

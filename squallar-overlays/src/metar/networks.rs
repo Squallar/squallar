@@ -37,18 +37,38 @@ impl StateNetwork {
     pub fn intersects(&self, view: &GeoBounds) -> bool {
         self.bounds().intersects(view)
     }
-
-    /// Degrees, not km. Ranks networks; never decides membership.
-    fn centre_distance(&self, lat: f64, lon: f64) -> f64 {
-        let clat = (self.min_lat + self.max_lat) / 2.0;
-        let clon = (self.min_lon + self.max_lon) / 2.0;
-        ((clat - lat).powi(2) + (clon - lon).powi(2)).sqrt()
-    }
 }
 
-/// Transfer cap, not a correctness rule. A zoomed-out map overlaps all of
-/// [`NETWORKS`]: 54 requests, ~3.9 MB, at a zoom where the plot is unreadable.
-pub const MAX_NETWORKS: usize = 12;
+/// **How many of the viewport's networks are in flight at once** — a bound on
+/// what one round holds in memory, and never on what it asks for.
+///
+/// A continental view overlaps 48 of the 54 networks: 48 requests and 3.4 MB
+/// of JSON. Under `futures::future::join_all` nothing starts a request late,
+/// so every body that has arrived is live at the same instant and the round's
+/// transient is the whole round. Measured 2026-09-10, one continental round,
+/// live-heap peak over the pre-round level (`squallar_alloc`):
+///
+/// ```text
+///                        every request at once     six at a time
+///   local fixture,
+///   48 x 71,799 B body        8,534,825 B           1,923,557 B
+///   the real IEM              6,079,110 B           2,044,989 B
+/// ```
+///
+/// Same total transfer, same 2,640 observations held either way (1,620,288 B
+/// of them). The bodies are the whole difference.
+///
+/// **And the unbounded shape drops networks.** On the real-IEM leg above,
+/// 48 simultaneous requests came back with `KS_ASOS` refused — a state blank
+/// on the map for no reason but the shape of the round. The bounded leg lost
+/// none.
+///
+/// Six rather than one because the round is latency-bound: the requests are
+/// independent and a strictly serial round pays 48 round trips end to end.
+/// What six costs against all-at-once is under a second of *data* latency on a
+/// continental round (measured 872 ms and 1,729 ms against 483 ms; two runs
+/// and one, so the direction is measured and the magnitude is not).
+pub const MAX_IN_FLIGHT: usize = 6;
 
 /// Stands in when the first overlay fetch precedes the first rendered frame, so
 /// there is no map extent yet. Fetching nothing looks like an outage.
@@ -447,20 +467,39 @@ pub const NETWORKS: &[StateNetwork] = &[
     },
 ];
 
-/// Nearest-first, capped at [`MAX_NETWORKS`]. Ordering matters only because of
-/// the cap.
+/// **Every network the viewport overlaps**, in [`NETWORKS`] order.
+///
+/// There is no cap on the count. There was one — the twelve nearest the
+/// viewport centre — and a continental view overlaps 48 networks, so it
+/// dropped thirty-six states' worth of stations off the map with nothing in
+/// the tree able to say so: the round reported the count it had *kept* as the
+/// number it asked for, so `MetarRound::completeness` read
+/// `expected: 12, missing: 0` over a map blank from the Rockies to the
+/// Atlantic. A user reported it as missing stations, which is what it was.
+///
+/// What the cap was protecting against is real and is now bounded where it
+/// belongs: how much of a round is resident at once, by
+/// [`MAX_IN_FLIGHT`], rather than how much of the country is on the map.
 pub fn networks_for_viewport(view: &GeoBounds) -> Vec<&'static str> {
-    let clat = (view.min_lat + view.max_lat) / 2.0;
-    let clon = (view.min_lon + view.max_lon) / 2.0;
+    NETWORKS
+        .iter()
+        .filter(|n| n.intersects(view))
+        .map(|n| n.state)
+        .collect()
+}
 
-    let mut hits: Vec<&StateNetwork> = NETWORKS.iter().filter(|n| n.intersects(view)).collect();
-    hits.sort_by(|a, b| {
-        a.centre_distance(clat, clon)
-            .partial_cmp(&b.centre_distance(clat, clon))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    hits.truncate(MAX_NETWORKS);
-    hits.into_iter().map(|n| n.state).collect()
+/// **Does `view` reach a network `held` never asked for?** — the one question
+/// that makes a viewport-scoped round stale for a reason other than its age.
+///
+/// Allocates nothing and stops at the first miss, because it is asked on the
+/// frame the map moves. `held` is what the round on the layer actually
+/// requested, not what the current view wants: a round is only ever stale
+/// against the view, and comparing against a recomputed want would compare a
+/// value with itself.
+pub fn viewport_reaches_beyond(view: &GeoBounds, held: &[&'static str]) -> bool {
+    NETWORKS
+        .iter()
+        .any(|n| n.intersects(view) && !held.contains(&n.state))
 }
 
 #[cfg(test)]
@@ -492,11 +531,6 @@ mod tests {
             ["OK", "TX"],
             "only Oklahoma and the Texas panhandle reach this box",
         );
-        assert!(
-            states.len() < MAX_NETWORKS,
-            "the result must be smaller than the cap, or the cap is doing the \
-             filtering and this test proves nothing",
-        );
         for far in ["ME", "FL", "WA", "PR", "AS"] {
             assert!(
                 !states.contains(&far),
@@ -512,27 +546,80 @@ mod tests {
         assert!(states.contains(&"TX"), "got {states:?}");
     }
 
+    /// **The user's screenshot, as an assertion.** A continental view asks for
+    /// every network it overlaps, and the four corners of the country are in
+    /// it. Under the old cap this answered twelve: the twelve nearest the
+    /// centre of the map, which is exactly the central-third-only picture that
+    /// was reported.
     #[test]
-    fn a_continental_viewport_is_capped() {
-        let states = networks_for_viewport(&view(24.0, 50.0, -125.0, -66.0));
-        assert!(
-            states.len() <= MAX_NETWORKS,
-            "{} networks selected, cap is {MAX_NETWORKS}",
+    fn a_continental_viewport_asks_for_every_network_it_overlaps() {
+        let continent = view(24.0, 50.0, -125.0, -66.0);
+        let states = networks_for_viewport(&continent);
+        let overlapping = NETWORKS.iter().filter(|n| n.intersects(&continent)).count();
+        assert_eq!(
             states.len(),
+            overlapping,
+            "the selection must be the overlap and nothing less: {states:?}",
         );
-        assert!(!states.is_empty());
+        assert!(
+            overlapping > 40,
+            "premise: a continental view really does overlap most of the \
+             table, or this test is asserting nothing ({overlapping})",
+        );
+        for corner in ["CA", "WA", "FL", "ME", "TX", "MN"] {
+            assert!(
+                states.contains(&corner),
+                "{corner} is on the continental map: {states:?}",
+            );
+        }
     }
 
     #[test]
-    fn the_cap_keeps_the_networks_nearest_the_viewport_centre() {
+    fn a_narrow_viewport_still_asks_for_no_more_than_it_overlaps() {
         let states = networks_for_viewport(&view(30.0, 45.0, -108.0, -88.0));
-        assert_eq!(states.len(), MAX_NETWORKS);
         assert!(states.contains(&"KS"), "got {states:?}");
         assert!(
             !states.contains(&"AS"),
-            "American Samoa is alphabetically 4th but 8,000 km away: {states:?}",
+            "American Samoa is 8,000 km away: {states:?}",
         );
-        assert_eq!(states[0], "KS", "nearest-first ordering: {states:?}");
+        assert!(
+            !states.contains(&"CA") && !states.contains(&"ME"),
+            "neither coast reaches this box: {states:?}",
+        );
+    }
+
+    /// The refetch predicate: what a round holds, against where the map now is.
+    #[test]
+    fn a_view_reaching_a_network_the_round_never_asked_for_is_beyond_it() {
+        let plains = view(33.0, 40.0, -103.0, -94.0);
+        let held = networks_for_viewport(&plains);
+        assert!(
+            !viewport_reaches_beyond(&plains, &held),
+            "the very view a round was fetched for cannot outrun it: {held:?}",
+        );
+        // A map that shrinks inside what the round holds asks for a subset.
+        let inside = view(33.2, 39.8, -102.5, -94.5);
+        assert!(
+            networks_for_viewport(&inside).len() < held.len(),
+            "premise: this is the subset case",
+        );
+        assert!(!viewport_reaches_beyond(&inside, &held));
+
+        // And a pan that keeps the very same ask.
+        let over_oklahoma = view(34.3, 36.3, -98.3, -96.3);
+        let ok_held = networks_for_viewport(&over_oklahoma);
+        let panned = view(34.4, 36.4, -98.2, -96.2);
+        assert_eq!(
+            networks_for_viewport(&panned),
+            ok_held,
+            "premise: the pan asks for the very same networks",
+        );
+        assert!(!viewport_reaches_beyond(&panned, &ok_held));
+        // The zoom out the user did.
+        assert!(
+            viewport_reaches_beyond(&view(24.0, 50.0, -125.0, -66.0), &held),
+            "the continent reaches forty networks this round never asked for",
+        );
     }
 
     #[test]

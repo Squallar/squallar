@@ -214,6 +214,24 @@ pub(crate) struct MetarHandler {
     /// and shared by every dispatch since — see [`Self::prepare_job`].
     pub(crate) obs_memo:
         crate::render::signature_memo::BuiltMemo<Arc<Vec<crate::metar::types::MetarOb>>>,
+    /// **The extent the map last drew**, and what the next round is fetched
+    /// for. `None` until a frame has drawn a map at all.
+    viewport: Option<squallar_geo::GeoBounds>,
+    /// **The state networks the round on `state.data` asked for**; `None`
+    /// before any round has landed.
+    ///
+    /// This is the only layer in the tree whose *request* is a function of the
+    /// map extent, and nothing in the tree recorded which extent a round was
+    /// fetched for. So zooming out after enabling the layer left the narrow
+    /// round's stations on a continental map for up to a whole poll interval —
+    /// five minutes of a map missing most of its stations, which is what a user
+    /// reported.
+    round_networks: Option<Vec<&'static str>>,
+    /// [`Self::round_covers_viewport`]'s answer, computed when the map moves
+    /// rather than when the question is asked: the question is asked on every
+    /// frame by the auto-poll walk, and the answer only changes when a round
+    /// lands or the extent moves.
+    round_covers: bool,
 }
 
 impl MetarHandler {
@@ -227,7 +245,40 @@ impl MetarHandler {
             obs_memo: crate::render::signature_memo::BuiltMemo::new(
                 crate::render::footprint::metar_job,
             ),
+            viewport: None,
+            round_networks: None,
+            round_covers: true,
         }
+    }
+
+    /// **The extent the next round is fetched for.**
+    ///
+    /// The extent this layer was told about, which is the one its due-ness was
+    /// decided against — see
+    /// [`OverlayHandler::round_covers_viewport`]. Fetching for a different
+    /// extent than the one that made the round stale is how a refetch becomes
+    /// a loop: the answer would arrive still not covering the map, and the
+    /// layer would be due again on the next frame, for ever. `ctx.viewport` is
+    /// the same extent one dispatch later, and stands in until a frame has
+    /// drawn a map at all.
+    fn round_extent(&self, ctx: &FetchConfig) -> squallar_geo::GeoBounds {
+        self.viewport
+            .or(ctx.viewport)
+            .unwrap_or(crate::metar::networks::DEFAULT_VIEWPORT)
+    }
+
+    /// Recompute [`Self::round_covers`] from the extent and the round now held.
+    ///
+    /// A round that has not landed yet cannot be outrun — the poll clock
+    /// already has such a layer due — so the answer there is `true` and the
+    /// network table is not walked at all.
+    fn recheck_coverage(&mut self) {
+        self.round_covers = match (&self.round_networks, &self.viewport) {
+            (Some(held), Some(view)) => {
+                !crate::metar::networks::viewport_reaches_beyond(view, held)
+            }
+            _ => true,
+        };
     }
 
     /// Must run after every `set_data`: `MapPoint::id` indexes `state.data`.
@@ -329,6 +380,32 @@ impl OverlayHandler for MetarHandler {
         Some(300)
     }
 
+    /// **The one viewport-scoped layer in the tree**, so the one that has
+    /// anything to do with this.
+    ///
+    /// The extent is taken on every call — it is what the next round is
+    /// fetched for — and the coverage question is asked only once the map has
+    /// come to rest. A round started mid-gesture would be fetched for an
+    /// extent the gesture had already left, and the next frame would start
+    /// another one.
+    fn note_viewport(
+        &mut self,
+        view: &squallar_geo::GeoBounds,
+        motion: squallar_source::handler::ViewportMotion,
+    ) {
+        self.viewport = Some(*view);
+        match motion {
+            squallar_source::handler::ViewportMotion::Moving => self.round_covers = true,
+            squallar_source::handler::ViewportMotion::Settled => self.recheck_coverage(),
+        }
+    }
+
+    /// Cached — see [`Self::round_covers`]. The walk that asks this asks it of
+    /// every polling layer on every frame.
+    fn round_covers_viewport(&self) -> bool {
+        self.round_covers
+    }
+
     fn clickable_items<'a>(&'a self, _pane: &PaneRef<'_>) -> Vec<ClickableItem<'a>> {
         Vec::new()
     }
@@ -342,6 +419,11 @@ impl OverlayHandler for MetarHandler {
         if !self.state.release_data() {
             return false;
         }
+        // The round went with the data: there is nothing left to be outrun,
+        // and a set kept past its observations would let the next pane to
+        // switch this layer on inherit a coverage claim over an empty map.
+        self.round_networks = None;
+        self.round_covers = true;
         self.rebuild_points();
         // The built inputs were made from the data that just went away, and
         // nothing dispatches this layer any more, so no later `get_or_build`
@@ -366,6 +448,11 @@ impl OverlayHandler for MetarHandler {
             Ok(round) => {
                 log::info!("Received {} METAR observations", round.observations.len());
                 let coverage = round.completeness();
+                // **What the layer now holds an answer for.** Recorded from the
+                // round rather than recomputed from the extent: the extent may
+                // have moved again while the round was in flight, and a
+                // recomputed set would claim coverage the bytes do not have.
+                self.round_networks = Some(round.networks);
                 let items = round
                     .observations
                     .into_iter()
@@ -375,9 +462,13 @@ impl OverlayHandler for MetarHandler {
                     })
                     .collect();
                 self.state.set_data_with_coverage(items, coverage);
+                self.recheck_coverage();
             }
             Err(e) => {
                 log::error!("METAR fetch failed: {e}");
+                // The held round is unchanged, so what it covers is unchanged:
+                // a failed widening leaves the layer due, and the failure
+                // ladder — not the poll clock — is what paces the retry.
                 self.state.record_failure(&e);
             }
         }
@@ -406,9 +497,7 @@ impl OverlayHandler for MetarHandler {
             }
         };
         let sources = ctx.sources.clone();
-        let viewport = ctx
-            .viewport
-            .unwrap_or(crate::metar::networks::DEFAULT_VIEWPORT);
+        let viewport = self.round_extent(ctx);
         log::info!("Fetching METAR observations for {viewport:?}");
         vec![FetchTask {
             kind: known::METAR,
@@ -937,5 +1026,512 @@ mod prepare_memo_tests {
         let handler = MetarHandler::new();
         assert!(handler.prepare_job(&ctx(7.0), &PaneRef::bare(0)).is_none());
         assert_eq!(handler.obs_memo.builds.get(), 0);
+    }
+}
+
+/// **The user's sequence**: zoom in, switch METAR on, zoom out.
+///
+/// Reported 2026-09-10 as "most of the metar sites are missing" — a continental
+/// map carrying stations over the central third of the country and nothing on
+/// either coast. Two defects made that picture, both of them here:
+///
+///   * nothing recorded which extent a round was fetched for, so the narrow
+///     round stayed on the map for the rest of its five-minute interval; and
+///   * the round was capped at the twelve networks nearest the middle of the
+///     map, and reported the twelve it kept as the number it had asked for, so
+///     the completeness row over a map missing thirty-six states read
+///     `expected: 12, missing: 0`.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod viewport_tests {
+    use super::*;
+    use crate::metar::networks::{NETWORKS, networks_for_viewport};
+    use crate::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
+    use squallar_geo::GeoBounds;
+    use squallar_source::handler::ViewportMotion;
+
+    fn view(min_lat: f64, max_lat: f64, min_lon: f64, max_lon: f64) -> GeoBounds {
+        GeoBounds {
+            min_lat,
+            max_lat,
+            min_lon,
+            max_lon,
+        }
+    }
+
+    /// KTLX padded by a degree — the zoomed-in map the layer is switched on at.
+    fn oklahoma() -> GeoBounds {
+        view(34.3, 36.3, -98.3, -96.3)
+    }
+
+    /// The same map nudged, still inside Oklahoma and the Texas panhandle.
+    fn oklahoma_nudged() -> GeoBounds {
+        view(34.4, 36.4, -98.2, -96.2)
+    }
+
+    /// The screenshot: the lower 48 plus a margin.
+    fn continent() -> GeoBounds {
+        view(24.0, 50.0, -125.0, -66.0)
+    }
+
+    fn lerp(a: &GeoBounds, b: &GeoBounds, t: f64) -> GeoBounds {
+        let mix = |x: f64, y: f64| x + (y - x) * t;
+        GeoBounds {
+            min_lat: mix(a.min_lat, b.min_lat),
+            max_lat: mix(a.max_lat, b.max_lat),
+            min_lon: mix(a.min_lon, b.min_lon),
+            max_lon: mix(a.max_lon, b.max_lon),
+        }
+    }
+
+    /// **A stand-in IEM.** Every `network=XX_ASOS` is answered with one station
+    /// `KXX` at the centre of that network's published extent, so which
+    /// networks a round covered is readable off the stations it left on the
+    /// map. `dead` refuses one network with a 503.
+    ///
+    /// Returns the origins and the request counter, which is how a test says
+    /// how many requests a sequence really cost.
+    fn iem_serving(
+        dead: Option<&'static str>,
+    ) -> (
+        squallar_source::origins::DataSources,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::io::{Read, Write};
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = requests.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut scratch = [0u8; 8192];
+                let read = stream.read(&mut scratch).unwrap_or(0);
+                let request = String::from_utf8_lossy(&scratch[..read]).to_string();
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let state = request
+                    .split("network=")
+                    .nth(1)
+                    .and_then(|rest| rest.split("_ASOS").next())
+                    .unwrap_or("")
+                    .to_string();
+                let network = NETWORKS.iter().find(|n| n.state == state);
+                let body = match network {
+                    _ if dead == Some(state.as_str()) => None,
+                    Some(n) => Some(format!(
+                        "{{\"data\":[{{\"station\":\"K{}\",\"name\":\"{} field\",\
+                         \"lat\":{},\"lon\":{},\"tmpf\":70.0}}]}}",
+                        n.state,
+                        n.state,
+                        (n.min_lat + n.max_lat) / 2.0,
+                        (n.min_lon + n.max_lon) / 2.0,
+                    )),
+                    None => Some("{\"data\":[]}".to_string()),
+                };
+                let out = match body {
+                    Some(body) => format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    ),
+                    None => "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\n\
+                             Connection: close\r\n\r\ndown"
+                        .to_string(),
+                };
+                let _ = stream.write_all(out.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (
+            squallar_source::origins::DataSources {
+                iem_base: format!("http://127.0.0.1:{port}").into(),
+                ..squallar_source::origins::DataSources::production()
+            },
+            requests,
+        )
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        squallar_source::tls::init();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    }
+
+    fn fetch_config(
+        sources: &squallar_source::origins::DataSources,
+        viewport: GeoBounds,
+    ) -> FetchConfig {
+        FetchConfig {
+            client: reqwest::Client::new(),
+            zone_cache_dir: None,
+            sources: sources.clone(),
+            // What the app hands every layer: the extent of the last frame
+            // that dispatched a render.
+            viewport: Some(viewport),
+            as_of: chrono::Utc::now().naive_utc(),
+            depicted_span_secs: None,
+            depicted_frames: Vec::new(),
+        }
+    }
+
+    /// One frame of a still map, and then one more: the extent is published
+    /// once as [`ViewportMotion::Moving`] and once as
+    /// [`ViewportMotion::Settled`], which is what the registry does across the
+    /// two frames of a gesture ending.
+    fn show(handler: &mut MetarHandler, at: GeoBounds) {
+        handler.note_viewport(&at, ViewportMotion::Moving);
+        handler.note_viewport(&at, ViewportMotion::Settled);
+    }
+
+    fn due(handler: &MetarHandler) -> bool {
+        handler.auto_fetch_delay().is_some_and(|d| d.is_zero())
+    }
+
+    /// Run the round the handler would start: **the handler's own choice of
+    /// extent**, the real round over it, and the answer back in through
+    /// `apply_fetch_result`.
+    ///
+    /// The one production step this stands in for is the client.
+    /// `create_fetch_tasks` builds METAR's own through
+    /// `squallar_source::tls::simple_client`, which sets `https_only` — so a
+    /// task it built would refuse a loopback fixture before it sent anything,
+    /// and every round here would come back empty for a reason that has
+    /// nothing to do with what is being tested. The extent decision, which is
+    /// what these tests are about, is the handler's own
+    /// [`MetarHandler::round_extent`] either way.
+    fn run_round(
+        handler: &mut MetarHandler,
+        sources: &squallar_source::origins::DataSources,
+        rt: &tokio::runtime::Runtime,
+        app_viewport: GeoBounds,
+    ) {
+        let pane = PaneRef::bare(0);
+        let extent = handler.round_extent(&fetch_config(sources, app_viewport));
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("client");
+        handler.set_fetching(true, &pane);
+        let round = rt.block_on(crate::metar::fetch::fetch_current_metars(
+            &client, sources, &extent,
+        ));
+        assert!(
+            round.is_ok(),
+            "the fixture answered nothing at all: {:?}",
+            round.err().map(|e| e.message),
+        );
+        handler.apply_fetch_result(Box::new(MetarFetchResult(round)) as FetchPayload, &pane);
+    }
+
+    /// The stations on the map, one per network the round covered.
+    fn stations(handler: &MetarHandler) -> Vec<String> {
+        let mut ids: Vec<String> = handler
+            .state
+            .data
+            .iter()
+            .map(|item| item.ob.station_id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// **The report, walked end to end.**
+    #[test]
+    fn zooming_out_after_a_narrow_round_refetches_and_covers_the_wide_map() {
+        let (sources, _requests) = iem_serving(None);
+        let rt = runtime();
+        let mut handler = MetarHandler::new();
+
+        // 1. Zoomed in over Oklahoma, METAR switched on. Nothing has been
+        //    fetched, so the layer is due on its clock alone.
+        show(&mut handler, oklahoma());
+        assert!(due(&handler), "a layer that has never fetched is due now");
+        run_round(&mut handler, &sources, &rt, oklahoma());
+        assert_eq!(
+            stations(&handler),
+            ["KOK", "KTX"],
+            "the narrow map asks for the two networks it overlaps",
+        );
+        assert!(
+            !due(&handler),
+            "a fresh round over the map it was fetched for is not due again",
+        );
+
+        // 2. The user zooms out. The round on the layer answers a question
+        //    about Oklahoma; the map is now asking about the country.
+        show(&mut handler, continent());
+        assert!(
+            due(&handler),
+            "the map reaches {} networks this round never asked for, and the \
+             poll clock would hold the narrow round for five minutes",
+            NETWORKS
+                .iter()
+                .filter(|n| n.intersects(&continent()) && !["OK", "TX"].contains(&n.state))
+                .count(),
+        );
+
+        // 3. And the round it starts covers the map, corner to corner.
+        run_round(&mut handler, &sources, &rt, continent());
+        let on_map = stations(&handler);
+        for corner in ["KCA", "KWA", "KFL", "KME"] {
+            assert!(
+                on_map.contains(&corner.to_string()),
+                "{corner} is on the continental map and is missing: {on_map:?}",
+            );
+        }
+        assert_eq!(
+            on_map.len(),
+            networks_for_viewport(&continent()).len(),
+            "one station per network the map overlaps: {on_map:?}",
+        );
+        assert!(
+            !due(&handler),
+            "the wide round covers the wide map: nothing is due, and a round \
+             that left the layer due would be a fetch every frame",
+        );
+    }
+
+    /// The damping. A pan that does not leave the networks the round holds is
+    /// not a reason to fetch, and without this every mouse-up over a state
+    /// border would be a round.
+    #[test]
+    fn a_pan_inside_the_same_networks_does_not_make_the_layer_due() {
+        let (sources, requests) = iem_serving(None);
+        let rt = runtime();
+        let mut handler = MetarHandler::new();
+
+        show(&mut handler, oklahoma());
+        run_round(&mut handler, &sources, &rt, oklahoma());
+        let after_first = requests.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(after_first, 2, "the narrow round is OK and TX");
+
+        assert_eq!(
+            networks_for_viewport(&oklahoma_nudged()),
+            networks_for_viewport(&oklahoma()),
+            "premise: the nudge asks for the very same networks",
+        );
+        show(&mut handler, oklahoma_nudged());
+        assert!(
+            !due(&handler),
+            "the map moved and asked for nothing new, so the round still \
+             answers it",
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::Relaxed),
+            after_first,
+            "and no request went out",
+        );
+    }
+
+    /// **What a continuous zoom-out costs, in rounds.** Forty frames of a
+    /// gesture that ends over the whole country: nothing is due on any of
+    /// them, and one round starts on the frame the map comes to rest.
+    ///
+    /// Without the settle gate this is one round per frame at which the
+    /// network set grows — a gesture that ends in a 54-network round having
+    /// started dozens of smaller ones on the way.
+    #[test]
+    fn a_continuous_zoom_out_starts_one_round_and_starts_it_at_the_end() {
+        let (sources, requests) = iem_serving(None);
+        let rt = runtime();
+        let mut handler = MetarHandler::new();
+
+        show(&mut handler, oklahoma());
+        run_round(&mut handler, &sources, &rt, oklahoma());
+        let before = requests.load(std::sync::atomic::Ordering::Relaxed);
+
+        const FRAMES: usize = 40;
+        let mut due_during = 0;
+        let mut grew = 0;
+        let mut held = networks_for_viewport(&oklahoma());
+        for frame in 1..=FRAMES {
+            let at = lerp(&oklahoma(), &continent(), frame as f64 / FRAMES as f64);
+            let wanted = networks_for_viewport(&at);
+            if wanted.len() > held.len() {
+                grew += 1;
+                held = wanted;
+            }
+            handler.note_viewport(&at, ViewportMotion::Moving);
+            if due(&handler) {
+                due_during += 1;
+            }
+        }
+        assert!(
+            grew > 5,
+            "premise: the network set really does grow during this gesture \
+             ({grew} of {FRAMES} frames), or the damping is untested",
+        );
+        assert_eq!(
+            due_during, 0,
+            "a round started mid-gesture is fetched for an extent the gesture \
+             has already left",
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::Relaxed),
+            before,
+            "and nothing went out during the gesture",
+        );
+
+        // The map comes to rest.
+        handler.note_viewport(&continent(), ViewportMotion::Settled);
+        assert!(due(&handler), "the gesture ended somewhere new: one round");
+        run_round(&mut handler, &sources, &rt, continent());
+        assert!(!due(&handler), "and exactly one");
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::Relaxed) - before,
+            networks_for_viewport(&continent()).len(),
+            "one request per network the settled map overlaps, and no round \
+             before it",
+        );
+    }
+
+    /// **A round the layer holds is fetched for the extent its due-ness was
+    /// decided against**, and not for whatever extent the app last dispatched
+    /// a render at. The two differ by a frame, and fetching for the older one
+    /// leaves the layer due on arrival — which is a round every frame, for
+    /// ever.
+    #[test]
+    fn the_round_is_fetched_for_the_extent_the_layer_was_told_about() {
+        let (sources, _requests) = iem_serving(None);
+        let rt = runtime();
+        let mut handler = MetarHandler::new();
+
+        show(&mut handler, continent());
+        // The app's own viewport still says Oklahoma: one frame behind.
+        assert_eq!(
+            handler.round_extent(&fetch_config(&sources, oklahoma())),
+            continent(),
+            "the round follows the extent the layer was told about",
+        );
+        run_round(&mut handler, &sources, &rt, oklahoma());
+        let on_map = stations(&handler);
+        assert!(
+            on_map.contains(&"KCA".to_string()) && on_map.contains(&"KME".to_string()),
+            "the round followed the stale extent: {on_map:?}",
+        );
+        assert!(!due(&handler), "and so it left the layer due");
+    }
+
+    /// **A settle changes what the layer will ASK for, and nothing it draws.**
+    ///
+    /// The drawn list moves through exactly one door — `set_data_with_coverage`,
+    /// which bumps `data_generation` — and the frame path keys held work on
+    /// that generation: a pass holding a tessellated mesh for these stations
+    /// holds the cull and the projection that produced it under the same key.
+    /// Due-ness now moves on a second signal, and this is what says that signal
+    /// is not a second door.
+    ///
+    /// A settle that bumped the generation would be just as wrong as one that
+    /// rewrote the list: it would throw that held work away on every gesture
+    /// end, for a set of stations that did not change.
+    #[test]
+    fn a_settle_makes_the_layer_due_without_touching_what_it_draws() {
+        let (sources, _requests) = iem_serving(None);
+        let rt = runtime();
+        let mut handler = MetarHandler::new();
+
+        show(&mut handler, oklahoma());
+        run_round(&mut handler, &sources, &rt, oklahoma());
+        let generation = handler.data_generation();
+        let drawn: Vec<(f64, f64, u32)> = handler
+            .per_frame_points()
+            .iter()
+            .map(|p| (p.lat, p.lon, p.id))
+            .collect();
+        assert!(!drawn.is_empty(), "premise: stations are on the map");
+
+        // The zoom-out. The layer becomes due...
+        show(&mut handler, continent());
+        assert!(due(&handler), "premise: the settle made the layer due");
+
+        // ...and nothing it draws has moved.
+        assert_eq!(
+            handler.data_generation(),
+            generation,
+            "the settle moved the generation, which discards every frame-path              cache keyed on it for a list that did not change",
+        );
+        let after: Vec<(f64, f64, u32)> = handler
+            .per_frame_points()
+            .iter()
+            .map(|p| (p.lat, p.lon, p.id))
+            .collect();
+        assert_eq!(after, drawn, "the settle changed the drawn list");
+
+        // **And the arrival that follows moves both.** So the two equalities
+        // above are a property of the settle, and not of a layer whose drawn
+        // list never changes at all.
+        run_round(&mut handler, &sources, &rt, continent());
+        assert_ne!(
+            handler.data_generation(),
+            generation,
+            "a round's arrival must move the generation, or the checks above              cannot fail",
+        );
+        assert!(
+            handler.per_frame_points().len() > drawn.len(),
+            "the wide round must replace the drawn list",
+        );
+    }
+
+    /// **A network that did not answer is counted against every network the
+    /// map overlaps.** The layer has an instrument that says a whole state is
+    /// blank; before the cap came off, a continental round reported
+    /// `expected: 12, missing: 0` over a map that was blank over thirty-six
+    /// states, because the count it published was taken after the truncation.
+    #[test]
+    fn an_incomplete_continental_round_counts_against_the_whole_map() {
+        let (sources, _requests) = iem_serving(Some("CA"));
+        let rt = runtime();
+        let mut handler = MetarHandler::new();
+
+        show(&mut handler, continent());
+        run_round(&mut handler, &sources, &rt, continent());
+
+        let overlapped = NETWORKS
+            .iter()
+            .filter(|n| n.intersects(&continent()))
+            .count();
+        let mut registry = OverlayRegistry::default();
+        registry.set_enabled(&known::METAR, true, &mut PaneMut::bare(0));
+        registry.apply_fetch_result(
+            OverlayFetchResult {
+                kind: known::METAR,
+                data: Box::new(MetarFetchResult(Ok(crate::metar::fetch::MetarRound {
+                    observations: Vec::new(),
+                    failed_networks: vec![(
+                        "CA".into(),
+                        crate::fetch_policy::FetchError::transient("CA: 503"),
+                    )],
+                    networks: networks_for_viewport(&continent()),
+                }))) as FetchPayload,
+            },
+            &PaneRef::bare(0),
+        );
+        let note = registry
+            .controls(&known::METAR, &PaneRef::bare(0))
+            .into_iter()
+            .find_map(|item| match item {
+                ControlItem::InfoText { text } if text.starts_with("Incomplete") => Some(text),
+                _ => None,
+            })
+            .expect("a round that lost a network says so");
+        assert!(
+            note.contains(&format!("missing 1 of {overlapped} state networks")),
+            "the denominator must be every network the map overlaps, not the \
+             number the round kept: {note}",
+        );
+
+        // And the same round, through the real fetch: California is the only
+        // state missing from the map.
+        let on_map = stations(&handler);
+        assert!(
+            !on_map.contains(&"KCA".to_string()),
+            "California refused: {on_map:?}",
+        );
+        assert_eq!(
+            on_map.len(),
+            overlapped - 1,
+            "every other network answered: {on_map:?}",
+        );
     }
 }

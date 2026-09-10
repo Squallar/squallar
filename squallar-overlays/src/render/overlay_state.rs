@@ -185,6 +185,25 @@ pub struct OverlayRegistry {
     /// Populated by map clicks; paged through in the popup.
     pub selected_overlays: Vec<Arc<dyn OverlayItem>>,
     pub selected_overlay_page: usize,
+    /// **The union of the extents this frame's panes have drawn so far**,
+    /// emptied by [`Self::commit_viewport`] at the head of the next frame.
+    ///
+    /// The union rather than the last pane's, because a viewport-scoped layer
+    /// holds ONE round for every pane that draws it: told each pane's extent in
+    /// turn, it would be outrun by whichever pane it heard about last, fetch
+    /// for that one, and be outrun again by the next pane on the very next
+    /// frame — a request storm on a still map with two panes in different
+    /// places. One round covering both is over-fetching bounded by the extents
+    /// actually on screen, and it terminates.
+    frame_viewport: Option<squallar_geo::GeoBounds>,
+    /// **The extent the handlers have been told about**, so a frame that did
+    /// not move the map costs one comparison instead of a walk of every
+    /// registered layer.
+    noted_viewport: Option<squallar_geo::GeoBounds>,
+    /// Whether the extent has moved since the handlers were last told it had
+    /// come to rest — what makes the settled frame a single frame rather than
+    /// every frame of a still map.
+    viewport_unsettled: bool,
 }
 
 /// This crate's own eleven — and **only** those.
@@ -210,6 +229,9 @@ impl OverlayRegistry {
             texture_ids,
             selected_overlays: Vec::new(),
             selected_overlay_page: 0,
+            frame_viewport: None,
+            noted_viewport: None,
+            viewport_unsettled: false,
         }
     }
 
@@ -420,6 +442,63 @@ impl OverlayRegistry {
             .filter(|(handler, _)| handler.auto_fetch_delay().is_some_and(|d| d.is_zero()))
             .map(|(_, id)| id.clone())
             .collect()
+    }
+
+    /// **A pane is drawing `view`.** Folded into this frame's union; no handler
+    /// hears about it until [`Self::commit_viewport`].
+    ///
+    /// Called once per pane per frame, and it is four comparisons.
+    pub fn note_viewport(&mut self, view: &squallar_geo::GeoBounds) {
+        self.frame_viewport = Some(match self.frame_viewport {
+            None => *view,
+            Some(seen) => squallar_geo::GeoBounds {
+                min_lat: seen.min_lat.min(view.min_lat),
+                max_lat: seen.max_lat.max(view.max_lat),
+                min_lon: seen.min_lon.min(view.min_lon),
+                max_lon: seen.max_lon.max(view.max_lon),
+            },
+        });
+    }
+
+    /// **Publish the extent the panes drew** to every handler, once, and only
+    /// when it moved.
+    ///
+    /// A layer whose request is scoped to the extent is holding an answer to
+    /// the *previous* extent's question until it is told otherwise, and until
+    /// this existed nothing in the tree could tell it — see
+    /// [`OverlayHandler::note_viewport`] and
+    /// [`OverlayHandler::round_covers_viewport`].
+    ///
+    /// Called at the head of the frame, beside the auto-poll check that reads
+    /// what it publishes, so the extent a due-ness is decided against is the
+    /// one the last completed frame really drew. A frame that did not move the
+    /// map, on a map that was not moving on the frame before it either, pays
+    /// two comparisons and touches no handler.
+    ///
+    /// **The frame the map comes to rest is its own event**
+    /// ([`ViewportMotion::Settled`](squallar_source::handler::ViewportMotion)),
+    /// and it is what a viewport-scoped layer acts on: a gesture is dozens of
+    /// frames at dozens of extents, and a layer that acted on each of them
+    /// would fetch on each of them.
+    pub fn commit_viewport(&mut self) {
+        let Some(view) = self.frame_viewport.take() else {
+            return;
+        };
+        let motion = if self.noted_viewport == Some(view) {
+            // Still, and the handlers have already heard so. This is the
+            // ordinary frame, and it ends here: two comparisons, no walk.
+            if !self.viewport_unsettled {
+                return;
+            }
+            squallar_source::handler::ViewportMotion::Settled
+        } else {
+            squallar_source::handler::ViewportMotion::Moving
+        };
+        self.viewport_unsettled = motion == squallar_source::handler::ViewportMotion::Moving;
+        self.noted_viewport = Some(view);
+        for handler in &mut self.handlers {
+            handler.note_viewport(&view, motion);
+        }
     }
 
     /// Wipe `kind`'s retry ledger because the **user** asked for a fetch.
@@ -963,6 +1042,73 @@ impl OverlayRegistry {
                 h.deserialize_state(val.clone());
             }
         }
+    }
+}
+
+/// **What the auto-poll walk costs on a frame where nothing is due.**
+#[cfg(test)]
+mod still_frame_tests {
+    use super::*;
+
+    /// [`OverlayRegistry::ids_due_for_auto_fetch`] promises in its own doc that
+    /// the ordinary frame's answer is an empty `Vec` and that an empty `Vec`
+    /// allocates nothing. **Capacity is what says so**, and it says it exactly:
+    /// a `Vec` that never allocated has capacity 0, where a heap level read
+    /// around the call cannot tell one allocated-and-freed vector from none at
+    /// all.
+    ///
+    /// The frame the viewport seam publishes on is this same walk, so this is
+    /// also what holds that seam to it.
+    #[test]
+    fn a_frame_with_nothing_due_allocates_no_answer() {
+        let mut reg = OverlayRegistry::default();
+        let polling: Vec<LayerId> = reg
+            .handlers()
+            .filter(|h| h.auto_poll_interval().is_some())
+            .map(|h| h.id())
+            .collect();
+        assert!(
+            polling.len() >= 8,
+            "premise: this build registers auto-polling layers at all ({})",
+            polling.len(),
+        );
+        // A layer that has never fetched is due, which is a first frame and not
+        // an ordinary one. A round in flight is the ordinary frame's shape.
+        for id in &polling {
+            reg.set_fetching(id, true, &PaneRef::bare(0));
+        }
+
+        // A still map, over the two frames that publish and the one that does
+        // not: none of them may put anything in the answer.
+        let view = squallar_geo::GeoBounds {
+            min_lat: 33.0,
+            max_lat: 40.0,
+            min_lon: -103.0,
+            max_lon: -94.0,
+        };
+        for _ in 0..3 {
+            reg.note_viewport(&view);
+            reg.commit_viewport();
+        }
+
+        let due = reg.ids_due_for_auto_fetch();
+        assert!(due.is_empty(), "nothing is due: {due:?}");
+        assert_eq!(
+            due.capacity(),
+            0,
+            "the empty answer allocated, so the ordinary frame allocates",
+        );
+
+        // **And the check is live.** One layer due, and the same walk both
+        // answers and allocates — so the zero above is a property of the
+        // frame, not of the assertion.
+        reg.set_fetching(&polling[0], false, &PaneRef::bare(0));
+        let due = reg.ids_due_for_auto_fetch();
+        assert_eq!(due.len(), 1, "one layer is due again");
+        assert!(
+            due.capacity() > 0,
+            "a non-empty answer must have allocated, or this test cannot fail",
+        );
     }
 }
 
