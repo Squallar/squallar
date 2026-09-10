@@ -3676,3 +3676,54 @@ fn a_level_change_mid_round_is_not_undone_by_the_write_back() {
         assert_eq!(cache.flash_count(), 1, "the new round's rows are held");
     });
 }
+
+/// **The map costs its slots, not its rows**, and only one of the two figures
+/// the cache publishes is the one the allocator was billed for.
+///
+/// A granule's rows arrive as one `Vec<GlmFlash>` and are moved into the `Arc`
+/// buffer and all, so spare capacity a parse left behind is resident for the
+/// granule's whole retention. `retained_bytes` cannot see it — this is the
+/// walk that can.
+#[test]
+fn the_cache_prices_its_slots_apart_from_its_rows() {
+    let mut cache = GlmCache::default();
+    let mut rows = Vec::with_capacity(64);
+    rows.push(flash_at(t0()));
+    assert_eq!(rows.capacity(), 64, "the fixture's own slack");
+
+    cache.insert("k".to_string(), t0(), rows);
+
+    assert_eq!(cache.retained_flashes(), 1);
+    assert_eq!(cache.retained_bytes(), FLASH_BYTES);
+    assert_eq!(
+        cache.retained_slots(),
+        64,
+        "the slot walk must read the granule vec's capacity, not its length - \
+         a walk that folded the maintained row level would agree with \
+         `retained_flashes` and could never disagree with it"
+    );
+    assert_eq!(
+        (cache.retained_slots() - cache.retained_flashes()) * FLASH_BYTES,
+        63 * FLASH_BYTES,
+        "the gap is what `retained_bytes` under-reports the map by"
+    );
+}
+
+/// The walk sums **every** granule, and an eviction takes a granule's slots
+/// with its rows.
+#[test]
+fn evicting_a_granule_takes_its_slots_too() {
+    let mut cache = GlmCache::default();
+    for (i, key) in ["a", "b"].iter().enumerate() {
+        let mut rows = Vec::with_capacity(10);
+        rows.push(flash_at(t0() + TimeDelta::minutes(i as i64)));
+        cache.insert((*key).to_string(), t0(), rows);
+    }
+    assert_eq!(cache.retained_slots(), 20);
+    assert_eq!(cache.retained_flashes(), 2);
+
+    cache.evict_oldest_over(1);
+
+    assert_eq!(cache.retained_flashes(), 1);
+    assert_eq!(cache.retained_slots(), 10);
+}

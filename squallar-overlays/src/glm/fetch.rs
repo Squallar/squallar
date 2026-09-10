@@ -213,11 +213,34 @@ impl GlmCache {
         self.retained_flashes
     }
 
-    /// **Bytes those rows cost**, which is the whole cost: a granule is one
-    /// `Vec<GlmFlash>` and `GlmFlash` owns nothing on the heap, so
-    /// `rows * FLASH_BYTES` prices the map's contents exactly. The `HashMap`'s
-    /// own table and its `String` keys are not in it — at the shipped cap
-    /// those are ~16 keys against 250,000 rows.
+    /// **Row *slots* the granule vecs hold**, which is not
+    /// [`Self::retained_flashes`] and is the figure the allocator was actually
+    /// billed for.
+    ///
+    /// A granule's rows arrive as one `Vec<GlmFlash>` built by
+    /// [`super::parse_with_source`] and are moved, buffer and all, into the
+    /// `Arc` this map stores — so a vec that ended its parse with spare
+    /// capacity carries that spare for the granule's whole retention.
+    /// [`Self::retained_bytes`] prices `rows * FLASH_BYTES` and therefore
+    /// **under-reports the map by exactly the slack this walks**; a census that
+    /// reads only the level cannot see the difference.
+    ///
+    /// A walk rather than a maintained level, for the same reason
+    /// [`Self::flash_count`] is one: it exists to disagree with the level
+    /// beside it, and a figure folded out of the same field could not.
+    pub fn retained_slots(&self) -> usize {
+        self.entries.values().map(|g| g.flashes.capacity()).sum()
+    }
+
+    /// **Bytes those rows cost**: a granule is one `Vec<GlmFlash>` and
+    /// `GlmFlash` owns nothing on the heap, so `rows * FLASH_BYTES` prices the
+    /// rows exactly.
+    ///
+    /// It does **not** price the map: a granule vec that ended its parse with
+    /// spare capacity carries that spare for its whole retention, and this
+    /// figure cannot see it. [`Self::retained_slots`] is the half that can.
+    /// The `HashMap`'s own table and its `String` keys are in neither — at the
+    /// shipped cap those are ~16 keys against 250,000 rows.
     pub fn retained_bytes(&self) -> usize {
         self.retained_flashes * FLASH_BYTES
     }
@@ -1270,11 +1293,21 @@ pub async fn fetch_glm_flashes(
     // **The figure names its denominator**: this is the retained set over the
     // whole residency, not over one frame's window. The rasterizer culls each
     // depicted frame to its own window from the same delivery.
+    // **The retained map priced twice**, because the two figures are different
+    // numbers and only one of them is what the allocator holds: `retained` is
+    // rows, `slots` is the capacity of the vecs those rows sit in. A parse that
+    // leaves spare capacity behind hands it to the cache for the granule's
+    // whole life, and every byte of the gap is resident and unreadable.
+    let retained = cache.retained_flashes();
+    let slots = cache.retained_slots();
     log::info!(
-        "GLM: {} flashes held over {:.0}s of residency in {} range(s)",
+        "GLM: {} flashes held over {:.0}s of residency in {} range(s); the map \
+         retains {retained} rows in {slots} slots ({} B), {} B of it slot slack",
         filtered.len(),
         depicted.total().num_milliseconds() as f64 / 1000.0,
         depicted.ranges().len(),
+        slots * FLASH_BYTES,
+        slots.saturating_sub(retained) * FLASH_BYTES,
     );
 
     Ok(build_outcome(
