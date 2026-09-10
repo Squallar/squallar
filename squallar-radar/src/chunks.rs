@@ -265,8 +265,14 @@ fn ingest_record(name: &str, record: volume::Record<'_>, out: &mut ChunkContents
                 }
                 // Before `into_radial`, which is where the number is lost.
                 out.declared_nyquist.declare_from_message(&m);
-                out.radials
-                    .push(m.into_radial().map_err(|e| decode(e.into()))?);
+                // The same drop the archive decode makes, for the same
+                // reason: a chunk-fed volume lands in the same caches and is
+                // read by the same readers. See `crate::moment_drop`.
+                let (radial, skipped_cfp) = m
+                    .into_radial_without_clutter_filter_power()
+                    .map_err(|e| decode(e.into()))?;
+                crate::moment_drop::dropped_cfp(skipped_cfp);
+                out.radials.push(radial);
             }
             MessageContents::DigitalRadarDataLegacy(m) => {
                 out.radials

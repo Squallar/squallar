@@ -155,8 +155,16 @@ fn contribution(
                     });
                 }
                 out.declared_nyquist.declare_from_message(&m);
-                out.radials
-                    .push(m.into_radial().map_err(nexrad_data::result::Error::from)?);
+                // **The clutter-filter-power moment is decoded past rather
+                // than built.** Nothing in this workspace reads it and it is a
+                // median 12.38 % of a decoded volume's bytes and 13.33 % of
+                // its moment blocks — see `crate::moment_drop`, which prices
+                // what this line does not allocate.
+                let (radial, skipped_cfp) = m
+                    .into_radial_without_clutter_filter_power()
+                    .map_err(nexrad_data::result::Error::from)?;
+                crate::moment_drop::dropped_cfp(skipped_cfp);
+                out.radials.push(radial);
             }
             MessageContents::VolumeCoveragePattern(m) if out.coverage_pattern.is_none() => {
                 out.coverage_pattern = Some(crate::chunks::coverage_pattern_from(&m));

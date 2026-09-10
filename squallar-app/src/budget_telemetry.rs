@@ -1182,6 +1182,34 @@ pub(crate) fn base_release_line(counts: BaseReleaseCounts) -> String {
     )
 }
 
+/// **What the decoder did not build**, as a running total.
+///
+/// The clutter-filter-power moment is decoded past rather than materialised
+/// (`squallar_radar::moment_drop`); this is the evidence that it happens on a
+/// running app rather than only in a test. A mechanism that executes zero
+/// times reads exactly like one that works, and two landed this month that
+/// did — the `VolumeSkeleton` nothing stored, and the base withdrawal that
+/// did not fire for a day — so the counter is always on and published whether
+/// or not anything gates on it.
+///
+/// `re-decodes` is 0 by construction: nothing reads the moment, so nothing can
+/// ask for it back. It is printed because a non-zero reading would mean that
+/// premise is false, and a claim nobody can falsify from the log is not
+/// evidence.
+///
+/// Its own line, and never appended to `budget state:`, which is scraped by a
+/// positional regex. MiB by integer division, the spelling every byte figure
+/// in this module uses.
+pub(crate) fn moment_drop_line() -> String {
+    format!(
+        "moment drop: cfp dropped {}, blocks {}, freeing {} MiB; re-decodes {}",
+        squallar_radar::moment_drop::dropped(),
+        squallar_radar::moment_drop::blocks(),
+        squallar_radar::moment_drop::bytes() / (1024 * 1024),
+        squallar_radar::moment_drop::redecodes(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1191,6 +1219,40 @@ mod tests {
     use squallar_device_profile::fit::PaneTerms;
     use squallar_device_profile::quality::DeviceClass;
     use squallar_egui::shell_api::{BudgetReadout, PaneBudget, PoolReadout};
+
+    /// **The `moment drop:` line's shape, pinned where the format string
+    /// lives**, so the reader that scrapes it can be built from a string this
+    /// binary actually produced rather than from one a report retyped.
+    ///
+    /// Four fields and their order, because a positional reader breaks
+    /// silently on a reorder and a lane quoting the wrong column would be
+    /// reporting blocks as bytes.
+    #[test]
+    fn the_moment_drop_line_names_four_fields_in_order() {
+        let line = moment_drop_line();
+        assert!(line.starts_with("moment drop: "), "{line}");
+        let numbers: Vec<&str> = line
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(
+            numbers.len(),
+            4,
+            "four figures, got {numbers:?} from {line}"
+        );
+        for field in ["cfp dropped ", "blocks ", ", freeing ", "re-decodes "] {
+            assert!(line.contains(field), "{line} is missing `{field}`");
+        }
+        let cfp = line.find("cfp dropped").expect("cfp field");
+        let blocks = line.find("blocks").expect("blocks field");
+        let freeing = line.find("freeing").expect("freeing field");
+        let redecodes = line.find("re-decodes").expect("re-decodes field");
+        assert!(
+            cfp < blocks && blocks < freeing && freeing < redecodes,
+            "the fields are out of order: {line}"
+        );
+        assert!(line.contains(" MiB"), "the byte figure has no unit: {line}");
+    }
 
     /// The rig driver, read at compile time so a moved or deleted file is a
     /// build failure rather than a skipped test.

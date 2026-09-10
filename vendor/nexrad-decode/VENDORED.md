@@ -486,6 +486,35 @@ it is exact — while the multi-segment payload slice was twelve bytes short per
 segment it was not, and with that fixed both KCRP's five-elevation map and the
 packaged single-elevation fixture pre-size to the number they parse.
 
+#### A radial can be built without its clutter-filter-power moment — `src/messages/digital_radar_data/message.rs`
+
+One added method, `Message::into_radial_without_clutter_filter_power`, marked
+`LOCAL CHANGE` at its definition. It is `into_radial` with one argument
+changed: `None` where that passes
+`clutter_filter_power_data_block.map(|b| b.into_inner().into_cfp_moment_data())`.
+Everything else — `build_radial`, the six other moments, the header reads, the
+order — is untouched, and `into_radial` itself is not modified, so every
+existing caller decodes exactly what it always did.
+
+The point is the allocation. `GenericDataBlock::into_cfp_moment_data` ends in
+`encoded_data.into_inner().into_owned()`, which copies the gate array out of
+the borrowed record into a `Vec`; not calling it is not a deferred free but an
+allocation that never happens. The method also returns
+`encoded_values().len()` of the block it skipped, read off the borrow before
+the message is consumed, so the caller can price what it did not allocate
+without a second walk. It is 0 when the message carries no CFP block —
+`KAMX20200810_000424_V06` in `squallar-radar/testdata` is such a message.
+
+Why squallar wants it: nothing in the workspace reads the clutter-filter-power
+moment. It has no product, no colour scale and no hover row, and outside tests
+`Radial::clutter_filter_power` has three call sites — a byte census, the
+skeleton strip, and the wasm wire copy — none of which is a consumer. Measured
+over 108 real archive volumes it is a median **12.38 %** of a decoded volume's
+bytes and **13.33 %** of its ~32,400 moment blocks. See
+`squallar-radar/src/moment_drop.rs`, which is where the decision and the
+figures live, and `squallar-radar/tests/cfp_is_not_decoded.rs`, which pins
+that the drop is one slot and not a blanket.
+
 #### The lint scoping — `src/lib.rs`
 
 In `src/lib.rs`'s crate-level lint attributes, upstream writes

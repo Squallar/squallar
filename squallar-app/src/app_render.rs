@@ -3144,6 +3144,11 @@ impl super::App {
             loud,
             &crate::budget_telemetry::base_release_line(self.base_releases),
         );
+        // **And what the decoder never built.** A running total and so its own
+        // line, beside the two above rather than in the census: the census
+        // carries levels and this is bytes that were never allocated in any of
+        // them, so the two must never be added.
+        say_telemetry(loud, &crate::budget_telemetry::moment_drop_line());
         // **And what those bases are holding that nothing would free.** The
         // release histogram above says which guard kept a base's gates; this
         // says what taking them would have been worth, which is a different

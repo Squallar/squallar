@@ -291,6 +291,52 @@ impl<'a> Message<'a> {
         )
     }
 
+    /// **LOCAL CHANGE.** Convert this message into a model radial **without
+    /// materialising the clutter-filter-power moment**, and report the encoded
+    /// bytes that were therefore never allocated.
+    ///
+    /// The difference against [`into_radial`](Self::into_radial) is one
+    /// argument: `None` where that passes
+    /// `clutter_filter_power_data_block.map(..into_cfp_moment_data())`. That
+    /// call is where the CFP gate array is copied out of the borrowed record
+    /// into an owned `Vec` — `GenericDataBlock::into_cfp_moment_data` ends in
+    /// `encoded_data.into_inner().into_owned()` — so not making it is not a
+    /// deferred free but an allocation that never happens. Everything else,
+    /// the six other moments included, is built by the same `build_radial`
+    /// from the same fields in the same order.
+    ///
+    /// The returned `usize` is `encoded_values().len()` of the block that was
+    /// dropped, read off the borrow before the message is consumed, and is 0
+    /// when the message carries no CFP block. It is what
+    /// `squallar_radar::moment_drop` prices the drop with; nothing here
+    /// records anything.
+    #[cfg(feature = "nexrad-model")]
+    pub fn into_radial_without_clutter_filter_power(
+        self,
+    ) -> crate::result::Result<(nexrad_model::data::Radial, usize)> {
+        let skipped = self
+            .clutter_filter_power_data_block
+            .as_ref()
+            .map_or(0, |block| block.inner().encoded_values().len());
+        let radial = Self::build_radial(
+            &self.header,
+            self.reflectivity_data_block
+                .map(|block| block.into_inner().into_moment_data()),
+            self.velocity_data_block
+                .map(|block| block.into_inner().into_moment_data()),
+            self.spectrum_width_data_block
+                .map(|block| block.into_inner().into_moment_data()),
+            self.differential_reflectivity_data_block
+                .map(|block| block.into_inner().into_moment_data()),
+            self.differential_phase_data_block
+                .map(|block| block.into_inner().into_moment_data()),
+            self.correlation_coefficient_data_block
+                .map(|block| block.into_inner().into_moment_data()),
+            None,
+        )?;
+        Ok((radial, skipped))
+    }
+
     /// Convert this digital radar data message into a common model radial, minimizing data copy.
     #[cfg(feature = "nexrad-model")]
     pub fn into_radial(self) -> crate::result::Result<nexrad_model::data::Radial> {

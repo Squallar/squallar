@@ -21,6 +21,7 @@ pub(crate) mod l3_values;
 pub mod level3;
 pub mod loop_downloads;
 pub mod loop_geometry;
+pub mod moment_drop;
 pub mod nrot;
 pub mod nyquist;
 mod palette;
