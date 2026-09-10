@@ -32,6 +32,8 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use chrono::{NaiveDateTime, TimeDelta};
 use squallar_overlays::glm::fetch::{FLASH_BYTES, GlmCache, GlmStore, poll_glm_into_store};
@@ -580,17 +582,19 @@ fn archive_keys(designator: &str, count: usize) -> Vec<(String, NaiveDateTime)> 
 fn s3_two_bucket_archive(
     east: Vec<(String, Vec<u8>)>,
     west: Vec<(String, Vec<u8>)>,
+    gate: Option<Arc<BodiesInFlight>>,
 ) -> DataSources {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let port = listener.local_addr().expect("local addr").port();
-    let east = std::sync::Arc::new(east);
-    let west = std::sync::Arc::new(west);
+    let east = Arc::new(east);
+    let west = Arc::new(west);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
-            let east = std::sync::Arc::clone(&east);
-            let west = std::sync::Arc::clone(&west);
+            let east = Arc::clone(&east);
+            let west = Arc::clone(&west);
+            let gate = gate.clone();
             std::thread::spawn(move || {
                 let mut scratch = [0u8; 8192];
                 let read = stream.read(&mut scratch).unwrap_or(0);
@@ -602,6 +606,14 @@ fn s3_two_bucket_archive(
                 } else {
                     &east
                 };
+                // Objects only. A listing is one request per satellite and is
+                // not a body in flight; holding it would gate the round on a
+                // window that can never fill.
+                if let Some(gate) = &gate
+                    && !is_a_listing(&path)
+                {
+                    gate.hold(GRANULE_FETCH_CONCURRENCY, A_QUIET_WIRE);
+                }
                 let _ = stream.write_all(&archive_reply(&path, granules));
                 let _ = stream.flush();
             });
@@ -617,6 +629,14 @@ fn s3_two_bucket_archive(
 
 /// The one route table [`s3_two_bucket_archive`] serves: a path carrying
 /// `prefix=` is a listing, anything else addresses an object.
+///
+/// Spelled once and read twice — [`archive_reply`] routes on it and the
+/// in-flight gate holds everything it answers `false` for.
+fn is_a_listing(path: &str) -> bool {
+    path.contains("prefix=")
+}
+
+/// A listing's keys under the prefix it names, or one object's own bytes.
 fn archive_reply(path: &str, granules: &[(String, Vec<u8>)]) -> Vec<u8> {
     if let Some(rest) = path.split("prefix=").nth(1) {
         let prefix = rest.split('&').next().unwrap_or("");
@@ -654,14 +674,122 @@ fn http_reply(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
     out
 }
 
+/// How long the gate below waits for another request before deciding the client
+/// has nothing more to send.
+///
+/// It bounds how long the fixture hunts for a violation, never the verdict: a
+/// window that closes under the cap is discarded and re-armed rather than read.
+const A_QUIET_WIRE: Duration = Duration::from_secs(1);
+
+/// **How many object requests the archive is holding at once**, and the most it
+/// ever held — the download phase's concurrency counted in bodies rather than
+/// weighed in bytes.
+///
+/// A byte high-water mark of work in flight is a scheduling outcome wearing
+/// load-immune units: it reads whatever had arrived at the instant the maximum
+/// fell, so the figure moves with the load on the box while the assertion over
+/// it reads like a property of the code. A count of requests the server is
+/// holding does not move: the client cannot have more requests outstanding than
+/// its stream lets it start, however fast or slowly the box runs them.
+///
+/// The gate is what makes that count a measurement rather than a sighting.
+/// Every object request blocks in [`hold`](Self::hold), so **no reply can be
+/// sent while the client is still free to send one more** — the fixture waits
+/// for the violation instead of hoping to be looking when it happens. It lets
+/// the requests it holds go when either
+///
+/// - one more than `cap` are held, which is the violation itself, or
+/// - `quiet` passes with nothing new arriving, which is the client having
+///   nothing more to send.
+///
+/// A window that expires under the cap is not a reading, so the gate re-arms
+/// and the next slots to fill get another turn. It latches open once it has
+/// seen the cap filled, and the rest of the round runs at full speed.
+struct BodiesInFlight {
+    state: Mutex<InFlight>,
+    arrived: Condvar,
+}
+
+struct InFlight {
+    /// Requests received and not yet let go.
+    held: usize,
+    /// The most held at once, which is the figure under test.
+    peak: usize,
+    /// Bumped when a generation is let go; each waiter watches its own value.
+    generation: u64,
+    /// Set once a reading has been taken: every request after passes through.
+    latched: bool,
+    last_arrival: Instant,
+}
+
+impl BodiesInFlight {
+    fn new() -> Arc<Self> {
+        Arc::new(BodiesInFlight {
+            state: Mutex::new(InFlight {
+                held: 0,
+                peak: 0,
+                generation: 0,
+                latched: false,
+                last_arrival: Instant::now(),
+            }),
+            arrived: Condvar::new(),
+        })
+    }
+
+    /// Hold this request until the batch cannot grow any further, counting it
+    /// while it waits.
+    ///
+    /// Every wait is bounded by `quiet` from the *last* arrival, so a waiter
+    /// always leaves and the fixture cannot hang on a client that stops.
+    fn hold(&self, cap: usize, quiet: Duration) {
+        let mut state = self.state.lock().expect("in-flight gate");
+        state.held += 1;
+        state.peak = state.peak.max(state.held);
+        state.last_arrival = Instant::now();
+        if !state.latched {
+            if state.held > cap {
+                // The claim is already false and the reading is taken: let the
+                // round run rather than spending a window on it.
+                state.latched = true;
+                state.generation += 1;
+            }
+            let mine = state.generation;
+            self.arrived.notify_all();
+            while state.generation == mine {
+                match quiet.checked_sub(state.last_arrival.elapsed()) {
+                    None => {
+                        state.latched = state.peak >= cap;
+                        state.generation += 1;
+                    }
+                    Some(left) => {
+                        state = self
+                            .arrived
+                            .wait_timeout(state, left)
+                            .expect("in-flight gate")
+                            .0;
+                    }
+                }
+            }
+        }
+        state.held -= 1;
+        drop(state);
+        self.arrived.notify_all();
+    }
+
+    fn peak(&self) -> usize {
+        self.state.lock().expect("in-flight gate").peak
+    }
+}
+
 /// Run one poll against a two-bucket archive over an **empty** store, and
 /// report the round's peak above that zero level.
 fn peak_of_a_cold_poll(
     east: Vec<(String, Vec<u8>)>,
     west: Vec<(String, Vec<u8>)>,
     window: Residency,
+    gate: Option<Arc<BodiesInFlight>>,
 ) -> (GlmStore, squallar_overlays::glm::GlmFetchOutcome, i64) {
-    let sources = s3_two_bucket_archive(east, west);
+    let sources = s3_two_bucket_archive(east, west, gate);
     let store = GlmStore::default();
     assert_eq!(
         store.retained_bytes(),
@@ -712,7 +840,7 @@ fn a_cold_poll_holds_one_row_buffer_per_delivery() {
         .collect();
     let granule_bytes = east[0].1.len();
 
-    let (store, outcome, peak) = peak_of_a_cold_poll(east, west, a_live_window());
+    let (store, outcome, peak) = peak_of_a_cold_poll(east, west, a_live_window(), None);
 
     let rows = cold_rows_total();
     assert_eq!(
@@ -844,19 +972,30 @@ fn a_granule_under_the_parser_exists_once() {
 /// **The concurrency cap is what bounds the bodies in flight**, not the size of
 /// the batch.
 ///
-/// The batch here is 45 objects per satellite against a cap of
-/// [`GRANULE_FETCH_CONCURRENCY`]; run uncapped it would hold all 45 bodies —
-/// 12,686,580 B rather than 5,638,480 B — and the bar below is set between the
-/// two. This is what makes the constant load-bearing rather than decorative,
-/// which is the whole of what naming a bare `20` buys.
+/// The batch is 45 objects per satellite against a cap of
+/// [`GRANULE_FETCH_CONCURRENCY`]; run uncapped it holds all 45. What is
+/// asserted is **the count of bodies in flight**, read off the archive through
+/// [`BodiesInFlight`], and it is the only figure here that is a property of the
+/// code rather than of the box.
 ///
-/// **The spread, before the difference**: five runs of the unchanged tree read
-/// 6,970,916 / 7,254,903 / 7,365,766 / 7,596,300 / 7,689,652 B, and a sixth
-/// 8,415,961 B — a 1.4 MB spread, since how many bodies have arrived when the
-/// window's maximum falls is a scheduling outcome. The bar sits 3.5 MB above
-/// the highest of those and ~3 MB below an uncapped batch. Nothing smaller than
-/// that spread is measurable here, which is why the parse door has its own test
-/// rather than a share of this figure.
+/// **The byte peak beside it is printed and never asserted, and that is the
+/// finding.** It was the bar until 2026-09-09, set at one body per slot plus
+/// half as much again for the transport and two cached levels — 11,913,720 B
+/// against a 5,638,480 B capped cost and a 12,686,580 B uncapped one. A peak of
+/// *in-flight* bytes is a scheduling outcome: it reads whatever had arrived at
+/// the instant the maximum fell, so it moved with the load on the box while its
+/// units read like a property of the code. Five runs on one idle box read
+/// 11,972,932 / 11,973,188 / 12,104,068 / 12,104,132 / 12,104,260 B — over the
+/// bar every time, with the gate below reporting the cap **exactly filled and
+/// never exceeded** on the same runs. The bar had drifted into the top 6 % of
+/// the gap between the two hypotheses it was there to separate, and lifting it
+/// clear of the excursion would have put it over the uncapped cost, where it
+/// would pass whether or not the stream was bounded at all.
+///
+/// The count has no such excursion, and the gate is what turns it from a
+/// sighting into a measurement: the archive answers nothing while the client is
+/// still free to send one more, so a batch that runs uncapped is *held* until
+/// its 21st request has been counted.
 #[test]
 fn a_batch_holds_no_more_bodies_than_the_concurrency_cap() {
     let east: Vec<(String, Vec<u8>)> = archive_keys("G19", WIRE_GRANULES_PER_SAT)
@@ -879,7 +1018,10 @@ fn a_batch_holds_no_more_bodies_than_the_concurrency_cap() {
         .collect();
     let granule_bytes = east[0].1.len();
 
-    let (store, outcome, peak) = peak_of_a_cold_poll(east, west, a_wire_window());
+    let gate = BodiesInFlight::new();
+    let (store, outcome, peak) =
+        peak_of_a_cold_poll(east, west, a_wire_window(), Some(Arc::clone(&gate)));
+    let bodies = gate.peak();
 
     let rows = WIRE_ROWS_PER_LEVEL * COLD_LEVELS.len() * WIRE_GRANULES_PER_SAT * 2;
     assert_eq!(
@@ -895,29 +1037,35 @@ fn a_batch_holds_no_more_bodies_than_the_concurrency_cap() {
     );
 
     let level = rows * FLASH_BYTES;
-    let in_flight = GRANULE_FETCH_CONCURRENCY * granule_bytes;
     println!(
         "cold poll (wire-sized): {} granules × {} rows, file {granule_bytes} B \
-         each = {rows} rows = {level} B cached; {GRANULE_FETCH_CONCURRENCY} in \
-         flight = {in_flight} B of bodies; PEAK {peak} B",
+         each = {rows} rows = {level} B cached; PEAK {bodies} bodies in flight \
+         of a {WIRE_GRANULES_PER_SAT}-object batch against a cap of \
+         {GRANULE_FETCH_CONCURRENCY} = {} B of bodies; byte peak of the whole \
+         round, NOT asserted: {peak} B",
         WIRE_GRANULES_PER_SAT * 2,
         WIRE_ROWS_PER_LEVEL * COLD_LEVELS.len(),
+        bodies * granule_bytes,
     );
 
-    // One body per slot, the cached level and its delivery, and half the
-    // bodies again for the transport's own buffers — which is what the 1.4 MB
-    // measured spread is made of. A batch run uncapped holds
-    // `WIRE_GRANULES_PER_SAT` bodies instead of `GRANULE_FETCH_CONCURRENCY` of
-    // them and cannot fit under this.
-    let bar = in_flight + in_flight / 2 + level * 2;
     assert!(
-        peak < bar as i64,
-        "a batch of {WIRE_GRANULES_PER_SAT} granules peaked at {peak} B, over \
-         the {bar} B that {GRANULE_FETCH_CONCURRENCY} bodies of \
-         {granule_bytes} B cost beside a {level} B cache and its delivery. \
+        bodies >= GRANULE_FETCH_CONCURRENCY,
+        "premise: the archive never held more than {bodies} of the \
+         {WIRE_GRANULES_PER_SAT} objects at once, under the \
+         {GRANULE_FETCH_CONCURRENCY} the cap allows, so the bar below was \
+         never approached and says nothing. The gate holds every object \
+         request until nothing new has arrived for {A_QUIET_WIRE:?}, so this \
+         is not a slow box losing a race — it is a round that could not put \
+         {GRANULE_FETCH_CONCURRENCY} requests in flight in that time",
+    );
+    assert!(
+        bodies <= GRANULE_FETCH_CONCURRENCY,
+        "a batch of {WIRE_GRANULES_PER_SAT} objects per satellite put {bodies} \
+         bodies in flight at once, over the {GRANULE_FETCH_CONCURRENCY} the \
+         cap allows — {} B of granule against the {} B a capped batch holds. \
          `download_and_parse_batch` must bound its stream by \
-         GRANULE_FETCH_CONCURRENCY; unbounded, this batch holds {} B of \
-         bodies",
-        WIRE_GRANULES_PER_SAT * granule_bytes,
+         GRANULE_FETCH_CONCURRENCY",
+        bodies * granule_bytes,
+        GRANULE_FETCH_CONCURRENCY * granule_bytes,
     );
 }
