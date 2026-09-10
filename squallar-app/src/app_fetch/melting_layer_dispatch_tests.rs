@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 const SITE: &str = "KTLX";
 
 /// A worker port that keeps what it was handed instead of posting it.
-struct Recorder(Arc<Mutex<Vec<Vec<u8>>>>);
+pub(super) struct Recorder(pub(super) Arc<Mutex<Vec<Vec<u8>>>>);
 
 impl JobSink for Recorder {
     /// Serialises here, as the browser's own sink does, so what these tests read back has
@@ -34,7 +34,7 @@ const OBJECT: &[u8] = &[0xAB; 16];
 
 /// A dual-pol volume small enough to build here and complete enough for the hybrid
 /// classification to extract from: every moment the classifier reads, on every radial.
-fn dual_pol_scan() -> nexrad_model::data::Scan {
+pub(super) fn dual_pol_scan() -> nexrad_model::data::Scan {
     use nexrad_model::data::{
         ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan,
         Sweep, VolumeCoveragePattern, WaveformType,

@@ -558,23 +558,39 @@ impl super::App {
             .get(site)
             .copied()
             .unwrap_or(0);
+        // **The pane list, asked once and used by both questions below** — which
+        // instants this site owes soundings for, and which volume it currently
+        // has loaded. Two calls would be two reaches across the GUI seam for two
+        // facts about one list, and the ceiling in this file has no slack; this
+        // is the same "asked once" the melting layer's `loaded_volume` already
+        // uses, widened to cover the sounding span rather than a second borrow
+        // taken beside it.
+        let panes = self.gui.panes();
         {
             // Environmental 0 °C / −20 °C heights, for the products
             // `RadarProduct::reads_env_heights` names.
+            //
+            // **Asked over a span, not for the wall-clock hour.** The fetch is
+            // keyed by site and two of this function's three callers have no
+            // pane in scope, so the instants come from the panes on this site —
+            // the same fan-out `latest_scan_time_for_site` below already does.
+            // A looping pane needs every hour of its lookback, because each
+            // frame is rendered against its own hour; one request covers the
+            // whole span, since Open-Meteo answers hourly rows in one response.
             let now = chrono::Utc::now();
-            let fresh = self
-                .render
-                .env_heights
-                .get(site)
-                .is_some_and(|h| !h.is_stale(now));
-            if !fresh && let Some(radar) = squallar_radar::sites::get_radar_site(site) {
+            if let Some((from, to)) = sounding_span_for_site(panes, site, now)
+                && !self.render.env_heights_cover(site, from, to)
+                && let Some(radar) = squallar_radar::sites::get_radar_site(site)
+            {
                 let (lat, lon) = (radar.lat, radar.lon);
                 let site = site.to_string();
                 self.spawn_async_task(self.channels.sounding_sender.clone(), async move {
-                    let heights = squallar_radar::sounding::fetch_env_heights(
+                    let heights = squallar_radar::sounding::fetch_env_heights_range(
                         &squallar_radar::sources::DataSources::production(),
                         lat,
                         lon,
+                        from,
+                        to,
                     )
                     .await;
                     crate::channels::SoundingResponse {
@@ -589,10 +605,9 @@ impl super::App {
             log::debug!("{site} has no RPG, so no Level III objects are fetched for it");
             return;
         }
-        // The volume this site currently has loaded, asked once and used by all
-        // three fetches below. Two separate calls is two reaches across the GUI
-        // seam for one answer, and the ceiling in this file has no slack.
-        let loaded_volume = latest_scan_time_for_site(self.gui.panes(), site);
+        // The volume this site currently has loaded, used by all three fetches
+        // below, off the same borrow the sounding span above took.
+        let loaded_volume = latest_scan_time_for_site(panes, site);
 
         // The RPG's own Melting Layer object (Level III 166, AWIPS `N0M`) for the
         // volume this site currently has loaded.
@@ -2765,11 +2780,18 @@ impl super::App {
         let storm_motion = (product == squallar_radar::types::RadarProduct::StormRelativeVelocity)
             .then(|| self.render.storm_motion_override_kt())
             .flatten();
-        // The environmental heights ride the same way for the hail pair and the
-        // classification.
-        let env_heights = self.render.env_heights_km_msl_for(product, &target.site);
-        // The melting layer does **not** ride the same way, and the difference
-        // is `timestamp`.
+        // The environmental heights ride the same way as the melting layer below,
+        // and for the same reason: `timestamp`. A loop spanning hours crosses
+        // real changes in the freezing level — 150 m at the median over six
+        // hours and 450 m at the worst, measured at KOAX over 72 hourly rows —
+        // and `H₀` clips every layer of the SHI this frame's POSH and MEHS come
+        // from. One site-global pair for the whole loop moves every frame's hail
+        // together in the direction of whatever hour happened to be fetched.
+        let env_heights = self
+            .render
+            .env_heights_km_msl_for(product, &target.site, timestamp);
+        // The melting layer rides the same way, and the difference is
+        // `timestamp`.
         let melting_layer = self
             .render
             .melting_layer_product_for(product, &target.site, timestamp);
@@ -3253,6 +3275,45 @@ fn local_to_utc_in<Tz: TimeZone>(tz: &Tz, timestamp: NaiveDateTime) -> NaiveDate
 }
 
 /// The newest scan of `site` any pane is currently showing, or `None` if none is.
+/// **The span of instants the panes on `site` need soundings for.**
+///
+/// A pane following live needs the current hour; a scrubbed pane needs its own
+/// instant; a pane with a lookback needs every hour that window covers, because
+/// `spawn_loop_frame_render` resolves the sounding for each frame's own instant.
+///
+/// The width is clamped to [`SOUNDING_SPAN_CEILING_HOURS`] so a pathological
+/// lookback cannot turn one request into thousands of rows. `None` when no pane
+/// is on this site, which is when no sounding is owed at all.
+pub(super) fn sounding_span_for_site(
+    panes: &[squallar_egui::pane::PaneState],
+    site: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+    let mut span: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> = None;
+    for pane in panes.iter().filter(|p| p.is_map() && p.site() == site) {
+        let end = pane.time.mode.as_of().map_or(now, |t| t.and_utc());
+        // `PaneState::loop_span_secs` is this raised to the transport's floor,
+        // and for radar that floor is 0 — so the lookback alone is the span here
+        // and the overlay registry does not need to be borrowed to ask.
+        let start =
+            end - chrono::Duration::seconds(pane.time.span_secs.min(i64::MAX as u64) as i64);
+        span = Some(match span {
+            None => (start, end),
+            Some((lo, hi)) => (lo.min(start), hi.max(end)),
+        });
+    }
+    let (from, to) = span?;
+    let ceiling = chrono::Duration::hours(SOUNDING_SPAN_CEILING_HOURS);
+    Some((from.max(to - ceiling), to))
+}
+
+/// **The widest span one sounding request may cover.** The lookback slider tops
+/// out at 1440 minutes (`squallar_egui::ui_timeline`), so 24 hours is every hour
+/// a loop can ask for; the store's own cap
+/// (`squallar_radar::sounding::MAX_HOURS_PER_SITE`) sits above the 25 buckets
+/// that implies.
+pub(super) const SOUNDING_SPAN_CEILING_HOURS: i64 = 24;
+
 pub(super) fn latest_scan_time_for_site(
     panes: &[squallar_egui::pane::PaneState],
     site: &str,
@@ -4486,6 +4547,10 @@ mod loop_refill_dispatch_tests;
 #[path = "app_fetch/melting_layer_dispatch_tests.rs"]
 #[cfg(test)]
 mod melting_layer_dispatch_tests;
+
+#[path = "app_fetch/sounding_asof_dispatch_tests.rs"]
+#[cfg(test)]
+mod sounding_asof_dispatch_tests;
 
 /// The sites overlay dispatch is a described job that reaches the installed
 /// sink, and a job the worker never answers still un-wedges the pane.

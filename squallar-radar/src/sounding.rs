@@ -22,7 +22,7 @@
 //! every HSDA size class and every HCA and HHC class, so a 500 m error moves
 //! all of them at once and leaves every one looking plausible.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Timelike, Utc};
 use serde::Deserialize;
 
 use crate::sources::DataSources;
@@ -34,44 +34,225 @@ pub const ENV_HEIGHTS_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// bad link, not transfer time.
 const SOUNDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Environmental freezing-level heights over one point, with the fetch time
-/// that [`Self::is_stale`] measures the TTL from.
+/// Environmental freezing-level heights over one point **for one hour**.
+///
+/// `valid_at` is the hour the two heights describe and `fetched_at` is when the
+/// request that produced them completed. They are the same hour for a live
+/// sounding and far apart for a historical one, and [`Self::is_stale`] is the
+/// difference: a sounding for a past hour is already final, so no elapsed
+/// wall-clock time can make it wrong.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EnvHeights {
     /// Height of the 0 °C surface, km above mean sea level.
     pub h0c_km_msl: f64,
     /// Height of the −20 °C surface, km above mean sea level.
     pub hm20c_km_msl: f64,
+    /// The UTC hour these heights describe.
+    pub valid_at: DateTime<Utc>,
     /// When the fetch completed (UTC).
     pub fetched_at: DateTime<Utc>,
 }
 
+/// The hour a sounding sample describes, as a UTC instant.
+///
+/// **The bucket the cache keys on.** Open-Meteo answers in whole hours, so this
+/// is the finest instant the source can distinguish — two requests inside one
+/// hour read the same model row and return byte-identical values. Measured at
+/// KOAX over 72 consecutive rows, `|Δh0|` across one hour is 50 m at the median
+/// and 250 m at the worst, against the 500 m this module's header names as the
+/// error that moves every hail and HCA class at once; across six hours it is
+/// 150 m and 450 m, which is why one pair cannot serve a whole loop.
+pub fn hour_bucket(t: DateTime<Utc>) -> DateTime<Utc> {
+    t.with_minute(0)
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .unwrap_or(t)
+}
+
+fn ttl() -> chrono::Duration {
+    chrono::Duration::from_std(ENV_HEIGHTS_TTL).expect("ENV_HEIGHTS_TTL fits in a chrono::Duration")
+}
+
 impl EnvHeights {
+    /// Whether this sample describes an hour already closed when it was fetched.
+    ///
+    /// Such a sample is a reading of the past: the model row behind it will not
+    /// be revised by waiting, so it never expires.
+    pub fn is_historical(&self) -> bool {
+        self.fetched_at.signed_duration_since(self.valid_at) >= ttl()
+    }
+
     /// Whether this value has outlived [`ENV_HEIGHTS_TTL`].
+    ///
+    /// Only a sounding for the live hour can: see [`Self::is_historical`].
     pub fn is_stale(&self, now: DateTime<Utc>) -> bool {
-        let ttl = chrono::Duration::from_std(ENV_HEIGHTS_TTL)
-            .expect("ENV_HEIGHTS_TTL fits in a chrono::Duration");
-        now.signed_duration_since(self.fetched_at) >= ttl
+        !self.is_historical() && now.signed_duration_since(self.fetched_at) >= ttl()
     }
 }
 
-/// Fetch the current 0 °C and −20 °C heights above `(lat, lon)`.
-pub async fn fetch_env_heights(sources: &DataSources, lat: f64, lon: f64) -> Option<EnvHeights> {
+/// Fetch the 0 °C and −20 °C heights above `(lat, lon)` **for the hour `as_of`
+/// falls in**.
+///
+/// `as_of` is the instant the pane is showing, not the wall clock: a pane
+/// scrubbed to a past hour and a loop frame from a past hour both resolve the
+/// sounding that was over the site then. Pass `Utc::now()` for a live pane.
+///
+/// `None` when that hour cannot be answered. Open-Meteo keeps the pressure
+/// levels the −20 °C height is interpolated from for about three weeks
+/// (measured 2026-09-10: present 22 days back, null at 24), so an instant older
+/// than that returns nothing rather than a wrong answer.
+pub async fn fetch_env_heights(
+    sources: &DataSources,
+    lat: f64,
+    lon: f64,
+    as_of: DateTime<Utc>,
+) -> Option<EnvHeights> {
+    let mut hours = fetch_env_heights_range(sources, lat, lon, as_of, as_of).await;
+    hours.sort_by_key(|h| {
+        h.valid_at
+            .signed_duration_since(as_of)
+            .num_seconds()
+            .unsigned_abs()
+    });
+    hours.into_iter().next()
+}
+
+/// Fetch **every hourly sounding from `from` to `to`** above `(lat, lon)`.
+///
+/// One request: Open-Meteo returns the whole range as hourly rows, so a loop's
+/// entire span of soundings costs one round trip rather than one per frame.
+/// Hours the model cannot answer are absent from the result rather than
+/// substituted — see [`parse_env_heights_series`].
+pub async fn fetch_env_heights_range(
+    sources: &DataSources,
+    lat: f64,
+    lon: f64,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Vec<EnvHeights> {
     crate::tls::init();
-    let url = sources.sounding_url(lat, lon);
-    let client = sources.sounding_client(SOUNDING_TIMEOUT).ok()?;
-    let response = client.get(&url).send().await.ok()?;
+    let url = sources.sounding_url(lat, lon, from, to);
+    let Ok(client) = sources.sounding_client(SOUNDING_TIMEOUT) else {
+        return Vec::new();
+    };
+    let Ok(response) = client.get(&url).send().await else {
+        return Vec::new();
+    };
     if !response.status().is_success() {
         log::warn!("Sounding fetch: HTTP {} from {url}", response.status());
-        return None;
+        return Vec::new();
     }
-    let body = squallar_source::http::body_to_string(response).await.ok()?;
-    let (h0c_km_msl, hm20c_km_msl) = parse_env_heights(&body)?;
-    Some(EnvHeights {
-        h0c_km_msl,
-        hm20c_km_msl,
-        fetched_at: Utc::now(),
-    })
+    let Ok(body) = squallar_source::http::body_to_string(response).await else {
+        return Vec::new();
+    };
+    let fetched_at = Utc::now();
+    parse_env_heights_series(&body)
+        .into_iter()
+        .map(|(valid_at, h0c_km_msl, hm20c_km_msl)| EnvHeights {
+            h0c_km_msl,
+            hm20c_km_msl,
+            valid_at,
+            fetched_at,
+        })
+        .collect()
+}
+
+/// **The most hourly soundings one site keeps.**
+///
+/// The lookback slider tops out at 1440 minutes (`squallar_egui::ui_timeline`),
+/// so the widest loop a pane can ask for spans 24 hours and touches 25 hourly
+/// buckets counting both ends. The rest is slack for a pane parked outside its
+/// own loop's span and for a second pane on the same site at another instant.
+///
+/// **This is what stops a scrubber drag being a leak.** Dragging mints instants
+/// without limit, but they land in hour buckets, and past this cap the sample
+/// furthest in time from the newest one is dropped.
+pub const MAX_HOURS_PER_SITE: usize = 32;
+
+/// The hourly soundings one site has in hand, bounded by [`MAX_HOURS_PER_SITE`].
+///
+/// A sample answers for **its own hour only**. Substituting a neighbouring hour
+/// is the defect this type exists to remove: an instant answered silently with
+/// another instant's data is exactly what a scrubbed pane showing today's
+/// freezing level was doing.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EnvHeightsStore {
+    by_hour: std::collections::BTreeMap<DateTime<Utc>, EnvHeights>,
+}
+
+impl EnvHeightsStore {
+    /// File a sample under the hour it describes, evicting to the cap.
+    ///
+    /// Returns whether the pair it holds for that hour actually moved — the
+    /// caller drops renders on that answer, and a refetch that lands the same
+    /// two numbers must not invalidate anything.
+    pub fn insert(&mut self, heights: EnvHeights) -> bool {
+        let hour = hour_bucket(heights.valid_at);
+        let moved = self.by_hour.get(&hour).is_none_or(|old| {
+            old.h0c_km_msl != heights.h0c_km_msl || old.hm20c_km_msl != heights.hm20c_km_msl
+        });
+        self.by_hour.insert(hour, heights);
+        while self.by_hour.len() > MAX_HOURS_PER_SITE {
+            // Furthest in time from the newest arrival: a loop walking forward
+            // sheds the hours behind it, and one walking back sheds the hours
+            // ahead. Both ends are reachable, so neither `first` nor `last` is
+            // the right one to drop.
+            let Some(&newest) = self.by_hour.keys().next_back() else {
+                break;
+            };
+            let Some(&furthest) = self
+                .by_hour
+                .keys()
+                .max_by_key(|k| k.signed_duration_since(newest).num_seconds().abs())
+            else {
+                break;
+            };
+            self.by_hour.remove(&furthest);
+        }
+        moved
+    }
+
+    /// The `(0 °C, −20 °C)` pair for the hour `when` falls in, or `None`.
+    ///
+    /// `None` is a real answer: the caller renders nothing rather than
+    /// classifying against some other hour's atmosphere.
+    pub fn at(&self, when: DateTime<Utc>) -> Option<(f64, f64)> {
+        self.by_hour
+            .get(&hour_bucket(when))
+            .map(|h| (h.h0c_km_msl, h.hm20c_km_msl))
+    }
+
+    /// Whether every hour in `from ..= to` is already held, so no fetch is owed.
+    pub fn covers(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> bool {
+        let mut hour = hour_bucket(from);
+        let last = hour_bucket(to);
+        while hour <= last {
+            if !self.by_hour.contains_key(&hour) {
+                return false;
+            }
+            hour += chrono::Duration::hours(1);
+        }
+        true
+    }
+
+    /// Drop every sample that has outlived the TTL for the live hour.
+    pub fn drop_stale(&mut self, now: DateTime<Utc>) {
+        self.by_hour.retain(|_, h| !h.is_stale(now));
+    }
+
+    /// How many hourly samples are held. **The quantity the cap bounds.**
+    pub fn len(&self) -> usize {
+        self.by_hour.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_hour.is_empty()
+    }
+
+    /// The hours held, oldest first.
+    pub fn hours(&self) -> impl Iterator<Item = DateTime<Utc>> + '_ {
+        self.by_hour.keys().copied()
+    }
 }
 
 /// The slice of an Open-Meteo `/v1/forecast` response this module reads.
@@ -85,6 +266,10 @@ struct SoundingResponse {
 /// whole response down — [`parse_env_heights`] just moves to the next hour.
 #[derive(Deserialize)]
 struct Hourly {
+    /// Row timestamps, `%Y-%m-%dT%H:%M` and UTC because the query names no
+    /// timezone. **The only thing that says which hour a row describes**, and
+    /// the reason a row is chosen by its own time rather than by its position.
+    time: Vec<String>,
     freezing_level_height: Vec<Option<f64>>,
     #[serde(rename = "temperature_600hPa")]
     t_600: Vec<Option<f64>>,
@@ -123,18 +308,62 @@ impl Hourly {
     }
 }
 
-/// Parse an Open-Meteo response into `(h0c_km_msl, hm20c_km_msl)`.
+/// Every complete hour in an Open-Meteo response, as
+/// `(valid_at, h0c_km_msl, hm20c_km_msl)`, in the order the response lists them.
+///
+/// Incomplete hours are dropped rather than taking the response down: Open-Meteo
+/// emits JSON `null` where a model row is missing, and beyond the pressure
+/// levels' retention window every row is null while `freezing_level_height`
+/// still reads — which is one height of the two and not enough to render with.
+pub fn parse_env_heights_series(json: &str) -> Vec<(DateTime<Utc>, f64, f64)> {
+    let Ok(response) = serde_json::from_str::<SoundingResponse>(json) else {
+        return Vec::new();
+    };
+    let hourly = &response.hourly;
+    (0..hourly.time.len())
+        .filter_map(|i| {
+            let valid_at = parse_hour(hourly.time.get(i)?)?;
+            let (freezing_m, levels) = hourly.row(i)?;
+            if !freezing_m.is_finite() {
+                return None;
+            }
+            let hm20_m = height_at_minus20_m(&levels)?;
+            Some((valid_at, freezing_m / 1000.0, hm20_m / 1000.0))
+        })
+        .collect()
+}
+
+/// Open-Meteo's `%Y-%m-%dT%H:%M` row stamp, read as UTC.
+///
+/// The query names no timezone, so the response is GMT and these are UTC
+/// instants. Seconds are absent from the format.
+fn parse_hour(raw: &str) -> Option<DateTime<Utc>> {
+    let naive = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M").ok()?;
+    Utc.from_utc_datetime(&naive).into()
+}
+
+/// The complete hour **nearest `as_of`**, as `(valid_at, h0c, hm20c)`.
+///
+/// Nearest rather than first: the response is a window around the requested
+/// hour, and taking whichever row happened to come back first is how a pane
+/// asking for one instant is answered with another. Ties go to the earlier row.
+pub fn parse_env_heights_at(json: &str, as_of: DateTime<Utc>) -> Option<(DateTime<Utc>, f64, f64)> {
+    parse_env_heights_series(json)
+        .into_iter()
+        .min_by_key(|(valid_at, _, _)| {
+            valid_at
+                .signed_duration_since(as_of)
+                .num_seconds()
+                .unsigned_abs()
+        })
+}
+
+/// Parse an Open-Meteo response into `(h0c_km_msl, hm20c_km_msl)`, taking the
+/// first complete hour it lists.
 pub fn parse_env_heights(json: &str) -> Option<(f64, f64)> {
-    let response: SoundingResponse = serde_json::from_str(json).ok()?;
-    let hours = response.hourly.freezing_level_height.len();
-    (0..hours).find_map(|i| {
-        let (freezing_m, levels) = response.hourly.row(i)?;
-        if !freezing_m.is_finite() {
-            return None;
-        }
-        let hm20_m = height_at_minus20_m(&levels)?;
-        Some((freezing_m / 1000.0, hm20_m / 1000.0))
-    })
+    parse_env_heights_series(json)
+        .first()
+        .map(|&(_, h0c, hm20c)| (h0c, hm20c))
 }
 
 const TARGET_C: f64 = -20.0;
@@ -355,12 +584,235 @@ mod tests {
         assert_eq!(parse_env_heights(&empty), None);
     }
 
+    // ── The hour a response is read at ────────────────────────────────────
+
+    fn utc(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, m, d, h, min, 0).unwrap()
+    }
+
+    /// **Defect 1, at the parse seam.** The KOAX fixture holds two hours whose
+    /// 0 °C heights differ by 90 m: 18:00 is 5.190 km and 19:00 is 5.100 km.
+    /// Asking for one hour must not answer with the other. Taking the first
+    /// complete row — which is what this did until the API grew an instant —
+    /// answers 5.190 for every question anyone can ask of this response.
+    #[test]
+    fn the_hour_asked_for_is_the_hour_returned() {
+        let (at18, h0_18, _) =
+            parse_env_heights_at(KOAX, utc(2026, 7, 28, 18, 0)).expect("18:00 is a complete row");
+        assert_eq!(at18, utc(2026, 7, 28, 18, 0));
+        assert_close(h0_18, 5.190, "0C height km at 18:00");
+
+        let (at19, h0_19, _) =
+            parse_env_heights_at(KOAX, utc(2026, 7, 28, 19, 0)).expect("19:00 is a complete row");
+        assert_eq!(at19, utc(2026, 7, 28, 19, 0));
+        assert_close(h0_19, 5.100, "0C height km at 19:00");
+
+        assert_ne!(
+            h0_18, h0_19,
+            "the two hours of this fixture must not resolve to one height",
+        );
+    }
+
+    /// Every instant inside an hour reads that hour's row: Open-Meteo answers in
+    /// whole hours, so a finer question has no finer answer.
+    #[test]
+    fn an_instant_inside_an_hour_reads_that_hours_row() {
+        for minute in [0, 1, 30, 59] {
+            let (valid_at, h0, _) = parse_env_heights_at(KOAX, utc(2026, 7, 28, 19, minute))
+                .expect("19:00 is a complete row");
+            assert_eq!(valid_at, utc(2026, 7, 28, 19, 0), "minute {minute}");
+            assert_close(h0, 5.100, "0C height km");
+        }
+    }
+
+    /// An instant off both ends takes the nearest row it has rather than the
+    /// first one listed.
+    #[test]
+    fn an_instant_outside_the_response_takes_the_nearest_row() {
+        let (early, _, _) =
+            parse_env_heights_at(KOAX, utc(2026, 7, 28, 4, 0)).expect("a row is still chosen");
+        assert_eq!(early, utc(2026, 7, 28, 18, 0), "nearest below the window");
+        let (late, _, _) =
+            parse_env_heights_at(KOAX, utc(2026, 7, 29, 6, 0)).expect("a row is still chosen");
+        assert_eq!(late, utc(2026, 7, 28, 19, 0), "nearest above the window");
+    }
+
+    /// The series is every complete hour, in response order.
+    #[test]
+    fn the_series_lists_every_complete_hour() {
+        let series = parse_env_heights_series(KOAX);
+        assert_eq!(series.len(), 2, "the fixture has two complete hours");
+        assert_eq!(series[0].0, utc(2026, 7, 28, 18, 0));
+        assert_eq!(series[1].0, utc(2026, 7, 28, 19, 0));
+    }
+
+    /// An hour whose pressure levels are null is dropped, not answered with the
+    /// freezing level alone — which is the shape Open-Meteo returns past the
+    /// levels' retention window.
+    #[test]
+    fn an_hour_with_null_pressure_levels_is_not_in_the_series() {
+        let json = KOAX.replacen("[4.1,3.9]", "[null,3.9]", 1);
+        let series = parse_env_heights_series(&json);
+        assert_eq!(series.len(), 1, "only the complete hour survives");
+        assert_eq!(series[0].0, utc(2026, 7, 28, 19, 0));
+        assert_eq!(
+            parse_env_heights_at(&json, utc(2026, 7, 28, 18, 0)).map(|(t, _, _)| t),
+            Some(utc(2026, 7, 28, 19, 0)),
+            "asking for the null hour falls to the neighbour rather than inventing one",
+        );
+    }
+
+    /// A response with no rows at all answers nothing.
+    #[test]
+    fn a_response_with_no_complete_hour_answers_nothing() {
+        let json = KOAX
+            .replace("[5190.00,5100.00]", "[null,null]")
+            .replace("[4.1,3.9]", "[null,null]");
+        assert_eq!(parse_env_heights_at(&json, utc(2026, 7, 28, 18, 0)), None);
+    }
+
+    // ── The store, and what bounds it ─────────────────────────────────────
+
+    fn sample(valid_at: DateTime<Utc>, h0: f64) -> EnvHeights {
+        EnvHeights {
+            h0c_km_msl: h0,
+            hm20c_km_msl: h0 + 3.0,
+            valid_at,
+            fetched_at: valid_at + chrono::Duration::days(1),
+        }
+    }
+
+    /// A sample answers for its own hour and for no other.
+    #[test]
+    fn the_store_answers_for_the_hour_asked_and_no_other() {
+        let mut store = EnvHeightsStore::default();
+        store.insert(sample(utc(2026, 7, 28, 18, 0), 5.0));
+        assert_eq!(store.at(utc(2026, 7, 28, 18, 0)), Some((5.0, 8.0)));
+        assert_eq!(store.at(utc(2026, 7, 28, 18, 59)), Some((5.0, 8.0)));
+        assert_eq!(
+            store.at(utc(2026, 7, 28, 19, 0)),
+            None,
+            "the next hour must not be answered with this one's sounding",
+        );
+    }
+
+    /// **The ceiling, with a reading.** A scrubber drag mints instants without
+    /// limit; this drags across a week at one-second steps — 604,800 distinct
+    /// instants, every one of them a `set` a naive instant-keyed map would have
+    /// kept — and the store must still hold [`MAX_HOURS_PER_SITE`].
+    #[test]
+    fn an_unbounded_scrubber_drag_cannot_grow_the_store_past_its_cap() {
+        let mut store = EnvHeightsStore::default();
+        let base = utc(2026, 7, 28, 0, 0);
+        let mut inserted = 0u32;
+        for step in 0..604_800u32 {
+            if step % 97 != 0 {
+                continue; // one sample per 97 s of drag, ~6,235 inserts
+            }
+            store.insert(sample(
+                base + chrono::Duration::seconds(i64::from(step)),
+                4.0 + f64::from(step % 100) / 100.0,
+            ));
+            inserted += 1;
+            assert!(
+                store.len() <= MAX_HOURS_PER_SITE,
+                "store reached {} entries after {inserted} inserts",
+                store.len(),
+            );
+        }
+        assert!(inserted > 6_000, "the drag must actually be long");
+        assert_eq!(
+            store.len(),
+            MAX_HOURS_PER_SITE,
+            "a week-long drag settles exactly at the cap",
+        );
+
+        let bytes = store.len() * std::mem::size_of::<EnvHeights>();
+        println!(
+            "EnvHeightsStore ceiling: {} blocks x {} B = {bytes} B per site              after {inserted} inserts across 604,800 distinct instants",
+            store.len(),
+            std::mem::size_of::<EnvHeights>(),
+        );
+        assert!(
+            bytes < 2_048,
+            "one site's whole sounding cache is {bytes} B",
+        );
+    }
+
+    /// The cap keeps the hours nearest the newest arrival, in both directions:
+    /// a loop walking backwards must not have its own frames evicted.
+    #[test]
+    fn the_cap_keeps_the_hours_around_the_newest_arrival() {
+        let mut store = EnvHeightsStore::default();
+        let base = utc(2026, 7, 28, 0, 0);
+        // Fill well past the cap walking forward, then land one far in the past.
+        for hour in 0..(MAX_HOURS_PER_SITE as i64 + 20) {
+            store.insert(sample(base + chrono::Duration::hours(hour), 4.0));
+        }
+        assert_eq!(store.len(), MAX_HOURS_PER_SITE);
+        let newest = base + chrono::Duration::hours(MAX_HOURS_PER_SITE as i64 + 19);
+        assert!(store.at(newest).is_some(), "the newest hour survives");
+        assert!(
+            store.at(base).is_none(),
+            "the hour furthest from the newest was shed",
+        );
+    }
+
+    /// A refetch landing the same two numbers is not a change, so it drops no
+    /// renders; a refetch that moves them is.
+    #[test]
+    fn only_a_moved_pair_reports_a_change() {
+        let mut store = EnvHeightsStore::default();
+        let hour = utc(2026, 7, 28, 18, 0);
+        assert!(store.insert(sample(hour, 5.19)), "the first sample is new");
+        assert!(
+            !store.insert(sample(hour, 5.19)),
+            "the same pair for the same hour did not move",
+        );
+        assert!(store.insert(sample(hour, 5.10)), "a moved pair is a change");
+    }
+
+    /// `covers` is what decides a fetch is owed: it must be false while any
+    /// hour of the span is missing and true only once every one is held.
+    #[test]
+    fn covers_is_false_until_every_hour_of_the_span_is_held() {
+        let mut store = EnvHeightsStore::default();
+        let from = utc(2026, 7, 28, 12, 0);
+        let to = utc(2026, 7, 28, 15, 0);
+        assert!(!store.covers(from, to), "an empty store covers nothing");
+        for hour in [12, 13, 15] {
+            store.insert(sample(utc(2026, 7, 28, hour, 0), 4.0));
+        }
+        assert!(!store.covers(from, to), "14:00 is still missing");
+        store.insert(sample(utc(2026, 7, 28, 14, 0), 4.0));
+        assert!(store.covers(from, to), "every hour of the span is held");
+        assert!(
+            store.covers(from, from),
+            "a single-hour span is covered by its own hour",
+        );
+    }
+
+    /// A whole 24-hour loop — the widest the lookback slider offers — fits under
+    /// the cap with room to spare.
+    #[test]
+    fn the_widest_loop_the_slider_offers_fits_under_the_cap() {
+        let mut store = EnvHeightsStore::default();
+        let base = utc(2026, 7, 28, 0, 0);
+        for hour in 0..=24 {
+            store.insert(sample(base + chrono::Duration::hours(hour), 4.0));
+        }
+        assert_eq!(store.len(), 25, "24 hours of span is 25 hourly buckets");
+        assert!(store.len() <= MAX_HOURS_PER_SITE);
+        assert!(store.covers(base, base + chrono::Duration::hours(24)));
+    }
+
     // ── TTL ───────────────────────────────────────────────────────────────
 
     fn heights_at(fetched_at: DateTime<Utc>) -> EnvHeights {
         EnvHeights {
             h0c_km_msl: 4.2,
             hm20c_km_msl: 7.5,
+            valid_at: fetched_at,
             fetched_at,
         }
     }
@@ -387,6 +839,39 @@ mod tests {
         );
     }
 
+    /// **A sounding for a past hour never expires.** The values describe an hour
+    /// that is already closed, so no amount of elapsed wall-clock time makes
+    /// them wrong — and expiring them would refetch the same numbers forever
+    /// while a pane sat parked in the past.
+    #[test]
+    fn a_historical_sounding_never_goes_stale() {
+        let valid_at = utc(2013, 5, 20, 20, 0);
+        let fetched_at = utc(2026, 7, 28, 18, 0);
+        let h = EnvHeights {
+            h0c_km_msl: 4.2,
+            hm20c_km_msl: 7.5,
+            valid_at,
+            fetched_at,
+        };
+        assert!(h.is_historical(), "an hour 13 years before the fetch");
+        assert!(!h.is_stale(fetched_at + chrono::Duration::days(365)));
+    }
+
+    /// A live sounding still ages out: `valid_at` and `fetched_at` are the same
+    /// hour, so nothing about it is final.
+    #[test]
+    fn a_live_sounding_still_ages_out() {
+        let now = utc(2026, 7, 28, 18, 0);
+        let h = EnvHeights {
+            h0c_km_msl: 4.2,
+            hm20c_km_msl: 7.5,
+            valid_at: now,
+            fetched_at: now,
+        };
+        assert!(!h.is_historical());
+        assert!(h.is_stale(now + chrono::Duration::hours(1)));
+    }
+
     #[test]
     fn a_clock_stepped_backwards_reads_as_fresh() {
         let fetched = chrono::DateTime::parse_from_rfc3339("2026-07-28T18:00:00Z")
@@ -403,7 +888,7 @@ mod tests {
     #[tokio::test]
     async fn live_koax_sounding_is_physically_plausible() {
         let sources = DataSources::production();
-        let heights = fetch_env_heights(&sources, 41.320, -96.367)
+        let heights = fetch_env_heights(&sources, 41.320, -96.367, Utc::now())
             .await
             .expect("live Open-Meteo fetch + parse should succeed");
         println!(

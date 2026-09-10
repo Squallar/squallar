@@ -657,7 +657,7 @@ pub struct RenderDispatcher {
     level3_data: HashMap<(String, String), Arc<Level3Product>>,
     /// Environmental 0 °C / −20 °C heights per site, from Open-Meteo — staged for the
     /// products [`RadarProduct::reads_env_heights`] names.
-    pub env_heights: HashMap<String, squallar_radar::sounding::EnvHeights>,
+    pub env_heights: HashMap<String, squallar_radar::sounding::EnvHeightsStore>,
     /// The RPG's own Melting Layer object per site — the top rung of
     /// `squallar_radar::hca::resolve_melting_layer`.
     melting_layer: HashMap<String, MeltingLayerObject>,
@@ -1306,11 +1306,30 @@ impl RenderDispatcher {
         heights: squallar_radar::sounding::EnvHeights,
         gui: &squallar_egui::Gui,
     ) -> bool {
-        let unchanged = self.env_heights.get(site).is_some_and(|old| {
-            old.h0c_km_msl == heights.h0c_km_msl && old.hm20c_km_msl == heights.hm20c_km_msl
-        });
-        self.env_heights.insert(site.to_string(), heights);
-        if unchanged {
+        self.set_env_heights_series(site, [heights], gui)
+    }
+
+    /// File a whole range of hourly soundings for a site at once — what one
+    /// `fetch_env_heights_range` returns — and drop the renders any of them
+    /// moved.
+    ///
+    /// The sweep below is by site rather than by hour. Which hour each render
+    /// stood on is already in its key (`env_heights_bits`), so the extract cache
+    /// separates itself; re-rendering a frame whose own hour did not move is a
+    /// wasted render and never a wrong pixel, and the alternative is walking
+    /// every key against every landed hour on the frame thread.
+    pub fn set_env_heights_series(
+        &mut self,
+        site: &str,
+        landed: impl IntoIterator<Item = squallar_radar::sounding::EnvHeights>,
+        gui: &squallar_egui::Gui,
+    ) -> bool {
+        let store = self.env_heights.entry(site.to_string()).or_default();
+        let mut moved = false;
+        for heights in landed {
+            moved |= store.insert(heights);
+        }
+        if !moved {
             return false;
         }
         for (idx, prs) in self.pane_render.iter_mut().enumerate() {
@@ -2071,19 +2090,40 @@ impl RenderDispatcher {
 
     /// The environmental heights a Level II render's parameters carry: the site's
     /// `(0 °C, −20 °C)` pair in km MSL, for the products that read them.
+    /// The environmental heights a render's parameters carry: the site's
+    /// `(0 °C, −20 °C)` pair **for the hour `at` falls in**, for the products
+    /// that read them.
+    ///
+    /// `at` is the instant being rendered — the volume a still pane is showing,
+    /// or one loop frame's own timestamp — and not the wall clock. The melting
+    /// layer and the RPG's storm motion are asked for by the same instant on the
+    /// same path, for the same reason: a frame from a past hour classified
+    /// against this hour's atmosphere is wrong on screen.
+    ///
+    /// `None` when that hour is not held. Nothing is substituted: a neighbouring
+    /// hour's sounding is the defect, not the fallback.
     pub(crate) fn env_heights_km_msl_for(
         &self,
         product: RadarProduct,
         site: &str,
+        at: chrono::NaiveDateTime,
     ) -> Option<(f64, f64)> {
-        product
-            .reads_env_heights()
-            .then(|| {
-                self.env_heights
-                    .get(site)
-                    .map(|h| (h.h0c_km_msl, h.hm20c_km_msl))
-            })
-            .flatten()
+        if !product.reads_env_heights() {
+            return None;
+        }
+        self.env_heights.get(site)?.at(at.and_utc())
+    }
+
+    /// Whether `site` already holds a sounding for every hour in `from ..= to`.
+    pub(crate) fn env_heights_cover(
+        &self,
+        site: &str,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        self.env_heights
+            .get(site)
+            .is_some_and(|store| store.covers(from, to))
     }
 
     /// The `N0M` object a render of `volume_start` may classify against — and
@@ -2344,7 +2384,7 @@ impl RenderDispatcher {
         let storm_motion = (product == RadarProduct::StormRelativeVelocity)
             .then(|| self.storm_motion_override_kt())
             .flatten();
-        let env_heights = self.env_heights_km_msl_for(product, site);
+        let env_heights = self.env_heights_km_msl_for(product, site, volume_start);
         (
             extract_key(
                 site,

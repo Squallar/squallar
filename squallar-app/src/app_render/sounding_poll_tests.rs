@@ -1,12 +1,30 @@
 use super::stamping_tests::{SITE, app_showing_site};
 use squallar_radar::sounding::EnvHeights;
 
+/// The hour these fixtures speak for. Fixed rather than `now()` so the lookup
+/// below asks for the same hour the sample was filed under.
+fn hour() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339("2026-07-28T18:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+}
+
 fn heights(h0c_km_msl: f64) -> EnvHeights {
     EnvHeights {
         h0c_km_msl,
         hm20c_km_msl: h0c_km_msl + 3.2,
-        fetched_at: chrono::Utc::now(),
+        valid_at: hour(),
+        fetched_at: hour(),
     }
+}
+
+/// The 0 °C height the app holds for this site at [`hour`].
+fn held(app: &crate::app::App) -> Option<f64> {
+    app.render
+        .env_heights
+        .get(SITE)
+        .and_then(|store| store.at(hour()))
+        .map(|(h0c, _)| h0c)
 }
 
 /// As the sounding spawn in `spawn_level3_fetches` produces one.
@@ -14,7 +32,7 @@ fn landed(generation: u64, heights: Option<EnvHeights>) -> crate::channels::Soun
     crate::channels::SoundingResponse {
         generation,
         site: SITE.to_string(),
-        heights,
+        heights: heights.into_iter().collect(),
     }
 }
 
@@ -30,7 +48,7 @@ fn a_failed_refetch_keeps_the_previous_heights() {
         .unwrap();
     app.poll_level3_results();
     assert_eq!(
-        app.render.env_heights.get(SITE).map(|h| h.h0c_km_msl),
+        held(&app),
         Some(4.2),
         "the landed sounding never reached env_heights",
     );
@@ -38,7 +56,7 @@ fn a_failed_refetch_keeps_the_previous_heights() {
     app.channels.sounding_sender.send(landed(0, None)).unwrap();
     app.poll_level3_results();
     assert_eq!(
-        app.render.env_heights.get(SITE).map(|h| h.h0c_km_msl),
+        held(&app),
         Some(4.2),
         "a failed refetch cleared the stored heights instead of keeping them",
     );

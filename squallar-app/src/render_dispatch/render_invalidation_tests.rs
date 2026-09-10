@@ -51,6 +51,16 @@ fn gui_showing(site: &str) -> squallar_egui::Gui {
     gui
 }
 
+/// The hour these fixtures' soundings speak for, and the instant every lookup
+/// below asks at. Fixed rather than `now()`: the heights are filed under their
+/// own hour, so the question and the answer have to name the same one.
+fn sounding_hour() -> chrono::NaiveDateTime {
+    chrono::NaiveDate::from_ymd_opt(2026, 7, 28)
+        .unwrap()
+        .and_hms_opt(18, 0, 0)
+        .unwrap()
+}
+
 /// The environmental heights route into the hail render parameters from the same map the
 /// sounding drain writes, and a moved pair drops exactly that site's hail renders — the
 /// per-site sibling of `changing_the_override_invalidates_the_storm_relative_renders`.
@@ -59,14 +69,19 @@ fn a_landed_sounding_routes_into_hail_renders_and_a_moved_pair_drops_them() {
     let heights = |h0: f64, hm20: f64| squallar_radar::sounding::EnvHeights {
         h0c_km_msl: h0,
         hm20c_km_msl: hm20,
-        fetched_at: chrono::Utc::now(),
+        valid_at: sounding_hour().and_utc(),
+        fetched_at: sounding_hour().and_utc(),
     };
     let mut d = RenderDispatcher::new();
     let gui = gui_showing("KTLX");
     d.ensure_pane_count(1);
 
     assert_eq!(
-        d.env_heights_km_msl_for(RadarProduct::ProbabilityOfSevereHail, "KTLX"),
+        d.env_heights_km_msl_for(
+            RadarProduct::ProbabilityOfSevereHail,
+            "KTLX",
+            sounding_hour()
+        ),
         None,
         "before any sounding lands the render must draw nothing, not zeros",
     );
@@ -75,16 +90,20 @@ fn a_landed_sounding_routes_into_hail_renders_and_a_moved_pair_drops_them() {
         "the first pair is a change from nothing",
     );
     assert_eq!(
-        d.env_heights_km_msl_for(RadarProduct::MaxExpectedHailSize, "KTLX"),
+        d.env_heights_km_msl_for(RadarProduct::MaxExpectedHailSize, "KTLX", sounding_hour()),
         Some((4.2, 7.1)),
     );
     assert_eq!(
-        d.env_heights_km_msl_for(RadarProduct::Reflectivity, "KTLX"),
+        d.env_heights_km_msl_for(RadarProduct::Reflectivity, "KTLX", sounding_hour()),
         None,
         "reflectivity does not read the environment",
     );
     assert_eq!(
-        d.env_heights_km_msl_for(RadarProduct::ProbabilityOfSevereHail, "KOUN"),
+        d.env_heights_km_msl_for(
+            RadarProduct::ProbabilityOfSevereHail,
+            "KOUN",
+            sounding_hour()
+        ),
         None,
         "the environment is per-site",
     );
@@ -165,7 +184,8 @@ fn a_moved_sounding_drops_every_render_that_read_the_old_environment() {
     let heights = |h0: f64, hm20: f64| squallar_radar::sounding::EnvHeights {
         h0c_km_msl: h0,
         hm20c_km_msl: hm20,
-        fetched_at: chrono::Utc::now(),
+        valid_at: sounding_hour().and_utc(),
+        fetched_at: sounding_hour().and_utc(),
     };
     let gui = gui_showing("KTLX");
 
@@ -189,7 +209,8 @@ fn a_moved_sounding_drops_every_render_that_read_the_old_environment() {
         // The other half of the agreement, and the one a mutation survived: invalidating a
         // pane is worth nothing if the redraw is then handed `None`.
         assert_eq!(
-            d.env_heights_km_msl_for(product, "KTLX").is_some(),
+            d.env_heights_km_msl_for(product, "KTLX", sounding_hour())
+                .is_some(),
             consumes,
             "{product:?}: the render parameters carry the pair exactly when \
              the product reads it",

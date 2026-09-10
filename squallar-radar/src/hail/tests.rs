@@ -75,10 +75,12 @@ fn refl_sweep(
 /// An environment at km-MSL heights, radar at 0 ft: MSL ≡ ARL, so the
 /// hand arithmetic needs no datum term.
 fn env(h0_km: f64, hm20_km: f64) -> EnvHeights {
+    let now = chrono::Utc::now();
     EnvHeights {
         h0c_km_msl: h0_km,
         hm20c_km_msl: hm20_km,
-        fetched_at: chrono::Utc::now(),
+        valid_at: now,
+        fetched_at: now,
     }
 }
 

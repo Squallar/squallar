@@ -2332,10 +2332,15 @@ pub fn render_hail_to_image(
         log::info!("{product:?}: no environmental heights — nothing to render");
         return None;
     };
+    // A carrier for the pair `compute_hail` reads, not a cache entry: which
+    // instant these two heights belong to was decided where they were looked
+    // up, and neither timestamp is read from here.
+    let now = chrono::Utc::now();
     let env = crate::sounding::EnvHeights {
         h0c_km_msl,
         hm20c_km_msl,
-        fetched_at: chrono::Utc::now(),
+        valid_at: now,
+        fetched_at: now,
     };
     let radar_height_ft = render_site_height_ft(radar_lat, radar_lon);
     // The observing antenna's beam, not the WSR-88D's: this caps the ceiling

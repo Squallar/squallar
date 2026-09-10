@@ -23,6 +23,7 @@
 //! So METAR and SPC requests must stay **simple**: no `User-Agent`, no custom
 //! headers; [`DataSources`] records that per origin.
 
+use chrono::{DateTime, Utc};
 use std::borrow::Cow;
 
 /// `Cow` so a test can point one field at a local mock server.
@@ -361,9 +362,32 @@ impl DataSources {
     /// height from — that span brackets the −20 °C surface in every ordinary
     /// atmosphere (~−13 °C climatological mean at 600 hPa, ~−45 °C at 300).
     ///
-    /// `forecast_hours=2` keeps the response at two hourly rows. Coordinates are
-    /// truncated to three decimals (~110 m), far inside the model's grid spacing.
-    pub fn sounding_url(&self, lat: f64, lon: f64) -> String {
+    /// `start_hour`/`end_hour` address **every hour from `from` to `to`**, so a
+    /// pane scrubbed into the past and a loop frame from the past resolve the
+    /// sounding that was over the site then rather than today's.
+    ///
+    /// A range rather than an hour because Open-Meteo answers hourly rows in one
+    /// response (~900 B each): a 24-hour loop's whole set of soundings is one
+    /// request, not twenty-five.
+    ///
+    /// The same endpoint serves both directions: `/v1/forecast` answers a past
+    /// hour, and `archive-api`'s ERA5 does not carry these variables at all
+    /// (probed 2026-09-10: `"undefined"` units and every row null, while
+    /// `temperature_2m` reads normally). The pressure levels the −20 °C height
+    /// needs are kept for about three weeks — present 22 days back, null at 24 —
+    /// so an older instant is answered with nothing rather than with today.
+    ///
+    /// Coordinates are truncated to three decimals (~110 m), far inside the
+    /// model's grid spacing.
+    pub fn sounding_url(
+        &self,
+        lat: f64,
+        lon: f64,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> String {
+        let start = from.format("%Y-%m-%dT%H:00");
+        let end = to.max(from).format("%Y-%m-%dT%H:00");
         format!(
             "{}/v1/forecast?latitude={lat:.3}&longitude={lon:.3}\
              &hourly=freezing_level_height,\
@@ -371,7 +395,7 @@ impl DataSources {
              temperature_500hPa,geopotential_height_500hPa,\
              temperature_400hPa,geopotential_height_400hPa,\
              temperature_300hPa,geopotential_height_300hPa\
-             &forecast_hours=2",
+             &start_hour={start}&end_hour={end}",
             self.sounding_base,
         )
     }
@@ -391,7 +415,7 @@ impl DataSources {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
+    use chrono::{NaiveDate, TimeZone};
 
     fn date() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 7, 25).unwrap()
@@ -407,7 +431,12 @@ mod tests {
             s.hrrr_idx_url(&date(), 3, 0),
             s.metar_state_url("OK"),
             s.nws_alerts_url(),
-            s.sounding_url(41.320, -96.367),
+            s.sounding_url(
+                41.320,
+                -96.367,
+                Utc.with_ymd_and_hms(2026, 7, 25, 1, 20, 0).unwrap(),
+                Utc.with_ymd_and_hms(2026, 7, 25, 2, 20, 0).unwrap(),
+            ),
             s.s3_object_url(&s.level2_bucket, "k"),
             s.s3_object_url(&s.goes_east_bucket, "k"),
             s.s3_object_url(&s.goes_west_bucket, "k"),
@@ -584,9 +613,13 @@ mod tests {
     }
 
     /// The sounding query, pinned verbatim: the CORS probes were run against it.
+    /// `start_hour`/`end_hour` are query parameters on the same endpoint and
+    /// method, so they do not change what was probed.
     #[test]
     fn the_sounding_url_is_the_probed_query_shape() {
-        let url = DataSources::production().sounding_url(41.320, -96.367);
+        let from = Utc.with_ymd_and_hms(2026, 7, 28, 18, 41, 9).unwrap();
+        let to = from + chrono::Duration::hours(1);
+        let url = DataSources::production().sounding_url(41.320, -96.367, from, to);
         assert_eq!(
             url,
             "https://api.open-meteo.com/v1/forecast?latitude=41.320&longitude=-96.367\
@@ -595,7 +628,41 @@ mod tests {
              temperature_500hPa,geopotential_height_500hPa,\
              temperature_400hPa,geopotential_height_400hPa,\
              temperature_300hPa,geopotential_height_300hPa\
-             &forecast_hours=2",
+             &start_hour=2026-07-28T18:00&end_hour=2026-07-28T19:00",
+        );
+    }
+
+    /// **The instant reaches the query.** Two different hours must not produce
+    /// the same URL: if they did, the sounding a scrubbed pane resolves would be
+    /// established by omission again, whatever the callers pass.
+    #[test]
+    fn a_different_hour_addresses_a_different_query() {
+        let s = DataSources::production();
+        let noon = Utc.with_ymd_and_hms(2026, 7, 28, 12, 0, 0).unwrap();
+        let evening = Utc.with_ymd_and_hms(2026, 7, 28, 18, 0, 0).unwrap();
+        let h = chrono::Duration::hours(1);
+        assert_ne!(
+            s.sounding_url(41.320, -96.367, noon, noon + h),
+            s.sounding_url(41.320, -96.367, evening, evening + h),
+        );
+        assert!(
+            s.sounding_url(41.320, -96.367, noon, noon + h)
+                .contains("start_hour=2026-07-28T12:00"),
+            "the requested hour is not in the query",
+        );
+    }
+
+    /// Minutes and seconds inside one hour address the same row, because
+    /// Open-Meteo answers in whole hours.
+    #[test]
+    fn every_instant_inside_one_hour_addresses_the_same_row() {
+        let s = DataSources::production();
+        let top = Utc.with_ymd_and_hms(2026, 7, 28, 18, 0, 0).unwrap();
+        let late = Utc.with_ymd_and_hms(2026, 7, 28, 18, 59, 59).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 7, 28, 19, 0, 0).unwrap();
+        assert_eq!(
+            s.sounding_url(41.320, -96.367, top, end),
+            s.sounding_url(41.320, -96.367, late, end),
         );
     }
 

@@ -616,8 +616,11 @@ pub struct ChunkResponse {
 pub struct SoundingResponse {
     pub generation: u64,
     pub site: String,
-    /// `None` when the fetch or parse failed; the receiver keeps what it holds.
-    pub heights: Option<squallar_radar::sounding::EnvHeights>,
+    /// **Every hour the request covered**, one entry per complete model row.
+    /// Empty when the fetch or parse failed, or when the instants asked for are
+    /// past Open-Meteo's retention for the pressure levels the −20 °C height is
+    /// interpolated from; the receiver keeps what it holds.
+    pub heights: Vec<squallar_radar::sounding::EnvHeights>,
 }
 
 /// The RPG's own Melting Layer object (Level III 166, AWIPS `N0M`) for one

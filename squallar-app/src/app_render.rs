@@ -4178,19 +4178,26 @@ impl super::App {
             // A failed fetch keeps the previous entry: a stale environment
             // beats none, and the TTL gate in `spawn_level3_fetches` retries
             // on the next poll precisely because nothing fresh landed here.
-            let Some(heights) = sounding.heights else {
+            if sounding.heights.is_empty() {
                 log::warn!("Sounding fetch failed for {}", sounding.site);
                 continue;
-            };
+            }
             log::info!(
-                "Env heights cached for {}: 0C {:.2} km, -20C {:.2} km MSL",
+                "Env heights cached for {}: {} hourly rows, {} .. {}",
                 sounding.site,
-                heights.h0c_km_msl,
-                heights.hm20c_km_msl
+                sounding.heights.len(),
+                sounding
+                    .heights
+                    .first()
+                    .map_or_else(String::new, |h| h.valid_at.to_string()),
+                sounding
+                    .heights
+                    .last()
+                    .map_or_else(String::new, |h| h.valid_at.to_string()),
             );
             if self
                 .render
-                .set_env_heights(&sounding.site, heights, &self.gui)
+                .set_env_heights_series(&sounding.site, sounding.heights, &self.gui)
             {
                 log::info!(
                     "Env heights moved for {}: dropped the renders that read them",
