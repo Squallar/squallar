@@ -391,10 +391,16 @@ impl OverlayHandler for SpcDiscussionHandler {
                     .filter(|md| !md.polygon.is_empty())
                     .filter_map(md_label)
                     .collect();
-                let items = discussions
-                    .into_iter()
-                    .map(|md| Arc::new(DiscussionItem { md }))
-                    .collect();
+                // Sized by the pointers, not `collect`ed: the in-place
+                // specialization would park the round's 280-B-per-row buffer,
+                // 35 slots per pointer. See the alert layer for the case
+                // where a shrink is the cheaper spelling.
+                let mut items = Vec::with_capacity(discussions.len());
+                items.extend(
+                    discussions
+                        .into_iter()
+                        .map(|md| Arc::new(DiscussionItem { md })),
+                );
                 self.state.set_data(items);
             }
             Err(e) => {
@@ -575,6 +581,39 @@ mod tests {
     use crate::spc::colors::{md_fill_color, md_stroke_color};
     use crate::spc::discussion::MdType;
     use crate::types::HatchPattern;
+
+    /// **The parked discussion list is sized by the pointers in it.**
+    ///
+    /// The same in-place collect as the other item layers: a `SpcDiscussion`
+    /// is 280 B against an `Arc`'s 8, so the round's buffer is parked holding
+    /// 35 slots per pointer. N is small here -- a handful of MDs are in force
+    /// at once -- so this is landed for the class and not for the bytes.
+    ///
+    /// Red on `95980a8de`: capacity 700 for 20 pointers.
+    #[test]
+    fn the_parked_discussion_list_is_sized_by_its_pointers() {
+        const MDS: usize = 20;
+        let mut handler = SpcDiscussionHandler::new();
+
+        let mut discussions = Vec::with_capacity(MDS);
+        discussions.extend((0..MDS).map(|i| md(i as u32)));
+        assert_eq!(discussions.capacity(), MDS, "the round's buffer is exact");
+
+        handler.apply_fetch_result(
+            Box::new(SpcDiscussionFetchResult(Ok(discussions))),
+            &PaneRef::bare(0),
+        );
+
+        assert_eq!(handler.state.data.len(), MDS);
+        assert_eq!(
+            handler.state.data.capacity(),
+            MDS,
+            "the parked list holds {} slots for {MDS} pointers -- the round's \
+             Vec<SpcDiscussion> allocation carried forward by an in-place \
+             collect",
+            handler.state.data.capacity(),
+        );
+    }
 
     fn md(number: u32) -> SpcDiscussion {
         let md_type = MdType::Convective;

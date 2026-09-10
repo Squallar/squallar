@@ -830,6 +830,24 @@ impl OverlayHandler for NwsAlertHandler {
                 // reach it, and is forgotten only when its item is evicted.
                 self.hidden_alerts
                     .retain(|id| items.iter().any(|i| i.alert.id == *id));
+                // **Shrunk here rather than sized at the collect**, because
+                // the history loop above pushes into this same buffer. The
+                // `collect` is an in-place one -- `Map` is `InPlaceIterable`,
+                // the alignments match and `Arc` is not larger than
+                // `NwsAlert` -- so `items` arrives holding the round's own
+                // 328-B-per-row buffer, 41 slots per pointer, and the
+                // departed rows land in slots that already exist.
+                //
+                // Measured at 297 warnings with 50 departing (release, grants
+                // on the calling thread, `overlay items` family): leaving it
+                // alone parks 243,156 B; shrinking here parks 148,516 B for
+                // one extra grant (747 -> 748). Building the destination with
+                // `Vec::with_capacity(alerts.len())` instead costs a grant
+                // more than that (749), because the 50 pushes then have to
+                // grow a buffer sized for the feed alone, and it still parks
+                // 150,492 B -- the 247 slots that doubling overshot by. Only
+                // this spelling absorbs the pushes for free AND lands exact.
+                items.shrink_to_fit();
                 // The coverage report travels with the data it describes: a
                 // round that placed 85 of 297 warnings keeps its fresh clock.
                 self.state
@@ -1166,6 +1184,51 @@ mod tests {
                 HatchPattern::None,
             )]),
         }
+    }
+
+    /// **The parked alert list is sized by the pointers in it.**
+    ///
+    /// `apply_fetch_result` builds `Vec<Arc<AlertItem>>` from the round's
+    /// `Vec<NwsAlert>` with a `collect`. That takes the standard library's
+    /// in-place specialization -- `Map` is `InPlaceIterable`, the alignments
+    /// match and the destination is not larger -- so the pointers are written
+    /// over the alerts and **the round's buffer is kept as the parked
+    /// list's**. An `NwsAlert` is 328 B against an `Arc`'s 8, so the layer
+    /// parks 41 slots per pointer.
+    ///
+    /// The history loop below the collect pushes into that same buffer, which
+    /// is why the slack is never grown out of: the pushes land in slots that
+    /// already exist, so the `Vec` never reallocates and never sheds them.
+    ///
+    /// Red on `95980a8de`: capacity 12,177 for 297 pointers -- 97,416 B of
+    /// buffer for 2,376 B of content, at the 297 warnings this handler's own
+    /// coverage comment cites.
+    #[test]
+    fn the_parked_alert_list_is_sized_by_its_pointers() {
+        const WARNINGS: usize = 297;
+        let mut handler = NwsAlertHandler::new();
+
+        let mut alerts = Vec::with_capacity(WARNINGS);
+        alerts.extend((0..WARNINGS).map(|i| alert(&format!("W{i:04}"), "Tornado Warning")));
+        assert_eq!(
+            alerts.capacity(),
+            WARNINGS,
+            "the round's own buffer is exact, so only the conversion is on trial",
+        );
+
+        handler.apply_fetch_result(whole(alerts), &PaneRef::across(&[]));
+
+        assert_eq!(handler.state.data.len(), WARNINGS, "every warning parked");
+        assert_eq!(
+            handler.state.data.capacity(),
+            WARNINGS,
+            "the parked list holds {} slots for {WARNINGS} pointers -- {} B of \
+             buffer for {} B of content, the round's Vec<NwsAlert> allocation \
+             carried forward by an in-place collect",
+            handler.state.data.capacity(),
+            handler.state.data.capacity() * size_of::<Arc<AlertItem>>(),
+            WARNINGS * size_of::<Arc<AlertItem>>(),
+        );
     }
 
     fn whole(alerts: Vec<NwsAlert>) -> FetchPayload {

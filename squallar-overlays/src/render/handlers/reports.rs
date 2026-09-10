@@ -411,12 +411,23 @@ impl OverlayHandler for StormReportsHandler {
                 // CSVs failed, so one or two failing arrives here as `Ok` with a
                 // whole kind of report absent — coverage, not health.
                 let coverage = round.completeness();
-                let items = round
-                    .reports
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, report)| Arc::new(StormReportItem { report, index: i }))
-                    .collect();
+                // **Built into an exactly sized list, not `collect`ed.** A
+                // `collect` here takes the in-place specialization -- both
+                // `Map` and `Enumerate` are `InPlaceIterable`, so the
+                // `.enumerate()` does not stop it -- and the round's
+                // 168-B-per-row buffer becomes the parked list's, 21 slots
+                // per pointer. Nothing is pushed after this, so sizing the
+                // destination is exact in one grant; the alert layer, which
+                // does push after its conversion, shrinks instead and says
+                // why.
+                let reports = round.reports;
+                let mut items = Vec::with_capacity(reports.len());
+                items.extend(
+                    reports
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, report)| Arc::new(StormReportItem { report, index: i })),
+                );
                 self.state.set_data_with_coverage(items, coverage);
             }
             Err(e) => {
@@ -1038,6 +1049,57 @@ mod as_of_tests {
             .unwrap()
             .and_hms_opt(h, m, 0)
             .unwrap()
+    }
+
+    /// **The parked report list is sized by the pointers in it.**
+    ///
+    /// `apply_fetch_result` collects the round's `Vec<StormReport>` into
+    /// `Vec<Arc<StormReportItem>>`. `Map` and `Enumerate` are both
+    /// `InPlaceIterable`, so the `.enumerate()` in the chain does not stop the
+    /// in-place specialization: the pointers are written over the reports and
+    /// the round's buffer becomes the parked list's. A `StormReport` is 168 B
+    /// against an `Arc`'s 8, so the layer parks 21 slots per pointer.
+    ///
+    /// Red on `95980a8de`: capacity 21,000 for 1,000 pointers.
+    #[test]
+    fn the_parked_report_list_is_sized_by_its_pointers() {
+        const REPORTS: usize = 1000;
+        let mut handler = StormReportsHandler::new();
+
+        let mut reports = Vec::with_capacity(REPORTS);
+        reports.extend((0..REPORTS).map(|i| StormReport {
+            kind: StormReportKind::Hail,
+            time: "2130".into(),
+            valid: None,
+            magnitude: Some(100.0),
+            location: format!("SITE {i}"),
+            county: "CLEVELAND".into(),
+            state: "OK".into(),
+            lat: 35.0,
+            lon: -97.5,
+            comments: String::new(),
+        }));
+        assert_eq!(reports.capacity(), REPORTS, "the round's buffer is exact");
+
+        handler.apply_fetch_result(
+            Box::new(StormReportsFetchResult(Ok(StormReportRound {
+                reports,
+                failed_kinds: Vec::new(),
+            }))),
+            &PaneRef::bare(0),
+        );
+
+        assert_eq!(handler.state.data.len(), REPORTS);
+        assert_eq!(
+            handler.state.data.capacity(),
+            REPORTS,
+            "the parked list holds {} slots for {REPORTS} pointers -- {} B of \
+             buffer for {} B of content, the round's Vec<StormReport> \
+             allocation carried forward by an in-place collect",
+            handler.state.data.capacity(),
+            handler.state.data.capacity() * size_of::<Arc<StormReportItem>>(),
+            REPORTS * size_of::<Arc<StormReportItem>>(),
+        );
     }
 
     fn handler_with_report(valid: Option<chrono::NaiveDateTime>) -> StormReportsHandler {
