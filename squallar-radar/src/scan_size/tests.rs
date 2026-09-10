@@ -18,6 +18,20 @@ use nexrad_model::data::{
 /// One allocator block, spelled the way the module charges it.
 const BLOCK: usize = ALLOCATOR_BLOCK_OVERHEAD;
 
+/// **What one non-empty gate buffer costs beside its gates**, and what it
+/// costs the block count.
+///
+/// Two blocks, since `nexrad_model::data::GateBuffer` made a gate buffer an
+/// `Arc<Vec<u8>>` so that cloning a volume shares it: the `Vec<u8>` holding
+/// the gates, and the `Arc` block holding the two counts and the `Vec`'s
+/// header. Written from the module's own constants rather than as a number,
+/// because [`GATE_BUFFER_SHARE_BYTES`] is a target property — 40 B on a
+/// 64-bit host, 20 B on wasm32.
+const GATE_BUFFER_OVERHEAD: usize = BLOCK + GATE_BUFFER_SHARE_BYTES + BLOCK;
+
+/// Blocks one non-empty gate buffer is charged.
+const GATE_BUFFER_BLOCKS: usize = 2;
+
 /// What a scan is charged before any sweep is walked: the sweep vector's own
 /// block plus the metadata blocks the walk cannot enumerate.
 const SCAN_LEVEL_BLOCKS: usize = (1 + SCAN_METADATA_BLOCKS) * ALLOCATOR_BLOCK_OVERHEAD;
@@ -115,11 +129,12 @@ fn held(scan: &Scan, gates: usize, moments: usize) -> usize {
         total += sweep.radials_capacity() * size_of::<Radial>() + BLOCK;
         // Every radial in these fixtures carries the same load, so the gate
         // term is arithmetic rather than another walk: one buffer per moment,
-        // `gates` bytes in it, one allocator block holding it.
+        // `gates` bytes in it, and the two blocks holding it — the `Vec` and
+        // the `Arc` that lets a clone of the volume share it.
         let per_radial = if gates == 0 {
             0
         } else {
-            moments * (gates + BLOCK)
+            moments * (gates + GATE_BUFFER_OVERHEAD)
         };
         total += sweep.radials().len() * per_radial;
     }
@@ -138,7 +153,7 @@ fn the_gate_bytes_of_every_moment_are_counted_once() {
 
     // And the same total, decomposed, so a reader can see which term is which.
     let payload = sweeps * radials * gates * moments;
-    let moment_blocks = sweeps * radials * moments * BLOCK;
+    let moment_blocks = sweeps * radials * moments * GATE_BUFFER_OVERHEAD;
     let containers = scan.sweeps_capacity() * size_of::<Sweep>()
         + scan
             .sweeps()
@@ -186,12 +201,12 @@ fn spare_capacity_in_a_radial_vector_is_charged() {
 #[test]
 fn one_allocator_block_is_charged_per_allocation() {
     let scan = scan_of(2, 10, 400, 5);
-    let blocks = 2 * 10 * 5   // one gate buffer per present moment
+    let blocks = 2 * 10 * 5 * GATE_BUFFER_BLOCKS // per present moment: gates + the `Arc` sharing them
         + 2                   // one radial vector per sweep
         + 1                   // the sweep vector
         + SCAN_METADATA_BLOCKS;
     let without_overhead = {
-        let payload = 2 * 10 * 400 * 5;
+        let payload = 2 * 10 * 400 * 5 + 2 * 10 * 5 * GATE_BUFFER_SHARE_BYTES;
         let containers = scan.sweeps_capacity() * size_of::<Sweep>()
             + scan
                 .sweeps()
@@ -216,9 +231,9 @@ fn an_absent_moment_is_not_charged() {
     let five = scan_bytes(&scan_of(2, 10, 500, 5));
     let seven = scan_bytes(&scan_of(2, 10, 500, 7));
     // The three loads the corpus census actually found. Each added moment is
-    // its gates plus the block holding them, and nothing else moves.
-    assert_eq!(five - three, 2 * 10 * 2 * (500 + BLOCK));
-    assert_eq!(seven - five, 2 * 10 * 2 * (500 + BLOCK));
+    // its gates plus the two blocks holding them, and nothing else moves.
+    assert_eq!(five - three, 2 * 10 * 2 * (500 + GATE_BUFFER_OVERHEAD));
+    assert_eq!(seven - five, 2 * 10 * 2 * (500 + GATE_BUFFER_OVERHEAD));
 }
 
 /// An empty volume is its containers and nothing else, and a volume with no

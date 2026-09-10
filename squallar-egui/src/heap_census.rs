@@ -401,7 +401,16 @@ families! {
          feed` overlaps `still scans` by a route this walk does not span \
          (radar's assembler is not the app's inventory). Those stay inside \
          [`Census::radar_floor`]'s range, which is why the range is still \
-         published.";
+         published. \
+         AT THE `Scan` POINTER, and gate buffers now share BELOW it. Since \
+         `nexrad_model::data::GateBuffer`, two distinct `Arc<Scan>`s can hold \
+         the same gate bytes - a rebuilt volume and the generation it was \
+         cloned from - and this walk compares `Scan` pointers, so it reads \
+         them as two allocations and this correction stays too small. It \
+         still cannot claim the heap is smaller than it is, which is the \
+         property it was built to keep; it just corrects less of the \
+         double-count than it used to. See `chunk feed` for the measured size \
+         of what is left.";
     RASTER_SHARED_BYTES, raster_shared_bytes, set_raster_shared_bytes,
         "**Bytes `render cache` and `cached renders` BOTH name** - the \
          correction term that turns their sum into a range, and NOT a holder \
@@ -672,7 +681,27 @@ families! {
          frame thread, where the bytes actually move. A FLOOR - the radials \
          of a cut still arriving are not priced, at most a sixteenth of a \
          volume - and an UPPER bound against `still scans`, which prices the \
-         same `Arc` once a round delivers it.";
+         same `Arc` once a round delivers it. \
+         WIDER SINCE GATE BUFFERS SHARE, and by a measured amount. \
+         `nexrad_model::data::GateBuffer` made a rebuild's clone of a volume \
+         a refcount bump instead of a copy, so the two generations a rebuild \
+         leaves alive - the assembler's new one, and whatever the bridge or \
+         the still inventory is still holding - now hold the SAME gate bytes \
+         while both live, and this family and `still scans` each charge them. \
+         The overlap was always there and was real bytes; it is now the same \
+         bytes twice. `squallar_radar::chunks::shared_overlap_bytes()` is the \
+         running upper bound on it - the gate term each live site's last \
+         rebuild shared, a median 32.3 MiB a copy and 147.8 MiB across the \
+         six sites at the end of a 420 s HEAVY6 leg - and it is an \
+         upper bound because nothing tells it the moment the older generation \
+         is dropped, which is usually a frame or two later when the frame \
+         thread's next `ChunkFeedManager::snapshot` refreshes the bridge. \
+         NOT FIXED BY A WALK, deliberately: the union that would resolve it \
+         is at the gate-buffer pointer, ~32,400 ids a volume across dozens of \
+         resident volumes, and this census reads on the 2 s telemetry tick on \
+         the frame thread. The arbiter for what the sharing actually saved is \
+         `squallar_alloc::live_bytes`, which counts bytes at grant and is \
+         therefore right about sharing by construction.";
     render_pool_bytes = squallar_radar::render::parked_bytes() as u64,
         "Render buffers `squallar_radar` is PARKING between renders - the \
          plan-view cell buffer, RGBA texture and value grid, and the section \

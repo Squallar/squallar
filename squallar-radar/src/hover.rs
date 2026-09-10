@@ -46,6 +46,17 @@ pub struct SweepGates {
     /// Carried rather than computed on demand, because the readers of this
     /// figure are a telemetry tick and a cache's byte budget and both ride
     /// the frame thread.
+    ///
+    /// **SHARED with the volume, since `nexrad_model::data::GateBuffer`.**
+    /// Cloning a moment out of a sweep now bumps a refcount rather than
+    /// copying its gates, so while the volume this was taken from is still
+    /// alive these bytes are its bytes and this figure names them a second
+    /// time. It is the same convention `scan_size` prices a volume with,
+    /// deliberately, and it is the right figure for the question a cache's
+    /// budget asks — what this entry is keeping alive once the volume goes —
+    /// but it is NOT additive with a live volume's own price. The trade is
+    /// strictly in the heap's favour either way: the pair used to be two
+    /// copies of these bytes and is now one.
     bytes: usize,
 }
 

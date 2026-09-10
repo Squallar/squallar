@@ -637,7 +637,13 @@ fn move_feed_level(was: u64, now: u64) {
 /// Nothing here ever prices bytes that have gone.
 ///
 /// **The one whole-volume under-count left is a rebuild a consumer forced,
-/// and MEASURED it is every rebuild.** `chunk_feed::SiteFeed::last_snapshot`
+/// and MEASURED it is every rebuild — but it is no longer a whole volume.**
+/// Since `nexrad_model::data::GateBuffer`, the two generations a rebuild
+/// leaves alive SHARE their gate buffers, so what is resident and outside this
+/// figure is the older generation's containers, not its gates; and what this
+/// figure and `still scans` now charge twice is the same shared gate bytes.
+/// [`shared_overlap_bytes`] is the measured upper bound on that, and
+/// `crate::scan_size`'s module note is where it is written down. `chunk_feed::SiteFeed::last_snapshot`
 /// holds an `Arc` of whatever [`VolumeAssembler::snapshot`] last handed out,
 /// to serve the frame thread while the poller is away on a round; the still
 /// inventory holds the same `Arc` from the moment a round delivers. At rest
@@ -678,11 +684,56 @@ static REBUILD_MOVED_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 static REBUILD_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REBUILD_COPIED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REBUILD_COPIED_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REBUILD_SHARED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REBUILD_SHARED_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// **Gate bytes the census is charging twice, right now**, summed across live
+/// assemblers — see the note in [`crate::scan_size`].
+static SHARED_OVERLAP_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn move_shared_overlap(was: u64, now: u64) {
+    feed_level_serial::with_move(|| {
+        SHARED_OVERLAP_BYTES.fetch_add(now.wrapping_sub(was), std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
+/// **An upper bound on what the radar census families over-report because a
+/// rebuild's two generations share their gate buffers.**
+///
+/// `nexrad_model::data::GateBuffer` makes a volume's clone a refcount bump
+/// rather than a copy, so while the assembler's new generation and whatever
+/// the bridge or the still inventory is still holding are both alive, the two
+/// families charge the same gate bytes twice. This is the sum, over live
+/// assemblers, of exactly the gate bytes each one's last rebuild shared.
+///
+/// **Its size, MEASURED** on a 420 s six-site HEAVY6 leg (2026-09-09, 153
+/// copying rebuilds): a copy shared a median **32.3 MiB** and at most
+/// **67.2 MiB**, and the sum across the six sites' last rebuilds — this
+/// gauge's own value at the end of the leg — was **147.8 MiB**.
+///
+/// **An upper bound, not the instant truth**: it is set at the rebuild and
+/// cleared at the next one or when the assembler is dropped, and nothing here
+/// learns the moment the older generation is actually released — which is
+/// usually within a frame or two, when the frame thread's next
+/// `ChunkFeedManager::snapshot` refreshes the bridge. It is deliberately the
+/// side that cannot understate the correction.
+///
+/// Zero before the first rebuild of a process, and zero for a site whose last
+/// rebuild moved rather than copied.
+pub fn shared_overlap_bytes() -> u64 {
+    SHARED_OVERLAP_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// What [`rebuild_totals`] answers. Bytes AND blocks, because a decoded
-/// volume's bytes are 95.9 % gate buffers at one block apiece: a figure in
-/// megabytes alone hides that the same copy is tens of thousands of
-/// allocations.
+/// volume's bytes are 95.9 % gate buffers: a figure in megabytes alone hides
+/// that the same copy was tens of thousands of allocations.
+///
+/// **Read `copied_bytes` and `copied_blocks` as the price of the volume the
+/// rebuild had in hand, not as what it spent.** They are what
+/// `scan_size::scan_bytes_and_blocks` charged the previous generation, which
+/// is what the copy cost until gate buffers became shareable and is still the
+/// right denominator for the saving. `shared_bytes` and `shared_blocks` are
+/// the part of that price the copy no longer pays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RebuildTotals {
     /// Rebuilds where `Arc::try_unwrap` succeeded and the sweeps moved.
@@ -695,8 +746,18 @@ pub struct RebuildTotals {
     pub copies: u64,
     /// Bytes those clones copied.
     pub copied_bytes: u64,
-    /// Allocations those clones made.
+    /// Allocations those clones would have made before the gate buffers
+    /// became shareable. See [`Self::shared_blocks`] for what they make now.
     pub copied_blocks: u64,
+    /// **Of [`Self::copied_bytes`], the bytes the clones did NOT allocate**
+    /// because `nexrad_model::data::GateBuffer` shares them. The difference,
+    /// `copied_bytes - shared_bytes`, is the container term a clone still
+    /// pays: the sweep vector, one radial vector per sweep, and the `Radial`
+    /// structs' inline moments.
+    pub shared_bytes: u64,
+    /// **Of [`Self::copied_blocks`], the allocations the clones did NOT
+    /// make** — two per non-empty moment, the gate `Vec` and its `Arc`.
+    pub shared_blocks: u64,
 }
 
 /// File one rebuild against [`rebuild_totals`], and say so at `debug`.
@@ -710,7 +771,14 @@ pub struct RebuildTotals {
 /// Off the frame thread wherever a rebuild is — `ChunkPoller::warm_snapshot`
 /// runs inside a round — and one line per sealed cut per site, which is about
 /// one every sixteen seconds on a VCP 212.
-fn record_rebuild(site: &str, copied: bool, owners: usize, bytes: u64, blocks: u64) {
+fn record_rebuild(
+    site: &str,
+    copied: bool,
+    owners: usize,
+    bytes: u64,
+    blocks: u64,
+    shared: (u64, u64),
+) {
     use std::sync::atomic::Ordering::Relaxed;
     // Through the same serialiser the byte level uses, for the same reason: a
     // test that brackets one rebuild with two reads of a process-wide counter
@@ -721,6 +789,8 @@ fn record_rebuild(site: &str, copied: bool, owners: usize, bytes: u64, blocks: u
             REBUILD_COPIES.fetch_add(1, Relaxed);
             REBUILD_COPIED_BYTES.fetch_add(bytes, Relaxed);
             REBUILD_COPIED_BLOCKS.fetch_add(blocks, Relaxed);
+            REBUILD_SHARED_BYTES.fetch_add(shared.0, Relaxed);
+            REBUILD_SHARED_BLOCKS.fetch_add(shared.1, Relaxed);
         } else {
             REBUILD_MOVES.fetch_add(1, Relaxed);
             REBUILD_MOVED_BYTES.fetch_add(bytes, Relaxed);
@@ -729,12 +799,18 @@ fn record_rebuild(site: &str, copied: bool, owners: usize, bytes: u64, blocks: u
     });
     let totals = rebuild_totals();
     log::debug!(
-        "{site}: volume rebuild {} with {owners} owner(s), {bytes} B in {blocks} blocks; \
-         totals copied {} rebuilds / {} B / {} blocks, moved {} rebuilds / {} B / {} blocks",
+        "{site}: volume rebuild {} with {owners} owner(s), {bytes} B in {blocks} blocks, \
+         shared {} B in {} blocks; \
+         totals copied {} rebuilds / {} B / {} blocks, shared {} B / {} blocks, \
+         moved {} rebuilds / {} B / {} blocks",
         if copied { "COPIED" } else { "moved" },
+        shared.0,
+        shared.1,
         totals.copies,
         totals.copied_bytes,
         totals.copied_blocks,
+        totals.shared_bytes,
+        totals.shared_blocks,
         totals.moves,
         totals.moved_bytes,
         totals.moved_blocks,
@@ -745,9 +821,33 @@ fn record_rebuild(site: &str, copied: bool, owners: usize, bytes: u64, blocks: u
 /// running totals over the life of the process.
 ///
 /// A rebuild that finds itself the volume's last owner costs nothing; one that
-/// finds a second owner clones every gate buffer in it. Both arms are counted,
-/// because a mechanism that never fires and one that always fires are
-/// indistinguishable from the arm that fired alone.
+/// finds a second owner clones the volume's containers and shares its gate
+/// buffers. Both arms are counted, because a mechanism that never fires and
+/// one that always fires are indistinguishable from the arm that fired alone.
+///
+/// **The reading that gate-buffer sharing landed on**, a 420 s six-site
+/// HEAVY6 leg on the same seed as the 156-of-156 measurement above
+/// (2026-09-09, 153 rebuilds with a previous volume, all of them copies):
+///
+/// ```text
+/// COPIED                        : 153   4,396.4 MiB   5,405,092 blocks
+/// of which SHARED, not allocated:       4,281.3 MiB   5,403,600 blocks
+/// copy still allocated          :         115.1 MiB       1,492 blocks
+/// mean shared per copy          :          28.0 MiB      35,318 blocks
+/// mean still allocated per copy :           0.752 MiB         9.8 blocks
+/// ```
+///
+/// **97.4 % of the bytes and 100.0 % of the blocks a rebuild used to allocate
+/// are gone**, and what is left is a sweep vector plus one radial vector a
+/// sweep — 9.8 allocations where the same volume's clone was ~17,700 on the
+/// pre-sharing model. `moves` staying at zero is correct rather than missing:
+/// see [`VolumeAssembler::snapshot`].
+///
+/// **The block figures are on the post-sharing model**, which charges two
+/// blocks a non-empty moment rather than one (`crate::scan_size`'s
+/// [`crate::scan_size::GATE_BUFFER_SHARE_BYTES`]), so `copied_blocks` here and
+/// the 18,873-a-rebuild mean quoted before it have different denominators and
+/// must not be subtracted from one another.
 pub fn rebuild_totals() -> RebuildTotals {
     use std::sync::atomic::Ordering::Relaxed;
     RebuildTotals {
@@ -757,6 +857,8 @@ pub fn rebuild_totals() -> RebuildTotals {
         copies: REBUILD_COPIES.load(Relaxed),
         copied_bytes: REBUILD_COPIED_BYTES.load(Relaxed),
         copied_blocks: REBUILD_COPIED_BLOCKS.load(Relaxed),
+        shared_bytes: REBUILD_SHARED_BYTES.load(Relaxed),
+        shared_blocks: REBUILD_SHARED_BLOCKS.load(Relaxed),
     }
 }
 
@@ -886,8 +988,15 @@ pub struct VolumeAssembler {
     /// of it. Zero exactly when no snapshot has been built.
     cached_bytes: u64,
     /// Allocations [`Self::cached`] holds, off the same walk that priced it —
-    /// what a rebuild forced to clone the volume allocates all over again.
+    /// what a rebuild forced to clone the volume would allocate all over
+    /// again if the gate buffers did not share.
     cached_blocks: u64,
+    /// **Gate bytes this assembler's last rebuild SHARED with the generation
+    /// it cloned from**, and therefore an upper bound on what the census
+    /// families are charging twice for this site — see
+    /// [`shared_overlap_bytes`]. Zero until a rebuild copies, and zero again
+    /// after one moves.
+    shared_overlap: u64,
     /// Every cut's declared Nyquist velocity, accumulated across the chunks as
     /// they arrive. See [`Self::declared_nyquist`].
     declared_nyquist: crate::nyquist::DeclaredNyquist,
@@ -908,6 +1017,7 @@ impl VolumeAssembler {
             staged_bytes: 0,
             cached_bytes: 0,
             cached_blocks: 0,
+            shared_overlap: 0,
             coverage_pattern: None,
             saw_start_chunk: false,
             saw_scan_end: false,
@@ -1235,16 +1345,32 @@ impl VolumeAssembler {
     /// sweeps into the new one. One volume per live site, in one place —
     /// which place it is depends only on how much of it has been built.
     ///
-    /// **The copy is not the exception — MEASURED, it is every rebuild.**
-    /// `try_unwrap` identifies the case where another owner still holds the
-    /// volume being rebuilt, and on a 420 s HEAVY6 leg (six live sites,
-    /// 2026-09-09) it failed on **156 of 156** rebuilds that had a previous
-    /// volume: 4,744.9 MiB cloned across 2,944,230 allocator blocks, a mean
-    /// 30.4 MiB and 18,873 blocks a rebuild. A second leg of the same arm read
-    /// 154 of 154 and 4,406.7 MiB. [`rebuild_totals`] is that reading, always
-    /// on, and the `debug` line beside it carries the per-rebuild figures and
-    /// the running totals together so a reader of either can check itself
-    /// against the other.
+    /// **The copy is not the exception — MEASURED, it is every rebuild —
+    /// and it is now nearly free.** `try_unwrap` identifies the case where
+    /// another owner still holds the volume being rebuilt, and on a 420 s
+    /// HEAVY6 leg (six live sites, 2026-09-09) it failed on **156 of 156**
+    /// rebuilds that had a previous volume: 4,744.9 MiB across 2,944,230
+    /// allocator blocks, a mean 30.4 MiB and 18,873 blocks a rebuild. A second
+    /// leg of the same arm read 154 of 154 and 4,406.7 MiB.
+    ///
+    /// That did not change and cannot be changed here — see the owner count
+    /// below. What changed is what the clone costs.
+    /// `nexrad_model::data::GateBuffer` made a moment's gate buffer an
+    /// `Arc<Vec<u8>>`, and 95.9 % of a volume's bytes are those buffers at one
+    /// block apiece, so `to_vec` below now copies the containers — the sweep
+    /// vector, one radial vector per sweep, and the `Radial` structs with
+    /// their inline moments — and bumps a refcount for every gate array
+    /// instead of reallocating one. [`RebuildTotals::shared_bytes`] and
+    /// [`RebuildTotals::shared_blocks`] are exactly that difference, filed on
+    /// the copy arm, and the `debug` line beside them carries the per-rebuild
+    /// figures and the running totals together so a reader of either can check
+    /// itself against the other.
+    ///
+    /// **The move arm stays at zero, and that is the correct outcome rather
+    /// than a missing one.** Sharing a gate buffer does not change who owns
+    /// the `Arc<Scan>`, so `try_unwrap` still fails exactly as often; the
+    /// saving is on the copy arm, in `shared_bytes` / `shared_blocks`, not in
+    /// a migration from one arm to the other.
     ///
     /// **And the owner count says no single holder can be removed to fix it.**
     /// The strong count seen at the rebuild, this `Arc` included, was **3 on
@@ -1259,10 +1385,8 @@ impl VolumeAssembler {
     /// construction.** Every copy was on `tokio-rt-worker` — inside a round,
     /// which is precisely the window the poller is away and the bridge MUST be
     /// held. The bridge is not a holder that overstays; it is a holder whose
-    /// whole purpose overlaps the rebuild. What would delete this copy is
-    /// making a `Sweep` clone cheap — 95.9 % of a volume's bytes are
-    /// per-(ray, moment) gate buffers at one block apiece — not moving
-    /// ownership around.
+    /// whole purpose overlaps the rebuild. Which is why the cut taken was
+    /// making a `Sweep` clone cheap rather than moving ownership around.
     ///
     /// **The warm path stays free**, which is what the frame thread's several
     /// calls a frame depend on; a build happens on the poller's thread, inside
@@ -1282,11 +1406,32 @@ impl VolumeAssembler {
                 let (bytes, blocks) = (self.cached_bytes, self.cached_blocks);
                 match std::sync::Arc::try_unwrap(previous) {
                     Ok(scan) => {
-                        record_rebuild(&self.site, false, owners, bytes, blocks);
+                        record_rebuild(&self.site, false, owners, bytes, blocks, (0, 0));
+                        move_shared_overlap(self.shared_overlap, 0);
+                        self.shared_overlap = 0;
                         scan.into_sweeps()
                     }
                     Err(shared) => {
-                        record_rebuild(&self.site, true, owners, bytes, blocks);
+                        // The gate term of the volume being cloned: what the
+                        // clone below would have allocated before
+                        // `nexrad_model::data::GateBuffer`, and what it now
+                        // bumps a refcount for instead. Priced from the
+                        // volume in hand rather than inferred from `bytes`,
+                        // because `bytes` includes the containers the clone
+                        // does still allocate.
+                        let (gate_bytes, gate_blocks) =
+                            crate::scan_size::scan_gate_bytes_and_blocks(&shared);
+                        let (gate_bytes, gate_blocks) = (gate_bytes as u64, gate_blocks as u64);
+                        record_rebuild(
+                            &self.site,
+                            true,
+                            owners,
+                            bytes,
+                            blocks,
+                            (gate_bytes, gate_blocks),
+                        );
+                        move_shared_overlap(self.shared_overlap, gate_bytes);
+                        self.shared_overlap = gate_bytes;
                         shared.sweeps().to_vec()
                     }
                 }
@@ -1499,6 +1644,7 @@ pub struct ChunkPoller {
 impl Drop for VolumeAssembler {
     fn drop(&mut self) {
         move_feed_level(self.staged_bytes.saturating_add(self.cached_bytes), 0);
+        move_shared_overlap(self.shared_overlap, 0);
     }
 }
 

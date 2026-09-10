@@ -58,7 +58,8 @@
 //! what a slice's length implies:
 //!
 //! * **The gate bytes** — every moment's `raw_values()`, which is nearly all
-//!   of the figure.
+//!   of the figure — and the `Arc` block that makes each of them shareable,
+//!   [`GATE_BUFFER_SHARE_BYTES`]. Two blocks per non-empty moment, not one.
 //! * **The containers, at capacity.** A `Scan` is `Vec<Sweep>`, a `Sweep` is
 //!   `Vec<Radial>`, and a `Radial` is seven `Option<MomentData>` inline. Both
 //!   vectors are charged `capacity() * size_of::<T>()`, through the
@@ -71,6 +72,36 @@
 //! * **The allocator's per-block overhead**, one
 //!   [`ALLOCATOR_BLOCK_OVERHEAD`] per allocation the walk can see, plus
 //!   [`SCAN_METADATA_BLOCKS`] for the ones it cannot.
+//!
+//! # The one figure that means something different since gate buffers share
+//!
+//! **This function prices every volume for its own gates, and two volumes
+//! that share gates are charged for them twice.** Before
+//! `nexrad_model::data::GateBuffer`, that was true and harmless: no two
+//! decoded volumes ever shared a gate buffer, so the eight holders above were
+//! either the same allocation (priced once, by pointer) or genuinely separate
+//! bytes. A rebuild's clone now shares, so while two generations of one site's
+//! volume are alive — the assembler's new one and whatever the bridge or the
+//! still inventory is still holding — `chunk feed` and `still scans` each
+//! charge the same gate bytes, and their sum **over-reports by one volume's
+//! gate term per site in that window**.
+//!
+//! **Its size is measured, not estimated**:
+//! [`crate::chunks::shared_overlap_bytes`] is the running sum, across live
+//! sites, of exactly the gate bytes each site's last rebuild shared — an
+//! upper bound on this over-report, because it does not know when the older
+//! generation is dropped. On a 420 s six-site HEAVY6 leg (2026-09-09, 153
+//! copying rebuilds) a copy shared a median **32.3 MiB** and at most
+//! **67.2 MiB**, and the sum across the six sites' last rebuilds — the gauge's
+//! own value at the end of the leg — was **147.8 MiB**.
+//!
+//! **It does not change what the census is for.** `Census::radar_total` is
+//! documented as an UPPER bound and `Census::unaccounted` reads
+//! "none (families price above live)" on 4 of 5 HEAVY6 legs already, for the
+//! same reason: `chunk feed` overlaps `still scans` by construction. The
+//! arbiter for this campaign's savings is `squallar_alloc::live_bytes`, which
+//! counts bytes at grant and is therefore right about sharing by
+//! construction.
 //!
 //! # What is not counted, and what that is worth
 //!
@@ -144,6 +175,54 @@ use nexrad_model::data::{DataMoment, Radial, Scan, Sweep};
 /// Worth, for scale: a median archive volume holds ~32,400 blocks, so this
 /// term is ~519 KB against a ~48.9 MiB volume — about 1.0 %.
 pub const ALLOCATOR_BLOCK_OVERHEAD: usize = 16;
+
+/// **The block that makes a gate buffer shareable**, charged once per
+/// non-empty moment beside the gate bytes themselves.
+///
+/// `nexrad_model::data::GateBuffer` is an `Arc<Vec<u8>>`: the gate bytes stay
+/// in the `Vec`'s own block, exactly where they were, and the `Arc` adds one
+/// small block holding two reference counts and the `Vec`'s three words. That
+/// second block is what lets `VolumeAssembler::snapshot`'s clone of a volume
+/// be ~18 refcount bumps instead of ~18,873 allocations, and it is a real
+/// resident cost that this model now charges rather than hides.
+///
+/// **What it moved, MEASURED against a counting allocator over 8 real archive
+/// volumes** (release build, 2026-09-09) — and the naive arithmetic
+/// over-states it by 3.4x, so the arithmetic is not what is quoted here.
+///
+/// The naive term is `+40 B` of `Arc` block and `+16 B` of
+/// [`ALLOCATOR_BLOCK_OVERHEAD`] on it per non-empty moment, which on ~32,400
+/// moments would be +1.73 MiB. **Most of that is paid back by the `Radial`
+/// struct getting smaller**: a moment now stores an 8-byte pointer where it
+/// stored a 24-byte `Vec`, and a `Radial` holds seven of them inline, so
+/// `size_of::<Radial>()` fell from **312 B to 200 B** and every radial slot a
+/// sweep's vector holds — spare capacity included, which is ~42 % past the
+/// length — got 112 B cheaper.
+///
+/// Net, requested bytes for a whole decoded volume held live:
+///
+/// * **+378,496 B on a 6,480-radial / 32,400-moment volume**, which is
+///   `32,400 x 40` of `Arc` blocks less `8,192 x 112` of radial slots, exactly;
+/// * median **+436 KB on a ~50-53 MB volume — +0.83 %**, over the 8 volumes;
+/// * **fewer bytes granted across the decode as a whole**, by a median
+///   481 KB, because the transient container growth shrank by more than the
+///   `Arc` blocks added.
+///
+/// The block count does rise by exactly one per non-empty moment, verified
+/// against the allocator on every volume (`+32,400`, `+35,280`, `+38,160`
+/// against moment counts of the same). **Decode time: +2.2 ms median on a
+/// ~285 ms volume, +0.8 %**, over 48 pairs interleaved round by round; the
+/// per-run noise floor of the same binary on the same file is 3.0 %, so the
+/// effect is real but under the floor and only visible paired.
+///
+/// A volume that is resident once pays that +0.83 %. Every additional
+/// generation alive at the same time — which before this was a full second
+/// copy of the gate bytes, 97.4 % of a volume, measured — now pays nothing at
+/// all.
+///
+/// Derived rather than written as `40`, because it is a target property: two
+/// `usize` counters plus a `Vec<u8>` header. On wasm32 it is 20 B, not 40.
+pub const GATE_BUFFER_SHARE_BYTES: usize = 2 * size_of::<usize>() + size_of::<Vec<u8>>();
 
 /// **Allocations a decoded volume holds that this walk cannot enumerate**,
 /// charged once for a scan that holds any sweeps at all.
@@ -294,11 +373,13 @@ fn radial_bytes_and_blocks(radial: &Radial) -> (usize, usize) {
             .into_iter()
             .flatten()
             .fold((0usize, 0usize), |(sum, blocks), m| {
-                let b = gate_bytes(m);
-                (sum.saturating_add(b), blocks + usize::from(b > 0))
+                let (b, n) = gate_bytes_and_blocks(m);
+                (sum.saturating_add(b), blocks + n)
             });
-    let cfp = radial.clutter_filter_power().map_or(0, gate_bytes);
-    (dual_pol.saturating_add(cfp), blocks + usize::from(cfp > 0))
+    let (cfp, cfp_blocks) = radial
+        .clutter_filter_power()
+        .map_or((0, 0), gate_bytes_and_blocks);
+    (dual_pol.saturating_add(cfp), blocks + cfp_blocks)
 }
 
 /// One moment's gate buffer: its bytes, and the block holding them.
@@ -311,12 +392,54 @@ fn radial_bytes_and_blocks(radial: &Radial) -> (usize, usize) {
 /// same convention — a sweep priced one way inside a volume and another way
 /// beside it would make the census's families disagree about one allocation.
 pub fn gate_bytes(moment: &impl DataMoment) -> usize {
+    gate_bytes_and_blocks(moment).0
+}
+
+/// **One moment's gate buffer: its bytes, and the blocks holding them.**
+///
+/// Two blocks, not one, since the buffer became shareable: the `Vec<u8>`
+/// holding the gate bytes, and the `Arc` block that lets a clone of the
+/// volume bump a count instead of copying them — see
+/// [`GATE_BUFFER_SHARE_BYTES`] for what that second block is worth.
+///
+/// An empty buffer is charged nothing at all, blocks included: its `Vec` never
+/// asked the allocator for anything, and `GateBuffer::empty` hands out one
+/// shared `Arc` for the whole process rather than one per released moment.
+pub fn gate_bytes_and_blocks(moment: &impl DataMoment) -> (usize, usize) {
     let len = moment.raw_values().len();
     if len == 0 {
-        0
+        (0, 0)
     } else {
-        len.saturating_add(ALLOCATOR_BLOCK_OVERHEAD)
+        (
+            len.saturating_add(ALLOCATOR_BLOCK_OVERHEAD)
+                .saturating_add(GATE_BUFFER_SHARE_BYTES)
+                .saturating_add(ALLOCATOR_BLOCK_OVERHEAD),
+            2,
+        )
     }
+}
+
+/// **What a clone of this volume does NOT allocate**: the gate bytes and the
+/// blocks holding them, summed over every non-empty moment.
+///
+/// `nexrad_model::data::GateBuffer` shares, so cloning a `Sweep` — which
+/// [`crate::chunks::VolumeAssembler::snapshot`] does on every rebuild it is
+/// not the volume's last owner for — copies the containers and bumps a
+/// refcount for each of these. This is the difference between what the clone
+/// would have cost and what it costs, and it is the figure
+/// [`crate::chunks::rebuild_totals`] files as `shared_bytes` / `shared_blocks`.
+///
+/// One walk of the volume, on the same terms as [`scan_bytes_and_blocks`] —
+/// so `scan_bytes_and_blocks(s).0 - scan_gate_bytes_and_blocks(s).0` is
+/// exactly the container term a clone still pays.
+pub fn scan_gate_bytes_and_blocks(scan: &Scan) -> (usize, usize) {
+    scan.sweeps()
+        .iter()
+        .flat_map(Sweep::radials)
+        .fold((0usize, 0usize), |(sum, blocks), radial| {
+            let (b, n) = radial_bytes_and_blocks(radial);
+            (sum.saturating_add(b), blocks.saturating_add(n))
+        })
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

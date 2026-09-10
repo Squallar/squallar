@@ -542,6 +542,30 @@ fn the_rebuild_counter_separates_a_copied_volume_from_a_moved_one() {
         after_copy.copied_blocks - before.copied_blocks,
     );
 
+    // The gate term of that copy, which `nexrad_model::data::GateBuffer`
+    // turned into refcount bumps. It is the whole point of the change and it
+    // is asserted as a proportion rather than a byte count, because the
+    // fixture's shape is free to move: what must not move is that nearly all
+    // of a copied volume is gates and that the copy no longer allocates them.
+    let shared_bytes = after_copy.shared_bytes - before.shared_bytes;
+    let shared_blocks = after_copy.shared_blocks - before.shared_blocks;
+    assert!(
+        shared_bytes > 0 && shared_blocks > 0,
+        "the copy reported {shared_bytes} B in {shared_blocks} blocks shared; \
+         the gate buffers are being copied, or the arm is not wired",
+    );
+    assert!(
+        shared_bytes * 10 > priced * 9,
+        "of {priced} B copied only {shared_bytes} B were shared, under 90 %; \
+         the gate term is not what the clone is skipping",
+    );
+    assert!(
+        after_copy.copied_blocks - before.copied_blocks - shared_blocks < 100,
+        "the copy still allocated {} blocks after the shared ones are taken \
+         out; a clone of a volume should be its containers and nothing else",
+        after_copy.copied_blocks - before.copied_blocks - shared_blocks,
+    );
+
     // ---- the move arm: nothing else holds it ----------------------------
     // Exactly the counterfactual an ownership fix would create. It is done
     // here by hand because no shipped path produces it: the rebuild runs
@@ -570,6 +594,11 @@ fn the_rebuild_counter_separates_a_copied_volume_from_a_moved_one() {
         "the move was priced at {} B, so nothing was reported as not copied",
         after_move.moved_bytes - before_move.moved_bytes,
     );
+    assert_eq!(
+        (after_move.shared_bytes, after_move.shared_blocks),
+        (after_copy.shared_bytes, after_copy.shared_blocks),
+        "a rebuild that MOVED filed shared bytes; nothing was cloned to share",
+    );
     assert!(
         after_move.moved_blocks - before_move.moved_blocks > 1_000,
         "the move reported {} blocks not allocated",
@@ -579,6 +608,87 @@ fn the_rebuild_counter_separates_a_copied_volume_from_a_moved_one() {
 
 /// One rebuild on the poller's own terms, and the handle dropped immediately:
 /// a `Scan` kept alive here would be the second owner the next rebuild sees.
+/// **A rebuilt volume's gates are the SAME allocation as the volume it was
+/// cloned from, and every gate reads back bit-identical.**
+///
+/// **The counter test above cannot do this job, and that is why this exists.**
+/// `shared_bytes` is computed by WALKING the volume being cloned, not by
+/// observing the clone, so it reports the same figure on a tree whose
+/// `GateBuffer::clone` deep-copies every byte. Only pointer identity can tell
+/// a shared clone from a copied one — and only a value comparison can tell a
+/// shared clone from a broken one, so both halves are asserted here.
+///
+/// TAMPER, run 2026-09-09: give `GateBuffer` a hand-written `Clone` that does
+/// `Arc::new(self.0.as_ref().clone())`. This test fails on the pointer
+/// assertion (`radial 0's gate buffer was reallocated by the rebuild`) while
+/// its value assertion and the whole of the counter test above still pass —
+/// exactly the split the two halves exist to make visible. A tamper on
+/// `GateBuffer::from` instead does NOT fail anything, because the sharing this
+/// is about happens at the `Sweep` clone and not at construction.
+#[test]
+fn a_rebuilt_volume_shares_the_gates_of_the_one_it_was_cloned_from() {
+    use nexrad_model::data::DataMoment;
+
+    const SITE: &str = "KTLX";
+    let _exclusive = crate::chunks::feed_level_serial::exclusive();
+    let mut mgr = mgr_assembling(SITE);
+    ingest(&mut mgr, SITE, 1, ChunkKind::Start, start_chunk());
+    ingest(&mut mgr, SITE, 2, ChunkKind::Intermediate, cut(1, 0.5));
+
+    // HELD across the rebuild, which is what makes the rebuild copy: this is
+    // the bridge's role played by hand, and the reference the comparison
+    // needs anyway.
+    let first = mgr.snapshot(SITE).expect("a sealed cut is a volume");
+    let before = crate::chunks::rebuild_totals();
+    ingest(&mut mgr, SITE, 3, ChunkKind::Intermediate, cut(2, 0.9));
+    let second = mgr.snapshot(SITE).expect("a rebuilt volume");
+    let after = crate::chunks::rebuild_totals();
+    assert_eq!(
+        after.copies - before.copies,
+        1,
+        "the fixture did not produce the copying rebuild this test is about",
+    );
+
+    // The reflectivity moments of the cut both generations carry.
+    let gates = |scan: &nexrad_model::data::Scan| -> Vec<(usize, Vec<u8>)> {
+        scan.sweeps()
+            .iter()
+            .filter(|s| s.elevation_number() == 1)
+            .flat_map(nexrad_model::data::Sweep::radials)
+            .filter_map(nexrad_model::data::Radial::reflectivity)
+            .map(|m| (m.gate_buffer().id(), m.raw_values().to_vec()))
+            .collect()
+    };
+    let old = gates(&first.scan);
+    let new = gates(&second.scan);
+    assert!(
+        !old.is_empty(),
+        "fixture: the first cut carries no reflectivity to compare",
+    );
+    assert_eq!(
+        old.len(),
+        new.len(),
+        "the rebuild did not carry the first cut's radials through",
+    );
+    for (i, ((old_id, old_bytes), (new_id, new_bytes))) in old.iter().zip(&new).enumerate() {
+        assert_eq!(
+            old_id, new_id,
+            "radial {i}'s gate buffer was reallocated by the rebuild; the \
+             clone is still deep-copying gates",
+        );
+        assert_eq!(
+            old_bytes, new_bytes,
+            "radial {i}'s gate values moved across a rebuild",
+        );
+    }
+    assert!(
+        old.iter()
+            .zip(&new)
+            .all(|((_, a), (_, b))| a == b && !a.is_empty()),
+        "the comparison passed over empty buffers only",
+    );
+}
+
 fn rebuild(mgr: &mut ChunkFeedManager, site: &str) {
     let built = mgr
         .feeds

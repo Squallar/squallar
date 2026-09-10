@@ -1,4 +1,5 @@
 use crate::BinaryData;
+use std::fmt::{self, Debug, Formatter};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,11 @@ pub trait DataMoment {
 
     /// Iterator over raw gate values as `u16`, handling both 8-bit and 16-bit word sizes.
     fn raw_gate_values(&self) -> impl Iterator<Item = u16> + '_;
+
+    /// **LOCAL CHANGE.** The shared allocation holding this moment's gates —
+    /// see [`GateBuffer`]. For a walk that must not charge one buffer twice
+    /// when two clones of a volume are alive at once.
+    fn gate_buffer(&self) -> &GateBuffer;
 }
 
 /// Implements [`DataMoment`] for a wrapper type that stores a `MomentDataBlock` as `self.inner`.
@@ -84,8 +90,129 @@ macro_rules! impl_data_moment {
             fn raw_gate_values(&self) -> impl Iterator<Item = u16> + '_ {
                 self.inner.raw_gate_values()
             }
+            fn gate_buffer(&self) -> &GateBuffer {
+                &self.inner.values.0
+            }
         }
     };
+}
+
+/// **LOCAL CHANGE.** Shared storage for one (ray, moment) gate buffer.
+///
+/// A decoded volume is **95.9 % per-(ray, moment) gate buffers**, one
+/// allocator block apiece and ~32,400 of them on a VCP-212-shaped volume.
+/// While `MomentDataBlock::values` was a `Vec<u8>`, cloning a `Sweep` — which
+/// `squallar_radar::chunks::VolumeAssembler::snapshot` does on every rebuild
+/// that is not the volume's last owner, MEASURED at 156 of 156 rebuilds on a
+/// 420 s six-site leg — deep-copied every one of them: 30.4 MiB across 18,873
+/// blocks per rebuild, on the poller's thread.
+///
+/// This makes that clone a refcount bump. The buffer is **immutable by
+/// construction**: it is written exactly once, by
+/// [`MomentDataBlock::from_fixed_point`], and there is no `&mut` path to the
+/// bytes anywhere in this crate or out of it — `Radial` hands out
+/// `Option<&MomentData>` and nothing else, and the only other writer,
+/// [`MomentDataBlock::without_values`], replaces the whole field with
+/// [`GateBuffer::empty`]. So sharing cannot change what any reader sees, and
+/// `Arc` rather than `Rc` because a volume is built on a runtime worker and
+/// read on the frame thread.
+///
+/// **Not `Arc<[u8]>`**: `Arc<[u8]>::from(Vec<u8>)` copies the bytes into a
+/// fresh allocation, which would put a whole volume's memcpy back on the
+/// decode path to save 24 bytes a buffer. `Arc<Vec<u8>>` moves the `Vec`'s
+/// three words into the new block and the gate bytes never move.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct GateBuffer(std::sync::Arc<Vec<u8>>);
+
+impl GateBuffer {
+    /// The shared empty buffer.
+    ///
+    /// One allocation for the whole process rather than one per released
+    /// moment: [`MomentDataBlock::without_values`] is called for every moment
+    /// of every radial of a volume being reduced to a skeleton, and an
+    /// `Arc::new(Vec::new())` apiece would be tens of thousands of blocks to
+    /// represent nothing.
+    pub fn empty() -> Self {
+        static EMPTY: std::sync::OnceLock<std::sync::Arc<Vec<u8>>> = std::sync::OnceLock::new();
+        Self(std::sync::Arc::clone(
+            EMPTY.get_or_init(|| std::sync::Arc::new(Vec::new())),
+        ))
+    }
+
+    /// The gate bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+
+    /// **The identity of the shared allocation**, for a walk that prices a set
+    /// of volumes and must not charge one buffer twice because two generations
+    /// of a rebuilt volume are alive at once.
+    ///
+    /// It is an address and it is only ever compared against another address
+    /// read while both owners are held — see
+    /// `squallar_radar::scan_size::GateBufferSet`, which holds the `Scan`s it
+    /// is walking for exactly as long as it holds their ids.
+    pub fn id(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.0) as usize
+    }
+
+    /// Whether these two moments' gates are the same allocation.
+    pub fn shares_with(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// How many owners this buffer has, this one included.
+    pub fn owners(&self) -> usize {
+        std::sync::Arc::strong_count(&self.0)
+    }
+}
+
+impl From<Vec<u8>> for GateBuffer {
+    fn from(values: Vec<u8>) -> Self {
+        Self(std::sync::Arc::new(values))
+    }
+}
+
+impl AsRef<[u8]> for GateBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl std::ops::Deref for GateBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl Debug for GateBuffer {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GateBuffer")
+            .field("len", &self.0.len())
+            .field("owners", &std::sync::Arc::strong_count(&self.0))
+            .finish()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for GateBuffer {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // The same wire form the `Vec<u8>` this replaced had: `serde` has no
+        // `Arc` impls without its own `rc` feature, and enabling that to
+        // serialise a byte string would be a wire change for nothing.
+        Serialize::serialize(self.0.as_ref(), serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for GateBuffer {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self(std::sync::Arc::new(Vec::<u8>::deserialize(
+            deserializer,
+        )?)))
+    }
 }
 
 /// CFP status codes for clutter filter power moments.
@@ -118,7 +245,7 @@ pub(crate) struct MomentDataBlock {
     data_word_size: u8,
     scale: f32,
     offset: f32,
-    values: BinaryData<Vec<u8>>,
+    values: BinaryData<GateBuffer>,
 }
 
 impl MomentDataBlock {
@@ -147,7 +274,7 @@ impl MomentDataBlock {
             data_word_size: self.data_word_size,
             scale: self.scale,
             offset: self.offset,
-            values: BinaryData::from(Vec::new()),
+            values: BinaryData::from(GateBuffer::empty()),
         }
     }
 
@@ -174,7 +301,7 @@ impl MomentDataBlock {
             data_word_size,
             scale,
             offset,
-            values: BinaryData::new(values),
+            values: BinaryData::new(GateBuffer::from(values)),
         }
     }
 
@@ -225,20 +352,24 @@ impl MomentDataBlock {
     /// The raw encoded gate values as bytes. For 8-bit moments, each byte is one gate.
     /// For 16-bit moments, each pair of bytes is a big-endian `u16` gate value.
     fn raw_values(&self) -> &[u8] {
-        &self.values
+        self.values.0.as_slice()
     }
 
     /// Iterator over raw gate values as `u16`, handling both 8-bit and 16-bit word sizes.
     fn raw_gate_values(&self) -> impl Iterator<Item = u16> + '_ {
         let is_16bit = self.data_word_size == 16;
         let step = if is_16bit { 2 } else { 1 };
-        self.values.chunks_exact(step).map(move |chunk| {
-            if is_16bit {
-                u16::from_be_bytes([chunk[0], chunk[1]])
-            } else {
-                chunk[0] as u16
-            }
-        })
+        self.values
+            .0
+            .as_slice()
+            .chunks_exact(step)
+            .map(move |chunk| {
+                if is_16bit {
+                    u16::from_be_bytes([chunk[0], chunk[1]])
+                } else {
+                    chunk[0] as u16
+                }
+            })
     }
 }
 

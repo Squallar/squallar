@@ -87,11 +87,104 @@ the added method must leave untouched.
 | --- | --- |
 | `src/data/scan.rs` | Two methods. `Scan::into_sweeps(self) -> Vec<Sweep>` — the only owned decomposition of a scan. It moves the field `Scan::new` took; no representation changes. `Scan::sweeps_capacity(&self) -> usize` — reads `Vec::capacity` on the same field, because `sweeps()` hands out a slice and a slice cannot report spare capacity. Both marked `LOCAL CHANGE` at their definitions. |
 | `src/data/sweep.rs` | One method, `Sweep::radials_capacity(&self) -> usize` — `Vec::capacity` on the radial vector, for the same reason and marked the same way. Reading it is what lets `squallar_radar::scan_size::scan_bytes` charge what the allocator holds rather than what the slice's length implies; the spare is ~42 % of the length in real decoded volumes. |
-| `src/data/moment.rs` | Three methods, one rule. `MomentDataBlock::without_values(&self)` returns the same block with `values` emptied and `gate_count`, `first_gate_range`, `gate_interval`, `data_word_size`, `scale` and `offset` carried over unchanged; `MomentData::without_values` and `CFPMomentData::without_values` expose it on the two public wrappers. All three marked `LOCAL CHANGE` at their definitions. No representation change — it constructs the struct the decoder constructs, with one field empty. Written on the block rather than rebuilt through the public accessors because `first_gate_range` and `gate_interval` are stored as fixed-point `u16` and read back as `f64` kilometres, so a round trip would not reproduce the block; and because `gate_count` is HASHED by `squallar_radar::sampler::ladder_fingerprint`, so a copy that changed it would silently move a cross-section's re-cut key. It is what lets `squallar_radar::skeleton::VolumeSkeleton` keep a volume's structure resident while releasing the arrays, which on a VCP-212-shaped volume is 3.18 % of the allocator cost of the whole. |
+| `src/data/moment.rs` | Three methods, one rule, and one added public type — `GateBuffer`, whose reason is under [Changed](#the-gate-buffer-shares--srcdatamomentrs). The three methods: `MomentDataBlock::without_values(&self)` returns the same block with `values` emptied and `gate_count`, `first_gate_range`, `gate_interval`, `data_word_size`, `scale` and `offset` carried over unchanged; `MomentData::without_values` and `CFPMomentData::without_values` expose it on the two public wrappers. All three marked `LOCAL CHANGE` at their definitions. No representation change — it constructs the struct the decoder constructs, with one field empty. Written on the block rather than rebuilt through the public accessors because `first_gate_range` and `gate_interval` are stored as fixed-point `u16` and read back as `f64` kilometres, so a round trip would not reproduce the block; and because `gate_count` is HASHED by `squallar_radar::sampler::ladder_fingerprint`, so a copy that changed it would silently move a cross-section's re-cut key. It is what lets `squallar_radar::skeleton::VolumeSkeleton` keep a volume's structure resident while releasing the arrays, which on a VCP-212-shaped volume is 3.18 % of the allocator cost of the whole. |
 | `Cargo.toml` | The `[lints]` tables every vendored crate here carries, so the clippy fix-bot cannot rewrite upstream source — see the comment above them and vendor/nexrad-decode/Cargo.toml for the mechanism. Also the two `[[test]]` blocks and five dev-dependencies of the deleted tests, removed. |
 | `LICENSE`, `VENDORED.md` | This file and the license notice. |
 
 ### Changed — source
+
+#### The gate buffer shares — `src/data/moment.rs`
+
+`MomentDataBlock::values` was `BinaryData<Vec<u8>>`; it is now
+`BinaryData<GateBuffer>`, where `GateBuffer` is an added newtype over
+`Arc<Vec<u8>>`.
+
+```rust
+-    values: BinaryData<Vec<u8>>,
++    values: BinaryData<GateBuffer>,
+```
+
+**Why.** A decoded volume is **95.9 % per-(ray, moment) gate buffers**, ~32,400
+of them at one allocator block apiece, and cloning a `Sweep` deep-copied every
+one. `squallar_radar::chunks::VolumeAssembler::snapshot` does that clone on
+every rebuild where it is not the volume's last owner, which on a 420 s
+six-site leg (2026-09-09) was **156 of 156 rebuilds — 4,744.9 MiB across
+2,944,230 blocks, a mean 30.4 MiB and 18,873 blocks apiece**, on the poller's
+thread. The two owners that make `Arc::try_unwrap` fail are both legitimate and
+both overlap the rebuild by construction (the bridge copy held precisely during
+the away window the rebuild runs in, and the still inventory), so ownership
+cannot be rearranged to fix it. Making the clone cheap is the remaining move.
+
+**Nothing rounds and nothing is lost.** The bytes are not touched: the `Vec`'s
+three words move into the `Arc`'s block and the gate bytes stay exactly where
+the decoder put them. `raw_values()` still returns `&[u8]` over the same
+memory, `raw_gate_values()` still `chunks_exact`es it, and `MomentData::iter`
+still decodes lazily from the raw slice. Upstream's `tests/model_types.rs` — the
+pin this delta must leave intact — passes unedited.
+
+**Sharing is safe because the buffer is immutable by construction, and that is
+checked rather than assumed.** `values` is a private field of a `pub(crate)`
+struct. It is **written in exactly two places**: `from_fixed_point`, which
+constructs it, and `without_values`, which replaces the whole field with
+`GateBuffer::empty`. It is **read in exactly two**: `raw_values` and
+`raw_gate_values`. There is no `&mut` path to a moment anywhere — `Radial`
+hands out `Option<&MomentData>` and has no `_mut` accessor, and neither do
+`Sweep` or `Scan` — so no caller inside this crate or outside it can mutate a
+gate buffer today, and `Arc` cannot change semantics that nothing exercises.
+`BinaryData`'s blanket `DerefMut` is reachable only from inside this module,
+which is why the audit is a file-scope one and not a workspace-wide one.
+`Arc` rather than `Rc` because a volume is decoded on a runtime worker and read
+on the frame thread; the buffer is never written after construction, so
+concurrent readers of a shared buffer race over nothing.
+
+**Not `Arc<[u8]>`.** `Arc<[u8]>::from(Vec<u8>)` copies the bytes into a fresh
+allocation, which would put a whole volume's memcpy on the decode path to save
+24 bytes a buffer. `Arc<Vec<u8>>` keeps `from_fixed_point(… , values: Vec<u8>)`
+free of a copy, and keeps its signature, so all 140 call sites and both
+decoders are untouched.
+
+**What it costs, measured.** One extra small block per non-empty gate buffer at
+decode: two `usize` counts plus the `Vec` header, **40 B on a 64-bit target and
+20 B on wasm32**. `squallar_radar::scan_size::GATE_BUFFER_SHARE_BYTES` is that
+term and the module prices it.
+
+Most of it is paid back by `size_of::<Radial>()` falling from **312 B to
+200 B** — a moment stores an 8-byte pointer where it stored a 24-byte `Vec`,
+and a `Radial` holds seven inline — so every radial slot a sweep's vector
+holds, its ~42 % spare capacity included, got 112 B cheaper. Against a counting
+allocator over 8 real archive volumes (release, 2026-09-09) the net is
+**+436 KB median on a ~50–53 MB volume, +0.83 %**, and the whole decode grants
+a median **481 KB fewer** bytes than before because the transient container
+growth shrank by more than the `Arc` blocks added. Allocation count at decode
+rises by exactly one per non-empty moment, verified on every volume. Decode
+time rises **+2.2 ms median on a ~285 ms volume, +0.8 %**, over 48 pairs
+interleaved round by round against a 3.0 % per-run noise floor.
+
+Against that: every *additional* generation of a volume alive at the same time,
+which was a full second copy of the gate bytes, now costs nothing. On a 420 s
+six-site leg that is **4,281.3 MiB and 5,403,600 allocations not made**.
+
+`GateBuffer::empty()` hands out one process-wide shared `Arc` rather than
+allocating per released moment, which makes `without_values` — called for every
+moment of every radial of a volume being reduced to a skeleton — cheaper than
+it was.
+
+**Maintenance cost of carrying this.** It is the largest of the three deltas in
+this file: it changes a field's *type* rather than adding a method beside it, so
+re-applying it onto a later upstream release means re-reading `moment.rs` rather
+than re-appending to it. Four call sites move with it inside this file
+(`from_fixed_point`, `without_values`, `raw_values`, `raw_gate_values`) plus the
+`GateBuffer` definition and one trait method. **A wrapper in `squallar-radar`
+was considered and cannot hold this**: the shared form has to be the storage
+*inside* `MomentDataBlock` for `Sweep`'s derived `Clone` — the clone this exists
+to make cheap — to be cheap, and a wrapper outside the model would have to
+rebuild every moment through `from_fixed_point`, which is the deep copy again.
+Nothing short of changing the field reaches it.
+
+Not offerable upstream as written: `GateBuffer` is a public type in a public
+data model, and the choice between a copy and a share belongs to whoever owns
+that API.
+
 
 #### The doubling slack — `src/data/sweep.rs`
 
