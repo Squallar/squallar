@@ -807,6 +807,44 @@ pub mod gauge {
             BOUND_EXCEEDED.load(Relaxed),
         )
     }
+
+    static DELIVERIES: AtomicUsize = AtomicUsize::new(0);
+    static DELIVERED_ROWS: AtomicU64 = AtomicU64::new(0);
+    static RASTERS: AtomicUsize = AtomicUsize::new(0);
+    static WALKED_ROWS: AtomicU64 = AtomicU64::new(0);
+
+    /// **A delivery the handler installed** — one poll's rows, at the moment
+    /// they become the slab a pane may draw from.
+    pub(crate) fn delivered(rows: usize) {
+        DELIVERIES.fetch_add(1, Relaxed);
+        DELIVERED_ROWS.fetch_add(rows as u64, Relaxed);
+    }
+
+    /// **A raster that walked a delivery** — the rows
+    /// [`crate::render::rasterize::rasterize_glm_strikes`] iterated, counted
+    /// once per picture and before any cull, because the question is whether
+    /// the block was read at all and every row is loaded to answer it.
+    pub(crate) fn rastered(rows: usize) {
+        RASTERS.fetch_add(1, Relaxed);
+        WALKED_ROWS.fetch_add(rows as u64, Relaxed);
+    }
+
+    /// `(deliveries, delivered_rows, rasters, walked_rows)`.
+    ///
+    /// **Two denominators, never added.** The first pair counts what the fetch
+    /// handed the handler; the second counts what the rasterizer read back out
+    /// of it, and one delivery is walked once per picture drawn from it — so
+    /// `walked_rows` above `delivered_rows` is a pane redrawing, not a leak.
+    /// `rasters == 0` beside `deliveries > 0` is the reading this exists for:
+    /// rows downloaded, parsed, installed and never loaded by an instruction.
+    pub fn read_delivery() -> (usize, u64, usize, u64) {
+        (
+            DELIVERIES.load(Relaxed),
+            DELIVERED_ROWS.load(Relaxed),
+            RASTERS.load(Relaxed),
+            WALKED_ROWS.load(Relaxed),
+        )
+    }
 }
 
 /// **The retention floor as it stands right now**, shared between

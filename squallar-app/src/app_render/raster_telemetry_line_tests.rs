@@ -885,3 +885,111 @@ fn upload_pacing_is_additive_and_leaves_the_rigs_upload_regex_alone() {
         "the pacing line must be its own sentence: {pacing}",
     );
 }
+
+/// **The `gridded fields:` sentence, and the absence that is its whole
+/// point.**
+///
+/// No rig probe reads this line, so what is pinned is the sentence a probe
+/// would be written from. The empty arm is the one that matters: a process
+/// whose gridded rasterizer never reached the cell loop must SAY so, because
+/// "no field drew" and "this field drew nothing" are the two readings this
+/// line exists to separate, and neither can be recovered from `gridded
+/// scatter:`.
+///
+/// Every figure is given a value no other position holds, on this file's own
+/// terms: a plausible value would let a transposition read as correct.
+#[test]
+fn the_gridded_fields_line_names_each_field_and_says_when_none_drew() {
+    use squallar_overlays::render::rasterize::gridded_ledger::FieldTotals;
+
+    assert_eq!(
+        super::gridded_fields_line(&[]),
+        "gridded fields: none",
+        "a process whose gridded rasterizer never reached the cell loop must \
+         say so as a sentence. An empty list rendered as a bare `gridded \
+         fields:` reads as a truncated line, which is what a scraper would \
+         report as a parse failure rather than as the reading it is",
+    );
+
+    assert_eq!(
+        super::gridded_fields_line(&[
+            (
+                "gmgsi_ir".to_owned(),
+                FieldTotals {
+                    pictures: 3,
+                    cells: 2048,
+                },
+            ),
+            (
+                "hrrr_cin".to_owned(),
+                FieldTotals {
+                    pictures: 7,
+                    cells: 4096,
+                },
+            ),
+        ]),
+        "gridded fields: gmgsi_ir 3 pictures / 2048 cells, \
+         hrrr_cin 7 pictures / 4096 cells",
+        "the `gridded fields:` sentence has drifted from what its reader was \
+         told to expect",
+    );
+}
+
+/// **The `glm delivery:` sentence, at the reading it was added to make
+/// sayable.**
+///
+/// `0 rasters` beside a nonzero delivery count is a poll's flashes downloaded,
+/// parsed, installed and never loaded by an instruction. That is a figure, not
+/// an absence, so it prints as one — and the two pairs are never added: rows
+/// delivered is one install's slab, rows walked is what a picture iterated,
+/// and one delivery drawn by three panes walks its rows three times.
+#[test]
+fn the_glm_delivery_line_can_say_a_delivery_nothing_walked() {
+    assert_eq!(
+        super::glm_delivery_line((0, 0, 0, 0)),
+        "glm delivery: 0 deliveries of 0 rows, 0 rasters walked 0 rows",
+        "a process that has polled nothing must still print the sentence: \
+         these are running totals a reader brackets a window over, and a \
+         window needs a reading at each end of it",
+    );
+
+    assert_eq!(
+        super::glm_delivery_line((2, 266_726, 0, 0)),
+        "glm delivery: 2 deliveries of 266726 rows, 0 rasters walked 0 rows",
+        "the reading this line exists for — rows installed and never read — \
+         has drifted from what its reader was told to expect",
+    );
+
+    assert_eq!(
+        super::glm_delivery_line((3, 4096, 8, 16_384)),
+        "glm delivery: 3 deliveries of 4096 rows, 8 rasters walked 16384 rows",
+        "the `glm delivery:` sentence has drifted from what its reader was \
+         told to expect",
+    );
+}
+
+/// **The `blank pages:` sentence.**
+///
+/// `claimed` is the fires-counter for the arm `squallar_egui::blank_page`
+/// gates, and its zero is a real reading: a leg on which no atlas page was
+/// minted and one on which the router ignored every note say the same thing
+/// through `noted`, which is why both terms are on the line. The byte figure
+/// is a transfer that did not happen and never a resident saving, so it is
+/// spelled `not transferred` rather than `saved`.
+#[test]
+fn the_blank_pages_line_says_its_fires_counter_and_its_denominator() {
+    assert_eq!(
+        super::blank_pages_line((0, 0, 0, 0), 0),
+        "blank pages: 0 noted, 0 claimed, 0 forgotten, 0 outstanding; \
+         0 B not transferred",
+        "a process that minted no atlas page must still print the sentence",
+    );
+
+    assert_eq!(
+        super::blank_pages_line((8, 5, 1, 13_046_544), 2),
+        "blank pages: 8 noted, 5 claimed, 1 forgotten, 2 outstanding; \
+         13046544 B not transferred",
+        "the `blank pages:` sentence has drifted from what its reader was told \
+         to expect",
+    );
+}

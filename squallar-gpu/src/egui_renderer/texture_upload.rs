@@ -844,6 +844,12 @@ impl TextureUploads {
         // `take`, so a later re-allocation under the same id is a real image
         // and takes the ordinary route.
         if delta.pos.is_none() && !mine && squallar_egui::blank_page::take(id) {
+            // The transfer this spares, priced where the delta's size is
+            // known. Not a resident saving: the texture is still allocated at
+            // the page's size and the image was still built to state it.
+            squallar_egui::blank_page::claimed_bytes(
+                (image.size[0] as u64) * (image.size[1] as u64) * 4,
+            );
             self.seed(device, queue, renderer, id, delta.options);
             self.pending.retain(|band| band.id != id);
             self.owned.remove(&id);

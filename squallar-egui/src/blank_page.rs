@@ -41,6 +41,7 @@
 //! by [`forget`], which the renderer calls for every id egui retires.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 /// Pages minted and not yet claimed by their allocation delta.
 ///
@@ -57,6 +58,7 @@ pub fn note(id: egui::TextureId) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if !blank.contains(&id) {
+        NOTED.fetch_add(1, Relaxed);
         blank.push(id);
     }
 }
@@ -73,6 +75,7 @@ pub fn take(id: egui::TextureId) -> bool {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match blank.iter().position(|held| *held == id) {
         Some(at) => {
+            CLAIMED.fetch_add(1, Relaxed);
             blank.swap_remove(at);
             true
         }
@@ -86,7 +89,40 @@ pub fn forget(ids: &[egui::TextureId]) {
     let mut blank = BLANK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let before = blank.len();
     blank.retain(|held| !ids.contains(held));
+    FORGOTTEN.fetch_add(before - blank.len(), Relaxed);
+}
+
+static NOTED: AtomicUsize = AtomicUsize::new(0);
+static CLAIMED: AtomicUsize = AtomicUsize::new(0);
+static FORGOTTEN: AtomicUsize = AtomicUsize::new(0);
+static CLAIMED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes an upload router did not transfer because [`take`] claimed the delta.
+///
+/// Filed by the router, which is the only place the delta's size is known, and
+/// **the transfer that did not happen** rather than a resident saving: the
+/// texture is still allocated at the page's size, and the `ColorImage` this
+/// spares the wire is still built and still dropped.
+pub fn claimed_bytes(bytes: u64) {
+    CLAIMED_BYTES.fetch_add(bytes, Relaxed);
+}
+
+/// `(noted, claimed, forgotten, claimed_bytes)`.
+///
+/// **`claimed` is the fires-counter.** The arm it gates is a policy the
+/// producer publishes and the renderer obeys; nothing else distinguishes a
+/// mechanism that ran from one whose condition never held. `noted` is its
+/// denominator, and `forgotten` the pages retired before their delta arrived —
+/// `noted == claimed + forgotten + outstanding()` on a healthy leg.
+pub fn totals() -> (usize, usize, usize, u64) {
+    (
+        NOTED.load(Relaxed),
+        CLAIMED.load(Relaxed),
+        FORGOTTEN.load(Relaxed),
+        CLAIMED_BYTES.load(Relaxed),
+    )
 }
 
 /// How many entries are outstanding. For the suite that holds the bound.

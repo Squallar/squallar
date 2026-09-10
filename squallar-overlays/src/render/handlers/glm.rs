@@ -1004,6 +1004,7 @@ impl OverlayHandler for GlmHandler {
                 // **The granule's own `Vec`, moved**: the parse already
                 // allocated it, so installing a poll asks the allocator for
                 // the one `Arc` around it and nothing else.
+                crate::glm::fetch::gauge::delivered(outcome.flashes.len());
                 self.state.set_data_with_coverage(
                     Arc::new(GlmSlab {
                         flashes: outcome.flashes,

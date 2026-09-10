@@ -3073,6 +3073,11 @@ pub fn rasterize_glm_strikes(
 
     let mut tally = ItemTally::default();
 
+    // Before the loop, and counting the rows offered rather than the rows
+    // drawn: the question this answers is whether the delivered block was read
+    // by an instruction at all, and every row is loaded to be culled.
+    crate::glm::fetch::gauge::rastered(flashes.len());
+
     for (i, flash) in flashes.iter().enumerate() {
         // Into the viewport's frame before either test: the flash carries a
         // folded longitude and `bounds` carries an unfolded one.
@@ -4391,6 +4396,10 @@ pub fn rasterize_gridded(
         written_px,
         u64::from(width) * u64::from(height),
     );
+    // The same picture, keyed by whose grid it was. A resident plane is
+    // written once at decode and read by this loop or by nothing, so a field
+    // absent from `by_field` after a leg is a decode nothing consumed.
+    gridded_ledger::record_field(input.field(), drawn_cells);
 
     RasterizeOutput {
         crop: None,

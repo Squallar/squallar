@@ -277,4 +277,42 @@ fn the_process_wide_reading_is_every_workers_rasters_summed() {
         now.per_cell().is_some_and(|r| r > 0.0),
         "written-per-cell is unreadable after a run that painted cells",
     );
+
+    // ── The per-field split, on the same rasters ──────────────────────────
+    //
+    // One field is the whole fixture, so the split has a known answer: the
+    // field's row IS the whole reading, and its `cells` term is the same
+    // `moved.cells` asserted above. The claim is not that the numbers agree by
+    // accident but that `by_field` is written from the same place and on the
+    // same population — a split written from a different site, or one arm
+    // short, is what this catches.
+    let by_field = gridded_ledger::by_field();
+    let field = squallar_overlays::mrms::fields::spec(
+        squallar_overlays::mrms::MrmsProduct::ReflectivityComposite,
+    )
+    .id
+    .clone();
+    let row = by_field
+        .iter()
+        .find(|(name, _)| name == field.as_str())
+        .map(|(_, t)| *t)
+        .unwrap_or_else(|| {
+            panic!(
+                "`by_field` has no row for `{}` after {calls} rasters of it; it                  holds {by_field:?}. An absent field is the reading that says                  nothing ever drew this source's grid, which is exactly the                  claim a missing write would make falsely",
+                field.as_str(),
+            )
+        });
+    assert_eq!(
+        (row.pictures, row.cells),
+        (moved.pictures, moved.cells),
+        "the per-field split reads {row:?} where the process-wide ledger moved          by {} pictures / {} cells over the one field this fixture draws. The          two are written from the same site and must sum to the same          population; the app prints them as one line's total and its split",
+        moved.pictures,
+        moved.cells,
+    );
+    assert_eq!(
+        by_field.len(),
+        1,
+        "`by_field` holds {} fields after a run that drew exactly one:          {by_field:?}. A field with a row nothing drew would read as a          consumer that fired",
+        by_field.len(),
+    );
 }

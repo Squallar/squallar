@@ -28,6 +28,8 @@
 //! across every worker. Both are written from the same place, once per picture.
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// One reading of the gridded rasterizer's cost.
@@ -114,4 +116,49 @@ pub fn totals() -> Totals {
 /// under libtest's thread pool, where a delta over [`totals`] is not.
 pub fn thread_totals() -> Totals {
     LOCAL.with(Cell::get)
+}
+
+/// One field's share of [`totals`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FieldTotals {
+    /// Pictures that reached the cell loop under this field id.
+    pub pictures: u64,
+    /// Grid cells those pictures painted.
+    pub cells: u64,
+}
+
+/// Pictures and cells **per field id**.
+///
+/// [`Totals`] is field-agnostic, so a leg on which one gridded source drew and
+/// another never did reads exactly like a leg on which both drew. The question
+/// "did *this* source's grid ever reach the cell loop" therefore has no answer
+/// in it, and that is the question a resident grid nothing ever sampled poses:
+/// a decoded plane is written once and read by the cell loop or by nothing.
+///
+/// A `Mutex<BTreeMap>` rather than atomics because the key set is open — a
+/// source registers a field, not a slot. It is taken **once per picture**, on
+/// the offload pool, beside the lock-free [`record`] that stays the hot path's
+/// cost; never per cell, and never on the frame thread.
+static BY_FIELD: Mutex<BTreeMap<String, FieldTotals>> = Mutex::new(BTreeMap::new());
+
+/// Post one picture's field. Called from [`record`]'s own site, once per
+/// raster.
+pub(crate) fn record_field(field: &squallar_source::product::FieldId, cells: u64) {
+    let mut by_field = BY_FIELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = by_field.entry(field.as_str().to_owned()).or_default();
+    entry.pictures += 1;
+    entry.cells += cells;
+}
+
+/// Every field this process has drawn a gridded picture for, ascending by id.
+/// **Empty is a reading**: no gridded raster reached the cell loop at all.
+pub fn by_field() -> Vec<(String, FieldTotals)> {
+    BY_FIELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|(field, totals)| (field.clone(), *totals))
+        .collect()
 }

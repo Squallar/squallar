@@ -1840,6 +1840,81 @@ fn gridded_scatter_line(
     )
 }
 
+/// The `gridded fields:` line — **which sources' grids reached the cell
+/// loop**, and how many cells each painted.
+///
+/// # Why the scatter line cannot answer this
+///
+/// `gridded scatter:` is field-agnostic. A leg on which the model drew and the
+/// mosaic never did reads identically to one on which both drew, so a decoded
+/// plane that nothing ever sampled is invisible in it — and a resident grid is
+/// written once at decode and then read by this loop or by nothing at all.
+///
+/// Denominator: **pictures that reached the cell loop**, process-wide across
+/// every worker, keyed by the id `GriddedInput::field` carries. Its `cells`
+/// term is the same population `gridded scatter:` sums, split by field; the two
+/// lines' `cells` therefore agree in total and are never added to each other.
+///
+/// **Absence is the reading.** A field this build fetched and decoded but never
+/// drew is a field with no row here, and a leg with no gridded raster at all
+/// prints `none`.
+fn gridded_fields_line(
+    by_field: &[(
+        String,
+        squallar_overlays::render::rasterize::gridded_ledger::FieldTotals,
+    )],
+) -> String {
+    if by_field.is_empty() {
+        return "gridded fields: none".to_owned();
+    }
+    let rows: Vec<String> = by_field
+        .iter()
+        .map(|(field, t)| format!("{field} {} pictures / {} cells", t.pictures, t.cells))
+        .collect();
+    format!("gridded fields: {}", rows.join(", "))
+}
+
+/// The `glm delivery:` line — **rows the lightning fetch handed the handler,
+/// against rows the rasterizer read back out of them.**
+///
+/// Two denominators and they are never added. `delivered` counts one poll's
+/// installed slab, once per install. `walked` counts the rows offered to
+/// `rasterize_glm_strikes`, once per picture — so one delivery drawn by three
+/// panes walks its rows three times, and `walked` above `delivered` is redraw,
+/// not duplication.
+///
+/// **`0 rasters` beside a nonzero `deliveries` is the reading this exists
+/// for**: a poll's flashes downloaded, parsed, installed and never loaded by
+/// an instruction, which is what DHAT reports as a written-and-never-read
+/// block and cannot itself distinguish from a consumer that had not run yet.
+fn glm_delivery_line(t: (usize, u64, usize, u64)) -> String {
+    let (deliveries, delivered_rows, rasters, walked_rows) = t;
+    format!(
+        "glm delivery: {deliveries} deliveries of {delivered_rows} rows, \
+         {rasters} rasters walked {walked_rows} rows"
+    )
+}
+
+/// The `blank pages:` line — the atlas pages whose first upload was claimed as
+/// carrying no information.
+///
+/// `claimed` is the arm's fires-counter: `squallar_egui::blank_page` is a fact
+/// the producer publishes and the upload router obeys, and nothing else
+/// separates a policy that ran from one whose condition never held. `noted` is
+/// its denominator; `forgotten` is pages retired before their delta arrived.
+///
+/// **`bytes` is a transfer that did not happen, never a resident saving.** The
+/// texture is still allocated at the page's size and the `ColorImage` stating
+/// that size is still built and still dropped — which is why the block reads
+/// as written-and-never-read whether this arm fires or not.
+fn blank_pages_line(t: (usize, usize, usize, u64), outstanding: usize) -> String {
+    let (noted, claimed, forgotten, bytes) = t;
+    format!(
+        "blank pages: {noted} noted, {claimed} claimed, {forgotten} forgotten, \
+         {outstanding} outstanding; {bytes} B not transferred"
+    )
+}
+
 /// The `frame need:` line — **frames drawn against frames that needed
 /// drawing**, and what the ones that did not are charged to.
 ///
@@ -3115,6 +3190,27 @@ impl super::App {
         say_telemetry(
             loud,
             &gridded_scatter_line(&squallar_overlays::render::rasterize::gridded_ledger::totals()),
+        );
+        // The same pictures split by whose grid they were, on the same
+        // unconditional terms. `cells` here sums to `cells` above and is never
+        // added to it. See `gridded_fields_line`.
+        say_telemetry(
+            loud,
+            &gridded_fields_line(&squallar_overlays::render::rasterize::gridded_ledger::by_field()),
+        );
+        // What the lightning fetch delivered against what the rasterizer read
+        // back — two denominators, never added. See `glm_delivery_line`.
+        say_telemetry(
+            loud,
+            &glm_delivery_line(squallar_overlays::glm::fetch::gauge::read_delivery()),
+        );
+        // The blank-page arm's fires-counter, and the transfer it spares.
+        say_telemetry(
+            loud,
+            &blank_pages_line(
+                squallar_egui::blank_page::totals(),
+                squallar_egui::blank_page::outstanding(),
+            ),
         );
         if let Some(state) = self.state.as_ref() {
             say_telemetry(loud, &prep_costs_line(&state.egui_renderer.pass_costs()));
