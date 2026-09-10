@@ -19,7 +19,7 @@ chrono = { workspace = true }
 # granules are deflate-compressed, so dropping `deflate` takes every consumer
 # dark. Do NOT enable `fast-deflate` either: it selects `flate2/zlib-ng`, which
 # is C and breaks wasm32/iOS cross-compilation.
-hdf5-pure = "=0.44.1"
+hdf5-pure = "=0.44.2"
 # The zlib side of an HDF5 filter pipeline, for `bandstream`: reading a chunked
 # variable band by band means inflating its chunks here rather than through
 # `hdf5_pure`'s whole-dataset read, which is the whole point — that read
