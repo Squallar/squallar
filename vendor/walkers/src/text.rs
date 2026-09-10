@@ -1,4 +1,4 @@
-use egui::{Color32, Pos2, Rect, Vec2, vec2};
+use egui::{Color32, Pos2, Rect, Vec2, pos2, vec2};
 
 #[derive(Debug, Clone)]
 pub struct Text {
@@ -215,8 +215,40 @@ pub struct OrientedRect {
 
 impl OrientedRect {
     pub fn new(center: Pos2, angle: f32, size: Vec2) -> Self {
-        let (s, c) = angle.sin_cos();
         let half = size * 0.5;
+
+        // **Nearly every label is upright**, and a rotation by zero is four
+        // multiplies by one, four by zero and a `sincosf` to learn that -- per
+        // label, per solve, per pane. Spelled out, the corners of an upright
+        // box are its own extents.
+        //
+        // The two arms agree BIT FOR BIT, which is what
+        // `an_upright_box_is_built_exactly_as_a_rotation_by_zero_builds_it`
+        // holds: with `sin_cos(0.0)` the rotated spelling adds a signed zero
+        // to each coordinate, and `v + 0.0` is `v` for every `v` except `-0.0`
+        // -- so the guard is a half-extent strictly above zero, which is what
+        // makes a coordinate of `center - half` a signed zero impossible. The
+        // finiteness conjunct is there for the same reason: `half * 0.0` is
+        // `NaN` when the half-extent is infinite, and the rotated spelling
+        // produces one where this arm would not.
+        if angle == 0.0
+            && half.x > 0.0
+            && half.y > 0.0
+            && (center.x + center.y + half.x + half.y).is_finite()
+        {
+            let min = center - half;
+            let max = center + half;
+            return Self {
+                corners: [min, pos2(max.x, min.y), max, pos2(min.x, max.y)],
+                // The same box `Rect::from_points` produces: a half-extent
+                // above zero orders the corners, and no coordinate here can be
+                // the `NaN` that would make a component-wise `min` pick the
+                // other operand.
+                bbox: Rect::from_min_max(min, max),
+            };
+        }
+
+        let (s, c) = angle.sin_cos();
 
         let ux = vec2(half.x * c, half.x * s);
         let uy = vec2(-half.y * s, half.y * c);
@@ -226,6 +258,29 @@ impl OrientedRect {
             center + ux - uy, // top-right
             center + ux + uy, // bottom-right
             center - ux + uy, // bottom-left
+        ];
+
+        Self {
+            corners,
+            bbox: Rect::from_points(&corners),
+        }
+    }
+
+    /// The rotated spelling, always. The only caller is the gate that holds
+    /// [`Self::new`]'s upright arm to it.
+    #[cfg(test)]
+    fn rotated(center: Pos2, angle: f32, size: Vec2) -> Self {
+        let (s, c) = angle.sin_cos();
+        let half = size * 0.5;
+
+        let ux = vec2(half.x * c, half.x * s);
+        let uy = vec2(-half.y * s, half.y * c);
+
+        let corners = [
+            center - ux - uy,
+            center + ux - uy,
+            center + ux + uy,
+            center - ux + uy,
         ];
 
         Self {
@@ -335,28 +390,82 @@ pub const BUCKET_POINTS: f32 = 64.0;
 /// tests in full -- so the answer is the same and only the search changes.
 const MAX_BUCKETS_PER_AREA: i64 = 256;
 
-/// The buckets a bounding box touches, or `None` when it touches too many to
+/// The buckets a bounding box touches, as a column range and a row range,
+/// both **exclusive** at the high end -- or `None` when it touches too many to
 /// be worth filing (see [`MAX_BUCKETS_PER_AREA`]) or is not finite.
 ///
-/// Inclusive on both ends: a box is in every bucket any part of it reaches.
+/// **One comparison chain decides all of that.** A `NaN` coordinate fails
+/// every compare, an infinite one fails a bound, an inverted box fails the
+/// ordering, and an oversized one fails a span cap -- so the four separate
+/// finite-and-in-range gates this replaces are one `&&` chain over values
+/// already in registers. It is worth spelling that way because it is reached
+/// once per claim on the frame thread and its result is *handed* to
+/// [`OccupiedAreas::file`] rather than recomputed there, which is the other
+/// half of the same cut: filing used to derive the span a second time from the
+/// same box.
+///
+/// Exclusive at the high end so the walk over it is a `Range` and not a
+/// `RangeInclusive`, which carries an exhausted flag and tests it on every
+/// step. The `+ 1.0` is done in the float, where a bucket index at the top of
+/// `i32` cannot overflow into the bottom of it.
+#[inline]
 fn bucket_span(bbox: Rect) -> Option<(i32, i32, i32, i32)> {
-    let floor = |v: f32| {
-        let cell = (v / BUCKET_POINTS).floor();
-        (cell.is_finite() && cell >= i32::MIN as f32 && cell <= i32::MAX as f32)
-            .then_some(cell as i32)
-    };
-    let x0 = floor(bbox.min.x)?;
-    let y0 = floor(bbox.min.y)?;
-    let x1 = floor(bbox.max.x)?;
-    let y1 = floor(bbox.max.y)?;
-    // `Rect::from_points` orders the corners, so this holds for any box built
-    // from an `OrientedRect`; a caller-composed inverted box is refused rather
-    // than silently filed in nothing.
-    if x1 < x0 || y1 < y0 {
-        return None;
-    }
-    let buckets = (i64::from(x1) - i64::from(x0) + 1) * (i64::from(y1) - i64::from(y0) + 1);
-    (buckets <= MAX_BUCKETS_PER_AREA).then_some((x0, y0, x1, y1))
+    const INV: f32 = 1.0 / BUCKET_POINTS;
+    const CELL_MIN: f32 = i32::MIN as f32;
+    const CELL_MAX: f32 = i32::MAX as f32;
+    let x0 = (bbox.min.x * INV).floor();
+    let y0 = (bbox.min.y * INV).floor();
+    let x1 = (bbox.max.x * INV).floor();
+    let y1 = (bbox.max.y * INV).floor();
+    let across = x1 - x0;
+    let down = y1 - y0;
+    let ok = x0 >= CELL_MIN
+        && y0 >= CELL_MIN
+        && x1 <= CELL_MAX
+        && y1 <= CELL_MAX
+        && across >= 0.0
+        && down >= 0.0
+        && (across + 1.0) * (down + 1.0) <= MAX_BUCKETS_PER_AREA as f32;
+    ok.then(|| (x0 as i32, y0 as i32, (x1 + 1.0) as i32, (y1 + 1.0) as i32))
+}
+
+/// The side of the cell grid, in buckets: the search's whole index is
+/// `GRID * GRID` chain heads in one flat array.
+///
+/// **A cell is a bucket folded onto the grid, not a bucket.** Two buckets
+/// [`GRID_POINTS`] apart on an axis share a cell, and a query that lands on
+/// one of them looks at the other's claims too. That is safe for the same
+/// reason the buckets themselves are: a candidate is only ever a *candidate*,
+/// and every one of them is put through [`OrientedRect::intersects`] before it
+/// refuses anything. Folding costs the extra tests and nothing else -- and it
+/// costs nothing at all on a pane narrower than [`GRID_POINTS`], which every
+/// pane this draws on is.
+///
+/// **Why a flat array and not the hash table it replaces.** A query touches
+/// two or three cells and a placement writes two or three more, so a pane's
+/// solve was making about five table operations per label over a table of
+/// screen coordinates -- and the table is what the search *is*, so its per-key
+/// cost is the search's cost. Folded onto a fixed grid the key arithmetic is
+/// two masks and a multiply-add, the lookup is one load, and the insertion is
+/// one store. Measured on a 1920x1080 fixture of 600 place names (535 reaching
+/// a claim, 396 placed, warm galley memo, callgrind, marginal instructions
+/// between a 100-pass and a 300-pass run): the claim phase fell **36.0 %**,
+/// and the whole label solve **25.3 %**, with the count of
+/// [`OrientedRect::intersects`] calls identical to the test.
+const GRID: i32 = 64;
+
+/// The distance on one axis after which two claims share a cell. Published
+/// for the reason [`BUCKET_POINTS`] is: it is what makes the folding a
+/// property a caller can state and a gate can hold.
+pub const GRID_POINTS: f32 = BUCKET_POINTS * GRID as f32;
+
+const GRID_MASK: i32 = GRID - 1;
+const CELLS: usize = (GRID as usize) * (GRID as usize);
+
+/// Where a bucket's chain head lives in [`OccupiedAreas::grid`].
+#[inline]
+fn cell_of(cx: i32, cy: i32) -> usize {
+    ((cy & GRID_MASK) as usize) * (GRID as usize) + ((cx & GRID_MASK) as usize)
 }
 
 /// Tracks areas occupied by texts to avoid overlapping them.
@@ -385,14 +494,24 @@ fn bucket_span(bbox: Rect) -> Option<(i32, i32, i32, i32)> {
 /// counted 343, ~78% of them inside the scan loop itself.
 pub struct OccupiedAreas {
     areas: Vec<OrientedRect>,
-    /// Head of each bucket's chain: an index into [`Self::filed`], or
-    /// [`END`].
-    heads: BucketMap,
+    /// The head of each cell's chain -- an index into [`Self::filed`], or
+    /// [`END`] -- for all [`CELLS`] cells at once. See [`GRID`] for why the
+    /// index is a flat array and not the table of screen coordinates it
+    /// replaces.
+    ///
+    /// Empty until the first claim is filed, so an [`OccupiedAreas`] that
+    /// never places a label pays nothing for it: walkers' own per-tile draw
+    /// builds one of these per tile.
+    grid: Vec<u32>,
+    /// The cells of [`Self::grid`] whose head is not [`END`], so
+    /// [`Self::clear`] can reset the cells a solve used instead of the whole
+    /// grid -- a couple of hundred stores rather than [`CELLS`] of them.
+    touched: Vec<u32>,
     /// The chains themselves, `(claim, next link)`.
     ///
-    /// **One arena rather than a `Vec` per bucket**, because a fresh
+    /// **One arena rather than a `Vec` per cell**, because a fresh
     /// `OccupiedAreas` is built for every pane on every frame: a map of
-    /// per-bucket vectors would have allocated once per occupied bucket per
+    /// per-cell vectors would have allocated once per occupied cell per
     /// frame — around two hundred on a 1920x1080 pane of labels — to save a
     /// scan that costs less than that.
     filed: Vec<(u32, u32)>,
@@ -410,50 +529,8 @@ pub struct OccupiedAreas {
     candidates: Vec<u32>,
 }
 
-/// The end of a bucket's chain.
+/// The end of a cell's chain.
 const END: u32 = u32::MAX;
-
-/// One bucket's key, packed so the table hashes eight bytes once rather than
-/// two fields twice.
-fn bucket_key(cx: i32, cy: i32) -> i64 {
-    (i64::from(cx) << 32) | i64::from(cy as u32)
-}
-
-/// A multiply-xorshift hash over the packed bucket key.
-///
-/// **Not a taste preference; the cut does not pay for itself without it.** A
-/// pane of 282 labels makes on the order of two thousand bucket lookups and
-/// insertions a frame, and SipHash — what `RandomState` gives a `HashMap` by
-/// default — costs more per key than the whole quadratic scan this replaces
-/// cost per test. The keys here are integers a caller cannot choose (they are
-/// screen positions divided by [`BUCKET_POINTS`]), so nothing is exposed by
-/// hashing them cheaply.
-#[derive(Default)]
-struct BucketHasher(u64);
-
-impl std::hash::Hasher for BucketHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write_i64(&mut self, value: i64) {
-        // The 64-bit golden-ratio constant, then a xorshift so the low bits a
-        // table indexes by carry the high bits' entropy.
-        let mixed = (value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        self.0 = mixed ^ (mixed >> 31);
-    }
-
-    /// Never reached: [`bucket_key`] is the only thing hashed here, and
-    /// `i64`'s `Hash` calls [`Self::write_i64`]. Spelled as a fold rather than
-    /// `unreachable!` so a future key type is slow rather than a panic.
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.write_i64(i64::from(byte));
-        }
-    }
-}
-
-type BucketMap = std::collections::HashMap<i64, u32, std::hash::BuildHasherDefault<BucketHasher>>;
 
 impl Default for OccupiedAreas {
     fn default() -> Self {
@@ -465,7 +542,8 @@ impl OccupiedAreas {
     pub fn new() -> Self {
         Self {
             areas: Vec::new(),
-            heads: BucketMap::default(),
+            grid: Vec::new(),
+            touched: Vec::new(),
             filed: Vec::new(),
             unbucketed: Vec::new(),
             seen: Vec::new(),
@@ -491,73 +569,102 @@ impl OccupiedAreas {
     /// with a stamp left behind, whether or not the stamps were cleared.
     pub fn clear(&mut self) {
         self.areas.clear();
-        self.heads.clear();
+        for &cell in &self.touched {
+            self.grid[cell as usize] = END;
+        }
+        self.touched.clear();
         self.filed.clear();
         self.unbucketed.clear();
         self.seen.clear();
         self.candidates.clear();
     }
 
+    /// Whether `rect`'s screen is free, and claim it when it is.
+    ///
+    /// **The whole cost of this is finding the claims already made**, not
+    /// deciding against them: on the 1920x1080 fixture above, a claim is put
+    /// through [`OrientedRect::intersects`] 1.42 times on average, and the
+    /// rest of the call is the index. So the index is where the work is spent
+    /// and where it has been taken from -- a flat cell grid, one span
+    /// computation handed on to [`Self::file`] rather than made twice, and the
+    /// buffers borrowed field by field rather than moved out and back.
     pub fn try_occupy(&mut self, rect: OrientedRect) -> bool {
-        // Taken out by name so the gather below can read `self.heads` and
-        // `self.filed` while it writes the stamps. Both go back before this
-        // returns.
-        let mut candidates = std::mem::take(&mut self.candidates);
-        let mut seen = std::mem::take(&mut self.seen);
+        // Field by field rather than `&mut self`, so the gather can read the
+        // grid and the arena while it writes the stamps without taking the
+        // buffers out and putting them back.
+        let Self {
+            areas,
+            grid,
+            filed,
+            unbucketed,
+            seen,
+            query,
+            candidates,
+            ..
+        } = self;
         candidates.clear();
+        *query += 1;
+        let query = *query;
 
-        self.query += 1;
-        let query = self.query;
-
-        match bucket_span(rect.bbox) {
-            Some((x0, y0, x1, y1)) => {
-                for cy in y0..=y1 {
-                    for cx in x0..=x1 {
-                        let mut link = self.heads.get(&bucket_key(cx, cy)).copied().unwrap_or(END);
-                        while link != END {
-                            let (at, next) = self.filed[link as usize];
-                            if seen[at as usize] != query {
-                                seen[at as usize] = query;
-                                candidates.push(at);
+        let span = bucket_span(rect.bbox);
+        match span {
+            Some((x0, y0, x_end, y_end)) => {
+                if !grid.is_empty() {
+                    for cy in y0..y_end {
+                        for cx in x0..x_end {
+                            let mut link = grid[cell_of(cx, cy)];
+                            while link != END {
+                                let (at, next) = filed[link as usize];
+                                if seen[at as usize] != query {
+                                    seen[at as usize] = query;
+                                    candidates.push(at);
+                                }
+                                link = next;
                             }
-                            link = next;
                         }
                     }
                 }
-                for &at in &self.unbucketed {
+                for &at in unbucketed.iter() {
                     if seen[at as usize] != query {
                         seen[at as usize] = query;
                         candidates.push(at);
                     }
                 }
             }
-            // A query with no bucket span is asked against everything, which
-            // is what the scan this replaces did for every query.
-            None => candidates.extend(0..self.areas.len() as u32),
+            None => candidates.extend(0..areas.len() as u32),
         }
 
         let free = !candidates
             .iter()
-            .any(|&at| self.areas[at as usize].intersects(&rect));
-
-        self.candidates = candidates;
-        self.seen = seen;
+            .any(|&at| areas[at as usize].intersects(&rect));
 
         if free {
-            self.file(rect);
+            self.file(rect, span);
         }
         free
     }
 
-    /// File an accepted claim in every bucket its bounding box touches.
-    fn file(&mut self, rect: OrientedRect) {
+    /// File an accepted claim in every cell its bounding box touches.
+    ///
+    /// The span is the caller's, already computed to answer the query. It is a
+    /// parameter and not a second [`bucket_span`] call because deriving it
+    /// again from the same box is the same arithmetic on the same bytes, and
+    /// filing is on the accepting path -- which most claims take.
+    fn file(&mut self, rect: OrientedRect, span: Option<(i32, i32, i32, i32)>) {
         let at = self.areas.len() as u32;
-        match bucket_span(rect.bbox) {
-            Some((x0, y0, x1, y1)) => {
-                for cy in y0..=y1 {
-                    for cx in x0..=x1 {
+        match span {
+            Some((x0, y0, x_end, y_end)) => {
+                if self.grid.is_empty() {
+                    self.grid.resize(CELLS, END);
+                }
+                for cy in y0..y_end {
+                    for cx in x0..x_end {
+                        let cell = cell_of(cx, cy);
                         let link = self.filed.len() as u32;
-                        let head = self.heads.insert(bucket_key(cx, cy), link).unwrap_or(END);
+                        let head = std::mem::replace(&mut self.grid[cell], link);
+                        if head == END {
+                            self.touched.push(cell as u32);
+                        }
                         self.filed.push((at, head));
                     }
                 }
@@ -1650,6 +1757,245 @@ mod tests {
         OrientedRect::new(pos2(cx, cy), angle, vec2(w, h))
     }
 
+    /// **The upright arm of `OrientedRect::new` is the rotated one, to the
+    /// bit.**
+    ///
+    /// A label's collision box decides which names the map draws and where
+    /// their glyphs land, so an arm that is *nearly* the rotated spelling is
+    /// not a cut, it is a rendering change nobody would attribute. The
+    /// comparison is over the raw bits and not over `==`, because the two
+    /// things that can differ here compare equal: `-0.0 == 0.0`, and no `NaN`
+    /// equals itself.
+    ///
+    /// The input set is chosen for the two ways they *can* differ. The
+    /// rotated spelling adds a signed zero to every coordinate — `sin(0.0)`
+    /// is `0.0` and the `uy` axis negates it — and `v + 0.0` is `v` for every
+    /// `v` but `-0.0`; and it multiplies a half-extent by that zero, which is
+    /// `NaN` when the half-extent is infinite. So the fixture carries zero and
+    /// negative-zero centres, zero and subnormal sizes, and infinities, and
+    /// `an_upright_box_with_a_zero_extent_takes_the_rotated_arm` is the arm
+    /// that says those cases really are reached.
+    #[test]
+    fn an_upright_box_is_built_exactly_as_a_rotation_by_zero_builds_it() {
+        let coords = [
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -320.0,
+            1920.0,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            1.0e-45,
+            3.0e38,
+            -3.0e38,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        let sizes = [
+            0.0f32,
+            1.0e-45,
+            f32::MIN_POSITIVE,
+            1.0,
+            96.0,
+            3.0e38,
+            f32::INFINITY,
+        ];
+        let bits = |r: &OrientedRect| {
+            let mut out = Vec::with_capacity(12);
+            for c in &r.corners {
+                out.push(c.x.to_bits());
+                out.push(c.y.to_bits());
+            }
+            out.extend([
+                r.bbox.min.x.to_bits(),
+                r.bbox.min.y.to_bits(),
+                r.bbox.max.x.to_bits(),
+                r.bbox.max.y.to_bits(),
+            ]);
+            out
+        };
+
+        let mut cases = 0usize;
+        for &cx in &coords {
+            for &cy in &coords {
+                for &w in &sizes {
+                    for &h in &sizes {
+                        let (at, size) = (pos2(cx, cy), vec2(w, h));
+                        let built = OrientedRect::new(at, 0.0, size);
+                        let rotated = OrientedRect::rotated(at, 0.0, size);
+                        assert_eq!(
+                            bits(&built),
+                            bits(&rotated),
+                            "centre ({cx}, {cy}) size ({w}, {h}) came out differently"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            cases,
+            coords.len() * coords.len() * sizes.len() * sizes.len()
+        );
+    }
+
+    /// **The guard is load-bearing, and these are the inputs that say so.**
+    ///
+    /// Without it the equality arm above could pass on a fixture that never
+    /// reaches a zero half-extent or an infinite one, and the guard could be
+    /// deleted with the arm still green. So this asserts the opposite of an
+    /// equality: on these inputs the *unguarded* upright arithmetic —
+    /// `center - half` and `center + half`, spelled here — gives an answer the
+    /// rotated spelling does not, which is exactly why they are sent to the
+    /// rotated one.
+    #[test]
+    fn the_upright_arm_is_refused_where_it_would_answer_differently() {
+        // A zero half-extent is what lets `center - half` be a negative zero,
+        // where the rotated spelling's `- (-0.0)` makes a positive one.
+        let (at, size) = (pos2(-0.0, 4.0), vec2(0.0, 8.0));
+        let unguarded = at - size * 0.5;
+        let rotated = OrientedRect::rotated(at, 0.0, size);
+        assert_ne!(
+            unguarded.x.to_bits(),
+            rotated.corners[0].x.to_bits(),
+            "fixture: the upright arithmetic already agrees here, so the \
+             guard turning this input away proves nothing",
+        );
+        assert_eq!(
+            OrientedRect::new(at, 0.0, size).corners[0].x.to_bits(),
+            rotated.corners[0].x.to_bits(),
+            "the guard let a zero half-extent through",
+        );
+
+        // An infinite half-extent is what makes `half * sin(0.0)` a `NaN`.
+        let (at, size) = (pos2(0.0, 0.0), vec2(f32::INFINITY, 1.0));
+        let unguarded = at - size * 0.5;
+        let rotated = OrientedRect::rotated(at, 0.0, size);
+        assert!(
+            unguarded.y.is_finite() && rotated.corners[0].y.is_nan(),
+            "fixture: expected the upright arithmetic to be finite where the \
+             rotated one is NaN; got {unguarded:?} and {:?}",
+            rotated.corners[0],
+        );
+        assert!(
+            OrientedRect::new(at, 0.0, size).corners[0].y.is_nan(),
+            "the guard let an infinite half-extent through",
+        );
+    }
+
+    /// **Two claims a grid period apart are two claims.**
+    ///
+    /// The cell grid folds bucket coordinates onto [`GRID`] columns and rows,
+    /// so claims [`GRID_POINTS`] apart on an axis land in the same cell and
+    /// become candidates for each other. Candidacy is not refusal: every
+    /// candidate goes through [`OrientedRect::intersects`], which knows where
+    /// the claims really are. A fold that refused them would silence a label
+    /// four thousand points away from the one that beat it.
+    ///
+    /// Both axes and both directions, because a fold that dropped the mask on
+    /// one of them would still pass on the others.
+    #[test]
+    fn claims_a_grid_period_apart_are_not_mistaken_for_each_other() {
+        for (dx, dy) in [
+            (GRID_POINTS, 0.0),
+            (-GRID_POINTS, 0.0),
+            (0.0, GRID_POINTS),
+            (0.0, -GRID_POINTS),
+            (GRID_POINTS, GRID_POINTS),
+            (GRID_POINTS * 3.0, -GRID_POINTS * 2.0),
+        ] {
+            let mut areas = OccupiedAreas::new();
+            let at = pos2(600.0, 400.0);
+            assert!(areas.try_occupy(OrientedRect::new(at, 0.0, vec2(96.0, 28.0))));
+            let away = pos2(at.x + dx, at.y + dy);
+            assert!(
+                areas.try_occupy(OrientedRect::new(away, 0.0, vec2(96.0, 28.0))),
+                "a claim at {away:?} was refused by one at {at:?}, {dx} by {dy} away",
+            );
+            // And the fold really did put them together: a claim that landed
+            // in a cell of its own would prove nothing about the mask.
+            let (first, second) = (
+                bucket_span(OrientedRect::new(at, 0.0, vec2(96.0, 28.0)).bbox).unwrap(),
+                bucket_span(OrientedRect::new(away, 0.0, vec2(96.0, 28.0)).bbox).unwrap(),
+            );
+            assert_eq!(
+                cell_of(first.0, first.1),
+                cell_of(second.0, second.1),
+                "fixture: {dx} by {dy} did not fold onto the same cell",
+            );
+        }
+    }
+
+    /// **A claim wide enough to fold onto its own cells is still filed
+    /// everywhere it reaches.**
+    ///
+    /// A box spanning more than [`GRID`] columns is filed in the same cell
+    /// several times over -- the fold is what makes that possible, and the
+    /// per-query stamp is what keeps it from being tested several times. What
+    /// must not happen is the other thing: a cell the box reaches that it was
+    /// never filed in, which would hand the same screen out twice.
+    ///
+    /// One bucket tall on purpose, so the box passes
+    /// [`MAX_BUCKETS_PER_AREA`] and really is filed rather than landing on
+    /// `unbucketed`, which every query tests in full and which would make the
+    /// arm prove nothing about the fold.
+    #[test]
+    fn a_claim_that_folds_onto_its_own_cells_is_filed_everywhere_it_reaches() {
+        let across = GRID_POINTS * 4.0 - BUCKET_POINTS;
+        // Offset half a bucket, so the box covers part of every bucket its
+        // span names rather than meeting the last one at a single edge.
+        let left = BUCKET_POINTS * 0.5;
+        let wide = OrientedRect::new(pos2(left + across * 0.5, 300.0), 0.0, vec2(across, 20.0));
+        let span = bucket_span(wide.bbox);
+        let (x0, y0, x_end, y_end) = span.expect(
+            "fixture: the claim was refused a span, so it lands on `unbucketed` \
+             and never exercises the fold",
+        );
+        assert!(
+            x_end - x0 > GRID,
+            "fixture: {} columns does not fold onto {GRID}",
+            x_end - x0,
+        );
+        assert_eq!(
+            y_end - y0,
+            1,
+            "fixture: the claim is more than one row tall"
+        );
+
+        let wide_bbox = wide.bbox;
+        let mut areas = OccupiedAreas::new();
+        assert!(areas.try_occupy(wide));
+        // Every bucket the box covers, asked in the middle of its row. A
+        // filing that stopped early leaves one of these free.
+        for column in x0..x_end {
+            let at = pos2(
+                ((column as f32 + 0.5) * BUCKET_POINTS)
+                    .clamp(wide_bbox.min.x + 4.0, wide_bbox.max.x - 4.0),
+                300.0,
+            );
+            let probe = OrientedRect::new(at, 0.0, vec2(6.0, 10.0));
+            let (probe_x0, _, probe_x_end, _) = bucket_span(probe.bbox).unwrap();
+            assert_eq!(
+                (probe_x0, probe_x_end),
+                (column, column + 1),
+                "fixture: the probe for column {column} sits in another bucket",
+            );
+            assert!(
+                !areas.try_occupy(probe),
+                "column {column} at {at:?} was handed out inside a claim that covers it",
+            );
+        }
+        // And a row the box does not reach stays free, so the arm is not
+        // simply refusing everything.
+        assert!(areas.try_occupy(OrientedRect::new(
+            pos2(GRID_POINTS * 1.5, 900.0),
+            0.0,
+            vec2(96.0, 28.0)
+        )));
+    }
+
     /// **A cleared `OccupiedAreas` answers exactly as a fresh one, and keeps
     /// what it grew.**
     ///
@@ -1701,9 +2047,10 @@ mod tests {
             reused.filed.capacity(),
             reused.seen.capacity(),
             reused.candidates.capacity(),
-            reused.heads.capacity(),
+            reused.grid.capacity(),
+            reused.touched.capacity(),
         );
-        assert!(grown.0 > 0 && grown.1 > 0 && grown.2 > 0 && grown.4 > 0);
+        assert!(grown.0 > 0 && grown.1 > 0 && grown.2 > 0 && grown.4 > 0 && grown.5 > 0);
 
         reused.clear();
         assert_eq!(
@@ -1713,10 +2060,21 @@ mod tests {
                 reused.seen.len(),
                 reused.unbucketed.len(),
                 reused.candidates.len(),
-                reused.heads.len(),
+                reused.touched.len(),
             ),
             (0, 0, 0, 0, 0, 0),
             "`clear` left a claim behind"
+        );
+        // **The cell grid keeps its allocation and loses its content**, and
+        // those are different fields now: `clear` empties the list of cells a
+        // solve wrote and resets exactly those, so a cell it forgot to list
+        // would still point at a retired claim. Read off the grid itself
+        // rather than off the list that drives the reset, or the assertion
+        // would be the implementation restated.
+        assert!(
+            reused.grid.iter().all(|&head| head == END),
+            "`clear` left {} of {CELLS} cells pointing at a retired claim",
+            reused.grid.iter().filter(|&&head| head != END).count(),
         );
         assert_eq!(
             (
@@ -1724,7 +2082,8 @@ mod tests {
                 reused.filed.capacity(),
                 reused.seen.capacity(),
                 reused.candidates.capacity(),
-                reused.heads.capacity(),
+                reused.grid.capacity(),
+                reused.touched.capacity(),
             ),
             grown,
             "`clear` released the buffers instead of emptying them"

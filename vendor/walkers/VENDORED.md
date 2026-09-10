@@ -3122,6 +3122,99 @@ and `a_point_galleys_style_is_keyed_too` pass unedited.
 index is the third of the three probes above and is keyed by the same names;
 one implementation, one set of gates.
 
+### Changed — source, thirty-eighth commit: the claim index is a folded cell grid, and an upright box is not a rotation
+
+`src/text.rs`, and one export in `src/lib.rs` (`GRID_POINTS`). `OccupiedAreas`
+keeps its rule, its `filed` arena, its `unbucketed` list and its per-query
+`seen` stamps. What changes is where a bucket's chain head lives: a
+`HashMap<i64, u32>` over packed screen coordinates becomes a flat
+`Vec<u32>` of `64 x 64` cells indexed by the bucket coordinates masked to the
+grid, with `touched` recording which cells a solve wrote so `clear` resets
+those rather than the grid. `BucketHasher`, `BucketMap` and `bucket_key` are
+gone with it. `bucket_span` is rewritten as one comparison chain returning
+**exclusive** high ends, and is called once per claim and handed to `file`
+instead of being derived a second time there. `OrientedRect::new` gains an
+upright arm.
+
+**The search was not spending its instructions on geometry.** Measured under
+callgrind on the shipped path — `squallar-egui`'s `solve_labels`, a 600-name
+pane at 1920x1080, release with LTO **off**, both arms in one binary behind a
+runtime switch, marginal instructions between a 100-pass and a 300-pass run,
+memo warm. The fixture reaches `try_occupy` 535 times a solve and places 396.
+Per claim the search visits **2.84 cells**, walks **2.45 chain links**, gathers
+**1.69 candidates** and runs **1.42** `OrientedRect::intersects`. At 69
+instructions a test that is **98 of the 874 instructions a claim cost** — so
+**89 % of the phase was the index, not the collision test**, and the candidate
+count was already at its floor: a candidate is exactly a claim whose bounding
+box shares a cell, and the bounding-box compare inside `intersects` is the
+cheap bound that settles it.
+
+| arm | Ir per claim | vs base |
+| --- | --- | --- |
+| base | 873.8 | — |
+| cell grid, one span, borrowed fields | 558.9 | **−36.04 %** |
+| upright `OrientedRect::new` | 810.8 | **−7.21 %** |
+| both | 495.8 | **−43.26 %** |
+
+The whole label solve falls **25.29 %** (799,818 → 597,547 instructions per
+solve). On a denser fixture — 1,221 claims, 53.7 % accepted, which is the
+acceptance rate a real pane shows — the claim phase falls **37.12 %**; the win
+shrinks with density because what grows is `intersects`, which is untouched.
+Unchanged-tree spread over three readings: 0.0001 % on the solve arms and at
+worst 0.0173 % on the claim arms.
+
+Control rows, identical **to the instruction** between the two arms over a
+120-solve run: `Text::galley_cached` (15,300,832), `LabelScratch::drawn_near`
+(8,404,591), `skrifa`'s hint `Engine::run` (8,039,853),
+**`OrientedRect::intersects` (6,362,422)**, `LabelScratch::placed` (6,349,858),
+`epaint::text::text_layout::layout` (5,108,629), `solve_labels` itself
+(4,989,435), `Arc<str>`'s `NameHasher` hash (2,472,879), `Shape` drop glue
+(1,632,653) and `FontFace::allocate_glyph` (1,388,383). `intersects` is the
+one that matters: the same instruction count means the candidate sets are
+identical, claim for claim.
+
+**Folding is safe because a candidate is only a candidate.** Two buckets
+`GRID_POINTS` apart share a cell, so a query sees the other's claims — and puts
+every one of them through the same `intersects`, which knows where they really
+are. It costs extra tests and nothing else, and costs nothing at all on a pane
+narrower than `GRID_POINTS`, which every pane this draws on is.
+
+**The upright arm is bit-identical, not merely equivalent.** With
+`sin_cos(0.0)` the rotated spelling adds a signed zero to each coordinate, and
+`v + 0.0` is `v` for every `v` but `-0.0`; and it multiplies a half-extent by
+that zero, which is `NaN` when the half-extent is infinite. So the arm is
+guarded on a strictly positive half-extent and a finite centre-plus-extent, and
+those are the only inputs on which the two spellings can differ.
+
+Gates, each shown red by a tamper that compiles and matched its pattern exactly
+once: `an_upright_box_is_built_exactly_as_a_rotation_by_zero_builds_it` (9,604
+cases compared on raw bits; reddened by dropping either conjunct of the guard),
+`the_upright_arm_is_refused_where_it_would_answer_differently` (asserts the
+*unguarded* arithmetic really does differ on those inputs, so the arm above
+cannot pass vacuously), `claims_a_grid_period_apart_are_not_mistaken_for_each_other`
+(reddened by refusing on candidacy instead of on `intersects`),
+`a_claim_that_folds_onto_its_own_cells_is_filed_everywhere_it_reaches`
+(reddened by filing only the claim's first cell) and the re-pointed
+`a_cleared_claim_set_answers_as_a_fresh_one_and_keeps_its_buffers`, which now
+reads the grid itself rather than the list driving the reset (reddened by
+skipping the reset).
+
+`squallar-egui`'s own `label_collision_is_bucketed` suite passes **unedited**,
+and has reach over this: truncating the query walk to its first cell reddens
+both `bucketing_places_exactly_what_a_full_scan_places` and
+`claiming_a_pane_of_labels_tests_only_its_own_neighbourhood`. A new
+`the_label_phase_paints_what_a_full_scan_would_paint` compares the whole
+tessellated pass — clip rects, texture ids, indices, and every vertex's
+position and uv bits and colour bytes — against a flat-scan reference over
+randomized rotated, wrapped, non-ASCII and off-canvas labels, with a same-arm
+control run first and last, an assertion that the digest reached 4,084 glyph
+vertices rather than an empty pass, and a liveness probe that moves one label
+nine points.
+
+`GRID_POINTS` is exported for the reason `BUCKET_POINTS` is: it is what makes
+the folding a property a caller can state and a gate can hold, rather than a
+number typed into a test.
+
 ### Turning `mvt` on, and why the lockfile does not move
 
 The fourth commit sets `walkers = { workspace = true, features = ["mvt"] }` in

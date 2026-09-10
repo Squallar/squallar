@@ -2839,6 +2839,9 @@ mod tests {
         ];
         (0..n)
             .map(|i| {
+                if i == usize::MAX {
+                    unreachable!()
+                }
                 let stem = stems[i % stems.len()];
                 let name = if i % 5 == 0 {
                     stem.to_owned()
@@ -3346,6 +3349,295 @@ mod tests {
     /// replaced: it is the geometry itself, so a memo that answered a galley
     /// addressing the wrong atlas texels is a difference here and was not
     /// there.
+    /// **The glass is what a full scan would paint.**
+    ///
+    /// The collision search decides *which* names a pane draws, so a change to
+    /// it that is wrong does not crash or slow anything down: it silently
+    /// drops a town, or draws two names on top of each other. The reference
+    /// here is the rule itself, spelled out — first claim to ask for a piece
+    /// of screen keeps it, decided by a flat scan over
+    /// `walkers::text::OrientedRect::intersects` — and what is compared is not
+    /// the decisions but the **tessellated pass**: clip rects, texture ids,
+    /// indices, and every vertex's position and uv bits and colour bytes.
+    ///
+    /// The reference shares `OrientedRect` and `Text::shape` with the solve
+    /// deliberately: the geometry and the drawing are held by their own gates
+    /// (`walkers`' `an_upright_box_is_built_exactly_as_a_rotation_by_zero_builds_it`
+    /// among them), and what has no other gate is the *search*. So the
+    /// reference replaces the search and nothing else.
+    ///
+    /// **What the fixture must carry for this to reach anything**, and what
+    /// the arms below assert about it rather than assume: names that wrap to
+    /// two rows, non-ASCII names, rotated labels, anchors off every edge of
+    /// the canvas, a placement set that is neither everything nor nothing —
+    /// and names that are all distinct and all within [`MAX_LABEL_ROWS`], so
+    /// the repeat-distance rule and the row cap never fire and the only thing
+    /// separating the two arms is the collision search.
+    ///
+    /// **What it does not cover.** It is a CPU tessellation of one pane's
+    /// label phase. It says nothing about the atlas those uv coordinates index
+    /// into — `a_memo_that_missed_the_repack_frames_does_not_serve_stale_glyphs`
+    /// holds that — nothing about what the GPU does with the vertices, and
+    /// nothing about layer order, opacity or the solve memo: a solve that never
+    /// ran at all would be compared against a reference that also never ran.
+    #[test]
+    fn the_label_phase_paints_what_a_full_scan_would_paint() {
+        let _ledger = ledger_guard();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+
+        // Deterministic, and written out so the fixture needs no dependency.
+        let mut state: u32 = 0x9e37_79b9;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 8) as f32 / (1 << 24) as f32
+        };
+        let stems = [
+            "Norman",
+            "Chickasha",
+            "Zurich",
+            "Lac Léman",
+            "Île-de-France",
+            "Ōsaka",
+            "Kraków",
+            "Iowa Tribe of Oklahoma",
+            "Seneca-Cayuga Nation",
+        ];
+
+        let mut non_ascii = 0usize;
+        let mut rotated = 0usize;
+        let mut off_canvas = 0usize;
+
+        let scattered: Vec<Text> = (0..240)
+            .map(|i| {
+                let stem = stems[i % stems.len()];
+                if !stem.is_ascii() {
+                    non_ascii += 1;
+                }
+                let angle = if i % 6 == 0 {
+                    rotated += 1;
+                    (next() - 0.5) * 2.0
+                } else {
+                    0.0
+                };
+                // A quarter of the anchors sit outside the canvas, on all four
+                // sides, which is where a pane's tiles really put them.
+                let at = egui::pos2(
+                    (next() * 1.5 - 0.25) * canvas.width(),
+                    (next() * 1.5 - 0.25) * canvas.height(),
+                );
+                if !canvas.contains(at) {
+                    off_canvas += 1;
+                }
+                let mut text = label(&format!("{stem} {i}"), at)
+                    // Wrapped as the city-label layer wraps, so the fixture
+                    // reaches multi-row blocks and the row cap.
+                    .with_wrapping(Some(8.0), None);
+                text.angle = angle;
+                text
+            })
+            .collect();
+
+        // **The first claim always wins**, so this one is certainly placed and
+        // it sits in the middle of the canvas, so its glyphs are certainly in
+        // the stream. It is what the liveness probe at the end nudges: a probe
+        // on a name the search refused, or on one clipped off the canvas,
+        // would move nothing however live the digest was.
+        let names: Vec<Text> =
+            std::iter::once(label("Nudge Probe", canvas.center()).with_wrapping(Some(8.0), None))
+                .chain(scattered)
+                .collect();
+
+        let distinct: std::collections::HashSet<&str> = names.iter().map(|t| &*t.text).collect();
+        assert_eq!(
+            distinct.len(),
+            names.len(),
+            "fixture: a repeated name would put the repeat-distance rule \
+             between the arms instead of the collision search",
+        );
+        assert!(non_ascii > 0 && rotated > 0 && off_canvas > 0);
+
+        let ctx = egui::Context::default();
+
+        // **The reference: the rule, spelled out.** Same galleys, same shapes,
+        // same order; a flat scan instead of the claim set.
+        let reference = |ui: &egui::Ui| -> Vec<egui::Shape> {
+            let mut galleys = walkers::GalleyCache::default();
+            let ppp = ui.ctx().pixels_per_point();
+            let mut kept: Vec<walkers::text::OrientedRect> = Vec::new();
+            let mut out = Vec::new();
+            for text in &names {
+                let galley = text.galley_cached(ui.ctx(), &mut galleys, ppp);
+                if galley.rows.len() > MAX_LABEL_ROWS {
+                    continue;
+                }
+                let area =
+                    walkers::text::OrientedRect::new(text.position, text.angle, galley.size());
+                let top_left = area.top_left();
+                if kept.iter().any(|held| held.intersects(&area)) {
+                    continue;
+                }
+                kept.push(area);
+                out.push(text.shape(galley, top_left));
+            }
+            out
+        };
+
+        let shipped = |ui: &egui::Ui| -> Vec<egui::Shape> {
+            solve_labels(
+                ui.ctx(),
+                &names,
+                &mut walkers::GalleyCache::default(),
+                &mut crate::label_cache::LabelScratch::default(),
+            )
+            .clone()
+        };
+
+        let run = |draw: &dyn Fn(&egui::Ui) -> Vec<egui::Shape>| -> (u64, usize, usize) {
+            let mut placed = 0;
+            let clipped = shapes_of_one_pass(&ctx, canvas, |ui| {
+                let shapes = draw(ui);
+                placed = shapes.len();
+                ui.painter().extend(shapes);
+            });
+            let (digest, vertices) = glass_digest(clipped, &ctx);
+            (digest, placed, vertices)
+        };
+
+        // The same-arm control, first and last, so a digest that drifted on
+        // its own could not be read as the arms agreeing or disagreeing.
+        let (control_before, placed, vertices) = run(&shipped);
+        let (from_reference, reference_placed, reference_vertices) = run(&reference);
+        let (control_after, _, _) = run(&shipped);
+
+        // **The digest reached the glyphs.** Without this every equality below
+        // holds just as well for a pass that tessellated to nothing, which is
+        // how a digest comes to be blind to the very thing it gates.
+        assert!(
+            vertices > 1_000,
+            "the pass tessellated to {vertices} vertices; the digest is not \
+             looking at a pane of labels",
+        );
+        // **The placement set first**, because that is what a wrong search
+        // changes: the same names, the same count. The vertices follow from
+        // it, and a count that matches while the pixels do not is the digest's
+        // to catch.
+        assert_eq!(
+            placed, reference_placed,
+            "the search placed {placed} names where the rule places \
+             {reference_placed}",
+        );
+        assert_eq!(
+            vertices, reference_vertices,
+            "the two arms put different numbers of vertices on the glass",
+        );
+
+        assert_eq!(
+            control_before, control_after,
+            "the same arm painted two different pictures, so nothing below \
+             would mean anything",
+        );
+        assert!(
+            placed > 0 && placed < names.len(),
+            "fixture: {placed} of {} names drew; a fixture that collides \
+             never or always agrees with any search whatsoever",
+            names.len(),
+        );
+        // The fixture really does reach the wrapping path.
+        let wrapped_rows = {
+            let mut galleys = walkers::GalleyCache::default();
+            let mut rows = 0;
+            let _ = shapes_of_one_pass(&ctx, canvas, |ui| {
+                let ppp = ui.ctx().pixels_per_point();
+                for text in &names {
+                    if text.galley_cached(ui.ctx(), &mut galleys, ppp).rows.len() > 1 {
+                        rows += 1;
+                    }
+                }
+            });
+            rows
+        };
+        assert!(
+            wrapped_rows > 0,
+            "fixture: no name wrapped, so a multi-row block is not covered",
+        );
+
+        assert_eq!(
+            control_before, from_reference,
+            "the pass the search paints is not the pass the rule paints",
+        );
+
+        // **The digest is live.** One label nudged by more than a pixel has to
+        // move it, or every equality above would hold for a digest that saw
+        // nothing.
+        let mut nudged = names.clone();
+        // Index 0 is the probe: placed first, so certainly placed, and at the
+        // middle of the canvas, so certainly drawn.
+        nudged[0].position.x += 9.0;
+        let (moved, _, _) = {
+            let draw = |ui: &egui::Ui| -> Vec<egui::Shape> {
+                solve_labels(
+                    ui.ctx(),
+                    &nudged,
+                    &mut walkers::GalleyCache::default(),
+                    &mut crate::label_cache::LabelScratch::default(),
+                )
+                .clone()
+            };
+            run(&draw)
+        };
+        assert_ne!(
+            control_before, moved,
+            "moving a label nine points did not move the digest",
+        );
+    }
+
+    /// A digest of everything a tessellated pass puts on the glass: the clip
+    /// rectangle's bits, the texture each mesh draws from, every index, and
+    /// every vertex's position and uv **bits** and colour bytes.
+    ///
+    /// Bits and not values, so a coordinate that changed sign without changing
+    /// magnitude is a change; and the whole stream and not the glyph meshes
+    /// alone, so a label that moved out from under its own halo would show.
+    fn glass_digest(shapes: Vec<egui::epaint::ClippedShape>, ctx: &egui::Context) -> (u64, usize) {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |word: u64| {
+            hash ^= word;
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        };
+        let primitives = ctx.tessellate(shapes, ctx.pixels_per_point());
+        // **What the digest actually reached**, handed back with it so the
+        // caller asserts on it rather than trusting it. A pass that tessellated
+        // to nothing hashes to a perfectly stable value.
+        let mut vertices = 0usize;
+        for piece in &primitives {
+            for corner in [piece.clip_rect.min, piece.clip_rect.max] {
+                eat(u64::from(corner.x.to_bits()));
+                eat(u64::from(corner.y.to_bits()));
+            }
+            match &piece.primitive {
+                egui::epaint::Primitive::Mesh(mesh) => {
+                    vertices += mesh.vertices.len();
+                    eat(match mesh.texture_id {
+                        egui::TextureId::Managed(id) => id,
+                        egui::TextureId::User(id) => id ^ 0x8000_0000_0000_0000,
+                    });
+                    for index in &mesh.indices {
+                        eat(u64::from(*index));
+                    }
+                    for vertex in &mesh.vertices {
+                        eat(u64::from(vertex.pos.x.to_bits()));
+                        eat(u64::from(vertex.pos.y.to_bits()));
+                        eat(u64::from(vertex.uv.x.to_bits()));
+                        eat(u64::from(vertex.uv.y.to_bits()));
+                        eat(u64::from(u32::from_le_bytes(vertex.color.to_array())));
+                    }
+                }
+                egui::epaint::Primitive::Callback(_) => eat(0xdead_beef),
+            }
+        }
+        (hash, vertices)
+    }
+
     fn painted_glyph_vertices(
         shapes: &[egui::epaint::ClippedShape],
     ) -> Vec<(egui::Pos2, egui::Pos2, egui::Color32)> {
