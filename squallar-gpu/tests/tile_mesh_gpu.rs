@@ -575,12 +575,15 @@ fn callback_shapes_at(
     vec![egui::Shape::Callback(egui::epaint::PaintCallback {
         rect: piece(),
         callback: bridge
-            .payload(tile_mesh::GroundDraw {
-                meshes,
-                first_run: 0,
-                run_count: meshes.runs().len(),
-                place: tile_mesh::Placement::of(piece()),
-                opacity,
+            .payload(tile_mesh::GroundBatch {
+                draws: &[tile_mesh::GroundDraw {
+                    meshes,
+                    first_run: 0,
+                    run_count: meshes.runs().len(),
+                    place: tile_mesh::Placement::of(piece()),
+                    opacity,
+                    clip: piece(),
+                }],
                 pass_nr,
             })
             .expect("the bridge always answers for a span it was given"),
@@ -602,12 +605,15 @@ fn callback_shapes_per_run(
             egui::Shape::Callback(egui::epaint::PaintCallback {
                 rect: piece(),
                 callback: bridge
-                    .payload(tile_mesh::GroundDraw {
-                        meshes,
-                        first_run: run,
-                        run_count: 1,
-                        place: tile_mesh::Placement::of(piece()),
-                        opacity: 1.0,
+                    .payload(tile_mesh::GroundBatch {
+                        draws: &[tile_mesh::GroundDraw {
+                            meshes,
+                            first_run: run,
+                            run_count: 1,
+                            place: tile_mesh::Placement::of(piece()),
+                            opacity: 1.0,
+                            clip: piece(),
+                        }],
                         pass_nr,
                     })
                     .expect("the bridge always answers for a run it was given"),
@@ -766,6 +772,22 @@ fn painted(pixels: &[u8]) -> usize {
         .count()
 }
 
+/// A tile's host fill bytes are drawn **once, by one store**, and a case that
+/// draws it twice needs two tiles.
+///
+/// `TileMeshStore::ensure` takes those bytes one way, on the first `prepare`
+/// that sees the tile: `cpu_shape` then finds nothing to read, and a *second*
+/// store finds nothing to upload and draws an empty picture. Both are the
+/// shipped contract (`TileMeshes::fills_epoch`, and the frame-side decline in
+/// `ui_map_overlays::run_is_drawable` that goes with it) rather than anything
+/// this file can arrange around — so a case that sweeps two target formats
+/// builds a **fresh tile per format**, and takes its CPU arm off that tile
+/// before the format's first frame.
+///
+/// Three of the cases here did neither and sat red behind `#[ignore]`.
+///
+/// `flat` and `flat_of` mint a new `TileMeshes` on every call, so this is a
+/// note about *where they are called from* and not a new mechanism.
 /// **The gate.** Same tile, two paths, byte-identical readback — on both
 /// gamma conventions, with the two conventions shown to differ from each
 /// other so the compare is known to be sensitive to the thing being tested.
@@ -777,16 +799,19 @@ fn the_callback_path_puts_the_same_bytes_on_screen_as_cpu_placement() {
         eprintln!("SKIPPED: no wgpu adapter");
         return;
     };
-    let meshes = flat();
-    assert_eq!(meshes.runs().len(), 1, "the fixture is one coalesced run");
-
     let mut readings = Vec::new();
     for format in [
         wgpu::TextureFormat::Rgba8UnormSrgb,
         wgpu::TextureFormat::Rgba8Unorm,
     ] {
+        // A fresh tile, and its CPU arm read off it before the first frame of
+        // this format draws anything. See the note above `cpu_shape`.
+        let meshes = flat();
+        assert_eq!(meshes.runs().len(), 1, "the fixture is one coalesced run");
+        let cpu_arm = cpu_shape(&meshes);
+
         let mut renderer = renderer_for(&device, format);
-        let cpu = frame(&device, &queue, &mut renderer, format, cpu_shape(&meshes));
+        let cpu = frame(&device, &queue, &mut renderer, format, cpu_arm.clone());
         let gpu = frame(
             &device,
             &queue,
@@ -864,30 +889,28 @@ fn a_callback_at_half_opacity_puts_the_same_bytes_on_screen_as_the_painters_tint
         eprintln!("SKIPPED: no wgpu adapter");
         return;
     };
-    let meshes = flat_of(&even_fills());
-    assert_eq!(meshes.runs().len(), 1, "the fixture is one coalesced run");
-
     for format in [
         wgpu::TextureFormat::Rgba8UnormSrgb,
         wgpu::TextureFormat::Rgba8Unorm,
     ] {
+        // A fresh tile per format, arms read off it first. See the note above
+        // `cpu_shape`.
+        let meshes = flat_of(&even_fills());
+        assert_eq!(meshes.runs().len(), 1, "the fixture is one coalesced run");
+        let cpu_arm = cpu_shape(&meshes);
+        let tinted_arm = cpu_shape_tinted(&meshes, HALF);
+
         let mut renderer = renderer_for(&device, format);
-        let full = frame(&device, &queue, &mut renderer, format, cpu_shape(&meshes));
+        let full = frame(&device, &queue, &mut renderer, format, cpu_arm.clone());
         let reference = frame_at(
             &device,
             &queue,
             &mut renderer,
             format,
             HALF,
-            cpu_shape(&meshes),
+            cpu_arm.clone(),
         );
-        let by_hand = frame(
-            &device,
-            &queue,
-            &mut renderer,
-            format,
-            cpu_shape_tinted(&meshes, HALF),
-        );
+        let by_hand = frame(&device, &queue, &mut renderer, format, tinted_arm.clone());
         let gpu = frame_at(
             &device,
             &queue,
@@ -1164,14 +1187,12 @@ fn a_frame_of_many_ground_draws_writes_the_ring_once() {
         "the fixture is one run per callback"
     );
 
+    // The CPU arm first: the frame below takes the tile's host bytes. See the
+    // note above `cpu_shape`.
+    let cpu_arm: Vec<egui::Shape> = (0..DRAWS).flat_map(|_| cpu_shape(&meshes)).collect();
+
     let gpu = frame(&device, &queue, &mut renderer, format, shapes);
-    let cpu = frame(
-        &device,
-        &queue,
-        &mut renderer,
-        format,
-        (0..DRAWS).flat_map(|_| cpu_shape(&meshes)).collect(),
-    );
+    let cpu = frame(&device, &queue, &mut renderer, format, cpu_arm);
     assert!(
         painted(&gpu) > (SIDE * SIDE / 4) as usize,
         "the batched frame painted too little for a match to mean anything"
@@ -1392,15 +1413,62 @@ fn grid_callback(
     egui::Shape::Callback(egui::epaint::PaintCallback {
         rect: tile.piece,
         callback: TileMeshBridge
-            .payload(tile_mesh::GroundDraw {
-                meshes,
-                first_run: 0,
-                run_count: 1,
-                place: tile_mesh::Placement::of(tile.full),
-                opacity: 1.0,
+            .payload(tile_mesh::GroundBatch {
+                draws: &[tile_mesh::GroundDraw {
+                    meshes,
+                    first_run: 0,
+                    run_count: 1,
+                    place: tile_mesh::Placement::of(tile.full),
+                    opacity: 1.0,
+                    clip: tile.piece,
+                }],
                 pass_nr,
             })
             .expect("the bridge always answers for a run it was given"),
+    })
+}
+
+/// **Every tile's runs in one batched callback**, each span carrying the piece
+/// its own callback was clipped to.
+///
+/// `clip_of` says what clip each span gets, so a case can hand the batch the
+/// pieces (what the walk does) or the whole canvas (the control that shows the
+/// per-span scissor is load-bearing).
+fn grid_batch(
+    tiles: &[&GridTile],
+    meshes: &[&std::sync::Arc<tile_mesh::TileMeshes>],
+    pass_nr: u64,
+    clip_of: impl Fn(&GridTile) -> egui::Rect,
+) -> egui::Shape {
+    let draws: Vec<tile_mesh::GroundDraw<'_>> = tiles
+        .iter()
+        .zip(meshes)
+        .map(|(tile, meshes)| tile_mesh::GroundDraw {
+            meshes,
+            first_run: 0,
+            run_count: 1,
+            place: tile_mesh::Placement::of(tile.full),
+            opacity: 1.0,
+            // Intersected with the canvas, because that is what
+            // `Painter::with_clip_rect` does to a tile's piece and so what
+            // egui put on the per-tile primitive.
+            clip: clip_of(tile).intersect(canvas()),
+        })
+        .collect();
+    let rect = draws
+        .iter()
+        .map(|draw| draw.clip)
+        .filter(|clip| clip.is_positive())
+        .reduce(|a, b| a.union(b))
+        .unwrap_or_else(canvas);
+    egui::Shape::Callback(egui::epaint::PaintCallback {
+        rect,
+        callback: TileMeshBridge
+            .payload(tile_mesh::GroundBatch {
+                draws: &draws,
+                pass_nr,
+            })
+            .expect("the bridge always answers for spans it was given"),
     })
 }
 
@@ -1415,6 +1483,334 @@ fn grid_geometry(
         .zip(meshes)
         .map(|(tile, meshes)| (tile.piece, vec![grid_callback(tile, meshes, pass_nr)]))
         .collect()
+}
+
+/// **The gate for the batch.** Every tile's runs in one callback put the same
+/// bytes on the screen as one callback per tile, and the two things that could
+/// make them differ are shown to be visible to the compare.
+///
+/// The arrangement the batch replaces is one `Shape::Callback` per tile, each
+/// added under its own piece's clip, which is what egui turned into the
+/// scissor. The batch is one callback under the whole canvas, and the scissor
+/// each span used to get from egui it now sets itself — so what is asserted
+/// here is that those are the same rectangle, applied the same way, in the
+/// same order.
+///
+/// Four readings:
+///
+/// * **per tile** — the arrangement being replaced: four tiles, four clipped
+///   groups, four callbacks, four primitives;
+/// * **batched** — one group, one callback, **one** primitive, every span
+///   carrying its own piece. Must match the first byte for byte;
+/// * **batched, unclipped** — the same batch with every span clipped to the
+///   canvas instead of its piece. Must *differ*: the fixture's fourth tile is
+///   a stretched ancestor whose quad reaches over all four pieces, so without
+///   the per-span scissor it paints its neighbours. This is what shows the
+///   scissor is load-bearing and that the compare can see one missing.
+/// * **batched, unclipped, reversed** — the unclipped spans in the opposite
+///   order. Must differ from the unclipped reading: with the scissors off the
+///   quads overlap, so this is what shows the compare can see draw order at
+///   all, and therefore that the agreement above is a real agreement about
+///   order rather than a compare that could not tell.
+///
+/// A **fifth tile, wholly off the canvas, sits in the MIDDLE of the batch** —
+/// not at its end, because a span that drew where it should not has to have
+/// spans after it for the compare to see it corrupt something. Its presence
+/// must change no pixel and no primitive.
+///
+/// **What this does not gate**, said plainly: the order the spans draw in.
+/// With every span carrying its own scissor these four tiles are disjoint, so
+/// reversing them changes nothing and this case would not notice — which is a
+/// true property of a tile grid, not a hole to paper over. Order is gated by
+/// `spans_of_one_batch_draw_in_the_order_they_were_held`, on spans that share
+/// a clip and overlap — `#[ignore]`d like this one, and run with
+/// `cargo test -p squallar-gpu --test tile_mesh_gpu -- --ignored`.
+#[test]
+#[ignore = "needs a real wgpu adapter"]
+fn one_batched_callback_puts_the_same_bytes_on_screen_as_one_callback_per_tile() {
+    let _serialised = gpu_lock();
+    let Some((device, queue)) = device() else {
+        eprintln!("SKIPPED: no wgpu adapter");
+        return;
+    };
+    let tiles = grid_tiles();
+    let meshes = grid_meshes(&tiles);
+
+    // The off-canvas tile: a whole grid cell placed a canvas-width east, so
+    // every texel of it is outside the target and its scissor rounds to zero
+    // width. Its own colours are distinct from every other tile's, so if it
+    // drew anywhere at all the compare would see it.
+    let away = GridTile {
+        piece: egui::Rect::from_min_size(
+            egui::pos2(SIDE as f32 + 40.0, GRID_ORIGIN.y),
+            egui::vec2(GRID_SIDE, GRID_SIDE),
+        ),
+        full: egui::Rect::from_min_size(
+            egui::pos2(SIDE as f32 + 40.0, GRID_ORIGIN.y),
+            egui::vec2(GRID_SIDE, GRID_SIDE),
+        ),
+        background: egui::Color32::from_rgb(0x01, 0x7f, 0x7f),
+        quad: egui::Color32::from_rgb(255, 0, 255),
+    };
+    let away_meshes = grid_meshes(std::slice::from_ref(&away)).remove(0);
+
+    // Non-triviality of the fixture, asserted rather than assumed:
+    let ancestor = &tiles[3];
+    for other in &tiles[..3] {
+        assert!(
+            ancestor.full.expand(0.01).contains_rect(other.piece),
+            "fixture: the ancestor's whole tile {:?} does not cover {:?}, so \
+             an absent per-span scissor would paint nothing extra and the \
+             control below would be vacuous",
+            ancestor.full,
+            other.piece
+        );
+    }
+    assert_eq!(
+        egui_wgpu::scissor_rect_in_pixels(&away.piece, 1.0, [SIDE, SIDE])[2],
+        0,
+        "fixture: the off-canvas tile's scissor is not zero-width, so the \
+         per-span skip it exists to exercise is not exercised"
+    );
+
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let mut renderer = renderer_for(&device, format);
+
+    // The order every arm draws in: the grid's four tiles with the off-canvas
+    // one third, so a span that failed to skip has two spans after it to
+    // corrupt.
+    let order: Vec<&GridTile> = vec![&tiles[0], &tiles[1], &away, &tiles[2], &tiles[3]];
+    let order_meshes: Vec<&std::sync::Arc<tile_mesh::TileMeshes>> =
+        vec![&meshes[0], &meshes[1], &away_meshes, &meshes[2], &meshes[3]];
+
+    // Arm one: one callback per tile, each under its own piece.
+    let per_tile: Vec<(egui::Rect, Vec<egui::Shape>)> = order
+        .iter()
+        .zip(&order_meshes)
+        .map(|(tile, meshes)| (tile.piece, vec![grid_callback(tile, meshes, 1)]))
+        .collect();
+    let (per_tile_pixels, per_tile_prims) =
+        frame_clipped(&device, &queue, &mut renderer, format, per_tile);
+
+    // Arm two: one callback for the lot, under the canvas.
+    let (batched_pixels, batched_prims) = frame_clipped(
+        &device,
+        &queue,
+        &mut renderer,
+        format,
+        vec![(
+            canvas(),
+            vec![grid_batch(&order, &order_meshes, 2, |tile| tile.piece)],
+        )],
+    );
+
+    // Each drawn quad is the middle half of its tile, so four of them are
+    // about `4 * (GRID_SIDE / 2)^2` texels; three of them is the floor a
+    // meaningful picture has to clear.
+    let floor = 3 * (GRID_SIDE as usize / 2).pow(2);
+    assert!(
+        painted(&per_tile_pixels) > floor,
+        "the per-tile arm painted only {} texels against a floor of {floor}, \
+         so a match would be two nearly-empty pictures agreeing",
+        painted(&per_tile_pixels)
+    );
+    assert_eq!(
+        per_tile_pixels, batched_pixels,
+        "one batched callback does not draw the picture of one callback per \
+         tile: the per-span scissor, the placement or the order is not what \
+         egui gave each primitive"
+    );
+    // **Four, not five.** The off-canvas tile's piece intersects the canvas in
+    // nothing, so epaint drops its `ClippedShape` before the primitive list —
+    // which is exactly the "draws nothing" the batch has to reproduce, and it
+    // reproduces it one layer lower, in `paint`'s per-span skip. The batch is
+    // handed that span on purpose here; the shipped walk drops it at the same
+    // place epaint does (`ui_map_overlays::hold_run_batch`), so the renderer's
+    // skip is defence in depth and this is where it is exercised.
+    assert_eq!(
+        per_tile_prims.len(),
+        4,
+        "the per-tile arm is not one primitive per on-canvas tile, so the \
+         count below is not measuring the cut"
+    );
+    assert_eq!(
+        batched_prims.len(),
+        1,
+        "the batch is not one primitive, which is the whole reason it exists"
+    );
+
+    // Control one: the same batch with no per-span scissor. The ancestor
+    // paints its neighbours, so this must differ.
+    let (unclipped, _) = frame_clipped(
+        &device,
+        &queue,
+        &mut renderer,
+        format,
+        vec![(
+            canvas(),
+            vec![grid_batch(&order, &order_meshes, 3, |_| canvas())],
+        )],
+    );
+    assert_ne!(
+        unclipped, batched_pixels,
+        "dropping every span's scissor changed no pixel, so this suite cannot \
+         see the clip at all and the agreement above is vacuous"
+    );
+
+    // Control two: the unclipped spans in the other order. With the scissors
+    // off the quads overlap, so this must differ from control one.
+    let mut reversed: Vec<&GridTile> = order.clone();
+    reversed.reverse();
+    let mut reversed_meshes: Vec<&std::sync::Arc<tile_mesh::TileMeshes>> = order_meshes.clone();
+    reversed_meshes.reverse();
+    let (unclipped_reversed, _) = frame_clipped(
+        &device,
+        &queue,
+        &mut renderer,
+        format,
+        vec![(
+            canvas(),
+            vec![grid_batch(&reversed, &reversed_meshes, 4, |_| canvas())],
+        )],
+    );
+    assert_ne!(
+        unclipped_reversed, unclipped,
+        "reversing the spans changed no pixel, so this suite cannot see draw \
+         order and the agreement above says nothing about it"
+    );
+
+    // And the off-canvas span really is inert: the same batch without it.
+    let kept: Vec<&GridTile> = vec![&tiles[0], &tiles[1], &tiles[2], &tiles[3]];
+    let kept_meshes: Vec<&std::sync::Arc<tile_mesh::TileMeshes>> =
+        vec![&meshes[0], &meshes[1], &meshes[2], &meshes[3]];
+    let (without, without_prims) = frame_clipped(
+        &device,
+        &queue,
+        &mut renderer,
+        format,
+        vec![(
+            canvas(),
+            vec![grid_batch(&kept, &kept_meshes, 5, |tile| tile.piece)],
+        )],
+    );
+    assert_eq!(
+        without, batched_pixels,
+        "the off-canvas span in the middle of the batch changed the picture, \
+         so `paint`'s per-span skip is not `egui_wgpu`'s"
+    );
+    assert_eq!(
+        without_prims.len(),
+        1,
+        "the batch without the off-canvas span is not one primitive"
+    );
+}
+
+/// **The order gate for the batch.** Spans that share a clip and overlap draw
+/// in the order they were held, and the compare is shown to be able to see it.
+///
+/// A batch holds more than one span of one tile whenever a run between two
+/// others is declined — the fill runs before it and after it are two spans at
+/// the same placement under the same clip, and what covers what is the whole
+/// question. `one_batched_callback_puts_the_same_bytes_on_screen_as_one_callback_per_tile`
+/// cannot answer it: its spans are a tile grid, so their scissors make them
+/// disjoint and any order draws the same picture. (That case is `#[ignore]`d
+/// as this one is; both run with
+/// `cargo test -p squallar-gpu --test tile_mesh_gpu -- --ignored`.)
+///
+/// Three readings of four **opaque, overlapping** quads (`layered_fills`),
+/// each its own run, held as four separate spans at one placement:
+///
+/// * **per span** — four callbacks under one clip, which is what the walk
+///   emitted before;
+/// * **batched** — one callback holding the four spans in that order. Must
+///   match byte for byte;
+/// * **batched, reversed** — the same four spans in the opposite order. Must
+///   *differ*, or the quads do not overlap enough for this suite to see an
+///   order at all and the agreement above is vacuous.
+#[test]
+#[ignore = "needs a real wgpu adapter"]
+fn spans_of_one_batch_draw_in_the_order_they_were_held() {
+    let _serialised = gpu_lock();
+    let Some((device, queue)) = device() else {
+        eprintln!("SKIPPED: no wgpu adapter");
+        return;
+    };
+    let layers = layered_fills();
+    let meshes = std::sync::Arc::new(tile_mesh::flatten_meshes(
+        layers.iter().enumerate().map(|(i, m)| (i as u32, m)),
+    ));
+    assert_eq!(
+        meshes.runs().len(),
+        4,
+        "the fixture is four runs, or there are no spans to order"
+    );
+
+    // One span per run, so the order under test is the order of the SPANS and
+    // not the order of the runs inside one span.
+    let spans = |order: Vec<usize>| -> egui::Shape {
+        let draws: Vec<tile_mesh::GroundDraw<'_>> = order
+            .into_iter()
+            .map(|run| tile_mesh::GroundDraw {
+                meshes: &meshes,
+                first_run: run,
+                run_count: 1,
+                place: tile_mesh::Placement::of(piece()),
+                opacity: 1.0,
+                clip: piece(),
+            })
+            .collect();
+        egui::Shape::Callback(egui::epaint::PaintCallback {
+            rect: piece(),
+            callback: TileMeshBridge
+                .payload(tile_mesh::GroundBatch {
+                    draws: &draws,
+                    pass_nr: 1,
+                })
+                .expect("the bridge always answers for spans it was given"),
+        })
+    };
+
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let mut renderer = renderer_for(&device, format);
+
+    let per_span = frame(
+        &device,
+        &queue,
+        &mut renderer,
+        format,
+        callback_shapes_per_run(&meshes, 0..4, 2),
+    );
+    let batched = frame(
+        &device,
+        &queue,
+        &mut renderer,
+        format,
+        vec![spans(vec![0, 1, 2, 3])],
+    );
+    let reversed = frame(
+        &device,
+        &queue,
+        &mut renderer,
+        format,
+        vec![spans(vec![3, 2, 1, 0])],
+    );
+
+    assert!(
+        painted(&per_span) > (SIDE * SIDE / 4) as usize,
+        "the per-span arm painted only {} texels, so a match would be two \
+         nearly-empty pictures agreeing",
+        painted(&per_span)
+    );
+    assert_eq!(
+        per_span, batched,
+        "four spans in one callback do not draw the picture of four callbacks \
+         in the same order: the batch has changed what covers what"
+    );
+    assert_ne!(
+        reversed, batched,
+        "reversing the spans changed no pixel, so this suite cannot see the \
+         order of a batch's spans and the agreement above is vacuous"
+    );
 }
 
 /// **The gate for the hoist.** Four tiles drawn four ways, and the readbacks

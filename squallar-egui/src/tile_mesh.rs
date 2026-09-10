@@ -168,6 +168,7 @@ pub struct TilePlan {
     steps: Vec<PlanStep>,
     shape_count: u32,
     shape_slots: u32,
+    cpu_shape_slots: u32,
 }
 
 impl TilePlan {
@@ -197,6 +198,20 @@ impl TilePlan {
     /// before any of this.
     pub fn shape_slots(&self) -> usize {
         self.shape_slots as usize
+    }
+
+    /// [`Self::shape_slots`] **without the run batches**, which is what the
+    /// ground walk reserves now that a run batch is held in the layer's
+    /// [`GroundBatch`] instead of pushed as a shape of its own.
+    ///
+    /// Zero for a tile whose every step is a run or a deferred label, which is
+    /// every tile of a shipped basemap frame; the walk then asks the allocator
+    /// for nothing at all. It stays a floor and not a promise for the same
+    /// reason `shape_slots` is: a run the renderer declines, or one issued
+    /// after a shape has already gone in, puts a shape here that this did not
+    /// count, and the vector grows -- as it did before any of this.
+    pub fn cpu_shape_slots(&self) -> usize {
+        self.cpu_shape_slots as usize
     }
 }
 
@@ -704,19 +719,24 @@ fn build_plan(shapes: &[ShapeOrText], runs: &[MeshRun]) -> TilePlan {
 
     steps.shrink_to_fit();
     // See `TilePlan::shape_slots`: a step that defers a label draws nothing.
-    let shape_slots = steps
+    let places = steps
         .iter()
         .filter(|step| match step {
-            PlanStep::Runs { .. } => true,
+            PlanStep::Runs { .. } => false,
             PlanStep::Place(index) => {
                 !matches!(shapes.get(*index as usize), Some(ShapeOrText::Text(_)))
             }
         })
         .count() as u32;
+    let batches = steps
+        .iter()
+        .filter(|step| matches!(step, PlanStep::Runs { .. }))
+        .count() as u32;
     TilePlan {
         steps,
         shape_count: shapes.len() as u32,
-        shape_slots,
+        shape_slots: places + batches,
+        cpu_shape_slots: places,
     }
 }
 
@@ -1337,8 +1357,60 @@ pub struct GroundDraw<'a> {
     /// CPU-placed shape beside these runs on its own and reaches the runs
     /// only through here.
     pub opacity: f32,
+    /// **The clip this span drew under when every tile handed the painter a
+    /// callback of its own** — the tile's piece, which is exactly what
+    /// `Painter::with_clip_rect` set and what egui turned into the primitive's
+    /// scissor. A [`GroundBatch`] goes in under the *pane's* clip, so the
+    /// renderer sets this per span itself; see [`GroundBatch`] for why that is
+    /// the same scissor and not a new one.
+    pub clip: egui::Rect,
+}
+
+/// The consecutive tiles' run spans of one layer's pass, drawn by **one**
+/// paint callback.
+///
+/// # Why one and not one per tile
+///
+/// A callback is a primitive boundary in egui's stream whatever it goes on to
+/// record, and the boundary is what the frame tail is paid for: a
+/// `ClippedPrimitive` each, a `set_viewport` each, a `prepare` and a `paint`
+/// dispatch each, and an `Arc<dyn Any>` minted and dropped each. On a
+/// 1920x1080 pane a vector basemap puts 45 tiles on the glass and every one of
+/// them was a callback of its own, for geometry that was already resident on
+/// the GPU and already drawn out of one store.
+///
+/// # Why the pixels do not move
+///
+/// * **Draw order.** The spans are drawn in the order they were accumulated,
+///   which is the order the walk issued them in, and the walk hands the batch
+///   over the moment it is about to draw anything else — a raster tile's
+///   quads, a run the renderer declined, a shape a tile placed on the CPU. So
+///   nothing that used to draw between two of these spans ends up drawing
+///   after both, which is the same argument [`RasterQuads`] makes and for the
+///   same reason.
+/// * **Clipping.** Each span carries [`GroundDraw::clip`] — the piece its own
+///   callback was clipped to — and the renderer sets that scissor per span,
+///   through the same rounding `egui_wgpu` puts a primitive's clip rect
+///   through. The vendored renderer already forgets the scissor it last set
+///   after a callback paints (`renderer.rs`, the `scissor = None` local
+///   change), so a callback setting its own is a case it is written for.
+/// * **Skips.** `egui_wgpu` skips a primitive whose clip rounds to a
+///   zero-width or zero-height scissor, and never calls `paint` for a callback
+///   whose viewport rounds to nothing. Both tests are made per span rather
+///   than once for the batch, off the same clip, so a span that used to draw
+///   nothing still draws nothing.
+///
+/// What the batch does **not** carry is the CPU-placed shapes of the same
+/// tiles. Those still go in at their own place through the painter; a tile
+/// that places any of them takes its runs back out of the batch rather than
+/// letting them cross it.
+pub struct GroundBatch<'a> {
+    /// The spans, in the order they draw.
+    pub draws: &'a [GroundDraw<'a>],
     /// egui's cumulative pass number, so the renderer can tell one frame's
-    /// draws from the next without a clock or a callback of its own.
+    /// draws from the next without a clock or a callback of its own. One per
+    /// batch and not one per span: every span of a batch is issued by one
+    /// pass of one layer.
     pub pass_nr: u64,
 }
 
@@ -1350,9 +1422,23 @@ pub struct GroundDraw<'a> {
 ///
 /// [`GuiEvent::TileMeshPainter`]: crate::shell_api::GuiEvent::TileMeshPainter
 pub trait TileMeshPainter: Send + Sync {
-    /// This frame's payload for one span of runs, or `None` when the renderer
+    /// Whether this renderer will draw `draw`, asked **before** the span joins
+    /// a [`GroundBatch`].
+    ///
+    /// A batch is minted once for many tiles, so a decline discovered at mint
+    /// time could not put one span's geometry back on the CPU at its own place
+    /// among the shapes — it would have to refuse the whole layer. This is
+    /// that question asked one span at a time, which is where the walk can
+    /// still act on the answer (`ui_map_overlays::place_run_on_cpu`).
+    ///
+    /// It has no default: a renderer that cannot answer it cannot be trusted
+    /// with the batch either, and a `true` written once here would be a
+    /// silently wrong answer for every implementor that inherited it.
+    fn accepts(&self, draw: &GroundDraw<'_>) -> bool;
+
+    /// This frame's payload for a batch of spans, or `None` when the renderer
     /// cannot draw them and the caller must place the shapes itself.
-    fn payload(&self, draw: GroundDraw<'_>) -> Option<Arc<dyn Any + Send + Sync>>;
+    fn payload(&self, batch: GroundBatch<'_>) -> Option<Arc<dyn Any + Send + Sync>>;
 }
 
 #[cfg(test)]

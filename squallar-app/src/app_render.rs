@@ -744,7 +744,7 @@ fn ground_tile_line(t: &squallar_egui::tile_mesh::ledger::Totals) -> String {
          {} uploads of {} B, {} evicted, {} B resident, {} unrendered, \
          {} stroke draws, {} label solves, {} stroke run meshes, \
          {} stroke mesh verts, {} shapes, {} shape slots, \
-         {} raster quads, {} raster quad meshes",
+         {} raster quads, {} raster quad meshes, {} ground callbacks",
         t.mesh_vertices_placed,
         t.path_points_placed,
         t.label_anchors_placed,
@@ -762,6 +762,7 @@ fn ground_tile_line(t: &squallar_egui::tile_mesh::ledger::Totals) -> String {
         t.ground_shape_slots,
         t.raster_quads,
         t.raster_quad_meshes,
+        t.ground_callbacks,
     )
 }
 

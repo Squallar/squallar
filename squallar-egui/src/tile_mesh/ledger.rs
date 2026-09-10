@@ -34,10 +34,22 @@
 //!   they say together is how much of the deferred work the memo removed. A
 //!   figure equal to the pane-frames the leg drew is a memo that never
 //!   answers; see `squallar_egui::label_cache`.
-//! * [`Totals::mesh_draws`] — **paint callbacks pushed for fill runs**, one
-//!   per run per tile per frame. The floor under the first figure's zero.
+//! * [`Totals::mesh_draws`] — **fill runs handed to the renderer**, one per
+//!   run per tile per frame. The floor under the first figure's zero. Its
+//!   denominator is RUNS, and since 2026-09-10 a run is no longer a callback:
+//!   see [`Totals::ground_callbacks`].
+//! * [`Totals::ground_callbacks`] — **paint callbacks the ground phase handed
+//!   the painter for those runs**. Its denominator is LAYER PASSES AND
+//!   FRAMES, one per hand-over of a `crate::tile_mesh::GroundBatch`, so it is
+//!   never divided into or added to the two run figures. Measured on a
+//!   1920x1080 pane at zoom 6 over 45 vector cells: **45 before the batch, 1
+//!   after**, with the run figures unmoved at 90 fills and 45 strokes.
 //! * [`Totals::ground_shapes`] — **shapes the ground phase handed the
 //!   painter**, and so what reaches `Context::tessellate` from the ground.
+//!   It does **not** count the batch: a callback held for
+//!   `crate::tile_mesh::GroundBatch` leaves the tile's own list, so a tile
+//!   that places nothing else reports zero here and its geometry is in
+//!   [`Totals::ground_callbacks`] instead.
 //!   The parent the two figures below are cuts of. Its denominator is TILES
 //!   AND FRAMES; it is never divided into a vertex figure.
 //! * [`Totals::ground_shape_slots`] — **slots the walk reserved to hold
@@ -81,6 +93,7 @@ static MESH_DRAWS: AtomicU64 = AtomicU64::new(0);
 static STROKE_DRAWS: AtomicU64 = AtomicU64::new(0);
 static STROKE_RUN_MESHES: AtomicU64 = AtomicU64::new(0);
 static STROKE_MESH_VERTICES: AtomicU64 = AtomicU64::new(0);
+static GROUND_CALLBACKS: AtomicU64 = AtomicU64::new(0);
 static GROUND_SHAPES: AtomicU64 = AtomicU64::new(0);
 static GROUND_SHAPE_SLOTS: AtomicU64 = AtomicU64::new(0);
 static RASTER_QUADS: AtomicU64 = AtomicU64::new(0);
@@ -102,6 +115,15 @@ pub struct Totals {
     pub label_solves: u64,
     pub mesh_draws: u64,
     pub stroke_draws: u64,
+    /// **Paint callbacks the ground phase handed the painter for run spans.**
+    /// Its denominator is LAYER PASSES AND FRAMES -- one per hand-over of a
+    /// `crate::tile_mesh::GroundBatch`, however many tiles' spans that batch
+    /// held -- so it is never divided into, added to or subtracted from
+    /// [`Self::mesh_draws`] and [`Self::stroke_draws`], whose denominator is
+    /// RUNS. What the three say together is how many boundaries a frame
+    /// records for the runs it draws: the run figures are what a cut here
+    /// must not move, and this is the one it does.
+    pub ground_callbacks: u64,
     /// Stroke runs a pass with no painter drew from the buffers they were
     /// already tessellated into, rather than by putting their paths back
     /// through epaint. One per run per tile per frame; see
@@ -189,6 +211,12 @@ pub fn note_label_anchors_placed(n: u64) {
 /// call per pane per frame, and only on a frame that solved.
 pub fn note_label_solve() {
     LABEL_SOLVES.fetch_add(1, Relaxed);
+}
+
+/// Paint callbacks one layer pass handed the painter for its run spans. One
+/// call per hand-over, whatever the batch held.
+pub fn note_ground_callback() {
+    GROUND_CALLBACKS.fetch_add(1, Relaxed);
 }
 
 /// Fill runs this tile handed to the renderer. One call per tile.
@@ -286,6 +314,7 @@ pub fn totals() -> Totals {
         stroke_draws: STROKE_DRAWS.load(Relaxed),
         stroke_run_meshes: STROKE_RUN_MESHES.load(Relaxed),
         stroke_mesh_vertices: STROKE_MESH_VERTICES.load(Relaxed),
+        ground_callbacks: GROUND_CALLBACKS.load(Relaxed),
         ground_shapes: GROUND_SHAPES.load(Relaxed),
         ground_shape_slots: GROUND_SHAPE_SLOTS.load(Relaxed),
         raster_quads: RASTER_QUADS.load(Relaxed),
@@ -312,6 +341,7 @@ pub(crate) fn reset() {
         &LABEL_SOLVES,
         &MESH_DRAWS,
         &STROKE_DRAWS,
+        &GROUND_CALLBACKS,
         &STROKE_RUN_MESHES,
         &STROKE_MESH_VERTICES,
         &GROUND_SHAPES,

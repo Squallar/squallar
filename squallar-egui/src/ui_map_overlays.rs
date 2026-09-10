@@ -398,6 +398,12 @@ pub(super) fn draw_tile_layer(
     let mut quads = crate::tile_mesh::RasterQuads::default();
     let mut quad_count: u64 = 0;
     let mut quad_meshes: u64 = 0;
+    // Every vector tile's run spans of this pass, in one callback per
+    // uninterrupted stretch of them rather than one per tile. See
+    // [`GroundSpans`] and [`crate::tile_mesh::GroundBatch`]: what ends a
+    // stretch is anything that has to draw between two of its members, and
+    // every hand-over below is one of those.
+    let mut spans = GroundSpans::default();
     for (rect, piece, background) in answered {
         match piece.tile {
             // `window_of` and not `piece.uv`: the tile may be a slot
@@ -413,14 +419,20 @@ pub(super) fn draw_tile_layer(
                     egui::Color32::WHITE,
                     pane_clip,
                 ) {
+                    // The quads this run holds were pushed after the spans the
+                    // batch is holding, so the batch goes in first.
+                    hand_over_spans(ui, &mut spans, ground, pass_nr);
                     ui.painter().add(run);
                     quad_meshes += 1;
                 }
             }
             Tile::Vector(ref shapes) => {
                 // The run this tile interrupts goes in ahead of its geometry,
-                // because that is where those quads went in before.
+                // because that is where those quads went in before -- and the
+                // batch goes in ahead of the run, because its spans were held
+                // before those quads were pushed.
                 if let Some(run) = quads.take() {
+                    hand_over_spans(ui, &mut spans, ground, pass_nr);
                     ui.painter().add(run);
                     quad_meshes += 1;
                 }
@@ -434,6 +446,7 @@ pub(super) fn draw_tile_layer(
                         feathering,
                         opacity,
                     },
+                    &mut spans,
                     rect,
                     piece.uv,
                     &mut labels,
@@ -443,9 +456,12 @@ pub(super) fn draw_tile_layer(
         }
     }
     if let Some(run) = quads.finish() {
+        hand_over_spans(ui, &mut spans, ground, pass_nr);
         ui.painter().add(run);
         quad_meshes += 1;
     }
+    // The pass is over: whatever the batch is still holding draws now.
+    hand_over_spans(ui, &mut spans, ground, pass_nr);
     if quad_count > 0 {
         crate::tile_mesh::ledger::note_raster_quads(quad_count, quad_meshes);
     }
@@ -727,17 +743,152 @@ fn run_is_drawable(
     }
 }
 
-/// One paint callback for `runs[first..first + count]`, drawn in that order.
-fn issue_run_batch(
+/// Draw whatever the layer's batch is holding, because something else is
+/// about to be drawn.
+///
+/// A no-op when the batch is empty or no renderer is installed, which is the
+/// whole of what an unpainted pass does.
+fn hand_over_spans(
+    ui: &egui::Ui,
+    spans: &mut GroundSpans,
+    painter: Option<&std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>>,
+    pass_nr: u64,
+) {
+    if spans.is_empty() {
+        return;
+    }
+    if let Some(painter) = painter
+        && let Some(shape) = spans.take(painter, pass_nr)
+    {
+        ui.painter().add(shape);
+    }
+}
+
+/// One tile's span of runs, waiting to be drawn with its neighbours'.
+struct PendingSpan {
+    /// Owned rather than borrowed: the span outlives the tile's own walk, and
+    /// this is the handle the renderer's residency is swept by.
+    meshes: std::sync::Arc<crate::tile_mesh::TileMeshes>,
+    first_run: usize,
+    run_count: usize,
+    place: crate::tile_mesh::Placement,
+    opacity: f32,
+    /// The tile's piece: the clip its own callback carried.
+    clip: egui::Rect,
+}
+
+/// The run spans of consecutive tiles, on their way to **one** paint callback.
+///
+/// The same shape as [`crate::tile_mesh::RasterQuads`] and for the same
+/// reason: what ends the run is anything that has to draw between two of its
+/// members. Every hand-over goes through [`Self::take`], and the walk calls it
+/// before it draws anything at all — so a span never crosses something that
+/// used to draw over or under it. [`crate::tile_mesh::GroundBatch`] carries
+/// the rest of the argument.
+#[derive(Default)]
+struct GroundSpans {
+    pending: Vec<PendingSpan>,
+}
+
+impl GroundSpans {
+    /// Hold this span for the batch. The caller has already established that
+    /// the renderer accepts it.
+    fn push(&mut self, span: PendingSpan) {
+        self.pending.push(span);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// Hand the held spans over as one shape, because something else is about
+    /// to be drawn -- or because the layer's pass is over.
+    ///
+    /// `None` when nothing is held, and also when the renderer declines the
+    /// batch outright. A decline here cannot put geometry back on the CPU: the
+    /// shapes it would place are the tiles' and those tiles' walks are over.
+    /// It is unreachable on the shipped bridge, whose only refusals are an
+    /// empty batch and a run range the caller has already checked, and
+    /// [`crate::tile_mesh::TileMeshPainter::accepts`] is where a decline the
+    /// walk can still act on is asked for.
+    fn take(
+        &mut self,
+        painter: &std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>,
+        pass_nr: u64,
+    ) -> Option<egui::Shape> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let spans = std::mem::take(&mut self.pending);
+        let draws: Vec<crate::tile_mesh::GroundDraw<'_>> = spans
+            .iter()
+            .map(|span| crate::tile_mesh::GroundDraw {
+                meshes: &span.meshes,
+                first_run: span.first_run,
+                run_count: span.run_count,
+                place: span.place,
+                opacity: span.opacity,
+                clip: span.clip,
+            })
+            .collect();
+        // The union of the pieces, which is what egui turns into a viewport
+        // and refuses when it is degenerate. Positive because every piece in
+        // it is: a span whose clip is not positive never joined the batch,
+        // because epaint drops a `ClippedShape` on exactly that test and this
+        // has to drop the same ones.
+        //
+        // The draw replaces that viewport with the whole screen, because the
+        // geometry is placed in screen points by the uniform exactly as the
+        // CPU path places it. What makes a stretched ancestor draw only the
+        // quarter that belongs to its tile is the scissor, and the scissor is
+        // now set per span from `GroundDraw::clip` rather than once for the
+        // primitive -- see `GroundBatch`.
+        let rect = draws
+            .iter()
+            .map(|draw| draw.clip)
+            .reduce(|a, b| a.union(b))
+            .expect("the batch is not empty");
+        let payload = painter.payload(crate::tile_mesh::GroundBatch {
+            draws: &draws,
+            pass_nr,
+        })?;
+        crate::tile_mesh::ledger::note_ground_callback();
+        Some(egui::Shape::Callback(egui::epaint::PaintCallback {
+            rect,
+            callback: payload,
+        }))
+    }
+}
+
+/// Hold `runs[first..first + count]` for the layer's batch, if the renderer
+/// will draw them.
+///
+/// `false` puts the span back on the CPU at its own place among the shapes,
+/// which is what a `None` from the old per-tile `payload` did.
+#[allow(clippy::too_many_arguments)]
+fn hold_run_batch(
     meshes: &std::sync::Arc<crate::tile_mesh::TileMeshes>,
     ground: &GroundMeshes<'_>,
+    spans: &mut GroundSpans,
     first: usize,
     count: usize,
     placement: egui::emath::TSTransform,
-    piece: egui::Rect,
-) -> Option<egui::Shape> {
-    let painter = ground.painter?;
-    let payload = painter.payload(crate::tile_mesh::GroundDraw {
+    clip: egui::Rect,
+) -> bool {
+    let Some(painter) = ground.painter else {
+        return false;
+    };
+    // **epaint's own drop, reapplied.** A `ClippedShape` whose clip rect is
+    // not positive never reaches the primitive list, so a tile clipped to
+    // nothing put no callback in the stream, ran no `prepare` and uploaded
+    // nothing. `clip` is the tile painter's own rect and so is already the
+    // intersection with the pane's -- `Painter::with_clip_rect` intersects --
+    // which is what makes a tile hanging off the pane edge clip to the part
+    // of it the pane shows and a tile wholly off it clip to nothing.
+    if !clip.is_positive() {
+        return false;
+    }
+    let draw = crate::tile_mesh::GroundDraw {
         meshes,
         first_run: first,
         run_count: count,
@@ -746,22 +897,20 @@ fn issue_run_batch(
             translation: [placement.translation.x, placement.translation.y],
         },
         opacity: ground.opacity,
-        pass_nr: ground.pass_nr,
-    })?;
-    Some(egui::Shape::Callback(egui::epaint::PaintCallback {
-        // The **piece**, which is what egui turns into a viewport and refuses
-        // when it is degenerate. The draw replaces that viewport with the
-        // whole screen, because the geometry is placed in screen points by the
-        // uniform exactly as the CPU path places it; the clip that makes a
-        // stretched ancestor draw only the quarter that belongs to this tile
-        // is egui's scissor, taken from the clip rect the painter carries.
-        //
-        // Every run of the batch shares this rect, because they are all runs
-        // of the same tile at the same placement -- which is what lets them
-        // share one callback at all.
-        rect: piece,
-        callback: payload,
-    }))
+        clip,
+    };
+    if !painter.accepts(&draw) {
+        return false;
+    }
+    spans.push(PendingSpan {
+        meshes: std::sync::Arc::clone(meshes),
+        first_run: first,
+        run_count: count,
+        place: draw.place,
+        opacity: draw.opacity,
+        clip,
+    });
+    true
 }
 
 /// Issue `runs[first..first + count]` as **as few paint callbacks as their
@@ -789,8 +938,14 @@ fn take_run_batch(
     count: usize,
     meshes: &std::sync::Arc<crate::tile_mesh::TileMeshes>,
     ground: &GroundMeshes<'_>,
+    spans: &mut GroundSpans,
     placement: egui::emath::TSTransform,
     rect: egui::Rect,
+    // The clip the tile's shapes are added under -- the piece intersected with
+    // the pane, which is what egui puts on the primitive and turns into the
+    // scissor. `rect` stays the piece: it is what the geometry is placed
+    // against and what a label anchor is tested inside.
+    clip: egui::Rect,
     shapes: &[walkers::ShapeOrText],
     counted: &mut Counted,
     placed: &mut Vec<egui::Shape>,
@@ -819,15 +974,37 @@ fn take_run_batch(
             reach += 1;
         }
         if reach > at {
-            if let Some(callback) = issue_run_batch(meshes, ground, at, reach - at, placement, rect)
-            {
+            // **Only a span that nothing of this tile has yet drawn over may
+            // join the layer's batch.** The batch is handed over just before
+            // `placed` reaches the painter, so everything in it draws ahead of
+            // everything in `placed` -- which is right for a span issued while
+            // `placed` was still empty and wrong for one issued after a shape
+            // went into it. A span past that point takes a batch of its own,
+            // exactly where its callback used to sit.
+            let held = placed.is_empty()
+                && hold_run_batch(meshes, ground, spans, at, reach - at, placement, clip);
+            let alone = if held {
+                None
+            } else {
+                let mut one = GroundSpans::default();
+                hold_run_batch(meshes, ground, &mut one, at, reach - at, placement, clip)
+                    .then(|| {
+                        ground
+                            .painter
+                            .and_then(|painter| one.take(painter, ground.pass_nr))
+                    })
+                    .flatten()
+            };
+            if held || alone.is_some() {
                 for run in &meshes.runs()[at..reach] {
                     match run.kind {
                         crate::tile_mesh::RunKind::Fill => counted.mesh_draws += 1,
                         crate::tile_mesh::RunKind::Stroke => counted.stroke_draws += 1,
                     }
                 }
-                placed.push(callback);
+                if let Some(callback) = alone {
+                    placed.push(callback);
+                }
             } else {
                 // The renderer refused the span outright. Every run in it goes
                 // back on the CPU, in order, exactly as a per-run decline does.
@@ -975,16 +1152,28 @@ fn hoist_background(
 /// its neighbours' data too; without the anchor test each copy would be drawn,
 /// and copies generalised at different zooms do not land close enough to be
 /// collided away.
+#[allow(clippy::too_many_arguments)]
 fn paint_vector_tile(
     painter: &egui::Painter,
     shapes: &[walkers::ShapeOrText],
     ground: GroundMeshes<'_>,
+    spans: &mut GroundSpans,
     rect: egui::Rect,
     uv: egui::Rect,
     labels: &mut Vec<walkers::Text>,
     background: Background,
 ) {
+    // The pane's painter, kept: the tile's own shapes go in under the tile's
+    // clip below, and the layer's batch goes in under the pane's, which is
+    // what lets a run of tiles share one primitive at all.
+    let pane_painter = painter;
     let painter = painter.with_clip_rect(rect);
+    // **What egui put on this tile's primitives**, which is the piece
+    // intersected with the pane (`Painter::with_clip_rect` intersects), and so
+    // what `egui_wgpu` turned into the scissor. A span held for the layer's
+    // batch carries this and the renderer sets it itself; see
+    // `crate::tile_mesh::GroundBatch`.
+    let span_clip = painter.clip_rect();
 
     let full = full_rect_of_clipped_tile(rect, uv);
     let placement = walkers::mvt::placement(full);
@@ -1019,8 +1208,26 @@ fn paint_vector_tile(
     // `TilePlan::shape_slots` settles the figure where the plan is settled,
     // off the frame thread. A tile with no plan has nothing to ask, so it
     // keeps the shape count the un-planned walk really can fill.
+    // **Reserved on the first push, not before it.** A planned tile whose
+    // every step is a run or a deferred label places nothing at all -- which
+    // is every tile of a shipped basemap frame now that the runs are held in
+    // the layer's batch -- and a `Vec::with_capacity` for a vector that stays
+    // empty is a buffer minted and released per tile per frame for nothing.
+    // The figure is still the plan's; only the moment it is asked for moves.
+    // **Minus the hoisted background.** `cpu_shape_slots` counts the plan's
+    // `Place` steps that are not labels, and shape 0 of a styled tile is its
+    // background rectangle: a `Place` by that count, and drawn by
+    // `HoistedBackgrounds` rather than by this walk whenever the caller says
+    // so. On a shipped basemap tile that is the whole of the count, so the
+    // walk asks the allocator for nothing at all -- 45 buffers a pane-frame,
+    // minted and released, at 1920x1080. Under-reserving by one when a plan
+    // has no `Place(0)` step costs a `Vec` growth, which is what the vector
+    // did before any of this.
     let mut placed: Vec<egui::Shape> =
-        Vec::with_capacity(planned.map_or(shapes.len(), |(_, plan)| plan.shape_slots()));
+        Vec::with_capacity(planned.map_or(shapes.len(), |(_, plan)| {
+            plan.cpu_shape_slots()
+                .saturating_sub(usize::from(background == Background::Hoisted))
+        }));
 
     if let Some((meshes, plan)) = planned {
         for step in plan.steps() {
@@ -1031,8 +1238,10 @@ fn paint_vector_tile(
                         count as usize,
                         meshes,
                         &ground,
+                        spans,
                         placement,
                         rect,
+                        span_clip,
                         shapes,
                         &mut counted,
                         &mut placed,
@@ -1051,12 +1260,21 @@ fn paint_vector_tile(
         }
     } else {
         for (index, shape) in shapes.iter().enumerate() {
-            if let Some((callback, kind)) = runs.take_at(index, &ground, placement, rect) {
+            if let Some((callback, kind)) = runs.take_at(
+                index,
+                &ground,
+                spans,
+                placed.is_empty(),
+                placement,
+                span_clip,
+            ) {
                 match kind {
                     crate::tile_mesh::RunKind::Fill => counted.mesh_draws += 1,
                     crate::tile_mesh::RunKind::Stroke => counted.stroke_draws += 1,
                 }
-                placed.push(callback);
+                if let Some(callback) = callback {
+                    placed.push(callback);
+                }
                 continue;
             }
             if runs.covers(index)
@@ -1074,6 +1292,21 @@ fn paint_vector_tile(
     counted.ground_shapes = placed.len() as u64;
     counted.ground_shape_slots = placed.capacity() as u64;
     counted.report();
+    if placed.is_empty() {
+        // Nothing of this tile draws on the CPU, so nothing of it has to cross
+        // the batch and the batch stays open for the next tile. `extend` is
+        // skipped rather than called with an empty list: it takes a
+        // `Context::write` for the graphics list either way.
+        return;
+    }
+    // Everything the batch is holding was issued before the first shape in
+    // `placed`, so it goes in first -- under the pane's clip, where a batch
+    // goes.
+    if let Some(painter_ref) = ground.painter
+        && let Some(batch) = spans.take(painter_ref, ground.pass_nr)
+    {
+        pane_painter.add(batch);
+    }
     painter.extend(placed);
 }
 
@@ -1160,17 +1393,22 @@ struct RunCursor {
 }
 
 impl RunCursor {
-    /// The paint callback for the shape at `index`, if that shape opens a run
-    /// this install can draw from the GPU, and which kind of run it was.
+    /// The run at shape `index`, taken for the GPU: held in the layer's batch
+    /// when `can_hold`, else minted as a batch of its own, with the kind of
+    /// run it was. `Some((None, kind))` is a run the batch is holding and the
+    /// caller has nothing to place for.
+    ///
     /// Advances past the run either way, so a run the renderer refuses falls
     /// through to CPU placement exactly once.
     fn take_at(
         &mut self,
         index: usize,
         ground: &GroundMeshes<'_>,
+        spans: &mut GroundSpans,
+        can_hold: bool,
         placement: egui::emath::TSTransform,
-        piece: egui::Rect,
-    ) -> Option<(egui::Shape, crate::tile_mesh::RunKind)> {
+        clip: egui::Rect,
+    ) -> Option<(Option<egui::Shape>, crate::tile_mesh::RunKind)> {
         let meshes = ground.meshes?;
         ground.painter?;
         let run = *meshes.runs().get(self.next)?;
@@ -1189,7 +1427,17 @@ impl RunCursor {
         if !run_is_drawable(run, meshes, ground) {
             return None;
         }
-        let shape = issue_run_batch(meshes, ground, self.next - 1, 1, placement, piece)?;
+        let first = self.next - 1;
+        let shape = if can_hold && hold_run_batch(meshes, ground, spans, first, 1, placement, clip)
+        {
+            None
+        } else {
+            let mut one = GroundSpans::default();
+            if !hold_run_batch(meshes, ground, &mut one, first, 1, placement, clip) {
+                return None;
+            }
+            Some(one.take(ground.painter?, ground.pass_nr)?)
+        };
         self.covered_to = index + run.shape_span as usize;
         Some((shape, run.kind))
     }
@@ -1916,8 +2164,8 @@ mod tests {
         let rect = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(256.0, 256.0));
 
         let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            paint_vector_tile(
-                ui.painter(),
+            paint_one_vector_tile(
+                ui,
                 &[ShapeOrText::Shape(egui::Shape::rect_filled(
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(EXTENT, EXTENT)),
                     0.0,
@@ -1979,8 +2227,8 @@ mod tests {
         let whole = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         let mut labels = Vec::new();
         for (shapes, rect) in tiles {
-            paint_vector_tile(
-                ui.painter(),
+            paint_one_vector_tile(
+                ui,
                 shapes,
                 GroundMeshes::CPU_ONLY,
                 *rect,
@@ -3331,6 +3579,37 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// One tile through the ground phase, with the layer's batch opened and
+    /// handed over around it.
+    ///
+    /// The shipped walk keeps one [`GroundSpans`] across every tile of a
+    /// layer's pass; a case that draws one tile is that walk with a span of
+    /// one, and the hand-over is what puts the batch's callback in the shape
+    /// list where the tile's own used to be.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_one_vector_tile(
+        ui: &egui::Ui,
+        shapes: &[ShapeOrText],
+        ground: GroundMeshes<'_>,
+        rect: egui::Rect,
+        uv: egui::Rect,
+        labels: &mut Vec<Text>,
+        background: Background,
+    ) {
+        let mut spans = GroundSpans::default();
+        paint_vector_tile(
+            ui.painter(),
+            shapes,
+            ground,
+            &mut spans,
+            rect,
+            uv,
+            labels,
+            background,
+        );
+        hand_over_spans(ui, &mut spans, ground.painter, ground.pass_nr);
+    }
+
     /// A painter that hands back a payload for every span of runs it is asked
     /// about, and remembers what it was asked: the tile, the span as
     /// `(first_run, run_count)`, the placement and the opacity.
@@ -3344,19 +3623,23 @@ mod tests {
     type Asked = (u64, (usize, usize), crate::tile_mesh::Placement, f32);
 
     impl crate::tile_mesh::TileMeshPainter for RecordingPainter {
+        fn accepts(&self, _draw: &crate::tile_mesh::GroundDraw<'_>) -> bool {
+            true
+        }
+
         fn payload(
             &self,
-            draw: crate::tile_mesh::GroundDraw<'_>,
+            batch: crate::tile_mesh::GroundBatch<'_>,
         ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
-            self.asked
-                .lock()
-                .expect("the recorder is not poisoned")
-                .push((
+            let mut asked = self.asked.lock().expect("the recorder is not poisoned");
+            for draw in batch.draws {
+                asked.push((
                     draw.meshes.id(),
                     (draw.first_run, draw.run_count),
                     draw.place,
                     draw.opacity,
                 ));
+            }
             Some(std::sync::Arc::new(()))
         }
     }
@@ -3540,8 +3823,8 @@ mod tests {
         crate::tile_mesh::ledger::reset();
         let mut labels = Vec::new();
         let emitted = shapes_of_one_pass(&ctx, canvas, |ui| {
-            paint_vector_tile(
-                ui.painter(),
+            paint_one_vector_tile(
+                ui,
                 &shapes,
                 GroundMeshes {
                     meshes: Some(&meshes),
@@ -4298,9 +4581,13 @@ mod tests {
     fn a_refused_run_falls_back_to_cpu_placement_exactly_once() {
         struct Refuses;
         impl crate::tile_mesh::TileMeshPainter for Refuses {
+            fn accepts(&self, _draw: &crate::tile_mesh::GroundDraw<'_>) -> bool {
+                false
+            }
+
             fn payload(
                 &self,
-                _draw: crate::tile_mesh::GroundDraw<'_>,
+                _batch: crate::tile_mesh::GroundBatch<'_>,
             ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
                 None
             }
@@ -4323,6 +4610,249 @@ mod tests {
                 .count(),
             2,
             "a refused run was not placed exactly once"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The batched ground callback.
+    //
+    // Every vector tile of a layer's pass used to hand the painter a
+    // `Shape::Callback` of its own; they now go into one, held across tiles
+    // by `GroundSpans` and handed over the moment anything else has to draw.
+    // Pixel parity with the per-tile arrangement is the GPU suite's to hold
+    // (`squallar-gpu/tests/tile_mesh_gpu.rs`,
+    // `one_batched_callback_puts_the_same_bytes_on_screen_as_one_callback_per_tile`
+    // and `spans_of_one_batch_draw_in_the_order_they_were_held`, both
+    // `#[ignore]`d because they need a real adapter: run with
+    // `cargo test -p squallar-gpu --test tile_mesh_gpu -- --ignored`);
+    // what is pinned here is the arrangement: how many callbacks a pass
+    // emits, which spans each carries in which order, what clip each span
+    // carries, and what still ends a batch.
+    // -----------------------------------------------------------------
+
+    /// A whole pane's worth of vector tiles, drawn through the ground phase
+    /// with a recorder installed: the shapes the pass emitted, the pane's
+    /// clip, the cells it walked, and every span the recorder was asked for.
+    ///
+    /// `raster_at` names a cell served as a **raster** tile instead, which is
+    /// what the interleave case needs.
+    fn a_full_pane_pass(
+        raster_at: Option<usize>,
+    ) -> (
+        Vec<egui::epaint::ClippedShape>,
+        egui::Rect,
+        Vec<TileId>,
+        Vec<Asked>,
+        crate::tile_mesh::ledger::Totals,
+    ) {
+        let (ctx, canvas, projector, mut tiles, cells) = a_pane_and_its_cells();
+        let texture = ctx.load_texture(
+            "batch-raster",
+            egui::ColorImage::filled([4, 4], egui::Color32::from_rgb(9, 9, 9)),
+            egui::TextureOptions::default(),
+        );
+        for (i, cell) in cells.iter().enumerate() {
+            if Some(i) == raster_at {
+                tiles.put_for_test(
+                    *cell,
+                    Tile::Raster(walkers::RasterTile::own(texture.clone())),
+                );
+            } else {
+                // `a_tile_with_a_quad` and not `a_styled_tile`: a styled tile
+                // carries a stroke, and a stroke run flattened at another
+                // feathering is declined and placed on the CPU -- which ends
+                // the batch at that tile and is the *other* case, gated by
+                // `a_tile_that_places_on_the_cpu_hands_the_batch_over_before_its_shapes`.
+                // Here every tile is a hoistable background and one fill run,
+                // so nothing but the walk itself decides how many callbacks
+                // there are.
+                tiles.put_for_test(
+                    *cell,
+                    a_tile_with_a_quad(egui::Color32::from_rgb(0x10, 0x20, 0x30 + i as u8)),
+                );
+            }
+        }
+
+        let recorder = std::sync::Arc::new(RecordingPainter::default());
+        let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> = recorder.clone();
+        crate::tile_mesh::ledger::reset();
+        let pane_clip = std::cell::Cell::new(egui::Rect::NOTHING);
+        let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
+            pane_clip.set(ui.clip_rect());
+            draw_tile_layer(ui, &projector, HOIST_ZOOM, &mut tiles, 0, Some(&painter));
+        });
+        let asked = recorder.asked.lock().expect("not poisoned").clone();
+        (
+            shapes,
+            pane_clip.get(),
+            cells,
+            asked,
+            crate::tile_mesh::ledger::totals(),
+        )
+    }
+
+    fn callbacks_of(shapes: &[egui::epaint::ClippedShape]) -> Vec<&egui::epaint::ClippedShape> {
+        shapes
+            .iter()
+            .filter(|c| matches!(c.shape, egui::Shape::Callback(_)))
+            .collect()
+    }
+
+    /// **A pane of vector tiles hands the painter ONE callback, not one per
+    /// tile** -- carrying every tile's span, in walk order, each under its own
+    /// piece's clip.
+    #[test]
+    fn a_pane_of_tiles_is_one_ground_callback_carrying_every_tiles_span() {
+        squallar_radar::tls::init();
+        let _ledger = ledger_guard();
+        let (shapes, pane_clip, cells, asked, totals) = a_full_pane_pass(None);
+
+        assert!(
+            cells.len() > 1,
+            "fixture: one cell cannot show a batch of more than one span"
+        );
+        let callbacks = callbacks_of(&shapes);
+        assert_eq!(
+            callbacks.len(),
+            1,
+            "{} cells emitted {} ground callbacks, not one",
+            cells.len(),
+            callbacks.len()
+        );
+        assert_eq!(
+            totals.ground_callbacks, 1,
+            "the ledger did not count exactly the one hand-over the pass made"
+        );
+        assert_eq!(
+            asked.len(),
+            cells.len(),
+            "the one callback does not carry one span per tile: the batch \
+             dropped a tile's geometry or asked for it twice"
+        );
+        assert_eq!(
+            callbacks[0].clip_rect, pane_clip,
+            "the batch is not under the pane's clip, so it cannot merge with \
+             what sits beside it and each span's own scissor is not the only \
+             thing clipping it"
+        );
+
+        // Every span is a distinct tile, and the runs are the tiles' own: the
+        // batch is a rearrangement and not a duplication.
+        let mut ids: Vec<u64> = asked.iter().map(|(id, ..)| *id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            cells.len(),
+            "the batch does not hold one distinct tile per cell"
+        );
+        assert!(
+            totals.mesh_draws + totals.stroke_draws >= cells.len() as u64,
+            "the batch drew fewer runs than there are tiles, so it did not \
+             merely change how many callbacks carry them"
+        );
+    }
+
+    /// **A raster cell between two vector cells closes the batch**, so the
+    /// quads it draws land where they landed before: after the spans held
+    /// ahead of it and before the spans held after it.
+    #[test]
+    fn a_raster_cell_between_two_vector_cells_ends_the_batch() {
+        squallar_radar::tls::init();
+        let _ledger = ledger_guard();
+        let (shapes, _, cells, _, totals) = a_full_pane_pass(Some(1));
+        assert!(
+            cells.len() > 2,
+            "fixture: the raster cell must have vector cells on both sides"
+        );
+
+        let kinds: Vec<&'static str> = shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Callback(_) => Some("callback"),
+                egui::Shape::Mesh(m) if m.texture_id != egui::TextureId::default() => {
+                    Some("raster")
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["callback", "raster", "callback"],
+            "the raster cell did not split the batch in two around itself"
+        );
+        assert_eq!(
+            totals.ground_callbacks, 2,
+            "the ledger did not count the two hand-overs the split made"
+        );
+        assert_eq!(
+            totals.raster_quads, 1,
+            "the fixture did not put exactly one raster cell on the glass"
+        );
+    }
+
+    /// **A tile that places a shape on the CPU hands the batch over first**,
+    /// so nothing held before that shape ends up drawing after it.
+    ///
+    /// The refusing painter is what makes the tile place: every run comes back
+    /// on the CPU, at its own position among the shapes, and the batch --
+    /// which by then holds the tiles walked before this one -- goes in ahead
+    /// of them.
+    #[test]
+    fn a_tile_that_places_on_the_cpu_hands_the_batch_over_before_its_shapes() {
+        squallar_radar::tls::init();
+        let _ledger = ledger_guard();
+
+        /// Accepts the first span it is asked about and refuses the rest, so
+        /// the first tile of the walk batches and the next one places.
+        #[derive(Default)]
+        struct AcceptsOne {
+            seen: std::sync::atomic::AtomicUsize,
+        }
+        impl crate::tile_mesh::TileMeshPainter for AcceptsOne {
+            fn accepts(&self, _draw: &crate::tile_mesh::GroundDraw<'_>) -> bool {
+                self.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0
+            }
+
+            fn payload(
+                &self,
+                _batch: crate::tile_mesh::GroundBatch<'_>,
+            ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+                Some(std::sync::Arc::new(()))
+            }
+        }
+
+        let (ctx, canvas, projector, mut tiles, cells) = a_pane_and_its_cells();
+        for cell in &cells {
+            tiles.put_for_test(*cell, Tile::Vector(std::sync::Arc::new(a_styled_tile())));
+        }
+        let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> =
+            std::sync::Arc::new(AcceptsOne::default());
+        crate::tile_mesh::ledger::reset();
+        let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
+            draw_tile_layer(ui, &projector, HOIST_ZOOM, &mut tiles, 0, Some(&painter));
+        });
+
+        let first_callback = shapes
+            .iter()
+            .position(|c| matches!(c.shape, egui::Shape::Callback(_)))
+            .expect("the accepted span was handed over");
+        let first_placed = shapes
+            .iter()
+            .position(|c| matches!(c.shape, egui::Shape::Path(_)))
+            .expect("a refused stroke run was placed on the CPU");
+        assert!(
+            first_callback < first_placed,
+            "the batch was handed over after a tile's CPU-placed shape ({} \
+             against {first_placed}), so geometry held before that shape now \
+             draws over it",
+            first_callback
+        );
+        assert_eq!(
+            callbacks_of(&shapes).len(),
+            1,
+            "only the first span was accepted, so exactly one batch was handed \
+             over"
         );
     }
 
@@ -4777,8 +5307,8 @@ mod tests {
         let counts = |ground: GroundMeshes<'_>, background: Background| {
             let mut labels = Vec::new();
             let emitted = shapes_of_one_pass(&ctx, canvas, |ui| {
-                paint_vector_tile(
-                    ui.painter(),
+                paint_one_vector_tile(
+                    ui,
                     &shapes,
                     ground,
                     rect,
@@ -4895,8 +5425,8 @@ mod tests {
         let deferred = |ground: GroundMeshes<'_>, uv: egui::Rect| {
             let mut labels = Vec::new();
             let _ = shapes_of_one_pass(&ctx, canvas, |ui| {
-                paint_vector_tile(
-                    ui.painter(),
+                paint_one_vector_tile(
+                    ui,
                     &shapes,
                     ground,
                     piece,

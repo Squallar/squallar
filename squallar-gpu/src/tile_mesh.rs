@@ -25,7 +25,7 @@
 //! The sweep runs once per egui pass, not once per callback: `prepare` is
 //! called for every one of the frame's ground draws, and a per-callback sweep
 //! over a few hundred entries would cost more than the placement this replaces.
-//! [`GroundDraw::pass_nr`] is what makes "once per pass" a fact.
+//! [`GroundBatch::pass_nr`] is what makes "once per pass" a fact.
 //!
 //! # The uniform ring
 //!
@@ -52,7 +52,8 @@ use std::sync::{Arc, Weak};
 
 use egui_wgpu::wgpu;
 use squallar_egui::tile_mesh::{
-    GroundDraw, Placement, RunKind, TILE_VERTEX_BYTES, TileMeshPainter, TileMeshes, ledger, stroke,
+    GroundBatch, GroundDraw, Placement, RunKind, TILE_VERTEX_BYTES, TileMeshPainter, TileMeshes,
+    ledger, stroke,
 };
 
 /// Placements one frame may carry before the ring wraps onto a slot the same
@@ -640,13 +641,11 @@ fn align_up(value: u32, alignment: u32) -> u32 {
 /// A consecutive span of one tile's runs, on one frame.
 ///
 /// **A span, not a run.** Every run of a tile is drawn at the same placement,
-/// under the same clip and out of the same two buffer pairs, so one callback
-/// draws all of them — and a callback is a primitive boundary in the egui
-/// stream whatever it goes on to record, so the boundary is the cost worth
-/// removing. The runs themselves are not stored: `meshes` already holds them
-/// and is already kept alive for the upload, so this is a range into
-/// [`TileMeshes::runs`] rather than a per-frame `Vec`.
-struct TileMeshCallback {
+/// under the same clip and out of the same two buffer pairs, so one draw
+/// covers all of them. The runs themselves are not stored: `meshes` already
+/// holds them and is already kept alive for the upload, so this is a range
+/// into [`TileMeshes::runs`] rather than a per-frame `Vec`.
+struct CallbackSpan {
     /// Keeps the flattened buffers alive until `prepare` has read them, and is
     /// what the store's weak handle is taken from.
     meshes: Arc<TileMeshes>,
@@ -662,11 +661,34 @@ struct TileMeshCallback {
     /// CPU-placed shapes beside these runs on its own and this is how it
     /// reaches the runs.
     opacity: f32,
-    pass_nr: u64,
+    /// The clip this span's own callback carried — the tile's piece. `paint`
+    /// puts it through `egui_wgpu`'s own rounding and sets it as the scissor,
+    /// because the batch's primitive carries the pane's clip and not this one.
+    clip: egui::Rect,
     /// Written by `prepare`, read by `paint`. See the module doc: every
     /// prepare of a frame runs before any paint of it. One slot serves the
     /// whole span, because one placement does.
     slot: AtomicU32,
+}
+
+/// **Every tile's runs of one layer's pass, in one callback.**
+///
+/// A callback is a primitive boundary in the egui stream whatever it goes on
+/// to record — a `ClippedPrimitive`, a `prepare` and a `paint` dispatch, a
+/// `set_viewport`, and an `Arc<dyn Any>` minted and dropped — and the boundary
+/// is the cost worth removing. A 1920x1080 pane puts 45 vector tiles on the
+/// glass and paid all of that 45 times for geometry that was already resident
+/// and already drawn out of one store.
+///
+/// What used to come from egui per primitive and now comes from here per span
+/// is the **scissor**: [`squallar_egui::tile_mesh::GroundBatch`] states why
+/// that is the same rectangle, and `paint` reproduces `egui_wgpu`'s own two
+/// skips off it rather than restating their arithmetic.
+struct TileMeshCallback {
+    /// The spans, in the order they draw, which is the order the ground walk
+    /// issued them in.
+    spans: Vec<CallbackSpan>,
+    pass_nr: u64,
 }
 
 impl egui_wgpu::CallbackTrait for TileMeshCallback {
@@ -687,8 +709,9 @@ impl egui_wgpu::CallbackTrait for TileMeshCallback {
             ledger::note_mesh_store_missing();
             return Vec::new();
         };
+        // Once for the batch, not once per span: the sweep is idempotent
+        // within a pass and every span of a batch belongs to one pass.
         store.sweep(self.pass_nr);
-        store.ensure(device, queue, &self.meshes);
 
         // `ScreenDescriptor::screen_size_in_points` is private to egui-wgpu;
         // this is its body, and it must stay its body — egui's own uniform
@@ -698,8 +721,11 @@ impl egui_wgpu::CallbackTrait for TileMeshCallback {
             screen_descriptor.size_in_pixels[0] as f32 / screen_descriptor.pixels_per_point,
             screen_descriptor.size_in_pixels[1] as f32 / screen_descriptor.pixels_per_point,
         ];
-        let slot = store.slot(queue, points, self.place, self.opacity);
-        self.slot.store(slot, Ordering::Relaxed);
+        for span in &self.spans {
+            store.ensure(device, queue, &span.meshes);
+            let slot = store.slot(queue, points, span.place, span.opacity);
+            span.slot.store(slot, Ordering::Relaxed);
+        }
         Vec::new()
     }
 
@@ -743,17 +769,6 @@ impl egui_wgpu::CallbackTrait for TileMeshCallback {
         let Some(store) = callback_resources.get::<TileMeshStore>() else {
             return;
         };
-        let Some(resident) = store.resident.get(&self.meshes.id()) else {
-            return;
-        };
-        let first = self.first_run as usize;
-        let Some(runs) = self
-            .meshes
-            .runs()
-            .get(first..first + self.run_count as usize)
-        else {
-            return;
-        };
 
         // The geometry here is already in screen points — the uniform placed
         // it — so the viewport has to be the whole frame or the tile would be
@@ -778,43 +793,88 @@ impl egui_wgpu::CallbackTrait for TileMeshCallback {
             0.0,
             1.0,
         );
-        render_pass.set_bind_group(
-            0,
-            &store.bind_group,
-            &[self.slot.load(Ordering::Relaxed) * store.stride],
-        );
 
-        for run in runs {
-            match run.kind {
-                RunKind::Fill => {
-                    // `continue`, not `return`: a tile can be missing the
-                    // buffer pair for one kind of run and hold the other, and
-                    // the runs after this one still draw.
-                    let Some((vertices, indices)) = &resident.fills else {
-                        continue;
-                    };
-                    render_pass.set_pipeline(&store.pipeline);
-                    render_pass.set_vertex_buffer(0, vertices.slice(..));
-                    render_pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                }
-                RunKind::Stroke => {
-                    let Some((vertices, indices)) = &resident.strokes else {
-                        continue;
-                    };
-                    render_pass.set_pipeline(&store.stroke_pipeline);
-                    // A stroke run's first vertex, which the vertex buffer is
-                    // bound at so the run's `u16` indices address it from zero.
-                    // WebGL2 has no base-vertex draw call, which is why this is
-                    // a binding offset rather than an argument to
-                    // `draw_indexed` — and why it is re-bound per run.
-                    render_pass.set_vertex_buffer(
-                        0,
-                        vertices.slice(u64::from(run.first_vertex) * stroke::STROKE_VERTEX_BYTES..),
-                    );
-                    render_pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint16);
-                }
+        for span in &self.spans {
+            let Some(resident) = store.resident.get(&span.meshes.id()) else {
+                continue;
+            };
+            let first = span.first_run as usize;
+            let Some(runs) = span
+                .meshes
+                .runs()
+                .get(first..first + span.run_count as usize)
+            else {
+                continue;
+            };
+
+            // **The scissor `egui_wgpu` set for this span's own primitive**,
+            // through `egui_wgpu`'s own exported rounding rather than a second
+            // statement of it, so the two cannot drift.
+            //
+            // The skip on a zero-sized result is `render`'s, kept for the same
+            // reason `render` has it: a scissor of no width is a state change
+            // bought for no pixels. It is **not** load-bearing for
+            // correctness, and this comment says so rather than letting a
+            // reader assume otherwise — a zero-width scissor draws nothing
+            // either way, and every span sets its own scissor before drawing,
+            // so nothing downstream inherits one. `render`'s other skip, on a
+            // callback whose *viewport* rounds to nothing, is the identical
+            // arithmetic on the identical rect (`ViewportInPixels::from_points`
+            // and `ScissorRect::new` both round, clamp and subtract), so it is
+            // this same test and is not made twice.
+            let [x, y, width, height] = egui_wgpu::scissor_rect_in_pixels(
+                &span.clip,
+                info.pixels_per_point,
+                info.screen_size_px,
+            );
+            if width == 0 || height == 0 {
+                continue;
             }
-            render_pass.draw_indexed(run.first_index..run.first_index + run.index_count, 0, 0..1);
+            render_pass.set_scissor_rect(x, y, width, height);
+            render_pass.set_bind_group(
+                0,
+                &store.bind_group,
+                &[span.slot.load(Ordering::Relaxed) * store.stride],
+            );
+
+            for run in runs {
+                match run.kind {
+                    RunKind::Fill => {
+                        // `continue`, not `return`: a tile can be missing the
+                        // buffer pair for one kind of run and hold the other,
+                        // and the runs after this one still draw.
+                        let Some((vertices, indices)) = &resident.fills else {
+                            continue;
+                        };
+                        render_pass.set_pipeline(&store.pipeline);
+                        render_pass.set_vertex_buffer(0, vertices.slice(..));
+                        render_pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                    }
+                    RunKind::Stroke => {
+                        let Some((vertices, indices)) = &resident.strokes else {
+                            continue;
+                        };
+                        render_pass.set_pipeline(&store.stroke_pipeline);
+                        // A stroke run's first vertex, which the vertex buffer
+                        // is bound at so the run's `u16` indices address it
+                        // from zero. WebGL2 has no base-vertex draw call, which
+                        // is why this is a binding offset rather than an
+                        // argument to `draw_indexed` — and why it is re-bound
+                        // per run.
+                        render_pass.set_vertex_buffer(
+                            0,
+                            vertices
+                                .slice(u64::from(run.first_vertex) * stroke::STROKE_VERTEX_BYTES..),
+                        );
+                        render_pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint16);
+                    }
+                }
+                render_pass.draw_indexed(
+                    run.first_index..run.first_index + run.index_count,
+                    0,
+                    0..1,
+                );
+            }
         }
     }
 }
@@ -829,28 +889,50 @@ impl egui_wgpu::CallbackTrait for TileMeshCallback {
 pub struct TileMeshBridge;
 
 impl TileMeshPainter for TileMeshBridge {
-    fn payload(&self, draw: GroundDraw<'_>) -> Option<Arc<dyn Any + Send + Sync>> {
-        // An empty span would be a callback that records a viewport and a bind
-        // group and draws nothing — a primitive boundary bought for no pixels,
-        // which is the cost this whole path exists to remove. The range check
-        // is what lets `paint` slice without one of its own.
-        if draw.run_count == 0 {
+    fn accepts(&self, draw: &GroundDraw<'_>) -> bool {
+        // An empty span would record a bind group and a scissor and draw
+        // nothing. The range check is what lets `paint` slice without one of
+        // its own, and asking it here rather than at mint time is what keeps a
+        // refusal actionable: the walk can still place this span's geometry on
+        // the CPU at its own place among the shapes.
+        draw.run_count != 0
+            && draw
+                .meshes
+                .runs()
+                .get(draw.first_run..draw.first_run + draw.run_count)
+                .is_some()
+    }
+
+    fn payload(&self, batch: GroundBatch<'_>) -> Option<Arc<dyn Any + Send + Sync>> {
+        // An empty batch would be a callback that records a viewport and draws
+        // nothing — a primitive boundary bought for no pixels, which is the
+        // cost this whole path exists to remove.
+        if batch.draws.is_empty() {
             return None;
         }
-        draw.meshes
-            .runs()
-            .get(draw.first_run..draw.first_run + draw.run_count)?;
+        let spans = batch
+            .draws
+            .iter()
+            .filter(|draw| self.accepts(draw))
+            .map(|draw| CallbackSpan {
+                meshes: Arc::clone(draw.meshes),
+                first_run: draw.first_run as u32,
+                run_count: draw.run_count as u32,
+                place: draw.place,
+                opacity: draw.opacity,
+                clip: draw.clip,
+                slot: AtomicU32::new(0),
+            })
+            .collect::<Vec<_>>();
+        if spans.is_empty() {
+            return None;
+        }
         Some(
             egui_wgpu::Callback::new_paint_callback(
                 egui::Rect::ZERO,
                 TileMeshCallback {
-                    meshes: Arc::clone(draw.meshes),
-                    first_run: draw.first_run as u32,
-                    run_count: draw.run_count as u32,
-                    place: draw.place,
-                    opacity: draw.opacity,
-                    pass_nr: draw.pass_nr,
-                    slot: AtomicU32::new(0),
+                    spans,
+                    pass_nr: batch.pass_nr,
                 },
             )
             .callback,
