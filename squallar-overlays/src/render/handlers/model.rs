@@ -2341,13 +2341,26 @@ impl OverlayHandler for ModelDataHandler {
     /// store still holds it; and the rasters and textures made from these
     /// grids, which belong to the overlay picture family and the GPU.
     fn resident_source_bytes(&self) -> u64 {
+        self.resident_source_states().total()
+    }
+
+    /// The stores this layer holds, named apart. `parked` is structurally zero
+    /// here and that is this layer's own fact rather than an omission: a GRIB2
+    /// record is decoded into a fresh values vector, so no decode buffer is
+    /// retained between grids — see `MODEL_FRAME_STAGING_BYTES`.
+    fn resident_source_states(&self) -> squallar_source::handler::SourceResidencyStates {
         let carried = match &self.state.data {
             Some(grid) if !self.cached_grids.holds(grid) && !self.frame_grids.holds(grid) => {
                 grid_bytes(grid)
             }
             _ => 0,
         };
-        (self.cached_grids.resident_bytes() + self.frame_grids.resident_bytes() + carried) as u64
+        squallar_source::handler::SourceResidencyStates {
+            live: self.cached_grids.resident_bytes() as u64,
+            staged: self.frame_grids.resident_bytes() as u64,
+            parked: 0,
+            carried: carried as u64,
+        }
     }
 
     /// **Let go of every decoded grid**, live cache and staging area both.

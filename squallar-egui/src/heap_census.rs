@@ -1558,6 +1558,125 @@ pub fn write_process_line<W: core::fmt::Write>(
 /// so the shape of the large grants is what a level structurally cannot say.
 /// Empty buckets are left out, so a quiet process says
 /// `large grants (page): none`.
+/// **`overlay grids`, attributed to the four handlers that hold it** — the
+/// decomposition the family's own figure cannot give.
+///
+/// `overlay grids` is one `u64` folded over fifteen handlers
+/// (`OverlayRegistry::resident_source_bytes`), and a sum is not attributable:
+/// the same total is arithmetically consistent with several different and
+/// contradictory mixes of mosaics, granules and grids, which is exactly how
+/// this family's published decompositions have been wrong before.
+///
+/// **Always emitted, including all-zero**, and that is the point of it: a
+/// binary that prints this row with five zeros has a walk that ran and found
+/// nothing, while a binary without the row has no walk at all. The two must
+/// never be confused for one another.
+///
+/// **Blocks and bytes are different currencies and are never added.** This row
+/// carries bytes only; entry counts belong on their own row.
+///
+/// `other` is every handler taking the trait's `0` default. A non-zero there
+/// is a gridded layer that landed without a term in
+/// `OverlayRegistry::resident_source_split`, and it is reported rather than
+/// folded into a neighbour so that it cannot hide.
+pub fn overlay_grid_split_line(instance: &str) -> String {
+    use core::fmt::Write;
+
+    let mut out = String::new();
+    let (mrms, gmgsi, model, glm, other) = overlay_grid_split();
+    let _ = write!(
+        out,
+        "overlay grid split ({instance}): mrms {mrms} B, gmgsi {gmgsi} B, \
+         model {model} B, glm {glm} B, other {other} B",
+    );
+    out
+}
+
+/// **The same family cut along the STATE axis** — live, staged for a loop
+/// frame, parked in a decode pool, carried by an `OverlayState`.
+///
+/// A separate row from the by-handler split and never added to it: these are
+/// the *same bytes* decomposed a second way, so summing the two rows would
+/// count the family twice. The two totals must agree, which is the check
+/// `overlay_grid_split_attributes.rs` makes.
+///
+/// The term that matters most to a cut is `parked`: a retained decode block is
+/// read by nothing between decodes, where a live mosaic answers hover and
+/// every re-raster and a staged granule is re-read whenever its loop frame
+/// re-rasterizes. Same family, three very different prices.
+///
+/// **Always emitted, including all-zero.**
+pub fn overlay_grid_states_line(instance: &str) -> String {
+    use core::fmt::Write;
+
+    let mut out = String::new();
+    let (live, staged, parked, carried) = overlay_grid_states();
+    let _ = write!(
+        out,
+        "overlay grid states ({instance}): live {live} B, staged {staged} B, \
+         parked {parked} B, carried {carried} B",
+    );
+    out
+}
+
+static OVERLAY_GRID_STATES: [core::sync::atomic::AtomicU64; 4] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Publish the state split, from the same site and the same walk as the rest.
+pub fn set_overlay_grid_states(live: u64, staged: u64, parked: u64, carried: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    OVERLAY_GRID_STATES[0].store(live, Relaxed);
+    OVERLAY_GRID_STATES[1].store(staged, Relaxed);
+    OVERLAY_GRID_STATES[2].store(parked, Relaxed);
+    OVERLAY_GRID_STATES[3].store(carried, Relaxed);
+}
+
+/// The four state terms as last published.
+pub fn overlay_grid_states() -> (u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        OVERLAY_GRID_STATES[0].load(Relaxed),
+        OVERLAY_GRID_STATES[1].load(Relaxed),
+        OVERLAY_GRID_STATES[2].load(Relaxed),
+        OVERLAY_GRID_STATES[3].load(Relaxed),
+    )
+}
+
+static OVERLAY_GRID_SPLIT: [core::sync::atomic::AtomicU64; 5] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Publish the split, from the one site that already publishes the family's
+/// sum so the two can never be read a frame apart.
+pub fn set_overlay_grid_split(mrms: u64, gmgsi: u64, model: u64, glm: u64, other: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    OVERLAY_GRID_SPLIT[0].store(mrms, Relaxed);
+    OVERLAY_GRID_SPLIT[1].store(gmgsi, Relaxed);
+    OVERLAY_GRID_SPLIT[2].store(model, Relaxed);
+    OVERLAY_GRID_SPLIT[3].store(glm, Relaxed);
+    OVERLAY_GRID_SPLIT[4].store(other, Relaxed);
+}
+
+/// The five terms as last published.
+pub fn overlay_grid_split() -> (u64, u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        OVERLAY_GRID_SPLIT[0].load(Relaxed),
+        OVERLAY_GRID_SPLIT[1].load(Relaxed),
+        OVERLAY_GRID_SPLIT[2].load(Relaxed),
+        OVERLAY_GRID_SPLIT[3].load(Relaxed),
+        OVERLAY_GRID_SPLIT[4].load(Relaxed),
+    )
+}
+
 pub fn large_grants_line(instance: &str) -> String {
     use core::fmt::Write;
 

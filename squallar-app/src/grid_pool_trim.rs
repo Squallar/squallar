@@ -1,13 +1,22 @@
 //! **When a session that has stopped decoding grids gives its staging blocks
 //! back.**
 //!
-//! `squallar_overlays::staging` parks one grid-sized decode buffer per gridded
-//! source — 49,000,000 B on MRMS, 15,000,000 B on GMGSI — so that the next
-//! granule is filled into a block that already exists instead of one the
-//! allocator has to find. The pool has exactly one release lever and, until
-//! this module, exactly one caller for it: `App::on_pressure`, which fires
-//! when the heap has already refused an allocation. So on every session that
-//! never hits a wall the two blocks are held for the life of the process.
+//! `squallar_overlays::staging` parks one decode buffer per gridded source —
+//! **224,000 B on MRMS and 15,000,000 B on GMGSI** — so that the next granule
+//! is filled into a block that already exists instead of one the allocator has
+//! to find.
+//!
+//! **The MRMS figure here said 49,000,000 B and was stale by 218x.** That was
+//! the flat CONUS plane the decode used to build for the tiler to read; since
+//! `decode::tile_png_codes` walks PNG rows instead, the slot holds
+//! `mrms::CONUS_BAND_BYTES` — 16 rows, pinned at 224,000 B by
+//! `mrms::staging::STAGING_POINTS`'s own `const _`. Every reading below that
+//! rests on the 49 MB figure is marked where it sits.
+//!
+//! The pool has exactly one release lever and, until this module, exactly one
+//! caller for it: `App::on_pressure`, which fires when the heap has already
+//! refused an allocation. So on every session that never hits a wall the two
+//! blocks are held for the life of the process.
 //!
 //! # What that costs, measured
 //!
@@ -27,21 +36,31 @@
 //!                    of leg-to-leg spread is the lightning cache above it.
 //! ```
 //!
-//! **That table is the reading it was, and its MRMS live row has since
+//! **That table is the reading it was, and BOTH of its MRMS rows have since
 //! moved.** The mosaic is tiled now
 //! (`squallar_overlays::render::gridded::TiledU16`) and reads 2,350,138 to
 //! 8,943,164 B over 28 granules of both shipped products; the parked block is
-//! the decode PLANE and did not move, so it is no longer half of MRMS's share
-//! but about nine tenths of it. Everything below applies unchanged and applies
-//! harder.
+//! no longer the decode plane either, but the 224,000 B band above. So MRMS's
+//! share of this family is a small fraction of what that table prices, and the
+//! parked bytes worth taking are **GMGSI's**, which did not move.
 //!
-//! **Half of that family is a block nothing reads.** It is not dead — the next
+//! Measured on a 420 s six-pane HEAVY6 leg (2026-09-10), through the
+//! `overlay grids` census family's own `parked` term: 14,997,000 B of GMGSI
+//! against 224,000 B of MRMS.
+//!
+//! **What is parked is a block nothing reads.** It is not dead — the next
 //! decode takes it — but a still leg decodes MRMS about once every two minutes,
 //! so the block is held for two minutes to save one allocation. Measured on
 //! this workspace's box (`std::alloc::System`, twenty samples), filling a
-//! 49,000,000 B mosaic costs 46.04 ms p50 from a fresh allocation against
+//! 49,000,000 B mosaic cost 46.04 ms p50 from a fresh allocation against
 //! 26.90 ms p50 from a retained one: **19.15 ms per decode**, which against a
-//! two-minute poll is 0.016 % of one thread bought with 61.0 MiB.
+//! two-minute poll is 0.016 % of one thread.
+//!
+//! **That timing is the plane's and is kept only as the shape of the trade.**
+//! It was measured filling a 49,000,000 B block; MRMS now parks 224,000 B and
+//! the figure does not transfer to it. What it still says correctly is that the
+//! saving is a fraction of a percent of one thread, which is what makes a
+//! parked block worth giving up at all.
 //!
 //! # Two halves, because one of them moves an average and not a peak
 //!
@@ -95,7 +114,9 @@
 //! frame from there is served out of the slot as before.
 //!
 //! The free itself is 0.218–0.467 ms for both blocks (twelve samples, 64,000,000
-//! B, `std::alloc::System`, this box under load). Small — and still handed to
+//! B, `std::alloc::System`, this box under load) — **measured when the two
+//! blocks summed to 64,000,000 B; they sum to 15,224,000 B now**, so that
+//! range is an upper bound rather than the current reading. Small — and still handed to
 //! `squallar_worker::offload`'s free lane rather than spent on an interaction
 //! frame, priced so `deferred drops` carries the bytes for the whole of the
 //! hand-off.
@@ -159,8 +180,48 @@ const SETTLED: u32 = u32::MAX;
 /// Statics rather than fields on `App`, because what they track is a static:
 /// the pools are process-global, one set per module instantiation, and an
 /// `App` is not the thing that owns them.
-static LAST_SERVED: AtomicU64 = AtomicU64::new(0);
-static QUIET: AtomicU32 = AtomicU32::new(0);
+/// **Per pool, and that is the whole of this policy's correctness.** A single
+/// pair of these read [`squallar_overlays::staging::decodes_served`], the SUM
+/// over both pools — so MRMS, which stages a granule per loop frame and
+/// re-polls every 120 s, moved the count on essentially every tick, every
+/// reading was [`Reading::Busy`], and GMGSI's 15,000,000 B block was never
+/// given up on any scene where MRMS was live. Measured on a 420 s six-pane
+/// HEAVY6 leg: the `overlay grids` census family's `parked` term sat at
+/// 15,221,000 B across every sample of the leg and never once fell.
+///
+/// Indexed by [`squallar_overlays::staging::Pool::index`].
+static LAST_SERVED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static QUIET: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+
+/// **The fires counter, per pool** — trims that fired, blocks given up, and
+/// bytes given up, plus the readings on both sides of the decision.
+///
+/// Blocks and bytes are **different currencies and are never added**: one
+/// block is one pool's parked buffer whatever it is holding, and a pool that
+/// has moved off its nominal shape is priced at what it actually held.
+///
+/// `busy` and `quiet` are the denominator this policy is rare or common
+/// against. Without them a `trims 0` row cannot distinguish "the mechanism
+/// never fired" from "the scene never went quiet", which is the distinction
+/// that would have caught this defect the day the trim landed.
+static TRIMS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static TRIM_BLOCKS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static TRIM_BYTES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static BUSY_READINGS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static QUIET_READINGS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// What this policy has given back, per pool: `(trims, blocks, bytes, busy,
+/// quiet)` — see the statics above for why blocks and bytes are apart.
+pub fn trim_totals(pool: squallar_overlays::staging::Pool) -> (u64, u64, u64, u64, u64) {
+    let i = pool.index();
+    (
+        TRIMS[i].load(Relaxed),
+        TRIM_BLOCKS[i].load(Relaxed),
+        TRIM_BYTES[i].load(Relaxed),
+        BUSY_READINGS[i].load(Relaxed),
+        QUIET_READINGS[i].load(Relaxed),
+    )
+}
 
 /// **What one reading means**, as a function of its inputs alone.
 ///
@@ -193,7 +254,22 @@ fn decide(served: u64, last_served: u64, quiet: u32, trim_after: Option<u32>) ->
 /// `squallar_worker::offload::discard`, whose deferred queue is thread-local
 /// and drained by the frame loop.
 pub fn observe_reading() -> Reading {
-    observe_served(squallar_overlays::staging::decodes_served())
+    // **Each pool asked with its OWN count**, never the sum: a summed count
+    // answers "did anything decode", and this policy is asking "may THIS
+    // block go". See [`LAST_SERVED`].
+    let mut worst = Reading::Settled;
+    for pool in squallar_overlays::staging::Pool::ALL {
+        let reading = observe_served_of(pool, squallar_overlays::staging::decodes_served_of(pool));
+        // Busy on any pool is what a single-`Reading` caller should hear, so
+        // an existing reader of this answer keeps its old meaning: "is the
+        // grid-decode side of this session working".
+        if reading == Reading::Busy {
+            worst = Reading::Busy;
+        } else if worst != Reading::Busy && reading == Reading::Trim {
+            worst = Reading::Trim;
+        }
+    }
+    worst
 }
 
 /// [`observe_reading`] with the count supplied — the stateful fold and the
@@ -209,15 +285,16 @@ pub fn observe_reading() -> Reading {
 /// block from one another test in the same binary left behind — the reason
 /// `squallar-overlays/tests/overlay_grid_residency_split.rs` is one test in one
 /// binary too.
-pub fn observe_served(served: u64) -> Reading {
+pub fn observe_served_of(pool: squallar_overlays::staging::Pool, served: u64) -> Reading {
+    let i = pool.index();
     let reading = decide(
         served,
-        LAST_SERVED.load(Relaxed),
-        QUIET.load(Relaxed),
+        LAST_SERVED[i].load(Relaxed),
+        QUIET[i].load(Relaxed),
         TRIM_AFTER,
     );
-    LAST_SERVED.store(served, Relaxed);
-    QUIET.store(
+    LAST_SERVED[i].store(served, Relaxed);
+    QUIET[i].store(
         match reading {
             Reading::Busy => 0,
             Reading::Quiet(n) => n,
@@ -226,13 +303,21 @@ pub fn observe_served(served: u64) -> Reading {
         Relaxed,
     );
     match reading {
+        Reading::Busy => {
+            BUSY_READINGS[i].fetch_add(1, Relaxed);
+        }
+        _ => {
+            QUIET_READINGS[i].fetch_add(1, Relaxed);
+        }
+    }
+    match reading {
         // **Parking back on.** A cadence the pools are worth something to has
         // come back, and the block they park will be reused by the decode
         // after this one. Set on every busy reading rather than on the edge:
         // it is one relaxed store per pool per tick and a level cannot drift
         // out of step with the policy the way an edge can.
-        Reading::Busy => squallar_overlays::staging::set_retaining_all(true),
-        Reading::Trim => release(),
+        Reading::Busy => squallar_overlays::staging::set_retaining_of(pool, true),
+        Reading::Trim => release(pool),
         Reading::Quiet(_) | Reading::Settled => {}
     }
     reading
@@ -245,7 +330,7 @@ pub fn observe_served(served: u64) -> Reading {
 /// a reader watching `live_bytes` fall sees one family's figure move to
 /// another's rather than a gap. Nothing is filed for an empty take: a payload
 /// of two `None`s is a queue entry that frees nothing.
-fn release() {
+fn release(pool: squallar_overlays::staging::Pool) {
     // **Both halves, and the order matters.** Parking off first, so a decode
     // racing this cannot park a block into a slot the take below has already
     // passed; the two are one relaxed store apiece and neither blocks.
@@ -257,17 +342,61 @@ fn release() {
     // family's high-water mark would not move. Held off, a still session parks
     // nothing at all from here until a busy reading turns it back on, which
     // costs a loop exactly one un-pooled decode at its start.
-    squallar_overlays::staging::set_retaining_all(false);
-    let taken = squallar_overlays::staging::take_all_retained();
+    squallar_overlays::staging::set_retaining_of(pool, false);
+    let taken = squallar_overlays::staging::take_retained_of(pool);
     let bytes = taken.bytes();
+    // **Counted before the empty exit**, so a trim that decided to fire and
+    // found nothing is still a fired trim. A counter that only counted the
+    // productive ones could not tell a policy that never runs from one that
+    // runs and has nothing to give.
+    let i = pool.index();
+    TRIMS[i].fetch_add(1, Relaxed);
     if bytes == 0 {
         return;
     }
-    log::debug!("grid staging pools: giving up {bytes} B after a quiet session");
+    TRIM_BLOCKS[i].fetch_add(1, Relaxed);
+    TRIM_BYTES[i].fetch_add(bytes, Relaxed);
+    log::debug!(
+        "grid staging pool {}: giving up {bytes} B after a quiet session",
+        pool.name()
+    );
     squallar_worker::offload::discard(
         "grid staging pools",
         squallar_worker::offload::Priced::new(bytes, taken),
     );
+}
+
+/// **The fires-counter row for this policy** — per pool, always emitted,
+/// all-zero included.
+///
+/// A row of zeros is a policy that ran and never fired; **no row at all** is a
+/// binary without the policy. Those are different findings and this must not
+/// merge them — which is exactly the confusion that let this trim sit unable
+/// to fire, since it shipped with no row of any kind.
+///
+/// `trims` counts every decision to fire, including one that found an empty
+/// slot; `blocks` and `bytes` count what came out. Blocks and bytes are
+/// different currencies and are never added.
+pub fn trim_line(instance: &str) -> String {
+    use core::fmt::Write;
+
+    let mut out = String::new();
+    let _ = write!(out, "grid pool trim ({instance}):");
+    for (n, pool) in squallar_overlays::staging::Pool::ALL
+        .into_iter()
+        .enumerate()
+    {
+        let (trims, blocks, bytes, busy, quiet) = trim_totals(pool);
+        let held = squallar_overlays::staging::retained_bytes_of(pool);
+        let _ = write!(
+            out,
+            "{} {} {trims} trims, {blocks} blocks, {bytes} B given, {held} B held, \
+             {busy} busy, {quiet} quiet",
+            if n == 0 { "" } else { ";" },
+            pool.name(),
+        );
+    }
+    out
 }
 
 #[cfg(test)]

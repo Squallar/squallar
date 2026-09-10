@@ -132,7 +132,28 @@ impl Gui {
         // Cheap by construction: a fold over the registered handlers, each
         // answering from a byte field or a walk of the one to four grid
         // entries its budget allows. No grid contents are touched.
-        crate::heap_census::set_overlay_grid_bytes(self.overlays.resident_source_bytes());
+        // **Attributed in the same walk that sums it.** The family's figure
+        // is a fold over fifteen handlers, and a sum cannot say which layer
+        // it came from — the gap that has let this family's decompositions be
+        // *solved* from granule arithmetic, which admits several exact and
+        // contradictory fits for one total. The split is the same pass, so
+        // the total is this split's own terms and the two can never be read a
+        // frame apart or disagree.
+        let split = self.overlays.resident_source_split();
+        crate::heap_census::set_overlay_grid_bytes(split.total());
+        crate::heap_census::set_overlay_grid_split(
+            split.mrms,
+            split.gmgsi,
+            split.model,
+            split.glm,
+            split.other,
+        );
+        crate::heap_census::set_overlay_grid_states(
+            split.live,
+            split.staged,
+            split.parked,
+            split.carried,
+        );
         // **The item half of the same question**, and two families rather
         // than one because they answer different things: what a layer has
         // INSTALLED, and what it has RETIRED and not yet handed to the

@@ -3568,6 +3568,18 @@ impl super::App {
         // [`crate::grid_pool_trim`] for the measured prices on both sides of
         // the trade and for why the wasm32 arm does not take it.
         crate::grid_pool_trim::observe_reading();
+        // **What that policy has actually given back**, always emitted and
+        // all-zero included. `grid_pool_trim` shipped with no counter at all,
+        // and the consequence was that it could not fire on any scene where
+        // MRMS was live — its quiet detector read the SUM of both pools' decode
+        // counts, MRMS moved that sum on nearly every tick, and GMGSI's
+        // 15,000,000 B block was never given up — with nothing in any log
+        // saying so for a day. `busy`/`quiet` are the denominator: without
+        // them a `trims 0` row cannot separate "the mechanism never fired"
+        // from "the scene never went quiet".
+        //
+        // **Blocks and bytes are different currencies and are never added.**
+        say_telemetry(loud, &crate::grid_pool_trim::trim_line("page"));
         say_telemetry(
             loud,
             &squallar_egui::heap_census::line(
@@ -3622,6 +3634,22 @@ impl super::App {
         // linear memory is grown by what was held at ONE instant and never
         // gives it back, so the transient pair that raised the peak is gone
         // from every level by the time any tick reads one.
+        // **`overlay grids`, attributed** — its own row because it is a
+        // decomposition of a family already on the census line and must never
+        // be added to it. Always emitted, all-zero included: a row of zeros is
+        // a walk that ran and found nothing, and no row at all is a binary
+        // without the walk. The two are different findings.
+        say_telemetry(
+            loud,
+            &squallar_egui::heap_census::overlay_grid_split_line("page"),
+        );
+        // **The same family along the other axis**, its own row and never
+        // added to the one above: these are the same bytes decomposed a
+        // second way, and adding the two rows would count the family twice.
+        say_telemetry(
+            loud,
+            &squallar_egui::heap_census::overlay_grid_states_line("page"),
+        );
         say_telemetry(loud, &squallar_egui::heap_census::large_grants_line("page"));
         // **The HTTP body reader's own line**, beside the grants and never
         // added to them: `peak shard` is the transport-buffer residency the

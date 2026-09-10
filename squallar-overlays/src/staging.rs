@@ -589,5 +589,93 @@ pub fn take_all_retained() -> RetainedBlocks {
     }
 }
 
+/// **Which shipped staging pool** — the name an idle policy needs so that one
+/// pool's activity cannot decide another pool's fate.
+///
+/// [`decodes_served`] sums the pools, and a summed count is the right figure
+/// for "did anything decode" and the wrong one for "may THIS block go": MRMS
+/// re-polls every 120 s and stages a granule per loop frame, GMGSI polls
+/// hourly, so a reader watching the sum sees MRMS's cadence and never sees
+/// GMGSI go quiet. [`release_all_retained`]'s own comment identifies exactly
+/// that hazard — "a short-circuit would leave GMGSI's block parked on every
+/// event where MRMS happened to have one" — and closes it in the release; this
+/// is the same hazard one level up, in the policy that decides whether the
+/// release is ever reached.
+///
+/// An enum rather than a registry to walk, the trade [`release_all_retained`]
+/// and [`decodes_served`] both take: a third source is a review question in one
+/// file, and [`Pool::ALL`] is the row a new pool must appear in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pool {
+    /// `crate::mrms::staging` — the CONUS mosaic band.
+    Mrms,
+    /// `crate::gmgsi::staging` — the global blend's codes.
+    Gmgsi,
+}
+
+impl Pool {
+    /// Every shipped pool, in the order a caller keeping per-pool state should
+    /// index it. A pool missing here is one no idle policy will ever trim.
+    pub const ALL: [Pool; 2] = [Pool::Mrms, Pool::Gmgsi];
+
+    /// The pool's index into a caller's own per-pool state.
+    pub fn index(self) -> usize {
+        match self {
+            Pool::Mrms => 0,
+            Pool::Gmgsi => 1,
+        }
+    }
+
+    /// This pool's name, for a counter row that has to say which one fired.
+    pub fn name(self) -> &'static str {
+        match self {
+            Pool::Mrms => "mrms",
+            Pool::Gmgsi => "gmgsi",
+        }
+    }
+}
+
+/// **One pool's own decode count** — [`decodes_served`] is the sum of these,
+/// and the sum is what an idle policy must NOT read. See [`Pool`].
+pub fn decodes_served_of(pool: Pool) -> u64 {
+    match pool {
+        Pool::Mrms => crate::mrms::staging::global().decodes_served(),
+        Pool::Gmgsi => crate::gmgsi::staging::global().decodes_served(),
+    }
+}
+
+/// One pool's retained bytes, so a counter can price what a trim gave back
+/// before it is handed away.
+pub fn retained_bytes_of(pool: Pool) -> u64 {
+    match pool {
+        Pool::Mrms => crate::mrms::staging::global().retained_bytes() as u64,
+        Pool::Gmgsi => crate::gmgsi::staging::global().retained_bytes() as u64,
+    }
+}
+
+/// Turn parking on or off in **one** pool. [`set_retaining_all`] is this over
+/// [`Pool::ALL`], and is what a caller with no per-pool state wants.
+pub fn set_retaining_of(pool: Pool, retaining: bool) {
+    match pool {
+        Pool::Mrms => crate::mrms::staging::global().set_retaining(retaining),
+        Pool::Gmgsi => crate::gmgsi::staging::global().set_retaining(retaining),
+    }
+}
+
+/// Take **one** pool's parked block, still owned, for a caller that frees
+/// elsewhere. The other pool's slot is left exactly as it was.
+pub fn take_retained_of(pool: Pool) -> RetainedBlocks {
+    match pool {
+        Pool::Mrms => RetainedBlocks {
+            mrms: crate::mrms::staging::global().take_retained(),
+            gmgsi: None,
+        },
+        Pool::Gmgsi => RetainedBlocks {
+            mrms: None,
+            gmgsi: crate::gmgsi::staging::global().take_retained(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests;

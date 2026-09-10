@@ -15,7 +15,27 @@
 //! the other half: a policy that trimmed on the first quiet reading would pass
 //! an end-state check and fails here on a named row.
 
-use squallar_app::grid_pool_trim::{Reading, TRIM_AFTER, observe_served};
+use squallar_app::grid_pool_trim::{Reading, TRIM_AFTER, observe_served_of};
+use squallar_overlays::staging::Pool;
+
+/// **One tick, every pool.** The policy keeps its quiet run per pool — a
+/// summed count answers "did anything decode" where this asks "may THIS block
+/// go" — so a driver that fed one figure to one door would leave the other
+/// pool's run un-advanced and its block parked for reasons this suite is not
+/// about.
+///
+/// Both pools are handed the SAME count here, which is what makes the readings
+/// comparable: a reading that differs between them under identical input is
+/// the policy losing its per-pool state rather than using it.
+fn tick(count: u64) -> Reading {
+    let readings = Pool::ALL.map(|pool| observe_served_of(pool, count));
+    assert_eq!(
+        readings[0], readings[1],
+        "both pools were driven with the same count, so their readings must \
+         agree: {readings:?}",
+    );
+    readings[0]
+}
 
 #[test]
 fn a_quiet_session_gives_both_staging_blocks_up_and_the_next_decode_is_served() {
@@ -57,13 +77,13 @@ fn a_quiet_session_gives_both_staging_blocks_up_and_the_next_decode_is_served() 
     // colour.
     let quiet_count = 4_242;
     assert_eq!(
-        observe_served(quiet_count),
+        tick(quiet_count),
         Reading::Busy,
         "the first reading arms the run — it has nothing to compare against",
     );
     for n in 1..threshold {
         assert_eq!(
-            observe_served(quiet_count),
+            tick(quiet_count),
             Reading::Quiet(n),
             "reading {n} of the quiet run is not yet the trim",
         );
@@ -77,14 +97,14 @@ fn a_quiet_session_gives_both_staging_blocks_up_and_the_next_decode_is_served() 
     }
 
     assert_eq!(
-        observe_served(quiet_count),
+        tick(quiet_count),
         Reading::Trim,
         "the {threshold}th reading is the one that gives the blocks up",
     );
     assert_eq!(mrms.retained_bytes(), 0, "the MRMS slot is empty");
     assert_eq!(gmgsi.retained_bytes(), 0, "the GMGSI slot is empty");
     assert_eq!(
-        observe_served(quiet_count),
+        tick(quiet_count),
         Reading::Settled,
         "and a session that has already trimmed does not file a payload on \
          every tick after it",
@@ -133,7 +153,7 @@ fn a_quiet_session_gives_both_staging_blocks_up_and_the_next_decode_is_served() 
     // parking back on -- one un-pooled decode at the start of a loop, and no
     // more.
     assert_eq!(
-        observe_served(quiet_count + 1),
+        tick(quiet_count + 1),
         Reading::Busy,
         "a decode in the interval re-arms the policy out of Settled",
     );

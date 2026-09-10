@@ -1789,16 +1789,25 @@ impl OverlayHandler for GmgsiHandler {
     /// against. `ModelHandler::resident_source_bytes` has asked both stores
     /// all along; this is that guard.
     fn resident_source_bytes(&self) -> u64 {
+        self.resident_source_states().total()
+    }
+
+    /// The four stores this layer holds, named apart. Same terms and the same
+    /// carry guard [`Self::resident_source_bytes`] has always summed — that
+    /// figure is now this one's total, so the two cannot drift.
+    fn resident_source_states(&self) -> squallar_source::handler::SourceResidencyStates {
         let carried = match &self.state.data {
             Some(grid) if !self.cached_grids.holds(grid) && !self.frame_grids.holds(grid) => {
                 grid.values.resident_bytes()
             }
             _ => 0,
         };
-        (self.cached_grids.resident_bytes()
-            + self.frame_grids.resident_bytes()
-            + self.frame_grids.staging.retained_bytes()
-            + carried) as u64
+        squallar_source::handler::SourceResidencyStates {
+            live: self.cached_grids.resident_bytes() as u64,
+            staged: self.frame_grids.resident_bytes() as u64,
+            parked: self.frame_grids.staging.retained_bytes() as u64,
+            carried: carried as u64,
+        }
     }
 }
 

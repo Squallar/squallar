@@ -1055,6 +1055,50 @@ impl OverlayRegistry {
             .fold(0u64, u64::saturating_add)
     }
 
+    /// **The same fold, attributed** — `overlay grids` split across the four
+    /// handlers that answer it, in one walk.
+    ///
+    /// [`Self::resident_source_bytes`] is one `u64` over fifteen handlers, and
+    /// a sum is not attributable: a reading of it can be one mosaic or four,
+    /// and nothing on the page says which layer it came from. That gap is why
+    /// the family's published decompositions have had to be *solved* from
+    /// arithmetic over granule sizes, which
+    /// `tests/overlay_grid_residency_split.rs` shows admits several exact and
+    /// contradictory fits for the same total.
+    ///
+    /// Same cost as the sum it replaces — one pass, each answer a field read
+    /// or a walk of a cache holding at most a handful of entries — so the
+    /// publish site calls this and adds, rather than walking twice.
+    pub fn resident_source_split(&self) -> SourceResidencySplit {
+        let mut split = SourceResidencySplit::default();
+        for handler in self.handlers() {
+            // **One ask per handler, decomposed both ways from it.** The state
+            // split's own total is the handler's `resident_source_bytes`, so
+            // asking for the states and adding them is the same figure the sum
+            // would have given — one walk, two decompositions, no drift.
+            let states = handler.resident_source_states();
+            let bytes = states.total();
+            split.live = split.live.saturating_add(states.live);
+            split.staged = split.staged.saturating_add(states.staged);
+            split.parked = split.parked.saturating_add(states.parked);
+            split.carried = split.carried.saturating_add(states.carried);
+            let id = handler.id();
+            let slot = if id == squallar_source::id::known::MRMS {
+                &mut split.mrms
+            } else if id == squallar_source::id::known::GMGSI {
+                &mut split.gmgsi
+            } else if id == squallar_source::id::known::MODEL_DATA {
+                &mut split.model
+            } else if id == squallar_source::id::known::LIGHTNING {
+                &mut split.glm
+            } else {
+                &mut split.other
+            };
+            *slot = slot.saturating_add(bytes);
+        }
+        split
+    }
+
     // ── Config persistence ────────────────────────────────────────────
 
     /// Keyed by the layer id **string** ([`LayerId::as_str`]) — the exact
@@ -1884,5 +1928,59 @@ mod id_cache_tests {
              registry position {}, so it is not stopping at the hit",
             expected_probes - 1,
         );
+    }
+}
+
+/// **`overlay grids`, by the handler that holds it** — the attribution
+/// [`OverlayRegistry::resident_source_bytes`] cannot give.
+///
+/// Four named terms because exactly four handlers override
+/// `SourceHandler::resident_source_bytes`; `other` is the fifth so that a
+/// gridded layer added without a term here shows up as an unattributed
+/// remainder instead of vanishing from the split while still being in the sum.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SourceResidencySplit {
+    /// `MrmsHandler`: live mosaics, staged loop granules, its retained band.
+    pub mrms: u64,
+    /// `GmgsiHandler`: live channel granules, staged loop granules, its pool.
+    pub gmgsi: u64,
+    /// `ModelDataHandler`: HRRR live grids, staged loop grids, its carry.
+    pub model: u64,
+    /// `GlmHandler`: the lightning layer's S3 granule cache.
+    pub glm: u64,
+    /// Every handler taking the trait default, which is `0` today. A non-zero
+    /// here is a new gridded layer this split does not name.
+    pub other: u64,
+    /// **The same total, cut the other way** — see
+    /// [`squallar_source::handler::SourceResidencyStates`]. Caches a pane
+    /// draws from.
+    pub live: u64,
+    /// Granules staged for loop frames, across every handler.
+    pub staged: u64,
+    /// Decode-pool blocks parked between decodes. **Read by nothing.**
+    pub parked: u64,
+    /// Grids an `OverlayState` carries that neither of its caches holds.
+    pub carried: u64,
+}
+
+impl SourceResidencySplit {
+    /// The figure `overlay grids` publishes — this split's own terms, so the
+    /// family and its decomposition can never disagree.
+    pub fn total(&self) -> u64 {
+        self.mrms
+            .saturating_add(self.gmgsi)
+            .saturating_add(self.model)
+            .saturating_add(self.glm)
+            .saturating_add(self.other)
+    }
+
+    /// The same figure reached along the state axis. **Must equal
+    /// [`Self::total`]** — two decompositions of one walk, and a build where
+    /// they differ has a handler whose states do not add to its own bytes.
+    pub fn state_total(&self) -> u64 {
+        self.live
+            .saturating_add(self.staged)
+            .saturating_add(self.parked)
+            .saturating_add(self.carried)
     }
 }

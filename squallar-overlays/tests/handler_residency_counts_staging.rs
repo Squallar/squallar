@@ -80,12 +80,22 @@ fn mentions_a_static_pool(line: &str) -> bool {
     line.contains("&'static") && line.contains("StagingPool")
 }
 
-/// The body of `fn resident_source_bytes`, by brace matching from its
-/// signature. `None` when the file has no such function at all — which for a
-/// pool-holding handler is the same defect in its worst form: a parked mosaic
-/// priced at the trait's `0`.
-fn residency_body(src: &str) -> Option<&str> {
-    let at = src.find("fn resident_source_bytes")?;
+/// **Every function a handler may price its parked block in.**
+///
+/// `resident_source_bytes` is the figure the census publishes, and a handler
+/// may answer it directly or delegate to `resident_source_states` — the split
+/// that names the same bytes by the state they sit in, whose `parked` term is
+/// where a pool's `retained_bytes()` is read. Both spellings price the block;
+/// a walk that knew only the first would redden on a handler that had done
+/// nothing wrong, and a reader would fix it by re-pointing this test.
+const RESIDENCY_FNS: [&str; 2] = ["fn resident_source_bytes", "fn resident_source_states"];
+
+/// The body of one residency function, by brace matching from its signature.
+/// `None` when the file has no such function at all — which for a pool-holding
+/// handler is the same defect in its worst form: a parked mosaic priced at the
+/// trait's `0`.
+fn residency_body<'a>(src: &'a str, signature: &str) -> Option<&'a str> {
+    let at = src.find(signature)?;
     let open = at + src[at..].find('{')?;
     let mut depth = 0usize;
     for (i, c) in src[open..].char_indices() {
@@ -160,17 +170,24 @@ fn a_handler_holding_a_staging_pool_prices_its_parked_buffer() {
     );
 
     for (file, src) in &holders {
-        let body = residency_body(src).unwrap_or_else(|| {
-            panic!(
-                "{file} retains a staging pool and has no `resident_source_bytes` \
-                 at all, so its parked grid is priced at the trait's 0",
-            )
-        });
+        // **Every residency spelling this handler has, concatenated.** The
+        // pool must be read by one of them; which one is the handler's own
+        // arrangement and not this walk's business.
+        let bodies: Vec<&str> = RESIDENCY_FNS
+            .iter()
+            .filter_map(|sig| residency_body(src, sig))
+            .collect();
+        assert!(
+            !bodies.is_empty(),
+            "{file} retains a staging pool and has no residency function at \
+             all, so its parked grid is priced at the trait's 0",
+        );
+        let body = bodies.concat();
         assert!(
             body.contains("retained_bytes"),
             "{file} retains a staging pool whose parked buffer is one whole \
              grid — 15,000,000 B for GMGSI, 49,000,000 B for MRMS — and its \
-             `resident_source_bytes` does not read it. The block is resident \
+             residency functions do not read it. The block is resident \
              whether or not anything is decoding, so the `overlay grids` census \
              the memory governor sheds against would report this layer as \
              holding less than it does, and an under-reporting census sheds \

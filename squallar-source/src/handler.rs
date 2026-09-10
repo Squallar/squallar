@@ -1533,6 +1533,67 @@ pub trait SourceHandler: Send {
     fn resident_source_bytes(&self) -> u64 {
         0
     }
+
+    /// **The same bytes, split by the STATE they are held in** — live, staged
+    /// for a loop frame, parked in a decode pool, or carried by the layer's
+    /// own `OverlayState`.
+    ///
+    /// [`Self::resident_source_bytes`] is one figure per handler, and a cut
+    /// aimed at this family needs to know which of a handler's four stores it
+    /// would take from: a live mosaic is read by hover and by every
+    /// re-raster, a staged loop granule is re-read whenever its frame
+    /// re-rasterizes, and a parked pool block is read by nothing at all. Those
+    /// are different bytes with different prices and the sum cannot tell them
+    /// apart.
+    ///
+    /// **Must agree with [`Self::resident_source_bytes`] term for term**: the
+    /// four add to exactly that figure, so the split can be quoted as a
+    /// decomposition of the published family rather than as a second opinion
+    /// about it. The default puts the whole of a handler's figure in `live`,
+    /// which is correct for every handler that takes the `0` default and for
+    /// any that holds one undifferentiated store.
+    ///
+    /// Same cost contract as the figure it decomposes: no grid contents, no
+    /// allocation, no blocking lock.
+    fn resident_source_states(&self) -> SourceResidencyStates {
+        SourceResidencyStates {
+            live: self.resident_source_bytes(),
+            staged: 0,
+            parked: 0,
+            carried: 0,
+        }
+    }
+}
+
+/// **What state a handler's decoded source bytes are held in** — see
+/// [`SourceHandler::resident_source_states`].
+///
+/// Four terms because they have four different prices to a memory cut:
+/// `parked` is read by nothing and is free to take; `staged` is re-read every
+/// time its loop frame re-rasterizes; `live` is read by hover and by every
+/// pan and zoom; `carried` is the layer's own `OverlayState` holding a grid
+/// neither cache does.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SourceResidencyStates {
+    /// The cache a pane draws from — read by hover and by every re-raster.
+    pub live: u64,
+    /// Granules staged for loop frames — re-read whenever a frame re-rasters.
+    pub staged: u64,
+    /// A decode pool's retained block. **Read by nothing** between decodes.
+    pub parked: u64,
+    /// A grid the handler's `OverlayState` holds that neither cache does.
+    pub carried: u64,
+}
+
+impl SourceResidencyStates {
+    /// The figure these decompose — must equal
+    /// [`SourceHandler::resident_source_bytes`].
+    pub fn total(&self) -> u64 {
+        self.live
+            .saturating_add(self.staged)
+            .saturating_add(self.parked)
+            .saturating_add(self.carried)
+    }
 }
 
 /// **Whether the map is being moved, or has come to rest** — the two frames
