@@ -2010,8 +2010,8 @@ fn a_poll_hands_the_drain_both_the_granule_and_the_rows() {
     );
     assert!(
         retired.iter().any(|value| value
-            .downcast_ref::<Arc<Vec<rasterize::FlashPaint>>>()
-            .is_some_and(|rows| rows.len() == 6)),
+            .downcast_ref::<GlmPaintRows>()
+            .is_some_and(|rows| rows.flashes.len() == 6)),
         "the previous granule's built paint rows must be the other",
     );
     assert!(
@@ -2072,8 +2072,8 @@ fn releasing_the_layer_hands_the_granule_and_the_live_rows_to_the_seam() {
     );
     assert!(
         retired.iter().any(|value| value
-            .downcast_ref::<Arc<Vec<rasterize::FlashPaint>>>()
-            .is_some_and(|rows| rows.len() == 12)),
+            .downcast_ref::<GlmPaintRows>()
+            .is_some_and(|rows| rows.flashes.len() == 12)),
         "the built rows must go too: nothing dispatches this layer any more, \
          so no later build would ever retire them",
     );

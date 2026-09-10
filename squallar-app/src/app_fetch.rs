@@ -4494,6 +4494,13 @@ mod overlay_extent_tests;
 #[path = "app_fetch/reports_extent_tests.rs"]
 mod reports_extent_tests;
 
+/// The lightning layer's `paints_in` against the rasterizer it mirrors: a
+/// refusal implies no ink, over the real texture planner at every scene shape
+/// the tree renders, and over a whole population as well as one flash.
+#[cfg(test)]
+#[path = "app_fetch/glm_extent_tests.rs"]
+mod glm_extent_tests;
+
 /// A non-radar loop gains a frame when its own source publishes one — the
 /// append walk read radar's slot and rejected every other layer's timeline.
 #[cfg(test)]

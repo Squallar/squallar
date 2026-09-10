@@ -343,13 +343,24 @@ impl GlmPaneState {
     }
 }
 
+/// **What one walk of a generation's flashes produces**: the rows the
+/// rasterizer paints, and the coarse index the dispatch door refuses with.
+///
+/// Two `Arc`s and not one struct behind one, because the rows go on the wire
+/// as [`rasterize::GlmStrikesInput::flashes`] and the index never leaves the
+/// frame thread. A clone is two refcount bumps.
+#[derive(Debug, Clone)]
+pub(crate) struct GlmPaintRows {
+    pub(crate) flashes: Arc<Vec<rasterize::FlashPaint>>,
+    pub(crate) occupancy: Arc<rasterize::FlashOccupancy>,
+}
+
 pub(crate) struct GlmHandler {
     pub state: OverlayState<Arc<GlmSlab>, Assembled>,
     /// **The paint rows of the current granule, built once per poll** and
     /// handed to every dispatch since as a refcount clone — see
     /// [`GlmHandler::paint_input`].
-    pub(crate) flash_memo:
-        crate::render::signature_memo::BuiltMemo<Arc<Vec<rasterize::FlashPaint>>>,
+    pub(crate) flash_memo: crate::render::signature_memo::BuiltMemo<GlmPaintRows>,
     /// **The registry's own copy**, used only where no pane is supplied. The
     /// config swap keeps it in step until WO-M10c deletes the swap; every
     /// answer prefers [`PaneRef::state`] when there is one.
@@ -431,7 +442,7 @@ impl GlmHandler {
             // argument, one `dealloc`, would say the opposite.
             state: OverlayState::parked(),
             flash_memo: crate::render::signature_memo::BuiltMemo::new(
-                crate::render::footprint::glm_flash_rows,
+                crate::render::footprint::glm_paint_rows,
             ),
             defaults: GlmPaneState::new(false),
             cache: Arc::new(GlmStore::default()),
@@ -492,25 +503,9 @@ impl GlmHandler {
         if self.state.data.is_empty() {
             return None;
         }
-        let flashes = self
-            .flash_memo
-            .get_or_build(self.state.data_generation, 0, || {
-                Some(Arc::new(
-                    self.state
-                        .data
-                        .flashes
-                        .iter()
-                        .map(|f| rasterize::FlashPaint {
-                            lat: f.lat,
-                            lon: f.lon,
-                            time: f.time,
-                            energy: f.energy,
-                        })
-                        .collect::<Vec<_>>(),
-                ))
-            })?;
+        let built = self.built_rows()?;
         Some(rasterize::GlmStrikesInput {
-            flashes,
+            flashes: built.flashes,
             zoom: ctx.zoom,
             is_dark: ctx.is_dark,
             time_window_secs: self.view(pane).time_window_secs,
@@ -521,6 +516,45 @@ impl GlmHandler {
             now: ctx.as_of,
             device_scale: ctx.device_scale,
         })
+    }
+
+    /// **The generation's paint rows and its occupancy index, off one walk.**
+    ///
+    /// The index is the dispatch door's — [`Self::paints_in`] cannot walk
+    /// 250,000 flashes on the frame thread — and it is built *here*, inside
+    /// the walk that was already touching every flash once per generation, so
+    /// what it adds is a band index, a bit and two integer compares per row
+    /// rather than a second pass. The two travel as one memo row for the same
+    /// reason: one generation key, one build, one park, one price.
+    ///
+    /// **Nothing is built for a refusal that would not have been built
+    /// anyway.** A door that misses builds the rows a dispatch was about to
+    /// build; a door that hits has already built them, because the miss that
+    /// built them was the door's own.
+    fn built_rows(&self) -> Option<GlmPaintRows> {
+        self.flash_memo
+            .get_or_build(self.state.data_generation, 0, || {
+                let mut occupancy = rasterize::FlashOccupancy::default();
+                let flashes = self
+                    .state
+                    .data
+                    .flashes
+                    .iter()
+                    .map(|f| {
+                        occupancy.insert(f.lat, f.lon, f.time);
+                        rasterize::FlashPaint {
+                            lat: f.lat,
+                            lon: f.lon,
+                            time: f.time,
+                            energy: f.energy,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                Some(GlmPaintRows {
+                    flashes: Arc::new(flashes),
+                    occupancy: Arc::new(occupancy),
+                })
+            })
     }
 
     /// Log window-gap *changes* only, and keep the current set for the panel.
@@ -1019,6 +1053,51 @@ impl OverlayHandler for GlmHandler {
                 .downcast_ref::<GlmFlashItem>()
                 .is_some_and(|f| f.index < count)
         });
+    }
+
+    /// **The layer's own extent test, one field before the raster.**
+    ///
+    /// [`Self::has_data`] is `!self.state.data.is_empty()` — one flash
+    /// anywhere the two satellites see — so a pane over a quiet sky dispatched
+    /// a full-size raster to be told nothing projected onto it. Measured on a
+    /// 420 s six-pane HEAVY6 leg: **10,020 of this layer's 10,020 blanks were
+    /// `outside-view`**, 97.0 % of every `outside-view` blank left in the app
+    /// after the storm reports' door landed, each one an offloaded job, a
+    /// worker turn, a funnel slot and a reply for an empty picture. This layer
+    /// re-rasters on the pane's clock (`RerenderReason::ContentSweeping`) and
+    /// cannot use `as_of_signature`, because the fade ramp makes no two
+    /// instants equal — so the count is a rate, not a backlog.
+    ///
+    /// The cull is [`rasterize::FlashOccupancy::any_paints_in`], which states
+    /// the superset argument term by term. **The rows are not built to answer
+    /// it and neither is the index**: both come off
+    /// [`Self::built_rows`]'s memo, whose miss is the walk a dispatch was
+    /// about to pay anyway.
+    ///
+    /// **An empty row set answers `true`.** `prepare_job` returning `None` is
+    /// a failed render and not an empty extent, and the trait requires
+    /// `has_data` to answer `false` exactly when it does; refusing here
+    /// instead would route an empty slab through the blank delivery and give
+    /// that pairing a second, disagreeing spelling.
+    fn paints_in(
+        &self,
+        bounds: &squallar_geo::GeoBounds,
+        ctx: &RasterizeContext,
+        pane: &PaneRef<'_>,
+    ) -> bool {
+        if self.state.data.is_empty() {
+            return true;
+        }
+        let Some(built) = self.built_rows() else {
+            return true;
+        };
+        built.occupancy.any_paints_in(
+            bounds,
+            ctx.zoom,
+            ctx.device_scale,
+            ctx.as_of,
+            self.view(pane).time_window_secs,
+        )
     }
 
     fn prepare_job(&self, ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {

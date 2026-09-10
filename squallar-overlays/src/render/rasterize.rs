@@ -1823,7 +1823,35 @@ const REPORT_PAD_FLOOR_FRACTION: f64 = 0.05;
 /// it: the symbols, and so the slack, are drawn at the clamped scale, while
 /// the texels are laid out at the raw one.
 fn report_pad(bounds: &GeoBounds, zoom: f64, device_scale: f32) -> Option<(f64, f64)> {
+    symbol_pad(
+        bounds,
+        zoom,
+        device_scale,
+        REPORT_SLACK_TEXELS * f64::from(sane_device_scale(device_scale)),
+    )
+}
+
+/// The ground a rasterizer's pixel slack covers, for a slack already stated
+/// **in texels at the scale the symbols are drawn at** — which is what
+/// `sane_device_scale` names in both callers and why it is applied by them
+/// rather than here.
+///
+/// The conversion and both margins are [`report_pad`]'s, whose doc states
+/// them; this is that body with the one term that differs between the two
+/// symbol layers — how far outside the texture each admits an item — passed
+/// in. **One spelling, on purpose:** a second copy that disagreed would refuse
+/// a raster its own rasterizer would have painted, which is the one direction
+/// `SourceHandler::paints_in` may not be wrong in.
+fn symbol_pad(
+    bounds: &GeoBounds,
+    zoom: f64,
+    device_scale: f32,
+    slack_texels: f64,
+) -> Option<(f64, f64)> {
     if !zoom.is_finite() || !device_scale.is_finite() || device_scale <= 0.0 {
+        return None;
+    }
+    if !slack_texels.is_finite() || slack_texels < 0.0 {
         return None;
     }
     let deg_per_point = 360.0 / (2f64.powf(zoom) * 256.0);
@@ -1831,8 +1859,7 @@ fn report_pad(bounds: &GeoBounds, zoom: f64, device_scale: f32) -> Option<(f64, 
         return None;
     }
     let texels_per_point = f64::from(device_scale);
-    let slack_scale = f64::from(sane_device_scale(device_scale)) / texels_per_point;
-    let lon_pad = REPORT_SLACK_TEXELS * slack_scale * deg_per_point * REPORT_PAD_HEADROOM;
+    let lon_pad = slack_texels / texels_per_point * deg_per_point * REPORT_PAD_HEADROOM;
 
     let mb = MercatorBounds::from_geo(bounds);
     let lon_floor = (bounds.max_lon - bounds.min_lon).abs() * REPORT_PAD_FLOOR_FRACTION;
@@ -1980,6 +2007,310 @@ pub struct GlmStrikesInput {
 
 squallar_source::impl_job_input!(GlmStrikesInput);
 
+/// **How far outside the texture [`rasterize_glm_strikes`] admits a flash, in
+/// texels** — its own `base_size`, which is both the bolt's drawn size and the
+/// reach of its projection cull, so there is exactly one number and one
+/// spelling of it.
+///
+/// ~12 points at zoom 6, clamped to 6-20 points, then taken into texels at the
+/// clamped device scale the symbols are drawn at.
+fn glm_base_size(zoom: f64, device_scale: f32) -> f32 {
+    (zoom as f32 * 2.0).clamp(6.0, 20.0) * sane_device_scale(device_scale)
+}
+
+/// The ground [`rasterize_glm_strikes`]'s pixel slack covers — [`symbol_pad`]
+/// with this layer's own slack, which unlike the storm reports' is a function
+/// of the zoom.
+fn glm_pad(bounds: &GeoBounds, zoom: f64, device_scale: f32) -> Option<(f64, f64)> {
+    symbol_pad(
+        bounds,
+        zoom,
+        device_scale,
+        f64::from(glm_base_size(zoom, device_scale)),
+    )
+}
+
+/// 1° latitude bands, index `lat + 90` floored into `0..180`.
+const OCC_LAT_BANDS: usize = 180;
+/// 1° longitude cells, index `lon.rem_euclid(360)` floored into `0..360`.
+const OCC_LON_CELLS: usize = 360;
+/// The words one band's longitude bitmap takes.
+const OCC_LON_WORDS: usize = OCC_LON_CELLS.div_ceil(64);
+/// **How many cells of grid the query dilates its box by, per side.**
+///
+/// Not a second opinion about the pad, which is stated in ground and is
+/// [`symbol_pad`]'s. This is about the *discretization*: the index places a
+/// flash by `lon.rem_euclid(360.0)` and a query places the box's edges by the
+/// same call on a number that reached it through
+/// [`MercatorBounds::wrap_lon`] and [`grow_bounds`]'s Mercator round trip. The
+/// two spellings agree exactly except within an ulp of a cell boundary, where
+/// they can name adjacent cells; one cell of dilation is more ground than any
+/// such disagreement can cross.
+///
+/// **It is margin and not a correction**, and the tamper that shows it is the
+/// pair `a_refused_flash_could_not_have_painted_ink` was run under: this at
+/// zero with `REPORT_PAD_HEADROOM` at 1.0 and `REPORT_PAD_FLOOR_FRACTION` at
+/// 0.0 — the exact conversion, every margin gone — is GREEN over all 144
+/// scenes, and one cell NARROWER than the exact box is RED. So what the suite
+/// needs is the cell arithmetic, and this is headroom over it.
+const OCC_DILATION_CELLS: i64 = 1;
+
+/// **Where the retained flashes are, coarsely, so the dispatch door can refuse
+/// a raster without walking them.**
+///
+/// [`GlmHandler::paints_in`] cannot afford the shape the storm reports' door
+/// takes. That predicate is a linear scan over a population of hundreds; this
+/// layer's population is the 250,000-row retention ceiling — measured
+/// 244,877-247,919 rows resident — and the same scan at 247,000 rows measures
+/// **0.518 ms on the frame thread** (release, best of five, 2.10 ns a row),
+/// which is disqualifying for a mechanism whose whole purpose is to save an
+/// offloaded job.
+///
+/// So the walk happens once per data generation instead, inside the one
+/// [`crate::render::handlers::glm`] already runs to build its paint rows, and
+/// what a dispatch reads is this: a 1°×1° occupancy bitmap of the globe with
+/// the time extent of each of its words beside it. **0.614-0.627 ms added to
+/// that once-per-generation walk** — which is a 20 s poll apart and lands on a
+/// frame already paying 0.795-0.842 ms for the rows, so the frame it lands on
+/// stays inside the 4 ms budget — and a query is `bands × OCC_LON_WORDS`
+/// masked word tests: **114-125 ns refused, 114 ns admitted, 352 ns for a view
+/// of the whole world**, which is the bound and is an admission anyway.
+///
+/// # It answers a superset of what the rasterizer inks
+///
+/// A cell is marked when a flash is anywhere inside it and a word's extent
+/// spans every flash in the word, so "occupied and in time" is implied by, and
+/// strictly weaker than, "a flash is here". Three things make that hold rather
+/// than merely sound:
+///
+/// * **A flash the index cannot place sets [`Self::unplaced`]**, and every
+///   query then admits. A non-finite latitude or longitude has no cell — and
+///   `as usize` would saturate it into cell 0, which is not a superset of
+///   anywhere else — so the index stops claiming to describe the rows.
+/// * **The band range is unioned with the raw box.** `grow_bounds` pads in
+///   Mercator, and `MercatorBounds::from_geo` clamps to Web Mercator's ±85.05°,
+///   so a box reaching past that limit comes back *narrower* than it went in.
+/// * **The time interval is widened a second at each end**, because the
+///   rasterizer's own window test is `f64` seconds off an integer millisecond
+///   subtraction and this one is integer milliseconds.
+///
+/// # What it is not
+///
+/// It is not a spatial *filter* — nothing here decides which flashes are
+/// drawn, and the rasterizer's loop is untouched. It answers one bit for a
+/// whole picture, and the only use of that bit is to skip a job that would
+/// have come back blank.
+#[derive(Debug, Clone)]
+pub struct FlashOccupancy {
+    /// Bit `c % 64` of `cells[band * OCC_LON_WORDS + c / 64]` is "a flash sits
+    /// in 1° band `band`, 1° cell `c`".
+    cells: Box<[u64]>,
+    /// `(earliest, latest)` flash time in the matching `cells` word,
+    /// `(MAX, MIN)` while the word is empty. **Per word and not per cell**:
+    /// 1,080 slots rather than 64,800, and a word's extent spans a superset of
+    /// any one of its cells'.
+    ///
+    /// `NaiveDateTime` and not milliseconds, because `timestamp_millis` is a
+    /// multiply chain and this is compared, not arithmetic — so the conversion
+    /// belongs once per query and not once per retained flash.
+    times: Box<[(chrono::NaiveDateTime, chrono::NaiveDateTime)]>,
+    /// A flash with a non-finite position, which this index does not describe.
+    unplaced: bool,
+    /// How many flashes were placed — zero only for an empty row set.
+    placed: usize,
+}
+
+impl Default for FlashOccupancy {
+    fn default() -> Self {
+        Self {
+            cells: vec![0u64; OCC_LAT_BANDS * OCC_LON_WORDS].into_boxed_slice(),
+            times: vec![
+                (chrono::NaiveDateTime::MAX, chrono::NaiveDateTime::MIN);
+                OCC_LAT_BANDS * OCC_LON_WORDS
+            ]
+            .into_boxed_slice(),
+            unplaced: false,
+            placed: 0,
+        }
+    }
+}
+
+/// Which 1° band a latitude falls in — **monotone and total**, which is what
+/// makes a query's band range cover every flash inside the query's latitudes.
+///
+/// `as i64` and not `floor()`: the cast truncates toward zero, which differs
+/// from a floor only below `-90°`, and there the clamp answers `0` either way.
+#[inline]
+fn occ_band(lat: f64) -> usize {
+    ((lat + 90.0) as i64).clamp(0, OCC_LAT_BANDS as i64 - 1) as usize
+}
+
+/// Which 1° cell a longitude falls in, in the `[0, 360)` frame the index is
+/// laid out in.
+///
+/// **The two comparisons are there instead of a division.** `rem_euclid` on
+/// `f64` is a real `fdiv`, this runs once per retained flash, and every
+/// longitude a GLM granule carries is already inside one of the two shifted
+/// ranges — the fallback is for a row no product produces and is kept because
+/// a wrong cell is not a slow cell, it is a missing overlay.
+#[inline]
+fn occ_cell(lon: f64) -> usize {
+    let normalized = if (0.0..360.0).contains(&lon) {
+        lon
+    } else if (-360.0..0.0).contains(&lon) {
+        lon + 360.0
+    } else {
+        lon.rem_euclid(360.0)
+    };
+    (normalized as i64).clamp(0, OCC_LON_CELLS as i64 - 1) as usize
+}
+
+impl FlashOccupancy {
+    /// Bytes this index owns on the heap — its two fixed tables, whose size is
+    /// a function of the grid alone and not of the row count.
+    pub fn heap_bytes(&self) -> u64 {
+        (std::mem::size_of_val(&*self.cells) + std::mem::size_of_val(&*self.times)) as u64
+    }
+
+    /// Record one flash. Called once per row of the generation, inside the walk
+    /// that builds the paint rows.
+    #[inline]
+    pub fn insert(&mut self, lat: f64, lon: f64, time: chrono::NaiveDateTime) {
+        if !lat.is_finite() || !lon.is_finite() {
+            self.unplaced = true;
+            return;
+        }
+        let cell = occ_cell(lon);
+        let idx = occ_band(lat) * OCC_LON_WORDS + cell / 64;
+        self.cells[idx] |= 1u64 << (cell % 64);
+        let slot = &mut self.times[idx];
+        if time < slot.0 {
+            slot.0 = time;
+        }
+        if time > slot.1 {
+            slot.1 = time;
+        }
+        self.placed += 1;
+    }
+
+    /// Whether **any** retained flash could put ink in a texture over
+    /// `bounds` — the predicate `GlmHandler::paints_in` is built from, and the
+    /// mirror of the three `continue`s at the head of
+    /// [`rasterize_glm_strikes`]'s loop.
+    ///
+    /// # What it mirrors, term by term
+    ///
+    /// * The geographic cull is that loop's: latitude inside the box, and a
+    ///   longitude whose `wrap_lon` representation is inside it. Both are
+    ///   carried out to the reach of the loop's *projection* cull by
+    ///   [`glm_pad`] and [`grow_bounds`], which is looser than the loop's own
+    ///   pre-projection test on both axes and is therefore the safe one to
+    ///   mirror.
+    /// * **The as-of cull and the fade window are one interval.** The loop
+    ///   drops a flash later than the depicted instant and a flash older than
+    ///   `time_window_secs`, so what can ink is `[as_of - window, as_of]` and
+    ///   nothing else. This is the finest-grained as-of dependence any layer
+    ///   has — the fade ramp makes a flash's *age* reach the pixels — and it
+    ///   is exactly why this layer cannot use `as_of_signature`. It does not
+    ///   stop the interval from being the whole of the loop's time test: a
+    ///   flash inside the interval may be drawn dim, but "dim" is ink and
+    ///   `time_decay_color` never returns a zero alpha.
+    ///
+    /// # Fail-open, by enumeration
+    ///
+    /// `true` — dispatch — for a slack the zoom or the density cannot describe
+    /// ([`glm_pad`] `None`), a non-finite or negative window, a box whose own
+    /// edges are inverted or non-finite, and a row set holding a flash this
+    /// index could not place. A wrong `true` costs one raster that comes back
+    /// blank, which is the behaviour without this method; a wrong `false`
+    /// **clears a pane that should have had ink**.
+    pub fn any_paints_in(
+        &self,
+        bounds: &GeoBounds,
+        zoom: f64,
+        device_scale: f32,
+        as_of: chrono::NaiveDateTime,
+        time_window_secs: f64,
+    ) -> bool {
+        if self.unplaced {
+            return true;
+        }
+        if self.placed == 0 {
+            return false;
+        }
+        if !time_window_secs.is_finite() || time_window_secs < 0.0 {
+            return true;
+        }
+        let Some((lon_pad, merc_pad)) = glm_pad(bounds, zoom, device_scale) else {
+            return true;
+        };
+        let grown = grow_bounds(bounds, lon_pad, merc_pad);
+        // The union, not `grown` alone: see the type's note on Web Mercator's
+        // latitude clamp.
+        let min_lat = grown.min_lat.min(bounds.min_lat);
+        let max_lat = grown.max_lat.max(bounds.max_lat);
+        let lon_lo = bounds.min_lon - lon_pad;
+        let lon_hi = bounds.max_lon + lon_pad;
+        if !min_lat.is_finite()
+            || !max_lat.is_finite()
+            || !lon_lo.is_finite()
+            || !lon_hi.is_finite()
+            || max_lat < min_lat
+            || lon_hi < lon_lo
+        {
+            return true;
+        }
+
+        // The interval the rasterizer's two time culls admit, **widened a
+        // second at each end** for the `f64`-seconds-versus-integer-
+        // milliseconds seam described on the type. A window or an `as_of` that
+        // walks off the calendar saturates to the far end of it, which is the
+        // open direction and therefore the safe one.
+        let slack = chrono::TimeDelta::seconds(1);
+        let hi = as_of
+            .checked_add_signed(slack)
+            .unwrap_or(chrono::NaiveDateTime::MAX);
+        let lo = chrono::TimeDelta::try_milliseconds((time_window_secs * 1000.0) as i64)
+            .and_then(|window| as_of.checked_sub_signed(window))
+            .and_then(|edge| edge.checked_sub_signed(slack))
+            .unwrap_or(chrono::NaiveDateTime::MIN);
+
+        let mut mask = [0u64; OCC_LON_WORDS];
+        if lon_hi - lon_lo >= 360.0 {
+            // Every longitude is inside the box, so `wrap_lon` can carry any
+            // flash into it.
+            for word in mask.iter_mut() {
+                *word = u64::MAX;
+            }
+        } else {
+            let a0 = lon_lo.rem_euclid(360.0);
+            let c0 = a0.floor() as i64 - OCC_DILATION_CELLS;
+            let c1 = (a0 + (lon_hi - lon_lo)).floor() as i64 + OCC_DILATION_CELLS;
+            for c in c0..=c1 {
+                let cell = c.rem_euclid(OCC_LON_CELLS as i64) as usize;
+                mask[cell / 64] |= 1u64 << (cell % 64);
+            }
+        }
+
+        let band_lo = occ_band(min_lat).saturating_sub(OCC_DILATION_CELLS as usize);
+        let band_hi = (occ_band(max_lat) + OCC_DILATION_CELLS as usize).min(OCC_LAT_BANDS - 1);
+        for band in band_lo..=band_hi {
+            let base = band * OCC_LON_WORDS;
+            let row = &self.cells[base..base + OCC_LON_WORDS];
+            for (word, (occupied, admitted)) in row.iter().zip(mask.iter()).enumerate() {
+                if occupied & admitted == 0 {
+                    continue;
+                }
+                let (first, last) = self.times[base + word];
+                if last >= lo && first <= hi {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
 pub fn rasterize_glm_strikes(
     input: &GlmStrikesInput,
     bounds: &GeoBounds,
@@ -2013,9 +2344,7 @@ pub fn rasterize_glm_strikes(
     let h = height as f32;
     let mut hit_cells = HitCells::new(width, height);
 
-    // ~12 points at zoom 6, clamped to 6-20 points, then taken into texels.
-    let zoom_f32 = *zoom as f32;
-    let base_size = (zoom_f32 * 2.0).clamp(6.0, 20.0) * sane_device_scale(*device_scale);
+    let base_size = glm_base_size(*zoom, *device_scale);
 
     let mut tally = ItemTally::default();
 

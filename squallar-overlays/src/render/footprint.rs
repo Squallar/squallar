@@ -360,10 +360,14 @@ pub(crate) fn reports_hit_slab(
 /// taken off is the same layer's item data and a separate 48 bytes a flash —
 /// two disjoint figures over one granule, which is the whole reason the item
 /// and parked families are read apart.
-pub(crate) fn glm_flash_rows(
-    rows: &std::sync::Arc<Vec<crate::render::rasterize::FlashPaint>>,
-) -> u64 {
-    arc_body(rows)
+pub(crate) fn glm_paint_rows(rows: &crate::render::handlers::glm::GlmPaintRows) -> u64 {
+    // **Both halves, because one walk built both and one park frees both.**
+    // The index is two fixed tables whose size is a function of the 1° grid
+    // alone — 34,560 B, whatever the row count — so it is a constant beside a
+    // figure in the megabytes and is on the row anyway: a census family whose
+    // purpose is to find what nobody counts may not itself stop counting at a
+    // size it judges small.
+    arc_body(&rows.flashes).saturating_add(rows.occupancy.heap_bytes())
 }
 
 /// The METAR job's own input, for the memo that holds whole jobs rather than
