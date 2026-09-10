@@ -64,9 +64,19 @@ impl SweepGates {
     /// The gates of the sweep `product` at `elevation_deg` was drawn from, or
     /// `None` where this volume cannot answer for that picture.
     ///
-    /// **Takes the volume and does not keep it.** The sweep's moments are
-    /// cloned out and `scan` is released at the end of this call, which is
-    /// what lets the loop download cache's eviction actually free a volume.
+    /// **Takes the volume and does not keep the `Scan`.** The sweep's moments
+    /// are cloned out and `scan` is released at the end of this call, so the
+    /// loop download cache's eviction is free to drop the volume.
+    ///
+    /// It does **not** follow that the eviction frees the volume's bytes, and
+    /// this doc said it did until 2026-09-09 — contradicting
+    /// [`Self::bytes`]'s own note eighty lines above, which has been right
+    /// since `7db617aa6`. `get_moment(radial).cloned()` clones a `MomentData`
+    /// whose `values` is a `GateBuffer` = `Arc<Vec<u8>>`, so what is cloned
+    /// out is a refcount per gate array. Until every other holder lets go,
+    /// these gates stay resident and this frame is one of the things keeping
+    /// them so.
+    ///
     /// One walk of one sweep's radials, once per landed loop frame.
     pub fn new(scan: &Scan, product: RadarProduct, elevation_deg: f32) -> Option<Self> {
         if !product.is_wire_moment() {

@@ -508,3 +508,185 @@ fn a_polar_frames_plane_is_counted_on_the_host_and_a_rasters_pixels_are_not() {
         (narrow_bytes + wide_bytes) as u64
     );
 }
+
+/// A one-sweep, one-radial, one-gate volume, so a `SweepGates` built from it
+/// prices something rather than nothing. Trimmed from
+/// `loop_decoded_census_tests`' fixture, which is a private helper of another
+/// module.
+fn one_gate_volume() -> Arc<nexrad_model::data::Scan> {
+    use nexrad_model::data::{MomentData, Radial, RadialStatus, Scan, Sweep};
+    let radial = Radial::new(
+        0,
+        0,
+        0.0,
+        1.0,
+        RadialStatus::ElevationStart,
+        1,
+        TILT,
+        Some(MomentData::from_fixed_point(
+            1,
+            0,
+            250,
+            8,
+            2.0,
+            66.0,
+            vec![100],
+        )),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    Arc::new(Scan::new(
+        nexrad_model::data::VolumeCoveragePattern::new(
+            212,
+            0,
+            0.5,
+            nexrad_model::data::PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            Vec::new(),
+        ),
+        vec![Sweep::new(1, vec![radial])],
+    ))
+}
+
+/// A plan-view picture whose hover holds a real sweep, so its
+/// `pinned_volume_bytes` is positive.
+fn picture_pinning_a_sweep(ctx: &egui::Context) -> LoopFrameImage {
+    let scan = one_gate_volume();
+    let sweep = squallar_radar::hover::SweepGates::new(&scan, RadarProduct::Reflectivity, TILT)
+        .expect("a reflectivity sweep at the fixture's own tilt");
+    let mut image = picture(ctx)
+        .plan_view()
+        .expect("`picture` is a plan view")
+        .clone();
+    image.hover = Arc::new(squallar_radar::hover::HoverSource::from_volume(
+        squallar_radar::render::polar::PolarField::default(),
+        Some(sweep),
+    ));
+    LoopFrameImage::PlanView(image)
+}
+
+/// **A frame whose volume is still cached is not sole; the same frame once the
+/// cache has let go IS.**
+///
+/// The whole point of the figure. `pinned_volume_bytes` counts this frame's
+/// sweep gates either way, and since `7db617aa6` those gates are the volume's
+/// own `Arc<Vec<u8>>`s — so while the volume is cached, dropping the frame
+/// returns a refcount and nothing else. Only the second reading is bytes a
+/// drop would actually give back.
+#[test]
+fn a_frames_sweep_is_sole_only_once_the_cache_has_let_the_volume_go() {
+    let ctx = egui::Context::default();
+    let mut store = LoopFrameStore::default();
+    let image = picture_pinning_a_sweep(&ctx);
+    let pinned = store_pinned(&image);
+    assert!(
+        pinned > 0,
+        "the fixture has to pin something or both readings below are zero \
+         for the wrong reason",
+    );
+    store.insert(
+        LoopFrameKey::plan_view(reflectivity(SITE, TILT), ts(4)),
+        image,
+        0,
+    );
+    assert_eq!(store.pinned_volume_bytes(), pinned);
+
+    // The cache still has it: the gates are its bytes, not the frame's.
+    let cached = store.sole_pinned_volume_bytes(|_, _| true);
+    assert_eq!(
+        (cached.bytes, cached.frames),
+        (0, 0),
+        "a frame whose volume is cached must not be counted sole",
+    );
+
+    // The cache let go: this frame is now what keeps the gates alive.
+    let evicted = store.sole_pinned_volume_bytes(|_, _| false);
+    assert_eq!(
+        (evicted.bytes, evicted.frames),
+        (pinned, 1),
+        "a frame whose volume is gone holds its gates on its own",
+    );
+}
+
+/// **The predicate is asked about the frame's OWN site and instant**, not about
+/// the store or the newest entry.
+///
+/// A cache that still holds 18:04 and has dropped 18:09 must leave the first
+/// uncounted and count the second. Spelled with two entries because a
+/// predicate that ignored its arguments and answered for the store as a whole
+/// would pass the test above in both directions.
+#[test]
+fn the_sole_walk_asks_the_cache_about_each_frames_own_instant() {
+    let ctx = egui::Context::default();
+    let mut store = LoopFrameStore::default();
+    let kept = picture_pinning_a_sweep(&ctx);
+    let gone = picture_pinning_a_sweep(&ctx);
+    let each = store_pinned(&kept);
+    store.insert(
+        LoopFrameKey::plan_view(reflectivity(SITE, TILT), ts(4)),
+        kept,
+        0,
+    );
+    store.insert(
+        LoopFrameKey::plan_view(reflectivity(SITE, TILT), ts(9)),
+        gone,
+        0,
+    );
+    let asked = std::cell::RefCell::new(Vec::new());
+    let sole = store.sole_pinned_volume_bytes(|site, ts| {
+        asked.borrow_mut().push((site.to_string(), *ts));
+        *ts == self::ts(4)
+    });
+    assert_eq!(
+        (sole.bytes, sole.frames),
+        (each, 1),
+        "exactly the frame the cache dropped is sole",
+    );
+    let asked = asked.into_inner();
+    assert_eq!(
+        asked,
+        vec![(SITE.to_string(), ts(4)), (SITE.to_string(), ts(9))],
+        "the walk asks once per entry, with that entry's own site and instant",
+    );
+}
+
+/// **The fires counter advances on every walk, including one that finds
+/// nothing.**
+///
+/// `sole pinned 0 B` is the healthy reading and is also what a walk that never
+/// ran prints, so the counter is the only thing separating them — and a
+/// counter that only advanced when it found something would be exactly as
+/// blind as no counter at all.
+#[test]
+fn the_fires_counter_advances_even_on_a_walk_that_finds_nothing() {
+    let store = LoopFrameStore::default();
+    let before = sole_walks();
+    let empty = store.sole_pinned_volume_bytes(|_, _| false);
+    assert_eq!((empty.bytes, empty.frames), (0, 0));
+    let after = sole_walks();
+    assert!(
+        after > before,
+        "an empty store still walked: {before} -> {after}",
+    );
+}
+
+/// [`LoopFrameStore::pinned_volume_bytes`] for one loose picture.
+fn store_pinned(image: &LoopFrameImage) -> u64 {
+    image
+        .plan_view()
+        .expect("a plan view")
+        .hover
+        .pinned_volume_bytes() as u64
+}

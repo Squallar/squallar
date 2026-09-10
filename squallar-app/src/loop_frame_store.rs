@@ -38,6 +38,7 @@
 use chrono::NaiveDateTime;
 use squallar_egui::pane::{LoopFrameImage, RenderTarget, SectionLoopKey};
 use squallar_radar::types::RenderView;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// **What one 2D loop frame is a picture of.** The plan-view half is the
 /// [`RenderTarget`] — site, product, and the tilt where the view says it
@@ -350,18 +351,31 @@ impl LoopFrameStore {
     /// the 5.8 KiB of its geometry, invisible to the census that gates this
     /// campaign's decisions.
     ///
-    /// **It overlaps no other family.** The moments are cloned out of the
+    /// **It is an UPPER BOUND and it overlaps `loop scans`.** This paragraph
+    /// used to say the opposite — that the moments are cloned out of the
     /// volume at extraction, so a stored frame shares no allocation with the
-    /// loop download cache, and dropping the frame is the only thing that
-    /// frees them. Two frames drawn from one volume hold two sweeps and are
-    /// counted twice because there are two: this is a partition of real
-    /// bytes, not a bound.
+    /// loop download cache, and that dropping the frame is the only thing
+    /// that frees them, making the figure "a partition of real bytes, not a
+    /// bound". `7db617aa6` made that false and left the sentence standing:
+    /// `nexrad_model::data::GateBuffer` is an `Arc<Vec<u8>>`, and
+    /// `SweepGates::new` builds its radials with `get_moment(..).cloned()`,
+    /// which is now **a refcount bump per gate array rather than a copy**. So
+    /// while the volume a frame was drawn from is still cached, these bytes
+    /// are that volume's bytes and this figure names them a second time.
+    /// [`Self::sole_pinned_volume_bytes`] is the lower bound beside it, and
+    /// the one that answers "what would dropping these frames return".
+    ///
+    /// Two frames drawn from one volume still hold two sweeps and are counted
+    /// twice; that part was always true.
     ///
     /// Which is why it has to exist separately from the cache's own figure:
-    /// `App::retain_loop_volumes` evicts by the timestamps panes currently
-    /// list, while a stored frame is kept by whether a pane still holds it,
-    /// so **a frame can outlive its cache entry** and these bytes would then
-    /// be named by nothing.
+    /// [`crate::app::App::evict_unneeded_loop_scans`] evicts by the
+    /// timestamps panes currently list, while a stored frame is kept by
+    /// whether a pane still holds it, so **a frame can outlive its cache
+    /// entry** and these bytes would then be named by nothing. (That sentence
+    /// named `App::retain_loop_volumes` until 2026-09-09, which does not
+    /// exist and never has — the second fabricated witness in this one doc
+    /// comment, whose own paragraph above confesses to the first.)
     ///
     /// O(entries), O(1) apiece — every sweep was priced once at extraction.
     pub fn pinned_volume_bytes(&self) -> u64 {
@@ -377,7 +391,73 @@ impl LoopFrameStore {
             sum.saturating_add(bytes)
         })
     }
+
+    /// **Of [`Self::pinned_volume_bytes`], the part dropping the frames would
+    /// actually return** — the frames whose volume the loop download cache
+    /// has already let go of.
+    ///
+    /// `cache_holds` answers, for one frame's own `(site, timestamp)`,
+    /// whether that cache still has the volume. Where it does, the frame's
+    /// gate arrays ARE that volume's bytes (see
+    /// [`Self::pinned_volume_bytes`] on `7db617aa6`) and dropping the frame
+    /// decrements a refcount and returns nothing. Where it does not, this
+    /// frame is the cache-side last holder and its bytes are real.
+    ///
+    /// **Sole against that cache, not against the process.** A volume the
+    /// still inventory, the per-site latest or a chunk feed also names is
+    /// gone from the loop cache and counted here while another family still
+    /// holds it, so this remains an over-count — a much tighter one. Closing
+    /// it needs the pointer union `App::loop_decoded_census` walks, which
+    /// costs a `Vec` of every live scan pointer; this walk deliberately does
+    /// not repeat that, because its whole value is being cheap enough to run
+    /// on the same tick as the census.
+    ///
+    /// O(entries), one cache lookup apiece, and **no radial walk** — the
+    /// property that keeps it off the frame thread's cost. `frames` is the
+    /// entries it found sole, so a zero can be read as "none was sole"
+    /// rather than "the walk found no entries".
+    pub fn sole_pinned_volume_bytes(
+        &self,
+        cache_holds: impl Fn(&str, &NaiveDateTime) -> bool,
+    ) -> SolePinned {
+        SOLE_WALKS.fetch_add(1, Ordering::Relaxed);
+        let mut out = SolePinned::default();
+        for entry in &self.entries {
+            let squallar_egui::pane::LoopFrameImage::PlanView(image) = &entry.image else {
+                continue;
+            };
+            let bytes = image.hover.pinned_volume_bytes() as u64;
+            if bytes == 0 || cache_holds(&entry.key.target.site, &entry.key.timestamp) {
+                continue;
+            }
+            out.bytes = out.bytes.saturating_add(bytes);
+            out.frames += 1;
+        }
+        out
+    }
 }
+
+/// [`LoopFrameStore::sole_pinned_volume_bytes`]'s two figures.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SolePinned {
+    /// Sweep-gate bytes held by frames whose volume the loop cache has let go.
+    pub bytes: u64,
+    /// The entries those bytes came from.
+    pub frames: u64,
+}
+
+/// Walks [`LoopFrameStore::sole_pinned_volume_bytes`] has made since launch.
+///
+/// **A fires counter, and it is not decoration.** Zero sole bytes is a
+/// legitimate healthy reading — every frame's volume still cached — and is
+/// also exactly what a walk that never ran reports. Without this figure the
+/// two are the same line, which is how several mechanisms in this tree came
+/// to be believed working while executing zero times.
+pub(crate) fn sole_walks() -> u64 {
+    SOLE_WALKS.load(Ordering::Relaxed)
+}
+
+static SOLE_WALKS: AtomicU64 = AtomicU64::new(0);
 
 /// Free pictures the store let go of.
 ///

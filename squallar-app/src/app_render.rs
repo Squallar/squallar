@@ -3747,7 +3747,22 @@ impl super::App {
             floor_bytes: self.budgets.loop_pool_floor_bytes,
             ceiling_bytes: self.budgets.loop_pool_ceiling_bytes,
             pool_bytes: self.loop_pool.bytes(),
-            ..self.loop_counts
+            // The sole walk needs the loop cache as well as the store, and
+            // both are the App's — so it belongs on this half rather than on
+            // `loop_demand`'s pane walk, which sees neither. O(entries) with
+            // one cache lookup apiece on the 2 s tick.
+            ..{
+                let mgr = &self.loop_mgr;
+                let sole = self
+                    .loop_frames
+                    .sole_pinned_volume_bytes(|site, ts| mgr.get_cached(site, ts).is_some());
+                crate::loop_telemetry::LoopState {
+                    sole_pinned_bytes: sole.bytes,
+                    sole_pinned_frames: sole.frames,
+                    sole_walks: crate::loop_frame_store::sole_walks(),
+                    ..self.loop_counts
+                }
+            }
         }
     }
 

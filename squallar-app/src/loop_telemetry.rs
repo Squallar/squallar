@@ -96,6 +96,16 @@ pub(crate) struct LoopState {
     /// Pictures in the loop frame store held by more than one pane — see
     /// the module note for the denominator.
     pub(crate) shared: usize,
+    /// **Sweep-gate bytes the stored frames would actually return if dropped**
+    /// — `LoopFrameStore::sole_pinned_volume_bytes`, the lower bound beside
+    /// the census's `loop frame scans` upper one. A subset of that family and
+    /// never added to it.
+    pub(crate) sole_pinned_bytes: u64,
+    /// The entries [`Self::sole_pinned_bytes`] came from.
+    pub(crate) sole_pinned_frames: u64,
+    /// Walks that figure has made since launch — its fires counter. See
+    /// `crate::loop_frame_store::sole_walks`.
+    pub(crate) sole_walks: u64,
 }
 
 impl LoopState {
@@ -213,6 +223,15 @@ impl SkippedTicks {
 /// column; the scalar the rig reads comes **after** it, under its own
 /// `loop_skipped_re` probe, so a run with four panes skipping and a run with
 /// none put that figure behind the same label.
+///
+/// **`sole pinned` rides behind `ticks skipped`, for the same reason and by
+/// the same rule.** It is the one figure on this line that is BYTES the store
+/// measured rather than a count of slots or a byte figure the pool planned:
+/// `share` is a permission — a mean of what the plan CHARGED at nominal
+/// per-frame prices, which reads 576 MiB on a scene with no loop frames at
+/// all — and a reader who took it for residency would be out by four orders
+/// of magnitude. `sole walks` is its fires counter, because zero sole bytes
+/// is a healthy reading and is also what a walk that never ran prints.
 pub(crate) fn loop_state_line(s: &LoopState, skips: &SkippedTicks) -> String {
     // `none` rather than an empty run of pairs, so the sentence never has two
     // separators with nothing between them and the healthy case is a positive
@@ -233,7 +252,8 @@ pub(crate) fn loop_state_line(s: &LoopState, skips: &SkippedTicks) -> String {
          {} resident, {} in flight, {} failed; allowed plan={} section={} \
          volume={} overlay={}, cap {}, held {}; share {} B, pool {} B, \
          floor {} B, ceiling {} B; advance {} us; shared {}; \
-         skipped by pane {attributed}; ticks skipped {}",
+         skipped by pane {attributed}; ticks skipped {}; \
+         sole pinned {} B over {} frames, sole walks {}",
         s.panes,
         s.layers,
         s.listed,
@@ -253,6 +273,9 @@ pub(crate) fn loop_state_line(s: &LoopState, skips: &SkippedTicks) -> String {
         s.advance_us,
         s.shared,
         skips.total(),
+        s.sole_pinned_bytes,
+        s.sole_pinned_frames,
+        s.sole_walks,
     )
 }
 

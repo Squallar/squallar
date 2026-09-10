@@ -313,12 +313,15 @@ families! {
         "Sweep gates the stored 2D loop frames are holding: each plan-view \
          frame's hover source retains the moments of the ONE sweep its \
          picture was drawn from, so the readout can decode a gate on demand. \
-         Those moments are cloned out of the volume at extraction and are the \
-         frame's own allocation, sharing nothing with the `Scan` they came \
-         from - so this family names bytes NO other family names, and \
-         dropping a stored frame is the only thing that frees them. It is a \
-         partition and not a bound: two frames drawn from one volume hold two \
-         sweeps and are counted twice because there are two.";
+         An UPPER BOUND that OVERLAPS `loop scans`: this text claimed until \
+         2026-09-09 that the moments are the frame's own allocation \
+         `sharing nothing with the Scan they came from`, which `7db617aa6` \
+         made false and left standing - a `GateBuffer` is an `Arc<Vec<u8>>` \
+         and `SweepGates::new` clones a refcount, not the gates, so while \
+         the volume is still cached these are its bytes named twice. The \
+         `loop state:` line's `sole pinned` is the lower bound beside this. \
+         Two frames drawn from one volume do hold two sweeps and are counted \
+         twice because there are two.";
     LOOP_ARCHIVE_BYTES, loop_archive_bytes, set_loop_archive_bytes,
         "Compressed Level II archives the loop download cache is holding, so \
          a frame whose decoded volume was evicted costs a DECODE to restore \
@@ -795,9 +798,11 @@ impl Census {
     ///
     /// Holders keep `Arc`s of the same volumes — the loop download cache, the
     /// still inventory, the derivation memo — so a volume two of them name is
-    /// counted twice here. `loop frame scans` is **not** one of them: a
-    /// stored frame holds a sweep's moments, its own allocation, so its
-    /// bytes are named once in this sum.
+    /// counted twice here. **`loop frame scans` IS one of them**, since
+    /// `7db617aa6`: a stored frame's sweep shares the volume's gate buffers
+    /// through an `Arc`, so its bytes are named twice in this sum whenever
+    /// that volume is still cached. This doc said the opposite until
+    /// 2026-09-09.
     /// Stated rather than corrected: the figure that matters for "what
     /// would emptying these free" is this one, and the partition it is not
     /// would take a graph walk on the frame thread.

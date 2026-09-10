@@ -83,6 +83,9 @@ fn distinct() -> LoopState {
         ceiling_bytes: 3_221_225_472,
         advance_us: 100_000,
         shared: 7,
+        sole_pinned_bytes: 1_310_720,
+        sole_pinned_frames: 11,
+        sole_walks: 23,
     }
 }
 
@@ -113,7 +116,8 @@ fn the_loop_state_line_reads_exactly_as_pinned() {
          volume=4 overlay=9, cap 36, held 60; share 29360128 B, \
          pool 58720256 B, floor 60817408 B, ceiling 3221225472 B; \
          advance 100000 us; shared 7; skipped by pane 1=4 3=2; \
-         ticks skipped 6",
+         ticks skipped 6; sole pinned 1310720 B over 11 frames, \
+         sole walks 23",
     );
 }
 
@@ -125,7 +129,10 @@ fn the_loop_state_line_reads_exactly_as_pinned() {
 fn a_run_that_skipped_nothing_still_says_so() {
     let line = loop_state_line(&distinct(), &SkippedTicks::default());
     assert!(
-        line.ends_with("; skipped by pane none; ticks skipped 0"),
+        line.ends_with(
+            "; skipped by pane none; ticks skipped 0; sole pinned 1310720 B \
+             over 11 frames, sole walks 23",
+        ),
         "a clean run must still name the counter: {line}",
     );
 }
@@ -174,7 +181,9 @@ fn the_rig_reads_the_loop_line_the_app_actually_writes() {
         )
     });
     assert_eq!(
-        tail, "; skipped by pane 1=4 3=2; ticks skipped 6",
+        tail,
+        "; skipped by pane 1=4 3=2; ticks skipped 6; \
+         sole pinned 1310720 B over 11 frames, sole walks 23",
         "the tail past the rig's fixed columns is not what it is pinned to",
     );
 }
@@ -184,14 +193,34 @@ fn the_rig_reads_the_loop_line_the_app_actually_writes() {
 /// behind a variable-arity per-pane group, so it needs a probe that finds it
 /// by label rather than by column — and that probe has to agree with the
 /// sentence exactly as the other one does.
+///
+/// **This asserted `ends_with` until 2026-09-09, and end-of-line was never
+/// the property.** `loop_skipped_re` is unanchored and takes its first match,
+/// so where the count sits in the line is irrelevant to it; what the rig
+/// actually needs is that the probe MATCHES and that no second `ticks
+/// skipped` can be found before the real one. Pinning the position instead
+/// meant the first figure appended behind the counter reddened this test
+/// while the rig it guards kept reading correctly — a seam test failing for a
+/// reason the seam does not have. Both halves are still pinned exactly, so
+/// every character of the tail is held.
 #[test]
 fn the_rig_reads_the_skipped_tick_count_the_app_actually_writes() {
     let line = loop_state_line(&distinct(), &distinct_skips());
     let probe = rendered(&pattern("loop_skipped_re"), &["6"]);
+    let (before, after) = line.split_once(&probe).unwrap_or_else(|| {
+        panic!(
+            "the skipped-tick probe reads {probe:?}, which does not appear in \
+             the line at all: {line:?}"
+        )
+    });
+    assert_eq!(
+        after, "; sole pinned 1310720 B over 11 frames, sole walks 23",
+        "what follows the skipped-tick count is not what it is pinned to",
+    );
     assert!(
-        line.ends_with(&probe),
-        "the skipped-tick probe reads {probe:?}, which is not how the line \
-         ends: {line:?}",
+        !before.contains("ticks skipped"),
+        "an earlier `ticks skipped` would take the rig's unanchored probe \
+         first and it would read the wrong figure: {line:?}",
     );
 }
 
@@ -352,4 +381,77 @@ fn every_e_scene_seed_asks_for_the_lines_that_denominate_it() {
             "scene {scene} no longer seeds a playing loop",
         );
     }
+}
+
+/// **The fires counter is on the line, and it is what separates a healthy zero
+/// from a walk that never ran.**
+///
+/// `sole pinned 0 B` is the reading a scene where every frame's volume is
+/// still cached produces — the common, healthy case — and it is character for
+/// character what a `sole_pinned_volume_bytes` that was never called would
+/// print. `sole walks` is the only thing on the line that tells them apart,
+/// so a zero-bytes reading with a positive walk count has to be expressible
+/// and has to read differently from a zero-walk one.
+#[test]
+fn a_healthy_zero_and_a_walk_that_never_ran_read_differently() {
+    let ran = LoopState {
+        sole_pinned_bytes: 0,
+        sole_pinned_frames: 0,
+        sole_walks: 104,
+        ..distinct()
+    };
+    let never = LoopState {
+        sole_walks: 0,
+        ..ran
+    };
+    let ran = loop_state_line(&ran, &SkippedTicks::default());
+    let never = loop_state_line(&never, &SkippedTicks::default());
+    assert!(
+        ran.ends_with("sole pinned 0 B over 0 frames, sole walks 104"),
+        "a walk that found nothing sole must still say it walked: {ran}",
+    );
+    assert!(
+        never.ends_with("sole pinned 0 B over 0 frames, sole walks 0"),
+        "a walk that never ran must be readable as such: {never}",
+    );
+    assert_ne!(
+        ran, never,
+        "the fires counter is the ONLY term separating these two readings; \
+         without it on the line they are the same sentence",
+    );
+}
+
+/// **`share` is a permission and `sole pinned` is a measurement, and the line
+/// must not let them be confused.**
+///
+/// `share` is a mean of what the pool's planner CHARGED at nominal per-frame
+/// prices — it reads 576 MiB on a REST1 scene whose `frames listed` is 0 —
+/// so it can stand at gigabytes while the store measurably holds nothing.
+/// That combination is not a contradiction and has to be expressible, because
+/// it is what a real idle reading looks like; a lane that read `share` as
+/// residency was out by four orders of magnitude.
+#[test]
+fn a_huge_share_and_zero_measured_bytes_is_a_legal_reading() {
+    let idle = LoopState {
+        listed: 0,
+        resident: 0,
+        share_bytes: 603_979_776,
+        sole_pinned_bytes: 0,
+        sole_pinned_frames: 0,
+        sole_walks: 88,
+        ..distinct()
+    };
+    let line = loop_state_line(&idle, &SkippedTicks::default());
+    assert!(
+        line.contains("0 frames listed, 0 resident"),
+        "the store's own counts have to be readable as zero: {line}",
+    );
+    assert!(
+        line.contains("share 603979776 B"),
+        "the permission stands at the pool floor regardless: {line}",
+    );
+    assert!(
+        line.ends_with("sole pinned 0 B over 0 frames, sole walks 88"),
+        "and the measured figure is zero beside it, walked: {line}",
+    );
 }
