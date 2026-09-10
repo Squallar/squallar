@@ -1084,7 +1084,7 @@ pub async fn fetch_glm_flashes(
         gauge::empty_delivery(downloaded_rows);
         log::info!(
             "GLM: this poll downloaded {downloaded_rows} rows and delivered \
-             none — every granule it fetched was older than the retention \
+             none - every granule it fetched was older than the retention \
              floor the panes ahead of it had already raised",
         );
     }
