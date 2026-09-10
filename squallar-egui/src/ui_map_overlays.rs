@@ -1493,13 +1493,16 @@ impl RunCursor {
 /// 14,663 glyph vertices per pane-frame, each vertex arriving at the value it
 /// already had. Tessellating the solve where it is made costs the same
 /// vertices once and a copy thereafter, and it is
-/// [`crate::point_painter::tessellate_text_shapes_into`] that does it, so the two
+/// [`crate::point_painter::tessellate_text_shapes_drain`] that does it, so the two
 /// text paths a pane has cannot drift apart.
 ///
 /// **A solve fills the retired solve's buffers**, rather than asking the
 /// allocator for another ~850 kB on every frame a pan re-solves on. See
 /// [`crate::label_cache::LabelCache::recycle`], which is also where the
-/// argument that nothing else can still be holding them lives.
+/// argument that nothing else can still be holding them lives — and
+/// [`crate::label_cache::LabelScratch`], which is that argument made about the
+/// other four things a solve used to mint and drop: the repeat-name index, the
+/// anchors behind it, the shape list, and the claimed areas.
 ///
 /// Placed under the pane's own painter, so the clip and the layer opacity
 /// still reach it exactly as they reached the shapes. **Below full opacity the
@@ -1524,12 +1527,18 @@ pub(super) fn paint_labels(
         Some(kept) => kept,
         None => {
             crate::tile_mesh::ledger::note_label_solve();
-            let placed = solve_labels(painter.ctx(), &labels, galleys);
+            solve_labels(painter.ctx(), &labels, galleys, cache.scratch());
             // The solve this one replaces owns a buffer of exactly the right
             // size; see `LabelCache::recycle`.
             let recycled = cache.recycle(pane_idx);
-            let mesh =
-                crate::point_painter::tessellate_text_shapes_into(painter.ctx(), placed, recycled);
+            // `_drain` and not `_into`: the shape list belongs to the scratch
+            // and is emptied here rather than consumed, so its buffer is
+            // there for the next solve exactly as the mesh's is.
+            let mesh = crate::point_painter::tessellate_text_shapes_drain(
+                painter.ctx(),
+                cache.scratch().shapes(),
+                recycled,
+            );
             cache.store(pane_idx, key, labels, mesh.clone());
             mesh
         }
@@ -1542,53 +1551,44 @@ pub(super) fn paint_labels(
 ///
 /// Pure in its inputs — the context's fonts, the list, and the memo it lays
 /// out through — which is the property [`paint_labels`]' memo stands on.
-pub(super) fn solve_labels(
+pub(super) fn solve_labels<'a>(
     ctx: &egui::Context,
     labels: &[walkers::Text],
     galleys: &mut walkers::GalleyCache,
-) -> Vec<egui::Shape> {
+    scratch: &'a mut crate::label_cache::LabelScratch,
+) -> &'a mut Vec<egui::Shape> {
     // **Once for the solve.** `Context::pixels_per_point` is `Context::write`,
     // and the galley memo used to take it per label — see
     // `walkers::Text::galley_cached`. It cannot differ between two labels of
     // one pass.
     let pixels_per_point = ctx.pixels_per_point();
-    let mut occupied = walkers::OccupiedAreas::new();
-    // Where each name has already been drawn, so a fragmented river is named
-    // once per stretch of screen rather than once per OSM way. See
-    // [`MIN_REPEAT_DISTANCE`].
-    //
-    // Borrowed from `labels`, never owned: the map is built and dropped inside
-    // this call, so a name that draws costs a hash of its bytes and no
-    // refcount traffic at all.
-    let mut placed_names: std::collections::HashMap<&std::sync::Arc<str>, Vec<egui::Pos2>> =
-        std::collections::HashMap::new();
-
-    let mut placed: Vec<egui::Shape> = Vec::with_capacity(labels.len());
+    // Every buffer below is the previous solve's, emptied. See
+    // [`crate::label_cache::LabelScratch`] for what that is worth and why a
+    // scratch that arrives full is the same solve as one that arrives empty.
+    scratch.begin();
 
     for text in labels {
         let position = text.position;
 
-        if placed_names.get(&text.text).is_some_and(|anchors| {
-            anchors
-                .iter()
-                .any(|at| at.distance(position) < MIN_REPEAT_DISTANCE)
-        }) {
+        // The repeat-distance rule: a fragmented river is named once per
+        // stretch of screen rather than once per OSM way. See
+        // [`MIN_REPEAT_DISTANCE`].
+        if scratch.drawn_near(&text.text, position, MIN_REPEAT_DISTANCE) {
             continue;
         }
 
-        let shape = lay_out_label(ctx, text, &mut occupied, galleys, pixels_per_point);
+        let shape = lay_out_label(ctx, text, scratch.occupied(), galleys, pixels_per_point);
 
         // Only a label that actually drew claims the spot. A name suppressed by
         // the collision test must not stop the same name drawing further along,
         // or one river losing a contest at a crowded confluence would be
         // silenced across the whole viewport.
         if !matches!(shape, egui::Shape::Noop) {
-            placed_names.entry(&text.text).or_default().push(position);
-            placed.push(shape);
+            scratch.placed(&text.text, position, shape);
         }
     }
 
-    placed
+    scratch.shapes()
 }
 
 #[cfg(test)]
@@ -2222,7 +2222,13 @@ mod tests {
     /// Both are run, and the second run is the shipped `paint_labels`, so
     /// every test below still drives the real path end to end.
     fn solve_and_paint(ui: &egui::Ui, labels: Vec<Text>) -> Vec<egui::Shape> {
-        let solved = solve_labels(ui.ctx(), &labels, &mut walkers::GalleyCache::default());
+        let solved = solve_labels(
+            ui.ctx(),
+            &labels,
+            &mut walkers::GalleyCache::default(),
+            &mut crate::label_cache::LabelScratch::default(),
+        )
+        .clone();
         paint_labels(
             ui.painter(),
             labels,
@@ -2598,7 +2604,8 @@ mod tests {
         };
 
         let solve = |ctx: &egui::Context, galleys: &mut walkers::GalleyCache| {
-            let placed = solve_labels(ctx, &names, galleys);
+            let mut scratch = crate::label_cache::LabelScratch::default();
+            let placed = solve_labels(ctx, &names, galleys, &mut scratch);
             assert_eq!(
                 placed.len(),
                 1,
@@ -2784,7 +2791,13 @@ mod tests {
         // phase's shapes and is made against them.
         let mut placed = Vec::new();
         let _ = shapes_of_one_pass(&egui::Context::default(), canvas, |ui| {
-            placed = solve_labels(ui.ctx(), &labels(), &mut walkers::GalleyCache::default());
+            placed = solve_labels(
+                ui.ctx(),
+                &labels(),
+                &mut walkers::GalleyCache::default(),
+                &mut crate::label_cache::LabelScratch::default(),
+            )
+            .clone();
         });
         assert!(
             text_shapes(&placed).len() < names.len(),
@@ -2805,6 +2818,204 @@ mod tests {
         );
     }
 
+    /// A list a pane could plausibly hand the solve: mostly distinct names
+    /// with a minority that repeat.
+    ///
+    /// **Distinctness is the property both tests below need.** What the
+    /// scratch removes is paid per DISTINCT PLACED NAME — a repeat-name table
+    /// entry, and before the cut one heap allocation each — so a fixture of a
+    /// handful of names repeated cannot reach it however long the list is. A
+    /// basemap pane's names are overwhelmingly distinct: the repeat rule is
+    /// there for fragmented rivers, not for towns.
+    fn crowd(n: usize, shift: f32) -> Vec<Text> {
+        let stems = [
+            "Norman",
+            "Washita River",
+            "Enid",
+            "Lake Thunderbird",
+            "Canadian River",
+            "Chickasha",
+            "El Reno",
+        ];
+        (0..n)
+            .map(|i| {
+                let stem = stems[i % stems.len()];
+                let name = if i % 5 == 0 {
+                    stem.to_owned()
+                } else {
+                    format!("{stem} {i}")
+                };
+                label(
+                    &name,
+                    egui::pos2(
+                        40.0 + shift + (i % 17) as f32 * 43.0,
+                        30.0 + (i / 17) as f32 * 37.0,
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    /// Solve `labels` through `scratch` and leave the shapes where they are.
+    ///
+    /// The shipped path drains the list into the tessellator on the same
+    /// frame, so a scratch normally arrives at the next solve with its shape
+    /// list already empty — which is exactly why a test that only drives the
+    /// shipped path cannot tell whether `begin` empties it. This is the caller
+    /// that leaves it full.
+    fn fill_scratch(
+        ctx: &egui::Context,
+        scratch: &mut crate::label_cache::LabelScratch,
+        labels: &[Text],
+    ) -> usize {
+        let mut galleys = walkers::GalleyCache::default();
+        let mut placed = 0;
+        let _ = shapes_of_one_pass(
+            ctx,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN),
+            |ui| {
+                placed = solve_labels(ui.ctx(), labels, &mut galleys, scratch).len();
+            },
+        );
+        placed
+    }
+
+    /// The mesh a list tessellates to when it is solved through `scratch`.
+    fn solved_mesh(
+        ctx: &egui::Context,
+        scratch: &mut crate::label_cache::LabelScratch,
+        labels: &[Text],
+    ) -> egui::Mesh {
+        let mut galleys = walkers::GalleyCache::default();
+        let mut mesh = egui::Mesh::default();
+        let _ = shapes_of_one_pass(
+            ctx,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN),
+            |ui| {
+                let placed = solve_labels(ui.ctx(), labels, &mut galleys, scratch);
+                mesh = crate::point_painter::tessellate_text_shapes_drain(
+                    ui.ctx(),
+                    placed,
+                    egui::Mesh::default(),
+                )
+                .map(|m| (*m).clone())
+                .unwrap_or_default();
+            },
+        );
+        mesh
+    }
+
+    /// **A scratch that arrives full solves what a fresh one solves.**
+    ///
+    /// The buffers a solve fills are the previous solve's, and everything the
+    /// rule reads — the repeat-name index, the anchors behind it, the shape
+    /// list and the claimed areas — is emptied by
+    /// [`crate::label_cache::LabelScratch::begin`] rather than dropped. That
+    /// is the whole safety argument for keeping them, and it is one a reader
+    /// cannot check by eye: a term left un-emptied would suppress names that
+    /// a *previous* viewport had drawn, on a map that has since moved.
+    ///
+    /// So the same list is solved twice — once through a scratch a different,
+    /// overlapping list has just filled, once through a scratch straight out
+    /// of `Default` — and the two must tessellate to the same vertices, uvs,
+    /// colours and indices. Setting any one of `begin`'s four `clear` calls to
+    /// a no-op makes this red.
+    #[test]
+    fn a_scratch_that_arrives_full_solves_what_a_fresh_one_does() {
+        let _ledger = ledger_guard();
+        let ctx = egui::Context::default();
+        let earlier = crowd(240, 7.0);
+        let now = crowd(240, 0.0);
+
+        let mut reused = crate::label_cache::LabelScratch::default();
+        // Filled and NOT drained, so the scratch arrives at the next solve
+        // carrying every one of its four buffers full.
+        let filling = fill_scratch(&ctx, &mut reused, &earlier);
+        assert!(
+            filling > 0,
+            "fixture: the filling solve placed nothing, so the scratch \
+             arrives empty and this compares nothing"
+        );
+        assert_ne!(
+            reused.lens(),
+            (0, 0, 0),
+            "fixture: the filling solve left the scratch empty"
+        );
+        let from_full = solved_mesh(&ctx, &mut reused, &now);
+
+        let mut fresh = crate::label_cache::LabelScratch::default();
+        let from_empty = solved_mesh(&ctx, &mut fresh, &now);
+
+        assert!(!from_empty.is_empty(), "the fresh solve placed nothing");
+        let describe = |m: &egui::Mesh| -> Vec<(egui::Pos2, egui::Pos2, egui::Color32)> {
+            m.vertices.iter().map(|v| (v.pos, v.uv, v.color)).collect()
+        };
+        assert_eq!(
+            describe(&from_full),
+            describe(&from_empty),
+            "a scratch carrying the previous solve drew different pixels"
+        );
+        assert_eq!(from_full.indices, from_empty.indices);
+        assert_eq!(from_full.texture_id, from_empty.texture_id);
+    }
+
+    /// **A solve keeps the buffers the last one grew.**
+    ///
+    /// The point of the scratch, in the one unit that is immune to what else
+    /// the box is doing: what `begin` does to each buffer is empty it, never
+    /// release it. Measured under callgrind on a 600-name pane over 200
+    /// consecutive solves, that is 68,501 `malloc` calls against 17,976 — the
+    /// per-name `Vec<Pos2>` the repeat-name index used to allocate, plus the
+    /// index's own growth from empty, plus the shape list, plus the collision
+    /// search's five buffers, every solve.
+    ///
+    /// Spelling it as capacity rather than as an allocation count is what
+    /// makes it a unit test rather than a test binary with its own global
+    /// allocator; a `begin` that swapped in fresh containers reads zero here.
+    #[test]
+    fn a_solve_keeps_the_buffers_the_last_one_grew() {
+        let _ledger = ledger_guard();
+        let ctx = egui::Context::default();
+        let mut scratch = crate::label_cache::LabelScratch::default();
+        let mesh = solved_mesh(&ctx, &mut scratch, &crowd(240, 0.0));
+        assert!(!mesh.is_empty(), "fixture: the solve placed nothing");
+
+        let grown = scratch.capacities();
+        assert!(
+            grown.0 > 0 && grown.1 > 0 && grown.2 > 0,
+            "fixture: a solve that filled nothing cannot show a buffer kept: {grown:?}"
+        );
+
+        let held = scratch.lens();
+        assert!(
+            held.0 > 0 && held.1 > 0,
+            "fixture: the solve filled no name index, so nothing here can \
+             show it being emptied: {held:?}"
+        );
+
+        // What the head of the next solve does.
+        scratch.begin();
+        assert_eq!(
+            scratch.capacities(),
+            grown,
+            "`begin` released the buffers instead of emptying them, so every \
+             solve pays the allocator for them again"
+        );
+        assert_eq!(
+            scratch.lens(),
+            (0, 0, 0),
+            "`begin` kept what the last solve wrote, so a scratch grows \
+             without bound across a session"
+        );
+
+        // And a second solve of the same list leaves the same amount in them,
+        // which is the same statement made about the shipped path rather than
+        // about `begin` alone.
+        let again = solved_mesh(&ctx, &mut scratch, &crowd(240, 0.0));
+        assert_eq!(mesh.indices, again.indices, "the second solve differed");
+        assert_eq!(scratch.capacities(), grown, "the second solve re-grew");
+    }
+
     /// **The mesh `paint_labels` paints is the solved shapes, vertex for
     /// vertex.**
     ///
@@ -2820,7 +3031,7 @@ mod tests {
     /// grows it changes every normalised UV and the comparison would be a
     /// comparison of atlases rather than of paths. The names are placed well
     /// inside the canvas, because the direct arm culls a text row against the
-    /// painter's clip and [`crate::point_painter::tessellate_text_shapes_into`]
+    /// painter's clip and [`crate::point_painter::tessellate_text_shapes_drain`]
     /// tessellates under `Rect::EVERYTHING` — the two agree exactly on a row
     /// the clip keeps, and only there. And more than one name is placed, at
     /// more than one row, so the comparison covers ordering and not just a
@@ -2842,13 +3053,24 @@ mod tests {
         // Warm the atlas with every glyph both arms use, so neither grows it
         // under the other.
         let _ = shapes_of_one_pass(&ctx, canvas, |ui| {
-            let _ = solve_labels(ui.ctx(), &labels(), &mut walkers::GalleyCache::default());
+            let _ = solve_labels(
+                ui.ctx(),
+                &labels(),
+                &mut walkers::GalleyCache::default(),
+                &mut crate::label_cache::LabelScratch::default(),
+            );
         });
 
         // The direct arm: the phase's shapes, added and tessellated by egui.
         let mut solved = Vec::new();
         let direct_pass = shapes_of_one_pass(&ctx, canvas, |ui| {
-            solved = solve_labels(ui.ctx(), &labels(), &mut walkers::GalleyCache::default());
+            solved = solve_labels(
+                ui.ctx(),
+                &labels(),
+                &mut walkers::GalleyCache::default(),
+                &mut crate::label_cache::LabelScratch::default(),
+            )
+            .clone();
             ui.painter().extend(solved.clone());
         });
         assert_eq!(
@@ -2952,9 +3174,14 @@ mod tests {
                 // The head of the pass, where the shell checks the raster.
                 galleys.begin_frame(ui.ctx());
                 paint_labels(ui.painter(), names(), &mut galleys, &mut cache, 0);
-                reference = crate::point_painter::tessellate_text_shapes_into(
+                reference = crate::point_painter::tessellate_text_shapes_drain(
                     ui.ctx(),
-                    solve_labels(ui.ctx(), &names(), &mut walkers::GalleyCache::default()),
+                    solve_labels(
+                        ui.ctx(),
+                        &names(),
+                        &mut walkers::GalleyCache::default(),
+                        &mut crate::label_cache::LabelScratch::default(),
+                    ),
                     egui::Mesh::default(),
                 );
                 burn(ui.ctx(), &mut size);

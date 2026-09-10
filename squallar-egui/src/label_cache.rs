@@ -11,7 +11,10 @@
 //!
 //! What that solve costs per name is a galley probe, a repeat-name probe, an
 //! oriented rectangle, a bucketed collision search and a shape; several
-//! hundred names sit on a 1920x1080 basemap pane.
+//! hundred names sit on a 1920x1080 basemap pane. What it costs per *solve* is
+//! the buffers all five write into, and those are [`LabelScratch`]'s: kept
+//! between solves, so a pane that has solved once asks the allocator for
+//! nothing when it solves again.
 //!
 //! # What is kept is the vertices, not the shapes
 //!
@@ -149,6 +152,14 @@ struct Kept {
 #[derive(Default)]
 pub(crate) struct LabelCache {
     entries: HashMap<usize, Kept>,
+    /// The buffers a solve fills, lent to whichever pane is solving.
+    ///
+    /// **One, not one per pane.** A scratch lives only for the length of the
+    /// solve that fills it — [`LabelScratch::begin`] empties it before
+    /// anything reads it — so two panes solving on the same frame share it in
+    /// sequence and neither can see the other's. The kept solves above are
+    /// per-pane because they are read on a later frame; this is not.
+    scratch: LabelScratch,
     solves: u64,
     hits: u64,
     recycled: u64,
@@ -214,7 +225,7 @@ impl LabelCache {
     /// a solve that starts from `Mesh::default()` takes that buffer from the
     /// allocator and hands it back one frame later, every frame — which is
     /// most of what a miss-frame solve costs. See
-    /// [`crate::point_painter::tessellate_text_shapes_into`] for the figures.
+    /// [`crate::point_painter::tessellate_text_shapes_drain`] for the figures.
     ///
     /// **Nothing else can be holding it.** The painter's clone of a kept mesh
     /// dies with the paint list `Context::tessellate` consumed at the end of
@@ -241,6 +252,11 @@ impl LabelCache {
         mesh.texture_id = egui::TextureId::default();
         self.recycled += 1;
         mesh
+    }
+
+    /// The buffers the next solve is to fill.
+    pub(crate) fn scratch(&mut self) -> &mut LabelScratch {
+        &mut self.scratch
     }
 
     pub(crate) fn store(
@@ -283,6 +299,152 @@ impl LabelCache {
     #[cfg(test)]
     pub(crate) fn recycled(&self) -> u64 {
         self.recycled
+    }
+}
+
+/// The buffers one label solve fills, kept between solves.
+///
+/// **`LabelCache::recycle` made this argument for the mesh and stopped
+/// there.** A solve that misses the memo builds, uses and drops four more
+/// things whose size is a property of the pane and not of the frame: the
+/// repeat-name index, one `Vec<Pos2>` per name that drew, the shape list, and
+/// the claimed areas. On the native rig's scene A that is on the order of a
+/// name index grown from empty to several hundred entries — rehashing every
+/// name it already holds each time it doubles — plus one heap allocation per
+/// placed name, plus a 64-byte-per-shape list, on every frame of a pan.
+/// Measured there with `perf` against the shipped binary, the solve's own body
+/// (everything outside the galley memo, the collision search and the
+/// tessellator) was 28.2 % of the whole `CityLabels` arm, and 63 of its 133
+/// samples were inside `__rust_alloc`, `grow_one` and `reserve_rehash`.
+///
+/// So the solve is handed these instead of making them, and it empties them
+/// rather than dropping them: after the first solve a pane's solve asks the
+/// allocator for nothing at all. That is the same bargain, and the same
+/// safety argument, as the mesh — the buffers are the cache's own, nothing
+/// else can be holding them, and empty is always correct because every entry
+/// is rebuilt from the labels before it is read.
+///
+/// **Nothing here is part of the memo key.** These are scratch: what a solve
+/// leaves in them is overwritten by the next solve before it is read, and a
+/// scratch that arrived full would produce the same shapes as one that
+/// arrived empty. See [`Self::begin`], which is what makes that true.
+#[derive(Default)]
+pub(crate) struct LabelScratch {
+    /// Where each name has already been drawn, so a fragmented river is named
+    /// once per stretch of screen rather than once per OSM way.
+    ///
+    /// **The key is owned rather than borrowed, and that is what lets this
+    /// outlive the solve.** It used to be `&Arc<str>` into the caller's list,
+    /// which costs nothing per name but pins the map to one call. Owned, an
+    /// insert costs one refcount bump on an `Arc` the tile is holding anyway
+    /// — against the heap allocation per name that the borrowed spelling's
+    /// `Vec<Pos2>` value cost. A *lookup* still borrows: `Arc<str>: Borrow<str>`,
+    /// so a probe hashes the name's bytes and touches no refcount.
+    ///
+    /// The value is the head of a chain in [`Self::anchors`], not a vector, so
+    /// a name that draws once — which is nearly all of them — costs no
+    /// allocation of its own.
+    names: HashMap<Arc<str>, u32>,
+    /// The anchor chains themselves, `(anchor, next link)`, in one arena.
+    ///
+    /// One `Vec` for the whole solve rather than one per name, for the reason
+    /// [`walkers::OccupiedAreas`]' own `filed` arena gives: a map of per-name
+    /// vectors allocates once per name that drew, per solve, to save a walk
+    /// that costs less than that.
+    anchors: Vec<(egui::Pos2, u32)>,
+    /// The shapes the solve placed, in paint order, drained into the
+    /// tessellator so the list's buffer survives with the scratch.
+    shapes: Vec<egui::Shape>,
+    /// The screen the solve's labels have claimed.
+    occupied: walkers::OccupiedAreas,
+}
+
+/// The end of an anchor chain.
+const NO_ANCHOR: u32 = u32::MAX;
+
+impl LabelScratch {
+    /// Empty every buffer, keeping every allocation.
+    ///
+    /// Called at the head of a solve rather than at its end, so what a solve
+    /// reads is what that solve wrote and nothing else — a scratch left full
+    /// by the previous solve is indistinguishable from a fresh one from the
+    /// moment this returns.
+    pub(crate) fn begin(&mut self) {
+        self.names.clear();
+        self.anchors.clear();
+        self.shapes.clear();
+        self.occupied.clear();
+    }
+
+    /// The claimed areas, for the solve to test against.
+    pub(crate) fn occupied(&mut self) -> &mut walkers::OccupiedAreas {
+        &mut self.occupied
+    }
+
+    /// Whether `name` has already drawn within `distance` of `at`.
+    pub(crate) fn drawn_near(&self, name: &str, at: egui::Pos2, distance: f32) -> bool {
+        let mut link = match self.names.get(name) {
+            Some(&head) => head,
+            None => return false,
+        };
+        while link != NO_ANCHOR {
+            let (anchor, next) = self.anchors[link as usize];
+            if anchor.distance(at) < distance {
+                return true;
+            }
+            link = next;
+        }
+        false
+    }
+
+    /// Record that `name` drew at `at`, and file `shape` in paint order.
+    pub(crate) fn placed(&mut self, name: &Arc<str>, at: egui::Pos2, shape: egui::Shape) {
+        let link = self.anchors.len() as u32;
+        // **One hash on the placing path**, which is what the borrowed
+        // spelling's `entry(..).or_default()` cost too. `get_mut` then
+        // `insert` would be two on the miss, and a placed name is usually a
+        // miss: a pane's names are mostly distinct. The `Arc` clone `entry`
+        // needs up front is a refcount bump, given straight back when the name
+        // was already there.
+        let head = match self.names.entry(name.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut at) => {
+                std::mem::replace(at.get_mut(), link)
+            }
+            std::collections::hash_map::Entry::Vacant(at) => {
+                at.insert(link);
+                NO_ANCHOR
+            }
+        };
+        self.anchors.push((at, head));
+        self.shapes.push(shape);
+    }
+
+    /// The shapes this solve placed, in paint order.
+    pub(crate) fn shapes(&mut self) -> &mut Vec<egui::Shape> {
+        &mut self.shapes
+    }
+
+    /// What each buffer can hold without asking the allocator.
+    ///
+    /// The figure the reuse is gated on — see
+    /// `ui_map_overlays::tests::a_solve_keeps_the_buffers_the_last_one_grew`.
+    #[cfg(test)]
+    pub(crate) fn capacities(&self) -> (usize, usize, usize) {
+        (
+            self.names.capacity(),
+            self.anchors.capacity(),
+            self.shapes.capacity(),
+        )
+    }
+
+    /// What each buffer is holding.
+    ///
+    /// The other half of the same gate: capacity says a buffer was kept, and
+    /// this says it was emptied. A `begin` that kept the anchors would grow
+    /// this without limit while every capacity figure still read healthy.
+    #[cfg(test)]
+    pub(crate) fn lens(&self) -> (usize, usize, usize) {
+        (self.names.len(), self.anchors.len(), self.shapes.len())
     }
 }
 

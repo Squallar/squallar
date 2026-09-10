@@ -522,19 +522,10 @@ fn tinted_mesh(memo: &mut TintMemo, base: &Arc<egui::Mesh>, opacity: f32) -> Arc
 /// `mesh` must be empty; [`crate::label_cache::LabelCache::recycle`] is what
 /// empties it without dropping the buffers, which is what `Mesh::clear` would
 /// do.
-pub(crate) fn tessellate_text_shapes_into(
-    ctx: &egui::Context,
-    mut shapes: Vec<Shape>,
-    mesh: egui::Mesh,
-) -> Option<Arc<egui::Mesh>> {
-    tessellate_text_shapes_drain(ctx, &mut shapes, mesh)
-}
-
-/// [`tessellate_text_shapes_into`], leaving the caller's list emptied rather
-/// than consumed, so the list's buffer survives with it.
-///
-/// The body is the one the other two spellings run; nothing about the mesh it
-/// produces depends on how the shapes arrived.
+/// The list is emptied rather than consumed, so its buffer survives with the
+/// caller — which is the same bargain `mesh` is here for, made about the other
+/// allocation a solve would otherwise mint and drop every frame. See
+/// [`crate::label_cache::LabelScratch`], which owns both.
 pub(crate) fn tessellate_text_shapes_drain(
     ctx: &egui::Context,
     shapes: &mut Vec<Shape>,
@@ -668,7 +659,7 @@ mod point_text_tests {
             paint_all(p, g, Some(&mut collected))
         });
         assert_eq!(collected.len(), 80, "the fixture collected no text");
-        let kept = tessellate_text_shapes_into(&ctx, collected, egui::Mesh::default())
+        let kept = tessellate_text_shapes_drain(&ctx, &mut collected, egui::Mesh::default())
             .expect("text tessellates to a mesh");
 
         assert!(!direct_mesh.is_empty(), "the direct pass painted nothing");
@@ -705,9 +696,9 @@ mod point_text_tests {
             out
         };
 
-        let first = collect(&mut galleys);
+        let mut first = collect(&mut galleys);
         assert_eq!(first.len(), 80, "the fixture collected no text");
-        let fresh = tessellate_text_shapes_into(&ctx, first, egui::Mesh::default())
+        let fresh = tessellate_text_shapes_drain(&ctx, &mut first, egui::Mesh::default())
             .expect("text tessellates to a mesh");
 
         // Park it as a build, then take its buffers back the way the miss path
