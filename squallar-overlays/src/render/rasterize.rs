@@ -293,7 +293,14 @@ pub struct PictureCrop {
 impl PictureCrop {
     /// The bytes a picture of this window costs, at 4 per texel.
     pub const fn bytes(&self) -> u64 {
-        (self.width as u64) * (self.height as u64) * 4
+        // Saturating for the same reason [`Self::fits`] is checked: the pair
+        // arrives off a wire, `u32::MAX` texels each way is `4 * (2^32 - 1)^2`
+        // which a `u64` cannot hold, and a wrapped product is a *small* byte
+        // figure — it would price an impossible picture as a cheap one at the
+        // cache's occupancy door. Saturating leaves every real window exact.
+        (self.width as u64)
+            .saturating_mul(self.height as u64)
+            .saturating_mul(4)
     }
 
     /// Whether this window is the whole of the grid it names — the case a
@@ -310,12 +317,26 @@ impl PictureCrop {
     /// ground it was rendered for, which is a visibly misplaced overlay rather
     /// than a failed render, and no counter in the tree would say so.
     pub const fn fits(&self) -> bool {
+        // **`checked_add` and not `+`, because the values are wire-decoded and
+        // the shipped profile does not check overflow.** `[profile.release]`
+        // sets no `overflow-checks`, so `x + width` for `x = u32::MAX` and
+        // `width = 1` is `0` in the binary that ships, and `0 <= of_width`
+        // passed this guard — the one guard there is — on the exact input it
+        // exists to refuse. A window that cannot state its own far edge in a
+        // `u32` is outside every grid a `u32` can describe, so the answer is
+        // no, not a wrapped yes.
+        let (Some(right), Some(bottom)) = (
+            self.x.checked_add(self.width),
+            self.y.checked_add(self.height),
+        ) else {
+            return false;
+        };
         self.width > 0
             && self.height > 0
             && self.of_width > 0
             && self.of_height > 0
-            && self.x + self.width <= self.of_width
-            && self.y + self.height <= self.of_height
+            && right <= self.of_width
+            && bottom <= self.of_height
     }
 
     /// The whole of a `width` x `height` grid.
@@ -341,10 +362,14 @@ impl PictureCrop {
     /// `MERCATOR_LAT_LIMIT_DEG` before it maps, and a second spelling that
     /// forgot the clamp would place a polar picture wrong by degrees.
     ///
-    /// Nothing downstream needs this today — the draw takes the whole
+    /// **Nothing calls this, in production or in a test**, and the sentence
+    /// that used to stand here said a gate did. The draw takes the whole
     /// picture's screen rect and reads the window out of it as a fraction,
-    /// which cannot disagree with the placement of the picture it is inside —
-    /// but the gate uses it to state what the window covers.
+    /// which cannot disagree with the placement of the picture it is inside,
+    /// so no caller needs the window's ground and none has appeared. It is
+    /// kept because the arithmetic is the inverse of the one placement
+    /// already trusts and a future caller should not re-derive it — but it is
+    /// unexercised, and a first caller should gate it before believing it.
     pub fn ground(&self, bounds: &GeoBounds) -> GeoBounds {
         let (width, height) = (self.of_width, self.of_height);
         let mb = MercatorBounds::from_geo(bounds);
@@ -358,10 +383,14 @@ impl PictureCrop {
         };
         GeoBounds {
             min_lon: lon_at(self.x),
-            max_lon: lon_at(self.x + self.width),
+            // Saturating on both far edges: this is the same wire-decoded
+            // pair [`Self::fits`] checks, and a wrapped far edge here would
+            // answer ground *north-west* of the window's own origin rather
+            // than refusing.
+            max_lon: lon_at(self.x.saturating_add(self.width)),
             // Y is inverted: the window's top row is its NORTH edge.
             max_lat: lat_at(self.y),
-            min_lat: lat_at(self.y + self.height),
+            min_lat: lat_at(self.y.saturating_add(self.height)),
         }
     }
 }
@@ -486,8 +515,16 @@ impl ContentExtent {
         let guard = CROP_GUARD_TEXELS as f32;
         let x0 = (self.min_x - guard).floor().max(0.0) as u32;
         let y0 = (self.min_y - guard).floor().max(0.0) as u32;
-        let x1 = ((self.max_x + guard).ceil().max(0.0) as u32 + 1).min(width);
-        let y1 = ((self.max_y + guard).ceil().max(0.0) as u32 + 1).min(height);
+        // `saturating_add` and not `+`: `as u32` saturates a huge-but-finite
+        // extent at `u32::MAX` (`add_rect` refuses only the non-finite ones),
+        // and `u32::MAX + 1` wraps to `0` under the shipped profile — which
+        // `.min(width)` then reads as a far edge of zero and the window below
+        // collapses to one texel. That is a *clipped* overlay, the defect this
+        // whole rounding-outward exists to avoid, arrived at by wrapping.
+        let x1 = (self.max_x + guard).ceil().max(0.0) as u32;
+        let y1 = (self.max_y + guard).ceil().max(0.0) as u32;
+        let x1 = x1.saturating_add(1).min(width);
+        let y1 = y1.saturating_add(1).min(height);
         let x0 = x0.min(width.saturating_sub(1));
         let y0 = y0.min(height.saturating_sub(1));
         Some(PictureCrop {
@@ -4467,6 +4504,12 @@ mod item_blank_reason_tests;
 /// tamper that shows the comparison is live.
 #[cfg(test)]
 mod crop_identity_tests;
+
+/// **The window's arithmetic on wire-decoded values.** [`PictureCrop::fits`]
+/// is the only guard on a window that arrives from an offloaded rasterizer,
+/// and every far edge it computes has to exist before it can be compared.
+#[cfg(test)]
+mod crop_bounds_tests;
 
 #[cfg(test)]
 pub(crate) mod lambert_fixture;
