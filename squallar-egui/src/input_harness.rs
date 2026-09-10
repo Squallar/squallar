@@ -2050,6 +2050,20 @@ impl InputHarness {
     /// contains. It is therefore the count that says what one frame of this
     /// surface asks the context to remember, which is a cost no paint memo
     /// can remove — a replayed surface still has to register.
+    /// The `Sense` of every widget the last frame registered inside `rect`.
+    ///
+    /// An `egui::Ui` scope registers with `Sense::hover()` and holds no
+    /// control, which is what lets a caller count scopes rather than widgets:
+    /// see `ui_topbar::bar_scope_tests`.
+    pub(crate) fn widget_senses_within(&self, rect: egui::Rect) -> Vec<egui::Sense> {
+        self.prev_widgets
+            .layers()
+            .flat_map(|(_, widgets)| widgets.iter())
+            .filter(|widget| rect.contains_rect(widget.rect))
+            .map(|widget| widget.sense)
+            .collect()
+    }
+
     pub(crate) fn widgets_within(&self, rect: egui::Rect) -> usize {
         self.prev_widgets
             .layers()

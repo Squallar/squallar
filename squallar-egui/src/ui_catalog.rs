@@ -270,8 +270,13 @@ impl super::Gui {
         actions: &mut Vec<GuiAction>,
         #[cfg(test)] probe: &mut CatalogProbe,
     ) {
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        // Right-to-left so the close button owns the right edge, in one
+        // `egui::Ui` rather than an `horizontal` wrapping a `with_layout` that
+        // reverses it — see `ui_layout::row_with_layout`.
+        crate::ui_layout::row_with_layout(
+            ui,
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
                 let close = ui.button(CLOSE_LABEL).hover_text("Close the catalog");
                 #[cfg(test)]
                 {
@@ -301,8 +306,8 @@ impl super::Gui {
                         probe.search = search.rect;
                     }
                 });
-            });
-        });
+            },
+        );
         ui.separator();
 
         egui::ScrollArea::vertical()

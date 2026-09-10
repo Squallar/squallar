@@ -312,8 +312,15 @@ impl super::Gui {
                             ui,
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
+                                // Through the memo like every other chrome
+                                // button: this one sits in a `right_to_left`
+                                // row, where `Ui::wrap_mode` is `Extend` and
+                                // the table answers.
+                                let collapse_text = self
+                                    .chrome_galleys
+                                    .label(ui, crate::chrome_galley::Spec::plain(COLLAPSE_LABEL));
                                 let collapse = ui
-                                    .button(COLLAPSE_LABEL)
+                                    .add(egui::Button::new(collapse_text))
                                     .hover_text("Collapse the layer stack");
                                 #[cfg(test)]
                                 {
@@ -776,11 +783,16 @@ impl super::Gui {
                                     let text_height =
                                         body_height + status.map_or(0.0, |_| small_height);
                                     ui.add_space(((content_height - text_height) / 2.0).max(0.0));
-                                    let name_text = if enabled {
-                                        egui::RichText::new(name.as_str())
+                                    let name_spec = if enabled {
+                                        crate::chrome_galley::Spec::plain(name.as_str())
                                     } else {
-                                        egui::RichText::new(name.as_str()).weak()
+                                        crate::chrome_galley::Spec::weak(name.as_str())
                                     };
+                                    let name_text = self.chrome_galleys.label_for(
+                                        ui,
+                                        name_spec,
+                                        egui::TextWrapMode::Truncate,
+                                    );
                                     let name_label = ui.add(
                                         egui::Label::new(name_text).selectable(false).truncate(),
                                     );
@@ -793,12 +805,19 @@ impl super::Gui {
                                         // updating, or is drawing 85 of 297 warnings, gets
                                         // the warning colour instead: same size, same
                                         // place, same rect, legible as a fault.
-                                        let text = egui::RichText::new(line).small();
-                                        let text = if line.starts_with(STATUS_MARK) {
-                                            text.color(ui.visuals().warn_fg_color)
+                                        let status_spec = if line.starts_with(STATUS_MARK) {
+                                            crate::chrome_galley::Spec::small_color(
+                                                line,
+                                                ui.visuals().warn_fg_color,
+                                            )
                                         } else {
-                                            text.weak()
+                                            crate::chrome_galley::Spec::small_weak(line)
                                         };
+                                        let text = self.chrome_galleys.label_for(
+                                            ui,
+                                            status_spec,
+                                            egui::TextWrapMode::Truncate,
+                                        );
                                         let status_label = ui.add(
                                             egui::Label::new(text).selectable(false).truncate(),
                                         );

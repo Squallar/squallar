@@ -586,8 +586,14 @@ impl super::Gui {
                         self.sheet_drag = None;
                     }
 
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Right-to-left so the close button owns the right edge,
+                    // in one `egui::Ui` rather than an `horizontal` wrapping a
+                    // `with_layout` that reverses it — see
+                    // `ui_layout::row_with_layout`.
+                    crate::ui_layout::row_with_layout(
+                        ui,
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
                             let close = ui.button(CLOSE_LABEL).hover_text("Close the sheet");
                             #[cfg(test)]
                             {
@@ -610,8 +616,8 @@ impl super::Gui {
                                     ui.add(egui::Label::new(text).truncate());
                                 },
                             );
-                        });
-                    });
+                        },
+                    );
 
                     // The phone-only Panes/Pane header (plan §1.3): the
                     // phone top bar has no segments, so the Layers page

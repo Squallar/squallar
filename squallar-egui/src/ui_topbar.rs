@@ -125,89 +125,34 @@ impl super::Gui {
             });
         let panel = egui::Panel::top("top_bar").frame(frame).show(ui, |ui| {
             ui.spacing_mut().interact_size.y = INTERACT_HEIGHT;
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = ROOMY_ITEM_SPACING;
-
-                if !compact {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let insp_open = self.insp_open;
-                        let inspector_text = self.chrome_galleys.label(
-                            ui,
-                            crate::chrome_galley::Spec::plain(INSPECTOR_TOGGLE_LABEL),
-                        );
-                        let inspector = ui.add(egui::Button::selectable(insp_open, inspector_text));
-                        #[cfg(test)]
-                        {
-                            probe.inspector_toggle = (inspector.rect, insp_open);
-                        }
-                        // A UiSweep target: the sweep opens the inspector here
-                        // and closes it by its own × button.
-                        crate::gesture_player::click_registry::register(
-                            crate::gesture_player::ui_sweep::INSPECTOR_TOGGLE,
-                            inspector.rect,
-                        );
-                        if inspector.clicked() {
-                            self.insp_open = !insp_open;
-                        }
-
-                        let armed = self.section_draw_armed();
-                        let section_text = self
-                            .chrome_galleys
-                            .label(ui, crate::chrome_galley::Spec::plain(SECTION_TOGGLE_LABEL));
-                        let section = ui.add(egui::Button::selectable(armed, section_text));
-                        #[cfg(test)]
-                        {
-                            probe.section_arm = (section.rect, armed);
-                        }
-                        if section.clicked() {
-                            self.set_section_draw_armed(!armed);
-                        }
-
-                        let region_armed = self.region_pick_armed();
-                        let region_text = self
-                            .chrome_galleys
-                            .label(ui, crate::chrome_galley::Spec::plain(REGION_TOGGLE_LABEL));
-                        let region = ui.add(egui::Button::selectable(region_armed, region_text));
-                        #[cfg(test)]
-                        {
-                            probe.region_arm = (region.rect, region_armed);
-                        }
-                        if region.clicked() {
-                            self.set_region_pick_armed(!region_armed);
-                        }
-
-                        let offline_armed = self.download_pick_armed();
-                        let offline_text = self
-                            .chrome_galleys
-                            .label(ui, crate::chrome_galley::Spec::plain(OFFLINE_TOGGLE_GLYPH));
-                        let offline = ui
-                            .add(egui::Button::selectable(offline_armed, offline_text))
-                            .hover_text(OFFLINE_TOGGLE_HINT);
-                        #[cfg(test)]
-                        {
-                            probe.offline_arm = (offline.rect, offline_armed);
-                        }
-                        if offline.clicked() {
-                            self.set_download_pick_armed(!offline_armed);
-                        }
-
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            self.render_top_bar_run(
-                                ui,
-                                &mut menu_frame,
-                                #[cfg(test)]
-                                &mut probe,
-                            );
-                        });
-                    });
-                } else {
+            if compact {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = ROOMY_ITEM_SPACING;
                     self.render_phone_top_bar_run(
                         ui,
                         #[cfg(test)]
                         &mut probe,
                     );
-                }
-            });
+                });
+            } else {
+                // Right-to-left so the four trailing toggles own the right
+                // edge, in one `egui::Ui` rather than an `horizontal`
+                // wrapping a `with_layout` that reverses it — see
+                // `ui_layout::row_with_layout`.
+                crate::ui_layout::row_with_layout(
+                    ui,
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = ROOMY_ITEM_SPACING;
+                        self.render_top_bar_trailing(
+                            ui,
+                            &mut menu_frame,
+                            #[cfg(test)]
+                            &mut probe,
+                        );
+                    },
+                );
+            }
         });
 
         self.clear_fade_on_top_bar_press(ui.ctx(), panel.response.rect);
@@ -224,6 +169,93 @@ impl super::Gui {
         for event in menu_frame.events {
             self.apply_menu_event(event, actions);
         }
+    }
+
+    /// The wide bar's own run: the four trailing toggles that own the right
+    /// edge, then the rest of the bar left-to-right in what is left.
+    ///
+    /// **Called in a `right_to_left` `Ui` the caller already made.** The row
+    /// used to be `horizontal(|ui| ui.with_layout(right_to_left, ..))`, and
+    /// `egui::Ui::horizontal` is `allocate_ui_with_layout` at the *ambient*
+    /// direction — so that spelling was two `egui::Ui`s for one row, and an
+    /// `egui::Ui` is not free: `new_child` registers a widget and an accesskit
+    /// node, and the `remember_min_rect` its `Drop` runs registers the same
+    /// widget again. See `crate::ui_layout::row_with_layout`, which is the
+    /// one-scope spelling and which this row now goes through.
+    fn render_top_bar_trailing(
+        &mut self,
+        ui: &mut egui::Ui,
+        menu_frame: &mut ui_menu::MenuFrame,
+        #[cfg(test)] probe: &mut super::TopBarProbe,
+    ) {
+        let insp_open = self.insp_open;
+        let inspector_text = self.chrome_galleys.label(
+            ui,
+            crate::chrome_galley::Spec::plain(INSPECTOR_TOGGLE_LABEL),
+        );
+        let inspector = ui.add(egui::Button::selectable(insp_open, inspector_text));
+        #[cfg(test)]
+        {
+            probe.inspector_toggle = (inspector.rect, insp_open);
+        }
+        // A UiSweep target: the sweep opens the inspector here
+        // and closes it by its own × button.
+        crate::gesture_player::click_registry::register(
+            crate::gesture_player::ui_sweep::INSPECTOR_TOGGLE,
+            inspector.rect,
+        );
+        if inspector.clicked() {
+            self.insp_open = !insp_open;
+        }
+
+        let armed = self.section_draw_armed();
+        let section_text = self
+            .chrome_galleys
+            .label(ui, crate::chrome_galley::Spec::plain(SECTION_TOGGLE_LABEL));
+        let section = ui.add(egui::Button::selectable(armed, section_text));
+        #[cfg(test)]
+        {
+            probe.section_arm = (section.rect, armed);
+        }
+        if section.clicked() {
+            self.set_section_draw_armed(!armed);
+        }
+
+        let region_armed = self.region_pick_armed();
+        let region_text = self
+            .chrome_galleys
+            .label(ui, crate::chrome_galley::Spec::plain(REGION_TOGGLE_LABEL));
+        let region = ui.add(egui::Button::selectable(region_armed, region_text));
+        #[cfg(test)]
+        {
+            probe.region_arm = (region.rect, region_armed);
+        }
+        if region.clicked() {
+            self.set_region_pick_armed(!region_armed);
+        }
+
+        let offline_armed = self.download_pick_armed();
+        let offline_text = self
+            .chrome_galleys
+            .label(ui, crate::chrome_galley::Spec::plain(OFFLINE_TOGGLE_GLYPH));
+        let offline = ui
+            .add(egui::Button::selectable(offline_armed, offline_text))
+            .hover_text(OFFLINE_TOGGLE_HINT);
+        #[cfg(test)]
+        {
+            probe.offline_arm = (offline.rect, offline_armed);
+        }
+        if offline.clicked() {
+            self.set_download_pick_armed(!offline_armed);
+        }
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            self.render_top_bar_run(
+                ui,
+                menu_frame,
+                #[cfg(test)]
+                probe,
+            );
+        });
     }
 
     /// The phone bar's run (plan §1.2): wordmark · ⏴ collapse · live scan summary
@@ -729,3 +761,9 @@ mod roomy_width_memo_tests {
         );
     }
 }
+
+/// What the wide bar's row costs the interaction registry — the scope count
+/// the `row_with_layout` spelling buys.
+#[cfg(test)]
+#[path = "ui_topbar/bar_scope_tests.rs"]
+mod bar_scope_tests;

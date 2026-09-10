@@ -77,6 +77,14 @@ pub(crate) struct Spec<'a> {
     size: Option<f32>,
     color: Option<egui::Color32>,
     weak: bool,
+    /// `RichText::small()`'s term — a `TextStyle` the layout resolves a whole
+    /// `FontId` from, which is a different thing from `size` overriding the
+    /// fallback font's. Kept separate for that reason: `.small()` and
+    /// `.size(small_size)` agree on the size and can disagree on the family.
+    /// A `bool` and not the `TextStyle`, because `TextStyle` is not `Copy` —
+    /// it carries an `Arc<str>` for user-named styles — and `Small` is the
+    /// only one any call site here asks for.
+    small: bool,
 }
 
 impl<'a> Spec<'a> {
@@ -87,6 +95,32 @@ impl<'a> Spec<'a> {
             size: None,
             color: None,
             weak: false,
+            small: false,
+        }
+    }
+
+    /// `RichText::new(text).weak()`.
+    pub(crate) fn weak(text: &'a str) -> Self {
+        Self {
+            weak: true,
+            ..Self::plain(text)
+        }
+    }
+
+    /// `RichText::new(text).small().weak()`.
+    pub(crate) fn small_weak(text: &'a str) -> Self {
+        Self {
+            small: true,
+            ..Self::weak(text)
+        }
+    }
+
+    /// `RichText::new(text).small().color(color)`.
+    pub(crate) fn small_color(text: &'a str, color: egui::Color32) -> Self {
+        Self {
+            small: true,
+            color: Some(color),
+            ..Self::plain(text)
         }
     }
 
@@ -128,10 +162,13 @@ impl<'a> Spec<'a> {
     /// This is the miss path *and* the definition of the hit path: a stored
     /// galley is whatever `into_galley_impl` made of exactly this value.
     fn widget_text(self) -> egui::WidgetText {
-        if self.size.is_none() && self.color.is_none() && !self.weak {
+        if self.size.is_none() && self.color.is_none() && !self.weak && !self.small {
             return egui::WidgetText::Text(self.text.to_owned());
         }
         let mut rich = egui::RichText::new(self.text);
+        if self.small {
+            rich = rich.small();
+        }
         if let Some(size) = self.size {
             rich = rich.size(size);
         }
@@ -176,10 +213,19 @@ struct Resolved {
 /// whatever its state picked. That is what keeps a hover out of this key.
 fn resolve(style: &egui::Style, spec: Spec<'_>) -> Resolved {
     let font = style.override_font_id.clone().unwrap_or_else(|| {
-        style.override_text_style.as_ref().map_or_else(
-            || egui::TextStyle::Body.resolve(style),
-            |ts| ts.resolve(style),
-        )
+        // `RichText::into_text_and_format` reads the *spec's* text style
+        // first and the `Style`'s override second — `text_style.or(
+        // style.override_text_style)` — so a `Spec::small_*` resolves its
+        // whole `FontId` out of `TextStyle::Small` rather than overriding the
+        // fallback font's size.
+        if spec.small {
+            egui::TextStyle::Small.resolve(style)
+        } else {
+            style.override_text_style.as_ref().map_or_else(
+                || egui::TextStyle::Body.resolve(style),
+                |ts| ts.resolve(style),
+            )
+        }
     });
     let size = spec.size.unwrap_or(font.size);
     let color = if let Some(color) = spec.color {
@@ -199,6 +245,33 @@ fn resolve(style: &egui::Style, spec: Spec<'_>) -> Resolved {
     }
 }
 
+/// Which of egui's two layout paths made the kept galley, and every term
+/// that path reads off the `Ui` beyond the ones [`Resolved`] carries.
+///
+/// The two are not interchangeable and a table that did not say which it held
+/// would hand a `Label` the galley `Button::atom_ui` asked for.
+/// `Button::atom_ui` goes through `WidgetText::into_galley_impl`, which leaves
+/// the job's `halign` and `justify` at `RichText`'s defaults;
+/// `Label::layout_in_ui` overwrites both off `Ui::layout()` and sets the wrap
+/// from the width the `Ui` has left. A call site that changed which one it
+/// asks for misses once and re-lays, which is what a changed key is for.
+#[derive(Clone, Copy, PartialEq)]
+enum Shape {
+    /// `Button::atom_ui`'s: wrap `Extend`, and the job's own halign/justify.
+    Atom,
+    /// `Label::layout_in_ui`'s, in the only corner of it this table answers
+    /// in — see [`ChromeGalleys::label_for`] for the declines that make
+    /// `halign` `LEFT` and `justify` `false` facts rather than terms.
+    Label {
+        /// `Truncate` and `Extend` only; `Wrap` declines.
+        wrap: egui::TextWrapMode,
+        /// `TextWrapping::max_width`, by bits: `f32::INFINITY` under
+        /// `Extend`, and `Ui::available_width` under `Truncate`, where the
+        /// galley elides to it.
+        max_width: u32,
+    },
+}
+
 /// One call site's laid-out label.
 struct Kept {
     /// A `String` rather than a `Box<str>` so that a call site whose label
@@ -208,6 +281,7 @@ struct Kept {
     text: String,
     resolved: Resolved,
     valign: egui::Align,
+    shape: Shape,
     galley: Arc<egui::Galley>,
 }
 
@@ -273,6 +347,72 @@ impl ChromeGalleys {
         if ui.wrap_mode() != egui::TextWrapMode::Extend {
             return spec.widget_text();
         }
+        self.serve(ui, spec, Shape::Atom)
+    }
+
+    /// The text to hand `egui::Label::new`, for a label the call site will
+    /// give `wrap`.
+    ///
+    /// **A different layout path from [`Self::label`], not a different
+    /// caller.** `egui::Button` hands its text to
+    /// `WidgetText::into_galley_impl`; `egui::Label` builds its own job in
+    /// `Label::layout_in_ui`, and that job reads three more things off the
+    /// `Ui`: the wrap mode the call site set (`Label::truncate` overrides
+    /// `Ui::wrap_mode`, so it is passed in rather than read here), the width
+    /// the `Ui` has left, and `Layout::horizontal_placement` /
+    /// `horizontal_justify`.
+    ///
+    /// **What this declines, and why each decline is what makes the rest
+    /// exact.**
+    ///
+    /// * `TextWrapMode::Wrap`. `Label` takes a different branch there — it
+    ///   indents the first row by what the previous widget left and sets
+    ///   `first_row_min_height` off the cursor — and the galley then depends
+    ///   on where in the row the label landed, which is not in this key.
+    /// * A layout whose `horizontal_placement` is not `Align::LEFT`, or that
+    ///   justifies. Those two are terms of `Label`'s job, and declining
+    ///   outside `LEFT`/`false` is what lets them be left out of the key: it
+    ///   is also exactly the pair `Label`'s `is_grid()` branch forces, so a
+    ///   `Grid` cell — which this crate cannot ask about, `Ui::is_grid` being
+    ///   `pub(crate)` — cannot differ from what is stored either.
+    /// * A non-finite `available_width` under `Truncate`, where the elision
+    ///   width would be keyed as a NaN that never compares equal.
+    ///
+    /// A decline is the `WidgetText` the call site would have built, so
+    /// `Label::new(..).truncate()` around it lays out exactly what it always
+    /// laid out. A hit is a `WidgetText::Galley`, which `Label` returns
+    /// untouched — `truncate()` and the rest of the builder are already baked
+    /// into it.
+    pub(crate) fn label_for(
+        &mut self,
+        ui: &egui::Ui,
+        spec: Spec<'_>,
+        wrap: egui::TextWrapMode,
+    ) -> egui::WidgetText {
+        let layout = ui.layout();
+        if wrap == egui::TextWrapMode::Wrap
+            || layout.horizontal_placement() != egui::Align::LEFT
+            || layout.horizontal_justify()
+        {
+            return spec.widget_text();
+        }
+        let max_width = label_max_width(ui, wrap);
+        if !max_width.is_finite() && wrap != egui::TextWrapMode::Extend {
+            return spec.widget_text();
+        }
+        self.serve(
+            ui,
+            spec,
+            Shape::Label {
+                wrap,
+                max_width: max_width.to_bits(),
+            },
+        )
+    }
+
+    /// The table itself: one probe on `Ui::next_auto_id`, every term compared
+    /// on the way out, and the layout `shape` names on a miss.
+    fn serve(&mut self, ui: &egui::Ui, spec: Spec<'_>, shape: Shape) -> egui::WidgetText {
         #[cfg(test)]
         if self.bypass {
             return spec.widget_text();
@@ -283,13 +423,14 @@ impl ChromeGalleys {
         let resolved = resolve(style, spec);
         if let Some(kept) = self.entries.get(&id)
             && kept.valign == valign
+            && kept.shape == shape
             && kept.resolved == resolved
             && *kept.text == *spec.text
         {
             self.hits += 1;
             return egui::WidgetText::Galley(kept.galley.clone());
         }
-        let galley = lay_out(ui, spec);
+        let galley = lay_out(ui, spec, shape);
         self.layouts += 1;
         match self.entries.entry(id) {
             std::collections::hash_map::Entry::Occupied(mut slot) => {
@@ -298,6 +439,7 @@ impl ChromeGalleys {
                 kept.text.push_str(spec.text);
                 kept.resolved = resolved;
                 kept.valign = valign;
+                kept.shape = shape;
                 kept.galley = galley.clone();
             }
             std::collections::hash_map::Entry::Vacant(slot) => {
@@ -305,6 +447,7 @@ impl ChromeGalleys {
                     text: spec.text.to_owned(),
                     resolved,
                     valign,
+                    shape,
                     galley: galley.clone(),
                 });
             }
@@ -341,6 +484,15 @@ impl ChromeGalleys {
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
+
+    /// Entries held for the `egui::Label` path, as against `Button`'s.
+    #[cfg(test)]
+    pub(crate) fn label_entries(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|kept| matches!(kept.shape, Shape::Label { .. }))
+            .count()
+    }
 }
 
 /// Lay `spec` out exactly as `Button::atom_ui` would have.
@@ -349,20 +501,64 @@ impl ChromeGalleys {
 /// because that is the value `atom_ui` passes: `override_font_id` if the
 /// style names one, `TextStyle::Body` otherwise. Nothing here reads the
 /// widget's state, because that path does not either.
-fn lay_out(ui: &egui::Ui, spec: Spec<'_>) -> Arc<egui::Galley> {
+fn lay_out(ui: &egui::Ui, spec: Spec<'_>, shape: Shape) -> Arc<egui::Galley> {
     let style = ui.style();
-    let fallback = egui::FontSelection::FontId(
-        style
-            .override_font_id
-            .clone()
-            .unwrap_or_else(|| egui::TextStyle::Body.resolve(style)),
-    );
-    let wrapping = egui::epaint::text::TextWrapping::from_wrap_mode_and_width(
-        egui::TextWrapMode::Extend,
-        f32::INFINITY,
-    );
-    spec.widget_text()
-        .into_galley_impl(ui.ctx(), style, wrapping, fallback, ui.text_valign())
+    match shape {
+        Shape::Atom => {
+            let fallback = egui::FontSelection::FontId(
+                style
+                    .override_font_id
+                    .clone()
+                    .unwrap_or_else(|| egui::TextStyle::Body.resolve(style)),
+            );
+            let wrapping = egui::epaint::text::TextWrapping::from_wrap_mode_and_width(
+                egui::TextWrapMode::Extend,
+                f32::INFINITY,
+            );
+            spec.widget_text().into_galley_impl(
+                ui.ctx(),
+                style,
+                wrapping,
+                fallback,
+                ui.text_valign(),
+            )
+        }
+        Shape::Label { wrap, .. } => lay_out_label(ui, spec, wrap),
+    }
+}
+
+/// The width `Label::layout_in_ui` gives the job under `wrap`.
+fn label_max_width(ui: &egui::Ui, wrap: egui::TextWrapMode) -> f32 {
+    match wrap {
+        egui::TextWrapMode::Extend => f32::INFINITY,
+        egui::TextWrapMode::Wrap | egui::TextWrapMode::Truncate => ui.available_width(),
+    }
+}
+
+/// Lay `spec` out exactly as `Label::layout_in_ui` would have, in the corner
+/// of it [`ChromeGalleys::label_for`] answers in.
+///
+/// Line for line against egui's own: the job comes from
+/// `WidgetText::into_layout_job` at `FontSelection::Default` and
+/// `Ui::text_valign`, the wrap is applied over whatever the job already
+/// carried, and `halign`/`justify` are written from the layout — which the
+/// caller has already narrowed to `LEFT`/`false`, the pair egui's own grid
+/// branch would force anyway. The `Wrap` branch that indents a first row is
+/// not here because the caller declines it.
+fn lay_out_label(ui: &egui::Ui, spec: Spec<'_>, wrap: egui::TextWrapMode) -> Arc<egui::Galley> {
+    let mut job = Arc::unwrap_or_clone(spec.widget_text().into_layout_job(
+        ui.style(),
+        egui::FontSelection::Default,
+        ui.text_valign(),
+    ));
+    job.wrap.max_width = label_max_width(ui, wrap);
+    if wrap == egui::TextWrapMode::Truncate {
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+    }
+    job.halign = egui::Align::LEFT;
+    job.justify = false;
+    ui.ctx().fonts_mut(|fonts| fonts.layout_job(job))
 }
 
 #[cfg(test)]
@@ -461,7 +657,9 @@ mod tests {
             };
             galley
         });
-        let fresh = pass(&ctx, |ui| lay_out(ui, Spec::plain("Add layer")));
+        let fresh = pass(&ctx, |ui| {
+            lay_out(ui, Spec::plain("Add layer"), Shape::Atom)
+        });
         assert_eq!(
             first.rows.len(),
             fresh.rows.len(),
@@ -669,6 +867,321 @@ mod tests {
              did not. A kept galley that is not the one egui would have \
              produced looks right and is wrong: same rects, same colours, \
              different letters."
+        );
+    }
+
+    /// A pass that hands the body a `Ui` laid out in `layout` at a known
+    /// width — what a stack row's name block is: `top_down(LEFT)`, so
+    /// `horizontal_placement` is `LEFT` and the label arm answers, with a
+    /// finite `available_width` for `Truncate` to elide against.
+    fn pass_in<R>(
+        ctx: &egui::Context,
+        layout: egui::Layout,
+        mut body: impl FnMut(&mut egui::Ui) -> R,
+    ) -> R {
+        let mut out = None;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_max_width(120.0);
+            ui.with_layout(layout, |ui| {
+                out = Some(body(ui));
+            });
+        });
+        out.expect("the body runs once per pass")
+    }
+
+    /// What `egui::Label` itself makes of `spec` at `wrap` — the value every
+    /// hit below has to equal.
+    fn lay_out_via_label(
+        ui: &mut egui::Ui,
+        spec: Spec<'_>,
+        wrap: egui::TextWrapMode,
+    ) -> Arc<egui::Galley> {
+        let response = ui.add(
+            egui::Label::new(spec.widget_text())
+                .selectable(false)
+                .wrap_mode(wrap),
+        );
+        let _ = response;
+        // The galley egui laid out is not handed back by `Label`, so it is
+        // read off the shape it painted.
+        ui.ctx().graphics(|layers| {
+            layers
+                .get(ui.layer_id())
+                .expect("the label painted into this layer")
+                .all_entries()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) => Some(text.galley.clone()),
+                    _ => None,
+                })
+                .next_back()
+                .expect("the label painted a text shape")
+        })
+    }
+
+    /// **The label arm answers what egui's own `Label` would have laid out.**
+    ///
+    /// Not "a galley that looks the same": the terms `Label::layout_in_ui`
+    /// writes into the job — the wrap width it elides against, the halign it
+    /// places rows by — are compared through the galley egui itself produced
+    /// from the same `Ui`.
+    #[test]
+    fn a_kept_truncating_label_is_the_galley_egui_lays_out() {
+        let ctx = egui::Context::default();
+        let mut table = ChromeGalleys::default();
+        let layout = egui::Layout::top_down(egui::Align::LEFT);
+        let long = "Storm-relative velocity, tilt 1";
+
+        let (memo, fresh) = pass_in(&ctx, layout, |ui| {
+            let egui::WidgetText::Galley(memo) =
+                table.label_for(ui, Spec::plain(long), egui::TextWrapMode::Truncate)
+            else {
+                panic!("the label arm declined a top-down truncating label");
+            };
+            let fresh = lay_out_via_label(ui, Spec::plain(long), egui::TextWrapMode::Truncate);
+            (memo, fresh)
+        });
+
+        assert!(
+            memo.elided,
+            "the fixture's label fits its width, so truncation — the term this \
+             arm exists to key — is not exercised at all"
+        );
+        assert_eq!(memo.text(), fresh.text(), "text");
+        assert_eq!(memo.size(), fresh.size(), "size");
+        assert_eq!(memo.rows.len(), fresh.rows.len(), "rows");
+        assert_eq!(memo.job.halign, fresh.job.halign, "halign");
+        assert_eq!(memo.job.justify, fresh.job.justify, "justify");
+        assert_eq!(
+            memo.job.wrap, fresh.job.wrap,
+            "the memo elided against a different width than egui did"
+        );
+        assert_eq!(memo.elided, fresh.elided, "elided");
+    }
+
+    /// Every term `Label::layout_in_ui` reads that [`Resolved`] does not
+    /// already carry, one arm each. A term that is not keyed is a hit that
+    /// puts last frame's shape on the glass.
+    #[test]
+    fn every_term_a_label_layout_reads_is_keyed() {
+        type Arm = (
+            &'static str,
+            Box<dyn Fn(&mut egui::Ui) -> (Spec<'static>, egui::TextWrapMode)>,
+        );
+        let base = "Storm-relative velocity, tilt 1";
+        let cases: Vec<Arm> = vec![
+            (
+                "text",
+                Box::new(|_: &mut egui::Ui| {
+                    (Spec::plain("Reflectivity"), egui::TextWrapMode::Truncate)
+                }),
+            ),
+            (
+                "wrap mode",
+                Box::new(move |_: &mut egui::Ui| (Spec::plain(base), egui::TextWrapMode::Extend)),
+            ),
+            (
+                "width",
+                Box::new(move |ui: &mut egui::Ui| {
+                    ui.set_max_width(60.0);
+                    (Spec::plain(base), egui::TextWrapMode::Truncate)
+                }),
+            ),
+            (
+                "small",
+                Box::new(move |_: &mut egui::Ui| {
+                    (Spec::small_weak(base), egui::TextWrapMode::Truncate)
+                }),
+            ),
+            (
+                "weak",
+                Box::new(move |_: &mut egui::Ui| (Spec::weak(base), egui::TextWrapMode::Truncate)),
+            ),
+            (
+                "colour",
+                Box::new(move |_: &mut egui::Ui| {
+                    (
+                        Spec::small_color(base, egui::Color32::RED),
+                        egui::TextWrapMode::Truncate,
+                    )
+                }),
+            ),
+            (
+                "font",
+                Box::new(move |ui: &mut egui::Ui| {
+                    ui.style_mut().override_font_id = Some(egui::FontId::monospace(21.0));
+                    (Spec::plain(base), egui::TextWrapMode::Truncate)
+                }),
+            ),
+        ];
+
+        for (name, mutate) in cases {
+            let ctx = egui::Context::default();
+            let mut table = ChromeGalleys::default();
+            let layout = egui::Layout::top_down(egui::Align::LEFT);
+            let first = pass_in(&ctx, layout, |ui| {
+                table.label_for(ui, Spec::plain(base), egui::TextWrapMode::Truncate)
+            });
+            assert!(
+                matches!(first, egui::WidgetText::Galley(_)),
+                "{name}: the arm declined the baseline call, so the miss below \
+                 proves nothing"
+            );
+            let before = table.layouts();
+            let second = pass_in(&ctx, layout, |ui| {
+                let (spec, wrap) = mutate(ui);
+                table.label_for(ui, spec, wrap)
+            });
+            let _ = second;
+            assert_eq!(
+                table.layouts() - before,
+                1,
+                "{name} moved and the table answered from the entry it had. \
+                 Every term `Label::layout_in_ui` reads has to be compared on \
+                 the way out, or a changed one is served last frame's galley."
+            );
+        }
+    }
+
+    /// **`RichText::small` is in the key on its own terms**, and this is a
+    /// separate arm because the arm above cannot reach it: every `Spec` that
+    /// carries `small` also carries a colour or `weak`, so a miss there is
+    /// explained by the colour and says nothing about the text style. Two
+    /// specs identical but for `small` are what [`resolve`] has to separate —
+    /// it resolves a whole `FontId` out of `TextStyle::Small`, and a `resolve`
+    /// that ignored the term would hand a status line the body font's galley
+    /// at the same call site.
+    #[test]
+    fn the_small_text_style_is_in_the_key() {
+        let ctx = egui::Context::default();
+        let mut table = ChromeGalleys::default();
+        let layout = egui::Layout::top_down(egui::Align::LEFT);
+        let line = "3 shown - W/Wa";
+        let colour = egui::Color32::RED;
+
+        let big = pass_in(&ctx, layout, |ui| {
+            table.label_for(
+                ui,
+                Spec::colored(line, colour),
+                egui::TextWrapMode::Truncate,
+            )
+        });
+        assert!(
+            matches!(big, egui::WidgetText::Galley(_)),
+            "the arm declined the baseline call, so the miss below proves nothing"
+        );
+        let before = table.layouts();
+        let small = pass_in(&ctx, layout, |ui| {
+            table.label_for(
+                ui,
+                Spec::small_color(line, colour),
+                egui::TextWrapMode::Truncate,
+            )
+        });
+        assert_eq!(
+            table.layouts() - before,
+            1,
+            "the same text at the same colour, one of them `small`, answered \
+             from the entry the other left. `TextStyle::Small` resolves a \
+             different `FontId`, so that hit is the body font's glyphs under a \
+             status line."
+        );
+        let (egui::WidgetText::Galley(big), egui::WidgetText::Galley(small)) = (big, small) else {
+            panic!("both calls answer with a galley");
+        };
+        assert!(
+            small.size().y < big.size().y,
+            "the two galleys are the same height ({} and {}), so this fixture \
+             cannot tell the two font sizes apart and the miss above could \
+             have come from anywhere",
+            small.size().y,
+            big.size().y,
+        );
+    }
+
+    /// Three declines, each of which is what lets a term be left out of the
+    /// key rather than guessed at.
+    #[test]
+    fn a_label_the_arm_cannot_key_is_declined_rather_than_guessed() {
+        let base = "Storm-relative velocity";
+        for (name, layout, wrap) in [
+            (
+                "wrapping",
+                egui::Layout::top_down(egui::Align::LEFT),
+                egui::TextWrapMode::Wrap,
+            ),
+            (
+                "right-to-left",
+                egui::Layout::right_to_left(egui::Align::Center),
+                egui::TextWrapMode::Truncate,
+            ),
+            (
+                "justifying",
+                egui::Layout::top_down(egui::Align::LEFT).with_cross_justify(true),
+                egui::TextWrapMode::Truncate,
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            let mut table = ChromeGalleys::default();
+            let declined = pass_in(&ctx, layout, |ui| {
+                !matches!(
+                    table.label_for(ui, Spec::plain(base), wrap),
+                    egui::WidgetText::Galley(_)
+                )
+            });
+            assert!(
+                declined,
+                "a {name} label was answered with a galley this table cannot \
+                 key: `Label::layout_in_ui` reads the width it was given, and \
+                 `Layout::horizontal_placement`/`horizontal_justify`, and \
+                 none of the three is in the key."
+            );
+            assert_eq!(table.len(), 0, "{name}: a declined call must keep nothing");
+        }
+    }
+
+    /// **The row labels the panel draws every frame are answered from the
+    /// table**, on the fixture the arm was measured on.
+    #[test]
+    fn a_settled_frame_answers_every_stack_row_label_from_the_table() {
+        let mut h = InputHarness::new();
+        h.warm_up();
+        h.frame();
+
+        let labels = h.gui().chrome_galleys_for_test().label_entries();
+        assert!(
+            labels >= 8,
+            "{labels} memoized label call site(s) is too few for this pin to \
+             mean anything: the layer panel draws one name per row and a \
+             status line under some of them, and a fixture that draws a \
+             handful cannot show one being asked twice",
+        );
+
+        let before = (
+            h.gui().chrome_galleys_for_test().hits(),
+            h.gui().chrome_galleys_for_test().layouts(),
+        );
+        for _ in 0..5 {
+            h.frame();
+        }
+        let after = (
+            h.gui().chrome_galleys_for_test().hits(),
+            h.gui().chrome_galleys_for_test().layouts(),
+        );
+        assert_eq!(
+            after.1 - before.1,
+            0,
+            "five frames of a panel nobody touched laid {} label(s) out again. \
+             Each one is a `LayoutJob` built from a `&str` the call site \
+             already holds, an `ahash` over that whole job, and a \
+             `Context::fonts_mut` write lock on the entire egui context, to be \
+             handed back the `Arc` it was handed last frame.",
+            after.1 - before.1,
+        );
+        assert!(
+            after.0 > before.0,
+            "no call site answered from the table across five frames"
         );
     }
 
