@@ -728,6 +728,31 @@ pub trait SourceHandler: Send {
     }
 
     /// Bumped on every data replacement; drives texture cache invalidation.
+    ///
+    /// **A two-way contract, and only one direction of it shows as a bug.**
+    ///
+    /// Bump it whenever what this handler would draw is replaced, a round
+    /// that empties the set included. [`Self::per_frame_points`] is cached
+    /// under this number by the point pass, which keeps not only the
+    /// tessellated text but the culled, projected screen positions and
+    /// hit-tests clicks against them; a drawn set that moves under a still
+    /// generation therefore puts a click on the station that used to be
+    /// there. `set_data`, `set_data_with_coverage` and
+    /// [`OverlayState::release_data`] bump for you — a handler writing
+    /// [`OverlayState::data`] directly owes the bump itself. Pinned by
+    /// `a_round_that_changes_the_drawn_set_moves_the_generation`.
+    ///
+    /// Do **not** bump it when what you would draw is unchanged. A viewport
+    /// that settled, a fetch that failed, a control re-set to the value it
+    /// already held, a frame: a bump on one of those throws away a cull and a
+    /// projection of an identical list and pays for both again, and because
+    /// the picture it rebuilds is right, no test asserting output can see it.
+    /// **The question is the drawn set, not what moved it** — a layer whose
+    /// picture is a function of a pane choice earns the bump on that choice,
+    /// which is why the satellite and gridded handlers bump when a resident
+    /// channel is selected and the alerts handler bumps when a category
+    /// filter changes. Pinned by
+    /// `the_doors_that_change_no_drawn_set_leave_the_generation_alone`.
     fn data_generation(&self) -> u64;
 
     /// A cheap token for **what this handler would draw in this pane**: a

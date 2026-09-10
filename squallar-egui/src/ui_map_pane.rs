@@ -3804,6 +3804,17 @@ fn render_per_frame_overlay(
     // positions the cull kept, which is what the pass below hit-tests against
     // instead of walking the list again. A layer without a picture draws as it
     // always did.
+    //
+    // **`generation` is the one term this pass cannot check for itself.** The
+    // other six are read here, off the projector, the style and the atlas; the
+    // handler's is a promise that the number moves when the list it hands over
+    // does. A handler that replaces its drawn set without moving it is served
+    // this build's positions for a list that is gone, and the click below
+    // lands on the station that used to be there rather than the one drawn.
+    // The other half of that promise costs no correctness and so shows in no
+    // test: a bump the drawn set did not earn discards a cull and a projection
+    // of a list that is identical. `SourceHandler::data_generation` states
+    // both halves.
     let key = text_only.then(|| {
         crate::point_painter::PointTextKey::new(
             galleys,
