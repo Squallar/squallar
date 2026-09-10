@@ -44,16 +44,28 @@ struct CachedGranule {
 
 impl CachedGranule {
     fn new(granule_start: NaiveDateTime, flashes: Vec<GlmFlash>) -> Self {
-        let newest = flashes
-            .iter()
-            .map(|f| f.time)
-            .max()
-            .unwrap_or(granule_start);
+        let newest = granule_newest(granule_start, &flashes);
         CachedGranule {
             flashes: std::sync::Arc::new(flashes),
             newest,
         }
     }
+}
+
+/// **The instant a granule is aged by**, and the one half of
+/// [`GlmCache::evict_oldest_over`]'s sort key that is not the S3 key.
+///
+/// Shared with [`GranuleSink`] rather than spelled twice: the sink has to
+/// decide whether a granule that has only just parsed sits above or below a
+/// trim that has already happened, and a second definition of "how old is this
+/// granule" is exactly how that decision would drift out of agreement with the
+/// eviction it exists to match.
+fn granule_newest(granule_start: NaiveDateTime, flashes: &[GlmFlash]) -> NaiveDateTime {
+    flashes
+        .iter()
+        .map(|f| f.time)
+        .max()
+        .unwrap_or(granule_start)
 }
 
 #[derive(Default, Clone)]
@@ -140,6 +152,39 @@ pub const MAX_RETAINED_FLASHES: usize = 250_000;
 /// bounding at all.
 pub const GRANULE_FETCH_CONCURRENCY: usize = 20;
 
+/// **What one [`GlmCache::evict_oldest_over`] call actually did**, split by
+/// whether the rows came back.
+#[derive(Default, Clone, PartialEq, Eq, Debug)]
+pub struct Eviction {
+    pub granules: usize,
+    pub rows: usize,
+    /// Rows in granules this cache was the **last owner of** — the only ones
+    /// whose bytes the allocator gets back. See the method's own note.
+    pub sole_rows: usize,
+    /// **The highest sort key this trim refused**, in
+    /// [`GlmCache::evict_oldest_over`]'s own `(newest, key)` terms — the
+    /// retention floor a later arrival has to clear. `None` if nothing was
+    /// evicted.
+    ///
+    /// It carries the S3 key and not the instant alone because the *key* is
+    /// what breaks a tie in that method's sort, and both satellites publish on
+    /// the same 20 s grid: a floor that compared instants only would refuse a
+    /// tied granule the end-of-poll trim kept, and which of a tied pair
+    /// survived would then depend on which one the wire answered first.
+    pub floor: Option<(NaiveDateTime, String)>,
+}
+
+impl Eviction {
+    fn absorb(&mut self, other: Eviction) {
+        self.granules += other.granules;
+        self.rows += other.rows;
+        self.sole_rows += other.sole_rows;
+        if other.floor > self.floor {
+            self.floor = other.floor;
+        }
+    }
+}
+
 impl GlmCache {
     pub fn evict_before(&mut self, cutoff: NaiveDateTime) {
         let retained = &mut self.retained_flashes;
@@ -181,10 +226,19 @@ impl GlmCache {
     /// — the byte bound on span retention (see [`MAX_RETAINED_FLASHES`]).
     /// Whole granules so [`Self::contains_key`] stays the download planner's
     /// truth: a half-kept granule would be "cached" and never refetched.
-    pub fn evict_oldest_over(&mut self, cap: usize) {
+    ///
+    /// **What it reports is what it freed, not what it removed**, and the two
+    /// are different numbers: a poll works on a [`GlmStore::snapshot`], whose
+    /// granules are `Arc`s the store still holds, so removing a carried-in
+    /// granule from this map drops a refcount and nothing else. Only a
+    /// granule this cache is the last owner of returns bytes to the
+    /// allocator, and [`Eviction::sole_rows`] is that half — measured with
+    /// `Arc::strong_count` at the instant of removal rather than assumed.
+    pub fn evict_oldest_over(&mut self, cap: usize) -> Eviction {
+        let mut evicted = Eviction::default();
         let mut total = self.flash_count();
         if total <= cap {
-            return;
+            return evicted;
         }
         let mut by_age: Vec<(NaiveDateTime, String)> = self
             .entries
@@ -197,10 +251,27 @@ impl GlmCache {
                 break;
             }
             if let Some(granule) = self.entries.remove(&key) {
-                total -= granule.flashes.len();
-                self.retained_flashes = self.retained_flashes.saturating_sub(granule.flashes.len());
+                let rows = granule.flashes.len();
+                total -= rows;
+                self.retained_flashes = self.retained_flashes.saturating_sub(rows);
+                evicted.granules += 1;
+                evicted.rows += rows;
+                if std::sync::Arc::strong_count(&granule.flashes) == 1 {
+                    evicted.sole_rows += rows;
+                }
+                let refused = (granule.newest, key);
+                if Some(&refused) > evicted.floor.as_ref() {
+                    evicted.floor = Some(refused);
+                }
             }
         }
+        evicted
+    }
+
+    /// Granules held, for the fires-counter's before/after — a walk of the
+    /// map's own length, not a maintained level.
+    pub fn granule_count(&self) -> usize {
+        self.entries.len()
     }
 
     pub fn all_flashes(&self) -> impl Iterator<Item = &GlmFlash> {
@@ -363,15 +434,223 @@ pub async fn poll_glm_into_store(
     result
 }
 
-fn cache_granules(
-    cache: &mut GlmCache,
-    entries: Vec<(String, Vec<GlmFlash>)>,
-    as_of: NaiveDateTime,
-) {
-    for (key, flashes) in entries {
-        let granule_start = granule_start_of(&key, as_of);
-        cache.insert(key, granule_start, flashes);
+/// **What the streaming install actually did, across every poll of the
+/// process** — always on, no feature gate and no sampling, because the levels
+/// it reports are the whole evidence for the cut that introduced it.
+///
+/// Every figure names its denominator. `polls` is the number of polls that
+/// reached the install stage at all — the divisor for every other row here.
+/// `peak_rows` and `unstreamed_peak_rows` are **high-water marks over polls**,
+/// not sums: the largest single poll's cache high-water, against what that
+/// same poll would have held with one end-of-poll trim. They are directly
+/// comparable and their difference is this mechanism's saving, priced on the
+/// same poll of the same leg rather than across a night — which matters here
+/// because this app's `live_peak` has a 703 MiB within-night spread on
+/// identical code, so a paired before/after on the peak could not have said
+/// this.
+///
+/// `trim_sole_rows` is the honest half of the eviction. A poll works on a
+/// [`GlmStore::snapshot`], so a granule it evicts that the store still holds is
+/// a refcount and not a free; only a granule this cache was the last owner of
+/// returns bytes. See [`GlmCache::evict_oldest_over`].
+pub mod gauge {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    static POLLS: AtomicUsize = AtomicUsize::new(0);
+    static PEAK_ROWS: AtomicUsize = AtomicUsize::new(0);
+    static UNSTREAMED_PEAK_ROWS: AtomicUsize = AtomicUsize::new(0);
+    static TRIM_GRANULES: AtomicUsize = AtomicUsize::new(0);
+    static TRIM_ROWS: AtomicUsize = AtomicUsize::new(0);
+    static TRIM_SOLE_ROWS: AtomicUsize = AtomicUsize::new(0);
+    static REFUSED_GRANULES: AtomicUsize = AtomicUsize::new(0);
+    static REFUSED_ROWS: AtomicUsize = AtomicUsize::new(0);
+
+    /// One poll's figures, folded in. The two peaks are `fetch_max`, the trim
+    /// counts are sums.
+    pub(super) fn record(
+        peak_rows: usize,
+        unstreamed_peak_rows: usize,
+        trim: &super::Eviction,
+        refused_granules: usize,
+        refused_rows: usize,
+    ) {
+        POLLS.fetch_add(1, Relaxed);
+        PEAK_ROWS.fetch_max(peak_rows, Relaxed);
+        UNSTREAMED_PEAK_ROWS.fetch_max(unstreamed_peak_rows, Relaxed);
+        TRIM_GRANULES.fetch_add(trim.granules, Relaxed);
+        TRIM_ROWS.fetch_add(trim.rows, Relaxed);
+        TRIM_SOLE_ROWS.fetch_add(trim.sole_rows, Relaxed);
+        REFUSED_GRANULES.fetch_add(refused_granules, Relaxed);
+        REFUSED_ROWS.fetch_add(refused_rows, Relaxed);
     }
+
+    /// `(polls, peak_rows, unstreamed_peak_rows, trim_granules, trim_rows,
+    /// trim_sole_rows, refused_granules, refused_rows)`.
+    pub fn read() -> (usize, usize, usize, usize, usize, usize, usize, usize) {
+        (
+            POLLS.load(Relaxed),
+            PEAK_ROWS.load(Relaxed),
+            UNSTREAMED_PEAK_ROWS.load(Relaxed),
+            TRIM_GRANULES.load(Relaxed),
+            TRIM_ROWS.load(Relaxed),
+            TRIM_SOLE_ROWS.load(Relaxed),
+            REFUSED_GRANULES.load(Relaxed),
+            REFUSED_ROWS.load(Relaxed),
+        )
+    }
+}
+
+/// **Where a granule's rows go the instant they parse.**
+///
+/// They used to go into `PollAccumulator::entries`, a `Vec` that held every
+/// granule of every satellite until the poll's last download returned, at
+/// which point the whole set was inserted and *then* trimmed to
+/// [`MAX_RETAINED_FLASHES`]. So the ceiling bounded what a poll **left
+/// behind** and never what it **held**: the transient peak was the residency's
+/// entire download, and a residency is a loop's whole span rather than one
+/// window. Streaming the install moves the ceiling onto the peak, and the
+/// retained set at the end is unchanged — eviction is oldest-first and the
+/// total only ever grows, so the survivors are the newest suffix within the
+/// cap whether the trim runs once at the end or after every insert.
+///
+/// **The counters are not diagnostics.** `peak_rows` against
+/// `installed_rows + carried_rows` is this cut's own before/after, read on the
+/// same poll of the same leg, which is the only way to price it: this app's
+/// `live_peak` has a 703 MiB within-night spread on identical code.
+struct GranuleSink<'a> {
+    cache: &'a mut GlmCache,
+    /// Dates a granule whose key will not parse — see [`granule_start_of`].
+    as_of: NaiveDateTime,
+    /// `Some` exactly when the posture test in [`fetch_glm_flashes`] says the
+    /// ceiling applies. `None` is a live pane, whose window bounds it instead.
+    cap: Option<usize>,
+    /// Rows the cache carried into this poll, after `evict_before`.
+    carried_rows: usize,
+    /// Rows this poll installed, summed over every granule — including the
+    /// ones the cap dropped again. `carried_rows + installed_rows` is what the
+    /// cache would have held at the old end-of-poll trim.
+    installed_rows: usize,
+    installed_granules: usize,
+    /// High-water of the cache's own level across the poll.
+    peak_rows: usize,
+    /// **The fires-counter**: what the in-poll trim did, summed. Its `floor`
+    /// is also read back by [`Self::install`] — the trim's own refusal is what
+    /// tells a later arrival it is too old to admit.
+    evicted: Eviction,
+    /// Granules the floor refused before they reached the cache — rows the
+    /// end-of-poll trim would have admitted and then evicted, and which this
+    /// shape never inserts at all.
+    refused_granules: usize,
+    refused_rows: usize,
+}
+
+impl<'a> GranuleSink<'a> {
+    fn new(cache: &'a mut GlmCache, as_of: NaiveDateTime, cap: Option<usize>) -> Self {
+        let carried_rows = cache.retained_flashes();
+        GranuleSink {
+            cache,
+            as_of,
+            cap,
+            carried_rows,
+            installed_rows: 0,
+            installed_granules: 0,
+            peak_rows: carried_rows,
+            evicted: Eviction::default(),
+            refused_granules: 0,
+            refused_rows: 0,
+        }
+    }
+
+    /// **A granule below the retention floor is not admitted at all.**
+    ///
+    /// Without that test the streamed trim is not the end-of-poll trim: a
+    /// granule that arrives *after* the trim has already refused a newer one
+    /// fits under the ceiling by itself and is kept, leaving a **hole** in the
+    /// retained history — measured on a fixture whose arrivals ran
+    /// newest-first, where the end-of-poll trim kept slots 5–7 and the streamed
+    /// one kept 3, 5, 6, 7. More rows, and worse: each frame of a loop draws
+    /// its own window, so a gap in the middle is one frame blank between two
+    /// that are lit, which for a nowcasting signal reads as "no lightning
+    /// then" rather than as "not retained".
+    ///
+    /// With it, the retained set is the newest suffix within the ceiling in
+    /// every arrival order — the same set, granule for granule, that one
+    /// end-of-poll trim leaves. That is pinned exhaustively over every
+    /// permutation of a fixture by
+    /// `the_streamed_trim_keeps_what_one_end_of_poll_trim_would_have_kept`.
+    fn install(&mut self, key: String, flashes: Vec<GlmFlash>) {
+        let granule_start = granule_start_of(&key, self.as_of);
+        let newest = granule_newest(granule_start, &flashes);
+        if let Some(floor) = self.evicted.floor.as_ref()
+            && (newest, key.as_str()) <= (floor.0, floor.1.as_str())
+        {
+            self.refused_granules += 1;
+            self.refused_rows += flashes.len();
+            return;
+        }
+        self.installed_rows += flashes.len();
+        self.installed_granules += 1;
+        self.cache.insert(key, granule_start, flashes);
+        self.peak_rows = self.peak_rows.max(self.cache.retained_flashes());
+        if let Some(cap) = self.cap {
+            let evicted = self.cache.evict_oldest_over(cap);
+            self.evicted.absorb(evicted);
+        }
+    }
+
+    /// **The last trim, through the same counters as every other one, and the
+    /// poll's figures on the way out.**
+    ///
+    /// The trim here is the one the poll ran before the sink existed, kept
+    /// because a poll that installs nothing still has to bound a cache an
+    /// earlier poll left over the ceiling under a different posture. Counting
+    /// it here rather than outside is what makes [`gauge`]'s trim rows the
+    /// **whole** trim: a counter that saw only the in-stream half would read
+    /// zero on exactly the shape that regressed the streaming away, and a
+    /// mechanism whose counter cannot report its own absence is the defect the
+    /// counter exists to catch.
+    fn finish(self) -> PollLevels {
+        // Refused rows belong in the control: the old shape parked every
+        // downloaded granule and trimmed once, so a granule this floor turned
+        // away is a granule that used to be resident until the poll ended.
+        let unstreamed_peak_rows = self.carried_rows + self.installed_rows + self.refused_rows;
+        let GranuleSink {
+            cache,
+            cap,
+            installed_granules,
+            peak_rows,
+            mut evicted,
+            refused_granules,
+            refused_rows,
+            ..
+        } = self;
+        if let Some(cap) = cap {
+            evicted.absorb(cache.evict_oldest_over(cap));
+        }
+        PollLevels {
+            installed_granules,
+            peak_rows,
+            unstreamed_peak_rows,
+            evicted,
+            refused_granules,
+            refused_rows,
+        }
+    }
+}
+
+/// One poll's own figures, read out of the sink as it closes — see [`gauge`]
+/// for what each one's denominator is.
+struct PollLevels {
+    installed_granules: usize,
+    peak_rows: usize,
+    /// What the poll would have peaked at with the trim only at the end: every
+    /// row it carried in plus every row it installed, none of them freed until
+    /// the last download returned. **This poll's own control for its own
+    /// peak**, which is the only kind this app can price a memory cut with.
+    unstreamed_peak_rows: usize,
+    evicted: Eviction,
+    refused_granules: usize,
+    refused_rows: usize,
 }
 
 /// The instant a granule is aged against, from the S3 key it was listed under;
@@ -457,6 +736,22 @@ pub async fn fetch_glm_flashes(
 
     cache.evict_before(cutoff);
 
+    // **The byte bound on span retention, read once before a byte is
+    // downloaded** — because the trim it gates now runs after every install
+    // rather than after the last one, which is what puts the ceiling on what a
+    // poll HOLDS and not only on what it leaves behind. A live pane's cache is
+    // bounded by its window exactly as it always was; a span could otherwise
+    // hold a day of storm at Event level. Oldest first, so an overflowing loop
+    // keeps its newest hours lit.
+    //
+    // The posture test is the residency's own shape, unchanged and in the same
+    // place in the poll's order: a live pane asks for one range and nothing
+    // more, while a span or a loop asks for several — or for one much wider
+    // than a window, which is the span posture coalesced.
+    let cap = (depicted.ranges().len() > 1 || depicted.total() > longest_single_window())
+        .then_some(MAX_RETAINED_FLASHES);
+    let mut sink = GranuleSink::new(cache, as_of, cap);
+
     let mut acc = PollAccumulator::default();
     let mut dead_feeds = Vec::new();
     let mut window_gaps = Vec::new();
@@ -494,7 +789,7 @@ pub async fn fetch_glm_flashes(
             });
         }
 
-        let new_keys = plan_downloads(&listing.keys, cache, &listed, &mut tally);
+        let new_keys = plan_downloads(&listing.keys, sink.cache, &listed, &mut tally);
 
         if new_keys.is_empty() {
             continue;
@@ -505,7 +800,9 @@ pub async fn fetch_glm_flashes(
             sat.display_name()
         );
 
-        let batch = download_and_parse_batch(client, sources, sat, bucket, &new_keys, levels).await;
+        let batch =
+            download_and_parse_batch(client, sources, sat, bucket, &new_keys, levels, &mut sink)
+                .await;
         acc.absorb(sat, levels, batch);
     }
 
@@ -523,21 +820,40 @@ pub async fn fetch_glm_flashes(
         ));
     }
 
-    cache_granules(cache, std::mem::take(&mut acc.entries), as_of);
-
-    // The byte bound on span retention, **only under a span posture**: a live
-    // pane's cache is bounded by its window exactly as it always was, while a
-    // span could otherwise hold a day of storm at Event level. Oldest first,
-    // so an overflowing loop keeps its newest hours lit.
-    // The posture test is the residency's own total: a live pane asks for
-    // exactly one window and nothing more, while a span or a loop asks for
-    // several (or for one much wider than a window).
-    // The posture test is the residency's own shape: a live pane asks for one
-    // range and nothing more, while a span or a loop asks for several — or for
-    // one much wider than a window, which is the span posture coalesced.
-    if depicted.ranges().len() > 1 || depicted.total() > longest_single_window() {
-        cache.evict_oldest_over(MAX_RETAINED_FLASHES);
-    }
+    // **The counters, always on and off the frame thread.** `peak` is the
+    // cache's own high-water across the poll; `unstreamed` is what it would
+    // have been with the trim only at the end, which is the same poll's own
+    // control. `sole` is the half of the eviction that returned bytes to the
+    // allocator: a poll works on a `GlmStore::snapshot`, so a carried-in
+    // granule it drops is a refcount and not a free.
+    let PollLevels {
+        installed_granules,
+        peak_rows,
+        unstreamed_peak_rows,
+        evicted,
+        refused_granules,
+        refused_rows,
+    } = sink.finish();
+    gauge::record(
+        peak_rows,
+        unstreamed_peak_rows,
+        &evicted,
+        refused_granules,
+        refused_rows,
+    );
+    log::info!(
+        "GLM poll: {installed_granules} granules installed, peak {peak_rows} rows \
+         ({} B), unstreamed peak would be {unstreamed_peak_rows} rows ({} B); \
+         in-poll trim dropped {} granules / {} rows, {} of them sole ({} B \
+         freed); the floor refused {refused_granules} granules / \
+         {refused_rows} rows before they were cached",
+        peak_rows * FLASH_BYTES,
+        unstreamed_peak_rows * FLASH_BYTES,
+        evicted.granules,
+        evicted.rows,
+        evicted.sole_rows,
+        evicted.sole_rows * FLASH_BYTES,
+    );
 
     // Still keyed on `satellites`, not `queried`: a satellite whose listing
     // failed still has earlier granules in window. The upper bound is the
@@ -639,19 +955,6 @@ fn build_outcome(
 
 #[derive(Default)]
 struct PollAccumulator {
-    /// **Holds each granule's rows until the poll ends, and that costs
-    /// nothing** — `cache_granules` moves every `Vec<GlmFlash>` into an
-    /// `Arc`, which adopts the buffer the parser built, so the rows are here
-    /// or in the cache and never in both.
-    ///
-    /// Installing per satellite instead — so GOES-East's granules leave this
-    /// Vec before GOES-West is listed — was measured against
-    /// `tests/glm_poll_peak.rs::a_cold_poll_holds_one_row_buffer_per_delivery`
-    /// and moved the cold-poll peak by **0 B** (40,329,586 B either way, three
-    /// runs each), in a window that registers a whole-cache-sized term. It
-    /// would also put satellite 2's `plan_downloads` in front of a cache
-    /// already carrying satellite 1's new keys, for no bytes.
-    entries: Vec<(String, Vec<GlmFlash>)>,
     parse_errors: Vec<String>,
     transport_errors: Vec<String>,
     level_failures: Vec<LevelFailure>,
@@ -669,12 +972,11 @@ impl PollAccumulator {
         self.level_failures.extend(batch.level_failures);
         self.drops.absorb(batch.drops);
 
-        if !batch.entries.is_empty() {
+        if batch.installed > 0 {
             for &level in levels {
                 self.evaluated_levels.push((satellite, level));
             }
         }
-        self.entries.extend(batch.entries);
     }
 }
 
@@ -916,8 +1218,13 @@ fn parse_filename_start_time(key: &str) -> Option<NaiveDateTime> {
     Some(NaiveDateTime::new(date, time))
 }
 
+#[derive(Default)]
 struct BatchOutcome {
-    entries: Vec<(String, Vec<GlmFlash>)>,
+    /// **Granules this batch installed**, not the granules themselves: the rows
+    /// went straight into the cache through [`GranuleSink`] as each parse
+    /// returned. A count is all any caller ever read — `absorb` asks only
+    /// whether the batch learned anything about the levels it queried.
+    installed: usize,
     /// One message per file that downloaded but would not parse.
     parse_errors: Vec<String>,
     /// One message per file that never arrived, tracked separately so a network
@@ -928,6 +1235,16 @@ struct BatchOutcome {
     drops: RecordDrops,
 }
 
+/// **The stream is consumed one granule at a time and each one is installed
+/// before the next is taken**, which is what bounds a poll's rows by the cache's
+/// own ceiling rather than by the size of the residency.
+///
+/// It used to `.collect()` the whole `buffer_unordered` stream into a `Vec` and
+/// hand it back, so a satellite's every parsed granule was resident at once and
+/// then joined the *other* satellite's in `PollAccumulator::entries`. That is
+/// what made [`GRANULE_FETCH_CONCURRENCY`]'s bound on *bodies* the only bound
+/// this function had: the bodies were capped at twenty and the parsed rows at
+/// nothing.
 async fn download_and_parse_batch(
     client: &reqwest::Client,
     sources: &DataSources,
@@ -935,6 +1252,7 @@ async fn download_and_parse_batch(
     bucket: &str,
     keys: &[&str],
     levels: &[GlmDataLevel],
+    sink: &mut GranuleSink<'_>,
 ) -> BatchOutcome {
     use futures::stream::StreamExt;
 
@@ -965,39 +1283,60 @@ async fn download_and_parse_batch(
         })
         .collect();
 
-    let results: Vec<Result<(String, GranuleParse), FileError>> = futures::stream::iter(futs)
-        .buffer_unordered(GRANULE_FETCH_CONCURRENCY)
-        .collect()
-        .await;
-
-    BatchOutcome::from_results(results)
+    let mut stream = futures::stream::iter(futs).buffer_unordered(GRANULE_FETCH_CONCURRENCY);
+    let mut outcome = BatchOutcome::default();
+    while let Some(result) = stream.next().await {
+        outcome.absorb_one(result, sink);
+    }
+    outcome
 }
 
 impl BatchOutcome {
-    fn from_results(results: Vec<Result<(String, GranuleParse), FileError>>) -> Self {
-        let mut outcome = BatchOutcome {
-            entries: Vec::new(),
-            parse_errors: Vec::new(),
-            transport_errors: Vec::new(),
-            level_failures: Vec::new(),
-            drops: RecordDrops::default(),
-        };
-        for result in results {
-            match result {
-                Ok((key, parsed)) => {
-                    outcome.drops.absorb(parsed.drops);
-                    for failure in parsed.level_failures {
-                        if !outcome.level_failures.iter().any(|f: &LevelFailure| {
-                            f.satellite == failure.satellite && f.level == failure.level
-                        }) {
-                            outcome.level_failures.push(failure);
-                        }
+    /// One finished download, folded in — and its rows handed to the sink
+    /// rather than parked in this struct. The failure bookkeeping is byte for
+    /// byte what `from_results` did; only the rows changed owner.
+    fn absorb_one(
+        &mut self,
+        result: Result<(String, GranuleParse), FileError>,
+        sink: &mut GranuleSink<'_>,
+    ) {
+        match result {
+            Ok((key, parsed)) => {
+                self.drops.absorb(parsed.drops);
+                for failure in parsed.level_failures {
+                    if !self.level_failures.iter().any(|f: &LevelFailure| {
+                        f.satellite == failure.satellite && f.level == failure.level
+                    }) {
+                        self.level_failures.push(failure);
                     }
-                    outcome.entries.push((key, parsed.records));
                 }
-                Err(FileError::Parse(e)) => outcome.parse_errors.push(e),
-                Err(FileError::Transport(e)) => outcome.transport_errors.push(e),
+                self.installed += 1;
+                sink.install(key, parsed.records);
             }
+            Err(FileError::Parse(e)) => self.parse_errors.push(e),
+            Err(FileError::Transport(e)) => self.transport_errors.push(e),
+        }
+    }
+}
+
+#[cfg(test)]
+impl BatchOutcome {
+    /// **The shape [`BatchOutcome::absorb_one`] replaced**, kept for the
+    /// partition arms: they ask what this function does with a mixed batch of
+    /// successes and both failure kinds, and that is unchanged. The rows now
+    /// need somewhere to go, so it folds through a sink over a scratch cache
+    /// with no cap — the arms assert on the failure buckets and the installed
+    /// count, never on the cache.
+    fn from_results(results: Vec<Result<(String, GranuleParse), FileError>>) -> Self {
+        let mut cache = GlmCache::default();
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let mut sink = GranuleSink::new(&mut cache, epoch, None);
+        let mut outcome = BatchOutcome::default();
+        for result in results {
+            outcome.absorb_one(result, &mut sink);
         }
         outcome
     }

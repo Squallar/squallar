@@ -1069,3 +1069,230 @@ fn a_batch_holds_no_more_bodies_than_the_concurrency_cap() {
         GRANULE_FETCH_CONCURRENCY * granule_bytes,
     );
 }
+
+// ── The retention ceiling, on the peak rather than on the leftovers ────────
+
+/// Granules one satellite publishes into the span below, at one per 20 s.
+///
+/// **Sized against [`MAX_RETAINED_FLASHES`] and not against a window**, which
+/// is the whole point of the fixture: two satellites at
+/// [`COLD_ROWS_PER_LEVEL`] rows in each of [`COLD_LEVELS`] is
+/// `2 × 50 × 14 000 = 1 400 000` rows, **5.6× the ceiling**. The nearest prior
+/// arm, `a_cold_poll_holds_one_row_buffer_per_delivery`, polls 30 objects into
+/// a 300 s live window for 420 000 rows and never reaches the ceiling at all,
+/// so it could not have seen this defect however it was written — the class
+/// needs a poll that downloads several times what it is allowed to keep.
+///
+/// The ratio is not arbitrary: 5.6× is the ratio a HEAVY6 leg's own
+/// `GLM: … flashes held over …s of residency in N range(s)` lines imply, at
+/// residencies of 1500–4073 s across up to 12 ranges.
+const SPAN_GRANULES_PER_SAT: usize = 50;
+
+/// A residency wider than any live pane's window, which is the second disjunct
+/// of the posture test in `fetch_glm_flashes` — a loop's span, coalesced. One
+/// range, so it is the *total* and not the range count that arms the ceiling,
+/// and the arm therefore holds for the single-range shape too.
+fn a_spanned_window() -> Residency {
+    Residency::over([(as_of() - TimeDelta::seconds(2_000), as_of())])
+}
+
+/// **The ceiling bounds what a poll HOLDS, not only what it leaves behind.**
+///
+/// Red before the streaming install, and by a factor the fixture chooses:
+/// `PollAccumulator::entries` held every granule of every satellite until the
+/// last download returned, and the trim to [`MAX_RETAINED_FLASHES`] ran once,
+/// after all of them. So a poll's transient peak was the *residency's whole
+/// download* — 1 400 000 rows, 67 200 000 B here — while the figure the
+/// constant advertises is 250 000 rows and 12 000 000 B. The ceiling described
+/// the leftovers.
+///
+/// **The retained set is the same set either way, and that is what makes this
+/// safe rather than a trade.** Eviction removes the globally-oldest granule
+/// present and a poll's total only ever grows, so the survivors are the newest
+/// suffix within the ceiling whether the trim runs once at the end or after
+/// every install — and independently of the order `buffer_unordered` completes
+/// in, which is the property that matters now that the trim runs inside the
+/// stream. The assertions below pin the *set*, by key, not just its size.
+///
+/// **Floor — `trim_at_the_end`: move the `evict_oldest_over` call out of
+/// `GranuleSink::install` and back to a single call after the satellite loop.**
+/// The key and row assertions stay green, which is the point; the peak bar
+/// reads ~67 MB against a ~34 MB bar and fails.
+#[test]
+fn a_spanned_poll_holds_no_more_rows_than_it_is_allowed_to_keep() {
+    use squallar_overlays::glm::fetch::MAX_RETAINED_FLASHES;
+
+    let east: Vec<(String, Vec<u8>)> = archive_keys("G19", SPAN_GRANULES_PER_SAT)
+        .into_iter()
+        .map(|(key, start)| (key, a_granule(start, 33.0, COLD_ROWS_PER_LEVEL, 0)))
+        .collect();
+    let west: Vec<(String, Vec<u8>)> = archive_keys("G18", SPAN_GRANULES_PER_SAT)
+        .into_iter()
+        .map(|(key, start)| (key, a_granule(start, 41.0, COLD_ROWS_PER_LEVEL, 0)))
+        .collect();
+
+    let rows_per_granule = COLD_ROWS_PER_LEVEL * COLD_LEVELS.len();
+    let downloaded_rows = rows_per_granule * SPAN_GRANULES_PER_SAT * 2;
+    assert!(
+        downloaded_rows > 4 * MAX_RETAINED_FLASHES,
+        "non-triviality floor: the fixture must download several times the \
+         ceiling ({downloaded_rows} rows against {MAX_RETAINED_FLASHES}), or \
+         the trim never runs and this arm asks nothing of it",
+    );
+
+    let before = squallar_overlays::glm::fetch::gauge::read();
+    let (store, outcome, peak) = peak_of_a_cold_poll(east, west, a_spanned_window(), None);
+    let after = squallar_overlays::glm::fetch::gauge::read();
+
+    // ── What survived, by key ──
+    //
+    // Read off the fixture's own key list, not `granule_contents`: that helper
+    // enumerates the *seeded* fixture's `granule_key` shape, and a poll of the
+    // archive caches `archive_keys`' shape. Asking it here answered 9 of 17
+    // retained granules — a reader's own miss, which is why the row and byte
+    // levels below are asserted against the same set rather than beside it.
+    let served: Vec<(String, usize)> = ["G19", "G18"]
+        .iter()
+        .flat_map(|d| {
+            archive_keys(d, SPAN_GRANULES_PER_SAT)
+                .into_iter()
+                .enumerate()
+                .map(|(i, (key, _))| (key, i))
+        })
+        .collect();
+    let retained_keys: Vec<&(String, usize)> = store.with_mut(|cache: &mut GlmCache| {
+        served
+            .iter()
+            .filter(|(key, _)| cache.contains_key(key))
+            .collect()
+    });
+    let retained = retained_keys.len();
+    let expected_retained = MAX_RETAINED_FLASHES / rows_per_granule;
+    assert_eq!(
+        retained, expected_retained,
+        "the trim must keep every granule that fits under the ceiling and no \
+         more: {MAX_RETAINED_FLASHES} rows at {rows_per_granule} a granule is \
+         {expected_retained}",
+    );
+    // Both satellites publish on the same 20 s grid, so the newest `n`
+    // granules are the newest `ceil(n/2)` publication slots.
+    let newest_slot = expected_retained.div_ceil(2) - 1;
+    for (key, slot) in &retained_keys {
+        assert!(
+            *slot <= newest_slot,
+            "eviction is oldest-first, so every survivor must come from the \
+             newest {} publications; {key} is #{slot}",
+            newest_slot + 1,
+        );
+    }
+
+    // **Neither satellite is starved.** The satellites are downloaded in
+    // sequence and now share one ceiling *inside* the poll rather than meeting
+    // it at the end, so a floor raised by GOES-East's granules is a floor
+    // GOES-West's have to clear. They publish on the same 20 s grid, so both
+    // must be represented in the survivors — a fix that quietly kept only the
+    // satellite that downloaded first would pass every byte assertion here.
+    for designator in ["G19", "G18"] {
+        assert!(
+            retained_keys
+                .iter()
+                .any(|(key, _)| key.contains(&format!("_{designator}_"))),
+            "{designator} has no granule in the retained set: the two \
+             satellites share one ceiling within a poll, and the one listed \
+             second must not be shut out of it",
+        );
+    }
+
+    // ── What a pane draws ──
+    assert_eq!(
+        outcome.flashes.len(),
+        retained * rows_per_granule,
+        "the delivery is the retained set filtered to the residency, and the \
+         residency covers every granule the fixture serves",
+    );
+    assert_eq!(
+        store.retained_bytes(),
+        retained * rows_per_granule * FLASH_BYTES,
+        "the level must agree with the survivors",
+    );
+    assert!(
+        store.retained_bytes() <= MAX_RETAINED_FLASHES * FLASH_BYTES,
+        "the ceiling is a ceiling",
+    );
+
+    // ── The fires-counter, in both its halves ──
+    //
+    // A granule the ceiling does not admit is accounted for exactly once: the
+    // trim evicted it after it was cached, or the retention floor refused it
+    // before it ever was. The second half is the one that costs nothing at all
+    // — rows that never enter the map — so the split is worth reporting rather
+    // than summing away.
+    let trim_granules = after.3 - before.3;
+    let trim_rows = after.4 - before.4;
+    let trim_sole_rows = after.5 - before.5;
+    let refused_granules = after.6 - before.6;
+    let refused_rows = after.7 - before.7;
+    assert_eq!(
+        trim_granules + refused_granules,
+        SPAN_GRANULES_PER_SAT * 2 - retained,
+        "every granule the ceiling did not admit must have been either trimmed \
+         or refused, and the counters must have seen it — a mechanism that \
+         fires zero times is the defect these counters exist to catch",
+    );
+    assert!(
+        trim_granules > 0 && refused_granules > 0,
+        "both halves must fire on this fixture, or one of them is untested \
+         here: trimmed {trim_granules}, refused {refused_granules}",
+    );
+    assert_eq!(
+        (trim_rows + refused_rows) / rows_per_granule,
+        trim_granules + refused_granules,
+        "the row counters must agree with the granule counters",
+    );
+    assert_eq!(
+        trim_sole_rows, trim_rows,
+        "this poll is the only holder of the granules it downloaded — a cold \
+         store, so nothing carried in behind an `Arc` — and every trimmed row \
+         must therefore be a row the allocator gets back rather than a \
+         refcount",
+    );
+    println!(
+        "counters: trimmed {trim_granules} granules / {trim_rows} rows ({} B, \
+         all sole); floor refused {refused_granules} granules / {refused_rows} \
+         rows before they were cached ({} B never inserted)",
+        trim_rows * FLASH_BYTES,
+        refused_rows * FLASH_BYTES,
+    );
+
+    // ── The peak ──
+    let ceiling = MAX_RETAINED_FLASHES * FLASH_BYTES;
+    let unstreamed = downloaded_rows * FLASH_BYTES;
+    println!(
+        "spanned poll: {} granules × {rows_per_granule} rows downloaded = \
+         {downloaded_rows} rows ({unstreamed} B) for a {MAX_RETAINED_FLASHES}-row \
+         ceiling ({ceiling} B); {retained} granules retained; PEAK {peak} B = \
+         {:.3}× the ceiling, {:.3}× the download",
+        SPAN_GRANULES_PER_SAT * 2,
+        peak as f64 / ceiling as f64,
+        peak as f64 / unstreamed as f64,
+    );
+
+    // One ceiling of cache, one delivery presized from it, and 10 MB for the
+    // `GRANULE_FETCH_CONCURRENCY` file buffers in flight (20 × ~281 KB = 5.6 MB),
+    // the granule under the parser and the listings. A poll that accumulates
+    // its whole download cannot fit under this and does not have to be close.
+    let bar = ceiling * 2 + 10_000_000;
+    assert!(
+        (peak as usize) < bar,
+        "a poll allowed to keep {ceiling} B peaked at {peak} B ({:.3}× the \
+         ceiling), over the {bar} B that one ceiling plus one delivery plus the \
+         file buffers costs. Accumulating every granule until the last download \
+         returns puts the whole {unstreamed} B download in this window.",
+        peak as f64 / ceiling as f64,
+    );
+    assert!(
+        unstreamed > bar,
+        "non-triviality floor: the bar must be one the old shape could not \
+         clear ({unstreamed} B download against a {bar} B bar)",
+    );
+}

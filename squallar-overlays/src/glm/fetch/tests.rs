@@ -261,7 +261,7 @@ fn batch_partition_keeps_every_error_and_separates_the_kinds() {
         Err(FileError::Transport("c.nc: HTTP status error: 503".into())),
         Err(FileError::Parse("d.nc: bad variable".into())),
     ]);
-    assert_eq!(outcome.entries.len(), 1);
+    assert_eq!(outcome.installed, 1);
     assert_eq!(
         outcome.parse_errors,
         vec!["b.nc: bad variable", "d.nc: bad variable"]
@@ -372,7 +372,7 @@ fn the_accumulator_forwards_every_bucket() {
         GlmSatellite::GoesWest,
         &[GlmDataLevel::Group, GlmDataLevel::Flash],
         BatchOutcome {
-            entries: vec![("a.nc".into(), Vec::new())],
+            installed: 1,
             parse_errors: vec!["p".into()],
             transport_errors: vec!["t".into()],
             level_failures: vec![level_failure(GlmSatellite::GoesWest, GlmDataLevel::Flash)],
@@ -384,7 +384,10 @@ fn the_accumulator_forwards_every_bucket() {
         },
     );
 
-    assert_eq!(acc.entries.len(), 1);
+    // The rows are the sink's now (`BatchOutcome::installed` is a count), so
+    // what this arm can still ask of `absorb` is that a batch which installed
+    // something is treated as evidence — the assertion on `evaluated_levels`
+    // below, which is the only thing the old `entries` length was read for.
     assert_eq!(
         (
             acc.drops.considered,
@@ -419,7 +422,7 @@ fn a_batch_that_parsed_nothing_is_not_evidence() {
         GlmSatellite::GoesEast,
         &[GlmDataLevel::Flash],
         BatchOutcome {
-            entries: Vec::new(),
+            installed: 0,
             parse_errors: vec!["every file failed".into()],
             transport_errors: Vec::new(),
             level_failures: Vec::new(),
@@ -692,7 +695,7 @@ fn a_quiet_granule_is_downloaded_once_not_once_per_poll() {
 }
 
 #[test]
-fn cache_granules_keeps_the_empty_ones_too() {
+fn the_install_door_keeps_the_empty_granules_too() {
     let busy = "GLM-L2-LCFA/2026/205/12/\
                     OR_GLM-L2-LCFA_G19_s20262051200000_e20262051200200_c20262051200214.nc";
     let quiet = "GLM-L2-LCFA/2026/205/12/\
@@ -700,14 +703,13 @@ fn cache_granules_keeps_the_empty_ones_too() {
     let now = wall_clock_unlike_keys();
 
     let mut cache = GlmCache::default();
-    cache_granules(
-        &mut cache,
-        vec![
-            (busy.to_string(), vec![flash_at(t0())]),
-            (quiet.to_string(), Vec::new()),
-        ],
-        now,
-    );
+    // Through the sink, which is the install door now that a granule reaches
+    // the cache the instant it parses rather than in one end-of-poll batch.
+    {
+        let mut sink = GranuleSink::new(&mut cache, now, None);
+        sink.install(busy.to_string(), vec![flash_at(t0())]);
+        sink.install(quiet.to_string(), Vec::new());
+    }
 
     assert!(cache.contains_key(busy));
     assert!(
@@ -3313,4 +3315,160 @@ fn cloning_the_cache_shares_the_granule_rows_rather_than_copying_them() {
          granule is what put a whole second `retained_bytes` on the heap for \
          the length of every poll",
     );
+}
+
+/// **The streamed trim keeps exactly the granules one end-of-poll trim kept,
+/// in EVERY arrival order** — which is the whole product-safety argument for
+/// moving it, and it has to be an argument about a *set*, because lightning is
+/// a nowcasting signal and a flash a pane could have drawn is a regression
+/// whatever the byte figure says.
+///
+/// **Exhaustive over all 40 320 permutations of eight granules**, not over three
+/// hand-picked orders, because the first version of this arm picked three and
+/// the fourth order was the one that broke: `buffer_unordered` completes in
+/// whatever order the wire answers, so the trim runs against a partially
+/// arrived cache an arbitrary number of times, and the shape that fails is a
+/// granule arriving *after* the trim has already refused a newer one. Kept
+/// under the ceiling by itself, it left a **hole** — measured newest-first at
+/// slots {3, 5, 6, 7} where the end-of-poll trim keeps {5, 6, 7}. More rows
+/// retained, and worse: each frame of a loop draws its own window, so a gap in
+/// the middle is one blank frame between two lit ones, which reads as "no
+/// lightning then".
+///
+/// `GranuleSink::install` closes it with a retention floor — the highest
+/// `(newest, key)` the trim has refused, in `evict_oldest_over`'s own sort
+/// terms so that a tie between the two satellites' 20 s grids breaks the same
+/// way it does there.
+///
+/// Row counts deliberately differ per granule: a uniform fixture puts the
+/// ceiling on a granule boundary, where every order agrees for a reason that
+/// has nothing to do with the invariant.
+///
+/// **Floor — `no_floor`: delete the refusal branch from `GranuleSink::install`.**
+/// The arm then fails, and a seven-slot version of this very fixture did NOT —
+/// it passed with the refusal removed, which is why the eighth slot is here.
+/// The class needs a slot small enough to fit under the ceiling on its own
+/// after a bigger, newer one has already been refused; slot 3 at nine rows is
+/// that slot, and slot 4 at twenty-six is the one it slips in behind. The
+/// witness this scan reaches first is
+/// `[4, 7, 5, 3, 2, 1, 0, 6]`.
+#[test]
+fn the_streamed_trim_keeps_what_one_end_of_poll_trim_would_have_kept() {
+    const CAP: usize = 100;
+    let base = t0();
+    // (slot, rows) — slot 0 is the oldest. Uneven rows so the ceiling falls
+    // inside a granule rather than between two.
+    let granules: Vec<(usize, usize)> = vec![
+        (0, 31),
+        (1, 17),
+        (2, 44),
+        (3, 9),
+        (4, 26),
+        (5, 38),
+        (6, 12),
+        (7, 41),
+    ];
+    let total: usize = granules.iter().map(|(_, rows)| rows).sum();
+    assert!(
+        total > CAP,
+        "non-triviality floor: {total} rows must overflow the {CAP}-row \
+         ceiling, or no arm trims anything and every set trivially agrees",
+    );
+
+    let seed = |(slot, rows): (usize, usize)| {
+        let start = base + TimeDelta::minutes(slot as i64 * 30);
+        let flashes: Vec<GlmFlash> = (0..rows)
+            .map(|i| flash_at(start + TimeDelta::milliseconds(i as i64)))
+            .collect();
+        (granule_key(start), start, flashes)
+    };
+
+    // The control: install every granule, then trim once — the shape the poll
+    // had before the sink existed.
+    let control = {
+        let mut cache = GlmCache::default();
+        for g in granules.iter().copied() {
+            let (key, start, flashes) = seed(g);
+            cache.insert(key, start, flashes);
+        }
+        assert_eq!(
+            cache.flash_count(),
+            total,
+            "premise: the control must hold the whole fixture before it trims",
+        );
+        cache.evict_oldest_over(CAP);
+        let mut keys = cached_keys(&cache);
+        keys.sort();
+        keys
+    };
+    assert!(
+        control.len() < granules.len(),
+        "premise: the control must have dropped something ({} of {} kept)",
+        control.len(),
+        granules.len(),
+    );
+
+    let mut orders = 0usize;
+    for order in permutations(&granules) {
+        orders += 1;
+        let mut cache = GlmCache::default();
+        let mut sink = GranuleSink::new(&mut cache, base, Some(CAP));
+        for g in order.iter().copied() {
+            let (key, _, flashes) = seed(g);
+            sink.install(key, flashes);
+            assert!(
+                sink.cache.flash_count() <= CAP,
+                "the ceiling must hold after every install, which is the whole \
+                 point of moving the trim into the stream; order {order:?}",
+            );
+        }
+        let levels = sink.finish();
+        let mut keys = cached_keys(&cache);
+        keys.sort();
+        assert_eq!(
+            keys, control,
+            "the streamed trim kept a different set of granules than one \
+             end-of-poll trim would have, on arrival order {order:?}. Both must \
+             settle on the newest suffix within the ceiling — a difference here \
+             is a flash a pane could have drawn and now cannot",
+        );
+        assert_eq!(
+            levels.evicted.rows + levels.refused_rows,
+            total - cache.flash_count(),
+            "every row that did not survive must be accounted for by the \
+             counters, as either trimmed or refused; order {order:?}",
+        );
+        assert_eq!(
+            levels.evicted.sole_rows, levels.evicted.rows,
+            "nothing else holds these granules, so every evicted row is a row \
+             the allocator gets back — the `sole` half of the figure",
+        );
+    }
+    assert_eq!(
+        orders, 40_320,
+        "premise: every permutation of eight granules"
+    );
+}
+
+/// Every ordering of `items`, by Heap's algorithm — the arrival orders
+/// `buffer_unordered` may produce, enumerated rather than sampled.
+fn permutations<T: Copy>(items: &[T]) -> Vec<Vec<T>> {
+    let mut current: Vec<T> = items.to_vec();
+    let mut out = Vec::new();
+    let mut counters = vec![0usize; current.len()];
+    out.push(current.clone());
+    let mut i = 0;
+    while i < current.len() {
+        if counters[i] < i {
+            let swap_with = if i % 2 == 0 { 0 } else { counters[i] };
+            current.swap(swap_with, i);
+            out.push(current.clone());
+            counters[i] += 1;
+            i = 0;
+        } else {
+            counters[i] = 0;
+            i += 1;
+        }
+    }
+    out
 }
