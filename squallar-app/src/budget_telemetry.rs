@@ -1238,6 +1238,22 @@ pub(crate) fn base_way_back_line(counts: BaseWayBackCounts) -> String {
     )
 }
 
+/// **How often the archive byte ceiling was told to keep a released base's
+/// only way back**, as a running total.
+///
+/// `held` is one count per pinned archive per pass that was actually over the
+/// ceiling — never a level, and never added to the `chunk archives:` figures
+/// below, which count volumes.
+///
+/// It is always on for the reason every counter on this path is: a stranded
+/// base and a base that was never released read identically from every other
+/// instrument this application has, so a pin that never fires and a pin that
+/// works are indistinguishable without it. Two counters shipped reading zero
+/// on this exact mechanism before it existed.
+pub(crate) fn way_back_pin_line(held: u64) -> String {
+    format!("way-back pins: archive ceiling held {held}")
+}
+
 /// **The way back the chunk feed keeps for its own volumes**, as running
 /// totals and one level.
 ///

@@ -329,6 +329,17 @@ pub struct LoopDownloadManager {
     /// holding 25 archives and no volumes read like one holding half a
     /// volume, and the census family that reports it could not say which.
     archive_bytes_cached: usize,
+    /// **How many times the byte ceiling was told to keep an archive it would
+    /// otherwise have evicted** — see [`Self::evict_archives_to_ceiling`]'s
+    /// `pinned`.
+    ///
+    /// A running total, incremented once per pinned archive per pass that was
+    /// actually over the ceiling, and never a level: what it exists to say is
+    /// whether the pin has ever fired on a running app. The mechanism it
+    /// guards has no other witness — a stranded base and a base that was never
+    /// released read identically from every other counter — and two counters
+    /// on this exact path have shipped reading zero.
+    archives_pinned_to_ceiling: u64,
     /// **Decodes dispatched and not yet landed, with the bytes each was
     /// reserved at** — the site's reserve at dispatch. Keyed as the caches
     /// are; a key here is also in `in_flight_set`, never the reverse.
@@ -483,6 +494,7 @@ impl LoopDownloadManager {
             scan_cache: HashMap::new(),
             archive_cache: HashMap::new(),
             archive_bytes_cached: 0,
+            archives_pinned_to_ceiling: 0,
             decodes_in_flight: HashMap::new(),
             decode_reserved_bytes: 0,
             in_flight_set: HashMap::new(),
@@ -1144,11 +1156,39 @@ impl LoopDownloadManager {
     /// which is exactly what a frame costs today — the policy degrades to
     /// current behaviour rather than to something worse.
     ///
+    /// # `pinned`, and why it is not optional
+    ///
+    /// **For one archive it is not a re-download, it is nothing at all.** A
+    /// merge base whose gates `App::release_unneeded_base_gates` has withdrawn
+    /// has exactly one way back — the compressed bytes held here — and
+    /// `App::ensure_base_whole` has nowhere else to ask. Evicting that archive
+    /// does not cost the frame a download; it leaves a base that can never be
+    /// made whole again, and a cross-section or 3D pane that asks for its
+    /// gates waits forever.
+    ///
+    /// Worse, on the plainest scene there is that archive is the FIRST one this
+    /// pass reaches. Where no live loop frame names the released base's volume
+    /// — every site that is not looping, which is REST1's own shape — the
+    /// caller's distance rank has no entry for it, answers `u64::MAX`, and the
+    /// sort puts it at the head of the eviction order ahead of every named
+    /// frame. A looping site whose newest frame IS the base is ranked
+    /// ordinarily and is not the first to go, so the hazard is not universal;
+    /// it is also not a corner, because the unlooped case is the common one and
+    /// it is the worst-ranked case rather than the best.
+    ///
+    /// It is a candidate FILTER and not a stop, mirroring
+    /// [`Self::evict_decoded_to_ceiling`]'s: a pinned archive is never ranked,
+    /// so it can never be reached however far over the ceiling this cache is,
+    /// and the pass goes on evicting whatever else it can. A cache that is over
+    /// the ceiling in pinned archives alone stays over it, which is the correct
+    /// direction — the alternative is a stranded volume.
+    ///
     /// O(held) and only when over the ceiling; held is a few dozen.
     pub fn evict_archives_to_ceiling(
         &mut self,
         ceiling: usize,
         rank: impl Fn(&str, &chrono::NaiveDateTime) -> u64,
+        pinned: impl Fn(&str, &chrono::NaiveDateTime, Option<chrono::NaiveDateTime>) -> bool,
     ) -> usize {
         if self.archive_bytes_cached <= ceiling {
             return 0;
@@ -1158,6 +1198,19 @@ impl LoopDownloadManager {
         // entry, and a nested `map` would have to move it.
         for (site, archives) in &self.archive_cache {
             for (ts, archive) in archives {
+                // The identity is resolved HERE, for
+                // [`Self::retain_archives`]' reason: the index is this type's
+                // and a caller that wanted to ask it would have to borrow the
+                // manager immutably while this method holds it mutably. A
+                // released base is keyed by its volume's own identity and the
+                // archive by the address the listing gave it, and on a
+                // chunk-fed volume those are not the same instant.
+                let collected = self.archive_identity.get(&(site.clone(), *ts)).copied();
+                if pinned(site.as_str(), ts, collected) {
+                    self.archives_pinned_to_ceiling =
+                        self.archives_pinned_to_ceiling.saturating_add(1);
+                    continue;
+                }
                 held.push((
                     rank(site.as_str(), ts),
                     site.clone(),
@@ -1195,6 +1248,13 @@ impl LoopDownloadManager {
             }
         }
         freed
+    }
+
+    /// **How many archives the byte ceiling has been told to keep** because a
+    /// released merge base's only way back runs through them. A running total;
+    /// see the field.
+    pub fn archives_pinned_to_ceiling(&self) -> u64 {
+        self.archives_pinned_to_ceiling
     }
 
     /// **Tell this cache what a volume is presumed to cost** before anything
@@ -3894,7 +3954,7 @@ mod archive_tests {
             "an archive with no volume beside it left its key behind",
         );
         mgr.cache_archive("KTLX", ts(3), Arc::new(vec![0u8; 64]));
-        mgr.evict_archives_to_ceiling(0, |_, _| 0);
+        mgr.evict_archives_to_ceiling(0, |_, _| 0, |_, _, _| false);
         assert_eq!(
             mgr.archives_ever.len(),
             0,
@@ -4017,9 +4077,11 @@ mod archive_tests {
         );
 
         // Furthest from the playhead first: minute 0 is the playhead.
-        let freed = mgr.evict_archives_to_ceiling(CEILING, |_, at| {
-            (at.and_utc().timestamp() - ts(0).and_utc().timestamp()) as u64
-        });
+        let freed = mgr.evict_archives_to_ceiling(
+            CEILING,
+            |_, at| (at.and_utc().timestamp() - ts(0).and_utc().timestamp()) as u64,
+            |_, _, _| false,
+        );
 
         assert!(freed > 0, "nothing was evicted");
         assert!(
@@ -4034,6 +4096,154 @@ mod archive_tests {
         assert!(
             !mgr.has_archive("KTLX", &ts(24)),
             "the furthest archive survived while the ceiling was exceeded"
+        );
+    }
+
+    /// **Without a pin the byte ceiling takes a released base's way back
+    /// FIRST**, ahead of every loop frame it is holding — the defect, forced
+    /// rather than argued.
+    ///
+    /// The scene is the one `App::release_unneeded_base_gates` leaves behind:
+    /// a volume whose decoded half has been withdrawn and whose compressed half
+    /// is the only thing that can bring it back, beside a loop holding 25
+    /// maximum-sized archives that put the cache over its ceiling. No live
+    /// frame names the released base's address — the pane holding it is not
+    /// looping — so the caller's distance rank answers `u64::MAX` for it and the
+    /// sort puts it at the head of the queue, ahead of all 25.
+    ///
+    /// This is `pinned` answering `false`, which is what the parameter's
+    /// absence was until 2026-09-10: the archive goes, `ensure_base_whole` has
+    /// nothing to decode from, and a cross-section or 3D pane on that site
+    /// waits for gates that can never arrive.
+    #[test]
+    fn without_a_pin_the_ceiling_takes_a_released_bases_way_back_before_any_loop_frame() {
+        const CEILING: usize = 96 * 1024 * 1024;
+        let released_at = ts(50);
+        let mut mgr = LoopDownloadManager::new();
+
+        // The released base: its identity is learned from the volume, the
+        // volume is then withdrawn, and the archive is all that is left.
+        mgr.cache_archive("KTLX", released_at, archive(CORPUS_MIN_ARCHIVE));
+        mgr.cache_scan("KTLX", released_at, priced_volume());
+        drop(mgr.evict_decoded_except(|site, at, _| !(site == "KTLX" && *at == released_at)));
+        assert!(
+            mgr.has_archive("KTLX", &released_at),
+            "precondition: the release keeps the archive it released against",
+        );
+
+        // The loop, whose frames are all nearer a playhead than the released
+        // base, which no frame names at all.
+        for minute in 0..25u32 {
+            mgr.cache_archive("KTLX", ts(minute), archive(CORPUS_MAX_ARCHIVE));
+        }
+        assert!(
+            mgr.cached_archive_bytes() > CEILING,
+            "precondition: the cache must be over the ceiling for the pass to run",
+        );
+
+        let freed = mgr.evict_archives_to_ceiling(
+            CEILING,
+            |_, at| {
+                if *at == released_at {
+                    u64::MAX
+                } else {
+                    (at.and_utc().timestamp() - ts(0).and_utc().timestamp()) as u64
+                }
+            },
+            |_, _, _| false,
+        );
+
+        assert!(freed > 0, "nothing was evicted, so nothing is being shown");
+        assert!(
+            !mgr.has_archive("KTLX", &released_at),
+            "the scene the pin exists for did not arise: the released base's way \
+             back survived an unpinned ceiling, so this test cannot show what \
+             pinning it buys",
+        );
+        assert_eq!(
+            mgr.archives_pinned_to_ceiling(),
+            0,
+            "nothing was pinned and the counter moved anyway",
+        );
+    }
+
+    /// **The pin keeps it, and keeps only it.**
+    ///
+    /// The same scene with the predicate the application passes. The way back
+    /// survives, the ceiling is still enforced against everything else, and the
+    /// counter says the pin fired — which is the only witness there is: a
+    /// stranded base and a base that was never released read identically from
+    /// every other instrument.
+    ///
+    /// TAMPER: return `false` from the pin and this is the test above.
+    #[test]
+    fn the_ceiling_will_not_take_a_released_bases_way_back() {
+        const CEILING: usize = 96 * 1024 * 1024;
+        let released_at = ts(50);
+        let mut mgr = LoopDownloadManager::new();
+
+        mgr.cache_archive("KTLX", released_at, archive(CORPUS_MIN_ARCHIVE));
+        mgr.cache_scan("KTLX", released_at, priced_volume());
+        let identity = crate::types::volume_collected_at(&priced_volume().0)
+            .expect("the fixture volume has a first radial");
+        drop(mgr.evict_decoded_except(|site, at, _| !(site == "KTLX" && *at == released_at)));
+        for minute in 0..25u32 {
+            mgr.cache_archive("KTLX", ts(minute), archive(CORPUS_MAX_ARCHIVE));
+        }
+        let before = mgr.cached_archive_bytes();
+        assert!(before > CEILING, "precondition: over the ceiling");
+
+        // Asked by IDENTITY, which is what a merge base is keyed by, and not
+        // by the address the archive is filed at — the two are not the same
+        // instant on a chunk-fed volume.
+        let freed = mgr.evict_archives_to_ceiling(
+            CEILING,
+            |_, at| {
+                if *at == released_at {
+                    u64::MAX
+                } else {
+                    (at.and_utc().timestamp() - ts(0).and_utc().timestamp()) as u64
+                }
+            },
+            |site, _, collected| site == "KTLX" && collected == Some(identity),
+        );
+
+        assert!(freed > 0, "the pass evicted nothing at all");
+        assert!(
+            mgr.has_archive("KTLX", &released_at),
+            "the byte ceiling took the released base's only way back",
+        );
+        assert!(
+            mgr.cached_archive_bytes() <= CEILING,
+            "the pin stopped the pass rather than filtering it: {} B left against \
+             a {CEILING} B ceiling",
+            mgr.cached_archive_bytes(),
+        );
+        assert_eq!(
+            mgr.archives_pinned_to_ceiling(),
+            1,
+            "the counter that is the pin's only witness did not move",
+        );
+    }
+
+    /// **A pinned archive is not consulted at all while the cache fits.**
+    ///
+    /// The counter is a running total over passes that were over the ceiling,
+    /// and a pass that early-returns must not charge it — otherwise the figure
+    /// says "the pin saved a way back" on a leg where nothing was ever at risk.
+    #[test]
+    fn a_cache_inside_the_ceiling_does_not_charge_the_pin() {
+        const CEILING: usize = 96 * 1024 * 1024;
+        let mut mgr = LoopDownloadManager::new();
+        mgr.cache_archive("KTLX", ts(0), archive(CORPUS_MIN_ARCHIVE));
+        assert_eq!(
+            mgr.evict_archives_to_ceiling(CEILING, |_, _| 0, |_, _, _| true),
+            0,
+        );
+        assert_eq!(
+            mgr.archives_pinned_to_ceiling(),
+            0,
+            "a pass that never ran charged the pin",
         );
     }
 
@@ -4058,7 +4268,7 @@ mod archive_tests {
         let before = mgr.cached_archive_bytes();
         assert!(before <= CEILING, "precondition: 25 minimum archives fit");
 
-        let freed = mgr.evict_archives_to_ceiling(CEILING, |_, _| 0);
+        let freed = mgr.evict_archives_to_ceiling(CEILING, |_, _| 0, |_, _, _| false);
 
         assert_eq!(freed, 0, "a cache that fits was trimmed anyway");
         assert_eq!(mgr.cached_archive_bytes(), before);

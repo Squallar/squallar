@@ -3390,6 +3390,12 @@ impl super::App {
         // Running totals beside a level, so its own line for the reason the
         // two above have one.
         say_telemetry(loud, &crate::budget_telemetry::chunk_archive_line());
+        // **And what the archive ceiling was stopped from taking.** Its own
+        // line beside the two above, and a running total for their reason.
+        say_telemetry(
+            loud,
+            &crate::budget_telemetry::way_back_pin_line(self.loop_mgr.archives_pinned_to_ceiling()),
+        );
         // **And what those bases are holding that nothing would free.** The
         // release histogram above says which guard kept a base's gates; this
         // says what taking them would have been worth, which is a different

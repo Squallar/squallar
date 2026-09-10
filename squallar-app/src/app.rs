@@ -3553,6 +3553,18 @@ impl App {
         // the frame count does not. Furthest from a playhead goes first; an
         // evicted archive costs a re-download if its frame is wanted again,
         // which is what that frame costs today.
+        //
+        // **Except for a released base's way back, which costs nothing back.**
+        // `retain_archives` above holds those against the "no live frame names
+        // it" question; this pass asked a byte question and had no pin at all,
+        // so archive pressure took the ways back and `ensure_base_whole` was
+        // left with the `warn` it logs for a state that is not supposed to
+        // exist. And on a site that is not looping it took them FIRST: nothing
+        // names that volume as a frame, so `frame_distance` has no entry and
+        // the rank below answers `u64::MAX`, which sorts ahead of every named
+        // frame. A looping site whose newest frame is the base ranks
+        // ordinarily. The same list `retain_archives` is given, asked by
+        // identity for the same reason.
         self.loop_mgr.evict_archives_to_ceiling(
             squallar_device_profile::constants::LOOP_ARCHIVE_CEILING_BYTES,
             // Distance from the nearest playhead; an archive no live frame
@@ -3563,6 +3575,11 @@ impl App {
                     .and_then(|frames| frames.get(ts))
                     .copied()
                     .unwrap_or(u64::MAX)
+            },
+            |site, _, collected| {
+                released_ways_back
+                    .iter()
+                    .any(|&(at_site, at)| at_site == site && Some(at) == collected)
             },
         );
         squallar_worker::offload::discard_each(
@@ -3703,10 +3720,18 @@ impl App {
             // volume's own first radial, the loop cache by the second its S3
             // key names, and the two are equal on 0 of 171 measured volumes.
             //
-            // The chunk feed's assembled volume is deliberately NOT here. It is
-            // a sixth holder, filed with `archive: None` and outside the trade
-            // entirely, and `release_unneeded_base_gates` never reaches a base
-            // it produced because `archive_for_identity` finds nothing for one.
+            // The chunk feed's live assembler is deliberately NOT here. It is a
+            // sixth holder of the same allocation, and it is the one holder
+            // this withdrawal must not touch: it is the volume the site is
+            // still filling, and taking it would be taking the live overlay
+            // rather than a copy of a finished one.
+            //
+            // The reason given here until 2026-09-10 was a different one and
+            // has stopped being true — that a chunk-assembled volume was filed
+            // with `archive: None` and so could never be reached at all. Since
+            // `48a3b479a` it carries the concatenation of its own chunks, this
+            // withdrawal reaches its base like any other, and the way back is
+            // decoded from those bytes.
             let mut freed: Vec<crate::volume_inventory::Still> =
                 self.volumes.release_stills_of(&released);
             if self

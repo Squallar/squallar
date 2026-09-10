@@ -2859,3 +2859,464 @@ fn an_assembler_fed_without_bytes_offers_no_archive() {
         "an assembler holding no compressed bytes offered an archive",
     );
 }
+
+// ---------------------------------------------------------------------------
+// The way back: a chunk-assembled volume's retained archive, decoded.
+// ---------------------------------------------------------------------------
+
+use nexrad_model::data::Scan;
+
+/// **The bucket's own split of one Archive II file into chunks.**
+///
+/// The start chunk is the 24-byte volume header and the first LDM record; every
+/// later chunk is one more record with its control word. That is the shape
+/// [`decode_chunk`] reads and the shape [`archive_from_chunks`] joins, so the
+/// concatenation in sequence order is the file again byte for byte — asserted
+/// here rather than assumed, because a splitter that lost a byte would make
+/// every comparison below vacuous.
+fn publish_as_chunks(file: &[u8]) -> Vec<(u16, ChunkKind, Vec<u8>)> {
+    let owned = volume::File::new(file.to_vec());
+    let lengths: Vec<usize> = owned
+        .records()
+        .expect("a real Archive II file splits into LDM records")
+        .iter()
+        .map(|record| record.data().len())
+        .collect();
+    assert!(!lengths.is_empty(), "the file carries no records");
+    let mut out: Vec<(u16, ChunkKind, Vec<u8>)> = Vec::with_capacity(lengths.len());
+    let mut at = std::mem::size_of::<volume::Header>();
+    for (index, len) in lengths.iter().enumerate() {
+        let end = at + len;
+        let (from, kind) = if index == 0 {
+            (0, ChunkKind::Start)
+        } else if index + 1 == lengths.len() {
+            (at, ChunkKind::End)
+        } else {
+            (at, ChunkKind::Intermediate)
+        };
+        out.push((index as u16 + 1, kind, file[from..end].to_vec()));
+        at = end;
+    }
+    assert_eq!(
+        at,
+        file.len(),
+        "the split dropped {} trailing byte(s), so nothing below is a comparison \
+         against the whole file",
+        file.len() - at,
+    );
+    let rejoined: Vec<u8> = out.iter().flat_map(|(_, _, b)| b.clone()).collect();
+    assert_eq!(
+        rejoined.as_slice(),
+        file,
+        "the chunks do not rejoin into the file they were cut from",
+    );
+    out
+}
+
+/// A chunk key's name, in the bucket's own spelling.
+fn chunk_name(sequence: u16, kind: ChunkKind) -> String {
+    let suffix = match kind {
+        ChunkKind::Start => 'S',
+        ChunkKind::Intermediate => 'I',
+        ChunkKind::End => 'E',
+    };
+    format!("{VOLUME_TIME}-{sequence:03}-{suffix}")
+}
+
+/// **Where two volumes first differ, reaching every gate byte** — the moment
+/// blocks are compared by `==`, and `GateBuffer`'s `PartialEq` is over the
+/// bytes and not over the shared pointer, so a single flipped gate is a
+/// difference here.
+///
+/// A walker rather than one `assert_eq!` on the `Scan`s for one reason: the
+/// failure message. A volume is millions of gate bytes and `Debug` on a
+/// mismatch would print all of them.
+fn first_difference(left: &Scan, right: &Scan) -> Option<String> {
+    if left.site() != right.site() {
+        return Some(format!(
+            "site: {:?} vs {:?}",
+            left.site().map(nexrad_model::meta::Site::identifier),
+            right.site().map(nexrad_model::meta::Site::identifier),
+        ));
+    }
+    if left.coverage_pattern() != right.coverage_pattern() {
+        return Some("coverage pattern".to_string());
+    }
+    if left.sweeps().len() != right.sweeps().len() {
+        return Some(format!(
+            "sweep count: {} vs {}",
+            left.sweeps().len(),
+            right.sweeps().len(),
+        ));
+    }
+    for (index, (a, b)) in left.sweeps().iter().zip(right.sweeps()).enumerate() {
+        if a.elevation_number() != b.elevation_number() {
+            return Some(format!(
+                "sweep {index}: elevation {} vs {}",
+                a.elevation_number(),
+                b.elevation_number(),
+            ));
+        }
+        if a.radials().len() != b.radials().len() {
+            return Some(format!(
+                "sweep {index} (elevation {}): {} radials vs {}",
+                a.elevation_number(),
+                a.radials().len(),
+                b.radials().len(),
+            ));
+        }
+        for (radial, (x, y)) in a.radials().iter().zip(b.radials()).enumerate() {
+            if x != y {
+                return Some(format!(
+                    "sweep {index} (elevation {}) radial {radial} (azimuth {:.3} vs {:.3}): {}",
+                    a.elevation_number(),
+                    x.azimuth_angle_degrees(),
+                    y.azimuth_angle_degrees(),
+                    moment_difference(x, y),
+                ));
+            }
+        }
+    }
+    // Anything the walk above does not name — a field added to one of these
+    // types and missed here — still fails the test.
+    (left != right).then(|| "the volumes differ outside the walk above".to_string())
+}
+
+/// One moment's name and the two radials' gate bytes for it, or `None` where a
+/// radial does not carry the moment at all.
+type MomentPair<'a> = (&'static str, Option<&'a [u8]>, Option<&'a [u8]>);
+
+/// Which of a radial's parts differs, for the message above.
+fn moment_difference(left: &Radial, right: &Radial) -> String {
+    use nexrad_model::data::DataMoment;
+
+    let moments: [MomentPair<'_>; 7] = [
+        (
+            "reflectivity",
+            left.reflectivity().map(DataMoment::raw_values),
+            right.reflectivity().map(DataMoment::raw_values),
+        ),
+        (
+            "velocity",
+            left.velocity().map(DataMoment::raw_values),
+            right.velocity().map(DataMoment::raw_values),
+        ),
+        (
+            "spectrum width",
+            left.spectrum_width().map(DataMoment::raw_values),
+            right.spectrum_width().map(DataMoment::raw_values),
+        ),
+        (
+            "differential reflectivity",
+            left.differential_reflectivity().map(DataMoment::raw_values),
+            right
+                .differential_reflectivity()
+                .map(DataMoment::raw_values),
+        ),
+        (
+            "differential phase",
+            left.differential_phase().map(DataMoment::raw_values),
+            right.differential_phase().map(DataMoment::raw_values),
+        ),
+        (
+            "correlation coefficient",
+            left.correlation_coefficient().map(DataMoment::raw_values),
+            right.correlation_coefficient().map(DataMoment::raw_values),
+        ),
+        (
+            "clutter filter power",
+            left.clutter_filter_power().map(DataMoment::raw_values),
+            right.clutter_filter_power().map(DataMoment::raw_values),
+        ),
+    ];
+    for (name, a, b) in moments {
+        match (a, b) {
+            (Some(a), Some(b)) if a == b => {}
+            (None, None) => {}
+            (Some(a), Some(b)) => {
+                let at = a.iter().zip(b).position(|(x, y)| x != y);
+                return match at {
+                    Some(at) => format!(
+                        "{name} gate {at} of {}: {:#04x} vs {:#04x}",
+                        a.len(),
+                        a[at],
+                        b[at],
+                    ),
+                    None => format!("{name}: {} gates vs {}", a.len(), b.len()),
+                };
+            }
+            (a, b) => {
+                return format!(
+                    "{name}: {} vs {}",
+                    if a.is_some() { "present" } else { "absent" },
+                    if b.is_some() { "present" } else { "absent" },
+                );
+            }
+        }
+    }
+    "scalars only, no moment differs".to_string()
+}
+
+/// **The same radial with another radial's gates**, every scalar kept.
+///
+/// The tamper the comparison above is proved against: azimuth, elevation,
+/// timestamp and status all come from `radial`, and only the gate bytes come
+/// from `donor` — so a walker that compares structure but never reaches the
+/// arrays would still call the two volumes equal.
+fn wearing_the_gates_of(radial: &Radial, donor: &Radial) -> Radial {
+    Radial::new(
+        radial.collection_timestamp(),
+        radial.azimuth_number(),
+        radial.azimuth_angle_degrees(),
+        radial.azimuth_spacing_degrees(),
+        radial.radial_status(),
+        radial.elevation_number(),
+        radial.elevation_angle_degrees(),
+        donor.reflectivity().cloned(),
+        donor.velocity().cloned(),
+        donor.spectrum_width().cloned(),
+        donor.differential_reflectivity().cloned(),
+        donor.differential_phase().cloned(),
+        donor.correlation_coefficient().cloned(),
+        donor.clutter_filter_power().cloned(),
+    )
+}
+
+/// One volume with one radial's gate bytes replaced by its neighbour's.
+fn with_one_radials_gates_swapped(scan: &Scan) -> Scan {
+    use nexrad_model::data::DataMoment;
+
+    let mut sweeps: Vec<nexrad_model::data::Sweep> = scan.sweeps().to_vec();
+    let sweep = sweeps
+        .iter_mut()
+        .find(|sweep| sweep.radials().len() >= 2)
+        .expect("a volume with a sweep of two or more radials");
+    let elevation = sweep.elevation_number();
+    let radials = sweep.radials();
+    let (first, second) = (&radials[0], &radials[1]);
+    assert_ne!(
+        first.reflectivity().map(DataMoment::raw_values),
+        second.reflectivity().map(DataMoment::raw_values),
+        "the two radials chosen for the tamper carry identical gates, so \
+         swapping them would change nothing and prove nothing",
+    );
+    let tampered = wearing_the_gates_of(second, first);
+    let mut kept: Vec<Radial> = radials.to_vec();
+    kept[1] = tampered;
+    *sweep = nexrad_model::data::Sweep::new(elevation, kept);
+    match scan.site() {
+        Some(site) => Scan::with_site(site.clone(), scan.coverage_pattern().clone(), sweeps),
+        None => Scan::new(scan.coverage_pattern().clone(), sweeps),
+    }
+}
+
+/// What one volume's round trip through the chunk feed and back out of its own
+/// archive established.
+struct WayBack {
+    chunks: usize,
+    /// Whether the assembler reported the volume whole.
+    whole: bool,
+    /// Whether the assembler offered its archive.
+    offered: bool,
+    /// Whether the archive it offered is the file, byte for byte.
+    archive_is_the_file: bool,
+    /// The first difference between the assembled volume and the decoded one.
+    difference: Option<String>,
+    sweeps: usize,
+    radials: usize,
+    gate_bytes: usize,
+    decode: std::time::Duration,
+}
+
+/// **Travel one real volume's way back**: cut it into the chunks the bucket
+/// publishes, feed them to the assembler exactly as the feed does, take the
+/// archive the assembler retained, decode it the way `App::ensure_base_whole`
+/// does, and compare the volume that comes out against the one the feed built.
+fn travel_the_way_back(file: &[u8]) -> WayBack {
+    use nexrad_model::data::DataMoment;
+
+    let chunks = publish_as_chunks(file);
+    let volume = vol(42);
+    let mut assembler = VolumeAssembler::new("KTLX", volume);
+    for (sequence, kind, bytes) in &chunks {
+        let id = ChunkId::parse("KTLX", volume, &chunk_name(*sequence, *kind))
+            .expect("the chunk name parses");
+        assembler.ingest(&id, bytes).expect("a real chunk decodes");
+    }
+    let assembled = assembler.snapshot();
+    let whole = assembler.is_whole_volume_complete();
+    let archive = assembler.take_archive();
+    let archive_is_the_file = archive
+        .as_deref()
+        .is_some_and(|held| held.as_slice() == file);
+    let offered = archive.is_some();
+    let archive = archive.unwrap_or_else(|| std::sync::Arc::new(file.to_vec()));
+
+    let started = std::time::Instant::now();
+    let decoded = crate::scan::decode_shared(archive).expect("the way back decodes");
+    let decode = started.elapsed();
+
+    let gate_bytes: usize = assembled
+        .sweeps()
+        .iter()
+        .flat_map(nexrad_model::data::Sweep::radials)
+        .map(|r| {
+            r.reflectivity().map_or(0, |m| m.raw_values().len())
+                + r.velocity().map_or(0, |m| m.raw_values().len())
+                + r.spectrum_width().map_or(0, |m| m.raw_values().len())
+                + r.differential_reflectivity()
+                    .map_or(0, |m| m.raw_values().len())
+                + r.differential_phase().map_or(0, |m| m.raw_values().len())
+                + r.correlation_coefficient()
+                    .map_or(0, |m| m.raw_values().len())
+        })
+        .sum();
+
+    WayBack {
+        chunks: chunks.len(),
+        whole,
+        offered,
+        archive_is_the_file,
+        difference: first_difference(&assembled, &decoded.scan),
+        sweeps: assembled.sweeps().len(),
+        radials: assembled
+            .sweeps()
+            .iter()
+            .map(|s| s.radials().len())
+            .sum::<usize>(),
+        gate_bytes,
+        decode,
+    }
+}
+
+/// **Every volume the feed offers an archive for travels its own way back and
+/// comes back unchanged**, gate byte for gate byte.
+///
+/// Not "every volume in the corpus", and the difference is the finding.
+/// Measured over 108 real volumes on 2026-09-10: 99 closed whole, and all 99
+/// came back byte-identical from their own retained archive. The other 9 did
+/// not close whole — they are captures that carry no scan end, so the
+/// assembler's snapshot holds only the cuts it sealed while a decode of the
+/// same bytes holds every radial in them — and `take_archive` refused every
+/// one of those 9. So the volumes the comparison would fail on are exactly the
+/// volumes the retention gate never files, which is what makes the withdrawal
+/// safe rather than lucky.
+///
+/// `#[ignore]`d and not `#[cfg]`-gated: it needs real Archive II volumes, which
+/// are 0.35-17 MB each and are not in this repository, so it names the
+/// directory it wants rather than quietly passing on an empty one. Run it as
+///
+/// ```text
+/// SQUALLAR_L2_CORPUS=<dir of *.ar2v> cargo test -p squallar-radar \
+///     --lib -- --ignored --nocapture --test-threads=1 the_way_back
+/// ```
+#[test]
+#[ignore = "needs a directory of real Archive II volumes; see the doc comment"]
+fn every_volume_the_feed_offers_an_archive_for_travels_the_way_back_unchanged() {
+    // The assembler moves this crate's process-global feed and retention
+    // levels, which several suites here assert against. This one asserts none
+    // of them, but it would perturb theirs under `--include-ignored`, and a
+    // peer suite red-gated by a neighbour is a race and not a flake.
+    let _serial = feed_level_serial::exclusive();
+    let files = corpus_volumes();
+    let mut differed: Vec<String> = Vec::new();
+    let mut mis_offered: Vec<String> = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
+    let mut offered = 0usize;
+    for path in &files {
+        let bytes = std::fs::read(path).expect("the corpus volume reads");
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let report = travel_the_way_back(&bytes);
+        println!(
+            "{name}: {} chunks, whole {}, offered {}, archive==file {}, {} sweeps, \
+             {} radials, {} gate bytes, decode {:?}, difference {:?}",
+            report.chunks,
+            report.whole,
+            report.offered,
+            report.archive_is_the_file,
+            report.sweeps,
+            report.radials,
+            report.gate_bytes,
+            report.decode,
+            report.difference,
+        );
+        // The retention's own gate, both directions: a whole volume offers its
+        // archive and a volume that is not whole offers none.
+        if report.whole != report.offered {
+            mis_offered.push(format!(
+                "{name}: whole {} but offered {}",
+                report.whole, report.offered,
+            ));
+        }
+        if !report.offered {
+            refused.push(name.to_string());
+            continue;
+        }
+        offered += 1;
+        assert!(
+            report.archive_is_the_file,
+            "{name}: the archive the feed retained is not the file its chunks were cut from",
+        );
+        if let Some(difference) = report.difference {
+            differed.push(format!("{name}: {difference}"));
+        }
+    }
+    println!(
+        "{offered} of {} volumes closed whole and were offered their own archive; \
+         {} were refused: {refused:?}",
+        files.len(),
+        refused.len(),
+    );
+    assert!(
+        mis_offered.is_empty(),
+        "the retention gate and the whole-volume predicate disagreed: {mis_offered:#?}",
+    );
+    assert!(
+        offered * 2 > files.len(),
+        "only {offered} of {} volumes reached the path under test, which is too \
+         few for this to be a measurement of it",
+        files.len(),
+    );
+    assert!(
+        differed.is_empty(),
+        "{} of {offered} volumes came back changed: {differed:#?}",
+        differed.len(),
+    );
+}
+
+/// The corpus this module's two `#[ignore]`d tests read.
+fn corpus_volumes() -> Vec<std::path::PathBuf> {
+    let Ok(dir) = std::env::var("SQUALLAR_L2_CORPUS") else {
+        panic!("SQUALLAR_L2_CORPUS is unset, so there is no corpus to walk");
+    };
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{dir}: {e}"))
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.extension().is_some_and(|e| e == "ar2v"))
+        .collect();
+    files.sort();
+    assert!(!files.is_empty(), "{dir} holds no *.ar2v volumes");
+    files
+}
+
+/// **The comparison can fail, and it fails on a gate byte.**
+///
+/// Runs against the corpus for the reason above. The tamper keeps every scalar
+/// of one radial and takes its neighbour's gates, so a comparison that walked
+/// the structure and never reached the arrays would still call the volumes
+/// equal.
+#[test]
+#[ignore = "needs a directory of real Archive II volumes; see the doc comment"]
+fn the_way_back_comparison_fails_on_a_single_swapped_radials_gates() {
+    let files = corpus_volumes();
+    let path = files.first().expect("the corpus holds a volume");
+    let bytes = std::fs::read(path).expect("the corpus volume reads");
+    let decoded = crate::scan::decode_shared(std::sync::Arc::new(bytes)).expect("it decodes");
+    let tampered = with_one_radials_gates_swapped(&decoded.scan);
+    let difference = first_difference(&decoded.scan, &tampered);
+    println!("tamper difference: {difference:?}");
+    assert!(
+        difference.is_some(),
+        "one radial's gate bytes were replaced and the comparison saw nothing",
+    );
+}

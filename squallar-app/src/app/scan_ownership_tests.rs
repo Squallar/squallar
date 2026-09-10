@@ -1114,6 +1114,105 @@ fn a_jointly_released_volume_comes_back_whole() {
     );
 }
 
+/// **The gate reader's own extraction is what asks a released base back**, and
+/// what it gets is the volume that left.
+///
+/// The scene the withdrawal was never travelled on. Every other test here
+/// stands in for the reader by calling `App::ensure_base_whole` directly;
+/// this drives `App::extract_base_volume`, which is the function
+/// `App::prepare_pane_volume` calls for a 3D pane navigated to the merge base
+/// — one of the two readers `release_unneeded_base_gates` counts as a
+/// `gate_readers` entry, and the reason its `gate_readers` set exists at all.
+///
+/// The order is the production one and each step is asserted rather than
+/// assumed: the extraction fails while the gates are gone, files the ask and
+/// spends exactly one decode; a second extraction on the same frame spends no
+/// more, because the first is in flight; and the volume the decode files comes
+/// back gate byte for gate byte.
+///
+/// TAMPER: remove the `self.ensure_base_whole(site)` line from
+/// `extract_site_volume` and the dispatch assertion goes red — the extraction
+/// then fails silently every frame, for ever, which is the failure that reads
+/// as a 3D pane that never paints.
+#[test]
+fn the_gate_readers_extraction_asks_a_released_base_back_and_gets_what_left() {
+    use nexrad_model::data::DataMoment;
+
+    let mut app = app_on_site();
+    land_one_archive_volume(&mut app, SITE, at(0));
+    the_pane_has_its_picture(&mut app);
+    app.loop_mgr
+        .cache_archive(SITE, at(0), std::sync::Arc::new(vec![0u8; 4096]));
+    let (base, _) = app.volumes.base_for(SITE).expect("a base");
+    let collected = app.volumes.base_collected_at(SITE).expect("a base");
+    let before: Vec<Vec<u8>> = base
+        .sweeps()
+        .iter()
+        .flat_map(nexrad_model::data::Sweep::radials)
+        .filter_map(nexrad_model::data::Radial::reflectivity)
+        .map(|m| m.raw_values().to_vec())
+        .collect();
+    assert!(
+        before.iter().any(|gates| !gates.is_empty()),
+        "fixture: the volume carries no gates, so nothing below compares any",
+    );
+
+    app.evict_unshown_scans();
+    assert!(
+        app.volumes.base_is_released(SITE),
+        "precondition: the withdrawal did not fire, so there is nothing to ask back",
+    );
+
+    let dispatched = app.base_restore_dispatches.get();
+    let served = app.extract_base_volume(SITE, squallar_radar::types::RadarProduct::Reflectivity);
+    assert!(
+        served.is_none(),
+        "released gates served a product anyway, so this scene never reached \
+         the state the restore exists for",
+    );
+    assert_eq!(
+        app.base_restore_dispatches.get(),
+        dispatched + 1,
+        "the gate reader's extraction did not spend a decode on the way back",
+    );
+    // The same reader again on the same frame: the ask is a set membership and
+    // the decode is in flight, so this costs nothing.
+    let _ = app.extract_base_volume(SITE, squallar_radar::types::RadarProduct::Reflectivity);
+    assert_eq!(
+        app.base_restore_dispatches.get(),
+        dispatched + 1,
+        "a second read of the same released gates spent a second decode",
+    );
+
+    // What the decode files, filed where a decode files it.
+    app.loop_mgr.complete_download(SITE, &at(0));
+    app.loop_mgr
+        .cache_scan(SITE, at(0), (Arc::clone(&base), Default::default()));
+    app.restore_released_bases();
+
+    let (restored, _) = app
+        .volumes
+        .base_for(SITE)
+        .expect("the base did not come back, so the gate reader waits for ever");
+    assert!(
+        app.volumes.still_for(SITE, collected).is_some(),
+        "the base came back without its still",
+    );
+    let after: Vec<Vec<u8>> = restored
+        .sweeps()
+        .iter()
+        .flat_map(nexrad_model::data::Sweep::radials)
+        .filter_map(nexrad_model::data::Radial::reflectivity)
+        .map(|m| m.raw_values().to_vec())
+        .collect();
+    assert_eq!(after, before, "the restored volume is not the one released");
+    assert!(
+        app.extract_base_volume(SITE, squallar_radar::types::RadarProduct::Reflectivity)
+            .is_some(),
+        "the gate reader still cannot be served after the restore",
+    );
+}
+
 /// **A loop frame landing on a released base does NOT put the volume back**,
 /// because a cached volume is not a demand.
 ///

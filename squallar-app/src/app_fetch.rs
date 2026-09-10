@@ -2988,11 +2988,16 @@ impl super::App {
     /// refuses to evict a volume with no archive behind it — its premise is
     /// that eviction costs a decode, and for a volume with nothing to decode
     /// from it would silently become a re-download policy. So the arrivals
-    /// that reach this function with their compressed bytes (the pane fetch,
-    /// the auto-poll and the adjacent-volume nudge, all three off
+    /// that reach this function with their compressed bytes file them here: the
+    /// pane fetch, the auto-poll and the adjacent-volume nudge, all three off
     /// `decode_offloaded`, which hands the responder the same `Arc` the job
-    /// held) file them here, and the ones that have none — the chunk feed's
-    /// assembled volumes — pass `None` and keep the standing behaviour.
+    /// held — and, since `48a3b479a`, the chunk feed, whose assembled volume
+    /// carries the concatenation of the chunks it was built from
+    /// (`chunks::VolumeAssembler::take_archive`). This paragraph named that
+    /// last one as the caller that passes `None` until 2026-09-10, which is
+    /// the day after it stopped being true; a `None` here is now only a
+    /// volume that did not close whole, and such a volume is not offered to
+    /// this function at all.
     ///
     /// The archive is filed under the SAME key as the volume, in this call,
     /// out of the same arguments, so the two halves of a frame cannot end up
