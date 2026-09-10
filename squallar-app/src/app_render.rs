@@ -510,6 +510,66 @@ fn overlay_blank_line(t: &squallar_egui::overlay_cache::ledger::Totals) -> Strin
     line
 }
 
+/// The `overlay blank layers:` running-total line — the same blanks
+/// [`overlay_blank_line`] counts, attributed to the **layer** that produced
+/// them.
+///
+/// **A fourth line rather than fields on the third**, for the reason
+/// [`overlay_reason_line`] gives: the rig's regexes are anchored over whole
+/// sentences, so a field inserted into one of them reads as "the path never
+/// ran". This line is additive.
+///
+/// # What it is for
+///
+/// `overlay blanks:` says a blank happened and why; it has never said *whose*.
+/// A blank is a whole offloaded rasterizer job — a funnel slot, a worker turn
+/// and a reply — that painted nothing, and the cut for that is a `paints_in`
+/// pre-check on the frame thread, which has to be written per handler. This
+/// line is the figure that says which handler is worth writing one for.
+///
+/// # Denominators
+///
+/// `blank` is [`ledger::Totals::blanks`], the **same** total
+/// `overlay blanks:` opens with, and the per-layer counts are a partition of
+/// it: this line and that one are two splits of one quantity and **are never
+/// added**. Within a layer, `outside-view` is that layer's share of the
+/// `outside-view` figure on the other line, so the two may be compared and
+/// summed down but never across.
+///
+/// **These are counts of wasted work and not of bytes.** A blank arrival is
+/// charged no bytes anywhere in this family, because no buffer was built for
+/// it — see the ledger's module note. Multiplying a count here by a picture
+/// size to get a saving is wrong twice: the bytes were never spent, and what
+/// was spent is a job, a reply and a funnel slot that no counter here prices.
+///
+/// # Why a layer can be absent
+///
+/// Only layers with a nonzero blank count are printed, and `layers` says how
+/// many that was. An absent layer produced no blank — which for nine of the
+/// nineteen ledger rows is the only reading possible, they never dispatch an
+/// overlay texture at all (see [`ledger::Totals::blank_layers`]).
+/// `off-ledger` is the row for an id the layer ledger does not hold.
+///
+/// [`ledger::Totals::blanks`]: squallar_egui::overlay_cache::ledger::Totals::blanks
+/// [`ledger::Totals::blank_layers`]: squallar_egui::overlay_cache::ledger::Totals::blank_layers
+fn overlay_blank_layer_line(t: &squallar_egui::overlay_cache::ledger::Totals) -> String {
+    use std::fmt::Write as _;
+    let mut line = format!(
+        "overlay blank layers: {} blank, {} layers",
+        t.blanks(),
+        t.blank_layers_seen(),
+    );
+    let outside_view = squallar_egui::overlay_cache::ledger::BlankReason::OutsideView;
+    for (name, total, row) in t.blank_layer_rows() {
+        let _ = write!(
+            line,
+            ", {name} {total} blank {} outside-view",
+            row[outside_view.index()],
+        );
+    }
+    line
+}
+
 /// The `texture uploads:` running-total line. See [`overlay_raster_line`] for
 /// why this is a value.
 ///
@@ -2801,6 +2861,10 @@ impl super::App {
             // could read. `OVERLAY_TELEMETRY_HEARTBEAT` is what makes it true
             // of both.
             say_telemetry(loud, &overlay_blank_line(&t));
+            // And whose blanks they were, off that same reading: the line
+            // above says a blank happened and why, this one says which layer
+            // paid for it, and neither is readable without the other.
+            say_telemetry(loud, &overlay_blank_layer_line(&t));
             // And the door, off that same reading: `overlay rasters:` counts
             // what got through and this counts what the ceiling held back, so
             // the two are only readable together.
@@ -4166,7 +4230,7 @@ impl super::App {
                     // and `note_blank` splits it by **why** — the figure that
                     // says whether this clear was correct or was data
                     // disappearing from under the user.
-                    squallar_egui::overlay_cache::ledger::note_blank(*reason);
+                    squallar_egui::overlay_cache::ledger::note_blank(*reason, &id);
                     None
                 }
             };

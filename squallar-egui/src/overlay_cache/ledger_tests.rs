@@ -232,6 +232,80 @@ fn a_sibling_threads_writes_stay_out_of_this_threads_figures() {
     );
 }
 
+/// **A blank is charged to the layer that produced it, and the two splits of
+/// the blank total agree.**
+///
+/// The per-layer array is written by the same `note_blank` as the per-reason
+/// one, so `blank_layers_balance` is an identity — but an identity is only
+/// evidence if the writes it balances actually landed somewhere distinguishable.
+/// So this asserts the *attribution* too: two layers blanking for the same
+/// reason must not pool, which is what a counter keyed by the reason alone
+/// looks like and is the whole defect this dimension exists to end.
+///
+/// The reset is checked here as well, on the new array specifically: the
+/// per-reason array was added beside `reasons` and missed by the loop that
+/// zeroes them (see the test below), so a second array added the same way gets
+/// its own check the day it lands rather than the day someone notices.
+#[test]
+fn a_blank_is_charged_to_its_own_layer_and_the_two_splits_agree() {
+    use ledger::BlankReason;
+    use squallar_source::id::{LayerId, known};
+
+    ledger::reset_for_test();
+    for _ in 0..5 {
+        ledger::note_blank(BlankReason::OutsideView, &known::LIGHTNING);
+    }
+    ledger::note_blank(BlankReason::OutsideView, &known::METAR);
+    ledger::note_blank(BlankReason::DrewNoInk, &known::LIGHTNING);
+    // An id no build registers: it must be counted, not dropped. A blank
+    // charged to nobody is how an attribution instrument reads green while
+    // silently missing its subject.
+    ledger::note_blank(
+        BlankReason::OutsideView,
+        &LayerId::new("AConfigFileSpelling"),
+    );
+
+    let t = ledger::totals();
+    assert_eq!(t.blanks(), 8, "the blanks did not all reach the ledger");
+    assert!(
+        t.blank_layers_balance(),
+        "the per-layer split does not account for the per-reason one",
+    );
+    // The attribution, and not merely the arithmetic: Lightning and Metar
+    // blanked for the SAME reason, and a counter that pooled them would pass
+    // every balance above.
+    assert_eq!(
+        t.blank_layer_reason(&known::LIGHTNING, BlankReason::OutsideView),
+        5
+    );
+    assert_eq!(
+        t.blank_layer_reason(&known::METAR, BlankReason::OutsideView),
+        1
+    );
+    assert_eq!(t.blank_layer(&known::LIGHTNING), 6);
+    assert_eq!(t.blank_layer(&known::METAR), 1);
+    assert_eq!(
+        t.blank_layer(&LayerId::new("SomeOtherUnregisteredSpelling")),
+        1,
+        "off-ledger ids share one slot, so this reads the same row",
+    );
+    // A layer that never blanked reads zero rather than being unrepresentable.
+    assert_eq!(t.blank_layer(&known::MRMS), 0);
+    assert_eq!(t.blank_layers_seen(), 3);
+    assert_eq!(
+        t.blank_layer_rows().map(|(_, total, _)| total).sum::<u64>(),
+        t.blanks(),
+        "the printed rows do not partition the blank total, so the line built \
+         from them would under-report and look complete",
+    );
+
+    ledger::reset_for_test();
+    let cleared = ledger::totals();
+    assert_eq!(cleared.blank_layer(&known::LIGHTNING), 0);
+    assert_eq!(cleared.blank_layers_seen(), 0);
+    assert!(cleared.blank_layers_balance());
+}
+
 /// **`reset_for_test` puts every counter back, the blank breakdown included.**
 ///
 /// It did not, from the day the breakdown landed until 2026-09-09: the array
@@ -252,7 +326,7 @@ fn the_reset_clears_the_blank_breakdown_and_not_only_the_dispatch_reasons() {
 
     ledger::reset_for_test();
     for reason in BlankReason::ALL {
-        ledger::note_blank(reason);
+        ledger::note_blank(reason, &squallar_source::id::known::LIGHTNING);
     }
 
     let posted = ledger::totals();

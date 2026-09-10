@@ -93,7 +93,24 @@
 //! [`Totals::pictures`], and `inked <= pictures` always.
 
 use super::RerenderReason;
+use squallar_source::id::{LAYER_ID_LEDGER, LayerId};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+/// The slot a blank is charged to when its layer id is not in
+/// [`LAYER_ID_LEDGER`] — a config-file spelling, or a layer registered by a
+/// build this table predates. **Not a bucket for the layers that never
+/// dispatch**: those have ledger rows of their own and read zero there.
+pub const OFF_LEDGER_SLOT: usize = LAYER_ID_LEDGER.len();
+
+/// How many rows the per-layer blank array has: every [`LAYER_ID_LEDGER`] row,
+/// plus [`OFF_LEDGER_SLOT`].
+pub const LAYER_SLOTS: usize = LAYER_ID_LEDGER.len() + 1;
+
+/// The name of one row of the per-layer blank array — a ledger spelling, or
+/// `"off-ledger"` for [`OFF_LEDGER_SLOT`].
+pub fn layer_slot_name(slot: usize) -> &'static str {
+    LAYER_ID_LEDGER.get(slot).copied().unwrap_or("off-ledger")
+}
 
 /// Every counter on this line, in one object.
 ///
@@ -115,6 +132,15 @@ struct Counters {
     /// counts the blank as a picture, so the two cannot drift — see
     /// [`Totals::blank_reasons_balance`].
     blank_reasons: [AtomicU64; BlankReason::COUNT],
+    /// The same blanks split a **second** way, by which layer produced them:
+    /// `[layer slot][BlankReason::index]`, the slot being
+    /// [`LayerId::ledger_slot`] with [`OFF_LEDGER_SLOT`] for an id the ledger
+    /// does not hold. Written by the same [`note_blank`] call, so it cannot
+    /// drift from either the blank count or the reason split — see
+    /// [`Totals::blank_layers_balance`].
+    ///
+    /// [`LayerId::ledger_slot`]: squallar_source::id::LayerId::ledger_slot
+    blank_layers: [[AtomicU64; BlankReason::COUNT]; LAYER_SLOTS],
     /// Rasterized responses received. See [`note_arrived`].
     arrived: AtomicU64,
     /// Responses thrown away before their pixels were handed over.
@@ -150,6 +176,8 @@ impl Counters {
             dispatched: AtomicU64::new(0),
             reasons: [const { AtomicU64::new(0) }; RerenderReason::COUNT],
             blank_reasons: [const { AtomicU64::new(0) }; BlankReason::COUNT],
+            blank_layers: [const { [const { AtomicU64::new(0) }; BlankReason::COUNT] };
+                LAYER_SLOTS],
             arrived: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             pictures: AtomicU64::new(0),
@@ -391,6 +419,24 @@ pub struct Totals {
     /// happened, and that is the difference between a correct clear and a user
     /// watching loaded data disappear. See [`Self::blanks_over_covered_ground`].
     pub blank_reasons: [u64; BlankReason::COUNT],
+    /// **The same blanks attributed to the layer that produced them**:
+    /// `[layer slot][BlankReason::index]`. Read it through
+    /// [`Self::blank_layer`], [`Self::blank_layer_reason`] and
+    /// [`Self::blank_layer_rows`] rather than by index.
+    ///
+    /// Its denominator is [`Self::blanks`], the same as
+    /// [`Self::blank_reasons`]', and the two are **two splits of one total and
+    /// are never added**: a blank appears once in each. Column sums down this
+    /// array equal `blank_reasons` row by row.
+    ///
+    /// **A zero row is a reading, not a hole.** Nine of the nineteen ledger
+    /// rows are layers that never dispatch an overlay texture at all — the
+    /// screen-space ones (`CityLabels`, `RadarSites`, `UserLocation`,
+    /// `ColorScale`), the tile ones (`Terrain`, `BasemapTiles`), `Radar`
+    /// (refused by name at the overlay dispatch, see the module note) and
+    /// `FakeSource` (registered by nothing) — plus every enabled layer whose
+    /// handler happens to dispatch nothing on the leg.
+    pub blank_layers: [[u64; BlankReason::COUNT]; LAYER_SLOTS],
     /// Of [`Self::dispatched`], those withdrawn at the supersede seam (WO-8)
     /// before their answer was used: a newer dispatch replaced every
     /// destination the raster was for, so the job was cancelled at the
@@ -482,6 +528,66 @@ impl Totals {
     /// How many blank arrivals were blank for `reason`.
     pub fn blank_reason(&self, reason: BlankReason) -> u64 {
         self.blank_reasons[reason.index()]
+    }
+
+    /// How many blanks `layer` produced, for any reason.
+    ///
+    /// An id outside [`LAYER_ID_LEDGER`] reads [`OFF_LEDGER_SLOT`]'s row, which
+    /// is shared by every such id: this answers "blanks charged to the slot
+    /// this id falls in", and for an off-ledger id that is not the same
+    /// question as "blanks from this layer".
+    pub fn blank_layer(&self, layer: &LayerId) -> u64 {
+        self.blank_layers[layer.ledger_slot().unwrap_or(OFF_LEDGER_SLOT)]
+            .iter()
+            .sum()
+    }
+
+    /// How many blanks `layer` produced **for one reason** — the figure that
+    /// answers which layer an `outside-view` count belongs to.
+    pub fn blank_layer_reason(&self, layer: &LayerId, reason: BlankReason) -> u64 {
+        self.blank_layers[layer.ledger_slot().unwrap_or(OFF_LEDGER_SLOT)][reason.index()]
+    }
+
+    /// Every layer slot that produced a blank at all, as
+    /// `(name, total, per-reason row)`, in [`LAYER_ID_LEDGER`] order.
+    ///
+    /// **Silent rows are zero rows.** A reader must not infer a layer is
+    /// missing from the instrument because it is absent here; see
+    /// [`Self::blank_layers`] on why nine rows can never be anything but zero.
+    pub fn blank_layer_rows(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, u64, &[u64; BlankReason::COUNT])> + '_ {
+        self.blank_layers
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, row)| {
+                let total: u64 = row.iter().sum();
+                (total > 0).then(|| (layer_slot_name(slot), total, row))
+            })
+    }
+
+    /// How many layer slots produced a blank.
+    pub fn blank_layers_seen(&self) -> usize {
+        self.blank_layer_rows().count()
+    }
+
+    /// The per-layer split accounts for **every** blank, and for every blank of
+    /// every reason.
+    ///
+    /// An identity and not an expectation, for [`Self::blank_reasons_balance`]'s
+    /// reason: [`note_blank`] is the only writer of either array and writes both
+    /// in the same call. It fails if a blank were ever counted on one array and
+    /// not the other, which is what a second `note_blank`-shaped call site would
+    /// look like.
+    pub fn blank_layers_balance(&self) -> bool {
+        BlankReason::ALL.iter().all(|reason| {
+            let column: u64 = self
+                .blank_layers
+                .iter()
+                .map(|row| row[reason.index()])
+                .sum();
+            column == self.blank_reasons[reason.index()]
+        })
     }
 
     /// The blanks account for every arrival that painted nothing.
@@ -658,12 +764,22 @@ pub fn note_picture(bytes: u64, inked: bool) {
 ///
 /// [`note_picture`] with `bytes` of zero and `inked` false, plus the reason,
 /// written by this one call so the blank count and its breakdown cannot drift
-/// (`Totals::blank_reasons_balance`). Three relaxed `fetch_add`s and a `match`
-/// on a fieldless enum; nothing here allocates or takes a clock.
-pub fn note_blank(reason: BlankReason) {
+/// (`Totals::blank_reasons_balance`), and attributed to the **layer** that
+/// produced it in the same call for the same reason
+/// (`Totals::blank_layers_balance`).
+///
+/// Three relaxed `fetch_add`s, a `match` on a fieldless enum and
+/// [`LayerId::ledger_slot`]'s `match` on a short string literal; nothing here
+/// allocates, locks, walks a table or takes a clock. `layer` is borrowed, so
+/// naming it costs no clone.
+///
+/// [`LayerId::ledger_slot`]: squallar_source::id::LayerId::ledger_slot
+pub fn note_blank(reason: BlankReason, layer: &LayerId) {
     let sink = sink();
     sink.pictures.fetch_add(1, Relaxed);
     sink.blank_reasons[reason.index()].fetch_add(1, Relaxed);
+    sink.blank_layers[layer.ledger_slot().unwrap_or(OFF_LEDGER_SLOT)][reason.index()]
+        .fetch_add(1, Relaxed);
 }
 
 /// Record a picture put straight on screen.
@@ -747,6 +863,9 @@ pub fn totals() -> Totals {
         door_peak_bytes: sink.door_peak_bytes.load(Relaxed),
         reasons: std::array::from_fn(|i| sink.reasons[i].load(Relaxed)),
         blank_reasons: std::array::from_fn(|i| sink.blank_reasons[i].load(Relaxed)),
+        blank_layers: std::array::from_fn(|slot| {
+            std::array::from_fn(|i| sink.blank_layers[slot][i].load(Relaxed))
+        }),
     }
 }
 
@@ -809,6 +928,11 @@ pub fn reset_for_test() {
     // It survived because `blank_reasons_balance` held either way: `pictures`
     // *was* reset, so a leaked reason count made the identity fail rather than
     // read wrong, and no suite had yet asserted an absolute per-reason count.
+    for row in &sink.blank_layers {
+        for counter in row {
+            counter.store(0, Relaxed);
+        }
+    }
     for counter in &sink.blank_reasons {
         counter.store(0, Relaxed);
     }

@@ -122,6 +122,10 @@ fn the_rig_reads_the_lines_the_app_actually_writes() {
         // Nor in this one, and for the same reason: the blank split is its
         // own line. See `app_render::overlay_blank_line`.
         blank_reasons: [0; squallar_egui::overlay_cache::ledger::BlankReason::COUNT],
+        // Nor the per-layer split of those blanks, which is a fourth line for
+        // the third time. See `app_render::overlay_blank_layer_line`.
+        blank_layers: [[0; squallar_egui::overlay_cache::ledger::BlankReason::COUNT];
+            squallar_egui::overlay_cache::ledger::LAYER_SLOTS],
         // The door's four, on their own line for the same reason again — and
         // the rig has no probe for that one yet, so the sentence is asserted
         // literally below rather than against a pattern it would have to
@@ -720,6 +724,92 @@ fn the_blank_line_names_every_reason_at_its_own_count() {
         "not every reason is represented, so the line above does not show \
          that every one of them can be reported",
     );
+}
+
+/// **The `overlay blank layers:` line names every layer that blanked, its own
+/// blank count, and its own share of `outside-view`.**
+///
+/// The sentence is what a reader parses, so the sentence is what is pinned —
+/// see the test above. Three properties beyond the spelling:
+///
+/// * a layer with no blanks is ABSENT, not printed as zero, and `layers` is
+///   what says how many rows to expect. Nine ledger rows can never be anything
+///   but zero, so printing all nineteen would be nine fields of noise on every
+///   emission;
+/// * the counts partition the same `blank` total the `overlay blanks:` line
+///   opens with, and that identity is asserted here rather than assumed;
+/// * an id outside the layer ledger lands on `off-ledger` and is still counted,
+///   because a blank charged to nobody is how an attribution instrument reads
+///   green while missing its subject.
+#[test]
+fn the_blank_layer_line_names_every_layer_that_blanked_and_its_outside_view_share() {
+    use squallar_egui::overlay_cache::ledger::{BlankReason, LAYER_SLOTS, OFF_LEDGER_SLOT};
+    use squallar_source::id::{LayerId, known};
+
+    let ov = BlankReason::OutsideView.index();
+    let ink = BlankReason::DrewNoInk.index();
+    let mut blank_layers = [[0u64; BlankReason::COUNT]; LAYER_SLOTS];
+    // Distinct values, none a prefix of another, and each layer's
+    // `outside-view` share deliberately smaller than its total so a line that
+    // printed the total twice cannot read as correct.
+    let lightning = known::LIGHTNING
+        .ledger_slot()
+        .expect("Lightning is a ledger row");
+    blank_layers[lightning][ov] = 9_000;
+    blank_layers[lightning][ink] = 41;
+    let metar = known::METAR.ledger_slot().expect("Metar is a ledger row");
+    blank_layers[metar][ov] = 300;
+    blank_layers[metar][ink] = 7;
+    blank_layers[OFF_LEDGER_SLOT][ov] = 2;
+
+    let mut blank_reasons = [0u64; BlankReason::COUNT];
+    for row in &blank_layers {
+        for (i, n) in row.iter().enumerate() {
+            blank_reasons[i] += n;
+        }
+    }
+    let posted: u64 = blank_reasons.iter().sum();
+
+    let t = ledger::Totals {
+        pictures: posted + 7,
+        inked: 7,
+        blank_reasons,
+        blank_layers,
+        ..Default::default()
+    };
+    assert!(
+        t.blank_layers_balance(),
+        "the fixture's per-layer split does not add to its per-reason split,          so the sentence below would be pinned against an impossible ledger",
+    );
+
+    assert_eq!(
+        super::overlay_blank_layer_line(&t),
+        "overlay blank layers: 9350 blank, 3 layers, \
+         Lightning 9041 blank 9000 outside-view, \
+         Metar 307 blank 300 outside-view, \
+         off-ledger 2 blank 2 outside-view",
+        "the `overlay blank layers:` sentence has moved. It is the only place a          blank is attributed to the layer that produced it, and without it the          `outside-view` count is a total nobody can act on -- the cut for it is          a per-handler `paints_in`, and which handler to write one for is          exactly what this line answers",
+    );
+
+    // Rows in `LAYER_ID_LEDGER` order and not in insertion or count order:
+    // Metar is row 7 and Lightning row 6, so a sort by count would put Metar
+    // first and a reader diffing two legs would see rows swap under it.
+    assert!(
+        lightning < metar,
+        "the fixture no longer tests the ordering"
+    );
+    // The `blank` figure the sentence opens with is the OTHER line's total,
+    // not a sum this line computes for itself.
+    assert_eq!(t.blanks(), posted);
+    assert_eq!(t.blank_layer(&known::LIGHTNING), 9_041);
+    assert_eq!(
+        t.blank_layer_reason(&known::LIGHTNING, BlankReason::OutsideView),
+        9_000
+    );
+    // Every layer that never blanked reads zero through the same reader, so a
+    // reader cannot tell "absent from the line" from "instrument missing".
+    assert_eq!(t.blank_layer(&known::MRMS), 0);
+    assert_eq!(t.blank_layer(&LayerId::new("SomeConfigFileSpelling")), 2);
 }
 
 /// **`upload pacing:` is its own sentence and never a field on `texture

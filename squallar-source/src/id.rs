@@ -40,6 +40,48 @@ impl LayerId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// This layer's slot in [`LAYER_ID_LEDGER`], or `None` for a spelling the
+    /// ledger does not hold — an id read out of a config file, or a layer a
+    /// build registers that this table has not been told about.
+    ///
+    /// **A `match` over literals and not a scan of `LAYER_ID_LEDGER`**, because
+    /// the one caller is a telemetry counter on an arrival path
+    /// (`squallar_egui::overlay_cache::ledger::note_blank`) and a nineteen-step
+    /// walk of string compares there is the cost that instrument refuses to
+    /// pay. rustc lowers this to a switch on the byte length and a `memcmp`
+    /// against the candidates of that length — at most four for any length in
+    /// the table.
+    ///
+    /// The slots are `LAYER_ID_LEDGER`'s indices, so they are as append-only as
+    /// the ledger is: a row's number is persisted in nothing, but a counter
+    /// array indexed by it is compared across legs, so moving one silently
+    /// re-labels every archived reading. `the_slots_are_the_ledgers_own_indices`
+    /// is what stops the match and the table drifting apart.
+    pub fn ledger_slot(&self) -> Option<usize> {
+        Some(match self.as_str() {
+            "ModelData" => 0,
+            "SpcOutlook" => 1,
+            "Radar" => 2,
+            "SpcDiscussions" => 3,
+            "NwsAlerts" => 4,
+            "StormReports" => 5,
+            "Lightning" => 6,
+            "Metar" => 7,
+            "CityLabels" => 8,
+            "RadarSites" => 9,
+            "UserLocation" => 10,
+            "ColorScale" => 11,
+            "SpcFireOutlook" => 12,
+            "Mrms" => 13,
+            "Gmgsi" => 14,
+            "FakeSource" => 15,
+            "Terrain" => 16,
+            "BasemapTiles" => 17,
+            "RadarCoverage" => 18,
+            _ => return None,
+        })
+    }
 }
 
 /// Every spelling was captured mechanically from the pre-M8 layer enum's
@@ -142,6 +184,36 @@ pub const LAYER_ID_LEDGER: [&str; 19] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`LayerId::ledger_slot`] IS [`LAYER_ID_LEDGER`]'s index, for every row.
+    ///
+    /// The slot table is a hand-written `match` and the ledger is an array;
+    /// nothing but this makes them the same numbering. It fails in both
+    /// directions — a row the match forgot reads `None`, and a row the match
+    /// numbers wrongly reads the wrong slot — and it also refuses a slot past
+    /// the end of the array, which is what a counter array indexed by these
+    /// would panic on.
+    #[test]
+    fn the_slots_are_the_ledgers_own_indices() {
+        for (want, spelling) in LAYER_ID_LEDGER.iter().enumerate() {
+            let got = LayerId::from_static(spelling).ledger_slot();
+            assert_eq!(
+                got,
+                Some(want),
+                "LAYER_ID_LEDGER row {want} ({spelling:?}) has slot {got:?}"
+            );
+        }
+        assert!(
+            LayerId::new("NotALayerAnyoneRegistered")
+                .ledger_slot()
+                .is_none(),
+            "a spelling outside the ledger must have no slot, not slot 0"
+        );
+        assert!(
+            LayerId::new("").ledger_slot().is_none(),
+            "the empty id must have no slot"
+        );
+    }
 
     /// Every `known` const appears in [`LAYER_ID_LEDGER`], with no duplicates.
     #[test]
