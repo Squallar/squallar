@@ -190,3 +190,64 @@ fn a_stamped_map_reprices_rather_than_drifting() {
         "the stamped entry is priced once the layer says so",
     );
 }
+
+/// **The census prices the allocation, not the fill** — and the alert row is
+/// no exception to it.
+///
+/// `alerts_input_bytes` is hand-rolled rather than `Vec::owned_bytes`, because
+/// the rows share their geometry with the alert list and pricing it twice
+/// inside one figure is the double count this module forbids. Being
+/// hand-rolled, it could quietly disagree with the vocabulary every other
+/// pricer speaks: `String` and `Vec` and `HashMap` all answer `capacity`,
+/// "the allocator is holding the capacity", because a census that reported
+/// `len` would report a buffer the process cannot use as bytes it does not
+/// hold.
+///
+/// It matters here more than elsewhere. `AlertsInput::alerts` is built by a
+/// **filtered** `collect` (`handlers/alert.rs`), whose `size_hint` lower bound
+/// is zero, so it grows by doubling and lands on a capacity above its length
+/// whenever the pane admits a number that is not a power of two. Pricing that
+/// by `len` would hide real resident bytes, and — the reason this test is
+/// written down — it would make any future fix to the reservation read as
+/// having done nothing at all.
+#[test]
+fn the_alert_row_prices_the_buffer_and_not_the_fill() {
+    use crate::render::rasterize::{AlertPaint, AlertsInput};
+
+    let paint = |i: usize| AlertPaint {
+        id: format!("urn:oid:2.49.0.1.840.0.{i}"),
+        category: crate::nws::alert::AlertCategory::Warning,
+        features: Arc::new(Vec::new()),
+    };
+
+    // A `Vec` with slack in it, the shape a filtered `collect` really produces.
+    let mut alerts = Vec::with_capacity(64);
+    alerts.extend((0..5).map(paint));
+    assert_eq!(alerts.len(), 5);
+    assert_eq!(
+        alerts.capacity(),
+        64,
+        "the fixture has the slack under test"
+    );
+
+    let ids: u64 = alerts.iter().map(|p| p.id.capacity() as u64).sum();
+    let input = AlertsInput {
+        alerts,
+        enabled_categories: Vec::new(),
+        hidden_ids: std::collections::HashSet::new(),
+        device_scale: 1.0,
+    };
+
+    let priced = super::alerts_input_bytes(&input);
+    let row = size_of::<AlertPaint>() as u64;
+
+    assert_eq!(
+        priced,
+        64 * row + ids,
+        "the alert row must price its buffer (64 rows x {row} B) and not its \
+         fill (5 rows); a figure of {} B would be the `len` reading, which \
+         under-reports {} B the allocator is really holding",
+        5 * row + ids,
+        59 * row,
+    );
+}

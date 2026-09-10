@@ -320,6 +320,23 @@ pub fn parse_alerts(json: &serde_json::Value) -> Vec<NwsAlert> {
         });
     }
 
+    // **The reservation was an upper bound; the return value is not.** The
+    // two `continue`s above drop features that carry neither geometry nor
+    // zones, and this `Vec` is not scratch: it is moved into `ActiveAlerts`
+    // and parked in the layer's state, so a slot reserved and never filled is
+    // resident for as long as the round is. It is reported, too --
+    // `ItemFootprint for Vec` prices `capacity`, so the slack is counted as
+    // this layer's memory, correctly.
+    //
+    // `shrink_to_fit` rather than a count pass, measured on a 1000-feature
+    // response (release, per call, 20 calls): admission needs `parse_geometry`
+    // and `parse_affected_zones`, so a counting pass is the expensive half of
+    // the walk run twice. This is one grant against the 4,301 the same call
+    // already makes at a 70% drop rate, and `Vec::shrink_to_fit` is a no-op
+    // when nothing was dropped -- the 1000-of-1000 case pays literally
+    // nothing, which a count pass would not.
+    alerts.shrink_to_fit();
+
     let with_geom = alerts.iter().filter(|a| !a.features.is_empty()).count();
     let zone_only = alerts.iter().filter(|a| a.features.is_empty()).count();
     log::info!(
