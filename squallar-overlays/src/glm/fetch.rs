@@ -1772,31 +1772,50 @@ fn flashes_in_window(
     cutoff: NaiveDateTime,
     horizon: NaiveDateTime,
 ) -> Vec<GlmFlash> {
-    // **Presized off the level, not grown into.** A `Filter` reports a lower
-    // size hint of zero, so `collect` started this Vec at four rows and
-    // doubled: the capacity it settled on was the next power of two above the
-    // row count, and it is not a transient — it travels into
-    // `GlmFetchOutcome::flashes` and on into the render handler's
-    // `Arc<GlmSlab>`, so up to 2× the rows stayed held for as long as the
-    // delivery was. At 420,000 rows that was 25,165,824 B of capacity carrying
-    // 20,160,000 B of rows.
+    // **Sized by what it delivers, counted.** This Vec is not scratch: it
+    // travels into `GlmFetchOutcome::flashes` and on into the render handler's
+    // `Arc<GlmSlab>`, so every slot it carries is resident for as long as the
+    // delivery is. Both earlier spellings sized it off something other than
+    // the result and both left unreadable capacity held. `collect` over a
+    // `Filter` grew by doubling to the next power of two above the row count —
+    // 25,165,824 B carrying 20,160,000 B at 420,000 rows. Presizing off
+    // `cache.retained_flashes()` traded that for the whole shared store, which
+    // is an upper bound but not a close one: the claim that it over-reserves
+    // only by "the straddling granule and a satellite just deselected" holds
+    // for a single live pane whose horizon is the newest thing cached, and one
+    // retention floor serves every pane. A pane parked behind its neighbours
+    // carries granules *newer* than its own horizon — the state
+    // `gauge::empty_delivery` above already counts — and the filter drops all
+    // of them: 3 rows out of a 240,003-row store reserved 9,600,000 B to hand
+    // over 120 B.
     //
-    // `retained_flashes` is an exact upper bound and a free read — the
-    // maintained level, not a walk: every row this filter can keep is a row the
-    // cache holds. What it over-reserves by is what the filter drops: the
-    // granule straddling the window's end, and — for the window it takes those
-    // granules to age out of `evict_before` — a satellite just deselected. That
-    // worst case is under 2× the rows kept, which is what doubling settled on
-    // anyway, so the reservation is never dearer than the growth it replaced
-    // and is exact on a steady pane.
-    let mut in_window = Vec::with_capacity(cache.retained_flashes());
-    in_window.extend(
-        cache
-            .all_flashes()
-            .filter(|f| satellites.contains(&f.satellite) && f.time >= cutoff && f.time <= horizon)
-            .cloned(),
-    );
-    in_window
+    // The count pass is the same predicate over the same rows, so the capacity
+    // is exact rather than merely tighter, and it allocates nothing. **It is
+    // not free** and the figure is not hidden: measured in release against a
+    // ±2.5% noise floor, a delivery costs +30.0% where every cached row is in
+    // window (1067→1387 µs at 240,000 rows) and +100.3% on the parked posture
+    // this fixes (272→544 µs at 3 rows of 240,003). That is a second walk of
+    // memory the collect below reads anyway, on the poll future rather than
+    // the frame thread, beside the S3 listing, downloads and HDF5 parse the
+    // same poll does.
+    //
+    // **`shrink_to_fit` after a `collect` was measured and refused.** It lands
+    // on the same exact capacity, and on the parked posture it is the cheaper
+    // of the two (-3.1%, inside the noise floor). But it reaches the doubled
+    // capacity *first* and then copies: +149.3% on a full delivery
+    // (1067→2660 µs), two allocations per delivery instead of one, and both
+    // buffers live at the memcpy instant — 20.1 MB where the count pass never
+    // exceeds the 9.6 MB it ends on. That transient is precisely what
+    // `tests/glm_poll_peak.rs`'s `a_cold_poll_holds_one_row_buffer_per_delivery`
+    // exists to bound, so the cheaper spelling is the one that spends the
+    // budget this file is written against. Exactness over amortization, the
+    // same trade `3c95fecc3` took one layer down.
+    let in_window =
+        |f: &&GlmFlash| satellites.contains(&f.satellite) && f.time >= cutoff && f.time <= horizon;
+
+    let mut delivered = Vec::with_capacity(cache.all_flashes().filter(in_window).count());
+    delivered.extend(cache.all_flashes().filter(in_window).cloned());
+    delivered
 }
 
 fn build_outcome(

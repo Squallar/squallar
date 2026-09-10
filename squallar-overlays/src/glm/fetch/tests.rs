@@ -4144,3 +4144,77 @@ fn the_union_orders_eviction_and_cannot_widen_it() {
         MAX_RETAINED_FLASHES * FLASH_BYTES,
     );
 }
+
+/// **The delivery is sized by what it delivers, not by the store it walks.**
+///
+/// `flashes_in_window` presized off `retained_flashes` — the whole shared
+/// cache — while the set it collects is one pane's window out of it. The two
+/// are the same number only on a single live pane whose horizon is the
+/// newest thing cached. They diverge exactly where `fetch_glm_flashes`
+/// already counts a divergence (`gauge::empty_delivery`): one retention floor
+/// serves every pane, so a pane parked behind its neighbours carries granules
+/// *newer* than its own horizon, and the filter drops every one of them.
+///
+/// That Vec is not scratch — `build_outcome` moves it into
+/// `GlmFetchOutcome::flashes` and the render handler moves it on into the
+/// `Arc<GlmSlab>` it installs, so the unreadable capacity is resident for as
+/// long as the delivery is. Same defect class as `3c95fecc3`, one layer up.
+#[test]
+fn a_small_delivery_out_of_a_large_store_is_sized_by_what_it_delivers() {
+    let cutoff = t0();
+    let horizon = cutoff + TimeDelta::minutes(5);
+
+    let mut cache = GlmCache::default();
+
+    // Three rows this parked pane can draw.
+    cache_granule(
+        &mut cache,
+        "in-window.nc",
+        vec![
+            flash_at(cutoff),
+            flash_at(cutoff + TimeDelta::minutes(2)),
+            flash_at(horizon),
+        ],
+    );
+
+    // 240,000 rows the neighbours' panes are holding the floor open for, every
+    // one of them past this pane's horizon. The order of the pinned rig leg's
+    // 240,726-flash delivery.
+    const PARKED_ROWS: usize = 240_000;
+    let ahead = horizon + TimeDelta::hours(1);
+    cache_granule(
+        &mut cache,
+        "ahead-of-this-pane.nc",
+        (0..PARKED_ROWS)
+            .map(|i| flash_at(ahead + TimeDelta::milliseconds(i as i64)))
+            .collect(),
+    );
+
+    assert_eq!(
+        cache.retained_flashes(),
+        PARKED_ROWS + 3,
+        "premise: the store really is three orders larger than the window",
+    );
+
+    let delivered = flashes_in_window(&cache, &[GlmSatellite::GoesEast], cutoff, horizon);
+
+    assert_eq!(
+        delivered.len(),
+        3,
+        "premise: only the in-window granule may be delivered",
+    );
+
+    assert_eq!(
+        delivered.capacity(),
+        delivered.len(),
+        "the delivery holds {} slots to hand over {}: {} B of capacity nothing \
+         can read beside {} B of rows, resident for the life of the slab. The \
+         store it walked is {} rows — a delivery sized off that, or grown into \
+         by doubling, is what this pins against",
+        delivered.capacity(),
+        delivered.len(),
+        (delivered.capacity() - delivered.len()) * FLASH_BYTES,
+        delivered.len() * FLASH_BYTES,
+        cache.retained_flashes(),
+    );
+}
