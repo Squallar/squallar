@@ -702,16 +702,16 @@ impl OverlayHandler for SpcOutlookHandler {
     /// user saw: nothing drawn, and a tap on the empty map still opening an
     /// outlook's details.
     ///
-    /// **The instant is the wall clock, and on a scrubbed pane that is not the
-    /// pane's.** A hit test has no [`RasterizeContext`] — [`PaneRef`] carries
-    /// no clock — so the two halves coincide exactly on a live pane and the
-    /// scrubbed pane's hit set is the live one. That residual is narrower than
-    /// the unfiltered walk it replaces, and closing it means putting `as_of`
-    /// on `PaneRef`.
+    /// **The instant is the pane's, not the wall clock's.** A hit test has no
+    /// [`RasterizeContext`] to read `as_of` off, so it takes the same instant
+    /// from the pane itself: a pane parked in April offers the outlook that
+    /// was in force in April, which is the one [`Self::paint_input`] drew.
+    /// While the pane follows live the two are the same clock read this
+    /// function always made.
     fn clickable_items<'a>(&'a self, pane: &PaneRef<'_>) -> Vec<ClickableItem<'a>> {
         let view = self.view(pane);
         let day = view.selected_day;
-        let now = chrono::Utc::now().naive_utc();
+        let now = pane.as_of_or_now();
         let mut items = Vec::new();
         for (product, outlook) in self.in_force_in_paint_order(view, now) {
             for feature in &outlook.features {
@@ -2458,9 +2458,10 @@ mod tests {
     /// all, which is the half of the defect the user could see working.
     ///
     /// Both windows are anchored to the wall clock rather than to a fixed
-    /// date, because `clickable_items` has no context to take an instant from
-    /// and reads that clock itself — a fixed-date fixture here would pass
-    /// today and rot on a date.
+    /// date, because this reading is the LIVE pane's: `PaneRef::bare` names
+    /// no instant, so `clickable_items` reads the wall clock and a fixed-date
+    /// fixture here would rot on a date. The scrubbed pane's reading is
+    /// `a_scrubbed_pane_taps_the_outlook_in_force_at_its_own_instant`.
     #[test]
     fn the_clickable_set_is_the_painted_set() {
         let base = crate::spc::outlook::parse_geojson(
@@ -2509,6 +2510,71 @@ mod tests {
         assert!(
             lapsed.clickable_items(&PaneRef::bare(0)).is_empty(),
             "nothing off the glass may open a popup",
+        );
+    }
+
+    /// **A pane parked in the past taps THAT instant's outlook**, both ways
+    /// round.
+    ///
+    /// An issuance that lapsed in April is what an April pane opens, and the
+    /// issuance in force today is not. Before [`PaneRef`] carried a clock
+    /// this walk read `Utc::now()` and answered both the other way about —
+    /// the tap on a scrubbed pane opened today's outlook, over geometry the
+    /// pane was not even drawing.
+    ///
+    /// The April window is a fixed date on purpose: it is the pane's instant,
+    /// not the wall clock's, so nothing here can rot.
+    #[test]
+    fn a_scrubbed_pane_taps_the_outlook_in_force_at_its_own_instant() {
+        let base = crate::spc::outlook::parse_geojson(
+            &serde_json::from_str(DAY2_CATEGORICAL).expect("the fixture is JSON"),
+            OutlookDay::Day2,
+            OutlookProduct::Categorical,
+        )
+        .expect("SPC's own bytes parse");
+        let hours = chrono::Duration::hours;
+        let april = chrono::NaiveDate::from_ymd_opt(2026, 4, 3)
+            .expect("a real date")
+            .and_hms_opt(18, 0, 0)
+            .expect("a real time");
+        let now = chrono::Utc::now().naive_utc();
+        let scrubbed = PaneRef {
+            as_of: Some(april),
+            ..PaneRef::bare(0)
+        };
+
+        // In force in April, lapsed long before today.
+        let then = holding(SpcOutlook {
+            issue: Some(april - hours(6)),
+            valid: Some(april),
+            expire: Some(april + hours(6)),
+            ..base.clone()
+        });
+        assert_eq!(
+            then.clickable_items(&scrubbed).len(),
+            2,
+            "an April pane opens the issuance that was in force in April",
+        );
+        assert!(
+            then.clickable_items(&PaneRef::bare(0)).is_empty(),
+            "premise: a live pane opens nothing, that issuance lapsed months ago",
+        );
+
+        // In force today, and no part of April.
+        let today = holding(SpcOutlook {
+            issue: Some(now - hours(2)),
+            valid: Some(now),
+            expire: Some(now + hours(22)),
+            ..base
+        });
+        assert!(
+            today.clickable_items(&scrubbed).is_empty(),
+            "an April pane must not open today's outlook",
+        );
+        assert_eq!(
+            today.clickable_items(&PaneRef::bare(0)).len(),
+            2,
+            "premise: it is today's product, and a live pane does open it",
         );
     }
 

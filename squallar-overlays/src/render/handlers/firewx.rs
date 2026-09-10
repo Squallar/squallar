@@ -754,12 +754,11 @@ impl OverlayHandler for SpcFireOutlookHandler {
     }
 
     /// **The same walk the picture is painted from**, so a polygon can offer a
-    /// popup only while it is also on the glass — see the convective layer's
-    /// note for the gap this closes and for why the instant here is the wall
-    /// clock rather than a scrubbed pane's own.
+    /// popup only while it is also on the glass — and over the same instant,
+    /// which is the pane's own. See the convective layer's note.
     fn clickable_items<'a>(&'a self, pane: &PaneRef<'_>) -> Vec<ClickableItem<'a>> {
         let view = self.view(pane);
-        let now = chrono::Utc::now().naive_utc();
+        let now = pane.as_of_or_now();
         let mut items = Vec::new();
         for (key, outlook) in self.in_force_in_paint_order(view, now) {
             let (day, hazard, product) = key;
@@ -2214,6 +2213,48 @@ mod tests {
             },
         );
         handler
+    }
+
+    /// **The fire layer's half of the same defect**, and the same two
+    /// directions: an April pane opens April's issuance and not today's.
+    ///
+    /// Its `clickable_items` read `Utc::now()` for the same reason the
+    /// convective one did — a hit test has no `RasterizeContext` — and both
+    /// now take the instant off the pane.
+    #[test]
+    fn a_scrubbed_pane_taps_the_fire_outlook_in_force_at_its_own_instant() {
+        let hours = chrono::Duration::hours;
+        let april = chrono::NaiveDate::from_ymd_opt(2026, 4, 3)
+            .expect("a real date")
+            .and_hms_opt(18, 0, 0)
+            .expect("a real time");
+        let now = chrono::Utc::now().naive_utc();
+        let scrubbed = PaneRef {
+            as_of: Some(april),
+            ..PaneRef::bare(0)
+        };
+
+        let then = day1_with_window(Some(april - hours(6)), Some(april), Some(april + hours(6)));
+        assert_eq!(
+            then.clickable_items(&scrubbed).len(),
+            1,
+            "an April pane opens the fire outlook in force in April",
+        );
+        assert!(
+            then.clickable_items(&PaneRef::bare(0)).is_empty(),
+            "premise: it lapsed months ago, so a live pane opens nothing",
+        );
+
+        let today = day1_with_window(Some(now - hours(2)), Some(now), Some(now + hours(22)));
+        assert!(
+            today.clickable_items(&scrubbed).is_empty(),
+            "an April pane must not open today's fire outlook",
+        );
+        assert_eq!(
+            today.clickable_items(&PaneRef::bare(0)).len(),
+            1,
+            "premise: a live pane does open it",
+        );
     }
 
     fn labels_at(handler: &SpcFireOutlookHandler, as_of: chrono::NaiveDateTime) -> Vec<String> {

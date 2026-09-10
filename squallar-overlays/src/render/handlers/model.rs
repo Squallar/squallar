@@ -1226,10 +1226,12 @@ impl FrameSource for ModelDataHandler {
         if view.axis != ModelAxis::Forecast {
             return chrono::Duration::zero();
         }
-        let now = chrono::Utc::now().naive_utc();
-        let run = self.run_of(view).unwrap_or_else(|| latest_run_at(now));
-        // Measured from the wall clock rather than from the run, so the range
-        // still covers f48 of a run whose f00 is already hours old.
+        // Through [`Self::run_at`] rather than [`Self::run_of`] plus the wall
+        // clock: the pane's own instant closes the "I do not know yet" hole,
+        // and bounds the cache arm with it. An unparked pane scrubbed into
+        // April is therefore sized by the run that was latest THEN — 18 hours
+        // or 48 depending on which hour that fell on — instead of by today's.
+        let run = self.run_at(view, pane.as_of_or_now());
         chrono::Duration::hours(i64::from(forecast_horizon(run)))
     }
 
@@ -2002,7 +2004,11 @@ impl OverlayHandler for ModelDataHandler {
         // The option *values* are relative tokens and the *labels* are
         // absolute times: the token is what persists (a saved instant reopens
         // days stale), and a time is what a user is actually picking.
-        let now = chrono::Utc::now().naive_utc();
+        // The pane's own instant: a pane parked in April is offered April's
+        // runs. The tokens below are *relative* to this, so the clock that
+        // builds the menu and the clock `apply_control` reads the pick back
+        // against have to be one clock — see `PaneMut::as_of`.
+        let now = pane.as_of_or_now();
         let latest = latest_run_at(now);
         let picked_run = view.selected_frame.map(|(run, _)| run);
         // The menu reaches twelve runs back, and further when this pane's own
@@ -2175,7 +2181,8 @@ impl OverlayHandler for ModelDataHandler {
             // every build before this control existed.
             "run" => {
                 if let ControlValue::String(ref val) = update.value {
-                    let now = chrono::Utc::now().naive_utc();
+                    // The same clock `controls` spelled the options with.
+                    let now = pane.as_of_or_now();
                     let (floor, current) = {
                         let view = self.view(&pane.as_ref());
                         (view.selected_param.min_forecast_hour(), view.selected_frame)
@@ -2201,7 +2208,8 @@ impl OverlayHandler for ModelDataHandler {
                 if let ControlValue::String(ref val) = update.value
                     && let Some(picked) = parse_f_hour(val)
                 {
-                    let now = chrono::Utc::now().naive_utc();
+                    // As above: the menu's clock, not the wall clock.
+                    let now = pane.as_of_or_now();
                     let (floor, current) = {
                         let view = self.view(&pane.as_ref());
                         (view.selected_param.min_forecast_hour(), view.selected_frame)
@@ -4745,6 +4753,146 @@ mod tests {
                 peers: &[],
             },
         )
+    }
+
+    /// **An April pane is offered April's run list, not today's.**
+    ///
+    /// The run menu spells its options as times, so the clock that builds it
+    /// decides which twelve runs a user can pick. Read off the wall clock, a
+    /// pane parked in April offered this afternoon's cycle.
+    #[test]
+    fn a_scrubbed_pane_is_offered_the_run_list_of_its_own_instant() {
+        let h = new_handler();
+        let april = chrono::NaiveDate::from_ymd_opt(2026, 4, 3)
+            .expect("a real date")
+            .and_hms_opt(9, 30, 0)
+            .expect("a real time");
+        let options = run_options_at(&h, april);
+        let latest = latest_run_at(april);
+
+        assert_eq!(
+            options[0].0, RUN_LATEST,
+            "premise: the list still opens on Latest",
+        );
+        assert_eq!(
+            options[1].1,
+            format!(
+                "{} (f00-f{})",
+                latest.format("%H:%Mz"),
+                forecast_horizon(latest)
+            ),
+            "the newest run offered is the one latest at the pane's own instant",
+        );
+        // Nothing in the menu may postdate the pane. The labels of the
+        // remaining rows are the same run walked backwards, so the oldest is
+        // the whole reach of the list.
+        let oldest = latest - chrono::Duration::hours(i64::from(RUN_CHOICES));
+        assert!(
+            oldest < april && latest <= april,
+            "every run offered ({oldest} .. {latest}) is at or before the pane's instant {april}",
+        );
+    }
+
+    /// The run dropdown's options, asked of a pane depicting `as_of`.
+    fn run_options_at(h: &ModelDataHandler, as_of: chrono::NaiveDateTime) -> Vec<(String, String)> {
+        h.controls(&PaneRef {
+            as_of: Some(as_of),
+            ..PaneRef::bare(0)
+        })
+        .into_iter()
+        .find_map(|item| match item {
+            ControlItem::Dropdown {
+                id: "run", options, ..
+            } => Some(options),
+            _ => None,
+        })
+        .expect("the model layer offers a run dropdown")
+    }
+
+    /// **How far the rail reaches is the PANE's run's reach.**
+    ///
+    /// Two April instants whose latest runs differ in horizon — 48 hours off
+    /// a synoptic cycle, 18 off every other one — must give two different
+    /// answers. Off the wall clock both gave today's run's reach, so they
+    /// were equal: that is the whole of the width-only defect.
+    ///
+    /// The two instants are found through the same `latest_run_at` the
+    /// handler uses, so nothing here encodes the publication lag.
+    #[test]
+    fn the_rails_forward_reach_belongs_to_the_panes_own_run() {
+        let h = new_handler();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 4, 3).expect("a real date");
+        let mut synoptic = None;
+        let mut off_cycle = None;
+        for hour in 0..24 {
+            let t = day.and_hms_opt(hour, 30, 0).expect("a real time");
+            if forecast_horizon(latest_run_at(t)) == 48 {
+                synoptic.get_or_insert(t);
+            } else {
+                off_cycle.get_or_insert(t);
+            }
+        }
+        let synoptic = synoptic.expect("some April hour sits on a synoptic run");
+        let off_cycle = off_cycle.expect("some April hour sits off one");
+
+        let horizon_at = |as_of| {
+            h.frame_horizon(&PaneRef {
+                as_of: Some(as_of),
+                ..PaneRef::bare(0)
+            })
+        };
+        assert_eq!(
+            horizon_at(synoptic),
+            chrono::Duration::hours(48),
+            "a pane parked on a synoptic run reaches f48",
+        );
+        assert_eq!(
+            horizon_at(off_cycle),
+            chrono::Duration::hours(18),
+            "a pane parked off one reaches f18",
+        );
+    }
+
+    /// **The menu's clock and the pick's clock are one clock.**
+    ///
+    /// A run option is a *relative* token, so `controls` spelling the list
+    /// against the pane's instant while `apply_control` resolved the choice
+    /// against the wall clock would park the pane on a run months from the
+    /// one whose time it read off the menu. This is the pairing that makes
+    /// the two `apply_control` sites part of the same change rather than a
+    /// downstream tidy-up.
+    #[test]
+    fn a_run_picked_on_a_scrubbed_pane_parks_it_on_the_run_the_menu_named() {
+        let mut h = new_handler();
+        let mut state = h.create_pane_state(true).expect("a pane state");
+        let april = chrono::NaiveDate::from_ymd_opt(2026, 4, 3)
+            .expect("a real date")
+            .and_hms_opt(9, 30, 0)
+            .expect("a real time");
+
+        // Three runs back, as this pane's own menu spells it.
+        let options = run_options_at(&h, april);
+        let (token, label) = options[4].clone();
+        let wanted = latest_run_at(april) - chrono::Duration::hours(3);
+
+        h.apply_control(
+            &ControlUpdate {
+                id: "run",
+                value: ControlValue::String(token.clone()),
+            },
+            &mut PaneMut {
+                pane_idx: 0,
+                state: Some(&mut *state),
+                as_of: Some(april),
+                peers: &[],
+            },
+        );
+
+        let (run, _) = frame_of(&state).expect("picking a run parks the pane on one");
+        assert_eq!(
+            run, wanted,
+            "the token {token:?} was offered as {label:?} and must resolve to it",
+        );
     }
 
     fn frame_of(state: &FetchPayload) -> Option<(chrono::NaiveDateTime, u8)> {
