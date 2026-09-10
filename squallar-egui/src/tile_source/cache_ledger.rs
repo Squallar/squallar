@@ -159,6 +159,9 @@ pub enum CacheEvent {
         kind: EvictedKind,
         bytes: u64,
     },
+    /// One read the parsed-geometry cache answered instead of the archive.
+    /// See [`Totals::parsed_served`].
+    ParsedServed,
     /// One grid cell a pass could draw **nothing** for. See
     /// [`Totals::blank_cells`].
     BlankCell,
@@ -255,6 +258,19 @@ pub struct Totals {
     pub wanted_on_glass: u64,
     /// A level: cells of the ancestor net the last whole pass wanted.
     pub wanted_net: u64,
+    /// A counter: reads the parsed-geometry cache answered, so the archive
+    /// -- and the block cache, the disk and the network behind it -- was not
+    /// consulted for that tile at all.
+    ///
+    /// **The one number that says what the parsed cache is FOR.** Its doc
+    /// comments call it the restyle path, and a restyle is one of the two
+    /// things that reach it; the other is any re-ask of a tile the styled
+    /// cache has since dropped, which on a pan is most asks. Those two have
+    /// completely different frequencies, and until this counter existed
+    /// nothing in the tree could tell them apart or say the population was
+    /// serving anything at all. Incremented on the IO side, where the read is
+    /// answered; the levels below are stored where a parse lands.
+    pub parsed_served: u64,
     /// A level: parses held in the source's parsed-geometry cache.
     pub parsed_entries: u64,
     /// A level: what those parses are charged.
@@ -302,6 +318,7 @@ impl Totals {
                 self.evicted_resident += 1;
                 self.evicted_bytes += bytes;
             }
+            CacheEvent::ParsedServed => self.parsed_served += 1,
             CacheEvent::BlankCell => self.blank_cells += 1,
         }
     }
@@ -327,6 +344,7 @@ impl Totals {
             .wrapping_add(self.puts())
             .wrapping_add(self.evicted())
             .wrapping_add(self.evicted_bytes)
+            .wrapping_add(self.parsed_served)
             .wrapping_add(self.blank_cells)
     }
 
@@ -351,6 +369,7 @@ impl Totals {
                 .evicted_resident
                 .saturating_sub(earlier.evicted_resident),
             evicted_bytes: self.evicted_bytes.saturating_sub(earlier.evicted_bytes),
+            parsed_served: self.parsed_served.saturating_sub(earlier.parsed_served),
             blank_cells: self.blank_cells.saturating_sub(earlier.blank_cells),
             resident_entries: self.resident_entries,
             resident_bytes: self.resident_bytes,
@@ -379,6 +398,7 @@ struct RoleLedger {
     evicted_resident: AtomicU64,
     evicted_bytes: AtomicU64,
     blank_cells: AtomicU64,
+    parsed_served: AtomicU64,
     resident_entries: AtomicU64,
     resident_bytes: AtomicU64,
     overrun_bytes: AtomicU64,
@@ -407,6 +427,7 @@ impl RoleLedger {
             evicted_resident: AtomicU64::new(0),
             evicted_bytes: AtomicU64::new(0),
             blank_cells: AtomicU64::new(0),
+            parsed_served: AtomicU64::new(0),
             resident_entries: AtomicU64::new(0),
             resident_bytes: AtomicU64::new(0),
             overrun_bytes: AtomicU64::new(0),
@@ -497,6 +518,7 @@ pub fn note(role: CacheRole, event: CacheEvent) {
             ledger.evicted_bytes.fetch_add(bytes, Relaxed);
             ledger.evicted_resident.fetch_add(1, Relaxed)
         }
+        CacheEvent::ParsedServed => ledger.parsed_served.fetch_add(1, Relaxed),
         CacheEvent::BlankCell => ledger.blank_cells.fetch_add(1, Relaxed),
     };
 }
@@ -590,6 +612,7 @@ pub fn totals(role: CacheRole) -> Totals {
         evicted_resident: ledger.evicted_resident.load(Relaxed),
         evicted_bytes: ledger.evicted_bytes.load(Relaxed),
         blank_cells: ledger.blank_cells.load(Relaxed),
+        parsed_served: ledger.parsed_served.load(Relaxed),
         resident_entries: ledger.resident_entries.load(Relaxed),
         resident_bytes: ledger.resident_bytes.load(Relaxed),
         overrun_bytes: ledger.overrun_bytes.load(Relaxed),

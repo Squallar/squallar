@@ -2846,7 +2846,7 @@ var ground_stroke_draws_re = /ground tiles: .*, (\d+) stroke draws/;
 // probes; the role group is a WORD, so that file gives this its own arm, as
 // it does `budget_state_re`. Running totals: the LAST match per role wins for
 // the headline reading; every match is kept for the settle assertion.
-var tile_cache_re = /tile cache \(([a-z0-9-]+)\): (\d+) asks, (\d+) restyle asks, (\d+) refetch after eviction, (\d+) of them still wanted, (\d+) puts first, (\d+) restyle, (\d+) duplicate, (\d+) orphan, (\d+) evicted pending, (\d+) evicted resident of (\d+) B, (\d+) entries, (\d+) B resident, (\d+) parsed, snap (\d+), floor (\d+) entries, (\d+) B overrun, (\d+) wanted on glass, (\d+) wanted net, (\d+) blank cells/;
+var tile_cache_re = /tile cache \(([a-z0-9-]+)\): (\d+) asks, (\d+) restyle asks, (\d+) refetch after eviction, (\d+) of them still wanted, (\d+) puts first, (\d+) restyle, (\d+) duplicate, (\d+) orphan, (\d+) evicted pending, (\d+) evicted resident of (\d+) B, (\d+) entries, (\d+) B resident, (\d+) parsed, (\d+) served from parse, snap (\d+), floor (\d+) entries, (\d+) B overrun, (\d+) wanted on glass, (\d+) wanted net, (\d+) blank cells/;
 // A FIFTH, and the only one about the 3D floor path. `paints` is per 3D pane
 // per frame its off-screen map strip really drew, `mirror renders` per mirror
 // pass encoded (per frame, not per pane) -- two denominators, never added, and
@@ -3051,25 +3051,32 @@ for (var i = 0; i < C.length; i++) {
                resident_entries: parseInt(tcm[13], 10),
                resident_bytes: parseInt(tcm[14], 10),
                parsed_entries: parseInt(tcm[15], 10),
+               // A COUNTER, sat among the levels because that is where the
+               // line prints it: reads the parsed-geometry cache answered
+               // instead of the archive. Its denominator is `asks`, and the
+               // ratio is what says whether the population is earning --
+               // 94.4 % of asks on a measured pan, 0 of 93 on a static
+               // viewport, where `restyle asks` was 0 on both.
+               parsed_served: parseInt(tcm[16], 10),
                // A LEVEL: 1 while the role's source is held at the whole
                // zoom below the fractional one. The settle assertion counts
                // its flips; nothing differences it.
-               snap: parseInt(tcm[16], 10),
+               snap: parseInt(tcm[17], 10),
                // Three more LEVELS, and they price the reading above against
                // the scene rather than against a number: the entries the
                // cache holds whatever the budget says, what that floor
                // carries past the budget, and the last whole pass's cells on
                // the glass and in the ancestor net. Never differenced.
-               floor_entries: parseInt(tcm[17], 10),
-               overrun_bytes: parseInt(tcm[18], 10),
-               wanted_on_glass: parseInt(tcm[19], 10),
-               wanted_net: parseInt(tcm[20], 10),
+               floor_entries: parseInt(tcm[18], 10),
+               overrun_bytes: parseInt(tcm[19], 10),
+               wanted_on_glass: parseInt(tcm[20], 10),
+               wanted_net: parseInt(tcm[21], 10),
                // A COUNTER, and the only one after the levels: grid cells a
                // pass could draw NOTHING for -- neither the tile nor any
                // ancestor of it resident. Its denominator is cells walked, so
                // it is read against `wanted on glass` and never against
                // `asks`. It is last because every reader here is positional.
-               blank_cells: parseInt(tcm[21], 10) };
+               blank_cells: parseInt(tcm[22], 10) };
     if (!tile_cache) tile_cache = {};
     tile_cache[tcm[1]] = tc;
     tile_cache_all.push(tc);

@@ -213,7 +213,7 @@ const RECOVERED: &str = "the archive is answering tile reads again, so it draws 
 /// | slot    | population      | one entry                                | figure |
 /// |---------|-----------------|------------------------------------------|--------|
 /// | basemap | styled entries  | shapes + flattened buffers               | this constant (tail), [`TYPICAL_STYLED_ENTRY_BYTES`] (typical) |
-/// | basemap | parsed geometry | the style-independent decode a restyle re-runs from | [`MEASURED_PARSED_TILE_BYTES`] (tail) |
+/// | basemap | parsed geometry | the style-independent decode a re-ask re-runs from | [`MEASURED_PARSED_TILE_BYTES`] (tail) |
 /// | terrain | rasters         | one 256x256 RGBA texture                 | [`RASTER_TILE_BYTES`], no tail |
 ///
 /// Every entry is charged at least [`byte_lru::MARKER_BYTES`], so a cache of
@@ -506,13 +506,44 @@ type IoTileBodies = ();
 /// decoded, keyed by [`TileId`], each charged at
 /// `walkers::mvt::ParsedTile::heap_bytes`.
 ///
-/// **Economy, with no floor.** It exists so a style change — a theme flip, a
-/// map-detail toggle — re-styles from the cached parse with zero fetches and
-/// zero re-parses ([`HttpsTiles::set_style`]); an entry evicted before the
-/// restyle costs one refetch for that tile, exactly the pre-split behaviour,
-/// and never a frame. So unlike the styled cache its working set is a target
-/// and not a floor, and its budget (the device's parsed allowance) is the
-/// whole of what bounds it.
+/// **Economy, with no floor.** An entry evicted before it is asked for again
+/// costs one refetch for that tile, exactly the pre-split behaviour, and
+/// never a frame. So unlike the styled cache its working set is a target and
+/// not a floor, and its budget (the device's parsed allowance) is the whole
+/// of what bounds it.
+///
+/// # What it is actually for, measured
+///
+/// This comment, and every other one in this file, used to say the population
+/// existed for a style change — a theme flip, a map-detail toggle
+/// ([`HttpsTiles::set_style`]). **That is the rarer of the two things that
+/// reach it, and on a real session it is not the one doing the work.**
+///
+/// [`cache_ledger::Totals::parsed_served`] counts the reads this cache
+/// answered, which is the number nothing in the tree could produce before it
+/// existed: the levels beside it say how much is held, and `restyle asks`
+/// counts only the re-asks a bumped style generation caused. Two 300 s legs
+/// on the committed REST1 seed, native release, one display, 2026-09-10:
+///
+/// | leg | asks | restyle asks | served from parse | held |
+/// | --- | --- | --- | --- | --- |
+/// | static viewport | 93 | 0 | **0** | 23.57 MiB |
+/// | the same seed under `pan-zoom-2d` | 6,129 | 0 | **5,783 (94.4 %)** | 63.8 MiB |
+///
+/// So the population is the **pan-back cache**: a tile the styled cache
+/// dropped behind a pan and the walk asks for again is answered here, without
+/// the archive, the block cache, the disk or the network. 340 tiles were
+/// parsed over that pan and 6,123 were styled — the cache is what makes those
+/// two numbers different, and re-parsing the 5,783 it answered would have
+/// added 7.9 s of decode to a 300 s pan at the leg's own mean parse of
+/// 1,364 us.
+///
+/// The bytes are genuinely reclaimable — `walkers::mvt::styled` takes
+/// `&ParsedTile` and returns an owned `Vec<ShapeOrText>` that borrows nothing
+/// from it, so nothing renders out of this population and dropping it would
+/// free every byte. **It is held because it is earning, not because it is
+/// co-held**, and a lane sent to reclaim it on the strength of the restyle
+/// framing should read the counter first.
 ///
 /// **On wasm32 the restyle is served from the undecoded bodies instead once
 /// the pump offloads**, and here is the price, per visible tile of the
@@ -1256,9 +1287,11 @@ fn timed_styled(parsed: &walkers::mvt::ParsedTile, style: &Style, zoom: u8) -> T
 
 /// [`decode_archive_tile`], with the parse half **remembered**: a vector
 /// body's zoom- and style-independent decode lands in `parsed_tiles` before
-/// the styling, so a later restyle of this tile ([`HttpsTiles::set_style`])
-/// touches neither the network nor the bytes. The raster arms delegate
-/// unchanged — there is nothing style-independent to keep for a pixel body.
+/// the styling, so a later ask for this tile — a pan back onto it, or a
+/// restyle ([`HttpsTiles::set_style`]) — touches neither the network nor the
+/// bytes. Which of those two actually spends the population is measured at
+/// [`SharedParsedTiles`]. The raster arms delegate unchanged — there is
+/// nothing style-independent to keep for a pixel body.
 ///
 /// Runs on the IO runtime's blocking pool, native only: the wasm32 pump
 /// takes the parse half alone ([`remember_parsed`]) and styles it in slices
@@ -5041,8 +5074,9 @@ impl ReadFailureRun {
 
 /// Read one tile out of the archive -- and on native, tessellate and upload it
 /// too. Or skip the archive entirely: a tile whose parse is already in
-/// [`SharedParsedTiles`] is re-styled from it, which is the whole of what a
-/// theme flip or a detail toggle costs since [`HttpsTiles::set_style`].
+/// [`SharedParsedTiles`] is re-styled from it. That is the whole of what a
+/// theme flip costs ([`HttpsTiles::set_style`]) and, measured, the whole of
+/// what most of a pan costs too.
 ///
 /// `kind` is decided once, at open, by [`serve_archive_continuously`] —
 /// **not re-derived here**. On native this function is the decoding side, so a
@@ -5217,9 +5251,11 @@ where
     S: crate::basemap_archive::ArchiveRangeSource,
     O: crate::basemap_archive::ArchiveRangeSource,
 {
-    // The restyle path: parsed geometry already held means the archive — and
-    // the network and disk behind it — is not consulted at all. This is what
-    // `HttpsTiles::set_style` turns a theme flip and a detail toggle into.
+    // Parsed geometry already held means the archive -- and the block cache,
+    // the disk and the network behind it -- is not consulted at all. Two
+    // things reach this: a restyle, and any re-ask of a tile the styled cache
+    // has since dropped. The second is 94.4 % of a pan's asks and the first
+    // was zero on both measured legs; see [`SharedParsedTiles`].
     let remembered = match (&styling.parsed_tiles, kind) {
         (Some(parsed_tiles), ArchiveTileKind::Vector) => parsed_tiles
             .lock()
@@ -5229,6 +5265,9 @@ where
         _ => None,
     };
     if let Some(parsed) = remembered {
+        // The whole reason this population is held, counted where it is
+        // spent rather than inferred from the levels beside it.
+        cache_ledger::note(styling.role, cache_ledger::CacheEvent::ParsedServed);
         #[cfg(not(target_arch = "wasm32"))]
         let payload = {
             let (style, epoch, feathering) = current_style(&styling.style);

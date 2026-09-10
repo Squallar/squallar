@@ -631,8 +631,8 @@ def scrape(lines, probes):
             # silently vanished from a green run. Recorded so it can say so.
             out["unparsed"].append((idx, "budget_state_re", line.strip()[:200]))
         # `tile cache (<role>)` is running totals with a WORD first, like
-        # `budget state`: its own arm, the role kept as text and the twenty
-        # figures after it as ints. No match leaves the family empty, which the
+        # `budget state`: its own arm, the role kept as text and the
+        # twenty-one figures after it as ints. No match leaves the family empty, which the
         # row prints as n/a -- a binary older than the line, never a zero.
         m = probes["tile_cache_re"].search(line)
         if m:
@@ -2842,12 +2842,12 @@ def print_row(row):
                 "refetch_still_wanted=%s "
                 "puts_first=%s puts_restyle=%s puts_duplicate=%s puts_orphan=%s "
                 "evicted_pending=%s evicted_resident=%s evicted_bytes=%s "
-                "entries=%s resident_bytes=%s parsed=%s snap=%s "
+                "entries=%s resident_bytes=%s parsed=%s parsed_served=%s snap=%s "
                 "floor_entries=%s overrun_bytes=%s wanted_on_glass=%s wanted_net=%s "
                 "blank_cells=%s"
                 % (role, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8],
                    f[9], f[10], f[11], f[12], f[13], f[14], f[15], f[16], f[17],
-                   f[18], f[19])
+                   f[18], f[19], f[20])
             )
     else:
         print(
@@ -4631,7 +4631,8 @@ class SharedFormatTests(unittest.TestCase):
             "(base): 1001 asks, 12 restyle asks, 103 refetch after eviction, "
             "0 of them still wanted, 904 puts first, 15 restyle, 26 duplicate, "
             "37 orphan, 48 evicted pending, 59 evicted resident of 6000060 B, "
-            "71 entries, 8000082 B resident, 93 parsed, snap 1, floor 111 "
+            "71 entries, 8000082 B resident, 93 parsed, 2002 served from parse, "
+            "snap 1, floor 111 "
             "entries, 222 B overrun, 84 wanted on glass, 4 wanted net, "
             "17 blank cells"
         )
@@ -4642,7 +4643,7 @@ class SharedFormatTests(unittest.TestCase):
         self.assertEqual(
             figures,
             [1001, 12, 103, 0, 904, 15, 26, 37, 48, 59, 6000060, 71, 8000082,
-             93, 1, 111, 222, 84, 4, 17],
+             93, 2002, 1, 111, 222, 84, 4, 17],
         )
         by_role = tile_cache_by_role(s["tile_cache"])
         self.assertEqual(set(by_role), {"base"})
@@ -4710,13 +4711,13 @@ class SharedFormatTests(unittest.TestCase):
         self.assertIn("tile cache: n/a", text)
         self.assertNotIn("tile cache (base)", text)
         row["tile_cache"] = {"base": (7, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
-                                          13, 14, 15, 16, 17, 18, 19, 20])}
+                                          13, 14, 15, 16, 17, 18, 19, 20, 21])}
         text = _capture(lambda: print_row(row))
         self.assertIn("tile cache (base): asks=1 restyle_asks=2 refetch_after_eviction=3", text)
-        self.assertIn("parsed=14 snap=15", text)
+        self.assertIn("parsed=14 parsed_served=15 snap=16", text)
         self.assertIn(
-            "floor_entries=16 overrun_bytes=17 wanted_on_glass=18 wanted_net=19 "
-            "blank_cells=20",
+            "floor_entries=17 overrun_bytes=18 wanted_on_glass=19 wanted_net=20 "
+            "blank_cells=21",
             text,
         )
 

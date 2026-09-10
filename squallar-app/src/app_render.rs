@@ -813,7 +813,8 @@ fn tile_cache_line(
         "tile cache ({}): {} asks, {} restyle asks, {} refetch after eviction, \
          {} of them still wanted, {} puts first, {} restyle, {} duplicate, \
          {} orphan, {} evicted pending, {} evicted resident of {} B, \
-         {} entries, {} B resident, {} parsed, snap {}, floor {} entries, \
+         {} entries, {} B resident, {} parsed, {} served from parse, \
+         snap {}, floor {} entries, \
          {} B overrun, {} wanted on glass, {} wanted net, {} blank cells",
         role.label(),
         t.requests,
@@ -830,6 +831,7 @@ fn tile_cache_line(
         t.resident_entries,
         t.resident_bytes,
         t.parsed_entries,
+        t.parsed_served,
         t.snapped,
         t.floor_entries,
         t.overrun_bytes,

@@ -299,6 +299,7 @@ fn the_rig_reads_the_tile_cache_line_the_app_actually_writes() {
         wanted_on_glass: 6_006,
         wanted_net: 7_007,
         parsed_entries: 93,
+        parsed_served: 2_002,
         parsed_bytes: 9_009,
         snapped: 1,
         blank_cells: 8_008,
@@ -312,8 +313,8 @@ fn the_rig_reads_the_tile_cache_line_the_app_actually_writes() {
     let body = rendered(
         &pattern[head.len()..],
         &[
-            1001, 12, 103, 0, 904, 15, 26, 37, 48, 59, 6_000_060, 71, 8_000_082, 93, 1, 5_005,
-            4_004, 6_006, 7_007, 8_008,
+            1001, 12, 103, 0, 904, 15, 26, 37, 48, 59, 6_000_060, 71, 8_000_082, 93, 2_002, 1,
+            5_005, 4_004, 6_006, 7_007, 8_008,
         ],
     );
     for role in ROLES {
