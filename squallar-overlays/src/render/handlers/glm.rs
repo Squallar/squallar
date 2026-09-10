@@ -1161,6 +1161,10 @@ impl OverlayHandler for GlmHandler {
         // down there while the app measured the span up here: two authorities
         // on one loop, which is the shape three consecutive GLM bugs lived in.
         let depicted = self.residency_for(pane, &self.depicted_stops(pane, ctx));
+        // **Which pane this round is for**, so the store can key what this pane
+        // needs and trim by the union rather than by whichever pane polled
+        // last. See `GlmStore::demand`.
+        let pane_idx = pane.pane_idx;
         vec![FetchTask {
             kind: known::LIGHTNING,
             future: Box::pin(async move {
@@ -1176,6 +1180,7 @@ impl OverlayHandler for GlmHandler {
                     &levels,
                     as_of,
                     depicted,
+                    pane_idx,
                 )
                 .await;
                 Box::new(GlmFetchResult(result)) as FetchPayload

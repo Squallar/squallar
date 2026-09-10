@@ -734,7 +734,7 @@ fn the_install_door_keeps_the_empty_granules_too() {
     // Through the sink, which is the install door now that a granule reaches
     // the cache the instant it parses rather than in one end-of-poll batch.
     {
-        let mut sink = GranuleSink::new(&mut cache, now, None);
+        let mut sink = GranuleSink::new(&mut cache, now, None, &[]);
         sink.install(busy.to_string(), vec![flash_at(t0())]);
         sink.install(quiet.to_string(), Vec::new());
     }
@@ -1302,6 +1302,8 @@ fn poll_spanned(
         .enable_all()
         .build()
         .expect("test runtime");
+    let depicted = span_residency(as_of, depicted_span_secs, GLM_MIN_TIME_WINDOW_SECS);
+    let demand = sole_demand(&depicted);
     runtime.block_on(fetch_glm_flashes(
         &client,
         sources,
@@ -1309,7 +1311,8 @@ fn poll_spanned(
         &[GlmDataLevel::Flash],
         cache,
         as_of,
-        span_residency(as_of, depicted_span_secs, GLM_MIN_TIME_WINDOW_SECS),
+        depicted,
+        &demand,
     ))
 }
 
@@ -1555,6 +1558,19 @@ fn seed_flash(cache: &mut GlmCache, key: &str, time: NaiveDateTime) {
 /// [`a_poll_landing_on_the_loops_oldest_frame_still_fills_the_whole_sweep`],
 /// which dispatches through `create_fetch_tasks` and counts the archive hours
 /// the real derivation reaches.
+/// **What one pane's poll declares it needs** — its own residency's ranges,
+/// which is exactly what `poll_glm_into_store` registers for that pane. A test
+/// exercising the union across panes builds this from more than one pane's.
+fn sole_demand(depicted: &Residency) -> Vec<Vec<(NaiveDateTime, NaiveDateTime)>> {
+    vec![
+        depicted
+            .ranges()
+            .iter()
+            .map(|range| (range.start, range.end))
+            .collect(),
+    ]
+}
+
 fn span_residency(as_of: NaiveDateTime, span_secs: Option<u64>, window_secs: f64) -> Residency {
     let span = TimeDelta::seconds(span_secs.unwrap_or(0) as i64);
     let window = TimeDelta::milliseconds((window_secs * 1000.0) as i64);
@@ -2681,6 +2697,8 @@ fn a_live_polls_listing_range_and_returned_set_are_unchanged() {
         .enable_all()
         .build()
         .expect("test runtime");
+    let depicted = span_residency(as_of, None, SWEEP_WINDOW_SECS);
+    let demand = sole_demand(&depicted);
     let outcome = runtime
         .block_on(fetch_glm_flashes(
             &client,
@@ -2689,7 +2707,8 @@ fn a_live_polls_listing_range_and_returned_set_are_unchanged() {
             &[GlmDataLevel::Flash],
             &mut cache,
             as_of,
-            span_residency(as_of, None, SWEEP_WINDOW_SECS),
+            depicted,
+            &demand,
         ))
         .expect("the listing answered");
 
@@ -2829,6 +2848,8 @@ fn lists_issued(as_of: NaiveDateTime, span_secs: Option<u64>, window_secs: f64) 
         .enable_all()
         .build()
         .expect("test runtime");
+    let depicted = span_residency(as_of, span_secs, window_secs);
+    let demand = sole_demand(&depicted);
     runtime
         .block_on(fetch_glm_flashes(
             &client,
@@ -2837,7 +2858,8 @@ fn lists_issued(as_of: NaiveDateTime, span_secs: Option<u64>, window_secs: f64) 
             &[GlmDataLevel::Flash],
             &mut cache,
             as_of,
-            span_residency(as_of, span_secs, window_secs),
+            depicted,
+            &demand,
         ))
         .expect("the listing answered");
     list_paths(&seen).len()
@@ -2884,6 +2906,8 @@ async fn live_glm_listing_reaches_the_hour_ahead_of_the_sample() {
     );
 
     let mut cache = GlmCache::default();
+    let depicted = span_residency(as_of, Some(LIVE_SPAN_SECS), GLM_MIN_TIME_WINDOW_SECS);
+    let demand = sole_demand(&depicted);
     let outcome = fetch_glm_flashes(
         &client,
         &sources,
@@ -2891,7 +2915,8 @@ async fn live_glm_listing_reaches_the_hour_ahead_of_the_sample() {
         &[GlmDataLevel::Flash],
         &mut cache,
         as_of,
-        span_residency(as_of, Some(LIVE_SPAN_SECS), GLM_MIN_TIME_WINDOW_SECS),
+        depicted,
+        &demand,
     )
     .await
     .expect("the live listing answered");
@@ -3100,7 +3125,7 @@ fn the_retention_level_agrees_with_a_walk_after_every_writer_of_the_map() {
 
     // `evict_oldest_over`, at a cap between two granules' worth.
     let before_cap = cache.retained_flashes();
-    cache.evict_oldest_over(before_cap - 1);
+    cache.evict_oldest_over(before_cap - 1, &[]);
     agree(&cache, "evict_oldest_over");
     assert!(
         cache.retained_flashes() < before_cap,
@@ -3440,7 +3465,7 @@ fn the_streamed_trim_keeps_what_one_end_of_poll_trim_would_have_kept() {
             total,
             "premise: the control must hold the whole fixture before it trims",
         );
-        cache.evict_oldest_over(CAP);
+        cache.evict_oldest_over(CAP, &[]);
         let mut keys = cached_keys(&cache);
         keys.sort();
         keys
@@ -3456,7 +3481,7 @@ fn the_streamed_trim_keeps_what_one_end_of_poll_trim_would_have_kept() {
     for order in permutations(&granules) {
         orders += 1;
         let mut cache = GlmCache::default();
-        let mut sink = GranuleSink::new(&mut cache, base, Some(CAP));
+        let mut sink = GranuleSink::new(&mut cache, base, Some(CAP), &[]);
         for g in order.iter().copied() {
             let (key, _, flashes) = seed(g);
             sink.install(key, flashes);
@@ -3594,6 +3619,7 @@ async fn a_round_queued_behind_another_downloads_nothing_it_already_holds() {
             &[GlmDataLevel::Flash],
             as_of,
             depicted.clone(),
+            0,
         ),
         poll_glm_into_store(
             &store,
@@ -3603,6 +3629,7 @@ async fn a_round_queued_behind_another_downloads_nothing_it_already_holds() {
             &[GlmDataLevel::Flash],
             as_of,
             depicted,
+            1,
         ),
     );
     first.expect("the first round must succeed");
@@ -3729,7 +3756,7 @@ fn evicting_a_granule_takes_its_slots_too() {
     assert_eq!(cache.retained_slots(), 20);
     assert_eq!(cache.retained_flashes(), 2);
 
-    cache.evict_oldest_over(1);
+    cache.evict_oldest_over(1, &[]);
 
     assert_eq!(cache.retained_flashes(), 1);
     assert_eq!(cache.retained_slots(), 10);
@@ -3790,4 +3817,330 @@ fn the_unknown_sentinel_round_trips_through_the_accessors() {
     // stay visible rather than read as "not reported".
     f.energy = 0.0;
     assert_eq!(f.energy_j(), Some(0.0));
+}
+
+// ── A pane parked in the past, beside a store of newer granules ───────────
+
+/// **Lightning on a pane parked in the past, for the whole time it is parked.**
+///
+/// The rig leg that found this parked six panes at 2026-04-27T06:00:00Z and
+/// took 84 zero-flash deliveries out of 85: the fetch honoured the pinned
+/// window — residency ranges of 1500/3000/3846 s inside it — and every poll
+/// then logged "every granule it fetched was older than the retention floor".
+///
+/// **The cause is not a floor that persists.** [`FloorCell`] is a
+/// [`GranuleSink`] field, `None` at construction and dropped by
+/// [`GranuleSink::finish`], and its one `publish` site is inside the `cap`
+/// guard — so a live pane (`cap == None`) cannot write it and no poll's floor
+/// outlives its own poll. What repeats is the *shape*: one
+/// [`MAX_RETAINED_FLASHES`] ceiling serves the whole process, eviction is
+/// oldest-first, and a pane parked in the past installs granules that are
+/// instantly the oldest rows in a store still holding newer ones.
+/// [`GlmCache::evict_before`] cannot clear those — it drops what is *older*
+/// than the cutoff, and they are newer. So the arrival is evicted on arrival,
+/// that eviction lifts this poll's own floor above the rest of a batch
+/// [`plan_downloads`] sorted newest-first, and the poll refuses everything it
+/// just paid to download. It happens again, from scratch, on every poll.
+///
+/// In one line: **eviction is oldest-first, but "oldest" is the exact opposite
+/// of "least wanted" the moment any pane is parked in the past.**
+///
+/// **Tamper — `starve_the_parked_pane`: pass `&[]` as the demand** at the
+/// `evict_oldest_over` call sites in [`GranuleSink::install`] and
+/// [`GranuleSink::finish`]. Empty demand marks every granule unwanted, which
+/// is precisely the oldest-first order this file shipped with, and the
+/// delivery assertion below goes back to reading 0.
+#[test]
+fn a_pane_parked_in_the_past_is_lit_beside_a_store_of_newer_granules() {
+    // Rows per seeded granule, and enough granules that the seed alone is over
+    // the ceiling — the parked pane's arrivals have to displace something.
+    const PER_GRANULE: usize = 80_000;
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 4, 27).unwrap();
+    let parked = day.and_hms_opt(6, 0, 0).unwrap();
+    // The span posture, which is what arms the ceiling: one range wider than
+    // `GLM_MAX_TIME_WINDOW_SECS`. `horizon` is `parked + 1800`.
+    let span_secs: u64 = 1800;
+
+    // **What a live phase leaves behind**, and the whole premise: granules six
+    // hours NEWER than anything the parked pane depicts. `evict_before` keeps
+    // every one of them — its test is `newest >= cutoff` and the cutoff is in
+    // the parked pane's past — and oldest-first eviction protects them for
+    // exactly the same reason it throws the parked pane's arrivals away.
+    let live_era = [
+        day.and_hms_opt(12, 0, 0).unwrap(),
+        day.and_hms_opt(12, 30, 0).unwrap(),
+        day.and_hms_opt(13, 0, 0).unwrap(),
+        day.and_hms_opt(13, 30, 0).unwrap(),
+    ];
+    let mut cache = GlmCache::default();
+    for start in live_era {
+        let flashes: Vec<GlmFlash> = (0..PER_GRANULE)
+            .map(|i| loop_flash_at(35.0, -97.0, start + TimeDelta::milliseconds(i as i64)))
+            .collect();
+        cache.insert(granule_key(start), start, flashes);
+    }
+
+    let seeded = cache.flash_count();
+    assert_eq!(
+        seeded,
+        PER_GRANULE * live_era.len(),
+        "premise: the seed is what the arithmetic below assumes",
+    );
+    assert!(
+        seeded > MAX_RETAINED_FLASHES,
+        "non-triviality floor: a seed at or under the ceiling never makes the \
+         trim run, and the parked pane's arrivals would fit beside it whatever \
+         the eviction order is. Seeded {seeded}, ceiling {MAX_RETAINED_FLASHES}",
+    );
+
+    // **The archive the parked pane is pointed at** — three granules inside its
+    // own window, served for real so the poll downloads and parses them.
+    let archived = [
+        parked - TimeDelta::seconds(40),
+        parked - TimeDelta::seconds(20),
+        parked,
+    ];
+    let granules: Vec<(String, Vec<u8>)> = archived
+        .iter()
+        .map(|&start| (granule_key(start), one_flash_granule(start, 35.0, -97.0)))
+        .collect();
+    let (sources, _seen) = s3_archive(granules);
+
+    let outcome = poll_spanned(&sources, &mut cache, parked, Some(span_secs))
+        .expect("both listings answered");
+
+    // ── The whole claim ──
+    // **Every granule, not merely one.** "Lit for the whole time it is parked"
+    // is a claim about the pane's whole window: a delivery holding some of its
+    // granules draws a loop with holes in it, which for a nowcasting signal
+    // reads as "no lightning then" rather than as "not retained". Asserting
+    // only non-emptiness would leave `shares` ungated — measured, on the
+    // `starve_the_parked_pane` tamper, at 2 of 3.
+    assert_eq!(
+        outcome.flashes.len(),
+        archived.len(),
+        "a pane parked at {parked} drew {} of the {} granules the archive \
+         served inside its own window. The missing ones were evicted on \
+         arrival or refused by the floor that eviction raised, because the \
+         store held {seeded} rows of newer granules no pane depicts and \
+         oldest-first eviction protects the newest",
+        outcome.flashes.len(),
+        archived.len(),
+    );
+
+    // ── And the ceiling it may not buy that with ──
+    let kept = cache.flash_count();
+    assert!(
+        kept <= MAX_RETAINED_FLASHES,
+        "the parked pane is lit but the ceiling is gone: {kept} rows retained \
+         against a ceiling of {MAX_RETAINED_FLASHES} ({} B at {FLASH_BYTES} B \
+         a row). Lightning that is correct and unbounded is not a fix",
+        kept * FLASH_BYTES,
+    );
+}
+
+/// **One live pane beside one parked pane, over one store that cannot hold
+/// both in full.** HEAVY6 is six panes; the interesting scene is the mix, and a
+/// union that is right for six parked panes can still be wrong here.
+///
+/// The live pane carries four granules of 80,000 rows — 320,000, over the
+/// 250,000 ceiling by itself — so the parked pane's three arrivals cannot be
+/// admitted without something of the live pane's going. That is the whole
+/// difficulty: with both sets *wanted*, a demand term that only says whether a
+/// granule is asked for leaves oldest-first as the tiebreak, and oldest-first
+/// hands the store to whichever pane sits furthest forward in time. The parked
+/// pane would be exactly as dark as it was before.
+///
+/// [`shares`] is what resolves it: the live pane's fourth-deepest granule goes
+/// before the parked pane's first, so the ceiling is met by trimming the tail
+/// of the pane holding the most rather than the whole of the pane holding the
+/// fewest. Both panes draw.
+///
+/// **Tamper — `starve_the_parked_pane`: return an empty map from [`shares`]**.
+/// Every granule then reads unwanted at equal depth, the sort falls back to
+/// `(newest, key)`, and the parked pane's assertion goes back to reading 0.
+#[test]
+fn a_parked_pane_draws_beside_a_live_pane_that_alone_fills_the_ceiling() {
+    const PER_GRANULE: usize = 80_000;
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 4, 27).unwrap();
+    let live_at = day.and_hms_opt(13, 35, 0).unwrap();
+    let parked_at = day.and_hms_opt(6, 0, 0).unwrap();
+
+    // **The live pane's own rows**, seeded rather than downloaded: what is
+    // under test is retention, and a fixture that served 320,000 rows over
+    // loopback would measure the parse.
+    let live_starts = [
+        day.and_hms_opt(13, 31, 0).unwrap(),
+        day.and_hms_opt(13, 32, 0).unwrap(),
+        day.and_hms_opt(13, 33, 0).unwrap(),
+        day.and_hms_opt(13, 34, 0).unwrap(),
+    ];
+    let store = GlmStore::default();
+    store.with_mut(|cache| {
+        for start in live_starts {
+            let flashes: Vec<GlmFlash> = (0..PER_GRANULE)
+                .map(|i| loop_flash_at(35.0, -97.0, start + TimeDelta::milliseconds(i as i64)))
+                .collect();
+            cache.insert(granule_key(start), start, flashes);
+        }
+    });
+    let seeded = store.with_mut(|cache| cache.flash_count());
+    assert!(
+        seeded > MAX_RETAINED_FLASHES,
+        "non-triviality floor: the live pane must overfill the ceiling on its \
+         own, or the parked pane's arrivals fit beside it whatever the order \
+         is. Seeded {seeded}, ceiling {MAX_RETAINED_FLASHES}",
+    );
+
+    // The parked pane's archive: three granules inside its own window.
+    let archived = [
+        parked_at - TimeDelta::seconds(40),
+        parked_at - TimeDelta::seconds(20),
+        parked_at,
+    ];
+    let (sources, _seen) = s3_archive(
+        archived
+            .iter()
+            .map(|&start| (granule_key(start), one_flash_granule(start, 35.0, -97.0)))
+            .collect(),
+    );
+    let client = loopback_client();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+
+    // Pane 0 is LIVE: one range, narrower than `GLM_MAX_TIME_WINDOW_SECS`, so
+    // its own poll runs with `cap == None` exactly as a live pane always has.
+    let live_window = Residency::over([(live_at - TimeDelta::seconds(300), live_at)]);
+    let live_first = runtime
+        .block_on(poll_glm_into_store(
+            &store,
+            &client,
+            &sources,
+            &[GlmSatellite::GoesEast],
+            &[GlmDataLevel::Flash],
+            live_at,
+            live_window.clone(),
+            0,
+        ))
+        .expect("the live listing answered");
+    assert!(
+        !live_first.flashes.is_empty(),
+        "premise: the live pane must be lit before the parked pane polls",
+    );
+
+    // Pane 1 is PARKED, under the span posture that arms the ceiling.
+    let parked = runtime
+        .block_on(poll_glm_into_store(
+            &store,
+            &client,
+            &sources,
+            &[GlmSatellite::GoesEast],
+            &[GlmDataLevel::Flash],
+            parked_at,
+            span_residency(parked_at, Some(1800), GLM_MIN_TIME_WINDOW_SECS),
+            1,
+        ))
+        .expect("the archive listing answered");
+    assert_eq!(
+        parked.flashes.len(),
+        archived.len(),
+        "the pane parked at {parked_at} drew {} of its {} archived granules \
+         beside a live pane. One ceiling serves both, the live pane's {seeded} \
+         rows sit newer than everything the parked pane depicts, and without a \
+         per-pane share the trim takes the whole of the pane holding the \
+         fewest rows before it takes the tail of the pane holding the most",
+        parked.flashes.len(),
+        archived.len(),
+    );
+
+    // And the live pane must not have paid for it with its own picture.
+    let live_again = runtime
+        .block_on(poll_glm_into_store(
+            &store,
+            &client,
+            &sources,
+            &[GlmSatellite::GoesEast],
+            &[GlmDataLevel::Flash],
+            live_at,
+            live_window,
+            0,
+        ))
+        .expect("the live listing answered");
+    assert!(
+        !live_again.flashes.is_empty(),
+        "the live pane went dark after a parked pane polled — the union traded \
+         one pane's picture for another's, which is the failure `PaneRef::peers` \
+         names by name",
+    );
+
+    // ── And neither of them bought it with the ceiling ──
+    let kept = store.with_mut(|cache| cache.flash_count());
+    assert!(
+        kept <= MAX_RETAINED_FLASHES,
+        "both panes are lit but retention is unbounded: {kept} rows against a \
+         ceiling of {MAX_RETAINED_FLASHES} ({} B at {FLASH_BYTES} B a row)",
+        kept * FLASH_BYTES,
+    );
+}
+
+/// **The ceiling is a ceiling, whatever the union says.** The reading behind
+/// "this landing reorders eviction and never re-sizes it".
+///
+/// Eight granules of 80,000 rows — 640,000, two and a half times the ceiling —
+/// and **every one of them wanted** by a declared pane. There is no eviction
+/// order that can satisfy this demand, which is the point: `evict_oldest_over`
+/// runs its loop on `total > cap` and not on wantedness, so demand chooses
+/// which granules survive and never how many.
+#[test]
+fn the_union_orders_eviction_and_cannot_widen_it() {
+    const PER_GRANULE: usize = 80_000;
+    const GRANULES: usize = 8;
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 4, 27).unwrap();
+    let base = day.and_hms_opt(6, 0, 0).unwrap();
+
+    let mut cache = GlmCache::default();
+    let starts: Vec<NaiveDateTime> = (0..GRANULES)
+        .map(|i| base + TimeDelta::minutes(i as i64))
+        .collect();
+    for &start in &starts {
+        let flashes: Vec<GlmFlash> = (0..PER_GRANULE)
+            .map(|i| loop_flash_at(35.0, -97.0, start + TimeDelta::milliseconds(i as i64)))
+            .collect();
+        cache.insert(granule_key(start), start, flashes);
+    }
+    let seeded = cache.flash_count();
+    assert_eq!(seeded, PER_GRANULE * GRANULES, "premise: the seed");
+
+    // Six panes, every one of them asking for the whole set — the widest
+    // demand this map can be handed.
+    let everything: Vec<Vec<(NaiveDateTime, NaiveDateTime)>> = (0..6)
+        .map(|_| vec![(base - TimeDelta::hours(1), base + TimeDelta::hours(1))])
+        .collect();
+    cache.evict_oldest_over(MAX_RETAINED_FLASHES, &everything);
+
+    let kept = cache.flash_count();
+    assert!(
+        kept <= MAX_RETAINED_FLASHES,
+        "the union widened retention: {kept} rows kept against a ceiling of \
+         {MAX_RETAINED_FLASHES} from a seed of {seeded}. Demand may reorder \
+         eviction and may never re-size it",
+    );
+    assert_eq!(
+        kept,
+        PER_GRANULE * 3,
+        "eviction is whole-granule and the cap is met exactly: three granules \
+         of {PER_GRANULE} fit under {MAX_RETAINED_FLASHES} and four do not",
+    );
+    assert_eq!(
+        cache.retained_bytes(),
+        kept * FLASH_BYTES,
+        "the level must agree with the survivors",
+    );
+    assert!(
+        cache.retained_bytes() <= MAX_RETAINED_FLASHES * FLASH_BYTES,
+        "the byte ceiling this cache is allowed to cost: {} B",
+        MAX_RETAINED_FLASHES * FLASH_BYTES,
+    );
 }

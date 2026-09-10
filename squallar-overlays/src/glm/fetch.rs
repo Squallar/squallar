@@ -153,6 +153,15 @@ pub const MAX_RETAINED_FLASHES: usize = 250_000;
 /// bounding at all.
 pub const GRANULE_FETCH_CONCURRENCY: usize = 20;
 
+/// **A retention mark, in [`GlmCache::evict_oldest_over`]'s own sort terms.**
+///
+/// The S3 key rides with the instant because the *key* is what breaks a tie in
+/// that method's sort and both satellites publish on the same 20 s grid: a mark
+/// comparing instants alone would refuse a tied granule the trim kept, and
+/// which of a tied pair survived would then depend on which one the wire
+/// answered first. `None` is a mark nothing has set yet.
+pub type Floor = Option<(NaiveDateTime, String)>;
+
 /// **What one [`GlmCache::evict_oldest_over`] call actually did**, split by
 /// whether the rows came back.
 #[derive(Default, Clone, PartialEq, Eq, Debug)]
@@ -172,7 +181,26 @@ pub struct Eviction {
     /// the same 20 s grid: a floor that compared instants only would refuse a
     /// tied granule the end-of-poll trim kept, and which of a tied pair
     /// survived would then depend on which one the wire answered first.
-    pub floor: Option<(NaiveDateTime, String)>,
+    pub floor: Floor,
+    /// **The floor a pure oldest-first trim would have stood at**, over the
+    /// same map and the same cap — computed and never enforced.
+    ///
+    /// It is the control for [`GranuleSink::admitted_below_age_floor`]: a
+    /// granule admitted at or below this mark is one the order this file
+    /// shipped with would have evicted on arrival and then refused. Carried in
+    /// the same `(newest, key)` terms as [`Self::floor`] so the two compare.
+    pub age_floor: Floor,
+    /// **The high-water this trim reached inside each pane's own ask**, indexed
+    /// by the pane's slot in the demand slice.
+    ///
+    /// A wanted granule is evicted for sitting too deep in some pane's tail, and
+    /// depth ranks newest-first, so a granule *older* than one this trim already
+    /// took from pane `i` is deeper still in pane `i`'s ask and cannot survive
+    /// either. That makes this a sound refusal mark — but only for a pane that
+    /// has one: a granule pane `i` has trimmed to may be the newest thing pane
+    /// `j` is parked on, which is why the test is over **every** pane that wants
+    /// the arrival rather than over the union.
+    pub pane_floors: Vec<Floor>,
 }
 
 impl Eviction {
@@ -183,7 +211,107 @@ impl Eviction {
         if other.floor > self.floor {
             self.floor = other.floor;
         }
+        if other.age_floor > self.age_floor {
+            self.age_floor = other.age_floor;
+        }
+        if self.pane_floors.len() < other.pane_floors.len() {
+            self.pane_floors.resize(other.pane_floors.len(), None);
+        }
+        for (held, incoming) in self.pane_floors.iter_mut().zip(other.pane_floors) {
+            if incoming > *held {
+                *held = incoming;
+            }
+        }
     }
+}
+
+/// **Whether any pane's residency still asks for a granule at this instant.**
+///
+/// The same edges [`shares`] ranks on, and the test [`FloorCell::refuses`]
+/// applies before it refuses anything: a granule some pane depicts is never
+/// turned away by the floor, because under a demand-ordered trim the floor no
+/// longer says anything about whether it would survive.
+fn demanded(demand: &[Vec<(NaiveDateTime, NaiveDateTime)>], newest: NaiveDateTime) -> bool {
+    demand
+        .iter()
+        .flatten()
+        .any(|&(from, to)| newest >= from && newest <= to + GRANULE_SPAN)
+}
+
+/// **How deep into some pane's own ask each retained granule sits.**
+///
+/// `None` — absent from the map — for a granule no pane's residency covers.
+/// Otherwise the granule's rank within the wanted set of the pane that ranks it
+/// best, counting newest-first from zero: a pane's newest granule is depth 0
+/// whether that pane asks for three granules or three hundred.
+///
+/// **This is what gives every pane a share of one ceiling.** Trimming the
+/// deepest tails first takes rows from the pane holding the most before it
+/// takes the only granule a pane parked in the past has — a live pane's
+/// ninetieth granule goes before a parked pane's third. Oldest-first alone
+/// cannot do that: under one shared ceiling it hands the whole store to
+/// whichever pane sits furthest forward in time, which is the defect this
+/// landing is about, and it survives a demand term that only says *whether* a
+/// granule is wanted.
+///
+/// Ranked on `newest` then the key — [`GlmCache::evict_oldest_over`]'s own
+/// order reversed — so a granule's depth never depends on map iteration order.
+///
+/// The union across panes, by taking the **minimum** depth: a granule two panes
+/// both draw is as safe as the pane that needs it most. `PaneRef::peers` states
+/// that rule for this whole workspace, and dropping what one pane selects to
+/// satisfy another is the failure it exists to prevent.
+fn shares<'a>(
+    rows: &'a [(NaiveDateTime, String, usize)],
+    demand: &[Vec<(NaiveDateTime, NaiveDateTime)>],
+) -> HashMap<&'a str, usize> {
+    let mut depth: HashMap<&'a str, usize> = HashMap::new();
+    for pane in demand {
+        let mut mine: Vec<&'a (NaiveDateTime, String, usize)> = rows
+            .iter()
+            .filter(|(newest, _, _)| {
+                // The upper edge is widened by [`GRANULE_SPAN`] because a
+                // granule whose newest flash lands just past a range's end
+                // still carries flashes inside it; the lower edge is not,
+                // because one whose newest flash falls before a range's start
+                // carries none at all.
+                pane.iter()
+                    .any(|&(from, to)| *newest >= from && *newest <= to + GRANULE_SPAN)
+            })
+            .collect();
+        mine.sort_by(|a, b| (b.0, &b.1).cmp(&(a.0, &a.1)));
+        for (rank, row) in mine.iter().enumerate() {
+            depth
+                .entry(row.1.as_str())
+                .and_modify(|held| *held = (*held).min(rank))
+                .or_insert(rank);
+        }
+    }
+    depth
+}
+
+/// **The floor a pure oldest-first trim would have stood at** over this map at
+/// this cap — the control [`Eviction::age_floor`] carries, computed without
+/// removing anything.
+///
+/// `rows` arrives sorted ascending on `(newest, key)`, which is the order this
+/// method shipped with; the walk drops row counts until the cap is met and
+/// reports the highest sort key it touched. A granule at or below that mark is
+/// one the shipped order would have evicted on arrival and then refused.
+fn age_floor_over(rows: &[(NaiveDateTime, String, usize)], cap: usize, total: usize) -> Floor {
+    let mut left = total;
+    let mut floor: Floor = None;
+    for (newest, key, count) in rows {
+        if left <= cap {
+            break;
+        }
+        left = left.saturating_sub(*count);
+        let refused = (*newest, key.clone());
+        if Some(&refused) > floor.as_ref() {
+            floor = Some(refused);
+        }
+    }
+    floor
 }
 
 impl GlmCache {
@@ -258,19 +386,53 @@ impl GlmCache {
     /// granule this cache is the last owner of returns bytes to the
     /// allocator, and [`Eviction::sole_rows`] is that half — measured with
     /// `Arc::strong_count` at the instant of removal rather than assumed.
-    pub fn evict_oldest_over(&mut self, cap: usize) -> Eviction {
+    pub fn evict_oldest_over(
+        &mut self,
+        cap: usize,
+        demand: &[Vec<(NaiveDateTime, NaiveDateTime)>],
+    ) -> Eviction {
         let mut evicted = Eviction::default();
         let mut total = self.flash_count();
         if total <= cap {
             return evicted;
         }
-        let mut by_age: Vec<(NaiveDateTime, String)> = self
+        // Ascending on `(newest, key)` — this method's shipped order, and the
+        // one [`age_floor_over`] needs to answer what that order would have
+        // refused.
+        let mut rows: Vec<(NaiveDateTime, String, usize)> = self
             .entries
             .iter()
-            .map(|(key, granule)| (granule.newest, key.clone()))
+            .map(|(key, granule)| (granule.newest, key.clone(), granule.flashes.len()))
             .collect();
-        by_age.sort();
-        for (_, key) in by_age {
+        rows.sort();
+        evicted.age_floor = age_floor_over(&rows, cap, total);
+
+        // **Least wanted first; then the deepest tail; then oldest.** `false`
+        // sorts before `true`, so every granule no pane still asks for goes
+        // before the first granule one does, and among the wanted the pane
+        // holding the most rows is trimmed before the pane holding the fewest.
+        //
+        // **An empty `demand` is the order this method shipped with**, exactly:
+        // no granule is wanted, every depth is equal, and `(newest, key)`
+        // ascending is left as the sole key. That is what every caller with no
+        // residency to declare passes, and it is why this landing reorders
+        // eviction without re-sizing it.
+        let depth = shares(&rows, demand);
+        evicted.pane_floors = vec![None; demand.len()];
+        let mut order: Vec<(bool, std::cmp::Reverse<usize>, NaiveDateTime, String)> = rows
+            .iter()
+            .map(|(newest, key, _)| {
+                let rank = depth.get(key.as_str()).copied();
+                (
+                    rank.is_some(),
+                    std::cmp::Reverse(rank.unwrap_or(0)),
+                    *newest,
+                    key.clone(),
+                )
+            })
+            .collect();
+        order.sort();
+        for (wanted_now, _, _, key) in order {
             if total <= cap {
                 break;
             }
@@ -283,6 +445,35 @@ impl GlmCache {
                 if std::sync::Arc::strong_count(&granule.flashes) == 1 {
                     evicted.sole_rows += rows;
                 }
+                // **Only an unwanted eviction raises the floor.** Under the
+                // shipped oldest-first order the newest granule a trim threw
+                // out was a sound low-water mark for what may still be
+                // admitted. Under a demand-ordered one it is not: the trim
+                // evicts the deepest tail, so the newest thing it dropped can
+                // be a live pane's granule from hours after everything the
+                // polling pane depicts — and a floor set there refuses every
+                // archived arrival, which is the defect this landing removes
+                // wearing a different hat. Measured: the parked pane's first
+                // granule was admitted and its other two were stopped early
+                // against a floor standing at a 12:00Z granule.
+                //
+                // With an empty demand every eviction is unwanted and this is
+                // the mark this method always published.
+                if wanted_now {
+                    // Which panes' tails this granule was taken from — the mark
+                    // an arrival deeper in those same tails is tested against.
+                    for (slot, pane) in demand.iter().enumerate() {
+                        if pane.iter().any(|&(from, to)| {
+                            granule.newest >= from && granule.newest <= to + GRANULE_SPAN
+                        }) {
+                            let reached = (granule.newest, key.clone());
+                            if Some(&reached) > evicted.pane_floors[slot].as_ref() {
+                                evicted.pane_floors[slot] = Some(reached);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let refused = (granule.newest, key);
                 if Some(&refused) > evicted.floor.as_ref() {
                     evicted.floor = Some(refused);
@@ -294,6 +485,7 @@ impl GlmCache {
 
     /// Granules held, for the fires-counter's before/after — a walk of the
     /// map's own length, not a maintained level.
+    // (helpers for the eviction order live at module scope, below)
     pub fn granule_count(&self) -> usize {
         self.entries.len()
     }
@@ -382,6 +574,23 @@ pub struct GlmStore {
     /// just turned off. A round whose generation moved under it discards its
     /// own cache instead ([`Self::replace_if_current`]).
     generation: std::sync::atomic::AtomicUsize,
+    /// **What each pane last told this store it needs**, keyed by
+    /// `PaneRef::pane_idx` and replaced on every poll of that pane.
+    ///
+    /// One store serves every pane, so the question "may this granule be
+    /// evicted" is a question about the **layer** and its answer is the union —
+    /// the rule `PaneRef::peers` states, and the one `derive::retain_volumes`
+    /// and `VolumeStore::retain_set` already follow. This layer's eviction was
+    /// the last one in the workspace still answering it oldest-first, which is
+    /// the opposite of least-wanted the moment a pane is parked in the past.
+    ///
+    /// **It orders eviction; it does not bound it.** A pane that stops polling
+    /// leaves its entry behind, and that costs nothing it could not already
+    /// cost: [`MAX_RETAINED_FLASHES`] is enforced over the whole map whatever
+    /// this says, so a stale entry can change *which* granules survive the cap
+    /// and never *how many*. The map is keyed by pane index, so it is bounded
+    /// by the pane count rather than by the poll count.
+    demand: std::sync::Mutex<HashMap<usize, Vec<(NaiveDateTime, NaiveDateTime)>>>,
 }
 
 impl Default for GlmStore {
@@ -391,11 +600,26 @@ impl Default for GlmStore {
             retained_bytes: std::sync::atomic::AtomicUsize::new(0),
             round: futures::lock::Mutex::new(()),
             generation: std::sync::atomic::AtomicUsize::new(0),
+            demand: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
 
 impl GlmStore {
+    /// **Record what this pane needs and answer with what every pane does.**
+    ///
+    /// Called once per poll, under the round gate, so the union a poll trims by
+    /// includes the ranges its predecessors in the same frame declared.
+    pub fn declare_demand(
+        &self,
+        pane_idx: usize,
+        ranges: Vec<(NaiveDateTime, NaiveDateTime)>,
+    ) -> Vec<Vec<(NaiveDateTime, NaiveDateTime)>> {
+        let mut guard = self.demand.lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(pane_idx, ranges);
+        guard.values().cloned().collect()
+    }
+
     /// **Bytes the cache is holding, without taking its lock** — the figure
     /// `GlmHandler::resident_source_bytes` answers with.
     ///
@@ -528,6 +752,7 @@ impl GlmStore {
 /// [`GlmCache::retained_bytes`] plus the granule map, not two of them. That is
 /// per **poll**, and with the gate it is also per app: the peak of a round is
 /// one poll's, where six concurrent polls held six.
+#[allow(clippy::too_many_arguments)]
 pub async fn poll_glm_into_store(
     store: &GlmStore,
     client: &reqwest::Client,
@@ -536,6 +761,7 @@ pub async fn poll_glm_into_store(
     levels: &[GlmDataLevel],
     as_of: NaiveDateTime,
     depicted: Residency,
+    pane_idx: usize,
 ) -> Result<GlmFetchOutcome, FetchError> {
     // **Counted before it is awaited**, because the answer is the question:
     // a `try_lock` that fails is a round that would have raced the one holding
@@ -557,6 +783,16 @@ pub async fn poll_glm_into_store(
             store.round.lock().await
         }
     };
+    // Inside the round gate, so the union carries what the polls ahead of this
+    // one in the same frame declared rather than a snapshot taken before them.
+    let demand = store.declare_demand(
+        pane_idx,
+        depicted
+            .ranges()
+            .iter()
+            .map(|range| (range.start, range.end))
+            .collect(),
+    );
     let (mut local_cache, generation) = store.snapshot_at();
     let result = fetch_glm_flashes(
         client,
@@ -566,6 +802,7 @@ pub async fn poll_glm_into_store(
         &mut local_cache,
         as_of,
         depicted,
+        &demand,
     )
     .await;
     if !store.replace_if_current(generation, local_cache) {
@@ -609,6 +846,9 @@ pub mod gauge {
     static TRIM_SOLE_ROWS: AtomicUsize = AtomicUsize::new(0);
     static REFUSED_GRANULES: AtomicUsize = AtomicUsize::new(0);
     static REFUSED_ROWS: AtomicUsize = AtomicUsize::new(0);
+    /// **This landing's fires-counter** — see
+    /// [`super::GranuleSink::admitted_below_age_floor`].
+    static ADMITTED_BELOW_AGE_FLOOR: AtomicUsize = AtomicUsize::new(0);
     static ROUNDS_QUEUED: AtomicUsize = AtomicUsize::new(0);
     static ROUNDS_DISCARDED_STALE: AtomicUsize = AtomicUsize::new(0);
     static KEYS_PLANNED: AtomicUsize = AtomicUsize::new(0);
@@ -741,8 +981,10 @@ pub mod gauge {
         trim: &super::Eviction,
         refused_granules: usize,
         refused_rows: usize,
+        admitted_below_age_floor: usize,
     ) {
         POLLS.fetch_add(1, Relaxed);
+        ADMITTED_BELOW_AGE_FLOOR.fetch_add(admitted_below_age_floor, Relaxed);
         PEAK_ROWS.fetch_max(peak_rows, Relaxed);
         UNSTREAMED_PEAK_ROWS.fetch_max(unstreamed_peak_rows, Relaxed);
         TRIM_GRANULES.fetch_add(trim.granules, Relaxed);
@@ -757,7 +999,7 @@ pub mod gauge {
     /// rounds_discarded_stale, keys_planned, keys_already_held,
     /// empty_deliveries, empty_delivery_rows, stopped_granules,
     /// stopped_bytes, fetched_granules, fetched_bytes, planned_bytes,
-    /// bound_exceeded)`.
+    /// bound_exceeded, admitted_below_age_floor)`.
     ///
     /// Appended to rather than reshaped: the readers index it positionally, and
     /// a row's position is what a published figure was read at.
@@ -783,6 +1025,7 @@ pub mod gauge {
         u64,
         u64,
         usize,
+        usize,
     ) {
         (
             POLLS.load(Relaxed),
@@ -805,6 +1048,7 @@ pub mod gauge {
             FETCHED_BYTES.load(Relaxed),
             PLANNED_BYTES.load(Relaxed),
             BOUND_EXCEEDED.load(Relaxed),
+            ADMITTED_BELOW_AGE_FLOOR.load(Relaxed),
         )
     }
 
@@ -863,11 +1107,29 @@ pub mod gauge {
 /// is spawned and must stay `Send`; the lock is taken once per granule, on the
 /// fetch task, between network awaits.
 #[derive(Clone, Default)]
-struct FloorCell(std::sync::Arc<std::sync::Mutex<Option<(NaiveDateTime, String)>>>);
+struct FloorCell {
+    floor: std::sync::Arc<std::sync::Mutex<Floor>>,
+    /// See [`Eviction::pane_floors`] — one mark per demand slot, `None` until
+    /// this poll's trim has taken anything from that pane's ask.
+    pane_floors: std::sync::Arc<std::sync::Mutex<Vec<Floor>>>,
+    /// **What every pane still asks for**, so the test below can decline to
+    /// refuse a granule some pane depicts. Shared rather than copied: the
+    /// in-flight downloads all read one set of ranges.
+    demand: std::sync::Arc<Vec<Vec<(NaiveDateTime, NaiveDateTime)>>>,
+}
 
 impl FloorCell {
-    fn publish(&self, floor: Option<(NaiveDateTime, String)>) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = floor;
+    fn new(demand: &[Vec<(NaiveDateTime, NaiveDateTime)>]) -> Self {
+        FloorCell {
+            floor: Default::default(),
+            pane_floors: Default::default(),
+            demand: std::sync::Arc::new(demand.to_vec()),
+        }
+    }
+
+    fn publish(&self, evicted: &Eviction) {
+        *self.floor.lock().unwrap_or_else(|e| e.into_inner()) = evicted.floor.clone();
+        *self.pane_floors.lock().unwrap_or_else(|e| e.into_inner()) = evicted.pane_floors.clone();
     }
 
     /// **The floor test, spelled once and applied to two arguments.**
@@ -882,7 +1144,40 @@ impl FloorCell {
     /// the bound is too generous for is downloaded and then refused by this
     /// same test, exactly as it was before.
     fn refuses(&self, newest: NaiveDateTime, key: &str) -> bool {
-        self.0
+        // **A granule some pane depicts is never refused here.** The floor is
+        // the high-water of what the trim evicted *for being unwanted*; a
+        // wanted arrival is admitted and the trim's own order decides whether
+        // it survives. Refusing one on this mark is how the early stop
+        // cancelled the downloads a parked pane had already been granted.
+        if demanded(&self.demand, newest) {
+            // **A wanted arrival is refused only where every pane that wants it
+            // has already been trimmed past it.** Depth ranks newest-first, so a
+            // granule older than one this trim took from pane `i` is deeper in
+            // pane `i`'s ask and cannot survive either — but a pane with no mark
+            // yet, or a shallower one, may be parked exactly here. Testing the
+            // union instead of every pane is what cancelled a parked pane's
+            // downloads; skipping the test entirely is what switched the early
+            // stop off on a wide span (`trimmed 83, stopped 0`).
+            let marks = self.pane_floors.lock().unwrap_or_else(|e| e.into_inner());
+            let mut wanted_by_any = false;
+            for (slot, pane) in self.demand.iter().enumerate() {
+                if !pane
+                    .iter()
+                    .any(|&(from, to)| newest >= from && newest <= to + GRANULE_SPAN)
+                {
+                    continue;
+                }
+                wanted_by_any = true;
+                let cleared = marks.get(slot).and_then(|mark| mark.as_ref()).is_some_and(
+                    |(mark_newest, mark_key)| (newest, key) <= (*mark_newest, mark_key.as_str()),
+                );
+                if !cleared {
+                    return false;
+                }
+            }
+            return wanted_by_any;
+        }
+        self.floor
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
@@ -936,6 +1231,17 @@ struct GranuleSink<'a> {
     refused_rows: usize,
     /// The live floor every in-flight download reads — see [`FloorCell`].
     floor: FloorCell,
+    /// **What every pane still asks for**, the union this poll's trim orders
+    /// its eviction by — see [`demanded`]. Never a bound on how much is kept:
+    /// the cap is, and it is unchanged.
+    demand: &'a [Vec<(NaiveDateTime, NaiveDateTime)>],
+    /// **The fires-counter for this landing**: granules admitted at or below
+    /// the floor a pure oldest-first trim would have stood at
+    /// ([`Eviction::age_floor`]) — that is, archived granules the shipped order
+    /// would have refused and this one keeps. Zero on a live pane, and zero on
+    /// any pane whose store never overflows, which is the point: a cut whose
+    /// counter cannot report its own absence is the cut that ships a nothing.
+    admitted_below_age_floor: usize,
     /// **The early stop's fires-counter**: granules whose GET was never issued
     /// because the floor had already risen above the newest flash their key can
     /// carry, and the object bytes that GET would have put on the wire and into
@@ -955,7 +1261,12 @@ struct GranuleSink<'a> {
 }
 
 impl<'a> GranuleSink<'a> {
-    fn new(cache: &'a mut GlmCache, as_of: NaiveDateTime, cap: Option<usize>) -> Self {
+    fn new(
+        cache: &'a mut GlmCache,
+        as_of: NaiveDateTime,
+        cap: Option<usize>,
+        demand: &'a [Vec<(NaiveDateTime, NaiveDateTime)>],
+    ) -> Self {
         let carried_rows = cache.retained_flashes();
         GranuleSink {
             cache,
@@ -968,7 +1279,9 @@ impl<'a> GranuleSink<'a> {
             evicted: Eviction::default(),
             refused_granules: 0,
             refused_rows: 0,
-            floor: FloorCell::default(),
+            floor: FloorCell::new(demand),
+            demand,
+            admitted_below_age_floor: 0,
             stopped_granules: 0,
             stopped_bytes: 0,
             fetched_granules: 0,
@@ -1020,15 +1333,26 @@ impl<'a> GranuleSink<'a> {
             self.refused_rows += flashes.len();
             return;
         }
+        // **Counted before the insert, against the mark as it stands** — the
+        // same instant the real floor test above was applied at, so the two
+        // answer the same question about the same granule.
+        if self
+            .evicted
+            .age_floor
+            .as_ref()
+            .is_some_and(|(age_newest, age_key)| (newest, key.as_str()) <= (*age_newest, age_key))
+        {
+            self.admitted_below_age_floor += 1;
+        }
         self.installed_rows += flashes.len();
         self.installed_granules += 1;
         self.cache.insert(key, granule_start, flashes);
         self.peak_rows = self.peak_rows.max(self.cache.retained_flashes());
         if let Some(cap) = self.cap {
-            let evicted = self.cache.evict_oldest_over(cap);
+            let evicted = self.cache.evict_oldest_over(cap, self.demand);
             self.evicted.absorb(evicted);
             // The downloads still in flight read this, not a copy of it.
-            self.floor.publish(self.evicted.floor.clone());
+            self.floor.publish(&self.evicted);
         }
     }
 
@@ -1062,10 +1386,12 @@ impl<'a> GranuleSink<'a> {
             fetched_granules,
             fetched_bytes,
             bound_exceeded,
+            demand,
+            admitted_below_age_floor,
             ..
         } = self;
         if let Some(cap) = cap {
-            evicted.absorb(cache.evict_oldest_over(cap));
+            evicted.absorb(cache.evict_oldest_over(cap, demand));
         }
         PollLevels {
             installed_granules,
@@ -1080,6 +1406,7 @@ impl<'a> GranuleSink<'a> {
             fetched_granules,
             fetched_bytes,
             bound_exceeded,
+            admitted_below_age_floor,
         }
     }
 }
@@ -1118,6 +1445,8 @@ struct PollLevels {
     fetched_granules: usize,
     fetched_bytes: u64,
     bound_exceeded: usize,
+    /// See [`GranuleSink::admitted_below_age_floor`].
+    admitted_below_age_floor: usize,
 }
 
 /// The instant a granule is aged against, from the S3 key it was listed under;
@@ -1145,6 +1474,7 @@ fn granule_start_of(key: &str, as_of: NaiveDateTime) -> NaiveDateTime {
 /// `as_of` still travels beside it, and only for what a residency cannot say:
 /// it dates a granule whose key will not parse ([`granule_start_of`]) and it
 /// is the fallback bound for a residency asking for nothing.
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_glm_flashes(
     client: &reqwest::Client,
     sources: &DataSources,
@@ -1153,6 +1483,7 @@ pub async fn fetch_glm_flashes(
     cache: &mut GlmCache,
     as_of: NaiveDateTime,
     depicted: Residency,
+    demand: &[Vec<(NaiveDateTime, NaiveDateTime)>],
 ) -> Result<GlmFetchOutcome, FetchError> {
     // The zero-object warning below assumes every queried range is wide enough
     // to always cover an already-published granule.
@@ -1199,7 +1530,21 @@ pub async fn fetch_glm_flashes(
     // would retain 40 s of archive nothing depicts, on every window — and an
     // instant-anchored one would evict exactly the granules the pane's other
     // frames display.
-    let cutoff = depicted.extent().map_or(start, |(oldest, _)| oldest);
+    // **The oldest instant ANY pane still asks for, not this one's.** One
+    // store serves every pane, so a cutoff read off the polling pane alone
+    // evicts the granules a pane parked behind it is drawing — and that pane's
+    // own next poll evicts this one's in return. `demand` always carries this
+    // poll's own ranges among the union's, so this can only sit at or below
+    // the value the line it replaces computed: it never evicts more.
+    let cutoff = demand
+        .iter()
+        .flatten()
+        .map(|&(from, _)| from)
+        .min()
+        .unwrap_or_else(|| depicted.extent().map_or(start, |(oldest, _)| oldest));
+    // What this poll DELIVERS is still its own window — the union orders
+    // retention, it never widens the picture.
+    let delivered_from = depicted.extent().map_or(start, |(oldest, _)| oldest);
 
     cache.evict_before(cutoff);
 
@@ -1217,7 +1562,7 @@ pub async fn fetch_glm_flashes(
     // than a window, which is the span posture coalesced.
     let cap = (depicted.ranges().len() > 1 || depicted.total() > longest_single_window())
         .then_some(MAX_RETAINED_FLASHES);
-    let mut sink = GranuleSink::new(cache, as_of, cap);
+    let mut sink = GranuleSink::new(cache, as_of, cap, demand);
 
     let mut acc = PollAccumulator::default();
     let mut dead_feeds = Vec::new();
@@ -1306,6 +1651,7 @@ pub async fn fetch_glm_flashes(
         fetched_granules,
         fetched_bytes,
         bound_exceeded,
+        admitted_below_age_floor,
     } = sink.finish();
     gauge::record(
         peak_rows,
@@ -1313,6 +1659,7 @@ pub async fn fetch_glm_flashes(
         &evicted,
         refused_granules,
         refused_rows,
+        admitted_below_age_floor,
     );
     gauge::planned(tally.planned, tally.already_held, tally.planned_bytes);
     gauge::early_stop(
@@ -1336,7 +1683,9 @@ pub async fn fetch_glm_flashes(
          GET against {fetched_granules} fetched / {fetched_bytes} B, of {} B \
          planned, and {bound_exceeded} parsed granules ran past their key's \
          bound; the parse packed {} rows into {} granule vecs sized to them, \
-         shrinking {} spare slots ({} B) off dropped records",
+         shrinking {} spare slots ({} B) off dropped records; the union kept \
+         {admitted_below_age_floor} granules an oldest-first trim would have \
+         refused",
         peak_rows * FLASH_BYTES,
         unstreamed_peak_rows * FLASH_BYTES,
         evicted.granules,
@@ -1357,7 +1706,7 @@ pub async fn fetch_glm_flashes(
     // span's `horizon`, not the sampled instant: the raster culls per depicted
     // frame, so returning the whole retained span is what lets every frame of
     // a loop draw its own window from one delivery.
-    let filtered = flashes_in_window(cache, satellites, cutoff, horizon);
+    let filtered = flashes_in_window(cache, satellites, delivered_from, horizon);
 
     // **A poll that downloaded rows and delivers none.** Not this landing's
     // cut and not a race: one ceiling serves every pane, so a pane whose
@@ -1975,7 +2324,7 @@ impl BatchOutcome {
             .unwrap()
             .and_hms_opt(0, 0, 0)
             .unwrap();
-        let mut sink = GranuleSink::new(&mut cache, epoch, None);
+        let mut sink = GranuleSink::new(&mut cache, epoch, None, &[]);
         let mut outcome = BatchOutcome::default();
         for result in results {
             outcome.absorb_one(result, &mut sink);

@@ -272,6 +272,7 @@ fn a_poll_does_not_hold_a_second_copy_of_the_granule_rows() {
             &[GlmDataLevel::Flash],
             as_of(),
             a_live_window(),
+            0,
         ))
     });
 
@@ -359,6 +360,7 @@ fn a_poll_that_fails_at_the_listing_leaves_the_cache_exactly_as_it_was() {
         &[GlmDataLevel::Flash],
         as_of(),
         a_live_window(),
+        0,
     ));
 
     assert!(result.is_err(), "premise: the poll must have failed");
@@ -833,6 +835,7 @@ fn peak_of_a_cold_poll(
             &COLD_LEVELS,
             as_of(),
             window,
+            0,
         ))
     });
     (
@@ -1436,6 +1439,7 @@ fn two_rounds_in_flight_at_once_both_reach_the_store() {
                 &COLD_LEVELS,
                 as_of(),
                 a_live_window(),
+                0,
             ),
             poll_glm_into_store(
                 &store,
@@ -1445,6 +1449,7 @@ fn two_rounds_in_flight_at_once_both_reach_the_store() {
                 &COLD_LEVELS,
                 as_of(),
                 a_live_window(),
+                1,
             ),
         )
     });
