@@ -344,7 +344,14 @@ pub(crate) struct LabelScratch {
     /// The value is the head of a chain in [`Self::anchors`], not a vector, so
     /// a name that draws once — which is nearly all of them — costs no
     /// allocation of its own.
-    names: HashMap<Arc<str>, u32>,
+    ///
+    /// **Hashed by [`walkers::NameHasher`], not by `RandomState`.** This table
+    /// is probed twice per name — once to ask whether the name has drawn
+    /// nearby, once more to file it when it does — and under SipHash those two
+    /// probes were 15.9 % of the whole solve's instructions, against a table
+    /// holding a few hundred names the pane is itself drawing. The argument
+    /// for hashing them cheaply is that hasher's own.
+    names: HashMap<Arc<str>, u32, walkers::NameHash>,
     /// The anchor chains themselves, `(anchor, next link)`, in one arena.
     ///
     /// One `Vec` for the whole solve rather than one per name, for the reason

@@ -3037,6 +3037,91 @@ one, and requires the two answer sequences to be equal, the cleared set to hold
 nothing, and every capacity to survive. Each of the six `clear` calls has been
 shown to redden it on its own, and so has replacing the body with `*self =
 Self::new()`.
+### Changed — source, thirty-seventh commit: the galley memos are probed by borrow, and not through SipHash
+
+`src/text.rs`, and one export in `src/lib.rs`. `GalleyCache::entries` becomes
+two levels — a style table of name tables — the way `points` already was; both
+tables and the app's own repeat-name index are hashed by a new `NameHasher`
+instead of `RandomState`; and `GalleyCache` gains `misses_by_reason()`. No
+layout, no key field, no ceiling and no atlas rule moves. `GalleyKey` is gone,
+replaced by `LabelStyle`, which is the same fields minus the text.
+
+**A pane's label solve was 45.9 % SipHash.** Measured under callgrind on the
+shipped path — `squallar-egui`'s `solve_labels`, 203 consecutive solves of a
+600-name pane at 1920x1080, release+LTO, the memo warm so every probe was a hit
+— the solve cost 247,165,098 instructions, of which:
+
+| probe | per solve | per probe | share |
+| --- | --- | --- | --- |
+| `entries`, keyed by `GalleyKey` | 364,497 | **651** | 29.9 % |
+| the repeat-name index, keyed by `&str` | 119,889 | 200 | 9.9 % |
+| the repeat-name index again, filing a placed name | 73,773 | 199 | 6.1 % |
+
+651 instructions to look one galley up, on a table that answered from memory.
+SipHash charges a full round per `write` call and a derived `Hash` spends one
+per field, so a five-field key cost roughly three times what its text alone
+did. The same solve's `Arc` traffic — the two atomic read-modify-writes the
+throwaway key's `text: Arc<str>` clone and drop made, 227,360 of them over the
+run — was **227,360 instructions, 0.09 %**. The refcount was never the cost;
+the hash it fed was.
+
+Two levels because a single-level map keyed by a struct holding the `Arc<str>`
+cannot be probed without building that struct, and building it clones the
+`Arc`. Split, the outer key is a style a whole pass has about four values of
+and the inner key is the name, which `Arc<str>: Borrow<str>` lets a probe
+borrow. The probe passes `&self.text` and not `&*self.text` on purpose: both
+hash identically, but `Arc` compares as an `Arc`, and std answers a pointer
+match without reading the bytes — the `&str` spelling sent 92,580 more calls
+into `memcmp` for the same answer.
+
+`NameHasher` is the argument `BucketHasher` already makes in this file, on keys
+that are place names rather than screen coordinates: what these tables can lose
+to a weak hash is comparisons inside a table `MAX_ENTRIES` already caps, and
+both are private memos of what the map is drawing. Bytes fold eight at a time
+through fixed-size reads — the obvious `word[..tail.len()].copy_from_slice(..)`
+has a runtime length and LLVM emits a `memcpy` call for it, which cost 4.29 M
+instructions before it was spelled away — and `finish` applies a murmur3
+finalizer because `hashbrown` reads the top seven bits and the low bits of the
+word for different things.
+
+Measured on the same fixture, same binary, same scene:
+
+| | base | after | |
+| --- | --- | --- | --- |
+| label solve, 203 solves | 247,165,098 | **156,882,472** | **−36.5 %** |
+| station-model galleys, 97,920 calls | 85,278,053 | **39,089,980** | **−54.2 %** |
+| `OccupiedAreas::try_occupy` (control) | 84,022,698 | 84,022,698 | — |
+| `__sincosf_fma` (control) | 2,159,920 | 2,159,920 | — |
+| `hypotf` (control) | 2,072,224 | 2,072,224 | — |
+| `drop_glue::<Shape>` (control) | 3,294,690 | 3,294,690 | — |
+| `__memcmp_avx2_movbe` (control) | 1,335,740 | 1,335,740 | — |
+| galleys laid out / memo hits | 456 / 113,784 | 456 / 113,784 | — |
+
+Every control row is identical to the instruction, and so are the memo's own
+layout and hit counts, so what left the solve left the probes and nothing else.
+
+**`misses_by_reason()` exists because the glass cannot report this.** A memo
+that never hits still paints correctly: a tampered key that made every probe a
+fresh style — the shape a copy-on-write clone or a re-minted style term takes
+— left every byte of the tessellated output identical while `layouts` went from
+456 to 114,240. The counters separate a probe that found no table for its style
+from one that found the style and not the text, which is the difference between
+a memo warming up and a key being minted fresh every pass.
+
+Gates, all three shown red by a tamper that compiles:
+`text::tests::a_borrowed_probe_and_a_stored_key_hash_alike` (the owned and
+borrowed spellings must hash alike, with distinct names hashing apart as the
+floor under it — a constant `finish` reddens the floor),
+`a_warm_pass_over_the_same_names_misses_nothing` and
+`a_miss_says_which_half_of_the_key_missed` (both reddened by the never-hits
+tamper above). The pre-existing `every_field_the_layout_reads_is_keyed`,
+`an_unchanged_second_pass_lays_out_nothing`, `the_ceiling_spans_both_tables`
+and `a_point_galleys_style_is_keyed_too` pass unedited.
+
+`NameHasher` and `NameHash` are exported because `squallar-egui`'s repeat-name
+index is the third of the three probes above and is keyed by the same names;
+one implementation, one set of gates.
+
 ### Turning `mvt` on, and why the lockfile does not move
 
 The fourth commit sets `walkers = { workspace = true, features = ["mvt"] }` in

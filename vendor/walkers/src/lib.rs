@@ -54,7 +54,10 @@ pub use style::Style;
 #[cfg(feature = "mvt")]
 pub use style::{Color, Filter, Float, Layer, Layout, Paint, Value, json};
 #[cfg(feature = "mvt")]
-pub use text::{AtlasStamp, BUCKET_POINTS, GalleyCache, OccupiedAreas, Text, intersect_tests};
+pub use text::{
+    AtlasStamp, BUCKET_POINTS, GalleyCache, NameHash, NameHasher, OccupiedAreas, Text,
+    intersect_tests,
+};
 pub use tiles::{RasterTile, Tile, TileId, TilePiece, Tiles, interpolate_from_lower_zoom};
 pub use zoom::InvalidZoom;
 

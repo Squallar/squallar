@@ -129,22 +129,51 @@ impl Text {
     ) -> std::sync::Arc<egui::Galley> {
         cache.settle(pixels_per_point);
 
-        let key = GalleyKey {
-            text: self.text.clone(),
+        let style = LabelStyle {
             font_size: self.font_size.to_bits(),
             text_color: self.text_color,
             max_width_ems: self.max_width_ems.map(f32::to_bits),
             line_height_ems: self.line_height_ems.map(f32::to_bits),
         };
 
-        if let Some(hit) = cache.entries.get(&key) {
-            cache.hits += 1;
-            return hit.clone();
+        // Read out before anything is counted, so the two miss reasons can be
+        // told apart: the borrow of `cache.entries` ends with this statement
+        // and what survives it is an owned answer.
+        //
+        // `&self.text` and not `&*self.text`. Both borrow, and both hash
+        // identically -- an `Arc<str>` hashes as the `str` it points at -- but
+        // the `Arc` spelling also *compares* as an `Arc`, and std answers a
+        // pointer match without reading the bytes. A pane probing the name its
+        // tile is still holding therefore settles on a pointer compare; the
+        // `&str` spelling sent 92,580 more calls into `memcmp` over the
+        // measured fixture for the identical answer.
+        let found = cache
+            .entries
+            .get(&style)
+            .map(|galleys| galleys.get(&self.text).cloned());
+
+        match found {
+            Some(Some(hit)) => {
+                cache.hits += 1;
+                return hit;
+            }
+            Some(None) => cache.text_misses += 1,
+            None => cache.style_misses += 1,
         }
 
         let galley = self.galley(ctx);
         cache.layouts += 1;
-        cache.entries.insert(key, galley.clone());
+        // The `Arc` is cloned here and only here: once per name the memo has
+        // not seen, never once per probe.
+        if cache
+            .entries
+            .entry(style)
+            .or_default()
+            .insert(self.text.clone(), galley.clone())
+            .is_none()
+        {
+            cache.entries_len += 1;
+        }
         galley
     }
 
@@ -540,6 +569,152 @@ impl OccupiedAreas {
     }
 }
 
+/// The hash both galley memos and the solve's repeat-name index are probed
+/// through: a multiply-xorshift fold, not SipHash.
+///
+/// **Not a taste preference, and measured on the shipped path.** A pane's
+/// label solve probes three tables per name — the galley memo, the
+/// repeat-name index, and the index again when the name draws — and with
+/// `RandomState` those three probes were **45.9 % of the whole solve's
+/// instructions** (203 solves x 600 names, release+LTO, callgrind, memo warm
+/// so every probe was a hit). The galley probe alone cost **651 instructions**
+/// of hashing per name, because SipHash charges a full round per `write` call
+/// and a struct key spends one per field.
+///
+/// The same argument [`BucketHasher`] makes, on keys that are place names
+/// rather than screen coordinates: what a table like this can lose to a poor
+/// hash is comparisons inside a table [`GalleyCache::MAX_ENTRIES`] already
+/// caps, and both tables are private memos of what the map is drawing, not a
+/// public index. A tile server that chose colliding names would slow its own
+/// labels down and reach nothing else.
+///
+/// Bytes are folded eight at a time and the length folded in after them, so
+/// two writes cannot be confused for one longer write. [`Hasher::finish`]
+/// applies a murmur3 finalizer because `hashbrown` reads the top seven bits
+/// for its control byte and the low bits for the bucket index, and a bare
+/// multiply leaves the top bits of a short key doing most of the work.
+#[derive(Default)]
+pub struct NameHasher(u64);
+
+impl NameHasher {
+    /// The 64-bit constant `rustc-hash` folds with.
+    const SEED: u64 = 0x517c_c1b7_2722_0a95;
+
+    #[inline]
+    fn fold(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(Self::SEED);
+    }
+}
+
+impl std::hash::Hasher for NameHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        // murmur3's finalizer: both halves of the word carry the whole key.
+        let mut hash = self.0;
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        hash ^= hash >> 33;
+        hash
+    }
+
+    /// **Every read here has a length the compiler knows.** The obvious
+    /// spelling of the tail — `word[..tail.len()].copy_from_slice(tail)` —
+    /// has a runtime length, and LLVM emits a call to `memcpy` for it: 4.29 M
+    /// instructions of `__memcpy_avx_unaligned_erms` over the measured fixture,
+    /// 2.7 % of the whole solve, to move at most seven bytes at a time.
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut rest = bytes;
+        while let Some((word, tail)) = rest.split_first_chunk::<8>() {
+            self.fold(u64::from_ne_bytes(*word));
+            rest = tail;
+        }
+        if !rest.is_empty() {
+            let mut word = 0u64;
+            if let Some((chunk, tail)) = rest.split_first_chunk::<4>() {
+                word = u64::from(u32::from_ne_bytes(*chunk));
+                rest = tail;
+            }
+            if let Some((chunk, tail)) = rest.split_first_chunk::<2>() {
+                word = (word << 16) | u64::from(u16::from_ne_bytes(*chunk));
+                rest = tail;
+            }
+            if let Some((byte, _)) = rest.split_first() {
+                word = (word << 8) | u64::from(*byte);
+            }
+            self.fold(word);
+        }
+        // Length after the bytes: `write("ab") + write("c")` must not be
+        // `write("abc")`, or two fields of a struct key could trade bytes.
+        self.fold(bytes.len() as u64);
+    }
+
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.fold(u64::from(value));
+    }
+
+    #[inline]
+    fn write_u16(&mut self, value: u16) {
+        self.fold(u64::from(value));
+    }
+
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.fold(u64::from(value));
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.fold(value);
+    }
+
+    #[inline]
+    fn write_u128(&mut self, value: u128) {
+        self.fold(value as u64);
+        self.fold((value >> 64) as u64);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.fold(value as u64);
+    }
+
+    #[inline]
+    fn write_i8(&mut self, value: i8) {
+        self.fold(value as u64);
+    }
+
+    #[inline]
+    fn write_i16(&mut self, value: i16) {
+        self.fold(value as u64);
+    }
+
+    #[inline]
+    fn write_i32(&mut self, value: i32) {
+        self.fold(value as u64);
+    }
+
+    #[inline]
+    fn write_i64(&mut self, value: i64) {
+        self.fold(value as u64);
+    }
+
+    #[inline]
+    fn write_isize(&mut self, value: isize) {
+        self.fold(value as u64);
+    }
+}
+
+/// [`NameHasher`] as a `HashMap` parameter.
+pub type NameHash = std::hash::BuildHasherDefault<NameHasher>;
+
+/// The inner table of one style: laid-out galleys by the text they were laid
+/// out from. `K` is what that style's caller can hand the table without
+/// allocating -- an `Arc<str>` a tile is holding, or a `Box<str>` copied once
+/// from a `&str` the caller owns.
+type Galleys<K> = std::collections::HashMap<K, std::sync::Arc<egui::Galley>, NameHash>;
+
 /// A memo of laid-out galleys for [`Text::galley_cached`].
 ///
 /// **Owned by the caller, never a thread-local or a process-wide pool**, so
@@ -582,7 +757,30 @@ pub struct GalleyCache {
     /// How many times the atlas has been seen to move under this table.
     /// See [`Self::generation`].
     generation: u64,
-    entries: std::collections::HashMap<GalleyKey, std::sync::Arc<egui::Galley>>,
+    /// The place-label table, keyed in two levels for the reason `points`
+    /// below is: **so a probe can borrow the name instead of cloning it.**
+    ///
+    /// A single-level map keyed by a struct holding the `Arc<str>` cannot be
+    /// probed without building that struct, and building it clones the `Arc`:
+    /// two atomic read-modify-writes per name per frame, given straight back
+    /// one statement later. Split, the name is the inner key and a probe
+    /// borrows it.
+    ///
+    /// **The refcount was the small half and the hash was the large one.**
+    /// Those two atomics were 227,360 instructions of a 247,165,098-instruction
+    /// solve — 0.09 % — while hashing the key they were part of was 29.9 %.
+    /// They are worth removing anyway because their *cost* is not their
+    /// instruction count: a clone-and-drop pair measures 4.09 ns on a line no
+    /// other core is touching and 22.78 ns while one is, and nothing in a
+    /// refcount tells a reader which it will be.
+    ///
+    /// The style is what a whole pass has about four distinct values of, so
+    /// the outer probe is a hash of sixteen bytes that hits the same slot for
+    /// hundreds of consecutive names.
+    entries: std::collections::HashMap<LabelStyle, Galleys<std::sync::Arc<str>>, NameHash>,
+    /// Entries across every inner map of `entries`, kept as a running count so
+    /// the ceiling check stays O(1).
+    entries_len: usize,
     /// The point-label table, keyed in two levels so a lookup can borrow.
     ///
     /// **Two levels because the hot path holds a `&str`, not a `String`.**
@@ -592,15 +790,16 @@ pub struct GalleyCache {
     /// allocation `Painter::text`'s `to_string()` was making. Splitting the
     /// style out leaves an inner map keyed by `Box<str>`, and `Box<str>:
     /// Borrow<str>`, so a hit costs a hash of the text and no allocation.
-    points: std::collections::HashMap<
-        PointStyle,
-        std::collections::HashMap<Box<str>, std::sync::Arc<egui::Galley>>,
-    >,
+    points: std::collections::HashMap<PointStyle, Galleys<Box<str>>, NameHash>,
     /// Entries across every inner map of `points`, kept as a running count so
     /// the ceiling check stays O(1).
     points_len: usize,
     layouts: u64,
     hits: u64,
+    /// Probes that found no table for their style at all.
+    style_misses: u64,
+    /// Probes that found their style's table and not their text in it.
+    text_misses: u64,
 }
 
 impl GalleyCache {
@@ -636,10 +835,17 @@ impl GalleyCache {
             family: font.family.clone(),
             color,
         };
-        if let Some(hit) = self.points.get(&style).and_then(|inner| inner.get(text)) {
-            let hit = hit.clone();
-            self.hits += 1;
-            return hit;
+        let found = self
+            .points
+            .get(&style)
+            .map(|inner| inner.get(text).cloned());
+        match found {
+            Some(Some(hit)) => {
+                self.hits += 1;
+                return hit;
+            }
+            Some(None) => self.text_misses += 1,
+            None => self.style_misses += 1,
         }
         let galley = ctx.fonts_mut(|f| f.layout(text.to_owned(), font, color, f32::INFINITY));
         self.layouts += 1;
@@ -667,7 +873,19 @@ impl GalleyCache {
 
     /// How many galleys are held.
     pub fn len(&self) -> usize {
-        self.entries.len() + self.points_len
+        self.entries_len + self.points_len
+    }
+
+    /// Why the probes that missed missed: how many found no table for their
+    /// style, and how many found the style and not the text.
+    ///
+    /// **The figure a two-level table has to be watched by.** A memo that
+    /// never hits still paints correctly, so nothing on the glass says whether
+    /// a key spelling reaches the entry it stored a frame ago; a style term
+    /// that is minted fresh each pass reads here as a style miss per name and
+    /// nowhere else.
+    pub fn misses_by_reason(&self) -> (u64, u64) {
+        (self.style_misses, self.text_misses)
     }
 
     /// Whether the table holds nothing.
@@ -758,6 +976,7 @@ impl GalleyCache {
 
     fn drop_all(&mut self) {
         self.entries.clear();
+        self.entries_len = 0;
         self.points.clear();
         self.points_len = 0;
     }
@@ -818,7 +1037,7 @@ impl AtlasStamp {
 /// [`GalleyCache::points`]. `FontId` is **not** `Eq` — it carries the size as a
 /// bare `f32` — so it is taken apart here and the size keyed by its bits, for
 /// the same reason and with the same "stricter is the safe direction" argument
-/// as [`GalleyKey`]: a spurious miss costs one layout, a spurious hit draws the
+/// as [`LabelStyle`]: a spurious miss costs one layout, a spurious hit draws the
 /// wrong text.
 #[derive(PartialEq, Eq, Hash, Clone)]
 struct PointStyle {
@@ -827,15 +1046,19 @@ struct PointStyle {
     color: Color32,
 }
 
-/// Every field [`Text::galley`] reads, in a form that is `Hash` and `Eq`.
+/// Every field [`Text::galley`] reads **except the text**, in a form that is
+/// `Hash` and `Eq`.
+///
+/// The style half of a place label's key, split out for the reason
+/// [`PointStyle`] is: the text is then the inner table's key and can be probed
+/// as a borrowed `&str`. See [`GalleyCache::entries`].
 ///
 /// The three `f32`s are keyed by their bits rather than by value because `f32`
 /// is not `Eq`. That is stricter than equality — `-0.0` and `0.0` are two keys
 /// — and stricter is the safe direction for a memo: a spurious miss costs one
 /// layout, a spurious hit draws the wrong text.
-#[derive(PartialEq, Eq, Hash)]
-struct GalleyKey {
-    text: std::sync::Arc<str>,
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+struct LabelStyle {
     font_size: u32,
     text_color: Color32,
     max_width_ems: Option<u32>,
@@ -979,6 +1202,175 @@ mod tests {
             let _ = label(name).galley_cached(&ctx, &mut dropped, ctx.pixels_per_point());
         }
         assert_eq!(dropped.layouts(), 2 * names.len() as u64);
+    }
+
+    /// **The borrowed probe and the stored key must hash to the same word.**
+    ///
+    /// A two-level table is probed with one spelling of the name and filled
+    /// with another. If those two hash differently the entry is unreachable
+    /// for ever: the memo pays the probe, lays the text out again, and stores
+    /// a second copy no probe will ever find — and nothing on the glass says
+    /// so, because a memo that never hits still paints correctly.
+    ///
+    /// The second half is the floor under the first: a hasher that answered a
+    /// constant would pass the agreement check and be useless.
+    #[test]
+    fn a_borrowed_probe_and_a_stored_key_hash_alike() {
+        use std::hash::{BuildHasher, Hash, Hasher};
+
+        fn hash_of(value: &impl Hash) -> u64 {
+            let mut hasher = super::NameHash::default().build_hasher();
+            value.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        for name in [
+            "",
+            "a",
+            "Norman",
+            "Washita River",
+            "North Canadian River",
+            "Ciudad Juárez",
+            "a name of exactly thirty-two ch",
+            "a name of exactly thirty-three c",
+        ] {
+            let owned: std::sync::Arc<str> = std::sync::Arc::from(name);
+            let boxed: Box<str> = Box::from(name);
+            let borrowed: &str = name;
+            assert_eq!(
+                hash_of(&owned),
+                hash_of(&borrowed),
+                "`Arc<str>` and `&str` must hash alike or an entry is unreachable: {name:?}"
+            );
+            assert_eq!(
+                hash_of(&boxed),
+                hash_of(&borrowed),
+                "`Box<str>` and `&str` must hash alike or an entry is unreachable: {name:?}"
+            );
+            // And they compare equal, which is the other half of a probe.
+            assert_eq!(&*owned, borrowed);
+            assert_eq!(&*boxed, borrowed);
+        }
+
+        // The floor: names that differ must hash apart. One collision here is
+        // allowed by any hash; a hasher that answered a constant would give
+        // every one of these.
+        let names = [
+            "Norman",
+            "Noble",
+            "Moore",
+            "Edmond",
+            "Yukon",
+            "Mustang",
+            "Bethany",
+            "Choctaw",
+            "Harrah",
+            "Purcell",
+            "Blanchard",
+            "Newcastle",
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for name in names {
+            assert!(
+                seen.insert(hash_of(&name)),
+                "{name} collided with an earlier name"
+            );
+        }
+        assert_eq!(seen.len(), names.len());
+    }
+
+    /// **A second pass over the same names misses nothing, of either kind.**
+    ///
+    /// The figure this cut has to be watched by: a key spelling that mints a
+    /// fresh style or a fresh text every pass reads here as a miss per name
+    /// and nowhere else. Both tables are asked, because they are keyed by two
+    /// different pairs of types.
+    #[test]
+    fn a_warm_pass_over_the_same_names_misses_nothing() {
+        let ctx = ctx_with_fonts();
+        let names = ["Norman", "Washita River", "Ciudad Juárez", "东京", ""];
+        let mut cache = GalleyCache::default();
+        let font = egui::FontId::proportional(11.0);
+
+        for name in names {
+            let _ = label(name).galley_cached(&ctx, &mut cache, ctx.pixels_per_point());
+            let _ = cache.galley_for_point(
+                &ctx,
+                name,
+                font.clone(),
+                Color32::WHITE,
+                ctx.pixels_per_point(),
+            );
+        }
+
+        let hits = cache.hits();
+        let layouts = cache.layouts();
+        let (style_misses, text_misses) = cache.misses_by_reason();
+
+        for name in names {
+            let _ = label(name).galley_cached(&ctx, &mut cache, ctx.pixels_per_point());
+            let _ = cache.galley_for_point(
+                &ctx,
+                name,
+                font.clone(),
+                Color32::WHITE,
+                ctx.pixels_per_point(),
+            );
+        }
+
+        assert_eq!(
+            cache.hits() - hits,
+            2 * names.len() as u64,
+            "every probe of the second pass was answered from the memo"
+        );
+        assert_eq!(
+            cache.layouts(),
+            layouts,
+            "the second pass laid nothing out again"
+        );
+        assert_eq!(
+            cache.misses_by_reason(),
+            (style_misses, text_misses),
+            "the second pass missed neither on the style nor on the text"
+        );
+    }
+
+    /// **A miss says which half missed.** The two are different defects: a
+    /// style nobody has drawn before is the memo working, and a style the
+    /// table already holds whose text is absent is too — but a style miss per
+    /// name, pass after pass, is a key being minted fresh, which is the way a
+    /// two-level memo dies silently.
+    #[test]
+    fn a_miss_says_which_half_of_the_key_missed() {
+        let ctx = ctx_with_fonts();
+        let mut cache = GalleyCache::default();
+
+        let _ = label("Norman").galley_cached(&ctx, &mut cache, ctx.pixels_per_point());
+        assert_eq!(
+            cache.misses_by_reason(),
+            (1, 0),
+            "the first name of a fresh table has no style table to be absent from"
+        );
+
+        // Same style, a name the table has not seen.
+        let _ = label("Moore").galley_cached(&ctx, &mut cache, ctx.pixels_per_point());
+        assert_eq!(
+            cache.misses_by_reason(),
+            (1, 1),
+            "a new name under a style already held is a text miss"
+        );
+
+        // A style the table has not seen, under a name it has.
+        let recoloured = Text {
+            text_color: Color32::RED,
+            ..label("Norman")
+        };
+        let _ = recoloured.galley_cached(&ctx, &mut cache, ctx.pixels_per_point());
+        assert_eq!(
+            cache.misses_by_reason(),
+            (2, 1),
+            "a new style is a style miss even for a name the table holds"
+        );
     }
 
     /// Everything the galley depends on invalidates it, one field at a time.
