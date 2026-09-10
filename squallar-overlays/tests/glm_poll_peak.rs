@@ -1296,3 +1296,102 @@ fn a_spanned_poll_holds_no_more_rows_than_it_is_allowed_to_keep() {
          clear ({unstreamed} B download against a {bar} B bar)",
     );
 }
+
+// ── The store's half of the race ────────────────────────────────────────────
+
+/// **Two rounds in flight at once both reach the store.**
+///
+/// The `satellite` control is per pane — `GOES-19`, `GOES-18`, `Both` — so two
+/// panes on one instant with two selections are two distinct asks, and
+/// `Gui::panes_owed_a_round` makes both due in the same frame. Their key sets
+/// are disjoint (the two satellites publish into two buckets) and their
+/// residency is identical, so neither round's retention has anything to say
+/// about the other's granules: whatever is missing at the end was **lost**, not
+/// evicted.
+///
+/// Red before `GlmStore::round`: both rounds snapshot the store before either
+/// writes back, so the one that finishes second publishes a cache built on an
+/// empty snapshot and one satellite's whole download — listed, downloaded,
+/// parsed and installed — is gone. Which satellite is whichever finished first,
+/// so the assertion names both and does not care about the order.
+///
+/// This is the shape behind the handed-over reading of one pane logging 77,034
+/// flashes held and then 357: the delivery is built from the poll's own copy of
+/// the cache, and a poll's copy is a snapshot of whatever the last write-back
+/// happened to leave.
+#[test]
+fn two_rounds_in_flight_at_once_both_reach_the_store() {
+    const RACING_GRANULES: usize = 4;
+    const ROWS: usize = 3;
+
+    let east: Vec<(String, Vec<u8>)> = archive_keys("G19", RACING_GRANULES)
+        .into_iter()
+        .map(|(key, start)| (key, a_granule(start, 33.0, ROWS, 0)))
+        .collect();
+    let west: Vec<(String, Vec<u8>)> = archive_keys("G18", RACING_GRANULES)
+        .into_iter()
+        .map(|(key, start)| (key, a_granule(start, 41.0, ROWS, 0)))
+        .collect();
+    let sources = s3_two_bucket_archive(east.clone(), west.clone(), None);
+    let store = GlmStore::default();
+    let client = loopback_client();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+
+    let (from_east, from_west) = runtime.block_on(async {
+        tokio::join!(
+            poll_glm_into_store(
+                &store,
+                &client,
+                &sources,
+                &[GlmSatellite::GoesEast],
+                &COLD_LEVELS,
+                as_of(),
+                a_live_window(),
+            ),
+            poll_glm_into_store(
+                &store,
+                &client,
+                &sources,
+                &[GlmSatellite::GoesWest],
+                &COLD_LEVELS,
+                as_of(),
+                a_live_window(),
+            ),
+        )
+    });
+    from_east.expect("the GOES-East round must succeed");
+    from_west.expect("the GOES-West round must succeed");
+
+    let missing: Vec<&String> = store.with_mut(|cache: &mut GlmCache| {
+        east.iter()
+            .chain(west.iter())
+            .map(|(key, _)| key)
+            .filter(|key| !cache.contains_key(key))
+            .collect()
+    });
+    assert!(
+        missing.is_empty(),
+        "{} of {} granules the two rounds downloaded are not in the store. \
+         Their residency is identical, so nothing here evicted them — a \
+         round's write-back discarded them: {missing:?}",
+        missing.len(),
+        2 * RACING_GRANULES,
+    );
+
+    // **The latency this must not cost, as a fixture.** The round that took the
+    // gate is not delayed by it, so the newest granule of the archive is in the
+    // store when the FIRST round returns — not when the last one does. Asserted
+    // through the level rather than a clock: the first round's own rows are
+    // resident, which is only true if it ran to completion without waiting.
+    let rows_per_granule = ROWS * COLD_LEVELS.len();
+    store.with_mut(|cache: &mut GlmCache| {
+        assert_eq!(
+            cache.flash_count(),
+            2 * RACING_GRANULES * rows_per_granule,
+            "both rounds' rows are held, at {rows_per_granule} rows a granule",
+        );
+    });
+}

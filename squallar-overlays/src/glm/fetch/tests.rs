@@ -879,7 +879,10 @@ fn level_failure(satellite: GlmSatellite, level: GlmDataLevel) -> LevelFailure {
 
 #[test]
 fn build_outcome_binds_each_bucket_to_its_own_field() {
-    let tally = PollTally { in_window: 12 };
+    let tally = PollTally {
+        in_window: 12,
+        ..PollTally::default()
+    };
     let acc = PollAccumulator {
         parse_errors: vec!["a.nc: GLM file has no 'flash_lat' variable".into()],
         transport_errors: vec!["b.nc: HTTP status error: 503".into()],
@@ -930,7 +933,10 @@ fn build_outcome_binds_each_bucket_to_its_own_field() {
 
 #[test]
 fn build_outcome_keeps_level_failures_out_of_the_file_counts() {
-    let tally = PollTally { in_window: 9 };
+    let tally = PollTally {
+        in_window: 9,
+        ..PollTally::default()
+    };
     let acc = PollAccumulator {
         level_failures: vec![level_failure(GlmSatellite::GoesEast, GlmDataLevel::Group)],
         ..Default::default()
@@ -952,7 +958,10 @@ fn build_outcome_keeps_level_failures_out_of_the_file_counts() {
 
 #[test]
 fn build_outcome_leaves_an_empty_bucket_unreported() {
-    let tally = PollTally { in_window: 14 };
+    let tally = PollTally {
+        in_window: 14,
+        ..PollTally::default()
+    };
     let acc = PollAccumulator {
         parse_errors: vec!["a.nc: boom".into()],
         ..Default::default()
@@ -3471,4 +3480,171 @@ fn permutations<T: Copy>(items: &[T]) -> Vec<Vec<T>> {
         }
     }
     out
+}
+
+// ── Two rounds of one store, in flight at once ──────────────────────────────
+//
+// `Gui::panes_owed_a_round` dispatches one round per **distinct ask on
+// screen**, in the same frame, and the six polls of a six-pane loop were
+// measured arriving in the same second on a HEAVY6 leg. Every one of them ran
+// `GlmStore::snapshot` → private cache → write-back, which is a
+// read-modify-write, so the last to finish published a cache that had never
+// seen the others.
+//
+// The two tests below take the two halves of the cost. This one is the
+// **network's** half — a granule downloaded by one round and then downloaded
+// again by the next, because `GlmCache::contains_key` is the download planner's
+// truth and the granule is not in the store to be found. The other, in
+// `tests/glm_poll_peak.rs`, is the **store's** half: a whole round's granules
+// absent from the cache that a poll paid for.
+
+/// The instant these two rounds depict. Fixed rather than `Utc::now()` so the
+/// keys the archive carries and the hours the poll lists are the same on every
+/// run.
+fn a_racing_instant() -> NaiveDateTime {
+    chrono::NaiveDate::from_ymd_opt(2026, 6, 15)
+        .unwrap()
+        .and_hms_opt(7, 30, 0)
+        .unwrap()
+}
+
+/// Three granules inside the depicted window, one flash each.
+fn a_racing_bucket() -> Vec<(String, Vec<u8>)> {
+    (1..=3)
+        .map(|i| {
+            let start = a_racing_instant() - TimeDelta::seconds(20 * i);
+            (
+                granule_key(start),
+                one_flash_granule(start, 35.0, -97.0 - i as f32),
+            )
+        })
+        .collect()
+}
+
+/// Object requests a recorded round made — every request that is not a listing.
+fn object_paths(seen: &RecordedRequests) -> Vec<String> {
+    request_paths(seen)
+        .into_iter()
+        .filter(|p| !p.contains("list-type=2"))
+        .collect()
+}
+
+/// **A granule is downloaded once per round of the archive, not once per pane
+/// that asked.**
+///
+/// Red before [`GlmStore::round`]: both rounds snapshot the store before either
+/// writes back, so both plans find an empty cache and both download all three
+/// granules — six GETs for three objects. The rows of whichever finished first
+/// were then discarded by the other's write-back, so the *next* round
+/// downloaded them for a third time.
+///
+/// The assertion is on the archive's own request log and is independent of which
+/// round finishes first: three objects exist and a round that already holds one
+/// asks for none of them.
+#[tokio::test]
+async fn a_round_queued_behind_another_downloads_nothing_it_already_holds() {
+    let bucket = a_racing_bucket();
+    let (sources, seen) = s3_archive(bucket.clone());
+    let store = GlmStore::default();
+    let client = loopback_client();
+    let as_of = a_racing_instant();
+    let depicted = span_residency(as_of, None, GLM_MIN_TIME_WINDOW_SECS);
+
+    let (first, second) = tokio::join!(
+        poll_glm_into_store(
+            &store,
+            &client,
+            &sources,
+            &[GlmSatellite::GoesEast],
+            &[GlmDataLevel::Flash],
+            as_of,
+            depicted.clone(),
+        ),
+        poll_glm_into_store(
+            &store,
+            &client,
+            &sources,
+            &[GlmSatellite::GoesEast],
+            &[GlmDataLevel::Flash],
+            as_of,
+            depicted,
+        ),
+    );
+    first.expect("the first round must succeed");
+    second.expect("the second round must succeed");
+
+    let objects = object_paths(&seen);
+    assert_eq!(
+        objects.len(),
+        bucket.len(),
+        "two rounds of the same instants downloaded {} objects for {} granules \
+         in the archive. A round that starts after another has written back \
+         plans against what that round installed and downloads nothing: {objects:?}",
+        objects.len(),
+        bucket.len(),
+    );
+
+    // Non-triviality: the round did reach the archive at all, and the store
+    // holds what it paid for. A gate that made both rounds fail early would
+    // satisfy the count above.
+    store.with_mut(|cache: &mut GlmCache| {
+        for (key, _) in &bucket {
+            assert!(
+                cache.contains_key(key),
+                "the store is missing {key}, which one of the two rounds \
+                 downloaded",
+            );
+        }
+    });
+}
+
+/// **A level change during a round is not undone by that round's write-back.**
+///
+/// The gate serialises polls against each other; it cannot serialise a poll
+/// against the frame thread, and `GlmHandler::clear_cache` runs on the control
+/// edit. A round in flight when the user turns a level off holds granules parsed
+/// under the old level set, and the unconditional write-back put them straight
+/// back — the same lost update in the other direction, and the rows it restored
+/// were the ones the user had just asked not to see.
+#[test]
+fn a_level_change_mid_round_is_not_undone_by_the_write_back() {
+    let store = GlmStore::default();
+    let (mut in_flight, generation) = store.snapshot_at();
+    cached_flash(
+        &mut in_flight,
+        "parsed/under/the/old/levels.nc",
+        GlmSatellite::GoesEast,
+    );
+
+    // The user's edit, which is where `clear_cache` lands.
+    store.clear();
+
+    assert!(
+        !store.replace_if_current(generation, in_flight),
+        "a round whose level generation moved must not publish its cache",
+    );
+    store.with_mut(|cache: &mut GlmCache| {
+        assert_eq!(
+            cache.flash_count(),
+            0,
+            "the clear survived: a round parsed under the old levels may not \
+             put its rows back",
+        );
+    });
+
+    // And the generation guard is not a blanket refusal: the *next* round,
+    // which snapshotted after the clear, publishes as it always did.
+    let (mut after, generation) = store.snapshot_at();
+    cached_flash(
+        &mut after,
+        "parsed/under/the/new/levels.nc",
+        GlmSatellite::GoesEast,
+    );
+    assert!(
+        store.replace_if_current(generation, after),
+        "a round that started after the clear must publish",
+    );
+    store.with_mut(|cache: &mut GlmCache| {
+        assert_eq!(cache.flash_count(), 1, "the new round's rows are held");
+    });
 }

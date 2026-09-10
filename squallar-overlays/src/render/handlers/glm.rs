@@ -754,8 +754,13 @@ impl GlmHandler {
     }
 
     /// Clear the file cache (needed when level selection changes).
+    ///
+    /// Through [`GlmStore::clear`] rather than a `replace`, so the level
+    /// generation moves with the clear: a round already in flight parsed its
+    /// granules under the old level set, and its write-back would otherwise
+    /// put the rows the user just turned off straight back on the map.
     fn clear_cache(&self) {
-        self.cache.replace(crate::glm::fetch::GlmCache::default());
+        self.cache.clear();
     }
     /// **Every instant this pane's clock can stop on**, ascending and never
     /// empty — what [`Self::residency_for`] is asked about.

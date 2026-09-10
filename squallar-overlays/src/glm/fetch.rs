@@ -327,6 +327,37 @@ pub struct GlmStore {
     /// every [`Self::with_mut`]. `Relaxed`, like every census level: a reader
     /// wants a recent figure, none wants a synchronised one.
     retained_bytes: std::sync::atomic::AtomicUsize,
+    /// **One round of this layer at a time**, and the whole of the fix for a
+    /// lost update — see [`poll_glm_into_store`].
+    ///
+    /// `Gui::panes_owed_a_round` splits on the depicted instant, so six loop
+    /// panes at six playheads dispatch six polls in one frame; every one of
+    /// them ran `snapshot` → private cache → [`Self::replace`], so the last to
+    /// finish published a cache built on a snapshot taken before the other
+    /// five wrote theirs and **five rounds' granules were discarded**. A
+    /// download the poll had already paid for, and one the next round pays for
+    /// again because [`GlmCache::contains_key`] is the download planner's
+    /// truth.
+    ///
+    /// The same shape and the same reason as `MrmsHandler::frame_gate` and
+    /// `GmgsiHandler`'s: an async mutex, FIFO-fair, held across the awaits a
+    /// `std::sync::MutexGuard` may not cross. Serialising costs the round
+    /// nothing it was not already paying — the bytes are the bottleneck either
+    /// way — and it buys the followers their predecessor's granules, which is
+    /// what turns six polls of one archive into one poll and five plans that
+    /// find their keys already held.
+    round: futures::lock::Mutex<()>,
+    /// **Which set of levels the cached granules were parsed under.** Bumped by
+    /// [`Self::clear`], which is what a level change calls.
+    ///
+    /// The gate above cannot serialise a *frame-thread* write against a poll:
+    /// `GlmHandler::clear_cache` runs on the control edit, not on the fetch
+    /// task, so a level change during an in-flight round would be undone by
+    /// that round's write-back — the same lost update in the other direction,
+    /// and worse, because what it restores was parsed under the levels the user
+    /// just turned off. A round whose generation moved under it discards its
+    /// own cache instead ([`Self::replace_if_current`]).
+    generation: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for GlmStore {
@@ -334,6 +365,8 @@ impl Default for GlmStore {
         GlmStore {
             cache: std::sync::Mutex::new(GlmCache::default()),
             retained_bytes: std::sync::atomic::AtomicUsize::new(0),
+            round: futures::lock::Mutex::new(()),
+            generation: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -387,10 +420,54 @@ impl GlmStore {
         self.cache.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// [`Self::snapshot`] and the level generation it was taken under, read
+    /// **under one hold of the lock** so the pair cannot describe two different
+    /// states of the store.
+    pub fn snapshot_at(&self) -> (GlmCache, usize) {
+        let guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let generation = self.generation.load(std::sync::atomic::Ordering::Acquire);
+        (guard.clone(), generation)
+    }
+
     /// Put a whole cache in place of the current one — the poll's write-back
     /// and the level-change clear, both of which replace rather than edit.
     pub fn replace(&self, cache: GlmCache) {
         self.with_mut(|held| *held = cache);
+    }
+
+    /// **Write a round back only if its levels are still the ones the layer is
+    /// showing**, and say whether it did.
+    ///
+    /// `false` is a level change that landed while the round was in flight: the
+    /// granules in `cache` were parsed under the old level set, so publishing
+    /// them would put rows the user just turned off back on the map, and would
+    /// undo the clear as well. Discarding the round is the only answer that
+    /// leaves the store describing one level set.
+    pub fn replace_if_current(&self, generation: usize, cache: GlmCache) -> bool {
+        let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if self.generation.load(std::sync::atomic::Ordering::Acquire) != generation {
+            return false;
+        }
+        *guard = cache;
+        self.retained_bytes
+            .store(guard.retained_bytes(), std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
+    /// **Drop every granule and declare a new level generation** — what a
+    /// change to the level selection calls, and the one write that is allowed
+    /// to happen off the fetch task.
+    ///
+    /// The bump is inside the lock and released with it, so a round that
+    /// snapshotted before this call cannot read the new generation and then
+    /// write the old cache back.
+    pub fn clear(&self) {
+        let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = GlmCache::default();
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.retained_bytes
+            .store(guard.retained_bytes(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -404,12 +481,28 @@ impl GlmStore {
 /// round that errors at the listing still installs whatever the local copy
 /// reached — the old cache is *not* a rollback and nothing here treats it as
 /// one. What the shape does guarantee is that a future **dropped** before it
-/// completes leaves the store untouched, because [`GlmStore::replace`] is the
-/// last thing it does. Both properties are the ones the inline spelling had.
+/// completes leaves the store untouched, because the write-back is the last
+/// thing it does. Both properties are the ones the inline spelling had.
+///
+/// **And one round at a time, which is what makes the copy safe at all.** The
+/// snapshot/write-back pair is a read-modify-write, so two of them in flight
+/// lose one of the two: six loop panes at six playheads dispatch six polls in
+/// one frame ([`GlmStore::round`] carries the measured shape), each snapshots
+/// the store, each downloads its own residency and the last to finish publishes
+/// a cache that never saw the other five. Every row of theirs was downloaded,
+/// parsed and then discarded, and the next round re-downloads it because
+/// [`GlmCache::contains_key`] is the download planner's truth.
+///
+/// The gate makes the followers cheap rather than merely correct: a poll that
+/// starts after its predecessor's write-back plans against the granules that
+/// predecessor installed, so an ask covering the same instants downloads
+/// **nothing**. Six polls of one archive become one poll and five plans.
 ///
 /// The rows are shared with the store for the length of the poll rather than
 /// copied (see `CachedGranule`), so the peak is one
-/// [`GlmCache::retained_bytes`] plus the granule map, not two of them.
+/// [`GlmCache::retained_bytes`] plus the granule map, not two of them. That is
+/// per **poll**, and with the gate it is also per app: the peak of a round is
+/// one poll's, where six concurrent polls held six.
 pub async fn poll_glm_into_store(
     store: &GlmStore,
     client: &reqwest::Client,
@@ -419,7 +512,27 @@ pub async fn poll_glm_into_store(
     as_of: NaiveDateTime,
     depicted: Residency,
 ) -> Result<GlmFetchOutcome, FetchError> {
-    let mut local_cache = store.snapshot();
+    // **Counted before it is awaited**, because the answer is the question:
+    // a `try_lock` that fails is a round that would have raced the one holding
+    // it, and after this landing there is nothing else that number can be read
+    // off. `futures::lock::Mutex` is FIFO-fair, so a queued round is served in
+    // arrival order rather than starved.
+    let held = store.round.try_lock();
+    let _round = match held {
+        Some(guard) => guard,
+        None => {
+            gauge::round_queued();
+            // Logged as well as counted: the gauge is process-global and a leg
+            // reads it off the log, so a mechanism that fires only in a
+            // counter nothing prints is a mechanism no leg can report.
+            log::info!(
+                "GLM: a round found another already in flight and queued behind \
+                 it rather than racing its write-back",
+            );
+            store.round.lock().await
+        }
+    };
+    let (mut local_cache, generation) = store.snapshot_at();
     let result = fetch_glm_flashes(
         client,
         sources,
@@ -430,7 +543,14 @@ pub async fn poll_glm_into_store(
         depicted,
     )
     .await;
-    store.replace(local_cache);
+    if !store.replace_if_current(generation, local_cache) {
+        gauge::round_discarded_stale();
+        log::info!(
+            "GLM: the level selection changed while a round was in flight; its \
+             granules were parsed under the old levels and are discarded rather \
+             than published over the clear",
+        );
+    }
     result
 }
 
@@ -464,6 +584,59 @@ pub mod gauge {
     static TRIM_SOLE_ROWS: AtomicUsize = AtomicUsize::new(0);
     static REFUSED_GRANULES: AtomicUsize = AtomicUsize::new(0);
     static REFUSED_ROWS: AtomicUsize = AtomicUsize::new(0);
+    static ROUNDS_QUEUED: AtomicUsize = AtomicUsize::new(0);
+    static ROUNDS_DISCARDED_STALE: AtomicUsize = AtomicUsize::new(0);
+    static KEYS_PLANNED: AtomicUsize = AtomicUsize::new(0);
+    static KEYS_ALREADY_HELD: AtomicUsize = AtomicUsize::new(0);
+    static EMPTY_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
+    static EMPTY_DELIVERY_ROWS: AtomicUsize = AtomicUsize::new(0);
+
+    /// **A round that found the gate held**, and therefore a round that used to
+    /// race the one holding it — the fires-counter for
+    /// [`super::GlmStore::round`]. A mechanism whose counter can only read zero
+    /// is a mechanism nobody can show ever ran; this one reads the number of
+    /// polls that would have lost or clobbered a write-back.
+    pub(super) fn round_queued() {
+        ROUNDS_QUEUED.fetch_add(1, Relaxed);
+    }
+
+    /// A round whose level generation moved under it, so its granules were
+    /// discarded rather than published over the clear.
+    pub(super) fn round_discarded_stale() {
+        ROUNDS_DISCARDED_STALE.fetch_add(1, Relaxed);
+    }
+
+    /// **What the download planner did with the store it found**, per poll and
+    /// summed: keys it planned a GET for, and keys it skipped because the cache
+    /// already held that granule.
+    ///
+    /// The second is the gate's saving in the units the network is billed in. A
+    /// follower of a coalesced round plans against its predecessor's granules,
+    /// so an ask over the same instants reads `planned == 0` and every one of
+    /// its keys lands here instead.
+    pub(super) fn planned(planned: usize, already_held: usize) {
+        KEYS_PLANNED.fetch_add(planned, Relaxed);
+        KEYS_ALREADY_HELD.fetch_add(already_held, Relaxed);
+    }
+
+    /// **A poll that downloaded granules and then delivered no flashes at
+    /// all** — the residual this landing does *not* cut, counted so the next
+    /// one has a figure to move.
+    ///
+    /// One ceiling of [`super::MAX_RETAINED_FLASHES`] serves every pane, and
+    /// eviction is oldest-first across the whole store. A pane whose playhead
+    /// sits behind its neighbours' therefore carries in granules **newer than
+    /// its own horizon**, which fill the ceiling by themselves, and the
+    /// retention floor then refuses every granule that poll just downloaded:
+    /// the poll delivers zero rows for a window that has lightning in it.
+    /// Measured on the handed-over HEAVY6 leg as `0 flashes held over 1500s of
+    /// residency in 5 range(s)` from a poll that had installed 18 granules.
+    /// That is a capacity fact about one shared ceiling, not a race, and the
+    /// gate above neither causes nor cures it.
+    pub(super) fn empty_delivery(rows_downloaded: usize) {
+        EMPTY_DELIVERIES.fetch_add(1, Relaxed);
+        EMPTY_DELIVERY_ROWS.fetch_add(rows_downloaded, Relaxed);
+    }
 
     /// One poll's figures, folded in. The two peaks are `fetch_max`, the trim
     /// counts are sums.
@@ -485,8 +658,29 @@ pub mod gauge {
     }
 
     /// `(polls, peak_rows, unstreamed_peak_rows, trim_granules, trim_rows,
-    /// trim_sole_rows, refused_granules, refused_rows)`.
-    pub fn read() -> (usize, usize, usize, usize, usize, usize, usize, usize) {
+    /// trim_sole_rows, refused_granules, refused_rows, rounds_queued,
+    /// rounds_discarded_stale, keys_planned, keys_already_held,
+    /// empty_deliveries, empty_delivery_rows)`.
+    ///
+    /// Appended to rather than reshaped: the readers index it positionally, and
+    /// a row's position is what a published figure was read at.
+    #[allow(clippy::type_complexity)]
+    pub fn read() -> (
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+    ) {
         (
             POLLS.load(Relaxed),
             PEAK_ROWS.load(Relaxed),
@@ -496,6 +690,12 @@ pub mod gauge {
             TRIM_SOLE_ROWS.load(Relaxed),
             REFUSED_GRANULES.load(Relaxed),
             REFUSED_ROWS.load(Relaxed),
+            ROUNDS_QUEUED.load(Relaxed),
+            ROUNDS_DISCARDED_STALE.load(Relaxed),
+            KEYS_PLANNED.load(Relaxed),
+            KEYS_ALREADY_HELD.load(Relaxed),
+            EMPTY_DELIVERIES.load(Relaxed),
+            EMPTY_DELIVERY_ROWS.load(Relaxed),
         )
     }
 }
@@ -618,6 +818,7 @@ impl<'a> GranuleSink<'a> {
             cache,
             cap,
             installed_granules,
+            installed_rows,
             peak_rows,
             mut evicted,
             refused_granules,
@@ -629,6 +830,7 @@ impl<'a> GranuleSink<'a> {
         }
         PollLevels {
             installed_granules,
+            downloaded_rows: installed_rows + refused_rows,
             peak_rows,
             unstreamed_peak_rows,
             evicted,
@@ -642,6 +844,11 @@ impl<'a> GranuleSink<'a> {
 /// for what each one's denominator is.
 struct PollLevels {
     installed_granules: usize,
+    /// Rows this poll took off the wire and parsed — installed plus refused.
+    /// The denominator for [`gauge::empty_delivery`]: a poll that delivers
+    /// nothing having downloaded this many is the starvation, and one that
+    /// downloaded nothing is simply a quiet sky.
+    downloaded_rows: usize,
     peak_rows: usize,
     /// What the poll would have peaked at with the trim only at the end: every
     /// row it carried in plus every row it installed, none of them freed until
@@ -828,6 +1035,7 @@ pub async fn fetch_glm_flashes(
     // granule it drops is a refcount and not a free.
     let PollLevels {
         installed_granules,
+        downloaded_rows,
         peak_rows,
         unstreamed_peak_rows,
         evicted,
@@ -841,18 +1049,22 @@ pub async fn fetch_glm_flashes(
         refused_granules,
         refused_rows,
     );
+    gauge::planned(tally.planned, tally.already_held);
     log::info!(
         "GLM poll: {installed_granules} granules installed, peak {peak_rows} rows \
          ({} B), unstreamed peak would be {unstreamed_peak_rows} rows ({} B); \
          in-poll trim dropped {} granules / {} rows, {} of them sole ({} B \
          freed); the floor refused {refused_granules} granules / \
-         {refused_rows} rows before they were cached",
+         {refused_rows} rows before they were cached; the plan asked for {} \
+         keys and skipped {} the store already held",
         peak_rows * FLASH_BYTES,
         unstreamed_peak_rows * FLASH_BYTES,
         evicted.granules,
         evicted.rows,
         evicted.sole_rows,
         evicted.sole_rows * FLASH_BYTES,
+        tally.planned,
+        tally.already_held,
     );
 
     // Still keyed on `satellites`, not `queried`: a satellite whose listing
@@ -861,6 +1073,21 @@ pub async fn fetch_glm_flashes(
     // frame, so returning the whole retained span is what lets every frame of
     // a loop draw its own window from one delivery.
     let filtered = flashes_in_window(cache, satellites, cutoff, horizon);
+
+    // **A poll that downloaded rows and delivers none.** Not this landing's
+    // cut and not a race: one ceiling serves every pane, so a pane whose
+    // playhead sits behind its neighbours' carries in granules newer than its
+    // own horizon, and the floor then refuses everything it just downloaded.
+    // Counted where the delivery is built, which is the only place both halves
+    // of the figure exist at once.
+    if filtered.is_empty() && downloaded_rows > 0 {
+        gauge::empty_delivery(downloaded_rows);
+        log::info!(
+            "GLM: this poll downloaded {downloaded_rows} rows and delivered \
+             none — every granule it fetched was older than the retention \
+             floor the panes ahead of it had already raised",
+        );
+    }
 
     // **The figure names its denominator**: this is the retained set over the
     // whole residency, not over one frame's window. The rasterizer culls each
@@ -983,6 +1210,12 @@ impl PollAccumulator {
 #[derive(Default)]
 struct PollTally {
     in_window: usize,
+    /// Keys this poll planned a GET for, and keys it skipped because the cache
+    /// already held that granule — [`gauge::planned`]'s two halves. Both are
+    /// counted over keys the residency covers, so they share one denominator
+    /// and `planned + already_held` is the covered set.
+    planned: usize,
+    already_held: usize,
 }
 
 /// The tally counts every listed key, not the returned ones: a download-count
@@ -994,11 +1227,16 @@ fn plan_downloads<'a>(
     tally: &mut PollTally,
 ) -> Vec<&'a str> {
     tally.in_window += keys.len();
-    keys.iter()
+    let planned: Vec<&'a str> = keys
+        .iter()
         .filter(|k| covers(listed, k.as_str()))
         .filter(|k| !cache.contains_key(k.as_str()))
         .map(|k| k.as_str())
-        .collect()
+        .collect();
+    let covered = keys.iter().filter(|k| covers(listed, k.as_str())).count();
+    tally.planned += planned.len();
+    tally.already_held += covered - planned.len();
+    planned
 }
 
 /// How much of a granule's content can start before the key's own timestamp
