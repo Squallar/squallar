@@ -3792,9 +3792,6 @@ fn render_per_frame_overlay(
     let hover_pos = ui.ctx().pointer_hover_pos().filter(|&p| !blocked(p));
     let click_pos = pf.overlay_click_pos.filter(|&p| !blocked(p));
 
-    let mut selected = Vec::new();
-    let mut closest_hover: Option<(f32, u32)> = None; // (distance², id)
-
     // **When the picture carries the geometry, the text is one kept mesh.**
     // A station model at the middle zoom tier is two one-to-three glyph
     // numbers per station; on a one-pane scene that is on the order of a
@@ -3803,84 +3800,127 @@ fn render_per_frame_overlay(
     // a pure function of the layer's data, the zoom, the theme and where the
     // projector puts each station — everything `PointTextKey` names — so it
     // is tessellated once per key into a single mesh and re-added while the
-    // key holds. Hit-testing below still walks every point every frame; only
-    // the drawing is kept. A layer without a picture draws as it always did.
+    // key holds — and, since the same key is the same projector, so are the
+    // positions the cull kept, which is what the pass below hit-tests against
+    // instead of walking the list again. A layer without a picture draws as it
+    // always did.
     let key = text_only.then(|| {
         crate::point_painter::PointTextKey::new(
-            ui.ctx(),
             galleys,
             projector,
             expanded,
             handler.data_generation(),
             zoom_f32,
             is_dark,
+            pixels_per_point,
         )
     });
-    let kept = key.and_then(|key| point_text.lookup(pf.pane_idx, pf.id, key));
-    let collecting = text_only && kept.is_none();
-    let mut sink: Vec<egui::Shape> = Vec::new();
 
-    // The turn this pane is looking at, once for the whole table. Every point
-    // below is carried into it **before** the geo cull and the projection, and
-    // not between them: `geo_bounds` is the viewport's own unfolded frame, so a
-    // station written -175 tested against a viewport reading 175..190 is
-    // rejected by the cull long before anything could place it.
-    let turn = crate::overlay_cache::pane_turn_lon(projector);
+    let mut selected = Vec::new();
+    let mut closest_hover: Option<(f32, u32)> = None; // (distance², id)
 
-    for pt in points {
-        let lon = squallar_geo::fold_lon_near(pt.lon, turn);
-
-        // Fast geo-bounds rejection before the costly projection.
-        if !geo_bounds.contains_point(pt.lat, lon) {
-            continue;
-        }
-
-        let screen = projector.project(walkers::lat_lon(pt.lat, lon)).to_pos2();
-
-        if !expanded.contains(screen) {
-            continue;
-        }
-
-        if !text_only || collecting {
-            let mut ep = EguiPointPainter {
-                painter,
-                center: screen,
-                galleys,
-                text_only,
-                sink: collecting.then_some(&mut sink),
-                pixels_per_point,
+    // **A held key is a held cull and a held projection, not just a held
+    // mesh.** The key carries the projector and the culling window, so a pass
+    // that finds its build still current would walk the whole point list to
+    // reach the same survivors at the same screen positions the build already
+    // wrote down. Hit-testing runs off those instead, and the list — every
+    // point, folded, geo-tested and projected — is not walked at all.
+    let kept_mesh = key.and_then(|key| {
+        let kept = point_text.kept(pf.pane_idx, pf.id, key)?;
+        for &(index, screen) in &kept.points {
+            let Some(pt) = points.get(index as usize) else {
+                continue;
             };
-            handler.draw_point(pt.id, &mut ep, &draw_ctx);
+            hit_test_point(
+                pt,
+                screen,
+                hit_radius,
+                click_pos,
+                hover_pos,
+                &mut selected,
+                &mut closest_hover,
+            );
         }
+        Some(kept.mesh.clone())
+    });
 
-        // Click detection — layer blocking already applied by pre-filter in ui_map.rs.
-        if let Some(click_pos) = click_pos {
-            let dx = click_pos.x - screen.x;
-            let dy = click_pos.y - screen.y;
-            if dx * dx + dy * dy <= hit_radius * hit_radius {
-                selected.push(pt.selection.clone());
-            }
-        }
+    let collecting = text_only && kept_mesh.is_none();
+    // The list the last build filled, emptied and kept; see
+    // `PointTextMeshes::take_scratch`.
+    let mut sink: Vec<egui::Shape> = point_text.take_scratch();
+    // Where this pass put every point that survived the cull, for the passes
+    // that find this build still current. Filled only on a build.
+    let mut placed: Vec<(u32, egui::Pos2)> = Vec::new();
+    if kept_mesh.is_none() {
+        // The turn this pane is looking at, once for the whole table. Every
+        // point below is carried into it **before** the geo cull and the
+        // projection, and not between them: `geo_bounds` is the viewport's own
+        // unfolded frame, so a station written -175 tested against a viewport
+        // reading 175..190 is rejected by the cull long before anything could
+        // place it.
+        let turn = crate::overlay_cache::pane_turn_lon(projector);
 
-        // Hover detection — a blocked cursor was already dropped above.
-        if let Some(hp) = hover_pos {
-            let dx = hp.x - screen.x;
-            let dy = hp.y - screen.y;
-            let d2 = dx * dx + dy * dy;
-            if d2 <= hit_radius * hit_radius
-                && closest_hover.is_none_or(|(best_d2, _)| d2 < best_d2)
-            {
-                closest_hover = Some((d2, pt.id));
+        for (index, pt) in points.iter().enumerate() {
+            let lon = squallar_geo::fold_lon_near(pt.lon, turn);
+
+            // Fast geo-bounds rejection before the costly projection.
+            if !geo_bounds.contains_point(pt.lat, lon) {
+                continue;
             }
+
+            let screen = projector.project(walkers::lat_lon(pt.lat, lon)).to_pos2();
+
+            if !expanded.contains(screen) {
+                continue;
+            }
+
+            if collecting {
+                placed.push((index as u32, screen));
+            }
+
+            if !text_only || collecting {
+                let mut ep = EguiPointPainter {
+                    painter,
+                    center: screen,
+                    galleys,
+                    text_only,
+                    sink: collecting.then_some(&mut sink),
+                    pixels_per_point,
+                };
+                handler.draw_point(pt.id, &mut ep, &draw_ctx);
+            }
+
+            hit_test_point(
+                pt,
+                screen,
+                hit_radius,
+                click_pos,
+                hover_pos,
+                &mut selected,
+                &mut closest_hover,
+            );
         }
     }
 
     if let Some(key) = key {
-        let mesh = match kept {
+        let mesh = match kept_mesh {
             Some(mesh) => mesh,
             None => {
-                let mesh = crate::point_painter::tessellate_text_shapes(ui.ctx(), sink);
-                point_text.store(pf.pane_idx, pf.id, key, mesh.clone());
+                // The build this one replaces owns buffers of exactly the
+                // right size; see `PointTextMeshes::recycle`.
+                let recycled = point_text.recycle(pf.pane_idx, pf.id);
+                let mesh = crate::point_painter::tessellate_text_shapes_drain(
+                    ui.ctx(),
+                    &mut sink,
+                    recycled,
+                );
+                point_text.store(
+                    pf.pane_idx,
+                    pf.id,
+                    key,
+                    mesh.clone(),
+                    std::mem::take(&mut placed),
+                );
                 mesh
             }
         };
@@ -3908,7 +3948,45 @@ fn render_per_frame_overlay(
         );
     }
 
+    point_text.put_scratch(sink);
+
     selected
+}
+
+/// One point's click and hover tests, at the position the pass put it.
+///
+/// **One spelling for both passes.** A pass that walks the point list and a
+/// pass that reads the positions its build wrote down must reach the same
+/// verdict about the same point, and two copies of a distance test are two
+/// places for that to stop being true.
+#[allow(clippy::too_many_arguments)]
+fn hit_test_point(
+    pt: &squallar_source::draw::MapPoint,
+    screen: egui::Pos2,
+    hit_radius: f32,
+    click_pos: Option<egui::Pos2>,
+    hover_pos: Option<egui::Pos2>,
+    selected: &mut Vec<Arc<dyn OverlayItem>>,
+    closest_hover: &mut Option<(f32, u32)>,
+) {
+    // Click detection — layer blocking already applied by pre-filter in ui_map.rs.
+    if let Some(click_pos) = click_pos {
+        let dx = click_pos.x - screen.x;
+        let dy = click_pos.y - screen.y;
+        if dx * dx + dy * dy <= hit_radius * hit_radius {
+            selected.push(pt.selection.clone());
+        }
+    }
+
+    // Hover detection — a blocked cursor was already dropped above.
+    if let Some(hp) = hover_pos {
+        let dx = hp.x - screen.x;
+        let dy = hp.y - screen.y;
+        let d2 = dx * dx + dy * dy;
+        if d2 <= hit_radius * hit_radius && closest_hover.is_none_or(|(best_d2, _)| d2 < best_d2) {
+            *closest_hover = Some((d2, pt.id));
+        }
+    }
 }
 
 /// Vertical offset (points) from the touch point to the tooltip centre, so the
@@ -5006,6 +5084,11 @@ mod layer_opacity_walk_tests;
 #[path = "ui_map_pane/lookup_tax_tests.rs"]
 #[cfg(test)]
 mod lookup_tax_tests;
+
+/// What a pass whose build is still current does not walk again.
+#[path = "ui_map_pane/kept_point_pass_tests.rs"]
+#[cfg(test)]
+mod kept_point_pass_tests;
 
 #[path = "ui_map_pane/pane_cost_tests.rs"]
 #[cfg(test)]

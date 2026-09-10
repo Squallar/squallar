@@ -34,6 +34,22 @@ pub struct MapPoint {
 
 /// `offset` is `[x, y]` pixels from the point centre; colours are `[r, g, b, a]`.
 pub trait PointPainter {
+    /// Whether geometry handed to this painter can reach anything.
+    ///
+    /// **A capability, asked once per point rather than answered per
+    /// primitive.** A painter drawing for a layer whose shapes are already in
+    /// a rasterized picture accepts every geometry call and drops it, so a
+    /// symbol built out of `line` and `filled_polygon` costs its whole
+    /// construction — the trigonometry, the loops, the `to_uppercase` that
+    /// selects it — for four calls that return at their first statement. A
+    /// point model asks this before building any of it.
+    ///
+    /// `true` by default, which is the answer for every painter that paints:
+    /// the pixmap rasterizer takes this arm and is unchanged by it.
+    fn wants_geometry(&self) -> bool {
+        true
+    }
+
     fn circle_filled(&mut self, offset: [f32; 2], radius: f32, color: [u8; 4]);
 
     fn circle_stroke(&mut self, offset: [f32; 2], radius: f32, color: [u8; 4], width: f32);

@@ -56,6 +56,13 @@ impl EguiPointPainter<'_> {
 }
 
 impl PointPainter for EguiPointPainter<'_> {
+    /// The `text_only` flag, read as the capability it is: a layer whose
+    /// picture already carries its geometry drops every non-text primitive
+    /// below, so a point model that asks this first never builds one.
+    fn wants_geometry(&self) -> bool {
+        !self.text_only
+    }
+
     fn circle_filled(&mut self, offset: [f32; 2], radius: f32, color: [u8; 4]) {
         if self.text_only {
             return;
@@ -176,14 +183,19 @@ pub(crate) struct PointTextKey {
 }
 
 impl PointTextKey {
+    /// `pixels_per_point` is the pass's, **carried rather than asked for**:
+    /// `Context::pixels_per_point` is `Context::write`, an exclusive lock on
+    /// the whole context, and the pass has already read it once for the layer
+    /// — see [`EguiPointPainter::pixels_per_point`], which is that same
+    /// number.
     pub(crate) fn new(
-        ctx: &egui::Context,
         galleys: &walkers::GalleyCache,
         projector: &walkers::Projector,
         rect: egui::Rect,
         generation: u64,
         zoom: f32,
         dark: bool,
+        pixels_per_point: f32,
     ) -> Self {
         let a = projector.project(walkers::lat_lon(0.0, 0.0));
         let b = projector.project(walkers::lat_lon(45.0, 90.0));
@@ -191,7 +203,7 @@ impl PointTextKey {
             generation,
             zoom: zoom.to_bits(),
             dark,
-            pixels_per_point: ctx.pixels_per_point().to_bits(),
+            pixels_per_point: pixels_per_point.to_bits(),
             rect: [
                 rect.min.x.to_bits(),
                 rect.min.y.to_bits(),
@@ -215,18 +227,46 @@ impl PointTextKey {
 /// one mesh instead. A `None` entry is a key under which the layer drew no
 /// text at all (every station culled, or nothing to say), kept so that case
 /// is not re-walked either.
+///
+/// **And the cull is kept with it.** [`Kept::points`] is where the build put
+/// every point that survived, so a pass holding the key hit-tests off that
+/// list rather than folding, geo-testing and projecting the layer's whole
+/// point list a second time to arrive at it.
+///
+/// **The buffers outlive the entry they were built in.** A build fills the
+/// vertex and index buffers of the build it replaces ([`Self::recycle`]) and
+/// collects into the shape list the last one used ([`Self::take_scratch`]),
+/// so a pan that rebuilds on nearly every frame stops asking the allocator
+/// for the same three buffers on each of them.
 #[derive(Default)]
 pub(crate) struct PointTextMeshes {
     entries: HashMap<(usize, LayerId), Kept>,
+    /// The shape list the last build filled, emptied and kept for the next
+    /// one. See [`Self::take_scratch`].
+    scratch: Vec<Shape>,
     builds: u64,
     hits: u64,
+    recycled_meshes: u64,
+    recycled_shapes: u64,
 }
 
-/// One pane-and-layer's kept text: the key it was built under and the mesh,
-/// `None` where the layer drew no text under that key.
-struct Kept {
+/// One pane-and-layer's kept text: the key it was built under, the mesh,
+/// `None` where the layer drew no text under that key, and where the pass that
+/// built it put every point that survived the cull.
+pub(crate) struct Kept {
     key: PointTextKey,
-    mesh: Option<Arc<egui::Mesh>>,
+    pub(crate) mesh: Option<Arc<egui::Mesh>>,
+    /// `(index into the handler's point list, screen position)` for every
+    /// point the building pass kept, in walk order.
+    ///
+    /// **The same key is the same projector**, which is what makes this
+    /// re-usable rather than a guess: [`PointTextKey`] carries two projected
+    /// reference points and the culling window, so a pass that finds its key
+    /// held would project the same points to the same places and cull the same
+    /// ones away. It is the identical argument the kept *mesh* already stands
+    /// on — a mesh is these positions with glyphs on them — so hit-testing off
+    /// this list is exactly as true as drawing the mesh is.
+    pub(crate) points: Vec<(u32, Pos2)>,
     /// The same mesh with a painter opacity already multiplied in. Every
     /// gridded layer's default opacity is below 1.0
     /// (`squallar_source::product::REFLECTIVITY_DEFAULT_OPACITY`), so this is
@@ -235,19 +275,76 @@ struct Kept {
 }
 
 impl PointTextMeshes {
-    /// The kept mesh for this pane and layer, if it was built under `key`.
-    pub(crate) fn lookup(
+    /// This pane-and-layer's kept solve, if it was built under `key`: the mesh
+    /// to re-add and the projected points to hit-test against.
+    pub(crate) fn kept(
         &mut self,
         pane: usize,
         layer: &LayerId,
         key: PointTextKey,
-    ) -> Option<Option<Arc<egui::Mesh>>> {
+    ) -> Option<&Kept> {
         let kept = self.entries.get(&(pane, layer.clone()))?;
         if kept.key != key {
             return None;
         }
         self.hits += 1;
-        Some(kept.mesh.clone())
+        self.entries.get(&(pane, layer.clone()))
+    }
+
+    /// The shape list the last build filled, emptied but keeping its buffer.
+    ///
+    /// **A build collects a few hundred `Shape`s and drops them a few lines
+    /// later**, and a list that starts from `Vec::new()` takes that buffer from
+    /// the allocator and grows it by doubling on every frame a pan rebuilds on.
+    /// The caller hands it back with [`Self::put_scratch`].
+    pub(crate) fn take_scratch(&mut self) -> Vec<Shape> {
+        if self.scratch.capacity() > 0 {
+            self.recycled_shapes += 1;
+        }
+        std::mem::take(&mut self.scratch)
+    }
+
+    /// Take the shape list back, emptied. Not `Vec::new()`: the capacity is
+    /// the whole point.
+    pub(crate) fn put_scratch(&mut self, mut scratch: Vec<Shape>) {
+        scratch.clear();
+        if scratch.capacity() > self.scratch.capacity() {
+            self.scratch = scratch;
+        }
+    }
+
+    /// This pane-and-layer's retired mesh, emptied but keeping its buffers,
+    /// for the build that is replacing it to fill.
+    ///
+    /// [`crate::label_cache::LabelCache::recycle`]'s reasoning verbatim, on
+    /// this pass's own memo: the painter's clone of a kept mesh dies with the
+    /// paint list `Context::tessellate` consumed at the end of the frame it was
+    /// added on, so by the time the next pass reaches this the memo holds the
+    /// only reference. `Arc::try_unwrap` makes that a fact rather than an
+    /// argument — a reference that somehow survived gives a fresh mesh and one
+    /// wasted allocation, never a mutation of geometry something is still
+    /// drawing.
+    ///
+    /// The entry is REMOVED, so a caller that takes the buffers must store a
+    /// new build; the call site is the miss path it is about to store from.
+    pub(crate) fn recycle(&mut self, pane: usize, layer: &LayerId) -> egui::Mesh {
+        let Some(mesh) = self
+            .entries
+            .remove(&(pane, layer.clone()))
+            .and_then(|k| k.mesh)
+        else {
+            return egui::Mesh::default();
+        };
+        let Ok(mut mesh) = Arc::try_unwrap(mesh) else {
+            return egui::Mesh::default();
+        };
+        // Not `Mesh::clear`, which replaces the vertex buffer with a fresh
+        // empty one and so throws away the whole point of this.
+        mesh.vertices.clear();
+        mesh.indices.clear();
+        mesh.texture_id = egui::TextureId::default();
+        self.recycled_meshes += 1;
+        mesh
     }
 
     pub(crate) fn store(
@@ -256,6 +353,7 @@ impl PointTextMeshes {
         layer: &LayerId,
         key: PointTextKey,
         mesh: Option<Arc<egui::Mesh>>,
+        points: Vec<(u32, Pos2)>,
     ) {
         self.builds += 1;
         self.entries.insert(
@@ -263,6 +361,7 @@ impl PointTextMeshes {
             Kept {
                 key,
                 mesh,
+                points,
                 tinted: None,
             },
         );
@@ -302,6 +401,20 @@ impl PointTextMeshes {
     #[cfg(test)]
     pub(crate) fn hits(&self) -> u64 {
         self.hits
+    }
+
+    /// Builds that filled the retired build's vertex and index buffers instead
+    /// of asking the allocator for new ones.
+    #[cfg(test)]
+    pub(crate) fn recycled_meshes(&self) -> u64 {
+        self.recycled_meshes
+    }
+
+    /// Builds that collected into the previous build's shape list instead of a
+    /// fresh one.
+    #[cfg(test)]
+    pub(crate) fn recycled_shapes(&self) -> u64 {
+        self.recycled_shapes
     }
 }
 
@@ -385,7 +498,8 @@ fn tinted_mesh(memo: &mut TintMemo, base: &Arc<egui::Mesh>, opacity: f32) -> Arc
 }
 
 /// One mesh from a pass's collected text shapes, tessellated exactly as egui
-/// would tessellate them at the end of this frame.
+/// would tessellate them at the end of this frame, filling buffers the caller
+/// already owns.
 ///
 /// The tessellator is built the way `Context::tessellate` builds its own —
 /// the context's pixels-per-point, its tessellation options and the font
@@ -395,14 +509,6 @@ fn tinted_mesh(memo: &mut TintMemo, base: &Arc<egui::Mesh>, opacity: f32) -> Arc
 /// everything: egui's would skip a text row entirely outside the pane, and
 /// this keeps such a row for the scissor to clip, which is the only way the
 /// two outputs differ and only outside the pane.
-pub(crate) fn tessellate_text_shapes(
-    ctx: &egui::Context,
-    shapes: Vec<Shape>,
-) -> Option<Arc<egui::Mesh>> {
-    tessellate_text_shapes_into(ctx, shapes, egui::Mesh::default())
-}
-
-/// [`tessellate_text_shapes`], filling buffers the caller already owns.
 ///
 /// **A pane's place names are ~850 kB of vertices, and a pan re-solves them on
 /// nearly half its frames.** Handed `Mesh::default()`, every one of those
@@ -418,7 +524,20 @@ pub(crate) fn tessellate_text_shapes(
 /// do.
 pub(crate) fn tessellate_text_shapes_into(
     ctx: &egui::Context,
-    shapes: Vec<Shape>,
+    mut shapes: Vec<Shape>,
+    mesh: egui::Mesh,
+) -> Option<Arc<egui::Mesh>> {
+    tessellate_text_shapes_drain(ctx, &mut shapes, mesh)
+}
+
+/// [`tessellate_text_shapes_into`], leaving the caller's list emptied rather
+/// than consumed, so the list's buffer survives with it.
+///
+/// The body is the one the other two spellings run; nothing about the mesh it
+/// produces depends on how the shapes arrived.
+pub(crate) fn tessellate_text_shapes_drain(
+    ctx: &egui::Context,
+    shapes: &mut Vec<Shape>,
     mut mesh: egui::Mesh,
 ) -> Option<Arc<egui::Mesh>> {
     debug_assert!(mesh.is_empty(), "a recycled mesh must be emptied first");
@@ -429,7 +548,7 @@ pub(crate) fn tessellate_text_shapes_into(
     let font_tex_size = ctx.fonts(|f| f.font_image_size());
     let mut tessellator =
         egui::epaint::Tessellator::new(ctx.pixels_per_point(), options, font_tex_size, Vec::new());
-    for shape in shapes {
+    for shape in shapes.drain(..) {
         tessellator.tessellate_shape(shape, &mut mesh);
     }
     (!mesh.is_empty()).then(|| Arc::new(mesh))
@@ -549,11 +668,91 @@ mod point_text_tests {
             paint_all(p, g, Some(&mut collected))
         });
         assert_eq!(collected.len(), 80, "the fixture collected no text");
-        let kept = tessellate_text_shapes(&ctx, collected).expect("text tessellates to a mesh");
+        let kept = tessellate_text_shapes_into(&ctx, collected, egui::Mesh::default())
+            .expect("text tessellates to a mesh");
 
         assert!(!direct_mesh.is_empty(), "the direct pass painted nothing");
         assert_eq!(vertices(&kept), vertices(&direct_mesh));
         assert_eq!(kept.indices, direct_mesh.indices);
+    }
+
+    /// **A build that fills the retired build's buffers emits the same bytes.**
+    ///
+    /// The point pass rebuilds on nearly every frame of a pan, and each build
+    /// used to take a fresh vertex buffer, an index buffer and a shape list
+    /// from the allocator and give all three back a frame later. They now come
+    /// from the build being replaced — [`PointTextMeshes::recycle`] and
+    /// [`PointTextMeshes::take_scratch`]. What must not change is the mesh: the
+    /// same shapes tessellated into recycled buffers have to be vertex for
+    /// vertex, index for index and texture for texture what they tessellate to
+    /// in fresh ones.
+    ///
+    /// The reuse itself is asserted too, and not by a counter alone: the
+    /// recycled mesh arrives EMPTY with a non-zero capacity, which is exactly
+    /// what `Mesh::clear` would not give and what makes this a saving rather
+    /// than a rename.
+    #[test]
+    fn a_build_filling_the_retired_builds_buffers_tessellates_to_the_same_bytes() {
+        let ctx = egui::Context::default();
+        let layer = LayerId::from_static("Fixture");
+        let mut galleys = walkers::GalleyCache::default();
+        // Warm the atlas so neither build grows it under the other.
+        let _ = shapes_of_one_pass(&ctx, &mut galleys, |p, g| paint_all(p, g, None));
+
+        let collect = |galleys: &mut walkers::GalleyCache| {
+            let mut out = Vec::new();
+            let _ = shapes_of_one_pass(&ctx, galleys, |p, g| paint_all(p, g, Some(&mut out)));
+            out
+        };
+
+        let first = collect(&mut galleys);
+        assert_eq!(first.len(), 80, "the fixture collected no text");
+        let fresh = tessellate_text_shapes_into(&ctx, first, egui::Mesh::default())
+            .expect("text tessellates to a mesh");
+
+        // Park it as a build, then take its buffers back the way the miss path
+        // does.
+        let mut meshes = PointTextMeshes::default();
+        let memory = walkers::MapMemory::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN);
+        let projector = walkers::Projector::new(rect, &memory, walkers::lat_lon(35.0, -97.0));
+        let key = PointTextKey::new(&galleys, &projector, rect, 1, 7.0, false, 1.0);
+        meshes.store(0, &layer, key, Some(fresh.clone()), Vec::new());
+        // What the fresh build produced, read out before the reference is let
+        // go: the paint list that held the painter's clone has been consumed,
+        // as it is by `Context::tessellate` at the end of the frame it was
+        // added on, so the memo's is the only one left.
+        let want_vertices = vertices(&fresh);
+        let want_indices = fresh.indices.clone();
+        let want_texture = fresh.texture_id;
+        drop(fresh);
+
+        let recycled = meshes.recycle(0, &layer);
+        assert_eq!(meshes.recycled_meshes(), 1, "the buffers were not taken");
+        assert!(recycled.is_empty(), "a recycled mesh must arrive emptied");
+        assert!(
+            recycled.vertices.capacity() > 0 && recycled.indices.capacity() > 0,
+            "a recycled mesh must arrive with its buffers, not with fresh ones"
+        );
+
+        let mut scratch = meshes.take_scratch();
+        scratch.extend(collect(&mut galleys));
+        let into_recycled = tessellate_text_shapes_drain(&ctx, &mut scratch, recycled)
+            .expect("text tessellates to a mesh");
+        assert!(
+            scratch.is_empty() && scratch.capacity() > 0,
+            "the shape list must come back emptied and still owning its buffer"
+        );
+        meshes.put_scratch(scratch);
+        assert!(
+            meshes.take_scratch().capacity() > 0,
+            "the shape list's buffer must survive the round trip"
+        );
+        assert_eq!(meshes.recycled_shapes(), 1);
+
+        assert_eq!(vertices(&into_recycled), want_vertices);
+        assert_eq!(into_recycled.indices, want_indices);
+        assert_eq!(into_recycled.texture_id, want_texture);
     }
 
     /// The mesh is built once per key and answered from the table while the
@@ -570,43 +769,47 @@ mod point_text_tests {
             let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN);
             let projector = walkers::Projector::new(rect, &memory, walkers::lat_lon(35.0, -97.0));
             let galleys = walkers::GalleyCache::default();
+            let ppp = ctx.pixels_per_point();
             let key = |generation| {
-                PointTextKey::new(ctx, &galleys, &projector, rect, generation, 7.0, false)
+                PointTextKey::new(&galleys, &projector, rect, generation, 7.0, false, ppp)
             };
+            let placed = || vec![(3_u32, egui::pos2(11.0, 22.0))];
 
-            assert!(
-                meshes.lookup(0, &layer, key(1)).is_none(),
-                "nothing kept yet"
-            );
-            meshes.store(0, &layer, key(1), None);
+            assert!(meshes.kept(0, &layer, key(1)).is_none(), "nothing kept yet");
+            meshes.store(0, &layer, key(1), None, placed());
             assert_eq!(meshes.builds(), 1);
             for _ in 0..3 {
-                assert!(meshes.lookup(0, &layer, key(1)).is_some());
+                let kept = meshes.kept(0, &layer, key(1)).expect("kept under its key");
+                assert_eq!(
+                    kept.points,
+                    placed(),
+                    "the projected points come back with the mesh"
+                );
             }
             assert_eq!(meshes.hits(), 3);
             assert!(
-                meshes.lookup(0, &layer, key(2)).is_none(),
+                meshes.kept(0, &layer, key(2)).is_none(),
                 "new data under the same view must rebuild"
             );
             assert!(
-                meshes.lookup(1, &layer, key(1)).is_none(),
+                meshes.kept(1, &layer, key(1)).is_none(),
                 "another pane's mesh is not this pane's"
             );
             assert_ne!(
                 key(1),
-                PointTextKey::new(ctx, &galleys, &projector, rect, 1, 7.0, true),
+                PointTextKey::new(&galleys, &projector, rect, 1, 7.0, true, ppp),
                 "the theme is part of the key"
             );
             assert_ne!(
                 key(1),
                 PointTextKey::new(
-                    ctx,
                     &galleys,
                     &projector,
                     rect.translate(egui::vec2(1.0, 0.0)),
                     1,
                     7.0,
-                    false
+                    false,
+                    ppp
                 ),
                 "the culling window is part of the key"
             );

@@ -1477,7 +1477,7 @@ impl RunCursor {
 /// 14,663 glyph vertices per pane-frame, each vertex arriving at the value it
 /// already had. Tessellating the solve where it is made costs the same
 /// vertices once and a copy thereafter, and it is
-/// [`crate::point_painter::tessellate_text_shapes`] that does it, so the two
+/// [`crate::point_painter::tessellate_text_shapes_into`] that does it, so the two
 /// text paths a pane has cannot drift apart.
 ///
 /// **A solve fills the retired solve's buffers**, rather than asking the
@@ -2804,7 +2804,7 @@ mod tests {
     /// grows it changes every normalised UV and the comparison would be a
     /// comparison of atlases rather than of paths. The names are placed well
     /// inside the canvas, because the direct arm culls a text row against the
-    /// painter's clip and [`crate::point_painter::tessellate_text_shapes`]
+    /// painter's clip and [`crate::point_painter::tessellate_text_shapes_into`]
     /// tessellates under `Rect::EVERYTHING` — the two agree exactly on a row
     /// the clip keeps, and only there. And more than one name is placed, at
     /// more than one row, so the comparison covers ordering and not just a
@@ -2936,9 +2936,10 @@ mod tests {
                 // The head of the pass, where the shell checks the raster.
                 galleys.begin_frame(ui.ctx());
                 paint_labels(ui.painter(), names(), &mut galleys, &mut cache, 0);
-                reference = crate::point_painter::tessellate_text_shapes(
+                reference = crate::point_painter::tessellate_text_shapes_into(
                     ui.ctx(),
                     solve_labels(ui.ctx(), &names(), &mut walkers::GalleyCache::default()),
+                    egui::Mesh::default(),
                 );
                 burn(ui.ctx(), &mut size);
             });

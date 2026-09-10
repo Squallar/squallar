@@ -91,7 +91,11 @@ pub fn draw_metar_station(
     ctx: &DrawPointContext,
 ) {
     let zoom = ctx.zoom;
-    let fc_color = flight_category_color(ob.flight_category);
+    // **Asked once per station, before anything is built.** Every symbol below
+    // that is not text is `line`, `circle_*` or `filled_polygon`, and a painter
+    // whose layer already carries its geometry in a picture drops all four. See
+    // [`PointPainter::wants_geometry`].
+    let geometry = painter.wants_geometry();
     let text_color = if ctx.is_dark {
         [255, 255, 255, 230]
     } else {
@@ -101,7 +105,10 @@ pub fn draw_metar_station(
     let circle_r = circle_radius_for_zoom(zoom);
 
     // ── Tier 1 ────────────────────────────────────────────────────────
-    draw_cloud_cover_circle(painter, ob, fc_color, circle_r, ctx.is_dark);
+    if geometry {
+        let fc_color = flight_category_color(ob.flight_category);
+        draw_cloud_cover_circle(painter, ob, fc_color, circle_r, ctx.is_dark);
+    }
 
     if zoom < TIER2_ZOOM {
         return;
@@ -128,7 +135,9 @@ pub fn draw_metar_station(
         );
     }
 
-    draw_wind_barb(painter, ob.wind_dir, ob.wind_speed_kt, circle_r, text_color);
+    if geometry {
+        draw_wind_barb(painter, ob.wind_dir, ob.wind_speed_kt, circle_r, text_color);
+    }
 
     if zoom < TIER3_ZOOM {
         return;
@@ -152,7 +161,7 @@ pub fn draw_metar_station(
         painter.text(VIS_OFFSET, vis, text_color, small, TextAnchor::CenterRight);
     }
 
-    if let Some(ref wx) = ob.wx_string {
+    if geometry && let Some(ref wx) = ob.wx_string {
         draw_wx_symbol(painter, WX_OFFSET, wx, text_color);
     }
 
@@ -798,10 +807,42 @@ mod tests {
         lines: Vec<([f32; 2], [f32; 2])>,
         /// Vertices per filled polygon.
         polygons: Vec<Vec<[f32; 2]>>,
+        /// Radii of filled discs — counted, because "the model built nothing
+        /// that is not text" is a claim about every primitive and this was the
+        /// one the fixture used to drop on the floor.
+        fills: Vec<f32>,
+        /// What [`PointPainter::wants_geometry`] answers.
+        geometry: bool,
+    }
+
+    impl RecordingPainter {
+        /// A painter that accepts geometry, as the pixmap rasterizer does.
+        fn painting() -> Self {
+            Self {
+                geometry: true,
+                ..Default::default()
+            }
+        }
+
+        /// A painter whose layer already carries its geometry in a picture, as
+        /// the frame thread's text-only painter does.
+        fn text_only() -> Self {
+            Self::default()
+        }
+
+        /// Every non-text primitive this painter was handed.
+        fn geometry_count(&self) -> usize {
+            self.strokes.len() + self.lines.len() + self.polygons.len() + self.fills.len()
+        }
     }
 
     impl PointPainter for RecordingPainter {
-        fn circle_filled(&mut self, _o: [f32; 2], _r: f32, _c: [u8; 4]) {}
+        fn wants_geometry(&self) -> bool {
+            self.geometry
+        }
+        fn circle_filled(&mut self, _o: [f32; 2], r: f32, _c: [u8; 4]) {
+            self.fills.push(r);
+        }
         fn circle_stroke(&mut self, _o: [f32; 2], r: f32, _c: [u8; 4], w: f32) {
             self.strokes.push((r, w));
         }
@@ -892,7 +933,7 @@ mod tests {
         let mut o = ob(None);
         o.altimeter_hpa = Some(1010.16);
         o.mslp_hpa = None;
-        let mut p = RecordingPainter::default();
+        let mut p = RecordingPainter::painting();
         draw_metar_station(&o, &StationText::of(&o), &mut p, &tier3());
         assert!(
             !p.texts.iter().any(|t| t.len() == 3 && t.starts_with('0')),
@@ -906,7 +947,7 @@ mod tests {
         let mut o = ob(None);
         o.altimeter_hpa = Some(1010.16);
         o.mslp_hpa = Some(1008.2);
-        let mut p = RecordingPainter::default();
+        let mut p = RecordingPainter::painting();
         draw_metar_station(&o, &StationText::of(&o), &mut p, &tier3());
         assert!(
             p.texts.iter().any(|t| t == "082"),
@@ -968,7 +1009,7 @@ mod tests {
     }
 
     fn plot(vis: Option<Visibility>) -> RecordingPainter {
-        let mut p = RecordingPainter::default();
+        let mut p = RecordingPainter::painting();
         let ctx = DrawPointContext {
             zoom: 12.0,
             is_dark: true,
@@ -976,6 +1017,107 @@ mod tests {
         let o = ob(vis);
         draw_metar_station(&o, &StationText::of(&o), &mut p, &ctx);
         p
+    }
+
+    /// A station carrying every branch of the model: cloud cover that takes
+    /// the partly-filled arm, a wind that draws a staff with pennants and
+    /// barbs, and a `wx` group that selects a symbol — so the geometry the
+    /// text-only arm must not build is not vacuously absent.
+    fn loaded_station() -> MetarOb {
+        let mut o = wind_ob(
+            Some(WindDir::Degrees(235)),
+            Some(63),
+            Some(Visibility {
+                miles: 2.5,
+                or_greater: false,
+            }),
+        );
+        o.temp_c = Some(19.4);
+        o.dewp_c = Some(11.1);
+        o.mslp_hpa = Some(1008.2);
+        o.flight_category = Some(FlightCategory::MVFR);
+        o.wx_string = Some("TSRA".into());
+        o.clouds = vec![crate::metar::types::CloudLayer {
+            cover: "SCT".into(),
+            base_ft: Some(3000),
+        }];
+        o
+    }
+
+    /// **A text-only painter is handed no geometry at all, and the same text.**
+    ///
+    /// The model's non-text symbols — the cloud disc, the wind staff with its
+    /// pennants and barbs, the weather glyph — are trigonometry, loops and a
+    /// `to_uppercase` built per station per frame, and a painter drawing for a
+    /// layer whose picture already carries them drops every one of the calls.
+    /// [`PointPainter::wants_geometry`] is asked before any of it is built.
+    ///
+    /// Both halves are the gate: **nothing** geometric reaches the text-only
+    /// painter, and the text that reaches it is character for character what
+    /// the painting one got. A version that skipped the text as well would
+    /// satisfy the first half alone.
+    #[test]
+    fn a_text_only_station_model_builds_no_geometry_and_the_same_text() {
+        let o = loaded_station();
+        let text = StationText::of(&o);
+        let ctx = tier3();
+
+        let mut painting = RecordingPainter::painting();
+        draw_metar_station(&o, &text, &mut painting, &ctx);
+        let mut quiet = RecordingPainter::text_only();
+        draw_metar_station(&o, &text, &mut quiet, &ctx);
+
+        assert!(
+            painting.geometry_count() >= 5,
+            "the fixture must reach the geometry it claims to suppress;              drew {} fills, {} strokes, {} lines, {} polygons",
+            painting.fills.len(),
+            painting.strokes.len(),
+            painting.lines.len(),
+            painting.polygons.len(),
+        );
+        assert!(
+            !painting.texts.is_empty(),
+            "the fixture must reach the text as well"
+        );
+        assert_eq!(
+            quiet.geometry_count(),
+            0,
+            "a text-only painter was handed geometry: {} fills, {} strokes,              {} lines, {} polygons",
+            quiet.fills.len(),
+            quiet.strokes.len(),
+            quiet.lines.len(),
+            quiet.polygons.len(),
+        );
+        assert_eq!(
+            quiet.texts, painting.texts,
+            "the text a text-only painter draws is the text the model draws"
+        );
+    }
+
+    /// The tier gate is upstream of the capability, so a text-only painter at
+    /// tier 1 — where the model is one disc and no text — is handed nothing at
+    /// all rather than a disc.
+    #[test]
+    fn a_text_only_station_model_at_the_lowest_tier_draws_nothing() {
+        let o = loaded_station();
+        let text = StationText::of(&o);
+        let low = DrawPointContext {
+            zoom: TIER2_ZOOM - 1.0,
+            is_dark: false,
+        };
+
+        let mut painting = RecordingPainter::painting();
+        draw_metar_station(&o, &text, &mut painting, &low);
+        assert!(
+            painting.geometry_count() > 0,
+            "tier 1 is the cloud disc, and the fixture must reach it"
+        );
+        assert!(painting.texts.is_empty(), "tier 1 carries no text");
+
+        let mut quiet = RecordingPainter::text_only();
+        draw_metar_station(&o, &text, &mut quiet, &low);
+        assert_eq!(quiet.geometry_count(), 0);
+        assert!(quiet.texts.is_empty());
     }
 
     #[test]
@@ -1034,7 +1176,7 @@ mod tests {
             base_ft: Some(3000),
         }];
         let radius = 6.0_f32;
-        let mut p = RecordingPainter::default();
+        let mut p = RecordingPainter::painting();
         draw_cloud_cover_circle(&mut p, &bkn, [0, 255, 0, 255], radius, true);
 
         assert!(
@@ -1066,7 +1208,7 @@ mod tests {
     // ── Wind barb ─────────────────────────────────────────────────────────
 
     fn barb(dir: Option<WindDir>, speed: Option<u16>) -> RecordingPainter {
-        let mut p = RecordingPainter::default();
+        let mut p = RecordingPainter::painting();
         draw_wind_barb(&mut p, dir, speed, 5.0, [0, 0, 0, 255]);
         p
     }
