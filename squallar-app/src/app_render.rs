@@ -536,6 +536,19 @@ fn overlay_blank_line(t: &squallar_egui::overlay_cache::ledger::Totals) -> Strin
 /// `outside-view` figure on the other line, so the two may be compared and
 /// summed down but never across.
 ///
+/// # Why `extent-declared-empty` is on the row
+///
+/// The two fields are the **two ends of one conversion**, which is the whole
+/// reading this line was written to support. `outside-view` is a layer paying
+/// an offloaded job to discover it had nothing in view; `extent-declared-empty`
+/// is the same layer refusing that job at the dispatch door through
+/// `SourceHandler::paints_in`. Landing such a predicate moves a layer's count
+/// from the first field to the second, so the pair is the **fires counter** for
+/// one: a mechanism that never ran leaves the row exactly where it was, and
+/// several mechanisms landed in this tree in September 2026 that executed zero
+/// times and were caught by nothing else. `blank` still bounds both — the row's
+/// fields are two of the reasons partitioning it and are never added to it.
+///
 /// **These are counts of wasted work and not of bytes.** A blank arrival is
 /// charged no bytes anywhere in this family, because no buffer was built for
 /// it — see the ledger's module note. Multiplying a count here by a picture
@@ -560,11 +573,13 @@ fn overlay_blank_layer_line(t: &squallar_egui::overlay_cache::ledger::Totals) ->
         t.blank_layers_seen(),
     );
     let outside_view = squallar_egui::overlay_cache::ledger::BlankReason::OutsideView;
+    let declared = squallar_egui::overlay_cache::ledger::BlankReason::ExtentDeclaredEmpty;
     for (name, total, row) in t.blank_layer_rows() {
         let _ = write!(
             line,
-            ", {name} {total} blank {} outside-view",
+            ", {name} {total} blank {} outside-view {} extent-declared-empty",
             row[outside_view.index()],
+            row[declared.index()],
         );
     }
     line

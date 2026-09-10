@@ -4487,6 +4487,13 @@ mod overlay_arrival_tests;
 #[path = "app_fetch/overlay_extent_tests.rs"]
 mod overlay_extent_tests;
 
+/// The storm report layer's `paints_in` against the rasterizer it mirrors: a
+/// refusal implies no ink, over the real texture planner at every scene shape
+/// the tree renders.
+#[cfg(test)]
+#[path = "app_fetch/reports_extent_tests.rs"]
+mod reports_extent_tests;
+
 /// A non-radar loop gains a frame when its own source publishes one — the
 /// append walk read radar's slot and rejected every other layer's timeline.
 #[cfg(test)]

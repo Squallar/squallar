@@ -441,6 +441,44 @@ impl OverlayHandler for StormReportsHandler {
         });
     }
 
+    /// **The layer's own extent test, one field before the raster.**
+    ///
+    /// [`Self::has_data`] is `!self.state.data.is_empty()` — one hail report
+    /// anywhere in the country — so a pane over Montana with a whole
+    /// convective day of Oklahoma reports dispatched a full-size raster to be
+    /// told its extent was empty. Measured on a 420 s six-pane leg
+    /// (`0ee9b98f6`'s per-layer blank attribution): **2,785 of this layer's
+    /// 2,792 blanks were `outside-view`**, 28.1 % of every `outside-view`
+    /// blank the app produced, each one an offloaded job, a worker turn, a
+    /// funnel slot and a reply for an empty picture.
+    ///
+    /// The cull is [`rasterize::any_report_paints_in`], which is the head of
+    /// `rasterize_storm_reports`' own loop — the as-of cull and the slack
+    /// rectangle — asked here instead. It states the superset argument.
+    ///
+    /// **The rows are not built to answer this.** `state.data` is read
+    /// directly rather than through [`Self::paint_input`]'s memo: a refusal
+    /// never reaches `prepare_job`, so building the row vector here would be
+    /// the one cost this exists to avoid, paid on the frame thread.
+    fn paints_in(
+        &self,
+        bounds: &squallar_geo::GeoBounds,
+        ctx: &RasterizeContext,
+        _pane: &PaneRef<'_>,
+    ) -> bool {
+        rasterize::any_report_paints_in(
+            self.state.data.iter().map(|item| rasterize::ReportPlace {
+                lat: item.report.lat,
+                lon: item.report.lon,
+                valid: item.report.valid,
+            }),
+            bounds,
+            ctx.zoom,
+            ctx.device_scale,
+            ctx.as_of,
+        )
+    }
+
     fn prepare_job(&self, ctx: &RasterizeContext, _pane: &PaneRef<'_>) -> Option<DescribedJob> {
         Some(DescribedJob::new(self.paint_input(ctx)?))
     }

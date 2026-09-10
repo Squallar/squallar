@@ -1762,6 +1762,132 @@ pub fn rasterize_storm_reports(
     }
 }
 
+/// One storm report as the **dispatch door** reads it: where it is, and when it
+/// happened. The kind is absent because the cull below does not look at it —
+/// every kind draws the same radius.
+pub struct ReportPlace {
+    pub lat: f64,
+    pub lon: f64,
+    /// [`ReportPaint::valid`]: `None` is never culled.
+    pub valid: Option<chrono::NaiveDateTime>,
+}
+
+/// How far outside the texture [`rasterize_storm_reports`] admits a report,
+/// **in texels** — its own `slack`, `20.0 * scale`, with `scale` the device
+/// scale the symbols are drawn at.
+const REPORT_SLACK_TEXELS: f64 = 20.0;
+
+/// The factor [`report_pad`] multiplies the exact texel→ground conversion by.
+///
+/// The conversion goes through the map zoom because the texture's texel count
+/// is **not** on [`RasterizeContext`] (54 sites construct one; the pixel plan
+/// reaches only the worker), and the zoom arrives quantized: the dispatch
+/// rounds to 1/32 of a zoom level (`ZOOM_QUANTIZATION_FACTOR`), so the ground
+/// it names is out by at most 2^(1/64), 1.1 %, and the planned side is
+/// truncated to a whole texel besides. A factor of 2 is far more than either
+/// needs, which is the point — this is the term that is cheap to be generous
+/// with, since what it buys back is a raster and what it costs is a walk that
+/// was going to run anyway.
+const REPORT_PAD_HEADROOM: f64 = 2.0;
+
+/// The floor under the pad, as a fraction of the box's own span per side.
+///
+/// It is not a second opinion about the slack — it is what keeps a *wrong*
+/// zoom from producing a wrong `false`. The zoom on a dispatch describes the
+/// viewport the bounds were taken from, so the two cannot disagree by more
+/// than the quantization above; if a later change ever lets them, a zoom that
+/// names a box far smaller than the one it is handed would shrink the pad
+/// towards nothing, and this term holds it at a twentieth of the box instead.
+/// It is **under** the zoom term at every picture this tree plans — the
+/// smallest, a 120-point pane, spends a third of its own box on the pad — so
+/// it changes no answer today and is there for the day the relationship
+/// moves.
+const REPORT_PAD_FLOOR_FRACTION: f64 = 0.05;
+
+/// The ground [`rasterize_storm_reports`]'s pixel slack covers, as a longitude
+/// pad and a Mercator-`y` pad for [`grow_bounds`].
+///
+/// # The texel→ground conversion, which is exact
+///
+/// One logical point of the map is `360 / (2^zoom * 256)` degrees of longitude
+/// — the Web Mercator scale `walkers::Projector` lays the pane out at, and the
+/// pane's bounds are its two unprojected corners. A texel is that divided by
+/// `device_scale`: `OverlayTexturePlan::pixels_per_point` is exactly the
+/// density the picture's texels were sized at, whether that came from the
+/// display alone or from the resolution the coverage widening gave up
+/// (`MIN_COVERAGE_SCALE`). The picture's own oversampling cancels — it widens
+/// the ground and the texel count by one factor — which is why neither the
+/// overdraw nor the pane's size appears here.
+///
+/// `sane_device_scale` is applied for the same reason the rasterizer applies
+/// it: the symbols, and so the slack, are drawn at the clamped scale, while
+/// the texels are laid out at the raw one.
+fn report_pad(bounds: &GeoBounds, zoom: f64, device_scale: f32) -> Option<(f64, f64)> {
+    if !zoom.is_finite() || !device_scale.is_finite() || device_scale <= 0.0 {
+        return None;
+    }
+    let deg_per_point = 360.0 / (2f64.powf(zoom) * 256.0);
+    if !deg_per_point.is_finite() || deg_per_point <= 0.0 {
+        return None;
+    }
+    let texels_per_point = f64::from(device_scale);
+    let slack_scale = f64::from(sane_device_scale(device_scale)) / texels_per_point;
+    let lon_pad = REPORT_SLACK_TEXELS * slack_scale * deg_per_point * REPORT_PAD_HEADROOM;
+
+    let mb = MercatorBounds::from_geo(bounds);
+    let lon_floor = (bounds.max_lon - bounds.min_lon).abs() * REPORT_PAD_FLOOR_FRACTION;
+    let merc_floor = (mb.merc_y_max - mb.merc_y_min).abs() * REPORT_PAD_FLOOR_FRACTION;
+    // Mercator `y` is in radians here (`lat_rad_to_mercator_y`), and one
+    // logical point is the same fraction of the world on both axes.
+    let merc_pad = lon_pad.to_radians();
+    Some((lon_pad.max(lon_floor), merc_pad.max(merc_floor)))
+}
+
+/// Whether **any** report could put ink in a texture over `bounds` — the
+/// predicate `StormReportsHandler::paints_in` is built from, and the mirror of
+/// the two `continue`s at the head of [`rasterize_storm_reports`]'s loop.
+///
+/// # What it mirrors, term by term
+///
+/// * The as-of cull is that loop's, spelled the same way down to the
+///   `is_some_and`: a report with no readable time is never culled, and a
+///   report later than the depicted instant has not happened yet.
+/// * The geographic cull is that loop's `slack` rectangle, carried into ground
+///   by [`report_pad`] and applied by [`grow_bounds`] — Mercator on the axis
+///   the texture's rows are linear in, degrees on the other. `nearest_lon` is
+///   the same shift the loop applies before it projects, so a dateline
+///   viewport asks about the same representation of a report either way.
+///
+/// **It admits a superset, on both terms.** The pad is the rasterizer's
+/// tolerance with a factor of two on it and a floor under it, so the ring of
+/// ground where the two disagree is ground the rasterizer accepts and this
+/// accepts too. `None` from [`report_pad`] — a zoom or a density that does not
+/// describe a picture — is `true`: the geometry is unknown, and the one
+/// direction this may not be wrong in is `false`.
+///
+/// **Unmemoized and per dispatch**, on the same terms as the alert layer's:
+/// the walk short-circuits on the first report that survives, so the scene it
+/// walks furthest on is the one where it is about to answer `true`.
+pub fn any_report_paints_in(
+    reports: impl IntoIterator<Item = ReportPlace>,
+    bounds: &GeoBounds,
+    zoom: f64,
+    device_scale: f32,
+    as_of: chrono::NaiveDateTime,
+) -> bool {
+    let Some((lon_pad, merc_pad)) = report_pad(bounds, zoom, device_scale) else {
+        return true;
+    };
+    let mb = MercatorBounds::from_geo(bounds);
+    let grown = grow_bounds(bounds, lon_pad, merc_pad);
+    reports.into_iter().any(|report| {
+        if report.valid.is_some_and(|valid| valid > as_of) {
+            return false;
+        }
+        grown.contains_point(report.lat, mb.nearest_lon(report.lon))
+    })
+}
+
 fn draw_lightning_bolt(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, rgba: [u8; 4]) {
     let s = size * 0.5;
     let mut pb = PathBuilder::new();

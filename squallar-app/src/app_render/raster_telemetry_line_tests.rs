@@ -748,6 +748,7 @@ fn the_blank_layer_line_names_every_layer_that_blanked_and_its_outside_view_shar
 
     let ov = BlankReason::OutsideView.index();
     let ink = BlankReason::DrewNoInk.index();
+    let declared = BlankReason::ExtentDeclaredEmpty.index();
     let mut blank_layers = [[0u64; BlankReason::COUNT]; LAYER_SLOTS];
     // Distinct values, none a prefix of another, and each layer's
     // `outside-view` share deliberately smaller than its total so a line that
@@ -760,6 +761,15 @@ fn the_blank_layer_line_names_every_layer_that_blanked_and_its_outside_view_shar
     let metar = known::METAR.ledger_slot().expect("Metar is a ledger row");
     blank_layers[metar][ov] = 300;
     blank_layers[metar][ink] = 7;
+    // The layer that refuses at the door rather than in the worker: its
+    // `outside-view` share is zero and its `extent-declared-empty` is most of
+    // its total, which is the shape a landed `paints_in` produces and the one
+    // a row printing the wrong reason could not fake.
+    let reports = known::STORM_REPORTS
+        .ledger_slot()
+        .expect("StormReports is a ledger row");
+    blank_layers[reports][declared] = 2_785;
+    blank_layers[reports][ink] = 5;
     blank_layers[OFF_LEDGER_SLOT][ov] = 2;
 
     let mut blank_reasons = [0u64; BlankReason::COUNT];
@@ -784,10 +794,11 @@ fn the_blank_layer_line_names_every_layer_that_blanked_and_its_outside_view_shar
 
     assert_eq!(
         super::overlay_blank_layer_line(&t),
-        "overlay blank layers: 9350 blank, 3 layers, \
-         Lightning 9041 blank 9000 outside-view, \
-         Metar 307 blank 300 outside-view, \
-         off-ledger 2 blank 2 outside-view",
+        "overlay blank layers: 12140 blank, 4 layers, \
+         StormReports 2790 blank 0 outside-view 2785 extent-declared-empty, \
+         Lightning 9041 blank 9000 outside-view 0 extent-declared-empty, \
+         Metar 307 blank 300 outside-view 0 extent-declared-empty, \
+         off-ledger 2 blank 2 outside-view 0 extent-declared-empty",
         "the `overlay blank layers:` sentence has moved. It is the only place a          blank is attributed to the layer that produced it, and without it the          `outside-view` count is a total nobody can act on -- the cut for it is          a per-handler `paints_in`, and which handler to write one for is          exactly what this line answers",
     );
 
