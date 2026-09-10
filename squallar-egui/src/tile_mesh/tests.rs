@@ -852,3 +852,164 @@ fn a_batched_background_run_tessellates_to_the_same_bytes_as_one_shape_per_tile(
         "batching the hoisted backgrounds moved the stream the renderer sees"
     );
 }
+
+/// A slippy grid of raster cells as `draw_tile_layer`'s second walk meets
+/// them: the rect the cell goes at, the atlas page it is a slot of, and the
+/// window of that page its pixels occupy.
+///
+/// **Two pages, interleaved, and two cells wholly off the pane — one of them
+/// in the MIDDLE of a run.** A viewport whose cells do not all fit one page of
+/// `crate::raster_atlas` spills into a second, and nothing sorts the walk by
+/// page; an off-pane cell is what `tiles::tile_span` produces at the edges of
+/// the grid and what epaint drops today off the shape's own bounds.
+///
+/// The mid-run one is the whole of the cull case and the reason it is placed
+/// there. An off-pane cell that *ends* a run gets a mesh of its own, whose
+/// bounds miss the clip, so epaint drops it and the stream is unchanged
+/// whether or not [`RasterQuads`] culls — a fixture with only that cell
+/// cannot see the defect at all. Inside a run of on-pane cells the union
+/// intersects the clip, epaint keeps the whole mesh, and the batch puts
+/// vertices in the stream that were never there.
+fn raster_grid() -> Vec<(egui::TextureId, egui::Rect, egui::Rect)> {
+    let page_a = egui::TextureId::Managed(7);
+    let page_b = egui::TextureId::Managed(9);
+    // Windows of a 1806x1806 page, as `RasterTile::window_of` hands them
+    // over: not the unit rect, so a batch that dropped the uv would be
+    // visible here.
+    let window = |col: f32, row: f32| {
+        egui::Rect::from_min_size(
+            egui::pos2(col * 258.0 / 1806.0, row * 258.0 / 1806.0),
+            egui::vec2(256.0 / 1806.0, 256.0 / 1806.0),
+        )
+    };
+    let at = |x: f32, y: f32| egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(256.0, 256.0));
+    vec![
+        // A run of two on one page.
+        (page_a, at(0.0, 0.0), window(0.0, 0.0)),
+        (page_a, at(256.0, 0.0), window(1.0, 0.0)),
+        // Wholly off the pane, on that same page, BETWEEN two cells that are
+        // on it: the cull case. It ends no run.
+        (page_a, at(-1024.0, -1024.0), window(4.0, 0.0)),
+        (page_a, at(256.0, 256.0), window(2.0, 0.0)),
+        // One page apart in the middle of the walk, which ends that run.
+        (page_b, at(0.0, 256.0), window(0.0, 0.0)),
+        // Back to the first page: a third run, not a re-opening of the first.
+        // Straddling the pane's right edge.
+        (page_a, at(384.0, 0.0), window(3.0, 0.0)),
+        // Wholly off the pane at the end of the walk, where a batch that
+        // never culled would still agree with the per-cell spelling.
+        (page_b, at(-512.0, -512.0), window(1.0, 1.0)),
+    ]
+}
+
+/// The pane the grid above is drawn under.
+const RASTER_CLIP: egui::Rect =
+    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(512.0, 384.0));
+
+/// Batch [`raster_grid`] exactly as the tile walk does, handing back the
+/// shapes in the order the painter was given them.
+fn batched_raster_shapes() -> Vec<egui::Shape> {
+    let mut quads = RasterQuads::default();
+    let mut shapes = Vec::new();
+    for (texture, rect, uv) in raster_grid() {
+        if let Some(run) = quads.push(texture, rect, uv, egui::Color32::WHITE, RASTER_CLIP) {
+            shapes.push(run);
+        }
+    }
+    shapes.extend(quads.finish());
+    shapes
+}
+
+/// **The batch draws the cells the one-`Painter::image`-per-cell spelling
+/// drew, byte for byte — texture ids included.**
+///
+/// `Painter::image` is `Shape::image`, which is `Mesh::with_texture` plus one
+/// `add_rect_with_uv`, so the per-cell arm here is what the shipped call
+/// produced before this cut; what is compared is the tessellated
+/// `ClippedPrimitive` stream, which is what the renderer sees.
+///
+/// The fixture carries the three cases a real pass has — cells inside the
+/// pane, one straddling its edge, one off it entirely — and the case a
+/// coloured background run cannot have: **two textures, interleaved**. A
+/// batch that merged across the page boundary would put one page's quads in
+/// the other page's mesh and this digest would name the wrong `tex=`.
+#[test]
+fn a_batched_raster_run_tessellates_to_the_same_bytes_as_one_image_per_tile() {
+    const PPP: f32 = 1.0;
+    let per_tile: Vec<egui::epaint::ClippedShape> = raster_grid()
+        .into_iter()
+        .map(|(texture, rect, uv)| egui::epaint::ClippedShape {
+            clip_rect: RASTER_CLIP,
+            shape: egui::Shape::image(texture, rect, uv, egui::Color32::WHITE),
+        })
+        .collect();
+    let batched: Vec<egui::epaint::ClippedShape> = batched_raster_shapes()
+        .into_iter()
+        .map(|shape| egui::epaint::ClippedShape {
+            clip_rect: RASTER_CLIP,
+            shape,
+        })
+        .collect();
+
+    let before = primitive_digest(&frame_tessellator(PPP).tessellate_shapes(per_tile));
+    let after = primitive_digest(&frame_tessellator(PPP).tessellate_shapes(batched));
+    assert!(
+        before.len() > 1 && before.iter().any(|p| p.contains("vertices=[(")),
+        "fixture: the per-cell run must emit more than one primitive with vertices \
+         in it, else this compares nothing"
+    );
+    assert!(
+        before.iter().any(|p| p.contains("tex=Managed(7)"))
+            && before.iter().any(|p| p.contains("tex=Managed(9)")),
+        "fixture: both pages must reach the stream, else the texture-id claim is vacuous"
+    );
+    assert_eq!(
+        before, after,
+        "batching the raster cells moved the stream the renderer sees"
+    );
+}
+
+/// **One shape per consecutive run of one page, and a culled cell ends no
+/// run.**
+///
+/// The byte-identity gate above holds the stream; this holds the quantity the
+/// cut is for. [`raster_grid`] draws five of its seven cells — page A three
+/// times, page B once, page A once — in three runs. Seven `Painter::add`
+/// calls become three.
+#[test]
+fn a_raster_run_is_one_shape_per_consecutive_page() {
+    let shapes = batched_raster_shapes();
+    let textures: Vec<egui::TextureId> = shapes
+        .iter()
+        .map(|shape| match shape {
+            egui::Shape::Mesh(mesh) => mesh.texture_id,
+            other => panic!("the raster arm handed the painter a {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        textures,
+        vec![
+            egui::TextureId::Managed(7),
+            egui::TextureId::Managed(9),
+            egui::TextureId::Managed(7),
+        ],
+        "the runs did not follow the walk's page order"
+    );
+    let quads: Vec<usize> = shapes
+        .iter()
+        .map(|shape| match shape {
+            egui::Shape::Mesh(mesh) => mesh.indices.len() / 6,
+            other => panic!("the raster arm handed the painter a {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        quads,
+        vec![3, 1, 1],
+        "an off-pane cell was kept, or a drawn one was dropped"
+    );
+    assert_eq!(
+        quads.iter().sum::<usize>(),
+        raster_grid().len() - 2,
+        "every cell but the two off-pane ones draws"
+    );
+}

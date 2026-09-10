@@ -9,8 +9,11 @@
 //! `queue.submit` replays every recorded command as a real GL call on the
 //! frame thread, and that is 93% of the tail.
 //!
-//! A raster tile layer draws its viewport one `Painter::image` per cell under
-//! **one** clip rect, so nothing but the texture separates them. Measured on
+//! A raster tile layer draws its viewport under **one** clip rect, so nothing
+//! but the texture separates its cells — one `Painter::image` per cell as it
+//! was measured, one mesh per consecutive run of one page since
+//! `crate::tile_mesh::RasterQuads`, and the same primitive stream either way.
+//! Measured on
 //! the native rig's scene D (1920x1080, one pane, terrain shading on,
 //! 2026-09-05): the terrain hillshade put **47 tiles on the glass as 47
 //! primitives, 47 draws, 47 bind groups and 94 buffer binds** — 47 of the 73

@@ -334,7 +334,9 @@ pub(super) fn draw_tile_layer(
     // [`crate::tile_mesh::HoistedBackgrounds`] for why that changes no
     // vertex, and `hoist_background` for why the hoist is legal at all.
     let mut backgrounds = crate::tile_mesh::HoistedBackgrounds::default();
-    let background_clip = ui.painter().clip_rect();
+    // One clip for both walks: the grid draws every cell under the pane's own
+    // rect, which is what lets a run of them merge at all.
+    let pane_clip = ui.painter().clip_rect();
     for ty in span.north..=span.south {
         for tx in span.west..=span.east {
             // **Two different columns, and that is the wrap.** `tx` is the
@@ -371,7 +373,7 @@ pub(super) fn draw_tile_layer(
                         rect,
                         piece.uv,
                         ui.pixels_per_point(),
-                        background_clip,
+                        pane_clip,
                     ) {
                         Background::Hoisted
                     } else {
@@ -389,6 +391,13 @@ pub(super) fn draw_tile_layer(
         ui.painter().add(shape);
     }
 
+    // Every raster cell of this pass, in one mesh per consecutive run of one
+    // atlas page rather than one `Shape::Mesh` and one `Painter::add` each.
+    // See [`crate::tile_mesh::RasterQuads`] for why that changes no vertex and
+    // for the two things that end a run.
+    let mut quads = crate::tile_mesh::RasterQuads::default();
+    let mut quad_count: u64 = 0;
+    let mut quad_meshes: u64 = 0;
     for (rect, piece, background) in answered {
         match piece.tile {
             // `window_of` and not `piece.uv`: the tile may be a slot
@@ -396,14 +405,25 @@ pub(super) fn draw_tile_layer(
             // window of the TILE. It is the identity for a tile with
             // a texture to itself.
             Tile::Raster(ref raster) => {
-                ui.painter().image(
+                quad_count += 1;
+                if let Some(run) = quads.push(
                     raster.id(),
                     rect,
                     raster.window_of(piece.uv),
                     egui::Color32::WHITE,
-                );
+                    pane_clip,
+                ) {
+                    ui.painter().add(run);
+                    quad_meshes += 1;
+                }
             }
             Tile::Vector(ref shapes) => {
+                // The run this tile interrupts goes in ahead of its geometry,
+                // because that is where those quads went in before.
+                if let Some(run) = quads.take() {
+                    ui.painter().add(run);
+                    quad_meshes += 1;
+                }
                 paint_vector_tile(
                     ui.painter(),
                     shapes,
@@ -421,6 +441,13 @@ pub(super) fn draw_tile_layer(
                 );
             }
         }
+    }
+    if let Some(run) = quads.finish() {
+        ui.painter().add(run);
+        quad_meshes += 1;
+    }
+    if quad_count > 0 {
+        crate::tile_mesh::ledger::note_raster_quads(quad_count, quad_meshes);
     }
 
     TileLayerPaint {

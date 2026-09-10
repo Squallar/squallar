@@ -195,13 +195,19 @@ fn the_slot_holds_the_tile_and_the_gutter_holds_its_edge() {
 
 /// **The figure this module exists for, as a count.**
 ///
-/// A row of raster tiles drawn the way `ui_map_overlays::draw_tile_layer`
-/// draws one — one `Painter::image` per cell, under one clip rect, in
-/// spatial order — is ONE `ClippedPrimitive` when the tiles share a texture
-/// and one primitive EACH when they do not. The second half is not decoration:
-/// it is what says this test would fail if `place` stopped sharing, and it is
-/// the shape of the stream measured on the native rig before this landed (47
-/// tiles, 47 primitives, 47 draws).
+/// A row of raster tiles submitted one `Painter::image` per cell, under one
+/// clip rect, in spatial order, is ONE `ClippedPrimitive` when the tiles share
+/// a texture and one primitive EACH when they do not. The second half is not
+/// decoration: it is what says this test would fail if `place` stopped
+/// sharing, and it is the shape of the stream measured on the native rig
+/// before this landed (47 tiles, 47 primitives, 47 draws).
+///
+/// **One `Painter::image` per cell is no longer how the tile walk spells it**
+/// — `crate::tile_mesh::RasterQuads` batches a consecutive run of one page
+/// into one shape — but it is still what the walk's stream must come out
+/// equal to, and it is the arrangement this file's claim is about. The
+/// batch's own equality with it is
+/// `crate::tile_mesh::tests::a_batched_raster_run_tessellates_to_the_same_bytes_as_one_image_per_tile`.
 #[test]
 fn a_row_of_raster_tiles_is_one_primitive_when_they_share_a_texture() {
     let ctx = Context::default();
@@ -232,7 +238,7 @@ fn a_row_of_raster_tiles_is_one_primitive_when_they_share_a_texture() {
 /// that they all fit one page (a 256x256 page holds 49).
 const TILES: usize = 12;
 
-/// How many `ClippedPrimitive`s a row of `tiles` becomes, drawn one
+/// How many `ClippedPrimitive`s a row of `tiles` becomes, submitted one
 /// `Painter::image` per tile under one clip rect.
 fn primitives_of(ctx: &Context, tiles: &[RasterTile]) -> usize {
     let canvas = Rect::from_min_size(

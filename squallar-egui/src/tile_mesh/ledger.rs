@@ -56,6 +56,15 @@
 //!   *second* figure's zero. A stroke run covers a span of consecutive paths,
 //!   so this is far below the shape count and is not comparable to it.
 //!
+//! * [`Totals::raster_quads`] and [`Totals::raster_quad_meshes`] — **raster
+//!   tile cells the grid walk placed**, and the shapes it handed the painter
+//!   to draw them. Its denominator is CELLS AND FRAMES; it is never added to
+//!   `ground_shapes`, which counts a vector tile's shapes. The two here
+//!   divide into one another, and the quotient is how many cells one atlas
+//!   page held in a row: one shape per consecutive run of one texture is what
+//!   `crate::tile_mesh::RasterQuads` moved the second figure to, and the
+//!   first is what it must not move.
+//!
 //! A fifth pair, [`Totals::mesh_uploads`] and [`Totals::mesh_upload_bytes`],
 //! is written by the **renderer**, not by this crate, and counts buffer
 //! writes rather than frames: the upload-once claim is the two of them against
@@ -74,6 +83,8 @@ static STROKE_RUN_MESHES: AtomicU64 = AtomicU64::new(0);
 static STROKE_MESH_VERTICES: AtomicU64 = AtomicU64::new(0);
 static GROUND_SHAPES: AtomicU64 = AtomicU64::new(0);
 static GROUND_SHAPE_SLOTS: AtomicU64 = AtomicU64::new(0);
+static RASTER_QUADS: AtomicU64 = AtomicU64::new(0);
+static RASTER_QUAD_MESHES: AtomicU64 = AtomicU64::new(0);
 static MESH_UPLOADS: AtomicU64 = AtomicU64::new(0);
 static MESH_UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
 static MESH_EVICTIONS: AtomicU64 = AtomicU64::new(0);
@@ -125,6 +136,19 @@ pub struct Totals {
     /// will place. Against a `ground_shapes` that must not move, this is the
     /// figure the sizing changes.
     pub ground_shape_slots: u64,
+    /// **Raster tile cells the grid walk placed**, over every tile layer of
+    /// every pane. The raster half of [`Self::ground_shapes`]'s question, and
+    /// a separate counter rather than a term in it: that one counts a vector
+    /// tile's shapes and these are textured quads, so the two are never
+    /// added.
+    pub raster_quads: u64,
+    /// **Shapes the raster arm handed the painter to draw them**, over the
+    /// same cells and frames, so the two divide into one another. One per
+    /// consecutive run of one atlas page, so the quotient is how many tiles a
+    /// run held -- and the figure `crate::tile_mesh::RasterQuads` moves while
+    /// [`Self::raster_quads`] must not. Equal counts are a viewport whose
+    /// cells never share a page two in a row.
+    pub raster_quad_meshes: u64,
     pub mesh_uploads: u64,
     pub mesh_upload_bytes: u64,
     pub mesh_evictions: u64,
@@ -137,6 +161,13 @@ pub struct Totals {
     /// crate declares no `log`, so the fault is counted where it happens and
     /// said where a logger exists.
     pub mesh_store_missing: u64,
+}
+
+/// Raster cells one tile pass placed, and the shapes it handed the painter
+/// for them. One call per tile layer per pane per frame.
+pub fn note_raster_quads(quads: u64, meshes: u64) {
+    RASTER_QUADS.fetch_add(quads, Relaxed);
+    RASTER_QUAD_MESHES.fetch_add(meshes, Relaxed);
 }
 
 /// Fill vertices this tile placed on the CPU. One call per tile.
@@ -222,6 +253,8 @@ impl Totals {
             .wrapping_add(self.stroke_run_meshes)
             .wrapping_add(self.ground_shapes)
             .wrapping_add(self.ground_shape_slots)
+            .wrapping_add(self.raster_quads)
+            .wrapping_add(self.raster_quad_meshes)
             .wrapping_add(self.mesh_uploads)
             .wrapping_add(self.mesh_evictions)
             .wrapping_add(self.mesh_store_missing)
@@ -255,6 +288,8 @@ pub fn totals() -> Totals {
         stroke_mesh_vertices: STROKE_MESH_VERTICES.load(Relaxed),
         ground_shapes: GROUND_SHAPES.load(Relaxed),
         ground_shape_slots: GROUND_SHAPE_SLOTS.load(Relaxed),
+        raster_quads: RASTER_QUADS.load(Relaxed),
+        raster_quad_meshes: RASTER_QUAD_MESHES.load(Relaxed),
         mesh_uploads: MESH_UPLOADS.load(Relaxed),
         mesh_upload_bytes: MESH_UPLOAD_BYTES.load(Relaxed),
         mesh_evictions: MESH_EVICTIONS.load(Relaxed),
@@ -281,6 +316,8 @@ pub(crate) fn reset() {
         &STROKE_MESH_VERTICES,
         &GROUND_SHAPES,
         &GROUND_SHAPE_SLOTS,
+        &RASTER_QUADS,
+        &RASTER_QUAD_MESHES,
         &MESH_UPLOADS,
         &MESH_UPLOAD_BYTES,
         &MESH_EVICTIONS,

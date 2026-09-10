@@ -727,7 +727,8 @@ fn layer_release_line(t: &squallar_egui::release_ledger::Totals) -> String {
 /// the browser rig parses this line by an unanchored regex
 /// (`.github/browser-rig/drive.py`); a field added at the end leaves every
 /// existing capture where it was. `stroke run meshes`, `stroke mesh verts`
-/// and `shapes` are appended for the same reason.
+/// and `shapes` are appended for the same reason, as are `raster quads` and
+/// `raster quad meshes`.
 ///
 /// The last three are the painterless pass's — a floor strip's. `stroke run
 /// meshes` and `stroke mesh verts` count runs drawn from the buffers they
@@ -742,7 +743,8 @@ fn ground_tile_line(t: &squallar_egui::tile_mesh::ledger::Totals) -> String {
         "ground tiles: {} placed, {} stroke pts, {} labels, {} draws, \
          {} uploads of {} B, {} evicted, {} B resident, {} unrendered, \
          {} stroke draws, {} label solves, {} stroke run meshes, \
-         {} stroke mesh verts, {} shapes, {} shape slots",
+         {} stroke mesh verts, {} shapes, {} shape slots, \
+         {} raster quads, {} raster quad meshes",
         t.mesh_vertices_placed,
         t.path_points_placed,
         t.label_anchors_placed,
@@ -758,6 +760,8 @@ fn ground_tile_line(t: &squallar_egui::tile_mesh::ledger::Totals) -> String {
         t.stroke_mesh_vertices,
         t.ground_shapes,
         t.ground_shape_slots,
+        t.raster_quads,
+        t.raster_quad_meshes,
     )
 }
 

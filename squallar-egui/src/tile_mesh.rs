@@ -1208,6 +1208,113 @@ impl HoistedBackgrounds {
     }
 }
 
+/// epaint's own coarse cull, applied where a batched quad is appended.
+///
+/// [`egui::Shape::image`] puts four vertices at the rect's corners and the
+/// tessellator drops the mesh when `clip_rect.intersects(mesh.calc_bounds())`
+/// is false (`coarse_tessellation_culling`, on by default). `calc_bounds`
+/// walks the four vertices through `Rect::extend_with`, which keeps `min`
+/// below `max`, so it is that rect with its corners sorted -- the identity
+/// for the positive rects `Projector::tile_rect_at` produces, and the right
+/// answer for anything else.
+fn quad_bounds(rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(rect.min.x.min(rect.max.x), rect.min.y.min(rect.max.y)),
+        egui::pos2(rect.min.x.max(rect.max.x), rect.min.y.max(rect.max.y)),
+    )
+}
+
+/// One tile pass's raster quads, batched into one mesh per consecutive run of
+/// one texture.
+///
+/// **The quads were already going to end up in one mesh per texture run.**
+/// `Painter::image` is `Mesh::with_texture` plus one `add_rect_with_uv`
+/// ([`egui::Shape::image`]), the grid draws every cell under ONE clip rect,
+/// and `Tessellator::tessellate_clipped_shape` starts a new primitive only on
+/// a clip change, a callback or a **texture change** -- so a run of tiles
+/// sharing a page of [`crate::raster_atlas`] was already being appended into
+/// the primitive the first of them opened. What that merge could not un-spend
+/// is what reaching it cost, per tile: a `Mesh` with two `Vec`s, an `Arc` to
+/// put it in a `Shape::Mesh`, and a `Context::write` for `Painter::add` to
+/// hand it over.
+///
+/// This accumulates the run instead and hands the painter one shape for it.
+/// The vertices go in in the same order with the same texture, so the stream
+/// the tessellator emits is the one it emitted before, which
+/// `tests::a_batched_raster_run_tessellates_to_the_same_bytes_as_one_image_per_tile`
+/// holds byte for byte -- texture ids included.
+///
+/// # Two things end a run
+///
+/// * **A different texture id.** A viewport whose tiles do not all fit one
+///   atlas page spills into a second, and two pages are two textures: they
+///   were two primitives before this type and they still are. Batching across
+///   them would put one texture's quads in the other's mesh.
+/// * **Anything drawn between two quads.** The grid's second walk interleaves
+///   raster and vector tiles, and a vector tile's geometry goes in where it
+///   goes in. [`Self::take`] is what the caller hands over first.
+///
+/// # The cull is epaint's, applied here
+///
+/// A batched mesh is bounded by the union of its quads, so epaint's coarse
+/// cull would KEEP a quad it drops today -- invisible either way, since the
+/// scissor takes it, but it would put vertices in the stream that were not
+/// there. So the same test is made here, per quad, against the same clip:
+/// [`quad_bounds`].
+#[derive(Default)]
+pub struct RasterQuads {
+    /// The run being accumulated: `None` before the first quad and after
+    /// every hand-over. An empty `Mesh` carries `TextureId::default()`,
+    /// which is the font atlas and a texture a tile could in principle be
+    /// in, so emptiness is spelled here rather than read off the mesh.
+    run: Option<egui::epaint::Mesh>,
+}
+
+impl RasterQuads {
+    /// Add one tile's quad, handing back the run it ended, if any.
+    ///
+    /// The returned shape is the run that was open **before** this quad and
+    /// must be given to the painter before this quad's own run is: the
+    /// caller adds it immediately, and the new run is not handed over until
+    /// a later `push`, [`Self::take`] or [`Self::finish`].
+    ///
+    /// A quad epaint would cull is dropped here and ends no run -- exactly as
+    /// it reaches the renderer today, where the cull happens after the shape
+    /// is submitted and so cannot separate two shapes either.
+    pub fn push(
+        &mut self,
+        texture: egui::TextureId,
+        rect: egui::Rect,
+        uv: egui::Rect,
+        tint: egui::Color32,
+        clip: egui::Rect,
+    ) -> Option<egui::Shape> {
+        if !clip.intersects(quad_bounds(rect)) {
+            return None;
+        }
+        let ended = match &self.run {
+            Some(run) if run.texture_id == texture => None,
+            Some(_) => self.take(),
+            None => None,
+        };
+        self.run
+            .get_or_insert_with(|| egui::epaint::Mesh::with_texture(texture))
+            .add_rect_with_uv(rect, uv, tint);
+        ended
+    }
+
+    /// Hand over the open run because something else is about to be drawn.
+    pub fn take(&mut self) -> Option<egui::Shape> {
+        self.run.take().map(|run| egui::Shape::Mesh(run.into()))
+    }
+
+    /// The last run of the pass, or `None` when every quad was culled or
+    /// there were none.
+    pub fn finish(mut self) -> Option<egui::Shape> {
+        self.take()
+    }
+}
+
 /// A consecutive span of one tile's runs, at one placement, on one frame.
 ///
 /// **A span rather than a run** because every run of a tile shares this

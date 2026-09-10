@@ -1337,7 +1337,9 @@ pub fn tile_zoom_for(zoom: f64, whole_zoom: bool, zoom_bias: u8, source_max_zoom
 /// 10x7 tiles where 9x6 are seen — and each of the extra 16 costs a
 /// `Tiles::at` call, an HTTP request through `request_once`, an LRU probe, a
 /// `TextureHandle` clone and drop (a write lock on the texture manager each),
-/// and a fully clipped `Painter::image`.
+/// and a placement epaint's coarse cull then throws away
+/// (`crate::tile_mesh::RasterQuads` makes that cull before the quad is
+/// batched, so what an off-glass cell costs today stops at the cache probe).
 ///
 /// **Longitude is not clamped; latitude is.** `Projector::unproject` is linear
 /// in pixel x and folds nothing, so a viewport straddling the antimeridian reads

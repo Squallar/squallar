@@ -1168,10 +1168,11 @@ pub(crate) fn decode_archive_tile(
         ArchiveTileKind::Hillshade => {
             let remapped = crate::terrain::decode_hillshade_tile(bytes)?;
             // **Through the atlas, not straight to a texture.** The hillshade
-            // is a whole tile layer drawn one `Painter::image` per cell under
-            // one clip rect, so a texture each is a primitive, a draw and a
-            // bind group each; see [`crate::raster_atlas`] for the measured
-            // figure and for what it falls back to.
+            // is a whole tile layer drawn under one clip rect, so a texture
+            // each is a primitive, a draw and a bind group each; see
+            // [`crate::raster_atlas`] for the measured figure and for what it
+            // falls back to. The page a tile lands in is also what decides
+            // how long a run `crate::tile_mesh::RasterQuads` can batch.
             Ok(Tile::Raster(crate::raster_atlas::place(
                 ctx,
                 "terrain-hillshade",
