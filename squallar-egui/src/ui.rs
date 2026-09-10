@@ -2392,6 +2392,16 @@ impl Gui {
     }
 
     #[cfg(test)]
+    pub(crate) fn chrome_galleys_for_test(&self) -> &crate::chrome_galley::ChromeGalleys {
+        &self.chrome_galleys
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_chrome_galley_bypass_for_test(&mut self, bypass: bool) {
+        self.chrome_galleys.set_bypass(bypass);
+    }
+
+    #[cfg(test)]
     pub(crate) fn stack_for_test(&self) -> &StackProbe {
         &self.probes.last_stack
     }

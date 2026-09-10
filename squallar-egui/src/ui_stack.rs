@@ -662,11 +662,12 @@ impl super::Gui {
                     // The 👁 eye. Both halves through `write_pane_overlay`,
                     // on the *taken* pane — `set_active_pane_overlay` would
                     // write the placeholder in the vector.
-                    let eye_text = if enabled {
-                        egui::RichText::new("\u{1f441}").size(EYE_GLYPH_SIZE)
+                    let eye_spec = if enabled {
+                        crate::chrome_galley::Spec::sized("\u{1f441}", EYE_GLYPH_SIZE)
                     } else {
-                        egui::RichText::new("-").size(EYE_GLYPH_SIZE).weak()
+                        crate::chrome_galley::Spec::sized_weak("-", EYE_GLYPH_SIZE)
                     };
+                    let eye_text = self.chrome_galleys.label(ui, eye_spec);
                     let eye = ui
                         .add(
                             egui::Button::new(eye_text)
@@ -739,19 +740,24 @@ impl super::Gui {
                             // rather than no control at all — an absent affordance
                             // reads as an oversight, and one that silently does
                             // nothing is worse than both.
+                            let remove_color = if refusal.is_none() {
+                                ui.visuals().weak_text_color()
+                            } else {
+                                ui.visuals().widgets.noninteractive.fg_stroke.color
+                            };
+                            let remove_text = self.chrome_galleys.label(
+                                ui,
+                                crate::chrome_galley::Spec::sized_color(
+                                    REMOVE_LABEL,
+                                    REMOVE_GLYPH_SIZE,
+                                    remove_color,
+                                ),
+                            );
                             let remove = ui.add_enabled(
                                 refusal.is_none(),
-                                egui::Button::new(
-                                    egui::RichText::new(REMOVE_LABEL)
-                                        .size(REMOVE_GLYPH_SIZE)
-                                        .color(if refusal.is_none() {
-                                            ui.visuals().weak_text_color()
-                                        } else {
-                                            ui.visuals().widgets.noninteractive.fg_stroke.color
-                                        }),
-                                )
-                                .frame(false)
-                                .min_size(egui::Vec2::splat(CONTROL_SIDE)),
+                                egui::Button::new(remove_text)
+                                    .frame(false)
+                                    .min_size(egui::Vec2::splat(CONTROL_SIDE)),
                             );
                             let remove =
                                 remove.hover_text_lazy(|| format!("Remove {name} from this pane"));

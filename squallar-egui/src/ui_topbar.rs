@@ -47,6 +47,22 @@ const PANE_TIGHT_LABEL: &str = "Pane";
 /// egui bundles (checked against `Fonts::has_glyph`, which is what
 /// `ui_glyphs`' coverage test walks), and a tofu box is worse than a word.
 /// Roomy and tight spellings, the same pairing the captions above use.
+/// The digit a pane segment carries.
+///
+/// A `&'static str` rather than `format!("{count}")`, which allocated a
+/// `String` per segment per frame for a number that is bounded by
+/// [`crate::ui_layout::WidthClass::max_panes_absolute`] and cannot change.
+/// The table has to cover that constant, and the assert below is what says so
+/// at compile time rather than by a blank segment on the glass.
+fn pane_count_label(count: usize) -> &'static str {
+    const LABELS: [&str; 9] = ["", "1", "2", "3", "4", "5", "6", "7", "8"];
+    const _: () = assert!(
+        crate::ui_layout::MAX_PANES_ABSOLUTE < LABELS.len(),
+        "a pane segment exists that this table has no digit for",
+    );
+    LABELS[count]
+}
+
 const SPLIT_LABELS: [(crate::pane::SplitOrientation, &str, &str, &str); 3] = [
     (
         crate::pane::SplitOrientation::Auto,
@@ -115,7 +131,11 @@ impl super::Gui {
                 if !compact {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let insp_open = self.insp_open;
-                        let inspector = ui.selectable_label(insp_open, INSPECTOR_TOGGLE_LABEL);
+                        let inspector_text = self.chrome_galleys.label(
+                            ui,
+                            crate::chrome_galley::Spec::plain(INSPECTOR_TOGGLE_LABEL),
+                        );
+                        let inspector = ui.add(egui::Button::selectable(insp_open, inspector_text));
                         #[cfg(test)]
                         {
                             probe.inspector_toggle = (inspector.rect, insp_open);
@@ -131,7 +151,10 @@ impl super::Gui {
                         }
 
                         let armed = self.section_draw_armed();
-                        let section = ui.selectable_label(armed, SECTION_TOGGLE_LABEL);
+                        let section_text = self
+                            .chrome_galleys
+                            .label(ui, crate::chrome_galley::Spec::plain(SECTION_TOGGLE_LABEL));
+                        let section = ui.add(egui::Button::selectable(armed, section_text));
                         #[cfg(test)]
                         {
                             probe.section_arm = (section.rect, armed);
@@ -141,7 +164,10 @@ impl super::Gui {
                         }
 
                         let region_armed = self.region_pick_armed();
-                        let region = ui.selectable_label(region_armed, REGION_TOGGLE_LABEL);
+                        let region_text = self
+                            .chrome_galleys
+                            .label(ui, crate::chrome_galley::Spec::plain(REGION_TOGGLE_LABEL));
+                        let region = ui.add(egui::Button::selectable(region_armed, region_text));
                         #[cfg(test)]
                         {
                             probe.region_arm = (region.rect, region_armed);
@@ -151,8 +177,11 @@ impl super::Gui {
                         }
 
                         let offline_armed = self.download_pick_armed();
+                        let offline_text = self
+                            .chrome_galleys
+                            .label(ui, crate::chrome_galley::Spec::plain(OFFLINE_TOGGLE_GLYPH));
                         let offline = ui
-                            .selectable_label(offline_armed, OFFLINE_TOGGLE_GLYPH)
+                            .add(egui::Button::selectable(offline_armed, offline_text))
                             .hover_text(OFFLINE_TOGGLE_HINT);
                         #[cfg(test)]
                         {
@@ -214,8 +243,11 @@ impl super::Gui {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if !collapsed {
                 let armed = self.section_draw_armed();
+                let section_text = self
+                    .chrome_galleys
+                    .label(ui, crate::chrome_galley::Spec::plain("\u{2215}"));
                 let section = ui
-                    .selectable_label(armed, "\u{2215}")
+                    .add(egui::Button::selectable(armed, section_text))
                     .hover_text("Draw cross-section");
                 #[cfg(test)]
                 {
@@ -229,8 +261,11 @@ impl super::Gui {
                 }
 
                 let region_armed = self.region_pick_armed();
+                let region_text = self
+                    .chrome_galleys
+                    .label(ui, crate::chrome_galley::Spec::plain("\u{26f6}"));
                 let region = ui
-                    .selectable_label(region_armed, "\u{26f6}")
+                    .add(egui::Button::selectable(region_armed, region_text))
                     .hover_text("Pick 3D region");
                 #[cfg(test)]
                 {
@@ -244,8 +279,11 @@ impl super::Gui {
                 }
 
                 let offline_armed = self.download_pick_armed();
+                let offline_text = self
+                    .chrome_galleys
+                    .label(ui, crate::chrome_galley::Spec::plain(OFFLINE_TOGGLE_GLYPH));
                 let offline = ui
-                    .selectable_label(offline_armed, OFFLINE_TOGGLE_GLYPH)
+                    .add(egui::Button::selectable(offline_armed, offline_text))
                     .hover_text(OFFLINE_TOGGLE_HINT);
                 #[cfg(test)]
                 {
@@ -341,7 +379,10 @@ impl super::Gui {
 
                     render_wordmark(ui);
 
-                    let menu_button = ui.button(MENU_BUTTON_LABEL);
+                    let menu_text = self
+                        .chrome_galleys
+                        .label(ui, crate::chrome_galley::Spec::plain(MENU_BUTTON_LABEL));
+                    let menu_button = ui.add(egui::Button::new(menu_text));
                     #[cfg(test)]
                     {
                         probe.menu_button = menu_button.rect;
@@ -398,7 +439,10 @@ impl super::Gui {
                     ui.separator();
 
                     let layers_open = self.layers_panel_visible();
-                    let layers = ui.selectable_label(layers_open, LAYERS_TOGGLE_LABEL);
+                    let layers_text = self
+                        .chrome_galleys
+                        .label(ui, crate::chrome_galley::Spec::plain(LAYERS_TOGGLE_LABEL));
+                    let layers = ui.add(egui::Button::selectable(layers_open, layers_text));
                     #[cfg(test)]
                     {
                         probe.layers_toggle = (layers.rect, layers_open);
@@ -441,10 +485,11 @@ impl super::Gui {
         for count in 1..=crate::ui_layout::WidthClass::max_panes_absolute() {
             let selected = self.pane_layout.pane_count == count;
             let enabled = count <= offered;
-            let button = ui.add_enabled(
-                enabled,
-                egui::Button::selectable(selected, format!("{count}")),
+            let count_text = self.chrome_galleys.label(
+                ui,
+                crate::chrome_galley::Spec::plain(pane_count_label(count)),
             );
+            let button = ui.add_enabled(enabled, egui::Button::selectable(selected, count_text));
             #[cfg(test)]
             self.probes.last_pane_options.push(super::PaneOptionProbe {
                 count,
@@ -463,8 +508,11 @@ impl super::Gui {
             for (orientation, roomy_label, tight_label, hover) in SPLIT_LABELS {
                 let selected = self.split_orientation == orientation;
                 let label = if roomy { roomy_label } else { tight_label };
+                let split_text = self
+                    .chrome_galleys
+                    .label(ui, crate::chrome_galley::Spec::plain(label));
                 let button = ui
-                    .add(egui::Button::selectable(selected, label))
+                    .add(egui::Button::selectable(selected, split_text))
                     .hover_text(hover);
                 #[cfg(test)]
                 self.probes
@@ -488,8 +536,12 @@ impl super::Gui {
             }
             for i in 0..self.pane_layout.pane_count {
                 let selected = self.active_pane == i;
+                let pane_text = self.chrome_galleys.label(
+                    ui,
+                    crate::chrome_galley::Spec::plain(pane_count_label(i + 1)),
+                );
                 if ui
-                    .selectable_label(selected, format!("{}", i + 1))
+                    .add(egui::Button::selectable(selected, pane_text))
                     .clicked()
                     && !selected
                 {

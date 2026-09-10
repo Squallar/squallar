@@ -2,6 +2,10 @@
 
 use squallar_device_profile::budget::{MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
 
+/// The most panes any width class offers, as a constant a `const` assert can
+/// read — [`WidthClass::max_panes_absolute`] is the same number as a function.
+pub(crate) const MAX_PANES_ABSOLUTE: usize = MAX_PANES_DESKTOP;
+
 /// Breakpoint (points) below which the content area is [`WidthClass::Compact`].
 const COMPACT_MAX_WIDTH: f32 = 600.0;
 /// Breakpoint (points) at and above which the content area is
@@ -53,7 +57,7 @@ impl WidthClass {
 
     /// The largest pane count any device may hold, used when *loading* a config.
     pub(crate) fn max_panes_absolute() -> usize {
-        MAX_PANES_DESKTOP
+        MAX_PANES_ABSOLUTE
     }
 }
 

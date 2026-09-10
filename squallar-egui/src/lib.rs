@@ -32,6 +32,7 @@ pub mod basemap_style;
 /// draw instead of one draw each.
 /// Textures whose first upload carries no information — see the module.
 pub mod blank_page;
+pub(crate) mod chrome_galley;
 pub(crate) mod field_facts;
 /// The 3D floor path's always-on counters: strips painted, mirrors rendered.
 pub mod floor_ledger;

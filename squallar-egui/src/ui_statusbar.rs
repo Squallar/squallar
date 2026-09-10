@@ -95,8 +95,11 @@ impl super::Gui {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
 
+                        let collapse_text = self
+                            .chrome_galleys
+                            .label(ui, crate::chrome_galley::Spec::plain(COLLAPSE_LABEL));
                         let collapse = ui
-                            .button(COLLAPSE_LABEL)
+                            .add(egui::Button::new(collapse_text))
                             .hover_text("Collapse the status bar");
                         #[cfg(test)]
                         {
@@ -106,9 +109,12 @@ impl super::Gui {
                             self.statusbar_collapsed = true;
                         }
 
+                        let refresh_text = self
+                            .chrome_galleys
+                            .label(ui, crate::chrome_galley::Spec::plain("\u{21bb}"));
                         let refresh_button = ui.add_enabled(
                             !self.fetching(),
-                            egui::Button::new("\u{21bb}").frame(false),
+                            egui::Button::new(refresh_text).frame(false),
                         );
                         #[cfg(test)]
                         {

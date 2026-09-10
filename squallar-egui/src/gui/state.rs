@@ -104,6 +104,10 @@ pub struct Gui {
     /// the same reason nothing else here is a thread-local: one owner, visible
     /// lifetime, and a test can build its own.
     pub(super) galley_cache: walkers::GalleyCache,
+    /// The chrome's own button labels, laid out once and kept between frames.
+    /// Owned here for the same reason `galley_cache` is: what it saves only
+    /// exists across frames. See [`crate::chrome_galley::ChromeGalleys`].
+    pub(super) chrome_galleys: crate::chrome_galley::ChromeGalleys,
     /// The point pass's text, kept tessellated per pane and layer between
     /// frames. Owned here for the same reason the galley memo is: it exists to
     /// outlive the frame. See [`crate::point_painter::PointTextMeshes`].
@@ -679,6 +683,7 @@ impl Gui {
             color_scale_orientation: ColorScaleOrientation::default(),
             map_pane_geo: HashMap::new(),
             galley_cache: walkers::GalleyCache::default(),
+            chrome_galleys: crate::chrome_galley::ChromeGalleys::default(),
             point_text_meshes: crate::point_painter::PointTextMeshes::default(),
             label_cache: crate::label_cache::LabelCache::default(),
             floor_strips: map::FloorStrips::default(),

@@ -857,7 +857,12 @@ impl super::Gui {
             ui,
             egui::Layout::right_to_left(egui::Align::Center),
             |ui| {
-                let collapse = ui.button("\u{23f7}").on_hover_text("Collapse the timeline");
+                let collapse_text = self
+                    .chrome_galleys
+                    .label(ui, crate::chrome_galley::Spec::plain("\u{23f7}"));
+                let collapse = ui
+                    .add(egui::Button::new(collapse_text))
+                    .on_hover_text("Collapse the timeline");
                 #[cfg(test)]
                 {
                     self.probes.last_timeline.collapse = collapse.rect;
@@ -866,8 +871,11 @@ impl super::Gui {
                     self.timeline_collapsed = true;
                 }
 
+                let expander_text = self
+                    .chrome_galleys
+                    .label(ui, crate::chrome_galley::Spec::plain("..."));
                 let expander = ui
-                    .selectable_label(self.timeline_row2, "...")
+                    .add(egui::Button::selectable(self.timeline_row2, expander_text))
                     .on_hover_text("Loop settings");
                 #[cfg(test)]
                 {
@@ -978,10 +986,16 @@ impl super::Gui {
             viewing_live && !self.panes[pane_idx].depicts_future(chrono::Utc::now().naive_utc());
 
         let live_button = if viewing_live {
-            egui::Button::new("\u{23fa} Live")
+            let text = self
+                .chrome_galleys
+                .label(ui, crate::chrome_galley::Spec::plain("\u{23fa} Live"));
+            egui::Button::new(text)
         } else {
-            egui::Button::new(egui::RichText::new("\u{23fa} Live").color(egui::Color32::WHITE))
-                .fill(egui::Color32::from_rgb(200, 50, 50))
+            let text = self.chrome_galleys.label(
+                ui,
+                crate::chrome_galley::Spec::colored("\u{23fa} Live", egui::Color32::WHITE),
+            );
+            egui::Button::new(text).fill(egui::Color32::from_rgb(200, 50, 50))
         };
         let live = ui.add(live_button);
         #[cfg(test)]
@@ -993,7 +1007,12 @@ impl super::Gui {
         }
 
         let step = self.panes[pane_idx].time.step;
-        let back = ui.button("\u{23f4}").on_hover_text("Back one step");
+        let back_text = self
+            .chrome_galleys
+            .label(ui, crate::chrome_galley::Spec::plain("\u{23f4}"));
+        let back = ui
+            .add(egui::Button::new(back_text))
+            .on_hover_text("Back one step");
         #[cfg(test)]
         {
             self.probes.last_timeline.back = back.rect;
@@ -1012,8 +1031,11 @@ impl super::Gui {
             }
         }
 
+        let fwd_text = self
+            .chrome_galleys
+            .label(ui, crate::chrome_galley::Spec::plain("\u{23f5}"));
         let fwd = ui
-            .add_enabled(!at_live_edge, egui::Button::new("\u{23f5}"))
+            .add_enabled(!at_live_edge, egui::Button::new(fwd_text))
             .on_hover_text("Forward one step");
         #[cfg(test)]
         {
@@ -1079,10 +1101,13 @@ impl super::Gui {
 
         let can_loop = self.panes[pane_idx].can_loop();
         let loop_active = self.panes[pane_idx].transport_state().is_active();
+        let loop_text = self
+            .chrome_galleys
+            .label(ui, crate::chrome_galley::Spec::plain("\u{221e}"));
         let loop_toggle = ui
             .add_enabled(
                 can_loop,
-                egui::Button::new("\u{221e}")
+                egui::Button::new(loop_text)
                     .selected(loop_active)
                     .min_size(ui.spacing().interact_size),
             )
@@ -1581,7 +1606,12 @@ impl super::Gui {
                 // a row of its own where the tuning pair did not — the same
                 // width class, decided once.
                 ui.horizontal(|ui| {
-                    let prev = ui.button("\u{23ee}").on_hover_text("Previous frame");
+                    let prev_text = self
+                        .chrome_galleys
+                        .label(ui, crate::chrome_galley::Spec::plain("\u{23ee}"));
+                    let prev = ui
+                        .add(egui::Button::new(prev_text))
+                        .on_hover_text("Previous frame");
                     #[cfg(test)]
                     {
                         row2.prev = prev.rect;
@@ -1596,12 +1626,15 @@ impl super::Gui {
                     }
 
                     let play_label = if playing { "\u{23f8}" } else { "\u{23f5}" };
+                    let play_text = self
+                        .chrome_galleys
+                        .label(ui, crate::chrome_galley::Spec::plain(play_label));
                     // `on_hover_ui`, not `on_hover_text`: the latter takes its
                     // text ALREADY built, so every frame the transport's second
                     // row was open allocated this String for a tooltip nobody
                     // was hovering. egui runs this body only while it is up.
                     let play = ui
-                        .add_enabled(!rendering || playing, egui::Button::new(play_label))
+                        .add_enabled(!rendering || playing, egui::Button::new(play_text))
                         .on_hover_ui(|ui| {
                             ui.set_max_width(ui.spacing().tooltip_width);
                             ui.add(egui::Label::new(play_hover(
@@ -1618,7 +1651,12 @@ impl super::Gui {
                         }
                     }
 
-                    let next = ui.button("\u{23ed}").on_hover_text("Next frame");
+                    let next_text = self
+                        .chrome_galleys
+                        .label(ui, crate::chrome_galley::Spec::plain("\u{23ed}"));
+                    let next = ui
+                        .add(egui::Button::new(next_text))
+                        .on_hover_text("Next frame");
                     #[cfg(test)]
                     {
                         row2.next = next.rect;

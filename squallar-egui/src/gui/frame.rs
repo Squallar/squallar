@@ -106,6 +106,11 @@ impl Gui {
         // It costs one `Context::fonts` — a write lock on the context — and
         // removes up to three of the same on the pane walk.
         self.galley_cache.begin_frame(ctx);
+        // The chrome's own kept labels ride the same reading: a galley is a
+        // galley whether a place name or a button carries it, and the
+        // generation above is the only thing that says the raster moved.
+        let atlas_generation = self.galley_cache.generation();
+        self.chrome_galleys.begin_frame(ctx, atlas_generation);
 
         if !self.settings_visible() {
             self.storm_motion_editing = false;
