@@ -248,6 +248,18 @@ pub(crate) struct PointTextMeshes {
     hits: u64,
     recycled_meshes: u64,
     recycled_shapes: u64,
+    recycled_points: u64,
+}
+
+/// **A retired build's buffers**, for the build replacing it to fill.
+///
+/// Two of them, because a build fills two lists of exactly the size the last
+/// build's were: the mesh, and the culled points it wrote down. See
+/// [`PointTextMeshes::retire`].
+#[derive(Default)]
+pub(crate) struct Retired {
+    pub(crate) mesh: egui::Mesh,
+    pub(crate) points: Vec<(u32, Pos2)>,
 }
 
 /// One pane-and-layer's kept text: the key it was built under, the mesh,
@@ -313,7 +325,7 @@ impl PointTextMeshes {
         }
     }
 
-    /// This pane-and-layer's retired mesh, emptied but keeping its buffers,
+    /// This pane-and-layer's retired build, emptied but keeping its buffers,
     /// for the build that is replacing it to fill.
     ///
     /// [`crate::label_cache::LabelCache::recycle`]'s reasoning verbatim, on
@@ -325,26 +337,38 @@ impl PointTextMeshes {
     /// wasted allocation, never a mutation of geometry something is still
     /// drawing.
     ///
+    /// **Both buffers, not just the mesh.** The point list is the same working
+    /// set fixed for the same pass: a rebuild keeps whichever of the layer's
+    /// points survived the cull, which is a number that moves by a handful
+    /// between one frame of a pan and the next, and it used to grow that list
+    /// from `Vec::new()` by doubling on every rebuilding frame while the list
+    /// the last build wrote — already the right size — went back to the
+    /// allocator underneath it.
+    ///
     /// The entry is REMOVED, so a caller that takes the buffers must store a
     /// new build; the call site is the miss path it is about to store from.
-    pub(crate) fn recycle(&mut self, pane: usize, layer: &LayerId) -> egui::Mesh {
-        let Some(mesh) = self
-            .entries
-            .remove(&(pane, layer.clone()))
-            .and_then(|k| k.mesh)
-        else {
-            return egui::Mesh::default();
+    pub(crate) fn retire(&mut self, pane: usize, layer: &LayerId) -> Retired {
+        let Some(kept) = self.entries.remove(&(pane, layer.clone())) else {
+            return Retired::default();
         };
-        let Ok(mut mesh) = Arc::try_unwrap(mesh) else {
-            return egui::Mesh::default();
+        let mut points = kept.points;
+        if points.capacity() > 0 {
+            self.recycled_points += 1;
+        }
+        points.clear();
+        let mesh = match kept.mesh.map(Arc::try_unwrap) {
+            Some(Ok(mut mesh)) => {
+                // Not `Mesh::clear`, which replaces the vertex buffer with a
+                // fresh empty one and so throws away the whole point of this.
+                mesh.vertices.clear();
+                mesh.indices.clear();
+                mesh.texture_id = egui::TextureId::default();
+                self.recycled_meshes += 1;
+                mesh
+            }
+            _ => egui::Mesh::default(),
         };
-        // Not `Mesh::clear`, which replaces the vertex buffer with a fresh
-        // empty one and so throws away the whole point of this.
-        mesh.vertices.clear();
-        mesh.indices.clear();
-        mesh.texture_id = egui::TextureId::default();
-        self.recycled_meshes += 1;
-        mesh
+        Retired { mesh, points }
     }
 
     pub(crate) fn store(
@@ -415,6 +439,27 @@ impl PointTextMeshes {
     #[cfg(test)]
     pub(crate) fn recycled_shapes(&self) -> u64 {
         self.recycled_shapes
+    }
+
+    /// Builds that filled the previous build's culled-point list instead of a
+    /// fresh one.
+    #[cfg(test)]
+    pub(crate) fn recycled_points(&self) -> u64 {
+        self.recycled_points
+    }
+
+    /// This pane-and-layer's stored culled-point list, to read its capacity
+    /// back or to grow it — the only way a test outside this module can tell a
+    /// refilled buffer from a fresh one of the same length.
+    #[cfg(test)]
+    pub(crate) fn stored_points_mut(
+        &mut self,
+        pane: usize,
+        layer: &LayerId,
+    ) -> Option<&mut Vec<(u32, Pos2)>> {
+        self.entries
+            .get_mut(&(pane, layer.clone()))
+            .map(|kept| &mut kept.points)
     }
 }
 
@@ -672,7 +717,7 @@ mod point_text_tests {
     /// The point pass rebuilds on nearly every frame of a pan, and each build
     /// used to take a fresh vertex buffer, an index buffer and a shape list
     /// from the allocator and give all three back a frame later. They now come
-    /// from the build being replaced — [`PointTextMeshes::recycle`] and
+    /// from the build being replaced — [`PointTextMeshes::retire`] and
     /// [`PointTextMeshes::take_scratch`]. What must not change is the mesh: the
     /// same shapes tessellated into recycled buffers have to be vertex for
     /// vertex, index for index and texture for texture what they tessellate to
@@ -708,7 +753,9 @@ mod point_text_tests {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN);
         let projector = walkers::Projector::new(rect, &memory, walkers::lat_lon(35.0, -97.0));
         let key = PointTextKey::new(&galleys, &projector, rect, 1, 7.0, false, 1.0);
-        meshes.store(0, &layer, key, Some(fresh.clone()), Vec::new());
+        let mut parked_points = Vec::with_capacity(64);
+        parked_points.extend((0..40).map(|i| (i, Pos2::new(i as f32, 0.0))));
+        meshes.store(0, &layer, key, Some(fresh.clone()), parked_points);
         // What the fresh build produced, read out before the reference is let
         // go: the paint list that held the painter's clone has been consumed,
         // as it is by `Context::tessellate` at the end of the frame it was
@@ -718,12 +765,28 @@ mod point_text_tests {
         let want_texture = fresh.texture_id;
         drop(fresh);
 
-        let recycled = meshes.recycle(0, &layer);
+        let retired = meshes.retire(0, &layer);
         assert_eq!(meshes.recycled_meshes(), 1, "the buffers were not taken");
+        assert_eq!(meshes.recycled_points(), 1, "the point list was not taken");
+        let recycled = retired.mesh;
         assert!(recycled.is_empty(), "a recycled mesh must arrive emptied");
         assert!(
             recycled.vertices.capacity() > 0 && recycled.indices.capacity() > 0,
             "a recycled mesh must arrive with its buffers, not with fresh ones"
+        );
+        // The point list, held to the same standard as the mesh above and for
+        // the same reason: a counter says the path RAN, and only the capacity
+        // says the allocator was spared. A `retire` that bumped the counter and
+        // handed back `Vec::new()` would read green on the counter alone.
+        assert!(
+            retired.points.is_empty(),
+            "a recycled point list must arrive emptied"
+        );
+        assert!(
+            retired.points.capacity() >= 40,
+            "a recycled point list must arrive with the buffer the build it \
+             replaces filled ({} entries of capacity), not with a fresh one",
+            retired.points.capacity()
         );
 
         let mut scratch = meshes.take_scratch();

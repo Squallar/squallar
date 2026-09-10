@@ -3859,9 +3859,18 @@ fn render_per_frame_overlay(
     // The list the last build filled, emptied and kept; see
     // `PointTextMeshes::take_scratch`.
     let mut sink: Vec<egui::Shape> = point_text.take_scratch();
+    // The build this pass is about to replace, retired here rather than after
+    // the loop: its point list is a buffer the loop below is about to refill,
+    // and a list taken after the loop has run is a list the loop already grew
+    // from empty. See `PointTextMeshes::retire`.
+    let mut retired = if key.is_some() && kept_mesh.is_none() {
+        point_text.retire(pf.pane_idx, pf.id)
+    } else {
+        crate::point_painter::Retired::default()
+    };
     // Where this pass put every point that survived the cull, for the passes
     // that find this build still current. Filled only on a build.
-    let mut placed: Vec<(u32, egui::Pos2)> = Vec::new();
+    let mut placed: Vec<(u32, egui::Pos2)> = std::mem::take(&mut retired.points);
     if kept_mesh.is_none() {
         // The turn this pane is looking at, once for the whole table. Every
         // point below is carried into it **before** the geo cull and the
@@ -3918,12 +3927,11 @@ fn render_per_frame_overlay(
             Some(mesh) => mesh,
             None => {
                 // The build this one replaces owns buffers of exactly the
-                // right size; see `PointTextMeshes::recycle`.
-                let recycled = point_text.recycle(pf.pane_idx, pf.id);
+                // right size; see `PointTextMeshes::retire`.
                 let mesh = crate::point_painter::tessellate_text_shapes_drain(
                     ui.ctx(),
                     &mut sink,
-                    recycled,
+                    std::mem::take(&mut retired.mesh),
                 );
                 point_text.store(
                     pf.pane_idx,

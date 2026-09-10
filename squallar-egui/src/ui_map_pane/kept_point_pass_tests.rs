@@ -345,8 +345,16 @@ fn a_kept_build_answers_the_click_and_draws_the_same_bytes() {
 ///
 /// A zoom is what makes the second pass a rebuild rather than a hit — it is a
 /// term of the key, and it is what the wheel half of the gesture moves. The
-/// first build has nothing to take and must say so; the second must take both
-/// the mesh's buffers and the shape list's, which is the whole of the saving.
+/// first build has nothing to take and must say so; the second must take
+/// **all three** — the mesh's buffers, the shape list's, and the culled-point
+/// list's — which is the whole of the saving.
+///
+/// The point list is counted here because it was the one this pin did not
+/// cover: the mesh and the shape list were recycled and the list of points the
+/// cull kept was minted from `Vec::new()` on every rebuilding frame of a pan,
+/// while the previous build's — already exactly the right size — went back to
+/// the allocator underneath it. A pin that names two of three buffers reads
+/// green on a pass that leaks the third.
 #[test]
 fn a_rebuild_takes_the_previous_builds_buffers() {
     let ctx = egui::Context::default();
@@ -361,6 +369,7 @@ fn a_rebuild_takes_the_previous_builds_buffers() {
         "the first build has nothing to take"
     );
     assert_eq!(meshes.recycled_shapes(), 0);
+    assert_eq!(meshes.recycled_points(), 0);
 
     let _ = pass_at(&ctx, &mut galleys, &mut meshes, &ON_PANE, None, 7.5);
     assert_eq!(meshes.builds(), 2, "a moved zoom is a rebuild, not a hit");
@@ -373,5 +382,32 @@ fn a_rebuild_takes_the_previous_builds_buffers() {
         meshes.recycled_shapes(),
         1,
         "the rebuild collected into a fresh shape list"
+    );
+    assert_eq!(
+        meshes.recycled_points(),
+        1,
+        "the rebuild grew a fresh list of culled points while the previous \
+         build's went back to the allocator"
+    );
+
+    // **And the pass FILLED it**, which the counter above cannot say: a pass
+    // that retires the buffer and then collects into `Vec::new()` anyway bumps
+    // that counter and reads green. So the parked list is given a capacity no
+    // fresh `Vec` growing to this fixture's handful of points could reach, and
+    // the next rebuild has to still be holding it.
+    meshes
+        .stored_points_mut(0, &known::METAR)
+        .expect("the build stored a list")
+        .reserve(4096);
+    let _ = pass_at(&ctx, &mut galleys, &mut meshes, &ON_PANE, None, 8.0);
+    assert_eq!(meshes.builds(), 3, "a moved zoom is a rebuild, not a hit");
+    let held = meshes
+        .stored_points_mut(0, &known::METAR)
+        .expect("the rebuild stored a list")
+        .capacity();
+    assert!(
+        held >= 4096,
+        "the rebuild stored a list of capacity {held}: it collected into a \
+         fresh `Vec` and gave the retired buffer back to the allocator"
     );
 }
