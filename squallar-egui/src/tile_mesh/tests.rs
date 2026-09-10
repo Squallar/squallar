@@ -829,7 +829,10 @@ fn a_batched_background_run_tessellates_to_the_same_bytes_as_one_shape_per_tile(
     let mut batched = HoistedBackgrounds::default();
     let hoisted = pieces
         .iter()
-        .filter(|piece| batched.push(&placed_background(**piece, fill), **piece, PPP, clip))
+        .filter(|piece| {
+            let placed = placed_background(**piece, fill);
+            batched.push(placed.rect, placed.fill, **piece, PPP, clip)
+        })
         .count();
     assert_eq!(
         hoisted,

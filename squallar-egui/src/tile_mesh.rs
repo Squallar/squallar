@@ -1133,7 +1133,7 @@ pub fn background_within(
     piece: egui::Rect,
     pixels_per_point: f32,
 ) -> Option<egui::Shape> {
-    let (within, fill) = background_quad_within(placed, piece, pixels_per_point)?;
+    let (within, fill) = background_quad_within(placed.rect, placed.fill, piece, pixels_per_point)?;
     let mut mesh = egui::epaint::Mesh::default();
     mesh.add_colored_rect(within, fill);
     Some(egui::Shape::Mesh(mesh.into()))
@@ -1148,18 +1148,16 @@ pub fn background_within(
 /// and that function is now this one plus the shape it wraps it in, so the
 /// two cannot answer differently.
 pub fn background_quad_within(
-    placed: &egui::epaint::RectShape,
+    placed: egui::Rect,
+    fill: egui::Color32,
     piece: egui::Rect,
     pixels_per_point: f32,
 ) -> Option<(egui::Rect, egui::Color32)> {
-    let within = placed
-        .rect
-        .intersect(piece)
-        .round_to_pixels(pixels_per_point);
+    let within = placed.intersect(piece).round_to_pixels(pixels_per_point);
     if !within.is_positive() {
         return None;
     }
-    Some((within, placed.fill))
+    Some((within, fill))
 }
 
 /// Every hoisted background quad of one tile pass, in one mesh.
@@ -1204,12 +1202,14 @@ impl HoistedBackgrounds {
     /// today for a shape epaint goes on to cull.
     pub fn push(
         &mut self,
-        placed: &egui::epaint::RectShape,
+        placed: egui::Rect,
+        fill: egui::Color32,
         piece: egui::Rect,
         pixels_per_point: f32,
         clip: egui::Rect,
     ) -> bool {
-        let Some((within, fill)) = background_quad_within(placed, piece, pixels_per_point) else {
+        let Some((within, fill)) = background_quad_within(placed, fill, piece, pixels_per_point)
+        else {
             return false;
         };
         if clip.intersects(within) {

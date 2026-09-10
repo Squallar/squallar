@@ -328,7 +328,12 @@ pub(super) fn draw_tile_layer(
     // 1920x1080 pane: the ground's largest remaining primitive source once
     // its callbacks were batched). The second walk draws the tiles. Why the
     // hoist changes no pixel is `hoist_background`'s to say.
-    let mut answered: Vec<(egui::Rect, GroundPiece, Background)> = Vec::with_capacity(span.tiles());
+    let mut answered: Vec<(
+        egui::Rect,
+        GroundPiece,
+        Background,
+        Option<egui::emath::TSTransform>,
+    )> = Vec::with_capacity(span.tiles());
     // Every hoisted rectangle of this pass, in one mesh rather than one
     // `Shape::Mesh` and one `Painter::add` each. See
     // [`crate::tile_mesh::HoistedBackgrounds`] for why that changes no
@@ -365,13 +370,28 @@ pub(super) fn draw_tile_layer(
             // holds the two answers together.
             let rect = projector.tile_rect_at(tx, ty, tile_zoom);
 
-            let background = match &piece.tile {
-                Tile::Vector(shapes) => {
+            // **Once per cell, for both walks.** The affine that puts this
+            // tile's shapes on the glass is a pure function of the cell's
+            // rect and its ancestor window, and both walks need it: the hoist
+            // to place the background rectangle, and `paint_vector_tile` to
+            // place everything else. It was computed in each, so every vector
+            // cell divided its way to the same two numbers twice.
+            let placement = match &piece.tile {
+                Tile::Vector(_) => Some(walkers::mvt::placement(full_rect_of_clipped_tile(
+                    rect, piece.uv,
+                ))),
+                // A raster tile carries no shapes to place; `Painter::image`
+                // takes its `uv` directly.
+                Tile::Raster(_) => None,
+            };
+
+            let background = match (&piece.tile, placement) {
+                (Tile::Vector(shapes), Some(placement)) => {
                     if hoist_background(
                         &mut backgrounds,
                         shapes,
+                        placement,
                         rect,
-                        piece.uv,
                         ui.pixels_per_point(),
                         pane_clip,
                     ) {
@@ -381,9 +401,9 @@ pub(super) fn draw_tile_layer(
                     }
                 }
                 // A raster tile has no background rectangle to take.
-                Tile::Raster(_) => Background::Inline,
+                _ => Background::Inline,
             };
-            answered.push((rect, piece, background));
+            answered.push((rect, piece, background, placement));
         }
     }
 
@@ -405,7 +425,7 @@ pub(super) fn draw_tile_layer(
     // stretch is anything that has to draw between two of its members, and
     // every hand-over below is one of those.
     let mut spans = GroundSpans::default();
-    for (rect, piece, background) in answered {
+    for (rect, piece, background, placement) in answered {
         match piece.tile {
             // `window_of` and not `piece.uv`: the tile may be a slot
             // of a shared texture, and the ancestor window is a
@@ -429,6 +449,13 @@ pub(super) fn draw_tile_layer(
                 // -- and the batch goes in ahead of the stretch, because its
                 // spans were held before those quads were pushed.
                 quad_meshes += hand_over_quads(ui, &mut quads, &mut spans, ground, pass_nr);
+                let Some(placement) = placement else {
+                    // Unreachable: the first walk gives every vector cell a
+                    // placement. Skipping rather than unwrapping keeps a
+                    // future raster/vector fork from panicking on the frame
+                    // thread.
+                    continue;
+                };
                 paint_vector_tile(
                     ui.painter(),
                     shapes,
@@ -441,7 +468,7 @@ pub(super) fn draw_tile_layer(
                     },
                     &mut spans,
                     rect,
-                    piece.uv,
+                    placement,
                     &mut labels,
                     background,
                 );
@@ -1087,8 +1114,8 @@ impl Background {
 fn hoist_background(
     into: &mut crate::tile_mesh::HoistedBackgrounds,
     shapes: &[walkers::ShapeOrText],
+    placement: egui::emath::TSTransform,
     piece: egui::Rect,
-    uv: egui::Rect,
     pixels_per_point: f32,
     clip: egui::Rect,
 ) -> bool {
@@ -1101,13 +1128,25 @@ fn hoist_background(
     if !crate::tile_mesh::is_hoistable_background(background) {
         return false;
     }
-    // `placed`, not a hand-written transform: the same arithmetic `place_one`
-    // applies to every shape the tile's own walk draws.
-    let placement = walkers::mvt::placement(full_rect_of_clipped_tile(piece, uv));
-    let walkers::ShapeOrText::Shape(egui::Shape::Rect(placed)) = first.placed(placement) else {
-        return false;
-    };
-    into.push(&placed, piece, pixels_per_point, clip)
+    // **The two fields, not a placed copy of the shape they sit in.**
+    // `ShapeOrText::placed` on a `Shape::Rect` clones the whole `Shape` and
+    // runs `Shape::transform` over the copy, and the copy is read for a rect
+    // and a colour and dropped: 160 instructions against the 1 the two
+    // reads cost, per vector cell per pass, measured under callgrind.
+    //
+    // The reads are the placed value and not an approximation of it.
+    // `Shape::transform`'s `Rect` arm is `rect = transform * rect` and this
+    // is that expression; the other three things it touches -- the corner
+    // radius, the stroke width and the blur -- are the ones
+    // `is_hoistable_background` has just required to be zero, and it leaves
+    // `fill` alone at any placement.
+    into.push(
+        placement * background.rect,
+        background.fill,
+        piece,
+        pixels_per_point,
+        clip,
+    )
 }
 
 /// Paint one decoded vector tile.
@@ -1175,7 +1214,7 @@ fn paint_vector_tile(
     ground: GroundMeshes<'_>,
     spans: &mut GroundSpans,
     rect: egui::Rect,
-    uv: egui::Rect,
+    placement: egui::emath::TSTransform,
     labels: &mut Vec<walkers::Text>,
     background: Background,
 ) {
@@ -1190,9 +1229,6 @@ fn paint_vector_tile(
     // batch carries this and the renderer sets it itself; see
     // `crate::tile_mesh::GroundBatch`.
     let span_clip = painter.clip_rect();
-
-    let full = full_rect_of_clipped_tile(rect, uv);
-    let placement = walkers::mvt::placement(full);
 
     // Accumulated and written once per tile per counter, not once per shape:
     // a dense tile is hundreds of shapes and these are `static` atomics.
@@ -4133,13 +4169,16 @@ mod tests {
         background: Background,
     ) {
         let mut spans = GroundSpans::default();
+        // The placement the walk hands down, spelled here so a case still
+        // names the `uv` it is about.
+        let placement = walkers::mvt::placement(full_rect_of_clipped_tile(rect, uv));
         paint_vector_tile(
             ui.painter(),
             shapes,
             ground,
             &mut spans,
             rect,
-            uv,
+            placement,
             labels,
             background,
         );
