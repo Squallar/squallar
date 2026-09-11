@@ -2756,10 +2756,13 @@ var C = window.__rig_console || [];
 var attached = [], different = [], off_frame = [], rayon = [];
 var by_kind = {};
 var transport = null;
+var action_budget = null;
 var uploads_all = [];
 var rasters_all = [];
 var cmdstream_all = [];
 var cmdstream_unparsed = null;
+var action_budget_all = [];
+var action_budget_unparsed = null;
 var off_re = /([A-Za-z0-9_-]+) took (\d+) ms off the frame/;
 var rayon_re = /rayon: (\d+) threads/;
 // The LAST match wins, not the first: `worker_port::account` logs RUNNING
@@ -2796,6 +2799,28 @@ var rasters_re = /overlay rasters: (\d+) dispatched, (\d+) arrived, (\d+) pictur
 var cmdstream_re = /command stream: last (\d+) primitives \((\d+) mesh, (\d+) callback, (\d+) skipped\), (\d+) draws, (\d+) calls; splits (\d+) clip, (\d+) texture, (\d+) callback, (\d+) mergeable; (\d+) resets, (\d+) scissors \((\d+) repeat\), (\d+) bind groups \((\d+) repeat\), (\d+) buffer binds; per walk (\d+) primitives, (\d+) calls over (\d+) walks/;
 var cmdstream_loose_re = /command stream: last \d+ primitives/;
 var uploads_re = /texture uploads: (\d+) deltas, (\d+) B to the GPU, (\d+) B whole, (\d+) bands, (\d+) B staged, (\d+) B blocking/;
+// `action budget:` is the per-frame GUI-action allowance's FIRES COUNTER, and
+// like `command stream:` it is a COUNT line that deliberately does not wear the
+// `frame ` prefix. It had NO reader here at all until 2026-09-10, which is the
+// one failure a fires counter cannot survive: the line exists so that one cheap
+// leg can answer whether the budget ever bit, and nothing on a leg could read
+// it.
+//
+// FIVE FIGURES, FOUR DENOMINATORS, AND A HIGH-WATER MARK. `handled` is actions
+// run on the frame thread, `bites` is FRAMES the budget stopped the loop on,
+// `deferred` is actions those bites carried to a later frame, `coalesced` is
+// re-emitted asks dropped against an identical queued one -- a saving in
+// downloads, never in frame time. None of the four is added to another.
+// `deepest` is the deepest the queue has EVER been: a level, not a total, so
+// two readings of it do not difference and the last one is the whole answer.
+//
+// **A missing line is not `0 bites`.** `action_budget::totals_if_moved` returns
+// `None` until `bites + deferred + coalesced` moves, so a leg on which the
+// budget never bit writes NO LINE AT ALL. Absence here therefore means either
+// "a binary older than the line" or "the budget never fired", and the two are
+// not separable from this reader -- reported as `null`, never as a zero.
+var action_budget_re = /action budget: (\d+) handled, (\d+) bites, (\d+) deferred, (\d+) coalesced, (\d+) deepest/;
+var action_budget_loose_re = /action budget: \d+ handled/;
 // A THIRD denominator, and it is added to neither of the two above. These
 // count archive tile BODIES DECODED, split by the archive header's declared
 // tile_type: `vector` is the self-hosted basemap's MVT, `raster` the terrain
@@ -3000,6 +3025,28 @@ for (var i = 0; i < C.length; i++) {
                        blocking_bytes: uploads.blocking_bytes });
   }
   else if (uploads_loose_re.test(m)) uploads_unparsed = m;
+  var abm = action_budget_re.exec(m);
+  if (abm) {
+    action_budget = { handled: parseInt(abm[1], 10),
+                      bites: parseInt(abm[2], 10),
+                      deferred: parseInt(abm[3], 10),
+                      coalesced: parseInt(abm[4], 10),
+                      // A LEVEL among the totals: last-wins is the answer for
+                      // it and a difference of two readings is not a reading.
+                      deepest: parseInt(abm[5], 10) };
+    // Per tick as well as last-wins, for `uploads_all`'s reason: these are
+    // written on the same 2 s tick as `frame worst:`, so two consecutive
+    // entries bracket the period whose worst frame that tick reports.
+    action_budget_all.push({ t: C[i].t, handled: action_budget.handled,
+                             bites: action_budget.bites,
+                             deferred: action_budget.deferred,
+                             coalesced: action_budget.coalesced,
+                             deepest: action_budget.deepest });
+  }
+  // Present but unparseable is NOT the same answer as absent, and here the two
+  // stories are already crowded: absence means an old binary OR a budget that
+  // never bit, and without this arm a reshaped line would impersonate both.
+  else if (action_budget_loose_re.test(m)) action_budget_unparsed = m;
   var bm = basemap_re.exec(m);
   if (bm) basemap = { vector_tiles: parseInt(bm[1], 10),
                       raster_tiles: parseInt(bm[2], 10),
@@ -3096,6 +3143,8 @@ return { attached: attached, different: different, off_frame: off_frame,
          transport: transport, rasters: rasters, uploads: uploads,
          uploads_all: uploads_all, rasters_all: rasters_all,
          cmdstream_all: cmdstream_all, cmdstream_unparsed: cmdstream_unparsed,
+         action_budget: action_budget, action_budget_all: action_budget_all,
+         action_budget_unparsed: action_budget_unparsed,
          basemap: basemap, ground: ground, floor: floor,
          tile_cache: tile_cache, tile_cache_all: tile_cache_all,
          tile_bodies: tile_bodies,
@@ -4659,6 +4708,7 @@ class RunningTotalsWatcher:
         self.uploads = {}
         self.rasters = {}
         self.cmdstream = {}
+        self.action_budget = {}
 
     def poll(self):
         sig = self.session.execute(WORKER_SIGNAL_PROBE) or {}
@@ -4674,13 +4724,16 @@ class RunningTotalsWatcher:
             self.rasters[r.get("t")] = r
         for r in sig.get("cmdstream_all") or []:
             self.cmdstream[r.get("t")] = r
+        for r in sig.get("action_budget_all") or []:
+            self.action_budget[r.get("t")] = r
         return sig
 
     def readings(self, family, role=None):
         """Every reading of `family` (optionally of one `role`), oldest first."""
         source = {"tile_cache": self.tile_cache, "ground": self.ground,
                   "basemap": self.basemap, "uploads": self.uploads,
-                  "rasters": self.rasters, "cmdstream": self.cmdstream}[family]
+                  "rasters": self.rasters, "cmdstream": self.cmdstream,
+                  "action_budget": self.action_budget}[family]
         rs = [r for r in source.values() if role is None or r.get("role") == role]
         rs.sort(key=lambda r: r.get("t") or 0)
         return rs
@@ -8694,6 +8747,16 @@ def run_smoke(args):
             (r for r in getattr(totals_watch, "cmdstream", {}).values()
              if r.get("t") is not None), key=lambda r: r["t"])
         result["command_stream_unparsed"] = _sig.get("cmdstream_unparsed")
+        # The per-frame action budget's FIRES COUNTER, per tick, from the
+        # watcher for `frame_worst_all`'s reason. An EMPTY list is not
+        # `0 bites`: the app writes no line until the budget moves, so an
+        # empty list means the budget never bit OR the binary predates the
+        # line, and the two are not separable here. `deepest` on each entry is
+        # a high-water mark and is never differenced.
+        result["action_budget_all"] = sorted(
+            (r for r in getattr(totals_watch, "action_budget", {}).values()
+             if r.get("t") is not None), key=lambda r: r["t"])
+        result["action_budget_unparsed"] = _sig.get("action_budget_unparsed")
         gw = gesture_window_stats(frames_watch, args.quiet_window,
                                   args.window_skip_loops)
         if gw is not None:
@@ -9504,6 +9567,37 @@ def run_smoke(args):
                  tb.get("encode_us"), tb.get("post_us"), tb.get("copy_us"),
                  tb.get("worst_copy_us"), tb.get("deliver_us"),
                  tb.get("worst_deliver_us")))
+    # The per-frame action budget, over the whole leg: first reading to last.
+    # Printed whether or not anything gates on it, on the same terms as the two
+    # raster figures -- this is a FIRES COUNTER, and the reading it exists to
+    # deliver is a small one.
+    #
+    # **The absence is the reading that needs the words.** The app writes this
+    # line only once `bites + deferred + coalesced` has moved, so no line at all
+    # means the budget never bit OR this binary predates the line; it is NEVER
+    # "0 bites measured". `deepest` is a high-water mark and is quoted as the
+    # last reading, never as a difference.
+    abl = result.get("action_budget_all")
+    abu = result.get("action_budget_unparsed")
+    if abl:
+        first, last = abl[0], abl[-1]
+        print("[%s] SUMMARY action budget: %s handled, %s bites, %s deferred, "
+              "%s coalesced over the leg; %s deepest (high-water, not a "
+              "difference) [four denominators, never added]"
+              % (tag, last["handled"] - first["handled"],
+                 last["bites"] - first["bites"],
+                 last["deferred"] - first["deferred"],
+                 last["coalesced"] - first["coalesced"],
+                 last["deepest"]))
+    elif abu:
+        print("[%s] SUMMARY action budget: READER BROKEN -- the line is in the "
+              "ring and the rig's pattern did not match it: %r" % (tag, abu))
+    else:
+        print("[%s] SUMMARY action budget: no `action budget:` line on this "
+              "leg. That is NOT a `0 bites` measurement: the app writes the "
+              "line only once the budget has moved, so this is a budget that "
+              "never bit OR a binary older than the line, and this reader "
+              "cannot tell them apart" % tag)
     ovr = result.get("overlay_rasters")
     if ovr is not None:
         print("[%s] SUMMARY overlay rasters: %s%s"

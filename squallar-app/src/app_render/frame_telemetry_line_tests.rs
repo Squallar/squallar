@@ -58,6 +58,48 @@ fn pattern(name: &str) -> String {
     rest[..end].to_string()
 }
 
+/// Every telemetry line family `src` formats, read out of its own `format!`
+/// literals: the lowercase words a line opens with, up to its first colon.
+///
+/// Deliberately dumb, and paired with an explicit table for that reason. It
+/// keeps `boot:` — a field spelled inside `frame worst:` rather than a line of
+/// its own — and the table says so; an extraction clever enough to drop that
+/// one is clever enough to drop a real family silently, which is the failure
+/// this whole gate is about.
+fn telemetry_line_families(src: &str) -> Vec<&str> {
+    const HEAD: &str = "format!(";
+    let mut out: Vec<&str> = src
+        .match_indices(HEAD)
+        .filter_map(|(at, _)| {
+            let rest = &src[at + HEAD.len()..];
+            let quote = rest.find('"')?;
+            // Only a literal that OPENS the call: anything else is an
+            // argument, or a literal in a later position.
+            if !rest[..quote].chars().all(char::is_whitespace) {
+                return None;
+            }
+            let body = &rest[quote + 1..];
+            let end = body
+                .find(|c: char| {
+                    !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == ' ' || c == '-')
+                })
+                .unwrap_or(body.len());
+            let name = body.get(..end)?;
+            if name.is_empty()
+                || name.starts_with(' ')
+                || name.ends_with(' ')
+                || body.as_bytes().get(end) != Some(&b':')
+            {
+                return None;
+            }
+            Some(name)
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// The sentence a frame-line pattern describes, given what each capture
 /// group should capture, in order.
 ///
@@ -1440,6 +1482,249 @@ fn every_frame_line_family_the_app_writes_has_a_named_rig_probe() {
         "the table names families the app no longer writes: {families:?}",
     );
 }
+/// The `action budget:` sentence, held against the rig's own pattern.
+///
+/// **No literal is hand-copied into the rig's half of this.** `rendered`
+/// substitutes values into `drive.py`'s own regex and the result must be the
+/// formatter's output, so neither side can move without the other.
+///
+/// The literal pin above it is there for the usual reason — a formatter that
+/// dropped a field and a regex that dropped the same field would agree with
+/// each other and with nothing else.
+#[test]
+fn the_rig_reads_the_action_budget_line_the_app_actually_writes() {
+    let totals = crate::action_budget::Totals {
+        handled: 9142,
+        bites: 37,
+        deferred: 411,
+        coalesced: 208,
+        deepest: 19,
+    };
+    let line = super::action_budget_line(&totals);
+    assert_eq!(
+        line,
+        "action budget: 9142 handled, 37 bites, 411 deferred, 208 coalesced, \
+         19 deepest",
+    );
+    assert_eq!(
+        line,
+        rendered(
+            &pattern("action_budget_re"),
+            &["9142", "37", "411", "208", "19"],
+        ),
+        "the `action budget:` line and the rig's probe have drifted",
+    );
+    // The NATIVE half reads the same pattern out of `drive.py` at run time,
+    // and until it lists the probe it reads nothing. The two halves have
+    // drifted before — `frame need:`, September 2026, where the native reader
+    // fell a field behind and printed `n/a`, which reads as an old binary.
+    assert_eq!(
+        line,
+        native_row_line("ActionBudgetTests", &["9142", "37", "411", "208", "19"]),
+        "the `action budget:` line and the NATIVE rig's fixture have drifted",
+    );
+    assert!(
+        NATIVE_ROW_PY.contains("\"action_budget_re\","),
+        "native_row.py does not list `action_budget_re` among its probes, so \
+         the fires counter reaches no native row",
+    );
+}
+
+/// **Every telemetry line family `app_render.rs` writes is claimed here — by a
+/// named rig regex, or by a stated reason for having none.**
+///
+/// The gate above is honest about its extent and its extent is `frame <name>`.
+/// That leaves the app's *counter* lines — `overlay rasters:`,
+/// `texture uploads:`, `command stream:`, `upload residency:` — covered by
+/// nothing at all, and on 2026-09-10 that hole was measured: `action budget:`
+/// landed in `62729db32` with a doc saying in so many words that **a `bites 0`
+/// reading is the point of the line**, and `grep -c "action budget"` was **0**
+/// in both `drive.py` and `native_row.py`. The one counter shipped so that a
+/// single cheap leg could answer whether a per-frame budget ever bites could
+/// not be read off a leg. Nothing went red, because the only enumeration in
+/// the tree read `"frame ` literals.
+///
+/// So this one reads **every** line the file formats, whatever its first word,
+/// and every one must be in the table below. A new family is a build failure
+/// until someone classifies it.
+///
+/// **`Unread` is a ratchet, not an escape hatch.** Fourteen families are in it
+/// today and the count is a ceiling that may only fall — otherwise the table
+/// would be a place to write a new family's name and walk away, which is the
+/// same coverage-shaped nothing this gate exists to replace. Shed one before
+/// adding one.
+///
+/// **What this does NOT cover**, stated so it cannot be read as more: the
+/// `squallar-app` crate writes telemetry from `budget_telemetry.rs` (fourteen
+/// more families) and `loop_telemetry.rs` (one), and `squallar-egui`'s
+/// `heap_census` writes several; none of those files is read here. This gate
+/// covers `app_render.rs`.
+#[test]
+fn every_telemetry_line_family_app_render_writes_is_claimed_by_a_probe_or_a_reason() {
+    /// How a family reaches — or fails to reach — a leg's artifact.
+    enum Claim {
+        /// Read off a leg by these `drive.py` regexes, which must exist.
+        By(&'static [&'static str]),
+        /// Not a line at all: a field spelled inside the line named here, so
+        /// the family's reader is that line's.
+        FieldOf(&'static str),
+        /// **No rig reader.** The family is invisible to every leg's
+        /// artifact, and the string is why that is currently tolerated.
+        Unread(&'static str),
+    }
+    use Claim::{By, FieldOf, Unread};
+
+    /// The most families that may be `Unread`. A ceiling, permanent, and it
+    /// may only FALL — `arch_ratchets`' discipline, for its reason.
+    const UNREAD_CEILING: usize = 14;
+    /// A floor under the extraction itself, so a rename of the formatters
+    /// that makes it match *nothing* fails loudly instead of passing over an
+    /// empty list. A gate that cannot fail is worse than one that did not run.
+    const KNOWN_FAMILY_FLOOR: usize = 25;
+
+    let claims: &[(&str, Claim)] = &[
+        // THE LINE THIS GATE WAS ADDED FOR. A fires counter with no reader is
+        // the one shape a fires counter cannot survive.
+        ("action budget", By(&["action_budget_re"])),
+        ("basemap tiles", By(&["basemap_re"])),
+        (
+            "blank pages",
+            Unread("the blank-raster arm's own counter; no leg reports it"),
+        ),
+        ("boot", FieldOf("frame worst")),
+        ("command stream", By(&["cmdstream_re"])),
+        (
+            "demand-ranked evictions",
+            Unread("landed with the MRMS/GMGSI demand ledger; unclaimed"),
+        ),
+        ("floor strips", By(&["floor_re"])),
+        ("frame cadence", By(&["cadence_re"])),
+        ("frame need", By(&["frame_need_re"])),
+        ("frame prep costs", By(&["prep_costs_re"])),
+        ("frame prep geometry", By(&["prep_geometry_re"])),
+        (
+            "frame worst",
+            By(&["frame_worst_re", "frame_worst_none_re"]),
+        ),
+        ("glm delivery", Unread("two denominators, neither scraped")),
+        ("gpu passes", By(&["gpu_passes_re"])),
+        (
+            "gridded fields",
+            Unread("the per-field cut of `gridded scatter`; unclaimed with it"),
+        ),
+        (
+            "gridded scatter",
+            Unread("the rasterizer's own census; unclaimed"),
+        ),
+        ("ground tiles", By(&["ground_re", "ground_stroke_draws_re"])),
+        (
+            "layer releases",
+            Unread("the release ledger's totals; unclaimed"),
+        ),
+        (
+            "overlay blank layers",
+            Unread("the per-layer cut of `overlay blanks`; unclaimed with it"),
+        ),
+        (
+            "overlay blanks",
+            Unread(
+                "`overlay rasters:`' `inked` carries the headline; this \
+                    opens it up and no leg reads the opening",
+            ),
+        ),
+        (
+            "overlay door",
+            Unread("the admission door's own counters; unclaimed"),
+        ),
+        ("overlay rasters", By(&["rasters_re"])),
+        (
+            "overlay reasons",
+            Unread("why a raster was asked for; unclaimed"),
+        ),
+        (
+            "overlay windows",
+            Unread("the per-pane raster window; unclaimed"),
+        ),
+        (
+            "parsed geometry",
+            Unread(
+                "the parsed-feature census beside `tile cache (…)`; \
+                    unclaimed",
+            ),
+        ),
+        ("texture uploads", By(&["uploads_re"])),
+        ("tile bodies", By(&["tile_bodies_re"])),
+        (
+            "upload pacing",
+            Unread(
+                "the band drain's creation budget — a fires counter too, \
+                    and unread for `action budget:`' reason",
+            ),
+        ),
+        (
+            "upload residency",
+            Unread("the band queue's host-byte high-water mark; unclaimed"),
+        ),
+    ];
+
+    let families = telemetry_line_families(APP_RENDER);
+    assert!(
+        families.len() >= KNOWN_FAMILY_FLOOR,
+        "only {} telemetry line families were extracted from app_render.rs, \
+         under the {KNOWN_FAMILY_FLOOR} known to be there: the extraction has \
+         stopped matching and this gate is passing over an empty list: \
+         {families:?}",
+        families.len(),
+    );
+    let mut unread = 0;
+    for family in &families {
+        let claim = claims
+            .iter()
+            .find(|(f, _)| f == family)
+            .map(|(_, c)| c)
+            .unwrap_or_else(|| {
+                panic!(
+                    "app_render.rs writes an `{family}:` line and this table \
+                     does not say how a leg reads it. Claim it: name the \
+                     `drive.py` regex that scrapes it, or record it as \
+                     `Unread` with the reason — and `Unread` is a ratchet, so \
+                     shed one first. An unclaimed family is invisible to \
+                     every leg's artifact, which reads there exactly like an \
+                     arm that produced no samples"
+                )
+            });
+        match claim {
+            By(probes) => {
+                for probe in *probes {
+                    assert!(
+                        DRIVE_PY.contains(&format!("var {probe} = /")),
+                        "`{family}:` is claimed by `{probe}` and drive.py has \
+                         no such regex, so the line reaches no leg",
+                    );
+                }
+            }
+            FieldOf(line) => assert!(
+                claims.iter().any(|(f, c)| f == line && matches!(c, By(_))),
+                "`{family}:` is recorded as a field of `{line}:`, which is \
+                 not itself a family read by a probe here",
+            ),
+            Unread(reason) => {
+                assert!(!reason.is_empty(), "`{family}:` is Unread with no reason");
+                unread += 1;
+            }
+        }
+    }
+    assert!(
+        unread <= UNREAD_CEILING,
+        "{unread} families are `Unread` and the ceiling is {UNREAD_CEILING}. \
+         It may only fall: give one of them a probe rather than raising it",
+    );
+    assert_eq!(
+        families.len(),
+        claims.len(),
+        "the table names families app_render.rs no longer writes: {families:?}",
+    );
+}
 
 /// The `frame pump (…)` sentence, pinned as a literal.
 ///
@@ -2379,20 +2664,36 @@ fn the_tile_bodies_line_reads_exactly_as_pinned() {
     );
 }
 
-/// The sentence `native_row.py`'s own `LINE` fixture describes, given one
-/// value per `%d` in order — the native half of "no reader may drift".
+/// The sentence one `native_row.py` test class's own `LINE` fixture describes,
+/// given one value per `%d` in order — the native half of "no reader may
+/// drift".
 ///
 /// Read out of that file rather than restated here, on `pattern`'s terms: a
 /// copy in this module would agree with itself forever while the rig read
 /// something else.
-fn native_row_line(values: &[&str]) -> String {
+///
+/// **Anchored on the class.** It used to take the file's FIRST `LINE = (`,
+/// which was `FrameNeedTests`' only because nothing else happened to be spelled
+/// that way; adding a second fixture class above it silently re-aimed this
+/// helper at the wrong sentence. The caller names the class it means.
+fn native_row_line(class: &str, values: &[&str]) -> String {
     const HEAD: &str = "    LINE = (";
-    let at = NATIVE_ROW_PY.find(HEAD).unwrap_or_else(|| {
+    let class_head = format!("class {class}(");
+    let from = NATIVE_ROW_PY.find(&class_head).unwrap_or_else(|| {
         panic!(
-            "native_row.py no longer declares `{HEAD}…`; the native rig's \
-             fixture for this line moved and this test can no longer read it"
+            "native_row.py no longer declares `{class_head}…`; the native \
+             rig's fixture class for this line moved and this test can no \
+             longer read it"
         )
     });
+    let at = from
+        + NATIVE_ROW_PY[from..].find(HEAD).unwrap_or_else(|| {
+            panic!(
+                "native_row.py's `{class}` no longer declares `{HEAD}…`; the \
+                 native rig's fixture for this line moved and this test can \
+                 no longer read it"
+            )
+        });
     let rest = &NATIVE_ROW_PY[at + HEAD.len()..];
     let end = rest
         .find(')')
@@ -2475,7 +2776,7 @@ fn the_frame_need_line_reads_exactly_as_pinned() {
     // makes "no reader may drift" true rather than true of one of them.
     assert_eq!(
         super::frame_need_line(&r),
-        native_row_line(&FIELDS),
+        native_row_line("FrameNeedTests", &FIELDS),
         "the `frame need:` line and the NATIVE rig's fixture have drifted",
     );
     // The fixture matching is not enough on its own: `native_row.py` also

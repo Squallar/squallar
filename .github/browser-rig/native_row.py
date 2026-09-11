@@ -186,6 +186,7 @@ PROBE_NAMES = (
     "tile_cache_re",
     "tile_bodies_re",
     "frame_need_re",
+    "action_budget_re",
     "gesture_begin_re",
     "gesture_loop_re",
 )
@@ -613,6 +614,7 @@ def scrape(lines, probes):
         "tile_cache": [],
         "tile_bodies": [],
         "frame_need": [],
+        "action_budget": [],
         "overlay_pictures": [],
         "segments": [],
         # `{key: [Reading]}` for every per-family line present, keyed the
@@ -657,11 +659,22 @@ def scrape(lines, probes):
             ("floor", "floor_re"),
             ("tile_bodies", "tile_bodies_re"),
             ("frame_need", "frame_need_re"),
+            ("action_budget", "action_budget_re"),
             ("loop_state", "loop_state_re"),
         ):
             m = probes[probe].search(line)
             if m:
                 out[key].append((idx, [int(x) for x in m.groups()]))
+        # `action budget:` gets `budget_state`'s second arm for the same
+        # reason: the pattern is positional and every group mandatory, so a
+        # field inserted anywhere before `deepest` stops the match dead and
+        # the family reads EMPTY. Empty already carries two meanings on this
+        # line -- a binary older than it, or a budget that never bit -- and a
+        # broken reader impersonating either is the one thing a fires counter
+        # must never do.
+        if ("action budget:" in line
+                and not probes["action_budget_re"].search(line)):
+            out["unparsed"].append((idx, "action_budget_re", line.strip()[:200]))
         # `budget state` is a level too, but its first group is the bracket's
         # NAME, so it cannot ride the all-`int()` loop above: the word is kept
         # as text and the fifteen figures after it are ints. Every group is
@@ -2500,6 +2513,38 @@ def build_row(args, scraped, probes):
             "charges_balance": sum(fnd[8:18]) == fnd[2],
         }
 
+    # **The per-frame action budget's FIRES COUNTER**, over the same bracket.
+    # The one family on this row whose whole purpose is to say whether a
+    # mechanism ever ran: a budget whose precondition never holds delivers
+    # exactly zero and looks landed, and this campaign has already shipped a
+    # ~94 MiB cut whose counter read 0 B on all 530 ticks.
+    #
+    # Four windowed totals and ONE LEVEL, never added and never mixed:
+    # `handled` is actions run on the frame thread, `bites` is FRAMES the
+    # budget stopped the loop on, `deferred` is actions those bites carried to
+    # a later frame, `coalesced` is re-emitted asks dropped against an
+    # identical queued one -- a saving in downloads, not in frame time.
+    # `deepest` is the deepest the queue has EVER been, so it is taken as the
+    # LAST reading in the bracket and never as a difference of two.
+    #
+    # **None here is not `0 bites`, and must never be quoted as one.**
+    # `action_budget::totals_if_moved` returns `None` until
+    # `bites + deferred + coalesced` moves, so a leg on which the budget never
+    # bit writes NO LINE AT ALL. Absence therefore means "the budget never
+    # fired" OR "a binary older than the line", and nothing on this row can
+    # separate them. That asymmetry is a defect in the telemetry, not in this
+    # arm -- the line's own doc says a `bites 0` reading is the point of it,
+    # and the emitter cannot produce one. Scraping it is what makes the
+    # disagreement visible on every row instead of nowhere at all.
+    ab = diff_totals(scraped["action_budget"], start_idx, end_idx)
+    abl = at_or_before(scraped["action_budget"], end_idx)
+    action_budget = (None if ab is None or abl is None else {
+        "handled": ab[0], "bites": ab[1], "deferred": ab[2],
+        "coalesced": ab[3],
+        # LEVEL: the last reading in the bracket, not a windowed difference.
+        "deepest": abl[1][4],
+    })
+
     # Basemap state, on `run_measure.sh`'s own two-counter terms.
     bt = diff_totals(scraped["basemap"], start_idx, end_idx)
     g = diff_totals(scraped["ground"], start_idx, end_idx)
@@ -2587,6 +2632,11 @@ def build_row(args, scraped, probes):
         "loop_state": (scraped["loop_state"][-1][1] if scraped["loop_state"] else None),
         "tile_bodies": tile_bodies,
         "frame_need": frame_need,
+        # `None` when no `action budget:` line brackets this window -- which
+        # means the budget never bit OR the binary predates the line. NEVER
+        # coerced to zero: this is a fires counter and a fabricated zero is
+        # the exact reading it exists to make impossible.
+        "action_budget": action_budget,
         # `(line, bracket, [fifteen ints])`, or None when the log has no
         # `budget state:` line -- a binary older than the line, kept apart
         # from a live binary reporting zeroes.
@@ -2871,6 +2921,27 @@ def print_row(row):
                 "instrument's own failure, not a reading of the scene"
                 % (fn_["partitions"], fn_["charges_balance"])
             )
+    # The per-frame action budget's fires counter, over the same bracket. Four
+    # windowed totals and one high-water mark, never added to each other and
+    # never to any frame segment: these are actions and frames, those are
+    # microseconds.
+    ab = row.get("action_budget")
+    if ab is None:
+        print(
+            "ROW   action budget: n/a (no `action budget:` line brackets this "
+            "window). That is NOT `0 bites`: the app writes the line only once "
+            "`bites + deferred + coalesced` moves, so this is a budget that "
+            "never bit OR a binary older than the line, and this row cannot "
+            "tell them apart"
+        )
+    else:
+        print(
+            "ROW   action budget: %s handled, %s bites, %s deferred, %s "
+            "coalesced [over the bracket; four denominators, never added]; "
+            "%s deepest [LEVEL, the last reading, never a difference]"
+            % (ab["handled"], ab["bites"], ab["deferred"], ab["coalesced"],
+               ab["deepest"])
+        )
     tb = row.get("tile_bodies")
     if tb is None:
         print(
@@ -5596,6 +5667,133 @@ class TileBodiesTests(unittest.TestCase):
         self.assertIn("ROW   tile bodies: n/a", text)
         self.assertIn("binary older than the line", text)
         self.assertNotIn("ROW   tile bodies: 0 offloaded", text)
+
+
+class ActionBudgetTests(unittest.TestCase):
+    """The fires counter for the per-frame GUI-action allowance.
+
+    The line landed in `62729db32` with a doc saying in so many words that a
+    `bites 0` reading is the point of it, and NEITHER HALF OF THE RIG HAD A
+    REGEX FOR IT: `grep -c "action budget"` was 0 in `drive.py` and 0 here, so
+    the one counter shipped to prove a cut fires could not be read off a leg at
+    all. This is that reader.
+    """
+
+    LINE = ("[..] INFO action budget: %d handled, %d bites, %d deferred, "
+            "%d coalesced, %d deepest")
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.load = os.path.join(self._tmp.name, "load")
+        with open(self.load, "w", encoding="utf-8") as fh:
+            for i in range(6):
+                fh.write("%d\t1.0\n" % (1_000_000 + 5 * i))
+        self.probes = compile_probes()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_the_probe_is_drive_pys_own(self):
+        """Read out of drive.py at run time, never restated here, so the two
+        halves of the rig cannot come to read different lines."""
+        self.assertEqual(
+            drive_pattern("action_budget_re"),
+            r"action budget: (\d+) handled, (\d+) bites, (\d+) deferred, "
+            r"(\d+) coalesced, (\d+) deepest")
+
+    def test_drive_py_reads_each_group_into_the_field_it_belongs_to(self):
+        """The POSITIONAL half, on `FrameNeedTests`' terms exactly: a field
+        inserted mid-line shifts every group after it while a match check and
+        a Rust literal pin both stay green, and the artifact then carries one
+        figure under another figure's name."""
+        text = _read(DRIVE_PY)
+        pattern = drive_pattern("action_budget_re", text)
+        # A distinct value per field, so a swapped pair cannot read as a match.
+        fields = [("handled", 9142), ("bites", 37), ("deferred", 411),
+                  ("coalesced", 208), ("deepest", 19)]
+        line = ("action budget: %d handled, %d bites, %d deferred, "
+                "%d coalesced, %d deepest" % tuple(v for _, v in fields))
+        m = re.search(pattern, line)
+        self.assertIsNotNone(m, "drive.py's probe no longer matches the line")
+        groups = m.groups()
+        self.assertEqual(len(groups), len(fields))
+        body = text[text.index("var abm = action_budget_re.exec(m);"):]
+        body = body[:body.index("action_budget_all.push")]
+        assigned = re.findall(r"(\w+): parseInt\(abm\[(\d+)\], 10\)", body)
+        self.assertEqual(
+            [name for name, _ in assigned], [name for name, _ in fields],
+            "drive.py reads a different set of fields, or reads them in a "
+            "different order, from the ones the line carries")
+        for (name, expected), (_, at) in zip(fields, assigned):
+            self.assertEqual(
+                int(groups[int(at) - 1]), expected,
+                "drive.py reads group %s into `%s`, which carries %s and not "
+                "%s -- the artifact labels one figure with another's name"
+                % (at, name, groups[int(at) - 1], expected))
+
+    def test_the_line_scrapes_with_every_group_mandatory(self):
+        m = self.probes["action_budget_re"].search(self.LINE % (900, 4, 61, 7, 12))
+        self.assertIsNotNone(m)
+        self.assertEqual([int(g) for g in m.groups()], [900, 4, 61, 7, 12])
+        # A field dropped anywhere stops the match dead, which is what keeps a
+        # partial reading from arriving as a full one.
+        self.assertIsNone(self.probes["action_budget_re"].search(
+            "[..] INFO action budget: 900 handled, 4 bites"))
+
+    def _row(self, lines):
+        row = build_row(_leg_args(self.load, 1), scrape(lines, self.probes), self.probes)
+        return row, _capture(lambda: print_row(row))
+
+    def test_the_row_windows_the_totals_and_keeps_deepest_as_a_level(self):
+        """Four running totals differenced over the bracket, and the
+        high-water mark taken as the LAST reading. Differencing `deepest`
+        would print the queue getting SHALLOWER as a negative depth."""
+        lines = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE)
+        out = []
+        seen = 0
+        for line in lines:
+            out.append(line)
+            if "gesture script pan-zoom-2d loop complete" in line:
+                seen += 1
+                out.append(self.LINE % (100 * seen, 2 * seen, 5 * seen,
+                                        3 * seen, 4 + seen))
+        row, text = self._row(out)
+        ab = row["action_budget"]
+        self.assertIsNotNone(ab)
+        self.assertGreater(ab["bites"], 0)
+        # Differences, so each is a multiple of its per-loop step and none of
+        # them carries the boot traffic ahead of the bracket.
+        self.assertEqual(ab["handled"] % 100, 0)
+        self.assertEqual(ab["deferred"], (ab["bites"] // 2) * 5)
+        self.assertEqual(ab["coalesced"], (ab["bites"] // 2) * 3)
+        # The level: a reading that was actually printed, never a difference.
+        self.assertGreater(ab["deepest"], 4)
+        self.assertIn("ROW   action budget: ", text)
+        self.assertIn("deepest [LEVEL", text)
+
+    def test_a_leg_with_no_line_says_so_rather_than_zero_bites(self):
+        """**The reading this whole lane is about.** `totals_if_moved` returns
+        `None` until the budget moves, so a leg on which it never bit writes no
+        line at all -- and `0 bites` printed for that would be a measurement
+        nobody took, of exactly the quantity the counter exists to deliver."""
+        row, text = self._row(_leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE))
+        self.assertIsNone(row["action_budget"])
+        self.assertIn("ROW   action budget: n/a", text)
+        self.assertIn("NOT `0 bites`", text)
+        self.assertNotIn("ROW   action budget: 0 handled", text)
+
+    def test_a_reshaped_line_is_a_broken_reader_not_an_absent_family(self):
+        """Absence already carries two meanings on this line. A third --
+        "the reader broke" -- impersonating either of them is what the
+        `unparsed` arm exists to stop."""
+        out = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE)
+        out.append("[..] INFO action budget: 900 handled, 4 bites, 61 spilled")
+        scraped = scrape(out, self.probes)
+        self.assertEqual(scraped["action_budget"], [])
+        self.assertTrue(
+            any(p == "action_budget_re" for _idx, p, _line in scraped["unparsed"]),
+            scraped["unparsed"])
 
 
 class FrameNeedTests(unittest.TestCase):
