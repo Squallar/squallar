@@ -769,3 +769,51 @@ fn the_font_atlas_is_inside_the_page_total() {
         "the glyph atlas is host bytes and must be inside the total"
     );
 }
+
+/// **The narrowing row's exact shape**, pinned at the producer.
+///
+/// The enumeration gate in `app_render/frame_telemetry_line_tests.rs` is blind
+/// to this row by construction — its own doc says it does not count the
+/// instance-scoped `<words> (<name>):` families that this module writes — so
+/// the row is pinned here instead, by its rendered text and its figure count.
+/// Without this, a field added or dropped would change what every reader parses
+/// and nothing in the tree would say so.
+#[test]
+fn the_grid_narrowing_row_keeps_its_shape() {
+    let line = super::grid_narrowing_line("page");
+    assert!(
+        line.starts_with("grid narrowing (page): "),
+        "the row's prefix is what every reader keys on: {line}",
+    );
+    for key in [
+        "offered ",
+        "narrowed ",
+        "refused ",
+        "lossy ",
+        "verified ",
+        " points;",
+        "wide ",
+        "narrow ",
+    ] {
+        assert!(line.contains(key), "the row lost `{key}`: {line}");
+    }
+    // Seven figures, in the order the reader takes them. A field added or
+    // dropped moves every later one, which is how a positional parser silently
+    // splits a series into two instruments.
+    let figures = line
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .count();
+    assert_eq!(
+        figures, 7,
+        "the row must carry exactly seven figures — offered, narrowed, \
+         refused, lossy, verified, wide, narrow: {line}",
+    );
+    // `wide` and `narrow` are the same grids priced twice and are never added;
+    // both must be present as byte figures so a reader cannot mistake one for
+    // a total.
+    assert!(
+        line.ends_with(" B"),
+        "the row ends with the narrow byte figure: {line}",
+    );
+}

@@ -50,7 +50,7 @@ pub(crate) fn lambert_grid_stepped(
 
     HrrrGridData {
         parameter,
-        values,
+        values: crate::render::gridded::GridValues::F32(values),
         coords: GridCoords::Lambert(geometry),
         ni,
         nj,

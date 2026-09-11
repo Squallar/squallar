@@ -14,7 +14,7 @@ fn grid(parameter: ModelParameter, values: Vec<f32>) -> HrrrGridData {
         crate::hrrr::summarize_values(&values, |v| parameter.paints(v));
     HrrrGridData {
         parameter,
-        values,
+        values: crate::render::gridded::GridValues::F32(values),
         coords: crate::hrrr::GridCoords::Explicit {
             lats: vec![35.1, 35.1, 35.0, 35.0],
             lons: vec![-97.1, -97.0, -97.1, -97.0],

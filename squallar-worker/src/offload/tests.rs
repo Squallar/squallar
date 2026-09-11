@@ -655,7 +655,7 @@ fn a_model_grid() -> squallar_overlays::hrrr::HrrrGridData {
         squallar_overlays::hrrr::summarize_values(&values, |v| parameter.paints(v));
     HrrrGridData {
         parameter,
-        values,
+        values: squallar_overlays::render::gridded::GridValues::F32(values),
         coords: GridCoords::Lambert(geometry),
         ni,
         nj,
@@ -4558,7 +4558,11 @@ fn the_model_render_is_byte_identical_direct_and_via_the_wire() {
     // could zero.
     let mut moved = a_model_grid();
     let (ci, cj) = ((win.i0 + win.i1) / 2, (win.j0 + win.j1) / 2);
-    moved.values[cj * moved.ni + ci] = 4000.0;
+    {
+        let mut v: Vec<f32> = moved.values.iter().collect();
+        v[cj * moved.ni + ci] = 4000.0;
+        moved.values = squallar_overlays::render::gridded::GridValues::F32(v);
+    }
     let repainted = overlay_raster_via_wire(&JobRequest {
         geometry,
         job: DescribedJob::new(GriddedInput::Whole(std::sync::Arc::new(moved))),

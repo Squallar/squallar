@@ -111,7 +111,11 @@ fn a_value_outside_the_window_is_dead_and_one_inside_is_not() {
          to probe and this test proves nothing",
     );
     let mut outside = grid.clone();
-    outside.values[0] = 4000.0;
+    {
+        let mut v: Vec<f32> = outside.values.iter().collect();
+        v[0] = 4000.0;
+        outside.values = crate::render::gridded::GridValues::F32(v);
+    }
     let moved_outside = rasterize_gridded(&GriddedInput::Whole(Arc::new(outside)), &bounds, W, H);
     assert_eq!(
         reference.rgba, moved_outside.rgba,
@@ -126,7 +130,11 @@ fn a_value_outside_the_window_is_dead_and_one_inside_is_not() {
     let draw = win.interior(grid.ni, grid.nj);
     let (ci, cj) = ((draw.i0 + draw.i1) / 2, (draw.j0 + draw.j1) / 2);
     let mut inside = grid.clone();
-    inside.values[cj * grid.ni + ci] = 4000.0;
+    {
+        let mut v: Vec<f32> = inside.values.iter().collect();
+        v[cj * grid.ni + ci] = 4000.0;
+        inside.values = crate::render::gridded::GridValues::F32(v);
+    }
     let moved_inside = rasterize_gridded(
         &GriddedInput::Window(window_form(&inside, &bounds, W, H)),
         &bounds,

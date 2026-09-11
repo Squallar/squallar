@@ -851,7 +851,15 @@ fn tile_png_codes(
 > {
     let shape = || format!("MRMS: cannot tile a {ni}x{nj} grid in this build's memory");
     let mut bands = crate::render::gridded::TileBands::new(
-        ni, nj, band, ref_val, two_pow, dig_factor, nan_codes,
+        ni,
+        nj,
+        band,
+        crate::render::gridded::TileDecode::Affine {
+            ref_val,
+            two_pow,
+            dig_factor,
+            nan_codes,
+        },
     )
     .ok_or_else(shape)?;
     let sample_bytes = plan.sample_bytes;

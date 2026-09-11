@@ -351,8 +351,18 @@ fn flat_of(plane: Vec<ScaledCode>) -> ScaledU16 {
 }
 
 fn tiled_of(plane: &[ScaledCode], ni: usize, nj: usize) -> TiledU16 {
-    TiledU16::from_plane(plane, ni, nj, -9990.0, 1.0, 0.1, vec![0, 9000])
-        .expect("a plane of the shape beside it tiles")
+    TiledU16::from_plane(
+        plane,
+        ni,
+        nj,
+        crate::render::gridded::TileDecode::Affine {
+            ref_val: -9990.0,
+            two_pow: 1.0,
+            dig_factor: 0.1,
+            nan_codes: vec![0, 9000],
+        },
+    )
+    .expect("a plane of the shape beside it tiles")
 }
 
 /// **Every point, bit for bit, against the flat store it replaces** — the whole
@@ -419,8 +429,18 @@ fn a_tiled_store_holds_only_the_tiles_that_carry_more_than_one_code() {
 
     // A plane of one code anywhere is index, prefix sum and reserved codes and
     // nothing else — the shape a mosaic's ocean is made of.
-    let empty = TiledU16::from_plane(&vec![0u16; ni * nj], ni, nj, -9990.0, 1.0, 0.1, vec![0])
-        .expect("tiles");
+    let empty = TiledU16::from_plane(
+        &vec![0u16; ni * nj],
+        ni,
+        nj,
+        crate::render::gridded::TileDecode::Affine {
+            ref_val: -9990.0,
+            two_pow: 1.0,
+            dig_factor: 0.1,
+            nan_codes: vec![0],
+        },
+    )
+    .expect("tiles");
     let tiles = ni.div_ceil(TILE) * nj.div_ceil(TILE);
     assert_eq!(
         empty.resident_bytes(),
@@ -432,8 +452,18 @@ fn a_tiled_store_holds_only_the_tiles_that_carry_more_than_one_code() {
     // **And the worst case is bounded.** Every tile distinct: the arena is the
     // plane rounded up to whole slots, and the overhead above it is the index.
     let all_distinct: Vec<u16> = (0..(ni * nj) as u32).map(|k| (k % 65_536) as u16).collect();
-    let worst =
-        TiledU16::from_plane(&all_distinct, ni, nj, -9990.0, 1.0, 0.1, vec![]).expect("tiles");
+    let worst = TiledU16::from_plane(
+        &all_distinct,
+        ni,
+        nj,
+        crate::render::gridded::TileDecode::Affine {
+            ref_val: -9990.0,
+            two_pow: 1.0,
+            dig_factor: 0.1,
+            nan_codes: vec![],
+        },
+    )
+    .expect("tiles");
     assert_eq!(worst.arena().len(), tiles * TILE_CELLS);
     assert_eq!(
         worst.resident_bytes(),
@@ -471,10 +501,7 @@ fn a_row_band_is_contiguous_and_rebuilds_to_the_same_values() {
         tj0 * TILE,
         tiled.band_index(tj0, tj1),
         tiled.arena()[range].to_vec(),
-        tiled.ref_val,
-        tiled.two_pow,
-        tiled.dig_factor,
-        tiled.nan_codes.clone(),
+        tiled.decode.clone(),
     )
     .expect("the band the lend cut is the band the index names");
 
@@ -508,17 +535,7 @@ fn a_band_index_that_does_not_match_its_arena_is_refused() {
     let arena = tiled.arena()[range].to_vec();
     let rows = (tj1 - tj0) * TILE;
     let build = |index: Vec<u32>, arena: Vec<u16>| {
-        TiledU16::from_band(
-            ni,
-            rows,
-            tj0 * TILE,
-            index,
-            arena,
-            tiled.ref_val,
-            tiled.two_pow,
-            tiled.dig_factor,
-            tiled.nan_codes.clone(),
-        )
+        TiledU16::from_band(ni, rows, tj0 * TILE, index, arena, tiled.decode.clone())
     };
     assert!(
         build(index.clone(), arena.clone()).is_some(),
@@ -554,8 +571,18 @@ fn a_band_index_that_does_not_match_its_arena_is_refused() {
 /// plane ever live — out of a plane this test holds only so it has something to
 /// compare against.
 fn banded_of(plane: &[ScaledCode], ni: usize, nj: usize) -> TiledU16 {
-    let mut bands = TileBands::new(ni, nj, Vec::new(), -9990.0, 1.0, 0.1, vec![0, 9000])
-        .expect("a builder for a real shape");
+    let mut bands = TileBands::new(
+        ni,
+        nj,
+        Vec::new(),
+        TileDecode::Affine {
+            ref_val: -9990.0,
+            two_pow: 1.0,
+            dig_factor: 0.1,
+            nan_codes: vec![0, 9000],
+        },
+    )
+    .expect("a builder for a real shape");
     for row in plane.chunks_exact(ni) {
         bands
             .fill_row(|dst| dst.copy_from_slice(row))
@@ -593,8 +620,18 @@ fn a_banded_build_is_the_same_store_as_a_plane_and_never_holds_one() {
 fn the_only_row_buffer_a_build_holds_is_one_band_of_it() {
     let (ni, nj) = (101usize, 67usize);
     let plane = mixed_plane(ni, nj);
-    let mut bands = TileBands::new(ni, nj, Vec::new(), -9990.0, 1.0, 0.1, vec![0, 9000])
-        .expect("a builder for a real shape");
+    let mut bands = TileBands::new(
+        ni,
+        nj,
+        Vec::new(),
+        TileDecode::Affine {
+            ref_val: -9990.0,
+            two_pow: 1.0,
+            dig_factor: 0.1,
+            nan_codes: vec![0, 9000],
+        },
+    )
+    .expect("a builder for a real shape");
     for row in plane.chunks_exact(ni) {
         bands
             .fill_row(|dst| dst.copy_from_slice(row))
@@ -673,8 +710,18 @@ fn a_builder_fed_fewer_rows_than_its_grid_declares_refuses() {
     let (ni, nj) = (101usize, 67usize);
     let plane = mixed_plane(ni, nj);
     for short in [0usize, 1, 4 * TILE, nj - 1] {
-        let mut bands = TileBands::new(ni, nj, Vec::new(), -9990.0, 1.0, 0.1, vec![0, 9000])
-            .expect("a builder for a real shape");
+        let mut bands = TileBands::new(
+            ni,
+            nj,
+            Vec::new(),
+            TileDecode::Affine {
+                ref_val: -9990.0,
+                two_pow: 1.0,
+                dig_factor: 0.1,
+                nan_codes: vec![0, 9000],
+            },
+        )
+        .expect("a builder for a real shape");
         for row in plane.chunks_exact(ni).take(short) {
             bands
                 .fill_row(|dst| dst.copy_from_slice(row))
@@ -695,8 +742,18 @@ fn a_builder_fed_fewer_rows_than_its_grid_declares_refuses() {
 fn a_builder_refuses_a_row_past_the_grid_it_was_told_about() {
     let (ni, nj) = (101usize, 67usize);
     let plane = mixed_plane(ni, nj);
-    let mut bands = TileBands::new(ni, nj, Vec::new(), -9990.0, 1.0, 0.1, vec![0, 9000])
-        .expect("a builder for a real shape");
+    let mut bands = TileBands::new(
+        ni,
+        nj,
+        Vec::new(),
+        TileDecode::Affine {
+            ref_val: -9990.0,
+            two_pow: 1.0,
+            dig_factor: 0.1,
+            nan_codes: vec![0, 9000],
+        },
+    )
+    .expect("a builder for a real shape");
     for row in plane.chunks_exact(ni) {
         bands
             .fill_row(|dst| dst.copy_from_slice(row))
@@ -705,5 +762,113 @@ fn a_builder_refuses_a_row_past_the_grid_it_was_told_about() {
     assert!(
         bands.fill_row(|dst| dst.fill(0)).is_none(),
         "row {nj} of a {nj}-row grid was accepted",
+    );
+}
+
+// ── The palette arm ─────────────────────────────────────────────────────────
+
+/// **Every point of a plane reads back as the bit pattern it went in as**, and
+/// every `NaN` spelling folds to one table entry rather than spending a slot
+/// each.
+///
+/// The test holds BOTH sides — the plane it wrote and the store built from it —
+/// so this is an independent instrument from the walk `from_f32_plane` does
+/// inside itself. Two instruments, the standard the radar truncation was held
+/// to.
+///
+/// Floor: `points` is asserted against the shape, so a walk that compared
+/// nothing cannot pass.
+#[test]
+fn a_palette_store_round_trips_every_point_and_folds_nan() {
+    let (ni, nj) = (37usize, 23usize);
+    // Values chosen to include the steps an affine cannot hold: 0.09999847 is
+    // MXUPHL's measured step and 0.06249905 is GUST's.
+    let plane: Vec<f32> = (0..ni * nj)
+        .map(|i| match i % 7 {
+            0 => f32::NAN,
+            1 => -0.0,
+            2 => 0.0,
+            3 => 0.099_998_47_f32 * (i as f32),
+            4 => 0.062_499_05_f32 * (i as f32),
+            5 => f32::from_bits(0x7fc0_1234), // a second NaN spelling
+            _ => -10.0,
+        })
+        .collect();
+
+    let tiled = TiledU16::from_f32_plane(&plane, ni, nj).expect("a real shape narrows");
+    let mut points = 0usize;
+    for (idx, &want) in plane.iter().enumerate() {
+        let got = tiled.get(idx).expect("a point inside the grid");
+        if want.is_nan() {
+            assert!(got.is_nan(), "point {idx} was {want} and read back {got}");
+        } else {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "point {idx} was {want} and read back {got}",
+            );
+        }
+        points += 1;
+    }
+    assert_eq!(
+        points,
+        ni * nj,
+        "the walk compared fewer points than the grid"
+    );
+
+    // -0.0 and 0.0 are different bit patterns and must not be folded into one
+    // another; the two NaN spellings must be.
+    let TileDecode::Palette(table) = &tiled.decode else {
+        panic!("a narrowed plane must carry a palette");
+    };
+    assert_eq!(
+        table.iter().filter(|v| v.is_nan()).count(),
+        1,
+        "two NaN spellings must share one entry",
+    );
+    assert!(
+        table.iter().any(|v| v.to_bits() == (-0.0f32).to_bits())
+            && table.iter().any(|v| v.to_bits() == 0.0f32.to_bits()),
+        "-0.0 and 0.0 are different values and each needs its own entry",
+    );
+}
+
+/// **A plane with more distinct values than a code can reach is REFUSED, not
+/// approximated.** The caller keeps the wide plane; there is no third answer.
+#[test]
+fn a_palette_refuses_a_plane_no_code_can_index() {
+    let n = MAX_PALETTE_ENTRIES + 1_000;
+    let plane: Vec<f32> = (0..n)
+        .map(|i| f32::from_bits(0x3f80_0000 + i as u32))
+        .collect();
+    assert!(
+        TiledU16::from_f32_plane(&plane, n, 1).is_none(),
+        "a plane of {n} distinct values must be refused, never quantised",
+    );
+}
+
+/// **A uniform plane costs its index and nothing else** — the property the
+/// sparse model fields are bought with.
+#[test]
+fn a_uniform_palette_plane_stores_no_arena() {
+    let (ni, nj) = (64usize, 64usize);
+    let tiled = TiledU16::from_f32_plane(&vec![-10.0f32; ni * nj], ni, nj).expect("tiles");
+    assert!(
+        tiled.arena().is_empty(),
+        "every tile is uniform, so no tile may take an arena slot",
+    );
+    assert_eq!(tiled.get(0), Some(-10.0));
+    assert_eq!(tiled.get(ni * nj - 1), Some(-10.0));
+}
+
+/// The same plane always builds the same store, so two builds of one granule
+/// are comparable byte for byte.
+#[test]
+fn a_palette_store_is_a_function_of_its_plane() {
+    let (ni, nj) = (40usize, 40usize);
+    let plane: Vec<f32> = (0..ni * nj).map(|i| (i % 19) as f32 * 0.25).collect();
+    assert_eq!(
+        TiledU16::from_f32_plane(&plane, ni, nj),
+        TiledU16::from_f32_plane(&plane, ni, nj),
     );
 }

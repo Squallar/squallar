@@ -964,7 +964,7 @@ impl JobSpec for GriddedJob {
         match input {
             GriddedInput::Whole(grid) => Some(ResidentBytes::of_range(
                 std::sync::Arc::clone(grid),
-                |g| bytemuck::cast_slice(&g.values),
+                |g| g.values.stored_bytes(),
                 start,
                 len,
             )),
@@ -1122,10 +1122,8 @@ enum WireValues {
     /// by the window the head names, which the raster iterates — they are just
     /// not cut out of the bytes.
     Tiled {
-        ref_val: f32,
-        two_pow: f32,
-        dig_factor: f32,
-        nan_codes: Vec<u16>,
+        /// How the band's codes read back — the affine, or a palette.
+        decode: crate::render::gridded::TileDecode,
         /// The band's first grid row. A multiple of `gridded::TILE`.
         origin_j: u32,
         /// Grid rows the band covers.
@@ -1141,8 +1139,18 @@ const WIRE_VALUES_F32: u8 = 0;
 const WIRE_VALUES_SCALED_U16: u8 = 1;
 /// Values tag: one byte a point, plus the window's absent points.
 const WIRE_VALUES_BYTES: u8 = 2;
-/// Values tag: the tiled 16-bit store, a band of whole tile rows.
+/// Values tag: the tiled 16-bit store, a band of whole tile rows, read back
+/// through the affine.
 const WIRE_VALUES_TILED_U16: u8 = 3;
+/// Values tag: the same tiled band, read back through a **palette**.
+///
+/// **A new tag rather than a sub-tag inside tag 3**, so that a build which
+/// predates the palette reports an ABSENCE and not a wrong population: its
+/// `match` falls to `_ => None` and the pane keeps its last texture, where a
+/// discriminant byte added inside tag 3 would have been read as the first byte
+/// of `ref_val` and drawn a grid of nonsense. Tag 3's layout is byte-identical
+/// to what it always was, so an MRMS band on the wire is unchanged.
+const WIRE_VALUES_TILED_PALETTE: u8 = 4;
 
 /// **How many tile index entries a head may name.**
 ///
@@ -1182,10 +1190,7 @@ impl WireValues {
                     .saturating_sub(origin_j)
                     .min(tj1.saturating_sub(tj0) * crate::render::gridded::TILE);
                 Self::Tiled {
-                    ref_val: t.ref_val,
-                    two_pow: t.two_pow,
-                    dig_factor: t.dig_factor,
-                    nan_codes: t.nan_codes.clone(),
+                    decode: t.decode.clone(),
                     origin_j: origin_j as u32,
                     rows: rows as u32,
                     index: t.band_index(tj0, tj1),
@@ -1269,21 +1274,34 @@ impl WireValues {
                 }
             }
             Self::Tiled {
-                ref_val,
-                two_pow,
-                dig_factor,
-                nan_codes,
+                decode,
                 origin_j,
                 rows,
                 index,
             } => {
-                out.push(WIRE_VALUES_TILED_U16);
-                out.extend_from_slice(&ref_val.to_le_bytes());
-                out.extend_from_slice(&two_pow.to_le_bytes());
-                out.extend_from_slice(&dig_factor.to_le_bytes());
-                out.push(nan_codes.len() as u8);
-                for code in nan_codes {
-                    out.extend_from_slice(&code.to_le_bytes());
+                match decode {
+                    crate::render::gridded::TileDecode::Affine {
+                        ref_val,
+                        two_pow,
+                        dig_factor,
+                        nan_codes,
+                    } => {
+                        out.push(WIRE_VALUES_TILED_U16);
+                        out.extend_from_slice(&ref_val.to_le_bytes());
+                        out.extend_from_slice(&two_pow.to_le_bytes());
+                        out.extend_from_slice(&dig_factor.to_le_bytes());
+                        out.push(nan_codes.len() as u8);
+                        for code in nan_codes {
+                            out.extend_from_slice(&code.to_le_bytes());
+                        }
+                    }
+                    crate::render::gridded::TileDecode::Palette(table) => {
+                        out.push(WIRE_VALUES_TILED_PALETTE);
+                        out.extend_from_slice(&(table.len() as u32).to_le_bytes());
+                        // One copy of the whole table, for the reason the index
+                        // below is copied whole: this runs on the FRAME THREAD.
+                        out.extend_from_slice(bytemuck::cast_slice(table));
+                    }
                 }
                 out.extend_from_slice(&origin_j.to_le_bytes());
                 out.extend_from_slice(&rows.to_le_bytes());
@@ -1334,18 +1352,44 @@ impl WireValues {
                 }
                 Some(Self::Bytes { absent })
             }
-            WIRE_VALUES_TILED_U16 => {
-                let ref_val = r.f32()?;
-                let two_pow = r.f32()?;
-                let dig_factor = r.f32()?;
-                let count = usize::from(r.u8()?);
-                if count > crate::render::gridded::MAX_NAN_CODES {
-                    return None;
-                }
-                let mut nan_codes = Vec::with_capacity(count);
-                for _ in 0..count {
-                    nan_codes.push(r.u16()?);
-                }
+            tag @ (WIRE_VALUES_TILED_U16 | WIRE_VALUES_TILED_PALETTE) => {
+                let decode = if tag == WIRE_VALUES_TILED_U16 {
+                    let ref_val = r.f32()?;
+                    let two_pow = r.f32()?;
+                    let dig_factor = r.f32()?;
+                    let count = usize::from(r.u8()?);
+                    if count > crate::render::gridded::MAX_NAN_CODES {
+                        return None;
+                    }
+                    let mut nan_codes = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        nan_codes.push(r.u16()?);
+                    }
+                    crate::render::gridded::TileDecode::Affine {
+                        ref_val,
+                        two_pow,
+                        dig_factor,
+                        nan_codes,
+                    }
+                } else {
+                    let count = r.u32()? as usize;
+                    // Bounded BEFORE the reservation, for the reason the index
+                    // count below is.
+                    if count > crate::render::gridded::MAX_PALETTE_ENTRIES {
+                        return None;
+                    }
+                    let bytes = r.take(count.checked_mul(size_of::<f32>())?)?;
+                    crate::render::gridded::TileDecode::Palette(
+                        bytes
+                            .chunks_exact(size_of::<f32>())
+                            .map(|c| {
+                                f32::from_le_bytes(
+                                    c.try_into().expect("`chunks_exact` yields four"),
+                                )
+                            })
+                            .collect(),
+                    )
+                };
                 let origin_j = r.u32()?;
                 let rows = r.u32()?;
                 let entries = r.u32()? as usize;
@@ -1361,10 +1405,7 @@ impl WireValues {
                     .map(|c| u32::from_le_bytes(c.try_into().expect("`chunks_exact` yields four")))
                     .collect();
                 Some(Self::Tiled {
-                    ref_val,
-                    two_pow,
-                    dig_factor,
-                    nan_codes,
+                    decode,
                     origin_j,
                     rows,
                     index,
@@ -1426,10 +1467,7 @@ impl WireValues {
             // the one it lent is answered `None` here rather than sampled at
             // the wrong tile.
             Self::Tiled {
-                ref_val,
-                two_pow,
-                dig_factor,
-                nan_codes,
+                decode,
                 origin_j,
                 rows,
                 index,
@@ -1446,10 +1484,7 @@ impl WireValues {
                         )
                     })
                     .collect(),
-                *ref_val,
-                *two_pow,
-                *dig_factor,
-                nan_codes.clone(),
+                decode.clone(),
             )
             .map(GridValues::Tiled),
         }
@@ -3047,8 +3082,18 @@ mod tests {
                 }
             })
             .collect();
-        let tiled = TiledU16::from_plane(&plane, ni, nj, -9990.0, 1.0, 0.1, vec![0, 9000])
-            .expect("a plane of the shape beside it tiles");
+        let tiled = TiledU16::from_plane(
+            &plane,
+            ni,
+            nj,
+            crate::render::gridded::TileDecode::Affine {
+                ref_val: -9990.0,
+                two_pow: 1.0,
+                dig_factor: 0.1,
+                nan_codes: vec![0, 9000],
+            },
+        )
+        .expect("a plane of the shape beside it tiles");
         let page = GridValues::Tiled(tiled.clone());
         assert!(
             page.resident_bytes() < ni * nj * 2,

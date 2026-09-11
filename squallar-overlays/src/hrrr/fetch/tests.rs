@@ -540,7 +540,7 @@ fn a_synthetic_lambert_message_decodes_through_the_real_parse_path() {
         "template 3.30 must take the lambert branch of grid_coords",
     );
     assert!(
-        grid.values.iter().all(|&v| v == -75.0),
+        grid.values.iter().all(|v| v == -75.0),
         "nbits = 0 is a constant field at the reference value: {:?}",
         grid.values,
     );
@@ -1961,7 +1961,10 @@ fn refc_values_hold_the_pins_from_the_first_green_run() {
         (1_905_140, -10.0), // last point
     ];
     for (index, expected) in PINS {
-        let got = REFC_GRID.values[index];
+        let got = REFC_GRID
+            .values
+            .get(index)
+            .expect("a point inside the grid");
         assert!(
             got == expected,
             "values[{index}] moved: decoder produced {got:?}, pin is {expected:?} \
@@ -1988,7 +1991,7 @@ fn the_real_refc_grid_paints_through_the_production_rasterizer() {
         .values
         .iter()
         .enumerate()
-        .max_by(|a, b| a.1.total_cmp(b.1))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
         .expect("1.9 M points");
     let (lat, lon) = grid.coords.at(max_index).expect("max index is on the grid");
     let bounds = GeoBounds {
@@ -2021,4 +2024,58 @@ fn the_real_refc_grid_paints_through_the_production_rasterizer() {
         stray, 0,
         "a viewport that excludes the whole grid painted {stray} pixels",
     );
+}
+
+/// **The real committed record narrows, and not one of its 1,905,141 points
+/// reads back wrong.**
+///
+/// The at-scale losslessness gate, on the shipped path: `parse_grib2` decodes
+/// and narrows exactly as production does, and the store's own walk compares
+/// every point against the plane it was built from. This reads that walk's
+/// counters rather than repeating it, so the two are a producer and a reader
+/// and not one instrument marking its own homework — and `verified` is the
+/// denominator that makes `lossy 0` mean something rather than meaning the
+/// check never ran.
+///
+/// Floor: tamper `from_f32_plane`'s arena write and `lossy` goes non-zero, the
+/// store is refused, and `values` falls back to the wide `F32` arm — so this
+/// test fails on both of its assertions at once.
+#[test]
+fn the_committed_record_narrows_and_reads_back_bit_for_bit() {
+    use crate::render::gridded::{GridValues, narrowing};
+
+    let grid = &**REFC_GRID;
+    assert_eq!(grid.values.len(), 1_905_141);
+
+    let GridValues::Tiled(tiled) = &grid.values else {
+        panic!(
+            "the committed REFC record did not narrow; it is the grid the \
+             whole model-grid saving is measured on",
+        );
+    };
+
+    // 7,620,564 B of `f32` plane is what this store replaces.
+    let wide = grid.values.len() * size_of::<f32>();
+    let narrow = tiled.resident_bytes();
+    assert!(
+        narrow * 2 < wide,
+        "the narrowing must at least halve the plane: {narrow} B against \
+         {wide} B. The floor is the palette alone (a code is half an `f32`); \
+         measured over 24 real records the worst was -48.7 %.",
+    );
+
+    let t = narrowing::totals();
+    assert_eq!(
+        t.lossy, 0,
+        "a built store did not read back as the plane it was built from; it \
+         was refused and the wide plane kept, so the picture is right and the \
+         tiler has a bug",
+    );
+    assert!(
+        t.verified >= 1_905_141,
+        "only {} points were ever compared, which is fewer than this one \
+         grid: `lossy 0` beside that is a check that did not run",
+        t.verified,
+    );
+    assert!(t.narrowed >= 1, "the counter must show this grid narrowing");
 }

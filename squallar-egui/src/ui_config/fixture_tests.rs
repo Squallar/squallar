@@ -1378,7 +1378,7 @@ fn two_panes_hold_different_hrrr_parameters_through_every_read_and_a_reopen() {
             squallar_overlays::hrrr::summarize_values(&values, |v| parameter.paints(v));
         HrrrGridData {
             parameter,
-            values,
+            values: squallar_overlays::render::gridded::GridValues::F32(values),
             coords: GridCoords::Explicit { lats, lons },
             ni,
             nj,

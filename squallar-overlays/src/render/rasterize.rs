@@ -3789,7 +3789,7 @@ impl GriddedInput {
     /// business and none of the raster's.
     fn whole_values(&self) -> Option<(ValuesRef<'_>, usize)> {
         match self {
-            Self::Whole(grid) => Some((ValuesRef::F32(&grid.values), grid.ni)),
+            Self::Whole(grid) => Some((grid.values.view(), grid.ni)),
             Self::Resident(grid) => Some((grid.values.view(), grid.ni)),
             Self::Window(_) => None,
         }
@@ -3800,7 +3800,7 @@ impl GriddedInput {
     /// What the wire tags itself with, and what the encoders dispatch on.
     pub fn values_ref(&self) -> ValuesRef<'_> {
         match self {
-            Self::Whole(grid) => ValuesRef::F32(&grid.values),
+            Self::Whole(grid) => grid.values.view(),
             Self::Resident(grid) => grid.values.view(),
             Self::Window(window) => window.values.view(),
         }

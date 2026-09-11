@@ -251,7 +251,7 @@ fn the_mrms_mosaic_paints_the_same_pixel_count_from_a_box_written_a_turn_up() {
     let parameter = ModelParameter::SurfaceBasedCape;
     let grid = HrrrGridData {
         parameter,
-        values,
+        values: crate::render::gridded::GridValues::F32(values),
         coords,
         ni: MRMS_NI,
         nj: MRMS_NJ,

@@ -66,7 +66,7 @@ fn a_seedable_grid() -> squallar_overlays::hrrr::HrrrGridData {
         squallar_overlays::hrrr::summarize_values(&values, |v| parameter.paints(v));
     HrrrGridData {
         parameter,
-        values,
+        values: squallar_overlays::render::gridded::GridValues::F32(values),
         coords: GridCoords::Explicit { lats, lons },
         ni,
         nj,

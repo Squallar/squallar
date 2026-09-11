@@ -85,7 +85,7 @@ fn grid_bytes(grid: &HrrrGridData) -> usize {
         // `size_of` below.
         crate::hrrr::GridCoords::Lambert(_) | crate::hrrr::GridCoords::Regular { .. } => 0,
     };
-    std::mem::size_of::<HrrrGridData>() + std::mem::size_of_val(grid.values.as_slice()) + coords
+    std::mem::size_of::<HrrrGridData>() + grid.values.resident_bytes() + coords
 }
 
 /// **How many bytes of decoded grid this target keeps resident**, across every
@@ -1854,7 +1854,7 @@ impl OverlayHandler for ModelDataHandler {
         // than a tooltip needs.
         let index = grid.coords.nearest(lat, lon)?;
         let (glat, glon) = grid.coords.at(index)?;
-        let best_val = *grid.values.get(index)?;
+        let best_val = grid.values.get(index)?;
         let (dlat, dlon) = (glat - lat, glon - lon);
         // ~0.05° ≈ 5 km at mid-latitudes.
         if dlat * dlat + dlon * dlon > 0.05 * 0.05 {
@@ -2551,7 +2551,7 @@ mod tests {
             crate::hrrr::summarize_values(&values, |v| parameter.paints(v));
         HrrrGridData {
             parameter,
-            values,
+            values: crate::render::gridded::GridValues::F32(values),
             coords: crate::hrrr::GridCoords::Explicit {
                 lats: vec![35.0; n],
                 lons: vec![-97.0; n],
@@ -2708,7 +2708,7 @@ mod tests {
             crate::hrrr::summarize_values(&values, |v| parameter.paints(v));
         let g = HrrrGridData {
             parameter,
-            values,
+            values: crate::render::gridded::GridValues::F32(values),
             coords: crate::hrrr::GridCoords::Explicit {
                 lats: vec![35.0, 35.0, 35.1, 35.1],
                 lons: vec![-97.1, -97.0, -97.1, -97.0],
@@ -2798,7 +2798,7 @@ mod tests {
             crate::hrrr::summarize_values(&values, |v| parameter.paints(v));
         let g = HrrrGridData {
             parameter,
-            values,
+            values: crate::render::gridded::GridValues::F32(values),
             coords: crate::hrrr::GridCoords::Explicit {
                 lats: vec![35.0; 3],
                 lons: vec![185.0, 190.0, 195.0],
@@ -3033,7 +3033,7 @@ mod tests {
         let Some(rasterize::GriddedInput::Whole(grid)) = job.downcast_ref() else {
             panic!("the model layer described a job of another kind");
         };
-        grid.values[0]
+        grid.values.get(0).expect("a point")
     }
 
     /// **WI-6b's central claim: the raster is of the frame the context names,
@@ -3430,7 +3430,7 @@ mod tests {
                 })
                 .unwrap_or_else(|| panic!("f{f_hour:02} is not resident"));
             assert_eq!(
-                resident.values,
+                resident.values.iter().collect::<Vec<f32>>(),
                 vec![value],
                 "f{f_hour:02} answered another hour's grid, so the two keys \
                  share one entry",
@@ -3543,7 +3543,7 @@ mod tests {
         let mut conus_grid = grid(ModelParameter::all()[0], vec![0.0]);
         conus_grid.coords =
             crate::hrrr::GridCoords::Lambert(conus.expect("the CONUS parts are a real grid"));
-        conus_grid.values = vec![0.0; 1799 * 1059];
+        conus_grid.values = crate::render::gridded::GridValues::F32(vec![0.0; 1799 * 1059]);
         assert_eq!(
             grid_bytes(&conus_grid) - std::mem::size_of::<HrrrGridData>(),
             HRRR_CONUS_GRID_BYTES,

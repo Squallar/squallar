@@ -4018,6 +4018,15 @@ impl super::App {
             loud,
             &squallar_egui::heap_census::overlay_grid_states_line("page"),
         );
+        // **What the model-grid narrowing has done**, its own row and added to
+        // nothing above: `wide`/`narrow` are cumulative flow where every figure
+        // on the census line is a level. Always emitted, all-zero included —
+        // `offered 0` is a mechanism that was never reached, and no row at all
+        // is a build without it. See `heap_census::grid_narrowing_line`.
+        say_telemetry(
+            loud,
+            &squallar_egui::heap_census::grid_narrowing_line("page"),
+        );
         // **The overlap between the two states above**, its own row and added
         // to neither: it re-reports bytes `staged` already carries in full.
         // Its `walks` term is the floor — a zero-duplicate reading and a walk

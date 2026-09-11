@@ -610,6 +610,7 @@ fn parse_grib2(
     check_domain_longitude(&bounds, &HRRR_DOMAIN_LON, "HRRR")?;
 
     let (visible_points, value_range) = super::summarize_values(&values, |v| param.paints(v));
+    let values = super::narrow_values(values, ni, nj);
 
     Ok(HrrrGridData {
         parameter: param,
@@ -879,12 +880,13 @@ async fn try_fetch_composite(
         .values
         .iter()
         .zip(other.values.iter())
-        .map(|(&u, &v)| (u * u + v * v).sqrt())
+        .map(|(u, v)| (u * u + v * v).sqrt())
         .collect();
 
     // Recomputed from the merged magnitudes: each component's own summary says
     // nothing about the vector magnitude the user sees.
     let (visible_points, value_range) = super::summarize_values(&values, |v| param.paints(v));
+    let values = super::narrow_values(values, base.ni, base.nj);
 
     Ok(HrrrGridData {
         parameter: *param,

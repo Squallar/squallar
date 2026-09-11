@@ -318,7 +318,7 @@ fn separable_grid(lat_axis: Vec<f64>, lon_axis: Vec<f64>) -> HrrrGridData {
     let (visible_points, value_range) = summarize_values(&values, |v| parameter.paints(v));
     HrrrGridData {
         parameter,
-        values,
+        values: crate::render::gridded::GridValues::F32(values),
         coords: GridCoords::separable(lat_axis, lon_axis),
         ni,
         nj,
@@ -344,7 +344,7 @@ fn wrapping_regular(lon0: f64) -> HrrrGridData {
     let (visible_points, value_range) = summarize_values(&values, |v| parameter.paints(v));
     HrrrGridData {
         parameter,
-        values,
+        values: crate::render::gridded::GridValues::F32(values),
         coords: GridCoords::Regular {
             lat0: 79.5,
             lon0,
@@ -392,12 +392,13 @@ fn the_fixtures_paint_a_different_colour_at_every_neighbour() {
         );
         for j in 0..grid.nj {
             for i in 0..grid.ni {
-                let here = paint.color_for_value(grid.values[j * grid.ni + i]);
+                let at = |k: usize| grid.values.get(k).expect("a point");
+                let here = paint.color_for_value(at(j * grid.ni + i));
                 assert_ne!(here[3], 0, "point ({i}, {j}) paints nothing");
                 if i + 1 < grid.ni {
                     assert_ne!(
                         here,
-                        paint.color_for_value(grid.values[j * grid.ni + i + 1]),
+                        paint.color_for_value(at(j * grid.ni + i + 1)),
                         "columns {i} and {} repeat a colour at row {j}",
                         i + 1,
                     );
@@ -405,7 +406,7 @@ fn the_fixtures_paint_a_different_colour_at_every_neighbour() {
                 if j + 1 < grid.nj {
                     assert_ne!(
                         here,
-                        paint.color_for_value(grid.values[(j + 1) * grid.ni + i]),
+                        paint.color_for_value(at((j + 1) * grid.ni + i)),
                         "rows {j} and {} repeat a colour at column {i}",
                         j + 1,
                     );

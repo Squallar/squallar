@@ -276,7 +276,7 @@ fn cin_grid() -> crate::hrrr::HrrrGridData {
         crate::hrrr::summarize_values(&values, |v| parameter.paints(v));
     HrrrGridData {
         parameter,
-        values,
+        values: crate::render::gridded::GridValues::F32(values),
         coords: GridCoords::Explicit { lats, lons },
         ni,
         nj,
@@ -712,7 +712,7 @@ fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
     );
 
     let mut empty = cin_grid();
-    empty.values.clear();
+    empty.values = crate::render::gridded::GridValues::F32(Vec::new());
     assert_eq!(
         rasterize_gridded(&whole(empty), &BOUNDS, W, H).alpha,
         AlphaMode::Straight,

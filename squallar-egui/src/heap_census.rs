@@ -1619,6 +1619,45 @@ pub fn overlay_grid_states_line(instance: &str) -> String {
     out
 }
 
+/// **What the model-grid palette narrowing has actually done** — the
+/// fires-counter for `TiledU16::from_f32_plane`.
+///
+/// **Always emitted, including all-zero**, and the all-zero reading is the
+/// point of it. Three findings this row keeps apart that a bare byte saving
+/// cannot:
+///
+/// * **not installed** — no row at all. A build without the narrowing prints
+///   nothing here, and that is different from one that narrowed nothing.
+/// * **armed and never offered a grid** — `offered 0`. The mechanism is in and
+///   the scene never reached it, which is how a ~94 MiB cut in this campaign
+///   delivered exactly zero for a day with nothing in any log saying so.
+/// * **offered and refusing** — `offered N, narrowed 0`. The grids arrived and
+///   every one was kept wide; `refused` and `lossy` say which reason.
+///
+/// **`lossy` is the correctness term and zero is the only healthy reading.** A
+/// non-zero means a built store did not read back as the plane it was built
+/// from, so it was DISCARDED and the wide plane kept — the picture is still
+/// right and the tiler has a bug. `verified` is its denominator: `lossy 0`
+/// beside `verified 0` is a check that never ran, and beside
+/// `verified 1905141` it is a grid proved point by point.
+///
+/// **`wide` and `narrow` are the SAME grids priced twice**, before and after,
+/// and are never added to each other or to any census family. Both are
+/// cumulative flow since process start, not levels — a grid counted here may
+/// since have been evicted.
+pub fn grid_narrowing_line(instance: &str) -> String {
+    use core::fmt::Write;
+
+    let t = squallar_overlays::render::gridded::narrowing::totals();
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "grid narrowing ({instance}): offered {}, narrowed {}, refused {}, lossy {}; verified {} points; wide {} B, narrow {} B",
+        t.offered, t.narrowed, t.refused, t.lossy, t.verified, t.wide_bytes, t.narrow_bytes,
+    );
+    out
+}
+
 static OVERLAY_GRID_STATES: [core::sync::atomic::AtomicU64; 4] = [
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),

@@ -397,6 +397,171 @@ pub const TILE_CELLS: usize = TILE * TILE;
 /// carries either with room to spare and the test is a single `and`.
 const TILE_UNIFORM: u32 = 1 << 31;
 
+/// **How a tiled store turns a stored code back into a value.**
+///
+/// Two arms because two sources need two different things, and the second is
+/// not reachable from the first.
+///
+/// [`Self::Affine`] is GRIB2 simple packing read back in place, which is what
+/// MRMS carries: its mosaic really is a 16-bit code and three scalars, so
+/// storing the code back is a **repacking, not a quantisation**.
+///
+/// [`Self::Palette`] is for a source whose decoded values are NOT on a lattice
+/// the affine can express. A model grid is exactly that. Measured over 24 real
+/// HRRR records (12 parameters x 2 seasons), 19 sit on an exact lattice but
+/// five do not: `MXUPHL` steps by 0.09999847, `GUST` by 0.06249905 and one
+/// `PWAT` by 0.12499809, and none of the three round-trips bit-exactly through
+/// `(ref_val + code * two_pow) * dig_factor`. A table indexed by the code is
+/// lossless **by construction** for any grid with at most 65,536 distinct
+/// values — the largest count over that whole corpus was 1,799, so the table
+/// is 7.2 KB against the 7,620,564 B plane it replaces.
+/// **What the palette narrowing has actually done** — the fires-counter for
+/// [`TiledU16::from_f32_plane`], and the denominator that makes a zero
+/// readable.
+///
+/// Five terms, because "it did not fire" and "it is not installed" are
+/// different findings and a bare saving cannot tell them apart. A build without
+/// the narrowing emits no row at all; a build with it that never narrowed a
+/// grid emits `offered 0`; a build that was offered grids and refused every one
+/// emits `offered N, narrowed 0, refused N` and names the reason. That last
+/// case is the one a ~94 MiB cut in this campaign shipped blind to, and it
+/// delivered exactly zero for a day with nothing in any log saying so.
+///
+/// **`wide bytes` and `narrow bytes` are the SAME grids priced twice**, before
+/// and after, and are never added. Both are cumulative flow since process
+/// start, not levels: a grid counted here may since have been evicted.
+pub mod narrowing {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    static OFFERED: AtomicU64 = AtomicU64::new(0);
+    static NARROWED: AtomicU64 = AtomicU64::new(0);
+    static REFUSED_DISTINCT: AtomicU64 = AtomicU64::new(0);
+    static REFUSED_LOSSY: AtomicU64 = AtomicU64::new(0);
+    static POINTS_VERIFIED: AtomicU64 = AtomicU64::new(0);
+    static WIDE_BYTES: AtomicU64 = AtomicU64::new(0);
+    static NARROW_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    /// A plane was offered to the narrowing.
+    pub fn offered() {
+        OFFERED.fetch_add(1, Relaxed);
+    }
+
+    /// A plane narrowed: `wide` bytes of `f32` became `narrow` bytes of store.
+    pub fn narrowed(wide: u64, narrow: u64) {
+        NARROWED.fetch_add(1, Relaxed);
+        WIDE_BYTES.fetch_add(wide, Relaxed);
+        NARROW_BYTES.fetch_add(narrow, Relaxed);
+    }
+
+    /// A plane kept wide because it carried more distinct values than a code
+    /// can reach, or because the allocation could not be served.
+    pub fn refused() {
+        REFUSED_DISTINCT.fetch_add(1, Relaxed);
+    }
+
+    /// **A built store did not read back as the plane it was built from.**
+    ///
+    /// Zero is the only healthy reading and it is emitted whether or not it is
+    /// zero, because a silently lossy narrowing is the one failure this whole
+    /// change must not have. A non-zero here means the store was DISCARDED and
+    /// the wide plane kept, so the picture is still right — but the tiler has a
+    /// bug and this is the row that says so.
+    pub fn refused_lossy() {
+        REFUSED_LOSSY.fetch_add(1, Relaxed);
+    }
+
+    /// Points compared, cumulative — the denominator that makes `lossy 0`
+    /// mean something. A `lossy 0` beside `verified 0` is a check that never
+    /// ran; beside `verified 1,905,141` it is a grid proved point by point.
+    pub fn verified(points: u64) {
+        POINTS_VERIFIED.fetch_add(points, Relaxed);
+    }
+
+    /// Every term, in the order the row prints them.
+    pub struct Totals {
+        pub offered: u64,
+        pub narrowed: u64,
+        pub refused: u64,
+        pub lossy: u64,
+        pub verified: u64,
+        pub wide_bytes: u64,
+        pub narrow_bytes: u64,
+    }
+
+    /// What the narrowing has done since process start.
+    pub fn totals() -> Totals {
+        Totals {
+            offered: OFFERED.load(Relaxed),
+            narrowed: NARROWED.load(Relaxed),
+            refused: REFUSED_DISTINCT.load(Relaxed),
+            lossy: REFUSED_LOSSY.load(Relaxed),
+            verified: POINTS_VERIFIED.load(Relaxed),
+            wide_bytes: WIDE_BYTES.load(Relaxed),
+            narrow_bytes: NARROW_BYTES.load(Relaxed),
+        }
+    }
+}
+
+/// **How many entries a palette may hold.**
+///
+/// A code is a [`ScaledCode`], so a table longer than this is one no code can
+/// reach. Declared here, beside the store, and read by the wire — not spelled
+/// twice.
+pub const MAX_PALETTE_ENTRIES: usize = 1 << 16;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TileDecode {
+    /// `(ref_val + code * two_pow) * dig_factor`, with an exhaustive sentinel
+    /// set. See [`ScaledU16`], whose body this is over the same operands.
+    Affine {
+        ref_val: f32,
+        /// `2^exp` — section 5's binary scale, pre-raised.
+        two_pow: f32,
+        /// `10^-dec` — section 5's decimal scale, pre-raised and negated.
+        dig_factor: f32,
+        /// Every code that reads back as `NaN`.
+        nan_codes: Vec<u16>,
+    },
+    /// The code is an index into this table. A code past its end reads `NaN`
+    /// rather than panicking: a head from another build may name one, and the
+    /// posture every other refusal on this path takes is to leave the pane its
+    /// last texture.
+    Palette(Vec<f32>),
+}
+
+impl TileDecode {
+    /// One stored code read back as the value it stands for.
+    #[inline]
+    pub fn value(&self, code: ScaledCode) -> f32 {
+        match self {
+            Self::Affine {
+                ref_val,
+                two_pow,
+                dig_factor,
+                nan_codes,
+            } => {
+                if nan_codes.contains(&code) {
+                    return f32::NAN;
+                }
+                (ref_val + f32::from(code) * two_pow) * dig_factor
+            }
+            Self::Palette(table) => table.get(code as usize).copied().unwrap_or(f32::NAN),
+        }
+    }
+
+    /// **What the decode itself costs resident** — the sentinel list or the
+    /// table. Counted because `TiledU16::resident_bytes` is the figure the
+    /// `overlay grids` census reads, and a palette is a heap block like any
+    /// other.
+    #[inline]
+    pub fn resident_bytes(&self) -> usize {
+        match self {
+            Self::Affine { nan_codes, .. } => size_of_val(nan_codes.as_slice()),
+            Self::Palette(table) => size_of_val(table.as_slice()),
+        }
+    }
+}
+
 /// **GRIB2 simple packing, kept packed AND kept sparse.**
 ///
 /// The same `(ref_val + code * two_pow) * dig_factor` [`ScaledU16`] evaluates,
@@ -462,15 +627,8 @@ pub struct TiledU16 {
     /// Slots stored before each tile row, `tiles_j + 1` entries. The prefix sum
     /// that turns a row band into that run.
     row_slot: Vec<u32>,
-    pub ref_val: f32,
-    /// `2^exp` — section 5's binary scale, pre-raised.
-    pub two_pow: f32,
-    /// `10^-dec` — section 5's decimal scale, pre-raised and negated.
-    pub dig_factor: f32,
-    /// Every code that reads back as `NaN`. [`ScaledU16::nan_codes`] carries the
-    /// reasoning; this store holds the same list because it decodes codes the
-    /// same way.
-    pub nan_codes: Vec<u16>,
+    /// How a stored code reads back as a value.
+    pub decode: TileDecode,
 }
 
 impl TiledU16 {
@@ -496,20 +654,115 @@ impl TiledU16 {
         codes: &[ScaledCode],
         ni: usize,
         nj: usize,
-        ref_val: f32,
-        two_pow: f32,
-        dig_factor: f32,
-        nan_codes: Vec<u16>,
+        decode: TileDecode,
     ) -> Option<Self> {
         if ni == 0 || nj == 0 || codes.len() != ni.checked_mul(nj)? {
             return None;
         }
-        let mut bands =
-            TileBands::new(ni, nj, Vec::new(), ref_val, two_pow, dig_factor, nan_codes)?;
+        let mut bands = TileBands::new(ni, nj, Vec::new(), decode)?;
         for row in codes.chunks_exact(ni) {
             bands.fill_row(|dst| dst.copy_from_slice(row))?;
         }
         bands.finish().map(|(tiled, _spent_band)| tiled)
+    }
+
+    /// **Tile a plane of `f32` values through a palette**, for a source whose
+    /// decoded values are not on a lattice an affine can express.
+    ///
+    /// `None` — never a panic, and never a lossy approximation — when the plane
+    /// carries more than [`MAX_PALETTE_ENTRIES`] distinct values, or when the
+    /// shape does not match, or when this build cannot serve the allocation.
+    /// The caller then keeps the wide plane, which is what makes this a pure
+    /// narrowing: a grid either round-trips bit for bit or is not narrowed.
+    ///
+    /// **Lossless by construction.** A code is an index into a table built from
+    /// the plane's own distinct bit patterns, so `value(code_at(p))` returns the
+    /// caller's own `f32` for every point, including every `NaN` — which is
+    /// folded to one canonical entry so that a plane with several `NaN`
+    /// spellings does not spend a palette slot on each.
+    ///
+    /// The table is ordered, so the same plane always builds the same store and
+    /// two builds of one granule are comparable byte for byte.
+    pub fn from_f32_plane(values: &[f32], ni: usize, nj: usize) -> Option<Self> {
+        narrowing::offered();
+        if ni == 0 || nj == 0 || values.len() != ni.checked_mul(nj)? {
+            narrowing::refused();
+            return None;
+        }
+        /// The one bit pattern every `NaN` is folded to.
+        const NAN_KEY: u32 = 0x7fc0_0000;
+        let key = |v: f32| if v.is_nan() { NAN_KEY } else { v.to_bits() };
+
+        // Ordered, so the palette is a function of the plane and not of the
+        // iteration that found it.
+        let mut distinct = std::collections::BTreeSet::new();
+        for &v in values {
+            distinct.insert(key(v));
+            if distinct.len() > MAX_PALETTE_ENTRIES {
+                narrowing::refused();
+                return None;
+            }
+        }
+        let mut table: Vec<f32> = Vec::new();
+        if table.try_reserve_exact(distinct.len()).is_err() {
+            narrowing::refused();
+            return None;
+        }
+        table.extend(distinct.iter().map(|&b| f32::from_bits(b)));
+        let code_of: std::collections::HashMap<u32, ScaledCode> = distinct
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| (b, i as ScaledCode))
+            .collect();
+
+        let built = (|| {
+            let mut bands = TileBands::new(ni, nj, Vec::new(), TileDecode::Palette(table))?;
+            for row in values.chunks_exact(ni) {
+                bands.fill_row(|dst| {
+                    for (v, slot) in row.iter().zip(dst.iter_mut()) {
+                        *slot = code_of[&key(*v)];
+                    }
+                })?;
+            }
+            bands.finish().map(|(tiled, _spent_band)| tiled)
+        })();
+        let built = built.filter(|tiled| {
+            // **Every point, every time, against the caller's own plane.**
+            //
+            // Not a sample and not an assertion: a lossy store is refused here
+            // and the wide plane kept, so a tiler bug costs bytes and never a
+            // picture. The walk is one pass of two dependent loads a point, on
+            // the worker that decoded the grid — never the frame thread.
+            let mut ok = true;
+            for (idx, &want) in values.iter().enumerate() {
+                let got = tiled.get(idx);
+                let same = match got {
+                    Some(g) if g.is_nan() => want.is_nan(),
+                    Some(g) => g.to_bits() == want.to_bits(),
+                    None => false,
+                };
+                if !same {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                narrowing::verified(values.len() as u64);
+            } else {
+                narrowing::refused_lossy();
+            }
+            ok
+        });
+        match built {
+            Some(tiled) => {
+                narrowing::narrowed(size_of_val(values) as u64, tiled.resident_bytes() as u64);
+                Some(tiled)
+            }
+            None => {
+                narrowing::refused();
+                None
+            }
+        }
     }
 
     /// A band's store, built at the far end of the wire from the index rows the
@@ -527,10 +780,7 @@ impl TiledU16 {
         origin_j: usize,
         index: Vec<u32>,
         arena: Vec<ScaledCode>,
-        ref_val: f32,
-        two_pow: f32,
-        dig_factor: f32,
-        nan_codes: Vec<u16>,
+        decode: TileDecode,
     ) -> Option<Self> {
         if ni == 0 || nj == 0 {
             return None;
@@ -582,10 +832,7 @@ impl TiledU16 {
             index,
             arena,
             row_slot,
-            ref_val,
-            two_pow,
-            dig_factor,
-            nan_codes,
+            decode,
         })
     }
 
@@ -644,10 +891,7 @@ impl TiledU16 {
     /// body over this store's own operands.
     #[inline]
     pub fn value(&self, code: ScaledCode) -> f32 {
-        if self.nan_codes.contains(&code) {
-            return f32::NAN;
-        }
-        (self.ref_val + f32::from(code) * self.two_pow) * self.dig_factor
+        self.decode.value(code)
     }
 
     /// The value at a flat index in this store's own `ni * nj` space.
@@ -691,7 +935,7 @@ impl TiledU16 {
         size_of_val(self.arena.as_slice())
             + size_of_val(self.index.as_slice())
             + size_of_val(self.row_slot.as_slice())
-            + size_of_val(self.nan_codes.as_slice())
+            + self.decode.resident_bytes()
     }
 
     /// **Whether any point of this store holds `code`.**
@@ -828,10 +1072,7 @@ pub struct TileBands {
     row_slot: Vec<u32>,
     arena: Vec<ScaledCode>,
     slots: usize,
-    ref_val: f32,
-    two_pow: f32,
-    dig_factor: f32,
-    nan_codes: Vec<u16>,
+    decode: TileDecode,
 }
 
 impl TileBands {
@@ -846,10 +1087,7 @@ impl TileBands {
         ni: usize,
         nj: usize,
         mut band: Vec<ScaledCode>,
-        ref_val: f32,
-        two_pow: f32,
-        dig_factor: f32,
-        nan_codes: Vec<u16>,
+        decode: TileDecode,
     ) -> Option<Self> {
         if ni == 0 || nj == 0 {
             return None;
@@ -888,10 +1126,7 @@ impl TileBands {
             row_slot,
             arena,
             slots: 0,
-            ref_val,
-            two_pow,
-            dig_factor,
-            nan_codes,
+            decode,
         })
     }
 
@@ -1006,10 +1241,7 @@ impl TileBands {
                 index: self.index,
                 arena: self.arena,
                 row_slot: self.row_slot,
-                ref_val: self.ref_val,
-                two_pow: self.two_pow,
-                dig_factor: self.dig_factor,
-                nan_codes: self.nan_codes,
+                decode: self.decode,
             },
             self.band,
         ))
