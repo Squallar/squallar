@@ -980,11 +980,13 @@ impl LoopDownloadManager {
     /// The heap first, then the medium. **This is one of the two places that
     /// pays for the spill** — and it is a path that already precedes a bzip2
     /// decode, measured on the production path at 4.7 ms to 41.3 ms
-    /// single-threaded over the 208-volume corpus, against a cold read of
-    /// 1.23 ms to 55.18 ms over the same volumes. The read is the LARGER half
-    /// at the top of that range: a restore is I/O-bound. See
-    /// `archive_spill`, which carries the table and the retraction of the
-    /// 19.3-915.8 ms decode figures this comment used to quote.
+    /// single-threaded over the 208-volume corpus. Against a cold read of
+    /// 1.12 ms to 27.14 ms over the same volumes on a quiet box (loadavg
+    /// 2.75, median of five draws), the read is **22-69 % of the decode and
+    /// never the larger half**, so a restore is CPU-bound. The 1.23-55.18 ms
+    /// read column this comment used to quote was taken at loadavg 18-73 and
+    /// carried the conclusion "I/O-bound" out of that; both are retracted.
+    /// See `archive_spill`, which carries the table.
     pub fn archive_for(&self, site: &str, ts: &chrono::NaiveDateTime) -> Option<Arc<Vec<u8>>> {
         if let Some(held) = self.archive_cache.get(site).and_then(|a| a.get(ts)) {
             return Some(Arc::clone(held));
