@@ -1652,9 +1652,19 @@ fn every_telemetry_line_family_app_render_writes_is_claimed_by_a_probe_or_a_reas
     }
     use Claim::{By, FieldOf, Unread};
 
+    /// **Over `app_render.rs`'s OWN rows.** Not to be confused with
+    /// `SIBLING_UNREAD_CEILING`, the differently-valued ceiling on the gate
+    /// ~190 lines below, which scans `budget_telemetry.rs` and
+    /// `loop_telemetry.rs` instead.
+    ///
     /// The most families that may be `Unread`. A ceiling, permanent, and it
     /// may only FALL — `arch_ratchets`' discipline, for its reason.
     const UNREAD_CEILING: usize = 14;
+    /// **Over `app_render.rs`'s OWN rows**, and 25 rather than
+    /// `SIBLING_FAMILY_FLOOR`'s 19 because it counts a different scan set. The
+    /// two were once both spelled `KNOWN_FAMILY_FLOOR`, ~190 lines apart, and
+    /// a reader who grepped the name got this one first whichever they meant.
+    ///
     /// A floor under the extraction itself, so a rename of the formatters
     /// that makes it match *nothing* fails loudly instead of passing over an
     /// empty list. A gate that cannot fail is worse than one that did not run.
@@ -1844,13 +1854,24 @@ fn every_telemetry_row_the_sibling_modules_write_is_claimed_by_a_probe_or_a_reas
     }
     use Claim::{By, ByNative, Unread};
 
+    /// **Over `budget_telemetry.rs` and `loop_telemetry.rs`** — the SIBLING
+    /// modules, not `app_render.rs`, whose own ceiling is `UNREAD_CEILING`
+    /// ~190 lines above and reads 14.
+    ///
     /// The most families that may be `Unread`. A ceiling, permanent, may only
     /// FALL — `arch_ratchets`' discipline, for its reason.
-    const UNREAD_CEILING: usize = 11;
+    const SIBLING_UNREAD_CEILING: usize = 11;
+    /// **Over `budget_telemetry.rs` and `loop_telemetry.rs`.** Named apart
+    /// from `KNOWN_FAMILY_FLOOR` above, which gates `app_render.rs`'s own rows
+    /// at 25: the two carried the same name for months, and a report quoting
+    /// a bare "18 -> 19" was ambiguous in this file while a grep of the name
+    /// found the wrong one first. A recount applied to the wrong constant is
+    /// correct arithmetic silently weakening the other gate.
+    ///
     /// A floor under the extraction, so a rename that makes it match *nothing*
     /// fails loudly rather than passing over an empty list. Raised 16 -> 17 when
     /// `80ddbbbe8` landed `payload share:`; a floor may rise to what is known to
-    /// be there, unlike `UNREAD_CEILING`, which may only fall.
+    /// be there, unlike `SIBLING_UNREAD_CEILING`, which may only fall.
     ///
     /// Raised 18 -> 19 for `loop decode:`. **The count is OBSERVED, not a
     /// delta to reapply**: the extraction over `budget_telemetry.rs` and
@@ -1860,7 +1881,7 @@ fn every_telemetry_row_the_sibling_modules_write_is_claimed_by_a_probe_or_a_reas
     /// short of reality, with no conflict and nothing red — so on a rebase,
     /// re-run the extraction and set this to what it COUNTS, never to the old
     /// value plus your own one.
-    const KNOWN_FAMILY_FLOOR: usize = 19;
+    const SIBLING_FAMILY_FLOOR: usize = 19;
     // NOTE: no new family landed with `pinned` — it is a FIELD on the existing
     // `loop decoded:` row, which this gate keys past (it reads the prefix up to
     // the first colon). The gate that catches a field addition is
@@ -1973,8 +1994,8 @@ fn every_telemetry_row_the_sibling_modules_write_is_claimed_by_a_probe_or_a_reas
     families.sort_unstable();
     families.dedup();
     assert!(
-        families.len() >= KNOWN_FAMILY_FLOOR,
-        "only {} telemetry row families were extracted from budget_telemetry.rs          and loop_telemetry.rs, under the {KNOWN_FAMILY_FLOOR} known to be          there: the extraction has stopped matching and this gate is passing          over a short list: {families:?}",
+        families.len() >= SIBLING_FAMILY_FLOOR,
+        "only {} telemetry row families were extracted from budget_telemetry.rs          and loop_telemetry.rs, under the {SIBLING_FAMILY_FLOOR} known to be          there: the extraction has stopped matching and this gate is passing          over a short list: {families:?}",
         families.len(),
     );
     let mut unread = 0;
@@ -2012,8 +2033,8 @@ fn every_telemetry_row_the_sibling_modules_write_is_claimed_by_a_probe_or_a_reas
         }
     }
     assert!(
-        unread <= UNREAD_CEILING,
-        "{unread} families are `Unread` and the ceiling is {UNREAD_CEILING}.          It may only fall: give one of them a probe rather than raising it",
+        unread <= SIBLING_UNREAD_CEILING,
+        "{unread} families are `Unread` and the ceiling is {SIBLING_UNREAD_CEILING}.          It may only fall: give one of them a probe rather than raising it",
     );
     assert_eq!(
         families.len(),
