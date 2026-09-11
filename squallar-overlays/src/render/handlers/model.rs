@@ -1872,30 +1872,34 @@ impl OverlayHandler for ModelDataHandler {
     /// a pure function of it — deliberately **not** `data_generation`, which every
     /// HRRR fetch bumps. `+ 1` keeps the first parameter's signature off `0`.
     ///
+    /// **Every field is read from the parameter's own
+    /// [`LegendScale`](squallar_source::product::LegendScale), none asserted.**
+    /// `is_gradient` was hardcoded `true` here while
+    /// [`crate::hrrr::fields`] states it per parameter as `!p.is_banded()`, so
+    /// the five reflectivity bars — which the raster paints as flat 5 dBZ
+    /// bands — drew their legend as a continuous wash.
+    ///
     /// **The stops are borrowed from [`crate::hrrr::fields`], not rebuilt.**
     /// [`ModelParameter::legend_thresholds`] allocates a fresh `Vec` per call,
     /// which is exactly why that module already builds every parameter's
     /// `LegendScale` once into a `&'static`; this asked for the table a second
     /// way and paid an allocation for it on each of the several calls a frame
-    /// makes per pane. Same stops, same order, same source table — `SCALES` is
-    /// built from `legend_thresholds` over `ModelParameter::all()`.
+    /// makes per pane. `SCALES` is built from `legend_thresholds` over
+    /// [`ModelParameter::all`](crate::hrrr::ModelParameter::all), so this is
+    /// the same table by a shorter route.
     fn legend(&self, pane: &PaneRef<'_>) -> Option<Signed<OverlayLegend>> {
         let view = self.view(pane);
         if !view.enabled {
             return None;
         }
-        let thresholds = &crate::hrrr::fields::spec(view.selected_param)
-            .scale
-            .thresholds[..];
-        let min = thresholds.first().map_or(0.0, |e| e.0);
-        let max = thresholds.last().map_or(1.0, |e| e.0);
+        let scale = &crate::hrrr::fields::spec(view.selected_param).scale;
         Some(Signed {
             signature: view.selected_param as u64 + 1,
             items: OverlayLegend {
-                thresholds,
-                is_gradient: true,
-                min_value: min,
-                max_value: max,
+                thresholds: &scale.thresholds,
+                is_gradient: scale.is_gradient,
+                min_value: scale.min_value,
+                max_value: scale.max_value,
                 unit_label: view.selected_param.unit_label(),
             },
         })

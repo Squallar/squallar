@@ -4828,18 +4828,179 @@ mod legend_ladder_tests {
     use squallar_overlays::hrrr::ModelParameter;
     use squallar_overlays::mrms::MrmsProduct;
 
-    fn legend_of(scale: &'static squallar_source::product::LegendScale) -> OverlayLegend {
-        OverlayLegend {
-            thresholds: &scale.thresholds,
-            is_gradient: scale.is_gradient,
-            min_value: scale.min_value,
-            max_value: scale.max_value,
-            unit_label: "dBZ",
-        }
+    /// One bar as a registered layer actually publishes it, beside the
+    /// `LegendScale` the field it was selected for declares.
+    struct PublishedBar {
+        layer: String,
+        field: &'static str,
+        legend: OverlayLegend,
+        scale: &'static squallar_source::product::LegendScale,
     }
 
-    fn mrms_reflectivity() -> OverlayLegend {
-        legend_of(squallar_overlays::mrms::fields::spec(MrmsProduct::ReflectivityComposite).scale)
+    /// **Every colour bar this build publishes, asked of the layers
+    /// themselves.**
+    ///
+    /// Walks [`crate::sources::all`] — the one composition, all eighteen
+    /// registrations — keeps the layers that answer
+    /// [`SourceHandler::carries_legend`], and drives each one across every row
+    /// of its own [`SourceHandler::products`] through the control it names in
+    /// [`SourceHandler::field_control_id`]. Nothing here names a source, a
+    /// product or a parameter, so a nineteenth registration with a bar is
+    /// covered by landing it.
+    ///
+    /// **The bar comes back from `legend`, not from the field's scale.** That
+    /// is the whole point: a helper that built an `OverlayLegend` out of
+    /// `spec(..).scale` would agree with that scale by construction and could
+    /// not see a handler that fills the struct in with something else — which
+    /// is exactly what `ModelDataHandler::legend` did, hardcoding
+    /// `is_gradient: true` over five banded reflectivity ladders.
+    fn every_published_bar() -> Vec<PublishedBar> {
+        use squallar_source::controls::{ControlUpdate, ControlValue};
+        use squallar_source::handler::{PaneMut, PaneRef};
+
+        let mut bars = Vec::new();
+        for mut handler in crate::sources::all() {
+            if !handler.carries_legend() {
+                continue;
+            }
+            let layer = handler.display_name().to_string();
+            let products = handler.products();
+            assert!(
+                !products.is_empty(),
+                "{layer} carries a legend but publishes no fields, so nothing \
+                 below can select one",
+            );
+            let control = handler.field_control_id().unwrap_or_else(|| {
+                panic!(
+                    "{layer} carries a legend over {} fields but names no \
+                     field control, so its bars cannot be reached from here",
+                    products.len(),
+                )
+            });
+
+            handler.set_enabled(true, &mut PaneMut::bare(0));
+            assert!(
+                handler.is_enabled(&PaneRef::bare(0)),
+                "{layer} did not take set_enabled, so its legend would be the \
+                 None a disabled layer answers",
+            );
+
+            for spec in products {
+                handler.apply_control(
+                    &ControlUpdate {
+                        id: control,
+                        value: ControlValue::String(spec.code.to_string()),
+                    },
+                    &mut PaneMut::bare(0),
+                );
+                let legend = handler
+                    .legend(&PaneRef::bare(0))
+                    .unwrap_or_else(|| panic!("{layer} answered no bar for {}", spec.name))
+                    .items;
+                bars.push(PublishedBar {
+                    layer: layer.clone(),
+                    field: spec.name,
+                    legend,
+                    scale: spec.scale,
+                });
+            }
+        }
+        bars
+    }
+
+    /// **How many bars this build publishes — a hand-kept number, and it must
+    /// stay one.**
+    ///
+    /// The second spelling of the census's size, on the same discipline as
+    /// [`crate::sources::REGISTERED_FIELD_COUNT`]: each source is its own
+    /// summand so the row says which registration each bar came from, and it
+    /// is never derived from `products()`, `all()` or anything else that moves
+    /// when a registration moves. A floor computed from the thing it floors
+    /// compares the registry against itself and cannot fail — a layer that
+    /// quietly stopped publishing a bar would hand the walk a shorter
+    /// expectation and be satisfied by it.
+    ///
+    /// The model's twenty-three parameters and MRMS's two products.
+    const PUBLISHED_BAR_COUNT: usize = 23 + 2;
+
+    /// **How many of those bars are banded**, kept the same way and for the
+    /// same reason: this is the half the defect lived on, and a census whose
+    /// banded set silently emptied would pass every band assertion below
+    /// vacuously.
+    ///
+    /// HRRR's five reflectivity fields and MRMS's composite.
+    const BANDED_BAR_COUNT: usize = 5 + 1;
+
+    /// **A layer's bar must report its field's own scale, not assert one.**
+    ///
+    /// `ModelDataHandler::legend` filled `OverlayLegend` in with
+    /// `is_gradient: true` for all twenty-three HRRR parameters while
+    /// `hrrr::fields` states it per parameter as `!p.is_banded()`. The five
+    /// reflectivity bars are banded there and the raster paints them as flat
+    /// 5 dBZ blocks, so the bar beside a forecast composite drew a continuous
+    /// wash over a picture that contained none.
+    ///
+    /// **This is the assertion the sibling test below cannot make.** That one
+    /// probes the painter, and the painter is correct — it reads whatever
+    /// `is_gradient` it is handed. The lie was upstream of it, in the projection
+    /// from `LegendScale` to `OverlayLegend`, so it is that projection that is
+    /// walked here: all four fields a bar carries over from its scale, for
+    /// every bar every registered layer publishes.
+    #[test]
+    fn every_published_bar_reports_its_own_scale() {
+        let bars = every_published_bar();
+        assert_eq!(
+            bars.len(),
+            PUBLISHED_BAR_COUNT,
+            "the census walked {} bars against a hand-kept {PUBLISHED_BAR_COUNT}",
+            bars.len(),
+        );
+
+        for bar in &bars {
+            let PublishedBar {
+                layer,
+                field,
+                legend,
+                scale,
+            } = bar;
+            assert_eq!(
+                legend.is_gradient,
+                scale.is_gradient,
+                "{layer}/{field} publishes a bar drawn as {} while its scale \
+                 says {}",
+                bar_shape(legend.is_gradient),
+                bar_shape(scale.is_gradient),
+            );
+            assert_eq!(
+                legend.thresholds,
+                &scale.thresholds[..],
+                "{layer}/{field} publishes stops its scale does not state",
+            );
+            assert_eq!(
+                legend.min_value, scale.min_value,
+                "{layer}/{field} publishes a bar floor its scale does not state",
+            );
+            assert_eq!(
+                legend.max_value, scale.max_value,
+                "{layer}/{field} publishes a bar ceiling its scale does not \
+                 state",
+            );
+        }
+
+        let banded = bars.iter().filter(|b| !b.scale.is_gradient).count();
+        assert_eq!(
+            banded,
+            BANDED_BAR_COUNT,
+            "{banded} of {} bars are banded against a hand-kept \
+             {BANDED_BAR_COUNT}; the band assertions in \
+             `an_overlay_legend_bands_when_its_scale_says_bands` are only \
+             worth what this set is",
+            bars.len(),
+        );
+    }
+
+    fn bar_shape(is_gradient: bool) -> &'static str {
+        if is_gradient { "a wash" } else { "bands" }
     }
 
     /// **The acceptance for the overlay bar that drew a wash over a banded
@@ -4851,76 +5012,123 @@ mod legend_ladder_tests {
     /// Probed through [`overlay_ramp_sampler`], which is the closure the
     /// painter hands `legend_ramp::ramp` — not a re-derivation of what it ought
     /// to do.
+    ///
+    /// **Over every bar the build publishes, not over MRMS's.** This covered
+    /// the one source it was written for and HRRR's five banded reflectivity
+    /// ladders went on drawing washes for as long as that list stayed a list.
+    /// The bars come from [`every_published_bar`], which asks the layers.
     #[test]
     fn an_overlay_legend_bands_when_its_scale_says_bands() {
-        let mrms = mrms_reflectivity();
-        assert!(!mrms.is_gradient, "precondition: MRMS's dBZ bar is banded");
-        let n = mrms.thresholds.len();
-        assert!(
-            n >= 10,
-            "precondition: {n} stops is too few to read bands off"
-        );
+        let bars = every_published_bar();
+        let mut banded = 0usize;
+        let mut washed = 0usize;
 
-        let sample = overlay_ramp_sampler(&mrms);
+        for PublishedBar {
+            layer,
+            field,
+            legend,
+            ..
+        } in &bars
+        {
+            let n = legend.thresholds.len();
+            let sample = overlay_ramp_sampler(legend);
 
-        // Inside one block the colour does not move...
-        for i in 0..n {
-            let lo = band_start_fraction(i, n);
-            let hi = band_start_fraction(i + 1, n);
-            let inner = [
-                lo + (hi - lo) * 0.1,
-                lo + (hi - lo) * 0.5,
-                hi - (hi - lo) * 0.05,
-            ];
-            for t in inner {
+            if legend.is_gradient {
+                // A wash keeps moving between its stops. Counted as distinct
+                // colours rather than as a probe rate, because that is the
+                // quantity a banded bar bounds: `n` blocks show at most `n`
+                // colours however finely the bar is sampled, so a bar drawn as
+                // bands cannot clear its own stop count and a wash over the
+                // same stops clears it by a wide margin.
+                //
+                // **This branch cannot catch a bar that lies about being a
+                // wash**, and that is not a gap to be closed here: a banded
+                // ladder sampled through the gradient painter is a real
+                // gradient, indistinguishable by colour from one that was
+                // meant. Restoring `is_gradient: true` in
+                // `ModelDataHandler::legend` sends all five HRRR reflectivity
+                // bars down here and every assertion in it passes. What
+                // reddens is the declaration walk in
+                // `every_published_bar_reports_its_own_scale`, and the
+                // hand-kept `BANDED_BAR_COUNT` below — which is why that count
+                // is not derived from the census it floors.
+                let mut seen: Vec<[u8; 4]> =
+                    (0..=512u16).map(|i| sample(f32::from(i) / 512.0)).collect();
+                seen.sort_unstable();
+                seen.dedup();
+                assert!(
+                    seen.len() > n,
+                    "{layer}/{field} is declared a wash but 513 probes over it \
+                     found only {} distinct colours, which its {n} stops would \
+                     bound if it were drawn as bands",
+                    seen.len(),
+                );
+                washed += 1;
+                continue;
+            }
+
+            assert!(
+                n >= 10,
+                "{layer}/{field}: {n} stops is too few to read bands off",
+            );
+
+            // Inside one block the colour does not move...
+            for i in 0..n {
+                let lo = band_start_fraction(i, n);
+                let hi = band_start_fraction(i + 1, n);
+                let inner = [
+                    lo + (hi - lo) * 0.1,
+                    lo + (hi - lo) * 0.5,
+                    hi - (hi - lo) * 0.05,
+                ];
+                for t in inner {
+                    assert_eq!(
+                        sample(t),
+                        sample(lo),
+                        "{layer}/{field}: band {i} of {n} is not flat: t={t} \
+                         differs from its own foot",
+                    );
+                }
                 assert_eq!(
-                    sample(t),
                     sample(lo),
-                    "band {i} of {n} is not flat: t={t} differs from its own foot",
+                    [
+                        legend.thresholds[i].1[0],
+                        legend.thresholds[i].1[1],
+                        legend.thresholds[i].1[2],
+                        255,
+                    ],
+                    "{layer}/{field}: band {i} does not show stop {i}'s own \
+                     colour",
                 );
             }
-            assert_eq!(
-                sample(lo),
-                [
-                    mrms.thresholds[i].1[0],
-                    mrms.thresholds[i].1[1],
-                    mrms.thresholds[i].1[2],
-                    255,
-                ],
-                "band {i} does not show stop {i}'s own colour",
-            );
+
+            // ...and it does move across every boundary, so "one colour for the
+            // whole bar" is not what the flatness above would accept.
+            for i in 1..n {
+                let foot = band_start_fraction(i, n);
+                assert_ne!(
+                    sample(foot - 1.0 / 4096.0),
+                    sample(foot),
+                    "{layer}/{field}: the bar does not change colour at the \
+                     foot of band {i}",
+                );
+            }
+            banded += 1;
         }
 
-        // ...and it does move across every boundary, so "one colour for the
-        // whole bar" is not what the flatness above would accept.
-        for i in 1..n {
-            let foot = band_start_fraction(i, n);
-            assert_ne!(
-                sample(foot - 1.0 / 4096.0),
-                sample(foot),
-                "the bar does not change colour at the foot of band {i}",
-            );
-        }
-
-        // The floor: a genuinely gradient overlay scale still draws a wash, so
-        // the fix is not "everything is bands now".
-        let precip =
-            legend_of(squallar_overlays::mrms::fields::spec(MrmsProduct::PrecipRate).scale);
-        assert!(
-            precip.is_gradient,
-            "precondition: MRMS precip rate is a continuous ramp",
+        // The floor, both ways: the banded set is the one the hand-kept count
+        // names, so the loop above did not walk past every band assertion; and
+        // genuinely gradient scales are still drawn as washes, so the fix is
+        // not "everything is bands now".
+        assert_eq!(
+            banded, BANDED_BAR_COUNT,
+            "{banded} bars took the band assertions against a hand-kept \
+             {BANDED_BAR_COUNT}",
         );
-        let wash = overlay_ramp_sampler(&precip);
-        let moved = (0..64u8)
-            .filter(|&i| {
-                let t = f32::from(i) / 64.0;
-                wash(t) != wash(t + 1.0 / 128.0)
-            })
-            .count();
-        assert!(
-            moved > 40,
-            "a gradient overlay bar must keep moving between its stops; it \
-             changed at only {moved} of 64 probes",
+        assert_eq!(
+            washed,
+            PUBLISHED_BAR_COUNT - BANDED_BAR_COUNT,
+            "{washed} bars took the wash assertion",
         );
     }
 
