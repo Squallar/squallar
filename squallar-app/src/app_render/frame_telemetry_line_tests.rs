@@ -2002,6 +2002,451 @@ fn every_telemetry_row_the_sibling_modules_write_is_claimed_by_a_probe_or_a_reas
     );
 }
 
+/// The three modules OUTSIDE `squallar-app` that write instance-scoped
+/// telemetry rows, read at compile time for `APP_RENDER`'s reason.
+///
+/// Crossing a crate boundary to read a file as TEXT is deliberate and is not a
+/// code reach: the gate below asks what those files write, and asking a
+/// fixture instead is how a row family goes unread while a test says
+/// otherwise. `grid_pool_trim.rs` is this crate's own.
+const GRID_POOL_TRIM: &str = include_str!("../grid_pool_trim.rs");
+const HEAP_CENSUS: &str = include_str!("../../../squallar-egui/src/heap_census.rs");
+const GRID_ARM_LEDGER: &str =
+    include_str!("../../../squallar-overlays/src/render/grid_arm_ledger.rs");
+
+/// Every **instance-scoped** telemetry row head `src` writes, as
+/// `(family, instance)` — the `<words> (<name>):` shape both gates above
+/// refuse by construction, because their extractors require the colon to
+/// follow the words directly.
+///
+/// `instance` is `Some(literal)` when the source spells the name out and
+/// `None` when it is a runtime value (`({instance})`, `({})`, a `.label()`
+/// call). That distinction is the whole subject: the FAMILY is a literal at
+/// every emit site in this tree without exception, so it can be enumerated;
+/// the INSTANCE sometimes cannot be, and a gate that pretended otherwise would
+/// be enumerating a list it cannot complete.
+///
+/// Two shapes, because the app writes these two ways:
+///
+/// * a `format!`/`write!`/`writeln!` head, `"<words> (<something>): …"`;
+/// * a call to `named_hist_line` / `named_split_line`, whose own head literal
+///   opens `"{prefix} ({name}): …"` and whose first two arguments are the
+///   family and the instance. `telemetry_row_families`' doc names these as
+///   outside it and they are the majority of the frame ledger.
+fn instance_scoped_heads(src: &str) -> Vec<(&str, Option<&str>)> {
+    fn words(body: &str) -> Option<(&str, &str)> {
+        let end = body
+            .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == ' ' || c == '-'))
+            .unwrap_or(body.len());
+        let name = body.get(..end)?;
+        if !name.ends_with(' ') || name.starts_with(' ') {
+            return None;
+        }
+        let name = name.trim_end();
+        if name.is_empty() {
+            return None;
+        }
+        Some((name, &body[end..]))
+    }
+
+    let mut out: Vec<(&str, Option<&str>)> = Vec::new();
+    for head in ["format!(", "write!(", "writeln!("] {
+        for (at, _) in src.match_indices(head) {
+            let rest = &src[at + head.len()..];
+            let Some(quote) = rest.find('"') else {
+                continue;
+            };
+            let before = &rest[..quote];
+            // `telemetry_row_families`' rule: the literal opens the call, or
+            // exactly one sink argument precedes it.
+            let opens = before.chars().all(char::is_whitespace);
+            let one_sink =
+                before.matches(',').count() == 1 && !before.contains('"') && !before.contains(')');
+            if !(opens || one_sink) {
+                continue;
+            }
+            let Some((family, after)) = words(&rest[quote + 1..]) else {
+                continue;
+            };
+            let Some(paren) = after.strip_prefix('(') else {
+                continue;
+            };
+            let Some(close) = paren.find(')') else {
+                continue;
+            };
+            // The colon straight after the closing paren is what makes this a
+            // ROW HEAD and not prose: `"tile ({x}, {y}) was not supplied"` and
+            // `"no config writer thread ({e}); writing inline"` both die here.
+            if paren.as_bytes().get(close + 1) != Some(&b':') {
+                continue;
+            }
+            let inside = &paren[..close];
+            if inside.contains('"') {
+                continue;
+            }
+            out.push((
+                family,
+                if inside.contains('{') {
+                    None
+                } else {
+                    Some(inside)
+                },
+            ));
+        }
+    }
+    for helper in ["named_hist_line(", "named_split_line("] {
+        for (at, _) in src.match_indices(helper) {
+            let rest = src[at + helper.len()..].trim_start();
+            let Some(rest) = rest.strip_prefix('"') else {
+                continue;
+            };
+            let Some(end) = rest.find('"') else {
+                continue;
+            };
+            let family = &rest[..end];
+            if family.is_empty()
+                || !family
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == ' ' || c == '-')
+            {
+                continue;
+            }
+            // The second argument is the instance. A literal when the call
+            // site spells it, `None` when it is an expression (`kind.label()`).
+            let arg = rest[end + 1..].trim_start().strip_prefix(',').unwrap_or("");
+            let arg = arg.trim_start();
+            let instance = arg
+                .strip_prefix('"')
+                .and_then(|a| a.find('"').map(|e| &a[..e]));
+            out.push((family, instance));
+        }
+    }
+    out
+}
+
+/// **Every instance-scoped telemetry row family is claimed here — and the
+/// claim says whether a name nobody has seen yet would be read.**
+///
+/// # What was actually wrong
+///
+/// The two gates above enumerate row heads of the shape `<words>:`. Both say
+/// in their own docs that they do not count the `<words> (<name>):` shape, and
+/// that exclusion was never measured. It covers **twenty-eight families**,
+/// among them `frame segment (…)`, `frame ui (…)`, `frame panes (…)`,
+/// `frame pump (…)`, `frame post (…)`, `frame dispatch (…)` and
+/// `frame service (interact|idle|presented)` — **the whole frame ledger, which
+/// is where this campaign's 4 ms bar is read from.** The instrument the
+/// campaign is scored on sat outside the gate that exists to stop a row
+/// shipping with no reader.
+///
+/// # The exclusion was half right, and this gate is only the half that holds
+///
+/// **The instance genuinely cannot always be enumerated.** `heap census
+/// ({instance})`, `grid pool trim ({instance})` and `tile cache ({})` take the
+/// name from their caller; `tile take (…)` and `tile phase (…)` take it from a
+/// `.label()` call. No static scan completes those lists.
+///
+/// **The family always can.** Every emit site in this tree spells its prefix as
+/// a string literal — the `format!` heads directly, the `named_hist_line` /
+/// `named_split_line` call sites in their first argument. And the family is the
+/// level the two gates above already work at: they claim `"action budget"`, not
+/// `action budget: 3 handled`. So the exclusion refused more than it had to.
+///
+/// # What a claim proves, and what it does not
+///
+/// * [`Claim::ByAnyInstance`] — the probe carries a **generic name group**,
+///   `\(([a-z0-9-]+)\)`. An instance no one has ever seen is read too, and
+///   every instance the source does spell is checked to be a string that group
+///   can actually match. This is the property that makes the exclusion
+///   unnecessary, and it is checked rather than assumed.
+/// * [`Claim::ByTheseInstances`] — the probe **spells its instance**. The
+///   family reaches a leg only for the names listed, so every literal instance
+///   the source writes must appear in one of them. A new one is a build
+///   failure here, which is the only place it could be caught.
+/// * [`Claim::Unread`] — no rig pattern in either half. A ratchet, at nine.
+///
+/// **This gate does NOT prove a family is read WELL.** It proves a pattern
+/// exists and is shaped to reach the family's instances. It cannot see whether
+/// the pattern reads every FIGURE on the row — `heap census (…)` is claimed
+/// here and `sample_census_loop_re` takes its first figure and stops — nor
+/// whether a reading is carried to an artifact, nor whether a rename of a
+/// FIELD would be caught. The second of those is a known hole in the rig's
+/// Python half generally: `_rendered` substitutes values positionally, so a
+/// pure name swap between two fields passes it, and only the Rust-side literal
+/// pins catch that. "A pattern matches it" and "a change to it would be
+/// caught" are different properties and only the first is gated here.
+///
+/// **Scope**: `app_render.rs`, `grid_pool_trim.rs`, `heap_census.rs` and
+/// `grid_arm_ledger.rs` — the four modules that write this shape today, found
+/// by grepping the tree for `"<words> ({…}):` and `"<words> (<literal>):`
+/// heads. A fifth module is invisible to this gate, exactly as a fourth was
+/// invisible to the one above it, and the floor below catches only a collapse
+/// of the extraction and not a file nobody listed.
+#[test]
+fn every_instance_scoped_telemetry_family_is_claimed_by_a_probe_or_a_reason() {
+    enum Claim {
+        /// Read by these `drive.py` probes, **each carrying a generic
+        /// `\(([a-z0-9-]+)\)` name group**: an unseen instance is read.
+        ByAnyInstance(&'static [&'static str]),
+        /// Read by these `drive.py` probes, each of which **spells its
+        /// instance**. Only the names spelled reach a leg.
+        ByTheseInstances(&'static [&'static str]),
+        /// **No rig pattern in either half**, and the string is why that is
+        /// currently tolerated.
+        Unread(&'static str),
+    }
+    use Claim::{ByAnyInstance, ByTheseInstances, Unread};
+
+    /// The generic name group every `ByAnyInstance` probe must carry, spelled
+    /// once. A probe whose group is narrower silently drops the instances it
+    /// cannot match, and a leg reads those exactly like an arm with no samples.
+    const NAME_GROUP: &str = r"\(([a-z0-9-]+)\)";
+    /// The most families that may be `Unread`. A ceiling, permanent, and it
+    /// may only FALL — `arch_ratchets`' discipline, for its reason.
+    ///
+    /// **Ten when the gate was written; nine because `grid narrowing (…)` got
+    /// its reader in the same change.** On a rebase, RE-COUNT the `Unread`
+    /// arms in the table and set this to what they come to — never
+    /// old-minus-one, which merges clean with another lane's shed and leaves
+    /// the ceiling one above the tree, so the next unread family costs
+    /// nothing.
+    const INSTANCE_UNREAD_CEILING: usize = 9;
+    /// A floor under the extraction, so a rename of the formatters that makes
+    /// it match *nothing* fails loudly instead of passing over an empty list.
+    ///
+    /// **Twenty-eight families were extracted when this was set** (2026-09-11,
+    /// across the four modules named above; twenty-seven when the table was
+    /// first written, and `frame content` landed on main before it did). The
+    /// floor is deliberately UNDER that: it catches a collapse of the
+    /// extraction, not growth, so landing a new family does not touch it and it
+    /// is not a second count to keep in step with the table — re-running the
+    /// extraction on the rebase confirmed 28 and left this at 24 rather than
+    /// moving it, which is what "set what it counts" means here. The
+    /// `assert_eq!` on `claims.len()` is what holds the table exact.
+    ///
+    /// **If this ever does need moving, RE-RUN the extraction on the rebased
+    /// tip and set it from what that counts — never old-plus-one.** Two lanes
+    /// each adding a family and each bumping a count by one merge clean and
+    /// leave the constant one short of the tree, which is a gate quietly
+    /// passing over a family nobody claimed.
+    const INSTANCE_FAMILY_FLOOR: usize = 24;
+
+    let claims: &[(&str, Claim)] = &[
+        // The frame ledger. Every one of these is read through a generic name
+        // group, so the sixteen `named_split_line` call sites that grew since
+        // the readers were written cost no rig edit at all — which is the
+        // strongest evidence that the family level is the right one to gate.
+        // The twenty-eighth family, and it arrived on this gate's FIRST
+        // rebase: `frame panes (content)` opened into ten cuts, one landing
+        // after the table was written. Its sibling gate caught the missing
+        // browser probe — `native_row.py` reads families by shape and had
+        // already picked the cuts up unasked, so the NATIVE arm was fine while
+        // the governing Firefox arm would have reported the family ABSENT
+        // rather than empty. That is the whole reason this file gates the
+        // family level and not the reading.
+        ("frame content", ByAnyInstance(&["frame_content_re"])),
+        ("frame dispatch", ByAnyInstance(&["frame_dispatch_re"])),
+        ("frame finish", ByAnyInstance(&["frame_finish_re"])),
+        ("frame panes", ByAnyInstance(&["frame_panes_re"])),
+        ("frame post", ByAnyInstance(&["frame_post_re"])),
+        ("frame pre", ByAnyInstance(&["frame_pre_re"])),
+        ("frame prepare", ByAnyInstance(&["frame_prepare_re"])),
+        ("frame pump", ByAnyInstance(&["frame_pump_re"])),
+        ("frame segment", ByAnyInstance(&["frame_segment_re"])),
+        (
+            "frame service less present",
+            ByAnyInstance(&["frame_service_less_present_re"]),
+        ),
+        ("frame stack", ByAnyInstance(&["frame_stack_re"])),
+        ("frame ui", ByAnyInstance(&["frame_ui_re"])),
+        // **The bar's own three populations, and they are spelled.** These are
+        // the only frame-ledger rows whose reader hard-codes its instance, so
+        // a fourth `frame service (…)` would reach no leg. The three literal
+        // heads in `app_render.rs` are checked against these three probes
+        // below, which is what makes that statement a gate rather than a note.
+        (
+            "frame service",
+            ByTheseInstances(&["svc_interact_re", "svc_idle_re", "svc_presented_re"]),
+        ),
+        // Not a family with instances at all: one row whose parenthetical says
+        // which population it summarises. Spelled, and rightly.
+        ("frame segments", ByTheseInstances(&["segments_re"])),
+        ("tile cache", ByAnyInstance(&["tile_cache_re"])),
+        ("tile phase", ByAnyInstance(&["tile_phase_re"])),
+        ("tile take", ByAnyInstance(&["tile_take_re"])),
+        // **`heap census (…)`, and the claim is narrower than it looks.**
+        // `sample_census_loop_re` reads the head and `loop scans` and stops;
+        // the rest of the row reaches no leg. This gate cannot see that, and
+        // says so rather than letting the claim read as full coverage.
+        ("heap census", ByAnyInstance(&["sample_census_loop_re"])),
+        // THE ROW THIS GATE WAS BUILT ALONGSIDE. A fires counter whose all-zero
+        // reading is the point of it, landed with a producer-side shape pin and
+        // no rig pattern at all — and neither gate above could say so.
+        ("grid narrowing", ByAnyInstance(&["grid_narrowing_re"])),
+        (
+            "grid pool trim",
+            Unread("the pool trim's own ledger; unclaimed"),
+        ),
+        (
+            "http bodies",
+            Unread("the in-flight body census; unclaimed"),
+        ),
+        (
+            "large grants",
+            Unread("the allocator's large-block list; unclaimed"),
+        ),
+        (
+            "overlay grid arms",
+            Unread("the per-arm grid ledger; unclaimed"),
+        ),
+        (
+            "overlay grid dupes",
+            Unread("the duplicate-granule walk; unclaimed"),
+        ),
+        (
+            "overlay grid live sole",
+            Unread("the sole-owner cut of the live grids; unclaimed"),
+        ),
+        (
+            "overlay grid split",
+            Unread("the per-source cut of `overlay grids`; unclaimed"),
+        ),
+        (
+            "overlay grid states",
+            Unread("the same bytes along the state axis; unclaimed with it"),
+        ),
+        (
+            "process memory",
+            Unread(
+                "rss and the live/peak pair; the campaign reads these off a \
+                 native ledger rather than a leg",
+            ),
+        ),
+    ];
+
+    let mut heads: Vec<(&str, Option<&str>)> = Vec::new();
+    for src in [APP_RENDER, GRID_POOL_TRIM, HEAP_CENSUS, GRID_ARM_LEDGER] {
+        heads.extend(instance_scoped_heads(src));
+    }
+    let mut families: Vec<&str> = heads.iter().map(|(f, _)| *f).collect();
+    families.sort_unstable();
+    families.dedup();
+    assert!(
+        families.len() >= INSTANCE_FAMILY_FLOOR,
+        "only {} instance-scoped telemetry families were extracted from the \
+         four modules that write them, under the {INSTANCE_FAMILY_FLOOR} known \
+         to be there: the extraction has stopped matching and this gate is \
+         passing over a short list: {families:?}",
+        families.len(),
+    );
+
+    let mut unread = 0;
+    for family in &families {
+        let claim = claims
+            .iter()
+            .find(|(f, _)| f == family)
+            .map(|(_, c)| c)
+            .unwrap_or_else(|| {
+                panic!(
+                    "an `{family} (<name>):` row is written and this table does \
+                     not say how a leg reads it. Claim it: name the `drive.py` \
+                     probe that scrapes it and say whether its name group is \
+                     GENERIC (an unseen instance is read) or SPELLED (only the \
+                     names listed are), or record it as `Unread` with the \
+                     reason — and `Unread` is a ratchet, so shed one first. \
+                     This shape is invisible to both `<words>:` gates in this \
+                     file, which is how a row can ship with no reader at all \
+                     and nothing go red"
+                )
+            });
+        // Every instance this family's source actually spells. Empty when the
+        // name is a runtime value, which is the case the exclusion was right
+        // about and the case this gate makes no claim on.
+        let spelled: Vec<&str> = heads
+            .iter()
+            .filter_map(|(f, i)| if f == family { *i } else { None })
+            .collect();
+        match claim {
+            ByAnyInstance(probes) => {
+                for probe in *probes {
+                    let body = pattern(probe);
+                    assert!(
+                        body.contains(NAME_GROUP),
+                        "`{family} (<name>):` is claimed as read for ANY \
+                         instance by `{probe}`, and that probe carries no \
+                         `{NAME_GROUP}` group. Either give it one, or move the \
+                         family to `ByTheseInstances` and list the names it \
+                         does read — a probe that silently reads a subset \
+                         makes the rest look like an arm with no samples"
+                    );
+                }
+                for instance in &spelled {
+                    assert!(
+                        !instance.is_empty()
+                            && instance
+                                .chars()
+                                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                        "`{family} ({instance}):` is written and the generic \
+                         name group `{NAME_GROUP}` cannot match `{instance}`, \
+                         so that one instance reaches no leg while its \
+                         siblings do — the quietest way for this family to \
+                         lose a cut"
+                    );
+                }
+            }
+            ByTheseInstances(probes) => {
+                let bodies: Vec<String> = probes.iter().copied().map(pattern).collect();
+                for (probe, body) in probes.iter().zip(&bodies) {
+                    assert!(
+                        !body.contains(NAME_GROUP),
+                        "`{family} (<name>):` is claimed as reading only the \
+                         instances `{probe}` spells, and `{probe}` carries the \
+                         generic `{NAME_GROUP}` group: it reads any instance, \
+                         so claim it `ByAnyInstance` and get that checked"
+                    );
+                }
+                assert!(
+                    !spelled.is_empty(),
+                    "`{family} (<name>):` is claimed as reading spelled \
+                     instances and its source spells none — its name is a \
+                     runtime value, so the listed probes read at most the \
+                     names someone guessed"
+                );
+                for instance in &spelled {
+                    let escaped = format!(r"\({instance}\)");
+                    assert!(
+                        bodies.iter().any(|b| b.contains(&escaped)),
+                        "`{family} ({instance}):` is written and no probe \
+                         claimed for this family spells `{escaped}`. This \
+                         family's readers hard-code their instance, so a new \
+                         one reaches no leg — here is the only place that can \
+                         be caught"
+                    );
+                }
+            }
+            Unread(reason) => {
+                assert!(
+                    !reason.is_empty(),
+                    "`{family} (<name>):` is Unread with no reason"
+                );
+                unread += 1;
+            }
+        }
+    }
+    assert!(
+        unread <= INSTANCE_UNREAD_CEILING,
+        "{unread} instance-scoped families are `Unread` and the ceiling is \
+         {INSTANCE_UNREAD_CEILING}. It may only fall: give one of them a probe \
+         rather than raising it",
+    );
+    assert_eq!(
+        families.len(),
+        claims.len(),
+        "the table names instance-scoped families nothing writes any more: \
+         {families:?}",
+    );
+}
+
 /// The `frame pump (…)` sentence, pinned as a literal.
 ///
 /// Same formatter as `frame segment (…)` and deliberately a **different

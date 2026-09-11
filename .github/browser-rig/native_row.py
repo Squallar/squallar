@@ -189,6 +189,7 @@ PROBE_NAMES = (
     "action_budget_re",
     "archive_spill_re",
     "payload_share_re",
+    "grid_narrowing_re",
     "gesture_begin_re",
     "gesture_loop_re",
 )
@@ -692,6 +693,11 @@ def scrape(lines, probes):
         "action_budget": [],
         "archive_spill": [],
         "payload_share": [],
+        # `(idx, [offered, narrowed, refused, lossy, verified, wide, narrow])`.
+        # The instance name rides beside it rather than in the figure list --
+        # it is text, and a list this file `int()`s must be all figures.
+        "grid_narrowing": [],
+        "grid_narrowing_names": [],
         "overlay_pictures": [],
         "loop_decoded": [],
         "loop_ceiling": [],
@@ -787,6 +793,43 @@ def scrape(lines, probes):
                 else:
                     out["unparsed"].append(
                         (idx, "payload_share_re", line.strip()[:200]))
+        # `grid narrowing (<name>):` -- the model-grid narrowing's fires
+        # counter. ABSENCE HERE MEANS "a build without the narrowing", which
+        # is the one reading a broken parser must never impersonate: it is the
+        # reading that says the mechanism is not in at all, as distinct from
+        # `offered 0` (in, and never reached) and `offered N, narrowed 0` (in,
+        # reached, and refusing). The app emits the row on every loud tick
+        # unconditionally, so a missing row is a binary, never a scene.
+        #
+        # Every figure on this row is preceded by its own WORD, so the
+        # fallback below is a true by-name parse rather than a second
+        # positional guess -- and it RECORDS that it fired, because a silent
+        # fallback hides exactly the producer change the row survived.
+        if "grid narrowing (" in line:
+            m = probes["grid_narrowing_re"].search(line)
+            if m:
+                g = m.groups()
+                out["grid_narrowing"].append((idx, [int(x) for x in g[1:]]))
+                out["grid_narrowing_names"].append(g[0])
+            else:
+                tail = line[line.index("grid narrowing ("):]
+                pairs = dict(re.findall(r"([a-z]+) (\d+)", tail))
+                need = ("offered", "narrowed", "refused", "lossy",
+                        "verified", "wide", "narrow")
+                if all(k in pairs for k in need):
+                    out["grid_narrowing"].append(
+                        (idx, [int(pairs[k]) for k in need]))
+                    out["grid_narrowing_names"].append("unread")
+                    out["unparsed"].append(
+                        (idx, "grid_narrowing_re(BY-NAME FALLBACK: the strict "
+                         "pattern no longer matches, the seven figures were "
+                         "read by their own words instead -- the emitter "
+                         "reordered, renamed or added a field and the strict "
+                         "probe needs re-pointing)",
+                         line.strip()[:200]))
+                else:
+                    out["unparsed"].append(
+                        (idx, "grid_narrowing_re", line.strip()[:200]))
         # `budget state` is a level too, but its first group is the bracket's
         # NAME, so it cannot ride the all-`int()` loop above: the word is kept
         # as text and the fifteen figures after it are ints. Every group is
@@ -2850,6 +2893,36 @@ def build_row(args, scraped, probes):
             "non-sharing arm, so the cut's premise is false. This is a "
             "FALSIFIER, not a byte figure" % payload_share["copied"])
 
+    # **What the model-grid palette narrowing did over the bracket.**
+    #
+    # Seven CUMULATIVE-FLOW totals differenced, and they are never mixed with a
+    # census level: `wide` and `narrow` are the SAME grids priced twice, before
+    # and after, so `wide - narrow` is flow saved across the window and not a
+    # resident saving now -- a grid counted here may since have been evicted.
+    #
+    # `lossy` runs the other way from the rest, `payload share:`' `copied`'s
+    # way: a non-zero means a built store did not read back as the plane it was
+    # built from, so the narrow copy was discarded and the wide plane kept. The
+    # picture stays right and the tiler has a bug, so it is escalated rather
+    # than averaged. Its denominator is `verified`, and the two are never read
+    # apart: `lossy 0` beside `verified 0` is a check that never ran.
+    gn = diff_totals(scraped["grid_narrowing"], start_idx, end_idx)
+    grid_narrowing = (None if gn is None else {
+        "instance": (scraped["grid_narrowing_names"][-1]
+                     if scraped["grid_narrowing_names"] else "unread"),
+        "offered": gn[0], "narrowed": gn[1], "refused": gn[2],
+        "lossy": gn[3], "verified": gn[4],
+        "wide_bytes": gn[5], "narrow_bytes": gn[6],
+        "checked": gn[4] > 0,
+    })
+    if grid_narrowing is not None and grid_narrowing["lossy"]:
+        notes.append(
+            "`grid narrowing:` lossy=%d over the bracket: a built store did "
+            "not read back as the plane it was built from, so the narrow copy "
+            "was DISCARDED and the wide plane kept. The picture is still "
+            "right and the tiler has a bug. This is a CORRECTNESS reading, "
+            "not a byte figure" % grid_narrowing["lossy"])
+
     # Basemap state, on `run_measure.sh`'s own two-counter terms.
     bt = diff_totals(scraped["basemap"], start_idx, end_idx)
     g = diff_totals(scraped["ground"], start_idx, end_idx)
@@ -2948,6 +3021,11 @@ def build_row(args, scraped, probes):
         "action_budget": action_budget,
         "archive_spill": archive_spill,
         "payload_share": payload_share,
+        # `None` when no `grid narrowing (<name>):` line brackets this window.
+        # The app writes it on every loud tick unconditionally, so that is a
+        # binary WITHOUT the narrowing -- never "narrowed nothing", which is a
+        # present row reading `offered 0`.
+        "grid_narrowing": grid_narrowing,
         # `(line, bracket, [fifteen ints])`, or None when the log has no
         # `budget state:` line -- a binary older than the line, kept apart
         # from a live binary reporting zeroes.
@@ -3355,6 +3433,28 @@ def print_row(row):
                "HELD (0 by construction, and it read 0)"
                if ps["premise_held"] else
                "FALSIFIED: a non-sharing arm exists")
+        )
+    gn = row.get("grid_narrowing")
+    if gn is None:
+        print(
+            "ROW   grid narrowing: n/a (no `grid narrowing (…):` line brackets "
+            "this window -- a build WITHOUT the narrowing, which is a "
+            "different finding from `offered 0`, the mechanism armed and never "
+            "reached. The app writes the row on every loud tick "
+            "unconditionally)"
+        )
+    else:
+        print(
+            "ROW   grid narrowing (%s): %s offered, %s narrowed, %s refused, "
+            "%s lossy [over the bracket]; wide %s B -> narrow %s B [the SAME "
+            "grids priced twice, CUMULATIVE FLOW, never added to each other "
+            "nor to a census level]; %s"
+            % (gn["instance"], gn["offered"], gn["narrowed"], gn["refused"],
+               gn["lossy"], gn["wide_bytes"], gn["narrow_bytes"],
+               ("VERIFIED %s points, lossy %s" % (gn["verified"], gn["lossy"]))
+               if gn["checked"] else
+               "verified 0 points -- the readback check NEVER RAN, so "
+               "`lossy 0` beside it is not a pass")
         )
     tb = row.get("tile_bodies")
     if tb is None:
@@ -6928,6 +7028,216 @@ class PayloadShareTests(unittest.TestCase):
         self.assertIsNone(row["payload_share"])
         self.assertIn("ROW   payload share: n/a", text)
         self.assertNotIn("ROW   payload share: 0 adopted", text)
+
+
+class GridNarrowingRowTests(unittest.TestCase):
+    """`grid narrowing (<name>):` -- a fires counter, and the reader it needed.
+
+    THE GAP THIS CLOSES IS THE GATE'S, NOT A READER'S ONLY. The enumeration
+    gates in `frame_telemetry_line_tests.rs` read row heads of the shape
+    `<words>:`; this row's head is `<words> (<name>):` and both gates say in
+    their own docs that they do not count it. So the row landed with a
+    producer-side shape pin (`heap_census::tests::the_grid_narrowing_row_keeps_
+    its_shape`) and no rig pattern at all, and nothing was red.
+
+    The name group is GENERIC, not the literal `page`. The emitter takes the
+    instance at the call site, so a second instance would otherwise reach this
+    rig as an absence -- and absence on this row means "a build without the
+    narrowing", the one reading it exists to keep separate.
+    """
+
+    # The emitter's own format string, `heap_census::grid_narrowing_line`.
+    LINE = ("[..] INFO grid narrowing (%s): offered %d, narrowed %d, "
+            "refused %d, lossy %d; verified %d points; wide %d B, narrow %d B")
+
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.load = os.path.join(self._tmp.name, "load")
+        with open(self.load, "w", encoding="utf-8") as fh:
+            for i in range(6):
+                fh.write("%d\t1.0\n" % (1_000_000 + 5 * i))
+        self.probes = compile_probes()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _row(self, lines):
+        row = build_row(_leg_args(self.load, 1), scrape(lines, self.probes), self.probes)
+        return row, _capture(lambda: print_row(row))
+
+    def _leg(self, rows):
+        """A leg log with one `grid narrowing` row after each loop marker.
+
+        `rows` is called with the loop ordinal and returns the seven figures.
+        """
+        out, seen = [], 0
+        for line in _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE):
+            out.append(line)
+            if "gesture script pan-zoom-2d loop complete" in line:
+                seen += 1
+                out.append(self.LINE % (("page",) + tuple(rows(seen))))
+        return out
+
+    def test_the_probe_is_drive_pys_own(self):
+        self.assertEqual(
+            drive_pattern("grid_narrowing_re"),
+            r"grid narrowing \(([a-z0-9-]+)\): offered (\d+), narrowed (\d+), "
+            r"refused (\d+), lossy (\d+); verified (\d+) points; "
+            r"wide (\d+) B, narrow (\d+) B")
+
+    def test_the_probe_matches_the_line_the_rust_emitter_formats(self):
+        """Against `heap_census::grid_narrowing_line`'s own format string,
+        field for field. A probe matching a line this test invented rather than
+        the one the app writes reads every leg as a build without the
+        narrowing, which is this row's most consequential reading."""
+        line = ("grid narrowing (page): offered 12, narrowed 9, refused 2, "
+                "lossy 0; verified 1905141 points; wide 7620564 B, "
+                "narrow 3810282 B")
+        m = self.probes["grid_narrowing_re"].search(line)
+        self.assertIsNotNone(m, "the probe does not match the emitted line")
+        self.assertEqual(m.group(1), "page")
+        self.assertEqual([int(g) for g in m.groups()[1:]],
+                         [12, 9, 2, 0, 1905141, 7620564, 3810282])
+
+    def test_the_seven_figures_are_the_shape_the_producer_pins(self):
+        """`the_grid_narrowing_row_keeps_its_shape` asserts the rendered text
+        carries EXACTLY seven figures. This half must take exactly seven, or
+        the two halves pin different rows."""
+        self.assertEqual(
+            drive_pattern("grid_narrowing_re").count(r"(\d+)"), 7)
+
+    def test_drive_py_reads_each_group_into_the_field_it_belongs_to(self):
+        """A POSITIONAL read, checked by giving every field a distinct value:
+        a group read one slot over is how a series silently becomes two
+        instruments at the format commit."""
+        text = _read(DRIVE_PY)
+        pattern = drive_pattern("grid_narrowing_re", text)
+        fields = [("offered", 12), ("narrowed", 9), ("refused", 2),
+                  ("lossy", 5), ("verified", 1905141),
+                  ("wide_bytes", 7620564), ("narrow_bytes", 3810282)]
+        line = self.LINE % (("page",) + tuple(v for _, v in fields))
+        m = re.search(pattern, line)
+        self.assertIsNotNone(m)
+        groups = m.groups()
+        body = text[text.index("var gnm = grid_narrowing_re.exec(m);"):]
+        body = body[:body.index("grid_narrowing_all.push")]
+        assigned = re.findall(r"(\w+): parseInt\(gnm\[(\d+)\], 10\)", body)
+        self.assertEqual([n for n, _ in assigned], [n for n, _ in fields])
+        for (name, expected), (_, at) in zip(fields, assigned):
+            self.assertEqual(
+                int(groups[int(at) - 1]), expected,
+                "drive.py reads group %s into `%s`, which carries %s not %s"
+                % (at, name, groups[int(at) - 1], expected))
+
+    def test_drive_py_reads_the_instance_as_text_not_as_a_figure(self):
+        """Group 1 is the instance NAME. `parseInt` on it would print `NaN`
+        for every leg and nothing downstream would say why."""
+        text = _read(DRIVE_PY)
+        body = text[text.index("var gnm = grid_narrowing_re.exec(m);"):]
+        body = body[:body.index("grid_narrowing_all.push")]
+        self.assertIn("instance: gnm[1]", body)
+        self.assertNotIn("parseInt(gnm[1]", body)
+
+    def test_an_instance_the_reader_has_never_seen_is_still_read(self):
+        """The generic name group is the whole point: a second call site
+        naming its own instance must be read, not read as an absence."""
+        out = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE)
+        out.append(self.LINE % ("worker-2", 1, 1, 0, 0, 4, 8, 4))
+        scraped = scrape(out, self.probes)
+        self.assertEqual(len(scraped["grid_narrowing"]), 1)
+        self.assertEqual(scraped["grid_narrowing_names"], ["worker-2"])
+        self.assertEqual(scraped["unparsed"], [])
+
+    def test_the_row_windows_the_seven_totals(self):
+        row, text = self._row(self._leg(
+            lambda n: (12 * n, 9 * n, 2 * n, 0, 100 * n, 800 * n, 400 * n)))
+        gn = row["grid_narrowing"]
+        self.assertIsNotNone(gn)
+        self.assertEqual(gn["instance"], "page")
+        self.assertGreater(gn["offered"], 0)
+        self.assertEqual(gn["offered"] % 12, 0)
+        self.assertEqual(gn["lossy"], 0)
+        self.assertTrue(gn["checked"])
+        self.assertIn("ROW   grid narrowing (page): ", text)
+        self.assertIn("CUMULATIVE FLOW", text)
+        self.assertIn("VERIFIED", text)
+
+    def test_a_non_zero_lossy_is_escalated_rather_than_averaged(self):
+        """`lossy` runs the other way from every figure beside it: a non-zero
+        means a built store did not read back as its own source plane."""
+        row, text = self._row(self._leg(
+            lambda n: (12 * n, 9 * n, 2 * n, 3 * n, 100 * n, 800 * n, 400 * n)))
+        gn = row["grid_narrowing"]
+        self.assertGreater(gn["lossy"], 0)
+        self.assertTrue(any("CORRECTNESS reading" in n for n in row["notes"]),
+                        row["notes"])
+
+    def test_verified_zero_says_the_check_never_ran_rather_than_passed(self):
+        """`lossy 0` beside `verified 0` is a readback check that did not run.
+        Printing it as a pass is the reading this row exists to refuse."""
+        row, text = self._row(self._leg(
+            lambda n: (12 * n, 9 * n, 2 * n, 0, 0, 800 * n, 400 * n)))
+        gn = row["grid_narrowing"]
+        self.assertEqual(gn["verified"], 0)
+        self.assertFalse(gn["checked"])
+        self.assertIn("NEVER RAN", text)
+        self.assertNotIn("VERIFIED 0 points", text)
+
+    def test_a_reordered_line_is_read_BY_NAME_and_says_that_it_was(self):
+        """Every figure on this row is preceded by its own word, so a reorder
+        is recoverable by name. The fallback must fire AND announce itself: a
+        silent one hides the producer change, and none at all discards a line
+        that is still perfectly readable."""
+        out = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE)
+        out.append("[..] INFO grid narrowing (page): narrowed 9, offered 12, "
+                   "refused 2, lossy 0; verified 1905141 points; "
+                   "wide 7620564 B, narrow 3810282 B")
+        scraped = scrape(out, self.probes)
+        self.assertEqual(len(scraped["grid_narrowing"]), 1,
+                         "the by-name fallback did not read the reordered line")
+        self.assertEqual(scraped["grid_narrowing"][0][1],
+                         [12, 9, 2, 0, 1905141, 7620564, 3810282],
+                         "the fallback read the words into the wrong slots")
+        self.assertTrue(
+            any("BY-NAME FALLBACK" in p for _idx, p, _l in scraped["unparsed"]),
+            "the fallback fired without announcing itself, which hides a "
+            "producer change: %r" % (scraped["unparsed"],))
+
+    def test_a_field_inserted_mid_row_is_read_by_name_and_announced(self):
+        """The failure the producer pin names: a field added moves every later
+        one. The strict probe must FAIL rather than shift a column, and the
+        fallback must recover the seven that are still there."""
+        out = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE)
+        out.append("[..] INFO grid narrowing (page): offered 12, narrowed 9, "
+                   "widened 4, refused 2, lossy 0; verified 1905141 points; "
+                   "wide 7620564 B, narrow 3810282 B")
+        scraped = scrape(out, self.probes)
+        self.assertEqual(scraped["grid_narrowing"][0][1],
+                         [12, 9, 2, 0, 1905141, 7620564, 3810282])
+        self.assertTrue(
+            any("BY-NAME FALLBACK" in p for _idx, p, _l in scraped["unparsed"]),
+            scraped["unparsed"])
+
+    def test_a_line_missing_a_field_entirely_is_unparsed_not_invented(self):
+        out = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE)
+        out.append("[..] INFO grid narrowing (page): offered 12, narrowed 9")
+        scraped = scrape(out, self.probes)
+        self.assertEqual(scraped["grid_narrowing"], [])
+        self.assertTrue(
+            any(p == "grid_narrowing_re" for _idx, p, _l in scraped["unparsed"]),
+            scraped["unparsed"])
+
+    def test_a_build_without_the_narrowing_says_so_rather_than_zero(self):
+        """The app writes this row on every loud tick unconditionally, so
+        absence is a BINARY without the mechanism -- never `offered 0`, which
+        is the mechanism in and never reached."""
+        row, text = self._row(_leg_log(ONE_PANE_PICTURE_BYTES,
+                                       OVERLAY_PICTURES_ONE))
+        self.assertIsNone(row["grid_narrowing"])
+        self.assertIn("ROW   grid narrowing: n/a", text)
+        self.assertNotIn("0 offered", text)
 
 
 class FrameNeedTests(unittest.TestCase):

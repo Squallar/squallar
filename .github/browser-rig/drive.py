@@ -2769,6 +2769,9 @@ var payload_share_all = [];
 var payload_share_unparsed = null;
 var archive_spill_all = [];
 var archive_spill_unparsed = null;
+var grid_narrowing = null;
+var grid_narrowing_all = [];
+var grid_narrowing_unparsed = null;
 var off_re = /([A-Za-z0-9_-]+) took (\d+) ms off the frame/;
 var rayon_re = /rayon: (\d+) threads/;
 // The LAST match wins, not the first: `worker_port::account` logs RUNNING
@@ -2868,6 +2871,41 @@ var archive_spill_loose_re = /archive spill: on-disk \d+ B/;
 // never summed with them.
 var payload_share_re = /payload share: adopted=(\d+) adopted_mib=(\d+) returned=(\d+) returned_mib=(\d+) copied=(\d+)/;
 var payload_share_loose_re = /payload share: adopted=/;
+// **What the model-grid palette narrowing has actually done** -- a fires
+// counter, read here for `action budget:`' reason: the one shape a fires
+// counter cannot survive is having no reader.
+//
+// **Three findings a bare byte saving cannot tell apart, and the reader must
+// keep them apart too.** `grid_narrowing` STAYS NULL when no line was seen,
+// which is a build without the narrowing -- never `offered 0`. `offered 0` on
+// a PRESENT row is the mechanism armed and never reached, which is exactly how
+// a ~94 MiB cut on this campaign delivered zero for a day. `offered N,
+// narrowed 0` is grids arriving and every one kept wide, with `refused` and
+// `lossy` saying which reason.
+//
+// **`lossy` is the correctness term and zero is the only healthy reading**: a
+// non-zero means a built store did not read back as the plane it was built
+// from, so the narrow copy was DISCARDED and the wide plane kept -- the picture
+// is still right and the tiler has a bug. `verified` is its denominator, and
+// `lossy 0` beside `verified 0` is a check that never ran rather than a check
+// that passed. The two are never read apart.
+//
+// **`wide` and `narrow` are the SAME grids priced twice**, before and after,
+// and are never added to each other nor to any census level: both are
+// CUMULATIVE FLOW since process start, where every figure on `heap census (…)`
+// is a level. A grid counted here may since have been evicted, so
+// `wide - narrow` is flow saved over the run and not a resident saving now.
+//
+// The instance is a GENERIC group, not the literal `page`: the emitter takes
+// the name at the call site (`grid_narrowing_line("page")`) and a second
+// instance would otherwise reach this rig as an absence.
+var grid_narrowing_re = /grid narrowing \(([a-z0-9-]+)\): offered (\d+), narrowed (\d+), refused (\d+), lossy (\d+); verified (\d+) points; wide (\d+) B, narrow (\d+) B/;
+// The name group is CAPTURING here though nothing reads it, because
+// `rig_js_tests`' stub builder substitutes a value for `([a-z0-9-]+)` and has
+// no spelling for the uncaptured `[a-z0-9-]+`: an uncaptured class survives
+// into the stub verbatim and the probe is then fed a line IT CANNOT MATCH,
+// so `grid_narrowing_unparsed` reads empty and the skew arm looks dead.
+var grid_narrowing_loose_re = /grid narrowing \(([a-z0-9-]+)\): offered \d+/;
 // A THIRD denominator, and it is added to neither of the two above. These
 // count archive tile BODIES DECODED, split by the archive header's declared
 // tile_type: `vector` is the self-hosted basemap's MVT, `raster` the terrain
@@ -3130,6 +3168,29 @@ for (var i = 0; i < C.length; i++) {
                              copied: payload_share.copied });
   }
   else if (payload_share_loose_re.test(m)) payload_share_unparsed = m;
+  var gnm = grid_narrowing_re.exec(m);
+  if (gnm) {
+    grid_narrowing = { instance: gnm[1],
+                       offered: parseInt(gnm[2], 10),
+                       narrowed: parseInt(gnm[3], 10),
+                       refused: parseInt(gnm[4], 10),
+                       lossy: parseInt(gnm[5], 10),
+                       verified: parseInt(gnm[6], 10),
+                       wide_bytes: parseInt(gnm[7], 10),
+                       narrow_bytes: parseInt(gnm[8], 10) };
+    grid_narrowing_all.push({ t: C[i].t, instance: grid_narrowing.instance,
+                              offered: grid_narrowing.offered,
+                              narrowed: grid_narrowing.narrowed,
+                              refused: grid_narrowing.refused,
+                              lossy: grid_narrowing.lossy,
+                              verified: grid_narrowing.verified,
+                              wide_bytes: grid_narrowing.wide_bytes,
+                              narrow_bytes: grid_narrowing.narrow_bytes });
+  }
+  // Present but unparseable is NOT absent, and on this line absence means "a
+  // build without the narrowing" -- the one reading a reshaped row must never
+  // impersonate, because it is the reading that says the mechanism is not in.
+  else if (grid_narrowing_loose_re.test(m)) grid_narrowing_unparsed = m;
   var bm = basemap_re.exec(m);
   if (bm) basemap = { vector_tiles: parseInt(bm[1], 10),
                       raster_tiles: parseInt(bm[2], 10),
@@ -3232,6 +3293,9 @@ return { attached: attached, different: different, off_frame: off_frame,
          archive_spill_unparsed: archive_spill_unparsed,
          payload_share: payload_share, payload_share_all: payload_share_all,
          payload_share_unparsed: payload_share_unparsed,
+         grid_narrowing: grid_narrowing,
+         grid_narrowing_all: grid_narrowing_all,
+         grid_narrowing_unparsed: grid_narrowing_unparsed,
          basemap: basemap, ground: ground, floor: floor,
          tile_cache: tile_cache, tile_cache_all: tile_cache_all,
          tile_bodies: tile_bodies,
