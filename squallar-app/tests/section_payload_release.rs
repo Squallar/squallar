@@ -27,8 +27,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use nexrad_model::data::{
-    ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep,
-    VolumeCoveragePattern, WaveformType,
+    ChannelConfiguration, DataMoment, ElevationCut, GateBuffer, MomentData, PulseWidth, Radial,
+    RadialStatus, Scan, Sweep, VolumeCoveragePattern, WaveformType,
 };
 use squallar_app::render_dispatch::{RenderDispatcher, SectionDispatch};
 use squallar_egui::pane::{SectionLine, SectionTarget, VolumeStamp};
@@ -165,11 +165,57 @@ fn target() -> SectionTarget {
     }
 }
 
-/// Cache a payload in `d` and wait for the cut it dispatched to answer, so the
-/// job's own clone of the payload is gone before anything is measured.
+/// Cache a payload in `d` and wait until the dispatcher's cached field is the
+/// payload's **only** owner, so every byte the release has to give back is held
+/// by the thing under test and by nothing else when the measurement runs.
+///
+/// **What makes that true is the owner count, and only the owner count.** The
+/// dispatched job is not given a copy of the payload, it is given a co-owner:
+/// `nexrad_model::data::GateBuffer` is an `Arc<Vec<u8>>` (see
+/// `squallar_radar::payload_share`, which prices what that stopped copying), so
+/// the job's `RenderInput` clone and the dispatcher's cached payload own the
+/// same gate bytes and only the framing is duplicated. Waiting for the cut to
+/// *answer* does not establish that the job has let go of them — the reply is
+/// sent from inside the job's own delivery, and the frame that owns the request
+/// drops it only once that delivery has returned. A release measured in between
+/// hands back the framing alone: 46,524 B against this suite's 1,319,040 B
+/// floor, measured on 36 of 38 failures.
+///
+/// So the wait is on a state. Hold every gate buffer the fixture built, wait
+/// for each to fall to this function's handle plus the dispatcher's payload,
+/// and drop the handles here, before anything is measured.
+///
+/// **Every buffer, and not one of them.** The payload tears down front to back,
+/// so one buffer going quiet says nothing about the rest: two of those 38
+/// failures had the first radial's buffer already released with ~295 KB of the
+/// payload still co-owned, and a wait on a single buffer passes both of those
+/// through into a green.
+///
+/// **Kept even once the job lane drops its request before delivering**, which
+/// makes waiting on the reply sufficient *by construction*. By construction
+/// means by an implementation detail of the worker pool, and a later reorder —
+/// or a sink whose delivery holds the request — puts this suite back to
+/// measuring a transient with nothing anywhere saying so. A wait on a state
+/// survives that; a wait on the reply does not. It is not redundant, it is the
+/// reason the suite cannot quietly stop measuring what it claims to.
 fn cache_a_payload(d: &mut RenderDispatcher) {
     let (tx, rx) = mpsc::channel();
     let scan = volume();
+    // Counted against `RADIALS` because `any()` over an empty set is false for
+    // free: a wait that cannot wait is the exact failure this function is being
+    // repaired for, and it would read as a pass.
+    let probes: Vec<GateBuffer> = scan
+        .sweeps()
+        .iter()
+        .flat_map(Sweep::radials)
+        .filter_map(Radial::reflectivity)
+        .map(|moment| moment.gate_buffer().clone())
+        .collect();
+    assert_eq!(
+        probes.len(),
+        RADIALS as usize,
+        "premise: every fixture radial carries the reflectivity this waits on",
+    );
     let dispatched = d.spawn_section_render(
         0,
         &target(),
@@ -191,6 +237,24 @@ fn cache_a_payload(d: &mut RenderDispatcher) {
     );
     rx.recv_timeout(Duration::from_secs(60))
         .expect("the dispatched cut answers");
+
+    // The fixture volume went with the extraction closure `spawn_section_render`
+    // consumed, so what is left owning each buffer is this function's handle,
+    // the dispatcher's cached payload, and the job's clone until the worker's
+    // frame has dropped its request: two apiece once it has. The deadline is a
+    // hang guard and never the gate — what is asserted is the count.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while probes.iter().any(|gates| gates.owners() > 2) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dispatched job never gave the payload back: {} of {} gate \
+             buffers are still owned by more than this handle and the \
+             dispatcher's cached payload",
+            probes.iter().filter(|gates| gates.owners() > 2).count(),
+            probes.len(),
+        );
+        std::thread::yield_now();
+    }
 }
 
 fn live() -> u64 {
