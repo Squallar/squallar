@@ -5,7 +5,7 @@
 //! a literal here AND against `drive.py`'s own pattern. A copy of a literal is
 //! a second place for it to be wrong.
 
-use super::{LoopState, SkippedTicks, loop_state_line};
+use super::{LoopDecodeChurn, LoopState, SkippedTicks, loop_decode_line, loop_state_line};
 
 /// The rig driver and the measurement launcher, read at compile time so a
 /// moved or deleted file is a build failure rather than a skipped test.
@@ -453,5 +453,72 @@ fn a_huge_share_and_zero_measured_bytes_is_a_legal_reading() {
     assert!(
         line.ends_with("sole pinned 0 B over 0 frames, sole walks 88"),
         "and the measured figure is zero beside it, walked: {line}",
+    );
+}
+
+/// **The `loop decode:` row's exact shape and figure count.**
+///
+/// The enumeration gate proves a row family EXISTS and is blind to a new
+/// field on it, so the string is pinned here where a sixth figure is a
+/// compile-time-adjacent failure rather than a silent widening. Five distinct
+/// values, so a transposed pair fails rather than rendering identically.
+#[test]
+fn the_loop_decode_row_names_every_churn_field() {
+    let line = loop_decode_line(LoopDecodeChurn {
+        offered: 9,
+        suppressed: 7,
+        laps: 3,
+        resident: 2,
+        saturated: true,
+    });
+    assert_eq!(
+        line,
+        "loop decode: offered 9, suppressed 7; laps 3 to hold 2; saturated 1",
+    );
+    assert_eq!(
+        line.split_whitespace()
+            .filter(|w| w.trim_end_matches(&[',', ';'][..]).parse::<u64>().is_ok())
+            .count(),
+        5,
+        "the row carries exactly five figures",
+    );
+}
+
+/// **The treadmill's signature, as the row renders it, against a healthy
+/// loop's.**
+///
+/// The pair is the point: on `laps` alone a pump that decoded 156 volumes to
+/// hold 2 and one that decoded 2 to hold 2 are both "a pump that decoded
+/// things". The figures are this campaign's own, measured on the rig at
+/// `squallar-radar/src/loop_downloads/tests/loop_decode_treadmill_tests.rs`
+/// over 40 rounds of a 24-frame loop.
+#[test]
+fn a_pump_going_round_in_circles_is_visible_as_such() {
+    let treadmill = loop_decode_line(LoopDecodeChurn {
+        offered: 960,
+        suppressed: 0,
+        laps: 156,
+        resident: 0,
+        saturated: false,
+    });
+    assert!(
+        treadmill.contains("laps 156 to hold 0"),
+        "the ratio the row exists for is not readable: {treadmill}",
+    );
+    assert!(
+        treadmill.contains("suppressed 0"),
+        "the fires-counter must read zero when the publication never \
+         reached the pump: {treadmill}",
+    );
+    let repaired = loop_decode_line(LoopDecodeChurn {
+        offered: 84,
+        suppressed: 798,
+        laps: 0,
+        resident: 2,
+        saturated: false,
+    });
+    assert!(
+        repaired.contains("laps 0 to hold 2"),
+        "the repaired shape is not readable either: {repaired}",
     );
 }

@@ -1851,7 +1851,16 @@ fn every_telemetry_row_the_sibling_modules_write_is_claimed_by_a_probe_or_a_reas
     /// fails loudly rather than passing over an empty list. Raised 16 -> 17 when
     /// `80ddbbbe8` landed `payload share:`; a floor may rise to what is known to
     /// be there, unlike `UNREAD_CEILING`, which may only fall.
-    const KNOWN_FAMILY_FLOOR: usize = 18;
+    ///
+    /// Raised 18 -> 19 for `loop decode:`. **The count is OBSERVED, not a
+    /// delta to reapply**: the extraction over `budget_telemetry.rs` and
+    /// `loop_telemetry.rs` yields 18 families at `b5c6fe895` and 19 with this
+    /// row, the one addition being `loop decode` itself. Two lanes each
+    /// bumping this by one merge cleanly to 19 and leave the floor a family
+    /// short of reality, with no conflict and nothing red — so on a rebase,
+    /// re-run the extraction and set this to what it COUNTS, never to the old
+    /// value plus your own one.
+    const KNOWN_FAMILY_FLOOR: usize = 19;
     // NOTE: no new family landed with `pinned` — it is a FIELD on the existing
     // `loop decoded:` row, which this gate keys past (it reads the prefix up to
     // the first colon). The gate that catches a field addition is
@@ -1915,6 +1924,17 @@ fn every_telemetry_row_the_sibling_modules_write_is_claimed_by_a_probe_or_a_reas
         // `ByNative` and not `By`: the figure is read off a MEMORY leg, which
         // is the native half's job, and there is no `drive.py` var for it.
         ("loop decoded", ByNative(&["LOOP_DECODED_RE"])),
+        // CLAIMED on landing, never `Unread`, and it is the row whose ABSENCE
+        // would have hidden the defect it was built for: the decode treadmill
+        // ran with `loop ceiling:` reading `over 0, evicted 0` on every tick,
+        // because the cycle was between the pump and the RESIDENCY sweep and
+        // that row reports only the ceiling. A reader watching the ceiling saw
+        // an idle pass while the pump decoded the same frames 156 times in 40
+        // rounds.
+        //
+        // `ByNative` for `loop ceiling:`'s reason: the pair it carries is read
+        // off a MEMORY leg, and there is no `drive.py` var for it.
+        ("loop decode", ByNative(&["LOOP_DECODE_RE"])),
         ("loop state", By(&["loop_state_re"])),
         (
             "moment drop",

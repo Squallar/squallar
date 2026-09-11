@@ -613,6 +613,34 @@ def loop_ceiling_reading(m):
     return dict(zip(LOOP_CEILING_FIELDS, (int(g) for g in m.groups())))
 
 
+# **What the decode PUMP did**, against `loop ceiling:`'s account of what one
+# eviction policy did. Its own probe because the treadmill this row exists to
+# catch ran with `loop ceiling:` reading `over 0, evicted 0` on every tick --
+# the decoded ceiling never fired at all, and the cycle was between the pump
+# and the RESIDENCY sweep, which that row does not report.
+#
+# `laps` alone is not a defect and must never be quoted alone: a retarget
+# blanks every frame, and a frame leaving the lookahead and coming back costs
+# one. The reading is `laps` AGAINST `resident` -- 156 laps to hold 2 volumes
+# is a treadmill, 0 to hold 2 is a loop doing its job, and on `laps` alone the
+# two are both "a pump that decoded things".
+#
+# `suppressed` is the FIRES-COUNTER. It reads 0 on a build where the app never
+# publishes what it wants decoded, which is the repair's precondition failing
+# loudly instead of a cut that silently delivered nothing.
+LOOP_DECODE_RE = re.compile(
+    r"loop decode: offered (\d+), suppressed (\d+); "
+    r"laps (\d+) to hold (\d+); saturated (\d+)"
+)
+
+LOOP_DECODE_FIELDS = ("offered", "suppressed", "laps", "resident", "saturated")
+
+
+def loop_decode_reading(m):
+    """A `LOOP_DECODE_RE` match as a dict over `LOOP_DECODE_FIELDS`."""
+    return dict(zip(LOOP_DECODE_FIELDS, (int(g) for g in m.groups())))
+
+
 LOOP_DECODED_FIELDS = (
     "volumes", "bytes_mib", "no_archive", "no_archive_mib",
     "unwanted", "unwanted_mib", "never_archived", "never_archived_mib",
@@ -701,6 +729,7 @@ def scrape(lines, probes):
         "overlay_pictures": [],
         "loop_decoded": [],
         "loop_ceiling": [],
+        "loop_decode": [],
         "segments": [],
         # `{key: [Reading]}` for every per-family line present, keyed the
         # browser rig's way (`segment:pre`, `dispatch:hitmap`), and the line
@@ -874,6 +903,12 @@ def scrape(lines, probes):
         m = LOOP_CEILING_RE.search(line)
         if m:
             out["loop_ceiling"].append((idx, loop_ceiling_reading(m)))
+        # `loop decode` is RUNNING TOTALS beside a LEVEL (`resident`), so a
+        # reader takes the LAST row of a leg and reads the pair, never the lap
+        # count on its own.
+        m = LOOP_DECODE_RE.search(line)
+        if m:
+            out["loop_decode"].append((idx, loop_decode_reading(m)))
         # `frame segments` is NOT one of them: its percentile groups are
         # `(\d+|none|over)`, and `over` is the top-bin clamp, which has no
         # upper edge and is not a number. Kept as text -- it is reported as
@@ -3875,6 +3910,69 @@ class LoopDecodedRowTests(unittest.TestCase):
         got = scrape([line], compile_probes())["loop_decoded"]
         self.assertEqual(len(got), 1)
         self.assertEqual(got[0][1]["pinned"], values[LOOP_DECODED_FIELDS.index("pinned")])
+
+
+class LoopDecodeRowTests(unittest.TestCase):
+    """`LOOP_DECODE_RE` against the EMITTER'S OWN format string.
+
+    Same two-gate shape as `LoopCeilingRowTests`, and the source file differs:
+    this row lives in `loop_telemetry.rs`, not `budget_telemetry.rs`. The
+    enumeration gate in `frame_telemetry_line_tests.rs` claims the ROW and is
+    blind to its COLUMNS, so a sixth figure appended on the producer would pass
+    it silently while this probe went on reading five.
+    """
+
+    ROW_SRC = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "..", "squallar-app", "src", "loop_telemetry.rs",
+    )
+
+    def _literal(self):
+        src = open(self.ROW_SRC, encoding="utf-8").read()
+        m = re.search(r'("loop decode: (?:[^"\\]|\\.)*")', src, re.S)
+        self.assertIsNotNone(m, "the `loop decode:` literal is gone from loop_telemetry.rs")
+        return m.group(1)[1:-1]
+
+    def test_the_probe_matches_the_emitters_own_format_string(self):
+        literal = self._literal()
+        values = list(range(3, 3 + len(LOOP_DECODE_FIELDS)))
+        line = LoopDecodedRowTests._rendered(literal, values)
+        m = LOOP_DECODE_RE.search(line)
+        self.assertIsNotNone(m, "LOOP_DECODE_RE does not match the row: %r" % line)
+        self.assertEqual(
+            loop_decode_reading(m),
+            dict(zip(LOOP_DECODE_FIELDS, values)),
+            "the probe matched but read the fields in the wrong order",
+        )
+
+    def test_the_field_count_is_pinned_to_the_emitter(self):
+        literal = self._literal()
+        self.assertEqual(
+            len(re.findall(r"\{[^{}]*\}", literal)),
+            len(LOOP_DECODE_FIELDS),
+            "loop_telemetry.rs emits a different number of figures than "
+            "LOOP_DECODE_FIELDS names; update both halves together",
+        )
+        self.assertEqual(LOOP_DECODE_RE.groups, len(LOOP_DECODE_FIELDS))
+
+    def test_the_treadmill_and_a_healthy_pump_are_told_apart(self):
+        """The distinction the row exists for, and it is a PAIR. On `laps`
+        alone these two rows are indistinguishable."""
+        literal = self._literal()
+        def read(offered, suppressed, laps, resident):
+            values = [offered, suppressed, laps, resident, 0]
+            return loop_decode_reading(
+                LOOP_DECODE_RE.search(LoopDecodedRowTests._rendered(literal, values))
+            )
+        treadmill = read(960, 0, 156, 0)
+        healthy = read(84, 798, 0, 2)
+        self.assertEqual((treadmill["laps"], treadmill["resident"]), (156, 0))
+        self.assertEqual((healthy["laps"], healthy["resident"]), (0, 2))
+        self.assertEqual(
+            treadmill["suppressed"], 0,
+            "the fires-counter must read zero when the app published nothing",
+        )
+        self.assertGreater(healthy["suppressed"], 0)
 
 
 class LoopCeilingRowTests(unittest.TestCase):

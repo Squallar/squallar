@@ -318,6 +318,38 @@ pub struct LoopDownloadManager {
     /// field instead.
     scan_over_arrivals: u64,
     scan_over_arrival_bytes: u64,
+    /// **What the residency sweep wants DECODED, published by the one place
+    /// that knows** — per site, the moments something will read the moments
+    /// of, and how far ahead of a playhead each of them sits.
+    ///
+    /// # Why the pump cannot answer this itself
+    ///
+    /// [`Self::needs_decode`] asks "are this frame's bytes here and its
+    /// moments not", which is a question about this cache. Whether anything
+    /// will *read* those moments is a question about the application's panes
+    /// — a frame that already carries a texture and is not the playhead or
+    /// inside its lookahead is one `App`'s residency pass evicts on its very
+    /// next tick. Without this map the pump offered those frames anyway and
+    /// the two passes ran against each other for ever: see
+    /// [`Self::frames_needing_decode`].
+    ///
+    /// **Empty means "not published", never "nothing is wanted".** A site
+    /// absent from this map is offered exactly what it was offered before
+    /// this map existed, so a caller that never publishes — every test in
+    /// this file, and every non-loop path — is unaffected.
+    decode_wants:
+        std::collections::HashMap<String, std::collections::HashMap<chrono::NaiveDateTime, u64>>,
+    /// **Keys this cache has filed a decoded volume under at least once**,
+    /// which is what makes a re-decode detectable as a re-decode rather than
+    /// counted as ordinary work. Capped, and it says when it saturated.
+    decoded_ever: std::collections::HashSet<(String, chrono::NaiveDateTime)>,
+    decoded_ever_saturated: bool,
+    /// The counters behind [`Self::decode_churn`]: decodes offered to the
+    /// pump, offers this map suppressed, and LAPS — a decode of a moment this
+    /// cache had already decoded and lost.
+    decode_offers: std::sync::atomic::AtomicU64,
+    decode_suppressed: std::sync::atomic::AtomicU64,
+    decode_laps: u64,
     /// **What the decoded byte ceiling's eviction pass has actually done, and
     /// how much of it it had to UNDO** — the counters behind
     /// [`Self::ceiling_churn`].
@@ -630,6 +662,12 @@ impl LoopDownloadManager {
             scan_reserve_bootstrap: 0,
             scan_over_arrivals: 0,
             scan_over_arrival_bytes: 0,
+            decode_wants: std::collections::HashMap::new(),
+            decoded_ever: std::collections::HashSet::new(),
+            decoded_ever_saturated: false,
+            decode_offers: std::sync::atomic::AtomicU64::new(0),
+            decode_suppressed: std::sync::atomic::AtomicU64::new(0),
+            decode_laps: 0,
             ceiling_asks: 0,
             ceiling_over: 0,
             ceiling_evictions: 0,
@@ -753,6 +791,20 @@ impl LoopDownloadManager {
         // pass bought its bytes with a decode and this is the decode being
         // paid for, so it is counted here rather than inferred from a later
         // eviction: `evictions - returns` is then the half that cost nothing.
+        // **A LAP: a moment this cache has decoded before, decoded again.**
+        // Counted here rather than at dispatch because here is where the key
+        // is known to have been filed before, and counted for BOTH eviction
+        // policies — the ceiling's and the residency sweep's — because the
+        // cost of a re-decode does not care which pass bought it.
+        let key = (site.to_string(), ts);
+        if self.decoded_ever.contains(&key) {
+            self.decode_laps = self.decode_laps.saturating_add(1);
+        } else if self.decoded_ever.len() < CEILING_OUTSTANDING_CAP {
+            self.decoded_ever.insert(key);
+        } else {
+            // Past the cap `decode_laps` is a LOWER bound and says so.
+            self.decoded_ever_saturated = true;
+        }
         if self.ceiling_outstanding.remove(&(site.to_string(), ts)) {
             self.ceiling_returns = self.ceiling_returns.saturating_add(1);
             self.ceiling_returned_bytes = self.ceiling_returned_bytes.saturating_add(price as u64);
@@ -1875,6 +1927,60 @@ impl LoopDownloadManager {
     ///
     /// `saturated` means `outstanding` hit its cap and `returns` is a lower
     /// bound from that point on.
+    /// **Publish what the residency sweep wants decoded**, per site, each
+    /// moment with its distance from the nearest playhead. The whole map is
+    /// replaced: it is a level and not an accumulation, and a site that has
+    /// stopped looping must stop being published for rather than linger.
+    ///
+    /// See [`Self::decode_wants`] for why the pump cannot derive this, and
+    /// [`Self::frames_needing_decode`] for what it does with it.
+    pub fn set_decode_wants(
+        &mut self,
+        wants: std::collections::HashMap<
+            String,
+            std::collections::HashMap<chrono::NaiveDateTime, u64>,
+        >,
+    ) {
+        self.decode_wants = wants;
+    }
+
+    /// **Whether the pump is doing work or going round in circles**:
+    /// `(offered, suppressed, laps, decoded_resident, saturated)`.
+    ///
+    /// # `laps` against `decoded_resident` is the whole reading
+    ///
+    /// `laps` counts a decode of a moment this cache had already decoded and
+    /// lost. A loop legitimately re-decodes: a retarget blanks every frame,
+    /// and a frame that scrolls out of the lookahead and back in costs one.
+    /// So a lap count alone reads as "busy" and says nothing. What says
+    /// something is the RATIO to what the pump managed to keep resident —
+    /// 160 laps to hold 2 volumes is a treadmill, 2 laps to hold 2 is a loop
+    /// doing its job — which is the shape this campaign's archive ceiling was
+    /// caught in at 7,339 spills against 57 net held.
+    ///
+    /// `suppressed` is the fires-counter for the filter in
+    /// [`Self::frames_needing_decode`]: offers it declined because the
+    /// residency sweep had already said nothing would read those moments. It
+    /// reads **0** on a build whose caller never calls
+    /// [`Self::set_decode_wants`], which is the precondition failing loudly
+    /// rather than a cut that quietly delivered nothing.
+    ///
+    /// Three running totals and one level; `saturated` says `laps` is a lower
+    /// bound because the seen-set hit its cap.
+    pub fn decode_churn(&self) -> (u64, u64, u64, usize, bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.decode_offers.load(Relaxed),
+            self.decode_suppressed.load(Relaxed),
+            self.decode_laps,
+            self.scan_cache
+                .values()
+                .map(std::collections::HashMap::len)
+                .sum(),
+            self.decoded_ever_saturated,
+        )
+    }
+
     pub fn ceiling_churn(&self) -> (u64, u64, u64, u64, u64, u64, usize, bool) {
         (
             self.ceiling_asks,
@@ -2058,12 +2164,44 @@ impl LoopDownloadManager {
         let Some(plan) = self.plans.get(&pane) else {
             return Vec::new();
         };
-        let mut wanted: Vec<chrono::NaiveDateTime> = plan
+        // **The residency sweep's own answer, if it has published one.** A
+        // site absent from the map has never been published for and keeps the
+        // behaviour this walk had before the map existed.
+        let wants = self.decode_wants.get(plan.site.as_str());
+        let mut suppressed = 0u64;
+        let mut wanted: Vec<(u64, chrono::NaiveDateTime)> = plan
             .frames
             .iter()
             .copied()
             .filter(|ts| self.needs_decode(&plan.site, ts))
+            .filter_map(|ts| match wants {
+                // **Not published for: offer it, ranked last but ahead of
+                // nothing.** The filter is sound in one direction only — it
+                // may never suppress a frame something will read — so an
+                // unpublished site is offered rather than guessed at.
+                None => Some((u64::MAX, ts)),
+                Some(ranks) => match ranks.get(&ts) {
+                    Some(rank) => Some((*rank, ts)),
+                    // **The treadmill's own frame**: its bytes are here, its
+                    // moments are not, and nothing will read them if they
+                    // arrive — the residency pass evicts it on the next tick.
+                    // Offering it is a decode bought and thrown away.
+                    None => {
+                        suppressed += 1;
+                        None
+                    }
+                },
+            })
             .collect();
+        // **Nearest to a playhead first, which is the order the evictions
+        // rank in reverse.** The pump walked the plan oldest-first and broke
+        // on the first frame that would not fit, so with a playhead anywhere
+        // but frame zero it spent its whole slot budget on the frames
+        // furthest from the glass and could starve the playhead itself.
+        // `sort_by_key` is stable, so equal ranks — and an unpublished site's
+        // all-`u64::MAX` ranks — keep plan order exactly.
+        wanted.sort_by_key(|(rank, _)| *rank);
+        let mut wanted: Vec<chrono::NaiveDateTime> = wanted.into_iter().map(|(_, ts)| ts).collect();
         // Both halves of the held set: an archive off the heap is decodable
         // exactly as a heap-held one is, and `needs_decode` already says so.
         let mut unlisted: Vec<chrono::NaiveDateTime> = self
@@ -2084,10 +2222,17 @@ impl LoopDownloadManager {
         // spilled copy), so this is insurance and not a policy.
         unlisted.dedup();
         wanted.extend(unlisted);
-        wanted
+        let offers: Vec<(String, chrono::NaiveDateTime)> = wanted
             .into_iter()
             .map(|ts| (plan.site.clone(), ts))
-            .collect()
+            .collect();
+        // Atomics for the reason `spill_restores` is one: this walk is a read
+        // of the cache and stays one, and a counter is not a reason to make
+        // every caller hold it mutably.
+        use std::sync::atomic::Ordering::Relaxed;
+        self.decode_offers.fetch_add(offers.len() as u64, Relaxed);
+        self.decode_suppressed.fetch_add(suppressed, Relaxed);
+        offers
     }
 
     pub fn complete_download(&mut self, site: &str, ts: &chrono::NaiveDateTime) {
@@ -2552,6 +2697,9 @@ impl LoopDownloadManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[path = "loop_decode_treadmill_tests.rs"]
+    mod treadmill;
     use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
 
     pub(super) fn ts(minute: u32) -> chrono::NaiveDateTime {

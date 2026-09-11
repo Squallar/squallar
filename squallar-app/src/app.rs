@@ -3419,6 +3419,53 @@ impl App {
                 *nearest = (*nearest).min(ahead as u64);
             }
         }
+        // **Tell the pump what this sweep wants decoded, before the sweep
+        // acts on it.** The two halves of the loop cache's decode cycle were
+        // answering different questions: this pass evicts a decoded volume
+        // the moment nothing will read its moments, and
+        // `frames_needing_decode` offered every archived moment whose volume
+        // was missing — which is, by construction, exactly what this pass had
+        // just thrown away. The pump re-decoded it, this pass evicted it
+        // again, and neither ceiling was involved: measured at 156 laps in 40
+        // rounds to hold 2 volumes, flat across every ceiling from 4 frames
+        // to 30.
+        //
+        // Published as `decoded_wanted` joined to `frame_distance` — the two
+        // maps the sweep has just built — so the pump's order is the reverse
+        // of the eviction's rank and neither is a second spelling of the
+        // other. The distance is what stops the pump starving the playhead:
+        // it walked the plan oldest-first and broke on the first frame that
+        // would not fit, so a playhead anywhere but frame zero could spend
+        // every slot on the frames furthest from the glass and never decode
+        // the one on screen.
+        //
+        // **Every active loop's site is published even when its wanted set is
+        // empty**, because an absent site means "nobody published" and is
+        // offered everything. An empty set is a real answer — the wasm arm
+        // keeps no lookahead at all — and must not read as silence.
+        self.loop_mgr.set_decode_wants(
+            decoded_wanted
+                .iter()
+                .map(|(site, frames)| {
+                    let distances = frame_distance.get(site);
+                    (
+                        (*site).to_string(),
+                        frames
+                            .iter()
+                            .map(|ts| {
+                                (
+                                    *ts,
+                                    distances
+                                        .and_then(|by_ts| by_ts.get(ts))
+                                        .copied()
+                                        .unwrap_or(u64::MAX),
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+        );
         let keep = |site: &str, ts: &chrono::NaiveDateTime| {
             settling.contains(site) || needed.get(site).is_some_and(|frames| frames.contains(ts))
         };

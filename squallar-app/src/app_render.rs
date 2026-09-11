@@ -3935,6 +3935,24 @@ impl super::App {
                 ),
             );
         }
+        // **And what the PUMP did on the other side of that cycle.** Its own
+        // row rather than a column on the one above: `loop ceiling:` reports
+        // one eviction policy, while the decode treadmill is fed by the
+        // residency sweep as well and ran with that row reading `over 0,
+        // evicted 0` throughout. See `loop_telemetry::LoopDecodeChurn`.
+        {
+            let (offered, suppressed, laps, resident, saturated) = self.loop_mgr.decode_churn();
+            say_telemetry(
+                loud,
+                &crate::loop_telemetry::loop_decode_line(crate::loop_telemetry::LoopDecodeChurn {
+                    offered,
+                    suppressed,
+                    laps,
+                    resident,
+                    saturated,
+                }),
+            );
+        }
         // **Every distinct decoded volume, counted once across all five
         // holders.** A LEVEL, unlike the two running totals above, and never
         // to be added to them or to the census families below — this is the

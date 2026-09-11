@@ -279,6 +279,57 @@ pub(crate) fn loop_state_line(s: &LoopState, skips: &SkippedTicks) -> String {
     )
 }
 
+/// **What the decode pump did, and how much of it was the same work twice** —
+/// the counters behind `LoopDownloadManager::decode_churn`.
+///
+/// # Its own row, and `laps` against `resident` is the reading
+///
+/// Never a column on `loop state:`, which is scraped positionally, and never
+/// a new field on `loop ceiling:`, which reports one eviction policy while
+/// this reports the cycle both policies feed. The defect this exists to catch
+/// ran with `loop ceiling:` reading `over 0, evicted 0` throughout — the
+/// decoded ceiling never fired at all, and a reader watching it would have
+/// seen an idle row while the pump re-decoded the same frames 156 times in 40
+/// rounds.
+///
+/// * `offered` / `suppressed` — decodes the pump was offered, and offers the
+///   residency sweep's published wants declined. `suppressed` is the
+///   **fires-counter**: it reads 0 on a build where `App` never calls
+///   `set_decode_wants`, so a repair whose precondition stopped holding says
+///   so instead of quietly delivering nothing.
+/// * `laps` — decodes of a moment this cache had already decoded and lost.
+///   **Not a defect on its own**: a retarget blanks every frame and a frame
+///   that leaves the lookahead and comes back costs one.
+/// * `resident` — decoded volumes held right now, the LEVEL the three totals
+///   above are read against. 156 laps to hold 2 is a treadmill; 0 laps to
+///   hold 2 is a loop doing its job. A raw lap count reads as merely busy.
+/// * `saturated` — 1 once the seen-set hit its cap, after which `laps` is a
+///   lower bound and must be read as one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LoopDecodeChurn {
+    pub(crate) offered: u64,
+    pub(crate) suppressed: u64,
+    pub(crate) laps: u64,
+    pub(crate) resident: usize,
+    pub(crate) saturated: bool,
+}
+
+/// The `loop decode:` line; see [`LoopDecodeChurn`].
+pub(crate) fn loop_decode_line(churn: LoopDecodeChurn) -> String {
+    let LoopDecodeChurn {
+        offered,
+        suppressed,
+        laps,
+        resident,
+        saturated,
+    } = churn;
+    format!(
+        "loop decode: offered {offered}, suppressed {suppressed}; \
+         laps {laps} to hold {resident}; saturated {}",
+        u8::from(saturated),
+    )
+}
+
 #[cfg(test)]
 #[path = "loop_telemetry/tests.rs"]
 mod tests;
