@@ -844,6 +844,43 @@ fn describe_gpu_capacity(reading: Option<(u64, GpuCapacitySource)>) -> String {
     }
 }
 
+/// `telemetry posture: frame=1 raster=0 store=1` — which of the two
+/// independent telemetry gates this process resolved **on**, and whether
+/// there was a store to resolve them against at all.
+///
+/// **This row is deliberately said with a bare `log::info!` and never through
+/// `render::say_telemetry`, and that is not an oversight to tidy up.**
+/// `say_telemetry(loud, line)` is `log::info!` when `loud` and `log::debug!`
+/// otherwise, so a posture row sent through it would land at `debug` exactly
+/// when both predicates are off — invisible precisely in the case it exists
+/// to report. It is the one legitimate line that bypasses the telemetry seam,
+/// *because* it reports the gate it would otherwise sit behind. Migrating it
+/// into `say_telemetry` silently deletes it from every leg that most needs
+/// it.
+///
+/// Three fields, not two, and the third is what makes the other two
+/// readable. `frame=0` alone collapses three different failures: no store at
+/// all (the runner never gave this process a config dir), the key absent (the
+/// seed never wrote it) and the key present but not `"1"` (the seed wrote the
+/// wrong value) — a runner bug, a seed bug and a value bug. `store`
+/// partitions them: `store=0` means no predicate could ever have been true,
+/// and `store=1` with `raster=0` means that one key is missing or wrong.
+///
+/// Both flags are the **resolved** state, never the value a seed intended: a
+/// seed that failed to take reads `0` here and the row says so.
+///
+/// `0` means the predicate resolved false. **Absence of the row means the
+/// build predates it**, and the two are never the same fact.
+fn telemetry_posture_line(frame_loud: bool, raster_loud: bool, store: bool) -> String {
+    let bit = |on: bool| u8::from(on);
+    format!(
+        "telemetry posture: frame={} raster={} store={}",
+        bit(frame_loud),
+        bit(raster_loud),
+        bit(store),
+    )
+}
+
 /// **The profile's capacity, or the browser probe's figure where the profile
 /// has only a presumption to offer.** The probe applies on exactly one
 /// profile: `Platform::Web` with a class the driver would not name — every
@@ -1070,6 +1107,28 @@ impl App {
         // frame and a config read is not a per-frame cost.
         let raster_telemetry_loud = render::raster_telemetry_is_loud(platform.kv().as_deref());
         let frame_telemetry_loud = render::frame_telemetry_is_loud(platform.kv().as_deref());
+        // Said here, before anything can have been gestured at, so a leg that
+        // dies in its first second still carries which gates were on.
+        //
+        // Bare `log::info!` and NOT `render::say_telemetry` on purpose — see
+        // `telemetry_posture_line`: through the seam this row would fall to
+        // `debug` exactly when both gates are off, which is the case it exists
+        // to report.
+        //
+        // On every target but Android this is the only emission. Android
+        // re-resolves both gates in `set_config_dir` and says the row again
+        // there, so **two rows is the Android contract and one is a defect** —
+        // one means `set_config_dir` never ran, and a reader taking the last
+        // match then sees this row's pre-store `frame=0 raster=0 store=0` and
+        // reads a seed failure that did not happen.
+        log::info!(
+            "{}",
+            telemetry_posture_line(
+                frame_telemetry_loud,
+                raster_telemetry_loud,
+                platform.kv().is_some(),
+            )
+        );
         let gesture_player = render::gesture_player_from(
             std::env::var("SQUALLAR_GESTURE_SCRIPT").ok(),
             platform.kv().as_deref(),
@@ -4376,6 +4435,22 @@ impl App {
             // `App::new`.
             self.raster_telemetry_loud = render::raster_telemetry_is_loud(Some(store.as_ref()));
             self.frame_telemetry_loud = render::frame_telemetry_is_loud(Some(store.as_ref()));
+            // Android resolves both gates twice: once in `App::new` against a
+            // bridge with no store, and again here. The row `App::new` said is
+            // true of that moment and false of this one, so say the resolved
+            // posture again rather than leave a reader holding the pre-store
+            // reading. Web and desktop never reach here and say it once.
+            //
+            // This emission is half the Android contract, and deleting it is
+            // not a lost log line: it makes a correctly seeded Android leg
+            // report `frame=0 raster=0 store=0`, which is what a seed failure
+            // looks like. `the_android_resolution_path_says_the_row_too` is
+            // what holds it here. Bare `log::info!` for the same reason as the
+            // other site — never `say_telemetry`.
+            log::info!(
+                "{}",
+                telemetry_posture_line(self.frame_telemetry_loud, self.raster_telemetry_loud, true)
+            );
             self.gesture_player = render::gesture_player_from(
                 std::env::var("SQUALLAR_GESTURE_SCRIPT").ok(),
                 Some(store.as_ref()),
@@ -4822,3 +4897,8 @@ mod scan_ownership_tests;
 /// half of the gate the fetch already asks.
 #[cfg(test)]
 mod disabled_radar_retention_tests;
+
+/// The startup row that says which telemetry gates resolved on — its exact
+/// text and its exact field count.
+#[cfg(test)]
+mod telemetry_posture_tests;
