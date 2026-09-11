@@ -21,10 +21,10 @@ that same panel at its native 3440x1440 @ 175 Hz — not 60. **So there is no
 "Mac 60 Hz arm" on this hardware; any figure so labelled was the ghost.** The
 only way to get 60 Hz out of the Mac on the real panel is to change the Mac's own
 display setting, and that is the user's device, not ours to change. The 16.67 ms
-rAF cadence and the 19,028 us native cadence recorded below were taken on the
-ghost, not on the panel, and a `finish` segment on the ghost is not a
-compositor's vblank. A real-panel Mac leg needs the KVM switched to the Mac,
-which takes the user's screen — get their word first.
+rAF cadence and the 19,028 us native frame-interval reading recorded below
+were taken on that ghost, not on the panel, and a `finish` segment on the
+ghost is not a compositor's vblank. A real-panel Mac leg needs the KVM
+switched to the Mac, which takes the user's screen — get their word first.
 
 Before any headed or cadence leg, read the display state on the Mac itself
 (`system_profiler SPDisplaysDataType`, or the rAF cadence as the presentation
@@ -51,8 +51,18 @@ legs, `frame cadence`, on the 1080p60 ghost display:
 | C | n=8754 | 19028 us |
 | E2 | n=11934 | 19028 us |
 
-19,028 us is 52.6 Hz against the 60 Hz ghost display, sustained for minutes, with
-a populated concentrated histogram climbing monotonically across 75 readings.
+**19,028 us is not a cadence. It is an upper bound, and it has been misread as a
+value.** `Hist` answers a percentile with the *upper* edge of the bin the sample
+fell in, and the edges are `62_500 x 2^(k/4)` ns, four per octave. So `p50 =
+19028 us` says "the median frame interval is at most 19.03 ms", the bin below it
+closes at 16.00 ms, and every value in (16.00, 19.03] reads as 19028 -- 16.67 ms
+included. Reading that edge as the value turned a display-paced app into a
+"52.6 Hz sustained" one. A Metal trace of the same app counts **2,415 frames in
+40.38 s against 2,422 vsyncs = 59.8 Hz, 7 dropped**: it is pacing to the 60 Hz
+ghost, and was all along. What this table *does* establish is that frames are
+being presented -- a populated, concentrated histogram climbing monotonically
+across 75 readings. Use it for that. Never read a rate off it.
+
 Compare the dead-display signature on the Linux box — `cadence n=182 p50=OVER` —
 roughly forty-eight times fewer frames from the same field. That signature is
 also exactly what Linux reads when the KVM is on the Mac, so it is a KVM
