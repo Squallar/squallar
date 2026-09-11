@@ -3804,6 +3804,14 @@ var begins = [], loops = [];
 // sees it only if the event happened to land in the last window; polled and
 // unioned in `FrameLineWatcher`, a line seen at any poll is seen.
 //
+// **THE ORDER AND THE MULTIPLICITY ARE THE READING**, which is why these are
+// pushed to a list and nothing here dedupes them: two distinct events emit
+// byte-identical lines whenever the second finds the caches already emptied
+// and the ladder already at its floor -- MEASURED at twelve events in two
+// distinct strings -- and the held-rung line below carries no field at all,
+// so every emission of it is identical by construction. `FrameLineWatcher`
+// unions them by OVERLAP for that reason.
+//
 // The literal is `pressure:` and NOT `budget pressure:`, and the shorter one
 // is deliberate. `App::on_pressure` writes a second, differently-headed line
 // -- `pressure: oom during gpu probe, presumption held`
@@ -4828,20 +4836,46 @@ class FrameLineWatcher:
         # the time the window ends.
         self.need = {}
         self.loops = {}
-        # Every `pressure:`-headed line seen at any poll, in ring order, kept
-        # as a list rather than a dict: these lines carry no `n` and two
-        # events can be identical in every field, so keying them would lose
-        # the second. The union is by VALUE against what is already held, so
-        # a line re-read across polls is not counted twice while a genuine
-        # repeat within one poll is kept.
+        # Every `pressure:`-headed line seen at any poll, in ring order, WITH
+        # ITS MULTIPLICITY KEPT: a list and not a dict because these lines
+        # carry no `n` to key on, and unioned by OVERLAP (`_merge_ring_lines`)
+        # and not by value because a REPEAT IS A READING here.
+        #
+        # **Measured, not argued.** Twelve `on_pressure(SurfaceLost)` events
+        # through the real `App` emit twelve lines in TWO distinct strings --
+        # five identical at rung 0, then seven identical at rung 7 -- because
+        # every field on the line goes quiet on a second event: the render and
+        # extract caches were emptied by the first, `tile economy` is 0 off
+        # the page-heap arm, `staging released` is 0 off the host-heap arm,
+        # and the rung and the oversample percentage stop moving once the
+        # ladder is at its floor (`refit_under_pressure`'s `floor_need`). Each
+        # of those zeroes is spelled out in the producer's own doc comments.
+        # A by-value `not in` union over that leg reports 2 events where 12
+        # fired: an 83 % undercount of the family `event_count` is taken over.
+        #
+        # The SIXTH shape needs no such conditions at all.
+        # `pressure: oom during gpu probe, presumption held`
+        # (`squallar-app/src/app_render.rs:8653`) is a CONSTANT string with no
+        # interpolated field, written once per frame for as long as the WebGPU
+        # probe holds its doubling textures -- "about two seconds"
+        # (`squallar-app/src/pressure.rs`), so of the order of a hundred
+        # emissions at 60 Hz, every one byte-identical BY CONSTRUCTION. How
+        # many allocations the browser refused inside that window is the whole
+        # diagnosis, and a by-value union answers one for ever.
+        #
+        # `budget_pressure_reading` consumes the multiplicity directly --
+        # `event_count`, "because pressure events are not running totals and a
+        # second is not a bigger first" -- and `native_row.py` keeps every
+        # occurrence off a desktop log, so a by-value union here also put the
+        # two rig halves in disagreement about one leg.
         self.pressure_lines = []
-        # The posture rows, in ring order, WITH THEIR MULTIPLICITY KEPT. A
-        # separate list and a separate union from `pressure_lines` on purpose:
-        # that one is a by-VALUE `not in` union, and an Android leg's two
-        # emissions can be identical in every field -- byte-for-byte the same
-        # string -- so a by-value union would report the contract shape as one
-        # emission and a reader taking the count would then call a healthy leg
-        # a lifecycle bug. `_merge_ring_lines` unions by OVERLAP instead.
+        # The posture rows, in ring order, WITH THEIR MULTIPLICITY KEPT, and a
+        # separate list from `pressure_lines` because they are a separate
+        # family -- no longer because the union differs: both take
+        # `_merge_ring_lines`. An Android leg's two emissions can be identical
+        # in every field -- byte-for-byte the same string -- so a by-value
+        # union would report the contract shape as one emission and a reader
+        # taking the count would then call a healthy leg a lifecycle bug.
         self.posture_lines = []
         self.last = {}
 
@@ -4880,16 +4914,13 @@ class FrameLineWatcher:
             self.begins[(r.get("t"), r.get("script"))] = r
         for r in sig.get("gesture_loops") or []:
             self.loops[(r.get("t"), r.get("frames"))] = r
-        # The ring evicts and a pressure event is written once, so a line seen
-        # at ANY poll is kept for the whole leg. Appended in the order the
-        # page wrote them, with what this poll already held skipped: the probe
-        # re-reads the whole ring each time.
-        for line in sig.get("budget_pressure_lines") or []:
-            if line not in self.pressure_lines:
-                self.pressure_lines.append(line)
-        # The posture rows, unioned by OVERLAP and not by value: the probe
-        # re-reads the whole ring each poll, so consecutive polls repeat what
-        # was already held, while a genuinely repeated row must survive as two.
+        # The two ring families, both unioned by OVERLAP and not by value: the
+        # probe re-reads the whole ring each poll, so consecutive polls repeat
+        # what was already held, while a genuinely repeated line must survive
+        # as two. The ring evicts and each of these is written once per event,
+        # so a line seen at ANY poll is kept for the whole leg.
+        self.pressure_lines = _merge_ring_lines(
+            self.pressure_lines, sig.get("budget_pressure_lines") or [])
         self.posture_lines = _merge_ring_lines(
             self.posture_lines, sig.get("telemetry_posture_lines") or [])
         self.last = sig
@@ -9244,6 +9275,50 @@ def selftest_budget_pressure_reading():
         r["state"] == "acted" and r["probe_held"] is True
         and r["render_entries"] == 3)
 
+    # ---- THE REPEAT IS A READING ----------------------------------------
+    # Two distinct events emit byte-identical lines whenever the second finds
+    # the caches already emptied and the ladder already at its floor: twelve
+    # `on_pressure(SurfaceLost)` events through the real `App` were measured
+    # at twelve lines in TWO distinct strings. The by-value `not in` union
+    # this watcher carried until 2026-09-11 kept ONE of each, and the comment
+    # over it claimed the opposite in as many words. These four pins are the
+    # difference, and the LAST TWO are the property the union exists for --
+    # they must stay green or the fix has traded one undercount for a
+    # double-count.
+    watcher = FrameLineWatcher(_StubSession({"budget_pressure_lines":
+                                             [OOM, OOM]}))
+    watcher.poll()
+    pin("two byte-identical events in ONE poll survive the union as TWO "
+        "(the by-value union kept one)",
+        watcher.pressure_lines == [OOM, OOM]
+        and budget_pressure_reading(watcher.pressure_lines)["event_count"] == 2)
+
+    watcher = FrameLineWatcher(_StubSession({"budget_pressure_lines": [OOM]}))
+    watcher.poll()
+    watcher.session = _StubSession({"budget_pressure_lines": [OOM, OOM]})
+    watcher.poll()
+    pin("an identical second event arriving BETWEEN polls survives as TWO, "
+        "and the poll that carried it does not re-append the first",
+        watcher.pressure_lines == [OOM, OOM]
+        and budget_pressure_reading(watcher.pressure_lines)["event_count"] == 2)
+
+    watcher = FrameLineWatcher(_StubSession({"budget_pressure_lines":
+                                             [HELD, OOM]}))
+    for _ in range(3):
+        watcher.poll()
+    pin("and the property the union exists for SURVIVES: one ring re-read on "
+        "three polls is still not double-counted",
+        watcher.pressure_lines == [HELD, OOM]
+        and budget_pressure_reading(watcher.pressure_lines)["event_count"] == 1)
+
+    watcher = FrameLineWatcher(_StubSession({"budget_pressure_lines":
+                                             [HELD, OOM]}))
+    watcher.poll()
+    watcher.session = _StubSession({"budget_pressure_lines": [OOM]})
+    watcher.poll()
+    pin("a ring that EVICTED its head does not re-append what is still held",
+        watcher.pressure_lines == [HELD, OOM])
+
     return failed
 
 
@@ -9412,8 +9487,8 @@ def selftest_telemetry_posture_reading():
     pin("on a ring that EVICTED its head it does not re-append",
         _merge_ring_lines([PRE_STORE, ALL_ON], [ALL_ON])
         == [PRE_STORE, ALL_ON])
-    # The case a by-value union gets wrong, and the reason this family does
-    # not share `pressure_lines`' union.
+    # The case a by-value union gets wrong. `pressure_lines` shared that
+    # broken union until 2026-09-11 and now shares this one instead.
     pin("an IDENTICAL second row survives the union as two entries",
         _merge_ring_lines([], [PRE_STORE, PRE_STORE])
         == [PRE_STORE, PRE_STORE]
