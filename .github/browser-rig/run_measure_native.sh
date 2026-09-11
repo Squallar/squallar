@@ -283,7 +283,7 @@ done
 # readable file rather than a program, so it is probed as one.
 probe_tools() {
   local t found=()
-  for t in xdotool xrandr ps sysctl osascript system_profiler; do
+  for t in xdotool xrandr ps sysctl osascript system_profiler open; do
     command -v "$t" >/dev/null 2>&1 && found+=("$t")
   done
   [ -r /proc/loadavg ] && found+=("procfs")
@@ -322,6 +322,7 @@ report_platform() {
       echo "  $cap: UNAVAILABLE -- $why"
     fi
   done
+  echo "  launch: $PLAT_LAUNCH${PLAT_WHY_LAUNCH:+ -- $PLAT_WHY_LAUNCH}"
 }
 
 if [ "$SHOW_PLATFORM" = 1 ]; then
@@ -483,6 +484,137 @@ end tell
 EOF
       ;;
     *) echo "" ;;
+  esac
+}
+
+# ------------------------------------------------------------ launch layer ---
+#
+# TWO IMPLEMENTATIONS OF ONE CONTRACT, and the macOS one exists because a shell
+# is not how anybody runs this app.
+#
+# `env ... "$bin" &` is a launch from the shell. On Linux that is exactly how a
+# user starts the app and the arm below is unchanged. On macOS it is not: the
+# process comes up as `TASK_APPTYPE_DAEMON_INTERACTIVE`, role
+# `TASK_UNSPECIFIED`, with an effective QoS CEILING of
+# `THREAD_QOS_USER_INITIATED` and a main thread at `THREAD_QOS_LEGACY`. Through
+# LaunchServices the same binary in the same bundle is
+# `TASK_APPTYPE_APP_DEFAULT`, `TASK_FOREGROUND_APPLICATION`, no ceiling, main
+# thread `THREAD_QOS_USER_INTERACTIVE`. Read from the effective side with
+# `sudo taskinfo`, 2026-09-10.
+#
+# It is worth about 25 points of the 4 ms bar before any code is considered --
+# the figures and their denominators are in `native_row.py`'s `LAUNCH_METHODS`,
+# which is also where the "this is not a thread-placement story" evidence
+# lives. Every native Mac timing figure taken before this described a process
+# the product never is.
+#
+# NOTHING IS ASKED OF THE APP. No QoS call, no thread policy, no workgroup, no
+# entitlement: on the shipped launch there is nothing to raise, because
+# LaunchServices has already set it. The fix is entirely in how the rig starts
+# the process, which is the honest place for it -- the rig was measuring the
+# wrong thing, the app was not doing the wrong thing.
+
+# plat_bundle <binary> <dir>: assemble the .app a LaunchServices launch needs
+# around <binary>, under <dir>. Prints the bundle path, or a reason on stderr.
+#
+# THE PLIST IS `packaging/macos/Info.plist` RENDERED, not a plist written here.
+# `NSHighResolutionCapable` is why: without it AppKit runs the process in 1x
+# scaled mode, the wgpu surface is created at half resolution, and every
+# picture-byte figure on the row would be a quarter of the shipped app's --
+# a leg that looks like a 4x win and is a different measurement. Reading the
+# product's own plist is what keeps the measured bundle and the shipped one
+# from drifting; `yaml_val` is `packaging/macos/Makefile`'s reader verbatim,
+# for the same reason.
+#
+# What is deliberately NOT here: the icon, the privacy manifest, and signing.
+# None of the three reaches the task apptype, the QoS ceiling, or the surface,
+# and a Mac-built binary is already ad-hoc signed by its own linker -- so the
+# bundle is the product's identity and metadata around the leg's own binary,
+# and it is not, and does not claim to be, a shippable artefact.
+plat_bundle() {
+  local bin="$1" dir="$2"
+  local app="$dir/squallar.app" plist="$REPO_ROOT/packaging/macos/Info.plist"
+  local proj="$REPO_ROOT/packaging/macos/project.yml"
+  [ -r "$plist" ] || { echo "no $plist to render" >&2; return 1; }
+  [ -r "$proj" ] || { echo "no $proj to read the bundle metadata from" >&2; return 1; }
+  yaml_val() { sed -n "s/.*$1: *\"\{0,1\}\([^\"]*\)\"\{0,1\}.*/\1/p" "$proj" | head -1; }
+  local bundle_id version build minos
+  bundle_id="$(yaml_val PRODUCT_BUNDLE_IDENTIFIER)"
+  version="$(yaml_val MARKETING_VERSION)"
+  build="$(yaml_val CURRENT_PROJECT_VERSION)"
+  minos="$(yaml_val MACOSX_DEPLOYMENT_TARGET)"
+  [ -n "$bundle_id" ] || { echo "no PRODUCT_BUNDLE_IDENTIFIER in $proj" >&2; return 1; }
+  [ -n "$minos" ] || { echo "no MACOSX_DEPLOYMENT_TARGET in $proj" >&2; return 1; }
+  rm -rf "$app"
+  mkdir -p "$app/Contents/MacOS" || return 1
+  cp "$bin" "$app/Contents/MacOS/squallar" || return 1
+  chmod 0755 "$app/Contents/MacOS/squallar"
+  printf 'APPL????' > "$app/Contents/PkgInfo"
+  sed -e "s|\$(EXECUTABLE_NAME)|squallar|g" \
+      -e "s|\$(PRODUCT_BUNDLE_IDENTIFIER)|$bundle_id|g" \
+      -e "s|\$(MARKETING_VERSION)|$version|g" \
+      -e "s|\$(CURRENT_PROJECT_VERSION)|$build|g" \
+      -e "s|\$(MACOSX_DEPLOYMENT_TARGET)|$minos|g" \
+      "$plist" > "$app/Contents/Info.plist" || return 1
+  # The Makefile's check, for the Makefile's reason: an unexpanded build
+  # setting is a plist key with a literal `$(...)` in it, and the launch that
+  # follows would be of an app with no identity rather than a failed one.
+  if grep -q '\$(' "$app/Contents/Info.plist"; then
+    echo "unexpanded build setting left in the rendered Info.plist" >&2
+    return 1
+  fi
+  echo "$app"
+}
+
+# plat_pid_of <executable path>: the one pid running exactly this executable.
+#
+# BY THE EXECUTABLE PATH, NEVER BY A PATTERN. `pgrep -f`/`pkill -f` match the
+# whole command line, and this script's own command line contains the very
+# path it would be searching for -- a trap that has bitten this repo twice.
+# `ps -o comm=` prints the executable macOS resolved for the process, not an
+# argv, so the shell running this cannot match itself however it was spelled.
+#
+# EXACTLY ONE, or nothing. Two means a leg from an earlier run is still alive,
+# and picking either is how a measurement comes to describe a process nobody
+# chose -- the same refusal `plat_window_resolve` makes for the same reason.
+# The bundle is assembled per leg, so its executable path is unique to this
+# leg and a stale process is a stale process, never a sibling arm.
+plat_pid_of() {
+  local exe="$1" waited=0 pids n
+  while [ "$waited" -lt 30 ]; do
+    pids="$(ps -Ao pid=,comm= 2>/dev/null \
+            | awk -v e="$exe" '''{ p = $1
+                                  sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "")
+                                  if ($0 == e) print p }''')"
+    n="$(printf '%s\n' "$pids" | grep -c '''[0-9]''')"
+    if [ "$n" -eq 1 ]; then printf '%s\n' "$pids"; return 0; fi
+    if [ "$n" -gt 1 ]; then
+      echo "$n live processes are running $exe; one is left over from an" >&2
+      echo "earlier leg and this run cannot tell which pid is its own" >&2
+      return 1
+    fi
+    sleep 1; waited=$((waited + 1))
+  done
+  echo "no process is running $exe 30s after the launch returned" >&2
+  return 1
+}
+
+# plat_reap <pid>: wait for a stopped app to actually be gone.
+plat_reap() {
+  case "${PLAT_LAUNCH:-}" in
+    launchservices)
+      # `open` returns as soon as LaunchServices accepts the request, so the
+      # app is NOT this shell's child: `wait` would return 127 immediately and
+      # the next leg would find two processes running its executable and
+      # refuse. Poll instead, then insist.
+      local n=0
+      while kill -0 "$1" 2>/dev/null && [ "$n" -lt 100 ]; do
+        sleep 0.1; n=$((n + 1))
+      done
+      kill -0 "$1" 2>/dev/null && kill -9 "$1" 2>/dev/null
+      return 0
+      ;;
+    *) wait "$1" 2>/dev/null ;;
   esac
 }
 
@@ -741,8 +873,39 @@ run_leg() {
   printf '%s\n' "${env_args[@]}" > "$dir/env.txt"
   echo "  launch env in $dir/env.txt ($SCALE_REPORT; the row records the scale" \
        "the leg was measured at either way)"
-  env "${env_args[@]}" "$bin" > "$log" 2>&1 &
-  pid=$!
+  case "${PLAT_LAUNCH:-}" in
+    launchservices)
+      local app
+      app="$(plat_bundle "$bin" "$dir" 2>"$dir/bundle.err")" || {
+        echo "ROW $tag NO RESULT (bundle: $(tr '\n' ' ' < "$dir/bundle.err"))"
+        return 1
+      }
+      # `--stdout` and `--stderr` are separate FILES because `open` opens each
+      # path it is given independently: pointing both at app.log would put two
+      # write offsets on one file and shred it. The readout is stderr on both
+      # platforms -- env_logger writes the telemetry sentences there at info --
+      # so stderr is app.log and stdout is kept beside it rather than dropped.
+      local -a open_args=(-n -a "$app" --stdout "$dir/app.stdout.log" --stderr "$log")
+      local e
+      for e in "${env_args[@]}"; do open_args+=(--env "$e"); done
+      echo "  launching through LaunchServices (open -n -a $app):" \
+           "the task comes up TASK_APPTYPE_APP_DEFAULT with no QoS ceiling"
+      open "${open_args[@]}" || {
+        echo "ROW $tag NO RESULT (open refused $app)"
+        return 1
+      }
+      pid="$(plat_pid_of "$app/Contents/MacOS/squallar" 2>"$dir/pid.err")" || {
+        echo "ROW $tag NO RESULT (pid: $(tr '\n' ' ' < "$dir/pid.err"))"
+        return 1
+      }
+      echo "  pid=$pid resolved by the bundle executable's path, never by a" \
+           "command-line pattern"
+      ;;
+    *)
+      env "${env_args[@]}" "$bin" > "$log" 2>&1 &
+      pid=$!
+      ;;
+  esac
 
   # 3. Wait for the app's own first surface line: proof a surface exists at
   #    all. Mined from the macOS lane -- it is a stronger boot signal than a
@@ -775,7 +938,7 @@ run_leg() {
     echo "ROW $tag REFUSED (geometry): $GEOM_WHY"
     echo "  pass --allow-unpinned to take the row anyway; the analyser will"
     echo "  still mark it INVALID."
-    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    kill "$pid" 2>/dev/null; plat_reap "$pid"
     return 1
   fi
 
@@ -828,7 +991,7 @@ run_leg() {
 
   # 8. Stop sampling, stop the app, analyse.
   kill "$sampler" 2>/dev/null; wait "$sampler" 2>/dev/null
-  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  kill "$pid" 2>/dev/null; plat_reap "$pid"
 
   # The window manager's reading is passed as the SECOND opinion. The analyser
   # takes the app's own surface line as authoritative and reports a
@@ -841,6 +1004,7 @@ run_leg() {
     --asked-geom "${W}x${H}" ${geom_args[@]+"${geom_args[@]}"} \
     --refresh "$REFRESH" --adapter "$ADAPTER" --panel "$PANEL" \
     --platform "$PLAT_NAME" --degraded "${PLAT_DEGRADED:-}" \
+    --launch "$PLAT_LAUNCH" \
     --position "$position" --load-file "$loadf" --quiet-max "$QUIET_MAX" \
     --skip-loops "$SKIP_LOOPS" --window-loops "$WINDOW_LOOPS" \
     --json "$OUT_DIR/$tag.json"

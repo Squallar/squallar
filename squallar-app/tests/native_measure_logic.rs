@@ -317,3 +317,153 @@ fn every_recorded_build_identity_field_is_claimed_by_the_subject_table() {
          has nothing to read",
     );
 }
+
+/// **A macOS leg is launched the way the product is launched, and every row
+/// says which launch it got.**
+///
+/// `run_measure_native.sh` started the app with `env ... "$bin" &` on both
+/// platforms. On Linux that is how a user starts it. On macOS it is not: the
+/// process comes up `TASK_APPTYPE_DAEMON_INTERACTIVE`, role
+/// `TASK_UNSPECIFIED`, with an effective QoS ceiling of
+/// `THREAD_QOS_USER_INITIATED` and its main thread at `THREAD_QOS_LEGACY`,
+/// where the same binary in the same bundle started through LaunchServices is
+/// `TASK_APPTYPE_APP_DEFAULT`, `TASK_FOREGROUND_APPLICATION`, no ceiling, main
+/// thread `THREAD_QOS_USER_INTERACTIVE`. Four counterbalanced legs put the
+/// price at 23–27 points of the 4 ms bar — 62.8 % and 64.3 % of interact
+/// frames under 4 ms from a shell against 89.5 % and 87.0 % through
+/// LaunchServices, each share over that leg's own bracketed interact count —
+/// before any code is considered. The figures and their denominators are in
+/// `native_row.py`'s `LAUNCH_METHODS`.
+///
+/// This has the two-file shape the rig keeps being bitten by, and is checked
+/// the way `squallar-app/tests/rig_verdict_binding.rs` checks the other half of
+/// it: the launcher and the analyser are separate files, neither one's suite
+/// compiles the other, and the binding between them is spelled in a flag. A
+/// measurement run cannot see this one — a leg launched the wrong way produces
+/// a perfectly well-formed row, which is precisely how every native Mac timing
+/// figure this campaign holds came to describe a process the product never is.
+///
+/// Three properties, and the third is the one that is easy to lose:
+///
+///   1. the macOS arm goes through LaunchServices, around a bundle assembled
+///      from the product's own `packaging/macos/Info.plist`;
+///   2. the pid is resolved by the bundle executable's path and never by a
+///      command-line pattern, because this script's own command line contains
+///      the path such a pattern would match;
+///   3. the row RECORDS which launch it got, as a keyed field the subject
+///      table gates — so a row from before this existed reads as an absence
+///      rather than being read back as the shell launch by default.
+#[test]
+fn a_macos_leg_is_launched_as_an_app_and_every_row_records_which() {
+    let runner = std::fs::read_to_string(
+        native_row_py()
+            .parent()
+            .expect("no rig dir")
+            .join("run_measure_native.sh"),
+    )
+    .expect("run_measure_native.sh is not readable");
+    let analyser = std::fs::read_to_string(native_row_py()).expect("analyser unreadable");
+
+    // Line-anchored, not `contains`. A substring test passes on `xopen
+    // "${open_args[@]}"`, and the tamper that found that hole was the one
+    // checking this very assertion could fail.
+    let launches_through_ls = runner
+        .lines()
+        .any(|l| l.trim_start().starts_with(r#"open "${open_args[@]}""#));
+    assert!(
+        launches_through_ls && runner.contains(r#"open_args=(-n -a "$app""#),
+        "run_measure_native.sh no longer launches through LaunchServices. `env ... \"$bin\" &` on \
+         macOS is TASK_APPTYPE_DAEMON_INTERACTIVE under a THREAD_QOS_USER_INITIATED ceiling, and \
+         it costs about 25 points of the 4 ms bar before any code is considered",
+    );
+    assert!(
+        runner.contains("plat_bundle() {") && runner.contains("packaging/macos/Info.plist"),
+        "the macOS leg no longer assembles its bundle from the product's own Info.plist. A plist \
+         written by the rig drops NSHighResolutionCapable, AppKit runs the process in 1x scaled \
+         mode, and every picture-byte figure on the row is a quarter of the shipped app's",
+    );
+
+    // The pid, and the trap. `open` returns as soon as LaunchServices accepts
+    // the request, so `$!` is the pid of `open`, not of the app, and every
+    // downstream reading — the surface wait, geometry, liveness, teardown —
+    // is keyed on it.
+    assert!(
+        runner.contains("plat_pid_of() {") && runner.contains("ps -Ao pid=,comm="),
+        "the macOS leg no longer resolves the app's real pid from the executable path. `open` \
+         returns immediately and `$!` is `open`'s pid, so everything keyed on it — the surface \
+         wait, the geometry pin, liveness, teardown — reads a process that has already exited",
+    );
+    // Over the CODE only. The comment above `plat_pid_of` names both spellings
+    // in order to say why neither is used, and a check that cannot tell a
+    // warning from the thing it warns about would force the warning out of the
+    // file — which is how the next lane re-derives the trap.
+    let runner_code: String = runner
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for trap in ["pgrep -f", "pkill -f"] {
+        assert!(
+            !runner_code.contains(trap),
+            "run_measure_native.sh matches processes with `{trap}`. The Bash tool puts the whole \
+             command in argv and this script's own command line contains the bundle path such a \
+             pattern searches for, so it matches itself — a documented trap that has cost this \
+             repo twice",
+        );
+    }
+
+    // Linux is untouched, and that is an assertion rather than a claim: the
+    // original launch line is still there, verbatim, as the arm every
+    // non-macOS platform takes.
+    assert!(
+        runner.contains(r#"env "${env_args[@]}" "$bin" > "$log" 2>&1 &"#),
+        "the shell-launch arm is gone. On Linux `exec` IS how a user starts the app; replacing it \
+         would change the Linux figures for a defect Linux does not have",
+    );
+    assert!(
+        runner.contains(r#"case "${PLAT_LAUNCH:-}" in"#),
+        "the launch is no longer selected by the platform plan, so the macOS arm is not gated \
+         behind a branch Linux never enters",
+    );
+
+    // The record. A flag on one side, a required argument on the other.
+    assert!(
+        runner.contains(r#"--launch "$PLAT_LAUNCH""#),
+        "run_measure_native.sh no longer stamps the launch method on its rows, so nothing \
+         downstream can tell a LaunchServices leg from a shell one — which is the difference \
+         between a row about the product and a row about a demoted daemon",
+    );
+    assert!(
+        analyser.contains(r#"a.add_argument("--launch", required=True"#),
+        "native_row.py's `analyze` no longer REQUIRES `--launch`. With a default, a runner that \
+         does not know about launch methods emits rows stamped with one anyway, and a confident \
+         wrong population is worse than a missing one",
+    );
+    assert!(
+        analyser.contains(r#""launch", _read_launch"#),
+        "native_row.py's `SUBJECT_FIELDS` no longer claims `launch`. Two legs started different \
+         ways did not measure the same process — on macOS not even the same task apptype — and \
+         with nothing comparing the field a pair across the change reads as a clean, pinned \
+         comparison",
+    );
+    // The keyed probe, named from here so its removal reddens from CI. The
+    // enumeration gate over the app's telemetry rows cannot cover this field:
+    // it keys on the prefix up to the first colon, so a field added to a row
+    // that ALREADY EXISTS passes it silently. `49d97c61f` hit the same hole
+    // with `pinned` on `loop decoded:` and closed it with two gates — a pin on
+    // the emitter's rendered string and its exact field count, and a probe
+    // matched against that rendering rather than a hand-typed sample. Both are
+    // `PlatformRowTests` in native_row.py; this is the third separation.
+    assert!(
+        analyser.contains("PLATFORM_ROW_RE = re.compile("),
+        "native_row.py no longer declares `PLATFORM_ROW_RE`, the keyed probe for the row that \
+         carries `launch=`. Without it the field is emitted and read by nothing, which is the \
+         failure the enumeration gate cannot see",
+    );
+    assert!(
+        analyser.contains(r#"row.get("launch") or "absent""#),
+        "native_row.py no longer prints `launch=absent` for a row that never recorded one. \
+         Reading a missing field back as `exec` would restate every row recorded before this \
+         change as the demoted arm deliberately; an absence is the only honest answer",
+    );
+}

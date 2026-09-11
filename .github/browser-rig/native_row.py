@@ -1726,6 +1726,78 @@ def divergence(count_a, count_b):
     }
 
 
+# ----------------------------------------------------------------- launch ---
+#
+# HOW A LEG STARTS THE APP, which on macOS decides what kind of process the
+# measurement is taken on.
+#
+# Deliberately NOT a `NATIVE_CAPABILITIES` entry. Those name a READING a row
+# loses, and a missing one degrades a column. This names how the process came
+# into being: it is never absent -- a leg always launched somehow -- and it
+# changes WHAT WAS MEASURED rather than what could be read off it. Putting it
+# in `degraded` would have said the row was missing a reading, when the row is
+# complete and describes a different process.
+#
+# macOS demotes a process launched from a shell. Read from the effective side
+# with `taskinfo` on 2026-09-10: started from a shell the task is
+# `TASK_APPTYPE_DAEMON_INTERACTIVE`, role `TASK_UNSPECIFIED`, with an effective
+# QoS CEILING of `THREAD_QOS_USER_INITIATED` and a main thread at
+# `THREAD_QOS_LEGACY`; started through LaunchServices it is
+# `TASK_APPTYPE_APP_DEFAULT`, `TASK_FOREGROUND_APPLICATION`, no ceiling, main
+# thread `THREAD_QOS_USER_INTERACTIVE`.
+#
+# The price, from four ABBA-counterbalanced legs on one box with one binary and
+# one bundle, each leg given a fresh `XDG_CACHE_HOME` and `XDG_CONFIG_HOME` and
+# windowed on whole gesture loops:
+#
+#     leg      launch           interact <4 ms        idle <4 ms
+#     G1       shell over ssh   62.8% (n=2902)        44.6% (n=4316)
+#     G2       LaunchServices   89.5% (n=2903)        96.3% (n=4318)
+#     G3       LaunchServices   87.0% (n=2906)        95.6% (n=4326)
+#     G4       shell over ssh   64.3% (n=2420)        55.6% (n=3605)
+#
+# The denominators are that leg's own bracketed interact and idle frame counts.
+# It splits by ARM and not by leg order, which is what counterbalancing is for.
+# Roughly 25 points of the 4 ms bar, before any code is considered -- so a
+# shell-launched macOS row is not a slightly worse reading of the product, it
+# is a reading of a process the product never is.
+#
+# This is NOT a thread-placement story and must not be told as one. The frame
+# thread sat on efficiency cores 55.5% of the time through LaunchServices and
+# 57.2% from a shell -- 1.7 points apart on legs whose bar differs by 23 to 27.
+# What moves is the worker pool, in the other direction.
+#
+# Linux has no such demotion and no LaunchServices. `exec` IS how a user starts
+# the app there, so a Linux row says `exec` because that is the truth about it,
+# never because a field defaulted.
+LAUNCH_METHODS = ("launchservices", "exec")
+
+
+def launch_plan(name, have):
+    """`(method, why)` -- how a leg starts the app here, and what that costs.
+
+    `why` is None when the method is the one a user's own launch produces, and
+    otherwise names what the row is measuring instead. It is a reason to print
+    beside a figure, not a refusal: a leg that cannot reach LaunchServices
+    still runs, and the row says what it was.
+    """
+    if name == "macos":
+        if "open" in have:
+            return ("launchservices", None)
+        return ("exec", "`open` is not on this machine, so the leg starts from "
+                        "the shell and macOS runs it as "
+                        "TASK_APPTYPE_DAEMON_INTERACTIVE under a "
+                        "THREAD_QOS_USER_INITIATED ceiling -- about 25 points "
+                        "of the 4 ms bar, before any code is considered")
+    if name == "linux":
+        return ("exec", None)
+    return ("exec", "no launch plan for platform %r: this runner knows linux "
+                    "and macos. The leg still runs, started from the shell, "
+                    "and the row records that -- whether that is how a user "
+                    "starts the app on this platform is unknown here"
+                    % (name or "?"))
+
+
 # ---------------------------------------------------------------- subject ---
 #
 # THE SUBJECT OF A MEASUREMENT: which build of which thing the leg ran.
@@ -1791,7 +1863,15 @@ def divergence(count_a, count_b):
 # `unknown` is `commit_for_arm`'s honest fallback and `?`/`-` are the row
 # printer's; all of them must read as absent, or a pair of `unknown`s would
 # satisfy an equality check and print a match nobody earned.
-SUBJECT_ABSENT = ("", "-", "?", "none", "null", "unknown", "unrecorded", "n/a")
+# `absent` is the row printer's spelling for a field the leg never recorded --
+# `scale=absent`, `launch=absent` -- and it is here because a ROW line gets
+# transcribed back into an artefact by hand and by script. Without it a
+# round-tripped `absent` would read as a RECORDED value, and the field would
+# report `misshapen` (a spelling the table stopped pinning) where the truth is
+# that nothing was ever written down. Two different findings with two different
+# remedies, and the reader must be able to say which path it took.
+SUBJECT_ABSENT = ("", "-", "?", "none", "null", "unknown", "unrecorded", "n/a",
+                  "absent")
 
 # A commit field naming MORE THAN ONE BUILD. `--commit <a>+<b>` and
 # `<a>-vs-<b>` are the two spellings two lanes independently invented on
@@ -1880,6 +1960,17 @@ def _read_commit(row):
     return _clean(row.get("commit"))
 
 
+def _read_launch(row):
+    """`launch`, or None on a row recorded before the field existed.
+
+    The absence is the point. `_clean` maps every one of `SUBJECT_ABSENT`'s
+    spellings to None, so a row carrying `-`, `?` or nothing at all reads as
+    unrecorded rather than as a method, and two such rows cannot satisfy an
+    equality check between them.
+    """
+    return _clean(row.get("launch"))
+
+
 def subject_browser(row):
     """Which browser the leg ran in: `firefox`, `chromium`, `native`, ..."""
     return _clean(row.get("browser"))
@@ -1921,6 +2012,10 @@ SHAPE_NONEMPTY_LINE = re.compile(r"\S")
 # decided what a sha LOOKS LIKE twice would eventually decide it twice
 # differently.
 SHAPE_SHA = _SHA_TOKEN
+# Tight on purpose, and generated from the method list so a third method cannot
+# be added in one place and read as misshapen in the other. An unrecognised
+# spelling costs the field its verdict (UNCHECKED) rather than raising one.
+SHAPE_LAUNCH_METHOD = re.compile(r"^(?:%s)$" % "|".join(LAUNCH_METHODS))
 
 SUBJECT_FIELDS = (
     SubjectField(
@@ -1945,6 +2040,20 @@ SUBJECT_FIELDS = (
         "the app build the leg measured. Two runs of the SAME arm on "
         "different commits is the defect; two DIFFERENT arms on different "
         "commits is what an A/B pair is for",
+    ),
+    SubjectField(
+        "launch", _read_launch, "same-browser", False,
+        SHAPE_LAUNCH_METHOD, "one of LAUNCH_METHODS: launchservices or exec",
+        "how the app was started. On macOS it decides the task apptype and "
+        "whether a QoS ceiling applies, and it moved the 4 ms bar by 23-27 "
+        "points on legs that shared a binary, a bundle and a box -- see "
+        "LAUNCH_METHODS. Gated between two legs naming the same `browser`, "
+        "which for native rows is EVERY native pair including an A/B across "
+        "arms: the launch is never a pair's declared axis, so a difference is "
+        "always a defect. NEVER the positive verdict -- two legs agreeing "
+        "they were both `exec` is no evidence they measured the same build. A "
+        "row recorded before this field existed reads `unrecorded`, which is "
+        "an absence and cannot pin; it is never read as an `exec` by default",
     ),
 )
 
@@ -2778,6 +2887,10 @@ def build_row(args, scraped, probes):
         # able to see which it is holding.
         "platform": args.platform,
         "degraded": [d for d in (args.degraded or "").split(",") if d],
+        # How the app was started. Read by `_read_launch` as part of the
+        # comparison's SUBJECT, because two legs started different ways did not
+        # measure the same process -- on macOS, not even the same task apptype.
+        "launch": args.launch,
         "windows": windows,
         "named_families": sorted(scraped["named"]),
         "window_basis": basis,
@@ -2873,6 +2986,69 @@ def tile_cache_by_role(readings):
     return out
 
 
+# The `ROW   platform` line, BY KEY.
+#
+# It exists because the enumeration gate that catches a new ROW keys on the
+# prefix up to the first colon, so it is blind to a new FIELD on a row that
+# already exists -- which is exactly what `launch=` is. A field can be added,
+# go unread, and the gate stays green. See
+# `49d97c61f`'s `pinned` for the same hole and the two gates that close it:
+# a pin on the emitter's own rendered string and its exact field count, and a
+# probe matched against that rendered string rather than against a hand-typed
+# sample. `PlatformRowTests` below is both.
+#
+# KEYED, never positional. Each group is preceded by the literal key it reads,
+# so a field added, removed or reordered on this line makes the probe MISS --
+# a visible absence -- where a positional parser would go on matching and
+# silently hand back a neighbouring field's value. That failure splits a series
+# into two instruments at the format commit with nothing saying where.
+PLATFORM_ROW_FIELDS = ("platform", "launch", "degraded")
+PLATFORM_ROW_RE = re.compile(
+    r"ROW   platform (?P<platform>[^;]*); "
+    r"launch=(?P<launch>[^;]*); "
+    # `[^;]*` and not `.*`: the last field is free text, and a greedy tail
+    # SWALLOWS a field appended after it -- the probe goes on matching and hands
+    # back `none; extra=-` as the capability list. That is the positional
+    # failure in its worst form, a wrong value rather than a miss. A capability
+    # list is comma-separated and never contains a semicolon, so refusing one
+    # turns an appended field into a visible absence.
+    r"capabilities unavailable: (?P<degraded>[^;]*)$"
+)
+
+
+def platform_row_reading(m):
+    """A `PLATFORM_ROW_RE` match as a dict over `PLATFORM_ROW_FIELDS`.
+
+    Every field goes through `_clean`, so the printer's own absence spellings
+    -- `?` for a platform the leg could not name, `absent` for a launch it never
+    recorded -- come back as None. None and not a default: the caller is told
+    the field was not recorded, which is the fact, and cannot be handed an
+    `exec` the leg never claimed.
+    """
+    return dict((name, _clean(m.group(name))) for name in PLATFORM_ROW_FIELDS)
+
+
+def print_platform_row(row):
+    """The `ROW   platform` line -- `PLATFORM_ROW_RE`'s emitter.
+
+    Its own function so the gates can take its output rather than a hand-typed
+    sample of it: a literal can be spelled right and passed the wrong
+    arguments, and only the function's own stdout can show that it was not.
+
+    `launch=` is KEYED, and a row that never recorded one prints `absent`
+    rather than a method it never carried. Defaulting it to `exec` would
+    restate every row taken before the field existed as the demoted arm
+    deliberately, which is the misreading the field exists to end; `absent` is
+    the honest thing, and `_clean` reads it straight back to None.
+    """
+    print(
+        "ROW   platform %s; launch=%s; capabilities unavailable: %s"
+        % (row.get("platform") or "?",
+           row.get("launch") or "absent",
+           ", ".join(row.get("degraded") or []) or "none")
+    )
+
+
 def print_row(row):
     """The ROW line. Shared columns first, in `run_measure.sh`'s order and
     spelling, then the native-only ones. A native row and a web row are meant
@@ -2930,11 +3106,7 @@ def print_row(row):
             else ("CONFIRMED" if s.get("met") else "REFUSED"),
         )
     )
-    print(
-        "ROW   platform %s; capabilities unavailable: %s"
-        % (row.get("platform") or "?",
-           ", ".join(row.get("degraded") or []) or "none")
-    )
+    print_platform_row(row)
     print("ROW   quiet: %s" % row["quiet_verdict"]["why"])
     print("ROW   liveness: %s" % row["liveness"]["verdict"])
     for family in ("interact", "idle", "cadence"):
@@ -3293,6 +3465,10 @@ def cmd_plan(args):
         up = cap.upper()
         print("PLAT_%s=%s" % (up, sh(c["tool"] if c["ok"] else "")))
         print("PLAT_WHY_%s=%s" % (up, sh(c["why"] or "")))
+    # Emitted beside the capabilities and not inside them: see LAUNCH_METHODS.
+    method, launch_why = launch_plan(plan["platform"], have)
+    print("PLAT_LAUNCH=%s" % sh(method))
+    print("PLAT_WHY_LAUNCH=%s" % sh(launch_why or ""))
     return 0
 
 
@@ -3355,6 +3531,13 @@ def main(argv):
     a.add_argument("--skip-loops", dest="skip_loops", type=int, default=2)
     a.add_argument("--window-loops", dest="window_loops", type=int, default=2)
     a.add_argument("--platform", default="unknown")
+    # REQUIRED, with no default. A default here would let a runner that does
+    # not know about launch methods emit rows stamped with one, and a wrong
+    # population is worse than a missing one: a stale caller now fails loudly
+    # instead of writing `exec` onto a leg nobody checked.
+    a.add_argument("--launch", required=True,
+                   help="how the leg started the app: %s"
+                        % ", ".join(LAUNCH_METHODS))
     a.add_argument("--degraded", default="",
                    help="comma-separated capabilities this leg ran without")
     a.add_argument("--json", default="")
@@ -4041,7 +4224,7 @@ def _leg_args(load_file, panes, log="", json_out="", scene="A", refresh="60"):
         asked_geom=(1920, 1080), achieved_geom=None, panes=panes, dpr="1",
         refresh=refresh, adapter="unknown", panel="off", position="p1(a)",
         load_file=load_file, quiet_max=8.0, skip_loops=2, window_loops=2,
-        platform="linux", degraded="", json=json_out,
+        platform="linux", degraded="", launch="exec", json=json_out,
     )
 
 
@@ -5650,6 +5833,231 @@ class SubjectTests(unittest.TestCase):
         census = subject_census([("a", {"browser": "native"}),
                                  ("b", {"browser": "native"})])
         self.assertEqual([c["state"] for c in census], ["unrecorded"])
+
+    # ---- the launch method ---------------------------------------------
+
+    def _launched(self, launch=None, commit="deadbeef", tag="A.main"):
+        """A native leg artefact, with `launch` OMITTED unless given.
+
+        Omitted, not empty: a row recorded before the field existed does not
+        carry the key at all, and that is the case every assertion below is
+        about.
+        """
+        row = {"browser": "native", "tag": tag, "commit": commit}
+        if launch is not None:
+            row["launch"] = launch
+        return row
+
+    def test_two_legs_launched_different_ways_did_not_measure_one_subject(self):
+        """The defect this field was added for, at the pair layer.
+
+        A LaunchServices leg against a shell-launched one differs by 23-27
+        points of the 4 ms bar on macOS before any code is considered, and
+        `commit` agreeing between them says nothing about it -- which is
+        exactly how such a pair used to read as a clean, pinned comparison.
+        """
+        v = subject_pin(self._launched("launchservices"), self._launched("exec"))
+        self.assertEqual(v["state"], "moved")
+        self.assertTrue(any("launch moved" in why for why in v["invalid"]),
+                        v["invalid"])
+
+    def test_a_row_from_before_the_field_reads_as_an_absence(self):
+        """NOT as an `exec`. Reading a missing field as the shell launch would
+        restate every recorded macOS row as the demoted arm deliberately, and a
+        confident wrong population is worse than a missing one."""
+        v = subject_pin(self._launched(), self._launched("launchservices"))
+        launch = [f for f in v["fields"] if f["name"] == "launch"][0]
+        self.assertEqual(launch["state"], "unrecorded")
+        self.assertIsNone(launch["a"])
+        self.assertNotIn("launch", v["invalid"])
+        # The pair is still adjudicable on the fields that WERE recorded; an
+        # absence may only ever relax.
+        self.assertEqual(v["state"], "pinned")
+        self.assertEqual(v["pinned_by"], ["commit"])
+
+    def test_agreeing_on_the_launch_is_never_the_positive_verdict(self):
+        """`may_pin` is False: two legs that agree they were both `exec` have
+        said nothing about whether they measured the same build."""
+        a = {"browser": "native", "tag": "A.main", "launch": "exec"}
+        b = {"browser": "native", "tag": "A.main", "launch": "exec"}
+        v = subject_pin(a, b)
+        self.assertEqual(v["pinned_by"], [])
+        self.assertEqual(v["state"], "unrecorded")
+
+    def test_the_row_printers_own_absence_spelling_round_trips_as_absence(self):
+        """`print_row` writes `launch=absent` for a leg that never recorded one.
+        That line is transcribed back into artefacts, so `absent` must read as
+        an absence and not as a value in a spelling the table stopped pinning:
+        `unrecorded` and `misshapen` are different findings with different
+        remedies, and reading the wrong one sends the next lane after the
+        analyser when the truth is that the RUNNER never wrote the field."""
+        v = subject_pin(self._launched("absent"), self._launched("launchservices"))
+        launch = [f for f in v["fields"] if f["name"] == "launch"][0]
+        self.assertEqual(launch["state"], "unrecorded")
+        self.assertIsNone(launch["a"])
+
+    def test_the_printed_absence_and_the_read_absence_are_the_same_word(self):
+        """Not two independent lists.
+
+        The spelling is READ OUT OF the emitter rather than restated here, the
+        way `shared_row_keys` reads the web row's columns out of the script
+        that prints them: a lane changing the printer's word without adding it
+        to `SUBJECT_ABSENT` reddens this instead of quietly producing rows
+        whose absence reads back as a value.
+        """
+        import inspect
+        src = inspect.getsource(print_platform_row)
+        spellings = re.findall(r'row\.get\("launch"\) or "([^"]+)"', src)
+        self.assertEqual(len(spellings), 1,
+                         "print_platform_row no longer prints exactly one absence "
+                         "spelling for `launch`: %r" % (spellings,))
+        self.assertIn(spellings[0], SUBJECT_ABSENT,
+                      "the emitter writes `launch=%s` for a leg that recorded "
+                      "nothing, and the subject table does not read that word "
+                      "as an absence -- a transcribed row would come back as a "
+                      "recorded value" % spellings[0])
+
+    def test_an_unrecognised_launch_spelling_stops_carrying_a_verdict(self):
+        v = subject_pin(self._launched("open"), self._launched("open"))
+        launch = [f for f in v["fields"] if f["name"] == "launch"][0]
+        self.assertEqual(launch["state"], "misshapen")
+        self.assertFalse(v["invalid"], "an unfamiliar spelling is not a defect")
+
+class PlatformRowTests(unittest.TestCase):
+    """`PLATFORM_ROW_RE` against `print_row`'S OWN FORMAT STRING.
+
+    The pair that covers a FIELD added to an existing row, which the
+    enumeration gate keys past. Neither test types the line out: the literal is
+    read out of the emitter and rendered the way `%` would render it, so a
+    sample that drifted from the emitter cannot be what the probe is proved
+    against. Three separations, each its own test -- rename the emitter's field
+    and the probe stops matching; append a field and the count moves; drop the
+    probe and the Rust gate that names it reddens from CI.
+    """
+
+    @staticmethod
+    def _literal():
+        """The `ROW   platform` format string, out of `print_row` itself."""
+        import inspect
+        found = re.findall(r'"(ROW   platform [^"]*)"', inspect.getsource(print_platform_row))
+        assert len(found) == 1, (
+            "print_platform_row no longer contains exactly one `ROW   platform` format "
+            "string: %r" % (found,))
+        return found[0]
+
+    def test_the_probe_matches_the_emitters_own_format_string(self):
+        line = self._literal() % ("macos", "launchservices", "none")
+        m = PLATFORM_ROW_RE.search(line)
+        self.assertIsNotNone(
+            m, "PLATFORM_ROW_RE does not match the line the emitter renders: %r" % line)
+        self.assertEqual(
+            platform_row_reading(m),
+            {"platform": "macos", "launch": "launchservices", "degraded": None},
+        )
+
+    def test_the_field_count_is_pinned_to_the_emitter(self):
+        """Appending a field reddens HERE and nowhere else.
+
+        The emitter's placeholder count, the probe's group count and the field
+        list are three spellings of one number, and a field that lands in only
+        one of them is a field nothing reads.
+        """
+        placeholders = self._literal().count("%s")
+        self.assertEqual(
+            placeholders, len(PLATFORM_ROW_FIELDS),
+            "print_platform_row renders %d fields on the platform row and "
+            "PLATFORM_ROW_FIELDS names %d. A field added to the line and not to "
+            "the probe is read by nothing, and the enumeration gate cannot see "
+            "it: that gate keys on the prefix up to the first colon and this is "
+            "a field on a row that already exists"
+            % (placeholders, len(PLATFORM_ROW_FIELDS)),
+        )
+        self.assertEqual(PLATFORM_ROW_RE.groups, len(PLATFORM_ROW_FIELDS))
+
+    def test_a_launch_the_leg_never_recorded_reads_as_an_absence(self):
+        """The printer's own absence spelling, through the probe, end to end.
+
+        `print_row` writes `launch=absent` for a row with no launch recorded,
+        and the probe hands back None rather than a method. A reader that
+        defaulted here would restate every row taken before the field existed
+        as the shell launch -- the demoted arm -- deliberately.
+        """
+        line = self._literal() % ("macos", "absent", "none")
+        r = platform_row_reading(PLATFORM_ROW_RE.search(line))
+        self.assertIsNone(r["launch"])
+        self.assertEqual(r["platform"], "macos")
+
+    def test_it_reads_by_key_so_a_reordered_line_misses_instead_of_lying(self):
+        """A positional parser's failure is a WRONG value; this one's is a miss.
+
+        The line with two fields transposed still parses under a positional
+        rule and hands back `launchservices` as the platform. Keyed, it does
+        not match at all, and a caller gets an absence it can act on.
+        """
+        transposed = "ROW   platform macos; caps=none; launch=launchservices"
+        self.assertIsNone(PLATFORM_ROW_RE.search(transposed))
+
+    def test_the_row_print_actually_carries_the_line_the_probe_expects(self):
+        """Not the literal alone -- the real `print_row` output.
+
+        The literal could be spelled correctly and passed the wrong arguments;
+        this is the one assertion taken from the function's own stdout.
+        """
+        row = {"platform": "macos", "launch": "launchservices",
+               "degraded": ["window"]}
+        printed = [l for l in _capture(lambda: print_platform_row(row)).splitlines()
+                   if l.startswith("ROW   platform")]
+        self.assertEqual(len(printed), 1, printed)
+        r = platform_row_reading(PLATFORM_ROW_RE.search(printed[0]))
+        self.assertEqual(r["launch"], "launchservices")
+        self.assertEqual(r["degraded"], "window")
+
+
+class LaunchPlanTests(unittest.TestCase):
+    """Which launch a leg gets here, and the reason when it is the wrong one."""
+
+    def test_macos_with_open_goes_through_launchservices(self):
+        self.assertEqual(launch_plan("macos", {"open", "ps"}),
+                         ("launchservices", None))
+
+    def test_macos_without_open_falls_back_and_names_the_price(self):
+        method, why = launch_plan("macos", {"ps"})
+        self.assertEqual(method, "exec")
+        self.assertIn("TASK_APPTYPE_DAEMON_INTERACTIVE", why)
+        self.assertIn("4 ms bar", why)
+
+    def test_linux_execs_and_that_is_the_products_own_launch(self):
+        """No reason, because there is nothing to warn about: `exec` IS how a
+        user starts the app on Linux, and a caption a reader cannot act on is
+        its own defect."""
+        self.assertEqual(launch_plan("linux", {"open"}), ("exec", None))
+
+    def test_an_unplanned_platform_says_it_does_not_know(self):
+        method, why = launch_plan("freebsd", set())
+        self.assertEqual(method, "exec")
+        self.assertIn("no launch plan", why)
+
+    def test_the_plan_the_runner_evaluates_carries_the_method(self):
+        """The runner `eval`s these lines; a method it cannot read is a leg
+        launched by whatever the fallback happens to be."""
+        import argparse
+        out = _capture(lambda: cmd_plan(argparse.Namespace(
+            system="Darwin", release="26.4.1", session="",
+            have="open,ps,sysctl,osascript,system_profiler")))
+        self.assertIn("PLAT_LAUNCH='launchservices'", out)
+        self.assertIn("PLAT_WHY_LAUNCH=''", out)
+        linux = _capture(lambda: cmd_plan(argparse.Namespace(
+            system="Linux", release="7.2.4", session="x11",
+            have="xdotool,xrandr,ps,procfs")))
+        self.assertIn("PLAT_LAUNCH='exec'", linux)
+
+    def test_the_shape_pin_and_the_method_list_cannot_drift(self):
+        by_name = {f.name: f for f in SUBJECT_FIELDS}
+        for method in LAUNCH_METHODS:
+            self.assertFalse(by_name["launch"].misshapen(method), method)
+        self.assertTrue(by_name["launch"].misshapen("LaunchServices"))
+        self.assertTrue(by_name["launch"].misshapen("exec-from-ssh"))
+
 
 class OrderTests(unittest.TestCase):
     """Counterbalancing is an equal mean position, not a four-letter word."""
