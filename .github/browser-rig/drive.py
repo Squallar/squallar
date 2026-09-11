@@ -3813,10 +3813,30 @@ var begins = [], loops = [];
 // rung did not move. Anything else landing here is an unclassified line,
 // which is the outcome this family is built around.
 var budget_pressure_lines = [];
+// THE TELEMETRY POSTURE ROW, whole lines, IN RING ORDER, classified by name
+// in `telemetry_posture_reading` below rather than page-side.
+//
+//   telemetry posture: frame=1 raster=0 store=1
+//
+// It lives in THIS probe -- the one the frame watcher polls throughout the
+// leg -- and not in the boot-time backend probe, for `budget pressure:`'
+// reason and more sharply. The row is written ONCE AT STARTUP, before
+// anything can have been gestured at, and `C` is a 1200-entry ring the app's
+// per-frame telemetry turns over in seconds. A probe that ran only at the end
+// of the leg would see it on no leg at all.
+//
+// **THE ORDER AND THE MULTIPLICITY ARE THE READING**, which is why these are
+// pushed to a list and nothing here dedupes them. Android emits the row TWICE
+// -- `App::new` against a bridge with no store, then `set_config_dir` once
+// the Activity has a data path -- and the two emissions being IDENTICAL
+// rather than differing is the whole diagnosis. A harvest that collapsed a
+// repeat would erase it.
+var telemetry_posture_lines = [];
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
   var t = C[i].t;
   if (m.indexOf("pressure:") !== -1) budget_pressure_lines.push(m);
+  if (m.indexOf("telemetry posture:") !== -1) telemetry_posture_lines.push(m);
   var x = svc_interact_re.exec(m);
   if (x) {
     interact = { t: t, n: parseInt(x[1], 10), p50: x[2], p90: x[3],
@@ -4221,6 +4241,7 @@ return { interact: interact, idle: idle, segments: segments, prep: prep,
          gesture_begins: begins, gesture_loops: loops,
          marks_total: (MK ? MK.length : -1),
          budget_pressure_lines: budget_pressure_lines,
+         telemetry_posture_lines: telemetry_posture_lines,
          console_total: C.length };
 """
 
@@ -4814,6 +4835,14 @@ class FrameLineWatcher:
         # a line re-read across polls is not counted twice while a genuine
         # repeat within one poll is kept.
         self.pressure_lines = []
+        # The posture rows, in ring order, WITH THEIR MULTIPLICITY KEPT. A
+        # separate list and a separate union from `pressure_lines` on purpose:
+        # that one is a by-VALUE `not in` union, and an Android leg's two
+        # emissions can be identical in every field -- byte-for-byte the same
+        # string -- so a by-value union would report the contract shape as one
+        # emission and a reader taking the count would then call a healthy leg
+        # a lifecycle bug. `_merge_ring_lines` unions by OVERLAP instead.
+        self.posture_lines = []
         self.last = {}
 
     def poll(self):
@@ -4858,6 +4887,11 @@ class FrameLineWatcher:
         for line in sig.get("budget_pressure_lines") or []:
             if line not in self.pressure_lines:
                 self.pressure_lines.append(line)
+        # The posture rows, unioned by OVERLAP and not by value: the probe
+        # re-reads the whole ring each poll, so consecutive polls repeat what
+        # was already held, while a genuinely repeated row must survive as two.
+        self.posture_lines = _merge_ring_lines(
+            self.posture_lines, sig.get("telemetry_posture_lines") or [])
         self.last = sig
         return sig
 
@@ -6027,6 +6061,282 @@ def budget_pressure_summary(reading):
         return ("rung HELD, no figures line: %s" % r.get("why")) + tail
     return ("ABSENT: %s" % r.get("why")) + tail
 
+
+def _merge_ring_lines(held, seen):
+    """Union two readings of ONE ring, keeping order AND multiplicity.
+
+    The console ring is re-read whole at every poll, so `seen` normally
+    repeats the tail of `held`; a naive extend double-counts and a by-value
+    `not in` union erases a row that legitimately appears twice. Both are
+    wrong for a family whose repeat IS the reading.
+
+    The overlap is the longest suffix of `held` that is a prefix of `seen`;
+    everything after it is new. That is exactly right in all four cases the
+    ring produces: an unchanged ring appends nothing, a ring that grew appends
+    only the growth, a ring that EVICTED its head still appends nothing (the
+    short `seen` is fully overlapped), and a second identical row arriving
+    between polls appends one entry rather than none.
+    """
+    if not seen:
+        return list(held)
+    if not held:
+        return list(seen)
+    k = min(len(held), len(seen))
+    while k > 0 and held[-k:] != seen[:k]:
+        k -= 1
+    return list(held) + list(seen[k:])
+
+
+# THE TELEMETRY POSTURE ROW, `squallar-app/src/app.rs:874`, landed 03195c73c.
+# Classified HERE and imported by `native_row.py`, which is
+# `budget_pressure_reading`'s arrangement and for its reason: two copies of a
+# classifier disagree the first time the producer grows a field, and the
+# native half would quietly report the wrong one.
+#
+#   telemetry posture: frame=1 raster=0 store=1
+#
+# Three fields, fixed order, single digits (`u8::from(bool)`), written by a
+# bare unconditional `log::info!` that deliberately bypasses `say_telemetry`.
+# `say_telemetry(loud, line)` is `log::info!` when `loud` and `log::debug!`
+# otherwise, so this row through the seam would land at `debug` exactly when
+# both gates are off -- invisible precisely in the case it exists to report.
+#
+# WHY BOTH RIG HALVES READ IT. `App::new` says it on EVERY target, so a
+# desktop log and a browser console ring both carry it, and what it explains
+# -- 61 `frame` and 17 `raster` `say_telemetry` rows being absent rather than
+# having nothing to say -- is a question asked on both arms.
+#
+# WHAT THE THREE FIELDS MEAN, from the producer's doc comment (app.rs:847):
+# `frame` and `raster` are the RESOLVED state of two independent switches and
+# never the value a seed intended -- a seed that failed to take reads `0`.
+# `store` is `platform.kv().is_some()` and partitions what `frame=0` alone
+# collapses into one digit: `store=0` means no predicate could ever have been
+# true (the runner never gave this process a config dir), and `store=1` with
+# `raster=0` means that one key is absent or holds something other than "1" --
+# a runner bug, a seed bug and a value bug, told apart.
+#
+# **`0` MEANS THE PREDICATE RESOLVED FALSE. ABSENCE OF THE ROW MEANS THE BUILD
+# PREDATES IT.** The producer's comment says this twice and it is the one
+# distinction this reader may not lose: an `absent` reading carries None in
+# all three fields and never 0, and a field the parser could not find is NAMED
+# in `unread`. Absent, `0` and unread are three readings, not one.
+#
+# BY NAME, NEVER BY POSITION, for `BUDGET_PRESSURE_FIGURES`' reason: a
+# positional parser silently splits a series into two instruments at the
+# format commit, and `native_row.py` `int()`s its groups by index.
+TELEMETRY_POSTURE_HEAD = "telemetry posture:"
+
+# Each field its own anchored pattern. `\b` on BOTH sides, and no trailing
+# group of any kind: a greedy tail swallows an appended fourth field into the
+# preceding capture, which is the WRONG-VALUE form and strictly worse than a
+# miss. A field that MOVES still reads here; a field that is GONE is named.
+TELEMETRY_POSTURE_FIELDS = (
+    ("frame", r"\bframe=(\d+)\b"),
+    ("raster", r"\braster=(\d+)\b"),
+    ("store", r"\bstore=(\d+)\b"),
+)
+
+# Every `name=value` token on the row, so a fourth field or an unforeseen
+# spelling arrives as a NAMED surprise rather than as silence -- the
+# `unclassified` bucket `gpu probe` and `budget pressure:` both carry. A
+# RENAMED field shows up twice over, as an unread known name and as an unknown
+# extra, and that pair is what says "renamed" rather than "removed".
+_POSTURE_TOKEN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)=(\S+)")
+
+# Said on every two-emission reading, and on no other.
+#
+# The two-emission path is Android's, Android is not a rig arm today, and so
+# this branch of the reader has never run against a real leg. The branch is
+# written anyway -- the alternative is discovering it the day Android becomes
+# an arm, when the reader misreports and nobody knows why -- but an
+# unexercised branch that does not SAY it is unexercised is indistinguishable
+# from one that has run, which is how a check nobody has ever seen fail gets
+# trusted. It announces itself at the moment it stops being speculation.
+#
+# Deliberately NOT said on the single-emission path: that one runs on every
+# desktop and web leg, and a warning printed on every normal leg is noise that
+# gets the whole reader ignored.
+ANDROID_BRANCH_UNEXERCISED = (
+    "THIS BRANCH OF THE READER HAS NEVER RUN AGAINST A REAL ANDROID LEG -- "
+    "Android is not a rig arm today, so this is the first two-emission "
+    "reading it has ever produced. CHECK it rather than trusting it."
+)
+
+
+def _telemetry_posture_emission(line):
+    """One emission, read BY NAME, with everything unread or unknown named."""
+    out = {"line": line, "unread": [], "unknown_fields": []}
+    for name, pat in TELEMETRY_POSTURE_FIELDS:
+        m = re.search(pat, line)
+        if m is None:
+            # NAMED, never defaulted. `0` is what the producer writes when a
+            # predicate resolved FALSE; a reader filling this with 0 would be
+            # reporting a seed failure the row never claimed.
+            out[name] = None
+            out["unread"].append(name)
+        else:
+            out[name] = int(m.group(1))
+    at = line.index(TELEMETRY_POSTURE_HEAD) + len(TELEMETRY_POSTURE_HEAD)
+    known = set(n for n, _ in TELEMETRY_POSTURE_FIELDS)
+    for name, value in _POSTURE_TOKEN_RE.findall(line[at:]):
+        if name not in known:
+            out["unknown_fields"].append("%s=%s" % (name, value))
+    out["digits"] = (out["frame"], out["raster"], out["store"])
+    return out
+
+
+def telemetry_posture_reading(lines):
+    """Which telemetry gates this process resolved on, and in what SEQUENCE.
+
+    **The sequence is kept, not a count and not just the last.** Desktop and
+    web emit the row once. Android emits it TWICE -- `App::new` runs before
+    the Activity has a data path, and `set_config_dir` re-resolves both
+    predicates once a store exists -- and a healthy Android leg reads
+    `0 0 0` then `1 1 1`.
+
+    A COUNT OF TWO IS SATISFIED BY A DEFECT. If both emissions happened before
+    a store existed the count is still 2, the last match is a pre-store
+    `0 0 0`, and a reader taking the last alone reports a seed failure that
+    did not happen. Under that defect the two rows are IDENTICAL; on a healthy
+    leg they DIFFER. So every emission is recorded, in order, capped, and the
+    consumer can see `0 0 0 -> 1 1 1` against `0 0 0 -> 0 0 0`.
+
+    **An identical pair is NOT called a defect here.** An Android build with a
+    store already in hand at the first resolve legitimately emits two
+    identical all-ones rows. The shape is reported and the judgement is left
+    to the consumer; folding it into a verdict is what stops a reading being
+    usable later.
+
+    `state` is the EMISSION shape and nothing else:
+
+    * `absent`         -- no row of any shape. **The build predates the row**
+                          (it landed in 03195c73c), or the ring evicted it.
+                          All three fields are None. NOT a resolved-false
+                          reading, which is what `0` means.
+    * `once`           -- one emission. Desktop's and web's whole contract.
+    * `resolved_twice` -- two or more, and they DIFFER. Android's contract
+                          shape: a pre-store resolve followed by a real one.
+    * `repeated`       -- two or more, ALL IDENTICAL. Either an Android build
+                          that had a store at first resolve, or both resolves
+                          happening before one existed. Reported, not judged.
+    * `unreadable`     -- a row is here and its fields did not parse. Without
+                          this arm that reads as an absence, whose documented
+                          meaning is a build predating the row -- a broken
+                          reader impersonating an old binary.
+
+    The FIELD shape is a separate axis and is never folded into `state`:
+    `unknown_fields` and `unclassified` carry a fourth field or an unforeseen
+    spelling, so a grown row on a two-emission leg does not cost one of the
+    two facts. `unread` names any of the three that were not found.
+
+    `posture` is the LAST emission, which is the reading; `sequence` is every
+    emission in order.
+    """
+    out = {"state": "absent", "posture": None, "sequence": [],
+           "emissions": 0, "frame": None, "raster": None, "store": None,
+           "unread": [], "unknown_fields": [], "unclassified": [],
+           "unexercised": False, "line": None,
+           "why": "no `telemetry posture:` row of any shape reached the "
+                  "reader. The build PREDATES the row (it landed in "
+                  "03195c73c) or the console ring evicted it. This is NOT "
+                  "`frame=0`: `0` means the predicate resolved false, and an "
+                  "absent row means nobody asked."}
+    seq, unclassified = [], []
+    for line in lines or []:
+        if TELEMETRY_POSTURE_HEAD in line:
+            e = _telemetry_posture_emission(line)
+            seq.append(e)
+            if e["unknown_fields"] or e["unread"]:
+                # The row is here and is not the row this reader was written
+                # for. Its named fields still read; the surprise is announced
+                # rather than dropped.
+                unclassified.append(line)
+        else:
+            unclassified.append(line)
+    out["sequence"] = seq
+    out["emissions"] = len(seq)
+    out["unclassified"] = unclassified
+    if not seq:
+        return out
+    last = seq[-1]
+    out["posture"] = last["digits"]
+    out["frame"], out["raster"] = last["frame"], last["raster"]
+    out["store"] = last["store"]
+    out["line"] = last["line"]
+    out["unread"] = list(last["unread"])
+    out["unknown_fields"] = list(last["unknown_fields"])
+    if last["unread"]:
+        out["state"] = "unreadable"
+        out["why"] = ("a `telemetry posture:` row is present and %s did not "
+                      "parse: the producer renamed or dropped a field. The "
+                      "fields that DID read are below and the missing ones "
+                      "are None, never 0 -- a different finding from an "
+                      "absent row and from a resolved-false one."
+                      % ", ".join(last["unread"]))
+        return out
+    if len(seq) == 1:
+        out["state"] = "once"
+        out["why"] = ("one emission, which is the whole contract on desktop "
+                      "and web: `App::new` resolved both gates against the "
+                      "store it was given and said so.")
+        return out
+    out["unexercised"] = True
+    if all(e["digits"] == seq[0]["digits"] for e in seq):
+        out["state"] = "repeated"
+        out["why"] = ("%d IDENTICAL emissions. On Android this is either a "
+                      "build that already had a store at the first resolve -- "
+                      "legitimate -- or both resolves happening before one "
+                      "existed, which is a lifecycle bug whose digits are "
+                      "indistinguishable from a seed failure. The shape is "
+                      "reported and NOT judged: read the digits. %s"
+                      % (len(seq), ANDROID_BRANCH_UNEXERCISED))
+    else:
+        out["state"] = "resolved_twice"
+        out["why"] = ("%d emissions that DIFFER, which is Android's contract "
+                      "shape: a pre-store resolve followed by a real one once "
+                      "`set_config_dir` had a data path. The LAST is the "
+                      "posture. %s" % (len(seq), ANDROID_BRANCH_UNEXERCISED))
+    return out
+
+
+def telemetry_posture_summary(reading):
+    """One line for the leg's SUMMARY block, naming the state either way."""
+    r = reading or {}
+    st = r.get("state")
+    tail = ((" [UNREAD FIELDS: %s]" % ", ".join(r["unread"]))
+            if r.get("unread") else "")
+    tail += ((" [UNKNOWN FIELDS: %s -- the row grew and this reader is "
+              "behind the producer]" % ", ".join(r["unknown_fields"]))
+             if r.get("unknown_fields") else "")
+    tail += ((" [%d line(s) of this family matched no known shape]"
+              % len(r["unclassified"])) if r.get("unclassified") else "")
+    if st == "absent":
+        return ("ABSENT: %s" % r.get("why")) + tail
+    if st == "unreadable":
+        return ("UNREADABLE: %s -- %r" % (r.get("why"),
+                                          str(r.get("line"))[:160])) + tail
+
+    def shape(e):
+        return "frame=%s raster=%s store=%s" % (
+            e["frame"], e["raster"], e["store"])
+
+    seq_list = r.get("sequence") or []
+    if not seq_list:
+        # A reading carrying no sequence at all: `None`, because a row built
+        # before this field existed reads that way, or a dict this function
+        # does not know. Reported as an absence in its own words rather than
+        # raising on the way to the artifact -- `budget_pressure_summary` ends
+        # the same way, and a telemetry reader must never be able to take the
+        # run down, which is the producer's own rule about this row.
+        return ("ABSENT: %s" % r.get("why")) + tail
+    seq = " -> ".join(shape(e) for e in seq_list)
+    head = "%s [%d emission(s): %s]" % (shape(seq_list[-1]),
+                                        len(seq_list), seq)
+    if st == "once":
+        return head + tail
+    return ("%s %s -- %s" % (head, "IDENTICAL PAIR, shape reported not judged"
+                             if st == "repeated" else "Android two-emission "
+                             "shape", ANDROID_BRANCH_UNEXERCISED)) + tail
 
 
 def app_backend_name(app):
@@ -8937,6 +9247,209 @@ def selftest_budget_pressure_reading():
     return failed
 
 
+def selftest_telemetry_posture_reading():
+    """Executable pins on `telemetry_posture_reading`. Returns the number failed.
+
+    The row landed an hour before this reader (03195c73c), so there is no
+    history of it to trust and no historical-red form available: the
+    historical spelling of this line is that there was none. Every shape is
+    pinned here instead, including the four a reader written for the happy
+    desktop line alone would have got wrong -- an identical pair, a fourth
+    field, a row whose fields did not parse, and no row at all.
+
+    The fixtures are the producer's OWN literal, `telemetry_posture_line`'s
+    `format!` at `squallar-app/src/app.rs:874`, so a fixture that drifts from
+    the format is a fixture that drifts from a Rust assertion someone has to
+    change.
+    """
+    failed = 0
+
+    def pin(name, ok):
+        nonlocal failed
+        print("[self-test] %s %s" % ("ok  " if ok else "FAIL", name))
+        if not ok:
+            failed += 1
+
+    def read(*lines):
+        return telemetry_posture_reading(list(lines))
+
+    def row(f, r, s):
+        return "telemetry posture: frame=%d raster=%d store=%d" % (f, r, s)
+
+    ALL_ON = row(1, 1, 1)
+    PRE_STORE = row(0, 0, 0)
+    FRAME_ONLY = row(1, 0, 1)
+
+    # ---- the five streams, and they must be FIVE DISTINCT READINGS -------
+    # A reader that reports the same thing for "absent" and "0" has failed the
+    # one distinction the producer's comment names twice.
+    single = read(ALL_ON)
+    healthy = read(PRE_STORE, ALL_ON)
+    identical = read(PRE_STORE, PRE_STORE)
+    grown = read(ALL_ON + " seed=2")
+    nothing = read()
+    five = [single, healthy, identical, grown, nothing]
+    pin("the five streams give five DISTINCT summaries",
+        len(set(telemetry_posture_summary(x) for x in five)) == 5)
+
+    # ---- absent is not zero, and not unread ------------------------------
+    pin("NO ROW reads `absent` with every field None, never 0",
+        nothing["state"] == "absent" and nothing["frame"] is None
+        and nothing["raster"] is None and nothing["store"] is None
+        and nothing["emissions"] == 0)
+    pin("and its `why` says the build predates the row, not that a predicate "
+        "resolved false",
+        "PREDATES" in nothing["why"] and "resolved false" in nothing["why"])
+    # The POSITIVE half of that negative: a row that really does say 0 reads
+    # as a resolved-false 0 and not as an absence. A pin asserting only the
+    # absence would pass for free if the parser never ran at all.
+    zeroes = read(PRE_STORE)
+    pin("a row of ZEROES reads 0, not None, and its state is `once`",
+        zeroes["state"] == "once" and zeroes["frame"] == 0
+        and zeroes["raster"] == 0 and zeroes["store"] == 0)
+    pin("`absent` and a row of zeroes are DIFFERENT readings",
+        telemetry_posture_summary(zeroes)
+        != telemetry_posture_summary(nothing))
+
+    # ---- the sequence is kept, not reduced to a count --------------------
+    pin("a healthy two-emission stream keeps BOTH in order and reports the "
+        "LAST as the posture",
+        healthy["state"] == "resolved_twice" and healthy["emissions"] == 2
+        and [e["digits"] for e in healthy["sequence"]] == [(0, 0, 0), (1, 1, 1)]
+        and healthy["posture"] == (1, 1, 1))
+    pin("an IDENTICAL pair is reported as its own shape and is NOT called a "
+        "defect",
+        identical["state"] == "repeated" and identical["posture"] == (0, 0, 0)
+        and [e["digits"] for e in identical["sequence"]]
+        == [(0, 0, 0), (0, 0, 0)]
+        and "NOT judged" in identical["why"])
+    # The two-emission shapes are told apart, which is the whole point of
+    # keeping the sequence: both have count 2 and only one is the contract.
+    pin("the differing pair and the identical pair are told APART though "
+        "both have a count of two",
+        healthy["emissions"] == identical["emissions"] == 2
+        and healthy["state"] != identical["state"])
+    pin("and the sequence reaches the summary, so a consumer sees "
+        "`0 0 0 -> 1 1 1` against `0 0 0 -> 0 0 0`",
+        "frame=0 raster=0 store=0 -> frame=1 raster=1 store=1"
+        in telemetry_posture_summary(healthy)
+        and "frame=0 raster=0 store=0 -> frame=0 raster=0 store=0"
+        in telemetry_posture_summary(identical))
+
+    # ---- the unexercised branch announces itself -------------------------
+    pin("BOTH two-emission readings say the branch has never run against a "
+        "real Android leg",
+        healthy["unexercised"] is True and identical["unexercised"] is True
+        and ANDROID_BRANCH_UNEXERCISED in telemetry_posture_summary(healthy)
+        and ANDROID_BRANCH_UNEXERCISED in telemetry_posture_summary(identical))
+    pin("and the single-emission path -- the one that actually runs on every "
+        "desktop and web leg -- does NOT say it",
+        single["unexercised"] is False
+        and ANDROID_BRANCH_UNEXERCISED not in telemetry_posture_summary(single)
+        and ANDROID_BRANCH_UNEXERCISED
+        not in telemetry_posture_summary(nothing))
+
+    # ---- by name, never by position --------------------------------------
+    # The fields are read off their own words, so a row whose fields were
+    # REORDERED still reads the same posture. A positional parser would hand
+    # back `frame=0` here and nobody would know.
+    shuffled = read("telemetry posture: store=1 raster=0 frame=1")
+    pin("the fields are read BY NAME: a reordered row reads the same posture",
+        shuffled["state"] == "once"
+        and shuffled["posture"] == read(FRAME_ONLY)["posture"] == (1, 0, 1))
+
+    # ---- a grown row: named surprise, not silence, and NOT a wrong value --
+    pin("a FOURTH field is named in `unknown_fields` and the row reaches "
+        "`unclassified` rather than passing silently",
+        grown["unknown_fields"] == ["seed=2"]
+        and len(grown["unclassified"]) == 1)
+    # The trailing-group hazard, which is the WRONG-VALUE form and so strictly
+    # worse than a miss: a greedy tail on `store=` swallows the new field.
+    pin("and the three known fields still read their OWN values -- no greedy "
+        "tail swallowed the appended field into `store`",
+        grown["frame"] == 1 and grown["raster"] == 1 and grown["store"] == 1)
+    pin("the grown row says so in its summary",
+        "UNKNOWN FIELDS: seed=2" in telemetry_posture_summary(grown))
+
+    # ---- a field that is GONE is named, never read off a neighbour -------
+    r = read("telemetry posture: frame=1 store=1")
+    pin("a field removed from the row reads UNREAD and None, never off a "
+        "neighbour and never 0",
+        r["state"] == "unreadable" and r["raster"] is None
+        and r["unread"] == ["raster"] and r["frame"] == 1 and r["store"] == 1)
+    pin("and `unreadable` is not `absent`: a broken reader may not "
+        "impersonate a build that predates the row",
+        telemetry_posture_summary(r).startswith("UNREADABLE")
+        and telemetry_posture_summary(nothing).startswith("ABSENT"))
+    # A RENAMED field shows up twice over, and that pair is what says
+    # "renamed" rather than "removed".
+    r = read("telemetry posture: frame=1 rasters=0 store=1")
+    pin("a RENAMED field is both unread under its old name and unknown under "
+        "its new one",
+        r["unread"] == ["raster"] and r["unknown_fields"] == ["rasters=0"])
+
+    # ---- an unforeseen spelling is classified, not dropped ---------------
+    r = read("telemetry posture: nothing of the expected shape")
+    pin("a posture-headed line of an unforeseen shape lands in "
+        "`unclassified` rather than being dropped",
+        r["state"] == "unreadable" and len(r["unclassified"]) == 1
+        and "matched no known shape" in telemetry_posture_summary(r))
+
+    # A reading this function does not know -- `None` above all, because a
+    # row built before the field existed reads exactly that way. It reached
+    # the native half's print path as eight red rows before this pin existed.
+    pin("a summary over `None` reads as an absence rather than raising",
+        telemetry_posture_summary(None).startswith("ABSENT")
+        and telemetry_posture_summary({}).startswith("ABSENT"))
+
+    # ---- the union keeps multiplicity ------------------------------------
+    pin("`_merge_ring_lines` on an unchanged ring appends nothing",
+        _merge_ring_lines([PRE_STORE, ALL_ON], [PRE_STORE, ALL_ON])
+        == [PRE_STORE, ALL_ON])
+    pin("on a ring that GREW it appends only the growth",
+        _merge_ring_lines([PRE_STORE], [PRE_STORE, ALL_ON])
+        == [PRE_STORE, ALL_ON])
+    pin("on a ring that EVICTED its head it does not re-append",
+        _merge_ring_lines([PRE_STORE, ALL_ON], [ALL_ON])
+        == [PRE_STORE, ALL_ON])
+    # The case a by-value union gets wrong, and the reason this family does
+    # not share `pressure_lines`' union.
+    pin("an IDENTICAL second row survives the union as two entries",
+        _merge_ring_lines([], [PRE_STORE, PRE_STORE])
+        == [PRE_STORE, PRE_STORE]
+        and _merge_ring_lines([PRE_STORE], [PRE_STORE, PRE_STORE])
+        == [PRE_STORE, PRE_STORE])
+
+    # ---- THE WHOLE CHAIN, not the classifier alone -----------------------
+    # The probe's hand-back key, the watcher's union across polls, and the
+    # reading off the end of it. A reader that works on a list handed to it
+    # directly and is fed by nothing is the shape `budget pressure:` was in
+    # for weeks -- present in the file and reaching no leg.
+    watcher = FrameLineWatcher(_StubSession(
+        {"telemetry_posture_lines": [PRE_STORE, ALL_ON]}))
+    watcher.poll()
+    watcher.poll()
+    pin("the probe's key reaches the watcher, and a second poll over the "
+        "same ring does not double-count",
+        watcher.posture_lines == [PRE_STORE, ALL_ON])
+    r = telemetry_posture_reading(watcher.posture_lines)
+    pin("and the reading off the watcher is the reading off the lines",
+        r["state"] == "resolved_twice" and r["posture"] == (1, 1, 1))
+    # And the identical pair survives the same chain, which is the case a
+    # by-value union in the watcher would have erased.
+    watcher = FrameLineWatcher(_StubSession(
+        {"telemetry_posture_lines": [PRE_STORE, PRE_STORE]}))
+    watcher.poll()
+    watcher.poll()
+    pin("an identical pair survives the WATCHER too, not only the union "
+        "helper",
+        watcher.posture_lines == [PRE_STORE, PRE_STORE]
+        and telemetry_posture_reading(
+            watcher.posture_lines)["state"] == "repeated")
+
+    return failed
+
+
 def selftest():
     failures = []
     if selftest_loop_or_refusal():
@@ -8950,6 +9463,8 @@ def selftest():
         failures.append("sample-probe patterns (see [self-test] lines)")
     if selftest_budget_pressure_reading():
         failures.append("budget-pressure reading (see [self-test] lines)")
+    if selftest_telemetry_posture_reading():
+        failures.append("telemetry-posture reading (see [self-test] lines)")
     if selftest_gpu_probe_reading():
         failures.append("gpu capacity probe reading "
                         "(see [self-test] lines)")
@@ -9827,6 +10342,14 @@ def run_smoke(args):
         # it -- an absence is a reported absence and never a zero reclaim.
         result["budget_pressure"] = budget_pressure_reading(
             getattr(frames_watch, "pressure_lines", []))
+        # The telemetry posture, from the WATCHER for a sharper version of the
+        # same reason: this row is written ONCE at startup, before any
+        # gesture, and the end-of-run snapshot's 1200-entry ring has long
+        # since turned over. Read here so the artifact carries the SEQUENCE of
+        # emissions -- an absence is a reported absence, `0` is a resolved
+        # false, and the two are never the same fact.
+        result["telemetry_posture"] = telemetry_posture_reading(
+            getattr(frames_watch, "posture_lines", []))
         # From the WATCHER, deduped by tick, and taken HERE rather than at the
         # worker-signal hand-back: that runs before the last polls, so the
         # artifact carried a list five ticks short of what the window was
@@ -10420,6 +10943,13 @@ def run_smoke(args):
     print("[%s] SUMMARY [%s] memory pressure: %s"
           % (tag, alabel,
              budget_pressure_summary(result.get("budget_pressure"))))
+    # On EVERY leg, on the same terms: this row says whether the leg's 78
+    # `say_telemetry` sites were loud, so a leg printing no telemetry and no
+    # posture row is a different finding from one printing no telemetry with
+    # `frame=0 raster=0` beside it.
+    print("[%s] SUMMARY [%s] telemetry posture: %s"
+          % (tag, alabel,
+             telemetry_posture_summary(result.get("telemetry_posture"))))
     wa = result.get("webgpu_adapter") or classify_webgpu_adapter(wg)
     if v.get("hardware_ok") is False:
         print("[%s] SUMMARY HARDWARE ARM FAILED: WebGL adapter is %s, WebGPU "

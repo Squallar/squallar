@@ -909,6 +909,13 @@ def scrape(lines, probes):
         # not given a pattern for -- `pressure: oom during gpu probe,
         # presumption held` does not carry the family's own head.
         "budget_pressure_lines": [],
+        # WHOLE `telemetry posture:` rows, IN LOG ORDER, with their
+        # multiplicity kept, classified later by `drive.py`'s
+        # `telemetry_posture_reading` rather than here. A list and not a
+        # level: Android emits the row twice and the two emissions can be
+        # byte-for-byte identical, so the ORDER and the COUNT are the reading
+        # and a `[-1]` here would throw away the diagnosis.
+        "telemetry_posture_lines": [],
         # Lines whose marker is present but whose positional regex did not
         # match -- a reader breakage, kept apart from an absent family.
         "unparsed": [],
@@ -1069,6 +1076,12 @@ def scrape(lines, probes):
         # `unclassified` bucket rather than being dropped.
         if "pressure:" in line:
             out["budget_pressure_lines"].append(line.strip())
+        # The telemetry posture row, kept WHOLE for the shared classifier --
+        # it reads the three fields by their own names and needs the env_logger
+        # preamble in front of the head not to matter. Every occurrence,
+        # because a repeat is a reading here and not a duplicate.
+        if "telemetry posture:" in line:
+            out["telemetry_posture_lines"].append(line.strip())
         m = probes["budget_state_re"].search(line)
         if m:
             g = m.groups()
@@ -3276,6 +3289,15 @@ def build_row(args, scraped, probes):
         # pressure is a reported absence and never a zero reclaim.
         "budget_pressure": drive_module().budget_pressure_reading(
             scraped["budget_pressure_lines"]),
+        # Which telemetry gates this leg resolved ON, from `drive.py`'s
+        # classifier so the two rig halves cannot disagree about a shape.
+        # ALWAYS a dict, never None: its own `state` says `absent` with a
+        # reason, and an absent row means the BINARY PREDATES it (03195c73c)
+        # while `frame=0` means the predicate resolved false. This half sees
+        # the single-emission desktop shape; the two-emission Android one is
+        # written and, as its own reading says, has never run.
+        "telemetry_posture": drive_module().telemetry_posture_reading(
+            scraped["telemetry_posture_lines"]),
         # Non-empty when a line's marker was present but its regex did not
         # match. `budget_state: None` with this non-empty means the READER
         # broke, not that the binary predates the line -- the two used to be
@@ -3553,6 +3575,15 @@ def print_row(row):
     # before the field existed reads the same way.
     print("ROW   memory pressure: %s"
           % drive_module().budget_pressure_summary(row.get("budget_pressure")))
+    # On EVERY row, not only when the gates were on: this row is what says
+    # whether a leg's 78 `say_telemetry` sites were loud, so a log with no
+    # telemetry in it and no posture row is a different finding from one with
+    # `frame=0 raster=0 store=1` beside it -- a binary predating the row
+    # against a seed that did not take. `.get` because a row built before the
+    # field existed reads the same way.
+    print("ROW   telemetry posture: %s"
+          % drive_module().telemetry_posture_summary(
+              row.get("telemetry_posture")))
     bs = row.get("budget_state")
     if bs:
         _line, bracket_name, f = bs
@@ -5941,6 +5972,130 @@ class SharedFormatTests(unittest.TestCase):
         row["budget_pressure"] = r
         text = _capture(lambda: print_row(row))
         self.assertIn("ROW FORMAT: pre-tile-economy", text)
+
+    def test_the_posture_row_scrapes_whole_and_reads_by_name(self):
+        """The telemetry posture row, through the SHARED classifier.
+
+        This half is where the row is read on every desktop leg -- `App::new`
+        says it on every target, and a native log is the only place a desktop
+        one lands. The env_logger preamble in front of the head must not stop
+        the read: a native line is never bare the way a browser console entry
+        is.
+        """
+        probes = compile_probes()
+        LINE = ("[2026-09-11T04:00:00Z INFO  squallar_app] telemetry posture: "
+                "frame=1 raster=0 store=1")
+        s = scrape([LINE], probes)
+        self.assertEqual(len(s["telemetry_posture_lines"]), 1)
+        r = drive_module().telemetry_posture_reading(
+            s["telemetry_posture_lines"])
+        self.assertEqual(r["state"], "once")
+        self.assertEqual(r["posture"], (1, 0, 1))
+        self.assertEqual(r["unread"], [])
+        self.assertEqual(r["unknown_fields"], [])
+        # The single-emission path is the one that actually runs here, so it
+        # must NOT carry the unexercised-branch notice.
+        self.assertFalse(r["unexercised"])
+
+    def test_a_log_with_no_posture_row_reads_absent_not_zero(self):
+        """The distinction the producer's doc comment names twice.
+
+        A log off a binary older than `03195c73c` carries no row at all, and
+        that is not `frame=0`. A reader that reported the same thing for both
+        would say "the seed did not take" about a build that never had the
+        switch."""
+        probes = compile_probes()
+        s = scrape(["[INFO] nothing of the kind here"], probes)
+        self.assertEqual(s["telemetry_posture_lines"], [])
+        r = drive_module().telemetry_posture_reading(
+            s["telemetry_posture_lines"])
+        self.assertEqual(r["state"], "absent")
+        self.assertIsNone(r["frame"])
+        self.assertIsNone(r["raster"])
+        self.assertIsNone(r["store"])
+        self.assertIn("PREDATES", r["why"])
+        row = _fixture_row()
+        row["telemetry_posture"] = r
+        text = _capture(lambda: print_row(row))
+        self.assertIn("telemetry posture: ABSENT", text)
+        # The absence must never print as a row of zeroes. Asserted on the
+        # whole triple and not on `frame=0` alone: the absence's own `why`
+        # says "This is NOT `frame=0`", so the narrower spelling was red
+        # against a reader that was behaving correctly.
+        self.assertNotIn("frame=0 raster=0 store=0", text)
+
+    def test_a_zero_row_is_a_reading_and_prints_differently_from_absence(self):
+        """The POSITIVE half of the negative above.
+
+        A case expecting "no match" passes for free when the machinery is
+        absent, so the absence pin is paired with a row that really does say
+        zero and must read as a resolved FALSE."""
+        probes = compile_probes()
+        ZERO = ("[2026-09-11T04:00:00Z INFO  squallar_app] telemetry posture: "
+                "frame=0 raster=0 store=0")
+        r = drive_module().telemetry_posture_reading(
+            scrape([ZERO], probes)["telemetry_posture_lines"])
+        self.assertEqual(r["state"], "once")
+        self.assertEqual(r["posture"], (0, 0, 0))
+        row = _fixture_row()
+        row["telemetry_posture"] = r
+        zero_text = _capture(lambda: print_row(row))
+        self.assertIn("frame=0 raster=0 store=0", zero_text)
+        row["telemetry_posture"] = drive_module().telemetry_posture_reading([])
+        absent_text = _capture(lambda: print_row(row))
+        self.assertNotEqual(zero_text, absent_text)
+
+    def test_two_emissions_survive_the_scrape_with_their_multiplicity(self):
+        """Android's shape, through this half's scrape.
+
+        Android is not a rig arm today and this reading has never been taken
+        off a real leg -- which is exactly why the reading SAYS SO, and why
+        the identical pair is reported as a shape rather than called a defect.
+        A log file is scraped once, so the multiplicity is simply kept; the
+        browser half has to work for it."""
+        probes = compile_probes()
+        PRE = ("[INFO] telemetry posture: frame=0 raster=0 store=0")
+        ON = ("[INFO] telemetry posture: frame=1 raster=1 store=1")
+        drive = drive_module()
+
+        healthy = drive.telemetry_posture_reading(
+            scrape([PRE, ON], probes)["telemetry_posture_lines"])
+        self.assertEqual(healthy["state"], "resolved_twice")
+        self.assertEqual([e["digits"] for e in healthy["sequence"]],
+                         [(0, 0, 0), (1, 1, 1)])
+        self.assertEqual(healthy["posture"], (1, 1, 1))
+
+        identical = drive.telemetry_posture_reading(
+            scrape([PRE, PRE], probes)["telemetry_posture_lines"])
+        self.assertEqual(identical["state"], "repeated")
+        self.assertEqual(len(identical["sequence"]), 2)
+        # Both have a count of two and only one is the contract: the count
+        # alone cannot tell them apart, which is why the sequence is kept.
+        self.assertEqual(healthy["emissions"], identical["emissions"])
+        self.assertNotEqual(healthy["state"], identical["state"])
+        # The identical pair is NOT called a defect.
+        self.assertIn("NOT judged", identical["why"])
+        # And BOTH announce that this branch has never run.
+        for r in (healthy, identical):
+            self.assertTrue(r["unexercised"])
+            self.assertIn(drive.ANDROID_BRANCH_UNEXERCISED,
+                          drive.telemetry_posture_summary(r))
+
+    def test_a_grown_posture_row_is_named_not_swallowed(self):
+        """A fourth field arrives as a line nobody classified, and the three
+        known fields keep their OWN values -- a greedy tail on `store=` would
+        have swallowed the new field, which is the wrong-value form."""
+        probes = compile_probes()
+        GROWN = ("[INFO] telemetry posture: frame=1 raster=1 store=1 seed=2")
+        r = drive_module().telemetry_posture_reading(
+            scrape([GROWN], probes)["telemetry_posture_lines"])
+        self.assertEqual(r["posture"], (1, 1, 1))
+        self.assertEqual(r["unknown_fields"], ["seed=2"])
+        self.assertEqual(len(r["unclassified"]), 1)
+        row = _fixture_row()
+        row["telemetry_posture"] = r
+        text = _capture(lambda: print_row(row))
+        self.assertIn("UNKNOWN FIELDS: seed=2", text)
 
     def test_a_log_without_the_budget_state_line_prints_n_a_not_zero(self):
         row = _fixture_row()
