@@ -1650,13 +1650,24 @@ fn the_rig_reads_the_action_budget_line_the_app_actually_writes() {
 /// `app_render.rs`, `grid_pool_trim.rs`, `heap_census.rs` and
 /// `grid_arm_ledger.rs`.
 ///
-/// **What is still in no denominator is a MODULE none of the three lists.**
+/// **A MODULE none of the three lists is now counted rather than invisible.**
 /// `squallar-app/src/app.rs` writes `gpu probe:` and the `squallar-web` crate
 /// writes `gpu probe (webgl2):` and more; every gate in this file reads a
 /// hand-listed set of `include_str!` sources, so a row family in a file nobody
-/// listed is invisible to all three — which is the hole the floors below
-/// cannot see, because a floor catches a collapse of the extraction and not a
-/// file that was never in it.
+/// listed was invisible to all three — a hole the floors below cannot see,
+/// because a floor catches a collapse of the extraction and not a file that was
+/// never in it.
+///
+/// [`every_file_that_writes_a_row_head_is_in_a_gate_scope_or_classified_here`]
+/// closes it by **walking** the tree instead of listing it, and records what
+/// that found: fourteen files hold a telemetry row no gate here covers. That
+/// gate does not claim those rows are read — it claims no file is unexamined,
+/// which is the difference between a debt with a ceiling on it and a debt
+/// nobody can see. It also found a second hole, which is not about lists at
+/// all: all three extractors read `format!`/`write!`/`writeln!` only, so a row
+/// written straight into `log::info!` is invisible to them whatever their
+/// scope — and `app_render.rs`, inside this gate's own scope, writes
+/// `pressure:` exactly that way.
 #[test]
 fn every_telemetry_line_family_app_render_writes_is_claimed_by_a_probe_or_a_reason() {
     /// How a family reaches — or fails to reach — a leg's artifact.
@@ -2240,9 +2251,14 @@ fn instance_scoped_heads(src: &str) -> Vec<(&str, Option<&str>)> {
 /// **Scope**: `app_render.rs`, `grid_pool_trim.rs`, `heap_census.rs` and
 /// `grid_arm_ledger.rs` — the four modules that write this shape today, found
 /// by grepping the tree for `"<words> ({…}):` and `"<words> (<literal>):`
-/// heads. A fifth module is invisible to this gate, exactly as a fourth was
+/// heads. A fifth module is invisible to THIS gate, exactly as a fourth was
 /// invisible to the one above it, and the floor below catches only a collapse
-/// of the extraction and not a file nobody listed.
+/// of the extraction and not a file nobody listed — but it is no longer
+/// invisible to the FILE:
+/// [`every_file_that_writes_a_row_head_is_in_a_gate_scope_or_classified_here`]
+/// walks the tree rather than listing it, so a fifth module emitting this shape
+/// fails there until someone classifies it. `squallar-web/src/bridge.rs` is the
+/// fifth module today and it is in that gate's table.
 #[test]
 fn every_instance_scoped_telemetry_family_is_claimed_by_a_probe_or_a_reason() {
     enum Claim {
@@ -4146,5 +4162,585 @@ fn the_rig_reads_the_presented_service_line_the_app_writes() {
             &["3", "2", "106", "4757", "4757", &hist],
         ),
         "the `frame service (presented):` line and the rig's probe have drifted",
+    );
+}
+
+/// The workspace root, so the scope of the gate below is **walked rather than
+/// hand-listed**.
+///
+/// Every gate above reads its sources through `include_str!`, which requires a
+/// literal path: the set of files it covers is spelled out by hand, so a row
+/// family written from a file nobody listed is invisible to it rather than
+/// counted as unread. That is not a flaw in those gates — a compile-time
+/// embed is what makes a moved source a build failure — but it cannot be the
+/// only scope in the file, because nothing tells anyone a fifth file exists.
+///
+/// `include_str!` cannot take a derived path, so the derivation happens where
+/// a derivation can: at test runtime, off the filesystem, exactly as
+/// `squallar-app/tests/arch_ratchets.rs` already walks this same tree for its
+/// coupling ceilings. The trade is explicit — this gate cannot make a deleted
+/// file a *compile* error the way the consts above do, and in exchange it
+/// cannot fail to notice a file that was never named.
+const WORKSPACE_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+
+/// The files the three gates above read, spelled as the walk below spells
+/// them. **Each must turn up in the walked set**, so a moved or renamed source
+/// fails here rather than shrinking the denominator quietly.
+const IN_GATE_SCOPE: &[&str] = &[
+    "squallar-app/src/app_render.rs",
+    "squallar-app/src/budget_telemetry.rs",
+    "squallar-app/src/loop_telemetry.rs",
+    "squallar-app/src/grid_pool_trim.rs",
+    "squallar-egui/src/heap_census.rs",
+    "squallar-overlays/src/render/grid_arm_ledger.rs",
+];
+
+/// Every `.rs` file under `dir`, recursively, skipping build output and vendored
+/// code — the walk `arch_ratchets` uses, plus `vendor` because a third party's
+/// log lines are not this app's telemetry.
+fn rs_files_under(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
+        panic!(
+            "the telemetry-scope walk cannot read {} ({e}); the tree moved and \
+             this gate's scope is now smaller than the tree",
+            dir.display()
+        )
+    });
+    for entry in entries {
+        let entry = entry.expect("a readable directory entry");
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if path.is_dir() {
+            if matches!(name.as_str(), "target" | "pkg" | ".git" | "vendor") {
+                continue;
+            }
+            rs_files_under(&path, out);
+        } else if name.ends_with(".rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Every telemetry row head `src` writes, as the literal words before the
+/// colon — `<words>:` and `<words> (<instance>):` both, and from a **`log::`
+/// macro as well as a `format!`**.
+///
+/// # Why this is a fourth extractor and not one of the three above
+///
+/// It must not share one. The three above are each paired with an exact table
+/// and a floor, and widening any of them moves counts that record a different
+/// scan; this one answers a different question — *which files emit at all* —
+/// and its answer has to be a superset of all three or the partition below is
+/// unsound.
+///
+/// # The `log::` arm, which is the second hole and was not the one on the label
+///
+/// The three extractors read `format!` / `write!` / `writeln!` heads. A row
+/// written straight into `log::info!("<words>: …")` with no intervening
+/// `format!` is invisible to all three **whatever their scope** — so this is
+/// not a file-list problem and widening the lists would not have found it.
+/// `squallar-web/src/gpu_probe/run.rs` emits its whole `gpu probe:` family that
+/// way and `squallar-app/src/app_render.rs` — the file the first gate is named
+/// after, and squarely inside its scope — writes `pressure:` that way.
+///
+/// **The size of that hole was measured, not estimated**: removing the `log::`
+/// arms here, leaving exactly the three heads the gates above read, takes the
+/// walked emitting set from **61 files to 31**. Half the files in this tree that
+/// write a row head write at least one of them where no extractor in this file
+/// could see it, and widening a scope list would not have moved one of them.
+///
+/// # `": "` and not `":"`
+///
+/// A row head is followed by a space or ends the literal. That is a statement
+/// about the row SHAPE and not a guess about content: `format!("http://{host}")`
+/// is a URL and not a `http:` family, and requiring the space is what
+/// distinguishes them. Measured on the tree this landed against: without it the
+/// walk reports 64 emitting files, with it 61, and the three it drops are all
+/// URL schemes. **Every family currently claimed by the three tables above
+/// survives it** — re-extracted, not assumed.
+///
+/// Deliberately dumb past that point, for [`telemetry_line_families`]' stated
+/// reason: it keeps error prose (`"the tile did not decode: {e}"` reads as a
+/// family here) and the table below says so. An extraction clever enough to
+/// drop those is clever enough to drop a real family silently, which is the
+/// failure this whole file is about.
+fn row_head_families(src: &str) -> Vec<String> {
+    const HEADS: [&str; 8] = [
+        "format!(",
+        "write!(",
+        "writeln!(",
+        "log::info!(",
+        "log::warn!(",
+        "log::error!(",
+        "log::debug!(",
+        "log::trace!(",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for head in HEADS {
+        for (at, _) in src.match_indices(head) {
+            let rest = &src[at + head.len()..];
+            let Some(quote) = rest.find('"') else {
+                continue;
+            };
+            let before = &rest[..quote];
+            // `telemetry_row_families`' rule: the literal opens the call, or
+            // exactly one sink argument precedes it.
+            let opens = before.chars().all(char::is_whitespace);
+            let one_sink =
+                before.matches(',').count() == 1 && !before.contains('"') && !before.contains(')');
+            if !(opens || one_sink) {
+                continue;
+            }
+            let body = &rest[quote + 1..];
+            let end = body
+                .find(|c: char| {
+                    !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == ' ' || c == '-')
+                })
+                .unwrap_or(body.len());
+            let Some(words) = body.get(..end) else {
+                continue;
+            };
+            if words.is_empty() || words.starts_with(' ') {
+                continue;
+            }
+            // Either `<words>:` or the instance-scoped `<words> (<name>):`. The
+            // instance shape is the ONLY one whose words end in a space -- the
+            // space before the paren -- so a trailing space is a discriminator
+            // here and not the rejection it is in `telemetry_line_families`,
+            // where the colon has to follow the words directly. Rejecting it
+            // outright dropped `grid pool trim (...)` and the positive control
+            // on IN_GATE_SCOPE caught that, which is what it is for.
+            let after = &body[end..];
+            let tail = if words.ends_with(' ') {
+                match after.strip_prefix('(').and_then(|paren| {
+                    paren
+                        .find(')')
+                        .filter(|close| !paren[..*close].contains('"'))
+                        .map(|close| &paren[close + 1..])
+                }) {
+                    Some(tail) => tail,
+                    None => continue,
+                }
+            } else {
+                after
+            };
+            let Some(fields) = tail.strip_prefix(':') else {
+                continue;
+            };
+            // The space is the row shape; `http://` dies here.
+            if !(fields.starts_with(' ') || fields.starts_with('"')) {
+                continue;
+            }
+            let family = words.trim_end();
+            if !out.iter().any(|f| f == family) {
+                out.push(family.to_string());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// **Every file in the workspace that writes a telemetry row head is either in
+/// a gate's scope above or classified here — and a new one is a build failure
+/// until someone says which.**
+///
+/// # What was actually wrong
+///
+/// The three gates above are exact over their own scope and each says so. None
+/// of them can say anything at all about a file nobody listed, and a floor
+/// under an extraction does not help: a floor catches the extraction
+/// collapsing, not a file that was never in it. The worked example was
+/// `gpu probe:`, which reached a leg as an absence for months while the state
+/// code beside it said a probe had happened; `0024495a1` gave it a rig reader
+/// and **no count in this file moved in either direction**, because no
+/// denominator contained it.
+///
+/// This gate makes absence impossible instead of invisible. The scope is
+/// walked, so the question it asks is closed over the tree: a file that emits
+/// a row head and appears in neither list below fails, naming itself.
+///
+/// # What it does and does not claim
+///
+/// It is a **scope** gate, not a coverage gate. It does not claim a family is
+/// read; it claims no file is unexamined. A file whose rows nothing reads is
+/// `RowOutsideEveryGate` and counts against a ceiling that may only fall —
+/// which is the whole difference between a debt that is recorded and a debt
+/// nobody can see.
+///
+/// `NotARow` is the other arm and it is not an escape hatch either: the reason
+/// string has to say why the head is not telemetry, and the staleness check
+/// below deletes the entry the moment the file stops emitting, so the table
+/// cannot silently outlive the tree.
+#[test]
+fn every_file_that_writes_a_row_head_is_in_a_gate_scope_or_classified_here() {
+    /// Why a file outside all three gates' scopes is outside them.
+    enum Class {
+        /// The head matches the row shape but is not a telemetry row: error
+        /// prose, a URL, a test fixture, an on-screen string. The reason says
+        /// which.
+        NotARow(&'static str),
+        /// **A real telemetry row, in no gate's denominator.** The debt this
+        /// gate exists to make countable. The string says what the row is.
+        RowOutsideEveryGate(&'static str),
+    }
+    use Class::{NotARow, RowOutsideEveryGate};
+
+    /// The most files that may hold a row no gate above covers. A ceiling,
+    /// permanent, and it may only FALL — `arch_ratchets`' discipline, for its
+    /// reason. **Bringing a file into a gate's scope above is what lowers it**;
+    /// a newly found one is evidence this was always understated, never a
+    /// reason to raise it.
+    ///
+    /// Set from the extraction, not from arithmetic: RE-RUN the walk on a
+    /// rebase and set this to the `RowOutsideEveryGate` arms it comes to, never
+    /// old-plus-one — two lanes each bumping by one merge clean and leave the
+    /// ceiling above the tree.
+    ///
+    /// **Fourteen is what the walk counted**, read off this assertion with the
+    /// ceiling temporarily at zero rather than by counting the arms by eye.
+    const OUTSIDE_CEILING: usize = 14;
+    /// A floor under the **walk**, not the extraction: a `read_dir` that
+    /// silently returns a subtree, or a `WORKSPACE_ROOT` that stops resolving,
+    /// reads as a tree with no telemetry in it and every assertion below
+    /// passes over an empty set. **Sixty-one emitting files were walked when
+    /// this landed**, read off this assertion with the floor temporarily
+    /// impossible; the floor sits under that because landing a new emitter must
+    /// not touch it, and because the exact partition is held by the two
+    /// assertions after it rather than by this number.
+    const EMITTING_FILE_FLOOR: usize = 50;
+
+    let classified: &[(&str, Class)] = &[
+        // ---- real telemetry rows, in no gate's denominator ----
+        (
+            "squallar-app/src/app.rs",
+            RowOutsideEveryGate(
+                "`gpu probe:` (read by drive.py since 0024495a1, in no gate's \
+                 scope), plus `memory shares:`, `texture ceiling:`, \
+                 `released base way-backs held:`, `first run:`, \
+                 `archive spill installed:`, `gpu pass probe installed:`",
+            ),
+        ),
+        (
+            "squallar-app/src/app_fetch.rs",
+            RowOutsideEveryGate("`overlay raster:` names the pane and the redraw reason"),
+        ),
+        (
+            "squallar-app/src/pressure.rs",
+            RowOutsideEveryGate(
+                "`budget pressure:` counts evicted entries and MiB and NO rig \
+                 half reads it; `linear memory:` is read by drive.py. Both are \
+                 heap instruments outside every denominator",
+            ),
+        ),
+        (
+            "squallar-app/src/render_pool_trim.rs",
+            RowOutsideEveryGate("`render pools:` reports the bytes a quiet session gave up"),
+        ),
+        (
+            "squallar-egui/src/admission.rs",
+            RowOutsideEveryGate("`admission:` names the pool and the MiB an ask wanted"),
+        ),
+        (
+            "squallar-egui/src/basemap_archive/block_cache.rs",
+            RowOutsideEveryGate("`archive block cache:` and `basemap cache seed:`"),
+        ),
+        (
+            "squallar-egui/src/tile_source.rs",
+            RowOutsideEveryGate("`basemap archive open:` reports zooms, tiles and compression"),
+        ),
+        (
+            "squallar-netcdf/src/bandstream.rs",
+            RowOutsideEveryGate(
+                "`netcdf band-streamed read:` and `netcdf picked read:` both \
+                 report bytes HELD — heap rows in no denominator",
+            ),
+        ),
+        (
+            "squallar-radar/src/catalogue.rs",
+            RowOutsideEveryGate("`site catalogue:` counts radars listed, placed and named"),
+        ),
+        (
+            "squallar-radar/src/nrot.rs",
+            RowOutsideEveryGate("`region-assign:` counts regions, edges accepted and components"),
+        ),
+        (
+            "squallar-web/src/bridge.rs",
+            RowOutsideEveryGate(
+                "`gpu probe (webgl2):` and `gpu probe:`; read by drive.py since \
+                 0024495a1, in no gate's scope",
+            ),
+        ),
+        (
+            "squallar-web/src/gpu_probe/run.rs",
+            RowOutsideEveryGate(
+                "three more `gpu probe:` shapes, every one written straight into \
+                 `log::info!` — invisible to all three extractors above whatever \
+                 their scope",
+            ),
+        ),
+        (
+            "squallar-web/src/worker_port.rs",
+            RowOutsideEveryGate(
+                "`transport:`, `worst reply:` and `reply blocks:` — the last \
+                 counts large blocks by exact size, a heap row",
+            ),
+        ),
+        (
+            "squallar/src/log_sink.rs",
+            RowOutsideEveryGate(
+                "`log sink:` counts the queue's enqueued, written, dropped and peak",
+            ),
+        ),
+        // ---- heads matching the row shape that are not telemetry rows ----
+        (
+            "squallar-app/src/app_render/frame_telemetry_line_tests.rs",
+            NotARow("this file; its heads are the pinned literals, not emits"),
+        ),
+        (
+            "squallar-app/src/app_render/raster_telemetry_line_tests.rs",
+            NotARow("the sibling pin file; pinned literals, not emits"),
+        ),
+        (
+            "squallar-app/src/site_catalogue.rs",
+            NotARow("persistence warnings; prose, no fields"),
+        ),
+        (
+            "squallar-app/src/site_positions.rs",
+            NotARow("persistence warnings; prose, no fields"),
+        ),
+        (
+            "squallar-basemap/src/jobs.rs",
+            NotARow("`basemap: z/x/y did not parse: {error}` is a decode failure"),
+        ),
+        (
+            "squallar-buildings/src/footprint.rs",
+            NotARow("a decode failure carried in an `Err`"),
+        ),
+        (
+            "squallar-buildings/src/jobs.rs",
+            NotARow("a tile read failure"),
+        ),
+        (
+            "squallar-buildings/src/prism.rs",
+            NotARow("a tile read failure"),
+        ),
+        (
+            "squallar-egui/src/basemap_archive.rs",
+            NotARow("archive open/read failures"),
+        ),
+        (
+            "squallar-egui/src/basemap_download.rs",
+            NotARow("eight segment-store failures; prose"),
+        ),
+        (
+            "squallar-egui/src/input_harness/tests.rs",
+            NotARow("a test fixture's unreachable base"),
+        ),
+        (
+            "squallar-egui/src/pmt_index.rs",
+            NotARow("index decode failures"),
+        ),
+        (
+            "squallar-egui/src/terrain.rs",
+            NotARow("hillshade tile failures"),
+        ),
+        (
+            "squallar-egui/src/ui_config.rs",
+            NotARow("preset read failures"),
+        ),
+        (
+            "squallar-egui/src/ui_diagnostics.rs",
+            NotARow(
+                "`seg p99 (presented):` is drawn in the diagnostics PANEL, not \
+                 logged; no console ring carries it and no rig could read it",
+            ),
+        ),
+        (
+            "squallar-elevation/src/jobs.rs",
+            NotARow("assemble/resample failures"),
+        ),
+        (
+            "squallar-gpu/tests/volume_shader.rs",
+            NotARow("a test's assertion message"),
+        ),
+        (
+            "squallar-icon/src/main.rs",
+            NotARow("a build-tool encode failure"),
+        ),
+        (
+            "squallar-location/src/gate.rs",
+            NotARow("location-memo persistence warnings"),
+        ),
+        (
+            "squallar-location/src/os_location/apple.rs",
+            NotARow("a missing bundle identifier"),
+        ),
+        (
+            "squallar-location/src/os_location/linux.rs",
+            NotARow("eight portal-session failures; prose"),
+        ),
+        (
+            "squallar-location/src/web.rs",
+            NotARow("geolocation failures"),
+        ),
+        (
+            "squallar-overlays/src/hrrr/fetch.rs",
+            NotARow("index/range request failures"),
+        ),
+        (
+            "squallar-radar/src/chunks/tests.rs",
+            NotARow("a test fixture's `site:`/`sweep count:` header"),
+        ),
+        (
+            "squallar-radar/src/derive.rs",
+            NotARow("`derivation refused:` carries a reason, not fields"),
+        ),
+        ("squallar-radar/src/jobs.rs", NotARow("an encode failure")),
+        (
+            "squallar-radar/src/voxel.rs",
+            NotARow("`voxel grid refused:` carries a reason"),
+        ),
+        (
+            "squallar-radar/src/xsect.rs",
+            NotARow("`cross-section refused:` carries a reason"),
+        ),
+        (
+            "squallar-volumetric/src/lib.rs",
+            NotARow("a wgpu error passed through"),
+        ),
+        (
+            "squallar-web/src/alloc_failure.rs",
+            NotARow("the allocation-failure message"),
+        ),
+        (
+            "squallar-web/src/entry.rs",
+            NotARow("event-loop and logger startup failures"),
+        ),
+        (
+            "squallar-web/src/rayon_pool.rs",
+            NotARow("two pool-installation notes at debug"),
+        ),
+        (
+            "squallar-web/src/worker.rs",
+            NotARow("`tile lane:` carries a pool failure, not fields"),
+        ),
+        ("squallar/src/kv.rs", NotARow("a config write failure")),
+        ("squallar/src/lib.rs", NotARow("the top-level exit message")),
+        (
+            "squallar/src/log_sink_tests.rs",
+            NotARow("the pin file for `log sink:`; pinned literals, not emits"),
+        ),
+        (
+            "squallar/src/platform.rs",
+            NotARow("a missing system timezone"),
+        ),
+        (
+            "tools/nws-zone-pack/src/main.rs",
+            NotARow("a build tool's progress line"),
+        ),
+        (
+            "tools/squallar-terrain/src/floor.rs",
+            NotARow("a build tool's progress line"),
+        ),
+        (
+            "tools/squallar-terrain/src/main.rs",
+            NotARow("a build tool's usage text"),
+        ),
+        (
+            "tools/squallar-terrain/src/run.rs",
+            NotARow("a build tool's missing-commands message"),
+        ),
+    ];
+
+    let root = std::path::Path::new(WORKSPACE_ROOT);
+    let mut files = Vec::new();
+    rs_files_under(root, &mut files);
+    files.sort();
+
+    let mut emitting: Vec<String> = Vec::new();
+    for path in &files {
+        let src = std::fs::read_to_string(path).expect("a readable .rs file");
+        if row_head_families(&src).is_empty() {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .expect("every walked path is under the root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        emitting.push(rel);
+    }
+
+    // The walk, not the extraction: an empty or truncated tree must not read as
+    // a tree with nothing to gate.
+    assert!(
+        emitting.len() >= EMITTING_FILE_FLOOR,
+        "the walk found only {} files writing a row head and the floor is \
+         {EMITTING_FILE_FLOOR}; the scope collapsed rather than the tree \
+         emptying — re-anchor WORKSPACE_ROOT",
+        emitting.len(),
+    );
+
+    // Positive control on the hand-listed half: every file the three gates
+    // above read must be one this walk found. A renamed source fails here
+    // instead of leaving both halves smaller and agreeing.
+    for wanted in IN_GATE_SCOPE {
+        assert!(
+            emitting.iter().any(|f| f == wanted),
+            "`{wanted}` is read by a gate above but the walk did not find it \
+             writing a row head; the file moved, or the extractor stopped \
+             seeing its heads",
+        );
+    }
+
+    // The partition. A file in neither list is what this gate exists for.
+    let unclassified: Vec<&String> = emitting
+        .iter()
+        .filter(|f| !IN_GATE_SCOPE.contains(&f.as_str()) && !classified.iter().any(|(p, _)| p == f))
+        .collect();
+    assert!(
+        unclassified.is_empty(),
+        "these files write a telemetry row head and are in NO gate's scope and \
+         in no arm of the table: {unclassified:?}. Classify each — \
+         `RowOutsideEveryGate` if its rows are real telemetry (and lower a \
+         ceiling above by bringing it into a gate's scope), `NotARow` with the \
+         reason if they are not. This is the failure the hand-listed scopes \
+         could not produce.",
+    );
+
+    // The table may not outlive the tree: an entry whose file stopped emitting
+    // is deleted, not kept as a name nobody checks.
+    let stale: Vec<&str> = classified
+        .iter()
+        .map(|(p, _)| *p)
+        .filter(|p| !emitting.iter().any(|f| f == p))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "these table entries name files that no longer write a row head: \
+         {stale:?}. Delete them — a stale entry is a name that reads as \
+         examined and is not.",
+    );
+
+    let mut outside = 0usize;
+    for (path, class) in classified {
+        match class {
+            NotARow(reason) | RowOutsideEveryGate(reason) => {
+                assert!(
+                    !reason.is_empty(),
+                    "`{path}` is classified with no reason given",
+                );
+            }
+        }
+        if matches!(class, RowOutsideEveryGate(_)) {
+            outside += 1;
+        }
+    }
+    assert!(
+        outside <= OUTSIDE_CEILING,
+        "{outside} files hold a telemetry row no gate above covers and the \
+         ceiling is {OUTSIDE_CEILING}. It may only fall: bring one into a \
+         gate's scope rather than raising it",
     );
 }
