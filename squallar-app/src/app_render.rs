@@ -4253,12 +4253,14 @@ impl super::App {
     }
 
     /// **What the loop's decoded cache is holding that no eviction can take**
-    /// — see [`crate::budget_telemetry::LoopDecodedCensus`] for the five
+    /// — see [`crate::budget_telemetry::LoopDecodedCensus`] for the seven
     /// figures and their denominators.
     ///
     /// `wanted` is the caller's own residency predicate, the very closure
-    /// `evict_decoded_except` was handed, so "unwanted" here means exactly
-    /// what the policy meant by it and not a second spelling of the rule.
+    /// `evict_decoded_except` was handed, and `pinned` is the one
+    /// `evict_decoded_to_ceiling` was handed, so "unwanted" and "pinned" here
+    /// mean exactly what the two policies meant by them and not a second
+    /// spelling of either rule.
     /// Asked AFTER the eviction passes have run, so every entry it finds
     /// unwanted is one a guard refused rather than one nobody had got to yet.
     ///
@@ -4273,6 +4275,7 @@ impl super::App {
     pub(crate) fn loop_decoded_census(
         &self,
         wanted: impl Fn(&str, &chrono::NaiveDateTime, &nexrad_model::data::Scan) -> bool,
+        pinned: impl Fn(&str, &chrono::NaiveDateTime, &nexrad_model::data::Scan) -> bool,
         now: chrono::NaiveDateTime,
     ) -> crate::budget_telemetry::LoopDecodedCensus {
         let mut census = crate::budget_telemetry::LoopDecodedCensus::default();
@@ -4291,6 +4294,22 @@ impl super::App {
         for entry in self.loop_mgr.decoded_entries() {
             census.volumes += 1;
             census.bytes = census.bytes.saturating_add(entry.bytes);
+            // **The floor under the byte ceiling**, and the one column here
+            // asked of an entry that HAS its way back. Every figure below
+            // answers what the archive-less guard refused; none of them can
+            // say what `evict_decoded_to_ceiling` was structurally unable to
+            // reach, which is the set a pane is parked on or whose site is
+            // settling. A ceiling lowered under this figure reclaims nothing
+            // however far it falls, so the number has to be readable before
+            // the next lowering rather than after it.
+            //
+            // `pinned` is the eviction's own closure, not a second spelling of
+            // it, for the reason `wanted` is: the two predicates that decide
+            // what the pass could take are the two asked here.
+            if entry.has_archive && pinned(entry.site, &entry.timestamp, entry.scan) {
+                census.pinned += 1;
+                census.pinned_bytes = census.pinned_bytes.saturating_add(entry.bytes);
+            }
             if entry.has_archive {
                 continue;
             }

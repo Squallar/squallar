@@ -975,7 +975,7 @@ pub(crate) fn base_holder_line(census: BaseHolderCensus) -> String {
 /// **What the loop's decoded cache is holding that no eviction path can
 /// take**, as a LEVEL read on the telemetry tick.
 ///
-/// # Six figures, and four of them are subsets of the one above
+/// # Seven figures: four are subsets of `no_archive`, and `pinned` is not
 ///
 /// `evict_decoded_except` and `evict_decoded_to_ceiling` both refuse a volume
 /// with no archive behind it, because their premise is that eviction costs a
@@ -1006,6 +1006,19 @@ pub(crate) fn base_holder_line(census: BaseHolderCensus) -> String {
 ///   exists: a base's superseded rungs read 148 MB and freed nothing because
 ///   six bases of six were co-held. **`sole_bytes` is the only figure here a
 ///   cut could bank.**
+/// * `pinned` / `pinned_bytes` — of `volumes`, the ones that **do** have an
+///   archive behind them and that `evict_decoded_to_ceiling` may still never
+///   take, because a pane is parked on the volume or its site is settling. The
+///   only column here outside the archive-less story, and the reason it is
+///   here: every other figure answers what the *guard* refused, and none of
+///   them can say what the *ceiling* cannot reach. **This is the floor under
+///   `LOOP_DECODED_CEILING_BYTES`.** Lowering that ceiling converts to bytes
+///   only in the room above this figure, so a ceiling set under it reclaims
+///   nothing at all however far it falls — which is the shape of a cut on this
+///   campaign that banked ~94 MiB and executed zero times. Disjoint from
+///   `no_archive` by construction (an entry with no way back is already
+///   refused by the guard and is never counted twice), so `pinned +
+///   no_archive <= volumes`.
 /// * `oldest_unwanted_s` — how long ago the oldest volume in the `unwanted`
 ///   set was collected, seconds, against the wall clock. The exposure window,
 ///   and the figure that says whether "the archive turns up minutes later" is
@@ -1024,6 +1037,13 @@ pub(crate) struct LoopDecodedCensus {
     pub(crate) sole: usize,
     pub(crate) sole_bytes: usize,
     pub(crate) oldest_unwanted_s: u64,
+    /// **The floor under [`LOOP_DECODED_CEILING_BYTES`]**, and the only figure
+    /// here that is not a subset of `no_archive` — see the note above.
+    ///
+    /// [`LOOP_DECODED_CEILING_BYTES`]:
+    ///     squallar_device_profile::constants::LOOP_DECODED_CEILING_BYTES
+    pub(crate) pinned: usize,
+    pub(crate) pinned_bytes: usize,
 }
 
 /// Its own line, never appended to `budget state:`, which is scraped by a
@@ -1041,17 +1061,21 @@ pub(crate) fn loop_decoded_line(census: LoopDecodedCensus) -> String {
         sole,
         sole_bytes,
         oldest_unwanted_s,
+        pinned,
+        pinned_bytes,
     } = census;
     let mib = |bytes: usize| bytes / (1024 * 1024);
     format!(
         "loop decoded: {volumes} volume(s) at {} MiB; no archive {no_archive} at {} MiB; \
          unwanted {unwanted} at {} MiB, never archived {never_archived} at {} MiB, \
-         sole {sole} at {} MiB; oldest unwanted {oldest_unwanted_s} s",
+         sole {sole} at {} MiB; oldest unwanted {oldest_unwanted_s} s; \
+         pinned {pinned} at {} MiB",
         mib(bytes),
         mib(no_archive_bytes),
         mib(unwanted_bytes),
         mib(never_archived_bytes),
         mib(sole_bytes),
+        mib(pinned_bytes),
     )
 }
 
@@ -1402,6 +1426,90 @@ mod tests {
     use squallar_device_profile::fit::PaneTerms;
     use squallar_device_profile::quality::DeviceClass;
     use squallar_egui::shell_api::{BudgetReadout, PaneBudget, PoolReadout};
+
+    /// **The `loop decoded:` row's exact shape, and every census field in
+    /// it.**
+    ///
+    /// A FIELD ADDED TO AN EXISTING ROW IS THE GAP THIS FILLS. The enumeration
+    /// in `frame_telemetry_line_tests.rs` keys on the family name up to the
+    /// first colon, so it claims the row and says nothing about its columns:
+    /// appending a fourteenth figure passes it silently, and the rig would go
+    /// on reading thirteen. This pins the whole string, so a field added,
+    /// renamed, reordered or given a different unit fails here, and
+    /// `native_row.py`'s `LoopDecodedRowTests` fails on the other side against
+    /// this same format string.
+    ///
+    /// **What already holds without a test, and why it is not enough.**
+    /// `loop_decoded_line` destructures `LoopDecodedCensus` with no `..`, so a
+    /// new field breaks this module's compile until it is named, and `-D
+    /// warnings` then turns the unused binding into an error until it is
+    /// *used*. That chain forces a new field into the format string. What it
+    /// cannot do is tell the RIG, whose pattern is in another language and
+    /// another file — so the shape has to be pinned somewhere both halves can
+    /// be held to, and this is that place.
+    ///
+    /// Thirteen distinct values, so a transposition of two columns fails
+    /// rather than rendering identically.
+    #[test]
+    fn the_loop_decoded_row_names_every_census_field() {
+        let mib = |n: usize| n * 1024 * 1024;
+        let line = loop_decoded_line(LoopDecodedCensus {
+            volumes: 11,
+            bytes: mib(12),
+            no_archive: 13,
+            no_archive_bytes: mib(14),
+            unwanted: 15,
+            unwanted_bytes: mib(16),
+            never_archived: 17,
+            never_archived_bytes: mib(18),
+            sole: 19,
+            sole_bytes: mib(20),
+            oldest_unwanted_s: 21,
+            pinned: 22,
+            pinned_bytes: mib(23),
+        });
+        assert_eq!(
+            line,
+            "loop decoded: 11 volume(s) at 12 MiB; no archive 13 at 14 MiB; \
+             unwanted 15 at 16 MiB, never archived 17 at 18 MiB, \
+             sole 19 at 20 MiB; oldest unwanted 21 s; pinned 22 at 23 MiB",
+        );
+        // The count, stated separately from the shape: a reader that counts
+        // figures (the rig does) breaks on arity even when every label it
+        // knows is still present.
+        assert_eq!(
+            line.split_whitespace()
+                .filter(|w| w.trim_end_matches(&[',', ';'][..]).parse::<u64>().is_ok())
+                .count(),
+            13,
+            "the rig's `LOOP_DECODED_RE` reads exactly thirteen figures",
+        );
+    }
+
+    /// **`pinned` is the floor under `LOOP_DECODED_CEILING_BYTES`, so it is
+    /// reported in the same unit the ceiling is set in**, and a reader can
+    /// compare the two without a conversion. The ceiling is bytes; the row is
+    /// MiB by integer division, as every byte figure in this module is — so
+    /// what this pins is that the DIVISOR is MiB and not kB or bytes, which is
+    /// the mistake that would make a 23 MiB floor read as 23 or as 24,117,248
+    /// and either way rank wrong against a 256 MiB ceiling.
+    #[test]
+    fn the_pinned_floor_is_reported_in_mib_against_a_ceiling_set_in_bytes() {
+        let ceiling = squallar_device_profile::constants::LOOP_DECODED_CEILING_BYTES;
+        let line = loop_decoded_line(LoopDecodedCensus {
+            pinned: 6,
+            pinned_bytes: ceiling,
+            ..Default::default()
+        });
+        assert!(
+            line.ends_with(&format!("pinned 6 at {} MiB", ceiling / (1024 * 1024))),
+            "the floor and the ceiling must be comparable without a conversion: {line}",
+        );
+        // A floor AT the ceiling is the readable state "this ceiling cannot
+        // reclaim another byte", which is the reading a lowering has to be
+        // checked against and the one a zeroed column could never say.
+        assert!(line.contains("pinned 6 at 256 MiB"), "{line}");
+    }
 
     /// **The `moment drop:` line's shape, pinned where the format string
     /// lives**, so the reader that scrapes it can be built from a string this

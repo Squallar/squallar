@@ -1840,12 +1840,18 @@ fn every_telemetry_row_the_sibling_modules_write_is_claimed_by_a_probe_or_a_reas
 
     /// The most families that may be `Unread`. A ceiling, permanent, may only
     /// FALL — `arch_ratchets`' discipline, for its reason.
-    const UNREAD_CEILING: usize = 12;
+    const UNREAD_CEILING: usize = 11;
     /// A floor under the extraction, so a rename that makes it match *nothing*
     /// fails loudly rather than passing over an empty list. Raised 16 -> 17 when
     /// `80ddbbbe8` landed `payload share:`; a floor may rise to what is known to
     /// be there, unlike `UNREAD_CEILING`, which may only fall.
     const KNOWN_FAMILY_FLOOR: usize = 17;
+    // NOTE: no new family landed with `pinned` — it is a FIELD on the existing
+    // `loop decoded:` row, which this gate keys past (it reads the prefix up to
+    // the first colon). The gate that catches a field addition is
+    // `LoopDecodedRowTests.test_the_field_count_is_pinned_to_the_emitter` in
+    // `native_row.py`, which counts the emitter's own placeholders, plus
+    // `the_loop_decoded_row_names_every_census_field` below.
 
     let claims: &[(&str, Claim)] = &[
         // THE ROW THIS GATE WAS ADDED FOR. Absent rather than zeroed when no
@@ -1882,10 +1888,19 @@ fn every_telemetry_row_the_sibling_modules_write_is_claimed_by_a_probe_or_a_reas
             "host heap watch",
             Unread("the host-heap watch level; the census carries the bytes"),
         ),
-        (
-            "loop decoded",
-            Unread("the loop's decoded-volume tally; unclaimed"),
-        ),
+        // CLAIMED, and the ceiling fell 12 -> 11 with it. `loop scans` is the
+        // largest family on the six-pane arm, and whether its ceiling can be
+        // lowered is the question of how much of it is PINNED — decoded
+        // volumes with their archive behind them that
+        // `evict_decoded_to_ceiling` may never take. A ceiling set under that
+        // figure reclaims nothing however far it falls, and this campaign has
+        // already banked a ~94 MiB cut that fired zero times because its
+        // precondition was unreadable. The row now carries `pinned` and the
+        // native half scrapes it.
+        //
+        // `ByNative` and not `By`: the figure is read off a MEMORY leg, which
+        // is the native half's job, and there is no `drive.py` var for it.
+        ("loop decoded", ByNative(&["LOOP_DECODED_RE"])),
         ("loop state", By(&["loop_state_re"])),
         (
             "moment drop",

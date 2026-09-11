@@ -550,6 +550,46 @@ WINIT_SCALE_RE = re.compile(r"Guessed window scale factor: (\d+(?:\.\d+)?)")
 # line, never a zero-size picture.
 OVERLAY_PICTURES_RE = re.compile(r"overlay pictures: n=(\d+), px=((?:\d+x\d+(?:;\d+x\d+)*)?), bytes=(\d+)")
 
+# `loop decoded: ...` (`squallar_app::budget_telemetry::loop_decoded_line`),
+# said once a telemetry period as a LEVEL. Thirteen mandatory groups, and the
+# LAST PAIR is the one a memory leg is run to read: `pinned` is the floor under
+# `LOOP_DECODED_CEILING_BYTES` -- decoded volumes that have their archive
+# behind them and that `evict_decoded_to_ceiling` may still never take, because
+# a pane is parked on the volume or its site is settling.
+#
+# WHY THIS ROW IS SCRAPED AT ALL, having been `Unread` since it landed: the
+# `loop scans` family is the largest on the six-pane arm, and whether its
+# ceiling can be LOWERED is exactly the question of how much of it is pinned.
+# A ceiling set under `pinned` reclaims nothing however far it falls, and this
+# campaign has already banked a ~94 MiB cut that executed zero times because
+# nobody could read its precondition. `pinned` is that precondition, as a
+# number, off a leg.
+#
+# Anchored on the row prefix, which is what keeps `pinned (\d+)` here from
+# colliding with `sole pinned {} B` on the unrelated `loop state:` row.
+# Every group mandatory; no match leaves the family empty, which is a binary
+# older than the line and never a zero.
+LOOP_DECODED_RE = re.compile(
+    r"loop decoded: (\d+) volume\(s\) at (\d+) MiB; "
+    r"no archive (\d+) at (\d+) MiB; "
+    r"unwanted (\d+) at (\d+) MiB, "
+    r"never archived (\d+) at (\d+) MiB, "
+    r"sole (\d+) at (\d+) MiB; "
+    r"oldest unwanted (\d+) s; "
+    r"pinned (\d+) at (\d+) MiB"
+)
+
+LOOP_DECODED_FIELDS = (
+    "volumes", "bytes_mib", "no_archive", "no_archive_mib",
+    "unwanted", "unwanted_mib", "never_archived", "never_archived_mib",
+    "sole", "sole_mib", "oldest_unwanted_s", "pinned", "pinned_mib",
+)
+
+
+def loop_decoded_reading(m):
+    """A `LOOP_DECODED_RE` match as a dict over `LOOP_DECODED_FIELDS`."""
+    return dict(zip(LOOP_DECODED_FIELDS, (int(g) for g in m.groups())))
+
 
 def overlay_pictures_reading(m):
     """An `OVERLAY_PICTURES_RE` match as `{"n", "px": [(w, h), ...], "bytes"}`."""
@@ -620,6 +660,7 @@ def scrape(lines, probes):
         "archive_spill": [],
         "payload_share": [],
         "overlay_pictures": [],
+        "loop_decoded": [],
         "segments": [],
         # `{key: [Reading]}` for every per-family line present, keyed the
         # browser rig's way (`segment:pre`, `dispatch:hitmap`), and the line
@@ -745,6 +786,12 @@ def scrape(lines, probes):
         m = OVERLAY_PICTURES_RE.search(line)
         if m:
             out["overlay_pictures"].append((idx, overlay_pictures_reading(m)))
+        # `loop decoded` is a LEVEL whose last pair is the floor under the
+        # decoded ceiling; its own arm because its groups are a flat row of
+        # counts and MiB rather than a histogram.
+        m = LOOP_DECODED_RE.search(line)
+        if m:
+            out["loop_decoded"].append((idx, loop_decoded_reading(m)))
         # `frame segments` is NOT one of them: its percentile groups are
         # `(\d+|none|over)`, and `over` is the top-bin clamp, which has no
         # upper edge and is not a number. Kept as text -- it is reported as
@@ -3414,6 +3461,98 @@ class HistogramTests(unittest.TestCase):
         counts[SLOTS - 1] = 3  # the over-ceiling clamp has no upper edge
         self.assertEqual(percentile_upper_micros(counts, 0.99), "over")
         self.assertIsNone(percentile_upper_micros([0] * SLOTS, 0.5))
+
+
+class LoopDecodedRowTests(unittest.TestCase):
+    """`LOOP_DECODED_RE` against the EMITTER'S OWN format string.
+
+    A probe checked against a sample someone typed here proves the sample, not
+    the row: the two drift the moment the Rust side is edited, and the gate in
+    `frame_telemetry_line_tests.rs` cannot catch it -- that one keys on the
+    prefix up to the first colon, so ADDING A FIELD passes it silently. This
+    reads the literal out of `budget_telemetry.rs`, renders it the way `format!`
+    would, and matches. A field added, renamed or reordered on the producer
+    fails here by name.
+    """
+
+    ROW_SRC = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "..", "squallar-app", "src", "budget_telemetry.rs",
+    )
+
+    @staticmethod
+    def _rendered(literal, values):
+        """`literal` as `format!` would render it, with `values` in order."""
+        # A backslash-newline in a Rust string literal eats the newline AND the
+        # next line's leading whitespace. Emulating that is the whole reason
+        # this is not a hand-typed sample.
+        joined = re.sub(r"\\\n\s*", "", literal)
+        out, i = [], 0
+        for piece in re.split(r"\{[^{}]*\}", joined):
+            out.append(piece)
+            if i < len(values):
+                out.append(str(values[i]))
+            i += 1
+        return "".join(out)
+
+    def _literal(self):
+        src = open(self.ROW_SRC, encoding="utf-8").read()
+        m = re.search(r'("loop decoded: (?:[^"\\]|\\.)*")', src, re.S)
+        self.assertIsNotNone(m, "the `loop decoded:` literal is gone from budget_telemetry.rs")
+        return m.group(1)[1:-1]
+
+    def test_the_probe_matches_the_emitters_own_format_string(self):
+        literal = self._literal()
+        # Distinct values, so a regex that matched the right shape with the
+        # groups transposed still fails.
+        values = list(range(11, 11 + len(LOOP_DECODED_FIELDS)))
+        line = self._rendered(literal, values)
+        m = LOOP_DECODED_RE.search(line)
+        self.assertIsNotNone(m, "LOOP_DECODED_RE does not match the row: %r" % line)
+        self.assertEqual(
+            loop_decoded_reading(m),
+            dict(zip(LOOP_DECODED_FIELDS, values)),
+            "the probe matched but read the fields in the wrong order",
+        )
+
+    def test_the_field_count_is_pinned_to_the_emitter(self):
+        """A field ADDED on the producer fails here -- the enumeration gate
+        in `frame_telemetry_line_tests.rs` keys on the prefix and cannot."""
+        literal = self._literal()
+        self.assertEqual(
+            len(re.findall(r"\{[^{}]*\}", literal)),
+            len(LOOP_DECODED_FIELDS),
+            "budget_telemetry.rs emits a different number of fields than "
+            "LOOP_DECODED_FIELDS names; update both halves together",
+        )
+        self.assertEqual(LOOP_DECODED_RE.groups, len(LOOP_DECODED_FIELDS))
+
+    def test_pinned_is_the_last_pair_and_is_read_as_a_number(self):
+        """The one figure a memory leg runs to read."""
+        literal = self._literal()
+        values = list(range(1, 1 + len(LOOP_DECODED_FIELDS)))
+        values[LOOP_DECODED_FIELDS.index("pinned")] = 7
+        values[LOOP_DECODED_FIELDS.index("pinned_mib")] = 321
+        m = LOOP_DECODED_RE.search(self._rendered(literal, values))
+        self.assertIsNotNone(m)
+        r = loop_decoded_reading(m)
+        self.assertEqual((r["pinned"], r["pinned_mib"]), (7, 321))
+
+    def test_it_does_not_match_the_unrelated_sole_pinned_on_loop_state(self):
+        """`loop state:` carries its own `sole pinned {} B`; the row prefix is
+        what keeps the two apart."""
+        self.assertIsNone(LOOP_DECODED_RE.search(
+            "loop state: 6 panes, 4 layers animating; sole pinned 123 B over 4 frames, "
+            "sole walks 9"
+        ))
+
+    def test_a_row_scrapes_into_its_family(self):
+        literal = self._literal()
+        values = list(range(11, 11 + len(LOOP_DECODED_FIELDS)))
+        line = self._rendered(literal, values)
+        got = scrape([line], compile_probes())["loop_decoded"]
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0][1]["pinned"], values[LOOP_DECODED_FIELDS.index("pinned")])
 
 
 class DivergenceTests(unittest.TestCase):

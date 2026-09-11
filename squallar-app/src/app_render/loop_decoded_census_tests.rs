@@ -431,6 +431,111 @@ fn the_same_frame_with_an_archive_behind_it_is_evicted_and_counted_nowhere() {
     );
 }
 
+/// **`pinned`: the floor under `LOOP_DECODED_CEILING_BYTES`**, and the column
+/// the control above is named `counted_nowhere` for.
+///
+/// That name was accurate and it was the gap. A volume WITH its archive behind
+/// it that `evict_decoded_to_ceiling` may still never take — because a pane is
+/// parked on it, or its site is settling — landed in `volumes` and `bytes` and
+/// in no other column, so the census could say what the archive-less GUARD
+/// refused and nothing at all about what the CEILING could not reach. Those are
+/// different sets and only the second one bounds a lowering: the ceiling
+/// reclaims in the room above this figure, so a ceiling set under it reclaims
+/// nothing however far it falls.
+///
+/// Why that mattered enough to add a column. `loop scans` is the largest
+/// family on the six-pane arm, its ceiling is the obvious thing to lower, and
+/// this campaign has already banked a ~94 MiB cut that executed zero times
+/// because its precondition never held on the measured arm and no counter said
+/// so. `pinned` is this ceiling's precondition, as a number, on the row a leg
+/// scrapes.
+///
+/// The fixture is the control's, deliberately: same app, same archives, same
+/// playhead, so the two tests differ only in which column they read.
+///
+/// TAMPER: drop the `pinned(..)` test in `App::loop_decoded_census` and this
+/// reads 0; drop its `entry.has_archive &&` and the archive-less frames join
+/// the count, breaking the disjointness this also asserts.
+#[test]
+fn a_volume_the_ceiling_may_never_take_is_counted_as_the_floor_under_it() {
+    let ctx = egui::Context::default();
+    let mut app = looping_pane(&[at(1), at(2), at(3), at(4), at(5)]);
+    // **Exactly one way back, behind the volume the pane is parked on**, and
+    // the narrowing is deliberate. Every fixture volume here carries the SAME
+    // collected instant, so the pin predicate's second clock
+    // (`Some(at) == collected`) matches all five; the archive is what singles
+    // one out, and it is also the column's own premise — an entry with no way
+    // back is refused by the guard and belongs to `no_archive`, never here.
+    app.loop_mgr
+        .cache_archive(SITE, at(2), Arc::new(vec![0u8; 64]));
+    let parked_price = app
+        .loop_mgr
+        .cached_scan_price(SITE, &at(2))
+        .expect("the cache priced the volume it filed");
+    // **What actually pins a volume against the ceiling**, and the fixture
+    // detail worth stating because getting it wrong makes this test unable to
+    // reach the state it asserts: the pass's `pinned` closure reads `parked`,
+    // which `evict_unneeded_loop_scans` builds from each pane's `scan_info` —
+    // the volume the pane is DISPLAYING — and not from a loop's playhead. A
+    // headless pane has no `scan_info` until something sets one, so without
+    // this the column reads 0 and the test would be asserting the absence of
+    // the very thing it is for.
+    let displayed = app
+        .loop_mgr
+        .get_cached(SITE, &at(2))
+        .expect("fixture: the cache holds the volume the pane is parked on")
+        .0
+        .clone();
+    let pane = app.gui.pane_mut(0).expect("a headless app has a pane");
+    pane.scan_info = Some(squallar_radar::types::ScanInfo::from_scan(
+        &displayed,
+        SITE,
+        at(2),
+        None,
+    ));
+    let ls = pane.time_state_mut(&known::RADAR);
+    ls.frames[0].image = Some(textured(&ctx));
+    ls.settle_playhead(squallar_egui::pane::TimeMode::AsOf(at(2)));
+    assert_eq!(ls.current_frame(), 1, "fixture: the playhead is on frame 1");
+
+    app.evict_unneeded_loop_scans();
+
+    let census = app.loop_decoded;
+    assert_eq!(
+        (census.pinned, census.pinned_bytes),
+        (1, parked_price),
+        "the volume a pane is parked on has its archive behind it and is the \
+         one the ceiling may never take, priced at what the cache filed it at",
+    );
+    assert!(
+        app.loop_mgr.get_cached(SITE, &at(2)).is_some(),
+        "control: the parked volume was evicted after all, so the column \
+         above is describing something other than what the ceiling cannot \
+         reach",
+    );
+    // **Disjoint from `no_archive` by construction**, which is what lets a
+    // reader ADD the two into one floor. Overlapping columns would double
+    // count the entries that are both, and the sum would rank a lowering
+    // against a figure larger than the cache.
+    assert_eq!(
+        (census.volumes, census.no_archive),
+        (5, 4),
+        "five volumes resident, and the four with no way back are the \
+         guard's, not the ceiling's",
+    );
+    assert_eq!(
+        census.pinned + census.no_archive,
+        census.volumes,
+        "the two refusals partition this cache exactly: every resident volume \
+         is refused either for having no way back or for being pinned, and \
+         none is counted twice",
+    );
+    assert!(
+        census.pinned + census.no_archive <= census.volumes,
+        "the two refusals must partition rather than overlap",
+    );
+}
+
 /// **`0f3de05db`'s lesson, applied to this cache**: an unwanted volume another
 /// store also names frees nothing when it goes, and a level without a `sole`
 /// column would report it as a prize.

@@ -3640,6 +3640,22 @@ impl App {
         // everywhere. Said rather than papered over: a caller-level test that
         // ran under the ceiling would pass whatever these arguments were,
         // which is the shape of gate this campaign keeps finding.
+        // **One spelling of the ceiling's pin, for the pass and for the read
+        // of what the pass could not take.** The census below reports
+        // `pinned`, the floor under `LOOP_DECODED_CEILING_BYTES`, and a
+        // second spelling of this predicate is how that reading would drift
+        // from the policy it describes — the reason `decoded_keep` is already
+        // shared with it rather than restated.
+        let ceiling_pinned =
+            |site: &str, ts: &chrono::NaiveDateTime, scan: &nexrad_model::data::Scan| {
+                if settling.contains(site) {
+                    return true;
+                }
+                let collected = squallar_radar::types::volume_collected_at(scan);
+                parked
+                    .iter()
+                    .any(|&(at_site, at)| at_site == site && (at == *ts || Some(at) == collected))
+            };
         squallar_worker::offload::discard_each(
             "evicted-loop-decoded-ceiling",
             crate::volume_inventory::volume_drop_parts(self.loop_mgr.evict_decoded_to_ceiling(
@@ -3651,15 +3667,7 @@ impl App {
                         .copied()
                         .unwrap_or(u64::MAX)
                 },
-                |site, ts, scan| {
-                    if settling.contains(site) {
-                        return true;
-                    }
-                    let collected = squallar_radar::types::volume_collected_at(scan);
-                    parked.iter().any(|&(at_site, at)| {
-                        at_site == site && (at == *ts || Some(at) == collected)
-                    })
-                },
+                ceiling_pinned,
             )),
         );
         // **What the pass could not take**, censused here because here is
@@ -3669,8 +3677,11 @@ impl App {
         // rule can say that. A read, not a lever — see
         // `crate::budget_telemetry::LoopDecodedCensus`.
         if std::mem::take(&mut self.loop_decoded_due) {
-            self.loop_decoded =
-                self.loop_decoded_census(decoded_keep, chrono::Utc::now().naive_utc());
+            self.loop_decoded = self.loop_decoded_census(
+                decoded_keep,
+                ceiling_pinned,
+                chrono::Utc::now().naive_utc(),
+            );
         }
         // **The compressed cache's own bound**, in bytes rather than frames
         // because the archive swings 16.5x across the measured corpus while
