@@ -5455,12 +5455,26 @@ def wait_console_regex(session, pattern, timeout=60.0, interval=0.5):
 APP_BACKEND_PROBE = r"""
 var C = window.__rig_console || [];
 var backend = null, ceiling = null;
+var probe_lines = [];
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
   if (m.indexOf("wgpu selected the ") !== -1) backend = m;
   if (m.indexOf("plan views may reach ") !== -1) ceiling = m;
+  // The capacity probe: ONE family, SEVEN shapes, and this takes them all
+  // rather than picking one. Three crates write it -- `squallar-web`'s bridge
+  // walks WebGL2 and announces its own start and its skip, `squallar-app`
+  // reports the landing for every backend, and `gpu_probe/run.rs` has three
+  // ways of ending with no figure -- and no two of them agree on their fields.
+  // A reader holding only the success shape reports a SKIPPED probe (every
+  // Firefox/Linux WebGL2 leg) and a WebGPU landing (every Chromium leg) as an
+  // ABSENCE, which is the wrong-value-versus-absent-value confusion this rig
+  // keeps paying for. Whole lines, classified by NAME in `gpu_probe_reading`
+  // below, so a shape this list has not met yet arrives as an unclassified
+  // line rather than as silence.
+  if (m.indexOf("gpu probe") !== -1) probe_lines.push(m);
 }
-return { backend: backend, raster_ceiling: ceiling, console_total: C.length };
+return { backend: backend, raster_ceiling: ceiling,
+         gpu_probe_lines: probe_lines, console_total: C.length };
 """
 
 
@@ -5487,6 +5501,13 @@ def wait_app_backend(session, timeout=60.0, interval=0.5):
         for key in ("backend", "raster_ceiling"):
             if not found.get(key) and last.get(key):
                 found[key] = last[key]
+        # Same rule for the probe's lines, as a union in ring order: the ring
+        # evicts, the walk announces its start and its result seconds apart,
+        # and a poll that sees only one of them must not discard the other.
+        seen = found.setdefault("gpu_probe_lines", [])
+        for line in last.get("gpu_probe_lines") or []:
+            if line not in seen:
+                seen.append(line)
         found["console_total"] = last.get("console_total")
         if found.get("backend") and found.get("raster_ceiling"):
             found["waited_s"] = round(time.monotonic() - t0, 2)
@@ -5497,6 +5518,226 @@ def wait_app_backend(session, timeout=60.0, interval=0.5):
     found["error"] = ("the app never logged %s within %.0fs"
                       % (" and ".join(missing), timeout))
     return found
+
+
+# THE GPU CAPACITY PROBE'S FAMILY, all seven shapes it is written in. UNREAD BY
+# EITHER RIG HALF until 2026-09-11: `grep -rn "gpu probe" .github/` returned
+# nothing, on the arm that governs.
+#
+#   squallar-web/src/bridge.rs
+#     gpu probe (webgl2): 448 MiB ok, failed at 960 MiB, 4 steps, 812 ms, out
+#       of memory, renderer 'NVIDIA ...'[; the page's own context was lost N
+#       times inside the probe's window]
+#     gpu probe (webgl2): walking to a 1024 MiB policy cap
+#     gpu probe: skipped (backend Gl)
+#   squallar-app/src/app.rs
+#     gpu probe: 4032 MiB ok, failed at 8128 MiB, 7 steps, 812 ms, backend
+#       BrowserWebGpu[, capped]
+#   squallar-web/src/gpu_probe/run.rs
+#     gpu probe: no second adapter (<error>); the presumption stands
+#     gpu probe: no throwaway device (<error>); the presumption stands
+#     gpu probe: nothing held (N steps, N ms); the presumption stands
+#
+# WHAT WAS ALREADY READ, so this is not a second reading of one figure. The
+# `budget state:` line carries `probe (\d+)` and `budget_state_re` has read it
+# all along -- but that field is `gpu_probe_code`, a 0-6 STATE code (absent /
+# skipped / pending / empty / found / found-capped / silent-to-cap) and nothing
+# else. The capacity in MiB, the total the device refused, the allocation count,
+# the wall time, what ENDED the walk, which renderer answered, which backend
+# landed it, whether it stopped at its own bound and whether the page's own
+# context was lost inside the window are on these lines and on no other. The
+# code said a probe had happened; it could not say what it found.
+#
+# BY NAME, NEVER BY POSITION. Each field is its own anchored pattern rather than
+# a group index on one big regex: these lines have grown before, an inserted
+# field renumbers every group after it, and `native_row.py` `int()`s groups by
+# index. A field that MOVES still reads; a field that is GONE is named in
+# `unread`, never read off a neighbour and never filled with a zero.
+GPU_PROBE_FIGURES = (
+    ("ok_mib", r"\b(\d+) MiB ok\b", int),
+    ("steps", r"\b(\d+) steps\b", int),
+    ("elapsed_ms", r"\b(\d+) ms\b", int),
+)
+
+
+def _gpu_probe_figures(line, out, unread):
+    """The three figures both walked shapes spell the same way, plus the
+    `failed at` token, whose ABSENCE the producer itself defines."""
+    for name, pat, cast in GPU_PROBE_FIGURES:
+        m = re.search(pat, line)
+        if m is None:
+            out[name] = None
+            unread.append(name)
+        else:
+            out[name] = cast(m.group(1))
+    m = re.search(r"\bfailed at (\d+) MiB\b", line)
+    if m:
+        out["failed_at_mib"], out["refused"] = int(m.group(1)), True
+    elif re.search(r"\bfailed at none\b", line):
+        # NEVER REFUSED -- the device held everything it was asked for. Not the
+        # same finding as a `failed at` token this parser could not locate,
+        # which is the case below.
+        out["failed_at_mib"], out["refused"] = None, False
+    else:
+        out["failed_at_mib"], out["refused"] = None, None
+        unread.append("failed_at")
+
+
+def gpu_probe_reading(app):
+    """The GPU capacity probe's reading, out of `wait_app_backend`'s lines.
+
+    ONE family, and the SHAPE that was seen is recorded in `state`, because
+    these are different findings and a rig that cannot tell them apart reads
+    four of them as "no probe":
+
+    * `walked`   -- a figure, from either the WebGL2 line or the app's landing
+                    report. `instrument` says which produced it.
+    * `skipped`  -- a real reading, and the one EVERY Firefox/Linux WebGL2 leg
+                    takes. A reader without it calls the commonest case absent.
+    * `no_figure`-- the probe ran and held nothing; the presumption stands.
+                    `why` carries the producer's own sentence.
+    * `walking`  -- the walk announced its start and had not reported by the
+                    end of the wait. Not a capacity, and not an absence either.
+    * `absent`   -- no line of any shape. A bundle older than the family, a
+                    backend with no probe at all, or a ring that evicted it.
+
+    `read_from` names the shape the values came out of and `unread` names every
+    field this parser could not find, so "the line changed" can never be read
+    as "the device reported zero". A line carrying `gpu probe` that matches no
+    shape here lands in `unclassified` rather than being dropped.
+    """
+    lines = list((app or {}).get("gpu_probe_lines") or [])
+    out = {"state": "absent", "read_from": None, "line": None,
+           "unread": [], "unclassified": [],
+           "why": "no `gpu probe` line of any shape reached the console ring "
+                  "within the app-backend wait: a bundle from before the "
+                  "family, a backend with no probe, or a ring that evicted it. "
+                  "NOT a zero capacity."}
+    if not lines:
+        return out
+    walking = None
+    for line in lines:
+        unread = []
+        if re.search(r"gpu probe \(([a-z0-9-]+)\): \d+ MiB ok\b", line):
+            m = re.search(r"gpu probe \(([a-z0-9-]+)\):", line)
+            r = {"state": "walked", "read_from": "gpu probe (<instrument>):",
+                 "instrument": m.group(1), "line": line, "backend": None,
+                 "capped": None}
+            _gpu_probe_figures(line, r, unread)
+            # The loose arm: what ended the walk, in the producer's own words.
+            # Eight spellings today and they are prose ("no limit found up to
+            # 1024 MiB; unmeasured, the presumption stands"), so a reader that
+            # enumerated them would report the next wording as an absence.
+            # Anchored on its neighbours, never on its content.
+            m = re.search(r" ms, (.+?), renderer\b", line)
+            if m:
+                r["ended"] = m.group(1)
+            else:
+                r["ended"] = None
+                unread.append("ended")
+            m = re.search(r"\brenderer '(.*?)'", line)
+            if m:
+                r["renderer"] = m.group(1)
+            elif re.search(r"\brenderer unknown\b", line):
+                # The context reported no name. A reading, not a miss.
+                r["renderer"] = None
+            else:
+                r["renderer"] = None
+                unread.append("renderer")
+            # Emitted only above zero -- the clause cannot be written as `0` --
+            # so its absence beside a present line READS 0. That is reading the
+            # format, not defaulting to one.
+            m = re.search(r"own context was lost (\d+) times", line)
+            r["own_context_losses"] = int(m.group(1)) if m else 0
+        elif re.search(r"gpu probe: \d+ MiB ok\b", line):
+            r = {"state": "walked", "read_from": "gpu probe: <n> MiB ok, ...",
+                 "instrument": None, "line": line, "ended": None,
+                 "renderer": None, "own_context_losses": None}
+            _gpu_probe_figures(line, r, unread)
+            m = re.search(r"\bbackend ([A-Za-z0-9_]+)", line)
+            if m:
+                r["backend"] = r["instrument"] = m.group(1)
+            else:
+                r["backend"] = None
+                unread.append("backend")
+            # `, capped` means the walk stopped at its OWN bound: the figure is
+            # a FLOOR on the allowance, not the allowance. Its absence is the
+            # producer saying otherwise, so this is a boolean either way.
+            r["capped"] = line.rstrip().endswith(", capped")
+        elif "gpu probe: skipped (backend " in line:
+            m = re.search(r"gpu probe: skipped \(backend ([A-Za-z0-9_]+)\)",
+                          line)
+            r = {"state": "skipped",
+                 "read_from": "gpu probe: skipped (backend <backend>)",
+                 "backend": m.group(1) if m else None, "line": line}
+            if not m:
+                unread.append("backend")
+        elif "; the presumption stands" in line:
+            m = re.search(r"gpu probe: (.*?); the presumption stands", line)
+            r = {"state": "no_figure",
+                 "read_from": "gpu probe: <reason>; the presumption stands",
+                 "why": m.group(1) if m else None, "line": line}
+            if not m:
+                unread.append("why")
+            m = re.search(r"\((\d+) steps, (\d+) ms\)", line)
+            r["steps"] = int(m.group(1)) if m else None
+            r["elapsed_ms"] = int(m.group(2)) if m else None
+        elif "walking to a " in line:
+            m = re.search(r"walking to a (\d+) MiB policy cap", line)
+            walking = {"state": "walking",
+                       "read_from": "gpu probe (<instrument>): walking to a "
+                                    "<n> MiB policy cap",
+                       "policy_cap_mib": int(m.group(1)) if m else None,
+                       "line": line, "unread": [] if m else ["policy_cap"],
+                       "unclassified": [],
+                       "why": "the walk started and had not reported by the "
+                              "end of the app-backend wait. NOT a capacity and "
+                              "NOT an absence."}
+            continue
+        else:
+            out["unclassified"].append(line)
+            continue
+        r["unread"] = unread
+        r["unclassified"] = out["unclassified"]
+        out = r  # a terminal shape; the LAST one in ring order is the reading
+    if out["state"] == "absent" and walking is not None:
+        walking["unclassified"] = out["unclassified"]
+        return walking
+    return out
+
+
+def gpu_probe_summary(reading):
+    """One line for the leg's SUMMARY block, naming the state either way."""
+    r = reading or {}
+    st = r.get("state")
+    tail = ((" [UNREAD FIELDS: %s]" % ", ".join(r["unread"]))
+            if r.get("unread") else "")
+    tail += ((" [%d line(s) of this family matched no known shape]"
+              % len(r["unclassified"])) if r.get("unclassified") else "")
+    if st == "walked":
+        return ("%s: %s MiB ok, failed at %s, %s steps, %s ms%s%s%s%s"
+                % (r.get("instrument") or "unknown instrument", r.get("ok_mib"),
+                   ("%s MiB" % r["failed_at_mib"]) if r.get("refused")
+                   else ("none" if r.get("refused") is False else "UNREAD"),
+                   r.get("steps"), r.get("elapsed_ms"),
+                   (", %s" % r["ended"]) if r.get("ended") else "",
+                   (", renderer '%s'" % r["renderer"]) if r.get("renderer")
+                   else "",
+                   ", capped (the figure is a FLOOR)" if r.get("capped")
+                   else "",
+                   (", own context lost %d times in the window"
+                    % r["own_context_losses"])
+                   if r.get("own_context_losses") else "")) + tail
+    if st == "skipped":
+        return ("skipped (backend %s) -- a reading, not an absence"
+                % r.get("backend")) + tail
+    if st == "no_figure":
+        return ("no figure -- %s; the presumption stands"
+                % r.get("why")) + tail
+    if st == "walking":
+        return ("WALKING to a %s MiB cap and unreported: %s"
+                % (r.get("policy_cap_mib"), r.get("why"))) + tail
+    return ("ABSENT: %s" % r.get("why")) + tail
 
 
 def app_backend_name(app):
@@ -8089,6 +8330,138 @@ def selftest_external_pngs():
     return failed
 
 
+def selftest_gpu_probe_reading():
+    """Executable pins on `gpu_probe_reading`. Returns the number failed.
+
+    The family had NO reader in either rig half until 2026-09-11, so there is no
+    history of it to trust and every shape is pinned here -- including the four
+    a reader written for the success line alone would have reported as "no
+    probe": the skip every Firefox/Linux leg takes, the landing report every
+    WebGPU leg writes, the three no-figure endings, and a walk that had not
+    reported yet.
+    """
+    failed = 0
+
+    def pin(name, ok):
+        nonlocal failed
+        print("[self-test] %s %s" % ("ok  " if ok else "FAIL", name))
+        if not ok:
+            failed += 1
+
+    def read(*lines):
+        return gpu_probe_reading({"gpu_probe_lines": list(lines)})
+
+    GL = ("gpu probe (webgl2): 448 MiB ok, failed at 960 MiB, 4 steps, 812 ms, "
+          "out of memory, renderer 'NVIDIA GeForce RTX 3080/PCIe/SSE2'")
+    SILENT = ("gpu probe (webgl2): 1024 MiB ok, failed at none, 9 steps, "
+              "1503 ms, no limit found up to 1024 MiB; unmeasured, the "
+              "presumption stands, renderer unknown")
+    LOST = GL + ("; the page's own context was lost 3 times inside the probe's "
+                 "window")
+    START = "gpu probe (webgl2): walking to a 1024 MiB policy cap"
+    WEBGPU = ("gpu probe: 4032 MiB ok, failed at 8128 MiB, 7 steps, 812 ms, "
+              "backend BrowserWebGpu")
+    CAPPED = ("gpu probe: 8192 MiB ok, failed at none, 8 steps, 1900 ms, "
+              "backend BrowserWebGpu, capped")
+    SKIPPED = "gpu probe: skipped (backend Gl)"
+    NOTHING = ("gpu probe: nothing held (3 steps, 41 ms); the presumption "
+               "stands")
+    NOADAPTER = ("gpu probe: no second adapter (requestAdapter returned null); "
+                 "the presumption stands")
+
+    r = read(START, GL)
+    pin("the WebGL2 walk yields every figure the state code cannot carry",
+        r["state"] == "walked" and r["instrument"] == "webgl2"
+        and r["ok_mib"] == 448 and r["failed_at_mib"] == 960
+        and r["refused"] is True and r["steps"] == 4
+        and r["elapsed_ms"] == 812 and r["ended"] == "out of memory"
+        and r["renderer"] == "NVIDIA GeForce RTX 3080/PCIe/SSE2"
+        and r["own_context_losses"] == 0 and r["unread"] == []
+        and r["unclassified"] == [])
+
+    r = read(SILENT)
+    pin("`failed at none` is NEVER REFUSED, not an unread field",
+        r["failed_at_mib"] is None and r["refused"] is False
+        and "failed_at" not in r["unread"])
+    pin("the ending is carried in the producer's own words, commas and "
+        "semicolon included",
+        r["ended"] == "no limit found up to 1024 MiB; unmeasured, the "
+                      "presumption stands")
+    pin("`renderer unknown` reads as no name rather than as unread",
+        r["renderer"] is None and "renderer" not in r["unread"])
+
+    r = read(LOST)
+    pin("the page's own context losses inside the probe window are read",
+        r["own_context_losses"] == 3 and r["ok_mib"] == 448)
+
+    r = read(WEBGPU)
+    pin("the app's LANDING report is the same family, not an absence -- it is "
+        "what every WebGPU leg writes",
+        r["state"] == "walked" and r["backend"] == "BrowserWebGpu"
+        and r["ok_mib"] == 4032 and r["failed_at_mib"] == 8128
+        and r["steps"] == 7 and r["elapsed_ms"] == 812
+        and r["capped"] is False and r["unread"] == [])
+    r = read(CAPPED)
+    pin("`, capped` says the figure is a FLOOR, and its absence says it is not",
+        r["capped"] is True and r["refused"] is False
+        and read(WEBGPU)["capped"] is False)
+
+    r = read(SKIPPED)
+    pin("a SKIPPED probe is a reading and names its backend -- the commonest "
+        "case on the governing arm",
+        r["state"] == "skipped" and r["backend"] == "Gl" and r["unread"] == [])
+
+    r = read(NOTHING)
+    pin("`nothing held` is a ran-and-found-nothing reading with its own "
+        "figures, not a capacity and not an absence",
+        r["state"] == "no_figure" and r["why"] == "nothing held (3 steps, "
+        "41 ms)" and r["steps"] == 3 and r["elapsed_ms"] == 41)
+    r = read(NOADAPTER)
+    pin("and so is a probe that never got an adapter, with the producer's own "
+        "reason",
+        r["state"] == "no_figure"
+        and r["why"] == "no second adapter (requestAdapter returned null)"
+        and r["steps"] is None)
+
+    r = read(START)
+    pin("a walk that started and never reported is WALKING, not a capacity and "
+        "not an absence",
+        r["state"] == "walking" and r["policy_cap_mib"] == 1024
+        and "NOT an absence" in r["why"])
+
+    r = read()
+    pin("no line of any shape is ABSENT with a reason, never a zero capacity",
+        r["state"] == "absent" and r["line"] is None
+        and "NOT a zero capacity" in r["why"])
+    pin("and the five states are five distinct values, not one falsy reading",
+        len({read(GL)["state"], read(SKIPPED)["state"], read(NOTHING)["state"],
+             read(START)["state"], read()["state"]}) == 5)
+
+    # A shape this list has not met is KEPT, not dropped: the next spelling
+    # must reach a reader as an unclassified line, never as silence.
+    r = read("gpu probe: some wording nobody has written yet", SKIPPED)
+    pin("a `gpu probe` line matching no known shape is carried as "
+        "unclassified",
+        r["state"] == "skipped" and len(r["unclassified"]) == 1)
+
+    # The property that makes "by name" worth the extra patterns, CHECKED
+    # rather than claimed.
+    GROWN = GL.replace("448 MiB ok,", "448 MiB ok, 2 shapes refused,")
+    r = read(GROWN)
+    pin("a field inserted mid-line moves no other field's reading",
+        r["ok_mib"] == 448 and r["steps"] == 4 and r["elapsed_ms"] == 812
+        and r["failed_at_mib"] == 960 and r["unread"] == [])
+
+    # And the other half: a field that is GONE is NAMED, not filled from a
+    # neighbour. A reader answering 812 for `steps` here would be the
+    # wrong-value-for-absent-value failure in its purest form.
+    r = read(GL.replace(" 4 steps,", ""))
+    pin("a field removed from the line reads as UNREAD, never off a neighbour",
+        r["steps"] is None and r["unread"] == ["steps"]
+        and r["elapsed_ms"] == 812)
+    return failed
+
+
 def selftest():
     failures = []
     if selftest_loop_or_refusal():
@@ -8100,6 +8473,9 @@ def selftest():
         failures.append("page/driver clock guard (see [self-test] lines)")
     if selftest_sample_probe_patterns():
         failures.append("sample-probe patterns (see [self-test] lines)")
+    if selftest_gpu_probe_reading():
+        failures.append("gpu capacity probe reading "
+                        "(see [self-test] lines)")
     failures += selftest_android()
     failures += selftest_adapters()
     failures += selftest_tile_cache_settles()
@@ -9551,6 +9927,8 @@ def run_smoke(args):
     for key in ("backend", "raster_ceiling"):
         if app.get(key):
             print("[%s] SUMMARY [%s]   %s" % (tag, alabel, app[key]))
+    print("[%s] SUMMARY [%s] gpu capacity probe: %s"
+          % (tag, alabel, gpu_probe_summary(gpu_probe_reading(app))))
     wa = result.get("webgpu_adapter") or classify_webgpu_adapter(wg)
     if v.get("hardware_ok") is False:
         print("[%s] SUMMARY HARDWARE ARM FAILED: WebGL adapter is %s, WebGPU "
