@@ -754,6 +754,33 @@ impl super::Gui {
     fn capture_preset(&self, name: String) -> PresetConfig {
         let finite = |e: f32| if e.is_finite() { e } else { 0.0 };
         let active = self.active_pane();
+        // **Shrunk, because this list is kept.** The `collect` is an in-place
+        // one — `Filter` is `InPlaceIterable`, the source is an owned
+        // `Vec<LayerId>` and the element type does not change, so alignment
+        // and size both permit the specialisation — which writes the
+        // survivors over the front of the registry's own buffer and hands
+        // that buffer on as the preset's. Its capacity is then one slot per
+        // *registered* layer however few the pane had ticked, and the preset
+        // is retained in `Gui::presets` and written to the config file.
+        // Measured through `capture_preset` at the app's 18 registrations
+        // with 8 ticked: 18 slots, 432 B of buffer for 192 B of ids.
+        //
+        // `shrink_to_fit` and not `Vec::with_capacity`: the survivor count is
+        // not known before the walk, so a destination sized for the source is
+        // exactly as wide as leaving it alone. Measured at 18 registered / 8
+        // kept (release, grants on the calling thread): leaving it alone 0
+        // grants and 432 B; shrinking 1 grant and 192 B; `with_capacity` +
+        // `extend` 1 grant and still 432 B; `Vec::new` + `extend` 2 grants
+        // for the same 192 B. `383cd8dfb` refused a shrink on a transient it
+        // doubled; nothing doubles here — the shrink only ever narrows a
+        // buffer the collect already owns.
+        let mut overlays: Vec<LayerId> = self
+            .overlays
+            .default_draw_order()
+            .into_iter()
+            .filter(|kind| active.is_overlay_enabled(kind))
+            .collect();
+        overlays.shrink_to_fit();
         PresetConfig {
             name,
             pane_count: self.pane_layout.pane_count,
@@ -765,13 +792,7 @@ impl super::Gui {
                     elevation: finite(pane.selected_elevation()),
                 })
                 .collect(),
-            overlays: self
-                .overlays
-                .default_draw_order()
-                .into_iter()
-                .filter(|kind| active.is_overlay_enabled(kind))
-                .collect::<Vec<_>>()
-                .into(),
+            overlays: overlays.into(),
         }
     }
 
@@ -954,3 +975,7 @@ fn preset_hover(registry: &OverlayRegistry, preset: &PresetConfig) -> String {
         products.join(" - ")
     )
 }
+
+#[path = "ui_catalog/preset_overlay_capacity_tests.rs"]
+#[cfg(test)]
+mod preset_overlay_capacity_tests;
