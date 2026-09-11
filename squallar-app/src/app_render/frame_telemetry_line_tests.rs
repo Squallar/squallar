@@ -2268,11 +2268,20 @@ fn every_instance_scoped_telemetry_family_is_claimed_by_a_probe_or_a_reason() {
         /// Read by these `drive.py` probes, each of which **spells its
         /// instance**. Only the names spelled reach a leg.
         ByTheseInstances(&'static [&'static str]),
+        /// Harvested WHOLE by `drive.py`'s console probe — an
+        /// `indexOf("<family>")` rather than a `var …_re` — and classified in
+        /// the named `drive.py` Python reader, which `native_row.py` imports
+        /// so the two halves cannot disagree about one leg. The instance is
+        /// read by name out of the whole row, so every instance is read and
+        /// none of `NAME_GROUP`'s lowercase-only limits apply: this is the
+        /// only claim that can honestly cover a family whose instances carry
+        /// spaces, as `rasterization worker` and `tile lane` do.
+        ByWholeLine(&'static str),
         /// **No rig pattern in either half**, and the string is why that is
         /// currently tolerated.
         Unread(&'static str),
     }
-    use Claim::{ByAnyInstance, ByTheseInstances, Unread};
+    use Claim::{ByAnyInstance, ByTheseInstances, ByWholeLine, Unread};
 
     /// The generic name group every `ByAnyInstance` probe must carry, spelled
     /// once. A probe whose group is narrower silently drops the instances it
@@ -2282,12 +2291,13 @@ fn every_instance_scoped_telemetry_family_is_claimed_by_a_probe_or_a_reason() {
     /// may only FALL — `arch_ratchets`' discipline, for its reason.
     ///
     /// **Ten when the gate was written; nine because `grid narrowing (…)` got
-    /// its reader in the same change.** On a rebase, RE-COUNT the `Unread`
-    /// arms in the table and set this to what they come to — never
-    /// old-minus-one, which merges clean with another lane's shed and leaves
-    /// the ceiling one above the tree, so the next unread family costs
-    /// nothing.
-    const INSTANCE_UNREAD_CEILING: usize = 9;
+    /// its reader in the same change; eight because `process memory (…)` got
+    /// one.** On a rebase, RE-COUNT the `Unread` arms in the table and set
+    /// this to what they come to — never old-minus-one, which merges clean
+    /// with another lane's shed and leaves the ceiling one above the tree, so
+    /// the next unread family costs nothing. Counted on the table below and
+    /// not inferred: eight.
+    const INSTANCE_UNREAD_CEILING: usize = 8;
     /// A floor under the extraction, so a rename of the formatters that makes
     /// it match *nothing* fails loudly instead of passing over an empty list.
     ///
@@ -2393,11 +2403,19 @@ fn every_instance_scoped_telemetry_family_is_claimed_by_a_probe_or_a_reason() {
             Unread("the same bytes along the state axis; unclaimed with it"),
         ),
         (
+            // `Census::unaccounted` and the `live` its own doc requires be
+            // printed beside it. Harvested whole rather than through a
+            // `var …_re`, deliberately: this row's instances are `page`,
+            // `rasterization worker`, `tile lane` and `process`, two of which
+            // carry a SPACE, so `NAME_GROUP` could not match them and a
+            // `ByAnyInstance` claim would be false for exactly the instances
+            // it claims to cover. Whole-line harvesting also keeps every
+            // figure read BY NAME, which this row needs more than most: its
+            // tail is conditional (`rss unread` on every web target,
+            // `breakdown unwalked` before a walk lands), so a positional
+            // probe's groups are not even in the same places on two targets.
             "process memory",
-            Unread(
-                "rss and the live/peak pair; the campaign reads these off a \
-                 native ledger rather than a leg",
-            ),
+            ByWholeLine("unaccounted_reading"),
         ),
     ];
 
@@ -2500,6 +2518,32 @@ fn every_instance_scoped_telemetry_family_is_claimed_by_a_probe_or_a_reason() {
                          be caught"
                     );
                 }
+            }
+            ByWholeLine(reader) => {
+                // The harvest, in the page-side probe. Without it the reader
+                // is never fed a line and the family reaches every leg as an
+                // absence — which is exactly what this table would then be
+                // claiming it does not.
+                let harvest = format!("indexOf(\"{family}\")");
+                assert!(
+                    DRIVE_PY.contains(&harvest),
+                    "`{family} (<name>):` is claimed as harvested whole and \
+                     drive.py's console probe carries no `{harvest}`. The \
+                     reader would be handed nothing and the family would reach \
+                     every leg as an absence, whose documented meaning is a \
+                     binary that never wrote the row"
+                );
+                // And the classifier it is handed to. `native_row.py` imports
+                // this by name (`drive_module().{reader}`), so a rename here
+                // that misses that call site takes the native half down at
+                // run time and nothing else would say so.
+                let def = format!("def {reader}(");
+                assert!(
+                    DRIVE_PY.contains(&def),
+                    "`{family} (<name>):` is claimed as classified by \
+                     `{reader}` and drive.py declares no `{def}…`. Both rig \
+                     halves call it by that name"
+                );
             }
             Unread(reason) => {
                 assert!(

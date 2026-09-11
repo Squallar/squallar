@@ -3840,11 +3840,28 @@ var budget_pressure_lines = [];
 // rather than differing is the whole diagnosis. A harvest that collapsed a
 // repeat would erase it.
 var telemetry_posture_lines = [];
+// THE PROCESS-MEMORY ROW, whole lines, IN RING ORDER, classified by name in
+// `unaccounted_reading` below rather than page-side. It carries
+// `Census::unaccounted` -- the figure the census exists to produce, and the
+// only reading of the heap a native arm has at all, `byteLength` being a web
+// thing. UNREAD BY EITHER RIG HALF until 2026-09-11.
+//
+// A LEVEL and not an event, unlike the two families above, so the LAST row of
+// an instance is the reading -- but every row is kept, because the three
+// states this figure takes are a TALLY and the last tick cannot say whether
+// the families' double-count is the common case or a rarity.
+//
+// The harvest literal is `process memory` and NOT `process memory (`: a
+// producer that dropped the parenthesised instance must reach the classifier
+// as an unclassified line, which is a reader breakage, and not as an absence,
+// whose documented meaning is a binary that never wrote the row.
+var process_memory_lines = [];
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
   var t = C[i].t;
   if (m.indexOf("pressure:") !== -1) budget_pressure_lines.push(m);
   if (m.indexOf("telemetry posture:") !== -1) telemetry_posture_lines.push(m);
+  if (m.indexOf("process memory") !== -1) process_memory_lines.push(m);
   var x = svc_interact_re.exec(m);
   if (x) {
     interact = { t: t, n: parseInt(x[1], 10), p50: x[2], p90: x[3],
@@ -4250,6 +4267,7 @@ return { interact: interact, idle: idle, segments: segments, prep: prep,
          marks_total: (MK ? MK.length : -1),
          budget_pressure_lines: budget_pressure_lines,
          telemetry_posture_lines: telemetry_posture_lines,
+         process_memory_lines: process_memory_lines,
          console_total: C.length };
 """
 
@@ -4877,6 +4895,11 @@ class FrameLineWatcher:
         # union would report the contract shape as one emission and a reader
         # taking the count would then call a healthy leg a lifecycle bug.
         self.posture_lines = []
+        # The `process memory (<instance>):` rows, in ring order, with their
+        # multiplicity kept. A LEVEL family and still a list: the tally of
+        # which of `unaccounted`'s states each tick took is the reading a
+        # campaign wants, and `[-1]` here would throw it away.
+        self.process_memory_lines = []
         self.last = {}
 
     def poll(self):
@@ -4923,6 +4946,13 @@ class FrameLineWatcher:
             self.pressure_lines, sig.get("budget_pressure_lines") or [])
         self.posture_lines = _merge_ring_lines(
             self.posture_lines, sig.get("telemetry_posture_lines") or [])
+        # A third, unioned the same way. The row is written on EVERY
+        # telemetry tick, so unlike the two above the ring holds many of them
+        # and the overlap union is what keeps a tick from being counted twice
+        # across polls -- which would corrupt the state tally, not just a
+        # multiplicity.
+        self.process_memory_lines = _merge_ring_lines(
+            self.process_memory_lines, sig.get("process_memory_lines") or [])
         self.last = sig
         return sig
 
@@ -6173,6 +6203,413 @@ def budget_pressure_summary(reading):
                                           r.get("held_distinct"), "line(s)"),
                    r.get("why"))) + tail
     return ("ABSENT: %s" % r.get("why")) + tail
+
+
+# THE UNACCOUNTED RANGE -- `Census::unaccounted`
+# (`squallar-egui/src/heap_census.rs:951`), UNREAD BY EITHER RIG HALF until
+# 2026-09-11: `grep -c unaccounted` returned 0 over both this file and
+# `native_row.py`, so no leg has ever carried a reading of it.
+#
+# WHAT IT IS, in the producer's own words: "every family nobody has thought to
+# count yet, plus whatever the census prices at zero". It is NOT an error
+# term, and "a caller printing it must print `live` beside it" -- which is why
+# `live` rides in this reading and in every line of the summary below.
+#
+# ONE crate writes it, one formatter, one `match`:
+# `write_process_line()` at `squallar-egui/src/heap_census.rs:1459`, reached on
+# the telemetry tick as instance `page` (`squallar-app/src/app_render.rs:4050`,
+# `log::info!` when the tick is loud) and from the native sampler thread as
+# instance `process` (`heap_census.rs:1339`, `log::debug!` on the walk's
+# cadence). `serve.py` hooks the console into `window.__rig_console`, so on a
+# browser leg the line reaches the ring; on a native leg it is a log line with
+# env_logger's preamble in front of it.
+#
+# TWO STRINGS AND FOUR STATES, and the second string is the important one.
+#
+#   ..., families <F> B floor <L> B, unaccounted <least> B to <most> B
+#   ..., families <F> B floor <L> B, unaccounted none (families price above live)
+#
+# `.0` is `live - resident_total` (the LEAST that can be unaccounted, the
+# families being an upper bound) and `.1` is `live - resident_floor` (the
+# MOST). Both are `checked_sub`, so either is `None` where the families price
+# ABOVE `live` -- "a real state when the radar families double-count, and
+# exactly the reading that says the upper bound is doing so". The producer
+# collapses every `None` combination into the ONE `none` string, and a reader
+# that stops there reports the worst state as the best one: `none` does NOT
+# mean zero unaccounted.
+#
+# It does not have to stop there. BOTH arms print `families`
+# (`resident_total`) and `floor` (`resident_floor`) unconditionally, and
+# `live` is on the same row, so the two ends are RECOVERABLE from published
+# fields on the `none` arm:
+#
+#   live <  families, live >= floor   the upper bound double-counts and the
+#                                     floor does not. `most = live - floor` is
+#                                     a valid bound and this reader DERIVES it
+#                                     -- `most_source` says `derived`, never
+#                                     `published`. The ordinary radar
+#                                     double-count case.
+#   live <  floor                     EVEN THE FLOOR prices above the
+#                                     allocator. A much stronger statement
+#                                     about the census, and not a degenerate
+#                                     case of the one above.
+#
+# `(Some, None)` -- `live >= families` while `live < floor` -- needs
+# `floor > families`, and that is **UNOBSERVED, not unreachable**: 0 of
+# 112,174 archived process samples. `floor <= families` reduces to
+# `radar shared <= sum(the five smaller radar families) + rasters shared`,
+# which is CONTINGENT and not an identity, because `radar shared` is
+# `published - union` and carries the loop cache's own internal duplication.
+# So this reader neither writes a text for the shape nor asserts it cannot
+# happen: it records a CONTRADICTION and keeps the end that IS derivable. A
+# reader that silently bucketed it would throw away the one observation that
+# would settle the question.
+#
+# BY NAME, NEVER BY POSITION. `native_row.py` `int()`s probe groups by index
+# and this line's first group is not even on the same target twice -- the
+# breakdown collapses to `rss unread` wherever there is no `/proc`, which is
+# every web target. Each field is its own anchored pattern, so a field that
+# MOVES still reads and a field that is GONE is NAMED.
+#
+# The head is `process memory` and NOT `process memory (`: a producer that
+# dropped the parenthesised instance must reach this reader as an
+# `unclassified` line, which is a reader breakage, and not as an ABSENCE,
+# whose documented meaning is a binary that never wrote the row.
+UNACCOUNTED_HEAD = "process memory ("
+
+# Anchored on the words either side rather than on an offset, and `live` most
+# of all: the same row ends `, rss over live 2000 B` on a native leg, so a
+# bare `live (\d+) B` reads the RSS residual as the allocator's live bytes --
+# the wrong-value form, on the field every other figure here is quoted
+# against.
+UNACCOUNTED_FIGURES = (
+    ("live", r"process memory \([^)]*\): live (\d+) B", int),
+    ("live_peak", r", live peak (\d+) B", int),
+    ("peak_large_blocks", r", peak large blocks (\d+)\b", int),
+    # `families` and `floor` sit in one clause and each is anchored on the
+    # other, so neither can read off a neighbouring figure.
+    ("families", r", families (\d+) B floor \d+ B", int),
+    ("floor", r", families \d+ B floor (\d+) B", int),
+)
+
+# The spellings of the figure itself, as a TABLE rather than a chain, because
+# a third one is written and waiting for a board. Neither is anchored at the
+# END of the line: the row grows a `; rss ...` group on a native leg and a
+# `; breakdown unwalked` one before a walk has landed, and a `$` here would
+# read every native tick as unreadable.
+#
+# **The third arm is ONE ENTRY HERE plus one branch in `_unaccounted_row`,
+# never a rewrite.** It is on a peer branch and NOT on main as of `4eb7e33d9`
+# (`grep -c "unaccounted at most"` over `heap_census.rs` returns 0), and it
+# publishes the very end this reader derives today:
+#
+#   , families {} B floor {} B, unaccounted at most {most} B (families price
+#   above live; the floor does not)
+#
+# so when it lands the branch reads `most` as PUBLISHED and the pin worth
+# writing is that the published figure equals the `live - floor` this reader
+# would have derived. Until then the two texts below are byte-unchanged and
+# this reader is written against main.
+UNACCOUNTED_CLAUSES = (
+    ("range", re.compile(r", unaccounted (\d+) B to (\d+) B")),
+    ("none", re.compile(
+        r", unaccounted none \(families price above live\)")),
+)
+
+
+def _unaccounted_row(line):
+    """One `process memory (<instance>):` row, classified on its own.
+
+    Returns the row's fields plus `state`, `contradictions` and `unread`. The
+    two `*_source` keys say whether an end was PUBLISHED by the producer or
+    DERIVED here, because a derived figure presented as a published one is a
+    claim about the app that the app did not make.
+    """
+    r = {"line": line, "instance": None, "state": "unreadable",
+         "live": None, "live_peak": None, "peak_large_blocks": None,
+         "families": None, "floor": None,
+         "least": None, "most": None,
+         "least_source": None, "most_source": None,
+         "read_from": None, "unread": [], "contradictions": [],
+         "why": "a `process memory` row is here and carries neither "
+                "`unaccounted <n> B to <n> B` nor `unaccounted none "
+                "(families price above live)`: the clause was reworded or "
+                "removed. NOT an absent row and NOT a zero."}
+    head = re.search(r"process memory \(([^)]*)\): ", line)
+    if head:
+        r["instance"] = head.group(1)
+    for name, pat, cast in UNACCOUNTED_FIGURES:
+        m = re.search(pat, line)
+        if m is None:
+            r["unread"].append(name)
+        else:
+            r[name] = cast(m.group(1))
+    seen = [(name, pat.search(line)) for name, pat in UNACCOUNTED_CLAUSES]
+    seen = [(name, m) for name, m in seen if m is not None]
+    if len(seen) > 1:
+        r["contradictions"].append("both_unaccounted_spellings_on_one_row")
+    spelling, rng = (seen[0] if seen else (None, None))
+    r["read_from"] = spelling
+    live, fam, flr = r["live"], r["families"], r["floor"]
+    # **`live 0 B` MEANS THE BINARY HAS NO COUNTING ALLOCATOR**, and it is
+    # checked before either arm is believed. `sample_process` publishes
+    # `squallar_alloc::live_bytes().unwrap_or(0)`
+    # (`squallar-egui/src/heap_census.rs:1289`) and `live_bytes` returns
+    # `None` while `PEAK` is zero (`squallar-alloc/src/lib.rs:583`), so an
+    # uninstrumented build prints `live 0 B` on every tick -- and
+    # `unaccounted(0)` is then `(None, None)` on every tick, which is
+    # BYTE-IDENTICAL to the census's most alarming reading.
+    #
+    # A binary that measured nothing and a census in its worst state are one
+    # string apart and only `live` separates them. This is not a reading about
+    # the heap at all and must not be reported as one.
+    if seen and live == 0:
+        r["state"] = "no_counting_allocator"
+        r["why"] = ("`live 0 B`: this binary has no counting allocator "
+                    "installed (or has never allocated), so "
+                    "`live_bytes()` was `None` and the row printed the "
+                    "`unwrap_or(0)`. Every `checked_sub` against it fails, so "
+                    "the row takes the `none` arm on every tick for a reason "
+                    "that is nothing to do with the census. NOT a reading of "
+                    "the heap, NOT a double-count, and NOT the floor pricing "
+                    "above the allocator.")
+    elif spelling == "range":
+        r["state"] = "range"
+        r["least"], r["most"] = int(rng.group(1)), int(rng.group(2))
+        r["least_source"] = r["most_source"] = "published"
+        r["why"] = ("both ends of the range were published: `live` exceeds "
+                    "the families at both of their ends.")
+        # The published ends against the published fields they are made of.
+        # This cannot fail while one formatter writes all three, and that is
+        # the point: it is the check that says so, and it is the only thing
+        # that would notice this reader reading `families` off the wrong
+        # clause.
+        if live is not None and fam is not None and r["least"] != live - fam:
+            r["contradictions"].append("published_least_is_not_live_minus_families")
+        if live is not None and flr is not None and r["most"] != live - flr:
+            r["contradictions"].append("published_most_is_not_live_minus_floor")
+    elif spelling == "none":
+        if live is None or fam is None or flr is None:
+            r["state"] = "none_unreadable"
+            r["why"] = ("the row says `unaccounted none` and `live`, "
+                        "`families` or `floor` did not read, so WHICH of the "
+                        "two none-states this is cannot be recovered. NOT a "
+                        "zero and NOT an absence.")
+        elif live >= fam and live >= flr:
+            r["state"] = "none_contradictory"
+            r["contradictions"].append("none_printed_while_both_ends_subtract")
+            r["why"] = ("the row says `unaccounted none` while `live` is at "
+                        "or above BOTH `families` and `floor`, so the "
+                        "producer's two `checked_sub`s would both have "
+                        "succeeded. One of the three figures on this row is "
+                        "not what this reader thinks it is.")
+        elif live >= fam:
+            # `live >= families` with `live < floor`, which needs
+            # `floor > families`: the `(Some, None)` shape the arithmetic
+            # above says cannot happen. Reported, never bucketed.
+            r["state"] = "none_contradictory"
+            r["contradictions"].append("floor_prices_above_families")
+            r["least"] = live - fam
+            r["least_source"] = "derived"
+            r["why"] = ("the row says `unaccounted none` with `live` at or "
+                        "above `families` but below `floor`, which requires "
+                        "`floor > families`. `resident_floor` is documented "
+                        "and derived to be at or below `resident_total`, so "
+                        "this row falsifies that. The LEAST end is derivable "
+                        "and is derived here.")
+        elif live >= flr:
+            r["state"] = "none_ceiling_above_live"
+            r["most"] = live - flr
+            r["most_source"] = "derived"
+            r["why"] = ("the families' UPPER BOUND prices above `live` and "
+                        "their floor does not -- the radar double-count the "
+                        "producer's doc names. The most that can be "
+                        "unaccounted is still a real bound and is DERIVED "
+                        "here as `live - floor`; the least is not "
+                        "recoverable. NOT zero unaccounted.")
+        else:
+            r["state"] = "none_floor_above_live"
+            r["why"] = ("EVEN THE FLOOR prices above `live`: the "
+                        "de-duplicated lower bound on what the census can "
+                        "see exceeds what the allocator says is live. "
+                        "Neither end is recoverable, and this is a stronger "
+                        "statement about the census than the double-count "
+                        "above it, not a degenerate case of it.")
+    return r
+
+
+def _unaccounted_compact(r):
+    """A row without its raw line, for the per-tick list on the artifact."""
+    return {k: r[k] for k in ("state", "read_from", "live", "families",
+                              "floor", "least", "most", "least_source",
+                              "most_source", "contradictions")}
+
+
+def unaccounted_reading(lines):
+    """`Census::unaccounted` off a leg's `process memory (<instance>):` rows.
+
+    PER INSTANCE, always. The page and the worker are two heaps under two
+    ceilings and the producer's own doc says to always match the instance; a
+    figure from the wrong one is worse than no figure. `instances` carries one
+    reading each and the top level mirrors the headline instance -- `page`
+    where it is present, since that is the tick both targets write, else the
+    first present name in sorted order. `headline_instance` says which, so no
+    one quotes the reading of a heap they did not mean.
+
+    Per instance, the reading is the LAST row (these are levels, not running
+    totals) plus the whole leg's TALLY:
+
+    * `tick_count`   -- how many rows of this instance were seen.
+    * `state_counts` -- how many of each state, so "is the double-count the
+                        common case or a rarity" is answered by any leg that
+                        was going to run anyway, rather than by the last tick.
+    * `distinct`     -- how many DIFFERENT things those rows said, counted
+                        over the family's own payload and not the raw string:
+                        a native row carries env_logger's timestamp, and a
+                        distinct-count over the whole line counts CLOCK TICKS.
+    * `ticks`        -- every row's figures, without its raw line.
+
+    States, and they are eight distinct values rather than one falsy reading:
+
+    * `no_counting_allocator`  -- `live 0 B`. The binary has no counting
+                                  allocator, so the row takes the `none` arm
+                                  on every tick for a reason that is nothing
+                                  to do with the census. Checked FIRST,
+                                  because it is one string away from the
+                                  worst state below and only `live` separates
+                                  them.
+    * `range`                  -- both ends published.
+    * `none_ceiling_above_live` -- `none`, the upper bound double-counts, the
+                                  floor does not. `most` is DERIVED here.
+    * `none_floor_above_live`  -- `none`, even the floor prices above `live`.
+    * `none_contradictory`     -- `none` in a combination the producer's two
+                                  `checked_sub`s could not have produced.
+                                  `contradictions` names which.
+    * `none_unreadable`        -- `none` and the fields needed to refine it
+                                  did not read.
+    * `unreadable`             -- a `process memory` row with neither
+                                  spelling of the clause on it.
+    * `absent`                 -- no row at all. NOT a measured zero: a
+                                  binary older than the line, a ring that
+                                  evicted it, or a tick that never ran.
+
+    `read_from` names which spelling of the clause the reading came out of, so
+    a producer that grows a third arm cannot reach a leg as a silent fallback.
+
+    `0` is none of these: `unaccounted 0 B to 0 B` is a `range` whose ends are
+    both zero, and it is a real measurement.
+    """
+    absent = {
+        "state": "absent", "headline_instance": None, "instance": None,
+        "line": None, "live": None, "live_peak": None,
+        "peak_large_blocks": None, "families": None, "floor": None,
+        "least": None, "most": None, "least_source": None,
+        "most_source": None, "read_from": None, "unread": [],
+        "contradictions": [], "tick_count": 0, "state_counts": {}, "distinct": 0, "ticks": [],
+        "why": "no `process memory` row of any shape reached this reader: "
+               "the bundle predates the line, the telemetry tick never ran, "
+               "or the console ring evicted every one. NOT a measured zero "
+               "and NOT proof the census accounts for the heap.",
+    }
+    per, unclassified = {}, []
+    for line in lines or []:
+        if "process memory" not in line:
+            unclassified.append(line)
+            continue
+        row = _unaccounted_row(line)
+        if row["instance"] is None:
+            # The head is there and the instance clause is not: a reader
+            # breakage, kept apart from an absent family.
+            unclassified.append(line)
+            continue
+        per.setdefault(row["instance"], []).append(row)
+    instances = {}
+    for name, rows in sorted(per.items()):
+        out = dict(rows[-1])
+        counts = {}
+        for row in rows:
+            counts[row["state"]] = counts.get(row["state"], 0) + 1
+        out["state_counts"] = counts
+        out["tick_count"] = len(rows)
+        # The family's own payload, not the raw line: `_pressure_payload` is
+        # family-agnostic despite its name and is shared here for exactly the
+        # reason it documents -- the native half hands this classifier a line
+        # with env_logger's preamble in front of it, and a variety count over
+        # the raw string would count clock ticks.
+        out["distinct"] = len(
+            {_pressure_payload(row["line"], UNACCOUNTED_HEAD) for row in rows})
+        out["contradiction_ticks"] = sum(1 for row in rows
+                                         if row["contradictions"])
+        out["ticks"] = [_unaccounted_compact(row) for row in rows]
+        instances[name] = out
+    if not instances:
+        out = dict(absent)
+        out["instances"] = {}
+        out["unclassified"] = unclassified
+        if unclassified:
+            out["state"] = "unreadable"
+            out["why"] = ("%d line(s) carry `process memory` and none of them "
+                          "carries a `(<instance>): ` clause this reader "
+                          "could read. That is a reader or producer "
+                          "breakage, NOT an absent family."
+                          % len(unclassified))
+        return out
+    headline = "page" if "page" in instances else sorted(instances)[0]
+    out = dict(instances[headline])
+    out["headline_instance"] = headline
+    out["instances"] = instances
+    out["unclassified"] = unclassified
+    return out
+
+
+def _unaccounted_end(value, source):
+    """One end, with WHERE IT CAME FROM attached, or why it is missing.
+
+    Never a bare number: the `none` arm's recoverable end is arithmetic this
+    reader did, and presenting it the way a published end is presented would
+    put a figure in the app's mouth that the app refused to print.
+    """
+    if value is None:
+        return "unrecoverable"
+    return "%s B (%s)" % (value, source)
+
+
+def unaccounted_summary(reading):
+    """One line per instance for the leg's SUMMARY block.
+
+    `live` is on every one of them, because the producer's doc requires it of
+    any caller that prints this figure and a range without its denominator is
+    uninterpretable. The two ends are printed SEPARATELY and never collapsed
+    to one number or a midpoint -- the width between them IS the reading.
+    """
+    r = reading or {}
+    instances = r.get("instances") or {}
+    tail = ((" [%d line(s) carrying `process memory` were unclassified]"
+             % len(r["unclassified"])) if r.get("unclassified") else "")
+    if not instances:
+        return ("%s: %s" % (str(r.get("state", "absent")).upper(),
+                            r.get("why"))) + tail
+    rows = []
+    for name, x in sorted(instances.items()):
+        counts = ", ".join("%s=%d" % (k, v)
+                           for k, v in sorted(x["state_counts"].items()))
+        bits = [
+            "%s: %s" % (name, x["state"]),
+            "least %s" % _unaccounted_end(x["least"], x["least_source"]),
+            "most %s" % _unaccounted_end(x["most"], x["most_source"]),
+            "of live %s B" % x["live"],
+            "[families %s B floor %s B]" % (x["families"], x["floor"]),
+            "%d tick(s), %d distinct, states {%s}"
+            % (x["tick_count"], x["distinct"], counts),
+        ]
+        if x.get("unread"):
+            bits.append("[UNREAD FIELDS: %s]" % ", ".join(x["unread"]))
+        if x.get("contradiction_ticks"):
+            bits.append("[CONTRADICTIONS on %d tick(s): %s]"
+                        % (x["contradiction_ticks"],
+                           ", ".join(x["contradictions"]) or "see ticks"))
+        rows.append("; ".join(bits))
+    return " | ".join(rows) + tail
 
 
 def _merge_ring_lines(held, seen):
@@ -9694,6 +10131,344 @@ def selftest_telemetry_posture_reading():
     return failed
 
 
+def selftest_unaccounted_reading():
+    """Executable pins on `unaccounted_reading`. Returns the number failed.
+
+    The figure had NO reader in either rig half until 2026-09-11, so there is
+    no history of it to trust and every shape is pinned here -- including the
+    four a reader written for the two-ended line alone would have reported as
+    nothing at all: the `none` arm whose MOST end is still recoverable, the
+    `none` arm where even the floor prices above `live`, a row whose clause
+    was reworded, and a row that never arrived.
+
+    `none` is the one that matters. It does NOT mean zero unaccounted, and a
+    reader that folds it into `0` reports the worst state as the best one.
+
+    The fixtures are the producer's own shape, from `write_process_line`'s
+    format contract at `squallar-egui/src/heap_census.rs:1419`, with figures
+    chosen so every branch is reached by ARITHMETIC on published fields --
+    which is the property under test, and a reader that hard-coded its
+    classification would pass a suite that exercised only one `none` row.
+    """
+    failed = 0
+
+    def pin(name, ok):
+        nonlocal failed
+        print("[self-test] %s %s" % ("ok  " if ok else "FAIL", name))
+        if not ok:
+            failed += 1
+
+    def read(*lines):
+        return unaccounted_reading(list(lines))
+
+    def row(instance="page", live=513802240, peak=520000000, blocks=3,
+            families=478642176, floor=461864960, clause=None, tail="; rss unread"):
+        if clause is None:
+            clause = "unaccounted %d B to %d B" % (live - families, live - floor)
+        return ("process memory (%s): live %d B, live peak %d B, peak large "
+                "blocks %d, families %d B floor %d B, %s%s"
+                % (instance, live, peak, blocks, families, floor, clause, tail))
+
+    NONE = "unaccounted none (families price above live)"
+    # The peer's firefox figures, the only reading of this figure anyone has:
+    # live 490 MiB, floor 454.6, unaccounted 35.4.
+    WEB = row()
+    # The full native tail, which is where the `live` trap lives: this row
+    # ends `rss over live 86581504 B`, and a reader anchoring `live (\\d+) B`
+    # on nothing reads the RSS residual as the allocator's live bytes.
+    NATIVE = row(live=613418496, families=478642176, floor=461864960,
+                 tail="; rss 700000000 B, anon 690000000 B, file 8000000 B, "
+                      "shmem 2000000 B, threads 41, rss over live 86581504 B"
+                      "; breakdown unwalked")
+    # `none` with `live` above the floor: the upper bound double-counts and
+    # the floor does not, so `most = live - floor` is a real bound.
+    CEIL = row(live=400000000, families=478642176, floor=361864960, clause=NONE)
+    # `none` with `live` below the floor: even the de-duplicated lower bound
+    # prices above the allocator. Not a degenerate case of the one above.
+    BELOW = row(live=300000000, families=478642176, floor=361864960, clause=NONE)
+    # A real zero at both ends, which is a MEASUREMENT and not an absence.
+    ZERO = row(live=478642176, families=478642176, floor=478642176)
+    # The clause reworded away, with every other figure still on the row.
+    GONE = ("process memory (page): live 1 B, live peak 2 B, peak large "
+            "blocks 3, families 4 B floor 5 B; rss unread")
+    # env_logger's preamble, which is what the native half hands the shared
+    # classifier and what a distinct-count over the raw line would count.
+    def stamped(line, at="04:00:00"):
+        return "[2026-09-11T%sZ INFO  squallar_app] %s" % (at, line)
+
+    r = read(WEB)
+    pin("the two-ended row yields both ends, both PUBLISHED, with `live` "
+        "beside them",
+        r["state"] == "range" and r["least"] == 35160064
+        and r["most"] == 51937280 and r["live"] == 513802240
+        and r["least_source"] == "published" and r["most_source"] == "published"
+        and r["families"] == 478642176 and r["floor"] == 461864960
+        and r["unread"] == [] and r["contradictions"] == []
+        and r["headline_instance"] == "page")
+
+    r = read(NATIVE)
+    pin("the full native tail reads as the web row does -- the `rss`, "
+        "`threads` and breakdown groups after the clause change nothing",
+        r["live"] == 613418496 and r["least"] == 134776320
+        and r["most"] == 151553536 and r["contradictions"] == []
+        and r["unread"] == [])
+    # The `live` anchor, and it takes the row with `live` GONE to make it
+    # load-bearing: while the field is present `re.search` finds it first and
+    # an unanchored pattern is right by accident. Remove it and the same
+    # unanchored pattern reads `rss over live 86581504 B` -- the wrong-value
+    # form, on the field every other figure here is quoted against.
+    NO_LIVE = NATIVE.replace("live 613418496 B, ", "")
+    pin("with `live` removed, the row reads UNREAD and never picks the "
+        "`rss over live` residual off the tail",
+        read(NO_LIVE)["live"] is None
+        and "live" in read(NO_LIVE)["unread"]
+        and read(NO_LIVE)["live"] != 86581504
+        and read(NO_LIVE)["families"] == 478642176
+        and read(NO_LIVE)["floor"] == 461864960)
+    pin("and that residual really is on the row, so the pin above is not "
+        "vacuous",
+        "rss over live 86581504 B" in NO_LIVE)
+
+    r = read(CEIL)
+    pin("`none` with `live` above the floor is the families' UPPER BOUND "
+        "double-counting: the MOST end is derived and the least is not",
+        r["state"] == "none_ceiling_above_live"
+        and r["most"] == 38135040 and r["most_source"] == "derived"
+        and r["least"] is None and r["least_source"] is None
+        and r["live"] == 400000000 and "NOT zero unaccounted" in r["why"])
+
+    r = read(BELOW)
+    pin("`none` with `live` below the floor is a STRONGER statement and its "
+        "own state: neither end is recoverable",
+        r["state"] == "none_floor_above_live"
+        and r["least"] is None and r["most"] is None
+        and r["least_source"] is None and r["most_source"] is None
+        and r["live"] == 300000000)
+
+    pin("the two `none` states are not one reading -- one string, two states, "
+        "and the second is not a degenerate case of the first",
+        read(CEIL)["state"] != read(BELOW)["state"]
+        and unaccounted_summary(read(CEIL))
+        != unaccounted_summary(read(BELOW)))
+
+    pin("a DERIVED end is labelled as derived and a published one as "
+        "published, so no figure is put in the producer's mouth",
+        "(derived)" in unaccounted_summary(read(CEIL))
+        and "(derived)" not in unaccounted_summary(read(WEB))
+        and "(published)" in unaccounted_summary(read(WEB)))
+
+    r = read(ZERO)
+    pin("`unaccounted 0 B to 0 B` is a MEASUREMENT: a `range` whose ends are "
+        "zero, and not the `none` state and not an absence",
+        r["state"] == "range" and r["least"] == 0 and r["most"] == 0
+        and r["least_source"] == "published"
+        and r["state"] != read(CEIL)["state"] and r["state"] != read()["state"])
+
+    r = read()
+    pin("no row of any shape is ABSENT with a reason, never a zero and never "
+        "a `none`",
+        r["state"] == "absent" and r["least"] is None and r["most"] is None
+        and r["live"] is None and r["tick_count"] == 0
+        and r["instances"] == {} and "NOT a measured zero" in r["why"])
+
+    r = read(GONE)
+    pin("a row whose `unaccounted` clause was reworded away is UNREADABLE, "
+        "not absent -- that is a broken reader impersonating a quiet leg",
+        r["state"] == "unreadable" and r["least"] is None
+        and r["live"] == 1 and r["families"] == 4 and r["floor"] == 5
+        and r["unread"] == [] and "NOT an absent row" in r["why"])
+
+    pin("absent, a real zero, `none` and unreadable are FOUR distinct "
+        "readings and none is coerced into another",
+        len({read()["state"], read(ZERO)["state"], read(CEIL)["state"],
+             read(GONE)["state"]}) == 4)
+
+    # `live 0 B` MEANS THE BINARY HAS NO COUNTING ALLOCATOR, and it takes the
+    # `none` arm on every tick. It is one string away from the census's worst
+    # state and only `live` separates them.
+    NOALLOC = row(live=0, families=478642176, floor=461864960, clause=NONE)
+    r = read(NOALLOC)
+    pin("`live 0 B` on the `none` arm is an UNINSTRUMENTED BINARY, not the "
+        "census pricing above the allocator -- the two are one string apart",
+        r["state"] == "no_counting_allocator"
+        and r["state"] != read(BELOW)["state"]
+        and r["live"] == 0 and r["least"] is None and r["most"] is None
+        and "no counting allocator" in r["why"]
+        and "NOT a reading of the heap" in r["why"])
+    pin("and it is not mistaken for the milder `none` either, nor its "
+        "derivation attempted",
+        read(NOALLOC)["state"] != read(CEIL)["state"]
+        and read(NOALLOC)["most_source"] is None)
+    # The same binary on the other arm: with an empty census every
+    # `checked_sub` against 0 SUCCEEDS, so it prints a two-ended range of
+    # zeroes -- which is why the guard is in front of both arms and not
+    # inside the `none` one.
+    NOALLOC_RANGE = row(live=0, families=0, floor=0)
+    r = read(NOALLOC_RANGE)
+    pin("`live 0 B` with an empty census prints `unaccounted 0 B to 0 B` and "
+        "is STILL an uninstrumented binary, not a measured zero",
+        r["state"] == "no_counting_allocator" and r["read_from"] == "range"
+        and r["state"] != read(ZERO)["state"])
+    pin("while a real `unaccounted 0 B to 0 B` at non-zero `live` is a "
+        "measurement, so the guard is on `live` and not on the figures",
+        read(ZERO)["state"] == "range" and read(ZERO)["live"] == 478642176
+        and read(ZERO)["least"] == 0)
+
+    pin("and the eight states this reader can take are eight DISTINCT values, "
+        "so no shape is a falsy synonym of another",
+        len({read()["state"], read(ZERO)["state"], read(CEIL)["state"],
+             read(BELOW)["state"], read(GONE)["state"], read(NOALLOC)["state"],
+             read(row(live=1000, families=100, floor=50, clause=NONE))["state"],
+             read("process memory (page): live peak 2 B, "
+                  + NONE)["state"]}) == 8)
+
+    pin("`read_from` names which spelling the reading came out of, so a third "
+        "producer arm cannot reach a leg as a silent fallback",
+        read(WEB)["read_from"] == "range"
+        and read(CEIL)["read_from"] == "none"
+        and read(GONE)["read_from"] is None
+        and read()["read_from"] is None)
+
+    # A field APPENDED to the row, which is the trailing-group hazard: a
+    # greedy tail swallows it into the preceding capture and reports a WRONG
+    # VALUE, which is strictly worse than a miss.
+    GROWN = row(tail=", live sole 77 B; rss unread")
+    r = read(GROWN)
+    pin("a field appended after the clause moves no reading and leaks into "
+        "no capture",
+        r["state"] == "range" and r["least"] == 35160064
+        and r["most"] == 51937280 and r["live"] == 513802240
+        and r["families"] == 478642176 and r["floor"] == 461864960
+        and r["unread"] == [])
+    # And the other half: a field INSERTED mid-row, which renumbers every
+    # positional group after it.
+    INSERTED = WEB.replace("peak large blocks 3,",
+                           "peak large blocks 3, loop scans 9 B,")
+    r = read(INSERTED)
+    pin("a field inserted mid-row moves no other field's reading, which is "
+        "what BY NAME buys over a positional probe",
+        r["live"] == 513802240 and r["live_peak"] == 520000000
+        and r["peak_large_blocks"] == 3 and r["families"] == 478642176
+        and r["floor"] == 461864960 and r["least"] == 35160064)
+    # And a field that is GONE is NAMED, never read off a neighbour.
+    r = read(WEB.replace(", live peak 520000000 B", ""))
+    pin("a field removed from the row reads as UNREAD, never off a neighbour",
+        r["live_peak"] is None and r["unread"] == ["live_peak"]
+        and r["live"] == 513802240 and r["least"] == 35160064)
+
+    # The two arithmetically impossible combinations. `(Some, None)` needs
+    # `floor > families`, which the census's own construction forbids; it is
+    # REPORTED rather than bucketed, because a reader that silently buckets it
+    # has thrown away the observation that would falsify the claim.
+    r = read(row(live=150, families=100, floor=200, clause=NONE))
+    pin("a `none` row with `floor` above `families` -- the `(Some, None)` "
+        "shape, UNOBSERVED in 112,174 archived samples and not proven "
+        "impossible -- is REPORTED and its recoverable end still derived",
+        r["state"] == "none_contradictory"
+        and "floor_prices_above_families" in r["contradictions"]
+        and r["least"] == 50 and r["least_source"] == "derived"
+        and r["contradiction_ticks"] == 1)
+    r = read(row(live=1000, families=100, floor=50, clause=NONE))
+    pin("a `none` row where BOTH `checked_sub`s would have succeeded is a "
+        "contradiction too, and not silently read as a double-count",
+        r["state"] == "none_contradictory"
+        and "none_printed_while_both_ends_subtract" in r["contradictions"])
+    pin("and a healthy leg carries neither, so the bucket is not a "
+        "always-on ornament",
+        read(WEB)["contradictions"] == []
+        and read(CEIL)["contradictions"] == []
+        and read(BELOW)["contradiction_ticks"] == 0
+        and "CONTRADICTIONS" not in unaccounted_summary(read(WEB))
+        and "CONTRADICTIONS" in unaccounted_summary(
+            read(row(live=150, families=100, floor=200, clause=NONE))))
+
+    # `none` with the fields needed to refine it missing: the state cannot be
+    # recovered and says so, rather than defaulting to the milder of the two.
+    r = read("process memory (page): live peak 2 B, " + NONE)
+    pin("a `none` row whose `live` did not read cannot be refined and says "
+        "so, rather than defaulting to the milder of the two states",
+        r["state"] == "none_unreadable" and "live" in r["unread"]
+        and r["state"] != read(CEIL)["state"]
+        and r["state"] != read(BELOW)["state"])
+
+    # PER INSTANCE, always: the page and the worker are two heaps under two
+    # ceilings and the producer's doc says to always match the instance.
+    r = read(row(instance="page", live=400000000, families=478642176,
+                 floor=361864960, clause=NONE),
+             row(instance="rasterization worker"),
+             row(instance="process", live=613418496))
+    pin("three instances are three readings and the headline is `page`, so "
+        "no one quotes a figure off the heap they did not mean",
+        sorted(r["instances"]) == ["page", "process", "rasterization worker"]
+        and r["headline_instance"] == "page"
+        and r["state"] == "none_ceiling_above_live"
+        and r["instances"]["rasterization worker"]["state"] == "range"
+        and r["instances"]["process"]["live"] == 613418496
+        and r["instances"]["page"]["tick_count"] == 1)
+
+    # The TALLY, which is the quantity a leg is run to get: whether the
+    # double-count is the common case or a rarity cannot be read off the last
+    # tick.
+    r = read(WEB, CEIL, CEIL, BELOW, WEB, CEIL)
+    pin("every tick is counted by state and the LAST is the reading, because "
+        "a level's last tick cannot say how often the families double-counted",
+        r["tick_count"] == 6 and r["state"] == "none_ceiling_above_live"
+        and r["state_counts"] == {"range": 2, "none_ceiling_above_live": 3,
+                                  "none_floor_above_live": 1}
+        and len(r["ticks"]) == 6
+        and "range=2" in unaccounted_summary(r)
+        and "none_ceiling_above_live=3" in unaccounted_summary(r))
+
+    # The transport artifact. A distinct-count over the raw line counts CLOCK
+    # TICKS on the native arm, where every row carries env_logger's timestamp.
+    r = read(stamped(WEB, "04:00:00"), stamped(WEB, "04:00:01"),
+             stamped(WEB, "04:00:02"))
+    pin("the variety is counted over the family's PAYLOAD, so three "
+        "identical rows at three timestamps read as one distinct thing said",
+        r["tick_count"] == 3 and r["distinct"] == 1
+        and r["live"] == 513802240 and r["instance"] == "page")
+    pin("and the raw strings really were three, so that pin is not vacuous",
+        len({stamped(WEB, "04:00:00"), stamped(WEB, "04:00:01"),
+             stamped(WEB, "04:00:02")}) == 3)
+    r = read(stamped(WEB, "04:00:00"), stamped(CEIL, "04:00:01"))
+    pin("two rows that say different things read as two distinct, so the "
+        "payload count is not pinned to one",
+        r["tick_count"] == 2 and r["distinct"] == 2)
+
+    # A shape this reader has not met is KEPT, not dropped.
+    r = read("process memory: live 1 B, unaccounted 1 B to 2 B")
+    pin("a `process memory` line with no `(<instance>): ` clause is carried "
+        "as unclassified rather than vanishing, and is not an absence",
+        r["unclassified"] == ["process memory: live 1 B, "
+                              "unaccounted 1 B to 2 B"]
+        and r["state"] == "unreadable"
+        and "NOT an absent family" in r["why"]
+        and "unclassified" in unaccounted_summary(r))
+
+    # `live` is on every summary line, on every state, because the producer's
+    # doc requires it of any caller that prints this figure.
+    pin("`live` is printed beside the figure on every state that has one",
+        all("of live" in unaccounted_summary(read(x))
+            for x in (WEB, NATIVE, CEIL, BELOW, ZERO, GONE)))
+    pin("the two ends are printed SEPARATELY and never collapsed to one "
+        "number or a midpoint",
+        "least" in unaccounted_summary(read(WEB))
+        and "most" in unaccounted_summary(read(WEB))
+        and "35160064" in unaccounted_summary(read(WEB))
+        and "51937280" in unaccounted_summary(read(WEB))
+        and "43548672" not in unaccounted_summary(read(WEB)))
+    pin("an unrecoverable end says so rather than printing a zero",
+        "least unrecoverable" in unaccounted_summary(read(CEIL))
+        and "most unrecoverable" in unaccounted_summary(read(BELOW))
+        and "least 0 B" not in unaccounted_summary(read(CEIL)))
+    pin("the summary tolerates a missing reading rather than raising on the "
+        "way to the artifact",
+        unaccounted_summary(None).startswith("ABSENT")
+        and unaccounted_summary({}).startswith("ABSENT"))
+
+    return failed
+
+
 def selftest():
     failures = []
     if selftest_loop_or_refusal():
@@ -9709,6 +10484,8 @@ def selftest():
         failures.append("budget-pressure reading (see [self-test] lines)")
     if selftest_telemetry_posture_reading():
         failures.append("telemetry-posture reading (see [self-test] lines)")
+    if selftest_unaccounted_reading():
+        failures.append("unaccounted reading (see [self-test] lines)")
     if selftest_gpu_probe_reading():
         failures.append("gpu capacity probe reading "
                         "(see [self-test] lines)")
@@ -10594,6 +11371,12 @@ def run_smoke(args):
         # false, and the two are never the same fact.
         result["telemetry_posture"] = telemetry_posture_reading(
             getattr(frames_watch, "posture_lines", []))
+        # `Census::unaccounted`, from the WATCHER for the opposite reason to
+        # the two above: this row is written on every telemetry tick, so the
+        # end-of-run snapshot has one of them and the leg has hundreds. The
+        # tally of which state each tick took is only in the watcher's list.
+        result["unaccounted"] = unaccounted_reading(
+            getattr(frames_watch, "process_memory_lines", []))
         # From the WATCHER, deduped by tick, and taken HERE rather than at the
         # worker-signal hand-back: that runs before the last polls, so the
         # artifact carried a list five ticks short of what the window was
@@ -11194,6 +11977,12 @@ def run_smoke(args):
     print("[%s] SUMMARY [%s] telemetry posture: %s"
           % (tag, alabel,
              telemetry_posture_summary(result.get("telemetry_posture"))))
+    # On EVERY leg, and `live` is on the line beside it because the
+    # producer's own doc requires that of any caller printing this figure: a
+    # range without its denominator is uninterpretable, and `none` is the
+    # families double-counting rather than a zero.
+    print("[%s] SUMMARY [%s] unaccounted: %s"
+          % (tag, alabel, unaccounted_summary(result.get("unaccounted"))))
     wa = result.get("webgpu_adapter") or classify_webgpu_adapter(wg)
     if v.get("hardware_ok") is False:
         print("[%s] SUMMARY HARDWARE ARM FAILED: WebGL adapter is %s, WebGPU "

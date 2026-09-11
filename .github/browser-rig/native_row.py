@@ -916,6 +916,14 @@ def scrape(lines, probes):
         # byte-for-byte identical, so the ORDER and the COUNT are the reading
         # and a `[-1]` here would throw away the diagnosis.
         "telemetry_posture_lines": [],
+        # WHOLE `process memory (<instance>):` rows, IN LOG ORDER, classified
+        # later by `drive.py`'s `unaccounted_reading` rather than here. This
+        # is the half that matters for `Census::unaccounted`: a native arm has
+        # no `byteLength` to take a residual against, so this row is the ONLY
+        # reading of how much of the heap the census does not name. A list and
+        # not a level -- the row is written every telemetry tick and the TALLY
+        # of which state each tick took is the quantity a leg is run for.
+        "process_memory_lines": [],
         # Lines whose marker is present but whose positional regex did not
         # match -- a reader breakage, kept apart from an absent family.
         "unparsed": [],
@@ -1082,6 +1090,15 @@ def scrape(lines, probes):
         # because a repeat is a reading here and not a duplicate.
         if "telemetry posture:" in line:
             out["telemetry_posture_lines"].append(line.strip())
+        # `Census::unaccounted` and the `live` it must be printed beside, kept
+        # WHOLE for the shared classifier: it reads every field by its own
+        # name and needs env_logger's preamble in front of the head not to
+        # matter. `process memory` and not `process memory (` -- a producer
+        # that dropped the instance clause must reach the classifier's
+        # `unclassified` bucket, which is a reader breakage, and not read as
+        # an absence, which means a binary that never wrote the row.
+        if "process memory" in line:
+            out["process_memory_lines"].append(line.strip())
         m = probes["budget_state_re"].search(line)
         if m:
             g = m.groups()
@@ -3296,8 +3313,17 @@ def build_row(args, scraped, probes):
         # while `frame=0` means the predicate resolved false. This half sees
         # the single-emission desktop shape; the two-emission Android one is
         # written and, as its own reading says, has never run.
-        "telemetry_posture": drive_module().telemetry_posture_reading(
-            scraped["telemetry_posture_lines"]),
+        # `Census::unaccounted`, from `drive.py`'s classifier for the same
+        # reason. ALWAYS a dict, never None: its own `state` says `absent`
+        # with a reason, and the four readings this figure can give are kept
+        # apart -- an absent row is a binary or a tick that never wrote one,
+        # `unaccounted 0 B to 0 B` is a real measurement, `none` is the
+        # families DOUBLE-COUNTING and not a zero, and `unreadable` is this
+        # reader behind the producer. PER INSTANCE, because the page and the
+        # worker are two heaps and a figure off the wrong one is worse than
+        # no figure.
+        "unaccounted": drive_module().unaccounted_reading(
+            scraped["process_memory_lines"]),
         # Non-empty when a line's marker was present but its regex did not
         # match. `budget_state: None` with this non-empty means the READER
         # broke, not that the binary predates the line -- the two used to be
@@ -3584,6 +3610,16 @@ def print_row(row):
     print("ROW   telemetry posture: %s"
           % drive_module().telemetry_posture_summary(
               row.get("telemetry_posture")))
+    # On EVERY row, on the same terms, and this is the arm that has no other
+    # reading of the figure: the web half can take a residual against
+    # `byteLength` and a native leg cannot, so `unaccounted` is the whole of
+    # what a native arm knows about the heap the census does not name. `live`
+    # is on the line beside it because the producer's own doc requires that of
+    # any caller printing it, and the two ends are printed separately because
+    # the width between them IS the reading. `.get` because a row built before
+    # the field existed reads the same way.
+    print("ROW   unaccounted: %s"
+          % drive_module().unaccounted_summary(row.get("unaccounted")))
     bs = row.get("budget_state")
     if bs:
         _line, bracket_name, f = bs
@@ -6019,6 +6055,279 @@ class SharedFormatTests(unittest.TestCase):
         row["budget_pressure"] = r
         text = _capture(lambda: print_row(row))
         self.assertIn("ROW FORMAT: pre-tile-economy", text)
+
+    # ---- `Census::unaccounted`, the native arm's only reading of the heap
+    # the census does not name. `byteLength` is a web thing and
+    # `Census::residual` therefore has no denominator at all off a leg here,
+    # which is why the producer's doc calls this "the figure the census exists
+    # to produce on a native arm".
+
+    def test_the_process_memory_row_scrapes_whole_and_reads_by_name(self):
+        """The two-ended row, through the SHARED classifier.
+
+        The env_logger preamble in front of the head must not stop the read: a
+        native line is never bare the way a browser console entry is. And the
+        native tail is the long one -- `rss`, `threads`, `rss over live` and
+        the breakdown all come AFTER the clause, so a reader anchored at the
+        end of the line would read every native tick as unreadable.
+        """
+        probes = compile_probes()
+        LINE = ("[2026-09-11T04:00:00Z INFO  squallar_app] process memory "
+                "(page): live 613418496 B, live peak 741064704 B, peak large "
+                "blocks 12, families 478642176 B floor 461864960 B, "
+                "unaccounted 134776320 B to 151553536 B; rss 700000000 B, "
+                "anon 690000000 B, file 8000000 B, shmem 2000000 B, "
+                "threads 41, rss over live 86581504 B; breakdown unwalked")
+        s = scrape([LINE], probes)
+        self.assertEqual(len(s["process_memory_lines"]), 1)
+        r = drive_module().unaccounted_reading(s["process_memory_lines"])
+        self.assertEqual(r["state"], "range")
+        self.assertEqual(r["instance"], "page")
+        self.assertEqual(r["least"], 134776320)
+        self.assertEqual(r["most"], 151553536)
+        self.assertEqual(r["least_source"], "published")
+        self.assertEqual(r["most_source"], "published")
+        # `live` must be the allocator's, not the `rss over live` residual
+        # sitting further along the same row.
+        self.assertEqual(r["live"], 613418496)
+        self.assertNotEqual(r["live"], 86581504)
+        self.assertEqual(r["unread"], [])
+        self.assertEqual(r["contradictions"], [])
+        row = _fixture_row()
+        row["unaccounted"] = r
+        text = _capture(lambda: print_row(row))
+        # The denominator travels with the figure, because the producer's doc
+        # requires it of any caller that prints this one.
+        self.assertIn("ROW   unaccounted:", text)
+        self.assertIn("of live 613418496 B", text)
+        self.assertIn("least 134776320 B (published)", text)
+        self.assertIn("most 151553536 B (published)", text)
+
+    def test_the_none_row_is_a_double_count_and_never_a_zero(self):
+        """`unaccounted none (families price above live)`, both of its states.
+
+        ONE string, TWO states. The producer collapses every `None`
+        combination into this one spelling; `families` and `floor` are printed
+        unconditionally on the same row and `live` is on it too, so which of
+        the two states a row is in is recoverable here and the MOST end is
+        recoverable in one of them.
+
+        A reader that folded this into `0` would report the worst state as the
+        best one, and one that reported both states alike would throw away a
+        usable bound in the milder of them.
+        """
+        probes = compile_probes()
+        HEAD = "[2026-09-11T04:00:00Z INFO  squallar_app] process memory "
+
+        def row_line(live, floor):
+            return (HEAD + "(page): live %d B, live peak 520000000 B, peak "
+                    "large blocks 3, families 478642176 B floor %d B, "
+                    "unaccounted none (families price above live); rss unread"
+                    % (live, floor))
+
+        # The upper bound double-counts; the floor does not.
+        CEIL = row_line(400000000, 361864960)
+        r = drive_module().unaccounted_reading(
+            scrape([CEIL], probes)["process_memory_lines"])
+        self.assertEqual(r["state"], "none_ceiling_above_live")
+        self.assertEqual(r["most"], 38135040)
+        self.assertEqual(r["most_source"], "derived")
+        self.assertIsNone(r["least"])
+        self.assertIsNone(r["least_source"])
+        # Not zero, and the summary has to say the word.
+        self.assertNotEqual(r["most"], 0)
+        row = _fixture_row()
+        row["unaccounted"] = r
+        ceil_text = _capture(lambda: print_row(row))
+        self.assertIn("most 38135040 B (derived)", ceil_text)
+        self.assertIn("least unrecoverable", ceil_text)
+
+        # Even the floor prices above the allocator: a stronger statement, and
+        # not a degenerate case of the one above.
+        BELOW = row_line(300000000, 361864960)
+        r2 = drive_module().unaccounted_reading(
+            scrape([BELOW], probes)["process_memory_lines"])
+        self.assertEqual(r2["state"], "none_floor_above_live")
+        self.assertIsNone(r2["most"])
+        self.assertIsNone(r2["least"])
+        row["unaccounted"] = r2
+        below_text = _capture(lambda: print_row(row))
+        self.assertNotEqual(ceil_text, below_text)
+
+        # And a REAL zero is neither of them.
+        ZERO = (HEAD + "(page): live 478642176 B, live peak 520000000 B, peak "
+                "large blocks 3, families 478642176 B floor 478642176 B, "
+                "unaccounted 0 B to 0 B; rss unread")
+        r3 = drive_module().unaccounted_reading(
+            scrape([ZERO], probes)["process_memory_lines"])
+        self.assertEqual(r3["state"], "range")
+        self.assertEqual((r3["least"], r3["most"]), (0, 0))
+        self.assertEqual(len({r["state"], r2["state"], r3["state"]}), 3)
+
+    def test_an_uninstrumented_binary_is_not_the_census_worst_state(self):
+        """`live 0 B` is one string away from the most alarming reading here.
+
+        `sample_process` publishes `live_bytes().unwrap_or(0)`
+        (`squallar-egui/src/heap_census.rs:1289`) and `live_bytes` is `None`
+        until the counting allocator has seen an allocation
+        (`squallar-alloc/src/lib.rs:583`), so a build without it prints
+        `live 0 B` on every tick. Every `checked_sub` against zero then fails
+        and the row takes the `none` arm for a reason that is nothing to do
+        with the census -- byte-identical to `live` having fallen below the
+        census's own de-duplicated floor.
+
+        The native arm is where this bites: a leg can be run against a bundle
+        whose allocator feature was off, and without this guard every one of
+        its ticks would be filed as the census reporting its own breakage.
+        """
+        probes = compile_probes()
+        HEAD = "[2026-09-11T04:00:00Z INFO  squallar_app] process memory "
+        DEAD = (HEAD + "(page): live 0 B, live peak 0 B, peak large blocks 0, "
+                "families 478642176 B floor 461864960 B, unaccounted none "
+                "(families price above live); rss unread")
+        r = drive_module().unaccounted_reading(
+            scrape([DEAD], probes)["process_memory_lines"])
+        self.assertEqual(r["state"], "no_counting_allocator")
+        self.assertEqual(r["live"], 0)
+        self.assertIsNone(r["least"])
+        self.assertIsNone(r["most"])
+        self.assertIsNone(r["most_source"])
+
+        # The state it must NOT be filed as, on a row identical but for
+        # `live`. Same clause, same families, same floor.
+        REAL = DEAD.replace("live 0 B", "live 300000000 B")
+        r2 = drive_module().unaccounted_reading(
+            scrape([REAL], probes)["process_memory_lines"])
+        self.assertEqual(r2["state"], "none_floor_above_live")
+        self.assertNotEqual(r["state"], r2["state"])
+        row = _fixture_row()
+        row["unaccounted"] = r
+        dead_text = _capture(lambda: print_row(row))
+        row["unaccounted"] = r2
+        real_text = _capture(lambda: print_row(row))
+        self.assertNotEqual(dead_text, real_text)
+        self.assertIn("no_counting_allocator", dead_text)
+
+    def test_a_log_with_no_process_memory_row_reads_absent_not_zero(self):
+        """An absence is a binary or a tick that never wrote the row.
+
+        A leg off a bundle older than the line, or one whose telemetry tick
+        never ran, carries no row at all -- and that is not
+        `unaccounted 0 B to 0 B`, which is a measurement, and not
+        `unaccounted none`, which is the families double-counting.
+        """
+        probes = compile_probes()
+        s = scrape(["[INFO] nothing to do with the heap here"], probes)
+        self.assertEqual(s["process_memory_lines"], [])
+        r = drive_module().unaccounted_reading(s["process_memory_lines"])
+        self.assertEqual(r["state"], "absent")
+        self.assertIsNone(r["least"])
+        self.assertIsNone(r["most"])
+        self.assertIsNone(r["live"])
+        self.assertEqual(r["tick_count"], 0)
+        self.assertIn("NOT a measured zero", r["why"])
+        row = _fixture_row()
+        row["unaccounted"] = r
+        text = _capture(lambda: print_row(row))
+        self.assertIn("ABSENT", text)
+        self.assertNotIn("0 B (published)", text)
+
+    def test_every_tick_is_tallied_and_the_preamble_is_not_counted(self):
+        """The TALLY, and the transport artifact that would corrupt it.
+
+        Whether the families' double-count is the common case or a rarity is
+        the question a leg is run to answer, and the last tick cannot say. So
+        every row is counted by state.
+
+        The variety beside the count is taken over the family's own PAYLOAD:
+        a native row carries env_logger's timestamp, and a distinct-count over
+        the raw line counts CLOCK TICKS -- the same identical row at three
+        instants would read as three different things said.
+        """
+        probes = compile_probes()
+
+        def stamped(at, clause):
+            return ("[2026-09-11T%sZ INFO  squallar_app] process memory "
+                    "(page): live 400000000 B, live peak 520000000 B, peak "
+                    "large blocks 3, families 478642176 B floor 361864960 B, "
+                    "%s; rss unread" % (at, clause))
+
+        NONE = "unaccounted none (families price above live)"
+        lines = [stamped("04:00:00", NONE), stamped("04:00:01", NONE),
+                 stamped("04:00:02", NONE)]
+        # The raw strings really are three, so the pin below is not vacuous.
+        self.assertEqual(len(set(lines)), 3)
+        s = scrape(lines, probes)
+        self.assertEqual(len(s["process_memory_lines"]), 3)
+        r = drive_module().unaccounted_reading(s["process_memory_lines"])
+        self.assertEqual(r["tick_count"], 3)
+        self.assertEqual(r["distinct"], 1)
+        self.assertEqual(r["state_counts"], {"none_ceiling_above_live": 3})
+        row = _fixture_row()
+        row["unaccounted"] = r
+        text = _capture(lambda: print_row(row))
+        self.assertIn("3 tick(s), 1 distinct", text)
+
+    def test_two_instances_are_two_heaps_and_never_one_reading(self):
+        """The page's tick and the native sampler thread's own row.
+
+        `write_process_line` takes the instance at the call site: the frame
+        thread's telemetry tick says `page` and the sampler thread says
+        `process` (`heap_census.rs:1339`, at `debug!`), and a native log run
+        loud enough can carry both. They are two readings of the same heap
+        taken by two threads, and on the web `rasterization worker` is a
+        DIFFERENT heap under a different ceiling -- the producer's doc says to
+        always match the instance for that reason.
+        """
+        probes = compile_probes()
+
+        def line(instance, live):
+            return ("[2026-09-11T04:00:00Z INFO  squallar_app] process memory "
+                    "(%s): live %d B, live peak 520000000 B, peak large "
+                    "blocks 3, families 478642176 B floor 461864960 B, "
+                    "unaccounted %d B to %d B; rss unread"
+                    % (instance, live, live - 478642176, live - 461864960))
+
+        s = scrape([line("page", 513802240),
+                    line("rasterization worker", 500000000),
+                    line("process", 613418496)], probes)
+        self.assertEqual(len(s["process_memory_lines"]), 3)
+        r = drive_module().unaccounted_reading(s["process_memory_lines"])
+        self.assertEqual(sorted(r["instances"]),
+                         ["page", "process", "rasterization worker"])
+        self.assertEqual(r["headline_instance"], "page")
+        self.assertEqual(r["live"], 513802240)
+        self.assertEqual(r["instances"]["process"]["live"], 613418496)
+        self.assertEqual(
+            r["instances"]["rasterization worker"]["live"], 500000000)
+        # Each instance's tally is its own: three rows, one apiece.
+        self.assertEqual(
+            [r["instances"][k]["tick_count"] for k in sorted(r["instances"])],
+            [1, 1, 1])
+
+    def test_a_reworded_clause_is_unreadable_not_absent(self):
+        """The reader behind the producer, kept apart from a quiet leg.
+
+        Without this arm a reworded clause reads as an absence, whose
+        documented meaning is a binary that never wrote the row -- a broken
+        reader impersonating a healthy one.
+        """
+        probes = compile_probes()
+        GONE = ("[2026-09-11T04:00:00Z INFO  squallar_app] process memory "
+                "(page): live 1 B, live peak 2 B, peak large blocks 3, "
+                "families 4 B floor 5 B; rss unread")
+        r = drive_module().unaccounted_reading(
+            scrape([GONE], probes)["process_memory_lines"])
+        self.assertEqual(r["state"], "unreadable")
+        self.assertIsNone(r["least"])
+        self.assertIsNone(r["most"])
+        # Every other figure on the row still read, which is what makes this
+        # a reading about the CLAUSE and not about the row.
+        self.assertEqual(r["live"], 1)
+        self.assertEqual(r["families"], 4)
+        self.assertEqual(r["unread"], [])
+        self.assertNotEqual(r["state"], drive_module().unaccounted_reading(
+            [])["state"])
 
     def test_the_posture_row_scrapes_whole_and_reads_by_name(self):
         """The telemetry posture row, through the SHARED classifier.
