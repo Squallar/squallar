@@ -337,11 +337,67 @@ fi
 # app really did are checkable against each other rather than assumed equal.
 LOOP_SEED='\"loop_lookback_secs\":3600,\"loop_speed_fps\":10.0,'
 
+# ------------------------------------------------ scene A's viewport pin ----
+#
+# **Scene A pins where the pane is looking, because an unpinned pane is moved
+# three times by NETWORK timing and every per-frame figure the scene reports is
+# a function of what ended up in the viewport.** Unpinned, a cold leg walks:
+#
+#   1. boot on an empty site table (nothing ships a catalogue: `site_catalogue`
+#      is read from the KV store, and a rig leg's store is fresh), so
+#      `ui_map.rs`'s centre falls all the way through to its last resort, the
+#      geographic centre of the contiguous USA -- 39.8283,-98.5795, ~1,200 km
+#      from the site the seed names;
+#   2. the detached `api.weather.gov/radar/stations` GET lands, the table
+#      resolves, and the centre becomes KTLX's own position. The map jumps;
+#   3. the first volume arrives and `Gui::claim_initial_zoom` snaps every pane
+#      to `DEFAULT_INITIAL_ZOOM` (7.0).
+#
+# Steps 2 and 3 are two independent network clocks, so four identically-seeded
+# legs land in four different places. Measured across four on the Mac: the
+# in-viewport station count read 31, 12, and TWICE the station-label block did
+# not run at all -- `handle_radar_site_interactions` gates on
+# `zoom >= SITE_LABEL_MIN_ZOOM` (5.0), which an un-snapped pane can sit below.
+#
+# **Both halves are required and neither is sufficient.** `restore_viewport`
+# (`ui_config.rs`) sets the `initial_zoom_set` latch from its ZOOM arm only, so
+# a seeded centre alone still eats the step-3 snap; and a seeded zoom alone
+# leaves the centre walking steps 1-2. Seeded together, `center_at` puts the
+# map in `Center::Exact` -- detached, and nothing in the app ever calls
+# `follow_my_position` -- so the viewport stops depending on either clock.
+#
+# **The values are the app's own converged state, not a new framing**: zoom 7.0
+# IS `DEFAULT_INITIAL_ZOOM`, and the centre is KTLX's own catalogue row
+# (`lat_udeg` 35333050, `lon_udeg` -97277750 -- the same figures in all 40
+# cached catalogues on this box), which is where step 2 was heading. The pin
+# therefore removes the race without re-baselining the scene: it starts the leg
+# at the state the lucky legs reached late. Measured -- two of four unpinned
+# legs ended exactly here on their own, and the other two did not.
+#
+# **Why zoom 7.0 and not the neighbours**, counted against a real cached
+# catalogue (197 placed rows) over the pane rect expanded by the 100 pt margin
+# `visible_radar_sites` uses: z5 puts 183 of 197 in view and z6 puts 107-155 --
+# nearly the whole network, a case no user is ever in and an unrepresentative
+# denominator for a per-station cost. z8 leaves 8-18, too few to score one
+# against. z7 leaves 31 at 1280x720 pt, 35 at 1440x778 and 59 at 1920x1037:
+# never empty, so the station-label cut stays measurable, and never saturated.
+#
+# The count is a function of the pane RECT as well as the pin, and the rect is
+# the canvas -- `RIG_CANVAS`, reported on every row as `canvas=` and unpinned by
+# default. Pinning the viewport makes a scene-A leg repeatable AT A GIVEN
+# CANVAS; it does not make two different canvases comparable, and never did.
+
 # scene_seed <scene>: the localStorage seed JSON; scene_script <scene>: the
 # gesture script the seed arms (also the row's script= denominator).
+#
+# Scene A's pin is spelled out in its arm rather than hoisted into a shell
+# variable the way `PANEL_SEED` and `LOOP_SEED` are, because `native_row.py`'s
+# viewport rule reads the seeds as FILE TEXT (`seed_sites`) as well as through
+# the shell: a pin behind a variable reads to that half of the rule as a scene
+# carrying no pin at all, which is its exempt case.
 scene_seed() {
   case "$1" in
-    A) echo '{"squallar.ui": "{'"$PANEL_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"enabled_overlays\":{'"$ALL_LAYERS"'}}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "pan-zoom-2d"}' ;;
+    A) echo '{"squallar.ui": "{'"$PANEL_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"zoom\":7.0,\"center\":[35.33305,-97.27775],\"enabled_overlays\":{'"$ALL_LAYERS"'}}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "pan-zoom-2d"}' ;;
     B) echo '{"squallar.ui": "{'"$PANEL_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"render\":\"Volume\"}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "orbit-3d"}' ;;
     C) echo '{"squallar.ui": "{'"$PANEL_SEED"'\"pane_count\":6,\"panes\":[{\"site\":\"KTLX\",\"layer_link\":false,\"render\":\"Volume\"},{\"site\":\"KTLX\",\"layer_link\":false},{\"site\":\"KINX\",\"layer_link\":false,\"render\":\"Volume\"},{\"site\":\"KINX\",\"layer_link\":false},{\"site\":\"KVNX\",\"layer_link\":false,\"render\":\"Volume\"},{\"site\":\"KVNX\",\"layer_link\":false}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "pan-zoom-2d"}' ;;
     D) echo '{"squallar.ui": "{'"$PANEL_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"enabled_overlays\":{'"$ALL_LAYERS"'}}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "ui-sweep"}' ;;

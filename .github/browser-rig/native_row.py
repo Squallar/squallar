@@ -434,13 +434,18 @@ def _scene_block(source=None):
     return "\n".join(lines[start:end + 1])
 
 
-def scene_from_shell(scene, panel="off", what="seed"):
-    """Evaluate `run_measure.sh`'s own `scene_seed`/`scene_script` for a scene."""
+def scene_from_shell(scene, panel="off", what="seed", source=None):
+    """Evaluate `run_measure.sh`'s own `scene_seed`/`scene_script` for a scene.
+
+    `source` substitutes text for the file, so a rule's own tests can put a
+    tampered table through the same bash the real one goes through instead of
+    through a second, kinder parser.
+    """
     import subprocess
 
     fn = "scene_seed" if what == "seed" else "scene_script"
     out = subprocess.run(
-        ["bash", "-c", "%s\n%s %s" % (_scene_block(), fn, scene)],
+        ["bash", "-c", "%s\n%s %s" % (_scene_block(source), fn, scene)],
         capture_output=True, text=True, env=dict(os.environ, PANEL=panel),
     )
     if out.returncode != 0:
@@ -633,6 +638,171 @@ def telemetry_seed_defects(sources=None, keys=None):
                        ", ".join(missing))
                 )
     return defects
+
+
+# -------------------------------------------------- the viewport pin rule --
+#
+# A seed that names a site does NOT thereby say where the pane is looking. The
+# centre falls through `ui_map.rs`'s three-step chain -- scan position, else the
+# site's table row, else the geographic centre of the contiguous USA -- and the
+# zoom is snapped to `DEFAULT_INITIAL_ZOOM` by `Gui::claim_initial_zoom` when
+# the session's first volume lands. Both steps move on NETWORK clocks, so an
+# unpinned scene draws a different patch of the world on every leg, and every
+# per-frame figure that scales with what is in the viewport moves with it.
+# Measured on four identically-seeded scene-A legs before this rule existed:
+# the in-viewport station count read 31, 12, and twice the station-label block
+# did not run at all.
+#
+# The rule below is deliberately CONDITIONAL, on `telemetry_seed_defects`'
+# terms: a seed that pins nothing is exempt without being named, because what a
+# scene's framing should be is its owner's call. What it refuses is HALF a pin,
+# and the asymmetry is real rather than tidiness -- `restore_viewport`
+# (`squallar-egui/src/ui_config.rs`) arms the `initial_zoom_set` latch from its
+# ZOOM arm only, so a seed carrying `center` alone still eats the first-scan
+# snap, and one carrying `zoom` alone leaves the centre walking the chain. Half
+# a pin is the shape that looks pinned and is not.
+
+# The two halves of a viewport, spelled as `PaneConfig`'s own serde field names
+# (`ui_config.rs`: `zoom: Option<f64>`, `center: Option<(f64, f64)>`). A pane
+# key is matched with its quote and colon so a substring of some other key
+# cannot answer for it -- `\"` is the shell literals' spelling, the plain one a
+# heredoc's.
+VIEWPORT_PIN_KEYS = ("zoom", "center")
+
+
+def _pin_key_re(key):
+    return re.compile(r'\\?"%s\\?"\s*:' % re.escape(key))
+
+
+def measuring_runners(sources=None, keys=None):
+    """The runners that take measurements, by CONTENT: they seed telemetry.
+
+    The same discriminator `telemetry_seed_defects` uses, lifted out so the two
+    rules cannot drift onto different ideas of which runners they govern. A
+    screenshot runner scrapes no rows and its framing is a picture-composition
+    choice, not a denominator, so it falls out of the viewport rule rather than
+    being listed out of it -- and the day one of its seeds gains a telemetry
+    switch, it becomes a measurement runner and this rule starts demanding
+    whole pins there too. That is the right direction to fail in.
+    """
+    keys = telemetry_keys() if keys is None else keys
+    out = set()
+    for name, _line, blob, _label in seed_sites(sources):
+        if any(k in blob for k in keys):
+            out.add(name)
+    return out
+
+
+def viewport_pin_defects(sources=None, keys=None):
+    """Seed sites that pin ONE half of the viewport and not the other.
+
+    Runs over every seed `seed_sites` finds in every MEASURING runner -- in
+    whatever runners the directory holds -- rather than over a scene list, for
+    the reason the telemetry rule gives: a hand-listed check goes blind exactly
+    when something new arrives, and a scene added tomorrow is the case this
+    rule exists for.
+
+    **Granularity is the seed, not the pane.** A multi-pane seed that pins one
+    pane completely and leaves another bare reads as clean here, because both
+    keys are somewhere in the blob. No scene pins anything but scene A's single
+    pane today; the day a multi-pane scene is pinned, this wants tightening to
+    a per-pane walk, and `scene_viewport_pin`'s first-pane read wants widening
+    with it.
+
+    Returns a list of human-readable defects; empty means clean.
+    """
+    measuring = measuring_runners(sources, keys)
+    defects = []
+    for name, line, blob, label in seed_sites(sources):
+        if name not in measuring:
+            continue
+        present = [k for k in VIEWPORT_PIN_KEYS if _pin_key_re(k).search(blob)]
+        if not present or len(present) == len(VIEWPORT_PIN_KEYS):
+            continue
+        missing = [k for k in VIEWPORT_PIN_KEYS if k not in present]
+        defects.append(
+            "%s:%d seed %s pins %s but not %s -- half a pin reads as pinned "
+            "and is not: `center` alone still takes the first-scan zoom snap "
+            "(`restore_viewport` arms the latch from its zoom arm only), and "
+            "`zoom` alone leaves the centre walking the site-table fallback "
+            "chain. The drawn population still moves between legs."
+            % (name, line, label or "(unlabelled)",
+               ", ".join(present), ", ".join(missing))
+        )
+    return defects
+
+
+def measure_scenes(source=None):
+    """Every scene `run_measure.sh`'s table defines, in the order it defines them.
+
+    Read out of the `case` arms of the sourced scene block rather than listed,
+    so a scene added to the table is covered by everything downstream without
+    anyone remembering to add it here. The `*)` catch-all is not a scene.
+    """
+    text = _scene_block(source)
+    body = text[text.index("scene_seed"):]
+    body = body[:body.index("\n}")]
+    scenes = []
+    for m in re.finditer(r"^\s*([A-Za-z0-9_|]+)\)", body, re.M):
+        for arm in m.group(1).split("|"):
+            if arm != "*" and arm not in scenes:
+                scenes.append(arm)
+    if len(scenes) < 2:
+        raise SystemExit(
+            "only %d scene arms were parsed out of run_measure.sh's scene "
+            "table; the table's spelling changed and this rule cannot check a "
+            "set it failed to read" % len(scenes)
+        )
+    return scenes
+
+
+UI_MAP_PANE_RS = os.path.join(
+    REPO_ROOT, "squallar-egui", "src", "ui_map_pane.rs"
+)
+
+_LABEL_MIN_ZOOM_RE = re.compile(
+    r"const\s+SITE_LABEL_MIN_ZOOM\s*:\s*f64\s*=\s*([0-9.]+)\s*;"
+)
+
+
+def site_label_min_zoom(source=None):
+    """The zoom below which the station-label pass does not run at all.
+
+    Read out of the app's own constant, on `telemetry_keys`' terms: the pinned
+    zoom is only meaningful relative to this gate, and a constant that moves
+    under a pin chosen against the old value turns a scene silently into one
+    that draws no labels -- which is the very reading ("the block never ran")
+    this pin was added to stop.
+    """
+    text = source if source is not None else _read(UI_MAP_PANE_RS)
+    m = _LABEL_MIN_ZOOM_RE.search(text)
+    if m is None:
+        raise SystemExit(
+            "`SITE_LABEL_MIN_ZOOM` was not found in %s; the station-label "
+            "zoom gate moved and the scene-A pin cannot be checked against a "
+            "value that was not read" % UI_MAP_PANE_RS
+        )
+    return float(m.group(1))
+
+
+def scene_viewport_pin(scene, panel="off", source=None):
+    """`(zoom, (lat, lon))` scene `scene` pins its first pane to, or `None`.
+
+    Through the shell and then through JSON, so what is checked is what the
+    leg is actually seeded with rather than what the file appears to say. A
+    pin hoisted into a shell variable therefore still reads as a pin here,
+    where the file-text half of the rule would not see it.
+    """
+    ui = json.loads(json.loads(scene_from_shell(scene, panel, source=source))[
+        WEB_KEY_PREFIX + "ui"])
+    panes = ui.get("panes") or []
+    if not panes:
+        return None
+    pane = panes[0]
+    if "zoom" not in pane or "center" not in pane:
+        return None
+    lat, lon = pane["center"]
+    return float(pane["zoom"]), (float(lat), float(lon))
 
 
 def cmd_seed(args):
@@ -8892,6 +9062,190 @@ class TelemetrySeedTests(unittest.TestCase):
         self.assertTrue(
             defects, "a seed gained one switch and the rule stayed silent")
         self.assertIn("raster_telemetry", defects[0])
+
+
+class ViewportPinTests(unittest.TestCase):
+    """Scene A pins where the pane is looking, and something notices if it stops.
+
+    The defect the pin closes: `ui_map.rs` falls through scan position -> the
+    site's table row -> the geographic centre of the USA for its centre, and
+    `Gui::claim_initial_zoom` snaps the zoom when the first volume lands. Both
+    move on network clocks. Four identically-seeded scene-A legs read an
+    in-viewport station count of 31, 12, and twice no station-label pass at
+    all -- so the same seed bought materially different per-frame work, and a
+    cut scored against that population could not be scored at all.
+    """
+
+    @staticmethod
+    def _digest(text):
+        import hashlib
+        return hashlib.sha256(text.encode()).hexdigest()
+
+    def test_scene_a_pins_its_panes_centre_and_zoom(self):
+        """The pin is READ BACK through bash and JSON, not matched as text.
+
+        Both panel postures, because `PANEL_SEED` is interpolated into the
+        same string literal and a quoting mistake shows up in one and not the
+        other.
+        """
+        for panel in ("off", "on"):
+            pin = scene_viewport_pin("A", panel)
+            self.assertIsNotNone(
+                pin,
+                "scene A (panel=%s) seeds no pane viewport; its drawn "
+                "population is back on two network clocks and every scene-A "
+                "figure is noise again" % panel)
+            zoom, (lat, lon) = pin
+            self.assertEqual(zoom, 7.0)
+            # KTLX's catalogue position, which is where the site fallback was
+            # heading anyway -- the pin removes the race, not the framing.
+            self.assertAlmostEqual(lat, 35.33305, places=5)
+            self.assertAlmostEqual(lon, -97.27775, places=5)
+
+    def test_the_pinned_zoom_clears_the_station_label_gate(self):
+        """A pin BELOW `SITE_LABEL_MIN_ZOOM` is a scene that draws no labels.
+
+        Which is one of the two readings the pin exists to stop, so the bar is
+        read out of the app's own constant rather than restated here: raising
+        the gate past a pin chosen against the old value has to fail loudly.
+        """
+        bar = site_label_min_zoom()
+        zoom, _center = scene_viewport_pin("A")
+        self.assertGreaterEqual(
+            zoom, bar,
+            "scene A pins zoom %s, under the %s the station-label pass needs; "
+            "the scene draws no station labels at all and the cut scored "
+            "against them is unmeasurable" % (zoom, bar))
+
+        # Positive control on the reader: a source whose constant says
+        # something else must come back saying something else, or the check
+        # above would pass identically against a hardcoded 5.0.
+        moved = site_label_min_zoom(
+            "const SITE_LABEL_MIN_ZOOM: f64 = 9.5;")
+        self.assertEqual(moved, 9.5)
+        self.assertNotEqual(moved, bar)
+        with self.assertRaises(SystemExit):
+            site_label_min_zoom("nothing declares that constant here")
+
+    def test_a_seed_that_pins_half_a_viewport_is_refused(self):
+        """Half a pin is the shape that reads as pinned and is not.
+
+        `center` alone still eats the first-scan zoom snap, because
+        `restore_viewport` arms `initial_zoom_set` from its zoom arm only.
+        """
+        real = _read(RUN_MEASURE_SH)
+        drop = '\\"center\\":[35.33305,-97.27775],'
+        self.assertEqual(
+            real.count(drop), 1,
+            "the scene-A centre spelling moved; this tamper no longer reaches "
+            "the seed it means to break")
+        broken = real.replace(drop, "")
+        self.assertNotEqual(self._digest(broken), self._digest(real))
+
+        defects = viewport_pin_defects({"run_measure.sh": broken})
+        self.assertEqual(
+            len(defects), 1,
+            "one seed lost one half and the rule reported %d defects: %s"
+            % (len(defects), defects))
+        self.assertIn("run_measure.sh", defects[0])
+        self.assertIn("center", defects[0])
+
+        # The mirror half, so the rule is not one-sided: a seed keeping only
+        # the centre is refused too.
+        drop_zoom = '\\"zoom\\":7.0,'
+        self.assertEqual(real.count(drop_zoom), 1)
+        other = real.replace(drop_zoom, "")
+        self.assertNotEqual(self._digest(other), self._digest(real))
+        defects = viewport_pin_defects({"run_measure.sh": other})
+        self.assertEqual(len(defects), 1, defects)
+        self.assertIn("zoom", defects[0])
+
+        # And the untampered text through the same call is clean, so the
+        # redness above is the tamper and not the injection path itself.
+        self.assertEqual(viewport_pin_defects({"run_measure.sh": real}), [])
+
+    def test_scene_a_losing_its_pin_entirely_is_caught(self):
+        """The hole a half-pin rule alone would leave.
+
+        Dropping BOTH halves is not half a pin, so `viewport_pin_defects` is
+        silent about it by design -- an unpinned scene is the exempt case.
+        What catches it is reading scene A's pin back and finding none.
+        """
+        real = _read(RUN_MEASURE_SH)
+        drop = '\\"zoom\\":7.0,\\"center\\":[35.33305,-97.27775],'
+        self.assertEqual(
+            real.count(drop), 1,
+            "the scene-A pin spelling moved; this tamper no longer reaches it")
+        broken = real.replace(drop, "")
+        self.assertNotEqual(self._digest(broken), self._digest(real))
+
+        # The half-pin rule is deliberately quiet here...
+        self.assertEqual(viewport_pin_defects({"run_measure.sh": broken}), [])
+        # ...and the scene-A reader is not.
+        self.assertIsNone(scene_viewport_pin("A", source=broken))
+        # Positive: the same reader against the real table finds the pin, so
+        # the `None` above is the tamper and not a broken evaluation path.
+        self.assertIsNotNone(scene_viewport_pin("A", source=real))
+
+    def test_no_other_scene_is_pinned_by_this_change(self):
+        """B, C, D and the E family are other lanes' denominators.
+
+        Pinning one would move its figures without anyone asking. Derived from
+        the table, so a scene added tomorrow is included in the sweep rather
+        than quietly outside it.
+        """
+        scenes = measure_scenes()
+        self.assertIn("A", scenes)
+        pinned = [s for s in scenes if scene_viewport_pin(s) is not None]
+        self.assertEqual(
+            pinned, ["A"],
+            "scenes %s carry a viewport pin; only scene A is meant to, and a "
+            "pin moves every figure that scene has ever reported" % pinned)
+
+    def test_the_scene_list_is_derived_from_the_table(self):
+        """Non-vacuity for the sweep above: a hand-list would go blind here."""
+        real = _read(RUN_MEASURE_SH)
+        self.assertEqual(measure_scenes(real),
+                         ["A", "B", "C", "D", "E1", "E2", "E3"])
+
+        # A scene added to the table is picked up unasked -- the property the
+        # sweep depends on, and the one a listed tuple does not have.
+        grown = real.replace(
+            "    B) echo '{", "    F) echo '{\n    B) echo '{", 1)
+        self.assertNotEqual(self._digest(grown), self._digest(real))
+        self.assertIn("F", measure_scenes(grown))
+
+        with self.assertRaises(SystemExit):
+            measure_scenes("ALL_LAYERS=x\nscene_seed() {\n}\n"
+                           "# scene-B denominator columns\n")
+
+    def test_a_runner_that_measures_nothing_is_exempt_without_being_named(self):
+        """Same discriminator as the telemetry rule, for the same reason.
+
+        A screenshot runner's framing is a picture-composition choice, not a
+        denominator. The half worth pinning is the second: a seed of its that
+        gains a telemetry switch makes it a measuring runner, and the viewport
+        rule starts governing it.
+        """
+        half = ('SEED_LS=\'{"squallar.ui":"{\\"panes\\":'
+                '[{\\"site\\":\\"KTLX\\",\\"zoom\\":7.0}]}"}\'\n')
+        self.assertEqual(viewport_pin_defects({"shots.sh": half}), [])
+        self.assertNotIn("shots.sh", measuring_runners({"shots.sh": half}))
+
+        armed = half.replace('{"squallar.ui"',
+                             '{"squallar.frame_telemetry":"1",'
+                             '"squallar.raster_telemetry":"1","squallar.ui"', 1)
+        self.assertNotEqual(self._digest(armed), self._digest(half))
+        self.assertIn("shots.sh", measuring_runners({"shots.sh": armed}))
+        defects = viewport_pin_defects({"shots.sh": armed})
+        self.assertEqual(len(defects), 1, defects)
+        self.assertIn("center", defects[0])
+
+    def test_the_live_tree_pins_no_half_viewport(self):
+        """The rule over the real directory, every measuring runner in it."""
+        self.assertEqual(viewport_pin_defects(), [])
+        # Non-vacuity: the sweep really did reach the measuring runners.
+        self.assertIn("run_measure.sh", measuring_runners())
 
 
 if __name__ == "__main__":
