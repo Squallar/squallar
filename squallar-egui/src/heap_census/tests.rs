@@ -587,12 +587,33 @@ fn the_widest_process_line_fits_its_buffer() {
         thp: u64::MAX,
         walks: u64::MAX,
     };
-    // Both unaccounted arms, because the `none` one is the wider prose.
+    // **All THREE unaccounted arms.** The widest is the `at most` one: it
+    // carries one twenty-digit figure fewer than the range and 30 bytes more
+    // prose, and it is the only arm that can print a saturated `families`
+    // beside a twenty-digit `floor`. `loop scans` and `still scans` at
+    // `10^19` saturate `radar_total` — so `families` is `u64::MAX` — while
+    // `radar_floor` stays their own `10^19`, and `live` one below the
+    // saturation puts the reading under the upper bound and over the floor.
+    // `floor` and `most` sum to `live`, so 39 digits across the pair is the
+    // ceiling and either split gives the same width.
+    let priced_above = Census {
+        loop_scan_bytes: 10_000_000_000_000_000_000,
+        still_scan_bytes: 10_000_000_000_000_000_000,
+        ..Default::default()
+    };
     let arms = [
         process_line(&Census::default(), &widest, "rasterization worker"),
         process_line(&distinct(), &widest, "rasterization worker"),
+        process_line(
+            &priced_above,
+            &ProcessCensus {
+                live: u64::MAX - 1,
+                ..widest
+            },
+            "rasterization worker",
+        ),
     ];
-    let said = arms.iter().max_by_key(|s| s.len()).expect("two arms");
+    let said = arms.iter().max_by_key(|s| s.len()).expect("three arms");
     assert!(
         said.len() <= PROCESS_LINE_CAPACITY,
         "the widest process line is {} bytes, past {PROCESS_LINE_CAPACITY}",
@@ -604,6 +625,80 @@ fn the_widest_process_line_fits_its_buffer() {
         "the widest process line is {} bytes; re-derive PROCESS_LINE_CAPACITY",
         said.len()
     );
+}
+
+/// **`unaccounted` has three states and the line prints three texts.**
+///
+/// `live` under `families` was ONE string for two different facts until
+/// 2026-09-11, and they are not the same news. The ordinary one is the radar
+/// families sharing `Arc`s — the upper bound prices above the allocator, the
+/// FLOOR still bounds it, and `live - floor` is a usable answer. The other is
+/// `live` under the floor too, after every correction this census knows how
+/// to make, which is the instrument reporting its own breakage. Measured over
+/// 112,174 archived native process samples on 380 legs, the collapsed arm was
+/// taken on 61.6 % of samples and the broken kind was 7.3 % of all samples —
+/// so a genuine instrument failure was hiding inside an ordinary reading
+/// roughly eight times in nine, printed in the same words.
+///
+/// **The two pre-existing texts are pinned VERBATIM here.** A rig reader keyed
+/// on their shape pays one added pattern for the new arm and nothing for the
+/// two it already matches; a moved shape would break it silently, which is the
+/// whole reason this test spells the strings out rather than describing them.
+#[test]
+fn the_line_tells_the_two_ways_a_census_prices_above_live_apart() {
+    // `radar_total` 200 with nothing shared, so the upper bound is 200 and
+    // the floor is the largest single family, 100.
+    let c = Census {
+        loop_scan_bytes: 100,
+        still_scan_bytes: 100,
+        ..Default::default()
+    };
+    assert_eq!(c.resident_total(), 200, "the upper bound double-counts");
+    assert_eq!(c.resident_floor(), 100, "the floor is the largest member");
+
+    let said = |live| {
+        process_line(
+            &c,
+            &ProcessCensus {
+                live,
+                ..Default::default()
+            },
+            "page",
+        )
+    };
+
+    let ranged = said(500);
+    assert!(
+        ranged.contains("families 200 B floor 100 B, unaccounted 300 B to 400 B"),
+        "the range arm's text moved: {ranged}",
+    );
+
+    // Under the upper bound, over the floor: the ordinary double-count.
+    let bounded = said(150);
+    assert!(
+        bounded.contains(
+            "families 200 B floor 100 B, unaccounted at most 50 B \
+             (families price above live; the floor does not)"
+        ),
+        "the floor still bounds this reading and the line must say so: {bounded}",
+    );
+    assert!(
+        !bounded.contains("unaccounted none"),
+        "a bounded reading was printed as the unbounded one: {bounded}",
+    );
+
+    // Under the FLOOR: the census is above the allocator after every
+    // correction it can make, and that is the instrument, not the heap.
+    let broken = said(50);
+    assert!(
+        broken.contains("families 200 B floor 100 B, unaccounted none (families price above live)"),
+        "the `none` arm's text moved: {broken}",
+    );
+
+    // Three states, three texts: no two of them read the same.
+    assert_ne!(ranged, bounded);
+    assert_ne!(bounded, broken);
+    assert_ne!(ranged, broken);
 }
 
 /// **A process that never installed the counting allocator says so**, rather

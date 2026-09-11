@@ -948,6 +948,24 @@ impl Census {
     /// **It is not an error term.** It is every family nobody has thought to
     /// count yet, plus whatever the census prices at zero. A caller printing
     /// it must print `live` beside it.
+    ///
+    /// **THREE states, not two, and a caller that prints one text for the
+    /// last two has hidden an instrument failure inside an ordinary
+    /// reading.** `(Some, Some)` is the range. `(None, Some)` is the routine
+    /// double-count: the upper bound prices above `live`, the floor does not,
+    /// and `.1` is still a real answer. `(None, None)` is `live` below the
+    /// FLOOR, after every correction this census can make — the census
+    /// reporting its own breakage, and the one whose figures deserve least
+    /// trust. Measured over 112,174 archived native process samples: 38.4 %,
+    /// 54.3 % and 7.3 %.
+    ///
+    /// A fourth pairing, `(Some, None)`, means [`Self::resident_floor`] sits
+    /// ABOVE [`Self::resident_total`]. It is not ruled out by the arithmetic —
+    /// it needs `radar_shared` to exceed the five smaller radar families plus
+    /// `raster_shared`, and `radar_shared` is published as `published − union`
+    /// so it also carries the loop cache's own internal duplication and is not
+    /// bounded by `still scans` — but it was not observed once in 58,283
+    /// archived census samples.
     pub fn unaccounted(&self, live: u64) -> (Option<u64>, Option<u64>) {
         (
             live.checked_sub(self.resident_total()),
@@ -1376,10 +1394,21 @@ pub const PROCESS_WALK_EVERY: u32 = 8;
 /// `the_widest_process_line_fits_its_buffer` says so rather than letting it
 /// land.
 ///
-/// The widest arm is the one where **both** the unaccounted range and the
+/// **`unaccounted` has THREE arms, and the widest line is no longer the
+/// range.** The arm added on 2026-09-11 for `live < families, live >= floor`
+/// carries one twenty-digit figure fewer than the range (`most` alone, not
+/// `least` and `most`) and 30 bytes more prose, and it is the only arm that
+/// can print a SATURATED `families` beside a twenty-digit `floor` — so it
+/// measures 774 bytes against the range arm's 723 and this constant is its
+/// width. The widest instance of it is `families` at `u64::MAX`, `floor` at
+/// `10^19` and `live` at `u64::MAX - 1`: `floor` and `most` cannot both reach
+/// twenty digits, because they sum to `live`, so 39 digits across the pair is
+/// the ceiling and either split gives the same width.
+///
+/// The next-widest arm is the one where **both** the unaccounted range and the
 /// `rss over live` term print their figures rather than their `none` prose:
 /// the range's `unaccounted <20> B to <20> B` is wider than
-/// `unaccounted none (families price above live)`, so the widest line is a
+/// `unaccounted none (families price above live)`, so that line is a
 /// census whose families price *below* `live`. Seventeen `u64::MAX` figures
 /// at 20 digits, the three counts among them, plus the prose — and the two
 /// census ends it prints (`families` and `floor`) grow with the census, so a
@@ -1405,7 +1434,17 @@ pub const PROCESS_WALK_EVERY: u32 = 8;
 /// `peak large blocks` is a COUNT and carries no `" B"`:
 /// `", peak large blocks "` is 20 characters plus twenty digits, so
 /// `20 + 20 = 40` and 683 becomes 723.
-pub const PROCESS_LINE_CAPACITY: usize = 723;
+///
+/// The `unaccounted at most` arm then takes it from 723 to **774**, and that
+/// +51 is not a digit and not a family: it is a different ARM of the same
+/// field becoming the widest one. Against the range arm it trades `least`'s
+/// twenty digits and `" B to "` (26) away and spends `" at most"` (8),
+/// `" (families price above live; the floor does not)"` (46), eleven digits
+/// on a saturated `families` and eleven on a twenty-digit `floor` — `+77 - 26
+/// = +51`. Re-derive by running `the_widest_process_line_fits_its_buffer`,
+/// which now measures all three arms and asserts equality; never carry the
+/// delta across a rebase.
+pub const PROCESS_LINE_CAPACITY: usize = 774;
 
 /// **The process denominator as one line.**
 ///
@@ -1478,6 +1517,36 @@ pub fn write_process_line<W: core::fmt::Write>(
             census.resident_total(),
             census.resident_floor(),
         ),
+        // **`live` is under the upper bound but not under the floor**, which
+        // is the ordinary consequence of the radar families sharing `Arc`s —
+        // [`Census::radar_total`] says so — and NOT a broken reading. The
+        // floor still bounds the heap, so `most` is a real answer and gets
+        // printed. Measured over 112,174 archived process samples on 380
+        // native legs: this is 54.3 % of all samples, against 7.3 % for the
+        // arm below, so collapsing the two hid a broken census inside an
+        // ordinary reading eight times in nine.
+        (None, Some(most)) => write!(
+            out,
+            ", families {} B floor {} B, unaccounted at most {most} B \
+             (families price above live; the floor does not)",
+            census.resident_total(),
+            census.resident_floor(),
+        ),
+        // **`live` is under the FLOOR**, after every correction this census
+        // knows how to make. That is the instrument reporting its own
+        // breakage rather than a fact about the heap, and the figures on this
+        // line are the ones that deserve least trust.
+        //
+        // `(Some, None)` — a floor ABOVE the upper bound — also lands here,
+        // and its prose would be wrong for it. It needs
+        // `radar shared > the five smaller radar families + rasters shared`,
+        // which `App::radar_shared_level` can reach in principle because it
+        // is `published − union` and so carries the loop cache's OWN internal
+        // duplication, unbounded by `still scans`. It was not observed once
+        // in 58,283 archived census samples (tightest margin 0 B, and only on
+        // an all-zero census), so it is left sharing this arm rather than
+        // given a fourth text a scraper would have to learn for a state
+        // nothing has ever printed.
         _ => write!(
             out,
             ", families {} B floor {} B, unaccounted none (families price above live)",
