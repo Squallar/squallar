@@ -419,6 +419,51 @@ pub fn gate_bytes_and_blocks(moment: &impl DataMoment) -> (usize, usize) {
     }
 }
 
+/// **The gate bytes this moment did NOT store** because they were a trailing run
+/// of the below-threshold sentinel — the fires-counter for that cut.
+///
+/// A *level* figure like [`gate_bytes`] cannot tell a small volume from a
+/// truncated one. This can: it is zero unless
+/// `MomentData::from_fixed_point_dropping_sentinel_tail` actually dropped
+/// something, so a reading of zero over a real volume means the cut did not
+/// fire and is a defect rather than a quiet success.
+///
+/// Counted at the same width the buffer is charged at, so
+/// `gate_bytes(m) + gate_bytes_dropped(m)` is what the moment would have cost
+/// before the cut — minus the block overheads, which the drop does not change
+/// unless the whole ray went away.
+pub fn gate_bytes_dropped(moment: &impl DataMoment) -> usize {
+    let step = if moment.data_word_size() == 16 { 2 } else { 1 };
+    usize::from(moment.trailing_sentinel_gates()).saturating_mul(step)
+}
+
+/// [`gate_bytes_dropped`] over every moment of every radial of every sweep.
+///
+/// The reader that makes the cut's claim checkable on a whole volume. Paired
+/// with [`scan_gate_bytes_and_blocks`] it gives the saving as a fraction of what
+/// the volume's gates would have cost, which is the figure the measurement was
+/// quoted in.
+pub fn scan_gate_bytes_dropped(scan: &nexrad_model::data::Scan) -> usize {
+    scan.sweeps()
+        .iter()
+        .flat_map(|sweep| sweep.radials())
+        .map(|radial| {
+            [
+                radial.reflectivity(),
+                radial.velocity(),
+                radial.spectrum_width(),
+                radial.differential_reflectivity(),
+                radial.differential_phase(),
+                radial.correlation_coefficient(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(gate_bytes_dropped)
+            .fold(0usize, usize::saturating_add)
+        })
+        .fold(0usize, usize::saturating_add)
+}
+
 /// **What a clone of this volume does NOT allocate**: the gate bytes and the
 /// blocks holding them, summed over every non-empty moment.
 ///

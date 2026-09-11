@@ -941,10 +941,31 @@ pub fn moment_value_at(
     let bytes = moment.raw_values();
     // Anything other than 16 is one byte per gate, which is how the model's own
     // `raw_gate_values` reads it. `raw_values().len()` is authoritative for how
-    // many gates there are, not `gate_count()`, for the same reason.
+    // many gates are STORED, not `gate_count()`, for the same reason.
     let step = if moment.data_word_size() == 16 { 2 } else { 1 };
     let start = gate.checked_mul(step)?;
-    let word = bytes.get(start..start.checked_add(step)?)?;
+    let Some(word) = bytes.get(start..start.checked_add(step)?) else {
+        // Past the stored bytes. A moment that dropped a below-threshold tail
+        // still ANSWERS for those gates, and with the sentinel the decoder
+        // read — `DataMoment::gates_present` is the authority on how far that
+        // reaches, and `raw_gate_values` restores the same zeroes for every
+        // consumer that iterates instead of indexing. Beyond it the gate is
+        // genuinely absent and stays `None`, which is what keeps a block
+        // declaring more gates than it carries reading `BeyondRange`.
+        if gate >= moment.gates_present() {
+            return None;
+        }
+        #[cfg(test)]
+        polar::note_gate_reads(1);
+        // Raw 0, decoded exactly as the iterator would decode it — so a
+        // `scale == 0.0` moment answers `Value(0.0)` here and a scaled one
+        // answers `BelowThreshold`, with no second spelling of the rule.
+        return Some(if moment.scale() == 0.0 {
+            MomentValue::Value(0.0)
+        } else {
+            MomentValue::BelowThreshold
+        });
+    };
 
     #[cfg(test)]
     polar::note_gate_reads((word.len() / step) as u64);

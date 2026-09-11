@@ -52,6 +52,24 @@ pub trait DataMoment {
     /// see [`GateBuffer`]. For a walk that must not charge one buffer twice
     /// when two clones of a volume are alive at once.
     fn gate_buffer(&self) -> &GateBuffer;
+
+    /// **LOCAL CHANGE.** Gates present on this moment that carry the
+    /// below-threshold sentinel and whose bytes were not stored. Zero unless the
+    /// block came from `from_fixed_point_dropping_sentinel_tail`.
+    ///
+    /// [`Self::raw_gate_values`] already restores them, so a consumer reading
+    /// gates needs nothing from this. It is for the two callers that index
+    /// `raw_values()` directly and for the byte accounting.
+    fn trailing_sentinel_gates(&self) -> u16;
+
+    /// **LOCAL CHANGE.** Gates this moment can answer for: the stored words plus
+    /// the restored sentinel tail. **This, not `raw_values().len()`, is the
+    /// authority on how many gates there are** — `raw_values()` is the authority
+    /// on how many are *stored*.
+    fn gates_present(&self) -> usize {
+        let step = if self.data_word_size() == 16 { 2 } else { 1 };
+        self.raw_values().len() / step + usize::from(self.trailing_sentinel_gates())
+    }
 }
 
 /// Implements [`DataMoment`] for a wrapper type that stores a `MomentDataBlock` as `self.inner`.
@@ -92,6 +110,9 @@ macro_rules! impl_data_moment {
             }
             fn gate_buffer(&self) -> &GateBuffer {
                 &self.inner.values.0
+            }
+            fn trailing_sentinel_gates(&self) -> u16 {
+                self.inner.trailing_sentinel_gates()
             }
         }
     };
@@ -246,6 +267,20 @@ pub(crate) struct MomentDataBlock {
     scale: f32,
     offset: f32,
     values: BinaryData<GateBuffer>,
+    /// **LOCAL CHANGE.** Gates that are present in the moment and carry the
+    /// below-threshold sentinel, but whose bytes are not stored — dropped as a
+    /// trailing run by [`MomentDataBlock::from_fixed_point_dropping_sentinel_tail`].
+    ///
+    /// Reads restore them: [`MomentDataBlock::raw_gate_values`] emits this many
+    /// raw zeroes after the stored bytes, so `iter`, `values` and every
+    /// consumer downstream of them see exactly the gates the decoder read.
+    ///
+    /// **Zero for every other constructor**, which is what keeps "declared
+    /// more gates than it carries" (a malformed or synthetic block, whose
+    /// unstored gates are *unknown*) distinct from "dropped a tail that was
+    /// measured and was sentinel". Those are different facts and only the
+    /// second may be restored as zeroes.
+    trailing_sentinel_gates: u16,
 }
 
 impl MomentDataBlock {
@@ -275,6 +310,14 @@ impl MomentDataBlock {
             scale: self.scale,
             offset: self.offset,
             values: BinaryData::from(GateBuffer::empty()),
+            // **Zero, deliberately.** A released block must go on yielding
+            // NOTHING from `raw_gate_values`, exactly as it did before this
+            // field existed: `skeleton`'s four silent readers are written
+            // against that. Restoring `gate_count` zeroes here would turn a
+            // gate-released volume into a fully below-threshold one, which is
+            // the blank-picture-reported-as-success failure that module exists
+            // to make unrepresentable.
+            trailing_sentinel_gates: 0,
         }
     }
 
@@ -333,7 +376,145 @@ impl MomentDataBlock {
             scale,
             offset,
             values: BinaryData::new(values),
+            // A buffer handed over whole has no implied tail. The spelling that
+            // carries one is `from_gate_buffer_with_sentinel_tail`, and it is a
+            // separate function rather than a defaulted argument because
+            // "declared more gates than it carries" and "dropped a measured
+            // sentinel tail" are different facts about a block.
+            trailing_sentinel_gates: 0,
         }
+    }
+
+    /// **LOCAL CHANGE.** [`Self::from_gate_buffer`] for a buffer whose trailing
+    /// run of below-threshold gates was dropped rather than stored, carrying the
+    /// count needed to restore them.
+    ///
+    /// **This is what makes the shared-buffer round trip in
+    /// `squallar_radar::render_input` compose with the truncation.** That round
+    /// trip takes a moment apart into scalars plus a `GateBuffer` and puts it
+    /// back together; the buffer is adopted by refcount, so a truncated one
+    /// arrives SHORT. Rebuilding it through plain [`Self::from_gate_buffer`]
+    /// would set the tail to zero and the reconstructed moment would answer for
+    /// `keep` gates instead of `gate_count` — silently, because the code plane
+    /// pads to `gate_count()` with the same sentinel and the picture would look
+    /// right while the velocity grid and the volumetric status plane saw gates
+    /// that were not there.
+    pub(crate) fn from_gate_buffer_with_sentinel_tail(
+        gate_count: u16,
+        first_gate_range: u16,
+        gate_interval: u16,
+        data_word_size: u8,
+        scale: f32,
+        offset: f32,
+        values: GateBuffer,
+        trailing_sentinel_gates: u16,
+    ) -> Self {
+        Self {
+            trailing_sentinel_gates,
+            ..Self::from_gate_buffer(
+                gate_count,
+                first_gate_range,
+                gate_interval,
+                data_word_size,
+                scale,
+                offset,
+                values,
+            )
+        }
+    }
+
+    /// **LOCAL CHANGE.** [`Self::from_fixed_point`] with the ray's trailing run
+    /// of below-threshold gates left unstored.
+    ///
+    /// # Why
+    ///
+    /// Gate buffers are 95.9 % of a decoded volume, and a radar ray is mostly
+    /// nothing: past the last gate that detected anything, every remaining gate
+    /// carries the below-threshold sentinel out to the end of the declared
+    /// sweep. MEASURED over 100 archived volumes from 8 sites and 5 VCPs
+    /// (`/home/reddragon/.cache/rd-t18-seam-corpus`), that trailing run is
+    /// **59.8 % of gate bytes on the precipitation VCP and 73.7 % on clear
+    /// air**, and no volume in the corpus was under 41.8 %.
+    ///
+    /// # Why this is lossless
+    ///
+    /// The drop is decided on, and restored at, the **raw** word level, before
+    /// any decode. `raw_gate_values` re-emits the dropped gates as raw `0`,
+    /// which is the byte the decoder would have read, so every consumer —
+    /// `iter`, `values`, `field::decode_moment_into`, the velocity grid, the
+    /// volumetric status plane — sees the identical sequence. This holds for a
+    /// `scale == 0.0` moment too, where raw `0` is an ordinary `Value(0.0)`
+    /// rather than a status code: padding is raw, so the decode that follows is
+    /// unchanged either way.
+    ///
+    /// Only a run of raw `0` is dropped. Range-folded gates (raw `1`) are
+    /// measurements and are stored; they are 0.06–0.48 % of gate bytes.
+    ///
+    /// # The caller's obligation
+    ///
+    /// `values` must be the moment's **complete** gate bytes, as read from the
+    /// message — `gate_count` gates of `data_word_size`. This constructor
+    /// converts "stored" into "stored plus a known sentinel tail", and that is
+    /// only true if nothing was missing on the way in.
+    pub(crate) fn from_fixed_point_dropping_sentinel_tail(
+        gate_count: u16,
+        first_gate_range: u16,
+        gate_interval: u16,
+        data_word_size: u8,
+        scale: f32,
+        offset: f32,
+        values: Vec<u8>,
+    ) -> Self {
+        let step = if data_word_size == 16 { 2 } else { 1 };
+        let whole = values.len() / step;
+        // The last gate that is not an all-zero word. `rposition` over whole
+        // words rather than over bytes: a 16-bit gate is sentinel only when
+        // BOTH its bytes are zero, and a byte-wise scan would stop on the
+        // high byte of a small non-zero value.
+        let keep = values
+            .chunks_exact(step)
+            .rposition(|word| word.iter().any(|&b| b != 0))
+            .map_or(0, |last| last + 1);
+        let dropped = whole.saturating_sub(keep);
+        // Only a tail this constructor can actually restore may be claimed.
+        // If the caller handed fewer bytes than `gate_count` declares, the
+        // gates beyond them are unknown, not sentinel, and stay that way.
+        let Ok(trailing_sentinel_gates) = u16::try_from(dropped) else {
+            return Self::from_fixed_point(
+                gate_count,
+                first_gate_range,
+                gate_interval,
+                data_word_size,
+                scale,
+                offset,
+                values,
+            );
+        };
+        let mut kept = values;
+        kept.truncate(keep * step);
+        // `truncate` alone keeps the original capacity, and capacity is what the
+        // allocator charged for — the whole point here is to hand `GateBuffer`
+        // a block the size of what it holds.
+        kept.shrink_to_fit();
+        // An all-sentinel ray keeps nothing, and routes to the ONE process-wide
+        // empty buffer rather than to a fresh zero-length `Arc`, so
+        // `scan_size::gate_bytes_and_blocks`'s `len == 0` arm (0 bytes, 0
+        // blocks) tells the truth about it.
+        let buffer = if kept.is_empty() {
+            GateBuffer::empty()
+        } else {
+            GateBuffer::from(kept)
+        };
+        Self::from_gate_buffer_with_sentinel_tail(
+            gate_count,
+            first_gate_range,
+            gate_interval,
+            data_word_size,
+            scale,
+            offset,
+            buffer,
+            trailing_sentinel_gates,
+        )
     }
 
     /// The number of gates in this data moment.
@@ -387,6 +568,13 @@ impl MomentDataBlock {
     }
 
     /// Iterator over raw gate values as `u16`, handling both 8-bit and 16-bit word sizes.
+    ///
+    /// **LOCAL CHANGE.** Ends with [`Self::trailing_sentinel_gates`] raw zeroes,
+    /// restoring a below-threshold tail that
+    /// [`Self::from_fixed_point_dropping_sentinel_tail`] chose not to store. The
+    /// count is zero for every other constructor, so this is the identity
+    /// iterator everywhere else — including for a gate-released block, which
+    /// goes on yielding nothing.
     fn raw_gate_values(&self) -> impl Iterator<Item = u16> + '_ {
         let is_16bit = self.data_word_size == 16;
         let step = if is_16bit { 2 } else { 1 };
@@ -401,6 +589,15 @@ impl MomentDataBlock {
                     chunk[0] as u16
                 }
             })
+            .chain(std::iter::repeat_n(
+                0u16,
+                usize::from(self.trailing_sentinel_gates),
+            ))
+    }
+
+    /// **LOCAL CHANGE.** See the field.
+    fn trailing_sentinel_gates(&self) -> u16 {
+        self.trailing_sentinel_gates
     }
 }
 
@@ -452,6 +649,35 @@ impl MomentData {
         }
     }
 
+    /// **LOCAL CHANGE.** [`Self::from_gate_buffer`] for a buffer whose trailing
+    /// below-threshold run was dropped — see
+    /// [`MomentDataBlock::from_gate_buffer_with_sentinel_tail`]. Carrying the
+    /// count is what lets a truncated moment survive a round trip that shares
+    /// the buffer instead of copying it.
+    pub fn from_gate_buffer_with_sentinel_tail(
+        gate_count: u16,
+        first_gate_range: u16,
+        gate_interval: u16,
+        data_word_size: u8,
+        scale: f32,
+        offset: f32,
+        values: GateBuffer,
+        trailing_sentinel_gates: u16,
+    ) -> Self {
+        Self {
+            inner: MomentDataBlock::from_gate_buffer_with_sentinel_tail(
+                gate_count,
+                first_gate_range,
+                gate_interval,
+                data_word_size,
+                scale,
+                offset,
+                values,
+                trailing_sentinel_gates,
+            ),
+        }
+    }
+
     /// Create new moment data from fixed-point encoding.
     pub fn from_fixed_point(
         gate_count: u16,
@@ -464,6 +690,33 @@ impl MomentData {
     ) -> Self {
         Self {
             inner: MomentDataBlock::from_fixed_point(
+                gate_count,
+                first_gate_range,
+                gate_interval,
+                data_word_size,
+                scale,
+                offset,
+                values,
+            ),
+        }
+    }
+
+    /// **LOCAL CHANGE.** [`Self::from_fixed_point`] with the ray's trailing run of
+    /// below-threshold gates left unstored — see
+    /// [`MomentDataBlock::from_fixed_point_dropping_sentinel_tail`] for what it
+    /// costs, what it saves and why it is lossless. `values` must be the
+    /// moment's complete gate bytes.
+    pub fn from_fixed_point_dropping_sentinel_tail(
+        gate_count: u16,
+        first_gate_range: u16,
+        gate_interval: u16,
+        data_word_size: u8,
+        scale: f32,
+        offset: f32,
+        values: Vec<u8>,
+    ) -> Self {
+        Self {
+            inner: MomentDataBlock::from_fixed_point_dropping_sentinel_tail(
                 gate_count,
                 first_gate_range,
                 gate_interval,
@@ -598,6 +851,35 @@ impl CFPMomentData {
                 scale,
                 offset,
                 values,
+            ),
+        }
+    }
+
+    /// **LOCAL CHANGE.** [`Self::from_gate_buffer`] for a buffer whose trailing
+    /// below-threshold run was dropped — see
+    /// [`MomentDataBlock::from_gate_buffer_with_sentinel_tail`]. Carrying the
+    /// count is what lets a truncated moment survive a round trip that shares
+    /// the buffer instead of copying it.
+    pub fn from_gate_buffer_with_sentinel_tail(
+        gate_count: u16,
+        first_gate_range: u16,
+        gate_interval: u16,
+        data_word_size: u8,
+        scale: f32,
+        offset: f32,
+        values: GateBuffer,
+        trailing_sentinel_gates: u16,
+    ) -> Self {
+        Self {
+            inner: MomentDataBlock::from_gate_buffer_with_sentinel_tail(
+                gate_count,
+                first_gate_range,
+                gate_interval,
+                data_word_size,
+                scale,
+                offset,
+                values,
+                trailing_sentinel_gates,
             ),
         }
     }

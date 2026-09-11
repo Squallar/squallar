@@ -394,8 +394,8 @@ fn the_volume_wire_layout_is_the_one_this_version_ships() {
     let bytes = a_volume().to_bytes();
     assert_eq!(
         (VERSION, bytes.len(), crate::wire::layout_digest(&bytes)),
-        (2, 1203, 0x4908_5ffd_c20a_bccc),
-        "the bytes `DecodedScan::to_bytes` writes are not the bytes version 2 \
+        (3, 1275, 0xefc1_6232_cedf_6ecb),
+        "the bytes `DecodedScan::to_bytes` writes are not the bytes version 3 \
          shipped. Something about this payload's layout moved — a field added, \
          removed, reordered, retyped, or written at a different width, here or \
          in the `DeclaredNyquist` table nested inside it. That is the change \

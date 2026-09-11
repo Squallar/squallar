@@ -15,7 +15,7 @@ const MAGIC: u16 = 0x5256;
 
 /// Bumped when the layout below changes. Read before anything else, so a
 /// payload from another generation is refused rather than misread.
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 
 /// `RadialStatus::Unknown`'s tag. The named variants take 0–5, which is the
 /// order upstream declares them in; 255 says "a byte followed".
@@ -349,7 +349,8 @@ impl DecodedScan {
                 for moment in moments.iter().flatten().chain(cfp.iter()) {
                     // gate count, first gate, interval, word size, scale,
                     // offset, gate length, gates.
-                    total += 2 + 2 + 2 + 1 + 4 + 4 + 4 + moment.gates.len();
+                    // The trailing `+ 2` is the trailing-sentinel-gate count.
+                    total += 2 + 2 + 2 + 1 + 4 + 4 + 2 + 4 + moment.gates.len();
                 }
             }
         }

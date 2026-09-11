@@ -160,6 +160,18 @@ pub(crate) struct MomentPayload {
     /// It derefs to `[u8]`, so readers spell `.len()` and `&gates[..]` as
     /// before.
     pub(crate) gates: GateBuffer,
+    /// Gates the moment answers for that are NOT in `gates`, because they were a
+    /// trailing run of the below-threshold sentinel that the decoder chose not
+    /// to store — see `MomentDataBlock::from_fixed_point_dropping_sentinel_tail`.
+    ///
+    /// **Carried, and not recomputed from `gate_count` minus the buffer.** The
+    /// buffer is SHARED here rather than copied, so a truncated moment arrives
+    /// short through a path that never allocated it; and `gate_count` minus the
+    /// stored gates is not the same quantity — for a block that merely declares
+    /// more gates than it carries, the difference is UNKNOWN gates rather than
+    /// sentinel ones, and inventing zeroes for those would be a fabrication.
+    /// Only a count the decoder actually measured may be restored.
+    trailing_sentinel_gates: u16,
 }
 
 impl RenderInput {
@@ -865,6 +877,7 @@ impl MomentPayload {
                 crate::payload_share::adopted(gates.as_slice().len());
                 gates
             },
+            trailing_sentinel_gates: moment.trailing_sentinel_gates(),
         }
     }
 
@@ -872,7 +885,7 @@ impl MomentPayload {
     /// payload that carries one. Same block, a different newtype over it.
     pub(crate) fn to_cfp_moment_data(&self) -> nexrad_model::data::CFPMomentData {
         crate::payload_share::returned(self.gates.as_slice().len());
-        nexrad_model::data::CFPMomentData::from_gate_buffer(
+        nexrad_model::data::CFPMomentData::from_gate_buffer_with_sentinel_tail(
             self.gate_count,
             self.first_gate_range_m,
             self.gate_interval_m,
@@ -880,12 +893,13 @@ impl MomentPayload {
             self.scale,
             self.offset,
             self.gates.clone(),
+            self.trailing_sentinel_gates,
         )
     }
 
     pub(crate) fn to_moment_data(&self) -> MomentData {
         crate::payload_share::returned(self.gates.as_slice().len());
-        MomentData::from_gate_buffer(
+        MomentData::from_gate_buffer_with_sentinel_tail(
             self.gate_count,
             self.first_gate_range_m,
             self.gate_interval_m,
@@ -893,6 +907,7 @@ impl MomentPayload {
             self.scale,
             self.offset,
             self.gates.clone(),
+            self.trailing_sentinel_gates,
         )
     }
 }
@@ -927,7 +942,7 @@ const MAGIC: [u8; 4] = *b"RDRI";
 /// layer object (`N0M`) as a length-prefixed blob. 11: the RPG's storm motion
 /// vector (`N0S` halfwords 51 and 52). 12: the derived-rung preference
 /// (`crate::srv::SrvFallback`) as one byte.
-const FORMAT_VERSION: u16 = 12;
+const FORMAT_VERSION: u16 = 13;
 
 impl RenderInput {
     /// Encode for transport. Little-endian throughout; gate blobs are copied
@@ -1229,10 +1244,15 @@ impl RenderInput {
                     + s.radials
                         .iter()
                         .map(|r| {
-                            10 + r.moment.as_ref().map_or(0, |m| 19 + m.gates.len())
+                            // 21 scalar bytes per moment: 2 gate count + 2
+                            // first-gate range + 2 gate interval + 1 word size
+                            // + 4 scale + 4 offset + 2 trailing sentinel gates
+                            // + 4 gate length. Extras carry a product code
+                            // byte on top.
+                            10 + r.moment.as_ref().map_or(0, |m| 21 + m.gates.len())
                                 + r.extras
                                     .iter()
-                                    .map(|(_, m)| 20 + m.gates.len())
+                                    .map(|(_, m)| 22 + m.gates.len())
                                     .sum::<usize>()
                         })
                         .sum::<usize>()
@@ -1253,6 +1273,7 @@ pub(crate) fn encode_moment(out: &mut Vec<u8>, moment: &MomentPayload) {
     out.push(moment.word_size);
     out.extend_from_slice(&moment.scale.to_le_bytes());
     out.extend_from_slice(&moment.offset.to_le_bytes());
+    out.extend_from_slice(&moment.trailing_sentinel_gates.to_le_bytes());
     out.extend_from_slice(&(moment.gates.len() as u32).to_le_bytes());
     out.extend_from_slice(moment.gates.as_slice());
 }
@@ -1264,6 +1285,11 @@ pub(crate) fn decode_moment(r: &mut Reader) -> Option<MomentPayload> {
     let word_size = r.u8()?;
     let scale = r.f32()?;
     let offset = r.f32()?;
+    // Before `gate_len`, matching `encode_moment`. This is a POSITIONAL format,
+    // so a reader that does not know about this field would take these two bytes
+    // as the high half of the length — which is why `FORMAT_VERSION` moved with
+    // it and the mismatch is refused rather than tolerated.
+    let trailing_sentinel_gates = r.u16()?;
     let gate_len = r.u32()?;
     // A fresh allocation on purpose: these bytes are borrowed from the wire
     // buffer, there is no buffer to adopt, and `payload_share` is not credited.
@@ -1276,6 +1302,7 @@ pub(crate) fn decode_moment(r: &mut Reader) -> Option<MomentPayload> {
         scale,
         offset,
         gates,
+        trailing_sentinel_gates,
     })
 }
 

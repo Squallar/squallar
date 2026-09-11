@@ -794,7 +794,7 @@ fn the_sentinel_elevation_is_one_no_sweep_can_carry() {
 
 #[test]
 fn the_format_version_is_the_one_this_layout_ships() {
-    assert_eq!(FORMAT_VERSION, 12);
+    assert_eq!(FORMAT_VERSION, 13);
     let bytes = RenderInput::extract(
         &volume(),
         0.5,
@@ -809,7 +809,7 @@ fn the_format_version_is_the_one_this_layout_ships() {
     assert_eq!(&bytes[..4], b"RDRI", "the magic moved");
     assert_eq!(
         u16::from_le_bytes([bytes[4], bytes[5]]),
-        12,
+        13,
         "the version is not where a decoder from another build looks for it",
     );
 }
@@ -823,6 +823,7 @@ fn layout_fixture() -> RenderInput {
         scale: 2.0,
         offset: 66.0,
         gates: vec![first, 128, 255].into(),
+        trailing_sentinel_gates: 0,
     };
     RenderInput {
         product: RadarProduct::Reflectivity,
@@ -886,8 +887,8 @@ fn the_wire_layout_is_the_one_this_version_ships() {
             bytes.len(),
             crate::wire::layout_digest(&bytes)
         ),
-        (12, 260, 0xaa29_1c4f_2a6e_feb5),
-        "the bytes `to_bytes` writes are not the bytes version 12 shipped. \
+        (13, 266, 0x3818_be3c_0fcb_ab5c),
+        "the bytes `to_bytes` writes are not the bytes version 13 shipped. \
          Something about this payload's layout moved — a field added, \
          removed, reordered, retyped, or written at a different width. That \
          is the change `FORMAT_VERSION` exists to announce, and a stale \

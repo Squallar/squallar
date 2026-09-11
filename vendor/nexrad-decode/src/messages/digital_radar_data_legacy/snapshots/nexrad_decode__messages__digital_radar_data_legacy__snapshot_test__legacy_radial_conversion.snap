@@ -35,6 +35,7 @@ Radial {
                         0,
                     ],
                 },
+                trailing_sentinel_gates: 0,
             },
         },
     ),
