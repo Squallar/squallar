@@ -177,8 +177,14 @@ pub(super) fn lane_job((id, request): (u64, JobRequest)) {
         log::debug!("{kind}: job {id} was withdrawn while it queued; never ran");
         return;
     }
+    let result = run(kind, &request);
+    // The input is dead the instant `run` answers, and `deliver` — which
+    // `deliver_job_reply` calls on this thread — is where the frame's picture
+    // is allocated. Freed before the call so the peak is `max(input, output)`
+    // and not `input + output`.
+    super::release_input(request);
     // Delivered on this thread. See `super::deliver_job_reply`.
-    super::deliver_job_reply(id, run(kind, &request));
+    super::deliver_job_reply(id, result);
 }
 
 /// Run a described job, answering `None` for one that panicked.

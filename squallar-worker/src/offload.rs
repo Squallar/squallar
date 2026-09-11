@@ -747,6 +747,71 @@ fn job_is_owed(id: u64) -> bool {
 }
 
 /// Job ids, unique across the process because [`PENDING`] is.
+/// Job inputs freed before their reply was delivered.
+///
+/// Both native run sites need the request only until [`execute`] answers, but
+/// used to hold it across `deliver` as well — and `deliver` is where the
+/// frame's picture is allocated (an `egui::ColorImage`, 206.75 MiB at the
+/// 7362 px desktop ceiling, see [`deliver_job_reply`]). Holding both made the
+/// peak `input + output` where `max(input, output)` was available for a
+/// `drop`.
+///
+/// **This counts the release, not the bytes.** It answers the one question a
+/// landed cut cannot answer for itself: whether either run path was taken at
+/// all. Zero here means no job reached [`pool::lane_job`] or [`run_here`] —
+/// every job went to a sink and was answered through
+/// [`deliver_encoded_reply`], which never owned an input to free.
+static INPUTS_RELEASED_BEFORE_DELIVERY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many job inputs were freed before their reply was delivered. See
+/// [`INPUTS_RELEASED_BEFORE_DELIVERY`]. Diagnostics and tests; nothing gates
+/// on it.
+pub fn inputs_released_before_delivery() -> u64 {
+    INPUTS_RELEASED_BEFORE_DELIVERY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Job inputs that were the **last** handle to their envelope when released.
+///
+/// The count above says the release happened; this one says it could free
+/// anything. Most large inputs are dispatched from behind a page-side memo or
+/// cache that holds the same `Arc` for the length of the run — the overlay
+/// `JobMemo` rows, the radar extract cache, the page's compressed archive —
+/// and against one of those the release is a refcount decrement and the bytes
+/// stay. A cut whose counter reads zero here freed framing, not payload.
+///
+/// **It sees one level.** This is the count of handles to the envelope
+/// (`DescribedJob`'s `Arc<dyn JobInput>`), so it catches a dispatch site that
+/// cloned the whole described job. It does NOT see an input that is itself
+/// sole-owned while its *fields* are `Arc`s shared with a source — radar gate
+/// buffers, the HRRR grid, an alert's rings. Those read as solely owned here
+/// and still free only the spine. Read it as an upper bound on what the
+/// release can have freed, never as a byte figure.
+static INPUTS_SOLELY_OWNED_AT_RELEASE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many released inputs were the last handle to their envelope. See
+/// [`INPUTS_SOLELY_OWNED_AT_RELEASE`], whose doc bounds what this can mean.
+pub fn inputs_solely_owned_at_release() -> u64 {
+    INPUTS_SOLELY_OWNED_AT_RELEASE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Free `request` ahead of its delivery, recording that it happened and
+/// whether it could free anything.
+///
+/// The drop is **inside** this call rather than at either site, so the two run
+/// paths cannot drift on the one ordering that matters: the input is gone
+/// before `deliver` allocates the picture.
+fn release_input(request: JobRequest) {
+    // A snapshot, and deliberately not synchronised: another owner may drop
+    // its handle the instant after this reads. It is a diagnostic, not a lock.
+    if std::sync::Arc::strong_count(&request.job.0) == 1 {
+        INPUTS_SOLELY_OWNED_AT_RELEASE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    INPUTS_RELEASED_BEFORE_DELIVERY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    drop(request);
+}
+
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Sink ids. A fresh one per installed sink, so [`Pending::sink`] identifies the
@@ -923,7 +988,11 @@ fn run_here(name: &'static str, request: JobRequest, deliver: Box<dyn FnOnce(Job
     {
         // Timed because this is the one arm where the cost lands on the frame.
         let started = web_time::Instant::now();
-        deliver(execute(&request));
+        let result = execute(&request);
+        // The input is dead the instant `execute` answers; `deliver` allocates
+        // the picture. Freed here so the two are never resident together.
+        release_input(request);
+        deliver(result);
         log::info!(
             "{name} took {} ms on the main thread",
             started.elapsed().as_millis()
@@ -932,7 +1001,11 @@ fn run_here(name: &'static str, request: JobRequest, deliver: Box<dyn FnOnce(Job
     #[cfg(not(target_arch = "wasm32"))]
     {
         let task = std::sync::Arc::new(std::sync::Mutex::new(Some(move || {
-            deliver(execute(&request))
+            let result = execute(&request);
+            // As the wasm arm above: the input is dead once `execute` answers,
+            // and `deliver` is what allocates the picture.
+            release_input(request);
+            deliver(result)
         })));
         let on_thread = std::sync::Arc::clone(&task);
         let spawned = std::thread::Builder::new()
