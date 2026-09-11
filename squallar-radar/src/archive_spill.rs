@@ -18,23 +18,42 @@
 //!
 //! # Priced against the decode it precedes, and never against nothing
 //!
-//! Measured over the 208-file local Archive II corpus at its minimum, median
-//! and maximum compressed size — a cold read, page cache dropped with
+//! Measured over the 208-file local Archive II corpus at its minimum, median,
+//! p90 and maximum compressed size — a cold read, page cache dropped with
 //! `posix_fadvise(POSIX_FADV_DONTNEED)`, median of five draws — against the
 //! single-threaded bzip2 decode that always follows it:
 //!
-//! | archive | cold read | bzip2 decode | read as % of decode |
-//! |---|---|---|---|
-//! | 0.34 MiB | 1.02 ms | 19.3 ms | 5.3 % |
-//! | 5.58 MiB | 11.62 ms | 305.8 ms | 3.8 % |
-//! | 17.96 MiB | 27.70 ms | 915.8 ms | 3.0 % |
+//! | archive | cold read | bzip2 decode |
+//! |---|---|---|
+//! | 0.34 MiB | 1.23 ms | 4.7 ms |
+//! | 5.54 MiB | 19.09 ms | 15.2 ms |
+//! | 10.99 MiB | 35.04 ms | 25.1 ms |
+//! | 17.96 MiB | 55.18 ms | 41.3 ms |
 //!
 //! The decode is not a cost this module adds — it is what a restore has
-//! always been, and that single-threaded 19.3 ms – 915.8 ms range is the
-//! measured restore figure on a browser's serial rayon pool (13.6 ms – 1.03 s)
-//! identified. The read is 3.0–5.3 % on top of a cost the path already pays,
-//! so eviction stays worthwhile by a wide margin: 11.6 ms of I/O to free a
-//! 50.7 MB decoded volume.
+//! always been. **It is also far smaller than this table said until
+//! 2026-09-10**, and the correction matters because the old figures were the
+//! stated reason eviction is cheap. They read 19.3 / 305.8 / 915.8 ms for the
+//! decode column, and no release build of this tree reproduces them: the
+//! decode above is `jobs::DecodeJob::run` — the production path, single
+//! volume at a time, median of five draws — and it agrees with the
+//! independent release-profile reading at `LOOP_DECODED_LOOKAHEAD_FRAMES`
+//! (6.0 / 10.7 / 40.9 ms over a different corpus) and not with the row it
+//! replaces. The old decode column is a ~20x overstatement of the current
+//! tree; what produced it is not established here, so it is retracted rather
+//! than explained.
+//!
+//! **The "read is 3.0–5.3 % of the decode" ratio goes with it**, and it
+//! inverts: the cold read is 26 % of the decode at the corpus minimum and
+//! 134 % of it at the maximum. A restore is I/O-bound, not CPU-bound. The
+//! read column above was taken on a box at loadavg 18–73 and is inflated by
+//! that; the decode column is CPU and is therefore an UPPER bound on a quiet
+//! box, which is the direction that keeps the retraction conservative.
+//!
+//! Eviction stays worthwhile, and on a stronger footing than the old ratio
+//! gave it: the whole restore is tens of milliseconds against a decoded
+//! volume of 15.8 MiB median and 41.4 MiB maximum (`scan_size::scan_bytes`
+//! over the same 208 volumes), off the frame thread on the job funnel.
 //!
 //! # `read`, never `mmap` — the two counters do not move together
 //!

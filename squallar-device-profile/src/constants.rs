@@ -1016,10 +1016,13 @@ pub const DESKTOP_LOOP_DECODED_CEILING_BYTES: usize = 256 * 1024 * 1024;
 ///
 /// Below ~67 MiB the sixth site's lookahead would round-trip on every playback
 /// wrap, which is the one case where the restore cost recurs predictably
-/// instead of rarely. That cost is measured and small — a cold read is
-/// 3.0-5.3 % of the bzip2 decode it always precedes (1.02 ms against 19.3 ms
-/// at the corpus minimum, 27.70 ms against 915.8 ms at the maximum) — but it
-/// is a cost, and it is the reason this is 96 MiB and not 0.
+/// instead of rarely. That cost is measured and small, but NOT for the reason
+/// this paragraph gave until 2026-09-10: the cold read is 26 % of the bzip2
+/// decode at the corpus minimum and 134 % of it at the maximum (1.23 ms
+/// against 4.7 ms, 55.18 ms against 41.3 ms), so a restore is I/O-bound and
+/// the whole of it is tens of milliseconds. `squallar_radar::archive_spill`
+/// carries the table and retracts the 19.3-915.8 ms decode column this cited.
+/// It is still a cost, and still the reason this is 96 MiB and not 0.
 ///
 /// The lever for a smaller archive total is the FRAME LIST the archives
 /// follow, not this number. That list is bounded by a count
