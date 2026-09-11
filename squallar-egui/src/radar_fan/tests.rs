@@ -50,9 +50,10 @@ fn one_level() -> FanSweep {
         field: squallar_radar::fields::known::HYDROMETEOR_CLASSIFICATION,
         radials: 8,
         gates: 4,
-        codes: (0..32u32).map(|i| i as u8).collect(),
+        codes: std::sync::Arc::new((0..32u32).map(|i| i as u8).collect()),
         level_offsets: vec![0],
         lut_rgba: vec![7; LUT_BYTES],
+        value_table: std::sync::Arc::new(vec![0.0; LUT_ENTRIES]),
         edges: (0..8)
             .map(|i| [i as f32 * 45.0, (i + 1) as f32 * 45.0])
             .collect(),
@@ -64,7 +65,7 @@ fn one_level() -> FanSweep {
 /// levels and 32 + 8 + 2 + 1 = 43 bytes.
 fn chained() -> FanSweep {
     FanSweep {
-        codes: (0..43u32).map(|i| i as u8).collect(),
+        codes: std::sync::Arc::new((0..43u32).map(|i| i as u8).collect()),
         level_offsets: vec![0, 32, 40, 42],
         ..one_level()
     }
@@ -111,7 +112,7 @@ fn a_ragged_chain_is_well_formed_at_the_lengths_the_texture_gives() {
     let sweep = FanSweep {
         radials: 5,
         gates: 3,
-        codes: vec![1; 18],
+        codes: std::sync::Arc::new(vec![1; 18]),
         level_offsets: vec![0, 15, 17],
         edges: vec![[0.0, 72.0]; 5],
         geometry: FanGeometry {
@@ -149,7 +150,7 @@ fn every_malformation_is_refused_one_at_a_time() {
         (
             "level 0 not starting at 0",
             FanSweep {
-                codes: vec![0; 33],
+                codes: std::sync::Arc::new(vec![0; 33]),
                 level_offsets: vec![1],
                 ..one_level()
             },
@@ -202,14 +203,14 @@ fn every_malformation_is_refused_one_at_a_time() {
         (
             "codes short of the level it declares",
             FanSweep {
-                codes: vec![0; 31],
+                codes: std::sync::Arc::new(vec![0; 31]),
                 ..one_level()
             },
         ),
         (
             "codes past the levels it declares",
             FanSweep {
-                codes: vec![0; 33],
+                codes: std::sync::Arc::new(vec![0; 33]),
                 ..one_level()
             },
         ),
@@ -227,7 +228,7 @@ fn every_malformation_is_refused_one_at_a_time() {
             // instead, and would say nothing about this one.
             "a chain with a gap between two levels",
             FanSweep {
-                codes: vec![0; 43],
+                codes: std::sync::Arc::new(vec![0; 43]),
                 level_offsets: vec![0, 33, 41, 43],
                 ..chained()
             },
@@ -239,23 +240,32 @@ fn every_malformation_is_refused_one_at_a_time() {
 }
 
 /// The one figure a budget would read, and it is read off the vectors.
+///
+/// **The value table is a term here since 2026-09-10**, when the readout began
+/// answering out of the picture's own plane and the payload started carrying
+/// what the codes decode to. It is a real 1,024 B a sweep and this is the only
+/// family that charges it — `squallar_radar::hover::CodedGates::resident_bytes`
+/// answers 0 precisely because this figure does not.
+///
+/// Every term is still the extent of a buffer this object holds rather than a
+/// number recorded here, which is the property the name states.
 #[test]
 fn resident_bytes_is_the_buffers_and_not_the_shape() {
     let sweep = chained();
     assert_eq!(
         sweep.resident_bytes(),
-        43 + LUT_BYTES + 8 * size_of::<[f32; 2]>()
+        43 + LUT_BYTES + 8 * size_of::<[f32; 2]>() + LUT_ENTRIES * size_of::<f32>()
     );
     // A payload whose codes are longer than its shape says still reports what
     // it is holding: this measures the object, so it cannot be a second
     // spelling of a price computed from `radials x gates`.
     let fat = FanSweep {
-        codes: vec![0; 1_000],
+        codes: std::sync::Arc::new(vec![0; 1_000]),
         ..chained()
     };
     assert_eq!(
         fat.resident_bytes(),
-        1_000 + LUT_BYTES + 8 * size_of::<[f32; 2]>()
+        1_000 + LUT_BYTES + 8 * size_of::<[f32; 2]>() + LUT_ENTRIES * size_of::<f32>()
     );
 }
 
@@ -266,7 +276,7 @@ fn a_level_that_is_not_there_is_none_and_never_a_short_slice() {
     let sweep = chained();
     assert_eq!(sweep.level(4), None);
     let truncated = FanSweep {
-        codes: vec![0; 42],
+        codes: std::sync::Arc::new(vec![0; 42]),
         ..chained()
     };
     assert_eq!(truncated.level(3), None);
@@ -296,7 +306,7 @@ fn no_radials() -> FanSweep {
     FanSweep {
         radials: 0,
         edges: Vec::new(),
-        codes: Vec::new(),
+        codes: std::sync::Arc::new(Vec::new()),
         ..one_level()
     }
 }
@@ -307,7 +317,7 @@ fn no_radials() -> FanSweep {
 fn no_levels() -> FanSweep {
     FanSweep {
         level_offsets: Vec::new(),
-        codes: Vec::new(),
+        codes: std::sync::Arc::new(Vec::new()),
         ..one_level()
     }
 }
@@ -332,7 +342,7 @@ fn each_guard_is_the_sole_reason_some_payload_is_refused() {
             FanSweep {
                 radials: 1,
                 edges: vec![[0.0, 45.0]],
-                codes: vec![0; 4],
+                codes: std::sync::Arc::new(vec![0; 4]),
                 ..one_level()
             },
         ),
@@ -401,7 +411,7 @@ fn each_guard_is_the_sole_reason_some_payload_is_refused() {
         (
             "codes are exactly the levels' length",
             FanSweep {
-                codes: vec![0; 33],
+                codes: std::sync::Arc::new(vec![0; 33]),
                 ..one_level()
             },
             one_level(),
@@ -453,4 +463,117 @@ fn every_outcome_has_a_counter_of_its_own() {
             .count(),
         ledger::EVERY_OUTCOME.len() - 1
     );
+}
+
+/// **The picture's family is the one that charges the plane**, and it charges
+/// it a byte a byte.
+///
+/// `squallar_radar::hover::CodedGates::resident_bytes` answers 0 on purpose:
+/// the readout borrows this buffer, and charging it there as well would name
+/// one allocation in two census families. That is only correct while the
+/// charge is really *here* — if this figure ignored `codes`, zeroing the other
+/// would make the bytes vanish from the census altogether and a cut over them
+/// would post a win by making memory invisible rather than absent.
+///
+/// So this asserts the charge moves with the buffer, by the buffer's own
+/// growth, rather than asserting a remembered total.
+#[test]
+fn the_payloads_own_price_carries_the_code_plane() {
+    let base = one_level();
+    let before = base.resident_bytes();
+
+    let grown_by = 64usize;
+    let mut codes = base.codes.as_ref().clone();
+    codes.extend(std::iter::repeat_n(0u8, grown_by));
+    let grown = FanSweep {
+        codes: std::sync::Arc::new(codes),
+        ..one_level()
+    };
+
+    assert_eq!(
+        grown.resident_bytes(),
+        before + grown_by,
+        "the code plane is not charged here, so nothing charges it: \
+         `CodedGates::resident_bytes` answers 0 because it trusts this figure"
+    );
+    assert!(
+        before >= base.codes.len(),
+        "a price below the plane's own length cannot be charging for it"
+    );
+}
+
+/// **A healthy payload still draws, asserted on a literal built right here.**
+///
+/// `is_well_formed` gained a conjunct on [`FanSweep::value_table`], and a
+/// conjunct narrows what PASSES as well as what fails. That direction is the
+/// dangerous one because it is invisible in a green suite: the gate has a
+/// production caller (`ui_map_pane`'s draw fork), so a payload that used to be
+/// accepted and is now refused is a pane with no radar on it, not a failing
+/// test.
+///
+/// Every other positive case in this file reaches the gate through
+/// `one_level` or `chained`, and the change that added the conjunct also
+/// edited both — so none of them is *independent* evidence any longer. This
+/// literal names every field itself.
+///
+/// The pair is the whole point: with the table at its full length the payload
+/// must pass, and with **only** that length changed it must be refused. One
+/// without the other proves nothing — the first alone cannot tell the conjunct
+/// is live, and the second alone cannot tell it is not refusing healthy
+/// pictures.
+#[test]
+fn a_hand_built_payload_passes_and_only_its_table_length_flips_that() {
+    let healthy = FanSweep {
+        field: squallar_radar::fields::known::REFLECTIVITY,
+        radials: 8,
+        gates: 4,
+        codes: std::sync::Arc::new(vec![3; 32]),
+        level_offsets: vec![0],
+        lut_rgba: vec![9; LUT_BYTES],
+        value_table: std::sync::Arc::new(vec![0.5; LUT_ENTRIES]),
+        edges: (0..8)
+            .map(|i| [i as f32 * 45.0, (i + 1) as f32 * 45.0])
+            .collect(),
+        geometry: geometry(),
+    };
+    assert!(
+        healthy.is_well_formed(),
+        "a payload carrying a full value table is refused — the new conjunct is \
+         narrowing what the draw fork will accept"
+    );
+
+    for wrong in [LUT_ENTRIES - 1, LUT_ENTRIES + 1] {
+        let bad = FanSweep {
+            value_table: std::sync::Arc::new(vec![0.5; wrong]),
+            codes: std::sync::Arc::clone(&healthy.codes),
+            lut_rgba: healthy.lut_rgba.clone(),
+            level_offsets: healthy.level_offsets.clone(),
+            edges: healthy.edges.clone(),
+            ..healthy_shape()
+        };
+        assert!(
+            !bad.is_well_formed(),
+            "a table of {wrong} entries is accepted, so a code can decode past \
+             the end of it and the conjunct is not live"
+        );
+    }
+}
+
+/// The shape [`a_hand_built_payload_passes_and_only_its_table_length_flips_that`]
+/// varies one field of, so the negative cases differ from the positive one in
+/// the table alone.
+fn healthy_shape() -> FanSweep {
+    FanSweep {
+        field: squallar_radar::fields::known::REFLECTIVITY,
+        radials: 8,
+        gates: 4,
+        codes: std::sync::Arc::new(vec![3; 32]),
+        level_offsets: vec![0],
+        lut_rgba: vec![9; LUT_BYTES],
+        value_table: std::sync::Arc::new(vec![0.5; LUT_ENTRIES]),
+        edges: (0..8)
+            .map(|i| [i as f32 * 45.0, (i + 1) as f32 * 45.0])
+            .collect(),
+        geometry: geometry(),
+    }
 }

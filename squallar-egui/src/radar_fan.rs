@@ -147,13 +147,29 @@ pub struct FanSweep {
     /// Gates at level 0 — the stride of a level-0 row.
     pub gates: u32,
     /// Level 0 followed by every further level, concatenated in level order.
-    pub codes: Vec<u8>,
+    ///
+    /// **Shared, and that is load-bearing.** The readout under the pointer
+    /// reads level 0 of this very buffer — `squallar_radar::hover::CodedGates`
+    /// holds a clone of this `Arc` — so a loop frame answers a hover without
+    /// cloning a moment out of the volume it was drawn from and without
+    /// pinning that volume. An `Arc` rather than a `Vec` is what makes the
+    /// readout cost a refcount instead of a second copy of the plane.
+    pub codes: std::sync::Arc<Vec<u8>>,
     /// Byte offset into [`Self::codes`] at which each level begins, level 0
     /// first. Its length is the number of levels, which is `1` for a
     /// categorical field whose codes must never be reduced.
     pub level_offsets: Vec<u32>,
     /// The colour table, [`LUT_BYTES`] of straight RGBA.
     pub lut_rgba: Vec<u8>,
+    /// **What each code decodes to**, 256 entries — the picture's colours say
+    /// what a gate looks like and this says what it *is*.
+    ///
+    /// Carried so the readout can answer from the plane rather than from the
+    /// volume: `lut_rgba` is not invertible, so a fan with only colours can be
+    /// drawn but not read. Baked once off the frame thread by
+    /// `squallar_radar::render::codes::CodePlane::value_table`, beside the
+    /// colour table it is the other half of.
+    pub value_table: std::sync::Arc<Vec<f32>>,
     /// The **drawn** sky of each radial, degrees clockwise from true north, as
     /// `(lo, hi)` — one entry per radial, in the render's own radial order.
     ///
@@ -205,7 +221,10 @@ impl FanSweep {
     /// small beside the plane and not small enough to round away when a pane
     /// is holding sixty of them.
     pub fn resident_bytes(&self) -> usize {
-        self.codes.len() + self.lut_rgba.len() + self.edges.len() * size_of::<[f32; 2]>()
+        self.codes.len()
+            + self.lut_rgba.len()
+            + self.edges.len() * size_of::<[f32; 2]>()
+            + self.value_table.len() * size_of::<f32>()
     }
 
     /// Whether this payload describes itself consistently.
@@ -239,6 +258,13 @@ impl FanSweep {
         // and anything longer is a producer and a consumer that disagree about
         // how many colours a code plane can address. Equality, both ways.
         if self.lut_rgba.len() != LUT_BYTES {
+            return false;
+        }
+        // And the value table by the same reading of the same question: it is
+        // indexed by a whole byte, so short is a code that decodes past the
+        // end and long is a producer and a readout disagreeing about how many
+        // numbers a code plane can name. Equality, both ways.
+        if self.value_table.len() != LUT_ENTRIES {
             return false;
         }
         if self.geometry.reach_gates == 0 || self.geometry.reach_gates > self.gates {

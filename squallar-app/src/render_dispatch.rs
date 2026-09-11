@@ -149,9 +149,15 @@ pub fn fan_sweep(
         field: crate::render_key::field_id_of(plane.product()),
         radials: u32::try_from(radials).ok()?,
         gates: u32::try_from(gates).ok()?,
-        codes,
+        // Shared with the readout rather than copied for it — see
+        // `FanSweep::codes` and `squallar_radar::hover::CodedGates`.
+        codes: std::sync::Arc::new(codes),
         level_offsets,
         lut_rgba: plane.lut().to_rgba_bytes(),
+        // Baked here, on the lane the reply is delivered on, beside the colour
+        // table and for the reason this function's own doc gives about the
+        // chain walk: neither belongs on the frame thread.
+        value_table: std::sync::Arc::new(plane.value_table()),
         edges,
         geometry: squallar_egui::radar_fan::FanGeometry {
             site_lat,

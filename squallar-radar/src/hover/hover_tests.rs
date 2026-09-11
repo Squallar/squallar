@@ -681,3 +681,61 @@ fn a_gap_radial_does_not_shift_the_radials_after_it() {
         "only {valued} valued reads — the fixture is empty"
     );
 }
+
+/// **A loop frame's `SweepGates` splits into two terms that are returned to
+/// the heap under different conditions**, and the split is the whole of what
+/// "how much does dropping it give back" depends on.
+///
+/// * The `Vec<Option<MomentData>>` itself is **this frame's own allocation**,
+///   shared with nothing. Dropping the frame returns it unconditionally.
+/// * The gate arrays are `GateBuffer` refcounts into the volume the sweep came
+///   out of. Dropping the frame returns them **only if nothing else holds that
+///   volume** — which is what `LoopFrameStore::sole_pinned_volume_bytes`
+///   measures at runtime and what `pinned_volume_bytes` over-counts.
+///
+/// So the container is a floor on the saving and the total is the ceiling, and
+/// a reader who quotes the total as the saving is quoting the ceiling. Pinned
+/// here as an identity rather than as either figure, so it cannot drift into
+/// one of them.
+///
+/// **Measured on this fixture, 2026-09-10**: 360 radials, container 8,656 B,
+/// gates 169,920 B, total 178,576 B — so the unconditional floor is **4.85 %**
+/// of the figure `pinned_volume_bytes` reports and the other 95.15 % is the
+/// runtime `sole` fraction's to give or withhold. Both figures are this
+/// fixture's and belong to no other: `squallar-app`'s own `scan_with_echo`
+/// sweep prices at 142,576 B for the same 360 radials, because it carries a
+/// different gate count. Neither number describes a real volume, which is
+/// 720 radials wide.
+#[test]
+fn a_sweeps_price_splits_into_its_own_vector_and_the_volumes_gates() {
+    let scan = volume(360, false);
+    let gates = SweepGates::new(&scan, RadarProduct::Reflectivity, ELEVATION)
+        .expect("the fixture carries reflectivity at this cut");
+
+    let index = crate::render::sweep_index_for(&scan, RadarProduct::Reflectivity, ELEVATION)
+        .expect("the same sweep the readout took");
+    let sweep = &scan.sweeps()[index];
+    let gate_term: usize = sweep
+        .radials()
+        .iter()
+        .filter_map(|r| RadarProduct::Reflectivity.get_moment(r))
+        .map(crate::scan_size::gate_bytes)
+        .sum();
+    let container = sweep
+        .radials()
+        .len()
+        .saturating_mul(size_of::<Option<nexrad_model::data::MomentData>>())
+        .saturating_add(crate::scan_size::ALLOCATOR_BLOCK_OVERHEAD);
+
+    assert_eq!(
+        gates.scan_bytes(),
+        container.saturating_add(gate_term),
+        "the priced figure is not the two terms it is made of, so neither \
+         bound below can be read off it"
+    );
+    assert!(
+        container > 0 && gate_term > container,
+        "container {container} B, gates {gate_term} B — the fixture must have \
+         both terms, and the gates must dominate, or the split says nothing"
+    );
+}

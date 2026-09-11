@@ -755,7 +755,8 @@ fn fan_sweeps() -> std::sync::Arc<[std::sync::Arc<squallar_egui::radar_fan::FanS
             field: squallar_radar::fields::known::REFLECTIVITY,
             radials: 4,
             gates: 2,
-            codes: vec![0; 8],
+            codes: std::sync::Arc::new(vec![0; 8]),
+            value_table: std::sync::Arc::new(vec![0.0; squallar_egui::radar_fan::LUT_ENTRIES]),
             level_offsets: vec![0],
             lut_rgba: vec![0; squallar_egui::radar_fan::LUT_BYTES],
             edges: vec![[0.0, 90.0], [90.0, 180.0], [180.0, 270.0], [270.0, 360.0]],
@@ -1532,7 +1533,7 @@ fn fan_sweeps_of(
 ) -> std::sync::Arc<[std::sync::Arc<squallar_egui::radar_fan::FanSweep>]> {
     let mut sweep = (*fan_sweeps()[0]).clone();
     sweep.gates = gates;
-    sweep.codes = vec![0; (sweep.radials * gates) as usize];
+    sweep.codes = std::sync::Arc::new(vec![0; (sweep.radials * gates) as usize]);
     sweep.geometry.reach_gates = gates;
     assert!(
         sweep.is_well_formed(),
@@ -1644,5 +1645,264 @@ fn a_measured_polar_frame_is_cheaper_than_the_raster_it_replaces() {
         polar < raster,
         "a polar frame ({polar} B) is not cheaper than the raster loop frame \
          it replaces ({raster} B), so the switch buys nothing"
+    );
+}
+
+/// The fan a loop frame of the fixture volume carries, and the **resident**
+/// field beside it as the oracle for what a readout over that fan must answer.
+///
+/// `values_wanted: true` here is the oracle's doing and not the frame's: the
+/// loop path asks for `false` and the reply strips what it gets, which is why
+/// the frame's own field below is stripped before it is handed over.
+fn fan_fixture(
+    lat: f64,
+    lon: f64,
+) -> (
+    Arc<squallar_egui::radar_fan::FanSweep>,
+    squallar_radar::render::polar::PolarField,
+) {
+    let scan = scan_with_echo();
+    let render = squallar_radar::render::render_sweep_plane(
+        &scan,
+        0.5,
+        RadarProduct::Reflectivity,
+        &squallar_radar::nyquist::DeclaredNyquist::empty(),
+        true,
+    )
+    .expect("the fixture sweep carries a code plane");
+    let plane = render
+        .codes
+        .as_ref()
+        .expect("the polar surface was asked for and given");
+    let fan = crate::render_dispatch::fan_sweep(plane, render.polar.geometry(), lat, lon)
+        .expect("the plane and its geometry describe one picture");
+    (Arc::new(fan), render.polar)
+}
+
+/// A loop response carrying the fixture's stripped field, as the reply
+/// delivers one.
+fn fan_response(
+    lat: f64,
+    lon: f64,
+    resident: &squallar_radar::render::polar::PolarField,
+) -> crate::channels::LoopRenderResponse {
+    let mut rr = response(
+        ts(0),
+        test_keys::key("KTLX", &squallar_radar::fields::known::REFLECTIVITY, 0.5),
+    );
+    rr.site_lat = lat;
+    rr.site_lon = lon;
+    let mut stripped = resident.clone();
+    stripped.strip_values();
+    rr.polar = stripped;
+    rr
+}
+
+/// Sample the disc, returning `(points, points that answered a number)`.
+fn sample_readings(hover: &squallar_radar::hover::HoverSource) -> (u32, u32) {
+    let (mut checked, mut values) = (0u32, 0u32);
+    let mut az = 0.5f64;
+    while az < 360.0 {
+        let mut km = 1.0f64;
+        while km < 70.0 {
+            checked += 1;
+            if matches!(hover.read(az, km), squallar_radar::hover::Reading::Value(_)) {
+                values += 1;
+            }
+            km *= 1.2;
+        }
+        az += 3.0;
+    }
+    (checked, values)
+}
+
+/// **The readout holds the picture's own allocation, asserted by identity.**
+///
+/// The whole saving is that `Arc::ptr_eq` — a readout over a *copy* of the same
+/// bytes would be byte-for-byte indistinguishable and would cost the plane
+/// twice, which is the shape of unrealised alias this campaign has already
+/// paid for. So equality is not the assertion; identity is, and the tamper
+/// below is a byte-identical copy that must fail it.
+#[test]
+fn the_readout_borrows_the_pictures_own_plane() {
+    let (lat, lon) = (35.3333, -97.2778);
+    let (fan, resident) = fan_fixture(lat, lon);
+    let rr = fan_response(lat, lon, &resident);
+
+    let surface = squallar_egui::pane::RadarSurface::Fan(Arc::from(vec![Arc::clone(&fan)]));
+    let img = rendered_image(&rr, surface, None);
+
+    let coded = img
+        .hover
+        .coded_plane()
+        .expect("a fan-drawn frame reads out of its own plane");
+    assert!(
+        Arc::ptr_eq(coded.codes_arc(), &fan.codes),
+        "the readout is not sharing the picture's plane — it holds a second \
+         allocation, so the plane is paid for twice and the cut buys nothing"
+    );
+
+    // The tamper: same bytes, different allocation. If the assertion above
+    // were written as equality it would pass on this, which is the defect.
+    let copied = squallar_radar::hover::CodedGates::new(
+        Arc::new(fan.codes.as_ref().clone()),
+        Arc::clone(&fan.value_table),
+        fan.radials as usize,
+        fan.gates as usize,
+    )
+    .expect("a copy of a well-formed plane is well formed");
+    assert_eq!(
+        copied.codes_arc().as_ref(),
+        fan.codes.as_ref(),
+        "the tamper must be byte-identical, or it is not testing identity"
+    );
+    assert!(
+        !Arc::ptr_eq(copied.codes_arc(), &fan.codes),
+        "the tamper shares the allocation, so this test cannot distinguish \
+         borrowing from copying and proves nothing"
+    );
+}
+
+/// **The user's ruling, pinned rather than the mechanism that serves it.**
+///
+/// The ruling is that a hover reads on every loop frame. It was served by
+/// `SweepGates` and is now served by the picture's own plane, and it must hold
+/// on both: this test is green on `ef82dddc7` and green after. That is
+/// deliberate — a test that went red on the old mechanism would be pinning the
+/// mechanism, and the readout being served by an accident nobody had pinned is
+/// how a memory cut came within one lane of blanking it.
+#[test]
+fn a_looping_pane_answers_a_hover_whatever_surface_it_drew() {
+    let (lat, lon) = (35.3333, -97.2778);
+    let (fan, resident) = fan_fixture(lat, lon);
+    let rr = fan_response(lat, lon, &resident);
+
+    // The frame's volume IS in the loop cache, so the old mechanism can answer
+    // and this test does not pass merely because the new one is the only one
+    // present.
+    let mut mgr = LoopDownloadManager::new();
+    mgr.cache_scan("KTLX", ts(0), (scan_with_echo(), Arc::default()));
+    let gates = frame_gates(&mgr, &rr);
+    assert!(
+        gates.is_some(),
+        "the fixture must reach the old mechanism too, or this pins nothing"
+    );
+
+    let surface = squallar_egui::pane::RadarSurface::Fan(Arc::from(vec![Arc::clone(&fan)]));
+    let img = rendered_image(&rr, surface, gates);
+
+    let (checked, values) = sample_readings(&img.hover);
+    assert!(checked > 1_000, "only {checked} points sampled");
+    assert!(
+        values > 500,
+        "a loop frame answered a number at only {values} of {checked} points — \
+         the readout on a looping pane is blank, against the standing ruling \
+         that a hover reads on every loop frame"
+    );
+}
+
+/// **The cut itself: a fan-drawn loop frame pins no volume AND still reads.**
+///
+/// Both halves in one test on purpose — it cannot be satisfied by blanking the
+/// readout, which is exactly how the byte figure could otherwise be bought.
+///
+/// **Red on `ef82dddc7`**, where a fan frame carries a `SweepGates` and this
+/// first assertion reads its bytes.
+#[test]
+fn a_fan_loop_frame_pins_no_volume_and_still_reads_a_value() {
+    let (lat, lon) = (35.3333, -97.2778);
+    let (fan, resident) = fan_fixture(lat, lon);
+    let rr = fan_response(lat, lon, &resident);
+
+    let mut mgr = LoopDownloadManager::new();
+    mgr.cache_scan("KTLX", ts(0), (scan_with_echo(), Arc::default()));
+    let gates = frame_gates(&mgr, &rr);
+
+    let surface = squallar_egui::pane::RadarSurface::Fan(Arc::from(vec![Arc::clone(&fan)]));
+    let img = rendered_image(&rr, surface, gates);
+
+    assert_eq!(
+        img.hover.pinned_volume_bytes(),
+        0,
+        "a fan-drawn loop frame is still pinning a sweep's moments out of the \
+         volume it was drawn from, though the plane on the glass already holds \
+         every number its readout can be asked for"
+    );
+
+    let (checked, values) = sample_readings(&img.hover);
+    assert!(
+        values > 500,
+        "the volume is unpinned but the readout answers at only {values} of \
+         {checked} points — the bytes were bought by blanking the hover"
+    );
+}
+
+/// **Hover equivalence, proven point by point rather than asserted.**
+///
+/// The readout over the picture's plane must answer exactly what a still
+/// pane's resident field answers at the same place — the same `Reading`, the
+/// same bits, `Unpainted` where the render painted nothing. Both decode the
+/// same codes through the same table, so any disagreement is a real defect and
+/// not a tolerance question.
+#[test]
+fn a_fan_readout_answers_exactly_what_the_resident_field_does() {
+    let (lat, lon) = (35.3333, -97.2778);
+    let (fan, resident) = fan_fixture(lat, lon);
+    let rr = fan_response(lat, lon, &resident);
+
+    let surface = squallar_egui::pane::RadarSurface::Fan(Arc::from(vec![Arc::clone(&fan)]));
+    let img = rendered_image(&rr, surface, None);
+    let oracle = squallar_radar::hover::HoverSource::resident(resident);
+
+    let (mut checked, mut values) = (0u32, 0u32);
+    let mut az = 0.5f64;
+    while az < 360.0 {
+        let mut km = 1.0f64;
+        while km < 70.0 {
+            let from_plane = img.hover.read(az, km);
+            let from_field = oracle.read(az, km);
+            assert_eq!(
+                from_plane, from_field,
+                "the plane and the resident field disagree at {az} deg, {km} km"
+            );
+            checked += 1;
+            if matches!(from_plane, squallar_radar::hover::Reading::Value(_)) {
+                values += 1;
+            }
+            km *= 1.2;
+        }
+        az += 3.0;
+    }
+    assert!(checked > 1_000, "only {checked} points compared");
+    assert!(
+        values > 500,
+        "only {values} of {checked} carried a number, so agreement is mostly \
+         agreement about blankness"
+    );
+}
+
+/// **What the producer actually builds passes the draw gate.**
+///
+/// `FanSweep::is_well_formed` gained a `value_table` conjunct and it has a
+/// production caller — the draw fork in `squallar_egui::ui_map_pane`. So the
+/// question is not whether a hand-made table of the right length passes, it is
+/// whether the table `fan_sweep` bakes off a real `CodePlane` does. If it did
+/// not, every polar pane would silently stop drawing and no byte figure would
+/// move.
+///
+/// Asserted on the real producer rather than argued from
+/// `CodePlane::value_table`'s two arms both being `LUT_ENTRIES` long.
+#[test]
+fn a_producer_built_fan_passes_the_draw_gate() {
+    let (fan, _resident) = fan_fixture(35.3333, -97.2778);
+    assert_eq!(
+        fan.value_table.len(),
+        squallar_egui::radar_fan::LUT_ENTRIES,
+        "the producer baked a table the draw gate will refuse"
+    );
+    assert!(
+        fan.is_well_formed(),
+        "the fan this tree's own producer builds is refused by the draw fork, \
+         so a polar pane draws nothing"
     );
 }

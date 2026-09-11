@@ -6684,7 +6684,16 @@ impl super::App {
             let origin_pane = rr.pane_idx;
             // Resolved before the pane is borrowed, and off the *response*
             // rather than off the pane — see `frame_gates`.
-            let gates = frame_gates(&self.loop_mgr, &rr);
+            //
+            // **Only for a reply that carried a raster.** A fan reply's
+            // readout is the plane it is already holding, so asking the volume
+            // for a second copy of the same numbers would walk a sweep's
+            // radials on the frame thread to build something nothing reads.
+            let gates = if rr.codes.is_none() {
+                frame_gates(&self.loop_mgr, &rr)
+            } else {
+                None
+            };
             // Asked here, beside the gates and for the same reason: off the
             // *response*, before anything borrows a pane, and with the
             // installed renderer in hand — a polar surface is only ever built
@@ -10511,6 +10520,16 @@ fn rendered_image(
     surface: squallar_egui::pane::RadarSurface,
     gates: Option<squallar_radar::hover::SweepGates>,
 ) -> squallar_egui::pane::RadarImageData {
+    // **The picture answers for itself where it can.** A fan is already
+    // holding the plane the readout needs, so the source borrows it and no
+    // volume is pinned; only a raster frame falls through to the sweep, which
+    // is the one arm `frame_gates` is still called for.
+    let hover = match coded_gates(&surface) {
+        Some(coded) => {
+            squallar_radar::hover::HoverSource::from_coded_plane(rr.polar.clone(), coded)
+        }
+        None => squallar_radar::hover::HoverSource::from_volume(rr.polar.clone(), gates),
+    };
     squallar_egui::pane::RadarImageData {
         surface,
         lat: rr.site_lat,
@@ -10525,11 +10544,29 @@ fn rendered_image(
         nyquist_ms: rr.nyquist_ms,
         melting_layer_source: rr.melting_layer_source,
         storm_motion: rr.storm_motion,
-        hover: Arc::new(squallar_radar::hover::HoverSource::from_volume(
-            rr.polar.clone(),
-            gates,
-        )),
+        hover: Arc::new(hover),
     }
+}
+
+/// **A readout over a fan's own payload**, or `None` for a raster surface.
+///
+/// The `Arc` clones here are the whole of the saving: the readout and the
+/// picture hold one allocation between them, which
+/// `the_readout_borrows_the_pictures_own_plane` asserts with `Arc::ptr_eq`
+/// rather than leaving to be read off this call graph.
+fn coded_gates(
+    surface: &squallar_egui::pane::RadarSurface,
+) -> Option<squallar_radar::hover::CodedGates> {
+    let squallar_egui::pane::RadarSurface::Fan(sweeps) = surface else {
+        return None;
+    };
+    let sweep = sweeps.first()?;
+    squallar_radar::hover::CodedGates::new(
+        Arc::clone(&sweep.codes),
+        Arc::clone(&sweep.value_table),
+        sweep.radials as usize,
+        sweep.gates as usize,
+    )
 }
 
 /// **The polar sweeps a finished loop render carried**, or `None` for a reply

@@ -3,6 +3,7 @@
 use crate::render::polar::{GateAt, PolarField, PolarGeometry};
 use crate::types::RadarProduct;
 use nexrad_model::data::Scan;
+use std::sync::Arc;
 
 /// What the readout can be told about a point.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -124,6 +125,91 @@ fn container_bytes(len: usize) -> usize {
         .saturating_add(crate::scan_size::ALLOCATOR_BLOCK_OVERHEAD)
 }
 
+/// **The drawn picture's own code plane, borrowed rather than copied** — the
+/// readout for a frame whose surface is a fan.
+///
+/// This is the cheap half of the pair [`SweepGates`] is the expensive half of,
+/// and the difference is whose allocation it is. A `SweepGates` clones one
+/// moment per radial out of a decoded volume and so keeps that volume's gate
+/// arrays alive; this holds the **same `Arc<Vec<u8>>` the `FanSweep` on the
+/// glass is drawn from**, so it adds a refcount and no bytes.
+///
+/// `codes` is level 0 followed by the mip chain, exactly as the picture's
+/// payload lays it out, and level 0 is `radials * gates` bytes at offset 0.
+/// The readout samples level 0 only: the chain is what the *picture* is
+/// reduced through and a number under the pointer must never be a reduction
+/// of the gate the user is looking at.
+///
+/// **Reads identically to a still pane's field**, and that is a property of
+/// this code rather than a hope: [`Self::at`] is [`PolarField::at`]'s body
+/// over the same table — bounds, index, table lookup, and the same NaN filter
+/// that makes an unpainted gate read `Unpainted` instead of a number.
+#[derive(Clone)]
+pub struct CodedGates {
+    /// The picture's payload, shared with the `FanSweep` that draws it.
+    codes: Arc<Vec<u8>>,
+    /// What each code decodes to — `crate::render::codes::CodePlane::value_table`,
+    /// 256 entries, shared with the same payload.
+    table: Arc<Vec<f32>>,
+    radials: usize,
+    gates: usize,
+}
+
+impl CodedGates {
+    /// A readout over a fan's own payload, or `None` where the four parts do
+    /// not describe one picture.
+    ///
+    /// **Refused rather than repaired**, for the reason
+    /// [`PolarField::from_code_table`] gives at the same door: a short buffer
+    /// or a foreign table answers a plausible number for a gate nobody
+    /// measured. The buffer may be *longer* than level 0 — it carries the mip
+    /// chain — so the check is `>=` where that one's is `==`.
+    pub fn new(
+        codes: Arc<Vec<u8>>,
+        table: Arc<Vec<f32>>,
+        radials: usize,
+        gates: usize,
+    ) -> Option<Self> {
+        if table.len() != crate::render::codes::LUT_ENTRIES {
+            return None;
+        }
+        let level0 = radials.checked_mul(gates)?;
+        if level0 == 0 || codes.len() < level0 {
+            return None;
+        }
+        Some(Self {
+            codes,
+            table,
+            radials,
+            gates,
+        })
+    }
+
+    /// The value at a gate, decoded through the table.
+    fn at(&self, at: GateAt) -> Option<f32> {
+        if at.gate >= self.gates || at.radial >= self.radials {
+            return None;
+        }
+        let code = *self.codes.get(at.radial * self.gates + at.gate)?;
+        let v = *self.table.get(usize::from(code))?;
+        (!v.is_nan()).then_some(v)
+    }
+
+    /// **Zero, and deliberately** — both allocations are the picture's, priced
+    /// where the picture is priced (`squallar_egui::radar_fan::FanSweep::resident_bytes`).
+    /// Charging them here as well would name one buffer in two census families
+    /// and report a saving that is a second spelling of a cost.
+    pub fn resident_bytes(&self) -> usize {
+        0
+    }
+
+    /// The payload this readout shares, for asserting **by identity** that it
+    /// is the picture's own allocation and not a copy of it.
+    pub fn codes_arc(&self) -> &Arc<Vec<u8>> {
+        &self.codes
+    }
+}
+
 /// Where a pane's readout gets its number: the geometry of the picture on the
 /// glass, and whatever is holding the values behind it.
 pub struct HoverSource {
@@ -132,18 +218,44 @@ pub struct HoverSource {
     field: PolarField,
     /// The volume behind it, for a frame whose values were not kept.
     sweep: Option<SweepGates>,
+    /// The picture's own code plane, for a frame drawn as a fan — the source
+    /// that costs nothing because the picture is already holding it.
+    coded: Option<CodedGates>,
 }
 
 impl HoverSource {
     /// A source over a render that kept its numbers — a still pane's.
     pub fn resident(field: PolarField) -> Self {
-        Self { field, sweep: None }
+        Self {
+            field,
+            sweep: None,
+            coded: None,
+        }
     }
 
     /// A source over a render whose numbers were dropped, reading them back out
     /// of the volume it was drawn from — a loop frame's.
     pub fn from_volume(field: PolarField, sweep: Option<SweepGates>) -> Self {
-        Self { field, sweep }
+        Self {
+            field,
+            sweep,
+            coded: None,
+        }
+    }
+
+    /// **A source over a loop frame drawn as a fan**, reading its numbers out
+    /// of the payload the picture is already holding.
+    ///
+    /// This is the arm that lets a loop frame answer a hover without a
+    /// `SweepGates`, which is the whole of the saving: no moment is cloned out
+    /// of a volume, no volume is pinned, and no walk of a sweep's radials
+    /// happens on the frame thread to build one.
+    pub fn from_coded_plane(field: PolarField, coded: CodedGates) -> Self {
+        Self {
+            field,
+            sweep: None,
+            coded: Some(coded),
+        }
     }
 
     /// A source over nothing, for a pane with no picture yet.
@@ -151,6 +263,7 @@ impl HoverSource {
         Self {
             field: PolarField::default(),
             sweep: None,
+            coded: None,
         }
     }
 
@@ -161,6 +274,16 @@ impl HoverSource {
         };
         if self.field.has_values() {
             return match self.field.at(at) {
+                Some(v) => Reading::Value(v),
+                None => Reading::Unpainted,
+            };
+        }
+        // The picture's own plane before the volume behind it: it is already
+        // resident, it needs no volume to still be cached, and it decodes the
+        // same number. A gate it finds unpainted is unpainted — the same
+        // reading the field arm above gives.
+        if let Some(coded) = self.coded.as_ref() {
+            return match coded.at(at) {
                 Some(v) => Reading::Value(v),
                 None => Reading::Unpainted,
             };
@@ -197,10 +320,22 @@ impl HoverSource {
     ///
     /// A loop frame's source is built by [`Self::from_volume`] and holds the
     /// gates of the one sweep its picture was drawn from, so the readout can
-    /// decode a gate on demand. Those gates are this source's own allocation
-    /// and are shared with nothing — see [`SweepGates`] — so this figure is
-    /// what dropping the source frees, exactly, and no other holder names
-    /// these bytes.
+    /// decode a gate on demand.
+    ///
+    /// **This is an upper bound and not what dropping the source frees.** This
+    /// paragraph claimed the opposite — "shared with nothing", "what dropping
+    /// the source frees, exactly" — until 2026-09-10, contradicting
+    /// [`SweepGates::bytes`] eighty lines above, which has said since
+    /// `7db617aa6` that cloning a moment bumps a `GateBuffer` refcount rather
+    /// than copying gates. While the volume the sweep came out of is still
+    /// cached these are that volume's bytes and this names them a second time;
+    /// `LoopFrameStore::sole_pinned_volume_bytes` is the lower bound beside
+    /// it.
+    ///
+    /// **Zero for a fan-drawn loop frame**, whose readout is
+    /// [`CodedGates`] over the picture's own payload — see
+    /// [`Self::from_coded_plane`]. That is the saving this figure is the
+    /// scoreboard for.
     ///
     /// **The name says "volume" and the thing is a sweep** because the name
     /// is the census family's, and a family renamed is a row a reader cannot
@@ -217,6 +352,16 @@ impl HoverSource {
     pub fn resident_bytes(&self) -> usize {
         self.field_bytes()
             .saturating_add(self.pinned_volume_bytes())
+    }
+
+    /// The picture's code plane this source reads through, where it has one.
+    ///
+    /// Exposed so a test can assert **by identity** — `Arc::ptr_eq` against
+    /// the `FanSweep`'s own payload — that the readout borrows the picture
+    /// rather than copying it. The saving is exactly that identity, and a
+    /// call graph is not evidence of it.
+    pub fn coded_plane(&self) -> Option<&CodedGates> {
+        self.coded.as_ref()
     }
 }
 

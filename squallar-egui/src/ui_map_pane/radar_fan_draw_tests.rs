@@ -91,9 +91,10 @@ fn sweep() -> FanSweep {
         field: squallar_radar::fields::known::REFLECTIVITY,
         radials: 4,
         gates: 2,
-        codes: vec![0; 8],
+        codes: std::sync::Arc::new(vec![0; 8]),
         level_offsets: vec![0],
         lut_rgba: vec![0; crate::radar_fan::LUT_BYTES],
+        value_table: std::sync::Arc::new(vec![0.0; crate::radar_fan::LUT_ENTRIES]),
         edges: vec![[0.0, 90.0], [90.0, 180.0], [180.0, 270.0], [270.0, 360.0]],
         geometry: crate::radar_fan::FanGeometry {
             site_lat: SITE_LAT,
@@ -378,7 +379,7 @@ fn one_bad_sweep_refuses_the_whole_set() {
     let recorder = Recorder::new(true);
     let painter: Arc<dyn RadarFanPainter> = recorder.clone();
     let bad = FanSweep {
-        codes: vec![0; 7],
+        codes: std::sync::Arc::new(vec![0; 7]),
         ..sweep()
     };
     assert_eq!(

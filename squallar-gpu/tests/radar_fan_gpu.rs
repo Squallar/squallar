@@ -229,9 +229,12 @@ fn payload(
         field: squallar_radar::fields::known::REFLECTIVITY,
         radials: radials as u32,
         gates: gates as u32,
-        codes,
+        codes: std::sync::Arc::new(codes),
         level_offsets: level_offsets(radials, gates, levels),
         lut_rgba: lut,
+        // Nothing this file drives reads a value back — it drives the upload
+        // path — so this is the well-formed length and no other claim.
+        value_table: std::sync::Arc::new(vec![0.0f32; squallar_egui::radar_fan::LUT_ENTRIES]),
         edges,
         geometry,
     }
