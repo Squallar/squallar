@@ -822,7 +822,7 @@ fn layout_fixture() -> RenderInput {
         word_size: 8,
         scale: 2.0,
         offset: 66.0,
-        gates: vec![first, 128, 255],
+        gates: vec![first, 128, 255].into(),
     };
     RenderInput {
         product: RadarProduct::Reflectivity,
@@ -1479,5 +1479,119 @@ fn the_doppler_half_is_still_marked_when_its_leading_radial_is_blank() {
     assert_eq!(
         marked, 2,
         "the two Doppler halves must still be recognisable after the port",
+    );
+}
+
+// ── The gate round trip shares rather than copies ────────────────────────────
+
+/// **The payload holds the scan's own allocation, not a copy of it.**
+///
+/// Pointer identity, and it needs both owners held to mean anything — an
+/// address compared after its owner dropped can match a reused block. The
+/// `scan` and the `input` are both alive for every assertion below, which is
+/// the same discipline `crate::scan_size::GateBufferSet` works under.
+///
+/// The fixture makes this a sharp claim rather than a tautological one: every
+/// radial in `volume()` carries the SAME reflectivity bytes from a SEPARATE
+/// `vec![byte; gates]`, so content equality would hold against any radial and
+/// only `shares_with` can distinguish the right allocation from 359 identical
+/// impostors.
+#[test]
+fn an_extracted_payload_shares_the_scans_gate_buffer() {
+    let scan = volume();
+    let input = RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None, None)
+        .expect("the volume carries reflectivity at 0.5");
+
+    let extracted = &input.sweeps[0];
+    let mut checked = 0usize;
+    for (i, radial) in extracted.radials.iter().enumerate() {
+        let Some(payload) = radial.moment.as_ref() else {
+            continue;
+        };
+        let source = scan.sweeps()[0].radials()[i]
+            .reflectivity()
+            .expect("every radial of sweep 0 carries reflectivity");
+        assert!(
+            payload.gates.shares_with(source.gate_buffer()),
+            "radial {i}'s payload copied its gates instead of sharing them"
+        );
+        assert_eq!(
+            payload.gates.as_slice(),
+            source.raw_values(),
+            "and the shared bytes are the moment's own"
+        );
+        checked += 1;
+    }
+    assert_eq!(
+        checked, RADIALS,
+        "every radial was checked, not a subset that happened to share"
+    );
+}
+
+/// **And the rebuild hands the same allocation back**, so the round trip moves
+/// no gate bytes in either direction. Both owners held, as above.
+#[test]
+fn a_rebuilt_moment_shares_the_payloads_gate_buffer() {
+    let scan = volume();
+    let input = RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None, None)
+        .expect("the volume carries reflectivity at 0.5");
+
+    let payload = input.sweeps[0].radials[0]
+        .moment
+        .as_ref()
+        .expect("radial 0 carries reflectivity");
+    let rebuilt = payload.to_moment_data();
+    assert!(
+        rebuilt.gate_buffer().shares_with(&payload.gates),
+        "`to_moment_data` copied the gates back out of the payload"
+    );
+    // Through to the original, which is the whole chain in one claim.
+    let source = scan.sweeps()[0].radials()[0]
+        .reflectivity()
+        .expect("radial 0 carries reflectivity");
+    assert!(
+        rebuilt.gate_buffer().shares_with(source.gate_buffer()),
+        "the rebuilt moment is not on the scan's allocation"
+    );
+}
+
+/// **The ledger fires on the real extract path**, not only when a unit test
+/// calls the counter by hand. A counter with no reader and a counter whose
+/// precondition never holds are the same defect one layer apart, and both have
+/// landed in this campaign.
+///
+/// A delta rather than an absolute: the totals are process-global and this
+/// crate's unit tests are one binary.
+#[test]
+fn extracting_a_volume_moves_the_payload_share_ledger() {
+    let before = (
+        crate::payload_share::adopted_count(),
+        crate::payload_share::adopted_bytes(),
+    );
+    let scan = volume();
+    let input = RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None, None)
+        .expect("the volume carries reflectivity at 0.5");
+    let payloads: usize = input
+        .sweeps
+        .iter()
+        .map(|s| s.radials.iter().filter(|r| r.moment.is_some()).count())
+        .sum();
+    assert!(payloads > 0, "the fixture produced no payloads to price");
+    assert!(
+        crate::payload_share::adopted_count() - before.0 >= payloads as u64,
+        "the ledger did not count the {payloads} payload(s) this extract built"
+    );
+    // 600 gates a radial at one byte per gate, plus the block the copy would
+    // have needed. Asserted against what the fixture DESCRIBES rather than a
+    // magic number.
+    let expected = payloads as u64 * (600 + crate::scan_size::ALLOCATOR_BLOCK_OVERHEAD as u64);
+    assert!(
+        crate::payload_share::adopted_bytes() - before.1 >= expected,
+        "priced under the {expected} B this extract did not copy"
+    );
+    assert_eq!(
+        crate::payload_share::copied(),
+        0,
+        "a payload fell back to copying its gates"
     );
 }

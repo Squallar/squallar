@@ -3804,6 +3804,11 @@ impl super::App {
         // carries levels and this is bytes that were never allocated in any of
         // them, so the two must never be added.
         say_telemetry(loud, &crate::budget_telemetry::moment_drop_line());
+        // **And what the render-input round trip never copied.** A running
+        // total for the reason above, and on the same rule against adding it to
+        // a census level: these are memcpys that no longer happen, not bytes
+        // resident anywhere.
+        say_telemetry(loud, &crate::budget_telemetry::payload_share_line());
         // **And what the chunk feed kept so its own volumes could be traded.**
         // Running totals beside a level, so its own line for the reason the
         // two above have one.

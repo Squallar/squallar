@@ -27,6 +27,8 @@ pub mod nrot;
 pub mod nyquist;
 mod palette;
 pub(crate) mod par;
+/// What the render-input gate round trip stopped copying.
+pub mod payload_share;
 pub(crate) mod product_spec;
 pub mod render;
 pub mod render_input;

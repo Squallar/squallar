@@ -4,8 +4,8 @@
 use crate::types::{MomentSlot, RadarProduct};
 use crate::wire::Reader;
 use nexrad_model::data::{
-    ChannelConfiguration, DataMoment, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus,
-    Scan, Sweep, VolumeCoveragePattern, WaveformType,
+    ChannelConfiguration, DataMoment, ElevationCut, GateBuffer, MomentData, PulseWidth, Radial,
+    RadialStatus, Scan, Sweep, VolumeCoveragePattern, WaveformType,
 };
 
 /// Everything [`crate::render::render_from`] needs to produce a frame, and
@@ -150,9 +150,16 @@ pub(crate) struct MomentPayload {
     word_size: u8,
     scale: f32,
     offset: f32,
-    /// Raw gate codes, exactly as `DataMoment::raw_values` returns them: one
-    /// byte per gate at 8-bit, a big-endian pair at 16-bit.
-    pub(crate) gates: Vec<u8>,
+    /// Raw gate codes, exactly what `DataMoment::raw_values` returns: one byte
+    /// per gate at 8-bit, a big-endian pair at 16-bit.
+    ///
+    /// **The model's own buffer, shared, not a copy of it.** `GateBuffer` is an
+    /// `Arc<Vec<u8>>` and both directions of this round trip go through it, so
+    /// building a payload and rebuilding a moment from one are refcount bumps —
+    /// see [`crate::payload_share`], which prices what that stopped copying.
+    /// It derefs to `[u8]`, so readers spell `.len()` and `&gates[..]` as
+    /// before.
+    pub(crate) gates: GateBuffer,
 }
 
 impl RenderInput {
@@ -853,14 +860,19 @@ impl MomentPayload {
             word_size: moment.data_word_size(),
             scale: moment.scale(),
             offset: moment.offset(),
-            gates: moment.raw_values().to_vec(),
+            gates: {
+                let gates = moment.gate_buffer().clone();
+                crate::payload_share::adopted(gates.as_slice().len());
+                gates
+            },
         }
     }
 
     /// The clutter-filter power moment these bytes describe, for the one
     /// payload that carries one. Same block, a different newtype over it.
     pub(crate) fn to_cfp_moment_data(&self) -> nexrad_model::data::CFPMomentData {
-        nexrad_model::data::CFPMomentData::from_fixed_point(
+        crate::payload_share::returned(self.gates.as_slice().len());
+        nexrad_model::data::CFPMomentData::from_gate_buffer(
             self.gate_count,
             self.first_gate_range_m,
             self.gate_interval_m,
@@ -872,7 +884,8 @@ impl MomentPayload {
     }
 
     pub(crate) fn to_moment_data(&self) -> MomentData {
-        MomentData::from_fixed_point(
+        crate::payload_share::returned(self.gates.as_slice().len());
+        MomentData::from_gate_buffer(
             self.gate_count,
             self.first_gate_range_m,
             self.gate_interval_m,
@@ -1241,7 +1254,7 @@ pub(crate) fn encode_moment(out: &mut Vec<u8>, moment: &MomentPayload) {
     out.extend_from_slice(&moment.scale.to_le_bytes());
     out.extend_from_slice(&moment.offset.to_le_bytes());
     out.extend_from_slice(&(moment.gates.len() as u32).to_le_bytes());
-    out.extend_from_slice(&moment.gates);
+    out.extend_from_slice(moment.gates.as_slice());
 }
 
 pub(crate) fn decode_moment(r: &mut Reader) -> Option<MomentPayload> {
@@ -1252,7 +1265,9 @@ pub(crate) fn decode_moment(r: &mut Reader) -> Option<MomentPayload> {
     let scale = r.f32()?;
     let offset = r.f32()?;
     let gate_len = r.u32()?;
-    let gates = r.take(gate_len as usize)?.to_vec();
+    // A fresh allocation on purpose: these bytes are borrowed from the wire
+    // buffer, there is no buffer to adopt, and `payload_share` is not credited.
+    let gates = GateBuffer::from(r.take(gate_len as usize)?.to_vec());
     Some(MomentPayload {
         gate_count,
         first_gate_range_m,

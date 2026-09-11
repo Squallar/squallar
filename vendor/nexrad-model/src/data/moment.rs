@@ -288,10 +288,41 @@ impl MomentDataBlock {
         offset: f32,
         values: Vec<u8>,
     ) -> Self {
+        Self::from_gate_buffer(
+            gate_count,
+            first_gate_range,
+            gate_interval,
+            data_word_size,
+            scale,
+            offset,
+            GateBuffer::from(values),
+        )
+    }
+
+    /// **LOCAL CHANGE.** The same block from a gate buffer that already
+    /// exists, so a caller holding one adopts the allocation instead of
+    /// copying the gates out of it.
+    ///
+    /// [`from_fixed_point`](Self::from_fixed_point) is this function with a
+    /// `Vec<u8>` moved into a fresh [`GateBuffer`] first; it stays because
+    /// every decoder call site is building the bytes and has no buffer to
+    /// adopt. This spelling is for the round trip in
+    /// `squallar_radar::render_input`, which takes a moment apart into scalars
+    /// plus gates and puts it back together, and copied a whole volume's gates
+    /// twice to do it.
+    pub(crate) fn from_gate_buffer(
+        gate_count: u16,
+        first_gate_range: u16,
+        gate_interval: u16,
+        data_word_size: u8,
+        scale: f32,
+        offset: f32,
+        values: GateBuffer,
+    ) -> Self {
         debug_assert!(
-            data_word_size != 16 || values.len() % 2 == 0,
+            data_word_size != 16 || values.as_slice().len() % 2 == 0,
             "16-bit moment data must have an even number of bytes, got {}",
-            values.len()
+            values.as_slice().len()
         );
 
         Self {
@@ -301,7 +332,7 @@ impl MomentDataBlock {
             data_word_size,
             scale,
             offset,
-            values: BinaryData::new(GateBuffer::from(values)),
+            values: BinaryData::new(values),
         }
     }
 
@@ -393,6 +424,31 @@ impl MomentData {
     pub fn without_values(&self) -> Self {
         Self {
             inner: self.inner.without_values(),
+        }
+    }
+
+    /// **LOCAL CHANGE.** The same moment from a gate buffer that already
+    /// exists — see [`MomentDataBlock::from_gate_buffer`]. The gates are
+    /// adopted by reference count; nothing is copied.
+    pub fn from_gate_buffer(
+        gate_count: u16,
+        first_gate_range: u16,
+        gate_interval: u16,
+        data_word_size: u8,
+        scale: f32,
+        offset: f32,
+        values: GateBuffer,
+    ) -> Self {
+        Self {
+            inner: MomentDataBlock::from_gate_buffer(
+                gate_count,
+                first_gate_range,
+                gate_interval,
+                data_word_size,
+                scale,
+                offset,
+                values,
+            ),
         }
     }
 
@@ -518,6 +574,31 @@ impl CFPMomentData {
     pub fn without_values(&self) -> Self {
         Self {
             inner: self.inner.without_values(),
+        }
+    }
+
+    /// **LOCAL CHANGE.** The same moment from a gate buffer that already
+    /// exists — see [`MomentDataBlock::from_gate_buffer`]. The gates are
+    /// adopted by reference count; nothing is copied.
+    pub fn from_gate_buffer(
+        gate_count: u16,
+        first_gate_range: u16,
+        gate_interval: u16,
+        data_word_size: u8,
+        scale: f32,
+        offset: f32,
+        values: GateBuffer,
+    ) -> Self {
+        Self {
+            inner: MomentDataBlock::from_gate_buffer(
+                gate_count,
+                first_gate_range,
+                gate_interval,
+                data_word_size,
+                scale,
+                offset,
+                values,
+            ),
         }
     }
 

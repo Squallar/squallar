@@ -1359,6 +1359,40 @@ pub(crate) fn moment_drop_line() -> String {
     )
 }
 
+/// **What the render-input round trip did not copy**, as a running total.
+///
+/// A decoded moment's gates live behind an `Arc`, and
+/// `squallar_radar::render_input::MomentPayload` used to memcpy the whole array
+/// out of it on the way in and back in on the way out. Both directions now
+/// share the allocation (`squallar_radar::payload_share`), and this is the
+/// evidence it happens on a running app rather than only in a test — the scar
+/// this line exists for is a ~94 MiB cut whose counter read 0 B on all 530
+/// ticks because its precondition never held, and which nobody read for a day.
+///
+/// **Two pairs, never summed**: `adopted` is one payload per reachable
+/// (radial, moment), `returned` is one per moment rebuilt from a payload, and
+/// only the arms that reassemble a volume do the second. Different
+/// denominators, so they are printed as separate fields with their own counts.
+///
+/// `copied` is 0 by construction: every `impl DataMoment` can hand over its
+/// buffer, so no arm falls back to a copy. It is printed because a non-zero
+/// reading would mean that premise is false, and a claim nobody can falsify
+/// from the log is not evidence.
+///
+/// Its own line, and never appended to `budget state:`, which is scraped by a
+/// positional regex. Every figure carries its `key=` so a reader parses by name
+/// and a reorder cannot silently move a column.
+pub(crate) fn payload_share_line() -> String {
+    format!(
+        "payload share: adopted={} adopted_mib={} returned={} returned_mib={} copied={}",
+        squallar_radar::payload_share::adopted_count(),
+        squallar_radar::payload_share::adopted_bytes() / (1024 * 1024),
+        squallar_radar::payload_share::returned_count(),
+        squallar_radar::payload_share::returned_bytes() / (1024 * 1024),
+        squallar_radar::payload_share::copied(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1376,6 +1410,48 @@ mod tests {
     /// Four fields and their order, because a positional reader breaks
     /// silently on a reorder and a lane quoting the wrong column would be
     /// reporting blocks as bytes.
+    /// **The `payload share:` line's shape, pinned where the format string
+    /// lives**, and parsed BY KEY rather than by position — a positional reader
+    /// splits one series into two instruments the moment a field is added, and
+    /// nothing in the log says where that happened.
+    ///
+    /// Five keys, so a rename breaks the reader loudly here instead of turning
+    /// a scrape into a silent zero.
+    #[test]
+    fn the_payload_share_line_carries_all_five_keys_by_name() {
+        let line = payload_share_line();
+        assert!(line.starts_with("payload share: "), "{line}");
+        let fields: std::collections::HashMap<&str, u64> = line
+            .trim_start_matches("payload share: ")
+            .split_whitespace()
+            .filter_map(|f| f.split_once('='))
+            .map(|(k, v)| (k, v.parse().expect("a number")))
+            .collect();
+        for key in [
+            "adopted",
+            "adopted_mib",
+            "returned",
+            "returned_mib",
+            "copied",
+        ] {
+            assert!(fields.contains_key(key), "{line} is missing `{key}=`");
+        }
+        assert_eq!(fields.len(), 5, "five keys, got {fields:?} from {line}");
+    }
+
+    /// **`copied` is 0 by construction and this is what falsifies it.** Every
+    /// `impl DataMoment` publishes its gate buffer, so `from_moment_data` has
+    /// no arm that must copy; a non-zero reading here would mean the module's
+    /// premise is false rather than that the counter moved.
+    #[test]
+    fn the_copy_fallback_never_fires() {
+        assert_eq!(
+            squallar_radar::payload_share::copied(),
+            0,
+            "a payload copied its gates: `from_moment_data` grew a non-sharing arm"
+        );
+    }
+
     #[test]
     fn the_moment_drop_line_names_four_fields_in_order() {
         let line = moment_drop_line();
