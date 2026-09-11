@@ -106,7 +106,7 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	491	453
 squallar-egui/src/tile_mesh/ledger.rs	121	83
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	1642	1577
+squallar-egui/src/tile_source.rs	1642	1575
 squallar-egui/src/tile_source/byte_lru.rs	272	271
 squallar-egui/src/tile_source/cache_ledger.rs	208	188
 squallar-egui/src/tile_source/snap.rs	157	157
@@ -202,7 +202,7 @@ squallar-netcdf/src/h5.rs	425	376
 squallar-nmea-serial/src/config.rs	6	3
 squallar-nmea-serial/src/nmea_parser.rs	55	0
 squallar-nmea-serial/src/serial.rs	249	111
-squallar-overlays/src/glm/fetch.rs	1301	1238
+squallar-overlays/src/glm/fetch.rs	1301	1237
 squallar-overlays/src/glm/mod.rs	33	33
 squallar-overlays/src/gmgsi/decode.rs	321	285
 squallar-overlays/src/gmgsi/fetch.rs	157	106
@@ -544,7 +544,7 @@ vendor/walkers/src/local_tiles.rs	52	0
 vendor/walkers/src/map.rs	481	408
 vendor/walkers/src/memory.rs	31	25
 vendor/walkers/src/mercator.rs	136	136
-vendor/walkers/src/mvt.rs	1525	1435
+vendor/walkers/src/mvt.rs	1525	1434
 vendor/walkers/src/options.rs	13	13
 vendor/walkers/src/position.rs	71	71
 vendor/walkers/src/projector.rs	202	202
