@@ -123,10 +123,17 @@ fn telemetry_line_families(src: &str) -> Vec<&str> {
 /// counted when a call's first string literal begins with lowercase words and
 /// the next character is `:`. That is the row PREFIX shape. It therefore does
 /// NOT count the instance-scoped `<words> (<name>):` rows that `heap_census.rs`
-/// and `grid_pool_trim.rs` write, nor the eleven `named_hist_line` families
-/// whose head literal opens with `{prefix}` — both are real rows and neither is
-/// in this gate's denominator. Extending to them means teaching the extractor a
-/// second shape, not widening this list.
+/// and `grid_pool_trim.rs` write, nor the fourteen families that reach a row
+/// through `named_hist_line` (four) or `named_split_line` (ten), whose head
+/// literal opens with `{prefix}` — all are real rows and none is in this
+/// gate's denominator.
+///
+/// **That is a statement about THIS extractor, and no longer about the file.**
+/// The second shape was taught to [`instance_scoped_heads`], and the
+/// twenty-eight families it finds are gated by
+/// [`every_instance_scoped_telemetry_family_is_claimed_by_a_probe_or_a_reason`]
+/// below. Widening THIS list is still the wrong move for them; reading this
+/// paragraph as "those rows are ungated" is now also wrong.
 fn telemetry_row_families(src: &str) -> Vec<&str> {
     const HEADS: [&str; 3] = ["format!(", "write!(", "writeln!("];
     let mut out: Vec<&str> = Vec::new();
@@ -1636,7 +1643,20 @@ fn the_rig_reads_the_action_budget_line_the_app_actually_writes() {
 /// (one); those sixteen are enumerated by
 /// [`every_telemetry_row_the_sibling_modules_write_is_claimed_by_a_probe_or_a_reason`].
 /// `squallar-egui`'s `heap_census` writes several more, in the instance-scoped
-/// `<words> (<name>):` shape, and NEITHER gate counts those.
+/// `<words> (<name>):` shape. Neither gate counts those and both say so —
+/// but they are no longer unguarded:
+/// [`every_instance_scoped_telemetry_family_is_claimed_by_a_probe_or_a_reason`]
+/// took that shape on 2026-09-11 and claims twenty-eight families across
+/// `app_render.rs`, `grid_pool_trim.rs`, `heap_census.rs` and
+/// `grid_arm_ledger.rs`.
+///
+/// **What is still in no denominator is a MODULE none of the three lists.**
+/// `squallar-app/src/app.rs` writes `gpu probe:` and the `squallar-web` crate
+/// writes `gpu probe (webgl2):` and more; every gate in this file reads a
+/// hand-listed set of `include_str!` sources, so a row family in a file nobody
+/// listed is invisible to all three — which is the hole the floors below
+/// cannot see, because a floor catches a collapse of the extraction and not a
+/// file that was never in it.
 #[test]
 fn every_telemetry_line_family_app_render_writes_is_claimed_by_a_probe_or_a_reason() {
     /// How a family reaches — or fails to reach — a leg's artifact.
