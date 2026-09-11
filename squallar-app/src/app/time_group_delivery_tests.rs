@@ -51,7 +51,7 @@ fn scrub(app: &mut App, pane_idx: usize, collected: chrono::NaiveDateTime) {
     let requester = FetchRequester::Pane(pane_idx);
     let generation = app.render.next_scan_generation(SITE, requester);
     deliver(app, requester, generation, collected);
-    app.poll_data_channels();
+    poll_frames(app, 1);
 }
 
 fn deliver(
@@ -76,6 +76,40 @@ fn deliver(
             is_auto_poll: false,
         })
         .expect("the channel is open");
+}
+
+/// Run `frames` frames of arrival ingest.
+///
+/// **One `poll_data_channels` is one FRAME, not one queue flush.** Its ingest
+/// is bounded by `INGEST_BUDGET_PER_FRAME` — 1 ms on desktop — and after the
+/// first arrival a frame that has spent it leaves the rest queued for the next
+/// one. A fixture that sends two replies and pumps once is therefore asserting
+/// against whichever prefix that single frame happened to reach, which is a
+/// clock and not a rule: measured here, one arrival costs 66 µs at p50 on an
+/// idle box, so the assertion holds by a 15x margin until the box is busy and
+/// then does not. Every arrival is taken by some frame, and each call takes at
+/// least one, so `frames` calls take `frames` arrivals.
+fn poll_frames(app: &mut App, frames: usize) {
+    for _ in 0..frames {
+        app.poll_data_channels();
+    }
+}
+
+/// Assert a reply was observed at all before asserting WHICH one won.
+///
+/// `assert_eq!(shown, at(12))` fails identically in shape for two unrelated
+/// defects — `at(6)`, the abandoned reply winning a supersession race, and
+/// `at(0)`, the moment `two_parked_panes` parked the pane at, which means no
+/// reply landed at all. One assertion, two mechanisms, and a bare timestamp
+/// either way. This splits them so the failure names the one it caught.
+fn assert_a_reply_landed(app: &App, idx: usize) {
+    assert_ne!(
+        shown_at(app, idx),
+        at(0),
+        "pane {idx} still holds the moment the fixture parked it at, so no \
+         reply was observed at all — this is a delivery that never landed, \
+         not a supersession that picked the wrong winner",
+    );
 }
 
 /// **The payoff pin.** Pane 0 scrubs; the time-unlinked sibling on the same
@@ -147,8 +181,10 @@ fn two_same_site_panes_can_each_have_a_fetch_in_flight() {
 
     deliver(&app, a, a_generation, at(6));
     deliver(&app, b, b_generation, at(12));
-    app.poll_data_channels();
+    poll_frames(&mut app, 2);
 
+    assert_a_reply_landed(&app, 0);
+    assert_a_reply_landed(&app, 1);
     assert_eq!(
         shown_at(&app, 0),
         at(6),
@@ -170,8 +206,9 @@ fn a_panes_own_re_request_still_supersedes_the_one_it_abandoned() {
 
     deliver(&app, a, abandoned, at(6));
     deliver(&app, a, current, at(12));
-    app.poll_data_channels();
+    poll_frames(&mut app, 2);
 
+    assert_a_reply_landed(&app, 0);
     assert_eq!(
         shown_at(&app, 0),
         at(12),
@@ -203,12 +240,62 @@ fn a_fetch_in_flight_for_a_closed_pane_lands_on_nobody() {
     app.handle_gui_action(GuiAction::PaneClosed { pane_idx: 1 }, None);
 
     deliver(&app, b, generation, at(12));
-    app.poll_data_channels();
+    poll_frames(&mut app, 1);
 
     assert_eq!(
         shown_at(&app, 0),
         at(0),
         "a fetch spawned for a pane that has since been closed landed on the \
          pane that took its index",
+    );
+}
+
+/// **An arrival the frame's budget cannot afford is DEFERRED, not dropped.**
+///
+/// `INGEST_BUDGET_PER_FRAME`'s contract is that what a frame cannot apply
+/// "stays queued and the window is asked for another frame". The drain read
+/// that budget *after* `try_recv_arrival` had already taken the message, so
+/// the arrival that crossed the boundary was destroyed at the `break`: never
+/// applied, never re-sent, and silent, because the only thing the drain logged
+/// was for the staleness path. The pane kept the moment it was parked at and
+/// no later frame could recover it — there was nothing left in the channel to
+/// recover.
+///
+/// Driven with a deadline that is already spent rather than by loading the
+/// box: the window in which a real stall does this is one arrival wide (66 µs
+/// at p50, against a 1 ms budget), which is why it took a full-workspace run
+/// to find and 33 later runs to not find again.
+#[test]
+fn an_arrival_the_budget_cannot_afford_is_deferred_rather_than_dropped() {
+    let mut app = two_parked_panes();
+    let a = FetchRequester::Pane(0);
+    let abandoned = app.render.next_scan_generation(SITE, a);
+    let current = app.render.next_scan_generation(SITE, a);
+
+    deliver(&app, a, abandoned, at(6));
+    deliver(&app, a, current, at(12));
+
+    // A frame whose budget is spent the moment it opens: `ingest_budget_spent`
+    // is `now >= deadline`. One arrival always goes through, so this frame
+    // takes the abandoned reply — and discards it, correctly, as stale.
+    app.ingest_deadline = Some(web_time::Instant::now());
+    app.run_frame_pump(super::frame_pump::PumpPhase::Ingest, None);
+    app.ingest_deadline = None;
+    assert_eq!(
+        shown_at(&app, 0),
+        at(0),
+        "the spent-budget frame applied more than the one arrival it is \
+         guaranteed, so what this pins below is not the boundary",
+    );
+
+    // The next frame, with a budget of its own.
+    poll_frames(&mut app, 1);
+    assert_a_reply_landed(&app, 0);
+    assert_eq!(
+        shown_at(&app, 0),
+        at(12),
+        "the reply the spent frame could not afford was taken off the channel \
+         and dropped instead of being left on it, so the pane holds a moment \
+         the user navigated away from until something unrelated refetches",
     );
 }

@@ -2677,11 +2677,19 @@ impl App {
         // One arrival always goes through before the budget is consulted, so a
         // drain that follows an expensive one still makes progress rather than
         // being starved by it for as long as the burst lasts.
+        // **The budget is read before the take, not after it.**
+        // `try_recv_arrival` is destructive: an arrival taken and then
+        // abandoned at a `break` is gone — never applied, never re-sent, and
+        // invisible, because the drain that dropped it logged nothing. What a
+        // spent budget owes the next frame is a queue, not a gap.
         let mut drained_one = false;
-        while let Ok(scan_resp) = self.channels.scan_receiver.try_recv_arrival() {
+        loop {
             if drained_one && self.ingest_budget_spent() {
                 break;
             }
+            let Ok(scan_resp) = self.channels.scan_receiver.try_recv_arrival() else {
+                break;
+            };
             drained_one = true;
             if self
                 .render
@@ -2841,13 +2849,21 @@ impl App {
     /// Whether this frame has spent its arrival budget, and if so ask for the
     /// frame that will drain the rest.
     ///
-    /// Called by the `Ingest` drains **between** arrivals, so the frame pays
-    /// this budget plus the one arrival that crossed it — see
+    /// Called by the `Ingest` drains **before each take and never before the
+    /// first**, so the frame pays this budget plus the arrival that was in
+    /// progress when it ran out — see
     /// [`squallar_device_profile::constants::INGEST_BUDGET_PER_FRAME`]. The
     /// redraw ask is here rather than at each call site so that no drain can
     /// stop early without one: what is left in the channel raises no frame
     /// need of its own, and a deferral nobody asked a frame for would wait for
     /// an unrelated repaint.
+    ///
+    /// Read before the take rather than after it, because
+    /// `ArrivalRecv::try_recv_arrival` is destructive and a message taken and
+    /// then abandoned at the caller's `break` is destroyed, not deferred. The
+    /// cost of that ordering is that a spent budget cannot see whether
+    /// anything is left, so the redraw here is sometimes asked for an empty
+    /// channel.
     fn ingest_budget_spent(&self) -> bool {
         let spent = self
             .ingest_deadline
@@ -2886,12 +2902,18 @@ impl App {
         let mut drained_one = false;
         // Bound once for the whole drain, not per arrival.
         let gui = &mut self.gui;
-        while let Ok(event) = self.channels.overlay_fetch_receiver.try_recv_arrival() {
+        loop {
+            // The budget is read before the take, on `poll_scan_results`'
+            // terms: `try_recv_arrival` is destructive and an arrival
+            // abandoned at this `break` would be gone, not deferred.
             if drained_one && deadline.is_some_and(|deadline| web_time::Instant::now() >= deadline)
             {
                 deferred = true;
                 break;
             }
+            let Ok(event) = self.channels.overlay_fetch_receiver.try_recv_arrival() else {
+                break;
+            };
             drained_one = true;
             // Not "the pane the fetch was for": the arrival carries a layer
             // id and no pane, and what the handler needs of it is the whole
@@ -2959,8 +2981,14 @@ impl App {
             }
         }
         // Below the loop because `gui` borrowed `self` for the whole of it.
-        // What this drain collected is applied either way; only the arrivals
-        // still in the channel are owed the frame.
+        // What this drain collected is applied either way.
+        //
+        // The budget is read before the take, so this asks for a frame the
+        // channel may turn out not to need: nothing can be peeked without
+        // being consumed, and a spent budget cannot tell an empty channel from
+        // a full one. It over-asks by at most one frame, and only on a frame
+        // whose ingest already exceeded its budget — the safe direction, since
+        // under-asking leaves data sitting until an unrelated repaint.
         if deferred {
             notify_redraw(&self.window);
         }

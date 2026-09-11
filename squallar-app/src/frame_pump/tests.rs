@@ -346,3 +346,64 @@ fn every_ingest_arrival_drain_consults_the_frame_budget() {
         );
     }
 }
+
+/// **The budget is read BEFORE the take, in every one of those three drains.**
+///
+/// `try_recv_arrival` is destructive. A drain spelled `while let Ok(msg) =
+/// try_recv_arrival() { if spent { break; } .. }` has already taken the
+/// message it then abandons, so the arrival that crosses the budget boundary
+/// is destroyed rather than left queued — the opposite of what
+/// `INGEST_BUDGET_PER_FRAME` documents ("what is left stays queued and the
+/// window is asked for another frame") and of what the action queue beside it
+/// does, which defers the action it cannot afford.
+///
+/// It cost one dropped archive volume to find: a full-workspace run caught a
+/// pane holding the moment it was parked at, and 33 later runs did not, because
+/// the window is one arrival wide — 66 µs at p50 against a 1 ms budget.
+/// `an_arrival_the_budget_cannot_afford_is_deferred_rather_than_dropped` pins
+/// the scan drain behaviourally; this is what carries the other two.
+#[test]
+fn every_ingest_arrival_drain_reads_its_budget_before_taking_the_message() {
+    let app = include_str!("../app.rs");
+    let chunks = include_str!("../app_chunks.rs");
+
+    for (source, name, budget, what) in [
+        (
+            app,
+            "fn poll_scan_results(",
+            "ingest_budget_spent()",
+            "scan",
+        ),
+        (
+            chunks,
+            "fn poll_chunk_results(",
+            "ingest_budget_spent()",
+            "chunk",
+        ),
+        (
+            app,
+            "fn poll_overlay_fetch_results(",
+            "deadline.is_some_and(",
+            "overlay fetch",
+        ),
+    ] {
+        let body = fn_body(source, name);
+        let take = body.find("try_recv_arrival()").unwrap_or_else(|| {
+            panic!(
+                "the {what} drain no longer takes its messages through \
+                 the counted spelling, so what this pin reads is gone"
+            )
+        });
+        let read = body
+            .find(budget)
+            .unwrap_or_else(|| panic!("the {what} drain no longer reads the frame's budget"));
+        assert!(
+            read < take,
+            "the {what} drain reads its budget {} bytes AFTER the \
+             `try_recv_arrival()` that takes the message, so the arrival that \
+             crosses the boundary is taken and then dropped at the `break` \
+             instead of being left on the channel for the next frame",
+            read - take,
+        );
+    }
+}

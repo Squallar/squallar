@@ -219,11 +219,19 @@ impl super::App {
     /// Drain finished rounds and apply them.
     pub(super) fn poll_chunk_results(&mut self) {
         // One arrival always goes through, on `poll_scan_results`' terms.
+        // **The budget is read before the take, not after it.**
+        // `try_recv_arrival` is destructive: an arrival taken and then
+        // abandoned at a `break` is gone — never applied, never re-sent, and
+        // invisible, because the drain that dropped it logged nothing. What a
+        // spent budget owes the next frame is a queue, not a gap.
         let mut drained_one = false;
-        while let Ok(resp) = self.channels.chunk_receiver.try_recv_arrival() {
+        loop {
             if drained_one && self.ingest_budget_spent() {
                 break;
             }
+            let Ok(resp) = self.channels.chunk_receiver.try_recv_arrival() else {
+                break;
+            };
             drained_one = true;
             let ChunkResponse {
                 generation,
