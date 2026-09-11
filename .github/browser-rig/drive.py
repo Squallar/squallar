@@ -5272,7 +5272,8 @@ def _window_stats(watcher, t0, t1, out):
 # not a zero -- that property is the dict's, not this list's.
 WINDOW_FAMILY_PREFIXES = ("segment:", "prepare:", "post:", "dispatch:",
                           "pre:", "ui:", "stack:", "panes:", "pump:",
-                          "finish:", "take:", "phase:", "lesspresent:")
+                          "finish:", "take:", "phase:", "lesspresent:",
+                          "content:")
 
 
 def watcher_named_in(gw):
