@@ -2,7 +2,7 @@
 """
 serve.py -- static file server for the squallar web bundle (rig edition).
 
-Serves /home/reddragon/projects/squallar/squallar-web (or --dir) with correct
+Serves the repo's squallar-web/ (or --dir) with correct
 MIME types (.wasm -> application/wasm, .js -> text/javascript; module scripts
 and instantiateStreaming both care). Never modifies the repo: all
 instrumentation happens at response time.
@@ -65,7 +65,7 @@ Programmatic use:
 
 CLI use (prints exactly one stdout line when ready, then serves until
 SIGTERM/SIGINT):
-    python3 serve.py --dir /home/reddragon/projects/squallar/squallar-web \
+    python3 serve.py --dir squallar-web \
         --port 0 --log out/serve.log
     # stdout: RIG-SERVE-READY <port> http://127.0.0.1:<port>/
 
@@ -112,7 +112,16 @@ import subprocess
 import sys
 import threading
 
-DEFAULT_DIR = "/home/reddragon/projects/squallar/squallar-web"
+# Resolved from THIS FILE (`<root>/.github/browser-rig/serve.py`), never from an
+# absolute path: the one that stood here named `projects/squallar`, which the
+# `rustdar` -> `squallar` rename moved in the wrong direction, so it had not
+# existed on this box since. Every rig caller passes --dir, so the rot only
+# ever bit a hand-run serve.py -- loudly (`FATAL: no index.html under ...`),
+# which is why it survived unnoticed rather than unreported.
+DEFAULT_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))),
+    "squallar-web")
 
 
 def lan_ip():

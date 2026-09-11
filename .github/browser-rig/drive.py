@@ -7989,6 +7989,106 @@ def selftest_wall_verdicts():
     return failed
 
 
+# Directories of PNGs written by encoders OTHER than this file's `_png_encode_test`,
+# each resolved from THIS FILE rather than from an absolute path: until
+# 2026-09-11 this arm named `/home/reddragon/projects/squallar/squallar-web/icons`,
+# a path the `rustdar` -> `squallar` rename moved in the wrong direction, so it
+# had never once run on this box.
+#
+# `required` is the difference between a CHECKOUT and BUILD OUTPUT. The
+# fixtures are tracked, so their absence means a broken checkout and is a
+# failure. `squallar-web/icons` is gitignored output of
+# `cargo run -p squallar-icon -- --web squallar-web/icons`, absent in every
+# fresh clone and on CI, so its absence is announced rather than failed --
+# announced, because the whole defect here was an absence that read as a pass.
+EXTERNAL_PNG_SOURCES = (
+    ("vendor/pmtiles/fixtures", True),
+    ("squallar-elevation/testdata", True),
+    ("squallar-web/icons", False),
+)
+
+
+def repo_root():
+    """The workspace root, resolved from this file: `<root>/.github/browser-rig/drive.py`.
+
+    Not a working directory (the rig is run from at least four of them) and
+    not an absolute path (one rotted silently through a rename).
+    """
+    return os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+
+
+def selftest_external_pngs():
+    """**The PNG decoder against an external encoder.** Returns failed pins.
+
+    Its round-trip sibling shares `_paeth` with the decoder, so it proves only
+    that the decoder agrees with ITSELF. This is the one arm that reads bytes
+    some other encoder produced -- real zlib streams, filter choices this
+    file never makes, chunks it never writes -- and until 2026-09-11 it was
+    guarded by `if os.path.isdir(<a path that did not exist>)`, so a wrong
+    path and a genuinely absent directory were indistinguishable and both
+    were silent.
+
+    So: no arm here may be absent quietly. A required source that cannot be
+    read FAILS and names the path it resolved; an optional one prints a SKIP
+    naming the path and the command that writes it; and whatever the source
+    list resolves to, decoding ZERO external images is itself a failure --
+    that last pin is what makes "the check did not run" impossible to
+    confuse with "the check passed", rather than merely unlikely today.
+    """
+    failed = 0
+
+    def pin(name, ok):
+        nonlocal failed
+        print("[self-test] %s %s" % ("ok  " if ok else "FAIL", name))
+        if not ok:
+            failed += 1
+
+    root = repo_root()
+    decoded = 0
+    for rel, required in EXTERNAL_PNG_SOURCES:
+        d = os.path.join(root, rel)
+        try:
+            names = sorted(n for n in os.listdir(d) if n.endswith(".png"))
+            why = None if names else "holds no .png"
+        except OSError as e:
+            names, why = [], "unreadable: %s" % e
+        if why is not None:
+            if required:
+                pin("external-PNG source %s is readable (%s -- %s)"
+                    % (rel, d, why), False)
+            else:
+                print("[self-test] SKIP external-PNG source %s (%s -- %s). "
+                      "Build output: `cargo run -p squallar-icon -- --web %s` "
+                      "writes it." % (rel, d, why, rel))
+            continue
+        for name in names:
+            with open(os.path.join(d, name), "rb") as fh:
+                st = png_stats(fh.read())
+            if st.get("blank") is None:
+                # An unsupported flavour (palette, interlaced, 16-bit) is a
+                # documented limit of this decoder rather than a defect --
+                # but it is announced, and it does NOT count toward the
+                # floor below, so a tree whose every external PNG became
+                # undecodable cannot read as a pass.
+                print("[self-test] note %s/%s is not decodable by this "
+                      "decoder: %s" % (rel, name, st.get("decode_error")))
+                continue
+            decoded += 1
+            pin("%s/%s decodes: %dx%d ch=%d, %d distinct colours over %d "
+                "samples, not blank"
+                % (rel, name, st["width"], st["height"], st["channels"],
+                   st["distinct_colors"], st["samples"]),
+                st.get("blank") is False)
+
+    pin("at least one externally-encoded PNG was decoded (%d were, from %d "
+        "declared sources under %s). This is the ONLY arm that checks the "
+        "decoder against something other than its own encoder, so a source "
+        "list that resolves to nothing must not read as a pass"
+        % (decoded, len(EXTERNAL_PNG_SOURCES), root), decoded > 0)
+    return failed
+
+
 def selftest():
     failures = []
     if selftest_loop_or_refusal():
@@ -8030,24 +8130,11 @@ def selftest():
     st = png_stats(_png_encode_test(64, 64, 3, grad, lambda y: (y % 4) + 1))
     if st.get("blank") is not False or st.get("near_blank") is not False:
         failures.append("gradient image classified blank: %s" % st)
-    # 3. real-world PNGs from an external encoder (repo icons), if readable
-    icons_dir = "/home/reddragon/projects/squallar/squallar-web/icons"
-    if os.path.isdir(icons_dir):
-        for name in sorted(os.listdir(icons_dir)):
-            if not name.endswith(".png"):
-                continue
-            with open(os.path.join(icons_dir, name), "rb") as fh:
-                st = png_stats(fh.read())
-            if st.get("blank") is None:
-                # unsupported flavour (e.g. palette) is a documented limit,
-                # not a failure -- but surface it
-                print("  note: %s not decodable: %s"
-                      % (name, st.get("decode_error")))
-            elif st.get("blank") is True:
-                failures.append("icon %s classified blank" % name)
-            else:
-                print("  ok: %s %dx%d distinct=%d" %
-                      (name, st["width"], st["height"], st["distinct_colors"]))
+    # 3. real-world PNGs from an external encoder: see
+    #    selftest_external_pngs, which reports its own pins.
+    if selftest_external_pngs():
+        failures.append("external-encoder PNG decode "
+                        "(see [self-test] lines)")
     if failures:
         for f in failures:
             print("SELFTEST FAIL: %s" % f)
