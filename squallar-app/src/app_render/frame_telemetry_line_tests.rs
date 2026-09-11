@@ -40,6 +40,17 @@ const NATIVE_ROW_PY: &str = include_str!("../../../.github/browser-rig/native_ro
 /// app writes, not what a fixture says it writes.
 const APP_RENDER: &str = include_str!("../app_render.rs");
 
+/// The two sibling modules of `squallar-app` that write telemetry rows of their
+/// own, read at compile time for `APP_RENDER`'s reason.
+///
+/// The gate above covers `app_render.rs` and says so. These are the files its
+/// own doc names as uncovered, and `archive spill:` landed in the first of them
+/// with no reader in either half of the rig and no test anywhere — the second
+/// instance of that class in two days, after `action budget:`. One hand-added
+/// pattern per instance is not a gate, so the families here are enumerated.
+const BUDGET_TELEMETRY: &str = include_str!("../budget_telemetry.rs");
+const LOOP_TELEMETRY: &str = include_str!("../loop_telemetry.rs");
+
 /// The body of a `var <name> = /…/;` regex literal in `drive.py`. Same
 /// extraction as `raster_telemetry_line_tests::pattern`, restated here only
 /// because the two modules pin different lines.
@@ -95,6 +106,64 @@ fn telemetry_line_families(src: &str) -> Vec<&str> {
             Some(name)
         })
         .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Every telemetry row family `src` formats, counting `write!`/`writeln!` as
+/// well as `format!`.
+///
+/// `telemetry_line_families` above requires the literal to OPEN the call, which
+/// is right for `app_render.rs` and blind by construction to a row built into a
+/// sink — and the sibling modules build most of theirs that way, so reusing it
+/// here would have reported a hole as covered.
+///
+/// **The scope, stated so this cannot be read as more than it is.** A family is
+/// counted when a call's first string literal begins with lowercase words and
+/// the next character is `:`. That is the row PREFIX shape. It therefore does
+/// NOT count the instance-scoped `<words> (<name>):` rows that `heap_census.rs`
+/// and `grid_pool_trim.rs` write, nor the eleven `named_hist_line` families
+/// whose head literal opens with `{prefix}` — both are real rows and neither is
+/// in this gate's denominator. Extending to them means teaching the extractor a
+/// second shape, not widening this list.
+fn telemetry_row_families(src: &str) -> Vec<&str> {
+    const HEADS: [&str; 3] = ["format!(", "write!(", "writeln!("];
+    let mut out: Vec<&str> = Vec::new();
+    for head in HEADS {
+        for (at, _) in src.match_indices(head) {
+            let rest = &src[at + head.len()..];
+            let Some(quote) = rest.find('"') else {
+                continue;
+            };
+            let before = &rest[..quote];
+            // Either the literal opens the call, or exactly one sink argument
+            // precedes it. Anything else is a literal in a later position.
+            let opens = before.chars().all(char::is_whitespace);
+            let one_sink =
+                before.matches(',').count() == 1 && !before.contains('"') && !before.contains(')');
+            if !(opens || one_sink) {
+                continue;
+            }
+            let body = &rest[quote + 1..];
+            let end = body
+                .find(|c: char| {
+                    !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == ' ' || c == '-')
+                })
+                .unwrap_or(body.len());
+            let Some(name) = body.get(..end) else {
+                continue;
+            };
+            if name.is_empty()
+                || name.starts_with(' ')
+                || name.ends_with(' ')
+                || body.as_bytes().get(end) != Some(&b':')
+            {
+                continue;
+            }
+            out.push(name);
+        }
+    }
     out.sort_unstable();
     out.dedup();
     out
@@ -1554,11 +1623,14 @@ fn the_rig_reads_the_action_budget_line_the_app_actually_writes() {
 /// same coverage-shaped nothing this gate exists to replace. Shed one before
 /// adding one.
 ///
-/// **What this does NOT cover**, stated so it cannot be read as more: the
-/// `squallar-app` crate writes telemetry from `budget_telemetry.rs` (fourteen
-/// more families) and `loop_telemetry.rs` (one), and `squallar-egui`'s
-/// `heap_census` writes several; none of those files is read here. This gate
-/// covers `app_render.rs`.
+/// **What this does NOT cover**, stated so it cannot be read as more: this gate
+/// covers `app_render.rs`. The `squallar-app` crate also writes telemetry from
+/// `budget_telemetry.rs` (FIFTEEN more families — fourteen when this note was
+/// written, and `archive spill:` is the fifteenth) and `loop_telemetry.rs`
+/// (one); those sixteen are enumerated by
+/// [`every_telemetry_row_the_sibling_modules_write_is_claimed_by_a_probe_or_a_reason`].
+/// `squallar-egui`'s `heap_census` writes several more, in the instance-scoped
+/// `<words> (<name>):` shape, and NEITHER gate counts those.
 #[test]
 fn every_telemetry_line_family_app_render_writes_is_claimed_by_a_probe_or_a_reason() {
     /// How a family reaches — or fails to reach — a leg's artifact.
@@ -1723,6 +1795,168 @@ fn every_telemetry_line_family_app_render_writes_is_claimed_by_a_probe_or_a_reas
         families.len(),
         claims.len(),
         "the table names families app_render.rs no longer writes: {families:?}",
+    );
+}
+
+/// **Every telemetry row the sibling modules write reaches a rig, or says why.**
+///
+/// The gate above covers `app_render.rs`. Its own doc names what it does not:
+/// `budget_telemetry.rs` and `loop_telemetry.rs`. `archive spill:` landed in the
+/// first of them with no `drive.py` regex, no `native_row.py` probe and no test
+/// anywhere — and it is the row on this campaign whose ABSENCE is a reading, so
+/// a counter nothing read could not carry the one distinction it was built for.
+/// `action budget:` was the same class two days earlier and was fixed by hand.
+/// A second hand-fix is not a gate; this enumerates the class.
+///
+/// **A claim may be satisfied by EITHER half of the rig**, which the gate above
+/// cannot express: it checks `drive.py` only, and `overlay pictures:` is read by
+/// `native_row.py`'s own `OVERLAY_PICTURES_RE` and by no `drive.py` `var`. A
+/// gate that accepted only the web half would have reported that family as
+/// unread and pushed someone to add a duplicate pattern.
+///
+/// **`Unread` is a ratchet at twelve and may only FALL.** Twelve of these
+/// sixteen families reach no leg, which is a real coverage figure and not a
+/// list to grow. The denominator is stated because a bare count invites the
+/// comparison this gate refuses to make: "rig regex literals" is not comparable
+/// to "call sites" — several literals are assertion messages, and one call site
+/// can emit from several branches.
+#[test]
+fn every_telemetry_row_the_sibling_modules_write_is_claimed_by_a_probe_or_a_reason() {
+    /// How a family reaches — or fails to reach — a leg's artifact.
+    enum Claim {
+        /// Read by these `drive.py` regexes, which must exist. `native_row.py`
+        /// extracts its own probes from the same literals, so one name covers
+        /// both halves.
+        By(&'static [&'static str]),
+        /// Read by `native_row.py` alone, by a pattern it declares itself. The
+        /// native half is the one that reads a memory leg, so this is a real
+        /// claim and not a weaker one.
+        ByNative(&'static [&'static str]),
+        /// **No rig reader on either half.** Invisible to every leg's artifact,
+        /// and the string is why that is currently tolerated.
+        Unread(&'static str),
+    }
+    use Claim::{By, ByNative, Unread};
+
+    /// The most families that may be `Unread`. A ceiling, permanent, may only
+    /// FALL — `arch_ratchets`' discipline, for its reason.
+    const UNREAD_CEILING: usize = 12;
+    /// A floor under the extraction, so a rename that makes it match *nothing*
+    /// fails loudly rather than passing over an empty list.
+    const KNOWN_FAMILY_FLOOR: usize = 16;
+
+    let claims: &[(&str, Claim)] = &[
+        // THE ROW THIS GATE WAS ADDED FOR. Absent rather than zeroed when no
+        // spill is installed, so a present `spilled 0` is the readable state
+        // "armed and did not fire" — and a ~94 MiB cut on this campaign
+        // delivered exactly zero because nothing read its counter for a day.
+        ("archive spill", By(&["archive_spill_re"])),
+        (
+            "base holders",
+            Unread("the base-layer holder census; no leg reports it"),
+        ),
+        (
+            "base release",
+            Unread("paired with `base restore:`; neither half scrapes it"),
+        ),
+        (
+            "base restore",
+            Unread("paired with `base release:`; neither half scrapes it"),
+        ),
+        (
+            "base way-back",
+            Unread("the way-back counts behind decoded eviction; unclaimed"),
+        ),
+        ("budget state", By(&["budget_state_re"])),
+        (
+            "chunk archives",
+            Unread("the chunked-archive tally; unclaimed"),
+        ),
+        (
+            "decoded trades",
+            Unread("the lookahead trade ledger; unclaimed"),
+        ),
+        (
+            "host heap watch",
+            Unread("the host-heap watch level; the census carries the bytes"),
+        ),
+        (
+            "loop decoded",
+            Unread("the loop's decoded-volume tally; unclaimed"),
+        ),
+        ("loop state", By(&["loop_state_re"])),
+        (
+            "moment drop",
+            Unread("bytes the decoder never built; a running total, unclaimed"),
+        ),
+        // The family that made `By` too narrow: no `drive.py` var, and the
+        // native half declares its own pattern for it.
+        ("overlay pictures", ByNative(&["OVERLAY_PICTURES_RE"])),
+        (
+            "radar dup volumes",
+            Unread("the duplicate-volume census; unclaimed"),
+        ),
+        (
+            "radar volumes",
+            Unread("the volume census; the heap census carries the bytes"),
+        ),
+        (
+            "way-back pins",
+            Unread("archives pinned to the ceiling; unclaimed"),
+        ),
+    ];
+
+    let mut families = telemetry_row_families(BUDGET_TELEMETRY);
+    families.extend(telemetry_row_families(LOOP_TELEMETRY));
+    families.sort_unstable();
+    families.dedup();
+    assert!(
+        families.len() >= KNOWN_FAMILY_FLOOR,
+        "only {} telemetry row families were extracted from budget_telemetry.rs          and loop_telemetry.rs, under the {KNOWN_FAMILY_FLOOR} known to be          there: the extraction has stopped matching and this gate is passing          over a short list: {families:?}",
+        families.len(),
+    );
+    let mut unread = 0;
+    for family in &families {
+        let claim = claims
+            .iter()
+            .find(|(f, _)| f == family)
+            .map(|(_, c)| c)
+            .unwrap_or_else(|| {
+                panic!(
+                    "a sibling telemetry module writes an `{family}:` row and                      this table does not say how a leg reads it. Claim it: name                      the `drive.py` regex or the `native_row.py` pattern that                      scrapes it, or record it as `Unread` with the reason — and                      `Unread` is a ratchet, so shed one first. An unclaimed row                      is invisible to every leg's artifact, which reads there                      exactly like an arm that produced no samples"
+                )
+            });
+        match claim {
+            By(probes) => {
+                for probe in *probes {
+                    assert!(
+                        DRIVE_PY.contains(&format!("var {probe} = /")),
+                        "`{family}:` is claimed by `{probe}` and drive.py has                          no such regex, so the row reaches no leg",
+                    );
+                }
+            }
+            ByNative(probes) => {
+                for probe in *probes {
+                    assert!(
+                        NATIVE_ROW_PY.contains(&format!("{probe} = re.compile(")),
+                        "`{family}:` is claimed by `{probe}` and native_row.py                          declares no such pattern, so the row reaches no                          native leg",
+                    );
+                }
+            }
+            Unread(reason) => {
+                assert!(!reason.is_empty(), "`{family}:` is Unread with no reason");
+                unread += 1;
+            }
+        }
+    }
+    assert!(
+        unread <= UNREAD_CEILING,
+        "{unread} families are `Unread` and the ceiling is {UNREAD_CEILING}.          It may only fall: give one of them a probe rather than raising it",
+    );
+    assert_eq!(
+        families.len(),
+        claims.len(),
+        "the table names families the sibling modules no longer write:          {families:?}",
     );
 }
 

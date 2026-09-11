@@ -2763,6 +2763,9 @@ var cmdstream_all = [];
 var cmdstream_unparsed = null;
 var action_budget_all = [];
 var action_budget_unparsed = null;
+var archive_spill = null;
+var archive_spill_all = [];
+var archive_spill_unparsed = null;
 var off_re = /([A-Za-z0-9_-]+) took (\d+) ms off the frame/;
 var rayon_re = /rayon: (\d+) threads/;
 // The LAST match wins, not the first: `worker_port::account` logs RUNNING
@@ -2821,6 +2824,27 @@ var uploads_re = /texture uploads: (\d+) deltas, (\d+) B to the GPU, (\d+) B who
 // not separable from this reader -- reported as `null`, never as a zero.
 var action_budget_re = /action budget: (\d+) handled, (\d+) bites, (\d+) deferred, (\d+) coalesced, (\d+) deepest/;
 var action_budget_loose_re = /action budget: \d+ handled/;
+// **Whether the archive spill fired, and whether anything came back.**
+//
+// Seven fields, and they are THREE kinds that are never added to each other.
+// `on-disk` is bytes on the MEDIUM -- they are the bytes that LEFT the heap,
+// so this figure belongs to no census level and adding it to one double-counts
+// a saving; `in <n>` is how many keys are spilled right now. Both are LEVELS:
+// last-wins is the answer and a difference of two readings is not a reading.
+// The five after them are RUNNING TOTALS and difference over a bracket.
+//
+// **An absent line is not `spilled 0`, and this is the one line on which that
+// distinction was DESIGNED IN.** `archive_spill_line` returns `None` when the
+// target has nowhere to put an archive, so the row is absent rather than a row
+// of zeros -- which makes a PRESENT row carrying `spilled 0` the real and
+// readable state "armed and did not fire". Absence means "no spill on this
+// target" (all of wasm, and any native box whose directory could not be made)
+// or "a binary older than the row", and never that the mechanism ran and did
+// nothing. A ~94 MiB cut on this campaign delivered exactly zero because its
+// precondition never held on the arm it ran on and nothing read the counter
+// for a day; reported as `null`, never as a zero.
+var archive_spill_re = /archive spill: on-disk (\d+) B in (\d+), spilled (\d+), refused-full (\d+), store-failed (\d+), restored (\d+), restore-misses (\d+)/;
+var archive_spill_loose_re = /archive spill: on-disk \d+ B/;
 // A THIRD denominator, and it is added to neither of the two above. These
 // count archive tile BODIES DECODED, split by the archive header's declared
 // tile_type: `vector` is the self-hosted basemap's MVT, `raster` the terrain
@@ -3047,6 +3071,28 @@ for (var i = 0; i < C.length; i++) {
   // stories are already crowded: absence means an old binary OR a budget that
   // never bit, and without this arm a reshaped line would impersonate both.
   else if (action_budget_loose_re.test(m)) action_budget_unparsed = m;
+  var asm = archive_spill_re.exec(m);
+  if (asm) {
+    archive_spill = { on_disk_bytes: parseInt(asm[1], 10),
+                      resident_keys: parseInt(asm[2], 10),
+                      spilled: parseInt(asm[3], 10),
+                      refused_full: parseInt(asm[4], 10),
+                      store_failed: parseInt(asm[5], 10),
+                      restored: parseInt(asm[6], 10),
+                      restore_misses: parseInt(asm[7], 10) };
+    archive_spill_all.push({ t: C[i].t,
+                             on_disk_bytes: archive_spill.on_disk_bytes,
+                             resident_keys: archive_spill.resident_keys,
+                             spilled: archive_spill.spilled,
+                             refused_full: archive_spill.refused_full,
+                             store_failed: archive_spill.store_failed,
+                             restored: archive_spill.restored,
+                             restore_misses: archive_spill.restore_misses });
+  }
+  // Present but unparseable is NOT absent, and on this line absence is the
+  // signal "no spill here" -- so a reshaped row impersonating it would erase
+  // the one distinction the row was built to carry.
+  else if (archive_spill_loose_re.test(m)) archive_spill_unparsed = m;
   var bm = basemap_re.exec(m);
   if (bm) basemap = { vector_tiles: parseInt(bm[1], 10),
                       raster_tiles: parseInt(bm[2], 10),
@@ -3145,6 +3191,8 @@ return { attached: attached, different: different, off_frame: off_frame,
          cmdstream_all: cmdstream_all, cmdstream_unparsed: cmdstream_unparsed,
          action_budget: action_budget, action_budget_all: action_budget_all,
          action_budget_unparsed: action_budget_unparsed,
+         archive_spill: archive_spill, archive_spill_all: archive_spill_all,
+         archive_spill_unparsed: archive_spill_unparsed,
          basemap: basemap, ground: ground, floor: floor,
          tile_cache: tile_cache, tile_cache_all: tile_cache_all,
          tile_bodies: tile_bodies,

@@ -187,6 +187,7 @@ PROBE_NAMES = (
     "tile_bodies_re",
     "frame_need_re",
     "action_budget_re",
+    "archive_spill_re",
     "gesture_begin_re",
     "gesture_loop_re",
 )
@@ -615,6 +616,7 @@ def scrape(lines, probes):
         "tile_bodies": [],
         "frame_need": [],
         "action_budget": [],
+        "archive_spill": [],
         "overlay_pictures": [],
         "segments": [],
         # `{key: [Reading]}` for every per-family line present, keyed the
@@ -660,6 +662,7 @@ def scrape(lines, probes):
             ("tile_bodies", "tile_bodies_re"),
             ("frame_need", "frame_need_re"),
             ("action_budget", "action_budget_re"),
+            ("archive_spill", "archive_spill_re"),
             ("loop_state", "loop_state_re"),
         ):
             m = probes[probe].search(line)
@@ -675,6 +678,14 @@ def scrape(lines, probes):
         if ("action budget:" in line
                 and not probes["action_budget_re"].search(line)):
             out["unparsed"].append((idx, "action_budget_re", line.strip()[:200]))
+        # `archive spill:` the same, and here the stakes are the inverse of
+        # the line above: absence on this row MEANS "no spill on this target",
+        # which is a reading. A reshaped line that silently stopped matching
+        # would therefore not read as a broken reader but as a true statement
+        # about the arm, which is the worst failure available to it.
+        if ("archive spill: on-disk" in line
+                and not probes["archive_spill_re"].search(line)):
+            out["unparsed"].append((idx, "archive_spill_re", line.strip()[:200]))
         # `budget state` is a level too, but its first group is the bracket's
         # NAME, so it cannot ride the all-`int()` loop above: the word is kept
         # as text and the fifteen figures after it are ints. Every group is
@@ -2545,6 +2556,51 @@ def build_row(args, scraped, probes):
         "deepest": abl[1][4],
     })
 
+    # **Which way the archive bytes went, and whether the spill is even here.**
+    #
+    # Seven fields in THREE kinds that are never added: `on_disk_bytes` is bytes
+    # on the MEDIUM -- the bytes that LEFT the heap, so they belong to no census
+    # level and adding them to one double-counts the saving -- and
+    # `resident_keys` is how many keys are spilled right now. Both are LEVELS,
+    # taken as the last reading in the bracket. The five after them are RUNNING
+    # TOTALS and difference over it.
+    #
+    # **None here is not `spilled 0`, and on this line that distinction is the
+    # point.** `archive_spill_line` returns `None` when the target has nowhere
+    # to put an archive, so the row is ABSENT rather than zeroed -- which is
+    # what makes a PRESENT row reading `spilled 0` the genuine, quotable state
+    # "armed and did not fire". So absence means "no spill on this target"
+    # (every wasm leg, and any native box whose directory could not be made) or
+    # "a binary older than the row", and never that the mechanism ran and did
+    # nothing. That is the opposite of `action budget:` above, whose zero is
+    # unreachable, and it is why this row can carry the weight that one cannot.
+    asp = diff_totals(scraped["archive_spill"], start_idx, end_idx)
+    aspl = at_or_before(scraped["archive_spill"], end_idx)
+    archive_spill = (None if asp is None or aspl is None else {
+        # LEVELS: the last reading in the bracket, never a difference.
+        "on_disk_bytes": aspl[1][0],
+        "resident_keys": aspl[1][1],
+        # RUNNING TOTALS, differenced over the bracket.
+        "spilled": asp[2], "refused_full": asp[3], "store_failed": asp[4],
+        "restored": asp[5], "restore_misses": asp[6],
+        # The reading the row exists to deliver, stated rather than left to a
+        # reader adding fields up: the mechanism is installed (the row is here
+        # at all) and this says whether it moved a byte in the window.
+        "armed_and_fired": asp[2] > 0,
+    })
+    if archive_spill is None:
+        notes.append(
+            "no `archive spill:` row in the bracket: this arm has NO SPILL "
+            "INSTALLED (or predates the row) -- it is NOT `spilled 0`, and the "
+            "archive-ceiling saving cannot be credited on this leg"
+        )
+    elif not archive_spill["armed_and_fired"]:
+        notes.append(
+            "`archive spill:` row PRESENT and `spilled 0` over the bracket: the "
+            "spill is armed and did not fire, so any archive-ceiling saving "
+            "claimed on this leg was delivered by something else"
+        )
+
     # Basemap state, on `run_measure.sh`'s own two-counter terms.
     bt = diff_totals(scraped["basemap"], start_idx, end_idx)
     g = diff_totals(scraped["ground"], start_idx, end_idx)
@@ -2637,6 +2693,7 @@ def build_row(args, scraped, probes):
         # coerced to zero: this is a fires counter and a fabricated zero is
         # the exact reading it exists to make impossible.
         "action_budget": action_budget,
+        "archive_spill": archive_spill,
         # `(line, bracket, [fifteen ints])`, or None when the log has no
         # `budget state:` line -- a binary older than the line, kept apart
         # from a live binary reporting zeroes.
@@ -2941,6 +2998,30 @@ def print_row(row):
             "%s deepest [LEVEL, the last reading, never a difference]"
             % (ab["handled"], ab["bites"], ab["deferred"], ab["coalesced"],
                ab["deepest"])
+        )
+    # Which way the archive bytes went. `on-disk` is bytes on the MEDIUM and is
+    # added to no census level -- they are the bytes that LEFT the heap, and
+    # adding them back double-counts the saving.
+    asp = row.get("archive_spill")
+    if asp is None:
+        print(
+            "ROW   archive spill: n/a (no `archive spill:` line brackets this "
+            "window). That is NOT `spilled 0`: the app writes the row only when "
+            "a spill is INSTALLED, so this arm has nowhere to put an archive "
+            "(every wasm leg, or a native box whose directory could not be "
+            "made) OR runs a binary older than the row. An archive-ceiling "
+            "saving cannot be credited on this leg"
+        )
+    else:
+        print(
+            "ROW   archive spill: %s B on-disk in %s keys [LEVELS, the last "
+            "reading, on the MEDIUM -- never added to a census family]; "
+            "%s spilled, %s refused-full, %s store-failed, %s restored, "
+            "%s restore-misses [over the bracket]; ARMED AND %s"
+            % (asp["on_disk_bytes"], asp["resident_keys"], asp["spilled"],
+               asp["refused_full"], asp["store_failed"], asp["restored"],
+               asp["restore_misses"],
+               "FIRED" if asp["armed_and_fired"] else "DID NOT FIRE")
         )
     tb = row.get("tile_bodies")
     if tb is None:
@@ -5793,6 +5874,173 @@ class ActionBudgetTests(unittest.TestCase):
         self.assertEqual(scraped["action_budget"], [])
         self.assertTrue(
             any(p == "action_budget_re" for _idx, p, _line in scraped["unparsed"]),
+            scraped["unparsed"])
+
+
+
+class ArchiveSpillTests(unittest.TestCase):
+    """`archive spill:`, the row whose ABSENCE is a reading.
+
+    Every other counter line in this rig reads absence as ambiguous. This one
+    was built so it is not: the emitter returns `None` when no spill is
+    installed, which is what makes a PRESENT row carrying `spilled 0` the
+    quotable state "armed and did not fire". These tests pin that asymmetry,
+    because a reader that prints a zero for absence destroys the only property
+    the row has.
+    """
+
+    LINE = ("[..] INFO archive spill: on-disk %d B in %d, spilled %d, "
+            "refused-full %d, store-failed %d, restored %d, restore-misses %d")
+
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.load = os.path.join(self._tmp.name, "load")
+        with open(self.load, "w", encoding="utf-8") as fh:
+            for i in range(6):
+                fh.write("%d\t1.0\n" % (1_000_000 + 5 * i))
+        self.probes = compile_probes()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _row(self, lines):
+        row = build_row(_leg_args(self.load, 1), scrape(lines, self.probes), self.probes)
+        return row, _capture(lambda: print_row(row))
+
+    def test_the_probe_is_drive_pys_own(self):
+        """Read out of drive.py at run time, never restated here, so the two
+        halves of the rig cannot come to read different lines."""
+        self.assertEqual(
+            drive_pattern("archive_spill_re"),
+            r"archive spill: on-disk (\d+) B in (\d+), spilled (\d+), "
+            r"refused-full (\d+), store-failed (\d+), restored (\d+), "
+            r"restore-misses (\d+)")
+
+    def test_the_probe_matches_the_line_the_rust_emitter_formats(self):
+        """The pattern against `budget_telemetry::archive_spill_line`'s own
+        format string, field for field. A regex that matches a line this test
+        invented and not the one the app writes reads every leg as absent --
+        which on this row is a FALSE STATEMENT about the arm, not a gap."""
+        line = ("archive spill: on-disk 87687975 B in 60, spilled 60, "
+                "refused-full 0, store-failed 0, restored 3, restore-misses 0")
+        m = self.probes["archive_spill_re"].search(line)
+        self.assertIsNotNone(m, "the probe does not match the emitted line")
+        self.assertEqual([int(g) for g in m.groups()],
+                         [87687975, 60, 60, 0, 0, 3, 0])
+
+    def test_drive_py_reads_each_group_into_the_field_it_belongs_to(self):
+        """The POSITIONAL half, on `ActionBudgetTests`' terms exactly: a field
+        inserted mid-line shifts every group after it while a match check and a
+        Rust literal pin both stay green, and the row then carries one figure
+        under another figure's name."""
+        text = _read(DRIVE_PY)
+        pattern = drive_pattern("archive_spill_re", text)
+        fields = [("on_disk_bytes", 87687975), ("resident_keys", 60),
+                  ("spilled", 137), ("refused_full", 4),
+                  ("store_failed", 2), ("restored", 19),
+                  ("restore_misses", 7)]
+        line = ("archive spill: on-disk %d B in %d, spilled %d, "
+                "refused-full %d, store-failed %d, restored %d, "
+                "restore-misses %d" % tuple(v for _, v in fields))
+        m = re.search(pattern, line)
+        self.assertIsNotNone(m, "drive.py's probe no longer matches the line")
+        groups = m.groups()
+        self.assertEqual(len(groups), len(fields))
+        body = text[text.index("var asm = archive_spill_re.exec(m);"):]
+        body = body[:body.index("archive_spill_all.push")]
+        assigned = re.findall(r"(\w+): parseInt\(asm\[(\d+)\], 10\)", body)
+        self.assertEqual(
+            [name for name, _ in assigned], [name for name, _ in fields],
+            "drive.py reads a different set of fields, or reads them in a "
+            "different order, from the ones the line carries")
+        for (name, expected), (_, at) in zip(fields, assigned):
+            self.assertEqual(
+                int(groups[int(at) - 1]), expected,
+                "drive.py reads group %s into `%s`, which carries %s and not "
+                "%s -- the row labels one figure with another's name"
+                % (at, name, groups[int(at) - 1], expected))
+
+    def test_a_field_dropped_anywhere_stops_the_match_dead(self):
+        m = self.probes["archive_spill_re"].search(
+            self.LINE % (1, 2, 3, 4, 5, 6, 7))
+        self.assertIsNotNone(m)
+        self.assertIsNone(self.probes["archive_spill_re"].search(
+            "[..] INFO archive spill: on-disk 1 B in 2, spilled 3"))
+
+    def test_the_row_windows_the_totals_and_keeps_on_disk_as_a_level(self):
+        """Five running totals differenced over the bracket; `on-disk` and the
+        key count taken as the LAST reading. Differencing a level would print
+        the medium shrinking as a negative byte count."""
+        lines = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE)
+        out, seen = [], 0
+        for line in lines:
+            out.append(line)
+            if "gesture script pan-zoom-2d loop complete" in line:
+                seen += 1
+                out.append(self.LINE % (1_000_000 * seen, 10 * seen,
+                                        7 * seen, 0, 0, 2 * seen, 0))
+        row, text = self._row(out)
+        asp = row["archive_spill"]
+        self.assertIsNotNone(asp)
+        # Differences: multiples of the per-loop step, carrying none of the
+        # traffic ahead of the bracket.
+        self.assertEqual(asp["spilled"] % 7, 0)
+        self.assertGreater(asp["spilled"], 0)
+        self.assertEqual(asp["restored"] % 2, 0)
+        # The levels: readings that were actually printed, never differences.
+        self.assertEqual(asp["on_disk_bytes"] % 1_000_000, 0)
+        self.assertGreater(asp["on_disk_bytes"], 0)
+        self.assertEqual(asp["resident_keys"] % 10, 0)
+        self.assertTrue(asp["armed_and_fired"])
+        self.assertIn("ROW   archive spill: ", text)
+        self.assertIn("ARMED AND FIRED", text)
+        self.assertIn("never added to a census family", text)
+
+    def test_an_absent_row_is_no_spill_installed_and_never_spilled_zero(self):
+        """**The distinction the row was designed to carry.** A ~94 MiB cut on
+        this campaign delivered exactly zero because its precondition never held
+        on the arm it ran on. Printing `spilled 0` for a leg with no spill
+        installed is that failure with the evidence erased."""
+        row, text = self._row(_leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE))
+        self.assertIsNone(row["archive_spill"])
+        self.assertIn("ROW   archive spill: n/a", text)
+        self.assertIn("NOT `spilled 0`", text)
+        self.assertNotIn("ROW   archive spill: 0 B on-disk", text)
+        self.assertNotIn("ARMED AND", text)
+
+    def test_a_present_row_reading_zero_is_armed_and_did_not_fire(self):
+        """The reading the row exists to deliver, and the one an absent row
+        cannot stand in for: the mechanism IS here and moved nothing."""
+        lines = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE)
+        out = []
+        for line in lines:
+            out.append(line)
+            if "gesture script pan-zoom-2d loop complete" in line:
+                out.append(self.LINE % (0, 0, 0, 0, 0, 0, 0))
+        row, text = self._row(out)
+        asp = row["archive_spill"]
+        self.assertIsNotNone(asp, "a present all-zero row must not read as absent")
+        self.assertEqual(asp["spilled"], 0)
+        self.assertFalse(asp["armed_and_fired"])
+        self.assertIn("ARMED AND DID NOT FIRE", text)
+        self.assertTrue(
+            any("armed and did not fire" in n for n in row["notes"]),
+            row["notes"])
+
+    def test_a_reshaped_line_is_a_broken_reader_not_an_absent_family(self):
+        """On this row the stakes are the inverse of `action budget:`: absence
+        MEANS "no spill on this target", so a reader that quietly stopped
+        matching would not read as broken but as a true statement about the
+        arm."""
+        out = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE)
+        out.append("[..] INFO archive spill: on-disk 123 B in 4, spilled 5, "
+                   "refused-full 0, store-failed 0, restored 0")
+        scraped = scrape(out, self.probes)
+        self.assertEqual(scraped["archive_spill"], [])
+        self.assertTrue(
+            any(p == "archive_spill_re" for _idx, p, _line in scraped["unparsed"]),
             scraped["unparsed"])
 
 
