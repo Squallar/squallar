@@ -168,6 +168,35 @@ def drive_pattern(name, source=None):
     return rest[:end]
 
 
+
+_DRIVE_MODULE = []
+
+
+def drive_module():
+    """`drive.py` itself, imported, so a reader can be SHARED and not restated.
+
+    This half already reads `drive.py`'s regex literals out of its source at
+    run time (`_re_body`) for the reason in this file's header: a pattern
+    restated here is a pattern that drifts. A whole READER has the same
+    problem and worse -- `budget_pressure_reading` classifies six shapes
+    across three tail generations, and two copies of that would disagree the
+    first time the producer grows a field, with the native half quietly
+    reporting the wrong generation.
+
+    `drive.py` is stdlib-only at module level -- `selenium` is imported inside
+    the functions that need it -- so importing it costs nothing and needs no
+    browser. Cached, because the module is ten thousand lines and `scrape` is
+    called per log.
+    """
+    if not _DRIVE_MODULE:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("rig_drive", DRIVE_PY)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _DRIVE_MODULE.append(mod)
+    return _DRIVE_MODULE[0]
+
+
 # The probes this analyser needs. Every one is `drive.py`'s, unmodified: the
 # JS and Python flavours agree on all of `\d`, `\(`, `\/`, `[0-9,]+`,
 # `[a-z0-9]+`, `[a-z0-9-]+`.
@@ -712,6 +741,15 @@ def scrape(lines, probes):
         "floor": [],
         "loop_state": [],
         "budget_state": [],
+        # WHOLE `pressure:` lines, in log order, classified later by
+        # `drive.py`'s `budget_pressure_reading` rather than here. This family
+        # is an EVENT and not a level: it has six shapes, two of which
+        # (`surface lost`, `out of memory`) are the ONLY causes a desktop can
+        # raise, so this half is the only one that can ever read them. The
+        # lines are kept whole because the classifier needs the head it was
+        # not given a pattern for -- `pressure: oom during gpu probe,
+        # presumption held` does not carry the family's own head.
+        "budget_pressure_lines": [],
         # Lines whose marker is present but whose positional regex did not
         # match -- a reader breakage, kept apart from an absent family.
         "unparsed": [],
@@ -864,6 +902,14 @@ def scrape(lines, probes):
         # as text and the fifteen figures after it are ints. Every group is
         # mandatory; no match at all leaves the family empty, which the row
         # prints as absent -- an older binary, never a zero reading.
+        # Memory pressure: the whole line, kept for the shared classifier.
+        # `pressure:` and not `budget pressure:` -- the held-rung line
+        # (`squallar-app/src/app_render.rs:8653`) has a different head, and a
+        # harvest keyed on the family's own head drops the only row that says
+        # why a rung did not move. Anything else here reaches the classifier's
+        # `unclassified` bucket rather than being dropped.
+        if "pressure:" in line:
+            out["budget_pressure_lines"].append(line.strip())
         m = probes["budget_state_re"].search(line)
         if m:
             g = m.groups()
@@ -3065,6 +3111,12 @@ def build_row(args, scraped, probes):
         # `budget state:` line -- a binary older than the line, kept apart
         # from a live binary reporting zeroes.
         "budget_state": (scraped["budget_state"][-1] if scraped["budget_state"] else None),
+        # The memory-pressure reading, from `drive.py`'s classifier so the two
+        # rig halves cannot disagree about a shape. ALWAYS a dict, never None:
+        # its own `state` says `absent` with a reason, so a leg that saw no
+        # pressure is a reported absence and never a zero reclaim.
+        "budget_pressure": drive_module().budget_pressure_reading(
+            scraped["budget_pressure_lines"]),
         # Non-empty when a line's marker was present but its regex did not
         # match. `budget_state: None` with this non-empty means the READER
         # broke, not that the binary predates the line -- the two used to be
@@ -3335,6 +3387,13 @@ def print_row(row):
     # never added to it. Absent when the log has no `budget state:` line: a
     # binary older than the line, printed as such and never as zeroes. `.get`
     # because a row built before the field existed reads the same way.
+    # Memory pressure, on EVERY row and not only when it fired: a family
+    # printed only when it acted cannot be told apart from a rig that stopped
+    # reading it, which is the state this family was in until 2026-09-11. The
+    # `absent` reading says so in its own words. `.get` because a row built
+    # before the field existed reads the same way.
+    print("ROW   memory pressure: %s"
+          % drive_module().budget_pressure_summary(row.get("budget_pressure")))
     bs = row.get("budget_state")
     if bs:
         _line, bracket_name, f = bs
@@ -5642,6 +5701,87 @@ class SharedFormatTests(unittest.TestCase):
             scrape([before_balloon], probes)["budget_state"], [],
             "a line without the balloon group matched: every group is mandatory",
         )
+
+    def test_the_pressure_family_scrapes_whole_and_classifies_by_name(self):
+        """The memory-pressure family, through the SHARED classifier.
+
+        This half is the only one that can ever see the two desktop causes:
+        `linear memory` and `worker memory` are raised only where
+        `page_max_bytes` is supplied, which is `squallar-web` alone, and the
+        memory warning is Android's and iOS's -- so `surface lost` and
+        `out of memory` reach a native log and nothing else does. The family
+        had no reader in either half until 2026-09-11.
+        """
+        probes = compile_probes()
+        SURFACE = (
+            "[2026-09-11T04:00:00Z WARN  squallar_app] budget pressure: "
+            "surface lost -> evicted render cache 4 entries 96 MiB, extracts "
+            "1, ladder rung 2, tile economy 0 MiB, staging released 0 MiB, "
+            "oversample 100"
+        )
+        s = scrape([SURFACE], probes)
+        self.assertEqual(len(s["budget_pressure_lines"]), 1)
+        r = drive_module().budget_pressure_reading(s["budget_pressure_lines"])
+        self.assertEqual(r["state"], "acted")
+        self.assertEqual(r["cause_label"], "surface lost")
+        self.assertEqual(r["render_entries"], 4)
+        self.assertEqual(r["render_mib"], 96)
+        self.assertEqual(r["ladder_rung"], 2)
+        self.assertEqual(r["format_generation"], "current")
+        self.assertEqual(r["unread"], [])
+        # The env_logger preamble in front of the head must not stop the read:
+        # a native line is never bare the way a browser console entry is.
+        self.assertEqual(r["used_mib"], None)
+
+    def test_the_held_rung_line_survives_the_family_head_grep(self):
+        """`pressure: oom during gpu probe` does NOT carry the family's head.
+
+        A harvest keyed on `budget pressure:` drops it, and with it the only
+        row that says why a rung did not move. The scrape keys on the shorter
+        literal for exactly that reason."""
+        probes = compile_probes()
+        HELD = ("[2026-09-11T04:00:00Z WARN  squallar_app] pressure: oom "
+                "during gpu probe, presumption held")
+        s = scrape([HELD], probes)
+        self.assertEqual(len(s["budget_pressure_lines"]), 1)
+        r = drive_module().budget_pressure_reading(s["budget_pressure_lines"])
+        self.assertEqual(r["state"], "probe_held")
+        self.assertTrue(r["probe_held"])
+
+    def test_a_log_with_no_pressure_line_reads_absent_not_zero(self):
+        probes = compile_probes()
+        s = scrape(["[INFO] nothing of the kind here"], probes)
+        self.assertEqual(s["budget_pressure_lines"], [])
+        r = drive_module().budget_pressure_reading(s["budget_pressure_lines"])
+        self.assertEqual(r["state"], "absent")
+        self.assertEqual(r["event_count"], 0)
+        self.assertIn("NOT a measured zero", r["why"])
+        row = _fixture_row()
+        row["budget_pressure"] = r
+        text = _capture(lambda: print_row(row))
+        self.assertIn("memory pressure: ABSENT", text)
+        # The absence must never print as a row of zeroes.
+        self.assertNotIn("0 render entries", text)
+
+    def test_an_older_binary_reads_the_grown_fields_as_unread(self):
+        """A row off a binary older than the tail's last three fields.
+
+        `git log -L 195,215:squallar-app/src/pressure.rs` gives three tail
+        generations; this is the first. The missing fields are NAMED, never
+        filled with the zero the current line prints when a cause is not the
+        page heap's."""
+        probes = compile_probes()
+        OLD = ("[WARN] budget pressure: out of memory -> evicted render cache "
+               "3 entries 48 MiB, extracts 2, ladder rung 1")
+        r = drive_module().budget_pressure_reading(
+            scrape([OLD], probes)["budget_pressure_lines"])
+        self.assertEqual(r["format_generation"], "pre-tile-economy")
+        self.assertIsNone(r["tile_economy_mib"])
+        self.assertIn("tile_economy_mib", r["unread"])
+        row = _fixture_row()
+        row["budget_pressure"] = r
+        text = _capture(lambda: print_row(row))
+        self.assertIn("ROW FORMAT: pre-tile-economy", text)
 
     def test_a_log_without_the_budget_state_line_prints_n_a_not_zero(self):
         row = _fixture_row()

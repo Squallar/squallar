@@ -3792,9 +3792,31 @@ var frame_content_all = [];
 var frame_finish_all = [];
 var frame_worst_all = [];
 var begins = [], loops = [];
+// THE MEMORY-PRESSURE FAMILY, whole lines, classified by NAME in
+// `budget_pressure_reading` below rather than page-side. SIX shapes and THREE
+// tail generations, enumerated over that function.
+//
+// It lives in THIS probe -- the one the frame watcher polls throughout the
+// leg -- and not in the boot-time backend probe or the end-of-leg worker
+// probe. `budget pressure:` is an EVENT, written at most a handful of times
+// per leg by `App::on_pressure`, and `C` is a 1200-entry ring the app's
+// per-frame telemetry turns over in seconds. A family read once at the end
+// sees it only if the event happened to land in the last window; polled and
+// unioned in `FrameLineWatcher`, a line seen at any poll is seen.
+//
+// The literal is `pressure:` and NOT `budget pressure:`, and the shorter one
+// is deliberate. `App::on_pressure` writes a second, differently-headed line
+// -- `pressure: oom during gpu probe, presumption held`
+// (`squallar-app/src/app_render.rs:8653`) -- immediately before the figures
+// line, on the one arm where the ladder rung is deliberately HELD. A harvest
+// keyed on the longer head drops it, and with it the only evidence of why the
+// rung did not move. Anything else landing here is an unclassified line,
+// which is the outcome this family is built around.
+var budget_pressure_lines = [];
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
   var t = C[i].t;
+  if (m.indexOf("pressure:") !== -1) budget_pressure_lines.push(m);
   var x = svc_interact_re.exec(m);
   if (x) {
     interact = { t: t, n: parseInt(x[1], 10), p50: x[2], p90: x[3],
@@ -4198,6 +4220,7 @@ return { interact: interact, idle: idle, segments: segments, prep: prep,
          frame_worst_all: frame_worst_all,
          gesture_begins: begins, gesture_loops: loops,
          marks_total: (MK ? MK.length : -1),
+         budget_pressure_lines: budget_pressure_lines,
          console_total: C.length };
 """
 
@@ -4784,6 +4807,13 @@ class FrameLineWatcher:
         # the time the window ends.
         self.need = {}
         self.loops = {}
+        # Every `pressure:`-headed line seen at any poll, in ring order, kept
+        # as a list rather than a dict: these lines carry no `n` and two
+        # events can be identical in every field, so keying them would lose
+        # the second. The union is by VALUE against what is already held, so
+        # a line re-read across polls is not counted twice while a genuine
+        # repeat within one poll is kept.
+        self.pressure_lines = []
         self.last = {}
 
     def poll(self):
@@ -4821,6 +4851,13 @@ class FrameLineWatcher:
             self.begins[(r.get("t"), r.get("script"))] = r
         for r in sig.get("gesture_loops") or []:
             self.loops[(r.get("t"), r.get("frames"))] = r
+        # The ring evicts and a pressure event is written once, so a line seen
+        # at ANY poll is kept for the whole leg. Appended in the order the
+        # page wrote them, with what this poll already held skipped: the probe
+        # re-reads the whole ring each time.
+        for line in sig.get("budget_pressure_lines") or []:
+            if line not in self.pressure_lines:
+                self.pressure_lines.append(line)
         self.last = sig
         return sig
 
@@ -5738,6 +5775,258 @@ def gpu_probe_summary(reading):
         return ("WALKING to a %s MiB cap and unreported: %s"
                 % (r.get("policy_cap_mib"), r.get("why"))) + tail
     return ("ABSENT: %s" % r.get("why")) + tail
+
+
+# THE MEMORY-PRESSURE FAMILY, all SIX shapes it is written in and all THREE
+# tail generations. UNREAD BY EITHER RIG HALF until 2026-09-11:
+# `grep -c "budget pressure" .github/browser-rig/drive.py` and the same over
+# `native_row.py` both returned 0, so no leg has ever carried a reading of it.
+#
+# ONE crate writes it, one formatter, one emit site: `pressure_line()` at
+# `squallar-app/src/pressure.rs:201`, a single `format!`, logged once per event
+# by `log::warn!` at `squallar-app/src/app_render.rs:8669`. `serve.py:309`
+# hooks `warn` into `window.__rig_console`, so the line reaches the ring.
+#
+#   budget pressure: <cause> -> evicted render cache <n> entries <n> MiB,
+#     extracts <n>, ladder rung <n>, tile economy <n> MiB,
+#     staging released <n> MiB, oversample <n>
+#
+# <cause> is `Pressure::describe()` (`pressure.rs:59`) and has FIVE spellings,
+# three bare and two carrying a pair of figures:
+#
+#   budget pressure: surface lost -> ...
+#   budget pressure: out of memory -> ...
+#   budget pressure: memory warning -> ...
+#   budget pressure: linear memory <used> of <max> MiB -> ...
+#   budget pressure: worker memory <used> of <max> MiB -> ...
+#
+# The SIXTH shape has a DIFFERENT HEAD, and a grep for the family head cannot
+# find it -- it was found by reading the emit site, not by grepping:
+#
+#   pressure: oom during gpu probe, presumption held
+#     (`squallar-app/src/app_render.rs:8653`)
+#
+# It is written immediately BEFORE the figures line on the one arm where the
+# ladder rung is deliberately held, and it is the only evidence of why the
+# rung did not move. `is_beyond_reach()` holds the rung the same way and says
+# nothing, so a held rung with no such line beside it is the worker-heap arm.
+#
+# WHICH CAUSE REACHES WHICH ARM, because a reader that cannot tell an absent
+# arm from a quiet one misreports both. `linear memory` and `worker memory`
+# are raised only where `page_max_bytes` is supplied, which is `squallar-web`
+# alone; `memory warning` is Android's `onLowMemory` and iOS's
+# `didReceiveMemoryWarning`; `surface lost` and `out of memory` are the two
+# GPU causes and the ONLY ones a desktop can raise. So this half can see three
+# of the five and `native_row.py` is the only half that can ever see a desktop
+# event -- which is why both halves grew an arm and neither is a duplicate of
+# the other.
+#
+# THREE TAIL GENERATIONS, and a bundle older than the tree is the case this
+# reader exists to keep honest. `git log -L 195,215:squallar-app/src/pressure.rs`:
+#
+#   ladder rung <n>                                         9069416a5, a366b086b
+#   ladder rung <n>, tile economy <n> MiB, oversample <n>    8526e6590
+#   ... plus `staging released <n> MiB`                      611da6229 (today)
+#
+# A row from before a field landed must reach the reader as an ABSENCE. It is
+# read by NAME, the missing field is named in `unread`, `tile_economy_mib` is
+# None and never 0 -- 0 is what the CURRENT line says when a cause is not the
+# page heap's, and the two are different findings. `format_generation` records
+# which of the three the row was, so a silent fallback cannot hide the
+# producer change the row was designed to survive.
+#
+# BY NAME, NEVER BY POSITION, for `GPU_PROBE_FIGURES`' reason: this line has
+# grown twice already, an inserted field renumbers every group after it, and
+# `native_row.py` `int()`s groups by index. Each field is its own anchored
+# pattern, so a field that MOVES still reads and a field that is GONE is named.
+BUDGET_PRESSURE_FIGURES = (
+    # Anchored on the words either side rather than on an offset: `entries`
+    # and the MiB figure sit in one clause and the second would otherwise read
+    # off whichever number came first on the line.
+    ("render_entries", r"evicted render cache (\d+) entries\b", int),
+    ("render_mib", r"evicted render cache \d+ entries (\d+) MiB", int),
+    ("extracts", r"\bextracts (\d+)", int),
+    ("ladder_rung", r"\bladder rung (\d+)", int),
+)
+
+# The three fields the tail GREW, kept apart from the four above because their
+# absence is a reading about the BUNDLE and not about the event: a row that
+# carries none of them came off a binary older than 8526e6590.
+BUDGET_PRESSURE_TAIL = (
+    ("tile_economy_mib", r"\btile economy (\d+) MiB", int),
+    ("staging_released_mib", r"\bstaging released (\d+) MiB", int),
+    ("oversample_percent", r"\boversample (\d+)", int),
+)
+
+# Which tail generation a row's PRESENT fields spell. Keyed by the tuple of
+# which of the three were found, so an unforeseen combination is `unknown`
+# rather than being rounded to the nearest known one.
+BUDGET_PRESSURE_GENERATIONS = {
+    (True, True, True): "current",
+    (True, False, True): "pre-staging-released",
+    (False, False, False): "pre-tile-economy",
+}
+
+
+def _budget_pressure_cause(line, out, unread):
+    """The cause clause, and the pair of figures the two heap causes carry.
+
+    NON-GREEDY, and that is the whole of it: `(.+)` here would run to the LAST
+    ` -> ` on a line that ever grows one, swallowing the tail into the cause
+    and reporting a wrong value where a miss would at least have been visible.
+    """
+    m = re.search(r"budget pressure: (.+?) -> evicted render cache", line)
+    if m is None:
+        out["cause"] = None
+        out["cause_label"] = None
+        out["used_mib"], out["max_mib"] = None, None
+        unread.append("cause")
+        return
+    out["cause"] = m.group(1)
+    # `linear memory 891 of 1024 MiB` and `worker memory ...` are the only two
+    # that carry figures; the three bare labels are the label itself. The
+    # absence of a pair is the producer saying this cause has none, NOT an
+    # unread field -- which is why neither is appended to `unread` here.
+    f = re.match(r"(.+?) (\d+) of (\d+) MiB$", out["cause"])
+    if f:
+        out["cause_label"] = f.group(1)
+        out["used_mib"], out["max_mib"] = int(f.group(2)), int(f.group(3))
+    else:
+        out["cause_label"] = out["cause"]
+        out["used_mib"], out["max_mib"] = None, None
+
+
+def budget_pressure_reading(lines):
+    """What memory pressure did to this leg, out of `FrameLineWatcher`'s lines.
+
+    ONE family, and the SHAPE that was seen is recorded in `state`, because
+    these are different findings and a rig that cannot tell them apart reads
+    three of them as "no pressure":
+
+    * `acted`      -- an event fired and this is what it gave back. The LAST
+                      one is the reading; `events` carries every one seen and
+                      `event_count` how many, because pressure events are not
+                      running totals and a second is not a bigger first.
+    * `probe_held` -- the `pressure: oom during gpu probe` line reached the
+                      reader and no figures line did. The event FIRED and the
+                      rung was deliberately held; not an absence and not a
+                      zero reclaim.
+    * `unreadable` -- a `budget pressure:` line is here and its head did not
+                      parse. Without this arm that reads as an absence, whose
+                      documented meaning is a session that never came under
+                      pressure -- a broken reader impersonating a healthy leg.
+    * `absent`     -- no line of any shape. Either nothing raised a cause or
+                      the ring evicted it. NOT a measured zero.
+
+    `read_from` names the shape the values came out of, `format_generation`
+    which of the three tails the row was written in, and `unread` every field
+    this parser could not find, so "the line changed" can never be read as
+    "the app reclaimed nothing". A `pressure:` line matching no shape here
+    lands in `unclassified` rather than being dropped.
+    """
+    out = {"state": "absent", "read_from": None, "line": None,
+           "unread": [], "unclassified": [], "events": [], "event_count": 0,
+           "probe_held": False, "format_generation": None,
+           "why": "no `pressure:` line of any shape reached the console ring "
+                  "during the leg: nothing raised a cause, the bundle "
+                  "predates the family, or the ring evicted it. NOT a "
+                  "measured zero and NOT proof the session stayed under its "
+                  "budgets."}
+    events, unclassified, held = [], [], False
+    for line in lines or []:
+        if "budget pressure: " in line:
+            unread = []
+            r = {"state": "acted",
+                 "read_from": "budget pressure: <cause> -> evicted render "
+                              "cache ...",
+                 "line": line}
+            _budget_pressure_cause(line, r, unread)
+            for name, pat, cast in BUDGET_PRESSURE_FIGURES:
+                m = re.search(pat, line)
+                if m is None:
+                    r[name] = None
+                    unread.append(name)
+                else:
+                    r[name] = cast(m.group(1))
+            present = []
+            for name, pat, cast in BUDGET_PRESSURE_TAIL:
+                m = re.search(pat, line)
+                present.append(m is not None)
+                r[name] = cast(m.group(1)) if m else None
+                if m is None:
+                    # NAMED, not defaulted. A zero here is what the current
+                    # line says when the cause is not the page heap's.
+                    unread.append(name)
+            r["format_generation"] = BUDGET_PRESSURE_GENERATIONS.get(
+                tuple(present), "unknown")
+            if r["cause"] is None:
+                # The head did not parse. Every figure may still have read,
+                # and the row is kept, but it is NOT an `acted` reading whose
+                # cause anyone can quote.
+                r["state"] = "unreadable"
+                r["why"] = ("a `budget pressure:` line is present and its "
+                            "cause clause did not parse: the producer "
+                            "reworded the head. The figures below may still "
+                            "be right and the CAUSE is unknown, which is a "
+                            "different finding from an absent line.")
+            r["unread"] = unread
+            events.append(r)
+        elif "pressure: oom during gpu probe" in line:
+            # A real reading about the LADDER: the rung was held on purpose.
+            # It carries no figures of its own, so it never becomes the
+            # reading when a figures line is also here -- it annotates it.
+            held = True
+        else:
+            unclassified.append(line)
+    if events:
+        out = dict(events[-1])
+        out["unread"] = list(events[-1]["unread"])
+    elif held:
+        out = {"state": "probe_held",
+               "read_from": "pressure: oom during gpu probe, presumption held",
+               "line": "pressure: oom during gpu probe, presumption held",
+               "unread": [], "format_generation": None,
+               "why": "an allocation was refused while the WebGPU probe held "
+                      "its doubling textures, so the ladder rung was held on "
+                      "purpose. The event FIRED; its figures line is not in "
+                      "the window. NOT an absence and NOT a zero reclaim."}
+    out["events"] = events
+    out["event_count"] = len(events)
+    out["probe_held"] = held
+    out["unclassified"] = unclassified
+    return out
+
+
+def budget_pressure_summary(reading):
+    """One line for the leg's SUMMARY block, naming the state either way."""
+    r = reading or {}
+    st = r.get("state")
+    tail = ((" [UNREAD FIELDS: %s]" % ", ".join(r["unread"]))
+            if r.get("unread") else "")
+    if r.get("format_generation") not in (None, "current"):
+        tail += (" [ROW FORMAT: %s -- this bundle is older than the tree, "
+                 "the missing fields are UNREAD and not zero]"
+                 % r["format_generation"])
+    tail += ((" [%d line(s) of this family matched no known shape]"
+              % len(r["unclassified"])) if r.get("unclassified") else "")
+    if st == "acted":
+        return ("%d event(s); last: %s -> %s render entries (%s MiB), %s "
+                "extracts, rung %s, tile economy %s MiB, staging released %s "
+                "MiB, oversample %s%%%s"
+                % (r.get("event_count"), r.get("cause"),
+                   r.get("render_entries"), r.get("render_mib"),
+                   r.get("extracts"), r.get("ladder_rung"),
+                   r.get("tile_economy_mib"), r.get("staging_released_mib"),
+                   r.get("oversample_percent"),
+                   ", rung HELD (gpu probe's own oom)"
+                   if r.get("probe_held") else "")) + tail
+    if st == "unreadable":
+        return ("UNREADABLE: %s -- %r" % (r.get("why"),
+                                          str(r.get("line"))[:160])) + tail
+    if st == "probe_held":
+        return ("rung HELD, no figures line: %s" % r.get("why")) + tail
+    return ("ABSENT: %s" % r.get("why")) + tail
+
 
 
 def app_backend_name(app):
@@ -8462,6 +8751,192 @@ def selftest_gpu_probe_reading():
     return failed
 
 
+def selftest_budget_pressure_reading():
+    """Executable pins on `budget_pressure_reading`. Returns the number failed.
+
+    The family had NO reader in either rig half until 2026-09-11, so there is
+    no history of it to trust and every shape is pinned here -- including the
+    three a reader written for the success line alone would have reported as
+    "no pressure": the differently-headed line that says the rung was HELD, a
+    row off a bundle older than the tail's last two fields, and a head this
+    parser could not read.
+
+    The fixtures are the producer's OWN literals, copied from
+    `squallar-app/src/pressure.rs`'s tests rather than composed here, so a
+    fixture that drifts from the format is a fixture that drifts from a Rust
+    assertion someone has to change.
+    """
+    failed = 0
+
+    def pin(name, ok):
+        nonlocal failed
+        print("[self-test] %s %s" % ("ok  " if ok else "FAIL", name))
+        if not ok:
+            failed += 1
+
+    def read(*lines):
+        return budget_pressure_reading(list(lines))
+
+    TAIL = ("evicted render cache 3 entries 48 MiB, extracts 2, ladder rung "
+            "1, tile economy 0 MiB, staging released 0 MiB, oversample 150")
+    BARE = ("evicted render cache 0 entries 0 MiB, extracts 0, ladder rung 0, "
+            "tile economy 0 MiB, staging released 0 MiB, oversample 0")
+    OOM = "budget pressure: out of memory -> " + TAIL
+    SURFACE = "budget pressure: surface lost -> " + BARE
+    WARNING = "budget pressure: memory warning -> " + BARE
+    LINEAR = ("budget pressure: linear memory 891 of 1024 MiB -> evicted "
+              "render cache 0 entries 0 MiB, extracts 0, ladder rung 1, tile "
+              "economy 0 MiB, staging released 0 MiB, oversample 0")
+    WORKER = ("budget pressure: worker memory 891 of 1024 MiB -> evicted "
+              "render cache 0 entries 0 MiB, extracts 0, ladder rung 0, tile "
+              "economy 0 MiB, staging released 0 MiB, oversample 0")
+    HELD = "pressure: oom during gpu probe, presumption held"
+    # The two tails this line was written with before today.
+    GEN1 = ("budget pressure: out of memory -> evicted render cache 3 entries "
+            "48 MiB, extracts 2, ladder rung 1")
+    GEN2 = ("budget pressure: out of memory -> evicted render cache 3 entries "
+            "48 MiB, extracts 2, ladder rung 1, tile economy 7 MiB, "
+            "oversample 150")
+
+    r = read(OOM)
+    pin("the GPU allocation failure yields every field on the line",
+        r["state"] == "acted" and r["cause"] == "out of memory"
+        and r["cause_label"] == "out of memory" and r["used_mib"] is None
+        and r["render_entries"] == 3 and r["render_mib"] == 48
+        and r["extracts"] == 2 and r["ladder_rung"] == 1
+        and r["tile_economy_mib"] == 0 and r["staging_released_mib"] == 0
+        and r["oversample_percent"] == 150
+        and r["format_generation"] == "current" and r["unread"] == []
+        and r["unclassified"] == [])
+
+    pin("the three BARE causes read as themselves and carry no figure pair",
+        all(read(s)["cause_label"] == want and read(s)["used_mib"] is None
+            and read(s)["state"] == "acted"
+            for s, want in ((SURFACE, "surface lost"),
+                            (OOM, "out of memory"),
+                            (WARNING, "memory warning"))))
+
+    r = read(LINEAR)
+    pin("the page heap's cause splits into a LABEL and the pair of figures it "
+        "carries -- the reading a presumption is lowered to",
+        r["cause"] == "linear memory 891 of 1024 MiB"
+        and r["cause_label"] == "linear memory" and r["used_mib"] == 891
+        and r["max_mib"] == 1024 and r["unread"] == [])
+    r = read(WORKER)
+    pin("and so does the worker's, which is a DIFFERENT heap and never added "
+        "to the page's",
+        r["cause_label"] == "worker memory" and r["used_mib"] == 891
+        and r["max_mib"] == 1024)
+
+    r = read(HELD)
+    pin("the differently-headed line that says the rung was HELD is a "
+        "reading, not an absence -- a head-grep for the family cannot find it",
+        r["state"] == "probe_held" and r["probe_held"] is True
+        and "NOT an absence" in r["why"])
+    r = read(HELD, OOM)
+    pin("and beside a figures line it ANNOTATES it rather than replacing it",
+        r["state"] == "acted" and r["probe_held"] is True
+        and r["ladder_rung"] == 1
+        and "rung HELD" in budget_pressure_summary(r))
+
+    r = read(GEN1)
+    pin("a row off a bundle older than the tail's last three fields reads "
+        "them as UNREAD and NEVER as zero",
+        r["state"] == "acted" and r["format_generation"] == "pre-tile-economy"
+        and r["tile_economy_mib"] is None
+        and r["staging_released_mib"] is None
+        and r["oversample_percent"] is None
+        and r["unread"] == ["tile_economy_mib", "staging_released_mib",
+                            "oversample_percent"]
+        and r["ladder_rung"] == 1)
+    r = read(GEN2)
+    pin("and the generation between the two is its own path, not rounded to a "
+        "neighbour",
+        r["format_generation"] == "pre-staging-released"
+        and r["tile_economy_mib"] == 7
+        and r["staging_released_mib"] is None
+        and r["unread"] == ["staging_released_mib"])
+    pin("the row format reaches a reader's EYES, not just the artifact",
+        "ROW FORMAT: pre-tile-economy" in budget_pressure_summary(read(GEN1))
+        and "ROW FORMAT" not in budget_pressure_summary(read(OOM)))
+    pin("a ZERO on a current row is a reading and is NOT the absence above",
+        read(OOM)["tile_economy_mib"] == 0
+        and read(GEN1)["tile_economy_mib"] is None)
+
+    r = read()
+    pin("no line of any shape is ABSENT with a reason, never a zero reclaim",
+        r["state"] == "absent" and r["line"] is None
+        and r["event_count"] == 0 and "NOT a measured zero" in r["why"])
+    r = read("budget pressure: a head nobody has written yet")
+    pin("a `budget pressure:` line whose head will not parse is UNREADABLE, "
+        "not absent -- that is a broken reader impersonating a healthy leg",
+        r["state"] == "unreadable" and "cause" in r["unread"])
+    pin("and the four states are four distinct values, not one falsy reading",
+        len({read(OOM)["state"], read(HELD)["state"], read()["state"],
+             read("budget pressure: nope")["state"]}) == 4)
+
+    # A shape this list has not met is KEPT, not dropped.
+    r = read("pressure: some wording nobody has written yet")
+    pin("a `pressure:` line matching no known shape is carried as "
+        "unclassified rather than vanishing",
+        r["unclassified"] == ["pressure: some wording nobody has written yet"]
+        and "matched no known shape" in budget_pressure_summary(r))
+
+    # Events, not running totals: a second event is not a bigger first.
+    r = read(OOM, OOM.replace("ladder rung 1", "ladder rung 2"))
+    pin("two events are two events -- the LAST is the reading and both are "
+        "kept, because these figures do not accumulate",
+        r["event_count"] == 2 and r["ladder_rung"] == 2
+        and len(r["events"]) == 2 and r["events"][0]["ladder_rung"] == 1)
+
+    # The property that makes "by name" worth the extra patterns, CHECKED
+    # rather than claimed. This line has already grown twice.
+    GROWN = OOM.replace("extracts 2,", "extracts 2, loop scans 9,")
+    r = read(GROWN)
+    pin("a field inserted mid-line moves no other field's reading",
+        r["render_entries"] == 3 and r["render_mib"] == 48
+        and r["extracts"] == 2 and r["ladder_rung"] == 1
+        and r["oversample_percent"] == 150 and r["unread"] == [])
+
+    # And the other half: a field that is GONE is NAMED, never read off a
+    # neighbour. A reader answering 48 for `extracts` here would be the
+    # wrong-value-for-absent-value failure in its purest form.
+    r = read(OOM.replace(" extracts 2,", ""))
+    pin("a field removed from the line reads as UNREAD, never off a neighbour",
+        r["extracts"] is None and "extracts" in r["unread"]
+        and r["render_mib"] == 48 and r["ladder_rung"] == 1)
+
+    # The trailing-group hazard, which is the WRONG-VALUE form and so strictly
+    # worse than a miss: a greedy cause clause runs to the LAST arrow on a
+    # line that ever grows one and swallows the whole tail.
+    TWO_ARROWS = OOM.replace("oversample 150",
+                             "oversample 150 -> evicted render cache 9 "
+                             "entries 9 MiB")
+    r = read(TWO_ARROWS)
+    pin("the cause clause is NON-GREEDY: a second arrow later on the line "
+        "does not swallow the tail into the cause",
+        r["cause"] == "out of memory" and r["render_entries"] == 3)
+
+    # THE WHOLE CHAIN, not the classifier alone: the probe's hand-back key,
+    # the watcher's union across polls, and the reading off the end of it. A
+    # reader that works on a list handed to it directly and is fed by nothing
+    # is the shape this family was already in -- present in the file and
+    # reaching no leg.
+    watcher = FrameLineWatcher(_StubSession({"budget_pressure_lines":
+                                             [HELD, OOM]}))
+    watcher.poll()
+    watcher.poll()
+    pin("the probe's key reaches the watcher, and a second poll over the same "
+        "ring does not double-count a line the first already held",
+        watcher.pressure_lines == [HELD, OOM])
+    r = budget_pressure_reading(watcher.pressure_lines)
+    pin("and the reading off the watcher is the reading off the lines",
+        r["state"] == "acted" and r["probe_held"] is True
+        and r["render_entries"] == 3)
+
+    return failed
+
+
 def selftest():
     failures = []
     if selftest_loop_or_refusal():
@@ -8473,6 +8948,8 @@ def selftest():
         failures.append("page/driver clock guard (see [self-test] lines)")
     if selftest_sample_probe_patterns():
         failures.append("sample-probe patterns (see [self-test] lines)")
+    if selftest_budget_pressure_reading():
+        failures.append("budget-pressure reading (see [self-test] lines)")
     if selftest_gpu_probe_reading():
         failures.append("gpu capacity probe reading "
                         "(see [self-test] lines)")
@@ -9342,6 +9819,14 @@ def run_smoke(args):
             stage("loop-or-refusal", **{k: v for k, v in
                                         result["loop_or_refusal"].items()
                                         if k != "error"})
+        # Memory pressure, from the WATCHER and not from `fl_last`: this
+        # family is an EVENT written a handful of times per leg, so the
+        # end-of-run snapshot's ring has almost certainly evicted it. Read
+        # here so the artifact carries every event the leg saw, with the
+        # state, the row's format generation and any unclassified line beside
+        # it -- an absence is a reported absence and never a zero reclaim.
+        result["budget_pressure"] = budget_pressure_reading(
+            getattr(frames_watch, "pressure_lines", []))
         # From the WATCHER, deduped by tick, and taken HERE rather than at the
         # worker-signal hand-back: that runs before the last polls, so the
         # artifact carried a list five ticks short of what the window was
@@ -9929,6 +10414,12 @@ def run_smoke(args):
             print("[%s] SUMMARY [%s]   %s" % (tag, alabel, app[key]))
     print("[%s] SUMMARY [%s] gpu capacity probe: %s"
           % (tag, alabel, gpu_probe_summary(gpu_probe_reading(app))))
+    # Reported whether or not anything gates on it, and on EVERY leg -- an
+    # absence is a reading here, and a family printed only when it fired
+    # cannot be told apart from a rig that stopped reading it.
+    print("[%s] SUMMARY [%s] memory pressure: %s"
+          % (tag, alabel,
+             budget_pressure_summary(result.get("budget_pressure"))))
     wa = result.get("webgpu_adapter") or classify_webgpu_adapter(wg)
     if v.get("hardware_ok") is False:
         print("[%s] SUMMARY HARDWARE ARM FAILED: WebGL adapter is %s, WebGPU "

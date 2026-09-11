@@ -4428,8 +4428,10 @@ fn every_file_that_writes_a_row_head_is_in_a_gate_scope_or_classified_here() {
         (
             "squallar-app/src/pressure.rs",
             RowOutsideEveryGate(
-                "`budget pressure:` counts evicted entries and MiB and NO rig \
-                 half reads it; `linear memory:` is read by drive.py. Both are \
+                "`budget pressure:` counts evicted entries and MiB, read by \
+                 BOTH rig halves since 2026-09-11 (`budget_pressure_reading`, \
+                 shared: `native_row.py` imports `drive.py`'s) and in no \
+                 gate's scope; `linear memory:` is read by drive.py. Both are \
                  heap instruments outside every denominator",
             ),
         ),
