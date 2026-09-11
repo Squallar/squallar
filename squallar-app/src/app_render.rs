@@ -11771,6 +11771,13 @@ mod raster_telemetry_line_tests;
 #[cfg(test)]
 mod loop_decoded_census_tests;
 
+/// That the residency sweep's publication reaches the decode pump under the
+/// keys the plan is filed at — the one thing no gate in `squallar-radar` can
+/// see, because those gates publish for themselves.
+#[path = "app_render/loop_decode_publication_tests.rs"]
+#[cfg(test)]
+mod loop_decode_publication_tests;
+
 /// The native rig seeds the keys this app reads, into the filenames its store
 /// opens — one scene's path through shell, python and two rust crates.
 #[path = "app_render/native_seed_pin_tests.rs"]
