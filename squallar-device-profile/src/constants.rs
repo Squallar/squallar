@@ -938,13 +938,25 @@ pub const MOBILE_LOOP_DECODED_CEILING_BYTES: usize = 320 * 1024 * 1024;
 /// 25-stamp desktop loop was 1,222 MiB of decoded volumes before this.
 pub const DESKTOP_LOOP_DECODED_CEILING_BYTES: usize = 256 * 1024 * 1024;
 
-/// **How many compressed bytes the loop may hold. Do not lower this to save
-/// memory: it is the one ceiling here where taking bytes can RAISE the
-/// process's resident total.**
+/// **How many compressed bytes the loop may hold ON THE HEAP.**
+///
+/// # **Do not lower this on a target with no archive spill**
+///
+/// On such a target this is still the one ceiling here where taking bytes can
+/// RAISE the process's resident total, for the reason below, and
+/// `WASM_LOOP_ARCHIVE_CEILING_BYTES` and
+/// `MOBILE_LOOP_ARCHIVE_CEILING_BYTES` are exactly those targets —
+/// `App::install_archive_spill` is a no-op on wasm and mobile does not install
+/// one — **so the prohibition binds on both of them unchanged.** The desktop
+/// arm is the only one it has been lifted for, and only because something
+/// specific was built to lift it.
 ///
 /// Stated at the constant rather than in a hand-back because a cut that
 /// backfires gets attempted twice if the reason it backfires is not written
-/// where the next person will hit it.
+/// where the next person will hit it. The warning is therefore **rewritten and
+/// not removed**: it was never a property of this number, it was a consequence
+/// of having nowhere to put a displaced archive, and it stays true wherever
+/// that is still the case.
 ///
 /// An archive is not slack. It is two things at once:
 ///
@@ -969,6 +981,46 @@ pub const DESKTOP_LOOP_DECODED_CEILING_BYTES: usize = 256 * 1024 * 1024;
 /// the process. On a six-site scene this ceiling is already binding, which
 /// means the stranding is not hypothetical.
 ///
+/// # What lifted it on desktop
+///
+/// **A displaced archive is no longer dropped there; it is written off the
+/// heap and stays a way back.** `squallar_radar::archive_spill` holds the
+/// bytes on a medium and keeps the KEY in memory, so both eviction refusals —
+/// which test key presence and never touch bytes — still see a way back and
+/// the decoded volume in front of it stays evictable. Measured: 60 archives
+/// against the old 256 MiB ceiling gave back the same 87,687,975 heap bytes
+/// whether the displaced archives were dropped or spilled, and the ways back
+/// went 45/60 to 60/60 (byte-identical across five draws).
+///
+/// **So on desktop what must not fall is no longer this number but the SUM.**
+/// [`LOOP_ARCHIVE_WAYS_BACK_BYTES`] is that sum and
+/// [`LOOP_ARCHIVE_SPILL_CEILING_BYTES`] is derived from it, so lowering this
+/// arm moves bytes to the medium and **cannot reduce how many ways back exist**
+/// — the property the prohibition was protecting. Lowering it past the sum
+/// would be the same defect at a different layer: the medium would refuse, the
+/// archive would be dropped, and the volume would strand exactly as before.
+/// That is why the two are tied here rather than tuned apart.
+///
+/// # Why 96 MiB on desktop, and what it protects
+///
+/// With a spill, a withdrawal hands the decoder a fresh buffer that is never
+/// re-filed here, so this ceiling no longer has to cover the decode path at
+/// all. What it buys is **avoiding a medium round-trip for the archives most
+/// likely to be asked again**, which are the playhead's and its one lookahead
+/// ([`LOOP_DECODED_LOOKAHEAD_FRAMES`] is `Some(1)` on desktop) at every
+/// looping site. Six sites is twelve archives: 70,150,188 B at the 208-corpus
+/// median of 5,845,849 B, or 66.9 MiB. 96 MiB holds that with room for the
+/// tail, and it holds five archives at the corpus MAXIMUM of 18,831,036 B
+/// (94,155,180 B, 89.8 MiB), so a scene of unusually large volumes keeps its
+/// whole in-flight set resident too.
+///
+/// Below ~67 MiB the sixth site's lookahead would round-trip on every playback
+/// wrap, which is the one case where the restore cost recurs predictably
+/// instead of rarely. That cost is measured and small — a cold read is
+/// 3.0-5.3 % of the bzip2 decode it always precedes (1.02 ms against 19.3 ms
+/// at the corpus minimum, 27.70 ms against 915.8 ms at the maximum) — but it
+/// is a cost, and it is the reason this is 96 MiB and not 0.
+///
 /// The lever for a smaller archive total is the FRAME LIST the archives
 /// follow, not this number. That list is bounded by a count
 /// ([`MAX_LOOP_FRAMES`], 60 on desktop) over a time span
@@ -987,16 +1039,56 @@ pub const LOOP_ARCHIVE_CEILING_BYTES: usize = MOBILE_LOOP_ARCHIVE_CEILING_BYTES;
 #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
 pub const LOOP_ARCHIVE_CEILING_BYTES: usize = DESKTOP_LOOP_ARCHIVE_CEILING_BYTES;
 
+/// **Unchanged, and not to be lowered**: wasm installs no spill, so every
+/// byte taken from this arm is an archive dropped and a volume stranded.
 pub const WASM_LOOP_ARCHIVE_CEILING_BYTES: usize = 128 * 1024 * 1024;
+/// **Unchanged, and not to be lowered**, for `WASM_..`'s reason: mobile
+/// installs no spill either.
 pub const MOBILE_LOOP_ARCHIVE_CEILING_BYTES: usize = 192 * 1024 * 1024;
-pub const DESKTOP_LOOP_ARCHIVE_CEILING_BYTES: usize = 256 * 1024 * 1024;
+/// The heap's share of [`LOOP_ARCHIVE_WAYS_BACK_BYTES`] on the one arm that
+/// has a medium for the rest. Was 256 MiB when the heap was the only place an
+/// archive could be; see the sizing note above for why this figure is 96.
+pub const DESKTOP_LOOP_ARCHIVE_CEILING_BYTES: usize = 96 * 1024 * 1024;
 
-/// **How many bytes the archive spill may hold on its medium.**
+/// **How many ways back the loop may hold at once, heap and medium together.**
 ///
-/// The ceiling above is a HOST-byte bound; this is the bound on where its
-/// overflow goes. A byte ceiling that moves its overflow to a medium which
-/// also runs out is a leak with a longer fuse, so the spill has its own bound
-/// and the overflow of *that* is a plain drop — exactly what a tree with no
+/// The quantity that must not fall, and the one the prohibition on
+/// [`LOOP_ARCHIVE_CEILING_BYTES`] was really protecting: an archive is the only
+/// way back to a released decoded volume, so the number of archives retained
+/// anywhere is what decides whether the decoded ceiling can reclaim or is
+/// stranded. **Where those bytes sit is a placement question; how many there
+/// are is this one.**
+///
+/// 1280 MiB, which is what the heap alone was asked to cover before the medium
+/// existed plus what the medium was first given (256 + 1024), so introducing
+/// the split and then lowering the heap share is **byte-neutral on ways back**
+/// rather than a quiet reduction of them.
+///
+/// It clears the scene it exists for with room to spare: a full desktop loop
+/// over the rig's pinned six-site instant is ~26 volumes per site over the
+/// two-hour span ([`LOOP_SPAN_BUDGET_SECS`]), so 156 archives, and at the
+/// 208-corpus median of 5,845,849 B that is 911,952,444 B — 869.7 MiB against
+/// 1280, leaving 410.3 MiB. At the count cap ([`MAX_LOOP_FRAMES`], 60 a site)
+/// six sites would want 2,104,505,640 B and the medium would refuse; that is
+/// the same degradation a tree with no spill has at 256 MiB, reached much
+/// later, and it is counted rather than silent — see the spill's
+/// `refused-full` figure.
+pub const LOOP_ARCHIVE_WAYS_BACK_BYTES: usize = 1280 * 1024 * 1024;
+
+/// **How many bytes the archive spill may hold on its medium: the rest of
+/// [`LOOP_ARCHIVE_WAYS_BACK_BYTES`] after the heap has taken its share.**
+///
+/// Derived and not tuned, so the two ceilings compose by construction:
+/// lowering the heap arm raises this by the same amount and the number of ways
+/// back is unchanged. A byte ceiling that moved its overflow to a medium which
+/// also runs out would be a leak with a longer fuse; one whose medium shrank
+/// as the heap shrank would be the stranding defect again, one layer down.
+///
+/// Against `DESKTOP_LOOP_ARCHIVE_CEILING_BYTES` and not against the
+/// cfg-selected arm, because the spill exists on desktop alone: wasm and
+/// mobile hold `None` and never read this.
+///
+/// The overflow of *this* bound is a plain drop — exactly what a tree with no
 /// spill does — rather than a second eviction policy to get wrong.
 ///
 /// Sized from the corpus rather than from the disk. The 208-file local
@@ -1017,7 +1109,8 @@ pub const DESKTOP_LOOP_ARCHIVE_CEILING_BYTES: usize = 256 * 1024 * 1024;
 /// before — the same fake cut as mapping the file, which
 /// `squallar_radar::archive_spill` refuses for the same reason. The desktop
 /// shell puts it under the user's cache root for that reason, never `/tmp`.
-pub const LOOP_ARCHIVE_SPILL_CEILING_BYTES: usize = 1024 * 1024 * 1024;
+pub const LOOP_ARCHIVE_SPILL_CEILING_BYTES: usize =
+    LOOP_ARCHIVE_WAYS_BACK_BYTES - DESKTOP_LOOP_ARCHIVE_CEILING_BYTES;
 
 /// **Which frames keep their DECODED volume beyond the ones with no texture
 /// yet**: `None` keeps none — a textured frame's volume goes the moment its

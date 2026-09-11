@@ -2035,3 +2035,157 @@ fn the_widest_canvases_still_afford_two_pictures() {
         );
     }
 }
+
+// ---- the archive ways-back budget: heap share + medium share ------------
+
+/// **The two archive ceilings compose to the ways-back total, exactly.**
+///
+/// The property the prohibition on `LOOP_ARCHIVE_CEILING_BYTES` was protecting
+/// was never that number, it was *how many ways back exist* — an archive is the
+/// only route back to a released decoded volume, and both decoded-eviction
+/// policies refuse a volume without one. Splitting the budget into a heap share
+/// and a medium share is a placement change; if the split ever failed to add
+/// up, lowering the heap arm would quietly reduce ways back and re-strand
+/// volumes one layer down, which is the defect the spill was built to remove.
+///
+/// TAMPER: set `LOOP_ARCHIVE_SPILL_CEILING_BYTES` to a literal and change
+/// `DESKTOP_LOOP_ARCHIVE_CEILING_BYTES`; this goes red, where a tuned pair
+/// would drift silently.
+#[test]
+fn the_two_archive_ceilings_compose_to_the_ways_back_total() {
+    assert_eq!(
+        super::DESKTOP_LOOP_ARCHIVE_CEILING_BYTES + super::LOOP_ARCHIVE_SPILL_CEILING_BYTES,
+        super::LOOP_ARCHIVE_WAYS_BACK_BYTES,
+        "the heap share and the medium share do not add up to the ways-back \
+         total, so lowering the heap arm reduces how many archives can be \
+         retained anywhere and strands the decoded volumes in front of them",
+    );
+    // And the split is a real split, not everything on one side — either
+    // degenerate case would pass the sum above while making one bound useless.
+    // Bound to locals, not asserted on the constants directly: a `const`
+    // condition is a compile-time value and clippy rejects an `assert!` over
+    // one. The message is worth more here than a const-block would be.
+    let heap_share = super::DESKTOP_LOOP_ARCHIVE_CEILING_BYTES;
+    let medium_share = super::LOOP_ARCHIVE_SPILL_CEILING_BYTES;
+    assert!(
+        heap_share > 0 && medium_share > 0,
+        "one side of the ways-back budget is zero: heap {heap_share} B, \
+         medium {medium_share} B — a bound that is zero is not a bound",
+    );
+}
+
+/// **The ways-back total covers a full desktop loop at the corpus median**, so
+/// the common case never re-downloads — the rule
+/// `the_wasm_loop_budgets_clear_the_reproduced_freeze` already holds the wasm
+/// arm to, asked of the SUM here because that is where the bytes may now sit.
+///
+/// The scene is the rig's pinned six-site instant: ~26 volumes a site over the
+/// two-hour span, so 156 archives. The median is the 208-file corpus's
+/// 5,845,849 B, spelled as a literal for the reason the wasm test spells its
+/// own — a corpus figure is evidence and belongs where it can be checked.
+#[test]
+fn the_ways_back_total_covers_a_full_desktop_loop_at_the_corpus_median() {
+    const CORPUS_MEDIAN_ARCHIVE: usize = 5_845_849;
+    const SITES: usize = 6;
+    const VOLUMES_PER_SITE_AT_THE_RIGS_CADENCE: usize = 26;
+    let full_loop = SITES * VOLUMES_PER_SITE_AT_THE_RIGS_CADENCE * CORPUS_MEDIAN_ARCHIVE;
+
+    assert!(
+        super::LOOP_ARCHIVE_WAYS_BACK_BYTES >= full_loop,
+        "the ways-back budget is {} MiB against a full six-site loop's {} MiB, \
+         so the medium would refuse mid-loop, the archive would be dropped and \
+         the volume stranded — the pre-spill defect at a different layer",
+        super::LOOP_ARCHIVE_WAYS_BACK_BYTES >> 20,
+        full_loop >> 20,
+    );
+    // The cadence, not the count cap, is what this is sized against, and the
+    // cap not biting is why: pin that, or the figure above is arbitrary.
+    let cadence = VOLUMES_PER_SITE_AT_THE_RIGS_CADENCE;
+    let cap = super::DESKTOP_MAX_LOOP_FRAMES;
+    assert!(
+        cadence < cap,
+        "the frame-count cap now bites at the measured cadence ({cadence} \
+         volumes a site against a cap of {cap}), so the loop's archive demand \
+         is bounded by the cap and this test is sizing against the wrong term",
+    );
+}
+
+/// **The heap share keeps the archives most likely to be asked again resident**,
+/// which is the only thing it still buys once a displaced archive has somewhere
+/// to go: a withdrawal hands the decoder a fresh buffer that is never re-filed
+/// in the cache, so the ceiling does not have to cover the decode path.
+///
+/// Those archives are the playhead's and its lookahead, at every looping site.
+/// Read from `DESKTOP_LOOP_DECODED_LOOKAHEAD_FRAMES` rather than spelled `2`,
+/// so raising the lookahead cannot silently outgrow the heap share.
+#[test]
+fn the_desktop_heap_share_keeps_every_sites_playhead_and_lookahead_resident() {
+    const CORPUS_MEDIAN_ARCHIVE: usize = 5_845_849;
+    const CORPUS_MAX_ARCHIVE: usize = 18_831_036;
+    const SITES: usize = 6;
+
+    let per_site = 1 + super::DESKTOP_LOOP_DECODED_LOOKAHEAD_FRAMES
+        .expect("the desktop arm states a lookahead");
+    let resident_set = SITES * per_site * CORPUS_MEDIAN_ARCHIVE;
+    assert!(
+        super::DESKTOP_LOOP_ARCHIVE_CEILING_BYTES >= resident_set,
+        "the heap share is {} B against the {} B that six sites' playhead and \
+         lookahead archives occupy at the corpus median, so a site's next frame \
+         round-trips to the medium on every playback wrap",
+        super::DESKTOP_LOOP_ARCHIVE_CEILING_BYTES,
+        resident_set,
+    );
+    // And a scene of unusually large volumes keeps its in-flight set too: the
+    // median is what the ceiling is sized on, the maximum is what it must not
+    // fall apart on.
+    let heap_share = super::DESKTOP_LOOP_ARCHIVE_CEILING_BYTES;
+    let five_at_the_maximum = 5 * CORPUS_MAX_ARCHIVE;
+    assert!(
+        heap_share >= five_at_the_maximum,
+        "the heap share is {heap_share} B and holds fewer than five archives \
+         at the corpus maximum of {CORPUS_MAX_ARCHIVE} B ({five_at_the_maximum} \
+         B), so a scene of unusually large volumes loses its in-flight set to \
+         the medium",
+    );
+}
+
+/// **The arms with no spill keep their archive ceilings**, and this test is the
+/// thing that makes that prohibition enforceable rather than prose.
+///
+/// `App::install_archive_spill` is a no-op on wasm and mobile installs none, so
+/// on both of those a byte taken from the archive ceiling is an archive
+/// DROPPED, and dropping one strands the median 15.5x-larger decoded volume in
+/// front of it as permanently un-evictable. The desktop arm was lowered only
+/// because something was built to catch what it displaces; these were not.
+///
+/// A future lane lowering one of these to save memory is the exact repeat the
+/// note at the constant exists to prevent, and a note is not a gate.
+#[test]
+fn the_arms_with_no_archive_spill_keep_their_ceilings() {
+    assert_eq!(
+        super::WASM_LOOP_ARCHIVE_CEILING_BYTES,
+        128 * 1024 * 1024,
+        "the wasm archive ceiling moved. wasm installs no spill, so a byte \
+         taken from here is an archive dropped and a decoded volume stranded \
+         un-evictable. If a spill has since been built for wasm — IndexedDB, \
+         asynchronous, with its own quota story — then change this test and the \
+         paragraph at `LOOP_ARCHIVE_CEILING_BYTES` together, in that order.",
+    );
+    assert_eq!(
+        super::MOBILE_LOOP_ARCHIVE_CEILING_BYTES,
+        192 * 1024 * 1024,
+        "the mobile archive ceiling moved, and mobile installs no spill \
+         either; see the wasm arm's message.",
+    );
+    // The floor that keeps the two assertions above from being a tautology: the
+    // arm that DOES have a medium is expected to differ from them, and if all
+    // three were equal this suite would be pinning nothing about the spill.
+    let desktop = super::DESKTOP_LOOP_ARCHIVE_CEILING_BYTES;
+    let wasm = super::WASM_LOOP_ARCHIVE_CEILING_BYTES;
+    assert!(
+        desktop < wasm,
+        "the desktop arm ({desktop} B) is no longer the lowered one against \
+         wasm ({wasm} B), so the pins above are not describing the split they \
+         were written for",
+    );
+}
