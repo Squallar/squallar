@@ -3788,6 +3788,17 @@ impl super::App {
             loud,
             &crate::budget_telemetry::base_way_back_line(self.base_way_backs),
         );
+        // **And which way the archive bytes went.** Absent, not zeroed, on a
+        // target with nowhere to put an archive — the row existing at all says
+        // the mechanism is armed, and the counters say whether it fired.
+        if let Some(line) = crate::budget_telemetry::archive_spill_line(
+            self.loop_mgr.has_spill(),
+            self.loop_mgr.spilled_bytes(),
+            self.loop_mgr.spilled_count(),
+            self.loop_mgr.spill_counts(),
+        ) {
+            say_telemetry(loud, &line);
+        }
         // **And what the decoder never built.** A running total and so its own
         // line, beside the two above rather than in the census: the census
         // carries levels and this is bytes that were never allocated in any of

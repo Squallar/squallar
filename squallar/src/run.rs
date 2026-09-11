@@ -53,6 +53,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(crate::platform::create_platform()),
         crate::platform::create_location(),
     );
+    // Somewhere for an archive the byte ceiling would otherwise drop. Taking
+    // an archive strands the decoded volume in front of it — a median 15.5x
+    // larger — as permanently un-evictable, because both decoded-eviction
+    // policies refuse a volume with no way back; spilling keeps the way back
+    // and still gives the heap bytes up.
+    if let Some(root) = crate::platform::DesktopPlatform::default_archive_spill_dir() {
+        app.install_archive_spill(root);
+    }
     event_loop
         .run_app(&mut app)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)

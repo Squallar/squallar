@@ -4211,6 +4211,59 @@ impl App {
     /// Override the archive block cache directory. The Android path: the
     /// platform learns its cache home only after startup, so the install
     /// that desktop and iOS perform inside `App::new` happens here instead.
+    /// **Give the loop somewhere to put an archive the byte ceiling would
+    /// otherwise drop.**
+    ///
+    /// Installed by the shell after construction, the way
+    /// [`Self::set_basemap_cache_dir`] is, rather than through a new
+    /// `Platform` verb: the spill exists on desktop only, and a target that
+    /// never calls this keeps the `None` branch, which is today's behaviour
+    /// exactly.
+    ///
+    /// A directory that cannot be made means no spill, not a broken one: the
+    /// manager then drops archives as it always has.
+    ///
+    /// **Never a `tmpfs` path.** RAM-backed storage puts the bytes in
+    /// `RssShmem` and the process costs the machine what it did before.
+    ///
+    /// **Two whole definitions, cfg-selected, and never a `cfg` inside one
+    /// body.** `squallar::run` is compiled for wasm as well as native, so the
+    /// call site cannot be the thing that varies — that is the shape
+    /// `squallar_alloc::process::resident` uses for the same reason, and
+    /// `--all-targets` on the wasm gate is what catches the alternative.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn install_archive_spill(&mut self, root: std::path::PathBuf) {
+        match squallar_radar::archive_spill::FsArchiveSpill::new(root.clone()) {
+            Some(spill) => {
+                self.loop_mgr.set_spill(
+                    Box::new(spill),
+                    squallar_device_profile::constants::LOOP_ARCHIVE_SPILL_CEILING_BYTES,
+                );
+                // **A distinct prefix from the `archive spill:` telemetry row.**
+                // Two lines sharing one prefix is how a scrape starts matching
+                // the wrong one; this says installation, that says residency.
+                log::info!(
+                    "archive spill installed: ceiling {} B at {}",
+                    squallar_device_profile::constants::LOOP_ARCHIVE_SPILL_CEILING_BYTES,
+                    root.display()
+                );
+            }
+            None => log::warn!(
+                "archive spill unavailable at {}; archives over the byte \
+                 ceiling will be dropped as before",
+                root.display()
+            ),
+        }
+    }
+
+    /// [`Self::install_archive_spill`]'s twin on a target with nowhere to put
+    /// an archive: the loop keeps its `None` and drops archives over the byte
+    /// ceiling exactly as it always has. An origin's `localStorage` is roughly
+    /// 5-10 MB against the 250.8 MiB this exists to move, and IndexedDB is
+    /// asynchronous with its own quota story — a separate piece of work.
+    #[cfg(target_arch = "wasm32")]
+    pub fn install_archive_spill(&mut self, _root: std::path::PathBuf) {}
+
     pub fn set_basemap_cache_dir(&mut self, dir: std::path::PathBuf) {
         squallar_egui::tiles::install_basemap_cache_dir(dir.clone());
         self.platform.set_basemap_cache_dir(dir);

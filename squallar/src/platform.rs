@@ -102,6 +102,30 @@ impl DesktopPlatform {
         )
     }
 
+    /// Where the loop's archive spill lives: a sibling of the other two under
+    /// the one clearable `squallar` cache root.
+    ///
+    /// **The cache root and never `/tmp`.** `/tmp` is a `tmpfs` on this
+    /// workspace's arm — 47 GB of RAM-backed storage — and a spill onto it
+    /// would put the bytes straight back in the process's resident set as
+    /// `RssShmem`, which is the same fake cut as mapping the file.
+    ///
+    /// The directory is purged on construction by `FsArchiveSpill::new`, so
+    /// nothing here persists across runs by design: a spilled file whose
+    /// in-memory key did not survive the process is unreachable and nothing
+    /// else would ever collect it.
+    pub(crate) fn default_archive_spill_dir() -> Option<std::path::PathBuf> {
+        let base = std::env::var("XDG_CACHE_HOME")
+            .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.cache", h)))
+            .or_else(|_| std::env::var("LOCALAPPDATA"))
+            .ok()?;
+        Some(
+            std::path::PathBuf::from(base)
+                .join("squallar")
+                .join("loop-archives"),
+        )
+    }
+
     /// `default_zone_cache_dir`'s twin: the archive block cache, a sibling
     /// directory so both live under one clearable `squallar` cache root.
     fn default_basemap_cache_dir() -> Option<std::path::PathBuf> {

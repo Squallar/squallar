@@ -991,6 +991,34 @@ pub const WASM_LOOP_ARCHIVE_CEILING_BYTES: usize = 128 * 1024 * 1024;
 pub const MOBILE_LOOP_ARCHIVE_CEILING_BYTES: usize = 192 * 1024 * 1024;
 pub const DESKTOP_LOOP_ARCHIVE_CEILING_BYTES: usize = 256 * 1024 * 1024;
 
+/// **How many bytes the archive spill may hold on its medium.**
+///
+/// The ceiling above is a HOST-byte bound; this is the bound on where its
+/// overflow goes. A byte ceiling that moves its overflow to a medium which
+/// also runs out is a leak with a longer fuse, so the spill has its own bound
+/// and the overflow of *that* is a plain drop — exactly what a tree with no
+/// spill does — rather than a second eviction policy to get wrong.
+///
+/// Sized from the corpus rather than from the disk. The 208-file local
+/// Archive II corpus is 1,281.6 MiB compressed at 6.16 MiB mean, and the
+/// scene this has to cover is the two-hour span
+/// ([`LOOP_SPAN_BUDGET_SECS`]) over six sites at the rig's pinned
+/// precipitation cadence — ~26 volumes per site, so ~156 archives, ~961 MiB.
+/// One GiB covers that and stops well short of being a disk policy.
+///
+/// **Not a `cfg` cascade, unlike its host-byte twin**, because the spill
+/// exists on exactly one platform family: there is no implementation on
+/// `wasm32` (an origin's `localStorage` is ~5–10 MB and IndexedDB is a
+/// separate, asynchronous piece of work), and mobile does not install one.
+/// Those targets hold `None` and never read this.
+///
+/// **The medium must not be a `tmpfs`.** A spill onto RAM-backed storage
+/// lands in `RssShmem` and the process costs the machine exactly what it did
+/// before — the same fake cut as mapping the file, which
+/// `squallar_radar::archive_spill` refuses for the same reason. The desktop
+/// shell puts it under the user's cache root for that reason, never `/tmp`.
+pub const LOOP_ARCHIVE_SPILL_CEILING_BYTES: usize = 1024 * 1024 * 1024;
+
 /// **Which frames keep their DECODED volume beyond the ones with no texture
 /// yet**: `None` keeps none — a textured frame's volume goes the moment its
 /// texture lands — and `Some(n)` keeps the playhead's and the `n` ahead of it

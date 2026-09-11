@@ -1223,6 +1223,35 @@ impl BaseWayBackCounts {
     }
 }
 
+/// **Whether the archive spill fired, and whether anything came back.**
+///
+/// `None` when this target has nowhere to put an archive, so the row is absent
+/// rather than a line of zeros: a reader must be able to tell "armed and did
+/// not fire" from "there is no spill here", and a tree without the spill at all
+/// prints no such row. A ~94 MiB cut on this campaign delivered exactly zero
+/// because its precondition never held on the arm it ran on and nothing
+/// noticed for a day.
+///
+/// `on-disk` is bytes on the MEDIUM, not host bytes, and is never added to a
+/// census level — they are the bytes that left the heap. The rest are running
+/// totals, so a line of their own.
+pub(crate) fn archive_spill_line(
+    installed: bool,
+    on_disk: usize,
+    resident_keys: usize,
+    counts: (u64, u64, u64, u64, u64),
+) -> Option<String> {
+    if !installed {
+        return None;
+    }
+    let (spilled, refused_full, store_failed, restored, restore_misses) = counts;
+    Some(format!(
+        "archive spill: on-disk {on_disk} B in {resident_keys}, spilled {spilled}, \
+         refused-full {refused_full}, store-failed {store_failed}, restored {restored}, \
+         restore-misses {restore_misses}"
+    ))
+}
+
 /// Its own line, and never appended to `budget state:`, which is scraped by a
 /// positional regex.
 pub(crate) fn base_way_back_line(counts: BaseWayBackCounts) -> String {

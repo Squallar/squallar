@@ -174,6 +174,61 @@ pub struct LoopDownloadManager {
     /// the drain's under the address the arrival carried — so the two halves
     /// of a frame cannot end up under two addresses.
     archive_cache: HashMap<String, HashMap<chrono::NaiveDateTime, Arc<Vec<u8>>>>,
+    /// **Where an archive goes instead of being dropped**, or `None` for a
+    /// target that has nowhere to put one.
+    ///
+    /// `None` is the whole of the web target's behaviour here: a `cfg`
+    /// selecting a value, never a fork inside a function body. Every path
+    /// below is written once and reads `None` as "there is no off-heap", which
+    /// is exactly today's behaviour.
+    spill: Option<Box<dyn crate::archive_spill::ArchiveSpill>>,
+    /// What [`spilled`](Self::spilled) may hold, in bytes on the medium.
+    ///
+    /// A byte ceiling that moves its overflow somewhere that also runs out is
+    /// a leak with a longer fuse, so the spill has its own bound and the
+    /// overflow of THAT is a plain drop — today's behaviour — rather than a
+    /// second eviction policy to get wrong.
+    spill_ceiling: usize,
+    /// **The keys of every archive whose bytes are off the heap, with the
+    /// length each was written at.**
+    ///
+    /// This map is the reason the change is small. Every question this type is
+    /// asked about an archive is a **key-presence** question — the two decoded
+    /// eviction policies both refuse a volume with nothing behind it by
+    /// testing `contains_key`, never by touching bytes — so the keys stay
+    /// here, in memory, and only a withdrawal of the bytes pays for I/O.
+    /// Nothing on a frame path reads a disk.
+    spilled: HashMap<String, HashMap<chrono::NaiveDateTime, usize>>,
+    /// What [`spilled`](Self::spilled) is holding on the medium, in bytes.
+    /// **Not host bytes** and never added to a census level: these are the
+    /// bytes that left the heap.
+    spill_bytes: usize,
+    /// Archives written off-heap instead of dropped. A running total.
+    ///
+    /// **A cut needs a counter that says it fired.** A ~94 MiB cut on this
+    /// campaign delivered exactly zero because its precondition never held on
+    /// the arm it ran on, and nothing noticed for a day. This row does not
+    /// exist in a tree without the spill, so a base binary prints no such row
+    /// rather than a zero that reads like a measurement.
+    archives_spilled: u64,
+    /// Times the spill was at its ceiling and the archive was dropped instead
+    /// — the disk bound biting, and the one state in which this behaves
+    /// exactly as a tree with no spill.
+    spill_refused_full: u64,
+    /// Times the store itself failed: no room, no permission, a site string
+    /// that will not go in a path. Distinct from a refusal, which is policy.
+    spill_store_failed: u64,
+    /// Bytes handed back off the medium, and the withdrawals that made them.
+    ///
+    /// `AtomicU64` because the two withdrawal paths ([`Self::archive_for`] and
+    /// [`Self::archive_for_identity`]) are `&self` — they are asked by the
+    /// pump while other fields are borrowed — and a counter is not worth
+    /// making them `&mut`.
+    spill_restores: std::sync::atomic::AtomicU64,
+    /// Withdrawals that found the key here and nothing on the medium. **Zero
+    /// on a sound tree**: the key and the file are written and removed
+    /// together, so a miss is this type disagreeing with the disk.
+    spill_restore_misses: std::sync::atomic::AtomicU64,
     /// Scans currently being downloaded, keyed by site then timestamp (to avoid
     /// duplicate downloads across panes looping the same site).
     in_flight_set: HashMap<String, HashSet<chrono::NaiveDateTime>>,
@@ -493,6 +548,15 @@ impl LoopDownloadManager {
         Self {
             scan_cache: HashMap::new(),
             archive_cache: HashMap::new(),
+            spill: None,
+            spill_ceiling: 0,
+            spilled: HashMap::new(),
+            spill_bytes: 0,
+            archives_spilled: 0,
+            spill_refused_full: 0,
+            spill_store_failed: 0,
+            spill_restores: std::sync::atomic::AtomicU64::new(0),
+            spill_restore_misses: std::sync::atomic::AtomicU64::new(0),
             archive_bytes_cached: 0,
             archives_pinned_to_ceiling: 0,
             decodes_in_flight: HashMap::new(),
@@ -708,19 +772,138 @@ impl LoopDownloadManager {
         }
         self.archive_bytes_cached = self.archive_bytes_cached.saturating_add(price);
         self.archives_ever.insert((site.to_string(), ts));
+        // A heap copy supersedes an off-heap one, or the two would both be
+        // counted and the medium would keep bytes nothing will ever read.
+        self.drop_spilled(site, &ts);
+    }
+
+    /// **Give this manager somewhere to put an archive instead of dropping
+    /// it**, bounded by `ceiling` bytes on the medium.
+    ///
+    /// Not a constructor argument: every existing caller and every existing
+    /// test builds a manager with no spill and keeps today's behaviour, so the
+    /// off-heap path is opt-in at the one place that owns a directory.
+    pub fn set_spill(
+        &mut self,
+        spill: Box<dyn crate::archive_spill::ArchiveSpill>,
+        ceiling: usize,
+    ) {
+        self.spill = Some(spill);
+        self.spill_ceiling = ceiling;
     }
 
     /// Whether the compressed archive for this frame is held, whatever the
     /// decoded half is doing.
+    ///
+    /// **On the heap or off it.** This is the one predicate every way-back
+    /// question in this type goes through — both decoded-eviction refusals,
+    /// the decode pump, the twin diagnostics — precisely so that moving bytes
+    /// off the heap cannot make one of them disagree with another about
+    /// whether a volume can still be rebuilt. It is two `HashMap` lookups and
+    /// touches no medium.
     pub fn has_archive(&self, site: &str, ts: &chrono::NaiveDateTime) -> bool {
         self.archive_cache
             .get(site)
             .is_some_and(|archives| archives.contains_key(ts))
+            || self.is_spilled(site, ts)
+    }
+
+    /// Whether this manager has anywhere to put an archive at all.
+    ///
+    /// Read by the telemetry row, which must be able to tell "armed and did
+    /// not fire" from "no spill on this target" — a counter that cannot
+    /// distinguish those is how a cut reads as delivered when its precondition
+    /// never held.
+    pub fn has_spill(&self) -> bool {
+        self.spill.is_some()
+    }
+
+    /// Whether this frame's archive is the off-heap one. A key lookup.
+    pub fn is_spilled(&self, site: &str, ts: &chrono::NaiveDateTime) -> bool {
+        self.spilled
+            .get(site)
+            .is_some_and(|keys| keys.contains_key(ts))
+    }
+
+    /// Bytes the spill is holding on its medium. **Not host bytes**, and never
+    /// added to a census level — these are the bytes that left the heap.
+    pub fn spilled_bytes(&self) -> usize {
+        self.spill_bytes
+    }
+
+    /// How many archives are off-heap right now.
+    pub fn spilled_count(&self) -> usize {
+        self.spilled.values().map(HashMap::len).sum()
+    }
+
+    /// **Did the spill fire, and did anything come back out of it**:
+    /// `(spilled, refused_full, store_failed, restored, restore_misses)`.
+    /// Running totals; a line of their own and never a census level.
+    pub fn spill_counts(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.archives_spilled,
+            self.spill_refused_full,
+            self.spill_store_failed,
+            self.spill_restores
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.spill_restore_misses
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// The bytes back off the medium, as a fresh allocation for the decode job.
+    ///
+    /// **Not re-inserted into [`archive_cache`](Self::archive_cache)**: the
+    /// point of the spill is that these bytes are not on the heap, and the job
+    /// funnel moves the `Arc` by pointer and drops it when the decode lands.
+    /// Re-filing it here would undo the cut on the next pass.
+    fn withdraw_spilled(&self, site: &str, ts: &chrono::NaiveDateTime) -> Option<Arc<Vec<u8>>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.is_spilled(site, ts) {
+            return None;
+        }
+        match self.spill.as_ref()?.load(site, *ts) {
+            Some(bytes) => {
+                self.spill_restores.fetch_add(1, Relaxed);
+                Some(Arc::new(bytes))
+            }
+            None => {
+                // The key is here and the medium is not. Counted rather than
+                // silently degraded: it means this type and the disk disagree.
+                self.spill_restore_misses.fetch_add(1, Relaxed);
+                None
+            }
+        }
+    }
+
+    /// Forget one spilled archive, on the medium and in the index together.
+    fn drop_spilled(&mut self, site: &str, ts: &chrono::NaiveDateTime) {
+        let Some(keys) = self.spilled.get_mut(site) else {
+            return;
+        };
+        if let Some(len) = keys.remove(ts) {
+            self.spill_bytes = self.spill_bytes.saturating_sub(len);
+            if let Some(spill) = self.spill.as_ref() {
+                spill.delete(site, *ts);
+            }
+        }
+        if keys.is_empty() {
+            self.spilled.remove(site);
+        }
     }
 
     /// The archive for this frame, as a pointer to hand the decode job.
+    ///
+    /// The heap first, then the medium. **This is one of the two places that
+    /// pays for the spill** — and it is a path that already precedes a bzip2
+    /// decode measured at 19.3 ms (4 chunks) to 915.8 ms (94 chunks)
+    /// single-threaded, against a cold read of 1.02 ms to 27.70 ms over the
+    /// same corpus: 3.0-5.3 % on top of a cost this call has always paid.
     pub fn archive_for(&self, site: &str, ts: &chrono::NaiveDateTime) -> Option<Arc<Vec<u8>>> {
-        self.archive_cache.get(site)?.get(ts).map(Arc::clone)
+        if let Some(held) = self.archive_cache.get(site).and_then(|a| a.get(ts)) {
+            return Some(Arc::clone(held));
+        }
+        self.withdraw_spilled(site, ts)
     }
 
     /// **Host bytes the compressed archives are holding.** O(1).
@@ -790,6 +973,7 @@ impl LoopDownloadManager {
         let Self {
             scan_cache,
             archive_cache,
+            spilled,
             scan_prices,
             scan_bytes_cached,
             archives_ever,
@@ -801,9 +985,17 @@ impl LoopDownloadManager {
             removed.extend(
                 scans
                     .extract_if(|ts, (scan, _)| {
+                        // On the heap or off it: a spilled archive is a way
+                        // back, so the volume in front of it stays evictable.
+                        // Spelled out rather than through `has_archive`
+                        // because `self` is destructured here for the disjoint
+                        // borrow the closure needs.
                         let rebuildable = archive_cache
                             .get(site.as_str())
-                            .is_some_and(|archives| archives.contains_key(ts));
+                            .is_some_and(|archives| archives.contains_key(ts))
+                            || spilled
+                                .get(site.as_str())
+                                .is_some_and(|keys| keys.contains_key(ts));
                         rebuildable && !keep(site.as_str(), ts, scan)
                     })
                     .map(|(ts, volume)| {
@@ -884,9 +1076,10 @@ impl LoopDownloadManager {
         // this cache is.
         let mut held: Vec<(u64, String, chrono::NaiveDateTime, usize)> = Vec::new();
         for (site, scans) in &self.scan_cache {
-            let archived = self.archive_cache.get(site.as_str());
             for (ts, (scan, _)) in scans {
-                if !archived.is_some_and(|archives| archives.contains_key(ts)) {
+                // The way-back predicate, on the heap or off it: this is the
+                // second policy that refuses a volume with nothing behind it.
+                if !self.has_archive(site.as_str(), ts) {
                     continue;
                 }
                 if pinned(site.as_str(), ts, scan) {
@@ -952,10 +1145,7 @@ impl LoopDownloadManager {
                     .get(&(site.clone(), *ts))
                     .copied()
                     .unwrap_or(0),
-                has_archive: self
-                    .archive_cache
-                    .get(site.as_str())
-                    .is_some_and(|archives| archives.contains_key(ts)),
+                has_archive: self.has_archive(site.as_str(), ts),
                 ever_had_archive: self.archives_ever.contains(&(site.clone(), *ts)),
             })
         })
@@ -1015,16 +1205,14 @@ impl LoopDownloadManager {
         // then asked the archive map answered `None` for a volume this cache
         // was holding the bytes of, with which of the two came out of the map
         // first deciding it.
-        let archives = self.archive_cache.get(site);
+        // Through `archive_for`, so an address whose bytes are off the heap
+        // is a way back exactly as a heap-held one is.
         self.archive_identity
             .iter()
             .filter(|((held_site, _), identity)| {
                 held_site.as_str() == site && **identity == collected
             })
-            .find_map(|((_, at), _)| {
-                let archive = archives?.get(at).map(Arc::clone)?;
-                Some((*at, archive))
-            })
+            .find_map(|((_, at), _)| self.archive_for(site, at).map(|archive| (*at, archive)))
     }
 
     /// **Every address this cache has learned decodes to `collected`, split
@@ -1054,11 +1242,7 @@ impl LoopDownloadManager {
                 continue;
             }
             learned = learned.saturating_add(1);
-            if self
-                .archive_cache
-                .get(site)
-                .is_some_and(|archives| archives.contains_key(held_ts))
-            {
+            if self.has_archive(site, held_ts) {
                 with_archive = with_archive.saturating_add(1);
                 if self
                     .scan_cache
@@ -1088,6 +1272,32 @@ impl LoopDownloadManager {
         &mut self,
         keep: impl Fn(&str, &chrono::NaiveDateTime, Option<chrono::NaiveDateTime>) -> bool,
     ) {
+        // **The spill follows the frame list down as well as up.** An archive
+        // the loop has stopped naming leaves the medium on the same pass and
+        // by the same predicate that drops the heap-held ones — this, and the
+        // refusal to spill past the spill's own ceiling, are what bound the
+        // disk over a long session without a second eviction policy.
+        let unwanted: Vec<(String, chrono::NaiveDateTime)> = self
+            .spilled
+            .iter()
+            .flat_map(|(site, keys)| keys.keys().map(|ts| (site.clone(), *ts)))
+            .filter(|(site, ts)| {
+                let collected = self.archive_identity.get(&(site.clone(), *ts)).copied();
+                !keep(site.as_str(), ts, collected)
+            })
+            .collect();
+        for (site, ts) in unwanted {
+            self.drop_spilled(&site, &ts);
+            self.archive_identity.remove(&(site.clone(), ts));
+            if !self
+                .scan_cache
+                .get(site.as_str())
+                .is_some_and(|scans| scans.contains_key(&ts))
+            {
+                self.archives_ever.remove(&(site, ts));
+            }
+        }
+
         let Self {
             archive_cache,
             archive_identity,
@@ -1184,6 +1394,48 @@ impl LoopDownloadManager {
     /// direction — the alternative is a stranded volume.
     ///
     /// O(held) and only when over the ceiling; held is a few dozen.
+    /// **Write one archive to the medium and file its key**, or say it did not
+    /// happen.
+    ///
+    /// `false` for three distinct reasons, counted apart because they are not
+    /// the same fact: there is no spill on this target, the spill is at its
+    /// ceiling (policy — the disk bound biting), or the store itself failed
+    /// (no room, no permission, a site string that will not go in a path). The
+    /// caller drops the archive on any of them, which is what a tree with no
+    /// spill does on every one.
+    fn spill_archive(
+        &mut self,
+        site: &str,
+        ts: chrono::NaiveDateTime,
+        archive: &Arc<Vec<u8>>,
+    ) -> bool {
+        if self.spill.is_none() {
+            return false;
+        }
+        let len = archive.len();
+        // The bound is checked before the write, so the medium never exceeds
+        // the ceiling even briefly.
+        if self.spill_bytes.saturating_add(len) > self.spill_ceiling {
+            self.spill_refused_full = self.spill_refused_full.saturating_add(1);
+            return false;
+        }
+        let stored = self
+            .spill
+            .as_ref()
+            .is_some_and(|spill| spill.store(site, ts, archive.as_slice()));
+        if !stored {
+            self.spill_store_failed = self.spill_store_failed.saturating_add(1);
+            return false;
+        }
+        self.spilled
+            .entry(site.to_string())
+            .or_default()
+            .insert(ts, len);
+        self.spill_bytes = self.spill_bytes.saturating_add(len);
+        self.archives_spilled = self.archives_spilled.saturating_add(1);
+        true
+    }
+
     pub fn evict_archives_to_ceiling(
         &mut self,
         ceiling: usize,
@@ -1227,24 +1479,44 @@ impl LoopDownloadManager {
             if self.archive_bytes_cached <= ceiling {
                 break;
             }
-            if let Some(archives) = self.archive_cache.get_mut(&site)
-                && archives.remove(&ts).is_some()
+            let mut now_empty = false;
+            let removed = match self.archive_cache.get_mut(&site) {
+                Some(archives) => {
+                    let taken = archives.remove(&ts);
+                    now_empty = archives.is_empty();
+                    taken
+                }
+                None => None,
+            };
+            let Some(archive) = removed else {
+                continue;
+            };
+            // The heap bytes are gone either way — that is the cut, and it is
+            // the figure `squallar_alloc::live_bytes` moves on.
+            self.archive_bytes_cached = self.archive_bytes_cached.saturating_sub(price);
+            freed = freed.saturating_add(price);
+            if now_empty {
+                self.archive_cache.remove(&site);
+            }
+            // **Off the heap rather than gone.** A spilled archive is still a
+            // way back, so the decoded volume it stands behind — a median
+            // 15.5x larger — stays evictable instead of being stranded
+            // un-evictable, which is what dropping it does. The archive
+            // identity therefore STAYS: it is the index the way back is found
+            // through, and only a real drop may take it.
+            if self.spill_archive(&site, ts, &archive) {
+                continue;
+            }
+            // Nowhere to put it, or no room there: today's behaviour exactly.
+            // The index is the archive's, not the volume's, so it leaves
+            // with the archive and never with the moments.
+            self.archive_identity.remove(&(site.clone(), ts));
+            if !self
+                .scan_cache
+                .get(site.as_str())
+                .is_some_and(|scans| scans.contains_key(&ts))
             {
-                self.archive_bytes_cached = self.archive_bytes_cached.saturating_sub(price);
-                freed = freed.saturating_add(price);
-                // The index is the archive's, not the volume's, so it leaves
-                // with the archive and never with the moments.
-                self.archive_identity.remove(&(site.clone(), ts));
-                if !self
-                    .scan_cache
-                    .get(site.as_str())
-                    .is_some_and(|scans| scans.contains_key(&ts))
-                {
-                    self.archives_ever.remove(&(site.clone(), ts));
-                }
-                if archives.is_empty() {
-                    self.archive_cache.remove(&site);
-                }
+                self.archives_ever.remove(&(site.clone(), ts));
             }
         }
         freed
@@ -1340,6 +1612,10 @@ impl LoopDownloadManager {
             .copied()
             .unwrap_or(0);
         let arrival_holders = Arc::strong_count(arriving);
+        // Read before the counters are borrowed mutably, and once for both
+        // readers below: one evaluation of the way-back predicate, one
+        // spelling of it.
+        let twin_has_archive = self.has_archive(site, &twin_ts);
         let dup = &mut self.identity_dup;
         dup.duplicates = dup.duplicates.saturating_add(1);
         dup.arrival_bytes = dup.arrival_bytes.saturating_add(price as u64);
@@ -1358,11 +1634,7 @@ impl LoopDownloadManager {
                 dup.twin_sole_bytes = dup.twin_sole_bytes.saturating_add(twin_price as u64);
             }
         }
-        if !self
-            .archive_cache
-            .get(site)
-            .is_some_and(|archives| archives.contains_key(&twin_ts))
-        {
+        if !twin_has_archive {
             dup.twin_archiveless = dup.twin_archiveless.saturating_add(1);
         }
         log::debug!(
@@ -1373,15 +1645,7 @@ impl LoopDownloadManager {
             arrival_holders,
             twin_price,
             twin_holders,
-            if self
-                .archive_cache
-                .get(site)
-                .is_some_and(|archives| archives.contains_key(&twin_ts))
-            {
-                "held"
-            } else {
-                "absent"
-            },
+            if twin_has_archive { "held" } else { "absent" },
         );
     }
 
@@ -1444,10 +1708,7 @@ impl LoopDownloadManager {
                         .scan_cache
                         .get(site)
                         .is_some_and(|scans| scans.contains_key(held_ts))
-                    && !self
-                        .archive_cache
-                        .get(site)
-                        .is_some_and(|archives| archives.contains_key(held_ts))
+                    && !self.has_archive(site, held_ts)
             })
             .map(|((_, held_ts), _)| *held_ts);
         let Some(twin_ts) = twin else {
@@ -1669,15 +1930,26 @@ impl LoopDownloadManager {
             .copied()
             .filter(|ts| self.needs_decode(&plan.site, ts))
             .collect();
-        if let Some(archives) = self.archive_cache.get(plan.site.as_str()) {
-            let mut unlisted: Vec<chrono::NaiveDateTime> = archives
-                .keys()
-                .copied()
-                .filter(|ts| !plan.frames.contains(ts) && self.needs_decode(&plan.site, ts))
-                .collect();
-            unlisted.sort_unstable();
-            wanted.extend(unlisted);
-        }
+        // Both halves of the held set: an archive off the heap is decodable
+        // exactly as a heap-held one is, and `needs_decode` already says so.
+        let mut unlisted: Vec<chrono::NaiveDateTime> = self
+            .archive_cache
+            .get(plan.site.as_str())
+            .into_iter()
+            .flat_map(|archives| archives.keys().copied())
+            .chain(
+                self.spilled
+                    .get(plan.site.as_str())
+                    .into_iter()
+                    .flat_map(|keys| keys.keys().copied()),
+            )
+            .filter(|ts| !plan.frames.contains(ts) && self.needs_decode(&plan.site, ts))
+            .collect();
+        unlisted.sort_unstable();
+        // The two maps are disjoint by construction (`cache_archive` drops the
+        // spilled copy), so this is insurance and not a policy.
+        unlisted.dedup();
+        wanted.extend(unlisted);
         wanted
             .into_iter()
             .map(|ts| (plan.site.clone(), ts))
@@ -4449,5 +4721,370 @@ mod archive_tests {
         );
         // And the archive is still there for the pump to rebuild from.
         assert!(mgr.needs_decode("KTLX", &ts(0)));
+    }
+
+    // ---- the off-heap spill ----------------------------------------------
+
+    /// An [`ArchiveSpill`](crate::archive_spill::ArchiveSpill) in memory, so a
+    /// manager test never touches a disk. The `FsArchiveSpill` has its own
+    /// suite; what these tests are about is the manager's bookkeeping.
+    /// The blobs a [`SpillDouble`] is holding, keyed as the caches key them.
+    type SpilledBlobs = HashMap<(String, chrono::NaiveDateTime), Vec<u8>>;
+
+    #[derive(Clone, Default)]
+    struct SpillProbe(Arc<std::sync::Mutex<SpilledBlobs>>);
+
+    impl SpillProbe {
+        fn len(&self) -> usize {
+            self.0.lock().expect("the probe is not poisoned").len()
+        }
+    }
+
+    struct SpillDouble {
+        probe: SpillProbe,
+        refuse: bool,
+    }
+
+    impl crate::archive_spill::ArchiveSpill for SpillDouble {
+        fn store(&self, site: &str, ts: chrono::NaiveDateTime, bytes: &[u8]) -> bool {
+            if self.refuse {
+                return false;
+            }
+            self.probe
+                .0
+                .lock()
+                .expect("the probe is not poisoned")
+                .insert((site.to_string(), ts), bytes.to_vec());
+            true
+        }
+
+        fn load(&self, site: &str, ts: chrono::NaiveDateTime) -> Option<Vec<u8>> {
+            self.probe
+                .0
+                .lock()
+                .expect("the probe is not poisoned")
+                .get(&(site.to_string(), ts))
+                .cloned()
+        }
+
+        fn delete(&self, site: &str, ts: chrono::NaiveDateTime) {
+            self.probe
+                .0
+                .lock()
+                .expect("the probe is not poisoned")
+                .remove(&(site.to_string(), ts));
+        }
+    }
+
+    /// A manager holding three minimum-corpus archives for one site, the
+    /// oldest of which also has its decoded half, and an archive ceiling one
+    /// byte under what it is holding so exactly the ranked-first archive must
+    /// go. `spill` gives it somewhere to put it.
+    fn over_ceiling(spill: Option<SpillProbe>, refuse: bool) -> (LoopDownloadManager, usize) {
+        let mut mgr = LoopDownloadManager::new();
+        if let Some(probe) = spill {
+            mgr.set_spill(Box::new(SpillDouble { probe, refuse }), 64 * 1024 * 1024);
+        }
+        // The decoded half of the frame whose archive is about to leave: it is
+        // the 15.5x-larger half, and whether it stays evictable is the point.
+        mgr.cache_scan("KTLX", ts(0), priced_volume());
+        for minute in 0..3u32 {
+            mgr.cache_archive("KTLX", ts(minute), archive(CORPUS_MIN_ARCHIVE));
+        }
+        let held = mgr.cached_archive_bytes();
+        (mgr, held)
+    }
+
+    /// Rank `ts(0)` furthest from the playhead, so it is the one the ceiling
+    /// reaches first.
+    fn oldest_first(_: &str, at: &chrono::NaiveDateTime) -> u64 {
+        if *at == ts(0) { u64::MAX } else { 0 }
+    }
+
+    /// **The whole cut, and the reason it is not simply a smaller ceiling: the
+    /// heap bytes leave AND the way back survives, so the decoded volume in
+    /// front of the archive stays evictable instead of being stranded.**
+    ///
+    /// Both arms in one test because the contrast is the claim. With nowhere to
+    /// put the archive — today's tree — the ceiling drops it and
+    /// `evict_decoded_except` then refuses the volume for ever: the archive was
+    /// a median 6.45 % of it, so 1 part is reclaimed and 15.5 parts are
+    /// stranded un-evictable. With a spill, the same pass frees the same heap
+    /// bytes and the volume is still reclaimable.
+    ///
+    /// TAMPER: make `spill_archive` return `false` unconditionally and the
+    /// spill arm becomes the control arm — `has_archive` goes false and the
+    /// decoded volume is refused.
+    #[test]
+    fn an_archive_the_ceiling_takes_goes_off_heap_and_is_still_a_way_back() {
+        // --- the control: no spill, which is this tree before the change ---
+        let (mut bare, held) = over_ceiling(None, false);
+        let freed = bare.evict_archives_to_ceiling(held - 1, oldest_first, |_, _, _| false);
+        assert!(freed > 0, "the fixture did not go over the ceiling");
+        assert!(
+            !bare.has_archive("KTLX", &ts(0)),
+            "the control arm kept the archive, so it is not the control",
+        );
+        assert_eq!(
+            bare.evict_decoded_except(|_, _, _| false).len(),
+            0,
+            "the decoded volume was evicted with no archive behind it, which \
+             would make the residency policy a re-download policy",
+        );
+        assert_eq!(bare.spill_counts().0, 0, "a manager with no spill spilled");
+
+        // --- the change: somewhere to put it ---
+        let probe = SpillProbe::default();
+        let (mut mgr, held) = over_ceiling(Some(probe.clone()), false);
+        let freed = mgr.evict_archives_to_ceiling(held - 1, oldest_first, |_, _, _| false);
+
+        assert_eq!(
+            freed,
+            CORPUS_MIN_ARCHIVE + crate::scan_size::ALLOCATOR_BLOCK_OVERHEAD,
+            "the heap did not give back the archive's bytes, which is the cut",
+        );
+        assert_eq!(
+            mgr.cached_archive_bytes(),
+            held - freed,
+            "the host-byte ledger disagrees with what it says it freed",
+        );
+        assert_eq!(
+            mgr.cached_archive_count("KTLX"),
+            2,
+            "the archive is still on the heap",
+        );
+
+        // The way back survived.
+        assert!(
+            mgr.has_archive("KTLX", &ts(0)),
+            "the way back went with the heap bytes, so the volume in front of \
+             it is now stranded un-evictable — the one outcome this change \
+             exists to avoid",
+        );
+        assert!(mgr.is_spilled("KTLX", &ts(0)));
+        assert_eq!(probe.len(), 1, "the bytes never reached the medium");
+        assert_eq!(
+            mgr.spilled_bytes(),
+            CORPUS_MIN_ARCHIVE,
+            "the medium's ledger is not the bytes written to it",
+        );
+
+        // And therefore the 15.5x-larger half is reclaimable.
+        assert_eq!(
+            mgr.evict_decoded_except(|_, _, _| false).len(),
+            1,
+            "the decoded volume was refused though its archive is one read \
+             away, so the spill bought nothing",
+        );
+    }
+
+    /// **The fires-counter pair, both directions.** A cut whose counter cannot
+    /// distinguish "did not fire" from "fired and did nothing" is how a
+    /// ~94 MiB cut on this campaign delivered exactly zero for a day.
+    #[test]
+    fn the_spill_counters_say_which_way_the_bytes_went() {
+        let probe = SpillProbe::default();
+        let (mut mgr, held) = over_ceiling(Some(probe.clone()), false);
+        assert_eq!(
+            mgr.spill_counts(),
+            (0, 0, 0, 0, 0),
+            "a manager that has evicted nothing has already counted something",
+        );
+
+        mgr.evict_archives_to_ceiling(held - 1, oldest_first, |_, _, _| false);
+        let (spilled, refused, failed, restored, misses) = mgr.spill_counts();
+        assert_eq!(
+            (spilled, refused, failed, restored, misses),
+            (1, 0, 0, 0, 0),
+            "one archive went off-heap and nothing has been asked back yet",
+        );
+
+        // The withdrawal direction.
+        let back = mgr
+            .archive_for("KTLX", &ts(0))
+            .expect("the archive is one read away");
+        assert_eq!(
+            back.len(),
+            CORPUS_MIN_ARCHIVE,
+            "the bytes that came back are not the ones that went out",
+        );
+        assert!(
+            back.iter().all(|b| *b == 7),
+            "the archive came back corrupted, so a decode would fail on it",
+        );
+        let (_, _, _, restored, misses) = mgr.spill_counts();
+        assert_eq!((restored, misses), (1, 0), "the restore was not counted");
+    }
+
+    /// **A released base's way back runs through the medium too.** This is the
+    /// other withdrawal, and it is the one whose absence leaves a cross-section
+    /// pane waiting for ever.
+    #[test]
+    fn a_released_base_finds_its_way_back_through_the_medium() {
+        let probe = SpillProbe::default();
+        let mut mgr = LoopDownloadManager::new();
+        mgr.set_spill(
+            Box::new(SpillDouble {
+                probe,
+                refuse: false,
+            }),
+            64 * 1024 * 1024,
+        );
+        let collected = crate::types::volume_collected_at(&priced_volume().0)
+            .expect("the fixture states an identity");
+
+        mgr.cache_scan("KTLX", ts(0), priced_volume());
+        mgr.cache_archive("KTLX", ts(0), archive(CORPUS_MIN_ARCHIVE));
+        let held = mgr.cached_archive_bytes();
+        assert!(
+            mgr.archive_for_identity("KTLX", collected).is_some(),
+            "the fixture did not reach the state this test is about",
+        );
+
+        mgr.evict_archives_to_ceiling(held - 1, oldest_first, |_, _, _| false);
+        assert_eq!(mgr.cached_archive_count("KTLX"), 0, "still on the heap");
+
+        let (at, found) = mgr
+            .archive_for_identity("KTLX", collected)
+            .expect("the medium is holding this identity's bytes");
+        assert_eq!(at, ts(0), "the wrong address came back");
+        assert_eq!(found.len(), CORPUS_MIN_ARCHIVE);
+
+        // And the diagnostic beside it agrees, rather than reporting the
+        // archive as gone.
+        let (learned, with_archive, _) = mgr.identity_way_backs("KTLX", collected);
+        assert_eq!(
+            (learned, with_archive),
+            (1, 1),
+            "the way-back diagnostic reports an off-heap archive as gone, so a \
+             real defect would be read as this change's doing",
+        );
+    }
+
+    /// **The disk has a ceiling too, and past it this behaves exactly as a
+    /// tree with no spill.** A byte ceiling that moves its overflow to a medium
+    /// which also runs out is a leak with a longer fuse.
+    #[test]
+    fn past_the_spills_own_ceiling_the_archive_is_dropped_and_the_refusal_counted() {
+        let probe = SpillProbe::default();
+        let mut mgr = LoopDownloadManager::new();
+        // Room for nothing: the first archive offered is already too big.
+        mgr.set_spill(
+            Box::new(SpillDouble {
+                probe: probe.clone(),
+                refuse: false,
+            }),
+            1024,
+        );
+        mgr.cache_scan("KTLX", ts(0), priced_volume());
+        for minute in 0..3u32 {
+            mgr.cache_archive("KTLX", ts(minute), archive(CORPUS_MIN_ARCHIVE));
+        }
+        let held = mgr.cached_archive_bytes();
+
+        let freed = mgr.evict_archives_to_ceiling(held - 1, oldest_first, |_, _, _| false);
+
+        assert!(freed > 0, "nothing was evicted, so nothing was offered");
+        assert_eq!(probe.len(), 0, "the medium took bytes past its ceiling");
+        assert_eq!(mgr.spilled_bytes(), 0);
+        assert!(
+            !mgr.has_archive("KTLX", &ts(0)),
+            "the archive is reported held though it reached neither the heap \
+             nor the medium",
+        );
+        let (spilled, refused, failed, _, _) = mgr.spill_counts();
+        assert_eq!(
+            (spilled, refused, failed),
+            (0, 1, 0),
+            "the refusal is not distinguishable from a store that failed",
+        );
+    }
+
+    /// A store that fails is not a policy refusal, and the two are counted
+    /// apart. Either way the archive is dropped, as a tree with no spill does.
+    #[test]
+    fn a_store_that_fails_is_counted_apart_from_a_full_medium() {
+        let probe = SpillProbe::default();
+        let (mut mgr, held) = over_ceiling(Some(probe.clone()), true);
+        mgr.evict_archives_to_ceiling(held - 1, oldest_first, |_, _, _| false);
+
+        assert_eq!(probe.len(), 0);
+        assert!(!mgr.has_archive("KTLX", &ts(0)));
+        let (spilled, refused, failed, _, _) = mgr.spill_counts();
+        assert_eq!(
+            (spilled, refused, failed),
+            (0, 0, 1),
+            "a failed store reads as a full medium, which would send the next \
+             reader to the wrong ceiling",
+        );
+    }
+
+    /// **The spill follows the frame list DOWN as well as up**, which with the
+    /// ceiling refusal is what bounds the medium over a long session.
+    #[test]
+    fn a_frame_the_loop_stops_naming_leaves_the_medium_too() {
+        let probe = SpillProbe::default();
+        let (mut mgr, held) = over_ceiling(Some(probe.clone()), false);
+        mgr.evict_archives_to_ceiling(held - 1, oldest_first, |_, _, _| false);
+        assert_eq!(probe.len(), 1, "the fixture did not reach a spilled state");
+        assert_eq!(mgr.spilled_count(), 1);
+
+        // The loop stops naming ts(0).
+        mgr.retain_archives(|_, at, _| *at != ts(0));
+
+        assert_eq!(
+            probe.len(),
+            0,
+            "a frame the loop no longer names kept its file on the medium; \
+             nothing else would ever collect it and the disk grows with every \
+             stamp a long session lists",
+        );
+        assert_eq!(mgr.spilled_bytes(), 0, "the medium's ledger did not follow");
+        assert_eq!(mgr.spilled_count(), 0);
+        assert!(!mgr.has_archive("KTLX", &ts(0)));
+    }
+
+    /// A heap copy supersedes an off-heap one, or both would be counted and the
+    /// medium would keep bytes nothing can ever read.
+    #[test]
+    fn a_heap_copy_supersedes_the_spilled_one() {
+        let probe = SpillProbe::default();
+        let (mut mgr, held) = over_ceiling(Some(probe.clone()), false);
+        mgr.evict_archives_to_ceiling(held - 1, oldest_first, |_, _, _| false);
+        assert!(mgr.is_spilled("KTLX", &ts(0)), "the fixture did not arise");
+
+        mgr.cache_archive("KTLX", ts(0), archive(CORPUS_MIN_ARCHIVE));
+
+        assert!(
+            !mgr.is_spilled("KTLX", &ts(0)),
+            "the spilled copy outlived the heap copy that replaced it",
+        );
+        assert_eq!(probe.len(), 0, "the medium kept an unreadable duplicate");
+        assert_eq!(mgr.spilled_bytes(), 0);
+        assert!(mgr.has_archive("KTLX", &ts(0)));
+    }
+
+    /// A key here with nothing on the medium is this type disagreeing with the
+    /// disk, and it is counted rather than silently degraded.
+    #[test]
+    fn a_key_the_medium_has_lost_is_counted_as_a_miss() {
+        let probe = SpillProbe::default();
+        let (mut mgr, held) = over_ceiling(Some(probe.clone()), false);
+        mgr.evict_archives_to_ceiling(held - 1, oldest_first, |_, _, _| false);
+        assert_eq!(probe.len(), 1, "the fixture did not arise");
+
+        // Something else took the file.
+        probe.0.lock().expect("not poisoned").clear();
+
+        assert!(
+            mgr.archive_for("KTLX", &ts(0)).is_none(),
+            "bytes were invented for a key the medium has lost",
+        );
+        let (_, _, _, restored, misses) = mgr.spill_counts();
+        assert_eq!(
+            (restored, misses),
+            (0, 1),
+            "a lost file read as a successful restore",
+        );
     }
 }
