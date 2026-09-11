@@ -35,7 +35,7 @@
 //! pane makes it sixty-nine, and a one-pane volume frame costs sixty. Count
 //! the panes before quoting the figure.
 //!
-//! **Two neighbouring instruments are NOT in the fifty-three, and naming them
+//! **Two neighbouring instruments are NOT in the sixty-three, and naming them
 //! is what stops the next recount oscillating.** `EguiRenderer` takes a sixth
 //! unconditional read for `PassCosts::note` (and two more when a pane mirror
 //! is requested), and `handle_redraw`'s tail takes up to two more building
@@ -102,8 +102,9 @@
 //!
 //! And **no new histogram is recorded per frame**: each family is a
 //! [`squallar_device_profile::hist::Split`], and a frame writes exactly one
-//! of its two halves. The pair costs 352 bytes per cut — **11 616 bytes**
-//! over the sixty-six — and the `presented` population is their exact
+//! of its two halves. The pair is 352 bytes per cut (two 176-byte `Hist`s) —
+//! **23 232 bytes** over the sixty-six, of which 11 616 is the second half
+//! this shape added — and the `presented` population is their exact
 //! bin-wise union, computed at telemetry time and never recorded.
 //!
 //! **Both figures were stale before the `pre` split, and by more than the
@@ -126,8 +127,10 @@
 //!
 //! **The unnecessary-frame verdict adds no clock read and no bin search**, and
 //! that is the pin: [`crate::frame_need`] rides on this call and costs one
-//! relaxed `swap` of a `u32` register plus between three and six `u64`
-//! increments per presented frame. The three counts above are unchanged by it.
+//! relaxed `swap` of a `u32` register plus two `u64` increments on an
+//! unnecessary frame or three to seven on a necessary one, one per raised
+//! cause of [`squallar_egui::frame_need::NeedCause`]'s five. The three counts
+//! above are unchanged by it.
 //!
 //! **A dispatching frame pays more, and only a dispatching frame.** The
 //! `dispatch` split ([`DispatchHists`]) adds two clock reads per
@@ -459,19 +462,22 @@ pub(crate) struct FinishPhaseStamps {
 ///
 /// # Denominator, and it is NOT the other splits'
 ///
-/// **Every presented frame, interact and idle alike** — deliberately wider
-/// than [`PrepareHists`], [`UiHists`], [`PumpHists`] and [`PostHists`], all
-/// of which record inside `finalize`'s `if interacted` arm. That choice is
-/// the whole reason this family is useful: the frames `finish` is a p99
+/// **Every presented frame, interact and idle alike, undivided** — where
+/// [`PrepareHists`], [`UiHists`], [`PumpHists`] and [`PostHists`] cover the
+/// same population as a [`squallar_device_profile::hist::Split`] that keeps
+/// the two halves apart. This family was wider than all four until the
+/// 2026-09-10 ruling, and that is why it is useful: the frames `finish` is a p99
 /// contributor on are **idle** ones. Measured on this box, Firefox, scene D,
 /// 3440x1440@174.96, n=107 interact frames: of the eight worst frames of a
 /// gesture window every one was family=idle, and `finish` was the largest
 /// segment on two of them, one at 14,179 us. A split recorded the way its
-/// four siblings are would have read EMPTY on exactly those frames.
+/// four siblings were before that ruling would have read EMPTY on exactly
+/// those frames.
 ///
-/// So `frame finish (*)` is **never added to `frame segment (finish)`** and
-/// is not even a decomposition of it: it decomposes the same span over a
-/// strictly larger frame set. [`FinishHists::whole`] is that parent, recorded
+/// So `frame finish (*)` is **never added to `frame segment (finish)`**: it
+/// decomposes the same span over the same presented frames, undivided where
+/// the segment keeps its two halves apart. [`FinishHists::whole`] is that
+/// parent, recorded
 /// here on this family's own denominator, so every share this family supports
 /// is computable without borrowing another family's `n`.
 ///
@@ -569,7 +575,7 @@ pub(crate) struct FinishHists {
 ///
 /// The threshold those figures were read against was 8 MiB, and the frame's
 /// whole allowance was 16 MiB — `band_cap` times a count of staging buffers,
-/// which is **7.6 ms** of blocking at the 2.1 GB/s that module measures, against
+/// which is **8.0 ms** of blocking at the 2.1 GB/s that module measures, against
 /// a [`squallar_device_profile::constants::TARGET_FRAME_SERVICE`] of 4 ms. Both
 /// are now one figure derived from that frame and that bandwidth
 /// (`texture_upload::whole_budget`), so the six-pane `upload` reading above is
@@ -1153,12 +1159,13 @@ pub(crate) struct SegmentHists {
 /// attributed a 53.8 ms scene-D max to the `ui` segment, and the `ui` split
 /// then measured `ui` at 3% of service.
 ///
-/// # The denominator, and it is NOT the segments'
+/// # The denominator, and why it is still not the segments' figure
 ///
-/// **Every presented frame**, interact and idle alike — which is the whole
-/// point. The six segment histograms and all nineteen cuts record interact
-/// frames only, and a click's *consequences* (the raster dispatch it causes,
-/// the texture the answer uploads, the source it releases) are paid on the
+/// **Every presented frame**, interact and idle alike — the same population
+/// the segment histograms cover since the 2026-09-10 ruling, but ONE frame's
+/// microseconds rather than a percentile over many. A click's *consequences*
+/// (the raster dispatch it causes, the texture the answer uploads, the
+/// source it releases) are paid on the
 /// frames after the one that carried the pointer event, every one of which
 /// this ledger files as idle. Measured on this box, scene D, 1920x1080 on a
 /// 3440x1440@174.96 display, main@3d5e1559: a two-loop window's worst
@@ -1194,11 +1201,12 @@ pub(crate) struct WorstFrame {
     /// frame. `the_worst_frames_ui_cuts_telescope_to_its_ui` derives that
     /// bound off the cut count and holds it.
     ///
-    /// **Why it is here and not left to [`UiHists`].** Those nine record
-    /// inside `finalize`'s `if interacted` arm, so a frame that carried no
-    /// pointer event — every frame that PAYS for a click, and half the spikes
-    /// measured on scene D — contributes to none of them. Until this field
-    /// the only way to attribute a worst frame's `ui` to a cut was to observe
+    /// **Why it is here and not left to [`UiHists`].** Those nine are
+    /// distributions and this is one frame: no percentile names the cut that
+    /// held the microseconds of the frame `frame worst:` names, and half the
+    /// spikes measured on scene D fall on the idle frames that PAY for a
+    /// click. Until this field the only way to attribute a worst frame's `ui`
+    /// to a cut was to observe
     /// that two cumulative maxima landed in adjacent bins, which is an
     /// inference across two aggregates and not a fact about one frame.
     ///
@@ -1214,14 +1222,13 @@ pub(crate) struct WorstFrame {
     /// [`micros`] calls can lose, and never over it**.
     ///
     /// **Here for [`WorstFrame::ui_cuts`]' reason exactly, and it is the
-    /// reason this field is not optional.** [`StackHists`] records inside
-    /// `finalize`'s `if interacted` arm, and half the `ui` spikes measured on
+    /// reason this field is not optional.** [`StackHists`] is a distribution
+    /// and this is one frame, and half the `ui` spikes measured on
     /// scene D — on the **browser** legs [`StackHists`] names, which are the
     /// only arms this family has been read on — fall on IDLE frames: 8,339,
     /// 6,600, 8,219 and 7,879 µs, because the frame that PAYS for a click
-    /// carries no pointer event. A
-    /// split that existed only in the interact histograms would be blind to
-    /// half the frames the p99 verdict is about.
+    /// carries no pointer event. A percentile over either half cannot name
+    /// the cut that held one latched frame's tail.
     ///
     /// Zeroed on a frame that left no `ui_phases`, on `ui_cuts`' terms.
     /// **Zero new clock reads**: the six stamps are already taken on every
@@ -1257,12 +1264,12 @@ pub(crate) struct WorstFrame {
     /// microseconds for seven cuts — so the worst frame's `pre` is decomposed
     /// by arithmetic on ONE frame.
     ///
-    /// **Here for [`WorstFrame::ui_cuts`]' reason exactly.** [`PreHists`]
-    /// records inside `finalize`'s `if interacted` arm, and the frame this
-    /// split was cut for is a latched one: `pre` read 10,357 µs on it, 88–92 %
+    /// **Here for [`WorstFrame::ui_cuts`]' reason exactly.** [`PreHists`] is a
+    /// distribution, and the frame this split was cut for is a latched one:
+    /// `pre` read 10,357 µs on it, 88–92 %
     /// of the whole frame. Half the expensive frames on scene D carry no
-    /// pointer event and are filed idle, so the interact-only histograms
-    /// cannot open the very frames the `max` verdict is about.
+    /// pointer event and are filed idle, and no percentile over either half
+    /// opens the single frame the `max` verdict is about.
     ///
     /// Zeroed on a frame that left no `pre_phases` — one of the head's three
     /// early exits, which is the same frame that leaves no acquire and is not
@@ -1277,14 +1284,14 @@ pub(crate) struct WorstFrame {
     /// decomposed by arithmetic on ONE frame.
     ///
     /// **Here for [`WorstFrame::ui_cuts`]' reason exactly, and this is the
-    /// segment where the gap was widest.** [`PostHists`] records inside
-    /// `finalize`'s `if interacted` arm, and `post` is not a per-frame cost
-    /// at all — it is one occasional event on an otherwise 46 µs span. Every
+    /// segment where the gap was widest.** [`PostHists`] is a distribution and
+    /// `post` is not a per-frame cost at all — it is one occasional event on
+    /// an otherwise 46 µs span. Every
     /// such event measured so far has landed on an IDLE frame: the Mac
     /// scene A leg of 2026-09-10 latched `post=15,409 µs` on a
     /// `family=idle` frame, a 335x outlier, and NOTHING in this tree could
-    /// name which of the seven cuts it was — the interact histograms never
-    /// saw the frame and this line carried no `post_*` column.
+    /// name which of the seven cuts it was — no percentile names one frame,
+    /// and this line carried no `post_*` column.
     ///
     /// Zeroed on a frame that left no `post_phases`. **Zero new clock
     /// reads**: the six stamps are already taken on every frame that reaches
@@ -1493,8 +1500,8 @@ fn service_micros(
 /// On a display with no present path the WSI does not wait — it copies.
 /// Measured on NVIDIA's Vulkan WSI under Xvfb, 2026-09-06: 6.73 ms at
 /// 640x480, 13.46 at 1024x588, 45.26 at 1920x1080 and 87.8 at 2878x1651 — a
-/// 6.73x time ratio across a 6.75x pixel ratio, which is a blit at 21.8 ns/px
-/// and not a vblank wait. That readback is charged to `finish`, therefore to
+/// 6.73x time ratio across a 6.75x pixel ratio, which is a blit at
+/// 18.5–22.4 ns/px over the four surfaces and not a vblank wait. That readback is charged to `finish`, therefore to
 /// `service`, so on every headless arm this campaign runs every `service`
 /// percentile reads `over` and the frame thread is held to ~11 fps. The
 /// excluded cut is the WSI's on either kind of display — a wait where there
@@ -1979,13 +1986,13 @@ impl FrameLedger {
         );
 
         // **Above the arm on purpose, and the only ARITHMETIC that is.** These
-        // nine ride on `WorstFrame`, whose denominator is every presented
-        // frame, so they have to be computed on the idle ones too -- the
-        // frames that pay for a click, where half of scene D's spikes live and
-        // where `UiHists` records nothing. The nine `self.ui.*.record` calls
-        // stay inside the arm below, so no histogram's denominator moves; only
-        // the subtraction left it. Zero new clock reads: `m.ui_phases` is
-        // already stamped on every presented frame.
+        // nine ride on `WorstFrame`, which latches ONE frame rather than a
+        // distribution, so they have to be computed on the idle ones too --
+        // the frames that pay for a click, where half of scene D's spikes
+        // live. The nine `self.ui.*.record` calls below file into a `Split`
+        // and move no denominator; only the subtraction left the arm. Zero
+        // new clock reads: `m.ui_phases` is already stamped on every
+        // presented frame.
         let ui_cuts = m.ui_phases.as_ref().map_or([0u32; 9], |phases| {
             ui_phase_micros(ui_start, phases, ui_end)
         });
@@ -1993,9 +2000,10 @@ impl FrameLedger {
         // **The same, one level down, and above the arm for the same reason.**
         // These seven cut `ui_cuts[4]` -- the `stack` cut, which owns the `ui`
         // tail and whose maximum is 16-20x its own median -- and HALF the
-        // measured spikes fall on idle frames, where `StackHists` records
-        // nothing. Zero new clock reads: `m.ui_phases` already carries the six
-        // stamps; only seven subtractions left the arm. The statement may not
+        // measured spikes fall on idle frames, which `StackHists` files in its
+        // idle half and never as one named frame. Zero new clock reads:
+        // `m.ui_phases` already carries the six stamps; only seven
+        // subtractions left the arm. The statement may not
         // read `interacted` -- see
         // `the_worst_frames_stack_cuts_are_computed_outside_the_interact_arm`.
         let stack_cuts = m.ui_phases.as_ref().map_or([0u32; 7], |phases| {
@@ -2038,9 +2046,10 @@ impl FrameLedger {
         // Above the arm, and for the sharpest instance of the three
         // bindings above's reason. `post` is the one segment whose cost is
         // NOT per-frame: a 46 us span that once read 15,409 us, and every
-        // such event observed has landed on an idle frame, where `PostHists`
-        // records nothing. Zero new clock reads: `m.post_phases` is stamped
-        // on every frame that reaches the tail; only seven subtractions left
+        // such event observed has landed on an idle frame, which `PostHists`
+        // files in its idle half and never as one named frame. Zero new clock
+        // reads: `m.post_phases` is stamped on every frame that reaches the
+        // tail; only seven subtractions left
         // the arm. The statement may not read `interacted` -- see
         // `the_worst_frames_post_cuts_are_computed_outside_the_interact_arm`.
         let post_cuts = m.post_phases.as_ref().map_or([0u32; 7], |phases| {
@@ -3356,9 +3365,9 @@ mod tests {
     /// frame the line names rather than standing beside it.
     ///
     /// The property the field exists for, and it is not the property
-    /// `frame stack (*)` has: those seven histograms record inside
-    /// `finalize`'s `if interacted` arm, and half the `ui` spikes measured on
-    /// scene D fall on IDLE frames — 8,339, 6,600, 8,219 and 7,879 µs.
+    /// `frame stack (*)` has: those seven histograms are distributions over
+    /// both halves and name no single frame, and half the `ui` spikes measured
+    /// on scene D fall on IDLE frames — 8,339, 6,600, 8,219 and 7,879 µs.
     ///
     /// **Both assertions are load-bearing and neither implies the other.**
     /// The sum catches a cut taken from the wrong pair of stamps only when
@@ -4207,9 +4216,10 @@ mod tests {
     /// which is what a real compositor hands back — so none of them shows the
     /// figure doing the thing it exists for. This one states the case it was
     /// built for: NVIDIA's Vulkan WSI with no present path copies the
-    /// swapchain image back at 21.8 ns/px, measured 87.8 ms at 2878x1651 on
-    /// 2026-09-06, and that lands inside `finish` and therefore inside
-    /// `service`. The figures are asserted against the fixture's own extent —
+    /// swapchain image back at 18.5 ns/px over 2878x1651's 4,751,578 px,
+    /// measured 87.8 ms on 2026-09-06, and that lands inside `finish` and
+    /// therefore inside `service`. The figures are asserted against the
+    /// fixture's own extent —
     /// the segments it is built from — and not against any threshold.
     #[test]
     fn a_frame_the_present_ate_reads_the_work_while_service_reads_the_readback() {
@@ -4546,22 +4556,21 @@ mod tests {
 
     /// **An idle frame can be the worst frame, and this is the whole point.**
     ///
-    /// Every segment histogram and all nineteen cuts in this file record
-    /// interact frames only, because they exist to say where an *interact*
-    /// frame's service went. A click's consequences — the raster dispatch it
-    /// causes, the texture its answer uploads, the source it releases — are
+    /// Every segment histogram and all fifty-nine cuts in this file are
+    /// distributions that name no single frame, and this latch is one frame.
+    /// A click's consequences — the raster dispatch it causes, the texture
+    /// its answer uploads, the source it releases — are
     /// paid on the frames after the one carrying the pointer event, and this
     /// ledger files every one of those as idle. Measured on scene D
     /// (main@3d5e1559, 1920x1080 on 3440x1440@174.96): a two-loop window's
     /// worst interact frame is in the 2.83-3.36 ms bin and its worst idle
-    /// frame is in 5.66-6.73 ms. A latch that inherited the segments'
-    /// interact-only rule would report the smaller of those two as the
-    /// window's worst frame and read green while the user waited.
+    /// frame is in 5.66-6.73 ms. A latch restricted to interact frames would
+    /// report the smaller of those two as the window's worst frame and read
+    /// green while the user waited.
     ///
     /// So this is the non-vacuity gate: it is RED against the degenerate
-    /// implementation — the latch moved inside `finalize`'s `if interacted`
-    /// arm — which is exactly the shape this instrument would have taken if
-    /// written to match its neighbours.
+    /// implementation — the latch restricted to interact frames — which is
+    /// the shape every family here carried until the 2026-09-10 ruling.
     #[test]
     fn the_worst_frame_latch_admits_an_idle_frame() {
         let clicked = frame(3_364, true);
@@ -4873,11 +4882,11 @@ mod tests {
     /// the line names rather than standing beside it.
     ///
     /// The property the field exists for, and it is not the same property
-    /// `frame pre (*)` has: those seven histograms record inside `finalize`'s
-    /// `if interacted` arm, and the frame this split was cut for is a latched
+    /// `frame pre (*)` has: those seven histograms are distributions that name
+    /// no single frame, and the frame this split was cut for is a latched
     /// one — `pre` read **10,357 µs on it, 88–92 % of the whole frame**.
     /// Half of scene D's expensive frames carry no pointer event and are filed
-    /// idle, so an interact-only histogram cannot open the very frames the
+    /// idle, and no percentile over either half opens the single frame the
     /// `max` verdict is about.
     ///
     /// Written on `the_worst_frames_ui_cuts_telescope_to_its_ui`'s corrected

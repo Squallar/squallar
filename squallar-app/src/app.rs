@@ -179,7 +179,8 @@ pub struct App {
     /// re-asked: on X11 both are display-server round trips whose cost scales
     /// with the server's queue depth, not with the frame — 72.61 us per
     /// interact frame at 640x480, 462-474 us at 1920x1080. Holding them nets
-    /// 49.94 us of that back, which is less than it removes.
+    /// 49.94 us per presented interact frame on the 640x480 arm, a paired
+    /// whole-frame figure and not a segment subtraction.
     /// Retired by the events that define the answers, never by a clock — see
     /// [`crate::window_gate`] for the arm and for why removed and saved differ.
     window_gate: crate::window_gate::WindowGate,

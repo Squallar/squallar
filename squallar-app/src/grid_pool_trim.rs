@@ -115,8 +115,9 @@
 //!
 //! The free itself is 0.218–0.467 ms for both blocks (twelve samples, 64,000,000
 //! B, `std::alloc::System`, this box under load) — **measured when the two
-//! blocks summed to 64,000,000 B; they sum to 15,224,000 B now**, so that
-//! range is an upper bound rather than the current reading. Small — and still handed to
+//! blocks summed to 64,000,000 B; they sum to 15,224,000 B nominal and read
+//! 15,221,000 B parked on the HEAVY6 leg above**, so that range is an upper
+//! bound rather than the current reading. Small — and still handed to
 //! `squallar_worker::offload`'s free lane rather than spent on an interaction
 //! frame, priced so `deferred drops` carries the bytes for the whole of the
 //! hand-off.

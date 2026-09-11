@@ -1027,11 +1027,12 @@ impl OverlayRegistry {
 
     /// [`OverlayHandler::resident_source_bytes`] over the handlers.
     ///
-    /// The three gridded layers are the bulk of it: MRMS at 49 MB a mosaic,
-    /// GMGSI at 15 MB a blend — one byte a point, the width its values are —
-    /// HRRR at 7.6 MB a grid. **And one that is not gridded**: the lightning
-    /// layer's S3 granule cache, up to `MAX_RETAINED_FLASHES` rows at 40 bytes
-    /// apiece — 12 MB — held beside its `OverlayState` and therefore in no
+    /// The three gridded layers are the bulk of it: MRMS at 2.3-8.9 MB a tiled
+    /// mosaic, GMGSI at 15 MB a blend — one byte a point, the width its values
+    /// are — HRRR at 7.6 MB a grid. **And one that is not gridded**: the
+    /// lightning layer's S3 granule cache, up to `MAX_RETAINED_FLASHES` rows at
+    /// 40 bytes apiece — 10,000,000 B — held beside its `OverlayState` and
+    /// therefore in no
     /// other family. Every other handler takes the trait's `0` default, which
     /// is a claim about scale rather than an omission — a few hundred parsed
     /// alert polygons do not move a figure read in megabytes.

@@ -341,14 +341,16 @@ pub const CONUS_TILED_CEILING_BYTES: usize = {
 /// once a `px_coords` buffer and a texture are in it.
 ///
 /// **The narrowing was BANKED, and the desktop arm is now read down to what
-/// the key space can use.** Stated as a multiple of [`CONUS_GRID_BYTES`], this
+/// the key space can use.** Stated as a multiple of one grid rather than as a
+/// round number of megabytes, this
 /// budget halved with the `u16` store — desktop went 392,000,000 B to
 /// 196,000,000 B and stayed *four* grids rather than becoming eight, on the
 /// argument that capacity a user has been given cannot be taken away without
 /// removing something they can see. Two of those four grids were never
 /// capacity: the cache keys by product and there are two, so the desktop arm
 /// priced 98 MB of headroom no insert could reach and nobody could see. It is
-/// two grids now, 98,000,000 B, and nothing resident changes — the cache's
+/// two grids now, 98,993,296 B — a multiple of [`CONUS_TILED_CEILING_BYTES`]
+/// since the store went tiled — and nothing resident changes — the cache's
 /// peak was two grids before and is two grids after. A third product added to
 /// `all()` moves this arm through the `const _` below, not by finding room in
 /// it.
@@ -431,7 +433,8 @@ const _: () = assert!(CONUS_GRID_BYTES == 49_000_000);
 const _: () = assert!(CONUS_BAND_BYTES == 224_000);
 const _: () = assert!(CONUS_GRID_BYTES / CONUS_BAND_BYTES == 218);
 // The tiled ceiling, pinned APART from the flat one so a build failure names
-// which moved. It is the flat plane plus 0.78 % of addressing overhead — the
+// which moved. It is 1.01 % above the flat plane — 384,584 B of addressing
+// plus 112,064 B of padded edge tiles — the
 // whole of what this representation can cost above the one it replaces, and the
 // figure the "bounded worst case" claim in `TiledU16` is made of.
 const _: () = assert!(CONUS_TILED_CEILING_BYTES == 49_496_648);

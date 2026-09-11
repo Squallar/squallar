@@ -284,7 +284,7 @@ pub fn decode_bytes(bytes: Vec<u8>) -> Result<DecodedScan> {
 /// **The decode does not copy the archive.** `decode_bytes` takes the buffer by
 /// value, so the one production caller — `jobs::DecodeJob::run`, which holds the
 /// archive as the `Arc<Vec<u8>>` the job funnel moves by pointer — had to clone
-/// the whole volume to call it: 0.34–17.96 MB (median 5.56 MB over the archive
+/// the whole volume to call it: 0.34–17.96 MiB (median 5.56 MiB over the archive
 /// sizes this reads), live for the length of the decode, on up to six concurrent
 /// decodes. `File::from_shared` is the vendored door that takes the pointer
 /// instead.

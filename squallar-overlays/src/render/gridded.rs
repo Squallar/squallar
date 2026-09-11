@@ -378,8 +378,9 @@ impl ScaledU16 {
 /// Chosen against the corpus rather than by taste: 28 granules of both shipped
 /// products spanning 2021-10-05 to 2026-09-08, priced at 8, 16 and 32 with this
 /// same fixed-slot layout. 16 holds the lowest bytes on 24 of the 28 and the
-/// lowest mean; 8 is 7 % better on the single densest granule and 1.5 MB worse
-/// in index alone on every one; 32 is 20-30 % worse throughout. See
+/// lowest mean; 8 is 7 % better on the single densest granule and 1.15 MB
+/// worse in index on every one (1,533,000 B against 16's 383,688); 32 is
+/// 20-30 % worse throughout. See
 /// [`TiledU16`].
 pub const TILE: usize = 16;
 
@@ -392,8 +393,8 @@ pub const TILE_CELLS: usize = TILE * TILE;
 /// one code, clear means they are its slot in the arena.
 ///
 /// The top bit rather than a side vector because the entry is read on the
-/// sampling path: a slot number needs 25 bits at the largest grid this store
-/// will hold (24.5 M points is 95,704 tiles) and a code needs 16, so one `u32`
+/// sampling path: a slot number needs 17 bits at the largest grid this store
+/// will hold (7000 x 3500 is 95,922 tiles) and a code needs 16, so one `u32`
 /// carries either with room to spare and the test is a single `and`.
 const TILE_UNIFORM: u32 = 1 << 31;
 
@@ -604,8 +605,9 @@ impl TileDecode {
 /// at the worst granule measured, so ~10 dependent loads) where this is two,
 /// and it is the raster's per-cell reader as well as hover's; and its worst
 /// case is unbounded above the flat store — a checkerboard row costs 4 B a
-/// point — where this one cannot exceed the flat store by more than its index,
-/// **0.78 %**, whatever arrives.
+/// point — where this one cannot exceed the flat store by more than its
+/// addressing and its padded edge tiles, **1.01 %** (49,496,648 B against
+/// 49,000,000), whatever arrives.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TiledU16 {
     /// Points along a parallel — the FULL grid's width. A band cut for the wire

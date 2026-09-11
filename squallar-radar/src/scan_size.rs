@@ -188,7 +188,7 @@ pub const ALLOCATOR_BLOCK_OVERHEAD: usize = 16;
 ///
 /// **What it moved, MEASURED against a counting allocator over 8 real archive
 /// volumes** (release build, 2026-09-09) — and the naive arithmetic
-/// over-states it by 3.4x, so the arithmetic is not what is quoted here.
+/// over-states it by 4.8x, so the arithmetic is not what is quoted here.
 ///
 /// The naive term is `+40 B` of `Arc` block and `+16 B` of
 /// [`ALLOCATOR_BLOCK_OVERHEAD`] on it per non-empty moment, which on ~32,400

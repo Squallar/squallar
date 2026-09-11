@@ -11,8 +11,8 @@
 //! (The sparse *floor* costs more than the dense one because nothing
 //! saturates: rays cross the whole box with no early-out.)
 //!
-//! Resolution is a real lever at ~85% efficiency — quartering the pixel count
-//! buys 3.4x, not 4x. The cost model is texture-unit bound (267-288 G dependent
+//! Resolution is a real lever at 60-77% efficiency — quartering the pixel count
+//! buys 2.4-3.1x across the four columns above, not 4x. The cost model is texture-unit bound (267-288 G dependent
 //! 3D-linear fetches/s, matching the 3090's trilinear rate), so frame cost is
 //! `covered px x steps x fetches/step / the device's 3D-linear rate`, which is
 //! what makes extrapolating to unmeasured devices defensible.
@@ -88,7 +88,7 @@ impl GroundPass {
 
 /// How far the offscreen is scaled down from the pane it will be blitted into.
 /// Named by the *linear* scale: `Half` is half the width and half the height,
-/// so a quarter of the pixels and about 3.4x the speed.
+/// so a quarter of the pixels and about 2.4-3.1x the speed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ResolutionRung {
     Native,

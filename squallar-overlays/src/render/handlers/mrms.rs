@@ -4,7 +4,8 @@
 //! viewport at encode — with two differences that are the whole content of this
 //! file:
 //!
-//! * **the cache's ceiling is bytes, not entries.** One CONUS grid is 49 MB, so
+//! * **the cache's ceiling is bytes, not entries.** One CONUS grid's tiled
+//!   ceiling is 49,496,648 B, so
 //!   `crate::mrms::GRID_CACHE_BYTES` is the budget and the entry count falls out
 //!   of it. `crate::mrms::GRID_HISTORY_ENTRIES` is an entry count, but of a
 //!   different thing: how many *unpinned* grids may stay under that ceiling, so
@@ -81,15 +82,17 @@ use squallar_source::time::{FrameListing, FrameSource, FrameStamp, TimeAxis};
 /// **One frame's granule at a time, application-wide** — the same shape as
 /// GMGSI's gate, needed harder here: `dispatch_loop_frame_fetches` has no
 /// throttle of its own, and `crate::mrms::staging`'s slot holds exactly one
-/// 49 MB values vector — every decode that does not get it allocates its own.
-/// Thirty unthrottled fetches — one slider-default hour at the ~2-minute
-/// cadence — would hold ~1.5 GB in flight before any cache saw a byte.
+/// 224,000 B tile-row band — every decode that does not get it allocates its
+/// own store. Thirty unthrottled fetches — one slider-default hour at the
+/// ~2-minute cadence — would hold 70 to 268 MB of tiled mosaic in flight
+/// before any cache saw a byte.
 ///
-/// The figure was ~2.9 GB at the `f32` width the store shipped with, and
-/// ~4.4 GB while a decode also held grib's 49 MB PNG image buffer beside it;
-/// `crate::mrms::decode` streams section 7 a row at a time now and the store
-/// is `u16`. The gate is unaffected by either — what it bounds is the values
-/// vector, whatever its width, and still one per concurrent decode.
+/// The figure was ~1.5 GB at the flat `u16` plane, ~2.9 GB at the `f32` width
+/// the store shipped with, and ~4.4 GB while a decode also held grib's 49 MB
+/// PNG image buffer beside it; `crate::mrms::decode` streams section 7 a row
+/// at a time now and the store is tiled. The gate is unaffected by any of
+/// them — what it bounds is one decode's own store, whatever its shape, and
+/// still one per concurrent decode.
 ///
 /// Serialising costs almost no wall time: the bytes are the bottleneck either
 /// way, and FIFO fairness means granules arrive in render-set order, which is
@@ -165,7 +168,8 @@ impl MrmsFrameCache {
     /// **Ranked by what the panes still ask for, not by age.** A staged
     /// granule evicted before its job is described costs one frame its picture
     /// until the next listing; a staged granule *kept* past the budget costs
-    /// 49 MB on an arm that has already said it cannot spare it. So the budget
+    /// up to 8.9 MB on an arm that has already said it cannot spare it. So the
+    /// budget
     /// still decides how many granules go, and `demanded` decides which.
     ///
     /// Age alone is the right order only while every pane is live, because
@@ -340,14 +344,15 @@ impl MrmsFrameCache {
 /// product on screen age out.
 ///
 /// An entry count would be the wrong instrument here for a reason the model's
-/// six-entry cache does not have: an MRMS grid is thirteen times an HRRR grid,
-/// so "six" would mean 588 MB on a phone and 588 MB in a browser tab.
+/// six-entry cache does not have: an MRMS grid's ceiling is six and a half
+/// times an HRRR grid's, so "six" would mean 297 MB on a phone and 297 MB in a
+/// browser tab.
 struct MrmsGridCache {
     entries: HashMap<MrmsProduct, Arc<MrmsGrid>>,
     recency: RefCell<Vec<MrmsProduct>>,
     /// **Injected, not read from the constant.** The shipped handler passes
     /// [`GRID_CACHE_BYTES`]; a test passes a budget it can actually overflow.
-    /// A cache whose only budget was 49 MB × 4 could not have its eviction
+    /// A cache whose only budget was 49,496,648 B × 2 could not have its eviction
     /// policy exercised at all, and an untested eviction policy is how a cache
     /// settles at one entry and every other pane stops drawing.
     budget: usize,
@@ -820,7 +825,8 @@ impl FrameSource for MrmsHandler {
     /// throttle. The throttle is inside the task: it takes the gate before it
     /// touches the network, so the whole render set may be dispatched at once
     /// (which it is — `dispatch_loop_frame_fetches` has no throttle of its
-    /// own) while only one 49 MB-peak decode exists at a time.
+    /// own) while only one decode — 2.3 to 8.9 MB of tiled store — exists at a
+    /// time.
     fn fetch_frame(
         &self,
         ctx: &FetchConfig,
@@ -1277,7 +1283,7 @@ impl OverlayHandler for MrmsHandler {
 
     /// The [`Resident`](rasterize::GriddedInput::Resident) carry: an `Arc` clone
     /// of the resident mosaic, so describing the job costs a refcount and the
-    /// 49 MB never moves. The values memcpy happens only in the web encoder,
+    /// tiled store never moves. The values memcpy happens only in the web encoder,
     /// which knows the texture's bounds and writes the window's rows alone.
     ///
     /// **A named frame is drawn from that frame's own granule.** `ctx.frame`
@@ -1503,9 +1509,9 @@ impl OverlayHandler for MrmsHandler {
         })
     }
 
-    /// **Three blocks, and one 49 MB mosaic is the unit of all of them**: the
-    /// live cache's decoded products, the staged loop granules, and the buffer
-    /// [`staging`] is retaining between decodes.
+    /// **Three blocks**: the live cache's decoded products and the staged loop
+    /// granules, each a tiled mosaic of 2,349,256 to 8,942,280 B, and the
+    /// 224,000 B band [`staging`] is retaining between decodes.
     ///
     /// The pool is counted once even though both caches were handed it — they
     /// are handed the *same* pool, [`staging::global`] on every shipped path,
@@ -1552,7 +1558,8 @@ impl OverlayHandler for MrmsHandler {
     /// real re-fetch penalty for this is the model layer, whose run is good
     /// for an hour — and `ModelHandler::release_data` releases anyway, on the
     /// ground that "half a gigabyte held for a session by a layer nobody is
-    /// looking at" is not worth a refetch. The same ground reaches further
+    /// looking at" — the 512 MiB desktop budget of the time, 96 MiB now — is
+    /// not worth a refetch. The same ground reaches further
     /// down than that doc thought: it read this layer's ceiling off
     /// [`GRID_CACHE_BYTES`] at 98 MB, and 98 MB is not what a tiled mosaic
     /// costs — but a looping pane's 11,333,496 B

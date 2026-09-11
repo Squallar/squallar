@@ -557,8 +557,8 @@ pub fn base_km_msl_for_box_in(
 /// What one grid's index plane may occupy, bytes.
 pub const VOXEL_TEXTURE_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 
-/// 128 × 128 × 64 — one MiB of indices, for wasm's single worker and 4 GiB
-/// linear memory.
+/// 128 × 128 × 64 — one MiB of indices, for wasm's single worker and the 1 GiB
+/// linear memory the module is linked with.
 pub const WASM_SHAPE: VoxelShape = VoxelShape {
     nx: 128,
     ny: 128,

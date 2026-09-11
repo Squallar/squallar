@@ -80,7 +80,8 @@
 //!   coordinate array shuffles-and-deflates 813:1 (`lat`) and 161:1 (`lon`).
 //! - every global and per-variable attribute is the granule's own.
 //! - `data` is a synthetic band ramp — constant along each row, stepping one
-//!   count every 12 rows so the whole `0..=255` domain appears — with the real
+//!   count every 12 rows, so counts 0-249 appear over the 3000 rows and the
+//!   top six of the domain do not — with the real
 //!   LW equator reading planted at `(row 1499, column 2500)` and one
 //!   `_FillValue` planted at `(1000, 1000)`.
 //!

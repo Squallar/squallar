@@ -26,11 +26,13 @@
 //!
 //! # What the page costs
 //!
-//! A page is allocated in full and uploaded once — 2048x2048 RGBA is 16 MB of
-//! zeros — where the per-tile textures it replaces are uploaded as they
-//! arrive. That is a one-off against a per-frame saving, and the steady state
-//! is within 4% of what it replaces: a tile's own upload grows by its gutter
-//! (a 256x256 tile is written as 258x258).
+//! A page is allocated in full and uploaded once — at the shipped 256x256 tile
+//! that is 1806x1806 RGBA, 13,046,544 B of zeros (seven pitches of 258 a side;
+//! [`MAX_PAGE_SIDE`] 2048 is the cap it rounds down from, not the allocation) —
+//! where the per-tile textures it replaces are uploaded as they arrive. That is
+//! a one-off against a per-frame saving, and the steady state is the gutter
+//! exactly: a full page is 49 slots of 258x258 against 49 tiles of 256x256,
+//! +1.57 %.
 //!
 //! # The gutter, and why the page is not a round number
 //!

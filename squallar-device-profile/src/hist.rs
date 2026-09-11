@@ -4,8 +4,8 @@
 //! octave — plus one clamp bin under the floor and one at or over the ceiling,
 //! so no sample is ever unrepresentable. The span brackets every figure the
 //! frame instrument quotes: a 4 ms service bar sits mid-range with a bin width
-//! of 2¼ (≈19%) around it, and one 60 Hz frame (16.7 ms) is still four bins
-//! under the ceiling.
+//! of 2¼ (≈19%) around it, and one 60 Hz frame (16.7 ms) is still about eight
+//! bins — two octaves — under the ceiling.
 //!
 //! The shape is compile-time and the counts are `u32`, so a `Hist` is 176
 //! bytes, allocates nothing after construction, and takes no lock: it is
@@ -299,7 +299,7 @@ impl Hist {
 /// **Zero new clock reads**: the stamps the frame ledger folds were already
 /// taken on every presented frame; only the `record` calls left the interact
 /// arm. Two `Hist`s is 352 bytes per cut, so the sixty-six pairs cost
-/// **11 616 bytes** over the whole ledger — see `frame_ledger`'s module doc
+/// **23,232 bytes** over the whole ledger — see `frame_ledger`'s module doc
 /// for the bin-search count, which is unchanged on an interact frame and
 /// rises on an idle one to match it: 12 to 71, a 1.80x rise over a leg
 /// measured at 46.5 % interact frames.

@@ -29,13 +29,14 @@
 //!
 //! # What removing it saves
 //!
-//! **Also not the same number.** On the 640×480 arm the two round trips took
-//! 72.61 µs out of the gate segment — that segment goes to zero — but
-//! 40.86 µs of it came back in the **pump** segment, 200× that column's floor
-//! in the null control. The net is **49.94 µs per presented interact frame,
-//! 68.8 % of what was removed**, and it holds outside the ledger: cadence
-//! improved 49.4 µs once the null's −9.48 µs bias was subtracted, which
-//! agrees with the service figure.
+//! **Also not the same number, and the net is not the difference.** On the
+//! 640×480 arm the two round trips took 72.61 µs out of the gate segment —
+//! that segment goes to zero — while the **pump** segment read 40.86 µs,
+//! 200× that column's floor in the null control. The net is the paired
+//! whole-frame figure and not `72.61 − 40.86`: **49.94 µs per presented
+//! interact frame, 68.8 % of what was removed**, and it holds outside the
+//! ledger — cadence improved 49.4 µs once the null's −9.48 µs bias was
+//! subtracted, which agrees with the service figure.
 //!
 //! The general form is what keeps this from rotting again: **a segment
 //! falling to zero proves the work left that segment, not that its cost left

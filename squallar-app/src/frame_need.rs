@@ -65,9 +65,11 @@
 //! # Cost
 //!
 //! Per presented frame: one relaxed `swap`, one `u32` popcount-free bit test,
-//! and between three and six `u64` increments. Per cause, on the frames where
-//! one happens: one relaxed `fetch_or`. **No clock read and no bin search** —
-//! the counts [`crate::frame_ledger`]'s module doc pins are untouched.
+//! and two `u64` increments on an unnecessary frame or three to seven on a
+//! necessary one — one per raised cause of [`NeedCause`]'s five. Per cause, on
+//! the frames where one happens: one relaxed `fetch_or`. **No clock read and
+//! no bin search** — the counts [`crate::frame_ledger`]'s module doc pins are
+//! untouched.
 //!
 //! The wake claim is all but free: the predicates are the ones
 //! `handle_redraw` already asks to decide whether to post a redraw, asked in

@@ -51,11 +51,12 @@ use squallar_source::time::Residency;
 /// How long a pane's clock must name one unserved instant before that instant
 /// is asked for.
 ///
-/// The same 100 ms the overlay rasteriser treats as "the gesture is over" —
-/// `squallar_egui::overlay_cache::SETTLE_REPAINT_DELAY`, reused rather than
-/// re-chosen, so the app has one idea of when a hand has stopped moving. It is
-/// what keeps a drag that passes through many instants from asking for each of
-/// them, without putting a single frame of latency in the rail: the check is a
+/// The same 500 ms the tile pump's quiet latch treats as "the interaction is
+/// over" — `squallar_egui::overlay_cache::SETTLE_REPAINT_DELAY`, reused rather
+/// than re-chosen, so the app has one idea of when a hand has stopped moving.
+/// It is what keeps a drag that passes through many instants from asking for
+/// each of them, without putting a single frame of latency in the rail: the
+/// check is a
 /// binary search over one pane's frame list and the ask itself is a spawned
 /// task.
 pub(crate) const REFILL_SETTLE: std::time::Duration =

@@ -35,8 +35,8 @@ use squallar_device_profile::constants::MIRROR_MAX_SIDE;
 /// steps a tile is drawn smaller and more of them fit, so a cache sized on the
 /// whole-zoom count evicts tiles that are still on the glass.
 ///
-/// Memory: 4× the frame's texels is 16× its bytes, 126 MiB for a 1080p frame,
-/// which no arm of `VOLUME_MIRROR_BYTES_MAX` admits.
+/// Memory: a rung of 4 is 16× the frame's texels and so 16× its bytes — 126 MiB
+/// for a 1080p frame — which no arm of `VOLUME_MIRROR_BYTES_MAX` admits.
 ///
 /// The mirror covers the frame plus the off-screen floor strips, which one
 /// uniform translation keeps under twice the frame — at most one extra halving

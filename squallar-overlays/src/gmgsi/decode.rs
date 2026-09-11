@@ -432,7 +432,7 @@ fn read_whole(
 /// function of exactly those, so an equal fingerprint *is* an equal array.
 /// A granule whose stored arrays differ in one byte misses and is read and
 /// verified as the first one was. ~446 KB of stored bytes are compared per
-/// variable per decode; nothing is inflated.
+/// decode — ~74 KB for `lat` and ~373 KB for `lon`; nothing is inflated.
 ///
 /// One entry per variable, `try_lock` only, for the reasons the staging pool
 /// gives: the contenders are a live fetch and a frame fetch, contention is

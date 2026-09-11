@@ -147,7 +147,7 @@ mod tests {
     const HANDHELD_MAX: u64 = 512 * MIB;
 
     /// **The lines are a fraction of the instance's own ceiling, not of a
-    /// constant** — 768 and 891 MiB of a 1 GiB heap, 384 and 445 MiB of a
+    /// constant** — 768 and 891 MiB of a 1 GiB heap, 384 and 446 MiB of a
     /// 512 MiB one — and a reading is judged at, below and above each.
     ///
     /// # Why this pin reads differently than it used to

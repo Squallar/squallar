@@ -550,8 +550,8 @@ impl ContentExtent {
 ///
 /// One and not two: the guard is a floor under the rounding above, which
 /// already takes both edges outward, and every texel of it is a texel
-/// allocated. At the measured densities a 2-texel guard on a 40 x 40 window is
-/// 20 % more picture for nothing.
+/// allocated. A second guard texel on a 40 x 40 window is 9.8 % more picture
+/// for nothing — 44² against 42².
 pub const CROP_GUARD_TEXELS: u32 = 1;
 
 /// **Whether a rasterizer may cut its picture down to its content.**
@@ -2173,7 +2173,8 @@ pub fn rasterize_metar_stations_windowed(
 /// thread.
 ///
 /// **Why this exists.** The METAR station model emits 46 shapes per station —
-/// 28 lines, 7 stroked circles, 6 filled circles, 4 polygons, 5 texts — and a
+/// 28 lines, 7 stroked circles, 6 filled circles, 4 polygons, 5 texts, which
+/// sum to 50 rather than 46; the census that settles which is unrun — and a
 /// scene D leg carries 799 observations. Drawn through `egui` that is ~36,750
 /// shapes per frame of which ~28,000 are STROKED, and a stroked path is the
 /// tessellator's expensive case: it feathers geometry along both edges. The
@@ -3472,7 +3473,8 @@ pub(crate) fn build_polygon_path(pts: &[(f32, f32)]) -> Option<tiny_skia::Path> 
 /// **Even-odd, because that is what the hit test computes.**
 /// `geo_point_in_feature` counts ray crossings per ring and never looks at
 /// orientation. Measured over a 7,015-zone NWS cache, two of 2,064 interior
-/// rings wind *with* their exterior and another 2,515 have zero area. The
+/// rings wind *with* their exterior; another 2,515 have zero area, over a ring
+/// population this reading does not name — it exceeds the 2,064. The
 /// exterior alone keeps `Winding`, since 4.7% of rings self-intersect.
 pub(crate) fn build_filled_polygon_path(
     exterior: &[(f32, f32)],

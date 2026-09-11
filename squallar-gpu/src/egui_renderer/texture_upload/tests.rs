@@ -875,12 +875,11 @@ fn a_noted_page_is_four_bytes_on_the_queue_where_it_was_thirteen_megabytes() {
 /// of why the high-water mark exists beside the level.
 ///
 /// `upload pending` — the same quantity, published every frame and read by a
-/// census line every two seconds — is 97-99 % zeros with a p50 of 0.0 on a
-/// 420 s leg, because a picture crosses this queue in fewer frames than the
-/// tick. Its own census note carries the reproduction: "a 206.75 MiB raster
-/// crossed this queue between two samples and it read 0 B at all 100 ticks".
-/// A cut to the queue's simultaneous residency cannot be scored against a
-/// figure like that.
+/// census line every two seconds — reads differently on every arm: 0 B at all
+/// 100 ticks while a 206.75 MiB raster crossed, on the FLOOR legs its census
+/// note reproduces, against 26-32 % zeros with a p50 of 16.2-27.8 MiB on three
+/// 420 s six-pane HEAVY6 legs of one binary (2026-09-11). A cut to the queue's
+/// simultaneous residency cannot be scored against either.
 ///
 /// Three readings, and the third is the one a plain store would fail: an empty
 /// queue after a full one still answers what the full one held.

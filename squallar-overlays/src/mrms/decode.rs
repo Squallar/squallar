@@ -9,10 +9,10 @@
 //!
 //! ## The grid is built from section 3, never from `latlons()`
 //!
-//! [`SubMessage::latlons`] would work and would be wrong twice over. It
-//! materialises a `(lat, lon)` pair per point — **392 MB** at 24.5 M points —
-//! and the only [`GridCoords`] arm it can be poured into is
-//! [`GridCoords::Explicit`], which answers `None` from both `index_bounds` and
+//! [`SubMessage::latlons`] would work and would be wrong twice over. It yields
+//! its pairs lazily off two axis vectors, but the only [`GridCoords`] arm it
+//! can be poured into is [`GridCoords::Explicit`] — one `f64` pair per point,
+//! **392 MB** at 24.5 M points — which answers `None` from both `index_bounds` and
 //! `cell_span_degrees`. That sends `rasterize`'s `projection_window` back to the
 //! full grid, so every pane would project all 24.5 M points on every re-render.
 //! [`regular_grid`] reads the same seven numbers off section 3 instead.
@@ -353,7 +353,7 @@ pub struct RawGrid {
     /// In the grid's own scanning order, with `missing` already mapped to
     /// `f32::NAN` — as a reading, whichever width the store is in.
     ///
-    /// [`GridValues::Scaled`] for every granule MRMS actually publishes; see
+    /// [`GridValues::Tiled`] for every granule MRMS actually publishes; see
     /// [`parse_grib2_raw_in`] for when it is not.
     pub values: GridValues,
 }

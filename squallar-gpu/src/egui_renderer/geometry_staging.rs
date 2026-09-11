@@ -61,10 +61,10 @@ use crate::staging_ring::{Ring, device_has_ring};
 ///
 /// 64 MiB. Measured on native scene A (2026-09-02, `frame prep geometry:`
 /// running totals differenced across two-second reports): the heaviest window
-/// staged 32.6 MB per `update_buffers` call, so this is a shade under 2x the
+/// staged 32.6 MB per `update_buffers` call, so this is a shade over 2x the
 /// worst frame that shape has produced. At
 /// [`crate::staging_ring::STAGING_RING_DEPTH`] slots it bounds this path's
-/// pinned host memory at 128 MiB, against the 16.9 MiB the texture ring holds.
+/// pinned host memory at 128 MiB, against the 16.0 MiB the texture ring holds.
 pub const MAX_STAGED_GEOMETRY_BYTES: u64 = 64 << 20;
 
 /// How coarsely a ring slot is sized.

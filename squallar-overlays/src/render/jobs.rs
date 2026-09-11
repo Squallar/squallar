@@ -451,7 +451,8 @@ impl JobOutCodec for ReportsJob {
 /// **The last layer to leave the frame thread.** Every other data overlay
 /// already rasterizes into a picture; METAR alone drew per station through
 /// `egui`, and a scene D leg carries 799 of them at 46 shapes each — 28 lines,
-/// 7 stroked circles, 6 filled circles, 4 polygons and 5 texts. Measured on a
+/// 7 stroked circles, 6 filled circles, 4 polygons and 5 texts, which sum to
+/// 50 rather than 46; the census that settles which is unrun. Measured on a
 /// 175 Hz leg that was 98,815 vertices and 401,072 indices staged EVERY FRAME,
 /// with `epaint::tessellator::stroke_and_fill_path` the largest symbol in the
 /// app, for observations that change every twenty minutes.
@@ -1668,8 +1669,9 @@ pub fn decode_raster_reply_split(
 /// the `Vec<Color32>` the consumer takes by move, and the head is BORROWED
 /// across that build — `offload::deliver_encoded_reply` binds it and passes
 /// `&head` — so both are live at the same instant. Measured on the rig's
-/// software arm, 2878x1566: 39,526,454 B and 39,526,452 B, 75.4 MiB for one
-/// picture, against a page whose whole linear high-water was 225-264 MiB.
+/// software arm, 2878x1566 CSS px at a device pixel ratio this reading does not
+/// name: 39,526,454 B and 39,526,452 B, 75.4 MiB for one picture, against a
+/// page whose whole linear high-water was 225-264 MiB.
 ///
 /// **The picture cannot be copied straight from the worker's view into the
 /// `Vec<Color32>` while it lives here, and the reason is alignment rather than
@@ -1708,7 +1710,8 @@ pub fn decode_raster_reply_split(
 /// of the head was 39,526,454 B and the `Vec<Color32>` built out of it
 /// 39,526,452 B, both live at once because `deliver_encoded_reply` binds the
 /// head and passes it by borrow across the decode — 75.4 MiB for one picture,
-/// against a measured page peak of 828-830 MiB.
+/// against a measured page peak of 828-830 MiB — a different leg from the
+/// 225-264 MiB above, and the two are not reconciled.
 ///
 /// Three other routes are recorded as refused rather than left to be
 /// re-derived. Freeing the head before the pixels are allocated is impossible,

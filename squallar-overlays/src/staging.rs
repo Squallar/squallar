@@ -336,9 +336,9 @@ impl<T: Copy> StagingPool<T> {
     /// the source, and a memory governor's tier-2 pressure step. Both want the
     /// same thing — the grid-sized block the slot is holding while nothing is
     /// decoding handed back to the allocator — and neither has to know the
-    /// other exists or to have run first. Two sources retain a grid apiece
-    /// (GMGSI 15 MB, MRMS 49 MB), so this is ~64 MB resident whether or not
-    /// anything is decoding.
+    /// other exists or to have run first. The two shipped slots retain a
+    /// 15,000,000 B GMGSI grid and a 224,000 B MRMS tile-row band, so this is
+    /// 15,224,000 B resident whether or not anything is decoding.
     ///
     /// `false` means nothing was released: the slot was empty, or —
     /// vanishingly rarely — a decode held the lock. **`try_lock`, never
@@ -363,9 +363,11 @@ impl<T: Copy> StagingPool<T> {
     /// the other case: it runs on the frame thread on an ordinary tick, so the
     /// free belongs on `squallar_worker::offload`'s lane and the block has to
     /// leave here still owned. Measured on this workspace's own box, dropping
-    /// both shipped blocks (64,000,000 B) is 0.218-0.467 ms over twelve
-    /// samples — small, and still not something an interaction frame should be
-    /// asked to spend when a lane exists that need not.
+    /// both shipped blocks is 0.218-0.467 ms over twelve samples — taken when
+    /// they summed to 64,000,000 B, and queued for re-timing at the
+    /// 15,224,000 B they sum to now — small, and still not something an
+    /// interaction frame should be asked to spend when a lane exists that need
+    /// not.
     ///
     /// `None` means nothing was retained, or — vanishingly rarely — a decode
     /// held the lock. `try_lock`, never `lock`, for the reason [`Self::take`]
@@ -488,10 +490,11 @@ impl<T: Copy> StagingPool<T> {
 /// cannot coalesce. A wall that has already been hit is not that case.
 ///
 /// **What it gives back**, at the shapes the two shipped slots retain:
-/// 49,000,000 B on MRMS and 15,000,000 B on GMGSI — 64,000,000 B (61.0 MiB)
-/// when both are parked. For scale, `overlay grids` read 155,776,456 B on the
-/// wasm32 page of the Tier-2 `huge` Firefox leg at tip `651d289d1`, of which
-/// the MRMS block alone is 31.5 %; the page was refusing allocations at 978 of
+/// 224,000 B on MRMS — one [`crate::mrms::CONUS_BAND_BYTES`] tile-row band —
+/// and 15,000,000 B on GMGSI, so 15,224,000 B (14.52 MiB) when both are
+/// parked. For scale, `overlay grids` read 155,776,456 B on the wasm32 page of
+/// the Tier-2 `huge` Firefox leg at tip `651d289d1`, of which the MRMS *plane*
+/// was 31.5 % before the store went tiled; the page was refusing allocations at 978 of
 /// its 1024 MiB when it died. `tests/overlay_grid_residency_split.rs` prices
 /// the family's three holders and this lever against them.
 ///

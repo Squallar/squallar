@@ -1234,10 +1234,10 @@ fn retain_frames_drops_this_products_unkept_granules_and_no_others() {
 /// **The gate serialises, and it releases.** `MrmsHandler::fetch_frame`'s doc
 /// claims the whole render set may be dispatched at once while only one
 /// granule is ever in flight; this is the floor under that claim. The stakes
-/// are higher than GMGSI's: the staging slot holds one 49 MB values vector and
-/// every decode that misses it allocates its own, so thirty concurrent fetches
-/// — one slider-default hour — would be ~1.5 GB in flight before any cache saw
-/// a byte.
+/// are higher than GMGSI's: the staging slot holds one 224,000 B tile-row band
+/// and every decode that misses it allocates its own store, so thirty
+/// concurrent fetches — one slider-default hour — would be 70 to 268 MB in
+/// flight before any cache saw a byte.
 ///
 /// Two fetch tasks are driven by hand inside one thread — `futures::poll!`
 /// with `yield_now` turns between, so "the second gets N chances" is a poll

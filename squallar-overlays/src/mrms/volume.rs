@@ -110,7 +110,7 @@
 //!   "there are none" as an ordinary case rather than as an error.
 //! * **Download is 13–45 MB per timestep against a ~120 s cadence.** Continuous
 //!   ingest is 0.1–0.4 MB/s sustained.
-//! * Still **97 to 99 % of the stack is not a reading at all** — the sparsity
+//! * Still **94 to 99 % of the stack is not a reading at all** — the sparsity
 //!   the whole track rests on is real. It is *how much* of the remainder to
 //!   budget for that the August week got wrong, not whether the field is sparse.
 //!
@@ -244,9 +244,10 @@ pub const MISSING_CODES: [f32; 2] = [-999.0, -99.0];
 /// One stacked timestep's values, in bytes: 33 × 7000 × 3500 `f32` =
 /// **3 234 000 000**.
 ///
-/// Stated so that nothing has to derive it in a hurry. It is **33× the whole
-/// wasm arm of [`GRID_CACHE_BYTES`](super::GRID_CACHE_BYTES)** — two 49 MB
-/// products, 98 MB — and it does not fit in a wasm32 address space at all.
+/// Stated so that nothing has to derive it in a hurry. It is **32.7× the whole
+/// wasm arm of [`GRID_CACHE_BYTES`](super::GRID_CACHE_BYTES)** — two tiled
+/// mosaic ceilings, 98,993,296 B — and it does not fit in a wasm32 address
+/// space at all.
 /// Nothing in this module is reachable from a render path, and this constant
 /// is the reason.
 ///
@@ -280,17 +281,18 @@ const _: () = assert!(CONUS_STACK_BYTES == 3_234_000_000);
 
 /// How many level GETs are in flight at once.
 ///
-/// A ceiling on **peak memory**, not on politeness. Every level decode needs a
-/// 49 MB values vector and `super::staging`'s slot holds exactly one, so all
-/// but one of the concurrent decodes allocates its own; the stack being filled
-/// is already [`CONUS_STACK_BYTES`], so the peak is
-/// `CONUS_STACK_BYTES + STACK_FETCH_CONCURRENCY × 49 MB` — ~3.4 GB at four,
-/// ~6.4 GB if all 33 ran at once.
+/// A ceiling on **peak memory**, not on politeness. Every level decode builds
+/// its own tiled store — 2,349,256 to 8,942,280 B over the 28-granule corpus —
+/// and `super::staging`'s slot holds one 224,000 B band, so the slot spares no
+/// concurrent decode its own allocation; the stack being filled is already
+/// [`CONUS_STACK_BYTES`], so the peak is `CONUS_STACK_BYTES +
+/// STACK_FETCH_CONCURRENCY × one tiled granule` — 3.24-3.27 GB at four,
+/// 3.31-3.53 GB if all 33 ran at once.
 ///
-/// The figure was `× 147 MB` while `super::decode` also held grib's 49 MB PNG
-/// image buffer for the length of a decode. The row walk removed that half; it
-/// did **not** remove the values vector, which is what this constant really
-/// bounds.
+/// The figure was `× 147 MB` while the store was a flat `f32` plane and
+/// `super::decode` also held grib's 49 MB PNG image buffer for the length of a
+/// decode. The row walk removed that half and the tiler removed the plane; what
+/// this constant bounds is the concurrent decodes' own stores.
 pub const STACK_FETCH_CONCURRENCY: usize = 4;
 
 /// How many level *listings* are in flight at once.

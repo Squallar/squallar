@@ -289,7 +289,8 @@ const _: () = {
 /// ask for the slot in the meantime.
 ///
 /// **Thirteen resident granules would be 195,000,000 B** (185.97 MiB) against
-/// a 96 MiB wasm model pool and a 56 MiB wasm loop pool — 1.94x and 3.32x over.
+/// a 64 MiB wasm model grid budget and a 56 MiB wasm loop pool floor — 2.91x
+/// and 3.32x over.
 /// A grid-holding loop is not a smaller version of this design, it is an
 /// infeasible one.
 pub const FRAME_STAGING_BYTES: usize = GLOBAL_GRANULE_BYTES;
@@ -1779,8 +1780,9 @@ impl OverlayHandler for GmgsiHandler {
     /// a granule the next poll replaces on arrival. The layer whose data is
     /// good for longest is the model layer at 3600 s, and
     /// `ModelHandler::release_data` releases everything — "half a gigabyte
-    /// held for a session by a layer nobody is looking at" is not worth a
-    /// refetch, and neither is 75 MB.
+    /// held for a session by a layer nobody is looking at", the 512 MiB desktop
+    /// budget of the time and 96 MiB now, is not worth a refetch, and neither
+    /// is 75 MB.
     ///
     /// **The way back is covered on both routes.** `OverlayState::release_data`
     /// clears the poll clock and bumps the generation; `has_data` reads the

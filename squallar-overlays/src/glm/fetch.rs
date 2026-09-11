@@ -80,7 +80,7 @@ pub struct GlmCache {
     /// `retained_points` is beside its slot: the reader is the frame thread's
     /// telemetry tick, the map is behind a `Mutex` a poll holds while it
     /// writes back, and a reader that missed the lock would have to answer a
-    /// false **zero** on a store of up to 12 MB. A missing family shows up in
+    /// false **zero** on a store of up to 10,000,000 B. A missing family shows up in
     /// the census residual; a false zero does not.
     ///
     /// Maintained at every site that adds or removes a granule and **nowhere
@@ -137,9 +137,10 @@ pub const MAX_RETAINED_FLASHES: usize = 250_000;
 /// measures the bodies: a 45-object batch reads 6,970,916–8,415,961 B under
 /// this cap and 17,235,745–17,840,225 B without it.
 ///
-/// **Justified, not derived.** MRMS holds four because one slot there is a
-/// 49 MB values vector; a GLM slot is 175× smaller, so the same politeness
-/// budget buys far more of them, and nothing measured here says where the
+/// **Justified, not derived.** MRMS holds four because one concurrent decode
+/// there builds its own tiled mosaic of up to 8,942,280 B, 32× a GLM body, so
+/// the same politeness
+/// budget buys far more of these, and nothing measured here says where the
 /// latency curve of a cold poll turns over. What the figure above does is make
 /// the cost of the number sayable, which a bare `20` at the call site could
 /// not.
@@ -528,7 +529,7 @@ impl GlmCache {
 /// behind the `Mutex` a poll holds while it clones the cache out and writes it
 /// back; the level is an atomic beside it. A census on the frame thread's
 /// telemetry tick may not block, and the two lock-free alternatives are both
-/// worse than the atomic: `try_lock` answers a **false zero** on a 12 MB store
+/// worse than the atomic: `try_lock` answers a **false zero** on a 10,000,000 B store
 /// whenever a poll is writing back, and a false zero is worse than a missing
 /// family — the missing one shows up in the residual. Same shape, same reason,
 /// as [`crate::staging::StagingPool`]'s `retained_points`.

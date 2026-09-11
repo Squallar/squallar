@@ -468,7 +468,7 @@ impl JobSpec for DecodeJob {
 
     /// **The archive itself, lent rather than written.**
     ///
-    /// This row's whole message IS the downloaded volume — 0.34-17.96 MB,
+    /// This row's whole message IS the downloaded volume — 0.34-17.96 MiB,
     /// median 5.56 MB over the 208 real volumes `volume_inventory` measures
     /// against — and [`Self::encode`] memcpy'd every byte of it into a wire
     /// buffer at the dispatch site, on the FRAME THREAD. The page already
@@ -518,7 +518,7 @@ impl JobSpec for DecodeJob {
 
     /// **The archive is not copied to decode it.** This read
     /// `decode_bytes(input.archive.as_ref().clone())`, which duplicated the
-    /// whole volume — 0.34–17.96 MB, median 5.56 MB — for the length of the
+    /// whole volume — 0.34–17.96 MiB, median 5.56 MiB — for the length of the
     /// decode, on up to `Budgets::concurrent_renders` decodes at once, purely
     /// because `decode_bytes` needs an owned buffer and `run` only ever sees a
     /// `&DecodeJob`. `decode_shared` takes the pointer the funnel already moved.

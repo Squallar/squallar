@@ -29,8 +29,8 @@
 //! native arm on scene A at one pane, against a frame's own submission of
 //! 149 us.
 //!
-//! A raster fills top-down over the frames its bands take (7 frames for 7362² on
-//! a ring device) and this module cannot hold it back — egui mints a fresh
+//! A raster fills top-down over the frames its bands take (27 bands, 14 frames,
+//! for 7362² on a ring device) and this module cannot hold it back — egui mints a fresh
 //! `TextureId` per `load_texture`. The drain must therefore keep asking for
 //! frames: the app runs on `ControlFlow::Wait`, so "there will be another frame"
 //! is not something it may assume.
@@ -54,7 +54,7 @@ use resident::ResidentTextures;
 /// 8 MiB: what `write_texture` moves in 4.0 ms at the measured 2.1 GB/s through
 /// the BAR window, a quarter of a 16.7 ms frame. Every band costs at most that
 /// much frame thread whichever route it takes, so the DMA path can fall back to
-/// `write_texture` mid-raster. Two slots of 8 MiB is 16.9 MiB of pinned host
+/// `write_texture` mid-raster. Two slots of 8 MiB is 16.0 MiB of pinned host
 /// memory against the 437 MB an un-banded ring would need.
 ///
 /// **That 16.7 ms is a 60 Hz frame, and this application aims at
@@ -65,8 +65,8 @@ use resident::ResidentTextures;
 /// figure as a **blocking** allowance. Two places used it as one:
 /// [`whole_budget`], which no longer does, and [`DECLINE_PATIENCE`]'s
 /// fallback, which still writes a whole 8 MiB band with `write_texture` when
-/// the ring has refused four frames running — 3.8 ms at the 2.1 GB/s below,
-/// which is nearly the whole bar on one frame. That path is bounded by
+/// the ring has refused four frames running — 4.0 ms at the 2.1 GB/s below,
+/// which is the whole bar on one frame. That path is bounded by
 /// nothing here and re-sizing it is a re-sweep of the ring slot, not a
 /// re-spelling of this line.
 pub const UPLOAD_BAND_BYTES: usize = 8 << 20;
@@ -320,8 +320,8 @@ const _: () = {
 ///   buffers**, chosen because a slot claimed on a frame cannot be handed back
 ///   on that frame.
 ///
-/// Their product on a ring device was 16 MiB, which is **7.6 ms** at
-/// [`BAR_WRITE_BYTES_PER_SEC`] — nearly twice
+/// Their product on a ring device was 16 MiB, which is **7.99 ms** at
+/// [`BAR_WRITE_BYTES_PER_SEC`] — almost exactly twice
 /// [`squallar_device_profile::constants::TARGET_FRAME_SERVICE`]. Nobody chose
 /// 7.6 ms; it fell out. A third staging buffer, a change with nothing to do
 /// with the frame thread, would silently have made this route 50% more
@@ -350,7 +350,7 @@ const _: () = {
 /// over 56 pan speeds, and this follows the sweep rather than re-deciding it.
 /// The same arithmetic as the ring arm would say ~1 MiB there (a quarter of
 /// 4 ms at the ~1 GB/s out of wasm linear memory the section above prices);
-/// taking it would halve a web frame's worst blocking spend and would delay
+/// taking it would quarter a web frame's worst blocking spend and would delay
 /// basemap tiles after a pan, and **no frame-time instrument exists on either
 /// web target** to say which wins — `run_tier2.sh` gates behaviour, not
 /// milliseconds. So it is stated here and not taken.
@@ -544,7 +544,7 @@ impl UploadTotals {
 pub struct TextureUploads {
     /// Built **eagerly**, at construction, on a device that can have one: the
     /// first upload through a cold ring measured 10.04 ms against 1.4 ms for
-    /// later ones (two buffer creations, two `map_async`es and 16.9 MiB of
+    /// later ones (two buffer creations, two `map_async`es and 16.0 MiB of
     /// first-touch page faults).
     ring: Option<Ring>,
     /// Whether this device could have a ring at all. See
@@ -580,15 +580,15 @@ pub struct TextureUploads {
     /// of this renderer.
     ///
     /// The level itself is a level, published every frame and read by a census
-    /// line every two seconds — and a picture crosses this queue in fewer
-    /// frames than that, so the sampled family is 97-99 % zeros with a p50 of
-    /// 0.0 and its whole-leg maximum is a lottery over which transient a tick
-    /// happened to land on. Its own census note already says so
-    /// (`squallar_egui::heap_census`'s `UPLOAD_PENDING_BYTES`: "a 206.75 MiB
-    /// raster crossed this queue between two samples and it read 0 B at all
-    /// 100 ticks"). **This is the figure that cannot miss one**, on the same
-    /// argument `squallar_alloc::live_peak_bytes` is built on: a maximum taken
-    /// where the quantity moves rather than on a clock.
+    /// line every two seconds, and what that sampling reads depends on the arm.
+    /// On the FLOOR legs a 206.75 MiB raster crossed between two samples and it
+    /// read 0 B at all 100 ticks (`squallar_egui::heap_census`'s
+    /// `UPLOAD_PENDING_BYTES`); on three 420 s six-pane HEAVY6 legs of one
+    /// binary (2026-09-11, 330-384 s window) the same family is 26-32 % zeros
+    /// with a p50 of 16.2-27.8 MiB. Neither that median nor the whole-leg
+    /// maximum is quotable alone, so **this is the figure that cannot miss
+    /// one**, on the same argument `squallar_alloc::live_peak_bytes` is built
+    /// on: a maximum taken where the quantity moves rather than on a clock.
     ///
     /// Taken once per [`Self::apply`], between the file loop and the drain,
     /// which is exactly where a frame's queue is at its largest: [`Self::file`]

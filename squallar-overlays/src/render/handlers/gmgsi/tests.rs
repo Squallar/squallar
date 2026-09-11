@@ -1054,8 +1054,8 @@ fn a_named_frame_is_rasterized_from_that_frames_granule_and_not_the_panes() {
 ///
 /// The byte arithmetic, with its denominator: **one mosaic is
 /// `3000 * 5000 * 1` = 15,000,000 B (14.31 MiB)**, so thirteen resident would
-/// be 195,000,000 B (185.97 MiB) — against a 96 MiB wasm model pool and a
-/// 56 MiB wasm loop pool, 1.94x and 3.32x over. The loop's own storage is thirteen *textures* at
+/// be 195,000,000 B (185.97 MiB) — against a 64 MiB wasm model grid budget and
+/// a 56 MiB wasm loop pool floor, 2.91x and 3.32x over. The loop's own storage is thirteen *textures* at
 /// 11.06 MB for a 1280x960-point pane, which is a different budget in a
 /// different crate.
 ///
