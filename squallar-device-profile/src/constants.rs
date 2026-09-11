@@ -960,11 +960,16 @@ pub const DESKTOP_LOOP_DECODED_CEILING_BYTES: usize = 256 * 1024 * 1024;
 ///
 /// An archive is not slack. It is two things at once:
 ///
-/// 1. **The cheapest retention this application has.** Measured over 39
-///    Archive II volumes of the 171-file `/home/reddragon/nrot-synth` corpus,
-///    an archive is 2.93 / 6.45 / 25.09 % (min / median / max) of the decoded
-///    volume it stands in for — a median **15.5x leverage**. Nothing else in
-///    the census returns a volume for 6 % of its bytes.
+/// 1. **The cheapest retention this application has** — though by 2.85x and
+///    not by the 15.5x this paragraph claimed until 2026-09-11. That figure
+///    came from 39 volumes of the 171-file `/home/reddragon/nrot-synth`
+///    corpus, which is SYNTHESISED; re-measured per volume over the whole of
+///    it the leverage is 10.99x, and over the 208-file `rd-t18-seam-corpus` of
+///    real Archive II volumes — the corpus every other figure on this constant
+///    uses, and the kind of data the loop actually decodes — an archive is
+///    12.9 / 35.1 / 53.5 % (min / median / max) of the decoded volume, a
+///    median **2.85x leverage**. Still the cheapest retention in the census,
+///    and 5.4x less cheap than the prose said.
 ///
 /// 2. **The precondition for evicting the DECODED half at all.** Both of the
 ///    policies that reclaim decoded volumes (they live in `squallar-radar`,
@@ -974,11 +979,12 @@ pub const DESKTOP_LOOP_DECODED_CEILING_BYTES: usize = 256 * 1024 * 1024;
 ///    by design: their cost is a decode, and for a volume with nothing to
 ///    decode from they would silently become a re-download policy.
 ///
-/// Put together: **taking an archive strands the 15.5x-larger decoded volume
-/// as permanently un-evictable.** Lowering this ceiling frees a median 2.9 MiB
-/// and can cost a median 45.0 MiB that no later pass is allowed to reclaim, so
-/// the arithmetic runs the wrong way and the loss is not recoverable inside
-/// the process. On a six-site scene this ceiling is already binding, which
+/// Put together: **taking an archive strands the 2.85x-larger decoded volume
+/// as permanently un-evictable.** Lowering this ceiling frees a median
+/// 5.58 MiB and can cost a median 15.98 MiB that no later pass is allowed to
+/// reclaim, so the arithmetic still runs the wrong way — by 2.85:1 and not by
+/// the 15.5:1 the synthetic corpus gave — and the loss is not recoverable
+/// inside the process. On a six-site scene this ceiling is already binding, which
 /// means the stranding is not hypothetical.
 ///
 /// # What lifted it on desktop
@@ -1001,28 +1007,64 @@ pub const DESKTOP_LOOP_DECODED_CEILING_BYTES: usize = 256 * 1024 * 1024;
 /// archive would be dropped, and the volume would strand exactly as before.
 /// That is why the two are tied here rather than tuned apart.
 ///
-/// # Why 96 MiB on desktop, and what it protects
+/// # Why 96 MiB on desktop, what it protects, and where it is short
 ///
-/// With a spill, a withdrawal hands the decoder a fresh buffer that is never
-/// re-filed here, so this ceiling no longer has to cover the decode path at
-/// all. What it buys is **avoiding a medium round-trip for the archives most
-/// likely to be asked again**, which are the playhead's and its one lookahead
-/// ([`LOOP_DECODED_LOOKAHEAD_FRAMES`] is `Some(1)` on desktop) at every
-/// looping site. Six sites is twelve archives: 70,150,188 B at the 208-corpus
-/// median of 5,845,849 B, or 66.9 MiB. 96 MiB holds that with room for the
-/// tail, and it holds five archives at the corpus MAXIMUM of 18,831,036 B
-/// (94,155,180 B, 89.8 MiB), so a scene of unusually large volumes keeps its
-/// whole in-flight set resident too.
+/// What this ceiling buys is **avoiding a medium round-trip for the archives
+/// most likely to be asked again**, which are the playhead's and its one
+/// lookahead ([`LOOP_DECODED_LOOKAHEAD_FRAMES`] is `Some(1)` on desktop) at
+/// every looping site. Six sites (`budget::MAX_PANES_DESKTOP`) is twelve
+/// archives, and **twelve archives is a distribution and not a product**.
+/// Sampled from the 208-file real-archive corpus, the sum of twelve is
 ///
-/// Below ~67 MiB the sixth site's lookahead would round-trip on every playback
-/// wrap, which is the one case where the restore cost recurs predictably
-/// instead of rarely. That cost is measured and small, but NOT for the reason
-/// this paragraph gave until 2026-09-10: the cold read is 26 % of the bzip2
-/// decode at the corpus minimum and 134 % of it at the maximum (1.23 ms
-/// against 4.7 ms, 55.18 ms against 41.3 ms), so a restore is I/O-bound and
-/// the whole of it is tens of milliseconds. `squallar_radar::archive_spill`
-/// carries the table and retracts the 19.3-915.8 ms decode column this cited.
-/// It is still a cost, and still the reason this is 96 MiB and not 0.
+/// | p50 | p90 | p99 | corpus max |
+/// |---|---|---|---|
+/// | 73.3 MiB | 90.0 MiB | 104.9 MiB | 135.2 MiB |
+///
+/// so 96 MiB covers the working set on about 95.6 % of independent scenes and
+/// **is exceeded on the other 4.4 %**. A real six-pane scene is not twelve
+/// independent draws — panes tend to sit on one weather system, so the sizes
+/// correlate — and a perfectly correlated scene wants 12x one volume:
+/// 66.9 MiB at the corpus median but **131.6 MiB at its p90** and 215.5 MiB
+/// at its maximum. The figure this paragraph used to argue from, 12 x the
+/// median = 66.9 MiB, is the p50 of the correlated case and describes neither
+/// tail.
+///
+/// **So 96 MiB is safe by tightness and not by distance**, which is the shape
+/// of bound this campaign does not trust. It is recorded rather than changed
+/// here: raising it to 128 MiB clears the independent case outright and the
+/// correlated case up to a p88 volume, and costs 32 MiB of the 144 MiB the
+/// lowering banked.
+///
+/// # What a ceiling under the working set actually costs, measured
+///
+/// Not what this comment said before 2026-09-11. It claimed a withdrawal
+/// "hands the decoder a fresh buffer that is never re-filed here, so this
+/// ceiling no longer has to cover the decode path at all". **The buffer is
+/// re-filed.** `LoopDownloadManager::withdraw_spilled` does not re-file, and
+/// says so, but the decode-completion path does: every decode returns its
+/// archive and the app calls `cache_archive`, which files it on the heap and
+/// deletes the spilled copy. The next pass over this ceiling then spills it
+/// again. An archive under a tight ceiling therefore cycles
+/// heap -> medium -> heap for as long as its frame keeps being re-decoded,
+/// and this ceiling does cover the decode path after all.
+///
+/// Driving both ceilings and the decode pump directly, 24 frames over 40
+/// rounds, the cycle is entirely conditional on the DECODED ceiling: with it
+/// above the frame count an archive is spilled once and never again (1-23
+/// spills in total across archive ceilings from 24 archives down to 2 — one
+/// per archive the ceiling displaced, 0 restores), and with it below, the
+/// same archive ceilings spill 12-22 times
+/// per round (481-881 spills, one restore each). This ceiling does not create
+/// the treadmill and cannot stop it; it sets how many archives ride it.
+///
+/// The recurring cost is the decode and not this medium: over the 208-file
+/// corpus a bzip2 decode is 5.05 / 17.23 / 41.70 ms (min / median / max)
+/// against a spill write of 0.08 / 0.79 / 2.36 ms and a cold read of
+/// 1.12 / 11.21 / 27.14 ms, all at loadavg 2.75. Raising this ceiling removes
+/// the write and the read from each cycle — 41 % of it at the median — and
+/// leaves the decode, so it buys a discount on a treadmill rather than an end
+/// to one. See `squallar_radar::archive_spill` for the table and its
+/// retractions.
 ///
 /// The lever for a smaller archive total is the FRAME LIST the archives
 /// follow, not this number. That list is bounded by a count

@@ -161,10 +161,12 @@ pub struct LoopDownloadManager {
     /// from**, keyed exactly as [`scan_cache`](Self::scan_cache) is.
     ///
     /// Held so that re-obtaining a volume the decoded cache has evicted is a
-    /// DECODE rather than a network round trip. Measured over 39 archive
-    /// volumes: a decoded volume is 33.7-82.7 MiB and the archive it came
-    /// from is 1.0-16.1 MiB, a median ratio of 17.1x, so holding the
-    /// compressed form instead costs a median 5.8 % of the decoded one.
+    /// DECODE rather than a network round trip. Over the 208-file real
+    /// Archive II corpus a decoded volume is 0.8-41.4 MiB and the archive it
+    /// came from is 0.34-18.0 MiB, a median ratio of **2.85x**, so holding the
+    /// compressed form instead costs a median 35 % of the decoded one. The
+    /// 17.1x / 5.8 % this used to quote is the synthetic `nrot-synth` corpus's
+    /// answer carried onto a real one; see `crate::archive_spill` for both.
     ///
     /// **Two paths file here, and the chunk feed is not one of them.** The
     /// loop's own downloads file the archive they fetched; the archive drain's
@@ -926,6 +928,18 @@ impl LoopDownloadManager {
     /// point of the spill is that these bytes are not on the heap, and the job
     /// funnel moves the `Arc` by pointer and drops it when the decode lands.
     /// Re-filing it here would undo the cut on the next pass.
+    ///
+    /// **And the intent is defeated one layer up, so do not read this as a
+    /// guarantee that a withdrawn archive stays off the heap.** The decode
+    /// this withdrawal feeds returns the same buffer to the app, which files
+    /// it with [`Self::cache_archive`] — on the heap, deleting the spilled
+    /// copy — so the next pass over the byte ceiling spills it again. A frame
+    /// that keeps being re-decoded therefore cycles heap -> medium -> heap
+    /// indefinitely, at one write and one read a lap. Nothing here can stop
+    /// that: what decides whether a frame keeps being re-decoded is the
+    /// DECODED ceiling and the pump, not this one. It is visible as
+    /// [`Self::spill_counts`]' first figure growing without bound against a
+    /// flat resident count.
     fn withdraw_spilled(&self, site: &str, ts: &chrono::NaiveDateTime) -> Option<Arc<Vec<u8>>> {
         use std::sync::atomic::Ordering::Relaxed;
         if !self.is_spilled(site, ts) {
@@ -1101,7 +1115,7 @@ impl LoopDownloadManager {
     /// check at all, which is right, because those volumes are on screen. The
     /// consequence was not: a cache pushed past the ceiling by arrivals it
     /// cannot refuse stayed past it, and the loop's own frames — which *can*
-    /// be traded for their archives at a median 5.8 % of the decoded cost —
+    /// be traded for their archives at a median 35 % of the decoded cost —
     /// were never asked to make the room.
     ///
     /// The archive half has had this bound since `d5b2dbe4e`
@@ -1587,7 +1601,7 @@ impl LoopDownloadManager {
             }
             // **Off the heap rather than gone.** A spilled archive is still a
             // way back, so the decoded volume it stands behind — a median
-            // 15.5x larger — stays evictable instead of being stranded
+            // 2.85x larger — stays evictable instead of being stranded
             // un-evictable, which is what dropping it does. The archive
             // identity therefore STAYS: it is the index the way back is found
             // through, and only a real drop may take it.
@@ -3724,6 +3738,105 @@ mod archive_tests {
     use super::tests::{priced_volume, ts, volume};
     use super::*;
 
+    /// **A spilled archive is not spilled twice while its frame stays
+    /// decoded.** The count must not grow with the number of pump rounds.
+    ///
+    /// The byte ceiling, the decoded ceiling and the decode the pump
+    /// dispatches off the back of them form a cycle: an archive the ceiling
+    /// puts on the medium is withdrawn to re-decode its frame, and the
+    /// decode-completion path files that same buffer back on the heap, where
+    /// the next ceiling pass spills it again. Whether the cycle turns is
+    /// decided entirely by the DECODED ceiling — this asserts the healthy
+    /// half, which is that the byte ceiling on its own never turns it.
+    ///
+    /// **The other half has no gate.** Driven the same way with the decoded
+    /// ceiling below the frame count, the same archive ceilings re-spill 12-22
+    /// archives per round instead of none; that is a live defect and pinning
+    /// it here would make it the spec.
+    ///
+    /// TAMPER: drop the decoded ceiling in this fixture to two volumes and the
+    /// second count comes back an order of magnitude above the first.
+    ///
+    /// Desktop only, because `FsArchiveSpill` is: wasm holds `None` and never
+    /// spills, so there is no cycle there to assert the absence of.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_spilled_archive_is_not_spilled_again_while_its_frame_stays_decoded() {
+        const FRAMES: u32 = 12;
+        /// The 208-file corpus median compressed archive.
+        const ARCH: usize = 5_845_849;
+
+        let root = std::env::temp_dir().join(format!(
+            "squallar-respill-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut mgr = LoopDownloadManager::new();
+        mgr.set_spill(
+            Box::new(crate::archive_spill::FsArchiveSpill::new(root.clone()).expect("a medium")),
+            1024 * 1024 * 1024,
+        );
+        for f in 0..FRAMES {
+            mgr.cache_scan("KTLX", ts(f), priced_volume());
+            mgr.cache_archive("KTLX", ts(f), archive(ARCH));
+        }
+        // Half the archives fit, so the pass really does spill; a ceiling that
+        // held them all would make this assertion vacuous.
+        let archive_ceiling = (FRAMES as usize / 2) * ARCH;
+        // Above the frame count, so nothing evicts a decoded volume and the
+        // pump never re-decodes anything.
+        let decoded_ceiling = mgr.cached_scan_bytes() * 2;
+        // Distance from a playhead parked on the first frame.
+        let rank = |_: &str, at: &chrono::NaiveDateTime| {
+            (at.and_utc().timestamp() - ts(0).and_utc().timestamp()) as u64
+        };
+
+        let round = |mgr: &mut LoopDownloadManager| {
+            mgr.evict_archives_to_ceiling(archive_ceiling, rank, |_, _, _| false);
+            let _ = mgr.evict_decoded_to_ceiling(decoded_ceiling, rank, |_, _, _| false);
+            for f in 0..FRAMES {
+                if mgr.needs_decode("KTLX", &ts(f))
+                    && let Some(a) = mgr.archive_for("KTLX", &ts(f))
+                {
+                    mgr.cache_scan("KTLX", ts(f), priced_volume());
+                    mgr.cache_archive("KTLX", ts(f), a);
+                }
+            }
+        };
+
+        for _ in 0..2 {
+            round(&mut mgr);
+        }
+        let (settled, ..) = mgr.spill_counts();
+        assert!(
+            settled > 0,
+            "the fixture spilled nothing, so it cannot tell a re-spill from a spill"
+        );
+        for _ in 0..20 {
+            round(&mut mgr);
+        }
+        let (after, _, _, restored, misses) = mgr.spill_counts();
+        assert_eq!(
+            after, settled,
+            "an archive was spilled again though nothing re-decoded its frame: \
+             the byte ceiling is cycling archives through the medium on its own"
+        );
+        assert_eq!(
+            (restored, misses),
+            (0, 0),
+            "nothing should have been withdrawn: every frame kept its volume"
+        );
+        assert_eq!(
+            (0..FRAMES)
+                .filter(|f| mgr.has_archive("KTLX", &ts(*f)))
+                .count(),
+            FRAMES as usize,
+            "a way back was lost, on the heap or off it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// An archive buffer of exactly `bytes` bytes.
     fn archive(bytes: usize) -> Arc<Vec<u8>> {
         Arc::new(vec![7u8; bytes])
@@ -4978,7 +5091,7 @@ mod archive_tests {
             mgr.set_spill(Box::new(SpillDouble { probe, refuse }), 64 * 1024 * 1024);
         }
         // The decoded half of the frame whose archive is about to leave: it is
-        // the 15.5x-larger half, and whether it stays evictable is the point.
+        // the 2.85x-larger half, and whether it stays evictable is the point.
         mgr.cache_scan("KTLX", ts(0), priced_volume());
         for minute in 0..3u32 {
             mgr.cache_archive("KTLX", ts(minute), archive(CORPUS_MIN_ARCHIVE));
@@ -5000,8 +5113,8 @@ mod archive_tests {
     /// Both arms in one test because the contrast is the claim. With nowhere to
     /// put the archive — today's tree — the ceiling drops it and
     /// `evict_decoded_except` then refuses the volume for ever: the archive was
-    /// a median 6.45 % of it, so 1 part is reclaimed and 15.5 parts are
-    /// stranded un-evictable. With a spill, the same pass frees the same heap
+    /// a median 35 % of it on the real corpus, so 1 part is reclaimed and
+    /// 1.85 parts are stranded un-evictable. With a spill, the same pass frees the same heap
     /// bytes and the volume is still reclaimable.
     ///
     /// TAMPER: make `spill_archive` return `false` unconditionally and the
@@ -5061,7 +5174,7 @@ mod archive_tests {
             "the medium's ledger is not the bytes written to it",
         );
 
-        // And therefore the 15.5x-larger half is reclaimable.
+        // And therefore the 2.85x-larger half is reclaimable.
         assert_eq!(
             mgr.evict_decoded_except(|_, _, _| false).len(),
             1,

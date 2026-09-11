@@ -1,14 +1,36 @@
 //! **Off-heap retention for the compressed half of a loop frame.**
 //!
-//! An archive is the cheapest retention this application has — a median 6.45 %
-//! of the decoded volume it stands in for, a 15.5x leverage — and it is also
-//! the precondition for evicting that volume at all: both decoded-eviction
-//! policies refuse a volume with no archive behind it, by design, because
-//! their cost is a decode and a volume with nothing to decode from would turn
-//! them into a re-download policy. So the archive ceiling cannot simply be
-//! lowered. Taking an archive strands the 15.5x-larger decoded volume as
-//! permanently un-evictable, which is why
+//! An archive is the cheapest retention this application has, and it is also
+//! the precondition for evicting the decoded volume at all: both
+//! decoded-eviction policies refuse a volume with no archive behind it, by
+//! design, because their cost is a decode and a volume with nothing to decode
+//! from would turn them into a re-download policy. So the archive ceiling
+//! cannot simply be lowered. Taking an archive strands the larger decoded
+//! volume as permanently un-evictable, which is why
 //! `LOOP_ARCHIVE_CEILING_BYTES` carries a paragraph telling the reader not to.
+//!
+//! **How much larger is a question about the corpus, and the 15.5x this file
+//! used to quote is the wrong corpus's answer.** Measured per volume as
+//! `scan_size::scan_bytes` against the compressed file it was decoded from:
+//!
+//! | corpus | archive as % of decoded (min / median / max) | median leverage |
+//! |---|---|---|
+//! | 208-file `rd-t18-seam-corpus`, real Archive II | 12.9 / 35.1 / 53.5 % | **2.85x** |
+//! | 171-file `nrot-synth`, synthesised | 5.4 / 9.1 / 40.3 % | 10.99x |
+//!
+//! The 6.45 % / 15.5x figure was taken over 39 volumes of the synthetic
+//! corpus, is stated at `LOOP_ARCHIVE_CEILING_BYTES` with that denominator
+//! named, and **arrives everywhere else in this tree with the denominator
+//! dropped** — including at the two eviction policies, which run on real
+//! archives and not on synthesised ones. On the real corpus the trade is
+//! 2.85x, not 15.5x: trading a decoded volume for its archive gives back
+//! 65 % of the frame's bytes rather than 94 %.
+//!
+//! **That does not reverse any decision here — it rescales them.** An archive
+//! is still the cheapest retention available and a dropped one still strands a
+//! volume 2.85x its size, so both the prohibition and this module survive; the
+//! arithmetic every one of them is argued from is 5.4x less favourable than
+//! the prose said.
 //!
 //! This module is the third option. Where the byte ceiling would DROP an
 //! archive, the bytes go to disk and the **key stays in memory**, so every
@@ -16,44 +38,57 @@
 //! `HashMap` without touching a disk, and only the withdrawal of the bytes
 //! pays for I/O.
 //!
-//! # Priced against the decode it precedes, and never against nothing
+//! # Priced against what the alternative actually is
 //!
-//! Measured over the 208-file local Archive II corpus at its minimum, median,
-//! p90 and maximum compressed size — a cold read, page cache dropped with
-//! `posix_fadvise(POSIX_FADV_DONTNEED)`, median of five draws — against the
-//! single-threaded bzip2 decode that always follows it:
+//! Three costs over the 208-file local Archive II corpus at its minimum,
+//! median, p90 and maximum compressed size — median of five draws, release,
+//! on a box at loadavg 2.75. The **write** this module pays to put an archive
+//! on the medium; the **cold read** to get it back, page cache dropped with
+//! `posix_fadvise(POSIX_FADV_DONTNEED)`; and the single-threaded **bzip2
+//! decode** that always follows the read, measured on the production path
+//! (`scan::decode_shared`, the one call `jobs::DecodeJob::run` makes).
 //!
-//! | archive | cold read | bzip2 decode |
-//! |---|---|---|
-//! | 0.34 MiB | 1.23 ms | 4.7 ms |
-//! | 5.54 MiB | 19.09 ms | 15.2 ms |
-//! | 10.99 MiB | 35.04 ms | 25.1 ms |
-//! | 17.96 MiB | 55.18 ms | 41.3 ms |
+//! | archive | spill write | cold read | bzip2 decode | read / decode |
+//! |---|---|---|---|---|
+//! | 0.34 MiB | 0.08 ms | 1.12 ms | 5.05 ms | 22 % |
+//! | 5.58 MiB | 0.79 ms | 11.21 ms | 17.23 ms | 65 % |
+//! | 10.99 MiB | 1.53 ms | 17.49 ms | 25.39 ms | 69 % |
+//! | 17.96 MiB | 2.36 ms | 27.14 ms | 41.70 ms | 65 % |
 //!
-//! The decode is not a cost this module adds — it is what a restore has
-//! always been. **It is also far smaller than this table said until
-//! 2026-09-10**, and the correction matters because the old figures were the
-//! stated reason eviction is cheap. They read 19.3 / 305.8 / 915.8 ms for the
-//! decode column, and no release build of this tree reproduces them: the
-//! decode above is `jobs::DecodeJob::run` — the production path, single
-//! volume at a time, median of five draws — and it agrees with the
-//! independent release-profile reading at `LOOP_DECODED_LOOKAHEAD_FRAMES`
-//! (6.0 / 10.7 / 40.9 ms over a different corpus) and not with the row it
-//! replaces. The old decode column is a ~20x overstatement of the current
-//! tree; what produced it is not established here, so it is retracted rather
-//! than explained.
+//! **Which figure is the price depends on which alternative is named, and
+//! this module has two.** Against an archive that stays on the HEAP, the
+//! whole marginal cost of putting this one on a medium is the write plus the
+//! read — 1.2 ms to 29.5 ms — because the decode is paid either way and is
+//! not a cost this module adds. Against an archive that is DROPPED, which is
+//! the behaviour this module replaces, the comparison is not a decode at all:
+//! a dropped archive is a volume with no way back, so the frame costs a
+//! network round trip, and the whole table is small against that. Both
+//! comparisons say spill. Neither of them is the comparison this file made
+//! before 2026-09-11.
 //!
-//! **The "read is 3.0–5.3 % of the decode" ratio goes with it**, and it
-//! inverts: the cold read is 26 % of the decode at the corpus minimum and
-//! 134 % of it at the maximum. A restore is I/O-bound, not CPU-bound. The
-//! read column above was taken on a box at loadavg 18–73 and is inflated by
-//! that; the decode column is CPU and is therefore an UPPER bound on a quiet
-//! box, which is the direction that keeps the retraction conservative.
+//! **The decode column was overstated ~20x and is retracted** (`dfc61b542`).
+//! It read 19.3 / 305.8 / 915.8 ms, and no release build of this tree
+//! reproduces it; the column above was re-measured independently and agrees
+//! with `dfc61b542`'s 4.7 / 15.2 / 25.1 / 41.3 ms to within a draw, and with
+//! the release-profile reading at `LOOP_DECODED_LOOKAHEAD_FRAMES` (6.0 / 10.7
+//! / 40.9 ms over a different corpus). What produced the old figures is not
+//! established, so they are retracted rather than explained.
 //!
-//! Eviction stays worthwhile, and on a stronger footing than the old ratio
-//! gave it: the whole restore is tens of milliseconds against a decoded
-//! volume of 15.8 MiB median and 41.4 MiB maximum (`scan_size::scan_bytes`
-//! over the same 208 volumes), off the frame thread on the job funnel.
+//! **"A restore is I/O-bound, not CPU-bound" is retracted with them, and it
+//! was an artefact of a loaded box.** That claim came from a read column
+//! taken at loadavg 18–73 (1.23 / 19.09 / 35.04 / 55.18 ms), which put the
+//! read at 134 % of the decode at the corpus maximum. Re-measured at loadavg
+//! 2.75 the read is 1.12 / 11.21 / 17.49 / 27.14 ms and never exceeds the
+//! decode: it is 22–69 % of it across the corpus, and a restore is
+//! decode-dominated on a quiet box. The read is the load-sensitive half and
+//! the decode is the CPU half, so on a busy box the two converge — but they
+//! do not invert, and nothing here should be argued from the inverted
+//! ordering.
+//!
+//! **The write is the cheap one and was never priced at all.** At 0.08–2.36 ms
+//! it is 5–6 % of the decode. That matters for a ceiling low enough to spill
+//! the same archive repeatedly: the recurring cost of such a treadmill is the
+//! decode, not this module.
 //!
 //! # `read`, never `mmap` — the two counters do not move together
 //!

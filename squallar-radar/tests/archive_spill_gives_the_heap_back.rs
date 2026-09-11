@@ -147,7 +147,7 @@ fn the_ceiling_gives_the_same_heap_bytes_back_either_way_and_only_a_spill_keeps_
     // **The way back: 0 against every archive that left.** This is what
     // separates the two arms, and it is the whole reason the spill exists —
     // both decoded-eviction policies refuse a volume with no way back, so an
-    // archive that is merely DROPPED strands the median 15.5x-larger decoded
+    // archive that is merely DROPPED strands the median 2.85x-larger decoded
     // volume in front of it as permanently un-evictable.
     let evicted = HELD as usize - bare_ways;
     assert!(evicted > 0, "the fixture evicted nothing");
