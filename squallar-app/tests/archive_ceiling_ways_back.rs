@@ -107,7 +107,13 @@ fn arm(root: &std::path::Path, ceiling: usize) -> (usize, u64, usize, usize) {
 
 #[test]
 fn the_lower_ceiling_takes_heap_bytes_and_no_ways_back() {
-    let root = std::env::temp_dir().join("squallar-ceiling-ways-back");
+    // Per-process, for the reason
+    // `squallar-radar/tests/archive_spill_gives_the_heap_back.rs` states at
+    // its own root: `FsArchiveSpill::new` purges what it is handed, so a
+    // constant name lets a concurrent instance of this binary delete this
+    // one's spilled files mid-run and cost it the ways back asserted below.
+    let root =
+        std::env::temp_dir().join(format!("squallar-ceiling-ways-back-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
 
     let (term_before, live_before, ways_before, disk_before) = arm(&root, CEILING_BEFORE);

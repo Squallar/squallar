@@ -12,8 +12,18 @@ fn ts(seconds: i64) -> chrono::NaiveDateTime {
 
 /// A directory of this test's own, under the OS temp dir. `FsArchiveSpill::new`
 /// purges what it is given, so a reused name cannot leak state between runs.
+///
+/// **The process id is load-bearing, not decoration.** `name` separates these
+/// tests from each other inside one binary; it does nothing about a second
+/// copy of this binary, which is the ordinary state of this box when two
+/// lanes run `cargo test --workspace` at once. That purge is unconditional,
+/// so under a shared name one instance's construction deletes the other's
+/// stored bytes and `load` hands back `None` for a key that was stored.
 fn spill_root(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("squallar-archive-spill-test-{name}"))
+    std::env::temp_dir().join(format!(
+        "squallar-archive-spill-test-{name}-{}",
+        std::process::id()
+    ))
 }
 
 #[test]

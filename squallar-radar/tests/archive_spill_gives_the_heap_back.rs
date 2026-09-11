@@ -82,7 +82,18 @@ fn ways_back(mgr: &LoopDownloadManager) -> usize {
 
 #[test]
 fn the_ceiling_gives_the_same_heap_bytes_back_either_way_and_only_a_spill_keeps_the_way_back() {
-    let root = std::env::temp_dir().join("squallar-spill-heap-gate");
+    // **This process's own directory, never a shared name.** Several lanes
+    // run `cargo test --workspace` on this box at once, so two instances of
+    // this binary are live together — and `FsArchiveSpill::new` PURGES the
+    // root it is given, by design, to close the cross-process leak. Under a
+    // constant name that purge lands on the other instance's spilled files
+    // while it is still writing them: its `store` returns `false`, the manager
+    // treats it as "nowhere to put it" and drops the archive, and the
+    // `spill_ways == HELD` assertion below reports a lost way back that this
+    // tree does not have. Measured on this binary: 3 of 4 concurrent
+    // instances red at 52, 57 and 59 ways back out of 60.
+    let root =
+        std::env::temp_dir().join(format!("squallar-spill-heap-gate-{}", std::process::id()));
     let before_all = squallar_alloc::process::resident().expect("/proc/self/status on linux");
 
     // ---- arm 1: no spill, which is this tree before the change ----
@@ -152,14 +163,26 @@ fn the_ceiling_gives_the_same_heap_bytes_back_either_way_and_only_a_spill_keeps_
     );
 
     // **Nothing was mapped.** A mapping would have posted the same fall in
-    // `live_bytes` above while growing the resident file-backed half instead
-    // of giving the pages up.
-    let file_growth = after_all.file_bytes.saturating_sub(before_all.file_bytes);
+    // `live_bytes` above while merely moving the pages into another resident
+    // class instead of giving them up.
+    //
+    // **`RssFile` + `RssShmem`, and the second term is the one that can
+    // actually fire here.** The kernel files a mapping under the class of the
+    // thing mapped, and this spill root is under `std::env::temp_dir()`,
+    // which is a tmpfs on this arm — so its pages are SHMEM and not
+    // file-backed. Against `file_bytes` alone this was the one assertion in
+    // the suite that could not see the medium the spill really uses:
+    // tampering `FsArchiveSpill::store` to `mmap` every spilled file and
+    // fault it in left this test GREEN, with `file_bytes` up 4,096 B while
+    // `VmRSS` grew 87.7 MB. Summed rather than checked one at a time, because
+    // the defect is one mapping landing in whichever class its medium has.
+    let mapped_growth = (after_all.file_bytes.saturating_add(after_all.shmem_bytes))
+        .saturating_sub(before_all.file_bytes.saturating_add(before_all.shmem_bytes));
     assert!(
-        file_growth < (spilled.spilled_bytes() as u64) / 2,
-        "resident file-backed memory grew {file_growth} B while {} B went to \
-         the medium — the spill is mapping its files, which moves bytes \
-         between RSS classes without giving any back",
+        mapped_growth < (spilled.spilled_bytes() as u64) / 2,
+        "resident file-backed and shared memory grew {mapped_growth} B while \
+         {} B went to the medium — the spill is mapping its files, which moves \
+         bytes between RSS classes without giving any back",
         spilled.spilled_bytes(),
     );
 
@@ -167,7 +190,7 @@ fn the_ceiling_gives_the_same_heap_bytes_back_either_way_and_only_a_spill_keeps_
         "drop arm: freed {bare_freed} B, live -{bare_drop} B, ways back {bare_ways}/{HELD}\n\
          spill arm: freed {spill_freed} B, live -{spill_drop} B, on-disk {} B in {}, \
          ways back {spill_ways}/{HELD}\n\
-         rss {} -> {} B (anon {} -> {}, file {} -> {})",
+         rss {} -> {} B (anon {} -> {}, file {} -> {}, shmem {} -> {})",
         spilled.spilled_bytes(),
         spilled.spilled_count(),
         before_all.rss_bytes,
@@ -176,6 +199,8 @@ fn the_ceiling_gives_the_same_heap_bytes_back_either_way_and_only_a_spill_keeps_
         after_all.anon_bytes,
         before_all.file_bytes,
         after_all.file_bytes,
+        before_all.shmem_bytes,
+        after_all.shmem_bytes,
     );
 
     let _ = std::fs::remove_dir_all(&root);

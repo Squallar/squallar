@@ -31,7 +31,13 @@ fn probe() -> PathBuf {
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("squallar-terrain-pipeline-{name}"));
+    // Per-process as well as per-test: the `remove_dir_all` below is
+    // unconditional, so a shared name lets a concurrent copy of this binary
+    // delete this run's inputs part-way through.
+    let d = std::env::temp_dir().join(format!(
+        "squallar-terrain-pipeline-{name}-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d

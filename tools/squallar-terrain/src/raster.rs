@@ -1033,7 +1033,15 @@ mod tests {
     use super::*;
 
     fn scope_scratch(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("squallar-terrain-scope-{name}"));
+        // `name` separates these tests inside one binary; the process id
+        // separates this binary from a second copy of itself, which is what a
+        // second concurrent `cargo test --workspace` on the same box is. The
+        // `remove_dir_all` below is unconditional and would otherwise land on
+        // the other run's scratch.
+        let d = std::env::temp_dir().join(format!(
+            "squallar-terrain-scope-{name}-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

@@ -37,7 +37,12 @@ mod tests {
     use std::io::Write;
 
     fn temp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("squallar-terrain-test-{name}"));
+        // Per-process as well as per-test: two copies of this binary writing
+        // and removing one path would hand a reader a half-written header.
+        let p = std::env::temp_dir().join(format!(
+            "squallar-terrain-test-{name}-{}",
+            std::process::id()
+        ));
         std::fs::File::create(&p).unwrap().write_all(bytes).unwrap();
         p
     }
