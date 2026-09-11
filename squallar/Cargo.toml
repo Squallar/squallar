@@ -65,6 +65,11 @@ log = { workspace = true }
 pollster = { workspace = true }
 winit = { workspace = true }
 env_logger = "=0.11.11"
+# The ANSI resolution `Target::Stderr` does inside env_logger, reached directly
+# so `log_sink`'s writer thread can do it there instead of on the frame thread.
+# Pinned to the copy env_logger already resolves, with the same features it
+# turns on, so this edge adds no crate and no feature to the graph.
+anstream = { version = "=1.0.0", default-features = false, features = ["auto", "wincon"] }
 # `wgpu::Adapter`, `wgpu::Device` and `wgpu::hal`, for the GPU readers in
 # `src/capacity/`. No features: squallar-gpu's manifest is the one wgpu
 # feature-chooser for the graph, and this entry only names the copy it already

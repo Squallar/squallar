@@ -30,6 +30,10 @@ pub mod kv;
 /// outside LaunchServices is scheduled differently enough that its timings do
 /// not compare, and this is what makes it say so.
 pub mod launch_posture;
+/// The log write, moved off whatever thread produced the record. Mounted here
+/// rather than beside `run` because the Android entry installs its own logger
+/// and must not reach this one.
+pub mod log_sink;
 /// Test-only. See the module docs for why it lives in this crate.
 pub mod network_security_config;
 /// Test-only. Mounted here because this package's executable is the one the

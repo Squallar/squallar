@@ -4807,6 +4807,7 @@ name = "squallar"
 version = "0.1.0"
 dependencies = [
  "android_logger",
+ "anstream",
  "ash",
  "dark-light",
  "env_logger",
