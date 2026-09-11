@@ -692,6 +692,146 @@ pub(crate) struct UiHists {
     pub(crate) chrome: Split,
 }
 
+/// Where the `ui` split's `statusbar` cut went, one level below [`UiHists`].
+///
+/// # Denominator
+///
+/// **Exactly [`UiHists::statusbar`]'s** — the frames on which that cut
+/// records, which is presented frames that left `ui_phases`, in each half
+/// separately — and that equality is the design, not a coincidence: the nine
+/// `record` calls sit in the very block the fourth `ui` cut's does, so
+/// `statusbar.gate.total()` and `ui.statusbar.total()` cannot differ
+/// (`the_statusbar_family_records_on_exactly_the_frames_its_parent_does`).
+/// [`StackHists`]' denominator note applies word for word.
+///
+/// **Never added to `frame ui (statusbar)`.** These are not a tenth `ui` cut
+/// beside it; they *are* it, opened up. The reporting prefix is deliberately
+/// `frame statusbar` — a sixth spelling beside `frame segment`, `frame ui`,
+/// `frame stack`, `frame panes` and `frame content` — so that no reader
+/// pattern-matching a prefix can add two levels of the same span. And
+/// `statusbar` is itself a `ui` CUT NAME, which is `ContentHists`' hazard
+/// exactly: a pattern looser than the literal `frame statusbar (` would
+/// scrape `frame ui (statusbar)` as one of these nine.
+///
+/// # What this split was cut to answer
+///
+/// `ui_statusbar` had nothing beneath it, so a frame that spent milliseconds
+/// on the status bar could say only that it had — and the reading that
+/// provoked this split was **9,572 µs on one latched idle frame**, the
+/// largest single unattributed figure on the board.
+///
+/// **One latch is not the distribution, and here the distribution exists.**
+/// `frame worst:` latches on `service`, so a `statusbar` spiking under a
+/// larger sibling is never latched and that 9,572 µs is a lower bound on both
+/// magnitude and frequency. What is NOT a lower bound is this cut's own
+/// histogram, which has been recorded all along. Read off 344 archived native
+/// legs carrying a `frame ui (statusbar)` line — 877,783 presented frames,
+/// the largest population this tree holds for it:
+///
+/// | half | n | mean | ≥1 ms | ≥4 ms | top occupied bin |
+/// |---|---|---|---|---|---|
+/// | interact | 104,213 | 130.3 µs | 1,748 (1.68 %) | 546 (0.524 %) | ≥64 ms |
+/// | idle | 135,738 | 95.4 µs | 1,509 (1.11 %) | 495 (0.365 %) | 38–45 ms |
+/// | pre-split halves | 637,832 | 57.2 µs | 1,023 (0.160 %) | 190 (0.0298 %) | ≥64 ms |
+///
+/// The ≥ counts are **exact and not percentile estimates**: 1 000 µs and
+/// 4 000 µs are bin edges 16 and 24 of [`squallar_device_profile::hist`]'s
+/// geometry, so a count either side of one is a sum of whole slots.
+///
+/// So this is not a once-an-hour outlier. It is a **spike a few times in a
+/// thousand frames on every leg**, and on the six-pane legs it is not even a
+/// spike: `sq-gatecut/PIN6.post.r3` reads mean 769.4 µs interact and 709.0 µs
+/// idle, which is **16.9 % of the whole `ui` segment and LARGER than
+/// `stack`** — the cut that has had a seven-way split since `ff0e7c2e5`.
+///
+/// # The episode, which is what the nine cuts are shaped to find
+///
+/// The cost is **bimodal within one build and one scene**, which is why a
+/// scene-shape explanation does not survive contact with the archive. Three
+/// repeats of the same six-pane leg on the same commit
+/// (`rd-fixedinput-out/out_e33e05671`): run 1 reads mean 47.7 µs interact,
+/// run 3 reads 48.5 µs, and run 2 reads **409.1 µs** with 64 interact frames
+/// at or over 4 ms against run 3's zero. Every sibling cut on run 2 is
+/// inflated too (`topbar` 1.5x, `stack` 3.0x), so part of that is the leg and
+/// not the bar — but `statusbar` moved 8.4x, and no sibling moved like it.
+///
+/// Something the status bar does is cheap in one state and expensive in
+/// another. The nine cuts below are placed to name which: `chip`, `scan` and
+/// `age` are the three per-frame `format!`-and-lay-out paths that only switch
+/// on once data has loaded; `error` is the banner that only draws while a
+/// fetch is failing; `buttons` and `open` are the flat furniture that should
+/// move with neither.
+///
+/// **These figures are from the LINUX native arm** — archived legs on this
+/// box, read from their own `app.log`s — and several of the legs quoted ran
+/// under fleet contention, which corrupts microseconds. Hold the SHARE
+/// between cuts on one leg rather than an absolute across legs, and read `n`
+/// before either.
+///
+/// # There is no `residual`, and that is deliberate
+///
+/// `gate` opens on the parent's own left boundary and `close` closes on its
+/// right one, so no `statusbar` time can hide in an unnamed tail —
+/// [`StackHists`]' reasoning, which is [`PostHists::close`]'s. What a
+/// subtraction would leave is [`micros`]' truncation dust, bounded at
+/// `n - 1 = 8` µs and never over.
+#[derive(Default)]
+pub(crate) struct StatusbarHists {
+    /// The compact-width gate, `chrome_fade`, the two collapse/restore slide
+    /// animations, the pointer-modality read and the frame style — **plus the
+    /// `available_rect_before_wrap()` the shell runs before the call**, which
+    /// is what putting this cut's left end on the parent's boundary buys.
+    /// Scales with nothing, **but it holds the WHOLE cut on a frame that
+    /// draws no bar**: both early returns are inside it. A `statusbar` that is
+    /// large and all in `gate` is a frame that spent its time deciding not to
+    /// draw.
+    pub(crate) gate: Split,
+    /// The `Area`'s placement, the `Frame`'s inner `Ui`, the dim pass and the
+    /// row's `horizontal` open. Flat furniture: it scales with neither the
+    /// scene nor the data, which is what makes a non-zero move here a finding
+    /// about egui rather than about the bar.
+    pub(crate) open: Split,
+    /// The collapse and refresh buttons — two `chrome_galley` labels, two
+    /// `Button`s, their hover text and their click reads — or the restore
+    /// button alone on the collapsed path. Flat furniture on `open`'s terms.
+    pub(crate) buttons: Split,
+    /// The auto-poll chip: `archive_fetching`, the three `ArchivePoll`
+    /// questions, `chunk_status` over the liveness slice, the `format!`s
+    /// inside `render_auto_poll_status`, its label, and the
+    /// `note_clock_change` compare. **Scales with the feed's STATE**, not with
+    /// the scene: a live feed formats an elevation and an age every frame
+    /// where a dead one formats a constant.
+    pub(crate) chip: Split,
+    /// `render_scan_info` — a `format!` over the site name and a
+    /// `UserPreferences::timezone` datetime format, rebuilt on **every frame a
+    /// scan is loaded**, plus the label that lays it out. Near-free before the
+    /// first scan lands and not after, which is one half of the step this
+    /// split exists to find.
+    pub(crate) scan: Split,
+    /// `render_product_age` — `chrono::Utc::now()`, a second timezone datetime
+    /// format and a second `format!`, on the same per-frame terms, plus a
+    /// separator and a label. Zero on a pane whose image carries no data time,
+    /// which is the other half of that step.
+    pub(crate) age: Split,
+    /// The pointer readout: the two `find_map`s over the panes and the labels
+    /// they draw. **Zero when the pointer modality is not a mouse**, so a zero
+    /// here on a touch leg is a reading about the modality, not about the
+    /// readout.
+    pub(crate) hover: Split,
+    /// The radar layer's error banner. The retry-ledger read that asks whether
+    /// there is one happens on **every** frame; the right-to-left scope and
+    /// `render_error_display` only on the frames a fetch is failing. That
+    /// asymmetry is the point: this cut is the difference between a healthy
+    /// origin and a sick one, and it is the first thing to read on a leg whose
+    /// `statusbar` stepped up and stayed there.
+    pub(crate) error: Split,
+    /// The teardown: the row's `horizontal`, the `Frame` and the `Area`
+    /// closing, and the rect handed back to `statusbar_rect`. **This family's
+    /// residual**, closing on the parent's own right boundary so that nothing
+    /// can hide behind it.
+    pub(crate) close: Split,
+}
+
 /// Where the `ui` split's `stack` cut went, one level below [`UiHists`].
 ///
 /// # Denominator
@@ -1425,6 +1565,9 @@ pub(crate) struct FrameLedger {
     /// See [`UiHists`] — `segments.ui`, opened up, same frames and same two
     /// populations.
     ui: UiHists,
+    /// See [`StatusbarHists`] — `ui.statusbar`, opened up, same frames and
+    /// same two populations.
+    statusbar: StatusbarHists,
     /// See [`StackHists`] — `ui.stack`, opened up, same frames and same two
     /// populations.
     stack: StackHists,
@@ -1810,6 +1953,41 @@ fn ui_phase_micros(
     ]
 }
 
+/// The nine contiguous cuts of the `ui` split's `statusbar` cut, in call
+/// order: `[gate, open, buttons, chip, scan, age, hover, error, close]` — see
+/// [`StatusbarHists`], whose fields these are.
+///
+/// Contiguous by construction: each cut ends where the next begins, and the
+/// pair at the ends are the PARENT CUT's own boundaries — `topbar` and
+/// `statusbar`, the very two [`ui_phase_micros`]' fourth entry is taken from
+/// — so the nine sum to `micros(topbar, statusbar)` to within the eight
+/// microseconds nine truncating [`micros`] calls can lose, and never over it.
+/// A free function so the telescoping is testable without a frame.
+///
+/// **Both ends are the parent's, neither is this split's own**, on
+/// [`stack_phase_micros`]' terms exactly: `close` runs to the parent's right
+/// boundary and `gate` opens on its left one, so a `statusbar` residual has
+/// nowhere to hide. It also means `gate` covers the one statement
+/// `render_shell_phased` runs between the `topbar` stamp and the call — the
+/// `available_rect_before_wrap()` that decides where the bar floats.
+fn statusbar_phase_micros(
+    topbar: Instant,
+    bar: &squallar_egui::shell_api::StatusbarStamps,
+    statusbar: Instant,
+) -> [u32; 9] {
+    [
+        micros(topbar, bar.gated),
+        micros(bar.gated, bar.opened),
+        micros(bar.opened, bar.buttoned),
+        micros(bar.buttoned, bar.chipped),
+        micros(bar.chipped, bar.scanned),
+        micros(bar.scanned, bar.aged),
+        micros(bar.aged, bar.hovered),
+        micros(bar.hovered, bar.errored),
+        micros(bar.errored, statusbar),
+    ]
+}
+
 /// The seven contiguous cuts of the `ui` split's `stack` cut, in call order:
 /// `[snap, gate, hydrate, statuses, render, inspector, settle]` — see
 /// [`StackHists`], whose fields these are.
@@ -2114,6 +2292,17 @@ impl FrameLedger {
             stack_phase_micros(phases.statusbar, &phases.stack, phases.shell)
         });
 
+        // **And the same one cut across**, on the same terms: these nine cut
+        // `ui_cuts[3]` -- the `statusbar` cut, which had nothing beneath it
+        // and read 9,572 us on one latched idle frame. Zero new clock reads
+        // beyond the eight `render_status_bar` takes: only nine subtractions
+        // are here. Above the arm because half this cut's own >=4 ms frames
+        // are idle ones (495 of 1,041 across the archive), and an idle frame
+        // never reaches the interact arm at all -- `StatusbarHists`.
+        let statusbar_cuts = m.ui_phases.as_ref().map_or([0u32; 9], |phases| {
+            statusbar_phase_micros(phases.topbar, &phases.statusbar_cuts, phases.statusbar)
+        });
+
         // The same, and for the same reason: `pre` is the segment that read
         // 10,357 us on ONE latched frame, and a latched frame is as often
         // idle as not. Above the arm, and the statement may not read
@@ -2313,6 +2502,33 @@ impl FrameLedger {
             self.ui.panes.record(panes, interacted);
             self.ui.apply.record(apply, interacted);
             self.ui.chrome.record(chrome, interacted);
+            // One level further down, inside the very guard the FOURTH cut
+            // above records under: these nine telescope to `statusbar`, and
+            // the two families' `n` are equal BY CONSTRUCTION rather than by
+            // inspection -- in each population separately. A frame that drew
+            // no bar still contributes a sample (`gate` holds the whole cut on
+            // it, which is a reading and not an absence), so this guard is
+            // `ui_phases` and never a width test. See `StatusbarHists`.
+            let [
+                sb_gate,
+                sb_open,
+                sb_buttons,
+                sb_chip,
+                sb_scan,
+                sb_age,
+                sb_hover,
+                sb_error,
+                sb_close,
+            ] = statusbar_cuts;
+            self.statusbar.gate.record(sb_gate, interacted);
+            self.statusbar.open.record(sb_open, interacted);
+            self.statusbar.buttons.record(sb_buttons, interacted);
+            self.statusbar.chip.record(sb_chip, interacted);
+            self.statusbar.scan.record(sb_scan, interacted);
+            self.statusbar.age.record(sb_age, interacted);
+            self.statusbar.hover.record(sb_hover, interacted);
+            self.statusbar.error.record(sb_error, interacted);
+            self.statusbar.close.record(sb_close, interacted);
             // One level further down, inside the very guard the fifth cut
             // above records under: these seven telescope to `stack`, and the
             // two families' `n` are equal BY CONSTRUCTION rather than by
@@ -2506,6 +2722,12 @@ impl FrameLedger {
         &self.prepare
     }
 
+    /// See [`StatusbarHists`] — `ui_phases().statusbar`, opened up, and never
+    /// added to it.
+    pub(crate) fn statusbar_phases(&self) -> &StatusbarHists {
+        &self.statusbar
+    }
+
     /// See [`StackHists`] — `ui_phases().stack`, opened up, and never added
     /// to it.
     pub(crate) fn stack_phases(&self) -> &StackHists {
@@ -2619,7 +2841,7 @@ mod tests {
         PumpPhaseStamps, WorstFrame, content_cut_micros, dispatch_cut_micros, finish_phase_micros,
         latch_worst, micros, panes_cut_micros, post_phase_micros, pre_phase_micros,
         prepare_phase_micros, pump_phase_micros, service_less_present_micros, service_micros,
-        stack_phase_micros, ui_phase_micros,
+        stack_phase_micros, statusbar_phase_micros, ui_phase_micros,
     };
     use squallar_egui::shell_api::UiPhaseStamps;
     use squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps;
@@ -2717,6 +2939,24 @@ mod tests {
         }
     }
 
+    /// Eight stamps on the parent's LEFT boundary — `stack_stamps_flat`'s
+    /// convention exactly, so the whole `statusbar` cut lands in `close` and
+    /// the eight before it read zero. A fixture for the levels ABOVE this
+    /// split, which telescope whatever it holds; the split's own arithmetic
+    /// has its own fixture (`statusbar_stamps_at`).
+    fn statusbar_stamps_flat(topbar: Instant) -> squallar_egui::shell_api::StatusbarStamps {
+        squallar_egui::shell_api::StatusbarStamps {
+            gated: topbar,
+            opened: topbar,
+            buttoned: topbar,
+            chipped: topbar,
+            scanned: topbar,
+            aged: topbar,
+            hovered: topbar,
+            errored: topbar,
+        }
+    }
+
     fn ui_phases_at(ui_start: Instant, offsets: [u64; 8]) -> UiPhaseStamps {
         let at = |us: u64| ui_start + std::time::Duration::from_micros(us);
         UiPhaseStamps {
@@ -2728,6 +2968,7 @@ mod tests {
             dialog: at(offsets[5]),
             panes: at(offsets[6]),
             applied: at(offsets[7]),
+            statusbar_cuts: statusbar_stamps_flat(at(offsets[2])),
             stack: stack_stamps_flat(at(offsets[3])),
             // The `panes` split's own seven are nanosecond sums this helper
             // has no frame to take, and every cut of the level ABOVE them
@@ -2860,6 +3101,129 @@ mod tests {
         }
     }
 
+    /// Eight stamps at named offsets from the PARENT's left boundary, so a
+    /// test can state its cuts as arithmetic.
+    ///
+    /// **Offsets from `topbar`, not from `gated`**, because the first cut's
+    /// left edge is the parent's own boundary and not a field of this type —
+    /// see [`super::StatusbarStamps`].
+    fn statusbar_stamps_at(
+        topbar: Instant,
+        offsets: [u64; 8],
+    ) -> squallar_egui::shell_api::StatusbarStamps {
+        let at = |us: u64| topbar + std::time::Duration::from_micros(us);
+        squallar_egui::shell_api::StatusbarStamps {
+            gated: at(offsets[0]),
+            opened: at(offsets[1]),
+            buttoned: at(offsets[2]),
+            chipped: at(offsets[3]),
+            scanned: at(offsets[4]),
+            aged: at(offsets[5]),
+            hovered: at(offsets[6]),
+            errored: at(offsets[7]),
+        }
+    }
+
+    /// **The nine cuts are a decomposition of `ui.statusbar`, not a sample of
+    /// it.**
+    ///
+    /// The sum telescopes to `micros(topbar, statusbar)` — the very span
+    /// [`super::UiHists::statusbar`] records, and [`ui_phase_micros`]' FOURTH
+    /// entry — so "what is in the status bar" is answered by subtraction
+    /// rather than by inference. That cut had nothing beneath it while it was
+    /// reading 9,572 µs on a latched idle frame.
+    ///
+    /// **Both ends are the PARENT cut's**, which is the property a re-pointed
+    /// boundary breaks: reading cut 5's left edge off `buttoned` instead of
+    /// `chipped` leaves the chip's span in no cut at all and the sum falls
+    /// short.
+    #[test]
+    fn the_statusbar_phases_telescope_to_statusbar() {
+        let topbar = Instant::now();
+        let bar = statusbar_stamps_at(topbar, [40, 260, 900, 3_400, 5_100, 6_050, 6_260, 9_100]);
+        let statusbar = topbar + std::time::Duration::from_micros(9_572);
+
+        let cuts = statusbar_phase_micros(topbar, &bar, statusbar);
+        assert_eq!(
+            cuts,
+            [40, 220, 640, 2_500, 1_700, 950, 210, 2_840, 472],
+            "a cut moved: the nine no longer bracket the regions they are \
+             named for",
+        );
+        assert_eq!(
+            cuts.iter().sum::<u32>(),
+            micros(topbar, statusbar),
+            "the nine cuts do not sum to the statusbar span they decompose, \
+             so the attribution this instrument reports is not an attribution \
+             of ui.statusbar",
+        );
+        assert_eq!(cuts.iter().sum::<u32>(), 9_572);
+        // And the parent really is the `ui` split's FOURTH cut, taken from the
+        // same two instants -- not a span that merely resembles it.
+        let ui_start = topbar - std::time::Duration::from_micros(2_500);
+        let ui_end = statusbar + std::time::Duration::from_micros(30_000);
+        let ui = ui_phase_micros(
+            ui_start,
+            &UiPhaseStamps {
+                polled: ui_start + std::time::Duration::from_micros(300),
+                laid_out: ui_start + std::time::Duration::from_micros(1_900),
+                topbar,
+                statusbar,
+                statusbar_cuts: bar,
+                shell: statusbar + std::time::Duration::from_micros(12_000),
+                dialog: statusbar + std::time::Duration::from_micros(12_500),
+                panes: statusbar + std::time::Duration::from_micros(25_000),
+                applied: statusbar + std::time::Duration::from_micros(25_500),
+                stack: stack_stamps_flat(statusbar),
+                panes_cuts: squallar_egui::shell_api::PanesCuts::default(),
+            },
+            ui_end,
+        );
+        assert_eq!(
+            ui[3],
+            cuts.iter().sum::<u32>(),
+            "the nine do not decompose the `ui` split's fourth cut, so this \
+             family names a span the level above it does not have",
+        );
+    }
+
+    /// **The non-vacuity floor: every stamp must be able to move the answer.**
+    ///
+    /// A split whose stamps are read in the wrong order, or whose eighth is
+    /// never read at all, still telescopes — the ends are the parent's, so the
+    /// sum is right however the interior is spelled. This moves each stamp one
+    /// at a time and requires the cut vector to change, which is what makes
+    /// the test above an assertion about the DECOMPOSITION and not just about
+    /// the total.
+    #[test]
+    fn every_statusbar_stamp_moves_a_cut() {
+        let topbar = Instant::now();
+        let base_offsets = [40u64, 260, 900, 3_400, 5_100, 6_050, 6_260, 9_100];
+        let statusbar = topbar + std::time::Duration::from_micros(9_572);
+        let base = statusbar_phase_micros(
+            topbar,
+            &statusbar_stamps_at(topbar, base_offsets),
+            statusbar,
+        );
+        for slot in 0..base_offsets.len() {
+            let mut moved = base_offsets;
+            moved[slot] += 100;
+            let cuts =
+                statusbar_phase_micros(topbar, &statusbar_stamps_at(topbar, moved), statusbar);
+            assert_ne!(
+                cuts, base,
+                "moving stamp {slot} changed no cut, so that boundary is not \
+                 read and the split has one fewer seam than it claims",
+            );
+            assert_eq!(
+                cuts.iter().sum::<u32>(),
+                micros(topbar, statusbar),
+                "moving stamp {slot} broke the telescope, so the nine no \
+                 longer decompose the parent",
+            );
+        }
+    }
+
     /// **The seven cuts are a decomposition of `ui.stack`, not a sample of
     /// it.**
     ///
@@ -2909,6 +3273,9 @@ mod tests {
                 dialog: shell + std::time::Duration::from_micros(500),
                 panes: shell + std::time::Duration::from_micros(5_000),
                 applied: shell + std::time::Duration::from_micros(5_500),
+                statusbar_cuts: statusbar_stamps_flat(
+                    ui_start + std::time::Duration::from_micros(2_500),
+                ),
                 stack,
                 panes_cuts: squallar_egui::shell_api::PanesCuts::default(),
             },
@@ -3310,6 +3677,7 @@ mod tests {
                 dialog: shell,
                 panes: shell,
                 applied: shell,
+                statusbar_cuts: statusbar_stamps_flat(start),
                 stack,
                 panes_cuts: squallar_egui::shell_api::PanesCuts::default(),
             });
@@ -3363,6 +3731,168 @@ mod tests {
             (2, 2),
             "the parent cut does not hold the four samples this test drove \
              through it -- two interact, two idle -- so the per-step equality above proved nothing",
+        );
+    }
+
+    /// **`frame statusbar (*)`'s `n` is `frame ui (statusbar)`'s `n`, on every
+    /// frame and not only in the total** —
+    /// `the_stack_family_records_on_exactly_the_frames_its_parent_does`, one
+    /// cut back.
+    ///
+    /// Every figure this split supports is its own `sum` over the parent
+    /// cut's `sum`, so the claim is about the frame SET and the object has to
+    /// be the trajectory — the pair after each frame — and not the pair at the
+    /// end. A family that skipped one frame and double-recorded another ends
+    /// level with its parent while never once having shared its denominator.
+    ///
+    /// **And a frame that drew no bar still contributes a sample.** That is
+    /// what makes `gate` a reading rather than an absence on a phone-width or
+    /// faded frame: `render_status_bar` is called on every frame that leaves
+    /// `ui_phases`, and it returns stamps on every path it can take.
+    #[test]
+    fn the_statusbar_family_records_on_exactly_the_frames_its_parent_does() {
+        let mut ledger = super::FrameLedger::default();
+
+        let agree = |ledger: &super::FrameLedger, after: &str| {
+            let parent = ledger.ui.statusbar.totals();
+            for (name, family) in [
+                ("gate", &ledger.statusbar.gate),
+                ("open", &ledger.statusbar.open),
+                ("buttons", &ledger.statusbar.buttons),
+                ("chip", &ledger.statusbar.chip),
+                ("scan", &ledger.statusbar.scan),
+                ("age", &ledger.statusbar.age),
+                ("hover", &ledger.statusbar.hover),
+                ("error", &ledger.statusbar.error),
+                ("close", &ledger.statusbar.close),
+            ] {
+                assert_eq!(
+                    family.totals(),
+                    parent,
+                    "after {after}: `frame statusbar ({name})` stands at {:?} \
+                     (interact, idle) samples against its parent \
+                     `frame ui (statusbar)`'s {:?}. Every share this family \
+                     supports is its own sum over that one, so a step where \
+                     the two disagree is a share computed between two \
+                     different frame sets -- even if they end level",
+                    family.totals(),
+                    parent,
+                );
+            }
+            parent
+        };
+        agree(&ledger, "no frames at all");
+
+        // **All three paths the bar can take, in both populations.** A drawn
+        // bar crosses all eight boundaries; a collapsed one crosses two and
+        // fills six from one clock read; a compact or faded frame crosses none
+        // and files its whole cut under `gate`. All three must record, and the
+        // stamps come off the real clock because `skipped_after` and
+        // `collapsed_after` read it themselves -- a synthetic timeline could
+        // not carry those arms without the two disagreeing about "now".
+        let mut expect = (0u64, 0u64);
+        for (path, interacted) in [
+            ("drawn", true),
+            ("collapsed", true),
+            ("not drawn", true),
+            ("drawn", false),
+            ("collapsed", false),
+            ("not drawn", false),
+        ] {
+            let start = Instant::now();
+            let bar = match path {
+                "not drawn" => {
+                    squallar_egui::shell_api::StatusbarStamps::skipped_after(Instant::now())
+                }
+                "collapsed" => {
+                    // The collapsed path crosses `opened` and `buttoned` and
+                    // carries the last of them into the six after it, which
+                    // is what `render_status_bar`'s epilogue does.
+                    let gated = Instant::now();
+                    let opened = Instant::now();
+                    let buttoned = Instant::now();
+                    squallar_egui::shell_api::StatusbarStamps {
+                        gated,
+                        opened,
+                        buttoned,
+                        chipped: buttoned,
+                        scanned: buttoned,
+                        aged: buttoned,
+                        hovered: buttoned,
+                        errored: buttoned,
+                    }
+                }
+                _ => squallar_egui::shell_api::StatusbarStamps {
+                    gated: Instant::now(),
+                    opened: Instant::now(),
+                    buttoned: Instant::now(),
+                    chipped: Instant::now(),
+                    scanned: Instant::now(),
+                    aged: Instant::now(),
+                    hovered: Instant::now(),
+                    errored: Instant::now(),
+                },
+            };
+            let statusbar = Instant::now();
+            let shell = Instant::now();
+            let ui_end = Instant::now();
+            ledger.cur.start = Some(start);
+            ledger.cur.setup = Some(start);
+            ledger.cur.ui_start = Some(start);
+            ledger.cur.ui_end = Some(ui_end);
+            ledger.cur.acquire = Some((ui_end, ui_end));
+            ledger.cur.present_return = Some(ui_end);
+            ledger.cur.ui_phases = Some(UiPhaseStamps {
+                polled: start,
+                laid_out: start,
+                topbar: start,
+                statusbar,
+                statusbar_cuts: bar,
+                shell,
+                dialog: shell,
+                panes: shell,
+                applied: shell,
+                stack: stack_stamps_flat(statusbar),
+                panes_cuts: squallar_egui::shell_api::PanesCuts::default(),
+            });
+            ledger.finalize(interacted);
+            let parent = agree(&ledger, path);
+            if interacted {
+                expect.0 += 1;
+            } else {
+                expect.1 += 1;
+            }
+            assert_eq!(
+                parent, expect,
+                "the parent cut did not take a sample from a frame that left \
+                 ui_phases under the population the frame belongs to, so the \
+                 equality above is holding two families level at a standstill \
+                 rather than through a frame",
+            );
+        }
+
+        // **A frame with no `ui_phases` at all.** The parent takes no sample
+        // and neither may this family: nine zeros would be nine false
+        // readings, not an absence.
+        let start = Instant::now();
+        let end = Instant::now();
+        ledger.cur.start = Some(start);
+        ledger.cur.setup = Some(start);
+        ledger.cur.ui_start = Some(start);
+        ledger.cur.ui_end = Some(end);
+        ledger.cur.acquire = Some((end, end));
+        ledger.cur.present_return = Some(end);
+        ledger.finalize(true);
+        let parent = agree(&ledger, "a frame that left no ui_phases");
+
+        // **Two families agreeing on ZERO is not proof of anything** -- the
+        // equality above is vacuously true on a ledger no frame ever reached.
+        assert_eq!(
+            parent,
+            (3, 3),
+            "the parent cut does not hold the six samples this test drove \
+             through it -- three interact, three idle -- so the per-step \
+             equality above proved nothing",
         );
     }
 
@@ -3449,6 +3979,7 @@ mod tests {
                 dialog: shell,
                 panes: shell,
                 applied: shell,
+                statusbar_cuts: statusbar_stamps_flat(start),
                 stack: stack_stamps_flat(statusbar),
                 panes_cuts: if charged {
                     panes_cuts([1_000, 0, 0, 0, 2_000, 0, 0])
@@ -4924,6 +5455,9 @@ mod tests {
             dialog: dusty_start + std::time::Duration::from_nanos(ns[5]),
             panes: dusty_start + std::time::Duration::from_nanos(ns[6]),
             applied: dusty_start + std::time::Duration::from_nanos(ns[7]),
+            statusbar_cuts: statusbar_stamps_flat(
+                dusty_start + std::time::Duration::from_nanos(ns[2]),
+            ),
             stack: stack_stamps_flat(dusty_start + std::time::Duration::from_nanos(ns[3])),
             panes_cuts: squallar_egui::shell_api::PanesCuts::default(),
         };
@@ -4976,6 +5510,7 @@ mod tests {
                 dialog: Instant::now(),
                 panes: Instant::now(),
                 applied: Instant::now(),
+                statusbar_cuts: statusbar_stamps_flat(topbar),
                 stack: stack_stamps_flat(live_statusbar),
                 panes_cuts: squallar_egui::shell_api::PanesCuts::default(),
             };
@@ -5732,6 +6267,16 @@ mod tests {
             laid_out: at(17),
             topbar: at(18),
             statusbar: at(19),
+            statusbar_cuts: squallar_egui::shell_api::StatusbarStamps {
+                gated: at(18),
+                opened: at(18),
+                buttoned: at(18),
+                chipped: at(18),
+                scanned: at(18),
+                aged: at(18),
+                hovered: at(18),
+                errored: at(18),
+            },
             stack: squallar_egui::shell_api::StackStamps {
                 snapped: at(20),
                 gated: at(21),

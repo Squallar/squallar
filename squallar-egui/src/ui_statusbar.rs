@@ -20,12 +20,17 @@ pub(super) const RESTORE_LABEL: &str = "\u{23f5}";
 impl super::Gui {
     /// The status bar along the bottom, floating over the map — on the two wide
     /// widths only.
+    ///
+    /// Returns where it crossed its own eight interior boundaries, so the
+    /// App's ledger can cut `ui.statusbar` with them — see
+    /// [`crate::shell_api::StatusbarStamps`], which names every cut and says
+    /// why the ends are the parent's and not this call's.
     pub(super) fn render_status_bar(
         &mut self,
         ctx: &egui::Context,
         map_rect: egui::Rect,
         actions: &mut Vec<GuiAction>,
-    ) {
+    ) -> crate::shell_api::StatusbarStamps {
         self.statusbar_rect = None;
         self.status_bar_tick = None;
         if self.layout.width == WidthClass::Compact {
@@ -33,14 +38,14 @@ impl super::Gui {
             {
                 self.probes.last_status_bar = super::StatusBarProbe::default();
             }
-            return;
+            return crate::shell_api::StatusbarStamps::skipped_after(web_time::Instant::now());
         }
         let Some(fade) = self.chrome_fade() else {
             #[cfg(test)]
             {
                 self.probes.last_status_bar = super::StatusBarProbe::default();
             }
-            return;
+            return crate::shell_api::StatusbarStamps::skipped_after(web_time::Instant::now());
         };
         let expanded_factor = crate::frame_need::animate_bool(
             ctx,
@@ -62,6 +67,16 @@ impl super::Gui {
         let frame = super::shell::chrome_frame(&ctx.global_style());
         let margin = frame.inner_margin;
         let inner_width = map_rect.width() - 2.0 * BAR_INSET - margin.sum().x;
+        let gated = web_time::Instant::now();
+
+        // The six stamps the closure below takes, hoisted out of it: the
+        // `Area`'s own placement and the `Frame`'s `Ui` are inside the call,
+        // so a stamp taken after it returns could not separate them from the
+        // widgets. `None` is the boundary the frame did not reach, and the
+        // epilogue fills each one from the last one it did — which is what
+        // makes an unreached cut read exactly zero rather than borrow the
+        // clock's dust.
+        let mut cuts: [Option<web_time::Instant>; 7] = [None; 7];
 
         let area = egui::Area::new(egui::Id::new("status_bar"))
             .order(egui::Order::Middle)
@@ -74,6 +89,7 @@ impl super::Gui {
                 frame.show(ui, |ui| {
                     fade::dim(ui, fade);
                     if expanded_factor <= 0.0 {
+                        cuts[0] = Some(web_time::Instant::now());
                         fade::dim(ui, restore_factor);
                         let restore = ui
                             .button(RESTORE_LABEL)
@@ -85,6 +101,7 @@ impl super::Gui {
                         if restore.clicked() {
                             self.statusbar_collapsed = false;
                         }
+                        cuts[1] = Some(web_time::Instant::now());
                         return;
                     }
                     if self.statusbar_collapsed {
@@ -94,6 +111,7 @@ impl super::Gui {
                     ui.set_width(inner_width);
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
+                        cuts[0] = Some(web_time::Instant::now());
 
                         let collapse_text = self
                             .chrome_galleys
@@ -125,6 +143,7 @@ impl super::Gui {
                                 .push(GuiAction::FetchRadarScan(self.active_pane_fetch_config()));
                         }
                         refresh_button.hover_text("Refresh radar data");
+                        cuts[1] = Some(web_time::Instant::now());
 
                         ui.separator();
 
@@ -151,6 +170,7 @@ impl super::Gui {
                         #[cfg(not(test))]
                         let _ = drawn;
                         ui.separator();
+                        cuts[2] = Some(web_time::Instant::now());
 
                         let scan_text = render_scan_info(
                             ui,
@@ -165,6 +185,7 @@ impl super::Gui {
                         }
                         #[cfg(not(test))]
                         let _ = scan_text;
+                        cuts[3] = Some(web_time::Instant::now());
 
                         let age_text = render_product_age(
                             ui,
@@ -177,6 +198,7 @@ impl super::Gui {
                         }
                         #[cfg(not(test))]
                         let _ = age_text;
+                        cuts[4] = Some(web_time::Instant::now());
 
                         if has_hover {
                             ui.separator();
@@ -186,6 +208,7 @@ impl super::Gui {
                                 probe.hover = true;
                             }
                         }
+                        cuts[5] = Some(web_time::Instant::now());
 
                         let radar_error = self.layer_error(&crate::radar_layer::POLL_LAYER);
                         if radar_error.is_some() {
@@ -206,6 +229,7 @@ impl super::Gui {
                                 self.dismiss_layer_error(&crate::radar_layer::POLL_LAYER);
                             }
                         }
+                        cuts[6] = Some(web_time::Instant::now());
                     });
                 });
             });
@@ -220,6 +244,27 @@ impl super::Gui {
         }
         #[cfg(not(test))]
         let _ = area;
+
+        // **Carry forward, never `now()`**, for `StatusbarStamps::skipped_after`'s
+        // reason: a boundary the frame did not cross takes the last one it
+        // did, so the cut it opens reads exactly zero. The collapsed path
+        // crosses the first two and none of the rest; a compact or faded
+        // frame returned above and never reached here at all.
+        let mut last = gated;
+        let stamped = cuts.map(|at| {
+            last = at.unwrap_or(last);
+            last
+        });
+        crate::shell_api::StatusbarStamps {
+            gated,
+            opened: stamped[0],
+            buttoned: stamped[1],
+            chipped: stamped[2],
+            scanned: stamped[3],
+            aged: stamped[4],
+            hovered: stamped[5],
+            errored: stamped[6],
+        }
     }
 }
 
@@ -530,6 +575,10 @@ pub(super) fn render_error_display(
     }
     close
 }
+
+#[cfg(test)]
+#[path = "ui_statusbar/cut_tests.rs"]
+mod cut_tests;
 
 #[cfg(test)]
 mod age_format {

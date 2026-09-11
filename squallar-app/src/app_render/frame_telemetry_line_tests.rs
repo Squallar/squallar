@@ -1112,6 +1112,10 @@ fn every_frame_cut_family_the_app_writes_is_scraped_and_windowed_by_the_rig() {
         ("frame stack", "stack"),
         // The same, one cut across: the split below `frame ui (panes)`.
         ("frame panes", "panes"),
+        // And one cut back: the split below `frame ui (statusbar)`, on the
+        // same terms — a probe that reads it and a window prefix that keeps
+        // it once read.
+        ("frame statusbar", "statusbar"),
         ("frame post", "post"),
         ("frame pump", "pump"),
         ("frame dispatch", "dispatch"),
@@ -1503,6 +1507,12 @@ fn every_frame_line_family_the_app_writes_has_a_named_rig_probe() {
         // anything looser than the literal `frame content (` would scrape
         // `frame panes (content)` as one of its own ten.
         ("content", &["frame_content_re"]),
+        // `frame ui (statusbar)`, opened up — `stack`'s sibling one cut back,
+        // and a sixth prefix for the same reason one cut across: `statusbar`
+        // is also a `ui` CUT NAME, so a probe anchored on anything looser than
+        // the literal `frame statusbar (` would scrape `frame ui (statusbar)`
+        // as one of its own nine.
+        ("statusbar", &["frame_statusbar_re"]),
         // Three probes, one family word. `frame service less present (…)`
         // is the SAME `service` family word — the enumeration below reads to
         // the first non-lowercase character — and it is deliberately the
@@ -2406,6 +2416,7 @@ fn every_instance_scoped_telemetry_family_is_claimed_by_a_probe_or_a_reason() {
             ByAnyInstance(&["frame_service_less_present_re"]),
         ),
         ("frame stack", ByAnyInstance(&["frame_stack_re"])),
+        ("frame statusbar", ByAnyInstance(&["frame_statusbar_re"])),
         ("frame ui", ByAnyInstance(&["frame_ui_re"])),
         // **The bar's own three populations, and they are spelled.** These are
         // the only frame-ledger rows whose reader hard-codes its instance, so
@@ -3198,6 +3209,167 @@ fn the_rig_reads_the_stack_lines_the_app_actually_writes() {
         pattern("frame_stack_re").starts_with("frame stack \\("),
         "the rig's stack probe is no longer anchored on the literal the check \
          above tests for, so that check has stopped covering the collision",
+    );
+}
+
+/// The `frame statusbar (…)` sentence, pinned as a literal.
+///
+/// Same formatter as `frame ui (…)` and `frame stack (…)`, and deliberately a
+/// **sixth prefix**: the nine are cuts of `frame ui (statusbar)`, which is
+/// itself a cut of `frame segment (ui)`. The `sum=` is the load-bearing field
+/// — 3 x 100 = 300, where every percentile of that histogram answers the
+/// bin's 106 us upper edge, which is why no share may be read off a
+/// percentile.
+#[test]
+fn the_frame_statusbar_line_reads_exactly_as_pinned() {
+    let mut h = Hist::new();
+    for _ in 0..3 {
+        h.record(100);
+    }
+    let mut slots = [0u32; 42];
+    slots[3] = 3;
+    let expected_hist = slots.map(|c| c.to_string()).join(",");
+    let (_, idle) = idle_half_pin();
+    assert_eq!(
+        super::named_split_line("frame statusbar", "chip", &split_pin(&h)),
+        format!(
+            "frame statusbar (chip): interact n=3, sum=300 us, p50=106 us, p90=106 us, \
+             p99=106 us, hist={expected_hist}{idle}"
+        ),
+    );
+}
+
+/// All nine `statusbar` cuts are emitted, under their own names, every tick —
+/// and each carries its own histogram.
+///
+/// The `n` conjunct is what stops a mis-wired call from reading green: `scan`
+/// carrying `age`'s histogram would keep every name right and every figure
+/// wrong. Those two are neighbours across a seam this split exists to
+/// resolve — both are per-frame `format!`-and-lay-out paths that switch on
+/// once data loads — so a swap there would answer the question with the
+/// wrong one of the pair.
+#[test]
+fn every_statusbar_phase_is_reported_under_its_own_name() {
+    let mut phases = crate::frame_ledger::StatusbarHists::default();
+    for (slot, hist) in [
+        &mut phases.gate,
+        &mut phases.open,
+        &mut phases.buttons,
+        &mut phases.chip,
+        &mut phases.scan,
+        &mut phases.age,
+        &mut phases.hover,
+        &mut phases.error,
+        &mut phases.close,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for _ in 0..=slot {
+            hist.record(1_000, true);
+        }
+        // A DIFFERENT idle count in every position, so a formatter that
+        // printed one half twice, or crossed the two, cannot read green.
+        for _ in 0..slot + 2 {
+            hist.record(1_000, false);
+        }
+    }
+    let lines = super::frame_statusbar_lines(&phases);
+    let names = [
+        "gate", "open", "buttons", "chip", "scan", "age", "hover", "error", "close",
+    ];
+    assert_eq!(lines.len(), names.len());
+    for (slot, (line, name)) in lines.iter().zip(names).enumerate() {
+        assert!(
+            line.starts_with(&format!(
+                "frame statusbar ({name}): interact n={}, ",
+                slot + 1
+            )) && line.contains(&format!("; idle n={}, ", slot + 2)),
+            "statusbar cut {slot} reported as {line:?}, which is not {name}'s \
+             line carrying {name}'s histogram",
+        );
+    }
+}
+
+/// **The `statusbar` cuts do not collide with the two levels above them.**
+///
+/// Three spellings name a `statusbar`: `frame segment (ui)` contains it,
+/// `frame ui (statusbar)` IS it, and `frame statusbar (…)` opens it up. A rig
+/// regex anchored loosely enough to match two of them would read a cut as its
+/// own parent — and because the nine sum to `frame ui (statusbar)`, which sums
+/// into `frame segment (ui)`, the mistake is *plausible arithmetic* rather
+/// than an obvious null.
+#[test]
+fn the_statusbar_cut_lines_are_not_mistakable_for_their_parents() {
+    let mut h = Hist::new();
+    h.record(1_000);
+    let parent_cut = super::named_split_line("frame ui", "statusbar", &split_pin(&h));
+    assert!(
+        !parent_cut.starts_with("frame statusbar ("),
+        "the `frame ui (statusbar)` line {parent_cut:?} reads as one of its \
+         own cuts, so a reader would add the nine to the one they decompose",
+    );
+    let segment_line = super::named_split_line("frame segment", "ui", &split_pin(&h));
+    assert!(
+        !segment_line.starts_with("frame statusbar ("),
+        "the ui segment line {segment_line:?} reads as a statusbar cut",
+    );
+    for line in super::frame_statusbar_lines(&crate::frame_ledger::StatusbarHists::default()) {
+        assert!(
+            line.starts_with("frame statusbar ("),
+            "a statusbar cut is not under the cut prefix: {line:?}",
+        );
+        assert!(
+            !line.starts_with("frame ui ("),
+            "the statusbar cut {line:?} reads as a tenth `ui` cut, which a \
+             reader would add to the `ui` nine it is already inside",
+        );
+        assert!(
+            !line.starts_with("frame segment"),
+            "the statusbar cut {line:?} reads as a seventh frame segment",
+        );
+    }
+}
+
+/// The rig's `frame statusbar` probe reads what the app writes.
+///
+/// A family the app writes and the rig has no regex for is ABSENT from the
+/// artifact rather than empty — the failure `0216ecaf0` shipped one cut
+/// across, where `native_row.py` picked the new family up by SHAPE and
+/// `drive.py`, which reads by name, did not. Firefox governs over Chrome on
+/// the web target, so the arm that would have gone silent is the governing
+/// one.
+#[test]
+fn the_rig_reads_the_statusbar_lines_the_app_actually_writes() {
+    let mut h = Hist::new();
+    h.record(100);
+    h.record(4_000);
+    let hist = counts_string(&h);
+    assert_eq!(
+        super::named_split_line("frame statusbar", "error", &split_pin(&h)),
+        rendered_split(
+            &pattern("frame_statusbar_re"),
+            "error",
+            ["2", "4100", "106", "4757", "4757", &hist]
+        ),
+        "the `frame statusbar (…)` line and the rig's probe have drifted",
+    );
+    // **The probe's own anchor may not appear in the line it decomposes.**
+    // `frame_statusbar_re` is anchored on the literal `frame statusbar (`, and
+    // the parent cut's line spells `frame ui (statusbar):` — one substring
+    // away from being scraped as one of its own nine, which would read as
+    // plausible arithmetic rather than as a null.
+    let parent = super::named_split_line("frame ui", "statusbar", &split_pin(&h));
+    assert!(
+        !parent.contains("frame statusbar ("),
+        "the rig's statusbar anchor appears in the `frame ui (statusbar)` line \
+         it decomposes: {parent:?}",
+    );
+    assert!(
+        pattern("frame_statusbar_re").starts_with("frame statusbar \\("),
+        "the rig's statusbar probe is no longer anchored on the literal the \
+         check above tests for, so that check has stopped covering the \
+         collision",
     );
 }
 

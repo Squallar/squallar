@@ -412,9 +412,11 @@ pub struct FrameDiagnostics<'a> {
 /// nine cuts, from the two widenings that landed after it was written. A lane
 /// that sizes its arrays off a stated count rather than off the fields writes
 /// against the wrong shape, so the count is restated here whenever a stamp is
-/// added — [`StackStamps`] below is the ninth through the fourteenth, and it
-/// deliberately does NOT change the nine: those six bound cuts of `stack`,
-/// which is one cut of this family, not a tenth beside them. [`PanesCuts`] is
+/// added — [`StackStamps`] below is the ninth through the fourteenth and
+/// [`StatusbarStamps`] the fifteenth through the twenty-second, and neither
+/// changes the nine: those bound cuts of `stack` and of `statusbar`, which are
+/// one cut of this family each, not a tenth and eleventh beside them.
+/// [`PanesCuts`] is
 /// not a stamp at all — it is nanosecond sums over `render_panes`' pane loop
 /// — and for the same reason does not change the nine either.
 #[derive(Clone, Copy, Debug)]
@@ -455,6 +457,14 @@ pub struct UiPhaseStamps {
     /// App's call site keeps its tuple arity and the App layer gains no new
     /// reach into the Gui: the six ride the stamps the ledger already takes.
     pub stack: StackStamps,
+    /// Where `render_status_bar` crossed its own eight interior boundaries —
+    /// [`UiPhaseStamps::topbar`] to [`UiPhaseStamps::statusbar`], opened up.
+    /// See [`StatusbarStamps`].
+    ///
+    /// **Carried inside this struct rather than returned beside it**, on
+    /// [`UiPhaseStamps::stack`]'s terms exactly: the App's call site keeps its
+    /// tuple arity and the App layer gains no new reach into the Gui.
+    pub statusbar_cuts: StatusbarStamps,
     /// Where `render_panes` spent the seventh cut — [`UiPhaseStamps::dialog`]
     /// to [`UiPhaseStamps::panes`], opened up. See [`PanesCuts`].
     ///
@@ -541,6 +551,114 @@ impl StackStamps {
             statused: now,
             rendered: now,
             inspected: now,
+        }
+    }
+}
+
+/// Where `Gui::render_status_bar` crossed its own boundaries — the eight
+/// interior stamps that cut `ui.statusbar`, the fourth of [`UiPhaseStamps`]'
+/// nine.
+///
+/// # Why this exists
+///
+/// `ui.statusbar` is one undivided cut over a call that draws two buttons, a
+/// chip, two formatted clock lines, a pointer readout and a dismissable error
+/// banner, and nothing in the tree could say which of those a frame paid for.
+/// It is not the small sibling its neighbour `topbar` is: read off 344
+/// archived native legs (877,783 presented frames, the largest population
+/// this tree holds for it), the two halves are **mean 130.3 µs over 104,213
+/// interact frames and 95.4 µs over 135,738 idle ones**, with 546 and 495
+/// frames at or over 4 ms — the bin edge, so those two counts are exact and
+/// not percentile estimates. On the six-pane legs it owns 16.9 % of the whole
+/// `ui` segment and is LARGER than `stack`, which has had a seven-way split
+/// since `ff0e7c2e5`.
+///
+/// **Instants, not durations**, for [`UiPhaseStamps`]' reason exactly: the
+/// parent's own two boundaries already exist (`topbar` and `statusbar`), so
+/// eight interior instants make nine contiguous cuts that telescope to the
+/// parent rather than summing to something near it.
+///
+/// # No `residual` field, and that is deliberate
+///
+/// The ninth cut (`close`) closes on the parent's own right boundary and the
+/// first (`gate`) opens on its left one, so no `statusbar` time can hide in
+/// an unnamed tail — [`StackStamps`]' reasoning, which is
+/// `frame_ledger::PostHists::close`'s. What a subtraction would leave is
+/// `frame_ledger::micros`' truncation dust, bounded at eight microseconds for
+/// nine cuts and never over.
+///
+/// **`gate` opens on the parent's boundary and not on this call's entry.**
+/// That is what puts `ui.available_rect_before_wrap()` — the one statement
+/// `render_shell_phased` runs between the `topbar` stamp and this call —
+/// inside a named cut rather than in a residual nobody would look at.
+#[derive(Clone, Copy, Debug)]
+pub struct StatusbarStamps {
+    /// After everything that can decide this frame draws no bar at all: the
+    /// compact-width gate, the chrome fade, the two collapse/restore slide
+    /// animations, the pointer-modality read and the frame style. **Holds the
+    /// whole span when the bar is not drawn** — both early returns are inside
+    /// it, which is why it is also the cut that exists on every path.
+    pub gated: web_time::Instant,
+    /// After the `Area` is placed and its `Frame` opened, down to the first
+    /// widget: the area layout, the frame's inner `Ui`, the dim pass and the
+    /// row's own `horizontal` open. On the collapsed path this closes at the
+    /// top of the restore branch instead, so `buttons` holds the restore
+    /// button and the six cuts after it read zero.
+    pub opened: web_time::Instant,
+    /// After the collapse and refresh buttons — two galleys through
+    /// `chrome_galley`, two `Button`s, their hover text and their click
+    /// reads — or after the restore button on the collapsed path.
+    pub buttoned: web_time::Instant,
+    /// After the auto-poll chip: `archive_fetching`, the three `ArchivePoll`
+    /// questions, `chunk_status` over the liveness slice,
+    /// `render_auto_poll_status`' own `format!`s and label, and the
+    /// `note_clock_change` compare that buys the frame restating a clock.
+    pub chipped: web_time::Instant,
+    /// After `render_scan_info` — a `format!` over the site name and a
+    /// `UserPreferences::timezone` datetime format, **rebuilt on every frame
+    /// a scan is loaded**, plus the label that lays it out.
+    pub scanned: web_time::Instant,
+    /// After `render_product_age` — `chrono::Utc::now()`, a second timezone
+    /// datetime format and a second `format!`, on the same per-frame terms,
+    /// plus a separator and a label. Zero on a pane whose image carries no
+    /// data time.
+    pub aged: web_time::Instant,
+    /// After the pointer readout: the two `find_map`s over the panes and the
+    /// labels they draw. Zero when the pointer modality is not a mouse.
+    pub hovered: web_time::Instant,
+    /// After the radar layer's error banner: the retry-ledger read that asks
+    /// whether there is one, and on the frames there is, the right-to-left
+    /// scope and `render_error_display`. **The read happens on every frame**
+    /// and the draw on the frames a fetch is failing, which is what makes
+    /// this cut the difference between a healthy origin and a sick one.
+    pub errored: web_time::Instant,
+}
+
+impl StatusbarStamps {
+    /// Every boundary the frame did not reach, at **one** clock read.
+    ///
+    /// The two early returns (`Compact` width, a faded chrome) skip seven of
+    /// the nine regions, and the collapsed path skips six. Filling their
+    /// stamps from a single instant is what makes those cuts read exactly
+    /// zero and leaves `gate` holding the remainder; a fresh `now()` per slot
+    /// would scatter the clock's own dust across cuts that ran no code, which
+    /// is a figure about the instrument rather than about the frame.
+    ///
+    /// **Recording is never skipped on these frames**, on
+    /// [`StackStamps::skipped_after`]'s terms: a narrower `n` than the parent
+    /// cut's would break the one property that makes the split arithmetic.
+    #[must_use]
+    pub fn skipped_after(gated: web_time::Instant) -> Self {
+        let now = web_time::Instant::now();
+        Self {
+            gated,
+            opened: now,
+            buttoned: now,
+            chipped: now,
+            scanned: now,
+            aged: now,
+            hovered: now,
+            errored: now,
         }
     }
 }

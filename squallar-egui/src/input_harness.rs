@@ -124,6 +124,11 @@ pub(crate) struct InputHarness {
     max_texture_side: Option<usize>,
     /// The [`GuiAction`]s `Gui::ui` returned from the last frame.
     last_actions: Vec<crate::actions::GuiAction>,
+    /// **Where the last frame crossed `Gui::ui_phased`'s own boundaries** —
+    /// the stamps the App's ledger cuts its `ui` segment with, kept so a test
+    /// can assert over the shipped instrument rather than over a fixture of
+    /// it. `None` before the first frame.
+    last_phases: Option<crate::shell_api::UiPhaseStamps>,
     /// **How many retired overlay payloads the last frame's drain moved.**
     ///
     /// The production caller hands these to the worker's discard pool; the
@@ -446,6 +451,7 @@ impl InputHarness {
             last_rect_fills: Vec::new(),
             max_texture_side: None,
             last_actions: Vec::new(),
+            last_phases: None,
             last_retired: 0,
             last_texts: Vec::new(),
             last_images: Vec::new(),
@@ -2092,6 +2098,22 @@ impl InputHarness {
     }
 
     /// The actions the last frame's `Gui::ui` emitted.
+    /// Collapse or restore the status bar without driving its button, so a
+    /// test can reach the collapsed path at any width.
+    pub(crate) fn set_status_bar_collapsed_for_test(&mut self, collapsed: bool) {
+        self.gui.set_statusbar_collapsed_for_test(collapsed);
+    }
+
+    /// Where the last frame crossed `ui_phased`'s boundaries — the very
+    /// stamps the App's ledger cuts `ui` with. Panics before the first frame:
+    /// a `None` read as "no phases" would be a fixture assertion wearing an
+    /// instrument's clothes.
+    pub(crate) fn last_phases(&self) -> &crate::shell_api::UiPhaseStamps {
+        self.last_phases
+            .as_ref()
+            .expect("no frame has run, so there are no phase stamps to read")
+    }
+
     pub(crate) fn last_actions(&self) -> &[crate::actions::GuiAction] {
         &self.last_actions
     }
@@ -2636,8 +2658,9 @@ impl InputHarness {
         // `ui_phased`, not `ui`: the third return is the frame's retired
         // batch, and the harness counts it so a test can assert the seam
         // moved something.
-        let (actions, _phases, retired) = self.gui.ui_phased(&ctx);
+        let (actions, phases, retired) = self.gui.ui_phased(&ctx);
         self.last_actions = actions;
+        self.last_phases = Some(phases);
         self.last_retired = retired.len();
 
         // The double-render guard, enforced on every frame any test runs:

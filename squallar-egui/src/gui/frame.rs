@@ -359,6 +359,10 @@ impl Gui {
                 dialog: dialog_done,
                 panes,
                 applied,
+                // The status bar's own eight, on the same terms: the fourth
+                // `ui` cut opened up, taken inside `render_status_bar` and
+                // carried rather than returned beside the tuple.
+                statusbar_cuts: shell.statusbar_cuts,
                 // The stack's own six, taken inside `render_shell_phased` and
                 // carried here rather than returned beside the tuple: the
                 // App's call site keeps its arity and gains no new reach.

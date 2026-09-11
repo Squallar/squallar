@@ -2464,6 +2464,14 @@ impl Gui {
         &self.presets
     }
 
+    /// Collapse or restore the status bar directly, for fixtures — the
+    /// collapsed path is otherwise reachable only by clicking a button whose
+    /// rect moves with the layout.
+    #[cfg(test)]
+    pub(crate) fn set_statusbar_collapsed_for_test(&mut self, collapsed: bool) {
+        self.statusbar_collapsed = collapsed;
+    }
+
     #[cfg(test)]
     pub(crate) fn control_render_passes_for_test(&self) -> u32 {
         self.probes.control_render_passes

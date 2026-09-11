@@ -97,6 +97,11 @@ pub(super) struct ShellPhased {
     pub topbar: web_time::Instant,
     /// After `render_status_bar`; the remainder is the stack and inspector.
     pub statusbar: web_time::Instant,
+    /// Where the status bar crossed its own eight interior boundaries — the
+    /// `topbar`..`statusbar` span above, opened up. See
+    /// [`crate::shell_api::StatusbarStamps`]. **The span's own two ends are
+    /// the two stamps either side of it here**, not fields of that type.
+    pub statusbar_cuts: crate::shell_api::StatusbarStamps,
     /// Where that remainder crossed its own six interior boundaries — see
     /// [`crate::shell_api::StackStamps`]. The stack was the single largest
     /// piece of the shell and the owner of the `ui` tail while it was one
@@ -129,7 +134,7 @@ impl super::Gui {
         // rect every floating surface positions itself in.
         let map_rect = ui.available_rect_before_wrap();
 
-        self.render_status_bar(ui.ctx(), map_rect, &mut actions);
+        let statusbar_cuts = self.render_status_bar(ui.ctx(), map_rect, &mut actions);
         let statusbar = web_time::Instant::now();
 
         let stack = self.render_stack_and_inspector(ui.ctx(), map_rect, &mut actions);
@@ -142,6 +147,7 @@ impl super::Gui {
             },
             topbar,
             statusbar,
+            statusbar_cuts,
             stack,
         }
     }

@@ -3745,6 +3745,11 @@ var frame_panes_re = /frame panes \(([a-z0-9-]+)\): interact n=(\d+), sum=(\d+) 
 // own reasoning one level further down: `content` is also a `panes` CUT NAME,
 // so anything looser than the literal `frame content (` would scrape
 // `frame panes (content)` as one of its own ten.
+// `frame ui (statusbar)`, opened up -- a SIXTH prefix, on `frame_content_re`'s
+// own reasoning one cut across: `statusbar` is also a `ui` CUT NAME, so
+// anything looser than the literal `frame statusbar (` would scrape
+// `frame ui (statusbar)` as one of its own nine.
+var frame_statusbar_re = /frame statusbar \(([a-z0-9-]+)\): interact n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+); idle n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var frame_content_re = /frame content \(([a-z0-9-]+)\): interact n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+); idle n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 // `frame finish (*)` decomposes the frame tail. **Its denominator is not
 // the others': it is recorded for EVERY presented frame, idle included,
@@ -3859,6 +3864,7 @@ var frame_ui_all = [];
 var frame_stack_all = [];
 var frame_panes_all = [];
 var frame_content_all = [];
+var frame_statusbar_all = [];
 var frame_finish_all = [];
 var frame_worst_all = [];
 var begins = [], loops = [];
@@ -4097,6 +4103,10 @@ for (var i = 0; i < C.length; i++) {
   // never added to `frame panes (*)`, `frame ui (*)` or `frame segment (ui)`.
   x = frame_content_re.exec(m);
   if (x) push_split(frame_content_all, t, x);
+  // `frame ui (statusbar)`, opened up. Same denominator by construction,
+  // never added to `frame ui (*)` and never to `frame segment (ui)`.
+  x = frame_statusbar_re.exec(m);
+  if (x) push_split(frame_statusbar_all, t, x);
   x = frame_pump_re.exec(m);
   if (x) push_split(frame_pump_all, t, x);
   x = frame_post_re.exec(m);
@@ -4328,6 +4338,7 @@ return { interact: interact, idle: idle, segments: segments, prep: prep,
          frame_stack_all: frame_stack_all,
          frame_panes_all: frame_panes_all,
          frame_content_all: frame_content_all,
+         frame_statusbar_all: frame_statusbar_all,
          frame_pump_all: frame_pump_all,
          frame_post_all: frame_post_all,
          frame_finish_all: frame_finish_all,
@@ -4990,6 +5001,7 @@ class FrameLineWatcher:
                             ("frame_stack_all", "stack"),
                             ("frame_panes_all", "panes"),
                             ("frame_content_all", "content"),
+                            ("frame_statusbar_all", "statusbar"),
                             ("frame_pump_all", "pump"),
                             ("frame_post_all", "post"),
                             ("frame_finish_all", "finish"),
@@ -5479,7 +5491,7 @@ def _window_stats(watcher, t0, t1, out):
 WINDOW_FAMILY_PREFIXES = ("segment:", "prepare:", "post:", "dispatch:",
                           "pre:", "ui:", "stack:", "panes:", "pump:",
                           "finish:", "take:", "phase:", "lesspresent:",
-                          "content:")
+                          "content:", "statusbar:")
 
 
 def watcher_named_in(gw):

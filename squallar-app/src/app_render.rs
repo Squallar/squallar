@@ -1560,6 +1560,70 @@ fn frame_ui_lines(u: &crate::frame_ledger::UiHists) -> [String; 9] {
     ]
 }
 
+/// The nine `frame statusbar (<name>):` lines — `frame ui (statusbar)`,
+/// opened up.
+///
+/// Denominator: **exactly `frame ui (statusbar)`'s**, and by construction
+/// rather than by inspection — the nine `record` calls sit inside the very
+/// guard the fourth `ui` cut's does, so the two families' `n` cannot differ.
+/// The nine are contiguous cuts of that one span, so their sums telescope to
+/// its sum to within the truncation [`named_hist_line`] describes.
+///
+/// **Never added to `frame ui (*)` and never to `frame segment (ui)`.** Each
+/// is the one below it, opened up, and adding any pair double-counts the same
+/// microseconds under two headings. The prefix is a sixth spelling —
+/// `frame statusbar`, not `frame ui` — precisely so that a reader
+/// pattern-matching on `frame ui` cannot sum two levels of one span. And for
+/// `frame_content_lines`' hazard one level across: `statusbar` is itself a
+/// `ui` CUT NAME, so a rig pattern looser than the literal
+/// `frame statusbar (` would scrape `frame ui (statusbar)` as one of these
+/// nine. `drive.py`'s `frame_statusbar_re` is anchored on that literal.
+///
+/// **`frame statusbar (gate)` is the not-drawn reading.** Both of
+/// `render_status_bar`'s early returns — a compact width and a faded chrome —
+/// are inside that cut, and so is the shell's own
+/// `available_rect_before_wrap()`. A large `gate` is a finding about the
+/// decision, not about the drawing. On a phone-width leg it is the whole cut
+/// by construction and the other eight are structural zeros.
+///
+/// # Which of the nine to read first
+///
+/// `chip`, `scan` and `age` are the three per-frame format-and-lay-out paths
+/// that switch on once data loads, and `error` is the banner that draws only
+/// while a fetch is failing. Those four are where a leg whose `statusbar`
+/// stepped up and stayed there should be read; `open`, `buttons` and `close`
+/// are flat furniture that should move with neither the scene nor the data,
+/// and a move in one of THOSE is a finding about egui.
+///
+/// # What these nine cannot answer
+///
+/// `frame_stack_lines`' whole closing section applies here word for word and
+/// is not repeated: `Hist` carries no maximum, every percentile it prints is a
+/// bin EDGE and a lower bound, and `frame worst:` latches on **`service`** and
+/// not on any cut — so `ui_statusbar=9572 us` on that line is a lower bound on
+/// this cut's maximum and on how often it is reached, never the maximum.
+///
+/// **These nine add no column to `frame worst:`,** deliberately. `drive.py`
+/// parses that line positionally across 106 capture groups, so nine new
+/// columns would reindex every downstream consumer of it. What the nine lines
+/// here carry instead is the `sum` — exact, never estimated — which is what a
+/// share is read off.
+///
+/// Emitted every tick, `n=0` included, on [`frame_segment_lines`]' terms.
+fn frame_statusbar_lines(b: &crate::frame_ledger::StatusbarHists) -> [String; 9] {
+    [
+        named_split_line("frame statusbar", "gate", &b.gate),
+        named_split_line("frame statusbar", "open", &b.open),
+        named_split_line("frame statusbar", "buttons", &b.buttons),
+        named_split_line("frame statusbar", "chip", &b.chip),
+        named_split_line("frame statusbar", "scan", &b.scan),
+        named_split_line("frame statusbar", "age", &b.age),
+        named_split_line("frame statusbar", "hover", &b.hover),
+        named_split_line("frame statusbar", "error", &b.error),
+        named_split_line("frame statusbar", "close", &b.close),
+    ]
+}
+
 /// The seven `frame stack (<name>):` lines — `frame ui (stack)`, opened up.
 ///
 /// Denominator: **exactly `frame ui (stack)`'s**, and by construction rather
@@ -3607,6 +3671,14 @@ impl super::App {
         // denominator, six contiguous cuts of that one span — a decomposition
         // of the line above, never a seventh segment beside it.
         for line in frame_ui_lines(ledger.ui_phases()) {
+            say_telemetry(loud, &line);
+        }
+        // One level below the nine above: which part of the status bar owns
+        // the cut that had nothing beneath it. Same denominator as
+        // `frame ui (statusbar)` by construction, nine contiguous cuts of that
+        // one cut — never added to it and never to `frame segment (ui)`. See
+        // `frame_statusbar_lines`.
+        for line in frame_statusbar_lines(ledger.statusbar_phases()) {
             say_telemetry(loud, &line);
         }
         // One level below the nine above: which part of the layer stack owns
