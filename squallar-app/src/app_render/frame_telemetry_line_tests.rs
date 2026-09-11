@@ -1842,8 +1842,10 @@ fn every_telemetry_row_the_sibling_modules_write_is_claimed_by_a_probe_or_a_reas
     /// FALL — `arch_ratchets`' discipline, for its reason.
     const UNREAD_CEILING: usize = 12;
     /// A floor under the extraction, so a rename that makes it match *nothing*
-    /// fails loudly rather than passing over an empty list.
-    const KNOWN_FAMILY_FLOOR: usize = 16;
+    /// fails loudly rather than passing over an empty list. Raised 16 -> 17 when
+    /// `80ddbbbe8` landed `payload share:`; a floor may rise to what is known to
+    /// be there, unlike `UNREAD_CEILING`, which may only fall.
+    const KNOWN_FAMILY_FLOOR: usize = 17;
 
     let claims: &[(&str, Claim)] = &[
         // THE ROW THIS GATE WAS ADDED FOR. Absent rather than zeroed when no
@@ -1892,6 +1894,17 @@ fn every_telemetry_row_the_sibling_modules_write_is_claimed_by_a_probe_or_a_reas
         // The family that made `By` too narrow: no `drive.py` var, and the
         // native half declares its own pattern for it.
         ("overlay pictures", ByNative(&["OVERLAY_PICTURES_RE"])),
+        // THE GATE'S FIRST REAL CATCH. `80ddbbbe8` landed this row while this
+        // gate sat committed and unlanded, and the gate reddened naming it on
+        // the first run after the rebase. Instance #3 of the class, and the
+        // first one found by a gate rather than by a person grepping.
+        //
+        // Narrower than `archive spill:` was, and the difference matters: that
+        // counter had no reader anywhere outside its own crate. This one is
+        // asserted in eight tests and cross-validates byte-exactly against a
+        // counting allocator. What was missing was only the RIG's ability to
+        // scrape it -- "no rig pattern", not "no reader".
+        ("payload share", By(&["payload_share_re"])),
         (
             "radar dup volumes",
             Unread("the duplicate-volume census; unclaimed"),

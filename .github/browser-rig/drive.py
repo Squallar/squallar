@@ -2764,6 +2764,9 @@ var cmdstream_unparsed = null;
 var action_budget_all = [];
 var action_budget_unparsed = null;
 var archive_spill = null;
+var payload_share = null;
+var payload_share_all = [];
+var payload_share_unparsed = null;
 var archive_spill_all = [];
 var archive_spill_unparsed = null;
 var off_re = /([A-Za-z0-9_-]+) took (\d+) ms off the frame/;
@@ -2845,6 +2848,26 @@ var action_budget_loose_re = /action budget: \d+ handled/;
 // for a day; reported as `null`, never as a zero.
 var archive_spill_re = /archive spill: on-disk (\d+) B in (\d+), spilled (\d+), refused-full (\d+), store-failed (\d+), restored (\d+), restore-misses (\d+)/;
 var archive_spill_loose_re = /archive spill: on-disk \d+ B/;
+// **The payload-share counters, and this row is spelled for a KEYED reader.**
+// Its emitter's doc says so: every figure carries its `key=` "so a reader
+// parses by name and a reorder cannot silently move a column". The keys are
+// therefore IN this pattern rather than implied by position -- a reorder makes
+// the match fail loudly instead of moving `returned` into `adopted`'s column.
+// `native_row.py` additionally falls back to a true by-name parse when this
+// fails, and SAYS it did, so a reordered line is still read rather than lost.
+//
+// Five running totals. `adopted_mib` and `returned_mib` are the emitter's own
+// INTEGER-DIVIDED MiB (`bytes / (1024 * 1024)`), so they are truncated and a
+// sub-MiB adoption reads 0: they are not byte figures and must never be
+// multiplied back up as though they were exact.
+//
+// `copied` is 0 BY CONSTRUCTION -- every `impl DataMoment` publishes its gate
+// buffer, so `from_moment_data` has no copying arm -- and a NON-ZERO reading
+// here falsifies the module's premise rather than reporting movement. That is
+// the opposite polarity to every other counter on this row and is why it is
+// never summed with them.
+var payload_share_re = /payload share: adopted=(\d+) adopted_mib=(\d+) returned=(\d+) returned_mib=(\d+) copied=(\d+)/;
+var payload_share_loose_re = /payload share: adopted=/;
 // A THIRD denominator, and it is added to neither of the two above. These
 // count archive tile BODIES DECODED, split by the archive header's declared
 // tile_type: `vector` is the self-hosted basemap's MVT, `raster` the terrain
@@ -3093,6 +3116,20 @@ for (var i = 0; i < C.length; i++) {
   // signal "no spill here" -- so a reshaped row impersonating it would erase
   // the one distinction the row was built to carry.
   else if (archive_spill_loose_re.test(m)) archive_spill_unparsed = m;
+  var psm = payload_share_re.exec(m);
+  if (psm) {
+    payload_share = { adopted: parseInt(psm[1], 10),
+                      adopted_mib: parseInt(psm[2], 10),
+                      returned: parseInt(psm[3], 10),
+                      returned_mib: parseInt(psm[4], 10),
+                      copied: parseInt(psm[5], 10) };
+    payload_share_all.push({ t: C[i].t, adopted: payload_share.adopted,
+                             adopted_mib: payload_share.adopted_mib,
+                             returned: payload_share.returned,
+                             returned_mib: payload_share.returned_mib,
+                             copied: payload_share.copied });
+  }
+  else if (payload_share_loose_re.test(m)) payload_share_unparsed = m;
   var bm = basemap_re.exec(m);
   if (bm) basemap = { vector_tiles: parseInt(bm[1], 10),
                       raster_tiles: parseInt(bm[2], 10),
@@ -3193,6 +3230,8 @@ return { attached: attached, different: different, off_frame: off_frame,
          action_budget_unparsed: action_budget_unparsed,
          archive_spill: archive_spill, archive_spill_all: archive_spill_all,
          archive_spill_unparsed: archive_spill_unparsed,
+         payload_share: payload_share, payload_share_all: payload_share_all,
+         payload_share_unparsed: payload_share_unparsed,
          basemap: basemap, ground: ground, floor: floor,
          tile_cache: tile_cache, tile_cache_all: tile_cache_all,
          tile_bodies: tile_bodies,

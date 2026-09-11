@@ -188,6 +188,7 @@ PROBE_NAMES = (
     "frame_need_re",
     "action_budget_re",
     "archive_spill_re",
+    "payload_share_re",
     "gesture_begin_re",
     "gesture_loop_re",
 )
@@ -617,6 +618,7 @@ def scrape(lines, probes):
         "frame_need": [],
         "action_budget": [],
         "archive_spill": [],
+        "payload_share": [],
         "overlay_pictures": [],
         "segments": [],
         # `{key: [Reading]}` for every per-family line present, keyed the
@@ -663,6 +665,7 @@ def scrape(lines, probes):
             ("frame_need", "frame_need_re"),
             ("action_budget", "action_budget_re"),
             ("archive_spill", "archive_spill_re"),
+            ("payload_share", "payload_share_re"),
             ("loop_state", "loop_state_re"),
         ):
             m = probes[probe].search(line)
@@ -686,6 +689,29 @@ def scrape(lines, probes):
         if ("archive spill: on-disk" in line
                 and not probes["archive_spill_re"].search(line)):
             out["unparsed"].append((idx, "archive_spill_re", line.strip()[:200]))
+        # `payload share:` is spelled for a KEYED reader -- its emitter's doc
+        # says every figure carries its `key=` so "a reorder cannot silently
+        # move a column". The strict probe embeds the keys, so a reorder fails
+        # it; rather than lose the reading, parse the pairs BY NAME and record
+        # that the fallback fired. A fallback that succeeded silently would hide
+        # a producer change, and one that did not exist would discard a line the
+        # row was explicitly designed to keep readable.
+        if "payload share: adopted=" in line:
+            if not probes["payload_share_re"].search(line):
+                pairs = dict(re.findall(r"([a-z_]+)=(\d+)", line))
+                need = ("adopted", "adopted_mib", "returned", "returned_mib", "copied")
+                if all(k in pairs for k in need):
+                    out["payload_share"].append(
+                        (idx, [int(pairs[k]) for k in need]))
+                    out["unparsed"].append(
+                        (idx, "payload_share_re(BY-NAME FALLBACK: the strict "
+                         "pattern no longer matches, the five keys were read by "
+                         "name instead -- the emitter reordered or renamed a "
+                         "field and the strict probe needs re-pointing)",
+                         line.strip()[:200]))
+                else:
+                    out["unparsed"].append(
+                        (idx, "payload_share_re", line.strip()[:200]))
         # `budget state` is a level too, but its first group is the bracket's
         # NAME, so it cannot ride the all-`int()` loop above: the word is kept
         # as text and the fifteen figures after it are ints. Every group is
@@ -2601,6 +2627,34 @@ def build_row(args, scraped, probes):
             "claimed on this leg was delivered by something else"
         )
 
+    # **Whether a moment's gate buffer was ADOPTED or COPIED.**
+    #
+    # Five running totals differenced over the bracket, and the two `_mib`
+    # figures are the emitter's own INTEGER-DIVIDED MiB (`bytes / 1024 / 1024`),
+    # so they are truncated: a sub-MiB adoption reads 0 and no byte figure can
+    # be recovered from them. They are reported as the MiB counts they are and
+    # never multiplied back up, which is the same mistake as reading a
+    # histogram's bin edge as a value.
+    #
+    # `copied` runs the OTHER WAY from every counter beside it. It is 0 by
+    # construction -- every `impl DataMoment` publishes its gate buffer, so
+    # `from_moment_data` has no arm that must copy -- so a rise here falsifies
+    # the cut's premise instead of measuring its work. It is never added to the
+    # other four and a non-zero reading is escalated, not averaged.
+    ps = diff_totals(scraped["payload_share"], start_idx, end_idx)
+    payload_share = (None if ps is None else {
+        "adopted": ps[0], "adopted_mib": ps[1],
+        "returned": ps[2], "returned_mib": ps[3],
+        "copied": ps[4],
+        "premise_held": ps[4] == 0,
+    })
+    if payload_share is not None and not payload_share["premise_held"]:
+        notes.append(
+            "`payload share:` copied=%d over the bracket, and that counter is 0 "
+            "BY CONSTRUCTION: a non-zero reading means `from_moment_data` grew a "
+            "non-sharing arm, so the cut's premise is false. This is a "
+            "FALSIFIER, not a byte figure" % payload_share["copied"])
+
     # Basemap state, on `run_measure.sh`'s own two-counter terms.
     bt = diff_totals(scraped["basemap"], start_idx, end_idx)
     g = diff_totals(scraped["ground"], start_idx, end_idx)
@@ -2694,6 +2748,7 @@ def build_row(args, scraped, probes):
         # the exact reading it exists to make impossible.
         "action_budget": action_budget,
         "archive_spill": archive_spill,
+        "payload_share": payload_share,
         # `(line, bracket, [fifteen ints])`, or None when the log has no
         # `budget state:` line -- a binary older than the line, kept apart
         # from a live binary reporting zeroes.
@@ -3022,6 +3077,26 @@ def print_row(row):
                asp["refused_full"], asp["store_failed"], asp["restored"],
                asp["restore_misses"],
                "FIRED" if asp["armed_and_fired"] else "DID NOT FIRE")
+        )
+    ps = row.get("payload_share")
+    if ps is None:
+        print(
+            "ROW   payload share: n/a (no `payload share:` line brackets this "
+            "window -- a binary older than the row. The app emits it on every "
+            "loud tick unconditionally, so this is never a leg that adopted "
+            "nothing)"
+        )
+    else:
+        print(
+            "ROW   payload share: %s adopted (%s MiB), %s returned (%s MiB) "
+            "[over the bracket; the two MiB figures are the emitter's own "
+            "INTEGER-DIVIDED MiB, truncated, never byte figures]; copied %s -> "
+            "PREMISE %s"
+            % (ps["adopted"], ps["adopted_mib"], ps["returned"],
+               ps["returned_mib"], ps["copied"],
+               "HELD (0 by construction, and it read 0)"
+               if ps["premise_held"] else
+               "FALSIFIED: a non-sharing arm exists")
         )
     tb = row.get("tile_bodies")
     if tb is None:
@@ -6042,6 +6117,146 @@ class ArchiveSpillTests(unittest.TestCase):
         self.assertTrue(
             any(p == "archive_spill_re" for _idx, p, _line in scraped["unparsed"]),
             scraped["unparsed"])
+
+
+
+class PayloadShareTests(unittest.TestCase):
+    """`payload share:`, the row this rig's enumeration gate caught.
+
+    `80ddbbbe8` landed it while the gate sat committed and unlanded; the gate
+    reddened naming it on the first run after the rebase. The row was never
+    unread in the broad sense -- eight tests assert its counter and it
+    cross-validates byte-exactly against a counting allocator -- it was
+    unreadable BY A RIG, which is a narrower and more precise claim.
+    """
+
+    LINE = ("[..] INFO payload share: adopted=%d adopted_mib=%d returned=%d "
+            "returned_mib=%d copied=%d")
+
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.load = os.path.join(self._tmp.name, "load")
+        with open(self.load, "w", encoding="utf-8") as fh:
+            for i in range(6):
+                fh.write("%d\t1.0\n" % (1_000_000 + 5 * i))
+        self.probes = compile_probes()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _row(self, lines):
+        row = build_row(_leg_args(self.load, 1), scrape(lines, self.probes), self.probes)
+        return row, _capture(lambda: print_row(row))
+
+    def test_the_probe_is_drive_pys_own(self):
+        self.assertEqual(
+            drive_pattern("payload_share_re"),
+            r"payload share: adopted=(\d+) adopted_mib=(\d+) returned=(\d+) "
+            r"returned_mib=(\d+) copied=(\d+)")
+
+    def test_the_probe_matches_the_line_the_rust_emitter_formats(self):
+        """Against `budget_telemetry::payload_share_line`'s own format string,
+        key for key. A probe matching a line this test invented rather than the
+        one the app writes reads every leg as a binary too old to have it."""
+        line = ("payload share: adopted=412 adopted_mib=2 returned=409 "
+                "returned_mib=2 copied=0")
+        m = self.probes["payload_share_re"].search(line)
+        self.assertIsNotNone(m, "the probe does not match the emitted line")
+        self.assertEqual([int(g) for g in m.groups()], [412, 2, 409, 2, 0])
+
+    def test_drive_py_reads_each_group_into_the_field_it_belongs_to(self):
+        text = _read(DRIVE_PY)
+        pattern = drive_pattern("payload_share_re", text)
+        fields = [("adopted", 412), ("adopted_mib", 7), ("returned", 409),
+                  ("returned_mib", 5), ("copied", 3)]
+        line = ("payload share: adopted=%d adopted_mib=%d returned=%d "
+                "returned_mib=%d copied=%d" % tuple(v for _, v in fields))
+        m = re.search(pattern, line)
+        self.assertIsNotNone(m)
+        groups = m.groups()
+        body = text[text.index("var psm = payload_share_re.exec(m);"):]
+        body = body[:body.index("payload_share_all.push")]
+        assigned = re.findall(r"(\w+): parseInt\(psm\[(\d+)\], 10\)", body)
+        self.assertEqual([n for n, _ in assigned], [n for n, _ in fields])
+        for (name, expected), (_, at) in zip(fields, assigned):
+            self.assertEqual(
+                int(groups[int(at) - 1]), expected,
+                "drive.py reads group %s into `%s`, which carries %s not %s"
+                % (at, name, groups[int(at) - 1], expected))
+
+    def test_the_row_windows_the_five_totals(self):
+        lines = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE)
+        out, seen = [], 0
+        for line in lines:
+            out.append(line)
+            if "gesture script pan-zoom-2d loop complete" in line:
+                seen += 1
+                out.append(self.LINE % (100 * seen, 3 * seen, 90 * seen, 2 * seen, 0))
+        row, text = self._row(out)
+        ps = row["payload_share"]
+        self.assertIsNotNone(ps)
+        self.assertEqual(ps["adopted"] % 100, 0)
+        self.assertGreater(ps["adopted"], 0)
+        self.assertEqual(ps["copied"], 0)
+        self.assertTrue(ps["premise_held"])
+        self.assertIn("ROW   payload share: ", text)
+        self.assertIn("PREMISE HELD", text)
+        self.assertIn("INTEGER-DIVIDED MiB", text)
+
+    def test_a_non_zero_copied_falsifies_the_premise_rather_than_measuring_work(self):
+        """`copied` runs the other way from every counter beside it: it is 0 by
+        construction, so a rise means `from_moment_data` grew a non-sharing arm
+        and the cut's premise is false."""
+        lines = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE)
+        out, seen = [], 0
+        for line in lines:
+            out.append(line)
+            if "gesture script pan-zoom-2d loop complete" in line:
+                seen += 1
+                out.append(self.LINE % (100 * seen, 3 * seen, 90 * seen, 2 * seen, 4 * seen))
+        row, text = self._row(out)
+        ps = row["payload_share"]
+        self.assertGreater(ps["copied"], 0)
+        self.assertFalse(ps["premise_held"])
+        self.assertIn("PREMISE FALSIFIED", text)
+        self.assertTrue(any("FALSIFIER" in n for n in row["notes"]), row["notes"])
+
+    def test_a_reordered_line_is_read_BY_NAME_and_says_that_it_was(self):
+        """The row's emitter doc promises a reorder cannot silently move a
+        column. The strict probe embeds the keys so a reorder fails it; the
+        by-name fallback then reads the five keys anyway AND records that it
+        fired, so the reading survives and the producer change is still visible.
+        A silent fallback would hide the change; no fallback would discard a
+        line built to stay readable."""
+        out = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE)
+        out.append("[..] INFO payload share: adopted=412 returned=409 "
+                   "adopted_mib=2 returned_mib=2 copied=0")
+        scraped = scrape(out, self.probes)
+        self.assertEqual(len(scraped["payload_share"]), 1,
+                         "the by-name fallback did not read the reordered line")
+        self.assertEqual(scraped["payload_share"][0][1], [412, 2, 409, 2, 0],
+                         "the fallback read the keys into the wrong slots")
+        self.assertTrue(
+            any("BY-NAME FALLBACK" in p for _idx, p, _l in scraped["unparsed"]),
+            "the fallback fired without announcing itself, which hides a "
+            "producer change: %r" % (scraped["unparsed"],))
+
+    def test_a_line_missing_a_key_entirely_is_unparsed_not_invented(self):
+        out = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE)
+        out.append("[..] INFO payload share: adopted=412 returned=409")
+        scraped = scrape(out, self.probes)
+        self.assertEqual(scraped["payload_share"], [])
+        self.assertTrue(
+            any(p == "payload_share_re" for _idx, p, _l in scraped["unparsed"]),
+            scraped["unparsed"])
+
+    def test_a_binary_older_than_the_line_says_so_rather_than_zero(self):
+        row, text = self._row(_leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE))
+        self.assertIsNone(row["payload_share"])
+        self.assertIn("ROW   payload share: n/a", text)
+        self.assertNotIn("ROW   payload share: 0 adopted", text)
 
 
 class FrameNeedTests(unittest.TestCase):
