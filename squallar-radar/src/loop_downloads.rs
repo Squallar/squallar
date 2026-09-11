@@ -138,6 +138,15 @@ pub enum L3FrameState {
 /// Manages loop radar download state: scan cache, in-flight tracking,
 /// and per-pane pending download queues. Grouping these together prevents
 /// partial updates that could leave the fields in an inconsistent state.
+/// The most outstanding ceiling evictions [`LoopDownloadManager`] remembers at
+/// once, so an instrument built for a memory campaign is not itself unbounded.
+/// One entry is a site string and a stamp; 4096 of them is a few hundred KiB at
+/// the very worst, against a realistic occupancy of a few dozen — the set
+/// self-prunes the moment a volume is filed again. Past it the set stops
+/// growing and `ceiling_churn`'s `saturated` says the return count has become a
+/// lower bound.
+const CEILING_OUTSTANDING_CAP: usize = 4096;
+
 pub struct LoopDownloadManager {
     /// Downloaded scan data cache for loop frames, keyed by site then timestamp
     /// (shared across every pane looping that site).
@@ -307,6 +316,50 @@ pub struct LoopDownloadManager {
     /// field instead.
     scan_over_arrivals: u64,
     scan_over_arrival_bytes: u64,
+    /// **What the decoded byte ceiling's eviction pass has actually done, and
+    /// how much of it it had to UNDO** — the counters behind
+    /// [`Self::ceiling_churn`].
+    ///
+    /// # Why the cycle is the quantity and the event is not
+    ///
+    /// `evict_decoded_to_ceiling` frees bytes by throwing away a decoded
+    /// volume and keeping its archive, so the cost of being wrong is a decode
+    /// (6.0 / 10.7 / 40.9 ms measured) and never a network round trip. That
+    /// makes a *single* eviction of a volume nothing ever wants again very
+    /// nearly free — it is the policy working. What is NOT free is evicting a
+    /// volume the loop immediately needs back: the ceiling then buys its bytes
+    /// with a decode, and a ceiling set low enough to do that continuously
+    /// buys them over and over. A count of evictions cannot tell those two
+    /// apart, and they are the difference between a cut and a regression.
+    ///
+    /// So `returns` is the figure that matters: an eviction this pass made
+    /// that had to be undone. `evictions - returns` is the clean half.
+    ///
+    /// # `asked` and `over`, for the reason every fires-counter needs them
+    ///
+    /// A pass that is never called and a pass called on a cache that is
+    /// already under the ceiling both evict nothing, and a byte figure reads 0
+    /// for both. `asked` counts the calls and `over` the calls that found work,
+    /// so "armed and idle" is a positive reading and not an absence — the
+    /// distinction a ~94 MiB cut on this campaign lacked when its counter read
+    /// 0 B on all 530 ticks.
+    ceiling_asks: u64,
+    ceiling_over: u64,
+    ceiling_evictions: u64,
+    ceiling_evicted_bytes: u64,
+    ceiling_returns: u64,
+    ceiling_returned_bytes: u64,
+    /// Keys this pass evicted that have not been filed again. **Self-pruning**:
+    /// an entry leaves the moment [`Self::cache_scan`] files its key, which is
+    /// the event it exists to detect, so it holds only evictions still
+    /// outstanding rather than a history of them.
+    ///
+    /// Capped at [`CEILING_OUTSTANDING_CAP`] because an instrument on a memory
+    /// campaign may not itself be unbounded. Past the cap it stops growing and
+    /// `ceiling_returns` becomes a LOWER BOUND, which `saturated` says out
+    /// loud rather than letting the figure quietly under-report.
+    ceiling_outstanding: std::collections::HashSet<(String, chrono::NaiveDateTime)>,
+    ceiling_saturated: bool,
     /// **One physical volume decoded twice, arriving at a second address** —
     /// the counters behind [`Self::identity_duplication`].
     ///
@@ -575,6 +628,14 @@ impl LoopDownloadManager {
             scan_reserve_bootstrap: 0,
             scan_over_arrivals: 0,
             scan_over_arrival_bytes: 0,
+            ceiling_asks: 0,
+            ceiling_over: 0,
+            ceiling_evictions: 0,
+            ceiling_evicted_bytes: 0,
+            ceiling_returns: 0,
+            ceiling_returned_bytes: 0,
+            ceiling_outstanding: std::collections::HashSet::new(),
+            ceiling_saturated: false,
             identity_dup: IdentityDuplication::default(),
             scan_prices: HashMap::new(),
             archives_ever: std::collections::HashSet::new(),
@@ -685,6 +746,14 @@ impl LoopDownloadManager {
                 price / (1024 * 1024),
                 reserved / (1024 * 1024),
             );
+        }
+        // **A volume the decoded ceiling threw away, arriving back.** The
+        // pass bought its bytes with a decode and this is the decode being
+        // paid for, so it is counted here rather than inferred from a later
+        // eviction: `evictions - returns` is then the half that cost nothing.
+        if self.ceiling_outstanding.remove(&(site.to_string(), ts)) {
+            self.ceiling_returns = self.ceiling_returns.saturating_add(1);
+            self.ceiling_returned_bytes = self.ceiling_returned_bytes.saturating_add(price as u64);
         }
         let peak = self.site_scan_peak.entry(site.to_string()).or_insert(0);
         *peak = (*peak).max(price);
@@ -1067,9 +1136,14 @@ impl LoopDownloadManager {
         rank: impl Fn(&str, &chrono::NaiveDateTime) -> u64,
         pinned: impl Fn(&str, &chrono::NaiveDateTime, &nexrad_model::data::Scan) -> bool,
     ) -> Vec<CachedVolume> {
+        // **Asked**, counted before the early return so a pass that found
+        // nothing to do is a positive reading rather than the same 0 a pass
+        // that never ran prints.
+        self.ceiling_asks = self.ceiling_asks.saturating_add(1);
         if self.scan_bytes_cached <= ceiling {
             return Vec::new();
         }
+        self.ceiling_over = self.ceiling_over.saturating_add(1);
         // Candidates only: an entry with no archive or one something is
         // drawing is not a candidate at all, so it is never ranked and can
         // never be reached by the walk below however far over the ceiling
@@ -1113,8 +1187,18 @@ impl LoopDownloadManager {
             // The price row leaves with the volume, so a later re-decode
             // files a fresh one rather than double-charging this cache.
             self.scan_prices.remove(&(site.clone(), ts));
-            self.archives_ever.remove(&(site, ts));
+            self.archives_ever.remove(&(site.clone(), ts));
             self.scan_bytes_cached = self.scan_bytes_cached.saturating_sub(price);
+            self.ceiling_evictions = self.ceiling_evictions.saturating_add(1);
+            self.ceiling_evicted_bytes = self.ceiling_evicted_bytes.saturating_add(price as u64);
+            // **Outstanding until it comes back**, which is what makes the
+            // return detectable at all. Past the cap the set stops growing and
+            // says so, rather than becoming an unbounded history.
+            if self.ceiling_outstanding.len() < CEILING_OUTSTANDING_CAP {
+                self.ceiling_outstanding.insert((site, ts));
+            } else {
+                self.ceiling_saturated = true;
+            }
             removed.push(volume);
         }
         removed
@@ -1752,6 +1836,37 @@ impl LoopDownloadManager {
     /// falsify it from the field.
     pub fn scan_over_arrivals(&self) -> (u64, u64) {
         (self.scan_over_arrivals, self.scan_over_arrival_bytes)
+    }
+
+    /// **What the decoded ceiling's eviction pass has done and had to undo**,
+    /// as running totals for the life of the process — never a level, which is
+    /// why they are reported on a line of their own and never added to
+    /// `LoopDecodedCensus`.
+    ///
+    /// `(asked, over, evictions, evicted_bytes, returns, returned_bytes,
+    /// outstanding, saturated)`.
+    ///
+    /// Reading it: `asked` with `over` at 0 is the ceiling armed and never
+    /// reached — the state a byte figure cannot distinguish from a pass that
+    /// was never wired. `returns` is the thrash: evictions this pass had to
+    /// buy back with a decode. `evictions - returns` is the half that cost
+    /// nothing, which is the policy working as designed. A `returns` that
+    /// tracks `evictions` is a ceiling set below what the scene actually
+    /// needs resident, and it is a FRAME-TIME cost rather than a memory one.
+    ///
+    /// `saturated` means `outstanding` hit its cap and `returns` is a lower
+    /// bound from that point on.
+    pub fn ceiling_churn(&self) -> (u64, u64, u64, u64, u64, u64, usize, bool) {
+        (
+            self.ceiling_asks,
+            self.ceiling_over,
+            self.ceiling_evictions,
+            self.ceiling_evicted_bytes,
+            self.ceiling_returns,
+            self.ceiling_returned_bytes,
+            self.ceiling_outstanding.len(),
+            self.ceiling_saturated,
+        )
     }
 
     /// **What a loop already holds decoded, at its measured size**: of the
@@ -3776,6 +3891,80 @@ mod archive_tests {
     /// under its pane; drop the `archived` skip and the archive-less volume
     /// goes with nothing able to hand it back; reverse the sort and the
     /// nearest frame to the playhead is the one that goes.
+    #[test]
+    fn the_ceiling_counts_the_eviction_it_bought_back_apart_from_the_one_it_did_not() {
+        let one = crate::scan_size::scan_bytes(&priced_volume().0);
+        // Room for three of the five, so exactly two go.
+        let ceiling = one * 3;
+        let mut mgr = LoopDownloadManager::new();
+        for minute in [0, 2, 4, 6, 8] {
+            mgr.cache_scan("KTLX", ts(minute), priced_volume());
+            mgr.cache_archive("KTLX", ts(minute), archive(1024));
+        }
+
+        // **Armed and idle, first**, because it is the reading a byte figure
+        // cannot give: a pass that ran against a cache already under its
+        // ceiling evicts nothing and must still be visible as having run.
+        let under = mgr.evict_decoded_to_ceiling(usize::MAX, |_, _| 0, |_, _, _| false);
+        assert!(under.is_empty());
+        let (asked, over, evicted, ..) = mgr.ceiling_churn();
+        assert_eq!(
+            (asked, over, evicted),
+            (1, 0, 0),
+            "asked but never over: the ceiling is armed and was not reached, \
+             which is not the same world as a pass nobody wired",
+        );
+
+        // Furthest stamp first, so minutes 8 and 6 are the two that go.
+        let rank = |ts: &chrono::NaiveDateTime| {
+            use chrono::Timelike;
+            u64::from(ts.and_utc().minute())
+        };
+        let removed = mgr.evict_decoded_to_ceiling(ceiling, |_, ts| rank(ts), |_, _, _| false);
+        assert_eq!(removed.len(), 2, "fixture: exactly two volumes go");
+        drop(removed);
+        let (asked, over, evicted, evicted_bytes, returned, returned_bytes, outstanding, saturated) =
+            mgr.ceiling_churn();
+        assert_eq!((asked, over, evicted), (2, 1, 2));
+        assert_eq!(evicted_bytes, (one * 2) as u64);
+        assert_eq!(
+            (returned, returned_bytes),
+            (0, 0),
+            "nothing has come back yet, so the whole eviction is still the \
+             free half",
+        );
+        assert_eq!(outstanding, 2);
+        assert!(!saturated);
+
+        // **One of the two comes back**, which is the decode the ceiling
+        // bought its bytes with. The other never does.
+        mgr.cache_scan("KTLX", ts(8), priced_volume());
+        let (_, _, evicted, _, returned, returned_bytes, outstanding, _) = mgr.ceiling_churn();
+        assert_eq!(
+            (returned, returned_bytes),
+            (1, one as u64),
+            "the volume the ceiling threw away and the loop needed back is \
+             the cycle, and it is counted where the decode is PAID rather \
+             than inferred from a later eviction",
+        );
+        assert_eq!(
+            evicted - returned,
+            1,
+            "and the eviction nothing wanted again stays in the free half: a \
+             count of evictions alone cannot tell these two apart, which is \
+             the whole reason this counter is a cycle and not an event",
+        );
+        assert_eq!(outstanding, 1, "the one that never came back is still owed");
+
+        // A volume that was never ceiling-evicted must not count as a return.
+        mgr.cache_scan("KTLX", ts(2), priced_volume());
+        let (_, _, _, _, returned, _, _, _) = mgr.ceiling_churn();
+        assert_eq!(
+            returned, 1,
+            "a re-file of a volume this pass never evicted is not a buy-back",
+        );
+    }
+
     #[test]
     fn the_decoded_ceiling_evicts_the_furthest_and_refuses_the_protected() {
         use chrono::Timelike;

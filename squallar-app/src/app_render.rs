@@ -3849,6 +3849,39 @@ impl super::App {
         // Arm the next pass to take a fresh one, so the walk behind it is paid
         // once a tick rather than once a frame.
         self.loop_decoded_due = true;
+        // **And what that ceiling's pass DID, as running totals.** Its own
+        // line and never a column on the census above: one is a level and
+        // these are totals, and the census says what is resident while this
+        // says what enforcing the ceiling cost. `returned` is the figure a
+        // lowering has to be read against — an eviction bought back with a
+        // decode is a frame-time price paid for a memory saving.
+        {
+            let (
+                asked,
+                over,
+                evicted,
+                evicted_bytes,
+                returned,
+                returned_bytes,
+                outstanding,
+                saturated,
+            ) = self.loop_mgr.ceiling_churn();
+            say_telemetry(
+                loud,
+                &crate::budget_telemetry::loop_ceiling_line(
+                    crate::budget_telemetry::LoopCeilingChurn {
+                        asked,
+                        over,
+                        evicted,
+                        evicted_bytes,
+                        returned,
+                        returned_bytes,
+                        outstanding,
+                        saturated,
+                    },
+                ),
+            );
+        }
         // **Every distinct decoded volume, counted once across all five
         // holders.** A LEVEL, unlike the two running totals above, and never
         // to be added to them or to the census families below — this is the

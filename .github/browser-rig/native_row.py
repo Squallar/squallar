@@ -579,6 +579,39 @@ LOOP_DECODED_RE = re.compile(
     r"pinned (\d+) at (\d+) MiB"
 )
 
+# `loop ceiling: ...` (`squallar_app::budget_telemetry::loop_ceiling_line`),
+# RUNNING TOTALS for the life of the process -- never a level, and never to be
+# differenced against the `loop decoded:` census.
+#
+# WHY THIS ROW IS WORTH A LEG ON ITS OWN. On the six-pane arm a byte delta of
+# ~100 MiB sits inside `loop scans`' 106.07 MiB governing floor AND inside a
+# 50.9 MiB same-binary spread, so a memory claim there cannot be resolved at
+# n=1. These are COUNTS. `returned` is exact: it is the number of decoded
+# volumes the ceiling pass threw away and then had to buy back with a decode,
+# and one is one whatever the noise on the byte figures is. That makes this row
+# quotable by itself rather than as a supporting figure beside a MiB delta.
+#
+# `asked` with `over` at 0 is the ceiling ARMED AND NEVER REACHED -- a positive
+# reading, and the one a byte figure cannot tell from a pass nobody wired.
+# `evicted - returned` is the half that cost nothing.
+LOOP_CEILING_RE = re.compile(
+    r"loop ceiling: asked (\d+), over (\d+); "
+    r"evicted (\d+) at (\d+) MiB; "
+    r"returned (\d+) at (\d+) MiB; net (\d+); "
+    r"outstanding (\d+); saturated (\d+)"
+)
+
+LOOP_CEILING_FIELDS = (
+    "asked", "over", "evicted", "evicted_mib",
+    "returned", "returned_mib", "net", "outstanding", "saturated",
+)
+
+
+def loop_ceiling_reading(m):
+    """A `LOOP_CEILING_RE` match as a dict over `LOOP_CEILING_FIELDS`."""
+    return dict(zip(LOOP_CEILING_FIELDS, (int(g) for g in m.groups())))
+
+
 LOOP_DECODED_FIELDS = (
     "volumes", "bytes_mib", "no_archive", "no_archive_mib",
     "unwanted", "unwanted_mib", "never_archived", "never_archived_mib",
@@ -661,6 +694,7 @@ def scrape(lines, probes):
         "payload_share": [],
         "overlay_pictures": [],
         "loop_decoded": [],
+        "loop_ceiling": [],
         "segments": [],
         # `{key: [Reading]}` for every per-family line present, keyed the
         # browser rig's way (`segment:pre`, `dispatch:hitmap`), and the line
@@ -792,6 +826,11 @@ def scrape(lines, probes):
         m = LOOP_DECODED_RE.search(line)
         if m:
             out["loop_decoded"].append((idx, loop_decoded_reading(m)))
+        # `loop ceiling` is RUNNING TOTALS, so a reader takes the LAST row of a
+        # leg rather than differencing rows, and never adds it to the census.
+        m = LOOP_CEILING_RE.search(line)
+        if m:
+            out["loop_ceiling"].append((idx, loop_ceiling_reading(m)))
         # `frame segments` is NOT one of them: its percentile groups are
         # `(\d+|none|over)`, and `over` is the top-bin clamp, which has no
         # upper edge and is not a number. Kept as text -- it is reported as
@@ -3736,6 +3775,91 @@ class LoopDecodedRowTests(unittest.TestCase):
         got = scrape([line], compile_probes())["loop_decoded"]
         self.assertEqual(len(got), 1)
         self.assertEqual(got[0][1]["pinned"], values[LOOP_DECODED_FIELDS.index("pinned")])
+
+
+class LoopCeilingRowTests(unittest.TestCase):
+    """`LOOP_CEILING_RE` against the EMITTER'S OWN format string.
+
+    Same two-gate shape as `LoopDecodedRowTests`, and needed for the same
+    reason: the enumeration gate in `frame_telemetry_line_tests.rs` claims the
+    ROW and cannot see its COLUMNS, so a ninth figure appended on the producer
+    would pass it silently while the rig went on reading eight.
+
+    This row carries counts rather than a level, and on the six-pane arm the
+    counts are the sharper instrument -- a ~100 MiB byte delta there is inside
+    both a 106.07 MiB governing floor and a 50.9 MiB same-binary spread, while
+    `returned` is exact.
+    """
+
+    ROW_SRC = LoopDecodedRowTests.ROW_SRC
+
+    def _literal(self):
+        src = open(self.ROW_SRC, encoding="utf-8").read()
+        m = re.search(r'("loop ceiling: (?:[^"\\]|\\.)*")', src, re.S)
+        self.assertIsNotNone(m, "the `loop ceiling:` literal is gone from budget_telemetry.rs")
+        return m.group(1)[1:-1]
+
+    def test_the_probe_matches_the_emitters_own_format_string(self):
+        literal = self._literal()
+        values = list(range(3, 3 + len(LOOP_CEILING_FIELDS)))
+        line = LoopDecodedRowTests._rendered(literal, values)
+        m = LOOP_CEILING_RE.search(line)
+        self.assertIsNotNone(m, "LOOP_CEILING_RE does not match the row: %r" % line)
+        self.assertEqual(
+            loop_ceiling_reading(m),
+            dict(zip(LOOP_CEILING_FIELDS, values)),
+            "the probe matched but read the fields in the wrong order",
+        )
+
+    def test_the_field_count_is_pinned_to_the_emitter(self):
+        literal = self._literal()
+        self.assertEqual(
+            len(re.findall(r"\{[^{}]*\}", literal)),
+            len(LOOP_CEILING_FIELDS),
+            "budget_telemetry.rs emits a different number of figures than "
+            "LOOP_CEILING_FIELDS names; update both halves together",
+        )
+        self.assertEqual(LOOP_CEILING_RE.groups, len(LOOP_CEILING_FIELDS))
+
+    def test_armed_and_idle_is_readable_and_is_not_the_same_as_unwired(self):
+        """The distinction the whole row exists for: a pass that ran and found
+        nothing prints `asked N, over 0`, which no byte figure can say."""
+        literal = self._literal()
+        values = [0] * len(LOOP_CEILING_FIELDS)
+        values[LOOP_CEILING_FIELDS.index("asked")] = 530
+        line = LoopDecodedRowTests._rendered(literal, values)
+        r = loop_ceiling_reading(LOOP_CEILING_RE.search(line))
+        self.assertEqual((r["asked"], r["over"], r["evicted"]), (530, 0, 0))
+
+    def test_returned_is_read_as_its_own_count(self):
+        literal = self._literal()
+        values = [1] * len(LOOP_CEILING_FIELDS)
+        values[LOOP_CEILING_FIELDS.index("evicted")] = 91
+        values[LOOP_CEILING_FIELDS.index("returned")] = 74
+        values[LOOP_CEILING_FIELDS.index("net")] = 17
+        line = LoopDecodedRowTests._rendered(literal, values)
+        r = loop_ceiling_reading(LOOP_CEILING_RE.search(line))
+        self.assertEqual((r["evicted"], r["returned"]), (91, 74))
+        # `net` is the half that cost nothing; a reader that took `evicted`
+        # alone for the lasting effect would be out by 74 here. The identity
+        # is checked rather than assumed, so a transposed scrape is caught.
+        self.assertEqual(r["net"], r["evicted"] - r["returned"])
+        self.assertEqual(r["net"], 17)
+
+    def test_it_does_not_match_the_loop_decoded_row(self):
+        self.assertIsNone(LOOP_CEILING_RE.search(
+            "loop decoded: 5 volume(s) at 100 MiB; no archive 4 at 80 MiB; "
+            "unwanted 1 at 20 MiB, never archived 0 at 0 MiB, sole 1 at 20 MiB; "
+            "oldest unwanted 30 s; pinned 1 at 20 MiB"
+        ))
+
+    def test_a_row_scrapes_into_its_family(self):
+        literal = self._literal()
+        values = list(range(3, 3 + len(LOOP_CEILING_FIELDS)))
+        line = LoopDecodedRowTests._rendered(literal, values)
+        got = scrape([line], compile_probes())["loop_ceiling"]
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0][1]["returned"], values[LOOP_CEILING_FIELDS.index("returned")])
 
 
 class DivergenceTests(unittest.TestCase):

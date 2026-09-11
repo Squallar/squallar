@@ -1046,6 +1046,88 @@ pub(crate) struct LoopDecodedCensus {
     pub(crate) pinned_bytes: usize,
 }
 
+/// **What the decoded ceiling's eviction pass did and had to undo**, as
+/// RUNNING TOTALS for the life of the process.
+///
+/// # Its own line, and never a column on `loop decoded:`
+///
+/// `loop decoded:` is a LEVEL read on the telemetry tick. These are totals.
+/// Mixing the two on one line is how a reader ends up differencing a total or
+/// summing a level, and `BaseReleaseCounts` already states the rule: totals
+/// "get a line of their own and are never added to the census". A row of its
+/// own also puts it inside the enumeration gate, which a new FIELD on an
+/// existing row would slip past — that gate keys on the prefix up to the first
+/// colon.
+///
+/// # What each figure answers, and why the event is not the quantity
+///
+/// * `asked` / `over` — calls to `evict_decoded_to_ceiling`, and the calls
+///   that found the cache over the ceiling. **`asked > 0, over = 0` is the
+///   ceiling armed and never reached**, which is a reading; a byte figure
+///   alone prints 0 for that and for a pass nobody wired, and those are
+///   different worlds. The ~94 MiB cut this campaign banked for days had
+///   exactly that ambiguity and turned out to be the second one.
+/// * `evicted` / `evicted_bytes` — volumes the pass removed, at the price the
+///   cache filed them at.
+/// * `returned` / `returned_bytes` — **of those, the ones that came back.**
+///   This is the quantity. An eviction the loop never wants again is very
+///   nearly free: the archive is retained, so the cost of being wrong is a
+///   decode and never a network round trip. An eviction the loop immediately
+///   needs back is the ceiling buying its bytes with a decode, and a ceiling
+///   low enough to do that continuously buys them again and again.
+///   `evicted - returned` is the free half. A `returned` tracking `evicted` is
+///   a ceiling set under what the scene needs resident, and that is a
+///   FRAME-TIME regression wearing a memory saving's clothes.
+/// * `net` — `evicted - returned`, **the figure the whole row is for.** It is
+///   redundant by construction and emitted anyway, for two reasons. It is the
+///   discriminator: a pass that evicted 7,339 volumes to make 57 of them stay
+///   away did 129x the work of one that evicted 57, and the two are
+///   indistinguishable on `evicted` alone — that exact shape was measured on
+///   this campaign's archive ceiling (7,339 spilled against 57 net held, on
+///   the lowered arm and not the baseline, and not load-driven: the baseline
+///   leg at loadavg 405 spilled 64). And the identity `net == evicted -
+///   returned` must hold, so a reader that scraped two of these figures
+///   transposed is caught by arithmetic rather than trusted.
+/// * `outstanding` — evictions not yet returned, the set's own occupancy.
+/// * `saturated` — 1 once that set hit its cap, after which `returned` is a
+///   lower bound and must be read as one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LoopCeilingChurn {
+    pub(crate) asked: u64,
+    pub(crate) over: u64,
+    pub(crate) evicted: u64,
+    pub(crate) evicted_bytes: u64,
+    pub(crate) returned: u64,
+    pub(crate) returned_bytes: u64,
+    pub(crate) outstanding: usize,
+    pub(crate) saturated: bool,
+}
+
+/// Its own line, for the reason on [`LoopCeilingChurn`]; MiB by integer
+/// division, as every byte figure in this module is.
+pub(crate) fn loop_ceiling_line(churn: LoopCeilingChurn) -> String {
+    let LoopCeilingChurn {
+        asked,
+        over,
+        evicted,
+        evicted_bytes,
+        returned,
+        returned_bytes,
+        outstanding,
+        saturated,
+    } = churn;
+    let mib = |bytes: u64| bytes / (1024 * 1024);
+    format!(
+        "loop ceiling: asked {asked}, over {over}; evicted {evicted} at {} MiB; \
+         returned {returned} at {} MiB; net {}; outstanding {outstanding}; \
+         saturated {}",
+        mib(evicted_bytes),
+        mib(returned_bytes),
+        evicted.saturating_sub(returned),
+        u8::from(saturated),
+    )
+}
+
 /// Its own line, never appended to `budget state:`, which is scraped by a
 /// positional regex; MiB by integer division, as every byte figure here is.
 pub(crate) fn loop_decoded_line(census: LoopDecodedCensus) -> String {
@@ -1426,6 +1508,94 @@ mod tests {
     use squallar_device_profile::fit::PaneTerms;
     use squallar_device_profile::quality::DeviceClass;
     use squallar_egui::shell_api::{BudgetReadout, PaneBudget, PoolReadout};
+
+    /// **The `loop ceiling:` row's exact shape and figure count.**
+    ///
+    /// The enumeration gate claims the ROW and is blind to its COLUMNS, so a
+    /// ninth figure appended here would pass it while the rig went on reading
+    /// eight. `native_row.py`'s `LoopCeilingRowTests` holds the other half
+    /// against this same format string.
+    ///
+    /// Eight distinct values, so a transposed pair fails rather than rendering
+    /// identically.
+    #[test]
+    fn the_loop_ceiling_row_names_every_churn_field() {
+        let mib = |n: u64| n * 1024 * 1024;
+        let line = loop_ceiling_line(LoopCeilingChurn {
+            asked: 3,
+            over: 4,
+            evicted: 9,
+            evicted_bytes: mib(6),
+            returned: 7,
+            returned_bytes: mib(8),
+            outstanding: 5,
+            saturated: true,
+        });
+        assert_eq!(
+            line,
+            "loop ceiling: asked 3, over 4; evicted 9 at 6 MiB; \
+             returned 7 at 8 MiB; net 2; outstanding 5; saturated 1",
+        );
+        assert_eq!(
+            line.split_whitespace()
+                .filter(|w| w.trim_end_matches(&[',', ';'][..]).parse::<u64>().is_ok())
+                .count(),
+            9,
+            "the rig's `LOOP_CEILING_RE` reads exactly nine figures",
+        );
+    }
+
+    /// **The thrash signature, as the row renders it.**
+    ///
+    /// The numbers are the ones measured on this campaign's archive ceiling —
+    /// 7,339 evictions to make 57 of them stay away — because a synthetic pair
+    /// would not show how far apart `evicted` and `net` can be. On `evicted`
+    /// alone this pass and a healthy one that evicted 57 are the same row.
+    #[test]
+    fn a_pass_that_undid_almost_everything_it_did_is_visible_as_such() {
+        let line = loop_ceiling_line(LoopCeilingChurn {
+            asked: 8_000,
+            over: 7_900,
+            evicted: 7_339,
+            returned: 7_282,
+            ..Default::default()
+        });
+        assert!(line.contains("evicted 7339"), "{line}");
+        assert!(line.contains("returned 7282"), "{line}");
+        assert!(
+            line.contains("net 57"),
+            "the row must say what all that work actually achieved: {line}",
+        );
+        // The healthy pass with the SAME lasting effect, and the row that
+        // must not look like the one above.
+        let healthy = loop_ceiling_line(LoopCeilingChurn {
+            asked: 8_000,
+            over: 60,
+            evicted: 57,
+            returned: 0,
+            ..Default::default()
+        });
+        assert!(healthy.contains("net 57"), "{healthy}");
+        assert!(healthy.contains("evicted 57"), "{healthy}");
+        assert_ne!(
+            line, healthy,
+            "129x the work for the same net effect must not render identically",
+        );
+    }
+
+    /// **`asked` without `over` is a reading, not an absence.** The state a
+    /// byte figure prints 0 for and a pass nobody wired prints 0 for too.
+    #[test]
+    fn a_ceiling_that_was_armed_and_never_reached_says_so_in_positive_figures() {
+        let line = loop_ceiling_line(LoopCeilingChurn {
+            asked: 530,
+            ..Default::default()
+        });
+        assert!(line.contains("asked 530, over 0"), "{line}");
+        assert!(line.contains("evicted 0 at 0 MiB"), "{line}");
+        assert!(line.contains("net 0"), "{line}");
+        assert!(line.ends_with("saturated 0"), "{line}");
+    }
 
     /// **The `loop decoded:` row's exact shape, and every census field in
     /// it.**

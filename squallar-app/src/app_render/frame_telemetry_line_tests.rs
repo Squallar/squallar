@@ -1845,7 +1845,7 @@ fn every_telemetry_row_the_sibling_modules_write_is_claimed_by_a_probe_or_a_reas
     /// fails loudly rather than passing over an empty list. Raised 16 -> 17 when
     /// `80ddbbbe8` landed `payload share:`; a floor may rise to what is known to
     /// be there, unlike `UNREAD_CEILING`, which may only fall.
-    const KNOWN_FAMILY_FLOOR: usize = 17;
+    const KNOWN_FAMILY_FLOOR: usize = 18;
     // NOTE: no new family landed with `pinned` — it is a FIELD on the existing
     // `loop decoded:` row, which this gate keys past (it reads the prefix up to
     // the first colon). The gate that catches a field addition is
@@ -1888,6 +1888,14 @@ fn every_telemetry_row_the_sibling_modules_write_is_claimed_by_a_probe_or_a_reas
             "host heap watch",
             Unread("the host-heap watch level; the census carries the bytes"),
         ),
+        // CLAIMED on landing, never `Unread`. The running-total twin of
+        // `loop decoded:`: that row says what the decoded cache HOLDS, this
+        // one says what enforcing its ceiling COST. Kept a row of its own
+        // rather than columns on the census because one is a level and these
+        // are totals — and because a new FIELD would slip past this gate,
+        // which keys on the prefix up to the first colon, while a new ROW
+        // cannot.
+        ("loop ceiling", ByNative(&["LOOP_CEILING_RE"])),
         // CLAIMED, and the ceiling fell 12 -> 11 with it. `loop scans` is the
         // largest family on the six-pane arm, and whether its ceiling can be
         // lowered is the question of how much of it is PINNED — decoded
