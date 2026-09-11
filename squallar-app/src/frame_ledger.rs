@@ -940,6 +940,60 @@ pub(crate) struct PanesHists {
     pub(crate) residual: Split,
 }
 
+/// Where the `panes` split's `content` cut went, one level below
+/// [`PanesHists`].
+///
+/// # Denominator
+///
+/// **Exactly [`PanesHists::content`]'s** — presented frames, in each half —
+/// recorded inside the very guard that records it, so the two families' `n`
+/// are equal by construction rather than by inspection. Never added to
+/// `frame panes (content)`: these are it, opened up. The reporting prefix is
+/// `frame content`, a fourth spelling beside `frame ui`, `frame stack` and
+/// `frame panes`, so no reader pattern-matching a prefix can add two levels of
+/// the same span together.
+///
+/// # The residual is a fact about the scene before it is one about the code
+///
+/// `content_ns` is charged at **three** sites — one per render view — and they
+/// are exclusive arms of one `match`. Only the plan-view arm is decomposed
+/// here, because it is the only one that is more than a single call, so a
+/// cross-section or volume pane contributes its whole arm to this family's
+/// residual and to none of the nine named cuts. On an all-plan-view scene the
+/// residual is the `walkers::Map` closure's own head and tail around
+/// `render_pane_map_content` — the zoom read, the armed-gesture tracking and
+/// the `PaneRenderCtx` this crate builds — plus up to eight microseconds of
+/// truncation dust per frame. Read `frame panes (widget)` beside it: a zero
+/// there says the panes were plan views and the residual is small by
+/// construction.
+///
+/// Nanoseconds in, microseconds out, for [`PanesHists`]' reason and by
+/// [`PanesHists`]' route.
+#[derive(Default)]
+pub(crate) struct ContentHists {
+    /// See [`squallar_egui::shell_api::ContentCuts::prologue_ns`].
+    pub(crate) prologue: Split,
+    /// See [`squallar_egui::shell_api::ContentCuts::ground_ns`].
+    pub(crate) ground: Split,
+    /// See [`squallar_egui::shell_api::ContentCuts::labels_ns`].
+    pub(crate) labels: Split,
+    /// See [`squallar_egui::shell_api::ContentCuts::radar_ns`].
+    pub(crate) radar: Split,
+    /// See [`squallar_egui::shell_api::ContentCuts::items_ns`].
+    pub(crate) items: Split,
+    /// See [`squallar_egui::shell_api::ContentCuts::walk_ns`].
+    pub(crate) walk: Split,
+    /// See [`squallar_egui::shell_api::ContentCuts::chrome_ns`].
+    pub(crate) chrome: Split,
+    /// See [`squallar_egui::shell_api::ContentCuts::plates_ns`].
+    pub(crate) plates: Split,
+    /// See [`squallar_egui::shell_api::ContentCuts::dispatch_ns`].
+    pub(crate) dispatch: Split,
+    /// `content` minus the nine above — arithmetic, not inference. See this
+    /// type's note on what a large one means.
+    pub(crate) residual: Split,
+}
+
 /// Where the `post` segment's time went, cut at the seams `handle_redraw`'s
 /// tail has.
 ///
@@ -1377,6 +1431,9 @@ pub(crate) struct FrameLedger {
     /// See [`PanesHists`] — `ui.panes`, opened up, same frames and same two
     /// populations.
     panes: PanesHists,
+    /// See [`ContentHists`] — `ui.panes.content`, opened up, same frames and
+    /// same two populations.
+    content: ContentHists,
     /// See [`PumpHists`] — `segments.pump`, opened up, same frames and same two
     /// populations.
     pump: PumpHists,
@@ -1607,6 +1664,53 @@ fn panes_cut_micros(cuts: squallar_egui::shell_api::PanesCuts, panes: u32) -> [u
         tools,
         credit,
         panes.saturating_sub(claimed),
+    ]
+}
+
+/// The ten cuts of the `panes` split's `content` cut, in call order:
+/// `[prologue, ground, labels, radar, items, walk, chrome, plates, dispatch,
+/// residual]` — see [`ContentHists`], whose fields these are.
+///
+/// `content` is the parent cut in whole microseconds, as [`panes_cut_micros`]
+/// computed it; `cuts` is the nanosecond accumulation
+/// `render_pane_map_content` made across the panes it drew. Saturating and not
+/// asserting, and a free function, for [`panes_cut_micros`]' reasons verbatim.
+fn content_cut_micros(cuts: squallar_egui::shell_api::ContentCuts, content: u32) -> [u32; 10] {
+    let us = |ns: u64| -> u32 { (ns / 1_000).min(u64::from(u32::MAX)) as u32 };
+    let named = [
+        us(cuts.prologue_ns),
+        us(cuts.ground_ns),
+        us(cuts.labels_ns),
+        us(cuts.radar_ns),
+        us(cuts.items_ns),
+        us(cuts.walk_ns),
+        us(cuts.chrome_ns),
+        us(cuts.plates_ns),
+        us(cuts.dispatch_ns),
+    ];
+    let claimed = named.iter().fold(0u32, |sum, &cut| sum.saturating_add(cut));
+    let [
+        prologue,
+        ground,
+        labels,
+        radar,
+        items,
+        walk,
+        chrome,
+        plates,
+        dispatch,
+    ] = named;
+    [
+        prologue,
+        ground,
+        labels,
+        radar,
+        items,
+        walk,
+        chrome,
+        plates,
+        dispatch,
+        content.saturating_sub(claimed),
     ]
 }
 
@@ -2074,6 +2178,11 @@ impl FrameLedger {
         let panes_cuts = m.ui_phases.as_ref().map_or([0u32; 8], |phases| {
             panes_cut_micros(phases.panes_cuts, ui_cuts[6])
         });
+        // And one level further down again, on the same terms: the parent is
+        // `panes_cuts[4]`, which the line above already computed.
+        let content_cuts = m.ui_phases.as_ref().map_or([0u32; 10], |phases| {
+            content_cut_micros(phases.panes_cuts.content, panes_cuts[4])
+        });
 
         // **EVERY family below records on BOTH populations**, which is the
         // 2026-09-10 ruling ("should the 4 ms bar cover every presented
@@ -2244,6 +2353,32 @@ impl FrameLedger {
             self.panes.tools.record(panes_tools, interacted);
             self.panes.credit.record(panes_credit, interacted);
             self.panes.residual.record(panes_residual, interacted);
+            // And one level further down, inside the very guard `panes.content`
+            // records under, so these two families' `n` are equal BY
+            // CONSTRUCTION. Zero new clock reads: `render_pane_map_content`
+            // took them where its walk is.
+            let [
+                content_prologue,
+                content_ground,
+                content_labels,
+                content_radar,
+                content_items,
+                content_walk,
+                content_chrome,
+                content_plates,
+                content_dispatch,
+                content_residual,
+            ] = content_cuts;
+            self.content.prologue.record(content_prologue, interacted);
+            self.content.ground.record(content_ground, interacted);
+            self.content.labels.record(content_labels, interacted);
+            self.content.radar.record(content_radar, interacted);
+            self.content.items.record(content_items, interacted);
+            self.content.walk.record(content_walk, interacted);
+            self.content.chrome.record(content_chrome, interacted);
+            self.content.plates.record(content_plates, interacted);
+            self.content.dispatch.record(content_dispatch, interacted);
+            self.content.residual.record(content_residual, interacted);
         }
         // And the same for `post`, whose right-hand boundary is `now` — the
         // very instant this function opened with, so the sixth cut closes on
@@ -2383,6 +2518,12 @@ impl FrameLedger {
         &self.panes
     }
 
+    /// See [`ContentHists`] — `panes_phases().content`, opened up, and never
+    /// added to it.
+    pub(crate) fn content_phases(&self) -> &ContentHists {
+        &self.content
+    }
+
     pub(crate) fn ui_phases(&self) -> &UiHists {
         &self.ui
     }
@@ -2475,10 +2616,10 @@ impl FrameLedger {
 mod tests {
     use super::{
         DispatchCuts, FinishPhaseStamps, Instant, PRESENT_CUT, PostPhaseStamps, PrePhaseStamps,
-        PumpPhaseStamps, WorstFrame, dispatch_cut_micros, finish_phase_micros, latch_worst, micros,
-        panes_cut_micros, post_phase_micros, pre_phase_micros, prepare_phase_micros,
-        pump_phase_micros, service_less_present_micros, service_micros, stack_phase_micros,
-        ui_phase_micros,
+        PumpPhaseStamps, WorstFrame, content_cut_micros, dispatch_cut_micros, finish_phase_micros,
+        latch_worst, micros, panes_cut_micros, post_phase_micros, pre_phase_micros,
+        prepare_phase_micros, pump_phase_micros, service_less_present_micros, service_micros,
+        stack_phase_micros, ui_phase_micros,
     };
     use squallar_egui::shell_api::UiPhaseStamps;
     use squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps;
@@ -5309,7 +5450,95 @@ mod tests {
             content_ns: seven[4],
             tools_ns: seven[5],
             credit_ns: seven[6],
+            content: squallar_egui::shell_api::ContentCuts::default(),
         }
+    }
+
+    /// A `render_pane_map_content` accumulation stated in nanoseconds, one
+    /// field at a time — [`panes_cuts`]' twin one family further down.
+    fn content_cuts(nine: [u64; 9]) -> squallar_egui::shell_api::ContentCuts {
+        squallar_egui::shell_api::ContentCuts {
+            prologue_ns: nine[0],
+            ground_ns: nine[1],
+            labels_ns: nine[2],
+            radar_ns: nine[3],
+            items_ns: nine[4],
+            walk_ns: nine[5],
+            chrome_ns: nine[6],
+            plates_ns: nine[7],
+            dispatch_ns: nine[8],
+        }
+    }
+
+    /// **The ten telescope to `content`.** `the_panes_cuts_telescope_to_panes`'
+    /// property one level down, and for its reason: the residual is defined as
+    /// the parent minus the nine named, so any plan-view draw time the nine
+    /// do not name is *in* the ninth figure rather than missing from the
+    /// report.
+    #[test]
+    fn the_content_cuts_telescope_to_content() {
+        let content = 9_000;
+        let ten = content_cut_micros(
+            content_cuts([
+                120_000, 1_400_000, 300_000, 900_000, 2_400_000, 410_000, 200_000, 70_000,
+                1_200_000,
+            ]),
+            content,
+        );
+        assert_eq!(
+            ten.iter().copied().fold(0u32, u32::wrapping_add),
+            content,
+            "the ten cuts of `content` do not sum to it: {ten:?}",
+        );
+        assert_eq!(ten[..9], [120, 1_400, 300, 900, 2_400, 410, 200, 70, 1_200]);
+        assert_eq!(ten[9], 2_000);
+    }
+
+    /// **Every one of the nine can move the answer, and moves exactly two
+    /// figures.** `every_panes_cut_is_load_bearing_against_the_residual`'s
+    /// property one level down, and it guards the same degeneracy: nine cuts
+    /// spelled as one accumulator telescope perfectly and decompose nothing.
+    #[test]
+    fn every_content_cut_is_load_bearing_against_the_residual() {
+        let content = 20_000;
+        let flat = content_cut_micros(content_cuts([0; 9]), content);
+        assert_eq!(
+            flat,
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, content],
+            "an unaccumulated frame does not file its whole parent under the \
+             residual, so the residual is not the parent minus the named",
+        );
+        for slot in 0..9 {
+            let mut ns = [0u64; 9];
+            ns[slot] = 3_000_000;
+            let moved = content_cut_micros(content_cuts(ns), content);
+            for other in 0..9 {
+                let expect = if other == slot { 3_000 } else { 0 };
+                assert_eq!(
+                    moved[other], expect,
+                    "charging cut {slot} moved cut {other}: {moved:?}. Two \
+                     cuts reading one accumulator would telescope and \
+                     decompose nothing",
+                );
+            }
+            assert_eq!(
+                moved[9],
+                content - 3_000,
+                "cut {slot}'s charge did not come out of the residual, so \
+                 the ten do not partition the parent",
+            );
+        }
+    }
+
+    /// **A `content` the eight overrun reports a zero residual and does not
+    /// panic** — `panes_cuts_that_overrun_their_span_report_a_zero_residual`
+    /// one level down. The parent is one subtraction of two clock reads and
+    /// the eight are eleven on a one-pane plan-view frame.
+    #[test]
+    fn content_cuts_that_overrun_their_span_report_a_zero_residual() {
+        let ten = content_cut_micros(content_cuts([0, 0, 0, 0, 8_000_000, 0, 0, 0, 0]), 3_000);
+        assert_eq!(ten[4], 8_000);
+        assert_eq!(ten[9], 0, "the residual went negative rather than to zero");
     }
 
     /// **The eight telescope to `panes`.** The residual is defined as the
@@ -5523,6 +5752,7 @@ mod tests {
                 content_ns: 1_000,
                 tools_ns: 1_000,
                 credit_ns: 1_000,
+                content: squallar_egui::shell_api::ContentCuts::default(),
             },
         });
         ledger.cur.ui_end = Some(at(30));

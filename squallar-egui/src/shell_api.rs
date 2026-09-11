@@ -614,6 +614,10 @@ pub struct PanesCuts {
     /// closes the floor-strip pass end and the two tile restores. Drawn once
     /// per panel however many panes there are.
     pub credit_ns: u64,
+    /// [`Self::content_ns`], opened up — never a cut beside the seven, and
+    /// never added to them. See [`ContentCuts`], including why its residual is
+    /// a fact about the scene's pane kinds first.
+    pub content: ContentCuts,
 }
 
 impl PanesCuts {
@@ -654,6 +658,145 @@ impl PanesCuts {
     /// wrong instant, and that is a mistake worth a compile error.
     pub(crate) fn close(slot: &mut u64, from: web_time::Instant) {
         let _ = Self::charge(slot, from);
+    }
+}
+
+/// Where [`PanesCuts::content_ns`] went, one level below it.
+///
+/// # Denominator, and the one thing that makes this split different
+///
+/// `content_ns` is charged at **three** call sites — one per render view — and
+/// they are mutually exclusive arms of one `match`, so a leg's `content`
+/// figure is whichever arms its panes took. The nine cuts here decompose the
+/// **plan-view** arm only, because `render_pane_map_content` is the only one
+/// of the three that is more than a single call. A cross-section or volume
+/// pane therefore contributes to `content_ns` and to **none** of these nine,
+/// and its whole arm lands in `frame_ledger::ContentHists`' residual. Read the
+/// residual against the scene's pane kinds before reading it as unnamed work
+/// — the same rule [`PanesCuts::widget_ns`] carries one level up.
+///
+/// # Nanoseconds in, and accumulated off to the side
+///
+/// `render_pane_map_content` is reached through a `walkers::Map` draw closure
+/// that already borrows everything this crate owns, so the cuts are summed
+/// into a thread-local ([`content_ledger`]) and drained where `content_ns`
+/// itself is charged, rather than threaded through `PaneRenderCtx` — which is
+/// built at seven sites, four of them tests. Nanoseconds for
+/// [`PanesCuts::charge_ns`]' reason: whole microseconds per pane would round
+/// every sub-microsecond piece into the residual.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct ContentCuts {
+    /// Before the layer walk: `hydrate_layer_states`, the visible-site
+    /// resolve, the excluded-rect join, the draw context, and the owned
+    /// `draw_order` list. Scales with the pane's layer count, not with data.
+    pub prologue_ns: u64,
+    /// The `BasemapTiles` and `Terrain` arms — `draw_tile_layer` twice, the
+    /// ground geometry and the label deferral. Scales with tile coverage.
+    pub ground_ns: u64,
+    /// The `CityLabels` arm: `paint_labels` over whatever the ground arm
+    /// deferred, through the galley and label caches.
+    pub labels_ns: u64,
+    /// The `Radar` arm: the live image, the still fan or the cached texture,
+    /// the range ring and the hover read-back.
+    pub radar_ns: u64,
+    /// The generic arm — every registered layer that is not one of the eight
+    /// the walk names, drawn as a texture, as per-frame points, or both. The
+    /// majority of the list on an all-layers scene.
+    pub items_ns: u64,
+    /// **The walk's own bookkeeping, drawing nothing**: per layer, the
+    /// enabled check, the handler resolve, the surface and double-shade
+    /// tests, and the opacity resolve, set and restore. Scales with the
+    /// pane's layer count and with nothing else — a layer switched off costs
+    /// this and no more.
+    pub walk_ns: u64,
+    /// The four arms the walk draws itself rather than delegating:
+    /// `RadarCoverage`'s cached texture, `RadarSites`' rings, icons, labels
+    /// and hit-testing, `UserLocation`, and `ColorScale`'s legend. Scales with
+    /// how many radar sites the viewport holds.
+    pub chrome_ns: u64,
+    /// After the walk: the cost plate and the four notice plates, the
+    /// selection hand-off, and the hover resolve over the layers that answer
+    /// it.
+    pub plates_ns: u64,
+    /// The pass that decides what to raster: the viewport bounds, the texture
+    /// plan, and the per-texture-layer cache-token walk that dispatches
+    /// `RenderOverlay`. Ends on the function's own return, so the long-press
+    /// tooltip is in here.
+    pub dispatch_ns: u64,
+}
+
+impl ContentCuts {
+    /// Add `other` field-wise, saturating — how a pane loop's panes and a
+    /// thread's drain both accumulate.
+    fn fold(&mut self, other: Self) {
+        self.prologue_ns = self.prologue_ns.saturating_add(other.prologue_ns);
+        self.ground_ns = self.ground_ns.saturating_add(other.ground_ns);
+        self.labels_ns = self.labels_ns.saturating_add(other.labels_ns);
+        self.radar_ns = self.radar_ns.saturating_add(other.radar_ns);
+        self.items_ns = self.items_ns.saturating_add(other.items_ns);
+        self.walk_ns = self.walk_ns.saturating_add(other.walk_ns);
+        self.chrome_ns = self.chrome_ns.saturating_add(other.chrome_ns);
+        self.plates_ns = self.plates_ns.saturating_add(other.plates_ns);
+        self.dispatch_ns = self.dispatch_ns.saturating_add(other.dispatch_ns);
+    }
+}
+
+/// [`ContentCuts`] for the panes drawn since the last drain, on this thread.
+///
+/// A thread-local for the reason [`ContentCuts`] gives: the charge sites are
+/// inside a draw closure, and the drain is in the caller that charges
+/// `content_ns`. `render_panes` resets it at its head, so a frame that never
+/// reached the pane loop cannot hand its leftovers to the next one.
+pub mod content_ledger {
+    use std::cell::Cell;
+
+    use super::ContentCuts;
+
+    thread_local! {
+        static CUTS: Cell<ContentCuts> = const {
+            Cell::new(ContentCuts {
+                prologue_ns: 0,
+                ground_ns: 0,
+                labels_ns: 0,
+                radar_ns: 0,
+                items_ns: 0,
+                walk_ns: 0,
+                chrome_ns: 0,
+                plates_ns: 0,
+                dispatch_ns: 0,
+            })
+        };
+    }
+
+    /// Add one pane's cuts to this thread's running sum.
+    pub(crate) fn add(cuts: ContentCuts) {
+        CUTS.with(|c| {
+            let mut held = c.get();
+            held.fold(cuts);
+            c.set(held);
+        });
+    }
+
+    /// Add this thread's running sum to `sink`, zeroing the sum.
+    ///
+    /// **Adds rather than assigns**, because the caller charges `content_ns`
+    /// once per pane and this is the same sum over the same panes: a pane loop
+    /// that assigned would keep the last pane's cuts against every pane's
+    /// parent.
+    pub(crate) fn drain_into(sink: &mut ContentCuts) {
+        sink.fold(CUTS.with(|c| c.replace(ContentCuts::default())));
+    }
+
+    /// Zero this thread's sum without reading it.
+    pub(crate) fn reset() {
+        CUTS.with(|c| c.set(ContentCuts::default()));
+    }
+
+    /// This thread's running sum, left in place — for tests, which need to
+    /// read the ledger without taking the drain out of the code under test.
+    #[cfg(test)]
+    pub(crate) fn peek() -> ContentCuts {
+        CUTS.with(|c| c.get())
     }
 }
 

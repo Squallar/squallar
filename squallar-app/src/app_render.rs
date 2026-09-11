@@ -1663,6 +1663,38 @@ fn frame_panes_lines(p: &crate::frame_ledger::PanesHists) -> [String; 8] {
     ]
 }
 
+/// The ten `frame content (<name>):` lines — `frame panes (content)`, opened
+/// up.
+///
+/// Same denominator as `frame panes (content)` by construction — the ten are
+/// recorded inside the very guard it records under — and a DECOMPOSITION of
+/// that one cut: `frame content (*)` is never added to `frame panes
+/// (content)`, and never to `frame ui (panes)` or `frame segment (ui)` above
+/// it. `named_split_line`'s reading rules apply unchanged: every percentile is
+/// a bin edge, percentiles never add, and the share that answers "which of the
+/// ten is this" is a `sum` over `frame panes (content)`'s `sum`.
+///
+/// **`frame content (residual)` is a scene reading first.** Only the plan-view
+/// arm of `content` is decomposed; a cross-section or volume pane files its
+/// whole arm in the residual. `frame panes (widget)` at zero is what says the
+/// scene had no plan-view pane, so read the pair. See `ContentHists`.
+///
+/// Emitted every tick, `n=0` included, on [`frame_segment_lines`]' terms.
+fn frame_content_lines(c: &crate::frame_ledger::ContentHists) -> [String; 10] {
+    [
+        named_split_line("frame content", "prologue", &c.prologue),
+        named_split_line("frame content", "ground", &c.ground),
+        named_split_line("frame content", "labels", &c.labels),
+        named_split_line("frame content", "radar", &c.radar),
+        named_split_line("frame content", "items", &c.items),
+        named_split_line("frame content", "walk", &c.walk),
+        named_split_line("frame content", "chrome", &c.chrome),
+        named_split_line("frame content", "plates", &c.plates),
+        named_split_line("frame content", "dispatch", &c.dispatch),
+        named_split_line("frame content", "residual", &c.residual),
+    ]
+}
+
 /// The eight `frame pump (<name>):` lines — the `pump` segment, opened up.
 ///
 /// Same denominator as `frame segment (pump)` — presented frames, both halves —
@@ -3553,6 +3585,13 @@ impl super::App {
         // — never added to it and never to `frame segment (ui)`. See
         // `frame_panes_lines`.
         for line in frame_panes_lines(ledger.panes_phases()) {
+            say_telemetry(loud, &line);
+        }
+        // One level below that again: which part of the plan-view pane owns
+        // the largest cut of `render_panes`. Same denominator as `frame panes
+        // (content)` by construction, nine named cuts and a residual — never
+        // added to it. See `frame_content_lines`.
+        for line in frame_content_lines(ledger.content_phases()) {
             say_telemetry(loud, &line);
         }
         // The `pump` segment above, opened up at the seams `setup_egui_frame`

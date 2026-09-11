@@ -76,6 +76,10 @@ impl super::Gui {
         // in no cut at all and inflate the ledger's residual by the clock's
         // own dust rather than by anything the frame did.
         let mut cuts = PanesCuts::default();
+        // A frame that never reached the pane loop must not hand its
+        // leftovers to the next one; `render_pane_map_content` sums into the
+        // ledger and the three `content_ns` charges below drain it.
+        crate::shell_api::content_ledger::reset();
         let mut at = web_time::Instant::now();
 
         let mut actions = Vec::new();
@@ -471,6 +475,9 @@ impl super::Gui {
                                             std::mem::take(&mut render_ctx.paint_order),
                                         ));
                                         at = PanesCuts::charge(&mut cuts.content_ns, at);
+                                        crate::shell_api::content_ledger::drain_into(
+                                            &mut cuts.content,
+                                        );
 
                                         self.track_section_edit(
                                             ui,
@@ -515,6 +522,7 @@ impl super::Gui {
                             // No `walkers::Map` on this arm, so `widget` stays
                             // at zero and the whole arm is `content`.
                             at = PanesCuts::charge(&mut cuts.content_ns, at);
+                            crate::shell_api::content_ledger::drain_into(&mut cuts.content);
                         }
                         RenderView::Volume => {
                             self.record_pane_content(pane_idx, RenderView::Volume, pane_rect);
@@ -618,6 +626,7 @@ impl super::Gui {
                             // As on the cross-section arm: no widget of its
                             // own, so the whole arm is `content`.
                             at = PanesCuts::charge(&mut cuts.content_ns, at);
+                            crate::shell_api::content_ledger::drain_into(&mut cuts.content);
                         }
                     }
 

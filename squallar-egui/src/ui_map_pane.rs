@@ -6,6 +6,7 @@ use crate::overlay_cache::{
 };
 use crate::pane::{LoopLoading, PaneState, RadarImageData, TimeMode};
 use crate::point_painter::EguiPointPainter;
+use crate::shell_api::{ContentCuts, PanesCuts};
 use squallar_overlays::render::draw::{DrawPointContext, HoverContext};
 use squallar_overlays::render::overlay_state::{
     OverlayItem, OverlayLegend, OverlayRegistry, Signed, Surface,
@@ -577,6 +578,11 @@ pub(super) fn render_pane_map_content(
         tiles_exact: true,
         overlay_work_owed: false,
     };
+    // `PanesCuts::content_ns`, opened up. Summed here and handed to
+    // `content_ledger` on the way out, because this call is inside a draw
+    // closure that already borrows everything the caller owns.
+    let mut cc = ContentCuts::default();
+    let mut at = web_time::Instant::now();
 
     ctx.pane.hydrate_layer_states(ctx.overlays, ctx.pane_idx);
 
@@ -617,6 +623,7 @@ pub(super) fn render_pane_map_content(
         // Restored after every arm below; the notices painted after the loop
         // run at it.
         let base_opacity = ui.opacity();
+        at = PanesCuts::charge(&mut cc.prologue_ns, at);
         for id in &draw_order {
             if !ctx.pane.is_overlay_enabled(id) {
                 continue;
@@ -652,6 +659,7 @@ pub(super) fn render_pane_map_content(
             // paint list — so submission order IS `draw_order`.
             #[cfg(test)]
             let mut painted_layer = ui.painter().layer_id();
+            at = PanesCuts::charge(&mut cc.walk_ns, at);
             match id {
                 id if *id == known::RADAR => {
                     // **Radar-addressed, and it stays that way** (WI-1 left
@@ -739,6 +747,7 @@ pub(super) fn render_pane_map_content(
                         .pane
                         .displayed_melting_layer_source()
                         .filter(|source| !source.is_measured());
+                    at = PanesCuts::charge(&mut cc.radar_ns, at);
                 }
                 id if *id == known::BASEMAP_TILES => {
                     // The ground phase: paints the tile geometry and defers
@@ -758,6 +767,7 @@ pub(super) fn render_pane_map_content(
                         resolution.tiles_exact &= paint.coverage.complete();
                         ctx.basemap_labels = paint.labels;
                     }
+                    at = PanesCuts::charge(&mut cc.ground_ns, at);
                 }
                 id if *id == known::TERRAIN => {
                     // A raster layer defers no labels: only a vector tile
@@ -771,6 +781,7 @@ pub(super) fn render_pane_map_content(
                             draw_tile_layer(ui, projector, zoom, tiles, ctx.tile_zoom_bias, None);
                         resolution.tiles_exact &= paint.coverage.complete();
                     }
+                    at = PanesCuts::charge(&mut cc.ground_ns, at);
                 }
                 id if *id == known::CITY_LABELS => {
                     // One `OccupiedAreas` for the whole pane, which is what
@@ -782,18 +793,21 @@ pub(super) fn render_pane_map_content(
                         ctx.label_cache,
                         ctx.pane_idx,
                     );
+                    at = PanesCuts::charge(&mut cc.labels_ns, at);
                 }
                 id if *id == known::RADAR_COVERAGE => {
                     if let Some(tex) = ctx.pane.overlay_cache(id).and_then(|c| c.current()) {
                         let screen_rect = ui.max_rect();
                         draw_overlay_texture(ui.painter(), projector, tex, screen_rect);
                     }
+                    at = PanesCuts::charge(&mut cc.chrome_ns, at);
                 }
                 id if *id == known::RADAR_SITES => {
                     // Under the dots, so a marker is never hidden by the ring
                     // belonging to it.
                     draw_selected_site_ring(ui, projector, ctx.pane);
                     handle_radar_site_interactions(ui, zoom, &visible_sites, ctx);
+                    at = PanesCuts::charge(&mut cc.chrome_ns, at);
                 }
                 id if *id == known::USER_LOCATION => {
                     if let Some((user_lat, user_lon)) = ctx.user_location {
@@ -806,6 +820,7 @@ pub(super) fn render_pane_map_content(
                             ctx.user_fix.as_ref(),
                         );
                     }
+                    at = PanesCuts::charge(&mut cc.chrome_ns, at);
                 }
                 // Color scale legend (screen-space HUD) — painted through the
                 // pane's own paint list, so `draw_order` genuinely places it.
@@ -824,6 +839,7 @@ pub(super) fn render_pane_map_content(
                         ctx.overlays,
                         ctx.preferences,
                     );
+                    at = PanesCuts::charge(&mut cc.chrome_ns, at);
                 }
                 // **Two `if`s, not a `match`.** A hybrid layer is BOTH: its
                 // geometry rides a picture and its text rides the point pass,
@@ -869,12 +885,15 @@ pub(super) fn render_pane_map_content(
                             },
                         ));
                     }
+                    at = PanesCuts::charge(&mut cc.items_ns, at);
                 }
             }
             ui.set_opacity(base_opacity);
             #[cfg(test)]
             ctx.paint_order.push((id.clone(), painted_layer));
         }
+
+        at = PanesCuts::charge(&mut cc.walk_ns, at);
 
         // **The pane's own cost**, in the corner the plates below do not
         // use. It is not one of them and does not compete for their slot:
@@ -1035,6 +1054,8 @@ pub(super) fn render_pane_map_content(
                 ctx.pane.overlay_hover_value = found;
             }
         }
+
+        at = PanesCuts::charge(&mut cc.plates_ns, at);
 
         let screen_rect = ui.max_rect();
         let viewport_bounds = viewport_geo_bounds(projector, screen_rect);
@@ -1319,6 +1340,9 @@ pub(super) fn render_pane_map_content(
             );
         }
     }
+
+    PanesCuts::close(&mut cc.dispatch_ns, at);
+    crate::shell_api::content_ledger::add(cc);
 
     resolution
 }
@@ -5128,6 +5152,11 @@ mod layer_opacity_walk_tests;
 #[path = "ui_map_pane/lookup_tax_tests.rs"]
 #[cfg(test)]
 mod lookup_tax_tests;
+
+/// That `panes:content`'s nine cuts are nine cuts and not one.
+#[path = "ui_map_pane/content_cuts_tests.rs"]
+#[cfg(test)]
+mod content_cuts_tests;
 
 /// What a pass whose build is still current does not walk again.
 #[path = "ui_map_pane/kept_point_pass_tests.rs"]
