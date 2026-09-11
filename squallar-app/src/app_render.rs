@@ -652,11 +652,25 @@ fn texture_upload_line(u: &squallar_gpu::egui_renderer::texture_upload::UploadTo
 /// # Why a peak and not the level the census already publishes
 ///
 /// `squallar_egui::heap_census`'s `upload pending` is the same quantity
-/// sampled on a two-second tick, and a picture crosses the queue in fewer
-/// frames than that: measured over five 420 s legs it is 97-99 % zeros with a
-/// p50 of 0.0, so its whole-leg maximum is a lottery over which transient a
-/// tick landed on. The peak is taken where the quantity moves — the argument
-/// `squallar_alloc::live_peak_bytes` is built on — so it cannot miss one.
+/// sampled on a two-second tick. Until 2026-09-11 this note read "measured
+/// over five 420 s legs it is 97-99 % zeros with a p50 of 0.0". The arm those
+/// five legs ran is not recorded here, and the figure does not hold on the
+/// six-pane one, so what follows names its own.
+///
+/// **Measured on three 420 s six-pane HEAVY6 legs of ONE binary and ONE seed
+/// (2026-09-11), over the canonical 330-384 s window: 26-32 % zeros with a
+/// p50 of 16.2-27.8 MiB.** On this arm the sampled level is a recurring
+/// residency rather than a transient the tick usually misses, so a zero read
+/// here is a trough and not an empty queue.
+///
+/// What survives that correction is the reason this line exists. The whole-leg
+/// MAXIMUM of the sampled level is a lottery over which transient a tick
+/// landed on: across those same three legs it spread 94.3-154.2 MiB, and
+/// sliding a fixed window across the phases of a single leg moves the median
+/// 2.9-40.0 MiB. So neither statistic is quotable alone, and a cut to this
+/// residency cannot be scored against either. The peak is taken where the
+/// quantity moves — the argument `squallar_alloc::live_peak_bytes` is built
+/// on — so it cannot miss one.
 fn upload_residency_line(peak: u64) -> String {
     format!("upload residency: {peak} B peak pending")
 }
