@@ -475,6 +475,165 @@ def seed_files(web_seed):
     return out
 
 
+# ------------------------------------------------- the telemetry seed rule --
+#
+# The app has TWO independent telemetry switches, not one, and each gates a
+# different set of `say_telemetry` call sites (17 raster, 61 frame on
+# 2026-09-11). A leg that seeds one and not the other measures an app whose
+# 17 raster rows are silently ABSENT -- and an absent row is indistinguishable
+# from a row whose family never fired, so the leg reports a plausible number
+# with no sign anything is missing. `seed_files` above already raises on a key
+# that lost its `squallar.` prefix; this is the same hazard one step earlier,
+# where the key was never written at all.
+
+REPO_ROOT = os.path.dirname(os.path.dirname(RIG_DIR))
+APP_RENDER_RS = os.path.join(REPO_ROOT, "squallar-app", "src", "app_render.rs")
+
+# `{` ... `}` object carrying the UI seed key. The `\"` spelling is what the
+# shell literals use; the plain one is what a heredoc row uses.
+_SEED_KEY_RE = re.compile(r'\\?"%sui\\?"\s*:' % re.escape(WEB_KEY_PREFIX))
+_TELEMETRY_CONST_RE = re.compile(
+    r'const\s+[A-Z0-9_]+_TELEMETRY_KEY\s*:\s*&\s*str\s*=\s*"([^"]+)"'
+)
+
+
+def telemetry_keys(source=None):
+    """Every telemetry switch the app declares, READ OUT of its own constants.
+
+    Derived rather than listed, and the reason is the defect that motivated
+    this rule: the campaign spent a night believing there was ONE telemetry
+    switch because a grep for `frame_telemetry_loud` found one binding. There
+    were two. A gate that hand-lists the pair it knows about repeats that
+    error the day a third switch lands -- the new switch's rows would go
+    silently absent exactly as the raster rows would, and this gate would be
+    green over it. So the set comes from `app_render.rs`'s own
+    `*_TELEMETRY_KEY` constants, and a third one is picked up unasked.
+    """
+    text = source if source is not None else _read(APP_RENDER_RS)
+    found = _TELEMETRY_CONST_RE.findall(text)
+    if len(found) < 2:
+        raise SystemExit(
+            "only %d `*_TELEMETRY_KEY` constants were parsed out of %s; the "
+            "app declared two on 2026-09-11 and this rule cannot check a set "
+            "it failed to read" % (len(found), APP_RENDER_RS)
+        )
+    return sorted(set(found))
+
+
+def _enclosing_object(text, at):
+    """The `{...}` literal containing offset `at`, by brace depth, or None."""
+    start = text.rfind("{", 0, at)
+    if start < 0:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return start, text[start:i + 1]
+    return None
+
+
+# How each runner labels a seed: a `case` arm, a shell assignment, or a
+# heredoc table row. Used only so a defect message names the seed the way its
+# own file spells it -- the RULE never keys on any of these, which is why a
+# spelling none of them match costs a label and not a missed seed.
+_LABEL_RES = (
+    re.compile(r"^\s*([A-Za-z0-9_]+)\)"),
+    re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)="),
+    re.compile(r"^([a-z0-9][a-z0-9-]*)\|"),
+)
+
+
+def _seed_label(text, start):
+    """What the runner calls the seed starting at `start`, or None."""
+    line = text[text.rfind("\n", 0, start) + 1:start]
+    for rx in _LABEL_RES:
+        m = rx.match(line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def seed_sites(sources=None):
+    """Every localStorage seed literal the rig's runners carry.
+
+    Derived by CONTENT, not by syntax. The runners spell their seeds three
+    different ways -- a `case` arm that echoes one (`run_measure.sh`), a plain
+    shell assignment (`run_tier2.sh`, `run_gpu_arm.sh`) and a heredoc table
+    row (`shoot_marketing.sh`) -- so a rule keyed on any one spelling finds a
+    third of them and reports the rest as absent. A discriminator of "a shell
+    assignment whose value is JSON" was proposed and checked against the tree
+    here: it finds 5 of the 12 telemetry seeds and none of the 7 scenes.
+
+    What every seed has in common is that it is a JSON object carrying the UI
+    config key, so that is what is looked for, and the file list is read off
+    the directory rather than named -- a runner nobody thought of, including
+    one added after this was written, is scanned like the rest.
+    """
+    if sources is None:
+        sources = {}
+        for name in sorted(os.listdir(RIG_DIR)):
+            if name.endswith(".sh"):
+                sources[name] = _read(os.path.join(RIG_DIR, name))
+    out = []
+    for name in sorted(sources):
+        text = sources[name]
+        for m in _SEED_KEY_RE.finditer(text):
+            found = _enclosing_object(text, m.start())
+            if found is None:
+                raise SystemExit(
+                    "%s carries a `%sui` seed key at line %d with no enclosing "
+                    "JSON object; the seed spelling changed and this rule can "
+                    "no longer read it"
+                    % (name, WEB_KEY_PREFIX, text.count("\n", 0, m.start()) + 1)
+                )
+            start, blob = found
+            out.append((name, text.count("\n", 0, start) + 1, blob,
+                        _seed_label(text, start)))
+    return out
+
+
+def telemetry_seed_defects(sources=None, keys=None):
+    """Seed sites that carry SOME telemetry switches but not all of them.
+
+    The rule is per RUNNER, and derived: a runner that seeds telemetry in any
+    of its seeds must seed EVERY switch in ALL of them. A runner that seeds no
+    telemetry anywhere is not a measurement runner and is exempt without being
+    named -- `shoot_marketing.sh` takes screenshots and scrapes no rows, and
+    it falls out of this rule rather than being listed out of it. The day a
+    telemetry key is added to one of its seeds, the rule starts demanding the
+    rest, which is the right direction to fail in.
+
+    Returns a list of human-readable defects; empty means clean.
+    """
+    keys = telemetry_keys() if keys is None else keys
+    sites = seed_sites(sources)
+    by_file = {}
+    for name, line, blob, label in sites:
+        by_file.setdefault(name, []).append((line, blob, label))
+    defects = []
+    for name in sorted(by_file):
+        rows = by_file[name]
+        if not any(k in blob for _l, blob, _lb in rows for k in keys):
+            continue
+        for line, blob, label in rows:
+            missing = [k for k in keys if k not in blob]
+            if missing:
+                defects.append(
+                    "%s:%d seed %s seeds %s but not %s -- that leg's %s rows "
+                    "are silently absent, which reads exactly like a family "
+                    "that never fired"
+                    % (name, line, label or "(unlabelled)",
+                       ", ".join(k for k in keys if k in blob) or "no switch",
+                       ", ".join(missing),
+                       ", ".join(missing))
+                )
+    return defects
+
+
 def cmd_seed(args):
     """Seed a redirected config dir from the web rig's own scene seed.
 
@@ -7856,6 +8015,139 @@ def _fixture_row(clamp=False, panes=1, reported="one"):
                    "as this leg's throughput figure, not the percentiles"]
                   if clamp else []),
     }
+
+
+class TelemetrySeedTests(unittest.TestCase):
+    """**Every rig seed carries every telemetry switch the app declares.**
+
+    The divergence this closes is not live today and would be silent when it
+    arrived: all 12 telemetry seeds across the three measurement runners carry
+    both switches on 2026-09-11. What has no gate is the seed added LATER that
+    carries one. The app's two switches gate 17 and 61 `say_telemetry` call
+    sites respectively, so a seed missing the raster key produces a leg whose
+    17 raster rows are absent -- and absent reads the same as never-fired.
+
+    The pins that existed before this could not see it. Both
+    `raster_telemetry_line_tests::the_rig_seeds_the_key_that_makes_the_lines_loud`
+    and its frame twin assert `file.contains("squallar.<key>": "1")` over a
+    WHOLE runner, so one surviving seed keeps them green while every other
+    seed in the same file has lost the key; and
+    `native_seed_pin_tests::the_native_rig_seeds_the_keys_this_app_reads`
+    parses scene A alone. Six of the seven scenes, three of the four Tier-2
+    seeds and the whole GPU arm were uncovered.
+    """
+
+    def test_the_switch_set_is_read_out_of_the_apps_own_constants(self):
+        """Non-vacuity for the DERIVATION, not just for the population.
+
+        A test that asserted only `["frame_telemetry", "raster_telemetry"]`
+        would pass identically if `telemetry_keys` ignored its source and
+        returned a hardcoded pair, which is the failure mode this whole rule
+        exists to avoid. So a third constant is injected and the set must
+        grow to include it.
+        """
+        self.assertEqual(telemetry_keys(),
+                         ["frame_telemetry", "raster_telemetry"])
+        grown = telemetry_keys(
+            _read(APP_RENDER_RS)
+            + '\npub(crate) const GPU_TELEMETRY_KEY: &str = "gpu_telemetry";\n'
+        )
+        self.assertIn("gpu_telemetry", grown,
+                      "telemetry_keys ignored its source; the set is hardcoded "
+                      "and a third switch would go ungated")
+        self.assertEqual(len(grown), 3)
+
+    def test_every_seed_the_runners_carry_is_found(self):
+        """Non-vacuity for the POPULATION, per runner rather than in total.
+
+        A per-file floor and not a single total: a parse that silently stopped
+        finding `run_measure.sh`'s seven case arms -- the shape no
+        assignment-based discriminator finds at all -- would still clear a
+        total of twelve using the other runners plus the marketing rows.
+        """
+        counts = {}
+        for name, _line, _blob, _label in seed_sites():
+            counts[name] = counts.get(name, 0) + 1
+        for name, least in (("run_measure.sh", 7),
+                            ("run_tier2.sh", 4),
+                            ("run_gpu_arm.sh", 1)):
+            self.assertGreaterEqual(
+                counts.get(name, 0), least,
+                "only %d seeds were parsed out of %s; there were %d on "
+                "2026-09-11 and a parse that found fewer would let this rule "
+                "pass over seeds it never read"
+                % (counts.get(name, 0), name, least))
+
+        # And every seed resolved to the name its own file gives it, so a
+        # defect message can say `seed B` rather than a bare offset. A label
+        # is cosmetic -- the rule never keys on one -- but an all-None column
+        # means the three spellings stopped being recognised, which is worth
+        # hearing before a defect message needs it.
+        labels = {(n, lb) for n, _l, _b, lb in seed_sites()}
+        for name, label in (("run_measure.sh", "B"), ("run_measure.sh", "E3"),
+                            ("run_tier2.sh", "TILECACHE_SEED_LS"),
+                            ("run_gpu_arm.sh", "SEED_LS")):
+            self.assertIn((name, label), labels)
+
+    def test_every_rig_seed_carries_every_telemetry_switch(self):
+        """The rule itself, over the real tree."""
+        self.assertEqual(telemetry_seed_defects(), [])
+
+    def test_a_seed_that_loses_one_switch_is_named(self):
+        """The constructed tamper, in process, so the rule stays non-vacuous.
+
+        Asserted the way the rule will actually be broken: ONE key removed
+        from ONE seed. The substitution is checked to have changed the text
+        before the defect is asserted -- a tamper that silently matched
+        nothing would leave the source clean, and `defects == []` would then
+        read as a passing gate rather than as a tamper that never happened.
+        """
+        real = _read(RUN_MEASURE_SH)
+        drop = ', "squallar.raster_telemetry": "1"'
+        self.assertEqual(
+            real.count(drop), 7,
+            "the raster seed spelling moved; this tamper no longer reaches "
+            "the scenes it means to break")
+        # Break E3 alone: the LAST arm, the one added most recently, and the
+        # one a hand-listed scene set is likeliest to have missed.
+        at = real.rindex(drop)
+        broken = real[:at] + real[at + len(drop):]
+        self.assertNotEqual(broken, real)
+        self.assertEqual(broken.count(drop), 6)
+
+        defects = telemetry_seed_defects({"run_measure.sh": broken})
+        self.assertEqual(
+            len(defects), 1,
+            "one seed lost one switch and the rule reported %d defects: %s"
+            % (len(defects), defects))
+        self.assertIn("run_measure.sh", defects[0])
+        self.assertIn("raster_telemetry", defects[0])
+        self.assertIn("frame_telemetry", defects[0])
+
+        # And the untampered text through the same call is clean, so the
+        # redness above is the tamper and not the injection path itself.
+        self.assertEqual(telemetry_seed_defects({"run_measure.sh": real}), [])
+
+    def test_a_runner_that_seeds_no_telemetry_is_exempt_without_being_named(self):
+        """`shoot_marketing.sh` takes screenshots and scrapes no telemetry.
+
+        It carries six seeds and neither switch. It is exempt because the rule
+        is per-runner and it seeds no telemetry at all -- not because it is on
+        a list. The second half is the part worth pinning: adding one switch
+        to one of its seeds must start demanding the other.
+        """
+        text = _read(os.path.join(RIG_DIR, "shoot_marketing.sh"))
+        keys = telemetry_keys()
+        self.assertFalse([k for k in keys if k in text])
+        self.assertEqual(telemetry_seed_defects({"shoot_marketing.sh": text}), [])
+
+        armed = text.replace(
+            '"squallar.ui"', '"squallar.frame_telemetry":"1","squallar.ui"', 1)
+        self.assertNotEqual(armed, text)
+        defects = telemetry_seed_defects({"shoot_marketing.sh": armed})
+        self.assertTrue(
+            defects, "a seed gained one switch and the rule stayed silent")
+        self.assertIn("raster_telemetry", defects[0])
 
 
 if __name__ == "__main__":
