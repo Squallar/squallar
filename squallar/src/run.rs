@@ -42,7 +42,15 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }));
 
-    log::info!("Starting squallar (native); malloc arenas: {arenas:?}");
+    // Read on the thread `run_app` below will drive the event loop on, and
+    // after the logger so it is visible. Nothing is set. A run launched
+    // outside LaunchServices -- a terminal, a `cargo run`, a headless leg over
+    // ssh -- is QoS-ceilinged and sits far more on the efficiency cores than
+    // the bundle a user opens, so its timings do not compare; printing this
+    // every launch is what stops that going unnoticed. See the module docs.
+    let posture = crate::launch_posture::read();
+
+    log::info!("Starting squallar (native); malloc arenas: {arenas:?}; launch posture: {posture}");
 
     // Before the app, because the first alerts round is what consumes it.
     // Only names the URL; nothing is fetched here.

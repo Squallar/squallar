@@ -68,6 +68,19 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     // ── Instruments that live on `campaign-harness` by policy ───────────
     // ── Names owned by a dependency or an OS ────────────────────────────
     (
+        "squallar/src/launch_posture.rs",
+        "pthread_set_qos_class_self_np",
+        "libSystem's own setter, and the subject of a section explaining why \
+         this module does NOT call it. It was declared here, measured, and \
+         removed: over ssh the task carries \
+         `eff qos ceiling: THREAD_QOS_USER_INITIATED`, so the request is \
+         clamped and `taskinfo` reports `QoS time ... UI: 0.000000` whether or \
+         not it ran. The paragraph has to name the function it is warning \
+         against, and the warning is that confirming this setter by reading \
+         the value back is a vacuous verification -- the getter answers the \
+         requested class, not the effective one.",
+    ),
+    (
         "squallar-volumetric/src/lib.rs",
         "max_uniform_buffer_binding_size",
         "`wgpu::Limits`' own field. The doc is explaining which device limit \
