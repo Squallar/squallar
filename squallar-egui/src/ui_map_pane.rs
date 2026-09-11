@@ -3569,110 +3569,148 @@ fn render_overlay_color_scales(
             continue;
         }
 
-        // One image over a ramp baked once per legend signature, and the ramp
-        // is sampled through `overlay_bar_color_at` — which is what makes a
-        // banded scale draw bands. See `crate::legend_ramp`.
-        painter.image(
-            legend_ramp::ramp(
-                painter.ctx(),
-                egui::Id::new(("squallar::legend_ramp::overlay", id.as_str(), horizontal)),
-                legend.signature,
-                "legend_ramp_overlay",
-                horizontal,
-                overlay_ramp_sampler(&legend.items),
-            )
-            .id(),
+        // **The bar is a picture of things that do not move between frames**,
+        // exactly as the radar bar above it is, so it is built once per
+        // version and replayed through one `Painter::extend` — see
+        // [`legend_ramp::painted`] and the argument `render_color_scale`
+        // carries. Until this the two sat one function apart with only one of
+        // them memoised: every tick label here allocated a `String` from a
+        // `&str` the caller already held and took a `Context::fonts` lock to
+        // be handed back the galley it was handed last frame, and each of the
+        // two shapes it became took a `Context::graphics` lock of its own.
+        //
+        // **The version names every input the shapes read.** The ramp texture
+        // is `ramp_id`; the geometry is `bar_rect`; the stops, their values
+        // and `is_gradient` are the legend's own `signature` — the key
+        // `memoized_overlay_ticks` and `legend_ramp::labels` already run
+        // under; `unit_label` is named beside it for `legend_reach`'s reason,
+        // that the signature is the handler's and nothing holds it to
+        // covering the title. The glyphs are laid out on the pixel grid
+        // `pixels_per_point` sets, so that is in the key for
+        // [`legend_ramp::measured`]'s reason. No `Visuals` is read: every
+        // colour here is a constant or a palette entry, so a theme switch has
+        // nothing to invalidate.
+        //
+        // One slot per **pane and layer**: two panes draw the same layer's bar
+        // at two rects, and a shared slot would have each rebuild the other's
+        // on every frame.
+        let ramp_id = legend_ramp::ramp(
+            painter.ctx(),
+            egui::Id::new(("squallar::legend_ramp::overlay", id.as_str(), horizontal)),
+            legend.signature,
+            "legend_ramp_overlay",
+            horizontal,
+            overlay_ramp_sampler(&legend.items),
+        )
+        .id();
+        let version = (
             bar_rect,
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
+            pane_rect,
+            horizontal,
+            legend.signature,
+            legend.items.unit_label,
+            ramp_id,
+            painter.ctx().pixels_per_point().to_bits(),
         );
+        let shapes = legend_ramp::painted(
+            painter.ctx(),
+            egui::Id::new(("squallar::legend_shapes::overlay", pane_idx, id.as_str())),
+            version,
+            || {
+                let mut sink = ShapeSink::new(painter);
+                // One image over a ramp baked once per legend signature, and
+                // the ramp is sampled through `overlay_bar_color_at` — which
+                // is what makes a banded scale draw bands. See
+                // `crate::legend_ramp`.
+                sink.image(
+                    ramp_id,
+                    bar_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
 
-        let label_font = egui::FontId::proportional(SCALE_FONT_SIZE);
-        let title_font = egui::FontId::proportional(SCALE_TITLE_FONT_SIZE);
+                let label_font = egui::FontId::proportional(SCALE_FONT_SIZE);
+                let title_font = egui::FontId::proportional(SCALE_TITLE_FONT_SIZE);
 
-        let tick_text = memoized_overlay_ticks(painter.ctx(), id, &legend);
-        let mut label_positions: Vec<(f32, &str)> = Vec::new();
-        let stop_count = legend.items.thresholds.len();
-        for ((i, &(val, _)), text) in legend
-            .items
-            .thresholds
-            .iter()
-            .enumerate()
-            .zip(tick_text.iter())
-        {
-            // A banded bar's blocks are equal-width, one per stop — the same
-            // convention the radar bar's discrete scales draw under — so the
-            // label for stop `i` goes at the foot of block `i`, not at where
-            // its *value* falls. Placing it by value on a banded bar puts every
-            // label a fraction of a block off and squeezes the top band to
-            // nothing.
-            let t = if legend.items.is_gradient {
-                (val - min_val) / range
-            } else {
-                band_start_fraction(i, stop_count)
-            };
-            let pixel_pos = if horizontal {
-                bar_rect.left() + t * bar_rect.width()
-            } else {
-                bar_rect.bottom() - t * bar_rect.height()
-            };
-            label_positions.push((pixel_pos, text));
-        }
-
-        let mut prev_pos: Option<f32> = None;
-        let thinned: Vec<(f32, &str)> = label_positions
-            .iter()
-            .filter(|(pos, _)| {
-                if let Some(prev) = prev_pos
-                    && (pos - prev).abs() < MIN_LABEL_SPACING
+                let tick_text = memoized_overlay_ticks(sink.ctx(), id, &legend);
+                let mut label_positions: Vec<(f32, &str)> = Vec::new();
+                let stop_count = legend.items.thresholds.len();
+                for ((i, &(val, _)), text) in legend
+                    .items
+                    .thresholds
+                    .iter()
+                    .enumerate()
+                    .zip(tick_text.iter())
                 {
-                    return false;
+                    // A banded bar's blocks are equal-width, one per stop — the same
+                    // convention the radar bar's discrete scales draw under — so the
+                    // label for stop `i` goes at the foot of block `i`, not at where
+                    // its *value* falls. Placing it by value on a banded bar puts every
+                    // label a fraction of a block off and squeezes the top band to
+                    // nothing.
+                    let t = if legend.items.is_gradient {
+                        (val - min_val) / range
+                    } else {
+                        band_start_fraction(i, stop_count)
+                    };
+                    let pixel_pos = if horizontal {
+                        bar_rect.left() + t * bar_rect.width()
+                    } else {
+                        bar_rect.bottom() - t * bar_rect.height()
+                    };
+                    label_positions.push((pixel_pos, text));
                 }
-                prev_pos = Some(*pos);
-                true
-            })
-            .copied()
-            .collect();
 
-        for (pixel_pos, text) in &thinned {
-            if horizontal {
-                let pos = egui::pos2(*pixel_pos, bar_rect.top() - SCALE_LABEL_LIFT);
-                draw_shadowed_text(
-                    painter,
-                    pos,
-                    egui::Align2::CENTER_BOTTOM,
-                    text,
-                    label_font.clone(),
-                );
-            } else {
-                let pos = egui::pos2(bar_rect.left() - SCALE_LABEL_GAP, *pixel_pos);
-                draw_shadowed_text(
-                    painter,
-                    pos,
-                    egui::Align2::RIGHT_CENTER,
-                    text,
-                    label_font.clone(),
-                );
-            }
-        }
+                let mut prev_pos: Option<f32> = None;
+                let thinned: Vec<(f32, &str)> = label_positions
+                    .iter()
+                    .filter(|(pos, _)| {
+                        if let Some(prev) = prev_pos
+                            && (pos - prev).abs() < MIN_LABEL_SPACING
+                        {
+                            return false;
+                        }
+                        prev_pos = Some(*pos);
+                        true
+                    })
+                    .copied()
+                    .collect();
 
-        let unit = legend.items.unit_label;
-        if horizontal {
-            // Under its own bar, for the reason the radar bar's title is: 12
-            // points is not enough to lay `kg/m²` out in, and the pane's clip
-            // rect turns the shortfall into a cut-off label.
-            let title_pos = egui::pos2(pane_rect.left() + 2.0, bar_rect.bottom() + 1.0);
-            draw_shadowed_text(painter, title_pos, egui::Align2::LEFT_TOP, unit, title_font);
-        } else {
-            let title_pos = egui::pos2(bar_rect.center().x, bar_rect.top() - 4.0);
-            draw_shadowed_text(
-                painter,
-                title_pos,
-                egui::Align2::CENTER_BOTTOM,
-                unit,
-                title_font,
-            );
-        }
+                for (pixel_pos, text) in &thinned {
+                    if horizontal {
+                        let pos = egui::pos2(*pixel_pos, bar_rect.top() - SCALE_LABEL_LIFT);
+                        sink.shadowed_text(
+                            pos,
+                            egui::Align2::CENTER_BOTTOM,
+                            text,
+                            label_font.clone(),
+                        );
+                    } else {
+                        let pos = egui::pos2(bar_rect.left() - SCALE_LABEL_GAP, *pixel_pos);
+                        sink.shadowed_text(
+                            pos,
+                            egui::Align2::RIGHT_CENTER,
+                            text,
+                            label_font.clone(),
+                        );
+                    }
+                }
+
+                let unit = legend.items.unit_label;
+                if horizontal {
+                    // Under its own bar, for the reason the radar bar's title is: 12
+                    // points is not enough to lay `kg/m²` out in, and the pane's clip
+                    // rect turns the shortfall into a cut-off label.
+                    let title_pos = egui::pos2(pane_rect.left() + 2.0, bar_rect.bottom() + 1.0);
+                    sink.shadowed_text(title_pos, egui::Align2::LEFT_TOP, unit, title_font);
+                } else {
+                    let title_pos = egui::pos2(bar_rect.center().x, bar_rect.top() - 4.0);
+                    sink.shadowed_text(title_pos, egui::Align2::CENTER_BOTTOM, unit, title_font);
+                }
+                sink.shapes
+            },
+        );
+        painter.extend(shapes.iter().cloned());
     }
 }
 

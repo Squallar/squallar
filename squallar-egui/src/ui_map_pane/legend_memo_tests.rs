@@ -200,3 +200,86 @@ fn the_replayed_bar_still_covers_its_rail() {
          list than it was built with",
     );
 }
+
+/// **The overlay bars are the same picture, and were the one half of this
+/// file's subject that nothing held to it.**
+///
+/// [`super::render_overlay_color_scales`] sits one function below
+/// [`super::render_color_scale`] and draws the same thing for every
+/// legend-carrying layer the pane has on, and until 2026-09-11 it rebuilt
+/// every tick galley and took a `Context::graphics` lock per shape on every
+/// frame while its twin replayed a held list. It now runs through the same
+/// [`crate::legend_ramp::painted`] slot, one per pane and layer.
+///
+/// Gated exactly as the radar bar above is, and for the same reason: a memo
+/// that hits when it should not is last frame's bar, at last frame's rect. The
+/// rect is the input moved, because it is the everyday one — a window resize
+/// — and every bar in the stack moves with it.
+#[test]
+fn the_overlay_bars_are_built_once_until_their_version_moves() {
+    let canvas = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+    let moved = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(760.0, 600.0));
+    let egui_ctx = egui::Context::default();
+    let overlays = OverlayRegistry::with_handlers(crate::sources::all());
+    let pane = pane_with_every_layer(&overlays);
+
+    let galleys = |ctx: &egui::Context, rect: egui::Rect| -> Vec<std::sync::Arc<egui::Galley>> {
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(canvas),
+            ..Default::default()
+        });
+        let painter = egui::Painter::new(ctx.clone(), egui::LayerId::background(), canvas);
+        render_overlay_color_scales(&painter, rect, false, 0, &pane, &overlays);
+        let output = ctx.end_pass();
+
+        fn collect(shape: &egui::Shape, into: &mut Vec<std::sync::Arc<egui::Galley>>) {
+            match shape {
+                egui::Shape::Text(text) => into.push(text.galley.clone()),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, into)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut out);
+        }
+        out
+    };
+
+    let first = galleys(&egui_ctx, canvas);
+    assert!(
+        first.len() > 1,
+        "premise: the overlay stack drew {} galleys, so neither half below is \
+         asking anything",
+        first.len(),
+    );
+
+    evicting_pass(&egui_ctx, canvas);
+    let replayed = galleys(&egui_ctx, canvas);
+    assert_eq!(
+        replayed.len(),
+        first.len(),
+        "the replay drew a different number of galleys than the build it is \
+         supposed to be replaying",
+    );
+    for (i, (was, now)) in first.iter().zip(&replayed).enumerate() {
+        assert!(
+            std::sync::Arc::ptr_eq(was, now),
+            "galley {i} ({:?}) was laid out again on a frame where nothing \
+             the overlay bars are a picture of had changed",
+            now.text(),
+        );
+    }
+
+    evicting_pass(&egui_ctx, canvas);
+    let rebuilt = galleys(&egui_ctx, moved);
+    assert!(
+        rebuilt
+            .iter()
+            .zip(&replayed)
+            .any(|(now, was)| !std::sync::Arc::ptr_eq(now, was)),
+        "the pane's rect moved and every overlay galley came back out of the \
+         memo: the bars are being painted at the rect they had before the \
+         resize",
+    );
+}
