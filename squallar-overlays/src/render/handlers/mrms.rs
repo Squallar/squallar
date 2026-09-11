@@ -1272,7 +1272,7 @@ impl OverlayHandler for MrmsHandler {
         Some(Signed {
             signature: view.selected_product as u64 + 1,
             items: OverlayLegend {
-                thresholds: spec.scale.thresholds.clone(),
+                thresholds: &spec.scale.thresholds,
                 is_gradient: spec.scale.is_gradient,
                 min_value: spec.scale.min_value,
                 max_value: spec.scale.max_value,

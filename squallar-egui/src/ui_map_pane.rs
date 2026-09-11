@@ -4828,9 +4828,9 @@ mod legend_ladder_tests {
     use squallar_overlays::hrrr::ModelParameter;
     use squallar_overlays::mrms::MrmsProduct;
 
-    fn legend_of(scale: &squallar_source::product::LegendScale) -> OverlayLegend {
+    fn legend_of(scale: &'static squallar_source::product::LegendScale) -> OverlayLegend {
         OverlayLegend {
-            thresholds: scale.thresholds.clone(),
+            thresholds: &scale.thresholds,
             is_gradient: scale.is_gradient,
             min_value: scale.min_value,
             max_value: scale.max_value,

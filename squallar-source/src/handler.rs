@@ -27,7 +27,18 @@ use crate::time::{FrameListing, FrameSource, FrameStamp, Residency, TimeAxis};
 /// Not `squallar_radar::LegendScale`: duplicated here to avoid the dependency.
 pub struct OverlayLegend {
     /// Colour stops, **sorted ascending by value**.
-    pub thresholds: Vec<(f32, [u8; 3])>,
+    ///
+    /// **Borrowed, not owned.** A legend is asked for several times per pane
+    /// per frame — once by each of [`OverlayHandler::legend`]'s callers that
+    /// measures the bar's gutter and once by the one that paints it — and the
+    /// answer is read for its `signature` far more often than for these
+    /// stops, because the bar behind that signature is baked once and
+    /// replayed. Handing back an owned `Vec` put one heap allocation on every
+    /// one of those calls to carry a table the handler was already holding:
+    /// every registered field's stops live in its [`ProductSpec::scale`],
+    /// which is itself a `&'static`. The borrow makes the per-frame
+    /// allocation unrepresentable rather than merely absent.
+    pub thresholds: &'static [(f32, [u8; 3])],
     pub is_gradient: bool,
     pub min_value: f32,
     pub max_value: f32,

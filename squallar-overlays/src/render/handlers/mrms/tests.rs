@@ -2243,3 +2243,45 @@ fn a_parked_panes_only_granule_outlives_a_live_panes_loop_tail() {
         "the ceiling is untouched: which granules go changed, how many are kept did not"
     );
 }
+
+// ── The bar, borrowed ───────────────────────────────────────────────────────
+
+/// **The bar is handed over as a borrow of the one table, not a copy of it** —
+/// for every product, and asserted by address rather than by value, because
+/// two equal `Vec`s are exactly what the defect produced.
+///
+/// `legend` is asked several times per pane per frame: once by each
+/// `color_scale_gutter` run measuring the gutter and once by
+/// `render_overlay_color_scales` painting it, and behind the shape memo almost
+/// every one of those reads the `signature` and never the stops. This used to
+/// clone `spec.scale.thresholds` — a heap allocation on each of those calls to
+/// copy a `&'static` table that outlives every frame.
+///
+/// The stops are asserted non-empty first: `ptr::eq` over two empty slices is
+/// not evidence of anything, and this test must not be able to pass on a
+/// product with no bar.
+#[test]
+fn every_products_legend_borrows_the_static_stops() {
+    for &product in MrmsProduct::all() {
+        let table = &crate::mrms::fields::spec(product).scale.thresholds[..];
+        assert!(
+            !table.is_empty(),
+            "{product:?}: an empty table makes the address check vacuous",
+        );
+
+        let h = handler_with(product, vec![45.0; 4]);
+        let state = pane_state(product);
+        let pane = PaneRef {
+            state: Some(&*state),
+            ..PaneRef::bare(0)
+        };
+        let legend = h.legend(&pane).expect("an enabled pane carries a bar");
+
+        assert!(
+            std::ptr::eq(legend.items.thresholds, table),
+            "{product:?}: the bar's stops are a copy, not `mrms::fields`' own \
+             table -- that copy is a heap allocation per call, several times \
+             per pane per frame",
+        );
+    }
+}

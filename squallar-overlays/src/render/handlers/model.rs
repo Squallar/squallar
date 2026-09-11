@@ -1871,12 +1871,22 @@ impl OverlayHandler for ModelDataHandler {
     /// The signature is the selected parameter and nothing else, since the bar is
     /// a pure function of it — deliberately **not** `data_generation`, which every
     /// HRRR fetch bumps. `+ 1` keeps the first parameter's signature off `0`.
+    ///
+    /// **The stops are borrowed from [`crate::hrrr::fields`], not rebuilt.**
+    /// [`ModelParameter::legend_thresholds`] allocates a fresh `Vec` per call,
+    /// which is exactly why that module already builds every parameter's
+    /// `LegendScale` once into a `&'static`; this asked for the table a second
+    /// way and paid an allocation for it on each of the several calls a frame
+    /// makes per pane. Same stops, same order, same source table — `SCALES` is
+    /// built from `legend_thresholds` over `ModelParameter::all()`.
     fn legend(&self, pane: &PaneRef<'_>) -> Option<Signed<OverlayLegend>> {
         let view = self.view(pane);
         if !view.enabled {
             return None;
         }
-        let thresholds = view.selected_param.legend_thresholds();
+        let thresholds = &crate::hrrr::fields::spec(view.selected_param)
+            .scale
+            .thresholds[..];
         let min = thresholds.first().map_or(0.0, |e| e.0);
         let max = thresholds.last().map_or(1.0, |e| e.0);
         Some(Signed {
@@ -3858,6 +3868,48 @@ mod tests {
             selected_param: param,
             ..ModelPaneState::new(true)
         })
+    }
+
+    /// **The bar is handed over as a borrow of the one table, not a copy of
+    /// it** — for every parameter, and asserted by address rather than by
+    /// value, because two equal `Vec`s are exactly what the defect produced.
+    ///
+    /// `legend` is asked several times per pane per frame: once by each
+    /// `color_scale_gutter` run measuring the gutter and once by
+    /// `render_overlay_color_scales` painting it, and behind the shape memo
+    /// almost every one of those reads the `signature` and never the stops.
+    /// This used to call `ModelParameter::legend_thresholds`, which builds a
+    /// fresh `Vec` from a `vec![]` literal on each call — so every one of them
+    /// allocated to hand back a table `hrrr::fields::SCALES` was already
+    /// holding for the life of the process.
+    ///
+    /// The stops are asserted non-empty first: `ptr::eq` over two empty slices
+    /// is not evidence of anything, and this test must not be able to pass on
+    /// a parameter with no bar.
+    #[test]
+    fn every_parameters_legend_borrows_the_static_stops() {
+        for &param in ModelParameter::all() {
+            let table = &crate::hrrr::fields::spec(param).scale.thresholds[..];
+            assert!(
+                !table.is_empty(),
+                "{param:?}: an empty table makes the address check vacuous",
+            );
+
+            let h = new_handler();
+            let state = pane_state(param);
+            let pane = PaneRef {
+                state: Some(&*state),
+                ..PaneRef::bare(0)
+            };
+            let legend = h.legend(&pane).expect("an enabled pane carries a bar");
+
+            assert!(
+                std::ptr::eq(legend.items.thresholds, table),
+                "{param:?}: the bar's stops are a copy, not `hrrr::fields`' own \
+                 table -- that copy is a heap allocation per call, several \
+                 times per pane per frame",
+            );
+        }
     }
 
     /// **Two panes, two HRRR parameters** — the order's named subject, and the
