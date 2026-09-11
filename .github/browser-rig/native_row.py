@@ -5938,6 +5938,53 @@ class SharedFormatTests(unittest.TestCase):
         self.assertEqual(r["state"], "probe_held")
         self.assertTrue(r["probe_held"])
 
+    def test_the_native_row_carries_the_event_count_AND_its_variety(self):
+        """Both numbers, off a desktop log, through the SHARED summary.
+
+        There is no second field to add here: this half owns no summary of
+        its own for this family and imports `drive.py`'s, which is the
+        arrangement that stops the two halves reporting one leg two ways. So
+        what this pins is not whether the field arrives -- it is whether it
+        means the same thing when it does.
+
+        It does not arrive for free. A native line carries env_logger's
+        timestamp, so a variety counted over the raw string would call six
+        identical events six distinct ON THIS ARM ALONE. These six say one
+        thing at one rung; the number a reader meets is `6 event(s), 1
+        distinct`, and that is the shape that says the FIELDS went quiet.
+        """
+        probes = compile_probes()
+        SAID = (
+            "budget pressure: out of memory -> evicted render cache 0 entries "
+            "0 MiB, extracts 0, ladder rung 7, tile economy 0 MiB, staging "
+            "released 0 MiB, oversample 0"
+        )
+        log = ["[2026-09-11T04:00:0%d.%03dZ WARN  squallar_app] %s"
+               % (i, i * 11, SAID) for i in range(6)]
+        s = scrape(log, probes)
+        self.assertEqual(len(s["budget_pressure_lines"]), 6)
+        r = drive_module().budget_pressure_reading(s["budget_pressure_lines"])
+        self.assertEqual(r["event_count"], 6)
+        self.assertEqual(r["event_distinct"], 1)
+        row = _fixture_row()
+        row["budget_pressure"] = r
+        text = _capture(lambda: print_row(row))
+        self.assertIn("6 event(s), 1 distinct", text)
+        # The negative that makes the positive worth having: neither number
+        # may stand in for the other on the printed row.
+        self.assertNotIn("1 event(s)", text)
+        self.assertNotIn("6 distinct", text)
+
+        # And six events that each said something different read as six over
+        # six -- so a reader who sees the pair AGREE has been told something,
+        # not handed a number that is always the count.
+        varied = ["[2026-09-11T04:00:0%d.000Z WARN  squallar_app] %s"
+                  % (i, SAID.replace("ladder rung 7", "ladder rung %d" % i))
+                  for i in range(6)]
+        r = drive_module().budget_pressure_reading(
+            scrape(varied, probes)["budget_pressure_lines"])
+        self.assertEqual((r["event_count"], r["event_distinct"]), (6, 6))
+
     def test_a_log_with_no_pressure_line_reads_absent_not_zero(self):
         probes = compile_probes()
         s = scrape(["[INFO] nothing of the kind here"], probes)

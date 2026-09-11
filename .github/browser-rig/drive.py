@@ -5961,6 +5961,25 @@ def _budget_pressure_cause(line, out, unread):
         out["used_mib"], out["max_mib"] = None, None
 
 
+def _pressure_payload(line, head):
+    """The family's OWN line, with the logger's frame around it removed.
+
+    The two rig halves hand this classifier different strings for the same
+    event. A browser console entry is bare; a native log line arrives with
+    env_logger's `[2026-09-11T04:00:00Z WARN  squallar_app]` preamble in
+    front of it -- `native_row.py` keeps the line WHOLE for that reason and
+    says so ("the native log has env_logger timestamps"), and the pins in
+    both halves carry the preamble deliberately.
+
+    So a variety count taken over the raw string would count CLOCK TICKS on
+    the native arm: twelve events that said one identical thing read as one
+    distinct here and twelve there, and the whole point of the halves sharing
+    this classifier is that they cannot report one leg two ways.
+    """
+    i = line.find(head)
+    return line[i:].strip() if i != -1 else line.strip()
+
+
 def budget_pressure_reading(lines):
     """What memory pressure did to this leg, out of `FrameLineWatcher`'s lines.
 
@@ -5972,10 +5991,24 @@ def budget_pressure_reading(lines):
                       one is the reading; `events` carries every one seen and
                       `event_count` how many, because pressure events are not
                       running totals and a second is not a bigger first.
+                      `event_distinct` is how many DIFFERENT things those
+                      said, and the two are not one reading: twelve
+                      `SurfaceLost` events through the real `App` were
+                      measured as twelve lines in TWO distinct strings,
+                      because every field goes quiet once the caches are
+                      empty and the ladder is at its floor. A high count over
+                      a low distinct is the shape that says THE FIELDS WENT
+                      SILENT, which a count alone cannot say and a distinct
+                      count alone reports as two events where twelve fired.
     * `probe_held` -- the `pressure: oom during gpu probe` line reached the
                       reader and no figures line did. The event FIRED and the
                       rung was deliberately held; not an absence and not a
-                      zero reclaim.
+                      zero reclaim. `held_count` is how many of that line
+                      arrived and `held_distinct` how many things they said
+                      -- one, BY CONSTRUCTION: the line carries no
+                      interpolated field at all, so the count is the only
+                      thing that separates one refused allocation from a
+                      hundred of them.
     * `unreadable` -- a `budget pressure:` line is here and its head did not
                       parse. Without this arm that reads as an absence, whose
                       documented meaning is a session that never came under
@@ -5991,13 +6024,14 @@ def budget_pressure_reading(lines):
     """
     out = {"state": "absent", "read_from": None, "line": None,
            "unread": [], "unclassified": [], "events": [], "event_count": 0,
+           "event_distinct": 0, "held_count": 0, "held_distinct": 0,
            "probe_held": False, "format_generation": None,
            "why": "no `pressure:` line of any shape reached the console ring "
                   "during the leg: nothing raised a cause, the bundle "
                   "predates the family, or the ring evicted it. NOT a "
                   "measured zero and NOT proof the session stayed under its "
                   "budgets."}
-    events, unclassified, held = [], [], False
+    events, unclassified, held_lines = [], [], []
     for line in lines or []:
         if "budget pressure: " in line:
             unread = []
@@ -6040,13 +6074,17 @@ def budget_pressure_reading(lines):
             # A real reading about the LADDER: the rung was held on purpose.
             # It carries no figures of its own, so it never becomes the
             # reading when a figures line is also here -- it annotates it.
-            held = True
+            # KEPT, not counted to a bool: this line is a constant with no
+            # interpolated field, so how many of them arrived is the entire
+            # quantity it has, and the ring now hands over every one
+            # (`_merge_ring_lines`, b91cfa238).
+            held_lines.append(line)
         else:
             unclassified.append(line)
     if events:
         out = dict(events[-1])
         out["unread"] = list(events[-1]["unread"])
-    elif held:
+    elif held_lines:
         out = {"state": "probe_held",
                "read_from": "pressure: oom during gpu probe, presumption held",
                "line": "pressure: oom during gpu probe, presumption held",
@@ -6057,9 +6095,46 @@ def budget_pressure_reading(lines):
                       "the window. NOT an absence and NOT a zero reclaim."}
     out["events"] = events
     out["event_count"] = len(events)
-    out["probe_held"] = held
+    # The multiplicity and the VARIETY, side by side, because neither is the
+    # other's proxy here. Two events are two events whatever they said, and
+    # two events saying one thing is a different finding from two saying two:
+    # the second is the ladder moving, the first is a line whose fields have
+    # all gone quiet.
+    out["event_distinct"] = len(
+        {_pressure_payload(e["line"], "budget pressure: ") for e in events})
+    out["probe_held"] = bool(held_lines)
+    out["held_count"] = len(held_lines)
+    out["held_distinct"] = len(
+        {_pressure_payload(l, "pressure: oom during gpu probe")
+         for l in held_lines})
     out["unclassified"] = unclassified
     return out
+
+
+def _pressure_multiplicity(count, distinct, noun):
+    """`12 event(s), 2 distinct` -- BOTH numbers, on every line, always.
+
+    A count alone is not interpretable for this family and neither is a
+    variety alone. Twelve `SurfaceLost` events off one leg were measured as
+    twelve lines in two distinct strings, so a reader given only "2" is
+    quoting an 83 % undercount of what fired, and a reader given only "12"
+    cannot see that ten of them said nothing new -- which is the signal that
+    the fields on the line have gone quiet rather than that pressure came and
+    went ten more times. The pair says both, and says it where a reader meets
+    the leg rather than in a comment about it.
+
+    Printed even when the two agree. A number that appears only when it is
+    interesting cannot be told from a number nobody wrote, and `N event(s), N
+    distinct` is the reading that every event said something different.
+    """
+    return "%s %s, %s" % (
+        "?" if count is None else count, noun,
+        # An ABSENCE, never a zero: a reading assembled before these fields
+        # existed has no variety in it to report, and printing `0 distinct`
+        # beside a positive count would be a wrong population rather than a
+        # missing one.
+        "distinct UNKNOWN (reading predates the field)"
+        if distinct is None else "%d distinct" % distinct)
 
 
 def budget_pressure_summary(reading):
@@ -6074,22 +6149,29 @@ def budget_pressure_summary(reading):
                  % r["format_generation"])
     tail += ((" [%d line(s) of this family matched no known shape]"
               % len(r["unclassified"])) if r.get("unclassified") else "")
+    held_note = ((", rung HELD (gpu probe's own oom, %s)"
+                  % _pressure_multiplicity(r.get("held_count"),
+                                           r.get("held_distinct"), "line(s)"))
+                 if r.get("probe_held") else "")
     if st == "acted":
-        return ("%d event(s); last: %s -> %s render entries (%s MiB), %s "
+        return ("%s; last: %s -> %s render entries (%s MiB), %s "
                 "extracts, rung %s, tile economy %s MiB, staging released %s "
                 "MiB, oversample %s%%%s"
-                % (r.get("event_count"), r.get("cause"),
+                % (_pressure_multiplicity(r.get("event_count"),
+                                          r.get("event_distinct"), "event(s)"),
+                   r.get("cause"),
                    r.get("render_entries"), r.get("render_mib"),
                    r.get("extracts"), r.get("ladder_rung"),
                    r.get("tile_economy_mib"), r.get("staging_released_mib"),
-                   r.get("oversample_percent"),
-                   ", rung HELD (gpu probe's own oom)"
-                   if r.get("probe_held") else "")) + tail
+                   r.get("oversample_percent"), held_note)) + tail
     if st == "unreadable":
         return ("UNREADABLE: %s -- %r" % (r.get("why"),
                                           str(r.get("line"))[:160])) + tail
     if st == "probe_held":
-        return ("rung HELD, no figures line: %s" % r.get("why")) + tail
+        return ("rung HELD on %s, no figures line: %s"
+                % (_pressure_multiplicity(r.get("held_count"),
+                                          r.get("held_distinct"), "line(s)"),
+                   r.get("why"))) + tail
     return ("ABSENT: %s" % r.get("why")) + tail
 
 
@@ -9318,6 +9400,93 @@ def selftest_budget_pressure_reading():
     watcher.poll()
     pin("a ring that EVICTED its head does not re-append what is still held",
         watcher.pressure_lines == [HELD, OOM])
+
+    # ---- BOTH NUMBERS, WHERE A READER MEETS THE LEG ---------------------
+    # The multiplicity survives the union (above) and `event_count` reports
+    # it, so the leg that motivated all of this -- twelve events, two
+    # distinct strings -- now reads as twelve and there is nowhere left that
+    # produces the two. These pins put the pair in the SUMMARY line, and the
+    # first of them is the measured shape itself: five identical rows at rung
+    # 0, then seven identical at rung 7, because every field goes quiet once
+    # the caches are empty and the ladder is at its floor.
+    TWELVE_TWO = ([SURFACE] * 5
+                  + [SURFACE.replace("ladder rung 0", "ladder rung 7")] * 7)
+    r = read(*TWELVE_TWO)
+    pin("the MEASURED leg -- twelve events in two distinct strings -- reads "
+        "as both numbers and not as either one",
+        r["event_count"] == 12 and r["event_distinct"] == 2
+        and "12 event(s), 2 distinct" in budget_pressure_summary(r))
+
+    # The negative above needs its positive, and this is also the pin that a
+    # `distinct` hardcoded to 1 fails: twelve events that each said something
+    # different are twelve distinct, and the pair AGREEING is the reading
+    # that no field went quiet.
+    r = read(*[SURFACE.replace("ladder rung 0", "ladder rung %d" % i)
+               for i in range(1, 13)])
+    pin("and twelve events that each said something DIFFERENT read as twelve "
+        "over twelve, so the pair agreeing is itself a reading",
+        r["event_count"] == 12 and r["event_distinct"] == 12
+        and "12 event(s), 12 distinct" in budget_pressure_summary(r))
+
+    # The sixth shape, which has no fields to go quiet: it is a constant
+    # string, so its variety is one BY CONSTRUCTION and its count is the
+    # whole of what it can say. A by-value union answered one for ever here.
+    r = read(*([HELD] * 12))
+    s = budget_pressure_summary(r)
+    pin("the CONSTANT-string shape carries its count beside its one distinct "
+        "-- twelve refusals inside the probe's window, not one",
+        r["state"] == "probe_held" and r["held_count"] == 12
+        and r["held_distinct"] == 1
+        and "rung HELD on 12 line(s), 1 distinct" in s
+        and "rung HELD on 1 line(s)" not in s)
+
+    # THE PREAMBLE IS NOT PART OF WHAT THE LINE SAID. A native log line
+    # carries env_logger's timestamp, so a variety counted over the raw
+    # string would make every event distinct on that arm and this number
+    # would mean two different things on the two halves of one rig.
+    STAMPED = "[2026-09-11T04:00:0%d.%03dZ WARN  squallar_app] "
+    r = read(*[(STAMPED % (i, i * 7)) + SURFACE for i in range(6)])
+    pin("two rig halves, ONE number: an env_logger timestamp in front of the "
+        "head is not a difference in what the line said",
+        r["event_count"] == 6 and r["event_distinct"] == 1
+        and "6 event(s), 1 distinct" in budget_pressure_summary(r))
+    r = read(*[(STAMPED % (i, i)) + HELD for i in range(4)])
+    pin("and the constant-string shape reads the same way off a stamped log",
+        r["held_count"] == 4 and r["held_distinct"] == 1
+        and "rung HELD on 4 line(s), 1 distinct" in budget_pressure_summary(r))
+
+    # `held_distinct` is one BY CONSTRUCTION today, so a pin that only ever
+    # saw the shipped constant could not tell it from a hardcoded 1. The day
+    # that line grows a field, the reader must notice.
+    GROWN_HELD = HELD.replace("presumption held", "presumption held, retry 2")
+    r = read(HELD, GROWN_HELD)
+    pin("and if that line ever grows a field, its variety is READ and not "
+        "assumed to be one",
+        r["held_count"] == 2 and r["held_distinct"] == 2
+        and "rung HELD on 2 line(s), 2 distinct" in budget_pressure_summary(r))
+
+    r = read(HELD, HELD, OOM)
+    pin("and where it ANNOTATES a figures line it brings both numbers with "
+        "it, rather than reading as a bare flag",
+        r["state"] == "acted" and r["probe_held"] is True
+        and "rung HELD (gpu probe's own oom, 2 line(s), 1 distinct)"
+        in budget_pressure_summary(r))
+
+    # An absence, never a zero: a reading assembled before these fields
+    # existed has no variety in it, and `0 distinct` beside a positive count
+    # would be a wrong population rather than a missing one.
+    stale = dict(read(OOM, OOM))
+    del stale["event_distinct"]
+    pin("a reading that PREDATES the field says so, and does not report zero "
+        "distinct beside two events",
+        "2 event(s), distinct UNKNOWN" in budget_pressure_summary(stale)
+        and "0 distinct" not in budget_pressure_summary(stale))
+
+    pin("the states with no multiplicity to report grow no figure",
+        budget_pressure_summary(read()).startswith("ABSENT:")
+        and "distinct" not in budget_pressure_summary(read())
+        and budget_pressure_summary(
+            read("budget pressure: nope")).startswith("UNREADABLE:"))
 
     return failed
 
