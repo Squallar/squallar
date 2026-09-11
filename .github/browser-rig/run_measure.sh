@@ -45,6 +45,38 @@
 #   E3 a volume pane looping, orbit-3d -- MAX_LOOP_VOLUME_BUILDS_PER_FRAME
 #      is 1 and a resident grid set is the largest thing the app holds.
 #
+# The MEMORY arms. A..E3 above are TIMING arms; these are the RSS campaign's,
+# and until 2026-09-11 they were not scenes at all. Each lived as one
+# `seed_<NAME>.json` per lane worktree, carried by hand into the next lane's
+# scratch dir -- 43 files across 27 directories. They were still byte-identical
+# per name on the day they moved here, which was luck: nothing was holding them
+# to it. They keep the names the campaign already quotes, so a lane asking for
+# HEAVY6 gets the HEAVY6 its peers measured; `scene_alias` resolves the second
+# spelling each of them acquired.
+#
+#   HEAVY6  6 panes, SIX sites (KTLX KINX KVNX KFDR KICT KDDC), every pane
+#      layer-unlinked and carrying the whole layer stack, every pane LOOPING,
+#      lookback 3600 / 10 fps, pan-zoom-2d -- the RSS worst case, live.
+#      `layer_link` is explicit here for the reason it is explicit in scene C:
+#      it defaults to TRUE and would collapse all six panes onto one site.
+#      Also spelled LIVE6.
+#   PIN6  HEAVY6 with every pane PARKED -- `as_of` 2026-04-27T06:00:00 AND
+#      `viewing_live` false, which are two statements and not one: the first is
+#      the instant the picture depicts, the second is whether chunks keep
+#      arriving. This is the fixed-input arm, and its whole value is that two
+#      legs taken weeks apart see the same bytes. Also spelled HEAVY6P.
+#   NOMRMS6  PIN6 with the Mrms layer alone switched off, and nothing else
+#      changed -- the arm PIN6 is differenced against to price one layer.
+#   REST1  1 pane, KTLX, the whole layer stack, NOT looping, no gesture -- the
+#      floor every six-pane figure is read against.
+#   PIN1  REST1 parked on the same instant. Also spelled REST1P.
+#
+# No leg here measures RSS: this file measures frame cost. What the memory arms
+# get from being scenes is ONE definition -- `native_row.py verify-seed <file>`
+# answers "is this the PIN6 the table defines?" against a lane's own copy, and
+# `every_measure_scene_seeds_the_layout_it_claims` holds each seed to the
+# claims above.
+#
 # Every E row needs denominators A..D do not: how many layers were really
 # looping, frames RESIDENT against frames LISTED (a loop that lists fourteen
 # and holds three animates three while every phase reads healthy), the pool
@@ -202,7 +234,12 @@
 #                     -> "Allow Remote Automation".
 #   RIG_SCENES        "A B C D" (default), or a subset, or any of the loop
 #                     scenes E1/E2/E3 (not in the default set: they are a
-#                     separate lane and they cost a settle each)
+#                     separate lane and they cost a settle each), or any of
+#                     the memory arms HEAVY6/PIN6/NOMRMS6/REST1/PIN1 and their
+#                     second spellings LIVE6/HEAVY6P/REST1P. The memory arms
+#                     are also not in the default set: they are six-pane
+#                     scenes belonging to the RSS campaign, and a frame-cost
+#                     row taken on one is a six-pane row, not a scene-A one.
 #   RIG_SETTLE        seconds before the warm rAF sample (default 6)
 #   RIG_MEASURE_WINDOW  seconds of scripted time after settle (default 46 --
 #                     at least two full 20 s script loops, so the window is
@@ -387,6 +424,59 @@ LOOP_SEED='\"loop_lookback_secs\":3600,\"loop_speed_fps\":10.0,'
 # default. Pinning the viewport makes a scene-A leg repeatable AT A GIVEN
 # CANVAS; it does not make two different canvases comparable, and never did.
 
+# ------------------------------------------------------- the memory arms ----
+#
+# The MEMORY arms' fragments. These scenes were not scenes until 2026-09-11:
+# each lived as one `seed_<NAME>.json` per lane worktree, carried by hand into
+# the next lane's scratch dir. 46 such files existed across 27 lane
+# directories on the day they were migrated, and every name was still
+# byte-identical everywhere it appeared -- CHECKED by hash, not assumed, and
+# had it not held, the divergence would have been the finding. They are here
+# so the next lane references an arm instead of inheriting a copy.
+#
+# Spelled as fragments spliced per pane rather than one literal per scene for
+# the same reason `ALL_LAYERS` is a variable: the six panes differ ONLY in
+# their site, and the live and parked arms differ ONLY by `MEM_PARK_TAIL`. A
+# scene that spelled its six panes out could drift from its sibling in one
+# pane and read as a different measurement, which is the whole failure the
+# seed files already had.
+MEM_PANE_MID='\",\"layer_link\":false,\"enabled_overlays\":'
+MEM_LOOP_TAIL=',\"loop_playback\":\"playing\"'
+
+# `as_of` + `viewing_live` together, and they are not the same statement:
+# `as_of` is the instant the picture DEPICTS, `viewing_live` is whether the
+# pane still follows the site's arrivals. Parking one without the other is a
+# pane that shows a fixed instant while chunks keep landing, which is neither
+# arm. See `PaneState::viewing_live`'s own comment.
+MEM_PARK_TAIL=',\"as_of\":\"2026-04-27T06:00:00\",\"viewing_live\":false'
+
+# `ALL_LAYERS` with the Mrms entry alone flipped, spelled out rather than
+# derived. Bash could compute it (`${ALL_LAYERS/...}`) and the Rust gate that
+# reads these assignments could not, so the gate would hold NOMRMS6 to a layer
+# stack the runner never seeds. Duplication that a test pins is better than a
+# derivation only one of the two readers can perform:
+# `nomrms6_switches_off_exactly_the_mrms_layer` asserts this is `ALL_LAYERS`
+# with that one entry changed and nothing else.
+ALL_LAYERS_NO_MRMS='\"ModelData\":true,\"SpcOutlook\":true,\"Radar\":true,\"SpcDiscussions\":true,\"NwsAlerts\":true,\"StormReports\":true,\"Lightning\":true,\"Metar\":true,\"CityLabels\":true,\"RadarSites\":true,\"RadarCoverage\":true,\"UserLocation\":true,\"ColorScale\":true,\"SpcFireOutlook\":true,\"Mrms\":false,\"Gmgsi\":true,\"Terrain\":true,\"BasemapTiles\":true'
+
+# scene_alias <name>: the canonical scene a name refers to, or the name
+# itself. The memory arms reached this table under TWO spellings each, because
+# two lanes named the same seed differently and both names then spread by
+# copying. The names are kept -- a lane's notes say `HEAVY6P` and those rows
+# are real -- but each resolves to ONE definition here, so the two spellings
+# can never again drift into two arms. The identity is not a decision made
+# here: `seed_LIVE6.json` and `seed_HEAVY6.json` were byte-identical in every
+# worktree that held either, and so were `seed_HEAVY6P.json`/`seed_PIN6.json`
+# and `seed_REST1P.json`/`seed_PIN1.json`. Recorded, not declared.
+scene_alias() {
+  case "$1" in
+    LIVE6)   echo HEAVY6 ;;
+    HEAVY6P) echo PIN6 ;;
+    REST1P)  echo PIN1 ;;
+    *)       echo "$1" ;;
+  esac
+}
+
 # scene_seed <scene>: the localStorage seed JSON; scene_script <scene>: the
 # gesture script the seed arms (also the row's script= denominator).
 #
@@ -396,6 +486,7 @@ LOOP_SEED='\"loop_lookback_secs\":3600,\"loop_speed_fps\":10.0,'
 # the shell: a pin behind a variable reads to that half of the rule as a scene
 # carrying no pin at all, which is its exempt case.
 scene_seed() {
+  set -- "$(scene_alias "$1")"
   case "$1" in
     A) echo '{"squallar.ui": "{'"$PANEL_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"zoom\":7.0,\"center\":[35.33305,-97.27775],\"enabled_overlays\":{'"$ALL_LAYERS"'}}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "pan-zoom-2d"}' ;;
     B) echo '{"squallar.ui": "{'"$PANEL_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"render\":\"Volume\"}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "orbit-3d"}' ;;
@@ -404,15 +495,23 @@ scene_seed() {
     E1) echo '{"squallar.ui": "{'"$PANEL_SEED$LOOP_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"loop_playback\":\"playing\",\"enabled_overlays\":{'"$ALL_LAYERS"'}}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1"}' ;;
     E2) echo '{"squallar.ui": "{'"$PANEL_SEED$LOOP_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"loop_playback\":\"playing\",\"enabled_overlays\":{'"$ALL_LAYERS"'}}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "pan-zoom-2d"}' ;;
     E3) echo '{"squallar.ui": "{'"$PANEL_SEED$LOOP_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"render\":\"Volume\",\"loop_playback\":\"playing\"}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "orbit-3d"}' ;;
+    HEAVY6) echo '{"squallar.ui": "{'"$PANEL_SEED$LOOP_SEED"'\"pane_count\":6,\"panes\":[{\"site\":\"KTLX'"$MEM_PANE_MID"'{'"$ALL_LAYERS"'}'"$MEM_LOOP_TAIL"'}'',{\"site\":\"KINX'"$MEM_PANE_MID"'{'"$ALL_LAYERS"'}'"$MEM_LOOP_TAIL"'}'',{\"site\":\"KVNX'"$MEM_PANE_MID"'{'"$ALL_LAYERS"'}'"$MEM_LOOP_TAIL"'}'',{\"site\":\"KFDR'"$MEM_PANE_MID"'{'"$ALL_LAYERS"'}'"$MEM_LOOP_TAIL"'}'',{\"site\":\"KICT'"$MEM_PANE_MID"'{'"$ALL_LAYERS"'}'"$MEM_LOOP_TAIL"'}'',{\"site\":\"KDDC'"$MEM_PANE_MID"'{'"$ALL_LAYERS"'}'"$MEM_LOOP_TAIL"'}'']}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "pan-zoom-2d"}' ;;
+    PIN6) echo '{"squallar.ui": "{'"$PANEL_SEED$LOOP_SEED"'\"pane_count\":6,\"panes\":[{\"site\":\"KTLX'"$MEM_PANE_MID"'{'"$ALL_LAYERS"'}'"$MEM_LOOP_TAIL""$MEM_PARK_TAIL"'}'',{\"site\":\"KINX'"$MEM_PANE_MID"'{'"$ALL_LAYERS"'}'"$MEM_LOOP_TAIL""$MEM_PARK_TAIL"'}'',{\"site\":\"KVNX'"$MEM_PANE_MID"'{'"$ALL_LAYERS"'}'"$MEM_LOOP_TAIL""$MEM_PARK_TAIL"'}'',{\"site\":\"KFDR'"$MEM_PANE_MID"'{'"$ALL_LAYERS"'}'"$MEM_LOOP_TAIL""$MEM_PARK_TAIL"'}'',{\"site\":\"KICT'"$MEM_PANE_MID"'{'"$ALL_LAYERS"'}'"$MEM_LOOP_TAIL""$MEM_PARK_TAIL"'}'',{\"site\":\"KDDC'"$MEM_PANE_MID"'{'"$ALL_LAYERS"'}'"$MEM_LOOP_TAIL""$MEM_PARK_TAIL"'}'']}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "pan-zoom-2d"}' ;;
+    NOMRMS6) echo '{"squallar.ui": "{'"$PANEL_SEED$LOOP_SEED"'\"pane_count\":6,\"panes\":[{\"site\":\"KTLX'"$MEM_PANE_MID"'{'"$ALL_LAYERS_NO_MRMS"'}'"$MEM_LOOP_TAIL""$MEM_PARK_TAIL"'}'',{\"site\":\"KINX'"$MEM_PANE_MID"'{'"$ALL_LAYERS_NO_MRMS"'}'"$MEM_LOOP_TAIL""$MEM_PARK_TAIL"'}'',{\"site\":\"KVNX'"$MEM_PANE_MID"'{'"$ALL_LAYERS_NO_MRMS"'}'"$MEM_LOOP_TAIL""$MEM_PARK_TAIL"'}'',{\"site\":\"KFDR'"$MEM_PANE_MID"'{'"$ALL_LAYERS_NO_MRMS"'}'"$MEM_LOOP_TAIL""$MEM_PARK_TAIL"'}'',{\"site\":\"KICT'"$MEM_PANE_MID"'{'"$ALL_LAYERS_NO_MRMS"'}'"$MEM_LOOP_TAIL""$MEM_PARK_TAIL"'}'',{\"site\":\"KDDC'"$MEM_PANE_MID"'{'"$ALL_LAYERS_NO_MRMS"'}'"$MEM_LOOP_TAIL""$MEM_PARK_TAIL"'}'']}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "pan-zoom-2d"}' ;;
+    REST1) echo '{"squallar.ui": "{'"$PANEL_SEED$LOOP_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX'"$MEM_PANE_MID"'{'"$ALL_LAYERS"'}''}'']}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1"}' ;;
+    PIN1) echo '{"squallar.ui": "{'"$PANEL_SEED$LOOP_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX'"$MEM_PANE_MID"'{'"$ALL_LAYERS"'}'"$MEM_PARK_TAIL"'}'']}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1"}' ;;
     *) return 1 ;;
   esac
 }
 scene_script() {
+  set -- "$(scene_alias "$1")"
   case "$1" in
     A|C|E2) echo pan-zoom-2d ;;
     B|E3)   echo orbit-3d ;;
     D)      echo ui-sweep ;;
     E1)     echo none ;;
+    HEAVY6|PIN6|NOMRMS6) echo pan-zoom-2d ;;
+    REST1|PIN1)          echo none ;;
   esac
 }
 

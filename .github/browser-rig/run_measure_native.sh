@@ -37,6 +37,19 @@
 #      by bash and remapped from localStorage keys to `<key>.json` files --
 #      read, never restated, so scene A cannot mean two different things on
 #      the two targets.
+#
+#      **The memory arms came onto that table on 2026-09-11 and this runner
+#      needed no change to run them.** They had been one `seed_<NAME>.json`
+#      per lane worktree, carried by hand -- 43 copies across 27 directories:
+#      the same failure this header describes for the protocol itself, one
+#      layer down. `--scenes HEAVY6` (or PIN6 / NOMRMS6 / REST1 / PIN1, or
+#      their second spellings LIVE6 / HEAVY6P / REST1P) works because step 1
+#      READS the table rather than knowing the scenes. A lane holding a copy
+#      can ask `native_row.py verify-seed <file>` whether it is the arm it
+#      thinks it is; a copy that matches none gets its NEAREST arm and the
+#      exact fields it differs by, never a refusal -- a lane told only
+#      "unknown" writes its own table, which is how the first five copies
+#      happened.
 #   2. `SQUALLAR_GESTURE_SCRIPT` in the environment. It outranks the stored
 #      key, so the scene's script is armed even if the seed were stale.
 #   3. **Window geometry pinned by PID-RESOLVED WINDOW and READ BACK FROM THE
@@ -166,6 +179,10 @@
 #   --out-dir DIR                 default <rig>/out-native
 #   --platform                    print the resolved platform plan and exit
 #   --gates                       print the default gate set and exit
+#   --scenes "<list>"             scenes to run (default A). Any arm
+#                                 run_measure.sh's table can seed, timing
+#                                 (A..E3) or memory (HEAVY6/PIN6/NOMRMS6/
+#                                 REST1/PIN1 and their second spellings)
 #   --selftest                    run native_row.py's own tests and exit
 #
 # Environment: RIG_DISPLAY, RIG_PANEL (on|off), SQUALLAR_NATIVE_BIN.

@@ -80,6 +80,7 @@ were decisions, not mechanism.
 """
 
 import argparse
+import io
 import json
 import math
 import os
@@ -459,6 +460,186 @@ def scene_from_shell(scene, panel="off", what="seed", source=None):
 def cmd_scene(args):
     print(scene_from_shell(args.scene, args.panel, args.what))
     return 0
+
+
+# ------------------------------------------------- verifying a lane's copy --
+#
+# Copies of these seeds will exist whatever this file says. Lanes work in
+# scratch dirs, carry files forward from the last lane, and a seed that has
+# already been measured against is worth more to them than a fresh one. On the
+# day the memory arms were migrated there were 43 `seed_<NAME>.json` files
+# across 27 lane directories, and they were still byte-identical per name --
+# which is luck, not a property. A FORBIDDEN copy is a copy nobody checks; a
+# CHECKABLE one answers "is this the PIN6 the table defines?" in one command.
+#
+# It degrades for the same reason the rest of this file does. A seed that
+# matches no arm is not an error to exit on: it is a lane whose case this
+# table does not cover, and the useful answer is WHICH arm it is nearest and
+# EXACTLY how it differs -- pane count, sites, layers, the park fields -- so
+# the lane can name what it measured instead of guessing. A refusal here sends
+# it back to hand-carrying the file, which is what this replaces.
+
+
+def seed_norm(web_seed):
+    """A seed as comparable DATA: the nested `squallar.ui` string parsed too.
+
+    Compared as data and not as bytes on purpose. The table splices
+    `PANEL_SEED` in at a different position from where a hand-written file put
+    it, and key order in a JSON object carries no meaning -- two seeds that
+    differ only there are the same scene, and a byte comparison would call
+    them different and send the lane off to reconcile nothing.
+    """
+    out = {}
+    for k, v in web_seed.items():
+        if k == WEB_KEY_PREFIX + "ui" and isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except ValueError:
+                pass
+        out[k] = v
+    return out
+
+
+def _walk(obj, path=""):
+    """`{dotted path: scalar}` over nested dicts/lists."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            out.update(_walk(v, "%s.%s" % (path, k) if path else str(k)))
+        return out
+    if isinstance(obj, list):
+        out = {}
+        for i, v in enumerate(obj):
+            out.update(_walk(v, "%s[%d]" % (path, i)))
+        return out
+    return {path: obj}
+
+
+def seed_diff(a, b, limit=None):
+    """Every field two normalised seeds disagree on, as readable lines."""
+    fa, fb = _walk(seed_norm(a)), _walk(seed_norm(b))
+    lines = []
+    for key in sorted(set(fa) | set(fb)):
+        va, vb = fa.get(key, "<absent>"), fb.get(key, "<absent>")
+        if va != vb:
+            lines.append("%s: table=%r file=%r" % (key, va, vb))
+    if limit is not None and len(lines) > limit:
+        return lines[:limit] + ["... and %d more" % (len(lines) - limit)]
+    return lines
+
+
+def _case_arms(body):
+    """The scene names a `case` body answers for, alternations split out."""
+    names = []
+    for line in body.splitlines():
+        head, sep, rest = line.partition(")")
+        if not sep or not rest.strip().startswith("echo"):
+            continue
+        for name in head.strip().split("|"):
+            name = name.strip()
+            if name and name != "*":
+                names.append(name)
+    return names
+
+
+def _fn_body(text, name):
+    head = "%s() {" % name
+    if head not in text:
+        return None
+    return text.split(head, 1)[1].split("\n}", 1)[0]
+
+
+def table_scene_names(source=None):
+    """`(canonical, {alias: canonical})` -- read out of the shell, not restated."""
+    text = source if source is not None else _read(RUN_MEASURE_SH)
+    seed_body = _fn_body(text, "scene_seed")
+    if seed_body is None:
+        raise SystemExit(
+            "run_measure.sh no longer defines `scene_seed`; the seed table "
+            "moved and nothing here can say what an arm is"
+        )
+    canonical = _case_arms(seed_body)
+    alias_body = _fn_body(text, "scene_alias")
+    aliases = {}
+    if alias_body is not None:
+        for line in alias_body.splitlines():
+            head, sep, rest = line.partition(")")
+            rest = rest.strip()
+            if not sep or not rest.startswith("echo"):
+                continue
+            name = head.strip()
+            target = rest[len("echo"):].strip().rstrip(";").strip()
+            if name == "*" or target.startswith("$"):
+                continue
+            aliases[name] = target
+    return canonical, aliases
+
+
+def cmd_verify_seed(args):
+    """Say whether one file IS an arm this table defines, and if not, what it is.
+
+    Exit 0 on a match, 1 on none. The exit code is the summary; the OUTPUT is
+    the answer, and there is always output.
+    """
+    try:
+        with open(args.file, encoding="utf-8") as fh:
+            mine = json.load(fh)
+    except (IOError, OSError) as e:
+        print("VERDICT unreadable: %s (%s)" % (args.file, e))
+        return 1
+    except ValueError as e:
+        print("VERDICT not JSON: %s (%s)" % (args.file, e))
+        return 1
+
+    try:
+        canonical, aliases = table_scene_names()
+    except SystemExit as e:
+        # The named-capability-that-can-be-ABSENT shape: no table is not a
+        # refusal, it is a verdict with the table column missing.
+        print("VERDICT UNCHECKED: %s" % e)
+        print("  the scene table could not be read, so this file was compared "
+              "against nothing. It is neither confirmed nor refuted.")
+        return 1
+
+    wanted = [args.scene] if args.scene else canonical
+    scored = []
+    unreadable = []
+    for name in wanted:
+        try:
+            theirs = json.loads(scene_from_shell(name, args.panel))
+        except (SystemExit, ValueError) as e:
+            unreadable.append((name, str(e).strip()))
+            continue
+        scored.append((len(seed_diff(theirs, mine)), name, theirs))
+    scored.sort(key=lambda r: (r[0], r[1]))
+
+    also = lambda n: sorted(a for a, c in aliases.items() if c == n)
+
+    if scored and scored[0][0] == 0:
+        name = scored[0][1]
+        alias = also(name)
+        print("VERDICT MATCH %s%s" % (name, (" (also spelled %s)" % ", ".join(alias)) if alias else ""))
+        print("  %s is the %s this table defines." % (args.file, name))
+        return 0
+
+    print("VERDICT NO MATCH: %s is not any arm this table defines" % args.file)
+    if not scored:
+        print("  nothing to compare against: %s"
+              % "; ".join("%s (%s)" % r for r in unreadable))
+        return 1
+    n_diff, name, theirs = scored[0]
+    alias = also(name)
+    print("  nearest arm: %s%s, %d field(s) apart"
+          % (name, (" (also %s)" % ", ".join(alias)) if alias else "", n_diff))
+    for line in seed_diff(theirs, mine, limit=args.max_diff):
+        print("    %s" % line)
+    print("  This is a variant, not a failure. Quote it as `%s + %d field(s)` "
+          "and name the differences above beside the figure -- a row whose "
+          "scene is stated is comparable; one whose scene is assumed is not."
+          % (name, n_diff))
+    for nm, why in unreadable:
+        print("  (arm %s could not be evaluated: %s)" % (nm, why))
+    return 1
 
 
 def seed_files(web_seed):
@@ -4289,6 +4470,15 @@ def main(argv):
     sc.add_argument("--what", choices=("seed", "script"), default="seed")
     sc.set_defaults(func=cmd_scene)
 
+    vs = sub.add_parser("verify-seed",
+                        help="is this seed file an arm the table defines?")
+    vs.add_argument("file")
+    vs.add_argument("--scene", default=None,
+                    help="check against ONE arm instead of all of them")
+    vs.add_argument("--panel", default="off")
+    vs.add_argument("--max-diff", type=int, default=20)
+    vs.set_defaults(func=cmd_verify_seed)
+
     sd = sub.add_parser("seed", help="seed a redirected config dir (JSON on stdin)")
     sd.add_argument("--config-dir", dest="config_dir", required=True)
     sd.set_defaults(func=cmd_seed)
@@ -6787,7 +6977,8 @@ class SeedTests(unittest.TestCase):
         Read out of the shell script by sourcing its own definitions, so the
         two targets cannot drift onto different scenes under one letter.
         """
-        for scene in ("A", "B", "C", "D", "E1", "E2", "E3"):
+        for scene in ("A", "B", "C", "D", "E1", "E2", "E3",
+                      "HEAVY6", "PIN6", "NOMRMS6", "REST1", "PIN1"):
             files = seed_files(json.loads(scene_from_shell(scene)))
             self.assertIn("ui.json", files)
             self.assertEqual(files["frame_telemetry.json"], "1")
@@ -8931,6 +9122,134 @@ def _fixture_row(clamp=False, panes=1, reported="one"):
     }
 
 
+class MemoryArmSeedTests(unittest.TestCase):
+    """The memory arms, and the verifier a lane points at its own copy.
+
+    These arms are the ones that spent a campaign as loose files, so the tests
+    that matter are the ones about a copy DIVERGING, not about the happy path.
+    """
+
+    def test_every_memory_arm_is_seedable_and_distinct(self):
+        seeds = {}
+        for name in ("HEAVY6", "PIN6", "NOMRMS6", "REST1", "PIN1"):
+            seeds[name] = json.loads(scene_from_shell(name))
+        # Distinct: an arm that silently equals another is a pair whose
+        # difference is zero, and every figure read against it is noise.
+        for a in seeds:
+            for b in seeds:
+                if a < b:
+                    self.assertNotEqual(
+                        seed_norm(seeds[a]), seed_norm(seeds[b]),
+                        "arms %s and %s seed the same app" % (a, b))
+
+    def test_each_alias_seeds_byte_for_byte_what_it_aliases(self):
+        for alias, canonical in (("LIVE6", "HEAVY6"), ("HEAVY6P", "PIN6"),
+                                 ("REST1P", "PIN1")):
+            self.assertEqual(
+                scene_from_shell(alias), scene_from_shell(canonical),
+                "%s and %s are two spellings of one arm and must seed one "
+                "app; they are two arms if they do not" % (alias, canonical))
+
+    def test_the_parked_arms_park_every_pane_on_both_fields(self):
+        for name in ("PIN6", "NOMRMS6", "PIN1"):
+            ui = json.loads(json.loads(scene_from_shell(name))["squallar.ui"])
+            for i, pane in enumerate(ui["panes"]):
+                self.assertEqual(pane.get("as_of"), "2026-04-27T06:00:00",
+                                 "%s pane %d" % (name, i))
+                self.assertIs(pane.get("viewing_live"), False,
+                              "%s pane %d still follows live" % (name, i))
+        for name in ("HEAVY6", "REST1"):
+            ui = json.loads(json.loads(scene_from_shell(name))["squallar.ui"])
+            for i, pane in enumerate(ui["panes"]):
+                self.assertNotIn("as_of", pane, "%s pane %d" % (name, i))
+                self.assertNotIn("viewing_live", pane, "%s pane %d" % (name, i))
+
+    def test_the_alias_table_is_read_out_of_the_shell(self):
+        canonical, aliases = table_scene_names()
+        for name in ("HEAVY6", "PIN6", "NOMRMS6", "REST1", "PIN1", "A", "E3"):
+            self.assertIn(name, canonical)
+        self.assertEqual(aliases.get("LIVE6"), "HEAVY6")
+        self.assertEqual(aliases.get("HEAVY6P"), "PIN6")
+        self.assertEqual(aliases.get("REST1P"), "PIN1")
+        for alias in aliases:
+            self.assertNotIn(alias, canonical,
+                             "%s is both an alias and an arm" % alias)
+
+    def test_seed_diff_names_the_field_and_is_empty_on_a_match(self):
+        a = json.loads(scene_from_shell("PIN6"))
+        self.assertEqual(seed_diff(a, json.loads(json.dumps(a))), [])
+        b = json.loads(scene_from_shell("PIN6"))
+        ui = json.loads(b["squallar.ui"])
+        ui["panes"][3]["viewing_live"] = True
+        b["squallar.ui"] = json.dumps(ui)
+        lines = seed_diff(a, b)
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("panes[3].viewing_live", lines[0])
+
+    def test_a_variant_gets_its_nearest_arm_and_never_a_refusal(self):
+        """The degrade path. A copy this table does not cover still gets an answer.
+
+        This is the property the runner's header is about: a lane whose case is
+        not covered and is told only "unknown" writes its own table. The
+        verdict must name the nearest arm and the exact difference, so the lane
+        can quote what it measured.
+        """
+        seed = json.loads(scene_from_shell("HEAVY6"))
+        ui = json.loads(seed["squallar.ui"])
+        ui["pane_count"] = 4
+        del ui["panes"][4:]
+        seed["squallar.ui"] = json.dumps(ui)
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump(seed, fh)
+            path = fh.name
+        try:
+            args = argparse.Namespace(file=path, scene=None, panel="off",
+                                      max_diff=40)
+            buf = io.StringIO()
+            old, sys.stdout = sys.stdout, buf
+            try:
+                rc = cmd_verify_seed(args)
+            finally:
+                sys.stdout = old
+            out = buf.getvalue()
+            self.assertEqual(rc, 1)
+            self.assertIn("NO MATCH", out)
+            self.assertIn("nearest arm: HEAVY6", out)
+            self.assertIn("pane_count", out)
+            # The positive half: the SAME command on an untouched arm matches,
+            # so "NO MATCH" above is a reading and not this command's floor.
+            with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                             delete=False) as fh2:
+                fh2.write(scene_from_shell("HEAVY6"))
+                good = fh2.name
+            try:
+                buf2 = io.StringIO()
+                old, sys.stdout = sys.stdout, buf2
+                try:
+                    rc2 = cmd_verify_seed(
+                        argparse.Namespace(file=good, scene=None, panel="off",
+                                           max_diff=40))
+                finally:
+                    sys.stdout = old
+                self.assertEqual(rc2, 0, buf2.getvalue())
+                self.assertIn("MATCH HEAVY6", buf2.getvalue())
+            finally:
+                os.unlink(good)
+        finally:
+            os.unlink(path)
+
+    def test_an_unreadable_table_is_a_verdict_not_a_traceback(self):
+        """No table is `UNCHECKED`, not a crash and not a false `NO MATCH`.
+
+        A missing table means the file was compared against NOTHING. Reporting
+        that as "does not match" would be the instrument's own breakage printed
+        as a finding.
+        """
+        with self.assertRaises(SystemExit):
+            table_scene_names(source="nothing that defines a scene table")
+
+
 class TelemetrySeedTests(unittest.TestCase):
     """**Every rig seed carries every telemetry switch the app declares.**
 
@@ -9019,15 +9338,21 @@ class TelemetrySeedTests(unittest.TestCase):
         real = _read(RUN_MEASURE_SH)
         drop = ', "squallar.raster_telemetry": "1"'
         self.assertEqual(
-            real.count(drop), 7,
+            real.count(drop), 12,
             "the raster seed spelling moved; this tamper no longer reaches "
             "the scenes it means to break")
-        # Break E3 alone: the LAST arm, the one added most recently, and the
-        # one a hand-listed scene set is likeliest to have missed.
+        # Break the LAST arm alone -- the one added most recently, and the one
+        # a hand-listed scene set is likeliest to have missed. That was E3
+        # until the memory arms landed on 2026-09-11 and is PIN1 now; the
+        # choice is "whatever is last", not a named scene, which is why this
+        # kept working across that change. The count above is what notices a
+        # scene arriving, and it is deliberately a NUMBER: an arm added
+        # without a telemetry switch would leave it at 12 and reach this
+        # assertion, not the rule's own.
         at = real.rindex(drop)
         broken = real[:at] + real[at + len(drop):]
         self.assertNotEqual(broken, real)
-        self.assertEqual(broken.count(drop), 6)
+        self.assertEqual(broken.count(drop), 11)
 
         defects = telemetry_seed_defects({"run_measure.sh": broken})
         self.assertEqual(
@@ -9205,8 +9530,13 @@ class ViewportPinTests(unittest.TestCase):
     def test_the_scene_list_is_derived_from_the_table(self):
         """Non-vacuity for the sweep above: a hand-list would go blind here."""
         real = _read(RUN_MEASURE_SH)
-        self.assertEqual(measure_scenes(real),
-                         ["A", "B", "C", "D", "E1", "E2", "E3"])
+        self.assertEqual(
+            measure_scenes(real),
+            ["A", "B", "C", "D", "E1", "E2", "E3",
+             # The memory arms, on the table since 2026-09-11. Canonical
+             # names only: `scene_alias` resolves LIVE6/HEAVY6P/REST1P before
+             # the `case`, so they are not arms and must not appear here.
+             "HEAVY6", "PIN6", "NOMRMS6", "REST1", "PIN1"])
 
         # A scene added to the table is picked up unasked -- the property the
         # sweep depends on, and the one a listed tuple does not have.

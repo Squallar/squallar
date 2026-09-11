@@ -63,7 +63,32 @@ struct Scene {
     all_layers: bool,
     /// Whether the header claims this scene's pane is seeded looping.
     looping: bool,
+    /// Whether the header claims every pane is PARKED — stopped on
+    /// [`PARK_INSTANT`] and no longer following the site's arrivals.
+    ///
+    /// Two fields, not one, and the seed must carry both: `as_of` is the
+    /// instant the picture depicts and `viewing_live` is whether chunks keep
+    /// landing. A seed that set only `as_of` would show a fixed instant while
+    /// arrivals kept coming, which is neither the live arm nor the parked one
+    /// — and its RSS row would sit between the two with nothing saying so.
+    parked: bool,
+    /// Layer ids the header claims this scene switches OFF.
+    ///
+    /// Empty for every scene that carries the whole stack. A scene that names
+    /// one here is asserted twice: that the id is a layer this build really
+    /// has, and that the seed leaves it off. Without the first, a respelled id
+    /// asserts nothing at all — `"Mrsm"` is off in every scene ever written.
+    layers_off: &'static [&'static str],
 }
+
+/// The instant the parked arms stop on.
+///
+/// Transcribed from the campaign's fixed-input protocol, not read back out of
+/// the seed: a value derived from the thing it checks agrees with it by
+/// construction. Every parked arm shares it so that two legs taken weeks apart
+/// are the same measurement — the point of parking is that the input set
+/// cannot move underneath a comparison.
+const PARK_INSTANT: &str = "2026-04-27T06:00:00";
 
 const SCENES: &[Scene] = &[
     Scene {
@@ -74,6 +99,8 @@ const SCENES: &[Scene] = &[
         script: Some("pan-zoom-2d"),
         all_layers: true,
         looping: false,
+        parked: false,
+        layers_off: &[],
     },
     Scene {
         name: "B",
@@ -83,6 +110,8 @@ const SCENES: &[Scene] = &[
         script: Some("orbit-3d"),
         all_layers: false,
         looping: false,
+        parked: false,
+        layers_off: &[],
     },
     Scene {
         name: "C",
@@ -92,6 +121,8 @@ const SCENES: &[Scene] = &[
         script: Some("pan-zoom-2d"),
         all_layers: false,
         looping: false,
+        parked: false,
+        layers_off: &[],
     },
     Scene {
         name: "D",
@@ -101,6 +132,8 @@ const SCENES: &[Scene] = &[
         script: Some("ui-sweep"),
         all_layers: true,
         looping: false,
+        parked: false,
+        layers_off: &[],
     },
     Scene {
         name: "E1",
@@ -110,6 +143,8 @@ const SCENES: &[Scene] = &[
         script: None,
         all_layers: true,
         looping: true,
+        parked: false,
+        layers_off: &[],
     },
     Scene {
         name: "E2",
@@ -119,6 +154,8 @@ const SCENES: &[Scene] = &[
         script: Some("pan-zoom-2d"),
         all_layers: true,
         looping: true,
+        parked: false,
+        layers_off: &[],
     },
     Scene {
         name: "E3",
@@ -130,6 +167,76 @@ const SCENES: &[Scene] = &[
         // and the seed names none. E1/E2 carry `ALL_LAYERS`; this one does not.
         all_layers: false,
         looping: true,
+        parked: false,
+        layers_off: &[],
+    },
+    // ---- the memory arms -------------------------------------------------
+    //
+    // Scenes A..E3 are TIMING arms and this file has always covered them. The
+    // memory arms were not scenes at all until 2026-09-11: each lived as one
+    // `seed_<NAME>.json` per lane worktree, carried by hand into the next
+    // lane's scratch dir, 43 copies across 27 directories. They were still
+    // byte-identical per name on the day they were migrated — but nothing was
+    // holding them to that, and a gate that covered one class of arm and not
+    // its sibling is exactly how that survived. These rows are the same
+    // claims, made about the other half.
+    Scene {
+        name: "HEAVY6",
+        panes: 6,
+        sites: 6,
+        volume_panes: 0,
+        script: Some("pan-zoom-2d"),
+        all_layers: true,
+        looping: true,
+        parked: false,
+        layers_off: &[],
+    },
+    Scene {
+        name: "PIN6",
+        panes: 6,
+        sites: 6,
+        volume_panes: 0,
+        script: Some("pan-zoom-2d"),
+        all_layers: true,
+        looping: true,
+        parked: true,
+        layers_off: &[],
+    },
+    Scene {
+        name: "NOMRMS6",
+        panes: 6,
+        sites: 6,
+        volume_panes: 0,
+        script: Some("pan-zoom-2d"),
+        // Still "the whole stack" as the header means it — one layer is
+        // switched off and `layers_off` names which, so the claim is the
+        // difference from PIN6 and not a second unexplained layer count.
+        all_layers: true,
+        looping: true,
+        parked: true,
+        layers_off: &["Mrms"],
+    },
+    Scene {
+        name: "REST1",
+        panes: 1,
+        sites: 1,
+        volume_panes: 0,
+        script: None,
+        all_layers: true,
+        looping: false,
+        parked: false,
+        layers_off: &[],
+    },
+    Scene {
+        name: "PIN1",
+        panes: 1,
+        sites: 1,
+        volume_panes: 0,
+        script: None,
+        all_layers: true,
+        looping: false,
+        parked: true,
+        layers_off: &[],
     },
 ];
 
@@ -360,7 +467,185 @@ fn every_measure_scene_seeds_the_layout_it_claims() {
                  what scenes A..D already cover",
             );
         }
+
+        // **Parked is TWO statements and both are checked.** A seed carrying
+        // `as_of` alone parks the picture while chunks keep landing, and one
+        // carrying `viewing_live:false` alone stops the feed on a pane still
+        // showing live — each is a third arm that reads like one of the two
+        // real ones. The fixed-input arms exist so that two legs taken weeks
+        // apart measure the same bytes; a pane that drifted to either of those
+        // states still prints a row.
+        //
+        // The live half is asserted just as hard. `as_of` is
+        // `skip_serializing_if`-absent for a live pane, so "the seed does not
+        // mention it" and "the pane is following live" are the same
+        // observation here only because this reads the loaded `Gui` and not
+        // the text.
+        let parked_at = chrono::NaiveDateTime::parse_from_str(PARK_INSTANT, "%Y-%m-%dT%H:%M:%S")
+            .expect("PARK_INSTANT is a parseable instant");
+        for (i, pane) in gui.panes().iter().enumerate() {
+            let as_of = pane.time.mode.as_of();
+            if scene.parked {
+                assert_eq!(
+                    as_of,
+                    Some(parked_at),
+                    "scene {name} pane {i} is parked on {as_of:?} where its \
+                     header claims {PARK_INSTANT}. A parked arm whose panes \
+                     do not all share one instant is measuring a different \
+                     input set per pane",
+                );
+                assert!(
+                    !pane.viewing_live,
+                    "scene {name} pane {i} is parked on an instant and STILL \
+                     following live arrivals, so its bytes grow with whatever \
+                     landed while the leg ran — the one thing a fixed-input \
+                     arm exists to exclude",
+                );
+            } else {
+                assert_eq!(
+                    as_of, None,
+                    "scene {name} pane {i} is parked on {as_of:?} where its \
+                     header claims a live arm",
+                );
+                assert!(
+                    pane.viewing_live,
+                    "scene {name} pane {i} is not following live where its \
+                     header claims a live arm",
+                );
+            }
+        }
+
+        // A layer the header says is OFF. Resolved through the handler list
+        // rather than compared as a string, which is what makes the negative
+        // below mean anything: an id this build does not have cannot be
+        // found, and a misspelling therefore panics here instead of asserting
+        // that `Mrsm` is disabled — which it is, in every scene ever written.
+        for want in scene.layers_off {
+            let id = gui
+                .overlays
+                .handlers()
+                .map(|h| h.id())
+                .find(|id| id.as_str() == *want)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "scene {name} claims it switches {want:?} off and this \
+                         build registers no such layer. Either the id was \
+                         respelled — in which case the seed enables the real \
+                         layer and the arm is silently the one it was supposed \
+                         to differ from — or the layer is gone and the scene \
+                         with it"
+                    )
+                });
+            for (i, pane) in gui.panes().iter().enumerate() {
+                assert!(
+                    !pane.is_overlay_enabled(&id),
+                    "scene {name} pane {i} has {want:?} switched ON where its \
+                     header claims it off. This arm's whole purpose is the \
+                     difference from the arm that carries it, and with the \
+                     layer on there is no difference to measure",
+                );
+            }
+        }
     }
+}
+
+/// **The alias spellings resolve, and resolve to arms this file states.**
+///
+/// The memory arms arrived under two names each — `LIVE6`/`HEAVY6`,
+/// `HEAVY6P`/`PIN6`, `REST1P`/`PIN1` — because two lanes named one seed
+/// differently and both names spread by copying. Keeping both spellings is
+/// right: a lane's notes say `HEAVY6P` and those rows are real. What is not
+/// safe is two spellings becoming two arms, which is what happened to the
+/// files. `scene_alias` collapses them, and this holds it to three properties:
+/// every alias points at a canonical arm, no alias shadows one, and the map
+/// does not chain.
+#[test]
+fn every_scene_alias_resolves_to_one_arm_this_file_states() {
+    let (_, body) = RUN_MEASURE.split_once("scene_alias() {").expect(
+        "run_measure.sh no longer defines `scene_alias`, so the two \
+                 spellings of each memory arm resolve to nothing and a lane \
+                 asking for LIVE6 gets no seed",
+    );
+    let body = body
+        .split_once("\n}")
+        .expect("`scene_alias` has no recognisable body")
+        .0;
+
+    let mut pairs = Vec::new();
+    for line in body.lines() {
+        let Some((pattern, rest)) = line.trim().split_once(')') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(target) = rest.strip_prefix("echo ") else {
+            continue;
+        };
+        let target = target.trim().trim_end_matches(";;").trim();
+        if pattern == "*" || target.starts_with('"') {
+            continue;
+        }
+        pairs.push((pattern, target));
+    }
+    assert!(
+        !pairs.is_empty(),
+        "no `<alias>) echo <canonical>` row was read out of `scene_alias`, so \
+         every assertion below walks an empty list and this test passes on \
+         nothing",
+    );
+
+    for (alias, canonical) in &pairs {
+        assert!(
+            SCENES.iter().any(|s| s.name == *canonical),
+            "alias {alias} resolves to {canonical}, which this file states no \
+             expected layout for: the alias is measured and scored with \
+             nothing holding it to anything",
+        );
+        assert!(
+            !SCENES.iter().any(|s| s.name == *alias),
+            "{alias} is both an alias and a scene in its own right. \
+             `scene_seed` resolves aliases FIRST, so its own arm is dead code \
+             and every leg asking for it silently measures {canonical}",
+        );
+        assert!(
+            !pairs.iter().any(|(a, _)| a == canonical),
+            "alias {alias} resolves to {canonical}, which is itself an alias. \
+             `scene_alias` resolves once, not to a fixed point, so this \
+             resolves to a name `scene_seed` has no arm for",
+        );
+    }
+}
+
+/// **`ALL_LAYERS_NO_MRMS` is `ALL_LAYERS` with that one entry changed.**
+///
+/// The two lists are spelled out separately because the Rust half of this
+/// table reads shell ASSIGNMENTS and cannot evaluate a bash substitution, so a
+/// derived `ALL_LAYERS_NO_MRMS` would leave this gate holding NOMRMS6 to a
+/// layer stack the runner never seeds. Duplication a test pins beats a
+/// derivation only one of the two readers can perform — but only while the
+/// test exists, and this is it. A second entry quietly flipped would make
+/// NOMRMS6 differ from PIN6 by two layers while every row still said one.
+#[test]
+fn nomrms6_switches_off_exactly_the_mrms_layer() {
+    let all = shell_var("ALL_LAYERS");
+    let no_mrms = shell_var("ALL_LAYERS_NO_MRMS");
+    assert_ne!(
+        all, no_mrms,
+        "`ALL_LAYERS_NO_MRMS` is identical to `ALL_LAYERS`, so NOMRMS6 is PIN6 \
+         under another name and the pair measures a difference of zero",
+    );
+    assert_eq!(
+        all.replace(r#"\"Mrms\":true"#, r#"\"Mrms\":false"#),
+        no_mrms,
+        "`ALL_LAYERS_NO_MRMS` is not `ALL_LAYERS` with the Mrms entry alone \
+         flipped. NOMRMS6 exists to differ from PIN6 by ONE layer; any other \
+         edit makes every figure taken against the pair a difference of \
+         something nobody stated",
+    );
+    assert!(
+        all.contains(r#"\"Mrms\":true"#),
+        "`ALL_LAYERS` no longer carries `Mrms` as an enabled layer, so the \
+         replacement above is a no-op and the equality it asserts is vacuous",
+    );
 }
 
 /// **The floor: the table above covers every arm the script really has.**
