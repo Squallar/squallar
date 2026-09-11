@@ -43,7 +43,9 @@
 //! conditional. None of the five feeds a figure in this file. The count above
 //! is **this ledger's** reads on the unconditional path.
 //!
-//! The bin searches, on a presented interact frame: ten outside the splits
+//! The bin searches, on a presented frame — **and since the 2026-09-10
+//! ruling the count no longer depends on which population the frame is
+//! in**: ten outside the splits
 //! (one service, one service-less-present, six segments, one acquire, one
 //! cadence) and sixty-one in them — **seven** the `pre` split ([`PreHists`]), **eight** the `pump`
 //! split ([`PumpHists`]), **nine** the `ui` split ([`UiHists`]), **seven**
@@ -52,13 +54,57 @@
 //! split's sibling one level below a different `ui` cut, and never added to
 //! those nine either), **six** the
 //! `prepare` split ([`PrepareHists`]), **seven** the `post` split
-//! ([`PostHists`]) and **nine** the `finish` split ([`FinishHists`]). All but
-//! the last record only on the frames their own segment does; the `finish`
-//! nine record on EVERY presented frame, which is the one denominator
-//! difference in this file and is the reason that split exists — see
-//! [`FinishHists`]. The two comparisons are [`WorstFrame`]'s latch and its
-//! session maximum, and like the `finish` nine they are offered EVERY
-//! presented frame.
+//! ([`PostHists`]) and **nine** the `finish` split ([`FinishHists`]). Each
+//! records on the frames its own segment does, whichever population they are
+//! in; the `finish` nine are a plain histogram over both. The two comparisons
+//! are [`WorstFrame`]'s latch and its session maximum, and like the `finish`
+//! nine they are offered EVERY presented frame.
+//!
+//! # What the 2026-09-10 ruling cost, in this file's own units
+//!
+//! **Seventy-one is unchanged on an interact frame and is what an IDLE frame
+//! now costs too.** Before the ruling every family but `finish` recorded
+//! inside `finalize`'s `if interacted` arm, so an idle frame paid **twelve**
+//! bin searches and not seventy-one: `service`, `service less present`,
+//! `cadence` and the `finish` nine, and nothing else — no segment, no
+//! acquire, and none of the other fifty-two. The user's answer ("should the
+//! 4 ms bar cover every presented frame?" — "Absolutely they should.") made
+//! the missing **fifty-nine** an every-frame cost.
+//!
+//! So the ledger's per-leg recording work went from
+//! `71·i + 12·(1 − i)` bin searches a frame to a flat `71`, where `i` is the
+//! interact share of presented frames — a multiplier of
+//! `71 / (12 + 59·i)`, which is 1.00 on a leg that is all interaction and
+//! 5.9x on one that is none. **Measure `i` on the leg rather than assuming
+//! it**: it is `frame service (interact)`'s `n` over that plus
+//! `frame service (idle)`'s, both of which this instrument has always printed
+//! side by side, and it is a property of the SCENE and not of the app.
+//!
+//! Measured on the native scene-A leg of 2026-09-10 (this box, Xvfb, the
+//! `pan-zoom-2d` gesture script, 75 s from boot — INVALID for any duration
+//! by the runner's own vblank gate, which does not touch a COUNT):
+//! 849 interact frames against 978 idle, so **`i` = 849 / 1 827 = 46.5 %**
+//! and the multiplier there is **1.80x** — 39.4 bin searches a frame before,
+//! 71 after. The frame thread's own WORST CASE is unchanged, because the
+//! worst frame is the one that does the most work and that frame already
+//! paid seventy-one; what rose is the cheap frames' floor.
+//!
+//! The same leg is the check that `presented` is exact and not an
+//! approximation: `frame service (presented)` read `n=1827` against 849 and
+//! 978 beside it, and its forty-two slots were the two lines' slots added one
+//! by one (`648 = 217 + 431`, `1048 = 528 + 520`, and so on to the ceiling
+//! clamp's `3 = 2 + 1`).
+//!
+//! **Zero new clock reads**, which is why the sixty-three above did not move:
+//! every stamp these sixty-one fold was already taken on every presented
+//! frame, and only the `record` calls left the arm — [`WorstFrame`]'s cut
+//! columns had already moved the SUBTRACTIONS out for the same reason.
+//!
+//! And **no new histogram is recorded per frame**: each family is a
+//! [`squallar_device_profile::hist::Split`], and a frame writes exactly one
+//! of its two halves. The pair costs 352 bytes per cut — **11 616 bytes**
+//! over the sixty-six — and the `presented` population is their exact
+//! bin-wise union, computed at telemetry time and never recorded.
 //!
 //! **Both figures were stale before the `pre` split, and by more than the
 //! split adds.** They read twenty-six and "about thirty-seven" while the `ui`
@@ -111,7 +157,7 @@
 //!   — innocent CPU service with a limping cadence is still a limp — and it
 //!   is **never added to service**; the two share no denominator.
 
-use squallar_device_profile::hist::Hist;
+use squallar_device_profile::hist::{Hist, Split};
 use web_time::Instant;
 
 /// Whether service is assembled as one whole-frame pair minus the acquire
@@ -213,7 +259,9 @@ pub(crate) struct PrePhaseStamps {
 ///
 /// # Denominator
 ///
-/// **Exactly [`SegmentHists::pre`]'s** — presented interact frames — and that
+/// **Exactly [`SegmentHists::pre`]'s** — presented frames, split into the
+/// interact and idle halves [`squallar_device_profile::hist::Split`] keeps
+/// apart, and the equality holds in EACH half — and that
 /// equality is the whole design. The seven are contiguous cuts of the one
 /// span, so they telescope to it (`the_pre_phases_telescope_to_pre`) to
 /// within [`micros`]' truncation, which makes the residual arithmetic rather
@@ -242,36 +290,36 @@ pub(crate) struct PreHists {
     /// than given a name it could not fill) and `poll_platform_state`: the
     /// theme poll, the location step, the fix poll and the heading poll.
     /// Reaches the platform, and on a browser that is a JS crossing per ask.
-    pub(crate) platform: Hist,
+    pub(crate) platform: Split,
     /// `poll_data_channels` — the `Ingest` pump walk, where every arrival
     /// channel is drained and its payload applied. **The data path onto the
     /// frame thread**, and the cut that scales with what arrived.
-    pub(crate) ingest: Hist,
+    pub(crate) ingest: Split,
     /// `evict_unshown_scans`: the pane walk, `retain_still` and the
     /// `discard_each` that queues what it evicted. Scales with pane count and
     /// with how many volumes fell out of retention.
-    pub(crate) evict: Hist,
+    pub(crate) evict: Split,
     /// `drain_deferred_drops`: the budgeted free of what eviction and
     /// supersession queued. Bounded by `DEFERRED_DROP_BUDGET_PER_FRAME` by
     /// design, so a figure meaningfully over that budget is the budget
     /// failing on its own boundary rather than a busy frame.
-    pub(crate) drops: Hist,
+    pub(crate) drops: Split,
     /// `autosave_config(false)`: one clock read and an interval compare on
     /// almost every frame, and on the one frame per period that fires, the
     /// whole UI config serialized to JSON and handed to the KV store. Its own
     /// cut because that shape — cheap on all but one frame — is exactly the
     /// shape a percentile over `pre` cannot attribute.
-    pub(crate) autosave: Hist,
+    pub(crate) autosave: Split,
     /// The minimized query and the zero-area `inner_size` query: two window
     /// calls, and on the frames either answers yes the frame is abandoned
     /// rather than drawn. Named because they are platform calls on the frame
     /// thread, and a windowing system is free to make them expensive.
-    pub(crate) gate: Hist,
+    pub(crate) gate: Split,
     /// `ensure_rendering_state` and the renderer/window test after it:
     /// nothing on a steady-state frame, and the whole device and surface
     /// bring-up on the first. The tail of the head, named rather than folded
     /// so that a `pre` residual cannot hide in an unnamed remainder.
-    pub(crate) ensure: Hist,
+    pub(crate) ensure: Split,
 }
 
 /// Where `setup_egui_frame` crossed the seven boundaries between the eight
@@ -303,7 +351,8 @@ pub(crate) struct PumpPhaseStamps {
 ///
 /// # Denominator
 ///
-/// **Exactly [`SegmentHists::pump`]'s** — presented interact frames — and
+/// **Exactly [`SegmentHists::pump`]'s** — presented frames, and the equality
+/// holds in each of [`squallar_device_profile::hist::Split`]'s two halves — and
 /// that equality is the whole design. The eight are contiguous cuts of the
 /// one span, so they telescope to it (`the_pump_phases_telescope_to_pump`),
 /// which makes the residual arithmetic rather than inference.
@@ -329,29 +378,29 @@ pub(crate) struct PumpHists {
     /// egui's `begin_frame`, the gesture player's event batch, the theme
     /// apply, `ensure_pane_count`, `release_hidden_pane_volumes` and the
     /// context clone. Scales with pane count, not with data.
-    pub(crate) begin: Hist,
+    pub(crate) begin: Split,
     /// `restore_cached_render` — an upload, and one-shot per session. Its own
     /// cut so a boot-frame cost cannot be read as a steady-state one.
-    pub(crate) restore: Hist,
+    pub(crate) restore: Split,
     /// `promote_uploaded_rasters`: the band-complete sweep that puts a
     /// finished raster into this frame's paint list. Scales with pictures.
-    pub(crate) promote: Hist,
+    pub(crate) promote: Split,
     /// `report_raster_telemetry`: one clock read on all but one frame per
     /// telemetry period, and on that one frame up to a dozen formatted
     /// `console.log` calls. Its own cut because a browser console is not a
     /// free sink and this is the only writer inside the segment.
-    pub(crate) raster: Hist,
+    pub(crate) raster: Split,
     /// The `Apply` pump walk — every arrival channel drained and applied.
-    pub(crate) apply: Hist,
+    pub(crate) apply: Split,
     /// The `Advance` pump walk — loop playback.
-    pub(crate) advance: Hist,
+    pub(crate) advance: Split,
     /// The `Dispatch` pump walk — the refill and the four render
     /// dispatchers. **Not** `frame post (dispatch)`; see the type doc.
-    pub(crate) dispatch: Hist,
+    pub(crate) dispatch: Split,
     /// The tail: the volume-store budget enforcement, `update_loop_readiness`
     /// and `push_frame_inputs`. Named rather than folded so a `pump` residual
     /// cannot hide in an unnamed remainder.
-    pub(crate) settle: Hist,
+    pub(crate) settle: Split,
 }
 
 /// Where `handle_redraw`'s tail crossed the five boundaries between the six
@@ -461,7 +510,9 @@ pub(crate) struct FinishHists {
 ///
 /// # Denominator
 ///
-/// **Exactly [`SegmentHists::prepare`]'s** — presented interact frames — and
+/// **Exactly [`SegmentHists::prepare`]'s** — presented frames, and the
+/// equality holds in each of [`squallar_device_profile::hist::Split`]'s two
+/// halves — and
 /// that equality is the whole design. The six are contiguous cuts of the one
 /// span, so they telescope to it (`the_prepare_phases_telescope_to_prepare`),
 /// which makes the residual arithmetic rather than inference: any prepare time
@@ -538,16 +589,16 @@ pub(crate) struct PrepareHists {
     /// `Gui::ui` return to the egui pass's close: the app's own prologue —
     /// the command encoder, the mirror source rects, the floor demand, the
     /// mirror rung plan and any mirror-texture realloc.
-    pub(crate) plan: Hist,
+    pub(crate) plan: Split,
     /// `Context::end_pass` and the platform-output handoff. Was invisible to
     /// every figure before this split: the renderer's first clock read used to
     /// be taken after it.
-    pub(crate) end_pass: Hist,
+    pub(crate) end_pass: Split,
     /// `Context::tessellate` — shapes to triangles, on this thread.
-    pub(crate) tessellate: Hist,
+    pub(crate) tessellate: Split,
     /// Filing and draining this frame's texture deltas: the memcpys into
     /// staging slots and any blocking `write_texture`.
-    pub(crate) upload: Hist,
+    pub(crate) upload: Split,
     /// The pane-mirror pass, and on a frame with no mirror request the
     /// sub-microsecond cost of finding that out — **plus the
     /// `staged_geometry` walk**, which is inside this span and not the next
@@ -557,19 +608,20 @@ pub(crate) struct PrepareHists {
     /// microseconds its byte total is divided by. It is named here so a
     /// reader who finds this cut non-zero on a scene with no 3D pane looks
     /// for a per-primitive walk rather than for a mirror that is not there.
-    pub(crate) mirror: Hist,
+    pub(crate) mirror: Split,
     /// egui's `update_buffers` — which also dispatches every paint callback's
     /// `prepare`, the 3D raymarch's CPU-side encode included — plus the return
     /// to the swapchain acquire, which is a handful of instructions and is
     /// folded in here rather than given a seventh name it could not fill.
-    pub(crate) buffers: Hist,
+    pub(crate) buffers: Split,
 }
 
 /// Where the `ui` segment's time went, cut at the seams `Gui::ui` has.
 ///
 /// # Denominator
 ///
-/// **Exactly [`SegmentHists::ui`]'s** — presented interact frames — and that
+/// **Exactly [`SegmentHists::ui`]'s** — presented frames, and the equality
+/// holds in each of [`squallar_device_profile::hist::Split`]'s two halves — and that
 /// equality is the whole design. The **nine** are contiguous cuts of the one
 /// span, so they telescope to it (`the_ui_phases_telescope_to_ui`), which
 /// makes the residual arithmetic rather than inference: any `ui` time these
@@ -591,26 +643,26 @@ pub(crate) struct UiHists {
     /// `Gui::ui` entry to the polls' end: the site-table republish, the
     /// auto-poll check and the offline-download settle. Emits most of the
     /// frame's fetch actions and draws nothing.
-    pub(crate) poll: Hist,
+    pub(crate) poll: Split,
     /// `LayoutCtx::resolve`, the pane-grid reflow, the site-query expiry, the
     /// fade invariants and the root `Ui`'s construction — the frame's
     /// geometry, settled before a widget is placed.
-    pub(crate) layout: Hist,
+    pub(crate) layout: Split,
     /// `render_shell`: topbar, layer stack, drawer. **The eye click the
     /// UiSweep scene drives is read here**, and acted on in `panes`.
     /// `render_top_bar`.
-    pub(crate) topbar: Hist,
+    pub(crate) topbar: Split,
     /// `render_status_bar`.
-    pub(crate) statusbar: Hist,
+    pub(crate) statusbar: Split,
     /// `render_stack_and_inspector` — the remainder of the shell, and the
     /// owner of this segment's tail: p50 421–500 µs against a max of
     /// 8,000–9,514 µs on the measured legs, 16–20x its own median. Opened up
     /// one level further by [`StackHists`], whose seven cuts telescope to
     /// exactly this one.
-    pub(crate) stack: Hist,
+    pub(crate) stack: Split,
     /// The time dialog, between the shell and the panes. Its own cut because
     /// a dialog that is not open should not be charged to the map surfaces.
-    pub(crate) dialog: Hist,
+    pub(crate) dialog: Split,
     /// `render_panes` — every map surface, and on a toggle frame the pane
     /// that acts on the click `shell` just read.
     ///
@@ -621,17 +673,17 @@ pub(crate) struct UiHists {
     ///
     /// Opened up one level further by [`PanesHists`], whose seven named cuts
     /// and residual telescope to exactly this one.
-    pub(crate) panes: Hist,
+    pub(crate) panes: Split,
     /// The four pending appliers (pane view, section line, region, section
     /// edit) and the fade toggle: state the surfaces above deferred out of
     /// their own borrows.
-    pub(crate) apply: Hist,
+    pub(crate) apply: Split,
     /// Everything after the appliers: pills, the phone bottom bar, the
     /// timeline, the error toast, the sheet, the download area, the overlay
     /// popup, the catalog, the diagnostics panel and the deferred pane close.
     /// One cut rather than ten because it was cheap on every scene measured;
     /// the day it is not, it splits.
-    pub(crate) chrome: Hist,
+    pub(crate) chrome: Split,
 }
 
 /// Where the `ui` split's `stack` cut went, one level below [`UiHists`].
@@ -639,7 +691,8 @@ pub(crate) struct UiHists {
 /// # Denominator
 ///
 /// **Exactly [`UiHists::stack`]'s** — the frames on which that cut records,
-/// which is presented interact frames that left `ui_phases` — and that
+/// which is presented frames that left `ui_phases`, in each half
+/// separately — and that
 /// equality is the design, not a coincidence: the seven `record` calls sit in
 /// the very block the ninth `ui` cut's do, so `stack.snap.total()` and
 /// `ui.stack.total()` cannot differ
@@ -701,7 +754,8 @@ pub(crate) struct UiHists {
 /// attributing a frame to either, and in both directions: this family can no
 /// more exonerate a neighbour than convict one.
 ///
-/// **And check the leg produces the frames.** Every cut here is interact-only,
+/// **And check the leg produces the frames.** Every cut here still has an
+/// interact HALF that is empty on a leg taking no input,
 /// so a leg that takes no input records `n=0` and the seven telescope
 /// perfectly over nothing — indistinguishable, on the artifact, from a
 /// correct instrument. The rig's `wide` leg reads `frame service (interact)`
@@ -722,38 +776,39 @@ pub(crate) struct StackHists {
     /// The two selection snaps — a pane that draws no map layers, and a layer
     /// the active pane does not hold. `O(1)`: it scales with nothing, which
     /// is what makes a non-zero reading here a finding rather than a size.
-    pub(crate) snap: Hist,
+    pub(crate) snap: Split,
     /// The compact-width gate, `chrome_fade` and the two slide animations.
     /// Scales with nothing either — **but it holds the WHOLE cut on a frame
     /// that draws no panel**, because all three of the early returns are
     /// inside it. A `stack` that is large and all in `gate` is a frame that
     /// spent its time deciding not to draw.
-    pub(crate) gate: Hist,
+    pub(crate) gate: Split,
     /// `PaneState::hydrate_layer_states`. Scales with the active pane's slot
     /// count.
-    pub(crate) hydrate: Hist,
+    pub(crate) hydrate: Split,
     /// `stack_row_statuses` — one status line per row. Scales with the layer
     /// count, and with the alert-set size through
     /// `NwsAlertHandler::status_line`.
-    pub(crate) statuses: Hist,
+    pub(crate) statuses: Split,
     /// `render_stack`. Scales with layer count times widgets per row.
-    pub(crate) render: Hist,
+    pub(crate) render: Split,
     /// `render_inspector`. Scales with the selected layer's control surface,
     /// so it moves with WHAT is selected rather than with how much there is.
-    pub(crate) inspector: Hist,
+    pub(crate) inspector: Split,
     /// The pane restore, `propagate_pane_sync`, the `ShellPhased`
     /// construction and the return out of `render_shell_phased`. Scales with
     /// **pane count**, which makes it structurally weak on a one-pane scene —
     /// and it is this family's residual, closing on the parent's own right
     /// boundary so that nothing can hide behind it.
-    pub(crate) settle: Hist,
+    pub(crate) settle: Split,
 }
 
 /// Where the `ui` split's `panes` cut went, one level below [`UiHists`].
 ///
 /// # Denominator
 ///
-/// **Exactly [`UiHists::panes`]'s** — presented interact frames that left
+/// **Exactly [`UiHists::panes`]'s** — presented frames, in each half
+/// separately, that left
 /// `ui_phases` — and that equality is the design, not a coincidence: the
 /// eight `record` calls sit in the very block the seventh `ui` cut's does, so
 /// `panes.residual.total()` and `ui.panes.total()` cannot differ
@@ -852,31 +907,31 @@ pub(crate) struct StackHists {
 pub(crate) struct PanesHists {
     /// See [`squallar_egui::shell_api::PanesCuts::setup_ns`] — the prologue
     /// before the central panel opens, tile-slot decisions included.
-    pub(crate) setup: Hist,
+    pub(crate) setup: Split,
     /// See [`squallar_egui::shell_api::PanesCuts::panel_ns`] — the panel's
     /// head, before the first pane.
-    pub(crate) panel: Hist,
+    pub(crate) panel: Split,
     /// See [`squallar_egui::shell_api::PanesCuts::resolve_ns`] — per pane,
     /// everything before its render-view arm. Scales with pane count.
-    pub(crate) resolve: Hist,
+    pub(crate) resolve: Split,
     /// See [`squallar_egui::shell_api::PanesCuts::widget_ns`] — per pane, the
     /// `walkers::Map` widget's own frame around this crate's draw closure.
     /// **Zero on a pane that is not a plan view.**
-    pub(crate) widget: Hist,
+    pub(crate) widget: Split,
     /// See [`squallar_egui::shell_api::PanesCuts::content_ns`] — per pane,
     /// the draw context this crate builds and the enabled-layer walk it hands
     /// over to. The only cut here that scales with layer data.
-    pub(crate) content: Hist,
+    pub(crate) content: Split,
     /// See [`squallar_egui::shell_api::PanesCuts::tools_ns`] — per pane, the
     /// furniture around the content. Inert unless a draw tool is armed.
-    pub(crate) tools: Hist,
+    pub(crate) tools: Split,
     /// See [`squallar_egui::shell_api::PanesCuts::credit_ns`] — the
     /// epilogue: dividers, credit, viewport sync and the tile restores.
-    pub(crate) credit: Hist,
+    pub(crate) credit: Split,
     /// `panes` minus the seven above — arithmetic, not inference. See this
     /// type's "Nanoseconds in, microseconds out" note for the three things it
     /// can hold.
-    pub(crate) residual: Hist,
+    pub(crate) residual: Split,
 }
 
 /// Where the `post` segment's time went, cut at the seams `handle_redraw`'s
@@ -884,7 +939,8 @@ pub(crate) struct PanesHists {
 ///
 /// # Denominator
 ///
-/// **Exactly [`SegmentHists::post`]'s** — presented interact frames — and that
+/// **Exactly [`SegmentHists::post`]'s** — presented frames, and the equality
+/// holds in each of [`squallar_device_profile::hist::Split`]'s two halves — and that
 /// equality is the whole design. The **seven** are contiguous cuts of the one
 /// span, so they telescope to it (`the_post_phases_telescope_to_post`), which
 /// makes the residual arithmetic rather than inference: any `post` time these
@@ -910,29 +966,29 @@ pub(crate) struct PostHists {
     /// which is the fetch layer, and reaches the network. `RenderOverlay` is
     /// not among them; it is intercepted into the list `dispatch` then acts
     /// on.
-    pub(crate) handle: Hist,
+    pub(crate) handle: Split,
     /// `dispatch_overlay_renders`: the dedupe, the grouping and one
     /// `spawn_overlay_render` per surviving request — the call that offloads
     /// a whole-picture raster to the worker pool.
-    pub(crate) dispatch: Hist,
+    pub(crate) dispatch: Split,
     /// `push_back_claim`: one `back_would_dismiss` read, and on the frames
     /// where the answer moved, one platform call.
-    pub(crate) back: Hist,
+    pub(crate) back: Split,
     /// The wake condition — eight in-flight questions asked of the render
     /// state, the GUI, the chunk feeds, the deferred drops and the gesture
     /// player — and the redraw ask it makes when any of them says yes.
-    pub(crate) wake: Hist,
+    pub(crate) wake: Split,
     /// `auto_poll_delay` and the instant it schedules into `auto_poll_at`:
     /// four delay reads, a minimum and one clock read.
-    pub(crate) poll: Hist,
+    pub(crate) poll: Split,
     /// The `repaint_action` match on egui's own repaint delay, and the redraw
     /// ask its `Now` arm makes.
-    pub(crate) repaint: Hist,
+    pub(crate) repaint: Split,
     /// The frame's close: the renderer's `frame_had_interaction` read, which
     /// is what decides whether this frame is a sample at all, and the return
     /// into `finalize`. Structurally tiny, and named rather than folded into
     /// `repaint` so that a `post` residual cannot hide in an unnamed tail.
-    pub(crate) close: Hist,
+    pub(crate) close: Split,
 }
 
 /// What one `dispatch_overlay_renders` call spent, by sub-cut, accumulated in
@@ -1001,7 +1057,8 @@ impl DispatchCuts {
 ///
 /// # Denominator
 ///
-/// **Exactly [`PostHists::dispatch`]'s** — presented interact frames on which
+/// **Exactly [`PostHists::dispatch`]'s** — presented frames, in each half
+/// separately, on which
 /// the tail dispatched at all. Six named cuts plus a residual, so they
 /// telescope to `dispatch` by construction
 /// (`the_dispatch_cuts_telescope_to_dispatch`).
@@ -1032,21 +1089,21 @@ impl DispatchCuts {
 #[derive(Default)]
 pub(crate) struct DispatchHists {
     /// See [`DispatchCuts::dedupe_ns`].
-    pub(crate) dedupe: Hist,
+    pub(crate) dedupe: Split,
     /// See [`DispatchCuts::marks_ns`].
-    pub(crate) marks: Hist,
+    pub(crate) marks: Split,
     /// See [`DispatchCuts::hydrate_ns`].
-    pub(crate) hydrate: Hist,
+    pub(crate) hydrate: Split,
     /// See [`DispatchCuts::prepare_ns`].
-    pub(crate) prepare: Hist,
+    pub(crate) prepare: Split,
     /// See [`DispatchCuts::hitmap_ns`].
-    pub(crate) hitmap: Hist,
+    pub(crate) hitmap: Split,
     /// See [`DispatchCuts::offload_ns`].
-    pub(crate) offload: Hist,
+    pub(crate) offload: Split,
     /// `dispatch` minus the six above — arithmetic, not inference. Any
     /// dispatch time the six do not name is a gap in this decomposition, and
     /// this is where it shows.
-    pub(crate) residual: Hist,
+    pub(crate) residual: Split,
 }
 
 /// The per-segment histograms of interact frames, and only interact frames:
@@ -1058,26 +1115,26 @@ pub(crate) struct SegmentHists {
     /// eviction, deferred drops and the autosave check. Opened up by
     /// [`PreHists`], whose seven cuts telescope to this within [`micros`]'
     /// truncation.
-    pub(crate) pre: Hist,
+    pub(crate) pre: Split,
     /// `setup_egui_frame` entry to `Gui::ui` — theme, restore, the raster
     /// promote and the three pump phases.
-    pub(crate) pump: Hist,
+    pub(crate) pump: Split,
     /// The `Gui::ui` call itself: layout and the paint list. Opened up by
     /// [`UiHists`], whose nine cuts telescope to this within [`micros`]'
     /// truncation.
-    pub(crate) ui: Hist,
+    pub(crate) ui: Split,
     /// `Gui::ui` return to the acquire: mirror planning, tessellation, the
     /// texture-delta uploads and egui's buffer staging. Opened up by
     /// [`PrepareHists`], whose six cuts telescope to this within [`micros`]'
     /// truncation.
-    pub(crate) prepare: Hist,
+    pub(crate) prepare: Split,
     /// Acquire return to `present_frame` return: draw, submit, present.
-    pub(crate) finish: Hist,
+    pub(crate) finish: Split,
     /// `present_frame` return to `finalize`: action processing and the
     /// repaint scheduling tail of `handle_redraw`. Opened up by
     /// [`PostHists`], whose seven cuts telescope to this within [`micros`]'
     /// truncation.
-    pub(crate) post: Hist,
+    pub(crate) post: Split,
 }
 
 /// The anatomy of the single most expensive presented frame since the last
@@ -1251,6 +1308,30 @@ pub(crate) struct WorstFrame {
     /// files, spelled as zeros here because this record is one frame's
     /// anatomy and not a distribution.
     pub(crate) dispatch_cuts: [u32; 7],
+    /// The eight `panes` cuts of THIS frame, in [`PanesHists`]' order:
+    /// `[setup, panel, resolve, widget, content, tools, credit, residual]` —
+    /// the seventh of [`WorstFrame::ui_cuts`], opened up. They telescope to
+    /// `ui_cuts[6]` by construction, the residual being the parent minus the
+    /// seven.
+    ///
+    /// **[`WorstFrame::stack_cuts`]' sibling one cut across, and here for the
+    /// same reason.** `panes` is the largest `ui` cut on every arm measured,
+    /// and until this field the `frame worst:` line could say a latched
+    /// frame's `ui_panes=` and not one thing below it. A leaf on the line is a
+    /// dead end for a search: the `ui` nine could be opened, the `stack` seven
+    /// could be opened, and the cut that usually owns the segment could not.
+    ///
+    /// **Zero new clock reads**: `render_panes` accumulates these as
+    /// nanosecond sums where its loop is, and `m.ui_phases.panes_cuts` is
+    /// already stamped on every presented frame — only `panes_cut_micros`
+    /// moved out of the arm.
+    ///
+    /// Zeroed on a frame that left no `ui_phases`, on `ui_cuts`' terms. And
+    /// these eight are a LOWER BOUND on the cut for
+    /// [`WorstFrame::stack_cuts`]' reason exactly: the latch key is `service`,
+    /// so they describe whichever frame was slowest OVERALL, and a frame whose
+    /// `panes` was large while its `service` was not is never printed.
+    pub(crate) panes_cuts: [u32; 8],
     /// Whether this frame's raw input carried interaction. Reported rather
     /// than filtered on: a scene whose worst frame is always idle is saying
     /// something, and a family column is how it says it.
@@ -1271,26 +1352,35 @@ pub(crate) struct FrameLedger {
     service_less_present_interact: Hist,
     /// `service_idle`'s frames, the same cut lighter.
     service_less_present_idle: Hist,
-    /// See [`SegmentHists`] — interact frames only.
+    /// See [`SegmentHists`] — every presented frame, as the interact/idle
+    /// pair [`squallar_device_profile::hist::Split`] keeps disjoint.
     segments: SegmentHists,
-    /// See [`PreHists`] — `segments.pre`, opened up, same frames.
+    /// See [`PreHists`] — `segments.pre`, opened up, same frames and same two
+    /// populations.
     pre: PreHists,
-    /// See [`PrepareHists`] — `segments.prepare`, opened up, same frames.
+    /// See [`PrepareHists`] — `segments.prepare`, opened up, same frames and same two
+    /// populations.
     prepare: PrepareHists,
-    /// See [`UiHists`] — `segments.ui`, opened up, same frames.
+    /// See [`UiHists`] — `segments.ui`, opened up, same frames and same two
+    /// populations.
     ui: UiHists,
-    /// See [`StackHists`] — `ui.stack`, opened up, same frames.
+    /// See [`StackHists`] — `ui.stack`, opened up, same frames and same two
+    /// populations.
     stack: StackHists,
-    /// See [`PanesHists`] — `ui.panes`, opened up, same frames.
+    /// See [`PanesHists`] — `ui.panes`, opened up, same frames and same two
+    /// populations.
     panes: PanesHists,
-    /// See [`PumpHists`] — `segments.pump`, opened up, same frames.
+    /// See [`PumpHists`] — `segments.pump`, opened up, same frames and same two
+    /// populations.
     pump: PumpHists,
-    /// See [`PostHists`] — `segments.post`, opened up, same frames.
+    /// See [`PostHists`] — `segments.post`, opened up, same frames and same two
+    /// populations.
     post: PostHists,
     /// See [`FinishHists`] — the `finish` span, opened up, over EVERY
     /// presented frame rather than the interact ones alone.
     finish: FinishHists,
-    /// See [`DispatchHists`] — `post.dispatch`, opened up, same frames.
+    /// See [`DispatchHists`] — `post.dispatch`, opened up, same frames and same two
+    /// populations.
     dispatch: DispatchHists,
     /// The dispatch accumulator the current `dispatch_overlay_renders` call is
     /// filling. Cleared and read by that call alone; a frame's value reaches
@@ -1298,9 +1388,10 @@ pub(crate) struct FrameLedger {
     /// dispatch — which runs upstream of the `post` tail — cannot leave a
     /// figure behind that `finalize` would file under `dispatch`.
     dispatch_scratch: DispatchCuts,
-    /// The acquire span itself, interact frames only. Reported beside the
-    /// segments and never inside service: it is the vsync block.
-    acquire: Hist,
+    /// The acquire span itself, **both populations** — see [`Split`].
+    /// Reported beside the segments and never inside service: it is the
+    /// vsync block, the display's time and not ours.
+    acquire: Split,
     /// Redraw-to-redraw of presented frames, both families.
     cadence: Hist,
     /// The worst presented frame since the last report — see [`WorstFrame`].
@@ -1964,207 +2055,219 @@ impl FrameLedger {
             .dispatch
             .map_or([0u32; 7], |cuts| dispatch_cut_micros(cuts, post_cuts[1]));
 
-        // EVERY split below is interact-only, and that is a limit worth
-        // stating rather than rediscovering. A frame the renderer did not call
-        // interacted -- boot among them -- contributes to `service_idle`, to
-        // the worst-frame latch and to `finish`, and to nothing else: no
-        // segment, no `prepare`, `post`, `pump` or `dispatch` cut, and no `ui`
-        // histogram. So a boot frame's anatomy is visible only on the
-        // `frame worst:` line -- which since `ui_cuts` landed carries that
-        // frame's own nine `ui` cuts, so `ui` is the one segment a search
-        // CAN open up behind such a frame; every other family is still empty.
-        // Measured instance, 2026-09-04: a 13 ms `pump` on a Mac Firefox boot
-        // frame, against a 203 us interact mean, attributable to no cut in the
-        // tree.
+        // The same, one level down from `ui_cuts[6]`: `panes` is the largest
+        // `ui` cut on every arm measured and the `frame worst:` line could
+        // name it and nothing below it. Zero new clock reads -- the eight
+        // arrive as nanosecond sums `render_panes` took where its loop is,
+        // already stamped on every presented frame; only `panes_cut_micros`
+        // left the arm. The statement may not read `interacted` -- see
+        // `the_worst_frames_panes_cuts_are_computed_outside_the_interact_arm`.
+        let panes_cuts = m.ui_phases.as_ref().map_or([0u32; 8], |phases| {
+            panes_cut_micros(phases.panes_cuts, ui_cuts[6])
+        });
+
+        // **EVERY family below records on BOTH populations**, which is the
+        // 2026-09-10 ruling ("should the 4 ms bar cover every presented
+        // frame rather than only frames carrying a pointer event?" --
+        // "Absolutely they should.") in the one place it had to land. Until
+        // it, every one of these sixty-six histograms recorded inside an
+        // `if interacted` arm, so a frame the renderer did not call
+        // interacted -- boot among them, and 60-64 % of the worst frames
+        // measured on the three Mac arms -- contributed to `service_idle`,
+        // to the worst-frame latch and to `finish`, and to nothing else. The
+        // bar was written against a population that structurally could not
+        // see two of every three worst frames.
+        //
+        // Each family is a [`Split`], so the sample lands under `interact` or
+        // under `idle` and the union is exact ([`Split::presented`]). **Zero
+        // new clock reads** -- every stamp folded here was already taken on
+        // every presented frame; only the `record` calls left the arm. The
+        // per-frame bin-search count is therefore UNCHANGED on an interact
+        // frame and rises on an idle one to equal it; see the module doc,
+        // which pins both.
+        //
+        // The two `service` families keep their own spelling because they
+        // already had this shape: `service_interact` and `service_idle` are
+        // what [`Split`] generalises, and rewriting them would move two
+        // published lines for no new figure.
         if interacted {
             self.service_interact.record(service);
             // Beside `service` and never instead of it: the same frame, one
-            // cut lighter. See `service_less_present_micros` -- and note that
-            // the bar this instrument reports against is still the line
-            // above.
+            // cut lighter. See `service_less_present_micros`.
             if let Some(cuts) = finish_cuts {
                 self.service_less_present_interact
                     .record(service_less_present_micros(service, cuts[PRESENT_CUT]));
-            }
-            let [pre, pump, ui, prepare, finish, post] = segments;
-            self.segments.pre.record(pre);
-            self.segments.pump.record(pump);
-            self.segments.ui.record(ui);
-            self.segments.prepare.record(prepare);
-            self.segments.finish.record(finish);
-            self.segments.post.record(post);
-            self.acquire.record(acquire);
-            // Inside the interact arm, and only here: these seven are cuts of
-            // the `pre` recorded above, and the left boundary is the very
-            // `start` stamp `pre` measures from. The seven values are
-            // computed above the arm because `WorstFrame::pre_cuts` needs
-            // them on idle frames too; the RECORD calls stay here, and still
-            // only on a frame that actually left `pre_phases`, so this
-            // family's denominator is `segments.pre`'s exactly. A frame with
-            // no phases must contribute no sample -- seven zeros would be
-            // seven false readings, not an absence.
-            if m.pre_phases.is_some() {
-                let [platform, ingest, evict, drops, autosave, gate, ensure] = pre_cuts;
-                self.pre.platform.record(platform);
-                self.pre.ingest.record(ingest);
-                self.pre.evict.record(evict);
-                self.pre.drops.record(drops);
-                self.pre.autosave.record(autosave);
-                self.pre.gate.record(gate);
-                self.pre.ensure.record(ensure);
-            }
-            // Inside the interact arm, and only here: these six are cuts of
-            // the `prepare` recorded two lines up, and a sample recorded on a
-            // frame that segment did not take would break the one property
-            // that makes the split arithmetic.
-            if let Some(phases) = m.prepare_phases.as_ref() {
-                let [plan, end_pass, tessellate, upload, mirror, buffers] =
-                    prepare_phase_micros(ui_end, phases, acquire_start);
-                self.prepare.plan.record(plan);
-                self.prepare.end_pass.record(end_pass);
-                self.prepare.tessellate.record(tessellate);
-                self.prepare.upload.record(upload);
-                self.prepare.mirror.record(mirror);
-                self.prepare.buffers.record(buffers);
-            }
-            // The same, for the `pump` segment recorded above — the eight
-            // cuts of `setup_egui_frame`, whose left boundary is the very
-            // `setup` stamp `pump` measures from.
-            if let Some(phases) = m.pump_phases.as_ref() {
-                let [
-                    begin,
-                    restore,
-                    promote,
-                    raster,
-                    apply,
-                    advance,
-                    dispatch,
-                    settle,
-                ] = pump_phase_micros(setup, phases, ui_start);
-                self.pump.begin.record(begin);
-                self.pump.restore.record(restore);
-                self.pump.promote.record(promote);
-                self.pump.raster.record(raster);
-                self.pump.apply.record(apply);
-                self.pump.advance.record(advance);
-                self.pump.dispatch.record(dispatch);
-                self.pump.settle.record(settle);
-            }
-            // The same, for the `ui` segment recorded above. Independent of
-            // the prepare block: a different segment, a different set of
-            // stamps, the same denominator rule.
-            //
-            // The nine values are computed above the arm because
-            // `WorstFrame::ui_cuts` needs them on idle frames too; the RECORD
-            // calls stay here, and still only on a frame that actually left
-            // `ui_phases`, so this family's denominator is exactly what it was
-            // before that move. A frame with no phases must contribute no
-            // sample -- nine zeros would be nine false readings, not an
-            // absence.
-            if m.ui_phases.is_some() {
-                let [
-                    poll,
-                    layout,
-                    topbar,
-                    statusbar,
-                    stack,
-                    dialog,
-                    panes,
-                    apply,
-                    chrome,
-                ] = ui_cuts;
-                self.ui.poll.record(poll);
-                self.ui.layout.record(layout);
-                self.ui.topbar.record(topbar);
-                self.ui.statusbar.record(statusbar);
-                self.ui.stack.record(stack);
-                self.ui.dialog.record(dialog);
-                self.ui.panes.record(panes);
-                self.ui.apply.record(apply);
-                self.ui.chrome.record(chrome);
-                // One level further down, inside the very guard the ninth cut
-                // above records under: these seven telescope to `stack`, the
-                // cut recorded four lines up, and the two families' `n` are
-                // equal BY CONSTRUCTION rather than by inspection. A frame
-                // that drew no panel still contributes a sample -- `gate`
-                // holds the whole cut on it, which is a reading and not an
-                // absence -- so this guard is `ui_phases`, never a panel
-                // test. See `StackHists` for why a narrower denominator here
-                // would break every share read off it.
-                let [snap, gate, hydrate, statuses, render, inspector, settle] = stack_cuts;
-                self.stack.snap.record(snap);
-                self.stack.gate.record(gate);
-                self.stack.hydrate.record(hydrate);
-                self.stack.statuses.record(statuses);
-                self.stack.render.record(render);
-                self.stack.inspector.record(inspector);
-                self.stack.settle.record(settle);
-                // And the seventh cut, opened up on the same terms: inside
-                // the very guard `ui.panes` records under, so the two
-                // families' `n` are equal BY CONSTRUCTION. Unlike the seven
-                // above these arrive as nanosecond sums over a pane loop, so
-                // the parent value -- `panes`, destructured five lines up --
-                // is what the residual is taken from. Zero new clock reads
-                // here: `render_panes` took them where the loop is.
-                let [
-                    panes_setup,
-                    panes_panel,
-                    panes_resolve,
-                    panes_widget,
-                    panes_content,
-                    panes_tools,
-                    panes_credit,
-                    panes_residual,
-                ] = panes_cut_micros(
-                    m.ui_phases
-                        .as_ref()
-                        .map_or_else(Default::default, |phases| phases.panes_cuts),
-                    panes,
-                );
-                self.panes.setup.record(panes_setup);
-                self.panes.panel.record(panes_panel);
-                self.panes.resolve.record(panes_resolve);
-                self.panes.widget.record(panes_widget);
-                self.panes.content.record(panes_content);
-                self.panes.tools.record(panes_tools);
-                self.panes.credit.record(panes_credit);
-                self.panes.residual.record(panes_residual);
-            }
-            // And the same for `post`, whose right-hand boundary is `now` —
-            // the very instant this function opened with, so the sixth cut
-            // closes on the same stamp the segment above did.
-            if m.post_phases.is_some() {
-                let [handle, dispatch, back, wake, poll, repaint, close] = post_cuts;
-                self.post.handle.record(handle);
-                self.post.dispatch.record(dispatch);
-                self.post.back.record(back);
-                self.post.wake.record(wake);
-                self.post.poll.record(poll);
-                self.post.repaint.record(repaint);
-                self.post.close.record(close);
-                // One level further down, and only on the frames whose tail
-                // actually dispatched: `dispatch` is the cut recorded two
-                // lines above `back`, and these seven telescope to exactly
-                // it. A frame that dispatched nothing leaves `cur.dispatch`
-                // empty and contributes no sample here — see
-                // `record_dispatch_cuts`.
-                if m.dispatch.is_some() {
-                    let [dedupe, marks, hydrate, prepare, hitmap, offload, residual] =
-                        dispatch_cuts;
-                    self.dispatch.dedupe.record(dedupe);
-                    self.dispatch.marks.record(marks);
-                    self.dispatch.hydrate.record(hydrate);
-                    self.dispatch.prepare.record(prepare);
-                    self.dispatch.hitmap.record(hitmap);
-                    self.dispatch.offload.record(offload);
-                    self.dispatch.residual.record(residual);
-                }
             }
         } else {
             self.service_idle.record(service);
             if let Some(cuts) = finish_cuts {
                 self.service_less_present_idle
                     .record(service_less_present_micros(service, cuts[PRESENT_CUT]));
+            }
+        }
+
+        let [pre, pump, ui, prepare, finish, post] = segments;
+        self.segments.pre.record(pre, interacted);
+        self.segments.pump.record(pump, interacted);
+        self.segments.ui.record(ui, interacted);
+        self.segments.prepare.record(prepare, interacted);
+        self.segments.finish.record(finish, interacted);
+        self.segments.post.record(post, interacted);
+        self.acquire.record(acquire, interacted);
+        // These seven are cuts of the `pre` recorded above, and the left
+        // boundary is the very `start` stamp `pre` measures from. The guard
+        // is `pre_phases` and not the population: a frame with no phases must
+        // contribute no sample to EITHER family -- seven zeros would be seven
+        // false readings, not an absence -- so this family's two denominators
+        // are `segments.pre`'s two exactly.
+        if m.pre_phases.is_some() {
+            let [platform, ingest, evict, drops, autosave, gate, ensure] = pre_cuts;
+            self.pre.platform.record(platform, interacted);
+            self.pre.ingest.record(ingest, interacted);
+            self.pre.evict.record(evict, interacted);
+            self.pre.drops.record(drops, interacted);
+            self.pre.autosave.record(autosave, interacted);
+            self.pre.gate.record(gate, interacted);
+            self.pre.ensure.record(ensure, interacted);
+        }
+        // The same, for the six cuts of the `prepare` recorded above: a
+        // sample recorded on a frame that segment did not take would break
+        // the one property that makes the split arithmetic.
+        if let Some(phases) = m.prepare_phases.as_ref() {
+            let [plan, end_pass, tessellate, upload, mirror, buffers] =
+                prepare_phase_micros(ui_end, phases, acquire_start);
+            self.prepare.plan.record(plan, interacted);
+            self.prepare.end_pass.record(end_pass, interacted);
+            self.prepare.tessellate.record(tessellate, interacted);
+            self.prepare.upload.record(upload, interacted);
+            self.prepare.mirror.record(mirror, interacted);
+            self.prepare.buffers.record(buffers, interacted);
+        }
+        // The same, for the `pump` segment recorded above — the eight cuts of
+        // `setup_egui_frame`, whose left boundary is the very `setup` stamp
+        // `pump` measures from.
+        if let Some(phases) = m.pump_phases.as_ref() {
+            let [
+                begin,
+                restore,
+                promote,
+                raster,
+                apply,
+                advance,
+                dispatch,
+                settle,
+            ] = pump_phase_micros(setup, phases, ui_start);
+            self.pump.begin.record(begin, interacted);
+            self.pump.restore.record(restore, interacted);
+            self.pump.promote.record(promote, interacted);
+            self.pump.raster.record(raster, interacted);
+            self.pump.apply.record(apply, interacted);
+            self.pump.advance.record(advance, interacted);
+            self.pump.dispatch.record(dispatch, interacted);
+            self.pump.settle.record(settle, interacted);
+        }
+        // The same, for the `ui` segment recorded above. Independent of the
+        // prepare block: a different segment, a different set of stamps, the
+        // same denominator rule.
+        //
+        // The nine values are computed above (they ride on
+        // `WorstFrame::ui_cuts` as well); the RECORD calls sit here, guarded
+        // on `ui_phases`, so this family's two denominators are exactly
+        // `segments.ui`'s two.
+        if m.ui_phases.is_some() {
+            let [
+                poll,
+                layout,
+                topbar,
+                statusbar,
+                stack,
+                dialog,
+                panes,
+                apply,
+                chrome,
+            ] = ui_cuts;
+            self.ui.poll.record(poll, interacted);
+            self.ui.layout.record(layout, interacted);
+            self.ui.topbar.record(topbar, interacted);
+            self.ui.statusbar.record(statusbar, interacted);
+            self.ui.stack.record(stack, interacted);
+            self.ui.dialog.record(dialog, interacted);
+            self.ui.panes.record(panes, interacted);
+            self.ui.apply.record(apply, interacted);
+            self.ui.chrome.record(chrome, interacted);
+            // One level further down, inside the very guard the fifth cut
+            // above records under: these seven telescope to `stack`, and the
+            // two families' `n` are equal BY CONSTRUCTION rather than by
+            // inspection -- in each population separately. A frame that drew
+            // no panel still contributes a sample -- `gate` holds the whole
+            // cut on it, which is a reading and not an absence -- so this
+            // guard is `ui_phases`, never a panel test. See `StackHists`.
+            let [snap, gate, hydrate, statuses, render, inspector, settle] = stack_cuts;
+            self.stack.snap.record(snap, interacted);
+            self.stack.gate.record(gate, interacted);
+            self.stack.hydrate.record(hydrate, interacted);
+            self.stack.statuses.record(statuses, interacted);
+            self.stack.render.record(render, interacted);
+            self.stack.inspector.record(inspector, interacted);
+            self.stack.settle.record(settle, interacted);
+            // And the seventh cut, opened up on the same terms: inside the
+            // very guard `ui.panes` records under, so the two families' `n`
+            // are equal BY CONSTRUCTION. Unlike the seven above these arrive
+            // as nanosecond sums over a pane loop, so the parent value --
+            // `panes`, destructured above -- is what the residual is taken
+            // from. Zero new clock reads here: `render_panes` took them where
+            // the loop is.
+            let [
+                panes_setup,
+                panes_panel,
+                panes_resolve,
+                panes_widget,
+                panes_content,
+                panes_tools,
+                panes_credit,
+                panes_residual,
+            ] = panes_cuts;
+            self.panes.setup.record(panes_setup, interacted);
+            self.panes.panel.record(panes_panel, interacted);
+            self.panes.resolve.record(panes_resolve, interacted);
+            self.panes.widget.record(panes_widget, interacted);
+            self.panes.content.record(panes_content, interacted);
+            self.panes.tools.record(panes_tools, interacted);
+            self.panes.credit.record(panes_credit, interacted);
+            self.panes.residual.record(panes_residual, interacted);
+        }
+        // And the same for `post`, whose right-hand boundary is `now` — the
+        // very instant this function opened with, so the sixth cut closes on
+        // the same stamp the segment above did.
+        //
+        // **This is the family the ruling was measured on.** `post` is the one
+        // segment whose cost is a rare event rather than a per-frame figure,
+        // and every such event observed has landed on an IDLE frame: the Mac
+        // scene A leg of 2026-09-10 latched `post=15,409 us` against the
+        // segment's own 46 us normal, and `PostHists` had no sample of it.
+        if m.post_phases.is_some() {
+            let [handle, dispatch, back, wake, poll, repaint, close] = post_cuts;
+            self.post.handle.record(handle, interacted);
+            self.post.dispatch.record(dispatch, interacted);
+            self.post.back.record(back, interacted);
+            self.post.wake.record(wake, interacted);
+            self.post.poll.record(poll, interacted);
+            self.post.repaint.record(repaint, interacted);
+            self.post.close.record(close, interacted);
+            // One level further down, and only on the frames whose tail
+            // actually dispatched: `dispatch` is the cut recorded two lines
+            // above `back`, and these seven telescope to exactly it. A frame
+            // that dispatched nothing leaves `cur.dispatch` empty and
+            // contributes no sample here — see `record_dispatch_cuts`.
+            if m.dispatch.is_some() {
+                let [dedupe, marks, hydrate, prepare, hitmap, offload, residual] = dispatch_cuts;
+                self.dispatch.dedupe.record(dedupe, interacted);
+                self.dispatch.marks.record(marks, interacted);
+                self.dispatch.hydrate.record(hydrate, interacted);
+                self.dispatch.prepare.record(prepare, interacted);
+                self.dispatch.hitmap.record(hitmap, interacted);
+                self.dispatch.offload.record(offload, interacted);
+                self.dispatch.residual.record(residual, interacted);
             }
         }
 
@@ -2202,6 +2305,7 @@ impl FrameLedger {
                 pre_cuts,
                 post_cuts,
                 dispatch_cuts,
+                panes_cuts,
                 interact: interacted,
             },
         ));
@@ -2214,6 +2318,7 @@ impl FrameLedger {
                 pre_cuts,
                 post_cuts,
                 dispatch_cuts,
+                panes_cuts,
                 interact: interacted,
             });
         }
@@ -2293,7 +2398,9 @@ impl FrameLedger {
         &self.finish
     }
 
-    pub(crate) fn acquire(&self) -> &Hist {
+    /// See [`Split`] — the vsync block, both populations. Never inside
+    /// service on either.
+    pub(crate) fn acquire(&self) -> &Split {
         &self.acquire
     }
 
@@ -2980,7 +3087,7 @@ mod tests {
         // about the frame SET, so the object has to be the trajectory -- the
         // pair after each frame -- and not the pair at the end.
         let agree = |ledger: &super::FrameLedger, after: &str| {
-            let parent = ledger.ui.stack.total();
+            let parent = ledger.ui.stack.totals();
             for (name, family) in [
                 ("snap", &ledger.stack.snap),
                 ("gate", &ledger.stack.gate),
@@ -2991,15 +3098,16 @@ mod tests {
                 ("settle", &ledger.stack.settle),
             ] {
                 assert_eq!(
-                    family.total(),
+                    family.totals(),
                     parent,
-                    "after {after}: `frame stack ({name})` stands at {} \
-                     samples against its parent `frame ui (stack)`'s {}. \
+                    "after {after}: `frame stack ({name})` stands at {:?} \
+                     (interact, idle) samples against its parent \
+                     `frame ui (stack)`'s {:?}. \
                      Every share this family supports is its own sum over \
                      that one, so a step where the two disagree is a share \
                      computed between two different frame sets -- even if \
                      they end level",
-                    family.total(),
+                    family.totals(),
                     parent,
                 );
             }
@@ -3007,7 +3115,15 @@ mod tests {
         };
         agree(&ledger, "no frames at all");
 
-        for (nth, closed) in [false, true].into_iter().enumerate() {
+        // **Both populations, alternating.** Since the 2026-09-10 ruling every
+        // family here records on idle frames too, and a fixture that drove
+        // only `finalize(true)` would hold the denominator claim over the
+        // interact half alone -- exactly the half that was never in doubt.
+        // `agree` compares the `(interact, idle)` PAIR, so a family that
+        // filed an idle frame under the wrong population fails here even
+        // though the two totals still match.
+        let mut expect = (0u64, 0u64);
+        for (closed, interacted) in [(false, true), (true, true), (false, false), (true, false)] {
             // **Every stamp off the real clock, in the order a frame takes
             // them.** `StackStamps::skipped_after` reads the clock itself, so
             // a synthetic timeline could not carry the closed arm without the
@@ -3047,7 +3163,7 @@ mod tests {
                 stack,
                 panes_cuts: squallar_egui::shell_api::PanesCuts::default(),
             });
-            ledger.finalize(true);
+            ledger.finalize(interacted);
             let parent = agree(
                 &ledger,
                 if closed {
@@ -3056,12 +3172,17 @@ mod tests {
                     "a frame that reached the panel"
                 },
             );
+            if interacted {
+                expect.0 += 1;
+            } else {
+                expect.1 += 1;
+            }
             assert_eq!(
-                parent,
-                nth as u64 + 1,
+                parent, expect,
                 "the parent cut did not take a sample from a frame that left \
-                 ui_phases, so the equality above is holding two families \
-                 level at a standstill rather than through a frame",
+                 ui_phases under the population the frame belongs to, so the \
+                 equality above is holding two families level at a \
+                 standstill rather than through a frame",
             );
         }
 
@@ -3088,9 +3209,10 @@ mod tests {
         // so every interact-only family on it telescopes perfectly over an
         // empty sample and looks correct while measuring nothing.
         assert_eq!(
-            parent, 2,
-            "the parent cut does not hold the two samples this test drove \
-             through it, so the per-step equality above proved nothing",
+            parent,
+            (2, 2),
+            "the parent cut does not hold the four samples this test drove \
+             through it -- two interact, two idle -- so the per-step equality above proved nothing",
         );
     }
 
@@ -3116,7 +3238,7 @@ mod tests {
         let mut ledger = super::FrameLedger::default();
 
         let agree = |ledger: &super::FrameLedger, after: &str| {
-            let parent = ledger.ui.panes.total();
+            let parent = ledger.ui.panes.totals();
             for (name, family) in [
                 ("setup", &ledger.panes.setup),
                 ("panel", &ledger.panes.panel),
@@ -3128,15 +3250,16 @@ mod tests {
                 ("residual", &ledger.panes.residual),
             ] {
                 assert_eq!(
-                    family.total(),
+                    family.totals(),
                     parent,
-                    "after {after}: `frame panes ({name})` stands at {} \
-                     samples against its parent `frame ui (panes)`'s {}. \
+                    "after {after}: `frame panes ({name})` stands at {:?} \
+                     (interact, idle) samples against its parent \
+                     `frame ui (panes)`'s {:?}. \
                      Every share this family supports is its own sum over \
                      that one, so a step where the two disagree is a share \
                      computed between two different frame sets -- even if \
                      they end level",
-                    family.total(),
+                    family.totals(),
                     parent,
                 );
             }
@@ -3148,7 +3271,15 @@ mod tests {
         // the step a family guarded on "did this frame charge anything"
         // would fail, and it is the common frame: a pane loop can run
         // entirely inside the clock's grain on a cheap scene.
-        for (nth, charged) in [true, false].into_iter().enumerate() {
+        // **Both populations, alternating.** Since the 2026-09-10 ruling every
+        // family here records on idle frames too, and a fixture that drove
+        // only `finalize(true)` would hold the denominator claim over the
+        // interact half alone -- exactly the half that was never in doubt.
+        // `agree` compares the `(interact, idle)` PAIR, so a family that
+        // filed an idle frame under the wrong population fails here even
+        // though the two totals still match.
+        let mut expect = (0u64, 0u64);
+        for (charged, interacted) in [(true, true), (false, true), (true, false), (false, false)] {
             let start = Instant::now();
             let statusbar = Instant::now();
             let shell = Instant::now();
@@ -3175,7 +3306,7 @@ mod tests {
                     squallar_egui::shell_api::PanesCuts::default()
                 },
             });
-            ledger.finalize(true);
+            ledger.finalize(interacted);
             let parent = agree(
                 &ledger,
                 if charged {
@@ -3184,12 +3315,17 @@ mod tests {
                     "a frame whose pane loop charged nothing"
                 },
             );
+            if interacted {
+                expect.0 += 1;
+            } else {
+                expect.1 += 1;
+            }
             assert_eq!(
-                parent,
-                nth as u64 + 1,
+                parent, expect,
                 "the parent cut did not take a sample from a frame that left \
-                 ui_phases, so the equality above is holding two families \
-                 level at a standstill rather than through a frame",
+                 ui_phases under the population the frame belongs to, so the \
+                 equality above is holding two families level at a \
+                 standstill rather than through a frame",
             );
         }
 
@@ -3208,9 +3344,10 @@ mod tests {
         let parent = agree(&ledger, "a frame that left no ui_phases");
 
         assert_eq!(
-            parent, 2,
-            "the parent cut does not hold the two samples this test drove \
-             through it, so the per-step equality above proved nothing",
+            parent,
+            (2, 2),
+            "the parent cut does not hold the four samples this test drove \
+             through it -- two interact, two idle -- so the per-step equality above proved nothing",
         );
     }
 
@@ -3244,6 +3381,7 @@ mod tests {
             pre_cuts: [3, 21, 9, 14, 2, 7, 8],
             post_cuts: [0u32; 7],
             dispatch_cuts: [0u32; 7],
+            panes_cuts: [0; 8],
             interact: true,
         };
         assert_eq!(
@@ -4381,6 +4519,7 @@ mod tests {
             pre_cuts,
             post_cuts: [0u32; 7],
             dispatch_cuts: [0u32; 7],
+            panes_cuts: [0; 8],
             interact,
         }
     }
@@ -4589,6 +4728,7 @@ mod tests {
             pre_cuts: [100, 300, 200, 250, 50, 50, 50],
             post_cuts: [0u32; 7],
             dispatch_cuts: [0u32; 7],
+            panes_cuts: [0; 8],
             interact: false,
         };
         assert_eq!(
@@ -4757,6 +4897,7 @@ mod tests {
             pre_cuts: pre_phase_micros(start, &phases, setup),
             post_cuts: [0u32; 7],
             dispatch_cuts: [0u32; 7],
+            panes_cuts: [0; 8],
             interact: false,
         };
         assert_eq!(
@@ -5001,6 +5142,47 @@ mod tests {
             !statement.contains("interacted"),
             "the ui cuts binding reads the interact flag, so an idle frame \
              would carry nine zeros however early the binding sits: \
+             {statement:?}",
+        );
+    }
+
+    /// **The eight `panes` cuts are computed for EVERY presented frame.**
+    /// [`the_worst_frames_ui_cuts_are_computed_outside_the_interact_arm`]'s
+    /// twin, one level below `ui_cuts[6]`.
+    ///
+    /// The degenerate is the same one and is the natural shape here too:
+    /// leaving `panes_cut_micros` where its eight `record` calls are, which
+    /// compiles, telescopes on the frames it fills, and reports eight zeros
+    /// on exactly the frames the columns were added to open -- the latched
+    /// one is as often idle as not, and `ui_panes` is the largest `ui` cut on
+    /// every arm measured.
+    #[test]
+    fn the_worst_frames_panes_cuts_are_computed_outside_the_interact_arm() {
+        let body = include_str!("frame_ledger.rs")
+            .split_once("pub(crate) fn finalize(")
+            .expect("finalize is no longer a method here")
+            .1;
+        let bound = body
+            .find("let panes_cuts = ")
+            .expect("finalize no longer binds the worst frame's eight panes cuts");
+        let interact_arm = body
+            .find("if interacted {")
+            .expect("finalize no longer splits on the interact flag");
+        assert!(
+            bound < interact_arm,
+            "the eight panes cuts are computed inside finalize's interact \
+             arm, so the frame `frame worst:` reports -- as often an idle one \
+             as not -- would carry eight zeros under the largest `ui` cut \
+             there is",
+        );
+        let statement = body[bound..]
+            .split_once("\n\n")
+            .expect("the panes_cuts binding is no longer a statement of its own")
+            .0;
+        assert!(
+            !statement.contains("interacted"),
+            "the panes cuts binding reads the interact flag, so an idle frame \
+             would carry eight zeros however early the binding sits: \
              {statement:?}",
         );
     }
@@ -5258,5 +5440,210 @@ mod tests {
             DispatchCuts::default(),
             "a second take saw the first take's figure again",
         );
+    }
+
+    /// **Every family in this file takes a sample from an IDLE frame** — the
+    /// 2026-09-10 ruling, enumerated cut by cut.
+    ///
+    /// # Why the enumeration and not a spot check
+    ///
+    /// The defect this gate exists against is *a family recording inside
+    /// `finalize`'s `if interacted` arm*, and it arrives one family at a time:
+    /// every split in this file was written that way, each one correct-looking
+    /// on its own, and the arm was where a new family naturally landed. A spot
+    /// check on one cut per family would pass a tree in which a NEW cut was
+    /// added inside an arm — so the list is the point, and it is spelled in
+    /// full so that adding a sixty-seventh histogram without a line here is a
+    /// compile error rather than a silent blind spot.
+    ///
+    /// # The fixture drives ONE idle frame with every phase present
+    ///
+    /// Every family's guard is its own phase stamp, never the population, so
+    /// a frame that left all of them must produce a sample in all of them.
+    /// The pair is asserted, not the total: `(0, 1)` says the sample was filed
+    /// as IDLE, where `1` alone would also be satisfied by a family that filed
+    /// an idle frame under `interact` and would report the bar over a
+    /// population that does not exist.
+    #[test]
+    fn every_family_takes_a_sample_from_an_idle_frame() {
+        let mut ledger = super::FrameLedger::default();
+        let t = Instant::now();
+        let at = |us: u64| t + std::time::Duration::from_micros(us);
+        ledger.cur.start = Some(t);
+        ledger.cur.pre_phases = Some(PrePhaseStamps {
+            polled: at(1),
+            ingested: at(2),
+            evicted: at(3),
+            dropped: at(4),
+            saved: at(5),
+            gated: at(6),
+        });
+        ledger.cur.setup = Some(at(7));
+        ledger.cur.pump_phases = Some(PumpPhaseStamps {
+            began: at(8),
+            restored: at(9),
+            promoted: at(10),
+            rastered: at(11),
+            applied: at(12),
+            advanced: at(13),
+            dispatched: at(14),
+        });
+        ledger.cur.ui_start = Some(at(15));
+        ledger.cur.ui_phases = Some(squallar_egui::shell_api::UiPhaseStamps {
+            polled: at(16),
+            laid_out: at(17),
+            topbar: at(18),
+            statusbar: at(19),
+            stack: squallar_egui::shell_api::StackStamps {
+                snapped: at(20),
+                gated: at(21),
+                hydrated: at(22),
+                statused: at(23),
+                rendered: at(24),
+                inspected: at(25),
+            },
+            shell: at(26),
+            dialog: at(27),
+            panes: at(28),
+            applied: at(29),
+            panes_cuts: squallar_egui::shell_api::PanesCuts {
+                setup_ns: 1_000,
+                panel_ns: 1_000,
+                resolve_ns: 1_000,
+                widget_ns: 1_000,
+                content_ns: 1_000,
+                tools_ns: 1_000,
+                credit_ns: 1_000,
+            },
+        });
+        ledger.cur.ui_end = Some(at(30));
+        ledger.cur.prepare_phases =
+            Some(squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps {
+                entry: at(31),
+                tessellate: at(32),
+                upload: at(33),
+                upload_done: at(34),
+                buffers: at(35),
+            });
+        ledger.cur.acquire = Some((at(36), at(37)));
+        ledger.cur.finish_phases = Some(FinishPhaseStamps {
+            filed: at(38),
+            viewed: at(39),
+            drawn: at(40),
+            resolved: at(41),
+            submitted: at(42),
+            collected: at(43),
+            freed: at(44),
+        });
+        ledger.cur.present_return = Some(at(45));
+        ledger.cur.post_phases = Some(PostPhaseStamps {
+            handled: at(46),
+            actions: at(47),
+            back: at(48),
+            wake: at(49),
+            poll: at(50),
+            repaint: at(51),
+        });
+        ledger.cur.dispatch = Some(DispatchCuts {
+            dedupe_ns: 1_000,
+            marks_ns: 1_000,
+            hydrate_ns: 1_000,
+            prepare_ns: 1_000,
+            hitmap_ns: 1_000,
+            offload_ns: 1_000,
+        });
+
+        // **The frame carries no pointer event.** Before the ruling this
+        // single call left sixty-six of the histograms below untouched.
+        ledger.finalize(false);
+
+        let families: [(&str, &squallar_device_profile::hist::Split); 66] = [
+            ("segment:pre", &ledger.segments.pre),
+            ("segment:pump", &ledger.segments.pump),
+            ("segment:ui", &ledger.segments.ui),
+            ("segment:prepare", &ledger.segments.prepare),
+            ("segment:finish", &ledger.segments.finish),
+            ("segment:post", &ledger.segments.post),
+            ("acquire", &ledger.acquire),
+            ("pre:platform", &ledger.pre.platform),
+            ("pre:ingest", &ledger.pre.ingest),
+            ("pre:evict", &ledger.pre.evict),
+            ("pre:drops", &ledger.pre.drops),
+            ("pre:autosave", &ledger.pre.autosave),
+            ("pre:gate", &ledger.pre.gate),
+            ("pre:ensure", &ledger.pre.ensure),
+            ("pump:begin", &ledger.pump.begin),
+            ("pump:restore", &ledger.pump.restore),
+            ("pump:promote", &ledger.pump.promote),
+            ("pump:raster", &ledger.pump.raster),
+            ("pump:apply", &ledger.pump.apply),
+            ("pump:advance", &ledger.pump.advance),
+            ("pump:dispatch", &ledger.pump.dispatch),
+            ("pump:settle", &ledger.pump.settle),
+            ("prepare:plan", &ledger.prepare.plan),
+            ("prepare:end_pass", &ledger.prepare.end_pass),
+            ("prepare:tessellate", &ledger.prepare.tessellate),
+            ("prepare:upload", &ledger.prepare.upload),
+            ("prepare:mirror", &ledger.prepare.mirror),
+            ("prepare:buffers", &ledger.prepare.buffers),
+            ("ui:poll", &ledger.ui.poll),
+            ("ui:layout", &ledger.ui.layout),
+            ("ui:topbar", &ledger.ui.topbar),
+            ("ui:statusbar", &ledger.ui.statusbar),
+            ("ui:stack", &ledger.ui.stack),
+            ("ui:dialog", &ledger.ui.dialog),
+            ("ui:panes", &ledger.ui.panes),
+            ("ui:apply", &ledger.ui.apply),
+            ("ui:chrome", &ledger.ui.chrome),
+            ("stack:snap", &ledger.stack.snap),
+            ("stack:gate", &ledger.stack.gate),
+            ("stack:hydrate", &ledger.stack.hydrate),
+            ("stack:statuses", &ledger.stack.statuses),
+            ("stack:render", &ledger.stack.render),
+            ("stack:inspector", &ledger.stack.inspector),
+            ("stack:settle", &ledger.stack.settle),
+            ("panes:setup", &ledger.panes.setup),
+            ("panes:panel", &ledger.panes.panel),
+            ("panes:resolve", &ledger.panes.resolve),
+            ("panes:widget", &ledger.panes.widget),
+            ("panes:content", &ledger.panes.content),
+            ("panes:tools", &ledger.panes.tools),
+            ("panes:credit", &ledger.panes.credit),
+            ("panes:residual", &ledger.panes.residual),
+            ("post:handle", &ledger.post.handle),
+            ("post:dispatch", &ledger.post.dispatch),
+            ("post:back", &ledger.post.back),
+            ("post:wake", &ledger.post.wake),
+            ("post:poll", &ledger.post.poll),
+            ("post:repaint", &ledger.post.repaint),
+            ("post:close", &ledger.post.close),
+            ("dispatch:dedupe", &ledger.dispatch.dedupe),
+            ("dispatch:marks", &ledger.dispatch.marks),
+            ("dispatch:hydrate", &ledger.dispatch.hydrate),
+            ("dispatch:prepare", &ledger.dispatch.prepare),
+            ("dispatch:hitmap", &ledger.dispatch.hitmap),
+            ("dispatch:offload", &ledger.dispatch.offload),
+            ("dispatch:residual", &ledger.dispatch.residual),
+        ];
+        for (name, family) in families {
+            assert_eq!(
+                family.totals(),
+                (0, 1),
+                "`{name}` stands at {:?} (interact, idle) after ONE idle \
+                 frame that left every phase stamp. It records on the \
+                 interact frames only, so the 4 ms bar -- which the user \
+                 ruled on 2026-09-10 covers every presented frame -- cannot \
+                 be stated for it, and 60-64 % of the worst frames measured \
+                 on the Mac arms are invisible to it",
+                family.totals(),
+            );
+        }
+        // `finish` is the one family that was ALREADY here, and it is a plain
+        // histogram over presented frames rather than a pair: there is
+        // nothing in it to split that is not already both. Held so that a
+        // reader meets the asymmetry rather than inferring a pair.
+        assert_eq!(ledger.finish.whole.total(), 1);
+        assert_eq!(ledger.service_idle.total(), 1);
+        assert_eq!(ledger.service_interact.total(), 0);
     }
 }

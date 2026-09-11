@@ -5,7 +5,7 @@
 //! [`crate::actions`]. The re-verbed `GuiAction` lands here at E5.
 
 use squallar_device_profile::fit::{NeedTerms, PaneTerms};
-use squallar_device_profile::hist::Hist;
+use squallar_device_profile::hist::{Hist, Split};
 use squallar_device_profile::scene::CapacitySource;
 use squallar_radar::types::ScanInfo;
 use squallar_source::id::LayerId;
@@ -368,12 +368,16 @@ pub struct FrameDiagnostics<'a> {
     pub service_interact: &'a Hist,
     /// Service of presented frames whose input carried none.
     pub service_idle: &'a Hist,
-    /// Where an interact frame's service went:
-    /// `[pre, pump, ui, prepare, finish, post]`.
-    pub segments: [&'a Hist; 6],
-    /// The swapchain-acquire span of interact frames — the vsync wait,
+    /// Where a presented frame's service went:
+    /// `[pre, pump, ui, prepare, finish, post]`, each as the
+    /// interact/idle pair — see [`Split`]. Borrowed as the pair rather than
+    /// as one histogram so that composing this still costs pointer packing:
+    /// the union is [`Split::presented`] and the overlay takes it only when
+    /// it is actually snapshotting.
+    pub segments: [&'a Split; 6],
+    /// The swapchain-acquire span, both populations — the vsync wait,
     /// excluded from service and reported beside it.
-    pub acquire: &'a Hist,
+    pub acquire: &'a Split,
     /// Redraw-to-redraw interval of presented frames, both input families.
     /// Never added to service; the two share no denominator.
     pub cadence: &'a Hist,

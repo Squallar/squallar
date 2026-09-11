@@ -1195,27 +1195,32 @@ fn frame_service_less_present_lines(
 
 /// The `frame segments:` line — where an interact frame's service goes.
 ///
-/// Denominator: interact frames only (see [`frame_service_interact_line`]),
-/// p99 per segment. The acquire is reported beside them and is **not** a
+/// Denominator: **interact frames only**, named in the line's own literal —
+/// `(interact, p99 us)` — and deliberately left there when the 2026-09-10
+/// ruling widened the rest of this file. It is the one summary line whose
+/// figures a reader has been comparing across weeks, and it says which
+/// population it is about; the widened figures are on
+/// `frame segment (<name>)`, which carries both halves and from which the
+/// presented p99 is an exact bin-wise sum. p99 per segment. The acquire is reported beside them and is **not** a
 /// service segment: it is the vsync block, already excluded from service, and
 /// adding it to the six segments does not produce any figure this instrument
 /// quotes.
 fn frame_segments_line(
     s: &crate::frame_ledger::SegmentHists,
-    acquire: &squallar_device_profile::hist::Hist,
+    acquire: &squallar_device_profile::hist::Split,
 ) -> String {
     format!(
         "frame segments (interact, p99 us): pre={}, pump={}, ui={}, \
          prepare={}, finish={}, post={}; acquire n={}, p50={} us, p99={} us",
-        pctl_us(&s.pre, 0.99),
-        pctl_us(&s.pump, 0.99),
-        pctl_us(&s.ui, 0.99),
-        pctl_us(&s.prepare, 0.99),
-        pctl_us(&s.finish, 0.99),
-        pctl_us(&s.post, 0.99),
-        acquire.total(),
-        pctl_us(acquire, 0.50),
-        pctl_us(acquire, 0.99),
+        pctl_us(s.pre.interact(), 0.99),
+        pctl_us(s.pump.interact(), 0.99),
+        pctl_us(s.ui.interact(), 0.99),
+        pctl_us(s.prepare.interact(), 0.99),
+        pctl_us(s.finish.interact(), 0.99),
+        pctl_us(s.post.interact(), 0.99),
+        acquire.interact().total(),
+        pctl_us(acquire.interact(), 0.50),
+        pctl_us(acquire.interact(), 0.99),
     )
 }
 
@@ -1277,10 +1282,130 @@ fn named_hist_line(prefix: &str, name: &str, h: &squallar_device_profile::hist::
     )
 }
 
+/// One named family as **both populations on one line** — the interact half
+/// and the idle half, each with [`named_hist_line`]'s six figures.
+///
+/// # Why both halves, and why one line
+///
+/// The 2026-09-10 ruling put the 4 ms bar over **every presented frame**, and
+/// until it every family this formatter serves recorded inside
+/// `frame_ledger::FrameLedger::finalize`'s `if interacted` arm. The two halves
+/// are DISJOINT and exhaustive over presented frames, so the presented
+/// population is their exact bin-wise union
+/// (`squallar_device_profile::hist::Split::presented`) and a reader gets all
+/// three denominators off one reading:
+///
+/// * **interact** — verbatim, so every figure this campaign published before
+///   the ruling still means exactly what it meant;
+/// * **idle** — the frames that PAY for a click, boot among them, where
+///   60-64 % of the worst frames measured on the Mac arms live;
+/// * **presented** — the two hists added slot by slot, which is exact because
+///   the bins are a compile-time shape.
+///
+/// One line rather than two because the page-side console ring holds 1200
+/// entries and evicts. Doubling this file's ~80 telemetry lines a tick would
+/// have halved the history a gesture window can bracket; the rig instead
+/// splits ONE match into its two family keys (`segment:pre-interact` and
+/// `segment:pre-idle` in `drive.py`), so the ring cost is nil and every
+/// windowing consumer downstream is unchanged.
+///
+/// # The two halves are added ONLY into `presented`
+///
+/// They are never added to a parent span, never to a sibling cut, and the
+/// per-family rules the `frame_ledger` docs state hold inside each half
+/// separately: `frame pre (*)`'s interact sums telescope to
+/// `frame segment (pre)`'s interact sum, and its idle sums to that line's
+/// idle sum, and the two families are never crossed.
+///
+/// # The old sentence no longer matches, on purpose
+///
+/// `{prefix} ({name}): n=…` was interact-only and did not say so. Widening it
+/// in place would have left every published figure looking unchanged while
+/// meaning something else. This shape does not match the old regex at all, so
+/// a reader that was not updated reports an ABSENCE — which this campaign can
+/// see — rather than a number from a population it did not ask for.
+fn named_split_line(prefix: &str, name: &str, sp: &squallar_device_profile::hist::Split) -> String {
+    let half = |h: &squallar_device_profile::hist::Hist| {
+        format!(
+            "n={}, sum={} us, p50={} us, p90={} us, p99={} us, hist={}",
+            h.total(),
+            h.sum_micros(),
+            pctl_us(h, 0.50),
+            pctl_us(h, 0.90),
+            pctl_us(h, 0.99),
+            hist_counts(h),
+        )
+    };
+    format!(
+        "{prefix} ({name}): interact {}; idle {}",
+        half(sp.interact()),
+        half(sp.idle()),
+    )
+}
+
+/// The `frame service (presented):` line — **the bar's own denominator**,
+/// stated once and directly.
+///
+/// # The figure
+///
+/// `frame service (interact)` and `frame service (idle)` are disjoint and
+/// exhaustive over presented frames, so this is their exact bin-wise union.
+/// It is DERIVED, not recorded: nothing on the frame thread pays for it, and
+/// it cannot drift from the two lines above it because it is made of them.
+///
+/// **Never add this line to either of those two.** It already contains both.
+///
+/// # `under_4000_us`, and why it is the one bar figure that is not an estimate
+///
+/// Every percentile this instrument prints is a bin EDGE and a lower bound —
+/// `Hist` is four bins per octave and carries no maximum. A COUNT either side
+/// of a bin boundary is exact, and 4 000 µs is exactly bin edge 24
+/// (`62 500 × 2^6` ns), so the number of presented frames that came in under
+/// the bar is a sum of whole slots and not an estimate. `under_4000_us / n` is
+/// therefore the campaign's sharpest statement of the bar.
+///
+/// Read the word: **strictly under**. A frame of exactly 4 000 µs opens the
+/// next bin and is not in it. With whole-microsecond samples that makes this
+/// "at or under 3 999 µs", which is the honest spelling of "under 4 ms" and
+/// not of "at or under 4 ms".
+///
+/// `unaligned` is unreachable here (4 000 is an edge, and
+/// `the_presented_service_line_reads_exactly_as_pinned` holds it); it is
+/// printed rather than panicked because a telemetry line must never be able
+/// to take the app down.
+fn frame_service_presented_line(
+    interact: &squallar_device_profile::hist::Hist,
+    idle: &squallar_device_profile::hist::Hist,
+) -> String {
+    let h = interact.plus(idle);
+    format!(
+        "frame service (presented): n={}, under_4000_us={}, p50={} us, p90={} us, \
+         p99={} us, hist={}",
+        h.total(),
+        h.count_strictly_under(BAR_MICROS)
+            .map_or_else(|| "unaligned".to_owned(), |c| c.to_string()),
+        pctl_us(&h, 0.50),
+        pctl_us(&h, 0.90),
+        pctl_us(&h, 0.99),
+        hist_counts(&h),
+    )
+}
+
+/// The responsiveness bar in microseconds. **Exactly bin edge 24** of
+/// `squallar_device_profile::hist`'s geometry (`62 500 × 2^(24/4)` ns), which
+/// is what makes the share under it exact rather than binned — see
+/// [`frame_service_presented_line`]. Moving this number to one that is not an
+/// edge silently turns that figure into an estimate, and
+/// `Hist::count_strictly_under` answers `None` rather than let it.
+const BAR_MICROS: u32 = 4_000;
+
 /// The six `frame segment (<name>):` lines — the windowable spelling of
 /// [`frame_segments_line`].
 ///
-/// Denominator: interact frames only, the same as `frame segments`, and the
+/// Denominator: **both populations**, on `named_split_line`'s terms — each
+/// line carries its interact half and its idle half, and the presented
+/// population is their exact bin-wise union. `frame segments` beside it stays
+/// interact-only and says so in its own literal. The
 /// six are **contiguous cuts of one frame's service**, so their sum telescopes
 /// to it, to within [`named_hist_line`]'s truncation. The acquire is not among them and is not a service segment; it stays
 /// on the `frame segments` line where it already is.
@@ -1291,12 +1416,12 @@ fn named_hist_line(prefix: &str, name: &str, h: &squallar_device_profile::hist::
 /// readable as a figure rather than as an absence.
 fn frame_segment_lines(s: &crate::frame_ledger::SegmentHists) -> [String; 6] {
     [
-        named_hist_line("frame segment", "pre", &s.pre),
-        named_hist_line("frame segment", "pump", &s.pump),
-        named_hist_line("frame segment", "ui", &s.ui),
-        named_hist_line("frame segment", "prepare", &s.prepare),
-        named_hist_line("frame segment", "finish", &s.finish),
-        named_hist_line("frame segment", "post", &s.post),
+        named_split_line("frame segment", "pre", &s.pre),
+        named_split_line("frame segment", "pump", &s.pump),
+        named_split_line("frame segment", "ui", &s.ui),
+        named_split_line("frame segment", "prepare", &s.prepare),
+        named_split_line("frame segment", "finish", &s.finish),
+        named_split_line("frame segment", "post", &s.post),
     ]
 }
 
@@ -1325,13 +1450,13 @@ fn frame_segment_lines(s: &crate::frame_ledger::SegmentHists) -> [String; 6] {
 /// an absence.
 fn frame_pre_lines(p: &crate::frame_ledger::PreHists) -> [String; 7] {
     [
-        named_hist_line("frame pre", "platform", &p.platform),
-        named_hist_line("frame pre", "ingest", &p.ingest),
-        named_hist_line("frame pre", "evict", &p.evict),
-        named_hist_line("frame pre", "drops", &p.drops),
-        named_hist_line("frame pre", "autosave", &p.autosave),
-        named_hist_line("frame pre", "gate", &p.gate),
-        named_hist_line("frame pre", "ensure", &p.ensure),
+        named_split_line("frame pre", "platform", &p.platform),
+        named_split_line("frame pre", "ingest", &p.ingest),
+        named_split_line("frame pre", "evict", &p.evict),
+        named_split_line("frame pre", "drops", &p.drops),
+        named_split_line("frame pre", "autosave", &p.autosave),
+        named_split_line("frame pre", "gate", &p.gate),
+        named_split_line("frame pre", "ensure", &p.ensure),
     ]
 }
 
@@ -1355,12 +1480,12 @@ fn frame_pre_lines(p: &crate::frame_ledger::PreHists) -> [String; 7] {
 /// 2D-only install is a figure, not an absence.
 fn frame_prepare_lines(p: &crate::frame_ledger::PrepareHists) -> [String; 6] {
     [
-        named_hist_line("frame prepare", "plan", &p.plan),
-        named_hist_line("frame prepare", "end-pass", &p.end_pass),
-        named_hist_line("frame prepare", "tessellate", &p.tessellate),
-        named_hist_line("frame prepare", "upload", &p.upload),
-        named_hist_line("frame prepare", "mirror", &p.mirror),
-        named_hist_line("frame prepare", "buffers", &p.buffers),
+        named_split_line("frame prepare", "plan", &p.plan),
+        named_split_line("frame prepare", "end-pass", &p.end_pass),
+        named_split_line("frame prepare", "tessellate", &p.tessellate),
+        named_split_line("frame prepare", "upload", &p.upload),
+        named_split_line("frame prepare", "mirror", &p.mirror),
+        named_split_line("frame prepare", "buffers", &p.buffers),
     ]
 }
 
@@ -1383,15 +1508,15 @@ fn frame_prepare_lines(p: &crate::frame_ledger::PrepareHists) -> [String; 6] {
 /// a desktop layout with no phone bar is a figure, not an absence.
 fn frame_ui_lines(u: &crate::frame_ledger::UiHists) -> [String; 9] {
     [
-        named_hist_line("frame ui", "poll", &u.poll),
-        named_hist_line("frame ui", "layout", &u.layout),
-        named_hist_line("frame ui", "topbar", &u.topbar),
-        named_hist_line("frame ui", "statusbar", &u.statusbar),
-        named_hist_line("frame ui", "stack", &u.stack),
-        named_hist_line("frame ui", "dialog", &u.dialog),
-        named_hist_line("frame ui", "panes", &u.panes),
-        named_hist_line("frame ui", "apply", &u.apply),
-        named_hist_line("frame ui", "chrome", &u.chrome),
+        named_split_line("frame ui", "poll", &u.poll),
+        named_split_line("frame ui", "layout", &u.layout),
+        named_split_line("frame ui", "topbar", &u.topbar),
+        named_split_line("frame ui", "statusbar", &u.statusbar),
+        named_split_line("frame ui", "stack", &u.stack),
+        named_split_line("frame ui", "dialog", &u.dialog),
+        named_split_line("frame ui", "panes", &u.panes),
+        named_split_line("frame ui", "apply", &u.apply),
+        named_split_line("frame ui", "chrome", &u.chrome),
     ]
 }
 
@@ -1463,13 +1588,13 @@ fn frame_ui_lines(u: &crate::frame_ledger::UiHists) -> [String; 9] {
 /// Emitted every tick, `n=0` included, on [`frame_segment_lines`]' terms.
 fn frame_stack_lines(s: &crate::frame_ledger::StackHists) -> [String; 7] {
     [
-        named_hist_line("frame stack", "snap", &s.snap),
-        named_hist_line("frame stack", "gate", &s.gate),
-        named_hist_line("frame stack", "hydrate", &s.hydrate),
-        named_hist_line("frame stack", "statuses", &s.statuses),
-        named_hist_line("frame stack", "render", &s.render),
-        named_hist_line("frame stack", "inspector", &s.inspector),
-        named_hist_line("frame stack", "settle", &s.settle),
+        named_split_line("frame stack", "snap", &s.snap),
+        named_split_line("frame stack", "gate", &s.gate),
+        named_split_line("frame stack", "hydrate", &s.hydrate),
+        named_split_line("frame stack", "statuses", &s.statuses),
+        named_split_line("frame stack", "render", &s.render),
+        named_split_line("frame stack", "inspector", &s.inspector),
+        named_split_line("frame stack", "settle", &s.settle),
     ]
 }
 
@@ -1496,7 +1621,7 @@ fn frame_stack_lines(s: &crate::frame_ledger::StackHists) -> [String; 7] {
 /// never add. The share that answers "which of the seven is `panes`" is this
 /// line's `sum` over `frame ui (panes)`'s `sum`, both carried exactly.
 ///
-/// And `n` first, because every cut here is interact-only: a leg that takes
+/// And `n` first, because each half here can be empty on its own: a leg that takes
 /// no input records `n=0` and the eight telescope perfectly over nothing —
 /// indistinguishable, on the artifact, from a correct instrument. The rig's
 /// `wide` leg reads `frame service (interact)` at `n=0` for exactly that
@@ -1513,20 +1638,20 @@ fn frame_stack_lines(s: &crate::frame_ledger::StackHists) -> [String; 7] {
 /// Emitted every tick, `n=0` included, on [`frame_segment_lines`]' terms.
 fn frame_panes_lines(p: &crate::frame_ledger::PanesHists) -> [String; 8] {
     [
-        named_hist_line("frame panes", "setup", &p.setup),
-        named_hist_line("frame panes", "panel", &p.panel),
-        named_hist_line("frame panes", "resolve", &p.resolve),
-        named_hist_line("frame panes", "widget", &p.widget),
-        named_hist_line("frame panes", "content", &p.content),
-        named_hist_line("frame panes", "tools", &p.tools),
-        named_hist_line("frame panes", "credit", &p.credit),
-        named_hist_line("frame panes", "residual", &p.residual),
+        named_split_line("frame panes", "setup", &p.setup),
+        named_split_line("frame panes", "panel", &p.panel),
+        named_split_line("frame panes", "resolve", &p.resolve),
+        named_split_line("frame panes", "widget", &p.widget),
+        named_split_line("frame panes", "content", &p.content),
+        named_split_line("frame panes", "tools", &p.tools),
+        named_split_line("frame panes", "credit", &p.credit),
+        named_split_line("frame panes", "residual", &p.residual),
     ]
 }
 
 /// The eight `frame pump (<name>):` lines — the `pump` segment, opened up.
 ///
-/// Same denominator as `frame segment (pump)` — presented interact frames —
+/// Same denominator as `frame segment (pump)` — presented frames, both halves —
 /// and a DECOMPOSITION of that one span rather than a ninth segment:
 /// `frame pump (*)` is never added to `frame segment (pump)`.
 ///
@@ -1536,14 +1661,14 @@ fn frame_panes_lines(p: &crate::frame_ledger::PanesHists) -> [String; 8] {
 /// parents, never summed.
 fn frame_pump_lines(p: &crate::frame_ledger::PumpHists) -> [String; 8] {
     [
-        named_hist_line("frame pump", "begin", &p.begin),
-        named_hist_line("frame pump", "restore", &p.restore),
-        named_hist_line("frame pump", "promote", &p.promote),
-        named_hist_line("frame pump", "raster", &p.raster),
-        named_hist_line("frame pump", "apply", &p.apply),
-        named_hist_line("frame pump", "advance", &p.advance),
-        named_hist_line("frame pump", "dispatch", &p.dispatch),
-        named_hist_line("frame pump", "settle", &p.settle),
+        named_split_line("frame pump", "begin", &p.begin),
+        named_split_line("frame pump", "restore", &p.restore),
+        named_split_line("frame pump", "promote", &p.promote),
+        named_split_line("frame pump", "raster", &p.raster),
+        named_split_line("frame pump", "apply", &p.apply),
+        named_split_line("frame pump", "advance", &p.advance),
+        named_split_line("frame pump", "dispatch", &p.dispatch),
+        named_split_line("frame pump", "settle", &p.settle),
     ]
 }
 
@@ -1562,13 +1687,13 @@ fn frame_pump_lines(p: &crate::frame_ledger::PumpHists) -> [String; 8] {
 /// and the split exists to name which cut carries it.
 fn frame_post_lines(p: &crate::frame_ledger::PostHists) -> [String; 7] {
     [
-        named_hist_line("frame post", "handle", &p.handle),
-        named_hist_line("frame post", "dispatch", &p.dispatch),
-        named_hist_line("frame post", "back", &p.back),
-        named_hist_line("frame post", "wake", &p.wake),
-        named_hist_line("frame post", "poll", &p.poll),
-        named_hist_line("frame post", "repaint", &p.repaint),
-        named_hist_line("frame post", "close", &p.close),
+        named_split_line("frame post", "handle", &p.handle),
+        named_split_line("frame post", "dispatch", &p.dispatch),
+        named_split_line("frame post", "back", &p.back),
+        named_split_line("frame post", "wake", &p.wake),
+        named_split_line("frame post", "poll", &p.poll),
+        named_split_line("frame post", "repaint", &p.repaint),
+        named_split_line("frame post", "close", &p.close),
     ]
 }
 
@@ -1576,12 +1701,26 @@ fn frame_post_lines(p: &crate::frame_ledger::PostHists) -> [String; 7] {
 ///
 /// # Denominator, and it is the one thing to read before any figure here
 ///
-/// **Every presented frame, interact and idle alike** — which is NOT the
-/// denominator of `frame segment (finish)` beside it, nor of any other split
-/// family this file prints. All four of those record inside `finalize`'s
-/// `if interacted` arm; this one records outside it, on purpose, because the
-/// frames on which `finish` is a p99 contributor are idle ones. See
-/// `frame_ledger::FinishHists`.
+/// **Every presented frame, interact and idle alike.** This family recorded
+/// outside `finalize`'s `if interacted` arm from the day it landed, because
+/// the frames on which `finish` is a p99 contributor are idle ones — it was
+/// the tree's one instrument already standing where the 2026-09-10 ruling
+/// put the bar.
+///
+/// # It is the ONE named family on this file's single-histogram shape
+///
+/// Every other `frame <fam> (<cut>)` line now carries `interact …; idle …`
+/// (see [`named_split_line`]); this one carries a bare `n=`, and that bare
+/// `n=` is **presented**. The shapes differ because the populations do:
+/// there is nothing here to split that is not already both. A reader
+/// comparing an `n` from this family to an `n` from any other is comparing a
+/// presented count to a half — and the rig keys them apart
+/// (`finish:file` against `segment:pre-interact`) so the two cannot be
+/// windowed as one.
+///
+/// It is NOT the denominator of `frame segment (finish)` beside it: that
+/// line's two halves are this one's frames split in two, and adding this
+/// family to either half double-counts. See `frame_ledger::FinishHists`.
 ///
 /// So the eight named cuts are **never added to `frame segment (finish)`**
 /// and are not a decomposition of it: they decompose the same span over a
@@ -1633,13 +1772,13 @@ fn frame_finish_lines(f: &crate::frame_ledger::FinishHists) -> [String; 9] {
 /// ratio of sums for that reason.
 fn frame_dispatch_lines(d: &crate::frame_ledger::DispatchHists) -> [String; 7] {
     [
-        named_hist_line("frame dispatch", "dedupe", &d.dedupe),
-        named_hist_line("frame dispatch", "marks", &d.marks),
-        named_hist_line("frame dispatch", "hydrate", &d.hydrate),
-        named_hist_line("frame dispatch", "prepare", &d.prepare),
-        named_hist_line("frame dispatch", "hitmap", &d.hitmap),
-        named_hist_line("frame dispatch", "offload", &d.offload),
-        named_hist_line("frame dispatch", "residual", &d.residual),
+        named_split_line("frame dispatch", "dedupe", &d.dedupe),
+        named_split_line("frame dispatch", "marks", &d.marks),
+        named_split_line("frame dispatch", "hydrate", &d.hydrate),
+        named_split_line("frame dispatch", "prepare", &d.prepare),
+        named_split_line("frame dispatch", "hitmap", &d.hitmap),
+        named_split_line("frame dispatch", "offload", &d.offload),
+        named_split_line("frame dispatch", "residual", &d.residual),
     ]
 }
 
@@ -1690,7 +1829,7 @@ fn frame_worst_line(
             let [pre, pump, ui, prepare, finish, post] = b.segments;
             format!(
                 "boot: {}, pre={} us, pump={} us, ui={} us, prepare={} us, finish={} us, \
-                 post={} us, {}, {}, {}, {}, {}",
+                 post={} us, {}, {}, {}, {}, {}, {}",
                 if b.interact { "interact" } else { "idle" },
                 pre,
                 pump,
@@ -1703,6 +1842,7 @@ fn frame_worst_line(
                 pre_cut_columns(b.pre_cuts),
                 post_cut_columns(b.post_cuts),
                 dispatch_cut_columns(b.dispatch_cuts),
+                panes_cut_columns(b.panes_cuts),
             )
         }
     };
@@ -1715,7 +1855,8 @@ fn frame_worst_line(
     let [pre, pump, ui, prepare, finish, post] = w.segments;
     format!(
         "frame worst: service={} us, family={}, since_boot={} us, pre={} us, pump={} us, \
-         ui={} us, prepare={} us, finish={} us, post={} us, {}, {}, {}, {}, {}, {boot}",
+         ui={} us, prepare={} us, finish={} us, post={} us, {}, {}, {}, {}, {}, {}, \
+         {boot}",
         w.service,
         if w.interact { "interact" } else { "idle" },
         since_boot_us,
@@ -1730,6 +1871,7 @@ fn frame_worst_line(
         pre_cut_columns(w.pre_cuts),
         post_cut_columns(w.post_cuts),
         dispatch_cut_columns(w.dispatch_cuts),
+        panes_cut_columns(w.panes_cuts),
     )
 }
 
@@ -1854,6 +1996,51 @@ fn post_cut_columns(cuts: [u32; 7]) -> String {
         "post_handle={handle} us, post_dispatch={dispatch} us, post_back={back} us, \
          post_wake={wake} us, post_poll={poll} us, post_repaint={repaint} us, \
          post_close={close} us"
+    )
+}
+
+/// One frame's eight `panes` cuts as the `panes_*=<n> us` columns
+/// `frame worst:` carries, in `PanesHists`' order — the seventh of the nine
+/// `ui_*` columns beside them, opened up.
+///
+/// **`panes_` and not `ui_panes_`**, so a reader matching the parent column
+/// `ui_panes=` cannot also match its own children — `disp_` against
+/// `post_dispatch=`'s trick exactly.
+///
+/// **Never added to `frame panes (*)`, and never to `ui_panes=` beside it.**
+/// These eight ARE that column, opened up: seven named cuts plus a residual,
+/// so they telescope to it by construction rather than by truncation, the
+/// residual being the parent minus the seven.
+///
+/// # Why they are here
+///
+/// `panes` is the largest `ui` cut on every arm measured, and until these
+/// columns it was the one leaf on this line with a split behind it that the
+/// line could not reach: `ui_stack=` could be opened by `stack_*`, `post=` by
+/// `post_*`, and the cut that usually owns the segment could not be opened at
+/// all. `frame panes (*)` carries the distribution, but a distribution cannot
+/// answer "which cut was the 9 ms on THIS frame" — that is an inference across
+/// two aggregates, and this campaign has read one as a fact before.
+///
+/// **Zero new clock reads**: `render_panes` accumulates the eight as
+/// nanosecond sums where its own loop is, and `frame_ledger`'s
+/// `panes_cut_micros` was already computing them for the histograms; only the
+/// call moved above the interact arm.
+fn panes_cut_columns(cuts: [u32; 8]) -> String {
+    let [
+        setup,
+        panel,
+        resolve,
+        widget,
+        content,
+        tools,
+        credit,
+        residual,
+    ] = cuts;
+    format!(
+        "panes_setup={setup} us, panes_panel={panel} us, panes_resolve={resolve} us, \
+         panes_widget={widget} us, panes_content={content} us, panes_tools={tools} us, \
+         panes_credit={credit} us, panes_residual={residual} us"
     )
 }
 
@@ -3291,6 +3478,15 @@ impl super::App {
             &frame_service_interact_line(ledger.service_interact()),
         );
         say_telemetry(loud, &frame_service_idle_line(ledger.service_idle()));
+        // The two lines above as ONE population — every presented frame, which
+        // is the denominator the 4 ms bar has been stated over since the
+        // 2026-09-10 ruling. Derived from the pair above and never added to
+        // them; it carries the exact under-bar count. See
+        // `frame_service_presented_line`.
+        say_telemetry(
+            loud,
+            &frame_service_presented_line(ledger.service_interact(), ledger.service_idle()),
+        );
         // The two lines above with the `finish` split's eighth cut taken back
         // out — the same frames, the same two families, one cut lighter.
         // **Not the bar**: that is still `frame service (interact)`. See

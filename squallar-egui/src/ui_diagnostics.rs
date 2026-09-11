@@ -42,7 +42,8 @@ const BUDGET_STATE_ABSENT: &str = "budget state: not yet composed";
 struct Snapshot {
     service_interact: Hist,
     service_idle: Hist,
-    /// `[pre, pump, ui, prepare, finish, post]`, interact frames only.
+    /// `[pre, pump, ui, prepare, finish, post]`, over EVERY presented
+    /// frame — the union of the ledger's interact and idle populations.
     segments: [Hist; 6],
     acquire: Hist,
     cadence: Hist,
@@ -63,15 +64,20 @@ impl Snapshot {
         Self {
             service_interact: *d.service_interact,
             service_idle: *d.service_idle,
+            // **Every presented frame, not the interact ones alone** — the
+            // 2026-09-10 ruling. `presented` is the exact union of the two
+            // populations the ledger records (`Split::presented`), taken
+            // here rather than borrowed because it is 42 integer adds and
+            // this call happens once a window, never per frame.
             segments: [
-                *d.segments[0],
-                *d.segments[1],
-                *d.segments[2],
-                *d.segments[3],
-                *d.segments[4],
-                *d.segments[5],
+                d.segments[0].presented(),
+                d.segments[1].presented(),
+                d.segments[2].presented(),
+                d.segments[3].presented(),
+                d.segments[4].presented(),
+                d.segments[5].presented(),
             ],
-            acquire: *d.acquire,
+            acquire: d.acquire.presented(),
             cadence: *d.cadence,
         }
     }
@@ -202,7 +208,7 @@ impl DiagnosticsState {
             (
                 "segments",
                 format!(
-                    "seg p99 (interact): pre {} pump {} ui {} prep {} fin {} post {} ms",
+                    "seg p99 (presented): pre {} pump {} ui {} prep {} fin {} post {} ms",
                     pctl_ms(&w.segments[0], 0.99),
                     pctl_ms(&w.segments[1], 0.99),
                     pctl_ms(&w.segments[2], 0.99),
@@ -214,7 +220,7 @@ impl DiagnosticsState {
             (
                 "acquire",
                 format!(
-                    "acquire n={}  p50 {}  p99 {} ms - vsync wait, not service",
+                    "acquire n={}  p50 {}  p99 {} ms - vsync wait, not service (presented)",
                     w.acquire.total(),
                     pctl_ms(&w.acquire, 0.50),
                     pctl_ms(&w.acquire, 0.99),
@@ -302,20 +308,32 @@ impl super::Gui {
 mod tests {
     use super::*;
     use crate::shell_api::FrameDiagnostics;
+    use squallar_device_profile::hist::Split;
 
     /// Every field of a [`FrameDiagnostics`] pointed at one recorder — the
     /// panel windows each field independently, so one recorder driving all
     /// of them exercises the mechanism without ten parallel scripts.
-    fn all_fields(h: &Hist) -> FrameDiagnostics<'_> {
+    ///
+    /// The segment and acquire fields take the pair rather than the
+    /// histogram, and the pair is built with the SAME samples on its interact
+    /// half and an empty idle half — so `Split::presented`, which the panel
+    /// reads, is `h` exactly and every figure below stays the figure it was
+    /// before the populations split.
+    fn all_fields<'a>(h: &'a Hist, pair: &'a Split) -> FrameDiagnostics<'a> {
         FrameDiagnostics {
             service_interact: h,
             service_idle: h,
-            segments: [h; 6],
-            acquire: h,
+            segments: [pair; 6],
+            acquire: pair,
             cadence: h,
             gpu_passes: None,
             budget_state: None,
         }
+    }
+
+    /// `h` as the interact half of a pair whose idle half is empty.
+    fn pair_of(h: &Hist) -> Split {
+        Split::from_halves(*h, Hist::new())
     }
 
     fn row<'a>(rows: &'a [(&'static str, String)], id: &str) -> &'a str {
@@ -338,7 +356,7 @@ mod tests {
         for _ in 0..3 {
             recorder.record(1_000);
         }
-        state.observe(true, Some(&all_fields(&recorder)), t0);
+        state.observe(true, Some(&all_fields(&recorder, &pair_of(&recorder))), t0);
         assert!(
             row(&state.rows(), "window").contains("collecting"),
             "one snapshot is not a window; the panel must say it is collecting",
@@ -351,7 +369,7 @@ mod tests {
         }
         state.observe(
             true,
-            Some(&all_fields(&recorder)),
+            Some(&all_fields(&recorder, &pair_of(&recorder))),
             t0 + WINDOW_PERIOD + Duration::from_millis(50),
         );
 
@@ -395,11 +413,11 @@ mod tests {
         let mut state = DiagnosticsState::default();
         let t0 = Instant::now();
         recorder.record(1_000);
-        state.observe(true, Some(&all_fields(&recorder)), t0);
+        state.observe(true, Some(&all_fields(&recorder, &pair_of(&recorder))), t0);
         recorder.record(1_000);
         state.observe(
             true,
-            Some(&all_fields(&recorder)),
+            Some(&all_fields(&recorder, &pair_of(&recorder))),
             t0 + WINDOW_PERIOD - Duration::from_millis(200),
         );
         assert!(
@@ -416,10 +434,10 @@ mod tests {
         let mut state = DiagnosticsState::default();
         let t0 = Instant::now();
         recorder.record(1_000);
-        state.observe(true, Some(&all_fields(&recorder)), t0);
+        state.observe(true, Some(&all_fields(&recorder, &pair_of(&recorder))), t0);
         state.observe(
             true,
-            Some(&all_fields(&recorder)),
+            Some(&all_fields(&recorder, &pair_of(&recorder))),
             t0 + WINDOW_PERIOD + Duration::from_millis(50),
         );
         assert!(
@@ -440,7 +458,11 @@ mod tests {
     fn the_gpu_row_is_absence_text_until_a_probe_speaks() {
         let recorder = Hist::new();
         let mut state = DiagnosticsState::default();
-        state.observe(true, Some(&all_fields(&recorder)), Instant::now());
+        state.observe(
+            true,
+            Some(&all_fields(&recorder, &pair_of(&recorder))),
+            Instant::now(),
+        );
         assert_eq!(row(&state.rows(), "gpu"), GPU_PASSES_ABSENT);
 
         // The shape the probe's line really has, so what this test feeds
@@ -448,7 +470,8 @@ mod tests {
         let line = "gpu passes: raymarch n=6, p50=900 us, p99=1200 us; \
                     ground n=0, p50=none, p99=none; mirror n=6, p50=400 us, \
                     p99=500 us; main n=6, p50=300 us, p99=400 us; 6 frames";
-        let mut with_line = all_fields(&recorder);
+        let pair = pair_of(&recorder);
+        let mut with_line = all_fields(&recorder, &pair);
         with_line.gpu_passes = Some(line);
         state.observe(true, Some(&with_line), Instant::now());
         assert_eq!(row(&state.rows(), "gpu"), line);

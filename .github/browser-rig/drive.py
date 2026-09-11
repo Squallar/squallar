@@ -3303,8 +3303,8 @@ var prep_costs_re = /frame prep costs: (\d+) passes, (\d+) us tessellate, (\d+) 
 // once at the end: a family the watcher never ingests can only ever be read as
 // a last-period fallback, which is what silently voided every windowed
 // worst-frame reading this instrument produced.
-var frame_worst_re = /frame worst: service=(\d+) us, family=([a-z0-9-]+), since_boot=(\d+) us, pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us, stack_snap=(\d+) us, stack_gate=(\d+) us, stack_hydrate=(\d+) us, stack_statuses=(\d+) us, stack_render=(\d+) us, stack_inspector=(\d+) us, stack_settle=(\d+) us, pre_platform=(\d+) us, pre_ingest=(\d+) us, pre_evict=(\d+) us, pre_drops=(\d+) us, pre_autosave=(\d+) us, pre_gate=(\d+) us, pre_ensure=(\d+) us, post_handle=(\d+) us, post_dispatch=(\d+) us, post_back=(\d+) us, post_wake=(\d+) us, post_poll=(\d+) us, post_repaint=(\d+) us, post_close=(\d+) us, disp_dedupe=(\d+) us, disp_marks=(\d+) us, disp_hydrate=(\d+) us, disp_prepare=(\d+) us, disp_hitmap=(\d+) us, disp_offload=(\d+) us, disp_residual=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us, stack_snap=(\d+) us, stack_gate=(\d+) us, stack_hydrate=(\d+) us, stack_statuses=(\d+) us, stack_render=(\d+) us, stack_inspector=(\d+) us, stack_settle=(\d+) us, pre_platform=(\d+) us, pre_ingest=(\d+) us, pre_evict=(\d+) us, pre_drops=(\d+) us, pre_autosave=(\d+) us, pre_gate=(\d+) us, pre_ensure=(\d+) us, post_handle=(\d+) us, post_dispatch=(\d+) us, post_back=(\d+) us, post_wake=(\d+) us, post_poll=(\d+) us, post_repaint=(\d+) us, post_close=(\d+) us, disp_dedupe=(\d+) us, disp_marks=(\d+) us, disp_hydrate=(\d+) us, disp_prepare=(\d+) us, disp_hitmap=(\d+) us, disp_offload=(\d+) us, disp_residual=(\d+) us/;
-var frame_worst_none_re = /frame worst: no frame presented this period, since_boot=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us, stack_snap=(\d+) us, stack_gate=(\d+) us, stack_hydrate=(\d+) us, stack_statuses=(\d+) us, stack_render=(\d+) us, stack_inspector=(\d+) us, stack_settle=(\d+) us, pre_platform=(\d+) us, pre_ingest=(\d+) us, pre_evict=(\d+) us, pre_drops=(\d+) us, pre_autosave=(\d+) us, pre_gate=(\d+) us, pre_ensure=(\d+) us, post_handle=(\d+) us, post_dispatch=(\d+) us, post_back=(\d+) us, post_wake=(\d+) us, post_poll=(\d+) us, post_repaint=(\d+) us, post_close=(\d+) us, disp_dedupe=(\d+) us, disp_marks=(\d+) us, disp_hydrate=(\d+) us, disp_prepare=(\d+) us, disp_hitmap=(\d+) us, disp_offload=(\d+) us, disp_residual=(\d+) us/;
+var frame_worst_re = /frame worst: service=(\d+) us, family=([a-z0-9-]+), since_boot=(\d+) us, pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us, stack_snap=(\d+) us, stack_gate=(\d+) us, stack_hydrate=(\d+) us, stack_statuses=(\d+) us, stack_render=(\d+) us, stack_inspector=(\d+) us, stack_settle=(\d+) us, pre_platform=(\d+) us, pre_ingest=(\d+) us, pre_evict=(\d+) us, pre_drops=(\d+) us, pre_autosave=(\d+) us, pre_gate=(\d+) us, pre_ensure=(\d+) us, post_handle=(\d+) us, post_dispatch=(\d+) us, post_back=(\d+) us, post_wake=(\d+) us, post_poll=(\d+) us, post_repaint=(\d+) us, post_close=(\d+) us, disp_dedupe=(\d+) us, disp_marks=(\d+) us, disp_hydrate=(\d+) us, disp_prepare=(\d+) us, disp_hitmap=(\d+) us, disp_offload=(\d+) us, disp_residual=(\d+) us, panes_setup=(\d+) us, panes_panel=(\d+) us, panes_resolve=(\d+) us, panes_widget=(\d+) us, panes_content=(\d+) us, panes_tools=(\d+) us, panes_credit=(\d+) us, panes_residual=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us, stack_snap=(\d+) us, stack_gate=(\d+) us, stack_hydrate=(\d+) us, stack_statuses=(\d+) us, stack_render=(\d+) us, stack_inspector=(\d+) us, stack_settle=(\d+) us, pre_platform=(\d+) us, pre_ingest=(\d+) us, pre_evict=(\d+) us, pre_drops=(\d+) us, pre_autosave=(\d+) us, pre_gate=(\d+) us, pre_ensure=(\d+) us, post_handle=(\d+) us, post_dispatch=(\d+) us, post_back=(\d+) us, post_wake=(\d+) us, post_poll=(\d+) us, post_repaint=(\d+) us, post_close=(\d+) us, disp_dedupe=(\d+) us, disp_marks=(\d+) us, disp_hydrate=(\d+) us, disp_prepare=(\d+) us, disp_hitmap=(\d+) us, disp_offload=(\d+) us, disp_residual=(\d+) us, panes_setup=(\d+) us, panes_panel=(\d+) us, panes_resolve=(\d+) us, panes_widget=(\d+) us, panes_content=(\d+) us, panes_tools=(\d+) us, panes_credit=(\d+) us, panes_residual=(\d+) us/;
+var frame_worst_none_re = /frame worst: no frame presented this period, since_boot=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us, stack_snap=(\d+) us, stack_gate=(\d+) us, stack_hydrate=(\d+) us, stack_statuses=(\d+) us, stack_render=(\d+) us, stack_inspector=(\d+) us, stack_settle=(\d+) us, pre_platform=(\d+) us, pre_ingest=(\d+) us, pre_evict=(\d+) us, pre_drops=(\d+) us, pre_autosave=(\d+) us, pre_gate=(\d+) us, pre_ensure=(\d+) us, post_handle=(\d+) us, post_dispatch=(\d+) us, post_back=(\d+) us, post_wake=(\d+) us, post_poll=(\d+) us, post_repaint=(\d+) us, post_close=(\d+) us, disp_dedupe=(\d+) us, disp_marks=(\d+) us, disp_hydrate=(\d+) us, disp_prepare=(\d+) us, disp_hitmap=(\d+) us, disp_offload=(\d+) us, disp_residual=(\d+) us, panes_setup=(\d+) us, panes_panel=(\d+) us, panes_resolve=(\d+) us, panes_widget=(\d+) us, panes_content=(\d+) us, panes_tools=(\d+) us, panes_credit=(\d+) us, panes_residual=(\d+) us/;
 var prep_geometry_re = /frame prep geometry: (\d+) stagings, (\d+) vertices, (\d+) indices, (\d+) B staged, (\d+) through the ring, (\d+) declined/;
 var gpu_passes_re = /gpu passes: raymarch n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; ground n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; mirror n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; main n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; (\d+) frames/;
 var cadence_re = /frame cadence: n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
@@ -3424,7 +3424,7 @@ var budget_state_re = /budget state: bracket ([a-z0-9]+), rung (\d+), steps (\d+
 // `basemap tiles` (decodes: excludes restyles and failures), to `overlay
 // rasters`, to `texture uploads`, or to any frame segment. Several takes can
 // share one `frame segment (pump)` sample.
-var frame_segment_re = /frame segment \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+var frame_segment_re = /frame segment \(([a-z0-9-]+)\): interact n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+); idle n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 // `frame segment (prepare)` opened up: six contiguous cuts of that ONE span,
 // same denominator (presented interact frames), so their sums telescope to
 // its sum. A DECOMPOSITION of the prepare segment, never a seventh segment --
@@ -3432,7 +3432,7 @@ var frame_segment_re = /frame segment \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p
 // whole of it. Also never added to `frame prep costs:`, which counts every
 // pass ENDED (idle frames and non-presenting frames included) and therefore
 // holds more samples than there are frames here.
-var frame_prepare_re = /frame prepare \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+var frame_prepare_re = /frame prepare \(([a-z0-9-]+)\): interact n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+); idle n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 // `frame segment (post)` opened up, on `frame prepare`'s terms exactly: six
 // contiguous cuts of that ONE span, same denominator (presented interact
 // frames), so their sums telescope to its sum. A DECOMPOSITION, never a
@@ -3462,15 +3462,15 @@ var frame_prepare_re = /frame prepare \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p
 // p99 1,682 us, and 10,357 us on ONE latched frame, 88-92% of that whole
 // frame. Read the answer off `sum`, never off a percentile: Hist is four
 // bins per octave.
-var frame_pre_re = /frame pre \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
-var frame_ui_re = /frame ui \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
-var frame_stack_re = /frame stack \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
-var frame_post_re = /frame post \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+var frame_pre_re = /frame pre \(([a-z0-9-]+)\): interact n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+); idle n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+var frame_ui_re = /frame ui \(([a-z0-9-]+)\): interact n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+); idle n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+var frame_stack_re = /frame stack \(([a-z0-9-]+)\): interact n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+); idle n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+var frame_post_re = /frame post \(([a-z0-9-]+)\): interact n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+); idle n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 // `frame ui (panes)`, opened up -- `frame_stack_re`'s sibling one cut across.
 // Seven mandatory groups and no optional one: `native_row.py` int()s every
 // group it is handed, so a field that can be absent has to reach the row as
 // None rather than be coerced to 0.
-var frame_panes_re = /frame panes \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+var frame_panes_re = /frame panes \(([a-z0-9-]+)\): interact n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+); idle n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 // `frame finish (*)` decomposes the frame tail. **Its denominator is not
 // the others': it is recorded for EVERY presented frame, idle included,
 // outside `finalize`'s interacted arm. So its `n` is LARGER than
@@ -3495,7 +3495,7 @@ var frame_finish_re = /frame finish \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50
 // 280 us on Chromium -- a factor of 42 on the same scene, with picture bytes
 // differing by only 2.25x. Read the answer off `sum`, never off a percentile:
 // Hist is four bins per octave.
-var frame_pump_re = /frame pump \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+var frame_pump_re = /frame pump \(([a-z0-9-]+)\): interact n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+); idle n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 // `frame post (dispatch)` opened up, one level below `frame post` on exactly
 // its terms: six named cuts plus a residual, contiguous within that one span,
 // same denominator, so their sums telescope to it. NEVER added to
@@ -3514,7 +3514,7 @@ var frame_pump_re = /frame pump \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d
 // Read the answer off `sum`, never off a percentile: Hist is four bins per
 // octave, so every percentile is quantized to a bin edge and any true ratio
 // between 1.68x and 2.38x prints as exactly 2.00x, while `sum` is exact.
-var frame_dispatch_re = /frame dispatch \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+var frame_dispatch_re = /frame dispatch \(([a-z0-9-]+)\): interact n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+); idle n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var tile_take_re = /tile take \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 // One vector take opened up: `parse` (per source layer, at most sixteen) and
 // `style` (per feature, thousands). A DECOMPOSITION of `tile take (vector)`,
@@ -3524,6 +3524,41 @@ var tile_take_re = /tile take \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|
 var tile_phase_re = /tile phase \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var gesture_begin_re = /gesture script ([a-z0-9-]+) begin/;
 var gesture_loop_re = /gesture script ([a-z0-9-]+) loop complete: (\d+) frames/;
+// **One line, two family keys.** Since the 2026-09-10 ruling every `frame
+// <fam> (<cut>)` line carries BOTH populations -- `interact` and `idle` --
+// because the 4 ms bar is now stated over every presented frame and those
+// families used to record only on frames carrying a pointer event.
+//
+// They stay two keys here rather than one record with two halves so that
+// every windowing consumer downstream (`_window_stats`, `hist_diff`,
+// `_window_mean_us`, `WINDOW_FAMILY_PREFIXES`) is unchanged: a family is
+// still one name and one histogram. `segment:pre-interact` and
+// `segment:pre-idle` are DISJOINT and exhaustive over presented frames, so
+// the presented population is their exact slot-wise sum -- `hist_sum`, never
+// an average of two percentiles.
+//
+// They stay ONE console line rather than two because the page-side ring holds
+// 1200 entries and evicts; doubling ~80 telemetry lines a tick would have
+// halved the history a gesture window can bracket.
+function push_split(into, t, x) {
+  into.push({ t: t, name: x[1] + "-interact", n: parseInt(x[2], 10),
+              sum: parseInt(x[3], 10), p50: x[4], p90: x[5], p99: x[6],
+              hist: x[7] });
+  into.push({ t: t, name: x[1] + "-idle", n: parseInt(x[8], 10),
+              sum: parseInt(x[9], 10), p50: x[10], p90: x[11], p99: x[12],
+              hist: x[13] });
+}
+// `svc_interact_re` and `svc_idle_re` as ONE population -- every presented
+// frame, which is the denominator the bar is stated over. DERIVED by the app
+// from those two and never added to either.
+//
+// `under_4000_us` is the campaign's sharpest bar figure and the only one here
+// that is not an estimate: 4 000 us is exactly bin edge 24 of the histogram
+// geometry, so the count below it is a sum of whole slots. Every percentile
+// on every line in this probe is a bin EDGE and a lower bound. Read
+// `under_4000_us / n` for the share under the bar, and read the word --
+// STRICTLY under, so a 4 000 us frame is not in it.
+var svc_presented_re = /frame service \(presented\): n=(\d+), under_4000_us=(\d+|unaligned), p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var interact = null, idle = null, segments = null, prep = null, gpu = null;
 var prep_geometry = null;
 var cadence = null, gpu_unavailable = false, loop_state = null;
@@ -3538,6 +3573,7 @@ var budget_state = null, budget_state_all = [];
 // before the counters, never 0.
 var admission_re = /admission asked (\d+) admitted (\d+) would refuse (\d+) refused (\d+)/;
 var interact_all = [], idle_all = [], cadence_all = [];
+var presented = null, presented_all = [];
 var frame_need = null, frame_need_all = [];
 var frame_segment_all = [], tile_take_all = [], tile_phase_all = [];
 var frame_prepare_all = [], frame_post_all = [], frame_dispatch_all = [];
@@ -3564,6 +3600,14 @@ for (var i = 0; i < C.length; i++) {
     idle = { t: t, n: parseInt(x[1], 10), p50: x[2], p90: x[3],
              p99: x[4], hist: x[5] };
     idle_all.push(idle);
+  }
+  x = svc_presented_re.exec(m);
+  if (x) {
+    presented = { t: t, n: parseInt(x[1], 10),
+                  under_4000_us: x[2] === "unaligned" ? null
+                                 : parseInt(x[2], 10),
+                  p50: x[3], p90: x[4], p99: x[5], hist: x[6] };
+    presented_all.push(presented);
   }
   x = frame_service_less_present_re.exec(m);
   if (x) frame_service_less_present_all.push({ t: t, name: x[1],
@@ -3691,49 +3735,31 @@ for (var i = 0; i < C.length; i++) {
     budget_state_all.push(budget_state);
   }
   x = frame_segment_re.exec(m);
-  if (x) frame_segment_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
-                                  sum: parseInt(x[3], 10), p50: x[4],
-                                  p90: x[5], p99: x[6], hist: x[7] });
+  if (x) push_split(frame_segment_all, t, x);
   x = frame_prepare_re.exec(m);
-  if (x) frame_prepare_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
-                                  sum: parseInt(x[3], 10), p50: x[4],
-                                  p90: x[5], p99: x[6], hist: x[7] });
+  if (x) push_split(frame_prepare_all, t, x);
   x = frame_pre_re.exec(m);
-  if (x) frame_pre_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
-                              sum: parseInt(x[3], 10), p50: x[4],
-                              p90: x[5], p99: x[6], hist: x[7] });
+  if (x) push_split(frame_pre_all, t, x);
   x = frame_ui_re.exec(m);
-  if (x) frame_ui_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
-                             sum: parseInt(x[3], 10), p50: x[4],
-                             p90: x[5], p99: x[6], hist: x[7] });
+  if (x) push_split(frame_ui_all, t, x);
   // `frame ui (stack)`, opened up. Same denominator by construction, never
   // added to `frame ui (*)` and never to `frame segment (ui)`.
   x = frame_stack_re.exec(m);
-  if (x) frame_stack_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
-                                sum: parseInt(x[3], 10), p50: x[4],
-                                p90: x[5], p99: x[6], hist: x[7] });
+  if (x) push_split(frame_stack_all, t, x);
   // `frame ui (panes)`, opened up. Same denominator by construction, never
   // added to `frame ui (*)` and never to `frame segment (ui)`.
   x = frame_panes_re.exec(m);
-  if (x) frame_panes_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
-                                sum: parseInt(x[3], 10), p50: x[4],
-                                p90: x[5], p99: x[6], hist: x[7] });
+  if (x) push_split(frame_panes_all, t, x);
   x = frame_pump_re.exec(m);
-  if (x) frame_pump_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
-                               sum: parseInt(x[3], 10), p50: x[4],
-                               p90: x[5], p99: x[6], hist: x[7] });
+  if (x) push_split(frame_pump_all, t, x);
   x = frame_post_re.exec(m);
-  if (x) frame_post_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
-                               sum: parseInt(x[3], 10), p50: x[4],
-                               p90: x[5], p99: x[6], hist: x[7] });
+  if (x) push_split(frame_post_all, t, x);
   x = frame_finish_re.exec(m);
   if (x) frame_finish_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                                  sum: parseInt(x[3], 10), p50: x[4],
                                  p90: x[5], p99: x[6], hist: x[7] });
   x = frame_dispatch_re.exec(m);
-  if (x) frame_dispatch_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
-                                   sum: parseInt(x[3], 10), p50: x[4],
-                                   p90: x[5], p99: x[6], hist: x[7] });
+  if (x) push_split(frame_dispatch_all, t, x);
   var wm = frame_worst_re.exec(m);
   // The nine `ui_*` are THIS frame's own ui cuts, telescoping to its `ui`.
   // They are never added to, and never ratio'd against, the `frame ui (*)`
@@ -3793,50 +3819,66 @@ for (var i = 0; i < C.length; i++) {
                           disp_hitmap: parseInt(wm[44], 10),
                           disp_offload: parseInt(wm[45], 10),
                           disp_residual: parseInt(wm[46], 10),
-                          boot_family: wm[47],
-                          boot_pre: parseInt(wm[48], 10),
-                          boot_pump: parseInt(wm[49], 10),
-                          boot_ui: parseInt(wm[50], 10),
-                          boot_prepare: parseInt(wm[51], 10),
-                          boot_finish: parseInt(wm[52], 10),
-                          boot_post: parseInt(wm[53], 10),
-                          boot_ui_poll: parseInt(wm[54], 10),
-                          boot_ui_layout: parseInt(wm[55], 10),
-                          boot_ui_topbar: parseInt(wm[56], 10),
-                          boot_ui_statusbar: parseInt(wm[57], 10),
-                          boot_ui_stack: parseInt(wm[58], 10),
-                          boot_ui_dialog: parseInt(wm[59], 10),
-                          boot_ui_panes: parseInt(wm[60], 10),
-                          boot_ui_apply: parseInt(wm[61], 10),
-                          boot_ui_chrome: parseInt(wm[62], 10),
-                          boot_stack_snap: parseInt(wm[63], 10),
-                          boot_stack_gate: parseInt(wm[64], 10),
-                          boot_stack_hydrate: parseInt(wm[65], 10),
-                          boot_stack_statuses: parseInt(wm[66], 10),
-                          boot_stack_render: parseInt(wm[67], 10),
-                          boot_stack_inspector: parseInt(wm[68], 10),
-                          boot_stack_settle: parseInt(wm[69], 10),
-                          boot_pre_platform: parseInt(wm[70], 10),
-                          boot_pre_ingest: parseInt(wm[71], 10),
-                          boot_pre_evict: parseInt(wm[72], 10),
-                          boot_pre_drops: parseInt(wm[73], 10),
-                          boot_pre_autosave: parseInt(wm[74], 10),
-                          boot_pre_gate: parseInt(wm[75], 10),
-                          boot_pre_ensure: parseInt(wm[76], 10),
-                          boot_post_handle: parseInt(wm[77], 10),
-                          boot_post_dispatch: parseInt(wm[78], 10),
-                          boot_post_back: parseInt(wm[79], 10),
-                          boot_post_wake: parseInt(wm[80], 10),
-                          boot_post_poll: parseInt(wm[81], 10),
-                          boot_post_repaint: parseInt(wm[82], 10),
-                          boot_post_close: parseInt(wm[83], 10),
-                          boot_disp_dedupe: parseInt(wm[84], 10),
-                          boot_disp_marks: parseInt(wm[85], 10),
-                          boot_disp_hydrate: parseInt(wm[86], 10),
-                          boot_disp_prepare: parseInt(wm[87], 10),
-                          boot_disp_hitmap: parseInt(wm[88], 10),
-                          boot_disp_offload: parseInt(wm[89], 10),
-                          boot_disp_residual: parseInt(wm[90], 10) });
+                          panes_setup: parseInt(wm[47], 10),
+                          panes_panel: parseInt(wm[48], 10),
+                          panes_resolve: parseInt(wm[49], 10),
+                          panes_widget: parseInt(wm[50], 10),
+                          panes_content: parseInt(wm[51], 10),
+                          panes_tools: parseInt(wm[52], 10),
+                          panes_credit: parseInt(wm[53], 10),
+                          panes_residual: parseInt(wm[54], 10),
+                          boot_family: wm[55],
+                          boot_pre: parseInt(wm[56], 10),
+                          boot_pump: parseInt(wm[57], 10),
+                          boot_ui: parseInt(wm[58], 10),
+                          boot_prepare: parseInt(wm[59], 10),
+                          boot_finish: parseInt(wm[60], 10),
+                          boot_post: parseInt(wm[61], 10),
+                          boot_ui_poll: parseInt(wm[62], 10),
+                          boot_ui_layout: parseInt(wm[63], 10),
+                          boot_ui_topbar: parseInt(wm[64], 10),
+                          boot_ui_statusbar: parseInt(wm[65], 10),
+                          boot_ui_stack: parseInt(wm[66], 10),
+                          boot_ui_dialog: parseInt(wm[67], 10),
+                          boot_ui_panes: parseInt(wm[68], 10),
+                          boot_ui_apply: parseInt(wm[69], 10),
+                          boot_ui_chrome: parseInt(wm[70], 10),
+                          boot_stack_snap: parseInt(wm[71], 10),
+                          boot_stack_gate: parseInt(wm[72], 10),
+                          boot_stack_hydrate: parseInt(wm[73], 10),
+                          boot_stack_statuses: parseInt(wm[74], 10),
+                          boot_stack_render: parseInt(wm[75], 10),
+                          boot_stack_inspector: parseInt(wm[76], 10),
+                          boot_stack_settle: parseInt(wm[77], 10),
+                          boot_pre_platform: parseInt(wm[78], 10),
+                          boot_pre_ingest: parseInt(wm[79], 10),
+                          boot_pre_evict: parseInt(wm[80], 10),
+                          boot_pre_drops: parseInt(wm[81], 10),
+                          boot_pre_autosave: parseInt(wm[82], 10),
+                          boot_pre_gate: parseInt(wm[83], 10),
+                          boot_pre_ensure: parseInt(wm[84], 10),
+                          boot_post_handle: parseInt(wm[85], 10),
+                          boot_post_dispatch: parseInt(wm[86], 10),
+                          boot_post_back: parseInt(wm[87], 10),
+                          boot_post_wake: parseInt(wm[88], 10),
+                          boot_post_poll: parseInt(wm[89], 10),
+                          boot_post_repaint: parseInt(wm[90], 10),
+                          boot_post_close: parseInt(wm[91], 10),
+                          boot_disp_dedupe: parseInt(wm[92], 10),
+                          boot_disp_marks: parseInt(wm[93], 10),
+                          boot_disp_hydrate: parseInt(wm[94], 10),
+                          boot_disp_prepare: parseInt(wm[95], 10),
+                          boot_disp_hitmap: parseInt(wm[96], 10),
+                          boot_disp_offload: parseInt(wm[97], 10),
+                          boot_disp_residual: parseInt(wm[98], 10),
+                          boot_panes_setup: parseInt(wm[99], 10),
+                          boot_panes_panel: parseInt(wm[100], 10),
+                          boot_panes_resolve: parseInt(wm[101], 10),
+                          boot_panes_widget: parseInt(wm[102], 10),
+                          boot_panes_content: parseInt(wm[103], 10),
+                          boot_panes_tools: parseInt(wm[104], 10),
+                          boot_panes_credit: parseInt(wm[105], 10),
+                          boot_panes_residual: parseInt(wm[106], 10) });
   var wn = frame_worst_none_re.exec(m);
   if (wn) frame_worst_all.push({ t: C[i].t,
                                  service: null,
@@ -3885,7 +3927,15 @@ for (var i = 0; i < C.length; i++) {
                                  boot_disp_prepare: parseInt(wn[42], 10),
                                  boot_disp_hitmap: parseInt(wn[43], 10),
                                  boot_disp_offload: parseInt(wn[44], 10),
-                                 boot_disp_residual: parseInt(wn[45], 10) });
+                                 boot_disp_residual: parseInt(wn[45], 10),
+                                 boot_panes_setup: parseInt(wn[46], 10),
+                                 boot_panes_panel: parseInt(wn[47], 10),
+                                 boot_panes_resolve: parseInt(wn[48], 10),
+                                 boot_panes_widget: parseInt(wn[49], 10),
+                                 boot_panes_content: parseInt(wn[50], 10),
+                                 boot_panes_tools: parseInt(wn[51], 10),
+                                 boot_panes_credit: parseInt(wn[52], 10),
+                                 boot_panes_residual: parseInt(wn[53], 10) });
   x = tile_take_re.exec(m);
   if (x) tile_take_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                               sum: parseInt(x[3], 10), p50: x[4],
@@ -3918,7 +3968,9 @@ return { interact: interact, idle: idle, segments: segments, prep: prep,
          gpu: gpu, gpu_unavailable: gpu_unavailable, cadence: cadence,
          loop_state: loop_state, loop_state_all: loop_state_all,
          budget_state: budget_state, budget_state_all: budget_state_all,
+         presented: presented,
          interact_all: interact_all, idle_all: idle_all,
+         presented_all: presented_all,
          cadence_all: cadence_all,
          frame_need: frame_need, frame_need_all: frame_need_all,
          frame_segment_all: frame_segment_all, tile_take_all: tile_take_all,
@@ -3969,6 +4021,44 @@ def hist_diff(now, then):
     swapped pair reads as zeros rather than as garbage (same contract as
     Hist::diff)."""
     return [max(0, a - b) for a, b in zip(now, then)]
+
+
+def hist_sum(a, b):
+    """Slot-wise sum of two histograms over the same bin geometry -- the
+    histogram of the UNION of two DISJOINT populations, and `hist_diff`'s
+    inverse (`Hist::plus` in squallar-device-profile).
+
+    **Only for populations that share no sample.** The one use it has here is
+    a family's `-interact` and `-idle` keys, which every presented frame falls
+    into exactly one of, so their sum is the `presented` population exactly and
+    not an approximation of it. Adding a family to its parent, or a cut to the
+    span it decomposes, produces counts that describe no population at all."""
+    return [x + y for x, y in zip(a, b)]
+
+
+# The 4 ms responsiveness bar, in whole microseconds, and the slot index whose
+# cumulative count is the number of frames STRICTLY under it.
+#
+# 4 000 us is exactly bin edge 24 (62 500 << 6 ns). Geometric bin k is slot
+# k + 1 and slot 0 is the under-floor clamp, so slots 0..=24 are exactly the
+# samples below the bar -- a sum of whole slots, not an interpolation. That
+# is the one bar figure this rig reports that is not an estimate; every
+# percentile beside it is a bin edge and a lower bound.
+#
+# Read the word: STRICTLY under. A frame of exactly 4 000 us opens slot 25 and
+# is not counted, which with whole-microsecond samples makes this "at or under
+# 3 999 us".
+BAR_US = 4000
+BAR_SLOT = 24
+
+
+def hist_share_under_bar(counts):
+    """(under, total) for BAR_US -- exact, both integers. `None` total means an
+    empty histogram, where a share is an absence and never a zero."""
+    total = sum(counts)
+    if total == 0:
+        return (0, 0)
+    return (sum(counts[:BAR_SLOT + 1]), total)
 
 
 def hist_percentile_upper_us(counts, q):
@@ -4459,6 +4549,12 @@ class FrameLineWatcher:
         self.session = session
         self.interact = {}
         self.idle = {}
+        # `interact` and `idle` as ONE population -- every presented frame,
+        # the denominator the 4 ms bar has been stated over since the
+        # 2026-09-10 ruling. Derived by the app from the two above and never
+        # added to either; it is the only reading here carrying an EXACT
+        # under-bar count (`under_4000_us`).
+        self.presented = {}
         self.cadence = {}
         # The named families, one dict per name seen: "frame segment (pump)"
         # keys as "segment:pump", "tile take (vector)" as "take:vector". Kept
@@ -4485,6 +4581,8 @@ class FrameLineWatcher:
             self.interact[(r.get("t"), r.get("n"))] = r
         for r in sig.get("idle_all") or []:
             self.idle[(r.get("t"), r.get("n"))] = r
+        for r in sig.get("presented_all") or []:
+            self.presented[(r.get("t"), r.get("n"))] = r
         for r in sig.get("cadence_all") or []:
             self.cadence[(r.get("t"), r.get("n"))] = r
         for prefix, key in (("frame_segment_all", "segment"),
@@ -4531,7 +4629,7 @@ class FrameLineWatcher:
 
     def readings(self, family):
         by_name = {"interact": self.interact, "idle": self.idle,
-                   "cadence": self.cadence}
+                   "presented": self.presented, "cadence": self.cadence}
         rs = list((by_name.get(family) or self.named.get(family) or {}).values())
         rs.sort(key=lambda r: (r.get("t") or 0, r.get("n") or 0))
         return rs
@@ -4812,7 +4910,7 @@ def _window_stats(watcher, t0, t1, out):
     # The named families come off the watcher rather than from a list, so an
     # arm that never produced a `tile take (put)` reading simply has no such
     # key -- an absence, not a zero, and the two must stay tellable apart.
-    for family in ("interact", "idle", "cadence") + tuple(
+    for family in ("interact", "idle", "presented", "cadence") + tuple(
             watcher.named_families()):
         rs = [r for r in watcher.readings(family)
               if hist_parse(r.get("hist")) is not None]
@@ -4851,7 +4949,48 @@ def _window_stats(watcher, t0, t1, out):
         # shows that shape. Kept in the artifact so a distribution question
         # can be asked of a finished run without re-measuring it.
         stats["bins"] = d
+        # The bar, exactly, on THIS family's own denominator. Integers, not a
+        # ratio: `under` and `n` both subtract across the window, so the share
+        # is arithmetic. See `hist_share_under_bar` -- STRICTLY under 4 000 us.
+        under, total = hist_share_under_bar(d)
+        stats["under_bar_us"] = BAR_US
+        stats["under_bar"] = under
+        stats["under_bar_of"] = total
         out[family] = stats
+    # **The presented population, per family, derived here and nowhere else.**
+    # Since the 2026-09-10 ruling the bar is stated over every presented frame,
+    # and each family arrives as two DISJOINT keys -- `-interact` and `-idle`.
+    # Their slot-wise sum is the union exactly (`hist_sum`), so p50/p90/p99 and
+    # the under-bar count below are the family's real figures over the bar's
+    # own denominator rather than an average of two percentiles.
+    #
+    # Derived and never recorded, so it cannot drift from the two halves; and
+    # NEVER added to either of them, which would double-count every frame.
+    for family in [k for k in list(out) if k.endswith("-interact")]:
+        stem = family[: -len("-interact")]
+        other = stem + "-idle"
+        i, d_ = out.get(family), out.get(other)
+        if not (isinstance(i, dict) and isinstance(d_, dict)
+                and i.get("bins") and d_.get("bins")):
+            continue
+        u = hist_sum(i["bins"], d_["bins"])
+        stats = hist_stats(u)
+        stats["bracket_a_t"] = i.get("bracket_a_t")
+        stats["bracket_b_t"] = i.get("bracket_b_t")
+        # Both halves carry an exact running sum, so the union's windowed mean
+        # is exact too -- but only when BOTH halves have one.
+        mi, md = i.get("mean_us"), d_.get("mean_us")
+        ni = (i.get("under_bar_of") or 0)
+        nd = (d_.get("under_bar_of") or 0)
+        stats["mean_us"] = (
+            (mi * ni + md * nd) // (ni + nd)
+            if mi is not None and md is not None and (ni + nd) > 0 else None)
+        stats["bins"] = u
+        under, total = hist_share_under_bar(u)
+        stats["under_bar_us"] = BAR_US
+        stats["under_bar"] = under
+        stats["under_bar_of"] = total
+        out[stem + "-presented"] = stats
     # The p99-shaped frame: of every period's worst that REPORTS ON the bracket,
     # the one with the largest service. A tick at time t reports the period
     # ending at t, so the frames inside t0..t1 are carried by the ticks in
@@ -8499,7 +8638,8 @@ def run_smoke(args):
                      fam.get("delta") for name, fam in tcs["families"].items()})
         fl_last = frames_watch.last or {}
         result["frame_lines"] = {
-            k: fl_last.get(k) for k in ("interact", "idle", "segments",
+            k: fl_last.get(k) for k in ("interact", "idle", "presented",
+                                        "segments",
                                         "prep", "gpu", "gpu_unavailable",
                                         "cadence", "loop_state",
                                         # Frames drawn against frames that
@@ -9473,6 +9613,23 @@ def run_smoke(args):
               "boot]: n=%s p50=%s us p90=%s us p99=%s us"
               % (tag, alabel, i.get("n"), i.get("p50"), i.get("p90"),
                  i.get("p99")))
+    if fl.get("presented"):
+        i = fl["presented"]
+        # **The bar's own denominator**, since the 2026-09-10 ruling: every
+        # presented frame. The union of the two rows above and never added to
+        # either. `under_4000_us` is the only figure on any of the three that
+        # is not an estimate -- 4 000 us is exactly bin edge 24, so the count
+        # below it is a sum of whole slots. STRICTLY under: a frame of exactly
+        # 4 000 us is not in it.
+        n = i.get("n") or 0
+        under = i.get("under_4000_us")
+        share = ("%.2f%%" % (100.0 * under / n)) if (under is not None and n)\
+            else "unread"
+        print("[%s] SUMMARY [%s] frame service (presented) [cumulative from "
+              "boot]: n=%s p50=%s us p90=%s us p99=%s us; under 4000 us "
+              "(strictly): %s = %s"
+              % (tag, alabel, i.get("n"), i.get("p50"), i.get("p90"),
+                 i.get("p99"), under, share))
     if fl.get("segments"):
         s = fl["segments"]
         print("[%s] SUMMARY [%s] frame segments (interact, p99 us, "

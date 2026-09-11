@@ -14,7 +14,7 @@
 //! edge, rounded up to whole microseconds) — not read back from the code
 //! under test.
 
-use squallar_device_profile::hist::Hist;
+use squallar_device_profile::hist::{Hist, Split};
 use squallar_gpu::egui_renderer::geometry_staging::GeometryStagingTotals;
 use squallar_gpu::egui_renderer::pass_costs::{PassCosts, StagedGeometry};
 
@@ -69,8 +69,15 @@ fn pattern(name: &str) -> String {
 /// escaped parens; everything else regexy failing the leftover check below
 /// is what keeps the substitution honest.
 fn rendered(pattern: &str, groups: &[&str]) -> String {
-    const GROUP_SPELLINGS: [&str; 4] =
-        [r"(\d+|none|over)", r"(\d+)", r"([0-9,]+)", r"([a-z0-9-]+)"];
+    const GROUP_SPELLINGS: [&str; 5] = [
+        r"(\d+|none|over)",
+        // See `frame_service_presented_line`: the exact under-bar count, whose
+        // `unaligned` arm is unreachable while the bar is a bin edge.
+        r"(\d+|unaligned)",
+        r"(\d+)",
+        r"([0-9,]+)",
+        r"([a-z0-9-]+)",
+    ];
     let mut out = String::new();
     let mut rest = pattern;
     let mut values = groups.iter();
@@ -102,6 +109,30 @@ fn rendered(pattern: &str, groups: &[&str]) -> String {
     out
 }
 
+/// [`rendered`] for a **split** family line: the name, this fixture's six
+/// interact figures, then the six [`idle_half_pin`] renders as — thirteen
+/// capture groups, in the order the rig's probe declares them.
+///
+/// Both halves are offered on purpose. `rendered` refuses a values list that
+/// is shorter than the pattern's group count, so a probe that lost its idle
+/// half — or an app line that stopped writing one — fails here rather than
+/// matching the interact half and reporting the family as if it were whole.
+fn rendered_split(pattern: &str, name: &str, interact: [&str; 6]) -> String {
+    let (idle, _) = idle_half_pin();
+    let idle_hist = counts_string(&idle);
+    let mut values: Vec<&str> = vec![name];
+    values.extend(interact);
+    values.extend(["1", "60000", "64000", "64000", "64000", &idle_hist]);
+    rendered(pattern, &values)
+}
+
+/// The eight `panes` cuts the worst-frame seam fixture carries, telescoping
+/// EXACTLY to its `ui_panes` of 812 — distinct values in every position, so a
+/// transposed pair of the sixteen columns they added cannot read as correct.
+const PANES_SEAM: [u32; 8] = [90, 55, 33, 480, 120, 22, 7, 5];
+/// The since-boot half's, telescoping to its `ui_panes` of 61.
+const PANES_SEAM_BOOT: [u32; 8] = [5, 3, 2, 34, 9, 4, 2, 2];
+
 /// A histogram's counts the way the line embeds them — from the public
 /// counts, not from the formatter under test.
 fn counts_string(h: &Hist) -> String {
@@ -110,6 +141,32 @@ fn counts_string(h: &Hist) -> String {
         .map(u32::to_string)
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// The `idle` half every `named_split_line` pin below carries, and the exact
+/// `; idle …` text it renders as.
+///
+/// **One 60 000 µs sample, deliberately unlike anything an interact fixture
+/// here holds.** A pin whose idle half were empty would hold the interact
+/// rendering and nothing else, and the failure it could not see is the one
+/// this shape makes easy: a formatter that printed one half twice, or that
+/// crossed the two, reads green against an empty second half. 60 000 µs lands
+/// in the last geometric bin (edge 39, `105 112 << 9` ns), whose upper edge is
+/// the 64 000 µs ceiling — so every percentile of it is 64000 and none of them
+/// can be confused with an interact figure.
+fn split_pin(interact: &Hist) -> Split {
+    Split::from_halves(*interact, idle_half_pin().0)
+}
+
+/// See [`split_pin`].
+fn idle_half_pin() -> (Hist, String) {
+    let mut h = Hist::new();
+    h.record(60_000);
+    let rendered = format!(
+        "; idle n=1, sum=60000 us, p50=64000 us, p90=64000 us, p99=64000 us, hist={}",
+        counts_string(&h),
+    );
+    (h, rendered)
 }
 
 /// Three samples in one bin: n and all three percentiles land on that bin's
@@ -172,15 +229,28 @@ fn the_interact_service_line_embeds_the_whole_histogram() {
 #[test]
 fn the_segments_line_names_each_segment_and_the_acquire_separately() {
     let mut s = crate::frame_ledger::SegmentHists::default();
-    s.pre.record(100);
-    s.pump.record(200);
-    s.ui.record(500);
-    s.prepare.record(1_000);
-    s.finish.record(2_000);
-    s.post.record(4_000);
-    let mut acquire = Hist::new();
-    acquire.record(3_000);
-    acquire.record(5_000);
+    s.pre.record(100, true);
+    s.pump.record(200, true);
+    s.ui.record(500, true);
+    s.prepare.record(1_000, true);
+    s.finish.record(2_000, true);
+    s.post.record(4_000, true);
+    // **Idle samples that must not reach this line.** `frame segments` names
+    // its own denominator in its own literal -- `(interact, p99 us)` -- and
+    // it is the one family line this file deliberately left on the narrower
+    // population when the 2026-09-10 ruling widened the rest. A 60 ms idle
+    // sample in every segment would move every figure below if the line ever
+    // started reading `presented`, so the pin is also the gate on that.
+    s.pre.record(60_000, false);
+    s.pump.record(60_000, false);
+    s.ui.record(60_000, false);
+    s.prepare.record(60_000, false);
+    s.finish.record(60_000, false);
+    s.post.record(60_000, false);
+    let mut acquire = squallar_device_profile::hist::Split::default();
+    acquire.record(3_000, true);
+    acquire.record(5_000, true);
+    acquire.record(60_000, false);
     assert_eq!(
         super::frame_segments_line(&s, &acquire),
         "frame segments (interact, p99 us): pre=106, pump=211, ui=595, \
@@ -326,15 +396,28 @@ fn the_rig_reads_the_frame_lines_the_app_actually_writes() {
     );
 
     let mut s = crate::frame_ledger::SegmentHists::default();
-    s.pre.record(100);
-    s.pump.record(200);
-    s.ui.record(500);
-    s.prepare.record(1_000);
-    s.finish.record(2_000);
-    s.post.record(4_000);
-    let mut acquire = Hist::new();
-    acquire.record(3_000);
-    acquire.record(5_000);
+    s.pre.record(100, true);
+    s.pump.record(200, true);
+    s.ui.record(500, true);
+    s.prepare.record(1_000, true);
+    s.finish.record(2_000, true);
+    s.post.record(4_000, true);
+    // **Idle samples that must not reach this line.** `frame segments` names
+    // its own denominator in its own literal -- `(interact, p99 us)` -- and
+    // it is the one family line this file deliberately left on the narrower
+    // population when the 2026-09-10 ruling widened the rest. A 60 ms idle
+    // sample in every segment would move every figure below if the line ever
+    // started reading `presented`, so the pin is also the gate on that.
+    s.pre.record(60_000, false);
+    s.pump.record(60_000, false);
+    s.ui.record(60_000, false);
+    s.prepare.record(60_000, false);
+    s.finish.record(60_000, false);
+    s.post.record(60_000, false);
+    let mut acquire = squallar_device_profile::hist::Split::default();
+    acquire.record(3_000, true);
+    acquire.record(5_000, true);
+    acquire.record(60_000, false);
     assert_eq!(
         super::frame_segments_line(&s, &acquire),
         rendered(
@@ -581,11 +664,16 @@ fn the_frame_segment_line_reads_exactly_as_pinned() {
     let mut slots = [0u32; 42];
     slots[3] = 3;
     let expected_hist = slots.map(|c| c.to_string()).join(",");
+    // The `; idle …` half every split line carries. Held as its own binding
+    // so the interact half above stays a literal: a formatter that dropped
+    // the second half, or printed the first one twice, fails on this suffix
+    // and not on a figure that could be mistaken for a rounding change.
+    let (_, idle) = idle_half_pin();
     assert_eq!(
-        super::named_hist_line("frame segment", "pump", &h),
+        super::named_split_line("frame segment", "pump", &split_pin(&h)),
         format!(
-            "frame segment (pump): n=3, sum=300 us, p50=106 us, p90=106 us, \
-             p99=106 us, hist={expected_hist}"
+            "frame segment (pump): interact n=3, sum=300 us, p50=106 us, p90=106 us, \
+             p99=106 us, hist={expected_hist}{idle}"
         ),
     );
 }
@@ -623,8 +711,8 @@ fn the_sum_separates_two_histograms_the_bins_cannot() {
     );
     assert_eq!((low.sum_micros(), high.sum_micros()), (360, 420));
     assert_ne!(
-        super::named_hist_line("frame segment", "ui", &low),
-        super::named_hist_line("frame segment", "ui", &high),
+        super::named_split_line("frame segment", "ui", &split_pin(&low)),
+        super::named_split_line("frame segment", "ui", &split_pin(&high)),
         "the two lines are identical, so a 17% cost difference is invisible \
          to every reader of this instrument",
     );
@@ -652,7 +740,14 @@ fn every_frame_segment_is_reported_under_its_own_name() {
     .enumerate()
     {
         for _ in 0..=slot {
-            hist.record(1_000);
+            hist.record(1_000, true);
+        }
+        // A DIFFERENT idle count in every position, so a formatter that
+        // printed one half twice, or crossed the two, cannot read green --
+        // and so the identity holds over BOTH populations rather than only
+        // over the one the family used to record on.
+        for _ in 0..slot + 2 {
+            hist.record(1_000, false);
         }
     }
     let lines = super::frame_segment_lines(&segments);
@@ -660,7 +755,10 @@ fn every_frame_segment_is_reported_under_its_own_name() {
     assert_eq!(lines.len(), names.len());
     for (slot, (line, name)) in lines.iter().zip(names).enumerate() {
         assert!(
-            line.starts_with(&format!("frame segment ({name}): n={}, ", slot + 1)),
+            line.starts_with(&format!(
+                "frame segment ({name}): interact n={}, ",
+                slot + 1
+            )) && line.contains(&format!("; idle n={}, ", slot + 2)),
             "segment {slot} reported as {line:?}, which is not {name}'s line \
              carrying {name}'s histogram",
         );
@@ -684,11 +782,16 @@ fn the_frame_prepare_line_reads_exactly_as_pinned() {
     let mut slots = [0u32; 42];
     slots[3] = 3;
     let expected_hist = slots.map(|c| c.to_string()).join(",");
+    // The `; idle …` half every split line carries. Held as its own binding
+    // so the interact half above stays a literal: a formatter that dropped
+    // the second half, or printed the first one twice, fails on this suffix
+    // and not on a figure that could be mistaken for a rounding change.
+    let (_, idle) = idle_half_pin();
     assert_eq!(
-        super::named_hist_line("frame prepare", "tessellate", &h),
+        super::named_split_line("frame prepare", "tessellate", &split_pin(&h)),
         format!(
-            "frame prepare (tessellate): n=3, sum=300 us, p50=106 us, \
-             p90=106 us, p99=106 us, hist={expected_hist}"
+            "frame prepare (tessellate): interact n=3, sum=300 us, p50=106 us, \
+             p90=106 us, p99=106 us, hist={expected_hist}{idle}"
         ),
     );
 }
@@ -715,7 +818,14 @@ fn every_prepare_phase_is_reported_under_its_own_name() {
     .enumerate()
     {
         for _ in 0..=slot {
-            hist.record(1_000);
+            hist.record(1_000, true);
+        }
+        // A DIFFERENT idle count in every position, so a formatter that
+        // printed one half twice, or crossed the two, cannot read green --
+        // and so the identity holds over BOTH populations rather than only
+        // over the one the family used to record on.
+        for _ in 0..slot + 2 {
+            hist.record(1_000, false);
         }
     }
     let lines = super::frame_prepare_lines(&phases);
@@ -730,7 +840,10 @@ fn every_prepare_phase_is_reported_under_its_own_name() {
     assert_eq!(lines.len(), names.len());
     for (slot, (line, name)) in lines.iter().zip(names).enumerate() {
         assert!(
-            line.starts_with(&format!("frame prepare ({name}): n={}, ", slot + 1)),
+            line.starts_with(&format!(
+                "frame prepare ({name}): interact n={}, ",
+                slot + 1
+            )) && line.contains(&format!("; idle n={}, ", slot + 2)),
             "prepare cut {slot} reported as {line:?}, which is not {name}'s \
              line carrying {name}'s histogram",
         );
@@ -773,10 +886,11 @@ fn the_rig_reads_the_prepare_lines_the_app_actually_writes() {
     h.record(4_000);
     let hist = counts_string(&h);
     assert_eq!(
-        super::named_hist_line("frame prepare", "end-pass", &h),
-        rendered(
+        super::named_split_line("frame prepare", "end-pass", &split_pin(&h)),
+        rendered_split(
             &pattern("frame_prepare_re"),
-            &["end-pass", "2", "4100", "106", "4757", "4757", &hist],
+            "end-pass",
+            ["2", "4100", "106", "4757", "4757", &hist]
         ),
         "the `frame prepare (…)` line and the rig's probe have drifted",
     );
@@ -797,10 +911,11 @@ fn the_rig_reads_the_ui_lines_the_app_actually_writes() {
     h.record(4_000);
     let hist = counts_string(&h);
     assert_eq!(
-        super::named_hist_line("frame ui", "layout", &h),
-        rendered(
+        super::named_split_line("frame ui", "layout", &split_pin(&h)),
+        rendered_split(
             &pattern("frame_ui_re"),
-            &["layout", "2", "4100", "106", "4757", "4757", &hist],
+            "layout",
+            ["2", "4100", "106", "4757", "4757", &hist]
         ),
         "the `frame ui (…)` line and the rig's probe have drifted",
     );
@@ -821,10 +936,11 @@ fn the_rig_reads_the_pre_lines_the_app_actually_writes() {
     h.record(4_000);
     let hist = counts_string(&h);
     assert_eq!(
-        super::named_hist_line("frame pre", "ingest", &h),
-        rendered(
+        super::named_split_line("frame pre", "ingest", &split_pin(&h)),
+        rendered_split(
             &pattern("frame_pre_re"),
-            &["ingest", "2", "4100", "106", "4757", "4757", &hist],
+            "ingest",
+            ["2", "4100", "106", "4757", "4757", &hist]
         ),
         "the `frame pre (…)` line and the rig's probe have drifted",
     );
@@ -846,8 +962,8 @@ fn the_rig_reads_the_pre_lines_the_app_actually_writes() {
         (pre_head.as_str(), prepare_head.as_str()),
         ("frame pre ", "frame prepare ")
     );
-    let prepare_line = super::named_hist_line("frame prepare", "plan", &h);
-    let pre_line = super::named_hist_line("frame pre", "platform", &h);
+    let prepare_line = super::named_split_line("frame prepare", "plan", &split_pin(&h));
+    let pre_line = super::named_split_line("frame pre", "platform", &split_pin(&h));
     assert!(
         !prepare_line.contains(&format!("{pre_head}(")),
         "the `frame pre` probe's head occurs inside a `frame prepare` line, \
@@ -971,6 +1087,11 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
         // upstream lands as plausible integers rather than as an absence.
         post_cuts: [7, 240, 3, 19, 5, 11, 8],
         dispatch_cuts: [4, 9, 17, 180, 12, 15, 3],
+        // Eight DISTINCT panes cuts telescoping EXACTLY to this frame's own
+        // `ui_panes`, on the same terms and for the same reason: they sit
+        // last in the positional regex now, where a miscount upstream lands
+        // as plausible integers rather than as an absence.
+        panes_cuts: PANES_SEAM,
         interact: true,
     };
     // The since-boot maximum is a whole frame too: a boot-time compile spike
@@ -984,6 +1105,7 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
         pre_cuts: [4, 31, 12, 20, 6, 9, 18],
         post_cuts: [6, 300, 2, 12, 4, 9, 5],
         dispatch_cuts: [3, 7, 21, 240, 14, 13, 2],
+        panes_cuts: PANES_SEAM_BOOT,
         interact: false,
     };
     assert_eq!(
@@ -1010,6 +1132,13 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
          pin below would pin a line whose stack_* columns decompose no frame",
     );
     assert_eq!(boot.stack_cuts.iter().sum::<u32>(), boot.ui_cuts[4]);
+    assert_eq!(
+        w.panes_cuts.iter().sum::<u32>(),
+        w.ui_cuts[6],
+        "the fixture's panes cuts do not telescope to its ui_panes, so the \
+         pin below would pin a line whose panes_* columns decompose no frame",
+    );
+    assert_eq!(boot.panes_cuts.iter().sum::<u32>(), boot.ui_cuts[6]);
     // And the two newest families, on the same terms: the seven `post` cuts
     // telescope to `post`, and the seven `dispatch` cuts to the SECOND of
     // those seven -- not to `post`. A fixture whose dispatch cuts summed to
@@ -1037,10 +1166,11 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
                 "13455", "interact", "22628", "64", "55", "9514", "2829", "700", "293", "11",
                 "402", "1207", "96", "6902", "4", "812", "3", "77", "21", "96", "340", "1180",
                 "4100", "900", "265", "3", "21", "9", "14", "2", "7", "8", "7", "240", "3", "19",
-                "5", "11", "8", "4", "9", "17", "180", "12", "15", "3", "idle", "100", "90", "300",
-                "21000", "800", "338", "7", "19", "41", "5", "133", "2", "61", "1", "31", "3", "8",
-                "14", "27", "61", "12", "8", "4", "31", "12", "20", "6", "9", "18", "6", "300",
-                "2", "12", "4", "9", "5", "3", "7", "21", "240", "14", "13", "2",
+                "5", "11", "8", "4", "9", "17", "180", "12", "15", "3", "90", "55", "33", "480",
+                "120", "22", "7", "5", "idle", "100", "90", "300", "21000", "800", "338", "7",
+                "19", "41", "5", "133", "2", "61", "1", "31", "3", "8", "14", "27", "61", "12",
+                "8", "4", "31", "12", "20", "6", "9", "18", "6", "300", "2", "12", "4", "9", "5",
+                "3", "7", "21", "240", "14", "13", "2", "5", "3", "2", "34", "9", "4", "2", "2",
             ],
         ),
         "the `frame worst:` line and the rig's probe have drifted",
@@ -1053,7 +1183,7 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
                 "22628", "idle", "100", "90", "300", "21000", "800", "338", "7", "19", "41", "5",
                 "133", "2", "61", "1", "31", "3", "8", "14", "27", "61", "12", "8", "4", "31",
                 "12", "20", "6", "9", "18", "6", "300", "2", "12", "4", "9", "5", "3", "7", "21",
-                "240", "14", "13", "2",
+                "240", "14", "13", "2", "5", "3", "2", "34", "9", "4", "2", "2",
             ],
         ),
         "the no-frame spelling and the rig's probe have drifted",
@@ -1259,6 +1389,12 @@ fn every_frame_line_family_the_app_writes_has_a_named_rig_probe() {
             &[
                 "svc_interact_re",
                 "svc_idle_re",
+                // The two above as ONE population — every presented frame,
+                // which is the denominator the 4 ms bar has been stated over
+                // since the 2026-09-10 ruling. A family the rig has no regex
+                // for is ABSENT from the artifact rather than empty, and the
+                // bar's own line is the last one that may be.
+                "svc_presented_re",
                 "frame_service_less_present_re",
             ],
         ),
@@ -1320,11 +1456,16 @@ fn the_frame_pump_line_reads_exactly_as_pinned() {
     let mut slots = [0u32; 42];
     slots[3] = 3;
     let expected_hist = slots.map(|c| c.to_string()).join(",");
+    // The `; idle …` half every split line carries. Held as its own binding
+    // so the interact half above stays a literal: a formatter that dropped
+    // the second half, or printed the first one twice, fails on this suffix
+    // and not on a figure that could be mistaken for a rounding change.
+    let (_, idle) = idle_half_pin();
     assert_eq!(
-        super::named_hist_line("frame pump", "apply", &h),
+        super::named_split_line("frame pump", "apply", &split_pin(&h)),
         format!(
-            "frame pump (apply): n=3, sum=300 us, p50=106 us, \
-             p90=106 us, p99=106 us, hist={expected_hist}"
+            "frame pump (apply): interact n=3, sum=300 us, p50=106 us, \
+             p90=106 us, p99=106 us, hist={expected_hist}{idle}"
         ),
     );
 }
@@ -1354,7 +1495,14 @@ fn every_pump_phase_is_reported_under_its_own_name() {
     .enumerate()
     {
         for _ in 0..=slot {
-            hist.record(1_000);
+            hist.record(1_000, true);
+        }
+        // A DIFFERENT idle count in every position, so a formatter that
+        // printed one half twice, or crossed the two, cannot read green --
+        // and so the identity holds over BOTH populations rather than only
+        // over the one the family used to record on.
+        for _ in 0..slot + 2 {
+            hist.record(1_000, false);
         }
     }
     let lines = super::frame_pump_lines(&phases);
@@ -1364,7 +1512,8 @@ fn every_pump_phase_is_reported_under_its_own_name() {
     assert_eq!(lines.len(), names.len());
     for (slot, (line, name)) in lines.iter().zip(names).enumerate() {
         assert!(
-            line.starts_with(&format!("frame pump ({name}): n={}, ", slot + 1)),
+            line.starts_with(&format!("frame pump ({name}): interact n={}, ", slot + 1))
+                && line.contains(&format!("; idle n={}, ", slot + 2)),
             "pump cut {slot} reported as {line:?}, which is not {name}'s line \
              carrying {name}'s histogram",
         );
@@ -1431,10 +1580,11 @@ fn the_rig_reads_the_pump_lines_the_app_actually_writes() {
     h.record(4_000);
     let hist = counts_string(&h);
     assert_eq!(
-        super::named_hist_line("frame pump", "apply", &h),
-        rendered(
+        super::named_split_line("frame pump", "apply", &split_pin(&h)),
+        rendered_split(
             &pattern("frame_pump_re"),
-            &["apply", "2", "4100", "106", "4757", "4757", &hist],
+            "apply",
+            ["2", "4100", "106", "4757", "4757", &hist]
         ),
         "the `frame pump (…)` line and the rig's probe have drifted",
     );
@@ -1455,11 +1605,16 @@ fn the_frame_post_line_reads_exactly_as_pinned() {
     let mut slots = [0u32; 42];
     slots[3] = 3;
     let expected_hist = slots.map(|c| c.to_string()).join(",");
+    // The `; idle …` half every split line carries. Held as its own binding
+    // so the interact half above stays a literal: a formatter that dropped
+    // the second half, or printed the first one twice, fails on this suffix
+    // and not on a figure that could be mistaken for a rounding change.
+    let (_, idle) = idle_half_pin();
     assert_eq!(
-        super::named_hist_line("frame post", "dispatch", &h),
+        super::named_split_line("frame post", "dispatch", &split_pin(&h)),
         format!(
-            "frame post (dispatch): n=3, sum=300 us, p50=106 us, \
-             p90=106 us, p99=106 us, hist={expected_hist}"
+            "frame post (dispatch): interact n=3, sum=300 us, p50=106 us, \
+             p90=106 us, p99=106 us, hist={expected_hist}{idle}"
         ),
     );
 }
@@ -1488,7 +1643,14 @@ fn every_post_phase_is_reported_under_its_own_name() {
     .enumerate()
     {
         for _ in 0..=slot {
-            hist.record(1_000);
+            hist.record(1_000, true);
+        }
+        // A DIFFERENT idle count in every position, so a formatter that
+        // printed one half twice, or crossed the two, cannot read green --
+        // and so the identity holds over BOTH populations rather than only
+        // over the one the family used to record on.
+        for _ in 0..slot + 2 {
+            hist.record(1_000, false);
         }
     }
     let lines = super::frame_post_lines(&phases);
@@ -1498,7 +1660,8 @@ fn every_post_phase_is_reported_under_its_own_name() {
     assert_eq!(lines.len(), names.len());
     for (slot, (line, name)) in lines.iter().zip(names).enumerate() {
         assert!(
-            line.starts_with(&format!("frame post ({name}): n={}, ", slot + 1)),
+            line.starts_with(&format!("frame post ({name}): interact n={}, ", slot + 1))
+                && line.contains(&format!("; idle n={}, ", slot + 2)),
             "post cut {slot} reported as {line:?}, which is not {name}'s line \
              carrying {name}'s histogram",
         );
@@ -1548,10 +1711,11 @@ fn the_rig_reads_the_post_lines_the_app_actually_writes() {
     h.record(4_000);
     let hist = counts_string(&h);
     assert_eq!(
-        super::named_hist_line("frame post", "dispatch", &h),
-        rendered(
+        super::named_split_line("frame post", "dispatch", &split_pin(&h)),
+        rendered_split(
             &pattern("frame_post_re"),
-            &["dispatch", "2", "4100", "106", "4757", "4757", &hist],
+            "dispatch",
+            ["2", "4100", "106", "4757", "4757", &hist]
         ),
         "the `frame post (…)` line and the rig's probe have drifted",
     );
@@ -1574,11 +1738,16 @@ fn the_frame_ui_line_reads_exactly_as_pinned() {
     let mut slots = [0u32; 42];
     slots[3] = 3;
     let expected_hist = slots.map(|c| c.to_string()).join(",");
+    // The `; idle …` half every split line carries. Held as its own binding
+    // so the interact half above stays a literal: a formatter that dropped
+    // the second half, or printed the first one twice, fails on this suffix
+    // and not on a figure that could be mistaken for a rounding change.
+    let (_, idle) = idle_half_pin();
     assert_eq!(
-        super::named_hist_line("frame ui", "shell", &h),
+        super::named_split_line("frame ui", "shell", &split_pin(&h)),
         format!(
-            "frame ui (shell): n=3, sum=300 us, p50=106 us, p90=106 us, \
-             p99=106 us, hist={expected_hist}"
+            "frame ui (shell): interact n=3, sum=300 us, p50=106 us, p90=106 us, \
+             p99=106 us, hist={expected_hist}{idle}"
         ),
     );
 }
@@ -1610,7 +1779,14 @@ fn every_ui_phase_is_reported_under_its_own_name() {
     .enumerate()
     {
         for _ in 0..=slot {
-            hist.record(1_000);
+            hist.record(1_000, true);
+        }
+        // A DIFFERENT idle count in every position, so a formatter that
+        // printed one half twice, or crossed the two, cannot read green --
+        // and so the identity holds over BOTH populations rather than only
+        // over the one the family used to record on.
+        for _ in 0..slot + 2 {
+            hist.record(1_000, false);
         }
     }
     let lines = super::frame_ui_lines(&phases);
@@ -1628,7 +1804,8 @@ fn every_ui_phase_is_reported_under_its_own_name() {
     assert_eq!(lines.len(), names.len());
     for (slot, (line, name)) in lines.iter().zip(names).enumerate() {
         assert!(
-            line.starts_with(&format!("frame ui ({name}): n={}, ", slot + 1)),
+            line.starts_with(&format!("frame ui ({name}): interact n={}, ", slot + 1))
+                && line.contains(&format!("; idle n={}, ", slot + 2)),
             "ui cut {slot} reported as {line:?}, which is not {name}'s line \
              carrying {name}'s histogram",
         );
@@ -1649,7 +1826,7 @@ fn every_ui_phase_is_reported_under_its_own_name() {
 fn the_ui_cut_lines_are_not_mistakable_for_the_ui_segment_line() {
     let mut h = Hist::new();
     h.record(1_000);
-    let segment_line = super::named_hist_line("frame segment", "ui", &h);
+    let segment_line = super::named_split_line("frame segment", "ui", &split_pin(&h));
     assert!(
         !segment_line.starts_with("frame ui ("),
         "the ui segment line {segment_line:?} reads as one of its own cuts",
@@ -1684,11 +1861,16 @@ fn the_frame_stack_line_reads_exactly_as_pinned() {
     let mut slots = [0u32; 42];
     slots[3] = 3;
     let expected_hist = slots.map(|c| c.to_string()).join(",");
+    // The `; idle …` half every split line carries. Held as its own binding
+    // so the interact half above stays a literal: a formatter that dropped
+    // the second half, or printed the first one twice, fails on this suffix
+    // and not on a figure that could be mistaken for a rounding change.
+    let (_, idle) = idle_half_pin();
     assert_eq!(
-        super::named_hist_line("frame stack", "gate", &h),
+        super::named_split_line("frame stack", "gate", &split_pin(&h)),
         format!(
-            "frame stack (gate): n=3, sum=300 us, p50=106 us, p90=106 us, \
-             p99=106 us, hist={expected_hist}"
+            "frame stack (gate): interact n=3, sum=300 us, p50=106 us, p90=106 us, \
+             p99=106 us, hist={expected_hist}{idle}"
         ),
     );
 }
@@ -1718,7 +1900,14 @@ fn every_stack_phase_is_reported_under_its_own_name() {
     .enumerate()
     {
         for _ in 0..=slot {
-            hist.record(1_000);
+            hist.record(1_000, true);
+        }
+        // A DIFFERENT idle count in every position, so a formatter that
+        // printed one half twice, or crossed the two, cannot read green --
+        // and so the identity holds over BOTH populations rather than only
+        // over the one the family used to record on.
+        for _ in 0..slot + 2 {
+            hist.record(1_000, false);
         }
     }
     let lines = super::frame_stack_lines(&phases);
@@ -1734,7 +1923,8 @@ fn every_stack_phase_is_reported_under_its_own_name() {
     assert_eq!(lines.len(), names.len());
     for (slot, (line, name)) in lines.iter().zip(names).enumerate() {
         assert!(
-            line.starts_with(&format!("frame stack ({name}): n={}, ", slot + 1)),
+            line.starts_with(&format!("frame stack ({name}): interact n={}, ", slot + 1))
+                && line.contains(&format!("; idle n={}, ", slot + 2)),
             "stack cut {slot} reported as {line:?}, which is not {name}'s line \
              carrying {name}'s histogram",
         );
@@ -1755,13 +1945,13 @@ fn every_stack_phase_is_reported_under_its_own_name() {
 fn the_stack_cut_lines_are_not_mistakable_for_their_parents() {
     let mut h = Hist::new();
     h.record(1_000);
-    let parent_cut = super::named_hist_line("frame ui", "stack", &h);
+    let parent_cut = super::named_split_line("frame ui", "stack", &split_pin(&h));
     assert!(
         !parent_cut.starts_with("frame stack ("),
         "the `frame ui (stack)` line {parent_cut:?} reads as one of its own \
          cuts, so a reader would add the seven to the one they decompose",
     );
-    let segment_line = super::named_hist_line("frame segment", "ui", &h);
+    let segment_line = super::named_split_line("frame segment", "ui", &split_pin(&h));
     assert!(
         !segment_line.starts_with("frame stack ("),
         "the ui segment line {segment_line:?} reads as a stack cut",
@@ -1797,10 +1987,11 @@ fn the_rig_reads_the_stack_lines_the_app_actually_writes() {
     h.record(4_000);
     let hist = counts_string(&h);
     assert_eq!(
-        super::named_hist_line("frame stack", "hydrate", &h),
-        rendered(
+        super::named_split_line("frame stack", "hydrate", &split_pin(&h)),
+        rendered_split(
             &pattern("frame_stack_re"),
-            &["hydrate", "2", "4100", "106", "4757", "4757", &hist],
+            "hydrate",
+            ["2", "4100", "106", "4757", "4757", &hist]
         ),
         "the `frame stack (…)` line and the rig's probe have drifted",
     );
@@ -1809,7 +2000,7 @@ fn the_rig_reads_the_stack_lines_the_app_actually_writes() {
     // parent cut's line spells `frame ui (stack):` — one substring away from
     // being scraped as one of its own seven, which would read as plausible
     // arithmetic rather than as a null.
-    let parent = super::named_hist_line("frame ui", "stack", &h);
+    let parent = super::named_split_line("frame ui", "stack", &split_pin(&h));
     assert!(
         !parent.contains("frame stack ("),
         "the rig's stack anchor appears in the `frame ui (stack)` line it \
@@ -1839,11 +2030,16 @@ fn the_frame_panes_line_reads_exactly_as_pinned() {
     let mut slots = [0u32; 42];
     slots[3] = 3;
     let expected_hist = slots.map(|c| c.to_string()).join(",");
+    // The `; idle …` half every split line carries. Held as its own binding
+    // so the interact half above stays a literal: a formatter that dropped
+    // the second half, or printed the first one twice, fails on this suffix
+    // and not on a figure that could be mistaken for a rounding change.
+    let (_, idle) = idle_half_pin();
     assert_eq!(
-        super::named_hist_line("frame panes", "content", &h),
+        super::named_split_line("frame panes", "content", &split_pin(&h)),
         format!(
-            "frame panes (content): n=3, sum=300 us, p50=106 us, p90=106 us, \
-             p99=106 us, hist={expected_hist}"
+            "frame panes (content): interact n=3, sum=300 us, p50=106 us, p90=106 us, \
+             p99=106 us, hist={expected_hist}{idle}"
         ),
     );
 }
@@ -1874,7 +2070,14 @@ fn every_panes_phase_is_reported_under_its_own_name() {
     .enumerate()
     {
         for _ in 0..=slot {
-            hist.record(1_000);
+            hist.record(1_000, true);
+        }
+        // A DIFFERENT idle count in every position, so a formatter that
+        // printed one half twice, or crossed the two, cannot read green --
+        // and so the identity holds over BOTH populations rather than only
+        // over the one the family used to record on.
+        for _ in 0..slot + 2 {
+            hist.record(1_000, false);
         }
     }
     let lines = super::frame_panes_lines(&phases);
@@ -1884,7 +2087,8 @@ fn every_panes_phase_is_reported_under_its_own_name() {
     assert_eq!(lines.len(), names.len());
     for (slot, (line, name)) in lines.iter().zip(names).enumerate() {
         assert!(
-            line.starts_with(&format!("frame panes ({name}): n={}, ", slot + 1)),
+            line.starts_with(&format!("frame panes ({name}): interact n={}, ", slot + 1))
+                && line.contains(&format!("; idle n={}, ", slot + 2)),
             "panes cut {slot} reported as {line:?}, which is not {name}'s \
              line carrying {name}'s histogram",
         );
@@ -1905,7 +2109,7 @@ fn every_panes_phase_is_reported_under_its_own_name() {
 fn the_panes_cut_lines_are_not_mistakable_for_their_parents() {
     let mut h = Hist::new();
     h.record(1_000);
-    let parent_cut = super::named_hist_line("frame ui", "panes", &h);
+    let parent_cut = super::named_split_line("frame ui", "panes", &split_pin(&h));
     assert!(
         !parent_cut.starts_with("frame panes ("),
         "the `frame ui (panes)` line {parent_cut:?} reads as one of its own \
@@ -1916,7 +2120,7 @@ fn the_panes_cut_lines_are_not_mistakable_for_their_parents() {
         "the rig's panes anchor appears inside the `frame ui (panes)` line it \
          decomposes: {parent_cut:?}",
     );
-    let segment_line = super::named_hist_line("frame segment", "ui", &h);
+    let segment_line = super::named_split_line("frame segment", "ui", &split_pin(&h));
     assert!(
         !segment_line.starts_with("frame panes ("),
         "the ui segment line {segment_line:?} reads as a panes cut",
@@ -1966,10 +2170,11 @@ fn the_rig_reads_the_panes_lines_the_app_actually_writes() {
     h.record(4_000);
     let hist = counts_string(&h);
     assert_eq!(
-        super::named_hist_line("frame panes", "widget", &h),
-        rendered(
+        super::named_split_line("frame panes", "widget", &split_pin(&h)),
+        rendered_split(
             &pattern("frame_panes_re"),
-            &["widget", "2", "4100", "106", "4757", "4757", &hist],
+            "widget",
+            ["2", "4100", "106", "4757", "4757", &hist]
         ),
         "the `frame panes (…)` line and the rig's probe have drifted",
     );
@@ -2074,15 +2279,20 @@ fn the_rig_reads_the_two_windowable_families_the_app_actually_writes() {
     }
     let hist = counts_string(&h);
 
+    // Both halves, so the seam test faces the whole sentence the app writes:
+    // the idle half is `idle_half_pin`'s, which `rendered_split` expects.
+    let mut pump = Split::from_halves(h, idle_half_pin().0);
+    let _ = &mut pump;
     let segments = crate::frame_ledger::SegmentHists {
-        pump: h,
+        pump,
         ..Default::default()
     };
     assert_eq!(
         super::frame_segment_lines(&segments)[1],
-        rendered(
+        rendered_split(
             &pattern("frame_segment_re"),
-            &["pump", "3", "300", "106", "106", "106", &hist],
+            "pump",
+            ["3", "300", "106", "106", "106", &hist]
         ),
         "the `frame segment (…):` line and the rig's probe have drifted",
     );
@@ -2106,18 +2316,19 @@ fn the_rig_reads_the_two_windowable_families_the_app_actually_writes() {
 #[test]
 fn a_windowable_line_that_drifted_by_one_space_is_not_accepted() {
     let hist = counts_string(&Hist::new());
-    let good = rendered(
+    let good = rendered_split(
         &pattern("frame_segment_re"),
-        &["pre", "0", "0", "none", "none", "none", &hist],
+        "pre",
+        ["0", "0", "none", "none", "none", &hist],
     );
     assert_eq!(
-        super::named_hist_line("frame segment", "pre", &Hist::new()),
+        super::named_split_line("frame segment", "pre", &split_pin(&Hist::new())),
         good,
     );
     let drifted = good.replacen(" us", "  us", 1);
     assert_ne!(drifted, good, "the perturbation perturbed nothing");
     assert_ne!(
-        super::named_hist_line("frame segment", "pre", &Hist::new()),
+        super::named_split_line("frame segment", "pre", &split_pin(&Hist::new())),
         drifted,
         "a line with one extra space compared equal to the real one, so the \
          seam test above cannot fail",
@@ -2420,6 +2631,7 @@ fn the_worst_frame_line_reads_exactly_as_pinned() {
         pre_cuts: [2, 18, 11, 21, 1, 4, 4],
         post_cuts: [0u32; 7],
         dispatch_cuts: [0u32; 7],
+        panes_cuts: [40, 22, 15, 120, 60, 18, 5, 8],
         interact: false,
     };
     assert_eq!(
@@ -2447,6 +2659,15 @@ fn the_worst_frame_line_reads_exactly_as_pinned() {
          the pin below would pin a line whose stack_* columns decompose no \
          frame",
     );
+    assert_eq!(
+        worst.panes_cuts.iter().sum::<u32>(),
+        worst.ui_cuts[6],
+        "the fixture's eight panes cuts do not telescope to its ui_panes, so \
+         the pin below would pin a line whose panes_* columns decompose no \
+         frame -- and these eight telescope EXACTLY, the eighth being the \
+         parent minus the seven, so a mismatch here is the fixture and never \
+         truncation",
+    );
     let boot = crate::frame_ledger::WorstFrame {
         service: 9_513,
         segments: [1, 2, 3, 9_500, 4, 3],
@@ -2455,6 +2676,7 @@ fn the_worst_frame_line_reads_exactly_as_pinned() {
         pre_cuts: [0, 1, 0, 0, 0, 0, 0],
         post_cuts: [0u32; 7],
         dispatch_cuts: [0u32; 7],
+        panes_cuts: [0, 0, 0, 0, 1, 0, 0, 0],
         interact: false,
     };
     assert_eq!(boot.ui_cuts.iter().sum::<u32>(), boot.segments[2]);
@@ -2475,7 +2697,8 @@ fn the_worst_frame_line_reads_exactly_as_pinned() {
          post_wake=0 us, post_poll=0 us, post_repaint=0 us, post_close=0 us, \
          disp_dedupe=0 us, disp_marks=0 us, disp_hydrate=0 us, \
          disp_prepare=0 us, disp_hitmap=0 us, disp_offload=0 us, \
-         disp_residual=0 us, boot: idle, pre=1 us, pump=2 us, \
+         disp_residual=0 us, panes_setup=40 us, panes_panel=22 us, panes_resolve=15 us, panes_widget=120 us, panes_content=60 us, panes_tools=18 us, panes_credit=5 us, panes_residual=8 us, \
+         boot: idle, pre=1 us, pump=2 us, \
          ui=3 us, prepare=9500 us, finish=4 us, post=3 us, ui_poll=0 us, \
          ui_layout=1 us, ui_topbar=0 us, ui_statusbar=0 us, ui_stack=1 us, \
          ui_dialog=0 us, ui_panes=1 us, ui_apply=0 us, ui_chrome=0 us, \
@@ -2487,7 +2710,7 @@ fn the_worst_frame_line_reads_exactly_as_pinned() {
          post_wake=0 us, post_poll=0 us, post_repaint=0 us, post_close=0 us, \
          disp_dedupe=0 us, disp_marks=0 us, disp_hydrate=0 us, \
          disp_prepare=0 us, disp_hitmap=0 us, disp_offload=0 us, \
-         disp_residual=0 us"
+         disp_residual=0 us, panes_setup=0 us, panes_panel=0 us, panes_resolve=0 us, panes_widget=0 us, panes_content=1 us, panes_tools=0 us, panes_credit=0 us, panes_residual=0 us"
     );
 }
 
@@ -2503,6 +2726,7 @@ fn the_worst_frame_line_names_the_interact_family_too() {
         pre_cuts: [10, 30, 20, 25, 5, 4, 6],
         post_cuts: [0u32; 7],
         dispatch_cuts: [0u32; 7],
+        panes_cuts: [0; 8],
         interact: true,
     };
     assert!(
@@ -2525,8 +2749,10 @@ fn the_worst_frame_line_says_absence_rather_than_a_zero_frame() {
         pre_cuts: [0, 1, 0, 0, 0, 0, 0],
         post_cuts: [0u32; 7],
         dispatch_cuts: [0u32; 7],
+        panes_cuts: [0, 0, 0, 0, 1, 0, 0, 0],
         interact: false,
     };
+    assert_eq!(boot.panes_cuts.iter().sum::<u32>(), boot.ui_cuts[6]);
     let line = super::frame_worst_line(None, Some(boot));
     assert!(
         !line.contains("service=0 us"),
@@ -2545,7 +2771,9 @@ fn the_worst_frame_line_says_absence_rather_than_a_zero_frame() {
          post_wake=0 us, post_poll=0 us, post_repaint=0 us, post_close=0 us, \
          disp_dedupe=0 us, disp_marks=0 us, disp_hydrate=0 us, \
          disp_prepare=0 us, disp_hitmap=0 us, disp_offload=0 us, \
-         disp_residual=0 us",
+         disp_residual=0 us, panes_setup=0 us, panes_panel=0 us, \
+         panes_resolve=0 us, panes_widget=0 us, panes_content=1 us, \
+         panes_tools=0 us, panes_credit=0 us, panes_residual=0 us",
         "an empty period must still carry the session maximum, or a console \
          ring that dropped the bad tick reads as a run with no bad frame",
     );
@@ -2569,6 +2797,7 @@ fn the_worst_frame_line_is_not_mistakable_for_a_segment_line() {
         pre_cuts: [10, 30, 20, 25, 5, 4, 6],
         post_cuts: [0u32; 7],
         dispatch_cuts: [0u32; 7],
+        panes_cuts: [0; 8],
         interact: true,
     };
     let worst_line = super::frame_worst_line(Some(worst), None);
@@ -2582,8 +2811,8 @@ fn the_worst_frame_line_is_not_mistakable_for_a_segment_line() {
          add one frame to a distribution that already contains it: \
          {worst_line:?}",
     );
-    let mut h = Hist::new();
-    h.record(1_000);
+    let mut h = squallar_device_profile::hist::Split::default();
+    h.record(1_000, true);
     for line in super::frame_segment_lines(&crate::frame_ledger::SegmentHists::default())
         .into_iter()
         .chain([super::frame_segments_line(
@@ -2620,7 +2849,14 @@ fn every_dispatch_cut_is_reported_under_its_own_name() {
     .enumerate()
     {
         for _ in 0..=slot {
-            hist.record(1_000);
+            hist.record(1_000, true);
+        }
+        // A DIFFERENT idle count in every position, so a formatter that
+        // printed one half twice, or crossed the two, cannot read green --
+        // and so the identity holds over BOTH populations rather than only
+        // over the one the family used to record on.
+        for _ in 0..slot + 2 {
+            hist.record(1_000, false);
         }
     }
     let lines = super::frame_dispatch_lines(&cuts);
@@ -2630,7 +2866,10 @@ fn every_dispatch_cut_is_reported_under_its_own_name() {
     assert_eq!(lines.len(), names.len());
     for (slot, (line, name)) in lines.iter().zip(names).enumerate() {
         assert!(
-            line.starts_with(&format!("frame dispatch ({name}): n={}, ", slot + 1)),
+            line.starts_with(&format!(
+                "frame dispatch ({name}): interact n={}, ",
+                slot + 1
+            )) && line.contains(&format!("; idle n={}, ", slot + 2)),
             "dispatch cut {slot} reported as {line:?}, which is not {name}'s \
              line carrying {name}'s histogram",
         );
@@ -2647,7 +2886,7 @@ fn every_dispatch_cut_is_reported_under_its_own_name() {
 fn the_dispatch_cuts_are_readable_as_neither_post_cuts_nor_segments() {
     let cuts = crate::frame_ledger::DispatchHists::default();
     let mut phases = crate::frame_ledger::PostHists::default();
-    phases.dispatch.record(1_000);
+    phases.dispatch.record(1_000, true);
 
     for line in &super::frame_dispatch_lines(&cuts) {
         assert!(
@@ -2708,5 +2947,121 @@ fn the_demand_ranked_row_is_absent_without_evictions_and_says_zero_with_them() {
         super::demand_ranked_eviction_line((0, 0), (0, 0), (7, 2)).is_some(),
         "the denominator is the SUM across the three stores, so one silent \
          store cannot suppress another's reading",
+    );
+}
+
+/// The `frame service (presented):` sentence, pinned as a literal — and its
+/// `under_4000_us` pinned against a fixture that straddles the bar.
+///
+/// **Three samples, one over the bar and two under, and the two under are on
+/// either side of the interact/idle seam.** A line that reported only one
+/// half, or that counted the over-bar frame, reads a different number here.
+/// 100 µs sits in slot 3 (upper edge 106); 4 000 µs sits in slot 25 — bin 24,
+/// which OPENS at the bar — so it is not under it and every percentile of
+/// this fixture answers that slot's 4 757 µs upper edge.
+#[test]
+fn the_presented_service_line_reads_exactly_as_pinned() {
+    let mut interact = Hist::new();
+    interact.record(100);
+    interact.record(4_000);
+    let mut idle = Hist::new();
+    idle.record(100);
+    let mut slots = [0u32; 42];
+    slots[3] = 2;
+    slots[25] = 1;
+    let expected_hist = slots.map(|c| c.to_string()).join(",");
+    assert_eq!(
+        super::frame_service_presented_line(&interact, &idle),
+        format!(
+            "frame service (presented): n=3, under_4000_us=2, p50=106 us, \
+             p90=4757 us, p99=4757 us, hist={expected_hist}"
+        ),
+    );
+}
+
+/// **The bar figure is exact, and 4 000 µs is NOT under the bar.**
+///
+/// The one thing `under_4000_us` promises that a percentile cannot is that it
+/// is a count of whole slots rather than an interpolation, and the one way to
+/// get it wrong by one is to include the frame that lands exactly on the edge.
+/// A frame of 4 000 µs opens bin 24; a frame of 3 999 µs closes bin 23. The
+/// two are one microsecond apart and fall on opposite sides of this figure,
+/// which is why the line's own doc spells the word *strictly*.
+#[test]
+fn the_bar_count_excludes_the_frame_that_lands_on_the_edge() {
+    let mut under = Hist::new();
+    under.record(3_999);
+    let mut on_edge = Hist::new();
+    on_edge.record(4_000);
+    assert!(
+        super::frame_service_presented_line(&under, &Hist::new()).contains("n=1, under_4000_us=1,"),
+        "a 3 999 us frame is not counted under the 4 000 us bar",
+    );
+    assert!(
+        super::frame_service_presented_line(&on_edge, &Hist::new())
+            .contains("n=1, under_4000_us=0,"),
+        "a frame of exactly 4 000 us was counted as UNDER the bar, so this \
+         figure is off by every frame that lands on the edge and the word \
+         `strictly` in its doc is false",
+    );
+}
+
+/// **The presented line is the union of the two beside it, and never their
+/// concatenation.**
+///
+/// `frame service (presented)` is derived, so the failure it can have that a
+/// recorded line cannot is disagreeing with its own parts. Held on the counts
+/// and on the exact under-bar figure at once: two histograms whose samples
+/// land in different slots, so a line that dropped a half, doubled one, or
+/// swapped the pair reads a different `n` AND a different `under_4000_us`.
+#[test]
+fn the_presented_service_line_is_the_exact_union_of_interact_and_idle() {
+    let mut interact = Hist::new();
+    for _ in 0..5 {
+        interact.record(100);
+    }
+    interact.record(9_000);
+    let mut idle = Hist::new();
+    for _ in 0..3 {
+        idle.record(2_000);
+    }
+    idle.record(30_000);
+    let line = super::frame_service_presented_line(&interact, &idle);
+    assert!(
+        line.contains("n=10, under_4000_us=8,"),
+        "the presented line is not the union of its two halves — 6 interact \
+         and 4 idle frames, of which 5 + 3 are under the bar: {line:?}",
+    );
+    assert_ne!(
+        line.replace("(presented)", "(interact)"),
+        super::frame_service_interact_line(&interact),
+        "the presented line reads as its interact half alone, so nothing here \
+         would notice the idle population going missing",
+    );
+}
+
+/// **The rig reads the presented line the app actually writes.**
+///
+/// The bar's own line is the last family that may be absent from an
+/// artifact — an unclaimed family is invisible to every leg, and this one
+/// carries the only exact bar figure the instrument has.
+#[test]
+fn the_rig_reads_the_presented_service_line_the_app_writes() {
+    let mut interact = Hist::new();
+    interact.record(100);
+    interact.record(4_000);
+    let mut idle = Hist::new();
+    idle.record(100);
+    let mut slots = [0u32; 42];
+    slots[3] = 2;
+    slots[25] = 1;
+    let hist = slots.map(|c| c.to_string()).join(",");
+    assert_eq!(
+        super::frame_service_presented_line(&interact, &idle),
+        rendered(
+            &pattern("svc_presented_re"),
+            &["3", "2", "106", "4757", "4757", &hist],
+        ),
+        "the `frame service (presented):` line and the rig's probe have drifted",
     );
 }

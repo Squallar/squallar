@@ -199,8 +199,14 @@ fn embedded_blocks(driver: &str) -> Vec<Block> {
 /// the driver hands back, and a new group spelling shows up there as a red
 /// that names the key.
 fn sample_matching(pattern: &str) -> String {
-    const SPELLINGS: [(&str, &str); 6] = [
+    const SPELLINGS: [(&str, &str); 7] = [
         (r"(\d+|none|over)", "7"),
+        // `frame service (presented)`'s exact under-bar count. `unaligned` is
+        // unreachable while the bar sits on a bin edge and is printed rather
+        // than panicked, because a telemetry line must never be able to take
+        // the app down -- so the alternation is real and the stub has to
+        // spell it.
+        (r"(\d+|unaligned)", "7"),
         (r"(\d+)", "7"),
         (r"([0-9,]+)", "1,2,3"),
         (r"([a-z0-9-]+)", "x"),
@@ -693,6 +699,11 @@ fn the_worst_frame_scrape_reads_back_the_line_the_app_formats() {
         // lands here, and the boot half's own thirty columns move with them.
         post_cuts: [7, 240, 3, 19, 5, 11, 8],
         dispatch_cuts: [4, 9, 17, 180, 12, 15, 3],
+        // Eight DISTINCT panes cuts telescoping EXACTLY to this frame's own
+        // `ui_panes` of 812 -- the SEVENTH ui cut, opened up. These sit last
+        // in both halves of the positional regex now, so every upstream
+        // miscount lands here.
+        panes_cuts: [90, 55, 33, 480, 120, 22, 7, 5],
         interact: true,
     };
     let boot = crate::frame_ledger::WorstFrame {
@@ -703,6 +714,7 @@ fn the_worst_frame_scrape_reads_back_the_line_the_app_formats() {
         pre_cuts: [4, 31, 12, 20, 6, 9, 18],
         post_cuts: [6, 300, 2, 12, 4, 9, 5],
         dispatch_cuts: [3, 7, 21, 240, 14, 13, 2],
+        panes_cuts: [5, 3, 2, 34, 9, 4, 2, 2],
         interact: false,
     };
     let payload = serde_json::to_string(&serde_json::json!({
@@ -886,6 +898,27 @@ console.log(JSON.stringify({{ threw: threw,
     assert_eq!(got[0]["boot_post_dispatch"].as_u64(), Some(300));
     assert_eq!(got[0]["boot_disp_prepare"].as_u64(), Some(240));
     assert_eq!(got[0]["boot_disp_residual"].as_u64(), Some(2));
+    // The eight `panes` columns, which sit LAST in both halves: the one place
+    // a miscount anywhere upstream lands, and the reason they are asserted
+    // rather than trusted. They telescope to `ui_panes` exactly -- the eighth
+    // is the parent minus the seven -- so the sum is a gate and not a
+    // truncation window.
+    assert_eq!(got[0]["panes_setup"].as_u64(), Some(90));
+    assert_eq!(got[0]["panes_widget"].as_u64(), Some(480));
+    assert_eq!(got[0]["panes_residual"].as_u64(), Some(5));
+    assert_eq!(
+        [
+            "setup", "panel", "resolve", "widget", "content", "tools", "credit", "residual"
+        ]
+        .iter()
+        .map(|c| got[0][format!("panes_{c}")].as_u64().unwrap_or_default())
+        .sum::<u64>(),
+        got[0]["ui_panes"].as_u64().unwrap_or_default(),
+        "the scraped panes cuts do not sum to the scraped ui_panes, so the \
+         rig read the eight out of the wrong capture groups",
+    );
+    assert_eq!(got[0]["boot_panes_widget"].as_u64(), Some(34));
+    assert_eq!(got[0]["boot_panes_residual"].as_u64(), Some(2));
     // The absence spelling: a period in which nothing presented still carries
     // the since-boot maximum and its stamp.
     assert_eq!(got[1]["t"].as_u64(), Some(4201), "the wrong console stamp");
@@ -903,6 +936,8 @@ console.log(JSON.stringify({{ threw: threw,
     assert_eq!(got[1]["boot_post_dispatch"].as_u64(), Some(300));
     assert_eq!(got[1]["boot_disp_prepare"].as_u64(), Some(240));
     assert_eq!(got[1]["boot_disp_residual"].as_u64(), Some(2));
+    assert_eq!(got[1]["boot_panes_widget"].as_u64(), Some(34));
+    assert_eq!(got[1]["boot_panes_residual"].as_u64(), Some(2));
 
     // **The group count is read off the pattern, not restated in prose.**
     // Two positional blocks were widened here and the comment above has been
@@ -916,10 +951,10 @@ console.log(JSON.stringify({{ threw: threw,
         .0;
     assert_eq!(
         worst_re.matches("(\\d+)").count() + worst_re.matches("([a-z0-9-]+)").count(),
-        90,
-        "the worst-frame pattern no longer has the 90 groups the scrape above \
-         indexes by number, so every field after the change reads the wrong \
-         column",
+        106,
+        "the worst-frame pattern no longer has the 106 groups the scrape \
+         above indexes by number, so every field after the change reads the \
+         wrong column",
     );
 }
 

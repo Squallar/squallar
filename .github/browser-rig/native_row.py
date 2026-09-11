@@ -197,44 +197,94 @@ PROBE_NAMES = (
 # seed probe below, checks every other `drive.py` probe carrying that tail
 # agrees, and generalises the prefix into a capture. The families a log
 # carries are then whatever lines are present.
-NAMED_HIST_SEED = "frame_segment_re"
+# The SPLIT shape's seed. Since the 2026-09-10 ruling every cut family carries
+# both populations on one line (`interact …; idle …`), and this is the seed for
+# that shape.
+NAMED_SPLIT_SEED = "frame_segment_re"
+# The single-histogram shape's seed. Two families are still written this way
+# and each is right to be: `frame finish (*)` already records over EVERY
+# presented frame -- there is nothing there to split that is not already both
+# -- and `frame service less present (interact|idle)` carries the population in
+# its NAME, so it is the same split spelled as two lines. Two shapes, both
+# checked, and no family may be on neither.
+NAMED_HIST_SEED = "frame_finish_re"
 NAMED_HIST_NAME_GROUP = r"\(([a-z0-9-]+)\): "
 NAMED_HIST_PREFIX = r"(?<![A-Za-z0-9_:.\-])([a-z]+(?: [a-z]+)*) "
 
 
-def named_hist_pattern(source=None):
-    """The one per-family regex, derived from `drive.py`'s.
-
-    Groups: prefix, name, n, sum, p50, p90, p99, hist. Refuses when the seed
-    lost its name group or when two of `drive.py`'s per-family probes no
-    longer share a tail -- the shape stopped being one, and a row windowed
-    on the wrong shape would print empty families as absences.
-    """
-    text = source if source is not None else _read(DRIVE_PY)
-    seed = drive_pattern(NAMED_HIST_SEED, text)
-    at = seed.find(NAMED_HIST_NAME_GROUP)
+def _named_tail(seed, text):
+    """The per-family tail of `drive.py`'s `seed` probe: everything after its
+    `(<name>): ` group. Refuses when the seed lost that group, or when the tail
+    no longer carries the two fields every windowed figure here differences."""
+    pat = drive_pattern(seed, text)
+    at = pat.find(NAMED_HIST_NAME_GROUP)
     if at < 0:
         raise SystemExit(
             "drive.py's `%s` no longer carries a `(<name>): ` group; the "
-            "per-family line shape cannot be read out of it" % NAMED_HIST_SEED
+            "per-family line shape cannot be read out of it" % seed
         )
-    tail = seed[at + len(NAMED_HIST_NAME_GROUP):]
+    tail = pat[at + len(NAMED_HIST_NAME_GROUP):]
     for needed in (r"n=(\d+), sum=(\d+) us", r"hist=([0-9,]+)"):
         if needed not in tail:
             raise SystemExit(
                 "drive.py's `%s` no longer carries `%s`; every windowed "
-                "per-family figure here is a difference of it"
-                % (NAMED_HIST_SEED, needed)
+                "per-family figure here is a difference of it" % (seed, needed)
             )
+    return tail
+
+
+def named_hist_patterns(source=None):
+    """The per-family regexes, derived from `drive.py`'s, one per SHAPE.
+
+    Returns `[(kind, compiled)]` with `kind` in `("split", "hist")`:
+
+    * **split** — `<prefix> (<name>): interact n=…, sum=…, …, hist=…;
+      idle n=…, sum=…, …, hist=…`. Groups: prefix, name, then the six interact
+      figures, then the six idle ones. Every cut family, since the 2026-09-10
+      ruling put the 4 ms bar over every presented frame.
+    * **hist** — `<prefix> (<name>): n=…, sum=…, …, hist=…`. Groups: prefix,
+      name, then six. `frame finish (*)`, already over every presented frame,
+      and `frame service less present (interact|idle)`, whose NAME is the
+      population.
+
+    Refuses when a `drive.py` per-family probe carries neither tail behind a
+    `(<name>): ` group. **That refusal is the gate**: a third shape, or a
+    silently reshaped family, would otherwise reach this row as an ABSENCE —
+    which reads exactly like an arm that produced no samples, and this
+    campaign has twice read the second when it had the first.
+    """
+    text = source if source is not None else _read(DRIVE_PY)
+    split_tail = _named_tail(NAMED_SPLIT_SEED, text)
+    hist_tail = _named_tail(NAMED_HIST_SEED, text)
+    if split_tail == hist_tail or not split_tail.endswith(hist_tail):
+        raise SystemExit(
+            "drive.py's two per-family shapes are no longer one a widening of "
+            "the other; `native_row.py` reads them by tail and cannot tell "
+            "them apart"
+        )
     for m in re.finditer(r"var ([a-z_]+_re) = /(.*)/;", text):
         body = m.group(2)
-        if body.endswith(tail) and not body[:-len(tail)].endswith(NAMED_HIST_NAME_GROUP):
-            raise SystemExit(
-                "drive.py's `%s` carries the per-family tail behind something "
-                "other than a `(<name>): ` group; the shape is no longer one "
-                "and this file cannot read it as one" % m.group(1)
-            )
-    return re.compile(NAMED_HIST_PREFIX + NAMED_HIST_NAME_GROUP + tail)
+        for tail in (split_tail, hist_tail):
+            if not body.endswith(tail):
+                continue
+            if body[:-len(tail)].endswith(NAMED_HIST_NAME_GROUP):
+                break
+        else:
+            if body.endswith(hist_tail):
+                raise SystemExit(
+                    "drive.py's `%s` carries a per-family tail behind "
+                    "something other than a `(<name>): ` group; this file "
+                    "reads families by that group and cannot read it as one"
+                    % m.group(1)
+                )
+    # Longest tail first: the split tail ENDS WITH the single-histogram one
+    # (the idle half is spelled the same way), so a split line matched by the
+    # narrow pattern would hand back the idle half wearing the whole family's
+    # name.
+    return [
+        ("split", re.compile(NAMED_HIST_PREFIX + NAMED_HIST_NAME_GROUP + split_tail)),
+        ("hist", re.compile(NAMED_HIST_PREFIX + NAMED_HIST_NAME_GROUP + hist_tail)),
+    ]
 
 
 def named_key(prefix, name):
@@ -247,7 +297,7 @@ def named_key(prefix, name):
 def compile_probes(source=None):
     text = source if source is not None else _read(DRIVE_PY)
     out = {n: re.compile(drive_pattern(n, text)) for n in PROBE_NAMES}
-    out["named_hist"] = named_hist_pattern(text)
+    out["named_hist"] = named_hist_patterns(text)
     return out
 
 
@@ -655,21 +705,32 @@ def scrape(lines, probes):
         # The per-family lines, whichever the app wrote: each carries the
         # running `sum` the windowed mean is exact from. A family nobody
         # listed is a family, not a dropped line.
-        m = probes["named_hist"].search(line)
-        if m:
+        for kind, probe in probes["named_hist"]:
+            m = probe.search(line)
+            if not m:
+                continue
             g = m.groups()
-            key = named_key(g[0], g[1])
-            seen = out["named_prefixes"].setdefault(key, g[0])
-            if seen != g[0]:
-                raise ValueError(
-                    "two per-family lines, `%s` and `%s`, share the key `%s`; "
-                    "the app grew a prefix this keying cannot tell apart"
-                    % (seen, g[0], key)
+            # One line, one key per POPULATION. A split family's two halves
+            # are disjoint over presented frames, so they stay two keys --
+            # `segment:pre-interact` and `segment:pre-idle` -- exactly as
+            # `drive.py`'s `push_split` keys them. They are added only into
+            # `presented`, and never into anything else.
+            halves = ([("-interact", 2), ("-idle", 8)] if kind == "split"
+                      else [("", 2)])
+            for suffix, at in halves:
+                key = named_key(g[0], g[1] + suffix)
+                seen = out["named_prefixes"].setdefault(key, g[0])
+                if seen != g[0]:
+                    raise ValueError(
+                        "two per-family lines, `%s` and `%s`, share the key "
+                        "`%s`; the app grew a prefix this keying cannot tell "
+                        "apart" % (seen, g[0], key)
+                    )
+                out["named"].setdefault(key, []).append(
+                    Reading(idx, int(g[at]), g[at + 2], g[at + 3], g[at + 4],
+                            parse_hist(g[at + 5]), sum=int(g[at + 1]))
                 )
-            out["named"].setdefault(key, []).append(
-                Reading(idx, int(g[2]), g[4], g[5], g[6], parse_hist(g[7]),
-                        sum=int(g[3]))
-            )
+            break
         m = probes["gesture_begin_re"].search(line)
         if m:
             out["begins"].append((idx, m.group(1)))
@@ -4485,21 +4546,42 @@ class FamilyWindowTests(unittest.TestCase):
         the `sum`-carrying lines and nothing else -- `frame service
         (interact)` and `frame segments (interact, p99 us)` do not match it,
         so interact is windowed once, under its own name."""
-        pat = self.probes["named_hist"]
+        pats = self.probes["named_hist"]
+        kinds = [k for k, _ in pats]
+        self.assertEqual(kinds, ["split", "hist"],
+                         "the two per-family shapes are no longer read "
+                         "longest-tail first, so a split line matches the "
+                         "narrow pattern and hands back its IDLE half under "
+                         "the whole family's name")
         hist = ",".join(["0"] * SLOTS)
-        self.assertIsNone(pat.search(
-            "frame service (interact): n=7, p50=100 us, p90=200 us, "
-            "p99=300 us, hist=" + hist))
-        self.assertIsNone(pat.search(
-            "frame segments (interact, p99 us): pre=1, pump=1, ui=1, "
-            "prepare=1, finish=1, post=1; acquire n=1, p50=1 us, p99=1 us"))
-        # And a family drive.py spells no probe for, in the app's shape.
-        m = pat.search("[2026-09-02T00:00:00Z INFO  squallar_app::app_render] "
-                       "frame ui (chrome): n=12, sum=340 us, p50=63 us, "
-                       "p90=63 us, p99=63 us, hist=" + hist)
+        for _, pat in pats:
+            self.assertIsNone(pat.search(
+                "frame service (interact): n=7, p50=100 us, p90=200 us, "
+                "p99=300 us, hist=" + hist))
+            self.assertIsNone(pat.search(
+                "frame segments (interact, p99 us): pre=1, pump=1, ui=1, "
+                "prepare=1, finish=1, post=1; acquire n=1, p50=1 us, p99=1 us"))
+        # A SPLIT family drive.py spells no probe for, in the app's shape.
+        # The two halves are read from the ONE line, in order.
+        split_pat = pats[0][1]
+        m = split_pat.search(
+            "[2026-09-02T00:00:00Z INFO  squallar_app::app_render] "
+            "frame ui (chrome): interact n=12, sum=340 us, p50=63 us, "
+            "p90=63 us, p99=63 us, hist=" + hist
+            + "; idle n=5, sum=90 us, p50=63 us, p90=63 us, p99=63 us, hist="
+            + hist)
         self.assertIsNotNone(m)
-        self.assertEqual((m.group(1), m.group(2), m.group(3), m.group(4)),
-                         ("frame ui", "chrome", "12", "340"))
+        self.assertEqual(
+            (m.group(1), m.group(2), m.group(3), m.group(4), m.group(9),
+             m.group(10)),
+            ("frame ui", "chrome", "12", "340", "5", "90"))
+        # The single-histogram shape, which is `frame finish (*)`'s and is
+        # PRESENTED -- both populations already, nothing to split.
+        hist_pat = pats[1][1]
+        m = hist_pat.search("frame finish (draw): n=12, sum=340 us, p50=63 us, "
+                            "p90=63 us, p99=63 us, hist=" + hist)
+        self.assertIsNotNone(m)
+        self.assertEqual((m.group(1), m.group(2)), ("frame finish", "draw"))
         self.assertFalse(any(k.startswith("interact") or k.startswith("service")
                              for k in self.row["named_families"]))
 
@@ -4509,20 +4591,22 @@ class FamilyWindowTests(unittest.TestCase):
         tail must put it behind a name group. A drive.py whose seed lost its
         `sum=` or whose siblings disagree is refused, not read as empty."""
         real = _read(DRIVE_PY)
-        self.assertIsNotNone(named_hist_pattern(real))
-        seed_line = next(l for l in real.splitlines()
-                         if l.startswith("var %s = /" % NAMED_HIST_SEED))
-        no_sum = real.replace(seed_line, seed_line.replace(r"sum=(\d+) us, ", ""))
-        self.assertNotEqual(no_sum, real)
-        with self.assertRaises(SystemExit):
-            named_hist_pattern(no_sum)
+        self.assertEqual(len(named_hist_patterns(real)), 2)
+        for seed in (NAMED_SPLIT_SEED, NAMED_HIST_SEED):
+            seed_line = next(l for l in real.splitlines()
+                             if l.startswith("var %s = /" % seed))
+            no_sum = real.replace(
+                seed_line, seed_line.replace(r"sum=(\d+) us, ", "", 1))
+            self.assertNotEqual(no_sum, real, seed)
+            with self.assertRaises(SystemExit):
+                named_hist_patterns(no_sum)
         post_line = next(l for l in real.splitlines()
                          if l.startswith("var frame_post_re = /"))
         split = real.replace(post_line, post_line.replace(
             r"frame post \(([a-z0-9-]+)\): ", "frame post [a-z]+: "))
         self.assertNotEqual(split, real)
         with self.assertRaises(SystemExit):
-            named_hist_pattern(split)
+            named_hist_patterns(split)
 
 
 class SharedFormatTests(unittest.TestCase):

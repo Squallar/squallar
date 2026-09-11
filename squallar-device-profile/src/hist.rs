@@ -135,6 +135,69 @@ impl Hist {
         self.sum_micros
     }
 
+    /// The histogram of the **union** of two DISJOINT populations recorded on
+    /// this same bin geometry: slot-wise counts added, exact sums added.
+    ///
+    /// [`Hist::diff`]'s inverse, and it is exact for the same reason `diff`
+    /// is: the bins are a compile-time shape, so two recorders' slot `k` is
+    /// the same half-open interval, and a count is a count. Nothing is
+    /// interpolated and no percentile is averaged — the result is the
+    /// histogram the two populations' samples would have produced had one
+    /// recorder seen all of them.
+    ///
+    /// # Only for populations that share no sample
+    ///
+    /// **The caller owns disjointness; this type cannot check it.** The one
+    /// use it exists for is a frame family recorded as `interact` XOR `idle`,
+    /// where every presented frame lands in exactly one of the two and
+    /// `plus` is therefore the `presented` population exactly. Adding a
+    /// family to its own parent, or a cut to the span it decomposes, produces
+    /// a number that describes no population at all — see
+    /// `squallar-app`'s `frame_ledger` for the families this workspace keeps
+    /// disjoint on purpose.
+    ///
+    /// Counts saturate, as [`Hist::record`]'s do.
+    pub fn plus(&self, other: &Hist) -> Hist {
+        let mut out = Hist::new();
+        for (slot, (a, b)) in self.counts.iter().zip(other.counts.iter()).enumerate() {
+            out.counts[slot] = a.saturating_add(*b);
+        }
+        out.sum_micros = self.sum_micros.saturating_add(other.sum_micros);
+        out
+    }
+
+    /// How many samples fell **strictly below** `micros`, exactly — or `None`
+    /// when `micros` is not one of this geometry's bin edges.
+    ///
+    /// # Why the exactness is enforced rather than documented
+    ///
+    /// Every other figure this type answers about a threshold is quantized:
+    /// [`Hist::percentile_upper_micros`] returns a bin EDGE and is a lower
+    /// bound on the true quantile. A *count* either side of a bin boundary is
+    /// not quantized at all — it is the sum of whole slots — but only when
+    /// the boundary IS a boundary. Asked about 3 800 µs, a histogram can
+    /// answer only "somewhere between slot 24's and slot 25's cumulative
+    /// count", and a method that silently picked one of those would hand back
+    /// an estimate wearing an exact figure's clothes.
+    ///
+    /// So the threshold must land on an edge, and the answer is then the
+    /// running count of slots `0..=k`, where slot `k + 1` is the bin that
+    /// OPENS at `micros`. **The 4 ms responsiveness bar is edge 24**
+    /// (`62 500 × 2^6` ns = 4 000 000 ns), which is why this method exists:
+    /// the share under the bar is the one bar figure that is not an estimate.
+    ///
+    /// Note the word: *strictly* below. A sample of exactly `micros` opens the
+    /// next bin and is NOT counted — with whole-microsecond samples that makes
+    /// this "at or under `micros - 1` µs", and a caller quoting "at or under
+    /// 4 ms" off it is off by whatever landed on 4 000 µs exactly.
+    pub fn count_strictly_under(&self, micros: u32) -> Option<u64> {
+        let ns = u64::from(micros) * 1_000;
+        let edge = (0..=GEOMETRIC_BINS).find(|&i| edge_ns(i) == ns)?;
+        // Slot 0 is the under-floor clamp and geometric bin `k` is slot
+        // `k + 1`, so the samples below edge `k` are slots `0..=k`.
+        Some(self.counts[..=edge].iter().map(|&c| u64::from(c)).sum())
+    }
+
     /// The **exact** arithmetic mean in whole microseconds (truncated), or
     /// `None` on an empty histogram.
     ///
@@ -188,6 +251,125 @@ impl Hist {
             }
         }
         unreachable!("total() counted a sample the walk did not reach");
+    }
+}
+
+/// One family's samples kept as the two DISJOINT populations every presented
+/// frame falls into: `interact` XOR `idle`.
+///
+/// # Why every cut family is a pair, and what that fixed
+///
+/// The user ruling of 2026-09-10 moved the 4 ms responsiveness bar from
+/// *frames carrying a pointer event* to **every presented frame**, on the
+/// measurement that 60–64 % of the worst frames on the Mac arms carry
+/// `family=idle`. Before it, every histogram in `squallar-app`'s
+/// `frame_ledger` except `FinishHists` and the two `service` pairs recorded
+/// inside `FrameLedger::finalize`'s `if interacted` arm, so the tree could
+/// not state a single per-segment or per-cut figure over the population the
+/// bar is now about.
+///
+/// This type is the shape that file's `service_interact` and `service_idle`
+/// have always had, generalised to the other sixty-six histograms. It is deliberately **not** an `interact` histogram beside an
+/// `all-frames` one: two disjoint populations sum EXACTLY into their union
+/// ([`Hist::plus`] — the bins are a compile-time shape, so a count is a
+/// count), which
+///
+/// * makes `presented` derivable and exact rather than recorded, so an
+///   interact frame does ONE bin search per family here and not two;
+/// * leaves `interact` recorded verbatim, so every figure this campaign
+///   published under the old denominator is still readable and still means
+///   what it meant, instead of being silently redefined; and
+/// * makes `idle` — the population that carried the spikes nothing could
+///   attribute — a first-class reading rather than a subtraction.
+///
+/// The reverse pairing (`interact` beside `presented`) stores the same two
+/// histograms and answers the same three questions, and costs an interact
+/// frame a second bin search per family to do it. It lost on that.
+///
+/// # Denominators, which are the whole point of this type
+///
+/// **`interact` and `idle` are never one number.** They are added only by
+/// [`Split::presented`], which is their union and is named for it. Neither is
+/// ever added to a parent span, to a sibling cut, or to the other family's
+/// PARENT — the rules each family's own doc in `squallar-app`'s
+/// `frame_ledger` states still hold inside each half.
+///
+/// # Cost
+///
+/// **Zero new clock reads**: the stamps the frame ledger folds were already
+/// taken on every presented frame; only the `record` calls left the interact
+/// arm. Two `Hist`s is 352 bytes per cut, so the sixty-six pairs cost
+/// **11 616 bytes** over the whole ledger — see `frame_ledger`'s module doc
+/// for the bin-search count, which is unchanged on an interact frame and
+/// rises on an idle one to match it: 12 to 71, a 1.80x rise over a leg
+/// measured at 46.5 % interact frames.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Split {
+    interact: Hist,
+    idle: Hist,
+}
+
+impl Split {
+    /// File one presented frame's sample under the population it belongs to.
+    /// Exactly one of the two is written, which is what makes
+    /// [`Split::presented`] their exact union.
+    pub fn record(&mut self, micros: u32, interacted: bool) {
+        if interacted {
+            self.interact.record(micros);
+        } else {
+            self.idle.record(micros);
+        }
+    }
+
+    /// The frames whose egui raw input carried at least one
+    /// pointer/touch/wheel/zoom event. **This is the population every figure
+    /// this campaign published before 2026-09-10 was measured over**, recorded
+    /// unchanged, so a reading either side of that date is comparable.
+    pub fn interact(&self) -> &Hist {
+        &self.interact
+    }
+
+    /// The presented frames that carried none — the frames that PAY for a
+    /// click, boot among them, and where the largest single stalls this
+    /// campaign has recorded live.
+    pub fn idle(&self) -> &Hist {
+        &self.idle
+    }
+
+    /// Both, as one histogram: **every presented frame**, which is the
+    /// denominator the 4 ms bar is now stated over.
+    ///
+    /// Exact, not estimated — see [`Hist::plus`]. Computed on demand at
+    /// telemetry time (42 `u32` adds), never recorded, so it costs the frame
+    /// thread nothing per frame and cannot drift from the two halves it is
+    /// made of.
+    pub fn presented(&self) -> Hist {
+        self.interact.plus(&self.idle)
+    }
+
+    /// A pair assembled from two halves recorded separately — the
+    /// composition [`Split::interact`] and [`Split::idle`] take apart.
+    ///
+    /// **Not a frame path.** The frame thread files a sample through
+    /// [`Split::record`], which is what keeps the two halves disjoint by
+    /// construction. This exists for callers that already hold the two
+    /// populations as histograms: a test pinning a sentence, or a reader
+    /// rebuilding a pair off two scraped readings. Disjointness is the
+    /// caller's, exactly as it is for [`Hist::plus`].
+    pub const fn from_halves(interact: Hist, idle: Hist) -> Self {
+        Self { interact, idle }
+    }
+
+    /// `(interact, idle)` sample counts — the pair a denominator claim has to
+    /// be checked against.
+    ///
+    /// **Not one number, on purpose.** Two families can agree exactly on the
+    /// union while disagreeing on each half — one records an idle frame the
+    /// other filed as interact, and the totals still match. A test that
+    /// asserts "this family records on exactly the frames its parent does"
+    /// is a claim about the frame SET, and only the pair can carry it.
+    pub fn totals(&self) -> (u64, u64) {
+        (self.interact.total(), self.idle.total())
     }
 }
 
