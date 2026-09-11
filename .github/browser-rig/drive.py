@@ -2757,12 +2757,15 @@ var attached = [], different = [], off_frame = [], rayon = [];
 var by_kind = {};
 var transport = null;
 var action_budget = null;
+var ingest_budget = null;
 var uploads_all = [];
 var rasters_all = [];
 var cmdstream_all = [];
 var cmdstream_unparsed = null;
 var action_budget_all = [];
 var action_budget_unparsed = null;
+var ingest_budget_all = [];
+var ingest_budget_unparsed = null;
 var archive_spill = null;
 var payload_share = null;
 var payload_share_all = [];
@@ -2830,6 +2833,46 @@ var uploads_re = /texture uploads: (\d+) deltas, (\d+) B to the GPU, (\d+) B who
 // not separable from this reader -- reported as `null`, never as a zero.
 var action_budget_re = /action budget: (\d+) handled, (\d+) bites, (\d+) deferred, (\d+) coalesced, (\d+) deepest/;
 var action_budget_loose_re = /action budget: \d+ handled/;
+// `ingest budget:` is `action budget:`' sibling one phase over -- the FIRES
+// COUNTER for the `PumpPhase::Ingest` arrival allowance -- and it is a COUNT
+// line that deliberately does not wear the `frame ` prefix either.
+//
+// SIX RUNNING TOTALS AND NO LEVEL. None of them is a high-water mark, so
+// unlike `action budget:`' `deepest` every one of the six differences over a
+// bracket.
+//
+// `phases` is the DENOMINATOR OF THE OTHER FIVE AND OF NOTHING ELSE:
+// `PumpPhase::Ingest` phases run, one per `App::poll_data_channels` call,
+// which is one per frame that got past `poll_platform_state`. **It is NOT
+// presented frames** -- a frame taking one of `handle_redraw`'s three early
+// exits runs the phase and is never presented -- so a share taken of it is
+// never a share of frames on screen.
+//
+// `arrivals` is arrival MESSAGES taken off a channel and handled on the frame
+// thread, summed over the phase's four `try_recv_arrival` drains, and never a
+// count of bytes. "Handled" rather than "applied": a message the drain then
+// discards as stale is counted, because the frame paid for taking and judging
+// it.
+// `bites` is phases on which the budget stopped at least one drain: **this is
+// the fires counter**, and a leg reading 0 here paid nothing for the
+// mechanism. `stops` is drain-stops summed over those phases -- each drain
+// keeps its own always-one-arrival guarantee, so a phase can stop once per
+// drain and each stop costs one whole arrival past the deadline, which makes
+// `stops` above `bites` the reading "the frame's real spend was the budget
+// plus SEVERAL whole arrivals". `builds` is 3D volume payloads extracted on
+// the frame thread by the arrival dispatch, and `held` is the arrival-dispatch
+// builds the budget turned away -- held, never dropped, because the pane's
+// draw-time level trigger re-asks next frame.
+//
+// **A missing line is not `0 bites`.** `ingest_budget::totals_if_moved`
+// returns `None` until `bites + stops + builds + held_builds` moves, so a leg
+// on which none of those happened writes NO LINE AT ALL. Absence here
+// therefore means either "a binary older than the line" or "the budget never
+// bit and no volume was built from an arrival", and the two are not separable
+// from this reader -- reported as `null`, never as a zero. `action_budget_re`'s
+// situation exactly.
+var ingest_budget_re = /ingest budget: (\d+) phases, (\d+) arrivals, (\d+) bites, (\d+) stops, (\d+) builds, (\d+) held/;
+var ingest_budget_loose_re = /ingest budget: \d+ phases/;
 // **Whether the archive spill fired, and whether anything came back.**
 //
 // Seven fields, and they are THREE kinds that are never added to each other.
@@ -3132,6 +3175,31 @@ for (var i = 0; i < C.length; i++) {
   // stories are already crowded: absence means an old binary OR a budget that
   // never bit, and without this arm a reshaped line would impersonate both.
   else if (action_budget_loose_re.test(m)) action_budget_unparsed = m;
+  var ibm = ingest_budget_re.exec(m);
+  if (ibm) {
+    // Six running totals and NO level: `action budget:`' `deepest` has no
+    // counterpart here, so every one of these differences over a bracket.
+    ingest_budget = { phases: parseInt(ibm[1], 10),
+                      arrivals: parseInt(ibm[2], 10),
+                      bites: parseInt(ibm[3], 10),
+                      stops: parseInt(ibm[4], 10),
+                      builds: parseInt(ibm[5], 10),
+                      held: parseInt(ibm[6], 10) };
+    // Per tick as well as last-wins, for `action_budget_all`'s reason: these
+    // are written on the same 2 s tick as `frame worst:`, so two consecutive
+    // entries bracket the period whose worst frame that tick reports.
+    ingest_budget_all.push({ t: C[i].t, phases: ingest_budget.phases,
+                             arrivals: ingest_budget.arrivals,
+                             bites: ingest_budget.bites,
+                             stops: ingest_budget.stops,
+                             builds: ingest_budget.builds,
+                             held: ingest_budget.held });
+  }
+  // Present but unparseable is NOT the same answer as absent, on the line
+  // above's terms exactly: absence here already means an old binary OR a
+  // budget that never bit and built nothing, and a reshaped line with no arm
+  // of its own would impersonate both.
+  else if (ingest_budget_loose_re.test(m)) ingest_budget_unparsed = m;
   var asm = archive_spill_re.exec(m);
   if (asm) {
     archive_spill = { on_disk_bytes: parseInt(asm[1], 10),
@@ -3289,6 +3357,8 @@ return { attached: attached, different: different, off_frame: off_frame,
          cmdstream_all: cmdstream_all, cmdstream_unparsed: cmdstream_unparsed,
          action_budget: action_budget, action_budget_all: action_budget_all,
          action_budget_unparsed: action_budget_unparsed,
+         ingest_budget: ingest_budget, ingest_budget_all: ingest_budget_all,
+         ingest_budget_unparsed: ingest_budget_unparsed,
          archive_spill: archive_spill, archive_spill_all: archive_spill_all,
          archive_spill_unparsed: archive_spill_unparsed,
          payload_share: payload_share, payload_share_all: payload_share_all,
@@ -5004,6 +5074,7 @@ class RunningTotalsWatcher:
         self.rasters = {}
         self.cmdstream = {}
         self.action_budget = {}
+        self.ingest_budget = {}
 
     def poll(self):
         sig = self.session.execute(WORKER_SIGNAL_PROBE) or {}
@@ -5021,6 +5092,8 @@ class RunningTotalsWatcher:
             self.cmdstream[r.get("t")] = r
         for r in sig.get("action_budget_all") or []:
             self.action_budget[r.get("t")] = r
+        for r in sig.get("ingest_budget_all") or []:
+            self.ingest_budget[r.get("t")] = r
         return sig
 
     def readings(self, family, role=None):
@@ -5028,7 +5101,8 @@ class RunningTotalsWatcher:
         source = {"tile_cache": self.tile_cache, "ground": self.ground,
                   "basemap": self.basemap, "uploads": self.uploads,
                   "rasters": self.rasters, "cmdstream": self.cmdstream,
-                  "action_budget": self.action_budget}[family]
+                  "action_budget": self.action_budget,
+                  "ingest_budget": self.ingest_budget}[family]
         rs = [r for r in source.values() if role is None or r.get("role") == role]
         rs.sort(key=lambda r: r.get("t") or 0)
         return rs
@@ -11419,6 +11493,19 @@ def run_smoke(args):
             (r for r in getattr(totals_watch, "action_budget", {}).values()
              if r.get("t") is not None), key=lambda r: r["t"])
         result["action_budget_unparsed"] = _sig.get("action_budget_unparsed")
+        # The `Ingest` phase's arrival allowance, per tick, from the watcher
+        # for the family above's reason. An EMPTY list is not `0 bites`: the
+        # app writes no line until `bites + stops + builds + held` moves, so
+        # an empty list means the budget never bit and no volume was built
+        # from an arrival OR the binary predates the line, and the two are not
+        # separable here. Every one of the six entries is a RUNNING TOTAL --
+        # there is no `deepest` here, so nothing on this family is exempt from
+        # differencing, and `phases` is the denominator of the other five and
+        # of nothing else (it counts `Ingest` phases, NOT presented frames).
+        result["ingest_budget_all"] = sorted(
+            (r for r in getattr(totals_watch, "ingest_budget", {}).values()
+             if r.get("t") is not None), key=lambda r: r["t"])
+        result["ingest_budget_unparsed"] = _sig.get("ingest_budget_unparsed")
         gw = gesture_window_stats(frames_watch, args.quiet_window,
                                   args.window_skip_loops)
         if gw is not None:
@@ -12281,6 +12368,48 @@ def run_smoke(args):
               "line only once the budget has moved, so this is a budget that "
               "never bit OR a binary older than the line, and this reader "
               "cannot tell them apart" % tag)
+    # The `Ingest` phase's arrival allowance, over the whole leg: first reading
+    # to last. Printed whether or not anything gates on it, on `action budget:`'
+    # terms exactly -- this is a FIRES COUNTER, and the reading it exists to
+    # deliver is a small one.
+    #
+    # **The absence is the reading that needs the words.** The app writes this
+    # line only once `bites + stops + builds + held` has moved, so no line at
+    # all means the budget never bit AND nothing was built from an arrival, OR
+    # this binary predates the line; it is NEVER "0 bites measured".
+    #
+    # **`phases` is the denominator of the other five and of nothing else**, and
+    # it is NOT presented frames: a frame taking one of `handle_redraw`'s early
+    # exits runs the phase and is never presented. **And `stops` above `bites`
+    # is a second reading**: each drain keeps its own always-one-arrival
+    # guarantee, so a phase that stopped several drains spent the budget plus
+    # SEVERAL whole arrivals. `held` builds were turned away, never dropped.
+    ibl = result.get("ingest_budget_all")
+    ibu = result.get("ingest_budget_unparsed")
+    if ibl:
+        first, last = ibl[0], ibl[-1]
+        print("[%s] SUMMARY ingest budget: %s phases [the denominator of the "
+              "five that follow and of nothing else; Ingest phases, NOT "
+              "presented frames], %s arrivals [MESSAGES, never bytes], %s "
+              "bites, %s stops [above `bites` means the budget plus SEVERAL "
+              "whole arrivals on a phase], %s builds, %s held [turned away, "
+              "never dropped] over the leg [six running totals, no level]"
+              % (tag, last["phases"] - first["phases"],
+                 last["arrivals"] - first["arrivals"],
+                 last["bites"] - first["bites"],
+                 last["stops"] - first["stops"],
+                 last["builds"] - first["builds"],
+                 last["held"] - first["held"]))
+    elif ibu:
+        print("[%s] SUMMARY ingest budget: READER BROKEN -- the line is in the "
+              "ring and the rig's pattern did not match it: %r" % (tag, ibu))
+    else:
+        print("[%s] SUMMARY ingest budget: no `ingest budget:` line on this "
+              "leg. That is NOT a `0 bites` measurement: the app writes the "
+              "line only once `bites + stops + builds + held` has moved, so "
+              "this is a budget that never bit and built nothing OR a binary "
+              "older than the line, and this reader cannot tell them apart"
+              % tag)
     ovr = result.get("overlay_rasters")
     if ovr is not None:
         print("[%s] SUMMARY overlay rasters: %s%s"

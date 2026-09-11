@@ -1564,6 +1564,60 @@ fn every_frame_line_family_the_app_writes_has_a_named_rig_probe() {
         "the table names families the app no longer writes: {families:?}",
     );
 }
+/// The `ingest budget:` sentence, held against both halves of the rig on
+/// [`the_rig_reads_the_action_budget_line_the_app_actually_writes`]' terms
+/// exactly.
+///
+/// The literal pin is there for that test's reason — a formatter that dropped
+/// a field and a regex that dropped the same field would agree with each other
+/// and with nothing else — and the values are deliberately all different and
+/// none of them zero, so a formatter that printed `phases` where `arrivals`
+/// belongs cannot pass against a fixture of repeated values.
+///
+/// **Six running totals and no level.** `action budget:`' `deepest` is a
+/// high-water mark and its readers take it last-wins; every field here
+/// differences over a bracket, and the rig's own comments say so. A reader
+/// that treated one of these as a level would report a rate for something that
+/// only ever grows.
+#[test]
+fn the_rig_reads_the_ingest_budget_line_the_app_actually_writes() {
+    let totals = crate::ingest_budget::Totals {
+        phases: 28885,
+        arrivals: 4193,
+        bites: 61,
+        stops: 104,
+        builds: 12,
+        held_builds: 5,
+    };
+    let line = super::ingest_budget_line(&totals);
+    assert_eq!(
+        line,
+        "ingest budget: 28885 phases, 4193 arrivals, 61 bites, 104 stops, \
+         12 builds, 5 held",
+    );
+    assert_eq!(
+        line,
+        rendered(
+            &pattern("ingest_budget_re"),
+            &["28885", "4193", "61", "104", "12", "5"],
+        ),
+        "the `ingest budget:` line and the rig's probe have drifted",
+    );
+    assert_eq!(
+        line,
+        native_row_line(
+            "IngestBudgetTests",
+            &["28885", "4193", "61", "104", "12", "5"]
+        ),
+        "the `ingest budget:` line and the NATIVE rig's fixture have drifted",
+    );
+    assert!(
+        NATIVE_ROW_PY.contains("\"ingest_budget_re\","),
+        "native_row.py does not list `ingest_budget_re` among its probes, so \
+         the fires counter reaches no native row",
+    );
+}
+
 /// The `action budget:` sentence, held against the rig's own pattern.
 ///
 /// **No literal is hand-copied into the rig's half of this.** `rendered`
@@ -1736,6 +1790,13 @@ fn every_telemetry_line_family_app_render_writes_is_claimed_by_a_probe_or_a_reas
             Unread("the rasterizer's own census; unclaimed"),
         ),
         ("ground tiles", By(&["ground_re", "ground_stroke_draws_re"])),
+        // `action budget:`' sibling, and claimed for its reason: a fires
+        // counter with no reader is the one shape a fires counter cannot
+        // survive. This one's absence is ambiguous in the same way —
+        // `ingest_budget::totals_if_moved` answers `None` until something
+        // happened — so the probe reports a missing line as `null`, never as a
+        // zero.
+        ("ingest budget", By(&["ingest_budget_re"])),
         (
             "layer releases",
             Unread("the release ledger's totals; unclaimed"),

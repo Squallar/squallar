@@ -216,6 +216,7 @@ PROBE_NAMES = (
     "tile_bodies_re",
     "frame_need_re",
     "action_budget_re",
+    "ingest_budget_re",
     "archive_spill_re",
     "payload_share_re",
     "grid_narrowing_re",
@@ -931,6 +932,7 @@ def scrape(lines, probes):
         "tile_bodies": [],
         "frame_need": [],
         "action_budget": [],
+        "ingest_budget": [],
         "archive_spill": [],
         "payload_share": [],
         # `(idx, [offered, narrowed, refused, lossy, verified, wide, narrow])`.
@@ -986,6 +988,7 @@ def scrape(lines, probes):
             ("tile_bodies", "tile_bodies_re"),
             ("frame_need", "frame_need_re"),
             ("action_budget", "action_budget_re"),
+            ("ingest_budget", "ingest_budget_re"),
             ("archive_spill", "archive_spill_re"),
             ("payload_share", "payload_share_re"),
             ("loop_state", "loop_state_re"),
@@ -1003,6 +1006,17 @@ def scrape(lines, probes):
         if ("action budget:" in line
                 and not probes["action_budget_re"].search(line)):
             out["unparsed"].append((idx, "action_budget_re", line.strip()[:200]))
+        # `ingest budget:` gets the same arm on the same terms, and its
+        # absence is crowded the same way: the pattern is positional and
+        # every one of its six groups mandatory, so a field inserted anywhere
+        # stops the match dead and the family reads EMPTY -- while empty
+        # already means "a binary older than the line" OR "the budget never
+        # bit and nothing was built from an arrival". A fires counter whose
+        # broken reader impersonates its own zero is the one failure it
+        # cannot survive.
+        if ("ingest budget:" in line
+                and not probes["ingest_budget_re"].search(line)):
+            out["unparsed"].append((idx, "ingest_budget_re", line.strip()[:200]))
         # `archive spill:` the same, and here the stakes are the inverse of
         # the line above: absence on this row MEANS "no spill on this target",
         # which is a reading. A reshaped line that silently stopped matching
@@ -3090,6 +3104,45 @@ def build_row(args, scraped, probes):
         "deepest": abl[1][4],
     })
 
+    # **The `Ingest` phase arrival allowance's FIRES COUNTER**, over the same
+    # bracket and for the family above's reason: a budget whose precondition
+    # never holds delivers exactly zero and looks landed.
+    #
+    # SIX WINDOWED TOTALS AND NO LEVEL. `action budget:`' `deepest` has no
+    # counterpart here, so nothing on this family is taken as a last reading
+    # and every one of the six differences over the bracket.
+    #
+    # They are not one denominator. `phases` is `PumpPhase::Ingest` phases run
+    # -- one per `App::poll_data_channels` call, which is one per frame that
+    # got past `poll_platform_state`, and therefore **NOT presented frames**: a
+    # frame taking one of `handle_redraw`'s three early exits runs the phase
+    # and is never presented. It is the denominator of the other five and of
+    # nothing else. `arrivals` is arrival MESSAGES taken off a channel and
+    # handled on the frame thread (stale ones counted too), summed
+    # over the phase's four `try_recv_arrival` drains, never bytes. `bites` is
+    # phases on which the budget stopped at least one drain -- the fires
+    # counter itself. `stops` is drain-stops summed over those phases, and
+    # since each drain keeps its own always-one-arrival guarantee, `stops`
+    # above `bites` says the frame's real spend was the budget plus SEVERAL
+    # whole arrivals. `builds` is 3D volume payloads extracted on the frame
+    # thread by the arrival dispatch; `held` is the ones the budget turned
+    # away -- held, never dropped, since the pane's draw-time level trigger
+    # re-asks next frame.
+    #
+    # **None here is not `0 bites`, and must never be quoted as one.**
+    # `ingest_budget::totals_if_moved` returns `None` until
+    # `bites + stops + builds + held_builds` moves, so a leg on which none of
+    # those happened writes NO LINE AT ALL. Absence therefore means "the
+    # budget never bit and no volume was built from an arrival" OR "a binary
+    # older than the line", and nothing on this row can separate them --
+    # `action budget:`' situation exactly, and the same defect in the
+    # telemetry rather than in this arm.
+    ib = diff_totals(scraped["ingest_budget"], start_idx, end_idx)
+    ingest_budget = (None if ib is None else {
+        "phases": ib[0], "arrivals": ib[1], "bites": ib[2],
+        "stops": ib[3], "builds": ib[4], "held": ib[5],
+    })
+
     # **Which way the archive bytes went, and whether the spill is even here.**
     #
     # Seven fields in THREE kinds that are never added: `on_disk_bytes` is bytes
@@ -3289,6 +3342,11 @@ def build_row(args, scraped, probes):
         # coerced to zero: this is a fires counter and a fabricated zero is
         # the exact reading it exists to make impossible.
         "action_budget": action_budget,
+        # `None` when no `ingest budget:` line brackets this window -- which
+        # means the budget never bit AND nothing was built from an arrival, OR
+        # the binary predates the line. NEVER coerced to zero, for the key
+        # above's reason.
+        "ingest_budget": ingest_budget,
         "archive_spill": archive_spill,
         "payload_share": payload_share,
         # `None` when no `grid narrowing (<name>):` line brackets this window.
@@ -3709,6 +3767,30 @@ def print_row(row):
             "%s deepest [LEVEL, the last reading, never a difference]"
             % (ab["handled"], ab["bites"], ab["deferred"], ab["coalesced"],
                ab["deepest"])
+        )
+    # The `Ingest` phase arrival allowance's fires counter, over the same
+    # bracket. Six windowed totals and no high-water mark, never added to each
+    # other and never to any frame segment: these are phases, messages and
+    # builds, those are microseconds.
+    ib = row.get("ingest_budget")
+    if ib is None:
+        print(
+            "ROW   ingest budget: n/a (no `ingest budget:` line brackets this "
+            "window). That is NOT `0 bites`: the app writes the line only once "
+            "`bites + stops + builds + held` moves, so this is a budget that "
+            "never bit and built nothing OR a binary older than the line, and "
+            "this row cannot tell them apart"
+        )
+    else:
+        print(
+            "ROW   ingest budget: %s phases [Ingest phases, NOT presented "
+            "frames -- the denominator of the five that follow and of nothing "
+            "else], %s arrivals [MESSAGES, never bytes], %s bites, %s stops "
+            "[above `bites` means the budget plus SEVERAL whole arrivals on a "
+            "phase], %s builds, %s held [turned away, never dropped] [over the "
+            "bracket; six running totals, no level]"
+            % (ib["phases"], ib["arrivals"], ib["bites"], ib["stops"],
+               ib["builds"], ib["held"])
         )
     # Which way the archive bytes went. `on-disk` is bytes on the MEDIUM and is
     # added to no census level -- they are the bytes that LEFT the heap, and
@@ -7628,6 +7710,157 @@ class ActionBudgetTests(unittest.TestCase):
         self.assertEqual(scraped["action_budget"], [])
         self.assertTrue(
             any(p == "action_budget_re" for _idx, p, _line in scraped["unparsed"]),
+            scraped["unparsed"])
+
+
+class IngestBudgetTests(unittest.TestCase):
+    """The fires counter for the `PumpPhase::Ingest` arrival allowance.
+
+    `ActionBudgetTests` one phase over, case for case, because the line is
+    that line's sibling in every respect that matters to a reader: a counter
+    whose whole purpose is to say whether a mechanism ever ran, a positional
+    pattern with every group mandatory, and an absence that already carries
+    two meanings before a broken reader adds a third.
+
+    Two things about it are NOT that line's, and both are pinned below. It
+    carries SIX running totals and NO level -- `deepest` has no counterpart
+    here, so every field differences over the bracket and none is taken as a
+    last reading. And `phases` is `Ingest` phases run, **not presented
+    frames**: a frame taking one of `handle_redraw`'s three early exits runs
+    the phase and is never presented, so `phases` is the denominator of the
+    other five and of nothing else.
+    """
+
+    LINE = ("[..] INFO ingest budget: %d phases, %d arrivals, %d bites, "
+            "%d stops, %d builds, %d held")
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.load = os.path.join(self._tmp.name, "load")
+        with open(self.load, "w", encoding="utf-8") as fh:
+            for i in range(6):
+                fh.write("%d\t1.0\n" % (1_000_000 + 5 * i))
+        self.probes = compile_probes()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_the_probe_is_drive_pys_own(self):
+        """Read out of drive.py at run time, never restated here, so the two
+        halves of the rig cannot come to read different lines."""
+        self.assertEqual(
+            drive_pattern("ingest_budget_re"),
+            r"ingest budget: (\d+) phases, (\d+) arrivals, (\d+) bites, "
+            r"(\d+) stops, (\d+) builds, (\d+) held")
+
+    def test_drive_py_reads_each_group_into_the_field_it_belongs_to(self):
+        """The POSITIONAL half, on `ActionBudgetTests`' terms exactly: a field
+        inserted mid-line shifts every group after it while a match check and
+        a Rust literal pin both stay green, and the artifact then carries one
+        figure under another figure's name. `stops` under `bites` is the worst
+        available reading of this line -- the two are the pair whose ORDER is
+        the finding."""
+        text = _read(DRIVE_PY)
+        pattern = drive_pattern("ingest_budget_re", text)
+        # A distinct value per field, so a swapped pair cannot read as a match.
+        fields = [("phases", 28885), ("arrivals", 4193), ("bites", 61),
+                  ("stops", 104), ("builds", 12), ("held", 5)]
+        line = ("ingest budget: %d phases, %d arrivals, %d bites, %d stops, "
+                "%d builds, %d held" % tuple(v for _, v in fields))
+        m = re.search(pattern, line)
+        self.assertIsNotNone(m, "drive.py's probe no longer matches the line")
+        groups = m.groups()
+        self.assertEqual(len(groups), len(fields))
+        body = text[text.index("var ibm = ingest_budget_re.exec(m);"):]
+        body = body[:body.index("ingest_budget_all.push")]
+        assigned = re.findall(r"(\w+): parseInt\(ibm\[(\d+)\], 10\)", body)
+        self.assertEqual(
+            [name for name, _ in assigned], [name for name, _ in fields],
+            "drive.py reads a different set of fields, or reads them in a "
+            "different order, from the ones the line carries")
+        for (name, expected), (_, at) in zip(fields, assigned):
+            self.assertEqual(
+                int(groups[int(at) - 1]), expected,
+                "drive.py reads group %s into `%s`, which carries %s and not "
+                "%s -- the artifact labels one figure with another's name"
+                % (at, name, groups[int(at) - 1], expected))
+
+    def test_the_line_scrapes_with_every_group_mandatory(self):
+        m = self.probes["ingest_budget_re"].search(
+            self.LINE % (28885, 4193, 61, 104, 12, 5))
+        self.assertIsNotNone(m)
+        self.assertEqual([int(g) for g in m.groups()],
+                         [28885, 4193, 61, 104, 12, 5])
+        # A field dropped anywhere stops the match dead, which is what keeps a
+        # partial reading from arriving as a full one.
+        self.assertIsNone(self.probes["ingest_budget_re"].search(
+            "[..] INFO ingest budget: 28885 phases, 4193 arrivals"))
+
+    def _row(self, lines):
+        row = build_row(_leg_args(self.load, 1), scrape(lines, self.probes), self.probes)
+        return row, _capture(lambda: print_row(row))
+
+    def test_the_row_windows_all_six_totals_and_keeps_no_level(self):
+        """Six running totals differenced over the bracket, and NOTHING taken
+        as a last reading. This is where the line parts company with
+        `action budget:`: there is no high-water mark on it, so a field
+        quoted as a level here would be the boot-to-now figure printed as a
+        window's."""
+        lines = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE)
+        out = []
+        seen = 0
+        for line in lines:
+            out.append(line)
+            if "gesture script pan-zoom-2d loop complete" in line:
+                seen += 1
+                out.append(self.LINE % (1000 * seen, 700 * seen, 2 * seen,
+                                        5 * seen, 3 * seen, seen))
+        row, text = self._row(out)
+        ib = row["ingest_budget"]
+        self.assertIsNotNone(ib)
+        self.assertGreater(ib["bites"], 0)
+        # Differences, so each is a multiple of its per-loop step and none of
+        # them carries the boot traffic ahead of the bracket.
+        loops = ib["bites"] // 2
+        self.assertEqual(ib["phases"], loops * 1000)
+        self.assertEqual(ib["arrivals"], loops * 700)
+        self.assertEqual(ib["stops"], loops * 5)
+        self.assertEqual(ib["builds"], loops * 3)
+        self.assertEqual(ib["held"], loops)
+        # `stops` above `bites` is a reading and not a contradiction: each
+        # drain keeps its own always-one-arrival guarantee, so one phase can
+        # stop several drains and pay a whole arrival for each.
+        self.assertGreater(ib["stops"], ib["bites"])
+        self.assertIn("ROW   ingest budget: ", text)
+        self.assertIn("NOT presented frames", text)
+        self.assertIn("six running totals, no level", text)
+
+    def test_a_leg_with_no_line_says_so_rather_than_zero_bites(self):
+        """**The reading this whole reader is about.** `totals_if_moved`
+        returns `None` until `bites + stops + builds + held_builds` moves, so
+        a leg on which none of those happened writes no line at all -- and
+        `0 bites` printed for that would be a measurement nobody took, of
+        exactly the quantity the counter exists to deliver."""
+        row, text = self._row(_leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE))
+        self.assertIsNone(row["ingest_budget"])
+        self.assertIn("ROW   ingest budget: n/a", text)
+        self.assertIn("NOT `0 bites`", text)
+        self.assertNotIn("ROW   ingest budget: 0 phases", text)
+
+    def test_a_reshaped_line_is_a_broken_reader_not_an_absent_family(self):
+        """Absence already carries two meanings on this line. A third --
+        "the reader broke" -- impersonating either of them is what the
+        `unparsed` arm exists to stop. A field INSERTED is the shape to test:
+        every group is mandatory and positional, so one more figure anywhere
+        before `held` stops the match dead and the family reads empty."""
+        out = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE)
+        out.append("[..] INFO ingest budget: 28885 phases, 4193 arrivals, "
+                   "61 bites, 7 skipped, 104 stops, 12 builds, 5 held")
+        scraped = scrape(out, self.probes)
+        self.assertEqual(scraped["ingest_budget"], [])
+        self.assertTrue(
+            any(p == "ingest_budget_re" for _idx, p, _line in scraped["unparsed"]),
             scraped["unparsed"])
 
 

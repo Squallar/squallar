@@ -331,6 +331,13 @@ fn every_ingest_arrival_drain_consults_the_frame_budget() {
         (app, "fn poll_scan_results(", "scan"),
         (chunks, "fn poll_chunk_results(", "chunk"),
         (app, "fn poll_overlay_fetch_results(", "overlay fetch"),
+        // Four, not three. This drain ran unbounded until 2026-09-11 for the
+        // reason an enumeration always misses one: the rule was carried by a
+        // list of names rather than by the phase, and nothing asked the phase
+        // whether the list was complete.
+        // `every_ingest_row_that_takes_a_message_reads_the_budget_first`
+        // below is what asks.
+        (app, "fn poll_voxel_results(", "voxel"),
     ] {
         let body = fn_body(source, name);
         assert!(
@@ -386,6 +393,12 @@ fn every_ingest_arrival_drain_reads_its_budget_before_taking_the_message() {
             "deadline.is_some_and(",
             "overlay fetch",
         ),
+        (
+            app,
+            "fn poll_voxel_results(",
+            "ingest_budget_spent()",
+            "voxel",
+        ),
     ] {
         let body = fn_body(source, name);
         let take = body.find("try_recv_arrival()").unwrap_or_else(|| {
@@ -406,4 +419,190 @@ fn every_ingest_arrival_drain_reads_its_budget_before_taking_the_message() {
             read - take,
         );
     }
+}
+
+/// **Every `Ingest` row that takes a message consults the frame's budget** —
+/// asked of the PHASE, not of a list of names.
+///
+/// The two pins above enumerate their drains, and an enumeration is exactly
+/// how `poll_voxel_results` ran unbounded from the day the budget landed until
+/// 2026-09-11: the rule was written down as three names, the fourth drain was
+/// the same `while let Ok(..) = try_recv_arrival()` shape in the same phase,
+/// and nothing ever asked whether the list was complete. This walks
+/// [`FRAME_PUMP`]'s own `Ingest` rows instead, so a fifth drain added tomorrow
+/// is in scope the moment its row is.
+///
+/// A source probe for [`every_ingest_arrival_drain_consults_the_frame_budget`]'s
+/// reason: an `App` cannot be stood up in a unit test, so what is checkable is
+/// the wiring.
+#[test]
+fn every_ingest_row_that_takes_a_message_reads_the_budget_first() {
+    let sources = [
+        ("app.rs", include_str!("../app.rs")),
+        ("app_chunks.rs", include_str!("../app_chunks.rs")),
+    ];
+
+    let mut with_takes = 0usize;
+    for entry in FRAME_PUMP.iter().filter(|e| e.phase == PumpPhase::Ingest) {
+        let needle = format!("fn {}(", entry.name);
+        let Some((file, body)) = sources
+            .iter()
+            .find(|(_, src)| src.contains(&needle))
+            .map(|(file, src)| (*file, fn_body(src, &needle)))
+        else {
+            panic!(
+                "the `Ingest` row `{}` names a method this pin cannot find in \
+                 app.rs or app_chunks.rs. Either it moved — add its file here \
+                 — or the row's `name` no longer matches the method it runs, \
+                 which is the thing `the_pump_rows_are_in_the_pinned_order` \
+                 cannot see.",
+                entry.name,
+            );
+        };
+        let Some(take) = body.find("try_recv_arrival()") else {
+            continue;
+        };
+        with_takes += 1;
+        let read = body
+            .find("ingest_budget_spent()")
+            .or_else(|| body.find("deadline.is_some_and("))
+            .unwrap_or_else(|| {
+                panic!(
+                    "`{}` ({file}) takes arrivals off a channel and never reads \
+                     the frame's arrival budget, so one burst is applied whole \
+                     on one frame — the unbounded shape \
+                     INGEST_BUDGET_PER_FRAME exists to stop.",
+                    entry.name,
+                )
+            });
+        assert!(
+            read < take,
+            "`{}` ({file}) reads the frame's budget {} bytes AFTER the \
+             `try_recv_arrival()` that takes the message, so the arrival that \
+             crosses the boundary is destroyed rather than deferred.",
+            entry.name,
+            read - take,
+        );
+        assert!(
+            body.contains("drained_one"),
+            "`{}` ({file}) lost its always-one-arrival guarantee, so a drain \
+             ahead of it in the phase can starve it for the length of a burst.",
+            entry.name,
+        );
+        assert!(
+            body.contains("ingest_budget::note_arrival()"),
+            "`{}` ({file}) applies arrivals on the frame thread and counts \
+             none of them, so `ingest budget:`'s `arrivals` reads low by this \
+             drain's whole traffic and nothing says which drain is missing.",
+            entry.name,
+        );
+        assert!(
+            body.contains("ingest_budget::note_stop()"),
+            "`{}` ({file}) stops on the budget and does not count the stop, so \
+             `bites` can read zero on a frame the budget actually bit — the \
+             fires counter reporting that the mechanism never fired.",
+            entry.name,
+        );
+    }
+
+    assert_eq!(
+        with_takes, 4,
+        "the number of `Ingest` rows that take messages off a channel moved. \
+         Four is not a target — the pin above is what holds the rule — but a \
+         change here means a drain was added or removed, and this count is the \
+         one thing that says so out loud rather than silently widening or \
+         narrowing what was checked.",
+    );
+}
+
+/// **The arrival dispatch's frame-thread volume extract is under the budget
+/// too, and with no free first ask.**
+///
+/// `publish_base_volumes` is an `Ingest` row that drains no channel, so
+/// neither pin above has ever covered it — and it reaches
+/// `App::prepare_volume`, which walks a product's moments out of the merged
+/// volume on this thread and logs its own duration in milliseconds. That is
+/// the one item of the phase that is heavy work by `CLAUDE.md`'s meaning
+/// rather than an apply.
+///
+/// **No `drained_one` here, deliberately.** The drains buy progress with one
+/// whole arrival because a channel that is never drained never empties; an ask
+/// is not a message, and a held one is re-asked by the draw-time level trigger
+/// on the next frame. A `drained_one` appearing in this body would mean the
+/// expensive item bought itself a free pass and the bound stopped binding.
+#[test]
+fn the_arrived_volume_dispatch_is_bounded_and_holds_rather_than_drops() {
+    let body = fn_body(include_str!("../app.rs"), "fn dispatch_arrived_volumes(");
+    // **Before the loop opens, and again inside it** — and the first of those
+    // is the one a tamper gets past. An earlier spelling of this pin asked
+    // only that `ingest_budget_spent()` appear SOMEWHERE in the body, and a
+    // tamper that replaced the pre-loop read with `false` — giving the first
+    // and most expensive ask a free pass — left the in-loop read standing and
+    // passed it clean. A `contains` over a body with two call sites cannot
+    // tell which one is gone.
+    let first = body.find("ingest_budget_spent()").unwrap_or_else(|| {
+        panic!(
+            "the arrived-volume dispatch no longer consults the frame's \
+             arrival budget at all, so a frame that already overran it goes on \
+             to extract a whole volume payload on the frame thread"
+        )
+    });
+    let loop_open = body
+        .find("for (pane_idx")
+        .expect("the arrived-volume dispatch no longer walks its asks in a `for`");
+    assert!(
+        first < loop_open,
+        "the arrived-volume dispatch reads the budget only INSIDE its loop, so \
+         the first ask — the one that runs before any read — is unbounded. The \
+         first ask is the expensive one: it is the extract that spends the \
+         budget, not the ask behind it."
+    );
+    assert!(
+        body[loop_open..].contains("ingest_budget_spent()"),
+        "the arrived-volume dispatch reads the budget once before its loop and \
+         never again, so one extract that overruns the budget does not stop \
+         the next: the bound holds for the first ask and for no other"
+    );
+    assert!(
+        body.contains("ingest_budget::note_held_build()"),
+        "the arrived-volume dispatch no longer counts the builds the budget \
+         turned away, so a bound that never binds and a bound that binds every \
+         frame read identically"
+    );
+    assert!(
+        body.contains("ingest_budget::note_build()"),
+        "the arrived-volume dispatch no longer counts the builds it DID run on \
+         the frame thread, which is the figure `held` is only readable against"
+    );
+    assert!(
+        !body.contains("drained_one"),
+        "the arrived-volume dispatch grew an always-one-ask guarantee. The \
+         drains have one because a channel that is never drained never \
+         empties; this holds asks, not messages, and a held ask is re-asked by \
+         the pane's draw-time level trigger — so a free first ask here buys \
+         nothing and lets the phase's most expensive single item past the \
+         bound every frame."
+    );
+}
+
+/// **The phase is opened and closed around the walk**, which is what makes
+/// `bites` a count of frames rather than of drains.
+#[test]
+fn the_ingest_phase_brackets_its_own_counters() {
+    let body = fn_body(include_str!("../app.rs"), "fn poll_data_channels(");
+    let open = body
+        .find("ingest_budget::open_phase()")
+        .expect("poll_data_channels no longer opens the ingest ledger's phase");
+    let walk = body
+        .find("run_frame_pump(")
+        .expect("poll_data_channels no longer runs the Ingest pump walk");
+    let close = body
+        .find("ingest_budget::close_phase(")
+        .expect("poll_data_channels no longer closes the ingest ledger's phase");
+    assert!(
+        open < walk && walk < close,
+        "the ingest ledger's phase no longer brackets the pump walk, so the \
+         stops it compares against are not this phase's and `bites` counts \
+         something other than frames"
+    );
 }

@@ -527,6 +527,88 @@ fn a_busy_render_slot_leaves_the_ask_to_the_draw_time_trigger() {
     );
 }
 
+/// **An arrived volume the frame's arrival budget cannot afford is HELD, not
+/// built** — and held is not dropped.
+///
+/// `a_busy_render_slot_leaves_the_ask_to_the_draw_time_trigger` above is this
+/// test's twin and pins the OTHER gate: that one spends the render slots, this
+/// one spends the frame's arrival allowance. They are separate doors and only
+/// one of them existed until 2026-09-11 — `dispatch_arrived_volumes` ran
+/// whatever `arrived_volume_asks` returned, however much of the frame's
+/// `Ingest` budget the four rows ahead of it had already eaten, and
+/// `prepare_volume`'s extract is the one item of that phase that is heavy work
+/// by `CLAUDE.md`'s meaning rather than an apply: it walks a product's moments
+/// out of the merged volume on this thread and logs its own duration in
+/// milliseconds.
+///
+/// **No free first ask here, unlike every drain in the phase.** The drains buy
+/// progress with one whole arrival because a channel nobody drains never
+/// empties; an ask is not a message, the three assertions below are what says
+/// so, and a `drained_one` in that body would put the phase's most expensive
+/// single item back outside the bound every frame.
+///
+/// Driven with a deadline that is already spent rather than by loading the
+/// box, on `an_arrival_the_budget_cannot_afford_is_deferred_rather_than_dropped`'s
+/// terms: `ingest_budget_spent` is `now >= deadline`, so this is exact at any
+/// load and gates on the property rather than on a clock.
+#[test]
+fn an_arrived_volume_the_frame_budget_cannot_afford_is_held_not_built() {
+    let mut app = headless(TestBridge::desktop());
+    give_it_a_painter(&mut app);
+    volume_pane_on(
+        &mut app,
+        0,
+        SITE,
+        &squallar_radar::fields::known::REFLECTIVITY,
+    );
+    app.volumes.install_base(
+        SITE.to_owned(),
+        (crate::volume_fixture::ready_scan(), Arc::default(), at(6)),
+    );
+    assert!(
+        app.render.render_slot_free(),
+        "precondition: a render slot is free, so the refusal below is the \
+         arrival budget's and not the twin gate's",
+    );
+
+    // A frame whose budget is spent the moment it opens.
+    app.ingest_deadline = Some(web_time::Instant::now());
+    let arrived = app.publish_base_volumes();
+    assert!(
+        !arrived.is_empty(),
+        "precondition: the volume did arrive, so the refusal below is the \
+         budget gate and not an absent arrival",
+    );
+    app.dispatch_arrived_volumes(&arrived);
+    app.ingest_deadline = None;
+
+    assert_eq!(
+        app.volume_extractions.get(),
+        0,
+        "a frame that had already spent its arrival budget went on to extract \
+         a whole volume payload on the frame thread — the bound reads as \
+         landed and binds nothing",
+    );
+    let pane = app.gui.pane(0).expect("pane 0");
+    assert_eq!(
+        pane.volume().and_then(|v| v.rendered_for.clone()),
+        None,
+        "a held ask was marked as served, which would leave the pane waiting \
+         for a build nobody ever started — held turned into dropped",
+    );
+    let stamp = radar_layer::current_volume_for(&app.liveness, SITE)
+        .expect("the site's stamp was published");
+    let (stamp, _) = pane.volume_stamp(Some(stamp)).expect("a stamp");
+    assert!(
+        pane.volume_build_due(
+            &pane.volume_target_for(&squallar_radar::fields::known::REFLECTIVITY, stamp)
+        ),
+        "the draw-time level-trigger must still be armed for the volume the \
+         budget held, or the frame the user is looking at is the last one that \
+         could ever have built it",
+    );
+}
+
 /// **The frame pump really runs it.** Every other test here calls the two
 /// halves directly, which would stay green if the row that runs them were
 /// deleted — the silent-partial-success shape. This one goes in through

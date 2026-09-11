@@ -705,6 +705,32 @@ fn action_budget_line(t: &crate::action_budget::Totals) -> String {
     )
 }
 
+/// The `ingest budget:` line — **what the `Ingest` phase's arrival allowance
+/// actually did**.
+///
+/// [`action_budget_line`]'s sibling, and its denominators are not that line's
+/// and are never added to it: `phases` is `Ingest` phases run — one per
+/// `poll_data_channels` call, which is one per frame that got past
+/// `poll_platform_state` and therefore NOT presented frames — `arrivals` is
+/// messages taken off a channel and handled on the frame thread (stale ones
+/// included), `bites` is phases on which the budget stopped at least one
+/// drain, `stops` is drain-stops summed over those, and
+/// `builds`/`held` are the arrival dispatch's frame-thread volume extracts and
+/// the ones the budget turned away. See [`crate::ingest_budget`].
+///
+/// **A `bites 0` reading is the point of the line**, on
+/// [`action_budget_line`]'s terms exactly. **And `stops` above `bites` is the
+/// second point**: each drain keeps its own always-one-arrival guarantee, so a
+/// phase that stops three drains spent the budget plus THREE whole arrivals,
+/// not the budget plus one.
+fn ingest_budget_line(t: &crate::ingest_budget::Totals) -> String {
+    format!(
+        "ingest budget: {} phases, {} arrivals, {} bites, {} stops, \
+         {} builds, {} held",
+        t.phases, t.arrivals, t.bites, t.stops, t.builds, t.held_builds,
+    )
+}
+
 /// The `upload pacing:` line — **what the band drain's texture-creation budget
 /// let through**.
 ///
@@ -3391,6 +3417,13 @@ impl super::App {
         // `crate::action_budget::Totals::progress`, which deliberately leaves
         // `handled` out for exactly that reason.
         let actions = crate::action_budget::totals_if_moved();
+        // **Only when the arrival budget has done something**, on the reading
+        // above's terms: `phases` and `arrivals` move on every frame of every
+        // session and are deliberately outside `progress`, so a session that
+        // never overran a frame's arrival allowance and never built a volume
+        // from an arrival writes no line here — see
+        // `crate::ingest_budget::Totals::progress`.
+        let ingest = crate::ingest_budget::totals_if_moved();
         if rasters.is_none()
             && uploads.is_none()
             && strips.is_none()
@@ -3398,6 +3431,7 @@ impl super::App {
             && basemap.is_none()
             && releases.is_none()
             && actions.is_none()
+            && ingest.is_none()
         {
             return;
         }
@@ -3487,6 +3521,9 @@ impl super::App {
         }
         if let Some(r) = releases {
             say_telemetry(loud, &layer_release_line(&r));
+        }
+        if let Some(i) = ingest {
+            say_telemetry(loud, &ingest_budget_line(&i));
         }
         if let Some(a) = actions {
             say_telemetry(loud, &action_budget_line(&a));

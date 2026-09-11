@@ -227,12 +227,14 @@ impl super::App {
         let mut drained_one = false;
         loop {
             if drained_one && self.ingest_budget_spent() {
+                crate::ingest_budget::note_stop();
                 break;
             }
             let Ok(resp) = self.channels.chunk_receiver.try_recv_arrival() else {
                 break;
             };
             drained_one = true;
+            crate::ingest_budget::note_arrival();
             let ChunkResponse {
                 generation,
                 site,

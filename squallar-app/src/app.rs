@@ -2376,7 +2376,26 @@ impl App {
     fn poll_voxel_results(&mut self) {
         use squallar_volumetric::bridge::VolumeEntry;
 
-        while let Ok(vr) = self.channels.voxel_receiver.try_recv_arrival() {
+        // The fourth drain of this phase, on `poll_scan_results`' terms — one
+        // arrival always goes through, and **the budget is read before the
+        // take, not after it**, because `try_recv_arrival` is destructive and
+        // an arrival abandoned at a `break` is gone rather than deferred.
+        //
+        // It ran unbounded until 2026-09-11, and the two source pins that
+        // carry this rule enumerated the other three by name, so nothing
+        // noticed: a burst of finished 3D builds was applied whole on whatever
+        // frame followed it.
+        let mut drained_one = false;
+        loop {
+            if drained_one && self.ingest_budget_spent() {
+                crate::ingest_budget::note_stop();
+                break;
+            }
+            let Ok(vr) = self.channels.voxel_receiver.try_recv_arrival() else {
+                break;
+            };
+            drained_one = true;
+            crate::ingest_budget::note_arrival();
             let ready_grid = vr.grid.map(|grid| std::sync::Arc::new(*grid));
             let entry = match &ready_grid {
                 Some(grid) => VolumeEntry::Ready(std::sync::Arc::clone(grid)),
@@ -2745,12 +2764,14 @@ impl App {
         let mut drained_one = false;
         loop {
             if drained_one && self.ingest_budget_spent() {
+                crate::ingest_budget::note_stop();
                 break;
             }
             let Ok(scan_resp) = self.channels.scan_receiver.try_recv_arrival() else {
                 break;
             };
             drained_one = true;
+            crate::ingest_budget::note_arrival();
             if self
                 .render
                 .is_scan_stale(&scan_resp.site, scan_resp.requester, scan_resp.generation)
@@ -2902,8 +2923,13 @@ impl App {
         self.ingest_deadline = Some(
             web_time::Instant::now() + squallar_device_profile::constants::INGEST_BUDGET_PER_FRAME,
         );
+        // Opened around the walk and closed after it, so `bites` counts
+        // FRAMES on which the budget stopped a drain however many drains it
+        // stopped — see `crate::ingest_budget`.
+        let opened = crate::ingest_budget::open_phase();
         self.run_frame_pump(frame_pump::PumpPhase::Ingest, None);
         self.ingest_deadline = None;
+        crate::ingest_budget::close_phase(opened);
     }
 
     /// Whether this frame has spent its arrival budget, and if so ask for the
@@ -2969,12 +2995,14 @@ impl App {
             if drained_one && deadline.is_some_and(|deadline| web_time::Instant::now() >= deadline)
             {
                 deferred = true;
+                crate::ingest_budget::note_stop();
                 break;
             }
             let Ok(event) = self.channels.overlay_fetch_receiver.try_recv_arrival() else {
                 break;
             };
             drained_one = true;
+            crate::ingest_budget::note_arrival();
             // Not "the pane the fetch was for": the arrival carries a layer
             // id and no pane, and what the handler needs of it is the whole
             // layer's — every pane's selection, unioned. `Gui` owns the panes
@@ -3131,7 +3159,43 @@ impl App {
         &mut self,
         arrived: &HashMap<String, squallar_egui::CurrentVolumeStamp>,
     ) {
-        for (pane_idx, layer, target) in self.arrived_volume_asks(arrived) {
+        // **Under the frame's arrival budget, and with no free first ask.**
+        //
+        // Every other row of `Ingest` lets one arrival through before it
+        // consults the clock, because a channel that is never drained is a
+        // queue that never empties. This is not a drain: the ask is not a
+        // message and holding it loses nothing, so there is nothing to starve
+        // and no reason to buy progress with a whole item. And the item is the
+        // expensive one — `prepare_volume` walks a product's moments out of
+        // the merged volume on this thread and logs its own duration in
+        // milliseconds, which is the only heavy work in this phase by
+        // `CLAUDE.md`'s meaning rather than an apply.
+        //
+        // **Held, not dropped.** A held ask marks nothing, so
+        // `mark_volume_rendered` is not reached and the pane's draw-time level
+        // trigger asks again on the next frame through `process_gui_actions`
+        // — the same fallback this dispatch already relies on when the render
+        // budget refuses one, which its own doc above calls the fallback
+        // working rather than a fault.
+        let asks = self.arrived_volume_asks(arrived);
+        if asks.is_empty() {
+            return;
+        }
+        let mut spent = self.ingest_budget_spent();
+        for (pane_idx, layer, target) in asks {
+            if spent {
+                crate::ingest_budget::note_held_build();
+                log::debug!(
+                    "3D volume view: pane {pane_idx} asked {} for {} at {} UTC as it \
+                     arrived, and this frame's arrival budget is spent; the draw loop's \
+                     level trigger will ask again",
+                    layer.as_str(),
+                    target.product.as_str(),
+                    target.volume.collected,
+                );
+                continue;
+            }
+            crate::ingest_budget::note_build();
             log::debug!(
                 "3D volume view: pane {pane_idx} asked {} for {} at {} UTC as it arrived, \
                  ahead of the draw loop",
@@ -3140,6 +3204,10 @@ impl App {
                 target.volume.collected,
             );
             self.handle_prepare_volume(pane_idx, &layer, target);
+            // Re-read after the build, not before the loop: one extract is
+            // what spends this budget, so the ask behind it is the one that
+            // must see the new answer.
+            spent = self.ingest_budget_spent();
         }
     }
 

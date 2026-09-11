@@ -38,6 +38,9 @@ pub(crate) mod frame_ledger;
 pub(crate) mod frame_need;
 /// When a session that has stopped decoding grids gives its staging blocks back.
 pub mod grid_pool_trim;
+/// What the `Ingest` phase's arrival allowance actually did — the fires
+/// counter `INGEST_BUDGET_PER_FRAME` shipped without.
+pub(crate) mod ingest_budget;
 pub mod input;
 pub mod location_hint;
 pub(crate) mod loop_frame_store;
