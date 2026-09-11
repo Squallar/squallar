@@ -1050,6 +1050,17 @@ impl FrameSource for GmgsiHandler {
         if self.frame_grids.entries.contains_key(&key) {
             return None;
         }
+        // **And the OTHER store a named frame can be drawn from** — see
+        // `MrmsHandler::fetch_frame`, which carries the account. Matched on the
+        // instant, never on the channel alone.
+        if self
+            .cached_grids
+            .entries
+            .get(&channel)
+            .is_some_and(|live| live.valid_time == key.valid)
+        {
+            return None;
+        }
         let object = self.frame_keys.get(&channel)?.get(&stamp.valid)?.clone();
         let client = ctx.client.clone();
         let sources = ctx.sources.clone();
@@ -1509,11 +1520,35 @@ impl OverlayHandler for GmgsiHandler {
     fn prepare_job(&self, ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
         let channel = self.view(pane).selected_channel;
         let granule = match ctx.frame {
-            Some(stamp) => self.frame_grids.get(FrameKey {
-                channel,
-                valid: stamp.valid,
-            })?,
-            None => self.cached_grids.get(channel)?,
+            Some(stamp) => {
+                // **The staging store first, then the live cache**, filtered on
+                // the instant — see `MrmsHandler::prepare_job`, which carries
+                // the account of why the filter is what makes this a second
+                // store rather than another instant's picture.
+                let staged = match self.frame_grids.get(FrameKey {
+                    channel,
+                    valid: stamp.valid,
+                }) {
+                    Some(granule) => Some(granule),
+                    None => self
+                        .cached_grids
+                        .get(channel)
+                        .filter(|live| live.valid_time == stamp.valid),
+                };
+                crate::render::grid_arm_ledger::note_frame(
+                    crate::render::grid_arm_ledger::GridLayer::Gmgsi,
+                    staged.is_some(),
+                );
+                staged?
+            }
+            None => {
+                let live = self.cached_grids.get(channel);
+                crate::render::grid_arm_ledger::note_live(
+                    crate::render::grid_arm_ledger::GridLayer::Gmgsi,
+                    live.is_some(),
+                );
+                live?
+            }
         };
         Some(DescribedJob::new(rasterize::GriddedInput::Resident(
             Arc::clone(&granule.grid),
@@ -1808,6 +1843,50 @@ impl OverlayHandler for GmgsiHandler {
             parked: self.frame_grids.staging.retained_bytes() as u64,
             carried: carried as u64,
         }
+    }
+
+    /// **A staged granule of the channel AND instant the live cache is
+    /// holding** — see `MrmsHandler`'s own note, which is this layer's story
+    /// too: `fetch_frame` declines a stamp `frame_grids` holds and never asks
+    /// `cached_grids`.
+    ///
+    /// Read off `entries` rather than through `get`, because both caches evict
+    /// by recency and a census read may not reorder them.
+    /// **One level here, and it is the inner one.** A live entry is a
+    /// `GmgsiGranule` held BY VALUE, so the map is its only owner and there is
+    /// no outer count to take; the bytes sit in its `grid: Arc<ResidentGrid>`,
+    /// which a described raster job clones and holds until its pixels land.
+    fn live_sole(&self) -> squallar_source::handler::LiveSole {
+        let mut out = squallar_source::handler::LiveSole::default();
+        for granule in self.cached_grids.entries.values() {
+            let bytes = granule.resident_bytes() as u64;
+            if Arc::strong_count(&granule.grid) == 1 {
+                out.sole_bytes = out.sole_bytes.saturating_add(bytes);
+                out.sole_entries = out.sole_entries.saturating_add(1);
+            } else {
+                out.shared_bytes = out.shared_bytes.saturating_add(bytes);
+                out.shared_entries = out.shared_entries.saturating_add(1);
+            }
+        }
+        out
+    }
+
+    fn staged_duplicating_live(&self) -> squallar_source::handler::StagedDuplicates {
+        let mut dupes = squallar_source::handler::StagedDuplicates::default();
+        for (key, staged) in &self.frame_grids.entries {
+            let Some(live) = self.cached_grids.entries.get(&key.channel) else {
+                continue;
+            };
+            if live.valid_time != key.valid {
+                continue;
+            }
+            if Arc::ptr_eq(&live.grid, &staged.grid) {
+                continue;
+            }
+            dupes.granules = dupes.granules.saturating_add(1);
+            dupes.bytes = dupes.bytes.saturating_add(staged.resident_bytes() as u64);
+        }
+        dupes
     }
 }
 

@@ -835,6 +835,24 @@ impl FrameSource for MrmsHandler {
         if self.frame_grids.entries.contains_key(&key) {
             return None;
         }
+        // **And the OTHER store a named frame can be drawn from.** `prepare_job`
+        // reads the staging store first and the live cache second, under the
+        // same instant — so a stamp the live cache is already holding needs no
+        // second GET and no second decode. Without this guard the two stores
+        // fill from two paths that never meet and one instant is fetched twice,
+        // decoded twice and held twice; `overlay grid dupes` is the reading
+        // that says how often. Matched on the instant and never on the product
+        // alone: the live cache holds ONE granule per product, and accepting it
+        // for any other stamp is the "one instant's mosaic presented as
+        // another's" defect `prepare_job` refuses by construction.
+        if self
+            .cached_grids
+            .entries
+            .get(&product)
+            .is_some_and(|live| live.valid == key.valid)
+        {
+            return None;
+        }
         let object = self.frame_keys.get(&product)?.get(&stamp.valid)?.clone();
         let client = ctx.client.clone();
         let sources = ctx.sources.clone();
@@ -1278,11 +1296,42 @@ impl OverlayHandler for MrmsHandler {
     fn prepare_job(&self, ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
         let product = self.view(pane).selected_product;
         let grid: &MrmsGrid = match ctx.frame {
-            Some(stamp) => self.frame_grids.get(FrameKey {
-                product,
-                valid: stamp.valid,
-            })?,
-            None => self.cached_grids.get(product)?,
+            Some(stamp) => {
+                // **The staging store first, then the live cache** — one
+                // instant, two stores, and a named frame is drawn from
+                // whichever holds it. `ModelDataHandler::prepare_job` has read
+                // both all along and states the reason this is not a fallback
+                // to another instant's picture: the second arm is filtered on
+                // `valid == stamp.valid`, so the granule it finds depicts
+                // exactly the stamp that was asked for. An unfiltered fall-back
+                // to `cached_grids` WOULD be that defect -- it holds one
+                // granule per product and would hand every frame of a loop the
+                // same picture.
+                let staged = match self.frame_grids.get(FrameKey {
+                    product,
+                    valid: stamp.valid,
+                }) {
+                    Some(granule) => Some(granule),
+                    None => self
+                        .cached_grids
+                        .get(product)
+                        .map(|live| &**live)
+                        .filter(|live| live.valid == stamp.valid),
+                };
+                crate::render::grid_arm_ledger::note_frame(
+                    crate::render::grid_arm_ledger::GridLayer::Mrms,
+                    staged.is_some(),
+                );
+                staged?
+            }
+            None => {
+                let live = self.cached_grids.get(product);
+                crate::render::grid_arm_ledger::note_live(
+                    crate::render::grid_arm_ledger::GridLayer::Mrms,
+                    live.is_some(),
+                );
+                &**live?
+            }
         };
         Some(DescribedJob::new(rasterize::GriddedInput::Resident(
             Arc::clone(&grid.grid),
@@ -1576,6 +1625,60 @@ impl OverlayHandler for MrmsHandler {
             parked: self.frame_grids.staging.retained_bytes() as u64,
             carried: carried as u64,
         }
+    }
+
+    /// **A staged granule of the product AND instant the live cache is holding**
+    /// — two decodes of one mosaic.
+    ///
+    /// `fetch_frame` declines a stamp `frame_grids` already holds and never
+    /// asks `cached_grids`, so the granule the auto-poll fetched is fetched a
+    /// second time the moment the loop's window reaches its instant.
+    ///
+    /// Read off `entries` rather than through `get`: **a census read may not
+    /// reorder the cache it is reading.** Both caches evict by recency, and
+    /// `MrmsGridCache::get`/`MrmsFrameCache::get` touch — so asking this
+    /// question through the front door would make the telemetry tick a
+    /// participant in the eviction order it is reporting on.
+    /// **Sole only when BOTH levels have one owner.** A live entry is an
+    /// `Arc<MrmsGrid>` whose `grid` is an `Arc<ResidentGrid>`, and the bytes
+    /// are in the inner one — so two counts have to be 1, not one. The outer
+    /// is shared with `state.data` on every path that sets it; the inner is
+    /// shared with any raster job `prepare_job` has described, which clones it
+    /// and holds it until the job's pixels land.
+    fn live_sole(&self) -> squallar_source::handler::LiveSole {
+        let mut out = squallar_source::handler::LiveSole::default();
+        for grid in self.cached_grids.entries.values() {
+            let bytes = grid.resident_bytes() as u64;
+            let sole = Arc::strong_count(grid) == 1 && Arc::strong_count(&grid.grid) == 1;
+            if sole {
+                out.sole_bytes = out.sole_bytes.saturating_add(bytes);
+                out.sole_entries = out.sole_entries.saturating_add(1);
+            } else {
+                out.shared_bytes = out.shared_bytes.saturating_add(bytes);
+                out.shared_entries = out.shared_entries.saturating_add(1);
+            }
+        }
+        out
+    }
+
+    fn staged_duplicating_live(&self) -> squallar_source::handler::StagedDuplicates {
+        let mut dupes = squallar_source::handler::StagedDuplicates::default();
+        for (key, staged) in &self.frame_grids.entries {
+            let Some(live) = self.cached_grids.entries.get(&key.product) else {
+                continue;
+            };
+            if live.valid != key.valid {
+                continue;
+            }
+            // The allocation, not the key: a granule the two stores already
+            // share costs one copy and there is nothing to give back.
+            if Arc::ptr_eq(&live.grid, &staged.grid) {
+                continue;
+            }
+            dupes.granules = dupes.granules.saturating_add(1);
+            dupes.bytes = dupes.bytes.saturating_add(staged.resident_bytes() as u64);
+        }
+        dupes
     }
 }
 

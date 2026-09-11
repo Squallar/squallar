@@ -1646,6 +1646,134 @@ pub fn overlay_grid_states() -> (u64, u64, u64, u64) {
     )
 }
 
+/// **How much of `staged` is a SECOND COPY of something `live` already holds**
+/// — the overlap between the two halves of `overlay grids`.
+///
+/// `overlay grid states` reports `live` and `staged` as two honest terms and
+/// cannot say whether one is the same data as the other. A gridded layer fills
+/// its two stores from two paths that never meet, and `fetch_frame` declines a
+/// stamp the *staging* store holds while never asking the live cache — so an
+/// instant both want is fetched twice, decoded twice and held twice.
+///
+/// **`walks` is the floor, and it is why this row is quotable.** A count of
+/// zero duplicates is a healthy reading and is *also* exactly what a walk that
+/// never ran prints. The two are told apart here and nowhere else: `0 granules,
+/// 0 B, 202 walks` says the question was asked two hundred times and the answer
+/// was no, where `0 granules, 0 B, 0 walks` says nothing at all.
+///
+/// **Never added to `overlay grids`.** This is a decomposition OF `staged`, not
+/// a population beside it; adding it would double bytes the family already
+/// carries in full.
+///
+/// **Always emitted, including all-zero.**
+pub fn overlay_grid_dupes_line(instance: &str) -> String {
+    use core::fmt::Write;
+
+    let mut out = String::new();
+    let (granules, bytes, walks) = overlay_grid_dupes();
+    let _ = write!(
+        out,
+        "overlay grid dupes ({instance}): {granules} granules, {bytes} B, {walks} walks",
+    );
+    out
+}
+
+/// **The live half of `overlay grids`, split by whether a release could give it
+/// back** — `sole` against `shared`.
+///
+/// `overlay grid states`' `live` term is what the live caches HOLD. It is not
+/// what releasing them would free: `prepare_job` hands a described raster job
+/// an `Arc::clone` of the grid, and a layer's own `OverlayState` carries its
+/// own reference, so a live entry can have two or three owners and dropping the
+/// cache's reference frees nothing until the last one goes.
+///
+/// **Only `sole` is quotable as a cut.** A delta claimed on the `live` total is
+/// a claim on bytes a raster job is still holding — the failure this row
+/// exists to stop.
+///
+/// `sole + shared` is the `live` term, so this is a decomposition of it and is
+/// **never added** to it or to any other row. `walks` is the floor, for the
+/// reason [`overlay_grid_dupes_line`] states.
+///
+/// **Always emitted, including all-zero.**
+pub fn overlay_grid_live_sole_line(instance: &str) -> String {
+    use core::fmt::Write;
+
+    let mut out = String::new();
+    let (sole, shared, sole_n, shared_n, walks) = overlay_grid_live_sole();
+    let _ = write!(
+        out,
+        "overlay grid live sole ({instance}): sole {sole} B over {sole_n} entries, \
+         shared {shared} B over {shared_n} entries, {walks} walks",
+    );
+    out
+}
+
+static OVERLAY_GRID_LIVE_SOLE: [core::sync::atomic::AtomicU64; 5] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Publish the sole/shared split of the live half, from the same site and the
+/// same walk as the rest. The walk counter is bumped here, by the publisher, so
+/// it counts asks rather than fires.
+pub fn set_overlay_grid_live_sole(
+    sole_bytes: u64,
+    shared_bytes: u64,
+    sole_entries: u64,
+    shared_entries: u64,
+) {
+    use core::sync::atomic::Ordering::Relaxed;
+    OVERLAY_GRID_LIVE_SOLE[0].store(sole_bytes, Relaxed);
+    OVERLAY_GRID_LIVE_SOLE[1].store(shared_bytes, Relaxed);
+    OVERLAY_GRID_LIVE_SOLE[2].store(sole_entries, Relaxed);
+    OVERLAY_GRID_LIVE_SOLE[3].store(shared_entries, Relaxed);
+    OVERLAY_GRID_LIVE_SOLE[4].fetch_add(1, Relaxed);
+}
+
+/// The sole/shared split as last published, and the walks behind it.
+pub fn overlay_grid_live_sole() -> (u64, u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        OVERLAY_GRID_LIVE_SOLE[0].load(Relaxed),
+        OVERLAY_GRID_LIVE_SOLE[1].load(Relaxed),
+        OVERLAY_GRID_LIVE_SOLE[2].load(Relaxed),
+        OVERLAY_GRID_LIVE_SOLE[3].load(Relaxed),
+        OVERLAY_GRID_LIVE_SOLE[4].load(Relaxed),
+    )
+}
+
+static OVERLAY_GRID_DUPES: [core::sync::atomic::AtomicU64; 3] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Publish the overlap, from the same site and the same walk as the rest.
+///
+/// The walk counter is bumped **here**, by the publisher, so it counts asks
+/// rather than fires: a caller cannot record an answer without recording that
+/// it asked.
+pub fn set_overlay_grid_dupes(granules: u64, bytes: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    OVERLAY_GRID_DUPES[0].store(granules, Relaxed);
+    OVERLAY_GRID_DUPES[1].store(bytes, Relaxed);
+    OVERLAY_GRID_DUPES[2].fetch_add(1, Relaxed);
+}
+
+/// The overlap as last published, and the number of walks behind it.
+pub fn overlay_grid_dupes() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        OVERLAY_GRID_DUPES[0].load(Relaxed),
+        OVERLAY_GRID_DUPES[1].load(Relaxed),
+        OVERLAY_GRID_DUPES[2].load(Relaxed),
+    )
+}
+
 static OVERLAY_GRID_SPLIT: [core::sync::atomic::AtomicU64; 5] = [
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),

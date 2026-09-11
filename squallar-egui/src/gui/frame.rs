@@ -154,6 +154,24 @@ impl Gui {
             split.parked,
             split.carried,
         );
+        // **How much of `staged` is a second copy of something `live` holds.**
+        // A second walk of the same handlers rather than a term of the split,
+        // because it is not a partition of the family: it re-reads bytes the
+        // split has already attributed and says something else about them.
+        // Taken here so the row and the two above are one frame's answer.
+        let dupes = self.overlays.staged_duplicating_live();
+        crate::heap_census::set_overlay_grid_dupes(dupes.granules, dupes.bytes);
+        // **And how much of the live half a release could actually give back.**
+        // Same walk, same frame: a cut at the live caches is scored on `sole`,
+        // never on the `live` term above, because `shared` is bytes a described
+        // raster job or a layer's carry is still holding.
+        let sole = self.overlays.live_sole();
+        crate::heap_census::set_overlay_grid_live_sole(
+            sole.sole_bytes,
+            sole.shared_bytes,
+            sole.sole_entries,
+            sole.shared_entries,
+        );
         // **The item half of the same question**, and two families rather
         // than one because they answer different things: what a layer has
         // INSTALLED, and what it has RETIRED and not yet handed to the

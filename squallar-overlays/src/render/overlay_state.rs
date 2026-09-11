@@ -1099,6 +1099,41 @@ impl OverlayRegistry {
         split
     }
 
+    /// **The overlap between the live and staged halves of `overlay grids`** —
+    /// one walk over the same handlers, folded.
+    ///
+    /// `resident_source_split` says how much is `live` and how much is
+    /// `staged`; this says how much of `staged` is a SECOND COPY of something
+    /// `live` is already holding. See
+    /// [`squallar_source::handler::SourceHandler::staged_duplicating_live`] for
+    /// why the two stores can hold one instant twice.
+    ///
+    /// Same cost as the split — one pass, each answer a walk of a cache holding
+    /// at most a handful of entries — so the publish site may take it on the
+    /// telemetry tick beside the other two.
+    pub fn staged_duplicating_live(&self) -> squallar_source::handler::StagedDuplicates {
+        let mut total = squallar_source::handler::StagedDuplicates::default();
+        for handler in self.handlers() {
+            total.add(handler.staged_duplicating_live());
+        }
+        total
+    }
+
+    /// **The live half of `overlay grids`, split by whether a release could
+    /// give it back** — one walk over the same handlers, folded.
+    ///
+    /// See
+    /// [`squallar_source::handler::SourceHandler::live_sole`]: `sole` is the
+    /// only half a cut may be scored on, because `shared` is bytes a raster job
+    /// or a layer's own carry is still holding.
+    pub fn live_sole(&self) -> squallar_source::handler::LiveSole {
+        let mut total = squallar_source::handler::LiveSole::default();
+        for handler in self.handlers() {
+            total.add(handler.live_sole());
+        }
+        total
+    }
+
     // ── Config persistence ────────────────────────────────────────────
 
     /// Keyed by the layer id **string** ([`LayerId::as_str`]) — the exact

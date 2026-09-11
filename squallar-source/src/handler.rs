@@ -1563,6 +1563,60 @@ pub trait SourceHandler: Send {
             carried: 0,
         }
     }
+
+    /// **Staged granules whose instant the LIVE store is already holding** —
+    /// the same data, twice, in two allocations.
+    ///
+    /// [`Self::resident_source_states`] reports `live` and `staged` as two
+    /// terms, and two is the right shape: they have different prices. What it
+    /// cannot say is whether one term is *the same data* as the other. A
+    /// gridded layer fills its two stores from two paths that never meet — the
+    /// auto-poll's `apply_fetch_result` into the live cache, a loop frame's
+    /// `apply_frame` into the staging store — and `fetch_frame` declines a
+    /// stamp the *staging* store already holds while never asking the live
+    /// cache at all. So an instant both stores want is fetched twice, decoded
+    /// twice and held twice, and the census reports it as two honest terms.
+    ///
+    /// **A counter and not an assertion**, because whether that overlap is
+    /// empty is a property of the scene — of where a loop's window sits
+    /// relative to the poll — rather than of this code. A build where it reads
+    /// zero on every scene has nothing to save and this says so; the figure
+    /// carries its own floor at the publish site.
+    ///
+    /// A granule the two stores genuinely **share** is not an overlap: it is
+    /// one allocation, and there is nothing to give back. Implementations
+    /// compare the allocation, not just the key.
+    ///
+    /// Same cost contract as the figures it qualifies — no grid contents, no
+    /// allocation, no blocking lock — and the default is "no overlap", which
+    /// is exactly right for a handler with one store.
+    fn staged_duplicating_live(&self) -> StagedDuplicates {
+        StagedDuplicates::default()
+    }
+
+    /// **How much of the live half this handler is the SOLE owner of** — the
+    /// only part of it a release could actually give back.
+    ///
+    /// `resident_source_states`' `live` term is what the live cache is
+    /// holding. It is **not** what releasing the live cache would free, and
+    /// the difference is not small: `prepare_job` hands a raster job
+    /// `Arc::clone` of the grid it describes, and a layer's own `OverlayState`
+    /// carries its own reference — so a live entry can have two or three
+    /// owners, and dropping the cache's reference frees nothing until the last
+    /// one goes.
+    ///
+    /// A cut scored on the family total rather than on this figure claims
+    /// bytes another owner is still holding. Implementations read the
+    /// allocation's own strong count, at **every** level that owns bytes: an
+    /// entry is `sole` only when dropping the cache's reference drops the
+    /// grid.
+    ///
+    /// Same cost contract as the rest — one relaxed atomic load per entry over
+    /// a cache bounded at a handful of grids, no contents, no allocation, no
+    /// blocking lock.
+    fn live_sole(&self) -> LiveSole {
+        LiveSole::default()
+    }
 }
 
 /// **What state a handler's decoded source bytes are held in** — see
@@ -1593,6 +1647,63 @@ impl SourceResidencyStates {
             .saturating_add(self.staged)
             .saturating_add(self.parked)
             .saturating_add(self.carried)
+    }
+}
+
+/// **The overlap between a handler's live store and its frame staging store**
+/// — see [`SourceHandler::staged_duplicating_live`].
+///
+/// Two figures and not one, and they are never added to anything: `granules`
+/// is a count of cache entries and `bytes` is what those entries cost. A
+/// reader who added them to `overlay grids` would double a term the family
+/// already carries in full — this is a decomposition OF `staged`, not a
+/// population beside it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StagedDuplicates {
+    /// Staged granules whose instant the live store also holds **in a
+    /// different allocation**. A shared allocation is one copy and is not
+    /// counted.
+    pub granules: u64,
+    /// What those granules cost — the bytes sharing the allocation gives back.
+    pub bytes: u64,
+}
+
+impl StagedDuplicates {
+    /// Fold another handler's answer in.
+    pub fn add(&mut self, other: Self) {
+        self.granules = self.granules.saturating_add(other.granules);
+        self.bytes = self.bytes.saturating_add(other.bytes);
+    }
+}
+
+/// **The live half split by whether a release could give it back** — see
+/// [`SourceHandler::live_sole`].
+///
+/// `sole + shared` is the `live` term of
+/// [`SourceHandler::resident_source_states`], so this is a decomposition of
+/// that figure and is never added to it. **`sole` is the only half quotable as
+/// a cut**: `shared` is bytes a second owner — an in-flight raster job, the
+/// layer's own carry — is holding, and releasing the cache leaves every one of
+/// them resident.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LiveSole {
+    /// Bytes in allocations this handler's live cache is the only owner of.
+    pub sole_bytes: u64,
+    /// Bytes in allocations someone else also holds. **Not free to take.**
+    pub shared_bytes: u64,
+    /// Live entries counted into `sole_bytes`.
+    pub sole_entries: u64,
+    /// Live entries counted into `shared_bytes`.
+    pub shared_entries: u64,
+}
+
+impl LiveSole {
+    /// Fold another handler's answer in.
+    pub fn add(&mut self, other: Self) {
+        self.sole_bytes = self.sole_bytes.saturating_add(other.sole_bytes);
+        self.shared_bytes = self.shared_bytes.saturating_add(other.shared_bytes);
+        self.sole_entries = self.sole_entries.saturating_add(other.sole_entries);
+        self.shared_entries = self.shared_entries.saturating_add(other.shared_entries);
     }
 }
 

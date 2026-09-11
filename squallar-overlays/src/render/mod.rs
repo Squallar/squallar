@@ -3,6 +3,7 @@ pub mod demand_ledger;
 pub mod draw;
 pub mod footprint;
 pub mod geo;
+pub mod grid_arm_ledger;
 pub mod gridded;
 // `pub` so the frontend's described-job dispatch tests can name the three
 // polygon kinds' fetch-result types — see `handlers`'s own module comment.

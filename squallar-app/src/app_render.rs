@@ -3955,6 +3955,29 @@ impl super::App {
             loud,
             &squallar_egui::heap_census::overlay_grid_states_line("page"),
         );
+        // **The overlap between the two states above**, its own row and added
+        // to neither: it re-reports bytes `staged` already carries in full.
+        // Its `walks` term is the floor — a zero-duplicate reading and a walk
+        // that never ran print the same two leading figures and are told apart
+        // only by that third one.
+        say_telemetry(
+            loud,
+            &squallar_egui::heap_census::overlay_grid_dupes_line("page"),
+        );
+        // **Which of the two stores the dispatch actually READ**, counts only
+        // and never added to the byte rows above: `overlay grid states` prices
+        // the live and staged halves, this says whether either was reached. A
+        // store nothing reads is the only kind a cut can take whole.
+        say_telemetry(
+            loud,
+            &squallar_overlays::render::grid_arm_ledger::arms_line("page"),
+        );
+        // **And of the live half, the part a release could give back**, its own
+        // row and added to nothing: `sole + shared` is the `live` term above.
+        say_telemetry(
+            loud,
+            &squallar_egui::heap_census::overlay_grid_live_sole_line("page"),
+        );
         say_telemetry(loud, &squallar_egui::heap_census::large_grants_line("page"));
         // **The HTTP body reader's own line**, beside the grants and never
         // added to them: `peak shard` is the transport-buffer residency the

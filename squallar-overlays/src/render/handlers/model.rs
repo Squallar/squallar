@@ -1923,11 +1923,24 @@ impl OverlayHandler for ModelDataHandler {
                 // finds depicts exactly the stamp that was asked for. It is
                 // what lets a pane parked on an hour its own loop also names
                 // rasterize that frame without a round trip.
-                self.frame_grids
+                let staged = self
+                    .frame_grids
                     .get(key)
-                    .or_else(|| self.cached_grids.get(key))?
+                    .or_else(|| self.cached_grids.get(key));
+                crate::render::grid_arm_ledger::note_frame(
+                    crate::render::grid_arm_ledger::GridLayer::Model,
+                    staged.is_some(),
+                );
+                staged?
             }
-            None => self.grid_of(pane)?,
+            None => {
+                let live = self.grid_of(pane);
+                crate::render::grid_arm_ledger::note_live(
+                    crate::render::grid_arm_ledger::GridLayer::Model,
+                    live.is_some(),
+                );
+                live?
+            }
         }
         .clone();
         Some(DescribedJob::new(rasterize::GriddedInput::Whole(grid)))
@@ -2361,6 +2374,48 @@ impl OverlayHandler for ModelDataHandler {
             parked: 0,
             carried: carried as u64,
         }
+    }
+
+    /// **A staged grid under a `GridKey` the live cache also holds** — and this
+    /// layer is the one where the two stores could share with no conversion at
+    /// all: both are `HashMap<GridKey, Arc<HrrrGridData>>`, the same key type
+    /// over the same `Arc`.
+    ///
+    /// Read off `entries` rather than through `get`, because both caches evict
+    /// by recency and a census read may not reorder them.
+    /// **One `Arc` per entry and one count to read.** The live cache holds
+    /// `Arc<HrrrGridData>` directly, and the other owners are this layer's own
+    /// carry and any raster job `prepare_job` has described — this layer's
+    /// frame arm hands the job a clone of whichever store answered, so a grid
+    /// both stores name reads `shared` here and is correctly not claimable.
+    fn live_sole(&self) -> squallar_source::handler::LiveSole {
+        let mut out = squallar_source::handler::LiveSole::default();
+        for grid in self.cached_grids.entries.values() {
+            let bytes = grid_bytes(grid) as u64;
+            if Arc::strong_count(grid) == 1 {
+                out.sole_bytes = out.sole_bytes.saturating_add(bytes);
+                out.sole_entries = out.sole_entries.saturating_add(1);
+            } else {
+                out.shared_bytes = out.shared_bytes.saturating_add(bytes);
+                out.shared_entries = out.shared_entries.saturating_add(1);
+            }
+        }
+        out
+    }
+
+    fn staged_duplicating_live(&self) -> squallar_source::handler::StagedDuplicates {
+        let mut dupes = squallar_source::handler::StagedDuplicates::default();
+        for (key, staged) in &self.frame_grids.entries {
+            let Some(live) = self.cached_grids.entries.get(key) else {
+                continue;
+            };
+            if Arc::ptr_eq(live, staged) {
+                continue;
+            }
+            dupes.granules = dupes.granules.saturating_add(1);
+            dupes.bytes = dupes.bytes.saturating_add(grid_bytes(staged) as u64);
+        }
+        dupes
     }
 
     /// **Let go of every decoded grid**, live cache and staging area both.
