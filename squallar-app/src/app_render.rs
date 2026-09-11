@@ -11778,6 +11778,12 @@ mod loop_decoded_census_tests;
 #[cfg(test)]
 mod loop_decode_publication_tests;
 
+/// The playhead's own frame: that the decode pump actually delivers the
+/// moments the residency sweep says it wants, at the frame on the glass.
+#[path = "app_render/loop_playhead_residency_tests.rs"]
+#[cfg(test)]
+mod loop_playhead_residency_tests;
+
 /// The native rig seeds the keys this app reads, into the filenames its store
 /// opens — one scene's path through shell, python and two rust crates.
 #[path = "app_render/native_seed_pin_tests.rs"]
