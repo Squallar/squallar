@@ -1490,6 +1490,12 @@ fn every_frame_line_family_the_app_writes_has_a_named_rig_probe() {
         // literal `frame panes (` would scrape `frame ui (panes)` as one of
         // its own eight.
         ("panes", &["frame_panes_re"]),
+        // `frame panes (content)`, opened up — `panes`' own sibling one cut
+        // further down, and a fifth prefix for the fourth one's reason:
+        // `content` is also a `panes` CUT NAME, so a probe anchored on
+        // anything looser than the literal `frame content (` would scrape
+        // `frame panes (content)` as one of its own ten.
+        ("content", &["frame_content_re"]),
         // Three probes, one family word. `frame service less present (…)`
         // is the SAME `service` family word — the enumeration below reads to
         // the first non-lowercase character — and it is deliberately the
