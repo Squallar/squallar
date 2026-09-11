@@ -77,8 +77,6 @@ thiserror = { workspace = true }
 # `Instant` for the feed/notifier clocks in `chunk_feed`/`chunk_notify`
 # (WO-RF1): std's on native, `performance.now()` on wasm.
 web-time = { workspace = true }
-# ListObjectsV2 response parsing in `archive`. Pure Rust (xml-rs).
-xml = "=1.4.0"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # rayon's locks spin where waiting is forbidden. `Atomics.wait` traps on a
@@ -93,6 +91,11 @@ rayon = { version = "=1.12.0", features = ["web_spin_lock"] }
 # ungated entry breaks `cargo check --target wasm32-unknown-unknown`.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# The oracle `archive::listing::tests` pins the ListObjectsV2 scanner against.
+# It parsed those responses in the shipped build until the scanner replaced it;
+# it stays here so the replacement is checked against it rather than against a
+# transcription of what it used to do.
+xml = "=1.4.0"
 # The hail sanity harness re-runs `nexrad-level3`'s whole-file zlib strip on
 # raw NHI objects to reach their Tabular Alphanumeric Block.
 flate2 = { workspace = true }

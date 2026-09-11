@@ -10,9 +10,11 @@ use std::sync::OnceLock;
 
 use chrono::NaiveDate;
 use reqwest::StatusCode;
-use xml::reader::{EventReader, XmlEvent};
 
 use crate::sources::DataSources;
+
+mod listing;
+use listing::parse_list_page;
 
 /// How long a single archive request may take, end to end. Upstream had *no*
 const ARCHIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
@@ -144,89 +146,6 @@ fn key_to_identifier(key: &str) -> Identifier {
     Identifier::new(key.split('/').skip(4).collect::<String>())
 }
 
-/// One page of a `ListObjectsV2` response.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct ListPage {
-    /// In the order S3 returned them, which is UTF-8 binary order.
-    keys: Vec<String>,
-    /// The `CommonPrefixes` a delimited listing collapsed everything below into.
-    common_prefixes: Vec<String>,
-    truncated: bool,
-    next_token: Option<String>,
-}
-
-/// Which element's character data is currently being accumulated.
-#[derive(PartialEq, Eq)]
-enum Field {
-    Key,
-    CommonPrefix,
-    IsTruncated,
-    NextToken,
-}
-
-/// Parse one `ListBucketResult` document. Only `Contents/Key`,
-/// `CommonPrefixes/Prefix`, `IsTruncated` and `NextContinuationToken` are read.
-fn parse_list_page(body: &str) -> Result<ListPage> {
-    let mut page = ListPage::default();
-    let mut field: Option<Field> = None;
-    let mut in_contents = false;
-    let mut in_common_prefixes = false;
-    let mut buffer = String::new();
-
-    for event in EventReader::new(body.as_bytes()) {
-        let event = event.map_err(|e| ArchiveError::MalformedListing(e.to_string()))?;
-        match event {
-            XmlEvent::StartElement { name, .. } => {
-                buffer.clear();
-                field = match name.local_name.as_str() {
-                    "Contents" => {
-                        in_contents = true;
-                        None
-                    }
-                    "CommonPrefixes" => {
-                        in_common_prefixes = true;
-                        None
-                    }
-                    "Key" if in_contents => Some(Field::Key),
-                    "Prefix" if in_common_prefixes => Some(Field::CommonPrefix),
-                    "IsTruncated" => Some(Field::IsTruncated),
-                    "NextContinuationToken" => Some(Field::NextToken),
-                    _ => None,
-                };
-            }
-            XmlEvent::Characters(chars) => {
-                if field.is_some() {
-                    buffer.push_str(&chars);
-                }
-            }
-            XmlEvent::EndElement { name } => {
-                match name.local_name.as_str() {
-                    "Contents" => in_contents = false,
-                    "CommonPrefixes" => in_common_prefixes = false,
-                    "Key" if field == Some(Field::Key) => {
-                        page.keys.push(std::mem::take(&mut buffer));
-                    }
-                    "Prefix" if field == Some(Field::CommonPrefix) => {
-                        page.common_prefixes.push(std::mem::take(&mut buffer));
-                    }
-                    "IsTruncated" if field == Some(Field::IsTruncated) => {
-                        page.truncated = buffer.trim() == "true";
-                    }
-                    "NextContinuationToken" if field == Some(Field::NextToken) => {
-                        page.next_token = Some(std::mem::take(&mut buffer));
-                    }
-                    _ => {}
-                }
-                field = None;
-                buffer.clear();
-            }
-            _ => {}
-        }
-    }
-
-    Ok(page)
-}
-
 /// Follow `NextContinuationToken` until the listing is complete. `fetch_page`
 /// takes the fully-built URL so a test can see what would have gone on the wire.
 pub(crate) async fn collect_keys<F, Fut>(
@@ -248,6 +167,12 @@ where
         keys.extend(page.keys);
 
         if !page.truncated {
+            let (pages, bytes) = listing::scanned_totals();
+            log::debug!(
+                "listing for prefix {prefix:?} complete: {} keys; {pages} pages and {bytes} wire \
+                 bytes scanned this process",
+                keys.len()
+            );
             return Ok(keys);
         }
         let Some(next) = page.next_token else {
@@ -285,6 +210,12 @@ where
         prefixes.extend(page.common_prefixes);
 
         if !page.truncated {
+            let (pages, bytes) = listing::scanned_totals();
+            log::debug!(
+                "delimited listing for prefix {prefix:?} complete: {} prefixes; {pages} pages and \
+                 {bytes} wire bytes scanned this process",
+                prefixes.len()
+            );
             return Ok(prefixes);
         }
         let Some(next) = page.next_token else {
