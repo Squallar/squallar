@@ -623,6 +623,9 @@ pub(super) fn render_pane_map_content(
         // Restored after every arm below; the notices painted after the loop
         // run at it.
         let base_opacity = ui.opacity();
+        if ctx.surfaces == PaneSurfaces::GroundAndGlass {
+            say_undrawn_still_radar(ctx, &draw_order);
+        }
         at = PanesCuts::charge(&mut cc.prologue_ns, at);
         for id in &draw_order {
             if !ctx.pane.is_overlay_enabled(id) {
@@ -679,6 +682,7 @@ pub(super) fn render_pane_map_content(
                                 projector,
                                 &img,
                                 ctx.pane,
+                                ctx.pane_idx,
                                 ctx.pane_rect,
                                 ctx.preferences,
                                 fan.as_ref(),
@@ -713,6 +717,7 @@ pub(super) fn render_pane_map_content(
                                 &sweeps,
                                 painter.as_ref(),
                                 ctx.surfaces,
+                                ctx.pane_idx,
                             );
                         } else if let Some(tex) =
                             ctx.pane.overlay_cache(id).and_then(|c| c.current())
@@ -1418,6 +1423,34 @@ pub(crate) fn resolved_layer_opacity(
     if clamped == 0.0 { 0.0 } else { clamped }
 }
 
+/// **A still radar surface the walk is never going to reach**, said once.
+///
+/// The fan fork says why a fan it was handed was refused; this is the case
+/// before it, where the pane holds a rendered surface -- the fan or the
+/// raster, `radar_meta_on_screen` answers for either -- and the walk skips
+/// radar's arm without asking: the slot is off, or the stack has no radar
+/// slot at all. Both are legitimate states a pane can be in and neither is a
+/// hole in the picture; what they are is invisible from a console whose
+/// every other line says the volume downloaded, decoded and rendered.
+///
+/// Cheap on the common path: an enabled radar slot is one indexed lookup and
+/// a return. Only a pane whose radar is off or absent reads further.
+fn say_undrawn_still_radar(ctx: &PaneRenderCtx<'_>, draw_order: &[LayerId]) {
+    use crate::radar_fan::notice::{self, Undrawn};
+    if ctx.pane.is_overlay_enabled(&known::RADAR) {
+        return;
+    }
+    let reason = if draw_order.contains(&known::RADAR) {
+        Undrawn::SlotDisabled
+    } else {
+        Undrawn::NotInDrawList
+    };
+    let Some(meta) = ctx.pane.radar_meta_on_screen() else {
+        return;
+    };
+    notice::undrawn(ctx.pane_idx, &meta.product, reason);
+}
+
 /// **The as-of half of the cache token, and it is `0` on a live pane.**
 ///
 /// An [`TimeAxis::EventLifetime`] layer's picture is *which items are valid at
@@ -1487,6 +1520,7 @@ fn render_radar_overlay(
     projector: &walkers::Projector,
     img: &RadarImageData,
     pane: &mut PaneState,
+    pane_idx: usize,
     pane_rect: egui::Rect,
     prefs: &UserPreferences,
     fan: Option<&std::sync::Arc<dyn crate::radar_fan::RadarFanPainter>>,
@@ -1502,7 +1536,15 @@ fn render_radar_overlay(
             );
         }
         crate::pane::RadarSurface::Fan(sweeps) => {
-            draw_radar_fan(ui, projector, (img.lat, img.lon), sweeps, fan, surfaces);
+            draw_radar_fan(
+                ui,
+                projector,
+                (img.lat, img.lon),
+                sweeps,
+                fan,
+                surfaces,
+                pane_idx,
+            );
         }
     }
 
@@ -1583,6 +1625,9 @@ fn render_radar_overlay(
 /// `the_fan_draws_at_the_position_the_user_ordered_radar_into` holds that the
 /// callback takes radar's ordered position and that there is exactly one of
 /// them per pane.
+///
+/// `pane_idx` is for the line a refusal prints, and for nothing else: the
+/// decision is [`issue_radar_fan`]'s and does not read it.
 fn draw_radar_fan(
     ui: &egui::Ui,
     projector: &walkers::Projector,
@@ -1590,9 +1635,21 @@ fn draw_radar_fan(
     sweeps: &Arc<[Arc<crate::radar_fan::FanSweep>]>,
     painter: Option<&Arc<dyn crate::radar_fan::RadarFanPainter>>,
     surfaces: PaneSurfaces,
+    pane_idx: usize,
 ) -> crate::radar_fan::FanOutcome {
     let outcome = issue_radar_fan(ui, projector, site, sweeps, painter, surfaces);
     crate::radar_fan::ledger::note(outcome);
+    // Counted above on every pass; SAID once per (pane, reason) -- see
+    // `radar_fan::notice`.
+    if let crate::radar_fan::FanOutcome::Refused(refusal) = outcome {
+        crate::radar_fan::notice::refused(
+            crate::radar_fan::notice::Subject {
+                pane: pane_idx,
+                sweeps,
+            },
+            refusal,
+        );
+    }
     outcome
 }
 

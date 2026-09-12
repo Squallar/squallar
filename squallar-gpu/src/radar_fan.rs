@@ -1477,6 +1477,95 @@ impl egui_wgpu::CallbackTrait for RadarFanCallback {
 #[derive(Default)]
 pub struct RadarFanBridge;
 
+/// **Which check declined, said once per check.**
+///
+/// The `None` this bridge answers reaches `squallar_egui`'s draw fork as one
+/// arm -- `PainterDeclined` -- and that side says so once per pane, naming
+/// the pane and the product. It cannot name the check: the seam is an
+/// `Option`, and widening it to carry a reason would put this crate's
+/// vocabulary in the UI crate's. So the check is named here, once per
+/// [`FanRefusal`] arm for the life of the process, beside the values that
+/// failed it. Read the two lines together: the pane's says WHERE, this one
+/// says WHAT.
+///
+/// The words go out through `squallar_egui::radar_fan::notice`, which holds
+/// the log facade: this crate's dependency charter (`tests/charter.rs`)
+/// admits no `log` of its own, and one line is not the case for amending
+/// it. The once-ness is decided HERE, where the arms are known, so the
+/// `Debug` formatting on the other side of the call happens once too.
+mod declined_notice {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    use super::FanRefusal;
+
+    static SAID: AtomicU8 = AtomicU8::new(0);
+
+    const fn bit(refusal: &FanRefusal) -> u8 {
+        match refusal {
+            FanRefusal::Shape { .. } => 1 << 0,
+            FanRefusal::CodeBytes { .. } => 1 << 1,
+            FanRefusal::LutBytes { .. } => 1 << 2,
+            FanRefusal::EdgeCount { .. } => 1 << 3,
+            FanRefusal::GateInterval(_) => 1 << 4,
+            FanRefusal::Site => 1 << 5,
+        }
+    }
+
+    /// Say `refusal` the first time its arm is met; `true` when this call
+    /// said it.
+    pub(super) fn say(refusal: &FanRefusal) -> bool {
+        let bit = bit(refusal);
+        if SAID.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+            return false;
+        }
+        squallar_egui::radar_fan::notice::renderer_declined(refusal);
+        true
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Once per ARM, not per value: two `Shape` refusals with different
+        /// numbers are one line, and a `Site` after them is another.
+        #[test]
+        fn each_check_is_said_once() {
+            let shape_a = FanRefusal::Shape {
+                radials: 0,
+                gates: 0,
+            };
+            let shape_b = FanRefusal::Shape {
+                radials: 1,
+                gates: 0,
+            };
+            // Another test in this process may have said `Shape` first; what
+            // is held is that the SECOND of these two is never said.
+            let _ = say(&shape_a);
+            assert!(!say(&shape_b), "a second Shape refusal was said again");
+            let _ = say(&FanRefusal::Site);
+            assert!(!say(&FanRefusal::Site));
+        }
+
+        /// The `Debug` form the line prints is ASCII for every arm.
+        #[test]
+        fn the_line_is_ascii() {
+            for refusal in [
+                FanRefusal::Shape {
+                    radials: 1,
+                    gates: 2,
+                },
+                FanRefusal::CodeBytes { got: 1, want: 2 },
+                FanRefusal::LutBytes { got: 1, want: 2 },
+                FanRefusal::EdgeCount { got: 1, want: 2 },
+                FanRefusal::GateInterval(-1.0),
+                FanRefusal::Site,
+            ] {
+                assert!(format!("{refusal:?}").is_ascii());
+            }
+        }
+    }
+}
+
 impl squallar_egui::radar_fan::RadarFanPainter for RadarFanBridge {
     fn payload(
         &self,
@@ -1487,7 +1576,10 @@ impl squallar_egui::radar_fan::RadarFanPainter for RadarFanBridge {
         // the cost this whole path exists to remove.
         let first = draw.sweeps.first()?;
         for sweep in draw.sweeps.iter() {
-            admit(sweep).ok()?;
+            if let Err(refusal) = admit(sweep) {
+                declined_notice::say(&refusal);
+                return None;
+            }
             // One `Locals` block per callback carries one site and one sphere.
             // See `FanRefusal::Site`.
             let (a, b) = (sweep.geometry, first.geometry);
@@ -1495,6 +1587,7 @@ impl squallar_egui::radar_fan::RadarFanPainter for RadarFanBridge {
                 || a.site_lon != b.site_lon
                 || a.earth_radius_km != b.earth_radius_km
             {
+                declined_notice::say(&FanRefusal::Site);
                 return None;
             }
         }

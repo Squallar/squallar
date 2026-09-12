@@ -4821,6 +4821,13 @@ fn every_file_that_writes_a_row_head_is_in_a_gate_scope_or_classified_here() {
             NotARow("index decode failures"),
         ),
         (
+            "squallar-egui/src/radar_fan.rs",
+            NotARow(
+                "`radar fan painter declined a sweep:` carries the renderer's \
+                 refusal, once per check; a notice with a reason, not fields",
+            ),
+        ),
+        (
             "squallar-egui/src/terrain.rs",
             NotARow("hillshade tile failures"),
         ),

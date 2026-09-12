@@ -182,7 +182,7 @@ fn overlay_pass(
         egui::Color32::RED,
     );
     render_radar_overlay(
-        &ui, &projector, &img, &mut pane, canvas, &prefs, painter, surfaces,
+        &ui, &projector, &img, &mut pane, 0, canvas, &prefs, painter, surfaces,
     );
     ui.painter().rect_filled(
         egui::Rect::from_min_size(egui::pos2(8.0, 8.0), egui::vec2(4.0, 4.0)),
@@ -440,7 +440,8 @@ fn the_draw_carries_the_frames_own_view() {
             (img.lat, img.lon),
             sweeps,
             Some(&painter),
-            PaneSurfaces::GroundAndGlass
+            PaneSurfaces::GroundAndGlass,
+            0,
         ),
         FanOutcome::Painted
     );
@@ -502,6 +503,7 @@ fn one_issue(
         sweeps,
         painter,
         surfaces,
+        0,
     );
     let _ = ctx.end_pass();
     outcome
@@ -932,5 +934,50 @@ fn a_still_pane_holding_a_plane_draws_it_through_the_renderer() {
     assert!(
         control.seen().is_empty(),
         "a still pane showing a texture asked the fan renderer for a payload",
+    );
+}
+
+// ── The case before the fork ────────────────────────────────────────────────
+
+/// **A still plane the pane holds with its radar slot off is said, once.**
+///
+/// The fork above says why a fan it was handed was refused. This is the
+/// state where it is never handed one: the surface rendered, the pane holds
+/// it, and the walk skips radar's arm because the slot is off. Through the
+/// harness, because that skip is the walk's own `is_overlay_enabled` read
+/// and nothing narrower reaches it.
+///
+/// The latch is process-wide and keyed by pane, so what is held is that the
+/// walk SET pane 0's `SlotDisabled` bit -- only the walk can -- and not
+/// that this call was the first to do so.
+#[test]
+fn a_held_plane_under_a_switched_off_slot_is_said_once() {
+    use crate::radar_fan::notice::{Undrawn, undrawn_was_said};
+    let recorder = Recorder::new(true);
+    let painter: Arc<dyn RadarFanPainter> = recorder.clone();
+    let mut harness = crate::input_harness::InputHarness::new();
+    harness.install_fan_painter(Arc::clone(&painter));
+    harness.load_scan("KTLX");
+    harness.place_radar_fan(
+        0,
+        &squallar_radar::fields::known::REFLECTIVITY,
+        0.5,
+        Arc::new(sweep()),
+    );
+    assert!(
+        harness.overlay_enabled_on(0, &known::RADAR),
+        "fixture: the pane starts with radar on"
+    );
+    harness.set_overlay_on_pane(0, &known::RADAR, false);
+    harness.frame();
+    assert!(
+        harness.gui().panes()[0].radar_meta_on_screen().is_some(),
+        "fixture: switching the slot off dropped the surface, so there is \
+         nothing held to say anything about"
+    );
+    assert!(
+        undrawn_was_said(0, Undrawn::SlotDisabled),
+        "the pane holds a rendered plane, its radar slot is off, and the \
+         console was told nothing"
     );
 }

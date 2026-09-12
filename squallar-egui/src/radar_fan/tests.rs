@@ -577,3 +577,71 @@ fn healthy_shape() -> FanSweep {
         geometry: geometry(),
     }
 }
+
+// ── The refusal said in words ───────────────────────────────────────────────
+
+/// **A refusal is said once per (pane, reason), and a second reason on the
+/// same pane is a second line.** Pane 9 and pane 10 are this test's alone:
+/// the latch is process-wide, and the draw-fork suites drive pane 0.
+///
+/// TAMPER: drop the `fetch_or` guard in `notice::refused` and the second
+/// call answers `true` -- one line per frame, the cost this exists to
+/// avoid; index the bit by reason alone and pane 10 reads as already said.
+#[test]
+fn a_refusal_is_said_once_per_pane_and_reason() {
+    use super::notice::{Subject, refused};
+    let sweeps = [std::sync::Arc::new(healthy_shape())];
+    let pane_9 = Subject {
+        pane: 9,
+        sweeps: &sweeps,
+    };
+    assert!(
+        refused(pane_9, FanRefusal::PainterDeclined),
+        "first time: said"
+    );
+    assert!(
+        !refused(pane_9, FanRefusal::PainterDeclined),
+        "the same pane and reason was said again"
+    );
+    assert!(
+        refused(pane_9, FanRefusal::Malformed),
+        "a different reason on the same pane was swallowed by the first"
+    );
+    let pane_10 = Subject {
+        pane: 10,
+        sweeps: &sweeps,
+    };
+    assert!(
+        refused(pane_10, FanRefusal::PainterDeclined),
+        "a different pane was swallowed by pane 9's latch"
+    );
+}
+
+/// Same latch shape for the case before the fork: a held still surface the
+/// walk never reaches. Pane 11 is this test's alone.
+#[test]
+fn an_undrawn_still_surface_is_said_once_per_pane_and_condition() {
+    use super::notice::{Undrawn, undrawn, undrawn_was_said};
+    let product = squallar_radar::fields::known::REFLECTIVITY;
+    assert!(!undrawn_was_said(11, Undrawn::SlotDisabled));
+    assert!(undrawn(11, &product, Undrawn::SlotDisabled));
+    assert!(!undrawn(11, &product, Undrawn::SlotDisabled));
+    assert!(undrawn_was_said(11, Undrawn::SlotDisabled));
+    assert!(!undrawn_was_said(11, Undrawn::NotInDrawList));
+    assert!(undrawn(11, &product, Undrawn::NotInDrawList));
+}
+
+/// Every word the two notices can print is ASCII: the console they exist
+/// for is pasted into a report, and `ui_glyphs`' literal scan covers the
+/// source -- this covers the FORMATTED subject, product and cut included,
+/// which is the one part of the line the source literals do not carry.
+#[test]
+fn the_notice_subject_is_ascii() {
+    let sweep = healthy_shape();
+    let subject = format!(
+        "{} at {:.1} deg",
+        sweep.field,
+        sweep.geometry.elevation_deg.unwrap_or(0.0)
+    );
+    assert!(subject.is_ascii(), "{subject:?}");
+}

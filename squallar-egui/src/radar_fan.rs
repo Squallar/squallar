@@ -477,6 +477,182 @@ pub mod ledger {
     pub(super) fn slot_for_test(outcome: FanOutcome) -> usize {
         slot(outcome)
     }
+
+    /// [`slot`], for the once-latch in [`super::notice`] -- the same map, so a
+    /// refusal is latched by the counter it is counted in and two arms cannot
+    /// share a latch without also sharing a counter.
+    pub(super) const fn slot_of(outcome: FanOutcome) -> usize {
+        slot(outcome)
+    }
+
+    /// One more than the largest slot, for sizing a latch over them.
+    pub(super) const SLOT_COUNT: usize = SLOTS;
+}
+
+/// **A refusal said in words, once per (pane, reason), on any page.**
+///
+/// [`ledger`] counts every refusal and has since the fan path existed. What
+/// nothing did was *say* one: the totals print only on a telemetry-seeded
+/// page, so a plain page whose radar downloaded, decoded and rendered -- and
+/// whose fan the painter then declined on every frame -- had a console with
+/// a `Spawning background render` line, a `radar took N ms off the frame`
+/// line, and no line at all about the picture that never appeared. The state
+/// that would have said why lived in a browser profile, and was wiped before
+/// anyone read it.
+///
+/// So the fork says it. **Once per (pane, reason)** and never per frame: a
+/// refused fan is refused on every pass, and a `warn!` per pass on a
+/// synchronous browser console is a cost the frame pays. The latch is a
+/// process-wide bitmask -- a refusal that clears and returns is not said
+/// again, which is the trade for a guard that costs one atomic `or`.
+///
+/// Every line is ASCII: the console this exists for is pasted, and the glyph
+/// scan (`ui_glyphs`) holds it.
+pub mod notice {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    use super::{FanOutcome, FanRefusal, FanSweep, ledger};
+
+    /// Who a fan draw was for, in the words a console reader has: the pane's
+    /// index and the sweeps it was to draw -- their field is the product and
+    /// their geometry names the cut.
+    #[derive(Clone, Copy)]
+    pub struct Subject<'a> {
+        pub pane: usize,
+        pub sweeps: &'a [Arc<FanSweep>],
+    }
+
+    /// Why a still radar surface the pane holds is not being drawn at all --
+    /// the draw fork was never reached, so no [`FanRefusal`] describes it.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Undrawn {
+        /// The pane's radar slot is switched off.
+        SlotDisabled,
+        /// The pane's layer stack has no radar slot to walk.
+        NotInDrawList,
+    }
+
+    /// Panes the refusal latch keeps apart. `SLOT_COUNT` bits per pane fit
+    /// this many in a `u64`; a pane past the last shares its group, which
+    /// costs a missed line on a layout no device draws.
+    const REFUSAL_PANES: usize = 64 / ledger::SLOT_COUNT;
+    const UNDRAWN_REASONS: usize = 2;
+    const UNDRAWN_PANES: usize = 32 / UNDRAWN_REASONS;
+
+    static REFUSED_SAID: AtomicU64 = AtomicU64::new(0);
+    static UNDRAWN_SAID: AtomicU32 = AtomicU32::new(0);
+
+    /// `true` exactly once per bit: the first caller to set it.
+    fn first_u64(word: &AtomicU64, bit: u64) -> bool {
+        word.fetch_or(bit, Ordering::Relaxed) & bit == 0
+    }
+
+    fn first_u32(word: &AtomicU32, bit: u32) -> bool {
+        word.fetch_or(bit, Ordering::Relaxed) & bit == 0
+    }
+
+    /// The product and cut behind a draw, for the line. `?` where the sweeps
+    /// are empty (which is itself the `Malformed` refusal).
+    fn describe(sweeps: &[Arc<FanSweep>]) -> String {
+        match sweeps.first() {
+            Some(first) => match first.geometry.elevation_deg {
+                Some(deg) => format!("{} at {deg:.1} deg", first.field),
+                None => first.field.to_string(),
+            },
+            None => "?".to_string(),
+        }
+    }
+
+    /// What the reader can do with each arm, in words that do not need the
+    /// enum's doc beside them.
+    const fn why(refusal: FanRefusal) -> &'static str {
+        match refusal {
+            FanRefusal::NoPainter => {
+                "no fan painter is installed, so no polar surface can be drawn in this build"
+            }
+            FanRefusal::Malformed => {
+                "a sweep payload does not describe itself consistently (is_well_formed said no)"
+            }
+            FanRefusal::FloorStrip => {
+                "this pass is a 3D pane's floor strip, which cannot carry a paint callback"
+            }
+            FanRefusal::PainterDeclined => {
+                "the renderer declined the payload (its own line above names the check)"
+            }
+        }
+    }
+
+    fn refusal_bit(pane: usize, refusal: FanRefusal) -> u64 {
+        let slot = ledger::slot_of(FanOutcome::Refused(refusal));
+        let group = pane.min(REFUSAL_PANES - 1);
+        1u64 << (group * ledger::SLOT_COUNT + slot)
+    }
+
+    fn undrawn_bit(pane: usize, reason: Undrawn) -> u32 {
+        let slot = match reason {
+            Undrawn::SlotDisabled => 0,
+            Undrawn::NotInDrawList => 1,
+        };
+        let group = pane.min(UNDRAWN_PANES - 1);
+        1u32 << (group * UNDRAWN_REASONS + slot)
+    }
+
+    /// Say `refusal` for `subject` the first time this pane meets it, and
+    /// answer whether this call was that time -- the property a test holds.
+    pub(crate) fn refused(subject: Subject<'_>, refusal: FanRefusal) -> bool {
+        if !first_u64(&REFUSED_SAID, refusal_bit(subject.pane, refusal)) {
+            return false;
+        }
+        log::warn!(
+            "pane {}: radar fan ({}) declined: {}",
+            subject.pane,
+            describe(subject.sweeps),
+            why(refusal)
+        );
+        true
+    }
+
+    /// Say that a still radar surface `pane` holds is not being drawn, and
+    /// which of the two stack conditions is why, the first time per pane
+    /// and condition; `true` when this call said it.
+    pub(crate) fn undrawn(
+        pane: usize,
+        product: &squallar_source::product::FieldId,
+        reason: Undrawn,
+    ) -> bool {
+        if !first_u32(&UNDRAWN_SAID, undrawn_bit(pane, reason)) {
+            return false;
+        }
+        let which = match reason {
+            Undrawn::SlotDisabled => "the Radar layer is switched off in this pane",
+            Undrawn::NotInDrawList => "this pane's layer stack has no Radar slot",
+        };
+        log::warn!(
+            "pane {pane}: a still radar surface ({product}) is held but {which}; nothing draws it"
+        );
+        true
+    }
+
+    /// **The renderer's half of a `PainterDeclined`**: the check that
+    /// declined, with the values that failed it, as the renderer's own
+    /// `Debug` form. Printed from here because this crate holds the log
+    /// facade and the renderer's dependency charter admits none; said once
+    /// per check because the RENDERER latches it, where its arms are known.
+    /// `&dyn Debug` so no renderer vocabulary crosses into this crate.
+    pub fn renderer_declined(check: &dyn std::fmt::Debug) {
+        log::warn!(
+            "radar fan painter declined a sweep: {check:?} (once per check; the pane's own line \
+             names the pane)"
+        );
+    }
+
+    /// Whether the (pane, reason) latch is set -- what a test that drives a
+    /// whole frame reads, since the walk does not hand the `bool` back.
+    #[cfg(test)]
+    pub(crate) fn undrawn_was_said(pane: usize, reason: Undrawn) -> bool {
+        UNDRAWN_SAID.load(Ordering::Relaxed) & undrawn_bit(pane, reason) != 0
+    }
 }
 
 #[cfg(test)]
