@@ -623,6 +623,14 @@ pub(super) fn render_pane_map_content(
         // Restored after every arm below; the notices painted after the loop
         // run at it.
         let base_opacity = ui.opacity();
+        // The stack as this pane draws it -- every enabled layer with a
+        // handler, in order, with its opacity -- folded to one number as the
+        // walk goes, so the pane can say its draw order the first frame it
+        // has one and again only when it moves (`stack_digest`). Folded
+        // BEFORE the surface and double-shade skips: those are the pass's,
+        // not the pane's, and a digest that read differently on a 3D pane's
+        // strip pass would re-say the stack every alternate pass.
+        let mut stack_digest = stack_digest::SEED;
         if ctx.surfaces == PaneSurfaces::GroundAndGlass {
             say_undrawn_still_radar(ctx, &draw_order);
         }
@@ -636,6 +644,20 @@ pub(super) fn render_pane_map_content(
             let Some(handler) = ctx.overlays.handler_by_id(id) else {
                 continue;
             };
+            // **The layer's opacity, and it is paint-time only** -- never in
+            // `overlay_cache_token`, so a slider drag re-rasters nothing. It
+            // reaches every shape the arm adds through `ui.painter()` (a
+            // `with_clip_rect` clone keeps the factor), and the vector-tile
+            // callback, the one shape a painter cannot tint, reads it through
+            // `GroundMeshes::opacity`. At 0.0 egui emits `Noop` and the arm
+            // still runs its hit-testing, so a fully transparent layer keeps
+            // hover and click: GIMP semantics.
+            //
+            // Resolved here, ahead of the two skips below, so the digest
+            // carries it for every layer the PANE draws, not every layer this
+            // PASS paints; the strip pass resolves a few it then skips.
+            let layer_opacity = resolved_layer_opacity(ctx.overlays, ctx.pane_idx, ctx.pane, id);
+            stack_digest = stack_digest::fold(stack_digest, id, layer_opacity);
             // The ground/glass split: a pass not painting this layer's surface
             // skips the arm entirely, so it also skips the paint-order record.
             if !ctx.surfaces.paints(handler.surface()) {
@@ -647,17 +669,7 @@ pub(super) fn render_pane_map_content(
             if ctx.double_shades(id) {
                 continue;
             }
-            // **The layer's opacity, and it is paint-time only** -- never in
-            // `overlay_cache_token`, so a slider drag re-rasters nothing. It
-            // reaches every shape the arm adds through `ui.painter()` (a
-            // `with_clip_rect` clone keeps the factor), and the vector-tile
-            // callback, the one shape a painter cannot tint, reads it through
-            // `GroundMeshes::opacity`. At 0.0 egui emits `Noop` and the arm
-            // still runs its hit-testing, so a fully transparent layer keeps
-            // hover and click: GIMP semantics.
-            ui.set_opacity(
-                base_opacity * resolved_layer_opacity(ctx.overlays, ctx.pane_idx, ctx.pane, id),
-            );
+            ui.set_opacity(base_opacity * layer_opacity);
             // Every arm below paints through `ui.painter()` — the pane's own
             // paint list — so submission order IS `draw_order`.
             #[cfg(test)]
@@ -896,6 +908,16 @@ pub(super) fn render_pane_map_content(
             ui.set_opacity(base_opacity);
             #[cfg(test)]
             ctx.paint_order.push((id.clone(), painted_layer));
+        }
+
+        // The glass pass says it, so a 3D pane's strip pass -- the same stack,
+        // the same digest -- is not a second voice. A moved digest is the
+        // only trigger: a persisted stack loading, a drag-reorder, a toggle,
+        // a slider settling. Never per frame.
+        if ctx.surfaces == PaneSurfaces::GroundAndGlass && stack_digest != ctx.pane.draw_order_said
+        {
+            ctx.pane.draw_order_said = stack_digest;
+            log::info!("{}", describe_draw_order(ctx, &draw_order));
         }
 
         at = PanesCuts::charge(&mut cc.walk_ns, at);
@@ -1421,6 +1443,94 @@ pub(crate) fn resolved_layer_opacity(
     // `-0.0 == 0.0`, so this arm catches the negative zero the clamp lets
     // through and hands back the one with the sign bit clear.
     if clamped == 0.0 { 0.0 } else { clamped }
+}
+
+/// **The stack as one number**, so a pane can tell that its draw order moved
+/// without keeping a copy of it to compare against.
+///
+/// FNV-1a over each drawn layer's id, a separator no id carries, and its
+/// opacity's bits, in draw order. Folded inside the layer walk, where the id
+/// and the opacity are already in hand, so telling "moved" from "same" costs
+/// the fold and one compare per frame and no lookup of its own.
+pub(crate) mod stack_digest {
+    use squallar_source::id::LayerId;
+
+    /// The FNV-1a offset basis: what an empty stack digests to. Never `0`,
+    /// which is what `PaneState::draw_order_said` holds before the pane has
+    /// said anything -- so a pane whose stack draws nothing still says so
+    /// once.
+    pub const SEED: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash
+    }
+
+    /// Fold one drawn layer into `hash`.
+    pub fn fold(hash: u64, id: &LayerId, opacity: f32) -> u64 {
+        let hash = bytes(hash, id.as_str().as_bytes());
+        let hash = bytes(hash, &[0]);
+        bytes(hash, &opacity.to_bits().to_le_bytes())
+    }
+}
+
+/// An opacity at or above this, on a full-extent gridded raster drawn above
+/// radar, is called opaque in the draw-order line: at 0.95 the radar
+/// beneath is a tint on the mosaic, not a picture.
+pub(crate) const OPAQUE_OVER_RADAR: f32 = 0.95;
+
+/// **One line saying what this pane draws, bottom to top**, with each
+/// layer's opacity -- the resolved list [`describe_draw_order`] reads off a
+/// pane, so the words can be held under test without one.
+///
+/// When radar is in the list and a full-extent gridded raster (MRMS, GMGSI,
+/// model data -- `squallar_overlays::render::handlers::gridded_layers`) sits
+/// above it at or over [`OPAQUE_OVER_RADAR`], the line says so: that is the
+/// stack a user reports as "radar does not draw" while every counter says it
+/// did, and the console this is written for could not tell it from a
+/// declined fan.
+pub(crate) fn draw_order_line(pane_idx: usize, drawn: &[(&LayerId, f32)]) -> String {
+    use std::fmt::Write as _;
+    let mut line = format!("pane {pane_idx} draws:");
+    if drawn.is_empty() {
+        line.push_str(" nothing (no enabled layer has a handler in this build)");
+        return line;
+    }
+    for (i, (id, opacity)) in drawn.iter().enumerate() {
+        let sep = if i == 0 { " " } else { ", " };
+        let _ = write!(line, "{sep}{} (op {opacity:.2})", id.as_str());
+    }
+    if let Some(radar_at) = drawn.iter().position(|(id, _)| **id == known::RADAR) {
+        let gridded = squallar_overlays::render::handlers::gridded_layers();
+        for (id, opacity) in &drawn[radar_at + 1..] {
+            if *opacity >= OPAQUE_OVER_RADAR && gridded.iter().any(|(g, _)| g == *id) {
+                let _ = write!(line, "; radar is beneath an opaque {}", id.as_str());
+            }
+        }
+    }
+    line
+}
+
+/// [`draw_order_line`] for `ctx`'s pane: the enabled layers with a handler,
+/// in `draw_order`, each at the opacity the walk paints it. Walked only when
+/// the digest moved, which is why this is a second walk and not part of the
+/// first.
+fn describe_draw_order(ctx: &PaneRenderCtx<'_>, draw_order: &[LayerId]) -> String {
+    let drawn: Vec<(&LayerId, f32)> = draw_order
+        .iter()
+        .filter(|id| ctx.pane.is_overlay_enabled(id) && ctx.overlays.handler_by_id(id).is_some())
+        .map(|id| {
+            (
+                id,
+                resolved_layer_opacity(ctx.overlays, ctx.pane_idx, ctx.pane, id),
+            )
+        })
+        .collect();
+    draw_order_line(ctx.pane_idx, &drawn)
 }
 
 /// **A still radar surface the walk is never going to reach**, said once.
@@ -5479,6 +5589,11 @@ mod radar_fan_draw_tests;
 #[path = "ui_map_pane/resolved_opacity_tests.rs"]
 #[cfg(test)]
 mod resolved_opacity_tests;
+
+/// The pane's draw-order line and the digest that triggers it.
+#[path = "ui_map_pane/draw_order_line_tests.rs"]
+#[cfg(test)]
+mod draw_order_line_tests;
 
 #[path = "ui_map_pane/site_label_size_tests.rs"]
 #[cfg(test)]

@@ -1211,6 +1211,15 @@ pub struct PaneState {
     /// (`frame_need::note_if_changed`). Session-only and never persisted: it
     /// describes the glass, not a preference.
     pub loading_notice_text: Option<String>,
+    /// **The layer stack this pane last described to the log**, as the
+    /// digest `ui_map_pane`'s layer walk folds over the enabled layers and
+    /// their opacities in draw order -- `0` before it has said anything. The
+    /// walk re-logs the pane's draw order exactly when the digest moves (a
+    /// persisted stack loading, a drag-reorder, a toggle, an opacity slider
+    /// settling), never per frame. Session-only and never persisted, for the
+    /// reason `loading_notice_text` is: it describes what the console has
+    /// been told, not a preference.
+    pub draw_order_said: u64,
     /// **The colour bars this pane keeps off the glass**, by the layer whose
     /// bar it is — radar's under [`known::RADAR`]. The Color Scale layer's own
     /// options: that layer's toggle is the whole HUD, and these are its bars
@@ -1962,6 +1971,7 @@ impl PaneState {
             hover_value: None,
             overlay_hover_value: None,
             loading_notice_text: None,
+            draw_order_said: 0,
             hidden_color_bars: BTreeSet::new(),
             last_hover_pos: None,
             map_memory,
