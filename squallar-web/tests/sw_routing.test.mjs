@@ -1136,6 +1136,32 @@ describe("install: a shell is published whole or not at all", () => {
     );
   });
 
+  it("does not announce a first install that a page asked for, or one after a restart", async () => {
+    // The other two roads to a first install: a page whose activation ran
+    // offline posts `check-update` when the tab returns (the first shell is
+    // installed then), and a worker killed for idleness before it ever
+    // installed one is restarted by a navigation. Neither has a shell to
+    // replace, and the token this worker installed on activation is also
+    // the token every later check compares against -- so the page that
+    // triggered the first install must never be told to reload for it.
+    const network = new Network();
+    publishDeploy(network, ORIGIN, "A");
+    network.offline = true;
+    const worker = await startWorker({ swUrl: SW_URL, network });
+    const client = worker.addClient();
+    await worker.activate();
+    assert.equal((await worker.cacheNames()).some((n) => n.startsWith(worker.internals.SHELL_PREFIX)), false);
+
+    network.offline = false;
+    await worker.message({ type: "squallar:check-update" });
+    assert.equal((await worker.cacheNames()).some((n) => n.startsWith(worker.internals.SHELL_PREFIX)), true);
+    assert.deepEqual(client.messages, [], "the page that asked for the first install was told to reload");
+
+    const restarted = await restartWorker(worker);
+    await restarted.fetch(restarted.navigation(ORIGIN), { resultingClientId: client.id });
+    assert.deepEqual(client.messages, [], "a restarted worker announced the shell it found as new");
+  });
+
   it("announces a replacement to every open window", async () => {
     const worker = await bootWorker({ tag: "A" });
     const one = worker.addClient();

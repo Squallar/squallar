@@ -251,18 +251,37 @@
           }
         });
 
+        // Whether `worker` is an update to this page: a worker installed
+        // BEHIND the one controlling it. "There is a controller" is not that
+        // test, and on a first visit it reads true. The worker's own
+        // `clients.claim()` runs at activation, and Firefox hands the page its
+        // `controllerchange` before the `updatefound` and `statechange` tasks
+        // queued ahead of it (measured 2026-09-12, Firefox 155: register()
+        // resolved at +227 ms with the controller null, controllerchange at
+        // +227 ms with the controller reading `installing`, then updatefound
+        // and `installed` at +228 ms with the controller === the installing
+        // worker). So by the time the page hears "installed", the worker it
+        // is hearing about is already the one in control, and the old test
+        // showed "A new version of Squallar is ready" on every first visit.
+        // Chromium delivers the events in order and never hit it. One
+        // ServiceWorker object exists per worker per page, so identity is
+        // the comparison: a genuine update is never the controller until
+        // the user accepts it, at which point this page reloads.
+        function isUpdateTo(worker) {
+          var controller = navigator.serviceWorker.controller;
+          return !!(worker && controller && controller !== worker);
+        }
+
         function watchForWaitingWorker(reg) {
-          // A worker parked in `waiting` means this page is controlled by an
-          // older one. On the very first visit there is no controller and
-          // nothing to update to.
-          if (reg.waiting && navigator.serviceWorker.controller) showUpdate();
+          // A worker parked in `waiting` behind this page's controller means
+          // an update is ready. On the very first visit there is nothing to
+          // update to.
+          if (isUpdateTo(reg.waiting)) showUpdate();
           reg.addEventListener("updatefound", function () {
             var incoming = reg.installing;
             if (!incoming) return;
             incoming.addEventListener("statechange", function () {
-              if (incoming.state === "installed" && navigator.serviceWorker.controller) {
-                showUpdate();
-              }
+              if (incoming.state === "installed" && isUpdateTo(incoming)) showUpdate();
             });
           });
         }

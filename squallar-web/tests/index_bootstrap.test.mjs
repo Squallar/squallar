@@ -189,6 +189,22 @@ async function runBootstrap({ onLine = true, serviceWorker = true } = {}) {
     },
     /** Make a worker that records what the page posts to it. */
     worker: () => ({ postMessage: (message) => posted.push(message) }),
+    /**
+     * A ServiceWorker object: a state, `statechange` listeners, and what the
+     * page posts to it. One object per worker, as a browser holds one per
+     * worker per page -- `controller === registration.installing` when they
+     * are the same worker, which is what the page compares.
+     */
+    serviceWorkerObject: (state = "installing") =>
+      Object.assign(new EventTargetStub(), {
+        state,
+        postMessage: (message) => posted.push(message),
+        /** Move to `next` and tell the page, as the browser does. */
+        become(next) {
+          this.state = next;
+          this.dispatch("statechange");
+        },
+      }),
   };
 }
 
@@ -292,6 +308,116 @@ describe("update prompt", () => {
 
     page.serviceWorker.dispatch("controllerchange");
     assert.equal(page.reloads.length, 1);
+  });
+});
+
+// ===========================================================================
+describe("update prompt: a new worker, as the registration reports it", () => {
+  // =========================================================================
+  //
+  // The registration announces a new worker through `updatefound` and then
+  // its `statechange`s. Whether that worker is an UPDATE -- something parked
+  // behind the worker controlling this page -- or simply the first worker
+  // this page ever registered is the whole question, and "is there a
+  // controller" answers it wrong on Firefox: the worker's own `clients.claim()`
+  // at activation reaches the page before the queued `updatefound` and
+  // `statechange` tasks do, so at `installed` the controller is already set
+  // and it IS the worker being installed.
+
+  it("does not announce the first worker a page registers, in Firefox's event order", async () => {
+    // The order measured on Firefox 155, 2026-09-12: register() resolves with
+    // the worker installing and no controller; controllerchange lands with
+    // the controller being that same object; then updatefound, then
+    // `installed` -- with the controller === the installing worker.
+    const page = await runBootstrap();
+    const first = page.serviceWorkerObject("installing");
+    page.registration.installing = first;
+    await page.load();
+
+    page.serviceWorker.controller = first;
+    page.serviceWorker.dispatch("controllerchange");
+    page.registration.dispatch("updatefound");
+    page.registration.waiting = first;
+    first.become("installed");
+    assert.equal(
+      page.element("squallar-update").hidden,
+      true,
+      "a first visit announced 'a new version is ready'; there was nothing to update from",
+    );
+
+    page.registration.waiting = null;
+    first.become("activating");
+    first.become("activated");
+    assert.equal(page.element("squallar-update").hidden, true);
+    assert.equal(page.reloads.length, 0, "a first-visit claim must not reload");
+  });
+
+  it("does not announce the first worker in the spec's order either", async () => {
+    // Chromium: `installed` arrives with no controller yet; the claim and
+    // its controllerchange come after activation.
+    const page = await runBootstrap();
+    const first = page.serviceWorkerObject("installing");
+    page.registration.installing = first;
+    await page.load();
+
+    page.registration.dispatch("updatefound");
+    first.become("installed");
+    first.become("activating");
+    page.serviceWorker.controller = first;
+    page.serviceWorker.dispatch("controllerchange");
+    first.become("activated");
+    assert.equal(page.element("squallar-update").hidden, true);
+  });
+
+  it("announces a worker installed behind the one controlling the page, once", async () => {
+    // A genuine update: this page is controlled by `old`; a new sw.js is
+    // found (by the visibilitychange `update()` or a navigation), installs
+    // and parks in `waiting` because `old` still controls this page.
+    const page = await runBootstrap();
+    const old = page.serviceWorkerObject("activated");
+    page.serviceWorker.controller = old;
+    page.registration.active = old;
+    await page.load();
+
+    const incoming = page.serviceWorkerObject("installing");
+    page.registration.installing = incoming;
+    page.registration.dispatch("updatefound");
+    assert.equal(page.element("squallar-update").hidden, true, "announced before it was even installed");
+    page.registration.installing = null;
+    page.registration.waiting = incoming;
+    incoming.become("installed");
+    assert.equal(page.element("squallar-update").hidden, false, "a parked update was not announced");
+
+    // Accepting it: the parked worker is told to take over, and the reload
+    // waits for the controller to change.
+    page.element("squallar-update-reload").click();
+    assert.deepEqual(page.posted, [{ type: "squallar:skip-waiting" }]);
+    page.serviceWorker.controller = incoming;
+    page.serviceWorker.dispatch("controllerchange");
+    assert.equal(page.reloads.length, 1);
+  });
+
+  it("announces a worker already parked when the page loads, and not the page's own", async () => {
+    // A page that opens while an update is already waiting hears no
+    // updatefound; it reads `registration.waiting` once. That read has the
+    // same two cases.
+    const parked = await runBootstrap();
+    const old = parked.serviceWorkerObject("activated");
+    parked.serviceWorker.controller = old;
+    parked.registration.active = old;
+    parked.registration.waiting = parked.serviceWorkerObject("installed");
+    await parked.load();
+    assert.equal(parked.element("squallar-update").hidden, false, "an update parked at load was not announced");
+
+    // Firefox's first visit, seen late: register() resolves after the claim,
+    // with the page's own first worker momentarily in `waiting` and already
+    // the controller.
+    const first = await runBootstrap();
+    const own = first.serviceWorkerObject("installed");
+    first.serviceWorker.controller = own;
+    first.registration.waiting = own;
+    await first.load();
+    assert.equal(first.element("squallar-update").hidden, true, "the page's own first worker was announced as an update");
   });
 });
 
