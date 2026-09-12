@@ -942,7 +942,11 @@ const MAGIC: [u8; 4] = *b"RDRI";
 /// layer object (`N0M`) as a length-prefixed blob. 11: the RPG's storm motion
 /// vector (`N0S` halfwords 51 and 52). 12: the derived-rung preference
 /// (`crate::srv::SrvFallback`) as one byte.
-const FORMAT_VERSION: u16 = 13;
+///
+/// `pub` for one reader: `squallar_worker::wire_identity` folds it into the
+/// local build token, so two builds whose `RenderInput` layouts differ refuse
+/// each other's worker instead of one misreading the other's bytes.
+pub const FORMAT_VERSION: u16 = 13;
 
 impl RenderInput {
     /// Encode for transport. Little-endian throughout; gate blobs are copied

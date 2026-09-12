@@ -15,7 +15,11 @@ const MAGIC: u16 = 0x5256;
 
 /// Bumped when the layout below changes. Read before anything else, so a
 /// payload from another generation is refused rather than misread.
-const VERSION: u8 = 3;
+///
+/// `pub` for one reader: `squallar_worker::wire_identity` folds it into the
+/// local build token, so the page/worker compare refuses a pair whose decoded
+/// volumes are laid out differently before either is asked to read one.
+pub const VERSION: u8 = 3;
 
 /// `RadialStatus::Unknown`'s tag. The named variants take 0–5, which is the
 /// order upstream declares them in; 255 says "a byte followed".

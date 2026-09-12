@@ -1315,7 +1315,10 @@ fn transfer_table_over(
 const MAGIC: [u8; 4] = *b"RDVX";
 
 /// Bumped whenever the layout below changes.
-const FORMAT_VERSION: u16 = 1;
+///
+/// `pub` for one reader: `squallar_worker::wire_identity` folds it into the
+/// local build token beside the other three payload formats the wire nests.
+pub const FORMAT_VERSION: u16 = 1;
 
 /// Encode for transport, or `None` when this build has no wire code for the
 /// grid's field.

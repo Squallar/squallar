@@ -136,7 +136,10 @@ pub const TAILS: &str = "tails";
 /// across a deploy can fetch a newer generation's module — a silent protocol
 /// disagreement rather than a linker error. `GITHUB_SHA` distinguishes two
 /// deploys in CI; locally the second segment is a digest of the wire's pinned
-/// identity rows, which does not cover the nested payload layouts.
+/// identity rows and of the format version of every payload the wire nests
+/// (`squallar_worker::wire_identity`), so a local pair whose `RenderInput`
+/// or decoded-volume layouts differ refuses each other the way a deployed
+/// pair from two deploys does.
 pub fn build_token() -> String {
     match option_env!("GITHUB_SHA") {
         Some(sha) => format!("{}/{}", env!("CARGO_PKG_VERSION"), sha),

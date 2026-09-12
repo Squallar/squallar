@@ -758,7 +758,11 @@ const MAGIC: [u8; 4] = *b"RDXS";
 /// Bumped whenever the layout below changes. The two ends of a worker boundary
 /// can be different builds — see `squallar-web`'s build-token handshake — so a
 /// mismatch has to be a clean `None`, not a misparse.
-const FORMAT_VERSION: u16 = 3;
+///
+/// `pub` for one reader: `squallar_worker::wire_identity` folds it into the
+/// local build token, so the mismatch is refused at the handshake and the
+/// clean `None` is the second line of defence rather than the first.
+pub const FORMAT_VERSION: u16 = 3;
 
 impl CrossSection {
     /// Encode for transport. Little-endian throughout; the image and status

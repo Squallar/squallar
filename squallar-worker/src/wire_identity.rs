@@ -5,11 +5,21 @@
 //! [`wire_digest`] is the local-dev half of the page/worker build token
 //! (`squallar_web::worker_protocol::build_token`); in CI the token carries
 //! `GITHUB_SHA` instead. Two local builds diverge exactly when a re-pinned
-//! row, the registry composition, or the envelope shape differs, and a
-//! divergent pair respawns rather than exchanging bytes one of them
-//! misreads. Nested payload layouts (`RenderInput`, the polar field, the
-//! decoded volume) are pinned by `squallar-radar`'s own digest suites and do
-//! not feed this one.
+//! row, the registry composition, the envelope shape, or a nested payload's
+//! format version differs, and a divergent pair respawns rather than
+//! exchanging bytes one of them misreads.
+//!
+//! # The nested formats were a hole, and it was found by the rig
+//!
+//! Until 2026-09-12 the nested payload layouts (`RenderInput`, the decoded
+//! volume, a cross-section, a voxel grid) did NOT feed this digest: they are
+//! pinned by `squallar-radar`'s own digest suites, and the framing rows
+//! below strip the nested payload before hashing (`framing_of`). So two
+//! builds with `volume_wire` at 2 and 3 and `render_input::FORMAT_VERSION`
+//! at 12 and 13 had the SAME local token, and the rig accepted a mixed
+//! page/worker pair that the deployed site -- whose token is `GITHUB_SHA` --
+//! refuses. [`PAYLOAD_FORMAT_LABELS`] and [`payload_format_rows`] are the
+//! close: each format constant, by name and value, is a row in the fold.
 
 /// The 17 job-framing rows, exactly as
 /// `offload::tests::the_job_framing_is_the_one_this_protocol_ships` asserts
@@ -344,6 +354,43 @@ pub const WIRE_BUILDING_REPLY_ROWS: &[&str] = &[
 /// fold; this names the 44 bytes after it, in wire order.
 pub const CANONICAL_ENVELOPE_LAYOUT: &str = "w:u32 h:u32 bounds:4xf64 ceil:u32";
 
+/// **The nested payload formats the wire carries, by the name of the
+/// constant that versions each**, in the order [`payload_format_rows`]
+/// folds them. Four today: the render request every radar job row nests,
+/// the decoded volume the `decode` row replies with, the cross-section the
+/// `section` row replies with, and the voxel grid the `voxels` rows reply
+/// with. Each is self-describing on the wire (a magic and a version), so a
+/// mismatched pair decodes cleanly to `None` -- but that is a job that
+/// fails after the handshake accepted the pair, and this list is what makes
+/// the handshake refuse it instead.
+///
+/// The labels are the constants' own paths so a reader of the digest input
+/// can find the constant, and `each_payload_format_constant_is_in_the_fold`
+/// holds each label to a row that carries it. Renaming a constant fails the
+/// build at [`payload_format_rows`]; renaming a label fails that test.
+pub const PAYLOAD_FORMAT_LABELS: [&str; 4] = [
+    "squallar_radar::render_input::FORMAT_VERSION",
+    "squallar_radar::volume_wire::VERSION",
+    "squallar_radar::xsect::FORMAT_VERSION",
+    "squallar_radar::voxel::FORMAT_VERSION",
+];
+
+/// One row per [`PAYLOAD_FORMAT_LABELS`] entry, `label | value`, read off
+/// the constants themselves -- never a literal copy of the version, which
+/// is the drift this exists to close.
+pub fn payload_format_rows() -> [String; 4] {
+    let [render_input, volume, section, voxels] = PAYLOAD_FORMAT_LABELS;
+    [
+        format!(
+            "{render_input} | {}",
+            squallar_radar::render_input::FORMAT_VERSION
+        ),
+        format!("{volume} | {}", squallar_radar::volume_wire::VERSION),
+        format!("{section} | {}", squallar_radar::xsect::FORMAT_VERSION),
+        format!("{voxels} | {}", squallar_radar::voxel::FORMAT_VERSION),
+    ]
+}
+
 /// FNV-1a 64, continued from `hash`. A copy of the house hash rather than a
 /// call to `squallar_radar::wire::layout_digest`, which is `#[cfg(test)]`.
 fn fnv1a64(mut hash: u64, bytes: &[u8]) -> u64 {
@@ -359,7 +406,7 @@ fn fnv1a64(mut hash: u64, bytes: &[u8]) -> u64 {
 /// row's kind, then [`CANONICAL_ENVELOPE_LAYOUT`], then every row of
 /// [`WIRE_REPLY_ROWS`], then every row of [`WIRE_FRAME_REPLY_ROWS`], then
 /// every row of [`WIRE_HEIGHT_REPLY_ROWS`], then every row of
-/// [`WIRE_BUILDING_REPLY_ROWS`].
+/// [`WIRE_BUILDING_REPLY_ROWS`], then every row of [`payload_format_rows`].
 ///
 /// Panics on a pinned row whose label is not in the registry.
 ///
@@ -388,6 +435,7 @@ fn fnv1a64(mut hash: u64, bytes: &[u8]) -> u64 {
 /// the answer, which means a way to perturb them that is not a source edit.
 /// Left named rather than left silent.
 pub fn wire_digest() -> u64 {
+    let formats = payload_format_rows();
     digest_over(
         WIRE_FRAMING_ROWS,
         CANONICAL_ENVELOPE_LAYOUT,
@@ -395,7 +443,12 @@ pub fn wire_digest() -> u64 {
         WIRE_FRAME_REPLY_ROWS,
         WIRE_HEIGHT_REPLY_ROWS,
         WIRE_BUILDING_REPLY_ROWS,
+        &as_strs(&formats),
     )
+}
+
+fn as_strs(rows: &[String]) -> Vec<&str> {
+    rows.iter().map(String::as_str).collect()
 }
 
 /// The fold itself, over the lists it is handed rather than the pinned
@@ -410,6 +463,7 @@ fn digest_over(
     frame_reply: &[&str],
     height_reply: &[&str],
     building_reply: &[&str],
+    payload_formats: &[&str],
 ) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for row in framing {
@@ -438,6 +492,9 @@ fn digest_over(
     for row in building_reply {
         hash = fnv1a64(hash, row.as_bytes());
     }
+    for row in payload_formats {
+        hash = fnv1a64(hash, row.as_bytes());
+    }
     hash
 }
 
@@ -450,6 +507,7 @@ mod digest_fold_tests {
     use super::*;
 
     fn real() -> u64 {
+        let formats = payload_format_rows();
         digest_over(
             WIRE_FRAMING_ROWS,
             CANONICAL_ENVELOPE_LAYOUT,
@@ -457,6 +515,7 @@ mod digest_fold_tests {
             WIRE_FRAME_REPLY_ROWS,
             WIRE_HEIGHT_REPLY_ROWS,
             WIRE_BUILDING_REPLY_ROWS,
+            &as_strs(&formats),
         )
     }
 
@@ -471,10 +530,6 @@ mod digest_fold_tests {
         out.swap(0, 1);
         assert_ne!(out[0], rows[0], "the perturbation must actually move a row");
         out
-    }
-
-    fn as_strs(v: &[String]) -> Vec<&str> {
-        v.iter().map(String::as_str).collect()
     }
 
     #[test]
@@ -496,6 +551,7 @@ mod digest_fold_tests {
             WIRE_FRAME_REPLY_ROWS,
             WIRE_HEIGHT_REPLY_ROWS,
             WIRE_BUILDING_REPLY_ROWS,
+            &as_strs(&payload_format_rows()),
         );
         assert_ne!(moved, real(), "the framing fold is not load-bearing");
     }
@@ -509,6 +565,7 @@ mod digest_fold_tests {
             WIRE_FRAME_REPLY_ROWS,
             WIRE_HEIGHT_REPLY_ROWS,
             WIRE_BUILDING_REPLY_ROWS,
+            &as_strs(&payload_format_rows()),
         );
         assert_ne!(moved, real(), "the envelope fold is not load-bearing");
     }
@@ -523,6 +580,7 @@ mod digest_fold_tests {
             WIRE_FRAME_REPLY_ROWS,
             WIRE_HEIGHT_REPLY_ROWS,
             WIRE_BUILDING_REPLY_ROWS,
+            &as_strs(&payload_format_rows()),
         );
         assert_ne!(moved, real(), "the reply fold is not load-bearing");
     }
@@ -537,6 +595,7 @@ mod digest_fold_tests {
             &as_strs(&p),
             WIRE_HEIGHT_REPLY_ROWS,
             WIRE_BUILDING_REPLY_ROWS,
+            &as_strs(&payload_format_rows()),
         );
         assert_ne!(moved, real(), "the frame-reply fold is not load-bearing");
     }
@@ -551,8 +610,98 @@ mod digest_fold_tests {
             WIRE_FRAME_REPLY_ROWS,
             &as_strs(&p),
             WIRE_BUILDING_REPLY_ROWS,
+            &as_strs(&payload_format_rows()),
         );
         assert_ne!(moved, real(), "the height-reply fold is not load-bearing");
+    }
+
+    /// The fold over the nested formats is load-bearing, the same way every
+    /// other list's is: swap two rows and the token moves.
+    #[test]
+    fn a_moved_payload_format_row_moves_the_digest() {
+        let p = perturbed(&as_strs(&payload_format_rows()));
+        let moved = digest_over(
+            WIRE_FRAMING_ROWS,
+            CANONICAL_ENVELOPE_LAYOUT,
+            WIRE_REPLY_ROWS,
+            WIRE_FRAME_REPLY_ROWS,
+            WIRE_HEIGHT_REPLY_ROWS,
+            WIRE_BUILDING_REPLY_ROWS,
+            &as_strs(&p),
+        );
+        assert_ne!(moved, real(), "the payload-format fold is not load-bearing");
+    }
+
+    /// **A bumped format version moves the token**, which is the whole
+    /// claim: the rows carry the value, so the digest over a build at
+    /// `volume_wire` 3 differs from the same build at 4. Driven as a row
+    /// rewrite rather than a source edit, the same way the fold tests are.
+    #[test]
+    fn a_bumped_payload_format_version_moves_the_digest() {
+        let rows = payload_format_rows();
+        for (i, label) in PAYLOAD_FORMAT_LABELS.iter().enumerate() {
+            let mut bumped: Vec<String> = rows.to_vec();
+            let (name, value) = rows[i]
+                .split_once(" | ")
+                .expect("a format row is `label | value`");
+            assert_eq!(name, *label);
+            let value: u32 = value.parse().expect("a format version is a number");
+            bumped[i] = format!("{name} | {}", value + 1);
+            let moved = digest_over(
+                WIRE_FRAMING_ROWS,
+                CANONICAL_ENVELOPE_LAYOUT,
+                WIRE_REPLY_ROWS,
+                WIRE_FRAME_REPLY_ROWS,
+                WIRE_HEIGHT_REPLY_ROWS,
+                WIRE_BUILDING_REPLY_ROWS,
+                &as_strs(&bumped),
+            );
+            assert_ne!(moved, real(), "bumping {label} left the token where it was");
+        }
+    }
+
+    /// **The digest input names each format constant.** Every label in
+    /// [`PAYLOAD_FORMAT_LABELS`] heads exactly one row, and every row's
+    /// value is the constant the label names -- read off the constant, not
+    /// off a literal. The presence control is the label: rename one here
+    /// and the `assert_eq` on the path goes red; rename the constant in
+    /// `squallar-radar` and `payload_format_rows` fails to build.
+    #[test]
+    fn each_payload_format_constant_is_in_the_fold() {
+        let rows = payload_format_rows();
+        assert_eq!(rows.len(), PAYLOAD_FORMAT_LABELS.len());
+        let expected: [(&str, u32); 4] = [
+            (
+                "squallar_radar::render_input::FORMAT_VERSION",
+                u32::from(squallar_radar::render_input::FORMAT_VERSION),
+            ),
+            (
+                "squallar_radar::volume_wire::VERSION",
+                u32::from(squallar_radar::volume_wire::VERSION),
+            ),
+            (
+                "squallar_radar::xsect::FORMAT_VERSION",
+                u32::from(squallar_radar::xsect::FORMAT_VERSION),
+            ),
+            (
+                "squallar_radar::voxel::FORMAT_VERSION",
+                u32::from(squallar_radar::voxel::FORMAT_VERSION),
+            ),
+        ];
+        for (label, value) in expected {
+            let matching: Vec<&String> = rows.iter().filter(|r| r.starts_with(label)).collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "{label} heads {} rows of the digest input, not one: {rows:?}",
+                matching.len()
+            );
+            assert_eq!(
+                matching[0],
+                &format!("{label} | {value}"),
+                "the row for {label} does not carry the constant's value"
+            );
+        }
     }
 
     #[test]
@@ -565,6 +714,7 @@ mod digest_fold_tests {
             WIRE_FRAME_REPLY_ROWS,
             WIRE_HEIGHT_REPLY_ROWS,
             &as_strs(&p),
+            &as_strs(&payload_format_rows()),
         );
         assert_ne!(moved, real(), "the building-reply fold is not load-bearing");
     }
