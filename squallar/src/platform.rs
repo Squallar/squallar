@@ -835,6 +835,31 @@ pub fn create_platform() -> IosPlatform {
     IosPlatform::new()
 }
 
+/// Where the loop's archive spill lives, or `None` on a target that installs
+/// none. A module-level pair rather than a call through the desktop type,
+/// because `run` is compiled on every native target and `DesktopPlatform` is
+/// not: the arm below is what the mobile builds resolve to. The desktop arm
+/// is [`DesktopPlatform::default_archive_spill_dir`] — the cache root, never
+/// `/tmp`, purged on construction — and this only names it.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) fn default_archive_spill_dir() -> Option<std::path::PathBuf> {
+    DesktopPlatform::default_archive_spill_dir()
+}
+
+/// The mobile arm: `None`, by design and not by omission. The spill exists
+/// on desktop alone — `LOOP_ARCHIVE_SPILL_CEILING_BYTES` states it: wasm and
+/// mobile hold `None` and never read the ceiling — so the loop on these
+/// targets drops an archive over the byte ceiling exactly as it did before a
+/// spill existed. Naming a directory here would install one.
+///
+/// iOS reaches this: `squallar_ios_main` enters through `run`. Android never
+/// does — `android_main` is its entry and builds the app itself — but `run`
+/// is compiled there all the same, so the name has to resolve.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub(crate) fn default_archive_spill_dir() -> Option<std::path::PathBuf> {
+    None
+}
+
 #[cfg(test)]
 mod ios_theme_source_tests {
     /// The iOS bridge only compiles on iOS, and no host test can hand it a

@@ -78,7 +78,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // larger — as permanently un-evictable, because both decoded-eviction
     // policies refuse a volume with no way back; spilling keeps the way back
     // and still gives the heap bytes up.
-    if let Some(root) = crate::platform::DesktopPlatform::default_archive_spill_dir() {
+    if let Some(root) = crate::platform::default_archive_spill_dir() {
         app.install_archive_spill(root);
     }
     let outcome = event_loop
