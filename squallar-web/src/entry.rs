@@ -45,7 +45,20 @@ pub fn start(page_heap_max_bytes: f64, worker_heap_max_bytes: f64) -> Result<(),
     // Which of the two browser APIs this run gets is not known yet — it takes a
     // `requestAdapter()`, and the app makes that call when it builds its wgpu
     // instance. `squallar_app::app_state` logs the answer.
-    log::info!("squallar starting (wasm32; WebGPU or WebGL2, decided at adapter request)");
+    //
+    // The build token is on this line so a pasted console names which deploy
+    // the PAGE is. It was printed only by the worker handshake
+    // (`worker_port::attach`, "rasterization worker attached (<token>, ...)"),
+    // which is the page's token too but only after a worker exists and the
+    // compare has passed — a page whose worker never attached, or whose
+    // service worker pinned it to an older shell generation than the one
+    // being debugged, printed no token at all. The same string the worker
+    // hello carries (`worker_protocol::build_token`): in CI the crate version
+    // and `GITHUB_SHA`, locally the version and the wire digest.
+    log::info!(
+        "squallar starting (build {}; wasm32; WebGPU or WebGL2, decided at adapter request)",
+        crate::worker_protocol::build_token()
+    );
 
     // `squallar_radar::par` is rayon on this target too now, and rayon panics on
     // a global pool nobody built. The page takes the one-thread,
