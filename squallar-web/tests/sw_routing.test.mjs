@@ -1032,6 +1032,73 @@ describe("updates: the version probe watches both halves of a deploy", () => {
       "an open window was not told the index-only deploy is ready",
     );
   });
+
+  /**
+   * Re-serve the directory index's validator in the weak spelling CloudFront
+   * uses once it holds the compressed variant: the same opaque tag under
+   * `W/`, with `content-encoding: br`. The bytes did not change.
+   */
+  function respellIndexValidatorWeak(network, origin, tag) {
+    network.serve(new URL("", origin).href, (request, init, method) =>
+      method === "HEAD"
+        ? new Response(null, {
+            status: 200,
+            headers: { etag: `W/"${tag}"`, "content-encoding": "br" },
+          })
+        : new Response(`::${tag}`, {
+            status: 200,
+            headers: { etag: `"${tag}"`, "content-type": "text/plain" },
+          }),
+    );
+  }
+
+  it("reads a weak and a strong spelling of one validator as one deploy", async () => {
+    const worker = await bootWorker({ tag: "A" });
+    const token = (headers) => worker.internals.validatorToken(new Response(null, { headers }));
+    assert.equal(token({ etag: 'W/"5b1ab916"', "content-encoding": "br" }), token({ etag: '"5b1ab916"' }));
+    assert.notEqual(token({ etag: '"5b1ab916"' }), token({ etag: '"c0ffee"' }));
+  });
+
+  it("does not reinstall when the origin respells the same validator weak", async () => {
+    // Measured on the live origin: `HEAD /` answers a strong `etag:
+    // "5b1ab916..."` uncompressed and `W/"5b1ab916..."` with
+    // `content-encoding: br` once CloudFront holds the compressed variant.
+    // Compared verbatim, that is two tokens for one deploy: two installs of
+    // identical bytes and two "new version ready" banners from one push.
+    const worker = await bootWorker({ tag: "A" });
+    const client = worker.addClient();
+    const before = (await worker.cacheNames()).filter((n) => n.startsWith("squallar-shell-"));
+
+    respellIndexValidatorWeak(worker.network, ORIGIN, "A");
+    await worker.message({ type: "squallar:check-update" });
+
+    const after = (await worker.cacheNames()).filter((n) => n.startsWith("squallar-shell-"));
+    assert.deepEqual(after, before, "the weak spelling of the same validator installed a second shell");
+    assert.equal(
+      client.messages.some((m) => m.type === "squallar:shell-updated"),
+      false,
+      "an open window was told a deploy that did not happen is ready",
+    );
+  });
+
+  it("still installs a deploy whose validator body changed, in either spelling", async () => {
+    // What a genuine change looks like: S3 writes a new object and a new
+    // opaque tag; CloudFront forwards that tag, strong or weak.
+    const worker = await bootWorker({ tag: "A" });
+    const client = worker.addClient();
+    respellIndexValidatorWeak(worker.network, ORIGIN, "A");
+    await worker.message({ type: "squallar:check-update" });
+
+    respellIndexValidatorWeak(worker.network, ORIGIN, "A2");
+    await worker.message({ type: "squallar:check-update" });
+
+    assert.equal((await loadPage(worker)).document, "::A2", "a changed weak validator was not installed");
+    assert.equal(
+      client.messages.filter((m) => m.type === "squallar:shell-updated").length,
+      1,
+      "one genuine change must announce exactly once",
+    );
+  });
 });
 
 // ===========================================================================

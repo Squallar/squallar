@@ -568,10 +568,30 @@ function routeFor({ url, method = "GET", mode = "no-cors", range = null }) {
  * probe says so, updates cannot be detected and the shell is left alone rather
  * than re-downloaded on every load. Pages sends `ETag`; `http.server` sends
  * `Last-Modified` + `Content-Length`.
+ *
+ * AN ETAG IS COMPARED BY ITS OPAQUE TAG, WITH THE `W/` PREFIX STRIPPED. The
+ * same bytes get two spellings from the deployed origin: CloudFront answers
+ * `HEAD /` with the strong `etag: "5b1ab916..."` until it holds the brotli
+ * variant, then with the weak `etag: W/"5b1ab916..."` and `content-encoding:
+ * br` -- the identical S3 object, marked weak because the body it now serves
+ * is a different encoding of it. Compared verbatim, the first probe after an
+ * invalidation and the next one gave two tokens for one deploy, so one push
+ * installed twice (a third 16 MB copy of the same bytes) and the page showed
+ * "new version ready" twice. The weak prefix means "equivalent, not
+ * byte-identical", which for a token that asks "is this the same deploy" is
+ * exactly equality, so it is dropped. A genuine change still moves the tag:
+ * S3 writes a new object and a new opaque tag with it, and CloudFront
+ * forwards that tag in both spellings. Asking for one spelling instead --
+ * `Accept-Encoding: identity` -- is not available to a service worker: the
+ * header is forbidden to `fetch()`, the browser sets its own.
+ *
+ * Case-insensitive on the prefix, which is safe because an opaque tag begins
+ * with a quote and can never begin with `w/`; a server spelling the prefix in
+ * lowercase is out of spec but would otherwise re-open the double install.
  */
 function validatorToken(response) {
   const etag = response.headers.get("etag");
-  if (etag) return `etag:${etag}`;
+  if (etag) return `etag:${etag.trim().replace(/^w\//i, "")}`;
   const lastModified = response.headers.get("last-modified");
   const length = response.headers.get("content-length");
   if (lastModified || length) return `lm:${lastModified || ""}|len:${length || ""}`;
