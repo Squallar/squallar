@@ -26,6 +26,13 @@ use wasm_bindgen::prelude::*;
 /// Where the lane's bootstrap lives, relative to this worker's script.
 /// Relative for the reason `worker_port::WORKER_URL` is: a project-Pages
 /// subpath. Precached by `sw.js` beside `worker.js`.
+///
+/// Started with this worker's own query string appended (`keyed_lane_url`):
+/// the page put its shell-generation key there, and the lane's script fetch
+/// and glue import have to carry it too -- Chromium attributes the lane's
+/// glue import to no client at all, and Firefox can answer the lane's script
+/// from its HTTP cache without asking the service worker. A URL the key makes
+/// fresh is one the cache has never seen. See `sw.js`'s `MIXED SHELLS`.
 const LANE_URL: &str = "./tile-lane.js";
 
 thread_local! {
@@ -106,6 +113,16 @@ pub fn squallar_worker_main(heap_max_bytes: f64) -> Result<(), JsValue> {
     Ok(())
 }
 
+/// [`LANE_URL`] carrying this worker's own query string, which is the page's
+/// `?pin=<key>` when the page started this worker through `worker_port.rs`
+/// and empty when something else did (a worker opened by hand): the lane
+/// then inherits whatever generation its own client id resolves to, which is
+/// what it did before the key existed.
+fn keyed_lane_url(scope: &web_sys::DedicatedWorkerGlobalScope) -> String {
+    let search = scope.location().search();
+    format!("{LANE_URL}{search}")
+}
+
 /// Start the tile lane on this worker's memory and answer the page's end of
 /// its port.
 ///
@@ -119,7 +136,7 @@ fn spawn_tile_lane(
 ) -> Result<web_sys::MessagePort, JsValue> {
     let options = web_sys::WorkerOptions::new();
     options.set_type(web_sys::WorkerType::Module);
-    let lane = web_sys::Worker::new_with_options(LANE_URL, &options)?;
+    let lane = web_sys::Worker::new_with_options(&keyed_lane_url(scope), &options)?;
     let channel = web_sys::MessageChannel::new()?;
 
     let on_error_scope = scope.clone();

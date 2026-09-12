@@ -667,6 +667,218 @@ worker restarted; its index.html and its wasm now disagree",
 });
 
 // ===========================================================================
+describe("atomicity: the worker tree a page starts draws from the page's generation", () => {
+  // =========================================================================
+  //
+  // The rasterization worker, its rayon threads and its tile lane are each a
+  // service-worker client of their own, and each imports the glue; the
+  // worker fetches the wasm module too. Which client id those requests carry
+  // is a per-browser fact (measured 2026-09-12, in the sw.js header): the
+  // worker's own for its direct imports in both browsers, NONE for the rayon
+  // threads' and the lane's imports in Chromium, a blob worker's own in
+  // Firefox. So two things are asserted here: the worker's script fetch pins
+  // its `resultingClientId`, and a request carrying the page's key in its URL
+  // is answered from the key's generation whatever id it carries, including
+  // none. Before either, a deploy landing between the page's navigation and
+  // the worker's imports gave the page a worker from another generation, and
+  // the page could not decode what it sent back: radar never drew, no error.
+
+  const PIN = "pin";
+
+  /** A page pinned to deploy A, with deploy B installed behind it. */
+  async function pageOnAWithBInstalled(worker) {
+    const page = worker.addClient();
+    await worker.fetch(worker.navigation(ORIGIN), { resultingClientId: page.id });
+    publishDeploy(worker.network, ORIGIN, "B");
+    await worker.message({ type: "squallar:check-update" });
+    return page;
+  }
+
+  const body = async (event) => (await event.response).text();
+  const keyed = (asset, key) => new Request(`${shellUrl(asset)}?${PIN}=${key}`);
+
+  it("spells the key parameter the page uses", async () => {
+    const worker = await bootWorker({ tag: "A" });
+    assert.equal(worker.internals.SHELL_PIN_PARAM, PIN);
+  });
+
+  it("pins the worker's own client id at its script fetch", async () => {
+    // The worker's direct imports and its wasm fetch carry the worker's id in
+    // both browsers; without this pin they resolved to the current generation.
+    const worker = await bootWorker({ tag: "A" });
+    const page = await pageOnAWithBInstalled(worker);
+
+    const script = await worker.fetch(new Request(shellUrl("worker.js")), {
+      clientId: page.id,
+      resultingClientId: "worker-1",
+    });
+    assert.equal(await body(script), "worker.js::A");
+    const glue = await worker.fetch(new Request(shellUrl("pkg/squallar_web.js")), {
+      clientId: "worker-1",
+    });
+    const wasm = await worker.fetch(new Request(shellUrl("pkg/squallar_web_bg.wasm")), {
+      clientId: "worker-1",
+    });
+    const heap = await worker.fetch(new Request(shellUrl("heap.js")), { clientId: "worker-1" });
+    assert.deepEqual(
+      [await body(glue), await body(wasm), await body(heap)],
+      ["pkg/squallar_web.js::A", "pkg/squallar_web_bg.wasm::A", "heap.js::A"],
+      "the worker a page on deploy A started was handed deploy B's bytes",
+    );
+  });
+
+  it("answers a keyed request from the key's generation, whoever asks", async () => {
+    // Chromium hands the rayon threads' and the lane's glue imports to the
+    // worker with an empty client id; Firefox hands the threads' with a blob
+    // worker's own, never-seen id. The key in the URL is all they carry.
+    const worker = await bootWorker({ tag: "A" });
+    const page = await pageOnAWithBInstalled(worker);
+
+    const script = await worker.fetch(keyed("worker.js", "k1"), {
+      clientId: page.id,
+      resultingClientId: "worker-1",
+    });
+    assert.equal(await body(script), "worker.js::A");
+
+    const asks = [
+      ["a rayon thread in Chromium", "pkg/squallar_web.js", { clientId: "" }],
+      ["a rayon thread in Firefox", "pkg/squallar_web.js", { clientId: "blob-worker-7" }],
+      ["the lane's script", "tile-lane.js", { clientId: "worker-1", resultingClientId: "lane-1" }],
+      ["the lane's glue in Chromium", "pkg/squallar_web.js", { clientId: "" }],
+      ["the lane's glue in Firefox", "pkg/squallar_web.js", { clientId: "lane-1" }],
+      ["the worker's module, keyed", "pkg/squallar_web_bg.wasm", { clientId: "worker-1" }],
+    ];
+    for (const [who, asset, ids] of asks) {
+      const event = await worker.fetch(keyed(asset, "k1"), ids);
+      assert.equal(await body(event), `${asset}::A`, `${who} was handed another generation`);
+    }
+  });
+
+  it("keeps a respawned worker on the page's generation", async () => {
+    // A replaced worker is a new client id under the same key.
+    const worker = await bootWorker({ tag: "A" });
+    const page = await pageOnAWithBInstalled(worker);
+    await worker.fetch(keyed("worker.js", "k1"), { clientId: page.id, resultingClientId: "worker-1" });
+
+    const respawn = await worker.fetch(keyed("worker.js", "k1"), {
+      clientId: page.id,
+      resultingClientId: "worker-2",
+    });
+    const wasm = await worker.fetch(new Request(shellUrl("pkg/squallar_web_bg.wasm")), {
+      clientId: "worker-2",
+    });
+    assert.deepEqual(
+      [await body(respawn), await body(wasm)],
+      ["worker.js::A", "pkg/squallar_web_bg.wasm::A"],
+    );
+  });
+
+  it("keeps the worker tree on its generation across a worker restart", async () => {
+    // Both pins are written down, for the reason the page's is: the service
+    // worker is killed after ~30 s idle, and the threads and the lane start
+    // seconds after the worker does.
+    const worker = await bootWorker({ tag: "A" });
+    const page = worker.addClient();
+    await worker.fetch(worker.navigation(ORIGIN), { resultingClientId: page.id });
+    await worker.fetch(keyed("worker.js", "k1"), { clientId: page.id, resultingClientId: "worker-1" });
+
+    const restarted = await restartWorker(worker);
+    publishDeploy(restarted.network, ORIGIN, "B");
+    await restarted.message({ type: "squallar:check-update" });
+
+    const glue = await restarted.fetch(keyed("pkg/squallar_web.js", "k1"), { clientId: "" });
+    const wasm = await restarted.fetch(new Request(shellUrl("pkg/squallar_web_bg.wasm")), {
+      clientId: "worker-1",
+    });
+    assert.deepEqual(
+      [await body(glue), await body(wasm)],
+      ["pkg/squallar_web.js::A", "pkg/squallar_web_bg.wasm::A"],
+      "the restarted service worker forgot which generation the page's worker tree is on",
+    );
+  });
+
+  it("gives the worker of a page that has no pin the current generation, whole", async () => {
+    // A page that navigated before any shell existed has no pin. Its worker
+    // tree still has to be one generation: the key and the worker's id are
+    // pinned to whatever was current when the worker's script was asked for,
+    // and a deploy landing after that no longer reaches the tree.
+    const network = new Network();
+    publishDeploy(network, ORIGIN, "A");
+    const worker = await startWorker({ swUrl: SW_URL, network });
+    const page = worker.addClient();
+    const nav = await worker.fetch(worker.navigation(ORIGIN), { resultingClientId: page.id });
+    assert.equal(nav.handled, true);
+    await worker.activate();
+
+    const script = await worker.fetch(keyed("worker.js", "k1"), {
+      clientId: page.id,
+      resultingClientId: "worker-1",
+    });
+    assert.equal(await body(script), "worker.js::A");
+    publishDeploy(worker.network, ORIGIN, "B");
+    await worker.message({ type: "squallar:check-update" });
+
+    const glue = await worker.fetch(keyed("pkg/squallar_web.js", "k1"), { clientId: "" });
+    const wasm = await worker.fetch(new Request(shellUrl("pkg/squallar_web_bg.wasm")), {
+      clientId: "worker-1",
+    });
+    assert.deepEqual(
+      [await body(glue), await body(wasm)],
+      ["pkg/squallar_web.js::A", "pkg/squallar_web_bg.wasm::A"],
+    );
+  });
+
+  it("does not move a page that loads after the update onto the worker's key", async () => {
+    // A key is a page's, not the origin's: a new page mints a new one and gets
+    // the new deploy, whole.
+    const worker = await bootWorker({ tag: "A" });
+    const page = await pageOnAWithBInstalled(worker);
+    await worker.fetch(keyed("worker.js", "k1"), { clientId: page.id, resultingClientId: "worker-1" });
+
+    const later = await loadPage(worker);
+    assert.deepEqual(generationOf(later), new Set(["B"]));
+    const script = await worker.fetch(keyed("worker.js", "k2"), {
+      clientId: later.client.id,
+      resultingClientId: "worker-9",
+    });
+    const glue = await worker.fetch(keyed("pkg/squallar_web.js", "k2"), { clientId: "" });
+    assert.deepEqual([await body(script), await body(glue)], ["worker.js::B", "pkg/squallar_web.js::B"]);
+  });
+
+  it("prunes a worker's pins with its page, and not before", async () => {
+    // Worker clients are not windows, so a prune keyed on live windows alone
+    // would drop them at the next navigation anywhere -- while the threads
+    // and the lane were still about to ask. They go with their page instead.
+    const worker = await bootWorker({ tag: "A" });
+    const page = await pageOnAWithBInstalled(worker);
+    await worker.fetch(keyed("worker.js", "k1"), { clientId: page.id, resultingClientId: "worker-1" });
+
+    // Another tab opens: a navigation, which is where pruning happens.
+    const other = worker.addClient();
+    await worker.fetch(worker.navigation(ORIGIN), { resultingClientId: other.id });
+    const pins = await (await (await worker.caches.open("squallar-meta-v2")).match(
+      `${ORIGIN}__squallar_sw_pins__`,
+    )).json();
+    assert.ok(pins["worker-1"] && pins["key:k1"], `the first page's worker pins were pruned while it was open: ${JSON.stringify(pins)}`);
+    const glue = await worker.fetch(keyed("pkg/squallar_web.js", "k1"), { clientId: "" });
+    assert.equal(await body(glue), "pkg/squallar_web.js::A");
+
+    // The first page closes; the next navigation prunes its worker's pins and
+    // the next deploy retires deploy A with nothing pinned to it.
+    worker.removeClient(page);
+    await worker.fetch(worker.navigation(ORIGIN), { resultingClientId: worker.addClient().id });
+    publishDeploy(worker.network, ORIGIN, "C");
+    await worker.message({ type: "squallar:check-update" });
+    const after = await (await (await worker.caches.open("squallar-meta-v2")).match(
+      `${ORIGIN}__squallar_sw_pins__`,
+    )).json();
+    assert.equal("worker-1" in after || "key:k1" in after, false, JSON.stringify(after));
+    const shells = (await worker.cacheNames()).filter((n) => n.startsWith("squallar-shell-"));
+    assert.equal(shells.some((n) => n.includes("%22A%22")), false, `deploy A retained: ${shells}`);
+  });
+});
+
+// ===========================================================================
 describe("install: a shell is published whole or not at all", () => {
   // =========================================================================
 

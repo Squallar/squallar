@@ -58,6 +58,46 @@
  * tried and is strictly worse: it keeps a cache that may have no reader while
  * still allowing deletion of one that does.
  *
+ * THE PAGE IS NOT THE ONLY CLIENT. The rasterization worker the page starts
+ * (`worker.js`), the tile lane that worker starts (`tile-lane.js`), and the
+ * rayon threads it starts from a blob URL are each a service-worker client of
+ * their own, and every one of them imports `pkg/squallar_web.js`; the worker
+ * fetches the wasm module a second time as well. Until 2026-09-12 only the
+ * page was pinned, so a deploy landing during boot -- the page's navigation
+ * pins generation A, `checkForUpdate` installs B and moves the pointer within
+ * the same second on a fast link -- gave the worker `worker.js` from A (its
+ * script fetch carries the PAGE's client id) and glue+wasm from B (its own,
+ * never-pinned client id). The page cannot decode what such a worker sends
+ * back; every still render came back empty and the radar never drew, with no
+ * error anywhere (measured: Firefox 78,136 -> 6,148 and Chromium
+ * 78,581 -> 6,091 radar-palette pixels in the KTLX disc, the residue being
+ * site markers). On the deployed site the build-token handshake refuses the
+ * pair instead and the page renders on its own thread while a respawn ladder
+ * fetches the same wrong generation again.
+ *
+ * Two pins close it, because the browsers attribute a worker tree's requests
+ * unevenly (measured 2026-09-12, Firefox 155 and Chromium 152):
+ *
+ *   * `event.resultingClientId` is populated on a dedicated worker's script
+ *     fetch in both, so that fetch pins the worker's own client id to the
+ *     generation its parent resolved to (`pinClient` with an owner). The
+ *     worker's direct imports and its wasm fetch then carry that id in both.
+ *   * The rayon threads' glue imports carry NO client id in Chromium and a
+ *     blob worker's own, never-seen id in Firefox; the lane's glue import
+ *     carries none in Chromium, and Firefox sometimes answers the lane's
+ *     script from its HTTP cache without asking this worker at all. Nothing
+ *     identity-based reaches those, so the generation rides in the URL
+ *     instead: the page starts `worker.js?pin=<key>`, `worker.js` and
+ *     `tile-lane.js` import the glue with the same query, the rayon helper
+ *     imports whatever URL the worker's glue was loaded at, and a shell
+ *     request carrying `pin=` resolves through `SHELL_PIN_PARAM` below to the
+ *     generation recorded for that key at its first sight. A fresh key is also
+ *     a URL no HTTP cache has seen.
+ *
+ * Worker and key pins are pruned with their owning page, never on their own:
+ * a worker client is not a window, and `matchAll` does not list a client whose
+ * script is still being fetched.
+ *
  * A client mid-session is never swapped; it gets `squallar:shell-updated` and
  * index.html offers a Reload.
  */
@@ -82,6 +122,22 @@ const ASSET_CACHE = `squallar-assets-v${SW_VERSION}`;
 /* Synthetic keys for the meta and client-pin records; nothing is served from them. */
 const META_KEY = new URL("__squallar_sw_meta__", ROOT).href;
 const PINS_KEY = new URL("__squallar_sw_pins__", ROOT).href;
+/* Which page each worker or key pin belongs to; see `pinClient`. */
+const OWNERS_KEY = new URL("__squallar_sw_owners__", ROOT).href;
+
+/*
+ * The query parameter a shell request carries when its generation cannot ride
+ * on a client id: `worker.js?pin=<key>` and everything that worker tree imports
+ * (see the header). The page mints the key -- `worker_port.rs` spells this
+ * same name, and `tests/pwa_assets.rs` holds the two equal -- and it need only
+ * be unique among the open tabs of one origin. The value is opaque here; it is
+ * never a cache name, so a page cannot ask for a generation by name.
+ */
+const SHELL_PIN_PARAM = "pin";
+
+/* How a key pin is filed among the client-id pins: keys and client ids share
+ * one record, and a client id is a UUID, which never starts with this. */
+const KEY_PIN_PREFIX = "key:";
 
 /*
  * The app shell, relative to ROOT. Twelve entries, but the wasm module
@@ -575,10 +631,12 @@ function currentMeta() {
 }
 
 /*
- * Which shell generation each live client is being served from, keyed by the
- * client id its navigation created. Mirrored into the meta cache by `writePins`,
- * since this is module state and the worker is killed after ~30s idle. The
- * durable copy is also what makes `cachesToKeep` exact rather than a guess.
+ * Which shell generation each live client is being served from. Keyed by the
+ * client id a navigation created, by the client id a worker's script fetch
+ * created, and -- under `KEY_PIN_PREFIX` -- by the key a page put in its
+ * worker tree's URLs. Mirrored into the meta cache by `writePins`, since this
+ * is module state and the worker is killed after ~30s idle. The durable copy
+ * is also what makes `cachesToKeep` exact rather than a guess.
  */
 const clientShells = new Map();
 
@@ -593,25 +651,51 @@ async function openShellCache(name) {
   return caches.open(name);
 }
 
-async function readPins() {
+async function readRecord(key) {
   const cache = await caches.open(META_CACHE);
-  const stored = await cache.match(PINS_KEY);
+  const stored = await cache.match(key);
   if (!stored) return {};
   try {
-    return await stored.json();
+    const record = await stored.json();
+    return record && typeof record === "object" ? record : {};
   } catch {
     return {};
   }
 }
 
-async function writePins(pins) {
+async function writeRecord(key, record) {
   const cache = await caches.open(META_CACHE);
   await cache.put(
-    PINS_KEY,
-    new Response(JSON.stringify(pins), {
+    key,
+    new Response(JSON.stringify(record), {
       headers: { "content-type": "application/json" },
     }),
   );
+}
+
+/** `{id: cacheName}`: the pins. */
+function readPins() {
+  return readRecord(PINS_KEY);
+}
+
+function writePins(pins) {
+  return writeRecord(PINS_KEY, pins);
+}
+
+/*
+ * `{id: parentId}`: who each worker or key pin belongs to, walked up to a
+ * window. Only windows are in `liveClientIds` -- a worker client is not one,
+ * and a client whose script is still being fetched is listed by nobody -- so
+ * this is what lets a worker's pin live exactly as long as its page and not
+ * one navigation longer. Durable only: it is read at every prune, never on
+ * the hot path.
+ */
+function readOwners() {
+  return readRecord(OWNERS_KEY);
+}
+
+function writeOwners(owners) {
+  return writeRecord(OWNERS_KEY, owners);
 }
 
 async function liveClientIds() {
@@ -619,48 +703,101 @@ async function liveClientIds() {
   return new Set(windows.map((c) => c.id));
 }
 
+/** Whether `id` is a live window, or belongs -- through its owners -- to one. */
+function isLive(id, live, owners) {
+  // Bounded, so a cycle in a corrupt record cannot hang a fetch.
+  for (let hops = 0; hops < 8; hops++) {
+    if (live.has(id)) return true;
+    const owner = owners[id];
+    if (typeof owner !== "string") return false;
+    id = owner;
+  }
+  return false;
+}
+
 /**
- * Record `cacheName` as the generation serving `clientId`, durably. Departed
- * clients are pruned in the same write, bounding the record by open tabs rather
- * than by tabs ever opened; `clientId` is exempt because the navigation creating
- * it has not finished, so it is not yet in `live`.
+ * Record `cacheName` as the generation serving `id`, durably. `id` is a
+ * window's client id, a worker's, or a key under `KEY_PIN_PREFIX`; `owner` is
+ * the client id that started it, absent for a window. Departed clients are
+ * pruned in the same write, bounding the record by open tabs rather than by
+ * tabs ever opened: a pin survives while its id, or the window at the top of
+ * its owner chain, is live. `id` is exempt because what creates it -- the
+ * navigation, or the worker's script fetch -- has not finished, so it is not
+ * yet in `live`; its owner, when it has one, is a page that already is.
  */
-async function pinClient(clientId, cacheName) {
-  clientShells.set(clientId, cacheName);
+async function pinClient(id, cacheName, owner = null) {
+  clientShells.set(id, cacheName);
 
   const live = await liveClientIds();
   const pins = await readPins();
-  for (const id of Object.keys(pins)) {
-    if (id !== clientId && !live.has(id)) delete pins[id];
+  const owners = await readOwners();
+  if (owner) owners[id] = owner;
+  else delete owners[id];
+  for (const stale of Object.keys(pins)) {
+    if (stale !== id && !isLive(stale, live, owners)) delete pins[stale];
   }
-  pins[clientId] = cacheName;
+  pins[id] = cacheName;
+  for (const stale of Object.keys(owners)) {
+    if (!(stale in pins)) delete owners[stale];
+  }
   await writePins(pins);
+  await writeOwners(owners);
 
-  for (const id of [...clientShells.keys()]) {
-    if (id !== clientId && !live.has(id)) clientShells.delete(id);
+  for (const stale of [...clientShells.keys()]) {
+    if (stale !== id && !isLive(stale, live, owners)) clientShells.delete(stale);
   }
 }
 
-/** The shell generation `clientId` is pinned to, falling back to the current one. */
-async function shellCacheForClient(clientId) {
-  if (clientId) {
-    let pinned = clientShells.get(clientId);
-    if (!pinned) {
-      // Either this client never navigated through this worker, or the worker
-      // restarted since it did. The second is why the pin is written down.
-      const pins = await readPins();
-      pinned = pins[clientId];
-      if (pinned) clientShells.set(clientId, pinned);
-    }
-    if (pinned) {
-      const cache = await openShellCache(pinned);
-      // A pin whose cache is gone falls through: the network is always a correct
-      // answer, just a slower one.
-      if (cache) return cache;
-    }
+/**
+ * The cache name `id` is pinned to, from memory or the durable record. Null
+ * when `id` is unpinned, and null when its cache is gone: the caller falls
+ * through, because the network is always a correct answer, just a slower one.
+ */
+async function pinnedShellName(id) {
+  if (!id) return null;
+  let pinned = clientShells.get(id);
+  if (!pinned) {
+    // Either this client never navigated through this worker, or the worker
+    // restarted since it did. The second is why the pin is written down.
+    const pins = await readPins();
+    pinned = pins[id];
+    if (pinned) clientShells.set(id, pinned);
   }
-  const meta = await currentMeta();
-  return openShellCache(meta && meta.cacheName);
+  if (!pinned || !(await caches.has(pinned))) return null;
+  return pinned;
+}
+
+/**
+ * The generation one shell request is answered from, and the pins it leaves
+ * behind. In order:
+ *
+ *   1. the key in its URL (`SHELL_PIN_PARAM`), pinned at first sight to
+ *      whatever 2 or 3 answer for the client that brought it -- the page,
+ *      asking for `worker.js?pin=<key>`;
+ *   2. the pin of the client that issued it;
+ *   3. the current generation.
+ *
+ * `resultingClientId`, present exactly when the request is a worker's script,
+ * is pinned to the same answer before the response is delivered, so the
+ * worker's own un-keyed fetches -- its wasm module, its `heap.js` -- resolve
+ * as its parent's did. Both pins are owned by the requesting client, so they
+ * go when its page goes. The header says which requests need which pin.
+ */
+async function shellCacheForRequest(url, clientId, resultingClientId) {
+  const key = url.searchParams.get(SHELL_PIN_PARAM);
+  const keyId = key ? KEY_PIN_PREFIX + key : null;
+  let name = keyId ? await pinnedShellName(keyId) : null;
+  const keyIsNew = keyId !== null && name === null;
+  if (!name) name = await pinnedShellName(clientId);
+  if (!name) {
+    const meta = await currentMeta();
+    name = meta && meta.cacheName ? meta.cacheName : null;
+  }
+  if (!name) return null;
+  const owner = clientId || null;
+  if (keyIsNew) await pinClient(keyId, name, owner);
+  if (resultingClientId) await pinClient(resultingClientId, name, owner);
+  return openShellCache(name);
 }
 
 /**
@@ -881,19 +1018,42 @@ async function forceReinstall() {
 // ---------------------------------------------------------------------------
 
 /**
- * `clientId` is the empty string for a request the browser cannot attribute,
- * which falls back to the current generation — correct, because such a request
- * is not part of a page load this worker pinned.
+ * `clientId` is the empty string for a request the browser cannot attribute;
+ * with no key in the URL either, that falls back to the current generation --
+ * correct, because such a request is not part of a page load this worker
+ * pinned. `ignoreSearch` is what makes the keyed spelling hit the entry
+ * `installShell` stored under the bare URL.
  */
-async function serveShell(request, clientId, key) {
-  const cache = await shellCacheForClient(clientId);
+async function serveShell(event) {
+  const url = new URL(event.request.url);
+  const cache = await shellCacheForRequest(url, event.clientId, event.resultingClientId);
   if (cache) {
-    const hit = await cache.match(key ?? request, { ignoreSearch: true });
-    if (hit) return hit;
+    const hit = await cache.match(event.request, { ignoreSearch: true });
+    if (hit) return url.searchParams.has(SHELL_PIN_PARAM) ? atRequestUrl(hit) : hit;
   }
   // No shell yet (first visit, or an unfinished update). Nothing is written
   // here: `checkForUpdate` owns every write to the shell cache.
-  return fetch(request);
+  return fetch(event.request);
+}
+
+/**
+ * The cached bytes under the URL that was asked for. A stored response's
+ * `url` is the one `installShell` fetched it at -- the bare `worker.js` --
+ * and a worker's `self.location` is set from its script's RESPONSE URL, not
+ * its request's (HTML, "run a worker"). Served as stored, `worker.js?pin=k`
+ * ran at `worker.js`, read an empty `location.search`, and the key went no
+ * further than the one fetch that carried it (measured: the worker's
+ * `loc=` mark without the query, its threads' glue from the current
+ * generation). A response built here has no URL of its own, and the fetch
+ * algorithm fills that in with the request's. The body is passed through,
+ * not copied.
+ */
+function atRequestUrl(response) {
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
 }
 
 /**
@@ -1470,7 +1630,7 @@ self.addEventListener("fetch", (event) => {
       event.waitUntil(checkForUpdate().catch(() => {}));
       return;
     case "shell":
-      event.respondWith(serveShell(event.request, event.clientId));
+      event.respondWith(serveShell(event));
       return;
     case "asset":
       event.respondWith(serveAsset(event));
@@ -1539,6 +1699,7 @@ self.__squallarSwInternals = {
   enforceBlockBudget,
   purgeStaleBlockCaches,
   isShellAsset,
+  SHELL_PIN_PARAM,
   normalizeHost,
   validatorToken,
   OFFLINE_CACHE,

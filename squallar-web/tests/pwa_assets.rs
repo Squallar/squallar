@@ -838,18 +838,77 @@ fn the_script_the_page_asks_for_is_shipped_and_precached() {
 
 /// One wasm module, instantiated twice: `sw.js` pins each client to a single
 /// shell generation because a mismatched glue/module pair is a `LinkError`.
+///
+/// The worker's import is dynamic and carries its own query string -- the
+/// shell-generation key the page put on `worker.js?pin=...` -- which is what
+/// lets `sw.js` answer it, and the rayon threads' imports of the same URL,
+/// from the page's generation. `the_worker_tree_carries_the_page_key` below
+/// holds the key's spelling across the three files.
 #[test]
 fn the_rasterization_worker_loads_the_same_module_as_the_page() {
     let glue = page_module_specifier();
     assert!(
-        RASTER_WORKER.contains(&format!("from \"{glue}\"")),
-        "index.html imports {glue:?} but worker.js does not. A second wasm \
-         artifact needs its own precache entries and its own place in sw.js's \
-         per-client shell pinning."
+        RASTER_WORKER.contains(&format!("import(\"{glue}\" + shellPin)")),
+        "index.html imports {glue:?} but worker.js does not import it keyed. A \
+         second wasm artifact needs its own precache entries and its own place \
+         in sw.js's per-client shell pinning; an unkeyed import is answered by \
+         the worker's own client id, which sw.js cannot pin for the rayon \
+         threads that import the same URL."
     );
     assert!(
         RASTER_WORKER.contains("squallar_worker_main"),
         "worker.js does not call the worker entry point"
+    );
+}
+
+/// The one identity every request in the worker tree can carry is the key the
+/// page spells on the worker's URL: `worker.js` and `tile-lane.js` pass their
+/// own query on to what they import, `worker.rs` passes the worker's on to
+/// the lane it starts, and `sw.js` reads the same parameter name. Four files,
+/// one spelling; a drift in any of them is a worker silently back on the
+/// current generation.
+#[test]
+fn the_worker_tree_carries_the_page_key() {
+    let in_sw = literal_after(SERVICE_WORKER, "sw.js", "const SHELL_PIN_PARAM = \"");
+    let in_page = literal_after(
+        WORKER_PORT,
+        "worker_port.rs",
+        "const SHELL_PIN_PARAM: &str = \"",
+    );
+    assert_eq!(
+        in_sw, in_page,
+        "sw.js reads `?{in_sw}=` off shell requests but worker_port.rs starts the \
+         worker with `?{in_page}=`; the worker tree would resolve to the current \
+         generation, not the page's"
+    );
+    assert!(
+        WORKER_PORT.contains("format!(\"{WORKER_URL}?{SHELL_PIN_PARAM}={key}\")"),
+        "worker_port.rs no longer starts the worker at WORKER_URL with the key"
+    );
+    for (what, src) in [("worker.js", RASTER_WORKER), ("tile-lane.js", TILE_LANE)] {
+        assert!(
+            src.contains("const shellPin = self.location.search;"),
+            "{what} does not read its own query string, so the key stops there"
+        );
+    }
+    let glue = page_module_specifier();
+    assert!(
+        TILE_LANE.contains(&format!("import(\"{glue}\" + shellPin)")),
+        "tile-lane.js does not import the glue keyed; Chromium attributes that \
+         import to no client, so nothing else can name its generation"
+    );
+    assert!(
+        RASTER_WORKER.contains("import(\"./heap.js\" + shellPin)"),
+        "worker.js imports heap.js unkeyed"
+    );
+    assert!(
+        RASTER_WORKER
+            .contains("new URL(\"./pkg/squallar_web_bg.wasm\" + shellPin, self.location.href)"),
+        "worker.js lets the glue resolve the module itself, which drops the query"
+    );
+    assert!(
+        RASTER_WORKER_RS.contains("scope.location().search()"),
+        "worker.rs no longer passes the worker's own query on to the lane it starts"
     );
 }
 
@@ -903,7 +962,7 @@ fn the_tile_lane_script_exists_and_is_precached() {
 fn the_tile_lane_loads_the_same_module_as_the_page_and_calls_its_entry() {
     let glue = page_module_specifier();
     assert!(
-        TILE_LANE.contains(&format!("from \"{glue}\"")),
+        TILE_LANE.contains(&format!("import(\"{glue}\" + shellPin)")),
         "index.html imports {glue:?} but tile-lane.js does not; a second wasm \
          artifact needs its own precache entries and its own place in sw.js's \
          per-client shell pinning."

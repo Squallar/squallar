@@ -60,6 +60,23 @@ use wasm_bindgen::prelude::*;
 /// Relative on purpose: the site is served from a project-Pages subpath.
 const WORKER_URL: &str = "./worker.js";
 
+/// The query parameter that carries this page's shell-generation key on
+/// [`WORKER_URL`] and, from there, on everything the worker tree imports.
+/// Held equal to `sw.js`'s `SHELL_PIN_PARAM` by `tests/pwa_assets.rs`.
+///
+/// **Why a key rides in the URL at all.** The service worker pins each page to
+/// one shell generation by its client id, and a deploy landing during boot
+/// used to give the worker this page started a *different* generation than
+/// the page: its script fetch carries the page's id, but its glue and wasm
+/// arrive under the worker's own, never-pinned id, and the rayon threads'
+/// glue imports arrive with no client id at all in Chromium. A key the page
+/// mints, spelled on the worker's URL and propagated by `worker.js` onto its
+/// imports, is the one identity every request in that tree can carry;
+/// `sw.js` records the generation it resolved for the key at first sight and
+/// answers every later request carrying it from the same one. See the
+/// `MIXED SHELLS` header of `sw.js`.
+const SHELL_PIN_PARAM: &str = "pin";
+
 /// The prefix of the `name` a rasterization worker is started under, the rest
 /// of which is its linear-memory ceiling in bytes. Held equal to `heap.js`'s
 /// own `WORKER_NAME_PREFIX` by `tests/linear_memory_ceiling.rs`.
@@ -85,6 +102,25 @@ thread_local! {
     /// Whether a respawn is already on a timer, so a `FATAL` and an `onerror` from
     /// the same dying worker schedule one attempt.
     static RESPAWN_SCHEDULED: Cell<bool> = const { Cell::new(false) };
+
+    /// This page's shell-generation key, minted once: a respawn must land on
+    /// the generation the page runs, and the service worker keeps that
+    /// answer by key (see [`SHELL_PIN_PARAM`]). Opaque and random; it only
+    /// has to differ between the tabs of one origin.
+    static SHELL_PIN_KEY: String = fresh_shell_pin_key();
+}
+
+/// Two `Math.random()` draws as hex: 104 bits, which is uniqueness enough for
+/// "the tabs open on one origin" without a `Crypto` feature for the one call.
+fn fresh_shell_pin_key() -> String {
+    const DRAW: f64 = (1u64 << 52) as f64;
+    let draw = || (js_sys::Math::random() * DRAW) as u64;
+    format!("{:013x}{:013x}", draw(), draw())
+}
+
+/// The URL the worker is started at: [`WORKER_URL`] carrying this page's key.
+fn keyed_worker_url() -> String {
+    SHELL_PIN_KEY.with(|key| format!("{WORKER_URL}?{SHELL_PIN_PARAM}={key}"))
 }
 
 /// Take the worker's heap reading — and its live bytes, where the message
@@ -138,7 +174,7 @@ fn spawn() {
         options.set_name(&format!("{WORKER_NAME_PREFIX}{bytes}"));
     }
 
-    let worker = match web_sys::Worker::new_with_options(WORKER_URL, &options) {
+    let worker = match web_sys::Worker::new_with_options(&keyed_worker_url(), &options) {
         Ok(worker) => worker,
         Err(e) => {
             log::warn!("no rasterization worker ({e:?}); rendering on the main thread");

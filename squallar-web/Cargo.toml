@@ -165,6 +165,10 @@ features = [
     "WorkerType",
     "DedicatedWorkerGlobalScope",
     "MessageEvent",
+    # `WorkerGlobalScope::location().search()`: the query the page started the
+    # rasterization worker with, which `spawn_tile_lane` passes on to the lane
+    # so the whole worker tree carries one shell-generation key (`sw.js`).
+    "WorkerLocation",
     # The tile lane (`src/worker.rs`, `spawn_tile_lane`): the worker opens a
     # `MessageChannel` between its nested lane Worker and the page, and both
     # ends speak on a `MessagePort`.

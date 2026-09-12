@@ -15,19 +15,33 @@
  * A MODULE worker for the reason `worker.js` is one, and every path relative
  * for the same reason (`sw.js` precaches this file beside `worker.js`).
  *
+ * The glue is imported dynamically, with this lane's own query string, for
+ * the reason `worker.js` imports its own that way: the worker started this
+ * file at `tile-lane.js?pin=<key>`, the page's shell-generation key, and the
+ * glue this lane loads has to match the module it is handed. Its import is
+ * one of the requests the browsers attribute to nobody (Chromium hands the
+ * service worker an empty client id for it), so the key in the URL is the
+ * only thing that can name its generation.
+ *
  * A failed init is reported on the port rather than left silent: the page
  * would otherwise wait for a `lanehello` that never comes. It still costs
  * nothing but the lane -- the page keeps styling tiles on its own thread.
  */
-import init, { squallar_tile_lane_main } from "./pkg/squallar_web.js";
+
+/* `?pin=<key>` as the worker spelled it; empty when opened by hand. */
+const shellPin = self.location.search;
 
 self.onmessage = function (event) {
   var d = event.data || {};
   if (d.kind !== "laneinit") return;
   self.onmessage = null;
-  init({ module_or_path: d.module, memory: d.memory })
-    .then(function () {
-      squallar_tile_lane_main(d.port);
+  import("./pkg/squallar_web.js" + shellPin)
+    .then(function (glue) {
+      return glue
+        .default({ module_or_path: d.module, memory: d.memory })
+        .then(function () {
+          glue.squallar_tile_lane_main(d.port);
+        });
     })
     .catch(function (e) {
       d.port.postMessage({ kind: "fatal", error: String(e) });
