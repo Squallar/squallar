@@ -37,11 +37,13 @@ import { describe, it } from "node:test";
 
 import {
   Network,
+  glueSource,
   opaqueResponse,
   publishDeploy,
   publishIndexOnlyDeploy,
   publishUnversionedDeploy,
   restartWorker,
+  snippetPath,
   startWorker,
 } from "./sw_harness.mjs";
 
@@ -64,6 +66,11 @@ const PRODUCTION_DATA_URLS = [
 
 function shellUrl(asset) {
   return new URL(asset, ORIGIN).href;
+}
+
+/** The glue body deploy `tag` serves: its snippet import, then the tag. */
+function glueOf(tag) {
+  return glueSource(tag, [snippetPath()]);
 }
 
 /** A worker with deploy `tag` installed and its first activation complete. */
@@ -421,6 +428,172 @@ describe("routing: the shell rule is confined to the deploy directory", () => {
 });
 
 // ===========================================================================
+describe("shell: the glue's own imports are shell, found by reading the glue", () => {
+  // =========================================================================
+  //
+  // wasm-bindgen emits `pkg/snippets/<crate>-<hash>/...` for the JS a crate
+  // ships beside its Rust and imports each one from the glue. The hash moves
+  // with the crate's pin, so no spelling in `SHELL_PATHS` can be right for
+  // long; the worker reads the glue it just cached and follows its imports
+  // instead. Every test here publishes a deploy whose glue carries the import
+  // line exactly as `wasm-pack build --target web` writes it.
+
+  const SNIPPET = snippetPath();
+
+  it("routes the snippet directory as shell, by directory containment", async () => {
+    const worker = await bootWorker();
+    const { routeFor } = worker.internals;
+    assert.equal(routeFor({ url: shellUrl(SNIPPET) }), "shell");
+    assert.equal(routeFor({ url: shellUrl(snippetPath("0000deadbeef0000")) }), "shell");
+    // Containment, not a prefix: a sibling directory is not the snippets.
+    assert.equal(routeFor({ url: shellUrl("pkg/snippetsx/a.js") }), "network");
+    assert.equal(routeFor({ url: shellUrl("pkg/other.js") }), "network");
+    assert.equal(routeFor({ url: "https://squallar.example/pkg/snippets/a.js" }), "network");
+  });
+
+  it("reads the static imports wasm-bindgen writes, and nothing that is not one", async () => {
+    const worker = await bootWorker();
+    const { staticImportSpecifiers } = worker.internals;
+    assert.deepEqual(staticImportSpecifiers(glueOf("A")), [`./${SNIPPET.slice("pkg/".length)}`]);
+    assert.deepEqual(
+      staticImportSpecifiers(
+        [
+          'import { a } from "./one.js";',
+          "import {",
+          "  b,",
+          "  c,",
+          '} from "./two.js";',
+          "import * as ns from './three.js';",
+          'import "./four.js";',
+          'export { d } from "./five.js";',
+          'export * from "./six.js";',
+          "export function f() {",
+          '  return Array.from("not an import");',
+          "}",
+          "// import x from './commented.js';",
+          " * import y from './documented.js';",
+          "const pkg = await import(data.mainJS);",
+          'let s = "import z from \'./quoted.js\'";',
+        ].join("\n"),
+      ),
+      ["./one.js", "./two.js", "./three.js", "./four.js", "./five.js", "./six.js"],
+    );
+  });
+
+  it("caches the snippet with the shell, in the same generation", async () => {
+    const worker = await bootWorker({ tag: "A" });
+    const entries = worker.cachedEntries().filter((e) => e.url === shellUrl(SNIPPET));
+    assert.equal(entries.length, 1, "the glue's import was not precached");
+    assert.ok(entries[0].cache.startsWith(worker.internals.SHELL_PREFIX));
+    const meta = await (await (await worker.caches.open(worker.internals.META_CACHE)).match(
+      new URL("__squallar_sw_meta__", ORIGIN).href,
+    )).json();
+    assert.deepEqual(meta.imports, [shellUrl(SNIPPET)], "the meta record does not say what the walk found");
+  });
+
+  it("serves the snippet from the shell offline, to every client that asks", async () => {
+    // The page's glue imports it, the rasterization worker's does, the tile
+    // lane's does, and each rayon thread fetches its bytes (`import.meta.url`)
+    // and imports the glue again from a blob worker Chromium attributes to no
+    // client and Firefox to a never-seen one. All of those must come from
+    // the cache.
+    const worker = await bootWorker({ tag: "A" });
+    const page = await loadPage(worker);
+    worker.network.offline = true;
+    for (const [who, ids] of [
+      ["the page", { clientId: page.client.id }],
+      ["a rayon thread in Chromium", { clientId: "" }],
+      ["a rayon thread in Firefox", { clientId: "blob-worker-7" }],
+    ]) {
+      const event = await worker.fetch(new Request(shellUrl(SNIPPET)), ids);
+      assert.equal(event.handled, true, `${who}'s snippet request was not answered by the worker`);
+      assert.equal(await (await event.response).text(), `${SNIPPET}::A`, `${who} did not get the cached snippet`);
+    }
+  });
+
+  it("refuses to publish a shell whose glue imports something the shell would not serve", async () => {
+    // The presence control for the walk: an import the routing rule does not
+    // cover must fail the install loudly, not cache a graph the fetch
+    // handler would never answer from.
+    const network = new Network();
+    publishDeploy(network, ORIGIN, "A", { glueImports: [SNIPPET, "vendored/extra.js"] });
+    const worker = await startWorker({ swUrl: SW_URL, network });
+    await worker.activate();
+
+    const names = await worker.cacheNames();
+    assert.equal(
+      names.some((n) => n.startsWith(worker.internals.SHELL_PREFIX)),
+      false,
+      `a shell was published with an import it cannot serve: ${names}`,
+    );
+    assert.equal(
+      worker.errors.some((e) => e.includes("vendored/extra.js") && e.includes("SHELL_DIRS")),
+      true,
+      `the refusal was silent: ${JSON.stringify(worker.errors)}`,
+    );
+    // And the page still works, straight from the network.
+    const event = await worker.fetch(worker.navigation(ORIGIN), { resultingClientId: "c1" });
+    assert.equal(await (await event.response).text(), "::A");
+  });
+
+  it("publishes nothing when the snippet the glue imports is missing from the deploy", async () => {
+    // The same all-or-nothing the named entries have: a deploy that staged
+    // the glue but not `pkg/snippets/` is not a shell.
+    const network = new Network();
+    publishDeploy(network, ORIGIN, "A");
+    network.serve(shellUrl(SNIPPET), new Response("nope", { status: 404 }));
+    const worker = await startWorker({ swUrl: SW_URL, network });
+    await worker.activate();
+    assert.equal(
+      (await worker.cacheNames()).some((n) => n.startsWith(worker.internals.SHELL_PREFIX)),
+      false,
+      "a shell missing the glue's import was published",
+    );
+  });
+
+  it("follows an import of an import", async () => {
+    const nested = "pkg/snippets/some-crate-0123456789abcdef/src/helper.js";
+    const network = new Network();
+    publishDeploy(network, ORIGIN, "A");
+    network.serve(shellUrl(SNIPPET), (request, init, method) =>
+      method === "HEAD"
+        ? new Response(null, { status: 200 })
+        : new Response(`import { h } from '../../some-crate-0123456789abcdef/src/helper.js';\n${SNIPPET}::A`, {
+            status: 200,
+          }),
+    );
+    network.serve(shellUrl(nested), new Response(`${nested}::A`, { status: 200 }));
+    const worker = await startWorker({ swUrl: SW_URL, network });
+    await worker.activate();
+    assert.equal(worker.cachedUrls().includes(shellUrl(nested)), true, "the second level was not cached");
+  });
+
+  it("follows the path a pin bump moves the snippet to, and keeps a pinned page on its own", async () => {
+    const worker = await bootWorker({ tag: "A" });
+    const page = await loadPage(worker);
+    const moved = snippetPath("b16b00b5deadbeef");
+    publishDeploy(worker.network, ORIGIN, "B", { snippetHash: "b16b00b5deadbeef" });
+    await worker.message({ type: "squallar:check-update" });
+
+    worker.network.offline = true;
+    const fresh = await loadPage(worker);
+    assert.deepEqual(generationOf(fresh), new Set(["B"]));
+    const theirs = await worker.fetch(new Request(shellUrl(moved)), { clientId: fresh.client.id });
+    assert.equal(await (await theirs.response).text(), `${moved}::B`, "the new page did not get B's snippet");
+    const ours = await worker.fetch(new Request(shellUrl(SNIPPET)), { clientId: page.client.id });
+    assert.equal(await (await ours.response).text(), `${SNIPPET}::A`, "the pinned page lost A's snippet");
+  });
+
+  it("still serves the snippet after the worker restarts", async () => {
+    const worker = await bootWorker({ tag: "A" });
+    const restarted = await restartWorker(worker);
+    restarted.network.offline = true;
+    const event = await restarted.fetch(new Request(shellUrl(SNIPPET)), { clientId: "" });
+    assert.equal(await (await event.response).text(), `${SNIPPET}::A`);
+  });
+});
+
+// ===========================================================================
 describe("offline: the shell survives and weather data honestly fails", () => {
   // =========================================================================
 
@@ -465,7 +638,7 @@ describe("offline: the shell survives and weather data honestly fails", () => {
     worker.network.offline = true;
     const event = await worker.fetch(new Request(shellUrl("pkg/squallar_web.js")));
     assert.equal(event.handled, true);
-    assert.equal(await (await event.response).text(), "pkg/squallar_web.js::A");
+    assert.equal(await (await event.response).text(), glueOf("A"));
   });
 });
 
@@ -499,7 +672,7 @@ describe("shell: navigations and subresources are cache-first", () => {
     assert.equal(event.handled, true);
     assert.equal(
       await (await event.response).text(),
-      "pkg/squallar_web.js::A",
+      glueOf("A"),
       "the glue was fetched from the network; a cached wasm module would then not match it",
     );
   });
@@ -609,7 +782,7 @@ describe("atomicity: one page load draws its shell from one deploy", () => {
     });
     assert.equal(
       await (await glue.response).text(),
-      "pkg/squallar_web.js::A",
+      glueOf("A"),
       "a page that navigated under deploy A was handed deploy B's glue after the \
 worker restarted; its index.html and its wasm now disagree",
     );
@@ -722,7 +895,7 @@ describe("atomicity: the worker tree a page starts draws from the page's generat
     const heap = await worker.fetch(new Request(shellUrl("heap.js")), { clientId: "worker-1" });
     assert.deepEqual(
       [await body(glue), await body(wasm), await body(heap)],
-      ["pkg/squallar_web.js::A", "pkg/squallar_web_bg.wasm::A", "heap.js::A"],
+      [glueOf("A"), "pkg/squallar_web_bg.wasm::A", "heap.js::A"],
       "the worker a page on deploy A started was handed deploy B's bytes",
     );
   });
@@ -748,9 +921,10 @@ describe("atomicity: the worker tree a page starts draws from the page's generat
       ["the lane's glue in Firefox", "pkg/squallar_web.js", { clientId: "lane-1" }],
       ["the worker's module, keyed", "pkg/squallar_web_bg.wasm", { clientId: "worker-1" }],
     ];
+    const expected = (asset) => (asset === "pkg/squallar_web.js" ? glueOf("A") : `${asset}::A`);
     for (const [who, asset, ids] of asks) {
       const event = await worker.fetch(keyed(asset, "k1"), ids);
-      assert.equal(await body(event), `${asset}::A`, `${who} was handed another generation`);
+      assert.equal(await body(event), expected(asset), `${who} was handed another generation`);
     }
   });
 
@@ -792,7 +966,7 @@ describe("atomicity: the worker tree a page starts draws from the page's generat
     });
     assert.deepEqual(
       [await body(glue), await body(wasm)],
-      ["pkg/squallar_web.js::A", "pkg/squallar_web_bg.wasm::A"],
+      [glueOf("A"), "pkg/squallar_web_bg.wasm::A"],
       "the restarted service worker forgot which generation the page's worker tree is on",
     );
   });
@@ -824,7 +998,7 @@ describe("atomicity: the worker tree a page starts draws from the page's generat
     });
     assert.deepEqual(
       [await body(glue), await body(wasm)],
-      ["pkg/squallar_web.js::A", "pkg/squallar_web_bg.wasm::A"],
+      [glueOf("A"), "pkg/squallar_web_bg.wasm::A"],
     );
   });
 
@@ -842,7 +1016,7 @@ describe("atomicity: the worker tree a page starts draws from the page's generat
       resultingClientId: "worker-9",
     });
     const glue = await worker.fetch(keyed("pkg/squallar_web.js", "k2"), { clientId: "" });
-    assert.deepEqual([await body(script), await body(glue)], ["worker.js::B", "pkg/squallar_web.js::B"]);
+    assert.deepEqual([await body(script), await body(glue)], ["worker.js::B", glueOf("B")]);
   });
 
   it("prunes a worker's pins with its page, and not before", async () => {
@@ -856,12 +1030,12 @@ describe("atomicity: the worker tree a page starts draws from the page's generat
     // Another tab opens: a navigation, which is where pruning happens.
     const other = worker.addClient();
     await worker.fetch(worker.navigation(ORIGIN), { resultingClientId: other.id });
-    const pins = await (await (await worker.caches.open("squallar-meta-v2")).match(
+    const pins = await (await (await worker.caches.open(worker.internals.META_CACHE)).match(
       `${ORIGIN}__squallar_sw_pins__`,
     )).json();
     assert.ok(pins["worker-1"] && pins["key:k1"], `the first page's worker pins were pruned while it was open: ${JSON.stringify(pins)}`);
     const glue = await worker.fetch(keyed("pkg/squallar_web.js", "k1"), { clientId: "" });
-    assert.equal(await body(glue), "pkg/squallar_web.js::A");
+    assert.equal(await body(glue), glueOf("A"));
 
     // The first page closes; the next navigation prunes its worker's pins and
     // the next deploy retires deploy A with nothing pinned to it.
@@ -869,7 +1043,7 @@ describe("atomicity: the worker tree a page starts draws from the page's generat
     await worker.fetch(worker.navigation(ORIGIN), { resultingClientId: worker.addClient().id });
     publishDeploy(worker.network, ORIGIN, "C");
     await worker.message({ type: "squallar:check-update" });
-    const after = await (await (await worker.caches.open("squallar-meta-v2")).match(
+    const after = await (await (await worker.caches.open(worker.internals.META_CACHE)).match(
       `${ORIGIN}__squallar_sw_pins__`,
     )).json();
     assert.equal("worker-1" in after || "key:k1" in after, false, JSON.stringify(after));

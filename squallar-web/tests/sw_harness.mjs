@@ -419,10 +419,14 @@ export async function startWorker({
   };
 
   const warnings = [];
+  const errors = [];
   const consoleShim = {
     ...console,
     warn: (...args) => {
       warnings.push(args.map(String).join(" "));
+    },
+    error: (...args) => {
+      errors.push(args.map(String).join(" "));
     },
   };
 
@@ -455,6 +459,7 @@ export async function startWorker({
     network,
     internals,
     warnings,
+    errors,
     listenerTypes: () => [...listeners.keys()],
 
     addClient(url = new URL("./", swUrl).href) {
@@ -535,6 +540,51 @@ function readShellPaths(src) {
   return paths;
 }
 
+/*
+ * The one shell file that is NOT in `SHELL_PATHS`: the JS snippet
+ * wasm-bindgen emits for `wasm-bindgen-rayon`, under a directory whose hash
+ * moves with that crate's pin. The glue imports it statically, and the worker
+ * finds it by reading the glue at install rather than by name -- so what a
+ * deploy here publishes as its glue is an `import` line in the exact shape
+ * `wasm-pack build --target web` writes (single-quoted, relative to the
+ * glue), followed by the tag body every other asset carries. The hash is the
+ * one the 2026-09 build emits; a deploy may publish another to model a pin
+ * bump moving the path.
+ */
+export const SNIPPET_HASH = "38edf6e439f6d70d";
+
+export function snippetPath(hash = SNIPPET_HASH) {
+  return `pkg/snippets/wasm-bindgen-rayon-${hash}/src/workerHelpers.no-bundler.js`;
+}
+
+/** The glue's specifier for a deploy-relative path: the glue lives in `pkg/`. */
+function specifierFromGlue(path) {
+  return path.startsWith("pkg/") ? `./${path.slice("pkg/".length)}` : `../${path}`;
+}
+
+/** The glue body for deploy `tag`: its import lines, then the tag body. */
+export function glueSource(tag, imports) {
+  const lines = imports.map((p) => `import { startWorkers } from '${specifierFromGlue(p)}';`);
+  return `${lines.join("\n")}\npkg/squallar_web.js::${tag}`;
+}
+
+/**
+ * Every asset of deploy `tag` with its body: the named shell, and the modules
+ * the glue imports. `glueImports` is the list of deploy-relative paths the
+ * glue's import lines name; by default the real snippet. A path listed there
+ * is served whether or not the worker's rules would let it be cached -- that
+ * is for the test to decide, and to assert.
+ */
+function deployAssets(tag, { snippetHash = SNIPPET_HASH, glueImports = null } = {}) {
+  const imports = glueImports ?? [snippetPath(snippetHash)];
+  const assets = new Map();
+  for (const asset of SHELL_ASSETS) {
+    assets.set(asset, asset === "pkg/squallar_web.js" ? glueSource(tag, imports) : `${asset}::${tag}`);
+  }
+  for (const path of imports) assets.set(path, `${path}::${tag}`);
+  return assets;
+}
+
 /**
  * Publish a deploy tagged `tag` at `origin`.
  *
@@ -543,15 +593,15 @@ function readShellPaths(src) {
  * shell atomicity is asserted. `HEAD` answers an `ETag` of the tag, which is
  * what `probeValidator` turns into the shell's version token.
  */
-export function publishDeploy(network, origin, tag, { headStatus = 200 } = {}) {
-  for (const asset of SHELL_ASSETS) {
+export function publishDeploy(network, origin, tag, { headStatus = 200, ...shape } = {}) {
+  for (const [asset, body] of deployAssets(tag, shape)) {
     const url = new URL(asset, origin).href;
     network.serve(url, (request, init, method) => {
       if (method === "HEAD") {
         if (headStatus !== 200) return new Response(null, { status: headStatus });
         return new Response(null, { status: 200, headers: { etag: `"${tag}"` } });
       }
-      return new Response(`${asset}::${tag}`, {
+      return new Response(body, {
         status: 200,
         headers: { etag: `"${tag}"`, "content-type": "text/plain" },
       });
@@ -583,11 +633,9 @@ export function publishIndexOnlyDeploy(network, origin, baseTag, indexTag) {
 
 /** A deploy that publishes no HTTP validators at all. */
 export function publishUnversionedDeploy(network, origin, tag) {
-  for (const asset of SHELL_ASSETS) {
+  for (const [asset, body] of deployAssets(tag)) {
     network.serve(new URL(asset, origin).href, (request, init, method) =>
-      method === "HEAD"
-        ? new Response(null, { status: 200 })
-        : new Response(`${asset}::${tag}`, { status: 200 }),
+      method === "HEAD" ? new Response(null, { status: 200 }) : new Response(body, { status: 200 }),
     );
   }
   return network;

@@ -219,6 +219,27 @@ jobs:
               test "$n" -ge 2 || { echo "::error::SHELL_PATHS parsed as $n entries; the parse is wrong or the list was gutted"; exit 1; }
               echo "ok: all $n SHELL_PATHS entries are staged"
 
+              # The glue's own imports: the JS snippets wasm-bindgen emits under
+              # `pkg/snippets/<crate>-<hash>/`, at paths no list in the tree can
+              # hold because the hash moves with the crate's pin. sw.js follows
+              # them at install (`SHELL_DIRS`), so each must resolve to a staged
+              # file inside one of those directories -- an import outside them is
+              # an install sw.js refuses, which is no shell at all. Read off the
+              # staged glue, the only file that knows the paths.
+              dirs=$(tr '\n' ' ' <squallar-web/sw.js | grep -oE 'SHELL_DIRS = \[[^]]*\]' | grep -oE '"[^"]*"' | tr -d '"')
+              test -n "$dirs" || { echo "::error::SHELL_DIRS parsed as empty; the parse is wrong or the list was gutted"; exit 1; }
+              n=0
+              for spec in $(grep -oE "^[[:space:]]*(import|export)[^;'\"\`()]*from[[:space:]]*['\"][^'\"]+['\"]|^[[:space:]]*import[[:space:]]*['\"][^'\"]+['\"]" dist/pkg/squallar_web.js | grep -oE "['\"][^'\"]+['\"]$" | tr -d "'\""); do
+                p=$(python3 -c 'import posixpath, sys; print(posixpath.normpath(posixpath.join("pkg", sys.argv[1])))' "$spec")
+                test -f "dist/$p" || { echo "::error::the glue imports '$spec', which is not staged at dist/$p"; exit 1; }
+                inside=0
+                for d in $dirs; do case "$p" in "$d"*) inside=1 ;; esac; done
+                test "$inside" -eq 1 || { echo "::error::the glue imports '$spec' (dist/$p), which is outside every SHELL_DIRS directory ($dirs); sw.js would refuse the install"; exit 1; }
+                n=$((n + 1))
+              done
+              test "$n" -ge 1 || { echo "::error::no static import read off dist/pkg/squallar_web.js; wasm-bindgen changed the glue's shape and sw.js's walk may be reading nothing"; exit 1; }
+              echo "ok: all $n glue import(s) are staged under SHELL_DIRS"
+
               # The other half of sw.js's cache map. `ASSET_PATHS` is fetched on
               # demand and cached on the way past, deliberately outside the
               # all-or-nothing shell install -- which is also why it needs a gate

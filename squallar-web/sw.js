@@ -104,8 +104,15 @@
 
 "use strict";
 
-/* Names caches only. The deployed content's version is the validator token. */
-const SW_VERSION = 2;
+/*
+ * Names caches only. The deployed content's version is the validator token.
+ *
+ * 3 since the shell grew the glue's own imports (`SHELL_DIRS` below): a v2
+ * shell cache is complete by v2's definition and not by this one, and a
+ * generation that is complete by name must be complete in fact -- a token
+ * that has not moved is never reinstalled.
+ */
+const SW_VERSION = 3;
 
 /*
  * The directory this worker was served from, with a trailing slash. Not
@@ -140,9 +147,11 @@ const SHELL_PIN_PARAM = "pin";
 const KEY_PIN_PREFIX = "key:";
 
 /*
- * The app shell, relative to ROOT. Twelve entries, but the wasm module
+ * The app shell, relative to ROOT. Twelve named entries, but the wasm module
  * (10,161,914 B) and its glue (117,911 B) are essentially all of it — index.html
- * and the icons together are under 260 KB.
+ * and the icons together are under 260 KB. The named entries are not the whole
+ * shell: the glue's own static imports are followed at install (`SHELL_DIRS`
+ * and `shellImports` below), because their paths cannot be written here.
  *
  * `""` is the directory index (`new URL("", ROOT)` is ROOT) and is the single
  * entry every navigation is answered from. `index.html` is deliberately not
@@ -185,6 +194,76 @@ const SHELL_PATHS = [
 
 const SHELL_URLS = SHELL_PATHS.map((p) => new URL(p, ROOT).href);
 const SHELL_URL_SET = new Set(SHELL_URLS);
+
+/*
+ * Directories under ROOT whose every file is shell: routed "shell" like a
+ * `SHELL_PATHS` entry, but precached by DISCOVERY rather than by name.
+ *
+ * `pkg/snippets/` is where wasm-bindgen writes the JS a crate ships alongside
+ * its Rust (`#[wasm_bindgen(module = "/src/...")]`), and the glue imports each
+ * one statically. Today that is one file, `wasm-bindgen-rayon`'s
+ * `workerHelpers.no-bundler.js`: the page's glue imports it, so does the
+ * rasterization worker's and the tile lane's, and every rayon thread is
+ * spawned from its bytes (`fetch(import.meta.url)`) and then imports the glue
+ * again. Until 2026-09-12 it was in no list here, so every one of those was a
+ * network fetch on every load (measured: 19 requests for the one file on a
+ * single boot, Firefox and Chromium alike) and an offline page's module graph
+ * failed at the glue's first line.
+ *
+ * It is not a `SHELL_PATHS` entry because its path cannot be written down:
+ * `snippets/wasm-bindgen-rayon-38edf6e439f6d70d/src/workerHelpers.no-bundler.js`
+ * carries a hash wasm-bindgen derives from the crate, which moves when the
+ * `wasm-bindgen-rayon` pin moves, and a spelling copied here would be one
+ * deploy behind the first time it did -- with `cache.addAll` all-or-nothing,
+ * that is no shell at all. The glue is the only file that knows the path, so
+ * the glue is where it is read from: `installShell` fetches the named entries,
+ * then reads the glue it just cached, follows its static `import`s
+ * (`shellImports`), and caches those into the same generation. The path is
+ * therefore always the one THIS generation's glue asks for, whatever the hash
+ * is that day. The alternatives were weighed and lose on exactly that point: a
+ * manifest the build writes is a second file that has to agree with the glue,
+ * and a directory listing is not something an origin serves.
+ *
+ * Discovery still needs a ROUTING rule the request can be matched against
+ * without reading anything, which is what this list is. An import the walk
+ * finds outside it (or outside `SHELL_PATHS`) fails the install loudly rather
+ * than caching a graph the fetch handler would never serve: an offline boot
+ * would fail at that import either way, and a red install is the one that
+ * gets seen. Every entry ends in `/`, so `isShellAsset` matches by directory
+ * containment, the `ROOT.pathname` way.
+ */
+const SHELL_DIRS = ["pkg/snippets/"];
+const SHELL_DIR_URLS = SHELL_DIRS.map((p) => new URL(p, ROOT).href);
+
+/*
+ * The module whose static imports the install follows: the wasm-bindgen glue.
+ * Only it, because it is the one shell script whose imports are GENERATED --
+ * the hand-written ones (`worker.js`, `tile-lane.js`, `heap.js`, the page)
+ * import only named entries, and `tests/pwa_assets.rs` holds them to that.
+ */
+const SHELL_IMPORT_ROOT = "pkg/squallar_web.js";
+
+/*
+ * The static imports of one ES module, as written: `import x from "s"`,
+ * `import { a } from "s"`, `import * as n from "s"`, `import "s"`,
+ * `export { a } from "s"` and `export * from "s"`, single- or multi-line.
+ * Anchored at a line start so a mention inside a `//` or ` * ` comment cannot
+ * match, and forbidden to cross `;`, a quote or a paren between the keyword
+ * and `from`, so a `from` inside a function body cannot either. A dynamic
+ * `import(...)` is not a static edge and is not matched: the rayon helper's
+ * `import(data.mainJS)` is the glue, already a named entry.
+ */
+const STATIC_IMPORT_RE =
+  /^[ \t]*(?:import|export)\b[^;'"`()]*?\bfrom[ \t]*['"]([^'"\n]+)['"]|^[ \t]*import[ \t]*['"]([^'"\n]+)['"]/gm;
+
+function staticImportSpecifiers(source) {
+  const out = [];
+  for (const m of String(source).matchAll(STATIC_IMPORT_RE)) out.push(m[1] ?? m[2]);
+  return out;
+}
+
+/* The bound at which a walk of the glue's imports stops being a module graph. */
+const SHELL_IMPORT_LIMIT = 64;
 
 /*
  * Same-origin data assets: cached, but deliberately NOT part of the shell.
@@ -440,7 +519,10 @@ function blockKey(generation, basename, index) {
 
 function isShellAsset(url) {
   // Query and fragment dropped so a cache-busted `?v=2` still resolves.
-  return SHELL_URL_SET.has(url.origin + url.pathname);
+  const bare = url.origin + url.pathname;
+  if (SHELL_URL_SET.has(bare)) return true;
+  // Directory containment: every entry ends in `/`.
+  return SHELL_DIR_URLS.some((dir) => bare.startsWith(dir));
 }
 
 function isDataAsset(url) {
@@ -821,10 +903,77 @@ async function shellCacheForRequest(url, clientId, resultingClientId) {
 }
 
 /**
+ * The shell entries the named ones import: the module graph under
+ * `SHELL_IMPORT_ROOT`, read from `cache` -- the bytes just stored, so the
+ * paths found are the ones THIS generation's glue will ask for, not those of
+ * whatever the origin serves by the time a second fetch lands. Each module
+ * found is fetched into `cache` and then read for its own imports, breadth
+ * first, until nothing new appears. Returns the URLs added.
+ *
+ * Every edge must resolve to something the fetch handler routes "shell"
+ * (`isShellAsset`): a cached entry nothing serves is not a shell, so an import
+ * outside `SHELL_PATHS` and `SHELL_DIRS` throws here and fails the install.
+ * The walk is bounded because the cache is durable storage and a cycle in a
+ * corrupt module must not fill it.
+ */
+async function shellImports(cache) {
+  // Said to the console as well as thrown: the install's callers swallow a
+  // failure, rightly, because a failed download is a first visit offline and
+  // the next navigation tries again -- but this is the build's shape, and it
+  // will fail the same way on every visit until someone reads this.
+  const refuse = (message) => {
+    console.error(`squallar sw: shell import walk: ${message}`);
+    return new Error(`shell import walk: ${message}`);
+  };
+  const added = [];
+  const seen = new Set(SHELL_URLS);
+  const queue = [new URL(SHELL_IMPORT_ROOT, ROOT).href];
+  while (queue.length) {
+    const moduleUrl = queue.shift();
+    const stored = await cache.match(moduleUrl);
+    if (!stored) throw refuse(`${moduleUrl} is not in the cache`);
+    const source = await stored.text();
+    const wanted = [];
+    for (const specifier of staticImportSpecifiers(source)) {
+      let resolved;
+      try {
+        resolved = new URL(specifier, moduleUrl);
+      } catch {
+        throw refuse(`${moduleUrl} imports ${specifier}, which is not a URL`);
+      }
+      resolved.search = "";
+      resolved.hash = "";
+      if (seen.has(resolved.href)) continue;
+      if (!isShellAsset(resolved)) {
+        throw refuse(
+          `${moduleUrl} imports ${specifier} (${resolved.href}), which is outside ` +
+            `SHELL_PATHS and SHELL_DIRS; the fetch handler would never serve it from the ` +
+            `shell, so an offline boot would fail at that import. Add its directory to ` +
+            `SHELL_DIRS.`,
+        );
+      }
+      seen.add(resolved.href);
+      wanted.push(resolved.href);
+      if (seen.size - SHELL_URLS.length > SHELL_IMPORT_LIMIT) {
+        throw refuse(`more than ${SHELL_IMPORT_LIMIT} modules under ${SHELL_IMPORT_ROOT}`);
+      }
+    }
+    if (wanted.length) {
+      await cache.addAll(wanted.map((u) => new Request(u, { cache: "no-cache" })));
+      added.push(...wanted);
+      queue.push(...wanted);
+    }
+  }
+  return added;
+}
+
+/**
  * Download the whole shell into a cache named for `token`, then publish it. The
  * trailing `writeMeta` is the publish and the only step that makes the new shell
- * visible; `addAll` is all-or-nothing, so a partially downloaded deploy can never
- * be published.
+ * visible. Two downloads: the named entries, all-or-nothing, and then the
+ * imports found in the glue they delivered (`shellImports`), each level
+ * all-or-nothing in turn. Nothing is published until every level has landed,
+ * so a partially downloaded deploy can never be published.
  */
 async function installShell(token, name = shellCacheName(token)) {
   // A rollback re-issues a token this worker has installed before, so `name`
@@ -849,21 +998,27 @@ async function installShell(token, name = shellCacheName(token)) {
    * would remove the second transfer and break atomicity — the module would be
    * cached separately from the glue that has to match it.
    */
+  let imports;
   try {
     await cache.addAll(SHELL_URLS.map((u) => new Request(u, { cache: "no-cache" })));
+    imports = await shellImports(cache);
   } catch (e) {
-    // `addAll` writes nothing when it rejects, so `name` now holds exactly what
-    // it held before the call. For a cache this install created, that is the
-    // empty husk `caches.open` above manufactured: left behind, `openShellCache`
-    // would treat it as a real generation and a later install under the same
-    // token would find it pre-existing. For a cache that predated this install
-    // — a rollback — it is a complete shell, possibly the one a pinned page is
-    // mid-load in, and deleting it would be this installer causing the exact
-    // mixed shell the pinning exists to prevent. Delete only what was created.
+    // `addAll` writes nothing when it rejects, and the import walk adds only
+    // whole levels, so for a cache this install created what is left is
+    // either the empty husk `caches.open` above manufactured or a shell
+    // missing its last level -- and left behind, `openShellCache` would treat
+    // either as a real generation and a later install under the same token
+    // would find it pre-existing. For a cache that predated this install — a
+    // rollback — it is a complete shell of this same generation, possibly the
+    // one a pinned page is mid-load in, and deleting it would be this
+    // installer causing the exact mixed shell the pinning exists to prevent.
+    // Delete only what was created.
     if (!preExisting) await caches.delete(name);
     throw e;
   }
-  await writeMeta({ token, cacheName: name, installedAt: Date.now() });
+  // `imports` is a record of what the walk found, for whoever reads the meta
+  // record back (the browser rig does); nothing here reads it.
+  await writeMeta({ token, cacheName: name, installedAt: Date.now(), imports });
   metaPromise = null;
   return name;
 }
@@ -1719,6 +1874,10 @@ self.__squallarSwInternals = {
   enforceBlockBudget,
   purgeStaleBlockCaches,
   isShellAsset,
+  SHELL_DIRS,
+  SHELL_DIR_URLS,
+  SHELL_IMPORT_ROOT,
+  staticImportSpecifiers,
   SHELL_PIN_PARAM,
   normalizeHost,
   validatorToken,

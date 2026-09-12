@@ -593,18 +593,38 @@ fn the_worker_never_lists_the_basemap_archive_as_a_cached_asset() {
 #[test]
 fn the_worker_shell_list_cannot_name_a_cross_origin_asset() {
     // `routeFor` builds shell URLs against the worker's own directory, so a
-    // relative entry cannot match any other origin.
-    for path in js_string_list(SERVICE_WORKER, "const SHELL_PATHS = [") {
-        assert!(
-            !path.starts_with('/'),
-            "shell path {path:?} is root-relative; it would break the subpath \
-             deploy and widen what the shell rule can match"
-        );
-        assert!(
-            !path.contains("://") && !path.starts_with("//"),
-            "shell path {path:?} names another origin; the app shell must be \
-             same-origin only"
-        );
+    // relative entry cannot match any other origin. The directories the shell
+    // serves by containment (`SHELL_DIRS`) are held to the same rule, and to
+    // ending in `/`: without the slash the rule is a prefix match, and
+    // `pkg/snippets` would also answer for `pkg/snippetsx/…`.
+    for (list, marker) in [
+        ("SHELL_PATHS", "const SHELL_PATHS = ["),
+        ("SHELL_DIRS", "const SHELL_DIRS = ["),
+    ] {
+        for path in js_string_list(SERVICE_WORKER, marker) {
+            assert!(
+                !path.starts_with('/'),
+                "{list} entry {path:?} is root-relative; it would break the subpath \
+                 deploy and widen what the shell rule can match"
+            );
+            assert!(
+                !path.contains("://") && !path.starts_with("//"),
+                "{list} entry {path:?} names another origin; the app shell must be \
+                 same-origin only"
+            );
+            assert!(
+                !path.contains("/../") && !path.starts_with("../"),
+                "{list} entry {path:?} climbs out of the deploy directory"
+            );
+            if list == "SHELL_DIRS" {
+                assert!(
+                    path.ends_with('/'),
+                    "SHELL_DIRS entry {path:?} does not end in `/`; `isShellAsset` \
+                     matches by directory containment, and without the slash it \
+                     is a prefix match on the path"
+                );
+            }
+        }
     }
 }
 
@@ -664,8 +684,17 @@ fn ci_staged_paths() -> BTreeSet<String> {
             cp_lines += 1;
         }
     }
-    for line in yaml.lines().map(str::trim) {
-        let Some(args) = line.strip_prefix("cp ") else {
+    // A `cp` may sit inside `if [ -d … ]; then cp … dist/…; fi` on one line
+    // (the snippets directory, which wasm-bindgen emits only for crates that
+    // ship JS), so each `;`-separated command of a line is read on its own,
+    // with a leading `then` dropped.
+    let commands = yaml
+        .lines()
+        .flat_map(|line| line.split(';'))
+        .map(str::trim)
+        .map(|cmd| cmd.strip_prefix("then ").map_or(cmd, str::trim));
+    for command in commands {
+        let Some(args) = command.strip_prefix("cp ") else {
             continue;
         };
         let mut words: Vec<&str> = args
@@ -714,8 +743,10 @@ fn every_path_sw_js_caches_is_named_by_the_ci_staging_step() {
     let staged = ci_staged_paths();
     let shell = js_string_list(SERVICE_WORKER, "const SHELL_PATHS = [");
     let assets = js_string_list(SERVICE_WORKER, "const ASSET_PATHS = [");
+    let dirs = js_string_list(SERVICE_WORKER, "const SHELL_DIRS = [");
     assert!(shell.len() > 1, "SHELL_PATHS in sw.js parsed as near-empty");
     assert!(!assets.is_empty(), "ASSET_PATHS in sw.js parsed as empty");
+    assert!(!dirs.is_empty(), "SHELL_DIRS in sw.js parsed as empty");
 
     let covered = |path: &str| {
         staged.contains(path)
@@ -729,6 +760,9 @@ fn every_path_sw_js_caches_is_named_by_the_ci_staging_step() {
         .iter()
         .map(|p| ("SHELL_PATHS", p))
         .chain(assets.iter().map(|p| ("ASSET_PATHS", p)))
+        // A directory served by containment must be staged whole: `pkg/snippets/`
+        // is covered by the `cp -R … dist/pkg/snippets` line and by nothing else.
+        .chain(dirs.iter().map(|p| ("SHELL_DIRS", p)))
     {
         // "" is the directory index, staged as index.html.
         let path = if path.is_empty() { "index.html" } else { path };
@@ -833,6 +867,175 @@ fn the_script_the_page_asks_for_is_shipped_and_precached() {
         "sw.js does not precache {relative:?}, which worker_port.rs starts. \
          Offline, and on any load the shell answers, rasterization would \
          silently move back onto the main thread."
+    );
+}
+
+/// The static `import` specifiers of an ES module's source: `import … from
+/// "s"`, `import "s"`, `export … from "s"`, single- or multi-line, read the
+/// way `sw.js`'s `STATIC_IMPORT_RE` reads them -- a statement that begins at
+/// a line start, with nothing between the keyword and `from` that could be a
+/// body (`;`, a quote, a paren). A dynamic `import(...)` is not one.
+///
+/// The text-level twin of the worker's scanner, for the same reason the rest
+/// of this file restates `sw.js`'s lists rather than running it: the scanner
+/// that ships is exercised in `sw_routing.test.mjs` on the real bytes; this
+/// one reads the source tree.
+fn static_import_specifiers(source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut lines = source.lines().peekable();
+    while let Some(line) = lines.next() {
+        let head = line.trim_start();
+        let keyword = if head.starts_with("import") {
+            "import"
+        } else if head.starts_with("export") {
+            "export"
+        } else {
+            continue;
+        };
+        // The statement, from its keyword to its terminator, joined across
+        // continuation lines the way the `m`-flag regex spans them.
+        let mut statement = head[keyword.len()..].to_string();
+        while !statement.contains(';')
+            && !statement.contains("from")
+            && let Some(next) = lines.peek()
+        {
+            statement.push('\n');
+            statement.push_str(next);
+            lines.next();
+        }
+        let body = statement.split(';').next().unwrap_or("");
+        let quoted_after = |rest: &str| -> Option<String> {
+            let rest = rest.trim_start_matches([' ', '\t']);
+            let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+            let inner = &rest[1..];
+            let end = inner.find(quote)?;
+            let spec = &inner[..end];
+            (!spec.contains('\n')).then(|| spec.to_string())
+        };
+        // `import "s"`: the quote follows the keyword directly.
+        if keyword == "import"
+            && let Some(spec) = quoted_after(body)
+        {
+            out.push(spec);
+            continue;
+        }
+        let Some(at) = body.find("from") else {
+            continue;
+        };
+        let between = &body[..at];
+        if between.contains(['\'', '"', '`', '(', ')']) {
+            continue;
+        }
+        if let Some(spec) = quoted_after(&body[at + "from".len()..]) {
+            out.push(spec);
+        }
+    }
+    out
+}
+
+/// The first line of the glue `wasm-pack build --target web` writes for this
+/// crate, as emitted 2026-09 (wasm-bindgen 0.2.128, `wasm-bindgen-rayon`
+/// 1.3.0): the one import whose path no list in the tree can hold, because
+/// the directory carries a hash wasm-bindgen derives from the crate.
+const GLUE_IMPORT_LINE: &str = "import { startWorkers } from \
+'./snippets/wasm-bindgen-rayon-38edf6e439f6d70d/src/workerHelpers.no-bundler.js';";
+
+/// The deploy-relative path a glue import resolves to, with the glue at
+/// `pkg/squallar_web.js`: `./x` is `pkg/x`, `../x` is `x`.
+fn glue_import_path(specifier: &str) -> String {
+    let mut parts: Vec<&str> = vec!["pkg"];
+    for seg in specifier.split('/') {
+        match seg {
+            "." | "" => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
+}
+
+/// The glue's imports that the shell would NOT precache: those outside both
+/// `SHELL_PATHS` and every `SHELL_DIRS` directory, as `sw.js` declares them.
+fn glue_imports_the_shell_would_not_precache(glue: &str) -> Vec<String> {
+    let named = js_string_list(SERVICE_WORKER, "const SHELL_PATHS = [");
+    let dirs = js_string_list(SERVICE_WORKER, "const SHELL_DIRS = [");
+    static_import_specifiers(glue)
+        .into_iter()
+        .map(|spec| glue_import_path(&spec))
+        .filter(|path| !named.contains(path) && !dirs.iter().any(|d| path.starts_with(d.as_str())))
+        .collect()
+}
+
+/// The glue's own imports are shell: `sw.js` follows them at install rather
+/// than naming them, because their directory carries a hash that moves with
+/// the `wasm-bindgen-rayon` pin. That only works if the directory the walk
+/// lands in is one the worker's routing rule serves -- `SHELL_DIRS` -- and
+/// is one the deploy stages. Read against the glue shape this build emits,
+/// and against the built glue whenever one is in the tree.
+#[test]
+fn every_import_the_glue_makes_is_one_the_shell_precaches() {
+    let root = literal_after(SERVICE_WORKER, "sw.js", "const SHELL_IMPORT_ROOT = \"");
+    assert_eq!(
+        root,
+        page_module_specifier().trim_start_matches("./"),
+        "sw.js walks the imports of {root:?}, but the page's module is a different file"
+    );
+    assert!(
+        js_string_list(SERVICE_WORKER, "const SHELL_PATHS = [").contains(&root),
+        "SHELL_IMPORT_ROOT {root:?} is not itself a precached shell entry, so there is \
+         nothing in the cache for the walk to read"
+    );
+
+    let fixture = format!("{GLUE_IMPORT_LINE}\nlet wasm;\nexport function start() {{}}\n");
+    let missed = glue_imports_the_shell_would_not_precache(&fixture);
+    assert!(
+        missed.is_empty(),
+        "the glue imports {missed:?}, which is in neither SHELL_PATHS nor under a \
+         SHELL_DIRS directory of sw.js; the shell would never serve it and an \
+         offline boot fails at the glue's first line"
+    );
+    assert_eq!(
+        static_import_specifiers(&fixture).len(),
+        1,
+        "the scanner read no import off the glue line this build emits; a vacuous pass"
+    );
+
+    // The built glue, when a `wasm-pack build` has left one here. Not a skip
+    // when absent: the fixture above is the shape, and the browser rig's
+    // shell-cache assertion runs the real walk on every Tier-2 leg.
+    let built = web_dir().join("pkg/squallar_web.js");
+    if let Ok(glue) = std::fs::read_to_string(&built) {
+        let missed = glue_imports_the_shell_would_not_precache(&glue);
+        assert!(
+            missed.is_empty(),
+            "{} imports {missed:?}, which sw.js would not precache",
+            built.display()
+        );
+        assert!(
+            !static_import_specifiers(&glue).is_empty(),
+            "{} has no static import the scanner can read; wasm-bindgen changed the \
+             glue's shape and sw.js's walk (STATIC_IMPORT_RE) may be reading nothing",
+            built.display()
+        );
+    }
+}
+
+/// The presence control for the test above: a glue with one more import,
+/// outside the shell, must be reported -- and only it.
+#[test]
+fn a_glue_import_outside_the_shell_is_reported() {
+    let glue = format!(
+        "{GLUE_IMPORT_LINE}\nimport {{ extra }} from '../vendored/extra.js';\n\
+         import './snippets/other-crate-0000/src/x.js';\nexport {{ y }} from \"./y.js\";\n\
+         // import z from '../commented.js';\nconst pkg = await import(data.mainJS);\n"
+    );
+    assert_eq!(
+        glue_imports_the_shell_would_not_precache(&glue),
+        vec!["vendored/extra.js".to_string(), "pkg/y.js".to_string()],
+        "the fake extra imports were not reported; the check cannot see a snippet the \
+         shell would not precache"
     );
 }
 
