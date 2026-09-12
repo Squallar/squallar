@@ -247,6 +247,11 @@
 #
 # Without --expect-cross-origin-isolated that run proves nothing: a browser
 # that ignored the headers looks exactly like one that honoured them.
+# --expect-service-worker asserts two things: a registration, and a shell
+# generation cache in Cache Storage (`squallar-shell-*`), because the
+# registration alone was green for months over a served tree with no
+# `icons/` in it, where `cache.addAll` failed and no shell ever installed.
+# The icons block below is what makes the second half satisfiable.
 #
 # AN OPEN GAP IN WHAT THIS GATE CAN DECIDE, and it is not a caveat on one leg.
 #
@@ -1235,6 +1240,44 @@ if [ ! -f "$WEB_DIR/pkg/squallar_web_bg.wasm" ]; then
   echo "FATAL: $WEB_DIR/pkg/squallar_web_bg.wasm missing -- build first" >&2
   exit 1
 fi
+
+# ---------------------------------------------------------------- icons ----
+# The served tree carries the rendered icons, the way the deploy does
+# (`build.yaml`: `cargo run -q -p squallar-icon -- --web dist/icons`). A
+# source checkout has no `squallar-web/icons/` -- the directory is gitignored
+# and every icon is rendered from `packaging/icon/squallar.svg` -- and
+# `sw.js` precaches five of them under `SHELL_PATHS` with `cache.addAll`,
+# which is all-or-nothing: one 404 and NO shell is cached, while the
+# registration reads active and every other assertion passes. So for as long
+# as this rig served the checkout, every SW-enabled leg (`--no-block-sw` +
+# `--expect-service-worker`) exercised a worker whose shell had never once
+# installed. drive.py now asserts a shell generation cache exists on those
+# legs; this is what lets it. Rendered whenever any of the five is missing,
+# `--skip-build` included -- it is not the wasm build, and a leg served
+# without them is a leg served a tree the deploy never ships.
+ensure_web_icons() {
+  local missing=0 f
+  for f in icon-192.png icon-512.png icon-maskable-512.png apple-touch-icon.png favicon-32.png; do
+    [ -f "$WEB_DIR/icons/$f" ] || missing=1
+  done
+  if [ "$missing" -eq 0 ]; then
+    echo "icons: $WEB_DIR/icons carries the five sw.js precaches"
+    return 0
+  fi
+  echo "rendering the web icons into $WEB_DIR/icons (squallar-icon --web)"
+  (cd "$REPO_ROOT" && cargo run -q -p squallar-icon -- --web "$WEB_DIR/icons") || {
+    echo "FATAL: squallar-icon --web failed; sw.js precaches icons/ and a" >&2
+    echo "       served tree without them installs no shell" >&2
+    exit 1
+  }
+  for f in icon-192.png icon-512.png icon-maskable-512.png apple-touch-icon.png favicon-32.png; do
+    [ -f "$WEB_DIR/icons/$f" ] || {
+      echo "FATAL: squallar-icon --web wrote no $WEB_DIR/icons/$f" >&2
+      exit 1
+    }
+  done
+}
+ensure_web_icons
 
 SERVER_PID=""
 stop_server() {

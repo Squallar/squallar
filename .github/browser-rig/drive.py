@@ -2512,7 +2512,14 @@ var done = arguments[arguments.length - 1];
 var out = {
   supported: !!navigator.serviceWorker,
   blocked_by_rig: !!(window.__rig && window.__rig.block_sw),
-  controller: null, registrations: null
+  controller: null, registrations: null,
+  // Every Cache Storage name this origin holds, or null where the API is
+  // absent. The shell generation cache (`squallar-shell-v<N>-<token>`) is
+  // what a successful `installShell` leaves behind, and the only evidence
+  // that `cache.addAll(SHELL_URLS)` -- all-or-nothing over twelve paths --
+  // actually completed: a registration with an `active` worker says the
+  // script ran, not that the shell installed.
+  cache_names: null
 };
 if (!navigator.serviceWorker) { done(out); return; }
 out.controller = navigator.serviceWorker.controller
@@ -2521,6 +2528,10 @@ var settled = false;
 var finish = function () { if (!settled) { settled = true; done(out); } };
 setTimeout(function () { out.error = 'getRegistrations timed out'; finish(); },
            15000);
+var caches_read = (typeof caches !== 'undefined' && caches && caches.keys)
+  ? caches.keys().then(function (ks) { out.cache_names = ks.map(String); },
+                       function (e) { out.caches_error = String(e); })
+  : Promise.resolve();
 navigator.serviceWorker.getRegistrations().then(function (rs) {
   out.registrations = rs.map(function (r) {
     var w = r.active || r.installing || r.waiting;
@@ -2530,9 +2541,49 @@ navigator.serviceWorker.getRegistrations().then(function (rs) {
              active: !!r.active, installing: !!r.installing,
              waiting: !!r.waiting };
   });
-  finish();
+  caches_read.then(finish, finish);
 }, function (e) { out.error = String(e); finish(); });
 """
+
+# The prefix `squallar-web/sw.js` names its shell generation caches with
+# (`SHELL_PREFIX`, `squallar-shell-v<SW_VERSION>-`), without the version: the
+# assertion is that SOME shell generation installed, and a bumped
+# SW_VERSION is exactly the deploy this must keep reading.
+SHELL_CACHE_PREFIX = "squallar-shell-"
+
+
+def shell_cache_verdict(sw):
+    """**A shell generation cache exists.** The second half of
+    `--expect-service-worker`.
+
+    A registration with an active worker is the script having run.
+    `installShell` is `cache.addAll` over every `SHELL_PATHS` entry, and
+    `addAll` is all-or-nothing: one 404 -- the five `icons/*.png` the deploy
+    renders and a source checkout does not carry -- and NO shell is cached,
+    while the registration reads active and every other assertion passes.
+    This rig ran that way for as long as it served the checkout: every
+    SW-enabled leg exercised a worker whose shell cache had never once
+    installed.
+
+    Pure: the SW probe's dict in, one dict out."""
+    names = sw.get("cache_names")
+    if names is None:
+        return {"ok": False, "shell_caches": [], "cache_names": None,
+                "error": "caches.keys() was not read (%s); a shell cache "
+                         "cannot be asserted from nothing"
+                         % (sw.get("caches_error") or sw.get("error")
+                            or "no Cache Storage API")}
+    shells = [n for n in names if str(n).startswith(SHELL_CACHE_PREFIX)]
+    out = {"ok": bool(shells), "shell_caches": shells,
+           "cache_names": list(names)}
+    if not shells:
+        out["error"] = (
+            "no `%s*` cache after the data window; Cache Storage holds %r. "
+            "The worker registered but `installShell` never completed -- "
+            "`cache.addAll` is all-or-nothing over SHELL_PATHS, so one "
+            "missing path (icons/ on an unrendered tree) is no shell at all"
+            % (SHELL_CACHE_PREFIX, list(names)))
+    return out
 
 RAF_SCRIPT = """
 var n = arguments[0];
@@ -10644,6 +10695,34 @@ def selftest_instantiate_fallback():
     return failed
 
 
+def selftest_shell_cache():
+    """Executable pins on `shell_cache_verdict`, the second half of
+    `--expect-service-worker`: both arms and the unread case. Returns the
+    number of failed pins."""
+    failed = 0
+
+    def pin(name, ok):
+        nonlocal failed
+        print("[self-test] %s %s" % ("ok  " if ok else "FAIL", name))
+        if not ok:
+            failed += 1
+
+    v = shell_cache_verdict({"cache_names": ["squallar-meta-v2",
+                                             "squallar-shell-v2-abc123",
+                                             "squallar-assets-v2"]})
+    pin("a shell generation cache passes and is named",
+        v["ok"] and v["shell_caches"] == ["squallar-shell-v2-abc123"])
+    v = shell_cache_verdict({"cache_names": ["squallar-meta-v2",
+                                             "squallar-assets-v2"]})
+    pin("meta and asset caches without a shell FAIL: the script ran, "
+        "the shell never installed",
+        not v["ok"] and "`installShell` never completed" in v.get("error", ""))
+    v = shell_cache_verdict({"cache_names": None, "caches_error": "boom"})
+    pin("an unread Cache Storage FAILS rather than passing vacuously",
+        not v["ok"] and "boom" in v.get("error", ""))
+    return failed
+
+
 def selftest():
     failures = []
     if selftest_loop_or_refusal():
@@ -10653,6 +10732,8 @@ def selftest():
                         "(see [self-test] lines)")
     if selftest_instantiate_fallback():
         failures.append("instantiate-fallback verdict (see [self-test] lines)")
+    if selftest_shell_cache():
+        failures.append("shell-cache verdict (see [self-test] lines)")
     if selftest_page_clock():
         failures.append("page/driver clock guard (see [self-test] lines)")
     if selftest_sample_probe_patterns():
@@ -11777,6 +11858,16 @@ def run_smoke(args):
                 if not sw_ok:
                     result["service_worker"]["expect_error"] = (
                         "no service-worker registration after the data window")
+                else:
+                    # And the shell really installed: a generation cache
+                    # exists. Asserted only once the registration is there,
+                    # so a leg with no worker fails on the first sentence
+                    # and not on a cache it could never have had.
+                    shell = shell_cache_verdict(sw)
+                    result["service_worker"]["shell_cache"] = shell
+                    if not shell["ok"]:
+                        sw_ok = False
+                        result["service_worker"]["expect_error"] = shell["error"]
         coi = env0.get("cross_origin_isolated")
         coi_ok = None
         if args.expect_cross_origin_isolated:
@@ -12213,6 +12304,10 @@ def run_smoke(args):
               % (tag, r.get("script"), r.get("scope"), r.get("state")))
     if swr.get("expect_error"):
         print("[%s] SUMMARY   sw EXPECT FAILED: %s" % (tag, swr["expect_error"]))
+    if isinstance(swr.get("shell_cache"), dict):
+        print("[%s] SUMMARY   sw shell cache: %s %s"
+              % (tag, "OK" if swr["shell_cache"].get("ok") else "FAILED",
+                 swr["shell_cache"].get("shell_caches")))
     res = result.get("resources") or {}
     print("[%s] SUMMARY resources=%s hosts=%s failed=%s status_unknown=%s"
           % (tag, res.get("count"), len(res.get("hosts") or {}),
