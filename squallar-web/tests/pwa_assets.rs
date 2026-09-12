@@ -902,9 +902,11 @@ fn the_worker_tree_carries_the_page_key() {
         "worker.js imports heap.js unkeyed"
     );
     assert!(
-        RASTER_WORKER
-            .contains("new URL(\"./pkg/squallar_web_bg.wasm\" + shellPin, self.location.href)"),
-        "worker.js lets the glue resolve the module itself, which drops the query"
+        RASTER_WORKER.contains(
+            "fetch(new URL(\"./pkg/squallar_web_bg.wasm\" + shellPin, self.location.href))"
+        ),
+        "worker.js lets heap.js fetch the module itself, which resolves MODULE_PATH \
+         against heap.js's URL with the query dropped"
     );
     assert!(
         RASTER_WORKER_RS.contains("scope.location().search()"),

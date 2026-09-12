@@ -27,15 +27,15 @@
  * rayon threads' glue imports carry no client id at all in Chromium). The
  * page therefore starts this file at `worker.js?pin=<key>`, and every shell
  * asset this file loads is asked for with the same query: `heap.js`, the
- * glue, and the module -- passed explicitly, because the glue would otherwise
- * resolve `squallar_web_bg.wasm` against its own URL with the query dropped.
- * The glue's `import.meta.url` is then the keyed URL, which is what
- * wasm-bindgen-rayon's helper hands each thread to import, so the threads
- * carry it without knowing. `sw.js` (`SHELL_PIN_PARAM`) answers every request
- * carrying the key from the generation it recorded for it at first sight. A
- * static `import` cannot spell a query it does not know at parse time, which
- * is why these are `import()`. The build-token handshake in
- * `worker_protocol.rs` stays as the last line: it refuses a pair the pin
+ * glue, and the module -- fetched here and handed to `initWithHeap`, because
+ * left to itself it resolves `MODULE_PATH` against `heap.js`'s own URL with
+ * the query dropped. The glue's `import.meta.url` is then the keyed URL,
+ * which is what wasm-bindgen-rayon's helper hands each thread to import, so
+ * the threads carry it without knowing. `sw.js` (`SHELL_PIN_PARAM`) answers
+ * every request carrying the key from the generation it recorded for it at
+ * first sight. A static `import` cannot spell a query it does not know at
+ * parse time, which is why these are `import()`. The build-token handshake
+ * in `worker_protocol.rs` stays as the last line: it refuses a pair the pin
  * somehow missed.
  *
  * Every path is relative. The site is served from a project-Pages subpath, so a
@@ -82,9 +82,9 @@ const shellPin = self.location.search;
    * (`worker_protocol::MEMMAX`), because the page's copy is the one that
    * would otherwise be wrong.
    */
-  const heapMaxInForce = await heap.initWithHeap(glue.default, heapMaxBytes, {
-    module_or_path: new URL("./pkg/squallar_web_bg.wasm" + shellPin, self.location.href),
-  });
+  const heapMaxInForce = await heap.initWithHeap(glue.default, heapMaxBytes, undefined, () =>
+    fetch(new URL("./pkg/squallar_web_bg.wasm" + shellPin, self.location.href)),
+  );
 
   /*
    * Rayon's threads (WS3b). `initThreadPool` spawns `squallarRayonThreads()`
