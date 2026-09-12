@@ -80,6 +80,14 @@ fn the_page_bootstrap_reports_connectivity_and_updates() {
     run_suite("tests/index_bootstrap.test.mjs");
 }
 
+/// `heap.js` reads the module's declared memory minimum off the module's
+/// own bytes rather than stating it; the suite runs that reading over a
+/// hand-built module and holds the engine's import rule beside it.
+#[test]
+fn the_heap_reads_the_modules_declared_minimum() {
+    run_suite("tests/heap.test.mjs");
+}
+
 /// Adding a suite and forgetting to invoke it is the failure mode this whole
 /// file exists to prevent.
 #[test]

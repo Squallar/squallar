@@ -47,6 +47,16 @@ Rig endpoints (byte transforms of repo files, applied per-response):
                     can never be cache-served the stub -- without that the
                     backoff ladder would deadlock on the stub forever.
 
+  /heap.js          byte-identical to disk, unless --doctor-heap-initial N:
+                    then the memory `initial` heap.js read off the module
+                    (`initial: pages`) is rewritten to the literal N. The
+                    presence control for drive.py's default instantiate-
+                    fallback assertion: N=1 is under any module's declared
+                    minimum, so every instance takes the LinkError fallback
+                    and prints the sentence the assertion fails on. A leg
+                    served this way MUST fail; one that passes proves the
+                    assertion is not reading the console.
+
   --pin-clock 2026-09-07T07:22:00Z pins both preludes' wall clock: the page
                     and the worker read that instant plus real elapsed time
                     from Date.now() / new Date(), so a loop seeded on a site
@@ -254,6 +264,16 @@ PAGE_PRELUDE = b"""<script>/* squallar rig prelude (injected by serve.py, repo u
   // rather than by turnover; a leg would have to run eleven hours to reach
   // the cap, and the cap exists only so a runaway cannot exhaust memory.
   var M = (window.__rig_marks = []);
+  // heap.js's fallback sentence, retained out of the ring for the reason M
+  // is: it is printed once at boot, the ring turns over in seconds, and
+  // drive.py asserts its ABSENCE on every leg -- an absence the ring could
+  // not distinguish from an eviction. Page lines and relayed worker lines
+  // both land here; bounded because a runaway would print it per boot only.
+  var F = (window.__rig_fallbacks = []);
+  function retain(t, m) {
+    if (m.indexOf("could not instantiate with a") < 0) return;
+    try { if (F.length < 50) F.push({ t: t, msg: m }); } catch (_) {}
+  }
   window.__rig = { t0: Date.now(), block_sw: __RIG_BLOCK_SW__ };
   var seed = __RIG_SEED_LS__;
   if (seed) {
@@ -313,6 +333,7 @@ PAGE_PRELUDE = b"""<script>/* squallar rig prelude (injected by serve.py, repo u
       var t = Date.now();
       push(C, { t: t, lvl: lvl, msg: m });
       mark(t, m);
+      retain(t, m);
       if (lvl === "error") push(E, { t: t, kind: "console.error", msg: m });
       if (orig) return orig.apply(null, arguments);
     };
@@ -321,7 +342,7 @@ PAGE_PRELUDE = b"""<script>/* squallar rig prelude (injected by serve.py, repo u
     var bc = new BroadcastChannel("__rig");
     bc.onmessage = function (m) {
       var d = m.data || {};
-      if (d.lvl) push(C, d); else push(E, d);
+      if (d.lvl) { push(C, d); retain(d.t, String(d.msg || "")); } else push(E, d);
     };
   } catch (_) {}
   try { performance.setResourceTimingBufferSize(4000); } catch (_) {}
@@ -453,6 +474,27 @@ def transform_worker(raw, pin_clock_ms=None):
     return prelude + b"\n" + raw
 
 
+# The one spelling `heap.js` constructs its memory with; held to exactly one
+# occurrence by `squallar-web/tests/linear_memory_ceiling.rs`, which is what
+# makes a byte substitution here a faithful doctor and not a guess.
+HEAP_INITIAL_SPELLING = b"initial: pages,"
+
+
+def transform_heap(raw, initial_pages):
+    """heap.js bytes -> heap.js constructing its memory with a literal
+    `initial` instead of the one it read off the module. Refuses (raises)
+    when the spelling is not there exactly once: a doctor that silently
+    served the real file would make the presence control pass for the wrong
+    reason."""
+    n = raw.count(HEAP_INITIAL_SPELLING)
+    if n != 1:
+        raise ValueError(
+            "heap.js carries %r %d time(s), not once; --doctor-heap-initial "
+            "cannot doctor it" % (HEAP_INITIAL_SPELLING.decode(), n))
+    return raw.replace(HEAP_INITIAL_SPELLING,
+                       b"initial: %d," % int(initial_pages))
+
+
 # Served for the FIRST /worker.js request under --doctor-first-worker. A
 # module worker with no imports; it posts a HELLO whose token no real build
 # can produce (build_token is version/protocol/sha -- "doctored" is not a
@@ -523,6 +565,13 @@ class RigHandler(http.server.SimpleHTTPRequestHandler):
                 "worker.js",
                 lambda raw: transform_worker(raw, self.server.rig_pin_clock_ms),
                 "text/javascript; charset=utf-8")
+        if path == "/heap.js" and self.server.rig_doctor_heap_initial is not None:
+            self.log_message("rig: serving DOCTORED heap.js (initial: %d pages)"
+                             % self.server.rig_doctor_heap_initial)
+            return self._send_transformed(
+                "heap.js",
+                lambda raw: transform_heap(raw, self.server.rig_doctor_heap_initial),
+                "text/javascript; charset=utf-8")
         return super().do_GET()
 
     def _send_transformed(self, relname, transform, ctype):
@@ -551,6 +600,7 @@ class RigServer(http.server.ThreadingHTTPServer):
 def start_server(directory=DEFAULT_DIR, port=0, host="127.0.0.1",
                  log=None, block_sw=True, instrument_worker=True, coep=False,
                  seed_local_storage=None, doctor_first_worker=False,
+                 doctor_heap_initial=None,
                  tls_cert=None, tls_key=None, pin_clock_ms=None):
     """Start serving in a daemon thread. Returns (httpd, thread).
     Stop with stop_server(httpd, thread). Port 0 picks a free port;
@@ -571,6 +621,7 @@ def start_server(directory=DEFAULT_DIR, port=0, host="127.0.0.1",
     httpd.rig_coep = coep
     httpd.rig_seed_ls = seed_local_storage
     httpd.rig_doctor_first_worker = doctor_first_worker
+    httpd.rig_doctor_heap_initial = doctor_heap_initial
     httpd.rig_pin_clock_ms = pin_clock_ms
     httpd.rig_doctor_served = False
     httpd.rig_doctor_lock = threading.Lock()
@@ -612,6 +663,13 @@ def main(argv=None):
                     help="answer the FIRST /worker.js request with a stub that "
                          "posts a doctored build token; later requests get the "
                          "real file (the Tier-2 respawn leg)")
+    ap.add_argument("--doctor-heap-initial", default=None, type=int,
+                    metavar="PAGES",
+                    help="serve heap.js constructing its memory with this "
+                         "literal `initial` instead of the minimum it read "
+                         "off the module. The presence control for drive.py's "
+                         "default instantiate-fallback assertion: 1 is under "
+                         "any module's minimum, so the leg MUST fail")
     ap.add_argument("--pin-clock", default=None, metavar="ISO8601-UTC",
                     help="pin the page's (and worker's) wall clock: Date.now() "
                          "and `new Date()` read this instant plus the real "
@@ -679,6 +737,7 @@ def main(argv=None):
         instrument_worker=not args.no_instrument_worker, coep=args.coep,
         seed_local_storage=seed,
         doctor_first_worker=args.doctor_first_worker,
+        doctor_heap_initial=args.doctor_heap_initial,
         tls_cert=tls_cert, tls_key=tls_key, pin_clock_ms=pin_clock_ms)
     port = httpd.server_address[1]
     scheme = "https" if httpd.rig_tls else "http"

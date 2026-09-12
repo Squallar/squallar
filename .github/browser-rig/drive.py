@@ -2650,6 +2650,7 @@ CONSOLE_EXPORT_BYTE_BUDGET = 2_000_000
 RIG_ERRORS_PROBE = """
 var C = window.__rig_console || [];
 var E = window.__rig_errors || [];
+var F = window.__rig_fallbacks || [];
 var CAP = %d, BUDGET = %d;
 // Walk NEWEST first and stop at the budget, so a bound that binds drops the
 // OLDEST -- the same end the ring itself evicts from, which keeps the
@@ -2664,6 +2665,16 @@ for (var i = C.length - 1; i >= 0 && keep.length < CAP; i--) {
   keep.push(e);
 }
 keep.reverse();
+// The heap.js fallback sentence: the prelude's retained copies (kept OUT of
+// the ring, so turnover cannot evict them) unioned with whatever the ring
+// still holds, so a page whose prelude predates the retained list -- or a
+// stub ring with no prelude at all -- still hands the lines back. The host
+// de-duplicates on (t, msg).
+var fallbacks = F.slice(0, 50);
+for (var j = 0; j < C.length && fallbacks.length < 50; j++) {
+  var fm = String((C[j] && C[j].msg) || "");
+  if (fm.indexOf("could not instantiate with a") !== -1) fallbacks.push(C[j]);
+}
 return {
   present: !!window.__rig,
   errors: E.slice(-120),
@@ -2676,6 +2687,10 @@ return {
   console_ring_capacity: CAP,
   console_ring_evicted: C.evicted || 0,
   console_bytes_est: used,
+  // See `fallbacks` above: the line is printed at boot and the ring turns
+  // over in seconds, so the ring alone would read "absent" on every leg
+  // longer than that.
+  instantiate_fallbacks: fallbacks,
   page_t0: (window.__rig && window.__rig.t0) || null,
   page_now: Date.now()
 };
@@ -4757,6 +4772,47 @@ def alloc_failure_verdict(allocs):
             "%d allocation refusal(s) reached the console; the first is %r. "
             "Nothing unwinds through one on this target"
             % (len(allocs), out["first"]))
+    return out
+
+
+# The sentence `squallar-web/heap.js` prints when the per-device linear
+# memory it constructed was refused and the glue built its own at the
+# module's declared bound. Printed by the page, and relayed from the
+# rasterization worker with the prelude's `[worker] ` prefix in front.
+INSTANTIATE_FALLBACK_NEEDLE = "could not instantiate with a"
+
+
+def instantiate_fallback_verdict(lines):
+    """**Every instance got the memory it asked for.** A DEFAULT assertion,
+    not an opt-in.
+
+    `heap.js` chooses a linear-memory ceiling per device before the module is
+    instantiated, and falls back to letting the glue construct the memory --
+    at the module's declared bound, the desktop figure -- when its own was
+    refused. That fallback is a page that boots, so every other assertion in
+    this rig passes through it. It fired on EVERY page and EVERY worker from
+    the day the module's declared minimum grew from 65 pages to 66 while
+    `heap.js` still stated 65, and the rig stayed green the whole time: a
+    handheld would have been given a 1 GiB wall its watermark never sheds
+    against, and nothing here could say so.
+
+    `lines` is the union of the prelude's retained copies
+    (`window.__rig_fallbacks`, which the ring's turnover cannot evict) and
+    whatever the console ring still holds. Pure: {t, msg} in, one dict out."""
+    hits = [l for l in lines
+            if INSTANTIATE_FALLBACK_NEEDLE in str((l or {}).get("msg", ""))]
+    page = [h for h in hits if not str(h.get("msg", "")).startswith("[worker]")]
+    worker = [h for h in hits if str(h.get("msg", "")).startswith("[worker]")]
+    out = {"ok": not hits, "count": len(hits),
+           "page_count": len(page), "worker_count": len(worker),
+           "first": (str(hits[0].get("msg"))[:300] if hits else None)}
+    if hits:
+        out["error"] = (
+            "%d instance(s) fell back to the module's declared memory bound "
+            "(%d page, %d worker); the first is %r. The per-device ceiling "
+            "heap.js chose was refused, so this leg measured a heap nobody "
+            "sized -- see squallar-web/heap.js, `initWithHeap`"
+            % (len(hits), len(page), len(worker), out["first"]))
     return out
 
 
@@ -10555,6 +10611,39 @@ def selftest_unaccounted_reading():
     return failed
 
 
+def selftest_instantiate_fallback():
+    """Executable pins on `instantiate_fallback_verdict`: both arms, the
+    page/worker split, and the presence control -- a line that merely
+    mentions memory is not the sentence. Returns the number of failed pins."""
+    failed = 0
+
+    def pin(name, ok):
+        nonlocal failed
+        print("[self-test] %s %s" % ("ok  " if ok else "FAIL", name))
+        if not ok:
+            failed += 1
+
+    v = instantiate_fallback_verdict([])
+    pin("no fallback line passes", v["ok"] and v["count"] == 0 and "error" not in v)
+    v = instantiate_fallback_verdict([
+        {"t": 1, "msg": "alloc failed: 8 B requested, 1 of 1024 MiB linear in page"},
+        {"t": 2, "msg": "rasterization worker attached (0.1.0/wire-1, rayon: 4 threads)"}])
+    pin("lines about memory that are not the sentence pass", v["ok"])
+    page = {"t": 3, "msg": "squallar: could not instantiate with a 1024 MiB linear "
+                           "memory (LinkError: imported Memory with incompatible "
+                           "size); retrying at the module's declared bound"}
+    worker = {"t": 4, "msg": "[worker] " + page["msg"]}
+    v = instantiate_fallback_verdict([page])
+    pin("the page's fallback line fails and is attributed to the page",
+        not v["ok"] and v["page_count"] == 1 and v["worker_count"] == 0
+        and "LinkError" in v.get("error", ""))
+    v = instantiate_fallback_verdict([worker, page])
+    pin("both instances are counted apart",
+        not v["ok"] and v["count"] == 2 and v["page_count"] == 1
+        and v["worker_count"] == 1)
+    return failed
+
+
 def selftest():
     failures = []
     if selftest_loop_or_refusal():
@@ -10562,6 +10651,8 @@ def selftest():
     if selftest_wall_verdicts():
         failures.append("linear-headroom / alloc-failure verdicts "
                         "(see [self-test] lines)")
+    if selftest_instantiate_fallback():
+        failures.append("instantiate-fallback verdict (see [self-test] lines)")
     if selftest_page_clock():
         failures.append("page/driver clock guard (see [self-test] lines)")
     if selftest_sample_probe_patterns():
@@ -11772,6 +11863,22 @@ def run_smoke(args):
             stage("linear-headroom", **{k: v for k, v
                                         in result["linear_headroom"].items()
                                         if k != "error"})
+        # EVERY LEG, no flag: the heap.js fallback sentence, from the
+        # prelude's retained copies plus whatever the ring still holds,
+        # de-duplicated on (t, msg) the way the refusal lines are.
+        sig = result.get("rig_signal") or {}
+        seen_fb = {}
+        for family in ("instantiate_fallbacks", "console", "console_tail"):
+            for e in (sig.get(family) or []):
+                msg = str((e or {}).get("msg", ""))
+                if INSTANTIATE_FALLBACK_NEEDLE in msg:
+                    seen_fb[(e.get("t"), msg)] = {"t": e.get("t"), "msg": msg}
+        result["instantiate_fallback"] = instantiate_fallback_verdict(
+            [seen_fb[k] for k in sorted(seen_fb, key=lambda k: (k[0] or 0, k[1]))])
+        stage("instantiate-fallback", **{k: v for k, v
+                                         in result["instantiate_fallback"].items()
+                                         if k != "error"})
+        ifb_ok = bool(result["instantiate_fallback"]["ok"])
         af_ok = (result.get("alloc_failures") is None
                  or bool(result["alloc_failures"]["ok"]))
         lh_ok = (result.get("linear_headroom") is None
@@ -11811,7 +11918,7 @@ def run_smoke(args):
         result["pass"] = (booted and canvas_ok and raf_ok
                           and canvas_blank is not True and not panics
                           and not traps and fp_ok and tcs_ok and lor_ok
-                          and af_ok and lh_ok
+                          and af_ok and lh_ok and ifb_ok
                           and worker_ok and ifr_ok and cwaits_ok
                           and sw_ok is not False and coi_ok is not False
                           and cv_ok is not False
@@ -11849,6 +11956,10 @@ def run_smoke(args):
             "alloc_failures_ok": (None if result.get("alloc_failures") is None
                                   else bool(result["alloc_failures"]["ok"])),
             "alloc_failure_count": (result.get("alloc_failures") or {}).get("count"),
+            # Default, every leg: no instance took heap.js's fallback to the
+            # module's declared bound. Never None -- there is no flag.
+            "instantiate_fallback_ok": ifb_ok,
+            "instantiate_fallback_count": result["instantiate_fallback"]["count"],
             "linear_headroom_ok": (None if result.get("linear_headroom") is None
                                    else bool(result["linear_headroom"]["ok"])),
             "peak_linear_page_mib": (result.get("linear_headroom") or {}).get(
@@ -12140,6 +12251,17 @@ def run_smoke(args):
             print("[%s] SUMMARY %s window: %s%s"
                   % (tag, _wname, "COMPLETE, " if _wrec.get("complete")
                      else "PARTIAL, ", _wrec.get("covers")))
+    ifb = result.get("instantiate_fallback")
+    if ifb is not None:
+        # Printed on every leg, PASS or FAIL: a default assertion that only
+        # spoke when it failed would leave a green row unable to say it had
+        # been asked.
+        print("[%s] SUMMARY linear-memory instantiation: %s (%d fallback line(s): "
+              "%d page, %d worker)%s"
+              % (tag, "OK" if ifb.get("ok") else "FAILED",
+                 ifb.get("count", 0), ifb.get("page_count", 0),
+                 ifb.get("worker_count", 0),
+                 "" if ifb.get("ok") else "; " + str(ifb.get("error"))))
     wrt = result.get("worker_round_trip")
     if wrt is not None:
         print("[%s] SUMMARY worker round-trip: %s (attach + off-the-frame "

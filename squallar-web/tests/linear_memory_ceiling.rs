@@ -224,6 +224,77 @@ fn the_worker_name_prefix_is_spelled_the_same_in_both_languages() {
     );
 }
 
+/// **`heap.js` states no `initial` figure; it reads one off the module.**
+///
+/// The file held `INITIAL_PAGES = 65`, a hand copy of the generated glue's
+/// own default, and the module came to declare 66: every page and worker
+/// then instantiated through the `LinkError` fallback, at the declared
+/// bound instead of the per-device one, with one `warn` nobody read. A
+/// figure read off the module cannot drift from it, so what is pinned is
+/// that the constant is gone and the reading is what `initWithHeap` uses:
+/// the only `initial:` in the file is the parsed one, and the parse is over
+/// a clone of the same `Response` the glue then streams -- one download.
+///
+/// The reading itself is exercised in `tests/heap.test.mjs`, under
+/// `sw_behaviour.rs`, over a module built byte by byte.
+#[test]
+fn the_initial_pages_are_read_off_the_module_and_stated_nowhere() {
+    assert!(
+        !HEAP_JS.contains("export const INITIAL_PAGES"),
+        "heap.js states the module's memory minimum again; it drifted the \
+         last time and every instance took the fallback",
+    );
+    let initials: Vec<&str> = HEAP_JS
+        .match_indices("initial:")
+        .map(|(at, _)| {
+            HEAP_JS[at + "initial:".len()..]
+                .split(',')
+                .next()
+                .expect("an `initial:` is followed by a value")
+                .trim()
+        })
+        .collect();
+    assert_eq!(
+        initials,
+        vec!["pages"],
+        "every `initial:` in heap.js must be the parsed minimum (`pages`), \
+         never a literal; found {initials:?}",
+    );
+    for needle in [
+        "export function readDeclaredMinimum(",
+        "export async function declaredMinimumPages(",
+        "const pages = await declaredMinimumPages(response.clone());",
+        "module_or_path: response,",
+    ] {
+        assert!(
+            HEAP_JS.contains(needle),
+            "heap.js no longer carries `{needle}`: the reading, or the single \
+             fetch it shares with the glue, is gone",
+        );
+    }
+}
+
+/// The module `heap.js` fetches to read its minimum from is the module the
+/// glue instantiates and the one `sw.js` precaches -- one spelling, held
+/// against the shell list, so a renamed bundle cannot leave the reading
+/// fetching a 404 while the glue streams the real file.
+#[test]
+fn the_module_path_heap_js_reads_is_the_one_the_shell_precaches() {
+    let path = js_string_const("MODULE_PATH");
+    let relative = path
+        .strip_prefix("./")
+        .unwrap_or_else(|| panic!("MODULE_PATH {path:?} is not spelled relative to heap.js"));
+    let sw = include_str!("../sw.js");
+    assert!(
+        sw.contains(&format!("\"{relative}\"")),
+        "heap.js reads {relative:?} and sw.js does not precache it",
+    );
+    assert!(
+        relative.ends_with("_bg.wasm"),
+        "{relative:?} is not a wasm-pack module"
+    );
+}
+
 /// The parser can disagree. A name that is absent panics, and a product is
 /// really multiplied rather than read as its first term.
 #[test]
