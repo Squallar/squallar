@@ -9,7 +9,7 @@ nexrad-level3/src/model/symbology.rs	5	5
 squallar-alloc/src/lib.rs	268	257
 squallar-alloc/src/process.rs	167	165
 squallar-app/src/action_budget.rs	56	33
-squallar-app/src/app.rs	2145	1618
+squallar-app/src/app.rs	2145	1614
 squallar-app/src/app_chunks.rs	273	154
 squallar-app/src/app_fetch.rs	2234	1686
 squallar-app/src/app_offline.rs	31	30
@@ -108,7 +108,7 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	490	452
 squallar-egui/src/tile_mesh/ledger.rs	121	83
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	1685	1618
+squallar-egui/src/tile_source.rs	1685	1619
 squallar-egui/src/tile_source/byte_lru.rs	272	271
 squallar-egui/src/tile_source/cache_ledger.rs	208	188
 squallar-egui/src/tile_source/snap.rs	157	157
@@ -248,7 +248,7 @@ squallar-overlays/src/render/handlers/location.rs	76	58
 squallar-overlays/src/render/handlers/metar.rs	987	879
 squallar-overlays/src/render/handlers/mod.rs	172	170
 squallar-overlays/src/render/handlers/model.rs	2962	2780
-squallar-overlays/src/render/handlers/mrms.rs	787	710
+squallar-overlays/src/render/handlers/mrms.rs	787	711
 squallar-overlays/src/render/handlers/outlook.rs	1715	1659
 squallar-overlays/src/render/handlers/reports.rs	796	725
 squallar-overlays/src/render/handlers/sites.rs	98	80
@@ -552,7 +552,7 @@ vendor/walkers/src/local_tiles.rs	52	0
 vendor/walkers/src/map.rs	481	408
 vendor/walkers/src/memory.rs	31	25
 vendor/walkers/src/mercator.rs	136	136
-vendor/walkers/src/mvt.rs	1525	1434
+vendor/walkers/src/mvt.rs	1525	1435
 vendor/walkers/src/options.rs	13	13
 vendor/walkers/src/position.rs	71	71
 vendor/walkers/src/projector.rs	202	202
