@@ -296,6 +296,39 @@ fn next_after(id: LoanId) -> LoanId {
     }
 }
 
+/// A JS `byteLength` as a byte count: `None` for anything that is not a
+/// finite, non-negative whole number.
+///
+/// `f64` in and `u64` out, and neither end may narrow: a linear memory at the
+/// 65,536 pages the module is linked at is exactly 2^32 bytes, one more than
+/// a wasm32 `u32` or `usize` holds.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn byte_count(number: f64) -> Option<u64> {
+    (number.is_finite() && number >= 0.0 && number.fract() == 0.0).then_some(number as u64)
+}
+
+#[cfg(test)]
+mod byte_count_tests {
+    use super::byte_count;
+
+    /// **A memory at the linked maximum reads 4 GiB, not 0.** js-sys's own
+    /// getter is `u32` and read this as 0; one page under and one page of
+    /// memory are the controls either side.
+    #[test]
+    fn a_memory_at_65536_pages_reads_its_whole_size() {
+        assert_eq!(byte_count(4_294_967_296.0), Some(1 << 32));
+        assert_eq!(
+            byte_count(4_294_967_296.0 - 65_536.0),
+            Some((1 << 32) - 65_536)
+        );
+        assert_eq!(byte_count(65_536.0), Some(65_536));
+        assert_eq!(byte_count(0.0), Some(0));
+        for junk in [f64::NAN, f64::INFINITY, -65_536.0, 1.5] {
+            assert_eq!(byte_count(junk), None, "{junk} read as a byte count");
+        }
+    }
+}
+
 /// The bookkeeping half, on the host, where a browser is not needed to run it.
 #[cfg(test)]
 mod loan_book_tests;
@@ -359,15 +392,36 @@ mod js {
         /// `byteLength`, whichever of the two buffer kinds this is. `None`
         /// for a value that is neither — which a `WebAssembly.Memory` cannot
         /// hand back, so the `Option` is the shape of the cast.
+        ///
+        /// **Read as a JS number, never through js-sys's getter.** js-sys
+        /// types `ArrayBuffer::byte_length` and
+        /// `SharedArrayBuffer::byte_length` as `u32`, and a linear memory
+        /// grown to the 65,536 pages the module is linked at is exactly
+        /// 2^32 bytes: through that getter the page's heap at the wall read
+        /// 0 — a watermark gone quiet, a spare figure bounded by nothing,
+        /// and an allocation-failure line saying `0 of 4096 MiB` at the one
+        /// moment it is read. A `usize` would wrap the same way on wasm32.
         fn byte_length(&self) -> Option<u64> {
-            if let Some(shared) = self.0.dyn_ref::<js_sys::SharedArrayBuffer>() {
-                Some(u64::from(shared.byte_length()))
+            if self.0.is_instance_of::<js_sys::SharedArrayBuffer>()
+                || self.0.is_instance_of::<js_sys::ArrayBuffer>()
+            {
+                super::byte_count(self.0.unchecked_ref::<HasByteLength>().byte_length_number())
             } else {
-                self.0
-                    .dyn_ref::<js_sys::ArrayBuffer>()
-                    .map(|plain| u64::from(plain.byte_length()))
+                None
             }
         }
+    }
+
+    #[wasm_bindgen]
+    extern "C" {
+        /// Anything with a `byteLength` — here, the buffer behind a linear
+        /// memory. A local type because an inherent getter cannot be added
+        /// to js-sys's own.
+        type HasByteLength;
+
+        /// `byteLength`, structurally, as the `f64` it is in JS.
+        #[wasm_bindgen(method, getter = byteLength)]
+        fn byte_length_number(this: &HasByteLength) -> f64;
     }
 
     /// How many bytes this instance's linear memory currently spans — the
