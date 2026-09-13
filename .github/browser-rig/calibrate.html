@@ -1,0 +1,403 @@
+<title>squallar rig: linear-memory wall</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Home-screen capable, so the no-driver arm can calibrate in the SAME
+     standalone context the installed app runs in (iPhone runbook, arm 2). -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<!--
+  RIG ONLY. NEVER DEPLOYED, NEVER PRECACHED.
+
+  Served by `.github/browser-rig/serve.py` at /rig/calibrate.html, read out of
+  this directory and never out of the served web directory. The web deploy
+  stages an opt-in list of files from squallar-web/ (`.github/workflows/
+  build.yaml`, the `web-wasm32` row) and this file does not live there;
+  `squallar-web/tests/wall_rig_pins.rs` holds both halves -- no staging line
+  names it and `sw.js` names it nowhere.
+
+  WHAT IT ANSWERS, per (device, browser):
+
+    1. Which maximum a `shared` WebAssembly.Memory CONSTRUCTS at, on the ladder
+       4096, 2048, 1024, 512, 256, 128 MiB. Only the constructor's throw is
+       caught, and each rung's memory is dropped before the next.
+    2. How many bytes of incompressible, TOUCHED linear memory the page
+       survives. ONE shared memory is grown `step_mib` at a time and every page
+       it adds is filled with xorshift32 output, which an OS memory compressor
+       cannot reclaim. Before each grow the step is persisted TWICE --
+       localStorage under two keys written alternately, so a write torn by the
+       kill still leaves the previous step intact, AND navigator.sendBeacon to
+       /rig/report -- and then `wait_ms` pass so the beacon is out of the
+       process before the grow that might end it.
+
+  A run ends by DEATH (the tab is killed; iOS reloads it), by REFUSAL (`grow`
+  throws -- a RangeError, or the memory's own maximum), or at the CAP. The next
+  load of the same `run` reads the record back and says which of the three.
+
+  QUERY PARAMETERS
+
+    run=<id>            start run <id>, or read it back if a record for <id>
+                        is already stored. Without it the page shows the last
+                        record it holds and a Start button.
+    cap_mib=4096        policy cap: a run never grows past it.
+    step_mib=32         MiB per grow.
+    wait_ms=250         pause between persisting a step and taking it.
+    die_at_mib=N        CONTROL. Simulate a death -- location.reload() -- at
+                        the first step whose survived total is >= N. The only
+                        way to exercise the death path on a desktop.
+    doctor_ladder=a,b   CONTROL. Rungs a and b (MiB) throw a synthetic refusal
+                        instead of constructing. The ladder verdict must go
+                        red; a leg where it does not is not reading the ladder.
+
+  READINGS: `window.__calibrate` (what `drive.py --calibrate` polls), the text
+  below (what a human reads off the glass), and every record on /rig/report.
+  Serve with --coep: a shared memory needs cross-origin isolation.
+-->
+<style>
+  :root { color-scheme: light dark; font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  body { margin: 0; padding: 12px 16px; }
+  h1 { font-size: 16px; margin: 0 0 8px; }
+  #verdict { font-weight: bold; margin: 8px 0; }
+  pre { white-space: pre-wrap; word-break: break-word; margin: 8px 0; }
+  button { font: inherit; padding: 8px 14px; }
+</style>
+<h1>squallar rig: linear-memory wall</h1>
+<div id="verdict">loading</div>
+<button id="start" hidden>Start a run</button>
+<pre id="out"></pre>
+<script type="module">
+"use strict";
+const MIB = 1024 * 1024;
+const PAGE = 65536;
+const LADDER_MIB = [4096, 2048, 1024, 512, 256, 128];
+const KEYS = ["squallar.rig.calibrate.a", "squallar.rig.calibrate.b"];
+const REPORT = "/rig/report";
+
+const q = new URLSearchParams(location.search);
+function num(name, dflt) {
+  const v = q.get(name);
+  if (v === null || v === "") return dflt;
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : dflt;
+}
+const RUN = q.get("run");
+const CAP_MIB = num("cap_mib", 4096);
+const STEP_MIB = Math.max(1, num("step_mib", 32));
+const WAIT_MS = num("wait_ms", 250);
+const DIE_AT_MIB = num("die_at_mib", null);
+const DOCTOR = (q.get("doctor_ladder") || "")
+  .split(",")
+  .map(Number)
+  .filter((n) => Number.isFinite(n) && n > 0);
+const LOAD = Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+
+const outEl = document.getElementById("out");
+const verdictEl = document.getElementById("verdict");
+const C = (window.__calibrate = {
+  load: LOAD,
+  run: RUN,
+  state: "init",
+  params: { cap_mib: CAP_MIB, step_mib: STEP_MIB, wait_ms: WAIT_MS, die_at_mib: DIE_AT_MIB, doctor_ladder: DOCTOR },
+  ask: null,
+  ladder: null,
+  ladder_verdict: null,
+  survived_mib: 0,
+  end: null,
+  record: null,
+  readback: null,
+  beacons: { sent: 0, refused: 0 },
+  verdict_text: null,
+  log: [],
+});
+
+function say(line) {
+  C.log.push(line);
+  if (C.log.length > 400) C.log.splice(0, 100);
+  outEl.textContent = C.log.join("\n");
+}
+function verdict(text) {
+  C.verdict_text = text;
+  verdictEl.textContent = text;
+}
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+let heap = null;
+let heapError = null;
+try {
+  heap = await import("../heap.js");
+} catch (e) {
+  heapError = String(e);
+}
+const COI = typeof self.crossOriginIsolated === "boolean" ? self.crossOriginIsolated : null;
+const BASE = {
+  ua: navigator.userAgent,
+  coi: COI,
+  sab: typeof SharedArrayBuffer !== "undefined",
+  cap_mib: CAP_MIB,
+  step_mib: STEP_MIB,
+  wait_ms: WAIT_MS,
+  die_at_mib: DIE_AT_MIB,
+  doctored: DOCTOR,
+};
+
+function beacon(rec) {
+  let ok = false;
+  try {
+    ok = navigator.sendBeacon(REPORT, JSON.stringify(rec));
+  } catch (e) {
+    ok = false;
+  }
+  if (ok) C.beacons.sent++;
+  else C.beacons.refused++;
+  return ok;
+}
+
+let seq = 0;
+function persist(fields) {
+  const rec = Object.assign({ v: 1, kind: "calibrate", run: RUN, load: LOAD, seq, t: Date.now() }, BASE, fields);
+  const key = KEYS[seq % 2];
+  seq++;
+  try {
+    localStorage.setItem(key, JSON.stringify(rec));
+    rec.stored_key = key;
+  } catch (e) {
+    rec.storage_error = String(e);
+  }
+  beacon(rec);
+  C.record = rec;
+  return rec;
+}
+
+function readStored(run) {
+  const found = [];
+  const torn = [];
+  for (const key of KEYS) {
+    let raw = null;
+    try {
+      raw = localStorage.getItem(key);
+    } catch (e) {
+      torn.push({ key, error: String(e) });
+      continue;
+    }
+    if (raw === null) continue;
+    try {
+      const rec = JSON.parse(raw);
+      if (rec && rec.kind === "calibrate" && typeof rec.seq === "number") found.push({ key, rec });
+      else torn.push({ key, error: "not a calibrate record" });
+    } catch (e) {
+      torn.push({ key, error: "unparseable: " + String(e) });
+    }
+  }
+  const mine = found.filter((f) => run === null || f.rec.run === run);
+  mine.sort((a, b) => b.rec.seq - a.rec.seq || b.rec.t - a.rec.t);
+  return { newest: mine.length ? mine[0] : null, intact: found.length, torn };
+}
+
+function readbackOf(stored) {
+  const rec = stored.newest.rec;
+  const endedBy = rec.phase === "ended" ? rec.end : "death";
+  return {
+    run: rec.run,
+    ended_by: endedBy,
+    simulated: endedBy === "death" && rec.die_at_mib !== null && rec.survived_mib >= rec.die_at_mib,
+    phase_at_end: rec.phase,
+    survived_mib: rec.survived_mib,
+    attempting_mib: rec.attempting_mib,
+    attempting_rung_mib: rec.attempting_rung_mib === undefined ? null : rec.attempting_rung_mib,
+    at_maximum: rec.at_maximum === undefined ? null : rec.at_maximum,
+    error: rec.error || null,
+    ask: rec.ask || null,
+    ladder: rec.ladder || null,
+    ladder_verdict: rec.ladder_verdict || null,
+    doctored: rec.doctored || [],
+    cap_mib: rec.cap_mib,
+    step_mib: rec.step_mib,
+    die_at_mib: rec.die_at_mib,
+    memory_maximum_mib: rec.memory_maximum_mib === undefined ? null : rec.memory_maximum_mib,
+    seq: rec.seq,
+    from_key: stored.newest.key,
+    keys_intact: stored.intact,
+    torn: stored.torn,
+    previous_load: rec.load,
+    ua: rec.ua,
+    coi: rec.coi,
+  };
+}
+
+function askOfHeap() {
+  if (!heap) return { page_mib: null, worker_mib: null, form: null, error: heapError };
+  try {
+    const choice = heap.chooseHeapMaxBytes(globalThis);
+    const s = heap.pageSignals(globalThis);
+    return {
+      page_mib: choice.page / MIB,
+      worker_mib: choice.worker / MIB,
+      form: heap.classifyFormFactor(s.pointerCoarse, s.anyPointerFine, s.maxTouchPoints),
+      signals: s,
+      error: null,
+    };
+  } catch (e) {
+    return { page_mib: null, worker_mib: null, form: null, error: String(e) };
+  }
+}
+
+function ladderVerdictOf(ladder, ask) {
+  const oks = ladder.filter((r) => r.ok).map((r) => r.mib);
+  const largest = oks.length ? Math.max(...oks) : null;
+  const rung = (mib) => {
+    const r = ladder.find((x) => x.mib === mib);
+    return r ? r.ok : null;
+  };
+  const page = ask.page_mib === null ? null : rung(ask.page_mib);
+  const worker = ask.worker_mib === null ? null : rung(ask.worker_mib);
+  const ok = page === true && worker === true;
+  let why = null;
+  if (ask.page_mib === null) {
+    why = "heap.js could not be read (" + ask.error + "), so the app's ask is unknown and nothing was held against the ladder";
+  } else if (!ok) {
+    const refused = [];
+    if (page !== true) refused.push("the page's " + ask.page_mib + " MiB");
+    if (worker !== true) refused.push("the worker's " + ask.worker_mib + " MiB");
+    why = "this build asks for " + refused.join(" and ") + " and that rung did not construct";
+  }
+  return { ok, largest_mib: largest, page_rung_ok: page, worker_rung_ok: worker, why };
+}
+
+function touch(buffer, offsetBytes, lengthBytes, seed) {
+  const words = new Uint32Array(buffer, offsetBytes, lengthBytes / 4);
+  let x = seed | 0 || 0x2545f491;
+  for (let i = 0; i < words.length; i++) {
+    x ^= x << 13;
+    x ^= x >>> 17;
+    x ^= x << 5;
+    words[i] = x;
+  }
+}
+
+async function ladderPhase() {
+  const ladder = [];
+  for (const mib of LADDER_MIB) {
+    // Persisted BEFORE the construct: a reservation that kills the tab must
+    // leave the rung it died on behind, on disk and on the wire.
+    persist({ phase: "ladder", attempting_rung_mib: mib, ladder: ladder.slice(), survived_mib: 0, attempting_mib: 0, ask: C.ask });
+    await sleep(WAIT_MS);
+    const r = { mib, ok: false, error: null, doctored: DOCTOR.includes(mib) };
+    if (r.doctored) {
+      r.error = "RangeError: rig doctored refusal (doctor_ladder=" + DOCTOR.join(",") + ")";
+    } else {
+      let memory = null;
+      try {
+        memory = new WebAssembly.Memory({ initial: 1, maximum: (mib * MIB) / PAGE, shared: true });
+        r.ok = true;
+      } catch (e) {
+        r.error = String(e);
+      }
+      memory = null;
+    }
+    ladder.push(r);
+    say("ladder " + mib + " MiB: " + (r.ok ? "constructs" : "REFUSED -- " + r.error));
+  }
+  return ladder;
+}
+
+function end(kind, fields) {
+  const rec = persist(Object.assign({ phase: "ended", end: kind, ask: C.ask, ladder: C.ladder, ladder_verdict: C.ladder_verdict }, fields));
+  C.state = "ended";
+  C.end = kind;
+  C.survived_mib = rec.survived_mib;
+  say("ENDED by " + kind.toUpperCase() + " with " + rec.survived_mib + " MiB touched and alive" + (rec.error ? " -- " + rec.error : ""));
+  verdict(
+    "run " + RUN + " ended by " + kind.toUpperCase() + " at " + rec.survived_mib + " MiB survived; ladder " +
+      (C.ladder_verdict.ok ? "ok" : "RED: " + C.ladder_verdict.why) + ". Reload to read it back.",
+  );
+}
+
+async function growthPhase() {
+  const maxMib = Math.min(C.ladder_verdict.largest_mib || 0, CAP_MIB);
+  if (!maxMib) {
+    end("refusal", { survived_mib: 0, attempting_mib: 0, error: "no rung constructed, so there is no shared memory to grow", at_maximum: true });
+    return;
+  }
+  let memory;
+  try {
+    memory = new WebAssembly.Memory({ initial: 0, maximum: (maxMib * MIB) / PAGE, shared: true });
+  } catch (e) {
+    end("refusal", { survived_mib: 0, attempting_mib: 0, error: "the growth memory did not construct: " + String(e), memory_maximum_mib: maxMib });
+    return;
+  }
+  window.__calibrate_memory = memory;
+  const seed0 = crypto.getRandomValues(new Uint32Array(1))[0];
+  let survived = 0;
+  C.state = "growing";
+  for (;;) {
+    const next = survived + STEP_MIB;
+    if (next > CAP_MIB) {
+      end("cap", { survived_mib: survived, attempting_mib: next, memory_maximum_mib: maxMib });
+      return;
+    }
+    persist({ phase: "growing", survived_mib: survived, attempting_mib: next, memory_maximum_mib: maxMib, ask: C.ask, ladder: C.ladder, ladder_verdict: C.ladder_verdict });
+    C.survived_mib = survived;
+    await sleep(WAIT_MS);
+    if (DIE_AT_MIB !== null && survived >= DIE_AT_MIB) {
+      say("CONTROL: simulating a death at " + survived + " MiB survived (die_at_mib=" + DIE_AT_MIB + ") -- reloading");
+      C.state = "simulated-death";
+      location.reload();
+      return;
+    }
+    try {
+      memory.grow((STEP_MIB * MIB) / PAGE);
+    } catch (e) {
+      end("refusal", { survived_mib: survived, attempting_mib: next, error: String(e), at_maximum: next > maxMib, memory_maximum_mib: maxMib });
+      return;
+    }
+    touch(memory.buffer, survived * MIB, STEP_MIB * MIB, (seed0 + survived) | 0);
+    survived = next;
+    C.survived_mib = survived;
+    if (survived % 256 === 0) say("survived " + survived + " MiB touched");
+  }
+}
+
+const stored = readStored(RUN);
+say("load " + LOAD + " crossOriginIsolated=" + COI + " SharedArrayBuffer=" + BASE.sab + " ua=" + BASE.ua);
+if (RUN !== null && stored.newest) {
+  const rb = readbackOf(stored);
+  C.readback = rb;
+  C.state = "readback";
+  beacon({ v: 1, kind: "calibrate", phase: "readback", run: RUN, load: LOAD, t: Date.now(), ua: BASE.ua, coi: COI, readback: rb });
+  const lv = rb.ladder_verdict;
+  verdict(
+    "PREVIOUS RUN " + RUN + " ENDED BY " + String(rb.ended_by).toUpperCase() + (rb.simulated ? " (SIMULATED: die_at_mib=" + rb.die_at_mib + ")" : "") +
+      " -- " + rb.survived_mib + " MiB touched and alive at its last step" +
+      (rb.phase_at_end === "ladder" ? " (died constructing the " + rb.attempting_rung_mib + " MiB rung)" : "") +
+      "; ladder " + (lv ? (lv.ok ? "ok, largest " + lv.largest_mib + " MiB" : "RED: " + lv.why) : "not reached"),
+  );
+  say("read back from " + rb.from_key + " (seq " + rb.seq + ", " + rb.keys_intact + " key(s) intact" + (rb.torn.length ? ", torn: " + JSON.stringify(rb.torn) : "") + ")");
+  if (rb.ladder) for (const r of rb.ladder) say("  ladder " + r.mib + " MiB: " + (r.ok ? "constructs" : "REFUSED -- " + r.error));
+  if (rb.error) say("  end error: " + rb.error);
+} else if (RUN !== null) {
+  C.ask = askOfHeap();
+  say("this build asks: page " + C.ask.page_mib + " MiB, worker " + C.ask.worker_mib + " MiB, form " + C.ask.form + (C.ask.error ? " (" + C.ask.error + ")" : ""));
+  C.state = "ladder";
+  verdict("run " + RUN + ": constructing the ladder");
+  C.ladder = await ladderPhase();
+  C.ladder_verdict = ladderVerdictOf(C.ladder, C.ask);
+  say("ladder verdict: " + (C.ladder_verdict.ok ? "ok" : "RED -- " + C.ladder_verdict.why) + "; largest " + C.ladder_verdict.largest_mib + " MiB");
+  verdict("run " + RUN + ": growing, " + STEP_MIB + " MiB a step to " + CAP_MIB + " MiB");
+  await growthPhase();
+} else {
+  C.state = "idle";
+  if (stored.newest) {
+    const rb = readbackOf(stored);
+    C.readback = rb;
+    verdict("last stored run " + rb.run + " ended by " + String(rb.ended_by).toUpperCase() + " at " + rb.survived_mib + " MiB survived");
+  } else {
+    verdict("no run stored on this origin");
+  }
+  const button = document.getElementById("start");
+  button.hidden = false;
+  button.addEventListener("click", () => {
+    const p = new URLSearchParams(location.search);
+    p.set("run", Date.now().toString(36));
+    location.replace(location.pathname + "?" + p.toString());
+  });
+}
+</script>

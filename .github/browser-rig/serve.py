@@ -57,6 +57,43 @@ Rig endpoints (byte transforms of repo files, applied per-response):
                     served this way MUST fail; one that passes proves the
                     assertion is not reading the console.
 
+  /rig/calibrate.html
+                    the linear-memory wall calibration page (M1). Read from
+                    THIS directory (`.github/browser-rig/calibrate.html`) and
+                    never from --dir: the page exists nowhere the web deploy
+                    stages from, which is what keeps it off the public site
+                    (`squallar-web/tests/wall_rig_pins.rs` holds that). Serve
+                    it with --coep -- a `shared` WebAssembly.Memory needs
+                    cross-origin isolation -- and --report-log, which is where
+                    its step records land.
+
+  POST /rig/report, POST /rig/console
+                    with --report-log PATH, every request is appended to PATH
+                    as ONE JSON line: {route, recv_utc, recv_ms, client,
+                    user_agent, bytes, body}, `body` parsed when it is JSON and
+                    kept as a string when it is not. The calibrate page beacons
+                    /rig/report; a --console-beacon page beacons /rig/console.
+                    This is how a device NO DRIVER can reach -- a home-screen
+                    web app on a phone -- still reports: it posts to this box.
+                    Without --report-log a POST is refused exactly as before
+                    (501).
+
+  --console-beacon  /index-rig.html gains a SECOND <script> straight after the
+                    prelude that forwards every console line carrying one of
+                    CONSOLE_BEACON_NEEDLES to /rig/console, batched once a
+                    second and flushed on pagehide. The entry sent is the one
+                    the prelude just pushed into its ring, verbatim, so a
+                    beaconed line and a driven leg's scraped line are the same
+                    {t, msg} and `drive.py analyze-console` turns the log into
+                    the row a driven leg writes. Off by default; when off the
+                    page is byte-identical to before.
+
+  --instrument-index  serve `/` and `/index.html` as the instrumented page too.
+                    A home-screen web app launches the manifest's `start_url`
+                    (`./`), never /index-rig.html, so without this an installed
+                    PWA runs with no prelude, no seed and no beacon. Off by
+                    default.
+
   --pin-clock 2026-09-07T07:22:00Z pins both preludes' wall clock: the page
                     and the worker read that instant plus real elapsed time
                     from Date.now() / new Date(), so a loop seeded on a site
@@ -64,7 +101,8 @@ Rig endpoints (byte transforms of repo files, applied per-response):
                     `long` leg pins the KTLX VCP 212 window that first hit
                     the page's 1 GiB linear-memory wall (run_tier2.sh).
 
-  /index.html, /sw.js and everything else are served byte-identical to disk.
+  /index.html, /sw.js and everything else are served byte-identical to disk
+  (`/` and `/index.html` excepted under --instrument-index).
 
 Programmatic use:
     import serve
@@ -121,6 +159,7 @@ import ssl
 import subprocess
 import sys
 import threading
+import time
 
 # Resolved from THIS FILE (`<root>/.github/browser-rig/serve.py`), never from an
 # absolute path: the one that stood here named `projects/squallar`, which the
@@ -132,6 +171,19 @@ DEFAULT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__)))),
     "squallar-web")
+
+# This file's own directory, for the rig-only pages served out of it.
+RIG_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# The calibrate page's one route and its one source. Never under --dir.
+CALIBRATE_ROUTE = "/rig/calibrate.html"
+CALIBRATE_FILE = os.path.join(RIG_DIR, "calibrate.html")
+
+# The two POST routes --report-log accepts, and the most one body may carry.
+# A calibrate step record is ~2 KiB and a console batch a few tens; a megabyte
+# is a bound on a runaway, not a budget anyone is near.
+REPORT_ROUTES = ("/rig/report", "/rig/console")
+REPORT_BODY_CAP_BYTES = 1024 * 1024
 
 
 def lan_ip():
@@ -428,6 +480,132 @@ try {
 """
 
 
+# What --console-beacon forwards: (needle, status, where the app writes it).
+#
+# Checked against the tree on 2026-09-12, needle by needle, and a needle is
+# `written` only where a formatter in the product spells it. `forward` names a
+# line a later milestone adds; it is kept so a build that grows the line
+# reports it without a rig change, and it costs one substring test a line.
+#
+# `render took` was in the M1 plan's list and is NOT here: no line carries it,
+# because no job kind is named `render`. Job replies are
+# `<kind> took N ms off the frame` (or `... on the main thread` where the job
+# ran on the page), with kinds `radar`, `level3`, `section`, `voxels`,
+# `decode`, `overlay/<name>`, `basemap/tiles`, `terrain/heights` and
+# `buildings/prisms` -- so the two tails below are what exists instead, and
+# `decode took` is a real line only because one kind is literally `decode`.
+CONSOLE_BEACON_NEEDLES = (
+    ("budget state:", "written", "squallar-app/src/budget_telemetry.rs"),
+    ("heap census", "written", "squallar-egui/src/heap_census.rs"),
+    ("alloc failed:", "written", "squallar-web/src/alloc_failure.rs"),
+    ("linear memory ladder:", "forward", "nothing writes it yet"),
+    ("could not instantiate with a", "written", "squallar-web/heap.js"),
+    ("budget pressure:", "written", "squallar-app/src/pressure.rs"),
+    ("decode took", "written",
+     "squallar-worker/src/offload.rs, job kind `decode` "
+     "(squallar-radar/src/jobs.rs)"),
+    (" ms off the frame", "written",
+     "squallar-worker/src/offload.rs deliver_job_reply"),
+    (" ms on the main thread", "written",
+     "squallar-worker/src/offload.rs run_here"),
+)
+
+# Injected straight AFTER the prelude, and only under --console-beacon, so the
+# page without the flag is the page it always was. It wraps the prelude's
+# console wrapper rather than replacing it: the prelude pushes the entry, and
+# this sends that exact entry. Worker lines arrive on the prelude's
+# BroadcastChannel; a second listener on the same channel sees the same
+# messages, so relayed worker refusals are forwarded too.
+CONSOLE_BEACON_SCRIPT = b"""<script>/* squallar rig console beacon (serve.py --console-beacon, repo untouched) */
+(function () {
+  "use strict";
+  var NEEDLES = __RIG_BEACON_NEEDLES__;
+  var ROUTE = "/rig/console";
+  var rig = window.__rig || {};
+  var load = Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+  var batch = [], seq = 0, stats = { sent: 0, refused: 0, lines: 0 };
+  window.__rig_beacon = { load: load, stats: stats };
+  function wanted(m) {
+    for (var i = 0; i < NEEDLES.length; i++) if (m.indexOf(NEEDLES[i]) >= 0) return true;
+    return false;
+  }
+  function flush(why) {
+    if (!batch.length && why === "tick") return;
+    var body;
+    try {
+      var standalone = false;
+      try {
+        standalone = !!((window.matchMedia && window.matchMedia("(display-mode: standalone)").matches)
+                        || navigator.standalone);
+      } catch (_) {}
+      body = JSON.stringify({
+        kind: "console", load: load, t0: rig.t0 || null, seq: seq++, why: why,
+        href: String(location.href), ua: navigator.userAgent,
+        coi: (typeof self.crossOriginIsolated === "boolean") ? self.crossOriginIsolated : null,
+        standalone: standalone, lines: batch.splice(0, batch.length) });
+    } catch (_) { return; }
+    var ok = false;
+    try { ok = navigator.sendBeacon(ROUTE, body); } catch (_) {}
+    if (!ok) {
+      try { fetch(ROUTE, { method: "POST", body: body, keepalive: true }); ok = true; } catch (_) {}
+    }
+    if (ok) stats.sent++; else stats.refused++;
+  }
+  function take(e) {
+    var m = String((e && e.msg) || "");
+    if (!wanted(m)) return;
+    stats.lines++;
+    batch.push({ t: e.t, lvl: e.lvl || e.kind || null, msg: m });
+    if (batch.length >= 100) flush("full");
+  }
+  var C = window.__rig_console;
+  ["error", "warn", "info", "log", "debug"].forEach(function (lvl) {
+    var inner = console[lvl];
+    if (!inner) return;
+    console[lvl] = function () {
+      var before = C ? C.length + (C.evicted || 0) : 0;
+      var r = inner.apply(console, arguments);
+      if (C && C.length + (C.evicted || 0) > before) take(C[C.length - 1]);
+      return r;
+    };
+  });
+  try {
+    var bc = new BroadcastChannel("__rig");
+    bc.onmessage = function (m) { take(m.data || {}); };
+  } catch (_) {}
+  flush("hello");
+  setInterval(function () { flush("tick"); }, 1000);
+  window.addEventListener("pagehide", function () { flush("pagehide"); });
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "hidden") flush("hidden");
+  });
+})();
+</script>
+"""
+
+
+def console_beacon_script():
+    """The beacon <script>, with the needle list spliced in as a JSON array."""
+    needles = json.dumps([n for n, _status, _where in CONSOLE_BEACON_NEEDLES])
+    return CONSOLE_BEACON_SCRIPT.replace(b"__RIG_BEACON_NEEDLES__",
+                                         needles.encode("utf-8"))
+
+
+def report_record(route, raw, client, user_agent, now=None):
+    """One POST, as the JSON line --report-log appends. Pure, so the shape a
+    reader depends on is checkable without a socket."""
+    now = time.time() if now is None else now
+    text = raw.decode("utf-8", "replace")
+    try:
+        body = json.loads(text)
+    except ValueError:
+        body = text
+    return {"route": route,
+            "recv_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+            "recv_ms": int(now * 1000), "client": client,
+            "user_agent": user_agent, "bytes": len(raw), "body": body}
+
+
 def parse_pin_clock(text):
     """`2026-09-07T07:22:00Z` -> milliseconds since the epoch. UTC only and
     the `Z` is required: a pin without a zone would mean a different instant
@@ -451,7 +629,7 @@ def pin_clock_literal(pin_clock_ms):
 
 
 def transform_index(raw, block_sw=True, seed_local_storage=None,
-                    pin_clock_ms=None):
+                    pin_clock_ms=None, console_beacon=False):
     """index.html bytes -> instrumented page bytes."""
     seed = (json.dumps(seed_local_storage).encode("utf-8")
             if seed_local_storage else b"null")
@@ -459,6 +637,8 @@ def transform_index(raw, block_sw=True, seed_local_storage=None,
         b"__RIG_BLOCK_SW__", b"true" if block_sw else b"false").replace(
         b"__RIG_SEED_LS__", seed).replace(
         b"__RIG_PIN_CLOCK_MS__", pin_clock_literal(pin_clock_ms))
+    if console_beacon:
+        prelude = prelude + console_beacon_script()
     marker = b"<head>"
     idx = raw.find(marker)
     if idx >= 0:
@@ -541,12 +721,17 @@ class RigHandler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?", 1)[0].split("#", 1)[0]
-        if path == "/index-rig.html":
+        if path == CALIBRATE_ROUTE:
+            return self._send_file(CALIBRATE_FILE, "text/html; charset=utf-8")
+        if path == "/index-rig.html" or (
+                self.server.rig_instrument_index
+                and path in ("/", "/index.html")):
             return self._send_transformed(
                 "index.html",
                 lambda raw: transform_index(raw, self.server.rig_block_sw,
                                             self.server.rig_seed_ls,
-                                            self.server.rig_pin_clock_ms),
+                                            self.server.rig_pin_clock_ms,
+                                            self.server.rig_console_beacon),
                 "text/html; charset=utf-8")
         if path == "/worker.js" and self.server.rig_doctor_first_worker:
             # Exactly the FIRST request gets the stub (threaded server: the
@@ -573,6 +758,44 @@ class RigHandler(http.server.SimpleHTTPRequestHandler):
                 lambda raw: transform_heap(raw, self.server.rig_doctor_heap_initial),
                 "text/javascript; charset=utf-8")
         return super().do_GET()
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0].split("#", 1)[0]
+        log = getattr(self.server, "rig_report_log", None)
+        if path not in REPORT_ROUTES or log is None:
+            # What BaseHTTPRequestHandler answers for a method it has no
+            # handler for, so a server without --report-log behaves as before.
+            self.send_error(501, "Unsupported method (%r)" % self.command)
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if n < 0 or n > REPORT_BODY_CAP_BYTES:
+            self.send_error(413, "rig: report body of %d bytes refused" % n)
+            return
+        raw = self.rfile.read(n) if n else b""
+        rec = report_record(path, raw, self.client_address[0],
+                            self.headers.get("User-Agent"))
+        line = json.dumps(rec, separators=(",", ":"), sort_keys=True) + "\n"
+        with self.server.rig_report_lock:
+            try:
+                log.write(line)
+                log.flush()
+            except ValueError:  # closed during shutdown
+                pass
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _send_file(self, fpath, ctype):
+        try:
+            with open(fpath, "rb") as f:
+                raw = f.read()
+        except OSError as e:
+            self.send_error(404, "rig: cannot read %s: %s" % (fpath, e))
+            return
+        self._send_bytes(raw, ctype)
 
     def _send_transformed(self, relname, transform, ctype):
         fpath = os.path.join(self.server.rig_dir, relname)
@@ -601,7 +824,9 @@ def start_server(directory=DEFAULT_DIR, port=0, host="127.0.0.1",
                  log=None, block_sw=True, instrument_worker=True, coep=False,
                  seed_local_storage=None, doctor_first_worker=False,
                  doctor_heap_initial=None,
-                 tls_cert=None, tls_key=None, pin_clock_ms=None):
+                 tls_cert=None, tls_key=None, pin_clock_ms=None,
+                 console_beacon=False, report_log=None,
+                 instrument_index=False):
     """Start serving in a daemon thread. Returns (httpd, thread).
     Stop with stop_server(httpd, thread). Port 0 picks a free port;
     read it from httpd.server_address[1]. With tls_cert+tls_key the
@@ -625,6 +850,14 @@ def start_server(directory=DEFAULT_DIR, port=0, host="127.0.0.1",
     httpd.rig_pin_clock_ms = pin_clock_ms
     httpd.rig_doctor_served = False
     httpd.rig_doctor_lock = threading.Lock()
+    httpd.rig_console_beacon = console_beacon
+    httpd.rig_instrument_index = instrument_index
+    # Line-buffered and append-only: a leg killed mid-run keeps every record
+    # that reached the server, and two legs pointed at one path interleave
+    # whole lines rather than bytes.
+    httpd.rig_report_log = (open(report_log, "a", buffering=1)
+                            if report_log else None)
+    httpd.rig_report_lock = threading.Lock()
     thread = threading.Thread(target=httpd.serve_forever,
                               name="rig-serve", daemon=True)
     thread.start()
@@ -636,6 +869,10 @@ def stop_server(httpd, thread=None):
     httpd.server_close()
     if thread is not None:
         thread.join(timeout=5)
+    log = getattr(httpd, "rig_report_log", None)
+    if log is not None:
+        with httpd.rig_report_lock:
+            log.close()
 
 
 def main(argv=None):
@@ -683,6 +920,20 @@ def main(argv=None):
                          "see the module doc for phone provisioning)")
     ap.add_argument("--tls-key", default=None, metavar="PEM",
                     help="private key for --tls-cert")
+    ap.add_argument("--report-log", default=None, metavar="PATH",
+                    help="accept POST /rig/report and /rig/console and append "
+                         "each request to PATH as one JSON line (server "
+                         "receive time and client address included). How a "
+                         "device no driver reaches -- a home-screen PWA -- "
+                         "reports to this box")
+    ap.add_argument("--console-beacon", action="store_true",
+                    help="inject a second script into /index-rig.html that "
+                         "forwards the app's memory console lines to "
+                         "/rig/console (needs --report-log)")
+    ap.add_argument("--instrument-index", action="store_true",
+                    help="also serve / and /index.html as the instrumented "
+                         "page, so a home-screen PWA (start_url ./) carries "
+                         "the prelude, the seed and the beacon")
     ap.add_argument("--tls", action="store_true",
                     help="serve https with a throwaway self-signed pair "
                          "generated via the openssl CLI (SANs: localhost, "
@@ -704,6 +955,12 @@ def main(argv=None):
         except (RuntimeError, OSError) as e:
             print("FATAL: %s" % e, file=sys.stderr)
             return 1
+
+    if args.console_beacon and not args.report_log:
+        print("FATAL: --console-beacon needs --report-log: the beacons "
+              "would have nowhere to land and every one would be a 501",
+              file=sys.stderr)
+        return 1
 
     if not os.path.isfile(os.path.join(args.dir, "index.html")):
         print("FATAL: no index.html under %s" % args.dir, file=sys.stderr)
@@ -738,7 +995,9 @@ def main(argv=None):
         seed_local_storage=seed,
         doctor_first_worker=args.doctor_first_worker,
         doctor_heap_initial=args.doctor_heap_initial,
-        tls_cert=tls_cert, tls_key=tls_key, pin_clock_ms=pin_clock_ms)
+        tls_cert=tls_cert, tls_key=tls_key, pin_clock_ms=pin_clock_ms,
+        console_beacon=args.console_beacon, report_log=args.report_log,
+        instrument_index=args.instrument_index)
     port = httpd.server_address[1]
     scheme = "https" if httpd.rig_tls else "http"
     # Exactly one machine-parseable stdout line.
