@@ -2729,6 +2729,7 @@ RIG_ERRORS_PROBE = """
 var C = window.__rig_console || [];
 var E = window.__rig_errors || [];
 var F = window.__rig_fallbacks || [];
+var L = window.__rig_ladder || [];
 var CAP = %d, BUDGET = %d;
 // Walk NEWEST first and stop at the budget, so a bound that binds drops the
 // OLDEST -- the same end the ring itself evicts from, which keeps the
@@ -2753,6 +2754,13 @@ for (var j = 0; j < C.length && fallbacks.length < 50; j++) {
   var fm = String((C[j] && C[j].msg) || "");
   if (fm.indexOf("could not instantiate with a") !== -1) fallbacks.push(C[j]);
 }
+// heap.js's ladder line, the same way and for the same reason: one line per
+// instance at boot, which the ring alone would have evicted.
+var ladder = L.slice(0, 50);
+for (var k = 0; k < C.length && ladder.length < 50; k++) {
+  var lm = String((C[k] && C[k].msg) || "");
+  if (lm.indexOf("linear memory ladder:") !== -1) ladder.push(C[k]);
+}
 return {
   present: !!window.__rig,
   errors: E.slice(-120),
@@ -2769,6 +2777,7 @@ return {
   // over in seconds, so the ring alone would read "absent" on every leg
   // longer than that.
   instantiate_fallbacks: fallbacks,
+  linear_memory_ladder: ladder,
   page_t0: (window.__rig && window.__rig.t0) || null,
   page_now: Date.now()
 };
@@ -3518,16 +3527,25 @@ return { attached: attached, different: different, off_frame: off_frame,
 # TSV names each column for the clock it came from.
 #
 # `heap max` is scraped beside `linear` for one reason: a reading that
-# approaches a ceiling is unreadable without the ceiling beside it. 1024 MiB is
-# a property of THIS build (`.github/scripts/wasm-threads.sh --max-memory`, and
-# `squallar-web/heap.js` may hand a handheld less), so the wall travels with
-# the figure that approaches it rather than living in a reader's head.
+# approaches a ceiling is unreadable without the ceiling beside it. There are
+# two: `heap max` is the budget POLICY `squallar-web/heap.js` chose per device
+# (1024 MiB on a desktop, 512/256 on a handheld) and the one every budget sheds
+# against, and `reserved` is what the ladder constructed, the one an
+# allocation dies against. Both travel with the figure that approaches them
+# rather than living in a reader's head, and they are never the same column.
 SAMPLE_PROBE = r"""
 var C = window.__rig_console || [];
 var E = window.__rig_errors || [];
+var L = window.__rig_ladder || [];
 var sample_cadence_re = /frame cadence: n=(\d+)/;
 var sample_linear_re = /budget state: .* linear (\d+)\/(\d+) MiB/;
 var sample_heap_max_re = /heap max (\d+)\/(\d+) MiB/;
+// What each memory was CONSTRUCTED with, right behind the policy above: the
+// reservation an allocation dies against, never a budget.
+var sample_reserved_re = /heap max \d+\/\d+ MiB reserved (\d+)\/(\d+) MiB/;
+// heap.js's ladder answer per instance, beside the `reserved` it must equal:
+// the page's line bare, the worker's behind the prelude's `[worker] `.
+var sample_ladder_re = /linear memory ladder: constructed (\d+) MiB/;
 var sample_admission_re = /admission asked (\d+) admitted (\d+) would refuse (\d+) refused (\d+)/;
 var sample_census_loop_re = /heap census \(([a-z0-9-]+)\): loop scans (\d+) B/;
 var sample_census_grids_re = /overlay grids (\d+) B/;
@@ -3556,16 +3574,26 @@ var row = { now: Date.now(), t0: (window.__rig && window.__rig.t0) || null,
             cadence_n: null, cadence_t: null,
             linear_page_mib: null, linear_worker_mib: null, linear_t: null,
             heap_max_page_mib: null, heap_max_worker_mib: null,
+            reserved_page_mib: null, reserved_worker_mib: null,
             asked: null, admitted: null, would_refuse: null, refused: null,
             live_page_mib: null, live_worker_mib: null,
             census_instance: null, loop_scan_b: null, overlay_grid_b: null,
             upload_pending_b: null,
             resident_total_b: null, census_linear_b: null, census_t: null,
             upload_bands: null, upload_blocking_b: null, upload_whole_b: null,
-            prep_passes: null, upload_apply_us: null };
+            prep_passes: null, upload_apply_us: null,
+            ladder_page_mib: null, ladder_worker_mib: null };
 var allocs = [];
+function sample_ladder(e) {
+  var lm = String((e && e.msg) || ""), lx = sample_ladder_re.exec(lm);
+  if (!lx) return;
+  if (lm.indexOf("[worker]") === 0) row.ladder_worker_mib = parseInt(lx[1], 10);
+  else row.ladder_page_mib = parseInt(lx[1], 10);
+}
+for (var li = 0; li < L.length; li++) sample_ladder(L[li]);
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || ""), t = C[i].t, x;
+  sample_ladder(C[i]);
   x = sample_cadence_re.exec(m);
   if (x) { row.cadence_n = parseInt(x[1], 10); row.cadence_t = t; }
   x = sample_linear_re.exec(m);
@@ -3580,6 +3608,11 @@ for (var i = 0; i < C.length; i++) {
     if (hm) {
       row.heap_max_page_mib = parseInt(hm[1], 10);
       row.heap_max_worker_mib = parseInt(hm[2], 10);
+    }
+    var rv = sample_reserved_re.exec(m);
+    if (rv) {
+      row.reserved_page_mib = parseInt(rv[1], 10);
+      row.reserved_worker_mib = parseInt(rv[2], 10);
     }
     var lv = sample_live_re.exec(m);
     if (lv) {
@@ -3630,9 +3663,9 @@ return { row: row, allocs: allocs, console_total: C.length };
 """
 
 
-# The wall rig's line scrape (M1, `--until-death`). Every line of the five
+# The wall rig's line scrape (M1, `--until-death`). Every line of the six
 # families a wall row is read from -- out of the console ring, the error ring
-# and the prelude's retained fallback copies -- handed back WHOLE and tagged
+# and the prelude's retained fallback and ladder copies -- handed back WHOLE and tagged
 # with the document's `t0`, so the host can tell one page load's lines from the
 # next one's after a reload, and so the reader that turns them into a row is
 # the same Python a beaconed log goes through (`wall_reading`). Each needle is
@@ -3642,19 +3675,22 @@ WALL_LINES_PROBE = r"""
 var C = window.__rig_console || [];
 var E = window.__rig_errors || [];
 var F = window.__rig_fallbacks || [];
+var L = window.__rig_ladder || [];
 var lines = [];
 function keep(e) {
   var m = String((e && e.msg) || "");
   if (m.indexOf("budget state:") >= 0 || m.indexOf("heap census (") >= 0
       || m.indexOf("alloc failed:") >= 0
       || m.indexOf("could not instantiate with a") >= 0
-      || m.indexOf("budget pressure:") >= 0) {
+      || m.indexOf("budget pressure:") >= 0
+      || m.indexOf("linear memory ladder:") >= 0) {
     lines.push({ t: e.t, lvl: e.lvl || e.kind || null, msg: m });
   }
 }
 for (var i = 0; i < C.length; i++) keep(C[i]);
 for (var j = 0; j < E.length; j++) keep(E[j]);
 for (var k = 0; k < F.length; k++) keep(F[k]);
+for (var q = 0; q < L.length; q++) keep(L[q]);
 return { lines: lines, t0: (window.__rig && window.__rig.t0) || null,
          now: Date.now() };
 """
@@ -4932,6 +4968,99 @@ def instantiate_fallback_verdict(lines):
     return out
 
 
+# The line `squallar-web/heap.js` prints ONCE per instance when its linear
+# memory ladder constructed a rung -- `squallar: linear memory ladder:
+# constructed N MiB after refusing [a, b]`, every figure in MiB. Printed by the
+# page, and relayed from the rasterization worker with the prelude's
+# `[worker] ` prefix in front (serve.py's worker prelude relays this one info
+# line and no other).
+LADDER_NEEDLE = "linear memory ladder:"
+_LADDER_LINE_RE = re.compile(
+    r"linear memory ladder: constructed (\d+) MiB after refusing \[([0-9, ]*)\]")
+
+
+def linear_memory_ladder_reading(lines):
+    """The LAST ladder line of each instance -- a respawned worker prints its
+    own -- as `{t, constructed_mib, refused_mib}`, with how many lines each
+    instance printed. Pure: {t, msg} lines in, one dict out."""
+    out = {"page": None, "worker": None, "page_lines": 0, "worker_lines": 0}
+    for line in lines or []:
+        msg = str((line or {}).get("msg", ""))
+        m = _LADDER_LINE_RE.search(msg)
+        if not m:
+            continue
+        who = "worker" if msg.startswith("[worker]") else "page"
+        out[who] = {"t": (line or {}).get("t"),
+                    "constructed_mib": int(m.group(1)),
+                    "refused_mib": [int(x) for x in m.group(2).split(",")
+                                    if x.strip()]}
+        out[who + "_lines"] += 1
+    return out
+
+
+def linear_memory_ladder_verdict(lines, reserved_page_mib, reserved_worker_mib):
+    """**Each instance's ladder answer is the ceiling the app judges it
+    against.** A DEFAULT assertion on every app leg, not an opt-in.
+
+    Named apart from `ladder_verdict`, which is the CALIBRATE page's (the
+    rungs a bare page constructs, held against what this build would ask).
+    This one reads what the page and the worker DID construct, off heap.js's
+    own lines, and holds each to the `reserved page/worker` the app prints on
+    its last `budget state:` line -- the value plumbed through `entry::start`
+    and the worker's hello, and the wall the allocation-failure line names.
+    The two are one fact read at two ends; a difference is a plumbing defect.
+
+    **Never to `heap max`.** That field is the budget POLICY the page chose
+    per device (1024 MiB on a desktop, 512/256 on a handheld), which every
+    watermark, allowance and door judges the heap against and which is never
+    what was constructed. Held to it, this verdict would fail every desktop at
+    4096 against 1024 -- or pass a build that had started sizing its budgets
+    from the reservation, which is the regression the split exists to
+    prevent.
+
+    **An absent line fails.** An instance that printed none either took
+    heap.js's fallback (`instantiate_fallback_verdict` says so) or is running
+    a heap.js that walks no ladder -- a build from before the ladder reads red
+    here, on purpose -- and either way nobody knows what wall it has.
+
+    Pure: {t, msg} lines and the two MiB figures in, one dict out."""
+    reading = linear_memory_ladder_reading(lines)
+    page, worker = reading["page"], reading["worker"]
+    out = {"ok": False,
+           "page_mib": None if page is None else page["constructed_mib"],
+           "worker_mib": None if worker is None else worker["constructed_mib"],
+           "page_refused_mib": None if page is None else page["refused_mib"],
+           "worker_refused_mib": (None if worker is None
+                                  else worker["refused_mib"]),
+           "page_lines": reading["page_lines"],
+           "worker_lines": reading["worker_lines"],
+           "reserved_page_mib": reserved_page_mib,
+           "reserved_worker_mib": reserved_worker_mib}
+    errors = []
+    if page is None:
+        errors.append("the page printed no `%s` line" % LADDER_NEEDLE)
+    if worker is None:
+        errors.append("the rasterization worker printed no `%s` line"
+                      % LADDER_NEEDLE)
+    if reserved_page_mib is None or reserved_worker_mib is None:
+        errors.append("no `budget state:` line carried `reserved`, so no "
+                      "ladder answer could be held against what the app was told")
+    else:
+        if page is not None and page["constructed_mib"] != reserved_page_mib:
+            errors.append("the page's ladder constructed %d MiB and the app "
+                          "reports the page's reservation as %d MiB"
+                          % (page["constructed_mib"], reserved_page_mib))
+        if (worker is not None
+                and worker["constructed_mib"] != reserved_worker_mib):
+            errors.append("the worker's ladder constructed %d MiB and the app "
+                          "reports the worker's reservation as %d MiB"
+                          % (worker["constructed_mib"], reserved_worker_mib))
+    out["ok"] = not errors
+    if errors:
+        out["error"] = "; ".join(errors) + " -- see squallar-web/heap.js"
+    return out
+
+
 def _alloc_instance(msg):
     """The instance word off an `alloc failed:` line -- `page`, `raster
     worker`, `tile lane` -- or `?` where the line does not carry one. The page
@@ -4965,13 +5094,14 @@ class CensusSampler:
                "linear_page_mib", "linear_page_ceiling_mib",
                "live_page_mib", "live_worker_mib",
                "linear_worker_mib", "linear_worker_ceiling_mib",
+               "linear_page_reserved_mib", "linear_worker_reserved_mib",
                "overlay_grids_b", "loop_scans_b", "upload_pending_b",
                "resident_total_b",
                "census_linear_b", "census_instance",
                "upload_bands", "upload_blocking_b", "upload_whole_b",
                "prep_passes", "upload_apply_us",
                "asked", "admitted", "would_refuse", "refused",
-               "alloc_failed_total")
+               "alloc_failed_total", "ladder_page_mib", "ladder_worker_mib")
 
     def __init__(self, session, path, interval, wall=False):
         self.session = session
@@ -5181,6 +5311,8 @@ def census_row(r, t_host_iso, leg_s, loadavg1, alloc_failed_total):
         "linear_page_ceiling_mib": r.get("heap_max_page_mib"),
         "linear_worker_mib": r.get("linear_worker_mib"),
         "linear_worker_ceiling_mib": r.get("heap_max_worker_mib"),
+        "linear_page_reserved_mib": r.get("reserved_page_mib"),
+        "linear_worker_reserved_mib": r.get("reserved_worker_mib"),
         "live_page_mib": r.get("live_page_mib"),
         "live_worker_mib": r.get("live_worker_mib"),
         "overlay_grids_b": r.get("overlay_grid_b"),
@@ -5199,6 +5331,8 @@ def census_row(r, t_host_iso, leg_s, loadavg1, alloc_failed_total):
         "would_refuse": r.get("would_refuse"),
         "refused": r.get("refused"),
         "alloc_failed_total": alloc_failed_total,
+        "ladder_page_mib": r.get("ladder_page_mib"),
+        "ladder_worker_mib": r.get("ladder_worker_mib"),
     }
 
 
@@ -5221,12 +5355,13 @@ def sample_row_from_lines(lines, patterns=None):
     P = patterns or sample_probe_patterns()
     row = dict.fromkeys((
         "cadence_n", "cadence_t", "linear_page_mib", "linear_worker_mib",
-        "linear_t", "heap_max_page_mib", "heap_max_worker_mib", "asked",
+        "linear_t", "heap_max_page_mib", "heap_max_worker_mib",
+        "reserved_page_mib", "reserved_worker_mib", "asked",
         "admitted", "would_refuse", "refused", "live_page_mib",
         "live_worker_mib", "census_instance", "loop_scan_b", "overlay_grid_b",
         "upload_pending_b", "resident_total_b", "census_linear_b", "census_t",
         "upload_bands", "upload_blocking_b", "upload_whole_b", "prep_passes",
-        "upload_apply_us"))
+        "upload_apply_us", "ladder_page_mib", "ladder_worker_mib"))
     allocs = []
     for e in lines:
         m, t = str((e or {}).get("msg") or ""), (e or {}).get("t")
@@ -5242,6 +5377,10 @@ def sample_row_from_lines(lines, patterns=None):
             if hm:
                 row["heap_max_page_mib"] = int(hm.group(1))
                 row["heap_max_worker_mib"] = int(hm.group(2))
+            rv = P["sample_reserved_re"].search(m)
+            if rv:
+                row["reserved_page_mib"] = int(rv.group(1))
+                row["reserved_worker_mib"] = int(rv.group(2))
             lv = P["sample_live_re"].search(m)
             if lv:
                 row["live_page_mib"] = int(lv.group(1))
@@ -5274,15 +5413,20 @@ def sample_row_from_lines(lines, patterns=None):
         if x:
             row["prep_passes"] = int(x.group(1))
             row["upload_apply_us"] = int(x.group(3))
+        x = P["sample_ladder_re"].search(m)
+        if x:
+            row["ladder_worker_mib" if m.startswith("[worker]")
+                else "ladder_page_mib"] = int(x.group(1))
         if "alloc failed:" in m:
             allocs.append({"t": t, "msg": m})
     return row, allocs
 
 
-# The five families a wall row is read from. Each is an `indexOf` literal in
+# The six families a wall row is read from. Each is an `indexOf` literal in
 # WALL_LINES_PROBE; the selftest holds the two spellings together.
 WALL_LINE_NEEDLES = ("budget state:", "heap census (", "alloc failed:",
-                     INSTANTIATE_FALLBACK_NEEDLE, "budget pressure:")
+                     INSTANTIATE_FALLBACK_NEEDLE, "budget pressure:",
+                     LADDER_NEEDLE)
 
 
 def is_wall_line(msg):
@@ -5318,8 +5462,10 @@ def census_families(msg):
 # The columns a wall row prints and a route comparison checks, in order.
 WALL_ROW_COLUMNS = (
     "booted", "ticks", "page_hw_mib", "worker_hw_mib", "sum_hw_mib",
-    "page_ceiling_mib", "worker_ceiling_mib", "census_last_resident_b",
-    "alloc_failures", "instantiate_fallbacks", "budget_pressure_events",
+    "page_ceiling_mib", "worker_ceiling_mib", "reserved_page_mib",
+    "reserved_worker_mib", "census_last_resident_b",
+    "alloc_failures", "instantiate_fallbacks", "ladder_page_mib",
+    "ladder_worker_mib", "budget_pressure_events",
     "deaths", "ladder_largest_mib", "wall_mib", "residue_mib")
 
 
@@ -5379,6 +5525,7 @@ def wall_reading(lines, deaths=None, calibrate=None):
         s = {"lines": len(ls), "ticks": 0, "page_hw_mib": None,
              "worker_hw_mib": None, "sum_hw_mib": None,
              "page_ceiling_mib": None, "worker_ceiling_mib": None,
+             "page_reserved_mib": None, "worker_reserved_mib": None,
              "census_last": None, "budget_pressure_events": 0}
         for e in ls:
             m = str(e.get("msg") or "")
@@ -5393,6 +5540,10 @@ def wall_reading(lines, deaths=None, calibrate=None):
                 if hm:
                     s["page_ceiling_mib"] = int(hm.group(1))
                     s["worker_ceiling_mib"] = int(hm.group(2))
+                rv = P["sample_reserved_re"].search(m)
+                if rv:
+                    s["page_reserved_mib"] = int(rv.group(1))
+                    s["worker_reserved_mib"] = int(rv.group(2))
             if "heap census (page)" in m:
                 _instance, fams = census_families(m)
                 s["census_last"] = {"t": e.get("t"), "families": fams}
@@ -5407,6 +5558,8 @@ def wall_reading(lines, deaths=None, calibrate=None):
     alloc = alloc_failure_verdict(allocs)
     hook_page, _hook_ceiling = alloc_line_page_levels(allocs)
     fallbacks = instantiate_fallback_verdict(first)
+    ladder = linear_memory_ladder_verdict(first, s["page_reserved_mib"],
+                                          s["worker_reserved_mib"])
     page_hw = max([v for v in (s["page_hw_mib"], hook_page) if v is not None],
                   default=None)
     wall_mib, largest, ladder_ok, why_no_wall = _wall_calibrate_terms(calibrate)
@@ -5429,6 +5582,8 @@ def wall_reading(lines, deaths=None, calibrate=None):
         "sum_hw_mib": s["sum_hw_mib"],
         "page_ceiling_mib": s["page_ceiling_mib"],
         "worker_ceiling_mib": s["worker_ceiling_mib"],
+        "reserved_page_mib": s["page_reserved_mib"],
+        "reserved_worker_mib": s["worker_reserved_mib"],
         "census_last": census,
         "census_last_resident_b": ((census or {}).get("families") or {}).get(
             "resident total"),
@@ -5438,6 +5593,12 @@ def wall_reading(lines, deaths=None, calibrate=None):
         "instantiate_fallbacks": fallbacks["count"],
         "instantiate_fallback_page": fallbacks["page_count"],
         "instantiate_fallback_worker": fallbacks["worker_count"],
+        "ladder_page_mib": ladder["page_mib"],
+        "ladder_worker_mib": ladder["worker_mib"],
+        "ladder_page_refused_mib": ladder["page_refused_mib"],
+        "ladder_worker_refused_mib": ladder["worker_refused_mib"],
+        "linear_memory_ladder_ok": ladder["ok"],
+        "linear_memory_ladder_error": ladder.get("error"),
         "budget_pressure_events": s["budget_pressure_events"],
         "deaths": None if deaths is None else len(deaths),
         "death_kinds": (None if deaths is None
@@ -5461,7 +5622,13 @@ def wall_reading(lines, deaths=None, calibrate=None):
                              "`budget state:` tick (MiB)",
             "sum_hw_mib": "the highest page+worker `linear` pair on ONE tick, "
                           "never the page peak plus the worker peak (MiB)",
-            "ceilings": "`heap max a/b` on the last tick (MiB)",
+            "ceilings": "`heap max a/b` on the last tick (MiB): the budget "
+                        "policy each heap is judged against",
+            "reserved": "`reserved a/b` on the last tick (MiB): what each "
+                        "memory was constructed with, never a budget",
+            "ladder": "the last `linear memory ladder:` line of each instance "
+                      "in the window (heap.js's constructed rung, MiB), held "
+                      "equal to `reserved`, never to the policy ceilings",
             "census_last": "the last `heap census (page)` line of the window",
             "wall_mib": "MiB of incompressible, touched linear memory the "
                         "calibrate leg on the same device and browser "
@@ -5632,6 +5799,9 @@ def ladder_verdict(ladder, ask):
     if not ladder:
         out["why"] = ("no ladder was read: the run died before it, or the "
                       "record carries none")
+    elif ask.get("page_mib") is None and ask.get("rungs_mib"):
+        out["why"] = ("no rung of this build's ladder %s MiB constructed on "
+                      "this engine" % (ask.get("rungs_mib"),))
     elif ask.get("page_mib") is None:
         out["why"] = ("the app's ask is unknown (heap.js could not be read), so "
                       "no rung was held against it")
@@ -11440,6 +11610,88 @@ def selftest_instantiate_fallback():
     return failed
 
 
+def selftest_linear_memory_ladder():
+    """Executable pins on `linear_memory_ladder_verdict` and on the ladder's
+    path into every reader: both instances, the respawn, both failure arms
+    (absent line, a figure that is not the app's), the wall row, the sampler's
+    Python row, and the probe spellings. Returns the number of failed pins."""
+    failed = 0
+
+    def pin(name, ok):
+        nonlocal failed
+        print("[self-test] %s %s" % ("ok  " if ok else "FAIL", name))
+        if not ok:
+            failed += 1
+
+    page = {"t": 1, "msg": "squallar: linear memory ladder: constructed 4096 "
+                           "MiB after refusing []"}
+    worker = {"t": 2, "msg": "[worker] squallar: linear memory ladder: "
+                             "constructed 2048 MiB after refusing [4096]"}
+    v = linear_memory_ladder_verdict([page, worker], 4096, 2048)
+    pin("both answers equal to heap max pass, refusals read",
+        v["ok"] and v["page_mib"] == 4096 and v["worker_mib"] == 2048
+        and v["page_refused_mib"] == [] and v["worker_refused_mib"] == [4096]
+        and "error" not in v)
+    v = linear_memory_ladder_verdict([page], 4096, 2048)
+    pin("an absent worker line fails and is named",
+        not v["ok"] and "worker printed no" in v.get("error", ""))
+    v = linear_memory_ladder_verdict([], 1024, 1024)
+    pin("a build that prints no ladder line fails",
+        not v["ok"] and "page printed no" in v.get("error", ""))
+    v = linear_memory_ladder_verdict([page, worker], 4096, 4096)
+    pin("a worker answer that is not the app's worker reservation fails",
+        not v["ok"] and "worker's ladder constructed 2048" in v.get("error", ""))
+    v = linear_memory_ladder_verdict([page, worker], None, None)
+    pin("no `reserved` to hold the answers against fails", not v["ok"])
+    v = linear_memory_ladder_verdict([page, worker], 1024, 256)
+    pin("the budget POLICY is not the reservation: answers held to it fail",
+        not v["ok"] and "page's ladder constructed 4096" in v.get("error", ""))
+    respawn = {"t": 3, "msg": "[worker] squallar: linear memory ladder: "
+                              "constructed 4096 MiB after refusing []"}
+    v = linear_memory_ladder_verdict([page, worker, respawn], 4096, 4096)
+    pin("the LAST worker line is the live worker's",
+        v["ok"] and v["worker_lines"] == 2 and v["worker_mib"] == 4096)
+    pin("a line that only mentions the ladder is not a reading",
+        linear_memory_ladder_reading(
+            [{"t": 1, "msg": "linear memory ladder: pending"}])["page"] is None)
+
+    budget_line = (
+        "budget state: bracket wasm32, rung 1, steps 0, pool 64 MiB, ceiling "
+        "288 MiB, vram 0 MiB, ram 0 MiB, declared 0 MiB, threads 8, form 2, "
+        "linear 100/50 MiB, cap 288 0, probe 3, balloon 0 MiB, page heap acts "
+        "0 at 0 MiB, heap max 1024/256 MiB reserved 4096/2048 MiB, host "
+        "steps 0 promotions 0 churn "
+        "0, admission asked 1 admitted 1 would refuse 0 refused 0, notices "
+        "raised 0 live 0 reoffered 0, live 91/41 MiB")
+    w = wall_reading([dict(page, load=1), dict(worker, load=1),
+                      {"t": 5, "msg": budget_line, "load": 1}])
+    pin("the wall row carries both answers and holds them to `reserved`, "
+        "with the policy beside them untouched",
+        w["ladder_page_mib"] == 4096 and w["ladder_worker_mib"] == 2048
+        and w["linear_memory_ladder_ok"] is True
+        and w["reserved_page_mib"] == 4096 and w["reserved_worker_mib"] == 2048
+        and w["page_ceiling_mib"] == 1024 and w["worker_ceiling_mib"] == 256
+        and {"reserved_page_mib", "reserved_worker_mib"} <= set(WALL_ROW_COLUMNS)
+        and {"ladder_page_mib", "ladder_worker_mib"} <= set(WALL_ROW_COLUMNS))
+    row, _allocs = sample_row_from_lines(
+        [page, worker, {"t": 5, "msg": budget_line}])
+    pin("the sampler's Python row reads both answers into TSV columns",
+        row["ladder_page_mib"] == 4096 and row["ladder_worker_mib"] == 2048
+        and row["reserved_page_mib"] == 4096
+        and row["heap_max_page_mib"] == 1024
+        and census_row(row, None, None, None, 0)["linear_page_reserved_mib"] == 4096
+        and {"ladder_page_mib", "ladder_worker_mib"}
+        <= set(CensusSampler.COLUMNS))
+    pin("the needle is a wall family and an indexOf literal in both scrapes",
+        LADDER_NEEDLE in WALL_LINE_NEEDLES
+        and 'indexOf("linear memory ladder:")' in WALL_LINES_PROBE
+        and 'indexOf("linear memory ladder:")' in RIG_ERRORS_PROBE)
+    pin("every scrape reads the list serve.py's prelude retains",
+        all("window.__rig_ladder" in p
+            for p in (RIG_ERRORS_PROBE, WALL_LINES_PROBE, SAMPLE_PROBE)))
+    return failed
+
+
 def selftest_shell_cache():
     """Executable pins on `shell_cache_verdict`, the second half of
     `--expect-service-worker`: both arms and the unread case. Returns the
@@ -11643,7 +11895,7 @@ def selftest_wall_rig():
     pin("wall lines are tagged with their document and kept once",
         len(s.wall_line_list()) == 1 and s.wall_line_list()[0]["load"] == 1)
     pin("the TSV's columns are unchanged by the wall rig",
-        "t0" not in CensusSampler.COLUMNS and len(CensusSampler.COLUMNS) == 28)
+        "t0" not in CensusSampler.COLUMNS and len(CensusSampler.COLUMNS) == 32)
     pin("page_death_kind reads a crash and not a script error",
         page_death_kind(str(crash)) == "crash"
         and page_death_kind(str(busy)) is None)
@@ -11723,6 +11975,8 @@ def selftest():
                         "(see [self-test] lines)")
     if selftest_instantiate_fallback():
         failures.append("instantiate-fallback verdict (see [self-test] lines)")
+    if selftest_linear_memory_ladder():
+        failures.append("linear-memory-ladder verdict (see [self-test] lines)")
     if selftest_shell_cache():
         failures.append("shell-cache verdict (see [self-test] lines)")
     if selftest_page_clock():
@@ -12948,16 +13202,23 @@ def run_smoke(args):
                 # refusing instance whether or not it is alive. Taking the max
                 # is what stops the assert passing at 940 while the hook says
                 # 1023. See `alloc_line_page_levels`.
+                #
+                # The CEILING is the sampled `heap max` alone. The hook's
+                # `of N MiB` has named the instance's RESERVATION since the
+                # budget policy split from it, and a reservation standing in
+                # for the policy would pass a page 3 GiB past the ceiling its
+                # budgets shed against. The hook's figure rides beside the
+                # verdict, labelled, and decides nothing.
                 a_peak, a_ceiling = alloc_line_page_levels(allocs)
                 s_peak, s_ceiling = (sampler.peak_page_mib(),
                                      sampler.page_ceiling_mib())
                 peak = max([v for v in (s_peak, a_peak) if v is not None],
                            default=None)
-                ceiling = s_ceiling if s_ceiling is not None else a_ceiling
                 result["linear_headroom"] = linear_headroom_verdict(
-                    peak, ceiling, args.expect_linear_headroom)
+                    peak, s_ceiling, args.expect_linear_headroom)
                 result["linear_headroom"]["peak_sampled_mib"] = s_peak
                 result["linear_headroom"]["peak_alloc_hook_mib"] = a_peak
+                result["linear_headroom"]["reserved_alloc_hook_mib"] = a_ceiling
             stage("linear-headroom", **{k: v for k, v
                                         in result["linear_headroom"].items()
                                         if k != "error"})
@@ -12976,6 +13237,32 @@ def run_smoke(args):
         stage("instantiate-fallback", **{k: v for k, v
                                          in result["instantiate_fallback"].items()
                                          if k != "error"})
+        # EVERY LEG, no flag: each instance's `linear memory ladder:` line,
+        # held to the `reserved page/worker` on the app's LAST `budget state:`
+        # line -- what was constructed, never the `heap max` policy. Retained copies plus the ring, de-duplicated on (t, msg) as
+        # the fallback lines are.
+        seen_ld, budget_seen = {}, {}
+        for family in ("linear_memory_ladder", "console", "console_tail"):
+            for e in (sig.get(family) or []):
+                msg = str((e or {}).get("msg", ""))
+                if LADDER_NEEDLE in msg:
+                    seen_ld[(e.get("t"), msg)] = {"t": e.get("t"), "msg": msg}
+                if "budget state:" in msg:
+                    budget_seen[(e.get("t") or 0, msg)] = msg
+        reserved_pair = (None, None)
+        reserved_re = sample_probe_patterns()["sample_reserved_re"]
+        for key in sorted(budget_seen, reverse=True):
+            rv_ = reserved_re.search(budget_seen[key])
+            if rv_:
+                reserved_pair = (int(rv_.group(1)), int(rv_.group(2)))
+                break
+        result["linear_memory_ladder"] = linear_memory_ladder_verdict(
+            [seen_ld[k] for k in sorted(seen_ld, key=lambda k: (k[0] or 0, k[1]))],
+            reserved_pair[0], reserved_pair[1])
+        stage("linear-memory-ladder", **{k: v for k, v
+                                         in result["linear_memory_ladder"].items()
+                                         if k != "error"})
+        lad_ok = bool(result["linear_memory_ladder"]["ok"])
         ifb_ok = bool(result["instantiate_fallback"]["ok"])
         af_ok = (result.get("alloc_failures") is None
                  or bool(result["alloc_failures"]["ok"]))
@@ -13016,7 +13303,7 @@ def run_smoke(args):
         result["pass"] = (booted and canvas_ok and raf_ok
                           and canvas_blank is not True and not panics
                           and not traps and fp_ok and tcs_ok and lor_ok
-                          and af_ok and lh_ok and ifb_ok
+                          and af_ok and lh_ok and ifb_ok and lad_ok
                           and worker_ok and ifr_ok and cwaits_ok
                           and sw_ok is not False and coi_ok is not False
                           and cv_ok is not False
@@ -13058,6 +13345,13 @@ def run_smoke(args):
             # module's declared bound. Never None -- there is no flag.
             "instantiate_fallback_ok": ifb_ok,
             "instantiate_fallback_count": result["instantiate_fallback"]["count"],
+            # Default, every leg: each instance printed its ladder answer, and
+            # it is the ceiling the app judges that instance against.
+            "linear_memory_ladder_ok": lad_ok,
+            "linear_memory_ladder_page_mib":
+                result["linear_memory_ladder"]["page_mib"],
+            "linear_memory_ladder_worker_mib":
+                result["linear_memory_ladder"]["worker_mib"],
             "linear_headroom_ok": (None if result.get("linear_headroom") is None
                                    else bool(result["linear_headroom"]["ok"])),
             "peak_linear_page_mib": (result.get("linear_headroom") or {}).get(
@@ -13108,7 +13402,7 @@ def run_smoke(args):
             sig_ = result.get("rig_signal")
             if isinstance(sig_, dict):
                 for fam in ("console", "console_tail", "errors",
-                            "instantiate_fallbacks"):
+                            "instantiate_fallbacks", "linear_memory_ladder"):
                     for e_ in sig_.get(fam) or []:
                         if is_wall_line((e_ or {}).get("msg")):
                             wall_lines.append({

@@ -322,9 +322,17 @@ PAGE_PRELUDE = b"""<script>/* squallar rig prelude (injected by serve.py, repo u
   // not distinguish from an eviction. Page lines and relayed worker lines
   // both land here; bounded because a runaway would print it per boot only.
   var F = (window.__rig_fallbacks = []);
+  // heap.js's ladder line, retained for F's reason: one line per instance at
+  // boot, and drive.py asserts its PRESENCE and holds its figure to the
+  // app's own `reserved`. Page lines and relayed worker lines both land here.
+  var L = (window.__rig_ladder = []);
   function retain(t, m) {
-    if (m.indexOf("could not instantiate with a") < 0) return;
-    try { if (F.length < 50) F.push({ t: t, msg: m }); } catch (_) {}
+    if (m.indexOf("could not instantiate with a") >= 0) {
+      try { if (F.length < 50) F.push({ t: t, msg: m }); } catch (_) {}
+    }
+    if (m.indexOf("linear memory ladder:") >= 0) {
+      try { if (L.length < 50) L.push({ t: t, msg: m }); } catch (_) {}
+    }
   }
   window.__rig = { t0: Date.now(), block_sw: __RIG_BLOCK_SW__ };
   var seed = __RIG_SEED_LS__;
@@ -472,6 +480,20 @@ try {
         catch (_) { s = "<unformattable>"; }
         if (lvl === "error") send({ t: Date.now(), kind: "worker.console.error", msg: s });
         else send({ t: Date.now(), lvl: "warn", msg: "[worker] " + s });
+        if (orig) return orig.apply(null, arguments);
+      };
+    });
+    // ONE info line crosses: heap.js's ladder line, which the worker prints
+    // at `info` once at boot. Every other worker info line stays local, and
+    // the first argument is tested before anything is formatted, so the
+    // worker's ordinary logging pays one indexOf.
+    ["info", "log"].forEach(function (lvl) {
+      var orig = console[lvl] ? console[lvl].bind(console) : null;
+      console[lvl] = function () {
+        var first = arguments.length ? arguments[0] : "";
+        if (typeof first === "string" && first.indexOf("linear memory ladder:") >= 0) {
+          send({ t: Date.now(), lvl: "info", msg: "[worker] " + first.slice(0, 2000) });
+        }
         if (orig) return orig.apply(null, arguments);
       };
     });

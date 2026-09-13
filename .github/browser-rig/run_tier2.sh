@@ -1241,6 +1241,66 @@ if [ ! -f "$WEB_DIR/pkg/squallar_web_bg.wasm" ]; then
   exit 1
 fi
 
+# THE BUILT MODULE'S MEMORY MAXIMUM, read off its bytes and its glue. The link
+# flag is wasm32's architectural 65,536 pages (`wasm-threads.sh`, held there by
+# `linear_memory_ceiling.rs`), and heap.js's ladder starts at it: a module that
+# came out of wasm-bindgen or wasm-opt declaring less would refuse every rung
+# above its declaration with a LinkError, and every instance would walk down to
+# it without a single leg failing. So the artefact itself is read, both halves.
+"$PY" - "$WEB_DIR/pkg/squallar_web_bg.wasm" "$WEB_DIR/pkg/squallar_web.js" <<'MODULE_LIMITS' || exit 1
+import re, sys
+wasm, glue = open(sys.argv[1], "rb").read(), open(sys.argv[2]).read()
+def leb(at):
+    value = shift = 0
+    while True:
+        b = wasm[at]
+        at += 1
+        value |= (b & 0x7f) << shift
+        shift += 7
+        if not b & 0x80:
+            return value, at
+declared, at = None, 8
+while at < len(wasm) and declared is None:
+    sid = wasm[at]
+    size, body = leb(at + 1)
+    at = body + size
+    if sid != 2:
+        continue
+    count, p = leb(body)
+    for _ in range(count):
+        n, p = leb(p)
+        p += n
+        n, p = leb(p)
+        p += n
+        kind = wasm[p]
+        p += 1
+        if kind == 0:
+            _, p = leb(p)
+        elif kind == 1:
+            flags = wasm[p + 1]
+            _, p = leb(p + 2)
+            if flags & 1:
+                _, p = leb(p)
+        elif kind == 2:
+            flags = wasm[p]
+            _, p = leb(p + 1)
+            declared = leb(p)[0] if flags & 1 else None
+            break
+        elif kind == 3:
+            p += 2
+        elif kind == 4:
+            _, p = leb(p + 1)
+        else:
+            sys.exit("FATAL: unreadable import kind %d in %s" % (kind, sys.argv[1]))
+glue_max = [int(m) for m in re.findall(
+    r"new WebAssembly\.Memory\(\{initial:\d+,maximum:(\d+),shared:true\}\)", glue)]
+print("built module memory maximum: module %s pages, glue %s" % (declared, glue_max))
+if declared != 65536 or glue_max != [65536]:
+    sys.exit("FATAL: the built module does not declare the 65,536-page maximum the link "
+             "flag states (module %r, glue %r); heap.js's ladder would be walled below it"
+             % (declared, glue_max))
+MODULE_LIMITS
+
 # ---------------------------------------------------------------- icons ----
 # The served tree carries the rendered icons, the way the deploy does
 # (`build.yaml`: `cargo run -q -p squallar-icon -- --web dist/icons`). A
