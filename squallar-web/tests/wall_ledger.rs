@@ -108,13 +108,13 @@ fn ledger_defects(text: &str, evidence: &dyn Fn(&str) -> Option<serde_json::Valu
             defects.push(format!("line {n}: leg_id {leg} appears twice"));
         }
         let key = (class.to_string(), browser.to_string(), scene.to_string());
-        if let Some((prev_page, prev_worker, prev_line)) = last.get(&key) {
-            if page > *prev_page || worker > *prev_worker {
-                defects.push(format!(
-                    "line {n}: {class}/{browser}/{scene} ceilings rose to {page}/{worker} MiB \
-                     from {prev_page}/{prev_worker} on line {prev_line}; ceilings may only fall"
-                ));
-            }
+        if let Some((prev_page, prev_worker, prev_line)) = last.get(&key)
+            && (page > *prev_page || worker > *prev_worker)
+        {
+            defects.push(format!(
+                "line {n}: {class}/{browser}/{scene} ceilings rose to {page}/{worker} MiB \
+                 from {prev_page}/{prev_worker} on line {prev_line}; ceilings may only fall"
+            ));
         }
         last.insert(key, (page, worker, n));
         match evidence(leg) {
