@@ -1,0 +1,548 @@
+{
+  "alloc_instances": [
+    "page",
+    "raster worker"
+  ],
+  "app_build": "b92a784f7",
+  "arm": "hardware",
+  "beaconed_route_agrees": true,
+  "beaconed_route_differs": [],
+  "browser": "safari",
+  "browser_version": "26.6.1",
+  "calibrate": {
+    "ask": {
+      "error": null,
+      "form": "handheld",
+      "page_mib": 512,
+      "signals": {
+        "anyPointerFine": false,
+        "deviceMemoryBytes": null,
+        "maxTouchPoints": 5,
+        "pointerCoarse": true
+      },
+      "worker_mib": 256
+    },
+    "doctored": [],
+    "ended_by": "death",
+    "ladder_largest_mib": 4096,
+    "ladder_ok": true,
+    "ok": true,
+    "routes_agree": null,
+    "simulated": false,
+    "survived_mib": 2304
+  },
+  "calibrate_join_rule": "the joined run (`calibrate`, `wall_mib`) is the one with the LOWEST survived MiB among runs that ended by death, refusal or cap and were not doctored",
+  "calibrate_runs": [
+    {
+      "ask": {
+        "error": null,
+        "form": "handheld",
+        "page_mib": 512,
+        "signals": {
+          "anyPointerFine": false,
+          "deviceMemoryBytes": null,
+          "maxTouchPoints": 5,
+          "pointerCoarse": true
+        },
+        "worker_mib": 256
+      },
+      "browser_version": "26.6.1",
+      "coi": true,
+      "deaths": [
+        "crash"
+      ],
+      "device_signals": {
+        "device_memory": null,
+        "device_memory_present": false,
+        "device_pixel_ratio": 3,
+        "hardware_concurrency": 4,
+        "max_touch_points": 5,
+        "measure_user_agent_specific_memory_present": false,
+        "platform": "iPhone",
+        "recorded_by": "the page's own calibrate record, load mtz5bn96-huy6wqt7, received 2026-09-13T01:39:15Z",
+        "screen_avail_height": 844,
+        "screen_avail_width": 390,
+        "screen_height": 844,
+        "screen_width": 390,
+        "standalone": false,
+        "ua_os_version": "18.7",
+        "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6.1 Mobile/15E148 Safari/604.1"
+      },
+      "ended_by": "death",
+      "errors": [],
+      "json": "/home/reddragon/.cache/lane-m1-wall-rig-out/iphone/cal1/safari.calibrate.json",
+      "ladder": [
+        {
+          "error": null,
+          "mib": 4096,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 2048,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 1024,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 512,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 256,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 128,
+          "ok": true
+        }
+      ],
+      "ladder_largest_mib": 4096,
+      "ladder_ok": true,
+      "notes": [
+        "only the /rig/report route answered"
+      ],
+      "ok": true,
+      "route_localstorage": null,
+      "route_report": {
+        "at_maximum": null,
+        "attempting_mib": 2336,
+        "attempting_rung_mib": null,
+        "ended_by": "death",
+        "error": null,
+        "memory_maximum_mib": 4096,
+        "phase_at_end": "growing",
+        "steps": 79,
+        "survived_mib": 2304
+      },
+      "routes_agree": null,
+      "run": "wall-20260913T013911Z-1173215-20150",
+      "survived_mib": 2304,
+      "total_s": 29.38
+    },
+    {
+      "ask": {
+        "error": null,
+        "form": "handheld",
+        "page_mib": 512,
+        "signals": {
+          "anyPointerFine": false,
+          "deviceMemoryBytes": null,
+          "maxTouchPoints": 5,
+          "pointerCoarse": true
+        },
+        "worker_mib": 256
+      },
+      "browser_version": "26.6.1",
+      "coi": true,
+      "deaths": [
+        "crash"
+      ],
+      "device_signals": {
+        "device_memory": null,
+        "device_memory_present": false,
+        "device_pixel_ratio": 3,
+        "hardware_concurrency": 4,
+        "max_touch_points": 5,
+        "measure_user_agent_specific_memory_present": false,
+        "platform": "iPhone",
+        "recorded_by": "the page's own calibrate record, load mtz5far8-vk3at9dg, received 2026-09-13T01:42:05Z",
+        "screen_avail_height": 844,
+        "screen_avail_width": 390,
+        "screen_height": 844,
+        "screen_width": 390,
+        "standalone": false,
+        "ua_os_version": "18.7",
+        "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6.1 Mobile/15E148 Safari/604.1"
+      },
+      "ended_by": "death",
+      "errors": [],
+      "json": "/home/reddragon/.cache/lane-m1-wall-rig-out/iphone/cal2/safari.calibrate.json",
+      "ladder": [
+        {
+          "error": null,
+          "mib": 4096,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 2048,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 1024,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 512,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 256,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 128,
+          "ok": true
+        }
+      ],
+      "ladder_largest_mib": 4096,
+      "ladder_ok": true,
+      "notes": [
+        "only the /rig/report route answered"
+      ],
+      "ok": true,
+      "route_localstorage": null,
+      "route_report": {
+        "at_maximum": null,
+        "attempting_mib": 2528,
+        "attempting_rung_mib": null,
+        "ended_by": "death",
+        "error": null,
+        "memory_maximum_mib": 4096,
+        "phase_at_end": "growing",
+        "steps": 85,
+        "survived_mib": 2496
+      },
+      "routes_agree": null,
+      "run": "wall-20260913T014202Z-1186244-26173",
+      "survived_mib": 2496,
+      "total_s": 30.6
+    },
+    {
+      "ask": {
+        "error": null,
+        "form": "handheld",
+        "page_mib": 512,
+        "signals": {
+          "anyPointerFine": false,
+          "deviceMemoryBytes": null,
+          "maxTouchPoints": 5,
+          "pointerCoarse": true
+        },
+        "worker_mib": 256
+      },
+      "browser_version": "26.6.1",
+      "coi": true,
+      "deaths": [
+        "crash"
+      ],
+      "device_signals": {
+        "device_memory": null,
+        "device_memory_present": false,
+        "device_pixel_ratio": 3,
+        "hardware_concurrency": 4,
+        "max_touch_points": 5,
+        "measure_user_agent_specific_memory_present": false,
+        "platform": "iPhone",
+        "recorded_by": "the page's own calibrate record, load mtz5gcfx-bai4fxg4, received 2026-09-13T01:42:54Z",
+        "screen_avail_height": 844,
+        "screen_avail_width": 390,
+        "screen_height": 844,
+        "screen_width": 390,
+        "standalone": false,
+        "ua_os_version": "18.7",
+        "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6.1 Mobile/15E148 Safari/604.1"
+      },
+      "ended_by": "death",
+      "errors": [],
+      "json": "/home/reddragon/.cache/lane-m1-wall-rig-out/iphone/cal3/safari.calibrate.json",
+      "ladder": [
+        {
+          "error": null,
+          "mib": 4096,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 2048,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 1024,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 512,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 256,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 128,
+          "ok": true
+        }
+      ],
+      "ladder_largest_mib": 4096,
+      "ladder_ok": true,
+      "notes": [
+        "only the /rig/report route answered"
+      ],
+      "ok": true,
+      "route_localstorage": null,
+      "route_report": {
+        "at_maximum": null,
+        "attempting_mib": 2880,
+        "attempting_rung_mib": null,
+        "ended_by": "death",
+        "error": null,
+        "memory_maximum_mib": 4096,
+        "phase_at_end": "growing",
+        "steps": 96,
+        "survived_mib": 2848
+      },
+      "routes_agree": null,
+      "run": "wall-20260913T014251Z-1186801-8720",
+      "survived_mib": 2848,
+      "total_s": 33.13
+    }
+  ],
+  "ceiling_page_mib": 512,
+  "ceiling_worker_mib": 256,
+  "commit": "31bd50823c1b",
+  "confounders": [
+    "GEOLOCATION PROMPT PENDING (stated confounder). squallar-location's gate asks at startup on a fresh origin: LocationMemo defaults to enabled=true, attempts=0, the permission reads Prompt, so LocationGate::step calls request_location -> watchPosition (squallar-location/src/gate.rs, web.rs). Every driven Safari-tab leg is a fresh origin, so the iOS location prompt was raised; the user saw it and could not answer it while automation held the phone. No fix and no refusal reached the app. Evidence it did not stall this leg is in `leg_liveness` below. A rig-side seed avoids the request with no product change: localStorage squallar.location = {\"attempts\":2,\"enabled\":true} (may_ask() is then false); it was NOT used for this row.",
+    "The Mac's Safari had Develop > iPhone > 'Connect via Network' enabled by the user before these legs; the WebDriver session added an Indirect (network) Web Inspector connection beside the Direct (USB) one.",
+    "safari:deviceUDID was the HARDWARE udid 00008110-001108891192801E; the CoreDevice identifier 64A825AA-AE5A-510E-88B0-E29F52F57C1D is discarded by safaridriver as a UDID mismatch.",
+    "Calibrate localStorage route: unreadable on this arm. Each calibrate run ended by the page's death, which terminates the automation session, and a second automation session starts on empty website data (probed 2026-09-13: session A wrote a key, session B on the same origin read 0 keys). Every calibrate figure here is the /rig/report route.",
+    "Served build: app b92a784f7 (wasm sha256 in provenance); rig at the `commit` column.",
+    "First WALL4 attempt (2026-09-13T01:46:31Z) lost its automation tab 1.5 s after the session connected (Mac log: 'Removed Drivable ... remote session was terminated'), before any tick; no alert or permission event was logged on the Mac. Its cause is not established. This row is the rerun at 01:51:41Z."
+  ],
+  "cross_origin_isolated": true,
+  "date": "2026-09-13",
+  "death_kinds": [],
+  "device_class": "ios-iphone13pro-safari-tab",
+  "device_reported": {
+    "core_device_udid": "64A825AA-AE5A-510E-88B0-E29F52F57C1D",
+    "cpu_type": "arm64e",
+    "developer_mode_status": "enabled (devicectl, 2026-09-13T01:36:19Z)",
+    "device_type": "iPhone",
+    "hardware_model": "D63AP",
+    "hardware_udid": "00008110-001108891192801E",
+    "marketing_name": null,
+    "model_product_type": "iPhone14,2",
+    "os_build": "23G83",
+    "os_version": "26.6.1",
+    "pairing_state": "paired (devicectl, 2026-09-13T01:36:19Z)",
+    "platform": "iOS",
+    "source": "xcrun devicectl device info details --device 64A825AA-AE5A-510E-88B0-E29F52F57C1D (on the Mac mini, read-only), 2026-09-12",
+    "transport": "wired",
+    "udid_note": "safaridriver's safari:deviceUDID is the HARDWARE udid (00008110-001108891192801E); the CoreDevice identifier 64A825AA-AE5A-510E-88B0-E29F52F57C1D is what devicectl takes and safaridriver discards as 'its UDID does not match the requested device UDID'"
+  },
+  "device_signals": {
+    "device_memory": null,
+    "device_memory_present": false,
+    "device_pixel_ratio": 3,
+    "hardware_concurrency": 4,
+    "max_touch_points": 5,
+    "measure_user_agent_specific_memory_present": false,
+    "platform": "iPhone",
+    "recorded_by": "the page's own console record, load mtz5rucc-meen5oso, received 2026-09-13T01:51:51Z",
+    "screen_avail_height": 844,
+    "screen_avail_width": 390,
+    "screen_height": 844,
+    "screen_width": 390,
+    "standalone": false,
+    "ua_os_version": "18.7",
+    "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6.1 Mobile/15E148 Safari/604.1"
+  },
+  "first_alloc_failure": "alloc failed: 18135314 B requested, 241 of 256 MiB linear in raster worker",
+  "job_costs": {
+    "basemap/tiles off the frame": {
+      "max_ms": 465,
+      "median_ms": 42,
+      "min_ms": 26,
+      "n": 9,
+      "p90_ms": 465,
+      "sum_ms": 831
+    },
+    "decode off the frame": {
+      "max_ms": 4369,
+      "median_ms": 2861,
+      "min_ms": 278,
+      "n": 14,
+      "p90_ms": 4172,
+      "sum_ms": 29345
+    },
+    "level2-decode on the main thread": {
+      "max_ms": 861,
+      "median_ms": 861,
+      "min_ms": 521,
+      "n": 2,
+      "p90_ms": 861,
+      "sum_ms": 1382
+    },
+    "loop-render on the main thread": {
+      "max_ms": 6,
+      "median_ms": 6,
+      "min_ms": 5,
+      "n": 6,
+      "p90_ms": 6,
+      "sum_ms": 34
+    },
+    "overlay/alerts off the frame": {
+      "max_ms": 3168,
+      "median_ms": 2859,
+      "min_ms": 2859,
+      "n": 3,
+      "p90_ms": 3168,
+      "sum_ms": 8886
+    },
+    "overlay/coverage off the frame": {
+      "max_ms": 3913,
+      "median_ms": 80,
+      "min_ms": 9,
+      "n": 276,
+      "p90_ms": 407,
+      "sum_ms": 52963
+    },
+    "overlay/coverage on the main thread": {
+      "max_ms": 13,
+      "median_ms": 7,
+      "min_ms": 5,
+      "n": 4,
+      "p90_ms": 13,
+      "sum_ms": 31
+    },
+    "overlay/glm off the frame": {
+      "max_ms": 4198,
+      "median_ms": 35,
+      "min_ms": 6,
+      "n": 295,
+      "p90_ms": 185,
+      "sum_ms": 41320
+    },
+    "overlay/glm on the main thread": {
+      "max_ms": 2,
+      "median_ms": 1,
+      "min_ms": 0,
+      "n": 4,
+      "p90_ms": 2,
+      "sum_ms": 3
+    },
+    "overlay/metar off the frame": {
+      "max_ms": 3912,
+      "median_ms": 73,
+      "min_ms": 8,
+      "n": 274,
+      "p90_ms": 393,
+      "sum_ms": 49859
+    },
+    "overlay/metar on the main thread": {
+      "max_ms": 25,
+      "median_ms": 5,
+      "min_ms": 5,
+      "n": 3,
+      "p90_ms": 25,
+      "sum_ms": 35
+    },
+    "overlay/model off the frame": {
+      "max_ms": 4272,
+      "median_ms": 70,
+      "min_ms": 4,
+      "n": 900,
+      "p90_ms": 425,
+      "sum_ms": 202522
+    },
+    "overlay/model on the main thread": {
+      "max_ms": 11,
+      "median_ms": 2,
+      "min_ms": 0,
+      "n": 10,
+      "p90_ms": 11,
+      "sum_ms": 32
+    },
+    "overlay/reports off the frame": {
+      "max_ms": 3148,
+      "median_ms": 57,
+      "min_ms": 6,
+      "n": 32,
+      "p90_ms": 490,
+      "sum_ms": 11052
+    },
+    "radar off the frame": {
+      "max_ms": 3967,
+      "median_ms": 422,
+      "min_ms": 17,
+      "n": 9,
+      "p90_ms": 3967,
+      "sum_ms": 9297
+    },
+    "radar-render on the main thread": {
+      "max_ms": 12,
+      "median_ms": 12,
+      "min_ms": 12,
+      "n": 1,
+      "p90_ms": 12,
+      "sum_ms": 12
+    }
+  },
+  "job_costs_basis": "every `<kind> took N ms off the frame|on the main thread` line the leg's page beaconed, over the whole leg, all page loads",
+  "leg_id": "20260913-ios-iphone13pro-safari-tab-safari-WALL4",
+  "leg_liveness": {
+    "boot_s_after_navigate": 1.14,
+    "budget_state_ticks": 22,
+    "first_alloc_failure_page_s": 11.0,
+    "jobs_completed": 1842,
+    "last_tick_page_s": 43.6,
+    "reading": "ticks every ~2 s until the page heap refused an allocation; the frame loop then trapped (smoke verdict records the traps). The stop follows the allocator, not the prompt",
+    "tick_gaps_over_5s": 0
+  },
+  "provenance": {
+    "calibrate_json": "/home/reddragon/.cache/lane-m1-wall-rig-out/iphone/scenes-wall4-rerun/safari.calibrate.json",
+    "leg_json": "/home/reddragon/.cache/lane-m1-wall-rig-out/iphone/scenes-wall4-rerun/safari.WALL4.json",
+    "report_log": "/home/reddragon/.cache/lane-m1-wall-rig-out/iphone/scenes-wall4-rerun/safari.WALL4.report.jsonl",
+    "run_id": "wall-20260913T015148Z-1311888-13832",
+    "samples_tsv": "/home/reddragon/.cache/lane-m1-wall-rig-out/iphone/scenes-wall4-rerun/safari.WALL4.samples.tsv",
+    "wasm_sha256": "b5c931d322d36449fe9445162dc2adc89dee3c9092698115f093ec2fafea7bed"
+  },
+  "scene": "WALL4",
+  "smoke_pass": false,
+  "tree_dirty_files": 0,
+  "wall": {
+    "alloc_failures": 3,
+    "booted": true,
+    "budget_pressure_events": 5,
+    "census_last_resident_b": 389350561,
+    "deaths": 0,
+    "instantiate_fallbacks": 0,
+    "ladder_largest_mib": 4096,
+    "page_ceiling_mib": 512,
+    "page_hw_mib": 510,
+    "residue_mib": 1620,
+    "sum_hw_mib": 684,
+    "ticks": 22,
+    "wall_mib": 2304,
+    "worker_ceiling_mib": 256,
+    "worker_hw_mib": 241
+  },
+  "wall_basis": {
+    "ceilings": "`heap max a/b` on the last tick (MiB)",
+    "census_last": "the last `heap census (page)` line of the window",
+    "deaths": "reloads and crashes a driver saw; page loads after the first in a beaconed log; null for a text dump, which cannot see one",
+    "page_hw_mib": "the higher of the highest page `linear` figure on a `budget state:` tick and the page level an `alloc failed: ... in page` line reports (MiB)",
+    "reading_window": "the FIRST page load: every line before the first death",
+    "residue_mib": "wall_mib minus sum_hw_mib: negative means the app's linear memory ALONE passed that device's measured wall",
+    "sum_hw_mib": "the highest page+worker `linear` pair on ONE tick, never the page peak plus the worker peak (MiB)",
+    "wall_mib": "MiB of incompressible, touched linear memory the calibrate leg on the same device and browser survived",
+    "worker_hw_mib": "the highest worker `linear` figure on a `budget state:` tick (MiB)"
+  },
+  "wall_mib": 2304,
+  "window_s": 150.0
+}

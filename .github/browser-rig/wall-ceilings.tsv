@@ -3,3 +3,6 @@ linux-desktop-x86_64	firefox	WALL1	1024	1024	4096	20260913-linux-desktop-x86_64-
 linux-desktop-x86_64	firefox	WALL6	1024	1024	4096	20260913-linux-desktop-x86_64-firefox-WALL6	b92a784f7f3d	2026-09-13
 linux-desktop-x86_64	chromium	WALL1	1024	1024	4096	20260913-linux-desktop-x86_64-chromium-WALL1	b92a784f7f3d	2026-09-13
 linux-desktop-x86_64	chromium	WALL6	1024	1024	4096	20260913-linux-desktop-x86_64-chromium-WALL6	b92a784f7f3d	2026-09-13
+ios-iphone13pro-safari-tab	safari	WALL1	512	256	2304	20260913-ios-iphone13pro-safari-tab-safari-WALL1	31bd50823c1b	2026-09-13
+ios-iphone13pro-safari-tab	safari	WALL4	512	256	2304	20260913-ios-iphone13pro-safari-tab-safari-WALL4	31bd50823c1b	2026-09-13
+ios-iphone13pro-safari-tab	safari	WALL6	512	256	2304	20260913-ios-iphone13pro-safari-tab-safari-WALL6	31bd50823c1b	2026-09-13
