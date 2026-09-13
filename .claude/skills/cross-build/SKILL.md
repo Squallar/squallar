@@ -30,7 +30,7 @@ export CONTAINERS_CONF_OVERRIDE=$HOME/.cache/rd-board-lock/podman-caged.conf   #
     "$IMG" bash -c '
       set -o pipefail
       export RUSTUP_TOOLCHAIN="${RUST_VERSION:?the image sets this}"
-      export CARGO_TARGET_DIR=/project/target-xcross
+      export CARGO_TARGET_DIR=/project/target/xcross
       <row from the table below> -j 4'
 ```
 
@@ -51,9 +51,13 @@ Four things in it are load-bearing; each was learnt the hard way:
   obeyed inside the image that fetches a fresh toolchain with none of the
   image's 23 targets and the row dies at "target may not be installed". CI
   does exactly this (`build.yaml` "Use the image's toolchain").
-- **Its own target dir.** `target-xcross/` for checks (CI uses `target/`, but
+- **Its own target dir.** `target/xcross/` for checks (CI uses `target/`, but
   locally that is the host toolchain's); the iOS Makefile uses `target-ios/`.
-  Never point it at the host `target/`.
+  A subdirectory of `target/` and never `target/` itself: cargo's host build
+  owns `target/debug`, `target/release` and `target/<triple>`, and nothing it
+  writes is named `xcross`. Under `target/` because `/target` is gitignored and
+  a sibling `target-xcross/` is not — a lane that ran the rows left it
+  untracked in the tree.
 
 And one thing to never do: **do not set `RUSTFLAGS`.** It replaces every
 `[target.*]` block in `.cargo/config.toml` wholesale — the Windows row loses
@@ -175,7 +179,7 @@ sessions, announce before taking it.
 | row | command | result | wall |
 |---|---|---|---|
 | iOS device, the break | `cargo check -p squallar --lib --target aarch64-apple-ios` on `cffa82fea` | **RED**, `error[E0433]: cannot find DesktopPlatform in platform` — CI's error verbatim | 65 s |
-| iOS device | `cargo check --workspace --all-targets --features squallar/jni-typecheck --target aarch64-apple-ios` | GREEN | 89 s (first triple into `target-xcross/`: pays the host-side build scripts and proc-macros once) |
+| iOS device | `cargo check --workspace --all-targets --features squallar/jni-typecheck --target aarch64-apple-ios` | GREEN | 89 s (first triple into `target/xcross/`: pays the host-side build scripts and proc-macros once) |
 | iOS simulator | same, `aarch64-apple-ios-sim` | GREEN | 31 s |
 | macOS arm64 | same, `aarch64-apple-darwin` | GREEN | 31 s |
 | macOS x86_64 | same, `x86_64-apple-darwin` | GREEN | 32 s |
@@ -183,7 +187,7 @@ sessions, announce before taking it.
 | iOS simulator link | `make -C packaging/ios IN_CONTAINER=1 SIMULATOR=1` inside the container (CI's row verbatim), `CARGO_BUILD_JOBS=4` | GREEN — release + fat LTO, staticlib linked against iphonesimulator26.4, `.app` assembled (`DTSDKName=iphonesimulator26.4`, `minos=15.0`) | 192 s |
 
 So the whole Apple + Windows check set is **about four minutes** on top of a
-lane's board, sharing one `target-xcross/`. There is no cost argument against
+lane's board, sharing one `target/xcross/`. There is no cost argument against
 running it either.
 
 Re-measure and replace this table when the image digest changes.
