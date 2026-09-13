@@ -269,21 +269,46 @@ function readbackOf(stored) {
   };
 }
 
+// This build's ladder, as heap.js states it. NOTHING IS CONSTRUCTED HERE: a
+// memory built only to ask the question holds its reservation until the GC
+// runs, and on the engines this page exists for that is enough to refuse a
+// rung of the ladder phase below that the device can in fact hold. The rungs
+// the app would stop at are read off the ladder phase's own constructions
+// instead (`askAnswered`), once it has run.
 function askOfHeap() {
-  if (!heap) return { page_mib: null, worker_mib: null, form: null, error: heapError };
+  if (!heap) return { page_mib: null, worker_mib: null, rungs_mib: null, error: heapError };
   try {
-    const choice = heap.chooseHeapMaxBytes(globalThis);
-    const s = heap.pageSignals(globalThis);
+    // The budget policy figures ride along for the record: what this
+    // device's heap would be JUDGED against, which is not what it constructs.
+    const policy = heap.choosePolicyHeapBytes(globalThis);
     return {
-      page_mib: choice.page / MIB,
-      worker_mib: choice.worker / MIB,
-      form: heap.classifyFormFactor(s.pointerCoarse, s.anyPointerFine, s.maxTouchPoints),
-      signals: s,
+      page_mib: null,
+      worker_mib: null,
+      rungs_mib: heap.LADDER_BYTES.map((b) => b / MIB),
+      policy_page_mib: policy.page / MIB,
+      policy_worker_mib: policy.worker / MIB,
       error: null,
     };
   } catch (e) {
-    return { page_mib: null, worker_mib: null, form: null, error: String(e) };
+    return { page_mib: null, worker_mib: null, rungs_mib: null, error: String(e) };
   }
+}
+
+// Where the app's ladder would stop on this engine, from the rungs the ladder
+// phase constructed: the page walks this build's rungs from the top, and the
+// worker walks from the page's rung. `rungs_match_calibrate` says whether this
+// page measured exactly the app's rungs; when it did not, a rung the app tries
+// may be one nothing here constructed, and the verdict cannot hold it.
+function askAnswered(ask, ladder) {
+  if (!ask.rungs_mib) return ask;
+  const constructs = (mib) => ladder.some((r) => r.mib === mib && r.ok);
+  const page = ask.rungs_mib.find(constructs);
+  const worker = page === undefined ? undefined : ask.rungs_mib.filter((m) => m <= page).find(constructs);
+  return Object.assign({}, ask, {
+    page_mib: page === undefined ? null : page,
+    worker_mib: worker === undefined ? null : worker,
+    rungs_match_calibrate: JSON.stringify(ask.rungs_mib) === JSON.stringify(LADDER_MIB),
+  });
 }
 
 function ladderVerdictOf(ladder, ask) {
@@ -297,8 +322,10 @@ function ladderVerdictOf(ladder, ask) {
   const worker = ask.worker_mib === null ? null : rung(ask.worker_mib);
   const ok = page === true && worker === true;
   let why = null;
-  if (ask.page_mib === null) {
+  if (ask.page_mib === null && ask.error) {
     why = "heap.js could not be read (" + ask.error + "), so the app's ask is unknown and nothing was held against the ladder";
+  } else if (ask.page_mib === null) {
+    why = "no rung of this build's ladder " + JSON.stringify(ask.rungs_mib) + " constructed on this engine";
   } else if (!ok) {
     const refused = [];
     if (page !== true) refused.push("the page's " + ask.page_mib + " MiB");
@@ -421,10 +448,12 @@ if (RUN !== null && stored.newest) {
   if (rb.error) say("  end error: " + rb.error);
 } else if (RUN !== null) {
   C.ask = askOfHeap();
-  say("this build asks: page " + C.ask.page_mib + " MiB, worker " + C.ask.worker_mib + " MiB, form " + C.ask.form + (C.ask.error ? " (" + C.ask.error + ")" : ""));
+  say("this build's ladder: " + JSON.stringify(C.ask.rungs_mib) + " MiB" + (C.ask.error ? " (" + C.ask.error + ")" : ""));
   C.state = "ladder";
   verdict("run " + RUN + ": constructing the ladder");
   C.ladder = await ladderPhase();
+  C.ask = askAnswered(C.ask, C.ladder);
+  say("the app's ladder would stop at: page " + C.ask.page_mib + " MiB, worker " + C.ask.worker_mib + " MiB (rungs match this page's: " + C.ask.rungs_match_calibrate + ")");
   C.ladder_verdict = ladderVerdictOf(C.ladder, C.ask);
   say("ladder verdict: " + (C.ladder_verdict.ok ? "ok" : "RED -- " + C.ladder_verdict.why) + "; largest " + C.ladder_verdict.largest_mib + " MiB");
   verdict("run " + RUN + ": growing, " + STEP_MIB + " MiB a step to " + CAP_MIB + " MiB");

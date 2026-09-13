@@ -335,25 +335,21 @@ fn every_written_beacon_needle_is_a_line_the_app_writes() {
         "`render took` is forwarded, and no job kind is named `render`"
     );
 
-    // The forward needle is forward: the day heap.js or the web crate writes
-    // it, its status must say `written` so the check above holds it.
+    // No needle is forward any more: `linear memory ladder:` was, until
+    // heap.js grew the line, and it is `written` now so the check above holds
+    // it to heap.js. A forward needle added later must name what will write it.
     let forward: Vec<&str> = rows
         .iter()
         .filter(|(_, s, _)| s == "forward")
         .map(|(n, _, _)| n.as_str())
         .collect();
-    assert_eq!(forward, ["linear memory ladder:"]);
-    let mut web = Vec::new();
-    files_under(&root.join("squallar-web/src"), &mut web);
-    web.push(root.join("squallar-web/heap.js"));
-    for path in &web {
-        let text = std::fs::read_to_string(path).unwrap_or_default();
-        assert!(
-            !text.contains("linear memory ladder:"),
-            "{} now writes `linear memory ladder:`; flip its needle to `written`",
-            path.display()
-        );
-    }
+    assert_eq!(forward, Vec::<&str>::new());
+    assert!(
+        rows.iter().any(|(n, s, w)| n == "linear memory ladder:"
+            && s == "written"
+            && w == "squallar-web/heap.js"),
+        "the ladder needle is not `written` against heap.js -- {rows:?}"
+    );
 
     // Presence control: one needle respelled must be named.
     let doctored = SERVE_PY.replacen(

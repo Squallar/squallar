@@ -622,7 +622,7 @@ impl Capacity {
     pub fn presumed(limits: &BudgetLimits) -> Self {
         Self {
             gpu_bytes: limits.app_texture_ceiling_bytes.at(Promotion::Floor) as u64,
-            host_bytes: limits.presumed_host_bytes.map(|bytes| bytes as u64),
+            host_bytes: limits.presumed_host_bytes,
             source: CapacitySource::Presumed,
             pools: Pools::Split,
         }

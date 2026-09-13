@@ -459,9 +459,9 @@ pub fn parse_grib2_raw_in(
     // The pool's own `take` keeps `try_reserve_exact`, not `with_capacity`, on
     // the arm that must still allocate: this is the largest single allocation
     // the app makes anywhere, and on wasm32 it is made against a memory with a
-    // **hard 1 GiB ceiling** (`--max-memory=1073741824`, set in
-    // `.github/scripts/wasm-threads.sh` because a shared memory has to declare
-    // one at link time). An infallible allocation the engine cannot serve calls
+    // **hard ceiling** — 1 GiB when this was measured, and now the rung
+    // `squallar-web/heap.js`'s ladder constructed, 4 GiB at most (the link
+    // flag in `.github/scripts/wasm-threads.sh`). An infallible allocation the engine cannot serve calls
     // `handle_alloc_error`, which aborts — and wasm32-unknown-unknown is
     // `panic-strategy = "abort"`, so **nothing unwinds**: every `RefCell` guard
     // live on the stack at that instant is never dropped. When the abort lands

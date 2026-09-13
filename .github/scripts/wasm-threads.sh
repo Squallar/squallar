@@ -118,10 +118,17 @@ done
 #                     This is the flag wasm-bindgen keys the thread glue off.
 #   --max-memory      required by wasm-ld whenever the memory is shared: a
 #                     shared memory cannot be relocated on growth, so its
-#                     ceiling has to be known at link time and the engine
-#                     reserves that much ADDRESS space up front. 1 GiB is
-#                     rustc's own figure when it passes these itself; the
-#                     reservation is virtual, not resident.
+#                     ceiling has to be known at link time. It is NOT a
+#                     policy figure: 4294967296 (65536 pages) is wasm32's
+#                     architectural maximum, so the link places no wall of
+#                     its own. The wall is found at runtime instead:
+#                     `squallar-web/heap.js` walks a ladder from 4 GiB down
+#                     and constructs the largest memory the engine accepts,
+#                     per page and per worker, because a supplied memory
+#                     links at any maximum at or below this one. It used to
+#                     be 1 GiB (rustc's own figure), and Chromium's six-pane
+#                     scene died against that wall on a desktop that
+#                     constructs and touches 4 GiB.
 #
 # The four `--export=` flags hand wasm-bindgen the linker-synthesized globals
 # its threading transform rewrites. They are not exported by default and
@@ -129,7 +136,7 @@ done
 # stops with `failed to find __heap_base for injecting thread id` -- which is
 # wasm-bindgen refusing to guess where a per-thread stack may be carved from,
 # not a missing feature.
-LINK_ARGS="-Clink-arg=--shared-memory -Clink-arg=--import-memory -Clink-arg=--max-memory=1073741824"
+LINK_ARGS="-Clink-arg=--shared-memory -Clink-arg=--import-memory -Clink-arg=--max-memory=4294967296"
 LINK_ARGS="$LINK_ARGS -Clink-arg=--export=__heap_base"
 LINK_ARGS="$LINK_ARGS -Clink-arg=--export=__tls_base"
 LINK_ARGS="$LINK_ARGS -Clink-arg=--export=__tls_size"

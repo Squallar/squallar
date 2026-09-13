@@ -121,14 +121,18 @@ pub struct DeviceProfile {
     /// What the platform can say about the shape of the device: a build fact
     /// natively, a pointer-media classification in a browser.
     pub form_factor: Option<FormFactor>,
-    /// **The maximum this instance's wasm linear memory was constructed
-    /// with**, in bytes. `None` natively, and `None` in a browser instance
-    /// nobody told.
+    /// **The budget policy ceiling for this instance's wasm linear memory**,
+    /// in bytes: the per-device figure the page chose (`squallar-web/heap.js`,
+    /// 1024 MiB on a desktop, 512 on a handheld), held to what the memory was
+    /// constructed with. `None` natively, and `None` in a browser instance
+    /// nobody told. **Never the reservation itself**: an engine may construct
+    /// far past where its OS kills the tab, and nothing here is sized from
+    /// that.
     ///
     /// Outranks [`BudgetLimits::presumed_host_bytes`] in [`Self::capacity`],
-    /// and that is the whole point of it: the bracket's figure is the bound
-    /// the module was LINKED with, and the instance's is the wall this device
-    /// actually got, which may be smaller. Nothing in [`resolve`] reads it —
+    /// and that is the whole point of it: the bracket's figure is a desktop's
+    /// policy, and the instance's is the policy this device got, which may be
+    /// smaller. Nothing in [`resolve`] reads it —
     /// like every other reading here it is spent by `fit`, through
     /// [`Self::capacity`].
     pub linear_memory_max_bytes: Option<u64>,
@@ -344,12 +348,11 @@ impl DeviceProfile {
             }
             None => {
                 let mut presumed = Capacity::presumed(&self.limits);
-                // **The pool, else the instance's own wall, outranks the
-                // bracket's presumption.** The bracket states what the module
-                // was LINKED with; a browser page chooses its memory's
-                // maximum per device below that bound before the module is
-                // instantiated, and it is that figure the scene has to fit
-                // inside. The two never compete — no browser has a pool
+                // **The pool, else the instance's own policy, outranks the
+                // bracket's presumption.** The bracket states a desktop's
+                // policy ceiling; a browser page chooses its policy per
+                // device before the module is instantiated, and it is that
+                // figure the scene has to fit inside. The two never compete — no browser has a pool
                 // reader and no native build has a linear memory — and a
                 // profile nobody told keeps the bracket's presumption, which
                 // is every native arm and every pre-plumbing test.
@@ -600,22 +603,24 @@ pub struct BudgetLimits {
     /// holds it within 1.25x of that sum.
     pub tile_host_ceiling_bytes: Bracket,
     /// **What the host memory is presumed to hold where nothing reads it.**
-    /// `Some` only on the wasm32 bracket: the page's linear memory has a
-    /// ceiling the module header declares
-    /// ([`constants::WASM_LINEAR_MEMORY_MAX_BYTES`]) — read, never probed — so
-    /// a browser is the one platform whose host capacity is *known* without a
+    /// `Some` only on the wasm32 bracket: a browser page's heap is judged
+    /// against a stated policy ceiling
+    /// ([`constants::WASM_POLICY_HEAP_BYTES`]) — stated, never probed — so a
+    /// browser is the one platform whose host capacity is *known* without a
     /// reader. A native bracket says nothing here; its RAM reaches
     /// [`Capacity`] through the profile's own `system_ram_bytes` on the
     /// measured arm, and on the presumed arm the host is unbounded, as it
     /// always was.
     ///
-    /// **This is the bound the module was LINKED with, and it is the ceiling
-    /// of the per-device choice rather than the choice itself.** A page picks
-    /// its memory's maximum at or below it before the module is instantiated
-    /// and tells the app what it picked, and
-    /// [`DeviceProfile::linear_memory_max_bytes`] outranks this figure
-    /// wherever one arrived.
-    pub presumed_host_bytes: Option<usize>,
+    /// **This is a desktop's policy figure, and a page that said which policy
+    /// it got outranks it** ([`DeviceProfile::linear_memory_max_bytes`]). It
+    /// is neither the link flag nor what any memory was constructed with
+    /// ([`constants::WASM_LINKED_MAX_BYTES`]); nothing is sized from those.
+    ///
+    /// **`u64`, not `usize`**: a wasm32 `usize` cannot hold 2^32 bytes, and
+    /// the measured wall model that replaces this policy may state a figure
+    /// that large.
+    pub presumed_host_bytes: Option<u64>,
 }
 
 /// The three tile allowances a set of budgets hands the tile caches, in
@@ -726,9 +731,9 @@ impl BudgetLimits {
         tile_parsed_bytes: rungs(constants::WASM_TILE_PARSED_BYTES),
         tile_terrain_bytes: rungs(constants::WASM_TILE_TERRAIN_BYTES),
         tile_host_ceiling_bytes: rungs(constants::WASM_TILE_HOST_CEILING_BYTES),
-        // The bound the module header declares. A page that told us what its
-        // own memory was built with outranks this — see the field's doc.
-        presumed_host_bytes: Some(constants::WASM_LINEAR_MEMORY_MAX_BYTES as usize),
+        // A desktop page's budget policy. A page that told us which policy
+        // this device got outranks it — see the field's doc.
+        presumed_host_bytes: Some(constants::WASM_POLICY_HEAP_BYTES),
     };
 
     /// The mobile bracket — native Android and iOS.

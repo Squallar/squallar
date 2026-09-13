@@ -607,3 +607,63 @@ describe("persistent storage: the page answers the worker's request", () => {
     assert.equal(page.element("squallar-update").hidden, true);
   });
 });
+
+/*
+ * ============================================================================
+ * The module script's one call into Rust
+ * ============================================================================
+ *
+ * `start` is a wasm-bindgen export, and a JS call with the wrong number of
+ * arguments is not an error: a missing `f64` arrives as `NaN`, which
+ * `heap_max::declare` drops as "nobody said", so a page that forgot to pass
+ * the worker's budget policy would boot, pass every leg, and judge its worker
+ * against no ceiling at all. So the arity is held against the Rust signature it
+ * calls, read from `entry.rs` rather than restated here.
+ */
+
+/** The `<script type="module">` block's body. */
+function extractModuleScript(html) {
+  const match = /<script type="module">([\s\S]*?)<\/script>/.exec(html);
+  assert.ok(match, "index.html has no module script");
+  return match[1];
+}
+
+/** Why `moduleScript`'s `start(...)` call does not match `entryRs`'s signature. */
+function startArityDefects(moduleScript, entryRs) {
+  const defects = [];
+  const calls = [...moduleScript.matchAll(/\bstart\(([^)]*)\)/g)];
+  if (calls.length !== 1) defects.push(`the module script calls start ${calls.length} times`);
+  const signature = /pub fn start\(([^)]*)\)/.exec(entryRs);
+  if (!signature) defects.push("entry.rs no longer declares `pub fn start(`");
+  if (calls.length === 1 && signature) {
+    const args = calls[0][1].split(",").map((s) => s.trim()).filter(Boolean);
+    const params = signature[1].split(",").map((s) => s.trim()).filter(Boolean);
+    if (args.length !== params.length) {
+      defects.push(`start is called with ${args.length} argument(s) and declared with ${params.length}`);
+    }
+  }
+  return defects;
+}
+
+describe("the module script's call to start", () => {
+  it("passes as many arguments as entry.rs declares", async () => {
+    const script = extractModuleScript(await indexHtml());
+    const entry = await readFile(new URL("../src/entry.rs", import.meta.url), "utf8");
+    assert.deepEqual(startArityDefects(script, entry), []);
+  });
+
+  it("a call with a dropped argument is caught", async () => {
+    const script = extractModuleScript(await indexHtml());
+    const entry = await readFile(new URL("../src/entry.rs", import.meta.url), "utf8");
+    const doctored = script.replace(
+      "start(pageReserved, policy.page, policy.worker);",
+      "start(pageReserved, policy.page);",
+    );
+    assert.notEqual(doctored, script, "the tamper did not apply");
+    const defects = startArityDefects(doctored, entry);
+    assert.ok(
+      defects.some((d) => d.includes("called with 2 argument")),
+      `a start missing the worker's policy went unnoticed: ${JSON.stringify(defects)}`,
+    );
+  });
+});

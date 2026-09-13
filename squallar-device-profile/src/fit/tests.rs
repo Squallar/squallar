@@ -964,8 +964,7 @@ fn the_allowance_is_the_constant_when_presumed_and_three_quarters_when_measured(
         // outranks this; that is `DeviceProfile::capacity`'s job and is
         // pinned by `a_page_that_said_what_its_heap_was_built_with_outranks_the_bracket`.
         assert_eq!(
-            cap.host_bytes,
-            limits.presumed_host_bytes.map(|bytes| bytes as u64),
+            cap.host_bytes, limits.presumed_host_bytes,
             "{}",
             limits.name,
         );

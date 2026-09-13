@@ -303,18 +303,20 @@ pub mod hook {
             IS_TILE_LANE.with(Cell::get),
         );
         let linear = crate::shared_loan::memory_bytes();
-        // **This instance's own ceiling, not the build's.** The two parted
-        // when the maximum became a per-device choice made in JS before the
-        // module existed (`crate::heap_max`); printing the link flag here
-        // would say `of 1024 MiB` on a phone that was refused at 512, which
-        // is the one figure a reader of this line would act on. It is per
-        // MEMORY, which is one fewer thing than the name beside it: the
-        // page's ceiling and the worker's are two separate choices and on a
-        // handheld two different figures, while the lane -- a thread on the
+        // **This instance's own reservation: not the build's link flag, and
+        // not its budget policy.** An allocation is refused against what the
+        // memory was constructed with (`crate::heap_max`), so that is the
+        // wall this line names; the policy the budgets shed against is on
+        // `budget state:` as `heap max`. Printing the link flag here would
+        // say `of 4096 MiB` beside a refusal at a 512 MiB rung, which is the
+        // one figure a reader of this line would act on. It is per MEMORY,
+        // which is one fewer thing than the name beside it: the page's
+        // reservation and the worker's are two separate ladders and may be
+        // two different figures, while the lane -- a thread on the
         // worker's memory -- reads the worker's, because it IS the worker's.
         // An instance that was never told judges against 0 and prints
         // `of 0 MiB`, which says "nobody said" rather than inventing a wall.
-        let max = crate::heap_max::this_instance().unwrap_or(0);
+        let max = crate::heap_max::this_reservation().unwrap_or(0);
         let line = super::line(layout.size(), linear, max, instance.as_str());
         web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(line.as_str()));
 
@@ -432,7 +434,7 @@ mod tests {
 
         // **The wall on the line is the INSTANCE's, and the same request
         // against a handheld's worker heap says so.** The hook reads
-        // `heap_max::this_instance()` and not the link flag, which on this
+        // `heap_max::this_reservation()` and not the link flag, which on this
         // arm would print `of 1024 MiB` beside a refusal that happened at
         // 256 -- the one figure a reader of this line would act on.
         assert_eq!(

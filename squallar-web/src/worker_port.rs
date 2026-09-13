@@ -161,16 +161,15 @@ fn spawn() {
     // A module worker, because `worker.js` `import`s the wasm-bindgen glue that
     // `--target web` emits. Classic workers cannot.
     options.set_type(web_sys::WorkerType::Module);
-    // **How the worker learns its own linear-memory ceiling.** `worker.js`
-    // constructs its `WebAssembly.Memory` before it can receive a message, and
-    // a `WorkerNavigator` carries neither `matchMedia` nor `maxTouchPoints`, so
-    // a worker left to classify the device for itself would read a handheld on
-    // every desktop. `name` is the one channel that is synchronous, present at
-    // the top of the worker's own script, and costs no URL: a query string
-    // would work too (`sw.js` matches the shell with `ignoreSearch`) at the
-    // price of a second spelling of a precached asset. A respawn re-reads the
-    // cell, so a worker that comes back comes back at the same ceiling.
-    if let Some(bytes) = crate::heap_max::worker_instance() {
+    // **How the worker learns where its linear-memory ladder starts.**
+    // `worker.js` constructs its `WebAssembly.Memory` before it can receive a
+    // message, so the page's rung travels on `name`: the one channel that is
+    // synchronous, present at the top of the worker's own script, and costs
+    // no URL. A query string would work too (`sw.js` matches the shell with
+    // `ignoreSearch`) at the price of a second spelling of a precached asset.
+    // A respawn re-reads the cell — by then the last worker's REPORTED rung —
+    // so a worker that comes back starts no higher than its predecessor got.
+    if let Some(bytes) = crate::heap_max::worker_ladder_start() {
         options.set_name(&format!("{WORKER_NAME_PREFIX}{bytes}"));
     }
 
@@ -300,9 +299,11 @@ fn handle_message(generation: u64, worker: &web_sys::Worker, data: &JsValue) {
             // After the token check: a worker of another build is not the one
             // whose heap this page reports.
             note_worker_memory(data);
-            // And its CEILING, which the page chose but the worker is the only
-            // one that knows it got — a refused memory leaves it at the
-            // module's declared bound instead (`heap.js`, `initWithHeap`).
+            // And its RESERVATION, which only the worker knows: the page
+            // handed it a starting rung, and its own ladder may have stopped
+            // lower, or taken the glue's fallback (`heap.js`, `initWithHeap`).
+            // The page's policy for the worker is held under it
+            // (`heap_max::worker_policy`).
             if let Some(bytes) = proto::field(data, proto::MEMMAX)
                 .and_then(|v| v.as_f64())
                 .filter(|v| v.is_finite() && *v > 0.0)

@@ -153,14 +153,24 @@ pub(crate) fn capacity_source_word(source: CapacitySource) -> &'static str {
 /// absent explicitly as 0 ([`gpu_probe_code`]). `balloon` is 0 whenever no
 /// loop holds more than its base, which is a real zero: nothing was granted.
 ///
-/// **`heap max <page>/<worker>` is the only witness there is** to the ceiling
-/// each wasm instance was actually constructed with. The page picks both per
-/// device before the module is instantiated (`squallar-web/heap.js`), and no
-/// engine implements `WebAssembly.Memory.prototype.type()`, so nothing can
-/// read a maximum back off a memory object: a leg that wants to assert the
-/// page came up at 512 MiB rather than 1024 has this field and nothing else.
-/// Both print 0 natively and on any bridge that reported none, which is an
-/// absence and not a wall of zero. It rides at the END, after `page heap
+/// **`heap max <page>/<worker>` is the budget POLICY ceiling each wasm
+/// instance is judged against** — what the watermarks, the host allowance and
+/// the admission doors read — **and `reserved <page>/<worker>` beside it is
+/// what each memory was actually constructed with**, the only figure an
+/// allocation is refused against. The page chooses the first per device and
+/// walks a ladder for the second before the module is instantiated
+/// (`squallar-web/heap.js`), and no engine implements
+/// `WebAssembly.Memory.prototype.type()`, so nothing can read either back off
+/// a memory object: a leg that wants to assert which ceilings a page came up
+/// under has these two fields and nothing else.
+///
+/// **`heap max` kept its meaning and its values when the two split** — a
+/// desktop read 1024 before and reads 1024 after — so a reader written against
+/// it stays right; the reservation took a NEW label rather than that one, so no
+/// old reader can take 4096 for a budget. It rides inside `heap max`'s own
+/// comma group, the way `host steps N promotions N churn N` does, so the
+/// line's separator count and every positional group behind it are unmoved. All four print 0 natively and on any
+/// bridge that reported none, which is an absence and not a wall of zero. It rides at the END, after `page heap
 /// acts`, for that field's own reason: `drive.py`'s `budget_state_re` and
 /// `native_row.py`'s copy of it read this line by positional groups and are
 /// unanchored at their end, so a trailing field is the only safe place to add
@@ -316,7 +326,7 @@ pub(crate) fn budget_state_line(
         "budget state: bracket {}, rung {rung}, steps {}, pool {} MiB, ceiling {} MiB, \
          vram {} MiB, ram {} MiB, declared {} MiB, threads {}, form {form}, \
          linear {}/{} MiB, cap {} {}, probe {}, balloon {} MiB, \
-         page heap acts {} at {} MiB, heap max {}/{} MiB, \
+         page heap acts {} at {} MiB, heap max {}/{} MiB reserved {}/{} MiB, \
          host steps {} promotions {} churn {}, \
          gpu steps {} restored {} dwell {}x {} s churn {}, \
          loop over {} MiB, loop clamped {}",
@@ -338,6 +348,8 @@ pub(crate) fn budget_state_line(
         mib(page_heap.last_acted_at().unwrap_or(0)),
         mib(linear.map_or(0, |l| l.page_max_bytes)),
         mib(linear.map_or(0, |l| l.worker_max_bytes)),
+        mib(linear.map_or(0, |l| l.page_reserved_bytes)),
+        mib(linear.map_or(0, |l| l.worker_reserved_bytes)),
         host_recovery.level(),
         host_recovery.promotions(),
         host_recovery.churn(),
@@ -1971,6 +1983,8 @@ mod tests {
             page_max_bytes: 900 << 20,
             worker_bytes: Some(700 << 20),
             worker_max_bytes: 1100 << 20,
+            page_reserved_bytes: 1300 << 20,
+            worker_reserved_bytes: 1500 << 20,
             worker_live_bytes: Some(600 << 20),
             page_live_bytes: None,
         });
@@ -2007,7 +2021,7 @@ mod tests {
             "budget state: bracket desktop, rung 1, steps 3, pool 3072 MiB, \
              ceiling 3840 MiB, vram 24576 MiB, ram 65536 MiB, declared 8192 MiB, \
              threads 32, form 2, linear 300/700 MiB, cap 5120 3, probe 5, \
-             balloon 7 MiB, page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
+             balloon 7 MiB, page heap acts 0 at 0 MiB, heap max 900/1100 MiB reserved 1300/1500 MiB, \
              host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, \
              host allowance none, rss 900 MiB, pool residual 650 MiB, \
              spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
@@ -2059,7 +2073,7 @@ mod tests {
             )
             .ends_with(
                 ", probe 5, balloon 0 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, \
+                 heap max 900/1100 MiB reserved 1300/1500 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, \
                  spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
                  notices raised 0 live 0 reoffered 0, \
                  live 250/600 MiB"
@@ -2089,7 +2103,7 @@ mod tests {
             )
             .ends_with(
                 ", cap 24576 2, probe 0, balloon 7 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance 30720 MiB, rss none, pool residual none, \
+                 heap max 900/1100 MiB reserved 1300/1500 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance 30720 MiB, rss none, pool residual none, \
                  spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
                  notices raised 0 live 0 reoffered 0, \
                  live 250/600 MiB"
@@ -2117,7 +2131,7 @@ mod tests {
             )
             .ends_with(
                 ", cap 3456 0, probe 1, balloon 7 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, \
+                 heap max 900/1100 MiB reserved 1300/1500 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, \
                  spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
                  notices raised 0 live 0 reoffered 0, \
                  live 250/600 MiB"
@@ -2213,7 +2227,7 @@ mod tests {
             tail,
             "0 MiB, ram 0 MiB, declared 0 MiB, threads 0, form 0, linear 0/0 MiB, \
              cap 3840 0, probe 0, balloon 0 MiB, page heap acts 0 at 0 MiB, \
-             heap max 0/0 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, \
+             heap max 0/0 MiB reserved 0/0 MiB, host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, \
              spare gpu none host none, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
              notices raised 0 live 0 reoffered 0, live 0/0 MiB",
         );
@@ -2502,7 +2516,7 @@ mod tests {
         );
         assert_eq!(
             &line[read_by_the_rig.len()..],
-            ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
+            ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB reserved 1300/1500 MiB, \
              host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, spare gpu none host none, door spare gpu none host none joint none, \
              admission asked 0 admitted 0 would refuse 0 refused 0, \
              notices raised 0 live 0 reoffered 0, \
@@ -2548,7 +2562,7 @@ mod tests {
         );
         assert_eq!(
             &line[read_by_the_rig.len()..],
-            ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
+            ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB reserved 1300/1500 MiB, \
              host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, \
              spare gpu 3568 MiB host 601 MiB, door spare gpu none host none joint none, admission asked 0 admitted 0 would refuse 0 refused 0, \
              notices raised 0 live 0 reoffered 0, \
@@ -2730,7 +2744,7 @@ mod tests {
         );
         assert!(
             never.ends_with(
-                ", page heap acts 0 at 0 MiB, heap max 0/0 MiB, \
+                ", page heap acts 0 at 0 MiB, heap max 0/0 MiB reserved 0/0 MiB, \
                  host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, spare gpu none host none, door spare gpu none host none joint none, \
                  admission asked 0 admitted 0 would refuse 0 refused 0, \
                  notices raised 0 live 0 reoffered 0, \
@@ -2743,11 +2757,11 @@ mod tests {
         // reading the `huge` legs sat at while every pressure line of theirs
         // was already out of every window.
         let mut watch = crate::pressure::LinearMemoryWatch::default();
-        // The wall a desktop-classified browser is given, which is the bound
-        // the module is linked with. A handheld's page is judged against 512
-        // MiB and its worker against 256, which is exactly why the line now
-        // ends by printing both walls.
-        let max = squallar_device_profile::constants::WASM_LINEAR_MEMORY_MAX_BYTES;
+        // The wall a desktop-classified browser's heap is judged against: its
+        // budget policy, not its reservation. A handheld's page is judged
+        // against 512 MiB and its worker against 256, which is exactly why the
+        // line prints both walls.
+        let max = squallar_device_profile::constants::WASM_POLICY_HEAP_BYTES;
         let _ = watch.observe(900 << 20, max, 0);
         let _ = watch.observe(1011 << 20, max, 0);
         assert_eq!(watch.acts(), 2);
@@ -2771,7 +2785,7 @@ mod tests {
         );
         assert!(
             acted.ends_with(
-                ", page heap acts 2 at 1011 MiB, heap max 0/0 MiB, \
+                ", page heap acts 2 at 1011 MiB, heap max 0/0 MiB reserved 0/0 MiB, \
                  host steps 0 promotions 0 churn 0, gpu steps 0 restored 0 dwell 1x 30 s churn 0, loop over 5 MiB, loop clamped 0, host allowance none, rss none, pool residual none, spare gpu none host none, door spare gpu none host none joint none, \
                  admission asked 0 admitted 0 would refuse 0 refused 0, \
                  notices raised 0 live 0 reoffered 0, \

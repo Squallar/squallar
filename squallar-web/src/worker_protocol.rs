@@ -79,11 +79,11 @@ pub const LIVE: &str = "live";
 /// Worker → page, on `HELLO` only: **the maximum the worker's own linear
 /// memory was constructed with**, in bytes.
 ///
-/// The page chose this figure and handed it over on the Worker's `name`
-/// (`squallar-web/heap.js`), so it is mostly a confirmation — except when the
-/// engine refused the supplied memory and the glue built one at the module's
-/// declared bound instead, which is the one case the page's own copy is
-/// wrong. Nothing can read a memory's maximum back
+/// The page knows only where the worker's ladder STARTED — its own rung,
+/// handed over on the Worker's `name` — and the worker walks
+/// `squallar-web/heap.js`'s ladder itself, so this is where it stopped: the
+/// rung the engine constructed, or the module's declared bound when every rung
+/// refused and the glue built its own. Nothing can read a memory's maximum back
 /// (`WebAssembly.Memory.prototype.type()` exists in neither engine), so this
 /// message is the only witness. Absent reads as "what we asked for", never as
 /// 0. On the hello alone because a ceiling cannot change for the life of an

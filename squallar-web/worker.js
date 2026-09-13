@@ -56,33 +56,27 @@ const shellPin = self.location.search;
   const glue = await import("./pkg/squallar_web.js" + shellPin);
 
   /*
-   * This worker's own linear-memory ceiling, as the PAGE chose it. It
-   * arrives on `self.name` because that is the only channel a worker can
-   * read synchronously at the top of its own script -- and it has to be the
-   * page's answer, not one computed here: a `WorkerNavigator` carries
-   * `hardwareConcurrency` and `deviceMemory` and neither `matchMedia` nor
-   * `maxTouchPoints`, so a worker classifying itself would read "unknown"
-   * on Firefox, which governs, and take the handheld arm on every desktop.
+   * Where this worker's ladder STARTS: the rung the page's own ladder
+   * constructed, handed over on `self.name` because that is the only channel
+   * a worker can read synchronously at the top of its own script. The worker
+   * states no figure of its own; `heap.js` owns the rungs.
    *
-   * The heap is a SEPARATE choice from the page's and on a handheld a
-   * smaller one: this instance holds the jobs in flight (bounded by
-   * `WASM_MAX_CONCURRENT_RENDERS`) plus the tile lane's scratch, never the
-   * caches. See `heap.js`.
+   * The heap is still this instance's own: it walks the ladder separately
+   * and may stop lower than the page did, because it constructs in the same
+   * process after the page's memory already holds its reservation.
    *
    * `null` -- a worker opened directly, or started by a page from a build
-   * before this -- falls back to the module's declared bound, which is what
-   * the glue would have built anyway.
+   * before this -- starts from the top rung.
    */
-  const heapMaxBytes = heap.heapFromName(self.name) ?? heap.DESKTOP_PAGE_BYTES;
+  const ladderStartBytes = heap.heapFromName(self.name) ?? heap.LADDER_BYTES[0];
 
   /*
-   * What the instance ACTUALLY got, which differs from what was asked for
-   * only when the engine refused the supplied memory and the glue built one
-   * at the declared bound. It rides back to the page on the hello
-   * (`worker_protocol::MEMMAX`), because the page's copy is the one that
-   * would otherwise be wrong.
+   * What the instance ACTUALLY got -- its ladder answer, or the module's
+   * declared bound when every rung refused and the glue built its own. It
+   * rides back to the page on the hello (`worker_protocol::MEMMAX`), because
+   * the page only knows where this ladder started.
    */
-  const heapMaxInForce = await heap.initWithHeap(glue.default, heapMaxBytes, undefined, () =>
+  const heapMaxInForce = await heap.initWithHeap(glue.default, ladderStartBytes, undefined, () =>
     fetch(new URL("./pkg/squallar_web_bg.wasm" + shellPin, self.location.href)),
   );
 

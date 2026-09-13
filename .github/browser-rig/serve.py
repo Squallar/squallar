@@ -498,7 +498,7 @@ CONSOLE_BEACON_NEEDLES = (
     ("budget state:", "written", "squallar-app/src/budget_telemetry.rs"),
     ("heap census", "written", "squallar-egui/src/heap_census.rs"),
     ("alloc failed:", "written", "squallar-web/src/alloc_failure.rs"),
-    ("linear memory ladder:", "forward", "nothing writes it yet"),
+    ("linear memory ladder:", "written", "squallar-web/heap.js"),
     ("could not instantiate with a", "written", "squallar-web/heap.js"),
     ("budget pressure:", "written", "squallar-app/src/pressure.rs"),
     ("decode took", "written",

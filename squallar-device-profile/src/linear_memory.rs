@@ -9,17 +9,18 @@
 //! not merely to still stand above the line. Without that a heap that acted
 //! once would act on every tick for the rest of the session.
 //!
-//! **The ceiling is an argument, not a constant.** It is whatever maximum the
-//! instance's `WebAssembly.Memory` was constructed with, chosen per device by
-//! `squallar-web/heap.js` before the module was instantiated and at or below
-//! [`crate::constants::WASM_LINEAR_MEMORY_MAX_BYTES`], the bound the module is
-//! linked with. The reading is the bridge's (`memory().buffer().byteLength` on
+//! **The ceiling is an argument, not a constant.** It is the budget policy
+//! ceiling the page chose for the instance — per device, by
+//! `squallar-web/heap.js`, before the module was instantiated
+//! ([`crate::constants::WASM_POLICY_HEAP_BYTES`] on a desktop) — and never the
+//! maximum the memory was constructed with, which on a phone reaches far past
+//! where the OS kills the tab. The reading is the bridge's (`memory().buffer().byteLength` on
 //! the page, the worker's own figure on its envelopes), the two instances have
 //! two ceilings and are judged separately, and neither their readings nor
 //! their walls are ever added. A ceiling of 0 is "nobody said" and is
 //! [`LinearMemoryVerdict::Quiet`] whatever the reading — never a wall of zero,
-//! and never silently replaced with the link flag, which on a handheld would
-//! be double the truth.
+//! and never silently replaced with the link flag
+//! ([`crate::constants::WASM_LINKED_MAX_BYTES`]), which is 4 GiB.
 //!
 //! **A native bridge reads no heap, so no PRESSURE is raised from here
 //! natively** — that is the caller's job, held in `squallar-app` by
@@ -134,14 +135,15 @@ mod tests {
     use LinearMemoryVerdict::{Act, Quiet, Warn};
 
     const MIB: u64 = 1 << 20;
-    /// The bound the module is LINKED with, which is also the ceiling a
-    /// desktop-classified browser is given (`squallar-web/heap.js`), so it is
-    /// still the figure the lines below are named for.
-    const MAX: u64 = crate::constants::WASM_LINEAR_MEMORY_MAX_BYTES;
+    /// The policy ceiling a desktop-classified browser's heap is judged
+    /// against (`squallar-web/heap.js`), so it is still the figure the lines
+    /// below are named for. It was also the link flag until the reservation
+    /// and the policy split; the value did not move.
+    const MAX: u64 = crate::constants::WASM_POLICY_HEAP_BYTES;
     /// **What a handheld's page instance is given instead.** Written out
     /// rather than imported: `squallar-device-profile` has no dependency on
     /// `squallar-web`, and the equality between this and `heap.js`'s
-    /// `HANDHELD_PAGE_BYTES` is held where the rest of that file's figures
+    /// `POLICY_HANDHELD_PAGE_BYTES` is held where the rest of that file's figures
     /// are, in `squallar-web/tests/linear_memory_ceiling.rs`. If that pin
     /// reddens, this row is what it is telling you to re-derive.
     const HANDHELD_MAX: u64 = 512 * MIB;

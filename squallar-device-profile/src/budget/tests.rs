@@ -2610,7 +2610,7 @@ fn a_page_that_said_what_its_heap_was_built_with_outranks_the_bracket() {
     silent.limits = BudgetLimits::WASM;
     let linked = BudgetLimits::WASM
         .presumed_host_bytes
-        .expect("the wasm bracket declares a host presumption") as u64;
+        .expect("the wasm bracket declares a host presumption");
     assert_eq!(
         silent.capacity().host_bytes,
         Some(linked),

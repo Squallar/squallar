@@ -10,9 +10,10 @@
 //! 7000 x 3500 samples of 16 bits that is **49,000,000 B**, measured, every
 //! granule, on all three committed fixtures.
 //!
-//! It is `vec![0; n]` — **infallible**. wasm32 links this module with a hard
-//! 1 GiB memory ceiling (`--max-memory=1073741824`,
-//! `.github/scripts/wasm-threads.sh`) and is `panic-strategy = "abort"`, so an
+//! It is `vec![0; n]` — **infallible**. wasm32 linked this module with a hard
+//! 1 GiB memory ceiling when this was measured (now each instance's runtime
+//! ladder rung, 4 GiB at most, `.github/scripts/wasm-threads.sh`) and is
+//! `panic-strategy = "abort"`, so an
 //! allocation the engine cannot serve reaches `alloc::handle_alloc_error` and
 //! traps. Nothing unwinds through that: winit's web event-loop runner keeps its
 //! `RefCell` borrowed for the life of the page, the frame loop stops for good,

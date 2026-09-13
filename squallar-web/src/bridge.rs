@@ -245,10 +245,11 @@ impl PlatformBridge for WebPlatform {
         HostSignals {
             system_ram_bytes: None,
             declared_ram_bytes: declared_ram_bytes(),
-            // Chosen per device by `heap.js` before this module existed and
-            // handed to `entry::start`; see `crate::heap_max` for why it
-            // cannot be read back off the memory object.
-            linear_memory_max_bytes: crate::heap_max::this_instance(),
+            // The budget POLICY ceiling `heap.js` chose for this device and
+            // handed to `entry::start`, held under the reservation — never the
+            // reservation itself, which nothing is sized from. See
+            // `crate::heap_max`.
+            linear_memory_max_bytes: crate::heap_max::this_policy(),
             parallelism: navigator_number("hardwareConcurrency")
                 .filter(|n| *n >= 1.0)
                 .map(|n| n as usize),
@@ -261,7 +262,11 @@ impl PlatformBridge for WebPlatform {
     fn linear_memory(&self) -> Option<LinearMemory> {
         Some(LinearMemory {
             page_bytes: crate::shared_loan::memory_bytes()?,
-            page_max_bytes: crate::heap_max::this_instance().unwrap_or(0),
+            // The wall the watermark and the doors read: the policy.
+            page_max_bytes: crate::heap_max::this_policy().unwrap_or(0),
+            // What was constructed, for the telemetry line alone.
+            page_reserved_bytes: crate::heap_max::this_reservation().unwrap_or(0),
+            worker_reserved_bytes: crate::heap_max::worker_reservation().unwrap_or(0),
             // `bytes()` and not `current()`: this pair is the readout's,
             // and the readout wants the last figure said whoever said it
             // (`crate::worker_heap::Reading`). A term that BOUNDS something
@@ -275,10 +280,11 @@ impl PlatformBridge for WebPlatform {
             // cannot advance on a re-published one
             // (`squallar_app::platform::LinearMemory::page_live_bytes`).
             page_live_bytes: squallar_alloc::live_bytes(),
-            // What the worker reported on its hello where it has said, else
-            // what this page asked for it. A zero is "nobody said", which the
-            // watermark spells `Quiet` rather than guessing a wall.
-            worker_max_bytes: crate::heap_max::worker_instance().unwrap_or(0),
+            // The page's policy for the worker, held under what the worker
+            // reported it reserved (its ladder's starting rung until it has
+            // said). A zero is "nobody said", which the watermark spells
+            // `Quiet` rather than guessing a wall.
+            worker_max_bytes: crate::heap_max::worker_policy().unwrap_or(0),
         })
     }
 

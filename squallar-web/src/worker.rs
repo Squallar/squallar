@@ -54,11 +54,11 @@ thread_local! {
 ///
 /// `heap_max_bytes` is the ceiling this worker's memory was constructed with.
 /// It arrives here rather than being read because no engine will say what a
-/// memory's maximum is, and it is a separate figure from the page's: the page
-/// chose it (a worker global has neither `matchMedia` nor `maxTouchPoints`)
-/// and handed it over on this Worker's `name`, and `worker.js` passes on what
-/// it actually got — which differs from what was asked for exactly when the
-/// engine refused the supplied memory and the glue built its own.
+/// memory's maximum is, and it is a separate figure from the page's: the
+/// worker walks `heap.js`'s ladder itself, from the page's rung (handed over
+/// on this Worker's `name`), and `worker.js` passes on the rung it stopped at
+/// — or the module's declared bound when every rung refused and the glue
+/// built its own.
 #[wasm_bindgen]
 pub fn squallar_worker_main(heap_max_bytes: f64) -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
@@ -228,7 +228,7 @@ fn say_memory(message: &js_sys::Object) {
 /// reply: unlike [`say_memory`]'s reading it cannot change for the life of the
 /// instance, and a `DONE` is the hot path.
 fn say_memory_max(message: &js_sys::Object) {
-    if let Some(bytes) = crate::heap_max::this_instance() {
+    if let Some(bytes) = crate::heap_max::this_reservation() {
         proto::set_field(message, proto::MEMMAX, &JsValue::from_f64(bytes as f64));
     }
 }

@@ -24,8 +24,9 @@
 //!
 //! ## Why that is the shipping fix and a bigger budget is not
 //!
-//! wasm32 linear memory only ever **grows**, and the browser build is capped at
-//! 1 GiB (`--max-memory=1073741824`, `.github/scripts/wasm-threads.sh`). A loop
+//! wasm32 linear memory only ever **grows**, and the browser build was capped
+//! at 1 GiB when this was measured (now at the rung each instance's runtime
+//! ladder constructs, 4 GiB at most, `.github/scripts/wasm-threads.sh`). A loop
 //! playing over the mosaic put ~147 MB of large-block churn on that heap per
 //! granule — the values vector, 98 MB at the `f32` width the store then
 //! had, plus grib's 49 MB PNG image buffer,

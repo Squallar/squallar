@@ -2365,11 +2365,15 @@ const MIB: u64 = 1 << 20;
 /// **A value the page reported, not a constant it looked up.** A browser
 /// instance's maximum is chosen per device before the module exists
 /// (`squallar-web/heap.js`), so what the app judges a reading against is
-/// whatever arrived on that reading. The full declared bound is what a
-/// desktop-classified device gets, which is the arm these fixtures model; a
-/// handheld's page would carry 512 MiB here and its worker 256, and every
-/// line below would fall proportionally.
-const WEB_HEAP_MAX: u64 = squallar_device_profile::constants::WASM_LINEAR_MEMORY_MAX_BYTES;
+/// whatever arrived on that reading. A desktop's budget policy is the arm
+/// these fixtures model; a handheld's page would carry 512 MiB here and its
+/// worker 256, and every line below would fall proportionally.
+const WEB_HEAP_MAX: u64 = squallar_device_profile::constants::WASM_POLICY_HEAP_BYTES;
+
+/// What a desktop page's memory was constructed with beside that policy: the
+/// top rung of `squallar-web/heap.js`'s ladder. Telemetry only — nothing
+/// these tests exercise reads it, which is the property the fixtures carry.
+const WEB_HEAP_RESERVED: u64 = squallar_device_profile::constants::WASM_LINKED_MAX_BYTES;
 
 /// **On the measured arm a pressure event lowers the capacity by one economy
 /// fraction of the card, and the allowance follows at three quarters.** A
@@ -2444,8 +2448,10 @@ fn worker_heap(worker_mib: u64) -> crate::platform::LinearMemory {
     crate::platform::LinearMemory {
         page_bytes: 100 * MIB,
         page_max_bytes: WEB_HEAP_MAX,
+        page_reserved_bytes: WEB_HEAP_RESERVED,
         worker_bytes: Some(worker_mib * MIB),
         worker_max_bytes: WEB_HEAP_MAX,
+        worker_reserved_bytes: WEB_HEAP_RESERVED,
         worker_live_bytes: None,
         page_live_bytes: None,
     }
@@ -2543,8 +2549,10 @@ fn a_heap_that_grows_past_the_refire_step_acts_again() {
         Some(crate::platform::LinearMemory {
             page_bytes: bytes,
             page_max_bytes: WEB_HEAP_MAX,
+            page_reserved_bytes: WEB_HEAP_RESERVED,
             worker_bytes: Some(50 * MIB),
             worker_max_bytes: WEB_HEAP_MAX,
+            worker_reserved_bytes: WEB_HEAP_RESERVED,
             worker_live_bytes: None,
             page_live_bytes: None,
         })
@@ -2639,8 +2647,10 @@ fn a_page_heap_event_lowers_the_host_ceiling_on_the_wasm_bracket() {
         Some(crate::platform::LinearMemory {
             page_bytes: bytes,
             page_max_bytes: WEB_HEAP_MAX,
+            page_reserved_bytes: WEB_HEAP_RESERVED,
             worker_bytes: None,
             worker_max_bytes: 0,
+            worker_reserved_bytes: 0,
             worker_live_bytes: None,
             page_live_bytes: None,
         })
@@ -2919,8 +2929,10 @@ fn page_and_live(page_bytes: u64, live: Option<u64>) -> Option<crate::platform::
     Some(crate::platform::LinearMemory {
         page_bytes,
         page_max_bytes: WEB_HEAP_MAX,
+        page_reserved_bytes: WEB_HEAP_RESERVED,
         worker_bytes: None,
         worker_max_bytes: 0,
+        worker_reserved_bytes: 0,
         worker_live_bytes: None,
         page_live_bytes: live,
     })
@@ -3320,8 +3332,10 @@ fn a_page_at_ninety_percent_with_levers_says_so_and_frees_something() {
     gauge.set(Some(crate::platform::LinearMemory {
         page_bytes: ninety,
         page_max_bytes: WEB_HEAP_MAX,
+        page_reserved_bytes: WEB_HEAP_RESERVED,
         worker_bytes: Some(50 * MIB),
         worker_max_bytes: WEB_HEAP_MAX,
+        worker_reserved_bytes: WEB_HEAP_RESERVED,
         worker_live_bytes: None,
         page_live_bytes: None,
     }));
