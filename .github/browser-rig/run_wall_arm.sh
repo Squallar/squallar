@@ -49,6 +49,14 @@
 #                        the arm is recorded on every row), hardware elsewhere.
 #                        Android and Safari legs are always the device's own.
 #   RIG_DEVICE_CLASS     the ledger's device_class    (default <os>-desktop-<arch>)
+#   RIG_CALIBRATE_JSONS  "a.json b.json ..": calibrate legs already run (e.g. three
+#                        on one phone). No calibrate leg runs; the scene legs join
+#                        the run with the LOWEST survived MiB that ended (death,
+#                        refusal or cap, never doctored), and every run's two
+#                        routes are written into each evidence file.
+#   RIG_DEVICE_INFO_JSON a JSON file of device facts read outside the browser
+#                        (e.g. `xcrun devicectl device info details`), copied
+#                        into each evidence file as `device_reported`
 #   RIG_SAFARI_IOS_UDID  safari legs drive THIS iOS device through safaridriver
 #   RIG_ADB_SERIAL       android legs: which device
 #   RIG_TLS_CERT / RIG_TLS_KEY  serve https with this pair (a phone on the LAN)
@@ -204,6 +212,17 @@ done
 for s in $SCENES; do
   seed_of "$s" > /dev/null || { echo "FATAL: run_measure.sh has no scene $s" >&2; exit 64; }
 done
+CAL_JSONS="${RIG_CALIBRATE_JSONS:-}"
+if [ -n "$CAL_JSONS" ]; then
+  CALIBRATE=0
+  for j in $CAL_JSONS; do
+    [ -f "$j" ] || { echo "FATAL: RIG_CALIBRATE_JSONS names $j, which does not exist" >&2; exit 64; }
+  done
+fi
+if [ -n "${RIG_DEVICE_INFO_JSON:-}" ] && [ ! -f "$RIG_DEVICE_INFO_JSON" ]; then
+  echo "FATAL: RIG_DEVICE_INFO_JSON names $RIG_DEVICE_INFO_JSON, which does not exist" >&2
+  exit 64
+fi
 
 # The driver's own pins first, as run_tier2.sh and run_measure.sh do: a red
 # selftest means every reader below is suspect.
@@ -324,6 +343,25 @@ for b in "${BROWSER_ARGS[@]}"; do
     fi
     LEGS+=("$tag")
   fi
+  if [ -n "$CAL_JSONS" ] && [ -n "$SCENES" ]; then
+    # shellcheck disable=SC2086
+    "$PY" - "$OUT_DIR/$b.calibrate.json" $CAL_JSONS <<'EOF' || { echo "FATAL: no calibrate run in RIG_CALIBRATE_JSONS ended; nothing to join" >&2; exit 1; }
+import json, shutil, sys
+dest, runs = sys.argv[1], []
+for p in sys.argv[2:]:
+    v = (json.load(open(p)).get("calibrate") or {})
+    if v.get("ended_by") in ("death", "refusal", "cap") and not v.get("doctored") \
+            and isinstance(v.get("survived_mib"), int):
+        runs.append((v["survived_mib"], p, v["ended_by"]))
+if not runs:
+    sys.exit(1)
+low = min(runs)
+if low[1] != dest:
+    shutil.copyfile(low[1], dest)
+print("joining calibrate run %s: ended by %s at %d MiB survived (the lowest of %d that ended)"
+      % (low[1], low[2], low[0], len(runs)))
+EOF
+  fi
   for scene in $SCENES; do
     tag="$b.$scene"
     rm -f "$OUT_DIR/$tag.json" "$OUT_DIR/$tag.samples.tsv" "$OUT_DIR/$tag.report.jsonl" \
@@ -371,7 +409,7 @@ echo
 echo "================ wall arm summary ($DEVICE_CLASS, arm=$ARM) ================"
 "$PY" - "$RIG_DIR" "$OUT_DIR" "$DEVICE_CLASS" "$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)" \
        "$(date -u +%Y-%m-%d)" "$ARM" "$WASM" "$SECONDS_WINDOW" ${LEGS[@]+"${LEGS[@]}"} <<'EOF'
-import hashlib, importlib.util, json, os, subprocess, sys
+import hashlib, importlib.util, json, os, re, subprocess, sys
 rig, out, device_class, commit, date, arm, wasm, window = sys.argv[1:9]
 legs = sys.argv[9:]
 spec = importlib.util.spec_from_file_location("drive", os.path.join(rig, "drive.py"))
@@ -391,6 +429,76 @@ repo = os.path.dirname(os.path.dirname(os.path.abspath(rig)))
 dirty = subprocess.run(["git", "-C", repo, "status", "--porcelain"],
                        capture_output=True, text=True).stdout.count("\n")
 ledger, evidence_dir = [], os.path.join(out, "wall-evidence")
+
+# `<kind> took N ms off the frame` / `... on the main thread`: every one the
+# leg's page beaconed, over the whole leg. `decode` is a job kind, so
+# `decode took` is in here as `decode off the frame`.
+JOB_RE = re.compile(r"([A-Za-z0-9_/-]+) took ([0-9]+) ms (off the frame|on the main thread)")
+
+def report_facts(path):
+    """(device signals from the page's first hello batch, job costs) off a
+    serve.py report log; (None, None) when there is no log."""
+    try:
+        fh = open(path)
+    except (OSError, TypeError):
+        return None, None
+    device, costs = None, {}
+    with fh:
+        for raw in fh:
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            body = rec.get("body")
+            if not isinstance(body, dict):
+                continue
+            if device is None and isinstance(body.get("device"), dict):
+                device = dict(body["device"], recorded_by=(
+                    "the page's own %s record, load %s, received %s"
+                    % (body.get("kind"), body.get("load"), rec.get("recv_utc"))))
+            for e in body.get("lines") or []:
+                m = JOB_RE.search(str((e or {}).get("msg") or ""))
+                if m:
+                    costs.setdefault("%s %s" % (m.group(1), m.group(3)), []).append(int(m.group(2)))
+    summary = {}
+    for k, v in sorted(costs.items()):
+        s = sorted(v)
+        summary[k] = {"n": len(s), "min_ms": s[0], "median_ms": s[len(s) // 2],
+                      "p90_ms": s[min(len(s) - 1, int(len(s) * 0.9))], "max_ms": s[-1],
+                      "sum_ms": sum(s)}
+    return device, summary
+
+def calibrate_run_record(p):
+    r = json.load(open(p))
+    v = r.get("calibrate") or {}
+    ls, rep = v.get("ls") or {}, v.get("report") or {}
+    dev, _ = report_facts((r.get("report_log") or {}).get("path"))
+    return {
+        "json": os.path.abspath(p), "run": r.get("calibrate_run"),
+        "browser_version": (r.get("session") or {}).get("browserVersion"),
+        "ended_by": v.get("ended_by"), "survived_mib": v.get("survived_mib"),
+        "ladder": [{"mib": x.get("mib"), "ok": x.get("ok"), "error": x.get("error")}
+                   for x in (rep.get("ladder") or ls.get("ladder") or [])],
+        "ladder_ok": v.get("ladder_ok"), "ladder_largest_mib": v.get("ladder_largest_mib"),
+        "ask": v.get("ask"),
+        "route_localstorage": ({k: ls.get(k) for k in ("ended_by", "survived_mib", "attempting_mib",
+                                                       "phase_at_end", "attempting_rung_mib",
+                                                       "at_maximum", "error", "memory_maximum_mib")}
+                               if ls else None),
+        "route_report": ({k: rep.get(k) for k in ("ended_by", "survived_mib", "attempting_mib",
+                                                  "phase_at_end", "attempting_rung_mib",
+                                                  "at_maximum", "error", "memory_maximum_mib", "steps")}
+                         if rep else None),
+        "routes_agree": v.get("routes_agree"), "ok": v.get("ok"),
+        "errors": v.get("errors"), "notes": v.get("notes"),
+        "deaths": [d.get("kind") for d in r.get("deaths") or []],
+        "coi": v.get("coi"), "total_s": r.get("total_s"), "device_signals": dev,
+    }
+
+cal_paths = (os.environ.get("RIG_CALIBRATE_JSONS") or "").split()
+device_reported = None
+if os.environ.get("RIG_DEVICE_INFO_JSON"):
+    device_reported = json.load(open(os.environ["RIG_DEVICE_INFO_JSON"]))
 for tag in legs:
     r = load(tag)
     if r is None:
@@ -435,6 +543,20 @@ for tag in legs:
     leg_id = "%s-%s-%s-%s" % (date.replace("-", ""), device_class, browser_name, scene)
     cal = load(browser_name + ".calibrate")
     calv = (cal or {}).get("calibrate") or {}
+    signals, job_costs = report_facts(os.path.join(out, tag + ".report.jsonl"))
+    runs = [calibrate_run_record(p) for p in cal_paths] or (
+        [calibrate_run_record(os.path.join(out, browser_name + ".calibrate.json"))]
+        if cal is not None else [])
+    if signals:
+        print("%-26s   device: screen %sx%s dpr %s cores %s deviceMemory %s measureUASM %s ua-os %s"
+              % ("", signals.get("screen_width"), signals.get("screen_height"),
+                 signals.get("device_pixel_ratio"), signals.get("hardware_concurrency"),
+                 "present" if signals.get("device_memory_present") else "ABSENT",
+                 "present" if signals.get("measure_user_agent_specific_memory_present") else "absent",
+                 signals.get("ua_os_version")))
+    for k, c in sorted((job_costs or {}).items()):
+        print("%-26s   job %-32s n=%d median=%d p90=%d max=%d ms"
+              % ("", k, c["n"], c["median_ms"], c["p90_ms"], c["max_ms"]))
     ev = {
         "leg_id": leg_id, "device_class": device_class, "browser": browser_name,
         "browser_version": version, "scene": scene, "commit": commit, "date": date,
@@ -452,6 +574,15 @@ for tag in legs:
         "beaconed_route_agrees": agree,
         "beaconed_route_differs": diffs,
         "tree_dirty_files": dirty,
+        "device_signals": signals,
+        "device_reported": device_reported,
+        "job_costs": job_costs,
+        "job_costs_basis": ("every `<kind> took N ms off the frame|on the main thread` line "
+                            "the leg's page beaconed, over the whole leg, all page loads"),
+        "calibrate_runs": runs,
+        "calibrate_join_rule": ("the joined run (`calibrate`, `wall_mib`) is the one with the "
+                                "LOWEST survived MiB among runs that ended by death, refusal "
+                                "or cap and were not doctored"),
         "calibrate": {k: calv.get(k) for k in ("ended_by", "survived_mib", "ladder_ok",
                                                "ladder_largest_mib", "ask", "simulated",
                                                "doctored", "routes_agree", "ok")},
