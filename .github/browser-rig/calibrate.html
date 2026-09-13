@@ -128,8 +128,54 @@ try {
   heapError = String(e);
 }
 const COI = typeof self.crossOriginIsolated === "boolean" ? self.crossOriginIsolated : null;
+// The raw signals a device table will be keyed on, as this page sees them. An
+// ABSENT API is recorded as absent (`*_present: false`), never as a zero:
+// `navigator.deviceMemory` does not exist on WebKit at all. serve.py's console
+// beacon records the same field names, so a scene leg and a calibrate leg on
+// one device carry comparable records.
+function deviceSignals() {
+  const nav = navigator;
+  const ua = String(nav.userAgent || "");
+  const os = ua.match(/OS ([0-9]+(?:_[0-9]+)*) like Mac OS X/);
+  let standalone = null;
+  try {
+    standalone = !!((window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || nav.standalone);
+  } catch (e) {
+    standalone = null;
+  }
+  return {
+    screen_width: screen.width,
+    screen_height: screen.height,
+    screen_avail_width: screen.availWidth,
+    screen_avail_height: screen.availHeight,
+    device_pixel_ratio: window.devicePixelRatio,
+    hardware_concurrency: typeof nav.hardwareConcurrency === "number" ? nav.hardwareConcurrency : null,
+    device_memory_present: "deviceMemory" in nav,
+    device_memory: typeof nav.deviceMemory === "number" ? nav.deviceMemory : null,
+    measure_user_agent_specific_memory_present: typeof performance.measureUserAgentSpecificMemory === "function",
+    max_touch_points: typeof nav.maxTouchPoints === "number" ? nav.maxTouchPoints : null,
+    platform: nav.platform || null,
+    user_agent: ua,
+    ua_os_version: os ? os[1].replace(/_/g, ".") : null,
+    standalone,
+  };
+}
+const DEVICE = deviceSignals();
+C.device = DEVICE;
+// What this origin already held when the run's page loaded. A fresh origin
+// (every rig leg serves on a new port) reads 0: the run starts on clean
+// website data, and the record says so rather than assuming it.
+let STORAGE_AT_LOAD = null;
+try {
+  STORAGE_AT_LOAD = { local_storage_keys: localStorage.length };
+} catch (e) {
+  STORAGE_AT_LOAD = { error: String(e) };
+}
+C.storage_at_load = STORAGE_AT_LOAD;
 const BASE = {
   ua: navigator.userAgent,
+  device: DEVICE,
+  storage_at_load: STORAGE_AT_LOAD,
   coi: COI,
   sab: typeof SharedArrayBuffer !== "undefined",
   cap_mib: CAP_MIB,

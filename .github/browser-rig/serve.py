@@ -525,6 +525,26 @@ CONSOLE_BEACON_SCRIPT = b"""<script>/* squallar rig console beacon (serve.py --c
   var load = Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
   var batch = [], seq = 0, stats = { sent: 0, refused: 0, lines: 0 };
   window.__rig_beacon = { load: load, stats: stats };
+  // The raw device signals, once, on the hello batch -- the field names
+  // calibrate.html records, so a scene leg's own page says what device it ran
+  // on. An absent API is `*_present: false`, never a zero.
+  function device() {
+    var nav = navigator, ua = String(nav.userAgent || "");
+    var os = ua.match(/OS ([0-9]+(?:_[0-9]+)*) like Mac OS X/);
+    var sa = null;
+    try { sa = !!((window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || nav.standalone); } catch (_) {}
+    return {
+      screen_width: screen.width, screen_height: screen.height,
+      screen_avail_width: screen.availWidth, screen_avail_height: screen.availHeight,
+      device_pixel_ratio: window.devicePixelRatio,
+      hardware_concurrency: (typeof nav.hardwareConcurrency === "number") ? nav.hardwareConcurrency : null,
+      device_memory_present: ("deviceMemory" in nav),
+      device_memory: (typeof nav.deviceMemory === "number") ? nav.deviceMemory : null,
+      measure_user_agent_specific_memory_present: (typeof performance.measureUserAgentSpecificMemory === "function"),
+      max_touch_points: (typeof nav.maxTouchPoints === "number") ? nav.maxTouchPoints : null,
+      platform: nav.platform || null, user_agent: ua,
+      ua_os_version: os ? os[1].split("_").join(".") : null, standalone: sa };
+  }
   function wanted(m) {
     for (var i = 0; i < NEEDLES.length; i++) if (m.indexOf(NEEDLES[i]) >= 0) return true;
     return false;
@@ -542,7 +562,8 @@ CONSOLE_BEACON_SCRIPT = b"""<script>/* squallar rig console beacon (serve.py --c
         kind: "console", load: load, t0: rig.t0 || null, seq: seq++, why: why,
         href: String(location.href), ua: navigator.userAgent,
         coi: (typeof self.crossOriginIsolated === "boolean") ? self.crossOriginIsolated : null,
-        standalone: standalone, lines: batch.splice(0, batch.length) });
+        standalone: standalone, device: (why === "hello") ? device() : undefined,
+        lines: batch.splice(0, batch.length) });
     } catch (_) { return; }
     var ok = false;
     try { ok = navigator.sendBeacon(ROUTE, body); } catch (_) {}
