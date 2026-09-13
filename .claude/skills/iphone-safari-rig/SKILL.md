@@ -7,17 +7,39 @@ description: Measure squallar's web memory wall on the iPhone 13 Pro (or any iOS
 
 ## Where this stands (2026-09-12)
 
-The first device attempt got as far as creating a WebDriver session, and the
-phone refused it:
+Two device attempts, both refused at WebDriver session creation. **No calibrate
+or scene leg has run on the phone.** Everything before session creation ran
+and is marked RAN below, with the date; everything after it is still UNRUN.
 
-```
-session not created: Could not create a session: Some devices were found, but could not be used:
-- iPhone (00008110-001108891192801E): device is not paired
-```
+1. **20:22 (Mac local), before CoreDevice pairing.**
+   ```
+   session not created: Could not create a session: Some devices were found, but could not be used:
+   - iPhone (00008110-001108891192801E): device is not paired
+   ```
+   devicectl over ssh read `pairingState: unpaired` at 20:17 (`device info
+   details`) and at 20:22 (`list devices --json-output`).
+2. **20:32, after the user ran `xcrun devicectl manage pair` over ssh.** It
+   asked nothing on either device and printed `available (paired)`. safaridriver
+   gave the same sentence with NO device line after it. devicectl over ssh then
+   read `pairingState: paired`, `tunnelState: connected`, `ddiServicesAvailable:
+   false`, `developerModeStatus: disabled`, and printed `Error: The operation
+   failed because Developer Mode is disabled.` against the capability `Enable
+   Developer Disk Image Services`. In the Mac's unified log, safaridriver
+   (`com.apple.WebDriver.HTTPService`) took three usage assertions on `device-0
+   (00008110-001108891192801E)`. It released each within ~30 ms
+   (`RemotePairingError(errorCode: 1033 … "Assertion released.")`), then exited.
 
-**No calibrate or scene leg has run on the phone.** Everything before session
-creation ran and is marked RAN below, with the date. Everything after it is
-still UNRUN. The desktop halves of the same code (calibrate page,
+**What differed was TIME, not the session.** Both `unpaired` reads came before
+the user's pair, and devicectl over ssh reads `paired` after it. Pairing was
+safaridriver's first requirement and is met. **Developer Mode on the phone** is
+the one requirement still visibly unmet, and it needs the user's hands. That it
+is the LAST one is an inference, not a reading: re-check after enabling it.
+
+Two ssh traps met on the way. `launchctl asuser $(id -u) …` over ssh fails
+without root (`Could not switch to audit session 0x186a2: 1: Operation not
+permitted`); it was not needed. And `log` is a zsh builtin in the Mac's login
+shell (`zsh:log:1: too many arguments`), so query the unified log as
+`/usr/bin/log show …`. The desktop halves of the same code (calibrate page,
 `--until-death`, `analyze-console`, the console beacon, `RIG_CALIBRATE_JSONS`)
 have run on Linux Firefox and Chromium. Treat an UNRUN command's first failure
 as a fact about the command, not about the phone.
@@ -34,7 +56,8 @@ read-only):
 | CoreDevice identifier (the safaridriver UDID) | `64A825AA-AE5A-510E-88B0-E29F52F57C1D` |
 | hardware UDID (what safaridriver's errors print) | `00008110-001108891192801E` |
 | transport | wired |
-| pairingState / tunnelState / ddiServicesAvailable | **unpaired** / disconnected / false |
+| pairingState / tunnelState | unpaired / disconnected at 20:17 and 20:22; **paired / connected** at 20:32, after the user's pair |
+| developerModeStatus / ddiServicesAvailable | **disabled** / false (20:32) |
 
 The same command writes these facts as JSON for the evidence files (RAN):
 
@@ -69,19 +92,22 @@ unpaired` here.
 Precondition check, read-only, before any driven leg (RAN):
 
 ```bash
-ssh mac 'xcrun devicectl list devices --json-output /dev/stdout' | grep -E '"(pairingState|tunnelState|ddiServicesAvailable)"'
+ssh mac 'xcrun devicectl device info details --device 64A825AA-AE5A-510E-88B0-E29F52F57C1D' \
+  | grep -E 'pairingState|developerModeStatus|ddiServicesAvailable|tunnelState|Developer Mode'
 ```
 
-`"pairingState" : "paired"` is required.
+Required: `pairingState: paired` AND `developerModeStatus: enabled`. The second
+is what 2026-09-12 stopped on.
 
 Done:
 - Mac: `safaridriver --enable`.
 - iPhone: Settings > Safari > Advanced > **Web Inspector ON** and **Remote Automation ON**; Auto-Lock **Never**; USB-trusted with the Mac.
 - iPhone: the mkcert root, `$(mkcert -CAROOT)/rootCA.pem` (sha256 `63:99:B0:D3:…:8C:37`), was AirDropped, its profile installed, and full trust enabled in Certificate Trust Settings (the user, 2026-09-12).
 
-**Pending, and it needs the user's hands AND the user's say-so on their Mac:**
-1. CoreDevice pairing (UNRUN). On the Mac: `xcrun devicectl manage pair --device 64A825AA-AE5A-510E-88B0-E29F52F57C1D`. The phone then asks to Trust and for its passcode. This writes a pairing record on the Mac, which is the user's personal machine, so the user runs it or authorises it; a lane never does it on its own.
-2. Possibly Developer Mode (UNVERIFIED whether safaridriver demands it once paired): iPhone Settings > Privacy & Security > Developer Mode > On, restart, confirm. Only if the next session creation names it.
+- CoreDevice pairing: `xcrun devicectl manage pair --device 64A825AA-AE5A-510E-88B0-E29F52F57C1D`, run by the user over ssh on 2026-09-12. It asked nothing on either device and printed `available (paired)`. It writes a pairing record on the user's personal Mac, so the user runs it; a lane never does.
+
+**Pending, and it needs the user's hands on the phone (nothing on the Mac):**
+- **Developer Mode.** iPhone Settings > Privacy & Security > Developer Mode (near the bottom) > On > Restart. After the restart, unlock the phone, tap **Turn On** in the prompt and enter the passcode. Then rerun the precondition check above, which must read `developerModeStatus: enabled`, and retry calibrate run 1.
 
 Never run `mkcert -install` on the Linux box: it edits the box's trust store.
 
