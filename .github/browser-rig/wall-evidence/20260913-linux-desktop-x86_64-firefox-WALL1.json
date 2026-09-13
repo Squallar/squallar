@@ -1,0 +1,82 @@
+{
+  "alloc_instances": [],
+  "arm": "software",
+  "beaconed_route_agrees": true,
+  "beaconed_route_differs": [],
+  "beaconed_ticks": 45,
+  "browser": "firefox",
+  "browser_version": "155.0.1",
+  "calibrate": {
+    "ask": {
+      "error": null,
+      "form": "desktop",
+      "page_mib": 1024,
+      "signals": {
+        "anyPointerFine": true,
+        "deviceMemoryBytes": null,
+        "maxTouchPoints": 0,
+        "pointerCoarse": false
+      },
+      "worker_mib": 1024
+    },
+    "doctored": [],
+    "ended_by": "cap",
+    "ladder_largest_mib": 4096,
+    "ladder_ok": true,
+    "ok": true,
+    "routes_agree": true,
+    "simulated": false,
+    "survived_mib": 4096
+  },
+  "ceiling_page_mib": 1024,
+  "ceiling_worker_mib": 1024,
+  "commit": "b92a784f7f3d",
+  "commit_basis": "b92a784f7 is the app build that ran: the wasm was built from it and no product file changes on this lane. The rig that ran was the lane's working tree (10 files modified) before its first commit.",
+  "cross_origin_isolated": true,
+  "date": "2026-09-13",
+  "death_kinds": [],
+  "device_class": "linux-desktop-x86_64",
+  "first_alloc_failure": null,
+  "leg_id": "20260913-linux-desktop-x86_64-firefox-WALL1",
+  "provenance": {
+    "calibrate_json": "/home/reddragon/.cache/lane-m1-wall-rig-out/wall/firefox.calibrate.json",
+    "leg_json": "/home/reddragon/.cache/lane-m1-wall-rig-out/wall/firefox.WALL1.json",
+    "report_log": "/home/reddragon/.cache/lane-m1-wall-rig-out/wall/firefox.WALL1.report.jsonl",
+    "run_id": "wall-20260913T001726Z-969465-32691",
+    "samples_tsv": "/home/reddragon/.cache/lane-m1-wall-rig-out/wall/firefox.WALL1.samples.tsv",
+    "wasm_sha256": "b5c931d322d36449fe9445162dc2adc89dee3c9092698115f093ec2fafea7bed"
+  },
+  "scene": "WALL1",
+  "smoke_pass": true,
+  "tree_dirty_files": 10,
+  "wall": {
+    "alloc_failures": 0,
+    "booted": true,
+    "budget_pressure_events": 0,
+    "census_last_resident_b": 70399801,
+    "deaths": 0,
+    "instantiate_fallbacks": 0,
+    "ladder_largest_mib": 4096,
+    "page_ceiling_mib": 1024,
+    "page_hw_mib": 125,
+    "residue_mib": 3843,
+    "sum_hw_mib": 253,
+    "ticks": 45,
+    "wall_mib": 4096,
+    "worker_ceiling_mib": 1024,
+    "worker_hw_mib": 128
+  },
+  "wall_basis": {
+    "ceilings": "`heap max a/b` on the last tick (MiB)",
+    "census_last": "the last `heap census (page)` line of the window",
+    "deaths": "reloads and crashes a driver saw; page loads after the first in a beaconed log; null for a text dump, which cannot see one",
+    "page_hw_mib": "the higher of the highest page `linear` figure on a `budget state:` tick and the page level an `alloc failed: ... in page` line reports (MiB)",
+    "reading_window": "the FIRST page load: every line before the first death",
+    "residue_mib": "wall_mib minus sum_hw_mib: negative means the app's linear memory ALONE passed that device's measured wall",
+    "sum_hw_mib": "the highest page+worker `linear` pair on ONE tick, never the page peak plus the worker peak (MiB)",
+    "wall_mib": "MiB of incompressible, touched linear memory the calibrate leg on the same device and browser survived",
+    "worker_hw_mib": "the highest worker `linear` figure on a `budget state:` tick (MiB)"
+  },
+  "wall_mib": 4096,
+  "window_s": 150.0
+}
