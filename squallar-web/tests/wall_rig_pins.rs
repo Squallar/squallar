@@ -67,7 +67,7 @@ fn deploy_defects(yaml: &str) -> Vec<String> {
     }
     for line in &copies {
         if line.contains("calibrate") || line.contains("browser-rig") {
-            defects.push(format!("the web row stages a rig file: {line:?}"));
+            defects.push(format!("the web row stages a rig file -- {line:?}"));
         }
         // Every source is under squallar-web/: the opt-in list is what keeps a
         // rig directory out of `dist/`, so a copy from anywhere else is the
@@ -78,7 +78,7 @@ fn deploy_defects(yaml: &str) -> Vec<String> {
             }
             if !word.starts_with("squallar-web/") {
                 defects.push(format!(
-                    "the web row copies {word:?}, which is not under squallar-web/: {line:?}"
+                    "the web row copies {word:?}, which is not under squallar-web/ -- {line:?}"
                 ));
             }
         }
@@ -86,7 +86,7 @@ fn deploy_defects(yaml: &str) -> Vec<String> {
     for (n, line) in yaml.lines().enumerate() {
         if line.contains("calibrate.html") {
             defects.push(format!(
-                "build.yaml:{} names the calibrate page: {line:?}",
+                "build.yaml line {} names the calibrate page -- {line:?}",
                 n + 1
             ));
         }
@@ -121,7 +121,7 @@ fn service_worker_defects(sw: &str) -> Vec<String> {
         entries += list.len();
         for entry in list {
             if entry.contains("calibrate") || entry.starts_with("rig/") || entry.contains("/rig/") {
-                defects.push(format!("sw.js `{marker}` names a rig page: {entry:?}"));
+                defects.push(format!("sw.js `{marker}` names a rig page -- {entry:?}"));
             }
         }
     }
